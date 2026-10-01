@@ -42,8 +42,10 @@ final class ReconcileTests: XCTestCase {
         XCTAssertFalse(h.guardFake.sleepDisabled)
     }
 
-    // (b) valid session -> agent confirmed, disablesleep re-applied idempotently, timer rescheduled
-    func testValidSessionIsReappliedAndRearmed() async throws {
+    // (b) valid session, sleep still off -> agent confirmed, sleep read but
+    // never re-applied (that would need the administrator password), timer
+    // rescheduled
+    func testValidSessionWithSleepStillOffIsRearmedWithoutPrompt() async throws {
         let now = h.clock.now
         let s = Session(startedAt: now.addingTimeInterval(-600), endsAt: now.addingTimeInterval(2 * 3600 + 14 * 60 + 30))
         try h.store.saveSession(s)
@@ -57,7 +59,8 @@ final class ReconcileTests: XCTestCase {
 
         XCTAssertEqual(m.session, s)
         XCTAssertTrue(m.isActive)
-        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1"])
+        XCTAssertEqual(h.guardFake.calls, ["pmset -g"])
+        XCTAssertEqual(h.prompt.shown, 0, "a relaunch must never ask for the password")
         XCTAssertEqual(m.scheduledDeadline, s.endsAt)
         XCTAssertEqual(h.backstop.arms, 1)
         XCTAssertEqual(m.remainingText, "2h 14m")
@@ -65,14 +68,15 @@ final class ReconcileTests: XCTestCase {
         XCTAssertEqual(try h.store.loadState()?.sleepDisabledByUs, true)
     }
 
-    // (b') valid session whose state.json was lost -> state rewritten before pmset
+    // (b') valid session whose state.json was lost, sleep still off -> ownership journaled again
     func testValidSessionWithMissingStateMarksSleepDisabledByUs() async throws {
         let now = h.clock.now
         try h.store.saveSession(Session(startedAt: now, endsAt: now.addingTimeInterval(3600)))
+        h.guardFake.sleepDisabled = true
         let m = h.makeManager()
         await m.reconcile()
         XCTAssertEqual(try h.store.loadState()?.sleepDisabledByUs, true)
-        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1"])
+        XCTAssertEqual(h.guardFake.calls, ["pmset -g"])
     }
 
     // (c) no session but pmset reports SleepDisabled -> set to 0
@@ -269,6 +273,7 @@ final class ReconcileTests: XCTestCase {
         )
         // Bypass clamping by writing a near-expired session and reconciling.
         try real.store.saveSession(Session(startedAt: Date(), endsAt: Date().addingTimeInterval(1.5)))
+        real.guardFake.sleepDisabled = true
         await m.reconcile()
         XCTAssertTrue(m.isActive)
         let deadline = Date().addingTimeInterval(8)

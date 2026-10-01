@@ -49,8 +49,47 @@ final class TempHome {
     }
 }
 
-/// Records every call; can be told to throw.
+/// The administrator password dialog as a fake. Answers at once in
+/// `.succeed`, `.cancel` and `.fail`; in `.hang` it waits on `gate` like a
+/// dialog nobody answers and then reports the timeout osascript's SIGTERM
+/// would produce. Never shows anything and never runs pmset.
+final class FakeAdministratorPrompt: AdministratorPromptRunning, @unchecked Sendable {
+    enum Mode { case succeed, cancel, fail, hang }
+
+    private let lock = NSLock()
+    private var _mode: Mode = .succeed
+    private var _shown = 0
+    /// Opened by the test to end a `.hang`.
+    let gate = AsyncGate()
+
+    var mode: Mode {
+        get { lock.withLock { _mode } }
+        set { lock.withLock { _mode = newValue } }
+    }
+    /// How many times the dialog was shown.
+    var shown: Int { lock.withLock { _shown } }
+
+    func disableSleep() async throws {
+        lock.withLock { _shown += 1 }
+        switch mode {
+        case .succeed:
+            return
+        case .cancel:
+            throw AdministratorPromptError.cancelled
+        case .fail:
+            throw AdministratorPromptError.failed(status: 1, stderr: "execution error: The administrator user name or password was incorrect.")
+        case .hang:
+            await gate.wait()
+            throw AdministratorPromptError.timedOut(seconds: AdministratorPrompt.timeout)
+        }
+    }
+}
+
+/// Records every call; can be told to throw. `disablesleep 1` goes through
+/// `prompt`, the way PmsetSleepGuard routes it through the administrator
+/// dialog, so a test can see whether a path would have prompted.
 final class FakeSleepGuard: SleepGuarding, @unchecked Sendable {
+    let prompt = FakeAdministratorPrompt()
     private let lock = NSLock()
     private var _calls: [String] = []
     private var _sleepDisabled = false
@@ -104,6 +143,7 @@ final class FakeSleepGuard: SleepGuarding, @unchecked Sendable {
 
     func setSleepDisabled(_ disabled: Bool) async throws {
         try record("disablesleep \(disabled ? 1 : 0)")
+        if disabled { try await prompt.disableSleep() }
         if disabled, let gate = sleepGate { await gate.wait() }
         sleepDisabled = disabled
         try afterEffect("disablesleep \(disabled ? 1 : 0)")
@@ -454,6 +494,8 @@ final class FakeClock: @unchecked Sendable {
 struct Harness {
     let home: TempHome
     let guardFake: FakeSleepGuard
+    /// The administrator dialog behind `guardFake`'s `disablesleep 1`.
+    var prompt: FakeAdministratorPrompt { guardFake.prompt }
     let procs: FakeProcessControl
     let backstop: FakeBackstop
     let clock: FakeClock

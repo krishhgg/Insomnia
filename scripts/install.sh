@@ -54,12 +54,17 @@ BIN="$("$SWIFT" build -c release --show-bin-path)/Insomnia"
 #    The password prompt comes first: until the rule is installed and proven
 #    effective, the running app is not asked to quit and neither the bundle,
 #    the installed backstop.sh nor the LaunchAgent are touched.
+#    Three commands, and none of them can keep the Mac awake: turning sleep
+#    back on and the battery Low Power Mode floor stay passwordless so the
+#    app, backstop.sh and uninstall.sh can recover unattended. Turning sleep
+#    off (`pmset -a disablesleep 1`) has no line here; the app asks for the
+#    administrator password each time a session starts. The file is always
+#    rewritten, so a reinstall over an older four-line rule drops that line.
 step "Writing $SUDOERS (requires your password once)"
 TMP_SUDOERS="$(mktemp)"
 trap 'rm -f "$TMP_SUDOERS"' EXIT
 cat > "$TMP_SUDOERS" <<SUDO
-# Installed by Insomnia install.sh. Exactly four commands, nothing else.
-$USER ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 1
+# Installed by Insomnia install.sh. Exactly three commands, nothing else.
 $USER ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0
 $USER ALL=(root) NOPASSWD: /usr/bin/pmset -b lowpowermode 1
 $USER ALL=(root) NOPASSWD: /usr/bin/pmset -b lowpowermode 0

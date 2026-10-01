@@ -1379,6 +1379,56 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(r.stderr.contains("not touched"), "says what was not: \(r.stderr)")
         XCTAssertTrue(r.stderr.contains("still running"), r.stderr)
     }
+
+    /// The passwordless lines, in one place for the two tests below. None
+    /// of them can keep the Mac awake: turning sleep off has no line and
+    /// goes through the administrator password dialog in the app.
+    private static let passwordlessLines = [
+        "tester ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0",
+        "tester ALL=(root) NOPASSWD: /usr/bin/pmset -b lowpowermode 1",
+        "tester ALL=(root) NOPASSWD: /usr/bin/pmset -b lowpowermode 0",
+    ]
+
+    private func sudoersRules() throws -> [String] {
+        try String(contentsOf: fx.sudoers, encoding: .utf8)
+            .split(separator: "\n").map(String.init)
+            .filter { !$0.hasPrefix("#") && !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+    }
+
+    func testInstallWritesExactlyThreePasswordlessLinesAndNoneTurnsSleepOff() throws {
+        try fx.prepareInstall()
+        fx.setMode("launchctl", "loaded")
+
+        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertEqual(try sudoersRules(), Self.passwordlessLines)
+        let text = try String(contentsOf: fx.sudoers, encoding: .utf8)
+        XCTAssertFalse(text.contains("disablesleep 1"), "a passwordless way to keep the Mac awake: \(text)")
+        XCTAssertTrue(fx.calls().contains("sudo -n -l /usr/bin/pmset -a disablesleep 0"), "the undo line is the one verified: \(fx.calls())")
+    }
+
+    /// A reinstall over the four-line rule of an older build replaces the
+    /// file: the `disablesleep 1` line does not survive.
+    func testReinstallOverFourLineRuleLeavesThreeLines() throws {
+        try fx.prepareInstall()
+        try fx.installMachinery()
+        try """
+        # Installed by Insomnia install.sh. Exactly four commands, nothing else.
+        tester ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 1
+        tester ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0
+        tester ALL=(root) NOPASSWD: /usr/bin/pmset -b lowpowermode 1
+        tester ALL=(root) NOPASSWD: /usr/bin/pmset -b lowpowermode 0
+
+        """.write(to: fx.sudoers, atomically: true, encoding: .utf8)
+        fx.setMode("launchctl", "loaded")
+
+        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertEqual(try sudoersRules(), Self.passwordlessLines)
+        XCTAssertFalse(try String(contentsOf: fx.sudoers, encoding: .utf8).contains("disablesleep 1"))
+    }
 }
 
 // MARK: - Fixture

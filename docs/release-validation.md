@@ -126,6 +126,11 @@ is performed. Do not replace "not run" with "passed" based on source review.
 | Headed-browser throttling with the lid closed | Not run |
 | Battery/thermal event behavior on supported hardware | Not run |
 | Install/upgrade/uninstall with recoverable failure conditions | Not run |
+| Start shows the administrator password dialog (names Insomnia's purpose, not just osascript) and `pmset -g` shows `SleepDisabled 1` after it | Not run |
+| Cancel in the dialog, a wrong password, and no answer for 120 s each roll the start back: no session, `SleepDisabled` absent, journal clean, "Session not started" notification; the dialog closes when the 120 s SIGTERM lands | Not run |
+| Relaunch (and login) with a valid session and `SleepDisabled 1` keeps the session without a prompt | Not run |
+| Relaunch with a valid session after `sudo pmset -a disablesleep 0` by hand ends the session with the "turned back on" notification, no prompt | Not run |
+| Reinstall over an older four-line `/etc/sudoers.d/insomnia` leaves exactly the three passwordless lines | Not run |
 
 Hardware tests must be supervised and must not endanger active user work. Use
 a stable, ventilated surface, not an enclosure. Do not intentionally overheat a

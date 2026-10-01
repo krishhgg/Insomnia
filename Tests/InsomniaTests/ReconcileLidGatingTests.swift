@@ -23,6 +23,7 @@ final class ReconcileLidGatingTests: XCTestCase {
         st.savedDisplayBrightness = 0.8
         st.savedKeyboardBrightness = 0.3
         try h.store.saveState(st)
+        h.guardFake.sleepDisabled = true
         return s
     }
 
@@ -46,7 +47,7 @@ final class ReconcileLidGatingTests: XCTestCase {
         XCTAssertEqual(after.savedDisplayBrightness, 0.8)
         XCTAssertEqual(after.savedKeyboardBrightness, 0.3)
         XCTAssertEqual(m.state, after)
-        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1"])
+        XCTAssertEqual(h.guardFake.calls, ["pmset -g"])
     }
 
     /// A journal holding only saved brightness (no freeze, no audio) is
@@ -60,6 +61,7 @@ final class ReconcileLidGatingTests: XCTestCase {
         st.savedDisplayBrightness = 0.8
         st.savedKeyboardBrightness = 0.3
         try h.store.saveState(st)
+        h.guardFake.sleepDisabled = true
         h.clamshell.closed = true
         let m = h.makeManager()
         await m.reconcile()

@@ -9,13 +9,19 @@ enum EndReason: String, Sendable {
     case thermalCritical
     case backstop
     /// Reconcile found a session on disk but could not arm the recovery
-    /// agent, journal, or hold sleep for it, so it ended the session instead
-    /// of holding sleep with nothing to release it.
+    /// agent, read the sleep setting, or journal for it, so it ended the
+    /// session instead of holding sleep with nothing to release it.
     case recoveryUnavailable
-    /// `pmset disablesleep 1` failed or timed out during start. The setting
-    /// may still have been applied, so the start is undone from the journal
-    /// like an end rather than rolled back from memory.
+    /// The administrator password dialog that turns sleep off was cancelled,
+    /// answered wrongly, timed out, or pmset failed behind it, during start.
+    /// The setting may still have been applied, so the start is undone from
+    /// the journal like an end rather than rolled back from memory.
     case startFailed
+    /// Reconcile found a valid session on disk but `pmset -g` no longer
+    /// reports SleepDisabled: something turned sleep back on while Insomnia
+    /// was not running. Turning it off again needs a password, which a
+    /// relaunch must never ask for, so the session ends instead.
+    case sleepReenabled
 }
 
 /// What `end` achieved. Callers that are about to quit need to know whether
@@ -349,6 +355,10 @@ final class SessionManager {
             return
         }
 
+        // The administrator password dialog. This is the only call that can
+        // prompt, and Start is the only path that reaches it: the user just
+        // pressed Enter, so someone is at the keyboard. A cancel, a wrong
+        // password, a timeout or a pmset failure all land here.
         do {
             try await sleepGuard.setSleepDisabled(true)
         } catch {
@@ -872,15 +882,33 @@ final class SessionManager {
         }
 
         if let s = onDisk, !s.isExpired(at: now) {
-            // Step 2: valid session. Arm first, then journal, then hold
-            // sleep. Any failure ends the session rather than holding sleep
-            // with nothing guaranteed to release it.
+            // Step 2: valid session. Arm first, then check that sleep is
+            // still off, then journal. Any failure ends the session rather
+            // than holding sleep with nothing guaranteed to release it.
             session = s
             do {
                 try await backstop.arm()
             } catch {
                 fail("could not arm recovery agent for the session on disk: \(error.localizedDescription); ending it")
                 _ = await performEnd(reason: .recoveryUnavailable)
+                return
+            }
+            // Never re-applied: `disablesleep 1` needs the administrator
+            // password, and a relaunch (login, a crash) has nobody at the
+            // keyboard to type it. The session continues only if sleep is
+            // still off; if it was turned back on meanwhile the session ends
+            // and says so.
+            let sleepStillOff: Bool
+            do {
+                sleepStillOff = try await sleepGuard.isSleepDisabled()
+            } catch {
+                fail("could not read the sleep setting for the session on disk: \(error.localizedDescription); ending it")
+                _ = await performEnd(reason: .recoveryUnavailable)
+                return
+            }
+            guard sleepStillOff else {
+                Log.info("reconcile: sleep was turned back on while Insomnia was not running; ending the session")
+                _ = await performEnd(reason: .sleepReenabled)
                 return
             }
             if !state.sleepDisabledByUs {
@@ -892,14 +920,7 @@ final class SessionManager {
                     return
                 }
             }
-            do {
-                try await sleepGuard.setSleepDisabled(true)
-                lastError = nil
-            } catch {
-                fail("could not re-apply sleep guard: \(error.localizedDescription); ending session")
-                _ = await performEnd(reason: .recoveryUnavailable)
-                return
-            }
+            lastError = nil
             Log.info("reconcile: session valid until \(iso(s.endsAt))")
             if !state.lowPowerSetByUs, state.displayRestoredUnderLowPower != nil {
                 dropDisplayWrite(reason: "the mode is not ours")
@@ -1082,8 +1103,9 @@ final class SessionManager {
         case .batteryFloor: "Battery fell below \(config.endFloor)%. Sleep is back to normal."
         case .thermalCritical: "Thermal state is critical. Sleep is back to normal."
         case .backstop: "A previous session left changes behind; everything has been undone."
-        case .recoveryUnavailable: "Insomnia could not arm its recovery agent for the session found on disk, so it ended the session. Sleep is back to normal."
-        case .startFailed: "Insomnia could not disable sleep, so no session was started. Sleep is back to normal."
+        case .recoveryUnavailable: "Insomnia could not confirm its recovery agent or the sleep setting for the session found on disk, so it ended the session. Sleep is back to normal."
+        case .startFailed: "The administrator password prompt was cancelled or failed, so no session was started. Sleep is back to normal."
+        case .sleepReenabled: "Sleep was turned back on while Insomnia was not running, so the session ended."
         }
     }
 }

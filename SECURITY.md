@@ -11,11 +11,18 @@ on this repository's Security page, use that private channel. Otherwise open a
 public issue containing only a request for a private security contact, without
 the sensitive details, and wait for the maintainer to arrange one.
 
-The installer grants the user account passwordless access to four exact pmset
-commands listed in the README. This grant is not exclusive to the Insomnia app:
-other processes running as that user can invoke them too. The app is not
-sandboxed; local logs can contain SSIDs, process metadata, and tmux target names.
-Hotspot passwords are stored in the login Keychain.
+The installer grants the user account passwordless access to three exact pmset
+commands listed in the README: turn sleep back on (`pmset -a disablesleep 0`)
+and switch battery Low Power Mode on or off (`pmset -b lowpowermode 1` and
+`0`). This grant is not exclusive to the Insomnia app: other processes running
+as that user can invoke them too. None of them can keep the Mac awake. Turning
+sleep off (`pmset -a disablesleep 1`) has no passwordless line; the app runs it
+through the standard macOS administrator dialog, with a fixed command string,
+each time the user starts a session, and never on relaunch or from the recovery
+agent. The rule stays in place after a failed install (the README says what
+was installed) and is removed by the uninstaller. The app is not sandboxed;
+local logs can contain SSIDs, process metadata, and tmux target names. Hotspot
+passwords are stored in the login Keychain.
 
 Passing automated checks or a secret scan does not establish the absence of
 vulnerabilities. Do not probe recovery by disrupting someone else's processes,

@@ -52,7 +52,10 @@ open "$HOME/Applications/Insomnia.app"
 The installer builds and ad-hoc signs the app, installs a background recovery
 agent, and asks for administrator access to install a narrowly scoped sudoers
 rule. It grants **your user account**, not just Insomnia, passwordless access to
-four power-setting commands. Review that permission before installing.
+three power-setting commands, none of which can keep the Mac awake: they turn
+sleep back on and switch battery Low Power Mode on or off. Turning sleep off is
+not in the rule; Insomnia asks for your administrator password each time you
+start a session. Review that permission before installing.
 
 <details>
 <summary><strong>Exactly what gets installed</strong></summary>
@@ -63,18 +66,21 @@ four power-setting commands. Review that permission before installing.
 | `~/Library/Application Support/Insomnia/` | Configuration, session/recovery journals, and `backstop.sh` |
 | `~/Library/LaunchAgents/com.insomnia.backstop.plist` | Per-user recovery agent |
 | `~/Library/Logs/Insomnia/` | `insomnia.log` and `handoffs.log` |
-| `/etc/sudoers.d/insomnia` | Permission for the four commands below |
+| `/etc/sudoers.d/insomnia` | Permission for the three commands below |
 
 ```text
-/usr/bin/pmset -a disablesleep 1
 /usr/bin/pmset -a disablesleep 0
 /usr/bin/pmset -b lowpowermode 1
 /usr/bin/pmset -b lowpowermode 0
 ```
 
-The grant is available to other processes running as your user. Insomnia is not
-sandboxed. The app, scripts, and journals are local; hotspot passwords use the
-login Keychain, not the configuration file.
+The grant is available to other processes running as your user. It lets them
+turn sleep back on and toggle Low Power Mode on battery, and nothing else; the
+command that keeps the Mac awake, `pmset -a disablesleep 1`, always goes
+through the standard macOS administrator password dialog. A reinstall over an
+older install replaces the file, so the old `disablesleep 1` line is removed.
+Insomnia is not sandboxed. The app, scripts, and journals are local; hotspot
+passwords use the login Keychain, not the configuration file.
 
 An upgrade asks the running app to quit and stops if it refuses. Unresolved
 recovery prevents replacing the existing recovery agent; follow the reported
@@ -85,7 +91,9 @@ instructions before retrying.
 ## Using it
 
 1. **Start:** click the eye in the menu bar, enter Days / Hours / Minutes, and
-   press Enter.
+   press Enter. macOS asks for your administrator password to turn system
+   sleep off. Cancelling the dialog, a wrong password, or no answer within
+   120 seconds leaves sleep as it was and no session started.
 2. **Extend:** click the eye or countdown during a session and enter more time.
 3. **End early:** press and hold the end control beside the countdown.
 4. **Inspect or configure:** right-click for status, recovery warnings,
@@ -163,6 +171,15 @@ Insomnia records pending changes in a recovery journal. On session end, the app
 attempts to undo them. An independent `launchd` agent checks every minute and
 can attempt recovery after the app exits unexpectedly, once the saved deadline
 has passed. It leaves a valid, unexpired session alone.
+
+Undoing never needs a password: the sudoers rule covers turning sleep back on,
+so the app, the agent, and the uninstaller can all restore sleep unattended.
+Turning sleep off is the only step that asks, and only when you press Enter.
+When Insomnia starts up (login, or a relaunch after a crash) and finds a valid
+session on disk, it checks whether sleep is still off. If it is, the session
+continues; if something turned sleep back on in the meantime, the session ends
+with a notification instead of asking for a password with nobody at the
+keyboard.
 
 The app and backstop use the same lock so they do not restore and rewrite the
 journal over one another. Failed restoration keeps the relevant entries;

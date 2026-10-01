@@ -74,9 +74,16 @@ recovery; newly written journals use `frozenProcesses`.
 - Click the cup/countdown to enter an extension; hold the end control to end.
   Right-click opens the status, browser actions, Settings, and Quit menu.
 - Session start: write session + state to disk, arm the launchd backstop, and
-  only then run `sudo pmset -a disablesleep 1`. A session never starts unless
-  the backstop is armed. If pmset fails, delete the session file and surface
-  the error. The journal and backstop always exist before sleep is disabled.
+  only then run `pmset -a disablesleep 1` through the macOS administrator
+  password dialog (`osascript` running a fixed `do shell script ... with
+  administrator privileges` literal; 120 s limit, SIGTERM only at the
+  deadline). A session never starts unless the backstop is armed. If the
+  dialog is cancelled, the password is wrong, it times out, or pmset fails,
+  undo from the journal like an end, delete the session file and surface the
+  error. The journal and backstop always exist before sleep is disabled, so a
+  crash while the dialog is up leaves recovery a record. Only an explicit
+  Start reaches the dialog; there is no auto-start, URL scheme or scheduled
+  start, and launch at login only reconciles.
 - Session end (timer, End now, Quit, battery floor, thermal critical):
   `sudo pmset -a disablesleep 0`, undo every RuntimeState entry, delete
   session, notify.
@@ -86,10 +93,17 @@ recovery; newly written journals use `frozenProcesses`.
 
 - `install.sh` writes `/etc/sudoers.d/insomnia` allowing the user to run,
   without a password, exactly:
-  - `/usr/bin/pmset -a disablesleep 1`
   - `/usr/bin/pmset -a disablesleep 0`
   - `/usr/bin/pmset -b lowpowermode 1`
   - `/usr/bin/pmset -b lowpowermode 0`
+- `/usr/bin/pmset -a disablesleep 1` is deliberately absent. With a
+  passwordless line, any process running as the user could keep the Mac
+  awake, unjournaled, with Insomnia not running. Turning sleep off goes
+  through the administrator password dialog instead
+  (`AdministratorPrompt.swift`).
+- Turning sleep back on and the Low Power Mode floor stay passwordless so the
+  app, `backstop.sh` and `uninstall.sh` can recover unattended: ending a
+  stuck or crashed session must never need a password.
 - Nothing else runs as root.
 
 ### 3. Lid observer
@@ -305,9 +319,14 @@ Reconcile runs at every Insomnia launch:
 1. Session file missing or expired → restore journaled changes: sleep,
    verified owned processes, Low Power Mode if we set it, and saved audio.
    Unverified entries and failed restoration remain unresolved, not successful.
-2. Session valid → establish the independent recovery agent before reapplying
-   the sleep guard, then resume observers. If the lid is open, restore recorded
-   lid-close actions. Arming or restoration errors must remain visible.
+2. Session valid → establish the independent recovery agent, then read
+   `pmset -g`. `SleepDisabled 1`: journal ownership if missing and resume
+   observers; the guard is never re-applied, since that needs the
+   administrator password and a relaunch has nobody at the keyboard.
+   `SleepDisabled 0` (something turned sleep back on while Insomnia was not
+   running): end the session with a notification, no prompt. If the lid is
+   open, restore recorded lid-close actions. Arming, read or restoration
+   errors must remain visible.
 3. `pmset -g` reports `SleepDisabled 1` with no session → set it to 0.
 
 Backstop, independent of the app:
@@ -328,9 +347,11 @@ Backstop, independent of the app:
 
 ### 9. Notifications
 
-`UNUserNotificationCenter`: session ended (with reason), extend reminder 5
-minutes before end, battery floor reached, thermal action taken, network gap
-recovered (with nudge summary), sleep restored by backstop.
+`UNUserNotificationCenter`: session ended (with reason), session not started
+(the password dialog was cancelled or failed), session ended because sleep was
+turned back on while Insomnia was not running, extend reminder 5 minutes
+before end, battery floor reached, thermal action taken, network gap recovered
+(with nudge summary), sleep restored by backstop.
 
 ### 10. Settings
 
@@ -540,6 +561,8 @@ git clone https://github.com/kgarg2468/Insomnia.git && cd Insomnia
 ```
 
 Then set the hotspot in Settings, pick a freeze list, and start a session.
+Each start asks for the administrator password (that is the `disablesleep 1`
+the sudoers file does not cover).
 
 ## Manual test plan
 
@@ -549,9 +572,13 @@ that any case passed; record results in the release validation record.
 
 1. **First launch.** Confirm the status item is visible to the right of the
    notch on first launch.
-2. **Stays awake.** Start 30m session, close lid, wait 5 minutes, ping the Mac
+2. **Stays awake.** Start 30m session; the administrator password dialog
+   appears and names what it does. Close lid, wait 5 minutes, ping the Mac
    from the phone or check the heartbeat log. Open lid: session still running,
-   sleep still disabled until end.
+   sleep still disabled until end. Separately: Enter, then Cancel in the
+   dialog → no session, `pmset -g` shows no `SleepDisabled`, session.json and
+   the journal are clean, and the "Session not started" notification names
+   the prompt.
 3. **Restores.** End now → `pmset -g` shows no `SleepDisabled`. Quit → same.
    Timer expiry → same, plus notification.
 4. **Backstop.** Force-quit a supervised disposable session, then verify
