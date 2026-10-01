@@ -281,6 +281,11 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
                     .textSelection(.enabled)
             }
+            if LidSimulationBuild.isCompiledIn {
+                Text(LidSimulationBuild.marker)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
         }
     }
 

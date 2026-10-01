@@ -662,7 +662,8 @@ final class StatusItemController: NSObject {
                 lastGap: status.lastGap
             ),
             throttledBrowsers: status.throttledBrowsers,
-            error: manager.lastError
+            error: manager.lastError,
+            lidSimulationBuild: LidSimulationBuild.isCompiledIn
         )
     }
 

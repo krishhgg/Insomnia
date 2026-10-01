@@ -47,6 +47,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // No Dock icon even when run from `swift run` (the bundle has LSUIElement).
         NSApp.setActivationPolicy(.accessory)
         Log.info("launched")
+        if LidSimulationBuild.isCompiledIn {
+            Log.info(LidSimulationBuild.marker)
+        }
         let settings = SettingsWindow { [manager, secrets, locationPermission] in
             AnyView(
                 SettingsView(

@@ -1,6 +1,111 @@
 import XCTest
 @testable import Insomnia
 
+/// Records what `AppServices` does with the watcher, so the gating can be
+/// proved without a dispatch source or a directory.
+@MainActor
+final class FakeLidSimulation: LidSimulating {
+    var onEvent: ((Bool) -> Void)?
+    private(set) var starts: [(directory: URL, file: URL)] = []
+    private(set) var stops = 0
+
+    func start(directory: URL, file: URL) { starts.append((directory, file)) }
+    func stop() { stops += 1 }
+}
+
+/// The watcher is compiled into debug builds and INSOMNIA_LID_SIMULATION
+/// release builds only. `swift test` builds debug, so the flag reads true
+/// here; what these tests pin is that the flag is what `AppServices` obeys,
+/// and that a build whose flag is false never starts an injected watcher.
+@MainActor
+final class LidSimulationGateTests: XCTestCase {
+    private func makeServices(home: TempHome, watcher: (any LidSimulating)?, enabled: Bool) -> AppServices {
+        AppServices(
+            paths: home.paths,
+            notifier: RecordingNotifier(),
+            audio: FakeAudioControl(),
+            processControl: FakeProcessControl(),
+            locationPermission: LocationPermission(authorizationStatus: .notDetermined),
+            lidSimulation: watcher,
+            lidSimulationEnabled: enabled
+        )
+    }
+
+    func testTheFlagMatchesTheCompilationCondition() {
+        #if DEBUG || INSOMNIA_LID_SIMULATION
+        XCTAssertTrue(LidSimulationBuild.isCompiledIn)
+        XCTAssertNotNil(LidSimulationBuild.makeWatcher())
+        #else
+        XCTAssertFalse(LidSimulationBuild.isCompiledIn)
+        XCTAssertNil(LidSimulationBuild.makeWatcher())
+        #endif
+    }
+
+    /// A release build has `isCompiledIn` false: even with a watcher in
+    /// hand (an injected one here, since such a build has none), the
+    /// services never start it and never wire its events.
+    func testAWatcherIsNotStartedWhenTheBuildFlagIsOff() {
+        let home = TempHome()
+        defer { home.destroy() }
+        let watcher = FakeLidSimulation()
+        let services = makeServices(home: home, watcher: watcher, enabled: false)
+
+        services.startLidSimulation()
+
+        XCTAssertTrue(watcher.starts.isEmpty, "the watcher was started with the flag off")
+        XCTAssertNil(watcher.onEvent, "the watcher's events were wired with the flag off")
+        XCTAssertFalse(services.status.lidClosed)
+    }
+
+    func testAWatcherIsStartedOnTheSupportDirectoryWhenTheBuildFlagIsOn() {
+        let home = TempHome()
+        defer { home.destroy() }
+        let watcher = FakeLidSimulation()
+        let services = makeServices(home: home, watcher: watcher, enabled: true)
+
+        services.startLidSimulation()
+
+        XCTAssertEqual(watcher.starts.count, 1)
+        XCTAssertEqual(watcher.starts.first?.directory, home.paths.appSupport)
+        XCTAssertEqual(watcher.starts.first?.file, home.paths.simulateLidFile)
+        // The event reaches the services: the status reflects the trigger.
+        watcher.onEvent?(true)
+        XCTAssertTrue(services.status.lidClosed)
+        watcher.onEvent?(false)
+        XCTAssertFalse(services.status.lidClosed)
+
+        services.stopLidSimulation()
+        XCTAssertEqual(watcher.stops, 1)
+        XCTAssertNil(watcher.onEvent)
+    }
+
+    /// Without a watcher (a release build) stop has nothing to do and the
+    /// start never touches the directory.
+    func testNoWatcherMeansNothingIsStartedOrStopped() {
+        let home = TempHome()
+        defer { home.destroy() }
+        let services = makeServices(home: home, watcher: nil, enabled: true)
+
+        services.startLidSimulation()
+        services.stopLidSimulation()
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: home.paths.simulateLidFile.path))
+    }
+
+    /// Such a build says so in the status menu, as a warning line, so it is
+    /// never mistaken for a normal release.
+    func testTheStatusMenuMarksALidSimulationBuild() {
+        let marked = StatusMenu.items(sessionActive: false, sleepHeld: false, machine: nil, actions: nil, throttledBrowsers: [], error: nil, lidSimulationBuild: true)
+        XCTAssertEqual(marked.map(\.kind), [.warning, .separator, .settings, .quit])
+        XCTAssertEqual(marked.first?.title, LidSimulationBuild.marker)
+        XCTAssertTrue(LidSimulationBuild.marker.contains("simulate-lid.sh"))
+
+        let plain = StatusMenu.items(sessionActive: false, sleepHeld: false, machine: nil, actions: nil, throttledBrowsers: [], error: nil, lidSimulationBuild: false)
+        XCTAssertEqual(plain.map(\.kind), [.settings, .quit])
+    }
+}
+
+#if DEBUG || INSOMNIA_LID_SIMULATION
 /// The file trigger behind scripts/simulate-lid.sh. Driven through
 /// `consume()` directly rather than the directory watcher, so nothing here
 /// waits on a dispatch source.
@@ -114,3 +219,4 @@ final class LidSimulationTests: XCTestCase {
         XCTAssertFalse(log().contains("cannot claim"), "a missing trigger is not an error: \(log())")
     }
 }
+#endif

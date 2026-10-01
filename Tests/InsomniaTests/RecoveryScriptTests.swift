@@ -1092,6 +1092,38 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(try fx.contents(of: fx.plist.deletingLastPathComponent()), ["com.insomnia.backstop.plist"])
     }
 
+    /// The scripts/simulate-lid.sh watcher is compiled out of a release
+    /// build unless the installer is told to compile it in: only
+    /// INSOMNIA_LID_SIMULATION=1 adds the define to the swift build lines,
+    /// and the installer says so.
+    func testInstallCompilesTheLidSimulationInOnlyWhenAsked() throws {
+        try fx.prepareInstall()
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        fx.setMode("launchctl", "loaded")
+
+        let plain = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+        XCTAssertEqual(plain.status, 0, plain.stderr + plain.stdout)
+        let plainBuilds = fx.calls().filter { $0.hasPrefix("swift build") }
+        XCTAssertEqual(plainBuilds, ["swift build -c release", "swift build -c release --show-bin-path"], "\(fx.calls())")
+        XCTAssertFalse(plain.stdout.contains("lid simulation compiled in"), plain.stdout)
+
+        fx.clearCalls()
+        let simulated = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester", "INSOMNIA_LID_SIMULATION": "1"])
+        XCTAssertEqual(simulated.status, 0, simulated.stderr + simulated.stdout)
+        let simulatedBuilds = fx.calls().filter { $0.hasPrefix("swift build") }
+        XCTAssertEqual(simulatedBuilds, [
+            "swift build -c release -Xswiftc -DINSOMNIA_LID_SIMULATION",
+            "swift build -c release -Xswiftc -DINSOMNIA_LID_SIMULATION --show-bin-path",
+        ], "\(fx.calls())")
+        XCTAssertTrue(simulated.stdout.contains("lid simulation compiled in (INSOMNIA_LID_SIMULATION=1)"), simulated.stdout)
+
+        // Any other value is "off": the define is a deliberate opt-in.
+        fx.clearCalls()
+        let other = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester", "INSOMNIA_LID_SIMULATION": "yes"])
+        XCTAssertEqual(other.status, 0, other.stderr + other.stdout)
+        XCTAssertEqual(fx.calls().filter { $0.hasPrefix("swift build") }.first, "swift build -c release", "\(fx.calls())")
+    }
+
     func testInstallLeavesTrustedPlistWhenBootstrapAndReloadBothFail() throws {
         try fx.prepareInstall()
         try "trusted".write(to: fx.plist, atomically: true, encoding: .utf8)

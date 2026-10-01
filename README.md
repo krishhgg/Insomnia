@@ -151,7 +151,12 @@ The defaults are worth knowing:
 
 To exercise the lid actions without closing the lid, run
 `scripts/simulate-lid.sh closed` and then `scripts/simulate-lid.sh open` during
-a session; the app runs the same actions it would on a real lid event.
+a session; the app runs the same actions it would on a real lid event. Only a
+build with the file watcher compiled in reads that trigger: a debug build, or
+a release build installed with `INSOMNIA_LID_SIMULATION=1 ./scripts/install.sh`.
+A normal install has no watcher, so no program running as your user can replay
+the lid actions by writing a file. A build that has it logs "Lid simulation
+build" at launch and shows the same line in the status menu and in Settings.
 
 ## How recovery works
 

@@ -527,7 +527,8 @@ Insomnia/
     install.sh             build, bundle, codesign, sudoers, launchd, login item
     uninstall.sh           reverse all of the above, restore sleep
     backstop.sh            standalone restore from JSON
-    simulate-lid.sh        file trigger for the lid-close action path
+    simulate-lid.sh        file trigger for the lid-close action path (debug and
+                           INSOMNIA_LID_SIMULATION=1 builds only)
   docs/spec.md
   README.md                setup, hotspot setting, Chrome note
 ```
@@ -582,6 +583,11 @@ that any case passed; record results in the release validation record.
     `savedKeyboardBrightness`). Open → both back, journal entries gone. Repeat
     with the lid open using `scripts/simulate-lid.sh closed` then `open`
     during a session; the log shows `lid SIMULATED closed (file trigger)`.
+    That needs a build with the watcher compiled in (installed with
+    `INSOMNIA_LID_SIMULATION=1 ./scripts/install.sh`; it logs "Lid
+    simulation build" at launch). A normal install ignores the trigger:
+    the watcher is compiled out so a file written by any other program
+    running as the user cannot replay the lid actions.
     Quit while closed → both restored. Force-quit while closed, reopen the app
     → restored at reconcile, and `backstop.sh` alone leaves both keys in place.
 
