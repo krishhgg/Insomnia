@@ -344,7 +344,17 @@ small settings window:
 - `lowPowerFloor`, `endFloor`, thermal rules on/off
 - hotspot SSID (password entered once, stored in Keychain), `nudgeThreshold`
 - tmux targets
-- launch at login (`SMAppService.mainApp`)
+- launch at login (`SMAppService.mainApp`). macOS ties the login item to
+  the bundle's signature and location, and `install.sh` ad-hoc signs a
+  fresh bundle on every run, so at launch, when the flag is on and
+  `SMAppService.mainApp.status` is anything but enabled, the app registers
+  again and logs the outcome. The Settings switch shows the status macOS
+  reports, not the flag; a registration waiting for approval shows a note
+  with a button that opens System Settings > General > Login Items, and a
+  register or unregister that throws shows its error under the switch.
+  The flag is persisted only when macOS accepted the change (including
+  one that still waits for approval). With the flag off nothing is
+  registered or unregistered at launch.
 
 ### 11. Menu bar UI: inline time entry
 

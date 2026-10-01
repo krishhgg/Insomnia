@@ -22,6 +22,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let status: any StatusSource
     let secrets: any HotspotSecretStore
     let locationPermission: LocationPermission
+    let loginItem = LoginItem()
     private var statusItem: StatusItemController?
     private var settingsWindow: SettingsWindow?
     private var terminating = false
@@ -47,12 +48,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // No Dock icon even when run from `swift run` (the bundle has LSUIElement).
         NSApp.setActivationPolicy(.accessory)
         Log.info("launched")
-        let settings = SettingsWindow { [manager, secrets, locationPermission] in
+        // The login item is tied to the bundle's signature, which install.sh
+        // renews on every run: register again if the flag is on and macOS
+        // no longer reports it enabled.
+        loginItem.healAtLaunch(wanted: manager.config.launchAtLogin)
+        let settings = SettingsWindow { [manager, secrets, locationPermission, loginItem] in
             AnyView(
                 SettingsView(
                     manager: manager,
                     secrets: secrets,
-                    locationPermission: locationPermission
+                    locationPermission: locationPermission,
+                    loginItem: loginItem
                 )
             )
         }
