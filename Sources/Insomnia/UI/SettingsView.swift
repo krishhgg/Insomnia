@@ -165,6 +165,10 @@ struct SettingsView: View {
                 add: { id in update { if !$0.agentList.contains(id) { $0.agentList.append(id) } } },
                 remove: { id in update { $0.agentList.removeAll { $0 == id } } }
             )
+            Toggle("Turn App Nap off for these apps during a session", isOn: bind(\.disableAppNapForAgents))
+            Text("Writes NSAppSleepDisabled = YES into each listed app's preferences when a session starts and puts the previous value back when it ends.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
         } header: {
             Text("Agent apps")
         } footer: {

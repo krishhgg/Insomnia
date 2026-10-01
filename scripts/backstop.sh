@@ -39,6 +39,13 @@
 #                              and keyboard backlight the app set to 0 on lid
 #                              close; only the app can restore these (private
 #                              frameworks). Kept for the app's reconcile.
+#       appNapOverrides     -> NSAppSleepDisabled the app set to YES in an
+#                              agent app's preferences, with the value it had
+#                              before: defaults write <bundleId>
+#                              NSAppSleepDisabled -bool <previous>, or
+#                              defaults delete <bundleId> NSAppSleepDisabled
+#                              when the key was absent. A delete that fails
+#                              because the key is already gone counts as done.
 #     A flag is cleared only after its undo succeeded. Unknown keys survive.
 #     Exit 0 only when the journal is clean afterwards; otherwise exit 1 so
 #     the failure is visible and the next periodic run retries.
@@ -64,9 +71,10 @@ LOCKF=/usr/bin/lockf
 PS=/bin/ps
 KILL=/bin/kill
 SYSCTL=/usr/sbin/sysctl
+DEFAULTS=/usr/bin/defaults
 LOCK_TIMEOUT_SECONDS=10
-# Longest a single undo command (sudo pmset) may run before it is sent
-# SIGTERM, and how long it then gets to exit before this run fails closed.
+# Longest a single undo command (sudo pmset, defaults) may run before it is
+# sent SIGTERM, and how long it then gets to exit before this run fails closed.
 COMMAND_TIMEOUT_SECONDS=30
 KILL_GRACE_SECONDS=3
 
@@ -262,6 +270,24 @@ journal_shape_problems() { # file
       done
     fi
   fi
+  t="$(type_of "$f" appNapOverrides)"
+  if [[ -n "$t" && "$t" != "(any)" ]]; then
+    if [[ "$t" != array ]]; then
+      echo "appNapOverrides is a $t, not an array"
+    else
+      i=0
+      while [[ -n "$(type_of "$f" "appNapOverrides.$i")" ]]; do
+        if [[ "$(type_of "$f" "appNapOverrides.$i")" != dictionary ]]; then
+          echo "appNapOverrides[$i] is not an object"
+        else
+          [[ "$(type_of "$f" "appNapOverrides.$i.bundleId")" == string ]] || echo "appNapOverrides[$i].bundleId is not a string"
+          t="$(type_of "$f" "appNapOverrides.$i.previous")"
+          [[ -z "$t" || "$t" == bool || "$t" == "(any)" ]] || echo "appNapOverrides[$i].previous is a $t, not a bool"
+        fi
+        i=$((i + 1))
+      done
+    fi
+  fi
 }
 
 # --- Read the session --------------------------------------------------------
@@ -307,7 +333,7 @@ fi
 
 sleep_held=false; low_power=false; docker_frozen=false; has_audio=0
 has_display=0; has_keyboard=0
-frozen_count=0; legacy_count=0
+frozen_count=0; legacy_count=0; app_nap_count=0
 if [[ "$journal_state" == clean ]]; then
   is_true "$STATE" sleepDisabledByUs && sleep_held=true
   is_true "$STATE" lowPowerSetByUs && low_power=true
@@ -322,8 +348,11 @@ if [[ "$journal_state" == clean ]]; then
   while extract "$STATE" "frozenPids.$legacy_count" >/dev/null; do
     legacy_count=$((legacy_count + 1))
   done
+  while extract_json "$STATE" "appNapOverrides.$app_nap_count" >/dev/null; do
+    app_nap_count=$((app_nap_count + 1))
+  done
   if [[ "$sleep_held" == true || "$low_power" == true || "$docker_frozen" == true ]] \
-     || (( has_audio == 1 || has_display == 1 || has_keyboard == 1 || frozen_count > 0 || legacy_count > 0 )); then
+     || (( has_audio == 1 || has_display == 1 || has_keyboard == 1 || frozen_count > 0 || legacy_count > 0 || app_nap_count > 0 )); then
     journal_state=dirty
   fi
 fi
@@ -478,6 +507,61 @@ if [[ "$docker_frozen" == true ]] && (( kept_frozen_count == 0 && legacy_count =
   new_docker=false; changed=1
 fi
 
+# App Nap. The app set NSAppSleepDisabled to YES in each listed agent app's
+# preferences and journaled what the key was before. Put that back with the
+# tool a person would use. Each entry is kept verbatim (unknown fields
+# included) unless its restore succeeded.
+kept_app_nap=""
+kept_app_nap_count=0
+keep_app_nap_entry() { # index
+  local entry
+  entry="$(extract_json "$STATE" "appNapOverrides.$1")"
+  if [[ -n "$kept_app_nap" ]]; then kept_app_nap="$kept_app_nap,$entry"; else kept_app_nap="$entry"; fi
+  kept_app_nap_count=$((kept_app_nap_count + 1))
+}
+if (( app_nap_count > 0 )); then
+  i=0
+  while (( i < app_nap_count )); do
+    bundle="$(extract "$STATE" "appNapOverrides.$i.bundleId" || true)"
+    previous="$(extract "$STATE" "appNapOverrides.$i.previous" || true)"
+    if [[ -z "$bundle" || "$bundle" == -* ]]; then
+      log error "App Nap entry $i has no usable bundle id (${bundle:-?}); kept, nothing written"
+      failures+=("App Nap entry $i has no usable bundle id")
+      keep_app_nap_entry "$i"
+    elif [[ "$previous" == true || "$previous" == false ]]; then
+      if run_bounded "$DEFAULTS" write "$bundle" NSAppSleepDisabled -bool "$previous"; then
+        log info "defaults write $bundle NSAppSleepDisabled -bool $previous ok"
+        changed=1
+      else
+        if (( command_alive )); then stop_transaction "defaults write $bundle NSAppSleepDisabled"; fi
+        log error "defaults write $bundle NSAppSleepDisabled -bool $previous failed; keeping journal entry for retry"
+        failures+=("App Nap is still off for $bundle: defaults write failed")
+        keep_app_nap_entry "$i"
+      fi
+    else
+      # The key was absent before, so it goes. `defaults delete` fails when
+      # the key is already gone, which is the wanted state: a failed delete
+      # counts as a failure only if a read still finds the key.
+      if run_bounded "$DEFAULTS" delete "$bundle" NSAppSleepDisabled; then
+        log info "defaults delete $bundle NSAppSleepDisabled ok"
+        changed=1
+      else
+        if (( command_alive )); then stop_transaction "defaults delete $bundle NSAppSleepDisabled"; fi
+        if run_bounded "$DEFAULTS" read "$bundle" NSAppSleepDisabled; then
+          log error "defaults delete $bundle NSAppSleepDisabled failed and the key is still set; keeping journal entry for retry"
+          failures+=("App Nap is still off for $bundle: defaults delete failed")
+          keep_app_nap_entry "$i"
+        else
+          if (( command_alive )); then stop_transaction "defaults read $bundle NSAppSleepDisabled"; fi
+          log info "defaults delete $bundle NSAppSleepDisabled: the key is already absent"
+          changed=1
+        fi
+      fi
+    fi
+    i=$((i + 1))
+  done
+fi
+
 # Display brightness and keyboard backlight are set through private
 # frameworks the shell has no access to; the keys stay for the app's reconcile.
 if (( has_audio == 1 || has_display == 1 || has_keyboard == 1 )); then
@@ -507,6 +591,9 @@ if (( changed == 1 )); then
   fi
   if (( publish_ok == 1 && frozen_count > 0 )); then
     "$PLUTIL" -replace frozenProcesses -json "[$kept_frozen]" "$tmp" >/dev/null 2>&1 || publish_ok=0
+  fi
+  if (( publish_ok == 1 && app_nap_count > 0 )); then
+    "$PLUTIL" -replace appNapOverrides -json "[$kept_app_nap]" "$tmp" >/dev/null 2>&1 || publish_ok=0
   fi
   if (( publish_ok == 1 )); then
     # plutil keeps JSON files as JSON; make sure the result is still one.

@@ -15,7 +15,10 @@ The installer grants the user account passwordless access to four exact pmset
 commands listed in the README. This grant is not exclusive to the Insomnia app:
 other processes running as that user can invoke them too. The app is not
 sandboxed; local logs can contain SSIDs, process metadata, and tmux target names.
-Hotspot passwords are stored in the login Keychain.
+Hotspot passwords are stored in the login Keychain. With the App Nap setting
+on (off by default), the app writes `NSAppSleepDisabled` into the preferences
+of each app on the agent list, after recording the previous value in its
+journal, and puts it back at session end.
 
 Passing automated checks or a secret scan does not establish the absence of
 vulnerabilities. Do not probe recovery by disrupting someone else's processes,

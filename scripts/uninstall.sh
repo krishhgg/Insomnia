@@ -38,6 +38,7 @@ LAUNCHCTL=/bin/launchctl
 SUDO=/usr/bin/sudo
 PLUTIL=/usr/bin/plutil
 LOCKF=/usr/bin/lockf
+DEFAULTS=/usr/bin/defaults
 LOCK_TIMEOUT_SECONDS=10
 # How long to wait for the app to exit after asking it to quit.
 QUIT_WAIT_SECONDS=10
@@ -59,6 +60,7 @@ LABEL="com.insomnia.backstop"
 PLIST="$LAUNCH_AGENTS/$LABEL.plist"
 SESSION="$APP_SUPPORT/session.json"
 STATE="$APP_SUPPORT/state.json"
+CONFIG="$APP_SUPPORT/config.json"
 LOCK="$APP_SUPPORT/.recovery.lock"
 UID_NUM="$(id -u)"
 
@@ -128,6 +130,24 @@ journal_shape_problems() { # file
       done
     fi
   fi
+  t="$(type_of "$f" appNapOverrides)"
+  if [[ -n "$t" && "$t" != "(any)" ]]; then
+    if [[ "$t" != array ]]; then
+      echo "appNapOverrides is a $t, not an array"
+    else
+      i=0
+      while [[ -n "$(type_of "$f" "appNapOverrides.$i")" ]]; do
+        if [[ "$(type_of "$f" "appNapOverrides.$i")" != dictionary ]]; then
+          echo "appNapOverrides[$i] is not an object"
+        else
+          [[ "$(type_of "$f" "appNapOverrides.$i.bundleId")" == string ]] || echo "appNapOverrides[$i].bundleId is not a string"
+          t="$(type_of "$f" "appNapOverrides.$i.previous")"
+          [[ -z "$t" || "$t" == bool || "$t" == "(any)" ]] || echo "appNapOverrides[$i].previous is a $t, not a bool"
+        fi
+        i=$((i + 1))
+      done
+    fi
+  fi
 }
 
 # Independent check of the journal: prints one line per unresolved item.
@@ -170,6 +190,36 @@ journal_problems() {
   if extract "$STATE" savedKeyboardBrightness >/dev/null; then
     echo "saved keyboard backlight is not restored; only the app can do that"
   fi
+  value="$(extract_json "$STATE" appNapOverrides || true)"
+  if [[ -n "$value" && "$value" != "[]" ]]; then
+    echo "App Nap settings (NSAppSleepDisabled) are not put back: $value"
+  fi
+}
+
+# Agent apps whose NSAppSleepDisabled is YES with no journal entry: set by a
+# build that did not record the previous value, or by the user. Nothing is
+# known to put back, so nothing is changed; the exact command to undo each
+# one is printed instead. The list comes from config.json's agentList; an
+# install that never launched the app has no config.json and wrote nothing.
+list_unrecorded_app_nap() {
+  [[ -f "$CONFIG" ]] || return 0
+  local i=0 id value found=0
+  while id="$(extract "$CONFIG" "agentList.$i")"; do
+    i=$((i + 1))
+    [[ -n "$id" && "$id" != -* ]] || continue
+    value="$("$DEFAULTS" read "$id" NSAppSleepDisabled 2>/dev/null || true)"
+    [[ "$value" == 1 ]] || continue
+    if (( found == 0 )); then
+      found=1
+      cat <<MSG
+NSAppSleepDisabled is YES for these agent apps and Insomnia has no record of
+what it was before (an older build set it without recording). They are left
+as they are. To turn App Nap back on for one, run:
+MSG
+    fi
+    printf '  defaults delete %s NSAppSleepDisabled\n' "$id"
+  done
+  (( found == 1 )) || echo "none left behind"
 }
 
 abort_incomplete() { # backstop exit status, problem lines...
@@ -196,6 +246,9 @@ What to do, then rerun this script:
   - Frozen or legacy pids: open Insomnia.app to resolve them, or inspect each
     with 'ps -o pid,stat,lstart,command -p <pid>' and 'kill -CONT <pid>' it
     yourself if it is a process you recognise.
+  - App Nap (NSAppSleepDisabled): the recovery agent retries 'defaults write'
+    or 'defaults delete' every minute, and Insomnia.app restores them at
+    launch. If 'defaults' keeps failing, see the log.
   - Unreadable journal or session file: open Insomnia.app, or repair the file.
   - Log: $LOG_DIR/insomnia.log
 MSG
@@ -270,6 +323,9 @@ if app_running; then
   echo "Insomnia started again; quit it and rerun. Nothing was removed." >&2
   exit 1
 fi
+
+step "Checking App Nap settings of agent apps"
+list_unrecorded_app_nap
 
 # 5. Remove, still under the lock -------------------------------------------
 # bootout first: it stops a running instance of the agent and drops queued

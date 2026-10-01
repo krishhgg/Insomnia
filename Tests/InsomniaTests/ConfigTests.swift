@@ -22,6 +22,7 @@ final class ConfigTests: XCTestCase {
         XCTAssertTrue(c.freezeAllApps)
         XCTAssertTrue(c.lowPowerOnLidClose)
         XCTAssertTrue(c.thermalRules)
+        XCTAssertFalse(c.disableAppNapForAgents, "writing other apps' preferences is opt-in")
         XCTAssertEqual(c.hotspotSSID, "")
         XCTAssertEqual(c.tmuxTargets, [])
         XCTAssertFalse(c.launchAtLogin)
@@ -76,6 +77,21 @@ final class ConfigTests: XCTestCase {
         XCTAssertEqual(off, expected)
         let data = try Store.makeEncoder().encode(off)
         XCTAssertEqual(try Store.makeDecoder().decode(Config.self, from: data), off)
+    }
+
+    /// A config.json written before the App Nap opt-in existed keeps the
+    /// default (off); an explicit true is honoured and round-trips.
+    func testDisableAppNapDecodesTolerantlyAndDefaultsOff() throws {
+        let legacy = try Store.makeDecoder().decode(Config.self, from: Data(#"{"agentList": ["com.google.Chrome"]}"#.utf8))
+        XCTAssertFalse(legacy.disableAppNapForAgents)
+        XCTAssertEqual(legacy.agentList, ["com.google.Chrome"])
+        let on = try Store.makeDecoder().decode(Config.self, from: Data(#"{"disableAppNapForAgents": true}"#.utf8))
+        XCTAssertTrue(on.disableAppNapForAgents)
+        var expected = Config()
+        expected.disableAppNapForAgents = true
+        XCTAssertEqual(on, expected)
+        let data = try Store.makeEncoder().encode(on)
+        XCTAssertEqual(try Store.makeDecoder().decode(Config.self, from: data), on)
     }
 
     /// Cheap typo guard for the shipped defaults: no duplicates, and every

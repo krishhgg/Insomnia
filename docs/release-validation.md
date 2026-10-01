@@ -120,6 +120,7 @@ is performed. Do not replace "not run" with "passed" based on source review.
 | Freeze-all scope with agents running (Cursor/T3 Code/Claude untouched) | Not run |
 | Simulated lid close/open via scripts/simulate-lid.sh | Not run |
 | Existing Low Power Mode preference and saved audio restoration | Not run |
+| App Nap opt-in: previous `NSAppSleepDisabled` put back at session end, by the backstop after a force-quit, and by uninstall | Not run |
 | Docker Desktop idle/busy behavior with another Docker context selected | Not run |
 | Hotspot permission, association, cancellation, and reconnect | Not run |
 | tmux cancellation with a dedicated disposable pane | Not run |

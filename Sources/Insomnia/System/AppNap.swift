@@ -2,27 +2,66 @@ import CoreFoundation
 import Foundation
 
 /// Spec section 5: `NSAppSleepDisabled = YES` for every agent app so App Nap
-/// never throttles it. Written to each app's own preferences domain, exactly
-/// like `defaults write <bundle> NSAppSleepDisabled -bool YES`. Persistent
-/// by design; never unset (spec open decisions).
+/// never throttles it, written to each app's own preferences domain exactly
+/// like `defaults write <bundle> NSAppSleepDisabled -bool YES`.
+///
+/// Opt-in (`Config.disableAppNapForAgents`, off by default): with it off
+/// Insomnia never writes another app's preferences. With it on, the value
+/// the key had before (absent, true or false) is journaled in state.json
+/// (`RuntimeState.appNapOverrides`) before the write, and put back at
+/// session end, at reconcile, or by backstop.sh with `defaults write` /
+/// `defaults delete`, so nothing is left behind after a crash, a force-quit
+/// or an uninstall. `SessionManager` owns that ordering; this file is only
+/// the preference access, injected so tests never touch real preferences.
+protocol AppNapPreferencing: Sendable {
+    /// `NSAppSleepDisabled` in the app's current-user, any-host domain, the
+    /// one `defaults write <bundle>` and `writeSleepDisabled` use. nil when
+    /// the key is absent. Throws when the value is not a boolean, so a
+    /// value that cannot be put back exactly is never overwritten.
+    func readSleepDisabled(bundleId: String) throws -> Bool?
+    /// Sets the key to `value`, or removes it when nil, and persists it.
+    func writeSleepDisabled(_ value: Bool?, bundleId: String) throws
+}
+
+struct AppNapError: Error, LocalizedError, Sendable {
+    let bundleId: String
+    let detail: String
+
+    var errorDescription: String? { "\(AppNap.key) for \(bundleId) \(detail)" }
+}
+
 enum AppNap {
     static let key = "NSAppSleepDisabled"
+}
 
-    @discardableResult
-    static func disable(for bundleIds: [String]) -> [String] {
-        var done: [String] = []
-        for id in bundleIds where !id.isEmpty {
-            let app = id as CFString
-            CFPreferencesSetAppValue(key as CFString, kCFBooleanTrue, app)
-            if CFPreferencesAppSynchronize(app) {
-                done.append(id)
-            } else {
-                Log.error("app nap: could not write \(key) for \(id)")
-            }
+/// CFPreferences on the app's own domain.
+struct CFAppNapPreferences: AppNapPreferencing {
+    func readSleepDisabled(bundleId: String) throws -> Bool? {
+        guard let value = CFPreferencesCopyValue(AppNap.key as CFString, bundleId as CFString, kCFPreferencesCurrentUser, kCFPreferencesAnyHost) else {
+            return nil
         }
-        if !done.isEmpty {
-            Log.info("app nap disabled for \(done.count) app(s)")
+        // `defaults write -bool` stores a CFBoolean and `-int 1` a CFNumber;
+        // both bridge to NSNumber. Anything else (a string "YES", say) is
+        // not ours to rewrite.
+        guard let number = value as? NSNumber else {
+            throw AppNapError(bundleId: bundleId, detail: "is not a boolean; left alone")
         }
-        return done
+        return number.boolValue
     }
+
+    func writeSleepDisabled(_ value: Bool?, bundleId: String) throws {
+        let app = bundleId as CFString
+        let cfValue: CFBoolean? = value.map { $0 ? kCFBooleanTrue : kCFBooleanFalse }
+        CFPreferencesSetValue(AppNap.key as CFString, cfValue, app, kCFPreferencesCurrentUser, kCFPreferencesAnyHost)
+        guard CFPreferencesSynchronize(app, kCFPreferencesCurrentUser, kCFPreferencesAnyHost) else {
+            throw AppNapError(bundleId: bundleId, detail: "could not be written")
+        }
+    }
+}
+
+/// Reads nothing and writes nothing. The default for every wiring that does
+/// not pass the real one, so no test can reach another app's preferences.
+struct NoopAppNapPreferences: AppNapPreferencing {
+    func readSleepDisabled(bundleId: String) throws -> Bool? { nil }
+    func writeSleepDisabled(_ value: Bool?, bundleId: String) throws {}
 }
