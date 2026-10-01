@@ -24,7 +24,23 @@ final class ConfigTests: XCTestCase {
         XCTAssertTrue(c.thermalRules)
         XCTAssertEqual(c.hotspotSSID, "")
         XCTAssertEqual(c.tmuxTargets, [])
+        XCTAssertFalse(c.tmuxNudgePressesEnter)
         XCTAssertFalse(c.launchAtLogin)
+    }
+
+    /// Enter after `continue` is opt-in: a config.json written before the
+    /// key existed, or without it, keeps it off; an explicit true is honoured.
+    func testTmuxNudgePressesEnterDecodesAndDefaultsOff() throws {
+        let legacy = try Store.makeDecoder().decode(Config.self, from: Data(#"{"tmuxTargets": ["agents:0.0"]}"#.utf8))
+        XCTAssertFalse(legacy.tmuxNudgePressesEnter)
+        XCTAssertEqual(legacy.tmuxTargets, ["agents:0.0"])
+        let on = try Store.makeDecoder().decode(Config.self, from: Data(#"{"tmuxNudgePressesEnter": true}"#.utf8))
+        XCTAssertTrue(on.tmuxNudgePressesEnter)
+        var expected = Config()
+        expected.tmuxNudgePressesEnter = true
+        XCTAssertEqual(on, expected)
+        let data = try Store.makeEncoder().encode(on)
+        XCTAssertEqual(try Store.makeDecoder().decode(Config.self, from: data), on)
     }
 
     func testPartialJSONFillsDefaults() throws {
