@@ -587,7 +587,10 @@ that any case passed; record results in the release validation record.
     `INSOMNIA_LID_SIMULATION=1 ./scripts/install.sh`; it logs "Lid
     simulation build" at launch). A normal install ignores the trigger:
     the watcher is compiled out so a file written by any other program
-    running as the user cannot replay the lid actions.
+    running as the user cannot replay the lid actions. CI proves that on
+    the binaries: `scripts/check-lid-simulation-gate.sh` builds the release
+    both ways and checks the watcher class and its log lines are absent
+    from the plain binary and present with the define.
     Quit while closed → both restored. Force-quit while closed, reopen the app
     → restored at reconcile, and `backstop.sh` alone leaves both keys in place.
 
