@@ -284,6 +284,8 @@ provided by the standalone backstop. Performance effects depend on workload.
   test plan below.
 - Each outage is logged with start, end, and gap length to
   `~/Library/Logs/Insomnia/handoffs.log`. The menu shows the last gap.
+  Like `insomnia.log`, the file is owner-only (0600) and is renamed to
+  `handoffs.log.1` once it passes 1 MiB (`OwnerOnly.swift`).
 - Path satisfied again after a gap longer than `nudgeThreshold` (default 90 s):
   - For every tagged tmux target (`session:window.pane`), run
     `tmux send-keys -t <target> "continue" Enter`.
@@ -335,7 +337,9 @@ recovered (with nudge summary), sleep restored by backstop.
 ### 10. Settings
 
 JSON at `~/Library/Application Support/Insomnia/config.json`, edited through a
-small settings window:
+small settings window. Like `session.json`, `state.json` and the recovery
+lock it is created mode 0600 in a 0700 directory, and a looser file from an
+older build is tightened when the app reads it:
 
 - presets, default preset
 - freeze list (bundle ids), freeze every other app on/off, Docker rule

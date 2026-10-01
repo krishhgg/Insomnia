@@ -462,12 +462,15 @@ final class RecoveryScriptTests: XCTestCase {
     func testUninstallPurgeRemovesOwnedFilesAndEmptyDirectoriesOnly() throws {
         try fx.installMachinery()
         try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
-        try "handoffs\n".write(to: fx.home.appendingPathComponent("Logs/handoffs.log"), atomically: true, encoding: .utf8)
+        for rotated in ["Logs/handoffs.log", "Logs/insomnia.log.1", "Logs/handoffs.log.1"] {
+            try "older lines\n".write(to: fx.home.appendingPathComponent(rotated), atomically: true, encoding: .utf8)
+        }
 
         let r = try fx.run(fx.uninstall, ["--purge"])
 
         XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
         for gone in [fx.state, fx.config, fx.logFile, fx.home.appendingPathComponent("Logs/handoffs.log"),
+                     fx.home.appendingPathComponent("Logs/insomnia.log.1"), fx.home.appendingPathComponent("Logs/handoffs.log.1"),
                      fx.installedBackstop, fx.plist, fx.app, fx.sudoers] {
             XCTAssertFalse(fx.exists(gone), gone.path)
         }
@@ -506,6 +509,27 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(fx.exists(fx.lock))
         XCTAssertFalse(fx.exists(fx.plist))
         XCTAssertTrue(r.stdout.contains("Kept \(fx.home.appendingPathComponent("Logs").path)"), r.stdout)
+    }
+
+    // MARK: - Owner-only files
+
+    /// `umask 077`: the log and its directory, the lock file and the
+    /// republished journal are owner-only even when the journal the run
+    /// started from was world-readable.
+    func testBackstopCreatesOwnerOnlyFilesAndRepublishesTheJournalOwnerOnly() throws {
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: fx.state.path)
+        XCTAssertFalse(fx.exists(fx.lock), "the fixture starts without a lock file")
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 0, r.stderr)
+        XCTAssertEqual(try fx.mode(fx.logFile), 0o600)
+        XCTAssertEqual(try fx.mode(fx.logFile.deletingLastPathComponent()), 0o700)
+        XCTAssertEqual(try fx.mode(fx.lock), 0o600)
+        XCTAssertEqual(try fx.mode(fx.state), 0o600, "the published journal must not inherit 0644 from the old one")
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, false)
     }
 
     // MARK: - Journal shape (typed corruption)
@@ -1852,6 +1876,13 @@ private final class ScriptFixture {
             "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
             "INSOMNIA_HOME": home.path,
         ]
+    }
+
+    /// POSIX mode bits of a file or directory.
+    func mode(_ url: URL) throws -> Int {
+        let attrs = try fm.attributesOfItem(atPath: url.path)
+        guard let m = attrs[.posixPermissions] as? Int else { throw FixtureError("no mode for \(url.path)") }
+        return m
     }
 
     /// Inode of a file, to prove the lock file was retained rather than replaced.

@@ -126,6 +126,7 @@ is performed. Do not replace "not run" with "passed" based on source review.
 | Headed-browser throttling with the lid closed | Not run |
 | Battery/thermal event behavior on supported hardware | Not run |
 | Install/upgrade/uninstall with recoverable failure conditions | Not run |
+| First launch over an existing install tightens Application Support/Insomnia and Logs/Insomnia to 0700 and their files to 0600 | Not run |
 
 Hardware tests must be supervised and must not endanger active user work. Use
 a stable, ventilated surface, not an enclosure. Do not intentionally overheat a

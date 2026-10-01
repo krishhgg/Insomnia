@@ -62,7 +62,7 @@ four power-setting commands. Review that permission before installing.
 | `~/Applications/Insomnia.app` | The menu bar app |
 | `~/Library/Application Support/Insomnia/` | Configuration, session/recovery journals, and `backstop.sh` |
 | `~/Library/LaunchAgents/com.insomnia.backstop.plist` | Per-user recovery agent |
-| `~/Library/Logs/Insomnia/` | `insomnia.log` and `handoffs.log` |
+| `~/Library/Logs/Insomnia/` | `insomnia.log` and `handoffs.log`, each capped at 1 MiB with one older copy kept as `.1` |
 | `/etc/sudoers.d/insomnia` | Permission for the four commands below |
 
 ```text
@@ -242,6 +242,11 @@ Configuration lives in `~/Library/Application Support/Insomnia/config.json`.
 Use Settings for the app's controls; [Config.swift](Sources/Insomnia/Model/Config.swift)
 defines the full configuration and defaults. Local logs can contain SSIDs,
 process metadata, and tmux targets. Check them before sharing publicly.
+Every file Insomnia creates is owner-only (mode 0600, its two directories
+0700), and a file left looser by an older build is tightened the next time
+the app opens it. `insomnia.log` and `handoffs.log` are capped at 1 MiB: a
+log past the cap is renamed to `insomnia.log.1` or `handoffs.log.1`,
+replacing the previous copy, and a new file starts.
 
 `INSOMNIA_HOME` relocates app support files, logs, and LaunchAgents for testing.
 It is **not an installation sandbox**: installation/removal also involves the

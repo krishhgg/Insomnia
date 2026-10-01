@@ -15,7 +15,10 @@ The installer grants the user account passwordless access to four exact pmset
 commands listed in the README. This grant is not exclusive to the Insomnia app:
 other processes running as that user can invoke them too. The app is not
 sandboxed; local logs can contain SSIDs, process metadata, and tmux target names.
-Hotspot passwords are stored in the login Keychain.
+The files Insomnia creates (logs, journal, session, config, recovery lock) are
+mode 0600 and its directories 0700; the backstop runs with `umask 077`. Logs
+are capped at 1 MiB with one older copy kept. Hotspot passwords are stored in
+the login Keychain.
 
 Passing automated checks or a secret scan does not establish the absence of
 vulnerabilities. Do not probe recovery by disrupting someone else's processes,

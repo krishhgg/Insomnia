@@ -54,6 +54,9 @@
 # Honours INSOMNIA_HOME with the same layout as the app (see Paths.swift).
 set -euo pipefail
 export LC_ALL=C TZ=UTC
+# Everything this run creates (log lines, the lock file, the published
+# journal, the directories) is owner-only, like the files the app writes.
+umask 077
 
 # Fixed tool paths: never taken from PATH or the environment. Tests patch
 # these lines in a private copy of the script.

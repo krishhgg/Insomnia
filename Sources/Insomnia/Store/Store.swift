@@ -3,6 +3,9 @@ import Foundation
 /// Atomic JSON persistence for the three files Insomnia keeps on disk.
 /// Writes go to a temp file in the same directory and are renamed into place
 /// so a crash mid-write can never leave a truncated session or state file.
+/// The temp file is created mode 0600, so the published file is owner-only
+/// from its first byte; a file written by an older build is tightened when
+/// it is read.
 struct Store: Sendable {
     let paths: Paths
 
@@ -31,6 +34,7 @@ struct Store: Sendable {
     /// undecodable content.
     func read<T: Decodable>(_ type: T.Type, from url: URL) throws -> T? {
         guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        OwnerOnly.tighten(path: url.path)
         let data = try Data(contentsOf: url)
         return try Store.makeDecoder().decode(T.self, from: data)
     }
@@ -39,9 +43,14 @@ struct Store: Sendable {
     func write<T: Encodable>(_ value: T, to url: URL) throws {
         let data = try Store.makeEncoder().encode(value)
         let dir = url.deletingLastPathComponent()
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try OwnerOnly.createDirectory(dir)
         let tmp = dir.appendingPathComponent(".\(url.lastPathComponent).tmp-\(UUID().uuidString)")
-        try data.write(to: tmp, options: [])
+        do {
+            try OwnerOnly.createFile(at: tmp, contents: data)
+        } catch {
+            try? FileManager.default.removeItem(at: tmp)
+            throw error
+        }
         if rename(tmp.path, url.path) != 0 {
             let err = errno
             try? FileManager.default.removeItem(at: tmp)

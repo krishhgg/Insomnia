@@ -305,7 +305,8 @@ rm -rf "$APP"
 if (( PURGE == 1 )); then
   step "Purging Insomnia's files in $APP_SUPPORT and $LOG_DIR"
   rm -f "$SESSION" "$STATE" "$APP_SUPPORT/config.json" "$APP_SUPPORT/backstop.sh" \
-        "$LOG_DIR/insomnia.log" "$LOG_DIR/handoffs.log"
+        "$LOG_DIR/insomnia.log" "$LOG_DIR/insomnia.log.1" \
+        "$LOG_DIR/handoffs.log" "$LOG_DIR/handoffs.log.1"
   # The lock file itself is kept, even on purge: this process still holds
   # it, and anything that opened it a moment ago (a queued agent run, an app
   # launched after the check above) waits on this inode. Unlinking it would
