@@ -279,4 +279,101 @@ final class ReconcileTests: XCTestCase {
         XCTAssertNil(try real.store.loadSession())
         XCTAssertEqual(real.guardFake.calls.last, "disablesleep 0")
     }
+
+    // MARK: Unreadable session.json
+
+    private var movedAsideSessions: [String] {
+        get throws {
+            try FileManager.default.contentsOfDirectory(atPath: h.home.paths.appSupport.path)
+                .filter { $0.hasPrefix(Paths.unreadableSessionPrefix) }.sorted()
+        }
+    }
+
+    /// A session.json that is not a session says nothing about what to undo
+    /// (the journal does). It is renamed to a timestamped sibling under the
+    /// lock, the user is told where, and reconcile goes on as with no
+    /// session: the pmset check still runs.
+    func testUnreadableSessionIsMovedAsideAndReported() async throws {
+        let bytes = Data("not json".utf8)
+        try bytes.write(to: h.home.paths.sessionFile)
+        try h.store.saveState(RuntimeState())
+
+        let m = h.makeManager()
+        await m.reconcile()
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: h.home.paths.sessionFile.path), "session.json left in place")
+        XCTAssertEqual(try movedAsideSessions, ["session.json.unreadable-20270115T080000Z"])
+        let moved = h.home.paths.appSupport.appendingPathComponent("session.json.unreadable-20270115T080000Z")
+        XCTAssertEqual(try Data(contentsOf: moved), bytes, "the bytes are kept as they were")
+        XCTAssertNil(m.session)
+        XCTAssertEqual(h.guardFake.calls, ["pmset -g"])
+        let posts = h.notifier.posts.filter { $0.title == SessionManager.sessionFileTitle }
+        XCTAssertEqual(posts.count, 1, "\(h.notifier.posts)")
+        XCTAssertTrue(posts.first?.body.contains(moved.path) == true, posts.first?.body ?? "")
+        XCTAssertNil(m.lastError)
+
+        // Next launch: no session file, nothing new moved, no second notice.
+        await m.reconcile()
+        XCTAssertEqual(try movedAsideSessions, ["session.json.unreadable-20270115T080000Z"])
+        XCTAssertEqual(h.notifier.posts.filter { $0.title == SessionManager.sessionFileTitle }.count, 1)
+    }
+
+    /// With a dirty journal the file is moved aside first, then the journal
+    /// is restored exactly as it would be with no session file.
+    func testUnreadableSessionWithDirtyJournalIsMovedAsideAndJournalRestored() async throws {
+        try Data("{\"endsAt\": 12}".utf8).write(to: h.home.paths.sessionFile)
+        var st = RuntimeState()
+        st.sleepDisabledByUs = true
+        try h.store.saveState(st)
+        h.guardFake.sleepDisabled = true
+
+        let m = h.makeManager()
+        await m.reconcile()
+
+        XCTAssertEqual(try movedAsideSessions, ["session.json.unreadable-20270115T080000Z"])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: h.home.paths.sessionFile.path))
+        XCTAssertTrue(h.guardFake.calls.contains("disablesleep 0"), "\(h.guardFake.calls)")
+        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
+        XCTAssertFalse(h.guardFake.sleepDisabled)
+        XCTAssertEqual(h.notifier.posts.filter { $0.title == SessionManager.sessionFileTitle }.count, 1)
+    }
+
+    /// An earlier moved-aside file with the same stamp is never overwritten;
+    /// the new one gets a -1 suffix.
+    func testUnreadableSessionNeverOverwritesAnEarlierMovedAsideFile() async throws {
+        let earlier = h.home.paths.appSupport.appendingPathComponent("session.json.unreadable-20270115T080000Z")
+        try FileManager.default.createDirectory(at: h.home.paths.appSupport, withIntermediateDirectories: true)
+        try Data("earlier".utf8).write(to: earlier)
+        try Data("later".utf8).write(to: h.home.paths.sessionFile)
+
+        let m = h.makeManager()
+        await m.reconcile()
+
+        XCTAssertEqual(try movedAsideSessions, [
+            "session.json.unreadable-20270115T080000Z",
+            "session.json.unreadable-20270115T080000Z-1",
+        ])
+        XCTAssertEqual(try String(contentsOf: earlier, encoding: .utf8), "earlier")
+        let later = h.home.paths.appSupport.appendingPathComponent("session.json.unreadable-20270115T080000Z-1")
+        XCTAssertEqual(try String(contentsOf: later, encoding: .utf8), "later")
+        XCTAssertTrue(h.notifier.posts.last?.body.contains("20270115T080000Z-1") == true, h.notifier.posts.last?.body ?? "")
+    }
+
+    /// An unreadable state.json refuses every transaction, reconcile
+    /// included, so an unreadable session.json beside it is not moved
+    /// either: nothing of that pair is touched until a person looks.
+    func testUnreadableSessionStaysWhenTheJournalIsUnreadable() async throws {
+        let session = Data("not json".utf8)
+        try session.write(to: h.home.paths.sessionFile)
+        try Data("{not json".utf8).write(to: h.home.paths.stateFile)
+
+        let m = h.makeManager()
+        await m.reconcile()
+
+        XCTAssertEqual(try Data(contentsOf: h.home.paths.sessionFile), session)
+        XCTAssertEqual(try movedAsideSessions, [])
+        XCTAssertEqual(h.guardFake.calls, [])
+        XCTAssertFalse(h.notifier.posts.contains { $0.title == SessionManager.sessionFileTitle }, "\(h.notifier.posts)")
+        XCTAssertEqual(h.notifier.posts.filter { $0.title == SessionManager.journalTitle }.count, 1)
+    }
 }

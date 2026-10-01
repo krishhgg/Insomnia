@@ -12,8 +12,9 @@
 # undoable, and state.json keeps the evidence. The message says what to do.
 #
 # Deletion is by exact owned file, never by directory tree: --purge removes
-# the files Insomnia writes (see Paths.swift) and then rmdir's its own
-# directories only if they are empty. The lock file is never unlinked, so
+# the files Insomnia writes (see Paths.swift), the session.json copies the
+# app or backstop.sh moved aside (session.json.unreadable-<stamp>, only that
+# exact shape), and then rmdir's its own directories only if they are empty. The lock file is never unlinked, so
 # --purge leaves APP_SUPPORT/.recovery.lock (and therefore APP_SUPPORT).
 #
 # Honours INSOMNIA_HOME with the same layout as the app (see Paths.swift).
@@ -135,7 +136,11 @@ journal_shape_problems() { # file
 journal_problems() {
   local key value shape
   if [[ -e "$SESSION" ]]; then
-    echo "session.json is still present"
+    if extract "$SESSION" endsAt >/dev/null; then
+      echo "session.json is still present"
+    else
+      echo "session.json is still present and unreadable"
+    fi
   fi
   [[ -e "$STATE" ]] || return 0
   if ! "$PLUTIL" -convert json -o /dev/null "$STATE" >/dev/null 2>&1; then
@@ -172,6 +177,20 @@ journal_problems() {
   fi
 }
 
+# Copies of session.json that the app or backstop.sh moved aside, one path
+# per line. Only names of exactly that shape (prefix, UTC stamp, optional
+# -n); anything else in the directory is not ours to remove.
+unreadable_sessions() {
+  local f
+  for f in "$APP_SUPPORT"/session.json.unreadable-*; do
+    [[ -e "$f" ]] || continue
+    if [[ "${f##*/}" =~ ^session\.json\.unreadable-[0-9]{8}T[0-9]{6}Z(-[0-9]+)?$ ]]; then
+      echo "$f"
+    fi
+  done
+  return 0
+}
+
 abort_incomplete() { # backstop exit status, problem lines...
   local rc="$1"; shift
   cat >&2 <<MSG
@@ -196,7 +215,12 @@ What to do, then rerun this script:
   - Frozen or legacy pids: open Insomnia.app to resolve them, or inspect each
     with 'ps -o pid,stat,lstart,command -p <pid>' and 'kill -CONT <pid>' it
     yourself if it is a process you recognise.
-  - Unreadable journal or session file: open Insomnia.app, or repair the file.
+  - Unreadable state.json: neither the app nor the recovery agent repairs or
+    removes it. Repair it by hand from the log, or move it away yourself once
+    you know its changes are undone.
+  - Unreadable session.json: the recovery agent renames it to
+    session.json.unreadable-<time> as soon as the journal is clean, and the
+    app does the same at launch. It needs no action of its own.
   - Log: $LOG_DIR/insomnia.log
 MSG
   exit 1
@@ -306,6 +330,7 @@ if (( PURGE == 1 )); then
   step "Purging Insomnia's files in $APP_SUPPORT and $LOG_DIR"
   rm -f "$SESSION" "$STATE" "$APP_SUPPORT/config.json" "$APP_SUPPORT/backstop.sh" \
         "$LOG_DIR/insomnia.log" "$LOG_DIR/handoffs.log"
+  while IFS= read -r f; do rm -f "$f"; done < <(unreadable_sessions)
   # The lock file itself is kept, even on purge: this process still holds
   # it, and anything that opened it a moment ago (a queued agent run, an app
   # launched after the check above) waits on this inode. Unlinking it would
@@ -318,6 +343,11 @@ if (( PURGE == 1 )); then
 else
   rm -f "$APP_SUPPORT/backstop.sh" "$SESSION" "$STATE"
   echo "Kept $APP_SUPPORT/config.json and $LOG_DIR (use --purge to remove)."
+  kept_sessions=0
+  while IFS= read -r f; do kept_sessions=$((kept_sessions + 1)); done < <(unreadable_sessions)
+  if (( kept_sessions > 0 )); then
+    echo "Kept $kept_sessions unreadable session.json file(s) moved aside in $APP_SUPPORT (use --purge to remove)."
+  fi
 fi
 
 echo "Done."

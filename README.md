@@ -166,7 +166,11 @@ has passed. It leaves a valid, unexpired session alone.
 
 The app and backstop use the same lock so they do not restore and rewrite the
 journal over one another. Failed restoration keeps the relevant entries;
-unreadable journals are preserved instead of treated as clean.
+unreadable journals are preserved instead of treated as clean. A session file
+that cannot be read counts as expired: once the journal is clean, the app at
+launch or the agent renames it to `session.json.unreadable-<time>` beside it,
+never deleting or overwriting anything, and the app says where it went.
+`uninstall.sh --purge` removes those copies; without `--purge` they stay.
 
 **Recovery is not “everything always gets undone.”** The backstop does not
 monitor battery or temperature. Saved audio needs the app to reopen, and

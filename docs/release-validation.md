@@ -114,6 +114,7 @@ is performed. Do not replace "not run" with "passed" based on source review.
 | --- | --- |
 | Normal end, deadline expiry, and repeated Quit restore live power state | Not run for release fixes |
 | Force-quit followed by launchd deadline recovery and retry after failure | Not run |
+| Unreadable session.json moved aside by the app at launch and by the agent, then uninstall with and without --purge | Not run |
 | Reboot/login with active or dirty journals | Not run |
 | Lid-close/open and safe recovery of explicitly selected test processes | Not run |
 | Lid-close display/keyboard darkening and restore | Not run |

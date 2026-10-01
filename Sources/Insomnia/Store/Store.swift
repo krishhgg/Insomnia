@@ -57,9 +57,42 @@ struct Store: Sendable {
 
     // MARK: Typed helpers
 
-    func loadSession() throws -> Session? { try read(Session.self, from: paths.sessionFile) }
+    /// Throws StoreError.unreadable, with a one-line reason, when the file
+    /// does not decode.
+    func loadSession() throws -> Session? {
+        do {
+            return try read(Session.self, from: paths.sessionFile)
+        } catch let error as DecodingError {
+            throw StoreError.unreadable(file: paths.sessionFile.path, detail: Self.brief(error))
+        }
+    }
     func saveSession(_ s: Session) throws { try write(s, to: paths.sessionFile) }
     func deleteSession() throws { try remove(at: paths.sessionFile) }
+
+    /// Renames an unreadable session.json to a timestamped sibling (see
+    /// Paths.unreadableSessionPrefix) and returns the new location. The
+    /// bytes are kept for inspection; the next reader sees no session.
+    /// Never overwrites: a taken name gets -1, -2, ..., and the rename
+    /// itself fails rather than replace a file that appeared meanwhile.
+    func moveAsideUnreadableSession(now: Date) throws -> URL {
+        let base = Paths.unreadableSessionPrefix + Self.stamp(now)
+        var dest = paths.appSupport.appendingPathComponent(base)
+        var n = 0
+        while FileManager.default.fileExists(atPath: dest.path) {
+            n += 1
+            dest = paths.appSupport.appendingPathComponent("\(base)-\(n)")
+        }
+        try FileManager.default.moveItem(at: paths.sessionFile, to: dest)
+        return dest
+    }
+
+    private static func stamp(_ date: Date) -> String {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = TimeZone(identifier: "UTC")
+        f.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
+        return f.string(from: date)
+    }
 
     /// Non-mutating. A journal that does not decode stays exactly where it
     /// is: it is the only record of what a previous run changed, and moving
@@ -97,6 +130,7 @@ struct Store: Sendable {
 enum StoreError: Error, LocalizedError {
     case rename(from: String, to: String, errno: Int32)
     case corrupt(file: String, detail: String)
+    case unreadable(file: String, detail: String)
 
     var errorDescription: String? {
         switch self {
@@ -104,6 +138,8 @@ enum StoreError: Error, LocalizedError {
             return "rename \(from) -> \(to) failed: \(String(cString: strerror(errno)))"
         case let .corrupt(file, detail):
             return "\(file) could not be decoded (\(detail)); it was left in place"
+        case let .unreadable(file, detail):
+            return "\(file) could not be decoded (\(detail))"
         }
     }
 }

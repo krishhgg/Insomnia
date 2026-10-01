@@ -867,7 +867,13 @@ final class SessionManager {
         do {
             onDisk = try store.loadSession()
         } catch {
-            Log.error("session.json unreadable (\(error.localizedDescription)); treating as expired")
+            // Not a session, so nothing in it can be trusted and nothing in
+            // it is needed: the journal, not the session file, says what to
+            // undo. Moved aside (never deleted or overwritten) and treated
+            // as no session; a dirty journal is still restored below. An
+            // unreadable state.json never gets here: exclusive() refuses
+            // the transaction first, and the session file stays with it.
+            moveAsideUnreadableSession(error)
             onDisk = nil
         }
 
@@ -943,6 +949,20 @@ final class SessionManager {
             }
         } catch {
             Log.error("reconcile: sleep check failed: \(error.localizedDescription)")
+        }
+    }
+
+    private func moveAsideUnreadableSession(_ error: Error) {
+        let detail = error.localizedDescription
+        do {
+            let moved = try store.moveAsideUnreadableSession(now: clock())
+            Log.error("session.json unreadable (\(detail)); moved to \(moved.path) and treated as no session")
+            notifier.post(
+                title: Self.sessionFileTitle,
+                body: "session.json could not be read (\(detail)). It was moved to \(moved.path) and treated as no session; anything journaled is restored."
+            )
+        } catch let moveError {
+            fail("session.json unreadable (\(detail)) and could not be moved aside: \(moveError.localizedDescription); treating as no session")
         }
     }
 
@@ -1065,6 +1085,7 @@ final class SessionManager {
     static let incompleteTitle = "Restore incomplete"
     static let notEndedTitle = "Session not ended"
     static let journalTitle = "Recovery journal unreadable"
+    static let sessionFileTitle = "Session file unreadable"
 
     private static func endTitle(_ reason: EndReason, had: Bool) -> String {
         switch reason {

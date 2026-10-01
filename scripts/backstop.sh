@@ -44,6 +44,11 @@
 #     the failure is visible and the next periodic run retries.
 #   - state.json unreadable, not a JSON object, or with a known key of the
 #     wrong type: nothing is touched, exit 1.
+#   - session.json present but not a session (no parseable endsAt): it is
+#     treated as expired. Once the journal is clean (already, or after the
+#     undo above succeeded) the file is renamed to
+#     session.json.unreadable-<UTC stamp>, never deleted or overwritten, so
+#     the next run sees no session. While the journal stays dirty it stays.
 #
 # Limitation: the shell compares process start time to the second and the
 # boot session; only the app also compares the microseconds.
@@ -328,6 +333,25 @@ if [[ "$journal_state" == clean ]]; then
   fi
 fi
 
+# session.json that is not a session. Its bytes are kept beside it under a
+# name the app writes too and `uninstall.sh --purge` removes; the next run
+# then sees no session. Called only once the journal is clean, so nothing
+# recorded is lost with it. Never overwrites: a taken name gets -1, -2, ...
+# and `mv -n` declines rather than replace a file that appeared meanwhile
+# (it exits 0 then, hence the check of both paths afterwards).
+quarantine_session() {
+  local base dest n
+  base="$SESSION.unreadable-$(date -u +%Y%m%dT%H%M%SZ)"
+  dest="$base"; n=0
+  while [[ -e "$dest" ]]; do n=$((n + 1)); dest="$base-$n"; done
+  if mv -n "$SESSION" "$dest" 2>/dev/null && [[ ! -e "$SESSION" && -e "$dest" ]]; then
+    log warn "session.json unreadable; moved to $dest and treated as no session"
+    return 0
+  fi
+  log error "session.json unreadable and could not be moved to $dest; kept in place"
+  return 1
+}
+
 case "$session_state" in
   none)      session_note="no session" ;;
   valid)     session_note="forced end of session (endsAt=$ends_at)" ;;
@@ -338,8 +362,8 @@ esac
 if [[ "$journal_state" != dirty ]]; then
   # Nothing journaled: nothing to undo, and nothing privileged runs.
   if [[ "$session_state" == malformed ]]; then
-    log error "$session_note; journal is clean but session.json is kept as evidence. Open Insomnia or remove it by hand"
-    exit 1
+    quarantine_session || exit 1
+    exit 0
   fi
   if [[ "$session_state" != none ]]; then
     if [[ "$journal_state" == missing ]]; then
@@ -531,9 +555,9 @@ if (( ${#failures[@]} > 0 )); then
 fi
 
 if [[ "$session_state" == malformed ]]; then
-  log error "journal cleared, but session.json is unreadable and kept as evidence. Open Insomnia or remove it by hand"
-  exit 1
+  quarantine_session || exit 1
+else
+  rm -f "$SESSION"
 fi
-rm -f "$SESSION"
 log info "journal cleared"
 exit 0
