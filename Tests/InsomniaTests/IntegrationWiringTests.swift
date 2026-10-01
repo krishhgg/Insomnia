@@ -2,7 +2,7 @@ import CoreLocation
 import XCTest
 @testable import Insomnia
 
-final class IntegrationWiringTests: XCTestCase {
+final class IntegrationWiringTests: InsomniaTestCase {
     @MainActor
     func testLiveStatusSourceReadsEveryValueFromSystemStatus() {
         let home = TempHome()

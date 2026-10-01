@@ -4,7 +4,7 @@ import XCTest
 
 /// The recovery lock is a kernel flock on one kept file, so it is shared
 /// with backstop.sh and released by the kernel if the holder dies.
-final class RecoveryLockTests: XCTestCase {
+final class RecoveryLockTests: InsomniaTestCase {
     var home: TempHome!
     var lock: RecoveryLock!
 

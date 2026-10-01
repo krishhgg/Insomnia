@@ -4,7 +4,7 @@ import XCTest
 /// Failure-path guarantees for recovery: what stays journaled, what is
 /// reported, and what is never touched.
 @MainActor
-final class RecoverySafetyTests: XCTestCase {
+final class RecoverySafetyTests: InsomniaTestCase {
     var h: Harness!
 
     override func setUp() async throws { h = Harness() }

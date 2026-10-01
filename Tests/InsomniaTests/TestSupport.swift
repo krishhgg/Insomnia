@@ -30,12 +30,53 @@ actor AsyncGate {
     }
 }
 
+/// One throwaway INSOMNIA_HOME for the whole test process. `Log.append` and
+/// `SessionManager.live` read the variable at call time and fall back to
+/// the real ~/Library when it is unset, so it is set here before the first
+/// test method runs and is never unset again. A TempHome moves it to a
+/// per-test directory and moves it back here on destroy, so work that
+/// outlives its test (a lifecycle task draining after teardown, a reassert
+/// timer) still lands in a temp directory. The directory is removed when
+/// the process exits.
+enum ProcessTestHome {
+    static let root: URL = {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("insomnia-tests-process-\(getpid())-\(UUID().uuidString)", isDirectory: true)
+        try! FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        setenv(Paths.environmentKey, url.path, 1)
+        atexit { try? FileManager.default.removeItem(at: ProcessTestHome.root) }
+        return url
+    }()
+
+    /// Idempotent; the first call creates the directory and sets the variable.
+    static func install() { _ = root }
+
+    /// Where INSOMNIA_HOME points right now, as the app would resolve it.
+    static var current: String? {
+        guard let value = getenv(Paths.environmentKey) else { return nil }
+        return String(cString: value)
+    }
+}
+
+/// Every test class extends this instead of XCTestCase so the process-wide
+/// home is installed before the first test method, whichever class XCTest
+/// runs first. TestIsolationTests fails if a class in the bundle skips it.
+class InsomniaTestCase: XCTestCase {
+    override class func setUp() {
+        super.setUp()
+        ProcessTestHome.install()
+    }
+}
+
 /// Creates a temp INSOMNIA_HOME and points the process environment at it.
+/// `destroy()` hands the variable back to `ProcessTestHome` rather than
+/// unsetting it, so nothing falls through to the real ~/Library afterwards.
 final class TempHome {
     let root: URL
     let paths: Paths
 
     init() {
+        ProcessTestHome.install()
         root = FileManager.default.temporaryDirectory
             .appendingPathComponent("insomnia-tests-\(UUID().uuidString)", isDirectory: true)
         try! FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -44,7 +85,7 @@ final class TempHome {
     }
 
     func destroy() {
-        unsetenv(Paths.environmentKey)
+        setenv(Paths.environmentKey, ProcessTestHome.root.path, 1)
         try? FileManager.default.removeItem(at: root)
     }
 }

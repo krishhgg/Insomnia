@@ -1,7 +1,7 @@
 import XCTest
 @testable import Insomnia
 
-final class FloorRulesTests: XCTestCase {
+final class FloorRulesTests: InsomniaTestCase {
     func eval(_ percent: Int?, charging: Bool = false, thermal: ProcessInfo.ThermalState = .nominal, lid: Bool = false, lp: Bool = false, config: Config = Config()) -> [FloorRules.Action] {
         FloorRules.evaluate(percent: percent, isCharging: charging, thermal: thermal, lidClosed: lid, lowPowerSetByUs: lp, config: config)
     }
@@ -154,7 +154,7 @@ final class FloorRulesTests: XCTestCase {
 }
 
 @MainActor
-final class FloorRuleDriverTests: XCTestCase {
+final class FloorRuleDriverTests: InsomniaTestCase {
     var h: Harness!
 
     override func setUp() async throws { h = Harness() }

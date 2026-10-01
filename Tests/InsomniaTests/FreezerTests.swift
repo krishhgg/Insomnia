@@ -2,7 +2,7 @@ import AppKit
 import XCTest
 @testable import Insomnia
 
-final class FreezerTests: XCTestCase {
+final class FreezerTests: InsomniaTestCase {
     // Slack main (100) with helpers 101, 102 (child of 101), 103; an unrelated
     // process 200 under launchd; Insomnia itself at 300.
     let processes: [ProcessEntry] = [

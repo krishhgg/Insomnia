@@ -4,7 +4,7 @@ import XCTest
 /// Spec section 8 step 2: lid-close actions still on disk are undone at
 /// reconcile only when the lid is open.
 @MainActor
-final class ReconcileLidGatingTests: XCTestCase {
+final class ReconcileLidGatingTests: InsomniaTestCase {
     var h: Harness!
 
     override func setUp() async throws { h = Harness() }

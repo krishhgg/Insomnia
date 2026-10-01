@@ -1,7 +1,7 @@
 import XCTest
 @testable import Insomnia
 
-final class StoreTests: XCTestCase {
+final class StoreTests: InsomniaTestCase {
     var home: TempHome!
     var store: Store!
 

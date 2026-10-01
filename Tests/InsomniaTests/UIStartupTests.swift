@@ -10,7 +10,7 @@ import XCTest
 /// took seconds to refuse, the user sat on an eye, a blank countdown and an
 /// inert end ring with no session behind them. The start now has a phase of
 /// its own, and the running controls only appear for a confirmed session.
-final class UIStartupTests: XCTestCase {
+final class UIStartupTests: InsomniaTestCase {
     /// A refused start reopens the pills, and with them the key-catcher
     /// panel. Tests that end there must not leave it up for the next test.
     override func tearDown() {

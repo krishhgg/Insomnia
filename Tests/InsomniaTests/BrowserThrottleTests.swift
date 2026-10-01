@@ -1,7 +1,7 @@
 import XCTest
 @testable import Insomnia
 
-final class BrowserThrottleTests: XCTestCase {
+final class BrowserThrottleTests: InsomniaTestCase {
     let chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 
     func testBothFlagsPresent() {
