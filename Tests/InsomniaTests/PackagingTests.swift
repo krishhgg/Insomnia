@@ -2,9 +2,12 @@ import AppKit
 import Foundation
 import ImageIO
 import XCTest
+@testable import Insomnia
 
-/// The checked-in icon artifacts and the bundle wiring that points at them.
-/// These read the real files and decode them; nothing here greps sources.
+/// The checked-in icon artifacts and the bundle wiring that points at them,
+/// and the recovery agent's verify-then-exec command line run against a
+/// scratch signed bundle with the real codesign. These read the real files
+/// and decode them; nothing here greps sources.
 final class PackagingTests: XCTestCase {
     private static var repoRoot: URL {
         // .../Tests/InsomniaTests/PackagingTests.swift -> repo root
@@ -96,6 +99,137 @@ final class PackagingTests: XCTestCase {
         XCTAssertGreaterThan(px.alpha(160, mid), 0.99, "the tile should start well inside the canvas")
         XCTAssertLessThan(px.luminance(160, mid), 0.3, "the tile edge is charcoal, not white")
         XCTAssertEqual(px.alpha(20, mid), 0, "a margin is left around the tile")
+    }
+
+    // MARK: - The recovery agent's command line (real codesign, scratch bundle)
+
+    private var scratch: URL!
+
+    override func setUpWithError() throws {
+        scratch = FileManager.default.temporaryDirectory
+            .appendingPathComponent("insomnia-packaging-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+    }
+
+    override func tearDown() {
+        if let scratch { try? FileManager.default.removeItem(at: scratch) }
+    }
+
+    /// A throwaway bundle laid out the way install.sh lays out Insomnia.app
+    /// (Mach-O main executable, Info.plist, backstop.sh under
+    /// Contents/Resources), ad-hoc signed afterwards so the resource seal
+    /// covers the script. The executable is a copy of /usr/bin/true. Nothing
+    /// here touches an installed app, a LaunchAgent or a keychain.
+    private func makeSignedBundle(named name: String = "Insomnia") throws -> URL {
+        let fm = FileManager.default
+        let bundle = scratch.appendingPathComponent("\(name).app", isDirectory: true)
+        try fm.createDirectory(at: bundle.appendingPathComponent("Contents/MacOS"), withIntermediateDirectories: true)
+        try fm.createDirectory(at: bundle.appendingPathComponent("Contents/Resources"), withIntermediateDirectories: true)
+        try fm.copyItem(atPath: "/usr/bin/true", toPath: bundle.appendingPathComponent("Contents/MacOS/\(name)").path)
+        let info: [String: Any] = [
+            "CFBundleExecutable": name, "CFBundleIdentifier": "com.kgarg.insomnia.packaging-test",
+            "CFBundlePackageType": "APPL", "CFBundleShortVersionString": "0.0.1",
+        ]
+        try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0)
+            .write(to: bundle.appendingPathComponent("Contents/Info.plist"))
+        let script = Paths.backstopScript(inBundle: bundle)
+        try "#!/bin/bash\nprintf 'ran %s\\n' \"$*\" >> \"$HOME/backstop.ran\"\n".write(to: script, atomically: true, encoding: .utf8)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+        let sign = try run("/usr/bin/codesign", ["--force", "--sign", "-", bundle.path])
+        XCTAssertEqual(sign.status, 0, sign.output)
+        return bundle
+    }
+
+    /// Runs the agent's command line exactly as launchd would, with HOME in
+    /// the scratch tree so the refusal log lands there.
+    private func runAgent(requirement: String, bundle: URL, home: URL) throws -> (status: Int32, output: String) {
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        return try run("/bin/sh", ["-c", LaunchdBackstop.agentProgram, "sh", requirement, bundle.path], environment: ["HOME": home.path, "PATH": "/usr/bin:/bin"])
+    }
+
+    private func run(_ exe: String, _ args: [String], environment: [String: String]? = nil) throws -> (status: Int32, output: String) {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: exe)
+        p.arguments = args
+        if let environment { p.environment = environment }
+        let out = Pipe()
+        p.standardOutput = out
+        p.standardError = out
+        try p.run()
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        return (p.terminationStatus, String(decoding: data, as: UTF8.self))
+    }
+
+    /// What install.sh reads: the `designated =>` line of `codesign -d -r-`,
+    /// without the "# " an implicit requirement carries.
+    private func codesignDesignatedRequirement(of path: String) throws -> String {
+        let r = try run("/usr/bin/codesign", ["-d", "-r-", path])
+        let line = try XCTUnwrap(r.output.components(separatedBy: "\n").first { $0.contains("designated => ") }, r.output)
+        return String(line[line.range(of: "designated => ")!.upperBound...])
+    }
+
+    /// The app reads the requirement through the Security framework and
+    /// install.sh through codesign; the plist only matches when both print
+    /// the same text. Checked on Apple-signed code and on an ad-hoc bundle.
+    func testDesignatedRequirementMatchesWhatCodesignPrints() throws {
+        XCTAssertEqual(try CodeRequirement.designated(ofCodeAt: URL(fileURLWithPath: "/bin/ls")), try codesignDesignatedRequirement(of: "/bin/ls"))
+        let bundle = try makeSignedBundle()
+        let fromSecurity = try CodeRequirement.designated(ofCodeAt: bundle)
+        XCTAssertEqual(fromSecurity, try codesignDesignatedRequirement(of: bundle.path))
+        XCTAssertTrue(fromSecurity.hasPrefix("cdhash H\""), "an ad-hoc signature is pinned by cdhash: \(fromSecurity)")
+        XCTAssertFalse(fromSecurity.contains("'"), "install.sh and the plist must hold it without quoting trouble")
+    }
+
+    func testUnsignedCodeHasNoRequirementToPin() {
+        let unsigned = scratch.appendingPathComponent("plain.sh")
+        try? "#!/bin/bash\n".write(to: unsigned, atomically: true, encoding: .utf8)
+        XCTAssertThrowsError(try CodeRequirement.designated(ofCodeAt: unsigned)) { error in
+            XCTAssertTrue(error.localizedDescription.contains(unsigned.path), error.localizedDescription)
+        }
+    }
+
+    /// The command line the LaunchAgent runs: an intact bundle runs its
+    /// sealed backstop.sh; a bundle whose sealed script was edited, or one
+    /// that is not the build the plist pins, runs nothing and logs why.
+    func testAgentProgramRunsTheSealedBackstopOnlyWhileTheBundleSatisfiesItsRequirement() throws {
+        let bundle = try makeSignedBundle()
+        let requirement = try CodeRequirement.designated(ofCodeAt: bundle)
+        let home = scratch.appendingPathComponent("home", isDirectory: true)
+        let ran = home.appendingPathComponent("backstop.ran")
+        let log = home.appendingPathComponent("Library/Logs/Insomnia/insomnia.log")
+
+        let intact = try runAgent(requirement: requirement, bundle: bundle, home: home)
+        XCTAssertEqual(intact.status, 0, intact.output)
+        XCTAssertEqual(try String(contentsOf: ran, encoding: .utf8), "ran \n", "the sealed script ran, with no arguments")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: log.path), "nothing to log while the bundle verifies")
+
+        try FileManager.default.removeItem(at: ran)
+        let script = Paths.backstopScript(inBundle: bundle)
+        try (String(contentsOf: script, encoding: .utf8) + "echo tampered\n").write(to: script, atomically: true, encoding: .utf8)
+        let edited = try runAgent(requirement: requirement, bundle: bundle, home: home)
+        XCTAssertEqual(edited.status, 1, edited.output)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: ran.path), "an edited sealed script must not run")
+        var logged = try String(contentsOf: log, encoding: .utf8)
+        XCTAssertTrue(logged.contains("[error] backstop agent: \(bundle.path) does not satisfy the pinned code requirement"), logged)
+        XCTAssertTrue(logged.contains("sealed resource"), "codesign's reason is kept: \(logged)")
+        XCTAssertEqual(logged.components(separatedBy: "\n").count, 2, "one line per refusal: \(logged)")
+
+        // Another build: a fresh, intact bundle that the pinned requirement
+        // (the first bundle's cdhash) does not describe.
+        let other = try makeSignedBundle(named: "Other")
+        XCTAssertNotEqual(try CodeRequirement.designated(ofCodeAt: other), requirement)
+        let wrongBuild = try runAgent(requirement: requirement, bundle: other, home: home)
+        XCTAssertEqual(wrongBuild.status, 1, wrongBuild.output)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: ran.path))
+        logged = try String(contentsOf: log, encoding: .utf8)
+        XCTAssertTrue(logged.contains("\(other.path) does not satisfy"), logged)
+        XCTAssertTrue(logged.contains("failed to satisfy specified code requirement"), logged)
+
+        // Its own requirement still runs it.
+        let own = try runAgent(requirement: try CodeRequirement.designated(ofCodeAt: other), bundle: other, home: home)
+        XCTAssertEqual(own.status, 0, own.output)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: ran.path))
     }
 
     // MARK: - Helpers

@@ -1,9 +1,10 @@
 #!/bin/bash
-# Build Insomnia, assemble ~/Applications/Insomnia.app, install the backstop
-# script + LaunchAgent, and write the sudoers rule. Idempotent; asks for sudo
-# once (for /etc/sudoers.d/insomnia), before anything of a previous install
-# is touched. Not atomic: a failure after the sudoers step says exactly what
-# was replaced so far.
+# Build Insomnia, assemble ~/Applications/Insomnia.app with backstop.sh sealed
+# inside it, install the LaunchAgent that verifies the bundle and runs that
+# script, and write the sudoers rule. Idempotent; asks for sudo once (for
+# /etc/sudoers.d/insomnia), before anything of a previous install is touched.
+# Not atomic: a failure after the sudoers step says exactly what was replaced
+# so far.
 set -euo pipefail
 
 # Installation always uses the standard per-user layout. A relocated
@@ -52,8 +53,8 @@ BIN="$("$SWIFT" build -c release --show-bin-path)/Insomnia"
 
 # 2. sudoers -----------------------------------------------------------------
 #    The password prompt comes first: until the rule is installed and proven
-#    effective, the running app is not asked to quit and neither the bundle,
-#    the installed backstop.sh nor the LaunchAgent are touched.
+#    effective, the running app is not asked to quit and neither the bundle
+#    (backstop.sh included) nor the LaunchAgent are touched.
 step "Writing $SUDOERS (requires your password once)"
 TMP_SUDOERS="$(mktemp)"
 trap 'rm -f "$TMP_SUDOERS"' EXIT
@@ -75,7 +76,7 @@ fi
 if "$SUDO" -n -l /usr/bin/pmset -a disablesleep 0 >/dev/null 2>&1; then
   echo "sudoers rule verified"
 else
-  echo "'sudo -n pmset' is still not permitted; check $SUDOERS. The app, backstop.sh and LaunchAgent were not touched." >&2
+  echo "'sudo -n pmset' is still not permitted; check $SUDOERS. The app (with backstop.sh) and the LaunchAgent were not touched." >&2
   exit 1
 fi
 
@@ -93,7 +94,7 @@ if "$PGREP" -x Insomnia >/dev/null 2>&1; then
   done
   if "$PGREP" -x Insomnia >/dev/null 2>&1; then
     echo "Insomnia is still running after ${QUIT_WAIT_SECONDS}s (it may be refusing to quit until its own recovery finishes)." >&2
-    echo "Let it finish or quit it from its menu, then rerun. $SUDOERS is installed; the app, backstop.sh and LaunchAgent were not touched." >&2
+    echo "Let it finish or quit it from its menu, then rerun. $SUDOERS is installed; the app (with backstop.sh) and the LaunchAgent were not touched." >&2
     exit 1
   fi
 fi
@@ -103,15 +104,38 @@ cp "$BIN" "$APP/Contents/MacOS/Insomnia"
 cp "$ROOT/Resources/Info.plist" "$APP/Contents/Info.plist"
 mkdir -p "$APP/Contents/Resources"
 cp "$ROOT/Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
+# backstop.sh goes into the bundle before it is signed, so the signature's
+# resource seal covers it. The LaunchAgent below verifies the whole bundle
+# against the requirement read after signing and only then runs this copy;
+# an edited script fails that check. No executable is left in a writable
+# directory.
+BACKSTOP="$APP/Contents/Resources/backstop.sh"
+cp "$ROOT/scripts/backstop.sh" "$BACKSTOP"
+chmod 755 "$BACKSTOP"
 "$PLUTIL" -lint "$APP/Contents/Info.plist" >/dev/null
 "$CODESIGN" --force --sign - --deep "$APP"
 echo "signed $("$CODESIGN" -dv "$APP" 2>&1 | grep -i identifier || true)"
+# What the agent pins: the bundle's designated requirement, in the form
+# `codesign -d -r-` prints (an implicit one carries a leading "# "). For an
+# ad-hoc signature that is the cdhash of this build, so no other build and
+# no edited bundle satisfies it. The app reads the same text through the
+# Security framework (CodeRequirement.swift) to recognise this plist.
+REQUIREMENT="$("$CODESIGN" -d -r- "$APP" 2>&1 | sed -n 's/^#\{0,1\} *designated => //p' | head -n 1)"
+if [[ -z "$REQUIREMENT" ]]; then
+  echo "could not read the designated requirement of $APP ('codesign -d -r-'); the LaunchAgent cannot pin the bundle. $SUDOERS is installed; the LaunchAgent was not touched." >&2
+  exit 1
+fi
+# The check the agent will run every minute, run once here so a bundle the
+# agent would refuse is caught now instead of at the first recovery.
+if ! "$CODESIGN" --verify --strict "-R=$REQUIREMENT" "$APP"; then
+  echo "$APP does not satisfy its own requirement ($REQUIREMENT); the LaunchAgent would never run backstop.sh. $SUDOERS and the app are installed; the LaunchAgent was not touched." >&2
+  exit 1
+fi
+echo "LaunchAgent will require: $REQUIREMENT"
 
-# 4. Backstop script + dirs --------------------------------------------------
-step "Installing backstop.sh to $APP_SUPPORT"
+# 4. Directories -------------------------------------------------------------
+step "Creating $APP_SUPPORT, $LOG_DIR and $LAUNCH_AGENTS"
 mkdir -p "$APP_SUPPORT" "$LOG_DIR" "$LAUNCH_AGENTS"
-cp "$ROOT/scripts/backstop.sh" "$APP_SUPPORT/backstop.sh"
-chmod +x "$APP_SUPPORT/backstop.sh"
 
 # 5. Recovery and LaunchAgent replacement are one transaction under the
 #    recovery lock (the same flock(2) file the app and backstop use), so a
@@ -126,7 +150,7 @@ lock_rc=0
 "$LOCKF" -t "$LOCK_TIMEOUT_SECONDS" 9 2>/dev/null || lock_rc=$?
 if (( lock_rc != 0 )); then
   echo "The recovery lock $LOCK is held by another process (the app or a running backstop)." >&2
-  echo "Wait a minute and rerun. The app, $APP_SUPPORT/backstop.sh and $SUDOERS are installed; the LaunchAgent was not touched." >&2
+  echo "Wait a minute and rerun. The app (with backstop.sh) and $SUDOERS are installed; the LaunchAgent was not touched." >&2
   exit 75
 fi
 if "$PGREP" -x Insomnia >/dev/null 2>&1; then
@@ -136,11 +160,18 @@ fi
 
 step "Ending any stale session and checking the recovery journal"
 recovery_rc=0
-/bin/bash "$APP_SUPPORT/backstop.sh" --force || recovery_rc=$?
+/bin/bash "$BACKSTOP" --force || recovery_rc=$?
 
-# 6. LaunchAgent: runs the backstop at load and every 60 s. The backstop
-#    enforces the saved deadline itself and is a no-op while the session on
-#    disk is valid. Same pattern as the app (LaunchdBackstop.swift): the
+# 6. LaunchAgent: verifies the bundle and runs its sealed backstop at load
+#    and every 60 s. The backstop enforces the saved deadline itself and is
+#    a no-op while the session on disk is valid. The plist's ProgramArguments
+#    are `/bin/sh -c "$AGENT_PROGRAM" sh "$REQUIREMENT" "$APP"`: the program
+#    runs `codesign --verify --strict -R=<requirement>` on the bundle and
+#    execs Contents/Resources/backstop.sh only when that passes; otherwise it
+#    logs one line to $LOG_DIR/insomnia.log and exits 1 without running
+#    anything. AGENT_PROGRAM must stay byte for byte what LaunchdBackstop.swift
+#    writes (LaunchdBackstopTests compares them), or the app reloads the agent
+#    at every session start. Same pattern as the app for the file itself: the
 #    trusted plist at $PLIST is only ever a plist launchd actually loaded.
 #    The new one is written to a private candidate one directory below it:
 #    launchctl refuses any path without a `.plist` suffix (EIO), and
@@ -184,17 +215,20 @@ schedule it runs was not verified here; check with 'launchctl print gui/$UID_NUM
 
 Install stopped: the backstop could not fully undo a previous session
 (exit status $recovery_rc). The LaunchAgent was not replaced or unloaded.
-Installed so far: the app at $APP, $APP_SUPPORT/backstop.sh, and $SUDOERS.
+Installed so far: the app at $APP (backstop.sh is inside it) and $SUDOERS.
 $agent_note
 Check $LOG_DIR/insomnia.log and resolve what it reports (saved audio, display
 brightness or keyboard backlight needs the app: open "$APP"), or run the
 recovery by hand:
-  /bin/bash "$APP_SUPPORT/backstop.sh" --force
+  /bin/bash "$BACKSTOP" --force
 Then rerun this script to install the LaunchAgent.
 FAIL
   exit 1
 fi
 
+# shellcheck disable=SC2016  # the $1/$2/$HOME/$r below are for the agent's shell, not this one
+AGENT_PROGRAM='r="$(/usr/bin/codesign --verify --strict "-R=$1" "$2" 2>&1)" && exec /bin/bash "$2/Contents/Resources/backstop.sh"; mkdir -p "$HOME/Library/Logs/Insomnia"; printf "%s [error] backstop agent: %s does not satisfy the pinned code requirement; backstop.sh not run. Reinstall Insomnia (scripts/install.sh). codesign: %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$2" "$(printf %s "$r" | tr "\n" " ")" >> "$HOME/Library/Logs/Insomnia/insomnia.log"; exit 1'
+xml_escape() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
 cat > "$CANDIDATE" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -204,8 +238,12 @@ cat > "$CANDIDATE" <<PLIST
 	<string>$LABEL</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>/bin/bash</string>
-		<string>$APP_SUPPORT/backstop.sh</string>
+		<string>/bin/sh</string>
+		<string>-c</string>
+		<string>$(printf '%s' "$AGENT_PROGRAM" | xml_escape)</string>
+		<string>sh</string>
+		<string>$(printf '%s' "$REQUIREMENT" | xml_escape)</string>
+		<string>$(printf '%s' "$APP" | xml_escape)</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
@@ -235,6 +273,12 @@ FAIL
     exit 1
   fi
   echo "LaunchAgent $LABEL loaded (launchctl print confirms); $PLIST published"
+  # Installs before this layout ran a writable copy from $APP_SUPPORT. The
+  # agent just loaded runs the sealed one, so that copy goes now, not before.
+  if [[ -e "$APP_SUPPORT/backstop.sh" ]]; then
+    rm -f "$APP_SUPPORT/backstop.sh"
+    echo "removed the previous install's $APP_SUPPORT/backstop.sh (the agent now runs the copy sealed in the bundle)"
+  fi
 else
   if (( bootstrap_rc != 0 )); then
     reason="'launchctl bootstrap' exited $bootstrap_rc for the new LaunchAgent"
@@ -290,7 +334,7 @@ so nothing was reloaded. Check 'launchctl print gui/$UID_NUM/$LABEL' and, if nee
 Install stopped: $reason.
 $plist_note
 $outcome
-The app, $APP_SUPPORT/backstop.sh and $SUDOERS are installed and the recovery
+The app (with backstop.sh) and $SUDOERS are installed and the recovery
 journal was clean when checked above. Fix the launchctl error and rerun.
 FAIL
   exit 1

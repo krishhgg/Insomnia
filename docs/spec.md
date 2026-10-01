@@ -34,7 +34,8 @@ closed bag. Its design goals are to:
 - Swift 6, SwiftUI content hosted in a custom `NSStatusItem`, Swift Package.
   No Xcode project.
 - `install.sh` assembles a minimal `Insomnia.app` bundle (`LSUIElement = true`,
-  no Dock icon), ad-hoc codesigns it, and installs it to `~/Applications`.
+  no Dock icon) with `backstop.sh` sealed under `Contents/Resources`, ad-hoc
+  codesigns it, and installs it to `~/Applications`.
 
 ## Core model
 
@@ -314,6 +315,13 @@ Backstop, independent of the app:
 
 - The agent reads the saved deadline; recurring recovery checks avoid replacing
   the loaded job for every extension and allow retries after a failure.
+- The agent runs only the `backstop.sh` sealed in the signed bundle. Its
+  command line verifies the bundle against the code requirement pinned in the
+  plist (`codesign --verify --strict -R=...`; for an ad-hoc build, that
+  build's cdhash) and execs the script when that passes; otherwise it logs
+  one line and exits without running anything. No executable lives in a
+  writable directory. The plist is a per-user file like any LaunchAgent; the
+  app rewrites a plist that does not match at the next arm.
 - App and script transactions must coordinate through a shared lock. Failure
   to acquire it must not permit an unprotected journal write or side effect.
 - Successful restores may clear their entries; failures must stay journaled.
@@ -524,7 +532,7 @@ Insomnia/
     TestSupport.swift
     UIStatusTests.swift
   scripts/
-    install.sh             build, bundle, codesign, sudoers, launchd, login item
+    install.sh             build, bundle (backstop.sh sealed inside), codesign, sudoers, launchd
     uninstall.sh           reverse all of the above, restore sleep
     backstop.sh            standalone restore from JSON
     simulate-lid.sh        file trigger for the lid-close action path

@@ -1,9 +1,11 @@
 #!/bin/bash
 # Reverse install.sh. Quits the app, takes the recovery lock, runs the current
-# backstop with --force under that same lock, verifies for itself that the
-# journal is clean, and only then removes the LaunchAgent, the sudoers rule,
-# the app bundle, and the journal. Keeps config.json and the logs unless
-# --purge. Everything after the quit happens while this process holds
+# backstop with --force under that same lock (the checkout's copy, else the
+# one sealed in the installed bundle, else the writable copy older installs
+# left in Application Support), verifies for itself that the journal is
+# clean, and only then removes the LaunchAgent, the sudoers rule, the app
+# bundle (backstop.sh included), and the journal. Keeps config.json and the
+# logs unless --purge. Everything after the quit happens while this process holds
 # APP_SUPPORT/.recovery.lock, so neither a queued periodic backstop nor a
 # relaunched app can republish the journal while it is being removed.
 #
@@ -241,15 +243,21 @@ fi
 
 # 3. Undo everything via the current backstop ---------------------------------
 # The backstop inherits fd 9 and shares this lock instead of waiting on it.
+# Newest first: the checkout's script, then the copy install.sh sealed into
+# the bundle, then the writable copy installs before that layout left in
+# $APP_SUPPORT.
 step "Restoring the machine via backstop --force"
 if [[ -f "$ROOT/scripts/backstop.sh" ]]; then
   BACKSTOP="$ROOT/scripts/backstop.sh"
+elif [[ -f "$APP/Contents/Resources/backstop.sh" ]]; then
+  BACKSTOP="$APP/Contents/Resources/backstop.sh"
 elif [[ -f "$APP_SUPPORT/backstop.sh" ]]; then
   BACKSTOP="$APP_SUPPORT/backstop.sh"
 else
-  echo "no backstop.sh found in $ROOT/scripts or $APP_SUPPORT; nothing was removed" >&2
+  echo "no backstop.sh found in $ROOT/scripts, $APP/Contents/Resources or $APP_SUPPORT; nothing was removed" >&2
   exit 1
 fi
+echo "using $BACKSTOP"
 recovery_rc=0
 /bin/bash "$BACKSTOP" --force || recovery_rc=$?
 
@@ -302,6 +310,8 @@ fi
 step "Removing app bundle"
 rm -rf "$APP"
 
+# $APP_SUPPORT/backstop.sh below is the writable copy of older installs; the
+# current one went with the bundle.
 if (( PURGE == 1 )); then
   step "Purging Insomnia's files in $APP_SUPPORT and $LOG_DIR"
   rm -f "$SESSION" "$STATE" "$APP_SUPPORT/config.json" "$APP_SUPPORT/backstop.sh" \

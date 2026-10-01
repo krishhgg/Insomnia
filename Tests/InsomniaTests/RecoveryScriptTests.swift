@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 import XCTest
+@testable import Insomnia
 
 /// Behavioural tests for scripts/backstop.sh and scripts/uninstall.sh.
 ///
@@ -463,12 +464,13 @@ final class RecoveryScriptTests: XCTestCase {
         try fx.installMachinery()
         try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
         try "handoffs\n".write(to: fx.home.appendingPathComponent("Logs/handoffs.log"), atomically: true, encoding: .utf8)
+        try fx.writeMarkerBackstop(at: fx.legacyBackstop, name: "legacy")
 
         let r = try fx.run(fx.uninstall, ["--purge"])
 
         XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
         for gone in [fx.state, fx.config, fx.logFile, fx.home.appendingPathComponent("Logs/handoffs.log"),
-                     fx.installedBackstop, fx.plist, fx.app, fx.sudoers] {
+                     fx.installedBackstop, fx.legacyBackstop, fx.plist, fx.app, fx.sudoers] {
             XCTAssertFalse(fx.exists(gone), gone.path)
         }
         XCTAssertFalse(fx.exists(fx.home.appendingPathComponent("Logs")), "empty owned directories are removed")
@@ -506,6 +508,61 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(fx.exists(fx.lock))
         XCTAssertFalse(fx.exists(fx.plist))
         XCTAssertTrue(r.stdout.contains("Kept \(fx.home.appendingPathComponent("Logs").path)"), r.stdout)
+    }
+
+    // MARK: - Which backstop uninstall.sh runs
+
+    /// Newest first: the checkout's script (every test above), else the copy
+    /// install.sh sealed into the bundle, else the writable copy of installs
+    /// before that layout. Each marker records which one ran.
+    func testUninstallRunsTheSealedCopyWhenTheCheckoutHasNoBackstop() throws {
+        try fx.installMachinery()
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        try FileManager.default.removeItem(at: fx.backstop)
+        try fx.writeMarkerBackstop(at: fx.installedBackstop, name: "sealed")
+        try fx.writeMarkerBackstop(at: fx.legacyBackstop, name: "legacy")
+
+        let r = try fx.run(fx.uninstall)
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertEqual(fx.calls().filter { $0.hasPrefix("backstop ") }, ["backstop sealed --force"], "\(fx.calls())")
+        XCTAssertTrue(r.stdout.contains("using \(fx.installedBackstop.path)"), r.stdout)
+        XCTAssertFalse(fx.exists(fx.app))
+        XCTAssertFalse(fx.exists(fx.legacyBackstop), "the writable copy goes with the rest")
+    }
+
+    func testUninstallRunsTheLegacyCopyWhenNeitherCheckoutNorBundleHasOne() throws {
+        try fx.installMachinery()
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        try FileManager.default.removeItem(at: fx.backstop)
+        try FileManager.default.removeItem(at: fx.installedBackstop)
+        try fx.writeMarkerBackstop(at: fx.legacyBackstop, name: "legacy")
+
+        let r = try fx.run(fx.uninstall)
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertEqual(fx.calls().filter { $0.hasPrefix("backstop ") }, ["backstop legacy --force"], "\(fx.calls())")
+        XCTAssertTrue(r.stdout.contains("using \(fx.legacyBackstop.path)"), r.stdout)
+        XCTAssertFalse(fx.exists(fx.legacyBackstop))
+    }
+
+    func testUninstallStopsBeforeRemovingAnythingWhenNoBackstopExists() throws {
+        try fx.installMachinery()
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        try FileManager.default.removeItem(at: fx.backstop)
+        try FileManager.default.removeItem(at: fx.installedBackstop)
+
+        let r = try fx.run(fx.uninstall, ["--purge"])
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertTrue(r.stderr.contains("no backstop.sh found"), r.stderr)
+        XCTAssertTrue(r.stderr.contains(fx.installedBackstop.deletingLastPathComponent().path), "every place looked is named: \(r.stderr)")
+        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("launchctl") || $0.hasPrefix("sudo") }, "\(fx.calls())")
+        XCTAssertTrue(fx.exists(fx.plist))
+        XCTAssertTrue(fx.exists(fx.sudoers))
+        XCTAssertTrue(fx.exists(fx.app))
+        XCTAssertTrue(fx.exists(fx.config))
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, true)
     }
 
     // MARK: - Journal shape (typed corruption)
@@ -1080,16 +1137,72 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(try fx.inode(fx.lock), lockInode, "the lock inode is preserved")
         XCTAssertTrue(try fx.lockIsFree())
         XCTAssertTrue(r.stdout.contains("launchctl print confirms"), r.stdout)
-        let plist = try String(contentsOf: fx.plist, encoding: .utf8)
-        XCTAssertTrue(plist.contains("<integer>60</integer>"), plist)
-        XCTAssertTrue(plist.contains(fx.installedBackstop.path), plist)
+        let plist = try fx.plistOnDisk()
+        XCTAssertEqual(plist["StartInterval"] as? Int, 60)
+        // The plist must be exactly what the app builds for the same bundle
+        // and requirement, or the app reloads the agent at every start.
+        let expected = LaunchdBackstop.plistDictionary(label: "com.insomnia.backstop", target: BackstopTarget(bundle: fx.app, requirement: fx.requirement))
+        XCTAssertTrue(NSDictionary(dictionary: plist).isEqual(to: expected), "install.sh wrote \(plist), the app builds \(expected)")
+        XCTAssertTrue(calls.contains("codesign --verify --strict -R=\(fx.requirement) \(fx.app.path)"), "the installer runs the agent's own check once: \(calls)")
         XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, false)
-        XCTAssertTrue(fx.exists(fx.installedBackstop))
+        XCTAssertTrue(fx.exists(fx.installedBackstop), "backstop.sh is sealed in the bundle")
+        XCTAssertFalse(fx.exists(fx.legacyBackstop), "no writable copy is installed")
         XCTAssertTrue(fx.exists(fx.sudoers))
         XCTAssertTrue(fx.exists(fx.app.appendingPathComponent("Contents/Info.plist")))
         XCTAssertTrue(fx.exists(fx.app.appendingPathComponent("Contents/Resources/AppIcon.icns")), "the app icon is bundled")
         XCTAssertTrue(r.stdout.contains("Installed"), r.stdout)
         XCTAssertEqual(try fx.contents(of: fx.plist.deletingLastPathComponent()), ["com.insomnia.backstop.plist"])
+    }
+
+    /// The writable copy of installs before the sealed layout is removed
+    /// once the verifying agent is confirmed loaded, not before: until then
+    /// the previous agent (which runs that copy) is what retries.
+    func testInstallRemovesTheLegacyWritableCopyOnlyAfterTheNewAgentIsLoaded() throws {
+        try fx.prepareInstall()
+        try "trusted".write(to: fx.plist, atomically: true, encoding: .utf8)
+        try fx.writeMarkerBackstop(at: fx.legacyBackstop, name: "legacy")
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        fx.setMode("launchctl", "loaded-bootstrap-fails-once")
+
+        let failed = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(failed.status, 1, failed.stderr + failed.stdout)
+        XCTAssertTrue(fx.exists(fx.legacyBackstop), "the previous agent still runs this copy")
+        XCTAssertFalse(fx.calls().contains("backstop legacy --force"), "recovery ran the sealed copy, not the old one: \(fx.calls())")
+        XCTAssertTrue(fx.exists(fx.installedBackstop))
+
+        fx.setMode("launchctl", "loaded")
+        fx.clearCalls()
+        let ok = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(ok.status, 0, ok.stderr + ok.stdout)
+        XCTAssertFalse(fx.exists(fx.legacyBackstop), "the writable copy is gone once the verifying agent is loaded")
+        XCTAssertTrue(ok.stdout.contains("removed the previous install's"), ok.stdout)
+        XCTAssertTrue(fx.exists(fx.installedBackstop))
+    }
+
+    /// install.sh runs the agent's own check once, right after signing. A
+    /// bundle that fails it would give an agent that always refuses, so the
+    /// agent is not installed and the previous one is left alone.
+    func testInstallStopsBeforeTheAgentWhenTheBundleFailsItsOwnRequirementCheck() throws {
+        try fx.prepareInstall()
+        try "trusted".write(to: fx.plist, atomically: true, encoding: .utf8)
+        try fx.writeMarkerBackstop(at: fx.legacyBackstop, name: "legacy")
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        fx.setMode("codesign", "verify-fails")
+
+        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        let calls = fx.calls()
+        XCTAssertTrue(calls.contains("codesign --verify --strict -R=\(fx.requirement) \(fx.app.path)"), "\(calls)")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("launchctl") }, "\(calls)")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("sudo -n \(fx.fakePmset)") }, "no recovery from a bundle the agent would refuse: \(calls)")
+        XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "trusted")
+        XCTAssertTrue(fx.exists(fx.legacyBackstop))
+        XCTAssertTrue(fx.exists(fx.sudoers), "the rule step comes first and is reported")
+        XCTAssertTrue(r.stderr.contains("would never run backstop.sh"), r.stderr)
+        XCTAssertTrue(r.stderr.contains(fx.sudoers.path), r.stderr)
     }
 
     func testInstallLeavesTrustedPlistWhenBootstrapAndReloadBothFail() throws {
@@ -1417,7 +1530,12 @@ private final class ScriptFixture {
     var state: URL { home.appendingPathComponent("state.json") }
     var config: URL { home.appendingPathComponent("config.json") }
     var lock: URL { home.appendingPathComponent(".recovery.lock") }
-    var installedBackstop: URL { home.appendingPathComponent("backstop.sh") }
+    /// backstop.sh as install.sh seals it into the bundle.
+    var installedBackstop: URL { app.appendingPathComponent("Contents/Resources/backstop.sh") }
+    /// The writable copy installs before the sealed layout left here.
+    var legacyBackstop: URL { home.appendingPathComponent("backstop.sh") }
+    /// What the fake codesign prints as the bundle's designated requirement.
+    let requirement = "cdhash H\"0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c\""
     var logFile: URL { home.appendingPathComponent("Logs/insomnia.log") }
     var plist: URL { home.appendingPathComponent("LaunchAgents/com.insomnia.backstop.plist") }
     var fakePmset: String { bin.appendingPathComponent("pmset").path }
@@ -1489,6 +1607,21 @@ private final class ScriptFixture {
     }
 
     func exists(_ url: URL) -> Bool { fm.fileExists(atPath: url.path) }
+
+    /// A stand-in backstop that records which copy ran and claims success.
+    func writeMarkerBackstop(at url: URL, name: String) throws {
+        try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try "#!/bin/bash\nprintf 'backstop \(name) %s\\n' \"$*\" >> \"\(callsLog.path)\"\nexit 0\n"
+            .write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    func plistOnDisk() throws -> [String: Any] {
+        let data = try Data(contentsOf: plist)
+        guard let obj = try PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any] else {
+            throw FixtureError("the LaunchAgent plist is not a dictionary")
+        }
+        return obj
+    }
 
     func contents(of dir: URL) throws -> [String] {
         try fm.contentsOfDirectory(atPath: dir.path).sorted()
@@ -1659,8 +1792,20 @@ private final class ScriptFixture {
         for a in "$@"; do [[ "$a" == --show-bin-path ]] && { echo "\(r)/binroot"; exit 0; }; done
         exit 0
         """)
+        // codesign: signing is recorded and succeeds. `-d -r-` prints a
+        // fixed designated requirement the way codesign does (on stderr,
+        // with the "# " an implicit requirement carries). `--verify` passes
+        // unless mode "verify-fails".
         try writeFake("codesign", """
         printf 'codesign %s\\n' "$*" >> "\(calls)"
+        mode="$(cat "\(r)/codesign.mode" 2>/dev/null || echo ok)"
+        last=""; for a in "$@"; do last="$a"; done
+        for a in "$@"; do
+          case "$a" in
+            -r-) echo "Executable=$last/Contents/MacOS/Insomnia" >&2; echo '# designated => \(requirement)' >&2; exit 0 ;;
+            --verify) if [[ "$mode" == verify-fails ]]; then echo "$last: a sealed resource is missing or invalid" >&2; exit 1; fi; exit 0 ;;
+          esac
+        done
         exit 0
         """)
         // ps: answers from ps.table. Modes: "fail" (exit 2 with an error
@@ -1826,6 +1971,7 @@ private final class ScriptFixture {
         try fm.createDirectory(at: logFile.deletingLastPathComponent(), withIntermediateDirectories: true)
         try "log\n".write(to: logFile, atomically: true, encoding: .utf8)
         try "{}".write(to: config, atomically: true, encoding: .utf8)
+        try fm.createDirectory(at: installedBackstop.deletingLastPathComponent(), withIntermediateDirectories: true)
         try fm.copyItem(at: backstop, to: installedBackstop)
     }
 

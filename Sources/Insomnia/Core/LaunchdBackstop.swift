@@ -4,6 +4,12 @@ import Foundation
 /// persistent: it runs at load and every minute, and enforces the deadline
 /// written in session.json itself, so the app never has to replace the job
 /// per extension (which used to leave a window with no agent at all).
+///
+/// The script it runs is the backstop.sh sealed inside the app bundle
+/// (Contents/Resources). The agent's command line verifies the bundle's code
+/// signature against the requirement pinned in the plist and only then
+/// execs the script, so a backstop.sh edited on disk is never run by
+/// launchd. Nothing executable lives in a writable support directory.
 protocol BackstopScheduling: Sendable {
     /// Make sure the polling agent is loaded with the current plist. Cheap
     /// when it already is; throws when it cannot be loaded.
@@ -15,38 +21,84 @@ struct BackstopError: LocalizedError {
     var errorDescription: String? { message }
 }
 
+/// The bundle whose sealed backstop.sh the agent runs, and the code
+/// requirement that bundle must satisfy first.
+struct BackstopTarget: Sendable, Equatable {
+    let bundle: URL
+    /// Designated requirement of the bundle's signature, in requirement
+    /// language, as `codesign -d -r-` prints it (see CodeRequirement).
+    let requirement: String
+
+    var script: URL { Paths.backstopScript(inBundle: bundle) }
+}
+
 struct LaunchdBackstop: BackstopScheduling {
     typealias Runner = @Sendable (_ exe: String, _ args: [String]) async throws -> ShellResult
+    typealias RequirementReader = @Sendable (_ bundle: URL) throws -> String
 
     static let launchctl = "/bin/launchctl"
     /// Seconds between backstop.sh runs while loaded. install.sh writes the same value.
     static let pollInterval = 60
     static let commandTimeout: TimeInterval = 15
 
+    /// What launchd runs: `/bin/sh -c <agentProgram> sh <requirement> <bundle>`.
+    /// The program verifies the bundle ($2) against the requirement ($1) with
+    /// codesign and execs the sealed backstop.sh only when that passes; the
+    /// resource seal covers the script, so an edited copy fails here. On
+    /// failure it appends one line to ~/Library/Logs/Insomnia/insomnia.log
+    /// (the LaunchAgent only ever exists in the standard layout) and exits 1
+    /// without running anything. install.sh embeds this same text (its
+    /// AGENT_PROGRAM line); LaunchdBackstopTests checks the two are equal so
+    /// the app recognises the plist install.sh wrote. No single quotes, so
+    /// the shell can hold it in one.
+    static let agentProgram = #"r="$(/usr/bin/codesign --verify --strict "-R=$1" "$2" 2>&1)" && exec /bin/bash "$2/Contents/Resources/backstop.sh"; mkdir -p "$HOME/Library/Logs/Insomnia"; printf "%s [error] backstop agent: %s does not satisfy the pinned code requirement; backstop.sh not run. Reinstall Insomnia (scripts/install.sh). codesign: %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$2" "$(printf %s "$r" | tr "\n" " ")" >> "$HOME/Library/Logs/Insomnia/insomnia.log"; exit 1"#
+
     let plistURL: URL
-    let scriptPath: String
+    let bundle: URL
     let label: String
     let uid: uid_t
+    private let readRequirement: RequirementReader
     private let run: Runner
 
+    /// `bundle` defaults to the bundle this process runs from, and, when it
+    /// is not running from one (`swift run`), to the installed bundle at
+    /// `paths.appBundle`, so a development build arms the agent against the
+    /// installed app's sealed script. `readRequirement` reads that bundle's
+    /// designated requirement at every arm(), so an upgrade is pinned the
+    /// first time the upgraded app arms.
     init(
         paths: Paths,
+        bundle: URL? = nil,
+        readRequirement: @escaping RequirementReader = { try CodeRequirement.designated(ofCodeAt: $0) },
         label: String = Paths.backstopLabel,
         uid: uid_t = getuid(),
         run: @escaping Runner = { try await CancellableCommand().run($0, $1, timeout: LaunchdBackstop.commandTimeout) }
     ) {
         self.plistURL = paths.backstopPlist
-        self.scriptPath = paths.backstopScript.path
+        self.bundle = bundle ?? Self.runningOrInstalledBundle(paths: paths)
+        self.readRequirement = readRequirement
         self.label = label
         self.uid = uid
         self.run = run
     }
 
+    static func runningOrInstalledBundle(paths: Paths, running: URL = Bundle.main.bundleURL) -> URL {
+        running.pathExtension == "app" ? running.standardizedFileURL : paths.appBundle
+    }
+
+    var scriptPath: String { Paths.backstopScript(inBundle: bundle).path }
+
     func arm() async throws {
         guard FileManager.default.fileExists(atPath: scriptPath) else {
-            throw BackstopError(message: "backstop.sh not installed at \(scriptPath); run scripts/install.sh")
+            throw BackstopError(message: "backstop.sh is not sealed in the app bundle at \(scriptPath); run scripts/install.sh")
         }
-        let desired = Self.plistDictionary(label: label, scriptPath: scriptPath)
+        let requirement: String
+        do {
+            requirement = try readRequirement(bundle)
+        } catch {
+            throw BackstopError(message: "the recovery agent cannot pin \(bundle.path): \(error.localizedDescription). Run scripts/install.sh, which signs the bundle")
+        }
+        let desired = Self.plistDictionary(label: label, target: BackstopTarget(bundle: bundle, requirement: requirement))
         if plistOnDiskMatches(desired), try await isLoaded() {
             return
         }
@@ -65,11 +117,12 @@ struct LaunchdBackstop: BackstopScheduling {
 
     // MARK: Plist
 
-    /// Pure builder, testable without launchd.
-    static func plistDictionary(label: String, scriptPath: String) -> [String: Any] {
+    /// Pure builder, testable without launchd. Must produce exactly what
+    /// install.sh writes, or every arm() reloads the agent.
+    static func plistDictionary(label: String, target: BackstopTarget) -> [String: Any] {
         [
             "Label": label,
-            "ProgramArguments": ["/bin/bash", scriptPath],
+            "ProgramArguments": ["/bin/sh", "-c", agentProgram, "sh", target.requirement, target.bundle.path],
             "RunAtLoad": true,
             "StartInterval": pollInterval,
         ]

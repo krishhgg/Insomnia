@@ -17,6 +17,13 @@ other processes running as that user can invoke them too. The app is not
 sandboxed; local logs can contain SSIDs, process metadata, and tmux target names.
 Hotspot passwords are stored in the login Keychain.
 
+The recovery LaunchAgent runs only the `backstop.sh` sealed inside the signed
+app bundle, after `codesign --verify --strict` passes against the code
+requirement pinned in its plist (the build's cdhash for an ad-hoc signature).
+An edited bundle or script is refused and logged. The plist itself lives in
+`~/Library/LaunchAgents` and, like every per-user LaunchAgent, can be edited
+by any program running as that user.
+
 Passing automated checks or a secret scan does not establish the absence of
 vulnerabilities. Do not probe recovery by disrupting someone else's processes,
 power settings, network, or data.

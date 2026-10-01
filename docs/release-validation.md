@@ -126,6 +126,7 @@ is performed. Do not replace "not run" with "passed" based on source review.
 | Headed-browser throttling with the lid closed | Not run |
 | Battery/thermal event behavior on supported hardware | Not run |
 | Install/upgrade/uninstall with recoverable failure conditions | Not run |
+| Recovery agent refuses to run after the installed bundle or its sealed backstop.sh is modified, and logs why | Not run |
 
 Hardware tests must be supervised and must not endanger active user work. Use
 a stable, ventilated surface, not an enclosure. Do not intentionally overheat a
@@ -133,10 +134,16 @@ machine to validate thermal handling; exercise injected thermal events first.
 
 Launchd sequencing tests use a fake command runner. Actual bootstrap of the
 private candidate plist, login loading, and crash recovery must still be
-checked on the supported macOS release. Installer tests redirect every app,
-LaunchAgent, sudoers, and command target into a temporary fixture. Real build,
-signing, privileged installation, and quit refusal by a running app have not
-been exercised as an end-to-end installation on a working Mac.
+checked on the supported macOS release. PackagingTests run the agent's
+verify-then-exec command line against a scratch ad-hoc bundle with the real
+codesign: an intact bundle runs its sealed script, and an edited script or
+another build's requirement is refused and logged. Whether launchd runs that
+command line as installed, and whether the installed app's plist is the one
+install.sh wrote, has not been checked on a working Mac. Installer tests
+redirect every app, LaunchAgent, sudoers, and command target into a temporary
+fixture. Real build, signing, privileged installation, and quit refusal by a
+running app have not been exercised as an end-to-end installation on a
+working Mac.
 
 ## Distribution boundary
 

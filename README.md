@@ -59,9 +59,9 @@ four power-setting commands. Review that permission before installing.
 
 | Location | Purpose |
 | --- | --- |
-| `~/Applications/Insomnia.app` | The menu bar app |
-| `~/Library/Application Support/Insomnia/` | Configuration, session/recovery journals, and `backstop.sh` |
-| `~/Library/LaunchAgents/com.insomnia.backstop.plist` | Per-user recovery agent |
+| `~/Applications/Insomnia.app` | The menu bar app, with `backstop.sh` sealed inside it at `Contents/Resources` |
+| `~/Library/Application Support/Insomnia/` | Configuration and the session/recovery journals |
+| `~/Library/LaunchAgents/com.insomnia.backstop.plist` | Per-user recovery agent: verifies the app's code signature, then runs the sealed `backstop.sh` |
 | `~/Library/Logs/Insomnia/` | `insomnia.log` and `handoffs.log` |
 | `/etc/sudoers.d/insomnia` | Permission for the four commands below |
 
@@ -75,6 +75,16 @@ four power-setting commands. Review that permission before installing.
 The grant is available to other processes running as your user. Insomnia is not
 sandboxed. The app, scripts, and journals are local; hotspot passwords use the
 login Keychain, not the configuration file.
+
+The recovery agent runs at login and every 60 seconds. Its command line pins
+the installed bundle's code requirement (for an ad-hoc build, the cdhash of
+that build) and runs `codesign --verify --strict` against it before executing
+the `backstop.sh` sealed inside the bundle. An edited bundle or script fails
+that check: the agent writes one line to `insomnia.log` and runs nothing until
+you reinstall. No executable is kept in a writable support directory. The plist
+in `~/Library/LaunchAgents` is still a per-user file that any program running
+as you can edit, like every LaunchAgent; the app rewrites it at the next
+session start when it does not match, which is a repair, not a tamper check.
 
 An upgrade asks the running app to quit and stops if it refuses. Unresolved
 recovery prevents replacing the existing recovery agent; follow the reported
