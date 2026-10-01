@@ -2,13 +2,39 @@ import Foundation
 import IOKit
 import IOKit.ps
 
+/// What the power source list says about the built-in battery. A desktop
+/// has none and the battery floors do not apply; a laptop whose battery
+/// cannot be read is a different state, because the end floor cannot be
+/// applied there either and the session must not run blind (spec section 6).
+enum BatteryStatus: Equatable, Sendable {
+    /// No internal battery.
+    case none
+    /// Battery present and its level read.
+    case percent(Int)
+    /// Battery present but its level not read: the power source list was
+    /// unavailable, had no internal battery entry, or the entry had no usable
+    /// capacity. `misses` counts consecutive reads in this state, capped at
+    /// 2; one is tolerated as a transient IOKit miss.
+    case unreadable(misses: Int)
+
+    var percent: Int? {
+        if case let .percent(p) = self { return p }
+        return nil
+    }
+}
+
 /// Spec section 6 event sources: `IOPSNotificationCreateRunLoopSource` for
 /// battery changes and `ProcessInfo.thermalStateDidChangeNotification`.
 /// Watts are read from `AppleSmartBattery` only when `instantWatts()` is
-/// called (the popover opening), never polled.
+/// called (the popover opening), never polled. While the battery is
+/// unreadable the list is re-read every `recheckDelay`, since IOKit sends
+/// no event for a read that keeps failing.
 @MainActor
 final class PowerMonitor {
-    private(set) var percent: Int?
+    typealias Reader = @Sendable () -> (battery: BatteryStatus, charging: Bool)
+
+    private(set) var battery: BatteryStatus = .none
+    var percent: Int? { battery.percent }
     /// True when on AC power or actively charging. The floor rules treat
     /// "charger connected" as the undo condition (spec section 6).
     private(set) var isCharging: Bool = false
@@ -17,13 +43,24 @@ final class PowerMonitor {
     /// Called on the main actor after any battery or thermal change.
     var onChange: (() -> Void)?
 
+    private let reader: Reader
+    private let recheckDelay: Duration
     private var source: CFRunLoopSource?
     private var thermalObserver: NSObjectProtocol?
+    private var running = false
+    private var recheck: Task<Void, Never>?
 
-    init() {}
+    /// `reader` and `recheckDelay` are injection points for tests; the
+    /// defaults read IOKit and wait 30 s between re-reads of an unreadable
+    /// battery.
+    init(reader: @escaping Reader = { PowerMonitor.readBattery() }, recheckDelay: Duration = .seconds(30)) {
+        self.reader = reader
+        self.recheckDelay = recheckDelay
+    }
 
     func start() {
-        guard source == nil, thermalObserver == nil else { return }
+        guard !running else { return }
+        running = true
         refreshBattery()
         thermalState = ProcessInfo.processInfo.thermalState
 
@@ -42,10 +79,13 @@ final class PowerMonitor {
         ) { [weak self] _ in
             Task { @MainActor in self?.handleThermal() }
         }
-        Log.info("power monitor started (battery \(percent.map(String.init) ?? "n/a")%, \(isCharging ? "charging" : "on battery"), thermal \(Self.name(thermalState)))")
+        Log.info("power monitor started (battery \(Self.describe(battery)), \(isCharging ? "charging" : "on battery"), thermal \(Self.name(thermalState)))")
     }
 
     func stop() {
+        running = false
+        recheck?.cancel()
+        recheck = nil
         if let s = source {
             CFRunLoopRemoveSource(CFRunLoopGetMain(), s, .commonModes)
             source = nil
@@ -57,11 +97,18 @@ final class PowerMonitor {
     }
 
     /// Re-read the power source list synchronously. Cheap; used by the
-    /// popover's on-demand refresh.
+    /// popover's on-demand refresh. A miss after a miss counts up, so the
+    /// floor rules can tell one transient failure from a battery that stays
+    /// unreadable.
     func refreshBattery() {
-        let snap = Self.readBattery()
-        percent = snap.percent
+        let snap = reader()
+        if case .unreadable = snap.battery, case let .unreadable(misses) = battery {
+            battery = .unreadable(misses: min(misses + 1, 2))
+        } else {
+            battery = snap.battery
+        }
         isCharging = snap.charging
+        scheduleRecheckIfUnreadable()
     }
 
     /// Signed watts: negative while discharging, positive while charging.
@@ -82,24 +129,41 @@ final class PowerMonitor {
 
     // MARK: Reads
 
-    nonisolated static func readBattery() -> (percent: Int?, charging: Bool) {
-        guard let info = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
-              let list = IOPSCopyPowerSourcesList(info)?.takeRetainedValue() as? [CFTypeRef]
-        else { return (nil, false) }
-        for ps in list {
-            guard let desc = IOPSGetPowerSourceDescription(info, ps)?.takeUnretainedValue() as? [String: Any] else { continue }
+    nonisolated static func readBattery() -> (battery: BatteryStatus, charging: Bool) {
+        var sources: [[String: Any]]?
+        if let info = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
+           let list = IOPSCopyPowerSourcesList(info)?.takeRetainedValue() as? [CFTypeRef] {
+            sources = list.compactMap { IOPSGetPowerSourceDescription(info, $0)?.takeUnretainedValue() as? [String: Any] }
+        }
+        return classify(sources: sources, hasBatteryService: hasBatteryService)
+    }
+
+    /// The power source descriptions as `BatteryStatus`. `sources` is nil
+    /// when the list itself could not be read. Without an internal battery
+    /// entry, `hasBatteryService` decides between a desktop (no battery) and
+    /// a laptop whose battery is not reported; it is only consulted then.
+    nonisolated static func classify(sources: [[String: Any]]?, hasBatteryService: () -> Bool) -> (battery: BatteryStatus, charging: Bool) {
+        for desc in sources ?? [] {
             guard desc[kIOPSTypeKey] as? String == kIOPSInternalBatteryType else { continue }
-            let current = desc[kIOPSCurrentCapacityKey] as? Int
-            let max = desc[kIOPSMaxCapacityKey] as? Int
-            var percent: Int?
-            if let current, let max, max > 0 {
-                percent = Int((Double(current) / Double(max) * 100).rounded())
-            }
             let onAC = desc[kIOPSPowerSourceStateKey] as? String == kIOPSACPowerValue
             let charging = desc[kIOPSIsChargingKey] as? Bool ?? false
-            return (percent, onAC || charging)
+            let current = desc[kIOPSCurrentCapacityKey] as? Int
+            let max = desc[kIOPSMaxCapacityKey] as? Int
+            guard let current, let max, max > 0 else {
+                return (.unreadable(misses: 1), onAC || charging)
+            }
+            return (.percent(Int((Double(current) / Double(max) * 100).rounded())), onAC || charging)
         }
-        return (nil, false)
+        return (hasBatteryService() ? .unreadable(misses: 1) : .none, false)
+    }
+
+    /// Whether the machine has a built-in battery at all, from the I/O
+    /// Registry rather than the power source list that just failed.
+    nonisolated static func hasBatteryService() -> Bool {
+        let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSmartBattery"))
+        guard service != 0 else { return false }
+        IOObjectRelease(service)
+        return true
     }
 
     nonisolated static func readInstantWatts() -> Double? {
@@ -128,11 +192,33 @@ final class PowerMonitor {
     }
 
     private func handleBattery() {
-        let before = (percent, isCharging)
+        let before = (battery, isCharging)
         refreshBattery()
-        if before != (percent, isCharging) {
-            Log.info("battery \(percent.map(String.init) ?? "n/a")% \(isCharging ? "charging" : "on battery")")
+        if before != (battery, isCharging) {
+            Log.info("battery \(Self.describe(battery)) \(isCharging ? "charging" : "on battery")")
             onChange?()
+        }
+    }
+
+    /// IOKit reports changes, not a read that keeps failing: while the
+    /// battery is unreadable, re-read it after `recheckDelay` so the second
+    /// miss (or the recovery) is seen. Only while started; `stop()` cancels.
+    private func scheduleRecheckIfUnreadable() {
+        recheck?.cancel()
+        recheck = nil
+        guard running, case .unreadable = battery else { return }
+        recheck = Task { @MainActor [weak self, recheckDelay] in
+            try? await Task.sleep(for: recheckDelay)
+            guard !Task.isCancelled else { return }
+            self?.handleBattery()
+        }
+    }
+
+    static func describe(_ battery: BatteryStatus) -> String {
+        switch battery {
+        case .none: "n/a (no battery)"
+        case let .percent(p): "\(p)%"
+        case let .unreadable(misses): "unreadable (miss \(misses))"
         }
     }
 

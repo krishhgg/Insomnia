@@ -252,15 +252,26 @@ last held while it was on was the battery or thermal floor, not the lid.
 ### 6. Battery and thermal floors
 
 Event sources: `IOPSNotificationCreateRunLoopSource` (fires on every battery
-percentage change) and `ProcessInfo.thermalStateDidChangeNotification`.
+percentage change) and `ProcessInfo.thermalStateDidChangeNotification`. While
+the battery is unreadable the power source list is re-read every 30 s, since
+IOKit sends no event for a read that keeps failing.
 
 | condition | action | undo |
 |---|---|---|
 | battery below `lowPowerFloor` (default 40%) | `pmset -b lowpowermode 1` | charger connected, or session end |
 | battery below `endFloor` (default 10%) | end session, notify | — |
+| battery present but unreadable on two consecutive reads, on battery, `endFloor` above 0 | end session, notify | — |
 | thermal state `serious` | `lowpowermode 1` | thermal back to `nominal`/`fair`, or session end |
 | thermal state `critical` | end session, notify | — |
 | lid closed (if `lowPowerOnLidClose`, charging or not) | `lowpowermode 1`, no notification | lid opened, or session end |
+
+`PowerMonitor` tells a machine with no internal battery (desktop: no floor
+applies) from one whose battery is present but not reported, by checking for
+the `AppleSmartBattery` service when the power source list has no battery
+entry or cannot be read at all. One missed read is tolerated as transient;
+the second ends the session, because the end floor cannot be applied to a
+level nobody can read. An unreadable level never counts as below a floor, so
+it does not enable Low Power Mode by itself.
 
 Insomnia does not enable Low Power Mode merely because a session starts; the
 causes are the battery floor, a serious thermal state, and (by default) a closed
@@ -329,7 +340,8 @@ Backstop, independent of the app:
 ### 9. Notifications
 
 `UNUserNotificationCenter`: session ended (with reason), extend reminder 5
-minutes before end, battery floor reached, thermal action taken, network gap
+minutes before end, battery floor reached, battery unreadable twice in a row,
+thermal action taken, network gap
 recovered (with nudge summary), sleep restored by backstop.
 
 ### 10. Settings
@@ -443,6 +455,7 @@ transitions. If it feels like a web dropdown, it is wrong.
 |---|---|---|
 | lid | IOKit interest notification | none |
 | battery % | IOPS run loop source | none |
+| battery unreadable | re-read every 30 s | one wake per 30 s, only while a session runs and the battery is unreadable |
 | thermal | `ProcessInfo` notification | none |
 | network path | `NWPathMonitor` | none |
 | session deadline | one in-app timer plus independent launchd recovery | recovery checks may wake periodically |
