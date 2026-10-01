@@ -76,11 +76,12 @@ The grant is available to other processes running as your user. Insomnia is not
 sandboxed. The app, scripts, and journals are local; hotspot passwords use the
 login Keychain, not the configuration file.
 
-An upgrade asks the running app to quit and stops if it refuses. Only a
-running copy of this app counts: a process is matched by its executable path
-(the installed bundle) or by its bundle id, not by its name, so the Insomnia
-API client, whose executable is also named Insomnia, is reported and left
-alone. A refusal names the pid and executable path it found. Unresolved
+An upgrade asks the running app to quit and stops if it refuses. A process
+is matched by its executable path (the installed bundle) or by its bundle id,
+not by its name, so the Insomnia API client, whose executable is also named
+Insomnia, is reported and left alone. A process named Insomnia whose bundle id
+cannot be read counts as this app and blocks the upgrade until it exits. A
+refusal names the pid and executable path it found. Unresolved
 recovery prevents replacing the existing recovery agent; follow the reported
 instructions before retrying.
 
@@ -267,8 +268,9 @@ From your checkout:
 The uninstaller requests cleanup before removing the app, agent, and sudoers
 rule. If recovery is incomplete or the app refuses to quit, it stops and names
 the pid and executable path of the copy still running; resolve the reported
-problem and retry. Other processes named Insomnia (the Insomnia API client)
-are reported and left alone. Purge removes owned files, not arbitrary
+problem and retry. A process named Insomnia with another bundle id (the
+Insomnia API client) is reported and left alone; one whose bundle id cannot be
+read blocks the uninstall until it exits. Purge removes owned files, not arbitrary
 directory contents. A small shared lock file is retained to keep concurrent
 recovery operations coordinated.
 

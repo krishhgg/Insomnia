@@ -50,30 +50,44 @@ step() { printf '\n==> %s\n' "$*"; }
 # that name too, so each pid is checked by its executable path (`ps -o
 # comm=`, the full path for an app LaunchServices launched): it is this app
 # when the path is the installed bundle's binary or lies in a bundle whose
-# Info.plist declares $BUNDLE_ID. Any other process is listed so the
-# messages can say what was found, and is otherwise left alone.
+# Info.plist declares $BUNDLE_ID. A process whose bundle id reads as
+# something else is another app and is left alone. One whose identity
+# cannot be read (no path, a path outside any bundle, an Info.plist that
+# does not parse) might be this app, so it counts as this app until it
+# exits: it is never signalled, but nothing is replaced or removed while
+# it runs.
 APP_FOUND=()     # "pid N (path)" per running copy of this app
-OTHER_FOUND=()   # the same for processes named Insomnia that are not
+UNVERIFIED=()    # "pid N (path; why)" per process that could not be told apart from it
+OTHER_FOUND=()   # "pid N (path, bundle id X)" per process proven to be another app
+BLOCKING=()      # APP_FOUND then UNVERIFIED: what must be gone before files are touched
 find_insomnia() {
-  local pid exe bundle id
-  APP_FOUND=(); OTHER_FOUND=()
+  local pid exe bundle id desc
+  APP_FOUND=(); UNVERIFIED=(); OTHER_FOUND=(); BLOCKING=()
   for pid in $("$PGREP" -x -u "$UID_NUM" Insomnia 2>/dev/null); do
     exe="$("$PS" -o comm= -p "$pid" 2>/dev/null || true)"
     id=""
+    desc="${exe:-executable path unknown}"   # what the messages say; gains the reason when unverified
     if [[ "$exe" == /*/Contents/MacOS/* ]]; then
       bundle="${exe%/Contents/MacOS/*}"
       id="$("$PLUTIL" -extract CFBundleIdentifier raw -o - "$bundle/Contents/Info.plist" 2>/dev/null || true)"
+      [[ -n "$id" ]] || desc="$exe; no bundle id readable from $bundle/Contents/Info.plist"
+    elif [[ -n "$exe" ]]; then
+      desc="$exe; not inside an app bundle, so no bundle id to read"
     fi
     if [[ "$exe" == "$APP/Contents/MacOS/Insomnia" || "$id" == "$BUNDLE_ID" ]]; then
-      APP_FOUND+=("pid $pid (${exe:-executable path unknown})")
+      APP_FOUND+=("pid $pid ($exe)")
+      BLOCKING+=("pid $pid ($exe)")
+    elif [[ -n "$id" ]]; then
+      OTHER_FOUND+=("pid $pid ($exe, bundle id $id)")
     else
-      OTHER_FOUND+=("pid $pid (${exe:-executable path unknown}${id:+, bundle id $id})")
+      UNVERIFIED+=("pid $pid ($desc)")
+      BLOCKING+=("pid $pid ($desc)")
     fi
   done
 }
 app_running() {
   find_insomnia
-  (( ${#APP_FOUND[@]} > 0 ))
+  (( ${#BLOCKING[@]} > 0 ))
 }
 # Comma-separated list, for messages. Call only with at least one argument:
 # bash 3.2 (/bin/bash) treats an empty array as unbound under `set -u`.
@@ -81,6 +95,10 @@ list() { local IFS=', '; echo "$*"; }
 report_others() {
   (( ${#OTHER_FOUND[@]} > 0 )) || return 0
   echo "Ignoring ${#OTHER_FOUND[@]} process(es) named Insomnia that are not this app: $(list "${OTHER_FOUND[@]}")."
+}
+report_unverified() {
+  (( ${#UNVERIFIED[@]} > 0 )) || return 0
+  echo "Cannot tell whether ${#UNVERIFIED[@]} process(es) named Insomnia are this app, so they count as it until they exit: $(list "${UNVERIFIED[@]}")."
 }
 
 # 1. Build -------------------------------------------------------------------
@@ -124,19 +142,23 @@ step "Assembling $APP"
 # Ask the app to quit and wait until it has actually exited. It refuses to
 # quit while it has unresolved recovery work; that refusal stands (no pkill),
 # and nothing of the old install is overwritten while it is still running.
-# Only this app counts (find_insomnia); another process named Insomnia is
-# reported and left alone.
+# This app counts, and so does a process named Insomnia that cannot be told
+# apart from it (find_insomnia); one proven to be another app is reported
+# and left alone.
 if app_running; then
   report_others
-  echo "Insomnia is running ($(list "${APP_FOUND[@]}")); quitting it first (this ends any session)."
+  report_unverified
+  if (( ${#APP_FOUND[@]} > 0 )); then
+    echo "Insomnia is running ($(list "${APP_FOUND[@]}")); quitting it first (this ends any session)."
+  fi
   "$OSASCRIPT" -e "tell application id \"$BUNDLE_ID\" to quit" >/dev/null 2>&1 || true
   for (( i = 0; i < QUIT_WAIT_SECONDS; i++ )); do
     app_running || break
     sleep 1
   done
   if app_running; then
-    echo "Insomnia is still running after ${QUIT_WAIT_SECONDS}s (it may be refusing to quit until its own recovery finishes): $(list "${APP_FOUND[@]}")." >&2
-    echo "Let it finish or quit it from its menu, then rerun. $SUDOERS is installed; the app, backstop.sh and LaunchAgent were not touched." >&2
+    echo "Insomnia is still running after ${QUIT_WAIT_SECONDS}s (it may be refusing to quit until its own recovery finishes, or a process named Insomnia could not be identified): $(list "${BLOCKING[@]}")." >&2
+    echo "Let it finish or quit it from its menu, quit any process listed as unverified, then rerun. $SUDOERS is installed; the app, backstop.sh and LaunchAgent were not touched." >&2
     exit 1
   fi
 else
@@ -175,7 +197,7 @@ if (( lock_rc != 0 )); then
   exit 75
 fi
 if app_running; then
-  echo "Insomnia started again ($(list "${APP_FOUND[@]}")); quit it and rerun. The LaunchAgent was not touched." >&2
+  echo "Insomnia started again ($(list "${BLOCKING[@]}")); quit it and rerun. The LaunchAgent was not touched." >&2
   exit 1
 fi
 

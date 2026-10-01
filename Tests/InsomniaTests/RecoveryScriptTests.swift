@@ -1479,23 +1479,74 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, true)
     }
 
-    /// A pid pgrep reported but ps cannot describe (gone in between, or an
-    /// executable path that is not inside any bundle) is not this app, and
-    /// the message says what little is known about it.
-    func testProcessWithoutAnIdentifiablePathIsNotTreatedAsThisApp() throws {
+    /// A pid pgrep reported but ps cannot describe, or whose executable is
+    /// not inside any bundle, might be this app. It is never signalled, but
+    /// nothing is removed while it runs, and the refusal says why.
+    func testProcessWithoutAnIdentifiablePathBlocksUninstall() throws {
         try fx.installMachinery()
         try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
         fx.setMode("pgrep", "0\n")
         try fx.pgrepPids([4242, 5151])
-        try fx.psComm([(5151, "./Insomnia")])      // 4242 has no row: gone by the time ps looked
+        try fx.psComm([(5151, "./Insomnia")])      // 4242 has no row: ps could not describe it
 
         let r = try fx.run(fx.uninstall)
 
-        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
-        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("osascript") }, "\(fx.calls())")
-        XCTAssertTrue(r.stdout.contains("pid 4242 (executable path unknown)"), r.stdout)
-        XCTAssertTrue(r.stdout.contains("pid 5151 (./Insomnia)"), r.stdout)
-        XCTAssertFalse(fx.exists(fx.app))
+        XCTAssertNotEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("pkill") || $0.hasPrefix("kill") }, "\(fx.calls())")
+        XCTAssertTrue(r.stdout.contains("Cannot tell whether 2 process(es) named Insomnia are this app"), r.stdout)
+        XCTAssertTrue(r.stderr.contains("pid 4242 (executable path unknown)"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("pid 5151 (./Insomnia; not inside an app bundle"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("Nothing was removed"), r.stderr)
+        XCTAssertTrue(fx.exists(fx.app))
+        XCTAssertTrue(fx.exists(fx.plist))
+        XCTAssertTrue(fx.exists(fx.sudoers))
+    }
+
+    /// A development copy whose Info.plist no longer parses while it runs:
+    /// its bundle id cannot be read, so it is not proven to be another app.
+    /// The installer waits for it and then refuses, naming the plist, and
+    /// the installed bundle is left as it was.
+    func testInstallRefusesWhileACopyWithAnUnreadableInfoPlistRuns() throws {
+        try fx.prepareInstall()
+        try fx.installMachinery()
+        let dev = try fx.otherBundle(in: "DevBuild", bundleId: "com.kgarg.insomnia")
+        let plist = dev.deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("Info.plist")
+        try "not a plist".write(to: plist, atomically: true, encoding: .utf8)
+        fx.setMode("pgrep", "0\n")                 // running, and it stays running
+        try fx.psComm([(4242, dev.path)])
+
+        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("pkill") }, "\(fx.calls())")
+        XCTAssertTrue(r.stdout.contains("Cannot tell whether 1 process(es) named Insomnia are this app"), r.stdout)
+        XCTAssertTrue(r.stderr.contains("still running"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("pid 4242 (\(dev.path); no bundle id readable from \(plist.path))"), r.stderr)
+        XCTAssertEqual(try String(contentsOf: fx.installedExecutable, encoding: .utf8), "binary", "old bundle replaced")
+        XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "plist", "LaunchAgent replaced")
+    }
+
+    /// The same copy during an uninstall: the API client beside it, with a
+    /// readable bundle id, is still ignored; the unverified copy blocks.
+    func testUninstallRefusesWhileACopyWithAnUnreadableInfoPlistRunsAndStillIgnoresTheClient() throws {
+        try fx.installMachinery()
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        let client = try fx.otherBundle(in: "Applications-foreign", bundleId: "com.insomnia.app")
+        let dev = try fx.otherBundle(in: "DevBuild", bundleId: "com.kgarg.insomnia")
+        try "".write(to: dev.deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("Info.plist"), atomically: true, encoding: .utf8)
+        fx.setMode("pgrep", "0\n")
+        try fx.pgrepPids([4242, 5151])
+        try fx.psComm([(4242, client.path), (5151, dev.path)])
+
+        let r = try fx.run(fx.uninstall)
+
+        XCTAssertNotEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertTrue(r.stdout.contains("Ignoring 1 process(es) named Insomnia that are not this app: pid 4242 (\(client.path), bundle id com.insomnia.app)"), r.stdout)
+        XCTAssertTrue(r.stdout.contains("Cannot tell whether 1 process(es) named Insomnia are this app"), r.stdout)
+        XCTAssertTrue(r.stderr.contains("pid 5151 (\(dev.path); no bundle id readable from"), r.stderr)
+        XCTAssertFalse(r.stderr.contains("pid 4242"), "the identified client must not be listed as blocking: \(r.stderr)")
+        XCTAssertTrue(fx.exists(fx.app))
+        XCTAssertTrue(fx.exists(fx.plist))
     }
 }
 
