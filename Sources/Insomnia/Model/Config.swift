@@ -34,7 +34,10 @@ struct Config: Codable, Equatable, Sendable {
     // Battery / thermal floors
     /// Battery percentage below which Low Power Mode is switched on.
     var lowPowerFloor: Int = 40
-    /// Battery percentage below which the session is ended.
+    /// Battery percentage below which the session is ended. 0 turns the
+    /// battery end off. Otherwise kept below `lowPowerFloor`, so Low Power
+    /// Mode always comes first: see `setEndFloor`, `setLowPowerFloor` and
+    /// `normalizeFloors`.
     var endFloor: Int = 10
     var thermalRules: Bool = true
 
@@ -113,5 +116,54 @@ struct Config: Codable, Equatable, Sendable {
         nudgeThreshold = try c.decodeIfPresent(TimeInterval.self, forKey: .nudgeThreshold) ?? d.nudgeThreshold
         tmuxTargets = try c.decodeIfPresent([String].self, forKey: .tmuxTargets) ?? d.tmuxTargets
         launchAtLogin = try c.decodeIfPresent(Bool.self, forKey: .launchAtLogin) ?? d.launchAtLogin
+    }
+}
+
+// MARK: Battery floors
+
+extension Config {
+    /// Settings step for both floors; the floors are kept at least one step
+    /// apart.
+    static let floorStep = 5
+    /// Highest end floor Settings offers: one step below a 100% Low Power
+    /// Mode floor.
+    static let maxEndFloor = 100 - floorStep
+
+    /// The order the rules expect: Low Power Mode before the end, unless the
+    /// end is off.
+    var floorsAreOrdered: Bool { endFloor == 0 || endFloor < lowPowerFloor }
+
+    /// Sets the end floor (0...`maxEndFloor`) and raises the Low Power Mode
+    /// floor one step above it when it would otherwise not be above it.
+    mutating func setEndFloor(_ value: Int) {
+        endFloor = min(max(value, 0), Config.maxEndFloor)
+        if endFloor > 0, lowPowerFloor <= endFloor {
+            lowPowerFloor = min(endFloor + Config.floorStep, 100)
+        }
+    }
+
+    /// Sets the Low Power Mode floor (0...100) and lowers the end floor one
+    /// step below it when it would otherwise not be below it. An end floor
+    /// pushed to 0 is off.
+    mutating func setLowPowerFloor(_ value: Int) {
+        lowPowerFloor = min(max(value, 0), 100)
+        if endFloor > 0, endFloor >= lowPowerFloor {
+            endFloor = max(lowPowerFloor - Config.floorStep, 0)
+        }
+    }
+
+    /// Clamps both floors to their ranges and restores the order by raising
+    /// the Low Power Mode floor, never by lowering the end the user asked
+    /// for. Returns a description of the change for the log, or nil when
+    /// nothing changed. Run on a config.json that Settings did not write.
+    mutating func normalizeFloors() -> String? {
+        let before = (lowPowerFloor, endFloor)
+        lowPowerFloor = min(max(lowPowerFloor, 0), 100)
+        endFloor = min(max(endFloor, 0), Config.maxEndFloor)
+        if !floorsAreOrdered {
+            lowPowerFloor = min(endFloor + Config.floorStep, 100)
+        }
+        guard (lowPowerFloor, endFloor) != before else { return nil }
+        return "battery floors corrected: lowPowerFloor \(before.0) -> \(lowPowerFloor), endFloor \(before.1) -> \(endFloor)"
     }
 }

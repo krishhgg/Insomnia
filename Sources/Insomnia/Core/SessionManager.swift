@@ -185,7 +185,13 @@ final class SessionManager {
         }
         self.state = loadedState ?? .clean
         self.lastError = loadError
-        if let c = (try? store.loadConfig()) ?? nil {
+        if var c = (try? store.loadConfig()) ?? nil {
+            // Settings keeps the end floor below the Low Power Mode floor; a
+            // hand-edited config.json may not. Fix it here and write it back.
+            if let change = c.normalizeFloors() {
+                Log.info("config.json: \(change)")
+                try? store.saveConfig(c)
+            }
             self.config = c
         } else {
             self.config = Config()

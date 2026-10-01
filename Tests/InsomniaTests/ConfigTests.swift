@@ -27,6 +27,102 @@ final class ConfigTests: XCTestCase {
         XCTAssertFalse(c.launchAtLogin)
     }
 
+    // MARK: Battery floors
+
+    func testDefaultFloorsAreOrdered() {
+        XCTAssertTrue(Config().floorsAreOrdered)
+        XCTAssertEqual(Config.floorStep, 5)
+        XCTAssertEqual(Config.maxEndFloor, 95)
+    }
+
+    /// Raising the end floor onto or past the Low Power Mode floor pushes
+    /// that floor one step up; the end floor itself stops at 95.
+    func testRaisingEndFloorPushesLowPowerFloorUp() {
+        var c = Config()
+        c.setEndFloor(35)
+        XCTAssertEqual([c.lowPowerFloor, c.endFloor], [40, 35])
+        c.setEndFloor(40)
+        XCTAssertEqual([c.lowPowerFloor, c.endFloor], [45, 40])
+        c.setEndFloor(70)
+        XCTAssertEqual([c.lowPowerFloor, c.endFloor], [75, 70])
+        c.setEndFloor(100)
+        XCTAssertEqual([c.lowPowerFloor, c.endFloor], [100, 95])
+        c.setEndFloor(-5)
+        XCTAssertEqual([c.lowPowerFloor, c.endFloor], [100, 0])
+        XCTAssertTrue(c.floorsAreOrdered)
+    }
+
+    /// Lowering the Low Power Mode floor onto or past the end floor pulls
+    /// the end floor one step down, to 0 (off) at the bottom.
+    func testLoweringLowPowerFloorPullsEndFloorDown() {
+        var c = Config()
+        c.setLowPowerFloor(15)
+        XCTAssertEqual([c.lowPowerFloor, c.endFloor], [15, 10])
+        c.setLowPowerFloor(10)
+        XCTAssertEqual([c.lowPowerFloor, c.endFloor], [10, 5])
+        c.setLowPowerFloor(5)
+        XCTAssertEqual([c.lowPowerFloor, c.endFloor], [5, 0])
+        c.setLowPowerFloor(0)
+        XCTAssertEqual([c.lowPowerFloor, c.endFloor], [0, 0])
+        c.setLowPowerFloor(150)
+        XCTAssertEqual([c.lowPowerFloor, c.endFloor], [100, 0])
+        XCTAssertTrue(c.floorsAreOrdered)
+    }
+
+    /// An end floor of 0 is off and stays off wherever the other floor goes.
+    func testEndFloorOffIsNotMovedByTheLowPowerFloor() {
+        var c = Config()
+        c.setEndFloor(0)
+        for v in [100, 40, 5, 0] {
+            c.setLowPowerFloor(v)
+            XCTAssertEqual(c.endFloor, 0, "lowPowerFloor \(v)")
+            XCTAssertTrue(c.floorsAreOrdered)
+        }
+    }
+
+    /// Decoding keeps whatever the file says; normalization is a separate
+    /// step that fixes the order by raising the Low Power Mode floor and
+    /// reports the change.
+    func testNormalizeFloorsCorrectsAnOutOfOrderFile() throws {
+        var c = try Store.makeDecoder().decode(Config.self, from: Data(#"{"lowPowerFloor": 40, "endFloor": 60}"#.utf8))
+        XCTAssertEqual([c.lowPowerFloor, c.endFloor], [40, 60])
+        XCTAssertFalse(c.floorsAreOrdered)
+
+        let change = c.normalizeFloors()
+
+        XCTAssertEqual([c.lowPowerFloor, c.endFloor], [65, 60])
+        XCTAssertEqual(change, "battery floors corrected: lowPowerFloor 40 -> 65, endFloor 60 -> 60")
+        XCTAssertTrue(c.floorsAreOrdered)
+    }
+
+    func testNormalizeFloorsClampsOutOfRangeValues() {
+        var c = Config()
+        c.lowPowerFloor = 140
+        c.endFloor = 100
+        XCTAssertEqual(c.normalizeFloors(), "battery floors corrected: lowPowerFloor 140 -> 100, endFloor 100 -> 95")
+        XCTAssertEqual([c.lowPowerFloor, c.endFloor], [100, 95])
+
+        var d = Config()
+        d.endFloor = -3
+        XCTAssertEqual(d.normalizeFloors(), "battery floors corrected: lowPowerFloor 40 -> 40, endFloor -3 -> 0")
+        XCTAssertEqual([d.lowPowerFloor, d.endFloor], [40, 0])
+
+        var e = Config()
+        e.lowPowerFloor = 40
+        e.endFloor = 40
+        XCTAssertEqual(e.normalizeFloors(), "battery floors corrected: lowPowerFloor 40 -> 45, endFloor 40 -> 40")
+    }
+
+    func testNormalizeFloorsLeavesAnOrderedConfigAlone() {
+        for (low, end) in [(40, 10), (5, 0), (0, 0), (100, 95), (100, 0)] {
+            var c = Config()
+            c.lowPowerFloor = low
+            c.endFloor = end
+            XCTAssertNil(c.normalizeFloors(), "\(low)/\(end)")
+            XCTAssertEqual([c.lowPowerFloor, c.endFloor], [low, end])
+        }
+    }
+
     func testPartialJSONFillsDefaults() throws {
         let data = Data(#"{"lowPowerFloor": 25}"#.utf8)
         let c = try Store.makeDecoder().decode(Config.self, from: data)
@@ -97,5 +193,44 @@ final class ConfigTests: XCTestCase {
         c.presets = [60]
         let data = try Store.makeEncoder().encode(c)
         XCTAssertEqual(try Store.makeDecoder().decode(Config.self, from: data), c)
+    }
+}
+
+/// SessionManager normalizes the floors when it loads config.json.
+@MainActor
+final class ConfigLoadTests: XCTestCase {
+    var h: Harness!
+
+    override func setUp() async throws { h = Harness() }
+    override func tearDown() async throws { h.home.destroy() }
+
+    private func log() -> String {
+        (try? String(contentsOf: h.home.paths.logFile, encoding: .utf8)) ?? ""
+    }
+
+    func testOutOfOrderFloorsAreCorrectedLoggedAndWrittenBack() throws {
+        var bad = Config()
+        bad.lowPowerFloor = 40
+        bad.endFloor = 60
+        try h.store.saveConfig(bad)
+
+        let m = h.makeManager()
+
+        XCTAssertEqual([m.config.lowPowerFloor, m.config.endFloor], [65, 60])
+        XCTAssertTrue(m.config.floorsAreOrdered)
+        XCTAssertEqual(try h.store.loadConfig(), m.config, "the corrected config was not written back")
+        XCTAssertTrue(log().contains("config.json: battery floors corrected: lowPowerFloor 40 -> 65, endFloor 60 -> 60"), log())
+    }
+
+    func testOrderedFloorsLoadUnchanged() throws {
+        var fine = Config()
+        fine.lowPowerFloor = 30
+        fine.endFloor = 25
+        try h.store.saveConfig(fine)
+
+        let m = h.makeManager()
+
+        XCTAssertEqual(m.config, fine)
+        XCTAssertFalse(log().contains("battery floors corrected"), log())
     }
 }

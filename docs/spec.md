@@ -257,10 +257,16 @@ percentage change) and `ProcessInfo.thermalStateDidChangeNotification`.
 | condition | action | undo |
 |---|---|---|
 | battery below `lowPowerFloor` (default 40%) | `pmset -b lowpowermode 1` | charger connected, or session end |
-| battery below `endFloor` (default 10%) | end session, notify | — |
+| battery below `endFloor` (default 10%; 0 turns the end off) | end session, notify | — |
 | thermal state `serious` | `lowpowermode 1` | thermal back to `nominal`/`fair`, or session end |
 | thermal state `critical` | end session, notify | — |
 | lid closed (if `lowPowerOnLidClose`, charging or not) | `lowpowermode 1`, no notification | lid opened, or session end |
+
+A non-zero `endFloor` stays below `lowPowerFloor` so Low Power Mode comes
+first. Settings enforces it in 5% steps by moving the other floor when the
+two would cross (`endFloor` at most 95). A `config.json` that violates it is
+corrected at load by raising `lowPowerFloor` to `endFloor` + 5 (capped at
+100), logged, and written back.
 
 Insomnia does not enable Low Power Mode merely because a session starts; the
 causes are the battery floor, a serious thermal state, and (by default) a closed
