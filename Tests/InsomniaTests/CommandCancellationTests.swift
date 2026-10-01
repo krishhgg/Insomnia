@@ -116,6 +116,113 @@ final class CommandCancellationTests: XCTestCase {
     /// The window Greptile flagged: the caller has already passed its
     /// cancellation check, the launch is queued, and the task is cancelled
     /// before `Process.run`. The child must never start.
+    // MARK: StopPolicy.terminateOnly (privileged commands: sudo pmset)
+
+    /// A script that ignores SIGTERM (the disposition survives exec), then
+    /// records its pid and *becomes* `sleep`, so the recorded pid is the one
+    /// the runner signals and only SIGKILL could end it early. The pid file
+    /// appears only once the trap is in place.
+    private func termIgnorer() throws -> (exe: String, pidFile: String) {
+        let pidFile = file("pid")
+        let exe = try script("ignorer", "trap '' TERM\nprintf '%s' $$ > '\(pidFile)'\nexec sleep 30")
+        return (exe, pidFile)
+    }
+
+    private func isAlive(_ pid: pid_t) -> Bool {
+        kill(pid, 0) == 0 || errno != ESRCH
+    }
+
+    /// The backstop's rule, now in the app: a privileged child that ignores
+    /// SIGTERM is never SIGKILLed. The call reports it as still running,
+    /// with the pid, as soon as the grace is over, not when it finally
+    /// exits, and the handle resolves once it does.
+    func testTerminateOnlyNeverSendsSigkillAndReportsTheChildAsStillRunning() async throws {
+        let (exe, pidFile) = try termIgnorer()
+        let started = Date()
+        var reported: UnfinishedCommand?
+        // One second leaves room for a slow spawn under parallel test load;
+        // the trap is in place long before the deadline.
+        do {
+            _ = try await CancellableCommand().run(exe, [], timeout: 1, stop: .terminateOnly(grace: 0.5))
+            XCTFail("a child that ignores TERM returned a result")
+        } catch let error as CommandStillRunningError {
+            reported = error.command
+            XCTAssertEqual(error.reason, .timeout(seconds: 1))
+            XCTAssertEqual(error.grace, 0.5)
+            XCTAssertTrue(error.localizedDescription.contains("left running"), error.localizedDescription)
+        }
+        let command = try XCTUnwrap(reported)
+        XCTAssertLessThan(Date().timeIntervalSince(started), 5, "the call waited for the child instead of reporting it")
+        let pid = try recordedPid(pidFile)
+        XCTAssertEqual(command.pid, pid)
+        XCTAssertTrue(command.isRunning)
+        XCTAssertNil(command.terminationStatus)
+        // Still alive well after the second a SIGKILL would have landed.
+        try await Task.sleep(for: .milliseconds(1500))
+        XCTAssertTrue(isAlive(pid), "the child was killed")
+        XCTAssertTrue(command.isRunning)
+
+        // The test, standing in for the operator, ends it; the handle sees the exit.
+        kill(pid, SIGKILL)
+        await command.waitUntilExit()
+        XCTAssertFalse(command.isRunning)
+        XCTAssertNotNil(command.terminationStatus)
+        try await assertGone(pid)
+    }
+
+    /// A privileged child that does stop on SIGTERM is a plain timeout, as
+    /// before; nothing is reported as running.
+    func testTerminateOnlyStillReportsATimeoutWhenTheChildStopsOnTerm() async throws {
+        let (exe, pidFile) = try sleeper()
+        do {
+            _ = try await CancellableCommand().run(exe, [], timeout: 1, stop: .terminateOnly(grace: 3))
+            XCTFail("command outlived its timeout")
+        } catch is ShellTimeoutError {}
+        try await assertGone(try recordedPid(pidFile))
+    }
+
+    func testCancelUnderTerminateOnlyReportsAChildThatIgnoresTermAsStillRunning() async throws {
+        let (exe, pidFile) = try termIgnorer()
+        let task = Task { try await CancellableCommand().run(exe, [], timeout: 30, stop: .terminateOnly(grace: 0.3)) }
+        try await waitForFile(pidFile)
+        let pid = try recordedPid(pidFile)
+        task.cancel()
+        do {
+            _ = try await task.value
+            XCTFail("cancelled command returned a result")
+        } catch let error as CommandStillRunningError {
+            XCTAssertEqual(error.reason, .cancelled)
+            XCTAssertEqual(error.command.pid, pid)
+            XCTAssertTrue(error.command.isRunning)
+            kill(pid, SIGKILL)
+            await error.command.waitUntilExit()
+        }
+        try await assertGone(pid)
+    }
+
+    func testCancelUnderTerminateOnlyIsACancellationWhenTheChildStops() async throws {
+        let (exe, pidFile) = try sleeper()
+        let task = Task { try await CancellableCommand().run(exe, [], timeout: 30, stop: .terminateOnly(grace: 3)) }
+        try await waitForFile(pidFile)
+        task.cancel()
+        do {
+            _ = try await task.value
+            XCTFail("cancelled command returned a result")
+        } catch is CancellationError {}
+        try await assertGone(try recordedPid(pidFile))
+    }
+
+    /// Non-privileged callers keep the escalation: a child that ignores TERM
+    /// is SIGKILLed a second later and the call is a timeout.
+    func testDefaultPolicyStillKillsAChildThatIgnoresTerm() async throws {
+        let (exe, pidFile) = try termIgnorer()
+        do {
+            _ = try await CancellableCommand().run(exe, [], timeout: 1)
+            XCTFail("command outlived its timeout")
+        } catch is ShellTimeoutError {}
+        try await assertGone(try recordedPid(pidFile))
+    }
+
     func testCancelBeforeLaunchNeverRunsTheChild() async throws {
         let sentinel = file("ran")
         let exe = try script("sentinel", "printf '' > '\(sentinel)'")

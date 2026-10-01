@@ -316,6 +316,14 @@ Backstop, independent of the app:
   the loaded job for every extension and allow retries after a failure.
 - App and script transactions must coordinate through a shared lock. Failure
   to acquire it must not permit an unprotected journal write or side effect.
+- A `sudo pmset` is sent SIGTERM at its timeout (20 s in the app, 30 s in the
+  agent), never SIGKILL: a killed sudo can orphan a root pmset that still
+  changes power state later, outside any transaction. One still running 3 s
+  after SIGTERM stops the transaction where it is, in the app as in the
+  agent's `run_bounded`: nothing else is undone, the journal keeps every
+  entry it had, and the recovery lock stays held until the command exits.
+  The app reports the pid with the `sudo kill` command, refuses to quit or
+  start a session until then, and retries the end when the command exits.
 - Successful restores may clear their entries; failures must stay journaled.
   Process recovery must verify identity and avoid resuming a process that
   Insomnia did not stop. Old PID-only entries need conservative handling.

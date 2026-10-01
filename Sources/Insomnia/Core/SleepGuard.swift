@@ -35,6 +35,10 @@ struct PmsetSleepGuard: SleepGuarding {
     /// pmset normally returns in well under a second; a hung powerd must not
     /// hang a quit or a lid action forever.
     static let timeout: TimeInterval = 20
+    /// How long a `sudo pmset` gets to exit after SIGTERM before it is
+    /// reported as still running. The same 3 s as KILL_GRACE_SECONDS in
+    /// scripts/backstop.sh.
+    static let stopGrace: TimeInterval = 3
 
     func setSleepDisabled(_ disabled: Bool) async throws {
         try await sudoPmset(["-a", "disablesleep", disabled ? "1" : "0"])
@@ -101,13 +105,18 @@ struct PmsetSleepGuard: SleepGuarding {
         return nil
     }
 
+    /// Throws `CommandStillRunningError` when sudo does not stop on SIGTERM
+    /// within `stopGrace`: the child is never SIGKILLed, because that would
+    /// orphan a root pmset that can still change power state after the
+    /// journal has moved on. The caller must keep its lock and journal
+    /// entry until `error.command.waitUntilExit()` returns.
     private func sudoPmset(_ args: [String]) async throws {
         let full = [Self.pmset] + args
         // CancellableCommand, not Shell.run(timeout:): it reports a child
         // that had to be stopped at the deadline as a timeout even if the
-        // child exits 0 on SIGTERM, and a caller cancelled mid-flight kills
+        // child exits 0 on SIGTERM, and a caller cancelled mid-flight stops
         // the child instead of leaving it running.
-        let r = try await CancellableCommand().run(Self.sudo, ["-n"] + full, timeout: Self.timeout)
+        let r = try await CancellableCommand().run(Self.sudo, ["-n"] + full, timeout: Self.timeout, stop: .terminateOnly(grace: Self.stopGrace))
         guard r.succeeded else {
             throw SleepGuardError(command: "sudo -n \(full.joined(separator: " "))", status: r.status, stderr: r.stderr)
         }

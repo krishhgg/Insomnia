@@ -37,12 +37,23 @@ enum EndOutcome: Sendable, Equatable {
     /// know what to undo and will not guess. The session stays active until
     /// a person fixes or moves the file.
     case journalUnreadable
+    /// A `sudo pmset` did not stop on SIGTERM and is still running (pid).
+    /// It is never SIGKILLed: that could leave a root pmset changing power
+    /// state after the journal moved on. Nothing after it was undone, the
+    /// journal keeps every entry it had, and the recovery lock stays held on
+    /// the command's behalf until it exits; the end is retried then and
+    /// quit is refused meanwhile, since the app exiting would drop the lock
+    /// and let the backstop run a second pmset beside the live one.
+    case privilegedCommandRunning(pid: Int32)
 }
 
 /// Why a lifecycle transaction did not run at all.
 enum TransactionRefusal: Error, Sendable {
     case lockBusy(String)
     case journalUnreadable(String)
+    /// A `sudo pmset` from an earlier transaction is still running and holds
+    /// the recovery lock through this process (see `EndOutcome`).
+    case commandRunning(pid: Int32)
 }
 
 /// Owns the session lifecycle: start / extend / end / reconcile.
@@ -140,6 +151,12 @@ final class SessionManager {
     /// Detail of the last unreadable-journal notification, so a journal
     /// that stays broken is announced once, not on every transaction.
     @ObservationIgnored private var announcedCorruption: String?
+    /// A `sudo pmset` that did not stop on SIGTERM and is still running.
+    /// Set by the transaction that ran it, which hands its recovery lock to
+    /// a task that releases it when the command exits (`holdLock`); cleared
+    /// then. While set, every transaction is refused and quit is deferred.
+    /// Mirrors run_bounded / stop_transaction in scripts/backstop.sh.
+    @ObservationIgnored private(set) var unfinishedCommand: UnfinishedCommand?
 
     init(
         paths: Paths,
@@ -235,6 +252,13 @@ final class SessionManager {
         let previous = lifecycleTail
         let task = Task<Result<T, TransactionRefusal>, Never> { @MainActor in
             await previous?.value
+            if let stuck = self.unfinishedCommand, stuck.isRunning {
+                // The lock is held in this process for that command; waiting
+                // for it here would only time out. Refused like a busy lock,
+                // but retried by the holder when the command exits.
+                self.fail("\(what) skipped, nothing changed: \(stuck.description) is still running and holds the recovery lock until it exits")
+                return .failure(.commandRunning(pid: stuck.pid))
+            }
             let handle: RecoveryLockHandle
             do {
                 handle = try await self.recoveryLock.acquire(timeout: self.recoveryLockTimeout)
@@ -242,14 +266,24 @@ final class SessionManager {
                 self.fail("\(what) skipped, nothing changed: \(error.localizedDescription)")
                 return .failure(.lockBusy(error.localizedDescription))
             }
-            defer { handle.release() }
+            var lockHandedOver = false
+            defer { if !lockHandedOver { handle.release() } }
             do {
                 try self.loadJournal()
             } catch {
                 self.refuseForUnreadableJournal(what, error)
                 return .failure(.journalUnreadable(error.localizedDescription))
             }
-            return .success(await op())
+            let result = await op()
+            if let stuck = self.unfinishedCommand, stuck.isRunning {
+                // A sudo pmset this transaction ran is still alive. The lock
+                // goes with it, not with the transaction: releasing it now
+                // would let the backstop run a second pmset beside the live
+                // one. stop_transaction in backstop.sh keeps it the same way.
+                lockHandedOver = true
+                self.holdLock(handle, until: stuck)
+            }
+            return .success(result)
         }
         lifecycleTail = Task { _ = await task.value }
         return await task.value
@@ -273,6 +307,46 @@ final class SessionManager {
 
     private static func unreadableJournalMessage(_ error: Error) -> String {
         "\(error.localizedDescription). Insomnia has changed nothing and will not start, extend or end sessions until the file is fixed or moved by hand; it is the only record of what a previous run changed."
+    }
+
+    /// Keep `handle` until `command` exits, then release it and finish what
+    /// the stopped transaction left: a pending end is retried right away,
+    /// since no timer could know when the command would exit. The pid is
+    /// logged the way backstop.sh logs it, so the two logs read the same.
+    private func holdLock(_ handle: RecoveryLockHandle, until command: UnfinishedCommand) {
+        Log.error("recovery lock kept for \(command.description) until it exits; Insomnia cannot start, end or recover until then; stop it by hand (sudo kill \(command.pid)) and the end is retried when it exits")
+        Task { @MainActor [weak self] in
+            await command.waitUntilExit()
+            handle.release()
+            Log.info("\(command.description) exited with status \(command.terminationStatus.map(String.init) ?? "?"); recovery lock released")
+            guard let self else { return }
+            if self.unfinishedCommand === command { self.unfinishedCommand = nil }
+            if let pending = self.pendingEnd {
+                Log.info("retrying pending end (\(pending.rawValue)) now that the command has exited")
+                await self.end(reason: pending == .quit ? .user : pending)
+            }
+        }
+    }
+
+    /// A `sudo pmset` did not stop on SIGTERM (`CommandStillRunningError`).
+    /// The transaction ends here, like stop_transaction in backstop.sh:
+    /// nothing else is undone or changed, the journal keeps every entry it
+    /// had (the flag written before the command stays, so the next run
+    /// retries it), and `exclusive` hands the lock to the command. The user
+    /// is told once, with the pid. `thenEnd` is the end that owes the
+    /// cleanup once the command has exited; it is retried then, and starts
+    /// are refused and quit deferred meanwhile.
+    private func stopTransaction(for error: CommandStillRunningError, thenEnd reason: EndReason?) {
+        unfinishedCommand = error.command
+        fail("\(error.localizedDescription); Insomnia holds the recovery lock and will not quit until it exits (sudo kill \(error.command.pid) to stop it by hand)")
+        notifier.post(
+            title: Self.commandRunningTitle,
+            body: "\(error.command.description) did not stop on SIGTERM and is left running, because killing it could leave a root pmset changing power settings outside the transaction. Nothing else was changed and the journal keeps its entries. Insomnia holds the recovery lock until it exits and will not quit or start a session before then. To stop it by hand: sudo kill \(error.command.pid)."
+        )
+        if let reason {
+            pendingEnd = reason
+            quitRequested = false
+        }
     }
 
     /// Lid actions run their journal writes and signals as one transaction
@@ -351,6 +425,13 @@ final class SessionManager {
 
         do {
             try await sleepGuard.setSleepDisabled(true)
+        } catch let still as CommandStillRunningError {
+            // Whether the setting was applied is unknown and no second pmset
+            // may run beside this one. session.json and the journal stay as
+            // written (the backstop honours that deadline if Insomnia dies);
+            // the start is undone like an end once the command has exited.
+            stopTransaction(for: still, thenEnd: .startFailed)
+            return
         } catch {
             fail("could not disable sleep: \(error.localizedDescription)")
             _ = await performEnd(reason: .startFailed)
@@ -425,6 +506,7 @@ final class SessionManager {
         case let .success(o): outcome = o
         case .failure(.lockBusy): outcome = .locked
         case .failure(.journalUnreadable): outcome = .journalUnreadable
+        case let .failure(.commandRunning(pid)): outcome = .privilegedCommandRunning(pid: pid)
         }
         switch outcome {
         case .restored, .incomplete(agentArmed: true):
@@ -441,6 +523,12 @@ final class SessionManager {
             // No timer: a broken file does not heal by itself. The end stays
             // pending, so new starts are refused and quit is deferred, until
             // the next end request finds a readable journal.
+            pendingEnd = reason
+            quitRequested = false
+        case .privilegedCommandRunning:
+            // No timer either: the task holding the lock for the command
+            // retries the end the moment it exits. Starts are refused and
+            // quit is deferred until then.
             pendingEnd = reason
             quitRequested = false
         }
@@ -465,6 +553,18 @@ final class SessionManager {
         await restoreAll()
         // App Nap defaults are intentionally left set (spec: open decisions).
         services?.stop()
+
+        if let stuck = unfinishedCommand, stuck.isRunning {
+            // restoreAll stopped at a sudo pmset that is still running and
+            // has told the user (stopTransaction). Nothing after it was
+            // undone and the journal keeps its entries; the lock goes to the
+            // command and this end runs again when it exits. Reached from
+            // reconcile and a failed start too, so the pending end is
+            // recorded here, not only in `end()`.
+            pendingEnd = reason
+            quitRequested = false
+            return .privilegedCommandRunning(pid: stuck.pid)
+        }
 
         if state.isDirty || deletionError != nil {
             // The journal is the retry list. Make sure something will read it.
@@ -576,6 +676,11 @@ final class SessionManager {
             }
             do {
                 try await sleepGuard.setLowPowerMode(true)
+            } catch let still as CommandStillRunningError {
+                // No rollback beside a live pmset. Ownership stays journaled;
+                // the session end clears it once the command has exited.
+                stopTransaction(for: still, thenEnd: nil)
+                return false
             } catch {
                 fail("could not enable low power mode: \(error.localizedDescription)")
                 do {
@@ -604,6 +709,11 @@ final class SessionManager {
                 Log.info("low power mode off")
                 settleDisplayAfterLowPower()
                 return true
+            } catch let still as CommandStillRunningError {
+                // Ownership stays journaled; the next evaluation or the
+                // session end retries once the command has exited.
+                stopTransaction(for: still, thenEnd: nil)
+                return false
             } catch {
                 Log.error("could not disable low power mode: \(error.localizedDescription)")
                 return false
@@ -625,12 +735,20 @@ final class SessionManager {
     /// while pmset is running (a lid-close freeze, say) is never overwritten.
     /// Failures are logged and the entry is left set so the next end,
     /// reconcile or the backstop retries it.
+    ///
+    /// A `sudo pmset` that does not stop on SIGTERM ends the restore right
+    /// there, as stop_transaction does in backstop.sh: no later undo runs
+    /// beside the live command, and the journal stays as it was. The caller
+    /// (`performEnd`) reports it and the end is retried once it has exited.
     func restoreAll() async {
         if state.sleepDisabledByUs {
             do {
                 try await sleepGuard.setSleepDisabled(false)
                 try? journal { $0.sleepDisabledByUs = false }
                 Log.info("sleep restored")
+            } catch let still as CommandStillRunningError {
+                stopTransaction(for: still, thenEnd: nil)
+                return
             } catch {
                 fail("could not restore sleep: \(error.localizedDescription)")
             }
@@ -644,6 +762,9 @@ final class SessionManager {
                 try? journal { $0.lowPowerSetByUs = false }
                 Log.info("low power mode cleared")
                 lowPowerJustCleared = true
+            } catch let still as CommandStillRunningError {
+                stopTransaction(for: still, thenEnd: nil)
+                return
             } catch {
                 fail("could not clear low power mode: \(error.localizedDescription)")
             }
@@ -895,6 +1016,12 @@ final class SessionManager {
             do {
                 try await sleepGuard.setSleepDisabled(true)
                 lastError = nil
+            } catch let still as CommandStillRunningError {
+                // Not surfaced: the session file and journal stay for the end
+                // that runs once the command has exited.
+                session = nil
+                stopTransaction(for: still, thenEnd: .recoveryUnavailable)
+                return
             } catch {
                 fail("could not re-apply sleep guard: \(error.localizedDescription); ending session")
                 _ = await performEnd(reason: .recoveryUnavailable)
@@ -941,6 +1068,8 @@ final class SessionManager {
                 Log.info("reconcile: pmset reports SleepDisabled with no session, clearing")
                 try await sleepGuard.setSleepDisabled(false)
             }
+        } catch let still as CommandStillRunningError {
+            stopTransaction(for: still, thenEnd: nil)
         } catch {
             Log.error("reconcile: sleep check failed: \(error.localizedDescription)")
         }
@@ -1065,6 +1194,7 @@ final class SessionManager {
     static let incompleteTitle = "Restore incomplete"
     static let notEndedTitle = "Session not ended"
     static let journalTitle = "Recovery journal unreadable"
+    static let commandRunningTitle = "Power command still running"
 
     private static func endTitle(_ reason: EndReason, had: Bool) -> String {
         switch reason {

@@ -185,9 +185,14 @@ installation scenarios still need [release validation](docs/release-validation.m
 - **Identity is not an atomic guarantee:** the app checks start time to the
   microsecond; the shell checks to the second. A lookup and a signal are still
   separate operations.
-- **Stuck power commands:** a command that survives its timeout keeps the
-  recovery lock until it exits. Other recovery attempts or new sessions wait
-  or fail with a warning instead of running alongside it.
+- **Stuck power commands:** a `sudo pmset` that has not finished after 20 s
+  is sent SIGTERM, never SIGKILL: killing sudo could leave a root pmset
+  changing power settings after the journal has moved on. If it is still
+  running 3 s later the transaction stops where it is, as the backstop's
+  does: nothing else is undone, the journal keeps its entries, and the
+  recovery lock stays held until the command exits. A notification and the
+  menu warning give the pid and `sudo kill <pid>`. Until it exits, Insomnia
+  refuses to quit or start a session; when it does, the end runs again.
 - **Audio:** the backstop preserves volume/mute entries but cannot restore
   CoreAudio. Reopen the app for recovery.
 - **Low Power Mode:** Insomnia checks the existing setting so it does not

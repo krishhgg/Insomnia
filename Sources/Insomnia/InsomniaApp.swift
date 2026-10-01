@@ -69,7 +69,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// If the end could not run (recovery lock busy, journal unreadable),
     /// left the journal dirty with no agent to retry, or could not remove
     /// session.json, the app stays so its own retry can finish the job;
-    /// quitting then would abandon a live session.
+    /// quitting then would abandon a live session. It also stays while a
+    /// `sudo pmset` that ignored SIGTERM is alive: exiting would drop the
+    /// recovery lock held for it and let the backstop run beside it.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard !terminating else { return .terminateCancel }
         terminating = true
@@ -78,7 +80,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             switch outcome {
             case .restored, .incomplete(agentArmed: true):
                 sender.reply(toApplicationShouldTerminate: true)
-            case .locked, .incomplete(agentArmed: false), .sessionRetained, .journalUnreadable:
+            case .locked, .incomplete(agentArmed: false), .sessionRetained, .journalUnreadable, .privilegedCommandRunning:
                 Log.error("quit deferred: recovery still pending (\(outcome)); staying to retry")
                 terminating = false
                 sender.reply(toApplicationShouldTerminate: false)
