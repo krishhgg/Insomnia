@@ -21,6 +21,7 @@ QUIT_WAIT_SECONDS=15
 # Fixed tool paths: never taken from PATH. Tests patch these lines in a
 # private copy of the script so no real tool ever runs.
 PGREP=/usr/bin/pgrep
+PS=/bin/ps
 OSASCRIPT=/usr/bin/osascript
 LAUNCHCTL=/bin/launchctl
 SUDO=/usr/bin/sudo
@@ -39,9 +40,48 @@ LAUNCH_AGENTS="$HOME/Library/LaunchAgents"
 LABEL="com.insomnia.backstop"
 PLIST="$LAUNCH_AGENTS/$LABEL.plist"
 SUDOERS=/etc/sudoers.d/insomnia
+BUNDLE_ID=com.kgarg.insomnia
 UID_NUM="$(id -u)"
 
 step() { printf '\n==> %s\n' "$*"; }
+
+# Running copies of this app. `pgrep -x Insomnia` matches every process of
+# this user named Insomnia, and the Insomnia API client's executable has
+# that name too, so each pid is checked by its executable path (`ps -o
+# comm=`, the full path for an app LaunchServices launched): it is this app
+# when the path is the installed bundle's binary or lies in a bundle whose
+# Info.plist declares $BUNDLE_ID. Any other process is listed so the
+# messages can say what was found, and is otherwise left alone.
+APP_FOUND=()     # "pid N (path)" per running copy of this app
+OTHER_FOUND=()   # the same for processes named Insomnia that are not
+find_insomnia() {
+  local pid exe bundle id
+  APP_FOUND=(); OTHER_FOUND=()
+  for pid in $("$PGREP" -x -u "$UID_NUM" Insomnia 2>/dev/null); do
+    exe="$("$PS" -o comm= -p "$pid" 2>/dev/null || true)"
+    id=""
+    if [[ "$exe" == /*/Contents/MacOS/* ]]; then
+      bundle="${exe%/Contents/MacOS/*}"
+      id="$("$PLUTIL" -extract CFBundleIdentifier raw -o - "$bundle/Contents/Info.plist" 2>/dev/null || true)"
+    fi
+    if [[ "$exe" == "$APP/Contents/MacOS/Insomnia" || "$id" == "$BUNDLE_ID" ]]; then
+      APP_FOUND+=("pid $pid (${exe:-executable path unknown})")
+    else
+      OTHER_FOUND+=("pid $pid (${exe:-executable path unknown}${id:+, bundle id $id})")
+    fi
+  done
+}
+app_running() {
+  find_insomnia
+  (( ${#APP_FOUND[@]} > 0 ))
+}
+# Comma-separated list, for messages. Call only with at least one argument:
+# bash 3.2 (/bin/bash) treats an empty array as unbound under `set -u`.
+list() { local IFS=', '; echo "$*"; }
+report_others() {
+  (( ${#OTHER_FOUND[@]} > 0 )) || return 0
+  echo "Ignoring ${#OTHER_FOUND[@]} process(es) named Insomnia that are not this app: $(list "${OTHER_FOUND[@]}")."
+}
 
 # 1. Build -------------------------------------------------------------------
 step "Building (release)"
@@ -84,18 +124,23 @@ step "Assembling $APP"
 # Ask the app to quit and wait until it has actually exited. It refuses to
 # quit while it has unresolved recovery work; that refusal stands (no pkill),
 # and nothing of the old install is overwritten while it is still running.
-if "$PGREP" -x Insomnia >/dev/null 2>&1; then
-  echo "Insomnia is running; quitting it first (this ends any session)."
-  "$OSASCRIPT" -e 'tell application id "com.kgarg.insomnia" to quit' >/dev/null 2>&1 || true
+# Only this app counts (find_insomnia); another process named Insomnia is
+# reported and left alone.
+if app_running; then
+  report_others
+  echo "Insomnia is running ($(list "${APP_FOUND[@]}")); quitting it first (this ends any session)."
+  "$OSASCRIPT" -e "tell application id \"$BUNDLE_ID\" to quit" >/dev/null 2>&1 || true
   for (( i = 0; i < QUIT_WAIT_SECONDS; i++ )); do
-    "$PGREP" -x Insomnia >/dev/null 2>&1 || break
+    app_running || break
     sleep 1
   done
-  if "$PGREP" -x Insomnia >/dev/null 2>&1; then
-    echo "Insomnia is still running after ${QUIT_WAIT_SECONDS}s (it may be refusing to quit until its own recovery finishes)." >&2
+  if app_running; then
+    echo "Insomnia is still running after ${QUIT_WAIT_SECONDS}s (it may be refusing to quit until its own recovery finishes): $(list "${APP_FOUND[@]}")." >&2
     echo "Let it finish or quit it from its menu, then rerun. $SUDOERS is installed; the app, backstop.sh and LaunchAgent were not touched." >&2
     exit 1
   fi
+else
+  report_others
 fi
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
@@ -129,8 +174,8 @@ if (( lock_rc != 0 )); then
   echo "Wait a minute and rerun. The app, $APP_SUPPORT/backstop.sh and $SUDOERS are installed; the LaunchAgent was not touched." >&2
   exit 75
 fi
-if "$PGREP" -x Insomnia >/dev/null 2>&1; then
-  echo "Insomnia started again; quit it and rerun. The LaunchAgent was not touched." >&2
+if app_running; then
+  echo "Insomnia started again ($(list "${APP_FOUND[@]}")); quit it and rerun. The LaunchAgent was not touched." >&2
   exit 1
 fi
 

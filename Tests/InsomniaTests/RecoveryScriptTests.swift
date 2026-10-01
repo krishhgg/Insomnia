@@ -1379,6 +1379,124 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(r.stderr.contains("not touched"), "says what was not: \(r.stderr)")
         XCTAssertTrue(r.stderr.contains("still running"), r.stderr)
     }
+
+    // MARK: - Process identity (install.sh and uninstall.sh)
+
+    /// The Insomnia API client's executable is also named Insomnia, so
+    /// `pgrep -x Insomnia` finds it. It is not this app: it is neither the
+    /// installed bundle's binary nor in a bundle with this app's bundle id,
+    /// so it must not be asked to quit and must not block the install.
+    func testInstallIgnoresAForeignProcessNamedInsomnia() throws {
+        try fx.prepareInstall()
+        try fx.installMachinery()
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        fx.setMode("launchctl", "loaded")
+        let client = try fx.otherBundle(in: "Applications-foreign", bundleId: "com.insomnia.app")
+        fx.setMode("pgrep", "0\n")                 // a process named Insomnia the whole time
+        try fx.psComm([(4242, client.path)])
+
+        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        let calls = fx.calls()
+        XCTAssertTrue(calls.contains("ps -o comm= -p 4242"), "the pid is identified, not just counted: \(calls)")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("osascript") }, "another app must not be told to quit: \(calls)")
+        XCTAssertTrue(r.stdout.contains("pid 4242"), "says which process was found: \(r.stdout)")
+        XCTAssertTrue(r.stdout.contains(client.path), r.stdout)
+        XCTAssertTrue(r.stdout.contains("com.insomnia.app"), r.stdout)
+        XCTAssertTrue(r.stdout.contains("not this app"), r.stdout)
+        XCTAssertTrue(r.stdout.contains("Installed"), r.stdout)
+        XCTAssertTrue(fx.exists(fx.plist))
+    }
+
+    func testUninstallIgnoresAForeignProcessNamedInsomnia() throws {
+        try fx.installMachinery()
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        let client = try fx.otherBundle(in: "Applications-foreign", bundleId: "com.insomnia.app")
+        fx.setMode("pgrep", "0\n")
+        try fx.psComm([(4242, client.path)])
+
+        let r = try fx.run(fx.uninstall)
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        let calls = fx.calls()
+        XCTAssertFalse(calls.contains { $0.hasPrefix("osascript") }, "\(calls)")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("pkill") || $0.hasPrefix("kill") }, "\(calls)")
+        XCTAssertTrue(r.stdout.contains("pid 4242"), r.stdout)
+        XCTAssertTrue(r.stdout.contains(client.path), r.stdout)
+        XCTAssertTrue(r.stdout.contains("not this app"), r.stdout)
+        XCTAssertFalse(fx.exists(fx.app))
+        XCTAssertFalse(fx.exists(fx.plist))
+        XCTAssertTrue(fx.exists(client), "the other app's bundle is not touched")
+    }
+
+    /// A copy of this app running from somewhere else (a development build
+    /// with the same bundle id) shares the journal and the lock, so it is
+    /// asked to quit and blocks the install like the installed copy does.
+    func testInstallQuitsACopyWithThisBundleIdAtAnotherPath() throws {
+        try fx.prepareInstall()
+        try fx.installMachinery()
+        let dev = try fx.otherBundle(in: "DevBuild", bundleId: "com.kgarg.insomnia")
+        fx.setMode("pgrep", "0\n")                 // running, and it stays running
+        try fx.psComm([(4242, dev.path)])
+
+        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        let calls = fx.calls()
+        XCTAssertTrue(calls.contains { $0.hasPrefix("osascript") }, "\(calls)")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("pkill") }, "\(calls)")
+        XCTAssertTrue(r.stderr.contains("still running"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("pid 4242"), "the refusal names the process: \(r.stderr)")
+        XCTAssertTrue(r.stderr.contains(dev.path), r.stderr)
+        XCTAssertEqual(try String(contentsOf: fx.installedExecutable, encoding: .utf8), "binary", "old bundle replaced")
+    }
+
+    /// Both kinds at once: the API client is ignored, the installed copy is
+    /// what the refusal names, with its pid and executable path.
+    func testUninstallRefusalNamesTheRunningCopyAndIgnoresTheOther() throws {
+        try fx.installMachinery()
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        let client = try fx.otherBundle(in: "Applications-foreign", bundleId: "com.insomnia.app")
+        fx.setMode("pgrep", "0\n")
+        try fx.pgrepPids([4242, 5151])
+        try fx.psComm([(4242, client.path), (5151, fx.installedExecutable.path)])
+
+        let r = try fx.run(fx.uninstall)
+
+        XCTAssertNotEqual(r.status, 0)
+        let calls = fx.calls()
+        XCTAssertTrue(calls.contains { $0.hasPrefix("osascript") }, "\(calls)")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("sudo") || $0.hasPrefix("launchctl") }, "\(calls)")
+        XCTAssertTrue(r.stdout.contains("pid 4242"), "the ignored process is reported: \(r.stdout)")
+        XCTAssertTrue(r.stdout.contains(client.path), r.stdout)
+        XCTAssertTrue(r.stderr.contains("refusing to quit"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("pid 5151"), "the refusal names the process: \(r.stderr)")
+        XCTAssertTrue(r.stderr.contains(fx.installedExecutable.path), r.stderr)
+        XCTAssertFalse(r.stderr.contains("pid 4242"), "the refusal is not about the other app: \(r.stderr)")
+        XCTAssertTrue(fx.exists(fx.app))
+        XCTAssertTrue(fx.exists(fx.plist))
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, true)
+    }
+
+    /// A pid pgrep reported but ps cannot describe (gone in between, or an
+    /// executable path that is not inside any bundle) is not this app, and
+    /// the message says what little is known about it.
+    func testProcessWithoutAnIdentifiablePathIsNotTreatedAsThisApp() throws {
+        try fx.installMachinery()
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        fx.setMode("pgrep", "0\n")
+        try fx.pgrepPids([4242, 5151])
+        try fx.psComm([(5151, "./Insomnia")])      // 4242 has no row: gone by the time ps looked
+
+        let r = try fx.run(fx.uninstall)
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("osascript") }, "\(fx.calls())")
+        XCTAssertTrue(r.stdout.contains("pid 4242 (executable path unknown)"), r.stdout)
+        XCTAssertTrue(r.stdout.contains("pid 5151 (./Insomnia)"), r.stdout)
+        XCTAssertFalse(fx.exists(fx.app))
+    }
 }
 
 // MARK: - Fixture
@@ -1439,6 +1557,39 @@ private final class ScriptFixture {
         try writeFakes()
         try writeScriptCopies()
         try bootUUID.write(to: root.appendingPathComponent("boot.uuid"), atomically: true, encoding: .utf8)
+        // The process the fake pgrep reports by default is the installed app.
+        try psComm([(4242, installedExecutable.path)])
+    }
+
+    /// Executable of the installed bundle, what `ps -o comm=` prints for a
+    /// copy of this app that LaunchServices launched from $APP.
+    var installedExecutable: URL { app.appendingPathComponent("Contents/MacOS/Insomnia") }
+
+    /// What `ps -o comm= -p <pid>` prints for each pid; a pid not listed is gone.
+    func psComm(_ rows: [(pid: Int, exe: String)]) throws {
+        let text = rows.map { "\($0.pid)|\($0.exe)" }.joined(separator: "\n") + "\n"
+        try text.write(to: root.appendingPathComponent("ps.comm"), atomically: true, encoding: .utf8)
+    }
+
+    /// Pids the fake pgrep prints whenever its mode says "running".
+    func pgrepPids(_ pids: [Int]) throws {
+        let text = pids.map(String.init).joined(separator: "\n") + "\n"
+        try text.write(to: root.appendingPathComponent("pgrep.pids"), atomically: true, encoding: .utf8)
+    }
+
+    /// Another app bundle inside the fixture, named Insomnia.app like the
+    /// API client, whose Info.plist declares `bundleId`. Returns the path
+    /// its executable would show in `ps -o comm=`.
+    func otherBundle(in dir: String, bundleId: String) throws -> URL {
+        let bundle = root.appendingPathComponent(dir, isDirectory: true).appendingPathComponent("Insomnia.app", isDirectory: true)
+        try fm.createDirectory(at: bundle.appendingPathComponent("Contents/MacOS"), withIntermediateDirectories: true)
+        try "binary".write(to: bundle.appendingPathComponent("Contents/MacOS/Insomnia"), atomically: true, encoding: .utf8)
+        try """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0"><dict><key>CFBundleIdentifier</key><string>\(bundleId)</string></dict></plist>
+        """.write(to: bundle.appendingPathComponent("Contents/Info.plist"), atomically: true, encoding: .utf8)
+        return bundle.appendingPathComponent("Contents/MacOS/Insomnia")
     }
 
     func destroy() {
@@ -1520,6 +1671,7 @@ private final class ScriptFixture {
         let uninstallText = try String(contentsOf: src.appendingPathComponent("uninstall.sh"), encoding: .utf8)
         try Self.patch(uninstallText, [
             "PGREP": bin.appendingPathComponent("pgrep").path,
+            "PS": bin.appendingPathComponent("ps").path,
             "OSASCRIPT": bin.appendingPathComponent("osascript").path,
             "LAUNCHCTL": bin.appendingPathComponent("launchctl").path,
             "SUDO": bin.appendingPathComponent("sudo").path,
@@ -1540,6 +1692,7 @@ private final class ScriptFixture {
             "LAUNCH_AGENTS": home.appendingPathComponent("LaunchAgents").path,
             "SUDOERS": sudoers.path,
             "PGREP": bin.appendingPathComponent("pgrep").path,
+            "PS": bin.appendingPathComponent("ps").path,
             "OSASCRIPT": bin.appendingPathComponent("osascript").path,
             "LAUNCHCTL": bin.appendingPathComponent("launchctl").path,
             "SUDO": bin.appendingPathComponent("sudo").path,
@@ -1665,12 +1818,22 @@ private final class ScriptFixture {
         """)
         // ps: answers from ps.table. Modes: "fail" (exit 2 with an error
         // line, like a broken ps) and "garbage" (exit 0 with nonsense).
+        // `-o comm= -p <pid>` (install.sh / uninstall.sh identifying a pid
+        // the fake pgrep reported) answers from ps.comm instead: "pid|path"
+        // per line, and a pid with no line is gone (exit 1, no output).
         try writeFake("ps", """
         printf 'ps %s\\n' "$*" >> "\(calls)"
+        pid=""; for a in "$@"; do pid="$a"; done
+        if [[ "${2:-}" == comm= ]]; then
+          [[ -f "\(r)/ps.comm" ]] || exit 1
+          while IFS='|' read -r p exe; do
+            if [[ "$p" == "$pid" ]]; then printf '%s\\n' "$exe"; exit 0; fi
+          done < "\(r)/ps.comm"
+          exit 1
+        fi
         mode="$(cat "\(r)/ps.mode" 2>/dev/null || echo ok)"
         if [[ "$mode" == fail ]]; then echo "ps: cannot read process table" >&2; exit 2; fi
         if [[ "$mode" == garbage ]]; then echo "not a process line"; exit 0; fi
-        pid=""; for a in "$@"; do pid="$a"; done
         [[ -f "\(r)/ps.table" ]] || exit 1
         while IFS='|' read -r p lstart stat uid; do
           if [[ "$p" == "$pid" ]]; then printf '%s %s %s\\n' "$lstart" "$stat" "$uid"; exit 0; fi
@@ -1687,13 +1850,18 @@ private final class ScriptFixture {
         cat "\(r)/boot.uuid"
         """)
         // pgrep: pgrep.mode holds one exit status per line, consumed in
-        // order; the last line repeats. Default 1 (not running).
+        // order; the last line repeats. Default 1 (not running). A match
+        // (exit 0) prints the pids in pgrep.pids, one per line (default
+        // 4242, which ps.comm maps to the installed bundle's binary).
         try writeFake("pgrep", """
         printf 'pgrep %s\\n' "$*" >> "\(calls)"
         f="\(r)/pgrep.mode"
         [[ -f "$f" ]] || exit 1
         first="$(head -n 1 "$f")"
         if (( $(wc -l < "$f") > 1 )); then tail -n +2 "$f" > "$f.next" && mv "$f.next" "$f"; fi
+        if [[ "${first:-1}" == 0 ]]; then
+          if [[ -f "\(r)/pgrep.pids" ]]; then cat "\(r)/pgrep.pids"; else echo 4242; fi
+        fi
         exit "${first:-1}"
         """)
         for tool in ["pkill", "osascript"] {

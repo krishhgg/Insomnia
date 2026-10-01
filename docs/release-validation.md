@@ -126,6 +126,7 @@ is performed. Do not replace "not run" with "passed" based on source review.
 | Headed-browser throttling with the lid closed | Not run |
 | Battery/thermal event behavior on supported hardware | Not run |
 | Install/upgrade/uninstall with recoverable failure conditions | Not run |
+| Install and uninstall while the Insomnia API client (same executable name, other bundle id) is running | Not run |
 
 Hardware tests must be supervised and must not endanger active user work. Use
 a stable, ventilated surface, not an enclosure. Do not intentionally overheat a
