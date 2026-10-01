@@ -114,22 +114,173 @@ struct KeychainError: Error, LocalizedError, Sendable {
         let msg = SecCopyErrorMessageString(status, nil) as String? ?? "OSStatus \(status)"
         return "keychain: \(msg)"
     }
+
+    /// The item is there but macOS would have to show a keychain prompt to
+    /// hand it over, and none was allowed. Measured on a throwaway keychain:
+    /// an item whose access list names another build (errSecAuthFailed), a
+    /// locked keychain (errSecAuthFailed too), and a delete of another
+    /// build's item (errSecInvalidOwnerEdit).
+    var isUnreadableWithoutPrompt: Bool {
+        status == errSecAuthFailed || status == errSecInteractionNotAllowed || status == errSecInvalidOwnerEdit
+    }
+
+    var problem: HotspotPasswordProblem {
+        isUnreadableWithoutPrompt ? .unreadable : .error(errorDescription ?? "OSStatus \(status)")
+    }
 }
 
-/// Login keychain generic password, service `insomnia-hotspot`, account = SSID.
-struct KeychainStore: KeychainStoring {
+/// Why the failover has no hotspot password to join with. Shown in the
+/// menu, in Settings and in one notification per outage; the join is never
+/// skipped without one of these being surfaced.
+enum HotspotPasswordProblem: Equatable, Sendable {
+    /// No keychain item for the configured SSID.
+    case missing
+    /// The item exists but this build of Insomnia may not read it without a
+    /// keychain prompt: it was saved by another build (an ad-hoc signature
+    /// changes on every install), or the login keychain is locked.
+    case unreadable
+    /// Any other keychain failure.
+    case error(String)
+
+    /// One sentence for the notification body and the Settings notice.
+    var explanation: String {
+        switch self {
+        case .missing:
+            "No hotspot password is saved. Enter it in Settings."
+        case .unreadable:
+            "This build of Insomnia can't read the saved hotspot password (it was saved by another build, or the login keychain is locked). Enter it again in Settings."
+        case let .error(message):
+            "The hotspot password can't be read: \(message)"
+        }
+    }
+
+    /// The right-click menu's warning line.
+    var menuLine: String {
+        switch self {
+        case .missing:
+            "\u{26A0} Hotspot password not saved: enter it in Settings"
+        case .unreadable:
+            "\u{26A0} Hotspot password unreadable by this build: enter it again in Settings"
+        case let .error(message):
+            "\u{26A0} Hotspot password unreadable: \(message)"
+        }
+    }
+
+    /// Under the password field in Settings. A missing item needs no notice
+    /// there: the field is empty.
+    var settingsNotice: String? {
+        switch self {
+        case .missing:
+            nil
+        case .unreadable:
+            "This build of Insomnia can't read the saved password: it was saved by another build, or the login keychain is locked. Enter it again and save. macOS may ask you to allow Insomnia to replace the old item."
+        case let .error(message):
+            "The saved password can't be read: \(message)"
+        }
+    }
+}
+
+/// The file-based keychain calls this store needs that the SDK marks
+/// deprecated since macOS 10.10 but still ships: the process-wide prompt
+/// switch and the per-item access list. Resolved by name, like the
+/// DisplayServices calls, so the build stays warning-free. They are public
+/// exports of Security.framework.
+enum LegacyKeychain {
+    private typealias SetInteraction = @convention(c) (UInt8) -> OSStatus
+    private typealias GetInteraction = @convention(c) (UnsafeMutablePointer<UInt8>) -> OSStatus
+    private typealias AccessCreate = @convention(c) (CFString, CFArray?, UnsafeMutablePointer<Unmanaged<SecAccess>?>) -> OSStatus
+    private typealias TrustedApplicationCreate = @convention(c) (UnsafePointer<CChar>?, UnsafeMutablePointer<Unmanaged<SecTrustedApplication>?>) -> OSStatus
+
+    private static func symbol<T>(_ name: String) throws -> T {
+        guard let handle = dlopen(nil, RTLD_LAZY), let pointer = dlsym(handle, name) else {
+            throw KeychainError(status: errSecUnimplemented)
+        }
+        return unsafeBitCast(pointer, to: T.self)
+    }
+
+    /// Runs `body` with keychain prompts allowed or forbidden for this
+    /// process and puts the previous setting back. With prompts forbidden an
+    /// operation that would need one fails instead (see
+    /// `KeychainError.isUnreadableWithoutPrompt`). Per-query keys such as
+    /// kSecUseAuthenticationUI only govern the data protection keychain;
+    /// this switch is what the file-based login keychain honours.
+    static func withPrompts<T>(_ allowed: Bool, _ body: () throws -> T) throws -> T {
+        let set: SetInteraction = try symbol("SecKeychainSetUserInteractionAllowed")
+        let get: GetInteraction = try symbol("SecKeychainGetUserInteractionAllowed")
+        var previous: UInt8 = 1
+        _ = get(&previous)
+        _ = set(allowed ? 1 : 0)
+        defer { _ = set(previous) }
+        return try body()
+    }
+
+    /// Whether this process may currently raise keychain prompts.
+    static func promptsAllowed() throws -> Bool {
+        let get: GetInteraction = try symbol("SecKeychainGetUserInteractionAllowed")
+        var state: UInt8 = 1
+        let status = get(&state)
+        guard status == errSecSuccess else { throw KeychainError(status: status) }
+        return state != 0
+    }
+
+    /// This process's code as a trusted application. Under ad-hoc signing
+    /// its designated requirement is the build's cdhash, so an access list
+    /// naming it trusts exactly this build.
+    static func thisApplication() throws -> SecTrustedApplication {
+        let create: TrustedApplicationCreate = try symbol("SecTrustedApplicationCreateFromPath")
+        var application: Unmanaged<SecTrustedApplication>?
+        let status = create(nil, &application)
+        guard status == errSecSuccess, let application else { throw KeychainError(status: status) }
+        return application.takeRetainedValue()
+    }
+
+    /// An access list that lets `applications` use the item without a
+    /// prompt and makes everyone else ask. `descriptor` is what that prompt
+    /// names. An empty list trusts nobody.
+    static func access(descriptor: String, trusting applications: [SecTrustedApplication]) throws -> SecAccess {
+        let create: AccessCreate = try symbol("SecAccessCreate")
+        var access: Unmanaged<SecAccess>?
+        let status = create(descriptor as CFString, applications as CFArray, &access)
+        guard status == errSecSuccess, let access else { throw KeychainError(status: status) }
+        return access.takeRetainedValue()
+    }
+}
+
+/// Login keychain generic password, service `insomnia-hotspot`, account =
+/// SSID. The item's access list names only the Insomnia build that saved it
+/// (`LegacyKeychain.thisApplication()`), and every read runs with keychain
+/// prompts forbidden, so the failover never raises a dialog: an item this
+/// build may not open fails with `KeychainError.isUnreadableWithoutPrompt`
+/// and the caller surfaces `HotspotPasswordProblem.unreadable`. Saving
+/// deletes the old item and creates a new one with this build on the list;
+/// deleting another build's item needs the prompt, and that one is allowed
+/// because a save or clear is the user's own click in Settings.
+///
+/// `kSecAttrAccessible` (this device only, when unlocked) is not set: the
+/// file-based login keychain accepts and drops it (measured on a throwaway
+/// keychain, the attribute does not read back), and the data protection
+/// keychain that honours it needs a keychain access group entitlement,
+/// which needs a team id.
+struct KeychainStore: KeychainStoring, @unchecked Sendable {
     static let service = "insomnia-hotspot"
+    /// What the keychain prompt names if another program asks for the item.
+    static let accessDescriptor = "Insomnia hotspot password"
+
+    /// One keychain instead of the login keychain search list. Tests pass a
+    /// throwaway keychain file; the app passes nothing. A CF reference the
+    /// store never mutates, hence the unchecked Sendable.
+    private let keychain: SecKeychain?
+
+    init(keychain: SecKeychain? = nil) {
+        self.keychain = keychain
+    }
 
     func get(service: String, account: String) throws -> String? {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-        ]
+        var query = self.query(service: service, account: account)
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
         var item: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        let status = try LegacyKeychain.withPrompts(false) { SecItemCopyMatching(query as CFDictionary, &item) }
         if status == errSecItemNotFound { return nil }
         guard status == errSecSuccess else { throw KeychainError(status: status) }
         guard let data = item as? Data else { return nil }
@@ -137,41 +288,72 @@ struct KeychainStore: KeychainStoring {
     }
 
     func set(service: String, account: String, value: String) throws {
-        let base: [String: Any] = [
+        try delete(service: service, account: account)
+        var add: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
+            kSecValueData as String: Data(value.utf8),
+            kSecAttrAccess as String: try LegacyKeychain.access(
+                descriptor: Self.accessDescriptor,
+                trusting: [try LegacyKeychain.thisApplication()]
+            ),
         ]
-        let data = Data(value.utf8)
-        let update = [kSecValueData as String: data]
-        var status = SecItemUpdate(base as CFDictionary, update as CFDictionary)
-        if status == errSecItemNotFound {
-            var add = base
-            add[kSecValueData as String] = data
-            status = SecItemAdd(add as CFDictionary, nil)
-        }
+        if let keychain { add[kSecUseKeychain as String] = keychain }
+        let status = try LegacyKeychain.withPrompts(false) { SecItemAdd(add as CFDictionary, nil) }
         guard status == errSecSuccess else { throw KeychainError(status: status) }
     }
 
     func delete(service: String, account: String) throws {
-        let query: [String: Any] = [
+        let query = self.query(service: service, account: account)
+        var status = try LegacyKeychain.withPrompts(false) { SecItemDelete(query as CFDictionary) }
+        if KeychainError(status: status).isUnreadableWithoutPrompt {
+            // Another build's item. Only the prompt can remove it, and this
+            // delete is the user's own save or clear in Settings.
+            status = try LegacyKeychain.withPrompts(true) { SecItemDelete(query as CFDictionary) }
+        }
+        guard status == errSecSuccess || status == errSecItemNotFound else {
+            throw KeychainError(status: status)
+        }
+    }
+
+    private func query(service: String, account: String) -> [String: Any] {
+        var query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
         ]
-        let status = SecItemDelete(query as CFDictionary)
-        guard status == errSecSuccess || status == errSecItemNotFound else {
-            throw KeychainError(status: status)
-        }
+        if let keychain { query[kSecMatchSearchList as String] = [keychain] }
+        return query
     }
 }
 
 final class FakeKeychainStore: KeychainStoring, @unchecked Sendable {
     private let lock = NSLock()
     private var items: [String: String] = [:]
-    func get(service: String, account: String) throws -> String? { lock.withLock { items["\(service)/\(account)"] } }
+    private var _unreadable: Set<String> = []
+    private var _deletes: [String] = []
+    /// Reads of these `service/account` keys fail the way another build's
+    /// item does with prompts forbidden (errSecAuthFailed).
+    var unreadable: Set<String> {
+        get { lock.withLock { _unreadable } }
+        set { lock.withLock { _unreadable = newValue } }
+    }
+    /// Every `service/account` deleted, in order.
+    var deletes: [String] { lock.withLock { _deletes } }
+
+    func get(service: String, account: String) throws -> String? {
+        let key = "\(service)/\(account)"
+        if unreadable.contains(key) { throw KeychainError(status: errSecAuthFailed) }
+        return lock.withLock { items[key] }
+    }
     func set(service: String, account: String, value: String) throws { lock.withLock { items["\(service)/\(account)"] = value } }
-    func delete(service: String, account: String) throws { lock.withLock { _ = items.removeValue(forKey: "\(service)/\(account)") } }
+    func delete(service: String, account: String) throws {
+        lock.withLock {
+            _deletes.append("\(service)/\(account)")
+            _ = items.removeValue(forKey: "\(service)/\(account)")
+        }
+    }
 }
 
 // MARK: - Driver
@@ -185,10 +367,21 @@ final class NetworkFailover {
 
     /// Called after every recovery with the gap length.
     var onRecovered: ((TimeInterval) -> Void)?
+    /// Called when the password problem changes: set when a join is skipped
+    /// for want of a readable password, nil once a read succeeds or the
+    /// password is saved again.
+    var onPasswordProblem: ((HotspotPasswordProblem?) -> Void)?
 
     private(set) var machine = FailoverMachine()
     private(set) var wifiInterface: String?
     private(set) var lastGap: TimeInterval?
+    /// Why the last join was skipped before the join itself, if it was.
+    private(set) var passwordProblem: HotspotPasswordProblem? {
+        didSet { if passwordProblem != oldValue { onPasswordProblem?(passwordProblem) } }
+    }
+    /// The problem already notified this outage, so the retries (every 5 to
+    /// 30 s) do not repeat it.
+    private var notifiedProblem: HotspotPasswordProblem?
 
     private let paths: Paths
     private let keychain: any KeychainStoring
@@ -256,6 +449,14 @@ final class NetworkFailover {
         inflight.removeAll()
         epoch += 1
         machine = FailoverMachine()
+        notifiedProblem = nil
+    }
+
+    /// Settings saved or cleared the password: forget the problem so the
+    /// menu line goes and the next outage reports afresh.
+    func passwordChanged() {
+        passwordProblem = nil
+        notifiedProblem = nil
     }
 
     /// Current SSID via `networksetup -getairportnetwork`; nil when unknown.
@@ -382,12 +583,16 @@ final class NetworkFailover {
         let password: String
         do {
             guard let p = try keychain.get(service: KeychainStore.service, account: ssid) else {
-                Log.error("hotspot join skipped: no Keychain item \(KeychainStore.service)/\(ssid)")
+                report(.missing)
                 return
             }
             password = p
+            passwordProblem = nil
+        } catch let error as KeychainError {
+            report(error.problem)
+            return
         } catch {
-            Log.error("hotspot join skipped: \(error.localizedDescription)")
+            report(.error(error.localizedDescription))
             return
         }
         Log.info("joining hotspot \(ssid) on \(iface) (attempt \(machine.joins))")
@@ -399,6 +604,16 @@ final class NetworkFailover {
         } catch {
             Log.error("CoreWLAN hotspot join failed: \(error.localizedDescription)")
         }
+    }
+
+    /// The join is skipped: log it, show it in the menu, and notify once per
+    /// outage. The log line names the problem, not the SSID.
+    private func report(_ problem: HotspotPasswordProblem) {
+        Log.error("hotspot join skipped: \(problem.explanation)")
+        passwordProblem = problem
+        guard notifiedProblem != problem else { return }
+        notifiedProblem = problem
+        notifier.post(title: "Hotspot not joined", body: problem.explanation)
     }
 
     private func recovered(start: Date, gap: TimeInterval) async {

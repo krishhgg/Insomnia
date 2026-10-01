@@ -200,5 +200,111 @@ final class NetworkFailoverDriverTests: XCTestCase {
             joiner.calls,
             [.init(ssid: "Phone", password: "top secret", interfaceName: "en0")]
         )
+        XCTAssertNil(n.passwordProblem)
+    }
+
+    private func driver(
+        keychain: FakeKeychainStore,
+        joiner: RecordingHotspotJoiner,
+        notifier: RecordingNotifier,
+        clock: FakeClock
+    ) -> NetworkFailover {
+        var config = Config()
+        config.hotspotSSID = "Phone"
+        return NetworkFailover(
+            paths: home.paths,
+            keychain: keychain,
+            hotspotJoiner: joiner,
+            notifier: notifier,
+            wifiInterface: "en0",
+            clock: { clock.now }
+        ) { config }
+    }
+
+    /// A join with no saved password is not a silent skip: the problem is
+    /// published for the menu and notified once, not on every retry.
+    func testMissingPasswordIsSurfacedOnceAndNoJoinIsAttempted() async throws {
+        let joiner = RecordingHotspotJoiner()
+        let notifier = RecordingNotifier()
+        let clock = FakeClock(Date(timeIntervalSince1970: 1_800_000_000))
+        let n = driver(keychain: FakeKeychainStore(), joiner: joiner, notifier: notifier, clock: clock)
+        let published = Locked<[HotspotPasswordProblem?]>([])
+        n.onPasswordProblem = { published.value.append($0) }
+
+        await n.simulate(satisfied: false)
+        for _ in 0..<3 {
+            clock.advance(30)
+            n.fireTimer()
+            await settleQueuedRequests()
+        }
+
+        XCTAssertEqual(joiner.calls, [])
+        XCTAssertEqual(n.passwordProblem, .missing)
+        XCTAssertEqual(published.value, [.missing])
+        XCTAssertEqual(notifier.posts.count, 1)
+        XCTAssertEqual(notifier.posts[0].title, "Hotspot not joined")
+        XCTAssertEqual(notifier.posts[0].body, "No hotspot password is saved. Enter it in Settings.")
+    }
+
+    /// The item exists but belongs to another build (the keychain refuses
+    /// it with prompts forbidden): same surfacing, with the re-enter wording.
+    func testUnreadablePasswordIsSurfacedWithTheReenterWording() async throws {
+        let keychain = FakeKeychainStore()
+        try keychain.set(service: KeychainStore.service, account: "Phone", value: "old build's secret")
+        keychain.unreadable = ["\(KeychainStore.service)/Phone"]
+        let joiner = RecordingHotspotJoiner()
+        let notifier = RecordingNotifier()
+        let n = driver(keychain: keychain, joiner: joiner, notifier: notifier, clock: FakeClock(Date()))
+
+        await n.joinHotspot()
+
+        XCTAssertEqual(joiner.calls, [])
+        XCTAssertEqual(n.passwordProblem, .unreadable)
+        XCTAssertEqual(n.passwordProblem?.menuLine, "\u{26A0} Hotspot password unreadable by this build: enter it again in Settings")
+        XCTAssertEqual(notifier.posts.map(\.body), [HotspotPasswordProblem.unreadable.explanation])
+        XCTAssertTrue(notifier.posts[0].body.contains("Enter it again in Settings"))
+    }
+
+    /// Saving in Settings clears the problem at once, and a read that then
+    /// succeeds keeps it clear; a problem that comes back after a save is
+    /// notified again.
+    func testSavingThePasswordClearsTheProblemAndRearmsTheNotification() async throws {
+        let keychain = FakeKeychainStore()
+        let joiner = RecordingHotspotJoiner()
+        let notifier = RecordingNotifier()
+        let n = driver(keychain: keychain, joiner: joiner, notifier: notifier, clock: FakeClock(Date()))
+        let published = Locked<[HotspotPasswordProblem?]>([])
+        n.onPasswordProblem = { published.value.append($0) }
+
+        await n.joinHotspot()
+        XCTAssertEqual(n.passwordProblem, .missing)
+        n.passwordChanged()
+        XCTAssertNil(n.passwordProblem)
+        XCTAssertEqual(published.value, [.missing, nil])
+
+        try keychain.set(service: KeychainStore.service, account: "Phone", value: "pw")
+        await n.joinHotspot()
+        XCTAssertNil(n.passwordProblem)
+        XCTAssertEqual(joiner.calls.map(\.password), ["pw"])
+
+        try keychain.delete(service: KeychainStore.service, account: "Phone")
+        await n.joinHotspot()
+        XCTAssertEqual(n.passwordProblem, .missing)
+        XCTAssertEqual(notifier.posts.count, 2, "the problem returned after a save, so it is notified again")
+    }
+
+    /// A new outage after stop() notifies again; the once-per-outage guard
+    /// does not outlive the driver's session.
+    func testStopRearmsTheNotificationForTheNextSession() async throws {
+        let joiner = RecordingHotspotJoiner()
+        let notifier = RecordingNotifier()
+        let n = driver(keychain: FakeKeychainStore(), joiner: joiner, notifier: notifier, clock: FakeClock(Date()))
+
+        await n.joinHotspot()
+        await n.joinHotspot()
+        XCTAssertEqual(notifier.posts.count, 1)
+        n.stop()
+        await n.joinHotspot()
+        XCTAssertEqual(notifier.posts.count, 2)
     }
 }

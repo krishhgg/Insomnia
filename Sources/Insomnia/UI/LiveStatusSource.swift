@@ -19,6 +19,7 @@ final class LiveStatusSource: StatusSource {
     var frozenCount: Int { services.status.frozenCount }
     var dockerPaused: Bool { services.status.dockerPaused }
     var throttledBrowsers: [String] { services.status.throttledBrowsers }
+    var hotspotPasswordProblem: HotspotPasswordProblem? { services.status.hotspotPasswordProblem }
     var locationPermission: LocationPermission { services.locationPermission }
 
     func refreshOnDemand() {

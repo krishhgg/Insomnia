@@ -277,6 +277,21 @@ provided by the standalone backstop. Performance effects depend on workload.
   SSID) and is never placed in process arguments. Retry with backoff (5 s,
   10 s, 20 s, 30 s, then every 30 s) until the path is satisfied or the
   session ends.
+- The Keychain item is created with an access list naming only the saving
+  build (`SecAccessCreate` with the running code as the sole trusted
+  application; under ad-hoc signing that is the build's cdhash). Reads run
+  with the process-wide Keychain prompt switch off
+  (`SecKeychainSetUserInteractionAllowed`, put back after each call), since
+  the per-query no-UI keys only govern the data protection keychain. An item
+  the build may not read fails with `errSecAuthFailed` (another build's item,
+  or a locked keychain; the file-based keychain cannot tell them apart), and
+  a missing item with `errSecItemNotFound`. Either skips the join and sets
+  `HotspotPasswordProblem`: a warning line in the right-click menu, a notice
+  under the password field in Settings, and one notification per outage. A
+  save in Settings deletes the item and creates it again under the current
+  build; deleting another build's item needs the prompt, which is allowed
+  only there. `kSecAttrAccessible` is not set: the file-based keychain drops
+  it, and the data protection keychain needs an access-group entitlement.
 - macOS 26 requires Location Services permission before CoreWLAN exposes SSIDs
   or returns results for an SSID-filtered scan. Insomnia requests when-in-use
   access when the hotspot is saved or a configured session starts, never at

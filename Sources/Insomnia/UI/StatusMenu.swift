@@ -29,12 +29,15 @@ enum StatusMenu {
     /// Disabled status lines, a separator, then Settings… and Quit. Empty
     /// lines are dropped, and the separator only appears when something
     /// precedes it, so the menu never opens with a stray rule at the top.
+    /// `hotspotWarning` is the line about a hotspot password the failover
+    /// could not use (`HotspotPasswordProblem.menuLine`).
     static func items(
         sessionActive: Bool,
         sleepHeld: Bool,
         machine: String?,
         actions: String?,
         throttledBrowsers: [String],
+        hotspotWarning: String? = nil,
         error: String?
     ) -> [Item] {
         var out: [Item] = []
@@ -55,6 +58,9 @@ enum StatusMenu {
             for name in throttledBrowsers {
                 out.append(Item(title: "Relaunch \(name) unthrottled", kind: .relaunchBrowser(name)))
             }
+        }
+        if let hotspot = present(hotspotWarning) {
+            out.append(Item(title: hotspot, kind: .warning))
         }
         if let error = present(error) {
             out.append(Item(title: "\u{26A0} \(error)", kind: .warning))

@@ -16,6 +16,8 @@ struct SettingsView: View {
     @State private var newTmuxTarget = ""
     @State private var hotspotPassword = ""
     @State private var hotspotSaved = false
+    /// Why the saved password could not be loaded or saved; under the field.
+    @State private var hotspotNotice: String?
     @State private var loginItemError: String?
     /// Names of the apps the automatic lid-close scope would freeze right
     /// now (the freeze list excluded); refreshed on appear and toggle.
@@ -34,7 +36,7 @@ struct SettingsView: View {
         .frame(width: 520)
         .frame(minHeight: 560, idealHeight: 720)
         .onAppear {
-            hotspotPassword = (try? secrets.load()) ?? ""
+            loadPassword()
             refreshWouldFreeze()
         }
         // The preview depends on the toggle, both lists and what is running:
@@ -203,6 +205,9 @@ struct SettingsView: View {
                 Button(hotspotSaved ? "Saved" : "Save", action: savePassword)
                     .disabled(hotspotPassword.isEmpty)
             }
+            if let hotspotNotice {
+                Text(hotspotNotice).font(.caption).foregroundStyle(.orange)
+            }
             HStack {
                 Text("Location: \(locationPermission.statusDescription)")
                     .foregroundStyle(.secondary)
@@ -235,7 +240,7 @@ struct SettingsView: View {
         } header: {
             Text("Network failover")
         } footer: {
-            Text("The password is kept in the login keychain. Location permission lets macOS reveal Wi-Fi network names and find the configured hotspot.")
+            Text("The password is kept in the login keychain, readable without a prompt only by the build of Insomnia that saved it; after a reinstall, enter it again. Location permission lets macOS reveal Wi-Fi network names and find the configured hotspot.")
         }
     }
 
@@ -244,6 +249,22 @@ struct SettingsView: View {
             get: { Int(manager.config.nudgeThreshold) },
             set: { seconds in update { $0.nudgeThreshold = TimeInterval(seconds) } }
         )
+    }
+
+    /// Reads without a keychain prompt. An item this build may not read
+    /// leaves the field empty and says why, so the user re-enters it;
+    /// saving then replaces the item (see `KeychainStore`).
+    private func loadPassword() {
+        do {
+            hotspotPassword = try secrets.load() ?? ""
+            hotspotNotice = nil
+        } catch let error as KeychainError {
+            hotspotPassword = ""
+            hotspotNotice = error.problem.settingsNotice
+        } catch {
+            hotspotPassword = ""
+            hotspotNotice = HotspotPasswordProblem.error(error.localizedDescription).settingsNotice
+        }
     }
 
     private func savePassword() {
@@ -257,7 +278,11 @@ struct SettingsView: View {
                 try secrets.save(hotspotPassword)
             }
             hotspotSaved = true
+            hotspotNotice = nil
+            manager.services?.hotspotPasswordChanged()
         } catch {
+            hotspotSaved = false
+            hotspotNotice = "Could not save the hotspot password: \(error.localizedDescription)"
             Log.error("could not save hotspot password: \(error.localizedDescription)")
         }
     }

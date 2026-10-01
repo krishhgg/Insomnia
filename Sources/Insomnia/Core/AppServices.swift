@@ -20,6 +20,9 @@ final class SystemStatus {
     var throttledBrowsers: [String] = []
     /// Full detail for the relaunch item (bundle id + name).
     var browsers: [BrowserStatus] = []
+    /// Why the failover could not join the hotspot this session, if a join
+    /// was skipped for want of a readable password. The menu shows it.
+    var hotspotPasswordProblem: HotspotPasswordProblem?
 
     @ObservationIgnored var refresher: (@MainActor () async -> Void)?
 
@@ -103,6 +106,7 @@ final class AppServices {
         self.manager = manager
         let config = manager.config
         status.lastGap = nil
+        status.hotspotPasswordProblem = nil
 
         if !config.hotspotSSID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             locationPermission.requestWhenInUse()
@@ -146,6 +150,7 @@ final class AppServices {
             manager?.config ?? Config()
         }
         net.onRecovered = { [weak self] gap in self?.status.lastGap = gap }
+        net.onPasswordProblem = { [weak self] problem in self?.status.hotspotPasswordProblem = problem }
         network = net
         networkTask = Task { [weak self, weak net] in
             guard let self, let net else { return }
@@ -244,6 +249,13 @@ final class AppServices {
         }
         browserTasks.append(task)
         await task.value
+    }
+
+    /// Settings saved or cleared the hotspot password: the menu line about
+    /// the old one no longer applies, and the next outage reports afresh.
+    func hotspotPasswordChanged() {
+        status.hotspotPasswordProblem = nil
+        network?.passwordChanged()
     }
 
     /// Re-run the floors with the current inputs. Settings that change a

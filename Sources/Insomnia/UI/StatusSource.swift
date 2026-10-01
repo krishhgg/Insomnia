@@ -16,6 +16,8 @@ protocol StatusSource: AnyObject, Observable {
     var dockerPaused: Bool { get }
     /// Display names of browsers running without the occlusion flags.
     var throttledBrowsers: [String] { get }
+    /// Why a hotspot join was skipped this session, if one was.
+    var hotspotPasswordProblem: HotspotPasswordProblem? { get }
 
     /// Called when the menu opens; observers refresh anything not pushed.
     func refreshOnDemand()
@@ -39,6 +41,7 @@ final class PlaceholderStatus: StatusSource {
     var frozenCount: Int = 0
     var dockerPaused: Bool = false
     var throttledBrowsers: [String] = []
+    var hotspotPasswordProblem: HotspotPasswordProblem? = nil
 
     init() {}
 

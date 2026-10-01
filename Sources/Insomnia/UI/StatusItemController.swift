@@ -662,6 +662,7 @@ final class StatusItemController: NSObject {
                 lastGap: status.lastGap
             ),
             throttledBrowsers: status.throttledBrowsers,
+            hotspotWarning: status.hotspotPasswordProblem?.menuLine,
             error: manager.lastError
         )
     }
