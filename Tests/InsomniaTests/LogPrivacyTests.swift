@@ -16,18 +16,27 @@ final class LogPrivacyTests: XCTestCase {
         let since = Date()
         Log.info("joining hotspot \(token) on en0 (attempt 1)")
         Log.error("tmux nudge to \(token) rejected")
+        // A line that is private by construction shows whether this Mac has
+        // private data logging enabled: then the store returns every body
+        // in clear and the redaction cannot be observed, whatever Log does.
+        let probe = Logger(subsystem: Paths.bundleIdentifier, category: "privacy-probe")
+        probe.info("probe \(token, privacy: .private)")
 
         // The process reads its own entries back the way `log show` would.
         let store = try OSLogStore(scope: .currentProcessIdentifier)
         let predicate = NSPredicate(format: "subsystem == %@", Paths.bundleIdentifier)
-        var messages: [String] = []
+        var entries: [OSLogEntryLog] = []
         let deadline = Date().addingTimeInterval(10)
         repeat {
-            let entries = try store.getEntries(at: store.position(date: since), matching: predicate)
-            messages = entries.compactMap { ($0 as? OSLogEntryLog)?.composedMessage }
-            if messages.count >= 2 { break }
+            entries = try store.getEntries(at: store.position(date: since), matching: predicate)
+                .compactMap { $0 as? OSLogEntryLog }
+            if entries.count >= 3 { break }
             Thread.sleep(forTimeInterval: 0.1)
         } while Date() < deadline
+        if entries.contains(where: { $0.category == "privacy-probe" && $0.composedMessage.contains(token) }) {
+            throw XCTSkip("private data logging is enabled on this Mac, so the unified log returns message bodies in clear")
+        }
+        let messages = entries.filter { $0.category == "core" }.map(\.composedMessage)
         if messages.isEmpty {
             throw XCTSkip("the unified log delivered no entries for this process within 10 s")
         }

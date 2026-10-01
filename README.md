@@ -245,10 +245,10 @@ Configuration lives in `~/Library/Application Support/Insomnia/config.json`.
 Use Settings for the app's controls; [Config.swift](Sources/Insomnia/Model/Config.swift)
 defines the full configuration and defaults. Local logs can contain SSIDs,
 process metadata, and tmux targets. Check them before sharing publicly.
-Every line also goes to the unified log with its body marked private, so
-`log show` and other local programs see `<private>` in place of the text
-unless private data logging is enabled on the Mac. The full text is only in
-`insomnia.log`.
+Lines the app writes to `insomnia.log` also go to the unified log with their
+bodies marked private, so `log show` and other local programs see `<private>`
+in place of the text unless private data logging is enabled on the Mac. The
+backstop's lines go only to `insomnia.log`, which keeps the full text of both.
 
 `INSOMNIA_HOME` relocates app support files, logs, and LaunchAgents for testing.
 It is **not an installation sandbox**: installation/removal also involves the
