@@ -115,6 +115,7 @@ is performed. Do not replace "not run" with "passed" based on source review.
 | Normal end, deadline expiry, and repeated Quit restore live power state | Not run for release fixes |
 | Force-quit followed by launchd deadline recovery and retry after failure | Not run |
 | Reboot/login with active or dirty journals | Not run |
+| Install from a terminal (confirmation prompt), with `--yes`, and without a terminal | Not run |
 | Lid-close/open and safe recovery of explicitly selected test processes | Not run |
 | Lid-close display/keyboard darkening and restore | Not run |
 | Freeze-all scope with agents running (Cursor/T3 Code/Claude untouched) | Not run |

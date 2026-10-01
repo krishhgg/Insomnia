@@ -54,6 +54,13 @@ agent, and asks for administrator access to install a narrowly scoped sudoers
 rule. It grants **your user account**, not just Insomnia, passwordless access to
 four power-setting commands. Review that permission before installing.
 
+Run the installer as the account that will use Insomnia, without `sudo`; it
+refuses to run as root. Before asking for your password it prints the exact
+sudoers rule, built for the account name from `id -un`, and waits for a `y`.
+Pass `--yes` to install the rule shown without the prompt; without a terminal
+the installer stops unless `--yes` is given. After writing the rule it reads
+the installed file back and stops if the content differs from what it showed.
+
 <details>
 <summary><strong>Exactly what gets installed</strong></summary>
 
