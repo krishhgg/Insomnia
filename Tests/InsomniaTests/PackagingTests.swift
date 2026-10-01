@@ -232,6 +232,140 @@ final class PackagingTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: ran.path))
     }
 
+    // MARK: - scripts/build-app.sh (patched copy: fake swift, real or recording codesign)
+
+    /// A private copy of build-app.sh whose `swift` is a fake that reports a
+    /// prepared binary directory (a copy of /usr/bin/true, so the real
+    /// codesign can sign the result) and whose `codesign` is either the real
+    /// tool or a recorder. ROOT is a scratch checkout with the real
+    /// Info.plist, icon and backstop.sh copied in.
+    private func patchedBuildApp(recordingCodesign: Bool) throws -> (script: URL, calls: URL) {
+        let fm = FileManager.default
+        let checkout = scratch.appendingPathComponent("checkout", isDirectory: true)
+        let bin = scratch.appendingPathComponent("bin", isDirectory: true)
+        let binroot = scratch.appendingPathComponent("binroot", isDirectory: true)
+        let calls = scratch.appendingPathComponent("calls.log")
+        for dir in [checkout.appendingPathComponent("scripts"), checkout.appendingPathComponent("Resources"), bin, binroot] {
+            try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+        for name in ["Info.plist", "AppIcon.icns"] {
+            try fm.copyItem(at: Self.repoRoot.appendingPathComponent("Resources/\(name)"), to: checkout.appendingPathComponent("Resources/\(name)"))
+        }
+        try fm.copyItem(at: Self.repoRoot.appendingPathComponent("scripts/backstop.sh"), to: checkout.appendingPathComponent("scripts/backstop.sh"))
+        try fm.copyItem(atPath: "/usr/bin/true", toPath: binroot.appendingPathComponent("Insomnia").path)
+
+        func fake(_ name: String, _ body: String) throws -> URL {
+            let url = bin.appendingPathComponent(name)
+            try ("#!/bin/bash\n" + body).write(to: url, atomically: true, encoding: .utf8)
+            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+            return url
+        }
+        let swift = try fake("swift", """
+        printf 'swift %s\\n' "$*" >> "\(calls.path)"
+        for a in "$@"; do [[ "$a" == --show-bin-path ]] && { echo "\(binroot.path)"; exit 0; }; done
+        exit 0
+        """)
+        let codesign = recordingCodesign
+            ? try fake("codesign", """
+              printf 'codesign %s\\n' "$*" >> "\(calls.path)"
+              exit 0
+              """)
+            : URL(fileURLWithPath: "/usr/bin/codesign")
+
+        var lines = try String(contentsOf: Self.repoRoot.appendingPathComponent("scripts/build-app.sh"), encoding: .utf8).components(separatedBy: "\n")
+        for (name, value) in ["SWIFT": swift.path, "CODESIGN": codesign.path] {
+            let hits = lines.indices.filter { lines[$0].hasPrefix("\(name)=") }
+            XCTAssertEqual(hits.count, 1, "build-app.sh must have exactly one \(name)= line")
+            lines[hits[0]] = "\(name)='\(value)'"
+        }
+        let script = checkout.appendingPathComponent("scripts/build-app.sh")
+        try lines.joined(separator: "\n").write(to: script, atomically: true, encoding: .utf8)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+        return (script, calls)
+    }
+
+    /// Ad-hoc by default: the output is a complete bundle (binary,
+    /// Info.plist, icon, backstop.sh) whose real signature verifies, whose
+    /// resource seal covers the backstop, and whose designated requirement
+    /// is the build's cdhash, the pin install.sh's agent uses.
+    func testBuildAppAssemblesAndAdHocSignsABundleWhoseSealCoversTheBackstop() throws {
+        let (script, _) = try patchedBuildApp(recordingCodesign: false)
+        let out = scratch.appendingPathComponent("out", isDirectory: true)
+
+        let r = try run("/bin/bash", [script.path, "--output", out.path], environment: ["PATH": "/usr/bin:/bin", "HOME": scratch.path])
+
+        XCTAssertEqual(r.status, 0, r.output)
+        let bundle = out.appendingPathComponent("Insomnia.app")
+        XCTAssertEqual(r.output.components(separatedBy: "\n").filter { !$0.isEmpty }.last, bundle.path, "the bundle path is printed last")
+        for rel in ["Contents/MacOS/Insomnia", "Contents/Info.plist", "Contents/Resources/AppIcon.icns", "Contents/Resources/backstop.sh", "Contents/_CodeSignature/CodeResources"] {
+            XCTAssertTrue(FileManager.default.fileExists(atPath: bundle.appendingPathComponent(rel).path), rel)
+        }
+        let perms = try FileManager.default.attributesOfItem(atPath: Paths.backstopScript(inBundle: bundle).path)[.posixPermissions] as? Int
+        XCTAssertEqual(perms.map { $0 & 0o111 }, 0o111, "backstop.sh is executable")
+        XCTAssertEqual(try run("/usr/bin/codesign", ["--verify", "--strict", bundle.path]).status, 0)
+        XCTAssertTrue(r.output.contains("Signature=adhoc"), r.output)
+        XCTAssertTrue(try CodeRequirement.designated(ofCodeAt: bundle).hasPrefix("cdhash H\""))
+
+        let script2 = Paths.backstopScript(inBundle: bundle)
+        try (String(contentsOf: script2, encoding: .utf8) + "# edited\n").write(to: script2, atomically: true, encoding: .utf8)
+        let edited = try run("/usr/bin/codesign", ["--verify", "--strict", bundle.path])
+        XCTAssertNotEqual(edited.status, 0, "an edited backstop.sh breaks the seal: \(edited.output)")
+    }
+
+    func testBuildAppReplacesABundleAlreadyInTheOutputDirectory() throws {
+        let (script, _) = try patchedBuildApp(recordingCodesign: false)
+        let out = scratch.appendingPathComponent("out", isDirectory: true)
+        let stale = out.appendingPathComponent("Insomnia.app/Contents/Resources/stale.txt")
+        try FileManager.default.createDirectory(at: stale.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try "old".write(to: stale, atomically: true, encoding: .utf8)
+
+        let r = try run("/bin/bash", [script.path, "--output", out.path], environment: ["PATH": "/usr/bin:/bin", "HOME": scratch.path])
+
+        XCTAssertEqual(r.status, 0, r.output)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: stale.path), "the previous bundle is replaced, not merged")
+    }
+
+    /// The signing command depends only on INSOMNIA_SIGN_IDENTITY: ad-hoc
+    /// without it, Developer ID with the hardened runtime and a timestamp
+    /// with it. Neither uses --deep (no nested code). Checked with a
+    /// recording codesign so no identity is needed.
+    func testBuildAppSignsAdHocWithoutAnIdentityAndWithHardenedRuntimeAndTimestampWithOne() throws {
+        let (script, calls) = try patchedBuildApp(recordingCodesign: true)
+        let out = scratch.appendingPathComponent("out", isDirectory: true)
+        let bundle = out.appendingPathComponent("Insomnia.app").path
+
+        let adhoc = try run("/bin/bash", [script.path, "--output", out.path], environment: ["PATH": "/usr/bin:/bin", "HOME": scratch.path])
+        XCTAssertEqual(adhoc.status, 0, adhoc.output)
+        var recorded = try String(contentsOf: calls, encoding: .utf8).components(separatedBy: "\n").filter { $0.hasPrefix("codesign") }
+        XCTAssertEqual(recorded, [
+            "codesign --force --sign - \(bundle)",
+            "codesign --verify --strict \(bundle)",
+            "codesign -dvv \(bundle)",
+        ])
+
+        try FileManager.default.removeItem(at: calls)
+        let signed = try run("/bin/bash", [script.path, "--output", out.path],
+                             environment: ["PATH": "/usr/bin:/bin", "HOME": scratch.path, "INSOMNIA_SIGN_IDENTITY": "Developer ID Application: Example (ABCDE12345)"])
+        XCTAssertEqual(signed.status, 0, signed.output)
+        recorded = try String(contentsOf: calls, encoding: .utf8).components(separatedBy: "\n").filter { $0.hasPrefix("codesign") }
+        XCTAssertEqual(recorded, [
+            "codesign --force --sign Developer ID Application: Example (ABCDE12345) --options runtime --timestamp \(bundle)",
+            "codesign --verify --strict \(bundle)",
+            "codesign -dvv \(bundle)",
+        ])
+        XCTAssertTrue(signed.output.contains("Signing with \"Developer ID Application: Example (ABCDE12345)\""), signed.output)
+    }
+
+    func testBuildAppNeedsAnOutputDirectory() throws {
+        let (script, calls) = try patchedBuildApp(recordingCodesign: true)
+        for args in [[String](), ["--output"], ["--bogus", "x"]] {
+            let r = try run("/bin/bash", [script.path] + args, environment: ["PATH": "/usr/bin:/bin", "HOME": scratch.path])
+            XCTAssertEqual(r.status, 2, "\(args): \(r.output)")
+            XCTAssertTrue(r.output.contains("usage:"), r.output)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: calls.path), "nothing was built or signed")
+    }
+
     // MARK: - Helpers
 
     private func bigEndian32(_ data: Data, at offset: Int) -> UInt32 {

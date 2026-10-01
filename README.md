@@ -39,20 +39,51 @@
 
 ## Install
 
-Requires **macOS 26 or later** and **Xcode with Swift 6.2 or later**. Installation
-currently means building from source:
+Requires **macOS 26 or later**. Until Developer ID signing is set up, releases
+are ad-hoc signed experimental prereleases: macOS blocks the first launch until
+you allow it in System Settings > Privacy & Security. The checksum and the
+build attestation below still show that the zip is what the Release workflow
+built from the tagged commit.
+
+1. Download `Insomnia-<version>-macos.zip` and `SHA256SUMS` from the
+   [latest release](https://github.com/krishhgg/Insomnia/releases).
+2. Verify the download (`gh` is the [GitHub CLI](https://cli.github.com)):
+
+   ```bash
+   shasum -a 256 -c SHA256SUMS
+   gh attestation verify Insomnia-<version>-macos.zip -R krishhgg/Insomnia
+   ```
+
+3. Unzip and run the installer that comes in the zip:
+
+   ```bash
+   ditto -x -k Insomnia-<version>-macos.zip .
+   cd Insomnia-<version>-macos
+   ./install.sh --app ./Insomnia.app
+   open "$HOME/Applications/Insomnia.app"
+   ```
+
+The installer checks the bundle's signature, identifier and version (and, for
+a Developer ID build, Gatekeeper's verdict) before it asks for anything. It
+then installs the app and a background recovery agent, and asks for
+administrator access to install a narrowly scoped sudoers rule. It grants
+**your user account**, not just Insomnia, passwordless access to four
+power-setting commands. Review that permission before installing.
+
+### Build from source (experimental)
+
+Requires **Xcode with Swift 6.2 or later**. Clone a release tag, not `main`:
 
 ```bash
-git clone https://github.com/kgarg2468/Insomnia.git
+git clone --branch v<version> --depth 1 https://github.com/krishhgg/Insomnia.git
 cd Insomnia
 ./scripts/install.sh
 open "$HOME/Applications/Insomnia.app"
 ```
 
-The installer builds and ad-hoc signs the app, installs a background recovery
-agent, and asks for administrator access to install a narrowly scoped sudoers
-rule. It grants **your user account**, not just Insomnia, passwordless access to
-four power-setting commands. Review that permission before installing.
+`scripts/install.sh` builds the same bundle the release workflow builds
+(`scripts/build-app.sh`), ad-hoc signed, and installs it the same way.
+[docs/releasing.md](docs/releasing.md) describes the release pipeline.
 
 <details>
 <summary><strong>Exactly what gets installed</strong></summary>

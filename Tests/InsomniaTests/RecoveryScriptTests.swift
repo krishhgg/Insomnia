@@ -1154,6 +1154,158 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(try fx.contents(of: fx.plist.deletingLastPathComponent()), ["com.insomnia.backstop.plist"])
     }
 
+    // MARK: - install.sh --app (a prebuilt bundle, as from a release zip)
+
+    /// The prebuilt bundle is checked before the password prompt and
+    /// installed as it is: no build, the signature verified with --deep,
+    /// the identifier and version read, then the usual steps with the same
+    /// agent plist a source install writes.
+    func testInstallFromPrebuiltAppVerifiesItBeforeSudoAndInstallsItWithoutBuilding() throws {
+        try fx.prepareInstall()
+        let prebuilt = try fx.writePrebuiltApp()
+        fx.setMode("launchctl", "loaded")
+
+        let r = try fx.run(fx.installRedirected, ["--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        let calls = fx.calls()
+        XCTAssertFalse(calls.contains { $0.hasPrefix("swift") }, "nothing is built: \(calls)")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("codesign --force") }, "the bundle is installed as signed: \(calls)")
+        let verify = try XCTUnwrap(calls.firstIndex(of: "codesign --verify --strict --deep \(prebuilt.path)"), "\(calls)")
+        let visudo = try XCTUnwrap(calls.firstIndex { $0.hasPrefix("sudo visudo") }, "\(calls)")
+        XCTAssertLessThan(verify, visudo, "verified before the password prompt: \(calls)")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("spctl") }, "Gatekeeper is asked about Developer ID builds only: \(calls)")
+        XCTAssertTrue(r.stdout.contains("Insomnia 0.1.0: ad-hoc signed, an experimental build"), r.stdout)
+        XCTAssertEqual(try String(contentsOf: fx.app.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "prebuilt")
+        XCTAssertTrue(fx.exists(fx.installedBackstop))
+        XCTAssertTrue(fx.exists(prebuilt), "the source bundle is copied, not moved")
+        let plist = try fx.plistOnDisk()
+        let expected = LaunchdBackstop.plistDictionary(label: "com.insomnia.backstop", target: BackstopTarget(bundle: fx.app, requirement: fx.requirement))
+        XCTAssertTrue(NSDictionary(dictionary: plist).isEqual(to: expected), "same agent as a source install: \(plist)")
+        XCTAssertTrue(r.stdout.contains("Uninstall:"), r.stdout)
+    }
+
+    func testInstallFromPrebuiltAppStopsBeforeSudoWhenItsSignatureDoesNotVerify() throws {
+        try fx.prepareInstall()
+        try fx.installMachinery()
+        let prebuilt = try fx.writePrebuiltApp()
+        fx.setMode("codesign", "deep-verify-fails")
+
+        let r = try fx.run(fx.installRedirected, ["--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        let calls = fx.calls()
+        XCTAssertEqual(calls, ["codesign --verify --strict --deep \(prebuilt.path)"], "nothing after the failed check: \(calls)")
+        XCTAssertTrue(r.stderr.contains("Nothing was changed"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("SHA256SUMS"), "points at the download checks: \(r.stderr)")
+        XCTAssertEqual(try String(contentsOf: fx.app.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "binary", "old bundle kept")
+        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), "rule", "sudoers rule kept")
+        XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "plist", "trusted plist kept")
+    }
+
+    func testInstallFromPrebuiltAppRefusesAnotherIdentifierAVersionlessBundleAndAMissingBackstop() throws {
+        try fx.prepareInstall()
+        let cases: [(String, (ScriptFixture) throws -> URL)] = [
+            ("identifier", { try $0.writePrebuiltApp(bundleID: "com.example.other") }),
+            ("version", { try $0.writePrebuiltApp(version: "dev") }),
+            ("backstop", { try $0.writePrebuiltApp(withBackstop: false) }),
+        ]
+        for (name, make) in cases {
+            let bundle = try make(fx)
+            fx.clearCalls()
+            let r = try fx.run(fx.installRedirected, ["--app", bundle.path], extraEnvironment: ["USER": "tester"])
+            XCTAssertEqual(r.status, 1, "\(name): \(r.stderr + r.stdout)")
+            XCTAssertFalse(fx.calls().contains { $0.hasPrefix("sudo") }, "\(name): \(fx.calls())")
+            XCTAssertTrue(r.stderr.contains("Nothing was changed"), "\(name): \(r.stderr)")
+            XCTAssertFalse(fx.exists(fx.app), name)
+            XCTAssertFalse(fx.exists(fx.sudoers), name)
+            try FileManager.default.removeItem(at: bundle)
+        }
+    }
+
+    /// A Developer ID bundle must also pass Gatekeeper (notarized, not
+    /// revoked). The team is printed, and checked once EXPECTED_TEAM_ID is
+    /// set in install.sh.
+    func testInstallFromDeveloperIDAppAsksGatekeeperAndChecksTheTeamWhenOneIsExpected() throws {
+        try fx.prepareInstall()
+        let prebuilt = try fx.writePrebuiltApp()
+        fx.setSigning("developer-id:ABCDE12345")
+        fx.setMode("launchctl", "loaded")
+
+        let unpinned = try fx.run(fx.installRedirected, ["--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(unpinned.status, 0, unpinned.stderr + unpinned.stdout)
+        XCTAssertTrue(fx.calls().contains("spctl --assess --type execute \(prebuilt.path)"), "\(fx.calls())")
+        XCTAssertTrue(unpinned.stdout.contains("Developer ID signed by team ABCDE12345"), unpinned.stdout)
+        XCTAssertTrue(unpinned.stdout.contains("EXPECTED_TEAM_ID is empty"), "says the team is not checked: \(unpinned.stdout)")
+
+        try fx.writeInstallCopies(extraConstants: ["EXPECTED_TEAM_ID": "ZZZZZ99999"])
+        fx.clearCalls()
+        let wrongTeam = try fx.run(fx.installRedirected, ["--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(wrongTeam.status, 1, wrongTeam.stderr + wrongTeam.stdout)
+        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("sudo") }, "\(fx.calls())")
+        XCTAssertTrue(wrongTeam.stderr.contains("signed by team 'ABCDE12345', not ZZZZZ99999"), wrongTeam.stderr)
+        XCTAssertTrue(wrongTeam.stderr.contains("Nothing was changed"), wrongTeam.stderr)
+
+        try fx.writeInstallCopies(extraConstants: ["EXPECTED_TEAM_ID": "ABCDE12345"])
+        fx.clearCalls()
+        let pinned = try fx.run(fx.installRedirected, ["--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(pinned.status, 0, pinned.stderr + pinned.stdout)
+        XCTAssertTrue(pinned.stdout.contains("Developer ID signed by team ABCDE12345, Gatekeeper accepts it"), pinned.stdout)
+        XCTAssertFalse(pinned.stdout.contains("EXPECTED_TEAM_ID is empty"), pinned.stdout)
+    }
+
+    func testInstallFromDeveloperIDAppStopsBeforeSudoWhenGatekeeperRejectsIt() throws {
+        try fx.prepareInstall()
+        let prebuilt = try fx.writePrebuiltApp()
+        fx.setSigning("developer-id:ABCDE12345")
+        fx.setMode("spctl", "reject")
+
+        let r = try fx.run(fx.installRedirected, ["--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertTrue(fx.calls().contains("spctl --assess --type execute \(prebuilt.path)"), "\(fx.calls())")
+        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("sudo") }, "\(fx.calls())")
+        XCTAssertTrue(r.stderr.contains("Gatekeeper rejects it"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("Nothing was changed"), r.stderr)
+        XCTAssertFalse(fx.exists(fx.app))
+    }
+
+    /// A source install builds through build-app.sh into a staging
+    /// directory before the password prompt; the installed bundle is that
+    /// build, and the staging directory is gone afterwards.
+    func testInstallFromSourceBuildsBeforeSudoAndInstallsTheStagedBundle() throws {
+        try fx.prepareInstall()
+        fx.setMode("launchctl", "loaded")
+
+        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        let calls = fx.calls()
+        let build = try XCTUnwrap(calls.firstIndex(of: "swift build -c release"), "\(calls)")
+        let sign = try XCTUnwrap(calls.firstIndex { $0.hasPrefix("codesign --force --sign - ") }, "ad-hoc, no identity in the environment: \(calls)")
+        let visudo = try XCTUnwrap(calls.firstIndex { $0.hasPrefix("sudo visudo") }, "\(calls)")
+        XCTAssertLessThan(build, sign)
+        XCTAssertLessThan(sign, visudo, "built and signed before the password prompt: \(calls)")
+        XCTAssertFalse(calls[sign].contains(fx.app.path), "signed in staging, not in place: \(calls[sign])")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("codesign --verify --strict --deep") }, "the prebuilt checks are for --app only: \(calls)")
+        XCTAssertTrue(fx.exists(fx.app.appendingPathComponent("Contents/MacOS/Insomnia")))
+        XCTAssertTrue(fx.exists(fx.installedBackstop))
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: fx.appsDir.path), ["Insomnia.app"])
+    }
+
+    func testInstallRejectsUnknownArguments() throws {
+        try fx.prepareInstall()
+
+        let r = try fx.run(fx.installRedirected, ["--bogus"], extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 2, r.stderr + r.stdout)
+        XCTAssertEqual(fx.calls(), [])
+        XCTAssertTrue(r.stderr.contains("usage:"), r.stderr)
+    }
+
     /// The writable copy of installs before the sealed layout is removed
     /// once the verifying agent is confirmed loaded, not before: until then
     /// the previous agent (which runs that copy) is what retries.
@@ -1181,15 +1333,17 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(fx.exists(fx.installedBackstop))
     }
 
-    /// install.sh runs the agent's own check once, right after signing. A
-    /// bundle that fails it would give an agent that always refuses, so the
-    /// agent is not installed and the previous one is left alone.
+    /// install.sh runs the agent's own check (`--verify -R=<requirement>`)
+    /// once, on the installed copy. A bundle that fails it would give an
+    /// agent that always refuses, so the agent is not installed and the
+    /// previous one is left alone. (build-app.sh's plain `--verify` passed
+    /// before the password prompt; only the pinned check fails here.)
     func testInstallStopsBeforeTheAgentWhenTheBundleFailsItsOwnRequirementCheck() throws {
         try fx.prepareInstall()
         try "trusted".write(to: fx.plist, atomically: true, encoding: .utf8)
         try fx.writeMarkerBackstop(at: fx.legacyBackstop, name: "legacy")
         try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
-        fx.setMode("codesign", "verify-fails")
+        fx.setMode("codesign", "requirement-verify-fails")
 
         let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
 
@@ -1662,9 +1816,25 @@ private final class ScriptFixture {
             "QUIT_WAIT_SECONDS": "1",
         ]).write(to: uninstall, atomically: true, encoding: .utf8)
 
-        // install.sh: every $HOME-derived path and every tool is redirected
-        // into the fixture (build, signing, sudo, launchctl included).
-        let installText = try String(contentsOf: src.appendingPathComponent("install.sh"), encoding: .utf8)
+        // build-app.sh (run by install.sh from $ROOT/scripts): build and
+        // signing go to the fakes.
+        let buildText = try String(contentsOf: src.appendingPathComponent("build-app.sh"), encoding: .utf8)
+        let buildApp = repoScripts.appendingPathComponent("build-app.sh")
+        try Self.patch(buildText, [
+            "SWIFT": bin.appendingPathComponent("swift").path,
+            "CODESIGN": bin.appendingPathComponent("codesign").path,
+        ]).write(to: buildApp, atomically: true, encoding: .utf8)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: buildApp.path)
+
+        try writeInstallCopies(extraConstants: [:])
+    }
+
+    /// install.sh: every $HOME-derived path and every tool is redirected
+    /// into the fixture (signing, Gatekeeper, sudo, launchctl included; the
+    /// build goes through the patched build-app.sh above). Tests that need
+    /// another constant (EXPECTED_TEAM_ID) rewrite both copies with it.
+    func writeInstallCopies(extraConstants: [String: String]) throws {
+        let installText = try String(contentsOf: Self.productionScripts.appendingPathComponent("install.sh"), encoding: .utf8)
         let patchedInstall = try Self.patch(installText, [
             "QUIT_WAIT_SECONDS": "1",
             "APP_DIR": appsDir.path,
@@ -1677,15 +1847,45 @@ private final class ScriptFixture {
             "LAUNCHCTL": bin.appendingPathComponent("launchctl").path,
             "SUDO": bin.appendingPathComponent("sudo").path,
             "CODESIGN": bin.appendingPathComponent("codesign").path,
-            "SWIFT": bin.appendingPathComponent("swift").path,
+            "SPCTL": bin.appendingPathComponent("spctl").path,
             "LOCK_TIMEOUT_SECONDS": "1",
-        ])
+        ].merging(extraConstants) { $1 })
         try patchedInstall.write(to: install, atomically: true, encoding: .utf8)
         // The redirected copy runs past the INSOMNIA_HOME refusal: that
         // variable is what makes the backstop copy it installs act on the
         // fixture instead of ~/Library. The plain copy keeps the refusal.
         try Self.replaceOnce(patchedInstall, #"if [[ -n "${INSOMNIA_HOME:-}" ]]; then"#, with: "if false; then")
             .write(to: installRedirected, atomically: true, encoding: .utf8)
+    }
+
+    /// A bundle the way a release zip carries it: Info.plist, a marker
+    /// executable and the sealed backstop (the fixture's patched copy, so
+    /// install.sh's recovery step acts on the fixture). What the fake
+    /// codesign says about its signature is set with `setMode("codesign",
+    /// ...)` and `setSigning(...)`.
+    func writePrebuiltApp(bundleID: String = "com.kgarg.insomnia", version: String = "0.1.0", withBackstop: Bool = true) throws -> URL {
+        let app = root.appendingPathComponent("dist/Insomnia.app", isDirectory: true)
+        try fm.createDirectory(at: app.appendingPathComponent("Contents/MacOS"), withIntermediateDirectories: true)
+        try fm.createDirectory(at: app.appendingPathComponent("Contents/Resources"), withIntermediateDirectories: true)
+        try """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0"><dict>
+        <key>CFBundleIdentifier</key><string>\(bundleID)</string>
+        <key>CFBundleShortVersionString</key><string>\(version)</string>
+        </dict></plist>
+        """.write(to: app.appendingPathComponent("Contents/Info.plist"), atomically: true, encoding: .utf8)
+        try "prebuilt".write(to: app.appendingPathComponent("Contents/MacOS/Insomnia"), atomically: true, encoding: .utf8)
+        if withBackstop {
+            try fm.copyItem(at: backstop, to: app.appendingPathComponent("Contents/Resources/backstop.sh"))
+        }
+        return app
+    }
+
+    /// What the fake codesign reports for `-dvv`: "adhoc", or
+    /// "developer-id:<team>" for a Developer ID Application signature.
+    func setSigning(_ value: String) {
+        try? value.write(to: root.appendingPathComponent("codesign.signing"), atomically: true, encoding: .utf8)
     }
 
     /// Rewrites `NAME=...` constant lines. Every name must match exactly one
@@ -1794,19 +1994,42 @@ private final class ScriptFixture {
         """)
         // codesign: signing is recorded and succeeds. `-d -r-` prints a
         // fixed designated requirement the way codesign does (on stderr,
-        // with the "# " an implicit requirement carries). `--verify` passes
-        // unless mode "verify-fails".
+        // with the "# " an implicit requirement carries). `-dvv` describes
+        // the signature per codesign.signing (adhoc | developer-id:<team>).
+        // `--verify` passes unless mode "verify-fails"; mode
+        // "deep-verify-fails" fails only the `--deep` form install.sh runs
+        // on a prebuilt bundle, and "requirement-verify-fails" only the
+        // `-R=` form (the agent's pinned check).
         try writeFake("codesign", """
         printf 'codesign %s\\n' "$*" >> "\(calls)"
         mode="$(cat "\(r)/codesign.mode" 2>/dev/null || echo ok)"
-        last=""; for a in "$@"; do last="$a"; done
+        signing="$(cat "\(r)/codesign.signing" 2>/dev/null || echo adhoc)"
+        last=""; deep=0; pinned=0; for a in "$@"; do last="$a"; [[ "$a" == --deep ]] && deep=1; [[ "$a" == -R=* ]] && pinned=1; done
         for a in "$@"; do
           case "$a" in
             -r-) echo "Executable=$last/Contents/MacOS/Insomnia" >&2; echo '# designated => \(requirement)' >&2; exit 0 ;;
-            --verify) if [[ "$mode" == verify-fails ]]; then echo "$last: a sealed resource is missing or invalid" >&2; exit 1; fi; exit 0 ;;
+            -dvv) echo "Executable=$last/Contents/MacOS/Insomnia" >&2; echo "Identifier=com.kgarg.insomnia" >&2
+                  case "$signing" in
+                    developer-id:*) echo "Authority=Developer ID Application: Tester (${signing#developer-id:})" >&2
+                                    echo "Authority=Developer ID Certification Authority" >&2
+                                    echo "Authority=Apple Root CA" >&2
+                                    echo "TeamIdentifier=${signing#developer-id:}" >&2 ;;
+                    *) echo "Signature=adhoc" >&2; echo "TeamIdentifier=not set" >&2 ;;
+                  esac
+                  exit 0 ;;
+            --verify) if [[ "$mode" == verify-fails || ( "$mode" == deep-verify-fails && $deep == 1 ) || ( "$mode" == requirement-verify-fails && $pinned == 1 ) ]]; then echo "$last: a sealed resource is missing or invalid" >&2; exit 1; fi; exit 0 ;;
           esac
         done
         exit 0
+        """)
+        // spctl: Gatekeeper's verdict on a Developer ID bundle. Mode
+        // "reject" is what an unnotarized or revoked signature gets.
+        try writeFake("spctl", """
+        printf 'spctl %s\\n' "$*" >> "\(calls)"
+        mode="$(cat "\(r)/spctl.mode" 2>/dev/null || echo ok)"
+        last=""; for a in "$@"; do last="$a"; done
+        if [[ "$mode" == reject ]]; then echo "$last: rejected" >&2; echo "source=Unnotarized Developer ID" >&2; exit 3; fi
+        echo "$last: accepted" >&2; echo "source=Notarized Developer ID" >&2; exit 0
         """)
         // ps: answers from ps.table. Modes: "fail" (exit 2 with an error
         // line, like a broken ps) and "garbage" (exit 0 with nonsense).

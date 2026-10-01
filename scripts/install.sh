@@ -1,10 +1,27 @@
 #!/bin/bash
-# Build Insomnia, assemble ~/Applications/Insomnia.app with backstop.sh sealed
-# inside it, install the LaunchAgent that verifies the bundle and runs that
-# script, and write the sudoers rule. Idempotent; asks for sudo once (for
+# Install Insomnia: put Insomnia.app (with backstop.sh sealed inside it) in
+# ~/Applications, install the LaunchAgent that verifies the bundle and runs
+# that script, and write the sudoers rule. Idempotent; asks for sudo once (for
 # /etc/sudoers.d/insomnia), before anything of a previous install is touched.
 # Not atomic: a failure after the sudoers step says exactly what was replaced
 # so far.
+#
+# Where the bundle comes from:
+#   ./scripts/install.sh                      builds it from this checkout
+#                                             (scripts/build-app.sh, ad-hoc
+#                                             signed unless INSOMNIA_SIGN_IDENTITY
+#                                             is set)
+#   ./install.sh --app /path/to/Insomnia.app  installs a prebuilt bundle, such
+#                                             as the one in a release zip, after
+#                                             checking its signature, bundle
+#                                             identifier and version (and, for
+#                                             a Developer ID signature,
+#                                             Gatekeeper's verdict and the
+#                                             team). Nothing of this checkout
+#                                             is needed then; the zip carries
+#                                             this script.
+# Either way the bundle is checked before the password prompt, so a bad build
+# or download changes nothing.
 set -euo pipefail
 
 # Installation always uses the standard per-user layout. A relocated
@@ -27,11 +44,20 @@ LAUNCHCTL=/bin/launchctl
 SUDO=/usr/bin/sudo
 PLUTIL=/usr/bin/plutil
 CODESIGN=/usr/bin/codesign
-SWIFT=/usr/bin/swift
+SPCTL=/usr/bin/spctl
+DITTO=/usr/bin/ditto
 LOCKF=/usr/bin/lockf
 LOCK_TIMEOUT_SECONDS=10
 
+# What a prebuilt bundle (--app) must be.
+BUNDLE_ID=com.kgarg.insomnia
+# Apple Team ID of the Developer ID that signs releases. Empty until the
+# maintainer sets up release signing (docs/releasing.md); while empty, a
+# Developer ID bundle is accepted from any team and the team is printed.
+EXPECTED_TEAM_ID=""
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_DIR="$HOME/Applications"
 APP="$APP_DIR/Insomnia.app"
 APP_SUPPORT="$HOME/Library/Application Support/Insomnia"
@@ -43,13 +69,82 @@ SUDOERS=/etc/sudoers.d/insomnia
 UID_NUM="$(id -u)"
 
 step() { printf '\n==> %s\n' "$*"; }
+usage() { echo "usage: $0 [--app /path/to/Insomnia.app]" >&2; }
 
-# 1. Build -------------------------------------------------------------------
-step "Building (release)"
-cd "$ROOT"
-"$SWIFT" build -c release
-BIN="$("$SWIFT" build -c release --show-bin-path)/Insomnia"
-[[ -x "$BIN" ]] || { echo "binary not found at $BIN" >&2; exit 1; }
+PREBUILT=""
+while (( $# )); do
+  case "$1" in
+    --app) [[ $# -ge 2 ]] || { usage; exit 2; }; PREBUILT="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "unknown argument: $1" >&2; usage; exit 2 ;;
+  esac
+done
+
+STAGE=""
+TMP_SUDOERS=""
+cleanup() { [[ -n "$STAGE" ]] && rm -rf "$STAGE"; [[ -n "$TMP_SUDOERS" ]] && rm -f "$TMP_SUDOERS"; return 0; }
+trap cleanup EXIT
+
+# 1. The bundle to install ---------------------------------------------------
+#    Built or verified before the password prompt: nothing on the machine has
+#    changed when this step fails.
+if [[ -n "$PREBUILT" ]]; then
+  step "Checking the prebuilt bundle $PREBUILT"
+  INFO_PLIST="$PREBUILT/Contents/Info.plist"
+  if [[ ! -d "$PREBUILT" || ! -f "$INFO_PLIST" ]]; then
+    echo "$PREBUILT is not an app bundle (no Contents/Info.plist). Nothing was changed." >&2
+    exit 1
+  fi
+  # Signature first: nothing below is read from the bundle until it is known
+  # to be intact. --strict rejects what newer codesign would, --deep covers
+  # nested code should a later build add any.
+  if ! "$CODESIGN" --verify --strict --deep "$PREBUILT"; then
+    echo "$PREBUILT fails 'codesign --verify --strict --deep': the download is damaged or was modified. Nothing was changed." >&2
+    echo "Check the zip against SHA256SUMS and 'gh attestation verify' (README, Install) and download it again." >&2
+    exit 1
+  fi
+  PREBUILT_ID="$("$PLUTIL" -extract CFBundleIdentifier raw -o - "$INFO_PLIST" 2>/dev/null || true)"
+  if [[ "$PREBUILT_ID" != "$BUNDLE_ID" ]]; then
+    echo "$PREBUILT has bundle identifier '${PREBUILT_ID:-<none>}', not $BUNDLE_ID. Nothing was changed." >&2
+    exit 1
+  fi
+  PREBUILT_VERSION="$("$PLUTIL" -extract CFBundleShortVersionString raw -o - "$INFO_PLIST" 2>/dev/null || true)"
+  if [[ ! "$PREBUILT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "$PREBUILT has no usable CFBundleShortVersionString ('${PREBUILT_VERSION:-<none>}'). Nothing was changed." >&2
+    exit 1
+  fi
+  if [[ ! -f "$PREBUILT/Contents/Resources/backstop.sh" ]]; then
+    echo "$PREBUILT has no Contents/Resources/backstop.sh; the recovery agent needs the sealed copy. Nothing was changed." >&2
+    exit 1
+  fi
+  SIGNING="$("$CODESIGN" -dvv "$PREBUILT" 2>&1 || true)"
+  if grep -q '^Authority=Developer ID Application' <<<"$SIGNING"; then
+    # A Developer ID build is meant to pass Gatekeeper: notarized, not revoked.
+    if ! "$SPCTL" --assess --type execute "$PREBUILT"; then
+      echo "$PREBUILT is Developer ID signed but Gatekeeper rejects it (not notarized, or the certificate was revoked). Nothing was changed." >&2
+      exit 1
+    fi
+    TEAM="$(sed -n 's/^TeamIdentifier=//p' <<<"$SIGNING" | head -n 1)"
+    if [[ -n "$EXPECTED_TEAM_ID" && "$TEAM" != "$EXPECTED_TEAM_ID" ]]; then
+      echo "$PREBUILT is signed by team '${TEAM:-<none>}', not $EXPECTED_TEAM_ID (the team this install.sh expects). Nothing was changed." >&2
+      exit 1
+    fi
+    if [[ -n "$EXPECTED_TEAM_ID" ]]; then
+      echo "Insomnia $PREBUILT_VERSION: Developer ID signed by team $TEAM, Gatekeeper accepts it"
+    else
+      echo "Insomnia $PREBUILT_VERSION: Developer ID signed by team ${TEAM:-<none>}, Gatekeeper accepts it (EXPECTED_TEAM_ID is empty in this install.sh, so the team is not checked)"
+    fi
+  else
+    echo "Insomnia $PREBUILT_VERSION: ad-hoc signed, an experimental build. The signature covers the bundle but names no developer,"
+    echo "so verify the download with SHA256SUMS and 'gh attestation verify' (README, Install). macOS blocks the first launch"
+    echo "of a downloaded ad-hoc build until you allow it in System Settings > Privacy & Security."
+  fi
+  SOURCE_APP="$PREBUILT"
+else
+  STAGE="$(mktemp -d)"
+  "$ROOT/scripts/build-app.sh" --output "$STAGE"
+  SOURCE_APP="$STAGE/Insomnia.app"
+fi
 
 # 2. sudoers -----------------------------------------------------------------
 #    The password prompt comes first: until the rule is installed and proven
@@ -57,7 +152,6 @@ BIN="$("$SWIFT" build -c release --show-bin-path)/Insomnia"
 #    (backstop.sh included) nor the LaunchAgent are touched.
 step "Writing $SUDOERS (requires your password once)"
 TMP_SUDOERS="$(mktemp)"
-trap 'rm -f "$TMP_SUDOERS"' EXIT
 cat > "$TMP_SUDOERS" <<SUDO
 # Installed by Insomnia install.sh. Exactly four commands, nothing else.
 $USER ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 1
@@ -99,27 +193,23 @@ if "$PGREP" -x Insomnia >/dev/null 2>&1; then
   fi
 fi
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS"
-cp "$BIN" "$APP/Contents/MacOS/Insomnia"
-cp "$ROOT/Resources/Info.plist" "$APP/Contents/Info.plist"
-mkdir -p "$APP/Contents/Resources"
-cp "$ROOT/Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
-# backstop.sh goes into the bundle before it is signed, so the signature's
-# resource seal covers it. The LaunchAgent below verifies the whole bundle
-# against the requirement read after signing and only then runs this copy;
-# an edited script fails that check. No executable is left in a writable
-# directory.
+mkdir -p "$APP_DIR"
+# ditto keeps the signature's resource seal and every attribute intact (a
+# downloaded bundle keeps its quarantine flag; Gatekeeper decides at launch).
+"$DITTO" "$SOURCE_APP" "$APP"
+# backstop.sh was sealed into the bundle before signing (build-app.sh), so
+# the signature's resource seal covers it. The LaunchAgent below verifies
+# the whole bundle against the requirement read here and only then runs this
+# copy; an edited script fails that check. No executable is left in a
+# writable directory.
 BACKSTOP="$APP/Contents/Resources/backstop.sh"
-cp "$ROOT/scripts/backstop.sh" "$BACKSTOP"
-chmod 755 "$BACKSTOP"
-"$PLUTIL" -lint "$APP/Contents/Info.plist" >/dev/null
-"$CODESIGN" --force --sign - --deep "$APP"
 echo "signed $("$CODESIGN" -dv "$APP" 2>&1 | grep -i identifier || true)"
 # What the agent pins: the bundle's designated requirement, in the form
 # `codesign -d -r-` prints (an implicit one carries a leading "# "). For an
 # ad-hoc signature that is the cdhash of this build, so no other build and
-# no edited bundle satisfies it. The app reads the same text through the
-# Security framework (CodeRequirement.swift) to recognise this plist.
+# no edited bundle satisfies it; for a Developer ID signature it names the
+# identifier and the team. The app reads the same text through the Security
+# framework (CodeRequirement.swift) to recognise this plist.
 REQUIREMENT="$("$CODESIGN" -d -r- "$APP" 2>&1 | sed -n 's/^#\{0,1\} *designated => //p' | head -n 1)"
 if [[ -z "$REQUIREMENT" ]]; then
   echo "could not read the designated requirement of $APP ('codesign -d -r-'); the LaunchAgent cannot pin the bundle. $SUDOERS is installed; the LaunchAgent was not touched." >&2
@@ -184,7 +274,7 @@ recovery_rc=0
 step "Installing LaunchAgent $LABEL"
 CANDIDATE_DIR="$LAUNCH_AGENTS/.$LABEL.staging"
 CANDIDATE="$CANDIDATE_DIR/$LABEL.candidate-$$.plist"
-trap 'rm -f "$TMP_SUDOERS" "$CANDIDATE"; rmdir "$CANDIDATE_DIR" 2>/dev/null || true' EXIT
+trap 'cleanup; rm -f "$CANDIDATE"; rmdir "$CANDIDATE_DIR" 2>/dev/null || true' EXIT
 mkdir -p "$CANDIDATE_DIR"
 # Leftovers of earlier attempts, including an older build's candidates in
 # $LAUNCH_AGENTS itself (those make launchd's login load report an error).
@@ -342,11 +432,12 @@ fi
 
 # 7. Done --------------------------------------------------------------------
 step "Installed"
+if [[ -f "$ROOT/scripts/uninstall.sh" ]]; then UNINSTALL="$ROOT/scripts/uninstall.sh"; else UNINSTALL="$SCRIPT_DIR/uninstall.sh"; fi
 cat <<NEXT
 Next steps:
   1. Launch:            open "$APP"
   2. Optional:          System Settings > Wi-Fi > Ask to join hotspots: Automatically
   3. Config lives at:   $APP_SUPPORT/config.json
   4. Logs:              $LOG_DIR/insomnia.log
-  5. Uninstall:         $ROOT/scripts/uninstall.sh
+  5. Uninstall:         $UNINSTALL
 NEXT

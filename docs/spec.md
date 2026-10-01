@@ -33,9 +33,12 @@ closed bag. Its design goals are to:
 - macOS 26 on Apple Silicon (built and tested on MacBook Pro M5).
 - Swift 6, SwiftUI content hosted in a custom `NSStatusItem`, Swift Package.
   No Xcode project.
-- `install.sh` assembles a minimal `Insomnia.app` bundle (`LSUIElement = true`,
-  no Dock icon) with `backstop.sh` sealed under `Contents/Resources`, ad-hoc
-  codesigns it, and installs it to `~/Applications`.
+- `build-app.sh` assembles a minimal `Insomnia.app` bundle (`LSUIElement =
+  true`, no Dock icon) with `backstop.sh` sealed under `Contents/Resources`
+  and signs it (ad-hoc, or with a Developer ID when `INSOMNIA_SIGN_IDENTITY`
+  is set). `install.sh` installs that build, or a prebuilt bundle passed with
+  `--app` after verifying it, to `~/Applications`. The Release workflow
+  packages the same bundle (`docs/releasing.md`).
 
 ## Core model
 
@@ -532,7 +535,8 @@ Insomnia/
     TestSupport.swift
     UIStatusTests.swift
   scripts/
-    install.sh             build, bundle (backstop.sh sealed inside), codesign, sudoers, launchd
+    build-app.sh           build, bundle (backstop.sh sealed inside), codesign
+    install.sh             build-app.sh or a verified --app bundle, sudoers, launchd
     uninstall.sh           reverse all of the above, restore sleep
     backstop.sh            standalone restore from JSON
     simulate-lid.sh        file trigger for the lid-close action path

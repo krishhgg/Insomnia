@@ -127,6 +127,9 @@ is performed. Do not replace "not run" with "passed" based on source review.
 | Battery/thermal event behavior on supported hardware | Not run |
 | Install/upgrade/uninstall with recoverable failure conditions | Not run |
 | Recovery agent refuses to run after the installed bundle or its sealed backstop.sh is modified, and logs why | Not run |
+| Install from a release zip with `install.sh --app` on a working Mac, first launch of the downloaded app | Not run |
+| Release workflow end to end: tag push, tests, package, attestation, GitHub Release, `gh attestation verify` of the download | Not run |
+| Developer ID signing, notarization and stapling in the Release workflow | Not run |
 
 Hardware tests must be supervised and must not endanger active user work. Use
 a stable, ventilated surface, not an enclosure. Do not intentionally overheat a
@@ -147,7 +150,15 @@ working Mac.
 
 ## Distribution boundary
 
-Local source builds use ad-hoc signing. Developer ID signing, notarization,
-download packaging, and a consumer installation/recovery walkthrough have not
-been completed. Open-source availability and a passing PR are not equivalent
-to readiness for a signed public binary release.
+Packaging is automated: `scripts/build-app.sh` makes the bundle, and the
+Release workflow tests, packages, checksums, attests and publishes it for a
+`v*` tag (`docs/releasing.md`). PackagingTests run a patched copy of
+`build-app.sh` with the real codesign, RecoveryScriptTests run `install.sh
+--app` against prebuilt fixtures, and ReleaseWorkflowTests check that every
+action in the workflows is pinned to a commit and that no job has more than
+read access except the one that publishes. No release has been produced with
+it yet. Developer ID signing and notarization run only once the maintainer
+adds the secrets; until then releases are ad-hoc signed prereleases. A
+consumer installation and recovery walkthrough from a downloaded zip has not
+been done. Open-source availability and a passing PR are not equivalent to
+readiness for a signed public binary release.
