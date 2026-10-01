@@ -123,3 +123,19 @@ enum StatusMenu {
         return item
     }
 }
+
+/// What the menu asks before "Relaunch <browser> unthrottled" quits
+/// anything. Pure so the copy is testable; the controller shows it as an
+/// NSAlert.
+struct RelaunchPrompt: Equatable {
+    static let confirmTitle = "Quit and relaunch"
+    static let cancelTitle = "Cancel"
+
+    let title: String
+    let message: String
+
+    init(browser name: String) {
+        title = "Quit and relaunch \(name)?"
+        message = "Insomnia quits \(name) and opens it again with the two flags that stop it throttling hidden windows. Your windows and tabs come back only if \(name) is set to reopen them on startup. If \(name) has not quit after \(Int(BrowserThrottle.quitTimeout)) s, nothing is relaunched."
+    }
+}

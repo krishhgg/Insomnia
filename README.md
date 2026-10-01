@@ -229,9 +229,14 @@ retract keystrokes already sent.
 Chromium browsers can throttle windows macOS considers occluded, including
 when the lid is closed. Insomnia detects supported running browsers missing
 `--disable-backgrounding-occluded-windows` or `--disable-renderer-backgrounding`
-and offers **Relaunch [browser] unthrottled** in the right-click menu. Relaunch
-preserves browser profile arguments. This is not a guarantee that every web
-app will keep working while the lid is closed.
+and offers **Relaunch [browser] unthrottled** in the right-click menu. The item
+asks first, because the browser is quit and its windows and tabs come back only
+if it is set to reopen them on startup. Insomnia reads the browser's profile
+arguments before quitting and carries them over; if it cannot read them, it
+does not quit. If the browser has not quit after 10 s, nothing is launched, and
+a notification says so: a second copy beside the first would be worse than a
+throttled one. This is not a guarantee that every web app will keep working
+while the lid is closed.
 
 </details>
 

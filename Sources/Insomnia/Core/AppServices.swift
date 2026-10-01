@@ -80,6 +80,7 @@ final class AppServices {
         keyboard: any KeyboardBacklighting = NoopKeyboardBacklight(),
         keychain: any KeychainStoring = KeychainStore(),
         locationPermission: LocationPermission = LocationPermission(),
+        browser: BrowserThrottle? = nil,
         idleSeconds: @escaping @Sendable () -> Double = { UserInput.secondsSinceLastInput() }
     ) {
         self.paths = paths
@@ -92,7 +93,7 @@ final class AppServices {
         self.docker = DockerRule(freezer: freezer)
         self.keychain = keychain
         self.locationPermission = locationPermission
-        self.browser = BrowserThrottle()
+        self.browser = browser ?? BrowserThrottle()
         status.refresher = { [weak self] in await self?.refreshOnDemand() }
     }
 
@@ -233,10 +234,16 @@ final class AppServices {
     }
 
     /// Quit and relaunch a Chromium browser with both anti-throttle flags.
+    /// The outcome lands seconds after the menu click, so anything short of
+    /// a relaunch goes out as a notification naming the browser.
     func relaunchUnthrottled(_ bundleId: String) async {
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
-            await self.browser.relaunchUnthrottled(bundleId: bundleId)
+            let outcome = await self.browser.relaunchUnthrottled(bundleId: bundleId)
+            let name = self.status.browsers.first { $0.bundleId == bundleId }?.name ?? bundleId
+            if let body = outcome.explanation(browser: name) {
+                self.notifier.post(title: "Browser not relaunched", body: body)
+            }
             guard !Task.isCancelled else { return }
             try? await Task.sleep(for: .seconds(2))
             guard !Task.isCancelled else { return }

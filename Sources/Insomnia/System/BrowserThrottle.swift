@@ -148,18 +148,99 @@ private final class ApplicationTerminationWaiter {
     }
 }
 
+/// The process side of a relaunch: which instances of a browser are
+/// running, quitting them, launching one. The app's implementation is
+/// NSWorkspace and `open -b`; tests inject a fake, so nothing real is quit.
+@MainActor
+protocol BrowserProcessControlling: AnyObject {
+    /// Process ids of every running application with this bundle id.
+    func runningPids(bundleId: String) -> [Int32]
+    /// Ask each application to quit and wait: true once all have quit,
+    /// false when `timeout` passes first.
+    func terminateAndWait(pids: [Int32], timeout: TimeInterval) async -> Bool
+    /// `open -b <bundleId> --args <arguments>`; throws when `open` fails.
+    func launch(bundleId: String, arguments: [String]) async throws
+}
+
+struct BrowserProcessError: Error, LocalizedError, Equatable {
+    let detail: String
+    var errorDescription: String? { detail }
+}
+
+@MainActor
+final class WorkspaceBrowserProcesses: BrowserProcessControlling {
+    func runningPids(bundleId: String) -> [Int32] {
+        NSWorkspace.shared.runningApplications
+            .filter { $0.bundleIdentifier == bundleId && !$0.isTerminated }
+            .map(\.processIdentifier)
+    }
+
+    func terminateAndWait(pids: [Int32], timeout: TimeInterval) async -> Bool {
+        let applications = pids.compactMap { NSRunningApplication(processIdentifier: $0) }
+        return await ApplicationTerminationWaiter(applications: applications).terminateAndWait(timeout: timeout)
+    }
+
+    func launch(bundleId: String, arguments: [String]) async throws {
+        let r = try await Shell.run("/usr/bin/open", ["-b", bundleId, "--args"] + arguments, timeout: 15)
+        guard r.succeeded else {
+            let stderr = r.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+            throw BrowserProcessError(detail: stderr.isEmpty ? "open exited with status \(r.status)" : stderr)
+        }
+    }
+}
+
+/// What "Relaunch <browser> unthrottled" did. Anything but `.relaunched`
+/// is reported to the user in a notification; the browser was quit only
+/// in `.launchFailed`.
+enum RelaunchOutcome: Equatable, Sendable {
+    /// Every instance quit and `open` returned 0.
+    case relaunched
+    /// No instance was running; nothing to quit.
+    case notRunning
+    /// The main process's arguments could not be read, so the profile
+    /// could not have been carried over. Nothing was quit.
+    case argumentsUnreadable(String)
+    /// An instance was still running after the wait. Nothing was launched:
+    /// `open` would have put a second copy beside it.
+    case stillRunning
+    /// Every instance quit, then `open` failed. The browser is not running.
+    case launchFailed(String)
+
+    /// The notification body, naming the browser; nil when the relaunch
+    /// happened.
+    func explanation(browser name: String) -> String? {
+        switch self {
+        case .relaunched:
+            nil
+        case .notRunning:
+            "\(name) is not running. Nothing was quit or relaunched."
+        case let .argumentsUnreadable(detail):
+            "Could not read \(name)'s profile arguments (\(detail)), so a relaunch could have opened the wrong profile. \(name) was not quit."
+        case .stillRunning:
+            "\(name) did not quit within \(Int(BrowserThrottle.quitTimeout)) s. Nothing was relaunched."
+        case let .launchFailed(detail):
+            "\(name) quit but could not be relaunched: \(detail). Open it yourself."
+        }
+    }
+}
+
 @MainActor
 final class BrowserThrottle {
     typealias ArgsReader = @Sendable (_ pid: Int32) async throws -> String
+
+    /// How long a browser gets to quit before the relaunch gives up.
+    nonisolated static let quitTimeout: TimeInterval = 10
 
     private(set) var statuses: [BrowserStatus] = []
     /// Display names of running Chromium browsers missing either flag.
     var throttledBrowsers: [String] { statuses.filter { !$0.unthrottled }.map(\.name) }
 
     private let readArgs: ArgsReader
+    private let processes: any BrowserProcessControlling
 
-    init(readArgs: ArgsReader? = nil) {
+    init(readArgs: ArgsReader? = nil, processes: (any BrowserProcessControlling)? = nil) {
         self.readArgs = readArgs ?? BrowserThrottle.psArgs
+        self.processes = processes ?? WorkspaceBrowserProcesses()
     }
 
     /// Inspect every running Chromium browser's main process.
@@ -185,29 +266,43 @@ final class BrowserThrottle {
         return out
     }
 
-    /// Quit the browser, wait up to 10 s for it to exit, relaunch it with
-    /// both flags (and the same profile arguments it had).
-    func relaunchUnthrottled(bundleId: String) async {
-        let running = NSWorkspace.shared.runningApplications.filter { $0.bundleIdentifier == bundleId }
-        var extra: [String] = []
-        if let main = running.first {
-            if let args = try? await readArgs(main.processIdentifier) {
-                extra = ChromiumFlags.preservedArgs(args: args)
-            }
+    /// Quit the browser, wait up to `quitTimeout` for every instance to
+    /// exit, and only then launch it with both flags and the profile
+    /// arguments it had. The arguments are read first: a browser whose
+    /// arguments cannot be read is not quit, since a relaunch without them
+    /// could open another profile. After the wait the running list is read
+    /// again, and an instance still there (the waiter timed out, or one
+    /// appeared meanwhile) means nothing is launched.
+    func relaunchUnthrottled(bundleId: String) async -> RelaunchOutcome {
+        let pids = processes.runningPids(bundleId: bundleId)
+        guard let main = pids.first else {
+            Log.info("relaunch: \(bundleId) is not running")
+            return .notRunning
         }
-        let terminated = await ApplicationTerminationWaiter(applications: running).terminateAndWait(timeout: 10)
-        if !terminated {
-            Log.error("relaunch: \(bundleId) did not quit within 10 s; launching anyway")
+        let extra: [String]
+        do {
+            let args = try await readArgs(main)
+            guard !args.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw BrowserProcessError(detail: "ps printed nothing for pid \(main)")
+            }
+            extra = ChromiumFlags.preservedArgs(args: args)
+        } catch {
+            Log.error("relaunch: could not read args of \(bundleId) (pid \(main)): \(error.localizedDescription); not quitting")
+            return .argumentsUnreadable(error.localizedDescription)
+        }
+        let quit = await processes.terminateAndWait(pids: pids, timeout: Self.quitTimeout)
+        let remaining = processes.runningPids(bundleId: bundleId)
+        guard quit, remaining.isEmpty else {
+            Log.error("relaunch: \(bundleId) still running after \(Int(Self.quitTimeout)) s (pids \(remaining)); not launching")
+            return .stillRunning
         }
         do {
-            let r = try await Shell.run("/usr/bin/open", ["-b", bundleId, "--args"] + ChromiumFlags.required + extra, timeout: 15)
-            if r.succeeded {
-                Log.info("relaunched \(bundleId) unthrottled")
-            } else {
-                Log.error("open -b \(bundleId) failed: \(r.stderr.trimmingCharacters(in: .whitespacesAndNewlines))")
-            }
+            try await processes.launch(bundleId: bundleId, arguments: ChromiumFlags.required + extra)
+            Log.info("relaunched \(bundleId) unthrottled")
+            return .relaunched
         } catch {
             Log.error("open -b \(bundleId) failed: \(error.localizedDescription)")
+            return .launchFailed(error.localizedDescription)
         }
     }
 

@@ -287,6 +287,50 @@ final class UIStatusTests: XCTestCase {
         XCTAssertEqual(items.map(\.kind), [.warning, .separator, .settings, .quit])
     }
 
+    /// The relaunch item asks first, since the browser is quit and its
+    /// windows come back only through its own session restore. Cancel
+    /// hands nothing on; confirming hands the name on.
+    @MainActor
+    func testRelaunchAsksBeforeQuittingAndCancelDoesNothing() {
+        _ = NSApplication.shared
+        let h = Harness()
+        defer { h.home.destroy() }
+        let source = RecordingStatusSource()
+        let asked = Locked<[String]>([])
+        let answer = Locked(false)
+        let controller = StatusItemController(
+            manager: h.makeManager(),
+            status: source,
+            showSettings: {},
+            confirmRelaunch: { name in
+                asked.value.append(name)
+                return answer.value
+            }
+        )
+
+        controller.relaunchBrowser(named: "Chrome")
+        XCTAssertEqual(asked.value, ["Chrome"])
+        XCTAssertEqual(source.relaunched, [])
+
+        answer.value = true
+        controller.relaunchBrowser(named: "Arc")
+        XCTAssertEqual(asked.value, ["Chrome", "Arc"])
+        XCTAssertEqual(source.relaunched, ["Arc"])
+    }
+
+    /// The prompt names the browser, says the windows depend on the
+    /// browser's own startup setting, and gives the 10 s rule.
+    func testRelaunchPromptCopy() {
+        let prompt = RelaunchPrompt(browser: "Chrome")
+        XCTAssertEqual(prompt.title, "Quit and relaunch Chrome?")
+        XCTAssertEqual(
+            prompt.message,
+            "Insomnia quits Chrome and opens it again with the two flags that stop it throttling hidden windows. Your windows and tabs come back only if Chrome is set to reopen them on startup. If Chrome has not quit after 10 s, nothing is relaunched."
+        )
+        XCTAssertEqual(RelaunchPrompt.confirmTitle, "Quit and relaunch")
+        XCTAssertEqual(RelaunchPrompt.cancelTitle, "Cancel")
+    }
+
     /// Greptile caught this as a regression: replacing the popover with a
     /// menu left the throttle warning with no way to act on it.
     func testEveryThrottledBrowserGetsItsOwnRelaunchItem() {
@@ -1072,4 +1116,24 @@ final class UIStatusTests: XCTestCase {
         XCTAssertFalse(panel?.isVisible ?? true)
         XCTAssertFalse(NSApp.windows.contains { $0 is KeyCatcherPanel && $0.isVisible })
     }
+}
+
+/// A status source that records relaunch requests and reports nothing else.
+@MainActor
+@Observable
+final class RecordingStatusSource: StatusSource {
+    var lidClosed = false
+    var batteryPercent: Int? = nil
+    var isCharging = false
+    var wifiSSID: String? = nil
+    var lastGap: TimeInterval? = nil
+    var frozenCount = 0
+    var dockerPaused = false
+    var throttledBrowsers: [String] = []
+    private(set) var relaunched: [String] = []
+
+    func refreshOnDemand() {}
+    func refreshInstant() {}
+    func instantWatts() -> Double? { nil }
+    func relaunchUnthrottled(_ name: String) { relaunched.append(name) }
 }

@@ -74,6 +74,34 @@ final class IntegrationWiringTests: XCTestCase {
         XCTAssertNil(LiveStatusSource.bundleID(forDisplayName: "Safari", in: statuses))
     }
 
+    /// A relaunch that stops short (here the browser is still running when
+    /// the wait ends) reaches the user as a notification naming the browser,
+    /// and nothing is launched.
+    @MainActor
+    func testARelaunchThatStopsShortIsNotifiedAndLaunchesNothing() async {
+        let home = TempHome()
+        defer { home.destroy() }
+        let notifier = RecordingNotifier()
+        let processes = FakeBrowserProcesses(pids: [42])
+        processes.quits = false
+        let services = AppServices(
+            paths: home.paths,
+            notifier: notifier,
+            audio: FakeAudioControl(),
+            processControl: FakeProcessControl(),
+            locationPermission: LocationPermission(authorizationStatus: .notDetermined),
+            browser: BrowserThrottle(readArgs: { _ in "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" }, processes: processes)
+        )
+        services.status.browsers = [BrowserStatus(bundleId: "com.google.Chrome", name: "Chrome", pid: 42, unthrottled: false)]
+
+        await services.relaunchUnthrottled("com.google.Chrome")
+
+        XCTAssertEqual(notifier.posts.map(\.title), ["Browser not relaunched"])
+        XCTAssertEqual(notifier.posts.map(\.body), ["Chrome did not quit within 10 s. Nothing was relaunched."])
+        XCTAssertEqual(processes.terminated, [[42]])
+        XCTAssertEqual(processes.launches.count, 0)
+    }
+
     func testKeychainSecretStoreUsesFailoverServiceAndCurrentSSID() throws {
         let keychain = FakeKeychainStore()
         var ssid = "Phone"

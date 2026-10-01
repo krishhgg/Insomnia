@@ -24,6 +24,9 @@ final class StatusItemController: NSObject {
     /// app delegate, which outlives any one status item.
     private let showSettings: () -> Void
     private let makeWidthWriter: WidthWriterFactory?
+    /// Asks before a browser is quit for a relaunch; true means go ahead.
+    /// Injected so tests never see the NSAlert.
+    private let confirmRelaunch: @MainActor (String) -> Bool
 
     private let statusItem: NSStatusItem
     private var hostingView: StatusHostingView?
@@ -61,12 +64,14 @@ final class StatusItemController: NSObject {
         manager: SessionManager,
         status: any StatusSource,
         showSettings: @escaping () -> Void,
-        makeWidthWriter: WidthWriterFactory? = nil
+        makeWidthWriter: WidthWriterFactory? = nil,
+        confirmRelaunch: (@MainActor (String) -> Bool)? = nil
     ) {
         self.manager = manager
         self.status = status
         self.showSettings = showSettings
         self.makeWidthWriter = makeWidthWriter
+        self.confirmRelaunch = confirmRelaunch ?? Self.askBeforeRelaunch
         Self.seedPreferredPositionIfNeeded()
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.autosaveName = Self.autosaveName
@@ -668,7 +673,29 @@ final class StatusItemController: NSObject {
 
     @objc private func menuRelaunchBrowser(_ sender: NSMenuItem) {
         guard let name = sender.representedObject as? String else { return }
+        relaunchBrowser(named: name)
+    }
+
+    /// The relaunch item: ask first, since the browser is quit and its
+    /// windows come back only through its own session restore. Cancel does
+    /// nothing.
+    func relaunchBrowser(named name: String) {
+        guard confirmRelaunch(name) else { return }
         status.relaunchUnthrottled(name)
+    }
+
+    private static func askBeforeRelaunch(_ name: String) -> Bool {
+        let prompt = RelaunchPrompt(browser: name)
+        let alert = NSAlert()
+        alert.messageText = prompt.title
+        alert.informativeText = prompt.message
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: RelaunchPrompt.confirmTitle)
+        alert.addButton(withTitle: RelaunchPrompt.cancelTitle)
+        // A menu bar app has no window to carry the alert; bring the app
+        // forward so the alert is not behind whatever is frontmost.
+        NSApp.activate(ignoringOtherApps: true)
+        return alert.runModal() == .alertFirstButtonReturn
     }
 
     @objc private func menuQuit() {
