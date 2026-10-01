@@ -68,7 +68,10 @@ recovery; newly written journals use `frozenProcesses`.
 ### 1. Timed sessions (the only way to keep the Mac awake)
 
 - Time is entered inline in the menu bar as Days / Hours / Minutes pills.
-  Enter with empty fields uses the configured default preset. Maximum 30 days.
+  Enter with empty fields uses the configured default preset. Maximum 24
+  hours by default (`maxDuration` in config.json, which also caps presets and
+  extensions). A time past the maximum is refused with the allowance shown
+  beside the pills ("Up to 1d"); it is never shortened without saying so.
 - While active the menu bar shows a second-resolution countdown. The redraw
   timer runs at 1 Hz and stops while the lid is closed.
 - Click the cup/countdown to enter an extension; hold the end control to end.
@@ -265,8 +268,10 @@ percentage change) and `ProcessInfo.thermalStateDidChangeNotification`.
 Insomnia does not enable Low Power Mode merely because a session starts; the
 causes are the battery floor, a serious thermal state, and (by default) a closed
 lid. One evaluation owns the mode: it is switched off only when no cause holds.
-Battery and thermal rules run only while the app is alive; they are not
-provided by the standalone backstop. Performance effects depend on workload.
+The Low Power Mode rules run only while the app is alive. The two ends (end
+floor, critical thermal state) are also enforced by the standalone backstop
+once a minute (section 8), so they hold after a crash. Performance effects
+depend on workload.
 
 ### 7. Network failover
 
@@ -316,15 +321,24 @@ Backstop, independent of the app:
   the loaded job for every extension and allow retries after a failure.
 - App and script transactions must coordinate through a shared lock. Failure
   to acquire it must not permit an unprotected journal write or side effect.
+- A valid session is live only while the app holds `.app.alive`, an flock(2)
+  taken at launch and released by the kernel when the process dies, and while
+  the end floor and the critical thermal level (`notifyutil -g
+  com.apple.system.thermalpressurelevel`, 3 and up) are not crossed. The
+  agent ends the session otherwise, exactly as `--force` does, and logs the
+  reason. A present battery that cannot be read fails closed; an unreadable
+  thermal level only warns. `--force` runs none of these checks.
 - Successful restores may clear their entries; failures must stay journaled.
   Process recovery must verify identity and avoid resuming a process that
   Insomnia did not stop. Old PID-only entries need conservative handling.
 - The shell does not restore CoreAudio settings. Saved audio must remain in
   the journal for the app to restore. Uninstall must preserve recovery tools
   and state when restoration is incomplete, including saved audio.
-- The agent is a recovery mechanism, not a guarantee of crash/reboot behavior
-  or a replacement for battery/thermal observers. These scenarios require
-  the separate hardware validation record.
+- The agent is a recovery mechanism, not a guarantee of crash/reboot behavior.
+  Its battery and thermal checks cover the two ends once a minute, not Low
+  Power Mode or notifications. At login the agent runs before the app and
+  ends a session the app left valid, because no process holds the alive lock.
+  These scenarios require the separate hardware validation record.
 
 ### 9. Notifications
 
@@ -369,7 +383,8 @@ one after another with a short stagger.
   replaces it with the number and the pill grows to fit. Tab and Shift-Tab
   move between pills, Enter starts the session, Esc collapses.
 - The "?" badge on each pill is a help affordance: hover shows a tooltip
-  ("Up to 30 days" etc.). It is not an input.
+  ("Up to 1d per session" on Days, from `maxDuration`; "0–23"; "0–59"). It
+  is not an input.
 - The current interface uses inline entry, not the preset-popover proposal
   from the original design. Empty-field Enter starts the default preset.
 
@@ -554,11 +569,15 @@ that any case passed; record results in the release validation record.
    sleep still disabled until end.
 3. **Restores.** End now → `pmset -g` shows no `SleepDisabled`. Quit → same.
    Timer expiry → same, plus notification.
-4. **Backstop.** Force-quit a supervised disposable session, then verify
-   deadline recovery and retry after an injected restore failure. Separately
-   test reboot/login with valid, expired, and dirty journals; the polling
-   agent honors a valid future deadline rather than unconditionally ending
-   every session at login. Saved audio requires the app to reopen.
+4. **Backstop.** Force-quit a supervised disposable session: the agent ends it
+   within a minute (log line "Insomnia is not running"). Verify retry after an
+   injected restore failure. With the app stopped (`kill -STOP`) and the Mac
+   on battery below the end floor, the agent ends the session on its own;
+   drive the thermal end with an injected reading against a patched copy of
+   the script, not the installed agent. Separately test reboot/login with
+   valid, expired, and dirty journals; at login the agent runs before the app
+   and ends a valid session, since no app holds the alive lock. Saved audio
+   requires the app to reopen.
 5. **Freeze.** Slack and WhatsApp on list, close lid, `ps -o stat` shows `T`
    for their whole trees. Open lid → running, reconnected, no relaunch.
 6. **Docker rule.** No containers → paused on close. One container → untouched.

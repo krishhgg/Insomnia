@@ -60,7 +60,7 @@ four power-setting commands. Review that permission before installing.
 | Location | Purpose |
 | --- | --- |
 | `~/Applications/Insomnia.app` | The menu bar app |
-| `~/Library/Application Support/Insomnia/` | Configuration, session/recovery journals, and `backstop.sh` |
+| `~/Library/Application Support/Insomnia/` | Configuration, session/recovery journals, lock files, and `backstop.sh` |
 | `~/Library/LaunchAgents/com.insomnia.backstop.plist` | Per-user recovery agent |
 | `~/Library/Logs/Insomnia/` | `insomnia.log` and `handoffs.log` |
 | `/etc/sudoers.d/insomnia` | Permission for the four commands below |
@@ -147,7 +147,11 @@ The defaults are worth knowing:
   when the lid opens, unless a battery or thermal rule still wants it.
 - **Battery rules:** below 40% on battery, request Low Power Mode; below 10%,
   end the session. Serious thermal state requests Low Power Mode; critical
-  thermal state ends the session. These rules require the app to be running.
+  thermal state ends the session. The Low Power Mode requests need the app to
+  be running. The two ends do not: the `launchd` backstop reads the battery
+  and the thermal pressure level once a minute and ends the session itself
+  when the app is gone, the charge is below the end floor on battery power, or
+  the thermal level is critical (see "How recovery works").
 
 To exercise the lid actions without closing the lid, run
 `scripts/simulate-lid.sh closed` and then `scripts/simulate-lid.sh open` during
@@ -161,18 +165,27 @@ a session; the app runs the same actions it would on a real lid event.
 
 Insomnia records pending changes in a recovery journal. On session end, the app
 attempts to undo them. An independent `launchd` agent checks every minute and
-can attempt recovery after the app exits unexpectedly, once the saved deadline
-has passed. It leaves a valid, unexpired session alone.
+restores the journal once the saved deadline has passed. It also ends a valid
+session early, restoring the journal the same way, in three cases. No Insomnia
+process holds the liveness lock: `.app.alive` is an `flock(2)` the app takes at
+launch, and the kernel releases it when the process dies, however it dies. The
+Mac is on battery power with the charge below the end floor from `config.json`
+(default 10%); a battery that is present but cannot be read counts as below
+it. Or the thermal pressure level reported by `notifyutil` is critical. Each
+early end is logged with its reason. Otherwise the session stands until its
+deadline, and sessions are capped at 24 hours by default (`maxDuration`).
 
 The app and backstop use the same lock so they do not restore and rewrite the
 journal over one another. Failed restoration keeps the relevant entries;
 unreadable journals are preserved instead of treated as clean.
 
-**Recovery is not “everything always gets undone.”** The backstop does not
-monitor battery or temperature. Saved audio needs the app to reopen, and
-unconfirmed process freezes may need manual inspection. If a warning remains,
-resolve it before leaving the Mac unattended. Real-machine crash, reboot, and
-installation scenarios still need [release validation](docs/release-validation.md).
+**Recovery is not “everything always gets undone.”** The backstop checks the
+battery and the thermal level once a minute and only for the two ends above.
+Low Power Mode requests and notifications need the app. Saved audio needs the
+app to reopen, and unconfirmed process freezes may need manual inspection. If a
+warning remains, resolve it before leaving the Mac unattended. Real-machine
+crash, reboot, and installation scenarios still need
+[release validation](docs/release-validation.md).
 
 <details>
 <summary><strong>Recovery limits and manual attention</strong></summary>

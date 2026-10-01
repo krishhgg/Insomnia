@@ -72,6 +72,43 @@ final class UIStartupTests: XCTestCase {
         return condition()
     }
 
+    // MARK: Over the maximum
+
+    /// Two days typed against the default 24-hour maximum: the pills stay
+    /// up with the value in them, the label beside them says what fits, the
+    /// focused pill shakes, and nothing is asked of the manager. Enter on
+    /// an allowed value then starts as usual.
+    @MainActor
+    func testATimePastTheMaximumIsRefusedBesideThePillsWithoutStartingAnything() async {
+        let rig = Rig()
+        defer { rig.h.home.destroy() }
+        XCTAssertEqual(rig.manager.config.maxDuration, 24 * 3600)
+        rig.controller.expand(mode: .start)
+        rig.controller.focus(.days)
+        XCTAssertTrue(rig.model.input.append(digit: 2, to: .days))
+
+        rig.controller.commit()
+        try? await Task.sleep(for: .milliseconds(50))
+
+        XCTAssertEqual(rig.model.phase, .entering(.start))
+        XCTAssertTrue(rig.model.slotsPresent)
+        XCTAssertEqual(rig.model.startError, "Up to 1d")
+        XCTAssertTrue(rig.model.startErrorShown)
+        XCTAssertEqual(rig.model.input.text(for: .days), "2")
+        XCTAssertEqual(rig.model.rejectBounce, 1)
+        XCTAssertNil(rig.model.pendingCountdown)
+        XCTAssertFalse(rig.manager.isActive)
+        XCTAssertEqual(rig.h.guardFake.calls, [], "nothing was asked of pmset")
+        XCTAssertNil(rig.manager.lastError, "not a failure of the manager's")
+
+        // Exactly the maximum is allowed and starts.
+        rig.model.input = DurationInput(days: 1)
+        rig.controller.commit()
+        let started = await waitUntil { rig.manager.isActive }
+        XCTAssertTrue(started)
+        XCTAssertEqual(rig.manager.session?.endsAt, rig.h.clock.now.addingTimeInterval(24 * 3600))
+    }
+
     // MARK: Success
 
     @MainActor

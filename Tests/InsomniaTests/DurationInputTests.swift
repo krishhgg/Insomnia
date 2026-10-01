@@ -159,9 +159,14 @@ final class DurationInputTests: XCTestCase {
 
     func testFieldStrings() {
         XCTAssertEqual(DurationInput.Field.days.placeholder, "Days")
-        XCTAssertEqual(DurationInput.Field.days.help, "Up to 30 days")
-        XCTAssertEqual(DurationInput.Field.hours.help, "0\u{2013}23")
-        XCTAssertEqual(DurationInput.Field.minutes.help, "0\u{2013}59")
+        // Days names the configured maximum session, which is what a
+        // session is held to, not the pill's 30-day entry ceiling.
+        XCTAssertEqual(DurationInput.Field.days.help(maxDuration: 24 * 3600), "Up to 1d per session")
+        XCTAssertEqual(DurationInput.Field.days.help(maxDuration: 30 * 24 * 3600), "Up to 30d per session")
+        XCTAssertEqual(DurationInput.Field.days.help(maxDuration: 36 * 3600), "Up to 1d12h per session")
+        XCTAssertEqual(DurationInput.Field.days.help(maxDuration: Config().maxDuration), "Up to 1d per session")
+        XCTAssertEqual(DurationInput.Field.hours.help(maxDuration: 24 * 3600), "0\u{2013}23")
+        XCTAssertEqual(DurationInput.Field.minutes.help(maxDuration: 24 * 3600), "0\u{2013}59")
     }
 
     // MARK: DurationParser (settings presets)

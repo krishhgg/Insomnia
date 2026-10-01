@@ -89,6 +89,10 @@ final class SessionManager {
     private let notifier: any Notifying
     private let clamshell: @Sendable () -> Bool?
     private let clock: @Sendable () -> Date
+    /// The manager's idea of now (a fake in tests). UI decisions about the
+    /// session the manager holds, such as how much an extension may still add
+    /// under `config.maxDuration`, must use this clock, not the wall clock.
+    var now: Date { clock() }
     private let recoveryLock: RecoveryLock
     private let recoveryLockTimeout: TimeInterval
     private let recoveryRetryDelay: TimeInterval

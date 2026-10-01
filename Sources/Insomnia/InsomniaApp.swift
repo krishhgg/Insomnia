@@ -22,6 +22,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let status: any StatusSource
     let secrets: any HotspotSecretStore
     let locationPermission: LocationPermission
+    /// Held from launch to exit (see AppAliveLock): backstop.sh ends a valid
+    /// session once it can take this lock, because the app is then gone.
+    let aliveLock: AppAliveLock
     private var statusItem: StatusItemController?
     private var settingsWindow: SettingsWindow?
     private var terminating = false
@@ -29,6 +32,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     override init() {
         let manager = SessionManager.live()
         self.manager = manager
+        aliveLock = AppAliveLock(url: manager.paths.appAliveFile)
         secrets = KeychainHotspotSecretStore(keychain: KeychainStore()) {
             manager.config.hotspotSSID
         }
@@ -60,7 +64,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem = StatusItemController(manager: manager, status: status) { [weak settings] in
             settings?.show()
         }
-        Task { await manager.reconcile() }
+        Task {
+            await takeAliveLock()
+            await manager.reconcile()
+        }
+    }
+
+    /// backstop.sh counts a session as over once it can take the alive lock
+    /// without waiting. Taken before reconcile, so the first backstop run
+    /// after launch already sees this process, and never released: the
+    /// kernel drops it when the process exits, however that happens. The
+    /// short retry covers a backstop probe holding it for a moment; a hold
+    /// that outlasts it is another Insomnia, whose lock the backstop sees.
+    private func takeAliveLock() async {
+        do {
+            if try await aliveLock.acquire(timeout: 2) {
+                Log.info("alive lock held")
+            } else {
+                Log.error("alive lock \(aliveLock.path) is held by another process (another Insomnia?); the backstop does not count this instance as running")
+            }
+        } catch {
+            Log.error("could not take the alive lock: \(error.localizedDescription); the backstop will end any session within a minute")
+        }
     }
 
     /// Quitting always ends the session (spec 1). Terminate is deferred until

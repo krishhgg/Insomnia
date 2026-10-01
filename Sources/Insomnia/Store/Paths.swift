@@ -64,6 +64,10 @@ struct Paths: Sendable, Equatable {
     /// flock(2) file shared with backstop.sh (`lockf -k` on the same path).
     /// Created once, never unlinked, so both sides lock the same inode.
     var recoveryLock: URL { appSupport.appendingPathComponent(".recovery.lock") }
+    /// flock(2) file the app holds for its whole lifetime (`AppAliveLock`).
+    /// backstop.sh probes it without waiting: acquiring it means no Insomnia
+    /// process is alive, and a valid session is then ended. Never unlinked.
+    var appAliveFile: URL { appSupport.appendingPathComponent(".app.alive") }
     /// Written by scripts/simulate-lid.sh ("closed" or "open") to drive the
     /// lid-close action path without touching the hinge. See LidSimulation.
     var simulateLidFile: URL { appSupport.appendingPathComponent("simulate-lid") }

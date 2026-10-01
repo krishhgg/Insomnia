@@ -17,7 +17,25 @@
 # the lock file's inode.
 #
 # Decision, driven only by what the journal says was changed:
-#   - session.json valid (endsAt in the future) and no --force: exit 0.
+#   - session.json valid (endsAt in the future) and no --force: the session
+#     is live only while Insomnia is running and the machine is within the
+#     floors the app enforces itself (FloorRules.swift). Three checks, any
+#     of which ends the session exactly as --force would, with a log line
+#     naming the reason:
+#       app alive  -> the app holds an flock(2) on APP_SUPPORT/.app.alive for
+#                     its whole lifetime (AppAliveLock.swift). Taking that
+#                     lock here without waiting means no app holds it: it
+#                     crashed, was force-quit, or has not started yet.
+#       battery    -> pmset -g batt: an internal battery is present, the Mac
+#                     draws from 'Battery Power', and the percentage is below
+#                     endFloor in config.json (default 10, strict, so 0
+#                     disables it). A battery present but unreadable, or a
+#                     failing pmset, ends too (fail closed). No battery: no
+#                     battery rule.
+#       thermal    -> notifyutil -g com.apple.system.thermalpressurelevel at
+#                     3 (trapping) or above, with thermalRules on (default).
+#                     Unreadable: a warning, not an end on that alone.
+#     All three pass: exit 0, nothing logged.
 #   - state.json missing or clean: nothing is undone and nothing privileged
 #     runs; an expired session.json is removed. Exit 0.
 #   - state.json dirty: undo each journaled entry from the journal alone:
@@ -64,7 +82,13 @@ LOCKF=/usr/bin/lockf
 PS=/bin/ps
 KILL=/bin/kill
 SYSCTL=/usr/sbin/sysctl
+NOTIFYUTIL=/usr/bin/notifyutil
 LOCK_TIMEOUT_SECONDS=10
+# com.apple.system.thermalpressurelevel at or above this ends a session. On
+# macOS the levels are 0 nominal, 1 moderate, 2 heavy, 3 trapping, 4 sleeping
+# (libkern/OSThermalNotification.h); ProcessInfo reports .critical from
+# trapping up, which is where the app's FloorRules end the session.
+THERMAL_CRITICAL_LEVEL=3
 # Longest a single undo command (sudo pmset) may run before it is sent
 # SIGTERM, and how long it then gets to exit before this run fails closed.
 COMMAND_TIMEOUT_SECONDS=30
@@ -88,7 +112,9 @@ else
 fi
 SESSION="$APP_SUPPORT/session.json"
 STATE="$APP_SUPPORT/state.json"
+CONFIG="$APP_SUPPORT/config.json"
 LOCK="$APP_SUPPORT/.recovery.lock"
+ALIVE="$APP_SUPPORT/.app.alive"
 LOG="$LOG_DIR/insomnia.log"
 
 log() { # level message
@@ -281,8 +307,115 @@ if [[ -f "$SESSION" ]]; then
   fi
 fi
 
+# --- Is a valid session still live? ------------------------------------------
+# A future deadline alone does not keep sleep disabled: the app must be
+# running and the machine within the floors the app would enforce itself.
+# The app's own floors fire first while it is healthy; these catch a crashed,
+# force-quit or stopped app. Nothing here changes the machine: the checks
+# only decide whether the session counts as over, and the undo below is the
+# same as for an expired one.
+
+# The app holds an exclusive flock on $ALIVE for its whole lifetime
+# (AppAliveLock.swift). The probe takes the lock without waiting and gives it
+# back at once (the command runs under it and exits), so it can only succeed
+# when nobody else holds it: lockf exits 75 (EX_TEMPFAIL) when the lock is
+# held, the one outcome that proves an app is there. -k keeps the file, so
+# the app and every later probe lock the same inode. A probe that fails some
+# other way (the file cannot be created, lockf itself fails) counts as not
+# alive: sleep must not stay disabled on a guess.
+app_alive() {
+  local rc=0
+  "$LOCKF" -k -s -t 0 "$ALIVE" /usr/bin/true 2>/dev/null || rc=$?
+  (( rc == 75 )) && return 0
+  (( rc == 0 )) || log warn "alive lock probe on $ALIVE failed (lockf exit $rc); counting Insomnia as not running"
+  return 1
+}
+
+# A setting from config.json, or the default when the file or key is missing
+# or the value is not of the right shape (the app falls back to its default
+# then too).
+config_int() { # key default
+  local v
+  v="$(extract "$CONFIG" "$1" || true)"
+  if [[ "$v" =~ ^[0-9]+$ ]]; then echo "$((10#$v))"; else echo "$2"; fi
+}
+config_bool() { # key default
+  local v
+  v="$(extract "$CONFIG" "$1" || true)"
+  case "$v" in true|false) echo "$v" ;; *) echo "$2" ;; esac
+}
+
+# pmset -g batt prints the source ("Now drawing from 'Battery Power'" or 'AC
+# Power') and one line per battery ("-InternalBattery-0 (id=...) 26%;
+# discharging; 0:41 remaining present: true"). Sets battery_reason and
+# returns 0 when the session must end: an internal battery is present, the
+# Mac draws from it, and the percentage is below endFloor (strict, so 0
+# disables the rule, as in FloorRules.swift); or pmset fails; or a battery is
+# present but its source or percentage cannot be read (fail closed, the
+# app's rule for an unreadable battery). No InternalBattery line is a
+# desktop: no battery rule.
+battery_reason=""
+battery_cutoff() {
+  local out rc=0 floor percent source line
+  local source_re="Now drawing from '([^']*)'" percent_re='[[:space:]]([0-9]+)%;'
+  battery_reason=""
+  out="$("$PMSET" -g batt 2>/dev/null)" || rc=$?
+  if (( rc != 0 )); then
+    battery_reason="battery state unreadable (pmset -g batt exit $rc)"
+    return 0
+  fi
+  line="$(grep -m 1 InternalBattery <<< "$out" || true)"
+  [[ -n "$line" ]] || return 1
+  source=""; percent=""
+  [[ "$out" =~ $source_re ]] && source="${BASH_REMATCH[1]}"
+  [[ "$line" =~ $percent_re ]] && percent="${BASH_REMATCH[1]}"
+  if [[ -z "$percent" || ( "$source" != "Battery Power" && "$source" != "AC Power" ) ]]; then
+    battery_reason="battery present but unreadable (source '${source:-?}', charge '${percent:-?}')"
+    return 0
+  fi
+  [[ "$source" == "Battery Power" ]] || return 1
+  floor="$(config_int endFloor 10)"
+  if (( 10#$percent < floor )); then
+    battery_reason="battery at ${percent}% on battery power, below the ${floor}% end floor"
+    return 0
+  fi
+  return 1
+}
+
+# notifyutil -g prints "com.apple.system.thermalpressurelevel N" (levels at
+# THERMAL_CRITICAL_LEVEL). Sets thermal_reason and returns 0 when the
+# session must end. Off with thermalRules false in config.json. Unreadable:
+# a warning, never an end on that alone; the alive and battery checks stand.
+thermal_reason=""
+thermal_cutoff() {
+  local out level
+  thermal_reason=""
+  [[ "$(config_bool thermalRules true)" == true ]] || return 1
+  out="$("$NOTIFYUTIL" -g com.apple.system.thermalpressurelevel 2>/dev/null)" || out=""
+  level="${out##* }"
+  if [[ -z "$out" || ! "$level" =~ ^[0-9]+$ ]]; then
+    log warn "thermal pressure level unreadable (notifyutil printed '${out:-nothing}'); not ending the session on that alone"
+    return 1
+  fi
+  if (( 10#$level >= THERMAL_CRITICAL_LEVEL )); then
+    thermal_reason="thermal pressure level $level (critical from $THERMAL_CRITICAL_LEVEL up)"
+    return 0
+  fi
+  return 1
+}
+
+cutoff=""
 if [[ "$session_state" == valid ]] && (( force == 0 )); then
-  exit 0
+  if ! app_alive; then
+    cutoff="Insomnia is not running"
+  elif battery_cutoff; then
+    cutoff="$battery_reason"
+  elif thermal_cutoff; then
+    cutoff="$thermal_reason"
+  else
+    exit 0
+  fi
+  log warn "ending the session before its deadline (endsAt=$ends_at): $cutoff"
 fi
 
 # --- Read the journal --------------------------------------------------------
@@ -330,7 +463,11 @@ fi
 
 case "$session_state" in
   none)      session_note="no session" ;;
-  valid)     session_note="forced end of session (endsAt=$ends_at)" ;;
+  valid)     if [[ -n "$cutoff" ]]; then
+               session_note="session ended early, $cutoff (endsAt=$ends_at)"
+             else
+               session_note="forced end of session (endsAt=$ends_at)"
+             fi ;;
   expired)   session_note="session expired (endsAt=$ends_at)" ;;
   malformed) session_note="session.json unreadable" ;;
 esac

@@ -4,11 +4,13 @@ import XCTest
 final class ConfigTests: XCTestCase {
     func testDefaults() {
         let c = Config()
-        XCTAssertEqual(c.presets, [1800, 3600, 7200, 14400, 28800, 43200, 86400, 259200])
+        XCTAssertEqual(c.presets, [1800, 3600, 7200, 14400, 28800, 43200, 86400])
         XCTAssertEqual(c.lowPowerFloor, 40)
         XCTAssertEqual(c.endFloor, 10)
         XCTAssertEqual(c.nudgeThreshold, 90)
-        XCTAssertEqual(c.maxDuration, 30 * 24 * 3600)
+        XCTAssertEqual(c.maxDuration, 24 * 3600)
+        XCTAssertTrue(c.presets.allSatisfy { $0 <= c.maxDuration }, "no shipped preset may exceed the maximum")
+        XCTAssertLessThanOrEqual(c.defaultPreset, c.maxDuration)
         XCTAssertEqual(c.freezeList, ["com.tinyspeck.slackmacgap", "net.whatsapp.WhatsApp", "com.hnc.Discord"])
         XCTAssertTrue(c.agentList.contains("com.apple.Terminal"))
         XCTAssertTrue(c.agentList.contains("com.t3tools.t3code"))
@@ -42,6 +44,16 @@ final class ConfigTests: XCTestCase {
         let old = try Store.makeDecoder().decode(Config.self, from: Data(#"{"muteOnLidClose": true}"#.utf8))
         XCTAssertTrue(old.lowPowerOnLidClose)
         XCTAssertTrue(old.muteOnLidClose)
+    }
+
+    /// The 24-hour ceiling is the decoder's default too, so an older
+    /// config.json without the key gets it; a written value is kept, so a
+    /// user who raised it in config.json keeps the longer sessions.
+    func testMaxDurationDefaultsTo24HoursAndAnExplicitValueIsKept() throws {
+        let old = try Store.makeDecoder().decode(Config.self, from: Data(#"{"lowPowerFloor": 25}"#.utf8))
+        XCTAssertEqual(old.maxDuration, 24 * 3600)
+        let raised = try Store.makeDecoder().decode(Config.self, from: Data(#"{"maxDuration": 2592000}"#.utf8))
+        XCTAssertEqual(raised.maxDuration, 30 * 24 * 3600)
     }
 
     func testEmptyObjectIsDefaults() throws {

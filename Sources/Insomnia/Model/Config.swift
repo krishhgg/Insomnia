@@ -8,8 +8,12 @@ struct Config: Codable, Equatable, Sendable {
     /// Preset durations in seconds, shown as chips.
     var presets: [TimeInterval] = Config.defaultPresets
     var defaultPreset: TimeInterval = 4 * 3600
-    /// Hard ceiling on a session, including extensions. 30 days.
-    var maxDuration: TimeInterval = 30 * 24 * 3600
+    /// Hard ceiling on a session, including extensions. 24 hours by default:
+    /// the backstop ends a session within a minute of the app going away, but
+    /// the deadline is still the last line, and one typo should not hold a
+    /// closed laptop awake for days. Raise it in config.json for longer
+    /// sessions; the Days pill accepts up to 30 days.
+    var maxDuration: TimeInterval = 24 * 3600
 
     // Lid-close actions
     /// Bundle ids to SIGSTOP while the lid is closed.
@@ -56,7 +60,6 @@ struct Config: Codable, Equatable, Sendable {
         8 * 3600,
         12 * 3600,
         24 * 3600,
-        3 * 24 * 3600,
     ]
 
     /// Default freeze list: chat apps that burn battery in the background.
