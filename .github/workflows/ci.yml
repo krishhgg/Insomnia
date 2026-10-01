@@ -9,11 +9,13 @@ on:
 permissions:
   contents: read
 
-# One run per ref. A newer push to a pull request cancels the stale run. A
-# push to main is never cancelled, so every merge commit keeps its result
-# even when the next merge lands a minute later.
+# Pull requests share one group per ref, so a newer push cancels the stale
+# run. Pushes to main get a group per commit: a concurrency group holds at
+# most one pending run, so a shared group would let a third merge replace
+# the pending second one even with cancel-in-progress off. Every merge
+# commit gets its own completed result.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
