@@ -46,6 +46,7 @@ QUIT_WAIT_SECONDS=15
 # Fixed tool paths: never taken from PATH. Tests patch these lines in a
 # private copy of the script so no real tool ever runs.
 PGREP=/usr/bin/pgrep
+KILL=/bin/kill
 OSASCRIPT=/usr/bin/osascript
 LAUNCHCTL=/bin/launchctl
 SUDO=/usr/bin/sudo
@@ -350,7 +351,7 @@ for dir in "$APP_DIR"/.Insomnia.app.staging.*; do
   [[ -d "$dir" && "$dir" != "$STAGE" ]] || continue
   owner="${dir##*/.Insomnia.app.staging.}"
   owner="${owner%%.*}"
-  if [[ "$owner" =~ ^[0-9]+$ ]] && kill -0 "$owner" 2>/dev/null; then
+  if [[ "$owner" =~ ^[0-9]+$ ]] && "$KILL" -0 "$owner" 2>/dev/null; then
     continue
   fi
   rm -rf "$dir"
@@ -474,14 +475,17 @@ bootstrap_rc=0
 "$LAUNCHCTL" bootstrap "gui/$UID_NUM" "$CANDIDATE" || bootstrap_rc=$?
 after="$(loaded_state)"
 published=0
+unloaded=no
 if (( bootstrap_rc == 0 )) && [[ "$after" == yes ]]; then
   if mv -f "$CANDIDATE" "$PLIST"; then
     published=1
   else
     # The new job is loaded, but the next login loads $PLIST, which still
-    # pins the previous build. Unload the new job; the swap is undone below
-    # like any other failed load, so bundle and plist match again.
+    # pins the previous build. Unload the new job; once print confirms it
+    # is gone, the swap is undone below like any other failed load, so
+    # bundle and plist match again.
     "$LAUNCHCTL" bootout "gui/$UID_NUM/$LABEL" >/dev/null 2>&1 || true
+    unloaded="$(loaded_state)"
   fi
 fi
 
@@ -507,6 +511,36 @@ else
     reason="the new LaunchAgent loaded, but its plist could not be moved to $PLIST,
 where the next login loads it from, so the new job was unloaded again"
     fix_note="Check that $LAUNCH_AGENTS is writable and rerun."
+  fi
+  if [[ "$unloaded" != no ]]; then
+    # The new job may still be loaded, and it pins the new build: putting
+    # the previous app back would leave it refusing every run. The swap
+    # stays and the previous bundle stays set aside, which is the state an
+    # install killed mid-swap leaves; the rerun's repair above handles it.
+    if (( had_app )); then
+      kept_note="The previous app is kept at $PREVIOUS_APP; the rerun puts it back
+first if $PLIST still pins it."
+    else
+      kept_note="No app was installed at $APP before this run."
+    fi
+    if [[ -f "$PLIST" ]]; then
+      plist_note="$PLIST was not modified and does not pin this build, so the agent the
+next login loads would refuse to run."
+    else
+      plist_note="No plist exists at $PLIST, so no agent loads at the next login."
+    fi
+    cat >&2 <<FAIL
+
+Install stopped: the new LaunchAgent loaded, but its plist could not be moved to
+$PLIST, where the next login loads it from, and unloading the new job
+again was not confirmed (launchctl print: $unloaded).
+The new build stays at $APP, because the job that may still be loaded pins
+it and would refuse the previous app. $kept_note
+$plist_note
+$SUDOERS is installed and the recovery journal was clean when checked above.
+Check that $LAUNCH_AGENTS is writable and rerun this script before you log out.
+FAIL
+    exit 1
   fi
   # Undo the swap first, so whatever job runs next (the previous plist
   # reloaded below, or loaded at the next login) finds the build it pins.
