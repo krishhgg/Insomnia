@@ -122,9 +122,11 @@ is performed. Do not replace "not run" with "passed" based on source review.
 | Existing Low Power Mode preference and saved audio restoration | Not run |
 | Docker Desktop idle/busy behavior with another Docker context selected | Not run |
 | Hotspot permission, association, cancellation, and reconnect | Not run |
+| Settings location note matches what System Settings shows after the grant | Not run |
 | tmux cancellation with a dedicated disposable pane | Not run |
 | Headed-browser throttling with the lid closed | Not run |
 | Battery/thermal event behavior on supported hardware | Not run |
+| Unreadable battery (IOKit miss) ends the session on a laptop after the second read; desktop unaffected | Not run |
 | Install/upgrade/uninstall with recoverable failure conditions | Not run |
 | Install and uninstall while the Insomnia API client (same executable name, other bundle id) is running | Not run |
 
