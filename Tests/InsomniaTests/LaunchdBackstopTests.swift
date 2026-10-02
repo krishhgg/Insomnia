@@ -4,7 +4,7 @@ import XCTest
 /// The agent is persistent: loaded once with RunAtLoad + StartInterval,
 /// never replaced per deadline. `arm()` only touches launchd when the agent
 /// is missing or its plist is stale.
-final class LaunchdBackstopTests: InsomniaTestCase {
+final class LaunchdBackstopTests: XCTestCase {
     var home: TempHome!
     /// (exe, args) of every command the backstop ran.
     let calls = Locked<[[String]]>([])

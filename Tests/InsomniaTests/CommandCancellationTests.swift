@@ -4,7 +4,7 @@ import XCTest
 
 /// Real child processes (tiny `/bin/sh` scripts in a private temp dir) driven
 /// through `CancellableCommand`. Nothing here touches user processes.
-final class CommandCancellationTests: InsomniaTestCase {
+final class CommandCancellationTests: XCTestCase {
     private var dir: URL!
 
     override func setUpWithError() throws {

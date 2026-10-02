@@ -1,7 +1,7 @@
 import XCTest
 @testable import Insomnia
 
-final class DurationInputTests: InsomniaTestCase {
+final class DurationInputTests: XCTestCase {
     // MARK: total / validation
 
     func testEmptyHasNoTotalAndIsInvalid() {

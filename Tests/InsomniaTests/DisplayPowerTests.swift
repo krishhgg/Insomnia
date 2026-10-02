@@ -3,7 +3,7 @@ import XCTest
 
 /// Pure logic of the display and keyboard backlight layer. The private
 /// frameworks themselves are never called from tests.
-final class DisplayPowerTests: InsomniaTestCase {
+final class DisplayPowerTests: XCTestCase {
     func testBrightnessIsClampedToUnitRange() {
         XCTAssertEqual(DisplayPower.clamped(-0.5), 0)
         XCTAssertEqual(DisplayPower.clamped(0), 0)

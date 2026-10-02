@@ -1,25 +1,54 @@
 import Foundation
-import ObjectiveC
 import XCTest
+import InsomniaTestHome
 @testable import Insomnia
 
 /// The suite must never write under the real ~/Library. `Log.append` and
 /// `SessionManager.live` resolve INSOMNIA_HOME at call time, so these
-/// tests check the variable itself, the file a default-argument log line
-/// lands in, and that every test class inherits the installer.
-final class TestIsolationTests: InsomniaTestCase {
+/// tests check that the InsomniaTestHome loader set the variable before
+/// XCTest ran, the file a default-argument log line lands in, and that a
+/// TempHome hands the variable back instead of unsetting it. This class
+/// extends XCTestCase directly on purpose: isolation must not depend on
+/// a base class or on which tests a `--filter` selects.
+final class TestIsolationTests: XCTestCase {
     private var realHome: URL { FileManager.default.homeDirectoryForCurrentUser }
 
     private func isUnderRealHome(_ url: URL) -> Bool {
         url.standardizedFileURL.path.hasPrefix(realHome.standardizedFileURL.path + "/")
     }
 
+    /// True only when every location the app writes to resolves outside
+    /// the real home. Callers that would write must stop when this is false.
+    private func isIsolated(_ paths: Paths) -> Bool {
+        paths != Paths.standard
+            && !isUnderRealHome(paths.logFile)
+            && !isUnderRealHome(paths.appSupport)
+            && !isUnderRealHome(paths.launchAgents)
+    }
+
+    func testLoaderSetTheHomeBeforeAnyTestRan() {
+        XCTAssertEqual(String(cString: insomnia_test_home_key()), Paths.environmentKey)
+        let root = ProcessTestHome.root
+        XCTAssertEqual(ProcessTestHome.current, root.path, "INSOMNIA_HOME is not the loader's directory")
+        XCTAssertTrue(root.lastPathComponent.hasPrefix("insomnia-tests-process-"), root.path)
+
+        var isDir: ObjCBool = false
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.path, isDirectory: &isDir))
+        XCTAssertTrue(isDir.boolValue)
+        XCTAssertFalse(isUnderRealHome(root), root.path)
+        XCTAssertTrue(
+            root.standardizedFileURL.path.hasPrefix(FileManager.default.temporaryDirectory.standardizedFileURL.path),
+            root.path
+        )
+    }
+
     func testDefaultLogLineResolvesOutsideRealHome() throws {
         let resolved = Paths.fromEnvironment()
-        XCTAssertNotEqual(resolved, Paths.standard, "INSOMNIA_HOME is unset; a log line would reach the real log")
-        XCTAssertFalse(isUnderRealHome(resolved.logFile), resolved.logFile.path)
-        XCTAssertFalse(isUnderRealHome(resolved.appSupport), resolved.appSupport.path)
-        XCTAssertFalse(isUnderRealHome(resolved.launchAgents), resolved.launchAgents.path)
+        // Stop here rather than write the probe into the real log, which is
+        // the outcome this test exists to prevent.
+        guard isIsolated(resolved) else {
+            return XCTFail("INSOMNIA_HOME does not isolate the run (log would go to \(resolved.logFile.path)); not writing a probe")
+        }
 
         // A line written the way production code writes one (default paths).
         let probe = "test isolation probe \(UUID().uuidString)"
@@ -45,55 +74,6 @@ final class TestIsolationTests: InsomniaTestCase {
 
         // Not unset: a task that outlives its test still logs to a temp dir.
         XCTAssertEqual(ProcessTestHome.current, ProcessTestHome.root.path)
-        XCTAssertFalse(isUnderRealHome(Paths.fromEnvironment().logFile))
-        XCTAssertNotEqual(Paths.fromEnvironment(), Paths.standard)
-    }
-
-    func testProcessWideHomeIsATempDirectory() {
-        let root = ProcessTestHome.root
-        var isDir: ObjCBool = false
-        XCTAssertTrue(FileManager.default.fileExists(atPath: root.path, isDirectory: &isDir))
-        XCTAssertTrue(isDir.boolValue)
-        XCTAssertFalse(isUnderRealHome(root), root.path)
-        XCTAssertTrue(
-            root.standardizedFileURL.path.hasPrefix(FileManager.default.temporaryDirectory.standardizedFileURL.path),
-            root.path
-        )
-    }
-
-    /// A test class declared `: XCTestCase` would run without the installer
-    /// if XCTest picked it first. Walk the classes in this test image and
-    /// refuse any XCTestCase subclass that does not go through
-    /// InsomniaTestCase. Only names come back from the runtime, and only
-    /// our own classes are looked up, so no private system class is touched.
-    func testEveryTestClassInheritsTheInstaller() throws {
-        let image = try XCTUnwrap(class_getImageName(InsomniaTestCase.self))
-        var count: UInt32 = 0
-        guard let names = objc_copyClassNamesForImage(image, &count) else { return XCTFail("no classes in image") }
-        defer { free(names) }
-
-        var checked = 0
-        var offenders: [String] = []
-        for i in 0..<Int(count) {
-            let name = String(cString: names[i])
-            guard let cls = NSClassFromString(name) else { continue }
-            guard inherits(cls, from: XCTestCase.self), cls != InsomniaTestCase.self else { continue }
-            checked += 1
-            if !inherits(cls, from: InsomniaTestCase.self) {
-                offenders.append(name)
-            }
-        }
-        XCTAssertGreaterThan(checked, 1, "expected to find the test classes in \(String(cString: image))")
-        XCTAssertEqual(offenders, [], "test classes must extend InsomniaTestCase, not XCTestCase")
-    }
-
-    /// Superclass walk through the runtime, not `isSubclass(of:)`.
-    private func inherits(_ cls: AnyClass, from ancestor: AnyClass) -> Bool {
-        var current: AnyClass? = class_getSuperclass(cls)
-        while let c = current {
-            if c == ancestor { return true }
-            current = class_getSuperclass(c)
-        }
-        return false
+        XCTAssertTrue(isIsolated(Paths.fromEnvironment()))
     }
 }

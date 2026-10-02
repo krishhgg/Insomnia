@@ -2,7 +2,7 @@ import XCTest
 @testable import Insomnia
 
 @MainActor
-final class LidActionsTests: InsomniaTestCase {
+final class LidActionsTests: XCTestCase {
     var h: Harness!
     var freezer: FakeFreezer!
 

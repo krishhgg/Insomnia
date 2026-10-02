@@ -2,7 +2,7 @@ import XCTest
 @testable import Insomnia
 
 @MainActor
-final class ReconcileTests: InsomniaTestCase {
+final class ReconcileTests: XCTestCase {
     var h: Harness!
 
     override func setUp() async throws {

@@ -1,7 +1,7 @@
 import XCTest
 @testable import Insomnia
 
-final class SessionMathTests: InsomniaTestCase {
+final class SessionMathTests: XCTestCase {
     let maxDuration: TimeInterval = 30 * 24 * 3600
     let t0 = Date(timeIntervalSince1970: 1_800_000_000)
 

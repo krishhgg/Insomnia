@@ -1,7 +1,7 @@
 import XCTest
 @testable import Insomnia
 
-final class PmsetParsingTests: InsomniaTestCase {
+final class PmsetParsingTests: XCTestCase {
     let withFlag = """
     System-wide power settings:
     Currently in use:

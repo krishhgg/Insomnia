@@ -8,7 +8,7 @@ import XCTest
 /// and it stays clear of the eye outline. The menu bar's eye: shaded shut
 /// with lashes below while idle, open with a pupil and lashes above while
 /// running, monochrome in both states.
-final class BrandingTests: InsomniaTestCase {
+final class BrandingTests: XCTestCase {
     private let grid = CGRect(x: 0, y: 0, width: EyeMoonGeometry.designSize, height: EyeMoonGeometry.designSize)
 
     func testCrescentSpineIsOnTheLeftAndItsOpeningAndTipsFaceRight() {

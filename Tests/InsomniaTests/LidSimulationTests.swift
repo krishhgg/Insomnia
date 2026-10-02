@@ -5,7 +5,7 @@ import XCTest
 /// `consume()` directly rather than the directory watcher, so nothing here
 /// waits on a dispatch source.
 @MainActor
-final class LidSimulationTests: InsomniaTestCase {
+final class LidSimulationTests: XCTestCase {
     var home: TempHome!
     var sim: LidSimulation!
     var events: Locked<[Bool]>!

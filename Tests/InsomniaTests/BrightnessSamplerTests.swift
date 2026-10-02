@@ -5,7 +5,7 @@ import XCTest
 /// machine recently and macOS is not holding the device down itself; the
 /// sampler keeps the last such reading per device for the lid close.
 @MainActor
-final class BrightnessSamplerTests: InsomniaTestCase {
+final class BrightnessSamplerTests: XCTestCase {
     var display: FakeDisplayDimmer!
     var keyboard: FakeKeyboardBacklight!
     var idle: Locked<Double>!

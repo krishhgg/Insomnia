@@ -82,7 +82,7 @@ private final class GatedJoiner: HotspotJoining, @unchecked Sendable {
 // MARK: - NetworkFailover: ending a session must end its nudges
 
 @MainActor
-final class NetworkFailoverCancellationTests: InsomniaTestCase {
+final class NetworkFailoverCancellationTests: XCTestCase {
     var home: TempHome!
     var notifier: RecordingNotifier!
     var clock: FakeClock!
@@ -254,7 +254,7 @@ final class NetworkFailoverCancellationTests: InsomniaTestCase {
 
 // MARK: - TmuxNudge loop
 
-final class TmuxNudgeTests: InsomniaTestCase {
+final class TmuxNudgeTests: XCTestCase {
     func testLoopStopsOncePermissionIsWithdrawn() async {
         let log = RunnerLog()
         let allowed = Locked(true)
@@ -306,7 +306,7 @@ final class TmuxNudgeTests: InsomniaTestCase {
 
 // MARK: - TmuxNudge live runner against a private tmux server
 
-final class TmuxLiveRunnerTests: InsomniaTestCase {
+final class TmuxLiveRunnerTests: XCTestCase {
     private var tmux: String!
     private var socket: String!
 
@@ -437,7 +437,7 @@ final class TmuxLiveRunnerTests: InsomniaTestCase {
 
 // MARK: - TmuxNudge live runner: target aliases and the check-to-send window
 
-final class TmuxTargetResolutionTests: InsomniaTestCase {
+final class TmuxTargetResolutionTests: XCTestCase {
     private var tmux: String!
     private var socket: String!
 
@@ -535,7 +535,7 @@ final class TmuxTargetResolutionTests: InsomniaTestCase {
 
 // MARK: - DockerRule endpoint binding
 
-final class DockerRuleEndpointTests: InsomniaTestCase {
+final class DockerRuleEndpointTests: XCTestCase {
     private var dir: URL!
 
     override func setUpWithError() throws {

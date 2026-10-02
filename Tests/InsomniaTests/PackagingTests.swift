@@ -5,7 +5,7 @@ import XCTest
 
 /// The checked-in icon artifacts and the bundle wiring that points at them.
 /// These read the real files and decode them; nothing here greps sources.
-final class PackagingTests: InsomniaTestCase {
+final class PackagingTests: XCTestCase {
     private static var repoRoot: URL {
         // .../Tests/InsomniaTests/PackagingTests.swift -> repo root
         URL(fileURLWithPath: #filePath)

@@ -1,7 +1,7 @@
 import XCTest
 @testable import Insomnia
 
-final class HardwarePortsParserTests: InsomniaTestCase {
+final class HardwarePortsParserTests: XCTestCase {
     let sample = """
 
     Hardware Port: Ethernet Adapter (en4)

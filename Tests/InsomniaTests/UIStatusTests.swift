@@ -2,7 +2,7 @@ import AppKit
 import XCTest
 @testable import Insomnia
 
-final class UIStatusTests: InsomniaTestCase {
+final class UIStatusTests: XCTestCase {
     @MainActor
     func testStatusHostUsesIntrinsicSizingAndHasAnIdleFittingSize() {
         let harness = Harness()

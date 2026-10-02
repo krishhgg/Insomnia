@@ -1,7 +1,7 @@
 import XCTest
 @testable import Insomnia
 
-final class ConfigTests: InsomniaTestCase {
+final class ConfigTests: XCTestCase {
     func testDefaults() {
         let c = Config()
         XCTAssertEqual(c.presets, [1800, 3600, 7200, 14400, 28800, 43200, 86400, 259200])

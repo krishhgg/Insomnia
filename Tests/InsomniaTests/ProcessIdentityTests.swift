@@ -6,7 +6,7 @@ import XCTest
 /// whatever now owns that pid, and never on a process someone else stopped.
 /// Identity is the kernel start time (seconds and microseconds) plus the boot
 /// session, recorded in the journal at freeze time.
-final class ProcessIdentityTests: InsomniaTestCase {
+final class ProcessIdentityTests: XCTestCase {
     typealias Sent = Locked<[(pid: Int32, sig: Int32)]>
 
     private func control(_ kernel: [Int32: ProcessSignalState], sent: Sent, result: Int32 = 0) -> SignalProcessControl {

@@ -19,7 +19,7 @@ final class RecordingHotspotJoiner: HotspotJoining, @unchecked Sendable {
     }
 }
 
-final class FailoverMachineTests: InsomniaTestCase {
+final class FailoverMachineTests: XCTestCase {
     let t0 = Date(timeIntervalSince1970: 1_800_000_000)
 
     func testShortBlipDoesNotJoin() {
@@ -100,7 +100,7 @@ final class FailoverMachineTests: InsomniaTestCase {
 }
 
 @MainActor
-final class NetworkFailoverDriverTests: InsomniaTestCase {
+final class NetworkFailoverDriverTests: XCTestCase {
     var home: TempHome!
 
     override func setUp() async throws { home = TempHome() }

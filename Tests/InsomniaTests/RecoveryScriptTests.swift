@@ -11,7 +11,7 @@ import XCTest
 /// nothing privileged runs, no real process is signaled, and no real home,
 /// LaunchAgent, sudoers file, or installed app is read or written. plutil,
 /// lockf, and date are the real tools. The fakes record every call.
-final class RecoveryScriptTests: InsomniaTestCase {
+final class RecoveryScriptTests: XCTestCase {
     private var fx: ScriptFixture!
 
     override func setUpWithError() throws {
