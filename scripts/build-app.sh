@@ -38,6 +38,10 @@ while (( $# )); do
   esac
 done
 [[ -n "$OUTPUT" ]] || { usage; exit 2; }
+# Resolved now, before the build changes into the checkout: a relative
+# --output means relative to the caller's directory, not to the checkout.
+mkdir -p "$OUTPUT"
+OUTPUT="$(cd "$OUTPUT" && pwd)"
 
 step() { printf '\n==> %s\n' "$*"; }
 
@@ -49,7 +53,6 @@ BIN="$("$SWIFT" build -c release --show-bin-path)/Insomnia"
 [[ -x "$BIN" ]] || { echo "binary not found at $BIN" >&2; exit 1; }
 
 # 2. Bundle ------------------------------------------------------------------
-mkdir -p "$OUTPUT"
 APP="$OUTPUT/Insomnia.app"
 step "Assembling $APP"
 rm -rf "$APP"

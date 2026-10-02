@@ -147,11 +147,12 @@ final class PackagingTests: XCTestCase {
         return try run("/bin/sh", ["-c", LaunchdBackstop.agentProgram, "sh", requirement, bundle.path], environment: ["HOME": home.path, "PATH": "/usr/bin:/bin"])
     }
 
-    private func run(_ exe: String, _ args: [String], environment: [String: String]? = nil) throws -> (status: Int32, output: String) {
+    private func run(_ exe: String, _ args: [String], environment: [String: String]? = nil, currentDirectory: URL? = nil) throws -> (status: Int32, output: String) {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: exe)
         p.arguments = args
         if let environment { p.environment = environment }
+        if let currentDirectory { p.currentDirectoryURL = currentDirectory }
         let out = Pipe()
         p.standardOutput = out
         p.standardError = out
@@ -389,6 +390,26 @@ final class PackagingTests: XCTestCase {
 
         XCTAssertEqual(r.status, 0, r.output)
         XCTAssertFalse(FileManager.default.fileExists(atPath: stale.path), "the previous bundle is replaced, not merged")
+    }
+
+    /// `--output` is resolved before the build changes into the checkout, so
+    /// a relative path means relative to the caller: release.yml runs the
+    /// script from the repository root, but a caller elsewhere gets its own
+    /// `dist`, not one inside the checkout.
+    func testBuildAppResolvesARelativeOutputAgainstTheCallersDirectory() throws {
+        let (script, _) = try patchedBuildApp(recordingCodesign: true)
+        let caller = scratch.appendingPathComponent("elsewhere", isDirectory: true)
+        try FileManager.default.createDirectory(at: caller, withIntermediateDirectories: true)
+
+        let r = try run("/bin/bash", [script.path, "--output", "dist"], environment: ["PATH": "/usr/bin:/bin", "HOME": scratch.path], currentDirectory: caller)
+
+        XCTAssertEqual(r.status, 0, r.output)
+        let bundle = caller.appendingPathComponent("dist/Insomnia.app")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: bundle.appendingPathComponent("Contents/Info.plist").path), "written under the caller's directory: \(r.output)")
+        let checkout = script.deletingLastPathComponent().deletingLastPathComponent()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: checkout.appendingPathComponent("dist").path), "nothing written into the checkout")
+        let printed = try XCTUnwrap(r.output.components(separatedBy: "\n").filter { !$0.isEmpty }.last)
+        XCTAssertEqual(URL(fileURLWithPath: printed).resolvingSymlinksInPath(), bundle.resolvingSymlinksInPath(), "the printed path is absolute")
     }
 
     /// The signing command depends only on INSOMNIA_SIGN_IDENTITY: ad-hoc
