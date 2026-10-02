@@ -128,6 +128,13 @@ final class SessionManager {
     /// then, so the value journaled at a later lid close is the user's,
     /// not the mode's rescaled one. nil in tests that do not wire it.
     var willEnableLowPower: (@MainActor () -> Void)?
+    /// Called once an unfinished command has exited, no end is pending and
+    /// Low Power Mode has been checked against the journal
+    /// (`settleAfterCommand`): `AppServices` replays a lid event refused
+    /// while the command ran, for the lid's latest state (`replayLid`),
+    /// and runs the floor rules on the corrected journal. nil in tests that
+    /// do not wire it.
+    var resyncAfterCommand: (@MainActor (_ replayLid: Bool) -> Void)?
     /// How far the panel may have drifted from a value written under Low
     /// Power Mode (auto-brightness moves it slowly) and still count as
     /// untouched by the user when the mode ends. A larger difference is a
@@ -163,9 +170,17 @@ final class SessionManager {
     /// A `sudo pmset` that did not stop on SIGTERM and is still running.
     /// Set by the transaction that ran it, which hands its recovery lock to
     /// a task that releases it when the command exits (`holdLock`); cleared
-    /// then. While set, every transaction is refused and quit is deferred.
-    /// Mirrors run_bounded / stop_transaction in scripts/backstop.sh.
+    /// then. While set, every transaction is refused and quit is deferred;
+    /// what a refused one owes is recorded (`Deferred`) and settled once
+    /// the command exits. Mirrors run_bounded / stop_transaction in
+    /// scripts/backstop.sh.
     @ObservationIgnored private(set) var unfinishedCommand: UnfinishedCommand?
+    /// A lid close or open refused while `unfinishedCommand` ran. Replayed
+    /// for the lid's latest state once it has exited; cleared then, or by
+    /// a session end, which undoes every lid action in the journal.
+    @ObservationIgnored private(set) var lidEventDeferred = false
+    /// The settle pass waiting to run again after a busy lock.
+    @ObservationIgnored private var settleRetry: Task<Void, Never>?
     /// Whether this launch has posted the notification for a SleepDisabled
     /// bit Insomnia did not set (reconcile step 3), so a bit that stays set
     /// is announced once, not on every reconcile.
@@ -255,20 +270,45 @@ final class SessionManager {
 
     // MARK: Lifecycle queue
 
+    /// What a transaction refused while an unfinished command holds the
+    /// lock still owes. A Low Power change needs no record: the floors run
+    /// again after every exit and ask for it anew. A start or extend is
+    /// the user's request; it is refused with a visible error and not
+    /// replayed later.
+    private enum Deferred {
+        /// Kept as `pendingEnd`; retried first when the command exits.
+        case end(EndReason)
+        /// Replayed for the lid's latest state when the command exits.
+        case lidEvent
+    }
+
     /// Runs `op` after every earlier lifecycle operation, holding the
     /// recovery lock, with `state` freshly read from disk under that lock.
     /// `op` is not run at all when the lock cannot be taken within the
     /// bound or when state.json does not decode: nothing is read, decided
     /// or changed unlocked, and an unreadable journal is never overwritten.
     /// Never blocks the main actor; the wait is polled.
-    private func exclusive<T: Sendable>(_ what: String, _ op: @escaping @MainActor @Sendable () async -> T) async -> Result<T, TransactionRefusal> {
+    ///
+    /// Refused while an unfinished command runs, `deferred` is recorded in
+    /// the refusal itself, before the caller resumes: the command can exit
+    /// and its holder settle in between, and must find the work then.
+    private func exclusive<T: Sendable>(_ what: String, owes deferred: Deferred? = nil, _ op: @escaping @MainActor @Sendable () async -> T) async -> Result<T, TransactionRefusal> {
         let previous = lifecycleTail
         let task = Task<Result<T, TransactionRefusal>, Never> { @MainActor in
             await previous?.value
             if let stuck = self.unfinishedCommand, stuck.isRunning {
                 // The lock is held in this process for that command; waiting
-                // for it here would only time out. Refused like a busy lock,
-                // but retried by the holder when the command exits.
+                // for it here would only time out. Refused like a busy lock;
+                // the holder settles what is owed when the command exits.
+                switch deferred {
+                case let .end(reason)?:
+                    self.pendingEnd = reason
+                    self.quitRequested = false
+                case .lidEvent?:
+                    self.lidEventDeferred = true
+                case nil:
+                    break
+                }
                 self.fail("\(what) skipped, nothing changed: \(stuck.description) is still running and holds the recovery lock until it exits")
                 return .failure(.commandRunning(pid: stuck.pid))
             }
@@ -295,7 +335,7 @@ final class SessionManager {
                 // it now would let the backstop run a second pmset beside the
                 // live one. stop_transaction in backstop.sh keeps it the same
                 // way. Handed over even if it has exited since it was
-                // reported: the holder is what retries the pending end.
+                // reported: the holder is what settles afterwards.
                 lockHandedOver = true
                 self.holdLock(handle, until: stuck)
             }
@@ -325,10 +365,11 @@ final class SessionManager {
         "\(error.localizedDescription). Insomnia has changed nothing and will not start, extend or end sessions until the file is fixed or moved by hand; it is the only record of what a previous run changed."
     }
 
-    /// Keep `handle` until `command` exits, then release it and finish what
-    /// the stopped transaction left: a pending end is retried right away,
-    /// since no timer could know when the command would exit. The pid is
-    /// logged the way backstop.sh logs it, so the two logs read the same.
+    /// Keep `handle` until `command` exits, then release it and settle what
+    /// the stopped transaction, and every one refused meanwhile, left owed
+    /// (`settle(after:)`): no timer could know when the command would exit.
+    /// The pid is logged the way backstop.sh logs it, so the two logs read
+    /// the same.
     private func holdLock(_ handle: RecoveryLockHandle, until command: UnfinishedCommand) {
         Log.error("recovery lock kept for \(command.description) until it exits; Insomnia cannot start, end or recover until then; stop it by hand (sudo kill \(command.pid)) and the end is retried when it exits")
         Task { @MainActor [weak self] in
@@ -337,11 +378,96 @@ final class SessionManager {
             Log.info("\(command.description) exited with status \(command.terminationStatus.map(String.init) ?? "?"); recovery lock released")
             guard let self else { return }
             if self.unfinishedCommand === command { self.unfinishedCommand = nil }
-            if let pending = self.pendingEnd {
-                Log.info("retrying pending end (\(pending.rawValue)) now that the command has exited")
-                await self.end(reason: pending == .quit ? .user : pending)
-            }
+            await self.settle(after: command)
         }
+    }
+
+    /// Re-establish a consistent state once `command` has exited and its
+    /// lock is free, whatever the command did meanwhile. A pending end goes
+    /// first and alone: it restores everything. Otherwise the session goes
+    /// on and `settleAfterCommand` checks it.
+    private func settle(after command: UnfinishedCommand) async {
+        if let pending = pendingEnd {
+            Log.info("retrying pending end (\(pending.rawValue)) now that \(command.description) has exited")
+            await end(reason: pending == .quit ? .user : pending)
+            return
+        }
+        await settleAfterCommand()
+    }
+
+    /// The session after an unfinished command has exited, with no end
+    /// pending: Low Power Mode is checked against the journal under the
+    /// lock (`performLowPowerCheck`), then `resyncAfterCommand` replays a
+    /// lid event refused meanwhile and runs the floor rules on the
+    /// corrected journal, which also asks again for any Low Power change
+    /// refused meanwhile. A busy lock (another process's transaction)
+    /// leaves all of it owed and tries again after `recoveryRetryDelay`; a
+    /// newer unfinished command settles it when that one exits. Run by the
+    /// holder; internal for tests.
+    func settleAfterCommand() async {
+        guard session != nil else { return }
+        switch await exclusive("low power check", { await self.performLowPowerCheck() }) {
+        case .success:
+            break
+        case .failure(.lockBusy):
+            scheduleSettleRetry()
+            return
+        case .failure(.commandRunning):
+            // A newer command holds the lock; its holder settles when it
+            // exits, and the lid event stays recorded until then.
+            return
+        case .failure(.journalUnreadable):
+            // Every transaction waits for a person to fix the file, as for
+            // an end; the session end undoes the lid actions from it then.
+            return
+        }
+        guard session != nil else { return }
+        let replayLid = lidEventDeferred
+        lidEventDeferred = false
+        resyncAfterCommand?(replayLid)
+    }
+
+    private func scheduleSettleRetry() {
+        settleRetry?.cancel()
+        let delay = recoveryRetryDelay
+        settleRetry = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(delay))
+            guard let self, !Task.isCancelled else { return }
+            Log.info("retrying the low power check after the power command")
+            await self.settleAfterCommand()
+        }
+    }
+
+    /// The journal's Low Power Mode ownership corrected to the mode itself,
+    /// read under the lock. A `lowpowermode` command left running keeps the
+    /// ownership journaled whatever it then does, so the flag can claim a
+    /// mode that is off: a `lowpowermode 1` that failed in the end, or a
+    /// rollback `lowpowermode 0` that went through. The floors and
+    /// `performSetLowPower` trust the flag and would never switch the mode
+    /// on again. Off: nobody holds it, so the flag is cleared and a display
+    /// write owed for the end of the mode is done, as after any switch-off.
+    /// On: it stays journaled as ours, for the floors or the end to switch
+    /// off. Unreadable: the flag stays; the `lowpowermode 0` it leads to at
+    /// the end is harmless.
+    private func performLowPowerCheck() async {
+        guard session != nil, state.lowPowerSetByUs else { return }
+        do {
+            if try await sleepGuard.isLowPowerModeOn() {
+                Log.info("low power mode reads on after the power command; still journaled as ours")
+                return
+            }
+        } catch {
+            Log.error("could not read low power mode after the power command; ownership kept in the journal: \(error.localizedDescription)")
+            return
+        }
+        do {
+            try journal { $0.lowPowerSetByUs = false }
+        } catch {
+            Log.error("low power mode reads off after the power command, but the journal could not be updated: \(error.localizedDescription)")
+            return
+        }
+        Log.info("low power mode reads off after the power command; ownership cleared from the journal")
+        settleDisplayAfterLowPower()
     }
 
     /// A `sudo pmset` did not stop on SIGTERM (`CommandStillRunningError`).
@@ -351,7 +477,9 @@ final class SessionManager {
     /// retries it), and `exclusive` hands the lock to the command. The user
     /// is told once, with the pid. `thenEnd` is the end that owes the
     /// cleanup once the command has exited; it is retried then, and starts
-    /// are refused and quit deferred meanwhile.
+    /// are refused and quit deferred meanwhile. Without one the session
+    /// goes on, and is checked against the mode once the command has
+    /// exited (`settleAfterCommand`).
     private func stopTransaction(for error: CommandStillRunningError, thenEnd reason: EndReason?) {
         unfinishedCommand = error.command
         fail("\(error.localizedDescription); Insomnia holds the recovery lock and will not quit until it exits (sudo kill \(error.command.pid) to stop it by hand)")
@@ -367,10 +495,11 @@ final class SessionManager {
 
     /// Lid actions run their journal writes and signals as one transaction
     /// on the same queue. False when the lock could not be taken or the
-    /// journal could not be read.
+    /// journal could not be read. Refused while an unfinished command runs,
+    /// the lid event is replayed once it has exited.
     @discardableResult
     func runExclusive(_ what: String, _ op: @escaping @MainActor @Sendable () async -> Void) async -> Bool {
-        if case .success = await exclusive(what, op) { return true }
+        if case .success = await exclusive(what, owes: .lidEvent, op) { return true }
         return false
     }
 
@@ -519,7 +648,7 @@ final class SessionManager {
         retryTimer?.invalidate()
         retryTimer = nil
         let outcome: EndOutcome
-        switch await exclusive("end", { await self.performEnd(reason: reason) }) {
+        switch await exclusive("end", owes: .end(reason), { await self.performEnd(reason: reason) }) {
         case let .success(o): outcome = o
         case .failure(.lockBusy): outcome = .locked
         case .failure(.journalUnreadable): outcome = .journalUnreadable
@@ -544,10 +673,12 @@ final class SessionManager {
             quitRequested = false
         case .privilegedCommandRunning:
             // No timer either: the task holding the lock for the command
-            // retries the end the moment it exits. Starts are refused and
-            // quit is deferred until then.
-            pendingEnd = reason
-            quitRequested = false
+            // retries the end the moment it exits. Nothing is recorded
+            // here: the refusal or the stopped end recorded `pendingEnd`
+            // before that task could run, and it may already have run and
+            // finished the end, which writing it again would undo. Starts
+            // are refused and quit is deferred until then.
+            break
         }
         return outcome
     }
@@ -557,6 +688,9 @@ final class SessionManager {
         Log.info("session end (\(reason.rawValue))")
         stopTimers()
         session = nil
+        // Every lid action is undone from the journal below, or by the
+        // retry of this end: a lid event refused earlier owes nothing.
+        lidEventDeferred = false
         scheduledDeadline = nil
         remainingText = ""
         countdownText = ""
@@ -694,8 +828,9 @@ final class SessionManager {
             do {
                 try await sleepGuard.setLowPowerMode(true)
             } catch let still as CommandStillRunningError {
-                // No rollback beside a live pmset. Ownership stays journaled;
-                // the session end clears it once the command has exited.
+                // No rollback beside a live pmset. Ownership stays journaled
+                // until the command has exited; the mode is read then and
+                // the journal corrected to it (`performLowPowerCheck`).
                 stopTransaction(for: still, thenEnd: nil)
                 return false
             } catch {
@@ -704,9 +839,9 @@ final class SessionManager {
                     try await sleepGuard.setLowPowerMode(false)
                     try? journal { $0.lowPowerSetByUs = false }
                 } catch let still as CommandStillRunningError {
-                    // The rollback itself is left running. Ownership stays
-                    // journaled for the session end; the lock stays with
-                    // the command.
+                    // The rollback itself is left running, and the lock
+                    // stays with it. Ownership stays journaled until it has
+                    // exited; the mode is read then (`performLowPowerCheck`).
                     stopTransaction(for: still, thenEnd: nil)
                 } catch {
                     fail("low power mode may be on and could not be switched off: \(error.localizedDescription); kept in the journal to retry")
@@ -732,8 +867,8 @@ final class SessionManager {
                 settleDisplayAfterLowPower()
                 return true
             } catch let still as CommandStillRunningError {
-                // Ownership stays journaled; the next evaluation or the
-                // session end retries once the command has exited.
+                // Ownership stays journaled until the command has exited;
+                // the mode is read then and the floors run again.
                 stopTransaction(for: still, thenEnd: nil)
                 return false
             } catch {
@@ -745,8 +880,10 @@ final class SessionManager {
 
     /// Undo every lid-close action recorded on disk: resume frozen pids,
     /// clear the Docker marker, restore volume and mute. Used by lid open.
+    /// Refused while an unfinished command runs, the lid event is replayed
+    /// once it has exited.
     func undoLidActions() async {
-        _ = await exclusive("lid open") { self.undoLidActionsInJournal() }
+        _ = await exclusive("lid open", owes: .lidEvent) { self.undoLidActionsInJournal() }
     }
 
     // MARK: Restore

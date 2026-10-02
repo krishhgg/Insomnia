@@ -196,7 +196,10 @@ installation scenarios still need [release validation](docs/release-validation.m
   does: nothing else is undone, the journal keeps its entries, and the
   recovery lock stays held until the command exits. A notification and the
   menu warning give the pid and `sudo kill <pid>`. Until it exits, Insomnia
-  refuses to quit or start a session; when it does, the end runs again.
+  refuses to quit or start a session, and records any end or lid event it
+  refuses. When the command exits, a pending end runs again. Otherwise
+  Insomnia reads Low Power Mode, corrects the journal to it, replays a
+  refused lid event and runs the floor rules again.
 - **Audio:** the backstop preserves volume/mute entries but cannot restore
   CoreAudio. Reopen the app for recovery.
 - **Sleep disabled by something else:** at launch, with no session and no

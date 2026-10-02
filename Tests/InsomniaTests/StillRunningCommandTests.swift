@@ -1,3 +1,4 @@
+import Observation
 import XCTest
 @testable import Insomnia
 
@@ -117,11 +118,14 @@ final class StillRunningCommandTests: XCTestCase {
 
     /// A live `lowpowermode 1` is not rolled back with a `lowpowermode 0`
     /// beside it. Ownership stays journaled, the session stays active, and
-    /// the lock is held for the command alone: once it exits nothing is
-    /// pending, and the session end clears the mode as usual.
+    /// the lock is held for the command alone. Once it exits nothing is
+    /// pending; the mode reads off (the command failed in the end), so the
+    /// ownership is cleared and the end has no mode to switch off.
     func testLowPowerOnStopsAtTheLiveCommandWithoutARollback() async throws {
         h.guardFake.stillRunning = ["lowpowermode 1"]
         let m = h.makeManager()
+        let resyncs = Locked<[Bool]>([])
+        m.resyncAfterCommand = { resyncs.value.append($0) }
         await m.start(duration: 3600)
 
         let changed = await m.setLowPower(true)
@@ -138,15 +142,43 @@ final class StillRunningCommandTests: XCTestCase {
         XCTAssertFalse(ran, "a transaction ran while the lock was held for the command")
 
         h.guardFake.stillRunning = []
-        h.guardFake.exitStuckCommands()
-        await waitUntil("lock never released") { (try? self.lockIsHeld()) == false }
+        h.guardFake.exitStuckCommands(status: 1)
+        await waitUntil("session never settled after the exit") { resyncs.value.count == 1 }
         XCTAssertNil(m.unfinishedCommand)
         XCTAssertNotNil(m.session, "session ended though nothing was pending")
         XCTAssertNil(m.pendingEnd)
+        XCTAssertEqual(h.guardFake.calls.suffix(2), ["lowpowermode 1", "pmset -g custom"])
+        XCTAssertEqual(try h.store.loadState()?.lowPowerSetByUs, false, "ownership of a mode that is off kept after the command exited")
+        XCTAssertFalse(try lockIsHeld())
+
+        let ended = await m.end(reason: .user)
+        XCTAssertEqual(ended, .restored)
+        XCTAssertEqual(h.guardFake.calls.suffix(2), ["pmset -g custom", "disablesleep 0"])
+        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
+    }
+
+    /// The same live `lowpowermode 1`, which this time switched the mode on
+    /// before it exited: the ownership stays, and the end switches it off.
+    func testLowPowerOnThatTookEffectBeforeExitingStaysOurs() async throws {
+        h.guardFake.stillRunning = ["lowpowermode 1"]
+        let m = h.makeManager()
+        let resyncs = Locked<[Bool]>([])
+        m.resyncAfterCommand = { resyncs.value.append($0) }
+        await m.start(duration: 3600)
+        _ = await m.setLowPower(true)
+
+        h.guardFake.stillRunning = []
+        h.guardFake.lowPowerOn = true
+        h.guardFake.exitStuckCommands()
+        await waitUntil("session never settled after the exit") { resyncs.value.count == 1 }
+        XCTAssertEqual(resyncs.value, [false], "no lid event was refused, so only the floors run")
+        XCTAssertEqual(h.guardFake.calls.suffix(2), ["lowpowermode 1", "pmset -g custom"])
+        XCTAssertEqual(try h.store.loadState()?.lowPowerSetByUs, true, "ownership of a mode Insomnia switched on dropped")
 
         let ended = await m.end(reason: .user)
         XCTAssertEqual(ended, .restored)
         XCTAssertEqual(h.guardFake.calls.suffix(2), ["disablesleep 0", "lowpowermode 0"])
+        XCTAssertFalse(h.guardFake.lowPowerOn)
         XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
     }
 
@@ -183,11 +215,23 @@ final class StillRunningCommandTests: XCTestCase {
 
     /// `lowpowermode 1` fails outright and the rollback `lowpowermode 0` is
     /// the command left running: it is tracked like any other, so the lock
-    /// stays with it and ownership stays journaled for the session end.
-    func testLowPowerRollbackLeftRunningKeepsTheLock() async throws {
+    /// stays with it and ownership stays journaled while it runs. The
+    /// rollback goes through in the end: the mode reads off after the exit,
+    /// the ownership is cleared, and the floors run on the corrected
+    /// journal and switch the mode on again, which a stale flag would have
+    /// stopped them doing.
+    func testLowPowerRollbackLeftRunningKeepsTheLockAndIsCheckedWhenItExits() async throws {
         h.guardFake.throwOn = ["lowpowermode 1"]
         h.guardFake.stillRunning = ["lowpowermode 0"]
         let m = h.makeManager()
+        let driver = FloorRuleDriver(manager: m, notifier: h.notifier)
+        let floorRuns = Locked(0)
+        m.resyncAfterCommand = { _ in
+            Task { @MainActor in
+                await driver.run(battery: .percent(30), isCharging: false, thermal: .nominal, lidClosed: false)
+                floorRuns.value += 1
+            }
+        }
         await m.start(duration: 3600)
 
         let changed = await m.setLowPower(true)
@@ -203,9 +247,20 @@ final class StillRunningCommandTests: XCTestCase {
         XCTAssertFalse(ran)
 
         h.guardFake.stillRunning = []
+        h.guardFake.throwOn = []
         h.guardFake.exitStuckCommands()
-        await waitUntil("lock never released") { (try? self.lockIsHeld()) == false }
+        await waitUntil("floors never ran after the exit") { floorRuns.value == 1 }
         XCTAssertNotNil(m.session)
+        XCTAssertEqual(
+            h.guardFake.calls,
+            ["disablesleep 1", "pmset -g custom", "lowpowermode 1", "lowpowermode 0", "pmset -g custom", "pmset -g custom", "lowpowermode 1"],
+            "the check, then the floors' enable on a journal that no longer claims the mode"
+        )
+        XCTAssertTrue(h.guardFake.lowPowerOn)
+        XCTAssertEqual(try h.store.loadState()?.lowPowerSetByUs, true)
+        XCTAssertEqual(h.notifier.posts.last?.title, "Low Power Mode on")
+        XCTAssertFalse(try lockIsHeld())
+
         let ended = await m.end(reason: .user)
         XCTAssertEqual(ended, .restored)
         XCTAssertEqual(h.guardFake.calls.suffix(2), ["disablesleep 0", "lowpowermode 0"])
@@ -268,5 +323,159 @@ final class StillRunningCommandTests: XCTestCase {
         XCTAssertNil(try h.store.loadSession())
         XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
         XCTAssertFalse(try lockIsHeld())
+    }
+
+    // MARK: Work refused while the command runs
+
+    /// Lid actions over the harness fakes, as AppServices builds them.
+    /// Nothing to freeze; muting is on, so a close journals the volume.
+    private func makeLidActions(_ m: SessionManager) -> LidActions {
+        m.config.muteOnLidClose = true
+        let freezer = FakeFreezer(apps: [], processes: [], control: h.procs)
+        return LidActions(manager: m, freezer: freezer, docker: DockerRule(freezer: freezer, probe: { false }), audio: h.audio, display: h.display, keyboard: h.keyboard)
+    }
+
+    /// An end refused while the command runs is recorded by the refusal
+    /// itself, before `end()` resumes. Here the command exits inside the
+    /// refusal, so its holder can run before the caller does: the holder
+    /// must find the end, and the caller resuming after it has finished
+    /// must not mark the end pending again with nothing left to retry it.
+    func testEndRefusedWhileTheCommandRunsIsRecordedBeforeTheCallerResumes() async throws {
+        let m = h.makeManager()
+        await m.start(duration: 3600)
+        h.guardFake.stillRunning = ["lowpowermode 1"]
+        _ = await m.setLowPower(true)
+        XCTAssertNil(m.pendingEnd)
+        h.guardFake.stillRunning = []
+        let pendingAtRefusal = Locked<EndReason?>(nil)
+        withObservationTracking {
+            _ = m.lastError
+        } onChange: { [guardFake = h.guardFake] in
+            // The refusal reports through `lastError`: this runs inside it.
+            MainActor.assumeIsolated { pendingAtRefusal.value = m.pendingEnd }
+            guardFake.exitStuckCommands()
+        }
+
+        let outcome = await m.end(reason: .user)
+
+        XCTAssertEqual(outcome, .privilegedCommandRunning(pid: 4242))
+        XCTAssertEqual(pendingAtRefusal.value, .user, "the refused end was not recorded before the caller resumed")
+        await waitUntil("end refused before the exit never retried") {
+            m.pendingEnd == nil && (try? self.h.store.loadState()) == RuntimeState.clean
+        }
+        XCTAssertNil(m.session)
+        XCTAssertNil(try h.store.loadSession())
+        XCTAssertFalse(h.guardFake.sleepDisabled)
+        XCTAssertEqual(h.guardFake.calls.suffix(3), ["lowpowermode 1", "disablesleep 0", "lowpowermode 0"])
+        XCTAssertFalse(try lockIsHeld())
+    }
+
+    /// A lid open refused while the command runs leaves the lid actions
+    /// journaled and is replayed once the command has exited, for the
+    /// lid's latest state (open), through the LidActions AppServices uses.
+    func testLidOpenRefusedWhileTheCommandRunsIsReplayedWhenItExits() async throws {
+        let m = h.makeManager()
+        let actions = makeLidActions(m)
+        await m.start(duration: 3600)
+        await actions.onClose()
+        XCTAssertEqual(try h.store.loadState()?.savedOutputVolume, 0.6)
+        h.guardFake.stillRunning = ["lowpowermode 1"]
+        _ = await m.setLowPower(true)
+
+        await actions.onOpen()
+
+        XCTAssertTrue(m.lidEventDeferred)
+        XCTAssertEqual(try h.store.loadState()?.savedOutputVolume, 0.6, "lid actions undone beside the live pmset")
+        XCTAssertTrue(h.audio.applied.isEmpty)
+
+        let replays = Locked<[Bool]>([])
+        m.resyncAfterCommand = { replay in
+            replays.value.append(replay)
+            if replay { Task { @MainActor in await actions.onOpen() } }
+        }
+        h.guardFake.stillRunning = []
+        h.guardFake.exitStuckCommands()
+        await waitUntil("refused lid open never replayed") { (try? self.h.store.loadState())?.hasLidActions == false }
+        XCTAssertEqual(replays.value, [true])
+        XCTAssertFalse(m.lidEventDeferred)
+        XCTAssertEqual(h.audio.applied.last?.volume, 0.6)
+        XCTAssertEqual(h.audio.applied.last?.muted, false)
+        XCTAssertNotNil(m.session)
+        XCTAssertFalse(try lockIsHeld())
+    }
+
+    /// The same for a lid close: nothing is muted beside the live pmset,
+    /// and the close runs once the command has exited.
+    func testLidCloseRefusedWhileTheCommandRunsIsReplayedWhenItExits() async throws {
+        let m = h.makeManager()
+        let actions = makeLidActions(m)
+        await m.start(duration: 3600)
+        h.guardFake.stillRunning = ["lowpowermode 1"]
+        _ = await m.setLowPower(true)
+
+        await actions.onClose()
+
+        XCTAssertTrue(m.lidEventDeferred)
+        XCTAssertEqual(h.audio.mutes, 0, "muted beside the live pmset")
+        XCTAssertNil(try h.store.loadState()?.savedOutputVolume)
+
+        let replays = Locked<[Bool]>([])
+        m.resyncAfterCommand = { replay in
+            replays.value.append(replay)
+            if replay { Task { @MainActor in await actions.onClose() } }
+        }
+        h.guardFake.stillRunning = []
+        h.guardFake.exitStuckCommands()
+        await waitUntil("refused lid close never replayed") { self.h.audio.mutes == 1 }
+        XCTAssertEqual(replays.value, [true])
+        XCTAssertEqual(try h.store.loadState()?.savedOutputVolume, 0.6)
+        XCTAssertFalse(m.lidEventDeferred)
+    }
+
+    /// With an end pending, the end runs first and alone: it undoes every
+    /// lid action from the journal itself, so a lid event refused meanwhile
+    /// owes nothing and nothing is replayed into the ended session.
+    func testPendingEndGoesBeforeALidEventRefusedMeanwhile() async throws {
+        let m = h.makeManager()
+        let actions = makeLidActions(m)
+        let replays = Locked<[Bool]>([])
+        m.resyncAfterCommand = { replays.value.append($0) }
+        await m.start(duration: 3600)
+        await actions.onClose()
+        h.guardFake.stillRunning = ["disablesleep 0"]
+        _ = await m.end(reason: .user)
+        await m.undoLidActions()
+        XCTAssertTrue(m.lidEventDeferred)
+        XCTAssertEqual(m.pendingEnd, .user)
+
+        h.guardFake.stillRunning = []
+        h.guardFake.exitStuckCommands()
+        await waitUntil("pending end never retried") { m.pendingEnd == nil }
+        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
+        XCTAssertEqual(h.audio.applied.last?.volume, 0.6)
+        XCTAssertFalse(m.lidEventDeferred)
+        XCTAssertEqual(replays.value, [], "lid event replayed after the end")
+    }
+
+    /// The check after the exit takes the lock like any transaction. If
+    /// another process holds it, nothing is checked or replayed, and the
+    /// pass runs again after the retry delay instead of being dropped.
+    func testCheckAfterTheCommandRunsAgainAfterABusyLock() async throws {
+        let m = h.makeManager(retryDelay: 0.2)
+        let resyncs = Locked<[Bool]>([])
+        m.resyncAfterCommand = { resyncs.value.append($0) }
+        await m.start(duration: 3600)
+        let on = await m.setLowPower(true)
+        XCTAssertTrue(on)
+        h.guardFake.lowPowerOn = false
+        let other = try XCTUnwrap(try RecoveryLock(url: h.home.paths.recoveryLock).tryAcquire())
+
+        await m.settleAfterCommand()
+
+        XCTAssertEqual(try h.store.loadState()?.lowPowerSetByUs, true, "checked without the lock")
+        XCTAssertEqual(resyncs.value, [])
+        other.release()
+        await waitUntil("check never ran again after the busy lock") { resyncs.value == [false] }
+        XCTAssertEqual(try h.store.loadState()?.lowPowerSetByUs, false)
     }
 }

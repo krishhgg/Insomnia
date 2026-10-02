@@ -117,6 +117,9 @@ final class AppServices {
         // rescaled value: sample once more just before the mode goes on
         // and keep that sample until it is off (spec section 4).
         manager.willEnableLowPower = { [weak self] in self?.sampleBrightnessIfLidOpen() }
+        // A power command left running refuses lid and floor transactions
+        // until it exits; the manager calls back then.
+        manager.resyncAfterCommand = { [weak self] replayLid in self?.resyncAfterCommand(replayLid: replayLid) }
         sampler.displayHeld = { [weak manager] in manager?.state.lowPowerSetByUs ?? false }
 
         lid.onChange = { [weak self] closed in self?.lidChanged(closed) }
@@ -255,6 +258,15 @@ final class AppServices {
     }
 
     // MARK: Private
+
+    /// An unfinished power command has exited and the manager has checked
+    /// Low Power Mode against the journal. A lid event refused while it ran
+    /// is replayed for the lid's latest state, which runs the floors after
+    /// it; otherwise the floors run now, on the corrected journal, and ask
+    /// again for any Low Power change refused meanwhile.
+    private func resyncAfterCommand(replayLid: Bool) {
+        if replayLid { lidChanged(status.lidClosed) } else { powerChanged() }
+    }
 
     private func lidChanged(_ closed: Bool) {
         status.lidClosed = closed
