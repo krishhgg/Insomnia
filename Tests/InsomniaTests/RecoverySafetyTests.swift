@@ -152,14 +152,17 @@ final class RecoverySafetyTests: XCTestCase {
         XCTAssertNil(m.scheduledDeadline)
     }
 
-    /// The deadline passes while reconcile's `disablesleep 1` for the
-    /// session on disk is still running. The end waits for it, so its
-    /// `disablesleep 0` lands last and nothing stays journaled.
+    /// The deadline passes while reconcile's `pmset -g` check for the
+    /// session on disk is still running. Reconcile never turns sleep off
+    /// again; it keeps the session only because sleep is still off, and then
+    /// journals that. The end waits for it, so its `disablesleep 0` lands
+    /// last and nothing stays journaled.
     func testEndDuringReconcileMustNotLeaveSleepDisabled() async throws {
         let now = h.clock.now
         try h.store.saveSession(Session(startedAt: now.addingTimeInterval(-600), endsAt: now.addingTimeInterval(60)))
+        h.guardFake.sleepDisabled = true
         let gate = AsyncGate()
-        h.guardFake.sleepGate = gate
+        h.guardFake.readGate = gate
         let m = h.makeManager()
 
         let reconcile = Task { await m.reconcile() }
@@ -173,7 +176,7 @@ final class RecoverySafetyTests: XCTestCase {
         // first await, so an end that ran here instead of queuing shows now.
         XCTAssertEqual(m.session, held, "the end ran inside the reconcile")
         XCTAssertEqual(try h.store.loadSession(), held, "the end ran inside the reconcile")
-        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1"])
+        XCTAssertEqual(h.guardFake.calls, ["pmset -g"])
         await gate.open()
         await reconcile.value
         let outcome = await end.value
@@ -182,7 +185,7 @@ final class RecoverySafetyTests: XCTestCase {
         XCTAssertNil(m.session)
         XCTAssertNil(m.scheduledDeadline)
         XCTAssertFalse(h.guardFake.sleepDisabled, "sleep left disabled after the end completed")
-        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1", "disablesleep 0"])
+        XCTAssertEqual(h.guardFake.calls, ["pmset -g", "disablesleep 0"])
         XCTAssertNil(try h.store.loadSession())
         XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
     }
