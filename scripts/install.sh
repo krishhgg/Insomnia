@@ -96,6 +96,18 @@ usage() { echo "usage: $0 [--app /path/to/Insomnia.app [--allow-unverified-origi
 # A command for the user to paste, each word quoted for the shell, so a space,
 # quote or $ in a path stays part of that path.
 command_line() { local line; line="$(printf '%q ' "$@")"; printf '%s' "${line% }"; }
+# `launchctl print` exits 0 when a job with the label is loaded and 113 when
+# none is. Anything else is unknown, not absent. Being loaded says nothing
+# about which plist or schedule that job runs (it may be an older one).
+loaded_state() { # -> yes | no | unknown:<rc>
+  local rc=0
+  "$LAUNCHCTL" print "gui/$UID_NUM/$LABEL" >/dev/null 2>&1 || rc=$?
+  case "$rc" in
+    0) echo yes ;;
+    113) echo no ;;
+    *) echo "unknown:$rc" ;;
+  esac
+}
 
 PREBUILT=""
 ALLOW_UNVERIFIED_ORIGIN=0
@@ -345,10 +357,45 @@ if [[ -d "$PREVIOUS_APP" ]]; then
     # Stopped after the second rename but before the new plist was
     # published: $PLIST still pins the previous bundle, so that one goes
     # back and the interrupted run's build is discarded with this run's
-    # staging directory.
+    # staging directory. That run may have left its own job loaded (it was
+    # killed after its bootstrap, or its unload failed). Such a job pins the
+    # build at $APP: a run loads its job only after the swap, and swaps only
+    # once print confirms the previous job is gone. So any loaded job is
+    # unloaded first, and if print does not confirm that, neither bundle
+    # moves and the job keeps the build it pins.
+    held="$(loaded_state)"
+    if [[ "$held" != no ]]; then
+      "$LAUNCHCTL" bootout "gui/$UID_NUM/$LABEL" >/dev/null 2>&1 || true
+      cleared="$(loaded_state)"
+      if [[ "$cleared" != no ]]; then
+        cat >&2 <<FAIL
+
+Install stopped: an interrupted run left its build at $APP and the previous app
+at $PREVIOUS_APP, and $PLIST pins the previous one.
+A job with label $LABEL may still be loaded from that run, and unloading it was
+not confirmed (launchctl print: $cleared). That job pins the build at $APP, so
+neither bundle was moved. Installed so far: $SUDOERS.
+The next login loads $PLIST, which does not match the app at $APP. Before you
+log out, unload the job and rerun this script:
+  launchctl bootout gui/$UID_NUM/$LABEL
+FAIL
+        exit 1
+      fi
+    fi
     mv "$APP" "$STAGE/Interrupted.app"
     mv "$PREVIOUS_APP" "$APP"
     echo "restored $APP, which an interrupted run had set aside; $PLIST pins it"
+    if [[ "$held" != no ]]; then
+      # The job just unloaded may have been the one retrying recovery; the
+      # previous plist takes over until this run replaces it.
+      reload_rc=0
+      "$LAUNCHCTL" bootstrap "gui/$UID_NUM" "$PLIST" >/dev/null 2>&1 || reload_rc=$?
+      if (( reload_rc == 0 )) && [[ "$(loaded_state)" == yes ]]; then
+        echo "unloaded the job the interrupted run left and loaded $PLIST again (launchctl print confirms)"
+      else
+        echo "unloaded the job the interrupted run left; loading $PLIST again was not confirmed ('launchctl bootstrap' exited $reload_rc)"
+      fi
+    fi
   else
     # $APP is what the plist pins (the interrupted run got as far as
     # publishing it), or nothing pins either: the set-aside copy is spare.
@@ -402,18 +449,6 @@ mkdir -p "$CANDIDATE_DIR"
 # $LAUNCH_AGENTS itself (those make launchd's login load report an error).
 rm -f "$CANDIDATE_DIR/$LABEL.candidate-"* "$LAUNCH_AGENTS/$LABEL.candidate-"*
 
-# `launchctl print` exits 0 when a job with the label is loaded and 113 when
-# none is. Anything else is unknown, not absent. Being loaded says nothing
-# about which plist or schedule that job runs (it may be an older one).
-loaded_state() { # -> yes | no | unknown:<rc>
-  local rc=0
-  "$LAUNCHCTL" print "gui/$UID_NUM/$LABEL" >/dev/null 2>&1 || rc=$?
-  case "$rc" in
-    0) echo yes ;;
-    113) echo no ;;
-    *) echo "unknown:$rc" ;;
-  esac
-}
 before="$(loaded_state)"
 
 if (( recovery_rc != 0 )); then
@@ -430,13 +465,13 @@ schedule it runs was not verified here; check with 'launchctl print gui/$UID_NUM
   if [[ -n "$PREBUILT" ]]; then
     rerun="$(command_line "$0" --app "$PREBUILT")"
     if (( ALLOW_UNVERIFIED_ORIGIN )); then rerun="$(command_line "$0" --allow-unverified-origin --app "$PREBUILT")"; fi
-    manual_step="or rerun this script. It checks a new private
+    manual_step="Or rerun this script. It checks a new private
 copy of the bundle and runs that copy's recovery before it replaces the app
 or the LaunchAgent:
   $rerun"
   else
-    manual_step="or run the recovery by hand:
-  /bin/bash \"$ROOT/scripts/backstop.sh\" --force
+    manual_step="Or run the recovery by hand:
+  $(command_line /bin/bash "$ROOT/scripts/backstop.sh" --force)
 Then rerun this script to install the app and the LaunchAgent."
   fi
   cat >&2 <<FAIL
@@ -446,9 +481,10 @@ Install stopped: the backstop could not fully undo a previous session
 not replaced or unloaded, so they still match each other; the new build
 was discarded. Installed so far: $SUDOERS.
 $agent_note
-Check $LOG_DIR/insomnia.log and resolve what it reports (saved audio, display
-brightness or keyboard backlight needs the app; if one is installed: open
-"$APP"), $manual_step
+Check $LOG_DIR/insomnia.log and resolve what it reports. Saved audio, display
+brightness or keyboard backlight needs the app; if one is installed, open it:
+  $(command_line open "$APP")
+$manual_step
 FAIL
   exit 1
 fi
@@ -483,11 +519,32 @@ PLIST
 
 # bootout by service target (ignored if nothing is loaded; a path launchctl
 # cannot read fails with EIO instead of unloading anything), swap the new
-# bundle in, then bootstrap from the candidate. The previous job is unloaded
-# before the swap and the new one loaded after it, so no agent is ever
-# loaded against the other build's bundle; on failure the swap is undone
-# before anything is reloaded.
+# bundle in, then bootstrap from the candidate. The swap waits until print
+# confirms the previous job is gone, and the new job is loaded after it, so
+# no agent is ever loaded against the other build's bundle, and any job
+# loaded after the swap is this run's. On failure that job is unloaded
+# (print confirms it) before the swap is undone and anything is reloaded.
 "$LAUNCHCTL" bootout "gui/$UID_NUM/$LABEL" >/dev/null 2>&1 || true
+if [[ "$before" != no ]]; then
+  cleared="$(loaded_state)"
+  if [[ "$cleared" != no ]]; then
+    reload_hint=""
+    if [[ "$cleared" != yes && -f "$PLIST" ]]; then
+      reload_hint="If no job is loaded, load the previous one again:
+  $(command_line launchctl bootstrap "gui/$UID_NUM" "$PLIST")
+"
+    fi
+    cat >&2 <<FAIL
+
+Install stopped: unloading the previous LaunchAgent job was not confirmed
+(launchctl print: $cleared), so the app at $APP was not replaced and the new
+build was discarded. $PLIST was not modified.
+$SUDOERS is installed and the recovery journal was clean when checked above.
+${reload_hint}Check 'launchctl print gui/$UID_NUM/$LABEL' and rerun this script.
+FAIL
+    exit 1
+  fi
+fi
 had_app=0
 if [[ -e "$APP" ]]; then
   mv "$APP" "$PREVIOUS_APP"
@@ -498,18 +555,8 @@ bootstrap_rc=0
 "$LAUNCHCTL" bootstrap "gui/$UID_NUM" "$CANDIDATE" || bootstrap_rc=$?
 after="$(loaded_state)"
 published=0
-unloaded=no
-if (( bootstrap_rc == 0 )) && [[ "$after" == yes ]]; then
-  if mv -f "$CANDIDATE" "$PLIST"; then
-    published=1
-  else
-    # The new job is loaded, but the next login loads $PLIST, which still
-    # pins the previous build. Unload the new job; once print confirms it
-    # is gone, the swap is undone below like any other failed load, so
-    # bundle and plist match again.
-    "$LAUNCHCTL" bootout "gui/$UID_NUM/$LABEL" >/dev/null 2>&1 || true
-    unloaded="$(loaded_state)"
-  fi
+if (( bootstrap_rc == 0 )) && [[ "$after" == yes ]] && mv -f "$CANDIDATE" "$PLIST"; then
+  published=1
 fi
 
 if (( published )); then
@@ -532,8 +579,20 @@ else
     reason="'launchctl bootstrap' reported success, but the job is not confirmed loaded (launchctl print: $after)"
   else
     reason="the new LaunchAgent loaded, but its plist could not be moved to $PLIST,
-where the next login loads it from, so the new job was unloaded again"
+where the next login loads it from"
     fix_note="Check that $LAUNCH_AGENTS is writable and rerun."
+  fi
+  # A job print lists, or cannot rule out, is this run's (see the swap
+  # above): loaded from the candidate, or by a bootstrap that reported an
+  # error anyway. It pins the new build, so it is unloaded before the
+  # previous bundle goes back, and print has to confirm that.
+  unloaded=no
+  stopped="Install stopped: $reason."
+  if [[ "$after" != no ]]; then
+    "$LAUNCHCTL" bootout "gui/$UID_NUM/$LABEL" >/dev/null 2>&1 || true
+    unloaded="$(loaded_state)"
+    stopped="$stopped
+The new job was unloaded again (launchctl print confirms)."
   fi
   if [[ "$unloaded" != no ]]; then
     # The new job may still be loaded, and it pins the new build: putting
@@ -541,8 +600,8 @@ where the next login loads it from, so the new job was unloaded again"
     # stays and the previous bundle stays set aside, which is the state an
     # install killed mid-swap leaves; the rerun's repair above handles it.
     if (( had_app )); then
-      kept_note="The previous app is kept at $PREVIOUS_APP; the rerun puts it back
-first if $PLIST still pins it."
+      kept_note="The previous app is kept at $PREVIOUS_APP; the rerun unloads the job
+and puts the previous app back if $PLIST still pins it."
     else
       kept_note="No app was installed at $APP before this run."
     fi
@@ -554,14 +613,13 @@ next login loads would refuse to run."
     fi
     cat >&2 <<FAIL
 
-Install stopped: the new LaunchAgent loaded, but its plist could not be moved to
-$PLIST, where the next login loads it from, and unloading the new job
-again was not confirmed (launchctl print: $unloaded).
-The new build stays at $APP, because the job that may still be loaded pins
-it and would refuse the previous app. $kept_note
+Install stopped: $reason.
+The new job may still be loaded: unloading it was not confirmed (launchctl print: $unloaded).
+The new build stays at $APP, because that job pins it and would refuse the
+previous app. $kept_note
 $plist_note
 $SUDOERS is installed and the recovery journal was clean when checked above.
-Check that $LAUNCH_AGENTS is writable and rerun this script before you log out.
+${fix_note%.} before you log out.
 FAIL
     exit 1
   fi
@@ -595,7 +653,7 @@ unknown: it may be the job that was loaded before this attempt. Check
       else
         outcome="The previous job could not be loaded again ('launchctl bootstrap' exited
 $reload_rc; launchctl print: $now); no job with label $LABEL is confirmed loaded. Run
-  launchctl bootstrap gui/$UID_NUM '$PLIST'
+  $(command_line launchctl bootstrap "gui/$UID_NUM" "$PLIST")
 yourself, or rerun this script."
       fi ;;
     no)
@@ -621,7 +679,7 @@ so nothing was reloaded. Check 'launchctl print gui/$UID_NUM/$LABEL' and, if nee
   fi
   cat >&2 <<FAIL
 
-Install stopped: $reason.
+$stopped
 $plist_note
 $app_note
 $outcome
@@ -638,9 +696,9 @@ step "Installed"
 UNINSTALL="$SCRIPT_DIR/uninstall.sh"
 cat <<NEXT
 Next steps:
-  1. Launch:            open "$APP"
+  1. Launch:            $(command_line open "$APP")
   2. Optional:          System Settings > Wi-Fi > Ask to join hotspots: Automatically
   3. Config lives at:   $APP_SUPPORT/config.json
   4. Logs:              $LOG_DIR/insomnia.log
-  5. Uninstall:         $UNINSTALL
+  5. Uninstall:         $(command_line "$UNINSTALL")
 NEXT
