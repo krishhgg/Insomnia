@@ -17,6 +17,8 @@ final class LaunchdBackstopTests: XCTestCase {
     /// The ProgramArguments of the plist the loaded job was bootstrapped
     /// from, which `launchctl print` lists under `arguments`.
     let loadedJob = Locked<[String]>([])
+    /// Its StartInterval, which `launchctl print` lists as `run interval`.
+    let loadedInterval = Locked<Int?>(nil)
     let bootstrapFails = Locked(false)
     /// bootout returns an error and leaves the job loaded, as launchd does
     /// for a job that is mid-transition.
@@ -34,6 +36,7 @@ final class LaunchdBackstopTests: XCTestCase {
         calls.value = []
         loaded.value = false
         loadedJob.value = []
+        loadedInterval.value = nil
         bootstrapFails.value = false
         bootoutFails.value = false
         onBootout.value = nil
@@ -54,7 +57,7 @@ final class LaunchdBackstopTests: XCTestCase {
             try FileManager.default.createDirectory(at: script.deletingLastPathComponent(), withIntermediateDirectories: true)
             try Data("#!/bin/bash\n".utf8).write(to: script)
         }
-        let calls = calls, loaded = loaded, loadedJob = loadedJob, bootstrapFails = bootstrapFails, bootoutFails = bootoutFails
+        let calls = calls, loaded = loaded, loadedJob = loadedJob, loadedInterval = loadedInterval, bootstrapFails = bootstrapFails, bootoutFails = bootoutFails
         let onBootout = onBootout, onBootstrapped = onBootstrapped, trustedPlistAtBootstrap = trustedPlistAtBootstrap
         let trusted = home.paths.backstopPlist
         let label = "com.insomnia.backstop"
@@ -86,7 +89,7 @@ final class LaunchdBackstopTests: XCTestCase {
             switch args.first {
             case "print":
                 guard loaded.value else { return ShellResult(status: 113, stdout: "", stderr: "Could not find service") }
-                return ShellResult(status: 0, stdout: Self.printOutput(arguments: loadedJob.value), stderr: "")
+                return ShellResult(status: 0, stdout: Self.printOutput(arguments: loadedJob.value, runInterval: loadedInterval.value), stderr: "")
             case "bootstrap":
                 trustedPlistAtBootstrap.value.append(try? Data(contentsOf: trusted))
                 guard args.count == 3, launchdAccepts(args[2]) else {
@@ -99,6 +102,7 @@ final class LaunchdBackstopTests: XCTestCase {
                 let plist = (try? Data(contentsOf: URL(fileURLWithPath: args[2])))
                     .flatMap { try? PropertyListSerialization.propertyList(from: $0, format: nil) as? [String: Any] }
                 loadedJob.value = plist?["ProgramArguments"] as? [String] ?? []
+                loadedInterval.value = plist?["StartInterval"] as? Int
                 if let hook = onBootstrapped.value { onBootstrapped.value = nil; hook() }
                 return ShellResult(status: 0, stdout: "", stderr: "")
             case "bootout":
@@ -122,8 +126,9 @@ final class LaunchdBackstopTests: XCTestCase {
 
     /// `launchctl print gui/501/<label>` for a loaded job, in the layout
     /// launchctl prints (checked 2026-10-02): top-level keys indented by one
-    /// tab, each argument on its own line indented by two.
-    static func printOutput(arguments: [String]) -> String {
+    /// tab, each argument on its own line indented by two, and `run
+    /// interval` only for a job with a StartInterval.
+    static func printOutput(arguments: [String], runInterval: Int?) -> String {
         """
         gui/501/com.insomnia.backstop = {
         \tactive count = 0
@@ -138,6 +143,11 @@ final class LaunchdBackstopTests: XCTestCase {
         \tdefault environment = {
         \t\tPATH => /usr/bin:/bin:/usr/sbin:/sbin
         \t}
+
+        \tdomain = gui/501 [100022]
+        \tcpumon = default
+        \(runInterval.map { "\trun interval = \($0) seconds\n" } ?? "")
+        \tproperties = runatload | inferred program | managed LWCR | has LWCR
         }
 
         """
@@ -407,23 +417,111 @@ final class LaunchdBackstopTests: XCTestCase {
         XCTAssertEqual(calls.value.map { $0[1] }, ["print"], "the job now runs this build's command line")
     }
 
-    /// The parser reads the arguments block in the layout launchctl prints,
-    /// with arguments holding spaces, quotes and `$` as the agent's do, and
-    /// gives up on output it does not know rather than guess. `captured` is
-    /// the start of `launchctl print` for a loaded Apple agent (2026-10-02).
-    func testPrintArgumentsAreReadFromLaunchctlsLayout() {
+    /// The parser reads the arguments block and the run interval in the
+    /// layout launchctl prints, with arguments holding spaces, quotes and `$`
+    /// as the agent's do, and gives up on output it does not know rather
+    /// than guess. `captured` is `launchctl print` of the agent an earlier
+    /// install loaded on this Mac (2026-10-02), with the home directory
+    /// replaced; `nonPolling` is the start of one for an Apple agent that
+    /// has no StartInterval.
+    func testLoadedJobIsReadFromLaunchctlsLayout() {
         XCTAssertEqual(
-            LaunchdBackstop.arguments(fromPrint: Self.printOutput(arguments: expectedArguments)),
-            expectedArguments
+            LaunchdBackstop.loadedJob(fromPrint: Self.printOutput(arguments: expectedArguments, runInterval: 60)),
+            LaunchdBackstop.LoadedJob(arguments: expectedArguments, runInterval: 60)
         )
-        let captured = "gui/501/com.apple.webkit.webpushd = {\n\tactive count = 0\n\tpath = /System/Volumes/Preboot/Cryptexes/App/System/Library/LaunchAgents/com.apple.webkit.webpushd.plist\n\ttype = LaunchAgent\n\tstate = not running\n\n\tprogram = /System/Cryptexes/App/usr/libexec/webpushd\n\targuments = {\n\t\t/System/Cryptexes/App/usr/libexec/webpushd\n\t\t--machServiceName\n\t\tcom.apple.webkit.webpushd.service\n\t}\n\n\tstderr path = /dev/null\n"
+        let captured = """
+        gui/501/com.insomnia.backstop = {
+        \tactive count = 0
+        \tpath = /Users/tester/Library/LaunchAgents/com.insomnia.backstop.plist
+        \ttype = LaunchAgent
+        \tstate = not running
+
+        \tprogram = /bin/bash
+        \targuments = {
+        \t\t/bin/bash
+        \t\t/Users/tester/Library/Application Support/Insomnia/backstop.sh
+        \t}
+
+        \tinherited environment = {
+        \t\tSSH_AUTH_SOCK => /private/tmp/com.apple.launchd.0teygTyWhX/Listeners
+        \t}
+
+        \tdefault environment = {
+        \t\tPATH => /usr/bin:/bin:/usr/sbin:/sbin
+        \t}
+
+        \tenvironment = {
+        \t\tOSLogRateLimit => 64
+        \t\tXPC_SERVICE_NAME => com.insomnia.backstop
+        \t}
+
+        \tdomain = gui/501 [100022]
+        \tasid = 100022
+        \tminimum runtime = 10
+        \texit timeout = 5
+        \truns = 22
+        \tlast exit code = 0
+
+        \tresource coalition = {
+        \t\tID = 939
+        \t\ttype = resource
+        \t\tstate = active
+        \t\tactive count = 1
+        \t\tname = com.insomnia.backstop
+        \t}
+
+        \tspawn type = daemon (3)
+        \tjetsam priority = 40
+        \tcpumon = default
+        \trun interval = 60 seconds
+
+        \tproperties = runatload | inferred program | managed LWCR | has LWCR
+        }
+
+        """
         XCTAssertEqual(
-            LaunchdBackstop.arguments(fromPrint: captured),
-            ["/System/Cryptexes/App/usr/libexec/webpushd", "--machServiceName", "com.apple.webkit.webpushd.service"]
+            LaunchdBackstop.loadedJob(fromPrint: captured),
+            LaunchdBackstop.LoadedJob(arguments: ["/bin/bash", "/Users/tester/Library/Application Support/Insomnia/backstop.sh"], runInterval: 60)
         )
-        XCTAssertNil(LaunchdBackstop.arguments(fromPrint: "gui/501/com.insomnia.backstop = {\n\tprogram = /bin/sh\n}\n"), "no arguments block")
-        XCTAssertNil(LaunchdBackstop.arguments(fromPrint: "x = {\n\targuments = {\n\t\t/bin/sh\n"), "no closing line")
-        XCTAssertNil(LaunchdBackstop.arguments(fromPrint: "x = {\n\targuments = {\n\t\t/bin/sh\n\tprogram = /bin/sh\n\t}\n}\n"), "a line that is not an argument")
+        let nonPolling = "gui/501/com.apple.webkit.webpushd = {\n\tactive count = 0\n\tpath = /System/Volumes/Preboot/Cryptexes/App/System/Library/LaunchAgents/com.apple.webkit.webpushd.plist\n\ttype = LaunchAgent\n\tstate = not running\n\n\tprogram = /System/Cryptexes/App/usr/libexec/webpushd\n\targuments = {\n\t\t/System/Cryptexes/App/usr/libexec/webpushd\n\t\t--machServiceName\n\t\tcom.apple.webkit.webpushd.service\n\t}\n\n\tstderr path = /dev/null\n"
+        XCTAssertEqual(
+            LaunchdBackstop.loadedJob(fromPrint: nonPolling),
+            LaunchdBackstop.LoadedJob(arguments: ["/System/Cryptexes/App/usr/libexec/webpushd", "--machServiceName", "com.apple.webkit.webpushd.service"], runInterval: nil)
+        )
+        XCTAssertEqual(
+            LaunchdBackstop.loadedJob(fromPrint: "x = {\n\targuments = {\n\t\t/bin/sh\n\t}\n\trun interval = 1 minute\n}\n")?.runInterval, .some(nil),
+            "an interval in another form reads as none"
+        )
+        XCTAssertNil(LaunchdBackstop.loadedJob(fromPrint: "gui/501/com.insomnia.backstop = {\n\tprogram = /bin/sh\n\trun interval = 60 seconds\n}\n"), "no arguments block")
+        XCTAssertNil(LaunchdBackstop.loadedJob(fromPrint: "x = {\n\targuments = {\n\t\t/bin/sh\n"), "no closing line")
+        XCTAssertNil(LaunchdBackstop.loadedJob(fromPrint: "x = {\n\targuments = {\n\t\t/bin/sh\n\tprogram = /bin/sh\n\t}\n}\n"), "a line that is not an argument")
+        XCTAssertNil(LaunchdBackstop.loadedJob(fromPrint: "x = {\n\targuments = {\n\t\t/bin/sh\n\t}\n\targuments = {\n\t\t/bin/zsh\n\t}\n}\n"), "two arguments blocks")
+    }
+
+    /// The plist on disk is this build's and the loaded job runs its command
+    /// line, but launchd starts that job only at load: it was loaded from a
+    /// plist without the StartInterval (an older layout, or one written by
+    /// hand). Once its first run is over nothing runs the backstop again, so
+    /// a session would hold sleep with no agent to end it. arm() reloads it.
+    func testLoadedJobWithoutThePollIntervalIsReloadedThoughItsCommandLineMatches() async throws {
+        let b = try makeBackstop()
+        try await b.arm()
+        loadedInterval.value = nil
+        calls.value = []
+
+        try await b.arm()
+
+        XCTAssertEqual(calls.value.map { $0[1] }, ["print", "bootout", "bootstrap"], "a job that does not poll is not armed")
+        XCTAssertEqual(loadedInterval.value, 60)
+
+        loadedInterval.value = 3600
+        calls.value = []
+        try await b.arm()
+        XCTAssertEqual(calls.value.map { $0[1] }, ["print", "bootout", "bootstrap"], "nor one that polls once an hour")
+
+        calls.value = []
+        try await b.arm()
+        XCTAssertEqual(calls.value.map { $0[1] }, ["print"])
     }
 
     func testArmBootstrapsWhenPlistIsCurrentButJobIsNotLoaded() async throws {

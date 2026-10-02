@@ -353,8 +353,8 @@ Backstop, independent of the app:
   one line and exits without running anything. No executable lives in a
   writable directory. The plist is a per-user file like any LaunchAgent; at
   the next arm the app rewrites a plist that does not match, and reloads a
-  loaded job whose command line (the arguments `launchctl print` lists)
-  differs from the plist's.
+  loaded job whose command line or run interval (the `arguments` and `run
+  interval` that `launchctl print` lists) differs from the plist's.
 - What the app pins is the requirement of the code it is running
   (SecCodeCopySelf), read after SecCodeCheckValidity confirmed the bundle on
   disk is that code, and the bundle must pass the agent's own check against
