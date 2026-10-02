@@ -423,7 +423,10 @@ MSG
 # one path. A copy is a regular file whose name has exactly the shape the
 # move writes (prefix, UTC stamp, optional -n). Anything else with such a
 # name (a directory, a FIFO, a symlink) goes to NOT_MOVED_ASIDE and is never
-# removed; other names under the prefix are not Insomnia's and are skipped.
+# removed, even when the app or backstop.sh renamed it there: a session.json
+# that cannot be read is moved without being opened, whatever it is, and
+# Insomnia did not create its contents. Other names under the prefix are
+# not Insomnia's and are skipped.
 collect_moved_aside_sessions() {
   local f
   MOVED_ASIDE=()
@@ -494,9 +497,10 @@ What to do, then rerun this script:
     session.json.unreadable-<time> as soon as the journal is clean, and the
     app does the same at launch. It needs no action of its own.
   - session.json that cannot be read at all: its end time is unknown, so
-    the app and the agent treat it as expired and undo the journal, but
-    never move or remove it, since it may have been a valid session. Fix
-    its permissions, or remove it if it is not a regular file, then rerun.
+    the app and the agent treat it as expired, undo the journal, and then
+    rename it to session.json.unreadable-<time> without opening it. If it
+    is still here, that rename failed (see the log): fix its permissions,
+    or remove it if it is not a regular file, then rerun.
   - Log: $LOG_DIR/insomnia.log
 MSG
   exit 1
@@ -625,7 +629,7 @@ if (( PURGE == 1 )); then
   fi
   if (( ${#NOT_MOVED_ASIDE[@]} > 0 )); then
     for f in "${NOT_MOVED_ASIDE[@]}"; do
-      echo "Left $f: it is named like a moved-aside session.json but is not a regular file, so Insomnia did not write it."
+      echo "Left $f: it is named like a moved-aside session.json but is not a regular file, so purge does not remove it. Remove it yourself if you do not need it."
     done
   fi
   # The lock file itself is kept, even on purge: this process still holds
@@ -643,6 +647,11 @@ else
   collect_moved_aside_sessions
   if (( ${#MOVED_ASIDE[@]} > 0 )); then
     echo "Kept ${#MOVED_ASIDE[@]} unreadable session.json file(s) moved aside in $APP_SUPPORT (use --purge to remove)."
+  fi
+  if (( ${#NOT_MOVED_ASIDE[@]} > 0 )); then
+    for f in "${NOT_MOVED_ASIDE[@]}"; do
+      echo "Kept $f: it is named like a moved-aside session.json but is not a regular file, so purge does not remove it either. Remove it yourself if you do not need it."
+    done
   fi
 fi
 

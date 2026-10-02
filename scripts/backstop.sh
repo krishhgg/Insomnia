@@ -64,10 +64,12 @@
 #     not a regular file (a FIFO or device is never opened: open(2) could
 #     block while this run holds the lock): its end time is unknown, and
 #     sleep is never held without a deadline that can be enforced, so it is
-#     treated as expired and the journal is undone as above. The file itself
-#     is never moved or removed; it may have been a valid session. Exit 1 on
-#     every run while it is there, so a person sees it. A state.json that is
-#     not a regular file is malformed.
+#     treated as expired and the journal is undone as above. The file is
+#     never opened, read or removed: it may have been a valid session. Once
+#     the journal is clean it is renamed aside like a malformed one, so its
+#     bytes stay as evidence and no later run, of this script or the app,
+#     can read it back as a session that was already treated as ended. A
+#     state.json that is not a regular file is malformed.
 #
 # Limitation: the shell compares process start time to the second and the
 # boot session; only the app also compares the microseconds.
@@ -450,34 +452,34 @@ if [[ "$journal_state" == clean ]]; then
   fi
 fi
 
-# session.json that is not a session. Its bytes are kept beside it under a
-# name the app writes too and `uninstall.sh --purge` removes; the next run
-# then sees no session. Called only once the journal is clean, so nothing
-# recorded is lost with it. Never overwrites: a taken name gets -1, -2, ...
-# and `mv -n` declines rather than replace a file that appeared meanwhile
-# (it exits 0 then, hence the check of both paths afterwards).
+# session.json that is not a session, or cannot be read. Its bytes are
+# kept beside it under a name the app writes too and `uninstall.sh --purge`
+# removes; the next run then sees no session. A rename never opens the
+# file, so a FIFO or a file without read permission moves the same way.
+# Called only once the journal is clean, so nothing recorded is lost with
+# it. Never overwrites: a taken name gets -1, -2, ... and `mv -n` declines
+# rather than replace a file that appeared meanwhile (it exits 0 then,
+# hence the check of both paths afterwards).
 quarantine_session() {
-  local base dest n line
+  local base dest n line what
   while IFS= read -r line; do
     [[ -n "$line" ]] && log warn "$SESSION: $line"
   done <<< "$session_problems"
+  what="session.json unreadable"
+  [[ "$session_state" == unreadable ]] && what="session.json cannot be read ($unreadable_why)"
   base="$SESSION.unreadable-$("$DATE" -u +%Y%m%dT%H%M%SZ)"
   dest="$base"; n=0
-  while [[ -e "$dest" ]]; do n=$((n + 1)); dest="$base-$n"; done
-  if "$MV" -n "$SESSION" "$dest" 2>/dev/null && [[ ! -e "$SESSION" && -e "$dest" ]]; then
-    log warn "session.json unreadable; moved to $dest and treated as no session"
+  while [[ -e "$dest" || -L "$dest" ]]; do n=$((n + 1)); dest="$base-$n"; done
+  if "$MV" -n "$SESSION" "$dest" 2>/dev/null && [[ ! -e "$SESSION" && ! -L "$SESSION" ]] && [[ -e "$dest" || -L "$dest" ]]; then
+    log warn "$what; moved to $dest and treated as no session"
     return 0
   fi
-  log error "session.json unreadable and could not be moved to $dest; kept in place"
+  if [[ "$session_state" == unreadable ]]; then
+    log error "$what and could not be moved to $dest; kept in place. Fix its permissions, or remove it if it is not a regular file: $SESSION"
+  else
+    log error "$what and could not be moved to $dest; kept in place"
+  fi
   return 1
-}
-
-# session.json that cannot be read stays exactly where it is: it is never
-# opened again, moved or removed here, because it may have been a valid
-# session and only a person can tell. Exit 1 keeps it visible on every run.
-keep_unreadable_session() {
-  log error "session.json cannot be read ($unreadable_why); left in place. Fix its permissions, or remove it if it is not a regular file: $SESSION"
-  exit 1
 }
 
 case "$session_state" in
@@ -492,9 +494,8 @@ if [[ "$journal_state" != dirty ]]; then
   # Nothing journaled: nothing to undo, and nothing privileged runs.
   if [[ "$session_state" == unreadable ]]; then
     log info "$session_note; nothing journaled to undo"
-    keep_unreadable_session
   fi
-  if [[ "$session_state" == malformed ]]; then
+  if [[ "$session_state" == malformed || "$session_state" == unreadable ]]; then
     quarantine_session || exit 1
     exit 0
   fi
@@ -761,8 +762,7 @@ fi
 
 log info "journal cleared"
 case "$session_state" in
-  malformed)  quarantine_session || exit 1 ;;
-  unreadable) keep_unreadable_session ;;
-  *)          "$RM" -f "$SESSION" ;;
+  malformed|unreadable) quarantine_session || exit 1 ;;
+  *)                    "$RM" -f "$SESSION" ;;
 esac
 exit 0

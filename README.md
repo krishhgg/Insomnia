@@ -182,10 +182,11 @@ anything: the app does this at launch, before restoring whatever the journal
 holds, and says where the file went; the agent does it once the journal is
 clean. A session file that cannot be read at all (permissions, or not a
 regular file, which is never opened) also counts as expired, since its end
-time is unknown: the journal is restored, but the file stays where it is,
-the app says so, the agent logs an error on every run, and a new session
-will not start until the file is fixed or removed. `uninstall.sh --purge`
-removes the renamed copies; without `--purge` they stay.
+time is unknown: the journal is restored and the file is renamed the same
+way without being opened, so a later launch cannot resume a session that
+was treated as ended. The app says where it went. `uninstall.sh --purge`
+removes the renamed copies that are regular files; without `--purge` they
+stay.
 
 **Recovery is not “everything always gets undone.”** The backstop does not
 monitor battery or temperature. Saved audio needs the app to reopen, and

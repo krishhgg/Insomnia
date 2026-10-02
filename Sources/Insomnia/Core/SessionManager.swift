@@ -155,10 +155,10 @@ final class SessionManager {
     /// is announced once, not on every reconcile.
     @ObservationIgnored private var announcedForeignSleep = false
     /// Set by reconcile when session.json could not be read, or was not a
-    /// session and could not be moved aside. The file is evidence then: an
-    /// end, and any retry of it, restores the journal but leaves the file
-    /// where it is. Cleared by the next reconcile, and by a start, whose own
-    /// session.json replaces it.
+    /// session, and could not be moved aside either. The file is evidence
+    /// then: an end, and any retry of it, restores the journal but leaves
+    /// the file where it is. Cleared by the next reconcile, and by a start,
+    /// whose own session.json replaces it.
     @ObservationIgnored private var keepSessionFile = false
 
     init(
@@ -362,8 +362,9 @@ final class SessionManager {
         do {
             sessionBefore = try store.loadSession()
         } catch {
-            // A session.json this start cannot read is never replaced: it may
-            // be a valid session that reconcile keeps as evidence, and a
+            // A session.json this start cannot read is never replaced: it
+            // appeared or lost its permissions after reconcile, or reconcile
+            // could not move it aside. It may be a valid session, and a
             // rollback could not put it back.
             fail("start refused, nothing changed: session.json could not be read (\(error.localizedDescription)). Fix its permissions, or remove it if it is not a regular file, then start again")
             return
@@ -504,7 +505,7 @@ final class SessionManager {
         countdownText = ""
         var deletionError: String?
         if keepSessionFile {
-            Log.info("session.json left in place: reconcile could not read it or move it aside")
+            Log.info("session.json left in place: reconcile could not move it aside")
         } else {
             do {
                 try store.deleteSession()
@@ -1011,15 +1012,11 @@ final class SessionManager {
             // I/O, or not a regular file, which Store never opens). Its end
             // time is unknown, and sleep is never held without a deadline
             // that can be enforced, so it counts as expired: a dirty journal
-            // is restored below. The file stays where it is as evidence; it
-            // may have been a valid session.
-            let detail = error.localizedDescription
-            keepSessionFile = true
-            fail("session.json could not be read (\(detail)); treated as expired and left in place")
-            notifier.post(
-                title: Self.sessionFileTitle,
-                body: "session.json could not be read (\(detail)), so its end time is unknown. Insomnia treats the session as expired and undoes what its journal recorded. The file was left in place; fix its permissions, or remove it if it is not a regular file."
-            )
+            // is restored below. It may have been a valid session, so it is
+            // kept as evidence, renamed aside without being opened. Left
+            // under its own name, a later launch that could read it would
+            // resume the session this one treated as ended.
+            moveAsideSessionThatCannotBeRead(error.localizedDescription)
             onDisk = nil
         }
 
@@ -1124,6 +1121,27 @@ final class SessionManager {
             // and leaves the file for the next launch to move.
             keepSessionFile = true
             fail("session.json unreadable (\(detail)) and could not be moved aside: \(moveError.localizedDescription); left in place and treated as no session")
+        }
+    }
+
+    /// session.json that could not be read at all, renamed without being
+    /// opened; a FIFO or a file without read permission moves the same way.
+    /// The restore of a dirty journal reports its own outcome.
+    private func moveAsideSessionThatCannotBeRead(_ detail: String) {
+        let expired = "session.json could not be read (\(detail)), so its end time is unknown. Insomnia treats the session as expired and undoes what its journal recorded."
+        do {
+            let moved = try store.moveAsideUnreadableSession(now: clock())
+            Log.error("session.json could not be read (\(detail)); treated as expired and moved, unopened, to \(moved.path)")
+            notifier.post(title: Self.sessionFileTitle, body: "\(expired) The file was moved, unopened, to \(moved.path).")
+        } catch let moveError {
+            // Kept, not deleted: an end that runs now restores the journal
+            // and leaves the file, and a start is refused while it is there.
+            keepSessionFile = true
+            fail("session.json could not be read (\(detail)) and could not be moved aside: \(moveError.localizedDescription); treated as expired and left in place")
+            notifier.post(
+                title: Self.sessionFileTitle,
+                body: "\(expired) The file could not be moved aside (\(moveError.localizedDescription)) and was left in place. Fix its permissions, or remove it if it is not a regular file."
+            )
         }
     }
 

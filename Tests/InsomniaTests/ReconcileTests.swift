@@ -405,6 +405,18 @@ final class ReconcileTests: XCTestCase {
         }
     }
 
+    /// Whether anything is at `url`, a dangling symlink included.
+    private func exists(_ url: URL) -> Bool {
+        var info = stat()
+        return lstat(url.path, &info) == 0
+    }
+
+    /// The file type bits of `url` itself (S_IFIFO, S_IFDIR, ...), or 0.
+    private func fileType(_ url: URL) -> mode_t {
+        var info = stat()
+        return lstat(url.path, &info) == 0 ? info.st_mode & S_IFMT : 0
+    }
+
     /// A session.json that is not a session says nothing about what to undo
     /// (the journal does). It is renamed to a timestamped sibling under the
     /// lock, the user is told where, and reconcile goes on as with no
@@ -461,9 +473,10 @@ final class ReconcileTests: XCTestCase {
     /// until a writer appears, and reconcile runs on the main actor under
     /// the recovery lock. Its end time is unknown, and sleep is never held
     /// without a deadline that can be enforced, so it counts as expired:
-    /// the journal is restored. The FIFO itself stays where it is, and the
-    /// error names the file type instead of a permissions problem.
-    func testSessionThatIsAFIFOIsNeverOpenedAndTheJournalIsRestored() async throws {
+    /// the journal is restored. The FIFO is renamed aside, still a FIFO,
+    /// and the notification names the file type instead of a permissions
+    /// problem.
+    func testSessionThatIsAFIFOIsNeverOpenedAndIsMovedAsideWhileTheJournalIsRestored() async throws {
         var st = RuntimeState()
         st.sleepDisabledByUs = true
         try h.store.saveState(st)
@@ -475,25 +488,30 @@ final class ReconcileTests: XCTestCase {
         await m.reconcile()
 
         XCTAssertFalse(fifo.readerSeen, "session.json was opened although it is a FIFO")
-        XCTAssertTrue(fifo.isStillFIFO, "session.json was moved or replaced")
-        XCTAssertEqual(try movedAsideSessions, [])
+        XCTAssertFalse(exists(h.home.paths.sessionFile), "session.json was not moved aside")
+        XCTAssertEqual(try movedAsideSessions, ["session.json.unreadable-20270115T080000Z"])
+        let moved = h.home.paths.appSupport.appendingPathComponent("session.json.unreadable-20270115T080000Z")
+        XCTAssertEqual(fileType(moved), S_IFIFO, "the FIFO was replaced instead of renamed")
         XCTAssertTrue(h.guardFake.calls.contains("disablesleep 0"), "\(h.guardFake.calls)")
         XCTAssertFalse(h.guardFake.sleepDisabled)
         XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
         XCTAssertNil(m.session)
-        XCTAssertTrue(try XCTUnwrap(m.lastError).contains("not a regular file"), m.lastError ?? "")
         let posts = h.notifier.posts.filter { $0.title == SessionManager.sessionFileTitle }
         XCTAssertEqual(posts.count, 1, "\(h.notifier.posts)")
-        XCTAssertTrue(posts.first?.body.contains("treats the session as expired") == true, posts.first?.body ?? "")
-        XCTAssertTrue(posts.first?.body.contains("left in place") == true, posts.first?.body ?? "")
+        let body = posts.first?.body ?? ""
+        XCTAssertTrue(body.contains("not a regular file"), body)
+        XCTAssertTrue(body.contains("treats the session as expired"), body)
+        XCTAssertTrue(body.contains("moved, unopened, to \(moved.path)"), body)
     }
 
     /// A session.json that exists but cannot be read at all (here: it is a
-    /// directory) is handled the same way: the journal is restored, the
-    /// directory is neither moved nor removed, and the user is told. The
-    /// next launch, with nothing journaled, changes nothing.
-    func testSessionThatCannotBeReadAtAllIsTreatedAsExpiredAndLeftInPlace() async throws {
+    /// directory) is handled the same way: the journal is restored and the
+    /// directory is renamed aside with its contents, never removed. The
+    /// next launch, with nothing journaled and no session.json, changes
+    /// nothing.
+    func testSessionThatCannotBeReadAtAllIsTreatedAsExpiredAndMovedAside() async throws {
         try FileManager.default.createDirectory(at: h.home.paths.sessionFile, withIntermediateDirectories: true)
+        try "inside".write(to: h.home.paths.sessionFile.appendingPathComponent("note"), atomically: true, encoding: .utf8)
         var st = RuntimeState()
         st.sleepDisabledByUs = true
         try h.store.saveState(st)
@@ -502,35 +520,38 @@ final class ReconcileTests: XCTestCase {
         let m = h.makeManager()
         await m.reconcile()
 
-        var isDir: ObjCBool = false
-        XCTAssertTrue(FileManager.default.fileExists(atPath: h.home.paths.sessionFile.path, isDirectory: &isDir) && isDir.boolValue, "session.json was moved or removed")
-        XCTAssertEqual(try movedAsideSessions, [])
+        XCTAssertFalse(exists(h.home.paths.sessionFile), "session.json was not moved aside")
+        XCTAssertEqual(try movedAsideSessions, ["session.json.unreadable-20270115T080000Z"])
+        let moved = h.home.paths.appSupport.appendingPathComponent("session.json.unreadable-20270115T080000Z")
+        XCTAssertEqual(try String(contentsOf: moved.appendingPathComponent("note"), encoding: .utf8), "inside")
         XCTAssertTrue(h.guardFake.calls.contains("disablesleep 0"), "\(h.guardFake.calls)")
         XCTAssertFalse(h.guardFake.calls.contains("disablesleep 1"), "\(h.guardFake.calls)")
         XCTAssertFalse(h.guardFake.sleepDisabled)
         XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
-        XCTAssertTrue(try XCTUnwrap(m.lastError).contains("could not be read"), m.lastError ?? "")
-        XCTAssertTrue(try XCTUnwrap(m.lastError).contains("treated as expired and left in place"), m.lastError ?? "")
         let posts = h.notifier.posts.filter { $0.title == SessionManager.sessionFileTitle }
         XCTAssertEqual(posts.count, 1, "\(h.notifier.posts)")
-        XCTAssertTrue(posts.first?.body.contains("left in place") == true, posts.first?.body ?? "")
+        XCTAssertTrue(posts.first?.body.contains("could not be read") == true, posts.first?.body ?? "")
+        XCTAssertTrue(posts.first?.body.contains("moved, unopened, to \(moved.path)") == true, posts.first?.body ?? "")
 
         let callsBefore = h.guardFake.calls.count
         await m.reconcile()
-        XCTAssertTrue(FileManager.default.fileExists(atPath: h.home.paths.sessionFile.path))
+        XCTAssertEqual(try movedAsideSessions, ["session.json.unreadable-20270115T080000Z"])
         XCTAssertFalse(h.guardFake.calls.dropFirst(callsBefore).contains { $0.hasPrefix("disablesleep") }, "\(h.guardFake.calls)")
     }
 
-    /// A regular session.json without read permission: the same, and its
-    /// bytes are untouched.
-    func testSessionWithoutReadPermissionIsTreatedAsExpiredAndLeftInPlace() async throws {
+    /// A valid session without read permission is treated as expired and
+    /// renamed aside with its bytes. The user then quits. When the file is
+    /// readable again with its end still ahead, the next launch must not
+    /// resume the session the first one treated as ended: it is no longer
+    /// named session.json.
+    func testSessionWithoutReadPermissionIsMovedAsideAndNeverResumedOnceReadable() async throws {
         try XCTSkipIf(getuid() == 0, "root reads a mode-000 file")
         let now = h.clock.now
         try h.store.saveSession(Session(startedAt: now, endsAt: now.addingTimeInterval(3600)))
-        let file = h.home.paths.sessionFile
-        let bytes = try Data(contentsOf: file)
-        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: file.path)
-        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: file.path) }
+        let bytes = try Data(contentsOf: h.home.paths.sessionFile)
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: h.home.paths.sessionFile.path)
+        let moved = h.home.paths.appSupport.appendingPathComponent("session.json.unreadable-20270115T080000Z")
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: moved.path) }
         var st = RuntimeState()
         st.sleepDisabledByUs = true
         try h.store.saveState(st)
@@ -543,16 +564,31 @@ final class ReconcileTests: XCTestCase {
         XCTAssertFalse(h.guardFake.calls.contains("disablesleep 1"), "\(h.guardFake.calls)")
         XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
         XCTAssertNil(m.session)
-        XCTAssertEqual(try movedAsideSessions, [])
-        XCTAssertTrue(try XCTUnwrap(m.lastError).contains("could not be read"), m.lastError ?? "")
-        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: file.path)
-        XCTAssertEqual(try Data(contentsOf: file), bytes, "the file was rewritten")
+        XCTAssertFalse(exists(h.home.paths.sessionFile), "session.json was not moved aside")
+        XCTAssertEqual(try movedAsideSessions, ["session.json.unreadable-20270115T080000Z"])
+        let quit = await m.end(reason: .quit)
+        XCTAssertEqual(quit, .restored)
+
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: moved.path)
+        XCTAssertEqual(try Data(contentsOf: moved), bytes, "the file was rewritten")
+        let callsBefore = h.guardFake.calls.count
+        let next = h.makeManager()
+        await next.reconcile()
+        XCTAssertNil(next.session, "a session that was treated as ended came back")
+        XCTAssertFalse(h.guardFake.calls.dropFirst(callsBefore).contains("disablesleep 1"), "\(h.guardFake.calls)")
+        XCTAssertEqual(h.backstop.arms, 0)
     }
 
-    /// An end that does not finish at reconcile, retried later, still
-    /// leaves the file: the retry restores the journal and nothing else.
-    func testRetriedEndKeepsASessionFileThatCouldNotBeRead() async throws {
+    /// When session.json can neither be read nor moved aside (the name it
+    /// would get is taken by a dangling symlink, which the existence check
+    /// does not see and the rename will not replace), it is kept in place
+    /// and the user is told to fix it. An end that does not finish at
+    /// reconcile, retried later, still leaves the file: the retry restores
+    /// the journal and nothing else.
+    func testSessionThatCannotBeReadOrMovedAsideIsKeptThroughARetriedEnd() async throws {
         try FileManager.default.createDirectory(at: h.home.paths.sessionFile, withIntermediateDirectories: true)
+        let taken = h.home.paths.appSupport.appendingPathComponent("session.json.unreadable-20270115T080000Z")
+        try FileManager.default.createSymbolicLink(atPath: taken.path, withDestinationPath: h.home.paths.appSupport.appendingPathComponent("missing").path)
         var st = RuntimeState()
         st.sleepDisabledByUs = true
         try h.store.saveState(st)
@@ -562,25 +598,32 @@ final class ReconcileTests: XCTestCase {
         let m = h.makeManager()
         await m.reconcile()
         XCTAssertEqual(try h.store.loadState()?.sleepDisabledByUs, true, "the failed restore cleared the journal")
+        let posts = h.notifier.posts.filter { $0.title == SessionManager.sessionFileTitle }
+        XCTAssertEqual(posts.count, 1, "\(h.notifier.posts)")
+        let body = posts.first?.body ?? ""
+        XCTAssertTrue(body.contains("treats the session as expired"), body)
+        XCTAssertTrue(body.contains("could not be moved aside"), body)
+        XCTAssertTrue(body.contains("left in place. Fix its permissions"), body)
 
         h.guardFake.throwOn = []
         let outcome = await m.end(reason: .backstop)
 
         XCTAssertEqual(outcome, .restored)
         XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
-        XCTAssertTrue(FileManager.default.fileExists(atPath: h.home.paths.sessionFile.path), "the retry removed session.json")
+        var isDir: ObjCBool = false
+        XCTAssertTrue(FileManager.default.fileExists(atPath: h.home.paths.sessionFile.path, isDirectory: &isDir) && isDir.boolValue, "the retry removed session.json")
     }
 
-    /// A start never replaces a session.json it cannot read: it may be a
-    /// valid session kept as evidence, and a rollback could not restore it.
-    /// The start is refused before anything is written.
+    /// A start never replaces a session.json it cannot read: one that
+    /// appeared after reconcile may be a valid session, and a rollback could
+    /// not restore it. The start is refused before anything is written.
     func testStartIsRefusedWhileSessionCannotBeRead() async throws {
-        try FileManager.default.createDirectory(at: h.home.paths.sessionFile, withIntermediateDirectories: true)
-        try "inside".write(to: h.home.paths.sessionFile.appendingPathComponent("note"), atomically: true, encoding: .utf8)
         try h.store.saveState(RuntimeState())
-
         let m = h.makeManager()
         await m.reconcile()
+        try FileManager.default.createDirectory(at: h.home.paths.sessionFile, withIntermediateDirectories: true)
+        try "inside".write(to: h.home.paths.sessionFile.appendingPathComponent("note"), atomically: true, encoding: .utf8)
+
         await m.start(duration: 3600)
 
         XCTAssertNil(m.session)
