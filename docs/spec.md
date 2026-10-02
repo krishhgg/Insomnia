@@ -307,12 +307,23 @@ provided by the standalone backstop. Performance effects depend on workload.
   `HotspotPasswordProblem`: a warning line in the right-click menu, a notice
   under the password field in Settings, and one notification per outage
   (re-armed on recovery, on stop and when the password is saved). A save in
-  Settings adds the item under the current build; an existing item is
-  deleted and the add repeated, so a failed save leaves the old password in
-  place. Deleting another build's item, and unlocking the keychain for the
-  add, need the prompt, which is allowed only there. `kSecAttrAccessible`
-  is not set: the file-based keychain drops it, and the data protection
-  keychain needs an access-group entitlement.
+  Settings never leaves the user without a password, and it writes to the
+  keychain that holds the item reads find, which need not be the default
+  keychain (a new item goes to the default keychain). An item the build can
+  read already names it, so only the value changes, in place
+  (`SecItemUpdate`). An item it cannot read needs a new access list, and
+  the file-based keychain changes that only by replacing the item (an
+  in-place update of `kSecAttrAccess` did not return when tried on a
+  throwaway keychain): the new password is added beside the old item, in
+  the same keychain, under service `insomnia-hotspot.replacing`; the old
+  item is deleted; the new one is renamed to `insomnia-hotspot`. Reads fall
+  back to the `.replacing` item when the main one is missing or unreadable,
+  so a save that fails or stops at any step leaves the old password or the
+  new one, and a refused delete removes the new item again. Clearing the
+  password deletes both. Deleting another build's item, and unlocking the
+  keychain for a save, need the prompt, which is allowed only there.
+  `kSecAttrAccessible` is not set: the file-based keychain drops it, and
+  the data protection keychain needs an access-group entitlement.
 - macOS 26 requires Location Services permission before CoreWLAN exposes SSIDs
   or returns results for an SSID-filtered scan. Insomnia requests when-in-use
   access when the hotspot is saved or a configured session starts, never at

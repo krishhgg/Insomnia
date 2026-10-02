@@ -42,7 +42,7 @@ struct SettingsView: View {
         // The failover may find the saved password unreadable while the
         // window is open; the notice follows what it reports.
         .onChange(of: manager.services?.status.hotspotPasswordProblem) { _, problem in
-            hotspotNotice = problem?.settingsNotice
+            hotspotNotice = Self.hotspotNotice(reported: problem, reread: secrets.load)
         }
         // The preview depends on the toggle, both lists and what is running:
         // recompute on any config change and whenever an app launches or quits.
@@ -267,16 +267,29 @@ struct SettingsView: View {
     /// leaves the field empty and says why, so the user re-enters it;
     /// saving then replaces the item (see `KeychainStore`).
     private func loadPassword() {
+        (hotspotPassword, hotspotNotice) = Self.loadedPassword(secrets.load)
+    }
+
+    /// A prompt-free load: the password for the field, or an empty field
+    /// and a notice saying why it cannot be shown.
+    static func loadedPassword(_ load: () throws -> String?) -> (password: String, notice: String?) {
         do {
-            hotspotPassword = try secrets.load() ?? ""
-            hotspotNotice = nil
+            return (try load() ?? "", nil)
         } catch let error as KeychainError {
-            hotspotPassword = ""
-            hotspotNotice = error.problem.settingsNotice
+            return ("", error.problem.settingsNotice)
         } catch {
-            hotspotPassword = ""
-            hotspotNotice = HotspotPasswordProblem.error(error.localizedDescription).settingsNotice
+            return ("", HotspotPasswordProblem.error(error.localizedDescription).settingsNotice)
         }
+    }
+
+    /// The notice under the password field. A problem the failover reports
+    /// shows as it is. A cleared report is not taken as "readable": it
+    /// also clears when the session ends, so the keychain is read again,
+    /// without a prompt, and the notice says what that read finds. The
+    /// field is left as the user has it.
+    static func hotspotNotice(reported: HotspotPasswordProblem?, reread: () throws -> String?) -> String? {
+        if let reported { return reported.settingsNotice }
+        return loadedPassword(reread).notice
     }
 
     private func savePassword() {

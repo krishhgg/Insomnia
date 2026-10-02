@@ -226,8 +226,8 @@ gives every install a new identity: after a reinstall the saved password is
 unreadable by the new build. Insomnia then skips the join, shows "Hotspot
 password unreadable by this build" in the right-click menu and in Settings,
 and sends one notification per outage. Enter the password again in Settings
-and save; the save replaces the old item, and macOS may ask you to allow
-Insomnia to delete it. A build signed with a stable identity would keep the
+and save; the save writes the new password before it removes the old item,
+and macOS may ask you to allow Insomnia to delete the old one. A build signed with a stable identity would keep the
 item readable across upgrades.
 
 macOS requires Location Services permission to reveal network names. Insomnia

@@ -182,13 +182,14 @@ enum HotspotPasswordProblem: Equatable, Sendable {
 
 /// The file-based keychain calls this store needs that the SDK marks
 /// deprecated since macOS 10.10 but still ships: the process-wide prompt
-/// switch and the per-item access list. Resolved by name, like the
-/// DisplayServices calls, so the build stays warning-free. They are public
-/// exports of Security.framework.
+/// switch, the per-item access list and the keychain an item lives in.
+/// Resolved by name, like the DisplayServices calls, so the build stays
+/// warning-free. They are public exports of Security.framework.
 enum LegacyKeychain {
     private typealias SetInteraction = @convention(c) (UInt8) -> OSStatus
     private typealias GetInteraction = @convention(c) (UnsafeMutablePointer<UInt8>) -> OSStatus
     private typealias AccessCreate = @convention(c) (CFString, CFArray?, UnsafeMutablePointer<Unmanaged<SecAccess>?>) -> OSStatus
+    private typealias ItemCopyKeychain = @convention(c) (UnsafeRawPointer, UnsafeMutablePointer<Unmanaged<SecKeychain>?>) -> OSStatus
     private typealias TrustedApplicationCreate = @convention(c) (UnsafePointer<CChar>?, UnsafeMutablePointer<Unmanaged<SecTrustedApplication>?>) -> OSStatus
 
     private static func symbol<T>(_ name: String) throws -> T {
@@ -250,6 +251,15 @@ enum LegacyKeychain {
         return allowed
     }
 
+    /// The keychain file an item lives in.
+    static func keychain(of item: CFTypeRef) throws -> SecKeychain {
+        let copy: ItemCopyKeychain = try symbol("SecKeychainItemCopyKeychain")
+        var keychain: Unmanaged<SecKeychain>?
+        let status = copy(Unmanaged.passUnretained(item).toOpaque(), &keychain)
+        guard status == errSecSuccess, let keychain else { throw KeychainError(status: status) }
+        return keychain.takeRetainedValue()
+    }
+
     /// This process's code as a trusted application. Under ad-hoc signing
     /// its designated requirement is the build's cdhash, so an access list
     /// naming it trusts exactly this build.
@@ -273,15 +283,18 @@ enum LegacyKeychain {
     }
 }
 
-/// The three SecItem calls behind `KeychainStore`, as a seam. The app uses
-/// Security's; tests script the status codes and record the call order and
-/// the prompt switch at each call, which covers the paths that need a
-/// prompt in real life (another build's item, a locked keychain) without
-/// raising one.
+/// The SecItem calls behind `KeychainStore`, plus the lookup of the
+/// keychain file an item lives in, as a seam. The app uses Security's;
+/// tests script the status codes and record the call order and the prompt
+/// switch at each call, which covers the paths that need a prompt in real
+/// life (another build's item, a locked keychain) without raising one.
 protocol KeychainItemCalls: Sendable {
     func copyMatching(_ query: CFDictionary, _ result: UnsafeMutablePointer<CFTypeRef?>) -> OSStatus
     func add(_ attributes: CFDictionary) -> OSStatus
+    func update(_ query: CFDictionary, _ attributes: CFDictionary) -> OSStatus
     func delete(_ query: CFDictionary) -> OSStatus
+    /// The keychain file holding `item`, a reference from `copyMatching`.
+    func keychain(of item: CFTypeRef) -> (OSStatus, SecKeychain?)
 }
 
 struct SecurityItemCalls: KeychainItemCalls {
@@ -293,8 +306,22 @@ struct SecurityItemCalls: KeychainItemCalls {
         SecItemAdd(attributes, nil)
     }
 
+    func update(_ query: CFDictionary, _ attributes: CFDictionary) -> OSStatus {
+        SecItemUpdate(query, attributes)
+    }
+
     func delete(_ query: CFDictionary) -> OSStatus {
         SecItemDelete(query)
+    }
+
+    func keychain(of item: CFTypeRef) -> (OSStatus, SecKeychain?) {
+        do {
+            return (errSecSuccess, try LegacyKeychain.keychain(of: item))
+        } catch let error as KeychainError {
+            return (error.status, nil)
+        } catch {
+            return (errSecUnimplemented, nil)
+        }
     }
 }
 
@@ -303,13 +330,21 @@ struct SecurityItemCalls: KeychainItemCalls {
 /// (`LegacyKeychain.thisApplication()`), and every read runs with keychain
 /// prompts forbidden, so the failover never raises a dialog: an item this
 /// build may not open fails with `KeychainError.isUnreadableWithoutPrompt`
-/// and the caller surfaces `HotspotPasswordProblem.unreadable`. Saving adds
-/// the item with this build on the list; an existing item (this build's or
-/// another's) is deleted and the add repeated, so the old password goes
-/// only once the keychain has shown it takes the new one. The prompts a
-/// save may raise, the unlock for the add and the delete of another
-/// build's item, are allowed because a save or clear is the user's own
-/// click in Settings.
+/// and the caller surfaces `HotspotPasswordProblem.unreadable`.
+///
+/// A save never leaves the user without a password, and it writes to the
+/// keychain file that holds the item reads find, which need not be the
+/// default keychain. An item this build can read already names this build
+/// in its access list, so only its value changes, in place. An item it
+/// cannot read (another build's, or a locked keychain) needs a new access
+/// list, and the file-based keychain changes that only by replacing the
+/// item: the new password is added beside it under
+/// `replacementService(for:)`, the old item is deleted, and the new one is
+/// renamed into its place. `get` reads the replacement when the item itself
+/// is missing or unreadable, so a save that fails or is cut off at any step
+/// leaves the old password or the new one. The prompts a save may raise,
+/// the unlock and the delete of another build's item, are allowed because
+/// a save or clear is the user's own click in Settings.
 ///
 /// `kSecAttrAccessible` (this device only, when unlocked) is not set: the
 /// file-based login keychain accepts and drops it (measured on a throwaway
@@ -321,39 +356,150 @@ struct KeychainStore: KeychainStoring, @unchecked Sendable {
     /// What the keychain prompt names if another program asks for the item.
     static let accessDescriptor = "Insomnia hotspot password"
 
-    /// One keychain instead of the login keychain search list. Tests pass a
-    /// throwaway keychain file; the app passes nothing. A CF reference the
-    /// store never mutates, hence the unchecked Sendable.
-    private let keychain: SecKeychain?
-    private let calls: any KeychainItemCalls
+    /// Where a save keeps the new password while it replaces an item this
+    /// build cannot read.
+    static func replacementService(for service: String) -> String {
+        "\(service).replacing"
+    }
 
-    init(keychain: SecKeychain? = nil, calls: any KeychainItemCalls = SecurityItemCalls()) {
-        self.keychain = keychain
+    /// The keychains searched, in order; nil is the user's search list.
+    /// Tests pass throwaway keychain files; the app passes nothing. CF
+    /// references the store never mutates, hence the unchecked Sendable.
+    private let searchList: [SecKeychain]?
+    /// Where an item with no existing copy is added; nil is the default
+    /// keychain.
+    private let newItems: SecKeychain?
+    private let calls: any KeychainItemCalls
+    /// nil is Security's process-wide switch. Tests against a throwaway
+    /// keychain pass one that refuses to allow prompts.
+    private let prompts: LegacyKeychain.PromptSwitch?
+
+    init(
+        keychain: SecKeychain? = nil,
+        calls: any KeychainItemCalls = SecurityItemCalls(),
+        prompts: LegacyKeychain.PromptSwitch? = nil
+    ) {
+        self.init(searchList: keychain.map { [$0] }, newItems: keychain, calls: calls, prompts: prompts)
+    }
+
+    init(
+        searchList: [SecKeychain]?,
+        newItems: SecKeychain?,
+        calls: any KeychainItemCalls = SecurityItemCalls(),
+        prompts: LegacyKeychain.PromptSwitch? = nil
+    ) {
+        self.searchList = searchList
+        self.newItems = newItems
         self.calls = calls
+        self.prompts = prompts
     }
 
     func get(service: String, account: String) throws -> String? {
+        let (status, data) = try read(service: service, account: account)
+        if status == errSecSuccess { return data.map { String(decoding: $0, as: UTF8.self) } }
+        guard status == errSecItemNotFound || KeychainError(status: status).isUnreadableWithoutPrompt else {
+            throw KeychainError(status: status)
+        }
+        // A save that was replacing this item stopped before the rename:
+        // the replacement holds the newer password.
+        let (replacementStatus, replacement) = try read(service: Self.replacementService(for: service), account: account)
+        if replacementStatus == errSecSuccess { return replacement.map { String(decoding: $0, as: UTF8.self) } }
+        if status == errSecItemNotFound {
+            if replacementStatus == errSecItemNotFound { return nil }
+            throw KeychainError(status: replacementStatus)
+        }
+        throw KeychainError(status: status)
+    }
+
+    func set(service: String, account: String, value: String) throws {
+        let data = Data(value.utf8)
+        let (status, _) = try read(service: service, account: account)
+        switch status {
+        case errSecItemNotFound:
+            try add(service: service, account: account, data: data, label: service, to: newItems)
+        case errSecSuccess:
+            // Readable without a prompt, so the access list already names
+            // this build: one in-place change of the value.
+            let holder = try keychainHolding(service: service, account: account)
+            let query = self.query(service: service, account: account, in: holder) as CFDictionary
+            let changes = [kSecValueData as String: data] as CFDictionary
+            let updated = try withPrompts(false) { calls.update(query, changes) }
+            guard updated == errSecSuccess else { throw KeychainError(status: updated) }
+        default:
+            guard KeychainError(status: status).isUnreadableWithoutPrompt else { throw KeychainError(status: status) }
+            try replaceUnreadable(service: service, account: account, data: data)
+            return
+        }
+        // A replacement left by an interrupted save is only read while this
+        // item is missing or unreadable; remove it if that needs no prompt.
+        let leftover = query(service: Self.replacementService(for: service), account: account) as CFDictionary
+        _ = try? withPrompts(false) { calls.delete(leftover) }
+    }
+
+    func delete(service: String, account: String) throws {
+        try deleteItem(service: service, account: account, in: nil)
+        try deleteItem(service: Self.replacementService(for: service), account: account, in: nil)
+    }
+
+    /// Another build's item or a locked keychain. Each step leaves a
+    /// password `get` can find: the old item until the delete succeeds,
+    /// the replacement from then on. A refused delete (the user declined
+    /// the prompt) removes the replacement again and keeps the old item.
+    private func replaceUnreadable(service: String, account: String, data: Data) throws {
+        let holder = try keychainHolding(service: service, account: account)
+        let replacement = Self.replacementService(for: service)
+        try deleteItem(service: replacement, account: account, in: holder)
+        try add(service: replacement, account: account, data: data, label: service, to: holder)
+        do {
+            try deleteItem(service: service, account: account, in: holder)
+        } catch {
+            let added = query(service: replacement, account: account, in: holder) as CFDictionary
+            _ = try? withPrompts(false) { calls.delete(added) }
+            throw error
+        }
+        let renamed = query(service: replacement, account: account, in: holder) as CFDictionary
+        let changes = [kSecAttrService as String: service] as CFDictionary
+        let status = try withPrompts(false) { calls.update(renamed, changes) }
+        guard status == errSecSuccess else { throw KeychainError(status: status) }
+    }
+
+    /// A prompt-free read of one item's value.
+    private func read(service: String, account: String) throws -> (OSStatus, Data?) {
         var query = self.query(service: service, account: account)
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
         var item: CFTypeRef?
-        let status = try LegacyKeychain.withPrompts(false) { calls.copyMatching(query as CFDictionary, &item) }
-        if status == errSecItemNotFound { return nil }
-        guard status == errSecSuccess else { throw KeychainError(status: status) }
-        guard let data = item as? Data else { return nil }
-        return String(decoding: data, as: UTF8.self)
+        let status = try withPrompts(false) { calls.copyMatching(query as CFDictionary, &item) }
+        return (status, item as? Data)
     }
 
-    /// Add first, delete only on a duplicate, then add again: nothing that
-    /// can fail (the access list, the keychain refusing the item) runs
-    /// after the old item is gone, except the repeated add of an item the
-    /// keychain has just accepted.
-    func set(service: String, account: String, value: String) throws {
+    /// The keychain file holding the item a read finds. Only a reference
+    /// is asked for, which needs no prompt even for another build's item.
+    private func keychainHolding(service: String, account: String) throws -> SecKeychain? {
+        var query = self.query(service: service, account: account)
+        query[kSecReturnRef as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        var item: CFTypeRef?
+        let status = try withPrompts(false) { calls.copyMatching(query as CFDictionary, &item) }
+        guard status == errSecSuccess, let item else {
+            throw KeychainError(status: status == errSecSuccess ? errSecItemNotFound : status)
+        }
+        let (lookup, holder) = calls.keychain(of: item)
+        guard lookup == errSecSuccess else { throw KeychainError(status: lookup) }
+        return holder
+    }
+
+    /// Adds with this build on the access list. A locked keychain gets the
+    /// unlock prompt, on the user's own click. `label`, what Keychain Access
+    /// shows, is the item's real service, which a replacement keeps after
+    /// the rename.
+    private func add(service: String, account: String, data: Data, label: String, to keychain: SecKeychain?) throws {
         var attributes: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
-            kSecValueData as String: Data(value.utf8),
+            kSecAttrLabel as String: label,
+            kSecValueData as String: data,
             kSecAttrAccess as String: try LegacyKeychain.access(
                 descriptor: Self.accessDescriptor,
                 trusting: [try LegacyKeychain.thisApplication()]
@@ -361,39 +507,44 @@ struct KeychainStore: KeychainStoring, @unchecked Sendable {
         ]
         if let keychain { attributes[kSecUseKeychain as String] = keychain }
         let item = attributes as CFDictionary
-        var status = try LegacyKeychain.withPrompts(false) { calls.add(item) }
+        var status = try withPrompts(false) { calls.add(item) }
         if KeychainError(status: status).isUnreadableWithoutPrompt {
-            // A locked keychain: the unlock prompt, on the user's own click.
-            status = try LegacyKeychain.withPrompts(true) { calls.add(item) }
-        }
-        if status == errSecDuplicateItem {
-            try delete(service: service, account: account)
-            status = try LegacyKeychain.withPrompts(false) { calls.add(item) }
+            status = try withPrompts(true) { calls.add(item) }
         }
         guard status == errSecSuccess else { throw KeychainError(status: status) }
     }
 
-    func delete(service: String, account: String) throws {
-        let query = self.query(service: service, account: account) as CFDictionary
-        var status = try LegacyKeychain.withPrompts(false) { calls.delete(query) }
+    /// Deletes without a prompt, or with one for another build's item: this
+    /// delete is always the user's own save or clear in Settings.
+    private func deleteItem(service: String, account: String, in holder: SecKeychain?) throws {
+        let query = self.query(service: service, account: account, in: holder) as CFDictionary
+        var status = try withPrompts(false) { calls.delete(query) }
         if KeychainError(status: status).isUnreadableWithoutPrompt {
-            // Another build's item. Only the prompt can remove it, and this
-            // delete is the user's own save or clear in Settings.
-            status = try LegacyKeychain.withPrompts(true) { calls.delete(query) }
+            status = try withPrompts(true) { calls.delete(query) }
         }
         guard status == errSecSuccess || status == errSecItemNotFound else {
             throw KeychainError(status: status)
         }
     }
 
-    private func query(service: String, account: String) -> [String: Any] {
+    /// `holder` narrows the search to the keychain that holds the item;
+    /// otherwise the store's search list applies.
+    private func query(service: String, account: String, in holder: SecKeychain? = nil) -> [String: Any] {
         var query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
         ]
-        if let keychain { query[kSecMatchSearchList as String] = [keychain] }
+        if let holder {
+            query[kSecMatchSearchList as String] = [holder]
+        } else if let searchList {
+            query[kSecMatchSearchList as String] = searchList
+        }
         return query
+    }
+
+    private func withPrompts<T>(_ allowed: Bool, _ body: () throws -> T) throws -> T {
+        try LegacyKeychain.withPrompts(allowed, using: prompts, body)
     }
 }
 
@@ -574,12 +725,15 @@ final class NetworkFailover {
     }
 
     /// Runs `operation` in a task that `stop()` cancels.
-    private func track(_ operation: @escaping @MainActor () async -> Void) {
+    @discardableResult
+    private func track(_ operation: @escaping @MainActor () async -> Void) -> Task<Void, Never> {
         let id = UUID()
-        inflight[id] = Task { @MainActor [weak self] in
+        let task = Task { @MainActor [weak self] in
             await operation()
             self?.inflight[id] = nil
         }
+        inflight[id] = task
+        return task
     }
 
     private func process(satisfied: Bool) async {
@@ -592,11 +746,13 @@ final class NetworkFailover {
     }
 
     /// What the retry timer calls. Internal so tests can exercise the
-    /// driver-owned join/retry task without waiting for a real timer.
-    func fireTimer() {
+    /// driver-owned join/retry task without waiting for a real timer; the
+    /// task is returned so a test can await the tick it fired.
+    @discardableResult
+    func fireTimer() -> Task<Void, Never> {
         retryTimer = nil
         let outputs = machine.timerFired(at: clock())
-        track { [weak self] in await self?.apply(outputs) }
+        return track { [weak self] in await self?.apply(outputs) }
     }
 
     private func apply(_ outputs: [FailoverMachine.Output]) async {

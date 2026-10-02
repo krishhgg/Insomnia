@@ -234,16 +234,14 @@ final class NetworkFailoverDriverTests: XCTestCase {
         await n.simulate(satisfied: false)
         for _ in 0..<3 {
             clock.advance(30)
-            n.fireTimer()
-            await settleQueuedRequests()
+            await n.fireTimer().value
         }
 
         XCTAssertEqual(joiner.calls, [])
         XCTAssertEqual(n.passwordProblem, .missing)
         XCTAssertEqual(published.value, [.missing])
-        XCTAssertEqual(notifier.posts.count, 1)
-        XCTAssertEqual(notifier.posts[0].title, "Hotspot not joined")
-        XCTAssertEqual(notifier.posts[0].body, "No hotspot password is saved. Enter it in Settings.")
+        XCTAssertEqual(notifier.posts.map(\.title), ["Hotspot not joined"])
+        XCTAssertEqual(notifier.posts.map(\.body), ["No hotspot password is saved. Enter it in Settings."])
     }
 
     /// The item exists but belongs to another build (the keychain refuses
@@ -262,7 +260,7 @@ final class NetworkFailoverDriverTests: XCTestCase {
         XCTAssertEqual(n.passwordProblem, .unreadable)
         XCTAssertEqual(n.passwordProblem?.menuLine, "\u{26A0} Hotspot password unreadable by this build: enter it again in Settings")
         XCTAssertEqual(notifier.posts.map(\.body), [HotspotPasswordProblem.unreadable.explanation])
-        XCTAssertTrue(notifier.posts[0].body.contains("Enter it again in Settings"))
+        XCTAssertTrue(HotspotPasswordProblem.unreadable.explanation.contains("Enter it again in Settings"))
     }
 
     /// Saving in Settings clears the problem at once, and a read that then
@@ -324,8 +322,7 @@ final class NetworkFailoverDriverTests: XCTestCase {
         await n.simulate(satisfied: false)
         for _ in 0..<2 {
             clock.advance(30)
-            n.fireTimer()
-            await settleQueuedRequests()
+            await n.fireTimer().value
         }
         XCTAssertEqual(skipped(), 1)
 
@@ -335,8 +332,7 @@ final class NetworkFailoverDriverTests: XCTestCase {
 
         await n.simulate(satisfied: false)
         clock.advance(30)
-        n.fireTimer()
-        await settleQueuedRequests()
+        await n.fireTimer().value
         XCTAssertEqual(skipped(), 2)
         XCTAssertEqual(joiner.calls, [])
     }
