@@ -215,37 +215,38 @@ final class LidActions {
             candidates.append(FrozenProcess(pid: pid, identity: identity))
         }
         guard !candidates.isEmpty else { return }
-        let candidatePids = Set(candidates.map(\.pid))
-        // Journal first, but without identity: an entry with no identity is
-        // never resumed by the app or backstop.sh, so until the kernel has
-        // said which pids it actually stopped the journal claims none of
-        // them. Identity is added below only for the confirmed stops.
-        let provisional = candidates.map { FrozenProcess(pid: $0.pid, identity: nil) }
+        // Journal first, with identity. The entry that later proves a stop
+        // was ours (pid, start time to the microsecond, boot session) has
+        // to be on disk before the signal; if the write fails nothing is
+        // signaled, so no process is ever stopped without a record that
+        // can resume it.
         do {
             try manager.journal { s in
-                s.frozenProcesses.append(contentsOf: provisional)
+                s.frozenProcesses.append(contentsOf: candidates)
                 if docker { s.dockerFrozen = true }
             }
         } catch {
-            Log.error("could not journal freeze of \(group.bundleId): \(error.localizedDescription); left running")
+            Log.error("could not journal freeze of \(group.bundleId): \(error.localizedDescription); \(candidates.count) pid(s) left running")
             return
         }
         let report = freezer.suspend(candidates, expectedParents: group.expectedParents)
-        // One write replaces the provisional entries: confirmed stops gain
-        // their identity, skipped pids (already stopped, gone, reparented,
-        // reused) leave. If this write fails the provisional entries stay
-        // on disk, still without identity, so nothing later resumes them;
-        // any that really are stopped are reported for manual recovery.
-        let suspended = Set(report.suspended)
-        let confirmed = candidates.filter { suspended.contains($0.pid) }
-        do {
-            try manager.journal { s in
-                s.frozenProcesses.removeAll { candidatePids.contains($0.pid) }
-                s.frozenProcesses.append(contentsOf: confirmed)
-                if docker, confirmed.isEmpty { s.dockerFrozen = false }
+        // Pids the kernel would not stop (already stopped, gone, reparented,
+        // reused) leave the journal so a later resume does not claim them.
+        // If that write fails they stay journaled with identity: resume
+        // still re-checks identity and the stopped state before any
+        // SIGCONT, which rules out gone and reused pids but not one that
+        // somebody else stopped. The stopped pids stay resumable either way.
+        let skipped = Set(report.skipped)
+        if !skipped.isEmpty {
+            do {
+                try manager.journal { s in
+                    s.frozenProcesses.removeAll { skipped.contains($0.pid) }
+                    if docker, report.suspended.isEmpty { s.dockerFrozen = false }
+                }
+            } catch {
+                let list = report.skipped.map(String.init).joined(separator: ", ")
+                Log.error("could not drop skipped pid(s) \(list) of \(group.bundleId) from the journal: \(error.localizedDescription); they stay journaled with identity and are only resumed if still stopped with the same identity")
             }
-        } catch {
-            Log.error("could not confirm freeze of \(group.bundleId) in the journal: \(error.localizedDescription); \(candidates.count) pid(s) stay journaled without identity and will not be resumed automatically")
         }
         Log.info("froze \(group.name) (\(report.suspended.count) pid(s), \(report.skipped.count) skipped)")
     }

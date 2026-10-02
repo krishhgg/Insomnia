@@ -118,6 +118,8 @@ is performed. Do not replace "not run" with "passed" based on source review.
 | Lid-close/open and safe recovery of explicitly selected test processes | Not run |
 | Lid-close display/keyboard darkening and restore | Not run |
 | Freeze-all scope with agents running (Cursor/T3 Code/Claude untouched) | Not run |
+| Freeze-all off on a fresh config.json (list only) and on with a terminal, a non-Chrome browser and a JetBrains IDE open (all untouched) | Not run |
+| Lid close with a read-only state.json: no process stopped, every app logged as left running | Not run |
 | Simulated lid close/open via scripts/simulate-lid.sh | Not run |
 | Existing Low Power Mode preference and saved audio restoration | Not run |
 | Docker Desktop idle/busy behavior with another Docker context selected | Not run |

@@ -157,30 +157,35 @@ final class FreezerTests: XCTestCase {
 
     func testLidCloseScopeIncludesRegularAppsThatAreNotDenied() {
         var c = Config()
+        c.freezeAllApps = true
         c.freezeList = ["com.tinyspeck.slackmacgap"]
         XCTAssertEqual(scope(c, apps + [wispr, figma]), ["com.tinyspeck.slackmacgap", "com.figma.Desktop", "com.electron.wispr-flow"])
     }
 
     func testLidCloseScopeExcludesAccessoryAndProhibitedApps() {
         var c = Config()
+        c.freezeAllApps = true
         c.freezeList = []
         XCTAssertEqual(scope(c, [wispr, bartender, daemon]), ["com.electron.wispr-flow"])
     }
 
     func testLidCloseScopeExcludesAppsWithoutBundleId() {
         var c = Config()
+        c.freezeAllApps = true
         c.freezeList = []
         XCTAssertEqual(scope(c, [nameless, wispr]), ["com.electron.wispr-flow"])
     }
 
     func testLidCloseScopeExcludesApple() {
         var c = Config()
+        c.freezeAllApps = true
         c.freezeList = []
         XCTAssertEqual(scope(c, [RunningApp(pid: 200, bundleId: "com.apple.Safari", name: "Safari"), RunningApp(pid: 201, bundleId: "com.apple.Notes", name: "Notes")]), [])
     }
 
     func testLidCloseScopeExcludesSelf() {
         var c = Config()
+        c.freezeAllApps = true
         c.freezeList = []
         XCTAssertEqual(scope(c, [RunningApp(pid: 300, bundleId: Paths.bundleIdentifier, name: "Insomnia")]), [])
         let other = RunningApp(pid: 301, bundleId: "dev.other.insomnia", name: "Insomnia")
@@ -190,6 +195,7 @@ final class FreezerTests: XCTestCase {
 
     func testLidCloseScopeExcludesDockerDesktop() {
         var c = Config()
+        c.freezeAllApps = true
         c.freezeList = []
         c.agentList = []
         let desktopUI = RunningApp(pid: 401, bundleId: "com.electron.dockerdesktop", name: "Docker Desktop")
@@ -198,6 +204,7 @@ final class FreezerTests: XCTestCase {
 
     func testLidCloseScopeExcludesAgentListEvenWhenOnFreezeList() {
         var c = Config()
+        c.freezeAllApps = true
         c.freezeList = ["com.electron.wispr-flow"]
         c.agentList = ["com.electron.wispr-flow"]
         let ids = scope(c, [wispr, figma])
@@ -210,6 +217,7 @@ final class FreezerTests: XCTestCase {
     func testBuiltInProtectedIsExcludedAutomaticallyButIncludedWhenOnFreezeList() {
         XCTAssertTrue(FreezePlanner.builtInProtected.contains("com.openai.codex"))
         var c = Config()
+        c.freezeAllApps = true
         c.freezeList = []
         c.agentList = []
         XCTAssertEqual(scope(c, [chatGPT, wispr]), ["com.electron.wispr-flow"])
@@ -218,16 +226,56 @@ final class FreezerTests: XCTestCase {
     }
 
     func testBuiltInProtectedCoversVerifiedIdsAndNoneIsApple() {
-        for id in ["com.microsoft.VSCode", "com.todesktop.230313mzl4w4u92", "dev.zed.Zed", "com.anthropic.claudefordesktop",
-                   "io.tailscale.ipn.macsys", "ai.elementlabs.lmstudio", "com.electron.ollama", "com.t3tools.t3code",
-                   "com.mitchellh.ghostty", "company.thebrowser.Browser", "com.google.Chrome"] {
-            XCTAssertTrue(FreezePlanner.builtInProtected.contains(id), id)
+        for id in ["com.microsoft.VSCode", "com.microsoft.VSCodeInsiders", "com.vscodium", "com.todesktop.230313mzl4w4u92",
+                   "com.exafunction.windsurf", "dev.zed.Zed", "com.google.antigravity", "com.google.antigravity-ide",
+                   "com.google.android.studio", "com.sublimetext.4", "com.panic.Nova", "com.anthropic.claudefordesktop",
+                   "com.openai.codex", "com.conductor.app", "com.t3tools.t3code", "com.t3tools.t3code.reasoning",
+                   "dev.warp.Warp-Stable", "com.mitchellh.ghostty", "com.googlecode.iterm2", "org.alacritty",
+                   "net.kovidgoyal.kitty", "com.github.wez.wezterm", "org.tabby", "co.zeit.hyper",
+                   "company.thebrowser.Browser", "com.google.Chrome", "org.chromium.Chromium", "com.microsoft.edgemac",
+                   "com.brave.Browser", "com.vivaldi.Vivaldi", "com.operasoftware.Opera", "org.mozilla.firefox",
+                   "org.mozilla.firefoxdeveloperedition", "org.mozilla.nightly", "app.zen-browser.zen",
+                   "io.tailscale.ipn.macsys", "ai.elementlabs.lmstudio", "com.electron.ollama", "com.electron.dockerdesktop",
+                   "com.1password.1password", "com.bitwarden.desktop", "com.postgresapp.Postgres2", "dev.kdrag0n.MacVirt"] {
+            XCTAssertTrue(FreezePlanner.isBuiltInProtected(id), id)
         }
+        XCTAssertFalse(FreezePlanner.isBuiltInProtected("dev.orbstack.OrbStack"), "OrbStack's real id is dev.kdrag0n.MacVirt; the guessed one must not linger")
         XCTAssertFalse(FreezePlanner.builtInProtected.contains { $0.hasPrefix("com.apple.") })
+        XCTAssertFalse(FreezePlanner.builtInProtectedPrefixes.contains { $0.hasPrefix("com.apple.") })
+    }
+
+    /// JetBrains ships one bundle id per product under `com.jetbrains.`;
+    /// the prefix covers all of them, and only them.
+    func testJetBrainsIDEsAreProtectedByPrefix() {
+        for id in ["com.jetbrains.intellij", "com.jetbrains.intellij.ce", "com.jetbrains.pycharm", "com.jetbrains.pycharm.ce",
+                   "com.jetbrains.WebStorm", "com.jetbrains.goland", "com.jetbrains.CLion", "com.jetbrains.rider",
+                   "com.jetbrains.PhpStorm", "com.jetbrains.rubymine", "com.jetbrains.datagrip"] {
+            XCTAssertTrue(FreezePlanner.isBuiltInProtected(id), id)
+        }
+        XCTAssertFalse(FreezePlanner.isBuiltInProtected("com.jetbrainsfan.app"))
+        XCTAssertFalse(FreezePlanner.isBuiltInProtected("com.jetbrains"))
+        var c = Config()
+        c.freezeAllApps = true
+        c.freezeList = []
+        c.agentList = []
+        let idea = RunningApp(pid: 1100, bundleId: "com.jetbrains.intellij", name: "IntelliJ IDEA")
+        XCTAssertEqual(scope(c, [idea, wispr]), ["com.electron.wispr-flow"])
+        c.freezeList = ["com.jetbrains.intellij"]
+        XCTAssertEqual(scope(c, [idea, wispr]), ["com.jetbrains.intellij", "com.electron.wispr-flow"], "an explicit entry overrides the prefix")
+    }
+
+    /// A fresh config does not opt in to the automatic scope: with Dock
+    /// apps running, the lid-close scope is the freeze list alone.
+    func testLidCloseScopeIsTheFreezeListOnlyByDefault() {
+        let c = Config()
+        XCTAssertFalse(c.freezeAllApps)
+        XCTAssertEqual(scope(c, apps + [wispr, figma]), Config.defaultFreezeList)
+        XCTAssertEqual(FreezePlanner.automaticCandidates(config: c, apps: apps + [wispr, figma]), [])
     }
 
     func testLidCloseScopeIsExplicitFirstThenAlphabeticalByName() {
         var c = Config()
+        c.freezeAllApps = true
         c.freezeList = ["net.whatsapp.WhatsApp", "com.tinyspeck.slackmacgap"]
         let arq = RunningApp(pid: 1000, bundleId: "com.haystack.arq", name: "arq")
         let zoom = RunningApp(pid: 1001, bundleId: "us.zoom.xos", name: "zoom.us")
@@ -239,6 +287,7 @@ final class FreezerTests: XCTestCase {
 
     func testLidCloseScopeMergesDuplicates() {
         var c = Config()
+        c.freezeAllApps = true
         c.freezeList = ["com.figma.Desktop", "com.figma.Desktop", "com.tinyspeck.slackmacgap"]
         let second = RunningApp(pid: 601, bundleId: "com.electron.wispr-flow", name: "Wispr Flow")
         let figmaAgain = RunningApp(pid: 701, bundleId: "com.figma.Desktop", name: "Figma")
@@ -255,6 +304,7 @@ final class FreezerTests: XCTestCase {
     /// `plan(config:)` is the lid-close scope turned into process groups.
     func testFakeFreezerPlanConfigCoversTheLidCloseScope() {
         var c = Config()
+        c.freezeAllApps = true
         c.freezeList = ["com.tinyspeck.slackmacgap"]
         let procs = processes + [ProcessEntry(pid: 600, ppid: 1, startedAt: 6000), ProcessEntry(pid: 900, ppid: 1, startedAt: 9000)]
         let f = FakeFreezer(apps: apps + [wispr, bartender], processes: procs, control: FakeProcessControl())

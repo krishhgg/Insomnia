@@ -21,11 +21,11 @@ struct ProcessIdentity: Codable, Equatable, Hashable, Sendable {
     }
 }
 
-/// One journaled SIGSTOP. `identity` is nil for entries written by an older
-/// build as `frozenPids`, which recorded the pid alone, and for provisional
-/// entries `LidActions.freeze` writes before the kernel has confirmed the
-/// stop. Either way such an entry is never signaled, because nothing proves
-/// the stopped process is ours.
+/// One journaled SIGSTOP. `LidActions.freeze` writes the entry, identity
+/// included, before the signal. `identity` is nil only for entries written
+/// by an older build as `frozenPids`, which recorded the pid alone; such an
+/// entry is never signaled, because nothing proves the stopped process is
+/// ours.
 struct FrozenProcess: Codable, Equatable, Hashable, Sendable {
     let pid: Int32
     let identity: ProcessIdentity?

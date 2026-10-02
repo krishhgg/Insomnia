@@ -680,7 +680,7 @@ final class SessionManager {
             }
             if !report.unverifiable.isEmpty {
                 let list = report.unverifiable.map(String.init).joined(separator: ", ")
-                fail("pid(s) \(list) are stopped but journaled without identity (a legacy entry from an older build, or a freeze interrupted before the kernel confirmed the stop), so Insomnia cannot prove it froze them and will not resume them. Check each one first, for example `ps -o pid,stat,lstart,command -p <pid>`, and only if it is a process you expected Insomnia to freeze run `kill -CONT <pid>`; the entry stays in the journal until resumed or gone")
+                fail("pid(s) \(list) are stopped but journaled without identity (an entry from an older build that recorded the pid alone), so Insomnia cannot prove it froze them and will not resume them. Check each one first, for example `ps -o pid,stat,lstart,command -p <pid>`, and only if it is a process you expected Insomnia to freeze run `kill -CONT <pid>`; the entry stays in the journal until resumed or gone")
             }
         } else if state.dockerFrozen {
             try? journal { $0.dockerFrozen = false }

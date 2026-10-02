@@ -78,58 +78,92 @@ enum FreezePlanner {
 
     /// Apps the automatic lid-close scope (`Config.freezeAllApps`) leaves
     /// alone even when they are not on the agent list: agent hosts, editors,
-    /// terminals, browsers agents drive, VPN and local model runtimes. Code
-    /// level, not persisted, because an existing config.json already carries
-    /// its own agent list and new defaults never reach it. An explicit
-    /// freeze-list entry overrides this set; the hard denylist does not.
+    /// terminals, browsers, password managers, local databases, VPN and
+    /// local model runtimes. Code level, not persisted, because an existing
+    /// config.json already carries its own agent list and new defaults never
+    /// reach it. An explicit freeze-list entry overrides this set; the hard
+    /// denylist does not. Membership is checked with `isBuiltInProtected`,
+    /// which also matches `builtInProtectedPrefixes`.
+    ///
+    /// Every id is verified. "installed" means read from the app's
+    /// Info.plist on a Mac that has it (`defaults read .../Info.plist
+    /// CFBundleIdentifier`); "cask" means the quit or zap stanza of the
+    /// named Homebrew cask (`brew info --cask --json=v2 <cask>`), read on
+    /// October 1, 2026. Apple's own apps are covered by the `com.apple.`
+    /// rule in `isDenied` and do not belong here.
     static let builtInProtected: Set<String> = [
-        // Editors and agent hosts (verified bundle ids)
-        "com.microsoft.VSCode",             // Visual Studio Code
-        "com.todesktop.230313mzl4w4u92",    // Cursor
-        "dev.zed.Zed",                      // Zed
-        "com.google.antigravity",           // Antigravity
-        "com.anthropic.claudefordesktop",   // Claude
-        "com.openai.codex",                 // ChatGPT (hosts Codex and computer use)
-        "com.conductor.app",                // Conductor
-        "com.t3tools.t3code",               // T3 Code (Nightly)
-        "com.t3tools.t3code.reasoning",     // T3 Code (Reasoning)
+        // Editors and agent hosts
+        "com.microsoft.VSCode",             // Visual Studio Code (installed)
+        "com.microsoft.VSCodeInsiders",     // Visual Studio Code Insiders (cask visual-studio-code@insiders)
+        "com.vscodium",                     // VSCodium (cask vscodium)
+        "com.todesktop.230313mzl4w4u92",    // Cursor (installed)
+        "com.exafunction.windsurf",         // Windsurf (cask devin-desktop, formerly windsurf)
+        "dev.zed.Zed",                      // Zed (installed)
+        "com.google.antigravity",           // Antigravity (installed)
+        "com.google.antigravity-ide",       // Antigravity IDE (installed)
+        "com.google.android.studio",        // Android Studio (cask android-studio)
+        "com.sublimetext.4",                // Sublime Text 4 (cask sublime-text)
+        "com.sublimetext.3",                // Sublime Text 3 (cask sublime-text, zap stanza)
+        "com.panic.Nova",                   // Nova (cask nova)
+        "com.anthropic.claudefordesktop",   // Claude (installed)
+        "com.openai.codex",                 // ChatGPT (hosts Codex and computer use; installed)
+        "com.conductor.app",                // Conductor (installed)
+        "com.t3tools.t3code",               // T3 Code (Nightly; installed)
+        "com.t3tools.t3code.reasoning",     // T3 Code (Reasoning; installed)
         // Terminals
-        "dev.warp.Warp-Stable",             // Warp
-        "com.mitchellh.ghostty",            // Ghostty
-        "com.googlecode.iterm2",            // iTerm2
+        "dev.warp.Warp-Stable",             // Warp (installed)
+        "com.mitchellh.ghostty",            // Ghostty (installed)
+        "com.googlecode.iterm2",            // iTerm2 (installed)
+        "org.alacritty",                    // Alacritty (cask alacritty)
+        "net.kovidgoyal.kitty",             // kitty (cask kitty)
+        "com.github.wez.wezterm",           // WezTerm (cask wezterm)
+        "org.tabby",                        // Tabby (cask tabby)
+        "co.zeit.hyper",                    // Hyper (cask hyper)
         // Browsers agents drive
-        "company.thebrowser.Browser",       // Arc
-        "com.google.Chrome",                // Google Chrome
-        "org.chromium.Chromium",            // Chromium
+        "company.thebrowser.Browser",       // Arc (installed)
+        "com.google.Chrome",                // Google Chrome (installed)
+        "org.chromium.Chromium",            // Chromium (cask chromium)
+        "com.microsoft.edgemac",            // Microsoft Edge (cask microsoft-edge)
+        "com.brave.Browser",                // Brave (cask brave-browser)
+        "com.vivaldi.Vivaldi",              // Vivaldi (cask vivaldi)
+        "com.operasoftware.Opera",          // Opera (cask opera)
+        "org.mozilla.firefox",              // Firefox (cask firefox)
+        "org.mozilla.firefoxdeveloperedition", // Firefox Developer Edition (cask firefox@developer-edition)
+        "org.mozilla.nightly",              // Firefox Nightly (cask firefox@nightly)
+        "app.zen-browser.zen",              // Zen (cask zen)
         // VPN and local model runtimes
-        "io.tailscale.ipn.macsys",          // Tailscale
-        "ai.elementlabs.lmstudio",          // LM Studio
-        "com.electron.ollama",              // Ollama
+        "io.tailscale.ipn.macsys",          // Tailscale (installed)
+        "ai.elementlabs.lmstudio",          // LM Studio (installed)
+        "com.electron.ollama",              // Ollama (cask ollama-app)
         // Docker Desktop's Electron front end registers under its own id
-        // (observed running alongside com.docker.docker); the Docker rule
-        // owns the whole tree, the automatic scope must not.
-        "com.electron.dockerdesktop",       // Docker Desktop UI
-        // Dock apps that host services agents depend on (SSH agent, local
-        // databases, container runtimes). Unverified ids, see below.
-        "com.1password.1password",          // 1Password (SSH agent lives in the app; unverified)
-        "com.bitwarden.desktop",            // Bitwarden (unverified)
-        "com.postgresapp.Postgres2",        // Postgres.app (unverified)
-        "dev.orbstack.OrbStack",            // OrbStack (unverified)
-        // Unverified: bundle ids taken from vendor documentation, not from a
-        // running copy on this machine.
-        "com.exafunction.windsurf",         // Windsurf (unverified)
-        "com.jetbrains.intellij",           // IntelliJ IDEA (unverified)
-        "com.jetbrains.pycharm",            // PyCharm (unverified)
-        "com.jetbrains.WebStorm",           // WebStorm (unverified)
-        "com.jetbrains.goland",             // GoLand (unverified)
-        "com.jetbrains.CLion",              // CLion (unverified)
-        "com.jetbrains.rider",              // Rider (unverified)
-        "com.jetbrains.PhpStorm",           // PhpStorm (unverified)
+        // (installed, inside Docker.app); the Docker rule owns the whole
+        // tree, the automatic scope must not.
+        "com.electron.dockerdesktop",       // Docker Desktop UI (installed)
+        // Dock apps that host services agents depend on: SSH agents, local
+        // databases, container runtimes.
+        "com.1password.1password",          // 1Password (cask 1password)
+        "com.bitwarden.desktop",            // Bitwarden (cask bitwarden)
+        "com.postgresapp.Postgres2",        // Postgres.app (cask postgres-app)
+        "dev.kdrag0n.MacVirt",              // OrbStack (cask orbstack)
     ]
+
+    /// Bundle-id prefixes protected the same way. Every JetBrains IDE is
+    /// `com.jetbrains.<product>` (cask intellij-idea com.jetbrains.intellij,
+    /// pycharm com.jetbrains.pycharm, webstorm com.jetbrains.WebStorm,
+    /// goland com.jetbrains.goland, clion com.jetbrains.CLion, rider
+    /// com.jetbrains.rider, phpstorm com.jetbrains.PhpStorm, rubymine
+    /// com.jetbrains.rubymine, datagrip com.jetbrains.datagrip; the
+    /// Community editions add `.ce`), so one prefix covers the family.
+    static let builtInProtectedPrefixes: [String] = ["com.jetbrains."]
+
+    static func isBuiltInProtected(_ bundleId: String) -> Bool {
+        builtInProtected.contains(bundleId) || builtInProtectedPrefixes.contains { bundleId.hasPrefix($0) }
+    }
 
     /// Dock apps the automatic scope would freeze right now, sorted by name
     /// and de-duplicated by bundle id: `activationPolicy == .regular` with a
-    /// bundle id, minus the hard denylist, minus `builtInProtected`, minus
+    /// bundle id, minus the hard denylist, minus the built-in protected
+    /// apps (`isBuiltInProtected`), minus
     /// anything already on the explicit freeze list. Empty when the toggle
     /// is off. Accessory (menu-bar) apps are never picked up; put them on
     /// the freeze list by hand.
@@ -140,7 +174,7 @@ enum FreezePlanner {
         var out: [RunningApp] = []
         for app in apps where app.activationPolicy == .regular {
             guard let id = app.bundleId, !seen.contains(id), !explicit.contains(id) else { continue }
-            guard !isDenied(id, config: config, selfBundleId: selfBundleId), !builtInProtected.contains(id) else { continue }
+            guard !isDenied(id, config: config, selfBundleId: selfBundleId), !isBuiltInProtected(id) else { continue }
             seen.insert(id)
             out.append(app)
         }
