@@ -15,6 +15,12 @@ The installer grants the user account passwordless access to four exact pmset
 commands listed in the README. This grant is not exclusive to the Insomnia app:
 other processes running as that user can invoke them too. The app is not
 sandboxed; local logs can contain SSIDs, process metadata, and tmux target names.
+The lines the app writes to `insomnia.log` also reach the unified log with the
+body marked private, so programs reading `log show` see `<private>` instead of
+those names unless private data logging is enabled on the Mac. Location
+Services access is requested only when a hotspot is saved or a session starts
+with one configured; it is used to read Wi-Fi network names and the app never
+requests location updates.
 
 The hotspot password is a generic-password item in the login Keychain
 (service `insomnia-hotspot`). Its access list names only the Insomnia build
