@@ -78,8 +78,11 @@ turn sleep back on and toggle Low Power Mode on battery, and nothing else; the
 command that keeps the Mac awake, `pmset -a disablesleep 1`, always goes
 through the standard macOS administrator password dialog. A reinstall over an
 older install replaces the file, so the old `disablesleep 1` line is removed.
-If an upgrade stops because the running app will not quit, the old build stays
-and the installer puts that line back for it until the next successful run.
+The installer never writes that line, on any path. It quits a running
+Insomnia before it asks for the password and stops with nothing changed if the
+app will not quit. If it stops after writing the rule but before replacing the
+app, an older build left installed cannot start a session until you rerun
+`./scripts/install.sh`, and the installer says so.
 Insomnia is not sandboxed. The app, scripts, and journals are local; hotspot
 passwords use the login Keychain, not the configuration file.
 

@@ -1,9 +1,9 @@
 #!/bin/bash
 # Build Insomnia, assemble ~/Applications/Insomnia.app, install the backstop
-# script + LaunchAgent, and write the sudoers rule. Idempotent; asks for sudo
-# once (for /etc/sudoers.d/insomnia), before anything of a previous install
-# is touched. Not atomic: a failure after the sudoers step says exactly what
-# was replaced so far.
+# script + LaunchAgent, and write the sudoers rule. Idempotent; quits a
+# running Insomnia, then asks for sudo once (for /etc/sudoers.d/insomnia),
+# before anything of a previous install is touched. Not atomic: a failure
+# after the sudoers step says exactly what was replaced so far.
 set -euo pipefail
 
 # Installation always uses the standard per-user layout. A relocated
@@ -50,40 +50,67 @@ cd "$ROOT"
 BIN="$("$SWIFT" build -c release --show-bin-path)/Insomnia"
 [[ -x "$BIN" ]] || { echo "binary not found at $BIN" >&2; exit 1; }
 
-# 2. sudoers -----------------------------------------------------------------
-#    The password prompt comes first: until the rule is installed and proven
-#    effective, the running app is not asked to quit and neither the bundle,
-#    the installed backstop.sh nor the LaunchAgent are touched.
+# 2. Quit, then sudoers ------------------------------------------------------
+#    The running app is asked to quit before anything else, so an app that
+#    refuses leaves everything as it was, the sudoers file included. Then the
+#    password prompt: until the rule is installed and proven effective,
+#    neither the bundle, the installed backstop.sh nor the LaunchAgent are
+#    touched.
 #    Three commands, and none of them can keep the Mac awake: turning sleep
 #    back on and the battery Low Power Mode floor stay passwordless so the
 #    app, backstop.sh and uninstall.sh can recover unattended. Turning sleep
-#    off (`pmset -a disablesleep 1`) has no line here; the app asks for the
-#    administrator password each time a session starts. The file is always
-#    rewritten, so a reinstall over an older four-line rule drops that line.
+#    off (`pmset -a disablesleep 1`) has no line here, on any path; the app
+#    asks for the administrator password each time a session starts. The
+#    file is always rewritten, so a reinstall over an older four-line rule
+#    drops that line. An older build still installed cannot start a session
+#    under the new rule, so a stop between the rule and the new bundle says
+#    so and gives the rerun command.
+QUIT_DONE=0
+# Ask the app to quit and wait until it has actually exited. It refuses to
+# quit while it has unresolved recovery work; that refusal stands (no pkill),
+# and nothing of the old install is overwritten while it is still running.
+if "$PGREP" -x Insomnia >/dev/null 2>&1; then
+  echo "Insomnia is running; quitting it first (this ends any session)."
+  "$OSASCRIPT" -e 'tell application id "com.kgarg.insomnia" to quit' >/dev/null 2>&1 || true
+  for (( i = 0; i < QUIT_WAIT_SECONDS; i++ )); do
+    "$PGREP" -x Insomnia >/dev/null 2>&1 || break
+    sleep 1
+  done
+  if "$PGREP" -x Insomnia >/dev/null 2>&1; then
+    echo "Insomnia is still running after ${QUIT_WAIT_SECONDS}s (it may be refusing to quit until its own recovery finishes)." >&2
+    echo "Let it finish or quit it from its menu, then rerun. Nothing was changed." >&2
+    exit 1
+  fi
+  QUIT_DONE=1
+fi
+
 step "Writing $SUDOERS (requires your password once)"
 TMP_SUDOERS="$(mktemp)"
-trap 'rm -f "$TMP_SUDOERS"' EXIT
-# The rule, printed. `with-disablesleep-1` adds the line a build older than
-# this script needs to start a session; only step 3 asks for it, and only
-# when that older build is the one left installed.
-sudoers_rule() {
-  if [[ "${1:-}" == with-disablesleep-1 ]]; then
-    echo "# Installed by Insomnia install.sh. Four commands while an older build is installed; rerun install.sh to drop the first."
-    echo "$USER ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 1"
-  else
-    echo "# Installed by Insomnia install.sh. Exactly three commands, nothing else."
-  fi
-  echo "$USER ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0"
-  echo "$USER ALL=(root) NOPASSWD: /usr/bin/pmset -b lowpowermode 1"
-  echo "$USER ALL=(root) NOPASSWD: /usr/bin/pmset -b lowpowermode 0"
+# Set from the moment the new rule is installed until the new bundle is
+# signed in place. Any stop in between prints rule_ahead_note on exit.
+RULE_AHEAD_OF_BUNDLE=0
+rule_ahead_note() {
+  cat >&2 <<NOTE
+
+$SUDOERS already holds the new three-line rule, but the app at $APP was not
+replaced. An Insomnia build older than this installer cannot start a session
+with that rule. Finish the install by rerunning:
+  $ROOT/scripts/install.sh
+NOTE
 }
-# Validates and installs the rule sudoers_rule "$1" prints. Non-zero when
-# sudo did not authenticate or visudo rejected the file.
-install_sudoers() {
-  sudoers_rule "${1:-}" > "$TMP_SUDOERS"
-  "$SUDO" visudo -cf "$TMP_SUDOERS" >/dev/null && "$SUDO" install -m 0440 -o root -g wheel "$TMP_SUDOERS" "$SUDOERS"
-}
-if ! install_sudoers; then
+trap 'rc=$?; rm -f "$TMP_SUDOERS"; if (( rc != 0 && RULE_AHEAD_OF_BUNDLE )); then rule_ahead_note; fi' EXIT
+cat > "$TMP_SUDOERS" <<SUDO
+# Installed by Insomnia install.sh. Exactly three commands, nothing else.
+$USER ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0
+$USER ALL=(root) NOPASSWD: /usr/bin/pmset -b lowpowermode 1
+$USER ALL=(root) NOPASSWD: /usr/bin/pmset -b lowpowermode 0
+SUDO
+if "$SUDO" visudo -cf "$TMP_SUDOERS" >/dev/null && "$SUDO" install -m 0440 -o root -g wheel "$TMP_SUDOERS" "$SUDOERS"; then
+  RULE_AHEAD_OF_BUNDLE=1
+elif (( QUIT_DONE )); then
+  echo "sudoers file failed validation (or sudo did not authenticate); not installed. Insomnia was quit, which ended any session; nothing else was changed. Open \"$APP\" to keep using the installed build, or rerun." >&2
+  exit 1
+else
   echo "sudoers file failed validation (or sudo did not authenticate); not installed. Nothing was changed." >&2
   exit 1
 fi
@@ -98,30 +125,11 @@ fi
 
 # 3. Bundle ------------------------------------------------------------------
 step "Assembling $APP"
-# Ask the app to quit and wait until it has actually exited. It refuses to
-# quit while it has unresolved recovery work; that refusal stands (no pkill),
-# and nothing of the old install is overwritten while it is still running.
+# The password prompt can take a while, and the app may have been opened
+# again meanwhile. Its bundle is not replaced while it runs.
 if "$PGREP" -x Insomnia >/dev/null 2>&1; then
-  echo "Insomnia is running; quitting it first (this ends any session)."
-  "$OSASCRIPT" -e 'tell application id "com.kgarg.insomnia" to quit' >/dev/null 2>&1 || true
-  for (( i = 0; i < QUIT_WAIT_SECONDS; i++ )); do
-    "$PGREP" -x Insomnia >/dev/null 2>&1 || break
-    sleep 1
-  done
-  if "$PGREP" -x Insomnia >/dev/null 2>&1; then
-    echo "Insomnia is still running after ${QUIT_WAIT_SECONDS}s (it may be refusing to quit until its own recovery finishes)." >&2
-    # This is the one stop that leaves the previous bundle installed. A
-    # build older than this script starts sessions with `sudo -n pmset -a
-    # disablesleep 1`, which the rule written above denies, so put that line
-    # back for it (sudo's cached credential normally covers this). The next
-    # successful run writes the three-line rule again.
-    if install_sudoers with-disablesleep-1; then
-      echo "Let it finish or quit it from its menu, then rerun. $SUDOERS was put back to the four-line rule the installed build needs (it permits 'pmset -a disablesleep 1' without a password until the rerun); the app, backstop.sh and LaunchAgent were not touched." >&2
-    else
-      echo "Let it finish or quit it from its menu, then rerun. $SUDOERS holds the new three-line rule, so the installed build cannot start a session until the rerun; the app, backstop.sh and LaunchAgent were not touched." >&2
-    fi
-    exit 1
-  fi
+  echo "Insomnia was opened again while the sudoers rule was being written; quit it and rerun." >&2
+  exit 1
 fi
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
@@ -131,6 +139,8 @@ mkdir -p "$APP/Contents/Resources"
 cp "$ROOT/Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 "$PLUTIL" -lint "$APP/Contents/Info.plist" >/dev/null
 "$CODESIGN" --force --sign - --deep "$APP"
+# shellcheck disable=SC2034  # read by the EXIT trap set in step 2
+RULE_AHEAD_OF_BUNDLE=0
 echo "signed $("$CODESIGN" -dv "$APP" 2>&1 | grep -i identifier || true)"
 
 # 4. Backstop script + dirs --------------------------------------------------

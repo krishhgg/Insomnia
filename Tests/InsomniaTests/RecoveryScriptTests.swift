@@ -1203,7 +1203,7 @@ final class RecoveryScriptTests: XCTestCase {
         try fx.prepareInstall()
         try "trusted".write(to: fx.plist, atomically: true, encoding: .utf8)
         try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
-        fx.setMode("pgrep", "1\n0\n")   // not running at the quit step, running again under the lock
+        fx.setMode("pgrep", "1\n1\n0\n")   // not running at the quit step or after the rule, running again under the lock
         fx.setMode("launchctl", "loaded")
 
         let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
@@ -1254,51 +1254,58 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(try fx.contents(of: launchAgents), ["com.insomnia.backstop.plist"], "staging directory not removed")
     }
 
-    /// The password prompt (visudo + install of the sudoers rule) comes
-    /// before the running app is asked to quit and before the bundle, the
-    /// installed backstop.sh or the LaunchAgent are touched: a failed or
-    /// refused authentication leaves the previous install exactly as it was
-    /// and the app running.
-    func testInstallStopsBeforeQuittingOrReplacingAnythingWhenSudoAuthFails() throws {
+    /// The running app is asked to quit before the password prompt, so an
+    /// app that refuses leaves the sudoers file alone. When it quits and
+    /// authentication then fails, nothing of the previous install is
+    /// replaced, the message says the app was quit, and the old build can be
+    /// opened again with its rule intact.
+    func testInstallThatQuitTheAppChangesNothingElseWhenSudoAuthFails() throws {
         try fx.prepareInstall()
         try fx.installMachinery()
         try "old helper".write(to: fx.installedBackstop, atomically: true, encoding: .utf8)
-        fx.setMode("pgrep", "0\n")          // the app is running the whole time
+        fx.setMode("pgrep", "0\n1\n")       // running, then quits when asked
         fx.setMode("sudo", "auth-fail")     // wrong password / no sudo rights
 
         let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
 
         XCTAssertNotEqual(r.status, 0, r.stdout)
         let calls = fx.calls()
-        XCTAssertFalse(calls.contains { $0.hasPrefix("osascript") }, "the app was asked to quit before authentication: \(calls)")
+        let quit = try XCTUnwrap(calls.firstIndex { $0.hasPrefix("osascript") }, "the app was not asked to quit: \(calls)")
+        let visudo = try XCTUnwrap(calls.firstIndex { $0.hasPrefix("sudo visudo") }, "authentication was not attempted: \(calls)")
+        XCTAssertLessThan(quit, visudo, "the app must be quit before the password prompt: \(calls)")
         XCTAssertFalse(calls.contains { $0.hasPrefix("launchctl") }, "\(calls)")
         XCTAssertFalse(calls.contains { $0.hasPrefix("sudo install") }, "\(calls)")
         XCTAssertEqual(try String(contentsOf: fx.app.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "binary", "old bundle replaced")
         XCTAssertEqual(try String(contentsOf: fx.installedBackstop, encoding: .utf8), "old helper", "installed backstop.sh replaced")
         XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "plist", "trusted plist touched")
         XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), "rule", "sudoers rule replaced")
-        XCTAssertTrue(r.stderr.contains("Nothing was changed"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("Insomnia was quit"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("nothing else was changed"), r.stderr)
+        XCTAssertFalse(r.stderr.contains("already holds the new three-line rule"), r.stderr)
     }
 
-    /// Authentication passes but the rule it installed does not grant the
-    /// pmset commands: still nothing of the previous install is replaced.
+    /// The app quits, authentication passes, but the rule it installed does
+    /// not grant the pmset commands: nothing else of the previous install is
+    /// replaced, and the message says the old build cannot start a session
+    /// until the rerun.
     func testInstallStopsBeforeReplacingAnythingWhenSudoersRuleIsNotEffective() throws {
         try fx.prepareInstall()
         try fx.installMachinery()
         try "old helper".write(to: fx.installedBackstop, atomically: true, encoding: .utf8)
-        fx.setMode("pgrep", "0\n")
+        fx.setMode("pgrep", "0\n1\n")       // running, then quits when asked
         fx.setMode("sudo", "rule-not-effective")
 
         let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
 
         XCTAssertNotEqual(r.status, 0, r.stdout)
         let calls = fx.calls()
-        XCTAssertFalse(calls.contains { $0.hasPrefix("osascript") }, "\(calls)")
+        XCTAssertTrue(calls.contains { $0.hasPrefix("osascript") }, "the app was asked to quit first: \(calls)")
         XCTAssertFalse(calls.contains { $0.hasPrefix("launchctl") }, "\(calls)")
         XCTAssertEqual(try String(contentsOf: fx.app.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "binary")
         XCTAssertEqual(try String(contentsOf: fx.installedBackstop, encoding: .utf8), "old helper")
         XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "plist")
         XCTAssertTrue(r.stderr.contains("still not permitted"), r.stderr)
+        assertRerunNote(r.stderr)
     }
 
     /// With no app running there is nothing to wait for: an installer that
@@ -1351,12 +1358,13 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "plist", "trusted plist touched")
         XCTAssertTrue(try String(contentsOf: fx.sudoers, encoding: .utf8).contains("NOPASSWD: /usr/bin/pmset"), "the new rule is what was installed")
         XCTAssertTrue(r.stderr.contains("still not permitted"), r.stderr)
+        assertRerunNote(r.stderr)
     }
 
-    /// The sudoers rule is installed before the app is asked to quit. When
-    /// the app then keeps running, the refusal must say so: the rule is in
-    /// place, and only the bundle, backstop.sh and LaunchAgent are untouched.
-    func testInstallRefusalWhenAppKeepsRunningReportsSudoersInstalled() throws {
+    /// An app that will not quit stops the install before the password
+    /// prompt: no sudo at all, the sudoers file, bundle, backstop.sh and
+    /// LaunchAgent exactly as they were, and the refusal stands (no pkill).
+    func testInstallStopsBeforeTheSudoersRuleWhenAppKeepsRunning() throws {
         try fx.prepareInstall()
         try fx.installMachinery()
         try "old helper".write(to: fx.installedBackstop, atomically: true, encoding: .utf8)
@@ -1366,18 +1374,16 @@ final class RecoveryScriptTests: XCTestCase {
 
         XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
         let calls = fx.calls()
-        XCTAssertTrue(calls.contains { $0.hasPrefix("sudo install") }, "\(calls)")
         XCTAssertTrue(calls.contains { $0.hasPrefix("osascript") }, "the app was asked to quit: \(calls)")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("sudo") }, "no password prompt for an install that cannot finish: \(calls)")
         XCTAssertFalse(calls.contains { $0.hasPrefix("pkill") }, "a refused quit stands: \(calls)")
         XCTAssertFalse(calls.contains { $0.hasPrefix("launchctl") }, "\(calls)")
-        XCTAssertTrue(try String(contentsOf: fx.sudoers, encoding: .utf8).contains("NOPASSWD: /usr/bin/pmset"), "the rule was installed")
+        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), "rule", "the sudoers file was touched")
         XCTAssertEqual(try String(contentsOf: fx.app.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "binary")
         XCTAssertEqual(try String(contentsOf: fx.installedBackstop, encoding: .utf8), "old helper")
         XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "plist")
-        XCTAssertFalse(r.stderr.contains("Nothing was changed"), "the sudoers rule was changed: \(r.stderr)")
-        XCTAssertTrue(r.stderr.contains(fx.sudoers.path), "says what was installed: \(r.stderr)")
-        XCTAssertTrue(r.stderr.contains("not touched"), "says what was not: \(r.stderr)")
         XCTAssertTrue(r.stderr.contains("still running"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("Nothing was changed"), r.stderr)
     }
 
     /// The passwordless lines, in one place for the tests below. None of
@@ -1388,8 +1394,6 @@ final class RecoveryScriptTests: XCTestCase {
         "tester ALL=(root) NOPASSWD: /usr/bin/pmset -b lowpowermode 1",
         "tester ALL=(root) NOPASSWD: /usr/bin/pmset -b lowpowermode 0",
     ]
-    /// The line a build older than this installer needs to start a session.
-    private static let oldStartLine = "tester ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 1"
 
     private func sudoersRules() throws -> [String] {
         try String(contentsOf: fx.sudoers, encoding: .utf8)
@@ -1434,42 +1438,46 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(fx.calls().filter { $0.hasPrefix("sudo install") }.count, 1, "written once: \(fx.calls())")
     }
 
-    /// The one stop that leaves the previous bundle installed is the app
-    /// refusing to quit. That build starts sessions with `sudo -n pmset -a
-    /// disablesleep 1`, which the three-line rule denies, so the line is
-    /// put back for it: three lines were written, then four, the bundle is
-    /// untouched, and the message says which rule is in place.
-    func testInstallWhoseAppKeepsRunningPutsTheOldLineBackForTheInstalledBuild() throws {
+    /// The app is opened again while the password prompt is up. The rule
+    /// is already written, so the stop says the old build cannot start a
+    /// session and gives the rerun command; the bundle is not replaced under
+    /// a running app.
+    func testInstallStopsAfterTheRuleWhenTheAppIsOpenedDuringThePasswordPrompt() throws {
         try fx.prepareInstall()
         try fx.installMachinery()
-        fx.setMode("pgrep", "0\n")          // running, and it stays running
+        try "old helper".write(to: fx.installedBackstop, atomically: true, encoding: .utf8)
+        fx.setMode("pgrep", "1\n0\n")       // not running at the quit step, running after the rule
 
         let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
 
         XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
-        XCTAssertEqual(fx.calls().filter { $0.hasPrefix("sudo install") }.count, 2, "\(fx.calls())")
-        XCTAssertEqual(try sudoersRules(), [Self.oldStartLine] + Self.passwordlessLines)
-        XCTAssertEqual(try String(contentsOf: fx.app.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "binary", "the old bundle stays")
-        XCTAssertTrue(r.stderr.contains("put back to the four-line rule"), r.stderr)
-        XCTAssertTrue(r.stderr.contains("still running"), r.stderr)
+        let calls = fx.calls()
+        XCTAssertEqual(calls.filter { $0.hasPrefix("sudo install") }.count, 1, "\(calls)")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("launchctl") }, "\(calls)")
+        XCTAssertEqual(try sudoersRules(), Self.passwordlessLines)
+        XCTAssertEqual(try String(contentsOf: fx.app.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "binary", "the bundle of a running app was replaced")
+        XCTAssertEqual(try String(contentsOf: fx.installedBackstop, encoding: .utf8), "old helper")
+        XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "plist")
+        XCTAssertTrue(r.stderr.contains("opened again"), r.stderr)
+        assertRerunNote(r.stderr)
     }
 
-    /// When the line cannot be put back (sudo wants a password again and
-    /// gets none), the three-line rule stays and the message says the
-    /// installed build cannot start a session until the rerun.
-    func testInstallWhoseAppKeepsRunningSaysSoWhenTheOldLineCannotBePutBack() throws {
+    /// No path of the installer may grant passwordless `disablesleep 1`:
+    /// no line outside a comment mentions it at all.
+    func testInstallerHasNoLineThatGrantsPasswordlessSleepOff() throws {
         try fx.prepareInstall()
-        try fx.installMachinery()
-        fx.setMode("pgrep", "0\n")
-        fx.setMode("sudo", "second-install-fails")
+        let text = try String(contentsOf: fx.installRedirected, encoding: .utf8)
+        let lines = text.split(separator: "\n").map(String.init)
+            .filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("#") }
+            .filter { $0.contains("disablesleep 1") }
+        XCTAssertEqual(lines, [])
+    }
 
-        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
-
-        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
-        XCTAssertEqual(fx.calls().filter { $0.hasPrefix("sudo install") }.count, 2, "\(fx.calls())")
-        XCTAssertEqual(try sudoersRules(), Self.passwordlessLines)
-        XCTAssertTrue(r.stderr.contains("cannot start a session until the rerun"), r.stderr)
-        XCTAssertTrue(r.stderr.contains("still running"), r.stderr)
+    private func assertRerunNote(_ stderr: String, file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertTrue(stderr.contains("already holds the new three-line rule"), stderr, file: file, line: line)
+        XCTAssertTrue(stderr.contains("cannot start a session"), stderr, file: file, line: line)
+        XCTAssertTrue(stderr.contains("Finish the install by rerunning:\n  "), stderr, file: file, line: line)
+        XCTAssertTrue(stderr.contains("/scripts/install.sh"), stderr, file: file, line: line)
     }
 }
 
@@ -1728,12 +1736,6 @@ private final class ScriptFixture {
             exit 0 ;;
           install)
             if [[ "$mode" == auth-fail ]]; then echo "sudo: 3 incorrect password attempts" >&2; exit 1; fi
-            # second-install-fails: the first install goes through, every later one
-            # fails like a sudo whose cached credential has expired and gets no password.
-            if [[ "$mode" == second-install-fails ]]; then
-              n=$(( $(cat "\(r)/sudo.installs" 2>/dev/null || echo 0) + 1 )); echo "$n" > "\(r)/sudo.installs"
-              if (( n > 1 )); then echo "sudo: a password is required" >&2; exit 1; fi
-            fi
             src=""; dst=""
             for a in "$@"; do src="$dst"; dst="$a"; done
             case "$dst" in "\(r)"/*) mkdir -p "$(dirname "$dst")"; cp "$src" "$dst"; exit 0 ;; esac

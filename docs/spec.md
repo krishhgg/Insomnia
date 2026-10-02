@@ -109,12 +109,15 @@ recovery; newly written journals use `frozenProcesses`.
 - Turning sleep back on and the Low Power Mode floor stay passwordless so the
   app, `backstop.sh` and `uninstall.sh` can recover unattended: ending a
   stuck or crashed session must never need a password.
-- `install.sh` writes the three-line rule before it asks a running app to
-  quit, so a cancelled password prompt changes nothing. If that app refuses
-  to quit, the previous bundle stays installed, and a build older than this
-  rule starts sessions with `sudo -n pmset -a disablesleep 1`; the installer
-  then puts that line back for it, says so, and the next successful run drops
-  it again. A successful install writes the file once.
+- `install.sh` never writes `disablesleep 1`, on any path. It asks a running
+  app to quit first and stops with nothing changed, the sudoers file
+  included, if the app is still running after 15 s. Then it writes the
+  three-line rule, checks that the app was not opened again during the
+  password prompt, and replaces the bundle. A build older than this rule
+  starts sessions with `sudo -n pmset -a disablesleep 1`, so any stop between
+  the rule and the new bundle leaves that build unable to start a session;
+  the installer says so and prints the rerun command. A successful install
+  writes the file once.
 - Nothing else runs as root.
 
 ### 3. Lid observer
@@ -383,7 +386,8 @@ Backstop, independent of the app:
 ### 9. Notifications
 
 `UNUserNotificationCenter`: session ended (with reason), session not started
-(the password dialog was cancelled or failed), session ended because sleep was
+(the password dialog was cancelled or failed), password prompt still running
+(osascript's pid, while the start waits for it), session ended because sleep was
 turned back on while Insomnia was not running, extend reminder 5 minutes
 before end, battery floor reached, battery unreadable twice in a row, thermal
 action taken, network gap recovered (with nudge summary), sleep restored by
