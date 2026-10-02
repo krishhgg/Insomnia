@@ -179,8 +179,7 @@ final class AppServices {
         lidTasks.removeAll()
         for task in floorTasks { task.cancel() }
         floorTasks.removeAll()
-        for task in browserTasks { task.cancel() }
-        browserTasks.removeAll()
+        cancelBrowserTasks()
         network?.stop()
         network = nil
         lidActions = nil
@@ -236,6 +235,14 @@ final class AppServices {
     /// Quit and relaunch a Chromium browser with both anti-throttle flags.
     /// The outcome lands seconds after the menu click, so anything short of
     /// a relaunch goes out as a notification naming the browser.
+    /// Cancel browser scans and relaunches in flight. `stop()` calls this
+    /// when the session ends; a relaunch waiting for the browser to start
+    /// then returns at once and posts nothing.
+    func cancelBrowserTasks() {
+        for task in browserTasks { task.cancel() }
+        browserTasks.removeAll()
+    }
+
     func relaunchUnthrottled(_ bundleId: String) async {
         let task = Task { @MainActor [weak self] in
             guard let self else { return }

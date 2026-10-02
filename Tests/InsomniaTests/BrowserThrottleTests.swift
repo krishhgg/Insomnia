@@ -168,7 +168,7 @@ final class BrowserThrottleTests: XCTestCase {
     @MainActor
     func testABrowserThatDoesNotShowUpAfterOpenIsReported() async {
         let processes = FakeBrowserProcesses(pids: [42])
-        processes.starts = false
+        processes.startWait = .neverAppears
         let throttle = throttle(args: chrome, processes: processes)
 
         let outcome = await throttle.relaunchUnthrottled(bundleId: "com.google.Chrome")
@@ -179,10 +179,52 @@ final class BrowserThrottleTests: XCTestCase {
         XCTAssertEqual(processes.startWaits, ["com.google.Chrome"])
     }
 
+    /// The finding: a session that ends during the start wait cancels the
+    /// relaunch task. The wait must end at once rather than spin until the
+    /// deadline, and the outcome is not a failure to report.
+    @MainActor
+    func testACancelledStartWaitEndsAtOnceAndIsNotAFailure() async throws {
+        let processes = FakeBrowserProcesses(pids: [42])
+        processes.startWait = .pollsUntilCancelled
+        let throttle = throttle(args: chrome, processes: processes)
+
+        let relaunch = Task { await throttle.relaunchUnthrottled(bundleId: "com.google.Chrome") }
+        try await processes.waitForStartWait()
+        let cancelledAt = ContinuousClock.now
+        relaunch.cancel()
+        let outcome = await relaunch.value
+
+        XCTAssertLessThan(ContinuousClock.now - cancelledAt, .seconds(1))
+        XCTAssertEqual(outcome, .cancelled)
+        XCTAssertEqual(processes.launches.count, 1)
+    }
+
+    /// The loop itself: once its task is cancelled it checks at most once
+    /// more and throws, where ignoring the sleep's error kept it checking
+    /// as fast as it could until the deadline.
+    @MainActor
+    func testThePollStopsCheckingWhenItsTaskIsCancelled() async {
+        let checks = Locked(0)
+        let poll = Task { @MainActor in
+            try await WorkspaceBrowserProcesses.poll(timeout: 3, every: .milliseconds(20)) {
+                checks.value += 1
+                return false
+            }
+        }
+        try? await Task.sleep(for: .milliseconds(100))
+        let checksAtCancel = checks.value
+        poll.cancel()
+        let result = await poll.result
+
+        XCTAssertThrowsError(try result.get()) { XCTAssertTrue($0 is CancellationError, "\($0)") }
+        XCTAssertLessThanOrEqual(checks.value, checksAtCancel + 1)
+    }
+
     /// Every outcome short of a relaunch has a notification body naming the
     /// browser and saying what was and was not done.
     func testOutcomeMessagesNameTheBrowser() {
         XCTAssertNil(RelaunchOutcome.relaunched.explanation(browser: "Chrome"))
+        XCTAssertNil(RelaunchOutcome.cancelled.explanation(browser: "Chrome"))
         XCTAssertEqual(
             RelaunchOutcome.stillRunning.explanation(browser: "Chrome"),
             "Chrome did not quit within 10 s, so nothing was relaunched. It may still quit later. If it does, open it again yourself."
@@ -218,8 +260,18 @@ final class FakeBrowserProcesses: BrowserProcessControlling {
     var pidsAfterQuit: [Int32]?
     /// Makes `launch` throw with this detail.
     var launchFailure: String?
-    /// Whether the wait after `launch` sees an instance running.
-    var starts = true
+    enum StartWait {
+        /// An instance is running as soon as the wait begins.
+        case appears
+        /// The wait reports that none appeared.
+        case neverAppears
+        /// The app's own poll loop runs against a list that stays empty,
+        /// so the wait lasts until its task is cancelled.
+        case pollsUntilCancelled
+    }
+
+    /// What the wait after `launch` sees.
+    var startWait = StartWait.appears
     private(set) var terminated: [[Int32]] = []
     private(set) var launches: [(bundleId: String, arguments: [String])] = []
     private(set) var startWaits: [String] = []
@@ -243,8 +295,24 @@ final class FakeBrowserProcesses: BrowserProcessControlling {
         if let launchFailure { throw BrowserProcessError(detail: launchFailure) }
     }
 
-    func waitUntilRunning(bundleId: String, timeout: TimeInterval) async -> Bool {
+    func waitUntilRunning(bundleId: String, timeout: TimeInterval) async throws -> Bool {
         startWaits.append(bundleId)
-        return starts
+        switch startWait {
+        case .appears: return true
+        case .neverAppears: return false
+        case .pollsUntilCancelled: return try await WorkspaceBrowserProcesses.poll(timeout: 3) { false }
+        }
+    }
+
+    /// Yield until the relaunch under test is inside the start wait.
+    func waitForStartWait() async throws {
+        let deadline = ContinuousClock.now + .seconds(2)
+        while startWaits.isEmpty {
+            guard ContinuousClock.now < deadline else {
+                XCTFail("the relaunch never reached the start wait")
+                return
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
     }
 }

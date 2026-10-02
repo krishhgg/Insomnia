@@ -162,7 +162,9 @@ protocol BrowserProcessControlling: AnyObject {
     func launch(bundleId: String, arguments: [String]) async throws
     /// Wait for an application with this bundle id to appear in the running
     /// list: true as soon as one does, false when `timeout` passes first.
-    func waitUntilRunning(bundleId: String, timeout: TimeInterval) async -> Bool
+    /// Throws CancellationError, and nothing else, when the task is
+    /// cancelled during the wait.
+    func waitUntilRunning(bundleId: String, timeout: TimeInterval) async throws -> Bool
 }
 
 struct BrowserProcessError: Error, LocalizedError, Equatable {
@@ -191,19 +193,28 @@ final class WorkspaceBrowserProcesses: BrowserProcessControlling {
         }
     }
 
-    func waitUntilRunning(bundleId: String, timeout: TimeInterval) async -> Bool {
+    func waitUntilRunning(bundleId: String, timeout: TimeInterval) async throws -> Bool {
+        try await Self.poll(timeout: timeout) { !runningPids(bundleId: bundleId).isEmpty }
+    }
+
+    /// Check `condition` every `interval` until it holds (true) or `timeout`
+    /// passes (false). In a cancelled task the sleep throws at once, and the
+    /// error is passed on: ignoring it would turn this loop into a spin on
+    /// the main actor until the deadline.
+    static func poll(timeout: TimeInterval, every interval: Duration = .milliseconds(250), until condition: () -> Bool) async throws -> Bool {
         let deadline = ContinuousClock.now + .seconds(timeout)
-        while runningPids(bundleId: bundleId).isEmpty {
+        while !condition() {
             guard ContinuousClock.now < deadline else { return false }
-            try? await Task.sleep(for: .milliseconds(250))
+            try await Task.sleep(for: interval)
         }
         return true
     }
 }
 
 /// What "Relaunch <browser> unthrottled" did. Anything but `.relaunched`
-/// is reported to the user in a notification; the browser was quit only
-/// in `.launchFailed` and `.didNotStart`.
+/// and `.cancelled` is reported to the user in a notification; the
+/// browser was quit only in `.launchFailed`, `.didNotStart` and
+/// `.cancelled`.
 enum RelaunchOutcome: Equatable, Sendable {
     /// Every instance quit, `open` returned 0, and an instance was running
     /// within `startTimeout`.
@@ -221,12 +232,17 @@ enum RelaunchOutcome: Equatable, Sendable {
     /// Every instance quit and `open` returned 0, but no instance was
     /// running `startTimeout` later. The browser is not running.
     case didNotStart
+    /// Every instance quit and `open` returned 0, then the task was
+    /// cancelled during the start wait because the session ended. Not
+    /// reported: the user ended the session, and whether the browser came
+    /// up is not known.
+    case cancelled
 
     /// The notification body, naming the browser; nil when the relaunch
     /// happened.
     func explanation(browser name: String) -> String? {
         switch self {
-        case .relaunched:
+        case .relaunched, .cancelled:
             nil
         case .notRunning:
             "\(name) is not running. Nothing was quit or relaunched."
@@ -327,7 +343,14 @@ final class BrowserThrottle {
             Log.error("open -b \(bundleId) failed: \(error.localizedDescription)")
             return .launchFailed(error.localizedDescription)
         }
-        guard await processes.waitUntilRunning(bundleId: bundleId, timeout: Self.startTimeout) else {
+        let started: Bool
+        do {
+            started = try await processes.waitUntilRunning(bundleId: bundleId, timeout: Self.startTimeout)
+        } catch {
+            Log.info("relaunch: start check for \(bundleId) cancelled after open returned; not reporting")
+            return .cancelled
+        }
+        guard started else {
             Log.error("relaunch: \(bundleId) not running \(Int(Self.startTimeout)) s after open returned")
             return .didNotStart
         }

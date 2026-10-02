@@ -252,8 +252,10 @@ last held while it was on was the battery or thermal floor, not the lid.
     any instance still there means nothing is launched, and the notification
     says the browser may still quit later and then has to be opened by hand.
     After `open` returns 0 the running list is polled for up to 5 s; a
-    browser not running by then is reported too. Every outcome short of a
-    relaunch is a "Browser not relaunched" notification naming the browser;
+    browser not running by then is reported too. A session that ends during
+    that wait cancels it at once and nothing is reported, since the user
+    ended the session. Every other outcome short of a relaunch is a
+    "Browser not relaunched" notification naming the browser;
     the process side (`BrowserProcessControlling`) is injected so the tests
     quit nothing.
   - Headless Playwright is unaffected and needs nothing.

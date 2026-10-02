@@ -102,6 +102,38 @@ final class IntegrationWiringTests: XCTestCase {
         XCTAssertEqual(processes.launches.count, 0)
     }
 
+    /// The session ending while a relaunched browser has not appeared yet:
+    /// `stop()` cancels the relaunch through `cancelBrowserTasks()`. The
+    /// relaunch returns at once, without holding the main actor until the
+    /// start deadline, and posts nothing, since the user ended the session.
+    @MainActor
+    func testARelaunchCancelledDuringTheStartWaitReturnsAtOnceAndPostsNothing() async throws {
+        let home = TempHome()
+        defer { home.destroy() }
+        let notifier = RecordingNotifier()
+        let processes = FakeBrowserProcesses(pids: [42])
+        processes.startWait = .pollsUntilCancelled
+        let services = AppServices(
+            paths: home.paths,
+            notifier: notifier,
+            audio: FakeAudioControl(),
+            processControl: FakeProcessControl(),
+            locationPermission: LocationPermission(authorizationStatus: .notDetermined),
+            browser: BrowserThrottle(readArgs: { _ in "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" }, processes: processes)
+        )
+        services.status.browsers = [BrowserStatus(bundleId: "com.google.Chrome", name: "Chrome", pid: 42, unthrottled: false)]
+
+        let relaunch = Task { await services.relaunchUnthrottled("com.google.Chrome") }
+        try await processes.waitForStartWait()
+        let cancelledAt = ContinuousClock.now
+        services.cancelBrowserTasks()
+        await relaunch.value
+
+        XCTAssertLessThan(ContinuousClock.now - cancelledAt, .seconds(1))
+        XCTAssertEqual(notifier.posts.count, 0)
+        XCTAssertEqual(processes.launches.count, 1)
+    }
+
     func testKeychainSecretStoreUsesFailoverServiceAndCurrentSSID() throws {
         let keychain = FakeKeychainStore()
         var ssid = "Phone"
