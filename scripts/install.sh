@@ -343,17 +343,103 @@ fi
 # runs under it too, so no other install is between setting the previous
 # bundle aside and resolving the swap now: a bundle at $PREVIOUS_APP belongs
 # to a run that was stopped, and no live run needs it to roll back.
-if [[ -d "$PREVIOUS_APP" ]]; then
-  # The requirement the plist on disk pins; launchd loads that file at the
-  # next login. Empty when there is no plist or it cannot be read.
+#
+# Until this run's recovery has succeeded, nothing that could part a loaded
+# job from the build it pins is touched: while recovery is unresolved that
+# job may be the one retrying it. Two things cannot: putting a set-aside
+# bundle back when nothing is at $APP, and removing the staging directories
+# of runs that are gone. A job only ever pins $APP, never a path inside a
+# staging directory.
+if [[ -d "$PREVIOUS_APP" && ! -e "$APP" ]]; then
+  # Stopped between the two renames: nothing at $APP.
+  mv "$PREVIOUS_APP" "$APP"
+  echo "restored $APP, which an interrupted run had set aside"
+fi
+# Staging directories of runs that are gone, matched by the exact name step 3
+# gives them (mktemp's suffix is six letters and digits). One whose PID is
+# alive belongs to an install that is still assembling its bundle and has
+# not reached this lock yet, so it stays. kill -0 only asks whether the
+# process exists; it sends no signal.
+staging_re='^\.Insomnia\.app\.staging\.([0-9]+)\.[A-Za-z0-9]{6}$'
+for dir in "$APP_DIR"/.Insomnia.app.staging.*; do
+  [[ -d "$dir" && ! -L "$dir" && "$dir" != "$STAGE" ]] || continue
+  [[ "${dir##*/}" =~ $staging_re ]] || continue
+  if "$KILL" -0 "${BASH_REMATCH[1]}" 2>/dev/null; then
+    continue
+  fi
+  rm -rf "$dir"
+done
+
+# True when the plist on disk, the one launchd loads at the next login, pins
+# the bundle at $PREVIOUS_APP and not the one at $APP.
+plist_pins_previous() {
+  local pinned
   pinned="$("$PLUTIL" -extract ProgramArguments.4 raw -o - "$PLIST" 2>/dev/null || true)"
-  if [[ ! -e "$APP" ]]; then
-    # Stopped between the two renames: nothing at $APP.
-    mv "$PREVIOUS_APP" "$APP"
-    echo "restored $APP, which an interrupted run had set aside"
-  elif [[ -n "$pinned" ]] \
-      && ! "$CODESIGN" --verify --strict "-R=$pinned" "$APP" >/dev/null 2>&1 \
-      && "$CODESIGN" --verify --strict "-R=$pinned" "$PREVIOUS_APP" >/dev/null 2>&1; then
+  [[ -n "$pinned" ]] \
+    && ! "$CODESIGN" --verify --strict "-R=$pinned" "$APP" >/dev/null 2>&1 \
+    && "$CODESIGN" --verify --strict "-R=$pinned" "$PREVIOUS_APP" >/dev/null 2>&1
+}
+
+step "Ending any stale session and checking the recovery journal"
+recovery_rc=0
+/bin/bash "$BACKSTOP" --force || recovery_rc=$?
+
+if (( recovery_rc != 0 )); then
+  held="$(loaded_state)"
+  case "$held" in
+    yes) agent_note="A LaunchAgent job with label $LABEL is loaded and was left as it was. Which plist and
+schedule it runs was not verified here; check with 'launchctl print gui/$UID_NUM/$LABEL'." ;;
+    no) agent_note="No LaunchAgent $LABEL is loaded, so nothing retries by itself." ;;
+    *) agent_note="'launchctl print gui/$UID_NUM/$LABEL' exited ${held#unknown:}, so whether a LaunchAgent is loaded is unknown." ;;
+  esac
+  if [[ -d "$PREVIOUS_APP" ]]; then
+    pair_note="An interrupted install left a build at $APP and set the previous app aside at
+$PREVIOUS_APP. Neither bundle was moved and no LaunchAgent job was unloaded or
+replaced, so a loaded job still finds the build it pins; the new build was discarded."
+    if plist_pins_previous; then
+      pair_note="$pair_note
+$PLIST pins the previous app, so the agent the next login loads refuses the
+build at $APP. Before you log out, resolve the recovery and rerun this script,
+which puts the previous app back."
+    fi
+  else
+    pair_note="The app at $APP and the LaunchAgent were not replaced or unloaded,
+so they still match each other; the new build was discarded."
+  fi
+  # How to run the recovery again. A checkout has backstop.sh under scripts/.
+  # A zip has it only inside the bundle at $PREBUILT, and the checked private
+  # copy is deleted when this script exits; the original may have changed
+  # since the check, so the step is this script again, which checks a new copy.
+  if [[ -n "$PREBUILT" ]]; then
+    rerun="$(command_line "$0" --app "$PREBUILT")"
+    if (( ALLOW_UNVERIFIED_ORIGIN )); then rerun="$(command_line "$0" --allow-unverified-origin --app "$PREBUILT")"; fi
+    manual_step="Or rerun this script. It checks a new private
+copy of the bundle and runs that copy's recovery before it replaces the app
+or the LaunchAgent:
+  $rerun"
+  else
+    manual_step="Or run the recovery by hand:
+  $(command_line /bin/bash "$ROOT/scripts/backstop.sh" --force)
+Then rerun this script to install the app and the LaunchAgent."
+  fi
+  cat >&2 <<FAIL
+
+Install stopped: the backstop could not fully undo a previous session
+(exit status $recovery_rc). $pair_note
+Installed so far: $SUDOERS.
+$agent_note
+Check $LOG_DIR/insomnia.log and resolve what it reports. Saved audio, display
+brightness or keyboard backlight needs the app; if one is installed, open it:
+  $(command_line open "$APP")
+$manual_step
+FAIL
+  exit 1
+fi
+
+# Recovery is resolved, so a loaded job has nothing left to retry, and the
+# rest of the repair may unload it and move bundles.
+if [[ -d "$PREVIOUS_APP" ]]; then
+  if plist_pins_previous; then
     # Stopped after the second rename but before the new plist was
     # published: $PLIST still pins the previous bundle, so that one goes
     # back and the interrupted run's build is discarded with this run's
@@ -374,7 +460,8 @@ Install stopped: an interrupted run left its build at $APP and the previous app
 at $PREVIOUS_APP, and $PLIST pins the previous one.
 A job with label $LABEL may still be loaded from that run, and unloading it was
 not confirmed (launchctl print: $cleared). That job pins the build at $APP, so
-neither bundle was moved. Installed so far: $SUDOERS.
+neither bundle was moved. Installed so far: $SUDOERS. The recovery journal was
+clean when checked above.
 The next login loads $PLIST, which does not match the app at $APP. Before you
 log out, unload the job and rerun this script:
   launchctl bootout gui/$UID_NUM/$LABEL
@@ -386,15 +473,40 @@ FAIL
     mv "$PREVIOUS_APP" "$APP"
     echo "restored $APP, which an interrupted run had set aside; $PLIST pins it"
     if [[ "$held" != no ]]; then
-      # The job just unloaded may have been the one retrying recovery; the
-      # previous plist takes over until this run replaces it.
+      # A job was loaded when this run started; the previous plist takes its
+      # place, so a failure in step 6 reloads that one. Unless print confirms
+      # the reload, nothing below may count on a loaded job, so the run stops.
       reload_rc=0
       "$LAUNCHCTL" bootstrap "gui/$UID_NUM" "$PLIST" >/dev/null 2>&1 || reload_rc=$?
-      if (( reload_rc == 0 )) && [[ "$(loaded_state)" == yes ]]; then
-        echo "unloaded the job the interrupted run left and loaded $PLIST again (launchctl print confirms)"
-      else
-        echo "unloaded the job the interrupted run left; loading $PLIST again was not confirmed ('launchctl bootstrap' exited $reload_rc)"
+      now="$(loaded_state)"
+      if (( reload_rc != 0 )) || [[ "$now" != yes ]]; then
+        if (( reload_rc != 0 )); then
+          reload_reason="'launchctl bootstrap' exited $reload_rc"
+        else
+          reload_reason="'launchctl bootstrap' reported success, but launchctl print says $now"
+        fi
+        if [[ "$now" == yes ]]; then
+          job_note="A job with label $LABEL is listed (launchctl print), but the bootstrap failed,
+so which plist it runs is unknown. Check 'launchctl print gui/$UID_NUM/$LABEL'."
+        else
+          job_note="No job with label $LABEL is confirmed loaded (launchctl print: $now). If none is,
+load the previous one again:
+  $(command_line launchctl bootstrap "gui/$UID_NUM" "$PLIST")"
+        fi
+        cat >&2 <<FAIL
+
+Install stopped: the job an interrupted run left was unloaded and the previous app
+is back at $APP, which $PLIST pins, but loading $PLIST again was not
+confirmed ($reload_reason).
+The new build was discarded. Installed so far: $SUDOERS. The recovery journal
+was clean when checked above, and the next login loads $PLIST, which matches
+the app at $APP.
+$job_note
+Then rerun this script.
+FAIL
+        exit 1
       fi
+      echo "unloaded the job the interrupted run left and loaded $PLIST again (launchctl print confirms)"
     fi
   else
     # $APP is what the plist pins (the interrupted run got as far as
@@ -403,23 +515,6 @@ FAIL
     echo "removed the bundle an interrupted run had set aside; $APP stays"
   fi
 fi
-# Staging directories of runs that are gone. One whose PID is alive belongs
-# to an install that is still assembling its bundle and has not reached this
-# lock yet, so it stays. kill -0 only asks whether the process exists; it
-# sends no signal.
-for dir in "$APP_DIR"/.Insomnia.app.staging.*; do
-  [[ -d "$dir" && "$dir" != "$STAGE" ]] || continue
-  owner="${dir##*/.Insomnia.app.staging.}"
-  owner="${owner%%.*}"
-  if [[ "$owner" =~ ^[0-9]+$ ]] && "$KILL" -0 "$owner" 2>/dev/null; then
-    continue
-  fi
-  rm -rf "$dir"
-done
-
-step "Ending any stale session and checking the recovery journal"
-recovery_rc=0
-/bin/bash "$BACKSTOP" --force || recovery_rc=$?
 
 # 6. LaunchAgent: verifies the bundle and runs its sealed backstop at load
 #    and every 60 s. The backstop enforces the saved deadline itself and is
@@ -438,9 +533,9 @@ recovery_rc=0
 #    subdirectories, so a leftover candidate is never picked up as a second
 #    copy of the label. It is loaded from there and published with one
 #    rename (same filesystem) after `launchctl print` confirms the job is
-#    loaded. Any failure leaves $PLIST byte for byte as it was. While
-#    recovery is unresolved the previous job is not unloaded or replaced,
-#    and neither is the bundle at $APP it pins.
+#    loaded. Any failure leaves $PLIST byte for byte as it was. A run whose
+#    recovery is unresolved stopped above, so the previous job and the
+#    bundle at $APP it pins are only replaced once nothing is left to retry.
 step "Installing LaunchAgent $LABEL"
 CANDIDATE_DIR="$LAUNCH_AGENTS/.$LABEL.staging"
 CANDIDATE="$CANDIDATE_DIR/$LABEL.candidate-$$.plist"
@@ -450,44 +545,6 @@ mkdir -p "$CANDIDATE_DIR"
 rm -f "$CANDIDATE_DIR/$LABEL.candidate-"* "$LAUNCH_AGENTS/$LABEL.candidate-"*
 
 before="$(loaded_state)"
-
-if (( recovery_rc != 0 )); then
-  case "$before" in
-    yes) agent_note="A LaunchAgent job with label $LABEL is loaded and was left as it was. Which plist and
-schedule it runs was not verified here; check with 'launchctl print gui/$UID_NUM/$LABEL'." ;;
-    no) agent_note="No LaunchAgent $LABEL is loaded, so nothing retries by itself." ;;
-    *) agent_note="'launchctl print gui/$UID_NUM/$LABEL' exited ${before#unknown:}, so whether a LaunchAgent is loaded is unknown." ;;
-  esac
-  # How to run the recovery again. A checkout has backstop.sh under scripts/.
-  # A zip has it only inside the bundle at $PREBUILT, and the checked private
-  # copy is deleted when this script exits; the original may have changed
-  # since the check, so the step is this script again, which checks a new copy.
-  if [[ -n "$PREBUILT" ]]; then
-    rerun="$(command_line "$0" --app "$PREBUILT")"
-    if (( ALLOW_UNVERIFIED_ORIGIN )); then rerun="$(command_line "$0" --allow-unverified-origin --app "$PREBUILT")"; fi
-    manual_step="Or rerun this script. It checks a new private
-copy of the bundle and runs that copy's recovery before it replaces the app
-or the LaunchAgent:
-  $rerun"
-  else
-    manual_step="Or run the recovery by hand:
-  $(command_line /bin/bash "$ROOT/scripts/backstop.sh" --force)
-Then rerun this script to install the app and the LaunchAgent."
-  fi
-  cat >&2 <<FAIL
-
-Install stopped: the backstop could not fully undo a previous session
-(exit status $recovery_rc). The app at $APP and the LaunchAgent were
-not replaced or unloaded, so they still match each other; the new build
-was discarded. Installed so far: $SUDOERS.
-$agent_note
-Check $LOG_DIR/insomnia.log and resolve what it reports. Saved audio, display
-brightness or keyboard backlight needs the app; if one is installed, open it:
-  $(command_line open "$APP")
-$manual_step
-FAIL
-  exit 1
-fi
 
 # shellcheck disable=SC2016  # the $1/$2/$HOME/$r below are for the agent's shell, not this one
 AGENT_PROGRAM='r="$(/usr/bin/codesign --verify --strict "-R=$1" "$2" 2>&1)" && exec /bin/bash "$2/Contents/Resources/backstop.sh"; mkdir -p "$HOME/Library/Logs/Insomnia"; printf "%s [error] backstop agent: %s does not satisfy the pinned code requirement; backstop.sh not run. Reinstall Insomnia (scripts/install.sh). codesign: %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$2" "$(printf %s "$r" | tr "\n" " ")" >> "$HOME/Library/Logs/Insomnia/insomnia.log"; exit 1'
@@ -669,8 +726,9 @@ exited ${now#unknown:}), so it is not confirmed either way. Check
       esac ;;
     *)
       outcome="Whether a job was loaded before is unknown (launchctl print exited ${before#unknown:}),
-so nothing was reloaded. Check 'launchctl print gui/$UID_NUM/$LABEL' and, if needed,
-'launchctl bootstrap gui/$UID_NUM $PLIST' yourself." ;;
+so nothing was reloaded. Check 'launchctl print gui/$UID_NUM/$LABEL' and, if no job is
+loaded, load the previous one yourself:
+  $(command_line launchctl bootstrap "gui/$UID_NUM" "$PLIST")" ;;
   esac
   if [[ -f "$PLIST" ]]; then
     plist_note="The plist at $PLIST was not modified."

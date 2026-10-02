@@ -113,15 +113,17 @@ struct LaunchdBackstop: BackstopScheduling {
         }
         let desired = Self.plistDictionary(label: label, target: BackstopTarget(bundle: bundle, requirement: requirement))
         // Armed when the plist the next login loads is this build's and the
-        // loaded job runs its command line. A loaded label alone may be
-        // another build's job, pinning a bundle or requirement this one does
-        // not satisfy: install.sh can leave one loaded when it stops between
-        // its bootstrap and publishing the plist.
-        if plistOnDiskMatches(desired), try await loadedArguments() == desired["ProgramArguments"] as? [String] {
+        // loaded job is the one it describes: the same command line, started
+        // every `pollInterval` seconds. A loaded label alone may be another
+        // build's job, pinning a bundle or requirement this one does not
+        // satisfy (install.sh can leave one loaded when it stops between its
+        // bootstrap and publishing the plist), or a job loaded from a plist
+        // without the interval, which never runs again to end a session.
+        if plistOnDiskMatches(desired), try await loadedJob() == LoadedJob(plist: desired) {
             return
         }
         // The plist at `plistURL` is what the next arm() trusts when the
-        // loaded job runs its command line, so it may only ever hold a
+        // loaded job is the one it describes, so it may only ever hold a
         // plist launchd actually loaded. Load through a private
         // candidate and publish it with one rename after bootstrap succeeded.
         // A failed replacement (bootout left the old job loaded, bootstrap
@@ -215,31 +217,64 @@ struct LaunchdBackstop: BackstopScheduling {
 
     // MARK: launchctl
 
-    /// The command line of the loaded job, from `launchctl print`: nil when
-    /// no job with the label is loaded or the output has no arguments.
-    func loadedArguments() async throws -> [String]? {
-        let r = try await run(Self.launchctl, ["print", "gui/\(uid)/\(label)"])
-        return r.succeeded ? Self.arguments(fromPrint: r.stdout) : nil
+    /// What `launchctl print` shows of a loaded job that makes it this
+    /// build's polling agent: the command it runs and how often launchd
+    /// starts it.
+    struct LoadedJob: Equatable, Sendable {
+        var arguments: [String]
+        /// StartInterval in seconds; nil when the job has none, so launchd
+        /// never starts it again by itself.
+        var runInterval: Int?
+
+        init(arguments: [String], runInterval: Int?) {
+            self.arguments = arguments
+            self.runInterval = runInterval
+        }
+
+        /// The job a plist from `plistDictionary` loads as.
+        init(plist: [String: Any]) {
+            self.init(arguments: plist["ProgramArguments"] as? [String] ?? [], runInterval: plist["StartInterval"] as? Int)
+        }
     }
 
-    /// The `arguments` block of `launchctl print <service>` output: opened by
-    /// `\targuments = {`, one argument per line indented by two tabs, closed
-    /// by `\t}`. Anything else inside the block, or no closing line, is an
-    /// output this does not know, so nil (and arm() reloads).
-    static func arguments(fromPrint output: String) -> [String]? {
+    /// The loaded job, from `launchctl print`: nil when no job with the
+    /// label is loaded or the output cannot be read.
+    func loadedJob() async throws -> LoadedJob? {
+        let r = try await run(Self.launchctl, ["print", "gui/\(uid)/\(label)"])
+        return r.succeeded ? Self.loadedJob(fromPrint: r.stdout) : nil
+    }
+
+    /// Reads `launchctl print <service>` output, whose top-level keys are
+    /// indented by one tab. `arguments = {` opens a block of one argument per
+    /// line, indented by two tabs, closed by `\t}`; `run interval = <n>
+    /// seconds` is there only for a job with a StartInterval. nil when the
+    /// arguments block is missing, repeated, unclosed or holds a line this
+    /// does not know; a run interval in another form reads as none. Either
+    /// way the job does not match a plist, and arm() reloads it.
+    static func loadedJob(fromPrint output: String) -> LoadedJob? {
+        let intervalPrefix = "\trun interval = ", intervalSuffix = " seconds"
         var arguments: [String]?
+        var inArguments = false
+        var runInterval: Int?
         for line in output.split(separator: "\n", omittingEmptySubsequences: false) {
-            if arguments == nil {
-                if line == "\targuments = {" { arguments = [] }
-            } else if line == "\t}" {
-                return arguments
-            } else if line.hasPrefix("\t\t") {
-                arguments?.append(String(line.dropFirst(2)))
-            } else {
-                return nil
+            if inArguments {
+                if line == "\t}" {
+                    inArguments = false
+                } else if line.hasPrefix("\t\t") {
+                    arguments?.append(String(line.dropFirst(2)))
+                } else {
+                    return nil
+                }
+            } else if line == "\targuments = {" {
+                guard arguments == nil else { return nil }
+                arguments = []
+                inArguments = true
+            } else if line.hasPrefix(intervalPrefix), line.hasSuffix(intervalSuffix) {
+                runInterval = Int(line.dropFirst(intervalPrefix.count).dropLast(intervalSuffix.count))
             }
         }
-        return nil
+        guard let arguments, !inArguments else { return nil }
+        return LoadedJob(arguments: arguments, runInterval: runInterval)
     }
 
     /// bootout by service target (ignored if not loaded: the trusted path may

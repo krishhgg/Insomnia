@@ -15,7 +15,10 @@
 #
 # Deletion is by exact owned file, never by directory tree: --purge removes
 # the files Insomnia writes (see Paths.swift) and then rmdir's its own
-# directories only if they are empty. The lock file is never unlinked, so
+# directories only if they are empty. The bundle trees removed are the
+# installed app and install.sh's own leftovers beside it, matched by the
+# exact names install.sh gives them, and the agent plist goes with the
+# candidate plists install.sh and the app stage it from. The lock file is never unlinked, so
 # --purge leaves APP_SUPPORT/.recovery.lock (and therefore APP_SUPPORT).
 #
 # Honours INSOMNIA_HOME with the same layout as the app (see Paths.swift).
@@ -41,9 +44,18 @@ SUDO=/usr/bin/sudo
 PLUTIL=/usr/bin/plutil
 CODESIGN=/usr/bin/codesign
 LOCKF=/usr/bin/lockf
+DEFAULTS=/usr/bin/defaults
+KILL=/bin/kill
 LOCK_TIMEOUT_SECONDS=10
 # How long to wait for the app to exit after asking it to quit.
 QUIT_WAIT_SECONDS=10
+# Longest one external call made by this script itself (pgrep, defaults,
+# launchctl, codesign) may run before it is stopped with SIGTERM, then
+# SIGKILL. These are unprivileged and never touch the journal, and they run
+# with the lock descriptor closed, so a call that hangs is reported and can
+# never keep the recovery lock. backstop.sh bounds its own commands; the two sudo calls
+# prompt for a password and are left to sudo's own prompt timeout.
+CALL_TIMEOUT_SECONDS=30
 APP="$HOME/Applications/Insomnia.app"
 SUDOERS=/etc/sudoers.d/insomnia
 
@@ -62,10 +74,97 @@ LABEL="com.insomnia.backstop"
 PLIST="$LAUNCH_AGENTS/$LABEL.plist"
 SESSION="$APP_SUPPORT/session.json"
 STATE="$APP_SUPPORT/state.json"
+CONFIG="$APP_SUPPORT/config.json"
+# The agent list the app ships with (Config.defaultAgentList in
+# Sources/Insomnia/Model/Config.swift; a test keeps this copy in step). An
+# older build may have set NSAppSleepDisabled for any of these, even one the
+# user later took off the list in config.json, so the check below covers
+# both lists.
+DEFAULT_AGENTS=(
+  com.t3tools.t3code              # T3 Code (Nightly)
+  com.t3tools.t3code.reasoning    # T3 Code (Reasoning)
+  com.conductor.app               # Conductor
+  com.apple.Terminal              # Terminal
+  com.googlecode.iterm2           # iTerm2
+  com.mitchellh.ghostty           # Ghostty
+  dev.warp.Warp-Stable            # Warp
+  com.google.Chrome               # Google Chrome
+  org.chromium.Chromium           # Chromium
+  company.thebrowser.Browser      # Arc
+  com.docker.docker               # Docker Desktop
+  com.microsoft.VSCode            # Visual Studio Code
+  com.todesktop.230313mzl4w4u92   # Cursor
+  dev.zed.Zed                     # Zed
+  com.google.antigravity          # Antigravity
+  com.anthropic.claudefordesktop  # Claude
+  com.openai.codex                # ChatGPT (hosts Codex and computer use)
+  io.tailscale.ipn.macsys         # Tailscale
+  ai.elementlabs.lmstudio         # LM Studio
+  com.electron.ollama             # Ollama
+)
 LOCK="$APP_SUPPORT/.recovery.lock"
 UID_NUM="$(id -u)"
 
 step() { printf '\n==> %s\n' "$*"; }
+
+# Scratch space for bounded(): this run's own directory, emptied on exit.
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/insomnia-uninstall.XXXXXX")"
+trap 'rm -f "$WORK"/call.* 2>/dev/null; rmdir "$WORK" 2>/dev/null || true' EXIT
+
+# Run one external call with a time limit. Its combined output is left in
+# BOUNDED_OUTPUT (trailing newline removed) and its exit status returned, or
+# 124 when it did not finish within CALL_TIMEOUT_SECONDS: it is then sent
+# SIGTERM, and SIGKILL a second later if it is still there. A supervising
+# subshell waits for the call and writes its status to a file; both run with
+# fd 9 (the recovery lock) closed, so nothing left behind by a stuck call
+# holds the lock once this script exits. Called directly, not in $(...), so
+# the counter that names each call's files stays unique.
+bounded_calls=0
+BOUNDED_OUTPUT=""
+bounded() { # command args...
+  local base supervisor cpid rc i
+  bounded_calls=$((bounded_calls + 1))
+  base="$WORK/call.$bounded_calls"
+  BOUNDED_OUTPUT=""
+  (
+    "$@" </dev/null >"$base.out" 2>&1 &
+    echo "$!" > "$base.pid"
+    rc=0
+    wait "$!" || rc=$?
+    echo "$rc" > "$base.rc"
+  ) </dev/null >/dev/null 2>&1 9>&- &
+  supervisor=$!
+  # Polled every 10 ms: a check makes some 30 calls, so a coarser poll
+  # would add seconds to an uninstall that is otherwise instant.
+  for (( i = 0; i < CALL_TIMEOUT_SECONDS * 100; i++ )); do
+    if [[ -s "$base.rc" ]]; then break; fi
+    sleep 0.01
+  done
+  if [[ ! -s "$base.rc" ]]; then
+    cpid="$(cat "$base.pid" 2>/dev/null || true)"
+    if [[ -n "$cpid" ]]; then kill -TERM "$cpid" 2>/dev/null || true; fi
+    for (( i = 0; i < 10; i++ )); do
+      if [[ -s "$base.rc" ]]; then break; fi
+      sleep 0.1
+    done
+    if [[ ! -s "$base.rc" && -n "$cpid" ]]; then
+      kill -KILL "$cpid" 2>/dev/null || true
+      for (( i = 0; i < 10; i++ )); do
+        if [[ -s "$base.rc" ]]; then break; fi
+        sleep 0.1
+      done
+    fi
+    # Reap the supervisor once it has written the status; one that is
+    # still waiting on an unkillable call is left behind without the lock.
+    if [[ -s "$base.rc" ]]; then wait "$supervisor" 2>/dev/null || true; fi
+    return 124
+  fi
+  read -r rc < "$base.rc"
+  wait "$supervisor" 2>/dev/null || true
+  IFS= read -r -d '' BOUNDED_OUTPUT < "$base.out" || true
+  BOUNDED_OUTPUT="${BOUNDED_OUTPUT%$'\n'}"
+  return "$rc"
+}
 
 # Fail closed on paths that are not the exact things install.sh created.
 case "$APP_SUPPORT" in /*) ;; *) echo "refusing: app support path is not absolute: $APP_SUPPORT" >&2; exit 1 ;; esac
@@ -131,6 +230,24 @@ journal_shape_problems() { # file
       done
     fi
   fi
+  t="$(type_of "$f" appNapOverrides)"
+  if [[ -n "$t" && "$t" != "(any)" ]]; then
+    if [[ "$t" != array ]]; then
+      echo "appNapOverrides is a $t, not an array"
+    else
+      i=0
+      while [[ -n "$(type_of "$f" "appNapOverrides.$i")" ]]; do
+        if [[ "$(type_of "$f" "appNapOverrides.$i")" != dictionary ]]; then
+          echo "appNapOverrides[$i] is not an object"
+        else
+          [[ "$(type_of "$f" "appNapOverrides.$i.bundleId")" == string ]] || echo "appNapOverrides[$i].bundleId is not a string"
+          t="$(type_of "$f" "appNapOverrides.$i.previous")"
+          [[ -z "$t" || "$t" == bool || "$t" == "(any)" ]] || echo "appNapOverrides[$i].previous is a $t, not a bool"
+        fi
+        i=$((i + 1))
+      done
+    fi
+  fi
 }
 
 # Independent check of the journal: prints one line per unresolved item.
@@ -173,6 +290,72 @@ journal_problems() {
   if extract "$STATE" savedKeyboardBrightness >/dev/null; then
     echo "saved keyboard backlight is not restored; only the app can do that"
   fi
+  value="$(extract_json "$STATE" appNapOverrides || true)"
+  if [[ -n "$value" && "$value" != "[]" ]]; then
+    echo "App Nap settings (NSAppSleepDisabled) are not put back: $value"
+  fi
+}
+
+# Agent apps whose NSAppSleepDisabled is YES with no journal entry: set by a
+# build that did not record the previous value, or by the user. Nothing is
+# known to put back, so nothing is changed; the exact command to undo each
+# one is printed instead, shell-quoted, since the list editor takes any
+# string. Checked: the shipped list plus config.json's agentList. Only a
+# read that says "does not exist" counts as clear; a read that fails any
+# other way is reported, not counted. Each read is bounded; one that does
+# not answer in time (cfprefsd stuck) ends the check, since the rest would
+# wait the same way, and uninstall goes on.
+list_unrecorded_app_nap() {
+  local ids="" i=0 id value rc found=0 checked=0 unreadable=0 stuck="" skipped=0
+  for id in "${DEFAULT_AGENTS[@]}"; do ids="$ids$id"$'\n'; done
+  if [[ -f "$CONFIG" ]]; then
+    while id="$(extract "$CONFIG" "agentList.$i")"; do
+      i=$((i + 1))
+      ids="$ids$id"$'\n'
+    done
+  fi
+  while IFS= read -r id; do
+    [[ -n "$id" && "$id" != -* ]] || continue
+    if [[ -n "$stuck" ]]; then skipped=$((skipped + 1)); continue; fi
+    rc=0
+    bounded "$DEFAULTS" read "$id" NSAppSleepDisabled || rc=$?
+    value="$BOUNDED_OUTPUT"
+    if (( rc == 124 )); then
+      stuck="$id"
+      unreadable=$((unreadable + 1))
+      printf 'defaults read did not answer within %ss for %s; check it yourself with: defaults read %q NSAppSleepDisabled\n' "$CALL_TIMEOUT_SECONDS" "$id" "$id"
+      continue
+    fi
+    if (( rc != 0 )); then
+      if [[ "$value" == *"does not exist"* ]]; then
+        checked=$((checked + 1))
+      else
+        unreadable=$((unreadable + 1))
+        printf 'could not read NSAppSleepDisabled for %s; check it yourself with: defaults read %q NSAppSleepDisabled\n' "$id" "$id"
+      fi
+      continue
+    fi
+    checked=$((checked + 1))
+    [[ "$value" == 1 ]] || continue
+    if (( found == 0 )); then
+      found=1
+      cat <<MSG
+NSAppSleepDisabled is YES for these agent apps and Insomnia has no record of
+what it was before (an older build set it without recording). They are left
+as they are. To turn App Nap back on for one, run:
+MSG
+    fi
+    printf '  defaults delete %q NSAppSleepDisabled\n' "$id"
+  done < <(printf '%s' "$ids" | awk '!seen[$0]++')
+  if (( found == 0 )); then
+    echo "none of the $checked agent apps checked has NSAppSleepDisabled set"
+  fi
+  if (( unreadable > 0 )); then
+    echo "$unreadable could not be read; see above"
+  fi
+  if (( skipped > 0 )); then
+    echo "stopped after $stuck did not answer; $skipped more agent apps were not checked"
+  fi
 }
 
 abort_incomplete() { # backstop exit status, problem lines...
@@ -199,14 +382,24 @@ What to do, then rerun this script:
   - Frozen or legacy pids: open Insomnia.app to resolve them, or inspect each
     with 'ps -o pid,stat,lstart,command -p <pid>' and 'kill -CONT <pid>' it
     yourself if it is a process you recognise.
+  - App Nap (NSAppSleepDisabled): the recovery agent retries 'defaults write'
+    or 'defaults delete' every minute, and Insomnia.app restores them at
+    launch. If 'defaults' keeps failing, see the log.
   - Unreadable journal or session file: open Insomnia.app, or repair the file.
   - Log: $LOG_DIR/insomnia.log
 MSG
   exit 1
 }
 
+# A pgrep that does not answer in time counts as "running": fail closed.
 app_running() {
-  "$PGREP" -x Insomnia >/dev/null 2>&1
+  local rc=0
+  bounded "$PGREP" -x Insomnia || rc=$?
+  if (( rc == 124 )); then
+    echo "pgrep did not answer within ${CALL_TIMEOUT_SECONDS}s; treating Insomnia as running." >&2
+    return 0
+  fi
+  return "$rc"
 }
 
 # 1. Quit the app --------------------------------------------------------------
@@ -255,9 +448,13 @@ if [[ -f "$ROOT/scripts/backstop.sh" ]]; then
   BACKSTOP="$ROOT/scripts/backstop.sh"
 elif [[ -f "$APP/Contents/Resources/backstop.sh" ]]; then
   verify_rc=0
-  verify_out="$("$CODESIGN" --verify --strict "$APP" 2>&1)" || verify_rc=$?
-  if (( verify_rc != 0 )); then
-    echo "$APP does not pass 'codesign --verify --strict' (exit $verify_rc: ${verify_out:-no detail}), so the backstop.sh sealed in it was not run." >&2
+  bounded "$CODESIGN" --verify --strict "$APP" || verify_rc=$?
+  if (( verify_rc == 124 )); then
+    echo "'codesign --verify --strict $APP' did not answer within ${CALL_TIMEOUT_SECONDS}s, so the backstop.sh sealed in it was not run." >&2
+    echo "Nothing was removed. Run this script from a checkout of the source (its scripts/backstop.sh is used first), or rerun once codesign answers." >&2
+    exit 1
+  elif (( verify_rc != 0 )); then
+    echo "$APP does not pass 'codesign --verify --strict' (exit $verify_rc: ${BOUNDED_OUTPUT:-no detail}), so the backstop.sh sealed in it was not run." >&2
     echo "Nothing was removed. Run this script from a checkout of the source (its scripts/backstop.sh is used first), or reinstall with scripts/install.sh and rerun." >&2
     exit 1
   fi
@@ -291,6 +488,9 @@ if app_running; then
   exit 1
 fi
 
+step "Checking App Nap settings of agent apps"
+list_unrecorded_app_nap
+
 # 5. Remove, still under the lock -------------------------------------------
 # bootout first: it stops a running instance of the agent and drops queued
 # runs, so nothing is left to reopen the journal once the files go. Then
@@ -298,14 +498,17 @@ fi
 # every recovery file intact.
 step "Removing LaunchAgent"
 bootout_rc=0
-"$LAUNCHCTL" bootout "gui/$UID_NUM" "$PLIST" >/dev/null 2>&1 || bootout_rc=$?
+bounded "$LAUNCHCTL" bootout "gui/$UID_NUM" "$PLIST" || bootout_rc=$?
 # `launchctl print` exits 113 only when the service is not loaded; 0 means
-# still loaded and anything else means launchd could not be asked.
+# still loaded and anything else means launchd could not be asked. 124 from
+# either call means it did not answer within CALL_TIMEOUT_SECONDS.
 print_rc=0
-"$LAUNCHCTL" print "gui/$UID_NUM/$LABEL" >/dev/null 2>&1 || print_rc=$?
+bounded "$LAUNCHCTL" print "gui/$UID_NUM/$LABEL" || print_rc=$?
 if (( print_rc != 113 )); then
   if (( print_rc == 0 )); then
     echo "launchctl bootout exited $bootout_rc and $LABEL is still loaded in gui/$UID_NUM." >&2
+  elif (( print_rc == 124 )); then
+    echo "launchctl bootout exited $bootout_rc and 'launchctl print' did not answer within ${CALL_TIMEOUT_SECONDS}s; cannot tell whether $LABEL is still loaded." >&2
   else
     echo "launchctl bootout exited $bootout_rc and 'launchctl print' exited $print_rc; cannot tell whether $LABEL is still loaded." >&2
   fi
@@ -313,6 +516,16 @@ if (( print_rc != 113 )); then
   exit 1
 fi
 rm -f "$PLIST"
+# Candidate plists install.sh and the app write before a load and rename
+# into place after it: in the staging directory beside the plist, and in
+# $LAUNCH_AGENTS itself for older builds. Only files with the label's
+# candidate prefix, the same ones both of them sweep; the staging directory
+# goes only once empty.
+CANDIDATE_DIR="$LAUNCH_AGENTS/.$LABEL.staging"
+for candidate in "$CANDIDATE_DIR/$LABEL.candidate-"* "$LAUNCH_AGENTS/$LABEL.candidate-"*; do
+  if [[ -f "$candidate" && ! -L "$candidate" ]]; then rm -f "$candidate"; fi
+done
+if [[ -d "$CANDIDATE_DIR" && ! -L "$CANDIDATE_DIR" ]]; then rmdir "$CANDIDATE_DIR" 2>/dev/null || true; fi
 
 step "Removing $SUDOERS (requires your password)"
 if [[ -e "$SUDOERS" ]] || "$SUDO" test -e "$SUDOERS"; then
@@ -321,6 +534,32 @@ fi
 
 step "Removing app bundle"
 rm -rf "$APP"
+# install.sh's leftovers beside the bundle, by the exact names it gives them.
+# An upgrade sets the previous bundle aside at .Insomnia.app.previous during
+# its swap and assembles the new one in .Insomnia.app.staging.<pid>.<six
+# letters and digits> (mktemp). The swap runs under the recovery lock, which
+# this script holds, so a set-aside bundle belongs to a run that was stopped.
+# A staging directory whose run is still alive belongs to an install that
+# has not reached the lock yet, and stays. kill -0 only asks whether the
+# process exists; it sends no signal. Symlinks and any other name are left.
+APP_DIR="$(dirname "$APP")"
+PREVIOUS_APP="$APP_DIR/.Insomnia.app.previous"
+if [[ -d "$PREVIOUS_APP" && ! -L "$PREVIOUS_APP" ]]; then
+  rm -rf "$PREVIOUS_APP"
+  echo "removed $PREVIOUS_APP, the previous bundle an interrupted install set aside"
+fi
+staging_re='^\.Insomnia\.app\.staging\.([0-9]+)\.[A-Za-z0-9]{6}$'
+for dir in "$APP_DIR"/.Insomnia.app.staging.*; do
+  [[ -d "$dir" && ! -L "$dir" ]] || continue
+  [[ "${dir##*/}" =~ $staging_re ]] || continue
+  owner="${BASH_REMATCH[1]}"
+  if "$KILL" -0 "$owner" 2>/dev/null; then
+    echo "kept $dir: the install.sh run that made it (pid $owner) is still running"
+    continue
+  fi
+  rm -rf "$dir"
+  echo "removed $dir, left by an install.sh run that is gone"
+done
 
 # $APP_SUPPORT/backstop.sh below is the writable copy of older installs; the
 # current one went with the bundle.

@@ -293,8 +293,7 @@ final class FloorRuleDriverTests: XCTestCase {
 
         // The end queues behind the held Low Power change; release the hold
         // first, then wait for both. Awaiting the end here would deadlock.
-        let end = Task { await m.end(reason: .user) }
-        await settleQueuedRequests()
+        let end = await runUntilSuspended { await m.end(reason: .user) }
         await gate.open()
         await floor.value
         _ = await end.value

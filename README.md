@@ -148,10 +148,13 @@ previous bundle back, so the loaded agent always matches the installed app. If
 the unload is not confirmed, the new bundle stays with the agent that pins it
 and the installer asks you to rerun it. After that, or after an install killed
 in the middle of that step, the next run keeps whichever bundle the agent's
-plist on disk pins. Before it moves a bundle back for that, it unloads any
-agent the earlier run left loaded, and it stops without moving either bundle
-if that unload is not confirmed. Unresolved recovery prevents replacing
-either; follow the reported instructions before retrying.
+plist on disk pins. It does that only after its own recovery step succeeds:
+while recovery is unresolved, an agent the earlier run left loaded may be the
+one retrying it, so the installer stops without unloading that agent or
+moving either bundle. Once recovery succeeds, it unloads that agent, moves the
+bundle back and loads the plist on disk again, and it stops if `launchctl
+print` does not confirm the unload or the reload. Unresolved recovery prevents
+replacing either; follow the reported instructions before retrying.
 
 </details>
 
@@ -226,6 +229,11 @@ The defaults are worth knowing:
   until it is readable again. A desktop has no battery and no floor. Serious
   thermal state requests Low Power Mode; critical thermal state ends the
   session. These rules require the app to be running.
+  Setting the end floor to 0 turns the battery end off. Otherwise the end
+  floor stays below the Low Power Mode floor. The Settings steppers move the
+  other floor when the two would cross, and a hand-edited `config.json` with
+  the floors out of order is corrected at launch, and logged, by raising the
+  Low Power Mode floor.
 
 To exercise the lid actions without closing the lid, run
 `scripts/simulate-lid.sh closed` and then `scripts/simulate-lid.sh open` during
@@ -268,10 +276,18 @@ installation scenarios still need [release validation](docs/release-validation.m
   or fail with a warning instead of running alongside it.
 - **Audio:** the backstop preserves volume/mute entries but cannot restore
   CoreAudio. Reopen the app for recovery.
+- **Sleep disabled by something else:** at launch, with no session and no
+  journal entry, a `SleepDisabled 1` in `pmset -g` is left alone: Insomnia
+  did not set it and only its owner should undo it. The menu shows a warning
+  and a notification gives the command, `sudo pmset -a disablesleep 0`.
+  Ending an Insomnia session sets it to 0 whoever set it.
 - **Low Power Mode:** Insomnia checks the existing setting so it does not
   claim ownership of an already-enabled preference.
-- **App Nap:** preferences applied to configured agent apps intentionally
-  persist after session end and uninstall.
+- **App Nap:** off by default. When the setting is on, Insomnia journals each
+  agent app's previous `NSAppSleepDisabled` value before writing it and puts
+  it back at session end, in the backstop, and in uninstall. Values an older
+  build wrote without a record are not guessed at: uninstall prints the
+  `defaults delete` command for each one and continues.
 - **Uninstall:** refuses to remove recovery machinery while unresolved changes
   remain. A failed uninstall is not confirmation that power settings are normal.
 
@@ -347,7 +363,10 @@ From your checkout:
 
 The uninstaller requests cleanup before removing the app, agent, and sudoers
 rule. If recovery is incomplete or the app refuses to quit, it stops; resolve
-the reported problem and retry. Purge removes owned files, not arbitrary
+the reported problem and retry. With the app it removes what an interrupted
+install left beside it: `~/Applications/.Insomnia.app.previous`, and
+`.Insomnia.app.staging.*` directories of installs that are no longer running.
+Nothing else in `~/Applications` is touched. Purge removes owned files, not arbitrary
 directory contents. A small shared lock file is retained to keep concurrent
 recovery operations coordinated.
 
