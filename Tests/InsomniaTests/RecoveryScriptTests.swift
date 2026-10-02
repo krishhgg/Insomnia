@@ -527,8 +527,39 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
         XCTAssertEqual(fx.calls().filter { $0.hasPrefix("backstop ") }, ["backstop sealed --force"], "\(fx.calls())")
         XCTAssertTrue(r.stdout.contains("using \(fx.installedBackstop.path)"), r.stdout)
+        let verify = try XCTUnwrap(fx.calls().firstIndex(of: "codesign --verify --strict \(fx.app.path)"), "the sealed copy is verified: \(fx.calls())")
+        let ran = try XCTUnwrap(fx.calls().firstIndex(of: "backstop sealed --force"))
+        XCTAssertLessThan(verify, ran, "verified before it runs: \(fx.calls())")
         XCTAssertFalse(fx.exists(fx.app))
         XCTAssertFalse(fx.exists(fx.legacyBackstop), "the writable copy goes with the rest")
+    }
+
+    /// The sealed copy is covered by the bundle's resource seal; when the
+    /// bundle no longer verifies (the script was edited, as the LaunchAgent
+    /// would also find), uninstall does not run it and removes nothing. The
+    /// checkout's copy is not verified: it is the source.
+    func testUninstallRefusesTheSealedCopyWhenTheBundleFailsVerification() throws {
+        try fx.installMachinery()
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        try FileManager.default.removeItem(at: fx.backstop)
+        try fx.writeMarkerBackstop(at: fx.installedBackstop, name: "sealed")
+        try fx.writeMarkerBackstop(at: fx.legacyBackstop, name: "legacy")
+        fx.setMode("codesign", "verify-fails")
+
+        let r = try fx.run(fx.uninstall, ["--purge"])
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertTrue(fx.calls().contains("codesign --verify --strict \(fx.app.path)"), "\(fx.calls())")
+        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("backstop ") }, "neither the unverified sealed copy nor the legacy copy ran: \(fx.calls())")
+        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("launchctl") || $0.hasPrefix("sudo") }, "\(fx.calls())")
+        XCTAssertTrue(r.stderr.contains("sealed resource"), "codesign's reason is reported: \(r.stderr)")
+        XCTAssertTrue(r.stderr.contains("Nothing was removed"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("checkout"), "the way out is named: \(r.stderr)")
+        XCTAssertTrue(fx.exists(fx.plist))
+        XCTAssertTrue(fx.exists(fx.sudoers))
+        XCTAssertTrue(fx.exists(fx.app))
+        XCTAssertTrue(fx.exists(fx.config))
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, true)
     }
 
     func testUninstallRunsTheLegacyCopyWhenNeitherCheckoutNorBundleHasOne() throws {
@@ -1734,6 +1765,7 @@ private final class ScriptFixture {
             "OSASCRIPT": bin.appendingPathComponent("osascript").path,
             "LAUNCHCTL": bin.appendingPathComponent("launchctl").path,
             "SUDO": bin.appendingPathComponent("sudo").path,
+            "CODESIGN": bin.appendingPathComponent("codesign").path,
             "APP": app.path,
             "SUDOERS": sudoers.path,
             "LOCK_TIMEOUT_SECONDS": "1",
