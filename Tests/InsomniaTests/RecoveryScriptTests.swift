@@ -709,6 +709,92 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(fx.calls().contains { $0.hasPrefix("defaults write") || $0.hasPrefix("defaults delete") }, "\(fx.calls())")
     }
 
+    /// A `defaults read` that never answers (cfprefsd stuck) is stopped
+    /// after the call limit, reported with the command to check it by hand,
+    /// and ends the check, since every later read would wait the same way.
+    /// Uninstall then finishes, and nothing left running holds the lock.
+    func testUninstallStopsAHungDefaultsReadAndFinishes() throws {
+        try fx.installMachinery()
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        try fx.writeConfig(#"{"agentList":["com.google.Chrome"]}"#)
+        fx.setMode("defaults", "hang:com.google.Chrome")
+        let index = try XCTUnwrap(Config.defaultAgentList.firstIndex(of: "com.google.Chrome"))
+
+        let started = Date()
+        let tmp = try fx.privateTmp()
+        let r = try fx.run(fx.uninstall, ["--purge"], extraEnvironment: ["TMPDIR": tmp.path])
+        let elapsed = Date().timeIntervalSince(started)
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertLessThan(elapsed, 20, "one bounded read, not the fake's 60 s hang")
+        XCTAssertEqual(fx.calls().filter { $0.hasPrefix("defaults read") },
+                       Config.defaultAgentList[...index].map { "defaults read \($0) NSAppSleepDisabled" },
+                       "the check stops at the read that did not answer")
+        XCTAssertFalse(fx.calls().contains("defaults FD9-OPEN"), "the read runs without the lock descriptor")
+        XCTAssertTrue(fx.hungProcessGone("defaults"), "the read ignored SIGTERM, so it was killed")
+        XCTAssertTrue(r.stdout.contains("defaults read did not answer within 1s for com.google.Chrome; check it yourself with: defaults read com.google.Chrome NSAppSleepDisabled"), r.stdout)
+        XCTAssertTrue(r.stdout.contains("stopped after com.google.Chrome did not answer; \(Config.defaultAgentList.count - index - 1) more agent apps were not checked"), r.stdout)
+        XCTAssertTrue(try fx.lockIsFree())
+        XCTAssertFalse(fx.exists(fx.plist))
+        XCTAssertFalse(fx.exists(fx.app))
+        XCTAssertFalse(fx.exists(fx.config))
+        XCTAssertEqual(try fx.contents(of: tmp), [], "the scratch directory is gone, including the stopped call's files")
+    }
+
+    /// A `launchctl print` that never answers cannot prove the agent is
+    /// gone: uninstall stops with every recovery file in place, and exits
+    /// instead of holding the lock while it waits.
+    func testUninstallStopsAHungLaunchctlPrintAndKeepsEverything() throws {
+        try fx.installMachinery()
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        fx.setMode("launchctl", "print-hangs")
+
+        let started = Date()
+        let tmp = try fx.privateTmp()
+        let r = try fx.run(fx.uninstall, ["--purge"], extraEnvironment: ["TMPDIR": tmp.path])
+        let elapsed = Date().timeIntervalSince(started)
+
+        XCTAssertNotEqual(r.status, 0)
+        XCTAssertLessThan(elapsed, 20, "one bounded print, not the fake's 60 s hang")
+        XCTAssertTrue(r.stderr.contains("'launchctl print' did not answer within 1s; cannot tell whether com.insomnia.backstop is still loaded"), r.stderr)
+        XCTAssertFalse(fx.calls().contains("launchctl FD9-OPEN"), "\(fx.calls())")
+        XCTAssertTrue(fx.hungProcessGone("launchctl"))
+        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("sudo rm") }, "\(fx.calls())")
+        XCTAssertTrue(fx.exists(fx.plist))
+        XCTAssertTrue(fx.exists(fx.sudoers))
+        XCTAssertTrue(fx.exists(fx.app))
+        XCTAssertTrue(fx.exists(fx.config))
+        XCTAssertTrue(fx.exists(fx.state))
+        XCTAssertTrue(try fx.lockIsFree())
+        XCTAssertEqual(try fx.contents(of: tmp), [], "the scratch directory is gone, including the stopped call's files")
+    }
+
+    /// A `pgrep` that never answers under the lock counts as "Insomnia is
+    /// running": uninstall stops before the backstop runs and lets go of
+    /// the lock.
+    func testUninstallTreatsAHungPgrepAsRunning() throws {
+        try fx.installMachinery()
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        fx.setMode("pgrep", "1\nhang\n")   // not running at the quit step, then no answer
+
+        let started = Date()
+        let tmp = try fx.privateTmp()
+        let r = try fx.run(fx.uninstall, extraEnvironment: ["TMPDIR": tmp.path])
+        let elapsed = Date().timeIntervalSince(started)
+
+        XCTAssertNotEqual(r.status, 0)
+        XCTAssertLessThan(elapsed, 20)
+        XCTAssertTrue(r.stderr.contains("pgrep did not answer within 1s; treating Insomnia as running."), r.stderr)
+        XCTAssertFalse(fx.calls().contains("pgrep FD9-OPEN"), "\(fx.calls())")
+        XCTAssertTrue(fx.hungProcessGone("pgrep"))
+        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("sudo") || $0.hasPrefix("launchctl") }, "\(fx.calls())")
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, true)
+        XCTAssertTrue(fx.exists(fx.plist))
+        XCTAssertTrue(fx.exists(fx.app))
+        XCTAssertTrue(try fx.lockIsFree())
+        XCTAssertEqual(try fx.contents(of: tmp), [], "the scratch directory is gone, including the stopped call's files")
+    }
+
     /// uninstall.sh carries a copy of the shipped agent list so its check
     /// covers apps the user later removed from config.json. The copy must
     /// match Config.defaultAgentList, in order.
@@ -1867,6 +1953,7 @@ private final class ScriptFixture {
             "SUDOERS": sudoers.path,
             "LOCK_TIMEOUT_SECONDS": "1",
             "QUIT_WAIT_SECONDS": "1",
+            "CALL_TIMEOUT_SECONDS": "1",
         ]).write(to: uninstall, atomically: true, encoding: .utf8)
 
         // install.sh: every $HOME-derived path and every tool is redirected
@@ -2034,7 +2121,8 @@ private final class ScriptFixture {
         // write and delete fail; "fail:<domain>" only that domain's. Mode
         // "unreachable" (or "unreachable:<domain>") fails every command,
         // read included, the way a cfprefsd that does not answer would:
-        // non-zero without the "does not exist" message.
+        // non-zero without the "does not exist" message. Mode "hang" (or
+        // "hang:<domain>") never answers; see hangHere.
         try writeFake("defaults", """
         printf 'defaults %s\\n' "$*" >> "\(calls)"
         mode="$(cat "\(r)/defaults.mode" 2>/dev/null || echo ok)"
@@ -2054,6 +2142,8 @@ private final class ScriptFixture {
           awk -F'|' -v d="$domain" '$1 != d' "$table" > "$table.next" && mv "$table.next" "$table"
         }
         failing() { [[ "$mode" == fail || "$mode" == "fail:$domain" ]]; }
+        \(hangHere("defaults"))
+        if [[ "$mode" == hang || "$mode" == "hang:$domain" ]]; then hang_here; fi
         if [[ "$mode" == unreachable || "$mode" == "unreachable:$domain" ]]; then
           echo "fake defaults: cfprefsd did not answer for $domain" >&2; exit 1
         fi
@@ -2081,6 +2171,8 @@ private final class ScriptFixture {
         [[ -f "$f" ]] || exit 1
         first="$(head -n 1 "$f")"
         if (( $(wc -l < "$f") > 1 )); then tail -n +2 "$f" > "$f.next" && mv "$f.next" "$f"; fi
+        \(hangHere("pgrep"))
+        if [[ "$first" == hang ]]; then hang_here; fi
         exit "${first:-1}"
         """)
         for tool in ["pkill", "osascript"] {
@@ -2123,11 +2215,14 @@ private final class ScriptFixture {
             echo 'launchctl LOCK-HELD during bootstrap' >> "\(calls)"
           fi
         fi
+        \(hangHere("launchctl"))
+        if [[ "${1:-}:$mode" == print:print-hangs ]]; then hang_here; fi
         prints=0
         if [[ "${1:-}" == print ]]; then
           prints=$(( $(cat "\(r)/print.count" 2>/dev/null || echo 0) + 1 )); echo "$prints" > "\(r)/print.count"
         fi
         case "${1:-}:$mode" in
+          bootout:print-hangs) exit 0 ;;
           bootout:ok|bootout:loaded|bootout:loaded-bootstrap-fails-once|bootout:loaded-then-lost|bootout:no-then-error|bootout:loaded-bootstrap-always-fails) exit 0 ;;
           bootstrap:ok|bootstrap:loaded) exit 0 ;;
           bootstrap:loaded-then-lost|bootstrap:no-then-error) echo "Bootstrap failed: 5: Input/output error" >&2; exit 5 ;;
@@ -2177,6 +2272,41 @@ private final class ScriptFixture {
         f.timeZone = TimeZone(identifier: "UTC")
         f.dateFormat = "EEE MMM d HH:mm:ss yyyy"
         return f.string(from: Date(timeIntervalSince1970: TimeInterval(epoch)))
+    }
+
+    /// Shell function for a fake: a call that never answers. It notes in
+    /// the call log if it inherited fd 9 (the recovery lock), records its
+    /// pid in `<tool>.hung.pid`, ignores SIGTERM and sleeps 60 s, so only a
+    /// SIGKILL ends it before then.
+    func hangHere(_ tool: String) -> String {
+        """
+        hang_here() {
+          if { : >&9; } 2>/dev/null; then echo '\(tool) FD9-OPEN' >> "\(callsLog.path)"; fi
+          echo $$ > "\(root.path)/\(tool).hung.pid"
+          trap '' TERM
+          exec /bin/sleep 60
+        }
+        """
+    }
+
+    /// A TMPDIR inside the fixture for one run, so a test can check that
+    /// the script leaves no scratch files behind.
+    func privateTmp() throws -> URL {
+        let dir = root.appendingPathComponent("tmp", isDirectory: true)
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    /// Whether the hung fake of `tool` ran and has since exited.
+    func hungProcessGone(_ tool: String, within seconds: Double = 5) -> Bool {
+        guard let text = try? String(contentsOf: root.appendingPathComponent("\(tool).hung.pid"), encoding: .utf8),
+              let pid = pid_t(text.trimmingCharacters(in: .whitespacesAndNewlines)) else { return false }
+        let deadline = Date().addingTimeInterval(seconds)
+        repeat {
+            if kill(pid, 0) == -1 && errno == ESRCH { return true }
+            Thread.sleep(forTimeInterval: 0.1)
+        } while Date() < deadline
+        return false
     }
 
     /// What the fake `defaults` holds: one NSAppSleepDisabled value per
@@ -2271,7 +2401,8 @@ private final class ScriptFixture {
 
     /// Runs a script copy. `fd9` opens that file on descriptor 9 of the child
     /// first, the way uninstall.sh hands its lock handle to the backstop.
-    /// `extraEnvironment` is for install.sh's refusal test only.
+    /// `extraEnvironment` is for install.sh's refusal test and for a
+    /// private TMPDIR (see privateTmp).
     func run(_ script: URL, _ args: [String] = [], fd9: URL? = nil, extraEnvironment: [String: String] = [:]) throws -> (status: Int32, stdout: String, stderr: String) {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/bash")

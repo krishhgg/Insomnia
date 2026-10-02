@@ -247,7 +247,11 @@ last held while it was on was the battery or thermal floor, not the lid.
   lists each whose key is `YES` with no journal entry, prints the
   shell-quoted `defaults delete` command for it, and continues. The summary
   says how many apps were checked; an app whose key cannot be read is
-  reported, not counted.
+  reported, not counted. Each read has a 30 s limit, like every other call
+  uninstall makes under the recovery lock (`pgrep`, `launchctl`); a read
+  that does not answer ends the check with the command to run by hand, and
+  uninstall goes on. A call past its limit gets SIGTERM, then SIGKILL, and
+  never holds the lock.
 - Browser throttling: Chromium browsers throttle windows macOS reports as
   occluded, which is every window once the lid is closed with no external
   display. Timers drop to 1 Hz, animation frames stop, pages report hidden.
