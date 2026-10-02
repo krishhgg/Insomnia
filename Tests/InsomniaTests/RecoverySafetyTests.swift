@@ -84,6 +84,7 @@ final class RecoverySafetyTests: XCTestCase {
         XCTAssertEqual(h.guardFake.calls, ["pmset -g", "disablesleep 1"])
         XCTAssertEqual(try h.store.loadState()?.sleepDisabledByUs, true)
         XCTAssertEqual(h.notifier.posts.map(\.title), [SessionManager.foreignSleepTitle])
+        XCTAssertNil(m.foreignSleepWarning)
         XCTAssertNil(m.lastError)
     }
 
