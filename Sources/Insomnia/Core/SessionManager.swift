@@ -81,6 +81,12 @@ final class SessionManager {
     private(set) var countdownText: String = ""
     /// Last failure worth showing in the menu; cleared on the next success.
     private(set) var lastError: String?
+    /// Reconcile found SleepDisabled set with no session and no journal
+    /// claim: something other than Insomnia disabled sleep. Kept apart from
+    /// `lastError` so a restore failure from the same reconcile stays
+    /// visible beside it. Cleared by a session start, or by
+    /// `recheckForeignSleep()` once the bit reads 0 again.
+    private(set) var foreignSleepWarning: String?
 
     var isActive: Bool { session != nil }
 
@@ -149,6 +155,10 @@ final class SessionManager {
     /// Detail of the last unreadable-journal notification, so a journal
     /// that stays broken is announced once, not on every transaction.
     @ObservationIgnored private var announcedCorruption: String?
+    /// Whether this launch has posted the notification for a SleepDisabled
+    /// bit Insomnia did not set (reconcile step 3), so a bit that stays set
+    /// is announced once, not on every reconcile.
+    @ObservationIgnored private var announcedForeignSleep = false
 
     init(
         paths: Paths,
@@ -425,6 +435,7 @@ final class SessionManager {
 
         session = new
         lastError = nil
+        foreignSleepWarning = nil
         Log.info("session started until \(iso(new.endsAt)) (\(Int(duration))s requested)")
         await armDeadline(new.endsAt)
         // App Nap defaults and every observer live in AppServices.
@@ -1001,19 +1012,69 @@ final class SessionManager {
             Log.info("reconcile: no session, nothing to restore")
         }
 
-        // Step 3: SleepDisabled set with no session -> clear it.
+        // Step 3: SleepDisabled set with no session. A disable Insomnia
+        // journaled was undone in step 1, so a bit still set here was set by
+        // something else (a hand-run pmset, another tool), or is still
+        // journaled as ours after a failed restore. Neither is cleared from
+        // here: the first is not Insomnia's to undo, the second is retried
+        // from the journal. The foreign case is observed and reported.
         do {
             if try await sleepGuard.isSleepDisabled() {
                 guard session == nil else {
                     Log.info("reconcile: a session started meanwhile; leaving SleepDisabled")
                     return
                 }
-                Log.info("reconcile: pmset reports SleepDisabled with no session, clearing")
-                try await sleepGuard.enableSleep()
+                if state.sleepDisabledByUs {
+                    Log.info("reconcile: SleepDisabled is still journaled as ours; the restore is retried from the journal, not repeated here")
+                } else {
+                    reportForeignSleepDisable()
+                }
             }
         } catch {
             Log.error("reconcile: sleep check failed: \(error.localizedDescription)")
         }
+    }
+
+    /// `pmset -g` shows SleepDisabled 1 with no session and no journal
+    /// entry: something other than Insomnia disabled sleep, and only its
+    /// owner should re-enable it. Shown on its own menu line on every
+    /// reconcile that finds it, and posted as a notification once per
+    /// launch. The line is cleared by the next session start, whose end
+    /// sets `disablesleep 0` whoever set the bit, or by a recheck that
+    /// reads the bit as 0.
+    private func reportForeignSleepDisable() {
+        foreignSleepWarning = Self.foreignSleepLine
+        guard !announcedForeignSleep else {
+            Log.info("reconcile: \(Self.foreignSleepLine) (already reported)")
+            return
+        }
+        announcedForeignSleep = true
+        Log.info("reconcile: \(Self.foreignSleepLine)")
+        notifier.post(
+            title: Self.foreignSleepTitle,
+            body: "pmset reports SleepDisabled 1, but Insomnia has no session and did not set it, so it is left alone. To re-enable sleep: \(Self.foreignSleepCommand). Ending an Insomnia session also sets it to 0."
+        )
+    }
+
+    /// Re-read `pmset -g` while the foreign-sleep line is up, and drop the
+    /// line once the bit reads 0: whoever set it has re-enabled sleep. The
+    /// menu calls this on open, so the line goes away on the opening after
+    /// the one that found it gone. The read changes nothing and takes no
+    /// lock, so it never waits behind a start or an end, and it only ever
+    /// clears the line, so an answer that lands after a session start is a
+    /// no-op. A bit that still reads 1 keeps the line; a failed read keeps
+    /// it too, since nothing is known to have changed.
+    func recheckForeignSleep() async {
+        guard foreignSleepWarning != nil else { return }
+        do {
+            if try await sleepGuard.isSleepDisabled() { return }
+        } catch {
+            Log.error("foreign sleep recheck failed, keeping the warning: \(error.localizedDescription)")
+            return
+        }
+        guard foreignSleepWarning != nil else { return }
+        foreignSleepWarning = nil
+        Log.info("SleepDisabled reads 0 again; foreign sleep warning cleared")
     }
 
     // MARK: Countdown (1 Hz redraw)
@@ -1174,6 +1235,9 @@ final class SessionManager {
     static let notEndedTitle = "Session not ended"
     static let journalTitle = "Recovery journal unreadable"
     static let promptStuckTitle = "Password prompt still running"
+    static let foreignSleepTitle = "Sleep is disabled by something else"
+    static let foreignSleepCommand = "sudo pmset -a disablesleep 0"
+    static let foreignSleepLine = "Sleep is disabled by something other than Insomnia; to re-enable it: \(foreignSleepCommand)"
 
     private static func endTitle(_ reason: EndReason, had: Bool) -> String {
         switch reason {

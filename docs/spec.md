@@ -385,7 +385,14 @@ Reconcile runs at every Insomnia launch:
    running): end the session with a notification, no prompt. If the lid is
    open, restore recorded lid-close actions. Arming, read or restoration
    errors must remain visible.
-3. `pmset -g` reports `SleepDisabled 1` with no session → set it to 0.
+3. `pmset -g` reports `SleepDisabled 1` with no session and no journal
+   entry → leave it. Step 1 has already undone a disable Insomnia journaled,
+   so this one was set by something else (a hand-run `pmset`, another tool)
+   and is not Insomnia's to undo. Log it, show it on the menu's warning line,
+   and notify once per launch with `sudo pmset -a disablesleep 0`. A bit
+   still journaled as ours after a failed restore is retried from the
+   journal, not from this check. Nothing clears `SleepDisabled` without a
+   journal entry, in the app or in the agent.
 
 Backstop, independent of the app:
 
@@ -411,7 +418,8 @@ Backstop, independent of the app:
 turned back on while Insomnia was not running, extend reminder 5 minutes
 before end, battery floor reached, battery unreadable twice in a row, thermal
 action taken, network gap recovered (with nudge summary), sleep restored by
-backstop.
+backstop, sleep disabled by something other than Insomnia (reconcile step 3,
+once per launch).
 
 ### 10. Settings
 

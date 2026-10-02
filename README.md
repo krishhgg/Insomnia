@@ -223,6 +223,11 @@ installation scenarios still need [release validation](docs/release-validation.m
   or fail with a warning instead of running alongside it.
 - **Audio:** the backstop preserves volume/mute entries but cannot restore
   CoreAudio. Reopen the app for recovery.
+- **Sleep disabled by something else:** at launch, with no session and no
+  journal entry, a `SleepDisabled 1` in `pmset -g` is left alone: Insomnia
+  did not set it and only its owner should undo it. The menu shows a warning
+  and a notification gives the command, `sudo pmset -a disablesleep 0`.
+  Ending an Insomnia session sets it to 0 whoever set it.
 - **Low Power Mode:** Insomnia checks the existing setting so it does not
   claim ownership of an already-enabled preference.
 - **App Nap:** preferences applied to configured agent apps intentionally
