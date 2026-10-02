@@ -226,7 +226,7 @@ final class LidActionsTests: XCTestCase {
         h.display.brightness = 0.75
 
         let driver = FloorRuleDriver(manager: m, notifier: h.notifier)
-        await driver.run(percent: 35, isCharging: false, thermal: .nominal, lidClosed: false)
+        await driver.run(battery: .percent(35), isCharging: false, thermal: .nominal, lidClosed: false)
         XCTAssertTrue(h.guardFake.lowPowerOn)
         XCTAssertEqual(journaledAtSample, false, "sampled before the ownership was journaled")
         XCTAssertEqual(callsAtSample, ["disablesleep 1", "pmset -g custom"], "and before lowpowermode 1")
@@ -240,7 +240,7 @@ final class LidActionsTests: XCTestCase {
         sampler.sample()
         XCTAssertEqual(sampler.last?.keyboard, 0.3, "the keyboard still samples")
 
-        await driver.run(percent: 35, isCharging: true, thermal: .nominal, lidClosed: false)
+        await driver.run(battery: .percent(35), isCharging: true, thermal: .nominal, lidClosed: false)
         XCTAssertFalse(h.guardFake.lowPowerOn)
         h.display.brightness = 0.8
         sampler.sample()
@@ -266,7 +266,7 @@ final class LidActionsTests: XCTestCase {
         h.display.onSet = { _ in modeAtWrite.value.append(guardFake.lowPowerOn) }
 
         let driver = FloorRuleDriver(manager: m, notifier: h.notifier)
-        await driver.run(percent: 35, isCharging: false, thermal: .nominal, lidClosed: false)
+        await driver.run(battery: .percent(35), isCharging: false, thermal: .nominal, lidClosed: false)
         h.display.brightness = 0.5
         sampler.sample()
         h.display.brightness = 0.335
@@ -280,7 +280,7 @@ final class LidActionsTests: XCTestCase {
         }
         XCTAssertEqual(h.display.sets, [0, 0.75, 0.75], "the open's restore and its re-assert, under the mode")
 
-        await driver.run(percent: 35, isCharging: true, thermal: .nominal, lidClosed: false)
+        await driver.run(battery: .percent(35), isCharging: true, thermal: .nominal, lidClosed: false)
         XCTAssertFalse(h.guardFake.lowPowerOn)
         for _ in 0..<300 where h.display.sets.count < 5 {
             try await Task.sleep(for: .milliseconds(10))
@@ -315,7 +315,7 @@ final class LidActionsTests: XCTestCase {
         h.display.onSet = { _ in modeAtWrite.value.append(guardFake.lowPowerOn) }
 
         let driver = FloorRuleDriver(manager: m, notifier: h.notifier)
-        await driver.run(percent: 35, isCharging: false, thermal: .nominal, lidClosed: false)
+        await driver.run(battery: .percent(35), isCharging: false, thermal: .nominal, lidClosed: false)
         await actions.onClose()
         await actions.onOpen()
         XCTAssertEqual(h.display.sets, [0, 0.75])
@@ -347,10 +347,10 @@ final class LidActionsTests: XCTestCase {
         h.display.brightness = 0.75
 
         let driver = FloorRuleDriver(manager: m, notifier: h.notifier)
-        await driver.run(percent: 80, isCharging: false, thermal: .nominal, lidClosed: true)
+        await driver.run(battery: .percent(80), isCharging: false, thermal: .nominal, lidClosed: true)
         await actions.onClose()
         await actions.onOpen()
-        await driver.run(percent: 80, isCharging: false, thermal: .nominal, lidClosed: false)
+        await driver.run(battery: .percent(80), isCharging: false, thermal: .nominal, lidClosed: false)
         XCTAssertFalse(h.guardFake.lowPowerOn)
         XCTAssertEqual(h.display.sets, [0, 0.75, 0.75])
 
@@ -376,7 +376,7 @@ final class LidActionsTests: XCTestCase {
         h.display.brightness = 0.75
 
         let driver = FloorRuleDriver(manager: m, notifier: h.notifier)
-        await driver.run(percent: 35, isCharging: false, thermal: .nominal, lidClosed: false)
+        await driver.run(battery: .percent(35), isCharging: false, thermal: .nominal, lidClosed: false)
         await actions.onClose()
         await actions.onOpen()
         XCTAssertEqual(h.display.sets, [0, 0.75])
@@ -385,7 +385,7 @@ final class LidActionsTests: XCTestCase {
         // ...a key press does not.
         h.display.brightness = 0.4
 
-        await driver.run(percent: 35, isCharging: true, thermal: .nominal, lidClosed: false)
+        await driver.run(battery: .percent(35), isCharging: true, thermal: .nominal, lidClosed: false)
         XCTAssertFalse(h.guardFake.lowPowerOn)
         XCTAssertEqual(h.display.sets, [0, 0.75], "nothing written over the user's value")
         XCTAssertNil(try h.store.loadState()?.displayRestoredUnderLowPower)
@@ -414,7 +414,7 @@ final class LidActionsTests: XCTestCase {
         await m.start(duration: 3600)
 
         let driver = FloorRuleDriver(manager: m, notifier: h.notifier)
-        await driver.run(percent: 35, isCharging: false, thermal: .nominal, lidClosed: false)
+        await driver.run(battery: .percent(35), isCharging: false, thermal: .nominal, lidClosed: false)
         XCTAssertTrue(h.guardFake.lowPowerOn)
         XCTAssertNil(try h.store.loadState()?.displayRestoredUnderLowPower)
         XCTAssertTrue(logText().contains("dropped: a new low power mode interval starts"), logText())
@@ -437,7 +437,7 @@ final class LidActionsTests: XCTestCase {
         await m.start(duration: 3600)
         h.display.brightness = 0.75
         let driver = FloorRuleDriver(manager: m, notifier: h.notifier)
-        await driver.run(percent: 35, isCharging: false, thermal: .nominal, lidClosed: false)
+        await driver.run(battery: .percent(35), isCharging: false, thermal: .nominal, lidClosed: false)
         await actions.onClose()
         await actions.onOpen()
 
@@ -470,7 +470,7 @@ final class LidActionsTests: XCTestCase {
         await m.start(duration: 3600)
         h.display.brightness = 0.75
         let driver = FloorRuleDriver(manager: m, notifier: h.notifier)
-        await driver.run(percent: 35, isCharging: false, thermal: .nominal, lidClosed: false)
+        await driver.run(battery: .percent(35), isCharging: false, thermal: .nominal, lidClosed: false)
         await actions.onClose()
         await actions.onOpen()
         XCTAssertEqual(try h.store.loadState()?.displayRestoredUnderLowPower, 0.75)
@@ -528,8 +528,8 @@ final class LidActionsTests: XCTestCase {
         await m.start(duration: 3600)
 
         let driver = FloorRuleDriver(manager: m, notifier: h.notifier)
-        await driver.run(percent: 35, isCharging: false, thermal: .nominal, lidClosed: false)
-        await driver.run(percent: 35, isCharging: true, thermal: .nominal, lidClosed: false)
+        await driver.run(battery: .percent(35), isCharging: false, thermal: .nominal, lidClosed: false)
+        await driver.run(battery: .percent(35), isCharging: true, thermal: .nominal, lidClosed: false)
         await m.end(reason: .user)
         XCTAssertEqual(h.display.sets, [])
     }
@@ -549,13 +549,13 @@ final class LidActionsTests: XCTestCase {
         h.display.brightness = 0.75
 
         let driver = FloorRuleDriver(manager: m, notifier: h.notifier)
-        await driver.run(percent: 35, isCharging: false, thermal: .nominal, lidClosed: false)
+        await driver.run(battery: .percent(35), isCharging: false, thermal: .nominal, lidClosed: false)
         await actions.onClose()
         await actions.onOpen()
         await actions.onClose()
         XCTAssertEqual(h.display.sets, [0, 0.75, 0])
 
-        await driver.run(percent: 35, isCharging: true, thermal: .nominal, lidClosed: true)
+        await driver.run(battery: .percent(35), isCharging: true, thermal: .nominal, lidClosed: true)
         XCTAssertFalse(h.guardFake.lowPowerOn)
         XCTAssertEqual(h.display.sets, [0, 0.75, 0], "nothing lit under the closed lid")
         XCTAssertTrue(logText().contains("display restore after low power mode dropped: darkened again"), logText())
