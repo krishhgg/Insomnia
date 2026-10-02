@@ -325,9 +325,10 @@ final class SessionManager {
     /// Start a session of `duration` seconds (clamped to `config.maxDuration`).
     /// Ignored if a session is already active; use `extend`.
     ///
-    /// Ordering: session.json, then state.json, then the recovery agent,
-    /// then the pending-start marker, then the password dialog that runs
-    /// `pmset disablesleep 1`. A failure before the dialog is rolled back:
+    /// Ordering: a check that the installed backstop.sh can void the
+    /// dialog (BackstopVersion), then session.json, then state.json, then
+    /// the recovery agent, then the pending-start marker, then the password
+    /// dialog that runs `pmset disablesleep 1`. A failure before the dialog is rolled back:
     /// nothing has touched the machine. So is a cancelled dialog or an
     /// osascript that never started, which ran nothing as root: no pmset
     /// runs, so a sleep setting someone else owns is left alone. Any other
@@ -364,6 +365,15 @@ final class SessionManager {
             Log.error("start refused, nothing changed")
             fail(text)
             notifier.post(title: Self.endTitle(.startFailed, had: false), body: "Nothing was changed: \(text)")
+            return
+        }
+        do {
+            // Only a backstop.sh that deletes the marker can void the
+            // dialog below if this process dies under it.
+            try backstop.checkVoidsPrompts()
+        } catch {
+            fail("start refused, nothing changed: \(error.localizedDescription)")
+            notifier.post(title: Self.endTitle(.startFailed, had: false), body: "Nothing was changed: \(error.localizedDescription).")
             return
         }
         let now = clock()
@@ -404,7 +414,9 @@ final class SessionManager {
         // every outcome, before this transaction lets go of the lock, and
         // by whoever takes the lock next if this process dies first, so a
         // dialog answered after its start was abandoned changes nothing.
-        let pending = PendingStart(marker: store.paths.pendingStartFile, nonce: UUID().uuidString)
+        // The command is also given the session's end and refuses after
+        // it, so a password typed too late changes nothing either.
+        let pending = PendingStart(marker: store.paths.pendingStartFile, nonce: UUID().uuidString, deadline: new.endsAt)
         do {
             try store.savePendingStart(pending.nonce)
         } catch {
@@ -425,30 +437,42 @@ final class SessionManager {
         do {
             try await sleepGuard.disableSleep(pending)
         } catch let AdministratorPromptError.stillRunning(prompt, grace) {
-            // The prompt's process did not stop on SIGTERM. The marker goes
-            // first, so an answer that still comes cannot turn sleep off.
-            // A root command already past that check holds the marker's
-            // lock, so the marker stays until it exits. Either way nothing
-            // is killed and nothing is rolled back beside it: session.json,
-            // the journal entry and the recovery lock stay until the prompt
+            // The prompt's process did not stop on SIGTERM. Nothing is
+            // killed. The marker goes first, under its lock, so an answer
+            // that still comes cannot turn sleep off.
+            let voided = await clearPendingStart()
+            let alive = prompt.osascriptAlive
+            if voided {
+                // The command behind the dialog now finds no marker and
+                // changes nothing, whenever it runs, so nothing here waits
+                // for it: the start is rolled back now and the recovery
+                // lock goes with this transaction. The leftover process is
+                // reported, and watched on its own until it exits.
+                reportStuckPrompt(prompt, grace: grace, osascriptAlive: alive, voided: true)
+                watchVoidedPrompt(prompt, grace: grace)
+                _ = await performEnd(reason: .startFailed)
+                return
+            }
+            // A root command already past its check holds the marker's
+            // lock and may still run pmset (or the marker cannot be
+            // deleted): nothing is rolled back beside it. session.json, the
+            // journal entry and the recovery lock stay until the prompt
             // exits, the same rule a stuck `sudo pmset` gets. The user is
             // told what is running and, while it is osascript itself, how
             // to stop it. Then the rollback.
-            let voided = await clearPendingStart()
-            let alive = prompt.osascriptAlive
-            reportStuckPrompt(prompt, grace: grace, osascriptAlive: alive)
+            reportStuckPrompt(prompt, grace: grace, osascriptAlive: alive, voided: false)
             if alive {
                 // The pid is ours to name only until osascript exits; a
                 // root command it started can keep its output open longer.
                 await prompt.waitUntilOsascriptExits()
                 if prompt.isRunning {
-                    fail("start: \(Self.stuckPromptText(prompt, grace: grace, osascriptAlive: false))")
+                    fail("start: \(Self.stuckPromptText(prompt, grace: grace, osascriptAlive: false, voided: false))")
                 }
             }
             await prompt.waitUntilExit()
             // The command that held the marker's lock has exited with the
             // prompt, so the marker can go before the undo reads the result.
-            if !voided { await clearPendingStart() }
+            await clearPendingStart()
             fail("could not disable sleep: \(prompt) did not finish in time and has now exited; rolling the start back")
             _ = await performEnd(reason: .startFailed)
             return
@@ -757,7 +781,13 @@ final class SessionManager {
                     Log.error("sleep restored, but its journal entry is kept")
                     fail(Self.markerProblemText(problem))
                 } else {
-                    try? journal { $0.sleepDisabledByUs = false }
+                    do {
+                        try journal { $0.sleepDisabledByUs = false }
+                    } catch {
+                        // The entry stays: the end reports itself incomplete
+                        // and the next run restores sleep again.
+                        fail("sleep restored but the journal entry could not be cleared: \(error.localizedDescription); it will be retried")
+                    }
                 }
             } catch {
                 fail("could not restore sleep: \(error.localizedDescription)")
@@ -1248,13 +1278,13 @@ final class SessionManager {
     }
 
     /// Posted once per stuck prompt: the notification and the menu's
-    /// warning line say what is running and that starts, ends and recovery
-    /// wait behind it. `kill <pid>` is only offered while the pid is
-    /// osascript's own, and only on the menu line: the caller replaces that
-    /// line as soon as osascript exits, while a notification stays in
-    /// Notification Center after the pid is gone and possibly reused.
-    private func reportStuckPrompt(_ prompt: UnfinishedPrompt, grace: TimeInterval, osascriptAlive: Bool) {
-        let body = Self.stuckPromptText(prompt, grace: grace, osascriptAlive: osascriptAlive)
+    /// warning line say what is running and what Insomnia does about it.
+    /// `kill <pid>` is only offered while the pid is osascript's own, and
+    /// only on the menu line: that line is replaced as soon as osascript
+    /// exits, while a notification stays in Notification Center after the
+    /// pid is gone and possibly reused.
+    private func reportStuckPrompt(_ prompt: UnfinishedPrompt, grace: TimeInterval, osascriptAlive: Bool, voided: Bool) {
+        let body = Self.stuckPromptText(prompt, grace: grace, osascriptAlive: osascriptAlive, voided: voided)
         if osascriptAlive {
             fail("start: \(body) To stop it by hand while it runs: kill \(prompt.pid)")
             notifier.post(title: Self.promptStuckTitle, body: "\(body) The Insomnia menu shows how to stop it while it runs.")
@@ -1264,11 +1294,33 @@ final class SessionManager {
         }
     }
 
-    private static func stuckPromptText(_ prompt: UnfinishedPrompt, grace: TimeInterval, osascriptAlive: Bool) -> String {
+    private static func stuckPromptText(_ prompt: UnfinishedPrompt, grace: TimeInterval, osascriptAlive: Bool, voided: Bool) -> String {
         let what = osascriptAlive
             ? "osascript (pid \(prompt.pid)), the process behind the password dialog, did not stop within \(Int(grace)) s."
             : "osascript (pid \(prompt.pid)) stopped, but a command it started as root is still running."
+        if voided {
+            return "\(what) Its start is void, so it can no longer turn sleep off; the start is rolled back without waiting for it."
+        }
         return "\(what) Insomnia keeps the session record and waits for it before rolling the start back; nothing else runs until then."
+    }
+
+    /// Outside any transaction, keeps the menu line `reportStuckPrompt`
+    /// set for a voided prompt true until the prompt is gone: the kill hint
+    /// goes when osascript exits, the whole line when the prompt has
+    /// exited. A line something else has set since is left alone.
+    private func watchVoidedPrompt(_ prompt: UnfinishedPrompt, grace: TimeInterval) {
+        let reported = lastError
+        Task { @MainActor [weak self] in
+            var line = reported
+            await prompt.waitUntilOsascriptExits()
+            if let self, line != nil, self.lastError == line, prompt.isRunning {
+                line = "start: \(Self.stuckPromptText(prompt, grace: grace, osascriptAlive: false, voided: true))"
+                self.lastError = line
+            }
+            await prompt.waitUntilExit()
+            if let self, line != nil, self.lastError == line { self.lastError = nil }
+            Log.info("\(prompt), whose start was voided, has exited")
+        }
     }
 
     /// Locks, then deletes the pending-start marker (see PendingStart and

@@ -67,6 +67,13 @@
 # (used by install.sh / uninstall.sh to end a stale session deliberately).
 #
 # Honours INSOMNIA_HOME with the same layout as the app (see Paths.swift).
+#
+# The line below says which recovery contract this copy implements. The app
+# reads it from the installed script before every password dialog and
+# refuses Start when it is missing or lower than it needs
+# (BackstopVersion.swift). 2: pending-start is deleted under its lock, as
+# described above. Raise it when the app comes to rely on something new here.
+# insomnia-backstop-version: 2
 set -euo pipefail
 export LC_ALL=C TZ=UTC
 

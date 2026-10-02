@@ -19,7 +19,7 @@ final class OsascriptAdministratorPromptTests: XCTestCase {
 
     private var argsFile: URL { dir.appendingPathComponent("args") }
     private var trace: URL { dir.appendingPathComponent("trace") }
-    private var start: PendingStart { PendingStart(marker: dir.appendingPathComponent("pending-start"), nonce: "nonce-1") }
+    private var start: PendingStart { PendingStart(marker: dir.appendingPathComponent("pending-start"), nonce: "nonce-1", deadline: Date().addingTimeInterval(3600)) }
 
     /// A fake osascript. `body` runs after the arguments were recorded, each
     /// ending in a NUL byte (the script spans lines), in `argsFile`.
@@ -57,9 +57,9 @@ final class OsascriptAdministratorPromptTests: XCTestCase {
     }
 
     /// The whole script is one literal: lockf on the marker, the root
-    /// command with each `"` escaped for AppleScript, the marker path and
-    /// nonce taken from argv through `quoted form of`, the privilege flag
-    /// and the dialog text.
+    /// command with each `"` escaped for AppleScript, the marker path,
+    /// nonce and deadline taken from argv through `quoted form of`, the
+    /// privilege flag and the dialog text.
     func testScriptIsTheExactLiteral() {
         let embedded = AdministratorPrompt.rootCommand
             .replacingOccurrences(of: "\\", with: "\\\\")
@@ -67,7 +67,7 @@ final class OsascriptAdministratorPromptTests: XCTestCase {
         XCTAssertEqual(AdministratorPrompt.markerLock, "/usr/bin/lockf -k -n -t 10")
         XCTAssertEqual(AdministratorPrompt.disableSleepScript, """
         on run argv
-        do shell script "\(AdministratorPrompt.markerLock) " & quoted form of (item 1 of argv) & " /bin/sh -c " & quoted form of "\(embedded)" & " insomnia " & quoted form of (item 1 of argv) & " " & quoted form of (item 2 of argv) with administrator privileges with prompt "Insomnia needs your password to turn off system sleep for this session."
+        do shell script "\(AdministratorPrompt.markerLock) " & quoted form of (item 1 of argv) & " /bin/sh -c " & quoted form of "\(embedded)" & " insomnia " & quoted form of (item 1 of argv) & " " & quoted form of (item 2 of argv) & " " & quoted form of (item 3 of argv) with administrator privileges with prompt "Insomnia needs your password to turn off system sleep for this session."
         end run
         """)
     }
@@ -89,12 +89,13 @@ final class OsascriptAdministratorPromptTests: XCTestCase {
         XCTAssertEqual(process.terminationStatus, 0, String(decoding: errData, as: UTF8.self))
     }
 
-    func testRunsTheFixedScriptThroughOsascriptWithTheMarkerAndNonceAsArguments() async throws {
+    /// The deadline goes as whole seconds since 1970, rounded down.
+    func testRunsTheFixedScriptThroughOsascriptWithTheMarkerNonceAndDeadlineAsArguments() async throws {
         let exe = try fakeOsascript("exit 0")
         let prompt = OsascriptAdministratorPrompt(executable: exe, timeout: 5)
-        let odd = PendingStart(marker: dir.appendingPathComponent("it's \"pending\" $(x)"), nonce: "nonce-1")
+        let odd = PendingStart(marker: dir.appendingPathComponent("it's \"pending\" $(x)"), nonce: "nonce-1", deadline: Date(timeIntervalSince1970: 1_800_000_900.9))
         try await prompt.disableSleep(odd)
-        XCTAssertEqual(try recordedArgs(), ["-e", AdministratorPrompt.disableSleepScript, odd.marker.path, "nonce-1"])
+        XCTAssertEqual(try recordedArgs(), ["-e", AdministratorPrompt.disableSleepScript, odd.marker.path, "nonce-1", "1800000900"])
     }
 
     func testCancelledDialogIsReportedAsCancelled() async throws {
@@ -357,6 +358,30 @@ final class RootCommandTests: XCTestCase {
         XCTAssertEqual(r.pmsetCalls, [])
     }
 
+    /// A password accepted at or after the session's end turns nothing
+    /// off, even though the marker still holds the nonce.
+    func testDoesNothingOnceTheSessionHasEnded() throws {
+        try Data("nonce-1".utf8).write(to: marker)
+        let now = Int(Date().timeIntervalSince1970)
+        for deadline in [now - 1, now, now - 86_400] {
+            let r = try runRootCommand(marker: marker, nonce: "nonce-1", deadline: String(deadline), in: dir)
+            XCTAssertEqual(r.status, 4, "deadline \(deadline): \(r.stderr)")
+            XCTAssertEqual(r.pmsetCalls, [], "deadline \(deadline)")
+            XCTAssertTrue(r.stderr.contains("the session this password was for has already ended; sleep was not turned off"), r.stderr)
+        }
+    }
+
+    /// A deadline that is not a plain number fails the comparison, which
+    /// refuses: a malformed one can never mean "no deadline".
+    func testAnUnreadableDeadlineNeverPasses() throws {
+        try Data("nonce-1".utf8).write(to: marker)
+        for deadline in ["", "soon", "1e12", "0x2540BE3FF", "9999999999s", "99999999999999999999", "$(echo 9999999999)"] {
+            let r = try runRootCommand(marker: marker, nonce: "nonce-1", deadline: deadline, in: dir)
+            XCTAssertEqual(r.status, 4, "deadline \(deadline.debugDescription): \(r.stderr)")
+            XCTAssertEqual(r.pmsetCalls, [], "deadline \(deadline.debugDescription)")
+        }
+    }
+
     /// The command holds the marker's lock from before its check until
     /// pmset exits, so the app cannot delete the marker in between: the
     /// removal times out and the marker stays, and once pmset is done it
@@ -384,13 +409,16 @@ final class RootCommandTests: XCTestCase {
     }
 
     /// The other order: a remover holds the lock when the answer comes.
-    /// The command waits for the lock, and by the time it has it the
-    /// marker is gone, so nothing runs.
+    /// The command has opened the marker and waits for the lock, and by
+    /// the time it has it the marker is gone, so nothing runs. The marker
+    /// is deleted only once lockf is seen blocked on it (see
+    /// `waitUntilLockfWaits`); a command that had not reached it yet would
+    /// exit 69, not 3.
     func testAnAnswerThatWaitsOnARemovalRunsNothing() throws {
         try Data("nonce-1".utf8).write(to: marker)
         let holder = try FileLockHolder(marker)
         let command = try RootCommandProcess(marker: marker, nonce: "nonce-1", in: dir)
-        usleep(300_000)
+        XCTAssertTrue(waitUntilLockfWaits(under: command.pid), "lockf never blocked on the marker")
         try FileManager.default.removeItem(at: marker)
         holder.release()
         let r = command.wait()
@@ -515,7 +543,7 @@ final class PmsetSleepGuardPromptTests: XCTestCase {
     }
 
     private func pendingStart() throws -> PendingStart {
-        let start = PendingStart(marker: dir.appendingPathComponent("pending-start"), nonce: UUID().uuidString)
+        let start = PendingStart(marker: dir.appendingPathComponent("pending-start"), nonce: UUID().uuidString, deadline: Date().addingTimeInterval(3600))
         try Data(start.nonce.utf8).write(to: start.marker)
         return start
     }
@@ -619,8 +647,39 @@ final class SleepPromptLifecycleTests: XCTestCase {
         let shownFor = try XCTUnwrap(h.prompt.starts.first)
         XCTAssertEqual(shownFor.marker, h.home.paths.pendingStartFile)
         XCTAssertFalse(shownFor.nonce.isEmpty)
+        XCTAssertEqual(shownFor.deadline, s.endsAt)
         XCTAssertEqual(h.prompt.markerAtShow, [shownFor.nonce])
         XCTAssertFalse(markerExists, "the marker must not outlive its start")
+    }
+
+    /// An installed backstop.sh that cannot void a dialog (an upgrade that
+    /// stopped before replacing it) means no dialog: Start is refused before
+    /// anything is written, and the user is told to run install.sh again.
+    func testStartWithAnOlderBackstopShowsNoPrompt() async throws {
+        h.backstop.outdatedScript = true
+        let m = h.makeManager()
+        await m.start(duration: 1800)
+
+        XCTAssertEqual(h.backstop.checks, 1)
+        XCTAssertEqual(h.prompt.shown, 0)
+        XCTAssertEqual(h.guardFake.calls, [])
+        XCTAssertEqual(h.backstop.arms, 0)
+        XCTAssertNil(m.session)
+        XCTAssertNil(try h.store.loadSession())
+        XCTAssertNil(try h.store.loadState())
+        XCTAssertFalse(markerExists)
+        let err = try XCTUnwrap(m.lastError)
+        XCTAssertTrue(err.hasPrefix("start refused, nothing changed: "), err)
+        XCTAssertTrue(err.hasSuffix("run scripts/install.sh again"), err)
+        let post = try XCTUnwrap(h.notifier.posts.last)
+        XCTAssertEqual(post.title, "Session not started")
+        XCTAssertTrue(post.body.hasPrefix("Nothing was changed: "), post.body)
+        XCTAssertTrue(post.body.contains("run scripts/install.sh again"), post.body)
+
+        h.backstop.outdatedScript = false
+        await m.start(duration: 1800)
+        XCTAssertTrue(m.isActive)
+        XCTAssertEqual(h.prompt.shown, 1)
     }
 
     /// Every attempt gets its own nonce, so a dialog left from one start
@@ -742,6 +801,23 @@ final class SleepPromptLifecycleTests: XCTestCase {
         XCTAssertEqual(h.notifier.posts.last?.title, "Session not started")
     }
 
+    /// A one-minute session whose password is typed 90 s later: the
+    /// dialog's command is given the session's end and refuses after it,
+    /// so sleep stays on and the start is rolled back.
+    func testPasswordTypedAfterTheSessionsEndTurnsNothingOff() async throws {
+        let clock = h.clock
+        h.prompt.onShow = { _ in clock.advance(90) }
+        let m = h.makeManager()
+        await m.start(duration: 60)
+
+        XCTAssertEqual(h.prompt.starts.first?.deadline, Date(timeIntervalSince1970: 1_800_000_060))
+        try assertRolledBackClean(m)
+        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1", "disablesleep 0"])
+        let err = try XCTUnwrap(m.lastError)
+        XCTAssertTrue(err.contains("the session this password was for has already ended"), err)
+        XCTAssertEqual(h.notifier.posts.last?.title, "Session not started")
+    }
+
     /// While the dialog is up the session file, the journal entry and the
     /// armed backstop already exist, so a crash mid-prompt leaves recovery
     /// a record. A dialog nobody answers times out and rolls back.
@@ -780,58 +856,87 @@ final class SleepPromptLifecycleTests: XCTestCase {
         }
     }
 
-    /// A prompt whose process will not stop is reported with its pid and
-    /// waited for: the marker goes at once, session.json, the journal entry
-    /// and the recovery lock stay, an end requested meanwhile queues behind
-    /// it, nothing is killed, the menu stops naming the pid once osascript
-    /// exits, and the rollback runs once the whole prompt has exited.
-    func testStuckPromptIsReportedWithItsPidAndRolledBackAfterItExits() async throws {
+    /// Starts with a prompt that never exits by itself. Returns its handle
+    /// once the start has been rolled back with the prompt still running;
+    /// nil (after recording a failure and letting the prompt go, so the
+    /// test ends instead of hanging) if the start waited for it instead.
+    private func startWithAVoidedStuckPrompt(_ m: SessionManager) async throws -> UnfinishedPrompt? {
         h.prompt.mode = .stuck
-        let m = h.makeManager()
-
         let start = Task { await m.start(duration: 1800) }
-        try await waitUntil("the stuck prompt is reported") {
-            h.notifier.posts.contains { $0.title == "Password prompt still running" }
-        }
-
+        let notifier = h.notifier
+        let rolledBack = { notifier.posts.contains { $0.title == "Session not started" } }
+        try await waitUntil("the start is rolled back while the prompt runs", rolledBack)
         let handle = try XCTUnwrap(h.prompt.unfinished)
-        XCTAssertTrue(handle.isRunning)
-        let post = try XCTUnwrap(h.notifier.posts.last)
-        XCTAssertTrue(post.body.contains("pid 4242"), post.body)
-        XCTAssertFalse(post.body.contains("kill"), "a notification outlives the pid, which may be reused: \(post.body)")
-        XCTAssertTrue(try XCTUnwrap(m.lastError).hasSuffix("kill 4242"), "the menu line offers it while osascript runs")
-        XCTAssertNil(m.session, "no session is surfaced")
-        XCTAssertFalse(markerExists, "an answer that still comes must not turn sleep off")
-        XCTAssertNotNil(try h.store.loadSession(), "session.json stays so the backstop honours the deadline")
-        XCTAssertEqual(try h.store.loadState()?.sleepDisabledByUs, true, "the journal entry stays")
-        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1"], "nothing is rolled back beside a command that may still run")
-        XCTAssertNil(try RecoveryLock(url: h.home.paths.recoveryLock).tryAcquire(), "the recovery lock stays held")
+        guard rolledBack() else {
+            handle.markExited()
+            await start.value
+            return nil
+        }
+        await start.value
+        return handle
+    }
 
-        let end = Task { await m.end(reason: .user) }
-        await settleQueuedRequests()
-        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1"], "the end waits behind the prompt")
+    /// A prompt whose process will not stop, with its marker gone under
+    /// the marker's lock: the command behind it can no longer change
+    /// anything, so the start is rolled back at once and the recovery lock
+    /// is let go while osascript still runs. Nothing is killed. The menu
+    /// names the pid while osascript runs, drops the kill when it exits,
+    /// and drops the line once the whole prompt has exited.
+    func testStuckPromptWhoseMarkerIsGoneIsRolledBackWithoutWaiting() async throws {
+        let m = h.makeManager()
+        guard let handle = try await startWithAVoidedStuckPrompt(m) else { return }
+
+        XCTAssertTrue(handle.osascriptAlive, "osascript has not exited")
+        try assertRolledBackClean(m)
+        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1", "disablesleep 0"])
+        let free = try XCTUnwrap(try RecoveryLock(url: h.home.paths.recoveryLock).tryAcquire(), "the recovery lock is let go")
+        free.release()
+        let stuck = h.notifier.posts.filter { $0.title == "Password prompt still running" }
+        XCTAssertEqual(stuck.count, 1, "\(h.notifier.posts)")
+        let body = try XCTUnwrap(stuck.first).body
+        XCTAssertTrue(body.contains("pid 4242"), body)
+        XCTAssertTrue(body.contains("can no longer turn sleep off"), body)
+        XCTAssertFalse(body.contains("kill"), "a notification outlives the pid, which may be reused: \(body)")
+        XCTAssertEqual(h.notifier.posts.last?.title, "Session not started")
+        XCTAssertTrue(try XCTUnwrap(m.lastError).hasSuffix("kill 4242"), "the menu line offers it while osascript runs")
+
+        // Nothing waits behind it: an end runs and a later start shows its
+        // own dialog.
+        let outcome = await m.end(reason: .user)
+        XCTAssertEqual(outcome, .restored)
+        XCTAssertTrue(handle.isRunning)
 
         // osascript exits while a command it started still holds its
-        // output: the menu line stops offering the kill at once, and
-        // nothing else moves.
+        // output: the kill goes, the line stays until that exits too.
         handle.markOsascriptExited()
         try await waitUntil("the menu line drops the kill") {
             !(m.lastError?.contains("kill") ?? true)
         }
         XCTAssertTrue(try XCTUnwrap(m.lastError).contains("a command it started as root is still running"), m.lastError ?? "")
-        XCTAssertTrue(handle.isRunning)
-        XCTAssertEqual(h.notifier.posts.filter { $0.title == "Password prompt still running" }.count, 1, "the change is a menu line, not a second notification")
-        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1"], "the rollback still waits for the output to close")
-        XCTAssertNotNil(try h.store.loadSession())
+        handle.markExited()
+        try await waitUntil("the menu line goes with the prompt") { m.lastError == nil }
+
+        h.prompt.mode = .succeed
+        await m.start(duration: 1800)
+        XCTAssertTrue(m.isActive)
+        XCTAssertEqual(h.prompt.shown, 2)
+    }
+
+    /// A menu line set by something else after the report is not the
+    /// watcher's to replace or clear.
+    func testVoidedPromptWatcherLeavesALaterLineAlone() async throws {
+        let m = h.makeManager()
+        guard let handle = try await startWithAVoidedStuckPrompt(m) else { return }
+        h.backstop.outdatedScript = true
+        await m.start(duration: 1800)
+        let later = try XCTUnwrap(m.lastError)
+        XCTAssertTrue(later.hasPrefix("start refused"), later)
 
         handle.markExited()
-        await start.value
-        XCTAssertFalse(m.lastError?.contains("kill") ?? false, "the menu line drops the pid once it has exited: \(m.lastError ?? "")")
-        _ = await end.value
-        try assertRolledBackClean(m)
-        XCTAssertEqual(h.guardFake.calls.filter { $0 == "disablesleep 0" }.count, 1, "\(h.guardFake.calls)")
-        XCTAssertTrue(h.notifier.posts.contains { $0.title == "Session not started" })
-        XCTAssertEqual(h.prompt.shown, 1)
+        try await waitUntil("the watcher sees the prompt exit") {
+            ((try? String(contentsOf: h.home.paths.logFile, encoding: .utf8)) ?? "").contains("whose start was voided, has exited")
+        }
+        XCTAssertEqual(m.lastError, later)
     }
 
     // MARK: Abandoned dialog
@@ -842,7 +947,7 @@ final class SleepPromptLifecycleTests: XCTestCase {
     /// answer to the old dialog then runs nothing.
     func testRelaunchVoidsTheDialogOfAStartThatDied() async throws {
         _ = try seedValidSession()
-        let orphan = PendingStart(marker: h.home.paths.pendingStartFile, nonce: UUID().uuidString)
+        let orphan = PendingStart(marker: h.home.paths.pendingStartFile, nonce: UUID().uuidString, deadline: Date().addingTimeInterval(3600))
         try h.store.savePendingStart(orphan.nonce)
         h.guardFake.sleepDisabled = false
         let m = h.makeManager()
@@ -850,7 +955,7 @@ final class SleepPromptLifecycleTests: XCTestCase {
 
         try assertRolledBackClean(m)
         XCTAssertEqual(h.prompt.shown, 0)
-        let late = try runRootCommand(marker: orphan.marker, nonce: orphan.nonce, in: h.home.root)
+        let late = try runRootCommand(marker: orphan.marker, nonce: orphan.nonce, deadline: orphan.deadlineArgument, in: h.home.root)
         XCTAssertEqual(late.status, 69, late.stderr)
         XCTAssertEqual(late.pmsetCalls, [], "the late answer must not turn sleep off")
     }
@@ -863,9 +968,9 @@ final class SleepPromptLifecycleTests: XCTestCase {
     /// clears the entry.
     func testRelaunchWhileTheAbandonedDialogsCommandRunsKeepsTheSleepEntry() async throws {
         _ = try seedValidSession()
-        let orphan = PendingStart(marker: h.home.paths.pendingStartFile, nonce: UUID().uuidString)
+        let orphan = PendingStart(marker: h.home.paths.pendingStartFile, nonce: UUID().uuidString, deadline: Date().addingTimeInterval(3600))
         try h.store.savePendingStart(orphan.nonce)
-        let command = try RootCommandProcess(marker: orphan.marker, nonce: orphan.nonce, in: h.home.root, holdPmset: true)
+        let command = try RootCommandProcess(marker: orphan.marker, nonce: orphan.nonce, deadline: orphan.deadlineArgument, in: h.home.root, holdPmset: true)
         defer { command.release() }
         XCTAssertTrue(command.waitUntilPmsetRuns())
         h.guardFake.sleepDisabled = false
@@ -940,10 +1045,47 @@ final class SleepPromptLifecycleTests: XCTestCase {
         XCTAssertNil(m.lastError, "the marker line goes with the marker")
     }
 
+    /// Sleep is restored but its journal entry cannot be cleared: the end
+    /// reports itself incomplete and logs why, the entry stays, and the
+    /// next run restores again and clears it.
+    func testSleepRestoreWhoseJournalClearFailsIsReported() async throws {
+        let m = h.makeManager()
+        await m.start(duration: 1800)
+        XCTAssertTrue(m.isActive)
+        let file = h.home.paths.stateFile.path
+        // Rename over an immutable state.json is refused.
+        try FileManager.default.setAttributes([.immutable: true], ofItemAtPath: file)
+        defer { try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: file) }
+
+        let outcome = await m.end(reason: .user)
+        try FileManager.default.setAttributes([.immutable: false], ofItemAtPath: file)
+
+        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1", "disablesleep 0"])
+        XCTAssertFalse(h.guardFake.sleepDisabled)
+        XCTAssertEqual(outcome, .incomplete(agentArmed: true))
+        XCTAssertEqual(try h.store.loadState()?.sleepDisabledByUs, true, "the entry stays for the next run")
+        XCTAssertEqual(m.state.sleepDisabledByUs, true)
+        let err = try XCTUnwrap(m.lastError)
+        XCTAssertTrue(err.hasPrefix("sleep restored but the journal entry could not be cleared: "), err)
+        XCTAssertTrue(err.hasSuffix("; it will be retried"), err)
+        let post = try XCTUnwrap(h.notifier.posts.last)
+        XCTAssertEqual(post.title, "Restore incomplete")
+        XCTAssertTrue(post.body.hasPrefix(err), post.body)
+        let log = (try? String(contentsOf: h.home.paths.logFile, encoding: .utf8)) ?? ""
+        XCTAssertTrue(log.contains("[error] insomnia: \(err)"), log)
+
+        await m.reconcile()
+        try assertRolledBackClean(m)
+        XCTAssertEqual(h.guardFake.calls.filter { $0 == "disablesleep 0" }.count, 2)
+    }
+
     /// The stuck prompt's root command is past its check and holds the
-    /// marker's lock: the marker stays while it runs, and goes once the
-    /// prompt has exited, before the rollback clears the sleep entry.
-    func testStuckPromptWhoseCommandHoldsTheMarkerClearsItAfterExit() async throws {
+    /// marker's lock, so it may still run pmset: the marker, session.json,
+    /// the journal entry and the recovery lock all stay, an end requested
+    /// meanwhile queues behind it, nothing is killed, the menu stops naming
+    /// the pid once osascript exits, and the rollback runs, after the
+    /// marker goes, once the whole prompt has exited.
+    func testStuckPromptWhoseCommandHoldsTheMarkerIsWaitedFor() async throws {
         let box = LockHolderBox()
         h.prompt.onShow = { start in box.hold(start.marker) }
         h.prompt.mode = .stuck
@@ -953,25 +1095,53 @@ final class SleepPromptLifecycleTests: XCTestCase {
         try await waitUntil("the stuck prompt is reported") {
             h.notifier.posts.contains { $0.title == "Password prompt still running" }
         }
+        let handle = try XCTUnwrap(h.prompt.unfinished)
+        XCTAssertTrue(handle.isRunning)
+        let post = try XCTUnwrap(h.notifier.posts.last)
+        XCTAssertTrue(post.body.contains("pid 4242"), post.body)
+        XCTAssertTrue(post.body.contains("waits for it before rolling the start back"), post.body)
+        XCTAssertFalse(post.body.contains("kill"), "a notification outlives the pid, which may be reused: \(post.body)")
+        XCTAssertTrue(try XCTUnwrap(m.lastError).hasSuffix("kill 4242"), "the menu line offers it while osascript runs")
         XCTAssertTrue(markerExists, "the command holding its lock keeps it")
         XCTAssertNotNil(m.markerProblem)
-        XCTAssertEqual(try h.store.loadState()?.sleepDisabledByUs, true)
+        XCTAssertNil(m.session, "no session is surfaced")
+        XCTAssertNotNil(try h.store.loadSession(), "session.json stays so the backstop honours the deadline")
+        XCTAssertEqual(try h.store.loadState()?.sleepDisabledByUs, true, "the journal entry stays")
+        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1"], "nothing is rolled back beside a command that may still run")
+        XCTAssertNil(try RecoveryLock(url: h.home.paths.recoveryLock).tryAcquire(), "the recovery lock stays held")
 
-        let handle = try XCTUnwrap(h.prompt.unfinished)
+        let end = Task { await m.end(reason: .user) }
+        await settleQueuedRequests()
+        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1"], "the end waits behind the prompt")
+
+        // osascript exits while the command it started still holds its
+        // output: the menu line stops offering the kill at once, and
+        // nothing else moves.
+        handle.markOsascriptExited()
+        try await waitUntil("the menu line drops the kill") {
+            !(m.lastError?.contains("kill") ?? true)
+        }
+        XCTAssertTrue(try XCTUnwrap(m.lastError).contains("a command it started as root is still running"), m.lastError ?? "")
+        XCTAssertEqual(h.notifier.posts.filter { $0.title == "Password prompt still running" }.count, 1, "the change is a menu line, not a second notification")
+        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1"], "the rollback still waits for the output to close")
+
         box.release()
         handle.markExited()
         await start.value
-
+        _ = await end.value
         try assertRolledBackClean(m)
         XCTAssertNil(m.markerProblem)
+        XCTAssertFalse(m.lastError?.contains("kill") ?? false, "\(m.lastError ?? "")")
         XCTAssertEqual(h.guardFake.calls, ["disablesleep 1", "disablesleep 0"])
+        XCTAssertTrue(h.notifier.posts.contains { $0.title == "Session not started" })
+        XCTAssertEqual(h.prompt.shown, 1)
     }
 
     /// The same, and the user has started again since: the old dialog's
     /// nonce is not the new start's, so it still runs nothing.
     func testDialogOfAStartThatDiedCannotActForANewerStart() async throws {
         _ = try seedValidSession()
-        let orphan = PendingStart(marker: h.home.paths.pendingStartFile, nonce: UUID().uuidString)
+        let orphan = PendingStart(marker: h.home.paths.pendingStartFile, nonce: UUID().uuidString, deadline: Date().addingTimeInterval(3600))
         try h.store.savePendingStart(orphan.nonce)
         h.guardFake.sleepDisabled = false
         let m = h.makeManager()
@@ -982,7 +1152,7 @@ final class SleepPromptLifecycleTests: XCTestCase {
         await h.prompt.gate.waitUntilStarted()
         let newer = try XCTUnwrap(h.prompt.starts.first)
         XCTAssertNotEqual(newer.nonce, orphan.nonce)
-        let late = try runRootCommand(marker: orphan.marker, nonce: orphan.nonce, in: h.home.root)
+        let late = try runRootCommand(marker: orphan.marker, nonce: orphan.nonce, deadline: orphan.deadlineArgument, in: h.home.root)
         XCTAssertEqual(late.status, 3, late.stderr)
         XCTAssertEqual(late.pmsetCalls, [])
         XCTAssertEqual(try String(contentsOf: newer.marker, encoding: .utf8), newer.nonce, "the newer start's marker is untouched")

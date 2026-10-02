@@ -71,6 +71,7 @@ final class FakeAdministratorPrompt: AdministratorPromptRunning, @unchecked Send
     private var _starts: [PendingStart] = []
     private var _markerAtShow: [String?] = []
     private var _onShow: (@Sendable (PendingStart) -> Void)?
+    private var _now: @Sendable () -> Date = { Date() }
     /// Opened by the test to end a `.hang`.
     let gate = AsyncGate()
 
@@ -90,6 +91,12 @@ final class FakeAdministratorPrompt: AdministratorPromptRunning, @unchecked Send
         get { lock.withLock { _onShow } }
         set { lock.withLock { _onShow = newValue } }
     }
+    /// The clock a `.succeed` answer compares the start's deadline with,
+    /// as the root command compares it with the system clock.
+    var now: @Sendable () -> Date {
+        get { lock.withLock { _now } }
+        set { lock.withLock { _now = newValue } }
+    }
 
     func disableSleep(_ start: PendingStart) async throws {
         let marker = try? String(contentsOf: start.marker, encoding: .utf8)
@@ -103,6 +110,9 @@ final class FakeAdministratorPrompt: AdministratorPromptRunning, @unchecked Send
         case .succeed:
             guard marker == start.nonce else {
                 throw AdministratorPromptError.failed(status: 1, stderr: "execution error: the start that asked for this password is over; sleep was not turned off (3)")
+            }
+            guard now() < start.deadline else {
+                throw AdministratorPromptError.failed(status: 1, stderr: "execution error: the session this password was for has already ended; sleep was not turned off (4)")
             }
             return
         case .cancel:
@@ -519,6 +529,19 @@ final class FakeBackstop: BackstopScheduling, @unchecked Sendable {
         if failArm { throw BackstopError(message: "fake launchd refused") }
         lock.withLock { _arms += 1 }
     }
+    private var _outdatedScript = false
+    private var _checks = 0
+    /// The installed backstop.sh is one that cannot void a dialog.
+    var outdatedScript: Bool {
+        get { lock.withLock { _outdatedScript } }
+        set { lock.withLock { _outdatedScript = newValue } }
+    }
+    /// `checkVoidsPrompts()` calls, passed or not.
+    var checks: Int { lock.withLock { _checks } }
+    func checkVoidsPrompts() throws {
+        let outdated = lock.withLock { _checks += 1; return _outdatedScript }
+        if outdated { throw BackstopError(message: "the installed backstop.sh is older than this build; run scripts/install.sh again") }
+    }
 }
 
 /// A mutable fake clock usable from the @Sendable clock closure.
@@ -561,6 +584,8 @@ struct Harness {
         keyboard = FakeKeyboardBacklight()
         notifier = RecordingNotifier()
         clamshell = FakeClamshell(false)
+        let c = clock
+        guardFake.prompt.now = { c.now }
     }
 
     /// `lockTimeout` is short so contention tests fail closed quickly;
@@ -618,9 +643,10 @@ func appleScriptQuotedForm(_ s: String) -> String {
 
 /// The command the dialog runs as root, started the way the dialog starts
 /// it: `/bin/sh -c` on the line `do shell script` builds, `<markerLock>
-/// '<marker>' /bin/sh -c '<rootCommand>' insomnia '<marker>' '<nonce>'`,
-/// quoted as `quoted form of` quotes it. The real /usr/bin/lockf takes the
-/// marker's lock. It runs as the current user with `dir` as its working
+/// '<marker>' /bin/sh -c '<rootCommand>' insomnia '<marker>' '<nonce>'
+/// '<deadline>'`, quoted as `quoted form of` quotes it. The deadline is an
+/// hour from now unless given. The real /usr/bin/lockf takes the marker's
+/// lock and the real /bin/date tells the time. It runs as the current user with `dir` as its working
 /// directory, and `/usr/bin/pmset` is replaced by a fake in `dir` that
 /// records its arguments. With `holdPmset` the fake pmset, once called,
 /// waits until `release()` (60 s at most, and only while `dir` exists), so
@@ -632,7 +658,7 @@ final class RootCommandProcess {
     private let started: URL
     private let releaseFile: URL
 
-    init(marker: URL, nonce: String, in dir: URL, holdPmset: Bool = false) throws {
+    init(marker: URL, nonce: String, deadline: String? = nil, in dir: URL, holdPmset: Bool = false) throws {
         let fake = dir.appendingPathComponent("fake-pmset")
         calls = dir.appendingPathComponent("pmset-calls")
         started = dir.appendingPathComponent("pmset-started")
@@ -656,6 +682,7 @@ final class RootCommandProcess {
         let line = AdministratorPrompt.markerLock + " " + appleScriptQuotedForm(marker.path)
             + " /bin/sh -c " + appleScriptQuotedForm(command.replacingOccurrences(of: real, with: fake.path))
             + " insomnia " + appleScriptQuotedForm(marker.path) + " " + appleScriptQuotedForm(nonce)
+            + " " + appleScriptQuotedForm(deadline ?? Self.inAnHour)
 
         process.executableURL = URL(fileURLWithPath: "/bin/sh")
         process.arguments = ["-c", line]
@@ -668,6 +695,12 @@ final class RootCommandProcess {
         process.standardInput = FileHandle.nullDevice
         process.standardError = err
         try process.run()
+    }
+
+    var pid: pid_t { process.processIdentifier }
+
+    static var inAnHour: String {
+        PendingStart(marker: URL(fileURLWithPath: "/"), nonce: "", deadline: Date().addingTimeInterval(3600)).deadlineArgument
     }
 
     /// Waits (10 s at most) until the fake pmset has been called.
@@ -696,9 +729,59 @@ final class RootCommandProcess {
     }
 }
 
+/// Waits (10 s at most) until `pid`, or a child of it, is /usr/bin/lockf
+/// blocked in the kernel: every thread waiting and not one system call
+/// made across five looks 10 ms apart. lockf blocks in exactly one place,
+/// the open(2) with O_EXLOCK that takes the lock, and that open has
+/// resolved the path to its file before it waits: from then on the waiter
+/// holds the marker itself, and deleting the path cannot stop it from
+/// getting the lock on that file.
+func waitUntilLockfWaits(under pid: pid_t) -> Bool {
+    func path(_ pid: pid_t) -> String? {
+        var buf = [UInt8](repeating: 0, count: 4 * Int(MAXPATHLEN))
+        let n = proc_pidpath(pid, &buf, UInt32(buf.count))
+        return n > 0 ? String(decoding: buf.prefix(Int(n)), as: UTF8.self) : nil
+    }
+    func children(_ pid: pid_t) -> [pid_t] {
+        var pids = [pid_t](repeating: 0, count: 64)
+        let n = proc_listchildpids(pid, &pids, Int32(pids.count * MemoryLayout<pid_t>.size))
+        return n > 0 ? Array(pids.prefix(Int(n))) : []
+    }
+    /// Unix system calls made so far, or nil unless every thread is waiting.
+    func blockedSyscalls(_ pid: pid_t) -> Int32? {
+        var tids = [UInt64](repeating: 0, count: 16)
+        let bytes = proc_pidinfo(pid, PROC_PIDLISTTHREADS, 0, &tids, Int32(tids.count * MemoryLayout<UInt64>.size))
+        guard bytes > 0 else { return nil }
+        for tid in tids.prefix(Int(bytes) / MemoryLayout<UInt64>.size) {
+            var info = proc_threadinfo()
+            guard proc_pidinfo(pid, PROC_PIDTHREADINFO, tid, &info, Int32(MemoryLayout<proc_threadinfo>.size)) > 0,
+                  info.pth_run_state == TH_STATE_WAITING else { return nil }
+        }
+        var task = proc_taskinfo()
+        guard proc_pidinfo(pid, PROC_PIDTASKINFO, 0, &task, Int32(MemoryLayout<proc_taskinfo>.size)) > 0 else { return nil }
+        return task.pti_syscalls_unix
+    }
+    let limit = Date().addingTimeInterval(10)
+    var last: (pid: pid_t, syscalls: Int32)?
+    var steady = 0
+    while Date() < limit {
+        let lockf = ([pid] + children(pid)).first { path($0) == "/usr/bin/lockf" }
+        if let lockf, let count = blockedSyscalls(lockf) {
+            steady = (last?.pid == lockf && last?.syscalls == count) ? steady + 1 : 0
+            last = (lockf, count)
+            if steady == 4 { return true }
+        } else {
+            steady = 0
+            last = nil
+        }
+        usleep(10_000)
+    }
+    return false
+}
+
 /// Runs the root command to the end (see RootCommandProcess).
-func runRootCommand(marker: URL, nonce: String, in dir: URL) throws -> RootCommandRun {
-    try RootCommandProcess(marker: marker, nonce: nonce, in: dir).wait()
+func runRootCommand(marker: URL, nonce: String, deadline: String? = nil, in dir: URL) throws -> RootCommandRun {
+    try RootCommandProcess(marker: marker, nonce: nonce, deadline: deadline, in: dir).wait()
 }
 
 /// Holds an flock(2) lock on `url` from this process, the way the root

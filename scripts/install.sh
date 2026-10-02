@@ -28,7 +28,14 @@ PLUTIL=/usr/bin/plutil
 CODESIGN=/usr/bin/codesign
 SWIFT=/usr/bin/swift
 LOCKF=/usr/bin/lockf
+INSTALL=/usr/bin/install
+RM=/bin/rm
+RMDIR=/bin/rmdir
+MKDIR=/bin/mkdir
+CP=/bin/cp
 LOCK_TIMEOUT_SECONDS=10
+# How long the runs of an older backstop.sh get to exit (step 4).
+RETIRE_WAIT_SECONDS=30
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_DIR="$HOME/Applications"
@@ -149,7 +156,7 @@ with that rule. Finish the install by rerunning:
   $ROOT/scripts/install.sh
 NOTE
 }
-trap 'rc=$?; rm -f "$TMP_SUDOERS"; if (( rc != 0 && RULE_AHEAD_OF_BUNDLE )); then rule_ahead_note; fi' EXIT
+trap 'rc=$?; "$RM" -f "$TMP_SUDOERS"; if (( rc != 0 && RULE_AHEAD_OF_BUNDLE )); then rule_ahead_note; fi' EXIT
 cat > "$TMP_SUDOERS" <<SUDO
 # Installed by Insomnia install.sh. Exactly three commands, nothing else.
 $USER ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0
@@ -170,38 +177,22 @@ else
   exit 1
 fi
 
-# 3. Bundle ------------------------------------------------------------------
-step "Assembling $APP"
+# 3. Recovery lock -----------------------------------------------------------
+#    Everything from here on is one transaction under the recovery lock (the
+#    same flock(2) file the app and backstop use): the new backstop.sh, the
+#    bundle that needs it, the recovery run and the LaunchAgent replacement.
+#    A freshly started app cannot dirty the journal between the clean check
+#    and the bootout of the old job, and cannot show a password dialog while
+#    an older backstop.sh may still run. The backstop inherits fd 9 and
+#    shares the lock instead of waiting on it. The lock file is never
+#    unlinked or replaced, so every party keeps locking the same inode.
 # The password prompt can take a while, and the app may have been opened
-# again meanwhile. Its bundle is not replaced while it runs.
+# again meanwhile. Nothing of it is replaced while it runs.
 if "$PGREP" -x Insomnia >/dev/null 2>&1; then
   echo "Insomnia was opened again while the sudoers rule was being written; quit it and rerun." >&2
   exit 1
 fi
-rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS"
-cp "$BIN" "$APP/Contents/MacOS/Insomnia"
-cp "$ROOT/Resources/Info.plist" "$APP/Contents/Info.plist"
-mkdir -p "$APP/Contents/Resources"
-cp "$ROOT/Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
-"$PLUTIL" -lint "$APP/Contents/Info.plist" >/dev/null
-"$CODESIGN" --force --sign - --deep "$APP"
-# shellcheck disable=SC2034  # read by the EXIT trap set in step 2
-RULE_AHEAD_OF_BUNDLE=0
-echo "signed $("$CODESIGN" -dv "$APP" 2>&1 | grep -i identifier || true)"
-
-# 4. Backstop script + dirs --------------------------------------------------
-step "Installing backstop.sh to $APP_SUPPORT"
-mkdir -p "$APP_SUPPORT" "$LOG_DIR" "$LAUNCH_AGENTS"
-cp "$ROOT/scripts/backstop.sh" "$APP_SUPPORT/backstop.sh"
-chmod +x "$APP_SUPPORT/backstop.sh"
-
-# 5. Recovery and LaunchAgent replacement are one transaction under the
-#    recovery lock (the same flock(2) file the app and backstop use), so a
-#    freshly started app cannot dirty the journal between the clean check
-#    and the bootout of the old job. The backstop inherits fd 9 and shares
-#    the lock instead of waiting on it. The lock file is never unlinked or
-#    replaced, so every party keeps locking the same inode.
+"$MKDIR" -p "$APP_SUPPORT" "$LOG_DIR" "$LAUNCH_AGENTS"
 step "Taking the recovery lock"
 LOCK="$APP_SUPPORT/.recovery.lock"
 exec 9<>"$LOCK"
@@ -209,19 +200,72 @@ lock_rc=0
 "$LOCKF" -t "$LOCK_TIMEOUT_SECONDS" 9 2>/dev/null || lock_rc=$?
 if (( lock_rc != 0 )); then
   echo "The recovery lock $LOCK is held by another process (the app or a running backstop)." >&2
-  echo "Wait a minute and rerun. The app, $APP_SUPPORT/backstop.sh and $SUDOERS are installed; the LaunchAgent was not touched." >&2
+  echo "Wait a minute and rerun. $SUDOERS is installed; the app, backstop.sh and the LaunchAgent were not touched." >&2
   exit 75
 fi
 if "$PGREP" -x Insomnia >/dev/null 2>&1; then
-  echo "Insomnia started again; quit it and rerun. The LaunchAgent was not touched." >&2
+  echo "Insomnia started again; quit it and rerun. $SUDOERS is installed; the app, backstop.sh and the LaunchAgent were not touched." >&2
   exit 1
 fi
 
+# 4. Backstop script ---------------------------------------------------------
+#    Installed before the bundle that relies on it. The app shows the
+#    password dialog only when the installed backstop.sh declares a version
+#    that deletes pending-start under its lock (BackstopVersion.swift), so
+#    a stop anywhere in this script never leaves a new app with an older
+#    backstop it would trust. `install -S` writes a temporary file and
+#    renames it over the old one: a run of the previous script keeps
+#    reading the file it opened instead of a mix of old and new text.
+step "Installing backstop.sh to $APP_SUPPORT"
+"$INSTALL" -S -m 0755 "$ROOT/scripts/backstop.sh" "$APP_SUPPORT/backstop.sh"
+
+# Every run of the previous backstop.sh has to be over before the new app
+# can exist: one already waiting on the recovery lock would run its older
+# code as soon as this script lets go, and an older script restores sleep
+# after a crash but leaves pending-start, so a password dialog left open
+# could still turn sleep off with nothing journaled. Each such run gives up
+# on the lock held here within its own 10 s timeout (launchd starts one at
+# a time), so this waits for every process running the installed path to
+# exit, a run started since the copy above included.
+backstop_runs() { # -> pids running $APP_SUPPORT/backstop.sh; fails if pgrep fails
+  local out rc=0 pid args
+  out="$("$PGREP" -lf 'backstop\.sh' 2>/dev/null)" || rc=$?
+  (( rc <= 1 )) || return 1
+  while read -r pid args; do
+    if [[ "$args" == *"$APP_SUPPORT/backstop.sh"* ]]; then printf '%s ' "$pid"; fi
+  done <<<"$out"
+}
+for (( waited = 0; ; waited++ )); do
+  runs="$(backstop_runs)" || runs="unknown (pgrep failed) "
+  [[ -n "$runs" ]] || break
+  if (( waited >= RETIRE_WAIT_SECONDS )); then
+    echo "backstop.sh is still running after ${RETIRE_WAIT_SECONDS}s (pid ${runs% }); a run that started before this install may still act on its older code." >&2
+    echo "Wait a minute and rerun. $SUDOERS and the new $APP_SUPPORT/backstop.sh are installed; the app and the LaunchAgent were not touched." >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+# 5. Bundle ------------------------------------------------------------------
+step "Assembling $APP"
+"$RM" -rf "$APP"
+"$MKDIR" -p "$APP/Contents/MacOS"
+"$CP" "$BIN" "$APP/Contents/MacOS/Insomnia"
+"$CP" "$ROOT/Resources/Info.plist" "$APP/Contents/Info.plist"
+"$MKDIR" -p "$APP/Contents/Resources"
+"$CP" "$ROOT/Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
+"$PLUTIL" -lint "$APP/Contents/Info.plist" >/dev/null
+"$CODESIGN" --force --sign - --deep "$APP"
+# shellcheck disable=SC2034  # read by the EXIT trap set in step 2
+RULE_AHEAD_OF_BUNDLE=0
+echo "signed $("$CODESIGN" -dv "$APP" 2>&1 | grep -i identifier || true)"
+
+# 6. Recovery ----------------------------------------------------------------
 step "Ending any stale session and checking the recovery journal"
 recovery_rc=0
 /bin/bash "$APP_SUPPORT/backstop.sh" --force || recovery_rc=$?
 
-# 6. LaunchAgent: runs the backstop at load and every 60 s. The backstop
+# 7. LaunchAgent: runs the backstop at load and every 60 s. The backstop
 #    enforces the saved deadline itself and is a no-op while the session on
 #    disk is valid. Same pattern as the app (LaunchdBackstop.swift): the
 #    trusted plist at $PLIST is only ever a plist launchd actually loaded.
@@ -236,11 +280,11 @@ recovery_rc=0
 step "Installing LaunchAgent $LABEL"
 CANDIDATE_DIR="$LAUNCH_AGENTS/.$LABEL.staging"
 CANDIDATE="$CANDIDATE_DIR/$LABEL.candidate-$$.plist"
-trap 'rm -f "$TMP_SUDOERS" "$CANDIDATE"; rmdir "$CANDIDATE_DIR" 2>/dev/null || true' EXIT
-mkdir -p "$CANDIDATE_DIR"
+trap '"$RM" -f "$TMP_SUDOERS" "$CANDIDATE"; "$RMDIR" "$CANDIDATE_DIR" 2>/dev/null || true' EXIT
+"$MKDIR" -p "$CANDIDATE_DIR"
 # Leftovers of earlier attempts, including an older build's candidates in
 # $LAUNCH_AGENTS itself (those make launchd's login load report an error).
-rm -f "$CANDIDATE_DIR/$LABEL.candidate-"* "$LAUNCH_AGENTS/$LABEL.candidate-"*
+"$RM" -f "$CANDIDATE_DIR/$LABEL.candidate-"* "$LAUNCH_AGENTS/$LABEL.candidate-"*
 
 # `launchctl print` exits 0 when a job with the label is loaded and 113 when
 # none is. Anything else is unknown, not absent. Being loaded says nothing
@@ -379,7 +423,7 @@ FAIL
   exit 1
 fi
 
-# 7. Done --------------------------------------------------------------------
+# 8. Done --------------------------------------------------------------------
 step "Installed"
 cat <<NEXT
 Next steps:

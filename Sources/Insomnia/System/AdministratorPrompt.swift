@@ -17,7 +17,8 @@ enum AdministratorPromptError: Error, LocalizedError, Sendable {
     case stillRunning(UnfinishedPrompt, grace: TimeInterval)
     /// osascript exited non-zero for another reason: the password was wrong
     /// too many times, the root command refused (the marker was gone or
-    /// held another nonce), or pmset itself failed.
+    /// held another nonce, or the session had already ended), or pmset
+    /// itself failed.
     case failed(status: Int32, stderr: String)
     case launchFailed(String)
 
@@ -146,10 +147,17 @@ final class UnfinishedPrompt: @unchecked Sendable, CustomStringConvertible {
 /// takes that lock first. A late answer to an abandoned dialog therefore
 /// cannot act for a newer start, and cannot leave sleep off after recovery
 /// cleared the journal: until the marker is gone, the journal keeps the
-/// sleep entry.
+/// sleep entry. Nor can an answer that comes after the session's end,
+/// `deadline`, turn sleep off: the root command compares it with the
+/// clock before pmset.
 struct PendingStart: Sendable, Equatable {
     let marker: URL
     let nonce: String
+    let deadline: Date
+
+    /// `deadline` as the root command's `$3`: whole seconds since 1970,
+    /// rounded down, so a refusal comes at most a second early, never late.
+    var deadlineArgument: String { String(Int(deadline.timeIntervalSince1970.rounded(.down))) }
 }
 
 /// The one privileged command Insomnia cannot run without a password:
@@ -160,11 +168,12 @@ struct PendingStart: Sendable, Equatable {
 /// user may reach this; relaunch and reconcile read `pmset -g` instead.
 protocol AdministratorPromptRunning: Sendable {
     /// Returns once `pmset -a disablesleep 1` has run as root, which it does
-    /// only while `start.marker` holds `start.nonce`. Throws an
-    /// `AdministratorPromptError` when the dialog was cancelled, the
-    /// password was wrong, the marker was gone or no longer matched, pmset
-    /// failed, nothing came back in time, or the prompt's process would not
-    /// stop (`.stillRunning`).
+    /// only while `start.marker` holds `start.nonce` and before
+    /// `start.deadline`. Throws an `AdministratorPromptError` when the
+    /// dialog was cancelled, the password was wrong, the marker was gone or
+    /// no longer matched, the deadline had passed, pmset failed, nothing
+    /// came back in time, or the prompt's process would not stop
+    /// (`.stillRunning`).
     func disableSleep(_ start: PendingStart) async throws
 }
 
@@ -180,21 +189,25 @@ enum AdministratorPrompt {
     /// effect the journal entry the start wrote first still covers.
     static let markerLock = "/usr/bin/lockf -k -n -t 10"
     /// What runs as root under that lock, as `/bin/sh -c <this> insomnia
-    /// <marker> <nonce>`. Fixed text: the marker path and nonce arrive only
-    /// as `$1` and `$2`, and the marker's content is only compared, never
-    /// run. pmset runs only while the marker holds the nonce. Exit 3: the
-    /// start was over before the password was accepted, and nothing ran.
-    static let rootCommand = #"m=$(/usr/bin/head -c 64 "$1" 2>/dev/null); if [ -z "$2" ] || [ "$m" != "$2" ]; then echo "the start that asked for this password is over; sleep was not turned off" >&2; exit 3; fi; exec /usr/bin/pmset -a disablesleep 1"#
+    /// <marker> <nonce> <deadline>`. Fixed text: the marker path, nonce and
+    /// deadline arrive only as `$1`, `$2` and `$3`, and the marker's content
+    /// is only compared, never run. pmset runs only while the marker holds
+    /// the nonce and the clock is before the deadline (seconds since 1970).
+    /// Exit 3: the start was over before the password was accepted. Exit 4:
+    /// the session had ended by then, or `$3` is not a number `[` can
+    /// compare, which fails the test and so refuses too. Either way nothing
+    /// ran.
+    static let rootCommand = #"m=$(/usr/bin/head -c 64 "$1" 2>/dev/null); if [ -z "$2" ] || [ "$m" != "$2" ]; then echo "the start that asked for this password is over; sleep was not turned off" >&2; exit 3; fi; if ! [ "$(/bin/date +%s)" -lt "$3" ] 2>/dev/null; then echo "the session this password was for has already ended; sleep was not turned off" >&2; exit 4; fi; exec /usr/bin/pmset -a disablesleep 1"#
     /// The whole AppleScript, as one literal: `markerLock`, `rootCommand`
     /// (each `"` escaped for AppleScript), the privilege flag and the
     /// dialog text are fixed at compile time. Its only inputs are the
-    /// marker path and the nonce, `item 1` and `item 2 of argv`, and both
-    /// reach the root shell through `quoted form of`, as lockf's file and
-    /// as positional parameters. No configuration value or environment
+    /// marker path, the nonce and the deadline, `item 1` to `item 3 of
+    /// argv`, and each reaches the root shell through `quoted form of`, as
+    /// lockf's file and as positional parameters. No configuration value or environment
     /// variable reaches the command that runs as root.
     static let disableSleepScript = #"""
     on run argv
-    do shell script "/usr/bin/lockf -k -n -t 10 " & quoted form of (item 1 of argv) & " /bin/sh -c " & quoted form of "m=$(/usr/bin/head -c 64 \"$1\" 2>/dev/null); if [ -z \"$2\" ] || [ \"$m\" != \"$2\" ]; then echo \"the start that asked for this password is over; sleep was not turned off\" >&2; exit 3; fi; exec /usr/bin/pmset -a disablesleep 1" & " insomnia " & quoted form of (item 1 of argv) & " " & quoted form of (item 2 of argv) with administrator privileges with prompt "Insomnia needs your password to turn off system sleep for this session."
+    do shell script "/usr/bin/lockf -k -n -t 10 " & quoted form of (item 1 of argv) & " /bin/sh -c " & quoted form of "m=$(/usr/bin/head -c 64 \"$1\" 2>/dev/null); if [ -z \"$2\" ] || [ \"$m\" != \"$2\" ]; then echo \"the start that asked for this password is over; sleep was not turned off\" >&2; exit 3; fi; if ! [ \"$(/bin/date +%s)\" -lt \"$3\" ] 2>/dev/null; then echo \"the session this password was for has already ended; sleep was not turned off\" >&2; exit 4; fi; exec /usr/bin/pmset -a disablesleep 1" & " insomnia " & quoted form of (item 1 of argv) & " " & quoted form of (item 2 of argv) & " " & quoted form of (item 3 of argv) with administrator privileges with prompt "Insomnia needs your password to turn off system sleep for this session."
     end run
     """#
     /// The user is typing a password, so the limit is generous. At the
@@ -247,7 +260,7 @@ struct OsascriptAdministratorPrompt: AdministratorPromptRunning {
     }
 
     func disableSleep(_ start: PendingStart) async throws {
-        let r = try await run(["-e", AdministratorPrompt.disableSleepScript, start.marker.path, start.nonce])
+        let r = try await run(["-e", AdministratorPrompt.disableSleepScript, start.marker.path, start.nonce, start.deadlineArgument])
         guard r.status == 0 else {
             if Self.isCancel(r.stderr) { throw AdministratorPromptError.cancelled }
             throw AdministratorPromptError.failed(status: r.status, stderr: r.stderr)

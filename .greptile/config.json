@@ -45,7 +45,7 @@
       "id": "recovery-lock-held-while-a-command-may-run",
       "severity": "high",
       "scope": ["Sources/Insomnia/Core/RecoveryLock.swift", "Sources/Insomnia/Core/SessionManager.swift", "Sources/Insomnia/Core/SleepGuard.swift", "scripts/backstop.sh", "scripts/uninstall.sh"],
-      "rule": "The recovery lock (.recovery.lock: flock in RecoveryLock.swift, lockf on fd 9 in the scripts) is not released, and no further undo runs, while a privileged command started under it may still be running. The lock file is never unlinked or replaced, so every holder locks the same inode. Failing to acquire the lock means doing nothing, never proceeding unlocked."
+      "rule": "The recovery lock (.recovery.lock: flock in RecoveryLock.swift, lockf on fd 9 in the scripts) is not released, and no further undo runs, while a privileged command started under it may still be running and may still change something. The one command that no longer can is a password prompt whose pending-start marker the transaction deleted under the marker's own lock: its root command then exits without running pmset, so the start rolls back and releases the lock without waiting for it (SessionManager's stillRunning branch). The lock file is never unlinked or replaced, so every holder locks the same inode. Failing to acquire the lock means doing nothing, never proceeding unlocked."
     },
     {
       "id": "only-verified-pids-are-resumed",
@@ -69,7 +69,7 @@
       "id": "scripts-call-tools-through-fixed-path-variables",
       "severity": "high",
       "scope": ["scripts/**/*.sh"],
-      "rule": "Every tool that changes the machine or reads process, power or launchd state is called through the absolute-path variable declared at the top of the script (PMSET, SUDO, PLUTIL, LOCKF, PS, KILL, SYSCTL, PGREP, OSASCRIPT, LAUNCHCTL, CODESIGN, SWIFT, SWIFTC, ICONUTIL), never by bare name through PATH. A new tool gets a new variable in that block, because RecoveryScriptTests and PackagingTests patch exactly those lines in a private copy of the script to substitute fakes."
+      "rule": "Every tool that changes the machine or reads process, power or launchd state is called through the absolute-path variable declared at the top of the script (PMSET, SUDO, PLUTIL, LOCKF, PS, KILL, SYSCTL, PGREP, OSASCRIPT, LAUNCHCTL, CODESIGN, SWIFT, SWIFTC, ICONUTIL, INSTALL, RM, RMDIR, MKDIR, CP), never by bare name through PATH. That includes cleanup in EXIT traps. A new tool gets a new variable in that block, because RecoveryScriptTests and PackagingTests patch exactly those lines in a private copy of the script to substitute fakes."
     },
     {
       "id": "sudoers-rule-is-three-exact-lines",

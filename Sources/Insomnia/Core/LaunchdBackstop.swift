@@ -8,6 +8,10 @@ protocol BackstopScheduling: Sendable {
     /// Make sure the polling agent is loaded with the current plist. Cheap
     /// when it already is; throws when it cannot be loaded.
     func arm() async throws
+    /// Throws unless the backstop.sh the agent runs deletes the
+    /// pending-start marker under its lock (see BackstopVersion). Start
+    /// checks this before it shows the password dialog.
+    func checkVoidsPrompts() throws
 }
 
 struct BackstopError: LocalizedError {

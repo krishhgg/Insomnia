@@ -118,17 +118,22 @@ Flag a change that breaks one of these; do not flag the behavior itself.
   writes a passwordless `disablesleep 1` line (PR #32).
 - `AdministratorPrompt.swift`, `SessionManager.swift`. The password prompt
   gets SIGTERM at 120 s and is never sent SIGKILL. One still running 3 s
-  later is reported with its pid, and the start keeps the recovery lock,
-  `session.json` and the journal entry until it exits, then rolls back. The
-  same rule as a stuck `sudo -n pmset`. The menu line offers `kill <pid>`
-  only until osascript itself exits; a root command it started can hold its
-  output longer, and the rollback still waits for that.
+  later is reported with its pid and its marker is deleted under the
+  marker's lock. Once that succeeds its root command can no longer run
+  pmset, so the start rolls back at once and releases the recovery lock;
+  the prompt is watched outside the transaction, and the menu line offers
+  `kill <pid>` until osascript exits and goes once the prompt has. Only
+  while the root command holds the marker's lock (past its checks, maybe in
+  pmset) or the marker cannot be deleted does the start keep the recovery
+  lock, `session.json` and the journal entry until the prompt exits, the
+  same rule as a stuck `sudo -n pmset`.
 - `AdministratorPrompt.swift`, `SessionManager.swift`, `backstop.sh`,
   `uninstall.sh`. A prompt can outlive its start (the app crashes or is
   force-quit under the dialog, the start rolls back after a stuck prompt).
   Its root command therefore runs under `lockf -k -n` on `pending-start`
   and runs `pmset -a disablesleep 1` only while the file holds that start's
-  nonce. The start deletes the file before it releases the recovery lock;
+  nonce and `/bin/date +%s` is below the session's end, passed as `$3`; a
+  `$3` that `[` cannot compare refuses too. The start deletes the file before it releases the recovery lock;
   every other lock holder deletes it before it touches the journal, and
   every deleter (Store.removePendingStart, backstop.sh, uninstall.sh)
   takes the file's own lock first, so the file never goes between the
@@ -140,6 +145,15 @@ Flag a change that breaks one of these; do not flag the behavior itself.
   and makes `uninstall.sh` refuse to remove anything. A cancelled dialog or
   an osascript that never launched ran nothing as root: the start restores
   the journal and session.json exactly and runs no pmset.
+- `BackstopVersion.swift`, `backstop.sh`, `install.sh`. Start reads the
+  installed `backstop.sh`'s `# insomnia-backstop-version:` line and shows no
+  dialog below version 2, the first that deletes `pending-start`; the user
+  is told to run `install.sh` again. `install.sh` installs `backstop.sh`
+  under the recovery lock before the bundle (`install -S`, so a running old
+  script keeps its inode) and waits up to `RETIRE_WAIT_SECONDS` for runs of
+  the old script to exit, stopping before the bundle if one stays. Bump the
+  version line and `BackstopVersion.required` together whenever the app
+  starts relying on new backstop behavior.
 - `DisplayPower.swift`, `LidActions.swift`. On lid close, brightness 0 is
   the primary mechanism; the display sleep request (`IORequestIdle`) is
   best effort and is ignored while any process holds a display assertion,

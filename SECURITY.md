@@ -20,13 +20,18 @@ sleep off (`pmset -a disablesleep 1`) has no passwordless line; the app runs it
 through the standard macOS administrator dialog, with a fixed command string,
 each time the user starts a session, and never on relaunch or from the recovery
 agent. That command turns sleep off only while the start that asked still
-holds its random nonce in `pending-start`, and it holds a `lockf` lock on that
-file from before the check until pmset exits. The start deletes the file when
+holds its random nonce in `pending-start`, and only before the session's end,
+which it receives as an argument and compares with the clock as root; it
+holds a `lockf` lock on that file from before the checks until pmset exits. The start deletes the file when
 it finishes, and the app at launch, the recovery agent and uninstall delete it
 under the recovery lock before they undo anything; every one of them takes the
 file's own lock first, so the file never goes while that command is past its
 check. A dialog answered after its start was abandoned (the app died, recovery
-ran, the start rolled back, a newer start began) runs nothing. A file that
+ran, the start rolled back, a newer start began) runs nothing. The app shows
+the dialog only when the installed `backstop.sh` declares, in its
+`# insomnia-backstop-version:` line, a version that deletes `pending-start`,
+and the installer installs that script before the app, so recovery after a
+crash under the dialog never depends on an older script. A file that
 cannot be deleted (its command is still running, an immutable flag, an ACL)
 does not stop sleep from being turned back on, but the journal keeps the sleep
 entry, the app and the agent report it and retry, and new sessions are refused

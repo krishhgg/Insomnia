@@ -85,7 +85,9 @@ the upgrade will end it before asking, and in a terminal it asks whether to
 continue. It stops with nothing changed if the app will not quit. If it stops
 after writing the rule but before replacing the app, an older build left
 installed cannot start a session until you rerun `./scripts/install.sh`, and
-the installer says so.
+the installer says so. The installer replaces `backstop.sh` before the app and
+waits up to 30 s for any run of the old script to finish; if one is still
+running it stops before the app is replaced and says to rerun.
 Insomnia is not sandboxed. The app, scripts, and journals are local; hotspot
 passwords use the login Keychain, not the configuration file.
 
@@ -103,12 +105,18 @@ instructions before retrying.
    so a sleep setting another tool made stays as it was. A wrong password,
    no answer within 120 seconds, or a pmset failure also starts no session,
    but Insomnia cannot tell whether pmset ran first, so it runs
-   `pmset -a disablesleep 0`, which also clears another tool's setting. If
-   the dialog's process will not close, Insomnia reports it with its pid and
-   waits for it before rolling the start back. A dialog left on screen after
-   Insomnia crashed or was force-quit does nothing when you answer it, once
-   Insomnia has relaunched or the recovery agent has run (within a minute).
-   If the `pending-start` file that guards such a dialog cannot be deleted,
+   `pmset -a disablesleep 0`, which also clears another tool's setting. A
+   password typed after the session would already have ended turns nothing
+   off. If the dialog's process will not close, Insomnia voids its start so
+   it can no longer turn sleep off, rolls the start back at once, and names
+   the process with its pid in the menu until it exits; only a command that
+   is already turning sleep off when the time runs out is waited for. A
+   dialog left on screen after Insomnia crashed or was force-quit does
+   nothing when you answer it, once Insomnia has relaunched or the recovery
+   agent has run (within a minute). Insomnia shows no dialog at all while
+   the installed `backstop.sh` is older than the app, because an older one
+   cannot void such a dialog: Start then says to run `./scripts/install.sh`
+   again. If the `pending-start` file that guards such a dialog cannot be deleted,
    Insomnia still turns sleep back on, but says so in the menu and a
    notification, keeps the journal entry, refuses new sessions, and retries
    until the file is gone.
@@ -227,7 +235,10 @@ installation scenarios still need [release validation](docs/release-validation.m
   separate operations.
 - **Stuck power commands:** a command that survives its timeout keeps the
   recovery lock until it exits. Other recovery attempts or new sessions wait
-  or fail with a warning instead of running alongside it.
+  or fail with a warning instead of running alongside it. The one exception
+  is a password dialog whose start was voided: it can no longer change
+  anything, so the start rolls back at once and the menu names it until it
+  exits.
 - **Audio:** the backstop preserves volume/mute entries but cannot restore
   CoreAudio. Reopen the app for recovery.
 - **Sleep disabled by something else:** at launch, with no session and no
