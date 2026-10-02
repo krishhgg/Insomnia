@@ -117,7 +117,8 @@ is performed. Do not replace "not run" with "passed" based on source review.
 | Backstop ends a valid session within a minute of the app being force-quit (alive lock released) | Not run |
 | Backstop battery end with the app stopped (`kill -STOP`), on battery power below the end floor | Not run |
 | Backstop thermal end via an injected thermal pressure reading (patched script copy) | Not run |
-| Reboot with an active session: the agent ends it at login because the app is not running yet | Not run |
+| Reboot with an active session and launch at login off: the agent ends it at login because no app holds the alive lock | Not run |
+| Reboot with an active session and launch at login on: whichever runs first decides; if the app resumes the session, it lasts until its deadline or a cutoff | Not run |
 | Reboot/login with active or dirty journals | Not run |
 | Lid-close/open and safe recovery of explicitly selected test processes | Not run |
 | Lid-close display/keyboard darkening and restore | Not run |

@@ -427,9 +427,12 @@ Backstop, independent of the app:
   keeps the entry.
 - The agent is a recovery mechanism, not a guarantee of crash/reboot behavior.
   Its battery and thermal checks cover the two ends once a minute, not Low
-  Power Mode or notifications. At login the agent runs before the app and
-  ends a session the app left valid, because no process holds the alive lock.
-  These scenarios require the separate hardware validation record.
+  Power Mode or notifications. A reboot alone does not end a session whose
+  deadline is still ahead. If no Insomnia holds the alive lock when the agent
+  first runs after login, the agent ends it. With launch at login on, the app can
+  start first; its reconcile then resumes the session as on any launch (step
+  2), and a healthy agent run keeps it until its deadline or a cutoff. These
+  scenarios require the separate hardware validation record.
 
 ### 9. Notifications
 
@@ -695,9 +698,10 @@ that any case passed; record results in the release validation record.
    on battery below the end floor, the agent ends the session on its own;
    drive the thermal end with an injected reading against a patched copy of
    the script, not the installed agent. Separately test reboot/login with
-   valid, expired, and dirty journals; at login the agent runs before the app
-   and ends a valid session, since no app holds the alive lock. Saved audio
-   requires the app to reopen.
+   valid, expired, and dirty journals. With launch at login off, the agent
+   ends a valid session at login, since no app holds the alive lock. With it
+   on, the app may resume the session first, and it then lasts until its
+   deadline or a cutoff. Saved audio requires the app to reopen.
 5. **Freeze.** Slack and WhatsApp on list, close lid, `ps -o stat` shows `T`
    for their whole trees. Open lid → running, reconnected, no relaunch.
 6. **Docker rule.** No containers → paused on close. One container → untouched.
