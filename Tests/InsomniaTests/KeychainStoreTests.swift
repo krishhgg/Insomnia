@@ -19,20 +19,28 @@ final class ThrowawayKeychain {
     let keychain: SecKeychain
     let directory: URL
 
-    init() throws {
-        directory = FileManager.default.temporaryDirectory
+    /// `directory` is where the keychain file goes; a fresh temp directory
+    /// by default. A setup that fails removes it again, so nothing
+    /// half-made is left behind.
+    init(directory: URL? = nil) throws {
+        self.directory = directory ?? FileManager.default.temporaryDirectory
             .appendingPathComponent("insomnia-keychain-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        let create: Create = try Self.symbol("SecKeychainCreate")
-        let password = "throwaway"
-        var created: Unmanaged<SecKeychain>?
-        let status = directory.appendingPathComponent("test.keychain-db").path.withCString { path in
-            password.withCString { pw in
-                create(path, UInt32(password.utf8.count), pw, 0, nil, &created)
+        try FileManager.default.createDirectory(at: self.directory, withIntermediateDirectories: true)
+        do {
+            let create: Create = try Self.symbol("SecKeychainCreate")
+            let password = "throwaway"
+            var created: Unmanaged<SecKeychain>?
+            let status = self.directory.appendingPathComponent("test.keychain-db").path.withCString { path in
+                password.withCString { pw in
+                    create(path, UInt32(password.utf8.count), pw, 0, nil, &created)
+                }
             }
+            guard status == errSecSuccess, let created else { throw KeychainError(status: status) }
+            keychain = created.takeRetainedValue()
+        } catch {
+            try? FileManager.default.removeItem(at: self.directory)
+            throw error
         }
-        guard status == errSecSuccess, let created else { throw KeychainError(status: status) }
-        keychain = created.takeRetainedValue()
     }
 
     func lock() throws {
@@ -58,7 +66,10 @@ final class ThrowawayKeychain {
 
 /// The real store against a throwaway keychain file. These run with
 /// keychain prompts forbidden by the store itself; a test that hung here
-/// would mean a prompt got through.
+/// would mean a prompt got through. Never call `set` or `delete` here on a
+/// locked keychain or on another build's item: those paths allow a prompt
+/// on purpose, and `KeychainStoreReplaceTests` covers them through the
+/// scripted calls instead.
 final class KeychainStoreTests: XCTestCase {
     private typealias ItemCopyAccess = @convention(c) (SecKeychainItem, UnsafeMutablePointer<Unmanaged<SecAccess>?>) -> OSStatus
     private typealias AccessCopyACLList = @convention(c) (SecAccess, UnsafeMutablePointer<Unmanaged<CFArray>?>) -> OSStatus
@@ -137,6 +148,21 @@ final class KeychainStoreTests: XCTestCase {
             XCTAssertEqual((error as? KeychainError)?.problem, .unreadable)
         }
         XCTAssertNil(try store.get(service: service, account: "Nope"), "a missing item is still missing while locked")
+    }
+
+    /// A keychain that cannot be created (here the file's path is already a
+    /// directory) leaves no directory behind.
+    func testFailedSetupLeavesNoFiles() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("insomnia-keychain-blocked-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory.appendingPathComponent("test.keychain-db"),
+            withIntermediateDirectories: true
+        )
+
+        XCTAssertThrowsError(try ThrowawayKeychain(directory: directory))
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
     }
 
     /// Prompts are off only for the duration of a call and the previous
@@ -237,5 +263,178 @@ final class KeychainStoreTests: XCTestCase {
             throw KeychainError(status: errSecUnimplemented)
         }
         return unsafeBitCast(pointer, to: T.self)
+    }
+}
+
+/// SecItem calls that answer from a script and record the order and the
+/// prompt switch (read from the real switch, which the store still
+/// toggles) at each call. Nothing here touches a keychain.
+final class ScriptedKeychainCalls: KeychainItemCalls, @unchecked Sendable {
+    struct Call: Equatable, CustomStringConvertible {
+        let name: String
+        let promptsAllowed: Bool
+
+        init(_ name: String, prompts: Bool) {
+            self.name = name
+            promptsAllowed = prompts
+        }
+
+        var description: String { "\(name)(prompts: \(promptsAllowed))" }
+    }
+
+    private let lock = NSLock()
+    private var scripted: [String: [OSStatus]]
+    private var _calls: [Call] = []
+    private var _added: [[String: Any]] = []
+
+    var calls: [Call] { lock.withLock { _calls } }
+    /// The attribute dictionaries handed to `add`.
+    var added: [[String: Any]] { lock.withLock { _added } }
+
+    init(copyMatching: [OSStatus] = [], add: [OSStatus] = [], delete: [OSStatus] = []) {
+        scripted = ["copyMatching": copyMatching, "add": add, "delete": delete]
+    }
+
+    func copyMatching(_ query: CFDictionary, _ result: UnsafeMutablePointer<CFTypeRef?>) -> OSStatus {
+        next("copyMatching")
+    }
+
+    func add(_ attributes: CFDictionary) -> OSStatus {
+        lock.withLock { _added.append((attributes as NSDictionary) as? [String: Any] ?? [:]) }
+        return next("add")
+    }
+
+    func delete(_ query: CFDictionary) -> OSStatus {
+        next("delete")
+    }
+
+    private func next(_ name: String) -> OSStatus {
+        let prompts = (try? LegacyKeychain.promptsAllowed()) ?? true
+        return lock.withLock {
+            _calls.append(Call(name, prompts: prompts))
+            var statuses = scripted[name] ?? []
+            guard !statuses.isEmpty else { return errSecUnimplemented }
+            let status = statuses.removeFirst()
+            scripted[name] = statuses
+            return status
+        }
+    }
+}
+
+/// `KeychainStore` over scripted SecItem calls. The replace path for
+/// another build's item and the unlock for a save need a prompt in real
+/// life, so they are covered here by the call order and the prompt switch
+/// at each call, never by a prompt.
+final class KeychainStoreReplaceTests: XCTestCase {
+    private let service = "insomnia-hotspot-test"
+
+    /// The reinstall case: the add hits the old build's item, the delete
+    /// needs the prompt (allowed, it is the user's Save), the add repeats
+    /// with prompts off.
+    func testReplacingAnotherBuildsItemDeletesItWithThePromptThenAddsWithout() throws {
+        let calls = ScriptedKeychainCalls(add: [errSecDuplicateItem, errSecSuccess], delete: [errSecInvalidOwnerEdit, errSecSuccess])
+        let store = KeychainStore(calls: calls)
+
+        try store.set(service: service, account: "Phone", value: "pw")
+
+        XCTAssertEqual(calls.calls, [
+            .init("add", prompts: false),
+            .init("delete", prompts: false),
+            .init("delete", prompts: true),
+            .init("add", prompts: false),
+        ])
+        XCTAssertEqual(calls.added.count, 2)
+        XCTAssertTrue(calls.added.allSatisfy { $0[kSecAttrAccess as String] != nil }, "every add carries the access list")
+    }
+
+    /// This build's own item is replaced without any prompt.
+    func testReplacingThisBuildsItemNeedsNoPrompt() throws {
+        let calls = ScriptedKeychainCalls(add: [errSecDuplicateItem, errSecSuccess], delete: [errSecSuccess])
+
+        try KeychainStore(calls: calls).set(service: service, account: "Phone", value: "pw")
+
+        XCTAssertEqual(calls.calls, [.init("add", prompts: false), .init("delete", prompts: false), .init("add", prompts: false)])
+    }
+
+    /// A save the keychain refuses deletes nothing: the old password stays.
+    func testAFailedAddLeavesTheOldItemAlone() {
+        let calls = ScriptedKeychainCalls(add: [errSecParam])
+
+        XCTAssertThrowsError(try KeychainStore(calls: calls).set(service: service, account: "Phone", value: "pw")) { error in
+            XCTAssertEqual((error as? KeychainError)?.status, errSecParam)
+        }
+
+        XCTAssertEqual(calls.calls, [.init("add", prompts: false)])
+    }
+
+    /// A locked keychain gets the unlock prompt on a save, which is the
+    /// user's click, and never on a read.
+    func testALockedKeychainIsUnlockedForASaveButNotForARead() throws {
+        let saving = ScriptedKeychainCalls(add: [errSecInteractionNotAllowed, errSecSuccess])
+        try KeychainStore(calls: saving).set(service: service, account: "Phone", value: "pw")
+        XCTAssertEqual(saving.calls, [.init("add", prompts: false), .init("add", prompts: true)])
+
+        let reading = ScriptedKeychainCalls(copyMatching: [errSecAuthFailed])
+        XCTAssertThrowsError(try KeychainStore(calls: reading).get(service: service, account: "Phone")) { error in
+            XCTAssertEqual((error as? KeychainError)?.problem, .unreadable)
+        }
+        XCTAssertEqual(reading.calls, [.init("copyMatching", prompts: false)])
+    }
+
+    /// A delete that fails for any other reason is an error, not a prompt.
+    func testADeleteRefusedForAnotherReasonIsAnError() {
+        let calls = ScriptedKeychainCalls(delete: [errSecParam])
+
+        XCTAssertThrowsError(try KeychainStore(calls: calls).delete(service: service, account: "Phone")) { error in
+            XCTAssertEqual((error as? KeychainError)?.status, errSecParam)
+        }
+
+        XCTAssertEqual(calls.calls, [.init("delete", prompts: false)])
+    }
+}
+
+/// `LegacyKeychain.withPrompts` over a scripted switch. The real switch is
+/// never touched here.
+final class PromptSwitchTests: XCTestCase {
+    func testAFailedWriteStopsTheCallBeforeItRuns() {
+        let prompts = LegacyKeychain.PromptSwitch(read: { (errSecSuccess, true) }, write: { _ in errSecInteractionNotAllowed })
+        var ran = false
+
+        XCTAssertThrowsError(try LegacyKeychain.withPrompts(false, using: prompts) { ran = true }) { error in
+            XCTAssertEqual((error as? KeychainError)?.status, errSecInteractionNotAllowed)
+        }
+
+        XCTAssertFalse(ran, "the keychain call must not run with the prompt setting unknown")
+    }
+
+    func testAFailedReadStopsBeforeAnythingIsWritten() {
+        let writes = Locked<[Bool]>([])
+        let prompts = LegacyKeychain.PromptSwitch(
+            read: { (errSecParam, true) },
+            write: { writes.value.append($0); return errSecSuccess }
+        )
+        var ran = false
+
+        XCTAssertThrowsError(try LegacyKeychain.withPrompts(false, using: prompts) { ran = true }) { error in
+            XCTAssertEqual((error as? KeychainError)?.status, errSecParam)
+        }
+
+        XCTAssertFalse(ran)
+        XCTAssertEqual(writes.value, [])
+    }
+
+    /// The setting that was there before is the one put back, even when it
+    /// was "forbidden".
+    func testTheSettingIsPutBackToWhatItWas() throws {
+        let writes = Locked<[Bool]>([])
+        let prompts = LegacyKeychain.PromptSwitch(
+            read: { (errSecSuccess, false) },
+            write: { writes.value.append($0); return errSecSuccess }
+        )
+
+        let result = try LegacyKeychain.withPrompts(true, using: prompts) { writes.value }
+
+        XCTAssertEqual(result, [true])
+        XCTAssertEqual(writes.value, [true, false])
     }
 }

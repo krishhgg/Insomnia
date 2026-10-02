@@ -187,6 +187,7 @@ final class AppServices {
         browserTasks.removeAll()
         network?.stop()
         network = nil
+        status.hotspotPasswordProblem = nil
         lidActions = nil
         floors = nil
         syncState()

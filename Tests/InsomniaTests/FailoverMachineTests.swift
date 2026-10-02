@@ -293,18 +293,51 @@ final class NetworkFailoverDriverTests: XCTestCase {
         XCTAssertEqual(notifier.posts.count, 2, "the problem returned after a save, so it is notified again")
     }
 
-    /// A new outage after stop() notifies again; the once-per-outage guard
-    /// does not outlive the driver's session.
-    func testStopRearmsTheNotificationForTheNextSession() async throws {
+    /// stop() ends the session: the problem goes (and with it the menu
+    /// line), and the once-per-outage guard does not outlive the session.
+    func testStopClearsTheProblemAndRearmsTheNotification() async throws {
         let joiner = RecordingHotspotJoiner()
         let notifier = RecordingNotifier()
         let n = driver(keychain: FakeKeychainStore(), joiner: joiner, notifier: notifier, clock: FakeClock(Date()))
+        let published = Locked<[HotspotPasswordProblem?]>([])
+        n.onPasswordProblem = { published.value.append($0) }
 
         await n.joinHotspot()
         await n.joinHotspot()
         XCTAssertEqual(notifier.posts.count, 1)
         n.stop()
+        XCTAssertNil(n.passwordProblem)
+        XCTAssertEqual(published.value, [.missing, nil])
         await n.joinHotspot()
         XCTAssertEqual(notifier.posts.count, 2)
+    }
+
+    /// A second outage in the same session is notified again: recovery
+    /// re-arms the once-per-outage guard.
+    func testANewOutageAfterRecoveryIsNotifiedAgain() async throws {
+        let joiner = RecordingHotspotJoiner()
+        let notifier = RecordingNotifier()
+        let clock = FakeClock(Date(timeIntervalSince1970: 1_800_000_000))
+        let n = driver(keychain: FakeKeychainStore(), joiner: joiner, notifier: notifier, clock: clock)
+        func skipped() -> Int { notifier.posts.filter { $0.title == "Hotspot not joined" }.count }
+
+        await n.simulate(satisfied: false)
+        for _ in 0..<2 {
+            clock.advance(30)
+            n.fireTimer()
+            await settleQueuedRequests()
+        }
+        XCTAssertEqual(skipped(), 1)
+
+        clock.advance(30)
+        await n.simulate(satisfied: true)
+        XCTAssertEqual(skipped(), 1, "recovery itself reports nothing about the password")
+
+        await n.simulate(satisfied: false)
+        clock.advance(30)
+        n.fireTimer()
+        await settleQueuedRequests()
+        XCTAssertEqual(skipped(), 2)
+        XCTAssertEqual(joiner.calls, [])
     }
 }

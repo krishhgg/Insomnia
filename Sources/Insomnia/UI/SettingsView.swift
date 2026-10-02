@@ -39,6 +39,11 @@ struct SettingsView: View {
             loadPassword()
             refreshWouldFreeze()
         }
+        // The failover may find the saved password unreadable while the
+        // window is open; the notice follows what it reports.
+        .onChange(of: manager.services?.status.hotspotPasswordProblem) { _, problem in
+            hotspotNotice = problem?.settingsNotice
+        }
         // The preview depends on the toggle, both lists and what is running:
         // recompute on any config change and whenever an app launches or quits.
         .onChange(of: manager.config) { refreshWouldFreeze() }

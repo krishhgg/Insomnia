@@ -287,11 +287,14 @@ provided by the standalone backstop. Performance effects depend on workload.
   or a locked keychain; the file-based keychain cannot tell them apart), and
   a missing item with `errSecItemNotFound`. Either skips the join and sets
   `HotspotPasswordProblem`: a warning line in the right-click menu, a notice
-  under the password field in Settings, and one notification per outage. A
-  save in Settings deletes the item and creates it again under the current
-  build; deleting another build's item needs the prompt, which is allowed
-  only there. `kSecAttrAccessible` is not set: the file-based keychain drops
-  it, and the data protection keychain needs an access-group entitlement.
+  under the password field in Settings, and one notification per outage
+  (re-armed on recovery, on stop and when the password is saved). A save in
+  Settings adds the item under the current build; an existing item is
+  deleted and the add repeated, so a failed save leaves the old password in
+  place. Deleting another build's item, and unlocking the keychain for the
+  add, need the prompt, which is allowed only there. `kSecAttrAccessible`
+  is not set: the file-based keychain drops it, and the data protection
+  keychain needs an access-group entitlement.
 - macOS 26 requires Location Services permission before CoreWLAN exposes SSIDs
   or returns results for an SSID-filtered scan. Insomnia requests when-in-use
   access when the hotspot is saved or a configured session starts, never at
