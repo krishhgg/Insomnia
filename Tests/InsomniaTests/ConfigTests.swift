@@ -219,7 +219,33 @@ final class ConfigLoadTests: XCTestCase {
         XCTAssertEqual([m.config.lowPowerFloor, m.config.endFloor], [65, 60])
         XCTAssertTrue(m.config.floorsAreOrdered)
         XCTAssertEqual(try h.store.loadConfig(), m.config, "the corrected config was not written back")
-        XCTAssertTrue(log().contains("config.json: battery floors corrected: lowPowerFloor 40 -> 65, endFloor 60 -> 60"), log())
+        XCTAssertTrue(log().contains("[info] insomnia: config.json: battery floors corrected: lowPowerFloor 40 -> 65, endFloor 60 -> 60; saved"), log())
+    }
+
+    /// When the corrected file cannot be written, the corrected floors still
+    /// apply in memory and the log says the save failed instead of
+    /// announcing a correction that did not reach the disk.
+    func testUnsavableCorrectionIsLoggedAsAnError() throws {
+        var bad = Config()
+        bad.lowPowerFloor = 40
+        bad.endFloor = 60
+        try h.store.saveConfig(bad)
+        // Store writes a temp file next to config.json; a read-only
+        // directory refuses it. Under INSOMNIA_HOME the Logs directory sits
+        // inside that directory, so it must exist before the chmod for the
+        // log line to land.
+        try h.home.paths.createDirectories()
+        let dir = h.home.paths.appSupport.path
+        XCTAssertEqual(chmod(dir, 0o500), 0)
+        defer { chmod(dir, 0o700) }
+
+        let m = h.makeManager()
+
+        XCTAssertEqual([m.config.lowPowerFloor, m.config.endFloor], [65, 60])
+        XCTAssertEqual(try h.store.loadConfig(), bad, "the file should be untouched when the write fails")
+        let log = log()
+        XCTAssertTrue(log.contains("[error] insomnia: config.json: battery floors corrected: lowPowerFloor 40 -> 65, endFloor 60 -> 60; could not save the correction: "), log)
+        XCTAssertFalse(log.contains("; saved"), log)
     }
 
     func testOrderedFloorsLoadUnchanged() throws {
