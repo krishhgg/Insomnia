@@ -54,7 +54,9 @@ final class TempHome {
 /// dialog nobody answers and then reports the timeout osascript's SIGTERM
 /// would produce; in `.stuck` it reports osascript (pid 4242) as still
 /// running after SIGTERM and hands out `unfinished`, which the test ends
-/// with `markExited()`. Never shows anything and never runs pmset.
+/// with `markExited()`. `.succeed` keeps the root command's rule: it fails
+/// with exit 3 unless the marker holds the nonce. Never shows anything and
+/// never runs pmset.
 final class FakeAdministratorPrompt: AdministratorPromptRunning, @unchecked Sendable {
     enum Mode { case succeed, cancel, fail, hang, stuck }
 
@@ -64,6 +66,8 @@ final class FakeAdministratorPrompt: AdministratorPromptRunning, @unchecked Send
     private var _mode: Mode = .succeed
     private var _shown = 0
     private var _unfinished: UnfinishedPrompt?
+    private var _starts: [PendingStart] = []
+    private var _markerAtShow: [String?] = []
     /// Opened by the test to end a `.hang`.
     let gate = AsyncGate()
 
@@ -75,11 +79,23 @@ final class FakeAdministratorPrompt: AdministratorPromptRunning, @unchecked Send
     var shown: Int { lock.withLock { _shown } }
     /// The handle a `.stuck` prompt threw, once it has.
     var unfinished: UnfinishedPrompt? { lock.withLock { _unfinished } }
+    /// The start each dialog was shown for, in order.
+    var starts: [PendingStart] { lock.withLock { _starts } }
+    /// The marker's content when each dialog was shown (nil: no file).
+    var markerAtShow: [String?] { lock.withLock { _markerAtShow } }
 
-    func disableSleep() async throws {
-        lock.withLock { _shown += 1 }
+    func disableSleep(_ start: PendingStart) async throws {
+        let marker = try? String(contentsOf: start.marker, encoding: .utf8)
+        lock.withLock {
+            _shown += 1
+            _starts.append(start)
+            _markerAtShow.append(marker)
+        }
         switch mode {
         case .succeed:
+            guard marker == start.nonce else {
+                throw AdministratorPromptError.failed(status: 1, stderr: "execution error: the start that asked for this password is over; sleep was not turned off (3)")
+            }
             return
         case .cancel:
             throw AdministratorPromptError.cancelled
@@ -152,12 +168,18 @@ final class FakeSleepGuard: SleepGuarding, @unchecked Sendable {
         }
     }
 
-    func setSleepDisabled(_ disabled: Bool) async throws {
-        try record("disablesleep \(disabled ? 1 : 0)")
-        if disabled { try await prompt.disableSleep() }
-        if disabled, let gate = sleepGate { await gate.wait() }
-        sleepDisabled = disabled
-        try afterEffect("disablesleep \(disabled ? 1 : 0)")
+    func disableSleep(_ start: PendingStart) async throws {
+        try record("disablesleep 1")
+        try await prompt.disableSleep(start)
+        if let gate = sleepGate { await gate.wait() }
+        sleepDisabled = true
+        try afterEffect("disablesleep 1")
+    }
+
+    func enableSleep() async throws {
+        try record("disablesleep 0")
+        sleepDisabled = false
+        try afterEffect("disablesleep 0")
     }
 
     func isSleepDisabled() async throws -> Bool {
@@ -567,4 +589,66 @@ struct Harness {
 @MainActor
 func settleQueuedRequests() async {
     for _ in 0..<5 { await Task.yield() }
+}
+
+/// What `AdministratorPrompt.rootCommand` did in one run.
+struct RootCommandRun {
+    let status: Int32
+    let stderr: String
+    /// Arguments of each pmset call, in order.
+    let pmsetCalls: [String]
+}
+
+/// AppleScript's `quoted form of`: single quotes, each `'` as `'\''`.
+func appleScriptQuotedForm(_ s: String) -> String {
+    "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
+}
+
+/// Runs `AdministratorPrompt.rootCommand` the way the dialog does: `/bin/sh
+/// -c` on the line `do shell script` builds, `/bin/sh -c '<command>'
+/// insomnia '<marker>' '<nonce>'`, quoted as `quoted form of` quotes it.
+/// It runs as the current user with `dir` as its working directory, and
+/// `/usr/bin/pmset` is replaced by a fake in `dir` that only records its
+/// arguments. With `dropMarkerDuringPmset`
+/// the fake deletes the marker when asked for `disablesleep 1`, as recovery
+/// taking the lock at that moment would.
+func runRootCommand(marker: URL, nonce: String, in dir: URL, dropMarkerDuringPmset: Bool = false) throws -> RootCommandRun {
+    let fake = dir.appendingPathComponent("fake-pmset")
+    let calls = dir.appendingPathComponent("pmset-calls")
+    try? FileManager.default.removeItem(at: calls)
+    try """
+    #!/bin/bash
+    printf '%s\\n' "$*" >> "$FAKE_PMSET_CALLS"
+    if [[ "$*" == "-a disablesleep 1" && -n "${FAKE_PMSET_DROP:-}" ]]; then rm -f "$FAKE_PMSET_DROP"; fi
+    exit 0
+    """.write(to: fake, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fake.path)
+
+    let real = "/usr/bin/pmset"
+    let command = AdministratorPrompt.rootCommand
+    XCTAssertEqual(command.components(separatedBy: real).count - 1, 2, "the command calls pmset twice, by absolute path")
+    XCTAssertFalse(fake.path.contains(" "), "the fake replaces an unquoted word")
+    let line = "/bin/sh -c " + appleScriptQuotedForm(command.replacingOccurrences(of: real, with: fake.path))
+        + " insomnia " + appleScriptQuotedForm(marker.path) + " " + appleScriptQuotedForm(nonce)
+
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/sh")
+    process.arguments = ["-c", line]
+    process.currentDirectoryURL = dir
+    var env = ProcessInfo.processInfo.environment
+    env["FAKE_PMSET_CALLS"] = calls.path
+    env["FAKE_PMSET_DROP"] = dropMarkerDuringPmset ? marker.path : ""
+    process.environment = env
+    process.standardInput = FileHandle.nullDevice
+    let err = Pipe()
+    process.standardError = err
+    try process.run()
+    let errData = err.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+    let recorded = (try? String(contentsOf: calls, encoding: .utf8)) ?? ""
+    return RootCommandRun(
+        status: process.terminationStatus,
+        stderr: String(decoding: errData, as: UTF8.self),
+        pmsetCalls: recorded.split(separator: "\n").map(String.init)
+    )
 }

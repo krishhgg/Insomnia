@@ -16,6 +16,13 @@
 # instead of deadlocking against it; fd 9 is accepted only if its inode is
 # the lock file's inode.
 #
+# First thing under the lock, every run deletes APP_SUPPORT/pending-start.
+# The app holds the lock for as long as a Start waits on its password
+# dialog, so a marker found here belongs to a start that was abandoned (the
+# app died under its dialog). The root command behind that dialog turns
+# sleep off only while the marker holds its nonce, so answering the dialog
+# after this point changes nothing.
+#
 # Decision, driven only by what the journal says was changed:
 #   - session.json valid (endsAt in the future) and no --force: exit 0.
 #   - state.json missing or clean: nothing is undone and nothing privileged
@@ -88,6 +95,7 @@ else
 fi
 SESSION="$APP_SUPPORT/session.json"
 STATE="$APP_SUPPORT/state.json"
+PENDING="$APP_SUPPORT/pending-start"
 LOCK="$APP_SUPPORT/.recovery.lock"
 LOG="$LOG_DIR/insomnia.log"
 
@@ -111,6 +119,16 @@ if (( lock_rc != 0 )); then
   exit 75
 fi
 # From here on this process holds the lock until it exits (fd 9 closes).
+
+# A pending-start marker under the lock belongs to an abandoned start: void
+# the password dialog it was written for (see the header).
+if [[ -e "$PENDING" || -L "$PENDING" ]]; then
+  if rm -f "$PENDING" 2>/dev/null; then
+    log info "deleted $PENDING; a password dialog left from an abandoned start can no longer turn sleep off"
+  else
+    log error "could not delete $PENDING; a password dialog left from an abandoned start could still turn sleep off"
+  fi
+fi
 
 # --- Helpers -----------------------------------------------------------------
 

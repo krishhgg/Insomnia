@@ -73,17 +73,22 @@ recovery; newly written journals use `frozenProcesses`.
   timer runs at 1 Hz and stops while the lid is closed.
 - Click the cup/countdown to enter an extension; hold the end control to end.
   Right-click opens the status, browser actions, Settings, and Quit menu.
-- Session start: write session + state to disk, arm the launchd backstop, and
-  only then run `pmset -a disablesleep 1` through the macOS administrator
-  password dialog (`osascript` running a fixed `do shell script ... with
-  administrator privileges` literal; 120 s limit, SIGTERM only at the
-  deadline). A session never starts unless the backstop is armed. If the
+- Session start: write session + state to disk, arm the launchd backstop,
+  write a fresh random nonce to `pending-start`, and only then run `pmset -a
+  disablesleep 1` through the macOS administrator password dialog
+  (`osascript` running a fixed `do shell script ... with administrator
+  privileges` literal; 120 s limit, SIGTERM only at the deadline). The
+  marker path and the nonce are the script's only inputs, passed as
+  positional parameters; the root command runs pmset only while the marker
+  holds the nonce and checks again afterwards (section 8). A session never starts unless the backstop is armed. If the
   dialog is cancelled, the password is wrong, it times out, or pmset fails,
   undo from the journal like an end, delete the session file and surface the
-  error. The wait is bounded: if the dialog's process has not finished 3 s
-  after the SIGTERM, Insomnia names its pid (notification and menu warning
-  line), kills nothing, keeps session.json, the journal entry and the
-  recovery lock until it exits, and rolls back then; starts, ends and the
+  error. The start deletes `pending-start` on every outcome before it lets go
+  of the recovery lock. The wait is bounded: if the dialog's process has not
+  finished 3 s after the SIGTERM, Insomnia deletes the marker, names its pid
+  (notification and menu warning line; the line stops naming the pid once
+  osascript itself exits), kills nothing, keeps session.json, the journal
+  entry and the recovery lock until it exits, and rolls back then; starts, ends and the
   agent wait behind it, the same rule as a `sudo pmset` that will not stop.
   The journal and backstop always exist before sleep is disabled, so a
   crash while the dialog is up leaves recovery a record. Only an explicit
@@ -354,6 +359,16 @@ provided by the standalone backstop. Performance effects depend on workload.
 Invariants:
 
 - Sleep is never disabled unless a session file with a future `endsAt` exists.
+- A password dialog turns sleep off only for the start that showed it, and
+  only while that start still holds the recovery lock. The start writes a
+  fresh nonce to `pending-start` before the dialog and deletes it before it
+  releases the lock. Every other holder of the lock (any app transaction,
+  reconcile at launch, `backstop.sh`, `uninstall.sh`) deletes it first,
+  before it reads or clears the journal. The root command checks the nonce
+  before pmset and again after it, and turns sleep back on if the marker
+  went missing in between, so a dialog answered after its start was
+  abandoned (crash or force-quit under the dialog, rollback, a newer start)
+  cannot leave sleep off once the journal entry is gone.
 - Every change Insomnia makes is in RuntimeState before it is made, and is
   undone from RuntimeState, never from memory.
 

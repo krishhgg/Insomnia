@@ -40,31 +40,49 @@ enum AdministratorPromptError: Error, LocalizedError, Sendable {
     }
 }
 
-/// A prompt the runner stopped waiting for. `waitUntilExit()` returns once
-/// osascript has been reaped and both its pipes have closed; nothing polls
-/// the pid, so a reused pid is never mistaken for the child. Same shape as
-/// the handle the sudo pmset runner hands out for a stuck `sudo pmset`.
+/// A prompt the runner stopped waiting for. Two exits are tracked: osascript's
+/// own (`waitUntilOsascriptExits()`), which is when its pid stops being ours
+/// to name, and the whole prompt's (`waitUntilExit()`), once osascript has
+/// been reaped and both its pipes have closed, which a root command it
+/// started can delay. Nothing polls the pid, so a reused pid is never
+/// mistaken for the child. Same shape as the handle the sudo pmset runner
+/// hands out for a stuck `sudo pmset`.
 final class UnfinishedPrompt: @unchecked Sendable, CustomStringConvertible {
-    /// osascript's pid.
+    /// osascript's pid. Only meaningful while `osascriptAlive`.
     let pid: pid_t
-    /// Whether osascript itself was still running when the runner gave up
-    /// waiting. False means it exited after SIGTERM and something it started
-    /// (the root command behind the dialog) still holds its output; there is
-    /// then no pid of ours to signal.
-    let osascriptAlive: Bool
 
     private let lock = NSLock()
+    private var osascriptRunning: Bool
     private var exited = false
+    private var osascriptWaiters: [CheckedContinuation<Void, Never>] = []
     private var waiters: [CheckedContinuation<Void, Never>] = []
 
     init(pid: pid_t, osascriptAlive: Bool) {
         self.pid = pid
-        self.osascriptAlive = osascriptAlive
+        self.osascriptRunning = osascriptAlive
     }
 
     var description: String { "osascript (pid \(pid))" }
 
+    /// Whether osascript itself is still running. False means it has exited
+    /// and something it started (the root command behind the dialog) may
+    /// still hold its output; there is then no pid of ours to signal.
+    var osascriptAlive: Bool { lock.withLock { osascriptRunning } }
+
     var isRunning: Bool { lock.withLock { !exited } }
+
+    /// Returns once osascript itself has exited, possibly before its output
+    /// closes.
+    func waitUntilOsascriptExits() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            let done: Bool = lock.withLock {
+                if !osascriptRunning { return true }
+                osascriptWaiters.append(continuation)
+                return false
+            }
+            if done { continuation.resume() }
+        }
+    }
 
     func waitUntilExit() async {
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
@@ -77,9 +95,23 @@ final class UnfinishedPrompt: @unchecked Sendable, CustomStringConvertible {
         }
     }
 
+    /// Called by the runner when osascript has been reaped, whether or not
+    /// its output has closed. Tests call it in place of a child.
+    func markOsascriptExited() {
+        let waiting: [CheckedContinuation<Void, Never>] = lock.withLock {
+            guard osascriptRunning else { return [] }
+            osascriptRunning = false
+            let w = osascriptWaiters
+            osascriptWaiters.removeAll()
+            return w
+        }
+        for waiter in waiting { waiter.resume() }
+    }
+
     /// Called by the runner once the child has exited and its output has
     /// closed. Tests call it in place of a child.
     func markExited() {
+        markOsascriptExited()
         let waiting: [CheckedContinuation<Void, Never>] = lock.withLock {
             guard !exited else { return [] }
             exited = true
@@ -91,6 +123,21 @@ final class UnfinishedPrompt: @unchecked Sendable, CustomStringConvertible {
     }
 }
 
+/// One Start's claim on the password dialog. Just before the dialog is
+/// shown, the start transaction writes `nonce` (random, fresh per attempt)
+/// to `marker`, and it deletes the file before it releases the recovery
+/// lock. Everyone else who takes that lock (reconcile at launch, any later
+/// transaction, backstop.sh, uninstall.sh) deletes it first: holding the
+/// lock means no start is waiting on a dialog, so a dialog still on screen
+/// was abandoned (the app crashed or was force-quit under it). The command
+/// the dialog runs as root turns sleep off only while the file holds this
+/// nonce, so a late answer to an abandoned dialog cannot leave sleep off
+/// after recovery cleared the journal, and cannot act for a newer start.
+struct PendingStart: Sendable, Equatable {
+    let marker: URL
+    let nonce: String
+}
+
 /// The one privileged command Insomnia cannot run without a password:
 /// `pmset -a disablesleep 1`, through the standard macOS administrator
 /// dialog. The sudoers rule install.sh writes only covers turning sleep
@@ -98,19 +145,37 @@ final class UnfinishedPrompt: @unchecked Sendable, CustomStringConvertible {
 /// user can keep the Mac awake unattended. Only an explicit Start by the
 /// user may reach this; relaunch and reconcile read `pmset -g` instead.
 protocol AdministratorPromptRunning: Sendable {
-    /// Returns once `pmset -a disablesleep 1` has run as root. Throws an
+    /// Returns once `pmset -a disablesleep 1` has run as root, which it does
+    /// only while `start.marker` holds `start.nonce`. Throws an
     /// `AdministratorPromptError` when the dialog was cancelled, the
-    /// password was wrong, pmset failed, nothing came back in time, or the
-    /// prompt's process would not stop (`.stillRunning`).
-    func disableSleep() async throws
+    /// password was wrong, the marker no longer matched, pmset failed,
+    /// nothing came back in time, or the prompt's process would not stop
+    /// (`.stillRunning`).
+    func disableSleep(_ start: PendingStart) async throws
 }
 
 enum AdministratorPrompt {
-    /// The whole AppleScript, as one literal. The command, the privilege
-    /// flag and the dialog text are fixed at compile time: no user input,
-    /// configuration value, path or environment variable reaches the
-    /// command that runs as root.
-    static let disableSleepScript = #"do shell script "/usr/bin/pmset -a disablesleep 1" with administrator privileges with prompt "Insomnia needs your password to turn off system sleep for this session.""#
+    /// What runs as root once the password is accepted, as `/bin/sh -c
+    /// <this> insomnia <marker> <nonce>`. Fixed text: the marker path and
+    /// nonce arrive only as `$1` and `$2`, and the marker's content is only
+    /// compared, never run. pmset runs only while the marker holds the
+    /// nonce. The marker is read again after pmset; if it is gone by then,
+    /// recovery took the lock while pmset ran and may already have cleared
+    /// the journal, so sleep is turned back on. Exit 3: the start was over
+    /// before the password was accepted, nothing ran. Exit 4: it ended
+    /// while pmset ran, and sleep was turned back on.
+    static let rootCommand = #"m=$(/usr/bin/head -c 64 "$1" 2>/dev/null); if [ -z "$2" ] || [ "$m" != "$2" ]; then echo "the start that asked for this password is over; sleep was not turned off" >&2; exit 3; fi; /usr/bin/pmset -a disablesleep 1 || exit $?; m=$(/usr/bin/head -c 64 "$1" 2>/dev/null); if [ "$m" = "$2" ]; then exit 0; fi; /usr/bin/pmset -a disablesleep 0; echo "the start that asked for this password ended while sleep was being turned off; sleep was turned back on" >&2; exit 4"#
+    /// The whole AppleScript, as one literal: `rootCommand` (each `"`
+    /// escaped for AppleScript), the privilege flag and the dialog text are
+    /// fixed at compile time. Its only inputs are the marker path and the
+    /// nonce, `item 1` and `item 2 of argv`, and both reach the root shell
+    /// through `quoted form of` as positional parameters. No configuration
+    /// value or environment variable reaches the command that runs as root.
+    static let disableSleepScript = #"""
+    on run argv
+    do shell script "/bin/sh -c " & quoted form of "m=$(/usr/bin/head -c 64 \"$1\" 2>/dev/null); if [ -z \"$2\" ] || [ \"$m\" != \"$2\" ]; then echo \"the start that asked for this password is over; sleep was not turned off\" >&2; exit 3; fi; /usr/bin/pmset -a disablesleep 1 || exit $?; m=$(/usr/bin/head -c 64 \"$1\" 2>/dev/null); if [ \"$m\" = \"$2\" ]; then exit 0; fi; /usr/bin/pmset -a disablesleep 0; echo \"the start that asked for this password ended while sleep was being turned off; sleep was turned back on\" >&2; exit 4" & " insomnia " & quoted form of (item 1 of argv) & " " & quoted form of (item 2 of argv) with administrator privileges with prompt "Insomnia needs your password to turn off system sleep for this session."
+    end run
+    """#
     /// The user is typing a password, so the limit is generous. At the
     /// deadline osascript gets SIGTERM, and the start is rolled back.
     static let timeout: TimeInterval = 120
@@ -140,21 +205,28 @@ struct OsascriptAdministratorPrompt: AdministratorPromptRunning {
     let executable: String
     let timeout: TimeInterval
     let grace: TimeInterval
+    /// Runs on a background queue after osascript is launched and before
+    /// the `timeout` clock starts. Production passes nothing. Tests block in
+    /// it until their fake has installed its signal handlers, so SIGTERM
+    /// never lands before the handler it is meant to meet.
+    let beforeDeadline: @Sendable () -> Void
 
     /// `executable` is only ever overridden by tests, with a fake that
     /// records its arguments and never shows a dialog.
     init(
         executable: String = Self.osascript,
         timeout: TimeInterval = AdministratorPrompt.timeout,
-        grace: TimeInterval = AdministratorPrompt.stopGrace
+        grace: TimeInterval = AdministratorPrompt.stopGrace,
+        beforeDeadline: @escaping @Sendable () -> Void = {}
     ) {
         self.executable = executable
         self.timeout = timeout
         self.grace = grace
+        self.beforeDeadline = beforeDeadline
     }
 
-    func disableSleep() async throws {
-        let r = try await run(["-e", AdministratorPrompt.disableSleepScript])
+    func disableSleep(_ start: PendingStart) async throws {
+        let r = try await run(["-e", AdministratorPrompt.disableSleepScript, start.marker.path, start.nonce])
         guard r.status == 0 else {
             // `User canceled. (-128)` is what the dialog's Cancel button
             // produces; everything else is a failure with its stderr.
@@ -179,6 +251,8 @@ struct OsascriptAdministratorPrompt: AdministratorPromptRunning {
         /// Set once the caller was answered with `.stillRunning`; the exit
         /// then goes to this handle.
         private var unfinished: UnfinishedPrompt?
+        /// osascript itself has been reaped (its output may still be open).
+        private var osascriptGone = false
 
         init(timeout: TimeInterval, grace: TimeInterval) {
             self.timeout = timeout
@@ -221,12 +295,22 @@ struct OsascriptAdministratorPrompt: AdministratorPromptRunning {
         private func graceExpired() {
             let (c, error): (CheckedContinuation<ShellResult, Error>?, AdministratorPromptError?) = lock.withLock {
                 guard let c = continuation, let p = process else { return (nil, nil) }
-                let handle = UnfinishedPrompt(pid: p.processIdentifier, osascriptAlive: p.isRunning)
+                let handle = UnfinishedPrompt(pid: p.processIdentifier, osascriptAlive: !osascriptGone && p.isRunning)
                 unfinished = handle
                 continuation = nil
                 return (c, .stillRunning(handle, grace: grace))
             }
             if let c, let error { c.resume(throwing: error) }
+        }
+
+        /// osascript has been reaped; its pipes may still be open. A handle
+        /// already given out learns it now, so nothing keeps naming the pid.
+        func osascriptExited() {
+            let handle: UnfinishedPrompt? = lock.withLock {
+                osascriptGone = true
+                return unfinished
+            }
+            handle?.markOsascriptExited()
         }
 
         /// The child has been reaped and both pipes have closed. Classified
@@ -251,6 +335,7 @@ struct OsascriptAdministratorPrompt: AdministratorPromptRunning {
         let exe = executable
         let state = RunState(timeout: timeout, grace: grace)
         let timeout = self.timeout
+        let beforeDeadline = self.beforeDeadline
         return try await withCheckedThrowingContinuation { continuation in
             state.attach(continuation)
             DispatchQueue.global(qos: .userInitiated).async {
@@ -271,12 +356,17 @@ struct OsascriptAdministratorPrompt: AdministratorPromptRunning {
                 }
                 state.launched(process)
 
-                let deadline = DispatchWorkItem { state.deadline() }
-                DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: deadline)
+                nonisolated(unsafe) let deadline = DispatchWorkItem { state.deadline() }
+                DispatchQueue.global().async {
+                    beforeDeadline()
+                    DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: deadline)
+                }
 
                 // Each pipe is drained on its own thread and the child is
                 // reaped here; none of the three waits blocks the answer
-                // the grace path gives, it only delays `exited`.
+                // the grace path gives, it only delays `exited`. osascript's
+                // own exit is reported as soon as it is reaped, before its
+                // output closes.
                 let group = DispatchGroup()
                 nonisolated(unsafe) var outData = Data()
                 nonisolated(unsafe) var errData = Data()
@@ -293,6 +383,7 @@ struct OsascriptAdministratorPrompt: AdministratorPromptRunning {
                     group.leave()
                 }
                 process.waitUntilExit()
+                state.osascriptExited()
                 group.wait()
                 deadline.cancel()
 

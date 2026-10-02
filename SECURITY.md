@@ -19,7 +19,13 @@ as that user can invoke them too. None of them can keep the Mac awake. Turning
 sleep off (`pmset -a disablesleep 1`) has no passwordless line; the app runs it
 through the standard macOS administrator dialog, with a fixed command string,
 each time the user starts a session, and never on relaunch or from the recovery
-agent. The rule stays in place after a failed install (the README says what
+agent. That command turns sleep off only while the start that asked still
+holds its random nonce in `pending-start`; the start deletes the file when it
+finishes, and the app at launch, the recovery agent and uninstall delete it
+under the recovery lock before they undo anything. A dialog answered after its
+start was abandoned (the app died, recovery ran, the start rolled back, a newer
+start began) runs nothing, or turns sleep back on if recovery deleted the file
+while pmset ran. The rule stays in place after a failed install (the README says what
 was installed). The installer never writes a passwordless `disablesleep 1`
 line, on any path, including failed upgrades. It asks for the password before
 it quits a running Insomnia, so a cancelled password changes nothing, and it

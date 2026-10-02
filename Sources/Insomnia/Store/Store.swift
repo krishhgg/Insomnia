@@ -37,7 +37,10 @@ struct Store: Sendable {
 
     /// Atomic write: temp file + rename(2).
     func write<T: Encodable>(_ value: T, to url: URL) throws {
-        let data = try Store.makeEncoder().encode(value)
+        try writeAtomically(try Store.makeEncoder().encode(value), to: url)
+    }
+
+    private func writeAtomically(_ data: Data, to url: URL) throws {
         let dir = url.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let tmp = dir.appendingPathComponent(".\(url.lastPathComponent).tmp-\(UUID().uuidString)")
@@ -75,6 +78,24 @@ struct Store: Sendable {
     }
     func saveState(_ s: RuntimeState) throws { try write(s, to: paths.stateFile) }
 
+    /// The pending-start marker holds the nonce as plain bytes, no newline,
+    /// written atomically so the root command never reads half of it.
+    func savePendingStart(_ nonce: String) throws {
+        try writeAtomically(Data(nonce.utf8), to: paths.pendingStartFile)
+    }
+
+    /// unlink(2), so a directory or anything else that is not a plain file
+    /// or link is never removed as a tree. Returns whether a marker was
+    /// there; a missing one is not an error.
+    @discardableResult
+    func deletePendingStart() throws -> Bool {
+        let path = paths.pendingStartFile.path
+        if unlink(path) == 0 { return true }
+        let err = errno
+        if err == ENOENT { return false }
+        throw StoreError.unlink(path: path, errno: err)
+    }
+
     func loadConfig() throws -> Config? { try read(Config.self, from: paths.configFile) }
     func saveConfig(_ c: Config) throws { try write(c, to: paths.configFile) }
 
@@ -97,9 +118,12 @@ struct Store: Sendable {
 enum StoreError: Error, LocalizedError {
     case rename(from: String, to: String, errno: Int32)
     case corrupt(file: String, detail: String)
+    case unlink(path: String, errno: Int32)
 
     var errorDescription: String? {
         switch self {
+        case let .unlink(path, errno):
+            return "deleting \(path) failed: \(String(cString: strerror(errno)))"
         case let .rename(from, to, errno):
             return "rename \(from) -> \(to) failed: \(String(cString: strerror(errno)))"
         case let .corrupt(file, detail):

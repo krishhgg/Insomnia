@@ -120,7 +120,20 @@ Flag a change that breaks one of these; do not flag the behavior itself.
   gets SIGTERM at 120 s and is never sent SIGKILL. One still running 3 s
   later is reported with its pid, and the start keeps the recovery lock,
   `session.json` and the journal entry until it exits, then rolls back. The
-  same rule as a stuck `sudo -n pmset`.
+  same rule as a stuck `sudo -n pmset`. The menu line offers `kill <pid>`
+  only until osascript itself exits; a root command it started can hold its
+  output longer, and the rollback still waits for that.
+- `AdministratorPrompt.swift`, `SessionManager.swift`, `backstop.sh`,
+  `uninstall.sh`. A prompt can outlive its start (the app crashes or is
+  force-quit under the dialog, the start rolls back after a stuck prompt).
+  Its root command therefore runs `pmset -a disablesleep 1` only while
+  `pending-start` holds that start's nonce, and turns sleep back on if the
+  file is gone right after pmset. The start deletes the file before it
+  releases the recovery lock; every other lock holder deletes it before it
+  touches the journal. The file is written with no newline and compared,
+  never run. A marker that cannot be written rolls the start back with no
+  prompt; one that cannot be deleted is logged, and `uninstall.sh` refuses
+  to remove anything while it is present.
 - `DisplayPower.swift`, `LidActions.swift`. On lid close, brightness 0 is
   the primary mechanism; the display sleep request (`IORequestIdle`) is
   best effort and is ignored while any process holds a display assertion,

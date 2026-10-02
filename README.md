@@ -102,7 +102,9 @@ instructions before retrying.
    sleep off. Cancelling the dialog, a wrong password, or no answer within
    120 seconds leaves sleep as it was and no session started. If the dialog's
    process will not close, Insomnia reports it with its pid and waits for it
-   before rolling the start back.
+   before rolling the start back. A dialog left on screen after Insomnia
+   crashed or was force-quit does nothing when you answer it, once Insomnia
+   has relaunched or the recovery agent has run (within a minute).
 2. **Extend:** click the eye or countdown during a session and enter more time.
 3. **End early:** press and hold the end control beside the countdown.
 4. **Inspect or configure:** right-click for status, recovery warnings,

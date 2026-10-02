@@ -252,6 +252,9 @@ final class SessionManager {
                 return .failure(.lockBusy(error.localizedDescription))
             }
             defer { handle.release() }
+            // Holding the lock means no start is waiting on a password
+            // dialog, so a marker left on disk belongs to an abandoned one.
+            self.clearPendingStart()
             do {
                 try self.loadJournal()
             } catch {
@@ -299,7 +302,8 @@ final class SessionManager {
     /// Ignored if a session is already active; use `extend`.
     ///
     /// Ordering: session.json, then state.json, then the recovery agent,
-    /// then `pmset disablesleep 1`. A failure before pmset is rolled back:
+    /// then the pending-start marker, then the password dialog that runs
+    /// `pmset disablesleep 1`. A failure before the dialog is rolled back:
     /// nothing has touched the machine. A pmset failure is ambiguous (the
     /// setting may have been applied before the error or timeout), so it is
     /// undone from the journal like an end, and the journal keeps the entry
@@ -358,29 +362,59 @@ final class SessionManager {
             return
         }
 
+        // The pending-start marker: the command the dialog runs as root
+        // turns sleep off only while this file holds this attempt's nonce.
+        // It is deleted below on every outcome, before this transaction
+        // lets go of the lock, and by whoever takes the lock next if this
+        // process dies first, so a dialog answered after its start was
+        // abandoned changes nothing.
+        let pending = PendingStart(marker: store.paths.pendingStartFile, nonce: UUID().uuidString)
+        do {
+            try store.savePendingStart(pending.nonce)
+        } catch {
+            clearPendingStart()
+            rollBackStart(journal: journalBefore, session: sessionBefore)
+            fail("could not write the pending-start marker: \(error.localizedDescription)")
+            return
+        }
+
         // The administrator password dialog. This is the only call that can
         // prompt, and Start is the only path that reaches it: the user just
         // pressed Enter, so someone is at the keyboard. A cancel, a wrong
         // password, a timeout or a pmset failure all land here.
         do {
-            try await sleepGuard.setSleepDisabled(true)
+            try await sleepGuard.disableSleep(pending)
         } catch let AdministratorPromptError.stillRunning(prompt, grace) {
-            // The prompt's process did not stop on SIGTERM. It may still
-            // turn sleep off, so nothing is killed and nothing is rolled
-            // back beside it: session.json, the journal entry and the
-            // recovery lock stay until it exits, the same rule a stuck
-            // `sudo pmset` gets. The user is told what is running and, when
-            // it is osascript itself, how to stop it. Then the rollback.
-            reportStuckPrompt(prompt, grace: grace)
+            // The prompt's process did not stop on SIGTERM. The marker goes
+            // first, so an answer that still comes cannot turn sleep off.
+            // A root command already past that check may still run, so
+            // nothing is killed and nothing is rolled back beside it:
+            // session.json, the journal entry and the recovery lock stay
+            // until it exits, the same rule a stuck `sudo pmset` gets. The
+            // user is told what is running and, while it is osascript
+            // itself, how to stop it. Then the rollback.
+            clearPendingStart()
+            let alive = prompt.osascriptAlive
+            reportStuckPrompt(prompt, grace: grace, osascriptAlive: alive)
+            if alive {
+                // The pid is ours to name only until osascript exits; a
+                // root command it started can keep its output open longer.
+                await prompt.waitUntilOsascriptExits()
+                if prompt.isRunning {
+                    fail("start: \(Self.stuckPromptText(prompt, grace: grace, osascriptAlive: false))")
+                }
+            }
             await prompt.waitUntilExit()
             fail("could not disable sleep: \(prompt) did not finish in time and has now exited; rolling the start back")
             _ = await performEnd(reason: .startFailed)
             return
         } catch {
+            clearPendingStart()
             fail("could not disable sleep: \(error.localizedDescription)")
             _ = await performEnd(reason: .startFailed)
             return
         }
+        clearPendingStart()
         guard endTicket == ticket else {
             // Sleep is disabled and journaled as ours. The end that was
             // requested runs next and restores from that journal; the session
@@ -653,7 +687,7 @@ final class SessionManager {
     func restoreAll() async {
         if state.sleepDisabledByUs {
             do {
-                try await sleepGuard.setSleepDisabled(false)
+                try await sleepGuard.enableSleep()
                 try? journal { $0.sleepDisabledByUs = false }
                 Log.info("sleep restored")
             } catch {
@@ -975,7 +1009,7 @@ final class SessionManager {
                     return
                 }
                 Log.info("reconcile: pmset reports SleepDisabled with no session, clearing")
-                try await sleepGuard.setSleepDisabled(false)
+                try await sleepGuard.enableSleep()
             }
         } catch {
             Log.error("reconcile: sleep check failed: \(error.localizedDescription)")
@@ -1098,19 +1132,37 @@ final class SessionManager {
     /// warning line say what is running and that starts, ends and recovery
     /// wait behind it. `kill <pid>` is only offered while the pid is
     /// osascript's own, and only on the menu line: the caller replaces that
-    /// line once osascript has exited, while a notification stays in
+    /// line as soon as osascript exits, while a notification stays in
     /// Notification Center after the pid is gone and possibly reused.
-    private func reportStuckPrompt(_ prompt: UnfinishedPrompt, grace: TimeInterval) {
-        let what = prompt.osascriptAlive
-            ? "osascript (pid \(prompt.pid)), the process behind the password dialog, did not stop within \(Int(grace)) s."
-            : "osascript (pid \(prompt.pid)) stopped, but a command it started as root is still running."
-        let body = "\(what) Insomnia keeps the session record and waits for it before rolling the start back; nothing else runs until then."
-        if prompt.osascriptAlive {
+    private func reportStuckPrompt(_ prompt: UnfinishedPrompt, grace: TimeInterval, osascriptAlive: Bool) {
+        let body = Self.stuckPromptText(prompt, grace: grace, osascriptAlive: osascriptAlive)
+        if osascriptAlive {
             fail("start: \(body) To stop it by hand while it runs: kill \(prompt.pid)")
             notifier.post(title: Self.promptStuckTitle, body: "\(body) The Insomnia menu shows how to stop it while it runs.")
         } else {
             fail("start: \(body)")
             notifier.post(title: Self.promptStuckTitle, body: body)
+        }
+    }
+
+    private static func stuckPromptText(_ prompt: UnfinishedPrompt, grace: TimeInterval, osascriptAlive: Bool) -> String {
+        let what = osascriptAlive
+            ? "osascript (pid \(prompt.pid)), the process behind the password dialog, did not stop within \(Int(grace)) s."
+            : "osascript (pid \(prompt.pid)) stopped, but a command it started as root is still running."
+        return "\(what) Insomnia keeps the session record and waits for it before rolling the start back; nothing else runs until then."
+    }
+
+    /// Deletes the pending-start marker (see PendingStart). A failure is
+    /// logged: it can only happen when the support directory cannot be
+    /// written, and then the journal writes of the same transaction fail
+    /// and keep it dirty as well.
+    private func clearPendingStart() {
+        do {
+            if try store.deletePendingStart() {
+                Log.info("deleted the pending-start marker; a password dialog left from that start can no longer turn sleep off")
+            }
+        } catch {
+            Log.error("could not delete the pending-start marker: \(error.localizedDescription); a password dialog left on screen could still turn sleep off")
         }
     }
 

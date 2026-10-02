@@ -335,7 +335,96 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(fx.calls(), [], "the lock file must not make later runs think something is journaled")
     }
 
+    // MARK: - backstop.sh and the pending-start marker
+
+    /// The app died under its password dialog and the backstop ends the
+    /// session. The marker goes first thing under the lock, before any
+    /// privileged command, so a late answer to that dialog runs nothing.
+    func testBackstopVoidsTheDialogOfAStartThatDiedBeforeItUndoesAnything() throws {
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        let nonce = UUID().uuidString
+        try Data(nonce.utf8).write(to: fx.pendingStart)
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 0, r.stderr)
+        XCTAssertFalse(fx.exists(fx.pendingStart))
+        XCTAssertEqual(fx.calls(), ["sudo -n \(fx.fakePmset) -a disablesleep 0"])
+        XCTAssertEqual(fx.markerAtSudo(), ["absent"], "the marker must be gone before pmset runs")
+        XCTAssertFalse(fx.exists(fx.session))
+        XCTAssertTrue(fx.log().contains("pending-start; a password dialog left from an abandoned start can no longer turn sleep off"), fx.log())
+
+        let late = try runRootCommand(marker: fx.pendingStart, nonce: nonce, in: fx.root)
+        XCTAssertEqual(late.status, 3, late.stderr)
+        XCTAssertEqual(late.pmsetCalls, [], "the late answer must not turn sleep off")
+    }
+
+    /// A session that is still valid is left alone, but the dialog of the
+    /// start that died is voided all the same.
+    func testBackstopVoidsAnAbandonedDialogEvenWhileTheSessionIsValid() throws {
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: 3600))
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        try Data(UUID().uuidString.utf8).write(to: fx.pendingStart)
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 0, r.stderr)
+        XCTAssertFalse(fx.exists(fx.pendingStart))
+        XCTAssertEqual(fx.calls(), [])
+        XCTAssertTrue(fx.exists(fx.session))
+    }
+
+    /// Without the lock a start may still be waiting on its dialog, so the
+    /// marker is left exactly as it was.
+    func testBackstopLeavesTheMarkerWhenTheLockIsHeld() throws {
+        let nonce = UUID().uuidString
+        try Data(nonce.utf8).write(to: fx.pendingStart)
+        let holder = try fx.holdLock()
+        defer { holder.terminate(); holder.waitUntilExit() }
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 75, r.stderr)
+        XCTAssertEqual(try String(contentsOf: fx.pendingStart, encoding: .utf8), nonce)
+    }
+
     // MARK: - uninstall.sh
+
+    /// uninstall.sh deletes the marker itself, before the backstop it runs,
+    /// which may be an older copy that does not know the file.
+    func testUninstallDeletesTheMarkerBeforeRunningTheBackstop() throws {
+        try fx.installMachinery()
+        try Data(UUID().uuidString.utf8).write(to: fx.pendingStart)
+        try """
+        #!/bin/bash
+        if [[ -e "\(fx.pendingStart.path)" ]]; then echo present; else echo absent; fi > "\(fx.root.path)/marker-at-backstop"
+        exit 0
+        """.write(to: fx.backstop, atomically: true, encoding: .utf8)
+
+        let r = try fx.run(fx.uninstall)
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertEqual(try String(contentsOf: fx.root.appendingPathComponent("marker-at-backstop"), encoding: .utf8), "absent\n")
+        XCTAssertFalse(fx.exists(fx.pendingStart))
+        XCTAssertFalse(fx.exists(fx.sudoers))
+    }
+
+    /// A marker that cannot be deleted keeps everything, the sudoers rule
+    /// included: the dialog it belongs to could still turn sleep off.
+    func testUninstallAbortsWhenTheMarkerCannotBeDeleted() throws {
+        try fx.installMachinery()
+        try FileManager.default.createDirectory(at: fx.pendingStart, withIntermediateDirectories: false)
+        try Data("x".utf8).write(to: fx.pendingStart.appendingPathComponent("keep"))
+
+        let r = try fx.run(fx.uninstall)
+
+        XCTAssertNotEqual(r.status, 0, r.stdout)
+        XCTAssertTrue((r.stderr + r.stdout).contains("pending-start is still present"), r.stderr + r.stdout)
+        XCTAssertTrue(fx.exists(fx.sudoers))
+        XCTAssertTrue(fx.exists(fx.plist))
+        XCTAssertTrue(fx.exists(fx.app))
+    }
 
     func testUninstallAbortsWhenRestoreFailsAndKeepsEverything() throws {
         try fx.installMachinery()
@@ -1668,6 +1757,7 @@ private final class ScriptFixture {
     var state: URL { home.appendingPathComponent("state.json") }
     var config: URL { home.appendingPathComponent("config.json") }
     var lock: URL { home.appendingPathComponent(".recovery.lock") }
+    var pendingStart: URL { home.appendingPathComponent("pending-start") }
     var installedBackstop: URL { home.appendingPathComponent("backstop.sh") }
     var logFile: URL { home.appendingPathComponent("Logs/insomnia.log") }
     var plist: URL { home.appendingPathComponent("LaunchAgents/com.insomnia.backstop.plist") }
@@ -1858,6 +1948,7 @@ private final class ScriptFixture {
         // heredoc cannot pass here.
         try writeFake("sudo", """
         printf 'sudo %s\\n' "$*" >> "\(calls)"
+        if [[ -e "\(pendingStart.path)" ]]; then echo present; else echo absent; fi >> "\(r)/marker-at-sudo"
         mode="$(cat "\(r)/sudo.mode" 2>/dev/null || echo ok)"
         # "ignore-term" and "closes-fd9" behave like a pmset that ignores
         # SIGTERM: they live until the test creates the release file (or the
@@ -2059,6 +2150,12 @@ private final class ScriptFixture {
     }
 
     // MARK: State
+
+    /// Whether the pending-start marker existed at each sudo call.
+    func markerAtSudo() -> [String] {
+        let text = (try? String(contentsOf: root.appendingPathComponent("marker-at-sudo"), encoding: .utf8)) ?? ""
+        return text.split(separator: "\n").map(String.init)
+    }
 
     func writeState(_ json: String) throws {
         try json.write(to: state, atomically: true, encoding: .utf8)

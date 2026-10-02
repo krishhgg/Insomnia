@@ -30,6 +30,12 @@
       "rule": "Sleep is disabled (pmset -a disablesleep 1 through the administrator password prompt) only after session.json and the sleepDisabledByUs journal entry are on disk and LaunchdBackstop.arm() has returned without error. A failed arm rolls the start back and never reaches the prompt. Only an explicit Start shows the prompt: reconcile at launch and every other path read pmset -g and never prompt or re-apply disablesleep 1. The LaunchAgent plist at the trusted path only ever holds a plist launchd actually loaded."
     },
     {
+      "id": "abandoned-password-prompt-cannot-turn-sleep-off",
+      "severity": "high",
+      "scope": ["Sources/Insomnia/Core/SessionManager.swift", "Sources/Insomnia/System/AdministratorPrompt.swift", "Sources/Insomnia/Core/SleepGuard.swift", "Sources/Insomnia/Store/Store.swift", "scripts/backstop.sh", "scripts/uninstall.sh"],
+      "rule": "The root command behind the password prompt runs pmset -a disablesleep 1 only while pending-start holds the nonce of the start that showed the prompt, reads it again after pmset, and turns sleep back on if it is gone. performStart writes a fresh nonce just before the prompt and deletes the marker on every outcome before it releases the recovery lock (on .stillRunning, before it waits). Every other holder of the lock deletes it before it reads or clears the journal: exclusive() in the app, backstop.sh right after lockf, uninstall.sh right after lockf and before it runs a possibly older backstop. Nothing deletes it without the lock, because a live start may be waiting on its prompt. SleepGuarding.disableSleep takes a PendingStart, so no path turns sleep off without a marker."
+    },
+    {
       "id": "sudo-is-never-sigkilled",
       "severity": "high",
       "scope": ["Sources/Insomnia/Core/SleepGuard.swift", "Sources/Insomnia/System/AdministratorPrompt.swift", "Sources/Insomnia/System/CancellableCommand.swift", "Sources/Insomnia/System/ShellTimeout.swift", "scripts/backstop.sh", "scripts/install.sh", "scripts/uninstall.sh"],
@@ -51,7 +57,7 @@
       "id": "no-shell-interpolation",
       "severity": "high",
       "scope": ["Sources/**"],
-      "rule": "A child process is started with an absolute executable path and an argument array: Shell.run, Shell.run(timeout:), CancellableCommand.run, or Process with executableURL and arguments. Nothing runs through /bin/sh -c, /bin/bash -c, zsh, osascript with a built command string, or a string that has data interpolated into it. The one AppleScript, AdministratorPrompt.disableSleepScript, is a compile-time literal. No executable is resolved through PATH; Shell.locate picks from a fixed candidate list of absolute paths."
+      "rule": "A child process is started with an absolute executable path and an argument array: Shell.run, Shell.run(timeout:), CancellableCommand.run, or Process with executableURL and arguments. Nothing runs through /bin/sh -c, /bin/bash -c, zsh, osascript with a built command string, or a string that has data interpolated into it. The one AppleScript, AdministratorPrompt.disableSleepScript, is a compile-time literal, and so is the root command it hands to /bin/sh -c (AdministratorPrompt.rootCommand). Their only data, the pending-start marker path and nonce, arrive as osascript arguments and reach that shell as $1 and $2 through quoted form of; they are compared, never spliced into command text. No executable is resolved through PATH; Shell.locate picks from a fixed candidate list of absolute paths."
     },
     {
       "id": "scripts-run-under-bash-3-2",

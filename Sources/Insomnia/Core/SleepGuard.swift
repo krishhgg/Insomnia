@@ -5,14 +5,17 @@ import Foundation
 /// everything else goes through the three passwordless pmset lines
 /// install.sh writes to sudoers, none of which can keep the Mac awake.
 protocol SleepGuarding: Sendable {
-    /// `true` shows the administrator password dialog and waits for it;
-    /// only an explicit Start by the user may call it. The wait is bounded:
-    /// an `AdministratorPromptError.stillRunning` means the dialog's process
-    /// would not stop and may still turn sleep off, so the caller must keep
-    /// its lock and journal entry until the handle it carries resolves.
-    /// `false` never prompts, so a crashed or stuck session can always be
-    /// ended.
-    func setSleepDisabled(_ disabled: Bool) async throws
+    /// Shows the administrator password dialog and waits for it; only an
+    /// explicit Start by the user may call it, after writing `start`'s
+    /// marker. Sleep is turned off only while that marker holds its nonce.
+    /// The wait is bounded: an `AdministratorPromptError.stillRunning` means
+    /// the dialog's process would not stop and may still turn sleep off, so
+    /// the caller must keep its lock and journal entry until the handle it
+    /// carries resolves.
+    func disableSleep(_ start: PendingStart) async throws
+    /// Turns sleep back on. Never prompts, so a crashed or stuck session can
+    /// always be ended.
+    func enableSleep() async throws
     func isSleepDisabled() async throws -> Bool
     func setLowPowerMode(_ on: Bool) async throws
     /// Battery Low Power Mode as pmset reports it now. Throws when it cannot
@@ -53,12 +56,12 @@ struct PmsetSleepGuard: SleepGuarding {
         self.prompt = prompt
     }
 
-    func setSleepDisabled(_ disabled: Bool) async throws {
-        if disabled {
-            try await prompt.disableSleep()
-        } else {
-            try await sudoPmset(["-a", "disablesleep", "0"])
-        }
+    func disableSleep(_ start: PendingStart) async throws {
+        try await prompt.disableSleep(start)
+    }
+
+    func enableSleep() async throws {
+        try await sudoPmset(["-a", "disablesleep", "0"])
     }
 
     func setLowPowerMode(_ on: Bool) async throws {

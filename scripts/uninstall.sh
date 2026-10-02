@@ -7,6 +7,11 @@
 # APP_SUPPORT/.recovery.lock, so neither a queued periodic backstop nor a
 # relaunched app can republish the journal while it is being removed.
 #
+# Right after the lock it deletes APP_SUPPORT/pending-start itself, because
+# the backstop it runs may be an older copy that does not know the file: a
+# password dialog left from an abandoned start must not turn sleep off once
+# the rule that turns it back on is gone.
+#
 # If anything Insomnia changed is still journaled, nothing is removed: the
 # LaunchAgent keeps retrying every minute, the sudoers rule keeps pmset
 # undoable, and state.json keeps the evidence. The message says what to do.
@@ -59,6 +64,7 @@ LABEL="com.insomnia.backstop"
 PLIST="$LAUNCH_AGENTS/$LABEL.plist"
 SESSION="$APP_SUPPORT/session.json"
 STATE="$APP_SUPPORT/state.json"
+PENDING="$APP_SUPPORT/pending-start"
 LOCK="$APP_SUPPORT/.recovery.lock"
 UID_NUM="$(id -u)"
 
@@ -136,6 +142,9 @@ journal_problems() {
   local key value shape
   if [[ -e "$SESSION" ]]; then
     echo "session.json is still present"
+  fi
+  if [[ -e "$PENDING" || -L "$PENDING" ]]; then
+    echo "pending-start is still present, so a password dialog left from an abandoned start could still turn sleep off"
   fi
   [[ -e "$STATE" ]] || return 0
   if ! "$PLUTIL" -convert json -o /dev/null "$STATE" >/dev/null 2>&1; then
@@ -238,6 +247,9 @@ if app_running; then
   echo "Insomnia started again; quit it and rerun. Nothing was removed." >&2
   exit 1
 fi
+# No start is waiting on a password dialog while this process holds the
+# lock, so a marker here is an abandoned start's (see the header).
+rm -f "$PENDING" 2>/dev/null || true
 
 # 3. Undo everything via the current backstop ---------------------------------
 # The backstop inherits fd 9 and shares this lock instead of waiting on it.
