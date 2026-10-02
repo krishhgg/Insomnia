@@ -43,8 +43,9 @@ published with a `SHA256SUMS` file and a GitHub build provenance attestation.
 Verify both before installing (`shasum -a 256 -c SHA256SUMS`,
 `gh attestation verify <zip> -R krishhgg/Insomnia --signer-workflow
 krishhgg/Insomnia/.github/workflows/release.yml --source-ref
-refs/tags/v<version>`); `install.sh --app` then checks the bundle's
-signature, identifier and version before asking for a password, and refuses
+refs/tags/v<version>`); `install.sh --app` then checks the signature,
+identifier and version of a private copy of the bundle before asking for a
+password, installs that copy, and refuses
 a bundle whose origin it cannot verify (a Developer ID signature from the
 team pinned in the script) unless `--allow-unverified-origin` is given. The
 attestation shows which workflow run produced the bytes, not

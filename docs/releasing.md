@@ -104,11 +104,14 @@ Together they show the bytes are what the Release workflow built from the
 tagged commit. They do not show the code is safe; the README's warnings
 apply to every build.
 
-`install.sh --app` then runs `codesign --verify --strict --deep` on the
-bundle, checks the bundle identifier and version, and for a Developer ID
-signature runs `spctl --assess --type execute` and compares the team, all
-before the password prompt. The copy it puts in `~/Applications` is checked
-once more against the requirement the recovery agent pins.
+`install.sh --app` then copies the bundle into a private temporary
+directory and checks that copy: it runs `codesign --verify --strict --deep`,
+checks the bundle identifier and version, and for a Developer ID signature
+runs `spctl --assess --type execute` and compares the team, all before the
+password prompt. It installs that copy, not the path it was given, so a
+bundle replaced at that path while the prompt waits is never installed. The
+copy it puts in `~/Applications` is checked once more against the
+requirement the recovery agent pins.
 
 What is verified while `EXPECTED_TEAM_ID` is empty and releases are ad-hoc
 signed: the checksum shows the zip was not altered after `SHA256SUMS` was

@@ -124,15 +124,25 @@ trap cleanup EXIT
 #    changed when this step fails.
 if [[ -n "$PREBUILT" ]]; then
   step "Checking the prebuilt bundle $PREBUILT"
-  INFO_PLIST="$PREBUILT/Contents/Info.plist"
-  if [[ ! -d "$PREBUILT" || ! -f "$INFO_PLIST" ]]; then
+  if [[ ! -d "$PREBUILT" || ! -f "$PREBUILT/Contents/Info.plist" ]]; then
     echo "$PREBUILT is not an app bundle (no Contents/Info.plist). Nothing was changed." >&2
     exit 1
   fi
+  # Every check below runs on a private copy, and that copy is what step 3
+  # stages and pins. $PREBUILT may sit where someone else can write (a
+  # shared folder, /tmp); a bundle swapped there while the password prompt
+  # waits is never copied in. BUILD_DIR is removed at exit, as for a build.
+  BUILD_DIR="$(mktemp -d)"
+  CHECKED_APP="$BUILD_DIR/Insomnia.app"
+  if ! "$DITTO" "$PREBUILT" "$CHECKED_APP"; then
+    echo "could not copy $PREBUILT to check it. Nothing was changed." >&2
+    exit 1
+  fi
+  INFO_PLIST="$CHECKED_APP/Contents/Info.plist"
   # Signature first: nothing below is read from the bundle until it is known
   # to be intact. --strict rejects what newer codesign would, --deep covers
   # nested code should a later build add any.
-  if ! "$CODESIGN" --verify --strict --deep "$PREBUILT"; then
+  if ! "$CODESIGN" --verify --strict --deep "$CHECKED_APP"; then
     echo "$PREBUILT fails 'codesign --verify --strict --deep': the download is damaged or was modified. Nothing was changed." >&2
     echo "Check the zip against SHA256SUMS and 'gh attestation verify' (README, Install) and download it again." >&2
     exit 1
@@ -147,7 +157,7 @@ if [[ -n "$PREBUILT" ]]; then
     echo "$PREBUILT has no usable CFBundleShortVersionString ('${PREBUILT_VERSION:-<none>}'). Nothing was changed." >&2
     exit 1
   fi
-  if [[ ! -f "$PREBUILT/Contents/Resources/backstop.sh" ]]; then
+  if [[ ! -f "$CHECKED_APP/Contents/Resources/backstop.sh" ]]; then
     echo "$PREBUILT has no Contents/Resources/backstop.sh; the recovery agent needs the sealed copy. Nothing was changed." >&2
     exit 1
   fi
@@ -158,12 +168,12 @@ if [[ -n "$PREBUILT" ]]; then
   # verdict (notarized, not revoked), establishes origin here. Everything
   # else is installed only with --allow-unverified-origin, after the user
   # verified the download with SHA256SUMS and the attestation themselves.
-  SIGNING="$("$CODESIGN" -dvv "$PREBUILT" 2>&1 || true)"
+  SIGNING="$("$CODESIGN" -dvv "$CHECKED_APP" 2>&1 || true)"
   TEAM="$(sed -n 's/^TeamIdentifier=//p' <<<"$SIGNING" | head -n 1)"
   origin=""
   unverified=""
   if grep -q '^Authority=Developer ID Application' <<<"$SIGNING"; then
-    if ! "$SPCTL" --assess --type execute "$PREBUILT"; then
+    if ! "$SPCTL" --assess --type execute "$CHECKED_APP"; then
       echo "$PREBUILT is Developer ID signed but Gatekeeper rejects it (not notarized, or the certificate was revoked). Nothing was changed." >&2
       exit 1
     fi
@@ -199,7 +209,7 @@ see the README), then rerun with the flag that says so:
 REFUSE
     exit 1
   fi
-  SOURCE_APP="$PREBUILT"
+  SOURCE_APP="$CHECKED_APP"
 else
   BUILD_DIR="$(mktemp -d)"
   "$ROOT/scripts/build-app.sh" --output "$BUILD_DIR"

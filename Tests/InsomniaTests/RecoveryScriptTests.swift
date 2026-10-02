@@ -1218,6 +1218,17 @@ final class RecoveryScriptTests: XCTestCase {
 
     // MARK: - install.sh --app (a prebuilt bundle, as from a release zip)
 
+    /// The private copy install.sh --app checks and installs, read from the
+    /// first deep verify in the recorded calls. Never the path passed in.
+    private func checkedCopy(of prebuilt: URL) throws -> String {
+        let prefix = "codesign --verify --strict --deep "
+        let call = try XCTUnwrap(fx.calls().first { $0.hasPrefix(prefix) }, "\(fx.calls())")
+        let path = String(call.dropFirst(prefix.count))
+        XCTAssertNotEqual(path, prebuilt.path, "checked at the path passed in")
+        XCTAssertTrue(path.hasSuffix("/Insomnia.app"), path)
+        return path
+    }
+
     /// The prebuilt bundle is checked before the password prompt and
     /// installed as it is: no build, the signature verified with --deep,
     /// the identifier and version read, then the usual steps with the same
@@ -1235,7 +1246,8 @@ final class RecoveryScriptTests: XCTestCase {
         let calls = fx.calls()
         XCTAssertFalse(calls.contains { $0.hasPrefix("swift") }, "nothing is built: \(calls)")
         XCTAssertFalse(calls.contains { $0.hasPrefix("codesign --force") }, "the bundle is installed as signed: \(calls)")
-        let verify = try XCTUnwrap(calls.firstIndex(of: "codesign --verify --strict --deep \(prebuilt.path)"), "\(calls)")
+        let copy = try checkedCopy(of: prebuilt)
+        let verify = try XCTUnwrap(calls.firstIndex(of: "codesign --verify --strict --deep \(copy)"), "\(calls)")
         let visudo = try XCTUnwrap(calls.firstIndex { $0.hasPrefix("sudo visudo") }, "\(calls)")
         XCTAssertLessThan(verify, visudo, "verified before the password prompt: \(calls)")
         XCTAssertFalse(calls.contains { $0.hasPrefix("spctl") }, "Gatekeeper is asked about Developer ID builds only: \(calls)")
@@ -1250,6 +1262,26 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(r.stdout.contains("Uninstall:"), r.stdout)
     }
 
+    /// The checks run on a private copy, and that copy is what gets staged
+    /// and pinned. A bundle swapped at the --app path while the password
+    /// prompt waits (the fake sudo does it during visudo) is never copied in.
+    func testInstallFromPrebuiltAppInstallsTheCopyItCheckedNotABundleSwappedDuringThePrompt() throws {
+        try fx.prepareInstall()
+        let prebuilt = try fx.writePrebuiltApp()
+        fx.setMode("launchctl", "loaded")
+        fx.setMode("sudo", "swap-prebuilt")
+
+        let r = try fx.run(fx.installRedirected, ["--allow-unverified-origin", "--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertEqual(try String(contentsOf: prebuilt.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "swapped", "the bundle at the --app path was replaced during the prompt")
+        XCTAssertEqual(try String(contentsOf: fx.app.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "prebuilt", "the checked copy is installed")
+        let copy = try checkedCopy(of: prebuilt)
+        let calls = fx.calls()
+        XCTAssertFalse(calls.contains { $0.hasSuffix(" \(prebuilt.path)") }, "no tool reads the --app path itself: \(calls)")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: copy), "the private copy is removed at exit")
+    }
+
     /// Integrity is not origin: an ad-hoc bundle, or a Developer ID bundle
     /// while EXPECTED_TEAM_ID is empty, passes every check on it and could
     /// still have been made by anyone. Without --allow-unverified-origin
@@ -1261,7 +1293,8 @@ final class RecoveryScriptTests: XCTestCase {
         let adhoc = try fx.run(fx.installRedirected, ["--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
 
         XCTAssertEqual(adhoc.status, 1, adhoc.stderr + adhoc.stdout)
-        XCTAssertEqual(fx.calls(), ["codesign --verify --strict --deep \(prebuilt.path)", "codesign -dvv \(prebuilt.path)"], "\(fx.calls())")
+        let copy = try checkedCopy(of: prebuilt)
+        XCTAssertEqual(fx.calls(), ["codesign --verify --strict --deep \(copy)", "codesign -dvv \(copy)"], "\(fx.calls())")
         XCTAssertTrue(adhoc.stderr.contains("The origin of Insomnia 0.1.0 at \(prebuilt.path) is not verified: ad-hoc signed"), adhoc.stderr)
         XCTAssertTrue(adhoc.stderr.contains("--allow-unverified-origin --app \"\(prebuilt.path)\""), "names the flag: \(adhoc.stderr)")
         XCTAssertTrue(adhoc.stderr.contains("Nothing was changed"), adhoc.stderr)
@@ -1273,7 +1306,7 @@ final class RecoveryScriptTests: XCTestCase {
         let unpinnedTeam = try fx.run(fx.installRedirected, ["--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
 
         XCTAssertEqual(unpinnedTeam.status, 1, unpinnedTeam.stderr + unpinnedTeam.stdout)
-        XCTAssertTrue(fx.calls().contains("spctl --assess --type execute \(prebuilt.path)"), "\(fx.calls())")
+        XCTAssertTrue(fx.calls().contains("spctl --assess --type execute \(try checkedCopy(of: prebuilt))"), "\(fx.calls())")
         XCTAssertFalse(fx.calls().contains { $0.hasPrefix("sudo") }, "\(fx.calls())")
         XCTAssertTrue(unpinnedTeam.stderr.contains("Developer ID signed by team ABCDE12345 and Gatekeeper accepts it, but EXPECTED_TEAM_ID is empty"), unpinnedTeam.stderr)
         XCTAssertTrue(unpinnedTeam.stderr.contains("Nothing was changed"), unpinnedTeam.stderr)
@@ -1330,7 +1363,7 @@ final class RecoveryScriptTests: XCTestCase {
 
         XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
         let calls = fx.calls()
-        XCTAssertEqual(calls, ["codesign --verify --strict --deep \(prebuilt.path)"], "nothing after the failed check: \(calls)")
+        XCTAssertEqual(calls, ["codesign --verify --strict --deep \(try checkedCopy(of: prebuilt))"], "nothing after the failed check: \(calls)")
         XCTAssertTrue(r.stderr.contains("Nothing was changed"), r.stderr)
         XCTAssertTrue(r.stderr.contains("SHA256SUMS"), "points at the download checks: \(r.stderr)")
         XCTAssertEqual(try String(contentsOf: fx.app.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "binary", "old bundle kept")
@@ -1372,7 +1405,7 @@ final class RecoveryScriptTests: XCTestCase {
         let unpinned = try fx.run(fx.installRedirected, ["--allow-unverified-origin", "--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
 
         XCTAssertEqual(unpinned.status, 0, unpinned.stderr + unpinned.stdout)
-        XCTAssertTrue(fx.calls().contains("spctl --assess --type execute \(prebuilt.path)"), "\(fx.calls())")
+        XCTAssertTrue(fx.calls().contains("spctl --assess --type execute \(try checkedCopy(of: prebuilt))"), "\(fx.calls())")
         XCTAssertTrue(unpinned.stdout.contains("WARNING: the origin of Insomnia 0.1.0 is not verified: Developer ID signed by team ABCDE12345"), unpinned.stdout)
         XCTAssertTrue(unpinned.stdout.contains("EXPECTED_TEAM_ID is empty"), "says the team is not checked: \(unpinned.stdout)")
 
@@ -1403,7 +1436,7 @@ final class RecoveryScriptTests: XCTestCase {
         let r = try fx.run(fx.installRedirected, ["--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
 
         XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
-        XCTAssertTrue(fx.calls().contains("spctl --assess --type execute \(prebuilt.path)"), "\(fx.calls())")
+        XCTAssertTrue(fx.calls().contains("spctl --assess --type execute \(try checkedCopy(of: prebuilt))"), "\(fx.calls())")
         XCTAssertFalse(fx.calls().contains { $0.hasPrefix("sudo") }, "\(fx.calls())")
         XCTAssertTrue(r.stderr.contains("Gatekeeper rejects it"), r.stderr)
         XCTAssertTrue(r.stderr.contains("Nothing was changed"), r.stderr)
@@ -2322,6 +2355,9 @@ private final class ScriptFixture {
               esac ;;
           visudo)
             if [[ "$mode" == auth-fail ]]; then echo "sudo: 3 incorrect password attempts" >&2; exit 1; fi
+            # "swap-prebuilt": someone replaces the --app bundle at its path
+            # (writePrebuiltApp's dist/Insomnia.app) while the password prompt waits.
+            if [[ "$mode" == swap-prebuilt ]]; then printf 'swapped' > "\(r)/dist/Insomnia.app/Contents/MacOS/Insomnia"; fi
             f=""; for a in "$@"; do f="$a"; done
             [[ -s "$f" ]] && grep -q 'NOPASSWD: /usr/bin/pmset' "$f" || { printf 'sudo VISUDO-REJECTED %s\\n' "$*" >> "\(calls)"; exit 1; }
             exit 0 ;;
