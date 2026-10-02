@@ -253,9 +253,12 @@ Lines the app writes to `insomnia.log` also go to the unified log with their
 bodies marked private, so `log show` and other local programs see `<private>`
 in place of the text unless private data logging is enabled on the Mac. The
 backstop's lines go only to `insomnia.log`, which keeps the full text of both.
-Every file Insomnia creates is owner-only (mode 0600, its two directories
-0700), and a file left looser by an older build is tightened the next time
-the app opens it. `insomnia.log` and `handoffs.log` are capped at 1 MiB: a
+The files in Application Support/Insomnia and Logs/Insomnia (config, session,
+journal, recovery lock, the two logs) are owner-only, mode 0600 with those two
+directories 0700, and one left looser by an older build is tightened the next
+time the app or the backstop opens it. The LaunchAgent plist and the installed
+scripts hold no private data and keep the modes the installer gives them.
+`insomnia.log` and `handoffs.log` are capped at 1 MiB: a
 log past the cap is renamed to `insomnia.log.1` or `handoffs.log.1`,
 replacing the previous copy, and a new file starts.
 
