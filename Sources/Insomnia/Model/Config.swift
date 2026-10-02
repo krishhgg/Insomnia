@@ -35,9 +35,10 @@ struct Config: Codable, Equatable, Sendable {
     /// Battery percentage below which Low Power Mode is switched on.
     var lowPowerFloor: Int = 40
     /// Battery percentage below which the session is ended. 0 turns the
-    /// battery end off. Otherwise kept below `lowPowerFloor`, so Low Power
-    /// Mode always comes first: see `setEndFloor`, `setLowPowerFloor` and
-    /// `normalizeFloors`.
+    /// battery end off. Otherwise kept below `lowPowerFloor`, which gives Low
+    /// Power Mode a chance to come on before the session ends; a reading
+    /// already below both floors still ends it. See `setEndFloor`,
+    /// `setLowPowerFloor` and `normalizeFloors`.
     var endFloor: Int = 10
     var thermalRules: Bool = true
 
@@ -129,8 +130,8 @@ extension Config {
     /// Mode floor.
     static let maxEndFloor = 100 - floorStep
 
-    /// The order the rules expect: Low Power Mode before the end, unless the
-    /// end is off.
+    /// A non-zero end floor sits below the Low Power Mode floor, so the mode
+    /// gets its chance before the end.
     var floorsAreOrdered: Bool { endFloor == 0 || endFloor < lowPowerFloor }
 
     /// Sets the end floor (0...`maxEndFloor`) and raises the Low Power Mode

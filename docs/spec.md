@@ -280,11 +280,13 @@ menu opened during a transient miss is not the second one, and the count
 never moves without the floor rules running. An unreadable level never counts
 as below a floor, so it does not enable Low Power Mode by itself.
 
-A non-zero `endFloor` stays below `lowPowerFloor` so Low Power Mode comes
-first. Settings enforces it in 5% steps by moving the other floor when the
-two would cross (`endFloor` at most 95). A `config.json` that violates it is
-corrected at load by raising `lowPowerFloor` to `endFloor` + 5 (capped at
-100), logged, and written back.
+A non-zero `endFloor` stays below `lowPowerFloor`, which gives Low Power Mode
+a chance to come on before the session ends. It is not a guarantee: a reading
+already below both floors, or one that crosses both between evaluations, ends
+the session without it. Settings enforces the order in 5% steps by moving the
+other floor when the two would cross (`endFloor` at most 95). A `config.json`
+that violates it is corrected at load by raising `lowPowerFloor` to `endFloor`
++ 5 (capped at 100), logged, and written back.
 
 Insomnia does not enable Low Power Mode merely because a session starts; the
 causes are the battery floor, a serious thermal state, and (by default) a closed
