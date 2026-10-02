@@ -101,6 +101,22 @@ log() { # level message
 
 # --- Lock --------------------------------------------------------------------
 mkdir -p "$APP_SUPPORT"
+# An upgrade over an older build: tighten what it left loose (0644 files,
+# 0755 directories), since this run may write to them before the upgraded
+# app has opened them. umask only covers what this run creates. A symlink
+# is left alone, as the app leaves it.
+tighten() { # mode path...
+  local mode="$1"
+  shift
+  local p
+  for p in "$@"; do
+    if [[ -e "$p" && ! -L "$p" ]]; then
+      chmod "$mode" "$p" 2>/dev/null || true
+    fi
+  done
+}
+tighten 700 "$APP_SUPPORT" "$LOG_DIR"
+tighten 600 "$LOG" "$LOCK" "$STATE" "$SESSION"
 inode() { stat -f %i "$1" 2>/dev/null; }
 if [[ -e /dev/fd/9 && -e "$LOCK" && -n "$(inode "$LOCK")" && "$(inode /dev/fd/9)" == "$(inode "$LOCK")" ]]; then
   : # fd 9 is the caller's handle on the lock file; share its lock.

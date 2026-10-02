@@ -532,6 +532,31 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, false)
     }
 
+    /// An upgrade over an older build: the log, lock, journal, session and
+    /// the two directories it left loose are tightened by the backstop too,
+    /// since it may run before the upgraded app has opened them.
+    func testBackstopTightensWhatAnOlderBuildLeftLoose() throws {
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: 3600))
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        let logsDir = fx.logFile.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: logsDir, withIntermediateDirectories: true)
+        try "old line\n".write(to: fx.logFile, atomically: true, encoding: .utf8)
+        try "".write(to: fx.lock, atomically: true, encoding: .utf8)
+        for (url, mode) in [(fx.home, 0o755), (logsDir, 0o755), (fx.logFile, 0o644), (fx.lock, 0o644), (fx.state, 0o644), (fx.session, 0o644)] {
+            try FileManager.default.setAttributes([.posixPermissions: mode], ofItemAtPath: url.path)
+        }
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 0, r.stderr)
+        XCTAssertEqual(try fx.mode(fx.home), 0o700)
+        XCTAssertEqual(try fx.mode(logsDir), 0o700)
+        for file in [fx.logFile, fx.lock, fx.state, fx.session] {
+            XCTAssertEqual(try fx.mode(file), 0o600, file.lastPathComponent)
+        }
+        XCTAssertTrue(fx.log().hasPrefix("old line\n"), "the loose log was replaced instead of kept")
+    }
+
     // MARK: - Journal shape (typed corruption)
 
     func testTypedCorruptJournalIsRejectedByBackstopWithoutCommands() throws {
