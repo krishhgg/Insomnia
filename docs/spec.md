@@ -252,15 +252,33 @@ last held while it was on was the battery or thermal floor, not the lid.
 ### 6. Battery and thermal floors
 
 Event sources: `IOPSNotificationCreateRunLoopSource` (fires on every battery
-percentage change) and `ProcessInfo.thermalStateDidChangeNotification`.
+percentage change) and `ProcessInfo.thermalStateDidChangeNotification`. While
+the battery is unreadable the power source list is re-read every 30 s, since
+IOKit sends no event for a read that keeps failing.
 
 | condition | action | undo |
 |---|---|---|
 | battery below `lowPowerFloor` (default 40%) | `pmset -b lowpowermode 1` | charger connected, or session end |
 | battery below `endFloor` (default 10%) | end session, notify | — |
+| battery present but unreadable on two consecutive reads, on battery, `endFloor` above 0 | end session, notify | — |
 | thermal state `serious` | `lowpowermode 1` | thermal back to `nominal`/`fair`, or session end |
 | thermal state `critical` | end session, notify | — |
 | lid closed (if `lowPowerOnLidClose`, charging or not) | `lowpowermode 1`, no notification | lid opened, or session end |
+
+`PowerMonitor` tells a machine with no internal battery (desktop: no floor
+applies) from one whose battery is present but not reported, by checking for
+the `AppleSmartBattery` service when the power source list has no battery
+entry or cannot be read at all. On that laptop, charger or battery comes from
+the driver's `ExternalConnected` property in the I/O Registry rather than the
+list that failed; when that cannot be read either, the laptop is taken to be
+on battery, so the session ends rather than holding sleep with no floor on a
+battery that may be draining. One missed read is tolerated as transient; the
+second ends the session, because the end floor cannot be applied to a level
+nobody can read. Only the IOKit event and the 30 s re-read count misses; the
+menu's own refresh reads the level but leaves the count where it is, so a
+menu opened during a transient miss is not the second one, and the count
+never moves without the floor rules running. An unreadable level never counts
+as below a floor, so it does not enable Low Power Mode by itself.
 
 Insomnia does not enable Low Power Mode merely because a session starts; the
 causes are the battery floor, a serious thermal state, and (by default) a closed
@@ -280,8 +298,14 @@ provided by the standalone backstop. Performance effects depend on workload.
 - macOS 26 requires Location Services permission before CoreWLAN exposes SSIDs
   or returns results for an SSID-filtered scan. Insomnia requests when-in-use
   access when the hotspot is saved or a configured session starts, never at
-  launch. The real hotspot join still must be run on the Mac in the manual
-  test plan below.
+  launch. Mac apps have no when-in-use state: a grant settles on
+  `authorizedAlways`, and System Settings records it as Location Services
+  access for Insomnia (the Settings window says so next to the Location
+  row). Insomnia never starts location updates. The real hotspot join still
+  must be run on the Mac in the manual test plan below.
+- Log lines naming the SSID, a tmux target or a process reach the unified
+  log as private data (`Log.swift`), so `log show` prints `<private>` for
+  the body; `insomnia.log` keeps the text.
 - Each outage is logged with start, end, and gap length to
   `~/Library/Logs/Insomnia/handoffs.log`. The menu shows the last gap.
 - Path satisfied again after a gap longer than `nudgeThreshold` (default 90 s):
@@ -337,7 +361,8 @@ Backstop, independent of the app:
 ### 9. Notifications
 
 `UNUserNotificationCenter`: session ended (with reason), extend reminder 5
-minutes before end, battery floor reached, thermal action taken, network gap
+minutes before end, battery floor reached, battery unreadable twice in a row,
+thermal action taken, network gap
 recovered (with nudge summary), sleep restored by backstop.
 
 ### 10. Settings
@@ -451,6 +476,7 @@ transitions. If it feels like a web dropdown, it is wrong.
 |---|---|---|
 | lid | IOKit interest notification | none |
 | battery % | IOPS run loop source | none |
+| battery unreadable | re-read every 30 s | one wake per 30 s, only while a session runs and the battery is unreadable |
 | thermal | `ProcessInfo` notification | none |
 | network path | `NWPathMonitor` | none |
 | session deadline | one in-app timer plus independent launchd recovery | recovery checks may wake periodically |

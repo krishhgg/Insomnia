@@ -1,0 +1,28 @@
+[
+  {
+    "path": "docs/spec.md",
+    "description": "Design notes: the Session and RuntimeState model, the lid-close action table, the Low Power Mode and floor rules, the recovery invariants in section 8, and the defaults chosen under open decisions."
+  },
+  {
+    "path": "SECURITY.md",
+    "description": "Trust boundary: the sudoers grant is not exclusive to the app, the app is not sandboxed, local logs may hold SSIDs and tmux targets, and hotspot passwords live in the login Keychain."
+  },
+  {
+    "path": "CONTRIBUTING.md",
+    "description": "What a pull request must include: regression tests through injected dependencies and temporary journals, never live power, process, install or hotspot changes on a contributor's machine, and what counts as review evidence."
+  },
+  {
+    "path": "docs/release-validation.md",
+    "description": "What has and has not been validated on real hardware; a hardware row changes from Not run only with recorded evidence."
+  },
+  {
+    "path": "scripts/backstop.sh",
+    "description": "The standalone recovery script launchd runs every 60 s. Its header states what it undoes from state.json, what it keeps for the app, the journal shape check, the shared lock, and why a timed-out sudo pmset is never SIGKILLed.",
+    "scope": ["Sources/Insomnia/Core/**", "Sources/Insomnia/Model/RuntimeState.swift", "scripts/**"]
+  },
+  {
+    "path": "Sources/Insomnia/Model/RuntimeState.swift",
+    "description": "The shape of state.json: every key the shell reads, the flat FrozenProcess encoding, the legacy frozenPids migration, and the isDirty and hasLidActions predicates.",
+    "scope": ["Sources/Insomnia/Core/**", "scripts/**"]
+  }
+]
