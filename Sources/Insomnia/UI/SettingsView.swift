@@ -42,7 +42,7 @@ struct SettingsView: View {
         // The failover may find the saved password unreadable while the
         // window is open; the notice follows what it reports.
         .onChange(of: manager.services?.status.hotspotPasswordProblem) { _, problem in
-            hotspotNotice = Self.hotspotNotice(reported: problem, reread: secrets.load)
+            hotspotNotice = Self.hotspotNotice(reported: problem, reread: secrets.peek)
         }
         // The preview depends on the toggle, both lists and what is running:
         // recompute on any config change and whenever an app launches or quits.
@@ -286,7 +286,9 @@ struct SettingsView: View {
     /// shows as it is. A cleared report is not taken as "readable": it
     /// also clears when the session ends, so the keychain is read again,
     /// without a prompt, and the notice says what that read finds. The
-    /// field is left as the user has it.
+    /// field is left as the user has it, and the reread is a peek: a load
+    /// would make an SSID typed since then the account a save moves the
+    /// password from, and the old SSID's item would stay behind.
     static func hotspotNotice(reported: HotspotPasswordProblem?, reread: () throws -> String?) -> String? {
         if let reported { return reported.settingsNotice }
         return loadedPassword(reread).notice

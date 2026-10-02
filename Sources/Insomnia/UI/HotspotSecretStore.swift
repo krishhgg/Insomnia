@@ -4,7 +4,12 @@ import Foundation
 /// implementation (`insomnia-hotspot` in the login keychain); the settings
 /// window only ever talks to this protocol.
 protocol HotspotSecretStore: AnyObject, Sendable {
+    /// The password for the current SSID, which becomes the account a
+    /// later save moves the password from.
     func load() throws -> String?
+    /// The same read without changing that account: a check, not a load
+    /// into the field.
+    func peek() throws -> String?
     func save(_ password: String) throws
     func delete() throws
 }
@@ -27,6 +32,10 @@ final class KeychainHotspotSecretStore: HotspotSecretStore, @unchecked Sendable 
         let ssid = currentSSID()
         lock.withLock { selectedSSID = ssid }
         return try keychain.get(service: KeychainStore.service, account: ssid)
+    }
+
+    func peek() throws -> String? {
+        try keychain.get(service: KeychainStore.service, account: currentSSID())
     }
 
     func save(_ password: String) throws {
@@ -62,6 +71,7 @@ final class InMemoryHotspotSecretStore: HotspotSecretStore, @unchecked Sendable 
     init() {}
 
     func load() throws -> String? { lock.withLock { password } }
+    func peek() throws -> String? { lock.withLock { password } }
     func save(_ password: String) throws { lock.withLock { self.password = password } }
     func delete() throws { lock.withLock { password = nil } }
 }

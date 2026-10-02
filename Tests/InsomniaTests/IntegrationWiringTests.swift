@@ -101,6 +101,24 @@ final class IntegrationWiringTests: XCTestCase {
         XCTAssertEqual(try keychain.get(service: KeychainStore.service, account: "New Phone"), "replacement")
     }
 
+    /// Settings rereads the password when the failover's report clears.
+    /// That check must not change which account a save moves the password
+    /// from, or an SSID typed meanwhile leaves the old item behind.
+    func testAPeekAfterAnSSIDChangeStillLetsASaveMoveThePassword() throws {
+        let keychain = FakeKeychainStore()
+        var ssid = "Old Phone"
+        let store = KeychainHotspotSecretStore(keychain: keychain) { ssid }
+        try store.save("first")
+        XCTAssertEqual(try store.load(), "first")
+
+        ssid = "New Phone"
+        XCTAssertNil(try store.peek())
+        try store.save("replacement")
+
+        XCTAssertNil(try keychain.get(service: KeychainStore.service, account: "Old Phone"))
+        XCTAssertEqual(try keychain.get(service: KeychainStore.service, account: "New Phone"), "replacement")
+    }
+
     func testWiFiStatusNameExplainsLocationRedaction() {
         XCTAssertEqual(
             WiFiStatusName.display(ssid: nil, locationAuthorized: false),
