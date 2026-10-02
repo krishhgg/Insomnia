@@ -467,7 +467,7 @@ final class RecoveryScriptTests: XCTestCase {
         try fx.writeState(dirty)
 
         let holder = try fx.holdLock()
-        defer { holder.terminate(); holder.waitUntilExit() }
+        defer { holder.stop() }
 
         let r = try fx.run(fx.backstop)
 
@@ -1081,7 +1081,7 @@ final class RecoveryScriptTests: XCTestCase {
         try fx.installMachinery()
         try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
         let holder = try fx.holdLock()
-        defer { holder.terminate(); holder.waitUntilExit() }
+        defer { holder.stop() }
 
         let r = try fx.run(fx.uninstall)
 
@@ -1149,7 +1149,7 @@ final class RecoveryScriptTests: XCTestCase {
         try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
         try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
         let holder = try fx.holdLock()
-        defer { holder.terminate(); holder.waitUntilExit() }
+        defer { holder.stop() }
         let other = fx.root.appendingPathComponent("other.file")
         try Data().write(to: other)
 
@@ -1642,7 +1642,7 @@ final class RecoveryScriptTests: XCTestCase {
         try "trusted".write(to: fx.plist, atomically: true, encoding: .utf8)
         try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
         let holder = try fx.holdLock()
-        defer { holder.terminate(); holder.waitUntilExit() }
+        defer { holder.stop() }
 
         let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
 
@@ -2283,8 +2283,9 @@ private final class ScriptFixture {
         probe.arguments = ["-k", "-s", "-t", "0", lock.path, "/usr/bin/true"]
         probe.standardOutput = FileHandle.nullDevice
         probe.standardError = FileHandle.nullDevice
+        let probeExit = ProcessExit(probe)
         try probe.run()
-        probe.waitUntilExit()
+        probeExit.wait()
         return probe.terminationStatus == 0
     }
 
@@ -2455,16 +2456,29 @@ private final class ScriptFixture {
         defer { try? out.close(); try? err.close() }
         p.standardOutput = out
         p.standardError = err
+        let childExit = ProcessExit(p)
         try p.run()
-        p.waitUntilExit()
+        childExit.wait()
         return (p.terminationStatus,
                 (try? String(contentsOf: outURL, encoding: .utf8)) ?? "",
                 (try? String(contentsOf: errURL, encoding: .utf8)) ?? "")
     }
 
+    /// A lockf process that holds the recovery lock.
+    struct LockHolder {
+        let process: Process
+        let exit: ProcessExit
+
+        /// Terminates the holder and returns once it has exited.
+        func stop() {
+            process.terminate()
+            exit.wait()
+        }
+    }
+
     /// Holds the recovery lock from another process, the way a running app
-    /// or a concurrent backstop would, until terminated.
-    func holdLock() throws -> Process {
+    /// or a concurrent backstop would, until stopped.
+    func holdLock() throws -> LockHolder {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/lockf")
         // The holder waits (not -t 0): a probe below may briefly own the lock
@@ -2476,6 +2490,7 @@ private final class ScriptFixture {
         defer { try? diag.close() }
         p.standardOutput = diag
         p.standardError = diag
+        let holder = LockHolder(process: p, exit: ProcessExit(p))
         try p.run()
         // Wait until the holder really owns the lock.
         var probes: [Int32] = []
@@ -2485,10 +2500,11 @@ private final class ScriptFixture {
             probe.arguments = ["-k", "-s", "-t", "0", lock.path, "/usr/bin/true"]
             probe.standardOutput = diag
             probe.standardError = diag
+            let probeExit = ProcessExit(probe)
             try probe.run()
-            probe.waitUntilExit()
+            probeExit.wait()
             probes.append(probe.terminationStatus)
-            if probe.terminationStatus == 75 { return p }
+            if probe.terminationStatus == 75 { return holder }
             Thread.sleep(forTimeInterval: 0.05)
         }
         p.terminate()
