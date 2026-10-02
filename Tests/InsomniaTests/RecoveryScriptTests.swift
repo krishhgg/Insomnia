@@ -1900,6 +1900,35 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(try fx.lockIsFree())
     }
 
+    /// The same for uninstall: an unknown bundle id blocks, in this account
+    /// as unverified and in another account as a copy there, and nothing is
+    /// asked to quit or removed.
+    func testUninstallRefusesWhileProcessesWithAnUnknownBundleIdRun() throws {
+        try fx.installMachinery()
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        let renamed = try fx.otherBundle(in: "DevBuild", bundleId: "com.example.insomnia-copy")
+        fx.setMode("pgrep", "0\n")
+        try fx.psComm([(4242, renamed.path)])
+
+        let r = try fx.run(fx.uninstall)
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertTrue(r.stderr.contains("pid 4242 (\(renamed.path); bundle id com.example.insomnia-copy is neither this app's nor the Insomnia API client's)"), r.stderr)
+        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("osascript") || $0.hasPrefix("pkill") || $0.hasPrefix("kill") }, "\(fx.calls())")
+        XCTAssertTrue(fx.exists(fx.app))
+        XCTAssertTrue(fx.exists(fx.plist))
+
+        try fx.psUid([(4242, ScriptFixture.otherUid)])
+        let other = try fx.run(fx.uninstall)
+
+        XCTAssertEqual(other.status, 1, other.stderr + other.stdout)
+        XCTAssertTrue(other.stderr.contains("Insomnia is running in another account"), other.stderr)
+        XCTAssertTrue(other.stderr.contains("pid 4242 (uid \(ScriptFixture.otherUid), \(renamed.path); bundle id com.example.insomnia-copy is neither"), other.stderr)
+        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("osascript") || $0.hasPrefix("sudo") || $0.hasPrefix("launchctl") }, "\(fx.calls())")
+        XCTAssertTrue(fx.exists(fx.app))
+        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), fx.sudoersRule)
+    }
+
     func testUninstallIgnoresAForeignProcessNamedInsomnia() throws {
         try fx.installMachinery()
         try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
@@ -2013,6 +2042,28 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(r.stdout.contains("Cannot tell whether 1 process(es) named Insomnia are this app"), r.stdout)
         XCTAssertTrue(r.stderr.contains("still running"), r.stderr)
         XCTAssertTrue(r.stderr.contains("pid 4242 (\(dev.path); no bundle id readable from \(plist.path))"), r.stderr)
+        XCTAssertEqual(try String(contentsOf: fx.installedExecutable, encoding: .utf8), "binary", "old bundle replaced")
+        XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "plist", "LaunchAgent replaced")
+    }
+
+    /// Only the API client's bundle id proves a process is another app. A
+    /// copy of this app whose Info.plist declares some other id would still
+    /// use this account's journal, so it blocks like an unreadable one and
+    /// is never asked to quit.
+    func testInstallRefusesWhileAProcessWithAnUnknownBundleIdRuns() throws {
+        try fx.prepareInstall()
+        try fx.installMachinery()
+        let renamed = try fx.otherBundle(in: "DevBuild", bundleId: "com.example.insomnia-copy")
+        fx.setMode("pgrep", "0\n")                 // running, and it stays running
+        try fx.psComm([(4242, renamed.path)])
+
+        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("osascript") || $0.hasPrefix("pkill") }, "\(fx.calls())")
+        XCTAssertFalse(r.stdout.contains("Ignoring"), r.stdout)
+        XCTAssertTrue(r.stdout.contains("Cannot tell whether 1 process(es) named Insomnia are this app"), r.stdout)
+        XCTAssertTrue(r.stderr.contains("pid 4242 (\(renamed.path); bundle id com.example.insomnia-copy is neither this app's nor the Insomnia API client's)"), r.stderr)
         XCTAssertEqual(try String(contentsOf: fx.installedExecutable, encoding: .utf8), "binary", "old bundle replaced")
         XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "plist", "LaunchAgent replaced")
     }

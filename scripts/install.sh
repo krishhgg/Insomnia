@@ -41,6 +41,9 @@ LABEL="com.insomnia.backstop"
 PLIST="$LAUNCH_AGENTS/$LABEL.plist"
 SUDOERS=/etc/sudoers.d/insomnia
 BUNDLE_ID=com.kgarg.insomnia
+# The Insomnia API client, whose executable is also named Insomnia. Its
+# bundle id is the only one that proves a process is not this app.
+CLIENT_BUNDLE_ID=com.insomnia.app
 UID_NUM="$(id -u)"
 
 step() { printf '\n==> %s\n' "$*"; }
@@ -51,9 +54,11 @@ step() { printf '\n==> %s\n' "$*"; }
 # executable path (`ps -o comm=`, the full path for an app LaunchServices
 # launched): it is this app when the path is the installed bundle's binary
 # or lies in a bundle whose Info.plist declares $BUNDLE_ID. A process whose
-# bundle id reads as something else is another app and is left alone. One
-# whose identity cannot be read (no path, a path outside any bundle, an
-# Info.plist that does not parse) might be this app, so it counts as this
+# bundle id reads as $CLIENT_BUNDLE_ID is the API client and is left alone.
+# Any other bundle id proves nothing: a copy of this app with an edited
+# Info.plist would still use this account's journal. Such a process, and
+# one whose identity cannot be read (no path, a path outside any bundle, an
+# Info.plist that does not parse), might be this app, so it counts as this
 # app until it exits: it is never signalled, but nothing is replaced or
 # removed while it runs. A copy in another account (`ps -o uid=`), or a
 # process there that cannot be told apart from one, blocks as well: the
@@ -64,7 +69,7 @@ step() { printf '\n==> %s\n' "$*"; }
 APP_FOUND=()      # "pid N (path)" per running copy of this app in this account
 UNVERIFIED=()     # "pid N (path; why)" per process of this account that could not be told apart from it
 OTHER_ACCOUNT=()  # "pid N (uid U, path)" per copy, or process that could not be told apart from one, in another account
-OTHER_FOUND=()    # "pid N (path, bundle id X)" per process proven to be another app
+OTHER_FOUND=()    # "pid N (path, bundle id X)" per process proven to be the API client
 BLOCKING=()       # the first three: what must be gone before files are touched
 # Bundle ids read before the recovery lock, as "bundle|id", reused under it.
 # Once the lock is held (PLIST_READS=0) no Info.plist is read: one on a
@@ -112,11 +117,12 @@ find_insomnia() {
     fi
     if [[ "$exe" == "$APP/Contents/MacOS/Insomnia" || "$id" == "$BUNDLE_ID" ]]; then
       this=1
-    elif [[ -n "$id" ]]; then
+    elif [[ "$id" == "$CLIENT_BUNDLE_ID" ]]; then
       OTHER_FOUND+=("pid $pid ($exe, bundle id $id)")
       continue
     else
       this=0
+      if [[ -n "$id" ]]; then desc="$exe; bundle id $id is neither this app's nor the Insomnia API client's"; fi
     fi
     # No uid (the process just exited, or ps failed) is not proof of
     # another account; such a pid is judged as one of this account's.
