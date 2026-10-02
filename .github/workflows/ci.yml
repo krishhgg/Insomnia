@@ -117,9 +117,21 @@ jobs:
               /usr/bin/sample "$x" 3 -mayDie || true
               echo "::endgroup::"
             done
-            pkill -x xctest 2>/dev/null || true
-            pkill -P "$test_pid" 2>/dev/null || true
-            kill "$test_pid" 2>/dev/null || true
+            # Collect the whole tree under swift test before anything dies:
+            # a killed parent hands its children to launchd, and a test stuck
+            # on a subprocess (a RecoveryScriptTests bash, a lockf holder)
+            # would then outlive the step.
+            tree=("$test_pid")
+            n=0
+            while [ "$n" -lt "${#tree[@]}" ]; do
+              while read -r child; do
+                tree+=("$child")
+              done < <(pgrep -P "${tree[$n]}" || true)
+              n=$((n + 1))
+            done
+            echo "killing the swift test process tree: ${tree[*]}"
+            kill -KILL "${tree[@]}" 2>/dev/null || true
+            pkill -KILL -x xctest 2>/dev/null || true
             exit 1
           fi
           wait "$test_pid"
