@@ -154,6 +154,12 @@ final class SessionManager {
     /// bit Insomnia did not set (reconcile step 3), so a bit that stays set
     /// is announced once, not on every reconcile.
     @ObservationIgnored private var announcedForeignSleep = false
+    /// Set by reconcile when session.json could not be read, or was not a
+    /// session and could not be moved aside. The file is evidence then: an
+    /// end, and any retry of it, restores the journal but leaves the file
+    /// where it is. Cleared by the next reconcile, and by a start, whose own
+    /// session.json replaces it.
+    @ObservationIgnored private var keepSessionFile = false
 
     init(
         paths: Paths,
@@ -352,10 +358,20 @@ final class SessionManager {
         // rollback puts exactly this back: an entry an earlier failed restore
         // left behind is evidence, not something this start may clear.
         let journalBefore = state
-        let sessionBefore = (try? store.loadSession()) ?? nil
+        let sessionBefore: Session?
+        do {
+            sessionBefore = try store.loadSession()
+        } catch {
+            // A session.json this start cannot read is never replaced: it may
+            // be a valid session that reconcile keeps as evidence, and a
+            // rollback could not put it back.
+            fail("start refused, nothing changed: session.json could not be read (\(error.localizedDescription)). Fix its permissions, or remove it if it is not a regular file, then start again")
+            return
+        }
 
         do {
             try store.saveSession(new)
+            keepSessionFile = false
             try journal { $0.sleepDisabledByUs = true }
         } catch {
             fail("could not write session: \(error.localizedDescription)")
@@ -487,11 +503,15 @@ final class SessionManager {
         remainingText = ""
         countdownText = ""
         var deletionError: String?
-        do {
-            try store.deleteSession()
-        } catch {
-            deletionError = error.localizedDescription
-            fail("could not remove session.json: \(error.localizedDescription)")
+        if keepSessionFile {
+            Log.info("session.json left in place: reconcile could not read it or move it aside")
+        } else {
+            do {
+                try store.deleteSession()
+            } catch {
+                deletionError = error.localizedDescription
+                fail("could not remove session.json: \(error.localizedDescription)")
+            }
         }
         await restoreAll()
         services?.stop()
@@ -972,6 +992,7 @@ final class SessionManager {
 
     private func performReconcile() async {
         let now = clock()
+        keepSessionFile = false
         var onDisk: Session?
         do {
             onDisk = try store.loadSession()
@@ -987,17 +1008,19 @@ final class SessionManager {
             onDisk = nil
         } catch {
             // The file exists but could not be read at all (permissions,
-            // I/O, or not a regular file, which Store never opens). That
-            // proves nothing about what it says: it may be a valid session.
-            // Nothing is decided or changed; the file and the journal stay
-            // for the next launch.
+            // I/O, or not a regular file, which Store never opens). Its end
+            // time is unknown, and sleep is never held without a deadline
+            // that can be enforced, so it counts as expired: a dirty journal
+            // is restored below. The file stays where it is as evidence; it
+            // may have been a valid session.
             let detail = error.localizedDescription
-            fail("reconcile refused, nothing changed: session.json could not be read (\(detail)); it was left in place")
+            keepSessionFile = true
+            fail("session.json could not be read (\(detail)); treated as expired and left in place")
             notifier.post(
                 title: Self.sessionFileTitle,
-                body: "session.json could not be read (\(detail)). Nothing was changed and it was left in place; fix its permissions, or remove it if it is not a regular file, then open Insomnia again."
+                body: "session.json could not be read (\(detail)), so its end time is unknown. Insomnia treats the session as expired and undoes what its journal recorded. The file was left in place; fix its permissions, or remove it if it is not a regular file."
             )
-            return
+            onDisk = nil
         }
 
         if let s = onDisk, !s.isExpired(at: now) {
@@ -1053,7 +1076,9 @@ final class SessionManager {
             Log.info("reconcile: session expired, restoring")
             _ = await performEnd(reason: .timer)
         } else if state.isDirty {
-            Log.info("reconcile: no session but dirty state, restoring")
+            Log.info(keepSessionFile
+                ? "reconcile: session.json kept in place, restoring the journal as for an expired session"
+                : "reconcile: no session but dirty state, restoring")
             _ = await performEnd(reason: .backstop)
         } else if state.displayRestoredUnderLowPower != nil {
             dropDisplayWrite(reason: "no session and the mode is not ours")
@@ -1095,7 +1120,10 @@ final class SessionManager {
                 body: "session.json is not a valid session file (\(detail)). It was moved to \(moved.path); Insomnia treats it as no session."
             )
         } catch let moveError {
-            fail("session.json unreadable (\(detail)) and could not be moved aside: \(moveError.localizedDescription); treating as no session")
+            // Kept, not deleted: an end that runs now restores the journal
+            // and leaves the file for the next launch to move.
+            keepSessionFile = true
+            fail("session.json unreadable (\(detail)) and could not be moved aside: \(moveError.localizedDescription); left in place and treated as no session")
         }
     }
 

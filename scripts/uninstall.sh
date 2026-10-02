@@ -14,8 +14,10 @@
 # Deletion is by exact owned file, never by directory tree: --purge removes
 # the files Insomnia writes (see Paths.swift), the session.json copies the
 # app or backstop.sh moved aside (session.json.unreadable-<stamp>, only that
-# exact shape), and then rmdir's its own directories only if they are empty. The lock file is never unlinked, so
-# --purge leaves APP_SUPPORT/.recovery.lock (and therefore APP_SUPPORT).
+# exact shape), and then rmdir's its own directories only if they are empty.
+# Only regular files are removed; anything else at one of those paths is
+# left with a message. The lock file is never unlinked, so --purge leaves
+# APP_SUPPORT/.recovery.lock (and therefore APP_SUPPORT).
 #
 # Honours INSOMNIA_HOME with the same layout as the app (see Paths.swift).
 set -euo pipefail
@@ -40,6 +42,11 @@ SUDO=/usr/bin/sudo
 PLUTIL=/usr/bin/plutil
 LOCKF=/usr/bin/lockf
 DEFAULTS=/usr/bin/defaults
+DATE=/bin/date
+MKDIR=/bin/mkdir
+RM=/bin/rm
+RMDIR=/bin/rmdir
+MKTEMP=/usr/bin/mktemp
 LOCK_TIMEOUT_SECONDS=10
 # How long to wait for the app to exit after asking it to quit.
 QUIT_WAIT_SECONDS=10
@@ -102,8 +109,8 @@ UID_NUM="$(id -u)"
 step() { printf '\n==> %s\n' "$*"; }
 
 # Scratch space for bounded(): this run's own directory, emptied on exit.
-WORK="$(mktemp -d "${TMPDIR:-/tmp}/insomnia-uninstall.XXXXXX")"
-trap 'rm -f "$WORK"/call.* 2>/dev/null; rmdir "$WORK" 2>/dev/null || true' EXIT
+WORK="$("$MKTEMP" -d "${TMPDIR:-/tmp}/insomnia-uninstall.XXXXXX")"
+trap '"$RM" -f "$WORK"/call.* 2>/dev/null; "$RMDIR" "$WORK" 2>/dev/null || true' EXIT
 
 # Run one external call with a time limit. Its combined output is left in
 # BOUNDED_OUTPUT (trailing newline removed) and its exit status returned, or
@@ -244,21 +251,66 @@ journal_shape_problems() { # file
   fi
 }
 
+# Same rules as backstop.sh: a date as Store.swift writes it, and the keys
+# and types the app's Session decoder needs.
+epoch_of() { # string
+  local e
+  e="$("$DATE" -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$1" +%s 2>/dev/null)" || return 0
+  if [[ "$("$DATE" -u -r "$e" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)" == "$1" ]]; then
+    echo "$e"
+  fi
+  return 0
+}
+session_shape_problems() { # file
+  local f="$1" key t i
+  # plutil also reads XML and binary property lists, which the app's
+  # JSONDecoder refuses, so the file itself must start with "{" too.
+  if [[ "$(LC_ALL=C tr -d ' \t\r\n' < "$f" 2>/dev/null | head -c 1)" != "{" ]] \
+     || [[ "$("$PLUTIL" -convert json -o - "$f" 2>/dev/null | head -c 1)" != "{" ]]; then
+    echo "session.json is not a JSON object"
+    return 0
+  fi
+  for key in startedAt endsAt; do
+    t="$(type_of "$f" "$key")"
+    if [[ -z "$t" ]]; then
+      echo "$key is missing"
+    elif [[ "$t" != string ]]; then
+      echo "$key is a JSON $t, not a date string"
+    elif [[ -z "$(epoch_of "$(extract "$f" "$key" || true)")" ]]; then
+      echo "$key is not a UTC date in the form 2027-01-15T08:00:00Z"
+    fi
+  done
+  t="$(type_of "$f" extensions)"
+  if [[ -z "$t" ]]; then
+    echo "extensions is missing"
+  elif [[ "$t" != array ]]; then
+    echo "extensions is a JSON $t, not an array"
+  else
+    i=0
+    while [[ -n "$(type_of "$f" "extensions.$i")" ]]; do
+      t="$(type_of "$f" "extensions.$i")"
+      [[ "$t" == integer || "$t" == float ]] || echo "extensions[$i] is a JSON $t, not a number"
+      i=$((i + 1))
+    done
+  fi
+}
+
 # Independent check of the journal: prints one line per unresolved item.
 # Trusts nothing about the backstop that just ran (it may be an older copy).
 journal_problems() {
   local key value shape
   if [[ -e "$SESSION" ]]; then
+    shape=""
     # Only a regular file is opened: open(2) on a FIFO with no writer
     # blocks, and this check runs while the recovery lock is held.
     if [[ ! -f "$SESSION" ]]; then
       echo "session.json is still present and cannot be read: it is not a regular file, so it was not opened"
     elif ! cat "$SESSION" >/dev/null 2>&1; then
       echo "session.json is still present and cannot be read (permissions or I/O)"
-    elif extract "$SESSION" endsAt >/dev/null; then
-      echo "session.json is still present"
+    elif shape="$(session_shape_problems "$SESSION")" && [[ -n "$shape" ]]; then
+      echo "session.json is still present and is not a session: ${shape%%$'\n'*}"
     else
-      echo "session.json is still present and is not a session (it does not parse)"
+      echo "session.json is still present"
     fi
   fi
   [[ -e "$STATE" ]] || return 0
@@ -366,15 +418,43 @@ MSG
   fi
 }
 
-# Copies of session.json that the app or backstop.sh moved aside, one path
-# per line. Only names of exactly that shape (prefix, UTC stamp, optional
-# -n); anything else in the directory is not ours to remove.
-unreadable_sessions() {
+# Copies of session.json that the app or backstop.sh moved aside, taken
+# straight from the glob into MOVED_ASIDE, so a path holding a newline stays
+# one path. A copy is a regular file whose name has exactly the shape the
+# move writes (prefix, UTC stamp, optional -n). Anything else with such a
+# name (a directory, a FIFO, a symlink) goes to NOT_MOVED_ASIDE and is never
+# removed; other names under the prefix are not Insomnia's and are skipped.
+collect_moved_aside_sessions() {
   local f
+  MOVED_ASIDE=()
+  NOT_MOVED_ASIDE=()
   for f in "$APP_SUPPORT"/session.json.unreadable-*; do
-    [[ -e "$f" ]] || continue
-    if [[ "${f##*/}" =~ ^session\.json\.unreadable-[0-9]{8}T[0-9]{6}Z(-[0-9]+)?$ ]]; then
-      echo "$f"
+    [[ -e "$f" || -L "$f" ]] || continue
+    [[ "${f##*/}" =~ ^session\.json\.unreadable-[0-9]{8}T[0-9]{6}Z(-[0-9]+)?$ ]] || continue
+    if [[ -f "$f" && ! -L "$f" ]]; then
+      MOVED_ASIDE+=("$f")
+    else
+      NOT_MOVED_ASIDE+=("$f")
+    fi
+  done
+  return 0
+}
+
+# Removes files Insomnia wrote, one path per argument. Only a regular file
+# is removed. Anything else at one of these paths is not something Insomnia
+# wrote; it is left and named, so a stray directory never stops the run
+# halfway. A removal that fails is named and counted, and the rest go on.
+remove_failures=0
+remove_owned() { # path...
+  local f
+  for f in "$@"; do
+    if [[ -f "$f" && ! -L "$f" ]]; then
+      if ! "$RM" -f "$f"; then
+        echo "Could not remove $f; left in place." >&2
+        remove_failures=$((remove_failures + 1))
+      fi
+    elif [[ -e "$f" || -L "$f" ]]; then
+      echo "Left $f: it is not a regular file, so Insomnia did not write it."
     fi
   done
   return 0
@@ -413,9 +493,10 @@ What to do, then rerun this script:
   - session.json that does not parse: the recovery agent renames it to
     session.json.unreadable-<time> as soon as the journal is clean, and the
     app does the same at launch. It needs no action of its own.
-  - session.json that cannot be read at all: neither the app nor the agent
-    decides anything from it. Restore access to it, or remove it if it is
-    not a regular file, then rerun.
+  - session.json that cannot be read at all: its end time is unknown, so
+    the app and the agent treat it as expired and undo the journal, but
+    never move or remove it, since it may have been a valid session. Fix
+    its permissions, or remove it if it is not a regular file, then rerun.
   - Log: $LOG_DIR/insomnia.log
 MSG
   exit 1
@@ -451,7 +532,7 @@ fi
 
 # 2. Take the recovery lock and keep it to the end ---------------------------
 step "Taking the recovery lock"
-mkdir -p "$APP_SUPPORT"
+"$MKDIR" -p "$APP_SUPPORT"
 exec 9<>"$LOCK"
 lock_rc=0
 "$LOCKF" -t "$LOCK_TIMEOUT_SECONDS" 9 2>/dev/null || lock_rc=$?
@@ -524,7 +605,7 @@ if (( print_rc != 113 )); then
   echo "Nothing was removed. Run 'launchctl bootout gui/$UID_NUM $PLIST' yourself, then rerun." >&2
   exit 1
 fi
-rm -f "$PLIST"
+"$RM" -f "$PLIST"
 
 step "Removing $SUDOERS (requires your password)"
 if [[ -e "$SUDOERS" ]] || "$SUDO" test -e "$SUDOERS"; then
@@ -532,30 +613,41 @@ if [[ -e "$SUDOERS" ]] || "$SUDO" test -e "$SUDOERS"; then
 fi
 
 step "Removing app bundle"
-rm -rf "$APP"
+"$RM" -rf "$APP"
 
 if (( PURGE == 1 )); then
   step "Purging Insomnia's files in $APP_SUPPORT and $LOG_DIR"
-  rm -f "$SESSION" "$STATE" "$APP_SUPPORT/config.json" "$APP_SUPPORT/backstop.sh" \
+  remove_owned "$SESSION" "$STATE" "$APP_SUPPORT/config.json" "$APP_SUPPORT/backstop.sh" \
         "$LOG_DIR/insomnia.log" "$LOG_DIR/handoffs.log"
-  while IFS= read -r f; do rm -f "$f"; done < <(unreadable_sessions)
+  collect_moved_aside_sessions
+  if (( ${#MOVED_ASIDE[@]} > 0 )); then
+    remove_owned "${MOVED_ASIDE[@]}"
+  fi
+  if (( ${#NOT_MOVED_ASIDE[@]} > 0 )); then
+    for f in "${NOT_MOVED_ASIDE[@]}"; do
+      echo "Left $f: it is named like a moved-aside session.json but is not a regular file, so Insomnia did not write it."
+    done
+  fi
   # The lock file itself is kept, even on purge: this process still holds
   # it, and anything that opened it a moment ago (a queued agent run, an app
   # launched after the check above) waits on this inode. Unlinking it would
   # let the next opener create a second lock nobody else sees. A leftover
   # empty lock file and its directory are the accepted cost.
-  rmdir "$LOG_DIR" 2>/dev/null || true
-  (( OWN_LAUNCH_AGENTS_DIR == 1 )) && { rmdir "$LAUNCH_AGENTS" 2>/dev/null || true; }
+  "$RMDIR" "$LOG_DIR" 2>/dev/null || true
+  (( OWN_LAUNCH_AGENTS_DIR == 1 )) && { "$RMDIR" "$LAUNCH_AGENTS" 2>/dev/null || true; }
   echo "Kept $LOCK (the recovery lock is never unlinked; delete $APP_SUPPORT by hand if you want it gone)."
   [[ -d "$LOG_DIR" ]] && echo "Kept $LOG_DIR: it still holds files Insomnia did not create."
 else
-  rm -f "$APP_SUPPORT/backstop.sh" "$SESSION" "$STATE"
+  remove_owned "$APP_SUPPORT/backstop.sh" "$SESSION" "$STATE"
   echo "Kept $APP_SUPPORT/config.json and $LOG_DIR (use --purge to remove)."
-  kept_sessions=0
-  while IFS= read -r f; do kept_sessions=$((kept_sessions + 1)); done < <(unreadable_sessions)
-  if (( kept_sessions > 0 )); then
-    echo "Kept $kept_sessions unreadable session.json file(s) moved aside in $APP_SUPPORT (use --purge to remove)."
+  collect_moved_aside_sessions
+  if (( ${#MOVED_ASIDE[@]} > 0 )); then
+    echo "Kept ${#MOVED_ASIDE[@]} unreadable session.json file(s) moved aside in $APP_SUPPORT (use --purge to remove)."
   fi
 fi
 
+if (( remove_failures > 0 )); then
+  echo "Done, except $remove_failures file(s) that could not be removed (named above)." >&2
+  exit 1
+fi
 echo "Done."
