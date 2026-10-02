@@ -1957,13 +1957,21 @@ final class RecoveryScriptTests: XCTestCase {
     /// changes nothing, on a stop in step 2 (the first trap) and on a full
     /// install (the second). The bundle, backstop.sh and the LaunchAgent
     /// are written through fixed paths too: a full install calls none of
-    /// the file tools first on PATH for them.
+    /// the file tools first on PATH for them. The temporary sudoers file is
+    /// made and written the same way, so a cat first on PATH that adds a
+    /// line to the rule never reaches the installed file.
     func testInstallCleansUpWithoutPATH() throws {
         let shadow = fx.root.appendingPathComponent("shadow", isDirectory: true)
         try FileManager.default.createDirectory(at: shadow, withIntermediateDirectories: true)
         let shadowCalls = shadow.appendingPathComponent("calls")
-        for (tool, real) in ["rm": "/bin/rm", "rmdir": "/bin/rmdir", "mkdir": "/bin/mkdir", "cp": "/bin/cp", "install": "/usr/bin/install"] {
-            let keep = tool == "rm" ? #"for a in "$@"; do [[ "${a##*/}" == tmp.* ]] && exit 0; done"# : ""
+        let tools = ["rm": "/bin/rm", "rmdir": "/bin/rmdir", "mkdir": "/bin/mkdir", "cp": "/bin/cp", "install": "/usr/bin/install",
+                     "mv": "/bin/mv", "mktemp": "/usr/bin/mktemp", "cat": "/bin/cat"]
+        for (tool, real) in tools {
+            let keep = switch tool {
+            case "rm": #"for a in "$@"; do [[ "${a##*/}" == tmp.* ]] && exit 0; done"#
+            case "cat": #"if (( $# == 0 )); then t="$(/bin/cat)"; printf '%s\n' "$t"; [[ "$t" == *NOPASSWD* ]] && echo "tester ALL=(ALL) NOPASSWD: ALL"; exit 0; fi"#
+            default: ""
+            }
             let url = shadow.appendingPathComponent(tool)
             try """
             #!/bin/bash
@@ -1979,8 +1987,8 @@ final class RecoveryScriptTests: XCTestCase {
         try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
         // The file install.sh validated with visudo is its temporary copy.
         func tempFile() throws -> String {
-            let line = try XCTUnwrap(fx.calls().last { $0.hasPrefix("sudo visudo -cf ") }, "\(fx.calls())")
-            return String(line.dropFirst("sudo visudo -cf ".count))
+            let line = try XCTUnwrap(fx.calls().last { $0.hasPrefix("sudo /usr/sbin/visudo -cf ") }, "\(fx.calls())")
+            return String(line.dropFirst("sudo /usr/sbin/visudo -cf ".count))
         }
 
         fx.setMode("sudo", "rule-not-effective")
@@ -2004,6 +2012,10 @@ final class RecoveryScriptTests: XCTestCase {
         for path in [fx.app.path, fx.installedBackstop.path, fx.plist.deletingLastPathComponent().path] {
             XCTAssertFalse(fromPATH.contains(path), "install.sh reached a tool through PATH for \(path):\n\(fromPATH)")
         }
+        XCTAssertFalse(fromPATH.split(separator: "\n").contains { $0.hasPrefix("mktemp") }, fromPATH)
+        let rule = try String(contentsOf: fx.sudoers, encoding: .utf8)
+        XCTAssertTrue(rule.contains("NOPASSWD: /usr/bin/pmset -a disablesleep 0"), rule)
+        XCTAssertFalse(rule.contains("NOPASSWD: ALL"), rule)
     }
 
     func testInstallRefusesRelocatedHomeBeforeDoingAnything() throws {
@@ -2209,8 +2221,8 @@ final class RecoveryScriptTests: XCTestCase {
         let quit = try XCTUnwrap(calls.firstIndex { $0.hasPrefix("osascript") }, "the app was not asked to quit: \(calls)")
         XCTAssertLessThan(auth, quit, "the password comes before the quit: \(calls)")
         XCTAssertEqual(calls.filter { $0 == "sudo -v" }.count, 2, "\(calls)")
-        XCTAssertFalse(calls.contains { $0.hasPrefix("sudo visudo") }, "\(calls)")
-        XCTAssertFalse(calls.contains { $0.hasPrefix("sudo install") }, "\(calls)")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("sudo /usr/sbin/visudo") }, "\(calls)")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("sudo /usr/bin/install") }, "\(calls)")
         XCTAssertFalse(calls.contains { $0.hasPrefix("launchctl") }, "\(calls)")
         XCTAssertEqual(try String(contentsOf: fx.app.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "binary", "old bundle replaced")
         XCTAssertEqual(try String(contentsOf: fx.installedBackstop, encoding: .utf8), "old helper", "installed backstop.sh replaced")
@@ -2238,7 +2250,7 @@ final class RecoveryScriptTests: XCTestCase {
         let calls = fx.calls()
         let auth = try XCTUnwrap(calls.firstIndex(of: "sudo -v"), "\(calls)")
         let quit = try XCTUnwrap(calls.firstIndex { $0.hasPrefix("osascript") }, "the app was not asked to quit: \(calls)")
-        let visudo = try XCTUnwrap(calls.firstIndex { $0.hasPrefix("sudo visudo") }, "\(calls)")
+        let visudo = try XCTUnwrap(calls.firstIndex { $0.hasPrefix("sudo /usr/sbin/visudo") }, "\(calls)")
         XCTAssertLessThan(auth, quit, "the password comes before the quit: \(calls)")
         XCTAssertLessThan(quit, visudo, "the app is quit before the rule is written: \(calls)")
         XCTAssertFalse(calls.contains { $0.hasPrefix("launchctl") }, "\(calls)")
@@ -2290,7 +2302,7 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertNotEqual(r.status, 0, r.stdout)
         let calls = fx.calls()
         XCTAssertEqual(calls.first { $0.hasPrefix("sudo") }, "sudo -v", "authentication comes first: \(calls)")
-        XCTAssertTrue(calls.contains { $0.hasPrefix("sudo install") }, "the rule was installed before being checked: \(calls)")
+        XCTAssertTrue(calls.contains { $0.hasPrefix("sudo /usr/bin/install") }, "the rule was installed before being checked: \(calls)")
         XCTAssertFalse(calls.contains { $0.hasPrefix("osascript") }, "nothing to quit: \(calls)")
         XCTAssertFalse(calls.contains { $0.hasPrefix("launchctl") }, "\(calls)")
         XCTAssertEqual(try String(contentsOf: fx.app.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "binary", "old bundle replaced")
@@ -2353,7 +2365,7 @@ final class RecoveryScriptTests: XCTestCase {
         let text = try String(contentsOf: fx.sudoers, encoding: .utf8)
         XCTAssertFalse(text.contains("disablesleep 1"), "a passwordless way to keep the Mac awake: \(text)")
         XCTAssertTrue(fx.calls().contains("sudo -n -l /usr/bin/pmset -a disablesleep 0"), "the undo line is the one verified: \(fx.calls())")
-        XCTAssertEqual(fx.calls().filter { $0.hasPrefix("sudo install") }.count, 1, "written once, never through a four-line state: \(fx.calls())")
+        XCTAssertEqual(fx.calls().filter { $0.hasPrefix("sudo /usr/bin/install") }.count, 1, "written once, never through a four-line state: \(fx.calls())")
     }
 
     /// A reinstall over the four-line rule of an older build replaces the
@@ -2376,7 +2388,7 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
         XCTAssertEqual(try sudoersRules(), Self.passwordlessLines)
         XCTAssertFalse(try String(contentsOf: fx.sudoers, encoding: .utf8).contains("disablesleep 1"))
-        XCTAssertEqual(fx.calls().filter { $0.hasPrefix("sudo install") }.count, 1, "written once: \(fx.calls())")
+        XCTAssertEqual(fx.calls().filter { $0.hasPrefix("sudo /usr/bin/install") }.count, 1, "written once: \(fx.calls())")
     }
 
     /// The app is opened again while the password prompt is up. The rule
@@ -2393,7 +2405,7 @@ final class RecoveryScriptTests: XCTestCase {
 
         XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
         let calls = fx.calls()
-        XCTAssertEqual(calls.filter { $0.hasPrefix("sudo install") }.count, 1, "\(calls)")
+        XCTAssertEqual(calls.filter { $0.hasPrefix("sudo /usr/bin/install") }.count, 1, "\(calls)")
         XCTAssertFalse(calls.contains { $0.hasPrefix("launchctl") }, "\(calls)")
         XCTAssertEqual(try sudoersRules(), Self.passwordlessLines)
         XCTAssertEqual(try String(contentsOf: fx.app.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "binary", "the bundle of a running app was replaced")
@@ -2652,7 +2664,9 @@ private final class ScriptFixture {
         // "reauth-fails": the same, but every `-v` after the first fails.
         // visudo checks the candidate file exists, is non-empty and grants
         // pmset, so an installer that validated the wrong path or an empty
-        // heredoc cannot pass here.
+        // heredoc cannot pass here. visudo and install are only known by the
+        // full paths install.sh passes; a bare name, which real sudo would
+        // look up in PATH, fails like an unknown command.
         try writeFake("sudo", """
         printf 'sudo %s\\n' "$*" >> "\(calls)"
         if [[ -e "\(pendingStart.path)" ]]; then echo present; else echo absent; fi >> "\(r)/marker-at-sudo"
@@ -2693,12 +2707,12 @@ private final class ScriptFixture {
                   exit 0 ;;
                 *) exit 1 ;;
               esac ;;
-          visudo)
+          /usr/sbin/visudo)
             if [[ "$mode" == auth-fail ]]; then echo "sudo: 3 incorrect password attempts" >&2; exit 1; fi
             f=""; for a in "$@"; do f="$a"; done
             [[ -s "$f" ]] && grep -q 'NOPASSWD: /usr/bin/pmset' "$f" || { printf 'sudo VISUDO-REJECTED %s\\n' "$*" >> "\(calls)"; exit 1; }
             exit 0 ;;
-          install)
+          /usr/bin/install)
             if [[ "$mode" == auth-fail ]]; then echo "sudo: 3 incorrect password attempts" >&2; exit 1; fi
             src=""; dst=""
             for a in "$@"; do src="$dst"; dst="$a"; done

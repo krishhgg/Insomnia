@@ -33,6 +33,12 @@ RM=/bin/rm
 RMDIR=/bin/rmdir
 MKDIR=/bin/mkdir
 CP=/bin/cp
+MV=/bin/mv
+MKTEMP=/usr/bin/mktemp
+CAT=/bin/cat
+# sudo is given visudo and install by full path. Given a bare name, it would
+# search the caller's PATH and run whatever it finds there as root.
+VISUDO=/usr/sbin/visudo
 LOCK_TIMEOUT_SECONDS=10
 # How long the runs of an older backstop.sh get to exit (step 4).
 RETIRE_WAIT_SECONDS=30
@@ -143,7 +149,7 @@ if ! "$SUDO" -n -v 2>/dev/null; then
   echo "The sudo credential expired while Insomnia was quitting; asking again."
   "$SUDO" -v || sudoers_not_installed "sudo did not authenticate"
 fi
-TMP_SUDOERS="$(mktemp)"
+TMP_SUDOERS="$("$MKTEMP")"
 # Set from the moment the new rule is installed until the new bundle is
 # signed in place. Any stop in between prints rule_ahead_note on exit.
 RULE_AHEAD_OF_BUNDLE=0
@@ -157,13 +163,13 @@ with that rule. Finish the install by rerunning:
 NOTE
 }
 trap 'rc=$?; "$RM" -f "$TMP_SUDOERS"; if (( rc != 0 && RULE_AHEAD_OF_BUNDLE )); then rule_ahead_note; fi' EXIT
-cat > "$TMP_SUDOERS" <<SUDO
+"$CAT" > "$TMP_SUDOERS" <<SUDO
 # Installed by Insomnia install.sh. Exactly three commands, nothing else.
 $USER ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0
 $USER ALL=(root) NOPASSWD: /usr/bin/pmset -b lowpowermode 1
 $USER ALL=(root) NOPASSWD: /usr/bin/pmset -b lowpowermode 0
 SUDO
-if "$SUDO" visudo -cf "$TMP_SUDOERS" >/dev/null && "$SUDO" install -m 0440 -o root -g wheel "$TMP_SUDOERS" "$SUDOERS"; then
+if "$SUDO" "$VISUDO" -cf "$TMP_SUDOERS" >/dev/null && "$SUDO" "$INSTALL" -m 0440 -o root -g wheel "$TMP_SUDOERS" "$SUDOERS"; then
   RULE_AHEAD_OF_BUNDLE=1
 else
   sudoers_not_installed "sudoers file failed validation (or sudo did not authenticate)"
@@ -352,7 +358,7 @@ bootstrap_rc=0
 after="$(loaded_state)"
 
 if (( bootstrap_rc == 0 )) && [[ "$after" == yes ]]; then
-  if ! mv -f "$CANDIDATE" "$PLIST"; then
+  if ! "$MV" -f "$CANDIDATE" "$PLIST"; then
     cat >&2 <<FAIL
 
 Install stopped: the new LaunchAgent is loaded (launchctl print confirms) but
