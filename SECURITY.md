@@ -16,14 +16,27 @@ The installer grants the user account passwordless access to four exact pmset
 commands listed in the README. This grant is not exclusive to the Insomnia app:
 other processes running as that user can invoke them too. The app is not
 sandboxed; local logs can contain SSIDs, process metadata, and tmux target names.
-Hotspot passwords are stored in the login Keychain.
+The lines the app writes to `insomnia.log` also reach the unified log with the
+body marked private, so programs reading `log show` see `<private>` instead of
+those names unless private data logging is enabled on the Mac. Hotspot
+passwords are stored in the login Keychain. Location Services access is
+requested only when a hotspot is saved or a session starts with one
+configured; it is used to read Wi-Fi network names and the app never requests
+location updates.
 
 The recovery LaunchAgent runs only the `backstop.sh` sealed inside the signed
 app bundle, after `codesign --verify --strict` passes against the code
 requirement pinned in its plist (the build's cdhash for an ad-hoc signature).
-An edited bundle or script is refused and logged. The plist itself lives in
-`~/Library/LaunchAgents` and, like every per-user LaunchAgent, can be edited
-by any program running as that user.
+An edited bundle or script is refused and logged. The app pins the code it is
+running (its own designated requirement, after confirming that the bundle on
+disk is still that code and passes the agent's check), so a bundle edited or
+re-signed under the running app is refused, not re-pinned. The plist itself
+lives in `~/Library/LaunchAgents` and, like every per-user LaunchAgent, can be
+edited by any program running as that user. With ad-hoc signatures these
+checks are integrity against accidents and against the app relaying a
+tampered bundle; they are not a boundary against a process running as the
+same user, which can edit the plist, load its own agent, replace and relaunch
+the app, and invoke the four pmset commands directly.
 
 Release zips are built by the Release workflow from the tagged commit and
 published with a `SHA256SUMS` file and a GitHub build provenance attestation.

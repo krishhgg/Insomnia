@@ -403,11 +403,17 @@ final class RecoverySafetyTests: XCTestCase {
         XCTAssertFalse(m.quitRequested, "quit stays requested although the app has to stay for the retry")
         held.release()
 
-        let deadline = Date().addingTimeInterval(5)
-        while m.isActive, Date() < deadline {
+        // Wait for the retry to finish, not to start: `end()` clears
+        // pendingEnd only after the outcome is in, whereas the session is
+        // dropped at the top of performEnd, before the guard is restored
+        // and the journal written. Polling isActive could resume between
+        // those two points and read a half-done retry.
+        let deadline = Date().addingTimeInterval(10)
+        while m.pendingEnd != nil, Date() < deadline {
             try await Task.sleep(for: .milliseconds(50))
         }
-        XCTAssertFalse(m.isActive, "pending end was never retried")
+        XCTAssertNil(m.pendingEnd, "pending end was never retried")
+        XCTAssertFalse(m.isActive)
         XCTAssertEqual(h.guardFake.calls, ["disablesleep 1", "disablesleep 0"])
         XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
         XCTAssertNil(m.pendingEnd)

@@ -42,7 +42,8 @@ final class LaunchdBackstopTests: XCTestCase {
     private func makeBackstop(
         installScript: Bool = true,
         requirement: String = LaunchdBackstopTests.requirement,
-        requirementUnreadable: Bool = false
+        requirementUnreadable: Bool = false,
+        bundleFailsCheck: Bool = false
     ) throws -> LaunchdBackstop {
         if installScript {
             let script = home.paths.backstopScript
@@ -64,13 +65,19 @@ final class LaunchdBackstopTests: XCTestCase {
             return obj["Label"] as? String == label
         }
         let bundle = home.paths.appBundle
-        let readRequirement: LaunchdBackstop.RequirementReader = { asked in
+        // Stands in for CodeRequirement.pin: the requirement of the fixture
+        // bundle, or the two ways the real one refuses (no readable
+        // signature; a bundle that fails the agent's check).
+        let pin: LaunchdBackstop.BundlePinner = { asked in
             guard asked == bundle, !requirementUnreadable else {
                 throw CodeRequirement.ReadError(path: asked.path, step: "SecStaticCodeCreateWithPath", status: -67062)
             }
+            if bundleFailsCheck {
+                throw CodeRequirement.VerifyError(path: asked.path, requirement: requirement, reason: "a sealed resource is missing or invalid")
+            }
             return requirement
         }
-        return LaunchdBackstop(paths: home.paths, bundle: bundle, readRequirement: readRequirement, uid: 501) { exe, args in
+        return LaunchdBackstop(paths: home.paths, bundle: bundle, pin: pin, uid: 501) { exe, args in
             calls.value.append([exe] + args)
             switch args.first {
             case "print":
@@ -322,6 +329,29 @@ final class LaunchdBackstopTests: XCTestCase {
 
     /// Plist current but the job not loaded (logged out and in without the
     /// agent, or booted out by hand): reload without rewriting.
+    /// The plist is current and launchd lists the job, but the bundle no
+    /// longer passes the agent's check (its sealed script was edited after
+    /// signing: the requirement still reads, the resource seal is broken,
+    /// and the agent refuses every run). Reporting that as armed would let
+    /// a session hold sleep behind an agent that never runs.
+    func testArmFailsWhenTheLoadedAgentsBundleNoLongerPassesTheAgentsCheck() async throws {
+        try await makeBackstop().arm()
+        XCTAssertTrue(loaded.value)
+        let trusted = try Data(contentsOf: home.paths.backstopPlist)
+        calls.value = []
+
+        let b = try makeBackstop(bundleFailsCheck: true)
+        do {
+            try await b.arm()
+            XCTFail("arm reported an agent whose bundle fails verification as armed")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("sealed resource"), error.localizedDescription)
+            XCTAssertTrue(error.localizedDescription.contains("install.sh"), error.localizedDescription)
+        }
+        XCTAssertEqual(calls.value, [], "nothing is asked of launchd: the plist is right, the bundle is wrong")
+        XCTAssertEqual(try Data(contentsOf: home.paths.backstopPlist), trusted, "the trusted plist is left for the reinstall")
+    }
+
     func testArmBootstrapsWhenPlistIsCurrentButJobIsNotLoaded() async throws {
         let b = try makeBackstop()
         try await b.arm()

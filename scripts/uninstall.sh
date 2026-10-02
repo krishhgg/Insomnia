@@ -39,6 +39,7 @@ OSASCRIPT=/usr/bin/osascript
 LAUNCHCTL=/bin/launchctl
 SUDO=/usr/bin/sudo
 PLUTIL=/usr/bin/plutil
+CODESIGN=/usr/bin/codesign
 LOCKF=/usr/bin/lockf
 LOCK_TIMEOUT_SECONDS=10
 # How long to wait for the app to exit after asking it to quit.
@@ -245,11 +246,22 @@ fi
 # The backstop inherits fd 9 and shares this lock instead of waiting on it.
 # Newest first: the checkout's script, then the copy install.sh sealed into
 # the bundle, then the writable copy installs before that layout left in
-# $APP_SUPPORT.
+# $APP_SUPPORT. The sealed copy runs only while the bundle's signature still
+# verifies: its resource seal covers the script, so this is the check the
+# LaunchAgent runs (without the pinned requirement, which this script does
+# not have), and an edited copy is refused the same way.
 step "Restoring the machine via backstop --force"
 if [[ -f "$ROOT/scripts/backstop.sh" ]]; then
   BACKSTOP="$ROOT/scripts/backstop.sh"
 elif [[ -f "$APP/Contents/Resources/backstop.sh" ]]; then
+  verify_rc=0
+  verify_out="$("$CODESIGN" --verify --strict "$APP" 2>&1)" || verify_rc=$?
+  if (( verify_rc != 0 )); then
+    echo "$APP does not pass 'codesign --verify --strict' (exit $verify_rc: ${verify_out:-no detail}), so the backstop.sh sealed in it was not run." >&2
+    echo "Nothing was removed. Run this script from a checkout of the source (its scripts/backstop.sh is used first), or reinstall with scripts/install.sh and rerun." >&2
+    exit 1
+  fi
+  echo "$APP verifies"
   BACKSTOP="$APP/Contents/Resources/backstop.sh"
 elif [[ -f "$APP_SUPPORT/backstop.sh" ]]; then
   BACKSTOP="$APP_SUPPORT/backstop.sh"

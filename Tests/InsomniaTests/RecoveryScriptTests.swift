@@ -527,8 +527,39 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
         XCTAssertEqual(fx.calls().filter { $0.hasPrefix("backstop ") }, ["backstop sealed --force"], "\(fx.calls())")
         XCTAssertTrue(r.stdout.contains("using \(fx.installedBackstop.path)"), r.stdout)
+        let verify = try XCTUnwrap(fx.calls().firstIndex(of: "codesign --verify --strict \(fx.app.path)"), "the sealed copy is verified: \(fx.calls())")
+        let ran = try XCTUnwrap(fx.calls().firstIndex(of: "backstop sealed --force"))
+        XCTAssertLessThan(verify, ran, "verified before it runs: \(fx.calls())")
         XCTAssertFalse(fx.exists(fx.app))
         XCTAssertFalse(fx.exists(fx.legacyBackstop), "the writable copy goes with the rest")
+    }
+
+    /// The sealed copy is covered by the bundle's resource seal; when the
+    /// bundle no longer verifies (the script was edited, as the LaunchAgent
+    /// would also find), uninstall does not run it and removes nothing. The
+    /// checkout's copy is not verified: it is the source.
+    func testUninstallRefusesTheSealedCopyWhenTheBundleFailsVerification() throws {
+        try fx.installMachinery()
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        try FileManager.default.removeItem(at: fx.backstop)
+        try fx.writeMarkerBackstop(at: fx.installedBackstop, name: "sealed")
+        try fx.writeMarkerBackstop(at: fx.legacyBackstop, name: "legacy")
+        fx.setMode("codesign", "verify-fails")
+
+        let r = try fx.run(fx.uninstall, ["--purge"])
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertTrue(fx.calls().contains("codesign --verify --strict \(fx.app.path)"), "\(fx.calls())")
+        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("backstop ") }, "neither the unverified sealed copy nor the legacy copy ran: \(fx.calls())")
+        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("launchctl") || $0.hasPrefix("sudo") }, "\(fx.calls())")
+        XCTAssertTrue(r.stderr.contains("sealed resource"), "codesign's reason is reported: \(r.stderr)")
+        XCTAssertTrue(r.stderr.contains("Nothing was removed"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("checkout"), "the way out is named: \(r.stderr)")
+        XCTAssertTrue(fx.exists(fx.plist))
+        XCTAssertTrue(fx.exists(fx.sudoers))
+        XCTAssertTrue(fx.exists(fx.app))
+        XCTAssertTrue(fx.exists(fx.config))
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, true)
     }
 
     func testUninstallRunsTheLegacyCopyWhenNeitherCheckoutNorBundleHasOne() throws {
@@ -1055,6 +1086,7 @@ final class RecoveryScriptTests: XCTestCase {
 
     func testInstallKeepsTheTrustedAgentWhenRecoveryIsUnresolved() throws {
         try fx.prepareInstall()
+        try fx.writePreviousApp()
         try "trusted".write(to: fx.plist, atomically: true, encoding: .utf8)
         try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
         fx.setMode("sudo", "fail")          // pmset undo fails; `sudo -n -l` still passes
@@ -1074,6 +1106,9 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(r.stderr.contains("every minute"), r.stderr)
         XCTAssertTrue(r.stderr.contains("backstop.sh\" --force"), "manual step named: \(r.stderr)")
         XCTAssertTrue(r.stderr.contains("not replaced"), r.stderr)
+        XCTAssertEqual(try fx.installedBinaryFirstLine(), "previous", "the bundle the retained agent pins stays in place")
+        XCTAssertEqual(try fx.contents(of: fx.appsDir), ["Insomnia.app"], "the staged build is discarded and nothing is set aside")
+        XCTAssertTrue(r.stderr.contains("discarded"), r.stderr)
         XCTAssertTrue(try fx.lockIsFree(), "the transaction ends with the script")
     }
 
@@ -1093,8 +1128,13 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(r.stderr.contains("every minute"), "no retry is promised: \(r.stderr)")
     }
 
+    /// An upgrade whose new agent cannot load: the previous plist is reloaded
+    /// and the previous bundle is back at $APP before that, so the reloaded
+    /// agent verifies the build it pins. The new bundle was in place only
+    /// while its own agent was being loaded.
     func testInstallRestoresThePreviousAgentWhenBootstrapFails() throws {
         try fx.prepareInstall()
+        try fx.writePreviousApp()
         try "trusted".write(to: fx.plist, atomically: true, encoding: .utf8)
         try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
         fx.setMode("launchctl", "loaded-bootstrap-fails-once")
@@ -1111,12 +1151,20 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(r.stderr.contains("not verified"), "reload success is not a schedule claim: \(r.stderr)")
         XCTAssertFalse(r.stderr.contains("every minute"), r.stderr)
         XCTAssertTrue(fx.exists(fx.sudoers))
-        XCTAssertTrue(fx.exists(fx.app.appendingPathComponent("Contents/MacOS/Insomnia")))
+        XCTAssertEqual(
+            fx.calls().filter { $0.hasPrefix("launchctl APP-") },
+            ["launchctl APP-BINARY=#!/bin/bash during bootstrap", "launchctl APP-BINARY=previous during bootstrap"],
+            "new bundle under the new agent's load, previous bundle under the previous agent's reload: \(fx.calls())"
+        )
+        XCTAssertEqual(try fx.installedBinaryFirstLine(), "previous", "the previous bundle is back for the previous agent")
+        XCTAssertEqual(try fx.contents(of: fx.appsDir), ["Insomnia.app"], "no staged or set-aside bundle is left")
+        XCTAssertTrue(r.stderr.contains("put back"), r.stderr)
         XCTAssertEqual(try fx.contents(of: fx.plist.deletingLastPathComponent()), ["com.insomnia.backstop.plist"], "no staged leftovers")
     }
 
     func testInstallReplacesTheAgentAfterCleanRecovery() throws {
         try fx.prepareInstall()
+        try fx.writePreviousApp()
         try "trusted".write(to: fx.plist, atomically: true, encoding: .utf8)
         try Data().write(to: fx.lock)
         let lockInode = try fx.inode(fx.lock)
@@ -1143,7 +1191,13 @@ final class RecoveryScriptTests: XCTestCase {
         // and requirement, or the app reloads the agent at every start.
         let expected = LaunchdBackstop.plistDictionary(label: "com.insomnia.backstop", target: BackstopTarget(bundle: fx.app, requirement: fx.requirement))
         XCTAssertTrue(NSDictionary(dictionary: plist).isEqual(to: expected), "install.sh wrote \(plist), the app builds \(expected)")
-        XCTAssertTrue(calls.contains("codesign --verify --strict -R=\(fx.requirement) \(fx.app.path)"), "the installer runs the agent's own check once: \(calls)")
+        XCTAssertTrue(calls.contains { $0.hasPrefix("codesign --verify --strict -R=\(fx.requirement) \(fx.appsDir.path)/.Insomnia.app.staging.") && $0.hasSuffix("/Insomnia.app") }, "the installer runs the agent's own check once, on the staged bundle: \(calls)")
+        XCTAssertEqual(try fx.installedBinaryFirstLine(), "#!/bin/bash", "the new bundle is installed")
+        XCTAssertEqual(try fx.contents(of: fx.appsDir), ["Insomnia.app"], "the previous bundle and the staging directory are gone")
+        let bootout = try XCTUnwrap(calls.firstIndex(of: "launchctl bootout gui/\(fx.uid)/com.insomnia.backstop"))
+        let swapped = try XCTUnwrap(calls.firstIndex(of: "launchctl APP-BINARY=#!/bin/bash during bootstrap"), "\(calls)")
+        XCTAssertLessThan(bootout, swapped, "the previous agent is unloaded before its bundle is replaced: \(calls)")
+        XCTAssertTrue(r.stdout.contains("replaced the previous"), r.stdout)
         XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, false)
         XCTAssertTrue(fx.exists(fx.installedBackstop), "backstop.sh is sealed in the bundle")
         XCTAssertFalse(fx.exists(fx.legacyBackstop), "no writable copy is installed")
@@ -1321,7 +1375,7 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(failed.status, 1, failed.stderr + failed.stdout)
         XCTAssertTrue(fx.exists(fx.legacyBackstop), "the previous agent still runs this copy")
         XCTAssertFalse(fx.calls().contains("backstop legacy --force"), "recovery ran the sealed copy, not the old one: \(fx.calls())")
-        XCTAssertTrue(fx.exists(fx.installedBackstop))
+        XCTAssertFalse(fx.exists(fx.app), "no bundle is installed without an agent that pins it")
 
         fx.setMode("launchctl", "loaded")
         fx.clearCalls()
@@ -1340,6 +1394,7 @@ final class RecoveryScriptTests: XCTestCase {
     /// before the password prompt; only the pinned check fails here.)
     func testInstallStopsBeforeTheAgentWhenTheBundleFailsItsOwnRequirementCheck() throws {
         try fx.prepareInstall()
+        try fx.writePreviousApp()
         try "trusted".write(to: fx.plist, atomically: true, encoding: .utf8)
         try fx.writeMarkerBackstop(at: fx.legacyBackstop, name: "legacy")
         try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
@@ -1349,7 +1404,9 @@ final class RecoveryScriptTests: XCTestCase {
 
         XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
         let calls = fx.calls()
-        XCTAssertTrue(calls.contains("codesign --verify --strict -R=\(fx.requirement) \(fx.app.path)"), "\(calls)")
+        XCTAssertTrue(calls.contains { $0.hasPrefix("codesign --verify --strict -R=\(fx.requirement) \(fx.appsDir.path)/.Insomnia.app.staging.") }, "\(calls)")
+        XCTAssertEqual(try fx.installedBinaryFirstLine(), "previous", "the previous bundle was never touched")
+        XCTAssertEqual(try fx.contents(of: fx.appsDir), ["Insomnia.app"], "the staged build is discarded")
         XCTAssertFalse(calls.contains { $0.hasPrefix("launchctl") }, "\(calls)")
         XCTAssertFalse(calls.contains { $0.hasPrefix("sudo -n \(fx.fakePmset)") }, "no recovery from a bundle the agent would refuse: \(calls)")
         XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "trusted")
@@ -1357,6 +1414,157 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(fx.exists(fx.sudoers), "the rule step comes first and is reported")
         XCTAssertTrue(r.stderr.contains("would never run backstop.sh"), r.stderr)
         XCTAssertTrue(r.stderr.contains(fx.sudoers.path), r.stderr)
+    }
+
+    /// A first install whose agent cannot load leaves what was there before:
+    /// no bundle at $APP, rather than a bundle no agent pins.
+    func testInstallWithNoPreviousAppLeavesNoneWhenTheAgentCannotLoad() throws {
+        try fx.prepareInstall()
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        fx.setMode("launchctl", "no-then-error")   // nothing loaded before; bootstrap fails
+
+        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertTrue(fx.calls().contains("launchctl APP-BINARY=#!/bin/bash during bootstrap"), "\(fx.calls())")
+        XCTAssertFalse(fx.exists(fx.app), "the new bundle is discarded with its agent")
+        XCTAssertEqual(try fx.contents(of: fx.appsDir), [])
+        XCTAssertTrue(r.stderr.contains("none is now"), r.stderr)
+        XCTAssertFalse(fx.exists(fx.plist))
+    }
+
+    /// A run killed between the two renames of the swap leaves the previous
+    /// bundle set aside and nothing at $APP. The next run puts it back as
+    /// soon as it holds the recovery lock, so a stop later in that run
+    /// (here: unresolved recovery) still leaves the previous pair in place.
+    func testInstallPutsBackABundleAnInterruptedRunSetAside() throws {
+        try fx.prepareInstall()
+        try fx.writePreviousApp(at: fx.appsDir.appendingPathComponent(".Insomnia.app.previous", isDirectory: true))
+        try "trusted".write(to: fx.plist, atomically: true, encoding: .utf8)
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        fx.setMode("sudo", "fail")
+        fx.setMode("launchctl", "loaded")
+
+        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertTrue(r.stdout.contains("restored \(fx.app.path)"), r.stdout)
+        XCTAssertEqual(try fx.installedBinaryFirstLine(), "previous")
+        XCTAssertEqual(try fx.contents(of: fx.appsDir), ["Insomnia.app"])
+        XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "trusted")
+    }
+
+    /// A run killed after the second rename leaves its new build at $APP and
+    /// the previous one set aside. Which of the two stays is decided by the
+    /// plist on disk, the one launchd loads at the next login: when it pins
+    /// only the set-aside bundle that one goes back, and when $APP satisfies
+    /// it the set-aside copy is removed. Either way the pair matches before
+    /// this run's own recovery step (unresolved here, so the run stops).
+    func testInstallKeepsTheBundleThePlistOnDiskPinsAfterAnInterruptedSwap() throws {
+        try fx.prepareInstall()
+        let previous = fx.appsDir.appendingPathComponent(".Insomnia.app.previous", isDirectory: true)
+        try fx.writeBundle(at: previous, marker: "previous")
+        try fx.writeBundle(at: fx.app, marker: "interrupted")
+        try fx.writeAgentPlist()
+        try fx.rejectSignature(of: fx.app)
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        fx.setMode("sudo", "fail")
+        fx.setMode("launchctl", "loaded")
+
+        let pinsPrevious = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(pinsPrevious.status, 1, pinsPrevious.stderr + pinsPrevious.stdout)
+        XCTAssertTrue(fx.calls().contains("codesign --verify --strict -R=\(fx.requirement) \(previous.path)"), "\(fx.calls())")
+        XCTAssertEqual(try fx.installedBinaryFirstLine(), "previous", "the bundle the plist pins is back")
+        XCTAssertEqual(try fx.contents(of: fx.appsDir), ["Insomnia.app"], "the interrupted build left with the staging directory")
+        XCTAssertTrue(pinsPrevious.stdout.contains("restored \(fx.app.path)"), pinsPrevious.stdout)
+
+        try FileManager.default.removeItem(at: fx.root.appendingPathComponent("codesign.rejects"))
+        try FileManager.default.removeItem(at: fx.app)
+        try fx.writeBundle(at: previous, marker: "previous")
+        try fx.writeBundle(at: fx.app, marker: "interrupted")
+        let pinsCurrent = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(pinsCurrent.status, 1, pinsCurrent.stderr + pinsCurrent.stdout)
+        XCTAssertEqual(try fx.installedBinaryFirstLine(), "interrupted", "$APP satisfies the plist, so it stays")
+        XCTAssertEqual(try fx.contents(of: fx.appsDir), ["Insomnia.app"], "the set-aside copy is removed")
+        XCTAssertTrue(pinsCurrent.stdout.contains("removed the bundle an interrupted run had set aside"), pinsCurrent.stdout)
+    }
+
+    /// Leftovers are cleaned only under the recovery lock: while another
+    /// process holds it, a set-aside bundle (which a live run may need to
+    /// roll back) and every staging directory stay. With the lock, a dead
+    /// run's staging directory is removed and a live run's (named by a PID
+    /// that exists, here this test's own) is kept.
+    func testInstallCleansLeftoversOnlyUnderTheLockAndKeepsALiveRunsStaging() throws {
+        try fx.prepareInstall()
+        try fx.writePreviousApp()
+        try "trusted".write(to: fx.plist, atomically: true, encoding: .utf8)
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        let finished = Process()
+        finished.executableURL = URL(fileURLWithPath: "/usr/bin/true")
+        try finished.run()
+        finished.waitUntilExit()
+        let dead = ".Insomnia.app.staging.\(finished.processIdentifier).AAAAAA"
+        let live = ".Insomnia.app.staging.\(ProcessInfo.processInfo.processIdentifier).BBBBBB"
+        let setAside = ".Insomnia.app.previous"
+        for name in [dead, live] {
+            try fx.writeBundle(at: fx.appsDir.appendingPathComponent(name).appendingPathComponent("Insomnia.app"), marker: "staged")
+        }
+        try fx.writeBundle(at: fx.appsDir.appendingPathComponent(setAside), marker: "set aside by a live run")
+
+        let holder = try fx.holdLock()
+        let blocked = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+        holder.terminate(); holder.waitUntilExit()
+
+        XCTAssertEqual(blocked.status, 75, blocked.stderr + blocked.stdout)
+        XCTAssertEqual(try fx.contents(of: fx.appsDir), [setAside, dead, live, "Insomnia.app"].sorted(), "nothing removed outside the lock")
+
+        try FileManager.default.removeItem(at: fx.appsDir.appendingPathComponent(setAside))
+        fx.setMode("launchctl", "loaded")
+        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertEqual(try fx.contents(of: fx.appsDir), [live, "Insomnia.app"].sorted(), "the dead run's staging is gone, the live run's stays")
+    }
+
+    /// The new agent loads but its plist cannot be moved into place (the
+    /// LaunchAgents directory is read-only here). The next login would load
+    /// the old plist, which pins the previous build, so the new job is
+    /// unloaded, the previous bundle goes back and the previous plist is
+    /// loaded again, the same as for a failed load.
+    func testInstallPutsThePreviousPairBackWhenThePlistCannotBePublished() throws {
+        try fx.prepareInstall()
+        try fx.writePreviousApp()
+        try "trusted".write(to: fx.plist, atomically: true, encoding: .utf8)
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        fx.setMode("launchctl", "loaded")
+        let agents = fx.plist.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: agents.appendingPathComponent(".com.insomnia.backstop.staging"), withIntermediateDirectories: true)
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: agents.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: agents.path) }
+
+        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        let calls = fx.calls()
+        let bootstraps = calls.filter { $0.hasPrefix("launchctl bootstrap") }
+        XCTAssertEqual(bootstraps.count, 2, "candidate, then the previous plist again: \(calls)")
+        XCTAssertEqual(bootstraps.last, "launchctl bootstrap gui/\(fx.uid) \(fx.plist.path)")
+        let firstLoad = try XCTUnwrap(calls.firstIndex { $0.hasPrefix("launchctl bootstrap") })
+        XCTAssertTrue(calls[firstLoad...].contains("launchctl bootout gui/\(fx.uid)/com.insomnia.backstop"), "the new job is unloaded: \(calls)")
+        XCTAssertEqual(
+            calls.filter { $0.hasPrefix("launchctl APP-") },
+            ["launchctl APP-BINARY=#!/bin/bash during bootstrap", "launchctl APP-BINARY=previous during bootstrap"],
+            "the previous bundle is back before the previous plist is loaded again: \(calls)"
+        )
+        XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "trusted", "the trusted plist was never modified")
+        XCTAssertEqual(try fx.installedBinaryFirstLine(), "previous")
+        XCTAssertEqual(try fx.contents(of: fx.appsDir), ["Insomnia.app"], "no staged or set-aside bundle is left")
+        XCTAssertTrue(r.stderr.contains("could not be moved to \(fx.plist.path)"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("put back"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("loaded again from the previous plist"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("is writable and rerun"), r.stderr)
     }
 
     func testInstallLeavesTrustedPlistWhenBootstrapAndReloadBothFail() throws {
@@ -1762,6 +1970,20 @@ private final class ScriptFixture {
 
     func exists(_ url: URL) -> Bool { fm.fileExists(atPath: url.path) }
 
+    /// A bundle from an earlier install at $APP, with a binary whose first
+    /// line ("previous") tells it apart from the fake build's ("#!/bin/bash").
+    func writePreviousApp(at url: URL? = nil) throws {
+        let bundle = url ?? app
+        try fm.createDirectory(at: bundle.appendingPathComponent("Contents/MacOS"), withIntermediateDirectories: true)
+        try "previous\n".write(to: bundle.appendingPathComponent("Contents/MacOS/Insomnia"), atomically: true, encoding: .utf8)
+    }
+
+    /// First line of the binary installed at $APP.
+    func installedBinaryFirstLine() throws -> String {
+        let text = try String(contentsOf: app.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8)
+        return String(text.split(separator: "\n", omittingEmptySubsequences: false).first ?? "")
+    }
+
     /// A stand-in backstop that records which copy ran and claims success.
     func writeMarkerBackstop(at url: URL, name: String) throws {
         try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -1810,6 +2032,7 @@ private final class ScriptFixture {
             "OSASCRIPT": bin.appendingPathComponent("osascript").path,
             "LAUNCHCTL": bin.appendingPathComponent("launchctl").path,
             "SUDO": bin.appendingPathComponent("sudo").path,
+            "CODESIGN": bin.appendingPathComponent("codesign").path,
             "APP": app.path,
             "SUDOERS": sudoers.path,
             "LOCK_TIMEOUT_SECONDS": "1",
@@ -1999,7 +2222,8 @@ private final class ScriptFixture {
         // `--verify` passes unless mode "verify-fails"; mode
         // "deep-verify-fails" fails only the `--deep` form install.sh runs
         // on a prebuilt bundle, and "requirement-verify-fails" only the
-        // `-R=` form (the agent's pinned check).
+        // `-R=` form (the agent's pinned check). A path listed in
+        // codesign.rejects (see `rejectSignature(of:)`) fails every form.
         try writeFake("codesign", """
         printf 'codesign %s\\n' "$*" >> "\(calls)"
         mode="$(cat "\(r)/codesign.mode" 2>/dev/null || echo ok)"
@@ -2017,7 +2241,10 @@ private final class ScriptFixture {
                     *) echo "Signature=adhoc" >&2; echo "TeamIdentifier=not set" >&2 ;;
                   esac
                   exit 0 ;;
-            --verify) if [[ "$mode" == verify-fails || ( "$mode" == deep-verify-fails && $deep == 1 ) || ( "$mode" == requirement-verify-fails && $pinned == 1 ) ]]; then echo "$last: a sealed resource is missing or invalid" >&2; exit 1; fi; exit 0 ;;
+            --verify)
+              if [[ -f "\(r)/codesign.rejects" ]] && grep -qxF -- "$last" "\(r)/codesign.rejects"; then echo "$last: does not satisfy its designated Requirement" >&2; exit 3; fi
+              if [[ "$mode" == verify-fails || ( "$mode" == deep-verify-fails && $deep == 1 ) || ( "$mode" == requirement-verify-fails && $pinned == 1 ) ]]; then echo "$last: a sealed resource is missing or invalid" >&2; exit 1; fi
+              exit 0 ;;
           esac
         done
         exit 0
@@ -2103,6 +2330,11 @@ private final class ScriptFixture {
           else
             echo 'launchctl LOCK-HELD during bootstrap' >> "\(calls)"
           fi
+          if [[ -f "\(app.path)/Contents/MacOS/Insomnia" ]]; then
+            echo "launchctl APP-BINARY=$(head -n 1 "\(app.path)/Contents/MacOS/Insomnia") during bootstrap" >> "\(calls)"
+          else
+            echo 'launchctl APP-ABSENT during bootstrap' >> "\(calls)"
+          fi
         fi
         prints=0
         if [[ "${1:-}" == print ]]; then
@@ -2140,6 +2372,28 @@ private final class ScriptFixture {
         try probe.run()
         probe.waitUntilExit()
         return probe.terminationStatus == 0
+    }
+
+    /// Makes the fake codesign's `--verify` fail for the bundle at `url`
+    /// only, the way a bundle that is not the build a requirement pins does.
+    func rejectSignature(of url: URL) throws {
+        let list = root.appendingPathComponent("codesign.rejects")
+        let existing = (try? String(contentsOf: list, encoding: .utf8)) ?? ""
+        try (existing + url.path + "\n").write(to: list, atomically: true, encoding: .utf8)
+    }
+
+    /// A bundle at `url` whose binary's first line is `marker`.
+    func writeBundle(at url: URL, marker: String) throws {
+        try fm.createDirectory(at: url.appendingPathComponent("Contents/MacOS"), withIntermediateDirectories: true)
+        try "\(marker)\n".write(to: url.appendingPathComponent("Contents/MacOS/Insomnia"), atomically: true, encoding: .utf8)
+    }
+
+    /// The agent plist an install writes for the bundle at $APP, pinning
+    /// the fake codesign's requirement.
+    func writeAgentPlist() throws {
+        let dict = LaunchdBackstop.plistDictionary(label: "com.insomnia.backstop", target: BackstopTarget(bundle: app, requirement: requirement))
+        let data = try PropertyListSerialization.data(fromPropertyList: dict, format: .xml, options: 0)
+        try data.write(to: plist)
     }
 
     func setMode(_ name: String, _ value: String) {
