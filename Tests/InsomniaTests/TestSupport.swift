@@ -57,6 +57,7 @@ final class FakeSleepGuard: SleepGuarding, @unchecked Sendable {
     private var _lowPowerOn = false
     private var _lowPowerGate: AsyncGate?
     private var _sleepGate: AsyncGate?
+    private var _restoreGate: AsyncGate?
     private var _readGate: AsyncGate?
     var throwOn: Set<String> = []
     /// Commands that take effect and *then* fail (a timeout after pmset
@@ -83,6 +84,11 @@ final class FakeSleepGuard: SleepGuarding, @unchecked Sendable {
         get { lock.withLock { _sleepGate } }
         set { lock.withLock { _sleepGate = newValue } }
     }
+    /// Holds `disablesleep 0` after the call is recorded, before it takes effect.
+    var restoreGate: AsyncGate? {
+        get { lock.withLock { _restoreGate } }
+        set { lock.withLock { _restoreGate = newValue } }
+    }
     /// Holds `pmset -g` after the call is recorded, before it answers.
     var readGate: AsyncGate? {
         get { lock.withLock { _readGate } }
@@ -105,6 +111,7 @@ final class FakeSleepGuard: SleepGuarding, @unchecked Sendable {
     func setSleepDisabled(_ disabled: Bool) async throws {
         try record("disablesleep \(disabled ? 1 : 0)")
         if disabled, let gate = sleepGate { await gate.wait() }
+        if !disabled, let gate = restoreGate { await gate.wait() }
         sleepDisabled = disabled
         try afterEffect("disablesleep \(disabled ? 1 : 0)")
     }

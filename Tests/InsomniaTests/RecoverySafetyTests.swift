@@ -151,6 +151,74 @@ final class RecoverySafetyTests: XCTestCase {
         XCTAssertNil(m.scheduledDeadline)
     }
 
+    /// The deadline passes while reconcile's `disablesleep 1` for the
+    /// session on disk is still running. The end waits for it, so its
+    /// `disablesleep 0` lands last and nothing stays journaled.
+    func testEndDuringReconcileMustNotLeaveSleepDisabled() async throws {
+        let now = h.clock.now
+        try h.store.saveSession(Session(startedAt: now.addingTimeInterval(-600), endsAt: now.addingTimeInterval(60)))
+        let gate = AsyncGate()
+        h.guardFake.sleepGate = gate
+        let m = h.makeManager()
+
+        let reconcile = Task { await m.reconcile() }
+        await gate.waitUntilStarted()
+        h.clock.advance(120)
+        let end = Task { await m.end(reason: .timer) }
+        await settleQueuedRequests()
+        await gate.open()
+        await reconcile.value
+        let outcome = await end.value
+
+        XCTAssertEqual(outcome, .restored)
+        XCTAssertNil(m.session)
+        XCTAssertNil(m.scheduledDeadline)
+        XCTAssertFalse(h.guardFake.sleepDisabled, "sleep left disabled after the end completed")
+        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1", "disablesleep 0"])
+        XCTAssertNil(try h.store.loadSession())
+        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
+    }
+
+    /// `isActive` goes false as soon as an end starts, while its
+    /// `disablesleep 0` is still running (pmset takes about 0.1 s). A test
+    /// that waits for `isActive` and then reads the fake or the journal reads
+    /// this window. The end still finishes first, and a start requested
+    /// inside the window runs after it: the only `disablesleep 1` that
+    /// follows belongs to a new session with its own session.json, journal
+    /// entry and deadline.
+    func testStartRequestedWhileAnEndRestoresRunsAfterIt() async throws {
+        let m = h.makeManager()
+        await m.start(duration: 3600)
+        let first = try XCTUnwrap(m.session)
+        let gate = AsyncGate()
+        h.guardFake.restoreGate = gate
+
+        let end = Task { await m.end(reason: .timer) }
+        await gate.waitUntilStarted()
+        XCTAssertFalse(m.isActive, "the session leaves memory when the end starts")
+        XCTAssertNil(try h.store.loadSession(), "session.json goes before the restore")
+        XCTAssertTrue(h.guardFake.sleepDisabled, "sleep is still disabled while pmset runs")
+        XCTAssertEqual(try h.store.loadState()?.sleepDisabledByUs, true, "the entry stays until pmset confirms")
+
+        h.clock.advance(60)
+        let start = Task { await m.start(duration: 600) }
+        await settleQueuedRequests()
+        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1", "disablesleep 0"], "the start ran inside the end")
+        await gate.open()
+        let outcome = await end.value
+        await start.value
+
+        XCTAssertEqual(outcome, .restored)
+        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1", "disablesleep 0", "disablesleep 1"])
+        let second = try XCTUnwrap(m.session)
+        XCTAssertNotEqual(second, first)
+        XCTAssertEqual(second.startedAt, h.clock.now)
+        XCTAssertEqual(second.endsAt, h.clock.now.addingTimeInterval(600))
+        XCTAssertEqual(m.scheduledDeadline, second.endsAt)
+        XCTAssertEqual(try h.store.loadSession(), second)
+        XCTAssertEqual(try h.store.loadState()?.sleepDisabledByUs, true)
+    }
+
     /// A valid session on disk whose agent cannot be armed is ended, never
     /// held: sleep is not disabled without something guaranteed to release it.
     func testReconcileMustNotHoldSleepWithoutBackstop() async throws {
@@ -403,14 +471,19 @@ final class RecoverySafetyTests: XCTestCase {
         XCTAssertFalse(m.quitRequested, "quit stays requested although the app has to stay for the retry")
         held.release()
 
-        let deadline = Date().addingTimeInterval(5)
-        while m.isActive, Date() < deadline {
-            try await Task.sleep(for: .milliseconds(50))
+        // Wait for the retried end to finish, not for it to start: `isActive`
+        // goes false at the top of the end, before `disablesleep 0` and the
+        // journal write. Clearing `pendingEnd` is the end's last step.
+        for _ in 0..<1000 where m.pendingEnd != nil {
+            try await Task.sleep(for: .milliseconds(10))
         }
-        XCTAssertFalse(m.isActive, "pending end was never retried")
+        XCTAssertNil(m.pendingEnd, "pending end was never retried")
+        XCTAssertFalse(m.isActive)
         XCTAssertEqual(h.guardFake.calls, ["disablesleep 1", "disablesleep 0"])
+        XCTAssertFalse(h.guardFake.sleepDisabled)
         XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
-        XCTAssertNil(m.pendingEnd)
+        XCTAssertNil(try h.store.loadSession())
+        XCTAssertEqual(h.notifier.posts.last?.title, "Session ended")
     }
 
     /// While an end is pending, a new session would be ended by the retry;
