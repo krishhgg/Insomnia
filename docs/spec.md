@@ -379,8 +379,10 @@ small settings window:
   install means the reinstall lost the registration and the app registers
   again; the same install means the user removed the item in System
   Settings, and the app turns the flag off rather than put it back; no
-  record (a config from before the field) means the two cannot be told
-  apart, so the app leaves the item alone and Settings shows the status.
+  record (a config from before the field) means this is the first launch
+  of a build that keeps one, itself a reinstall, so the app registers once
+  and records the install. A user who removed the item while Insomnia's
+  switch stayed on gets it back that once.
   Every outcome is logged. The Settings switch shows what macOS has on
   file (enabled or waiting for approval), not the flag; a registration
   waiting for approval shows a note with a button that opens System

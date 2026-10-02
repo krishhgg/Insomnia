@@ -123,21 +123,46 @@ final class LoginItemTests: XCTestCase {
         XCTAssertTrue(log().contains("treating that as removed in System Settings and turning the flag off"), log())
     }
 
-    /// A config written before the install was recorded: a reinstall and a
-    /// removal cannot be told apart, so the item is left alone, the flag
-    /// kept, and Settings shows the status with its note.
-    func testLaunchLeavesAnUnrecordedInstallAlone() {
+    /// The first upgrade to a build that records the install: config.json
+    /// has the flag on and no record, and the reinstall dropped the item.
+    /// That launch is itself a reinstall, so the app registers once and
+    /// records the install. Once: if the item then goes away for this
+    /// install, the next launch reads it as removed by the user.
+    func testFirstUpgradeFromAConfigWithoutARecordRegistersOnce() {
         let service = FakeLoginItemService(status: .notRegistered)
+        let item = makeItem(service)
+        var config = wanted(install: nil)
+
+        XCTAssertTrue(item.healAtLaunch(config: &config))
+
+        XCTAssertEqual(service.registers, 1)
+        XCTAssertTrue(item.isEnabled)
+        XCTAssertTrue(config.launchAtLogin)
+        XCTAssertEqual(config.launchAtLoginInstall, thisInstall)
+        XCTAssertTrue(log().contains("no install is on record (a config from before the record existed); treating this as the first launch after an upgrade, registering once and recording the install"), log())
+        XCTAssertTrue(log().contains("registered again; install recorded"), log())
+
+        service.status = .notRegistered
+        XCTAssertTrue(item.healAtLaunch(config: &config))
+
+        XCTAssertEqual(service.registers, 1, "not registered a second time")
+        XCTAssertFalse(config.launchAtLogin)
+        XCTAssertNil(config.launchAtLoginInstall)
+    }
+
+    /// The one-time registration fails: nothing is recorded, so the next
+    /// launch tries again rather than reading the gap as a removal.
+    func testFirstUpgradeWhoseRegisterFailsRecordsNothing() {
+        let service = FakeLoginItemService(status: .notRegistered)
+        service.registerError = "refused"
         let item = makeItem(service)
         var config = wanted(install: nil)
 
         XCTAssertFalse(item.healAtLaunch(config: &config))
 
-        XCTAssertEqual(service.registers, 0)
-        XCTAssertTrue(config.launchAtLogin)
-        XCTAssertNil(config.launchAtLoginInstall)
-        XCTAssertFalse(item.isRegistered)
-        XCTAssertTrue(log().contains("no install is on record"), log())
+        XCTAssertEqual(service.registers, 1)
+        XCTAssertEqual(item.error, "refused")
+        XCTAssertEqual(config, wanted(install: nil))
     }
 
     /// Enabled: nothing to register. The install is recorded when it is

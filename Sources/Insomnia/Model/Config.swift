@@ -51,7 +51,8 @@ struct Config: Codable, Equatable, Sendable {
     /// macOS last had on file, written when a registration is accepted.
     /// At launch it tells a reinstall, which the app heals by registering
     /// again, from the user removing the item in System Settings, which
-    /// the app respects. nil until the switch is turned on once.
+    /// the app respects. nil in a config written before this field; the
+    /// first launch with the flag on registers once and records it.
     var launchAtLoginInstall: String?
 
     static let defaultPresets: [TimeInterval] = [

@@ -62,11 +62,12 @@ struct SMAppServiceLoginItem: LoginItemServicing {
 /// so a registration can stop being enabled after an upgrade without any
 /// error. config.json remembers which install macOS last had on file
 /// (`Config.launchAtLoginInstall`): at launch, when the flag is on, macOS
-/// does not report the item registered and the install has changed, the
-/// app registers again; when the install is the one macOS had on file,
-/// the item went away by the user's hand in System Settings and the flag
-/// is turned off instead. A registration that needs the user's approval,
-/// or one that fails, is shown in Settings instead of only logged.
+/// does not report the item registered and the install has changed (or
+/// none is on record yet), the app registers again; when the install is
+/// the one macOS had on file, the item went away by the user's hand in
+/// System Settings and the flag is turned off instead. A registration that
+/// needs the user's approval, or one that fails, is shown in Settings
+/// instead of only logged.
 @MainActor
 @Observable
 final class LoginItem {
@@ -139,12 +140,14 @@ final class LoginItem {
     /// With the flag off nothing is touched: an item the user enabled in
     /// System Settings themselves is theirs. With the flag on and the item
     /// registered, the current install is recorded. Otherwise the recorded
-    /// install decides: none on record (a config written before this was
-    /// recorded) and a reinstall cannot be told from a removal, so the item
-    /// is left alone and Settings shows the status; the same install, and
-    /// the registration went away by the user's hand, so the flag follows;
-    /// a different install, and the registration was lost to the
-    /// reinstall, so the app registers again.
+    /// install decides: the same install, and the registration went away
+    /// by the user's hand, so the flag follows; a different install, and
+    /// the registration was lost to the reinstall, so the app registers
+    /// again. None on record means a config written before the record
+    /// existed, so this is the first launch of a build that keeps one,
+    /// which is itself a reinstall: the app registers once and records the
+    /// install. A user who removed the item in System Settings while the
+    /// switch stayed on gets it back that once, as the switch said.
     @discardableResult
     func healAtLaunch(config: inout Config) -> Bool {
         refresh()
@@ -155,24 +158,25 @@ final class LoginItem {
             config.launchAtLoginInstall = install
             return true
         }
-        guard let known = config.launchAtLoginInstall else {
-            Log.info("launch at login: config wants it but macOS reports it \(status.description), and no install is on record to tell a reinstall from a removal in System Settings; leaving it alone")
-            return false
-        }
-        guard known != install else {
+        let known = config.launchAtLoginInstall
+        if known == install {
             Log.info("launch at login: config wants it but macOS reports it \(status.description) for the install it had on file; treating that as removed in System Settings and turning the flag off")
             config.launchAtLogin = false
             config.launchAtLoginInstall = nil
             return true
         }
-        Log.info("launch at login: config wants it but macOS reports it \(status.description) and the install changed; registering again (the signature changes on every install)")
+        if known == nil {
+            Log.info("launch at login: config wants it but macOS reports it \(status.description) and no install is on record (a config from before the record existed); treating this as the first launch after an upgrade, registering once and recording the install")
+        } else {
+            Log.info("launch at login: config wants it but macOS reports it \(status.description) and the install changed; registering again (the signature changes on every install)")
+        }
         do {
             try service.register()
             error = nil
             refresh()
             switch status {
             case .enabled:
-                Log.info("launch at login: registered again")
+                Log.info("launch at login: registered again; install recorded")
             case .requiresApproval:
                 Log.info("launch at login: registered, waiting for approval in System Settings > General > Login Items")
             default:
