@@ -216,6 +216,11 @@ final class StillRunningCommandTests: XCTestCase {
     /// transaction's own check. The end is still stopped and pending, the
     /// lock still goes to the holder, and the holder retries the end: a fast
     /// exit must not leave the cleanup pending with nothing to retry it.
+    ///
+    /// The holder can retry before this test's next line runs, so nothing
+    /// here waits on that ordering. The fake reports the command stuck once
+    /// and clears it itself, and where the first end stopped is read from
+    /// the order of the calls afterwards, not from a check in between.
     func testCommandThatExitsAsSoonAsReportedStillGetsTheRetry() async throws {
         let m = h.makeManager()
         await m.start(duration: 3600)
@@ -227,10 +232,12 @@ final class StillRunningCommandTests: XCTestCase {
         let outcome = await m.end(reason: .user)
 
         XCTAssertEqual(outcome, .privilegedCommandRunning(pid: 4242))
-        XCTAssertFalse(h.guardFake.calls.contains("lowpowermode 0"), "restore continued past the stopped command: \(h.guardFake.calls)")
-        h.guardFake.stillRunning = []
+        XCTAssertEqual(h.guardFake.stillRunning, [], "a fast-exiting command is reported stuck once")
         await waitUntil("pending end never retried after a fast exit") { m.pendingEnd == nil }
-        XCTAssertEqual(h.guardFake.calls.suffix(3), ["disablesleep 0", "disablesleep 0", "lowpowermode 0"])
+        // One stuck report, one retry, nothing between them: the first end
+        // stopped at the stuck command instead of going on to lowpowermode 0.
+        XCTAssertEqual(h.guardFake.calls.suffix(4), ["lowpowermode 1", "disablesleep 0", "disablesleep 0", "lowpowermode 0"])
+        XCTAssertEqual(h.notifier.posts.filter { $0.title == SessionManager.commandRunningTitle }.count, 1, "\(h.notifier.posts)")
         XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
         XCTAssertNil(m.unfinishedCommand)
         XCTAssertFalse(try lockIsHeld())

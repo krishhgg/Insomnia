@@ -62,14 +62,8 @@ final class FakeSleepGuard: SleepGuarding, @unchecked Sendable {
     /// Commands that take effect and *then* fail (a timeout after pmset
     /// already applied the setting): the ambiguous failure shape.
     var throwAfterEffect: Set<String> = []
-    /// Commands reported as still running after SIGTERM
-    /// (`CommandStillRunningError`): recorded, no effect, and a fake child
-    /// in `stuck` that stays alive until `exitStuckCommands()`.
-    var stillRunning: Set<String> = []
-    /// With `stillRunning`: the fake child exits the moment it is reported,
-    /// before the caller can look at it (the window between the grace and
-    /// the transaction's own check).
-    var stuckExitsAtOnce = false
+    private var _stillRunning: Set<String> = []
+    private var _stuckExitsAtOnce = false
     private var _stuck: [UnfinishedCommand] = []
     private var _nextPid: Int32 = 4242
 
@@ -99,6 +93,24 @@ final class FakeSleepGuard: SleepGuarding, @unchecked Sendable {
         set { lock.withLock { _readGate = newValue } }
     }
 
+    /// Commands reported as still running after SIGTERM
+    /// (`CommandStillRunningError`): recorded, no effect, and a fake child
+    /// in `stuck` that stays alive until `exitStuckCommands()`.
+    var stillRunning: Set<String> {
+        get { lock.withLock { _stillRunning } }
+        set { lock.withLock { _stillRunning = newValue } }
+    }
+    /// With `stillRunning`: the fake child exits the moment it is reported,
+    /// before the caller can look at it (the window between the grace and
+    /// the transaction's own check). The command leaves `stillRunning` in
+    /// the same step, so it is reported stuck once: the retry that follows
+    /// its exit finds it finished whenever it runs, and a test never has to
+    /// clear it in a race with that retry.
+    var stuckExitsAtOnce: Bool {
+        get { lock.withLock { _stuckExitsAtOnce } }
+        set { lock.withLock { _stuckExitsAtOnce = newValue } }
+    }
+
     /// Fake children reported as still running, oldest first.
     var stuck: [UnfinishedCommand] { lock.withLock { _stuck } }
 
@@ -117,16 +129,18 @@ final class FakeSleepGuard: SleepGuarding, @unchecked Sendable {
         if throwOn.contains(c) {
             throw SleepGuardError(command: c, status: 1, stderr: "sudo: a password is required")
         }
-        if stillRunning.contains(c) {
-            let child: UnfinishedCommand = lock.withLock {
-                let pid = _nextPid
-                _nextPid += 1
-                let child = UnfinishedCommand(exe: "/usr/bin/sudo", args: ["-n", "/usr/bin/pmset"] + c.split(separator: " ").map(String.init), pid: pid)
-                _stuck.append(child)
-                return child
-            }
-            if stuckExitsAtOnce { exitStuckCommands() }
-            throw CommandStillRunningError(command: child, reason: .timeout(seconds: 20), grace: 3)
+        let reported: (child: UnfinishedCommand, exitsAtOnce: Bool)? = lock.withLock {
+            guard _stillRunning.contains(c) else { return nil }
+            let pid = _nextPid
+            _nextPid += 1
+            let child = UnfinishedCommand(exe: "/usr/bin/sudo", args: ["-n", "/usr/bin/pmset"] + c.split(separator: " ").map(String.init), pid: pid)
+            _stuck.append(child)
+            if _stuckExitsAtOnce { _stillRunning.remove(c) }
+            return (child, _stuckExitsAtOnce)
+        }
+        if let reported {
+            if reported.exitsAtOnce { exitStuckCommands() }
+            throw CommandStillRunningError(command: reported.child, reason: .timeout(seconds: 20), grace: 3)
         }
     }
 
