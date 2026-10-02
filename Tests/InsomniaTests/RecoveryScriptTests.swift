@@ -607,7 +607,7 @@ final class RecoveryScriptTests: XCTestCase {
         let nonce = UUID().uuidString
         try Data(nonce.utf8).write(to: fx.pendingStart)
         let holder = try fx.holdLock()
-        defer { holder.terminate(); holder.waitUntilExit() }
+        defer { holder.stop() }
 
         let r = try fx.run(fx.backstop)
 

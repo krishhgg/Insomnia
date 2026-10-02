@@ -83,9 +83,10 @@ final class OsascriptAdministratorPromptTests: XCTestCase {
         process.standardInput = FileHandle.nullDevice
         let err = Pipe()
         process.standardError = err
+        let compileExit = ProcessExit(process)
         try process.run()
         let errData = err.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
+        compileExit.wait()
         XCTAssertEqual(process.terminationStatus, 0, String(decoding: errData, as: UTF8.self))
     }
 

@@ -742,6 +742,7 @@ func appleScriptQuotedForm(_ s: String) -> String {
 /// a test can act while the command holds the marker's lock.
 final class RootCommandProcess {
     private let process = Process()
+    private let childExit: ProcessExit
     private let err = Pipe()
     private let calls: URL
     private let started: URL
@@ -783,6 +784,7 @@ final class RootCommandProcess {
         process.environment = env
         process.standardInput = FileHandle.nullDevice
         process.standardError = err
+        childExit = ProcessExit(process)
         try process.run()
     }
 
@@ -808,7 +810,7 @@ final class RootCommandProcess {
 
     func wait() -> RootCommandRun {
         let errData = err.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
+        childExit.wait()
         let recorded = (try? String(contentsOf: calls, encoding: .utf8)) ?? ""
         return RootCommandRun(
             status: process.terminationStatus,

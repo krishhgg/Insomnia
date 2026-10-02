@@ -386,6 +386,7 @@ struct OsascriptAdministratorPrompt: AdministratorPromptRunning {
                 let err = Pipe()
                 process.standardOutput = out
                 process.standardError = err
+                let osascriptExit = ProcessExit(process)
 
                 do {
                     try process.run()
@@ -421,7 +422,7 @@ struct OsascriptAdministratorPrompt: AdministratorPromptRunning {
                     errData = errHandle.readDataToEndOfFile()
                     group.leave()
                 }
-                process.waitUntilExit()
+                osascriptExit.wait()
                 state.osascriptExited()
                 group.wait()
                 deadline.cancel()
