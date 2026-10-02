@@ -298,8 +298,14 @@ provided by the standalone backstop. Performance effects depend on workload.
 - macOS 26 requires Location Services permission before CoreWLAN exposes SSIDs
   or returns results for an SSID-filtered scan. Insomnia requests when-in-use
   access when the hotspot is saved or a configured session starts, never at
-  launch. The real hotspot join still must be run on the Mac in the manual
-  test plan below.
+  launch. Mac apps have no when-in-use state: a grant settles on
+  `authorizedAlways`, and System Settings records it as Location Services
+  access for Insomnia (the Settings window says so next to the Location
+  row). Insomnia never starts location updates. The real hotspot join still
+  must be run on the Mac in the manual test plan below.
+- Log lines naming the SSID, a tmux target or a process reach the unified
+  log as private data (`Log.swift`), so `log show` prints `<private>` for
+  the body; `insomnia.log` keeps the text.
 - Each outage is logged with start, end, and gap length to
   `~/Library/Logs/Insomnia/handoffs.log`. The menu shows the last gap.
 - Path satisfied again after a gap longer than `nudgeThreshold` (default 90 s):

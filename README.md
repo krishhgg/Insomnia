@@ -218,7 +218,10 @@ arguments.
 macOS requires Location Services permission to reveal network names. Insomnia
 requests it on the first hotspot save, or when starting a session with a
 configured hotspot—not merely on launch. If denied, use the Location row in
-Settings to open **Privacy & Security → Location Services**.
+Settings to open **Privacy & Security → Location Services**. Mac apps have no
+when-in-use grant, so System Settings records it as Location Services access
+for Insomnia. Insomnia uses it only to read Wi-Fi network names through
+CoreWLAN and never requests your location.
 
 Configured tmux targets opt into sending `continue` followed by Enter after a
 long outage (90 seconds by default). The default target list is empty. Use
@@ -247,6 +250,10 @@ Configuration lives in `~/Library/Application Support/Insomnia/config.json`.
 Use Settings for the app's controls; [Config.swift](Sources/Insomnia/Model/Config.swift)
 defines the full configuration and defaults. Local logs can contain SSIDs,
 process metadata, and tmux targets. Check them before sharing publicly.
+Lines the app writes to `insomnia.log` also go to the unified log with their
+bodies marked private, so `log show` and other local programs see `<private>`
+in place of the text unless private data logging is enabled on the Mac. The
+backstop's lines go only to `insomnia.log`, which keeps the full text of both.
 
 `INSOMNIA_HOME` relocates app support files, logs, and LaunchAgents for testing.
 It is **not an installation sandbox**: installation/removal also involves the
