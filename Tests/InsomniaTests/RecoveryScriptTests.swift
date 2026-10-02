@@ -1375,14 +1375,15 @@ final class RecoveryScriptTests: XCTestCase {
     /// The new agent loads but its plist cannot be moved into place (the
     /// LaunchAgents directory is read-only here). The next login would load
     /// the old plist, which pins the previous build, so the new job is
-    /// unloaded, the previous bundle goes back and the previous plist is
-    /// loaded again, the same as for a failed load.
+    /// unloaded (launchctl print confirms it is gone), the previous bundle
+    /// goes back and the previous plist is loaded again, the same as for a
+    /// failed load.
     func testInstallPutsThePreviousPairBackWhenThePlistCannotBePublished() throws {
         try fx.prepareInstall()
         try fx.writePreviousApp()
         try "trusted".write(to: fx.plist, atomically: true, encoding: .utf8)
         try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
-        fx.setMode("launchctl", "loaded")
+        fx.setMode("launchctl", "loaded-tracked")
         let agents = fx.plist.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: agents.appendingPathComponent(".com.insomnia.backstop.staging"), withIntermediateDirectories: true)
         try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: agents.path)
@@ -1408,6 +1409,44 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(r.stderr.contains("could not be moved to \(fx.plist.path)"), r.stderr)
         XCTAssertTrue(r.stderr.contains("put back"), r.stderr)
         XCTAssertTrue(r.stderr.contains("loaded again from the previous plist"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("is writable and rerun"), r.stderr)
+    }
+
+    /// As above, but the new job cannot be unloaded again: launchctl print
+    /// still lists it after the bootout. That job pins the new build, so
+    /// putting the previous bundle back would leave it refusing every run.
+    /// The new build stays, the previous bundle stays set aside (the state
+    /// an install killed mid-swap leaves, which the next run repairs; see
+    /// testInstallKeepsTheBundleThePlistOnDiskPinsAfterAnInterruptedSwap),
+    /// and nothing is loaded over the job.
+    func testInstallKeepsTheNewBuildWhenItsJobCannotBeUnloadedAfterAFailedPublish() throws {
+        try fx.prepareInstall()
+        try fx.writePreviousApp()
+        try "trusted".write(to: fx.plist, atomically: true, encoding: .utf8)
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        fx.setMode("launchctl", "loaded-tracked-unload-fails")
+        let agents = fx.plist.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: agents.appendingPathComponent(".com.insomnia.backstop.staging"), withIntermediateDirectories: true)
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: agents.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: agents.path) }
+        let previous = fx.appsDir.appendingPathComponent(".Insomnia.app.previous", isDirectory: true)
+
+        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        let calls = fx.calls()
+        XCTAssertEqual(calls.filter { $0.hasPrefix("launchctl bootstrap") }.count, 1, "the previous plist is not loaded over the job: \(calls)")
+        let firstLoad = try XCTUnwrap(calls.firstIndex { $0.hasPrefix("launchctl bootstrap") })
+        let unload = try XCTUnwrap(calls.lastIndex(of: "launchctl bootout gui/\(fx.uid)/com.insomnia.backstop"))
+        XCTAssertGreaterThan(unload, firstLoad, "the new job's unload was tried: \(calls)")
+        XCTAssertTrue(calls[unload...].contains("launchctl print gui/\(fx.uid)/com.insomnia.backstop"), "and checked: \(calls)")
+        XCTAssertEqual(try fx.installedBinaryFirstLine(), "#!/bin/bash", "the build the loaded job pins stays at $APP")
+        XCTAssertEqual(try fx.contents(of: fx.appsDir), [".Insomnia.app.previous", "Insomnia.app"], "the previous bundle stays set aside")
+        XCTAssertEqual(try String(contentsOf: previous.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "previous\n")
+        XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "trusted", "the trusted plist was never modified")
+        XCTAssertTrue(r.stderr.contains("not confirmed (launchctl print: yes)"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("stays at \(fx.app.path)"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("kept at \(previous.path)"), r.stderr)
         XCTAssertTrue(r.stderr.contains("is writable and rerun"), r.stderr)
     }
 
@@ -2090,6 +2129,10 @@ private final class ScriptFixture {
         // once, then fails with an error; bootstrap fails.
         // "loaded-bootstrap-always-fails": print always says loaded (a job
         // already exists) and every bootstrap fails, reload included.
+        // "loaded-tracked": the job starts loaded, bootout unloads it,
+        // bootstrap loads it (and fails while it is loaded), and print
+        // reports which. "loaded-tracked-unload-fails": the same, except
+        // that a bootout after a bootstrap fails and the job stays loaded.
         try writeFake("launchctl", """
         printf 'launchctl %s\\n' "$*" >> "\(calls)"
         mode="$(cat "\(r)/launchctl.mode" 2>/dev/null || echo ok)"
@@ -2117,6 +2160,16 @@ private final class ScriptFixture {
           prints=$(( $(cat "\(r)/print.count" 2>/dev/null || echo 0) + 1 )); echo "$prints" > "\(r)/print.count"
         fi
         case "${1:-}:$mode" in
+          bootout:loaded-tracked|bootout:loaded-tracked-unload-fails)
+            if [[ "$mode" == loaded-tracked-unload-fails && -e "\(r)/launchctl.bootstrapped" ]]; then
+              echo "Boot-out failed: 5: Input/output error" >&2; exit 5
+            fi
+            : > "\(r)/launchctl.unloaded"; exit 0 ;;
+          bootstrap:loaded-tracked|bootstrap:loaded-tracked-unload-fails)
+            [[ -e "\(r)/launchctl.unloaded" ]] || { echo "Bootstrap failed: 37: Operation already in progress" >&2; exit 37; }
+            rm -f "\(r)/launchctl.unloaded"; : > "\(r)/launchctl.bootstrapped"; exit 0 ;;
+          print:loaded-tracked|print:loaded-tracked-unload-fails)
+            if [[ -e "\(r)/launchctl.unloaded" ]]; then exit 113; fi; exit 0 ;;
           bootout:ok|bootout:loaded|bootout:loaded-bootstrap-fails-once|bootout:loaded-then-lost|bootout:no-then-error|bootout:loaded-bootstrap-always-fails) exit 0 ;;
           bootstrap:ok|bootstrap:loaded) exit 0 ;;
           bootstrap:loaded-then-lost|bootstrap:no-then-error) echo "Bootstrap failed: 5: Input/output error" >&2; exit 5 ;;
