@@ -128,6 +128,7 @@ is performed. Do not replace "not run" with "passed" based on source review.
 | Battery/thermal event behavior on supported hardware | Not run |
 | `SleepDisabled 1` set by hand with no session: left alone and reported at launch, not cleared | Not run |
 | Unreadable battery (IOKit miss) ends the session on a laptop after the second read; desktop unaffected | Not run |
+| Settings floor steppers keep the end floor below the Low Power Mode floor by moving the other stepper | Not run |
 | Install/upgrade/uninstall with recoverable failure conditions | Not run |
 
 Hardware tests must be supervised and must not endanger active user work. Use

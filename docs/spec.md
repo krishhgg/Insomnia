@@ -259,7 +259,7 @@ IOKit sends no event for a read that keeps failing.
 | condition | action | undo |
 |---|---|---|
 | battery below `lowPowerFloor` (default 40%) | `pmset -b lowpowermode 1` | charger connected, or session end |
-| battery below `endFloor` (default 10%) | end session, notify | — |
+| battery below `endFloor` (default 10%; 0 turns the end off) | end session, notify | — |
 | battery present but unreadable on two consecutive reads, on battery, `endFloor` above 0 | end session, notify | — |
 | thermal state `serious` | `lowpowermode 1` | thermal back to `nominal`/`fair`, or session end |
 | thermal state `critical` | end session, notify | — |
@@ -279,6 +279,14 @@ menu's own refresh reads the level but leaves the count where it is, so a
 menu opened during a transient miss is not the second one, and the count
 never moves without the floor rules running. An unreadable level never counts
 as below a floor, so it does not enable Low Power Mode by itself.
+
+A non-zero `endFloor` stays below `lowPowerFloor`, which gives Low Power Mode
+a chance to come on before the session ends. It is not a guarantee: a reading
+already below both floors, or one that crosses both between evaluations, ends
+the session without it. Settings enforces the order in 5% steps by moving the
+other floor when the two would cross (`endFloor` at most 95). A `config.json`
+that violates it is corrected at load by raising `lowPowerFloor` to `endFloor`
++ 5 (capped at 100), logged, and written back.
 
 Insomnia does not enable Low Power Mode merely because a session starts; the
 causes are the battery floor, a serious thermal state, and (by default) a closed

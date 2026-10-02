@@ -73,6 +73,16 @@ struct SettingsView: View {
         save()
     }
 
+    /// The floor steppers go through the Config setters, which move the
+    /// other floor when the two would cross.
+    private var lowPowerFloor: Binding<Int> {
+        Binding(get: { manager.config.lowPowerFloor }, set: { v in update { $0.setLowPowerFloor(v) } })
+    }
+
+    private var endFloor: Binding<Int> {
+        Binding(get: { manager.config.endFloor }, set: { v in update { $0.setEndFloor(v) } })
+    }
+
     // MARK: Sections
 
     private var sessionSection: some View {
@@ -184,12 +194,15 @@ struct SettingsView: View {
 
     private var powerSection: some View {
         Section("Battery and thermal") {
-            Stepper(value: bind(\.lowPowerFloor), in: 0...100, step: 5) {
+            Stepper(value: lowPowerFloor, in: 0...100, step: Config.floorStep) {
                 LabeledContent("Low Power Mode below", value: "\(manager.config.lowPowerFloor)%")
             }
-            Stepper(value: bind(\.endFloor), in: 0...100, step: 5) {
+            Stepper(value: endFloor, in: 0...Config.maxEndFloor, step: Config.floorStep) {
                 LabeledContent("End session below", value: "\(manager.config.endFloor)%")
             }
+            Text("0 turns the battery end off. The end floor stays below the Low Power Mode floor. Moving one onto the other moves it along.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
             Toggle("Thermal rules (Low Power Mode when hot, end when critical)", isOn: bind(\.thermalRules))
         }
     }

@@ -152,6 +152,11 @@ The defaults are worth knowing:
   until it is readable again. A desktop has no battery and no floor. Serious
   thermal state requests Low Power Mode; critical thermal state ends the
   session. These rules require the app to be running.
+  Setting the end floor to 0 turns the battery end off. Otherwise the end
+  floor stays below the Low Power Mode floor. The Settings steppers move the
+  other floor when the two would cross, and a hand-edited `config.json` with
+  the floors out of order is corrected at launch, and logged, by raising the
+  Low Power Mode floor.
 
 To exercise the lid actions without closing the lid, run
 `scripts/simulate-lid.sh closed` and then `scripts/simulate-lid.sh open` during
