@@ -346,14 +346,25 @@ small settings window:
 - tmux targets
 - launch at login (`SMAppService.mainApp`). macOS ties the login item to
   the bundle's signature and location, and `install.sh` ad-hoc signs a
-  fresh bundle on every run, so at launch, when the flag is on and
-  `SMAppService.mainApp.status` is anything but enabled, the app registers
-  again and logs the outcome. The Settings switch shows the status macOS
-  reports, not the flag; a registration waiting for approval shows a note
-  with a button that opens System Settings > General > Login Items, and a
-  register or unregister that throws shows its error under the switch.
-  The flag is persisted only when macOS accepted the change (including
-  one that still waits for approval). With the flag off nothing is
+  fresh bundle on every run, so an upgrade can drop the registration.
+  config.json keeps `launchAtLoginInstall`, the code directory hash and
+  bundle path of the install whose registration macOS last accepted. At
+  launch, with the flag on and `SMAppService.mainApp.status` neither
+  enabled nor waiting for approval, that record decides: a different
+  install means the reinstall lost the registration and the app registers
+  again; the same install means the user removed the item in System
+  Settings, and the app turns the flag off rather than put it back; no
+  record (a config from before the field) means the two cannot be told
+  apart, so the app leaves the item alone and Settings shows the status.
+  Every outcome is logged. The Settings switch shows what macOS has on
+  file (enabled or waiting for approval), not the flag; a registration
+  waiting for approval shows a note with a button that opens System
+  Settings > General > Login Items, and turning the switch off withdraws
+  it; a register or unregister that throws shows its error under the
+  switch. The flag and the install are persisted only when macOS accepted
+  the change. The status is re-read when the Settings window appears and
+  whenever the app becomes active, so an approval or removal made in
+  System Settings shows without a relaunch. With the flag off nothing is
   registered or unregistered at launch.
 
 ### 11. Menu bar UI: inline time entry

@@ -47,6 +47,12 @@ struct Config: Codable, Equatable, Sendable {
 
     // App
     var launchAtLogin: Bool = false
+    /// The install (code directory hash and bundle path) whose login item
+    /// macOS last had on file, written when a registration is accepted.
+    /// At launch it tells a reinstall, which the app heals by registering
+    /// again, from the user removing the item in System Settings, which
+    /// the app respects. nil until the switch is turned on once.
+    var launchAtLoginInstall: String?
 
     static let defaultPresets: [TimeInterval] = [
         30 * 60,
@@ -113,5 +119,6 @@ struct Config: Codable, Equatable, Sendable {
         nudgeThreshold = try c.decodeIfPresent(TimeInterval.self, forKey: .nudgeThreshold) ?? d.nudgeThreshold
         tmuxTargets = try c.decodeIfPresent([String].self, forKey: .tmuxTargets) ?? d.tmuxTargets
         launchAtLogin = try c.decodeIfPresent(Bool.self, forKey: .launchAtLogin) ?? d.launchAtLogin
+        launchAtLoginInstall = try c.decodeIfPresent(String.self, forKey: .launchAtLoginInstall)
     }
 }

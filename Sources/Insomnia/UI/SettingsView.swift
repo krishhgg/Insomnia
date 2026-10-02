@@ -37,7 +37,8 @@ struct SettingsView: View {
             hotspotPassword = (try? secrets.load()) ?? ""
             refreshWouldFreeze()
             // The user may have approved or removed the item in System
-            // Settings since the launch-time check.
+            // Settings since the launch-time check (LoginItem also re-reads
+            // whenever the app becomes active, for a window left open).
             loginItem.refresh()
         }
         // The preview depends on the toggle, both lists and what is running:
@@ -285,18 +286,18 @@ struct SettingsView: View {
         }
     }
 
-    /// The switch shows what macOS reports (`LoginItem.isEnabled`), so a
-    /// registration that an upgrade dropped reads as off even while
-    /// config.json still says on; the note below explains the difference.
+    /// The switch shows what macOS has on file (`LoginItem.isRegistered`:
+    /// enabled or waiting for approval), so a registration that an upgrade
+    /// dropped reads as off even while config.json still says on, and a
+    /// pending one can be withdrawn by turning the switch off; the note
+    /// below explains the state.
     private var launchAtLogin: Binding<Bool> {
         Binding(
-            get: { loginItem.isEnabled },
+            get: { loginItem.isRegistered },
             set: { on in
                 // Persist only what macOS accepted; a refused change leaves
                 // the flag as it was and its error on screen.
-                if loginItem.set(on) {
-                    update { $0.launchAtLogin = on }
-                }
+                update { config in _ = loginItem.set(on, config: &config) }
             }
         )
     }
@@ -309,13 +310,13 @@ struct SettingsView: View {
             Text("Login item: \(error)").font(.caption).foregroundStyle(.red)
         } else if loginItem.needsApproval {
             HStack {
-                Text("Waiting for approval in System Settings > General > Login Items.")
+                Text("Waiting for approval in System Settings > General > Login Items. Turn the switch off to withdraw it.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()
                 Button("Open Login Items") { loginItem.openLoginItems() }
             }
-        } else if manager.config.launchAtLogin, !loginItem.isEnabled {
+        } else if manager.config.launchAtLogin, !loginItem.isRegistered {
             Text("Login item: macOS reports it \(loginItem.status.description). Turn the switch on to register it again.")
                 .font(.caption)
                 .foregroundStyle(.orange)

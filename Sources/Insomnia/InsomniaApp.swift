@@ -49,9 +49,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.accessory)
         Log.info("launched")
         // The login item is tied to the bundle's signature, which install.sh
-        // renews on every run: register again if the flag is on and macOS
-        // no longer reports it enabled.
-        loginItem.healAtLaunch(wanted: manager.config.launchAtLogin)
+        // renews on every run: register again if the flag is on, macOS no
+        // longer reports the item and the install changed; follow the user
+        // if they removed the item for the install macOS had on file.
+        var config = manager.config
+        if loginItem.healAtLaunch(config: &config) {
+            manager.config = config
+            do {
+                try manager.store.saveConfig(config)
+            } catch {
+                Log.error("could not save config after the launch at login check: \(error.localizedDescription)")
+            }
+        }
         let settings = SettingsWindow { [manager, secrets, locationPermission, loginItem] in
             AnyView(
                 SettingsView(
