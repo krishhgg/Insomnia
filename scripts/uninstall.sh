@@ -136,10 +136,12 @@ journal_shape_problems() { # file
 journal_problems() {
   local key value shape
   if [[ -e "$SESSION" ]]; then
-    if extract "$SESSION" endsAt >/dev/null; then
+    if ! cat "$SESSION" >/dev/null 2>&1; then
+      echo "session.json is still present and cannot be read (permissions or I/O)"
+    elif extract "$SESSION" endsAt >/dev/null; then
       echo "session.json is still present"
     else
-      echo "session.json is still present and unreadable"
+      echo "session.json is still present and is not a session (it does not parse)"
     fi
   fi
   [[ -e "$STATE" ]] || return 0
@@ -218,9 +220,11 @@ What to do, then rerun this script:
   - Unreadable state.json: neither the app nor the recovery agent repairs or
     removes it. Repair it by hand from the log, or move it away yourself once
     you know its changes are undone.
-  - Unreadable session.json: the recovery agent renames it to
+  - session.json that does not parse: the recovery agent renames it to
     session.json.unreadable-<time> as soon as the journal is clean, and the
     app does the same at launch. It needs no action of its own.
+  - session.json that cannot be read at all: neither the app nor the agent
+    decides anything from it. Restore access to it, then rerun.
   - Log: $LOG_DIR/insomnia.log
 MSG
   exit 1

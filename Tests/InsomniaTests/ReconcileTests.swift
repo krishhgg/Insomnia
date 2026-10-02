@@ -335,7 +335,34 @@ final class ReconcileTests: XCTestCase {
         XCTAssertTrue(h.guardFake.calls.contains("disablesleep 0"), "\(h.guardFake.calls)")
         XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
         XCTAssertFalse(h.guardFake.sleepDisabled)
-        XCTAssertEqual(h.notifier.posts.filter { $0.title == SessionManager.sessionFileTitle }.count, 1)
+        let moveNotice = h.notifier.posts.filter { $0.title == SessionManager.sessionFileTitle }
+        XCTAssertEqual(moveNotice.count, 1)
+        XCTAssertFalse(moveNotice.first?.body.lowercased().contains("restored") == true,
+                       "the move notice must not speak for the restore, which has its own outcome: \(moveNotice)")
+    }
+
+    /// A session.json that exists but cannot be read at all (here: it is a
+    /// directory) may be a valid session. Nothing is moved, decided or
+    /// undone; the user is told, and the next launch retries.
+    func testSessionThatCannotBeReadAtAllIsLeftInPlaceAndNothingIsDecided() async throws {
+        try FileManager.default.createDirectory(at: h.home.paths.sessionFile, withIntermediateDirectories: true)
+        var st = RuntimeState()
+        st.sleepDisabledByUs = true
+        try h.store.saveState(st)
+        h.guardFake.sleepDisabled = true
+
+        let m = h.makeManager()
+        await m.reconcile()
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: h.home.paths.sessionFile.path), "session.json was moved or removed")
+        XCTAssertEqual(try movedAsideSessions, [])
+        XCTAssertEqual(h.guardFake.calls, [], "something was undone or checked from a session that could not be read")
+        XCTAssertTrue(h.guardFake.sleepDisabled)
+        XCTAssertEqual(try h.store.loadState(), st, "the journal was changed")
+        XCTAssertTrue(try XCTUnwrap(m.lastError).contains("could not be read"), m.lastError ?? "")
+        let posts = h.notifier.posts.filter { $0.title == SessionManager.sessionFileTitle }
+        XCTAssertEqual(posts.count, 1, "\(h.notifier.posts)")
+        XCTAssertTrue(posts.first?.body.contains("left in place") == true, posts.first?.body ?? "")
     }
 
     /// An earlier moved-aside file with the same stamp is never overwritten;

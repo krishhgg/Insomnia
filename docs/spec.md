@@ -309,8 +309,10 @@ Reconcile runs at every Insomnia launch:
    the lock to `session.json.unreadable-<UTC stamp>` (never deleted, never
    overwriting an earlier copy), the user is told where, and the journal is
    restored as with no session. `backstop.sh` does the same once the journal
-   is clean. An unreadable journal still refuses every transaction and leaves
-   both files in place.
+   is clean. A session file that exists but cannot be read at all proves
+   nothing and is left in place; neither the app nor `backstop.sh` decides
+   or undoes anything from it. An unreadable journal still refuses every
+   transaction and leaves both files in place.
 2. Session valid → establish the independent recovery agent before reapplying
    the sleep guard, then resume observers. If the lid is open, restore recorded
    lid-close actions. Arming or restoration errors must remain visible.

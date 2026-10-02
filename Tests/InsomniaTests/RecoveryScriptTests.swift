@@ -392,6 +392,42 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: fx.home.appendingPathComponent(added[0]), encoding: .utf8), "not json")
     }
 
+    /// A session.json that exists but cannot be read at all (here: it is a
+    /// directory) may be a valid session. The backstop decides nothing,
+    /// undoes nothing, moves nothing and exits 1 for the next run.
+    func testSessionThatCannotBeReadAtAllIsLeftInPlaceAndNothingIsUndone() throws {
+        try FileManager.default.createDirectory(at: fx.session, withIntermediateDirectories: true)
+        let dirty = #"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#
+        try fx.writeState(dirty)
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 1, r.stderr + fx.log())
+        XCTAssertEqual(fx.calls(), [], "something was undone from a session that could not be read")
+        XCTAssertTrue(fx.exists(fx.session))
+        XCTAssertEqual(try movedAsideSessions(), [])
+        XCTAssertEqual(try String(contentsOf: fx.state, encoding: .utf8), dirty)
+        XCTAssertTrue(fx.log().contains("cannot be read"), fx.log())
+    }
+
+    /// The same file during an uninstall: it stops before removing anything
+    /// and names the problem as an access failure, not a broken file.
+    func testUninstallStopsWhenSessionCannotBeReadAtAll() throws {
+        try fx.installMachinery()
+        try FileManager.default.createDirectory(at: fx.session, withIntermediateDirectories: true)
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+
+        let r = try fx.run(fx.uninstall)
+
+        XCTAssertNotEqual(r.status, 0)
+        XCTAssertTrue(fx.exists(fx.session))
+        XCTAssertTrue(fx.exists(fx.plist))
+        XCTAssertTrue(fx.exists(fx.sudoers))
+        XCTAssertTrue(fx.exists(fx.app))
+        XCTAssertTrue(r.stderr.contains("session.json is still present and cannot be read"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("Restore access to it"), r.stderr)
+    }
+
     /// Uninstall runs the backstop first, which moves the file aside, so an
     /// unreadable session.json with a clean journal no longer blocks it.
     /// Without --purge the moved-aside copy is kept and said so.
@@ -443,7 +479,7 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(fx.exists(fx.session))
         XCTAssertTrue(fx.exists(fx.plist))
         XCTAssertTrue(fx.exists(fx.sudoers))
-        XCTAssertTrue(r.stderr.contains("session.json is still present and unreadable"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("session.json is still present and is not a session"), r.stderr)
         XCTAssertTrue(r.stderr.contains("sleepDisabledByUs is still true"), r.stderr)
         XCTAssertTrue(r.stderr.contains("renames it to"), r.stderr)
         XCTAssertFalse(r.stderr.contains("repair the file"), r.stderr)

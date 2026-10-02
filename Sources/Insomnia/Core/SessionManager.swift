@@ -866,15 +866,28 @@ final class SessionManager {
         var onDisk: Session?
         do {
             onDisk = try store.loadSession()
-        } catch {
-            // Not a session, so nothing in it can be trusted and nothing in
-            // it is needed: the journal, not the session file, says what to
-            // undo. Moved aside (never deleted or overwritten) and treated
-            // as no session; a dirty journal is still restored below. An
-            // unreadable state.json never gets here: exclusive() refuses
-            // the transaction first, and the session file stays with it.
-            moveAsideUnreadableSession(error)
+        } catch StoreError.unreadable(_, let detail) {
+            // The bytes were read and are not a session, so nothing in them
+            // can be trusted and nothing in them is needed: the journal, not
+            // the session file, says what to undo. Moved aside (never
+            // deleted or overwritten) and treated as no session; a dirty
+            // journal is still restored below. An unreadable state.json
+            // never gets here: exclusive() refuses the transaction first,
+            // and the session file stays with it.
+            moveAsideUnreadableSession(detail)
             onDisk = nil
+        } catch {
+            // The file exists but could not be read at all (permissions,
+            // I/O). That proves nothing about what it says: it may be a
+            // valid session. Nothing is decided or changed; the file and
+            // the journal stay for the next launch.
+            let detail = error.localizedDescription
+            fail("reconcile refused, nothing changed: session.json could not be read (\(detail)); it was left in place")
+            notifier.post(
+                title: Self.sessionFileTitle,
+                body: "session.json could not be read (\(detail)). Nothing was changed and it was left in place; restore access to the file and open Insomnia again."
+            )
+            return
         }
 
         if let s = onDisk, !s.isExpired(at: now) {
@@ -952,14 +965,15 @@ final class SessionManager {
         }
     }
 
-    private func moveAsideUnreadableSession(_ error: Error) {
-        let detail = error.localizedDescription
+    /// The outcome of restoring the journal is reported by the end itself,
+    /// not here: this only says where the file went.
+    private func moveAsideUnreadableSession(_ detail: String) {
         do {
             let moved = try store.moveAsideUnreadableSession(now: clock())
             Log.error("session.json unreadable (\(detail)); moved to \(moved.path) and treated as no session")
             notifier.post(
                 title: Self.sessionFileTitle,
-                body: "session.json could not be read (\(detail)). It was moved to \(moved.path) and treated as no session; anything journaled is restored."
+                body: "session.json is not a valid session file (\(detail)). It was moved to \(moved.path); Insomnia treats it as no session."
             )
         } catch let moveError {
             fail("session.json unreadable (\(detail)) and could not be moved aside: \(moveError.localizedDescription); treating as no session")

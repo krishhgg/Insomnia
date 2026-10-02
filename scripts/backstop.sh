@@ -44,11 +44,14 @@
 #     the failure is visible and the next periodic run retries.
 #   - state.json unreadable, not a JSON object, or with a known key of the
 #     wrong type: nothing is touched, exit 1.
-#   - session.json present but not a session (no parseable endsAt): it is
-#     treated as expired. Once the journal is clean (already, or after the
-#     undo above succeeded) the file is renamed to
+#   - session.json present but not a session (readable, no parseable
+#     endsAt): it is treated as expired. Once the journal is clean (already,
+#     or after the undo above succeeded) the file is renamed to
 #     session.json.unreadable-<UTC stamp>, never deleted or overwritten, so
 #     the next run sees no session. While the journal stays dirty it stays.
+#   - session.json present but not readable at all (permissions, I/O): that
+#     proves nothing about what it says, so nothing is decided, nothing is
+#     undone, exit 1; the next run retries.
 #
 # Limitation: the shell compares process start time to the second and the
 # boot session; only the app also compares the microseconds.
@@ -273,7 +276,11 @@ journal_shape_problems() { # file
 # session_state: none | valid | expired | malformed
 session_state=none
 ends_at=""
-if [[ -f "$SESSION" ]]; then
+if [[ -e "$SESSION" ]]; then
+  if ! cat "$SESSION" >/dev/null 2>&1; then
+    log error "session.json exists but cannot be read; it may be a valid session, so nothing is decided and nothing is undone. Restore access to $SESSION"
+    exit 1
+  fi
   session_state=malformed
   ends_at="$(extract "$SESSION" endsAt || true)"
   if [[ -n "$ends_at" ]]; then
