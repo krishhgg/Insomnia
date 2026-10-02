@@ -344,8 +344,10 @@ Backstop, independent of the app:
   plist (`codesign --verify --strict -R=...`; for an ad-hoc build, that
   build's cdhash) and execs the script when that passes; otherwise it logs
   one line and exits without running anything. No executable lives in a
-  writable directory. The plist is a per-user file like any LaunchAgent; the
-  app rewrites a plist that does not match at the next arm.
+  writable directory. The plist is a per-user file like any LaunchAgent; at
+  the next arm the app rewrites a plist that does not match, and reloads a
+  loaded job whose command line (the arguments `launchctl print` lists)
+  differs from the plist's.
 - What the app pins is the requirement of the code it is running
   (SecCodeCopySelf), read after SecCodeCheckValidity confirmed the bundle on
   disk is that code, and the bundle must pass the agent's own check against

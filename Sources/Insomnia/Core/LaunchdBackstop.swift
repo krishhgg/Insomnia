@@ -112,12 +112,17 @@ struct LaunchdBackstop: BackstopScheduling {
             throw BackstopError(message: "the recovery agent cannot pin \(bundle.path): \(error.localizedDescription). Reinstall with scripts/install.sh")
         }
         let desired = Self.plistDictionary(label: label, target: BackstopTarget(bundle: bundle, requirement: requirement))
-        if plistOnDiskMatches(desired), try await isLoaded() {
+        // Armed when the plist the next login loads is this build's and the
+        // loaded job runs its command line. A loaded label alone may be
+        // another build's job, pinning a bundle or requirement this one does
+        // not satisfy: install.sh can leave one loaded when it stops between
+        // its bootstrap and publishing the plist.
+        if plistOnDiskMatches(desired), try await loadedArguments() == desired["ProgramArguments"] as? [String] {
             return
         }
-        // The plist at `plistURL` is what the next arm() trusts when
-        // `launchctl print` says the label is loaded, so it may only ever
-        // hold a plist launchd actually loaded. Load through a private
+        // The plist at `plistURL` is what the next arm() trusts when the
+        // loaded job runs its command line, so it may only ever hold a
+        // plist launchd actually loaded. Load through a private
         // candidate and publish it with one rename after bootstrap succeeded.
         // A failed replacement (bootout left the old job loaded, bootstrap
         // refused, volume stopped taking writes) then leaves the trusted path
@@ -210,9 +215,31 @@ struct LaunchdBackstop: BackstopScheduling {
 
     // MARK: launchctl
 
-    func isLoaded() async throws -> Bool {
+    /// The command line of the loaded job, from `launchctl print`: nil when
+    /// no job with the label is loaded or the output has no arguments.
+    func loadedArguments() async throws -> [String]? {
         let r = try await run(Self.launchctl, ["print", "gui/\(uid)/\(label)"])
-        return r.succeeded
+        return r.succeeded ? Self.arguments(fromPrint: r.stdout) : nil
+    }
+
+    /// The `arguments` block of `launchctl print <service>` output: opened by
+    /// `\targuments = {`, one argument per line indented by two tabs, closed
+    /// by `\t}`. Anything else inside the block, or no closing line, is an
+    /// output this does not know, so nil (and arm() reloads).
+    static func arguments(fromPrint output: String) -> [String]? {
+        var arguments: [String]?
+        for line in output.split(separator: "\n", omittingEmptySubsequences: false) {
+            if arguments == nil {
+                if line == "\targuments = {" { arguments = [] }
+            } else if line == "\t}" {
+                return arguments
+            } else if line.hasPrefix("\t\t") {
+                arguments?.append(String(line.dropFirst(2)))
+            } else {
+                return nil
+            }
+        }
+        return nil
     }
 
     /// bootout by service target (ignored if not loaded: the trusted path may

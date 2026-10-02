@@ -14,6 +14,9 @@ final class LaunchdBackstopTests: XCTestCase {
     let calls = Locked<[[String]]>([])
     /// Whether `launchctl print` reports the job loaded.
     let loaded = Locked(false)
+    /// The ProgramArguments of the plist the loaded job was bootstrapped
+    /// from, which `launchctl print` lists under `arguments`.
+    let loadedJob = Locked<[String]>([])
     let bootstrapFails = Locked(false)
     /// bootout returns an error and leaves the job loaded, as launchd does
     /// for a job that is mid-transition.
@@ -30,6 +33,7 @@ final class LaunchdBackstopTests: XCTestCase {
         home = TempHome()
         calls.value = []
         loaded.value = false
+        loadedJob.value = []
         bootstrapFails.value = false
         bootoutFails.value = false
         onBootout.value = nil
@@ -50,7 +54,7 @@ final class LaunchdBackstopTests: XCTestCase {
             try FileManager.default.createDirectory(at: script.deletingLastPathComponent(), withIntermediateDirectories: true)
             try Data("#!/bin/bash\n".utf8).write(to: script)
         }
-        let calls = calls, loaded = loaded, bootstrapFails = bootstrapFails, bootoutFails = bootoutFails
+        let calls = calls, loaded = loaded, loadedJob = loadedJob, bootstrapFails = bootstrapFails, bootoutFails = bootoutFails
         let onBootout = onBootout, onBootstrapped = onBootstrapped, trustedPlistAtBootstrap = trustedPlistAtBootstrap
         let trusted = home.paths.backstopPlist
         let label = "com.insomnia.backstop"
@@ -81,7 +85,8 @@ final class LaunchdBackstopTests: XCTestCase {
             calls.value.append([exe] + args)
             switch args.first {
             case "print":
-                return ShellResult(status: loaded.value ? 0 : 113, stdout: "", stderr: loaded.value ? "" : "Could not find service")
+                guard loaded.value else { return ShellResult(status: 113, stdout: "", stderr: "Could not find service") }
+                return ShellResult(status: 0, stdout: Self.printOutput(arguments: loadedJob.value), stderr: "")
             case "bootstrap":
                 trustedPlistAtBootstrap.value.append(try? Data(contentsOf: trusted))
                 guard args.count == 3, launchdAccepts(args[2]) else {
@@ -91,6 +96,9 @@ final class LaunchdBackstopTests: XCTestCase {
                 // launchd refuses to bootstrap a label that is still loaded.
                 if loaded.value { return ShellResult(status: 37, stdout: "", stderr: "Bootstrap failed: 37: Operation already in progress") }
                 loaded.value = true
+                let plist = (try? Data(contentsOf: URL(fileURLWithPath: args[2])))
+                    .flatMap { try? PropertyListSerialization.propertyList(from: $0, format: nil) as? [String: Any] }
+                loadedJob.value = plist?["ProgramArguments"] as? [String] ?? []
                 if let hook = onBootstrapped.value { onBootstrapped.value = nil; hook() }
                 return ShellResult(status: 0, stdout: "", stderr: "")
             case "bootout":
@@ -110,6 +118,29 @@ final class LaunchdBackstopTests: XCTestCase {
                 return ShellResult(status: 1, stdout: "", stderr: "unexpected \(args)")
             }
         }
+    }
+
+    /// `launchctl print gui/501/<label>` for a loaded job, in the layout
+    /// launchctl prints (checked 2026-10-02): top-level keys indented by one
+    /// tab, each argument on its own line indented by two.
+    static func printOutput(arguments: [String]) -> String {
+        """
+        gui/501/com.insomnia.backstop = {
+        \tactive count = 0
+        \tpath = /Users/tester/Library/LaunchAgents/.com.insomnia.backstop.staging/com.insomnia.backstop.candidate-1.plist
+        \ttype = LaunchAgent
+        \tstate = not running
+
+        \tprogram = /bin/sh
+        \targuments = {
+        \(arguments.map { "\t\t\($0)\n" }.joined())\t}
+
+        \tdefault environment = {
+        \t\tPATH => /usr/bin:/bin:/usr/sbin:/sbin
+        \t}
+        }
+
+        """
     }
 
     private func plistOnDisk() throws -> [String: Any] {
@@ -350,6 +381,49 @@ final class LaunchdBackstopTests: XCTestCase {
         }
         XCTAssertEqual(calls.value, [], "nothing is asked of launchd: the plist is right, the bundle is wrong")
         XCTAssertEqual(try Data(contentsOf: home.paths.backstopPlist), trusted, "the trusted plist is left for the reinstall")
+    }
+
+    /// The plist on disk is this build's, but the loaded job runs another
+    /// build's command line: install.sh stopped after its bootstrap and
+    /// before it published its plist, or a job was loaded by hand from
+    /// another plist with the label. That job verifies a bundle or
+    /// requirement this build does not satisfy, so arm() reloads it from
+    /// this build's plist.
+    func testLoadedJobRunningAnotherBuildsCommandLineIsReloadedThoughThePlistIsCurrent() async throws {
+        let b = try makeBackstop()
+        try await b.arm()
+        let trusted = try Data(contentsOf: home.paths.backstopPlist)
+        loadedJob.value = ["/bin/sh", "-c", LaunchdBackstop.agentProgram, "sh", "cdhash H\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"", home.paths.appBundle.path]
+        calls.value = []
+
+        try await b.arm()
+
+        XCTAssertEqual(calls.value.map { $0[1] }, ["print", "bootout", "bootstrap"], "a loaded label is not this build's agent")
+        XCTAssertEqual(loadedJob.value, expectedArguments)
+        XCTAssertEqual(try Data(contentsOf: home.paths.backstopPlist), trusted)
+
+        calls.value = []
+        try await b.arm()
+        XCTAssertEqual(calls.value.map { $0[1] }, ["print"], "the job now runs this build's command line")
+    }
+
+    /// The parser reads the arguments block in the layout launchctl prints,
+    /// with arguments holding spaces, quotes and `$` as the agent's do, and
+    /// gives up on output it does not know rather than guess. `captured` is
+    /// the start of `launchctl print` for a loaded Apple agent (2026-10-02).
+    func testPrintArgumentsAreReadFromLaunchctlsLayout() {
+        XCTAssertEqual(
+            LaunchdBackstop.arguments(fromPrint: Self.printOutput(arguments: expectedArguments)),
+            expectedArguments
+        )
+        let captured = "gui/501/com.apple.webkit.webpushd = {\n\tactive count = 0\n\tpath = /System/Volumes/Preboot/Cryptexes/App/System/Library/LaunchAgents/com.apple.webkit.webpushd.plist\n\ttype = LaunchAgent\n\tstate = not running\n\n\tprogram = /System/Cryptexes/App/usr/libexec/webpushd\n\targuments = {\n\t\t/System/Cryptexes/App/usr/libexec/webpushd\n\t\t--machServiceName\n\t\tcom.apple.webkit.webpushd.service\n\t}\n\n\tstderr path = /dev/null\n"
+        XCTAssertEqual(
+            LaunchdBackstop.arguments(fromPrint: captured),
+            ["/System/Cryptexes/App/usr/libexec/webpushd", "--machServiceName", "com.apple.webkit.webpushd.service"]
+        )
+        XCTAssertNil(LaunchdBackstop.arguments(fromPrint: "gui/501/com.insomnia.backstop = {\n\tprogram = /bin/sh\n}\n"), "no arguments block")
+        XCTAssertNil(LaunchdBackstop.arguments(fromPrint: "x = {\n\targuments = {\n\t\t/bin/sh\n"), "no closing line")
+        XCTAssertNil(LaunchdBackstop.arguments(fromPrint: "x = {\n\targuments = {\n\t\t/bin/sh\n\tprogram = /bin/sh\n\t}\n}\n"), "a line that is not an argument")
     }
 
     func testArmBootstrapsWhenPlistIsCurrentButJobIsNotLoaded() async throws {
