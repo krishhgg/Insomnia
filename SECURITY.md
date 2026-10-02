@@ -20,9 +20,16 @@ Hotspot passwords are stored in the login Keychain.
 The recovery LaunchAgent runs only the `backstop.sh` sealed inside the signed
 app bundle, after `codesign --verify --strict` passes against the code
 requirement pinned in its plist (the build's cdhash for an ad-hoc signature).
-An edited bundle or script is refused and logged. The plist itself lives in
-`~/Library/LaunchAgents` and, like every per-user LaunchAgent, can be edited
-by any program running as that user.
+An edited bundle or script is refused and logged. The app pins the code it is
+running (its own designated requirement, after confirming that the bundle on
+disk is still that code and passes the agent's check), so a bundle edited or
+re-signed under the running app is refused, not re-pinned. The plist itself
+lives in `~/Library/LaunchAgents` and, like every per-user LaunchAgent, can be
+edited by any program running as that user. With ad-hoc signatures these
+checks are integrity against accidents and against the app relaying a
+tampered bundle; they are not a boundary against a process running as the
+same user, which can edit the plist, load its own agent, replace and relaunch
+the app, and invoke the four pmset commands directly.
 
 Passing automated checks or a secret scan does not establish the absence of
 vulnerabilities. Do not probe recovery by disrupting someone else's processes,

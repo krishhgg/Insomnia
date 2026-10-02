@@ -232,6 +232,72 @@ final class PackagingTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: ran.path))
     }
 
+    // MARK: - What arm() pins (CodeRequirement.pin, real codesign)
+
+    /// Reading a requirement does not validate the bundle: a sealed script
+    /// edited after signing still reads its old requirement, and an agent
+    /// pinned to it refuses every run. pin() runs the agent's check as well
+    /// and refuses the bundle, so arm() fails with the reason.
+    func testPinRefusesABundleWhoseSealedScriptWasEditedAfterSigning() throws {
+        let bundle = try makeSignedBundle()
+        let requirement = try CodeRequirement.designated(ofCodeAt: bundle)
+        // The test host is not an app bundle, so pin() takes the development
+        // path: the requirement comes from the bundle on disk.
+        XCTAssertEqual(try CodeRequirement.pin(bundle: bundle), requirement)
+
+        let script = Paths.backstopScript(inBundle: bundle)
+        try (String(contentsOf: script, encoding: .utf8) + "echo tampered\n").write(to: script, atomically: true, encoding: .utf8)
+        XCTAssertEqual(try CodeRequirement.designated(ofCodeAt: bundle), requirement, "the requirement alone still reads")
+        XCTAssertThrowsError(try CodeRequirement.verify(codeAt: bundle, satisfies: requirement)) { error in
+            XCTAssertTrue(error.localizedDescription.contains("sealed resource"), error.localizedDescription)
+        }
+        XCTAssertThrowsError(try CodeRequirement.pin(bundle: bundle)) { error in
+            XCTAssertTrue(error.localizedDescription.contains(bundle.path), error.localizedDescription)
+            XCTAssertTrue(error.localizedDescription.contains("sealed resource"), error.localizedDescription)
+        }
+    }
+
+    /// The installed app pins the code it is running, not what is on disk.
+    /// A same-user process can replace the sealed script and re-sign the
+    /// bundle ad hoc under the running app; the bundle then carries a new
+    /// requirement, and pin() refuses it instead of publishing it.
+    func testPinOfTheRunningAppRefusesABundleReSignedSinceLaunch() throws {
+        let bundle = try makeSignedBundle()
+        let launched = CodeRequirement.RunningCode(path: bundle, requirement: try CodeRequirement.designated(ofCodeAt: bundle))
+        XCTAssertEqual(try CodeRequirement.pin(bundle: bundle, running: { launched }, mainBundle: bundle), launched.requirement)
+
+        let script = Paths.backstopScript(inBundle: bundle)
+        try (String(contentsOf: script, encoding: .utf8) + "echo tampered\n").write(to: script, atomically: true, encoding: .utf8)
+        let reSign = try run("/usr/bin/codesign", ["--force", "--sign", "-", bundle.path])
+        XCTAssertEqual(reSign.status, 0, reSign.output)
+        let replacement = try CodeRequirement.designated(ofCodeAt: bundle)
+        XCTAssertNotEqual(replacement, launched.requirement, "re-signing gives the bundle a new cdhash")
+        XCTAssertNoThrow(try CodeRequirement.verify(codeAt: bundle, satisfies: replacement), "the replacement is a valid bundle in its own right")
+        XCTAssertThrowsError(try CodeRequirement.pin(bundle: bundle, running: { launched }, mainBundle: bundle)) { error in
+            XCTAssertTrue(error.localizedDescription.contains("failed to satisfy"), error.localizedDescription)
+        }
+
+        // A process running from one bundle never pins another.
+        let other = try makeSignedBundle(named: "Other")
+        XCTAssertThrowsError(try CodeRequirement.pin(bundle: other, running: { launched }, mainBundle: other)) { error in
+            XCTAssertTrue(error.localizedDescription.contains("runs from \(bundle.path)"), error.localizedDescription)
+        }
+    }
+
+    /// CodeRequirement.running() is the kernel's view of this process; the
+    /// bundle re-signed under a running app fails its SecCodeCheckValidity,
+    /// which the test host cannot stage against itself. What it can check:
+    /// the reading is consistent (the code at the reported path satisfies
+    /// the reported requirement) and the host is not an app bundle, so the
+    /// default pin() in these tests reads bundles from disk.
+    func testRunningCodeSatisfiesItsOwnRequirement() throws {
+        let me = try CodeRequirement.running()
+        XCTAssertTrue(FileManager.default.fileExists(atPath: me.path.path), me.path.path)
+        XCTAssertFalse(me.requirement.isEmpty)
+        XCTAssertNoThrow(try CodeRequirement.verify(codeAt: me.path, satisfies: me.requirement))
+        XCTAssertNotEqual(Bundle.main.bundleURL.pathExtension, "app")
+    }
+
     // MARK: - Helpers
 
     private func bigEndian32(_ data: Data, at offset: Int) -> UInt32 {

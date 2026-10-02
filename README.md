@@ -86,6 +86,17 @@ in `~/Library/LaunchAgents` is still a per-user file that any program running
 as you can edit, like every LaunchAgent; the app rewrites it at the next
 session start when it does not match, which is a repair, not a tamper check.
 
+What the app pins is the requirement of the code it is itself running, read
+through the Security framework after checking that the bundle on disk is still
+that code and still passes the agent's check. A bundle whose sealed script was
+edited, or that was re-signed under the running app, is refused rather than
+pinned: the app does not start a session, or reports the end as incomplete,
+and names the reason, until you reinstall. With ad-hoc signatures this guards
+against accidental edits and against the app relaying a tampered bundle into
+the agent, not against a process running as you: that process can edit the
+plist, load its own agent, quit the app and launch a replacement, and run the
+four `pmset` commands itself.
+
 An upgrade asks the running app to quit and stops if it refuses. Unresolved
 recovery prevents replacing the existing recovery agent; follow the reported
 instructions before retrying.

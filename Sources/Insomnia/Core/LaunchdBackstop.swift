@@ -10,6 +10,12 @@ import Foundation
 /// signature against the requirement pinned in the plist and only then
 /// execs the script, so a backstop.sh edited on disk is never run by
 /// launchd. Nothing executable lives in a writable support directory.
+///
+/// What the app pins is the requirement of the code it is itself running
+/// (CodeRequirement.pin), after checking that the bundle on disk still is
+/// that code and still passes the agent's check. A bundle edited or
+/// re-signed under the running app makes arm() fail, with the reason, rather
+/// than report an agent that refuses every run or pin the replacement.
 protocol BackstopScheduling: Sendable {
     /// Make sure the polling agent is loaded with the current plist. Cheap
     /// when it already is; throws when it cannot be loaded.
@@ -34,7 +40,9 @@ struct BackstopTarget: Sendable, Equatable {
 
 struct LaunchdBackstop: BackstopScheduling {
     typealias Runner = @Sendable (_ exe: String, _ args: [String]) async throws -> ShellResult
-    typealias RequirementReader = @Sendable (_ bundle: URL) throws -> String
+    /// Returns the requirement to pin for a bundle that satisfies it right
+    /// now, or throws with the reason it must not be pinned.
+    typealias BundlePinner = @Sendable (_ bundle: URL) throws -> String
 
     static let launchctl = "/bin/launchctl"
     /// Seconds between backstop.sh runs while loaded. install.sh writes the same value.
@@ -57,26 +65,27 @@ struct LaunchdBackstop: BackstopScheduling {
     let bundle: URL
     let label: String
     let uid: uid_t
-    private let readRequirement: RequirementReader
+    private let pin: BundlePinner
     private let run: Runner
 
     /// `bundle` defaults to the bundle this process runs from, and, when it
     /// is not running from one (`swift run`), to the installed bundle at
     /// `paths.appBundle`, so a development build arms the agent against the
-    /// installed app's sealed script. `readRequirement` reads that bundle's
-    /// designated requirement at every arm(), so an upgrade is pinned the
-    /// first time the upgraded app arms.
+    /// installed app's sealed script. `pin` runs at every arm(), so an
+    /// upgrade is pinned the first time the upgraded app arms; the default
+    /// is CodeRequirement.pin (the running code's own requirement, and the
+    /// agent's check on the bundle).
     init(
         paths: Paths,
         bundle: URL? = nil,
-        readRequirement: @escaping RequirementReader = { try CodeRequirement.designated(ofCodeAt: $0) },
+        pin: @escaping BundlePinner = { try CodeRequirement.pin(bundle: $0) },
         label: String = Paths.backstopLabel,
         uid: uid_t = getuid(),
         run: @escaping Runner = { try await CancellableCommand().run($0, $1, timeout: LaunchdBackstop.commandTimeout) }
     ) {
         self.plistURL = paths.backstopPlist
         self.bundle = bundle ?? Self.runningOrInstalledBundle(paths: paths)
-        self.readRequirement = readRequirement
+        self.pin = pin
         self.label = label
         self.uid = uid
         self.run = run
@@ -92,11 +101,15 @@ struct LaunchdBackstop: BackstopScheduling {
         guard FileManager.default.fileExists(atPath: scriptPath) else {
             throw BackstopError(message: "backstop.sh is not sealed in the app bundle at \(scriptPath); run scripts/install.sh")
         }
+        // Before trusting a loaded agent: the bundle it would verify must
+        // pass that verification now. A sealed script edited after signing
+        // leaves the plist current and the job loaded, but the agent refuses
+        // every run; that is not armed.
         let requirement: String
         do {
-            requirement = try readRequirement(bundle)
+            requirement = try pin(bundle)
         } catch {
-            throw BackstopError(message: "the recovery agent cannot pin \(bundle.path): \(error.localizedDescription). Run scripts/install.sh, which signs the bundle")
+            throw BackstopError(message: "the recovery agent cannot pin \(bundle.path): \(error.localizedDescription). Reinstall with scripts/install.sh")
         }
         let desired = Self.plistDictionary(label: label, target: BackstopTarget(bundle: bundle, requirement: requirement))
         if plistOnDiskMatches(desired), try await isLoaded() {

@@ -322,6 +322,13 @@ Backstop, independent of the app:
   one line and exits without running anything. No executable lives in a
   writable directory. The plist is a per-user file like any LaunchAgent; the
   app rewrites a plist that does not match at the next arm.
+- What the app pins is the requirement of the code it is running
+  (SecCodeCopySelf), read after SecCodeCheckValidity confirmed the bundle on
+  disk is that code, and the bundle must pass the agent's own check against
+  it at every arm. Otherwise arm() fails with the reason: a loaded agent
+  whose bundle no longer verifies is never reported as armed, and a bundle
+  re-signed under the running app is never re-pinned. A `swift run` build
+  outside any bundle pins the installed bundle from disk.
 - App and script transactions must coordinate through a shared lock. Failure
   to acquire it must not permit an unprotected journal write or side effect.
 - Successful restores may clear their entries; failures must stay journaled.
