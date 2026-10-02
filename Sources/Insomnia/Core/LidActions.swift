@@ -137,7 +137,10 @@ final class LidActions {
             }
             try manager.journal { s in
                 // Keep an earlier save if a previous close was never undone.
+                // The device answered, so one kept after a refused restore
+                // is an ordinary entry again.
                 if s.savedDisplayBrightness == nil { s.savedDisplayBrightness = value }
+                s.displayRestoreRefused = false
             }
             do {
                 try display.setBrightness(0)
@@ -164,6 +167,7 @@ final class LidActions {
                 if let value {
                     try manager.journal { s in
                         if s.savedKeyboardBrightness == nil { s.savedKeyboardBrightness = value }
+                        s.keyboardRestoreRefused = false
                     }
                     do {
                         try keyboard.setBrightness(0)

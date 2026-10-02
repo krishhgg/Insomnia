@@ -54,6 +54,8 @@ RuntimeState {                // everything Insomnia changed and must undo
   savedMuted:         Bool?
   savedDisplayBrightness:  Float?  // nil when darkening is off or lid is open
   savedKeyboardBrightness: Float?  // nil when there is no backlight, too
+  displayRestoreRefused:   Bool    // written only when true: the guard refused this restore; see section 4
+  keyboardRestoreRefused:  Bool    // the same for the keyboard backlight
   displayRestoredUnderLowPower: Float?  // restored on open under our Low Power Mode; written again when it ends
   appNapOverrides:    [{bundleId, previous?}]  // previous absent when the app had no NSAppSleepDisabled key
 }
@@ -132,13 +134,29 @@ device is skipped at lid close with a log line, nothing is journaled for
 it, and Settings shows the reason under the darken toggle. With nothing
 journaled for either device the close does not request display sleep,
 since lid open and reconcile wake the display only for a journaled
-brightness, as section 4 describes. A brightness journaled before an
-update that the guard now refuses is not written on open or reconcile:
-the entry is dropped so the journal can come clean, and the error tells
-the user to set the level with the brightness keys or Control Center.
-Retrying it would keep the journal dirty forever. The guards narrow the
-risk of calling a private function whose shape changed; they do not
-replace the hardware rows in docs/release-validation.md.
+brightness, as section 4 describes.
+
+A brightness journaled before an update that the guard now refuses is not
+written on open or reconcile, and it is not dropped either: an entry is
+cleared only after its undo. It stays in the journal with
+`displayRestoreRefused` or `keyboardRestoreRefused` set, and the error
+says it could not be restored on this macOS build and to set the level
+with the brightness keys or Control Center. A flagged entry is not dirty,
+for the app, backstop.sh or uninstall.sh. Nothing on that build can
+restore it, and counting it would post "Restore incomplete" at every end
+and launch, fail the backstop every minute, and stop uninstall for good.
+It also does not hold back a new session or Quit. The app tries again at
+every lid open and launch, with or without a session. On a build or macOS
+where the guard allows the call, the value is written and both keys are
+cleared; a failed write there clears the flag, and the entry is retried
+like any failed restore. A lid close that can read the device clears the
+flag too, keeping the earlier saved value. Uninstall goes ahead past a
+flagged entry, prints the saved level, and keeps state.json, even with
+`--purge`, so a later install that can make the call restores it.
+
+The guards narrow the risk of calling a private function whose shape
+changed; they do not replace the hardware rows in
+docs/release-validation.md.
 
 Freeze scope rules:
 
@@ -408,6 +426,11 @@ Backstop, independent of the app:
 - The shell does not restore CoreAudio settings. Saved audio must remain in
   the journal for the app to restore. Uninstall must preserve recovery tools
   and state when restoration is incomplete, including saved audio.
+- The shell does not restore display or keyboard brightness either; both stay
+  in the journal for the app. One flagged `displayRestoreRefused` or
+  `keyboardRestoreRefused` is kept but does not make the journal dirty, so
+  it neither fails the run nor stops uninstall, which keeps state.json for
+  it (section 4).
 - The shell puts `appNapOverrides` back with `defaults write <id>
   NSAppSleepDisabled -bool <previous>` or `defaults delete` when the key was
   absent. A delete that fails counts as done only when `defaults read` then

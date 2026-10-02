@@ -95,10 +95,23 @@ struct RuntimeState: Codable, Equatable, Sendable {
     /// Built-in keyboard backlight (0...1) before the lid close set it to 0;
     /// nil when darkening is off, there is no backlight, or the lid is open.
     var savedKeyboardBrightness: Float? = nil
+    /// The private-call guard refused the restore of the saved display
+    /// brightness on this Mac (spec section 4). The value stays journaled
+    /// for a build or macOS that can make the call; this flag only takes
+    /// it out of `isDirty`, since no retry, backstop run or end on this
+    /// build can restore it. Cleared once the device answers again.
+    var displayRestoreRefused: Bool = false
+    /// The same for the saved keyboard backlight.
+    var keyboardRestoreRefused: Bool = false
     /// A display or keyboard brightness is journaled for the open to
-    /// restore. Lid open and reconcile wake the display only then, so lid
-    /// close asks the display to sleep only then too.
+    /// restore, refused or not. Lid open and reconcile wake the display
+    /// only then, so lid close asks the display to sleep only then too.
     var brightnessJournaled: Bool { savedDisplayBrightness != nil || savedKeyboardBrightness != nil }
+    /// A saved brightness kept only because the guard refused its restore.
+    var hasRefusedBrightness: Bool {
+        (savedDisplayBrightness != nil && displayRestoreRefused)
+            || (savedKeyboardBrightness != nil && keyboardRestoreRefused)
+    }
     /// A display brightness restored on lid open while `lowPowerSetByUs`:
     /// written once more right after Insomnia switches the mode off, since
     /// the mode's end rescales the panel (spec section 4). Not something
@@ -123,16 +136,19 @@ struct RuntimeState: Codable, Equatable, Sendable {
     }
 
     /// True when a lid close left something to undo on lid open: freezes,
-    /// the Docker marker, saved audio, saved display or keyboard brightness.
+    /// the Docker marker, saved audio, saved display or keyboard brightness
+    /// other than one kept after a refused restore.
     var hasLidActions: Bool {
         !frozenProcesses.isEmpty || dockerFrozen
             || savedOutputVolume != nil || savedMuted != nil
-            || savedDisplayBrightness != nil || savedKeyboardBrightness != nil
+            || (savedDisplayBrightness != nil && !displayRestoreRefused)
+            || (savedKeyboardBrightness != nil && !keyboardRestoreRefused)
     }
 
     private enum CodingKeys: String, CodingKey {
         case sleepDisabledByUs, lowPowerSetByUs, frozenProcesses, frozenPids, dockerFrozen, savedOutputVolume, savedMuted
         case savedDisplayBrightness, savedKeyboardBrightness, displayRestoredUnderLowPower
+        case displayRestoreRefused, keyboardRestoreRefused
         case appNapOverrides
     }
 
@@ -157,6 +173,8 @@ struct RuntimeState: Codable, Equatable, Sendable {
         savedDisplayBrightness = try c.decodeIfPresent(Float.self, forKey: .savedDisplayBrightness)
         savedKeyboardBrightness = try c.decodeIfPresent(Float.self, forKey: .savedKeyboardBrightness)
         displayRestoredUnderLowPower = try c.decodeIfPresent(Float.self, forKey: .displayRestoredUnderLowPower)
+        displayRestoreRefused = try c.decodeIfPresent(Bool.self, forKey: .displayRestoreRefused) ?? false
+        keyboardRestoreRefused = try c.decodeIfPresent(Bool.self, forKey: .keyboardRestoreRefused) ?? false
         appNapOverrides = try c.decodeIfPresent([AppNapOverride].self, forKey: .appNapOverrides) ?? []
     }
 
@@ -173,6 +191,10 @@ struct RuntimeState: Codable, Equatable, Sendable {
         try c.encodeIfPresent(savedDisplayBrightness, forKey: .savedDisplayBrightness)
         try c.encodeIfPresent(savedKeyboardBrightness, forKey: .savedKeyboardBrightness)
         try c.encodeIfPresent(displayRestoredUnderLowPower, forKey: .displayRestoredUnderLowPower)
+        // Written only while set, so a journal without a refusal reads the
+        // same to backstop.sh and uninstall.sh as before the flags existed.
+        if displayRestoreRefused { try c.encode(true, forKey: .displayRestoreRefused) }
+        if keyboardRestoreRefused { try c.encode(true, forKey: .keyboardRestoreRefused) }
         try c.encode(appNapOverrides, forKey: .appNapOverrides)
     }
 }

@@ -25,7 +25,10 @@ journaled pid that still exists, is stopped, started in this boot session at
 the journaled second, and belongs to this user. It keeps, and never
 restores, `savedOutputVolume`, `savedMuted`, `savedDisplayBrightness`,
 `savedKeyboardBrightness` and `displayRestoredUnderLowPower`: CoreAudio and
-the private brightness frameworks need the app. Legacy `frozenPids` entries
+the private brightness frameworks need the app. A saved brightness flagged
+`displayRestoreRefused` or `keyboardRestoreRefused` (the app's private-call
+guard refused that restore on this macOS) stays journaled but is not dirty
+for the app, the backstop or uninstall, which keeps state.json for it. Legacy `frozenPids` entries
 are never signaled or cleared by the shell. A flag is cleared only after
 its undo succeeded; a journal that is unreadable or has a known key of the
 wrong type is left untouched and the run exits 1.

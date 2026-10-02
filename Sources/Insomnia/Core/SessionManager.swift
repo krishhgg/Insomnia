@@ -829,19 +829,15 @@ final class SessionManager {
         if state.brightnessJournaled {
             display.wake()
         }
-        // A value saved before an update (of macOS, or of Insomnia's
-        // measured tables) that the private-call guard now refuses can
-        // never be written by this build: dropped, not retried.
-        if let saved = state.savedDisplayBrightness, let why = display.refusal() {
-            dropRefusedRestore("display brightness", saved: saved, why: why) { $0.savedDisplayBrightness = nil }
-        }
-        if let saved = state.savedKeyboardBrightness, let why = keyboard.refusal() {
-            dropRefusedRestore("keyboard backlight", saved: saved, why: why) { $0.savedKeyboardBrightness = nil }
-        }
         // Read before the entries are cleared: the re-assert below needs them.
         var restoredDisplay: Float?
         var restoredKeyboard: Float?
-        if let saved = state.savedDisplayBrightness {
+        // A value saved before an update (of macOS, or of Insomnia's
+        // measured tables) that the private-call guard now refuses is kept,
+        // not written and not dropped: see keepRefusedRestore.
+        if let saved = state.savedDisplayBrightness, let why = display.refusal() {
+            keepRefusedRestore("display brightness", saved: saved, why: why, flag: \.displayRestoreRefused)
+        } else if let saved = state.savedDisplayBrightness {
             do {
                 try display.setBrightness(saved)
                 Log.info("display restored (brightness \(saved))")
@@ -852,6 +848,7 @@ final class SessionManager {
                 do {
                     try journal { s in
                         s.savedDisplayBrightness = nil
+                        s.displayRestoreRefused = false
                         s.displayRestoredUnderLowPower = underLowPower ? saved : nil
                     }
                 } catch {
@@ -859,20 +856,27 @@ final class SessionManager {
                 }
             } catch {
                 fail("could not restore display brightness: \(error.localizedDescription)")
+                makeRetryable("display brightness", flag: \.displayRestoreRefused)
             }
         }
-        if let saved = state.savedKeyboardBrightness {
+        if let saved = state.savedKeyboardBrightness, let why = keyboard.refusal() {
+            keepRefusedRestore("keyboard backlight", saved: saved, why: why, flag: \.keyboardRestoreRefused)
+        } else if let saved = state.savedKeyboardBrightness {
             do {
                 try keyboard.setBrightness(saved)
                 Log.info("keyboard backlight restored (brightness \(saved))")
                 restoredKeyboard = saved
                 do {
-                    try journal { $0.savedKeyboardBrightness = nil }
+                    try journal { s in
+                        s.savedKeyboardBrightness = nil
+                        s.keyboardRestoreRefused = false
+                    }
                 } catch {
                     fail("keyboard backlight restored but the journal entry could not be cleared: \(error.localizedDescription); it will be retried")
                 }
             } catch {
                 fail("could not restore keyboard backlight: \(error.localizedDescription)")
+                makeRetryable("keyboard backlight", flag: \.keyboardRestoreRefused)
             }
         }
         // powerd applies its own remembered "pre-dim" brightness a moment
@@ -1055,10 +1059,18 @@ final class SessionManager {
         } else if state.isDirty {
             Log.info("reconcile: no session but dirty state, restoring")
             _ = await performEnd(reason: .backstop)
-        } else if state.displayRestoredUnderLowPower != nil {
-            dropDisplayWrite(reason: "no session and the mode is not ours")
         } else {
-            Log.info("reconcile: no session, nothing to restore")
+            if state.displayRestoredUnderLowPower != nil {
+                dropDisplayWrite(reason: "no session and the mode is not ours")
+            } else if !state.hasRefusedBrightness {
+                Log.info("reconcile: no session, nothing to restore")
+            }
+            // Not dirty, but this launch may be the build or macOS that
+            // can make the call; still refused, the entry stays.
+            if state.hasRefusedBrightness {
+                Log.info("reconcile: no session; trying again the brightness kept after a refused restore")
+                undoLidActionsInJournal()
+            }
         }
 
         // Step 3: SleepDisabled set with no session. A disable Insomnia
@@ -1238,17 +1250,37 @@ final class SessionManager {
         Log.error(message)
     }
 
-    /// The guard refuses this device on this Mac, so retrying its saved
-    /// value would keep the journal dirty, with a "Restore incomplete" at
-    /// every end and launch, and restore nothing. The entry is dropped and
-    /// the user is told to set the level by hand.
-    private func dropRefusedRestore(_ what: String, saved: Float, why: String, clear: (inout RuntimeState) -> Void) {
-        let message = "could not restore the \(what) saved before the lid closed (\(saved)): \(why). Set it with the brightness keys or Control Center"
+    /// The guard refuses this device on this Mac, so this build cannot
+    /// write the saved value. It stays journaled, since an entry is cleared
+    /// only after its undo, and is flagged so it stops counting as dirty:
+    /// no retry, backstop run or end on this build can restore it, and
+    /// counting it would post "Restore incomplete" at every end and launch,
+    /// fail the backstop every minute and stop uninstall.sh. The app tries
+    /// again at every lid open and launch, so a build or macOS that can
+    /// make the call restores it then. The user is told each time.
+    private func keepRefusedRestore(_ what: String, saved: Float, why: String, flag: WritableKeyPath<RuntimeState, Bool>) {
+        let message = "could not restore the \(what) saved before the lid closed (\(saved)) on this macOS build: \(why). Set it with the brightness keys or Control Center; the saved value stays in the journal for a version that can restore it"
+        guard !state[keyPath: flag] else {
+            fail(message)
+            return
+        }
         do {
-            try journal(clear)
-            fail("\(message); the saved value was dropped, since this build will not call that function on this Mac")
+            try journal { $0[keyPath: flag] = true }
+            fail(message)
         } catch {
-            fail("\(message); the journal entry could not be cleared either: \(error.localizedDescription)")
+            fail("\(message). It could not be marked as refused (\(error.localizedDescription)), so it still counts as not restored")
+        }
+    }
+
+    /// A value kept after a refusal that this build may write after all,
+    /// and the write failed: it is retried like any failed restore from
+    /// now on, so the flag goes.
+    private func makeRetryable(_ what: String, flag: WritableKeyPath<RuntimeState, Bool>) {
+        guard state[keyPath: flag] else { return }
+        do {
+            try journal { $0[keyPath: flag] = false }
+        } catch {
+            fail("could not mark the \(what) for retry: \(error.localizedDescription)")
         }
     }
 
