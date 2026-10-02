@@ -66,7 +66,7 @@ struct Config: Codable, Equatable, Sendable {
     /// their defaults. Settings saves the whole struct, so an ordinary
     /// install has these as explicit values; the decoder reads exactly these
     /// as the current defaults and keeps any other value, which a person
-    /// chose by hand.
+    /// chose by hand, unless it no longer fits under the new ceiling.
     static let legacyMaxDuration: TimeInterval = 30 * 24 * 3600
     static let legacyPresets: [TimeInterval] = defaultPresets + [3 * 24 * 3600]
 
@@ -109,9 +109,18 @@ struct Config: Codable, Equatable, Sendable {
         let d = Config()
         presets = try c.decodeIfPresent([TimeInterval].self, forKey: .presets) ?? d.presets
         defaultPreset = try c.decodeIfPresent(TimeInterval.self, forKey: .defaultPreset) ?? d.defaultPreset
-        maxDuration = try c.decodeIfPresent(TimeInterval.self, forKey: .maxDuration) ?? d.maxDuration
+        let savedMax = try c.decodeIfPresent(TimeInterval.self, forKey: .maxDuration)
+        maxDuration = savedMax ?? d.maxDuration
         if presets == Config.legacyPresets { presets = d.presets }
         if maxDuration == Config.legacyMaxDuration { maxDuration = d.maxDuration }
+        // A ceiling the user never set is now 24 hours, not the 30 days the
+        // presets and default were picked under. Presets above it go
+        // (Settings refuses to add them), and a default above it moves to
+        // the largest preset left, since bare Enter would refuse it.
+        if savedMax == nil || savedMax == Config.legacyMaxDuration {
+            presets.removeAll { $0 > maxDuration }
+            if defaultPreset > maxDuration { defaultPreset = presets.max() ?? d.defaultPreset }
+        }
         freezeList = try c.decodeIfPresent([String].self, forKey: .freezeList) ?? d.freezeList
         freezeAllApps = try c.decodeIfPresent(Bool.self, forKey: .freezeAllApps) ?? d.freezeAllApps
         dockerRule = try c.decodeIfPresent(Bool.self, forKey: .dockerRule) ?? d.dockerRule

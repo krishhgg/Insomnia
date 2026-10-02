@@ -74,7 +74,9 @@ recovery; newly written journals use `frozenProcesses`.
   beside the pills ("Up to 1d", "Up to 23h30m"); it is never shortened
   without saying so. A config.json saved by an older build with that build's
   defaults (30 days, a 3-day preset) reads as the current defaults; any other
-  saved value is kept.
+  saved value is kept. When the user never set the ceiling, presets above 24
+  hours are dropped and a default above it moves to the largest preset left
+  (the 4-hour stock default if none is), so bare Enter still starts.
 - While active the menu bar shows a second-resolution countdown. The redraw
   timer runs at 1 Hz and stops while the lid is closed.
 - Click the cup/countdown to enter an extension; hold the end control to end.

@@ -59,7 +59,8 @@ final class ConfigTests: XCTestCase {
     /// Settings saves the whole struct, so every ordinary config.json from an
     /// older build holds that build's defaults (30 days, a 3-day preset) as
     /// explicit values. Exactly those read as the current defaults; any other
-    /// value was chosen by hand and is kept, a 3-day preset included.
+    /// value was chosen by hand and is kept, a 3-day preset included, unless
+    /// the ceiling it sits under was not (see the next test).
     func testLegacyDefaultsSavedByOlderBuildsReadAsTheCurrentDefaults() throws {
         let saved = #"{"maxDuration": 2592000, "presets": [1800, 3600, 7200, 14400, 28800, 43200, 86400, 259200]}"#
         let migrated = try Store.makeDecoder().decode(Config.self, from: Data(saved.utf8))
@@ -72,9 +73,54 @@ final class ConfigTests: XCTestCase {
         XCTAssertEqual(kept.maxDuration, 7 * 24 * 3600)
         XCTAssertEqual(kept.presets, [3600, 259200])
 
-        // A customized list that still has the old default's shape minus one entry is not the old default.
+        // A customized list that still has the old default's shape minus one
+        // entry is not the old default: it is kept, minus the entry above
+        // the 24-hour ceiling it now sits under.
         let trimmed = #"{"presets": [1800, 3600, 7200, 14400, 28800, 43200, 259200]}"#
-        XCTAssertEqual(try Store.makeDecoder().decode(Config.self, from: Data(trimmed.utf8)).presets, [1800, 3600, 7200, 14400, 28800, 43200, 259200])
+        XCTAssertEqual(try Store.makeDecoder().decode(Config.self, from: Data(trimmed.utf8)).presets, [1800, 3600, 7200, 14400, 28800, 43200])
+    }
+
+    /// An older build could have the 3-day preset as its default. Once the
+    /// 30-day ceiling the user never chose becomes 24 hours, that default
+    /// would make bare Enter refuse, so it moves to the largest preset left
+    /// under the ceiling, and presets above the ceiling go (Settings refuses
+    /// to add them). A ceiling the user set keeps everything as it was.
+    @MainActor
+    func testADefaultAboveTheMigratedCeilingMovesToTheLargestPresetUnderIt() throws {
+        func decode(_ json: String) throws -> Config {
+            try Store.makeDecoder().decode(Config.self, from: Data(json.utf8))
+        }
+        func bareEnter(_ c: Config) -> MenuBarModel.CommitAction {
+            MenuBarModel.commitAction(mode: .start, typed: nil, defaultPreset: c.defaultPreset, maxDuration: c.maxDuration)
+        }
+
+        let stock = try decode(#"{"maxDuration": 2592000, "presets": [1800, 3600, 7200, 14400, 28800, 43200, 86400, 259200], "defaultPreset": 259200}"#)
+        XCTAssertEqual(stock.maxDuration, 24 * 3600)
+        XCTAssertEqual(stock.presets, Config.defaultPresets)
+        XCTAssertEqual(stock.defaultPreset, 24 * 3600)
+        XCTAssertEqual(bareEnter(stock), .run(24 * 3600))
+
+        let trimmed = try decode(#"{"maxDuration": 2592000, "presets": [1800, 3600, 7200, 14400, 28800, 43200, 259200], "defaultPreset": 259200}"#)
+        XCTAssertEqual(trimmed.presets, [1800, 3600, 7200, 14400, 28800, 43200])
+        XCTAssertEqual(trimmed.defaultPreset, 12 * 3600)
+        XCTAssertEqual(bareEnter(trimmed), .run(12 * 3600))
+
+        // Nothing left under the ceiling: the stock default.
+        let onlyLong = try decode(#"{"presets": [259200], "defaultPreset": 259200}"#)
+        XCTAssertEqual(onlyLong.presets, [])
+        XCTAssertEqual(onlyLong.defaultPreset, Config().defaultPreset)
+        XCTAssertEqual(bareEnter(onlyLong), .run(Config().defaultPreset))
+
+        // A default that still fits stays where the user put it.
+        let fits = try decode(#"{"maxDuration": 2592000, "presets": [1800, 3600, 7200, 14400, 28800, 43200, 86400, 259200], "defaultPreset": 7200}"#)
+        XCTAssertEqual(fits.defaultPreset, 7200)
+
+        // A ceiling set by hand keeps the 3-day default; only the stock list changes.
+        let raised = try decode(#"{"maxDuration": 604800, "presets": [1800, 3600, 7200, 14400, 28800, 43200, 86400, 259200], "defaultPreset": 259200}"#)
+        XCTAssertEqual(raised.maxDuration, 7 * 24 * 3600)
+        XCTAssertEqual(raised.presets, Config.defaultPresets)
+        XCTAssertEqual(raised.defaultPreset, 3 * 24 * 3600)
+        XCTAssertEqual(bareEnter(raised), .run(3 * 24 * 3600))
     }
 
     func testEmptyObjectIsDefaults() throws {
