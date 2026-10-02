@@ -8,6 +8,12 @@ enum EndReason: String, Sendable {
     case batteryFloor
     case thermalCritical
     case backstop
+    /// session.json was gone while this process still held the session: the
+    /// recovery agent ended it (its log line says why: app not running,
+    /// battery below the end floor, critical heat) while the app was stopped,
+    /// hung, or not holding the alive lock, and restored from the journal.
+    /// The app ends on its side from whatever the journal still holds.
+    case agentCutoff
     /// Reconcile found a session on disk but could not arm the recovery
     /// agent, journal, or hold sleep for it, so it ended the session instead
     /// of holding sleep with nothing to release it.
@@ -125,6 +131,7 @@ final class SessionManager {
     @ObservationIgnored private var deadlineTimer: Timer?
     @ObservationIgnored private var countdownTimer: Timer?
     @ObservationIgnored private var retryTimer: Timer?
+    @ObservationIgnored private var checkingAgentEnd = false
     /// Whether the 1 Hz redraw is currently on the run loop. Tests assert on
     /// this to prove an idle session leaves no repeating wakeup behind.
     var countdownTimerArmed: Bool { countdownTimer != nil }
@@ -234,8 +241,11 @@ final class SessionManager {
     /// `op` is not run at all when the lock cannot be taken within the
     /// bound or when state.json does not decode: nothing is read, decided
     /// or changed unlocked, and an unreadable journal is never overwritten.
+    /// With `syncSession` (every caller but `end`, which does this work
+    /// itself) a session the recovery agent has ended meanwhile is ended
+    /// here first, so `op` never acts on a session that is over on disk.
     /// Never blocks the main actor; the wait is polled.
-    private func exclusive<T: Sendable>(_ what: String, _ op: @escaping @MainActor @Sendable () async -> T) async -> Result<T, TransactionRefusal> {
+    private func exclusive<T: Sendable>(_ what: String, syncSession: Bool = true, _ op: @escaping @MainActor @Sendable () async -> T) async -> Result<T, TransactionRefusal> {
         let previous = lifecycleTail
         let task = Task<Result<T, TransactionRefusal>, Never> { @MainActor in
             await previous?.value
@@ -253,10 +263,43 @@ final class SessionManager {
                 self.refuseForUnreadableJournal(what, error)
                 return .failure(.journalUnreadable(error.localizedDescription))
             }
+            if syncSession { await self.adoptAgentEnd() }
             return .success(await op())
         }
         lifecycleTail = Task { _ = await task.value }
         return await task.value
+    }
+
+    /// Disk decides whether a session exists. session.json gone while this
+    /// process still holds a session means backstop.sh ended it (its log
+    /// line says why) while this process could not act: stopped, hung, or
+    /// without the alive lock. The agent has restored what it could; the end
+    /// here runs from the journal just read under the lock, so anything it
+    /// left is retried, and observers, timers and the countdown stop. An
+    /// unreadable session.json is not a vanished one and is left alone.
+    private func adoptAgentEnd() async {
+        guard let s = session else { return }
+        let onDisk: Session?
+        do {
+            onDisk = try store.loadSession()
+        } catch {
+            return
+        }
+        guard onDisk == nil else { return }
+        Log.error("session.json is gone while the session until \(iso(s.endsAt)) was active: the recovery agent ended it (its log line says why); ending here from the journal")
+        endTicket += 1
+        _ = await performEnd(reason: .agentCutoff)
+    }
+
+    /// The 1 Hz tick's look for a session the agent ended while the lid was
+    /// open and nothing else transacted: a cheap stat first, then the
+    /// decision and the end under the lock (`adoptAgentEnd`).
+    private func noticeAgentEnd() async {
+        guard session != nil, !checkingAgentEnd,
+              !FileManager.default.fileExists(atPath: paths.sessionFile.path) else { return }
+        checkingAgentEnd = true
+        defer { checkingAgentEnd = false }
+        _ = await exclusive("agent end") {}
     }
 
     /// Disk is the source of truth. Missing means clean; anything that does
@@ -425,7 +468,7 @@ final class SessionManager {
         retryTimer?.invalidate()
         retryTimer = nil
         let outcome: EndOutcome
-        switch await exclusive("end", { await self.performEnd(reason: reason) }) {
+        switch await exclusive("end", syncSession: false, { await self.performEnd(reason: reason) }) {
         case let .success(o): outcome = o
         case .failure(.lockBusy): outcome = .locked
         case .failure(.journalUnreadable): outcome = .journalUnreadable
@@ -1038,7 +1081,11 @@ final class SessionManager {
         guard session != nil else { return }
         let first = SessionMath.nextSecondBoundary(after: clock())
         let timer = Timer(fire: first, interval: 1, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.refreshCountdown() }
+            Task { @MainActor in
+                guard let self else { return }
+                self.refreshCountdown()
+                await self.noticeAgentEnd()
+            }
         }
         timer.tolerance = 0.1
         RunLoop.main.add(timer, forMode: .common)
@@ -1086,6 +1133,7 @@ final class SessionManager {
         case .batteryFloor: "Battery fell below \(config.endFloor)%. Sleep is back to normal."
         case .thermalCritical: "Thermal state is critical. Sleep is back to normal."
         case .backstop: "A previous session left changes behind; everything has been undone."
+        case .agentCutoff: "The recovery agent ended the session while Insomnia could not (see insomnia.log for its reason). Sleep is back to normal."
         case .recoveryUnavailable: "Insomnia could not arm its recovery agent for the session found on disk, so it ended the session. Sleep is back to normal."
         case .startFailed: "Insomnia could not disable sleep, so no session was started. Sleep is back to normal."
         }

@@ -82,6 +82,32 @@ final class AppAliveLockTests: XCTestCase {
         XCTAssertTrue(mine.isHeld)
     }
 
+    /// A launch that found the lock held keeps trying: the moment the other
+    /// holder exits, this one holds it, so the backstop counts it as running.
+    func testAcquireEventuallyTakesTheLockOnceTheHolderIsGone() async throws {
+        let held = makeLock()
+        XCTAssertTrue(try held.tryAcquire())
+        let mine = makeLock()
+        let waiter = Task { await mine.acquireEventually(pollEvery: .milliseconds(20)) }
+        try await Task.sleep(for: .milliseconds(120))
+        XCTAssertFalse(mine.isHeld, "still held elsewhere")
+        held.release()
+        await waiter.value
+        XCTAssertTrue(mine.isHeld)
+    }
+
+    func testAcquireEventuallyStopsWhenCancelled() async throws {
+        let held = makeLock()
+        XCTAssertTrue(try held.tryAcquire())
+        let mine = makeLock()
+        let waiter = Task { await mine.acquireEventually(pollEvery: .milliseconds(20)) }
+        try await Task.sleep(for: .milliseconds(60))
+        waiter.cancel()
+        await waiter.value
+        XCTAssertFalse(mine.isHeld)
+        XCTAssertTrue(held.isHeld)
+    }
+
     /// backstop.sh probes with `lockf -k -s -t 0 <file> /usr/bin/true` in
     /// another process: 75 (EX_TEMPFAIL) while the app holds the lock, 0
     /// once it is gone, and the probe's own hold is gone with the probe.

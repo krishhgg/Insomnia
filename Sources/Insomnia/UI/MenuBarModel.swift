@@ -43,11 +43,11 @@ final class MenuBarModel {
         return defaultPreset > allowed ? .tooLong(allowed: allowed) : .run(defaultPreset)
     }
 
-    /// Label beside the pills for a refused `tooLong`: "Up to 1d" (the same
-    /// short form as the preset chips), or "At the maximum" once nothing
-    /// more fits.
+    /// Label beside the pills for a refused `tooLong`: "Up to 1d", "Up to
+    /// 1d30m" (every unit that still fits, floored to the minute, so the
+    /// user can type it back), or "At the maximum" once nothing more fits.
     static func tooLongText(allowed: TimeInterval) -> String {
-        allowed >= SessionMath.minimumDuration ? "Up to \(chipLabel(for: allowed))" : "At the maximum"
+        allowed >= SessionMath.minimumDuration ? "Up to \(exactLabel(for: allowed))" : "At the maximum"
     }
 
     enum Phase: Equatable, Sendable {

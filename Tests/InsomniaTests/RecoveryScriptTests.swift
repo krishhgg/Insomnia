@@ -262,6 +262,74 @@ final class RecoveryScriptTests: XCTestCase {
         try assertSessionEnded(try fx.run(fx.backstop), reason: "below the 10% end floor")
     }
 
+    /// With the floor off nothing is read, so a failing pmset cannot end a
+    /// session the user exempted from the battery rule.
+    func testEndFloorZeroSkipsTheBatteryReadSoAFailingPmsetCannotEnd() throws {
+        try writeLiveSession()
+        let app = try fx.holdAliveLock()
+        defer { app.terminate() }
+        try fx.writeConfig(#"{"endFloor": 0}"#)
+        fx.setBattery("FAIL")
+
+        let r = try fx.run(fx.backstop)
+
+        try assertSessionKept(r)
+        XCTAssertEqual(calls(), [thermalRead], "no battery read with the floor off")
+    }
+
+    /// A JSON string is not the Int or Bool the app decodes: "30" and
+    /// "false" fall back to the defaults here as they do in the app, so both
+    /// sides enforce the same floor and the same thermal rule.
+    func testStringTypedConfigValuesAreIgnoredLikeTheAppDoes() throws {
+        let app = try fx.holdAliveLock()
+        defer { app.terminate() }
+
+        try writeLiveSession()
+        try fx.writeConfig(#"{"endFloor": "30"}"#)
+        fx.setBattery(fx.battery(source: "Battery Power", percent: 25))
+        try assertSessionKept(try fx.run(fx.backstop))
+
+        try writeLiveSession()
+        fx.clearCalls()
+        try fx.writeConfig(#"{"endFloor": "30"}"#)
+        fx.setBattery(fx.battery(source: "Battery Power", percent: 9))
+        try assertSessionEnded(try fx.run(fx.backstop), reason: "below the 10% end floor")
+
+        try writeLiveSession()
+        fx.clearCalls()
+        try fx.writeConfig(#"{"thermalRules": "false", "endFloor": 10.0}"#)
+        fx.setBattery(fx.battery(source: "AC Power", percent: 50, state: "charging"))
+        fx.setThermal("4")
+        try assertSessionEnded(try fx.run(fx.backstop), reason: "thermal pressure level 4")
+    }
+
+    /// The reads run under the recovery lock, so they are bounded like the
+    /// undo commands (COMMAND_TIMEOUT_SECONDS, 1 s in this fixture). A
+    /// battery read that hangs is terminated and counts as unreadable: the
+    /// session ends. A thermal read that hangs only warns.
+    func testHungReadsAreBoundedBatteryFailsClosedThermalWarns() throws {
+        let app = try fx.holdAliveLock()
+        defer { app.terminate() }
+
+        try writeLiveSession()
+        fx.setBattery("HANG")
+        var started = Date()
+        try assertSessionEnded(try fx.run(fx.backstop), reason: "pmset -g batt did not finish within 1s")
+        XCTAssertLessThan(Date().timeIntervalSince(started), 20, "the hung read must not hold the run for its whole minute")
+        XCTAssertTrue(fx.log().contains("did not finish within 1s; terminated with SIGTERM"), fx.log())
+
+        try writeLiveSession()
+        fx.clearCalls()
+        fx.setBattery(fx.battery(source: "AC Power", percent: 100, state: "charged"))
+        fx.setThermal("HANG")
+        started = Date()
+        try assertSessionKept(try fx.run(fx.backstop))
+        XCTAssertLessThan(Date().timeIntervalSince(started), 20)
+        XCTAssertTrue(fx.log().contains("thermal pressure level unreadable"), fx.log())
+        let leftovers = try FileManager.default.contentsOfDirectory(atPath: fx.home.path).filter { $0.hasPrefix(".backstop.") }
+        XCTAssertEqual(leftovers, [], "status and capture files are cleaned up")
+    }
+
     /// Levels 0 to 2 (nominal, moderate, heavy) keep the session; 3 and 4
     /// (trapping, sleeping) are what ProcessInfo reports as critical and
     /// end it.
@@ -1902,6 +1970,7 @@ private final class ScriptFixture {
           printf 'pmset -g batt\\n' >> "\(calls)"
           if [[ -f "\(r)/pmset.batt" ]]; then
             [[ "$(cat "\(r)/pmset.batt")" == FAIL ]] && exit 1
+            [[ "$(cat "\(r)/pmset.batt")" == HANG ]] && exec /bin/sleep 60
             cat "\(r)/pmset.batt"; exit 0
           fi
           printf "Now drawing from 'AC Power'\\n -InternalBattery-0 (id=1)\\t100%%; charged; 0:00 remaining present: true\\n"
@@ -1912,11 +1981,12 @@ private final class ScriptFixture {
         """)
         // notifyutil -g <key>: prints "<key> <level>" with the level from
         // thermal.mode (default 0). "FAIL": exit 1 with no output. "GARBAGE":
-        // exit 0 with a line that has no level in it.
+        // exit 0 with a line that has no level in it. "HANG": never returns.
         try writeFake("notifyutil", """
         printf 'notifyutil %s\\n' "$*" >> "\(calls)"
         mode="$(cat "\(r)/thermal.mode" 2>/dev/null || echo 0)"
         [[ "$mode" == FAIL ]] && exit 1
+        [[ "$mode" == HANG ]] && exec /bin/sleep 60
         [[ "$mode" == GARBAGE ]] && { echo "something unexpected"; exit 0; }
         echo "${2:-} $mode"
         """)
@@ -2046,8 +2116,9 @@ private final class ScriptFixture {
         try? value.write(to: root.appendingPathComponent("\(name).mode"), atomically: true, encoding: .utf8)
     }
 
-    /// What the fake `pmset -g batt` prints ("FAIL": it fails instead). The
-    /// fixture default is a MacBook on AC power at 100%.
+    /// What the fake `pmset -g batt` prints ("FAIL": it fails instead;
+    /// "HANG": it never returns). The fixture default is a MacBook on AC
+    /// power at 100%.
     func setBattery(_ output: String) {
         try? output.write(to: root.appendingPathComponent("pmset.batt"), atomically: true, encoding: .utf8)
     }
@@ -2058,7 +2129,7 @@ private final class ScriptFixture {
     }
 
     /// The thermal pressure level the fake notifyutil reports (default 0),
-    /// or "FAIL" / "GARBAGE".
+    /// or "FAIL" / "GARBAGE" / "HANG".
     func setThermal(_ mode: String) {
         setMode("thermal", mode)
     }

@@ -256,6 +256,99 @@ final class ReconcileTests: XCTestCase {
         XCTAssertEqual(m.remainingText, "58m")
     }
 
+    // MARK: A session the recovery agent ended while the app could not act
+
+    /// backstop.sh ended the session (battery below the floor while the app
+    /// was stopped, say) and restored from the journal: session.json gone,
+    /// state.json clean. The app still holds the session in memory. Its next
+    /// transaction (an extend here) ends it on the app's side from the clean
+    /// journal: no pmset, no session written back, countdown stopped, and a
+    /// notification that says who ended it. A later end by the user is then
+    /// an ordinary end with nothing left to do.
+    func testASessionTheAgentEndedIsDroppedAtTheNextTransaction() async throws {
+        let m = h.makeManager()
+        await m.start(duration: 3600)
+        XCTAssertTrue(m.isActive)
+        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1"])
+        try h.store.deleteSession()
+        try h.store.saveState(.clean)
+
+        await m.extend(by: 600)
+
+        XCTAssertNil(m.session)
+        XCTAssertFalse(m.isActive)
+        XCTAssertNil(try h.store.loadSession(), "the extend must not write the session back")
+        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
+        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1"], "the agent restored sleep; nothing to undo here")
+        XCTAssertFalse(m.countdownTimerArmed)
+        XCTAssertEqual(h.notifier.posts.last?.title, "Session ended")
+        XCTAssertTrue(h.notifier.posts.last?.body.contains("recovery agent ended the session") ?? false, "\(h.notifier.posts)")
+
+        let outcome = await m.end(reason: .user)
+        XCTAssertEqual(outcome, .restored)
+        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1"])
+    }
+
+    /// What the agent could not undo stays in its journal, and the app's end
+    /// retries it from there: the agent restored sleep but left a frozen
+    /// process, which the app resumes.
+    func testTheAppRetriesWhatTheAgentLeftJournaled() async throws {
+        let m = h.makeManager()
+        await m.start(duration: 3600)
+        try h.store.deleteSession()
+        var left = RuntimeState.clean
+        left.frozenProcesses = [FrozenProcess(pid: 111, startedAt: 5)]
+        try h.store.saveState(left)
+
+        await m.extend(by: 600)
+
+        XCTAssertFalse(m.isActive)
+        XCTAssertEqual(h.procs.resumed, [[111]])
+        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
+    }
+
+    /// An end requested by the user does the same work itself and must not
+    /// be doubled by the check: one end, one notification.
+    func testAUserEndAfterTheAgentsEndIsOneEnd() async throws {
+        let m = h.makeManager()
+        await m.start(duration: 3600)
+        try h.store.deleteSession()
+        try h.store.saveState(.clean)
+        let before = h.notifier.posts.count
+
+        let outcome = await m.end(reason: .user)
+
+        XCTAssertEqual(outcome, .restored)
+        XCTAssertFalse(m.isActive)
+        XCTAssertEqual(h.notifier.posts.count, before + 1)
+        XCTAssertEqual(h.notifier.posts.last?.body, "Ended by you. Sleep is back to normal.")
+    }
+
+    /// With the lid open the countdown ticks once a second, and a tick that
+    /// finds session.json gone ends the session within about a second, with
+    /// no transaction of the user's needed.
+    func testTheCountdownTickNoticesASessionTheAgentEnded() async throws {
+        // Real-time harness so the 1 Hz Timer actually fires.
+        let real = Harness(now: Date())
+        defer { real.home.destroy() }
+        let m = real.makeManager()
+        await m.start(duration: 3600)
+        XCTAssertTrue(m.isActive)
+        XCTAssertTrue(m.countdownTimerArmed)
+        try real.store.deleteSession()
+        try real.store.saveState(.clean)
+
+        let deadline = Date().addingTimeInterval(8)
+        while m.isActive && Date() < deadline {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+
+        XCTAssertFalse(m.isActive)
+        XCTAssertFalse(m.countdownTimerArmed)
+        XCTAssertEqual(real.guardFake.calls, ["disablesleep 1"])
+        XCTAssertTrue(real.notifier.posts.last?.body.contains("recovery agent") ?? false, "\(real.notifier.posts)")
+    }
+
     func testDeadlineTimerFiresEnd() async throws {
         // Use the real clock for this one so the Timer can actually fire.
         let real = Harness(now: Date())

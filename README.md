@@ -160,7 +160,9 @@ a session; the app runs the same actions it would on a real lid event.
 ## How recovery works
 
 <p align="center">
-  <img src="docs/assets/recovery-flow.svg" alt="The app and a launchd backstop coordinate through a shared lock and recovery journal. The app handles normal cleanup. The backstop checks every minute and attempts due recovery, leaving valid active sessions alone. Failed or unreadable recovery evidence stays on disk; saved audio needs the app and unconfirmed stopped processes need inspection." width="880">
+  <img src="docs/assets/recovery-flow.svg" alt="The app and a launchd backstop coordinate through a shared lock and recovery journal. The app handles normal cleanup. The backstop checks every minute: it restores once the deadline has passed, and it ends a valid session early when no app holds the liveness lock, the battery is below the end floor on battery power, or the thermal level is critical. Failed or unreadable recovery evidence stays on disk; saved audio needs the app and unconfirmed stopped processes need inspection." width="880">
+  <br>
+  <sub>The drawing shows the two paths back to normal. It predates the backstop's own early ends (app gone, end floor, critical heat), which the text below describes.</sub>
 </p>
 
 Insomnia records pending changes in a recovery journal. On session end, the app

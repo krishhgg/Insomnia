@@ -200,7 +200,7 @@ run_bounded() { # command args...
     rm -f "$APP_SUPPORT"/.backstop.*.pid "$APP_SUPPORT"/.backstop.*.rc
   fi
   (
-    "$@" </dev/null >/dev/null 2>&1 &
+    "$@" </dev/null >"${BOUNDED_STDOUT:-/dev/null}" 2>/dev/null &
     cpid=$!
     echo "$cpid" > "$pidfile"
     rc=0
@@ -227,6 +227,27 @@ run_bounded() { # command args...
   wait "$supervisor" 2>/dev/null || true
   rm -f "$pidfile" "$rcfile"
   return "$rc"
+}
+
+# run_bounded for a read (pmset -g batt, notifyutil -g): the command's stdout
+# is captured into the variable named by $1, under the same time limit, so a
+# read that hangs cannot hold the recovery lock for the whole minute. A read
+# changes nothing, so one that ignores SIGTERM is left to its supervisor like
+# an undo command (lock held until it ends, pid logged) and this run goes on;
+# the caller treats the read as failed (exit 124 or 125).
+run_bounded_read() { # varname command args...
+  local __name="$1" __file __rc=0 __alive_before=$command_alive
+  shift
+  __file="$APP_SUPPORT/.backstop.$$.read"
+  : > "$__file"
+  BOUNDED_STDOUT="$__file" run_bounded "$@" || __rc=$?
+  # A read left alive is logged above and keeps the lock through its
+  # supervisor, but it is not an undo command: it must not make a later undo
+  # command's own failure read as "still alive".
+  command_alive=$__alive_before
+  printf -v "$__name" '%s' "$(cat "$__file" 2>/dev/null)"
+  rm -f "$__file"
+  return "$__rc"
 }
 
 # End this run right after a timed-out undo command that is still alive:
@@ -332,17 +353,26 @@ app_alive() {
 }
 
 # A setting from config.json, or the default when the file or key is missing
-# or the value is not of the right shape (the app falls back to its default
-# then too).
+# or the value is not of the JSON type the app decodes (Int, Bool): a string
+# "false" or "30" is rejected here as the app rejects it, so both enforce the
+# same rule. plutil -extract raw prints a string and a number alike; the type
+# comes from plutil -type.
 config_int() { # key default
   local v
   v="$(extract "$CONFIG" "$1" || true)"
-  if [[ "$v" =~ ^[0-9]+$ ]]; then echo "$((10#$v))"; else echo "$2"; fi
+  if [[ "$(type_of "$CONFIG" "$1")" == integer && "$v" =~ ^[0-9]+$ ]]; then
+    echo "$((10#$v))"
+  else
+    echo "$2"
+  fi
 }
 config_bool() { # key default
   local v
   v="$(extract "$CONFIG" "$1" || true)"
-  case "$v" in true|false) echo "$v" ;; *) echo "$2" ;; esac
+  if [[ "$(type_of "$CONFIG" "$1")" == bool ]]; then
+    case "$v" in true|false) echo "$v"; return ;; esac
+  fi
+  echo "$2"
 }
 
 # pmset -g batt prints the source ("Now drawing from 'Battery Power'" or 'AC
@@ -350,17 +380,23 @@ config_bool() { # key default
 # discharging; 0:41 remaining present: true"). Sets battery_reason and
 # returns 0 when the session must end: an internal battery is present, the
 # Mac draws from it, and the percentage is below endFloor (strict, so 0
-# disables the rule, as in FloorRules.swift); or pmset fails; or a battery is
-# present but its source or percentage cannot be read (fail closed, the
-# app's rule for an unreadable battery). No InternalBattery line is a
-# desktop: no battery rule.
+# disables the rule, as in FloorRules.swift, and nothing is read then); or
+# pmset fails or hangs; or a battery is present but its source or percentage
+# cannot be read (fail closed, the app's rule for an unreadable battery). No
+# InternalBattery line is a desktop: no battery rule. A pmset that fails
+# cannot tell a desktop from a laptop, so with the floor on it ends.
 battery_reason=""
 battery_cutoff() {
-  local out rc=0 floor percent source line
+  local out="" rc=0 floor percent source line
   local source_re="Now drawing from '([^']*)'" percent_re='[[:space:]]([0-9]+)%;'
   battery_reason=""
-  out="$("$PMSET" -g batt 2>/dev/null)" || rc=$?
-  if (( rc != 0 )); then
+  floor="$(config_int endFloor 10)"
+  (( floor > 0 )) || return 1
+  run_bounded_read out "$PMSET" -g batt || rc=$?
+  if (( rc == 124 || rc == 125 )); then
+    battery_reason="battery state unreadable (pmset -g batt did not finish within ${COMMAND_TIMEOUT_SECONDS}s)"
+    return 0
+  elif (( rc != 0 )); then
     battery_reason="battery state unreadable (pmset -g batt exit $rc)"
     return 0
   fi
@@ -374,7 +410,6 @@ battery_cutoff() {
     return 0
   fi
   [[ "$source" == "Battery Power" ]] || return 1
-  floor="$(config_int endFloor 10)"
   if (( 10#$percent < floor )); then
     battery_reason="battery at ${percent}% on battery power, below the ${floor}% end floor"
     return 0
@@ -384,14 +419,15 @@ battery_cutoff() {
 
 # notifyutil -g prints "com.apple.system.thermalpressurelevel N" (levels at
 # THERMAL_CRITICAL_LEVEL). Sets thermal_reason and returns 0 when the
-# session must end. Off with thermalRules false in config.json. Unreadable:
-# a warning, never an end on that alone; the alive and battery checks stand.
+# session must end. Off with thermalRules false in config.json. Unreadable
+# (failed, hung, or not a level): a warning, never an end on that alone; the
+# alive and battery checks stand.
 thermal_reason=""
 thermal_cutoff() {
-  local out level
+  local out="" level
   thermal_reason=""
   [[ "$(config_bool thermalRules true)" == true ]] || return 1
-  out="$("$NOTIFYUTIL" -g com.apple.system.thermalpressurelevel 2>/dev/null)" || out=""
+  run_bounded_read out "$NOTIFYUTIL" -g com.apple.system.thermalpressurelevel || out=""
   level="${out##* }"
   if [[ -z "$out" || ! "$level" =~ ^[0-9]+$ ]]; then
     log warn "thermal pressure level unreadable (notifyutil printed '${out:-nothing}'); not ending the session on that alone"

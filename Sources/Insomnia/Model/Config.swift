@@ -62,6 +62,14 @@ struct Config: Codable, Equatable, Sendable {
         24 * 3600,
     ]
 
+    /// What builds before the 24-hour ceiling wrote into config.json as
+    /// their defaults. Settings saves the whole struct, so an ordinary
+    /// install has these as explicit values; the decoder reads exactly these
+    /// as the current defaults and keeps any other value, which a person
+    /// chose by hand.
+    static let legacyMaxDuration: TimeInterval = 30 * 24 * 3600
+    static let legacyPresets: [TimeInterval] = defaultPresets + [3 * 24 * 3600]
+
     /// Default freeze list: chat apps that burn battery in the background.
     static let defaultFreezeList: [String] = [
         "com.tinyspeck.slackmacgap",      // Slack
@@ -102,6 +110,8 @@ struct Config: Codable, Equatable, Sendable {
         presets = try c.decodeIfPresent([TimeInterval].self, forKey: .presets) ?? d.presets
         defaultPreset = try c.decodeIfPresent(TimeInterval.self, forKey: .defaultPreset) ?? d.defaultPreset
         maxDuration = try c.decodeIfPresent(TimeInterval.self, forKey: .maxDuration) ?? d.maxDuration
+        if presets == Config.legacyPresets { presets = d.presets }
+        if maxDuration == Config.legacyMaxDuration { maxDuration = d.maxDuration }
         freezeList = try c.decodeIfPresent([String].self, forKey: .freezeList) ?? d.freezeList
         freezeAllApps = try c.decodeIfPresent(Bool.self, forKey: .freezeAllApps) ?? d.freezeAllApps
         dockerRule = try c.decodeIfPresent(Bool.self, forKey: .dockerRule) ?? d.dockerRule

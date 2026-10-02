@@ -347,6 +347,9 @@ final class UIStatusTests: XCTestCase {
         // The same label the 24h preset chip and the Settings maximum row show.
         XCTAssertEqual(MenuBarModel.tooLongText(allowed: day), "Up to 1d")
         XCTAssertEqual(MenuBarModel.tooLongText(allowed: 23 * 3600 + 30 * 60), "Up to 23h30m")
+        // Minutes past a day are kept: the user can type 1d30m back in.
+        XCTAssertEqual(MenuBarModel.tooLongText(allowed: day + 30 * 60), "Up to 1d30m")
+        XCTAssertEqual(MenuBarModel.tooLongText(allowed: day + 30 * 60 + 45), "Up to 1d30m")
         XCTAssertEqual(MenuBarModel.tooLongText(allowed: 30), "At the maximum")
         XCTAssertEqual(MenuBarModel.tooLongText(allowed: -5), "At the maximum")
     }

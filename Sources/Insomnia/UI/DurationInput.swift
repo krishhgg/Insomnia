@@ -25,7 +25,7 @@ struct DurationInput: Equatable, Sendable {
         /// ceiling: that is the number a session is held to.
         func help(maxDuration: TimeInterval) -> String {
             switch self {
-            case .days: return "Up to \(chipLabel(for: maxDuration)) per session"
+            case .days: return "Up to \(exactLabel(for: maxDuration)) per session"
             case .hours: return "0\u{2013}\(DurationInput.maxHours)"
             case .minutes: return "0\u{2013}\(DurationInput.maxMinutes)"
             }

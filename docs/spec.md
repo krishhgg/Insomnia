@@ -71,7 +71,10 @@ recovery; newly written journals use `frozenProcesses`.
   Enter with empty fields uses the configured default preset. Maximum 24
   hours by default (`maxDuration` in config.json, which also caps presets and
   extensions). A time past the maximum is refused with the allowance shown
-  beside the pills ("Up to 1d"); it is never shortened without saying so.
+  beside the pills ("Up to 1d", "Up to 23h30m"); it is never shortened
+  without saying so. A config.json saved by an older build with that build's
+  defaults (30 days, a 3-day preset) reads as the current defaults; any other
+  saved value is kept.
 - While active the menu bar shows a second-resolution countdown. The redraw
   timer runs at 1 Hz and stops while the lid is closed.
 - Click the cup/countdown to enter an extension; hold the end control to end.

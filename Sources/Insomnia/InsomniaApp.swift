@@ -74,17 +74,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// without waiting. Taken before reconcile, so the first backstop run
     /// after launch already sees this process, and never released: the
     /// kernel drops it when the process exits, however that happens. The
-    /// short retry covers a backstop probe holding it for a moment; a hold
-    /// that outlasts it is another Insomnia, whose lock the backstop sees.
+    /// 2 s wait covers a backstop probe holding it for a moment; a hold that
+    /// outlasts it is another Insomnia, whose lock the backstop sees. This
+    /// instance then keeps trying for as long as it runs, so that when the
+    /// other one exits this one is counted as alive within 2 s, not never:
+    /// otherwise a session started here would be ended by the backstop's
+    /// next run as "Insomnia is not running".
     private func takeAliveLock() async {
         do {
             if try await aliveLock.acquire(timeout: 2) {
                 Log.info("alive lock held")
-            } else {
-                Log.error("alive lock \(aliveLock.path) is held by another process (another Insomnia?); the backstop does not count this instance as running")
+                return
             }
+            Log.error("alive lock \(aliveLock.path) is held by another process (another Insomnia?); until it is free the backstop does not count this instance as running and ends any session it starts; retrying every 2 s")
         } catch {
-            Log.error("could not take the alive lock: \(error.localizedDescription); the backstop will end any session within a minute")
+            Log.error("could not take the alive lock: \(error.localizedDescription); until it is held the backstop ends any session within a minute; retrying every 2 s")
+        }
+        Task { [aliveLock] in
+            await aliveLock.acquireEventually(pollEvery: .seconds(2))
+            if aliveLock.isHeld { Log.info("alive lock held after waiting") }
         }
     }
 
