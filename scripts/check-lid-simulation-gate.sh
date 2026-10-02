@@ -2,10 +2,11 @@
 # Proves on the built binaries, not on the compilation condition, that the
 # scripts/simulate-lid.sh watcher is compiled out of a plain release build
 # and in only with -DINSOMNIA_LID_SIMULATION (what install.sh adds for
-# INSOMNIA_LID_SIMULATION=1). CI runs this after `swift build -c release`;
-# it can be run locally the same way. It builds into .build only and
-# installs nothing. The opt-in build uses its own scratch path so the
-# plain release binary is left as built.
+# INSOMNIA_LID_SIMULATION=1). CI runs this after its release build step,
+# with the same flags, so the plain build here is that binary rather than
+# a rebuild; it can be run locally the same way. It builds into .build
+# only and installs nothing. The opt-in build uses its own scratch path so
+# the plain release binary is left as built.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -15,11 +16,13 @@ SIM_SCRATCH=.build/lid-simulation
 # its log lines and the build marker shown in the status menu and Settings.
 SYMBOL='13LidSimulationC'
 TEXTS=("lid SIMULATED" "Lid simulation build:")
+# The flags of CI's "Build release" step; a warning in either build fails.
+RELEASE_FLAGS=(-c release -Xswiftc -warnings-as-errors)
 
-"$SWIFT" build -c release
-plain="$("$SWIFT" build -c release --show-bin-path)/Insomnia"
-"$SWIFT" build -c release --scratch-path "$SIM_SCRATCH" -Xswiftc -DINSOMNIA_LID_SIMULATION
-sim="$("$SWIFT" build -c release --scratch-path "$SIM_SCRATCH" -Xswiftc -DINSOMNIA_LID_SIMULATION --show-bin-path)/Insomnia"
+"$SWIFT" build "${RELEASE_FLAGS[@]}"
+plain="$("$SWIFT" build "${RELEASE_FLAGS[@]}" --show-bin-path)/Insomnia"
+"$SWIFT" build "${RELEASE_FLAGS[@]}" --scratch-path "$SIM_SCRATCH" -Xswiftc -DINSOMNIA_LID_SIMULATION
+sim="$("$SWIFT" build "${RELEASE_FLAGS[@]}" --scratch-path "$SIM_SCRATCH" -Xswiftc -DINSOMNIA_LID_SIMULATION --show-bin-path)/Insomnia"
 
 failed=0
 check() { # label binary present|absent
