@@ -1280,6 +1280,46 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(fx.exists(fx.app))
     }
 
+    /// The release-install path with the real codesign: a bundle ad-hoc
+    /// signed with `codesign -s -` inside the fixture (every other tool stays
+    /// a fake) verifies before the password prompt, the copy ditto makes at
+    /// the installed path verifies again against the requirement codesign
+    /// read from it, and the agent plist pins that real cdhash. After the
+    /// sealed script is edited the same bundle is refused before sudo with
+    /// codesign's reason.
+    func testInstallFromAnAdHocSignedPrebuiltAppVerifiesTheRealSignatureAndItsDittoCopy() throws {
+        try fx.prepareInstall()
+        try fx.writeInstallCopies(extraConstants: ["CODESIGN": "/usr/bin/codesign"])
+        let prebuilt = try fx.writePrebuiltApp(machO: true)
+        let sign = try fx.runTool("/usr/bin/codesign", ["--force", "--sign", "-", prebuilt.path])
+        XCTAssertEqual(sign.status, 0, sign.output)
+        fx.setMode("launchctl", "loaded")
+
+        let r = try fx.run(fx.installRedirected, ["--allow-unverified-origin", "--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        let requirement = try CodeRequirement.designated(ofCodeAt: prebuilt)
+        XCTAssertTrue(requirement.hasPrefix("cdhash H\""), requirement)
+        XCTAssertTrue(r.stdout.contains("LaunchAgent will require: \(requirement)"), r.stdout)
+        let installed = try fx.runTool("/usr/bin/codesign", ["--verify", "--strict", "--deep", fx.app.path])
+        XCTAssertEqual(installed.status, 0, "the ditto copy at the installed path verifies: \(installed.output)")
+        XCTAssertNoThrow(try CodeRequirement.verify(codeAt: fx.app, satisfies: requirement))
+        let plist = try fx.plistOnDisk()
+        let expected = LaunchdBackstop.plistDictionary(label: "com.insomnia.backstop", target: BackstopTarget(bundle: fx.app, requirement: requirement))
+        XCTAssertTrue(NSDictionary(dictionary: plist).isEqual(to: expected), "the agent pins the real requirement: \(plist)")
+        XCTAssertTrue(fx.calls().contains { $0.hasPrefix("launchctl bootstrap") }, "\(fx.calls())")
+
+        let sealed = prebuilt.appendingPathComponent("Contents/Resources/backstop.sh")
+        try (String(contentsOf: sealed, encoding: .utf8) + "# edited\n").write(to: sealed, atomically: true, encoding: .utf8)
+        fx.clearCalls()
+        let edited = try fx.run(fx.installRedirected, ["--allow-unverified-origin", "--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(edited.status, 1, edited.stderr + edited.stdout)
+        XCTAssertEqual(fx.calls(), [], "the real codesign refused before any fake tool ran: \(fx.calls())")
+        XCTAssertTrue(edited.stderr.contains("fails 'codesign --verify --strict --deep'"), edited.stderr)
+        XCTAssertTrue(edited.stderr.contains("Nothing was changed"), edited.stderr)
+    }
+
     func testInstallFromPrebuiltAppStopsBeforeSudoWhenItsSignatureDoesNotVerify() throws {
         try fx.prepareInstall()
         try fx.installMachinery()
@@ -2132,11 +2172,12 @@ private final class ScriptFixture {
     }
 
     /// A bundle the way a release zip carries it: Info.plist, a marker
-    /// executable and the sealed backstop (the fixture's patched copy, so
-    /// install.sh's recovery step acts on the fixture). What the fake
-    /// codesign says about its signature is set with `setMode("codesign",
-    /// ...)` and `setSigning(...)`.
-    func writePrebuiltApp(bundleID: String = "com.kgarg.insomnia", version: String = "0.1.0", withBackstop: Bool = true) throws -> URL {
+    /// executable (or a real Mach-O, a copy of /usr/bin/true, when `machO`
+    /// is set so the real codesign can sign the bundle) and the sealed
+    /// backstop (the fixture's patched copy, so install.sh's recovery step
+    /// acts on the fixture). What the fake codesign says about its signature
+    /// is set with `setMode("codesign", ...)` and `setSigning(...)`.
+    func writePrebuiltApp(bundleID: String = "com.kgarg.insomnia", version: String = "0.1.0", withBackstop: Bool = true, machO: Bool = false) throws -> URL {
         let app = root.appendingPathComponent("dist/Insomnia.app", isDirectory: true)
         try fm.createDirectory(at: app.appendingPathComponent("Contents/MacOS"), withIntermediateDirectories: true)
         try fm.createDirectory(at: app.appendingPathComponent("Contents/Resources"), withIntermediateDirectories: true)
@@ -2144,11 +2185,17 @@ private final class ScriptFixture {
         <?xml version="1.0" encoding="UTF-8"?>
         <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
         <plist version="1.0"><dict>
+        <key>CFBundleExecutable</key><string>Insomnia</string>
         <key>CFBundleIdentifier</key><string>\(bundleID)</string>
+        <key>CFBundlePackageType</key><string>APPL</string>
         <key>CFBundleShortVersionString</key><string>\(version)</string>
         </dict></plist>
         """.write(to: app.appendingPathComponent("Contents/Info.plist"), atomically: true, encoding: .utf8)
-        try "prebuilt".write(to: app.appendingPathComponent("Contents/MacOS/Insomnia"), atomically: true, encoding: .utf8)
+        if machO {
+            try fm.copyItem(atPath: "/usr/bin/true", toPath: app.appendingPathComponent("Contents/MacOS/Insomnia").path)
+        } else {
+            try "prebuilt".write(to: app.appendingPathComponent("Contents/MacOS/Insomnia"), atomically: true, encoding: .utf8)
+        }
         if withBackstop {
             try fm.copyItem(at: backstop, to: app.appendingPathComponent("Contents/Resources/backstop.sh"))
         }
@@ -2504,9 +2551,12 @@ private final class ScriptFixture {
 
     // MARK: Running
 
+    /// Decoded lossily: the fake launchctl copies the first line of the
+    /// installed binary into the log, which is Mach-O bytes, not text, for
+    /// the fixture the real codesign signs.
     func calls() -> [String] {
-        guard let text = try? String(contentsOf: callsLog, encoding: .utf8) else { return [] }
-        return text.split(separator: "\n").map(String.init)
+        guard let data = try? Data(contentsOf: callsLog) else { return [] }
+        return String(decoding: data, as: UTF8.self).split(separator: "\n").map(String.init)
     }
 
     func clearCalls() {
@@ -2561,6 +2611,23 @@ private final class ScriptFixture {
         return (p.terminationStatus,
                 (try? String(contentsOf: outURL, encoding: .utf8)) ?? "",
                 (try? String(contentsOf: errURL, encoding: .utf8)) ?? "")
+    }
+
+    /// Runs a real tool (not a script) with the fixture's environment, for
+    /// the one test that signs its fixture with the real codesign.
+    func runTool(_ exe: String, _ args: [String]) throws -> (status: Int32, output: String) {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: exe)
+        p.arguments = args
+        p.environment = childEnvironment
+        p.currentDirectoryURL = root
+        let out = Pipe()
+        p.standardOutput = out
+        p.standardError = out
+        try p.run()
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        return (p.terminationStatus, String(decoding: data, as: UTF8.self))
     }
 
     /// Holds the recovery lock from another process, the way a running app

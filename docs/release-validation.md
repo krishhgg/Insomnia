@@ -159,11 +159,12 @@ Packaging is automated: `scripts/build-app.sh` makes the bundle, and the
 Release workflow tests, packages, checksums, attests and publishes it for a
 `v*` tag (`docs/releasing.md`). PackagingTests run a patched copy of
 `build-app.sh` with the real codesign, RecoveryScriptTests run `install.sh
---app` against prebuilt fixtures, and ReleaseWorkflowTests check that every
-action in the workflows is pinned to a commit and that no job has more than
-read access except the one that publishes. No release has been produced with
-it yet. Developer ID signing and notarization run only once the maintainer
-adds the secrets; until then releases are ad-hoc signed prereleases. A
+--app` against prebuilt fixtures, one of them ad-hoc signed by the real
+codesign, and ReleaseWorkflowTests check that every action in the workflows
+is pinned to a commit and that no job has more than read access except the
+one that publishes. No release has been produced with it yet. Developer ID
+signing and notarization run only once the maintainer adds the secrets;
+until then releases are ad-hoc signed prereleases. A
 consumer installation and recovery walkthrough from a downloaded zip has not
 been done. Open-source availability and a passing PR are not equivalent to
 readiness for a signed public binary release.
