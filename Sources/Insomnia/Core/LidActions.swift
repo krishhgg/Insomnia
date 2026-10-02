@@ -86,6 +86,9 @@ final class LidActions {
                 }
             }
 
+            // A session whose end arrived during this transaction has no
+            // countdown left to pause; its end is queued right behind.
+            guard manager.isActive, manager.endTicket == ticket, !Task.isCancelled else { return }
             manager.pauseCountdown()
         }
         if !ran { Log.error("lid close actions skipped: recovery lock busy") }

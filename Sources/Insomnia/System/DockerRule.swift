@@ -55,23 +55,25 @@ struct DockerRule: Sendable {
         do {
             let idle = try await probe()
             guard idle else {
-                Log.info("docker rule: containers running, Docker left alone")
+                Log.info("docker rule: first check found containers running, Docker left alone")
                 return nil
             }
+            Log.info("docker rule: first check found no running container")
             return docker
         } catch {
-            Log.error("docker rule: probe failed, Docker left alone: \(error.localizedDescription)")
+            Log.error("docker rule: first check failed, Docker left alone: \(error.localizedDescription)")
             return nil
         }
     }
 
     /// The second check. True only when the probe answers idle again; busy,
-    /// a failed probe and a timeout all return false, each with its own log
-    /// line, and the caller leaves Docker alone.
+    /// a failed probe and a timeout all return false. Every answer of both
+    /// checks gets its own log line, so a release check can read which
+    /// probe saw what.
     func isStillIdle() async -> Bool {
         do {
             let idle = try await probe()
-            if !idle { Log.info("docker rule: second check found containers running, Docker left alone") }
+            Log.info(idle ? "docker rule: second check found no running container" : "docker rule: second check found containers running, Docker left alone")
             return idle
         } catch {
             Log.error("docker rule: second check failed, Docker left alone: \(error.localizedDescription)")

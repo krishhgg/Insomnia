@@ -121,7 +121,7 @@ is performed. Do not replace "not run" with "passed" based on source review.
 | Simulated lid close/open via scripts/simulate-lid.sh | Not run |
 | Existing Low Power Mode preference and saved audio restoration | Not run |
 | Docker Desktop idle/busy behavior with another Docker context selected | Not run |
-| Docker rule off on a fresh config.json (no `docker ps`, Docker untouched) and on with a container started between the two idle checks (Docker untouched, second check logged) | Not run |
+| Docker rule off on a fresh config.json (no `docker ps`, Docker untouched) and on with a container started between the two idle checks (Docker untouched, both checks logged with their answers) | Not run |
 | Hotspot permission, association, cancellation, and reconnect | Not run |
 | Settings location note matches what System Settings shows after the grant | Not run |
 | tmux cancellation with a dedicated disposable pane | Not run |

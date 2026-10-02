@@ -587,9 +587,12 @@ that any case passed; record results in the release validation record.
    every session at login. Saved audio requires the app to reopen.
 5. **Freeze.** Slack and WhatsApp on list, close lid, `ps -o stat` shows `T`
    for their whole trees. Open lid → running, reconnected, no relaunch.
-6. **Docker rule.** Rule on. No containers → paused on close. One container →
-   untouched. A container started between the two checks (`docker ps` is
-   logged twice) → untouched, log names the second check.
+6. **Docker rule.** Rule on. No containers → paused on close; insomnia.log
+   has "first check found no running container" and "second check found no
+   running container". One container → untouched, log has "first check found
+   containers running". A container started between the two checks →
+   untouched, log has the first check finding none and "second check found
+   containers running".
 7. **Mute.** Volume 60%, close lid → muted. Open → 60%, unmuted.
 8. **Chrome occlusion.** Lid closed, Playwright attached to headed Chrome:
    read `document.visibilityState` and measure `setInterval` drift. Repeat with

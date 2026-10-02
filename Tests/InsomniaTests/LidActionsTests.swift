@@ -1143,6 +1143,7 @@ final class LidActionsTests: XCTestCase {
         XCTAssertFalse(s.dockerFrozen)
         XCTAssertEqual(m.state, s)
         let log = logText()
+        XCTAssertTrue(log.contains("docker rule: first check found no running container"), log)
         XCTAssertTrue(log.contains("second check found containers running, Docker left alone"), log)
         XCTAssertTrue(log.contains("Docker left running: the check before the signal said no"), log)
 
@@ -1190,6 +1191,25 @@ final class LidActionsTests: XCTestCase {
         let s = try XCTUnwrap(try h.store.loadState())
         XCTAssertEqual(s.frozenPids, [100, 101, 102, 400, 401])
         XCTAssertTrue(s.dockerFrozen)
+        // Both answers are in insomnia.log, so a release check can read them.
+        let log = logText()
+        XCTAssertTrue(log.contains("docker rule: first check found no running container"), log)
+        XCTAssertTrue(log.contains("docker rule: second check found no running container"), log)
+    }
+
+    /// The first check finds a container: no second check, one log line.
+    func testFirstCheckBusyIsLoggedAndSkipsTheSecond() async throws {
+        let probes = Locked(0)
+        let (m, actions) = await make(dockerIdle: { probes.value += 1; return false })
+        await m.start(duration: 3600)
+
+        await actions.onClose()
+
+        XCTAssertEqual(probes.value, 1)
+        XCTAssertEqual(h.procs.suspended, [[100, 101, 102]])
+        let log = logText()
+        XCTAssertTrue(log.contains("docker rule: first check found containers running, Docker left alone"), log)
+        XCTAssertFalse(log.contains("second check"), log)
     }
 
     /// An end requested while the second probe is running wins, as it does
@@ -1216,6 +1236,61 @@ final class LidActionsTests: XCTestCase {
         XCTAssertEqual(h.procs.suspended, [[100, 101, 102]])
         XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
         XCTAssertTrue(logText().contains("session ending during the second check"), logText())
+    }
+
+    /// The same end during the second check, then a new session started
+    /// with the lid open. The close transaction must not pause the
+    /// countdown of the session that was ending, and the next session's
+    /// countdown must tick: the real 1 Hz timer redraws it, not only a flag.
+    func testEndDuringTheSecondCheckLeavesTheNextSessionsCountdownTicking() async throws {
+        // The redraw timer fires on wall-clock time, so the fake clock
+        // starts there and the first tick comes within a second.
+        h.clock.now = Date()
+        let gate = AsyncGate()
+        let calls = Locked(0)
+        let (m, actions) = await make(dockerIdle: {
+            calls.value += 1
+            if calls.value == 2 { await gate.wait() }
+            return true
+        })
+        await m.start(duration: 3600)
+        let close = Task { await actions.onClose() }
+        await gate.waitUntilStarted()
+        let end = Task { await m.end(reason: .user) }
+        await settleQueuedRequests()
+        await gate.open()
+        await close.value
+        _ = await end.value
+        XCTAssertFalse(m.isActive)
+
+        XCTAssertEqual(h.clamshell.closed, false, "the lid is open for the new session")
+        await m.start(duration: 3600)
+
+        XCTAssertTrue(m.isActive)
+        XCTAssertTrue(m.countdownTimerArmed, "a session started with the lid open has no countdown timer")
+        let before = m.countdownText
+        h.clock.advance(7)
+        let deadline = Date().addingTimeInterval(5)
+        while m.countdownText == before, Date() < deadline {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        XCTAssertNotEqual(m.countdownText, before, "the countdown did not tick")
+    }
+
+    /// Older than the Docker rule: a session that ends with the lid shut
+    /// gets no lid open call (there is no session left), so the pause from
+    /// its close must not carry into the next session.
+    func testEndWithTheLidClosedDoesNotPauseTheNextSessionsCountdown() async throws {
+        let (m, actions) = await make(dockerIdle: { false })
+        await m.start(duration: 3600)
+        await actions.onClose()
+        XCTAssertFalse(m.countdownTimerArmed)
+
+        await m.end(reason: .timer)
+        await actions.onOpen()
+        await m.start(duration: 3600)
+
+        XCTAssertTrue(m.countdownTimerArmed, "the next session inherited the lid-closed pause")
     }
 
     func testAudioReadFailureSkipsMuteButStillFreezes() async throws {
