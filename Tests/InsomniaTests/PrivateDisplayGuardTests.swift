@@ -313,6 +313,78 @@ final class RefusedDarkeningTests: XCTestCase {
         XCTAssertFalse(try XCTUnwrap(try h.store.loadState()).brightnessJournaled)
     }
 
+    private var refusedKeyboard: CoreBrightnessKeyboardBacklight {
+        CoreBrightnessKeyboardBacklight(loadClass: { ChangedSignatureKeyboardClient.self })
+    }
+
+    /// Brightness saved under a lid close before an update, as the journal
+    /// would hold it.
+    private func seedSavedBrightness(sessionValid: Bool) throws {
+        if sessionValid {
+            let now = h.clock.now
+            try h.store.saveSession(Session(startedAt: now.addingTimeInterval(-600), endsAt: now.addingTimeInterval(3600)))
+        }
+        var st = RuntimeState()
+        st.savedDisplayBrightness = 0.8
+        st.savedKeyboardBrightness = 0.3
+        try h.store.saveState(st)
+    }
+
+    /// The values were saved on a measured Mac; after an update the guard
+    /// refuses both devices. The relaunch with the lid open wakes the
+    /// display, writes nothing through the refused calls, drops both
+    /// entries instead of retrying them forever, and says how to restore
+    /// the levels by hand.
+    func testASavedValueTheGuardNowRefusesIsDroppedNotRetried() async throws {
+        try seedSavedBrightness(sessionValid: true)
+        h.clamshell.closed = false
+        let m = h.makeManager(display: refusedDisplay, keyboard: refusedKeyboard)
+
+        await m.reconcile()
+
+        XCTAssertEqual(h.display.wakes, 1)
+        XCTAssertEqual(h.display.sets, [])
+        XCTAssertEqual(h.keyboard.sets, [])
+        let after = try XCTUnwrap(try h.store.loadState())
+        XCTAssertNil(after.savedDisplayBrightness)
+        XCTAssertNil(after.savedKeyboardBrightness)
+        XCTAssertFalse(after.hasLidActions, "the live session keeps the sleep guard journaled, but no lid entry is left")
+        let error = try XCTUnwrap(m.lastError)
+        XCTAssertTrue(error.contains("Set it with the brightness keys or Control Center"), error)
+        let log = logText()
+        XCTAssertTrue(log.contains("could not restore the display brightness saved before the lid closed (0.8): DisplayServices brightness calls were measured on macOS 26 only; this is macOS 27"), log)
+        XCTAssertTrue(log.contains("could not restore the keyboard backlight saved before the lid closed (0.3): KeyboardBrightnessClient isKeyboardBuiltIn: has type encoding B@:i"), log)
+        XCTAssertTrue(log.contains("the saved value was dropped"), log)
+    }
+
+    /// No session left, only the refused entries: the end that reconcile
+    /// runs finds the journal clean afterwards, so no "Restore incomplete"
+    /// is posted and nothing is scheduled to retry.
+    func testARefusedEntryDoesNotLeaveTheJournalDirty() async throws {
+        try seedSavedBrightness(sessionValid: false)
+        h.clamshell.closed = false
+        let m = h.makeManager(display: refusedDisplay, keyboard: refusedKeyboard)
+
+        await m.reconcile()
+
+        XCTAssertFalse(try XCTUnwrap(try h.store.loadState()).isDirty)
+        XCTAssertFalse(h.notifier.posts.contains { $0.title == SessionManager.incompleteTitle }, "\(h.notifier.posts)")
+    }
+
+    /// Only a refusal drops the entry: a measured device whose write fails
+    /// keeps it for the retry, as before.
+    func testAFailedWriteOnAMeasuredDeviceStillKeepsTheEntry() async throws {
+        try seedSavedBrightness(sessionValid: true)
+        h.clamshell.closed = false
+        h.display.throwOnSet = true
+        let m = h.makeManager()
+
+        await m.reconcile()
+
+        XCTAssertEqual(try h.store.loadState()?.savedDisplayBrightness, 0.8)
+        XCTAssertNil(try h.store.loadState()?.savedKeyboardBrightness, "the keyboard restored")
+    }
+
     func testSettingsSeesEveryRefusalWithItsDevice() {
         let m = SessionManager(
             paths: h.home.paths,

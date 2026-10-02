@@ -723,6 +723,15 @@ final class SessionManager {
         if state.brightnessJournaled {
             display.wake()
         }
+        // A value saved before an update (of macOS, or of Insomnia's
+        // measured tables) that the private-call guard now refuses can
+        // never be written by this build: dropped, not retried.
+        if let saved = state.savedDisplayBrightness, let why = display.refusal() {
+            dropRefusedRestore("display brightness", saved: saved, why: why) { $0.savedDisplayBrightness = nil }
+        }
+        if let saved = state.savedKeyboardBrightness, let why = keyboard.refusal() {
+            dropRefusedRestore("keyboard backlight", saved: saved, why: why) { $0.savedKeyboardBrightness = nil }
+        }
         // Read before the entries are cleared: the re-assert below needs them.
         var restoredDisplay: Float?
         var restoredKeyboard: Float?
@@ -1070,6 +1079,20 @@ final class SessionManager {
     private func fail(_ message: String) {
         lastError = message
         Log.error(message)
+    }
+
+    /// The guard refuses this device on this Mac, so retrying its saved
+    /// value would keep the journal dirty, with a "Restore incomplete" at
+    /// every end and launch, and restore nothing. The entry is dropped and
+    /// the user is told to set the level by hand.
+    private func dropRefusedRestore(_ what: String, saved: Float, why: String, clear: (inout RuntimeState) -> Void) {
+        let message = "could not restore the \(what) saved before the lid closed (\(saved)): \(why). Set it with the brightness keys or Control Center"
+        do {
+            try journal(clear)
+            fail("\(message); the saved value was dropped, since this build will not call that function on this Mac")
+        } catch {
+            fail("\(message); the journal entry could not be cleared either: \(error.localizedDescription)")
+        }
     }
 
     private func iso(_ d: Date) -> String {

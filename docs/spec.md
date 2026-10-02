@@ -131,9 +131,13 @@ device is skipped at lid close with a log line, nothing is journaled for
 it, and Settings shows the reason under the darken toggle. With nothing
 journaled for either device the close does not request display sleep,
 since lid open and reconcile wake the display only for a journaled
-brightness, as section 4 describes. The guards narrow the risk of
-calling a private function whose shape changed; they do not replace the
-hardware rows in docs/release-validation.md.
+brightness, as section 4 describes. A brightness journaled before an
+update that the guard now refuses is not written on open or reconcile:
+the entry is dropped so the journal can come clean, and the error tells
+the user to set the level with the brightness keys or Control Center.
+Retrying it would keep the journal dirty forever. The guards narrow the
+risk of calling a private function whose shape changed; they do not
+replace the hardware rows in docs/release-validation.md.
 
 Freeze scope rules:
 
