@@ -1,9 +1,9 @@
 #!/bin/bash
 # Build Insomnia, assemble ~/Applications/Insomnia.app, install the backstop
-# script + LaunchAgent, and write the sudoers rule. Idempotent; quits a
-# running Insomnia, then asks for sudo once (for /etc/sudoers.d/insomnia),
-# before anything of a previous install is touched. Not atomic: a failure
-# after the sudoers step says exactly what was replaced so far.
+# script + LaunchAgent, and write the sudoers rule. Idempotent; asks for sudo
+# once (for /etc/sudoers.d/insomnia) before a running Insomnia is asked to
+# quit and before anything of a previous install is touched. Not atomic: a
+# failure after the sudoers step says exactly what was replaced so far.
 set -euo pipefail
 
 # Installation always uses the standard per-user layout. A relocated
@@ -50,10 +50,13 @@ cd "$ROOT"
 BIN="$("$SWIFT" build -c release --show-bin-path)/Insomnia"
 [[ -x "$BIN" ]] || { echo "binary not found at $BIN" >&2; exit 1; }
 
-# 2. Quit, then sudoers ------------------------------------------------------
-#    The running app is asked to quit before anything else, so an app that
-#    refuses leaves everything as it was, the sudoers file included. Then the
-#    password prompt: until the rule is installed and proven effective,
+# 2. Password, quit, then sudoers --------------------------------------------
+#    Order: say whether a session will end, ask for the password (`sudo -v`),
+#    quit the running app, then write the rule on sudo's cached credential.
+#    A cancelled or failed password stops before the app is asked to quit,
+#    so it changes nothing and a running session keeps going. An app that
+#    refuses to quit stops the install with nothing changed, the sudoers
+#    file included. Until the rule is installed and proven effective,
 #    neither the bundle, the installed backstop.sh nor the LaunchAgent are
 #    touched.
 #    Three commands, and none of them can keep the Mac awake: turning sleep
@@ -65,6 +68,37 @@ BIN="$("$SWIFT" build -c release --show-bin-path)/Insomnia"
 #    drops that line. An older build still installed cannot start a session
 #    under the new rule, so a stop between the rule and the new bundle says
 #    so and gives the rerun command.
+
+# Whether session.json holds a deadline still in the future, read the way
+# backstop.sh reads it. A file whose deadline cannot be read counts as a
+# running session: it may be one.
+session_running() {
+  local f="$APP_SUPPORT/session.json" ends ends_epoch
+  [[ -f "$f" ]] || return 1
+  ends="$("$PLUTIL" -extract endsAt raw -o - "$f" 2>/dev/null || true)"
+  ends_epoch="$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$ends" +%s 2>/dev/null || true)"
+  [[ -z "$ends_epoch" ]] || (( ends_epoch > $(date -u +%s) ))
+}
+if session_running; then
+  echo "A session is running and the upgrade will end it."
+  # Asked only when there is a terminal to answer on; a run without one
+  # goes ahead after the line above.
+  if [[ -t 0 ]]; then
+    answer=""
+    read -r -p "Continue? [y/N] " answer || true
+    case "$answer" in
+      [yY]|[yY][eE][sS]) ;;
+      *) echo "Nothing was changed; the session keeps running." >&2; exit 1 ;;
+    esac
+  fi
+fi
+
+step "Authenticating (requires your password once)"
+if ! "$SUDO" -v; then
+  echo "sudo did not authenticate. Nothing was changed; Insomnia was not asked to quit, so a running session keeps going." >&2
+  exit 1
+fi
+
 QUIT_DONE=0
 # Ask the app to quit and wait until it has actually exited. It refuses to
 # quit while it has unresolved recovery work; that refusal stands (no pkill),
@@ -84,7 +118,24 @@ if "$PGREP" -x Insomnia >/dev/null 2>&1; then
   QUIT_DONE=1
 fi
 
-step "Writing $SUDOERS (requires your password once)"
+# The sudoers file is not installed. What the message says depends on
+# whether the app was already quit.
+sudoers_not_installed() { # reason
+  if (( QUIT_DONE )); then
+    echo "$1; not installed. Insomnia was quit, which ended any session; nothing else was changed. Open \"$APP\" to keep using the installed build, or rerun." >&2
+  else
+    echo "$1; not installed. Nothing was changed." >&2
+  fi
+  exit 1
+}
+
+step "Writing $SUDOERS"
+# The quit can take up to QUIT_WAIT_SECONDS. If sudo's cached credential
+# expired meanwhile, ask once more; otherwise the commands below use it.
+if ! "$SUDO" -n -v 2>/dev/null; then
+  echo "The sudo credential expired while Insomnia was quitting; asking again."
+  "$SUDO" -v || sudoers_not_installed "sudo did not authenticate"
+fi
 TMP_SUDOERS="$(mktemp)"
 # Set from the moment the new rule is installed until the new bundle is
 # signed in place. Any stop in between prints rule_ahead_note on exit.
@@ -107,12 +158,8 @@ $USER ALL=(root) NOPASSWD: /usr/bin/pmset -b lowpowermode 0
 SUDO
 if "$SUDO" visudo -cf "$TMP_SUDOERS" >/dev/null && "$SUDO" install -m 0440 -o root -g wheel "$TMP_SUDOERS" "$SUDOERS"; then
   RULE_AHEAD_OF_BUNDLE=1
-elif (( QUIT_DONE )); then
-  echo "sudoers file failed validation (or sudo did not authenticate); not installed. Insomnia was quit, which ended any session; nothing else was changed. Open \"$APP\" to keep using the installed build, or rerun." >&2
-  exit 1
 else
-  echo "sudoers file failed validation (or sudo did not authenticate); not installed. Nothing was changed." >&2
-  exit 1
+  sudoers_not_installed "sudoers file failed validation (or sudo did not authenticate)"
 fi
 # `sudo -l <command>` checks the rule without running pmset (nothing on the
 # machine changes). The backstop cannot undo anything without it, so stop here.

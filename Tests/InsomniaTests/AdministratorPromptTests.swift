@@ -348,8 +348,8 @@ final class SleepPromptLifecycleTests: XCTestCase {
         XCTAssertTrue(handle.isRunning)
         let post = try XCTUnwrap(h.notifier.posts.last)
         XCTAssertTrue(post.body.contains("pid 4242"), post.body)
-        XCTAssertTrue(post.body.hasSuffix("kill 4242"), post.body)
-        XCTAssertTrue(try XCTUnwrap(m.lastError).contains("pid 4242"))
+        XCTAssertFalse(post.body.contains("kill"), "a notification outlives the pid, which may be reused: \(post.body)")
+        XCTAssertTrue(try XCTUnwrap(m.lastError).hasSuffix("kill 4242"), "the menu line offers it while osascript runs")
         XCTAssertNil(m.session, "no session is surfaced")
         XCTAssertNotNil(try h.store.loadSession(), "session.json stays so the backstop honours the deadline")
         XCTAssertEqual(try h.store.loadState()?.sleepDisabledByUs, true, "the journal entry stays")
@@ -362,6 +362,7 @@ final class SleepPromptLifecycleTests: XCTestCase {
 
         handle.markExited()
         await start.value
+        XCTAssertFalse(m.lastError?.contains("kill") ?? false, "the menu line drops the pid once it has exited: \(m.lastError ?? "")")
         _ = await end.value
         try assertRolledBackClean(m)
         XCTAssertEqual(h.guardFake.calls.filter { $0 == "disablesleep 0" }.count, 1, "\(h.guardFake.calls)")

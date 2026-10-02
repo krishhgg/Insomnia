@@ -109,11 +109,16 @@ recovery; newly written journals use `frozenProcesses`.
 - Turning sleep back on and the Low Power Mode floor stay passwordless so the
   app, `backstop.sh` and `uninstall.sh` can recover unattended: ending a
   stuck or crashed session must never need a password.
-- `install.sh` never writes `disablesleep 1`, on any path. It asks a running
-  app to quit first and stops with nothing changed, the sudoers file
-  included, if the app is still running after 15 s. Then it writes the
-  three-line rule, checks that the app was not opened again during the
-  password prompt, and replaces the bundle. A build older than this rule
+- `install.sh` never writes `disablesleep 1`, on any path. When
+  `session.json` holds a future deadline it first says the upgrade will end
+  the session and, in a terminal, asks to continue. It asks for the password
+  (`sudo -v`) before anything else, so a cancelled or failed password
+  changes nothing and a running session keeps going. Then it asks a running
+  app to quit and stops with nothing changed, the sudoers file included, if
+  the app is still running after 15 s. Then it writes the three-line rule on
+  sudo's cached credential (asking once more if it expired during the
+  quit), checks that the app was not opened again meanwhile, and replaces
+  the bundle. A build older than this rule
   starts sessions with `sudo -n pmset -a disablesleep 1`, so any stop between
   the rule and the new bundle leaves that build unable to start a session;
   the installer says so and prints the rerun command. A successful install

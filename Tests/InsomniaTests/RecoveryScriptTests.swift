@@ -1254,27 +1254,174 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(try fx.contents(of: launchAgents), ["com.insomnia.backstop.plist"], "staging directory not removed")
     }
 
-    /// The running app is asked to quit before the password prompt, so an
-    /// app that refuses leaves the sudoers file alone. When it quits and
-    /// authentication then fails, nothing of the previous install is
-    /// replaced, the message says the app was quit, and the old build can be
-    /// opened again with its rule intact.
-    func testInstallThatQuitTheAppChangesNothingElseWhenSudoAuthFails() throws {
+    /// The password comes before the quit. A wrong or cancelled password
+    /// stops the install with the app still running: it is never asked to
+    /// quit, and the sudoers file, bundle, backstop.sh and plist are as
+    /// they were.
+    func testInstallWithTheAppRunningChangesNothingWhenSudoAuthFails() throws {
         try fx.prepareInstall()
         try fx.installMachinery()
         try "old helper".write(to: fx.installedBackstop, atomically: true, encoding: .utf8)
-        fx.setMode("pgrep", "0\n1\n")       // running, then quits when asked
+        fx.setMode("pgrep", "0\n")          // running
         fx.setMode("sudo", "auth-fail")     // wrong password / no sudo rights
 
         let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
 
-        XCTAssertNotEqual(r.status, 0, r.stdout)
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
         let calls = fx.calls()
-        let quit = try XCTUnwrap(calls.firstIndex { $0.hasPrefix("osascript") }, "the app was not asked to quit: \(calls)")
-        let visudo = try XCTUnwrap(calls.firstIndex { $0.hasPrefix("sudo visudo") }, "authentication was not attempted: \(calls)")
-        XCTAssertLessThan(quit, visudo, "the app must be quit before the password prompt: \(calls)")
+        XCTAssertEqual(calls.filter { $0.hasPrefix("sudo") }, ["sudo -v"], "the password is the first and only sudo: \(calls)")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("osascript") }, "the app was asked to quit: \(calls)")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("pkill") }, "\(calls)")
         XCTAssertFalse(calls.contains { $0.hasPrefix("launchctl") }, "\(calls)")
+        XCTAssertEqual(try String(contentsOf: fx.app.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "binary", "old bundle replaced")
+        XCTAssertEqual(try String(contentsOf: fx.installedBackstop, encoding: .utf8), "old helper", "installed backstop.sh replaced")
+        XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "plist", "trusted plist touched")
+        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), "rule", "sudoers rule replaced")
+        XCTAssertTrue(r.stderr.contains("Nothing was changed"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("not asked to quit"), r.stderr)
+        XCTAssertFalse(r.stderr.contains("Insomnia was quit"), r.stderr)
+    }
+
+    /// A cancelled password while a session runs: the installer said the
+    /// upgrade would end the session before it asked, and the cancel leaves
+    /// the app and its session running. session.json is untouched and no
+    /// recovery runs.
+    func testInstallCancelledPasswordDuringASessionLeavesTheSessionRunning() throws {
+        try fx.prepareInstall()
+        try fx.installMachinery()
+        try fx.writeSession(endsAt: Date().addingTimeInterval(3600))
+        let session = try Data(contentsOf: fx.session)
+        fx.setMode("pgrep", "0\n")          // running
+        fx.setMode("sudo", "auth-fail")     // the password dialog was cancelled
+
+        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        let warning = try XCTUnwrap(r.stdout.range(of: "A session is running and the upgrade will end it."), r.stdout)
+        let auth = try XCTUnwrap(r.stdout.range(of: "==> Authenticating"), r.stdout)
+        XCTAssertLessThan(warning.lowerBound, auth.lowerBound, "said before the password is asked for")
+        let calls = fx.calls()
+        XCTAssertEqual(calls.filter { $0.hasPrefix("sudo") }, ["sudo -v"], "\(calls)")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("osascript") }, "the app was asked to quit: \(calls)")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("launchctl") }, "\(calls)")
+        XCTAssertEqual(try Data(contentsOf: fx.session), session, "session.json changed")
+        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), "rule")
+        XCTAssertEqual(try String(contentsOf: fx.app.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "binary")
+        XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "plist")
+        XCTAssertTrue(r.stderr.contains("Nothing was changed"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("a running session keeps going"), r.stderr)
+    }
+
+    /// In a terminal, the installer asks before it ends a session. Anything
+    /// but yes stops it before the password: no sudo, no quit.
+    func testInstallInATerminalStopsBeforeThePasswordWhenTheUserKeepsTheSession() throws {
+        try fx.prepareInstall()
+        try fx.installMachinery()
+        try fx.writeSession(endsAt: Date().addingTimeInterval(3600))
+        fx.setMode("pgrep", "0\n")          // running
+
+        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"], terminalInput: "n\n")
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertTrue(r.stdout.contains("A session is running and the upgrade will end it."), r.stdout)
+        XCTAssertTrue(r.stderr.contains("Continue? [y/N]"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("Nothing was changed; the session keeps running."), r.stderr)
+        let calls = fx.calls()
+        XCTAssertFalse(calls.contains { $0.hasPrefix("sudo") }, "\(calls)")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("osascript") }, "\(calls)")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fx.session.path))
+        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), "rule")
+    }
+
+    /// Yes in a terminal goes ahead: password, quit, rule, bundle.
+    func testInstallInATerminalGoesAheadWhenTheUserAgreesToEndTheSession() throws {
+        try fx.prepareInstall()
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        try fx.writeSession(endsAt: Date().addingTimeInterval(3600))
+        fx.setMode("pgrep", "0\n1\n")       // running, then quits when asked
+        fx.setMode("launchctl", "loaded")
+
+        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"], terminalInput: "y\n")
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertTrue(r.stderr.contains("Continue? [y/N]"), r.stderr)
+        let calls = fx.calls()
+        let auth = try XCTUnwrap(calls.firstIndex(of: "sudo -v"), "\(calls)")
+        let quit = try XCTUnwrap(calls.firstIndex { $0.hasPrefix("osascript") }, "\(calls)")
+        XCTAssertLessThan(auth, quit, "the password comes before the quit: \(calls)")
+        XCTAssertEqual(try sudoersRules(), Self.passwordlessLines)
+    }
+
+    /// Without a terminal there is no one to ask: the line is printed and
+    /// the install goes ahead.
+    func testInstallWithoutATerminalSaysTheSessionWillEndAndGoesAhead() throws {
+        try fx.prepareInstall()
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        try fx.writeSession(endsAt: Date().addingTimeInterval(3600))
+        fx.setMode("launchctl", "loaded")
+
+        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertTrue(r.stdout.contains("A session is running and the upgrade will end it."), r.stdout)
+        XCTAssertFalse(r.stderr.contains("Continue?"), r.stderr)
+    }
+
+    /// A session whose deadline has passed is not running: no line, and no
+    /// question even in a terminal.
+    func testInstallDoesNotAskAboutAnExpiredSession() throws {
+        try fx.prepareInstall()
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        try fx.writeSession(endsAt: Date().addingTimeInterval(-60))
+        fx.setMode("launchctl", "loaded")
+
+        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"], terminalInput: "n\n")
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertFalse(r.stdout.contains("A session is running"), r.stdout)
+        XCTAssertFalse(r.stderr.contains("Continue?"), r.stderr)
+    }
+
+    /// The quit can outlast sudo's cached credential. The installer then
+    /// asks for the password once more and finishes.
+    func testInstallAsksAgainWhenTheCredentialExpiredDuringTheQuit() throws {
+        try fx.prepareInstall()
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        fx.setMode("pgrep", "0\n1\n")       // running, then quits when asked
+        fx.setMode("sudo", "cache-expires")
+        fx.setMode("launchctl", "loaded")
+
+        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertTrue(r.stdout.contains("asking again"), r.stdout)
+        let calls = fx.calls()
+        XCTAssertEqual(calls.filter { $0 == "sudo -v" }.count, 2, "\(calls)")
+        XCTAssertEqual(try sudoersRules(), Self.passwordlessLines)
+    }
+
+    /// The app quit, the cached credential expired, and the second password
+    /// fails: the sudoers file, bundle, backstop.sh and plist are as they
+    /// were, and the message says the app was quit so the old build can be
+    /// opened again with its rule intact.
+    func testInstallThatQuitTheAppChangesNothingElseWhenTheSecondPasswordFails() throws {
+        try fx.prepareInstall()
+        try fx.installMachinery()
+        try "old helper".write(to: fx.installedBackstop, atomically: true, encoding: .utf8)
+        fx.setMode("pgrep", "0\n1\n")       // running, then quits when asked
+        fx.setMode("sudo", "reauth-fails")
+
+        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        let calls = fx.calls()
+        let auth = try XCTUnwrap(calls.firstIndex(of: "sudo -v"), "\(calls)")
+        let quit = try XCTUnwrap(calls.firstIndex { $0.hasPrefix("osascript") }, "the app was not asked to quit: \(calls)")
+        XCTAssertLessThan(auth, quit, "the password comes before the quit: \(calls)")
+        XCTAssertEqual(calls.filter { $0 == "sudo -v" }.count, 2, "\(calls)")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("sudo visudo") }, "\(calls)")
         XCTAssertFalse(calls.contains { $0.hasPrefix("sudo install") }, "\(calls)")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("launchctl") }, "\(calls)")
         XCTAssertEqual(try String(contentsOf: fx.app.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "binary", "old bundle replaced")
         XCTAssertEqual(try String(contentsOf: fx.installedBackstop, encoding: .utf8), "old helper", "installed backstop.sh replaced")
         XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "plist", "trusted plist touched")
@@ -1284,7 +1431,7 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(r.stderr.contains("already holds the new three-line rule"), r.stderr)
     }
 
-    /// The app quits, authentication passes, but the rule it installed does
+    /// Authentication passes, the app quits, but the rule it installed does
     /// not grant the pmset commands: nothing else of the previous install is
     /// replaced, and the message says the old build cannot start a session
     /// until the rerun.
@@ -1299,7 +1446,11 @@ final class RecoveryScriptTests: XCTestCase {
 
         XCTAssertNotEqual(r.status, 0, r.stdout)
         let calls = fx.calls()
-        XCTAssertTrue(calls.contains { $0.hasPrefix("osascript") }, "the app was asked to quit first: \(calls)")
+        let auth = try XCTUnwrap(calls.firstIndex(of: "sudo -v"), "\(calls)")
+        let quit = try XCTUnwrap(calls.firstIndex { $0.hasPrefix("osascript") }, "the app was not asked to quit: \(calls)")
+        let visudo = try XCTUnwrap(calls.firstIndex { $0.hasPrefix("sudo visudo") }, "\(calls)")
+        XCTAssertLessThan(auth, quit, "the password comes before the quit: \(calls)")
+        XCTAssertLessThan(quit, visudo, "the app is quit before the rule is written: \(calls)")
         XCTAssertFalse(calls.contains { $0.hasPrefix("launchctl") }, "\(calls)")
         XCTAssertEqual(try String(contentsOf: fx.app.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "binary")
         XCTAssertEqual(try String(contentsOf: fx.installedBackstop, encoding: .utf8), "old helper")
@@ -1311,8 +1462,8 @@ final class RecoveryScriptTests: XCTestCase {
     /// With no app running there is nothing to wait for: an installer that
     /// assembled the bundle and copied backstop.sh before asking for the
     /// password would reach the overwrite path here. Authentication must
-    /// still be the first thing attempted, and its failure must leave the
-    /// old bundle, helper and plist byte for byte as they were.
+    /// still be the first sudo, and its failure must leave the old bundle,
+    /// helper, plist and sudoers file byte for byte as they were.
     func testInstallWithNoAppRunningStopsBeforeReplacingAnythingWhenSudoAuthFails() throws {
         try fx.prepareInstall()
         try fx.installMachinery()
@@ -1324,8 +1475,7 @@ final class RecoveryScriptTests: XCTestCase {
 
         XCTAssertNotEqual(r.status, 0, r.stdout)
         let calls = fx.calls()
-        XCTAssertTrue(calls.contains { $0.hasPrefix("sudo visudo") }, "authentication was attempted: \(calls)")
-        XCTAssertFalse(calls.contains { $0.hasPrefix("sudo install") }, "\(calls)")
+        XCTAssertEqual(calls.filter { $0.hasPrefix("sudo") }, ["sudo -v"], "authentication was attempted, and nothing after it: \(calls)")
         XCTAssertFalse(calls.contains { $0.hasPrefix("osascript") }, "nothing to quit: \(calls)")
         XCTAssertFalse(calls.contains { $0.hasPrefix("launchctl") }, "\(calls)")
         XCTAssertEqual(try String(contentsOf: fx.app.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "binary", "old bundle replaced")
@@ -1349,7 +1499,7 @@ final class RecoveryScriptTests: XCTestCase {
 
         XCTAssertNotEqual(r.status, 0, r.stdout)
         let calls = fx.calls()
-        XCTAssertTrue(calls.contains { $0.hasPrefix("sudo visudo") }, "authentication was attempted: \(calls)")
+        XCTAssertEqual(calls.first { $0.hasPrefix("sudo") }, "sudo -v", "authentication comes first: \(calls)")
         XCTAssertTrue(calls.contains { $0.hasPrefix("sudo install") }, "the rule was installed before being checked: \(calls)")
         XCTAssertFalse(calls.contains { $0.hasPrefix("osascript") }, "nothing to quit: \(calls)")
         XCTAssertFalse(calls.contains { $0.hasPrefix("launchctl") }, "\(calls)")
@@ -1361,9 +1511,10 @@ final class RecoveryScriptTests: XCTestCase {
         assertRerunNote(r.stderr)
     }
 
-    /// An app that will not quit stops the install before the password
-    /// prompt: no sudo at all, the sudoers file, bundle, backstop.sh and
-    /// LaunchAgent exactly as they were, and the refusal stands (no pkill).
+    /// An app that will not quit stops the install after the password and
+    /// before the rule: no sudo besides `sudo -v`, the sudoers file, bundle,
+    /// backstop.sh and LaunchAgent exactly as they were, and the refusal
+    /// stands (no pkill).
     func testInstallStopsBeforeTheSudoersRuleWhenAppKeepsRunning() throws {
         try fx.prepareInstall()
         try fx.installMachinery()
@@ -1375,7 +1526,7 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
         let calls = fx.calls()
         XCTAssertTrue(calls.contains { $0.hasPrefix("osascript") }, "the app was asked to quit: \(calls)")
-        XCTAssertFalse(calls.contains { $0.hasPrefix("sudo") }, "no password prompt for an install that cannot finish: \(calls)")
+        XCTAssertEqual(calls.filter { $0.hasPrefix("sudo") }, ["sudo -v"], "nothing written for an install that cannot finish: \(calls)")
         XCTAssertFalse(calls.contains { $0.hasPrefix("pkill") }, "a refused quit stands: \(calls)")
         XCTAssertFalse(calls.contains { $0.hasPrefix("launchctl") }, "\(calls)")
         XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), "rule", "the sudoers file was touched")
@@ -1698,6 +1849,10 @@ private final class ScriptFixture {
         // fails like a wrong password, and `-n` forms fail as unpermitted.
         // Mode "rule-not-effective": authentication passes and the rule is
         // installed, but `sudo -n -l <pmset ...>` still says no.
+        // `sudo -v` authenticates and `sudo -n -v` checks the cached
+        // credential. Mode "cache-expires": the credential has expired by
+        // the time `-n -v` asks, and `-v` succeeds again. Mode
+        // "reauth-fails": the same, but every `-v` after the first fails.
         // visudo checks the candidate file exists, is non-empty and grants
         // pmset, so an installer that validated the wrong path or an empty
         // heredoc cannot pass here.
@@ -1711,7 +1866,18 @@ private final class ScriptFixture {
         # write command.ended = released | watchdog, so a test can tell a
         # command that is still alive (no file) from one that ended, and why.
         case "${1:-}" in
-          -n) if [[ "${2:-}" == -l ]]; then
+          -v) case "$mode" in
+                auth-fail) echo "sudo: 3 incorrect password attempts" >&2; exit 1 ;;
+                reauth-fails)
+                  n=$(( $(cat "\(r)/sudo.auths" 2>/dev/null || echo 0) + 1 )); echo "$n" > "\(r)/sudo.auths"
+                  if (( n > 1 )); then echo "sudo: 3 incorrect password attempts" >&2; exit 1; fi
+                  exit 0 ;;
+                *) exit 0 ;;
+              esac ;;
+          -n) if [[ "${2:-}" == -v ]]; then
+                case "$mode" in auth-fail|cache-expires|reauth-fails) exit 1 ;; *) exit 0 ;; esac
+              fi
+              if [[ "${2:-}" == -l ]]; then
                 case "$mode" in auth-fail|rule-not-effective) exit 1 ;; *) exit 0 ;; esac
               fi
               case "$mode" in
@@ -1962,9 +2128,27 @@ private final class ScriptFixture {
 
     /// Runs a script copy. `fd9` opens that file on descriptor 9 of the child
     /// first, the way uninstall.sh hands its lock handle to the backstop.
-    /// `extraEnvironment` is for install.sh's refusal test only.
-    func run(_ script: URL, _ args: [String] = [], fd9: URL? = nil, extraEnvironment: [String: String] = [:]) throws -> (status: Int32, stdout: String, stderr: String) {
+    /// `extraEnvironment` is for install.sh's refusal test only. stdin is
+    /// /dev/null, never the test process's own (a terminal when `swift test`
+    /// runs in one), unless `terminalInput` is given: then stdin is a pty
+    /// whose input queue already holds that text, so `[[ -t 0 ]]` is true
+    /// and `read` gets the answer without any timing.
+    func run(_ script: URL, _ args: [String] = [], fd9: URL? = nil, extraEnvironment: [String: String] = [:], terminalInput: String? = nil) throws -> (status: Int32, stdout: String, stderr: String) {
         let p = Process()
+        var terminal: (master: FileHandle, slave: FileHandle)?
+        if let terminalInput {
+            var master: Int32 = -1
+            var slave: Int32 = -1
+            guard openpty(&master, &slave, nil, nil, nil) == 0 else { throw FixtureError("openpty failed: errno \(errno)") }
+            let m = FileHandle(fileDescriptor: master, closeOnDealloc: true)
+            let sl = FileHandle(fileDescriptor: slave, closeOnDealloc: true)
+            try m.write(contentsOf: Data(terminalInput.utf8))
+            terminal = (m, sl)
+            p.standardInput = sl
+        } else {
+            p.standardInput = FileHandle.nullDevice
+        }
+        defer { if let terminal { try? terminal.slave.close(); try? terminal.master.close() } }
         p.executableURL = URL(fileURLWithPath: "/bin/bash")
         if let fd9 {
             p.arguments = ["-c", #"exec 9<>"$0" && exec /bin/bash "$@""#, fd9.path, script.path] + args

@@ -3,13 +3,13 @@
   "commentTypes": ["logic", "syntax"],
   "autoReview": ["open", "push"],
   "ignorePatterns": "Resources/*.png\nResources/*.icns\ndocs/assets/*.svg\n",
-  "instructions": "Insomnia is a macOS menu bar app that keeps a MacBook awake for one timed session. While a session runs it executes sudo -n pmset to disable sleep and to switch Low Power Mode, SIGSTOPs other apps' processes when the lid closes, mutes audio, sets the display and keyboard backlight to 0, and writes NSAppSleepDisabled into agent apps' preferences. Every change is journaled in state.json before it is made and is undone from that journal, by the app (reconcile at launch, lid open, session end, Quit) or by scripts/backstop.sh, which a per-user LaunchAgent runs at load and every 60 s with macOS /bin/bash 3.2. The worst bugs leave the Mac in a changed state with nothing able to undo it: a change made before its journal entry is on disk, an entry cleared before the undo was confirmed, a journal the shell can no longer parse, a SIGKILLed sudo, a recovery lock released while a privileged command still runs, or a SIGCONT sent to a process Insomnia did not stop. Weigh those far above style. Read .greptile/rules.md before flagging a design listed there as deliberate.",
+  "instructions": "Insomnia is a macOS menu bar app that keeps a MacBook awake for one timed session. A session starts by turning sleep off with pmset -a disablesleep 1 through the macOS administrator password prompt (osascript, AdministratorPrompt.swift); while it runs the app executes sudo -n pmset to turn sleep back on and to switch Low Power Mode, SIGSTOPs other apps' processes when the lid closes, mutes audio, sets the display and keyboard backlight to 0, and writes NSAppSleepDisabled into agent apps' preferences. Every change is journaled in state.json before it is made and is undone from that journal, by the app (reconcile at launch, lid open, session end, Quit) or by scripts/backstop.sh, which a per-user LaunchAgent runs at load and every 60 s with macOS /bin/bash 3.2. The worst bugs leave the Mac in a changed state with nothing able to undo it: a change made before its journal entry is on disk, an entry cleared before the undo was confirmed, a journal the shell can no longer parse, a SIGKILLed sudo, a recovery lock released while a privileged command still runs, or a SIGCONT sent to a process Insomnia did not stop. Weigh those far above style. Read .greptile/rules.md before flagging a design listed there as deliberate.",
   "rules": [
     {
       "id": "journal-before-change",
       "severity": "high",
       "scope": ["Sources/Insomnia/Core/**", "Sources/Insomnia/System/**", "scripts/backstop.sh"],
-      "rule": "Any change to power state (sudo pmset disablesleep or lowpowermode), to another process (SIGSTOP), to audio output (volume or mute), or to display or keyboard brightness is written to state.json first, through Store.saveState (the journal helper in SessionManager), and that write has returned without error before the change is made. If the write fails the change is not made. The one exception is NSAppSleepDisabled in AppNap.swift, which docs/spec.md section 5 leaves unjournaled and persistent on purpose."
+      "rule": "Any change to power state (pmset disablesleep, through sudo -n or the administrator password prompt, or pmset lowpowermode), to another process (SIGSTOP), to audio output (volume or mute), or to display or keyboard brightness is written to state.json first, through Store.saveState (the journal helper in SessionManager), and that write has returned without error before the change is made. If the write fails the change is not made. The one exception is NSAppSleepDisabled in AppNap.swift, which docs/spec.md section 5 leaves unjournaled and persistent on purpose."
     },
     {
       "id": "journal-cleared-only-after-confirmed-undo",
@@ -26,14 +26,14 @@
     {
       "id": "backstop-armed-before-sleep-is-disabled",
       "severity": "high",
-      "scope": ["Sources/Insomnia/Core/SessionManager.swift", "Sources/Insomnia/Core/LaunchdBackstop.swift"],
-      "rule": "Sleep is disabled (sudo -n pmset -a disablesleep 1) only after session.json and the sleepDisabledByUs journal entry are on disk and LaunchdBackstop.arm() has returned without error. A failed arm rolls the start back and never reaches pmset. The LaunchAgent plist at the trusted path only ever holds a plist launchd actually loaded."
+      "scope": ["Sources/Insomnia/Core/SessionManager.swift", "Sources/Insomnia/Core/LaunchdBackstop.swift", "Sources/Insomnia/System/AdministratorPrompt.swift"],
+      "rule": "Sleep is disabled (pmset -a disablesleep 1 through the administrator password prompt) only after session.json and the sleepDisabledByUs journal entry are on disk and LaunchdBackstop.arm() has returned without error. A failed arm rolls the start back and never reaches the prompt. Only an explicit Start shows the prompt: reconcile at launch and every other path read pmset -g and never prompt or re-apply disablesleep 1. The LaunchAgent plist at the trusted path only ever holds a plist launchd actually loaded."
     },
     {
       "id": "sudo-is-never-sigkilled",
       "severity": "high",
-      "scope": ["Sources/Insomnia/Core/SleepGuard.swift", "Sources/Insomnia/System/CancellableCommand.swift", "Sources/Insomnia/System/ShellTimeout.swift", "scripts/backstop.sh", "scripts/install.sh", "scripts/uninstall.sh"],
-      "rule": "A privileged command (sudo -n pmset) is never sent SIGKILL, in the app or in the scripts. On timeout it may get SIGTERM, which sudo relays to pmset and waits for. A command still alive after that is left running and reported with its pid, because killing sudo orphans a root pmset that can change power state later, outside any transaction."
+      "scope": ["Sources/Insomnia/Core/SleepGuard.swift", "Sources/Insomnia/System/AdministratorPrompt.swift", "Sources/Insomnia/System/CancellableCommand.swift", "Sources/Insomnia/System/ShellTimeout.swift", "scripts/backstop.sh", "scripts/install.sh", "scripts/uninstall.sh"],
+      "rule": "A privileged command (sudo -n pmset, or the osascript behind the administrator password prompt) is never sent SIGKILL, in the app or in the scripts. On timeout it may get SIGTERM, which sudo relays to pmset and waits for, and which takes the password dialog down with osascript. A command still alive after that is left running and reported with its pid, because killing sudo orphans a root pmset that can change power state later, outside any transaction."
     },
     {
       "id": "recovery-lock-held-while-a-command-may-run",
@@ -51,7 +51,7 @@
       "id": "no-shell-interpolation",
       "severity": "high",
       "scope": ["Sources/**"],
-      "rule": "A child process is started with an absolute executable path and an argument array: Shell.run, Shell.run(timeout:), CancellableCommand.run, or Process with executableURL and arguments. Nothing runs through /bin/sh -c, /bin/bash -c, zsh, osascript with a built command string, or a string that has data interpolated into it. No executable is resolved through PATH; Shell.locate picks from a fixed candidate list of absolute paths."
+      "rule": "A child process is started with an absolute executable path and an argument array: Shell.run, Shell.run(timeout:), CancellableCommand.run, or Process with executableURL and arguments. Nothing runs through /bin/sh -c, /bin/bash -c, zsh, osascript with a built command string, or a string that has data interpolated into it. The one AppleScript, AdministratorPrompt.disableSleepScript, is a compile-time literal. No executable is resolved through PATH; Shell.locate picks from a fixed candidate list of absolute paths."
     },
     {
       "id": "scripts-run-under-bash-3-2",
@@ -66,10 +66,10 @@
       "rule": "Every tool that changes the machine or reads process, power or launchd state is called through the absolute-path variable declared at the top of the script (PMSET, SUDO, PLUTIL, LOCKF, PS, KILL, SYSCTL, PGREP, OSASCRIPT, LAUNCHCTL, CODESIGN, SWIFT, SWIFTC, ICONUTIL), never by bare name through PATH. A new tool gets a new variable in that block, because RecoveryScriptTests and PackagingTests patch exactly those lines in a private copy of the script to substitute fakes."
     },
     {
-      "id": "sudoers-rule-is-four-exact-lines",
+      "id": "sudoers-rule-is-three-exact-lines",
       "severity": "high",
-      "scope": ["scripts/install.sh", "scripts/uninstall.sh", "Sources/Insomnia/Core/SleepGuard.swift", "README.md", "SECURITY.md", "docs/spec.md"],
-      "rule": "The file install.sh writes to /etc/sudoers.d/insomnia grants NOPASSWD for exactly these four commands and nothing else: /usr/bin/pmset -a disablesleep 1, /usr/bin/pmset -a disablesleep 0, /usr/bin/pmset -b lowpowermode 1, /usr/bin/pmset -b lowpowermode 0. No wildcard, no ALL, no bare /usr/bin/pmset, no other command, and it is validated with visudo -cf before it is installed. SleepGuard.swift runs only those four argument lists, and README.md, SECURITY.md and docs/spec.md list the same four."
+      "scope": ["scripts/install.sh", "scripts/uninstall.sh", "Sources/Insomnia/Core/SleepGuard.swift", "Sources/Insomnia/System/AdministratorPrompt.swift", "README.md", "SECURITY.md", "docs/spec.md"],
+      "rule": "The file install.sh writes to /etc/sudoers.d/insomnia grants NOPASSWD for exactly these three commands and nothing else: /usr/bin/pmset -a disablesleep 0, /usr/bin/pmset -b lowpowermode 1, /usr/bin/pmset -b lowpowermode 0. No wildcard, no ALL, no bare /usr/bin/pmset, no other command, and it is validated with visudo -cf before it is installed. /usr/bin/pmset -a disablesleep 1 is never passwordless, on any install.sh path including failure and rollback paths: it runs only through the administrator password prompt (AdministratorPrompt.disableSleepScript via /usr/bin/osascript). SleepGuard.swift runs only those three argument lists through sudo -n, and README.md, SECURITY.md and docs/spec.md list the same three and the prompt."
     },
     {
       "id": "behavior-changes-come-with-regression-tests",

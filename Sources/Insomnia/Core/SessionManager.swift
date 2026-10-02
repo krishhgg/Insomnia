@@ -1097,15 +1097,21 @@ final class SessionManager {
     /// Posted once per stuck prompt: the notification and the menu's
     /// warning line say what is running and that starts, ends and recovery
     /// wait behind it. `kill <pid>` is only offered while the pid is
-    /// osascript's own; once it has exited the pid may be reused.
+    /// osascript's own, and only on the menu line: the caller replaces that
+    /// line once osascript has exited, while a notification stays in
+    /// Notification Center after the pid is gone and possibly reused.
     private func reportStuckPrompt(_ prompt: UnfinishedPrompt, grace: TimeInterval) {
         let what = prompt.osascriptAlive
             ? "osascript (pid \(prompt.pid)), the process behind the password dialog, did not stop within \(Int(grace)) s."
             : "osascript (pid \(prompt.pid)) stopped, but a command it started as root is still running."
-        let hint = prompt.osascriptAlive ? " To stop it by hand: kill \(prompt.pid)" : ""
-        let body = "\(what) Insomnia keeps the session record and waits for it before rolling the start back; nothing else runs until then.\(hint)"
-        fail("start: \(body)")
-        notifier.post(title: Self.promptStuckTitle, body: body)
+        let body = "\(what) Insomnia keeps the session record and waits for it before rolling the start back; nothing else runs until then."
+        if prompt.osascriptAlive {
+            fail("start: \(body) To stop it by hand while it runs: kill \(prompt.pid)")
+            notifier.post(title: Self.promptStuckTitle, body: "\(body) The Insomnia menu shows how to stop it while it runs.")
+        } else {
+            fail("start: \(body)")
+            notifier.post(title: Self.promptStuckTitle, body: body)
+        }
     }
 
     private func iso(_ d: Date) -> String {

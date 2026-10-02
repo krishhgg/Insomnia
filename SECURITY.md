@@ -21,9 +21,10 @@ through the standard macOS administrator dialog, with a fixed command string,
 each time the user starts a session, and never on relaunch or from the recovery
 agent. The rule stays in place after a failed install (the README says what
 was installed). The installer never writes a passwordless `disablesleep 1`
-line, on any path, including failed upgrades. It quits a running Insomnia
-before it writes the rule and stops with nothing changed if the app will not
-quit. If it stops after the rule is written but before the app is replaced, an
+line, on any path, including failed upgrades. It asks for the password before
+it quits a running Insomnia, so a cancelled password changes nothing, and it
+quits the app before it writes the rule, stopping with nothing changed if the
+app will not quit. If it stops after the rule is written but before the app is replaced, an
 older build left installed cannot start a session until the installer is
 rerun; it fails closed and the installer prints the rerun command. The
 uninstaller removes the file. The app is not sandboxed; local logs can contain
