@@ -148,10 +148,13 @@ step "Assembling $APP"
 if app_running; then
   report_others
   report_unverified
+  # The quit goes only to a copy identified as this app. An unverified
+  # process is waited for, but its presence alone never asks the real app
+  # to quit.
   if (( ${#APP_FOUND[@]} > 0 )); then
     echo "Insomnia is running ($(list "${APP_FOUND[@]}")); quitting it first (this ends any session)."
+    "$OSASCRIPT" -e "tell application id \"$BUNDLE_ID\" to quit" >/dev/null 2>&1 || true
   fi
-  "$OSASCRIPT" -e "tell application id \"$BUNDLE_ID\" to quit" >/dev/null 2>&1 || true
   for (( i = 0; i < QUIT_WAIT_SECONDS; i++ )); do
     app_running || break
     sleep 1

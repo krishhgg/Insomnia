@@ -1526,6 +1526,41 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "plist", "LaunchAgent replaced")
     }
 
+    /// An unverified process alone is waited for but never causes a quit
+    /// request: osascript would reach the real app by bundle id. Here it
+    /// exits during the wait and the install goes on.
+    func testInstallSendsNoQuitWhenOnlyAnUnverifiedProcessRuns() throws {
+        try fx.prepareInstall()
+        fx.setMode("launchctl", "loaded")
+        fx.setMode("pgrep", "0\n1\n")             // seen once, gone on the next look
+        try fx.psComm([(4242, "./Insomnia")])
+
+        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertTrue(r.stdout.contains("Cannot tell whether 1 process(es) named Insomnia are this app"), r.stdout)
+        XCTAssertFalse(r.stdout.contains("quitting it first"), r.stdout)
+        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("osascript") }, "a quit was sent for a process that is not known to be this app: \(fx.calls())")
+        XCTAssertTrue(r.stdout.contains("==> Installed"), r.stdout)
+    }
+
+    /// The same for uninstall: waited for, no quit request, and once it is
+    /// gone the uninstall goes on.
+    func testUninstallSendsNoQuitWhenOnlyAnUnverifiedProcessRuns() throws {
+        try fx.installMachinery()
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        fx.setMode("pgrep", "0\n1\n")
+        try fx.psComm([(4242, "./Insomnia")])
+
+        let r = try fx.run(fx.uninstall)
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertTrue(r.stdout.contains("Cannot tell whether 1 process(es) named Insomnia are this app"), r.stdout)
+        XCTAssertFalse(r.stdout.contains("asking it to quit"), r.stdout)
+        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("osascript") }, "a quit was sent for a process that is not known to be this app: \(fx.calls())")
+        XCTAssertFalse(fx.exists(fx.app))
+    }
+
     /// The same copy during an uninstall: the API client beside it, with a
     /// readable bundle id, is still ignored; the unverified copy blocks.
     func testUninstallRefusesWhileACopyWithAnUnreadableInfoPlistRunsAndStillIgnoresTheClient() throws {
