@@ -146,8 +146,13 @@ The defaults are worth knowing:
   Mac otherwise keeps running at full speed; the mode is switched off again
   when the lid opens, unless a battery or thermal rule still wants it.
 - **Battery rules:** below 40% on battery, request Low Power Mode; below 10%,
-  end the session. Serious thermal state requests Low Power Mode; critical
-  thermal state ends the session. These rules require the app to be running.
+  end the session. A battery that is present but cannot be read on two
+  consecutive reads while on battery also ends the session, with a
+  notification saying why: the floor cannot be applied to a level nobody can
+  read. One failed read is tolerated, and the level is re-read every 30 s
+  until it is readable again. A desktop has no battery and no floor. Serious
+  thermal state requests Low Power Mode; critical thermal state ends the
+  session. These rules require the app to be running.
 
 To exercise the lid actions without closing the lid, run
 `scripts/simulate-lid.sh closed` and then `scripts/simulate-lid.sh open` during
