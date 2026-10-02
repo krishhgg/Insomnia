@@ -434,8 +434,8 @@ one after another with a short stagger.
   replaces it with the number and the pill grows to fit. Tab and Shift-Tab
   move between pills, Enter starts the session, Esc collapses.
 - The "?" badge on each pill is a help affordance: hover shows a tooltip
-  ("Up to 1d per session" on Days, from `maxDuration`; "0–23"; "0–59"). It
-  is not an input.
+  ("Up to 1d per session" on Days, from `maxDuration`; the range 0 to 23 on
+  Hours and 0 to 59 on Minutes). It is not an input.
 - The current interface uses inline entry, not the preset-popover proposal
   from the original design. Empty-field Enter starts the default preset.
 
