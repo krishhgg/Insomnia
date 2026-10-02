@@ -19,7 +19,9 @@ enum FloorRules {
 
     /// Ordered actions for the current inputs.
     ///
-    /// - battery below `endFloor` while not charging: end session
+    /// - battery below `endFloor` while not charging: end session. 0 never
+    ///   matches, so 0 turns the battery end off; Config keeps a non-zero
+    ///   `endFloor` below `lowPowerFloor`.
     /// - thermal `critical` (if `thermalRules`): end session
     /// - battery present but unreadable on two consecutive reads while not
     ///   charging, with an end floor set: end session. The floor cannot be
