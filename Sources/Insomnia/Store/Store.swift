@@ -31,6 +31,16 @@ struct Store: Sendable {
     /// undecodable content.
     func read<T: Decodable>(_ type: T.Type, from url: URL) throws -> T? {
         guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        // Only a regular file is opened. open(2) on a FIFO with no writer
+        // blocks, and these reads run on the main actor under the recovery
+        // lock. Data(contentsOf:) on macOS 26 refuses a FIFO with EACCES,
+        // which reads as a permissions problem; this check names the real
+        // cause and does not rely on that. stat(2) follows a symlink, as
+        // Data(contentsOf:) does.
+        var info = stat()
+        if stat(url.path, &info) == 0, info.st_mode & S_IFMT != S_IFREG {
+            throw StoreError.notRegularFile(file: url.path)
+        }
         let data = try Data(contentsOf: url)
         return try Store.makeDecoder().decode(T.self, from: data)
     }
@@ -131,6 +141,7 @@ enum StoreError: Error, LocalizedError {
     case rename(from: String, to: String, errno: Int32)
     case corrupt(file: String, detail: String)
     case unreadable(file: String, detail: String)
+    case notRegularFile(file: String)
 
     var errorDescription: String? {
         switch self {
@@ -140,6 +151,8 @@ enum StoreError: Error, LocalizedError {
             return "\(file) could not be decoded (\(detail)); it was left in place"
         case let .unreadable(file, detail):
             return "\(file) could not be decoded (\(detail))"
+        case let .notRegularFile(file):
+            return "\(file) is not a regular file; it was not opened"
         }
     }
 }

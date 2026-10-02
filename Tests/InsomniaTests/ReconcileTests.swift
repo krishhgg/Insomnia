@@ -341,6 +341,30 @@ final class ReconcileTests: XCTestCase {
                        "the move notice must not speak for the restore, which has its own outcome: \(moveNotice)")
     }
 
+    /// A session.json that is a FIFO is never opened: open(2) on it blocks
+    /// until a writer appears, and reconcile runs on the main actor under
+    /// the recovery lock. It is treated like a file that cannot be read,
+    /// left in place with nothing decided or undone, and the error names
+    /// the file type instead of a permissions problem.
+    func testSessionThatIsAFIFOIsNeverOpenedAndNothingIsDecided() async throws {
+        var st = RuntimeState()
+        st.sleepDisabledByUs = true
+        try h.store.saveState(st)
+        let fifo = try FIFOWatch(at: h.home.paths.sessionFile)
+        defer { fifo.stop() }
+        h.guardFake.sleepDisabled = true
+
+        let m = h.makeManager()
+        await m.reconcile()
+
+        XCTAssertFalse(fifo.readerSeen, "session.json was opened although it is a FIFO")
+        XCTAssertTrue(fifo.isStillFIFO, "session.json was moved or replaced")
+        XCTAssertEqual(try movedAsideSessions, [])
+        XCTAssertEqual(h.guardFake.calls, [], "something was undone or checked from a session that was not read")
+        XCTAssertEqual(try h.store.loadState(), st)
+        XCTAssertTrue(try XCTUnwrap(m.lastError).contains("not a regular file"), m.lastError ?? "")
+    }
+
     /// A session.json that exists but cannot be read at all (here: it is a
     /// directory) may be a valid session. Nothing is moved, decided or
     /// undone; the user is told, and the next launch retries.

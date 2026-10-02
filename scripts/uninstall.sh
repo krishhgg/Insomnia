@@ -136,7 +136,11 @@ journal_shape_problems() { # file
 journal_problems() {
   local key value shape
   if [[ -e "$SESSION" ]]; then
-    if ! cat "$SESSION" >/dev/null 2>&1; then
+    # Only a regular file is opened: open(2) on a FIFO with no writer
+    # blocks, and this check runs while the recovery lock is held.
+    if [[ ! -f "$SESSION" ]]; then
+      echo "session.json is still present and cannot be read: it is not a regular file, so it was not opened"
+    elif ! cat "$SESSION" >/dev/null 2>&1; then
       echo "session.json is still present and cannot be read (permissions or I/O)"
     elif extract "$SESSION" endsAt >/dev/null; then
       echo "session.json is still present"
@@ -145,6 +149,10 @@ journal_problems() {
     fi
   fi
   [[ -e "$STATE" ]] || return 0
+  if [[ ! -f "$STATE" ]]; then
+    echo "state.json is not a regular file, so it was not opened"
+    return 0
+  fi
   if ! "$PLUTIL" -convert json -o /dev/null "$STATE" >/dev/null 2>&1; then
     echo "state.json is unreadable or malformed"
     return 0
@@ -224,7 +232,8 @@ What to do, then rerun this script:
     session.json.unreadable-<time> as soon as the journal is clean, and the
     app does the same at launch. It needs no action of its own.
   - session.json that cannot be read at all: neither the app nor the agent
-    decides anything from it. Restore access to it, then rerun.
+    decides anything from it. Restore access to it, or remove it if it is
+    not a regular file, then rerun.
   - Log: $LOG_DIR/insomnia.log
 MSG
   exit 1

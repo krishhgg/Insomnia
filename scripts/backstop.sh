@@ -49,9 +49,11 @@
 #     or after the undo above succeeded) the file is renamed to
 #     session.json.unreadable-<UTC stamp>, never deleted or overwritten, so
 #     the next run sees no session. While the journal stays dirty it stays.
-#   - session.json present but not readable at all (permissions, I/O): that
-#     proves nothing about what it says, so nothing is decided, nothing is
-#     undone, exit 1; the next run retries.
+#   - session.json present but not readable at all (permissions, I/O), or
+#     not a regular file (a FIFO or device is never opened: open(2) could
+#     block while this run holds the lock): that proves nothing about what
+#     it says, so nothing is decided, nothing is undone, exit 1; the next
+#     run retries. A state.json that is not a regular file is malformed.
 #
 # Limitation: the shell compares process start time to the second and the
 # boot session; only the app also compares the microseconds.
@@ -277,6 +279,12 @@ journal_shape_problems() { # file
 session_state=none
 ends_at=""
 if [[ -e "$SESSION" ]]; then
+  # Only a regular file is opened: open(2) on a FIFO with no writer, or on
+  # some devices, blocks, and this run holds the recovery lock.
+  if [[ ! -f "$SESSION" ]]; then
+    log error "session.json exists but cannot be read: it is not a regular file, so it is not opened. Nothing is decided and nothing is undone. Remove or replace $SESSION"
+    exit 1
+  fi
   if ! cat "$SESSION" >/dev/null 2>&1; then
     log error "session.json exists but cannot be read; it may be a valid session, so nothing is decided and nothing is undone. Restore access to $SESSION"
     exit 1
@@ -301,6 +309,10 @@ fi
 # journal_state: missing | malformed | clean | dirty
 if [[ ! -e "$STATE" ]]; then
   journal_state=missing
+elif [[ ! -f "$STATE" ]]; then
+  # Never opened, for the same reason as session.json above.
+  journal_state=malformed
+  shape_problems="not a regular file"
 elif ! "$PLUTIL" -convert json -o /dev/null "$STATE" >/dev/null 2>&1; then
   journal_state=malformed
   shape_problems="not valid JSON"

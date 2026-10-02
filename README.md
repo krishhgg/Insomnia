@@ -175,8 +175,9 @@ that does not parse counts as expired and is renamed to
 `session.json.unreadable-<time>` beside it, never deleting or overwriting
 anything: the app does this at launch, before restoring whatever the journal
 holds, and says where the file went; the agent does it once the journal is
-clean. A session file that cannot be read at all (permissions) is left in
-place and nothing is decided from it. `uninstall.sh --purge` removes the
+clean. A session file that cannot be read at all (permissions, or not a
+regular file, which is never opened) is left in place and nothing is decided
+from it. `uninstall.sh --purge` removes the
 renamed copies; without `--purge` they stay.
 
 **Recovery is not “everything always gets undone.”** The backstop does not

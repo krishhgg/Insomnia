@@ -881,14 +881,15 @@ final class SessionManager {
             onDisk = nil
         } catch {
             // The file exists but could not be read at all (permissions,
-            // I/O). That proves nothing about what it says: it may be a
-            // valid session. Nothing is decided or changed; the file and
-            // the journal stay for the next launch.
+            // I/O, or not a regular file, which Store never opens). That
+            // proves nothing about what it says: it may be a valid session.
+            // Nothing is decided or changed; the file and the journal stay
+            // for the next launch.
             let detail = error.localizedDescription
             fail("reconcile refused, nothing changed: session.json could not be read (\(detail)); it was left in place")
             notifier.post(
                 title: Self.sessionFileTitle,
-                body: "session.json could not be read (\(detail)). Nothing was changed and it was left in place; restore access to the file and open Insomnia again."
+                body: "session.json could not be read (\(detail)). Nothing was changed and it was left in place; fix its permissions, or remove it if it is not a regular file, then open Insomnia again."
             )
             return
         }

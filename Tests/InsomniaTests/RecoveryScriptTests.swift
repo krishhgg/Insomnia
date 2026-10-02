@@ -428,6 +428,66 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(r.stderr.contains("Restore access to it"), r.stderr)
     }
 
+    /// A session.json that is a FIFO is never opened by the backstop: open(2)
+    /// would block while it holds the recovery lock, and neither the app nor
+    /// a later run could recover. Nothing is undone, exit 1.
+    func testSessionThatIsAFIFOIsNeverOpenedByTheBackstop() throws {
+        let dirty = #"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#
+        try fx.writeState(dirty)
+        let fifo = try FIFOWatch(at: fx.session)
+        defer { fifo.stop() }
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 1, r.stderr + fx.log())
+        XCTAssertFalse(fifo.readerSeen, "session.json was opened although it is a FIFO")
+        XCTAssertTrue(fifo.isStillFIFO)
+        XCTAssertEqual(fx.calls(), [])
+        XCTAssertEqual(try movedAsideSessions(), [])
+        XCTAssertEqual(try String(contentsOf: fx.state, encoding: .utf8), dirty)
+        XCTAssertTrue(fx.log().contains("not a regular file"), fx.log())
+    }
+
+    /// The same for state.json: never opened, reported as malformed, nothing
+    /// undone, and the session file stays.
+    func testJournalThatIsAFIFOIsNeverOpenedByTheBackstop() throws {
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        let fifo = try FIFOWatch(at: fx.state)
+        defer { fifo.stop() }
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 1, r.stderr + fx.log())
+        XCTAssertFalse(fifo.readerSeen, "state.json was opened although it is a FIFO")
+        XCTAssertTrue(fifo.isStillFIFO)
+        XCTAssertEqual(fx.calls(), [])
+        XCTAssertTrue(fx.exists(fx.session))
+        XCTAssertTrue(fx.log().contains("not a regular file"), fx.log())
+    }
+
+    /// Uninstall with both files as FIFOs: neither the backstop it runs nor
+    /// its own journal check opens them, and it stops before removing
+    /// anything.
+    func testUninstallNeverOpensSessionOrJournalFIFOs() throws {
+        try fx.installMachinery()
+        let session = try FIFOWatch(at: fx.session)
+        let state = try FIFOWatch(at: fx.state)
+        defer { session.stop(); state.stop() }
+
+        let r = try fx.run(fx.uninstall)
+
+        XCTAssertNotEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertFalse(session.readerSeen, "session.json was opened although it is a FIFO")
+        XCTAssertFalse(state.readerSeen, "state.json was opened although it is a FIFO")
+        XCTAssertTrue(session.isStillFIFO)
+        XCTAssertTrue(state.isStillFIFO)
+        XCTAssertTrue(r.stderr.contains("session.json is still present and cannot be read: it is not a regular file"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("state.json is not a regular file"), r.stderr)
+        XCTAssertTrue(fx.exists(fx.plist))
+        XCTAssertTrue(fx.exists(fx.sudoers))
+        XCTAssertTrue(fx.exists(fx.app))
+    }
+
     /// Uninstall runs the backstop first, which moves the file aside, so an
     /// unreadable session.json with a clean journal no longer blocks it.
     /// Without --purge the moved-aside copy is kept and said so.

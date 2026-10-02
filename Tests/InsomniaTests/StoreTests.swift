@@ -201,6 +201,21 @@ final class StoreTests: XCTestCase {
     /// and every later read keeps failing until a person deals with it: the
     /// next reader (this app, backstop.sh, uninstall.sh) must not see "no
     /// journal" and call the machine clean.
+    /// A journal that is a FIFO is never opened (open(2) would block until a
+    /// writer appears). The read fails instead and the FIFO stays.
+    func testStateThatIsAFIFOIsNotOpenedAndFailsTheRead() throws {
+        try FileManager.default.createDirectory(at: home.paths.appSupport, withIntermediateDirectories: true)
+        let fifo = try FIFOWatch(at: home.paths.stateFile)
+        defer { fifo.stop() }
+
+        XCTAssertThrowsError(try store.loadState()) { error in
+            guard case StoreError.notRegularFile = error else { return XCTFail("\(error)") }
+            XCTAssertTrue(error.localizedDescription.contains(home.paths.stateFile.path), error.localizedDescription)
+        }
+        XCTAssertFalse(fifo.readerSeen, "state.json was opened although it is a FIFO")
+        XCTAssertTrue(fifo.isStillFIFO)
+    }
+
     func testCorruptStateIsLeftInPlaceAndKeepsFailing() throws {
         try Data("{not json".utf8).write(to: home.paths.stateFile)
         for _ in 0..<2 {
