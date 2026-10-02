@@ -3,17 +3,23 @@ import os
 
 /// Unified logging plus a plain-text line appended to insomnia.log, which is
 /// shared with backstop.sh so one file tells the whole story.
+///
+/// The unified log is readable by every program running as the user (and
+/// by anyone with a sysdiagnose), so message bodies go there as private
+/// data: `log show` prints `<private>` in their place. The bodies name
+/// SSIDs, tmux targets, process names and bundle ids. insomnia.log keeps
+/// the full text for the user; its permissions are its own protection.
 enum Log {
     static let logger = Logger(subsystem: Paths.bundleIdentifier, category: "core")
     private static let lock = NSLock()
 
     static func info(_ message: String) {
-        logger.info("\(message, privacy: .public)")
+        logger.info("\(message, privacy: .private)")
         append(level: "info", message)
     }
 
     static func error(_ message: String) {
-        logger.error("\(message, privacy: .public)")
+        logger.error("\(message, privacy: .private)")
         append(level: "error", message)
     }
 
@@ -26,7 +32,8 @@ enum Log {
             // Owner-only, and rotated to insomnia.log.1 past OwnerOnly.maxLogBytes.
             try OwnerOnly.appendToLog(line, at: paths.logFile)
         } catch {
-            logger.error("log append failed: \(error.localizedDescription, privacy: .public)")
+            // The description carries a path under the home directory.
+            logger.error("log append failed: \(error.localizedDescription, privacy: .private)")
         }
     }
 }

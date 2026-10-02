@@ -15,10 +15,15 @@ The installer grants the user account passwordless access to four exact pmset
 commands listed in the README. This grant is not exclusive to the Insomnia app:
 other processes running as that user can invoke them too. The app is not
 sandboxed; local logs can contain SSIDs, process metadata, and tmux target names.
-The files Insomnia creates (logs, journal, session, config, recovery lock) are
-mode 0600 and its directories 0700; the backstop runs with `umask 077`. Logs
-are capped at 1 MiB with one older copy kept. Hotspot passwords are stored in
-the login Keychain.
+The lines the app writes to `insomnia.log` also reach the unified log with the
+body marked private, so programs reading `log show` see `<private>` instead of
+those names unless private data logging is enabled on the Mac. The files
+Insomnia creates (logs, journal, session, config, recovery lock) are mode 0600
+and its directories 0700; the backstop runs with `umask 077`. Logs are capped at
+1 MiB with one older copy kept. Hotspot passwords are stored in the login
+Keychain. Location Services access is requested only when a hotspot is saved or
+a session starts with one configured; it is used to read Wi-Fi network names and
+the app never requests location updates.
 
 Passing automated checks or a secret scan does not establish the absence of
 vulnerabilities. Do not probe recovery by disrupting someone else's processes,
