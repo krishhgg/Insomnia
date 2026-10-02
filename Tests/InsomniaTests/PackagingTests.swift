@@ -2,6 +2,7 @@ import AppKit
 import Foundation
 import ImageIO
 import XCTest
+@testable import Insomnia
 
 /// The checked-in icon artifacts and the bundle wiring that points at them.
 /// These read the real files and decode them; nothing here greps sources.
@@ -92,10 +93,73 @@ final class PackagingTests: XCTestCase {
             if l > 0.75 { light += 1 }
         }
         XCTAssertGreaterThan(dark, 200, "charcoal tile should dominate the centre line")
-        XCTAssertGreaterThan(light, 4, "the eye/moon should cross the centre line")
+        XCTAssertGreaterThan(light, 4, "the eye should cross the centre line")
         XCTAssertGreaterThan(px.alpha(160, mid), 0.99, "the tile should start well inside the canvas")
         XCTAssertLessThan(px.luminance(160, mid), 0.3, "the tile edge is charcoal, not white")
         XCTAssertEqual(px.alpha(20, mid), 0, "a margin is left around the tile")
+    }
+
+    /// The checked-in files are what `AppIconArtwork` draws now, so a
+    /// geometry change without `scripts/generate-app-icon.sh` fails here.
+    func testMasterPngIsTheOpenEyeArtworkRenderedAt1024() throws {
+        let url = resources.appendingPathComponent("AppIcon-1024.png")
+        let source = try XCTUnwrap(CGImageSourceCreateWithURL(url as CFURL, nil))
+        let committed = IconPixels(try XCTUnwrap(CGImageSourceCreateImageAtIndex(source, 0, nil)))
+        let drawn = IconPixels(try XCTUnwrap(AppIconArtwork.render(pixels: 1024)))
+        XCTAssertEqual(committed.width, drawn.width)
+        XCTAssertEqual(committed.height, drawn.height)
+        let differences = committed.differences(from: drawn, tolerance: 32)
+        XCTAssertLessThan(differences, 1024 * 1024 / 1000, "AppIcon-1024.png differs from the artwork at \(differences) pixels; run scripts/generate-app-icon.sh")
+    }
+
+    func testIcnsMembersAreTheArtworkRenderedAtTheirOwnSizes() throws {
+        let url = resources.appendingPathComponent("AppIcon.icns")
+        let image = try XCTUnwrap(NSImage(contentsOf: url))
+        for pixels in [16, 32, 1024] {
+            let rep = try XCTUnwrap(image.representations.first { $0.pixelsWide == pixels && $0.pixelsHigh == pixels }, "no \(pixels)px member")
+            let ctx = try XCTUnwrap(CGContext(
+                data: nil, width: pixels, height: pixels, bitsPerComponent: 8, bytesPerRow: 0,
+                space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            ))
+            NSGraphicsContext.saveGraphicsState()
+            NSGraphicsContext.current = NSGraphicsContext(cgContext: ctx, flipped: false)
+            XCTAssertTrue(rep.draw(in: NSRect(x: 0, y: 0, width: pixels, height: pixels)), "\(pixels)px member does not draw")
+            NSGraphicsContext.restoreGraphicsState()
+            let member = IconPixels(try XCTUnwrap(ctx.makeImage()))
+            let drawn = IconPixels(try XCTUnwrap(AppIconArtwork.render(pixels: pixels)))
+            let differences = member.differences(from: drawn, tolerance: 32)
+            XCTAssertLessThan(differences, max(pixels * pixels / 1000, 3), "the \(pixels)px member differs from the artwork at \(differences) pixels; run scripts/generate-app-icon.sh")
+        }
+    }
+
+    func testReadmeSvgIsTheArtworkWrittenOut() throws {
+        let url = Self.repoRoot.appendingPathComponent("docs/assets/eye-open.svg")
+        let committed = try String(contentsOf: url, encoding: .utf8)
+        XCTAssertEqual(committed, AppIconArtwork.svg(), "docs/assets/eye-open.svg differs from the artwork; run scripts/generate-app-icon.sh")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: Self.repoRoot.appendingPathComponent("docs/assets/eye-moon.svg").path), "the old eye-and-moon SVG is gone")
+
+        // What the README embeds: the tile, then the lens, pupil and lashes on the 24-unit grid, named for what they are.
+        let grid = CGRect(x: 0, y: 0, width: EyeLensGeometry.designSize, height: EyeLensGeometry.designSize)
+        XCTAssertTrue(committed.contains("<title id=\"eo-title\">Insomnia</title>"))
+        XCTAssertTrue(committed.contains("<desc id=\"eo-desc\">The Insomnia mark: an open almond-shaped eye with a round pupil and five lashes above the upper lid"))
+        XCTAssertFalse(committed.lowercased().contains("crescent"))
+        XCTAssertTrue(committed.contains("<rect x=\"100\" y=\"100\" width=\"824\" height=\"824\" rx=\"184.3288\" fill=\"#303336\"/>"))
+        XCTAssertTrue(committed.contains("d=\"\(AppIconArtwork.pathData(EyeMarkGeometry.lens(in: grid)))\" fill=\"none\" stroke=\"#E6E3DD\" stroke-width=\"1.5\""))
+        XCTAssertTrue(committed.contains("d=\"\(AppIconArtwork.pathData(EyeMarkGeometry.pupil(in: grid)))\" fill=\"#E6E3DD\""))
+        XCTAssertTrue(committed.contains("d=\"\(AppIconArtwork.pathData(EyeMarkGeometry.lashes(in: grid, side: .above)))\" fill=\"none\" stroke=\"#E6E3DD\""))
+        XCTAssertFalse(committed.contains(AppIconArtwork.pathData(EyeMarkGeometry.lashes(in: grid, side: .below))), "no lower lashes: the eye is open")
+        // The grid is placed where the icon places it.
+        let mark = AppIconArtwork.mark
+        let scale = AppIconArtwork.number(mark.width / EyeLensGeometry.designSize)
+        XCTAssertTrue(committed.contains("transform=\"translate(\(AppIconArtwork.number(mark.minX)) \(AppIconArtwork.number(mark.minY))) scale(\(scale))\""))
+        // Path data is moves, lines, cubics and closes with no empty segments.
+        let pupil = AppIconArtwork.pathData(EyeMarkGeometry.pupil(in: grid))
+        XCTAssertTrue(pupil.hasPrefix("M"))
+        XCTAssertTrue(pupil.hasSuffix("Z"))
+        XCTAssertFalse(pupil.contains("L"), "an arc's lead-in line to its own start is dropped")
+        XCTAssertEqual(AppIconArtwork.number(184.32880), "184.3288")
+        XCTAssertEqual(AppIconArtwork.number(12), "12")
+        XCTAssertEqual(AppIconArtwork.number(-0.00001), "0")
     }
 
     // MARK: - Helpers

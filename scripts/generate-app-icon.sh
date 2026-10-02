@@ -1,8 +1,10 @@
 #!/bin/bash
-# Regenerate Resources/AppIcon-1024.png and Resources/AppIcon.icns from the
-# vector geometry the app draws with (Sources/Insomnia/UI/EyeMoonGeometry.swift
-# and BrandPalette.swift), via scripts/generate-app-icon.swift. Deterministic:
-# the same sources produce the same bytes. Needs Xcode's swiftc and iconutil.
+# Regenerate Resources/AppIcon-1024.png, Resources/AppIcon.icns and
+# docs/assets/eye-open.svg from the drawing the app carries
+# (Sources/Insomnia/UI/AppIconArtwork.swift over EyeLensGeometry.swift,
+# EyeMarkGeometry.swift and BrandPalette.swift), via
+# scripts/generate-app-icon.swift. Deterministic: the same sources produce
+# the same bytes. Needs Xcode's swiftc and iconutil.
 #
 #   scripts/generate-app-icon.sh [PREVIEW_DIR]
 #
@@ -20,12 +22,17 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 "$SWIFTC" -O -parse-as-library \
-  "$ROOT/Sources/Insomnia/UI/EyeMoonGeometry.swift" \
+  "$ROOT/Sources/Insomnia/UI/EyeLensGeometry.swift" \
+  "$ROOT/Sources/Insomnia/UI/EyeMarkGeometry.swift" \
   "$ROOT/Sources/Insomnia/UI/BrandPalette.swift" \
+  "$ROOT/Sources/Insomnia/UI/AppIconArtwork.swift" \
   "$ROOT/scripts/generate-app-icon.swift" \
   -o "$WORK/generate-app-icon"
 
-"$WORK/generate-app-icon" --png "$ROOT/Resources/AppIcon-1024.png" --iconset "$WORK/AppIcon.iconset"
+"$WORK/generate-app-icon" \
+  --png "$ROOT/Resources/AppIcon-1024.png" \
+  --iconset "$WORK/AppIcon.iconset" \
+  --svg "$ROOT/docs/assets/eye-open.svg"
 "$ICONUTIL" -c icns "$WORK/AppIcon.iconset" -o "$ROOT/Resources/AppIcon.icns"
 
 if [[ -n "$PREVIEW_DIR" ]]; then
@@ -33,4 +40,4 @@ if [[ -n "$PREVIEW_DIR" ]]; then
   cp "$WORK/AppIcon.iconset"/*.png "$PREVIEW_DIR/"
 fi
 
-echo "wrote $ROOT/Resources/AppIcon-1024.png and $ROOT/Resources/AppIcon.icns"
+echo "wrote $ROOT/Resources/AppIcon-1024.png, $ROOT/Resources/AppIcon.icns and $ROOT/docs/assets/eye-open.svg"
