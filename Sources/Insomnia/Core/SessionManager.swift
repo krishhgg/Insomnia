@@ -361,6 +361,18 @@ final class SessionManager {
         // password, a timeout or a pmset failure all land here.
         do {
             try await sleepGuard.setSleepDisabled(true)
+        } catch let AdministratorPromptError.stillRunning(prompt, grace) {
+            // The prompt's process did not stop on SIGTERM. It may still
+            // turn sleep off, so nothing is killed and nothing is rolled
+            // back beside it: session.json, the journal entry and the
+            // recovery lock stay until it exits, the same rule a stuck
+            // `sudo pmset` gets. The user is told what is running and, when
+            // it is osascript itself, how to stop it. Then the rollback.
+            reportStuckPrompt(prompt, grace: grace)
+            await prompt.waitUntilExit()
+            fail("could not disable sleep: \(prompt) did not finish in time and has now exited; rolling the start back")
+            _ = await performEnd(reason: .startFailed)
+            return
         } catch {
             fail("could not disable sleep: \(error.localizedDescription)")
             _ = await performEnd(reason: .startFailed)
@@ -1079,6 +1091,20 @@ final class SessionManager {
         Log.error(message)
     }
 
+    /// Posted once per stuck prompt: the notification and the menu's
+    /// warning line say what is running and that starts, ends and recovery
+    /// wait behind it. `kill <pid>` is only offered while the pid is
+    /// osascript's own; once it has exited the pid may be reused.
+    private func reportStuckPrompt(_ prompt: UnfinishedPrompt, grace: TimeInterval) {
+        let what = prompt.osascriptAlive
+            ? "osascript (pid \(prompt.pid)), the process behind the password dialog, did not stop within \(Int(grace)) s."
+            : "osascript (pid \(prompt.pid)) stopped, but a command it started as root is still running."
+        let hint = prompt.osascriptAlive ? " To stop it by hand: kill \(prompt.pid)" : ""
+        let body = "\(what) Insomnia keeps the session record and waits for it before rolling the start back; nothing else runs until then.\(hint)"
+        fail("start: \(body)")
+        notifier.post(title: Self.promptStuckTitle, body: body)
+    }
+
     private func iso(_ d: Date) -> String {
         ISO8601DateFormatter().string(from: d)
     }
@@ -1086,6 +1112,7 @@ final class SessionManager {
     static let incompleteTitle = "Restore incomplete"
     static let notEndedTitle = "Session not ended"
     static let journalTitle = "Recovery journal unreadable"
+    static let promptStuckTitle = "Password prompt still running"
 
     private static func endTitle(_ reason: EndReason, had: Bool) -> String {
         switch reason {

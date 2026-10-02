@@ -20,7 +20,10 @@ sleep off (`pmset -a disablesleep 1`) has no passwordless line; the app runs it
 through the standard macOS administrator dialog, with a fixed command string,
 each time the user starts a session, and never on relaunch or from the recovery
 agent. The rule stays in place after a failed install (the README says what
-was installed) and is removed by the uninstaller. The app is not sandboxed;
+was installed). When an upgrade stops because the previous build will not
+quit, the installer puts that build's `disablesleep 1` line back and says so,
+so a failed upgrade never leaves an install that cannot start a session. The
+uninstaller removes the file. The app is not sandboxed;
 local logs can contain SSIDs, process metadata, and tmux target names. Hotspot
 passwords are stored in the login Keychain.
 

@@ -52,13 +52,18 @@ final class TempHome {
 /// The administrator password dialog as a fake. Answers at once in
 /// `.succeed`, `.cancel` and `.fail`; in `.hang` it waits on `gate` like a
 /// dialog nobody answers and then reports the timeout osascript's SIGTERM
-/// would produce. Never shows anything and never runs pmset.
+/// would produce; in `.stuck` it reports osascript (pid 4242) as still
+/// running after SIGTERM and hands out `unfinished`, which the test ends
+/// with `markExited()`. Never shows anything and never runs pmset.
 final class FakeAdministratorPrompt: AdministratorPromptRunning, @unchecked Sendable {
-    enum Mode { case succeed, cancel, fail, hang }
+    enum Mode { case succeed, cancel, fail, hang, stuck }
+
+    static let stuckPid: pid_t = 4242
 
     private let lock = NSLock()
     private var _mode: Mode = .succeed
     private var _shown = 0
+    private var _unfinished: UnfinishedPrompt?
     /// Opened by the test to end a `.hang`.
     let gate = AsyncGate()
 
@@ -68,6 +73,8 @@ final class FakeAdministratorPrompt: AdministratorPromptRunning, @unchecked Send
     }
     /// How many times the dialog was shown.
     var shown: Int { lock.withLock { _shown } }
+    /// The handle a `.stuck` prompt threw, once it has.
+    var unfinished: UnfinishedPrompt? { lock.withLock { _unfinished } }
 
     func disableSleep() async throws {
         lock.withLock { _shown += 1 }
@@ -81,6 +88,10 @@ final class FakeAdministratorPrompt: AdministratorPromptRunning, @unchecked Send
         case .hang:
             await gate.wait()
             throw AdministratorPromptError.timedOut(seconds: AdministratorPrompt.timeout)
+        case .stuck:
+            let handle = UnfinishedPrompt(pid: Self.stuckPid, osascriptAlive: true)
+            lock.withLock { _unfinished = handle }
+            throw AdministratorPromptError.stillRunning(handle, grace: AdministratorPrompt.stopGrace)
         }
     }
 }

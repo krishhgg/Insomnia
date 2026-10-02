@@ -80,7 +80,12 @@ recovery; newly written journals use `frozenProcesses`.
   deadline). A session never starts unless the backstop is armed. If the
   dialog is cancelled, the password is wrong, it times out, or pmset fails,
   undo from the journal like an end, delete the session file and surface the
-  error. The journal and backstop always exist before sleep is disabled, so a
+  error. The wait is bounded: if the dialog's process has not finished 3 s
+  after the SIGTERM, Insomnia names its pid (notification and menu warning
+  line), kills nothing, keeps session.json, the journal entry and the
+  recovery lock until it exits, and rolls back then; starts, ends and the
+  agent wait behind it, the same rule as a `sudo pmset` that will not stop.
+  The journal and backstop always exist before sleep is disabled, so a
   crash while the dialog is up leaves recovery a record. Only an explicit
   Start reaches the dialog; there is no auto-start, URL scheme or scheduled
   start, and launch at login only reconciles.
@@ -104,6 +109,12 @@ recovery; newly written journals use `frozenProcesses`.
 - Turning sleep back on and the Low Power Mode floor stay passwordless so the
   app, `backstop.sh` and `uninstall.sh` can recover unattended: ending a
   stuck or crashed session must never need a password.
+- `install.sh` writes the three-line rule before it asks a running app to
+  quit, so a cancelled password prompt changes nothing. If that app refuses
+  to quit, the previous bundle stays installed, and a build older than this
+  rule starts sessions with `sudo -n pmset -a disablesleep 1`; the installer
+  then puts that line back for it, says so, and the next successful run drops
+  it again. A successful install writes the file once.
 - Nothing else runs as root.
 
 ### 3. Lid observer

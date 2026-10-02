@@ -111,6 +111,67 @@ final class OsascriptAdministratorPromptTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(Date().timeIntervalSince(began), 4.5, "returned before the child had exited")
         XCTAssertEqual(try String(contentsOf: marker, encoding: .utf8), "term\nclean\n", "the child was not left to finish its TERM handler")
     }
+
+    /// A child that ignores SIGTERM is not killed. The caller is answered
+    /// `grace` seconds after the deadline with the pid and a handle, and
+    /// the handle resolves only when the child exits on its own.
+    func testChildThatIgnoresSigtermIsReportedStillRunningAndNeverKilled() async throws {
+        let release = dir.appendingPathComponent("release")
+        let exe = try fakeOsascript("""
+        trap '' TERM
+        while [[ ! -e '\(release.path)' ]]; do sleep 0.1; done
+        echo released >> '\(marker.path)'
+        exit 0
+        """)
+        let prompt = OsascriptAdministratorPrompt(executable: exe, timeout: 2, grace: 1)
+        let began = Date()
+        var reported: UnfinishedPrompt?
+        do {
+            try await prompt.disableSleep()
+            XCTFail("must be reported still running")
+        } catch let AdministratorPromptError.stillRunning(p, grace) {
+            reported = p
+            XCTAssertEqual(grace, 1)
+        }
+        let handle = try XCTUnwrap(reported)
+        XCTAssertGreaterThanOrEqual(Date().timeIntervalSince(began), 3, "answered before the deadline plus grace")
+        XCTAssertTrue(handle.osascriptAlive)
+        XCTAssertTrue(handle.isRunning)
+        XCTAssertEqual(kill(handle.pid, 0), 0, "the child must be alive, not killed")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path), "the child has not finished")
+
+        try "".write(to: release, atomically: true, encoding: .utf8)
+        await handle.waitUntilExit()
+        XCTAssertFalse(handle.isRunning)
+        XCTAssertEqual(try String(contentsOf: marker, encoding: .utf8), "released\n", "the child finished on its own")
+    }
+
+    /// osascript dies on SIGTERM but a command it started keeps its output
+    /// open: reported as still running with no live pid of ours, and the
+    /// handle resolves when that command lets go. `Process.terminate()`
+    /// signals the whole process group, so the holder ignores SIGTERM the
+    /// way a root pmset is out of the user's reach.
+    func testOutputHeldAfterOsascriptExitsIsReportedWithoutALivePid() async throws {
+        let exe = try fakeOsascript("""
+        ( trap '' TERM; exec sleep 5 ) &
+        wait
+        """)
+        let prompt = OsascriptAdministratorPrompt(executable: exe, timeout: 2, grace: 1)
+        let began = Date()
+        var reported: UnfinishedPrompt?
+        do {
+            try await prompt.disableSleep()
+            XCTFail("must be reported still running")
+        } catch let AdministratorPromptError.stillRunning(p, _) {
+            reported = p
+        }
+        let handle = try XCTUnwrap(reported)
+        XCTAssertFalse(handle.osascriptAlive, "osascript itself died on SIGTERM")
+        XCTAssertTrue(handle.isRunning, "its output is still held")
+        await handle.waitUntilExit()
+        XCTAssertFalse(handle.isRunning)
+        XCTAssertGreaterThanOrEqual(Date().timeIntervalSince(began), 4.5, "resolved before the pipe holder exited")
+    }
 }
 
 /// PmsetSleepGuard routes only `disablesleep 1` through the dialog. Its
@@ -132,6 +193,21 @@ final class PmsetSleepGuardPromptTests: XCTestCase {
             XCTFail("must throw")
         } catch AdministratorPromptError.cancelled {
             // expected
+        }
+        XCTAssertEqual(prompt.shown, 1)
+    }
+
+    func testStillRunningPromptSurfacesWithItsHandle() async throws {
+        let prompt = FakeAdministratorPrompt()
+        prompt.mode = .stuck
+        let sleepGuard = PmsetSleepGuard(prompt: prompt)
+        do {
+            try await sleepGuard.setSleepDisabled(true)
+            XCTFail("must throw")
+        } catch let AdministratorPromptError.stillRunning(p, grace) {
+            XCTAssertEqual(p.pid, FakeAdministratorPrompt.stuckPid)
+            XCTAssertTrue(p === prompt.unfinished)
+            XCTAssertEqual(grace, AdministratorPrompt.stopGrace)
         }
         XCTAssertEqual(prompt.shown, 1)
     }
@@ -242,6 +318,55 @@ final class SleepPromptLifecycleTests: XCTestCase {
         let err = try XCTUnwrap(m.lastError)
         XCTAssertTrue(err.contains("not answered within"), err)
         XCTAssertEqual(h.notifier.posts.last?.title, "Session not started")
+    }
+
+    private func waitUntil(_ what: String, within seconds: TimeInterval = 5, _ condition: () -> Bool) async throws {
+        let deadline = Date().addingTimeInterval(seconds)
+        while !condition() {
+            if Date() > deadline {
+                XCTFail("timed out waiting until \(what)")
+                return
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+    }
+
+    /// A prompt whose process will not stop is reported with its pid and
+    /// waited for: session.json, the journal entry and the recovery lock
+    /// stay, an end requested meanwhile queues behind it, nothing is
+    /// killed, and the rollback runs once the process has exited.
+    func testStuckPromptIsReportedWithItsPidAndRolledBackAfterItExits() async throws {
+        h.prompt.mode = .stuck
+        let m = h.makeManager()
+
+        let start = Task { await m.start(duration: 1800) }
+        try await waitUntil("the stuck prompt is reported") {
+            h.notifier.posts.contains { $0.title == "Password prompt still running" }
+        }
+
+        let handle = try XCTUnwrap(h.prompt.unfinished)
+        XCTAssertTrue(handle.isRunning)
+        let post = try XCTUnwrap(h.notifier.posts.last)
+        XCTAssertTrue(post.body.contains("pid 4242"), post.body)
+        XCTAssertTrue(post.body.hasSuffix("kill 4242"), post.body)
+        XCTAssertTrue(try XCTUnwrap(m.lastError).contains("pid 4242"))
+        XCTAssertNil(m.session, "no session is surfaced")
+        XCTAssertNotNil(try h.store.loadSession(), "session.json stays so the backstop honours the deadline")
+        XCTAssertEqual(try h.store.loadState()?.sleepDisabledByUs, true, "the journal entry stays")
+        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1"], "nothing is rolled back beside a command that may still run")
+        XCTAssertNil(try RecoveryLock(url: h.home.paths.recoveryLock).tryAcquire(), "the recovery lock stays held")
+
+        let end = Task { await m.end(reason: .user) }
+        await settleQueuedRequests()
+        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1"], "the end waits behind the prompt")
+
+        handle.markExited()
+        await start.value
+        _ = await end.value
+        try assertRolledBackClean(m)
+        XCTAssertEqual(h.guardFake.calls.filter { $0 == "disablesleep 0" }.count, 1, "\(h.guardFake.calls)")
+        XCTAssertTrue(h.notifier.posts.contains { $0.title == "Session not started" })
+        XCTAssertEqual(h.prompt.shown, 1)
     }
 
     // MARK: Relaunch

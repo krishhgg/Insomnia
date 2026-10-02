@@ -63,15 +63,27 @@ BIN="$("$SWIFT" build -c release --show-bin-path)/Insomnia"
 step "Writing $SUDOERS (requires your password once)"
 TMP_SUDOERS="$(mktemp)"
 trap 'rm -f "$TMP_SUDOERS"' EXIT
-cat > "$TMP_SUDOERS" <<SUDO
-# Installed by Insomnia install.sh. Exactly three commands, nothing else.
-$USER ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0
-$USER ALL=(root) NOPASSWD: /usr/bin/pmset -b lowpowermode 1
-$USER ALL=(root) NOPASSWD: /usr/bin/pmset -b lowpowermode 0
-SUDO
-if "$SUDO" visudo -cf "$TMP_SUDOERS" >/dev/null; then
-  "$SUDO" install -m 0440 -o root -g wheel "$TMP_SUDOERS" "$SUDOERS"
-else
+# The rule, printed. `with-disablesleep-1` adds the line a build older than
+# this script needs to start a session; only step 3 asks for it, and only
+# when that older build is the one left installed.
+sudoers_rule() {
+  if [[ "${1:-}" == with-disablesleep-1 ]]; then
+    echo "# Installed by Insomnia install.sh. Four commands while an older build is installed; rerun install.sh to drop the first."
+    echo "$USER ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 1"
+  else
+    echo "# Installed by Insomnia install.sh. Exactly three commands, nothing else."
+  fi
+  echo "$USER ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0"
+  echo "$USER ALL=(root) NOPASSWD: /usr/bin/pmset -b lowpowermode 1"
+  echo "$USER ALL=(root) NOPASSWD: /usr/bin/pmset -b lowpowermode 0"
+}
+# Validates and installs the rule sudoers_rule "$1" prints. Non-zero when
+# sudo did not authenticate or visudo rejected the file.
+install_sudoers() {
+  sudoers_rule "${1:-}" > "$TMP_SUDOERS"
+  "$SUDO" visudo -cf "$TMP_SUDOERS" >/dev/null && "$SUDO" install -m 0440 -o root -g wheel "$TMP_SUDOERS" "$SUDOERS"
+}
+if ! install_sudoers; then
   echo "sudoers file failed validation (or sudo did not authenticate); not installed. Nothing was changed." >&2
   exit 1
 fi
@@ -98,7 +110,16 @@ if "$PGREP" -x Insomnia >/dev/null 2>&1; then
   done
   if "$PGREP" -x Insomnia >/dev/null 2>&1; then
     echo "Insomnia is still running after ${QUIT_WAIT_SECONDS}s (it may be refusing to quit until its own recovery finishes)." >&2
-    echo "Let it finish or quit it from its menu, then rerun. $SUDOERS is installed; the app, backstop.sh and LaunchAgent were not touched." >&2
+    # This is the one stop that leaves the previous bundle installed. A
+    # build older than this script starts sessions with `sudo -n pmset -a
+    # disablesleep 1`, which the rule written above denies, so put that line
+    # back for it (sudo's cached credential normally covers this). The next
+    # successful run writes the three-line rule again.
+    if install_sudoers with-disablesleep-1; then
+      echo "Let it finish or quit it from its menu, then rerun. $SUDOERS was put back to the four-line rule the installed build needs (it permits 'pmset -a disablesleep 1' without a password until the rerun); the app, backstop.sh and LaunchAgent were not touched." >&2
+    else
+      echo "Let it finish or quit it from its menu, then rerun. $SUDOERS holds the new three-line rule, so the installed build cannot start a session until the rerun; the app, backstop.sh and LaunchAgent were not touched." >&2
+    fi
     exit 1
   fi
 fi

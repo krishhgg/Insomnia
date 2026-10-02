@@ -6,8 +6,12 @@ import Foundation
 /// install.sh writes to sudoers, none of which can keep the Mac awake.
 protocol SleepGuarding: Sendable {
     /// `true` shows the administrator password dialog and waits for it;
-    /// only an explicit Start by the user may call it. `false` never
-    /// prompts, so a crashed or stuck session can always be ended.
+    /// only an explicit Start by the user may call it. The wait is bounded:
+    /// an `AdministratorPromptError.stillRunning` means the dialog's process
+    /// would not stop and may still turn sleep off, so the caller must keep
+    /// its lock and journal entry until the handle it carries resolves.
+    /// `false` never prompts, so a crashed or stuck session can always be
+    /// ended.
     func setSleepDisabled(_ disabled: Bool) async throws
     func isSleepDisabled() async throws -> Bool
     func setLowPowerMode(_ on: Bool) async throws

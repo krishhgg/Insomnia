@@ -79,6 +79,8 @@ turn sleep back on and toggle Low Power Mode on battery, and nothing else; the
 command that keeps the Mac awake, `pmset -a disablesleep 1`, always goes
 through the standard macOS administrator password dialog. A reinstall over an
 older install replaces the file, so the old `disablesleep 1` line is removed.
+If an upgrade stops because the running app will not quit, the old build stays
+and the installer puts that line back for it until the next successful run.
 Insomnia is not sandboxed. The app, scripts, and journals are local; hotspot
 passwords use the login Keychain, not the configuration file.
 
@@ -93,7 +95,9 @@ instructions before retrying.
 1. **Start:** click the eye in the menu bar, enter Days / Hours / Minutes, and
    press Enter. macOS asks for your administrator password to turn system
    sleep off. Cancelling the dialog, a wrong password, or no answer within
-   120 seconds leaves sleep as it was and no session started.
+   120 seconds leaves sleep as it was and no session started. If the dialog's
+   process will not close, Insomnia reports it with its pid and waits for it
+   before rolling the start back.
 2. **Extend:** click the eye or countdown during a session and enter more time.
 3. **End early:** press and hold the end control beside the countdown.
 4. **Inspect or configure:** right-click for status, recovery warnings,

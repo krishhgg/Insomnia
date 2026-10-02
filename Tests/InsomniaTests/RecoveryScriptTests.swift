@@ -1380,14 +1380,16 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(r.stderr.contains("still running"), r.stderr)
     }
 
-    /// The passwordless lines, in one place for the two tests below. None
-    /// of them can keep the Mac awake: turning sleep off has no line and
-    /// goes through the administrator password dialog in the app.
+    /// The passwordless lines, in one place for the tests below. None of
+    /// them can keep the Mac awake: turning sleep off has no line and goes
+    /// through the administrator password dialog in the app.
     private static let passwordlessLines = [
         "tester ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0",
         "tester ALL=(root) NOPASSWD: /usr/bin/pmset -b lowpowermode 1",
         "tester ALL=(root) NOPASSWD: /usr/bin/pmset -b lowpowermode 0",
     ]
+    /// The line a build older than this installer needs to start a session.
+    private static let oldStartLine = "tester ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 1"
 
     private func sudoersRules() throws -> [String] {
         try String(contentsOf: fx.sudoers, encoding: .utf8)
@@ -1406,6 +1408,7 @@ final class RecoveryScriptTests: XCTestCase {
         let text = try String(contentsOf: fx.sudoers, encoding: .utf8)
         XCTAssertFalse(text.contains("disablesleep 1"), "a passwordless way to keep the Mac awake: \(text)")
         XCTAssertTrue(fx.calls().contains("sudo -n -l /usr/bin/pmset -a disablesleep 0"), "the undo line is the one verified: \(fx.calls())")
+        XCTAssertEqual(fx.calls().filter { $0.hasPrefix("sudo install") }.count, 1, "written once, never through a four-line state: \(fx.calls())")
     }
 
     /// A reinstall over the four-line rule of an older build replaces the
@@ -1428,6 +1431,45 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
         XCTAssertEqual(try sudoersRules(), Self.passwordlessLines)
         XCTAssertFalse(try String(contentsOf: fx.sudoers, encoding: .utf8).contains("disablesleep 1"))
+        XCTAssertEqual(fx.calls().filter { $0.hasPrefix("sudo install") }.count, 1, "written once: \(fx.calls())")
+    }
+
+    /// The one stop that leaves the previous bundle installed is the app
+    /// refusing to quit. That build starts sessions with `sudo -n pmset -a
+    /// disablesleep 1`, which the three-line rule denies, so the line is
+    /// put back for it: three lines were written, then four, the bundle is
+    /// untouched, and the message says which rule is in place.
+    func testInstallWhoseAppKeepsRunningPutsTheOldLineBackForTheInstalledBuild() throws {
+        try fx.prepareInstall()
+        try fx.installMachinery()
+        fx.setMode("pgrep", "0\n")          // running, and it stays running
+
+        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertEqual(fx.calls().filter { $0.hasPrefix("sudo install") }.count, 2, "\(fx.calls())")
+        XCTAssertEqual(try sudoersRules(), [Self.oldStartLine] + Self.passwordlessLines)
+        XCTAssertEqual(try String(contentsOf: fx.app.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "binary", "the old bundle stays")
+        XCTAssertTrue(r.stderr.contains("put back to the four-line rule"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("still running"), r.stderr)
+    }
+
+    /// When the line cannot be put back (sudo wants a password again and
+    /// gets none), the three-line rule stays and the message says the
+    /// installed build cannot start a session until the rerun.
+    func testInstallWhoseAppKeepsRunningSaysSoWhenTheOldLineCannotBePutBack() throws {
+        try fx.prepareInstall()
+        try fx.installMachinery()
+        fx.setMode("pgrep", "0\n")
+        fx.setMode("sudo", "second-install-fails")
+
+        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertEqual(fx.calls().filter { $0.hasPrefix("sudo install") }.count, 2, "\(fx.calls())")
+        XCTAssertEqual(try sudoersRules(), Self.passwordlessLines)
+        XCTAssertTrue(r.stderr.contains("cannot start a session until the rerun"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("still running"), r.stderr)
     }
 }
 
@@ -1686,6 +1728,12 @@ private final class ScriptFixture {
             exit 0 ;;
           install)
             if [[ "$mode" == auth-fail ]]; then echo "sudo: 3 incorrect password attempts" >&2; exit 1; fi
+            # second-install-fails: the first install goes through, every later one
+            # fails like a sudo whose cached credential has expired and gets no password.
+            if [[ "$mode" == second-install-fails ]]; then
+              n=$(( $(cat "\(r)/sudo.installs" 2>/dev/null || echo 0) + 1 )); echo "$n" > "\(r)/sudo.installs"
+              if (( n > 1 )); then echo "sudo: a password is required" >&2; exit 1; fi
+            fi
             src=""; dst=""
             for a in "$@"; do src="$dst"; dst="$a"; done
             case "$dst" in "\(r)"/*) mkdir -p "$(dirname "$dst")"; cp "$src" "$dst"; exit 0 ;; esac

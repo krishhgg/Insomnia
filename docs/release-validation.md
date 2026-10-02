@@ -131,6 +131,8 @@ is performed. Do not replace "not run" with "passed" based on source review.
 | Relaunch (and login) with a valid session and `SleepDisabled 1` keeps the session without a prompt | Not run |
 | Relaunch with a valid session after `sudo pmset -a disablesleep 0` by hand ends the session with the "turned back on" notification, no prompt | Not run |
 | Reinstall over an older four-line `/etc/sudoers.d/insomnia` leaves exactly the three passwordless lines | Not run |
+| A dialog whose osascript has not exited 3 s after the 120 s SIGTERM is reported with its pid (notification and menu warning line), nothing is killed, and the start rolls back once it exits | Not run |
+| An upgrade whose running app refuses to quit leaves the previous bundle with the four-line rule and says so; the next successful run leaves three lines | Not run |
 
 Hardware tests must be supervised and must not endanger active user work. Use
 a stable, ventilated surface, not an enclosure. Do not intentionally overheat a
