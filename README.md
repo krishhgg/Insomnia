@@ -184,12 +184,15 @@ installation scenarios still need [release validation](docs/release-validation.m
 <summary><strong>Recovery limits and manual attention</strong></summary>
 
 - **Process ownership:** automatic resume checks the recorded process start
-  time and boot session. The app writes that identity to the journal before
-  it sends SIGSTOP, and sends nothing when the write fails, so a crash after
-  the signal leaves a resumable entry. Entries from builds that recorded the
-  pid alone are not automatically resumed while stopped. Verify the live
-  process and whether it should be resumed; never blindly signal a PID from
-  an old log.
+  time and boot session. The app journals each pid before it sends SIGSTOP,
+  and sends nothing when that write fails. The identity is added only after
+  the kernel confirms Insomnia's own stop, so a process somebody else had
+  stopped is never resumed. If the confirming write fails, the app resumes
+  what it just stopped. If the app dies between the stop and that write,
+  the stopped pids stay journaled without identity, like entries from builds
+  that recorded the pid alone, and are not automatically resumed while
+  stopped. Verify the live process and whether it should be resumed; never
+  blindly signal a PID from an old log.
 - **Identity is not an atomic guarantee:** the app checks start time to the
   microsecond; the shell checks to the second. A lookup and a signal are still
   separate operations.

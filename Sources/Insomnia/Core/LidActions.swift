@@ -215,14 +215,17 @@ final class LidActions {
             candidates.append(FrozenProcess(pid: pid, identity: identity))
         }
         guard !candidates.isEmpty else { return }
-        // Journal first, with identity. The entry that later proves a stop
-        // was ours (pid, start time to the microsecond, boot session) has
-        // to be on disk before the signal; if the write fails nothing is
-        // signaled, so no process is ever stopped without a record that
-        // can resume it.
+        let candidatePids = Set(candidates.map(\.pid))
+        // Journal first, without identity. Neither the app nor backstop.sh
+        // ever signals an entry without identity, so until the kernel has
+        // said which pids Insomnia itself stopped, the journal claims none
+        // of them: a pid somebody else stopped, which the SIGSTOP below
+        // skips, cannot be resumed from this entry wherever the app dies.
+        // If this write fails nothing is signaled.
+        let provisional = candidates.map { FrozenProcess(pid: $0.pid, identity: nil) }
         do {
             try manager.journal { s in
-                s.frozenProcesses.append(contentsOf: candidates)
+                s.frozenProcesses.append(contentsOf: provisional)
                 if docker { s.dockerFrozen = true }
             }
         } catch {
@@ -230,23 +233,29 @@ final class LidActions {
             return
         }
         let report = freezer.suspend(candidates, expectedParents: group.expectedParents)
-        // Pids the kernel would not stop (already stopped, gone, reparented,
-        // reused) leave the journal so a later resume does not claim them.
-        // If that write fails they stay journaled with identity: resume
-        // still re-checks identity and the stopped state before any
-        // SIGCONT, which rules out gone and reused pids but not one that
-        // somebody else stopped. The stopped pids stay resumable either way.
-        let skipped = Set(report.skipped)
-        if !skipped.isEmpty {
-            do {
-                try manager.journal { s in
-                    s.frozenProcesses.removeAll { skipped.contains($0.pid) }
-                    if docker, report.suspended.isEmpty { s.dockerFrozen = false }
-                }
-            } catch {
-                let list = report.skipped.map(String.init).joined(separator: ", ")
-                Log.error("could not drop skipped pid(s) \(list) of \(group.bundleId) from the journal: \(error.localizedDescription); they stay journaled with identity and are only resumed if still stopped with the same identity")
+        // One write promotes the stops Insomnia made: they gain their
+        // identity (start time to the microsecond, boot session) and become
+        // resumable. Skipped pids (already stopped, gone, reparented,
+        // reused) leave. If the app dies before this write, the stopped
+        // pids keep entries without identity and are reported for a person
+        // to check instead of being resumed.
+        let suspended = Set(report.suspended)
+        let confirmed = candidates.filter { suspended.contains($0.pid) }
+        do {
+            try manager.journal { s in
+                s.frozenProcesses.removeAll { candidatePids.contains($0.pid) }
+                s.frozenProcesses.append(contentsOf: confirmed)
+                if docker, confirmed.isEmpty { s.dockerFrozen = false }
             }
+        } catch {
+            // Nothing on disk can resume these stops, but this run still
+            // knows they are Insomnia's: undo them now. The provisional
+            // entries stay without identity; on lid open a resumed pid is
+            // running and clears as gone, and a skipped one is never signaled.
+            let undo = freezer.resume(confirmed)
+            let stuck = undo.failed + undo.unverifiable + undo.unobserved
+            Log.error("could not confirm freeze of \(group.bundleId) in the journal: \(error.localizedDescription); resumed \(undo.resumed.count) of the \(confirmed.count) pid(s) it had just stopped" + (stuck.isEmpty ? "" : "; pid(s) \(stuck.map(String.init).joined(separator: ", ")) are still stopped, journaled without identity"))
+            return
         }
         Log.info("froze \(group.name) (\(report.suspended.count) pid(s), \(report.skipped.count) skipped)")
     }

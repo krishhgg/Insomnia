@@ -21,11 +21,13 @@ struct ProcessIdentity: Codable, Equatable, Hashable, Sendable {
     }
 }
 
-/// One journaled SIGSTOP. `LidActions.freeze` writes the entry, identity
-/// included, before the signal. `identity` is nil only for entries written
-/// by an older build as `frozenPids`, which recorded the pid alone; such an
-/// entry is never signaled, because nothing proves the stopped process is
-/// ours.
+/// One journaled SIGSTOP. `LidActions.freeze` writes the entry without
+/// identity before the signal and adds the identity only after the kernel
+/// confirmed that Insomnia's own SIGSTOP stopped the process. `identity` is
+/// nil for such a provisional entry (the app died or the write failed
+/// before the confirmation) and for entries written by an older build as
+/// `frozenPids`, which recorded the pid alone. An entry without identity is
+/// never signaled, because nothing proves the stopped process is ours.
 struct FrozenProcess: Codable, Equatable, Hashable, Sendable {
     let pid: Int32
     let identity: ProcessIdentity?
