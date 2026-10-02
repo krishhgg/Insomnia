@@ -80,6 +80,10 @@ struct RuntimeState: Codable, Equatable, Sendable {
     /// Built-in keyboard backlight (0...1) before the lid close set it to 0;
     /// nil when darkening is off, there is no backlight, or the lid is open.
     var savedKeyboardBrightness: Float? = nil
+    /// A display or keyboard brightness is journaled for the open to
+    /// restore. Lid open and reconcile wake the display only then, so lid
+    /// close asks the display to sleep only then too.
+    var brightnessJournaled: Bool { savedDisplayBrightness != nil || savedKeyboardBrightness != nil }
     /// A display brightness restored on lid open while `lowPowerSetByUs`:
     /// written once more right after Insomnia switches the mode off, since
     /// the mode's end rescales the panel (spec section 4). Not something

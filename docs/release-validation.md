@@ -115,7 +115,9 @@ refuses the DisplayServices calls on any macOS major other than 26, and the
 keyboard class when a required method is missing or an encoding (offsets
 removed) differs from these; on an Intel Mac `BOOL` encodes as `c`, so the
 keyboard backlight is refused there until measured. A refused device is
-skipped at lid close, journals nothing, and is named in Settings. Unit tests
+skipped at lid close, journals nothing, and is named in Settings; with
+both devices refused the close does not request display sleep, since the
+open wakes the display only for a journaled brightness. Unit tests
 with an injected version and fake classes only; the rows below stay "Not
 run", and the guards do not stand in for them.
 
@@ -133,7 +135,7 @@ is performed. Do not replace "not run" with "passed" based on source review.
 | Lid-close/open and safe recovery of explicitly selected test processes | Not run |
 | Lid-close display/keyboard darkening and restore | Not run |
 | Darkening still runs under the private-call guards on macOS 26 (close the lid during a session: the log shows "display darkened" and "keyboard backlight off" and no "refused" line; Settings shows no note under the darken toggle) | Not run |
-| Darkening refused on an unmeasured macOS version (a macOS major other than 26, or a `KeyboardBrightnessClient` whose methods changed: the log shows the "refused" line once and "skipped" at lid close, nothing is journaled for that device, and Settings names the reason under the darken toggle) | Not run |
+| Darkening refused on an unmeasured macOS version (a macOS major other than 26, or a `KeyboardBrightnessClient` whose methods changed: the log shows the "refused" line once and "skipped" at lid close, nothing is journaled for that device, and Settings names the reason under the darken toggle; with both refused the log shows "display sleep not requested" and the panel is lit when the lid opens) | Not run |
 | Freeze-all scope with agents running (Cursor/T3 Code/Claude untouched) | Not run |
 | Simulated lid close/open via scripts/simulate-lid.sh | Not run |
 | Existing Low Power Mode preference and saved audio restoration | Not run |

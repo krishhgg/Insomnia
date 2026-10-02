@@ -742,6 +742,26 @@ final class LidActionsTests: XCTestCase {
         XCTAssertEqual(h.keyboard.sets, [0, 0.5])
     }
 
+    /// Neither brightness is known (the display read fails, no keyboard
+    /// backlight): nothing is journaled, so the open would not wake the
+    /// display. The close does not ask it to sleep; the rest still runs.
+    func testNothingJournaledMeansNoDisplaySleepRequest() async throws {
+        let (m, actions) = await make()
+        h.display.throwOnRead = true
+        h.keyboard.brightness = nil
+        await m.start(duration: 3600)
+
+        await actions.onClose()
+
+        XCTAssertEqual(h.display.sleepRequests, 0)
+        XCTAssertFalse(try XCTUnwrap(try h.store.loadState()).brightnessJournaled)
+        XCTAssertEqual(h.procs.suspended.count, 2, "the rest of the transaction still runs")
+        XCTAssertTrue(logText().contains("display sleep not requested"), logText())
+
+        await actions.onOpen()
+        XCTAssertEqual(h.display.wakes, 0)
+    }
+
     /// Setting 0 failed: the value is still journaled, so the open restores
     /// it (harmless if the panel never dimmed).
     func testDisplaySetFailureKeepsTheSavedValueForTheOpen() async throws {

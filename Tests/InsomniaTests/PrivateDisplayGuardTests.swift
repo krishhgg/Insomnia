@@ -40,12 +40,14 @@ final class RenamedSetterKeyboardClient: NSObject {
 /// display to sleep.
 struct BrightnessOnlyDimmer: DisplayDimming {
     let inner: DisplayServicesDimmer
+    /// Takes the sleep, wake and asleep calls and counts them.
+    let power: FakeDisplayDimmer
 
     func readBrightness() throws -> Float { try inner.readBrightness() }
     func setBrightness(_ value: Float) throws { try inner.setBrightness(value) }
-    func requestSleep() throws {}
-    func wake() {}
-    func isAsleep() -> Bool { false }
+    func requestSleep() throws { try power.requestSleep() }
+    func wake() { power.wake() }
+    func isAsleep() -> Bool { power.isAsleep() }
     func refusal() -> String? { inner.refusal() }
 }
 
@@ -208,10 +210,12 @@ final class RefusedDarkeningTests: XCTestCase {
         h.home.destroy()
     }
 
-    /// The display is refused (an unmeasured macOS), the keyboard class is
-    /// shaped as measured: the close skips the display with a log line and
-    /// journals nothing for it, and still darkens the keyboard.
-    func testARefusedDisplayIsSkippedAndUnjournaledWhileTheKeyboardStillDarkens() async throws {
+    /// Lid actions with only darkening on, over the given devices; the
+    /// display's sleep and wake land on `h.display`.
+    private func makeDarkeningOnly(
+        display: any DisplayDimming,
+        keyboard: any KeyboardBacklighting
+    ) -> (SessionManager, LidActions) {
         let m = h.makeManager()
         m.config.muteOnLidClose = false
         m.config.freezeList = []
@@ -222,10 +226,28 @@ final class RefusedDarkeningTests: XCTestCase {
             freezer: freezer,
             docker: DockerRule(freezer: freezer, probe: { true }),
             audio: h.audio,
-            display: BrightnessOnlyDimmer(inner: DisplayServicesDimmer(osMajorVersion: 27)),
-            keyboard: h.keyboard,
+            display: display,
+            keyboard: keyboard,
             sampler: nil
         )
+        return (m, actions)
+    }
+
+    private var refusedDisplay: BrightnessOnlyDimmer {
+        BrightnessOnlyDimmer(inner: DisplayServicesDimmer(osMajorVersion: 27), power: h.display)
+    }
+
+    private func logText() -> String {
+        (try? String(contentsOf: h.home.paths.logFile, encoding: .utf8)) ?? ""
+    }
+
+    /// The display is refused (an unmeasured macOS), the keyboard class is
+    /// shaped as measured: the close skips the display with a log line and
+    /// journals nothing for it, and still darkens the keyboard. The
+    /// keyboard entry is journaled, so the display may sleep: the open
+    /// wakes it before the keyboard comes back.
+    func testARefusedDisplayIsSkippedAndUnjournaledWhileTheKeyboardStillDarkens() async throws {
+        let (m, actions) = makeDarkeningOnly(display: refusedDisplay, keyboard: h.keyboard)
         await m.start(duration: 3600)
 
         await actions.onClose()
@@ -234,10 +256,61 @@ final class RefusedDarkeningTests: XCTestCase {
         XCTAssertNil(state.savedDisplayBrightness, "nothing journaled for a device that was never read")
         XCTAssertEqual(state.savedKeyboardBrightness, 0.5)
         XCTAssertEqual(h.keyboard.sets, [0])
-        let log = (try? String(contentsOf: h.home.paths.logFile, encoding: .utf8)) ?? ""
+        XCTAssertEqual(h.display.sleepRequests, 1)
+        let log = logText()
         XCTAssertTrue(log.contains("display darkening refused: DisplayServices brightness calls were measured on macOS 26 only; this is macOS 27"), log)
         XCTAssertTrue(log.contains("display darken on lid close skipped: DisplayServices brightness calls were measured on macOS 26 only; this is macOS 27"), log)
         XCTAssertTrue(log.contains("keyboard backlight off (was brightness 0.5)"), log)
+
+        await actions.onOpen()
+
+        XCTAssertEqual(h.display.wakes, 1, "the display the close put to sleep is woken")
+        XCTAssertEqual(h.keyboard.sets, [0, 0.5])
+        XCTAssertNil(try h.store.loadState()?.savedKeyboardBrightness)
+    }
+
+    /// Both devices refused: nothing is darkened or journaled, so nothing
+    /// on open would wake the display. The close does not ask it to sleep,
+    /// and the open has nothing to wake.
+    func testBothRefusedLeavesTheDisplayAwake() async throws {
+        let (m, actions) = makeDarkeningOnly(
+            display: refusedDisplay,
+            keyboard: CoreBrightnessKeyboardBacklight(loadClass: { ChangedSignatureKeyboardClient.self })
+        )
+        await m.start(duration: 3600)
+
+        await actions.onClose()
+
+        XCTAssertEqual(h.display.sleepRequests, 0, "no journaled brightness, so no wake on open: no sleep request")
+        let state = try XCTUnwrap(try h.store.loadState())
+        XCTAssertFalse(state.brightnessJournaled)
+        XCTAssertTrue(logText().contains("display sleep not requested: no display or keyboard brightness is journaled"), logText())
+        XCTAssertNil(m.lastError)
+
+        await actions.onOpen()
+
+        XCTAssertEqual(h.display.wakes, 0)
+        XCTAssertNil(m.lastError)
+    }
+
+    /// The app dies between a close that journaled only the keyboard (the
+    /// display refused) and the open. The relaunch reconciles with the lid
+    /// open and wakes the display from the same journal entry the sleep
+    /// request was made for.
+    func testARelaunchAfterTheCloseStillWakesTheDisplay() async throws {
+        let (m, actions) = makeDarkeningOnly(display: refusedDisplay, keyboard: h.keyboard)
+        await m.start(duration: 3600)
+        await actions.onClose()
+        XCTAssertEqual(h.display.sleepRequests, 1)
+        XCTAssertEqual(h.display.wakes, 0)
+
+        h.clamshell.closed = false
+        let relaunched = h.makeManager()
+        await relaunched.reconcile()
+
+        XCTAssertEqual(h.display.wakes, 1)
+        XCTAssertEqual(h.keyboard.sets, [0, 0.5])
+        XCTAssertFalse(try XCTUnwrap(try h.store.loadState()).brightnessJournaled)
     }
 
     func testSettingsSeesEveryRefusalWithItsDevice() {
@@ -246,7 +319,7 @@ final class RefusedDarkeningTests: XCTestCase {
             sleepGuard: h.guardFake,
             processControl: h.procs,
             backstop: h.backstop,
-            display: BrightnessOnlyDimmer(inner: DisplayServicesDimmer(osMajorVersion: 27)),
+            display: refusedDisplay,
             keyboard: CoreBrightnessKeyboardBacklight(loadClass: { ChangedSignatureKeyboardClient.self })
         )
 

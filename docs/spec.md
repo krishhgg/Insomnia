@@ -128,9 +128,12 @@ encodings measured on macOS 26 (`DisplayPower.measuredKeyboardClientEncodings`,
 stack offsets removed); a missing required method or a changed encoding
 refuses the keyboard backlight before anything is instantiated. A refused
 device is skipped at lid close with a log line, nothing is journaled for
-it, and Settings shows the reason under the darken toggle. The guards
-narrow the risk of calling a private function whose shape changed; they do
-not replace the hardware rows in docs/release-validation.md.
+it, and Settings shows the reason under the darken toggle. With nothing
+journaled for either device the close does not request display sleep,
+since lid open and reconcile wake the display only for a journaled
+brightness, as section 4 describes. The guards narrow the risk of
+calling a private function whose shape changed; they do not replace the
+hardware rows in docs/release-validation.md.
 
 Freeze scope rules:
 
@@ -171,8 +174,10 @@ the panel and keys stayed lit for the whole closed period. A display sleep
 request (`IORequestIdle` on `IODisplayWrangler`, what `pmset displaysleepnow`
 does) is ignored while any process holds a display assertion, and agents
 routinely do, so brightness 0 is the primary mechanism and the sleep request
-is best effort. Display brightness 0 does not switch the keyboard backlight
-off; it is set separately. Both values are journaled before they are changed
+is best effort. It is made only when a display or keyboard brightness is
+journaled, because the wake that undoes it on open, or on reconcile after
+a relaunch, runs only for such an entry. Display brightness 0 does not
+switch the keyboard backlight off; it is set separately. Both values are journaled before they are changed
 and restored on open, session end, Quit, or reconcile with the lid open; the
 backstop keeps the entries and only the app restores them (private
 frameworks). What is journaled is the user's value, not whatever the device

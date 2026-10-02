@@ -181,6 +181,14 @@ final class LidActions {
             Log.error("keyboard backlight on lid close skipped: \(error.localizedDescription)")
         }
 
+        // The wake that undoes this request runs on open, and on reconcile
+        // after a relaunch, only for a journaled brightness. With nothing
+        // journaled (both devices refused or unreadable) nothing would wake
+        // a panel this put to sleep, so it is not asked to sleep.
+        guard manager.state.brightnessJournaled else {
+            Log.info("display sleep not requested: no display or keyboard brightness is journaled, so nothing would wake the display on open")
+            return
+        }
         do {
             try display.requestSleep()
             Log.info("display sleep requested")

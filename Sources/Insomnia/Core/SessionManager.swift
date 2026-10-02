@@ -720,7 +720,7 @@ final class SessionManager {
         // the OS: with the sleep guard on, macOS never turns the panel off on
         // lid close, so brightness 0 is what keeps it dark. Wake first: the
         // panel may also be asleep from the best-effort sleep request.
-        if state.savedDisplayBrightness != nil || state.savedKeyboardBrightness != nil {
+        if state.brightnessJournaled {
             display.wake()
         }
         // Read before the entries are cleared: the re-assert below needs them.
