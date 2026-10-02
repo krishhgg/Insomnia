@@ -722,7 +722,7 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, true)
         let calls = fx.calls()
         XCTAssertFalse(calls.contains { $0.hasPrefix("launchctl") }, "\(calls)")
-        XCTAssertFalse(calls.contains { $0.hasPrefix("sudo rm") }, "\(calls)")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("sudo /bin/rm") }, "\(calls)")
         XCTAssertTrue(r.stderr.contains("BEFORE removing anything"), r.stderr)
         XCTAssertTrue(r.stderr.contains("sleepDisabledByUs is still true"), r.stderr)
         XCTAssertTrue(r.stderr.contains(fx.sudoers.path), r.stderr)
@@ -971,7 +971,7 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(r.stderr.contains("'launchctl print' did not answer within 1s; cannot tell whether com.insomnia.backstop is still loaded"), r.stderr)
         XCTAssertFalse(fx.calls().contains("launchctl FD9-OPEN"), "\(fx.calls())")
         XCTAssertTrue(fx.hungProcessGone("launchctl"))
-        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("sudo rm") }, "\(fx.calls())")
+        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("sudo /bin/rm") }, "\(fx.calls())")
         XCTAssertTrue(fx.exists(fx.plist))
         XCTAssertTrue(fx.exists(fx.sudoers))
         XCTAssertTrue(fx.exists(fx.app))
@@ -1078,7 +1078,7 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
         XCTAssertTrue(fx.calls().contains("sudo -n \(fx.fakePmset) -a disablesleep 0"), "\(fx.calls())")
         XCTAssertTrue(fx.calls().contains("launchctl bootout gui/\(fx.uid) \(fx.plist.path)"), "\(fx.calls())")
-        XCTAssertTrue(fx.calls().contains("sudo rm -f \(fx.sudoers.path)"), "\(fx.calls())")
+        XCTAssertTrue(fx.calls().contains("sudo /bin/rm -f \(fx.sudoers.path)"), "\(fx.calls())")
         XCTAssertFalse(fx.exists(fx.plist))
         XCTAssertFalse(fx.exists(fx.sudoers))
         XCTAssertFalse(fx.exists(fx.app))
@@ -1088,6 +1088,25 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(fx.exists(fx.config), "config.json survives without --purge")
         XCTAssertTrue(fx.exists(fx.logFile), "logs survive without --purge")
         XCTAssertTrue(fx.exists(fx.appsDir), "only the bundle goes, not its parent")
+    }
+
+    /// A rule in a directory only root can search is found by sudo running
+    /// /bin/test and removed by sudo running /bin/rm, both by full path.
+    func testUninstallFindsAndRemovesARuleOnlyRootCanSee() throws {
+        try fx.installMachinery()
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        let dir = fx.sudoers.deletingLastPathComponent().path
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: dir)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir) }
+        fx.setMode("sudo-root", "search")
+
+        let r = try fx.run(fx.uninstall)
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertTrue(fx.calls().contains("sudo /bin/test -e \(fx.sudoers.path)"), "\(fx.calls())")
+        XCTAssertTrue(fx.calls().contains("sudo /bin/rm -f \(fx.sudoers.path)"), "\(fx.calls())")
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir)
+        XCTAssertFalse(fx.exists(fx.sudoers))
     }
 
     func testUninstallPurgeRemovesOwnedFilesAndEmptyDirectoriesOnly() throws {
@@ -1335,7 +1354,7 @@ final class RecoveryScriptTests: XCTestCase {
 
         XCTAssertNotEqual(r.status, 0)
         XCTAssertTrue(fx.calls().contains("sudo -n \(fx.fakePmset) -a disablesleep 0"), "recovery still ran: \(fx.calls())")
-        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("launchctl") || $0.hasPrefix("sudo rm") }, "\(fx.calls())")
+        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("launchctl") || $0.hasPrefix("sudo /bin/rm") }, "\(fx.calls())")
         XCTAssertTrue(fx.exists(fx.plist))
         XCTAssertTrue(fx.exists(fx.sudoers))
         XCTAssertTrue(fx.exists(fx.app))
@@ -1459,7 +1478,7 @@ final class RecoveryScriptTests: XCTestCase {
 
         XCTAssertNotEqual(r.status, 0)
         XCTAssertTrue(fx.calls().contains("launchctl print gui/\(fx.uid)/com.insomnia.backstop"), "\(fx.calls())")
-        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("sudo rm") }, "\(fx.calls())")
+        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("sudo /bin/rm") }, "\(fx.calls())")
         XCTAssertTrue(fx.exists(fx.plist), "the agent file stays while launchd still lists the job")
         XCTAssertTrue(fx.exists(fx.sudoers))
         XCTAssertTrue(fx.exists(fx.app))
@@ -1621,7 +1640,7 @@ final class RecoveryScriptTests: XCTestCase {
         let r = try fx.run(fx.uninstall, ["--purge"])
 
         XCTAssertNotEqual(r.status, 0)
-        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("sudo rm") }, "\(fx.calls())")
+        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("sudo /bin/rm") }, "\(fx.calls())")
         XCTAssertTrue(fx.exists(fx.plist), "an unproven bootout keeps the agent file")
         XCTAssertTrue(fx.exists(fx.sudoers))
         XCTAssertTrue(fx.exists(fx.app))
@@ -2651,8 +2670,10 @@ private final class ScriptFixture {
         let calls = callsLog.path
         let r = root.path
         // sudo: `-n <cmd>` is the pmset path and succeeds or fails by mode
-        // without running anything. `rm`/`test` run unprivileged, and only
-        // on a path inside the fixture.
+        // without running anything. /bin/rm and /bin/test run unprivileged,
+        // and only on a path inside the fixture. With sudo-root.mode
+        // "search", they can also see through a directory the user cannot
+        // search, as root can.
         // Mode "hang" behaves like a pmset that never returns.
         // Mode "auth-fail": every form that would prompt (visudo, install)
         // fails like a wrong password, and `-n` forms fail as unpermitted.
@@ -2718,9 +2739,14 @@ private final class ScriptFixture {
             for a in "$@"; do src="$dst"; dst="$a"; done
             case "$dst" in "\(r)"/*) mkdir -p "$(dirname "$dst")"; cp "$src" "$dst"; exit 0 ;; esac
             printf 'sudo REFUSED %s\\n' "$*" >> "\(calls)"; exit 1 ;;
-          rm|test)
+          /bin/rm|/bin/test)
             for a in "$@"; do
-              case "$a" in "\(r)"/*) exec "$@" ;; esac
+              case "$a" in "\(r)"/*)
+                if [[ "$(cat "\(r)/sudo-root.mode" 2>/dev/null)" == search ]]; then
+                  d="$(dirname "$a")"; /bin/chmod u+x "$d"; "$@"; rc=$?; /bin/chmod u-x "$d"; exit $rc
+                fi
+                exec "$@" ;;
+              esac
             done
             printf 'sudo REFUSED %s\\n' "$*" >> "\(calls)"; exit 1 ;;
           *) exit 1 ;;

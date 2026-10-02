@@ -48,6 +48,9 @@ PLUTIL=/usr/bin/plutil
 LOCKF=/usr/bin/lockf
 RM=/bin/rm
 DEFAULTS=/usr/bin/defaults
+# sudo is given test and rm by full path. Given a bare name, it would search
+# the caller's PATH and run whatever it finds there as root.
+TEST=/bin/test
 LOCK_TIMEOUT_SECONDS=10
 # How long to wait for the root command behind a password dialog to let go
 # of the pending-start marker.
@@ -517,8 +520,8 @@ fi
 rm -f "$PLIST"
 
 step "Removing $SUDOERS (requires your password)"
-if [[ -e "$SUDOERS" ]] || "$SUDO" test -e "$SUDOERS"; then
-  "$SUDO" rm -f "$SUDOERS"
+if [[ -e "$SUDOERS" ]] || "$SUDO" "$TEST" -e "$SUDOERS"; then
+  "$SUDO" "$RM" -f "$SUDOERS"
 fi
 
 step "Removing app bundle"
