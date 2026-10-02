@@ -20,7 +20,10 @@ body marked private, so programs reading `log show` see `<private>` instead of
 those names unless private data logging is enabled on the Mac. Location
 Services access is requested only when a hotspot is saved or a session starts
 with one configured; it is used to read Wi-Fi network names and the app never
-requests location updates.
+requests location updates. With the App Nap setting on (off by default), the
+app writes `NSAppSleepDisabled` into the preferences of each app on the agent
+list, after recording the previous value in its journal, and puts it back at
+session end.
 
 The hotspot password is a generic-password item in the login Keychain
 (service `insomnia-hotspot`). Its access list names only the Insomnia build

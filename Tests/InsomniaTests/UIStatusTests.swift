@@ -1036,7 +1036,12 @@ final class UIStatusTests: XCTestCase {
         let h = Harness()
         defer { h.home.destroy() }
         let manager = h.makeManager()
-        let controller = StatusItemController(manager: manager, status: PlaceholderStatus(), showSettings: {})
+        // The controller reads the manager's fake clock. The tick still runs
+        // on the real run loop, but every tick between two clock moves reads
+        // the same second, so a runner that delays or bunches ticks cannot
+        // skip a value.
+        let clock = h.clock
+        let controller = StatusItemController(manager: manager, status: PlaceholderStatus(), showSettings: {}, clock: { clock.now })
         let gate = AsyncGate()
         h.backstop.armGate = gate
         controller.expand(mode: .start)
@@ -1049,9 +1054,9 @@ final class UIStatusTests: XCTestCase {
         XCTAssertEqual(controller.model.pendingProjection?.shape, .hours)
         XCTAssertEqual(controller.model.pendingCountdown, "2:00:00")
         XCTAssertTrue(controller.pendingTickArmed)
-        // Partial seconds round up, so the first whole second can still read
-        // 2:00:00; the second one cannot.
-        let deadline = Date().addingTimeInterval(2.5)
+        // Only a tick can move the text, and it moves to what the clock reads.
+        clock.advance(1)
+        let deadline = Date().addingTimeInterval(5)
         while controller.model.pendingCountdown == "2:00:00", Date() < deadline {
             try? await Task.sleep(for: .milliseconds(20))
         }
@@ -1067,7 +1072,8 @@ final class UIStatusTests: XCTestCase {
         XCTAssertFalse(controller.pendingTickArmed)
         XCTAssertNil(controller.model.pendingProjection)
         XCTAssertNil(controller.model.pendingCountdown)
-        XCTAssertEqual(manager.countdownText, "2:00:00")
+        // The live text takes over at the second the projection had reached.
+        XCTAssertEqual(manager.countdownText, "1:59:59")
     }
 
     /// The digits are read by a local key monitor, which only sees events sent
