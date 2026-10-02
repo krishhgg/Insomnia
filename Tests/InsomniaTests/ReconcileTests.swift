@@ -449,6 +449,43 @@ final class ReconcileTests: XCTestCase {
         XCTAssertTrue(real.notifier.posts.last?.body.contains("recovery agent") ?? false, "\(real.notifier.posts)")
     }
 
+    /// backstop.sh removes session.json before its undo, so a pmset of its
+    /// that hangs still holds the recovery lock when the tick sees the end.
+    /// One lock wait fails; the tick then waits the retry delay (the clock
+    /// here only moves when advanced) instead of queueing a wait and a log
+    /// line every second, and ends the session once the lock is free.
+    func testTheTickWaitsTheRetryDelayWhileTheAgentHoldsTheLock() async throws {
+        let real = Harness(now: Date())
+        defer { real.home.destroy() }
+        let m = real.makeManager()
+        await m.start(duration: 3600)
+        let held = try XCTUnwrap(try RecoveryLock(url: real.home.paths.recoveryLock).tryAcquire())
+        try real.store.deleteSession()
+        try real.store.saveState(.clean)
+        func skipped() -> Int {
+            let log = (try? String(contentsOf: real.home.paths.logFile, encoding: .utf8)) ?? ""
+            return log.components(separatedBy: "agent end skipped").count - 1
+        }
+
+        // Three seconds hold at least two ticks: without the delay, two failed lock waits.
+        try await Task.sleep(for: .milliseconds(3200))
+        XCTAssertEqual(skipped(), 1)
+        XCTAssertTrue(m.isActive)
+
+        held.release()
+        try await Task.sleep(for: .milliseconds(1500))
+        XCTAssertTrue(m.isActive, "not before the retry delay")
+        real.clock.advance(60)
+        let deadline = Date().addingTimeInterval(8)
+        while m.isActive && Date() < deadline {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+
+        XCTAssertFalse(m.isActive)
+        XCTAssertEqual(skipped(), 1)
+        XCTAssertTrue(real.notifier.posts.last?.body.contains("recovery agent") ?? false, "\(real.notifier.posts)")
+    }
+
     func testDeadlineTimerFiresEnd() async throws {
         // Use the real clock for this one so the Timer can actually fire.
         let real = Harness(now: Date())

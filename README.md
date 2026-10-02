@@ -178,8 +178,11 @@ launch, and the kernel releases it when the process dies, however it dies. The
 Mac is on battery power with the charge below the end floor from `config.json`
 (default 10%); a battery that is present but cannot be read counts as below
 it. Or the thermal pressure level reported by `notifyutil` is critical. Each
-early end is logged with its reason. Otherwise the session stands until its
-deadline, and sessions are capped at 24 hours by default (`maxDuration`).
+early end is logged with its reason, and the saved session is deleted before
+the restore starts. A restore that cannot finish leaves entries in the journal
+for the next run and the app, never a session that a relaunched app would
+resume. Otherwise the session stands until its deadline, and sessions are
+capped at 24 hours by default (`maxDuration`).
 
 The app and backstop use the same lock so they do not restore and rewrite the
 journal over one another. Failed restoration keeps the relevant entries;

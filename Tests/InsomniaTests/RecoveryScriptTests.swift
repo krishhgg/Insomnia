@@ -428,6 +428,123 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(fx.exists(fx.session))
     }
 
+    // MARK: backstop.sh: an early end is final even when its undo is not
+
+    private let journalWithSavedBrightness = #"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"savedDisplayBrightness":0.6}"#
+
+    /// Saved brightness is the app's to restore, so the run that ends the
+    /// session of an app that died cannot clear the journal. The session
+    /// ends anyway: session.json goes, and what is left stays journaled.
+    func testEarlyEndWithAnUndoOnlyTheAppCanFinishStillRemovesTheSession() throws {
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: 3600))
+        try fx.writeState(journalWithSavedBrightness)
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 1, r.stderr + fx.log())
+        XCTAssertEqual(calls(), [sleepRestored])
+        XCTAssertFalse(fx.exists(fx.session), "a relaunched app must find no session to resume")
+        let s = try fx.stateJSON()
+        XCTAssertEqual(s["sleepDisabledByUs"] as? Bool, false)
+        XCTAssertEqual((s["savedDisplayBrightness"] as? NSNumber)?.doubleValue, 0.6, "kept for the app")
+        XCTAssertTrue(fx.log().contains("Insomnia is not running"), fx.log())
+    }
+
+    /// A pmset that fails leaves sleep journaled, not the session. The next
+    /// run finds no session to check and undoes what is journaled.
+    func testEarlyEndWithAFailingPmsetRemovesTheSessionAndTheNextRunFinishes() throws {
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+        try writeLiveSession()
+        fx.setBattery(fx.battery(source: "Battery Power", percent: 9))
+        fx.setMode("sudo", "fail")
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 1, r.stderr + fx.log())
+        XCTAssertFalse(fx.exists(fx.session))
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, true, "a failed pmset stays journaled")
+        XCTAssertTrue(fx.log().contains("journal kept dirty"), fx.log())
+
+        fx.setMode("sudo", "ok")
+        fx.clearCalls()
+        let next = try fx.run(fx.backstop)
+
+        XCTAssertEqual(next.status, 0, next.stderr + fx.log())
+        XCTAssertEqual(calls(), [sleepRestored], "no session left, so nothing is read before the undo")
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, false)
+    }
+
+    /// --force (install.sh, uninstall.sh) ends a valid session the same way.
+    func testForcedEndWithAFailingPmsetStillRemovesTheSession() throws {
+        try writeLiveSession()
+        fx.setMode("sudo", "fail")
+
+        let r = try fx.run(fx.backstop, ["--force"])
+
+        XCTAssertEqual(r.status, 1, r.stderr + fx.log())
+        XCTAssertFalse(fx.exists(fx.session))
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, true)
+        XCTAssertTrue(fx.log().contains("forced end of session"), fx.log())
+    }
+
+    /// An undo that hangs stops the run with the journal as read and the
+    /// lock with the live command. The session it ended is gone all the
+    /// same, so the app sees the end and nothing can resume it.
+    func testEarlyEndWhoseUndoHangsStillRemovesTheSession() throws {
+        try writeLiveSession()
+        fx.setMode("sudo", "ignore-term")
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertNotEqual(r.status, 0)
+        XCTAssertFalse(fx.exists(fx.session))
+        XCTAssertEqual(try String(contentsOf: fx.state, encoding: .utf8), liveJournal, "journal unchanged while the command runs")
+        XCTAssertFalse(try fx.lockIsFree(), "the live command keeps the lock")
+        fx.releaseCommand()
+        XCTAssertTrue(try fx.waitUntilLockIsFree())
+    }
+
+    /// The relaunch the early end must not undo. The backstop ends the
+    /// session of an app that died; its pmset fails and the saved
+    /// brightness is the app's to restore. Insomnia launched afterwards
+    /// finds no session, so it does not disable sleep again: it restores
+    /// what the journal still holds and leaves it clean.
+    @MainActor
+    func testAppRelaunchedAfterAPartialEarlyEndRestoresInsteadOfResuming() async throws {
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: 3600))
+        try fx.writeState(journalWithSavedBrightness)
+        fx.setMode("sudo", "fail")
+        XCTAssertEqual(try fx.run(fx.backstop).status, 1, fx.log())
+        XCTAssertFalse(fx.exists(fx.session))
+
+        // The app logs into the fixture, not ~/Library/Logs/Insomnia.
+        setenv(Paths.environmentKey, fx.home.path, 1)
+        defer { unsetenv(Paths.environmentKey) }
+        let paths = Paths.fromEnvironment()
+        let sleepGuard = FakeSleepGuard()
+        let display = FakeDisplayDimmer(brightness: 0)
+        let m = SessionManager(
+            paths: paths,
+            sleepGuard: sleepGuard,
+            processControl: FakeProcessControl(),
+            backstop: FakeBackstop(),
+            display: display,
+            clamshell: { false },
+            recoveryLockTimeout: 2,
+            recoveryRetryDelay: 3600,
+            reassertDelay: .seconds(3600)
+        )
+        await m.reconcile()
+
+        XCTAssertNil(m.session, "the ended session must not come back")
+        XCTAssertFalse(sleepGuard.calls.contains("disablesleep 1"), "\(sleepGuard.calls)")
+        XCTAssertTrue(sleepGuard.calls.contains("disablesleep 0"), "\(sleepGuard.calls)")
+        XCTAssertEqual(display.sets.last, 0.6)
+        let after = try XCTUnwrap(try Store(paths: paths).loadState())
+        XCTAssertFalse(after.isDirty, "\(after)")
+    }
+
     func testExpiredSessionRestoresEverythingAndClearsJournal() throws {
         try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
         let started = 1_789_388_423

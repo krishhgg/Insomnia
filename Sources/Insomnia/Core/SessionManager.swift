@@ -141,6 +141,12 @@ final class SessionManager {
     @ObservationIgnored private var countdownTimer: Timer?
     @ObservationIgnored private var retryTimer: Timer?
     @ObservationIgnored private var checkingAgentEnd = false
+    /// The tick's next look for the agent's end after one found the recovery
+    /// lock held. backstop.sh removes session.json before its undo, so an
+    /// undo command that hangs keeps the lock past the end; the tick then
+    /// asks again after `recoveryRetryDelay`, not on every second with a new
+    /// lock wait and log line each time.
+    @ObservationIgnored private var agentEndRetryAt = Date.distantPast
     /// Whether the 1 Hz redraw is currently on the run loop. Tests assert on
     /// this to prove an idle session leaves no repeating wakeup behind.
     var countdownTimerArmed: Bool { countdownTimer != nil }
@@ -312,11 +318,14 @@ final class SessionManager {
     /// open and nothing else transacted: a cheap stat first, then the
     /// decision and the end under the lock (`adoptAgentEnd`).
     private func noticeAgentEnd() async {
-        guard session != nil, !checkingAgentEnd,
+        guard session != nil, !checkingAgentEnd, now >= agentEndRetryAt,
               !FileManager.default.fileExists(atPath: paths.sessionFile.path) else { return }
         checkingAgentEnd = true
         defer { checkingAgentEnd = false }
-        _ = await exclusive("agent end") {}
+        let result = await exclusive("agent end") {}
+        if case .failure(.lockBusy) = result {
+            agentEndRetryAt = now.addingTimeInterval(recoveryRetryDelay)
+        }
     }
 
     /// Disk is the source of truth. Missing means clean; anything that does

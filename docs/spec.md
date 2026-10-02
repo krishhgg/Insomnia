@@ -368,6 +368,11 @@ Backstop, independent of the app:
   agent ends the session otherwise, exactly as `--force` does, and logs the
   reason. A present battery that cannot be read fails closed; an unreadable
   thermal level only warns. `--force` runs none of these checks.
+- An end the agent decides is final from that decision. It removes
+  `session.json` under the lock before it undoes anything, so an undo it
+  cannot finish (a failing or hung `pmset`, saved audio or brightness only the
+  app restores) leaves journal entries, never a session a relaunched app would
+  resume. The app ends its side when it sees `session.json` gone.
 - The battery and thermal reads have the undo commands' time limit but never
   hold the lock: they run with its descriptor closed, and one that ignores
   SIGTERM gets SIGKILL. A hung read fails only its own check, never the next

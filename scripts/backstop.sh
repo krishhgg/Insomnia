@@ -36,6 +36,11 @@
 #                     3 (trapping) or above, with thermalRules on (default).
 #                     Unreadable: a warning, not an end on that alone.
 #     All three pass: exit 0, nothing logged.
+#   - A valid session this run ends (a check above, or --force) is over
+#     from that decision: session.json is removed before anything is undone,
+#     so an undo that cannot finish (saved brightness only the app restores,
+#     a failing or hung pmset) never leaves a session a relaunched app would
+#     resume. What is left stays in state.json for the next run and the app.
 #   - state.json missing or clean: nothing is undone and nothing privileged
 #     runs; an expired session.json is removed. Exit 0.
 #   - state.json dirty: undo each journaled entry from the journal alone:
@@ -279,10 +284,11 @@ run_read() { # varname command args...
 }
 
 # End this run right after a timed-out undo command that is still alive:
-# nothing else is undone, the journal and session stay exactly as read, and
-# the lock stays with the live command's supervisor.
+# nothing else is undone, the journal stays exactly as read (a session this
+# run decided to end is already gone), and the lock stays with the live
+# command's supervisor.
 stop_transaction() { # what
-  log error "recovery stopped after '$1' (still running); no further undo this run, journal and session kept unchanged until it ends"
+  log error "recovery stopped after '$1' (still running); no further undo this run, journal kept unchanged until it ends"
   exit 1
 }
 
@@ -480,6 +486,18 @@ if [[ "$session_state" == valid ]] && (( force == 0 )); then
     exit 0
   fi
   log warn "ending the session before its deadline (endsAt=$ends_at): $cutoff"
+fi
+
+# A valid session this run ends (a cutoff above, or --force) is over from
+# here, whatever the undo below achieves, so session.json goes now, under the
+# lock. Left in place after a partial undo (saved brightness only the app can
+# restore, a failing or hung pmset), it would still read as valid: a
+# relaunched Insomnia would resume it and disable sleep again, and an app
+# that was stopped or hung would never see the end (it ends its side when
+# session.json is gone). What the undo cannot finish stays in state.json,
+# which the next run and the app's reconcile complete without a session.
+if [[ "$session_state" == valid ]] && ! rm -f "$SESSION"; then
+  log error "could not remove $SESSION; until it is gone a relaunched Insomnia could resume the session this run ends"
 fi
 
 # --- Read the journal --------------------------------------------------------
