@@ -1337,6 +1337,57 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(fx.calls(), [])
     }
 
+    /// --yes removes the prompt, not the password. With no terminal and
+    /// nothing cached, sudo could never authenticate, so the installer says
+    /// what to run instead of failing inside visudo.
+    func testInstallWithYesAndNoTerminalStopsWhenSudoHasNoCachedCredentials() throws {
+        try fx.prepareInstall()
+        try fx.installMachinery()
+        fx.setMode("sudo", "no-cached-credentials")
+
+        let r = try fx.run(fx.installRedirected, ["--yes"])
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertTrue(r.stderr.contains("sudo -v"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("Nothing was changed"), r.stderr)
+        let calls = fx.calls()
+        XCTAssertTrue(calls.contains("sudo -n -v"), "\(calls)")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("sudo visudo") || $0.hasPrefix("sudo install") || $0.hasPrefix("osascript") }, "\(calls)")
+        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), "rule")
+        XCTAssertEqual(try String(contentsOf: fx.app.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "binary")
+    }
+
+    /// When the directory service cannot answer, the refusal says so and
+    /// quotes the error, instead of `set -e` ending the script silently.
+    func testInstallExplainsWhenTheAccountLookupFails() throws {
+        try fx.prepareInstall()
+        try fx.installMachinery()
+        fx.setMode("dscl", "fail")
+
+        let r = try fx.run(fx.installRedirected, ["--yes"])
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertTrue(r.stderr.contains("could not look up the home directory of tester"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("eDSRecordNotFound"), "dscl's own error is shown: \(r.stderr)")
+        XCTAssertTrue(r.stderr.contains("Nothing was changed"), r.stderr)
+        XCTAssertEqual(fx.calls(), [])
+        XCTAssertFalse(r.stdout.contains("==>"), r.stdout)
+    }
+
+    /// HOME and the account's home are compared as directories: a symlink
+    /// to it with a trailing slash is the same place and installs.
+    func testInstallAcceptsHomeNamedThroughASymlinkWithATrailingSlash() throws {
+        try fx.prepareInstall()
+        fx.setMode("launchctl", "loaded")
+        let link = fx.root.appendingPathComponent("homelink")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: fx.home)
+
+        let r = try fx.run(fx.installRedirected, ["--yes"], extraEnvironment: ["HOME": link.path + "/"])
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertTrue(r.stdout.contains("==> Installed"), r.stdout)
+    }
+
     /// The file on disk is read back through sudo and must be the rule
     /// shown. Anything else is not trusted as policy, and nothing of the
     /// previous install is touched.
@@ -1736,6 +1787,8 @@ private final class ScriptFixture {
         // installed, but `sudo -n -l <pmset ...>` still says no.
         // Mode "tamper": `install` writes the file with one extra line, so
         // what is on disk is not what the installer was given.
+        // Mode "no-cached-credentials": `sudo -n -v` fails, as it does when
+        // a password would be needed and -n forbids asking.
         // visudo checks the candidate file exists, is non-empty and grants
         // pmset, so an installer that validated the wrong path or an empty
         // heredoc cannot pass here.
@@ -1751,6 +1804,9 @@ private final class ScriptFixture {
         case "${1:-}" in
           -n) if [[ "${2:-}" == -l ]]; then
                 case "$mode" in auth-fail|rule-not-effective) exit 1 ;; *) exit 0 ;; esac
+              fi
+              if [[ "${2:-}" == -v ]]; then
+                case "$mode" in no-cached-credentials) exit 1 ;; *) exit 0 ;; esac
               fi
               case "$mode" in
                 ok) exit 0 ;;
@@ -1902,20 +1958,24 @@ private final class ScriptFixture {
         """)
     }
 
-    /// Account identity as install.sh reads it: `id -u` is this uid unless
-    /// id.uid says otherwise, `id -un` is "tester" unless id.name says
-    /// otherwise, and dscl reports the fixture home for any account unless
-    /// dscl.home says otherwise. Neither is recorded in calls.log.
+    /// Account identity as install.sh reads it: `id -u` is 501 unless id.uid
+    /// says otherwise (never the real uid, so a suite run as root still
+    /// installs), `id -un` is "tester" unless id.name says otherwise, and
+    /// dscl reports the fixture home for any account unless dscl.home says
+    /// otherwise, or fails in mode "fail". Neither is recorded in calls.log.
     private func writeIdentityFakes() throws {
         let r = root.path
         try writeFake("id", """
         case "${1:-}" in
-          -u) if [[ -f "\(r)/id.uid.mode" ]]; then cat "\(r)/id.uid.mode"; else /usr/bin/id -u; fi ;;
+          -u) if [[ -f "\(r)/id.uid.mode" ]]; then cat "\(r)/id.uid.mode"; else echo 501; fi ;;
           -un) if [[ -f "\(r)/id.name.mode" ]]; then cat "\(r)/id.name.mode"; else echo tester; fi ;;
           *) exit 1 ;;
         esac
         """)
         try writeFake("dscl", """
+        if [[ "$(cat "\(r)/dscl.mode" 2>/dev/null)" == fail ]]; then
+          echo "<dscl_cmd> DS Error: -14136 (eDSRecordNotFound)" >&2; exit 56
+        fi
         if [[ -f "\(r)/dscl.home.mode" ]]; then h="$(cat "\(r)/dscl.home.mode")"; else h='\(home.path)'; fi
         echo "NFSHomeDirectory: $h"
         """)

@@ -7,13 +7,21 @@
 # was replaced so far.
 #
 # --yes: install the rule shown without asking (for a run with no terminal).
+# sudo still has to authenticate, and with no terminal it cannot ask, so
+# the credentials must already be cached (`sudo -v` first, in the same
+# shell) or the account must have a passwordless rule; this is checked
+# before anything is written.
 set -euo pipefail
 
 ASSUME_YES=0
 for arg in "$@"; do
   case "$arg" in
     --yes) ASSUME_YES=1 ;;
-    -h|--help) echo "usage: $0 [--yes]"; echo "  --yes  install the sudoers rule shown without asking (no terminal needed)"; exit 0 ;;
+    -h|--help)
+      echo "usage: $0 [--yes]"
+      echo "  --yes  install the sudoers rule shown without asking. With no terminal, sudo must"
+      echo "         already be authenticated: run 'sudo -v' first in the same shell."
+      exit 0 ;;
     *) echo "unknown option: $arg" >&2; exit 2 ;;
   esac
 done
@@ -50,8 +58,20 @@ if [[ ! "$ACCOUNT" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]]; then
   echo "into a sudoers rule safely. Nothing was changed." >&2
   exit 1
 fi
-ACCOUNT_HOME="$("$DSCL" /Search -read "/Users/$ACCOUNT" NFSHomeDirectory 2>/dev/null | sed -n 's/^NFSHomeDirectory: //p')"
-if [[ -z "$ACCOUNT_HOME" || "${HOME:-}" != "$ACCOUNT_HOME" ]]; then
+if ! dscl_out="$("$DSCL" /Search -read "/Users/$ACCOUNT" NFSHomeDirectory 2>&1)"; then
+  echo "could not look up the home directory of $ACCOUNT (dscl /Search -read /Users/$ACCOUNT NFSHomeDirectory failed: ${dscl_out:-no output}). Nothing was changed." >&2
+  exit 1
+fi
+ACCOUNT_HOME="$(sed -n 's/^NFSHomeDirectory: //p' <<< "$dscl_out")"
+# The same directory, not the same string: HOME may name it through a
+# symlink (/var is one) or with a trailing slash.
+canonical_dir() { # prints the real path of a directory; nothing if it is not one
+  [[ -n "$1" && -d "$1" ]] || return 0
+  (cd -P -- "$1" 2>/dev/null && pwd -P) || true
+}
+HOME_REAL="$(canonical_dir "${HOME:-}")"
+ACCOUNT_HOME_REAL="$(canonical_dir "$ACCOUNT_HOME")"
+if [[ -z "$ACCOUNT_HOME" || -z "$HOME_REAL" || "$HOME_REAL" != "$ACCOUNT_HOME_REAL" ]]; then
   echo "HOME is '${HOME:-}' but the home directory of $ACCOUNT is '${ACCOUNT_HOME:-unknown}'. The installer writes under HOME" >&2
   echo "and grants $ACCOUNT, so both must belong to the same account. Nothing was changed." >&2
   exit 1
@@ -128,7 +148,7 @@ sudoers_rule | sed 's/^/    /'
 echo
 if (( ASSUME_YES == 0 )); then
   if [[ ! -t 0 ]]; then
-    echo "No terminal to confirm the rule on. Rerun from a terminal, or with --yes to install the rule shown above without asking. Nothing was changed." >&2
+    echo "No terminal to confirm the rule on. Rerun from a terminal, or with --yes to install the rule shown above without asking (sudo must then be authenticated already: run 'sudo -v' first). Nothing was changed." >&2
     exit 1
   fi
   answer=""
@@ -137,6 +157,12 @@ if (( ASSUME_YES == 0 )); then
     y|Y|yes|Yes|YES) ;;
     *) echo "Not installed. Nothing was changed."; exit 1 ;;
   esac
+fi
+# With no terminal sudo cannot ask for a password either. `sudo -n -v` only
+# refreshes cached credentials, or fails when a password would be needed.
+if [[ ! -t 0 ]] && ! "$SUDO" -n -v 2>/dev/null; then
+  echo "sudo needs a password and there is no terminal to ask on. Run 'sudo -v' first in this shell (its credentials stay cached for a few minutes), or rerun from a terminal. Nothing was changed." >&2
+  exit 1
 fi
 
 step "Writing $SUDOERS (requires your password once)"
