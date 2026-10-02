@@ -160,6 +160,9 @@ protocol BrowserProcessControlling: AnyObject {
     func terminateAndWait(pids: [Int32], timeout: TimeInterval) async -> Bool
     /// `open -b <bundleId> --args <arguments>`; throws when `open` fails.
     func launch(bundleId: String, arguments: [String]) async throws
+    /// Wait for an application with this bundle id to appear in the running
+    /// list: true as soon as one does, false when `timeout` passes first.
+    func waitUntilRunning(bundleId: String, timeout: TimeInterval) async -> Bool
 }
 
 struct BrowserProcessError: Error, LocalizedError, Equatable {
@@ -187,13 +190,23 @@ final class WorkspaceBrowserProcesses: BrowserProcessControlling {
             throw BrowserProcessError(detail: stderr.isEmpty ? "open exited with status \(r.status)" : stderr)
         }
     }
+
+    func waitUntilRunning(bundleId: String, timeout: TimeInterval) async -> Bool {
+        let deadline = ContinuousClock.now + .seconds(timeout)
+        while runningPids(bundleId: bundleId).isEmpty {
+            guard ContinuousClock.now < deadline else { return false }
+            try? await Task.sleep(for: .milliseconds(250))
+        }
+        return true
+    }
 }
 
 /// What "Relaunch <browser> unthrottled" did. Anything but `.relaunched`
 /// is reported to the user in a notification; the browser was quit only
-/// in `.launchFailed`.
+/// in `.launchFailed` and `.didNotStart`.
 enum RelaunchOutcome: Equatable, Sendable {
-    /// Every instance quit and `open` returned 0.
+    /// Every instance quit, `open` returned 0, and an instance was running
+    /// within `startTimeout`.
     case relaunched
     /// No instance was running; nothing to quit.
     case notRunning
@@ -205,6 +218,9 @@ enum RelaunchOutcome: Equatable, Sendable {
     case stillRunning
     /// Every instance quit, then `open` failed. The browser is not running.
     case launchFailed(String)
+    /// Every instance quit and `open` returned 0, but no instance was
+    /// running `startTimeout` later. The browser is not running.
+    case didNotStart
 
     /// The notification body, naming the browser; nil when the relaunch
     /// happened.
@@ -217,9 +233,11 @@ enum RelaunchOutcome: Equatable, Sendable {
         case let .argumentsUnreadable(detail):
             "Could not read \(name)'s profile arguments (\(detail)), so a relaunch could have opened the wrong profile. \(name) was not quit."
         case .stillRunning:
-            "\(name) did not quit within \(Int(BrowserThrottle.quitTimeout)) s. Nothing was relaunched."
+            "\(name) did not quit within \(Int(BrowserThrottle.quitTimeout)) s, so nothing was relaunched. It may still quit later. If it does, open it again yourself."
         case let .launchFailed(detail):
             "\(name) quit but could not be relaunched: \(detail). Open it yourself."
+        case .didNotStart:
+            "\(name) quit and was asked to open again, but it was not running after \(Int(BrowserThrottle.startTimeout)) s. Open it yourself."
         }
     }
 }
@@ -230,6 +248,9 @@ final class BrowserThrottle {
 
     /// How long a browser gets to quit before the relaunch gives up.
     nonisolated static let quitTimeout: TimeInterval = 10
+    /// How long a relaunched browser gets to show up in the running list
+    /// before the relaunch is reported as failed.
+    nonisolated static let startTimeout: TimeInterval = 5
 
     private(set) var statuses: [BrowserStatus] = []
     /// Display names of running Chromium browsers missing either flag.
@@ -272,7 +293,11 @@ final class BrowserThrottle {
     /// arguments cannot be read is not quit, since a relaunch without them
     /// could open another profile. After the wait the running list is read
     /// again, and an instance still there (the waiter timed out, or one
-    /// appeared meanwhile) means nothing is launched.
+    /// appeared meanwhile) means nothing is launched. `open` returning 0
+    /// is not the end either: the running list is polled for up to
+    /// `startTimeout`, and a browser that has not appeared by then is
+    /// reported, so the user is not left without a browser and without a
+    /// word.
     func relaunchUnthrottled(bundleId: String) async -> RelaunchOutcome {
         let pids = processes.runningPids(bundleId: bundleId)
         guard let main = pids.first else {
@@ -298,12 +323,16 @@ final class BrowserThrottle {
         }
         do {
             try await processes.launch(bundleId: bundleId, arguments: ChromiumFlags.required + extra)
-            Log.info("relaunched \(bundleId) unthrottled")
-            return .relaunched
         } catch {
             Log.error("open -b \(bundleId) failed: \(error.localizedDescription)")
             return .launchFailed(error.localizedDescription)
         }
+        guard await processes.waitUntilRunning(bundleId: bundleId, timeout: Self.startTimeout) else {
+            Log.error("relaunch: \(bundleId) not running \(Int(Self.startTimeout)) s after open returned")
+            return .didNotStart
+        }
+        Log.info("relaunched \(bundleId) unthrottled")
+        return .relaunched
     }
 
     static let psArgs: ArgsReader = { pid in

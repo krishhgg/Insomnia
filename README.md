@@ -235,8 +235,10 @@ if it is set to reopen them on startup. Insomnia reads the browser's profile
 arguments before quitting and carries them over; if it cannot read them, it
 does not quit. If the browser has not quit after 10 s, nothing is launched, and
 a notification says so: a second copy beside the first would be worse than a
-throttled one. This is not a guarantee that every web app will keep working
-while the lid is closed.
+throttled one. The quit request stands, so a browser that closes later has to
+be opened again by hand. After `open` returns, Insomnia waits up to 5 s for the
+browser to show up as running and notifies if it does not. This is not a
+guarantee that every web app will keep working while the lid is closed.
 
 </details>
 

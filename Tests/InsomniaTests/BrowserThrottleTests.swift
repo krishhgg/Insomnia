@@ -76,6 +76,7 @@ final class BrowserThrottleTests: XCTestCase {
         XCTAssertEqual(outcome, .relaunched)
         XCTAssertEqual(processes.terminated, [[42, 43]])
         XCTAssertEqual(processes.launches.map(\.bundleId), ["com.google.Chrome"])
+        XCTAssertEqual(processes.startWaits, ["com.google.Chrome"])
         XCTAssertEqual(
             processes.launches.first?.arguments,
             ChromiumFlags.required + ["--user-data-dir=/tmp/p", "--profile-directory=Work"]
@@ -158,6 +159,24 @@ final class BrowserThrottleTests: XCTestCase {
         XCTAssertEqual(outcome, .launchFailed("LSOpenURLsWithRole() failed with error -10810"))
         XCTAssertEqual(processes.terminated, [[42]])
         XCTAssertEqual(processes.launches.count, 1)
+        XCTAssertEqual(processes.startWaits, [])
+    }
+
+    /// `open` returning 0 only means LaunchServices accepted the request.
+    /// A browser that is not in the running list afterwards is reported,
+    /// not announced as relaunched.
+    @MainActor
+    func testABrowserThatDoesNotShowUpAfterOpenIsReported() async {
+        let processes = FakeBrowserProcesses(pids: [42])
+        processes.starts = false
+        let throttle = throttle(args: chrome, processes: processes)
+
+        let outcome = await throttle.relaunchUnthrottled(bundleId: "com.google.Chrome")
+
+        XCTAssertEqual(outcome, .didNotStart)
+        XCTAssertEqual(processes.terminated, [[42]])
+        XCTAssertEqual(processes.launches.count, 1)
+        XCTAssertEqual(processes.startWaits, ["com.google.Chrome"])
     }
 
     /// Every outcome short of a relaunch has a notification body naming the
@@ -166,7 +185,7 @@ final class BrowserThrottleTests: XCTestCase {
         XCTAssertNil(RelaunchOutcome.relaunched.explanation(browser: "Chrome"))
         XCTAssertEqual(
             RelaunchOutcome.stillRunning.explanation(browser: "Chrome"),
-            "Chrome did not quit within 10 s. Nothing was relaunched."
+            "Chrome did not quit within 10 s, so nothing was relaunched. It may still quit later. If it does, open it again yourself."
         )
         XCTAssertEqual(
             RelaunchOutcome.notRunning.explanation(browser: "Arc"),
@@ -179,6 +198,10 @@ final class BrowserThrottleTests: XCTestCase {
         XCTAssertEqual(
             RelaunchOutcome.launchFailed("open exited with status 1").explanation(browser: "Chromium"),
             "Chromium quit but could not be relaunched: open exited with status 1. Open it yourself."
+        )
+        XCTAssertEqual(
+            RelaunchOutcome.didNotStart.explanation(browser: "Chromium"),
+            "Chromium quit and was asked to open again, but it was not running after 5 s. Open it yourself."
         )
     }
 }
@@ -195,8 +218,11 @@ final class FakeBrowserProcesses: BrowserProcessControlling {
     var pidsAfterQuit: [Int32]?
     /// Makes `launch` throw with this detail.
     var launchFailure: String?
+    /// Whether the wait after `launch` sees an instance running.
+    var starts = true
     private(set) var terminated: [[Int32]] = []
     private(set) var launches: [(bundleId: String, arguments: [String])] = []
+    private(set) var startWaits: [String] = []
 
     init(pids: [Int32]) {
         self.pids = pids
@@ -215,5 +241,10 @@ final class FakeBrowserProcesses: BrowserProcessControlling {
     func launch(bundleId: String, arguments: [String]) async throws {
         launches.append((bundleId, arguments))
         if let launchFailure { throw BrowserProcessError(detail: launchFailure) }
+    }
+
+    func waitUntilRunning(bundleId: String, timeout: TimeInterval) async -> Bool {
+        startWaits.append(bundleId)
+        return starts
     }
 }

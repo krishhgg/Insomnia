@@ -97,7 +97,7 @@ final class IntegrationWiringTests: XCTestCase {
         await services.relaunchUnthrottled("com.google.Chrome")
 
         XCTAssertEqual(notifier.posts.map(\.title), ["Browser not relaunched"])
-        XCTAssertEqual(notifier.posts.map(\.body), ["Chrome did not quit within 10 s. Nothing was relaunched."])
+        XCTAssertEqual(notifier.posts.map(\.body), ["Chrome did not quit within 10 s, so nothing was relaunched. It may still quit later. If it does, open it again yourself."])
         XCTAssertEqual(processes.terminated, [[42]])
         XCTAssertEqual(processes.launches.count, 0)
     }

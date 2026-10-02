@@ -249,10 +249,13 @@ last held while it was on was the battery or thermal floor, not the lid.
     read before the quit, and unreadable arguments (including empty `ps`
     output) stop the relaunch before anything is quit. After the quit
     request Insomnia waits up to 10 s, then reads the running list again:
-    any instance still there means nothing is launched. Every outcome short
-    of a relaunch is a "Browser not relaunched" notification naming the
-    browser; the process side (`BrowserProcessControlling`) is injected so
-    the tests quit nothing.
+    any instance still there means nothing is launched, and the notification
+    says the browser may still quit later and then has to be opened by hand.
+    After `open` returns 0 the running list is polled for up to 5 s; a
+    browser not running by then is reported too. Every outcome short of a
+    relaunch is a "Browser not relaunched" notification naming the browser;
+    the process side (`BrowserProcessControlling`) is injected so the tests
+    quit nothing.
   - Headless Playwright is unaffected and needs nothing.
   - **Must be verified on the real machine with the lid shut** (see test plan).
     If macOS 26 does not mark windows occluded in this state, the feature is
