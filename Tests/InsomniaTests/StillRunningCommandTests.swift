@@ -150,6 +150,92 @@ final class StillRunningCommandTests: XCTestCase {
         XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
     }
 
+    /// Reconcile restoring an expired session, with that `disablesleep 0`
+    /// left running: step 3 must not run a second one beside it. Nothing
+    /// else runs, the lock goes to the command, and the end runs again
+    /// once it has exited.
+    func testReconcileRestoreStopsAtTheLiveCommandAndRunsNoSecondOne() async throws {
+        let now = h.clock.now
+        try h.store.saveSession(Session(startedAt: now.addingTimeInterval(-7200), endsAt: now.addingTimeInterval(-60)))
+        var st = RuntimeState()
+        st.sleepDisabledByUs = true
+        try h.store.saveState(st)
+        h.guardFake.sleepDisabled = true
+        h.guardFake.stillRunning = ["disablesleep 0"]
+        let m = h.makeManager()
+
+        await m.reconcile()
+
+        XCTAssertEqual(h.guardFake.calls, ["disablesleep 0"], "a second pmset ran beside the live one")
+        XCTAssertEqual(m.pendingEnd, .timer)
+        XCTAssertEqual(m.unfinishedCommand?.pid, 4242)
+        XCTAssertEqual(try h.store.loadState()?.sleepDisabledByUs, true)
+        XCTAssertTrue(try lockIsHeld())
+
+        h.guardFake.stillRunning = []
+        h.guardFake.exitStuckCommands()
+        await waitUntil("pending end never retried") { m.pendingEnd == nil }
+        XCTAssertEqual(h.guardFake.calls, ["disablesleep 0", "disablesleep 0"])
+        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
+        XCTAssertFalse(h.guardFake.sleepDisabled)
+        XCTAssertFalse(try lockIsHeld())
+    }
+
+    /// `lowpowermode 1` fails outright and the rollback `lowpowermode 0` is
+    /// the command left running: it is tracked like any other, so the lock
+    /// stays with it and ownership stays journaled for the session end.
+    func testLowPowerRollbackLeftRunningKeepsTheLock() async throws {
+        h.guardFake.throwOn = ["lowpowermode 1"]
+        h.guardFake.stillRunning = ["lowpowermode 0"]
+        let m = h.makeManager()
+        await m.start(duration: 3600)
+
+        let changed = await m.setLowPower(true)
+
+        XCTAssertFalse(changed)
+        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1", "pmset -g custom", "lowpowermode 1", "lowpowermode 0"])
+        XCTAssertEqual(m.unfinishedCommand?.pid, 4242)
+        XCTAssertEqual(try h.store.loadState()?.lowPowerSetByUs, true, "ownership dropped with the rollback still running")
+        XCTAssertTrue(try lockIsHeld(), "recovery lock released with the rollback still running")
+        var ran = false
+        let admitted = await m.runExclusive("probe") { ran = true }
+        XCTAssertFalse(admitted)
+        XCTAssertFalse(ran)
+
+        h.guardFake.stillRunning = []
+        h.guardFake.exitStuckCommands()
+        await waitUntil("lock never released") { (try? self.lockIsHeld()) == false }
+        XCTAssertNotNil(m.session)
+        let ended = await m.end(reason: .user)
+        XCTAssertEqual(ended, .restored)
+        XCTAssertEqual(h.guardFake.calls.suffix(2), ["disablesleep 0", "lowpowermode 0"])
+        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
+    }
+
+    /// The command exits in the moment between being reported and the
+    /// transaction's own check. The end is still stopped and pending, the
+    /// lock still goes to the holder, and the holder retries the end: a fast
+    /// exit must not leave the cleanup pending with nothing to retry it.
+    func testCommandThatExitsAsSoonAsReportedStillGetsTheRetry() async throws {
+        let m = h.makeManager()
+        await m.start(duration: 3600)
+        let lowPower = await m.setLowPower(true)
+        XCTAssertTrue(lowPower)
+        h.guardFake.stillRunning = ["disablesleep 0"]
+        h.guardFake.stuckExitsAtOnce = true
+
+        let outcome = await m.end(reason: .user)
+
+        XCTAssertEqual(outcome, .privilegedCommandRunning(pid: 4242))
+        XCTAssertFalse(h.guardFake.calls.contains("lowpowermode 0"), "restore continued past the stopped command: \(h.guardFake.calls)")
+        h.guardFake.stillRunning = []
+        await waitUntil("pending end never retried after a fast exit") { m.pendingEnd == nil }
+        XCTAssertEqual(h.guardFake.calls.suffix(3), ["disablesleep 0", "disablesleep 0", "lowpowermode 0"])
+        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
+        XCTAssertNil(m.unfinishedCommand)
+        XCTAssertFalse(try lockIsHeld())
+    }
+
     /// Reconcile re-applying sleep for a session found on disk, with that
     /// pmset left running: the session is not surfaced, the files stay, and
     /// the end that undoes it runs once the command has exited.

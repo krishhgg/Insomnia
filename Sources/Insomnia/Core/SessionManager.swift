@@ -274,12 +274,15 @@ final class SessionManager {
                 self.refuseForUnreadableJournal(what, error)
                 return .failure(.journalUnreadable(error.localizedDescription))
             }
+            let before = self.unfinishedCommand
             let result = await op()
-            if let stuck = self.unfinishedCommand, stuck.isRunning {
-                // A sudo pmset this transaction ran is still alive. The lock
-                // goes with it, not with the transaction: releasing it now
-                // would let the backstop run a second pmset beside the live
-                // one. stop_transaction in backstop.sh keeps it the same way.
+            if let stuck = self.unfinishedCommand, stuck !== before {
+                // A sudo pmset this transaction ran did not stop on SIGTERM.
+                // The lock goes with it, not with the transaction: releasing
+                // it now would let the backstop run a second pmset beside the
+                // live one. stop_transaction in backstop.sh keeps it the same
+                // way. Handed over even if it has exited since it was
+                // reported: the holder is what retries the pending end.
                 lockHandedOver = true
                 self.holdLock(handle, until: stuck)
             }
@@ -550,13 +553,13 @@ final class SessionManager {
             deletionError = error.localizedDescription
             fail("could not remove session.json: \(error.localizedDescription)")
         }
-        await restoreAll()
+        let stuck = await restoreAll()
         // App Nap defaults are intentionally left set (spec: open decisions).
         services?.stop()
 
-        if let stuck = unfinishedCommand, stuck.isRunning {
-            // restoreAll stopped at a sudo pmset that is still running and
-            // has told the user (stopTransaction). Nothing after it was
+        if let stuck {
+            // restoreAll stopped at a sudo pmset that did not stop on SIGTERM
+            // and has told the user (stopTransaction). Nothing after it was
             // undone and the journal keeps its entries; the lock goes to the
             // command and this end runs again when it exits. Reached from
             // reconcile and a failed start too, so the pending end is
@@ -686,6 +689,11 @@ final class SessionManager {
                 do {
                     try await sleepGuard.setLowPowerMode(false)
                     try? journal { $0.lowPowerSetByUs = false }
+                } catch let still as CommandStillRunningError {
+                    // The rollback itself is left running. Ownership stays
+                    // journaled for the session end; the lock stays with
+                    // the command.
+                    stopTransaction(for: still, thenEnd: nil)
                 } catch {
                     fail("low power mode may be on and could not be switched off: \(error.localizedDescription); kept in the journal to retry")
                     do { try await backstop.arm() } catch { Log.error("recovery agent could not be confirmed: \(error.localizedDescription)") }
@@ -738,9 +746,10 @@ final class SessionManager {
     ///
     /// A `sudo pmset` that does not stop on SIGTERM ends the restore right
     /// there, as stop_transaction does in backstop.sh: no later undo runs
-    /// beside the live command, and the journal stays as it was. The caller
-    /// (`performEnd`) reports it and the end is retried once it has exited.
-    func restoreAll() async {
+    /// beside the live command, and the journal stays as it was. That
+    /// command is returned; the caller (`performEnd`) reports the end as
+    /// stopped and it is retried once the command has exited.
+    func restoreAll() async -> UnfinishedCommand? {
         if state.sleepDisabledByUs {
             do {
                 try await sleepGuard.setSleepDisabled(false)
@@ -748,7 +757,7 @@ final class SessionManager {
                 Log.info("sleep restored")
             } catch let still as CommandStillRunningError {
                 stopTransaction(for: still, thenEnd: nil)
-                return
+                return still.command
             } catch {
                 fail("could not restore sleep: \(error.localizedDescription)")
             }
@@ -764,7 +773,7 @@ final class SessionManager {
                 lowPowerJustCleared = true
             } catch let still as CommandStillRunningError {
                 stopTransaction(for: still, thenEnd: nil)
-                return
+                return still.command
             } catch {
                 fail("could not clear low power mode: \(error.localizedDescription)")
             }
@@ -777,6 +786,7 @@ final class SessionManager {
         // nothing more (its journal write clears the entry), and a lid
         // still open gets its second write now.
         if lowPowerJustCleared { settleDisplayAfterLowPower() }
+        return nil
     }
 
     /// Shared body of lid open, reconcile (lid open) and `restoreAll()`;
@@ -1045,13 +1055,16 @@ final class SessionManager {
             return
         }
 
-        // Step 1: missing or expired -> full end.
+        // Step 1: missing or expired -> full end. A restore stopped at a
+        // sudo pmset that did not stop on SIGTERM ends the reconcile too:
+        // step 3 would run a second `disablesleep 0` beside the live one.
+        // The lock goes to the command and the end is retried when it exits.
         if onDisk != nil {
             Log.info("reconcile: session expired, restoring")
-            _ = await performEnd(reason: .timer)
+            if case .privilegedCommandRunning = await performEnd(reason: .timer) { return }
         } else if state.isDirty {
             Log.info("reconcile: no session but dirty state, restoring")
-            _ = await performEnd(reason: .backstop)
+            if case .privilegedCommandRunning = await performEnd(reason: .backstop) { return }
         } else if state.displayRestoredUnderLowPower != nil {
             dropDisplayWrite(reason: "no session and the mode is not ours")
         } else {

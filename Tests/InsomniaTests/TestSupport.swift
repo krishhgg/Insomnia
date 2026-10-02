@@ -66,6 +66,10 @@ final class FakeSleepGuard: SleepGuarding, @unchecked Sendable {
     /// (`CommandStillRunningError`): recorded, no effect, and a fake child
     /// in `stuck` that stays alive until `exitStuckCommands()`.
     var stillRunning: Set<String> = []
+    /// With `stillRunning`: the fake child exits the moment it is reported,
+    /// before the caller can look at it (the window between the grace and
+    /// the transaction's own check).
+    var stuckExitsAtOnce = false
     private var _stuck: [UnfinishedCommand] = []
     private var _nextPid: Int32 = 4242
 
@@ -121,6 +125,7 @@ final class FakeSleepGuard: SleepGuarding, @unchecked Sendable {
                 _stuck.append(child)
                 return child
             }
+            if stuckExitsAtOnce { exitStuckCommands() }
             throw CommandStillRunningError(command: child, reason: .timeout(seconds: 20), grace: 3)
         }
     }
