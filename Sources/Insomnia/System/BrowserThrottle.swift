@@ -148,16 +148,34 @@ private final class ApplicationTerminationWaiter {
     }
 }
 
+/// One running copy of a browser, as the running list showed it. A quit
+/// goes to `process`, never to a fresh lookup of `pid`: by the time the
+/// quit goes out the pid may belong to another app, while the object
+/// stands for this one process and quits nothing once it has exited.
+struct BrowserInstance {
+    let pid: Int32
+    /// The workspace's `NSRunningApplication` in the app; the fake's own
+    /// object in tests.
+    let process: AnyObject
+    /// The kernel's start time for `pid` when the list was read, which a
+    /// later process given the same pid cannot share; nil when it could
+    /// not be read.
+    let identity: ProcessIdentity?
+}
+
 /// The process side of a relaunch: which instances of a browser are
 /// running, quitting them, launching one. The app's implementation is
 /// NSWorkspace and `open -b`; tests inject a fake, so nothing real is quit.
 @MainActor
 protocol BrowserProcessControlling: AnyObject {
-    /// Process ids of every running application with this bundle id.
-    func runningPids(bundleId: String) -> [Int32]
-    /// Ask each application to quit and wait: true once all have quit,
-    /// false when `timeout` passes first.
-    func terminateAndWait(pids: [Int32], timeout: TimeInterval) async -> Bool
+    /// Every running application with this bundle id.
+    func runningInstances(bundleId: String) -> [BrowserInstance]
+    /// Whether `instance` is still the process the list showed: it has not
+    /// exited, and its pid has not gone to a later process.
+    func isRunning(_ instance: BrowserInstance) -> Bool
+    /// Ask each instance to quit and wait: true once all have quit, false
+    /// when `timeout` passes first.
+    func terminateAndWait(_ instances: [BrowserInstance], timeout: TimeInterval) async -> Bool
     /// `open -b <bundleId> --args <arguments>`; throws when `open` fails.
     func launch(bundleId: String, arguments: [String]) async throws
     /// Wait for an application with this bundle id to appear in the running
@@ -174,14 +192,27 @@ struct BrowserProcessError: Error, LocalizedError, Equatable {
 
 @MainActor
 final class WorkspaceBrowserProcesses: BrowserProcessControlling {
-    func runningPids(bundleId: String) -> [Int32] {
+    func runningInstances(bundleId: String) -> [BrowserInstance] {
         NSWorkspace.shared.runningApplications
             .filter { $0.bundleIdentifier == bundleId && !$0.isTerminated }
-            .map(\.processIdentifier)
+            .map { BrowserInstance(pid: $0.processIdentifier, process: $0, identity: Self.identity(of: $0.processIdentifier)) }
     }
 
-    func terminateAndWait(pids: [Int32], timeout: TimeInterval) async -> Bool {
-        let applications = pids.compactMap { NSRunningApplication(processIdentifier: $0) }
+    /// `isTerminated` changes when the workspace's notification arrives,
+    /// which can trail the exit; the kernel's start time for the pid says
+    /// at once whether it is still this process. Without a recorded start
+    /// time, `isTerminated` is all there is.
+    func isRunning(_ instance: BrowserInstance) -> Bool {
+        guard let application = instance.process as? NSRunningApplication, !application.isTerminated else { return false }
+        guard let identity = instance.identity else { return true }
+        return Self.identity(of: instance.pid) == identity
+    }
+
+    /// Quits the application objects the list returned, as found. One whose
+    /// process has exited since is skipped, and nothing is looked up again
+    /// by pid.
+    func terminateAndWait(_ instances: [BrowserInstance], timeout: TimeInterval) async -> Bool {
+        let applications = instances.compactMap { $0.process as? NSRunningApplication }
         return await ApplicationTerminationWaiter(applications: applications).terminateAndWait(timeout: timeout)
     }
 
@@ -194,20 +225,32 @@ final class WorkspaceBrowserProcesses: BrowserProcessControlling {
     }
 
     func waitUntilRunning(bundleId: String, timeout: TimeInterval) async throws -> Bool {
-        try await Self.poll(timeout: timeout) { !runningPids(bundleId: bundleId).isEmpty }
+        try await Self.poll(timeout: timeout) { !runningInstances(bundleId: bundleId).isEmpty }
     }
 
-    /// Check `condition` every `interval` until it holds (true) or `timeout`
-    /// passes (false). In a cancelled task the sleep throws at once, and the
+    /// Check `condition` every `interval` until it holds (true) or
+    /// `timeout` has been slept through (false). The wait is counted in
+    /// sleeps, so `sleep` is the only clock, and tests pass one they
+    /// control. In a cancelled task `Task.sleep` throws at once, and the
     /// error is passed on: ignoring it would turn this loop into a spin on
-    /// the main actor until the deadline.
-    static func poll(timeout: TimeInterval, every interval: Duration = .milliseconds(250), until condition: () -> Bool) async throws -> Bool {
-        let deadline = ContinuousClock.now + .seconds(timeout)
-        while !condition() {
-            guard ContinuousClock.now < deadline else { return false }
-            try await Task.sleep(for: interval)
+    /// the main actor.
+    static func poll(
+        timeout: TimeInterval,
+        every interval: Duration = .milliseconds(250),
+        sleep: (Duration) async throws -> Void = { try await Task.sleep(for: $0) },
+        until condition: () -> Bool
+    ) async throws -> Bool {
+        let sleeps = interval > .zero ? Int((.seconds(timeout) / interval).rounded(.up)) : 0
+        for _ in 0..<sleeps {
+            if condition() { return true }
+            try await sleep(interval)
         }
-        return true
+        return condition()
+    }
+
+    private static func identity(of pid: Int32) -> ProcessIdentity? {
+        guard case let .present(state) = SignalProcessControl.kernelState(pid: pid) else { return nil }
+        return state.identity
     }
 }
 
@@ -307,32 +350,38 @@ final class BrowserThrottle {
     /// exit, and only then launch it with both flags and the profile
     /// arguments it had. The arguments are read first: a browser whose
     /// arguments cannot be read is not quit, since a relaunch without them
-    /// could open another profile. After the wait the running list is read
-    /// again, and an instance still there (the waiter timed out, or one
-    /// appeared meanwhile) means nothing is launched. `open` returning 0
-    /// is not the end either: the running list is polled for up to
-    /// `startTimeout`, and a browser that has not appeared by then is
+    /// could open another profile. `ps` is given a pid, so a main process
+    /// that exits during the read counts as unreadable too: the pid may
+    /// have named another process by then. The quit goes to the instances
+    /// the list returned, not to their pids. After the wait the running
+    /// list is read again, and an instance still there (the waiter timed
+    /// out, or one appeared meanwhile) means nothing is launched. `open`
+    /// returning 0 is not the end either: the running list is polled for
+    /// up to `startTimeout`, and a browser that has not appeared by then is
     /// reported, so the user is not left without a browser and without a
     /// word.
     func relaunchUnthrottled(bundleId: String) async -> RelaunchOutcome {
-        let pids = processes.runningPids(bundleId: bundleId)
-        guard let main = pids.first else {
+        let instances = processes.runningInstances(bundleId: bundleId)
+        guard let main = instances.first else {
             Log.info("relaunch: \(bundleId) is not running")
             return .notRunning
         }
         let extra: [String]
         do {
-            let args = try await readArgs(main)
+            let args = try await readArgs(main.pid)
             guard !args.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                throw BrowserProcessError(detail: "ps printed nothing for pid \(main)")
+                throw BrowserProcessError(detail: "ps printed nothing for pid \(main.pid)")
+            }
+            guard processes.isRunning(main) else {
+                throw BrowserProcessError(detail: "pid \(main.pid) exited while they were read")
             }
             extra = ChromiumFlags.preservedArgs(args: args)
         } catch {
-            Log.error("relaunch: could not read args of \(bundleId) (pid \(main)): \(error.localizedDescription); not quitting")
+            Log.error("relaunch: could not read args of \(bundleId) (pid \(main.pid)): \(error.localizedDescription); not quitting")
             return .argumentsUnreadable(error.localizedDescription)
         }
-        let quit = await processes.terminateAndWait(pids: pids, timeout: Self.quitTimeout)
-        let remaining = processes.runningPids(bundleId: bundleId)
+        let quit = await processes.terminateAndWait(instances, timeout: Self.quitTimeout)
+        let remaining = processes.runningInstances(bundleId: bundleId).map(\.pid)
         guard quit, remaining.isEmpty else {
             Log.error("relaunch: \(bundleId) still running after \(Int(Self.quitTimeout)) s (pids \(remaining)); not launching")
             return .stillRunning

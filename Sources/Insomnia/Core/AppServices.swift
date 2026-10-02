@@ -232,9 +232,6 @@ final class AppServices {
         power.instantWatts()
     }
 
-    /// Quit and relaunch a Chromium browser with both anti-throttle flags.
-    /// The outcome lands seconds after the menu click, so anything short of
-    /// a relaunch goes out as a notification naming the browser.
     /// Cancel browser scans and relaunches in flight. `stop()` calls this
     /// when the session ends; a relaunch waiting for the browser to start
     /// then returns at once and posts nothing.
@@ -243,11 +240,16 @@ final class AppServices {
         browserTasks.removeAll()
     }
 
+    /// Quit and relaunch a Chromium browser with both anti-throttle flags.
+    /// The outcome lands seconds after the menu click, so anything short of
+    /// a relaunch goes out as a notification naming the browser. The name
+    /// is taken before the relaunch starts: a scan that finishes meanwhile
+    /// replaces `status.browsers`, and the browser is not running then.
     func relaunchUnthrottled(_ bundleId: String) async {
+        let name = status.browsers.first { $0.bundleId == bundleId }?.name ?? bundleId
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
             let outcome = await self.browser.relaunchUnthrottled(bundleId: bundleId)
-            let name = self.status.browsers.first { $0.bundleId == bundleId }?.name ?? bundleId
             if let body = outcome.explanation(browser: name) {
                 self.notifier.post(title: "Browser not relaunched", body: body)
             }

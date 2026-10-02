@@ -180,44 +180,115 @@ final class BrowserThrottleTests: XCTestCase {
     }
 
     /// The finding: a session that ends during the start wait cancels the
-    /// relaunch task. The wait must end at once rather than spin until the
-    /// deadline, and the outcome is not a failure to report.
+    /// relaunch task. The wait must end at once rather than keep checking,
+    /// and the outcome is not a failure to report. The test waits for the
+    /// relaunch to be inside the wait, not for a time; the wait's own
+    /// sleeps last until cancelled, so no deadline can end it instead.
     @MainActor
-    func testACancelledStartWaitEndsAtOnceAndIsNotAFailure() async throws {
+    func testACancelledStartWaitEndsAtOnceAndIsNotAFailure() async {
         let processes = FakeBrowserProcesses(pids: [42])
         processes.startWait = .pollsUntilCancelled
         let throttle = throttle(args: chrome, processes: processes)
 
         let relaunch = Task { await throttle.relaunchUnthrottled(bundleId: "com.google.Chrome") }
-        try await processes.waitForStartWait()
-        let cancelledAt = ContinuousClock.now
+        await fulfillment(of: [processes.insideStartWait], timeout: 60)
+        let checksAtCancel = processes.startChecks
         relaunch.cancel()
         let outcome = await relaunch.value
 
-        XCTAssertLessThan(ContinuousClock.now - cancelledAt, .seconds(1))
         XCTAssertEqual(outcome, .cancelled)
+        XCTAssertLessThanOrEqual(processes.startChecks, checksAtCancel + 1, "the wait kept checking after the cancel")
         XCTAssertEqual(processes.launches.count, 1)
     }
 
     /// The loop itself: once its task is cancelled it checks at most once
     /// more and throws, where ignoring the sleep's error kept it checking
-    /// as fast as it could until the deadline.
+    /// as fast as it could. The sleep is the test's: it reports that the
+    /// loop is asleep and then lasts until the task is cancelled.
     @MainActor
     func testThePollStopsCheckingWhenItsTaskIsCancelled() async {
         let checks = Locked(0)
+        let asleep = expectation(description: "the poll is asleep")
+        asleep.assertForOverFulfill = false
         let poll = Task { @MainActor in
-            try await WorkspaceBrowserProcesses.poll(timeout: 3, every: .milliseconds(20)) {
+            try await WorkspaceBrowserProcesses.poll(timeout: 60, every: .milliseconds(20), sleep: { _ in
+                asleep.fulfill()
+                try await Task.sleep(for: .seconds(3600))
+            }) {
                 checks.value += 1
                 return false
             }
         }
-        try? await Task.sleep(for: .milliseconds(100))
+        await fulfillment(of: [asleep], timeout: 60)
         let checksAtCancel = checks.value
         poll.cancel()
         let result = await poll.result
 
         XCTAssertThrowsError(try result.get()) { XCTAssertTrue($0 is CancellationError, "\($0)") }
         XCTAssertLessThanOrEqual(checks.value, checksAtCancel + 1)
+    }
+
+    /// Without a cancel the poll gives up after `timeout` worth of sleeps,
+    /// and stops as soon as the condition holds; no clock is read.
+    @MainActor
+    func testThePollCountsItsSleeps() async throws {
+        let slept = Locked<[Duration]>([])
+        let gaveUp = try await WorkspaceBrowserProcesses.poll(timeout: 1, every: .milliseconds(250), sleep: { slept.value.append($0) }) { false }
+        XCTAssertFalse(gaveUp)
+        XCTAssertEqual(slept.value, Array(repeating: .milliseconds(250), count: 4))
+
+        let checks = Locked(0)
+        let found = try await WorkspaceBrowserProcesses.poll(timeout: 1, sleep: { _ in }) {
+            checks.value += 1
+            return checks.value == 3
+        }
+        XCTAssertTrue(found)
+        XCTAssertEqual(checks.value, 3)
+    }
+
+    /// The main process exits while its arguments are read and another app
+    /// gets its pid. `ps` may have read that app's arguments, so nothing is
+    /// quit, and the app now holding the pid is left alone.
+    @MainActor
+    func testAMainProcessThatExitsDuringTheReadStopsTheRelaunch() async {
+        let processes = FakeBrowserProcesses(pids: [42])
+        let throttle = BrowserThrottle(readArgs: { _ in
+            await MainActor.run {
+                processes.exit(pid: 42)
+                processes.start(bundleId: "com.apple.finder", pid: 42)
+            }
+            return "/System/Library/CoreServices/Finder.app/Contents/MacOS/Finder"
+        }, processes: processes)
+
+        let outcome = await throttle.relaunchUnthrottled(bundleId: "com.google.Chrome")
+
+        XCTAssertEqual(outcome, .argumentsUnreadable("pid 42 exited while they were read"))
+        XCTAssertEqual(processes.terminated, [])
+        XCTAssertEqual(processes.launches.count, 0)
+        XCTAssertEqual(processes.processes.filter { $0.bundleId == "com.apple.finder" }.map(\.running), [true])
+    }
+
+    /// Another instance exits during the read and its pid goes to another
+    /// app. The quit goes to the instances the list returned, so that app
+    /// is not asked to quit.
+    @MainActor
+    func testTheQuitGoesToTheInstancesFoundNotToTheirPids() async {
+        let processes = FakeBrowserProcesses(pids: [42, 43])
+        let found = processes.processes
+        let throttle = BrowserThrottle(readArgs: { [chrome] _ in
+            await MainActor.run {
+                processes.exit(pid: 43)
+                processes.start(bundleId: "com.apple.finder", pid: 43)
+            }
+            return chrome
+        }, processes: processes)
+
+        let outcome = await throttle.relaunchUnthrottled(bundleId: "com.google.Chrome")
+
+        XCTAssertEqual(outcome, .relaunched)
+        XCTAssertEqual(processes.quitRequests.count, 1)
+        XCTAssertTrue(zip(processes.quitRequests.first ?? [], found).allSatisfy { $0 === $1 }, "the quit went to other objects")
+        XCTAssertEqual(processes.processes.filter { $0.bundleId == "com.apple.finder" }.map(\.running), [true], "the app that took pid 43 was quit")
     }
 
     /// Every outcome short of a relaunch has a notification body naming the
@@ -248,45 +319,90 @@ final class BrowserThrottleTests: XCTestCase {
     }
 }
 
-/// Records what the relaunch asked for and answers from scripted state;
-/// nothing real is quit or launched.
+/// A running list of fake processes; records what the relaunch asked for.
+/// Nothing real is quit or launched.
 @MainActor
 final class FakeBrowserProcesses: BrowserProcessControlling {
-    /// Pids reported before the quit.
-    var pids: [Int32]
-    /// Whether the wait reports every instance gone.
+    /// One process. The object is its identity: a later process given the
+    /// same pid is another object.
+    final class Process {
+        let bundleId: String
+        let pid: Int32
+        fileprivate(set) var running = true
+
+        init(bundleId: String, pid: Int32) {
+            self.bundleId = bundleId
+            self.pid = pid
+        }
+    }
+
+    /// Every process the fake has known, running or not.
+    private(set) var processes: [Process]
+    /// Whether a quit request makes the instances exit.
     var quits = true
-    /// Pids reported after the wait. Default: none when `quits`, else `pids`.
+    /// Pids of new instances that appear during the quit wait.
     var pidsAfterQuit: [Int32]?
     /// Makes `launch` throw with this detail.
     var launchFailure: String?
+    /// Runs during the quit wait, before it ends.
+    var duringQuit: (@MainActor () -> Void)?
     enum StartWait {
         /// An instance is running as soon as the wait begins.
         case appears
         /// The wait reports that none appeared.
         case neverAppears
         /// The app's own poll loop runs against a list that stays empty,
-        /// so the wait lasts until its task is cancelled.
+        /// with sleeps that last until the task is cancelled, so only a
+        /// cancel ends the wait. `insideStartWait` is fulfilled at the
+        /// first sleep.
         case pollsUntilCancelled
     }
 
     /// What the wait after `launch` sees.
     var startWait = StartWait.appears
-    private(set) var terminated: [[Int32]] = []
+    /// Pids of each quit request, in order.
+    var terminated: [[Int32]] { quitRequests.map { $0.map(\.pid) } }
+    private(set) var quitRequests: [[Process]] = []
     private(set) var launches: [(bundleId: String, arguments: [String])] = []
     private(set) var startWaits: [String] = []
+    /// How often the `.pollsUntilCancelled` wait has checked the list.
+    private(set) var startChecks = 0
+    let insideStartWait: XCTestExpectation = {
+        let e = XCTestExpectation(description: "the relaunch is inside the start wait")
+        e.assertForOverFulfill = false
+        return e
+    }()
 
-    init(pids: [Int32]) {
-        self.pids = pids
+    init(pids: [Int32], bundleId: String = "com.google.Chrome") {
+        processes = pids.map { Process(bundleId: bundleId, pid: $0) }
     }
 
-    func runningPids(bundleId: String) -> [Int32] {
-        guard !terminated.isEmpty else { return pids }
-        return pidsAfterQuit ?? (quits ? [] : pids)
+    @discardableResult
+    func start(bundleId: String = "com.google.Chrome", pid: Int32) -> Process {
+        let process = Process(bundleId: bundleId, pid: pid)
+        processes.append(process)
+        return process
     }
 
-    func terminateAndWait(pids: [Int32], timeout: TimeInterval) async -> Bool {
-        terminated.append(pids)
+    func exit(pid: Int32) {
+        for process in processes where process.pid == pid { process.running = false }
+    }
+
+    func runningInstances(bundleId: String) -> [BrowserInstance] {
+        processes.filter { $0.bundleId == bundleId && $0.running }
+            .map { BrowserInstance(pid: $0.pid, process: $0, identity: nil) }
+    }
+
+    func isRunning(_ instance: BrowserInstance) -> Bool {
+        (instance.process as? Process)?.running ?? false
+    }
+
+    func terminateAndWait(_ instances: [BrowserInstance], timeout: TimeInterval) async -> Bool {
+        let asked = instances.compactMap { $0.process as? Process }
+        quitRequests.append(asked)
+        if quits { asked.forEach { $0.running = false } }
+        for pid in pidsAfterQuit ?? [] { start(pid: pid) }
+        duringQuit?()
         return quits
     }
 
@@ -300,19 +416,14 @@ final class FakeBrowserProcesses: BrowserProcessControlling {
         switch startWait {
         case .appears: return true
         case .neverAppears: return false
-        case .pollsUntilCancelled: return try await WorkspaceBrowserProcesses.poll(timeout: 3) { false }
-        }
-    }
-
-    /// Yield until the relaunch under test is inside the start wait.
-    func waitForStartWait() async throws {
-        let deadline = ContinuousClock.now + .seconds(2)
-        while startWaits.isEmpty {
-            guard ContinuousClock.now < deadline else {
-                XCTFail("the relaunch never reached the start wait")
-                return
+        case .pollsUntilCancelled:
+            return try await WorkspaceBrowserProcesses.poll(timeout: 3600, sleep: { [insideStartWait] _ in
+                insideStartWait.fulfill()
+                try await Task.sleep(for: .seconds(3600))
+            }) {
+                startChecks += 1
+                return false
             }
-            try await Task.sleep(for: .milliseconds(10))
         }
     }
 }

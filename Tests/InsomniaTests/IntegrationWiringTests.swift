@@ -107,7 +107,7 @@ final class IntegrationWiringTests: XCTestCase {
     /// relaunch returns at once, without holding the main actor until the
     /// start deadline, and posts nothing, since the user ended the session.
     @MainActor
-    func testARelaunchCancelledDuringTheStartWaitReturnsAtOnceAndPostsNothing() async throws {
+    func testARelaunchCancelledDuringTheStartWaitReturnsAtOnceAndPostsNothing() async {
         let home = TempHome()
         defer { home.destroy() }
         let notifier = RecordingNotifier()
@@ -124,14 +124,41 @@ final class IntegrationWiringTests: XCTestCase {
         services.status.browsers = [BrowserStatus(bundleId: "com.google.Chrome", name: "Chrome", pid: 42, unthrottled: false)]
 
         let relaunch = Task { await services.relaunchUnthrottled("com.google.Chrome") }
-        try await processes.waitForStartWait()
-        let cancelledAt = ContinuousClock.now
+        await fulfillment(of: [processes.insideStartWait], timeout: 60)
+        let checksAtCancel = processes.startChecks
         services.cancelBrowserTasks()
         await relaunch.value
 
-        XCTAssertLessThan(ContinuousClock.now - cancelledAt, .seconds(1))
         XCTAssertEqual(notifier.posts.count, 0)
+        XCTAssertLessThanOrEqual(processes.startChecks, checksAtCancel + 1, "the wait kept checking after the cancel")
         XCTAssertEqual(processes.launches.count, 1)
+    }
+
+    /// A browser scan that finishes during the relaunch replaces the
+    /// browser list, and the quit browser is not in it. The notification
+    /// still names the browser, not its bundle id.
+    @MainActor
+    func testARelaunchFailureNamesTheBrowserAfterTheListChanged() async {
+        let home = TempHome()
+        defer { home.destroy() }
+        let notifier = RecordingNotifier()
+        let processes = FakeBrowserProcesses(pids: [42])
+        processes.quits = false
+        let services = AppServices(
+            paths: home.paths,
+            notifier: notifier,
+            audio: FakeAudioControl(),
+            processControl: FakeProcessControl(),
+            locationPermission: LocationPermission(authorizationStatus: .notDetermined),
+            browser: BrowserThrottle(readArgs: { _ in "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" }, processes: processes)
+        )
+        services.status.browsers = [BrowserStatus(bundleId: "com.google.Chrome", name: "Chrome", pid: 42, unthrottled: false)]
+        processes.duringQuit = { services.status.browsers = [] }
+
+        await services.relaunchUnthrottled("com.google.Chrome")
+
+        XCTAssertEqual(processes.quitRequests.count, 1, "the list was cleared during the quit wait")
+        XCTAssertEqual(notifier.posts.map(\.body), ["Chrome did not quit within 10 s, so nothing was relaunched. It may still quit later. If it does, open it again yourself."])
     }
 
     func testKeychainSecretStoreUsesFailoverServiceAndCurrentSSID() throws {
