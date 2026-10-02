@@ -84,12 +84,49 @@ struct Store: Sendable {
         try writeAtomically(Data(nonce.utf8), to: paths.pendingStartFile)
     }
 
-    /// unlink(2), so a directory or anything else that is not a plain file
-    /// or link is never removed as a tree. Returns whether a marker was
-    /// there; a missing one is not an error.
+    /// Deletes the pending-start marker under the marker's own lock. The
+    /// command the password dialog runs as root holds an flock(2) lock on
+    /// the marker from before its nonce check until pmset exits (see
+    /// AdministratorPrompt.markerLock), so taking that lock first means the
+    /// marker goes either before the check, which then fails, or after
+    /// pmset has exited, never in between. The link is followed to the
+    /// file, as lockf follows it, and the wait is polled so the caller is
+    /// never blocked. Returns whether a marker was there.
+    ///
+    /// Throws `.markerBusy` when the lock is still held after `timeout`,
+    /// and `.unlink` when the file cannot be deleted (an immutable flag, a
+    /// deny-delete ACL, a directory in its place). unlink(2) never removes
+    /// a tree. The marker then stays, and callers must treat the dialog it
+    /// belongs to as still able to turn sleep off.
     @discardableResult
-    func deletePendingStart() throws -> Bool {
+    func removePendingStart(timeout: TimeInterval, pollEvery: Duration = .milliseconds(50)) async throws -> Bool {
         let path = paths.pendingStartFile.path
+        let deadline = ContinuousClock.now + .seconds(timeout)
+        while true {
+            // O_NONBLOCK: a FIFO in its place must not hang the open.
+            let fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC)
+            if fd < 0 {
+                let err = errno
+                guard err == ENOENT else { throw StoreError.open(path: path, errno: err) }
+                // Missing, or a link to nothing, which lockf cannot open
+                // either; the link itself still goes.
+                return try Self.unlinkMarker(path)
+            }
+            if flock(fd, LOCK_EX | LOCK_NB) == 0 {
+                defer { close(fd) }
+                return try Self.unlinkMarker(path)
+            }
+            let err = errno
+            close(fd)
+            guard err == EWOULDBLOCK else { throw StoreError.lock(path: path, errno: err) }
+            guard ContinuousClock.now < deadline else {
+                throw StoreError.markerBusy(path: path, seconds: timeout)
+            }
+            try await Task.sleep(for: pollEvery)
+        }
+    }
+
+    private static func unlinkMarker(_ path: String) throws -> Bool {
         if unlink(path) == 0 { return true }
         let err = errno
         if err == ENOENT { return false }
@@ -119,11 +156,20 @@ enum StoreError: Error, LocalizedError {
     case rename(from: String, to: String, errno: Int32)
     case corrupt(file: String, detail: String)
     case unlink(path: String, errno: Int32)
+    case open(path: String, errno: Int32)
+    case lock(path: String, errno: Int32)
+    case markerBusy(path: String, seconds: TimeInterval)
 
     var errorDescription: String? {
         switch self {
         case let .unlink(path, errno):
             return "deleting \(path) failed: \(String(cString: strerror(errno)))"
+        case let .open(path, errno):
+            return "opening \(path) failed: \(String(cString: strerror(errno)))"
+        case let .lock(path, errno):
+            return "locking \(path) failed: \(String(cString: strerror(errno)))"
+        case let .markerBusy(path, seconds):
+            return "\(path) was still locked after \(String(format: "%g", seconds)) s by the command a password dialog started as root"
         case let .rename(from, to, errno):
             return "rename \(from) -> \(to) failed: \(String(cString: strerror(errno)))"
         case let .corrupt(file, detail):

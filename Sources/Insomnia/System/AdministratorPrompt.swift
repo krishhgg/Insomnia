@@ -16,9 +16,20 @@ enum AdministratorPromptError: Error, LocalizedError, Sendable {
     /// sleep off.
     case stillRunning(UnfinishedPrompt, grace: TimeInterval)
     /// osascript exited non-zero for another reason: the password was wrong
-    /// too many times, or pmset itself failed.
+    /// too many times, the root command refused (the marker was gone or
+    /// held another nonce), or pmset itself failed.
     case failed(status: Int32, stderr: String)
     case launchFailed(String)
+
+    /// Nothing can have run as root: the dialog was cancelled, or osascript
+    /// never started. Every other failure may have run pmset before it
+    /// failed or was stopped, so the caller undoes it like an end.
+    var nothingRan: Bool {
+        switch self {
+        case .cancelled, .launchFailed: true
+        case .timedOut, .stillRunning, .failed: false
+        }
+    }
 
     var errorDescription: String? {
         switch self {
@@ -131,8 +142,11 @@ final class UnfinishedPrompt: @unchecked Sendable, CustomStringConvertible {
 /// lock means no start is waiting on a dialog, so a dialog still on screen
 /// was abandoned (the app crashed or was force-quit under it). The command
 /// the dialog runs as root turns sleep off only while the file holds this
-/// nonce, so a late answer to an abandoned dialog cannot leave sleep off
-/// after recovery cleared the journal, and cannot act for a newer start.
+/// nonce, and holds a lock on the file until pmset exits; every deleter
+/// takes that lock first. A late answer to an abandoned dialog therefore
+/// cannot act for a newer start, and cannot leave sleep off after recovery
+/// cleared the journal: until the marker is gone, the journal keeps the
+/// sleep entry.
 struct PendingStart: Sendable, Equatable {
     let marker: URL
     let nonce: String
@@ -148,32 +162,39 @@ protocol AdministratorPromptRunning: Sendable {
     /// Returns once `pmset -a disablesleep 1` has run as root, which it does
     /// only while `start.marker` holds `start.nonce`. Throws an
     /// `AdministratorPromptError` when the dialog was cancelled, the
-    /// password was wrong, the marker no longer matched, pmset failed,
-    /// nothing came back in time, or the prompt's process would not stop
-    /// (`.stillRunning`).
+    /// password was wrong, the marker was gone or no longer matched, pmset
+    /// failed, nothing came back in time, or the prompt's process would not
+    /// stop (`.stillRunning`).
     func disableSleep(_ start: PendingStart) async throws
 }
 
 enum AdministratorPrompt {
-    /// What runs as root once the password is accepted, as `/bin/sh -c
-    /// <this> insomnia <marker> <nonce>`. Fixed text: the marker path and
-    /// nonce arrive only as `$1` and `$2`, and the marker's content is only
-    /// compared, never run. pmset runs only while the marker holds the
-    /// nonce. The marker is read again after pmset; if it is gone by then,
-    /// recovery took the lock while pmset ran and may already have cleared
-    /// the journal, so sleep is turned back on. Exit 3: the start was over
-    /// before the password was accepted, nothing ran. Exit 4: it ended
-    /// while pmset ran, and sleep was turned back on.
-    static let rootCommand = #"m=$(/usr/bin/head -c 64 "$1" 2>/dev/null); if [ -z "$2" ] || [ "$m" != "$2" ]; then echo "the start that asked for this password is over; sleep was not turned off" >&2; exit 3; fi; /usr/bin/pmset -a disablesleep 1 || exit $?; m=$(/usr/bin/head -c 64 "$1" 2>/dev/null); if [ "$m" = "$2" ]; then exit 0; fi; /usr/bin/pmset -a disablesleep 0; echo "the start that asked for this password ended while sleep was being turned off; sleep was turned back on" >&2; exit 4"#
-    /// The whole AppleScript, as one literal: `rootCommand` (each `"`
-    /// escaped for AppleScript), the privilege flag and the dialog text are
-    /// fixed at compile time. Its only inputs are the marker path and the
-    /// nonce, `item 1` and `item 2 of argv`, and both reach the root shell
-    /// through `quoted form of` as positional parameters. No configuration
-    /// value or environment variable reaches the command that runs as root.
+    /// The first half of what runs as root. `lockf` opens the marker
+    /// (`-n`: never creates it, and exits 69 when it is gone), takes an
+    /// flock(2) lock on it within 10 s (exit 75 otherwise), runs the rest
+    /// and holds the lock until that exits; `-k` leaves the file in place.
+    /// Everyone who deletes the marker takes the same lock first
+    /// (Store.removePendingStart, backstop.sh, uninstall.sh), so the
+    /// marker cannot go between the nonce check and the end of pmset: it
+    /// goes before the check, which then fails, or after pmset, whose
+    /// effect the journal entry the start wrote first still covers.
+    static let markerLock = "/usr/bin/lockf -k -n -t 10"
+    /// What runs as root under that lock, as `/bin/sh -c <this> insomnia
+    /// <marker> <nonce>`. Fixed text: the marker path and nonce arrive only
+    /// as `$1` and `$2`, and the marker's content is only compared, never
+    /// run. pmset runs only while the marker holds the nonce. Exit 3: the
+    /// start was over before the password was accepted, and nothing ran.
+    static let rootCommand = #"m=$(/usr/bin/head -c 64 "$1" 2>/dev/null); if [ -z "$2" ] || [ "$m" != "$2" ]; then echo "the start that asked for this password is over; sleep was not turned off" >&2; exit 3; fi; exec /usr/bin/pmset -a disablesleep 1"#
+    /// The whole AppleScript, as one literal: `markerLock`, `rootCommand`
+    /// (each `"` escaped for AppleScript), the privilege flag and the
+    /// dialog text are fixed at compile time. Its only inputs are the
+    /// marker path and the nonce, `item 1` and `item 2 of argv`, and both
+    /// reach the root shell through `quoted form of`, as lockf's file and
+    /// as positional parameters. No configuration value or environment
+    /// variable reaches the command that runs as root.
     static let disableSleepScript = #"""
     on run argv
-    do shell script "/bin/sh -c " & quoted form of "m=$(/usr/bin/head -c 64 \"$1\" 2>/dev/null); if [ -z \"$2\" ] || [ \"$m\" != \"$2\" ]; then echo \"the start that asked for this password is over; sleep was not turned off\" >&2; exit 3; fi; /usr/bin/pmset -a disablesleep 1 || exit $?; m=$(/usr/bin/head -c 64 \"$1\" 2>/dev/null); if [ \"$m\" = \"$2\" ]; then exit 0; fi; /usr/bin/pmset -a disablesleep 0; echo \"the start that asked for this password ended while sleep was being turned off; sleep was turned back on\" >&2; exit 4" & " insomnia " & quoted form of (item 1 of argv) & " " & quoted form of (item 2 of argv) with administrator privileges with prompt "Insomnia needs your password to turn off system sleep for this session."
+    do shell script "/usr/bin/lockf -k -n -t 10 " & quoted form of (item 1 of argv) & " /bin/sh -c " & quoted form of "m=$(/usr/bin/head -c 64 \"$1\" 2>/dev/null); if [ -z \"$2\" ] || [ \"$m\" != \"$2\" ]; then echo \"the start that asked for this password is over; sleep was not turned off\" >&2; exit 3; fi; exec /usr/bin/pmset -a disablesleep 1" & " insomnia " & quoted form of (item 1 of argv) & " " & quoted form of (item 2 of argv) with administrator privileges with prompt "Insomnia needs your password to turn off system sleep for this session."
     end run
     """#
     /// The user is typing a password, so the limit is generous. At the
@@ -228,13 +249,18 @@ struct OsascriptAdministratorPrompt: AdministratorPromptRunning {
     func disableSleep(_ start: PendingStart) async throws {
         let r = try await run(["-e", AdministratorPrompt.disableSleepScript, start.marker.path, start.nonce])
         guard r.status == 0 else {
-            // `User canceled. (-128)` is what the dialog's Cancel button
-            // produces; everything else is a failure with its stderr.
-            if r.stderr.contains("User canceled") || r.stderr.contains("(-128)") {
-                throw AdministratorPromptError.cancelled
-            }
+            if Self.isCancel(r.stderr) { throw AdministratorPromptError.cancelled }
             throw AdministratorPromptError.failed(status: r.status, stderr: r.stderr)
         }
+    }
+
+    /// The dialog's Cancel button ends osascript with `execution error:
+    /// User canceled. (-128)`, and nothing has run as root. A command that
+    /// ran ends the same line with its own exit status instead, so its
+    /// output (a lockf message naming the marker path, say) is never taken
+    /// for a cancel, whatever text it contains.
+    static func isCancel(_ stderr: String) -> Bool {
+        stderr.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix("(-128)")
     }
 
     /// The one place that knows whether the child exists, whether this

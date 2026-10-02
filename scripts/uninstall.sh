@@ -10,7 +10,10 @@
 # Right after the lock it deletes APP_SUPPORT/pending-start itself, because
 # the backstop it runs may be an older copy that does not know the file: a
 # password dialog left from an abandoned start must not turn sleep off once
-# the rule that turns it back on is gone.
+# the rule that turns it back on is gone. It takes the marker's own lockf
+# lock first, the lock the root command behind that dialog holds while it
+# runs, so the marker never goes while that command is past its check. A
+# marker that cannot be deleted stops the uninstall (see journal_problems).
 #
 # If anything Insomnia changed is still journaled, nothing is removed: the
 # LaunchAgent keeps retrying every minute, the sudoers rule keeps pmset
@@ -43,7 +46,11 @@ LAUNCHCTL=/bin/launchctl
 SUDO=/usr/bin/sudo
 PLUTIL=/usr/bin/plutil
 LOCKF=/usr/bin/lockf
+RM=/bin/rm
 LOCK_TIMEOUT_SECONDS=10
+# How long to wait for the root command behind a password dialog to let go
+# of the pending-start marker.
+PENDING_LOCK_TIMEOUT_SECONDS=10
 # How long to wait for the app to exit after asking it to quit.
 QUIT_WAIT_SECONDS=10
 APP="$HOME/Applications/Insomnia.app"
@@ -248,8 +255,16 @@ if app_running; then
   exit 1
 fi
 # No start is waiting on a password dialog while this process holds the
-# lock, so a marker here is an abandoned start's (see the header).
-rm -f "$PENDING" 2>/dev/null || true
+# lock, so a marker here is an abandoned start's (see the header). lockf -n
+# exits 69 when there is nothing to open: gone meanwhile, or a link to
+# nothing, which the root command cannot open either.
+if [[ -e "$PENDING" || -L "$PENDING" ]]; then
+  marker_rc=0
+  "$LOCKF" -k -n -s -t "$PENDING_LOCK_TIMEOUT_SECONDS" "$PENDING" "$RM" -f "$PENDING" 2>/dev/null || marker_rc=$?
+  if (( marker_rc == 69 )); then
+    "$RM" -f "$PENDING" 2>/dev/null || true
+  fi
+fi
 
 # 3. Undo everything via the current backstop ---------------------------------
 # The backstop inherits fd 9 and shares this lock instead of waiting on it.

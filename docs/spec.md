@@ -79,13 +79,20 @@ recovery; newly written journals use `frozenProcesses`.
   (`osascript` running a fixed `do shell script ... with administrator
   privileges` literal; 120 s limit, SIGTERM only at the deadline). The
   marker path and the nonce are the script's only inputs, passed as
-  positional parameters; the root command runs pmset only while the marker
-  holds the nonce and checks again afterwards (section 8). A session never starts unless the backstop is armed. If the
-  dialog is cancelled, the password is wrong, it times out, or pmset fails,
-  undo from the journal like an end, delete the session file and surface the
-  error. The start deletes `pending-start` on every outcome before it lets go
-  of the recovery lock. The wait is bounded: if the dialog's process has not
-  finished 3 s after the SIGTERM, Insomnia deletes the marker, names its pid
+  positional parameters; the root command runs under `lockf` on the marker
+  and runs pmset only while the marker holds the nonce (section 8). A
+  session never starts unless the backstop is armed, and a start is refused
+  while a `pending-start` from an earlier start cannot be removed. If the
+  dialog is cancelled or osascript cannot be launched, nothing ran as root:
+  put session.json and the journal back exactly as they were read, run no
+  pmset (a `SleepDisabled` set by another tool stays), and surface the
+  error. If the password is wrong, it times out, or pmset fails, pmset may
+  have run, so undo from the journal like an end, delete the session file
+  and surface the error. The start deletes `pending-start` on every outcome
+  before it lets go of the recovery lock. The wait is bounded: if the
+  dialog's process has not finished 3 s after the SIGTERM, Insomnia deletes
+  the marker (or, while the dialog's root command holds its lock, deletes
+  it once the prompt exits), names its pid
   (notification and menu warning line; the line stops naming the pid once
   osascript itself exits), kills nothing, keeps session.json, the journal
   entry and the recovery lock until it exits, and rolls back then; starts, ends and the
@@ -364,11 +371,20 @@ Invariants:
   fresh nonce to `pending-start` before the dialog and deletes it before it
   releases the lock. Every other holder of the lock (any app transaction,
   reconcile at launch, `backstop.sh`, `uninstall.sh`) deletes it first,
-  before it reads or clears the journal. The root command checks the nonce
-  before pmset and again after it, and turns sleep back on if the marker
-  went missing in between, so a dialog answered after its start was
-  abandoned (crash or force-quit under the dialog, rollback, a newer start)
-  cannot leave sleep off once the journal entry is gone.
+  before it reads or clears the journal. The root command runs as `lockf
+  -k -n <marker> /bin/sh -c ...`: it holds the marker's flock from before
+  its nonce check until pmset exits, and every deleter takes that lock
+  before it unlinks the file. The marker therefore goes either before the
+  check, which then fails, or after pmset, while the journal entry still
+  covers it, so a dialog answered after its start was abandoned (crash or
+  force-quit under the dialog, rollback, a newer start) cannot leave sleep
+  off once the journal entry is gone.
+- `sleepDisabledByUs` is cleared only by a transaction that removed
+  `pending-start` before it restored sleep. A marker that cannot be locked
+  within its timeout or cannot be deleted leaves recovery incomplete: sleep
+  is still restored, the entry stays, the app reports it (log, "Restore
+  incomplete" notification, menu line) and refuses new starts, the agent
+  exits 1, and every later run retries.
 - Every change Insomnia makes is in RuntimeState before it is made, and is
   undone from RuntimeState, never from memory.
 
@@ -413,7 +429,8 @@ Backstop, independent of the app:
 ### 9. Notifications
 
 `UNUserNotificationCenter`: session ended (with reason), session not started
-(the password dialog was cancelled or failed), password prompt still running
+(the password dialog was cancelled or failed, or a `pending-start` that
+cannot be removed refused the start), password prompt still running
 (osascript's pid, while the start waits for it), session ended because sleep was
 turned back on while Insomnia was not running, extend reminder 5 minutes
 before end, battery floor reached, battery unreadable twice in a row, thermal
@@ -645,9 +662,10 @@ that any case passed; record results in the release validation record.
    appears and names what it does. Close lid, wait 5 minutes, ping the Mac
    from the phone or check the heartbeat log. Open lid: session still running,
    sleep still disabled until end. Separately: Enter, then Cancel in the
-   dialog → no session, `pmset -g` shows no `SleepDisabled`, session.json and
-   the journal are clean, and the "Session not started" notification names
-   the prompt.
+   dialog → no session, `pmset -g` unchanged (no `SleepDisabled` unless
+   something else had set it, and then it stays), session.json and the
+   journal are clean, and the "Session not started" notification says
+   nothing was changed.
 3. **Restores.** End now → `pmset -g` shows no `SleepDisabled`. Quit → same.
    Timer expiry → same, plus notification.
 4. **Backstop.** Force-quit a supervised disposable session, then verify

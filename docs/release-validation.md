@@ -130,12 +130,14 @@ is performed. Do not replace "not run" with "passed" based on source review.
 | Unreadable battery (IOKit miss) ends the session on a laptop after the second read; desktop unaffected | Not run |
 | Install/upgrade/uninstall with recoverable failure conditions | Not run |
 | Start shows the administrator password dialog (names Insomnia's purpose, not just osascript) and `pmset -g` shows `SleepDisabled 1` after it | Not run |
-| Cancel in the dialog, a wrong password, and no answer for 120 s each roll the start back: no session, `SleepDisabled` absent, journal clean, "Session not started" notification; the dialog closes when the 120 s SIGTERM lands | Not run |
+| Cancel in the dialog rolls the start back with no pmset: no session, journal clean, a `SleepDisabled 1` set by hand beforehand still set, "Session not started" notification saying nothing was changed | Not run |
+| A wrong password and no answer for 120 s each roll the start back through `disablesleep 0`: no session, `SleepDisabled` absent, journal clean, "Session not started" notification; the dialog closes when the 120 s SIGTERM lands | Not run |
 | Relaunch (and login) with a valid session and `SleepDisabled 1` keeps the session without a prompt | Not run |
 | Relaunch with a valid session after `sudo pmset -a disablesleep 0` by hand ends the session with the "turned back on" notification, no prompt | Not run |
 | Reinstall over an older four-line `/etc/sudoers.d/insomnia` leaves exactly the three passwordless lines | Not run |
 | A dialog whose osascript has not exited 3 s after the 120 s SIGTERM is reported with its pid (notification and menu warning line), nothing is killed, and the start rolls back once it exits | Not run |
 | Force-quit Insomnia while its password dialog is up, then relaunch it (or wait a minute for the agent), then enter the password in the old dialog: `pending-start` is gone, the dialog's command reports the start is over, and `pmset -g` shows no `SleepDisabled 1` | Not run |
+| `chflags uchg` on `pending-start` while a password dialog is up, then force-quit and relaunch: sleep restored, "Restore incomplete" names the file, the journal keeps `sleepDisabledByUs`, Start is refused; after `chflags nouchg` the next agent run or relaunch deletes the file and clears the entry | Not run |
 | An upgrade whose running app refuses to quit stops after the password prompt and before the rule, and leaves `/etc/sudoers.d/insomnia` byte for byte as it was | Not run |
 | An upgrade stopped after the rule is written (open the app again after the installer quit it, before the bundle step) leaves exactly the three passwordless lines, keeps the old bundle, and prints the rerun command; the rerun finishes the install | Not run |
 | With a session running, the installer prints "A session is running and the upgrade will end it." before the password prompt; answering anything but y at "Continue?" in a terminal stops it with no password prompt, the app running and the session counting down | Not run |

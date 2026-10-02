@@ -21,14 +21,22 @@
 # dialog, so a marker found here belongs to a start that was abandoned (the
 # app died under its dialog). The root command behind that dialog turns
 # sleep off only while the marker holds its nonce, so answering the dialog
-# after this point changes nothing.
+# after this point changes nothing. That command also holds a lockf lock on
+# the marker from before its nonce check until pmset exits, and the marker
+# is deleted only under the same lock: it goes before the check, or after
+# pmset, whose effect the journal entry still covers. A marker that cannot
+# be locked within PENDING_LOCK_TIMEOUT_SECONDS or cannot be deleted means
+# that dialog could still turn sleep off later: sleep is still restored,
+# but sleepDisabledByUs stays journaled and the run exits 1, so the next run
+# retries.
 #
 # Decision, driven only by what the journal says was changed:
 #   - session.json valid (endsAt in the future) and no --force: exit 0.
 #   - state.json missing or clean: nothing is undone and nothing privileged
 #     runs; an expired session.json is removed. Exit 0.
 #   - state.json dirty: undo each journaled entry from the journal alone:
-#       sleepDisabledByUs   -> sudo -n pmset -a disablesleep 0
+#       sleepDisabledByUs   -> sudo -n pmset -a disablesleep 0 (the entry is
+#                              cleared only if pending-start is gone)
 #       lowPowerSetByUs     -> sudo -n pmset -b lowpowermode 0
 #       frozenProcesses     -> SIGCONT, but only to a pid that is observed to
 #                              exist, be stopped, have started in this boot
@@ -71,7 +79,11 @@ LOCKF=/usr/bin/lockf
 PS=/bin/ps
 KILL=/bin/kill
 SYSCTL=/usr/sbin/sysctl
+RM=/bin/rm
 LOCK_TIMEOUT_SECONDS=10
+# How long to wait for the root command behind a password dialog to let go
+# of the pending-start marker (pmset takes well under a second).
+PENDING_LOCK_TIMEOUT_SECONDS=10
 # Longest a single undo command (sudo pmset) may run before it is sent
 # SIGTERM, and how long it then gets to exit before this run fails closed.
 COMMAND_TIMEOUT_SECONDS=30
@@ -121,12 +133,27 @@ fi
 # From here on this process holds the lock until it exits (fd 9 closes).
 
 # A pending-start marker under the lock belongs to an abandoned start: void
-# the password dialog it was written for (see the header).
+# the password dialog it was written for, under the marker's own lock (see
+# the header). lockf -n exits 69 when there is nothing to open: the marker
+# went meanwhile, or it is a link to nothing, which the root command cannot
+# open either, so the link itself is removed.
+marker_stuck=0
 if [[ -e "$PENDING" || -L "$PENDING" ]]; then
-  if rm -f "$PENDING" 2>/dev/null; then
-    log info "deleted $PENDING; a password dialog left from an abandoned start can no longer turn sleep off"
+  marker_rc=0
+  "$LOCKF" -k -n -s -t "$PENDING_LOCK_TIMEOUT_SECONDS" "$PENDING" "$RM" -f "$PENDING" 2>/dev/null || marker_rc=$?
+  if (( marker_rc == 69 )); then
+    "$RM" -f "$PENDING" 2>/dev/null || true
+  fi
+  if [[ -e "$PENDING" || -L "$PENDING" ]]; then
+    marker_stuck=1
+    if (( marker_rc == 75 )); then
+      why="still locked after ${PENDING_LOCK_TIMEOUT_SECONDS}s by the command a password dialog started as root"
+    else
+      why="could not be deleted (lockf exit $marker_rc)"
+    fi
+    log error "$PENDING $why; a password dialog left from an abandoned start could still turn sleep off, so sleepDisabledByUs stays journaled until a later run deletes it"
   else
-    log error "could not delete $PENDING; a password dialog left from an abandoned start could still turn sleep off"
+    log info "deleted $PENDING; a password dialog left from an abandoned start can no longer turn sleep off"
   fi
 fi
 
@@ -367,6 +394,10 @@ if [[ "$journal_state" != dirty ]]; then
     fi
     rm -f "$SESSION"
   fi
+  if (( marker_stuck )); then
+    log error "journal is clean, but $PENDING is still present; will retry on the next run"
+    exit 1
+  fi
   exit 0
 fi
 
@@ -380,7 +411,11 @@ new_sleep="$sleep_held"
 if [[ "$sleep_held" == true ]]; then
   if run_bounded "$SUDO" -n "$PMSET" -a disablesleep 0; then
     log info "pmset -a disablesleep 0 ok"
-    new_sleep=false; changed=1
+    if (( marker_stuck )); then
+      log error "sleep restored, but sleepDisabledByUs stays journaled while $PENDING is present"
+    else
+      new_sleep=false; changed=1
+    fi
   else
     if (( command_alive )); then stop_transaction "pmset -a disablesleep 0"; fi
     log error "pmset -a disablesleep 0 failed (sudoers rule missing? run install.sh); keeping journal entry for retry"
@@ -542,6 +577,9 @@ if (( changed == 1 )); then
 fi
 
 # --- Report ------------------------------------------------------------------
+if (( marker_stuck )); then
+  failures+=("$PENDING is still present, so a password dialog left from an abandoned start could still turn sleep off")
+fi
 if (( ${#failures[@]} > 0 )); then
   for f in "${failures[@]}"; do log error "still journaled: $f"; done
   log error "journal kept dirty (${#failures[@]} item(s)); will retry on the next run"

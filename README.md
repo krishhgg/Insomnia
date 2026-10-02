@@ -99,12 +99,19 @@ instructions before retrying.
 
 1. **Start:** click the eye in the menu bar, enter Days / Hours / Minutes, and
    press Enter. macOS asks for your administrator password to turn system
-   sleep off. Cancelling the dialog, a wrong password, or no answer within
-   120 seconds leaves sleep as it was and no session started. If the dialog's
-   process will not close, Insomnia reports it with its pid and waits for it
-   before rolling the start back. A dialog left on screen after Insomnia
-   crashed or was force-quit does nothing when you answer it, once Insomnia
-   has relaunched or the recovery agent has run (within a minute).
+   sleep off. Cancelling the dialog starts no session and changes nothing,
+   so a sleep setting another tool made stays as it was. A wrong password,
+   no answer within 120 seconds, or a pmset failure also starts no session,
+   but Insomnia cannot tell whether pmset ran first, so it runs
+   `pmset -a disablesleep 0`, which also clears another tool's setting. If
+   the dialog's process will not close, Insomnia reports it with its pid and
+   waits for it before rolling the start back. A dialog left on screen after
+   Insomnia crashed or was force-quit does nothing when you answer it, once
+   Insomnia has relaunched or the recovery agent has run (within a minute).
+   If the `pending-start` file that guards such a dialog cannot be deleted,
+   Insomnia still turns sleep back on, but says so in the menu and a
+   notification, keeps the journal entry, refuses new sessions, and retries
+   until the file is gone.
 2. **Extend:** click the eye or countdown during a session and enter more time.
 3. **End early:** press and hold the end control beside the countdown.
 4. **Inspect or configure:** right-click for status, recovery warnings,

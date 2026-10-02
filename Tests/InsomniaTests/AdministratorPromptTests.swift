@@ -56,16 +56,18 @@ final class OsascriptAdministratorPromptTests: XCTestCase {
         "i=0; while [[ ! -e '\(release.path)' && -d '\(dir.path)' && $i -lt 1200 ]]; do sleep 0.05; i=$((i + 1)); done"
     }
 
-    /// The whole script is one literal: the root command with each `"`
-    /// escaped for AppleScript, the marker path and nonce taken from argv
-    /// through `quoted form of`, the privilege flag and the dialog text.
+    /// The whole script is one literal: lockf on the marker, the root
+    /// command with each `"` escaped for AppleScript, the marker path and
+    /// nonce taken from argv through `quoted form of`, the privilege flag
+    /// and the dialog text.
     func testScriptIsTheExactLiteral() {
         let embedded = AdministratorPrompt.rootCommand
             .replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")
+        XCTAssertEqual(AdministratorPrompt.markerLock, "/usr/bin/lockf -k -n -t 10")
         XCTAssertEqual(AdministratorPrompt.disableSleepScript, """
         on run argv
-        do shell script "/bin/sh -c " & quoted form of "\(embedded)" & " insomnia " & quoted form of (item 1 of argv) & " " & quoted form of (item 2 of argv) with administrator privileges with prompt "Insomnia needs your password to turn off system sleep for this session."
+        do shell script "\(AdministratorPrompt.markerLock) " & quoted form of (item 1 of argv) & " /bin/sh -c " & quoted form of "\(embedded)" & " insomnia " & quoted form of (item 1 of argv) & " " & quoted form of (item 2 of argv) with administrator privileges with prompt "Insomnia needs your password to turn off system sleep for this session."
         end run
         """)
     }
@@ -104,6 +106,29 @@ final class OsascriptAdministratorPromptTests: XCTestCase {
         } catch AdministratorPromptError.cancelled {
             // expected
         }
+    }
+
+    /// Only the dialog's own -128 is a cancel. A command that ran and
+    /// failed ends osascript's error with its own status, whatever its
+    /// message contains (here a marker path with the cancel text in it).
+    func testCancelTextInACommandsOutputIsNotACancel() async throws {
+        let exe = try fakeOsascript("echo 'execution error: lockf: /x/User canceled. (-128)/pending-start: No such file or directory (69)' >&2; exit 1")
+        let prompt = OsascriptAdministratorPrompt(executable: exe, timeout: 5)
+        do {
+            try await prompt.disableSleep(start)
+            XCTFail("must throw")
+        } catch let AdministratorPromptError.failed(status, stderr) {
+            XCTAssertEqual(status, 1)
+            XCTAssertTrue(stderr.hasSuffix("(69)\n"), stderr)
+        }
+    }
+
+    func testOnlyCancelAndLaunchFailureRanNothing() {
+        XCTAssertTrue(AdministratorPromptError.cancelled.nothingRan)
+        XCTAssertTrue(AdministratorPromptError.launchFailed("x").nothingRan)
+        XCTAssertFalse(AdministratorPromptError.timedOut(seconds: 1).nothingRan)
+        XCTAssertFalse(AdministratorPromptError.failed(status: 1, stderr: "").nothingRan)
+        XCTAssertFalse(AdministratorPromptError.stillRunning(UnfinishedPrompt(pid: 1, osascriptAlive: false), grace: 1).nothingRan)
     }
 
     func testWrongPasswordIsAFailureThatKeepsStderr() async throws {
@@ -145,7 +170,10 @@ final class OsascriptAdministratorPromptTests: XCTestCase {
     /// runner waits for it to finish before reporting the timeout. The fake
     /// traps TERM, takes 1.5 s to exit (longer than the 1 s SIGKILL grace
     /// CancellableCommand would allow) and exits 0; it is still a timeout.
-    /// The deadline starts only once the trap is installed.
+    /// The deadline starts only once the trap is installed. The grace is
+    /// set here, not taken from the default, and a machine slow enough to
+    /// outlast it gets `.stillRunning`, whose handle is awaited: either way
+    /// the handler must have finished, untouched by anything stronger.
     func testTimeoutSendsSigtermOnlyAndWaitsForTheChildToExit() async throws {
         let ready = dir.appendingPathComponent("ready")
         let exe = try fakeOsascript("""
@@ -155,15 +183,19 @@ final class OsascriptAdministratorPromptTests: XCTestCase {
         wait $!
         echo untouched >> "\(trace.path)"
         """)
-        let prompt = OsascriptAdministratorPrompt(executable: exe, timeout: 1, beforeDeadline: untilExists(ready))
+        let grace: TimeInterval = 20
+        let prompt = OsascriptAdministratorPrompt(executable: exe, timeout: 1, grace: grace, beforeDeadline: untilExists(ready))
         let began = Date()
         do {
             try await prompt.disableSleep(start)
             XCTFail("must time out")
         } catch let AdministratorPromptError.timedOut(seconds) {
             XCTAssertEqual(seconds, 1)
+            XCTAssertGreaterThanOrEqual(Date().timeIntervalSince(began), 2.5, "returned before the child had exited")
+        } catch let AdministratorPromptError.stillRunning(handle, reported) {
+            XCTAssertEqual(reported, grace)
+            await handle.waitUntilExit()
         }
-        XCTAssertGreaterThanOrEqual(Date().timeIntervalSince(began), 2.5, "returned before the child had exited")
         XCTAssertEqual(try String(contentsOf: trace, encoding: .utf8), "term\nclean\n", "the child was not left to finish its TERM handler")
     }
 
@@ -273,7 +305,8 @@ final class OsascriptAdministratorPromptTests: XCTestCase {
 }
 
 /// The command the dialog runs as root, run as the current user under
-/// /bin/sh with the dialog's quoting and a fake pmset (runRootCommand).
+/// /bin/sh with the dialog's quoting, the real lockf and a fake pmset
+/// (RootCommandProcess).
 final class RootCommandTests: XCTestCase {
     private var dir: URL!
 
@@ -288,21 +321,23 @@ final class RootCommandTests: XCTestCase {
     }
 
     private var marker: URL { dir.appendingPathComponent("pending-start") }
+    private var store: Store { Store(paths: Paths(root: dir)) }
 
     func testTurnsSleepOffWhileTheMarkerHoldsTheNonce() throws {
         try Data("nonce-1".utf8).write(to: marker)
         let r = try runRootCommand(marker: marker, nonce: "nonce-1", in: dir)
         XCTAssertEqual(r.status, 0, r.stderr)
         XCTAssertEqual(r.pmsetCalls, ["-a disablesleep 1"])
+        XCTAssertEqual(try String(contentsOf: marker, encoding: .utf8), "nonce-1", "lockf -k leaves the file")
     }
 
-    /// Recovery (or the start itself) deleted the marker: a late answer
-    /// runs nothing.
+    /// Recovery (or the start itself) deleted the marker: lockf -n has
+    /// nothing to open, and a late answer runs nothing.
     func testDoesNothingOnceTheMarkerIsGone() throws {
         let r = try runRootCommand(marker: marker, nonce: "nonce-1", in: dir)
-        XCTAssertEqual(r.status, 3)
+        XCTAssertEqual(r.status, 69, r.stderr)
         XCTAssertEqual(r.pmsetCalls, [])
-        XCTAssertTrue(r.stderr.contains("sleep was not turned off"), r.stderr)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path), "lockf -n never creates the marker")
     }
 
     /// A dialog left from an older start cannot act for a newer one.
@@ -311,6 +346,7 @@ final class RootCommandTests: XCTestCase {
         let r = try runRootCommand(marker: marker, nonce: "nonce-1", in: dir)
         XCTAssertEqual(r.status, 3)
         XCTAssertEqual(r.pmsetCalls, [])
+        XCTAssertTrue(r.stderr.contains("sleep was not turned off"), r.stderr)
         XCTAssertEqual(try String(contentsOf: marker, encoding: .utf8), "nonce-2", "the newer start's marker is left alone")
     }
 
@@ -321,14 +357,45 @@ final class RootCommandTests: XCTestCase {
         XCTAssertEqual(r.pmsetCalls, [])
     }
 
-    /// Recovery took the lock and deleted the marker while pmset ran, and
-    /// may have cleared the journal already: sleep is turned back on.
-    func testMarkerDeletedWhilePmsetRunsTurnsSleepBackOn() throws {
+    /// The command holds the marker's lock from before its check until
+    /// pmset exits, so the app cannot delete the marker in between: the
+    /// removal times out and the marker stays, and once pmset is done it
+    /// goes.
+    func testTheMarkerCannotBeRemovedWhilePmsetRuns() async throws {
         try Data("nonce-1".utf8).write(to: marker)
-        let r = try runRootCommand(marker: marker, nonce: "nonce-1", in: dir, dropMarkerDuringPmset: true)
-        XCTAssertEqual(r.status, 4, r.stderr)
-        XCTAssertEqual(r.pmsetCalls, ["-a disablesleep 1", "-a disablesleep 0"])
-        XCTAssertTrue(r.stderr.contains("sleep was turned back on"), r.stderr)
+        let command = try RootCommandProcess(marker: marker, nonce: "nonce-1", in: dir, holdPmset: true)
+        XCTAssertTrue(command.waitUntilPmsetRuns())
+
+        do {
+            try await store.removePendingStart(timeout: 0.3)
+            XCTFail("the marker must not go while pmset runs")
+        } catch StoreError.markerBusy {
+            // expected
+        }
+        XCTAssertEqual(try String(contentsOf: marker, encoding: .utf8), "nonce-1")
+
+        command.release()
+        let r = command.wait()
+        XCTAssertEqual(r.status, 0, r.stderr)
+        XCTAssertEqual(r.pmsetCalls, ["-a disablesleep 1"])
+        let removed = try await store.removePendingStart(timeout: 5)
+        XCTAssertTrue(removed)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+    }
+
+    /// The other order: a remover holds the lock when the answer comes.
+    /// The command waits for the lock, and by the time it has it the
+    /// marker is gone, so nothing runs.
+    func testAnAnswerThatWaitsOnARemovalRunsNothing() throws {
+        try Data("nonce-1".utf8).write(to: marker)
+        let holder = try FileLockHolder(marker)
+        let command = try RootCommandProcess(marker: marker, nonce: "nonce-1", in: dir)
+        usleep(300_000)
+        try FileManager.default.removeItem(at: marker)
+        holder.release()
+        let r = command.wait()
+        XCTAssertEqual(r.status, 3, r.stderr)
+        XCTAssertEqual(r.pmsetCalls, [])
     }
 
     /// The marker path and the nonce are data: quotes, spaces and `$(...)`
@@ -343,6 +410,92 @@ final class RootCommandTests: XCTestCase {
         XCTAssertEqual(r.status, 0, r.stderr)
         XCTAssertEqual(r.pmsetCalls, ["-a disablesleep 1"])
         XCTAssertFalse(FileManager.default.fileExists(atPath: dir.appendingPathComponent("canary").path))
+    }
+}
+
+/// Store.removePendingStart: lock, then unlink.
+final class PendingStartRemovalTests: XCTestCase {
+    private var dir: URL!
+
+    override func setUpWithError() throws {
+        dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("insomnia-marker-tests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    }
+
+    override func tearDownWithError() throws {
+        chflags(marker.path, 0)
+        try? FileManager.default.removeItem(at: dir)
+    }
+
+    private var marker: URL { dir.appendingPathComponent("pending-start") }
+    private var store: Store { Store(paths: Paths(root: dir)) }
+
+    func testRemovesAMarkerAndReportsAMissingOne() async throws {
+        try Data("n".utf8).write(to: marker)
+        let first = try await store.removePendingStart(timeout: 1)
+        let second = try await store.removePendingStart(timeout: 1)
+        XCTAssertTrue(first)
+        XCTAssertFalse(second)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+    }
+
+    /// Waits for a lock that is let go within the timeout.
+    func testWaitsForTheLockToBeLetGo() async throws {
+        try Data("n".utf8).write(to: marker)
+        let holder = try FileLockHolder(marker)
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.2) { holder.release() }
+        let removed = try await store.removePendingStart(timeout: 5)
+        XCTAssertTrue(removed)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+    }
+
+    func testAHeldLockKeepsTheMarker() async throws {
+        try Data("n".utf8).write(to: marker)
+        let holder = try FileLockHolder(marker)
+        defer { holder.release() }
+        do {
+            try await store.removePendingStart(timeout: 0.2)
+            XCTFail("must throw")
+        } catch StoreError.markerBusy {
+            // expected
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
+    }
+
+    /// An immutable flag makes unlink fail; the failure is reported, not
+    /// swallowed.
+    func testAnImmutableMarkerIsReported() async throws {
+        try Data("n".utf8).write(to: marker)
+        XCTAssertEqual(chflags(marker.path, UInt32(UF_IMMUTABLE)), 0)
+        do {
+            try await store.removePendingStart(timeout: 0.2)
+            XCTFail("must throw")
+        } catch StoreError.unlink {
+            // expected
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
+    }
+
+    /// A directory is never removed as a tree.
+    func testADirectoryIsNotRemoved() async throws {
+        try FileManager.default.createDirectory(at: marker, withIntermediateDirectories: false)
+        try Data("x".utf8).write(to: marker.appendingPathComponent("keep"))
+        do {
+            try await store.removePendingStart(timeout: 0.2)
+            XCTFail("must throw")
+        } catch StoreError.unlink {
+            // expected
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: marker.appendingPathComponent("keep").path))
+    }
+
+    /// A link to nothing cannot be opened by lockf either; the link goes.
+    func testADanglingLinkIsRemoved() async throws {
+        try FileManager.default.createSymbolicLink(atPath: marker.path, withDestinationPath: dir.appendingPathComponent("nowhere").path)
+        let removed = try await store.removePendingStart(timeout: 1)
+        XCTAssertTrue(removed)
+        XCTAssertNil(try? FileManager.default.destinationOfSymbolicLink(atPath: marker.path))
     }
 }
 
@@ -486,11 +639,18 @@ final class SleepPromptLifecycleTests: XCTestCase {
     }
 
     /// No marker, no dialog: a start that cannot write it is rolled back
-    /// before anything is shown or run.
+    /// before anything is shown or run. A directory takes the marker's
+    /// place after the transaction cleared the path, while the backstop is
+    /// being armed.
     func testMarkerThatCannotBeWrittenRollsBackWithoutAPrompt() async throws {
-        try FileManager.default.createDirectory(at: h.home.paths.pendingStartFile, withIntermediateDirectories: false)
+        let gate = AsyncGate()
+        h.backstop.armGate = gate
         let m = h.makeManager()
-        await m.start(duration: 1800)
+        let start = Task { await m.start(duration: 1800) }
+        await gate.waitUntilStarted()
+        try FileManager.default.createDirectory(at: h.home.paths.pendingStartFile, withIntermediateDirectories: false)
+        await gate.open()
+        await start.value
 
         XCTAssertEqual(h.prompt.shown, 0)
         XCTAssertEqual(h.guardFake.calls, [])
@@ -501,6 +661,9 @@ final class SleepPromptLifecycleTests: XCTestCase {
         XCTAssertTrue(err.contains("pending-start marker"), err)
     }
 
+    /// A cancelled dialog ran nothing as root, so nothing is undone
+    /// either: the journal and session.json go back as they were and no
+    /// pmset runs.
     func testCancelledPromptRollsBackAndSaysSo() async throws {
         h.prompt.mode = .cancel
         let m = h.makeManager()
@@ -508,14 +671,62 @@ final class SleepPromptLifecycleTests: XCTestCase {
 
         try assertRolledBackClean(m)
         XCTAssertEqual(h.prompt.shown, 1)
-        // The undo runs from the journal, through the passwordless line.
-        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1", "disablesleep 0"])
+        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1"], "no pmset runs after a cancel")
         XCTAssertEqual(h.backstop.arms, 1)
         let err = try XCTUnwrap(m.lastError)
         XCTAssertTrue(err.contains("cancelled"), err)
         let last = try XCTUnwrap(h.notifier.posts.last)
         XCTAssertEqual(last.title, "Session not started")
-        XCTAssertTrue(last.body.contains("password prompt was cancelled or failed"), last.body)
+        XCTAssertEqual(last.body, "No session was started, and nothing was changed: the administrator password prompt was cancelled.")
+    }
+
+    /// The README's promise: cancelling leaves sleep as it was, so a
+    /// SleepDisabled bit another tool set before the start stays set.
+    func testCancelLeavesASleepSettingSomeoneElseOwns() async throws {
+        h.prompt.mode = .cancel
+        h.guardFake.sleepDisabled = true
+        let m = h.makeManager()
+        await m.start(duration: 1800)
+
+        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1"])
+        XCTAssertTrue(h.guardFake.sleepDisabled, "another tool's setting must survive a cancel")
+        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
+        XCTAssertNil(try h.store.loadSession())
+        XCTAssertFalse(markerExists)
+        XCTAssertNil(m.session)
+    }
+
+    /// osascript never started, so nothing ran as root: the same exact
+    /// rollback with no pmset.
+    func testLaunchFailureRollsBackWithoutPmset() async throws {
+        h.prompt.mode = .launchFail
+        h.guardFake.sleepDisabled = true
+        let m = h.makeManager()
+        await m.start(duration: 1800)
+
+        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1"])
+        XCTAssertTrue(h.guardFake.sleepDisabled)
+        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
+        XCTAssertNil(try h.store.loadSession())
+        XCTAssertFalse(markerExists)
+        let err = try XCTUnwrap(m.lastError)
+        XCTAssertTrue(err.contains("could not launch osascript"), err)
+        XCTAssertEqual(h.notifier.posts.last?.title, "Session not started")
+    }
+
+    /// The rollback puts back what was on disk, not a clean slate: an
+    /// entry an earlier failed restore left stays for recovery.
+    func testCancelKeepsAnEntryAnEarlierRestoreLeft() async throws {
+        var earlier = RuntimeState()
+        earlier.sleepDisabledByUs = true
+        try h.store.saveState(earlier)
+        h.prompt.mode = .cancel
+        let m = h.makeManager()
+        await m.start(duration: 1800)
+
+        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1"])
+        XCTAssertEqual(try h.store.loadState(), earlier)
+        XCTAssertNil(try h.store.loadSession())
     }
 
     func testFailedPromptRollsBack() async throws {
@@ -640,8 +851,120 @@ final class SleepPromptLifecycleTests: XCTestCase {
         try assertRolledBackClean(m)
         XCTAssertEqual(h.prompt.shown, 0)
         let late = try runRootCommand(marker: orphan.marker, nonce: orphan.nonce, in: h.home.root)
-        XCTAssertEqual(late.status, 3, late.stderr)
+        XCTAssertEqual(late.status, 69, late.stderr)
         XCTAssertEqual(late.pmsetCalls, [], "the late answer must not turn sleep off")
+    }
+
+    /// The app died under its dialog, the dialog was answered, and its
+    /// root command is still in pmset when the app comes back. Reconcile
+    /// cannot take the marker's lock: sleep is restored, but the entry
+    /// stays, which the menu and a notification report. After the command
+    /// is done, the next run removes the marker, restores again and
+    /// clears the entry.
+    func testRelaunchWhileTheAbandonedDialogsCommandRunsKeepsTheSleepEntry() async throws {
+        _ = try seedValidSession()
+        let orphan = PendingStart(marker: h.home.paths.pendingStartFile, nonce: UUID().uuidString)
+        try h.store.savePendingStart(orphan.nonce)
+        let command = try RootCommandProcess(marker: orphan.marker, nonce: orphan.nonce, in: h.home.root, holdPmset: true)
+        defer { command.release() }
+        XCTAssertTrue(command.waitUntilPmsetRuns())
+        h.guardFake.sleepDisabled = false
+        let m = h.makeManager()
+        await m.reconcile()
+
+        XCTAssertEqual(h.guardFake.calls, ["pmset -g", "disablesleep 0"], "sleep itself is still restored")
+        XCTAssertEqual(try h.store.loadState()?.sleepDisabledByUs, true, "the entry stays while the command may still turn sleep off")
+        XCTAssertTrue(markerExists)
+        XCTAssertNotNil(m.markerProblem)
+        let err = try XCTUnwrap(m.lastError)
+        XCTAssertTrue(err.contains("pending-start marker could not be removed"), err)
+        XCTAssertTrue(err.contains("still locked"), err)
+        let post = try XCTUnwrap(h.notifier.posts.last)
+        XCTAssertEqual(post.title, "Restore incomplete")
+        XCTAssertTrue(post.body.contains("pending-start marker could not be removed"), post.body)
+
+        // No new dialog while the old command may still act.
+        await m.start(duration: 1800)
+        XCTAssertEqual(h.prompt.shown, 0)
+        XCTAssertNil(m.session)
+        XCTAssertNil(try h.store.loadSession())
+        XCTAssertEqual(h.notifier.posts.last?.title, "Session not started")
+        XCTAssertTrue(try XCTUnwrap(h.notifier.posts.last).body.hasPrefix("Nothing was changed: the pending-start marker could not be removed"))
+
+        command.release()
+        let r = command.wait()
+        XCTAssertEqual(r.pmsetCalls, ["-a disablesleep 1"])
+        h.guardFake.sleepDisabled = true
+        await m.reconcile()
+
+        try assertRolledBackClean(m)
+        XCTAssertNil(m.markerProblem)
+        XCTAssertNil(m.lastError, "the marker line goes with the marker")
+    }
+
+    /// A marker that cannot be deleted (an immutable flag) is the same to
+    /// recovery as one still in use: sleep is restored, the entry stays,
+    /// starts are refused, and once the flag is gone the next run
+    /// finishes.
+    func testUndeletableMarkerKeepsTheSleepEntryAndRefusesStarts() async throws {
+        var dirty = RuntimeState()
+        dirty.sleepDisabledByUs = true
+        try h.store.saveState(dirty)
+        try h.store.savePendingStart(UUID().uuidString)
+        let path = h.home.paths.pendingStartFile.path
+        XCTAssertEqual(chflags(path, UInt32(UF_IMMUTABLE)), 0)
+        defer { chflags(path, 0) }
+        h.guardFake.sleepDisabled = true
+        let m = h.makeManager()
+        await m.reconcile()
+
+        XCTAssertEqual(h.guardFake.calls.filter { $0 == "disablesleep 0" }.count, 1)
+        XCTAssertFalse(h.guardFake.sleepDisabled, "sleep itself is restored")
+        XCTAssertEqual(try h.store.loadState()?.sleepDisabledByUs, true)
+        XCTAssertTrue(markerExists)
+        XCTAssertEqual(h.notifier.posts.last?.title, "Restore incomplete")
+        XCTAssertTrue(try XCTUnwrap(m.lastError).contains("pending-start marker could not be removed"))
+
+        await m.start(duration: 1800)
+        XCTAssertEqual(h.prompt.shown, 0, "no start while the marker stays")
+        XCTAssertNil(m.session)
+        XCTAssertNil(try h.store.loadSession())
+        XCTAssertTrue(try XCTUnwrap(m.lastError).hasPrefix("the pending-start marker could not be removed"), m.lastError ?? "")
+        XCTAssertEqual(h.notifier.posts.last?.title, "Session not started")
+        XCTAssertTrue(try XCTUnwrap(h.notifier.posts.last).body.hasPrefix("Nothing was changed: the pending-start marker could not be removed"))
+
+        chflags(path, 0)
+        await m.reconcile()
+        try assertRolledBackClean(m)
+        XCTAssertNil(m.markerProblem)
+        XCTAssertNil(m.lastError, "the marker line goes with the marker")
+    }
+
+    /// The stuck prompt's root command is past its check and holds the
+    /// marker's lock: the marker stays while it runs, and goes once the
+    /// prompt has exited, before the rollback clears the sleep entry.
+    func testStuckPromptWhoseCommandHoldsTheMarkerClearsItAfterExit() async throws {
+        let box = LockHolderBox()
+        h.prompt.onShow = { start in box.hold(start.marker) }
+        h.prompt.mode = .stuck
+        let m = h.makeManager()
+
+        let start = Task { await m.start(duration: 1800) }
+        try await waitUntil("the stuck prompt is reported") {
+            h.notifier.posts.contains { $0.title == "Password prompt still running" }
+        }
+        XCTAssertTrue(markerExists, "the command holding its lock keeps it")
+        XCTAssertNotNil(m.markerProblem)
+        XCTAssertEqual(try h.store.loadState()?.sleepDisabledByUs, true)
+
+        let handle = try XCTUnwrap(h.prompt.unfinished)
+        box.release()
+        handle.markExited()
+        await start.value
+
+        try assertRolledBackClean(m)
+        XCTAssertNil(m.markerProblem)
+        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1", "disablesleep 0"])
     }
 
     /// The same, and the user has started again since: the old dialog's

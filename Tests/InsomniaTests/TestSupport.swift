@@ -50,15 +50,17 @@ final class TempHome {
 }
 
 /// The administrator password dialog as a fake. Answers at once in
-/// `.succeed`, `.cancel` and `.fail`; in `.hang` it waits on `gate` like a
+/// `.succeed`, `.cancel`, `.fail` and `.launchFail` (osascript could not
+/// be started); in `.hang` it waits on `gate` like a
 /// dialog nobody answers and then reports the timeout osascript's SIGTERM
 /// would produce; in `.stuck` it reports osascript (pid 4242) as still
 /// running after SIGTERM and hands out `unfinished`, which the test ends
 /// with `markExited()`. `.succeed` keeps the root command's rule: it fails
-/// with exit 3 unless the marker holds the nonce. Never shows anything and
+/// with exit 3 unless the marker holds the nonce. `onShow` runs when the
+/// dialog is shown, before the mode's answer. Never shows anything and
 /// never runs pmset.
 final class FakeAdministratorPrompt: AdministratorPromptRunning, @unchecked Sendable {
-    enum Mode { case succeed, cancel, fail, hang, stuck }
+    enum Mode { case succeed, cancel, fail, launchFail, hang, stuck }
 
     static let stuckPid: pid_t = 4242
 
@@ -68,6 +70,7 @@ final class FakeAdministratorPrompt: AdministratorPromptRunning, @unchecked Send
     private var _unfinished: UnfinishedPrompt?
     private var _starts: [PendingStart] = []
     private var _markerAtShow: [String?] = []
+    private var _onShow: (@Sendable (PendingStart) -> Void)?
     /// Opened by the test to end a `.hang`.
     let gate = AsyncGate()
 
@@ -83,6 +86,10 @@ final class FakeAdministratorPrompt: AdministratorPromptRunning, @unchecked Send
     var starts: [PendingStart] { lock.withLock { _starts } }
     /// The marker's content when each dialog was shown (nil: no file).
     var markerAtShow: [String?] { lock.withLock { _markerAtShow } }
+    var onShow: (@Sendable (PendingStart) -> Void)? {
+        get { lock.withLock { _onShow } }
+        set { lock.withLock { _onShow = newValue } }
+    }
 
     func disableSleep(_ start: PendingStart) async throws {
         let marker = try? String(contentsOf: start.marker, encoding: .utf8)
@@ -91,6 +98,7 @@ final class FakeAdministratorPrompt: AdministratorPromptRunning, @unchecked Send
             _starts.append(start)
             _markerAtShow.append(marker)
         }
+        onShow?(start)
         switch mode {
         case .succeed:
             guard marker == start.nonce else {
@@ -101,6 +109,8 @@ final class FakeAdministratorPrompt: AdministratorPromptRunning, @unchecked Send
             throw AdministratorPromptError.cancelled
         case .fail:
             throw AdministratorPromptError.failed(status: 1, stderr: "execution error: The administrator user name or password was incorrect.")
+        case .launchFail:
+            throw AdministratorPromptError.launchFailed("The file osascript does not exist.")
         case .hang:
             await gate.wait()
             throw AdministratorPromptError.timedOut(seconds: AdministratorPrompt.timeout)
@@ -560,6 +570,7 @@ struct Harness {
     func makeManager(
         lockTimeout: TimeInterval = 0.3,
         retryDelay: TimeInterval = 60,
+        markerLockTimeout: TimeInterval = 0.3,
         reassertDelay: Duration = .seconds(3600)
     ) -> SessionManager {
         let c = clock
@@ -577,6 +588,7 @@ struct Harness {
             clock: { c.now },
             recoveryLockTimeout: lockTimeout,
             recoveryRetryDelay: retryDelay,
+            markerLockTimeout: markerLockTimeout,
             reassertDelay: reassertDelay
         )
     }
@@ -604,51 +616,130 @@ func appleScriptQuotedForm(_ s: String) -> String {
     "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
 }
 
-/// Runs `AdministratorPrompt.rootCommand` the way the dialog does: `/bin/sh
-/// -c` on the line `do shell script` builds, `/bin/sh -c '<command>'
-/// insomnia '<marker>' '<nonce>'`, quoted as `quoted form of` quotes it.
-/// It runs as the current user with `dir` as its working directory, and
-/// `/usr/bin/pmset` is replaced by a fake in `dir` that only records its
-/// arguments. With `dropMarkerDuringPmset`
-/// the fake deletes the marker when asked for `disablesleep 1`, as recovery
-/// taking the lock at that moment would.
-func runRootCommand(marker: URL, nonce: String, in dir: URL, dropMarkerDuringPmset: Bool = false) throws -> RootCommandRun {
-    let fake = dir.appendingPathComponent("fake-pmset")
-    let calls = dir.appendingPathComponent("pmset-calls")
-    try? FileManager.default.removeItem(at: calls)
-    try """
-    #!/bin/bash
-    printf '%s\\n' "$*" >> "$FAKE_PMSET_CALLS"
-    if [[ "$*" == "-a disablesleep 1" && -n "${FAKE_PMSET_DROP:-}" ]]; then rm -f "$FAKE_PMSET_DROP"; fi
-    exit 0
-    """.write(to: fake, atomically: true, encoding: .utf8)
-    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fake.path)
+/// The command the dialog runs as root, started the way the dialog starts
+/// it: `/bin/sh -c` on the line `do shell script` builds, `<markerLock>
+/// '<marker>' /bin/sh -c '<rootCommand>' insomnia '<marker>' '<nonce>'`,
+/// quoted as `quoted form of` quotes it. The real /usr/bin/lockf takes the
+/// marker's lock. It runs as the current user with `dir` as its working
+/// directory, and `/usr/bin/pmset` is replaced by a fake in `dir` that
+/// records its arguments. With `holdPmset` the fake pmset, once called,
+/// waits until `release()` (60 s at most, and only while `dir` exists), so
+/// a test can act while the command holds the marker's lock.
+final class RootCommandProcess {
+    private let process = Process()
+    private let err = Pipe()
+    private let calls: URL
+    private let started: URL
+    private let releaseFile: URL
 
-    let real = "/usr/bin/pmset"
-    let command = AdministratorPrompt.rootCommand
-    XCTAssertEqual(command.components(separatedBy: real).count - 1, 2, "the command calls pmset twice, by absolute path")
-    XCTAssertFalse(fake.path.contains(" "), "the fake replaces an unquoted word")
-    let line = "/bin/sh -c " + appleScriptQuotedForm(command.replacingOccurrences(of: real, with: fake.path))
-        + " insomnia " + appleScriptQuotedForm(marker.path) + " " + appleScriptQuotedForm(nonce)
+    init(marker: URL, nonce: String, in dir: URL, holdPmset: Bool = false) throws {
+        let fake = dir.appendingPathComponent("fake-pmset")
+        calls = dir.appendingPathComponent("pmset-calls")
+        started = dir.appendingPathComponent("pmset-started")
+        releaseFile = dir.appendingPathComponent("pmset-release")
+        for file in [calls, started, releaseFile] { try? FileManager.default.removeItem(at: file) }
+        try """
+        #!/bin/bash
+        printf '%s\\n' "$*" >> "$FAKE_PMSET_CALLS"
+        : > "$FAKE_PMSET_STARTED"
+        if [[ -n "${FAKE_PMSET_HOLD:-}" ]]; then
+          i=0; while [[ ! -e "$FAKE_PMSET_HOLD" && -d "${FAKE_PMSET_HOLD%/*}" && $i -lt 1200 ]]; do sleep 0.05; i=$((i + 1)); done
+        fi
+        exit 0
+        """.write(to: fake, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fake.path)
 
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: "/bin/sh")
-    process.arguments = ["-c", line]
-    process.currentDirectoryURL = dir
-    var env = ProcessInfo.processInfo.environment
-    env["FAKE_PMSET_CALLS"] = calls.path
-    env["FAKE_PMSET_DROP"] = dropMarkerDuringPmset ? marker.path : ""
-    process.environment = env
-    process.standardInput = FileHandle.nullDevice
-    let err = Pipe()
-    process.standardError = err
-    try process.run()
-    let errData = err.fileHandleForReading.readDataToEndOfFile()
-    process.waitUntilExit()
-    let recorded = (try? String(contentsOf: calls, encoding: .utf8)) ?? ""
-    return RootCommandRun(
-        status: process.terminationStatus,
-        stderr: String(decoding: errData, as: UTF8.self),
-        pmsetCalls: recorded.split(separator: "\n").map(String.init)
-    )
+        let real = "/usr/bin/pmset"
+        let command = AdministratorPrompt.rootCommand
+        XCTAssertEqual(command.components(separatedBy: real).count - 1, 1, "the command calls pmset once, by absolute path")
+        XCTAssertFalse(fake.path.contains(" "), "the fake replaces an unquoted word")
+        let line = AdministratorPrompt.markerLock + " " + appleScriptQuotedForm(marker.path)
+            + " /bin/sh -c " + appleScriptQuotedForm(command.replacingOccurrences(of: real, with: fake.path))
+            + " insomnia " + appleScriptQuotedForm(marker.path) + " " + appleScriptQuotedForm(nonce)
+
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = ["-c", line]
+        process.currentDirectoryURL = dir
+        var env = ProcessInfo.processInfo.environment
+        env["FAKE_PMSET_CALLS"] = calls.path
+        env["FAKE_PMSET_STARTED"] = started.path
+        env["FAKE_PMSET_HOLD"] = holdPmset ? releaseFile.path : ""
+        process.environment = env
+        process.standardInput = FileHandle.nullDevice
+        process.standardError = err
+        try process.run()
+    }
+
+    /// Waits (10 s at most) until the fake pmset has been called.
+    func waitUntilPmsetRuns() -> Bool {
+        let limit = Date().addingTimeInterval(10)
+        while !FileManager.default.fileExists(atPath: started.path) {
+            if Date() > limit { return false }
+            usleep(10_000)
+        }
+        return true
+    }
+
+    func release() {
+        FileManager.default.createFile(atPath: releaseFile.path, contents: nil)
+    }
+
+    func wait() -> RootCommandRun {
+        let errData = err.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        let recorded = (try? String(contentsOf: calls, encoding: .utf8)) ?? ""
+        return RootCommandRun(
+            status: process.terminationStatus,
+            stderr: String(decoding: errData, as: UTF8.self),
+            pmsetCalls: recorded.split(separator: "\n").map(String.init)
+        )
+    }
+}
+
+/// Runs the root command to the end (see RootCommandProcess).
+func runRootCommand(marker: URL, nonce: String, in dir: URL) throws -> RootCommandRun {
+    try RootCommandProcess(marker: marker, nonce: nonce, in: dir).wait()
+}
+
+/// Holds an flock(2) lock on `url` from this process, the way the root
+/// command's lockf holds the marker, until `release()`.
+final class FileLockHolder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var fd: Int32
+
+    init(_ url: URL) throws {
+        fd = open(url.path, O_RDONLY | O_CLOEXEC)
+        guard fd >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        guard flock(fd, LOCK_EX | LOCK_NB) == 0 else {
+            let err = errno
+            close(fd)
+            throw POSIXError(POSIXErrorCode(rawValue: err) ?? .EIO)
+        }
+    }
+
+    func release() {
+        lock.withLock {
+            guard fd >= 0 else { return }
+            close(fd)
+            fd = -1
+        }
+    }
+
+    deinit { release() }
+}
+
+/// A FileLockHolder a `@Sendable` callback can create and a test can
+/// release later.
+final class LockHolderBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var holder: FileLockHolder?
+
+    func hold(_ url: URL) {
+        let h = try? FileLockHolder(url)
+        lock.withLock { holder = h }
+    }
+
+    func release() {
+        lock.withLock { holder?.release() }
+    }
 }

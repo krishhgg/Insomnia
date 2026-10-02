@@ -356,8 +356,78 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(fx.log().contains("pending-start; a password dialog left from an abandoned start can no longer turn sleep off"), fx.log())
 
         let late = try runRootCommand(marker: fx.pendingStart, nonce: nonce, in: fx.root)
-        XCTAssertEqual(late.status, 3, late.stderr)
+        XCTAssertEqual(late.status, 69, late.stderr)
         XCTAssertEqual(late.pmsetCalls, [], "the late answer must not turn sleep off")
+    }
+
+    /// The root command behind an abandoned dialog is still in pmset and
+    /// holds the marker's lock. The backstop restores sleep but keeps the
+    /// entry and exits 1; once the command is done the next run removes
+    /// the marker and clears the entry.
+    func testBackstopKeepsTheSleepEntryWhileTheMarkerIsLocked() throws {
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        let nonce = UUID().uuidString
+        try Data(nonce.utf8).write(to: fx.pendingStart)
+        let command = try RootCommandProcess(marker: fx.pendingStart, nonce: nonce, in: fx.root, holdPmset: true)
+        defer { command.release() }
+        XCTAssertTrue(command.waitUntilPmsetRuns())
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 1, r.stderr)
+        XCTAssertEqual(fx.calls(), ["sudo -n \(fx.fakePmset) -a disablesleep 0"], "sleep itself is still restored")
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, true, "the entry stays while the command may still turn sleep off")
+        XCTAssertEqual(try String(contentsOf: fx.pendingStart, encoding: .utf8), nonce)
+        XCTAssertTrue(fx.log().contains("still locked after 1s by the command a password dialog started as root"), fx.log())
+        XCTAssertTrue(fx.log().contains("journal kept dirty"), fx.log())
+
+        command.release()
+        XCTAssertEqual(command.wait().pmsetCalls, ["-a disablesleep 1"])
+        fx.clearCalls()
+        let again = try fx.run(fx.backstop)
+
+        XCTAssertEqual(again.status, 0, again.stderr)
+        XCTAssertFalse(fx.exists(fx.pendingStart))
+        XCTAssertEqual(fx.calls(), ["sudo -n \(fx.fakePmset) -a disablesleep 0"])
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, false)
+        XCTAssertFalse(fx.exists(fx.session))
+    }
+
+    /// A marker that cannot be deleted (an immutable flag) is reported the
+    /// same way: sleep restored, entry kept, exit 1, and cleared once the
+    /// flag is gone.
+    func testBackstopKeepsTheSleepEntryWhenTheMarkerCannotBeDeleted() throws {
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        try Data(UUID().uuidString.utf8).write(to: fx.pendingStart)
+        XCTAssertEqual(chflags(fx.pendingStart.path, UInt32(UF_IMMUTABLE)), 0)
+        defer { chflags(fx.pendingStart.path, 0) }
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 1, r.stderr)
+        XCTAssertEqual(fx.calls(), ["sudo -n \(fx.fakePmset) -a disablesleep 0"])
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, true)
+        XCTAssertTrue(fx.exists(fx.pendingStart))
+        XCTAssertTrue(fx.log().contains("could not be deleted"), fx.log())
+
+        chflags(fx.pendingStart.path, 0)
+        let again = try fx.run(fx.backstop)
+        XCTAssertEqual(again.status, 0, again.stderr)
+        XCTAssertFalse(fx.exists(fx.pendingStart))
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, false)
+    }
+
+    /// With nothing journaled a stuck marker still makes the run fail, so
+    /// it is retried and visible in the log.
+    func testBackstopFailsOnAStuckMarkerEvenWithACleanJournal() throws {
+        try FileManager.default.createDirectory(at: fx.pendingStart, withIntermediateDirectories: false)
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 1, r.stderr)
+        XCTAssertEqual(fx.calls(), [])
+        XCTAssertTrue(fx.log().contains("journal is clean, but \(fx.pendingStart.path) is still present"), fx.log())
     }
 
     /// A session that is still valid is left alone, but the dialog of the
@@ -410,6 +480,23 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(fx.exists(fx.sudoers))
     }
 
+    /// The root command behind an abandoned dialog holds the marker's lock:
+    /// uninstall does not delete it under that command and removes nothing.
+    func testUninstallAbortsWhileTheMarkerIsLocked() throws {
+        try fx.installMachinery()
+        try Data(UUID().uuidString.utf8).write(to: fx.pendingStart)
+        let holder = try FileLockHolder(fx.pendingStart)
+        defer { holder.release() }
+
+        let r = try fx.run(fx.uninstall)
+
+        XCTAssertNotEqual(r.status, 0, r.stdout)
+        XCTAssertTrue((r.stderr + r.stdout).contains("pending-start is still present"), r.stderr + r.stdout)
+        XCTAssertTrue(fx.exists(fx.pendingStart))
+        XCTAssertTrue(fx.exists(fx.sudoers))
+        XCTAssertTrue(fx.exists(fx.plist))
+    }
+
     /// A marker that cannot be deleted keeps everything, the sudoers rule
     /// included: the dialog it belongs to could still turn sleep off.
     func testUninstallAbortsWhenTheMarkerCannotBeDeleted() throws {
@@ -424,6 +511,42 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(fx.exists(fx.sudoers))
         XCTAssertTrue(fx.exists(fx.plist))
         XCTAssertTrue(fx.exists(fx.app))
+    }
+
+    /// Both scripts delete the marker through RM=/bin/rm, never an rm found
+    /// on PATH: one first on PATH that leaves the marker in place changes
+    /// nothing, for a plain marker (deleted under lockf) and for a link to
+    /// nothing (deleted after lockf finds nothing to open).
+    func testScriptsDeleteTheMarkerWithoutPATH() throws {
+        let shadow = fx.root.appendingPathComponent("shadow", isDirectory: true)
+        try FileManager.default.createDirectory(at: shadow, withIntermediateDirectories: true)
+        let shadowRm = shadow.appendingPathComponent("rm")
+        try """
+        #!/bin/bash
+        for a in "$@"; do [[ "$a" == "\(fx.pendingStart.path)" ]] && exit 0; done
+        exec /bin/rm "$@"
+        """.write(to: shadowRm, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: shadowRm.path)
+        let path = ["PATH": "\(shadow.path):/usr/bin:/bin:/usr/sbin:/sbin"]
+
+        try Data(UUID().uuidString.utf8).write(to: fx.pendingStart)
+        var r = try fx.run(fx.backstop, extraEnvironment: path)
+        XCTAssertEqual(r.status, 0, r.stderr)
+        XCTAssertFalse(fx.exists(fx.pendingStart))
+
+        try FileManager.default.createSymbolicLink(
+            atPath: fx.pendingStart.path, withDestinationPath: fx.root.appendingPathComponent("nowhere").path)
+        r = try fx.run(fx.backstop, extraEnvironment: path)
+        XCTAssertEqual(r.status, 0, r.stderr)
+        XCTAssertNil(try? FileManager.default.destinationOfSymbolicLink(atPath: fx.pendingStart.path), "the link must be gone")
+
+        // A stub backstop, so only uninstall.sh's own deletion can remove it.
+        try fx.installMachinery()
+        try Data(UUID().uuidString.utf8).write(to: fx.pendingStart)
+        try "#!/bin/bash\nexit 0\n".write(to: fx.backstop, atomically: true, encoding: .utf8)
+        r = try fx.run(fx.uninstall, extraEnvironment: path)
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertFalse(fx.exists(fx.pendingStart))
     }
 
     func testUninstallAbortsWhenRestoreFailsAndKeepsEverything() throws {
@@ -1854,6 +1977,7 @@ private final class ScriptFixture {
             "KILL": bin.appendingPathComponent("kill").path,
             "SYSCTL": bin.appendingPathComponent("sysctl").path,
             "LOCK_TIMEOUT_SECONDS": "1",
+            "PENDING_LOCK_TIMEOUT_SECONDS": "1",
             "COMMAND_TIMEOUT_SECONDS": "1",
             "KILL_GRACE_SECONDS": "1",
         ]).write(to: backstop, atomically: true, encoding: .utf8)
@@ -1867,6 +1991,7 @@ private final class ScriptFixture {
             "APP": app.path,
             "SUDOERS": sudoers.path,
             "LOCK_TIMEOUT_SECONDS": "1",
+            "PENDING_LOCK_TIMEOUT_SECONDS": "1",
             "QUIT_WAIT_SECONDS": "1",
         ]).write(to: uninstall, atomically: true, encoding: .utf8)
 
@@ -2225,7 +2350,8 @@ private final class ScriptFixture {
 
     /// Runs a script copy. `fd9` opens that file on descriptor 9 of the child
     /// first, the way uninstall.sh hands its lock handle to the backstop.
-    /// `extraEnvironment` is for install.sh's refusal test only. stdin is
+    /// `extraEnvironment` is for install.sh's refusal test and the PATH
+    /// test of the marker deletion. stdin is
     /// /dev/null, never the test process's own (a terminal when `swift test`
     /// runs in one), unless `terminalInput` is given: then stdin is a pty
     /// whose input queue already holds that text, so `[[ -t 0 ]]` is true

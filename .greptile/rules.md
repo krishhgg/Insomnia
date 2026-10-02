@@ -126,14 +126,20 @@ Flag a change that breaks one of these; do not flag the behavior itself.
 - `AdministratorPrompt.swift`, `SessionManager.swift`, `backstop.sh`,
   `uninstall.sh`. A prompt can outlive its start (the app crashes or is
   force-quit under the dialog, the start rolls back after a stuck prompt).
-  Its root command therefore runs `pmset -a disablesleep 1` only while
-  `pending-start` holds that start's nonce, and turns sleep back on if the
-  file is gone right after pmset. The start deletes the file before it
-  releases the recovery lock; every other lock holder deletes it before it
-  touches the journal. The file is written with no newline and compared,
-  never run. A marker that cannot be written rolls the start back with no
-  prompt; one that cannot be deleted is logged, and `uninstall.sh` refuses
-  to remove anything while it is present.
+  Its root command therefore runs under `lockf -k -n` on `pending-start`
+  and runs `pmset -a disablesleep 1` only while the file holds that start's
+  nonce. The start deletes the file before it releases the recovery lock;
+  every other lock holder deletes it before it touches the journal, and
+  every deleter (Store.removePendingStart, backstop.sh, uninstall.sh)
+  takes the file's own lock first, so the file never goes between the
+  nonce check and the end of pmset. The file is written with no newline
+  and compared, never run. A marker that cannot be written rolls the start
+  back with no prompt. One that cannot be locked in time or deleted keeps
+  `sleepDisabledByUs` journaled after sleep is restored (the app and the
+  backstop both gate the clearing on it), is reported, refuses new starts,
+  and makes `uninstall.sh` refuse to remove anything. A cancelled dialog or
+  an osascript that never launched ran nothing as root: the start restores
+  the journal and session.json exactly and runs no pmset.
 - `DisplayPower.swift`, `LidActions.swift`. On lid close, brightness 0 is
   the primary mechanism; the display sleep request (`IORequestIdle`) is
   best effort and is ignored while any process holds a display assertion,
