@@ -420,10 +420,22 @@ schedule it runs was not verified here; check with 'launchctl print gui/$UID_NUM
     no) agent_note="No LaunchAgent $LABEL is loaded, so nothing retries by itself." ;;
     *) agent_note="'launchctl print gui/$UID_NUM/$LABEL' exited ${before#unknown:}, so whether a LaunchAgent is loaded is unknown." ;;
   esac
-  # The copy of backstop.sh the user can run by hand: a zip carries it only
-  # inside the bundle; a checkout has it under scripts/.
-  manual_backstop="$ROOT/scripts/backstop.sh"
-  if [[ -n "$PREBUILT" ]]; then manual_backstop="$PREBUILT/Contents/Resources/backstop.sh"; fi
+  # How to run the recovery again. A checkout has backstop.sh under scripts/.
+  # A zip has it only inside the bundle at $PREBUILT, and the checked private
+  # copy is deleted when this script exits; the original may have changed
+  # since the check, so the step is this script again, which checks a new copy.
+  if [[ -n "$PREBUILT" ]]; then
+    rerun="$0 --app \"$PREBUILT\""
+    if (( ALLOW_UNVERIFIED_ORIGIN )); then rerun="$0 --allow-unverified-origin --app \"$PREBUILT\""; fi
+    manual_step="or rerun this script. It checks a new private
+copy of the bundle and runs that copy's recovery before it replaces the app
+or the LaunchAgent:
+  $rerun"
+  else
+    manual_step="or run the recovery by hand:
+  /bin/bash \"$ROOT/scripts/backstop.sh\" --force
+Then rerun this script to install the app and the LaunchAgent."
+  fi
   cat >&2 <<FAIL
 
 Install stopped: the backstop could not fully undo a previous session
@@ -433,9 +445,7 @@ was discarded. Installed so far: $SUDOERS.
 $agent_note
 Check $LOG_DIR/insomnia.log and resolve what it reports (saved audio, display
 brightness or keyboard backlight needs the app; if one is installed: open
-"$APP"), or run the recovery by hand:
-  /bin/bash "$manual_backstop" --force
-Then rerun this script to install the app and the LaunchAgent.
+"$APP"), $manual_step
 FAIL
   exit 1
 fi

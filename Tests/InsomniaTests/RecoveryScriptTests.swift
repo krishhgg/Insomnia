@@ -1111,12 +1111,16 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(r.stderr.contains("discarded"), r.stderr)
         XCTAssertTrue(try fx.lockIsFree(), "the transaction ends with the script")
 
-        // A zip install has no scripts/ directory; the hint names the copy sealed in the downloaded bundle.
+        // A zip install has no scripts/ directory. The checked copy of the bundle is gone when the
+        // script exits and the original was never checked in place, so the hint runs no script from
+        // either; it names this installer again, which checks a new copy first.
         let prebuilt = try fx.writePrebuiltApp()
         let zip = try fx.run(fx.installRedirected, ["--allow-unverified-origin", "--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
 
         XCTAssertEqual(zip.status, 1, zip.stderr + zip.stdout)
-        XCTAssertTrue(zip.stderr.contains("\"\(prebuilt.path)/Contents/Resources/backstop.sh\" --force"), "manual step names the sealed copy: \(zip.stderr)")
+        XCTAssertFalse(zip.stderr.contains("/bin/bash"), "no hand-run backstop.sh: \(zip.stderr)")
+        XCTAssertFalse(zip.stderr.contains("\(prebuilt.path)/Contents"), "nothing inside the unchecked bundle is named: \(zip.stderr)")
+        XCTAssertTrue(zip.stderr.contains("\(fx.installRedirected.path) --allow-unverified-origin --app \"\(prebuilt.path)\""), "manual step reruns the installer on the bundle: \(zip.stderr)")
         XCTAssertEqual(try fx.installedBinaryFirstLine(), "previous")
     }
 
