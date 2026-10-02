@@ -136,9 +136,17 @@ struct TmuxNudge: Sendable {
             // an unset option print nothing with exit 0.
             try Task.checkCancellation()
             let mark = try await command.run(tmux, server + ["show-options", "-qpv", "-t", paneId, markOption], timeout: 5)
+            // A failed lookup (the server went away after the state read)
+            // says nothing about the mark, so it is tmux's error, not a
+            // skip. A pane that closed in that window is not a failure here:
+            // with -q, tmux 3.6 prints nothing and exits 0 for it.
+            guard mark.succeeded else {
+                Log.error("tmux show-options -t \(paneId) (\(target)): \(mark.stderr.trimmingCharacters(in: .whitespacesAndNewlines))")
+                return false
+            }
             // An unmarked pane is the expected state of a target listed
             // before marks existed, so this is a skip, not an error.
-            guard mark.succeeded, isMarked(showOptionsOutput: mark.stdout) else {
+            guard isMarked(showOptionsOutput: mark.stdout) else {
                 Log.info("tmux nudge to \(target) skipped: pane \(paneId) is not marked for nudges; mark it with: \(markCommand(target: paneId))")
                 return false
             }

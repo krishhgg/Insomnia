@@ -426,6 +426,38 @@ final class TmuxLiveRunnerTests: XCTestCase {
         XCTAssertFalse(log.contains("[error]"), log)
     }
 
+    /// A server that goes away between the state read and the mark read
+    /// makes show-options fail. That is tmux's error, logged as one, and not
+    /// an unmarked pane.
+    func testFailedMarkLookupIsAnErrorNotASkip() async throws {
+        let home = TempHome()
+        defer { home.destroy() }
+        try await startPane(command: "cat")
+        // tearDown cannot ask a dead server for its socket file.
+        let socketPath = try await tmuxRun(["display-message", "-p", "#{socket_path}"]).stdout
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        defer { if !socketPath.isEmpty { try? FileManager.default.removeItem(atPath: socketPath) } }
+        let tmux = self.tmux!
+        let socket = self.socket!
+        let launches = RunnerLog()
+        let command = CancellableCommand(beforeLaunch: {
+            // Second launch is the mark read: stop the server first.
+            if launches.nextCall() == 2 {
+                _ = try? await Shell.run(tmux, ["-L", socket, "kill-server"], timeout: 5)
+            }
+        })
+        let nudge = TmuxNudge(run: TmuxNudge.makeLiveRunner(socketName: socket, command: command))
+
+        let count = await nudge.nudge(targets: ["nudge:0.0"], pressEnter: true)
+
+        XCTAssertEqual(count, 0)
+        let log = try String(contentsOf: home.paths.logFile, encoding: .utf8)
+        let lines = log.split(whereSeparator: \.isNewline).filter { $0.contains("nudge:0.0") }
+        XCTAssertEqual(lines.count, 1, log)
+        XCTAssertTrue(lines.first?.contains("[error] insomnia: tmux show-options -t %0 (nudge:0.0): ") ?? false, log)
+        XCTAssertFalse(log.contains("not marked"), log)
+    }
+
     /// The mark must be on the pane itself. The same option set on the
     /// session (what `set-option` does without `-p`) is visible to a format
     /// lookup but is not a mark.
