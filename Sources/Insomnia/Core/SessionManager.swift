@@ -6,6 +6,9 @@ enum EndReason: String, Sendable {
     case user
     case quit
     case batteryFloor
+    /// Battery present but its level unreadable on two consecutive reads
+    /// while on battery: the end floor could not be applied.
+    case batteryUnreadable
     case thermalCritical
     case backstop
     /// Reconcile found a session on disk but could not arm the recovery
@@ -1223,6 +1226,7 @@ final class SessionManager {
         case .user: "Ended by you. Sleep is back to normal."
         case .quit: "Insomnia quit. Sleep is back to normal."
         case .batteryFloor: "Battery fell below \(config.endFloor)%. Sleep is back to normal."
+        case .batteryUnreadable: "The battery level could not be read twice in a row, so the \(config.endFloor)% floor could not be applied. Sleep is back to normal."
         case .thermalCritical: "Thermal state is critical. Sleep is back to normal."
         case .backstop: "A previous session left changes behind; everything has been undone."
         case .recoveryUnavailable: "Insomnia could not arm its recovery agent for the session found on disk, so it ended the session. Sleep is back to normal."
