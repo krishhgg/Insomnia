@@ -106,10 +106,13 @@ previous bundle back, so the loaded agent always matches the installed app. If
 the unload is not confirmed, the new bundle stays with the agent that pins it
 and the installer asks you to rerun it. After that, or after an install killed
 in the middle of that step, the next run keeps whichever bundle the agent's
-plist on disk pins. Before it moves a bundle back for that, it unloads any
-agent the earlier run left loaded, and it stops without moving either bundle
-if that unload is not confirmed. Unresolved recovery prevents replacing
-either; follow the reported instructions before retrying.
+plist on disk pins. It does that only after its own recovery step succeeds:
+while recovery is unresolved, an agent the earlier run left loaded may be the
+one retrying it, so the installer stops without unloading that agent or
+moving either bundle. Once recovery succeeds, it unloads that agent, moves the
+bundle back and loads the plist on disk again, and it stops if `launchctl
+print` does not confirm the unload or the reload. Unresolved recovery prevents
+replacing either; follow the reported instructions before retrying.
 
 </details>
 

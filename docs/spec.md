@@ -370,9 +370,16 @@ Backstop, independent of the app:
   install.sh unloads any job that may be loaded, confirms that with print,
   and puts the previous bundle back; if the unload is not confirmed, the
   new bundle stays, because that job pins it. A rerun after an interrupted
-  or failed swap keeps the bundle the plist on disk pins, and unloads and
-  confirms any loaded job before it moves a bundle. A loaded job is never
-  left pinning a bundle that was moved away. uninstall.sh runs the
+  or failed swap keeps the bundle the plist on disk pins. It runs its
+  forced recovery first, with the loaded job and the bundles as the earlier
+  run left them, and stops there if recovery fails. Only then does it
+  unload and confirm any loaded job, move a bundle and load the plist on
+  disk again; it stops when print does not confirm the unload or that
+  reload. A loaded job is never left pinning a bundle that was moved away,
+  and no step after a failed bootstrap counts on a loaded job. Before
+  recovery the run only puts a set-aside bundle back when nothing is at the
+  app's path, and removes staging directories whose owning install is gone
+  (matched by the exact name install.sh gives them). uninstall.sh runs the
   bundle's sealed backstop.sh only after `codesign --verify --strict`
   passes on the bundle.
 - App and script transactions must coordinate through a shared lock. Failure
