@@ -184,9 +184,10 @@ clean. A session file that cannot be read at all (permissions, or not a
 regular file, which is never opened) also counts as expired, since its end
 time is unknown: the journal is restored and the file is renamed the same
 way without being opened, so a later launch cannot resume a session that
-was treated as ended. The app says where it went. `uninstall.sh --purge`
-removes the renamed copies that are regular files; without `--purge` they
-stay.
+was treated as ended. The app says where it went. If the rename fails, the
+app keeps trying it and will not quit until the file is gone.
+`uninstall.sh --purge` removes the renamed copies that are regular files;
+without `--purge` they stay.
 
 **Recovery is not “everything always gets undone.”** The backstop does not
 monitor battery or temperature. Saved audio needs the app to reopen, and

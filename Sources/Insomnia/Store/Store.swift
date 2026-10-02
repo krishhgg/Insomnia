@@ -78,6 +78,12 @@ struct Store: Sendable {
     }
     func saveSession(_ s: Session) throws { try write(s, to: paths.sessionFile) }
     func deleteSession() throws { try remove(at: paths.sessionFile) }
+    /// Whether anything is at session.json, a dangling symlink included.
+    /// lstat(2) only: the entry is never opened.
+    func sessionEntryExists() -> Bool {
+        var st = stat()
+        return lstat(paths.sessionFile.path, &st) == 0
+    }
 
     /// Renames an unreadable session.json to a timestamped sibling (see
     /// Paths.unreadableSessionPrefix) and returns the new location. The

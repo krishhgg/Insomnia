@@ -475,7 +475,7 @@ quarantine_session() {
     return 0
   fi
   if [[ "$session_state" == unreadable ]]; then
-    log error "$what and could not be moved to $dest; kept in place. Fix its permissions, or remove it if it is not a regular file: $SESSION"
+    log error "$what and could not be moved to $dest; kept in place, and the next run tries again. Remove it or move it out of $APP_SUPPORT: if it became readable there, the app would resume it: $SESSION"
   else
     log error "$what and could not be moved to $dest; kept in place"
   fi

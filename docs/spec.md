@@ -374,8 +374,12 @@ Reconcile runs at every Insomnia launch:
    aside the same way (the app at once, `backstop.sh` once the journal is
    clean), which keeps it as evidence and keeps a later launch from
    resuming a session that was treated as ended. The app notifies with the
-   new path. If the rename fails the file stays, the app says to fix it,
-   and a start is refused while a session.json it cannot read is there.
+   new path. If the rename fails the file stays and a start is refused
+   while it is there. Every end then restores the journal and tries the
+   rename again; while it fails the end is not finished, so quit is refused
+   and the end is retried, because the file would be resumed if it became
+   readable in place. The messages say to remove it or move it out of the
+   folder. `backstop.sh` tries the rename again on every run.
    An unreadable journal still refuses every transaction and leaves both
    files in place.
 2. Session valid → establish the independent recovery agent before reapplying

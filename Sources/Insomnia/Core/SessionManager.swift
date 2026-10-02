@@ -160,6 +160,11 @@ final class SessionManager {
     /// the file where it is. Cleared by the next reconcile, and by a start,
     /// whose own session.json replaces it.
     @ObservationIgnored private var keepSessionFile = false
+    /// Set with keepSessionFile when the file could not be read at all. It
+    /// may hold a future end time, and a launch after it becomes readable
+    /// would resume it, so an end tries the rename again and, while that
+    /// fails, is not finished: quit is refused and the end is retried.
+    @ObservationIgnored private var unreadSessionInPlace = false
 
     init(
         paths: Paths,
@@ -366,13 +371,14 @@ final class SessionManager {
             // appeared or lost its permissions after reconcile, or reconcile
             // could not move it aside. It may be a valid session, and a
             // rollback could not put it back.
-            fail("start refused, nothing changed: session.json could not be read (\(error.localizedDescription)). Fix its permissions, or remove it if it is not a regular file, then start again")
+            fail("start refused, nothing changed: session.json could not be read (\(error.localizedDescription)). Remove it or move it out of \(paths.appSupport.path), then start again")
             return
         }
 
         do {
             try store.saveSession(new)
             keepSessionFile = false
+            unreadSessionInPlace = false
             try journal { $0.sleepDisabledByUs = true }
         } catch {
             fail("could not write session: \(error.localizedDescription)")
@@ -503,21 +509,25 @@ final class SessionManager {
         scheduledDeadline = nil
         remainingText = ""
         countdownText = ""
-        var deletionError: String?
-        if keepSessionFile {
+        // Why session.json is still in place when a relaunch could act on
+        // it; the end is then retried and quit refused.
+        var retainedBecause: String?
+        if unreadSessionInPlace {
+            retainedBecause = retryMovingAsideSessionThatCannotBeRead()
+        } else if keepSessionFile {
             Log.info("session.json left in place: reconcile could not move it aside")
         } else {
             do {
                 try store.deleteSession()
             } catch {
-                deletionError = error.localizedDescription
+                retainedBecause = "session.json could not be removed (\(error.localizedDescription)); a relaunch would hold sleep again for it."
                 fail("could not remove session.json: \(error.localizedDescription)")
             }
         }
         await restoreAll()
         services?.stop()
 
-        if state.isDirty || deletionError != nil {
+        if state.isDirty || retainedBecause != nil {
             // The journal is the retry list. Make sure something will read it.
             var armed = true
             if state.isDirty {
@@ -528,13 +538,13 @@ final class SessionManager {
                     fail("recovery agent could not be confirmed: \(error.localizedDescription)")
                 }
             }
-            if let deletionError {
+            if let retainedBecause {
                 // The agent enforces deadlines, it does not remove a live
                 // session file; only this process can, so it stays to retry.
                 let journalNote = state.isDirty ? " Some changes are also still journaled." : ""
                 notifier.post(
                     title: Self.incompleteTitle,
-                    body: "session.json could not be removed (\(deletionError)); a relaunch would hold sleep again for it.\(journalNote) Insomnia retries in \(Int(recoveryRetryDelay)) s; do not quit until it is removed."
+                    body: "\(retainedBecause)\(journalNote) Insomnia retries in \(Int(recoveryRetryDelay)) s; do not quit until it is gone."
                 )
                 scheduleEndRetry(reason)
                 return .sessionRetained
@@ -994,6 +1004,7 @@ final class SessionManager {
     private func performReconcile() async {
         let now = clock()
         keepSessionFile = false
+        unreadSessionInPlace = false
         var onDisk: Session?
         do {
             onDisk = try store.loadSession()
@@ -1134,14 +1145,39 @@ final class SessionManager {
             Log.error("session.json could not be read (\(detail)); treated as expired and moved, unopened, to \(moved.path)")
             notifier.post(title: Self.sessionFileTitle, body: "\(expired) The file was moved, unopened, to \(moved.path).")
         } catch let moveError {
-            // Kept, not deleted: an end that runs now restores the journal
-            // and leaves the file, and a start is refused while it is there.
+            // Kept, not deleted. A start is refused while it is there, and
+            // every end restores the journal, tries the rename again, and
+            // stays unfinished while it fails.
             keepSessionFile = true
+            unreadSessionInPlace = true
             fail("session.json could not be read (\(detail)) and could not be moved aside: \(moveError.localizedDescription); treated as expired and left in place")
             notifier.post(
                 title: Self.sessionFileTitle,
-                body: "\(expired) The file could not be moved aside (\(moveError.localizedDescription)) and was left in place. Fix its permissions, or remove it if it is not a regular file."
+                body: "\(expired) The file could not be moved aside (\(moveError.localizedDescription)) and was left in place. If it became readable there, a relaunch would resume it, so Insomnia retries the rename and will not quit until it is gone. Remove it or move it out of \(paths.appSupport.path)."
             )
+        }
+    }
+
+    /// An end's second try at renaming a session.json that could not be
+    /// read. Nil once nothing is left at session.json (renamed now, or
+    /// removed by a person); otherwise why it is still there.
+    private func retryMovingAsideSessionThatCannotBeRead() -> String? {
+        guard store.sessionEntryExists() else {
+            keepSessionFile = false
+            unreadSessionInPlace = false
+            Log.info("session.json that could not be read is gone")
+            return nil
+        }
+        do {
+            let moved = try store.moveAsideUnreadableSession(now: clock())
+            keepSessionFile = false
+            unreadSessionInPlace = false
+            Log.info("session.json that could not be read moved, unopened, to \(moved.path)")
+            notifier.post(title: Self.sessionFileTitle, body: "session.json, which could not be read, was moved, unopened, to \(moved.path).")
+            return nil
+        } catch {
+            fail("session.json could not be read and still could not be moved aside: \(error.localizedDescription)")
+            return "session.json could not be read or moved aside (\(error.localizedDescription)). If it became readable where it is, a relaunch would resume it and hold sleep again. Remove it or move it out of \(paths.appSupport.path)."
         }
     }
 

@@ -669,6 +669,33 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(fx.log().contains("treated as expired; nothing journaled to undo"), fx.log())
     }
 
+    /// When the rename fails (an immutable entry here) the file stays, the
+    /// run exits nonzero, and the log says to remove it or move it rather
+    /// than make it readable. The next run tries the rename again.
+    func testSessionThatCannotBeReadOrRenamedIsKeptAndRetriedOnTheNextRun() throws {
+        try FileManager.default.createDirectory(at: fx.session, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes([.immutable: true], ofItemAtPath: fx.session.path)
+        defer { try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: fx.session.path) }
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertNotEqual(r.status, 0, r.stderr + fx.log())
+        XCTAssertEqual(fx.calls(), [])
+        XCTAssertTrue(fx.exists(fx.session))
+        XCTAssertEqual(try movedAsideSessions(), [])
+        let log = fx.log()
+        XCTAssertTrue(log.contains("kept in place, and the next run tries again"), log)
+        XCTAssertTrue(log.contains("Remove it or move it out of \(fx.home.path): if it became readable there, the app would resume it"), log)
+
+        try FileManager.default.setAttributes([.immutable: false], ofItemAtPath: fx.session.path)
+        let next = try fx.run(fx.backstop)
+
+        XCTAssertEqual(next.status, 0, next.stderr + fx.log())
+        XCTAssertFalse(fx.exists(fx.session))
+        XCTAssertEqual(try movedAsideSessions().count, 1)
+    }
+
     /// A regular session.json without read permission, holding a session
     /// whose end is still ahead: the same. Its bytes move unchanged, so
     /// once its permissions are fixed it is still not session.json and no

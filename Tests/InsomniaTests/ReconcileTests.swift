@@ -581,11 +581,11 @@ final class ReconcileTests: XCTestCase {
 
     /// When session.json can neither be read nor moved aside (the name it
     /// would get is taken by a dangling symlink, which the existence check
-    /// does not see and the rename will not replace), it is kept in place
-    /// and the user is told to fix it. An end that does not finish at
-    /// reconcile, retried later, still leaves the file: the retry restores
-    /// the journal and nothing else.
-    func testSessionThatCannotBeReadOrMovedAsideIsKeptThroughARetriedEnd() async throws {
+    /// does not see and the rename will not replace), it is kept in place.
+    /// Every end restores the journal and tries the rename again; while it
+    /// fails the end is not finished, since the file would be resumed if it
+    /// became readable there. Once the name is free, the retry moves it.
+    func testSessionThatCannotBeReadOrMovedAsideKeepsTheEndPendingUntilItMoves() async throws {
         try FileManager.default.createDirectory(at: h.home.paths.sessionFile, withIntermediateDirectories: true)
         let taken = h.home.paths.appSupport.appendingPathComponent("session.json.unreadable-20270115T080000Z")
         try FileManager.default.createSymbolicLink(atPath: taken.path, withDestinationPath: h.home.paths.appSupport.appendingPathComponent("missing").path)
@@ -603,15 +603,91 @@ final class ReconcileTests: XCTestCase {
         let body = posts.first?.body ?? ""
         XCTAssertTrue(body.contains("treats the session as expired"), body)
         XCTAssertTrue(body.contains("could not be moved aside"), body)
-        XCTAssertTrue(body.contains("left in place. Fix its permissions"), body)
+        XCTAssertTrue(body.contains("will not quit until it is gone"), body)
+        XCTAssertTrue(body.contains("Remove it or move it out of \(h.home.paths.appSupport.path)"), body)
 
         h.guardFake.throwOn = []
         let outcome = await m.end(reason: .backstop)
 
-        XCTAssertEqual(outcome, .restored)
+        XCTAssertEqual(outcome, .sessionRetained)
         XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
-        var isDir: ObjCBool = false
-        XCTAssertTrue(FileManager.default.fileExists(atPath: h.home.paths.sessionFile.path, isDirectory: &isDir) && isDir.boolValue, "the retry removed session.json")
+        XCTAssertEqual(fileType(h.home.paths.sessionFile), S_IFDIR, "session.json was removed, not kept")
+        let retained = try XCTUnwrap(h.notifier.posts.last)
+        XCTAssertEqual(retained.title, SessionManager.incompleteTitle)
+        XCTAssertTrue(retained.body.contains("could not be read or moved aside"), retained.body)
+        XCTAssertTrue(retained.body.contains("a relaunch would resume it"), retained.body)
+
+        try FileManager.default.removeItem(at: taken)
+        let retried = await m.end(reason: .backstop)
+
+        XCTAssertEqual(retried, .restored)
+        XCTAssertFalse(exists(h.home.paths.sessionFile))
+        XCTAssertEqual(fileType(taken), S_IFDIR, "the retry did not move session.json aside")
+        XCTAssertTrue(h.notifier.posts.contains { $0.title == SessionManager.sessionFileTitle && $0.body.contains("moved, unopened, to \(taken.path)") }, "\(h.notifier.posts)")
+        XCTAssertNil(m.pendingEnd)
+    }
+
+    /// A session.json without read permission that cannot be renamed, a
+    /// clean journal, and a quit. The quit is
+    /// refused while the file is in place, since making it readable would
+    /// let the next launch resume a session that was treated as ended. Once
+    /// the rename works, the quit goes through and a later launch finds no
+    /// session, even with the copy readable again.
+    func testQuitIsRefusedWhileASessionThatCannotBeReadStaysInPlace() async throws {
+        try XCTSkipIf(getuid() == 0, "root reads a mode-000 file")
+        let now = h.clock.now
+        try h.store.saveSession(Session(startedAt: now, endsAt: now.addingTimeInterval(3600)))
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: h.home.paths.sessionFile.path)
+        let moved = h.home.paths.appSupport.appendingPathComponent("session.json.unreadable-20270115T080000Z")
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: h.home.paths.sessionFile.path)
+            try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: moved.path)
+        }
+        try FileManager.default.createSymbolicLink(atPath: moved.path, withDestinationPath: h.home.paths.appSupport.appendingPathComponent("missing").path)
+        try h.store.saveState(RuntimeState())
+
+        let m = h.makeManager()
+        await m.reconcile()
+        XCTAssertNil(m.session)
+        XCTAssertTrue(exists(h.home.paths.sessionFile))
+
+        let quit = await m.end(reason: .quit)
+
+        XCTAssertEqual(quit, .sessionRetained, "quit went through with a resumable session.json in place")
+        XCTAssertEqual(m.pendingEnd, .quit)
+        XCTAssertTrue(exists(h.home.paths.sessionFile), "the fixture did not keep session.json")
+
+        try FileManager.default.removeItem(at: moved)
+        let retried = await m.end(reason: .quit)
+
+        XCTAssertEqual(retried, .restored)
+        XCTAssertFalse(exists(h.home.paths.sessionFile))
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: moved.path)
+        let next = h.makeManager()
+        await next.reconcile()
+        XCTAssertNil(next.session, "a session that was treated as ended came back")
+        XCTAssertFalse(h.guardFake.calls.contains("disablesleep 1"), "\(h.guardFake.calls)")
+        XCTAssertEqual(h.backstop.arms, 0)
+    }
+
+    /// A person may remove the file instead: the next end finds nothing at
+    /// session.json and finishes.
+    func testEndFinishesOnceASessionThatCannotBeReadIsRemoved() async throws {
+        try FileManager.default.createDirectory(at: h.home.paths.sessionFile, withIntermediateDirectories: true)
+        let taken = h.home.paths.appSupport.appendingPathComponent("session.json.unreadable-20270115T080000Z")
+        try FileManager.default.createSymbolicLink(atPath: taken.path, withDestinationPath: h.home.paths.appSupport.appendingPathComponent("missing").path)
+        try h.store.saveState(RuntimeState())
+        let m = h.makeManager()
+        await m.reconcile()
+        let refused = await m.end(reason: .quit)
+        XCTAssertEqual(refused, .sessionRetained)
+
+        try FileManager.default.removeItem(at: h.home.paths.sessionFile)
+        let outcome = await m.end(reason: .quit)
+
+        XCTAssertEqual(outcome, .restored)
+        XCTAssertNil(m.pendingEnd)
+        XCTAssertEqual(fileType(taken), S_IFLNK, "nothing was moved")
     }
 
     /// A start never replaces a session.json it cannot read: one that

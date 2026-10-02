@@ -499,8 +499,9 @@ What to do, then rerun this script:
   - session.json that cannot be read at all: its end time is unknown, so
     the app and the agent treat it as expired, undo the journal, and then
     rename it to session.json.unreadable-<time> without opening it. If it
-    is still here, that rename failed (see the log): fix its permissions,
-    or remove it if it is not a regular file, then rerun.
+    is still here, that rename failed (see the log): remove it or move it
+    out of this folder, then rerun. Do not make it readable where it is:
+    the app would then resume it.
   - Log: $LOG_DIR/insomnia.log
 MSG
   exit 1
