@@ -57,7 +57,38 @@ jobs:
           "$tmux_bin" -V
 
       - name: Run tests
-        run: swift test
+        # NSUnbufferedIO makes XCTest write each line as it happens. With
+        # the default 16 KB stdout buffer the log of a hung run stops up to
+        # 16 KB before the test that hung, which has already misled one
+        # investigation. If the run is still going after 20 minutes (a
+        # normal run takes about 3), the watchdog samples every xctest
+        # process so the log shows what the hung test is waiting on, then
+        # fails the step instead of waiting for the job timeout.
+        env:
+          NSUnbufferedIO: "YES"
+        run: |
+          swift test &
+          test_pid=$!
+          for ((i = 0; i < 1200; i++)); do
+            kill -0 "$test_pid" 2>/dev/null || break
+            sleep 1
+          done
+          if kill -0 "$test_pid" 2>/dev/null; then
+            echo "::error::swift test still running after 20 minutes; sampling xctest"
+            echo "::group::processes"
+            ps -axo pid,ppid,stat,etime,command
+            echo "::endgroup::"
+            for x in $(pgrep -x xctest); do
+              echo "::group::xctest pid $x"
+              /usr/bin/sample "$x" 3 -mayDie || true
+              echo "::endgroup::"
+            done
+            pkill -x xctest 2>/dev/null || true
+            pkill -P "$test_pid" 2>/dev/null || true
+            kill "$test_pid" 2>/dev/null || true
+            exit 1
+          fi
+          wait "$test_pid"
 
       - name: Build release
         run: swift build -c release
