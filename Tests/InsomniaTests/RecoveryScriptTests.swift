@@ -98,7 +98,7 @@ final class RecoveryScriptTests: XCTestCase {
 
     private func assertSessionKept(_ r: (status: Int32, stdout: String, stderr: String), file: StaticString = #filePath, line: UInt = #line) throws {
         XCTAssertEqual(r.status, 0, r.stderr + fx.log(), file: file, line: line)
-        XCTAssertFalse(calls().contains { $0.hasPrefix("sudo") || $0.hasPrefix("kill") }, "\(calls())", file: file, line: line)
+        XCTAssertFalse(calls().contains { $0.hasPrefix("sudo") || $0.hasPrefix("kill -CONT") }, "\(calls())", file: file, line: line)
         XCTAssertEqual(try String(contentsOf: fx.state, encoding: .utf8), liveJournal, "journal must not be rewritten", file: file, line: line)
         XCTAssertTrue(fx.exists(fx.session), "the session must stand", file: file, line: line)
     }
@@ -317,6 +317,7 @@ final class RecoveryScriptTests: XCTestCase {
         try assertSessionEnded(try fx.run(fx.backstop), reason: "pmset -g batt did not finish within 1s")
         XCTAssertLessThan(Date().timeIntervalSince(started), 20, "the hung read must not hold the run for its whole minute")
         XCTAssertTrue(fx.log().contains("did not finish within 1s; terminated with SIGTERM"), fx.log())
+        XCTAssertTrue(fx.calls().contains { $0.hasPrefix("kill -TERM ") }, "the timeout signal goes through $KILL: \(fx.calls())")
 
         try writeLiveSession()
         fx.clearCalls()
@@ -343,6 +344,7 @@ final class RecoveryScriptTests: XCTestCase {
         try assertSessionKept(try fx.run(fx.backstop))
 
         XCTAssertTrue(fx.log().contains("ignored SIGTERM; sent SIGKILL"), fx.log())
+        XCTAssertTrue(fx.calls().contains { $0.hasPrefix("kill -KILL ") }, "the timeout signal goes through $KILL: \(fx.calls())")
         XCTAssertTrue(fx.log().contains("thermal pressure level unreadable"), fx.log())
         XCTAssertTrue(fx.calls().contains("notifyutil checked fd 9"), "\(fx.calls())")
         XCTAssertFalse(fx.calls().contains { $0.hasSuffix("had fd 9") }, "neither the read nor its supervisor may inherit the lock: \(fx.calls())")
@@ -1474,7 +1476,8 @@ final class RecoveryScriptTests: XCTestCase {
 
         XCTAssertNotEqual(r.status, 0)
         XCTAssertNil(fx.commandEnded(), "the script returned while the first command was still alive (not released)")
-        XCTAssertEqual(fx.calls(), ["sudo -n \(fx.fakePmset) -a disablesleep 0"], "no second undo while the first is alive")
+        XCTAssertEqual(fx.calls().filter { !$0.hasPrefix("kill -TERM ") }, ["sudo -n \(fx.fakePmset) -a disablesleep 0"], "no second undo while the first is alive, and no SIGKILL")
+        XCTAssertEqual(fx.calls().filter { $0.hasPrefix("kill -TERM ") }.count, 1, "\(fx.calls())")
         let s = try fx.stateJSON()
         XCTAssertEqual(s["sleepDisabledByUs"] as? Bool, true)
         XCTAssertEqual(s["lowPowerSetByUs"] as? Bool, true)
@@ -2293,10 +2296,20 @@ private final class ScriptFixture {
         done < "\(r)/ps.table"
         exit 1
         """)
+        // kill: a timeout's -TERM or -KILL goes on to the real kill only
+        // for a command the run under test started (its pid is in one of
+        // the run's .backstop.*.pid files), so that command really stops.
+        // Any other pid, such as a journal's frozen pid, is never signalled.
         try writeFake("kill", """
         printf 'kill %s\\n' "$*" >> "\(calls)"
         fail="$(cat "\(r)/kill.fail.mode" 2>/dev/null || true)"
         for f in $fail; do [[ "$f" == "${2:-}" ]] && exit 1; done
+        case "${1:-}" in
+          -TERM|-KILL)
+            if [[ -n "${2:-}" ]] && cat "\(home.path)"/.backstop.*.pid 2>/dev/null | grep -qx -- "$2"; then
+              exec /bin/kill "$1" "$2"
+            fi ;;
+        esac
         exit 0
         """)
         try writeFake("sysctl", """

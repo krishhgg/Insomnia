@@ -224,7 +224,7 @@ run_bounded() { # command args...
   if ! wait_for_status "$rcfile" "$COMMAND_TIMEOUT_SECONDS"; then
     cpid="$(cat "$pidfile" 2>/dev/null || true)"
     if [[ -n "$cpid" ]]; then
-      kill -TERM "$cpid" 2>/dev/null || true
+      "$KILL" -TERM "$cpid" 2>/dev/null || true
     fi
     if ! wait_for_status "$rcfile" "$KILL_GRACE_SECONDS"; then
       log error "'$*' (pid ${cpid:-?}) did not finish within ${COMMAND_TIMEOUT_SECONDS}s and did not stop on SIGTERM. It is not killed, because that could leave a root pmset running outside the transaction. It keeps the recovery lock until it ends, so Insomnia cannot start and recovery cannot run until then; stop it by hand (sudo kill ${cpid:-<pid>}) and the next run will retry"
@@ -273,11 +273,11 @@ run_read() { # varname command args...
     rc="$(cat "$rcfile")"
   else
     cpid="$(cat "$pidfile" 2>/dev/null || true)"
-    if [[ -n "$cpid" ]]; then kill -TERM "$cpid" 2>/dev/null || true; fi
+    if [[ -n "$cpid" ]]; then "$KILL" -TERM "$cpid" 2>/dev/null || true; fi
     if wait_for_status "$rcfile" "$KILL_GRACE_SECONDS"; then
       log error "'$*' did not finish within ${COMMAND_TIMEOUT_SECONDS}s; terminated with SIGTERM (pid ${cpid:-?})"
     else
-      if [[ -n "$cpid" ]]; then kill -KILL "$cpid" 2>/dev/null || true; fi
+      if [[ -n "$cpid" ]]; then "$KILL" -KILL "$cpid" 2>/dev/null || true; fi
       log error "'$*' did not finish within ${COMMAND_TIMEOUT_SECONDS}s and ignored SIGTERM; sent SIGKILL (pid ${cpid:-?}). A read holds no lock, so nothing waits for it"
       wait_for_status "$rcfile" "$KILL_GRACE_SECONDS" || true
     fi
