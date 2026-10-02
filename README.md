@@ -98,14 +98,18 @@ four `pmset` commands itself.
 
 An upgrade asks the running app to quit and stops if it refuses. The new
 bundle is built in a staging directory next to the app and moved into place in
-the same step that replaces the recovery agent; if the new agent cannot be
-loaded, or its plist cannot be saved and the new agent is unloaded again, the
-previous bundle is put back, so the loaded agent always matches the installed
-app. If that unload fails, the new bundle stays with the agent that pins it and
-the installer asks you to rerun it. After that, or after an install killed in
-the middle of that step, the next run keeps whichever bundle the agent's plist
-on disk pins. Unresolved recovery prevents replacing either; follow the
-reported instructions before retrying.
+the same step that replaces the recovery agent. That step starts only after
+`launchctl print` confirms the previous agent is unloaded; otherwise nothing is
+replaced. If the new agent cannot be loaded, or its plist cannot be saved, the
+installer unloads it, waits for `launchctl print` to confirm that, and puts the
+previous bundle back, so the loaded agent always matches the installed app. If
+the unload is not confirmed, the new bundle stays with the agent that pins it
+and the installer asks you to rerun it. After that, or after an install killed
+in the middle of that step, the next run keeps whichever bundle the agent's
+plist on disk pins. Before it moves a bundle back for that, it unloads any
+agent the earlier run left loaded, and it stops without moving either bundle
+if that unload is not confirmed. Unresolved recovery prevents replacing
+either; follow the reported instructions before retrying.
 
 </details>
 

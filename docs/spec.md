@@ -353,11 +353,17 @@ Backstop, independent of the app:
   whose bundle no longer verifies is never reported as armed, and a bundle
   re-signed under the running app is never re-pinned. A `swift run` build
   outside any bundle pins the installed bundle from disk.
-- install.sh replaces the bundle and the agent in one locked step (new
-  bundle staged next to the app, swapped in after the previous job is
-  unloaded and before the new one is loaded) and puts the previous bundle
-  back when the new agent cannot be loaded, so the agent on disk always
-  pins the bundle at `~/Applications/Insomnia.app`. uninstall.sh runs the
+- install.sh replaces the bundle and the agent in one locked step: the new
+  bundle is staged next to the app and swapped in only after `launchctl
+  print` confirms the previous job is unloaded, then the new job is loaded.
+  So any job loaded after the swap is this run's and pins the new bundle.
+  When the new job cannot be loaded or its plist cannot be published,
+  install.sh unloads any job that may be loaded, confirms that with print,
+  and puts the previous bundle back; if the unload is not confirmed, the
+  new bundle stays, because that job pins it. A rerun after an interrupted
+  or failed swap keeps the bundle the plist on disk pins, and unloads and
+  confirms any loaded job before it moves a bundle. A loaded job is never
+  left pinning a bundle that was moved away. uninstall.sh runs the
   bundle's sealed backstop.sh only after `codesign --verify --strict`
   passes on the bundle.
 - App and script transactions must coordinate through a shared lock. Failure
