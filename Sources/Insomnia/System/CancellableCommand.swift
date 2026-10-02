@@ -107,9 +107,14 @@ struct CancellableCommand: Sendable {
     /// tests that must cancel the task in the window between the caller's
     /// last cancellation check and `Process.run`.
     let beforeLaunch: Hook?
+    /// Awaited after the launch; the timeout starts counting when it
+    /// returns. Injection point for tests whose child must be ready (a
+    /// signal trap in place, say) before the deadline can fire.
+    let beforeDeadline: Hook?
 
-    init(beforeLaunch: Hook? = nil) {
+    init(beforeLaunch: Hook? = nil, beforeDeadline: Hook? = nil) {
         self.beforeLaunch = beforeLaunch
+        self.beforeDeadline = beforeDeadline
     }
 
     func run(_ exe: String, _ args: [String], timeout: TimeInterval, stop: StopPolicy = .terminateThenKill) async throws -> ShellResult {
@@ -140,7 +145,16 @@ struct CancellableCommand: Sendable {
                     }
 
                     let killer = DispatchWorkItem { state.deadline() }
-                    DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: killer)
+                    if let beforeDeadline {
+                        // Not cancelled at the exit: `deadline()` finds no
+                        // running child then and does nothing.
+                        Task {
+                            await beforeDeadline()
+                            DispatchQueue.global().asyncAfter(deadline: .now() + timeout) { state.deadline() }
+                        }
+                    } else {
+                        DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: killer)
+                    }
 
                     let group = DispatchGroup()
                     nonisolated(unsafe) var errData = Data()

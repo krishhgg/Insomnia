@@ -138,12 +138,20 @@ final class CommandCancellationTests: XCTestCase {
     /// exits, and the handle resolves once it does.
     func testTerminateOnlyNeverSendsSigkillAndReportsTheChildAsStillRunning() async throws {
         let (exe, pidFile) = try termIgnorer()
-        let started = Date()
+        let ready = Locked<Date?>(nil)
+        // The deadline starts counting only once the child has written its
+        // pid, which it does after `trap '' TERM`: the SIGTERM always finds
+        // the trap in place, however slow the spawn. Bounded, so a child
+        // that never starts fails the assertions below instead of hanging.
+        let runner = CancellableCommand(beforeDeadline: {
+            for _ in 0..<1000 where !FileManager.default.fileExists(atPath: pidFile) {
+                try? await Task.sleep(for: .milliseconds(10))
+            }
+            ready.value = Date()
+        })
         var reported: UnfinishedCommand?
-        // One second leaves room for a slow spawn under parallel test load;
-        // the trap is in place long before the deadline.
         do {
-            _ = try await CancellableCommand().run(exe, [], timeout: 1, stop: .terminateOnly(grace: 0.5))
+            _ = try await runner.run(exe, [], timeout: 1, stop: .terminateOnly(grace: 0.5))
             XCTFail("a child that ignores TERM returned a result")
         } catch let error as CommandStillRunningError {
             reported = error.command
@@ -152,7 +160,8 @@ final class CommandCancellationTests: XCTestCase {
             XCTAssertTrue(error.localizedDescription.contains("left running"), error.localizedDescription)
         }
         let command = try XCTUnwrap(reported)
-        XCTAssertLessThan(Date().timeIntervalSince(started), 5, "the call waited for the child instead of reporting it")
+        let readyAt = try XCTUnwrap(ready.value, "the deadline never started")
+        XCTAssertLessThan(Date().timeIntervalSince(readyAt), 5, "the call waited for the child instead of reporting it")
         let pid = try recordedPid(pidFile)
         XCTAssertEqual(command.pid, pid)
         XCTAssertTrue(command.isRunning)
