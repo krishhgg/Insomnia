@@ -1,0 +1,18 @@
+# Every action in .github/workflows is pinned by full commit SHA with a
+# version comment. Dependabot opens a pull request when a newer release
+# exists and rewrites both the SHA and the comment. There is no Swift
+# package ecosystem here: Package.swift has no dependencies.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      # Wait 7 days after a release before proposing it, so a release that
+      # is yanked or found compromised in its first week never reaches a PR
+      # (zizmor's dependabot-cooldown audit).
+      default-days: 7
+    commit-message:
+      # Matches the repo's "Area: what changed" subject style.
+      prefix: "CI"
