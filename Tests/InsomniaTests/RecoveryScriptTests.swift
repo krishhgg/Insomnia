@@ -1341,18 +1341,15 @@ final class RecoveryScriptTests: XCTestCase {
     /// process holds it, a set-aside bundle (which a live run may need to
     /// roll back) and every staging directory stay. With the lock, a dead
     /// run's staging directory is removed and a live run's (named by a PID
-    /// that exists, here this test's own) is kept.
+    /// that `$KILL -0` reports alive) is kept.
     func testInstallCleansLeftoversOnlyUnderTheLockAndKeepsALiveRunsStaging() throws {
         try fx.prepareInstall()
         try fx.writePreviousApp()
         try "trusted".write(to: fx.plist, atomically: true, encoding: .utf8)
         try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
-        let finished = Process()
-        finished.executableURL = URL(fileURLWithPath: "/usr/bin/true")
-        try finished.run()
-        finished.waitUntilExit()
-        let dead = ".Insomnia.app.staging.\(finished.processIdentifier).AAAAAA"
-        let live = ".Insomnia.app.staging.\(ProcessInfo.processInfo.processIdentifier).BBBBBB"
+        fx.setMode("kill.fail", "4242")   // the fake kill: 4242 is gone, 4343 is alive
+        let dead = ".Insomnia.app.staging.4242.AAAAAA"
+        let live = ".Insomnia.app.staging.4343.BBBBBB"
         let setAside = ".Insomnia.app.previous"
         for name in [dead, live] {
             try fx.writeBundle(at: fx.appsDir.appendingPathComponent(name).appendingPathComponent("Insomnia.app"), marker: "staged")
@@ -1372,6 +1369,7 @@ final class RecoveryScriptTests: XCTestCase {
 
         XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
         XCTAssertEqual(try fx.contents(of: fx.appsDir), [live, "Insomnia.app"].sorted(), "the dead run's staging is gone, the live run's stays")
+        XCTAssertTrue(fx.calls().contains("kill -0 4242") && fx.calls().contains("kill -0 4343"), "asked through $KILL: \(fx.calls())")
     }
 
     /// The new agent loads but its plist cannot be moved into place (the
@@ -1896,6 +1894,7 @@ private final class ScriptFixture {
             "LAUNCH_AGENTS": home.appendingPathComponent("LaunchAgents").path,
             "SUDOERS": sudoers.path,
             "PGREP": bin.appendingPathComponent("pgrep").path,
+            "KILL": bin.appendingPathComponent("kill").path,
             "OSASCRIPT": bin.appendingPathComponent("osascript").path,
             "LAUNCHCTL": bin.appendingPathComponent("launchctl").path,
             "SUDO": bin.appendingPathComponent("sudo").path,

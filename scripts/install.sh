@@ -25,6 +25,7 @@ QUIT_WAIT_SECONDS=15
 # Fixed tool paths: never taken from PATH. Tests patch these lines in a
 # private copy of the script so no real tool ever runs.
 PGREP=/usr/bin/pgrep
+KILL=/bin/kill
 OSASCRIPT=/usr/bin/osascript
 LAUNCHCTL=/bin/launchctl
 SUDO=/usr/bin/sudo
@@ -224,7 +225,7 @@ for dir in "$APP_DIR"/.Insomnia.app.staging.*; do
   [[ -d "$dir" && "$dir" != "$STAGE" ]] || continue
   owner="${dir##*/.Insomnia.app.staging.}"
   owner="${owner%%.*}"
-  if [[ "$owner" =~ ^[0-9]+$ ]] && kill -0 "$owner" 2>/dev/null; then
+  if [[ "$owner" =~ ^[0-9]+$ ]] && "$KILL" -0 "$owner" 2>/dev/null; then
     continue
   fi
   rm -rf "$dir"
