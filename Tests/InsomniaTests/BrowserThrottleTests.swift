@@ -1,3 +1,4 @@
+import AppKit
 import XCTest
 @testable import Insomnia
 
@@ -262,10 +263,54 @@ final class BrowserThrottleTests: XCTestCase {
 
         let outcome = await throttle.relaunchUnthrottled(bundleId: "com.google.Chrome")
 
-        XCTAssertEqual(outcome, .argumentsUnreadable("pid 42 exited while they were read"))
+        XCTAssertEqual(outcome, .argumentsUnreadable("pid 42 exited while they were read, or could not be checked"))
         XCTAssertEqual(processes.terminated, [])
         XCTAssertEqual(processes.launches.count, 0)
         XCTAssertEqual(processes.processes.filter { $0.bundleId == "com.apple.finder" }.map(\.running), [true])
+    }
+
+    /// A main process whose start time could not be read cannot be tied to
+    /// what `ps` prints for its pid, so its arguments are not read at all
+    /// and nothing is quit; the user is told, as for any unreadable read.
+    @MainActor
+    func testAMainProcessWithoutAStartTimeIsNotReadOrQuit() async {
+        let processes = FakeBrowserProcesses(pids: [42])
+        processes.processes[0].identity = nil
+        let reads = Locked(0)
+        let throttle = BrowserThrottle(readArgs: { [chrome] _ in
+            reads.value += 1
+            return chrome
+        }, processes: processes)
+
+        let outcome = await throttle.relaunchUnthrottled(bundleId: "com.google.Chrome")
+
+        XCTAssertEqual(outcome, .argumentsUnreadable("the start time of pid 42 could not be read to check them"))
+        XCTAssertEqual(reads.value, 0)
+        XCTAssertEqual(processes.terminated, [])
+        XCTAssertEqual(processes.launches.count, 0)
+        XCTAssertEqual(
+            outcome.explanation(browser: "Chrome"),
+            "Could not read Chrome's profile arguments (the start time of pid 42 could not be read to check them), so a relaunch could have opened the wrong profile. Chrome was not quit."
+        )
+    }
+
+    /// The app's check, on whichever app the workspace lists first with a
+    /// readable start time: confirmed only with a start time recorded and
+    /// still matching. Read-only; nothing is signalled, quit or launched.
+    @MainActor
+    func testTheWorkspaceCheckFailsClosedWithoutAStartTime() throws {
+        let found = NSWorkspace.shared.runningApplications.lazy.compactMap { app -> (NSRunningApplication, ProcessIdentity)? in
+            guard !app.isTerminated, case let .present(state) = SignalProcessControl.kernelState(pid: app.processIdentifier) else { return nil }
+            return (app, state.identity)
+        }.first
+        guard let (app, identity) = found else { throw XCTSkip("no running app with a readable start time") }
+        let workspace = WorkspaceBrowserProcesses()
+        let pid = app.processIdentifier
+        let other = ProcessIdentity(startedAt: identity.startedAt - 1, startedAtMicros: 0, bootSession: identity.bootSession)
+
+        XCTAssertTrue(workspace.isRunning(BrowserInstance(pid: pid, process: app, identity: identity)))
+        XCTAssertFalse(workspace.isRunning(BrowserInstance(pid: pid, process: app, identity: nil)), "no start time recorded")
+        XCTAssertFalse(workspace.isRunning(BrowserInstance(pid: pid, process: app, identity: other)), "another process's start time")
     }
 
     /// Another instance exits during the read and its pid goes to another
@@ -329,10 +374,14 @@ final class FakeBrowserProcesses: BrowserProcessControlling {
         let bundleId: String
         let pid: Int32
         fileprivate(set) var running = true
+        /// What the list reports as the kernel start time; nil plays an
+        /// unreadable one.
+        var identity: ProcessIdentity?
 
-        init(bundleId: String, pid: Int32) {
+        init(bundleId: String, pid: Int32, startedAt: Int64) {
             self.bundleId = bundleId
             self.pid = pid
+            identity = ProcessIdentity(startedAt: startedAt, startedAtMicros: 0, bootSession: "fake")
         }
     }
 
@@ -374,12 +423,12 @@ final class FakeBrowserProcesses: BrowserProcessControlling {
     }()
 
     init(pids: [Int32], bundleId: String = "com.google.Chrome") {
-        processes = pids.map { Process(bundleId: bundleId, pid: $0) }
+        processes = pids.enumerated().map { Process(bundleId: bundleId, pid: $1, startedAt: Int64($0)) }
     }
 
     @discardableResult
     func start(bundleId: String = "com.google.Chrome", pid: Int32) -> Process {
-        let process = Process(bundleId: bundleId, pid: pid)
+        let process = Process(bundleId: bundleId, pid: pid, startedAt: Int64(processes.count))
         processes.append(process)
         return process
     }
@@ -390,11 +439,13 @@ final class FakeBrowserProcesses: BrowserProcessControlling {
 
     func runningInstances(bundleId: String) -> [BrowserInstance] {
         processes.filter { $0.bundleId == bundleId && $0.running }
-            .map { BrowserInstance(pid: $0.pid, process: $0, identity: nil) }
+            .map { BrowserInstance(pid: $0.pid, process: $0, identity: $0.identity) }
     }
 
+    /// Fails closed like the app's: no start time, no confirmation.
     func isRunning(_ instance: BrowserInstance) -> Bool {
-        (instance.process as? Process)?.running ?? false
+        guard let process = instance.process as? Process, instance.identity != nil else { return false }
+        return process.running && process.identity == instance.identity
     }
 
     func terminateAndWait(_ instances: [BrowserInstance], timeout: TimeInterval) async -> Bool {

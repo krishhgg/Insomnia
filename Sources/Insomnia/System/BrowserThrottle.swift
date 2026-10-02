@@ -159,7 +159,8 @@ struct BrowserInstance {
     let process: AnyObject
     /// The kernel's start time for `pid` when the list was read, which a
     /// later process given the same pid cannot share; nil when it could
-    /// not be read.
+    /// not be read, and then nothing read by pid can be tied to this
+    /// process.
     let identity: ProcessIdentity?
 }
 
@@ -171,7 +172,8 @@ protocol BrowserProcessControlling: AnyObject {
     /// Every running application with this bundle id.
     func runningInstances(bundleId: String) -> [BrowserInstance]
     /// Whether `instance` is still the process the list showed: it has not
-    /// exited, and its pid has not gone to a later process.
+    /// exited, and its pid has not gone to a later process. False when
+    /// that cannot be confirmed.
     func isRunning(_ instance: BrowserInstance) -> Bool
     /// Ask each instance to quit and wait: true once all have quit, false
     /// when `timeout` passes first.
@@ -201,10 +203,11 @@ final class WorkspaceBrowserProcesses: BrowserProcessControlling {
     /// `isTerminated` changes when the workspace's notification arrives,
     /// which can trail the exit; the kernel's start time for the pid says
     /// at once whether it is still this process. Without a recorded start
-    /// time, `isTerminated` is all there is.
+    /// time, or with one that cannot be read now, nothing confirms it, so
+    /// the answer is no.
     func isRunning(_ instance: BrowserInstance) -> Bool {
-        guard let application = instance.process as? NSRunningApplication, !application.isTerminated else { return false }
-        guard let identity = instance.identity else { return true }
+        guard let application = instance.process as? NSRunningApplication, !application.isTerminated,
+              let identity = instance.identity else { return false }
         return Self.identity(of: instance.pid) == identity
     }
 
@@ -350,16 +353,18 @@ final class BrowserThrottle {
     /// exit, and only then launch it with both flags and the profile
     /// arguments it had. The arguments are read first: a browser whose
     /// arguments cannot be read is not quit, since a relaunch without them
-    /// could open another profile. `ps` is given a pid, so a main process
-    /// that exits during the read counts as unreadable too: the pid may
-    /// have named another process by then. The quit goes to the instances
-    /// the list returned, not to their pids. After the wait the running
-    /// list is read again, and an instance still there (the waiter timed
-    /// out, or one appeared meanwhile) means nothing is launched. `open`
-    /// returning 0 is not the end either: the running list is polled for
-    /// up to `startTimeout`, and a browser that has not appeared by then is
-    /// reported, so the user is not left without a browser and without a
-    /// word.
+    /// could open another profile. `ps` is given a pid, so the read counts
+    /// only if the kernel's start time for that pid was read before it and
+    /// matches after it; a main process that exits during the read, or
+    /// whose start time cannot be read, counts as unreadable too, since
+    /// the pid may have named another process. The quit goes to the
+    /// instances the list returned, not to their pids. After the wait the
+    /// running list is read again, and an instance still there (the waiter
+    /// timed out, or one appeared meanwhile) means nothing is launched.
+    /// `open` returning 0 is not the end either: the running list is
+    /// polled for up to `startTimeout`, and a browser that has not appeared
+    /// by then is reported, so the user is not left without a browser and
+    /// without a word.
     func relaunchUnthrottled(bundleId: String) async -> RelaunchOutcome {
         let instances = processes.runningInstances(bundleId: bundleId)
         guard let main = instances.first else {
@@ -368,12 +373,15 @@ final class BrowserThrottle {
         }
         let extra: [String]
         do {
+            guard main.identity != nil else {
+                throw BrowserProcessError(detail: "the start time of pid \(main.pid) could not be read to check them")
+            }
             let args = try await readArgs(main.pid)
             guard !args.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 throw BrowserProcessError(detail: "ps printed nothing for pid \(main.pid)")
             }
             guard processes.isRunning(main) else {
-                throw BrowserProcessError(detail: "pid \(main.pid) exited while they were read")
+                throw BrowserProcessError(detail: "pid \(main.pid) exited while they were read, or could not be checked")
             }
             extra = ChromiumFlags.preservedArgs(args: args)
         } catch {

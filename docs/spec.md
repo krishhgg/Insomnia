@@ -250,12 +250,14 @@ last held while it was on was the battery or thermal floor, not the lid.
     output) stop the relaunch before anything is quit. So does a main
     process that exits during the read, checked by `NSRunningApplication`
     and by the kernel's start time for the pid, since `ps` reads by pid and
-    the pid may have gone to another process. The quit goes to the
-    `NSRunningApplication` objects found before the read, never to a fresh
-    lookup of their pids. After the quit request Insomnia waits up to 10 s,
-    then reads the running list again: any instance still there means
-    nothing is launched, and the notification says the browser may still
-    quit later and then has to be opened by hand.
+    the pid may have gone to another process. A start time that cannot be
+    read counts the same way: nothing confirms the pid is still the
+    browser, so the arguments are not read and nothing is quit. The quit
+    goes to the `NSRunningApplication` objects found before the read, never
+    to a fresh lookup of their pids. After the quit request Insomnia waits up
+    to 10 s, then reads the running list again: any instance still there
+    means nothing is launched, and the notification says the browser may
+    still quit later and then has to be opened by hand.
     After `open` returns 0 the running list is polled for up to 5 s; a
     browser not running by then is reported too. A session that ends during
     that wait cancels it at once and nothing is reported, since the user
