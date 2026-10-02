@@ -620,7 +620,9 @@ fi
 
 # 7. Done --------------------------------------------------------------------
 step "Installed"
-if [[ -f "$ROOT/scripts/uninstall.sh" ]]; then UNINSTALL="$ROOT/scripts/uninstall.sh"; else UNINSTALL="$SCRIPT_DIR/uninstall.sh"; fi
+# The uninstaller shipped beside this script: scripts/ in a checkout, the
+# zip's top level in a release (which may be unpacked inside a checkout).
+UNINSTALL="$SCRIPT_DIR/uninstall.sh"
 cat <<NEXT
 Next steps:
   1. Launch:            open "$APP"

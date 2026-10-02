@@ -1282,6 +1282,24 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: copy), "the private copy is removed at exit")
     }
 
+    /// A release zip unpacked inside a source checkout: the uninstaller the
+    /// installer names is the one beside it, not the checkout's.
+    func testInstallFromAZipInsideACheckoutNamesTheUninstallerBesideIt() throws {
+        try fx.prepareInstall()
+        let prebuilt = try fx.writePrebuiltApp()
+        fx.setMode("launchctl", "loaded")
+        let unpacked = fx.repoScripts.deletingLastPathComponent().appendingPathComponent("Insomnia-0.1.0-macos", isDirectory: true)
+        try FileManager.default.createDirectory(at: unpacked, withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: fx.installRedirected, to: unpacked.appendingPathComponent("install.sh"))
+        try "# the zip's uninstaller\n".write(to: unpacked.appendingPathComponent("uninstall.sh"), atomically: true, encoding: .utf8)
+        XCTAssertTrue(fx.exists(fx.repoScripts.appendingPathComponent("uninstall.sh")), "the checkout around it has one too")
+
+        let r = try fx.run(unpacked.appendingPathComponent("install.sh"), ["--allow-unverified-origin", "--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertTrue(r.stdout.contains("Uninstall:         \(unpacked.path)/uninstall.sh"), r.stdout)
+    }
+
     /// Integrity is not origin: an ad-hoc bundle, or a Developer ID bundle
     /// while EXPECTED_TEAM_ID is empty, passes every check on it and could
     /// still have been made by anyone. Without --allow-unverified-origin
