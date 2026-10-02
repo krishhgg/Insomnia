@@ -321,7 +321,10 @@ From your checkout:
 
 The uninstaller requests cleanup before removing the app, agent, and sudoers
 rule. If recovery is incomplete or the app refuses to quit, it stops; resolve
-the reported problem and retry. Purge removes owned files, not arbitrary
+the reported problem and retry. With the app it removes what an interrupted
+install left beside it: `~/Applications/.Insomnia.app.previous`, and
+`.Insomnia.app.staging.*` directories of installs that are no longer running.
+Nothing else in `~/Applications` is touched. Purge removes owned files, not arbitrary
 directory contents. A small shared lock file is retained to keep concurrent
 recovery operations coordinated.
 

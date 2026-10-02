@@ -252,10 +252,10 @@ last held while it was on was the battery or thermal floor, not the lid.
   shell-quoted `defaults delete` command for it, and continues. The summary
   says how many apps were checked; an app whose key cannot be read is
   reported, not counted. Each read has a 30 s limit, like every other call
-  uninstall makes under the recovery lock (`pgrep`, `launchctl`); a read
-  that does not answer ends the check with the command to run by hand, and
-  uninstall goes on. A call past its limit gets SIGTERM, then SIGKILL, and
-  never holds the lock.
+  uninstall makes under the recovery lock (`pgrep`, `launchctl`,
+  `codesign`); a read that does not answer ends the check with the command
+  to run by hand, and uninstall goes on. A call past its limit gets SIGTERM,
+  then SIGKILL, and never holds the lock.
 - Browser throttling: Chromium browsers throttle windows macOS reports as
   occluded, which is every window once the lid is closed with no external
   display. Timers drop to 1 Hz, animation frames stop, pages report hidden.
@@ -411,7 +411,15 @@ Backstop, independent of the app:
   app's path, and removes staging directories whose owning install is gone
   (matched by the exact name install.sh gives them). uninstall.sh runs the
   bundle's sealed backstop.sh only after `codesign --verify --strict`
-  passes on the bundle.
+  passes on the bundle (a bounded call, like its other calls under the
+  lock). Once recovery is confirmed and print confirms the agent unloaded,
+  it removes the bundle and install.sh's leftovers beside it, by their exact
+  names: `.Insomnia.app.previous`, and `.Insomnia.app.staging.<pid>.<six
+  letters and digits>` directories whose run `kill -0` reports gone (a live
+  run's stays). Symlinks and other names are left. With the agent plist go
+  the candidate plists install.sh and the app stage it from
+  (`com.insomnia.backstop.candidate-*` in `.com.insomnia.backstop.staging`
+  and, from older builds, in the LaunchAgents directory).
 - App and script transactions must coordinate through a shared lock. Failure
   to acquire it must not permit an unprotected journal write or side effect.
 - Successful restores may clear their entries; failures must stay journaled.

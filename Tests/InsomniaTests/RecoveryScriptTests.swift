@@ -928,6 +928,101 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(r.stdout.contains("Kept \(fx.home.appendingPathComponent("Logs").path)"), r.stdout)
     }
 
+    /// What install.sh leaves beside the bundle goes with it: the previous
+    /// bundle an interrupted upgrade set aside and the staging directories
+    /// of runs that are gone, matched by the exact names install.sh gives
+    /// them. A staging directory whose run `$KILL -0` reports alive stays,
+    /// and so does every other name, symlink and symlink target. The
+    /// candidate plists install.sh and the app stage the agent in go with
+    /// the agent plist, and only those.
+    func testUninstallRemovesTheInstallersLeftoversByTheirExactNames() throws {
+        try fx.installMachinery()
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        let leftovers = try writeInstallerLeftovers()
+        fx.setMode("kill.fail", "4242")   // the fake kill: 4242 is gone, 4343 is alive
+
+        let r = try fx.run(fx.uninstall)
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertFalse(fx.exists(fx.app))
+        XCTAssertEqual(try fx.contents(of: fx.appsDir), leftovers.keptInApps, "only install.sh's own leftovers are removed")
+        XCTAssertTrue(fx.exists(leftovers.linkTarget.appendingPathComponent("Insomnia.app/Contents/MacOS/Insomnia")), "a symlink's target is never touched")
+        XCTAssertTrue(fx.calls().contains("kill -0 4242") && fx.calls().contains("kill -0 4343"), "asked through $KILL: \(fx.calls())")
+        XCTAssertTrue(r.stdout.contains("kept \(fx.appsDir.path)/.Insomnia.app.staging.4343.BBBBBB"), r.stdout)
+        let launchAgents = fx.plist.deletingLastPathComponent()
+        XCTAssertEqual(try fx.contents(of: launchAgents), [".com.insomnia.backstop.staging", "com.other.agent.plist"])
+        XCTAssertEqual(try fx.contents(of: launchAgents.appendingPathComponent(".com.insomnia.backstop.staging")), ["notes.txt"], "a file that is not a candidate stays, and so does its directory")
+
+        // With no foreign file left, the staging directory itself goes.
+        try FileManager.default.removeItem(at: launchAgents.appendingPathComponent(".com.insomnia.backstop.staging/notes.txt"))
+        try fx.installMachinery()
+        try "<plist/>".write(to: launchAgents.appendingPathComponent(".com.insomnia.backstop.staging/com.insomnia.backstop.candidate-77.plist"), atomically: true, encoding: .utf8)
+        let again = try fx.run(fx.uninstall)
+        XCTAssertEqual(again.status, 0, again.stderr + again.stdout)
+        XCTAssertEqual(try fx.contents(of: launchAgents), ["com.other.agent.plist"])
+    }
+
+    /// The leftovers go only after recovery is confirmed and the agent is
+    /// unloaded, like the bundle: an uninstall that stops for an unresolved
+    /// journal or a job launchd still lists leaves every one of them.
+    func testUninstallKeepsTheInstallersLeftoversWhenItStopsBeforeRemoving() throws {
+        for stop in ["recovery fails", "agent still loaded"] {
+            fx.destroy()
+            fx = try ScriptFixture()
+            try fx.installMachinery()
+            try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+            let leftovers = try writeInstallerLeftovers()
+            fx.setMode("kill.fail", "4242 4343")   // every staging run is gone
+            if stop == "recovery fails" {
+                fx.setMode("sudo", "fail")
+            } else {
+                fx.setMode("launchctl", "bootout-fails-still-loaded")
+            }
+            let launchAgents = fx.plist.deletingLastPathComponent()
+            let before = try fx.contents(of: launchAgents)
+            let staged = try fx.contents(of: launchAgents.appendingPathComponent(".com.insomnia.backstop.staging"))
+
+            let r = try fx.run(fx.uninstall)
+
+            XCTAssertEqual(r.status, 1, "\(stop): \(r.stderr + r.stdout)")
+            XCTAssertEqual(try fx.contents(of: fx.appsDir), (leftovers.removable + leftovers.keptInApps + ["Insomnia.app"]).sorted(), stop)
+            XCTAssertEqual(try fx.contents(of: launchAgents), before, stop)
+            XCTAssertEqual(try fx.contents(of: launchAgents.appendingPathComponent(".com.insomnia.backstop.staging")), staged, stop)
+            XCTAssertFalse(fx.calls().contains { $0.hasPrefix("kill ") }, "\(stop): \(fx.calls())")
+        }
+    }
+
+    /// Beside the installed bundle: what install.sh can leave (the
+    /// set-aside previous bundle, a dead and a live run's staging
+    /// directory) and names it must not touch. In the LaunchAgents
+    /// directory: candidate plists of install.sh, of the app and of older
+    /// builds, plus another agent's plist and a stray file.
+    private func writeInstallerLeftovers() throws -> (removable: [String], keptInApps: [String], linkTarget: URL) {
+        let removable = [".Insomnia.app.previous", ".Insomnia.app.staging.4242.AAAAAA"]
+        let live = ".Insomnia.app.staging.4343.BBBBBB"
+        let unlike = [".Insomnia.app.staging.4242", ".Insomnia.app.staging.4242.AAAAAA.old", ".Insomnia.app.staging.x4242.AAAAAA",
+                      ".Insomnia.app.previous.old", "Other.app", ".Other.app.previous"]
+        let link = ".Insomnia.app.staging.4242.CCCCCC"
+        for name in removable + [live] + unlike {
+            try fx.writeBundle(at: fx.appsDir.appendingPathComponent(name).appendingPathComponent("Insomnia.app"), marker: "left")
+        }
+        let elsewhere = fx.root.appendingPathComponent("elsewhere", isDirectory: true)
+        try fx.writeBundle(at: elsewhere.appendingPathComponent("Insomnia.app"), marker: "not the installer's")
+        try FileManager.default.createSymbolicLink(at: fx.appsDir.appendingPathComponent(link), withDestinationURL: elsewhere)
+
+        let launchAgents = fx.plist.deletingLastPathComponent()
+        let staging = launchAgents.appendingPathComponent(".com.insomnia.backstop.staging", isDirectory: true)
+        try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
+        for url in [staging.appendingPathComponent("com.insomnia.backstop.candidate-4242.plist"),
+                    staging.appendingPathComponent("com.insomnia.backstop.candidate-0F2C9A54-1B7E-4D7A-9C11-5E3B2A7D9F00.plist"),
+                    launchAgents.appendingPathComponent("com.insomnia.backstop.candidate-0F2C9A54-1B7E-4D7A-9C11-5E3B2A7D9F01"),
+                    staging.appendingPathComponent("notes.txt"),
+                    launchAgents.appendingPathComponent("com.other.agent.plist")] {
+            try "<plist/>".write(to: url, atomically: true, encoding: .utf8)
+        }
+        return (removable, ([live, link] + unlike).sorted(), elsewhere)
+    }
+
     // MARK: - Which backstop uninstall.sh runs
 
     /// Newest first: the checkout's script (every test above), else the copy
@@ -2663,6 +2758,7 @@ private final class ScriptFixture {
             "SUDO": bin.appendingPathComponent("sudo").path,
             "CODESIGN": bin.appendingPathComponent("codesign").path,
             "DEFAULTS": bin.appendingPathComponent("defaults").path,
+            "KILL": bin.appendingPathComponent("kill").path,
             "APP": app.path,
             "SUDOERS": sudoers.path,
             "LOCK_TIMEOUT_SECONDS": "1",

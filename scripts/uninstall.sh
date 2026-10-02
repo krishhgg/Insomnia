@@ -15,7 +15,10 @@
 #
 # Deletion is by exact owned file, never by directory tree: --purge removes
 # the files Insomnia writes (see Paths.swift) and then rmdir's its own
-# directories only if they are empty. The lock file is never unlinked, so
+# directories only if they are empty. The bundle trees removed are the
+# installed app and install.sh's own leftovers beside it, matched by the
+# exact names install.sh gives them, and the agent plist goes with the
+# candidate plists install.sh and the app stage it from. The lock file is never unlinked, so
 # --purge leaves APP_SUPPORT/.recovery.lock (and therefore APP_SUPPORT).
 #
 # Honours INSOMNIA_HOME with the same layout as the app (see Paths.swift).
@@ -42,6 +45,7 @@ PLUTIL=/usr/bin/plutil
 CODESIGN=/usr/bin/codesign
 LOCKF=/usr/bin/lockf
 DEFAULTS=/usr/bin/defaults
+KILL=/bin/kill
 LOCK_TIMEOUT_SECONDS=10
 # How long to wait for the app to exit after asking it to quit.
 QUIT_WAIT_SECONDS=10
@@ -512,6 +516,16 @@ if (( print_rc != 113 )); then
   exit 1
 fi
 rm -f "$PLIST"
+# Candidate plists install.sh and the app write before a load and rename
+# into place after it: in the staging directory beside the plist, and in
+# $LAUNCH_AGENTS itself for older builds. Only files with the label's
+# candidate prefix, the same ones both of them sweep; the staging directory
+# goes only once empty.
+CANDIDATE_DIR="$LAUNCH_AGENTS/.$LABEL.staging"
+for candidate in "$CANDIDATE_DIR/$LABEL.candidate-"* "$LAUNCH_AGENTS/$LABEL.candidate-"*; do
+  if [[ -f "$candidate" && ! -L "$candidate" ]]; then rm -f "$candidate"; fi
+done
+if [[ -d "$CANDIDATE_DIR" && ! -L "$CANDIDATE_DIR" ]]; then rmdir "$CANDIDATE_DIR" 2>/dev/null || true; fi
 
 step "Removing $SUDOERS (requires your password)"
 if [[ -e "$SUDOERS" ]] || "$SUDO" test -e "$SUDOERS"; then
@@ -520,6 +534,32 @@ fi
 
 step "Removing app bundle"
 rm -rf "$APP"
+# install.sh's leftovers beside the bundle, by the exact names it gives them.
+# An upgrade sets the previous bundle aside at .Insomnia.app.previous during
+# its swap and assembles the new one in .Insomnia.app.staging.<pid>.<six
+# letters and digits> (mktemp). The swap runs under the recovery lock, which
+# this script holds, so a set-aside bundle belongs to a run that was stopped.
+# A staging directory whose run is still alive belongs to an install that
+# has not reached the lock yet, and stays. kill -0 only asks whether the
+# process exists; it sends no signal. Symlinks and any other name are left.
+APP_DIR="$(dirname "$APP")"
+PREVIOUS_APP="$APP_DIR/.Insomnia.app.previous"
+if [[ -d "$PREVIOUS_APP" && ! -L "$PREVIOUS_APP" ]]; then
+  rm -rf "$PREVIOUS_APP"
+  echo "removed $PREVIOUS_APP, the previous bundle an interrupted install set aside"
+fi
+staging_re='^\.Insomnia\.app\.staging\.([0-9]+)\.[A-Za-z0-9]{6}$'
+for dir in "$APP_DIR"/.Insomnia.app.staging.*; do
+  [[ -d "$dir" && ! -L "$dir" ]] || continue
+  [[ "${dir##*/}" =~ $staging_re ]] || continue
+  owner="${BASH_REMATCH[1]}"
+  if "$KILL" -0 "$owner" 2>/dev/null; then
+    echo "kept $dir: the install.sh run that made it (pid $owner) is still running"
+    continue
+  fi
+  rm -rf "$dir"
+  echo "removed $dir, left by an install.sh run that is gone"
+done
 
 # $APP_SUPPORT/backstop.sh below is the writable copy of older installs; the
 # current one went with the bundle.
