@@ -28,8 +28,11 @@ final class LidActionsTests: XCTestCase {
         h.home.destroy()
     }
 
+    /// `dockerRule` nil keeps the shipped default (off); the tests here opt
+    /// in so the Docker tree (400, 401) is part of the close.
     private func make(
         dockerIdle: @escaping @Sendable () async throws -> Bool = { true },
+        dockerRule: Bool? = true,
         mute: Bool = true,
         sampler: BrightnessSampler? = nil,
         reassertDelay: Duration = .seconds(3600)
@@ -37,6 +40,7 @@ final class LidActionsTests: XCTestCase {
         let m = h.makeManager(reassertDelay: reassertDelay)
         m.config.muteOnLidClose = mute
         m.config.freezeList = ["com.tinyspeck.slackmacgap"]
+        if let dockerRule { m.config.dockerRule = dockerRule }
         let docker = DockerRule(freezer: freezer, probe: dockerIdle)
         let actions = LidActions(manager: m, freezer: freezer, docker: docker, audio: h.audio, display: h.display, keyboard: h.keyboard, sampler: sampler)
         return (m, actions)
@@ -1091,6 +1095,127 @@ final class LidActionsTests: XCTestCase {
 
         XCTAssertEqual(h.procs.suspended, [[100, 101, 102]])
         XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
+    }
+
+    /// A fresh config leaves Docker alone: the rule is opt in. The probe
+    /// never runs.
+    func testDockerRuleIsOffByDefault() async throws {
+        let probes = Locked(0)
+        let (m, actions) = await make(dockerIdle: { probes.value += 1; return true }, dockerRule: nil)
+        XCTAssertFalse(m.config.dockerRule)
+        await m.start(duration: 3600)
+        await actions.onClose()
+        XCTAssertEqual(h.procs.suspended, [[100, 101, 102]])
+        XCTAssertEqual(probes.value, 0, "docker ps ran with the rule off")
+        XCTAssertFalse(try XCTUnwrap(try h.store.loadState()).dockerFrozen)
+    }
+
+    // MARK: Second idle check
+
+    /// A probe that answers from a script, one entry per call, and records
+    /// what it saw on disk at each call.
+    private func scriptedProbe(_ answers: [Result<Bool, Error>], seen: Locked<[[Int32]]>? = nil) -> @Sendable () async throws -> Bool {
+        let calls = Locked(0)
+        let store = h.store
+        return {
+            let i = calls.value
+            calls.value = i + 1
+            if let seen {
+                let s = (try? store.loadState()) ?? nil
+                seen.value.append(s?.frozenPids ?? [])
+            }
+            return try answers[min(i, answers.count - 1)].get()
+        }
+    }
+
+    /// The first probe says idle, the second (right before the SIGSTOP)
+    /// finds a container: Docker is left running, its journal entries go
+    /// away again, and the log says why.
+    func testSecondIdleCheckBusyLeavesDockerAloneAndCleansTheJournal() async throws {
+        let (m, actions) = await make(dockerIdle: scriptedProbe([.success(true), .success(false)]))
+        await m.start(duration: 3600)
+
+        await actions.onClose()
+
+        XCTAssertEqual(h.procs.suspended, [[100, 101, 102]], "Docker was stopped although the second check was busy")
+        let s = try XCTUnwrap(try h.store.loadState())
+        XCTAssertEqual(s.frozenPids, [100, 101, 102])
+        XCTAssertFalse(s.dockerFrozen)
+        XCTAssertEqual(m.state, s)
+        let log = logText()
+        XCTAssertTrue(log.contains("second check found containers running, Docker left alone"), log)
+        XCTAssertTrue(log.contains("Docker left running: the check before the signal said no"), log)
+
+        await actions.onOpen()
+        XCTAssertEqual(h.procs.resumed, [[100, 101, 102]])
+        XCTAssertEqual(try h.store.loadState()?.frozenProcesses, [])
+    }
+
+    /// The second probe fails (here: times out). Same outcome as busy.
+    func testSecondIdleCheckFailureLeavesDockerAlone() async throws {
+        let timeout = ShellTimeoutError.timedOut(exe: "docker", seconds: 5)
+        let (m, actions) = await make(dockerIdle: scriptedProbe([.success(true), .failure(timeout)]))
+        await m.start(duration: 3600)
+
+        await actions.onClose()
+
+        XCTAssertEqual(h.procs.suspended, [[100, 101, 102]])
+        let s = try XCTUnwrap(try h.store.loadState())
+        XCTAssertEqual(s.frozenPids, [100, 101, 102])
+        XCTAssertFalse(s.dockerFrozen)
+        let log = logText()
+        XCTAssertTrue(log.contains("second check failed, Docker left alone"), log)
+        XCTAssertTrue(log.contains(timeout.localizedDescription), "the reason must be logged: \(log)")
+    }
+
+    /// Order on close: the first probe, then the journal write for Docker,
+    /// then the second probe, then the SIGSTOP. The second probe sees the
+    /// Docker entries already on disk; nothing else runs between it and
+    /// the signal.
+    func testSecondIdleCheckRunsAfterTheJournalWriteAndRightBeforeTheSignal() async throws {
+        let events = Locked<[String]>([])
+        let seen = Locked<[[Int32]]>([])
+        let probe = scriptedProbe([.success(true), .success(true)], seen: seen)
+        let (m, actions) = await make(dockerIdle: {
+            events.value.append("probe")
+            return try await probe()
+        })
+        await m.start(duration: 3600)
+        h.procs.onSuspend = { pids in events.value.append("suspend \(pids)") }
+
+        await actions.onClose()
+
+        XCTAssertEqual(events.value, ["suspend [100, 101, 102]", "probe", "probe", "suspend [400, 401]"])
+        XCTAssertEqual(seen.value, [[100, 101, 102], [100, 101, 102, 400, 401]], "the second probe must run after Docker's journal write")
+        let s = try XCTUnwrap(try h.store.loadState())
+        XCTAssertEqual(s.frozenPids, [100, 101, 102, 400, 401])
+        XCTAssertTrue(s.dockerFrozen)
+    }
+
+    /// An end requested while the second probe is running wins, as it does
+    /// for the first one: Docker is not frozen and the end finds nothing
+    /// of it in the journal.
+    func testSessionEndWhileTheSecondCheckIsSuspendedNeverFreezesDocker() async throws {
+        let gate = AsyncGate()
+        let calls = Locked(0)
+        let (m, actions) = await make(dockerIdle: {
+            calls.value += 1
+            if calls.value == 2 { await gate.wait() }
+            return true
+        })
+        await m.start(duration: 3600)
+        let close = Task { await actions.onClose() }
+        await gate.waitUntilStarted()
+
+        let end = Task { await m.end(reason: .user) }
+        await settleQueuedRequests()
+        await gate.open()
+        await close.value
+        _ = await end.value
+
+        XCTAssertEqual(h.procs.suspended, [[100, 101, 102]])
+        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
+        XCTAssertTrue(logText().contains("session ending during the second check"), logText())
     }
 
     func testAudioReadFailureSkipsMuteButStillFreezes() async throws {

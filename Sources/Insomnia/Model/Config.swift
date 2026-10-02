@@ -18,7 +18,11 @@ struct Config: Codable, Equatable, Sendable {
     /// app, Docker Desktop or built-in protected (`FreezePlanner.builtInProtected`).
     /// Off: the freeze list only.
     var freezeAllApps: Bool = true
-    var dockerRule: Bool = true
+    /// SIGSTOP Docker Desktop on lid close when `docker ps` finds no running
+    /// container, checked once more right before the signal. Off by default
+    /// (and for a config.json without the key): a container that starts
+    /// between the last check and the signal is frozen with Desktop.
+    var dockerRule: Bool = false
     var muteOnLidClose: Bool = false
     /// Save the display brightness and keyboard backlight, set both to zero
     /// on lid close and restore them on lid open. With sleep disabled macOS

@@ -111,7 +111,7 @@ Quit, or reconcile.
 | Display (optional, default on) | save brightness, set it to 0, request display sleep (best effort) | wake the display, restore the saved brightness |
 | Keyboard backlight (optional, same toggle) | save brightness, set it to 0 | restore the saved brightness |
 | Freeze scope | `SIGSTOP` every process whose responsible app is in the freeze scope (rules below) | `SIGCONT` the recorded pids only |
-| Docker rule | if Docker Desktop is running and `docker ps -q` is empty, freeze it | resume |
+| Docker rule (default off) | if Docker Desktop is running and `docker ps -q` is empty, journal its tree, ask `docker ps -q` once more right before the SIGSTOP and freeze it only on a second clean empty answer; busy, a failed probe or a timeout at either point leaves it running | resume |
 | Mute (optional) | save volume and mute state, then mute | restore both exactly |
 | Low Power Mode | on (optional, default on) | off unless a battery or thermal floor still wants it |
 | Countdown redraw | stop timer | restart timer |
@@ -561,7 +561,9 @@ that any case passed; record results in the release validation record.
    every session at login. Saved audio requires the app to reopen.
 5. **Freeze.** Slack and WhatsApp on list, close lid, `ps -o stat` shows `T`
    for their whole trees. Open lid → running, reconnected, no relaunch.
-6. **Docker rule.** No containers → paused on close. One container → untouched.
+6. **Docker rule.** Rule on. No containers → paused on close. One container →
+   untouched. A container started between the two checks (`docker ps` is
+   logged twice) → untouched, log names the second check.
 7. **Mute.** Volume 60%, close lid → muted. Open → 60%, unmuted.
 8. **Chrome occlusion.** Lid closed, Playwright attached to headed Chrome:
    read `document.visibilityState` and measure `setInterval` drift. Repeat with

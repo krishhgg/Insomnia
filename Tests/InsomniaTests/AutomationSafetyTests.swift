@@ -533,6 +533,37 @@ final class TmuxTargetResolutionTests: XCTestCase {
     }
 }
 
+// MARK: - DockerRule second check
+
+final class DockerRuleSecondCheckTests: XCTestCase {
+    private func rule(_ probe: @escaping DockerRule.ContainerProbe) -> DockerRule {
+        DockerRule(freezer: FakeFreezer(apps: [], processes: [], control: FakeProcessControl()), probe: probe)
+    }
+
+    /// Only a clean idle answer lets the SIGSTOP go ahead. Busy, a failed
+    /// `docker ps` and a timeout all say no.
+    func testOnlyACleanIdleAnswerIsStillIdle() async {
+        let idle = await rule { true }.isStillIdle()
+        XCTAssertTrue(idle)
+        let busy = await rule { false }.isStillIdle()
+        XCTAssertFalse(busy)
+        let failed = await rule { throw SleepGuardError(command: "docker ps -q", status: 1, stderr: "Cannot connect") }.isStillIdle()
+        XCTAssertFalse(failed)
+        let timedOut = await rule { throw ShellTimeoutError.timedOut(exe: "docker", seconds: 5) }.isStillIdle()
+        XCTAssertFalse(timedOut)
+    }
+
+    /// The rule off: no group, and the probe never runs.
+    func testRuleOffNeverProbes() async {
+        let probes = Locked(0)
+        var config = Config()
+        config.dockerRule = false
+        let group = await rule { probes.value += 1; return true }.idleDockerGroup(config: config)
+        XCTAssertNil(group)
+        XCTAssertEqual(probes.value, 0)
+    }
+}
+
 // MARK: - DockerRule endpoint binding
 
 final class DockerRuleEndpointTests: XCTestCase {

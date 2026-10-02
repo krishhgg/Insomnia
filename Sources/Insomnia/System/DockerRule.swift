@@ -7,9 +7,12 @@ import Foundation
 /// The rule only *decides*; `LidActions` journals `dockerFrozen` and the
 /// pids before the group is actually stopped.
 ///
-/// The idle answer is a snapshot. A container that starts between
-/// `docker ps` and the SIGSTOP is frozen along with Desktop; nothing in
-/// this process can close that window.
+/// The idle answer is a snapshot, so `LidActions` asks twice: once to pick
+/// Docker up (`idleDockerGroup`) and once more right before the SIGSTOP
+/// (`isStillIdle`), after the journal write, with only the per-pid kernel
+/// lookups left between the answer and the signal. A container that starts
+/// inside that last window is still frozen along with Desktop; nothing in
+/// this process can close it, which is why the rule is off by default.
 struct DockerRule: Sendable {
     static let bundleId = FreezePlanner.dockerBundleId
     static let timeout: TimeInterval = 5
@@ -59,6 +62,20 @@ struct DockerRule: Sendable {
         } catch {
             Log.error("docker rule: probe failed, Docker left alone: \(error.localizedDescription)")
             return nil
+        }
+    }
+
+    /// The second check. True only when the probe answers idle again; busy,
+    /// a failed probe and a timeout all return false, each with its own log
+    /// line, and the caller leaves Docker alone.
+    func isStillIdle() async -> Bool {
+        do {
+            let idle = try await probe()
+            if !idle { Log.info("docker rule: second check found containers running, Docker left alone") }
+            return idle
+        } catch {
+            Log.error("docker rule: second check failed, Docker left alone: \(error.localizedDescription)")
+            return false
         }
     }
 
