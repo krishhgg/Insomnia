@@ -284,7 +284,10 @@ final class ReconcileTests: XCTestCase {
         for _ in 0..<1000 where !real.notifier.posts.contains(where: { $0.title == "Session ended" }) {
             try await Task.sleep(for: .milliseconds(10))
         }
-        XCTAssertGreaterThanOrEqual(Date(), endsAt, "the session ended before its deadline")
+        // When the restore was called, not when this loop noticed it: a poll
+        // that resumes late would hide an end that came early.
+        let restoredAt = try XCTUnwrap(real.guardFake.restoreCalledAt, "the end never restored sleep")
+        XCTAssertGreaterThanOrEqual(restoredAt, endsAt, "the session ended before its deadline")
         XCTAssertEqual(real.notifier.posts.last?.body, "Time is up. Sleep is back to normal.")
         XCTAssertFalse(m.isActive)
         XCTAssertNil(try real.store.loadSession())

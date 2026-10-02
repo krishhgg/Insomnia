@@ -71,8 +71,7 @@ final class RecoverySafetyTests: XCTestCase {
 
         let reconcile = Task { await m.reconcile() }
         await gate.waitUntilStarted()
-        let start = Task { await m.start(duration: 3600) }
-        await settleQueuedRequests()
+        let start = await runUntilSuspended { await m.start(duration: 3600) }
         await gate.open()
         await reconcile.value
         await start.value
@@ -93,8 +92,7 @@ final class RecoverySafetyTests: XCTestCase {
 
         let lowPower = Task { await m.setLowPower(true) }
         await gate.waitUntilStarted()
-        let end = Task { await m.end(reason: .user) }
-        await settleQueuedRequests()
+        let end = await runUntilSuspended { await m.end(reason: .user) }
         await gate.open()
         let changed = await lowPower.value
         _ = await end.value
@@ -115,8 +113,7 @@ final class RecoverySafetyTests: XCTestCase {
 
         let start = Task { await m.start(duration: 3600) }
         await gate.waitUntilStarted()
-        let end = Task { await m.end(reason: .user) }
-        await settleQueuedRequests()
+        let end = await runUntilSuspended { await m.end(reason: .user) }
         await gate.open()
         await start.value
         _ = await end.value
@@ -138,8 +135,7 @@ final class RecoverySafetyTests: XCTestCase {
 
         let extend = Task { await m.extend(by: 3600) }
         await gate.waitUntilStarted()
-        let end = Task { await m.end(reason: .user) }
-        await settleQueuedRequests()
+        let end = await runUntilSuspended { await m.end(reason: .user) }
         await gate.open()
         await extend.value
         _ = await end.value
@@ -163,9 +159,16 @@ final class RecoverySafetyTests: XCTestCase {
 
         let reconcile = Task { await m.reconcile() }
         await gate.waitUntilStarted()
+        let held = try XCTUnwrap(m.session)
         h.clock.advance(120)
-        let end = Task { await m.end(reason: .timer) }
-        await settleQueuedRequests()
+        let ticket = m.endTicket
+        let end = await runUntilSuspended { await m.end(reason: .timer) }
+        XCTAssertEqual(m.endTicket, ticket + 1, "the end was not requested while reconcile held pmset")
+        // performEnd clears the session and deletes session.json before its
+        // first await, so an end that ran here instead of queuing shows now.
+        XCTAssertEqual(m.session, held, "the end ran inside the reconcile")
+        XCTAssertEqual(try h.store.loadSession(), held, "the end ran inside the reconcile")
+        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1"])
         await gate.open()
         await reconcile.value
         let outcome = await end.value
@@ -201,8 +204,11 @@ final class RecoverySafetyTests: XCTestCase {
         XCTAssertEqual(try h.store.loadState()?.sleepDisabledByUs, true, "the entry stays until pmset confirms")
 
         h.clock.advance(60)
-        let start = Task { await m.start(duration: 600) }
-        await settleQueuedRequests()
+        let start = await runUntilSuspended { await m.start(duration: 600) }
+        // performStart writes session.json and the journal before its first
+        // await, so a start that ran here instead of queuing shows on disk.
+        XCTAssertNil(try h.store.loadSession(), "the start ran inside the end")
+        XCTAssertNil(m.session, "the start ran inside the end")
         XCTAssertEqual(h.guardFake.calls, ["disablesleep 1", "disablesleep 0"], "the start ran inside the end")
         await gate.open()
         let outcome = await end.value
@@ -336,8 +342,7 @@ final class RecoverySafetyTests: XCTestCase {
 
         let start = Task { await m.start(duration: 3600) }
         await gate.waitUntilStarted()
-        let end = Task { await m.end(reason: .user) }
-        await settleQueuedRequests()
+        let end = await runUntilSuspended { await m.end(reason: .user) }
         await gate.open()
         await start.value
         _ = await end.value
@@ -522,10 +527,8 @@ final class RecoverySafetyTests: XCTestCase {
         let m = h.makeManager()
         let first = Task { await m.start(duration: 3600) }
         await gate.waitUntilStarted()
-        let quit = Task { await m.end(reason: .quit) }
-        await settleQueuedRequests()
-        let second = Task { await m.start(duration: 3600) }
-        await settleQueuedRequests()
+        let quit = await runUntilSuspended { await m.end(reason: .quit) }
+        let second = await runUntilSuspended { await m.start(duration: 3600) }
         await gate.open()
         await first.value
         _ = await quit.value
