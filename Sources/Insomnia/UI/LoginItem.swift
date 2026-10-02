@@ -103,23 +103,40 @@ final class LoginItem {
         }
     }
 
-    /// The code directory hash of the running bundle (new on every ad-hoc
-    /// signing, so on every install.sh run) and its path, the two things
-    /// macOS ties the login item to. The path alone when the hash cannot
-    /// be read.
+    /// The running install: see `install(codeHash:bundlePath:executablePath:)`.
     static func liveInstall() -> String {
-        let path = Bundle.main.bundleURL.path
+        install(codeHash: liveCodeHash(), bundlePath: Bundle.main.bundleURL.path, executablePath: Bundle.main.executablePath)
+    }
+
+    /// The code directory hash and bundle path, the two things macOS ties
+    /// the login item to, plus the executable's file identity. install.sh
+    /// can sign an unchanged build to the same hash at the same path, and
+    /// an unsigned build has no hash at all, but it always deletes the old
+    /// bundle and copies the executable in fresh, so the file identity
+    /// tells every install.sh run apart and stays put across launches of
+    /// one install.
+    static func install(codeHash: Data?, bundlePath: String, executablePath: String?) -> String {
+        let hash = codeHash.map { $0.map { String(format: "%02x", $0) }.joined() } ?? "unsigned"
+        return "\(hash)@\(bundlePath)#\(fileIdentity(executablePath))"
+    }
+
+    /// Inode and birth time: a copy gets new ones, a launch reads the same.
+    static func fileIdentity(_ path: String?) -> String {
+        var info = stat()
+        guard let path, stat(path, &info) == 0 else { return "nofile" }
+        let born = info.st_birthtimespec
+        return "\(info.st_ino).\(born.tv_sec).\(born.tv_nsec)"
+    }
+
+    private static func liveCodeHash() -> Data? {
         var code: SecCode?
         var staticCode: SecStaticCode?
         var info: CFDictionary?
         guard SecCodeCopySelf([], &code) == errSecSuccess, let code,
               SecCodeCopyStaticCode(code, [], &staticCode) == errSecSuccess, let staticCode,
-              SecCodeCopySigningInformation(staticCode, [], &info) == errSecSuccess,
-              let hash = (info as? [String: Any])?[kSecCodeInfoUnique as String] as? Data
-        else {
-            return "unsigned@\(path)"
-        }
-        return hash.map { String(format: "%02x", $0) }.joined() + "@" + path
+              SecCodeCopySigningInformation(staticCode, [], &info) == errSecSuccess
+        else { return nil }
+        return (info as? [String: Any])?[kSecCodeInfoUnique as String] as? Data
     }
 
     var isEnabled: Bool { status == .enabled }

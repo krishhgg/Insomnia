@@ -452,11 +452,55 @@ final class LoginItemTests: XCTestCase {
 
     /// The live install identity has the two parts macOS ties the item
     /// to: a hash (or "unsigned") and the bundle path. Read only.
-    func testLiveInstallNamesHashAndPath() {
+    func testLiveInstallNamesHashPathAndExecutable() throws {
         let install = LoginItem.liveInstall()
         let parts = install.split(separator: "@", maxSplits: 1)
         XCTAssertEqual(parts.count, 2, install)
-        XCTAssertEqual(String(parts[1]), Bundle.main.bundleURL.path)
         XCTAssertTrue(parts[0] == "unsigned" || parts[0].allSatisfy(\.isHexDigit), install)
+        let file = try XCTUnwrap(parts[1].lastIndex(of: "#"))
+        XCTAssertEqual(String(parts[1][..<file]), Bundle.main.bundleURL.path)
+        let identity = String(parts[1][parts[1].index(after: file)...])
+        XCTAssertNotEqual(identity, "nofile", install)
+        XCTAssertEqual(identity, LoginItem.fileIdentity(Bundle.main.executablePath))
+        XCTAssertEqual(LoginItem.liveInstall(), install, "stable within one install")
+    }
+
+    /// install.sh run twice on an unchanged build: the same hash (or none)
+    /// at the same path, but the executable is deleted and copied again.
+    /// That reads as a different install, and the same file read twice
+    /// reads the same.
+    func testAReinstallOfTheSameBuildAtTheSamePathIsADifferentInstall() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("loginitem-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let exe = dir.appendingPathComponent("Insomnia").path
+        let bundle = "/Users/me/Applications/Insomnia.app"
+        let hash = Data([0x0b, 0x1c])
+        let bytes = Data("same build".utf8)
+
+        XCTAssertTrue(FileManager.default.createFile(atPath: exe, contents: bytes))
+        let first = LoginItem.install(codeHash: hash, bundlePath: bundle, executablePath: exe)
+        let firstUnsigned = LoginItem.install(codeHash: nil, bundlePath: bundle, executablePath: exe)
+        XCTAssertEqual(LoginItem.install(codeHash: hash, bundlePath: bundle, executablePath: exe), first)
+        XCTAssertTrue(first.hasPrefix("0b1c@\(bundle)#"), first)
+        XCTAssertTrue(firstUnsigned.hasPrefix("unsigned@\(bundle)#"), firstUnsigned)
+
+        try FileManager.default.removeItem(atPath: exe)
+        XCTAssertTrue(FileManager.default.createFile(atPath: exe, contents: bytes))
+        let second = LoginItem.install(codeHash: hash, bundlePath: bundle, executablePath: exe)
+        let secondUnsigned = LoginItem.install(codeHash: nil, bundlePath: bundle, executablePath: exe)
+
+        XCTAssertNotEqual(second, first)
+        XCTAssertNotEqual(secondUnsigned, firstUnsigned)
+
+        // The launch after that reinstall, with macOS having dropped the
+        // item: registered again, not read as a removal.
+        let service = FakeLoginItemService(status: .notRegistered)
+        let item = LoginItem(service: service, install: second, activity: activity)
+        var config = wanted(install: first)
+        XCTAssertTrue(item.healAtLaunch(config: &config))
+        XCTAssertEqual(service.registers, 1)
+        XCTAssertTrue(config.launchAtLogin)
+        XCTAssertEqual(config.launchAtLoginInstall, second)
     }
 }

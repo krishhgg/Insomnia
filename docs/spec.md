@@ -372,8 +372,11 @@ small settings window:
 - launch at login (`SMAppService.mainApp`). macOS ties the login item to
   the bundle's signature and location, and `install.sh` ad-hoc signs a
   fresh bundle on every run, so an upgrade can drop the registration.
-  config.json keeps `launchAtLoginInstall`, the code directory hash and
-  bundle path of the install whose registration macOS last accepted. At
+  config.json keeps `launchAtLoginInstall`, the code directory hash,
+  bundle path and executable file identity (inode and birth time) of the
+  install whose registration macOS last accepted. install.sh deletes the
+  bundle and copies the executable in fresh, so even an unchanged or
+  unsigned build reinstalled at the same path reads as a new install. At
   launch, with the flag on and `SMAppService.mainApp.status` neither
   enabled nor waiting for approval, that record decides: a different
   install means the reinstall lost the registration and the app registers
