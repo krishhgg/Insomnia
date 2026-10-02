@@ -95,33 +95,33 @@ final class OwnerOnlyTests: XCTestCase {
 
     /// Two processes can both find the log oversized. The one that gets to
     /// rotate second must not rename the fresh log over the retained copy.
-    /// The test plays the first process: it holds the file lock the appender
-    /// waits on, rotates, writes its own line, and only then lets go.
+    /// The appender is stopped after it has found the file it holds past the
+    /// cap; the test then plays the other process, rotating and writing its
+    /// own line, and only then lets the appender go on.
     func testRotationByAnotherProcessIsNoticedAndTheRetainedCopyKept() throws {
         let log = home.paths.logs.appendingPathComponent("race.log")
         let big = "0123456789ABCDEF\n"
         try OwnerOnly.appendToLog(big, at: log)
-        let held = open(log.path, O_RDONLY)
-        XCTAssertGreaterThanOrEqual(held, 0)
-        XCTAssertEqual(flock(held, LOCK_EX), 0)
+        let reached = DispatchSemaphore(value: 0)
+        let proceed = DispatchSemaphore(value: 0)
         let done = DispatchSemaphore(value: 0)
         let failure = Locked<String?>(nil)
         DispatchQueue.global().async {
             do {
-                try OwnerOnly.appendToLog("second\n", at: log, maxBytes: 10)
+                try OwnerOnly.appendToLog("second\n", at: log, maxBytes: 10) {
+                    reached.signal()
+                    _ = proceed.wait(timeout: .now() + 5)
+                }
             } catch {
                 failure.value = "\(error)"
             }
             done.signal()
         }
-        // The appender opens the oversized file and waits for its lock.
-        Thread.sleep(forTimeInterval: 0.3)
-        XCTAssertEqual(done.wait(timeout: .now()), .timedOut, "the appender should be waiting for the lock")
+        XCTAssertEqual(reached.wait(timeout: .now() + 5), .success, "the appender never found the log past the cap")
 
         XCTAssertEqual(rename(log.path, OwnerOnly.rotated(log).path), 0)
         try OwnerOnly.appendToLog("first\n", at: log, maxBytes: 10)
-        XCTAssertEqual(flock(held, LOCK_UN), 0)
-        close(held)
+        proceed.signal()
 
         XCTAssertEqual(done.wait(timeout: .now() + 5), .success)
         XCTAssertNil(failure.value)
