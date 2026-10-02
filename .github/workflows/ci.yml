@@ -91,7 +91,50 @@ jobs:
           "$tmux_bin" -V
 
       - name: Run tests
-        run: swift test
+        # NSUnbufferedIO makes XCTest write each line as it happens. With
+        # the default 16 KB stdout buffer the log of a hung run stops up to
+        # 16 KB before the test that hung, which has already misled one
+        # investigation. If the run is still going after 20 minutes (a
+        # normal run takes about 3), the watchdog samples every xctest
+        # process so the log shows what the hung test is waiting on, then
+        # fails the step instead of waiting for the job timeout.
+        env:
+          NSUnbufferedIO: "YES"
+        run: |
+          swift test &
+          test_pid=$!
+          for ((i = 0; i < 1200; i++)); do
+            kill -0 "$test_pid" 2>/dev/null || break
+            sleep 1
+          done
+          if kill -0 "$test_pid" 2>/dev/null; then
+            echo "::error::swift test still running after 20 minutes; sampling xctest"
+            echo "::group::processes"
+            ps -axo pid,ppid,stat,etime,command
+            echo "::endgroup::"
+            for x in $(pgrep -x xctest); do
+              echo "::group::xctest pid $x"
+              /usr/bin/sample "$x" 3 -mayDie || true
+              echo "::endgroup::"
+            done
+            # Collect the whole tree under swift test before anything dies:
+            # a killed parent hands its children to launchd, and a test stuck
+            # on a subprocess (a RecoveryScriptTests bash, a lockf holder)
+            # would then outlive the step.
+            tree=("$test_pid")
+            n=0
+            while [ "$n" -lt "${#tree[@]}" ]; do
+              while read -r child; do
+                tree+=("$child")
+              done < <(pgrep -P "${tree[$n]}" || true)
+              n=$((n + 1))
+            done
+            echo "killing the swift test process tree: ${tree[*]}"
+            kill -KILL "${tree[@]}" 2>/dev/null || true
+            pkill -KILL -x xctest 2>/dev/null || true
+            exit 1
+          fi
+          wait "$test_pid"
 
       - name: Build release
         # docs/release-validation.md cites "no compiler warnings" as evidence,
