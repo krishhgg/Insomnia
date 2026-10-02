@@ -1,0 +1,105 @@
+{
+  "strictness": 2,
+  "commentTypes": ["logic", "syntax"],
+  "autoReview": ["open", "push"],
+  "ignorePatterns": "Resources/*.png\nResources/*.icns\ndocs/assets/*.svg\n",
+  "instructions": "Insomnia is a macOS menu bar app that keeps a MacBook awake for one timed session. While a session runs it executes sudo -n pmset to disable sleep and to switch Low Power Mode, SIGSTOPs other apps' processes when the lid closes, mutes audio, sets the display and keyboard backlight to 0, and writes NSAppSleepDisabled into agent apps' preferences. Every change is journaled in state.json before it is made and is undone from that journal, by the app (reconcile at launch, lid open, session end, Quit) or by scripts/backstop.sh, which a per-user LaunchAgent runs at load and every 60 s with macOS /bin/bash 3.2. The worst bugs leave the Mac in a changed state with nothing able to undo it: a change made before its journal entry is on disk, an entry cleared before the undo was confirmed, a journal the shell can no longer parse, a SIGKILLed sudo, a recovery lock released while a privileged command still runs, or a SIGCONT sent to a process Insomnia did not stop. Weigh those far above style. Read .greptile/rules.md before flagging a design listed there as deliberate.",
+  "rules": [
+    {
+      "id": "journal-before-change",
+      "severity": "high",
+      "scope": ["Sources/Insomnia/Core/**", "Sources/Insomnia/System/**", "scripts/backstop.sh"],
+      "rule": "Any change to power state (sudo pmset disablesleep or lowpowermode), to another process (SIGSTOP), to audio output (volume or mute), to display or keyboard brightness, or to another app's NSAppSleepDisabled (AppNap.swift, opt-in) is written to state.json first, through Store.saveState (the journal helper in SessionManager), and that write has returned without error before the change is made. If the write fails the change is not made."
+    },
+    {
+      "id": "journal-cleared-only-after-confirmed-undo",
+      "severity": "high",
+      "scope": ["Sources/Insomnia/Core/**", "Sources/Insomnia/System/**", "scripts/backstop.sh", "scripts/uninstall.sh"],
+      "rule": "A journal entry in state.json is cleared only after the undo it records has been confirmed: the pmset command exited 0, the SIGCONT was delivered to a verified pid, the audio or brightness write returned without error. A failed, timed-out or unverified undo leaves the entry in place so reconcile or backstop.sh retries it, and a failure to clear an entry after a successful undo is reported to the user and logged, not swallowed with try?."
+    },
+    {
+      "id": "journal-shape-in-sync-with-scripts",
+      "severity": "high",
+      "scope": ["Sources/Insomnia/Model/RuntimeState.swift", "Sources/Insomnia/Model/Session.swift", "Sources/Insomnia/Store/**", "scripts/backstop.sh", "scripts/uninstall.sh", "Tests/InsomniaTests/RecoveryScriptTests.swift"],
+      "rule": "A change to the keys, types or encoding of state.json (RuntimeState, FrozenProcess) or session.json (Session) also updates journal_shape_problems and the key reads in scripts/backstop.sh and scripts/uninstall.sh, states what the shell does with the new key (undo it, keep it for the app, or ignore it), and adds or changes cases in Tests/InsomniaTests/RecoveryScriptTests.swift. The app's decoder keeps accepting a journal written by an older build or by backstop.sh."
+    },
+    {
+      "id": "backstop-armed-before-sleep-is-disabled",
+      "severity": "high",
+      "scope": ["Sources/Insomnia/Core/SessionManager.swift", "Sources/Insomnia/Core/LaunchdBackstop.swift"],
+      "rule": "Sleep is disabled (sudo -n pmset -a disablesleep 1) only after session.json and the sleepDisabledByUs journal entry are on disk and LaunchdBackstop.arm() has returned without error. A failed arm rolls the start back and never reaches pmset. The LaunchAgent plist at the trusted path only ever holds a plist launchd actually loaded."
+    },
+    {
+      "id": "sudo-is-never-sigkilled",
+      "severity": "high",
+      "scope": ["Sources/Insomnia/Core/SleepGuard.swift", "Sources/Insomnia/System/CancellableCommand.swift", "Sources/Insomnia/System/ShellTimeout.swift", "scripts/backstop.sh", "scripts/install.sh", "scripts/uninstall.sh"],
+      "rule": "A privileged command (sudo -n pmset) is never sent SIGKILL, in the app or in the scripts. On timeout it may get SIGTERM, which sudo relays to pmset and waits for. A command still alive after that is left running and reported with its pid, because killing sudo orphans a root pmset that can change power state later, outside any transaction."
+    },
+    {
+      "id": "recovery-lock-held-while-a-command-may-run",
+      "severity": "high",
+      "scope": ["Sources/Insomnia/Core/RecoveryLock.swift", "Sources/Insomnia/Core/SessionManager.swift", "Sources/Insomnia/Core/SleepGuard.swift", "scripts/backstop.sh", "scripts/uninstall.sh"],
+      "rule": "The recovery lock (.recovery.lock: flock in RecoveryLock.swift, lockf on fd 9 in the scripts) is not released, and no further undo runs, while a privileged command started under it may still be running. The lock file is never unlinked or replaced, so every holder locks the same inode. Failing to acquire the lock means doing nothing, never proceeding unlocked."
+    },
+    {
+      "id": "only-verified-pids-are-resumed",
+      "severity": "high",
+      "scope": ["Sources/Insomnia/Core/ProcessControl.swift", "Sources/Insomnia/Core/LidActions.swift", "Sources/Insomnia/System/Freezer.swift", "scripts/backstop.sh"],
+      "rule": "SIGCONT is sent only to a journaled pid whose recorded identity still matches the live process: start time to the microsecond and boot session in the app, start time to the second and boot session in backstop.sh. Provisional entries (identity nil, written before the kernel confirmed the stop) and legacy frozenPids are never signaled and are never cleared by the shell. A pid that cannot be observed stays journaled."
+    },
+    {
+      "id": "no-shell-interpolation",
+      "severity": "high",
+      "scope": ["Sources/**"],
+      "rule": "A child process is started with an absolute executable path and an argument array: Shell.run, Shell.run(timeout:), CancellableCommand.run, or Process with executableURL and arguments. Nothing runs through /bin/sh -c, /bin/bash -c, zsh, osascript with a built command string, or a string that has data interpolated into it. No executable is resolved through PATH; Shell.locate picks from a fixed candidate list of absolute paths."
+    },
+    {
+      "id": "scripts-run-under-bash-3-2",
+      "severity": "high",
+      "scope": ["scripts/**/*.sh"],
+      "rule": "The scripts run under macOS /bin/bash 3.2 (the LaunchAgent runs backstop.sh with it; install.sh and uninstall.sh run under it) and must parse with /bin/bash -n there. Do not use bash 4 or 5 features: mapfile or readarray, declare -A, ${var,,}, ${var^^}, ${var@Q}, negative array subscripts, wait -n, coproc, or |&. ShellCheck in CI runs on Linux and does not catch these."
+    },
+    {
+      "id": "scripts-call-tools-through-fixed-path-variables",
+      "severity": "high",
+      "scope": ["scripts/**/*.sh"],
+      "rule": "Every tool that changes the machine or reads process, power or launchd state is called through the absolute-path variable declared at the top of the script (PMSET, SUDO, PLUTIL, LOCKF, PS, KILL, SYSCTL, PGREP, OSASCRIPT, LAUNCHCTL, CODESIGN, SWIFT, SWIFTC, ICONUTIL), never by bare name through PATH. A new tool gets a new variable in that block, because RecoveryScriptTests and PackagingTests patch exactly those lines in a private copy of the script to substitute fakes. A script's own bounded-call helper may signal the child it started with the shell builtin `kill`; every signal to a process the script did not start goes through `$KILL`."
+    },
+    {
+      "id": "sudoers-rule-is-four-exact-lines",
+      "severity": "high",
+      "scope": ["scripts/install.sh", "scripts/uninstall.sh", "Sources/Insomnia/Core/SleepGuard.swift", "README.md", "SECURITY.md", "docs/spec.md"],
+      "rule": "The file install.sh writes to /etc/sudoers.d/insomnia grants NOPASSWD for exactly these four commands and nothing else: /usr/bin/pmset -a disablesleep 1, /usr/bin/pmset -a disablesleep 0, /usr/bin/pmset -b lowpowermode 1, /usr/bin/pmset -b lowpowermode 0. No wildcard, no ALL, no bare /usr/bin/pmset, no other command, and it is validated with visudo -cf before it is installed. SleepGuard.swift runs only those four argument lists, and README.md, SECURITY.md and docs/spec.md list the same four."
+    },
+    {
+      "id": "behavior-changes-come-with-regression-tests",
+      "severity": "medium",
+      "scope": ["Sources/**", "scripts/**"],
+      "rule": "A behavior change comes with a regression test in Tests/InsomniaTests that exercises the changed path and asserts the observable outcome (journal contents, the fake's recorded calls and their order, the script's exit code and the journal it leaves), not only that a mock method was called. App code is tested through the injected system dependencies and the fakes in TestSupport.swift with a temporary journal (TempHome, INSOMNIA_HOME); scripts are tested through a patched private copy with fake tools, as RecoveryScriptTests and PackagingTests do."
+    },
+    {
+      "id": "tests-never-touch-the-live-machine",
+      "severity": "high",
+      "scope": ["Tests/**"],
+      "rule": "A test never runs pmset with arguments that change a setting, never signals a process it did not start itself, never reads, adds or deletes login Keychain items, never writes another app's preferences (CFPreferences or defaults), never runs install.sh, uninstall.sh, backstop.sh or simulate-lid.sh unpatched against the real home, and never touches ~/Library/Application Support/Insomnia, ~/Library/LaunchAgents or /etc. tmux cases use a private server socket, not the contributor's panes."
+    },
+    {
+      "id": "unified-log-keeps-identifying-data-private",
+      "severity": "high",
+      "scope": ["Sources/**"],
+      "rule": "Nothing user-identifying reaches the unified log (os.Logger) as public: no SSID or hotspot name, tmux target or pane id, process name, bundle id, app name, path under the home directory, or pane content. Such values keep the default private privacy; only fixed phrases, counts, numbers and error kinds may be marked privacy: .public. The plain-text insomnia.log file is a separate local file and may hold them (SECURITY.md)."
+    },
+    {
+      "id": "release-validation-rows-need-hardware-evidence",
+      "severity": "high",
+      "scope": ["docs/release-validation.md"],
+      "rule": "A row in the 'Hardware validation still required' table changes from 'Not run' only together with the tested commit, hardware, macOS version, date and observed result written into the same file. New behavior that needs a check on real hardware adds a 'Not run' row. Passing tests, a source review or a green CI run are never recorded as hardware evidence."
+    },
+    {
+      "id": "writing-style",
+      "severity": "low",
+      "scope": ["**/*.md", "Sources/Insomnia/UI/**", "Resources/Info.plist"],
+      "rule": "Docs, comments and user-facing strings use no em dashes or en dashes (end the sentence or use a comma), sentence-case headings, plain words (not crucial, robust, seamless, leverage, utilize, or ensure as filler), active voice, the mechanism before the feeling, and actual numbers where they exist. UI copy is short and says what happens."
+    }
+  ]
+}

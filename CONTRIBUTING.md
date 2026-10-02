@@ -5,6 +5,17 @@ macOS 26 with an Xcode toolchain that supports the package's Swift 6.2 tools
 version. Pull requests should include regression tests for changed behavior
 and pass the build, test, and shell-script checks.
 
+CI runs on every pull request and push to main. The macOS job parses
+`scripts/*.sh` with `/bin/bash -n` under the system bash 3.2 and greps them
+for bash 4 builtins and expansions (`mapfile`, `declare -A`, `${x,,}`),
+because the LaunchAgent, install.sh and uninstall.sh run under 3.2 and
+ShellCheck on Linux does not catch those. It then runs `swift test` and
+builds the release with `-Xswiftc -warnings-as-errors`, so a compiler
+warning fails the build. Two Linux jobs run ShellCheck over the scripts and
+actionlint plus zizmor over `.github/workflows`. Greptile reviews every
+push to a pull request with the rules in `.greptile/`; it reads that folder
+from the pull request's branch.
+
 The tmux integration cases require tmux at one of the executable paths probed
 by the app. CI installs it explicitly; when checking a local run, inspect the
 skip count so missing tmux is not mistaken for integration coverage. Tests

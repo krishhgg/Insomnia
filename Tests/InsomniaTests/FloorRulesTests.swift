@@ -2,8 +2,13 @@ import XCTest
 @testable import Insomnia
 
 final class FloorRulesTests: XCTestCase {
+    /// nil is a machine with no battery (desktop).
     func eval(_ percent: Int?, charging: Bool = false, thermal: ProcessInfo.ThermalState = .nominal, lid: Bool = false, lp: Bool = false, config: Config = Config()) -> [FloorRules.Action] {
-        FloorRules.evaluate(percent: percent, isCharging: charging, thermal: thermal, lidClosed: lid, lowPowerSetByUs: lp, config: config)
+        eval(battery: percent.map { .percent($0) } ?? .none, charging: charging, thermal: thermal, lid: lid, lp: lp, config: config)
+    }
+
+    func eval(battery: BatteryStatus, charging: Bool = false, thermal: ProcessInfo.ThermalState = .nominal, lid: Bool = false, lp: Bool = false, config: Config = Config()) -> [FloorRules.Action] {
+        FloorRules.evaluate(battery: battery, isCharging: charging, thermal: thermal, lidClosed: lid, lowPowerSetByUs: lp, config: config)
     }
 
     // Row 1: battery below lowPowerFloor -> lowpowermode 1
@@ -54,6 +59,46 @@ final class FloorRulesTests: XCTestCase {
 
     func testBatteryEndFloorWinsOverThermalCritical() {
         XCTAssertEqual(eval(5, thermal: .critical), [.endSession(.batteryFloor)])
+    }
+
+    // Row 2, unreadable: a battery that is present but cannot be read on
+    // two consecutive reads ends the session while on battery. One miss is
+    // a transient IOKit failure and changes nothing.
+    func testUnreadableBatteryEndsSessionAfterTwoMisses() {
+        XCTAssertEqual(eval(battery: .unreadable(misses: 1)), [])
+        XCTAssertEqual(eval(battery: .unreadable(misses: 2)), [.endSession(.batteryUnreadable)])
+        XCTAssertEqual(eval(battery: .unreadable(misses: 2), lp: true), [.endSession(.batteryUnreadable)])
+    }
+
+    func testUnreadableBatteryWhileChargingDoesNotEnd() {
+        XCTAssertEqual(eval(battery: .unreadable(misses: 2), charging: true), [])
+        // Low Power Mode we set for the battery floor is released: no level
+        // is below a floor when none is known.
+        XCTAssertEqual(eval(battery: .unreadable(misses: 2), charging: true, lp: true), [.disableLowPower])
+    }
+
+    // A desktop has no battery to read; the floors never apply.
+    func testNoBatteryIsNotUnreadable() {
+        XCTAssertEqual(eval(nil), [])
+        XCTAssertEqual(eval(battery: .none, lp: true), [.disableLowPower])
+    }
+
+    // No end floor (0) means nothing to apply, read or not.
+    func testUnreadableBatteryWithEndFloorDisabledDoesNotEnd() {
+        var c = Config()
+        c.endFloor = 0
+        XCTAssertEqual(eval(battery: .unreadable(misses: 2), config: c), [])
+    }
+
+    func testThermalCriticalWinsOverUnreadableBattery() {
+        XCTAssertEqual(eval(battery: .unreadable(misses: 2), thermal: .critical), [.endSession(.thermalCritical)])
+    }
+
+    // Unreadable is not "below the floor": nothing enables Low Power Mode
+    // for the battery, and a lid or thermal cause still works as before.
+    func testUnreadableBatteryDoesNotEnableLowPowerByItself() {
+        XCTAssertEqual(eval(battery: .unreadable(misses: 1), lid: true), [.enableLowPower(.lid)])
+        XCTAssertEqual(eval(battery: .unreadable(misses: 1), thermal: .serious), [.enableLowPower(.thermal)])
     }
 
     func testThermalRulesOffIgnoresThermal() {
@@ -164,14 +209,14 @@ final class FloorRuleDriverTests: XCTestCase {
         let m = h.makeManager()
         await m.start(duration: 3600)
         let driver = FloorRuleDriver(manager: m, notifier: h.notifier)
-        await driver.run(percent: 35, isCharging: false, thermal: .nominal, lidClosed: false)
+        await driver.run(battery: .percent(35), isCharging: false, thermal: .nominal, lidClosed: false)
         // The current mode is read before it is taken over.
         XCTAssertEqual(h.guardFake.calls, ["disablesleep 1", "pmset -g custom", "lowpowermode 1"])
         XCTAssertEqual(try h.store.loadState()?.lowPowerSetByUs, true)
         XCTAssertEqual(h.notifier.posts.last?.title, "Low Power Mode on")
         XCTAssertTrue(h.notifier.posts.last?.body.contains("35%") ?? false)
 
-        await driver.run(percent: 35, isCharging: true, thermal: .nominal, lidClosed: false)
+        await driver.run(battery: .percent(35), isCharging: true, thermal: .nominal, lidClosed: false)
         XCTAssertEqual(h.guardFake.calls.last, "lowpowermode 0")
         XCTAssertEqual(try h.store.loadState()?.lowPowerSetByUs, false)
         XCTAssertEqual(h.notifier.posts.last?.title, "Low Power Mode off")
@@ -182,7 +227,7 @@ final class FloorRuleDriverTests: XCTestCase {
         await m.start(duration: 3600)
         h.guardFake.throwOn = ["lowpowermode 1"]
         let driver = FloorRuleDriver(manager: m, notifier: h.notifier)
-        await driver.run(percent: 35, isCharging: false, thermal: .nominal, lidClosed: false)
+        await driver.run(battery: .percent(35), isCharging: false, thermal: .nominal, lidClosed: false)
         XCTAssertEqual(try h.store.loadState()?.lowPowerSetByUs, false)
         XCTAssertFalse(h.notifier.posts.contains { $0.title == "Low Power Mode on" })
     }
@@ -191,7 +236,7 @@ final class FloorRuleDriverTests: XCTestCase {
         let m = h.makeManager()
         await m.start(duration: 3600)
         let driver = FloorRuleDriver(manager: m, notifier: h.notifier)
-        await driver.run(percent: 8, isCharging: false, thermal: .nominal, lidClosed: false)
+        await driver.run(battery: .percent(8), isCharging: false, thermal: .nominal, lidClosed: false)
         XCTAssertFalse(m.isActive)
         XCTAssertNil(try h.store.loadSession())
         XCTAssertEqual(h.guardFake.calls.last, "disablesleep 0")
@@ -199,12 +244,30 @@ final class FloorRuleDriverTests: XCTestCase {
         XCTAssertTrue(h.notifier.posts.last?.body.contains("10%") ?? false)
     }
 
+    func testUnreadableBatteryEndsSessionAndSaysWhy() async throws {
+        let m = h.makeManager()
+        await m.start(duration: 3600)
+        let driver = FloorRuleDriver(manager: m, notifier: h.notifier)
+        await driver.run(battery: .unreadable(misses: 1), isCharging: false, thermal: .nominal, lidClosed: false)
+        XCTAssertTrue(m.isActive, "one missed read ended the session")
+        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1"])
+
+        await driver.run(battery: .unreadable(misses: 2), isCharging: false, thermal: .nominal, lidClosed: false)
+        XCTAssertFalse(m.isActive)
+        XCTAssertNil(try h.store.loadSession())
+        XCTAssertEqual(h.guardFake.calls.last, "disablesleep 0")
+        XCTAssertEqual(h.notifier.posts.last?.title, "Session ended")
+        let body = try XCTUnwrap(h.notifier.posts.last?.body)
+        XCTAssertTrue(body.contains("could not be read"), body)
+        XCTAssertTrue(body.contains("10%"), body)
+    }
+
     func testThermalCriticalEndsSession() async throws {
         let m = h.makeManager()
         await m.start(duration: 3600)
         await m.setLowPower(true)
         let driver = FloorRuleDriver(manager: m, notifier: h.notifier)
-        await driver.run(percent: 80, isCharging: false, thermal: .critical, lidClosed: false)
+        await driver.run(battery: .percent(80), isCharging: false, thermal: .critical, lidClosed: false)
         XCTAssertFalse(m.isActive)
         XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
         XCTAssertTrue(h.guardFake.calls.contains("lowpowermode 0"))
@@ -214,7 +277,7 @@ final class FloorRuleDriverTests: XCTestCase {
     func testNoSessionDoesNothing() async throws {
         let m = h.makeManager()
         let driver = FloorRuleDriver(manager: m, notifier: h.notifier)
-        await driver.run(percent: 5, isCharging: false, thermal: .critical, lidClosed: false)
+        await driver.run(battery: .percent(5), isCharging: false, thermal: .critical, lidClosed: false)
         XCTAssertEqual(h.guardFake.calls, [])
         XCTAssertEqual(h.notifier.posts.count, 0)
     }
@@ -225,13 +288,12 @@ final class FloorRuleDriverTests: XCTestCase {
         let m = h.makeManager()
         await m.start(duration: 3600)
         let driver = FloorRuleDriver(manager: m, notifier: h.notifier)
-        let floor = Task { await driver.run(percent: 35, isCharging: false, thermal: .nominal, lidClosed: false) }
+        let floor = Task { await driver.run(battery: .percent(35), isCharging: false, thermal: .nominal, lidClosed: false) }
         await gate.waitUntilStarted()
 
         // The end queues behind the held Low Power change; release the hold
         // first, then wait for both. Awaiting the end here would deadlock.
-        let end = Task { await m.end(reason: .user) }
-        await settleQueuedRequests()
+        let end = await runUntilSuspended { await m.end(reason: .user) }
         await gate.open()
         await floor.value
         _ = await end.value
@@ -249,7 +311,7 @@ final class FloorRuleDriverTests: XCTestCase {
         let m = h.makeManager()
         await m.start(duration: 3600)
         let driver = FloorRuleDriver(manager: m, notifier: h.notifier)
-        await driver.run(percent: 35, isCharging: false, thermal: .nominal, lidClosed: false)
+        await driver.run(battery: .percent(35), isCharging: false, thermal: .nominal, lidClosed: false)
 
         XCTAssertEqual(h.guardFake.calls, ["disablesleep 1", "pmset -g custom"])
         XCTAssertEqual(try h.store.loadState()?.lowPowerSetByUs, false)
@@ -267,7 +329,7 @@ final class FloorRuleDriverTests: XCTestCase {
         let m = h.makeManager()
         await m.start(duration: 3600)
         let driver = FloorRuleDriver(manager: m, notifier: h.notifier)
-        await driver.run(percent: 35, isCharging: false, thermal: .nominal, lidClosed: false)
+        await driver.run(battery: .percent(35), isCharging: false, thermal: .nominal, lidClosed: false)
 
         XCTAssertFalse(h.guardFake.calls.contains("lowpowermode 1"))
         XCTAssertEqual(try h.store.loadState()?.lowPowerSetByUs, false)
@@ -315,7 +377,7 @@ final class FloorRuleDriverTests: XCTestCase {
         let m = h.makeManager()
         await m.start(duration: 3600)
         let driver = FloorRuleDriver(manager: m, notifier: h.notifier)
-        await driver.run(percent: 80, isCharging: true, thermal: .nominal, lidClosed: true)
+        await driver.run(battery: .percent(80), isCharging: true, thermal: .nominal, lidClosed: true)
         XCTAssertEqual(h.guardFake.calls, ["disablesleep 1", "pmset -g custom", "lowpowermode 1"])
         XCTAssertTrue(h.guardFake.lowPowerOn)
         XCTAssertEqual(try h.store.loadState()?.lowPowerSetByUs, true)
@@ -331,10 +393,10 @@ final class FloorRuleDriverTests: XCTestCase {
         let m = h.makeManager()
         await m.start(duration: 3600)
         let driver = FloorRuleDriver(manager: m, notifier: h.notifier)
-        await driver.run(percent: 80, isCharging: false, thermal: .nominal, lidClosed: true)
+        await driver.run(battery: .percent(80), isCharging: false, thermal: .nominal, lidClosed: true)
         XCTAssertTrue(h.guardFake.lowPowerOn)
 
-        await driver.run(percent: 80, isCharging: false, thermal: .nominal, lidClosed: false)
+        await driver.run(battery: .percent(80), isCharging: false, thermal: .nominal, lidClosed: false)
         XCTAssertFalse(h.guardFake.lowPowerOn)
         XCTAssertEqual(h.guardFake.calls.last, "lowpowermode 0")
         XCTAssertEqual(try h.store.loadState()?.lowPowerSetByUs, false)
@@ -345,8 +407,8 @@ final class FloorRuleDriverTests: XCTestCase {
         let m = h.makeManager()
         await m.start(duration: 3600)
         let driver = FloorRuleDriver(manager: m, notifier: h.notifier)
-        await driver.run(percent: 80, isCharging: false, thermal: .nominal, lidClosed: true)
-        await driver.run(percent: 35, isCharging: false, thermal: .nominal, lidClosed: false)
+        await driver.run(battery: .percent(80), isCharging: false, thermal: .nominal, lidClosed: true)
+        await driver.run(battery: .percent(35), isCharging: false, thermal: .nominal, lidClosed: false)
         XCTAssertTrue(h.guardFake.lowPowerOn)
         XCTAssertFalse(h.guardFake.calls.contains("lowpowermode 0"))
         XCTAssertEqual(h.notifier.posts.count, 0)
@@ -357,11 +419,11 @@ final class FloorRuleDriverTests: XCTestCase {
         let m = h.makeManager()
         await m.start(duration: 3600)
         let driver = FloorRuleDriver(manager: m, notifier: h.notifier)
-        await driver.run(percent: 35, isCharging: false, thermal: .nominal, lidClosed: true)
+        await driver.run(battery: .percent(35), isCharging: false, thermal: .nominal, lidClosed: true)
         XCTAssertEqual(h.notifier.posts.last?.title, "Low Power Mode on")
         XCTAssertTrue(h.notifier.posts.last?.body.contains("35%") ?? false)
 
-        await driver.run(percent: 35, isCharging: true, thermal: .nominal, lidClosed: false)
+        await driver.run(battery: .percent(35), isCharging: true, thermal: .nominal, lidClosed: false)
         XCTAssertEqual(h.notifier.posts.last?.title, "Low Power Mode off")
         XCTAssertEqual(h.notifier.posts.last?.body, "Charger connected.")
     }
@@ -371,7 +433,7 @@ final class FloorRuleDriverTests: XCTestCase {
         m.config.lowPowerOnLidClose = false
         await m.start(duration: 3600)
         let driver = FloorRuleDriver(manager: m, notifier: h.notifier)
-        await driver.run(percent: 80, isCharging: false, thermal: .nominal, lidClosed: true)
+        await driver.run(battery: .percent(80), isCharging: false, thermal: .nominal, lidClosed: true)
         XCTAssertFalse(h.guardFake.calls.contains("lowpowermode 1"))
         XCTAssertEqual(try h.store.loadState()?.lowPowerSetByUs, false)
     }
@@ -387,17 +449,17 @@ final class FloorRuleDriverTests: XCTestCase {
         let m = h.makeManager()
         await m.start(duration: 3600)
         let driver = FloorRuleDriver(manager: m, notifier: h.notifier)
-        await driver.run(percent: 80, isCharging: false, thermal: .nominal, lidClosed: true)
+        await driver.run(battery: .percent(80), isCharging: false, thermal: .nominal, lidClosed: true)
         XCTAssertTrue(h.guardFake.lowPowerOn)
         XCTAssertEqual(h.notifier.posts.count, 0)
 
-        await driver.run(percent: 35, isCharging: false, thermal: .nominal, lidClosed: true)
-        await driver.run(percent: 35, isCharging: true, thermal: .nominal, lidClosed: true)
+        await driver.run(battery: .percent(35), isCharging: false, thermal: .nominal, lidClosed: true)
+        await driver.run(battery: .percent(35), isCharging: true, thermal: .nominal, lidClosed: true)
         XCTAssertTrue(h.guardFake.lowPowerOn)
         XCTAssertFalse(h.guardFake.calls.contains("lowpowermode 0"))
         XCTAssertEqual(h.notifier.posts.count, 0)
 
-        await driver.run(percent: 35, isCharging: true, thermal: .nominal, lidClosed: false)
+        await driver.run(battery: .percent(35), isCharging: true, thermal: .nominal, lidClosed: false)
         XCTAssertFalse(h.guardFake.lowPowerOn)
         XCTAssertEqual(h.guardFake.calls.last, "lowpowermode 0")
         XCTAssertEqual(try h.store.loadState()?.lowPowerSetByUs, false)
@@ -412,17 +474,17 @@ final class FloorRuleDriverTests: XCTestCase {
         let m = h.makeManager()
         await m.start(duration: 3600)
         let driver = FloorRuleDriver(manager: m, notifier: h.notifier)
-        await driver.run(percent: 80, isCharging: false, thermal: .nominal, lidClosed: true)
+        await driver.run(battery: .percent(80), isCharging: false, thermal: .nominal, lidClosed: true)
         XCTAssertTrue(h.guardFake.lowPowerOn)
         XCTAssertEqual(h.notifier.posts.count, 0)
 
-        await driver.run(percent: 35, isCharging: false, thermal: .nominal, lidClosed: true)
-        await driver.run(percent: 35, isCharging: false, thermal: .nominal, lidClosed: false)
+        await driver.run(battery: .percent(35), isCharging: false, thermal: .nominal, lidClosed: true)
+        await driver.run(battery: .percent(35), isCharging: false, thermal: .nominal, lidClosed: false)
         XCTAssertTrue(h.guardFake.lowPowerOn)
         XCTAssertFalse(h.guardFake.calls.contains("lowpowermode 0"))
         XCTAssertEqual(h.notifier.posts.count, 0)
 
-        await driver.run(percent: 35, isCharging: true, thermal: .nominal, lidClosed: false)
+        await driver.run(battery: .percent(35), isCharging: true, thermal: .nominal, lidClosed: false)
         XCTAssertFalse(h.guardFake.lowPowerOn)
         XCTAssertEqual(h.guardFake.calls.last, "lowpowermode 0")
         XCTAssertEqual(h.notifier.posts.count, 1)
@@ -438,18 +500,18 @@ final class FloorRuleDriverTests: XCTestCase {
         let m = h.makeManager()
         await m.start(duration: 3600)
         let driver = FloorRuleDriver(manager: m, notifier: h.notifier)
-        await driver.run(percent: 35, isCharging: false, thermal: .nominal, lidClosed: false)
+        await driver.run(battery: .percent(35), isCharging: false, thermal: .nominal, lidClosed: false)
         XCTAssertTrue(h.guardFake.lowPowerOn)
         XCTAssertEqual(h.notifier.posts.count, 1)
         XCTAssertEqual(h.notifier.posts.last?.title, "Low Power Mode on")
 
-        await driver.run(percent: 35, isCharging: false, thermal: .nominal, lidClosed: true)
-        await driver.run(percent: 35, isCharging: true, thermal: .nominal, lidClosed: true)
+        await driver.run(battery: .percent(35), isCharging: false, thermal: .nominal, lidClosed: true)
+        await driver.run(battery: .percent(35), isCharging: true, thermal: .nominal, lidClosed: true)
         XCTAssertTrue(h.guardFake.lowPowerOn)
         XCTAssertFalse(h.guardFake.calls.contains("lowpowermode 0"))
         XCTAssertEqual(h.notifier.posts.count, 1)
 
-        await driver.run(percent: 35, isCharging: true, thermal: .nominal, lidClosed: false)
+        await driver.run(battery: .percent(35), isCharging: true, thermal: .nominal, lidClosed: false)
         XCTAssertFalse(h.guardFake.lowPowerOn)
         XCTAssertEqual(h.guardFake.calls.last, "lowpowermode 0")
         XCTAssertEqual(h.notifier.posts.count, 1, "lid-open disable was announced")
@@ -461,13 +523,13 @@ final class FloorRuleDriverTests: XCTestCase {
         let m = h.makeManager()
         await m.start(duration: 3600)
         let driver = FloorRuleDriver(manager: m, notifier: h.notifier)
-        await driver.run(percent: 80, isCharging: false, thermal: .nominal, lidClosed: true)
-        await driver.run(percent: 80, isCharging: false, thermal: .serious, lidClosed: true)
-        await driver.run(percent: 80, isCharging: false, thermal: .serious, lidClosed: false)
+        await driver.run(battery: .percent(80), isCharging: false, thermal: .nominal, lidClosed: true)
+        await driver.run(battery: .percent(80), isCharging: false, thermal: .serious, lidClosed: true)
+        await driver.run(battery: .percent(80), isCharging: false, thermal: .serious, lidClosed: false)
         XCTAssertTrue(h.guardFake.lowPowerOn)
         XCTAssertEqual(h.notifier.posts.count, 0)
 
-        await driver.run(percent: 80, isCharging: false, thermal: .fair, lidClosed: false)
+        await driver.run(battery: .percent(80), isCharging: false, thermal: .fair, lidClosed: false)
         XCTAssertFalse(h.guardFake.lowPowerOn)
         XCTAssertEqual(h.notifier.posts.last?.title, "Low Power Mode off")
         XCTAssertEqual(h.notifier.posts.last?.body, "Back above the floor.")
@@ -479,16 +541,16 @@ final class FloorRuleDriverTests: XCTestCase {
         let m = h.makeManager()
         await m.start(duration: 3600)
         let driver = FloorRuleDriver(manager: m, notifier: h.notifier)
-        await driver.run(percent: 80, isCharging: true, thermal: .nominal, lidClosed: true)
+        await driver.run(battery: .percent(80), isCharging: true, thermal: .nominal, lidClosed: true)
         XCTAssertTrue(h.guardFake.lowPowerOn)
 
         m.config.lowPowerOnLidClose = false
-        await driver.run(percent: 80, isCharging: true, thermal: .nominal, lidClosed: true)
+        await driver.run(battery: .percent(80), isCharging: true, thermal: .nominal, lidClosed: true)
         XCTAssertFalse(h.guardFake.lowPowerOn)
         XCTAssertEqual(try h.store.loadState()?.lowPowerSetByUs, false)
 
         m.config.lowPowerOnLidClose = true
-        await driver.run(percent: 80, isCharging: true, thermal: .nominal, lidClosed: true)
+        await driver.run(battery: .percent(80), isCharging: true, thermal: .nominal, lidClosed: true)
         XCTAssertTrue(h.guardFake.lowPowerOn)
         XCTAssertEqual(try h.store.loadState()?.lowPowerSetByUs, true)
         XCTAssertEqual(h.notifier.posts.count, 0)

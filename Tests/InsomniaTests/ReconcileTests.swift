@@ -75,15 +75,115 @@ final class ReconcileTests: XCTestCase {
         XCTAssertEqual(h.guardFake.calls, ["disablesleep 1"])
     }
 
-    // (c) no session but pmset reports SleepDisabled -> set to 0
-    func testNoSessionButSleepDisabledIsCleared() async throws {
+    // (c) no session, no journal entry, but pmset reports SleepDisabled:
+    // something else set it. Left alone, reported once with the command to
+    // undo it; an Insomnia session's end still sets it to 0 as always.
+    func testNoSessionButSleepDisabledIsLeftAloneAndReported() async throws {
         h.guardFake.sleepDisabled = true
         let m = h.makeManager()
         await m.reconcile()
         XCTAssertNil(m.session)
-        XCTAssertEqual(h.guardFake.calls, ["pmset -g", "disablesleep 0"])
-        XCTAssertFalse(h.guardFake.sleepDisabled)
+        XCTAssertEqual(h.guardFake.calls, ["pmset -g"], "a SleepDisabled bit Insomnia did not set was cleared")
+        XCTAssertTrue(h.guardFake.sleepDisabled)
         XCTAssertNil(try h.store.loadSession())
+        XCTAssertEqual(h.notifier.posts.map(\.title), [SessionManager.foreignSleepTitle])
+        XCTAssertTrue(h.notifier.posts[0].body.contains(SessionManager.foreignSleepCommand), h.notifier.posts[0].body)
+        XCTAssertTrue(try XCTUnwrap(m.foreignSleepWarning).contains(SessionManager.foreignSleepCommand), m.foreignSleepWarning ?? "")
+        XCTAssertNil(m.lastError, "a bit someone else set is not an Insomnia failure")
+
+        // A second reconcile keeps the warning line but does not post again.
+        await m.reconcile()
+        XCTAssertEqual(h.notifier.posts.count, 1)
+        XCTAssertEqual(m.foreignSleepWarning, SessionManager.foreignSleepLine)
+
+        // Insomnia's own session clears the line, and its end sets the bit to 0.
+        await m.start(duration: 3600)
+        XCTAssertNil(m.foreignSleepWarning)
+        XCTAssertNil(m.lastError)
+        _ = await m.end(reason: .user)
+        XCTAssertFalse(h.guardFake.sleepDisabled)
+    }
+
+    // (c4) step 1 fails to clear Low Power Mode and step 3 finds a foreign
+    // SleepDisabled bit in the same reconcile. Both stay visible: the
+    // restore failure in `lastError`, the bit on its own line.
+    func testForeignSleepLineDoesNotReplaceARestoreError() async throws {
+        var st = RuntimeState()
+        st.lowPowerSetByUs = true
+        try h.store.saveState(st)
+        h.guardFake.lowPowerOn = true
+        h.guardFake.throwOn = ["lowpowermode 0"]
+        h.guardFake.sleepDisabled = true
+        let m = h.makeManager()
+        await m.reconcile()
+        XCTAssertEqual(h.guardFake.calls, ["lowpowermode 0", "pmset -g"])
+        XCTAssertEqual(try h.store.loadState()?.lowPowerSetByUs, true)
+        XCTAssertTrue(try XCTUnwrap(m.lastError).contains("could not clear low power mode"), m.lastError ?? "")
+        XCTAssertEqual(m.foreignSleepWarning, SessionManager.foreignSleepLine)
+        XCTAssertEqual(h.notifier.posts.map(\.title), [SessionManager.incompleteTitle, SessionManager.foreignSleepTitle])
+    }
+
+    // (c5) the line is rechecked on menu open and dropped once the bit
+    // reads 0; a bit still set, or an unreadable pmset, keeps it. No read
+    // is made while the line is down.
+    func testForeignSleepLineIsDroppedOnceTheBitReadsZero() async throws {
+        let m = h.makeManager()
+        await m.recheckForeignSleep()
+        XCTAssertEqual(h.guardFake.calls, [], "nothing to recheck without the line")
+
+        h.guardFake.sleepDisabled = true
+        await m.reconcile()
+        XCTAssertEqual(m.foreignSleepWarning, SessionManager.foreignSleepLine)
+
+        await m.recheckForeignSleep()
+        XCTAssertEqual(m.foreignSleepWarning, SessionManager.foreignSleepLine, "the bit is still set")
+
+        h.guardFake.throwOn = ["pmset -g"]
+        await m.recheckForeignSleep()
+        XCTAssertEqual(m.foreignSleepWarning, SessionManager.foreignSleepLine, "an unreadable pmset proves nothing")
+        h.guardFake.throwOn = []
+
+        h.guardFake.sleepDisabled = false // its owner re-enabled sleep
+        await m.recheckForeignSleep()
+        XCTAssertNil(m.foreignSleepWarning)
+        XCTAssertEqual(h.guardFake.calls, ["pmset -g", "pmset -g", "pmset -g", "pmset -g"])
+        XCTAssertEqual(h.notifier.posts.count, 1, "clearing the line posts nothing")
+        XCTAssertNil(m.lastError)
+
+        await m.recheckForeignSleep()
+        XCTAssertEqual(h.guardFake.calls.count, 4, "no read once the line is down")
+    }
+
+    // (c2) journaled as ours with no session -> cleared through the journal
+    // in step 1; step 3 finds nothing foreign to report.
+    func testNoSessionButJournaledSleepDisabledIsClearedFromTheJournal() async throws {
+        var st = RuntimeState()
+        st.sleepDisabledByUs = true
+        try h.store.saveState(st)
+        h.guardFake.sleepDisabled = true
+        let m = h.makeManager()
+        await m.reconcile()
+        XCTAssertEqual(h.guardFake.calls, ["disablesleep 0", "pmset -g"])
+        XCTAssertFalse(h.guardFake.sleepDisabled)
+        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
+        XCTAssertFalse(h.notifier.posts.contains { $0.title == SessionManager.foreignSleepTitle }, "\(h.notifier.posts)")
+    }
+
+    // (c3) journaled as ours and the restore fails -> the bit is ours, still
+    // journaled for the retry, and not reported as someone else's.
+    func testFailedJournaledRestoreIsNotReportedAsForeign() async throws {
+        var st = RuntimeState()
+        st.sleepDisabledByUs = true
+        try h.store.saveState(st)
+        h.guardFake.sleepDisabled = true
+        h.guardFake.throwOn = ["disablesleep 0"]
+        let m = h.makeManager()
+        await m.reconcile()
+        XCTAssertEqual(h.guardFake.calls, ["disablesleep 0", "pmset -g"])
+        XCTAssertTrue(h.guardFake.sleepDisabled)
+        XCTAssertEqual(try h.store.loadState()?.sleepDisabledByUs, true)
+        XCTAssertFalse(h.notifier.posts.contains { $0.title == SessionManager.foreignSleepTitle }, "\(h.notifier.posts)")
+        XCTAssertTrue(try XCTUnwrap(m.lastError).contains("could not restore sleep"), m.lastError ?? "")
     }
 
     // (c') no session, clean state, pmset clean -> nothing but the check
@@ -265,18 +365,34 @@ final class ReconcileTests: XCTestCase {
             sleepGuard: real.guardFake,
             processControl: real.procs,
             backstop: real.backstop,
+            notifier: real.notifier,
+            clamshell: { false },
             clock: { Date() }
         )
         // Bypass clamping by writing a near-expired session and reconciling.
-        try real.store.saveSession(Session(startedAt: Date(), endsAt: Date().addingTimeInterval(1.5)))
+        // session.json keeps whole seconds, so a fractional deadline would
+        // come back up to a second earlier than written.
+        let endsAt = Date(timeIntervalSince1970: (Date().timeIntervalSince1970 + 2).rounded(.up))
+        try real.store.saveSession(Session(startedAt: Date(), endsAt: endsAt))
         await m.reconcile()
         XCTAssertTrue(m.isActive)
-        let deadline = Date().addingTimeInterval(8)
-        while m.isActive && Date() < deadline {
-            try await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(m.scheduledDeadline, endsAt)
+
+        // Wait for the end to finish, not for it to start: `isActive` goes
+        // false at the top of the end, before `disablesleep 0` and the
+        // journal write. The notification is the end's last step.
+        for _ in 0..<1000 where !real.notifier.posts.contains(where: { $0.title == "Session ended" }) {
+            try await Task.sleep(for: .milliseconds(10))
         }
+        // When the restore was called, not when this loop noticed it: a poll
+        // that resumes late would hide an end that came early.
+        let restoredAt = try XCTUnwrap(real.guardFake.restoreCalledAt, "the end never restored sleep")
+        XCTAssertGreaterThanOrEqual(restoredAt, endsAt, "the session ended before its deadline")
+        XCTAssertEqual(real.notifier.posts.last?.body, "Time is up. Sleep is back to normal.")
         XCTAssertFalse(m.isActive)
         XCTAssertNil(try real.store.loadSession())
-        XCTAssertEqual(real.guardFake.calls.last, "disablesleep 0")
+        XCTAssertEqual(try real.store.loadState(), RuntimeState.clean)
+        XCTAssertEqual(real.guardFake.calls, ["disablesleep 1", "disablesleep 0"])
+        XCTAssertFalse(real.guardFake.sleepDisabled)
     }
 }
