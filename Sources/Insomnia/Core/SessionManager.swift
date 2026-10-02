@@ -201,6 +201,10 @@ final class SessionManager {
         self.lastError = loadError
         if let c = (try? store.loadConfig()) ?? nil {
             self.config = c
+            // An older build's file was just read with its stock values
+            // migrated. Writing it back once marks it current, so a ceiling
+            // typed into it later is read as the user's.
+            if (try? store.configHasVersion()) == false { try? store.saveConfig(c) }
         } else {
             self.config = Config()
             try? store.saveConfig(self.config)

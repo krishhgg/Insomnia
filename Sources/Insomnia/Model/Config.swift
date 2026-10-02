@@ -52,6 +52,12 @@ struct Config: Codable, Equatable, Sendable {
     // App
     var launchAtLogin: Bool = false
 
+    /// Which defaults the file was written under; 2 is the 24-hour ceiling.
+    /// A file without the key comes from an older build, and only such a
+    /// file has its stock values migrated on read.
+    var configVersion: Int = Config.currentVersion
+    static let currentVersion = 2
+
     static let defaultPresets: [TimeInterval] = [
         30 * 60,
         1 * 3600,
@@ -64,9 +70,10 @@ struct Config: Codable, Equatable, Sendable {
 
     /// What builds before the 24-hour ceiling wrote into config.json as
     /// their defaults. Settings saves the whole struct, so an ordinary
-    /// install has these as explicit values; the decoder reads exactly these
-    /// as the current defaults and keeps any other value, which a person
-    /// chose by hand, unless it no longer fits under the new ceiling.
+    /// install has these as explicit values; in a file without
+    /// `configVersion` the decoder reads exactly these as the current
+    /// defaults and keeps any other value, which a person chose by hand,
+    /// unless it no longer fits under the new ceiling.
     static let legacyMaxDuration: TimeInterval = 30 * 24 * 3600
     static let legacyPresets: [TimeInterval] = defaultPresets + [3 * 24 * 3600]
 
@@ -111,15 +118,19 @@ struct Config: Codable, Equatable, Sendable {
         defaultPreset = try c.decodeIfPresent(TimeInterval.self, forKey: .defaultPreset) ?? d.defaultPreset
         let savedMax = try c.decodeIfPresent(TimeInterval.self, forKey: .maxDuration)
         maxDuration = savedMax ?? d.maxDuration
-        if presets == Config.legacyPresets { presets = d.presets }
-        if maxDuration == Config.legacyMaxDuration { maxDuration = d.maxDuration }
-        // A ceiling the user never set is now 24 hours, not the 30 days the
-        // presets and default were picked under. Presets above it go
-        // (Settings refuses to add them), and a default above it moves to
-        // the largest preset left, since bare Enter would refuse it.
-        if savedMax == nil || savedMax == Config.legacyMaxDuration {
-            presets.removeAll { $0 > maxDuration }
-            if defaultPreset > maxDuration { defaultPreset = presets.max() ?? d.defaultPreset }
+        // In a current file every value was written by this build or by
+        // hand, a 30-day ceiling included; only an older file is migrated.
+        if try c.decodeIfPresent(Int.self, forKey: .configVersion) == nil {
+            if presets == Config.legacyPresets { presets = d.presets }
+            if maxDuration == Config.legacyMaxDuration { maxDuration = d.maxDuration }
+            // A ceiling the user never set is now 24 hours, not the 30 days
+            // the presets and default were picked under. Presets above it go
+            // (Settings refuses to add them), and a default above it moves
+            // to the largest preset left, since bare Enter would refuse it.
+            if savedMax == nil || savedMax == Config.legacyMaxDuration {
+                presets.removeAll { $0 > maxDuration }
+                if defaultPreset > maxDuration { defaultPreset = presets.max() ?? d.defaultPreset }
+            }
         }
         freezeList = try c.decodeIfPresent([String].self, forKey: .freezeList) ?? d.freezeList
         freezeAllApps = try c.decodeIfPresent(Bool.self, forKey: .freezeAllApps) ?? d.freezeAllApps

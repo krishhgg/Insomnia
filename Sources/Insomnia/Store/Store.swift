@@ -78,6 +78,12 @@ struct Store: Sendable {
     func loadConfig() throws -> Config? { try read(Config.self, from: paths.configFile) }
     func saveConfig(_ c: Config) throws { try write(c, to: paths.configFile) }
 
+    /// False for a config.json written before `configVersion` existed.
+    func configHasVersion() throws -> Bool {
+        let object = try JSONSerialization.jsonObject(with: Data(contentsOf: paths.configFile))
+        return (object as? [String: Any])?["configVersion"] != nil
+    }
+
     /// One line about why decoding failed, fit for a notification.
     private static func brief(_ error: DecodingError) -> String {
         func path(_ c: DecodingError.Context) -> String {

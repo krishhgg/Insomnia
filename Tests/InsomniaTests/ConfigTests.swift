@@ -123,6 +123,48 @@ final class ConfigTests: XCTestCase {
         XCTAssertEqual(bareEnter(raised), .run(3 * 24 * 3600))
     }
 
+    /// Only a file without `configVersion` can hold an older build's stock
+    /// values. A current file's 30-day ceiling was set by hand and is kept,
+    /// with the presets and default under it.
+    func testACurrentFileKeepsA30DayCeilingSetByHand() throws {
+        let json = #"{"configVersion": 2, "maxDuration": 2592000, "presets": [1800, 3600, 7200, 14400, 28800, 43200, 86400, 259200], "defaultPreset": 259200}"#
+        let c = try Store.makeDecoder().decode(Config.self, from: Data(json.utf8))
+        XCTAssertEqual(c.maxDuration, 30 * 24 * 3600)
+        XCTAssertEqual(c.presets, Config.legacyPresets)
+        XCTAssertEqual(c.defaultPreset, 3 * 24 * 3600)
+
+        let written = try XCTUnwrap(JSONSerialization.jsonObject(with: Store.makeEncoder().encode(Config())) as? [String: Any])
+        XCTAssertEqual(written["configVersion"] as? Int, 2)
+    }
+
+    /// The app reads an older file with the stock values migrated and writes
+    /// it back once with the marker, so a 30-day ceiling typed into that file
+    /// afterwards is the user's. A current file is not rewritten at launch.
+    @MainActor
+    func testAnOlderFileIsWrittenBackOnceSoALaterHandEditIsKept() throws {
+        let h = Harness()
+        defer { h.home.destroy() }
+        let url = h.home.paths.configFile
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data(#"{"maxDuration": 2592000, "presets": [1800, 3600, 7200, 14400, 28800, 43200, 86400, 259200], "defaultPreset": 259200, "endFloor": 15}"#.utf8).write(to: url)
+
+        let upgraded = h.makeManager()
+        XCTAssertEqual(upgraded.config.maxDuration, 24 * 3600)
+        XCTAssertEqual(upgraded.config.defaultPreset, 24 * 3600)
+        XCTAssertEqual(upgraded.config.endFloor, 15)
+        var onDisk = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
+        XCTAssertEqual(onDisk["configVersion"] as? Int, 2)
+        XCTAssertEqual(onDisk["maxDuration"] as? Double, 24 * 3600)
+        XCTAssertEqual(onDisk["endFloor"] as? Int, 15)
+
+        onDisk["maxDuration"] = 2592000
+        let handEdited = try JSONSerialization.data(withJSONObject: onDisk)
+        try handEdited.write(to: url)
+        let later = h.makeManager()
+        XCTAssertEqual(later.config.maxDuration, 30 * 24 * 3600)
+        XCTAssertEqual(try Data(contentsOf: url), handEdited, "a current file is read, not rewritten")
+    }
+
     func testEmptyObjectIsDefaults() throws {
         let c = try Store.makeDecoder().decode(Config.self, from: Data("{}".utf8))
         XCTAssertEqual(c, Config())
