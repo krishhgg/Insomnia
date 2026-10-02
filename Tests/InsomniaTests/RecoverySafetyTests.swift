@@ -62,7 +62,9 @@ final class RecoverySafetyTests: XCTestCase {
     // MARK: Lifecycle under suspended operations (release the hold, then await)
 
     /// Reconcile's final pmset check is answered late, after a new session
-    /// started. It must not clear that session's sleep guard.
+    /// started. It must not clear that session's sleep guard. The stale bit
+    /// had no journal claim, so it is reported as someone else's before the
+    /// start; the start then clears the warning line.
     func testLateReconcileMustNotClearNewSessionSleepGuard() async throws {
         let gate = AsyncGate()
         h.guardFake.readGate = gate
@@ -79,8 +81,11 @@ final class RecoverySafetyTests: XCTestCase {
 
         XCTAssertTrue(m.isActive)
         XCTAssertTrue(h.guardFake.sleepDisabled, "the new session's sleep guard was cleared by the late reconcile")
-        XCTAssertEqual(h.guardFake.calls, ["pmset -g", "disablesleep 0", "disablesleep 1"])
+        XCTAssertEqual(h.guardFake.calls, ["pmset -g", "disablesleep 1"])
         XCTAssertEqual(try h.store.loadState()?.sleepDisabledByUs, true)
+        XCTAssertEqual(h.notifier.posts.map(\.title), [SessionManager.foreignSleepTitle])
+        XCTAssertNil(m.foreignSleepWarning)
+        XCTAssertNil(m.lastError)
     }
 
     /// `lowpowermode 1` completes after the session ended. The mode must not
