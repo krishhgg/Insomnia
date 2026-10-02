@@ -99,9 +99,11 @@ four `pmset` commands itself.
 An upgrade asks the running app to quit and stops if it refuses. The new
 bundle is built in a staging directory next to the app and moved into place in
 the same step that replaces the recovery agent; if the new agent cannot be
-loaded, the previous bundle is put back, so the loaded agent always matches
-the installed app. Unresolved recovery prevents replacing either; follow the
-reported instructions before retrying.
+loaded or its plist cannot be saved, the previous bundle is put back, so the
+loaded agent always matches the installed app. If an install is killed in the
+middle of that step, the next run keeps whichever bundle the agent's plist on
+disk pins. Unresolved recovery prevents replacing either; follow the reported
+instructions before retrying.
 
 </details>
 

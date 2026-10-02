@@ -131,6 +131,7 @@ is performed. Do not replace "not run" with "passed" based on source review.
 | Recovery agent refuses to run after the installed bundle or its sealed backstop.sh is modified, and logs why | Not run |
 | Running app refuses to arm (session start refused, reason shown) after its installed bundle is edited or re-signed under it | Not run |
 | Upgrade whose new agent fails to load puts the previous bundle back and reloads the previous agent, on a working Mac | Not run |
+| Upgrade whose new agent plist cannot be saved, and a rerun after an install killed mid-swap, leave the app and the agent's plist matching, on a working Mac | Not run |
 
 Hardware tests must be supervised and must not endanger active user work. Use
 a stable, ventilated surface, not an enclosure. Do not intentionally overheat a

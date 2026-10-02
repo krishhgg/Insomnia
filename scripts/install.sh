@@ -46,7 +46,9 @@ SUDOERS=/etc/sudoers.d/insomnia
 UID_NUM="$(id -u)"
 # Where the new bundle is assembled and signed (step 3) and where the previous
 # one waits during the swap (step 6). Both inside $APP_DIR, so the swap is two
-# renames on one filesystem.
+# renames on one filesystem. The staging directory's name carries the PID of
+# the run that made it, so a later run can tell a dead run's leftover from
+# the directory of an install that is still running (step 5).
 PREVIOUS_APP="$APP_DIR/.Insomnia.app.previous"
 STAGE=""
 NEW_APP=""
@@ -122,14 +124,7 @@ if "$PGREP" -x Insomnia >/dev/null 2>&1; then
   fi
 fi
 mkdir -p "$APP_DIR"
-# A run interrupted between the two renames of the swap leaves the previous
-# app under its holding name and nothing at $APP: put it back first.
-if [[ ! -e "$APP" && -d "$PREVIOUS_APP" ]]; then
-  mv "$PREVIOUS_APP" "$APP"
-  echo "restored $APP, which an interrupted run had set aside"
-fi
-rm -rf "$PREVIOUS_APP" "$APP_DIR"/.Insomnia.app.staging.*
-STAGE="$(mktemp -d "$APP_DIR/.Insomnia.app.staging.XXXXXX")"
+STAGE="$(mktemp -d "$APP_DIR/.Insomnia.app.staging.$$.XXXXXX")"
 NEW_APP="$STAGE/Insomnia.app"
 mkdir -p "$NEW_APP/Contents/MacOS"
 cp "$BIN" "$NEW_APP/Contents/MacOS/Insomnia"
@@ -191,6 +186,49 @@ if "$PGREP" -x Insomnia >/dev/null 2>&1; then
   echo "Insomnia started again; quit it and rerun. The app at $APP and the LaunchAgent were not touched." >&2
   exit 1
 fi
+
+# Leftovers of earlier runs are handled only here, under the lock. Step 6
+# runs under it too, so no other install is between setting the previous
+# bundle aside and resolving the swap now: a bundle at $PREVIOUS_APP belongs
+# to a run that was stopped, and no live run needs it to roll back.
+if [[ -d "$PREVIOUS_APP" ]]; then
+  # The requirement the plist on disk pins; launchd loads that file at the
+  # next login. Empty when there is no plist or it cannot be read.
+  pinned="$("$PLUTIL" -extract ProgramArguments.4 raw -o - "$PLIST" 2>/dev/null || true)"
+  if [[ ! -e "$APP" ]]; then
+    # Stopped between the two renames: nothing at $APP.
+    mv "$PREVIOUS_APP" "$APP"
+    echo "restored $APP, which an interrupted run had set aside"
+  elif [[ -n "$pinned" ]] \
+      && ! "$CODESIGN" --verify --strict "-R=$pinned" "$APP" >/dev/null 2>&1 \
+      && "$CODESIGN" --verify --strict "-R=$pinned" "$PREVIOUS_APP" >/dev/null 2>&1; then
+    # Stopped after the second rename but before the new plist was
+    # published: $PLIST still pins the previous bundle, so that one goes
+    # back and the interrupted run's build is discarded with this run's
+    # staging directory.
+    mv "$APP" "$STAGE/Interrupted.app"
+    mv "$PREVIOUS_APP" "$APP"
+    echo "restored $APP, which an interrupted run had set aside; $PLIST pins it"
+  else
+    # $APP is what the plist pins (the interrupted run got as far as
+    # publishing it), or nothing pins either: the set-aside copy is spare.
+    rm -rf "$PREVIOUS_APP"
+    echo "removed the bundle an interrupted run had set aside; $APP stays"
+  fi
+fi
+# Staging directories of runs that are gone. One whose PID is alive belongs
+# to an install that is still assembling its bundle and has not reached this
+# lock yet, so it stays. kill -0 only asks whether the process exists; it
+# sends no signal.
+for dir in "$APP_DIR"/.Insomnia.app.staging.*; do
+  [[ -d "$dir" && "$dir" != "$STAGE" ]] || continue
+  owner="${dir##*/.Insomnia.app.staging.}"
+  owner="${owner%%.*}"
+  if [[ "$owner" =~ ^[0-9]+$ ]] && kill -0 "$owner" 2>/dev/null; then
+    continue
+  fi
+  rm -rf "$dir"
+done
 
 step "Ending any stale session and checking the recovery journal"
 recovery_rc=0
@@ -305,18 +343,19 @@ mv "$NEW_APP" "$APP"
 bootstrap_rc=0
 "$LAUNCHCTL" bootstrap "gui/$UID_NUM" "$CANDIDATE" || bootstrap_rc=$?
 after="$(loaded_state)"
-
+published=0
 if (( bootstrap_rc == 0 )) && [[ "$after" == yes ]]; then
-  if ! mv -f "$CANDIDATE" "$PLIST"; then
-    cat >&2 <<FAIL
-
-Install stopped: the new LaunchAgent is loaded (launchctl print confirms) and
-the new app is at $APP, but the agent's plist could not be published to
-$PLIST, so the next login would load whatever is there now, which does not
-pin this build. Fix the directory and rerun.
-FAIL
-    exit 1
+  if mv -f "$CANDIDATE" "$PLIST"; then
+    published=1
+  else
+    # The new job is loaded, but the next login loads $PLIST, which still
+    # pins the previous build. Unload the new job; the swap is undone below
+    # like any other failed load, so bundle and plist match again.
+    "$LAUNCHCTL" bootout "gui/$UID_NUM/$LABEL" >/dev/null 2>&1 || true
   fi
+fi
+
+if (( published )); then
   echo "LaunchAgent $LABEL loaded (launchctl print confirms); $PLIST published"
   if (( had_app )); then
     rm -rf "$PREVIOUS_APP"
@@ -329,10 +368,15 @@ FAIL
     echo "removed the previous install's $APP_SUPPORT/backstop.sh (the agent now runs the copy sealed in the bundle)"
   fi
 else
+  fix_note="Fix the launchctl error and rerun."
   if (( bootstrap_rc != 0 )); then
     reason="'launchctl bootstrap' exited $bootstrap_rc for the new LaunchAgent"
-  else
+  elif [[ "$after" != yes ]]; then
     reason="'launchctl bootstrap' reported success, but the job is not confirmed loaded (launchctl print: $after)"
+  else
+    reason="the new LaunchAgent loaded, but its plist could not be moved to $PLIST,
+where the next login loads it from, so the new job was unloaded again"
+    fix_note="Check that $LAUNCH_AGENTS is writable and rerun."
   fi
   # Undo the swap first, so whatever job runs next (the previous plist
   # reloaded below, or loaded at the next login) finds the build it pins.
@@ -395,7 +439,7 @@ $plist_note
 $app_note
 $outcome
 $SUDOERS is installed and the recovery journal was clean when checked above.
-Fix the launchctl error and rerun.
+$fix_note
 FAIL
   exit 1
 fi
