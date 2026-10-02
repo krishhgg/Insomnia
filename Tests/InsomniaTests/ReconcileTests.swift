@@ -451,39 +451,39 @@ final class ReconcileTests: XCTestCase {
 
     /// backstop.sh removes session.json before its undo, so a pmset of its
     /// that hangs still holds the recovery lock when the tick sees the end.
-    /// One lock wait fails; the tick then waits the retry delay (the clock
-    /// here only moves when advanced) instead of queueing a wait and a log
-    /// line every second, and ends the session once the lock is free.
+    /// The test runs the ticks itself: the 1 Hz timer's first fire date
+    /// comes from the harness clock, which is fixed in 2027, so it never
+    /// fires during the test. The first tick finds the lock held and
+    /// fails one bounded wait. Ticks within the retry delay do not try
+    /// again, although the lock is free by then. The first tick after the
+    /// delay ends the session.
     func testTheTickWaitsTheRetryDelayWhileTheAgentHoldsTheLock() async throws {
-        let real = Harness(now: Date())
-        defer { real.home.destroy() }
-        let m = real.makeManager()
+        let m = h.makeManager(retryDelay: 60)
         await m.start(duration: 3600)
-        let held = try XCTUnwrap(try RecoveryLock(url: real.home.paths.recoveryLock).tryAcquire())
-        try real.store.deleteSession()
-        try real.store.saveState(.clean)
+        let held = try XCTUnwrap(try RecoveryLock(url: h.home.paths.recoveryLock).tryAcquire())
+        try h.store.deleteSession()
+        try h.store.saveState(.clean)
         func skipped() -> Int {
-            let log = (try? String(contentsOf: real.home.paths.logFile, encoding: .utf8)) ?? ""
+            let log = (try? String(contentsOf: h.home.paths.logFile, encoding: .utf8)) ?? ""
             return log.components(separatedBy: "agent end skipped").count - 1
         }
 
-        // Three seconds hold at least two ticks: without the delay, two failed lock waits.
-        try await Task.sleep(for: .milliseconds(3200))
+        await m.noticeAgentEnd()
         XCTAssertEqual(skipped(), 1)
         XCTAssertTrue(m.isActive)
 
         held.release()
-        try await Task.sleep(for: .milliseconds(1500))
-        XCTAssertTrue(m.isActive, "not before the retry delay")
-        real.clock.advance(60)
-        let deadline = Date().addingTimeInterval(8)
-        while m.isActive && Date() < deadline {
-            try await Task.sleep(for: .milliseconds(50))
-        }
+        await m.noticeAgentEnd()
+        h.clock.advance(59)
+        await m.noticeAgentEnd()
+        XCTAssertTrue(m.isActive, "no new attempt before the retry delay")
+        XCTAssertEqual(skipped(), 1)
 
+        h.clock.advance(1)
+        await m.noticeAgentEnd()
         XCTAssertFalse(m.isActive)
         XCTAssertEqual(skipped(), 1)
-        XCTAssertTrue(real.notifier.posts.last?.body.contains("recovery agent") ?? false, "\(real.notifier.posts)")
+        XCTAssertTrue(h.notifier.posts.last?.body.contains("recovery agent") ?? false, "\(h.notifier.posts)")
     }
 
     // MARK: A session.json recorded as ended
