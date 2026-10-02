@@ -515,3 +515,49 @@ struct Harness {
 func settleQueuedRequests() async {
     for _ in 0..<5 { await Task.yield() }
 }
+
+/// A keychain whose `set` blocks its thread until `release()`, the way a
+/// save waits while macOS shows a keychain dialog. The wait gives up after
+/// `limit` so a call made on the main actor fails a test instead of hanging
+/// it; `gaveUp` says it did. Reads and deletes answer at once from memory.
+final class BlockingKeychain: KeychainStoring, @unchecked Sendable {
+    /// Fulfilled once `set` is inside its wait.
+    let entered = XCTestExpectation(description: "the save is waiting")
+    private let gate = DispatchSemaphore(value: 0)
+    private let limit: DispatchTimeInterval
+    private let lock = NSLock()
+    private var items: [String: String] = [:]
+    private var waiting = false
+    private var _gaveUp = false
+
+    init(limit: DispatchTimeInterval = .seconds(5), items: [String: String] = [:]) {
+        self.limit = limit
+        self.items = items
+        entered.assertForOverFulfill = false
+    }
+
+    /// Whether a `set` is inside its wait right now.
+    var isWaiting: Bool { lock.withLock { waiting } }
+    var gaveUp: Bool { lock.withLock { _gaveUp } }
+
+    func release() { gate.signal() }
+
+    func get(service: String, account: String) throws -> String? {
+        lock.withLock { items["\(service)/\(account)"] }
+    }
+
+    func set(service: String, account: String, value: String) throws {
+        lock.withLock { waiting = true }
+        entered.fulfill()
+        let answered = gate.wait(timeout: .now() + limit) == .success
+        lock.withLock {
+            waiting = false
+            if !answered { _gaveUp = true }
+            items["\(service)/\(account)"] = value
+        }
+    }
+
+    func delete(service: String, account: String) throws {
+        _ = lock.withLock { items.removeValue(forKey: "\(service)/\(account)") }
+    }
+}

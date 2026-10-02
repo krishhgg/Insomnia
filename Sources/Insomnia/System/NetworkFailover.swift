@@ -102,10 +102,35 @@ enum HardwarePortsParser {
 
 // MARK: - Keychain
 
+/// Synchronous: a call can wait on a keychain dialog for as long as the
+/// user leaves it open. The app makes these calls only on `KeychainQueue`.
 protocol KeychainStoring: Sendable {
     func get(service: String, account: String) throws -> String?
     func set(service: String, account: String, value: String) throws
     func delete(service: String, account: String) throws
+}
+
+/// Runs the app's keychain calls one at a time on a thread of their own.
+/// A save can wait on a keychain dialog until the user answers it; on the
+/// main actor that wait would hold up the battery floor, the deadline
+/// timer and End. The prompt switch is process-wide, so a read that turns
+/// prompts off must not run while a save has them on: one serial queue
+/// for every call keeps them apart. A dispatch queue rather than an
+/// actor, so a call left waiting on a dialog holds this queue's thread
+/// and not one of the shared pool's.
+final class KeychainQueue: Sendable {
+    /// The one the app uses, for the failover's reads and Settings' saves.
+    static let shared = KeychainQueue()
+
+    private let queue = DispatchQueue(label: "com.kgarg.insomnia.keychain")
+
+    init() {}
+
+    func run<T: Sendable>(_ body: @escaping @Sendable () throws -> T) async throws -> T {
+        try await withCheckedThrowingContinuation { continuation in
+            queue.async { continuation.resume(with: Result(catching: body)) }
+        }
+    }
 }
 
 struct KeychainError: Error, LocalizedError, Sendable {
@@ -191,6 +216,8 @@ enum LegacyKeychain {
     private typealias AccessCreate = @convention(c) (CFString, CFArray?, UnsafeMutablePointer<Unmanaged<SecAccess>?>) -> OSStatus
     private typealias ItemCopyKeychain = @convention(c) (UnsafeRawPointer, UnsafeMutablePointer<Unmanaged<SecKeychain>?>) -> OSStatus
     private typealias TrustedApplicationCreate = @convention(c) (UnsafePointer<CChar>?, UnsafeMutablePointer<Unmanaged<SecTrustedApplication>?>) -> OSStatus
+    private typealias GetStatus = @convention(c) (SecKeychain?, UnsafeMutablePointer<UInt32>) -> OSStatus
+    private typealias Unlock = @convention(c) (SecKeychain?, UInt32, UnsafeRawPointer?, UInt8) -> OSStatus
 
     private static func symbol<T>(_ name: String) throws -> T {
         guard let handle = dlopen(nil, RTLD_LAZY), let pointer = dlsym(handle, name) else {
@@ -260,6 +287,25 @@ enum LegacyKeychain {
         return keychain.takeRetainedValue()
     }
 
+    /// Whether `keychain` (nil: the default keychain) is locked. Only reads
+    /// its status, so no prompt.
+    static func isLocked(_ keychain: SecKeychain?) throws -> Bool {
+        let get: GetStatus = try symbol("SecKeychainGetStatus")
+        var status: UInt32 = 0
+        let result = get(keychain, &status)
+        guard result == errSecSuccess else { throw KeychainError(status: result) }
+        // kSecUnlockStateStatus
+        return status & 1 == 0
+    }
+
+    /// Unlocks `keychain` (nil: the default keychain) by asking the user for
+    /// its password, if prompts are allowed; otherwise it fails.
+    static func unlock(_ keychain: SecKeychain?) throws {
+        let unlock: Unlock = try symbol("SecKeychainUnlock")
+        let result = unlock(keychain, 0, nil, 0)
+        guard result == errSecSuccess else { throw KeychainError(status: result) }
+    }
+
     /// This process's code as a trusted application. Under ad-hoc signing
     /// its designated requirement is the build's cdhash, so an access list
     /// naming it trusts exactly this build.
@@ -295,6 +341,11 @@ protocol KeychainItemCalls: Sendable {
     func delete(_ query: CFDictionary) -> OSStatus
     /// The keychain file holding `item`, a reference from `copyMatching`.
     func keychain(of item: CFTypeRef) -> (OSStatus, SecKeychain?)
+    /// Whether that keychain is locked.
+    func isLocked(_ keychain: SecKeychain?) -> (OSStatus, Bool)
+    /// Unlocks it, with the system's password prompt when prompts are
+    /// allowed.
+    func unlock(_ keychain: SecKeychain?) -> OSStatus
 }
 
 struct SecurityItemCalls: KeychainItemCalls {
@@ -323,6 +374,27 @@ struct SecurityItemCalls: KeychainItemCalls {
             return (errSecUnimplemented, nil)
         }
     }
+
+    func isLocked(_ keychain: SecKeychain?) -> (OSStatus, Bool) {
+        do {
+            return (errSecSuccess, try LegacyKeychain.isLocked(keychain))
+        } catch let error as KeychainError {
+            return (error.status, false)
+        } catch {
+            return (errSecUnimplemented, false)
+        }
+    }
+
+    func unlock(_ keychain: SecKeychain?) -> OSStatus {
+        do {
+            try LegacyKeychain.unlock(keychain)
+            return errSecSuccess
+        } catch let error as KeychainError {
+            return error.status
+        } catch {
+            return errSecUnimplemented
+        }
+    }
 }
 
 /// Login keychain generic password, service `insomnia-hotspot`, account =
@@ -334,17 +406,21 @@ struct SecurityItemCalls: KeychainItemCalls {
 ///
 /// A save never leaves the user without a password, and it writes to the
 /// keychain file that holds the item reads find, which need not be the
-/// default keychain. An item this build can read already names this build
-/// in its access list, so only its value changes, in place. An item it
-/// cannot read (another build's, or a locked keychain) needs a new access
-/// list, and the file-based keychain changes that only by replacing the
-/// item: the new password is added beside it under
+/// default keychain. A locked keychain hides this build's items as well as
+/// another build's, so a save that finds the item unreadable first unlocks
+/// that keychain and starts over. An item this build can read already
+/// names this build in its access list, so only its value changes, in
+/// place. An item it still cannot read is another build's and needs a new
+/// access list, which the file-based keychain changes only by replacing
+/// the item: the new password goes beside it under
 /// `replacementService(for:)`, the old item is deleted, and the new one is
 /// renamed into its place. `get` reads the replacement when the item itself
 /// is missing or unreadable, so a save that fails or is cut off at any step
-/// leaves the old password or the new one. The prompts a save may raise,
-/// the unlock and the delete of another build's item, are allowed because
-/// a save or clear is the user's own click in Settings.
+/// leaves a password reads return, the one they returned before or the new
+/// one. The prompts a save may raise, the unlock and the delete of another
+/// build's item, are allowed because a save or clear is the user's own
+/// click in Settings. Every call can wait on such a prompt, so the app
+/// runs them on `KeychainQueue`.
 ///
 /// `kSecAttrAccessible` (this device only, when unlocked) is not set: the
 /// file-based login keychain accepts and drops it (measured on a throwaway
@@ -412,7 +488,11 @@ struct KeychainStore: KeychainStoring, @unchecked Sendable {
     }
 
     func set(service: String, account: String, value: String) throws {
-        let data = Data(value.utf8)
+        try set(service: service, account: account, data: Data(value.utf8), unlocked: false)
+    }
+
+    /// `unlocked`: this save has already unlocked the keychain once.
+    private func set(service: String, account: String, data: Data, unlocked: Bool) throws {
         let (status, _) = try read(service: service, account: account)
         switch status {
         case errSecItemNotFound:
@@ -421,13 +501,21 @@ struct KeychainStore: KeychainStoring, @unchecked Sendable {
             // Readable without a prompt, so the access list already names
             // this build: one in-place change of the value.
             let holder = try keychainHolding(service: service, account: account)
-            let query = self.query(service: service, account: account, in: holder) as CFDictionary
-            let changes = [kSecValueData as String: data] as CFDictionary
-            let updated = try withPrompts(false) { calls.update(query, changes) }
-            guard updated == errSecSuccess else { throw KeychainError(status: updated) }
+            try updateValue(service: service, account: account, data: data, in: holder)
         default:
             guard KeychainError(status: status).isUnreadableWithoutPrompt else { throw KeychainError(status: status) }
-            try replaceUnreadable(service: service, account: account, data: data)
+            let holder = try keychainHolding(service: service, account: account)
+            if try isLocked(holder) {
+                // Locked, every item reads as unreadable, this build's own
+                // included. Unlock (the user's Save allows the prompt) and
+                // decide again by what reads return then.
+                guard !unlocked else { throw KeychainError(status: errSecInteractionNotAllowed) }
+                let result = try withPrompts(true) { calls.unlock(holder) }
+                guard result == errSecSuccess else { throw KeychainError(status: result) }
+                try set(service: service, account: account, data: data, unlocked: true)
+                return
+            }
+            try replaceUnreadable(service: service, account: account, data: data, in: holder)
             return
         }
         // A replacement left by an interrupted save is only read while this
@@ -441,31 +529,67 @@ struct KeychainStore: KeychainStoring, @unchecked Sendable {
         try deleteItem(service: Self.replacementService(for: service), account: account, in: nil)
     }
 
-    /// Another build's item or a locked keychain. Each step leaves a
-    /// password `get` can find: the old item until the delete succeeds,
-    /// the replacement from then on. A refused delete (the user declined
-    /// the prompt) removes the replacement again and keeps the old item.
-    private func replaceUnreadable(service: String, account: String, data: Data) throws {
-        let holder = try keychainHolding(service: service, account: account)
+    /// Another build's item, in an unlocked keychain. Each step leaves a
+    /// password `get` can find: what it found before until the new
+    /// password is written, the new one from then on. A replacement this
+    /// build can read, left by a save that stopped short, is what `get`
+    /// returns now, so it is never deleted first: its value changes in
+    /// place. One this build cannot read is another build's and is deleted
+    /// before the add. A refused delete of the old item (the user declined
+    /// the prompt) puts the replacement back as it was, removing one this
+    /// save added, and keeps the old item.
+    private func replaceUnreadable(service: String, account: String, data: Data, in holder: SecKeychain?) throws {
         let replacement = Self.replacementService(for: service)
-        try deleteItem(service: replacement, account: account, in: holder)
-        try add(service: replacement, account: account, data: data, label: service, to: holder)
+        let (status, earlier) = try read(service: replacement, account: account, in: holder)
+        switch status {
+        case errSecSuccess:
+            try updateValue(service: replacement, account: account, data: data, in: holder)
+        case errSecItemNotFound:
+            try add(service: replacement, account: account, data: data, label: service, to: holder)
+        default:
+            guard KeychainError(status: status).isUnreadableWithoutPrompt else { throw KeychainError(status: status) }
+            // Only while the keychain is unlocked does unreadable mean
+            // another build's; a keychain that locked again since the
+            // check could be hiding this build's replacement.
+            guard try !isLocked(holder) else { throw KeychainError(status: errSecInteractionNotAllowed) }
+            try deleteItem(service: replacement, account: account, in: holder)
+            try add(service: replacement, account: account, data: data, label: service, to: holder)
+        }
         do {
             try deleteItem(service: service, account: account, in: holder)
         } catch {
-            let added = query(service: replacement, account: account, in: holder) as CFDictionary
-            _ = try? withPrompts(false) { calls.delete(added) }
+            if status != errSecSuccess {
+                let added = query(service: replacement, account: account, in: holder) as CFDictionary
+                _ = try? withPrompts(false) { calls.delete(added) }
+            } else if let earlier {
+                try? updateValue(service: replacement, account: account, data: earlier, in: holder)
+            }
             throw error
         }
         let renamed = query(service: replacement, account: account, in: holder) as CFDictionary
         let changes = [kSecAttrService as String: service] as CFDictionary
-        let status = try withPrompts(false) { calls.update(renamed, changes) }
+        let renameStatus = try withPrompts(false) { calls.update(renamed, changes) }
+        guard renameStatus == errSecSuccess else { throw KeychainError(status: renameStatus) }
+    }
+
+    /// One prompt-free, in-place change of an item's value; for items this
+    /// build can read, whose access list already names it.
+    private func updateValue(service: String, account: String, data: Data, in holder: SecKeychain?) throws {
+        let query = self.query(service: service, account: account, in: holder) as CFDictionary
+        let changes = [kSecValueData as String: data] as CFDictionary
+        let status = try withPrompts(false) { calls.update(query, changes) }
         guard status == errSecSuccess else { throw KeychainError(status: status) }
     }
 
+    private func isLocked(_ holder: SecKeychain?) throws -> Bool {
+        let (status, locked) = calls.isLocked(holder)
+        guard status == errSecSuccess else { throw KeychainError(status: status) }
+        return locked
+    }
+
     /// A prompt-free read of one item's value.
-    private func read(service: String, account: String) throws -> (OSStatus, Data?) {
-        var query = self.query(service: service, account: account)
+    private func read(service: String, account: String, in holder: SecKeychain? = nil) throws -> (OSStatus, Data?) {
+        var query = self.query(service: service, account: account, in: holder)
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
         var item: CFTypeRef?
@@ -606,6 +730,7 @@ final class NetworkFailover {
 
     private let paths: Paths
     private let keychain: any KeychainStoring
+    private let keychainQueue: KeychainQueue
     private let nudge: TmuxNudge
     private let hotspotJoiner: any HotspotJoining
     private let notifier: any Notifying
@@ -624,6 +749,7 @@ final class NetworkFailover {
     init(
         paths: Paths,
         keychain: any KeychainStoring = KeychainStore(),
+        keychainQueue: KeychainQueue = .shared,
         nudge: TmuxNudge = TmuxNudge(),
         hotspotJoiner: any HotspotJoining = CoreWLANHotspotJoiner(),
         notifier: any Notifying,
@@ -633,6 +759,7 @@ final class NetworkFailover {
     ) {
         self.paths = paths
         self.keychain = keychain
+        self.keychainQueue = keychainQueue
         self.nudge = nudge
         self.hotspotJoiner = hotspotJoiner
         self.notifier = notifier
@@ -809,18 +936,32 @@ final class NetworkFailover {
             Log.error("hotspot join skipped: no Wi-Fi interface")
             return
         }
-        let password: String
+        // Off the main actor, behind any save Settings has running, which
+        // may be waiting on a keychain dialog.
+        let epoch = self.epoch
+        let keychain = self.keychain
+        let read: Result<String?, any Error>
         do {
-            guard let p = try keychain.get(service: KeychainStore.service, account: ssid) else {
-                report(.missing)
-                return
-            }
+            read = .success(try await keychainQueue.run { try keychain.get(service: KeychainStore.service, account: ssid) })
+        } catch {
+            read = .failure(error)
+        }
+        guard !Task.isCancelled, self.epoch == epoch else {
+            Log.info("hotspot join dropped: the session ended during the keychain read")
+            return
+        }
+        let password: String
+        switch read {
+        case let .success(p?):
             password = p
             passwordProblem = nil
-        } catch let error as KeychainError {
+        case .success(nil):
+            report(.missing)
+            return
+        case let .failure(error as KeychainError):
             report(error.problem)
             return
-        } catch {
+        case let .failure(error):
             report(.error(error.localizedDescription))
             return
         }

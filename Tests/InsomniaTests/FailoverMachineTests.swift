@@ -203,6 +203,52 @@ final class NetworkFailoverDriverTests: XCTestCase {
         XCTAssertNil(n.passwordProblem)
     }
 
+    /// A join whose keychain read waits behind a save in Settings (stuck
+    /// on a keychain dialog) does not hold up stop(), and once the session
+    /// has ended the read's answer neither joins nor reports anything.
+    func testAJoinWaitingBehindABlockedSaveDoesNothingAfterTheSessionEnds() async throws {
+        let queue = KeychainQueue()
+        let keychain = BlockingKeychain(items: ["\(KeychainStore.service)/Phone": "old"])
+        let store = KeychainHotspotSecretStore(keychain: keychain, queue: queue) { "Phone" }
+        let saving = Task { await SettingsView.storePassword("new", in: store) }
+        await fulfillment(of: [keychain.entered], timeout: 5)
+
+        let joiner = RecordingHotspotJoiner()
+        let notifier = RecordingNotifier()
+        let clock = FakeClock(Date(timeIntervalSince1970: 1_800_000_000))
+        let joining = expectation(description: "the join started")
+        joining.assertForOverFulfill = false
+        var config = Config()
+        config.hotspotSSID = "Phone"
+        let n = NetworkFailover(
+            paths: home.paths,
+            keychain: keychain,
+            keychainQueue: queue,
+            hotspotJoiner: joiner,
+            notifier: notifier,
+            wifiInterface: "en0",
+            clock: { clock.now }
+        ) {
+            joining.fulfill()
+            return config
+        }
+        await n.simulate(satisfied: false)
+        clock.advance(30)
+        let tick = n.fireTimer()
+        await fulfillment(of: [joining], timeout: 5)
+
+        n.stop()
+        XCTAssertTrue(keychain.isWaiting, "stop() ran while the save was still waiting")
+        keychain.release()
+        _ = await saving.value
+        await tick.value
+
+        XCTAssertEqual(joiner.calls, [])
+        XCTAssertEqual(notifier.posts.map(\.title), [])
+        XCTAssertNil(n.passwordProblem)
+        XCTAssertFalse(keychain.gaveUp)
+    }
+
     private func driver(
         keychain: FakeKeychainStore,
         joiner: RecordingHotspotJoiner,

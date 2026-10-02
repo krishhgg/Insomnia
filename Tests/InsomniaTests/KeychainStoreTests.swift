@@ -200,6 +200,34 @@ final class KeychainStoreTests: XCTestCase {
         XCTAssertEqual(try items(account: "Phone", service: replacement).count, 0)
     }
 
+    /// The old build's item (here one trusting nobody) and this build's
+    /// replacement from a save that stopped short are both there. The save
+    /// changes the replacement's value, deletes the old item and renames
+    /// the replacement: one item, trusting this process.
+    func testASaveWithAReplacementLeftBehindFinishesTheReplace() throws {
+        try addItem(account: "Phone", value: "theirs", trusting: [])
+        try store.set(service: replacement, account: "Phone", value: "mid")
+        XCTAssertEqual(try store.get(service: service, account: "Phone"), "mid")
+
+        try store.set(service: service, account: "Phone", value: "mine")
+
+        XCTAssertEqual(try store.get(service: service, account: "Phone"), "mine")
+        XCTAssertEqual(try items(account: "Phone").count, 1)
+        XCTAssertEqual(try items(account: "Phone", service: replacement).count, 0)
+        let me = try trustedApplicationData(LegacyKeychain.thisApplication())
+        let trusting = try accessLists(account: "Phone").compactMap(\.applications).filter { !$0.isEmpty }
+        XCTAssertEqual(try trusting.map { try $0.map(trustedApplicationData) }, [[me]])
+    }
+
+    /// The lock check only reads the keychain's status.
+    func testTheLockStateIsReadWithoutAPrompt() throws {
+        XCTAssertFalse(try LegacyKeychain.isLocked(throwaway.keychain))
+        try throwaway.lock()
+        XCTAssertTrue(try LegacyKeychain.isLocked(throwaway.keychain))
+        try throwaway.unlock()
+        XCTAssertFalse(try LegacyKeychain.isLocked(throwaway.keychain))
+    }
+
     /// A replacement left by a save that stopped before the rename is what
     /// reads return, and clearing the password removes it.
     func testReadsAndClearsCoverAReplacementLeftBehind() throws {
@@ -397,6 +425,8 @@ final class KeychainModel: KeychainItemCalls, @unchecked Sendable {
 
     enum Kind: String {
         case read, find, add, update, rename, delete
+        /// The keychain-wide calls; recorded with an empty service.
+        case lockCheck, unlock
     }
 
     struct Call: Equatable, CustomStringConvertible {
@@ -420,6 +450,10 @@ final class KeychainModel: KeychainItemCalls, @unchecked Sendable {
     private var _calls: [Call] = []
     private var _added: [[String: Any]] = []
     private var failures: [Kind: [OSStatus]] = [:]
+    /// Call number (0-based, every kind counted) that fails, and how.
+    private var failingCall: (index: Int, status: OSStatus)?
+    /// The keychain locks itself again just before this read.
+    private var relockBeforeRead: String?
     /// Changes (adds, updates, deletes) that still take effect; nil is no
     /// limit. Once spent, every change fails with errSecIO and changes
     /// nothing, which leaves the keychain as a crash would.
@@ -446,6 +480,18 @@ final class KeychainModel: KeychainItemCalls, @unchecked Sendable {
     /// The next call of `kind` fails with `status` and changes nothing.
     func fail(_ kind: Kind, with status: OSStatus) {
         lock.withLock { failures[kind, default: []].append(status) }
+    }
+
+    /// Call number `index` (0-based, every kind counted) fails with
+    /// `status` and changes nothing.
+    func fail(callAt index: Int, with status: OSStatus) {
+        lock.withLock { failingCall = (index, status) }
+    }
+
+    /// The keychain locks again, as its auto-lock would, just before the
+    /// next read of `service`.
+    func relock(beforeReadOf service: String) {
+        lock.withLock { relockBeforeRead = service }
     }
 
     func copyMatching(_ query: CFDictionary, _ result: UnsafeMutablePointer<CFTypeRef?>) -> OSStatus {
@@ -510,6 +556,26 @@ final class KeychainModel: KeychainItemCalls, @unchecked Sendable {
         (errSecSuccess, nil)
     }
 
+    func isLocked(_ keychain: SecKeychain?) -> (OSStatus, Bool) {
+        var locked = false
+        let status = record(.lockCheck, "") { _ in
+            locked = _locked
+            return errSecSuccess
+        }
+        return (status, locked)
+    }
+
+    /// Unlocking needs the prompt, and the user's answer is `promptAnswer`.
+    func unlock(_ keychain: SecKeychain?) -> OSStatus {
+        record(.unlock, "") { _ in
+            guard _locked else { return errSecSuccess }
+            guard _calls.last!.promptsAllowed else { return errSecInteractionNotAllowed }
+            guard promptAnswer == errSecSuccess else { return promptAnswer }
+            _locked = false
+            return errSecSuccess
+        }
+    }
+
     /// A change, which a locked keychain refuses without a prompt.
     private func change(_ kind: Kind, _ service: String, _ body: (Item?) -> OSStatus) -> OSStatus {
         record(kind, service) { item in
@@ -532,6 +598,13 @@ final class KeychainModel: KeychainItemCalls, @unchecked Sendable {
         let prompts = prompts.allowed
         return lock.withLock {
             _calls.append(Call(kind, service, prompts: prompts))
+            if kind == .read, service == relockBeforeRead {
+                relockBeforeRead = nil
+                _locked = true
+            }
+            if let failing = failingCall, failing.index == _calls.count - 1 {
+                return failing.status
+            }
             if var queued = failures[kind], !queued.isEmpty {
                 let status = queued.removeFirst()
                 failures[kind] = queued
@@ -608,7 +681,8 @@ final class KeychainStoreReplaceTests: XCTestCase {
         XCTAssertEqual(keychain.calls, [
             .init(.read, service, prompts: false),
             .init(.find, service, prompts: false),
-            .init(.delete, replacement, prompts: false),
+            .init(.lockCheck, "", prompts: false),
+            .init(.read, replacement, prompts: false),
             .init(.add, replacement, prompts: false),
             .init(.delete, service, prompts: false),
             .init(.delete, service, prompts: true),
@@ -699,7 +773,8 @@ final class KeychainStoreReplaceTests: XCTestCase {
     }
 
     /// A locked keychain gets the unlock prompt on a save, which is the
-    /// user's click, and never on a read.
+    /// user's click, and never on a read. Unlocked, this build's item
+    /// reads again, so its value changes in place.
     func testALockedKeychainIsUnlockedForASaveButNotForARead() throws {
         let keychain = KeychainModel([service: .init(value: "old", ours: true)], locked: true)
 
@@ -711,8 +786,148 @@ final class KeychainStoreReplaceTests: XCTestCase {
 
         try store(keychain).set(service: service, account: "Phone", value: "new")
 
-        XCTAssertEqual(keychain.calls.filter(\.promptsAllowed), [.init(.add, replacement, prompts: true)])
+        XCTAssertEqual(keychain.calls.filter(\.promptsAllowed), [.init(.unlock, "", prompts: true)])
+        XCTAssertFalse(keychain.calls.contains { $0.kind == .delete && $0.service == service }, "this build's item is not replaced")
         XCTAssertEqual(keychain.items, [service: .init(value: "new", ours: true)])
+    }
+
+    /// The user declines the unlock prompt: nothing changes.
+    func testADeclinedUnlockChangesNothing() {
+        let items: [String: KeychainModel.Item] = [service: .init(value: "old", ours: false), replacement: .init(value: "mid", ours: true)]
+        let keychain = KeychainModel(items, locked: true)
+        keychain.promptAnswer = errSecUserCanceled
+
+        XCTAssertThrowsError(try store(keychain).set(service: service, account: "Phone", value: "new")) { error in
+            XCTAssertEqual((error as? KeychainError)?.status, errSecUserCanceled)
+        }
+
+        XCTAssertEqual(keychain.items, items)
+        XCTAssertEqual(keychain.calls.map(\.kind), [.read, .find, .lockCheck, .unlock])
+    }
+
+    // MARK: A save that finds an earlier save's replacement
+
+    /// An earlier save stopped after writing the replacement, so the old
+    /// build's item and this build's replacement are both there, and the
+    /// replacement is the password reads return. The next save changes its
+    /// value in place and never deletes it.
+    func testAReplacementThisBuildCanReadIsUpdatedInPlaceNotDeleted() throws {
+        let keychain = KeychainModel([service: .init(value: "old", ours: false), replacement: .init(value: "mid", ours: true)])
+
+        try store(keychain).set(service: service, account: "Phone", value: "new")
+
+        XCTAssertEqual(keychain.calls, [
+            .init(.read, service, prompts: false),
+            .init(.find, service, prompts: false),
+            .init(.lockCheck, "", prompts: false),
+            .init(.read, replacement, prompts: false),
+            .init(.update, replacement, prompts: false),
+            .init(.delete, service, prompts: false),
+            .init(.delete, service, prompts: true),
+            .init(.rename, replacement, prompts: false),
+        ])
+        XCTAssertEqual(keychain.items, [service: .init(value: "new", ours: true)])
+    }
+
+    /// The same save failing at each of its calls in turn, and cut off
+    /// after each number of changes: every time reads still return a
+    /// password, the one from before or the new one, and a retry then
+    /// saves.
+    func testARetryStartingWithBothItemsAlwaysLeavesAReadablePassword() throws {
+        let start: [String: KeychainModel.Item] = [service: .init(value: "old", ours: false), replacement: .init(value: "mid", ours: true)]
+        let clean = KeychainModel(start)
+        try store(clean).set(service: service, account: "Phone", value: "new")
+        let steps = clean.calls.count
+
+        for failing in 0..<steps {
+            let keychain = KeychainModel(start)
+            keychain.fail(callAt: failing, with: errSecIO)
+            try assertAPasswordSurvives(keychain, "failing call \(failing) (\(clean.calls[failing]))")
+        }
+        for changes in 0...steps {
+            let keychain = KeychainModel(start)
+            keychain.changesLeft = changes
+            try assertAPasswordSurvives(keychain, "cut off after \(changes) changes")
+        }
+    }
+
+    /// The user declines the delete prompt for the old item: the
+    /// replacement gets its earlier value back, so reads return what they
+    /// did before the save.
+    func testADeclinedDeleteWithAReadableReplacementPutsItBack() throws {
+        let start: [String: KeychainModel.Item] = [service: .init(value: "old", ours: false), replacement: .init(value: "mid", ours: true)]
+        let keychain = KeychainModel(start)
+        keychain.promptAnswer = errSecUserCanceled
+
+        XCTAssertThrowsError(try store(keychain).set(service: service, account: "Phone", value: "new")) { error in
+            XCTAssertEqual((error as? KeychainError)?.status, errSecUserCanceled)
+        }
+
+        XCTAssertEqual(keychain.items, start)
+        XCTAssertEqual(try store(keychain).get(service: service, account: "Phone"), "mid")
+    }
+
+    /// Locked, the replacement reads as unreadable like the old item. The
+    /// save unlocks first and only then decides, so this build's
+    /// replacement is changed in place rather than taken for another
+    /// build's and deleted.
+    func testALockedKeychainIsUnlockedBeforeTheReplacementIsJudged() throws {
+        let keychain = KeychainModel([service: .init(value: "old", ours: false), replacement: .init(value: "mid", ours: true)], locked: true)
+
+        try store(keychain).set(service: service, account: "Phone", value: "new")
+
+        XCTAssertEqual(keychain.calls.filter(\.promptsAllowed), [.init(.unlock, "", prompts: true), .init(.delete, service, prompts: true)])
+        XCTAssertFalse(keychain.calls.contains { $0.kind == .delete && $0.service == replacement })
+        XCTAssertEqual(keychain.items, [service: .init(value: "new", ours: true)])
+    }
+
+    /// A replacement still unreadable with the keychain unlocked is another
+    /// build's: it holds nothing this build can return, so it is deleted
+    /// (with the prompt) and added again.
+    func testAnotherBuildsReplacementIsDeletedAndAddedAgain() throws {
+        let keychain = KeychainModel([service: .init(value: "old", ours: false), replacement: .init(value: "theirs", ours: false)])
+
+        try store(keychain).set(service: service, account: "Phone", value: "new")
+
+        XCTAssertEqual(Array(keychain.calls.dropFirst(3)), [
+            .init(.read, replacement, prompts: false),
+            .init(.lockCheck, "", prompts: false),
+            .init(.delete, replacement, prompts: false),
+            .init(.delete, replacement, prompts: true),
+            .init(.add, replacement, prompts: false),
+            .init(.delete, service, prompts: false),
+            .init(.delete, service, prompts: true),
+            .init(.rename, replacement, prompts: false),
+        ])
+        XCTAssertEqual(keychain.items, [service: .init(value: "new", ours: true)])
+    }
+
+    /// The keychain locks again between the check and the read of the
+    /// replacement, so this build's replacement reads as unreadable. It is
+    /// not deleted on that reading: the save stops, and the replacement
+    /// still holds the password reads return.
+    func testAKeychainThatLocksAgainMidSaveKeepsTheReplacement() throws {
+        let keychain = KeychainModel([service: .init(value: "old", ours: false), replacement: .init(value: "mid", ours: true)])
+        keychain.relock(beforeReadOf: replacement)
+        keychain.fail(.add, with: errSecIO)
+
+        XCTAssertThrowsError(try store(keychain).set(service: service, account: "Phone", value: "new")) { error in
+            XCTAssertEqual((error as? KeychainError)?.status, errSecInteractionNotAllowed)
+        }
+
+        XCTAssertEqual(keychain.items[replacement], .init(value: "mid", ours: true))
+        XCTAssertFalse(keychain.calls.contains { $0.kind == .delete })
+    }
+
+    private func assertAPasswordSurvives(_ keychain: KeychainModel, _ when: String) throws {
+        _ = try? store(keychain).set(service: service, account: "Phone", value: "new")
+        keychain.changesLeft = nil
+        let read = Result { try store(keychain).get(service: service, account: "Phone") }
+        XCTAssertNoThrow(try read.get(), "\(when): \(keychain.items)")
+        XCTAssertTrue(["mid", "new"].contains(try? read.get()), "\(when): read \(String(describing: try? read.get())), \(keychain.items)")
+
+        try store(keychain).set(service: service, account: "Phone", value: "newer")
+        XCTAssertEqual(keychain.items, [service: .init(value: "newer", ours: true)], "the retry after \(when)")
     }
 
     func testClearingRemovesTheReplacementToo() throws {

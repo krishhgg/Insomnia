@@ -227,8 +227,11 @@ unreadable by the new build. Insomnia then skips the join, shows "Hotspot
 password unreadable by this build" in the right-click menu and in Settings,
 and sends one notification per outage. Enter the password again in Settings
 and save; the save writes the new password before it removes the old item,
-and macOS may ask you to allow Insomnia to delete the old one. A build signed with a stable identity would keep the
-item readable across upgrades.
+and macOS may ask you to allow Insomnia to delete the old one, or to unlock
+the login keychain. The Save button reads "Saving…" until macOS answers;
+the rest of Insomnia, including the battery floor and End, keeps running
+while the dialog is open. A build signed with a stable identity would keep
+the item readable across upgrades.
 
 macOS requires Location Services permission to reveal network names. Insomnia
 requests it on the first hotspot save, or when starting a session with a

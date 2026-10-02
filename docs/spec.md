@@ -309,21 +309,38 @@ provided by the standalone backstop. Performance effects depend on workload.
   (re-armed on recovery, on stop and when the password is saved). A save in
   Settings never leaves the user without a password, and it writes to the
   keychain that holds the item reads find, which need not be the default
-  keychain (a new item goes to the default keychain). An item the build can
-  read already names it, so only the value changes, in place
-  (`SecItemUpdate`). An item it cannot read needs a new access list, and
-  the file-based keychain changes that only by replacing the item (an
-  in-place update of `kSecAttrAccess` did not return when tried on a
-  throwaway keychain): the new password is added beside the old item, in
-  the same keychain, under service `insomnia-hotspot.replacing`; the old
-  item is deleted; the new one is renamed to `insomnia-hotspot`. Reads fall
-  back to the `.replacing` item when the main one is missing or unreadable,
-  so a save that fails or stops at any step leaves the old password or the
-  new one, and a refused delete removes the new item again. Clearing the
-  password deletes both. Deleting another build's item, and unlocking the
-  keychain for a save, need the prompt, which is allowed only there.
+  keychain (a new item goes to the default keychain). A locked keychain
+  hides this build's items as well as another build's, so a save that
+  finds the item unreadable first checks the keychain's lock state
+  (`SecKeychainGetStatus`) and, if it is locked, unlocks it (the prompt)
+  and starts over. An item the build can read already names it, so only
+  the value changes, in place (`SecItemUpdate`). An item it still cannot
+  read is another build's and needs a new access list, and the file-based
+  keychain changes that only by replacing the item (an in-place update of
+  `kSecAttrAccess` did not return when tried on a throwaway keychain): the
+  new password is put beside the old item, in the same keychain, under
+  service `insomnia-hotspot.replacing`; the old item is deleted; the new
+  one is renamed to `insomnia-hotspot`. Reads fall back to the
+  `.replacing` item when the main one is missing or unreadable, so a save
+  that fails or stops at any step leaves the password reads returned
+  before or the new one. A `.replacing` item the build can read, left by a
+  save that stopped short, is that password, so the next save changes its
+  value in place and never deletes it first; one it cannot read with the
+  keychain unlocked is another build's and is deleted, then added again. A
+  refused delete of the old item removes a `.replacing` item the save
+  added, or puts back the value of one it changed. Clearing the password
+  deletes both. Deleting another build's item, and unlocking the keychain
+  for a save, need the prompt, which is allowed only there.
   `kSecAttrAccessible` is not set: the file-based keychain drops it, and
   the data protection keychain needs an access-group entitlement.
+- Every keychain call the app makes, the failover's reads and the saves
+  and clears in Settings, runs on one serial dispatch queue
+  (`KeychainQueue`), never on the main actor. A save can wait on a
+  keychain prompt for as long as the user leaves it open, and the battery
+  floor, the deadline timer and End keep running meanwhile; one queue also
+  keeps two calls from setting the process-wide prompt switch at once. The
+  Save button reads "Saving…" until the keychain answers. A join whose
+  read waited behind a save does nothing once the session has ended.
 - macOS 26 requires Location Services permission before CoreWLAN exposes SSIDs
   or returns results for an SSID-filtered scan. Insomnia requests when-in-use
   access when the hotspot is saved or a configured session starts, never at

@@ -74,28 +74,32 @@ final class IntegrationWiringTests: XCTestCase {
         XCTAssertNil(LiveStatusSource.bundleID(forDisplayName: "Safari", in: statuses))
     }
 
-    func testKeychainSecretStoreUsesFailoverServiceAndCurrentSSID() throws {
+    @MainActor
+    func testKeychainSecretStoreUsesFailoverServiceAndCurrentSSID() async throws {
         let keychain = FakeKeychainStore()
-        var ssid = "Phone"
-        let store = KeychainHotspotSecretStore(keychain: keychain) { ssid }
+        let ssid = Locked("Phone")
+        let store = KeychainHotspotSecretStore(keychain: keychain, queue: KeychainQueue()) { ssid.value }
 
-        try store.save("secret")
+        try await store.save("secret")
 
         XCTAssertEqual(try keychain.get(service: KeychainStore.service, account: "Phone"), "secret")
-        XCTAssertEqual(try store.load(), "secret")
+        let loaded = try await store.load()
+        XCTAssertEqual(loaded, "secret")
 
-        ssid = "Other Phone"
-        XCTAssertNil(try store.load())
+        ssid.value = "Other Phone"
+        let other = try await store.load()
+        XCTAssertNil(other)
     }
 
-    func testKeychainSecretStoreMovesPasswordWhenSSIDChanges() throws {
+    @MainActor
+    func testKeychainSecretStoreMovesPasswordWhenSSIDChanges() async throws {
         let keychain = FakeKeychainStore()
-        var ssid = "Old Phone"
-        let store = KeychainHotspotSecretStore(keychain: keychain) { ssid }
-        try store.save("first")
+        let ssid = Locked("Old Phone")
+        let store = KeychainHotspotSecretStore(keychain: keychain, queue: KeychainQueue()) { ssid.value }
+        try await store.save("first")
 
-        ssid = "New Phone"
-        try store.save("replacement")
+        ssid.value = "New Phone"
+        try await store.save("replacement")
 
         XCTAssertNil(try keychain.get(service: KeychainStore.service, account: "Old Phone"))
         XCTAssertEqual(try keychain.get(service: KeychainStore.service, account: "New Phone"), "replacement")
@@ -104,16 +108,19 @@ final class IntegrationWiringTests: XCTestCase {
     /// Settings rereads the password when the failover's report clears.
     /// That check must not change which account a save moves the password
     /// from, or an SSID typed meanwhile leaves the old item behind.
-    func testAPeekAfterAnSSIDChangeStillLetsASaveMoveThePassword() throws {
+    @MainActor
+    func testAPeekAfterAnSSIDChangeStillLetsASaveMoveThePassword() async throws {
         let keychain = FakeKeychainStore()
-        var ssid = "Old Phone"
-        let store = KeychainHotspotSecretStore(keychain: keychain) { ssid }
-        try store.save("first")
-        XCTAssertEqual(try store.load(), "first")
+        let ssid = Locked("Old Phone")
+        let store = KeychainHotspotSecretStore(keychain: keychain, queue: KeychainQueue()) { ssid.value }
+        try await store.save("first")
+        let loaded = try await store.load()
+        XCTAssertEqual(loaded, "first")
 
-        ssid = "New Phone"
-        XCTAssertNil(try store.peek())
-        try store.save("replacement")
+        ssid.value = "New Phone"
+        let peeked = try await store.peek()
+        XCTAssertNil(peeked)
+        try await store.save("replacement")
 
         XCTAssertNil(try keychain.get(service: KeychainStore.service, account: "Old Phone"))
         XCTAssertEqual(try keychain.get(service: KeychainStore.service, account: "New Phone"), "replacement")
