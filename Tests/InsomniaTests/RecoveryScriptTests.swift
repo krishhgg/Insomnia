@@ -109,7 +109,7 @@ final class RecoveryScriptTests: XCTestCase {
     func testValidSessionWithTheAppAliveAndAHealthyMachineIsLeftAlone() throws {
         try writeLiveSession()
         let app = try fx.holdAliveLock()
-        defer { app.terminate() }
+        defer { app.release() }
 
         let r = try fx.run(fx.backstop)
 
@@ -140,7 +140,7 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(try fx.run(fx.backstop).status, 0)
         XCTAssertFalse(fx.exists(fx.session))
         let app = try fx.holdAliveLock()
-        defer { app.terminate() }
+        defer { app.release() }
         try writeLiveSession()
         fx.clearCalls()
         try assertSessionKept(try fx.run(fx.backstop))
@@ -179,7 +179,7 @@ final class RecoveryScriptTests: XCTestCase {
     func testBatteryBelowTheEndFloorOnBatteryPowerEndsTheSession() throws {
         try writeLiveSession()
         let app = try fx.holdAliveLock()
-        defer { app.terminate() }
+        defer { app.release() }
         fx.setBattery(fx.battery(source: "Battery Power", percent: 9))
 
         let r = try fx.run(fx.backstop)
@@ -192,7 +192,7 @@ final class RecoveryScriptTests: XCTestCase {
     /// it. On AC power the charge does not matter at all.
     func testBatteryAtTheFloorOrOnACPowerKeepsTheSession() throws {
         let app = try fx.holdAliveLock()
-        defer { app.terminate() }
+        defer { app.release() }
         for (source, percent, state) in [("Battery Power", 10, "discharging"), ("AC Power", 3, "charging"), ("AC Power", 0, "charging")] {
             try writeLiveSession()
             fx.setBattery(fx.battery(source: source, percent: percent, state: state))
@@ -204,7 +204,7 @@ final class RecoveryScriptTests: XCTestCase {
     /// that fails, ends the session; sleep must not stay disabled on a guess.
     func testBatteryUnreadableOrPmsetFailingEndsTheSession() throws {
         let app = try fx.holdAliveLock()
-        defer { app.terminate() }
+        defer { app.release() }
         let cases: [(output: String, reason: String)] = [
             ("FAIL", "battery state unreadable (pmset -g batt exit 1)"),
             ("Now drawing from 'Battery Power'\n -InternalBattery-0 (id=1)\t(no estimate) present: true\n", "battery present but unreadable"),
@@ -224,7 +224,7 @@ final class RecoveryScriptTests: XCTestCase {
     func testDesktopWithoutABatteryHasNoBatteryRule() throws {
         try writeLiveSession()
         let app = try fx.holdAliveLock()
-        defer { app.terminate() }
+        defer { app.release() }
         fx.setBattery("Now drawing from 'AC Power'\n")
 
         let r = try fx.run(fx.backstop)
@@ -237,7 +237,7 @@ final class RecoveryScriptTests: XCTestCase {
     /// a value that is not a whole number falls back to the default 10.
     func testEndFloorIsReadFromConfigAndZeroDisablesIt() throws {
         let app = try fx.holdAliveLock()
-        defer { app.terminate() }
+        defer { app.release() }
 
         try writeLiveSession()
         try fx.writeConfig(#"{"endFloor": 30}"#)
@@ -267,7 +267,7 @@ final class RecoveryScriptTests: XCTestCase {
     func testEndFloorZeroSkipsTheBatteryReadSoAFailingPmsetCannotEnd() throws {
         try writeLiveSession()
         let app = try fx.holdAliveLock()
-        defer { app.terminate() }
+        defer { app.release() }
         try fx.writeConfig(#"{"endFloor": 0}"#)
         fx.setBattery("FAIL")
 
@@ -282,7 +282,7 @@ final class RecoveryScriptTests: XCTestCase {
     /// sides enforce the same floor and the same thermal rule.
     func testStringTypedConfigValuesAreIgnoredLikeTheAppDoes() throws {
         let app = try fx.holdAliveLock()
-        defer { app.terminate() }
+        defer { app.release() }
 
         try writeLiveSession()
         try fx.writeConfig(#"{"endFloor": "30"}"#)
@@ -309,7 +309,7 @@ final class RecoveryScriptTests: XCTestCase {
     /// session ends. A thermal read that hangs only warns.
     func testHungReadsAreBoundedBatteryFailsClosedThermalWarns() throws {
         let app = try fx.holdAliveLock()
-        defer { app.terminate() }
+        defer { app.release() }
 
         try writeLiveSession()
         fx.setBattery("HANG")
@@ -335,7 +335,7 @@ final class RecoveryScriptTests: XCTestCase {
     /// end it.
     func testThermalPressureAtTrappingOrAboveEndsTheSession() throws {
         let app = try fx.holdAliveLock()
-        defer { app.terminate() }
+        defer { app.release() }
         for level in 0...2 {
             try writeLiveSession()
             fx.setThermal("\(level)")
@@ -354,7 +354,7 @@ final class RecoveryScriptTests: XCTestCase {
     /// warning in the log, never an end on its own.
     func testThermalUnreadableWarnsWithoutEndingTheSession() throws {
         let app = try fx.holdAliveLock()
-        defer { app.terminate() }
+        defer { app.release() }
         for mode in ["FAIL", "GARBAGE"] {
             try writeLiveSession()
             fx.setThermal(mode)
@@ -367,7 +367,7 @@ final class RecoveryScriptTests: XCTestCase {
     func testThermalRulesOffIgnoresCriticalHeat() throws {
         try writeLiveSession()
         let app = try fx.holdAliveLock()
-        defer { app.terminate() }
+        defer { app.release() }
         try fx.writeConfig(#"{"thermalRules": false}"#)
         fx.setThermal("4")
 
@@ -382,7 +382,7 @@ final class RecoveryScriptTests: XCTestCase {
     func testCutoffReasonIsInTheRestoreLogLine() throws {
         try writeLiveSession()
         let app = try fx.holdAliveLock()
-        defer { app.terminate() }
+        defer { app.release() }
         fx.setThermal("3")
 
         _ = try fx.run(fx.backstop)
@@ -2250,24 +2250,23 @@ private final class ScriptFixture {
                 (try? String(contentsOf: errURL, encoding: .utf8)) ?? "")
     }
 
+    /// Holds the alive lock the way the running app does, with its own type
+    /// (AppAliveLock.swift), in this process until the test releases it. No
+    /// timer: it cannot run out between the script runs of a slow test.
+    func holdAliveLock() throws -> AppAliveLock {
+        let lock = AppAliveLock(url: alive)
+        guard try lock.tryAcquire() else { throw FixtureError("could not take \(alive.lastPathComponent): another holder has it") }
+        return lock
+    }
+
     /// Holds the recovery lock from another process, the way a running app
     /// or a concurrent backstop would, until terminated.
     func holdLock() throws -> Process {
-        try hold(lock)
-    }
-
-    /// Holds the alive lock from another process, the way a running app does
-    /// for its whole lifetime (AppAliveLock.swift), until terminated.
-    func holdAliveLock() throws -> Process {
-        try hold(alive)
-    }
-
-    private func hold(_ file: URL) throws -> Process {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/lockf")
         // The holder waits (not -t 0): a probe below may briefly own the lock
         // at the same instant, and the holder must outlast that, not give up.
-        p.arguments = ["-k", "-t", "10", file.path, "/bin/sleep", "30"]
+        p.arguments = ["-k", "-t", "10", lock.path, "/bin/sleep", "30"]
         let diagURL = root.appendingPathComponent("lock-holder.log")
         fm.createFile(atPath: diagURL.path, contents: nil)
         let diag = try FileHandle(forWritingTo: diagURL)
@@ -2280,7 +2279,7 @@ private final class ScriptFixture {
         for _ in 0..<50 {
             let probe = Process()
             probe.executableURL = URL(fileURLWithPath: "/usr/bin/lockf")
-            probe.arguments = ["-k", "-s", "-t", "0", file.path, "/usr/bin/true"]
+            probe.arguments = ["-k", "-s", "-t", "0", lock.path, "/usr/bin/true"]
             probe.standardOutput = diag
             probe.standardError = diag
             try probe.run()
@@ -2291,6 +2290,6 @@ private final class ScriptFixture {
         }
         p.terminate()
         let text = (try? String(contentsOf: diagURL, encoding: .utf8)) ?? ""
-        throw FixtureError("could not take \(file.lastPathComponent) for the contention test; holder running=\(p.isRunning) probes=\(probes) output=\(text)")
+        throw FixtureError("could not take the recovery lock for the contention test; holder running=\(p.isRunning) probes=\(probes) output=\(text)")
     }
 }
