@@ -61,6 +61,8 @@ final class PowerMonitor {
     func start() {
         guard !running else { return }
         running = true
+        // Misses from before a stop are not consecutive with this run.
+        battery = .none
         refreshBattery()
         thermalState = ProcessInfo.processInfo.thermalState
 
@@ -96,11 +98,28 @@ final class PowerMonitor {
         }
     }
 
-    /// Re-read the power source list synchronously. Cheap; used by the
-    /// popover's on-demand refresh. A miss after a miss counts up, so the
-    /// floor rules can tell one transient failure from a battery that stays
-    /// unreadable.
+    /// Re-read the power source list synchronously for the menu and the
+    /// startup snapshot. Cheap. Misses are not counted here: only the event
+    /// path and the recheck count them, so a menu opened during a transient
+    /// miss cannot be the second one, and the count never moves without
+    /// `handleBattery` seeing the move and running the floor rules. A battery
+    /// that stays unreadable keeps its count; one that has just become
+    /// unreadable gets a recheck if none is pending.
     func refreshBattery() {
+        let snap = reader()
+        if case .unreadable = snap.battery, case .unreadable = battery {
+            // Keep the count.
+        } else {
+            battery = snap.battery
+        }
+        isCharging = snap.charging
+        if recheck == nil { scheduleRecheckIfUnreadable() }
+    }
+
+    /// The read behind IOKit events and the recheck. A miss after a miss
+    /// counts up, so the floor rules can tell one transient failure from a
+    /// battery that stays unreadable.
+    private func readCountingMisses() {
         let snap = reader()
         if case .unreadable = snap.battery, case let .unreadable(misses) = battery {
             battery = .unreadable(misses: min(misses + 1, 2))
@@ -135,14 +154,23 @@ final class PowerMonitor {
            let list = IOPSCopyPowerSourcesList(info)?.takeRetainedValue() as? [CFTypeRef] {
             sources = list.compactMap { IOPSGetPowerSourceDescription(info, $0)?.takeUnretainedValue() as? [String: Any] }
         }
-        return classify(sources: sources, hasBatteryService: hasBatteryService)
+        return classify(sources: sources, hasBatteryService: hasBatteryService, externalPowerConnected: externalPowerConnected)
     }
 
     /// The power source descriptions as `BatteryStatus`. `sources` is nil
     /// when the list itself could not be read. Without an internal battery
     /// entry, `hasBatteryService` decides between a desktop (no battery) and
-    /// a laptop whose battery is not reported; it is only consulted then.
-    nonisolated static func classify(sources: [[String: Any]]?, hasBatteryService: () -> Bool) -> (battery: BatteryStatus, charging: Bool) {
+    /// a laptop whose battery is not reported, and on that laptop
+    /// `externalPowerConnected` decides charger or battery; both are only
+    /// consulted then. When the charger state cannot be read either, the
+    /// laptop is taken to be on battery: the two-miss rule then ends the
+    /// session, which costs a restart, whereas taking it to be on a charger
+    /// would hold sleep with no floor on a battery that may be draining.
+    nonisolated static func classify(
+        sources: [[String: Any]]?,
+        hasBatteryService: () -> Bool,
+        externalPowerConnected: () -> Bool?
+    ) -> (battery: BatteryStatus, charging: Bool) {
         for desc in sources ?? [] {
             guard desc[kIOPSTypeKey] as? String == kIOPSInternalBatteryType else { continue }
             let onAC = desc[kIOPSPowerSourceStateKey] as? String == kIOPSACPowerValue
@@ -154,7 +182,8 @@ final class PowerMonitor {
             }
             return (.percent(Int((Double(current) / Double(max) * 100).rounded())), onAC || charging)
         }
-        return (hasBatteryService() ? .unreadable(misses: 1) : .none, false)
+        guard hasBatteryService() else { return (.none, false) }
+        return (.unreadable(misses: 1), externalPowerConnected() ?? false)
     }
 
     /// Whether the machine has a built-in battery at all, from the I/O
@@ -164,6 +193,17 @@ final class PowerMonitor {
         guard service != 0 else { return false }
         IOObjectRelease(service)
         return true
+    }
+
+    /// `ExternalConnected` from the `AppleSmartBattery` service: the battery
+    /// driver's own view of whether a charger is attached, read from the I/O
+    /// Registry rather than the power source list that just failed. nil when
+    /// the service or the property cannot be read.
+    nonisolated static func externalPowerConnected() -> Bool? {
+        let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSmartBattery"))
+        guard service != 0 else { return nil }
+        defer { IOObjectRelease(service) }
+        return IORegistryEntryCreateCFProperty(service, "ExternalConnected" as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue() as? Bool
     }
 
     nonisolated static func readInstantWatts() -> Double? {
@@ -193,7 +233,7 @@ final class PowerMonitor {
 
     private func handleBattery() {
         let before = (battery, isCharging)
-        refreshBattery()
+        readCountingMisses()
         if before != (battery, isCharging) {
             Log.info("battery \(Self.describe(battery)) \(isCharging ? "charging" : "on battery")")
             onChange?()

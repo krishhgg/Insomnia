@@ -268,10 +268,17 @@ IOKit sends no event for a read that keeps failing.
 `PowerMonitor` tells a machine with no internal battery (desktop: no floor
 applies) from one whose battery is present but not reported, by checking for
 the `AppleSmartBattery` service when the power source list has no battery
-entry or cannot be read at all. One missed read is tolerated as transient;
-the second ends the session, because the end floor cannot be applied to a
-level nobody can read. An unreadable level never counts as below a floor, so
-it does not enable Low Power Mode by itself.
+entry or cannot be read at all. On that laptop, charger or battery comes from
+the driver's `ExternalConnected` property in the I/O Registry rather than the
+list that failed; when that cannot be read either, the laptop is taken to be
+on battery, so the session ends rather than holding sleep with no floor on a
+battery that may be draining. One missed read is tolerated as transient; the
+second ends the session, because the end floor cannot be applied to a level
+nobody can read. Only the IOKit event and the 30 s re-read count misses; the
+menu's own refresh reads the level but leaves the count where it is, so a
+menu opened during a transient miss is not the second one, and the count
+never moves without the floor rules running. An unreadable level never counts
+as below a floor, so it does not enable Low Power Mode by itself.
 
 Insomnia does not enable Low Power Mode merely because a session starts; the
 causes are the battery floor, a serious thermal state, and (by default) a closed
