@@ -236,7 +236,10 @@ last held while it was on was the battery or thermal floor, not the lid.
   start reads each listed app's `NSAppSleepDisabled`, journals the previous
   value (absent, true or false) in `appNapOverrides`, and only then writes
   `YES`. A journal write failure means no preference write. An app whose key
-  is already `YES` is skipped: there is nothing to put back. Session end,
+  is already `YES` is skipped: there is nothing to put back. So is an entry
+  `defaults` would not read as that app's domain (a leading `-`, a path,
+  `NSGlobalDomain`, anything but ASCII letters, digits, `.`, `-` and `_`),
+  since the backstop could not put it back; it is logged. Session end,
   reconcile, the backstop and uninstall write the recorded value back
   (`defaults delete` when it was absent) and clear the entry only after that
   write succeeded. Settings shows the toggle, the list of apps it affects,

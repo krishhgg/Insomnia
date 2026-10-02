@@ -686,13 +686,19 @@ final class SessionManager {
     /// preference write. A key already YES is left alone and not journaled,
     /// since there is nothing to put back; a value that is not a boolean is
     /// left alone too. An app already journaled (reconcile after a crash)
-    /// keeps its recorded value and is set to YES again.
+    /// keeps its recorded value and is set to YES again. An id backstop.sh
+    /// could not restore (`AppNap.isRestorable`) is skipped before anything
+    /// is journaled.
     private func applyAppNapInJournal() {
         guard config.disableAppNapForAgents else { return }
         var seen = Set<String>()
         var written = 0
         var alreadyOff = 0
         for id in config.agentList where !id.isEmpty && seen.insert(id).inserted {
+            guard AppNap.isRestorable(bundleId: id) else {
+                Log.error("app nap: \(id.debugDescription) is not a bundle id the recovery agent can restore; left alone")
+                continue
+            }
             if !state.appNapOverrides.contains(where: { $0.bundleId == id }) {
                 let previous: Bool?
                 do {

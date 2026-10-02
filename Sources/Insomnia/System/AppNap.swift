@@ -46,6 +46,23 @@ enum AppNap {
         }
         return CFEqual(value, kCFBooleanTrue)
     }
+
+    /// Whether `defaults <verb> <bundleId>`, which backstop.sh restores
+    /// with, names the same domain CFPreferences writes. Only ids made of
+    /// ASCII letters, digits, `.`, `-` and `_` that start with a letter or
+    /// digit qualify. A leading `-` is an option to `defaults` (backstop.sh
+    /// refuses the entry and keeps it forever), a `/` or `~` makes it a plist
+    /// path, and `defaults` reads NSGlobalDomain as every app's domain where
+    /// CFPreferences reads it as an app called that. Any other id is never
+    /// journaled or written.
+    static func isRestorable(bundleId: String) -> Bool {
+        func isAlphanumeric(_ s: Unicode.Scalar) -> Bool {
+            ("a"..."z").contains(s) || ("A"..."Z").contains(s) || ("0"..."9").contains(s)
+        }
+        let scalars = bundleId.unicodeScalars
+        guard bundleId != "NSGlobalDomain", let first = scalars.first, isAlphanumeric(first) else { return false }
+        return scalars.allSatisfy { isAlphanumeric($0) || $0 == "." || $0 == "-" || $0 == "_" }
+    }
 }
 
 /// CFPreferences on the app's own domain.

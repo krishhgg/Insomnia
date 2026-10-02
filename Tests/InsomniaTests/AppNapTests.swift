@@ -87,6 +87,32 @@ final class AppNapTests: XCTestCase {
         XCTAssertNil(m.lastError)
     }
 
+    /// An agent-list id that `defaults` reads as an option, a plist path or
+    /// the global domain is left alone: backstop.sh could not put it back
+    /// after a force-quit, so it is never journaled or written.
+    func testIdsTheBackstopCannotRestoreAreNeverJournaledOrWritten() async throws {
+        let m = makeManager(optIn: true, agents: ["-g", "/tmp/prefs", "NSGlobalDomain", "com.example app", chrome])
+
+        await m.start(duration: 3600)
+
+        XCTAssertTrue(m.isActive)
+        XCTAssertEqual(writes(h.appNap), ["\(chrome)=true"])
+        XCTAssertEqual(try h.store.loadState()?.appNapOverrides, [AppNapOverride(bundleId: chrome, previous: nil)])
+        XCTAssertNil(m.lastError)
+        let log = (try? String(contentsOf: h.home.paths.logFile, encoding: .utf8)) ?? ""
+        XCTAssertTrue(log.contains("\"-g\" is not a bundle id the recovery agent can restore"), log)
+    }
+
+    func testRestorableIdsAreTheOnesDefaultsNamesTheSameWay() {
+        for id in Config.defaultAgentList + [warp, "org.example.my_app", "2BUA8C4S2C.com.example"] {
+            XCTAssertTrue(AppNap.isRestorable(bundleId: id), id)
+        }
+        for id in ["", "-", "-g", "--help", "/Users/x/foo.plist", "~/foo", "NSGlobalDomain", ".GlobalPreferences",
+                   "_foo", "com.example app", "com.example\n", "com.exämple"] {
+            XCTAssertFalse(AppNap.isRestorable(bundleId: id), id.debugDescription)
+        }
+    }
+
     /// Session end puts every recorded value back: a deleted key for an
     /// absent one, false for false, and clears the entries. The key that
     /// was already YES is untouched.
