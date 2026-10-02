@@ -57,6 +57,8 @@ final class FakeSleepGuard: SleepGuarding, @unchecked Sendable {
     private var _lowPowerOn = false
     private var _lowPowerGate: AsyncGate?
     private var _sleepGate: AsyncGate?
+    private var _restoreGate: AsyncGate?
+    private var _restoreCalledAt: Date?
     private var _readGate: AsyncGate?
     var throwOn: Set<String> = []
     /// Commands that take effect and *then* fail (a timeout after pmset
@@ -83,6 +85,13 @@ final class FakeSleepGuard: SleepGuarding, @unchecked Sendable {
         get { lock.withLock { _sleepGate } }
         set { lock.withLock { _sleepGate = newValue } }
     }
+    /// Holds `disablesleep 0` after the call is recorded, before it takes effect.
+    var restoreGate: AsyncGate? {
+        get { lock.withLock { _restoreGate } }
+        set { lock.withLock { _restoreGate = newValue } }
+    }
+    /// Wall-clock time of the latest `disablesleep 0` call, taken as it arrives.
+    var restoreCalledAt: Date? { lock.withLock { _restoreCalledAt } }
     /// Holds `pmset -g` after the call is recorded, before it answers.
     var readGate: AsyncGate? {
         get { lock.withLock { _readGate } }
@@ -103,8 +112,10 @@ final class FakeSleepGuard: SleepGuarding, @unchecked Sendable {
     }
 
     func setSleepDisabled(_ disabled: Bool) async throws {
+        if !disabled { lock.withLock { _restoreCalledAt = Date() } }
         try record("disablesleep \(disabled ? 1 : 0)")
         if disabled, let gate = sleepGate { await gate.wait() }
+        if !disabled, let gate = restoreGate { await gate.wait() }
         sleepDisabled = disabled
         try afterEffect("disablesleep \(disabled ? 1 : 0)")
     }
@@ -507,10 +518,37 @@ struct Harness {
     }
 }
 
-/// Let tasks created just now run up to their first suspension (the
-/// lifecycle queue), so the request order is fixed before a held operation
-/// is released. Serialized tests must release the held operation and only
-/// then await the operation queued behind it.
+/// Runs `request` in a new main-actor task and returns that task once the
+/// request has been called and the task has let go of the main actor: at
+/// its first suspension, or because it finished. Lifecycle requests join
+/// the queue before their first suspension, so a request made while an
+/// earlier operation is held is queued behind it when this returns. Fails
+/// the test if the task never ran. Release the held operation, then await
+/// the returned task; awaiting it first would deadlock.
+@MainActor
+func runUntilSuspended<T: Sendable>(
+    _ request: @escaping @MainActor @Sendable () async -> T,
+    file: StaticString = #filePath, line: UInt = #line
+) async -> Task<T, Never> {
+    let called = MainActorFlag()
+    let task = Task { @MainActor in
+        called.isSet = true
+        return await request()
+    }
+    for _ in 0..<1000 where !called.isSet { await Task.yield() }
+    XCTAssertTrue(called.isSet, "the request never ran", file: file, line: line)
+    return task
+}
+
+@MainActor
+private final class MainActorFlag {
+    var isSet = false
+}
+
+/// Yields a few times so that tasks created just now can run. Nothing
+/// confirms they did, so use it only where the test has no handle on the
+/// request (controller actions that start their own tasks), and
+/// `runUntilSuspended` everywhere else.
 @MainActor
 func settleQueuedRequests() async {
     for _ in 0..<5 { await Task.yield() }
