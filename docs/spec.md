@@ -55,6 +55,7 @@ RuntimeState {                // everything Insomnia changed and must undo
   savedDisplayBrightness:  Float?  // nil when darkening is off or lid is open
   savedKeyboardBrightness: Float?  // nil when there is no backlight, too
   displayRestoredUnderLowPower: Float?  // restored on open under our Low Power Mode; written again when it ends
+  appNapOverrides:    [{bundleId, previous?}]  // previous absent when the app had no NSAppSleepDisabled key
 }
 ```
 
@@ -228,12 +229,32 @@ last held while it was on was the battery or thermal floor, not the lid.
 - Built-in protection (section 4): the same editors, agent hosts, terminals,
   browsers, VPN and local model runtimes are protected from the automatic
   lid-close scope even on an install whose config.json predates these
-  defaults and never lists them. Only the agent list also disables App Nap;
-  only an explicit freeze-list entry overrides the built-in protection.
-- On session start Insomnia sets `NSAppSleepDisabled = YES` for each listed app
-  so App Nap never throttles them. This is a persistent per-app default and is
-  left in place after session end and uninstall. This changes the affected
-  apps' behavior outside an Insomnia session too.
+  defaults and never lists them. Only the agent list can also turn App Nap
+  off; only an explicit freeze-list entry overrides the built-in protection.
+- Turning App Nap off is opt-in (`disableAppNapForAgents`, default off). With
+  it off Insomnia never writes another app's preferences. With it on, session
+  start reads each listed app's `NSAppSleepDisabled`, journals the previous
+  value (absent, true or false) in `appNapOverrides`, and only then writes
+  `YES`. A journal write failure means no preference write. An app whose key
+  is already `YES` is skipped: there is nothing to put back. So is an entry
+  `defaults` would not read as that app's domain (a leading `-`, a path,
+  `NSGlobalDomain`, anything but ASCII letters, digits, `.`, `-` and `_`),
+  since the backstop could not put it back; it is logged. Session end,
+  reconcile, the backstop and uninstall write the recorded value back
+  (`defaults delete` when it was absent) and clear the entry only after that
+  write succeeded. Settings shows the toggle, the list of apps it affects,
+  and what it changes.
+- Values written by builds before this were never recorded and are not
+  guessed at: uninstall reads the key for every app on the shipped agent
+  list and on config.json's (an app taken off the list may still carry one),
+  lists each whose key is `YES` with no journal entry, prints the
+  shell-quoted `defaults delete` command for it, and continues. The summary
+  says how many apps were checked; an app whose key cannot be read is
+  reported, not counted. Each read has a 30 s limit, like every other call
+  uninstall makes under the recovery lock (`pgrep`, `launchctl`); a read
+  that does not answer ends the check with the command to run by hand, and
+  uninstall goes on. A call past its limit gets SIGTERM, then SIGKILL, and
+  never holds the lock.
 - Browser throttling: Chromium browsers throttle windows macOS reports as
   occluded, which is every window once the lid is closed with no external
   display. Timers drop to 1 Hz, animation frames stop, pages report hidden.
@@ -335,7 +356,8 @@ Invariants:
 Reconcile runs at every Insomnia launch:
 
 1. Session file missing or expired → restore journaled changes: sleep,
-   verified owned processes, Low Power Mode if we set it, and saved audio.
+   verified owned processes, Low Power Mode if we set it, saved audio, and
+   recorded App Nap values.
    Unverified entries and failed restoration remain unresolved, not successful.
 2. Session valid → establish the independent recovery agent before reapplying
    the sleep guard, then resume observers. If the lid is open, restore recorded
@@ -361,6 +383,11 @@ Backstop, independent of the app:
 - The shell does not restore CoreAudio settings. Saved audio must remain in
   the journal for the app to restore. Uninstall must preserve recovery tools
   and state when restoration is incomplete, including saved audio.
+- The shell puts `appNapOverrides` back with `defaults write <id>
+  NSAppSleepDisabled -bool <previous>` or `defaults delete` when the key was
+  absent. A delete that fails counts as done only when `defaults read` then
+  says the key does not exist; a read that succeeds or fails any other way
+  keeps the entry.
 - The agent is a recovery mechanism, not a guarantee of crash/reboot behavior
   or a replacement for battery/thermal observers. These scenarios require
   the separate hardware validation record.
@@ -381,7 +408,7 @@ small settings window:
 - presets, default preset
 - freeze list (bundle ids), freeze every other app on/off, Docker rule
   on/off, mute on lid close on/off
-- agent list (bundle ids)
+- agent list (bundle ids), turn App Nap off for them on/off (default off)
 - `lowPowerFloor`, `endFloor`, thermal rules on/off
 - hotspot SSID (password entered once, stored in Keychain), `nudgeThreshold`
 - tmux targets
@@ -652,10 +679,19 @@ that any case passed; record results in the release validation record.
     during a session; the log shows `lid SIMULATED closed (file trigger)`.
     Quit while closed → both restored. Force-quit while closed, reopen the app
     → restored at reconcile, and `backstop.sh` alone leaves both keys in place.
+14. **App Nap.** With the setting on and Terminal on the agent list, `defaults
+    delete com.apple.Terminal NSAppSleepDisabled`, start a session → `defaults
+    read` shows 1 and `state.json` has an `appNapOverrides` entry without
+    `previous`. End → the key is gone, entry gone. Repeat with the key set to
+    0 → put back to 0. Force-quit during a session → `backstop.sh` alone puts
+    it back. Set the key to 1 by hand, empty `appNapOverrides`, run
+    `uninstall.sh` → it prints the `defaults delete` command and continues.
 
 ## Open decisions (defaults chosen, change if you disagree)
 
 - `pmset -a` (all power sources) rather than `-b` for `disablesleep`, so
   behaviour is identical whether or not a charger is attached.
 - Default `lowPowerFloor` 40%, `endFloor` 10%, `nudgeThreshold` 90 s.
-- App Nap defaults are left set after a session ends.
+- Turning App Nap off for agent apps is opt-in and the previous value is put
+  back at session end. Values older builds wrote without a record are listed
+  by uninstall, never deleted by it.

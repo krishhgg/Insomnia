@@ -351,6 +351,54 @@ final class FakeKeyboardBacklight: KeyboardBacklighting, @unchecked Sendable {
     }
 }
 
+/// In-memory `NSAppSleepDisabled` per bundle id, with a hook fired inside
+/// each write so a test can inspect disk at the moment of the side effect.
+final class FakeAppNapPreferences: AppNapPreferencing, @unchecked Sendable {
+    private let lock = NSLock()
+    private var _values: [String: Bool]
+    private var _writes: [(bundleId: String, value: Bool?)] = []
+    private var _unreadable: Set<String> = []
+    private var _failWrites: Set<String> = []
+    /// Called synchronously inside `writeSleepDisabled`.
+    var onWrite: (@Sendable (String, Bool?) -> Void)?
+
+    init(values: [String: Bool] = [:]) {
+        _values = values
+    }
+
+    /// The key per bundle id as it stands now; absent ids have no key.
+    var values: [String: Bool] {
+        get { lock.withLock { _values } }
+        set { lock.withLock { _values = newValue } }
+    }
+    /// Every write, in order; nil means the key was deleted.
+    var writes: [(bundleId: String, value: Bool?)] { lock.withLock { _writes } }
+    /// Bundle ids whose value reads as something that is not a boolean.
+    var unreadable: Set<String> {
+        get { lock.withLock { _unreadable } }
+        set { lock.withLock { _unreadable = newValue } }
+    }
+    /// Bundle ids whose writes fail (cfprefsd refused the synchronize).
+    var failWrites: Set<String> {
+        get { lock.withLock { _failWrites } }
+        set { lock.withLock { _failWrites = newValue } }
+    }
+
+    func readSleepDisabled(bundleId: String) throws -> Bool? {
+        if unreadable.contains(bundleId) { throw AppNapError(bundleId: bundleId, detail: "is not a boolean; left alone") }
+        return lock.withLock { _values[bundleId] }
+    }
+
+    func writeSleepDisabled(_ value: Bool?, bundleId: String) throws {
+        if failWrites.contains(bundleId) { throw AppNapError(bundleId: bundleId, detail: "could not be written") }
+        lock.withLock {
+            _values[bundleId] = value
+            _writes.append((bundleId, value))
+        }
+        onWrite?(bundleId, value)
+    }
+}
+
 /// Freezer over an injected process snapshot; signals go to a FakeProcessControl.
 final class FakeFreezer: Freezing, @unchecked Sendable {
     private let lock = NSLock()
@@ -472,6 +520,7 @@ struct Harness {
     let audio: FakeAudioControl
     let display: FakeDisplayDimmer
     let keyboard: FakeKeyboardBacklight
+    let appNap: FakeAppNapPreferences
     let notifier: RecordingNotifier
     let clamshell: FakeClamshell
 
@@ -485,6 +534,7 @@ struct Harness {
         audio = FakeAudioControl()
         display = FakeDisplayDimmer()
         keyboard = FakeKeyboardBacklight()
+        appNap = FakeAppNapPreferences()
         notifier = RecordingNotifier()
         clamshell = FakeClamshell(false)
     }
@@ -508,6 +558,7 @@ struct Harness {
             audio: audio,
             display: display,
             keyboard: keyboard,
+            appNap: appNap,
             notifier: notifier,
             clamshell: { lid.closed },
             clock: { c.now },

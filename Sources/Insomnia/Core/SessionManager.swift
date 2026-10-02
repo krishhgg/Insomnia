@@ -95,6 +95,7 @@ final class SessionManager {
     private let audio: any AudioControlling
     private let display: any DisplayDimming
     private let keyboard: any KeyboardBacklighting
+    private let appNap: any AppNapPreferencing
     private let notifier: any Notifying
     private let clamshell: @Sendable () -> Bool?
     private let clock: @Sendable () -> Date
@@ -162,6 +163,7 @@ final class SessionManager {
         audio: any AudioControlling = NoopAudioControl(),
         display: any DisplayDimming = NoopDisplayDimmer(),
         keyboard: any KeyboardBacklighting = NoopKeyboardBacklight(),
+        appNap: any AppNapPreferencing = NoopAppNapPreferences(),
         notifier: any Notifying = RecordingNotifier(),
         clamshell: @escaping @Sendable () -> Bool? = { LidObserver.readClamshellState() },
         clock: @escaping @Sendable () -> Date = { Date() },
@@ -177,6 +179,7 @@ final class SessionManager {
         self.audio = audio
         self.display = display
         self.keyboard = keyboard
+        self.appNap = appNap
         self.notifier = notifier
         self.clamshell = clamshell
         self.clock = clock
@@ -233,6 +236,7 @@ final class SessionManager {
             audio: audio,
             display: display,
             keyboard: keyboard,
+            appNap: CFAppNapPreferences(),
             notifier: notifier
         )
         let services = AppServices(
@@ -394,7 +398,8 @@ final class SessionManager {
         foreignSleepWarning = nil
         Log.info("session started until \(iso(new.endsAt)) (\(Int(duration))s requested)")
         await armDeadline(new.endsAt)
-        // App Nap defaults and every observer live in AppServices.
+        applyAppNapInJournal()
+        // Every observer lives in AppServices.
         services?.start(for: self)
         // PR3: schedule "5 minutes left" notification.
     }
@@ -489,7 +494,6 @@ final class SessionManager {
             fail("could not remove session.json: \(error.localizedDescription)")
         }
         await restoreAll()
-        // App Nap defaults are intentionally left set (spec: open decisions).
         services?.stop()
 
         if state.isDirty || deletionError != nil {
@@ -678,10 +682,89 @@ final class SessionManager {
         }
 
         undoLidActionsInJournal()
+        restoreAppNapInJournal()
         // After the undo: a restore just written with the mode off owes
         // nothing more (its journal write clears the entry), and a lid
         // still open gets its second write now.
         if lowPowerJustCleared { settleDisplayAfterLowPower() }
+    }
+
+    // MARK: App Nap (spec section 5)
+
+    /// `NSAppSleepDisabled = YES` for each agent app, when the user opted
+    /// in. Journal first: the value the key has now (absent, true or false)
+    /// is on disk before the preference is touched, so a crash between the
+    /// two still restores it, and a journal write that fails means no
+    /// preference write. A key already YES is left alone and not journaled,
+    /// since there is nothing to put back; a value that is not a boolean is
+    /// left alone too. An app already journaled (reconcile after a crash)
+    /// keeps its recorded value and is set to YES again. An id backstop.sh
+    /// could not restore (`AppNap.isRestorable`) is skipped before anything
+    /// is journaled.
+    private func applyAppNapInJournal() {
+        guard config.disableAppNapForAgents else { return }
+        var seen = Set<String>()
+        var written = 0
+        var alreadyOff = 0
+        for id in config.agentList where !id.isEmpty && seen.insert(id).inserted {
+            guard AppNap.isRestorable(bundleId: id) else {
+                Log.error("app nap: \(id.debugDescription) is not a bundle id the recovery agent can restore; left alone")
+                continue
+            }
+            if !state.appNapOverrides.contains(where: { $0.bundleId == id }) {
+                let previous: Bool?
+                do {
+                    previous = try appNap.readSleepDisabled(bundleId: id)
+                } catch {
+                    Log.error("app nap: \(error.localizedDescription)")
+                    continue
+                }
+                if previous == true {
+                    alreadyOff += 1
+                    continue
+                }
+                do {
+                    try journal { $0.appNapOverrides.append(AppNapOverride(bundleId: id, previous: previous)) }
+                } catch {
+                    fail("could not journal the App Nap setting of \(id): \(error.localizedDescription); its preferences are left unchanged")
+                    break
+                }
+            }
+            do {
+                try appNap.writeSleepDisabled(true, bundleId: id)
+                written += 1
+            } catch {
+                // Already journaled: the restore puts the recorded value
+                // back whether or not this write landed.
+                fail("app nap: \(error.localizedDescription); kept in the journal to restore")
+            }
+        }
+        if written > 0 || alreadyOff > 0 {
+            Log.info("app nap disabled for \(written) app(s); \(alreadyOff) already had it off")
+        }
+    }
+
+    /// Put back what `applyAppNapInJournal` recorded: the previous value,
+    /// or delete the key when it was absent. An entry is cleared only after
+    /// its write succeeded; a failed one stays for the next end, reconcile
+    /// or the backstop (`defaults write` / `defaults delete`).
+    private func restoreAppNapInJournal() {
+        guard !state.appNapOverrides.isEmpty else { return }
+        var restored = 0
+        for entry in state.appNapOverrides {
+            do {
+                try appNap.writeSleepDisabled(entry.previous, bundleId: entry.bundleId)
+                restored += 1
+                do {
+                    try journal { $0.appNapOverrides.removeAll { $0.bundleId == entry.bundleId } }
+                } catch {
+                    fail("App Nap restored for \(entry.bundleId) but the journal entry could not be cleared: \(error.localizedDescription); it will be retried")
+                }
+            } catch {
+                fail("could not restore App Nap for \(entry.bundleId): \(error.localizedDescription); kept in the journal to retry")
+            }
+        }
+        Log.info("app nap restored for \(restored) app(s)")
     }
 
     /// Shared body of lid open, reconcile (lid open) and `restoreAll()`;
@@ -940,6 +1023,7 @@ final class SessionManager {
                 Log.info("reconcile: lid \(lidClosed == nil ? "unknown" : "closed"), keeping lid-close actions")
             }
             await armDeadline(s.endsAt)
+            applyAppNapInJournal()
             services?.start(for: self)
             return
         }

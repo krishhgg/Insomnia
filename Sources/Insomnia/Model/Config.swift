@@ -30,6 +30,11 @@ struct Config: Codable, Equatable, Sendable {
 
     // Agent apps that must never be throttled or frozen.
     var agentList: [String] = Config.defaultAgentList
+    /// Write `NSAppSleepDisabled = YES` into each agent app's preferences at
+    /// session start so App Nap never throttles it, and put the previous
+    /// value back at session end. Off: Insomnia never writes another app's
+    /// preferences.
+    var disableAppNapForAgents: Bool = false
 
     // Battery / thermal floors
     /// Battery percentage below which Low Power Mode is switched on.
@@ -118,6 +123,7 @@ struct Config: Codable, Equatable, Sendable {
         darkenDisplayOnLidClose = try c.decodeIfPresent(Bool.self, forKey: .darkenDisplayOnLidClose) ?? d.darkenDisplayOnLidClose
         lowPowerOnLidClose = try c.decodeIfPresent(Bool.self, forKey: .lowPowerOnLidClose) ?? d.lowPowerOnLidClose
         agentList = try c.decodeIfPresent([String].self, forKey: .agentList) ?? d.agentList
+        disableAppNapForAgents = try c.decodeIfPresent(Bool.self, forKey: .disableAppNapForAgents) ?? d.disableAppNapForAgents
         lowPowerFloor = try c.decodeIfPresent(Int.self, forKey: .lowPowerFloor) ?? d.lowPowerFloor
         endFloor = try c.decodeIfPresent(Int.self, forKey: .endFloor) ?? d.endFloor
         thermalRules = try c.decodeIfPresent(Bool.self, forKey: .thermalRules) ?? d.thermalRules
