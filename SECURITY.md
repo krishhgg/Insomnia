@@ -22,8 +22,8 @@ each time the user starts a session, and never on relaunch or from the recovery
 agent. That command turns sleep off only while the start that asked still
 holds its random nonce in `pending-start`, and only before the session's end,
 which it receives as an argument and compares with the clock as root; it
-holds a `lockf` lock on that file from before the checks until pmset exits. The start deletes the file when
-it finishes, and the app at launch, the recovery agent and uninstall delete it
+holds a `lockf` lock on that file from before the checks until pmset exits.
+The start deletes the file when it finishes, and the app at launch, the recovery agent and uninstall delete it
 under the recovery lock before they undo anything; every one of them takes the
 file's own lock first, so the file never goes while that command is past its
 check. A dialog answered after its start was abandoned (the app died, recovery
@@ -50,7 +50,10 @@ programs reading `log show` see `<private>` instead of those names unless
 private data logging is enabled on the Mac. Hotspot passwords are stored in
 the login Keychain. Location Services access is requested only when a hotspot
 is saved or a session starts with one configured; it is used to read Wi-Fi
-network names and the app never requests location updates.
+network names and the app never requests location updates. With the App Nap setting on (off by
+default), the app writes `NSAppSleepDisabled` into the preferences of each app
+on the agent list, after recording the previous value in its journal, and puts
+it back at session end.
 
 Passing automated checks or a secret scan does not establish the absence of
 vulnerabilities. Do not probe recovery by disrupting someone else's processes,
