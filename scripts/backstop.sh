@@ -200,7 +200,7 @@ run_bounded() { # command args...
     rm -f "$APP_SUPPORT"/.backstop.*.pid "$APP_SUPPORT"/.backstop.*.rc
   fi
   (
-    "$@" </dev/null >"${BOUNDED_STDOUT:-/dev/null}" 2>/dev/null &
+    "$@" </dev/null >/dev/null 2>&1 &
     cpid=$!
     echo "$cpid" > "$pidfile"
     rc=0
@@ -229,25 +229,53 @@ run_bounded() { # command args...
   return "$rc"
 }
 
-# run_bounded for a read (pmset -g batt, notifyutil -g): the command's stdout
-# is captured into the variable named by $1, under the same time limit, so a
-# read that hangs cannot hold the recovery lock for the whole minute. A read
-# changes nothing, so one that ignores SIGTERM is left to its supervisor like
-# an undo command (lock held until it ends, pid logged) and this run goes on;
-# the caller treats the read as failed (exit 124 or 125).
-run_bounded_read() { # varname command args...
-  local __name="$1" __file __rc=0 __alive_before=$command_alive
+# Run one read (pmset -g batt, notifyutil -g) with the undo commands' time
+# limit and put its stdout in the variable named by $1. A read changes
+# nothing, so unlike an undo command it has no reason to hold the recovery
+# lock: its supervisor closes fd 9 before starting it, so neither holds the
+# lock and a read that hangs can only fail itself, never a later run or the
+# app. For the same reason a read that ignores SIGTERM gets SIGKILL: it runs
+# unprivileged and has nothing to leave half done. This run never waits for
+# it past that. Returns the read's exit status, or 124 when it was stopped.
+run_read() { # varname command args...
+  local name="$1" pidfile rcfile outfile cpid rc supervisor
   shift
-  __file="$APP_SUPPORT/.backstop.$$.read"
-  : > "$__file"
-  BOUNDED_STDOUT="$__file" run_bounded "$@" || __rc=$?
-  # A read left alive is logged above and keeps the lock through its
-  # supervisor, but it is not an undo command: it must not make a later undo
-  # command's own failure read as "still alive".
-  command_alive=$__alive_before
-  printf -v "$__name" '%s' "$(cat "$__file" 2>/dev/null)"
-  rm -f "$__file"
-  return "$__rc"
+  bounded_calls=$((bounded_calls + 1))
+  pidfile="$APP_SUPPORT/.backstop.$$.$bounded_calls.pid"
+  rcfile="$APP_SUPPORT/.backstop.$$.$bounded_calls.rc"
+  outfile="$APP_SUPPORT/.backstop.$$.$bounded_calls.out"
+  if (( bounded_calls == 1 )); then
+    rm -f "$APP_SUPPORT"/.backstop.*.pid "$APP_SUPPORT"/.backstop.*.rc "$APP_SUPPORT"/.backstop.*.out
+  fi
+  (
+    "$@" </dev/null >"$outfile" 2>/dev/null &
+    cpid=$!
+    echo "$cpid" > "$pidfile"
+    rc=0
+    wait "$cpid" || rc=$?
+    echo "$rc" > "$rcfile"
+  ) 9>&- </dev/null >/dev/null 2>&1 &
+  supervisor=$!
+  if wait_for_status "$rcfile" "$COMMAND_TIMEOUT_SECONDS"; then
+    rc="$(cat "$rcfile")"
+  else
+    cpid="$(cat "$pidfile" 2>/dev/null || true)"
+    if [[ -n "$cpid" ]]; then kill -TERM "$cpid" 2>/dev/null || true; fi
+    if wait_for_status "$rcfile" "$KILL_GRACE_SECONDS"; then
+      log error "'$*' did not finish within ${COMMAND_TIMEOUT_SECONDS}s; terminated with SIGTERM (pid ${cpid:-?})"
+    else
+      if [[ -n "$cpid" ]]; then kill -KILL "$cpid" 2>/dev/null || true; fi
+      log error "'$*' did not finish within ${COMMAND_TIMEOUT_SECONDS}s and ignored SIGTERM; sent SIGKILL (pid ${cpid:-?}). A read holds no lock, so nothing waits for it"
+      wait_for_status "$rcfile" "$KILL_GRACE_SECONDS" || true
+    fi
+    rc=124
+  fi
+  # A supervisor that wrote a status is done; one whose read survived even
+  # SIGKILL is left behind without the lock.
+  if [[ -s "$rcfile" ]]; then wait "$supervisor" 2>/dev/null || true; fi
+  printf -v "$name" '%s' "$(cat "$outfile" 2>/dev/null)"
+  rm -f "$pidfile" "$rcfile" "$outfile"
+  return "$rc"
 }
 
 # End this run right after a timed-out undo command that is still alive:
@@ -392,8 +420,8 @@ battery_cutoff() {
   battery_reason=""
   floor="$(config_int endFloor 10)"
   (( floor > 0 )) || return 1
-  run_bounded_read out "$PMSET" -g batt || rc=$?
-  if (( rc == 124 || rc == 125 )); then
+  run_read out "$PMSET" -g batt || rc=$?
+  if (( rc == 124 )); then
     battery_reason="battery state unreadable (pmset -g batt did not finish within ${COMMAND_TIMEOUT_SECONDS}s)"
     return 0
   elif (( rc != 0 )); then
@@ -427,7 +455,7 @@ thermal_cutoff() {
   local out="" level
   thermal_reason=""
   [[ "$(config_bool thermalRules true)" == true ]] || return 1
-  run_bounded_read out "$NOTIFYUTIL" -g com.apple.system.thermalpressurelevel || out=""
+  run_read out "$NOTIFYUTIL" -g com.apple.system.thermalpressurelevel || out=""
   level="${out##* }"
   if [[ -z "$out" || ! "$level" =~ ^[0-9]+$ ]]; then
     log warn "thermal pressure level unreadable (notifyutil printed '${out:-nothing}'); not ending the session on that alone"

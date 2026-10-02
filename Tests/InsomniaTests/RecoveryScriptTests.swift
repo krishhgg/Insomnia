@@ -303,10 +303,10 @@ final class RecoveryScriptTests: XCTestCase {
         try assertSessionEnded(try fx.run(fx.backstop), reason: "thermal pressure level 4")
     }
 
-    /// The reads run under the recovery lock, so they are bounded like the
-    /// undo commands (COMMAND_TIMEOUT_SECONDS, 1 s in this fixture). A
-    /// battery read that hangs is terminated and counts as unreadable: the
-    /// session ends. A thermal read that hangs only warns.
+    /// The reads are bounded like the undo commands (COMMAND_TIMEOUT_SECONDS,
+    /// 1 s in this fixture). A battery read that hangs is terminated and
+    /// counts as unreadable: the session ends. A thermal read that hangs
+    /// only warns.
     func testHungReadsAreBoundedBatteryFailsClosedThermalWarns() throws {
         let app = try fx.holdAliveLock()
         defer { app.release() }
@@ -328,6 +328,31 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(fx.log().contains("thermal pressure level unreadable"), fx.log())
         let leftovers = try FileManager.default.contentsOfDirectory(atPath: fx.home.path).filter { $0.hasPrefix(".backstop.") }
         XCTAssertEqual(leftovers, [], "status and capture files are cleaned up")
+    }
+
+    /// A read never holds the recovery lock: its supervisor closes fd 9
+    /// before starting it. One that ignores SIGTERM and leaves a child
+    /// behind is killed, and the lock is free the moment the run exits, so
+    /// the next minute's run takes it and can still end the session.
+    func testReadThatIgnoresSigtermLeavesTheLockToTheNextRun() throws {
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+        try writeLiveSession()
+        fx.setThermal("IGNORE_TERM")
+
+        try assertSessionKept(try fx.run(fx.backstop))
+
+        XCTAssertTrue(fx.log().contains("ignored SIGTERM; sent SIGKILL"), fx.log())
+        XCTAssertTrue(fx.log().contains("thermal pressure level unreadable"), fx.log())
+        XCTAssertTrue(fx.calls().contains("notifyutil checked fd 9"), "\(fx.calls())")
+        XCTAssertFalse(fx.calls().contains { $0.hasSuffix("had fd 9") }, "neither the read nor its supervisor may inherit the lock: \(fx.calls())")
+        XCTAssertTrue(try fx.lockIsFree(), "nothing the read started holds the lock")
+
+        fx.clearCalls()
+        fx.setThermal("3")
+        try assertSessionEnded(try fx.run(fx.backstop), reason: "thermal pressure level 3")
+        let leftovers = try FileManager.default.contentsOfDirectory(atPath: fx.home.path).filter { $0.hasPrefix(".backstop.") }
+        XCTAssertEqual(leftovers, [])
     }
 
     /// Levels 0 to 2 (nominal, moderate, heavy) keep the session; 3 and 4
@@ -1982,11 +2007,22 @@ private final class ScriptFixture {
         // notifyutil -g <key>: prints "<key> <level>" with the level from
         // thermal.mode (default 0). "FAIL": exit 1 with no output. "GARBAGE":
         // exit 0 with a line that has no level in it. "HANG": never returns.
+        // "IGNORE_TERM": never returns and ignores SIGTERM; it first records
+        // whether it or its parent (the read's supervisor) has fd 9 open and
+        // leaves a child behind that would keep any descriptor it inherited.
         try writeFake("notifyutil", """
         printf 'notifyutil %s\\n' "$*" >> "\(calls)"
         mode="$(cat "\(r)/thermal.mode" 2>/dev/null || echo 0)"
         [[ "$mode" == FAIL ]] && exit 1
         [[ "$mode" == HANG ]] && exec /bin/sleep 60
+        if [[ "$mode" == IGNORE_TERM ]]; then
+          trap '' TERM
+          [[ -e /dev/fd/9 ]] && printf 'notifyutil had fd 9\\n' >> "\(calls)"
+          [[ -n "$(/usr/sbin/lsof -a -p "$PPID" -d 9 -t 2>/dev/null)" ]] && printf 'notifyutil supervisor had fd 9\\n' >> "\(calls)"
+          printf 'notifyutil checked fd 9\\n' >> "\(calls)"
+          /bin/sleep 5 </dev/null >/dev/null 2>&1 &
+          exec /bin/sleep 60
+        fi
         [[ "$mode" == GARBAGE ]] && { echo "something unexpected"; exit 0; }
         echo "${2:-} $mode"
         """)

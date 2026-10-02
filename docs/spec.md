@@ -368,6 +368,10 @@ Backstop, independent of the app:
   agent ends the session otherwise, exactly as `--force` does, and logs the
   reason. A present battery that cannot be read fails closed; an unreadable
   thermal level only warns. `--force` runs none of these checks.
+- The battery and thermal reads have the undo commands' time limit but never
+  hold the lock: they run with its descriptor closed, and one that ignores
+  SIGTERM gets SIGKILL. A hung read fails only its own check, never the next
+  run or the app.
 - Successful restores may clear their entries; failures must stay journaled.
   Process recovery must verify identity and avoid resuming a process that
   Insomnia did not stop. Old PID-only entries need conservative handling.
