@@ -333,9 +333,27 @@ final class RecoveryScriptTests: XCTestCase {
     }
 
     /// A read never holds the recovery lock: its supervisor closes fd 9
-    /// before starting it. One that ignores SIGTERM and leaves a child
-    /// behind is killed, and the lock is free the moment the run exits, so
-    /// the next minute's run takes it and can still end the session.
+    /// before starting it, so neither has it while the run holds the lock.
+    /// The fake looks with lsof, which can take seconds on a busy machine,
+    /// so this run gets a 30 s time limit; the read answers as soon as it
+    /// has looked, so the limit never fires.
+    func testReadsRunWithoutTheLockDescriptor() throws {
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+        try writeLiveSession()
+        try fx.setCommandTimeout(30)
+        fx.setThermal("CHECK_FD9")
+
+        try assertSessionKept(try fx.run(fx.backstop))
+
+        XCTAssertTrue(fx.calls().contains("notifyutil checked fd 9"), "\(fx.calls())")
+        XCTAssertFalse(fx.calls().contains { $0.hasSuffix("had fd 9") }, "neither the read nor its supervisor may inherit the lock: \(fx.calls())")
+        XCTAssertFalse(fx.log().contains("did not finish"), fx.log())
+    }
+
+    /// A read that ignores SIGTERM and leaves a child behind is killed, and
+    /// the lock is free the moment the run exits, so the next minute's run
+    /// takes it and can still end the session.
     func testReadThatIgnoresSigtermLeavesTheLockToTheNextRun() throws {
         let app = try fx.holdAliveLock()
         defer { app.release() }
@@ -347,8 +365,6 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(fx.log().contains("ignored SIGTERM; sent SIGKILL"), fx.log())
         XCTAssertTrue(fx.calls().contains { $0.hasPrefix("kill -KILL ") }, "the timeout signal goes through $KILL: \(fx.calls())")
         XCTAssertTrue(fx.log().contains("thermal pressure level unreadable"), fx.log())
-        XCTAssertTrue(fx.calls().contains("notifyutil checked fd 9"), "\(fx.calls())")
-        XCTAssertFalse(fx.calls().contains { $0.hasSuffix("had fd 9") }, "neither the read nor its supervisor may inherit the lock: \(fx.calls())")
         XCTAssertTrue(try fx.lockIsFree(), "nothing the read started holds the lock")
 
         fx.clearCalls()
@@ -2678,9 +2694,11 @@ private final class ScriptFixture {
         // notifyutil -g <key>: prints "<key> <level>" with the level from
         // thermal.mode (default 0). "FAIL": exit 1 with no output. "GARBAGE":
         // exit 0 with a line that has no level in it. "HANG": never returns.
-        // "IGNORE_TERM": never returns and ignores SIGTERM; it first records
-        // whether it or its parent (the read's supervisor) has fd 9 open and
-        // leaves a child behind that would keep any descriptor it inherited.
+        // "IGNORE_TERM": never returns and ignores SIGTERM; it leaves a child
+        // behind that would keep any descriptor it inherited. "CHECK_FD9":
+        // records whether it or its parent (the read's supervisor) has fd 9
+        // open, then prints level 0. lsof can take seconds on a busy machine,
+        // so a test using it raises the time limit (setCommandTimeout).
         try writeFake("notifyutil", """
         printf 'notifyutil %s\\n' "$*" >> "\(calls)"
         mode="$(cat "\(r)/thermal.mode" 2>/dev/null || echo 0)"
@@ -2688,11 +2706,14 @@ private final class ScriptFixture {
         [[ "$mode" == HANG ]] && exec /bin/sleep 60
         if [[ "$mode" == IGNORE_TERM ]]; then
           trap '' TERM
+          /bin/sleep 5 </dev/null >/dev/null 2>&1 &
+          exec /bin/sleep 60
+        fi
+        if [[ "$mode" == CHECK_FD9 ]]; then
           [[ -e /dev/fd/9 ]] && printf 'notifyutil had fd 9\\n' >> "\(calls)"
           [[ -n "$(/usr/sbin/lsof -a -p "$PPID" -d 9 -t 2>/dev/null)" ]] && printf 'notifyutil supervisor had fd 9\\n' >> "\(calls)"
           printf 'notifyutil checked fd 9\\n' >> "\(calls)"
-          /bin/sleep 5 </dev/null >/dev/null 2>&1 &
-          exec /bin/sleep 60
+          echo "${2:-} 0"; exit 0
         fi
         [[ "$mode" == GARBAGE ]] && { echo "something unexpected"; exit 0; }
         echo "${2:-} $mode"
@@ -2908,6 +2929,14 @@ private final class ScriptFixture {
 
     func writeConfig(_ json: String) throws {
         try json.write(to: config, atomically: true, encoding: .utf8)
+    }
+
+    /// Sets COMMAND_TIMEOUT_SECONDS in this fixture's copy of backstop.sh,
+    /// for a fake command that needs more than the default 1 s to look
+    /// around before it answers.
+    func setCommandTimeout(_ seconds: Int) throws {
+        let text = try String(contentsOf: backstop, encoding: .utf8)
+        try Self.patch(text, ["COMMAND_TIMEOUT_SECONDS": "\(seconds)"]).write(to: backstop, atomically: true, encoding: .utf8)
     }
 
     func psTable(_ rows: [(pid: Int, lstart: String, stat: String, uid: String)]) throws {
