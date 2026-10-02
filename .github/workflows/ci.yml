@@ -9,10 +9,14 @@ on:
 permissions:
   contents: read
 
-# One run per ref; a newer push cancels the stale one.
+# Pull requests share one group per ref, so a newer push cancels the stale
+# run. Pushes to main get a group per commit: a concurrency group holds at
+# most one pending run, so a shared group would let a third merge replace
+# the pending second one even with cancel-in-progress off. Every merge
+# commit gets its own completed result.
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   swift:
@@ -31,6 +35,36 @@ jobs:
         run: |
           xcodebuild -version
           swift --version
+
+      - name: Syntax-check scripts with /bin/bash 3.2
+        # The LaunchAgent runs backstop.sh with macOS /bin/bash 3.2, and
+        # install.sh and uninstall.sh run under it too. ShellCheck runs on
+        # Linux and assumes bash 5, so bash 4 syntax passes lint. `bash -n`
+        # parses each script under the real interpreter without executing
+        # it; it rejects parse-level bash 4 syntax (;;&, |&, [[ -v x ]]).
+        # Builtins and expansions that 3.2 only rejects at run time
+        # (mapfile, declare -A, ${x,,}, wait -n) are caught by the grep
+        # below on non-comment lines, and by RecoveryScriptTests, which run
+        # patched copies of the scripts with /bin/bash in `swift test`.
+        run: |
+          /bin/bash --version
+          case "$(/bin/bash -c 'echo "$BASH_VERSION"')" in
+            3.2.*) ;;
+            *)
+              echo "/bin/bash is not 3.2; the syntax check no longer proves 3.2 compatibility" >&2
+              exit 1
+              ;;
+          esac
+          for script in scripts/*.sh; do
+            /bin/bash -n "$script"
+            echo "syntax ok: $script"
+          done
+          bash4='^[^#]*((^|[^A-Za-z0-9_])(mapfile|readarray|coproc)([^A-Za-z0-9_]|$)|declare +-[a-zA-Z]*A|(^|[^A-Za-z0-9_])local +-[a-zA-Z]*n([^A-Za-z0-9_]|$)|(^|[^A-Za-z0-9_])wait +-n([^A-Za-z0-9_]|$)|\$\{[A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?(,,|\^\^|@[QEPAa])|\[-[0-9]+\])'
+          if grep -nE "$bash4" scripts/*.sh; then
+            echo "bash 4 construct found above; /bin/bash 3.2 fails it at run time" >&2
+            exit 1
+          fi
+          echo "no bash 4 builtins or expansions found"
 
       - name: Install tmux
         # The hosted macOS image has no tmux, so the tmux integration tests skip.
@@ -60,7 +94,9 @@ jobs:
         run: swift test
 
       - name: Build release
-        run: swift build -c release
+        # docs/release-validation.md cites "no compiler warnings" as evidence,
+        # so a warning fails this build instead of scrolling past.
+        run: swift build -c release -Xswiftc -warnings-as-errors
 
       - name: Check the lid simulation is compiled out of the release binary
         # Looks at the binaries, not the compilation condition: the plain
@@ -84,3 +120,60 @@ jobs:
         run: |
           shellcheck --version
           shellcheck scripts/*.sh
+
+  lint-workflows:
+    name: Lint workflows
+    # actionlint checks workflow syntax, expressions and runner labels and
+    # runs the preinstalled shellcheck over every run: block. zizmor audits
+    # the workflows and dependabot.yml for unpinned actions, template
+    # injection, persisted credentials and over-broad permissions. Both are
+    # pinned to one version and verified against a checksum before they run;
+    # Dependabot does not update these pins, so bump them by hand.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      ACTIONLINT_VERSION: "1.7.12"
+      # sha256 of actionlint_1.7.12_linux_amd64.tar.gz from the release's
+      # actionlint_1.7.12_checksums.txt.
+      ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+      ZIZMOR_VERSION: "1.30.1"
+      # sha256 of zizmor-1.30.1-py3-none-manylinux_2_28_x86_64.whl on PyPI.
+      ZIZMOR_SHA256: eee12266b793cb87ad4a7e3af2e72404f8a63e3de5eb099b80bf7b1cfd232a8e
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install actionlint
+        run: |
+          tools="$RUNNER_TEMP/actionlint"
+          mkdir -p "$tools"
+          curl -sSfL --retry 3 -o "$tools/actionlint.tar.gz" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "${ACTIONLINT_SHA256}  $tools/actionlint.tar.gz" | sha256sum -c -
+          tar -xzf "$tools/actionlint.tar.gz" -C "$tools" actionlint
+          "$tools/actionlint" -version
+
+      - name: Run actionlint
+        run: |
+          shellcheck --version
+          "$RUNNER_TEMP/actionlint/actionlint" -no-color
+
+      - name: Install zizmor
+        # A private venv; pip refuses the install unless the downloaded wheel
+        # matches the pinned hash.
+        run: |
+          python3 --version
+          python3 -m venv "$RUNNER_TEMP/zizmor"
+          printf 'zizmor==%s --hash=sha256:%s\n' "$ZIZMOR_VERSION" "$ZIZMOR_SHA256" > "$RUNNER_TEMP/zizmor-requirements.txt"
+          "$RUNNER_TEMP/zizmor/bin/pip" install --require-hashes --only-binary=:all: --no-deps \
+            -r "$RUNNER_TEMP/zizmor-requirements.txt"
+          "$RUNNER_TEMP/zizmor/bin/zizmor" --version
+
+      - name: Run zizmor
+        env:
+          # The online audits (impostor commits, known vulnerable actions)
+          # read public action repositories; the read-only job token is enough.
+          GH_TOKEN: ${{ github.token }}
+        run: '"$RUNNER_TEMP/zizmor/bin/zizmor" --no-progress --color never .'
