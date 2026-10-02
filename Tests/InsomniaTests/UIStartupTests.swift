@@ -32,7 +32,10 @@ final class UIStartupTests: XCTestCase {
             _ = NSApplication.shared
             h = Harness()
             manager = h.makeManager()
-            controller = StatusItemController(manager: manager, status: PlaceholderStatus(), showSettings: {})
+            // The manager's fake clock, so the projected countdown reads the
+            // same second however late a test reads it.
+            let clock = h.clock
+            controller = StatusItemController(manager: manager, status: PlaceholderStatus(), showSettings: {}, clock: { clock.now })
         }
 
         var model: MenuBarModel { controller.model }
