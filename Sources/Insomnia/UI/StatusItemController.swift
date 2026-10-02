@@ -638,6 +638,9 @@ final class StatusItemController: NSObject {
         // Kick that scan off anyway, for the next opening.
         status.refreshInstant()
         status.refreshOnDemand()
+        // Same for the foreign-sleep line: re-read the bit now, and let the
+        // next opening drop the line if sleep is enabled again.
+        Task { await manager.recheckForeignSleep() }
         let menu = StatusMenu.menu(
             menuItems(),
             target: self,
@@ -668,7 +671,8 @@ final class StatusItemController: NSObject {
                 lastGap: status.lastGap
             ),
             throttledBrowsers: status.throttledBrowsers,
-            error: manager.lastError
+            error: manager.lastError,
+            foreignSleep: manager.foreignSleepWarning
         )
     }
 

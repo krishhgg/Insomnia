@@ -130,6 +130,7 @@ is performed. Do not replace "not run" with "passed" based on source review.
 | tmux cancellation with a dedicated disposable pane | Not run |
 | Headed-browser throttling with the lid closed | Not run |
 | Battery/thermal event behavior on supported hardware | Not run |
+| `SleepDisabled 1` set by hand with no session: left alone and reported at launch, not cleared | Not run |
 | Unreadable battery (IOKit miss) ends the session on a laptop after the second read; desktop unaffected | Not run |
 | Install/upgrade/uninstall with recoverable failure conditions | Not run |
 
