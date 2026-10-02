@@ -9,7 +9,7 @@
       "id": "journal-before-change",
       "severity": "high",
       "scope": ["Sources/Insomnia/Core/**", "Sources/Insomnia/System/**", "scripts/backstop.sh"],
-      "rule": "Any change to power state (sudo pmset disablesleep or lowpowermode), to another process (SIGSTOP), to audio output (volume or mute), or to display or keyboard brightness is written to state.json first, through Store.saveState (the journal helper in SessionManager), and that write has returned without error before the change is made. If the write fails the change is not made. The one exception is NSAppSleepDisabled in AppNap.swift, which docs/spec.md section 5 leaves unjournaled and persistent on purpose."
+      "rule": "Any change to power state (sudo pmset disablesleep or lowpowermode), to another process (SIGSTOP), to audio output (volume or mute), to display or keyboard brightness, or to another app's NSAppSleepDisabled (AppNap.swift, opt-in) is written to state.json first, through Store.saveState (the journal helper in SessionManager), and that write has returned without error before the change is made. If the write fails the change is not made."
     },
     {
       "id": "journal-cleared-only-after-confirmed-undo",
