@@ -22,7 +22,10 @@ and run by a per-user LaunchAgent at load and every 60 s with macOS
 missing or expired it runs `sudo -n pmset -a disablesleep 0` and
 `-b lowpowermode 0` for the journaled flags and sends SIGCONT only to a
 journaled pid that still exists, is stopped, started in this boot session at
-the journaled second, and belongs to this user. It keeps, and never
+the journaled second, and belongs to this user. Entries that record
+`startedAtMicros` it never signals itself: it hands them to the installed
+app binary (`Insomnia --resume-frozen`), which checks each to the
+microsecond and signals it, and keeps them on any unexpected answer. It keeps, and never
 restores, `savedOutputVolume`, `savedMuted`, `savedDisplayBrightness`,
 `savedKeyboardBrightness` and `displayRestoredUnderLowPower`: CoreAudio and
 the private brightness frameworks need the app. Legacy `frozenPids` entries
@@ -84,6 +87,13 @@ Flag a change that breaks one of these; do not flag the behavior itself.
   supervising subshell keeps the lock until the command ends, so every later
   app start and backstop run is refused as "lock held" until then. Killing
   sudo would orphan a root pmset outside any transaction.
+- `backstop.sh`, `run_app_bounded`. The `Insomnia --resume-frozen` call
+  is killed with SIGKILL when SIGTERM plus 3 s does not end it, unlike
+  `run_bounded`: it is the user's own unprivileged binary, and once SIGKILL
+  is delivered it runs no more code, so it cannot signal anything later.
+  It runs without fd 9, so it never holds the lock. A timeout, or any
+  answer that is not exactly one `<pid> <word>` line per entry with a
+  matching exit status, keeps every entry of the call.
 - `backstop.sh`, kept entries. Saved audio, saved display and keyboard
   brightness, and `displayRestoredUnderLowPower` are kept for the app, not
   restored by the shell. Legacy `frozenPids` are never signaled or cleared

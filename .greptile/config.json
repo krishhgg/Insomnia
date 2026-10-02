@@ -44,8 +44,8 @@
     {
       "id": "only-verified-pids-are-resumed",
       "severity": "high",
-      "scope": ["Sources/Insomnia/Core/ProcessControl.swift", "Sources/Insomnia/Core/LidActions.swift", "Sources/Insomnia/System/Freezer.swift", "scripts/backstop.sh"],
-      "rule": "SIGCONT is sent only to a journaled pid whose recorded identity still matches the live process: start time to the microsecond and boot session in the app, start time to the second and boot session in backstop.sh. Provisional entries (identity nil, written before the kernel confirmed the stop) and legacy frozenPids are never signaled and are never cleared by the shell. A pid that cannot be observed stays journaled."
+      "scope": ["Sources/Insomnia/Core/ProcessControl.swift", "Sources/Insomnia/Core/LidActions.swift", "Sources/Insomnia/Core/ResumeFrozenCommand.swift", "Sources/Insomnia/System/Freezer.swift", "scripts/backstop.sh"],
+      "rule": "SIGCONT is sent only to a journaled pid whose recorded identity still matches the live process: start time to the microsecond and boot session in the app, and in the app binary that backstop.sh runs for entries that record startedAtMicros (Insomnia --resume-frozen, with a time limit; a timeout or any answer that is not exactly one expected line per entry keeps the entries); start time to the second and boot session in backstop.sh only for entries without startedAtMicros. Provisional entries (identity nil, written before the kernel confirmed the stop) and legacy frozenPids are never signaled and are never cleared by the shell. A pid that cannot be observed stays journaled."
     },
     {
       "id": "no-shell-interpolation",

@@ -342,15 +342,21 @@ Backstop, independent of the app:
   to acquire it must not permit an unprotected journal write or side effect.
 - Successful restores may clear their entries; failures must stay journaled.
   Process recovery must verify identity and avoid resuming a process that
-  Insomnia did not stop. For an entry that records `startedAtMicros` the
-  script runs the installed app binary (`Insomnia --resume-frozen <pid>
-  <startedAt> <startedAtMicros> <bootSession>`, answered before AppKit
-  starts) so the comparison is to the microsecond and the signal follows
-  the lookup in one process; the script acts only on the binary's
-  documented answers (`resumed` and `gone` clear the entry, everything
-  else keeps it) and keeps the entry when the binary is missing. Entries
-  without microseconds keep the shell's one-second `ps` comparison. Old
-  PID-only entries need conservative handling.
+  Insomnia did not stop. The entries that record `startedAtMicros` go to
+  the installed app binary in one call (`Insomnia --resume-frozen` followed
+  by `<pid> <startedAt> <startedAtMicros> <bootSession>` once per entry,
+  answered before AppKit starts), so the comparison is to the microsecond
+  and each entry's signal follows its own lookup in one process. The binary
+  prints one line per entry in argument order, `<pid> <word>`, and exits 0
+  when every word is `resumed` or `gone`, 1 otherwise. The script runs it
+  with the same 30-second limit as a power command, then SIGTERM, then
+  SIGKILL, and without the lock descriptor. It checks the whole answer:
+  one line per entry with that entry's pid and a known word and nothing
+  else, and an exit status that agrees with the words. `resumed` and `gone`
+  clear an entry, the other words keep it, and a missing binary, a timeout
+  or any other answer keeps every entry of the call. Entries without
+  microseconds keep the shell's one-second `ps` comparison. Old PID-only
+  entries need conservative handling.
 - The shell does not restore CoreAudio settings. Saved audio must remain in
   the journal for the app to restore. Uninstall must preserve recovery tools
   and state when restoration is incomplete, including saved audio.
