@@ -4,9 +4,12 @@ import Foundation
 /// the microsecond and the boot session it started in. A reused pid, or the
 /// same pid after a reboot, cannot match all three.
 ///
-/// backstop.sh can only read whole seconds from `ps -o lstart`, so the shell
-/// compares `startedAt` and `bootSession` and treats that as one-second
-/// identity, not an exact match. Only the app compares the microseconds.
+/// backstop.sh can only read whole seconds from `ps -o lstart`, so for an
+/// entry that records `startedAtMicros` it asks the installed app binary
+/// (`Insomnia --resume-frozen`, see `ResumeFrozenCommand`) to compare all
+/// three and signal; the shell never signals such an entry itself. Only an
+/// entry written without microseconds (an older build) is compared by the
+/// shell on `startedAt` and `bootSession`, a one-second identity.
 struct ProcessIdentity: Codable, Equatable, Hashable, Sendable {
     /// Seconds since the epoch, the same value `ps -o lstart` prints.
     let startedAt: Int64

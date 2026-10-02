@@ -23,13 +23,27 @@
 #   - state.json dirty: undo each journaled entry from the journal alone:
 #       sleepDisabledByUs   -> sudo -n pmset -a disablesleep 0
 #       lowPowerSetByUs     -> sudo -n pmset -b lowpowermode 0
-#       frozenProcesses     -> SIGCONT, but only to a pid that is observed to
-#                              exist, be stopped, have started in this boot
-#                              session at the journaled second (ps -o lstart)
-#                              and belong to this user. A pid observed gone,
-#                              running, or not matching is cleared without a
-#                              signal. A pid that cannot be observed (ps
-#                              fails or prints something unparseable) is kept.
+#       frozenProcesses     -> SIGCONT, but only to a pid verified to be the
+#                              process the app froze. An entry that records
+#                              startedAtMicros is handed to the installed app
+#                              binary (INSOMNIA_BIN --resume-frozen), which
+#                              does one kernel lookup (start time to the
+#                              microsecond, boot session, stopped state)
+#                              immediately followed by the SIGCONT; this
+#                              script never signals such an entry itself.
+#                              When the binary is missing, cannot run, or
+#                              answers anything but its documented words, the
+#                              entry is kept and not signaled. An entry
+#                              without startedAtMicros (an older build) is
+#                              checked here instead: it must exist, be
+#                              stopped, have started in this boot session at
+#                              the journaled second (ps -o lstart) and belong
+#                              to this user. A pid observed gone, running, or
+#                              not matching is cleared without a signal. A pid
+#                              that cannot be observed (ps fails or prints
+#                              something unparseable) is kept. In both paths
+#                              an entry from another boot session is cleared
+#                              without a lookup.
 #       frozenPids (legacy)  -> never signaled and never cleared here, even if
 #                              the pid is gone: nothing proves the stopped
 #                              process is ours. Only the app resolves them.
@@ -45,8 +59,9 @@
 #   - state.json unreadable, not a JSON object, or with a known key of the
 #     wrong type: nothing is touched, exit 1.
 #
-# Limitation: the shell compares process start time to the second and the
-# boot session; only the app also compares the microseconds.
+# Limitation: for an entry without startedAtMicros the shell compares process
+# start time to the second only. For every entry a lookup and a signal are
+# still two operations, in the app binary as here.
 #
 # --force: treat the session as expired even if endsAt is in the future
 # (used by install.sh / uninstall.sh to end a stale session deliberately).
@@ -64,6 +79,10 @@ LOCKF=/usr/bin/lockf
 PS=/bin/ps
 KILL=/bin/kill
 SYSCTL=/usr/sbin/sysctl
+# The installed app binary, for the microsecond identity check of
+# frozenProcesses entries (see above). A fixed path like the tools, never
+# PATH. install.sh puts the bundle here.
+INSOMNIA_BIN="${HOME:-}/Applications/Insomnia.app/Contents/MacOS/Insomnia"
 LOCK_TIMEOUT_SECONDS=10
 # Longest a single undo command (sudo pmset) may run before it is sent
 # SIGTERM, and how long it then gets to exit before this run fails closed.
@@ -413,6 +432,46 @@ observe() { # pid
   p_stat="$stat"; p_uid="$uid"
   observation=seen
 }
+# Hand one entry that records microseconds to the app binary (see the
+# frozenProcesses rule in the header). Only the documented word and exit
+# status pairs are acted on; anything else keeps the entry unsignaled.
+resume_via_app() { # pid startedAt startedAtMicros bootSession index
+  local pid="$1" started="$2" micros="$3" boot="$4" i="$5" out word rc=0
+  if ! [[ "$micros" =~ ^[0-9]+$ ]]; then
+    log error "pid $pid has an invalid startedAtMicros ($micros); kept, not signaled"
+    failures+=("pid $pid has an invalid identity and was not resumed")
+    keep_entry "$i"
+    return 0
+  fi
+  if [[ ! -x "$INSOMNIA_BIN" ]]; then
+    log error "pid $pid needs the app binary for its microsecond identity check, but $INSOMNIA_BIN is missing or not executable; kept, not signaled"
+    failures+=("pid $pid was not resumed: app binary missing at $INSOMNIA_BIN")
+    keep_entry "$i"
+    return 0
+  fi
+  out="$("$INSOMNIA_BIN" --resume-frozen "$pid" "$started" "$micros" "$boot" 2>/dev/null </dev/null)" || rc=$?
+  word="${out%%[[:space:]]*}"
+  case "$word:$rc" in
+    resumed:0)
+      log info "SIGCONT sent to pid $pid by the app binary after a microsecond identity check"
+      changed=1 ;;
+    gone:0)
+      log info "pid $pid is gone, running, or not the process we froze (app binary: gone); cleared without signal"
+      changed=1 ;;
+    failed:1)
+      log error "SIGCONT to pid $pid failed (app binary: failed); keeping journal entry for retry"
+      failures+=("pid $pid is still stopped: SIGCONT failed")
+      keep_entry "$i" ;;
+    unobserved:1|unverifiable:1)
+      log error "pid $pid could not be verified (app binary: $word); kept, not signaled"
+      failures+=("pid $pid could not be verified and was not resumed")
+      keep_entry "$i" ;;
+    *)
+      log error "pid $pid: unexpected answer from $INSOMNIA_BIN (exit $rc, output '$out'); kept, not signaled"
+      failures+=("pid $pid was not resumed: unexpected answer from the app binary")
+      keep_entry "$i" ;;
+  esac
+}
 if (( frozen_count > 0 )); then
   boot_now="$("$SYSCTL" -n kern.bootsessionuuid 2>/dev/null || true)"
   uid_now="$(id -u)"
@@ -420,6 +479,7 @@ if (( frozen_count > 0 )); then
   while (( i < frozen_count )); do
     pid="$(extract "$STATE" "frozenProcesses.$i.pid" || true)"
     started="$(extract "$STATE" "frozenProcesses.$i.startedAt" || true)"
+    micros="$(extract "$STATE" "frozenProcesses.$i.startedAtMicros" || true)"
     boot="$(extract "$STATE" "frozenProcesses.$i.bootSession" || true)"
     if ! is_positive_int "$pid"; then
       log error "frozen entry $i has no valid pid (${pid:-?}); kept, not signaled"
@@ -436,6 +496,8 @@ if (( frozen_count > 0 )); then
     elif [[ "$boot" != "$boot_now" ]]; then
       log info "pid $pid belongs to a previous boot; cleared without signal"
       changed=1
+    elif [[ -n "$micros" ]]; then
+      resume_via_app "$pid" "$started" "$micros" "$boot" "$i"
     else
       observe "$pid"
       case "$observation" in

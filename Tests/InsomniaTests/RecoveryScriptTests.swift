@@ -107,9 +107,8 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(fx.calls(), [
             "sudo -n \(fx.fakePmset) -a disablesleep 0",
             "sudo -n \(fx.fakePmset) -b lowpowermode 0",
-            "ps -o lstart=,stat=,uid= -p 4242",
-            "kill -CONT 4242",
-        ])
+            "Insomnia --resume-frozen 4242 \(started) 17 \(fx.bootUUID)",
+        ], "an entry with microseconds is resumed by the app binary, never by ps and kill")
         let s = try fx.stateJSON()
         XCTAssertEqual(s["sleepDisabledByUs"] as? Bool, false)
         XCTAssertEqual(s["lowPowerSetByUs"] as? Bool, false)
@@ -129,14 +128,14 @@ final class RecoveryScriptTests: XCTestCase {
            {"pid":111,"startedAt":\(started),"startedAtMicros":1,"bootSession":"\(fx.bootUUID)"},
            {"pid":222,"startedAt":\(started),"startedAtMicros":2,"bootSession":"\(fx.bootUUID)","note":"custom"}]}
         """)
-        try fx.psTable([(111, fx.lstart(started), "T", fx.uid), (222, fx.lstart(started), "T+", fx.uid)])
-        fx.setMode("kill.fail", "222")
+        try fx.insomniaTable([(222, "failed", 1)])
 
         let r = try fx.run(fx.backstop)
 
         XCTAssertNotEqual(r.status, 0)
-        XCTAssertTrue(fx.calls().contains("kill -CONT 111"))
-        XCTAssertTrue(fx.calls().contains("kill -CONT 222"))
+        XCTAssertTrue(fx.calls().contains("Insomnia --resume-frozen 111 \(started) 1 \(fx.bootUUID)"), "\(fx.calls())")
+        XCTAssertTrue(fx.calls().contains("Insomnia --resume-frozen 222 \(started) 2 \(fx.bootUUID)"), "\(fx.calls())")
+        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("kill") || $0.hasPrefix("ps") }, "\(fx.calls())")
         let s = try fx.stateJSON()
         XCTAssertEqual(s["sleepDisabledByUs"] as? Bool, false, "an unrelated stuck pid must not hold sleep disabled")
         let frozen = try XCTUnwrap(s["frozenProcesses"] as? [[String: Any]])
@@ -169,17 +168,19 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(fx.log().contains("444"), fx.log())
     }
 
+    /// Entries without microseconds (an older build) keep the one-second
+    /// ps comparison in the shell.
     func testGoneRunningOrMismatchedProcessesClearWithoutSignal() throws {
         try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
         let started = 1_789_388_423
         try fx.writeState("""
         {"sleepDisabledByUs":false,"lowPowerSetByUs":false,"dockerFrozen":true,
          "frozenProcesses":[
-           {"pid":301,"startedAt":\(started),"startedAtMicros":0,"bootSession":"\(fx.bootUUID)"},
-           {"pid":302,"startedAt":\(started),"startedAtMicros":0,"bootSession":"\(fx.bootUUID)"},
-           {"pid":303,"startedAt":\(started),"startedAtMicros":0,"bootSession":"\(fx.bootUUID)"},
-           {"pid":304,"startedAt":\(started),"startedAtMicros":0,"bootSession":"other-boot"},
-           {"pid":305,"startedAt":\(started),"startedAtMicros":0,"bootSession":"\(fx.bootUUID)"}]}
+           {"pid":301,"startedAt":\(started),"bootSession":"\(fx.bootUUID)"},
+           {"pid":302,"startedAt":\(started),"bootSession":"\(fx.bootUUID)"},
+           {"pid":303,"startedAt":\(started),"bootSession":"\(fx.bootUUID)"},
+           {"pid":304,"startedAt":\(started),"bootSession":"other-boot"},
+           {"pid":305,"startedAt":\(started),"bootSession":"\(fx.bootUUID)"}]}
         """)
         try fx.psTable([
             // 301 is gone (not in the table).
@@ -192,7 +193,7 @@ final class RecoveryScriptTests: XCTestCase {
         let r = try fx.run(fx.backstop)
 
         XCTAssertEqual(r.status, 0, r.stderr)
-        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("kill") }, "\(fx.calls())")
+        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("kill") || $0.hasPrefix("Insomnia") }, "\(fx.calls())")
         XCTAssertFalse(fx.calls().contains("ps -o lstart=,stat=,uid= -p 304"), "another boot needs no lookup")
         let s = try fx.stateJSON()
         XCTAssertEqual((s["frozenProcesses"] as? [Any])?.count, 0)
@@ -595,14 +596,14 @@ final class RecoveryScriptTests: XCTestCase {
         }
     }
 
-    // MARK: - Process observation failures
+    // MARK: - Process observation failures (entries without microseconds)
 
     func testPsCommandFailureKeepsEntryWithoutSignal() throws {
         try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
         let started = 1_789_388_423
         try fx.writeState("""
         {"sleepDisabledByUs":false,"lowPowerSetByUs":false,"dockerFrozen":true,
-         "frozenProcesses":[{"pid":777,"startedAt":\(started),"startedAtMicros":0,"bootSession":"\(fx.bootUUID)"}]}
+         "frozenProcesses":[{"pid":777,"startedAt":\(started),"bootSession":"\(fx.bootUUID)"}]}
         """)
         fx.setMode("ps", "fail")
 
@@ -622,7 +623,7 @@ final class RecoveryScriptTests: XCTestCase {
         let started = 1_789_388_423
         try fx.writeState("""
         {"sleepDisabledByUs":false,"lowPowerSetByUs":false,"dockerFrozen":false,
-         "frozenProcesses":[{"pid":778,"startedAt":\(started),"startedAtMicros":0,"bootSession":"\(fx.bootUUID)"}]}
+         "frozenProcesses":[{"pid":778,"startedAt":\(started),"bootSession":"\(fx.bootUUID)"}]}
         """)
         fx.setMode("ps", "garbage")
 
@@ -649,6 +650,167 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertNotEqual(r.status, 0)
         XCTAssertEqual(fx.calls(), [], "no ps lookup and no signal without a boot session to compare")
         XCTAssertEqual((try fx.stateJSON()["frozenProcesses"] as? [[String: Any]])?.first?["pid"] as? Int, 779)
+    }
+
+    // MARK: - Microsecond identity through the app binary
+
+    private func writeMicrosecondEntry(pid: Int, started: Int, micros: Int, boot: String? = nil, extra: String = "") throws {
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        try fx.writeState("""
+        {"sleepDisabledByUs":false,"lowPowerSetByUs":false,"dockerFrozen":true,
+         "frozenProcesses":[{"pid":\(pid),"startedAt":\(started),"startedAtMicros":\(micros),"bootSession":"\(boot ?? fx.bootUUID)"\(extra)}]}
+        """)
+    }
+
+    private func onlyFrozenEntry() throws -> [String: Any]? {
+        (try fx.stateJSON()["frozenProcesses"] as? [[String: Any]])?.first
+    }
+
+    /// The shell passes the four identity fields through unchanged and
+    /// never runs ps or kill for such an entry. "resumed" clears it.
+    func testMicrosecondEntryIsHandedToTheAppBinaryWithItsFullIdentity() throws {
+        let started = 1_789_388_423
+        try writeMicrosecondEntry(pid: 5100, started: started, micros: 654_321)
+        try fx.psTable([(5100, fx.lstart(started), "T", fx.uid)])
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 0, r.stderr)
+        XCTAssertEqual(fx.calls(), ["Insomnia --resume-frozen 5100 \(started) 654321 \(fx.bootUUID)"])
+        XCTAssertEqual((try fx.stateJSON()["frozenProcesses"] as? [Any])?.count, 0)
+        XCTAssertEqual(try fx.stateJSON()["dockerFrozen"] as? Bool, false)
+        XCTAssertTrue(fx.log().contains("SIGCONT sent to pid 5100 by the app binary"), fx.log())
+    }
+
+    /// Microseconds of 0 are an identity too (the key is present), not a
+    /// missing value: the binary is asked, ps is not.
+    func testZeroMicrosecondsStillUsesTheAppBinary() throws {
+        let started = 1_789_388_423
+        try writeMicrosecondEntry(pid: 5101, started: started, micros: 0)
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 0, r.stderr)
+        XCTAssertEqual(fx.calls(), ["Insomnia --resume-frozen 5101 \(started) 0 \(fx.bootUUID)"])
+    }
+
+    func testAppBinaryGoneClearsTheEntryWithoutSignal() throws {
+        try writeMicrosecondEntry(pid: 5102, started: 1_789_388_423, micros: 5)
+        try fx.insomniaTable([(5102, "gone", 0)])
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 0, r.stderr)
+        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("kill") }, "\(fx.calls())")
+        XCTAssertEqual((try fx.stateJSON()["frozenProcesses"] as? [Any])?.count, 0)
+        XCTAssertTrue(fx.log().contains("pid 5102 is gone, running, or not the process we froze"), fx.log())
+        XCTAssertFalse(fx.exists(fx.session))
+    }
+
+    /// failed, unobserved and unverifiable keep the entry verbatim for the
+    /// next run, with the journal dirty and the session file in place.
+    func testAppBinaryFailedUnobservedAndUnverifiableKeepTheEntry() throws {
+        for (word, expectation) in [("failed", "SIGCONT failed"), ("unobserved", "could not be verified"), ("unverifiable", "could not be verified")] {
+            fx.destroy()
+            fx = try ScriptFixture()
+            try writeMicrosecondEntry(pid: 5103, started: 1_789_388_423, micros: 9, extra: #","note":"custom""#)
+            try fx.insomniaTable([(5103, word, 1)])
+
+            let r = try fx.run(fx.backstop)
+
+            XCTAssertNotEqual(r.status, 0, word)
+            let entry = try XCTUnwrap(try onlyFrozenEntry(), word)
+            XCTAssertEqual(entry["pid"] as? Int, 5103, word)
+            XCTAssertEqual(entry["startedAtMicros"] as? Int, 9, "\(word): identity must survive for the next attempt")
+            XCTAssertEqual(entry["note"] as? String, "custom", word)
+            XCTAssertEqual(try fx.stateJSON()["dockerFrozen"] as? Bool, true, word)
+            XCTAssertTrue(fx.exists(fx.session), word)
+            XCTAssertTrue(fx.log().contains(expectation), "\(word): \(fx.log())")
+        }
+    }
+
+    /// No app binary at the fixed path: the entry is kept, nothing is
+    /// signaled, and the log names the path. The shell does not fall back
+    /// to its one-second comparison.
+    func testMissingAppBinaryKeepsTheEntryWithoutSignal() throws {
+        let started = 1_789_388_423
+        try writeMicrosecondEntry(pid: 5104, started: started, micros: 1)
+        try fx.psTable([(5104, fx.lstart(started), "T", fx.uid)])
+        try FileManager.default.removeItem(at: fx.fakeInsomnia)
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertNotEqual(r.status, 0)
+        XCTAssertEqual(fx.calls(), [], "ps or kill ran although the identity check needs the app binary")
+        XCTAssertEqual(try onlyFrozenEntry()?["pid"] as? Int, 5104)
+        XCTAssertTrue(fx.log().contains("\(fx.fakeInsomnia.path) is missing or not executable"), fx.log())
+        XCTAssertTrue(fx.exists(fx.session))
+    }
+
+    /// A word the shell does not know, or a known word with the wrong exit
+    /// status, is not acted on: kept, not signaled, logged with the answer.
+    func testUnexpectedAppBinaryAnswerKeepsTheEntry() throws {
+        for (word, status) in [("bogus", 0), ("resumed", 1), ("gone", 1), ("failed", 0), ("", 0), ("", 70)] {
+            fx.destroy()
+            fx = try ScriptFixture()
+            try writeMicrosecondEntry(pid: 5105, started: 1_789_388_423, micros: 2)
+            try fx.insomniaTable([(5105, word, status)])
+
+            let r = try fx.run(fx.backstop)
+
+            XCTAssertNotEqual(r.status, 0, "\(word) \(status)")
+            XCTAssertEqual(try onlyFrozenEntry()?["pid"] as? Int, 5105, "\(word) \(status)")
+            XCTAssertTrue(fx.log().contains("unexpected answer from \(fx.fakeInsomnia.path) (exit \(status), output '\(word)')"), "\(word) \(status): \(fx.log())")
+        }
+    }
+
+    /// Another boot session is settled by the shell: cleared without a
+    /// lookup, so the binary is not run.
+    func testMicrosecondEntryFromAnotherBootIsClearedWithoutRunningTheBinary() throws {
+        try writeMicrosecondEntry(pid: 5106, started: 1_789_388_423, micros: 3, boot: "other-boot")
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 0, r.stderr)
+        XCTAssertEqual(fx.calls(), [])
+        XCTAssertEqual((try fx.stateJSON()["frozenProcesses"] as? [Any])?.count, 0)
+    }
+
+    /// Negative microseconds pass the shape check (an integer) but are not
+    /// an identity the binary accepts: kept, binary not run.
+    func testNegativeMicrosecondsKeepTheEntryWithoutRunningTheBinary() throws {
+        try writeMicrosecondEntry(pid: 5107, started: 1_789_388_423, micros: -1)
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertNotEqual(r.status, 0)
+        XCTAssertEqual(fx.calls(), [])
+        XCTAssertEqual(try onlyFrozenEntry()?["pid"] as? Int, 5107)
+        XCTAssertTrue(fx.log().contains("invalid startedAtMicros"), fx.log())
+    }
+
+    /// Mixed journal: the entry with microseconds goes to the binary, the
+    /// one without keeps the ps path, each in journal order.
+    func testEntriesWithAndWithoutMicrosecondsTakeTheirOwnPath() throws {
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        let started = 1_789_388_423
+        try fx.writeState("""
+        {"sleepDisabledByUs":false,"lowPowerSetByUs":false,"dockerFrozen":false,
+         "frozenProcesses":[
+           {"pid":5108,"startedAt":\(started),"startedAtMicros":8,"bootSession":"\(fx.bootUUID)"},
+           {"pid":5109,"startedAt":\(started),"bootSession":"\(fx.bootUUID)"}]}
+        """)
+        try fx.psTable([(5108, fx.lstart(started), "T", fx.uid), (5109, fx.lstart(started), "T", fx.uid)])
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 0, r.stderr)
+        XCTAssertEqual(fx.calls(), [
+            "Insomnia --resume-frozen 5108 \(started) 8 \(fx.bootUUID)",
+            "ps -o lstart=,stat=,uid= -p 5109",
+            "kill -CONT 5109",
+        ])
+        XCTAssertEqual((try fx.stateJSON()["frozenProcesses"] as? [Any])?.count, 0)
     }
 
     // MARK: - Uninstall locking and interleaving
@@ -1421,6 +1583,8 @@ private final class ScriptFixture {
     var logFile: URL { home.appendingPathComponent("Logs/insomnia.log") }
     var plist: URL { home.appendingPathComponent("LaunchAgents/com.insomnia.backstop.plist") }
     var fakePmset: String { bin.appendingPathComponent("pmset").path }
+    /// The fake app binary backstop.sh calls for `--resume-frozen`.
+    var fakeInsomnia: URL { bin.appendingPathComponent("Insomnia") }
 
     private let fm = FileManager.default
 
@@ -1512,6 +1676,7 @@ private final class ScriptFixture {
             "PS": bin.appendingPathComponent("ps").path,
             "KILL": bin.appendingPathComponent("kill").path,
             "SYSCTL": bin.appendingPathComponent("sysctl").path,
+            "INSOMNIA_BIN": fakeInsomnia.path,
             "LOCK_TIMEOUT_SECONDS": "1",
             "COMMAND_TIMEOUT_SECONDS": "1",
             "KILL_GRACE_SECONDS": "1",
@@ -1686,6 +1851,19 @@ private final class ScriptFixture {
         try writeFake("sysctl", """
         cat "\(r)/boot.uuid"
         """)
+        // Insomnia --resume-frozen: answers from insomnia.table (pid|word|status),
+        // "resumed" with exit 0 for a pid without a row.
+        try writeFake("Insomnia", """
+        printf 'Insomnia %s\\n' "$*" >> "\(calls)"
+        pid="${2:-}"
+        if [[ -f "\(r)/insomnia.table" ]]; then
+          while IFS='|' read -r p word status; do
+            if [[ "$p" == "$pid" ]]; then printf '%s\\n' "$word"; exit "$status"; fi
+          done < "\(r)/insomnia.table"
+        fi
+        echo resumed
+        exit 0
+        """)
         // pgrep: pgrep.mode holds one exit status per line, consumed in
         // order; the last line repeats. Default 1 (not running).
         try writeFake("pgrep", """
@@ -1776,6 +1954,13 @@ private final class ScriptFixture {
 
     func setMode(_ name: String, _ value: String) {
         try? value.write(to: root.appendingPathComponent("\(name).mode"), atomically: true, encoding: .utf8)
+    }
+
+    /// What the fake app binary answers per pid: the printed word and its
+    /// exit status.
+    func insomniaTable(_ rows: [(pid: Int, word: String, status: Int)]) throws {
+        let text = rows.map { "\($0.pid)|\($0.word)|\($0.status)" }.joined(separator: "\n") + "\n"
+        try text.write(to: root.appendingPathComponent("insomnia.table"), atomically: true, encoding: .utf8)
     }
 
     func psTable(_ rows: [(pid: Int, lstart: String, stat: String, uid: String)]) throws {

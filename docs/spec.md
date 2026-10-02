@@ -318,7 +318,15 @@ Backstop, independent of the app:
   to acquire it must not permit an unprotected journal write or side effect.
 - Successful restores may clear their entries; failures must stay journaled.
   Process recovery must verify identity and avoid resuming a process that
-  Insomnia did not stop. Old PID-only entries need conservative handling.
+  Insomnia did not stop. For an entry that records `startedAtMicros` the
+  script runs the installed app binary (`Insomnia --resume-frozen <pid>
+  <startedAt> <startedAtMicros> <bootSession>`, answered before AppKit
+  starts) so the comparison is to the microsecond and the signal follows
+  the lookup in one process; the script acts only on the binary's
+  documented answers (`resumed` and `gone` clear the entry, everything
+  else keeps it) and keeps the entry when the binary is missing. Entries
+  without microseconds keep the shell's one-second `ps` comparison. Old
+  PID-only entries need conservative handling.
 - The shell does not restore CoreAudio settings. Saved audio must remain in
   the journal for the app to restore. Uninstall must preserve recovery tools
   and state when restoration is incomplete, including saved audio.

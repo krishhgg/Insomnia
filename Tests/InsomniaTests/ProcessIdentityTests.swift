@@ -214,6 +214,74 @@ final class ProcessIdentityTests: XCTestCase {
         XCTAssertEqual(report.gone, [101])
     }
 
+    /// Pins the order the ownership rule depends on: for each pid, one
+    /// lookup immediately followed by its signal, before the next pid is
+    /// looked up. A pid that gets no signal costs exactly one lookup.
+    /// Never all lookups first and the signals after.
+    func testEveryResumeSignalIsImmediatelyPrecededByItsOwnLookup() {
+        let events = Locked<[String]>([])
+        let kernel: [Int32: ProcessSignalState] = [
+            100: ProcessSignalState(ppid: 1, stopped: true, startedAt: 1000),
+            101: ProcessSignalState(ppid: 1, stopped: true, startedAt: 1001),
+            102: ProcessSignalState(ppid: 1, stopped: false, startedAt: 1002),
+        ]
+        let c = SignalProcessControl(
+            stateLookup: { pid in
+                events.value.append("lookup \(pid)")
+                return kernel[pid].map(ProcessLookup.present) ?? .absent
+            },
+            send: { pid, sig in
+                events.value.append("send \(pid) \(sig == SIGCONT ? "CONT" : "other")")
+                return 0
+            }
+        )
+        let report = c.resume([
+            FrozenProcess(pid: 100, startedAt: 1000),
+            FrozenProcess(pid: 103, startedAt: 1003),
+            FrozenProcess(pid: 101, startedAt: 1001),
+            FrozenProcess(pid: 102, startedAt: 1002),
+        ])
+        XCTAssertEqual(events.value, [
+            "lookup 100", "send 100 CONT",
+            "lookup 103",
+            "lookup 101", "send 101 CONT",
+            "lookup 102",
+        ])
+        XCTAssertEqual(report.resumed, [100, 101])
+        XCTAssertEqual(report.gone, [103, 102])
+    }
+
+    func testEverySuspendSignalIsImmediatelyPrecededByItsOwnLookup() {
+        let events = Locked<[String]>([])
+        let kernel: [Int32: ProcessSignalState] = [
+            100: ProcessSignalState(ppid: 1, stopped: false, startedAt: 1000),
+            101: ProcessSignalState(ppid: 100, stopped: false, startedAt: 1001),
+            102: ProcessSignalState(ppid: 100, stopped: true, startedAt: 1002),
+        ]
+        let c = SignalProcessControl(
+            stateLookup: { pid in
+                events.value.append("lookup \(pid)")
+                return kernel[pid].map(ProcessLookup.present) ?? .absent
+            },
+            send: { pid, sig in
+                events.value.append("send \(pid) \(sig == SIGSTOP ? "STOP" : "other")")
+                return 0
+            }
+        )
+        let report = c.suspend([
+            FrozenProcess(pid: 100, startedAt: 1000),
+            FrozenProcess(pid: 102, startedAt: 1002),
+            FrozenProcess(pid: 101, startedAt: 1001),
+        ], expectedParents: [100: 1, 101: 100, 102: 100])
+        XCTAssertEqual(events.value, [
+            "lookup 100", "send 100 STOP",
+            "lookup 102",
+            "lookup 101", "send 101 STOP",
+        ])
+        XCTAssertEqual(report.suspended, [100, 101])
+        XCTAssertEqual(report.skipped, [102])
+    }
+
     // MARK: Planner
 
     func testPlannerRecordsIdentityForEveryPidAndLeavesOutStoppedOnes() {

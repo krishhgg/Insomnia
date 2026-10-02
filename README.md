@@ -183,8 +183,13 @@ installation scenarios still need [release validation](docs/release-validation.m
   Verify the live process and whether it should be resumed; never blindly
   signal a PID from an old log.
 - **Identity is not an atomic guarantee:** the app checks start time to the
-  microsecond; the shell checks to the second. A lookup and a signal are still
-  separate operations.
+  microsecond, and the backstop asks the installed app binary
+  (`Insomnia --resume-frozen`) to do the same check and send the signal for
+  every entry that records microseconds; it never signals those itself, and
+  keeps the entry when the binary is missing or answers anything unexpected.
+  Entries written by builds before microseconds were recorded keep the
+  one-second `ps` comparison in the shell. A lookup and a signal are still
+  separate operations, one pid at a time.
 - **Stuck power commands:** a command that survives its timeout keeps the
   recovery lock until it exits. Other recovery attempts or new sessions wait
   or fail with a warning instead of running alongside it.
