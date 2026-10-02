@@ -139,9 +139,13 @@ jobs:
           keychain="$RUNNER_TEMP/insomnia-release.keychain-db"
           keychain_password="$(uuidgen)"
           security create-keychain -p "$keychain_password" "$keychain"
+          # Exported before anything is imported, so the removal step below
+          # runs even if a command after this one fails.
+          echo "SIGNING_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
           security set-keychain-settings -lut 3600 "$keychain"
           security unlock-keychain -p "$keychain_password" "$keychain"
           p12="$RUNNER_TEMP/insomnia-release.p12"
+          trap 'rm -f "$p12"' EXIT
           printf '%s' "$P12_BASE64" | base64 --decode > "$p12"
           security import "$p12" -k "$keychain" -P "$P12_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
           rm -f "$p12"
@@ -152,7 +156,6 @@ jobs:
           while IFS= read -r line; do existing+=("$line"); done < <(security list-keychains -d user | sed -e 's/^ *"//' -e 's/"$//')
           security list-keychains -d user -s "$keychain" "${existing[@]}"
           security find-identity -v -p codesigning "$keychain"
-          echo "SIGNING_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
 
       - name: Build and sign
         id: build
@@ -194,6 +197,7 @@ jobs:
           NOTARY_ISSUER_ID: ${{ secrets.INSOMNIA_NOTARY_ISSUER_ID }}
         run: |
           key="$RUNNER_TEMP/notary.p8"
+          trap 'rm -f "$key"' EXIT
           printf '%s' "$NOTARY_KEY_BASE64" | base64 --decode > "$key"
           submission="$RUNNER_TEMP/Insomnia-notary.zip"
           /usr/bin/ditto -c -k --sequesterRsrc --keepParent dist/Insomnia.app "$submission"

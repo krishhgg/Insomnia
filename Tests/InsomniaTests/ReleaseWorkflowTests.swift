@@ -85,6 +85,21 @@ final class ReleaseWorkflowTests: XCTestCase {
         XCTAssertFalse(text.contains("--allow-unsigned"), "no Gatekeeper workarounds")
     }
 
+    /// Key material leaves the runner even when a signing step fails: each
+    /// decoded key file is removed by an EXIT trap set before it is written,
+    /// and the keychain path is exported before anything is imported, so
+    /// the always() removal step finds it.
+    func testKeyFilesAndTheKeychainAreRemovedWhenASigningStepFails() throws {
+        let text = try XCTUnwrap(try workflows().first { $0.name == "release.yml" }).text
+        func offset(_ needle: String) throws -> String.Index {
+            try XCTUnwrap(text.range(of: needle), "release.yml has no \(needle)").lowerBound
+        }
+        XCTAssertLessThan(try offset(#"trap 'rm -f "$p12"' EXIT"#), try offset(#"base64 --decode > "$p12""#))
+        XCTAssertLessThan(try offset(#"trap 'rm -f "$key"' EXIT"#), try offset(#"base64 --decode > "$key""#))
+        XCTAssertLessThan(try offset(#"echo "SIGNING_KEYCHAIN=$keychain" >> "$GITHUB_ENV""#), try offset(#"security import "$p12""#))
+        XCTAssertTrue(text.contains("if: always() && env.SIGNING_KEYCHAIN != ''"), "the keychain removal runs after a failure")
+    }
+
     /// The job that holds the signing key has read-only access; only the job
     /// that publishes may write, and only what publishing needs.
     func testOnlyTheReleaseJobMayWrite() throws {
