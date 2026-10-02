@@ -23,13 +23,17 @@ enum FloorRules {
     ///   matches, so 0 turns the battery end off; Config keeps a non-zero
     ///   `endFloor` below `lowPowerFloor`.
     /// - thermal `critical` (if `thermalRules`): end session
+    /// - battery present but unreadable on two consecutive reads while not
+    ///   charging, with an end floor set: end session. The floor cannot be
+    ///   applied to a level nobody can read, and the Mac is on a battery
+    ///   that may be about to die. A desktop has no battery and no floor.
     /// - battery below `lowPowerFloor` while not charging, thermal
     ///   `serious` (if `thermalRules`), or lid closed (if
     ///   `lowPowerOnLidClose`, charging or not): Low Power Mode on
     /// - none of the above while we set Low Power Mode: Low Power Mode off
     ///   ("charger connected", "thermal back to nominal/fair", "lid opened")
     static func evaluate(
-        percent: Int?,
+        battery: BatteryStatus,
         isCharging: Bool,
         thermal: ProcessInfo.ThermalState,
         lidClosed: Bool,
@@ -37,11 +41,15 @@ enum FloorRules {
         config: Config
     ) -> [Action] {
         let onBattery = !isCharging
+        let percent = battery.percent
         if let p = percent, onBattery, p < config.endFloor {
             return [.endSession(.batteryFloor)]
         }
         if config.thermalRules, thermal == .critical {
             return [.endSession(.thermalCritical)]
+        }
+        if case let .unreadable(misses) = battery, onBattery, misses >= 2, config.endFloor > 0 {
+            return [.endSession(.batteryUnreadable)]
         }
         let cause = lowPowerCause(percent: percent, isCharging: isCharging, thermal: thermal, lidClosed: lidClosed, config: config)
         if let cause, !lowPowerSetByUs { return [.enableLowPower(cause)] }
@@ -96,11 +104,12 @@ struct FloorRuleDriver {
         self.notifier = notifier
     }
 
-    func run(percent: Int?, isCharging: Bool, thermal: ProcessInfo.ThermalState, lidClosed: Bool) async {
+    func run(battery: BatteryStatus, isCharging: Bool, thermal: ProcessInfo.ThermalState, lidClosed: Bool) async {
         guard let manager, manager.isActive, !Task.isCancelled else { return }
         let config = manager.config
+        let percent = battery.percent
         let actions = FloorRules.evaluate(
-            percent: percent,
+            battery: battery,
             isCharging: isCharging,
             thermal: thermal,
             lidClosed: lidClosed,

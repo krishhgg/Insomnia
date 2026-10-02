@@ -22,7 +22,6 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/kgarg2468/Insomnia/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/kgarg2468/Insomnia/actions/workflows/ci.yml/badge.svg"></a>
   <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/License-MIT-536D78?style=flat-square"></a>
   <img alt="macOS 26 or later" src="https://img.shields.io/badge/macOS-26%2B-303336?style=flat-square">
   <img alt="Experimental source build" src="https://img.shields.io/badge/Status-experimental-536D78?style=flat-square">
@@ -146,8 +145,13 @@ The defaults are worth knowing:
   Mac otherwise keeps running at full speed; the mode is switched off again
   when the lid opens, unless a battery or thermal rule still wants it.
 - **Battery rules:** below 40% on battery, request Low Power Mode; below 10%,
-  end the session. Serious thermal state requests Low Power Mode; critical
-  thermal state ends the session. These rules require the app to be running.
+  end the session. A battery that is present but cannot be read on two
+  consecutive reads while on battery also ends the session, with a
+  notification saying why: the floor cannot be applied to a level nobody can
+  read. One failed read is tolerated, and the level is re-read every 30 s
+  until it is readable again. A desktop has no battery and no floor. Serious
+  thermal state requests Low Power Mode; critical thermal state ends the
+  session. These rules require the app to be running.
   Setting the end floor to 0 turns the battery end off. Otherwise the end
   floor stays below the Low Power Mode floor. The Settings steppers move the
   other floor when the two would cross, and a hand-edited `config.json` with
@@ -218,7 +222,10 @@ arguments.
 macOS requires Location Services permission to reveal network names. Insomnia
 requests it on the first hotspot save, or when starting a session with a
 configured hotspot—not merely on launch. If denied, use the Location row in
-Settings to open **Privacy & Security → Location Services**.
+Settings to open **Privacy & Security → Location Services**. Mac apps have no
+when-in-use grant, so System Settings records it as Location Services access
+for Insomnia. Insomnia uses it only to read Wi-Fi network names through
+CoreWLAN and never requests your location.
 
 Configured tmux targets opt into sending `continue` followed by Enter after a
 long outage (90 seconds by default). The default target list is empty. Use
@@ -247,6 +254,10 @@ Configuration lives in `~/Library/Application Support/Insomnia/config.json`.
 Use Settings for the app's controls; [Config.swift](Sources/Insomnia/Model/Config.swift)
 defines the full configuration and defaults. Local logs can contain SSIDs,
 process metadata, and tmux targets. Check them before sharing publicly.
+Lines the app writes to `insomnia.log` also go to the unified log with their
+bodies marked private, so `log show` and other local programs see `<private>`
+in place of the text unless private data logging is enabled on the Mac. The
+backstop's lines go only to `insomnia.log`, which keeps the full text of both.
 
 `INSOMNIA_HOME` relocates app support files, logs, and LaunchAgents for testing.
 It is **not an installation sandbox**: installation/removal also involves the
@@ -278,10 +289,12 @@ swift build
 swift test
 ```
 
-CI runs Swift tests, a release build, and ShellCheck. tmux integration tests
-need tmux installed; check skip counts rather than assuming missing integration
-coverage passed. Tests use injected dependencies and temporary fixtures—not
-live installation or power changes on a contributor's machine.
+CI runs Swift tests, a release build with warnings as errors, a bash 3.2
+syntax check of the scripts, ShellCheck, and actionlint plus zizmor over the
+workflows. tmux integration tests need tmux installed; check skip counts
+rather than assuming missing integration coverage passed. Tests use injected
+dependencies and temporary fixtures—not live installation or power changes
+on a contributor's machine.
 
 The app icon keeps the eye-and-moon [vector geometry](Sources/Insomnia/UI/EyeMoonGeometry.swift); the menu bar shows a [closed eye](Sources/Insomnia/UI/EyeMarkGeometry.swift) that opens while a session runs.
 After changing the artwork, run `./scripts/generate-app-icon.sh` to regenerate

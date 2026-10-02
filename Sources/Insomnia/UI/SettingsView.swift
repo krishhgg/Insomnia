@@ -216,15 +216,22 @@ struct SettingsView: View {
                 Button(hotspotSaved ? "Saved" : "Save", action: savePassword)
                     .disabled(hotspotPassword.isEmpty)
             }
-            HStack {
-                Text("Location: \(locationPermission.statusDescription)")
-                    .foregroundStyle(.secondary)
-                Spacer()
-                if locationPermission.isDenied {
-                    Button("Open Location Services") {
-                        locationPermission.openLocationServicesSettings()
+            VStack(alignment: .leading, spacing: 2) {
+                HStack {
+                    Text("Location: \(locationPermission.statusDescription)")
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    if locationPermission.isDenied {
+                        Button("Open Location Services") {
+                            locationPermission.openLocationServicesSettings()
+                        }
                     }
                 }
+                // macOS has no when-in-use grant for Mac apps: the grant is
+                // recorded as Location Services access for Insomnia.
+                Text("macOS records this grant as Location Services access for Insomnia. Insomnia uses it only to read Wi-Fi network names and never requests your location.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
             Stepper(value: nudgeSeconds, in: 10...900, step: 10) {
                 LabeledContent("Nudge tmux after", value: "\(Int(manager.config.nudgeThreshold)) s offline")
