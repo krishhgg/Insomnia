@@ -80,6 +80,9 @@ is matched by its executable path (the installed bundle) or by its bundle id,
 not by its name, so the Insomnia API client, whose executable is also named
 Insomnia, is reported and left alone. A process named Insomnia whose bundle id
 cannot be read counts as this app and blocks the upgrade until it exits. A
+copy running in another account, or a process there that cannot be told apart
+from one, stops the install before the sudoers rule is replaced, since that
+copy may need the rule; it is named and never asked to quit. A
 refusal names the pid and executable path it found. Unresolved
 recovery prevents replacing the existing recovery agent; follow the reported
 instructions before retrying.
@@ -294,7 +297,12 @@ rule. If recovery is incomplete or the app refuses to quit, it stops and names
 the pid and executable path of the copy still running; resolve the reported
 problem and retry. A process named Insomnia with another bundle id (the
 Insomnia API client) is reported and left alone; one whose bundle id cannot be
-read blocks the uninstall until it exits. Purge removes owned files, not arbitrary
+read blocks the uninstall until it exits. A copy running in another account stops
+the uninstall before anything is removed, and is never asked to quit. The
+sudoers rule is one file for the whole Mac and names the account that installed
+last. The uninstaller reads it through sudo and removes it only when it is
+exactly the rule the installer writes for your account; otherwise it keeps the
+file and says why. Purge removes owned files, not arbitrary
 directory contents. A small shared lock file is retained to keep concurrent
 recovery operations coordinated.
 

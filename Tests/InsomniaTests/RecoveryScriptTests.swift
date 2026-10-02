@@ -12,7 +12,7 @@ import XCTest
 /// the fixture, so nothing privileged runs, no real process is signaled, no
 /// real app's preferences are read or written, and no real home,
 /// LaunchAgent, sudoers file, or installed app is read or written. plutil,
-/// lockf, and date are the real tools. The fakes record every call.
+/// lockf, date, and id are the real tools. The fakes record every call.
 final class RecoveryScriptTests: XCTestCase {
     private var fx: ScriptFixture!
 
@@ -1627,7 +1627,9 @@ final class RecoveryScriptTests: XCTestCase {
         try fx.prepareInstall()
         try "trusted".write(to: fx.plist, atomically: true, encoding: .utf8)
         try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
-        fx.setMode("pgrep", "1\n0\n")   // not running at the quit step, running again under the lock
+        // Not running before the sudoers step or at the quit step, running
+        // again under the lock.
+        fx.setMode("pgrep", "1\n1\n0\n")
         fx.setMode("launchctl", "loaded")
 
         let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
@@ -1700,7 +1702,7 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: fx.app.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "binary", "old bundle replaced")
         XCTAssertEqual(try String(contentsOf: fx.installedBackstop, encoding: .utf8), "old helper", "installed backstop.sh replaced")
         XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "plist", "trusted plist touched")
-        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), "rule", "sudoers rule replaced")
+        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), fx.sudoersRule, "sudoers rule replaced")
         XCTAssertTrue(r.stderr.contains("Nothing was changed"), r.stderr)
     }
 
@@ -1748,7 +1750,7 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: fx.app.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "binary", "old bundle replaced")
         XCTAssertEqual(try String(contentsOf: fx.installedBackstop, encoding: .utf8), "old helper", "installed backstop.sh replaced")
         XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "plist", "trusted plist touched")
-        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), "rule", "sudoers rule replaced")
+        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), fx.sudoersRule, "sudoers rule replaced")
         XCTAssertTrue(r.stderr.contains("Nothing was changed"), r.stderr)
     }
 
@@ -1956,7 +1958,9 @@ final class RecoveryScriptTests: XCTestCase {
     func testInstallSendsNoQuitWhenOnlyAnUnverifiedProcessRuns() throws {
         try fx.prepareInstall()
         fx.setMode("launchctl", "loaded")
-        fx.setMode("pgrep", "0\n1\n")             // seen once, gone on the next look
+        // Seen before the sudoers step and at the quit step, gone on the
+        // next look.
+        fx.setMode("pgrep", "0\n0\n1\n")
         try fx.psComm([(4242, "./Insomnia")])
 
         let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
@@ -2006,6 +2010,172 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(r.stderr.contains("pid 4242"), "the identified client must not be listed as blocking: \(r.stderr)")
         XCTAssertTrue(fx.exists(fx.app))
         XCTAssertTrue(fx.exists(fx.plist))
+    }
+    // MARK: - Another account (install.sh and uninstall.sh)
+
+    /// A copy of this app in another account, and a process there named
+    /// Insomnia that cannot be identified: the sudoers rule is one file for
+    /// the whole Mac and that copy may need it, so uninstall stops before
+    /// anything is removed. Neither process is asked to quit or signalled;
+    /// a quit request by bundle id could only reach this account's copy.
+    func testUninstallStopsForInsomniaInAnotherAccountAndNeverSignalsIt() throws {
+        try fx.installMachinery()
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        let theirs = try fx.otherBundle(in: "OtherAccount", bundleId: "com.kgarg.insomnia")
+        fx.setMode("pgrep", "0\n")
+        try fx.pgrepPids([4242, 5151])
+        try fx.psComm([(4242, theirs.path), (5151, "./Insomnia")])
+        try fx.psUid([(4242, ScriptFixture.otherUid), (5151, ScriptFixture.otherUid)])
+
+        let r = try fx.run(fx.uninstall)
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        let calls = fx.calls()
+        XCTAssertTrue(calls.contains("ps -o uid= -p 4242"), "the owner is read: \(calls)")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("osascript") }, "no quit request: \(calls)")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("pkill") || $0.hasPrefix("kill") }, "no signal: \(calls)")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("sudo") || $0.hasPrefix("launchctl") }, "nothing undone or removed: \(calls)")
+        XCTAssertTrue(r.stderr.contains("Insomnia is running in another account"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("pid 4242 (uid \(ScriptFixture.otherUid), \(theirs.path))"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("pid 5151 (uid \(ScriptFixture.otherUid), ./Insomnia; not inside an app bundle"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("not asked to quit"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("Nothing was removed"), r.stderr)
+        XCTAssertTrue(fx.exists(fx.app))
+        XCTAssertTrue(fx.exists(fx.plist))
+        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), fx.sudoersRule)
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, true)
+    }
+
+    /// The same copy during an install: it stops before the sudoers step,
+    /// so the rule that copy may need is never replaced, and this
+    /// account's running copy is not asked to quit either.
+    func testInstallStopsBeforeTheSudoersStepForInsomniaInAnotherAccount() throws {
+        try fx.prepareInstall()
+        try fx.installMachinery()
+        let theirs = try fx.otherBundle(in: "OtherAccount", bundleId: "com.kgarg.insomnia")
+        fx.setMode("pgrep", "0\n")
+        try fx.pgrepPids([4242, 5151])
+        try fx.psComm([(4242, theirs.path), (5151, fx.installedExecutable.path)])
+        try fx.psUid([(4242, ScriptFixture.otherUid)])
+
+        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        let calls = fx.calls()
+        XCTAssertFalse(calls.contains { $0.hasPrefix("sudo") }, "the rule is not replaced: \(calls)")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("osascript") || $0.hasPrefix("pkill") || $0.hasPrefix("kill") }, "\(calls)")
+        XCTAssertTrue(r.stderr.contains("pid 4242 (uid \(ScriptFixture.otherUid), \(theirs.path))"), r.stderr)
+        XCTAssertFalse(r.stderr.contains("pid 5151"), "this account's copy is not the reason: \(r.stderr)")
+        XCTAssertTrue(r.stderr.contains("Nothing was changed"), r.stderr)
+        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), fx.sudoersRule)
+        XCTAssertEqual(try String(contentsOf: fx.installedExecutable, encoding: .utf8), "binary", "old bundle replaced")
+        XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "plist", "LaunchAgent replaced")
+    }
+
+    /// The API client in another account is still another app: it is
+    /// reported and ignored, and the uninstall goes on.
+    func testUninstallIgnoresAnotherAppInAnotherAccount() throws {
+        try fx.installMachinery()
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        let client = try fx.otherBundle(in: "Applications-foreign", bundleId: "com.insomnia.app")
+        fx.setMode("pgrep", "0\n")
+        try fx.psComm([(4242, client.path)])
+        try fx.psUid([(4242, ScriptFixture.otherUid)])
+
+        let r = try fx.run(fx.uninstall)
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("osascript") }, "\(fx.calls())")
+        XCTAssertTrue(r.stdout.contains("pid 4242 (\(client.path), bundle id com.insomnia.app)"), r.stdout)
+        XCTAssertFalse(r.stderr.contains("another account"), r.stderr)
+        XCTAssertFalse(fx.exists(fx.app))
+        XCTAssertFalse(fx.exists(fx.sudoers))
+    }
+
+    // MARK: - Shared sudoers rule (uninstall.sh)
+
+    /// The rule this account's install wrote is read through sudo, matched
+    /// line by line, and then removed.
+    func testUninstallReadsTheRuleBackAndRemovesItWhenThisAccountsInstallWroteIt() throws {
+        try fx.installMachinery()
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+
+        let r = try fx.run(fx.uninstall)
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        let sudo = fx.calls().filter { $0.hasPrefix("sudo cat") || $0.hasPrefix("sudo rm") }
+        XCTAssertEqual(sudo, ["sudo cat \(fx.sudoers.path)", "sudo rm -f \(fx.sudoers.path)"])
+        XCTAssertFalse(fx.exists(fx.sudoers))
+        XCTAssertFalse((r.stdout + r.stderr).contains("Kept \(fx.sudoers.path)"), r.stdout + r.stderr)
+    }
+
+    /// Another account installed Insomnia after this one, so the shared file
+    /// grants that account. Removing it would leave that account's app and
+    /// agent without the grant they need to undo a session, so it is kept
+    /// and the rest of the uninstall goes on.
+    func testUninstallKeepsARuleThatGrantsAnotherAccount() throws {
+        try fx.installMachinery()
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        let theirs = ScriptFixture.sudoersRule(for: "other_\(ScriptFixture.account)")
+        try theirs.write(to: fx.sudoers, atomically: true, encoding: .utf8)
+
+        let r = try fx.run(fx.uninstall)
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertTrue(fx.calls().contains("sudo cat \(fx.sudoers.path)"), "\(fx.calls())")
+        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("sudo rm") }, "\(fx.calls())")
+        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), theirs)
+        XCTAssertTrue(r.stdout.contains("Kept \(fx.sudoers.path): it grants other_\(ScriptFixture.account), not \(ScriptFixture.account)."), r.stdout)
+        XCTAssertTrue(r.stdout.contains("Uninstall Insomnia in that account"), r.stdout)
+        XCTAssertFalse(fx.exists(fx.app))
+        XCTAssertFalse(fx.exists(fx.plist))
+    }
+
+    /// A file that is not exactly what install.sh writes for this account
+    /// (an extra grant, no grant at all, a line install.sh never writes) is
+    /// not Insomnia's to remove. It is kept with the reason, and the rest of
+    /// the uninstall goes on.
+    func testUninstallKeepsARuleThatIsNotWhatInstallWritesForThisAccount() throws {
+        let me = ScriptFixture.account
+        let cases: [(text: String, why: String)] = [
+            (ScriptFixture.sudoersRule(for: me) + "\(me) ALL=(ALL) NOPASSWD: ALL\n",
+             "it has a line install.sh does not write: \(me) ALL=(ALL) NOPASSWD: ALL"),
+            ("# Installed by Insomnia install.sh. Exactly four commands, nothing else.\n", "it grants nothing"),
+            ("rule", "it has a line install.sh does not write: rule"),
+        ]
+        for c in cases {
+            let f = try ScriptFixture()
+            defer { f.destroy() }
+            try f.installMachinery()
+            try f.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+            try c.text.write(to: f.sudoers, atomically: true, encoding: .utf8)
+
+            let r = try f.run(f.uninstall)
+
+            XCTAssertEqual(r.status, 0, c.text + r.stderr + r.stdout)
+            XCTAssertFalse(f.calls().contains { $0.hasPrefix("sudo rm") }, c.text + "\(f.calls())")
+            XCTAssertEqual(try String(contentsOf: f.sudoers, encoding: .utf8), c.text)
+            XCTAssertTrue(r.stderr.contains("Kept \(f.sudoers.path): it is not the rule install.sh writes for \(me) (\(c.why))."), c.text + r.stderr)
+            XCTAssertFalse(f.exists(f.app), c.text)
+        }
+    }
+
+    /// A rule that cannot be read through sudo is neither judged nor removed:
+    /// the uninstall stops with the app still installed.
+    func testUninstallStopsWhenTheRuleCannotBeReadThroughSudo() throws {
+        try XCTSkipIf(getuid() == 0, "root reads a mode-000 file")
+        try fx.installMachinery()
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: fx.sudoers.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: fx.sudoers.path) }
+
+        let r = try fx.run(fx.uninstall)
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("sudo rm") }, "\(fx.calls())")
+        XCTAssertTrue(r.stderr.contains("Could not read \(fx.sudoers.path) through sudo, so it was kept."), r.stderr)
+        XCTAssertTrue(fx.exists(fx.sudoers))
+        XCTAssertTrue(fx.exists(fx.app), "the app stays until the rule is dealt with")
     }
 }
 
@@ -2080,6 +2250,31 @@ private final class ScriptFixture {
         let text = rows.map { "\($0.pid)|\($0.exe)" }.joined(separator: "\n") + "\n"
         try text.write(to: root.appendingPathComponent("ps.comm"), atomically: true, encoding: .utf8)
     }
+
+    /// What `ps -o uid= -p <pid>` prints for each listed pid, for a process
+    /// in another account; other pids in ps.comm are the test account's.
+    func psUid(_ rows: [(pid: Int, uid: Int)]) throws {
+        let text = rows.map { "\($0.pid)|\($0.uid)" }.joined(separator: "\n") + "\n"
+        try text.write(to: root.appendingPathComponent("ps.uid"), atomically: true, encoding: .utf8)
+    }
+
+    /// A uid that is not the test account's.
+    static let otherUid = Int(getuid()) + 1
+
+    /// The account running the tests, which is what uninstall.sh's `id -un`
+    /// prints.
+    static let account = String(cString: getpwuid(getuid())!.pointee.pw_name)
+
+    /// The rule install.sh writes for `account`.
+    static func sudoersRule(for account: String) -> String {
+        let grants = ["-a disablesleep 1", "-a disablesleep 0", "-b lowpowermode 1", "-b lowpowermode 0"]
+            .map { "\(account) ALL=(root) NOPASSWD: /usr/bin/pmset \($0)" }
+        return (["# Installed by Insomnia install.sh. Exactly four commands, nothing else."] + grants)
+            .joined(separator: "\n") + "\n"
+    }
+
+    /// What installMachinery writes to the sudoers path: this account's rule.
+    var sudoersRule: String { Self.sudoersRule(for: Self.account) }
 
     /// Pids the fake pgrep prints whenever its mode says "running".
     func pgrepPids(_ pids: [Int]) throws {
@@ -2306,7 +2501,7 @@ private final class ScriptFixture {
             for a in "$@"; do src="$dst"; dst="$a"; done
             case "$dst" in "\(r)"/*) mkdir -p "$(dirname "$dst")"; cp "$src" "$dst"; exit 0 ;; esac
             printf 'sudo REFUSED %s\\n' "$*" >> "\(calls)"; exit 1 ;;
-          rm|test)
+          rm|test|cat)
             for a in "$@"; do
               case "$a" in "\(r)"/*) exec "$@" ;; esac
             done
@@ -2334,9 +2529,24 @@ private final class ScriptFixture {
         // `-o comm= -p <pid>` (install.sh / uninstall.sh identifying a pid
         // the fake pgrep reported) answers from ps.comm instead: "pid|path"
         // per line, and a pid with no line is gone (exit 1, no output).
+        // `-o uid= -p <pid>` answers from ps.uid ("pid|uid" per line), padded
+        // like the real column; a pid listed only in ps.comm belongs to the
+        // account running the tests.
         try writeFake("ps", """
         printf 'ps %s\\n' "$*" >> "\(calls)"
         pid=""; for a in "$@"; do pid="$a"; done
+        if [[ "${2:-}" == uid= ]]; then
+          if [[ -f "\(r)/ps.uid" ]]; then
+            while IFS='|' read -r p u; do
+              if [[ "$p" == "$pid" ]]; then printf '%5s\\n' "$u"; exit 0; fi
+            done < "\(r)/ps.uid"
+          fi
+          [[ -f "\(r)/ps.comm" ]] || exit 1
+          while IFS='|' read -r p exe; do
+            if [[ "$p" == "$pid" ]]; then printf '%5s\\n' "$UID"; exit 0; fi
+          done < "\(r)/ps.comm"
+          exit 1
+        fi
         if [[ "${2:-}" == comm= ]]; then
           [[ -f "\(r)/ps.comm" ]] || exit 1
           while IFS='|' read -r p exe; do
@@ -2614,7 +2824,7 @@ private final class ScriptFixture {
         try fm.createDirectory(at: app.appendingPathComponent("Contents/MacOS"), withIntermediateDirectories: true)
         try "binary".write(to: app.appendingPathComponent("Contents/MacOS/Insomnia"), atomically: true, encoding: .utf8)
         try fm.createDirectory(at: sudoers.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try "rule".write(to: sudoers, atomically: true, encoding: .utf8)
+        try sudoersRule.write(to: sudoers, atomically: true, encoding: .utf8)
         try fm.createDirectory(at: plist.deletingLastPathComponent(), withIntermediateDirectories: true)
         try "plist".write(to: plist, atomically: true, encoding: .utf8)
         try fm.createDirectory(at: logFile.deletingLastPathComponent(), withIntermediateDirectories: true)

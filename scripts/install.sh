@@ -45,25 +45,34 @@ UID_NUM="$(id -u)"
 
 step() { printf '\n==> %s\n' "$*"; }
 
-# Running copies of this app. `pgrep -x Insomnia` matches every process of
-# this user named Insomnia, and the Insomnia API client's executable has
-# that name too, so each pid is checked by its executable path (`ps -o
-# comm=`, the full path for an app LaunchServices launched): it is this app
-# when the path is the installed bundle's binary or lies in a bundle whose
-# Info.plist declares $BUNDLE_ID. A process whose bundle id reads as
-# something else is another app and is left alone. One whose identity
-# cannot be read (no path, a path outside any bundle, an Info.plist that
-# does not parse) might be this app, so it counts as this app until it
-# exits: it is never signalled, but nothing is replaced or removed while
-# it runs.
-APP_FOUND=()     # "pid N (path)" per running copy of this app
-UNVERIFIED=()    # "pid N (path; why)" per process that could not be told apart from it
-OTHER_FOUND=()   # "pid N (path, bundle id X)" per process proven to be another app
-BLOCKING=()      # APP_FOUND then UNVERIFIED: what must be gone before files are touched
+# Running copies of this app, in this account or any other. `pgrep -x
+# Insomnia` matches every process named Insomnia, and the Insomnia API
+# client's executable has that name too, so each pid is checked by its
+# executable path (`ps -o comm=`, the full path for an app LaunchServices
+# launched): it is this app when the path is the installed bundle's binary
+# or lies in a bundle whose Info.plist declares $BUNDLE_ID. A process whose
+# bundle id reads as something else is another app and is left alone. One
+# whose identity cannot be read (no path, a path outside any bundle, an
+# Info.plist that does not parse) might be this app, so it counts as this
+# app until it exits: it is never signalled, but nothing is replaced or
+# removed while it runs. A copy in another account (`ps -o uid=`), or a
+# process there that cannot be told apart from one, blocks as well: the
+# rule at $SUDOERS is one file for the whole Mac, this install replaces it
+# with a rule for this account, and that copy may need it to undo its own
+# session. It is reported, and never asked to quit or signalled; only its
+# own account can quit it.
+APP_FOUND=()      # "pid N (path)" per running copy of this app in this account
+UNVERIFIED=()     # "pid N (path; why)" per process of this account that could not be told apart from it
+OTHER_ACCOUNT=()  # "pid N (uid U, path)" per copy, or process that could not be told apart from one, in another account
+OTHER_FOUND=()    # "pid N (path, bundle id X)" per process proven to be another app
+BLOCKING=()       # the first three: what must be gone before files are touched
 find_insomnia() {
-  local pid exe bundle id desc
-  APP_FOUND=(); UNVERIFIED=(); OTHER_FOUND=(); BLOCKING=()
-  for pid in $("$PGREP" -x -u "$UID_NUM" Insomnia 2>/dev/null); do
+  local pid owner exe bundle id desc this
+  APP_FOUND=(); UNVERIFIED=(); OTHER_ACCOUNT=(); OTHER_FOUND=(); BLOCKING=()
+  for pid in $("$PGREP" -x Insomnia 2>/dev/null); do
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    owner="$("$PS" -o uid= -p "$pid" 2>/dev/null || true)"
+    owner="${owner//[[:space:]]/}"
     exe="$("$PS" -o comm= -p "$pid" 2>/dev/null || true)"
     id=""
     desc="${exe:-executable path unknown}"   # what the messages say; gains the reason when unverified
@@ -75,10 +84,21 @@ find_insomnia() {
       desc="$exe; not inside an app bundle, so no bundle id to read"
     fi
     if [[ "$exe" == "$APP/Contents/MacOS/Insomnia" || "$id" == "$BUNDLE_ID" ]]; then
-      APP_FOUND+=("pid $pid ($exe)")
-      BLOCKING+=("pid $pid ($exe)")
+      this=1
     elif [[ -n "$id" ]]; then
       OTHER_FOUND+=("pid $pid ($exe, bundle id $id)")
+      continue
+    else
+      this=0
+    fi
+    # No uid (the process just exited, or ps failed) is not proof of
+    # another account; such a pid is judged as one of this account's.
+    if [[ -n "$owner" && "$owner" != "$UID_NUM" ]]; then
+      OTHER_ACCOUNT+=("pid $pid (uid $owner, $desc)")
+      BLOCKING+=("pid $pid (uid $owner, $desc)")
+    elif (( this == 1 )); then
+      APP_FOUND+=("pid $pid ($exe)")
+      BLOCKING+=("pid $pid ($exe)")
     else
       UNVERIFIED+=("pid $pid ($desc)")
       BLOCKING+=("pid $pid ($desc)")
@@ -100,6 +120,15 @@ report_unverified() {
   (( ${#UNVERIFIED[@]} > 0 )) || return 0
   echo "Cannot tell whether ${#UNVERIFIED[@]} process(es) named Insomnia are this app, so they count as it until they exit: $(list "${UNVERIFIED[@]}")."
 }
+# Stops the run when Insomnia runs in another account; nothing is sent to
+# that process. The argument says what this run has changed so far.
+stop_for_other_accounts() { # what was changed
+  (( ${#OTHER_ACCOUNT[@]} > 0 )) || return 0
+  echo "Insomnia is running in another account, or a process named Insomnia there could not be told apart from it: $(list "${OTHER_ACCOUNT[@]}")." >&2
+  echo "$SUDOERS is shared by every account on this Mac and that copy may need the rule in it, so it is left alone and not asked to quit." >&2
+  echo "Quit Insomnia in that account, then rerun. $1" >&2
+  exit 1
+}
 
 # 1. Build -------------------------------------------------------------------
 step "Building (release)"
@@ -111,7 +140,11 @@ BIN="$("$SWIFT" build -c release --show-bin-path)/Insomnia"
 # 2. sudoers -----------------------------------------------------------------
 #    The password prompt comes first: until the rule is installed and proven
 #    effective, the running app is not asked to quit and neither the bundle,
-#    the installed backstop.sh nor the LaunchAgent are touched.
+#    the installed backstop.sh nor the LaunchAgent are touched. A copy
+#    running in another account stops the install before the rule is
+#    replaced (find_insomnia).
+find_insomnia
+stop_for_other_accounts "Nothing was changed."
 step "Writing $SUDOERS (requires your password once)"
 TMP_SUDOERS="$(mktemp)"
 trap 'rm -f "$TMP_SUDOERS"' EXIT
@@ -144,13 +177,14 @@ step "Assembling $APP"
 # and nothing of the old install is overwritten while it is still running.
 # This app counts, and so does a process named Insomnia that cannot be told
 # apart from it (find_insomnia); one proven to be another app is reported
-# and left alone.
+# and left alone. A copy in another account stops the install.
 if app_running; then
   report_others
+  stop_for_other_accounts "$SUDOERS is installed; the app, backstop.sh and LaunchAgent were not touched."
   report_unverified
-  # The quit goes only to a copy identified as this app. An unverified
-  # process is waited for, but its presence alone never asks the real app
-  # to quit.
+  # The quit goes only to a copy identified as this app in this account. An
+  # unverified process is waited for, but its presence alone never asks the
+  # real app to quit.
   if (( ${#APP_FOUND[@]} > 0 )); then
     echo "Insomnia is running ($(list "${APP_FOUND[@]}")); quitting it first (this ends any session)."
     "$OSASCRIPT" -e "tell application id \"$BUNDLE_ID\" to quit" >/dev/null 2>&1 || true
