@@ -181,7 +181,9 @@ it. Or the thermal pressure level reported by `notifyutil` is critical. Each
 early end is logged with its reason, and the saved session is deleted before
 the restore starts. A restore that cannot finish leaves entries in the journal
 for the next run and the app, never a session that a relaunched app would
-resume. Otherwise the session stands until its deadline, and sessions are
+resume. If the saved session cannot be deleted, its end is recorded beside it
+in `ended-session.json`, and the app restores that session instead of resuming
+it. Otherwise the session stands until its deadline, and sessions are
 capped at 24 hours by default (`maxDuration`).
 
 The app and backstop use the same lock so they do not restore and rewrite the

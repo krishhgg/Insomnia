@@ -39,8 +39,9 @@ enum EndOutcome: Sendable, Equatable {
     /// session is still active. An in-process retry is scheduled.
     case locked
     /// session.json could not be removed. Whatever the journal held was
-    /// undone, but a relaunch would find a valid session and hold sleep
-    /// again, so the end is retried in process and quit is refused.
+    /// undone and the end is recorded in ended-session.json when that write
+    /// works, so a relaunch restores instead of resuming. The removal is
+    /// retried in process and quit is refused.
     case sessionRetained
     /// state.json cannot be read. Nothing was changed: Insomnia does not
     /// know what to undo and will not guess. The session stays active until
@@ -296,10 +297,12 @@ final class SessionManager {
     /// Disk decides whether a session exists. session.json gone while this
     /// process still holds a session means backstop.sh ended it (its log
     /// line says why) while this process could not act: stopped, hung, or
-    /// without the alive lock. The agent has restored what it could; the end
-    /// here runs from the journal just read under the lock, so anything it
-    /// left is retried, and observers, timers and the countdown stop. An
-    /// unreadable session.json is not a vanished one and is left alone.
+    /// without the alive lock. So does a session.json the agent recorded as
+    /// ended because it could not remove the file. The agent has restored
+    /// what it could; the end here runs from the journal just read under the
+    /// lock, so anything it left is retried, and observers, timers and the
+    /// countdown stop. An unreadable session.json is not a vanished one and
+    /// is left alone.
     private func adoptAgentEnd() async {
         guard let s = session else { return }
         let onDisk: Session?
@@ -308,18 +311,25 @@ final class SessionManager {
         } catch {
             return
         }
-        guard onDisk == nil else { return }
-        Log.error("session.json is gone while the session until \(iso(s.endsAt)) was active: the recovery agent ended it (its log line says why); ending here from the journal")
+        if onDisk == nil {
+            Log.error("session.json is gone while the session until \(iso(s.endsAt)) was active: the recovery agent ended it (its log line says why); ending here from the journal")
+        } else if store.sessionEndIsRecorded() {
+            Log.error("the session until \(iso(s.endsAt)) is recorded as ended in ended-session.json: the recovery agent ended it but could not remove session.json (its log line says why); ending here from the journal")
+        } else {
+            return
+        }
         endTicket += 1
         _ = await performEnd(reason: .agentCutoff)
     }
 
     /// The 1 Hz tick's look for a session the agent ended while the lid was
-    /// open and nothing else transacted: a cheap stat first, then the
-    /// decision and the end under the lock (`adoptAgentEnd`).
-    private func noticeAgentEnd() async {
+    /// open and nothing else transacted: a cheap look first (session.json
+    /// gone, or recorded as ended), then the decision and the end under the
+    /// lock (`adoptAgentEnd`). Internal so tests can run one tick at a time.
+    func noticeAgentEnd() async {
         guard session != nil, !checkingAgentEnd, now >= agentEndRetryAt,
-              !FileManager.default.fileExists(atPath: paths.sessionFile.path) else { return }
+              !FileManager.default.fileExists(atPath: paths.sessionFile.path) || store.sessionEndIsRecorded()
+        else { return }
         checkingAgentEnd = true
         defer { checkingAgentEnd = false }
         let result = await exclusive("agent end") {}
@@ -530,11 +540,15 @@ final class SessionManager {
         remainingText = ""
         countdownText = ""
         var deletionError: String?
+        var endRecorded = false
         do {
             try store.deleteSession()
         } catch {
             deletionError = error.localizedDescription
-            fail("could not remove session.json: \(error.localizedDescription)")
+            // The end is decided: a file that stays must not read as a live
+            // session to the next launch or to backstop.sh.
+            endRecorded = store.recordSessionEnd()
+            fail("could not remove session.json: \(error.localizedDescription)" + (endRecorded ? "; its end is recorded in ended-session.json" : "; its end could not be recorded either"))
         }
         await restoreAll()
         // App Nap defaults are intentionally left set (spec: open decisions).
@@ -555,9 +569,12 @@ final class SessionManager {
                 // The agent enforces deadlines, it does not remove a live
                 // session file; only this process can, so it stays to retry.
                 let journalNote = state.isDirty ? " Some changes are also still journaled." : ""
+                let relaunch = endRecorded
+                    ? "its end is recorded, so a relaunch will not resume it"
+                    : "a relaunch would hold sleep again for it"
                 notifier.post(
                     title: Self.incompleteTitle,
-                    body: "session.json could not be removed (\(deletionError)); a relaunch would hold sleep again for it.\(journalNote) Insomnia retries in \(Int(recoveryRetryDelay)) s; do not quit until it is removed."
+                    body: "session.json could not be removed (\(deletionError)); \(relaunch).\(journalNote) Insomnia retries in \(Int(recoveryRetryDelay)) s; do not quit until it is removed."
                 )
                 scheduleEndRetry(reason)
                 return .sessionRetained
@@ -945,7 +962,11 @@ final class SessionManager {
             onDisk = nil
         }
 
-        if let s = onDisk, !s.isExpired(at: now) {
+        // A session ended earlier whose session.json could not be removed
+        // (ended-session.json holds its bytes) is over, deadline or not.
+        let endedEarlier = onDisk != nil && store.sessionEndIsRecorded()
+
+        if let s = onDisk, !s.isExpired(at: now), !endedEarlier {
             // Step 2: valid session. Arm first, then journal, then hold
             // sleep. Any failure ends the session rather than holding sleep
             // with nothing guaranteed to release it.
@@ -992,8 +1013,11 @@ final class SessionManager {
             return
         }
 
-        // Step 1: missing or expired -> full end.
-        if onDisk != nil {
+        // Step 1: missing, expired or ended earlier -> full end.
+        if endedEarlier {
+            Log.info("reconcile: session.json holds a session already ended (recorded in ended-session.json); restoring, not resuming")
+            _ = await performEnd(reason: .backstop)
+        } else if onDisk != nil {
             Log.info("reconcile: session expired, restoring")
             _ = await performEnd(reason: .timer)
         } else if state.isDirty {

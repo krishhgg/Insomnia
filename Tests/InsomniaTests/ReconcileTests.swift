@@ -486,6 +486,67 @@ final class ReconcileTests: XCTestCase {
         XCTAssertTrue(real.notifier.posts.last?.body.contains("recovery agent") ?? false, "\(real.notifier.posts)")
     }
 
+    // MARK: A session.json recorded as ended
+
+    /// The agent ended the session but could not remove session.json, so it
+    /// recorded the end in ended-session.json. The tick treats the record as
+    /// it treats a missing file and ends the session here.
+    func testTheTickAdoptsASessionTheAgentRecordedAsEnded() async throws {
+        let m = h.makeManager()
+        await m.start(duration: 3600)
+        XCTAssertTrue(h.store.recordSessionEnd())
+        try h.store.saveState(.clean)
+
+        await m.noticeAgentEnd()
+
+        XCTAssertFalse(m.isActive)
+        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1"], "the agent restored sleep")
+        XCTAssertNil(try h.store.loadSession())
+        XCTAssertFalse(FileManager.default.fileExists(atPath: h.home.paths.endedSessionFile.path), "the record goes with the file")
+        XCTAssertTrue(h.notifier.posts.last?.body.contains("recovery agent ended the session") ?? false, "\(h.notifier.posts)")
+    }
+
+    /// At launch, a valid session.json whose end is recorded is restored as
+    /// an ended session, never resumed, and both files are removed.
+    func testASessionRecordedAsEndedIsRestoredNotResumed() async throws {
+        let now = h.clock.now
+        try h.store.saveSession(Session(startedAt: now.addingTimeInterval(-600), endsAt: now.addingTimeInterval(3600)))
+        var st = RuntimeState()
+        st.sleepDisabledByUs = true
+        try h.store.saveState(st)
+        h.guardFake.sleepDisabled = true
+        XCTAssertTrue(h.store.recordSessionEnd())
+
+        let m = h.makeManager()
+        await m.reconcile()
+
+        XCTAssertFalse(m.isActive)
+        XCTAssertFalse(h.guardFake.calls.contains("disablesleep 1"), "\(h.guardFake.calls)")
+        XCTAssertTrue(h.guardFake.calls.contains("disablesleep 0"), "\(h.guardFake.calls)")
+        XCTAssertNil(try h.store.loadSession())
+        XCTAssertFalse(FileManager.default.fileExists(atPath: h.home.paths.endedSessionFile.path))
+        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
+    }
+
+    /// A record of an earlier session.json matches no later one: the session
+    /// on disk now is resumed as usual.
+    func testAStaleEndRecordDoesNotEndTheSessionOnDisk() async throws {
+        let now = h.clock.now
+        try h.store.saveSession(Session(startedAt: now.addingTimeInterval(-7200), endsAt: now.addingTimeInterval(1800)))
+        XCTAssertTrue(h.store.recordSessionEnd())
+        let s = Session(startedAt: now.addingTimeInterval(-600), endsAt: now.addingTimeInterval(3600))
+        try h.store.saveSession(s)
+        var st = RuntimeState()
+        st.sleepDisabledByUs = true
+        try h.store.saveState(st)
+
+        let m = h.makeManager()
+        await m.reconcile()
+
+        XCTAssertEqual(m.session, s)
+        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1"])
+    }
+
     func testDeadlineTimerFiresEnd() async throws {
         // Use the real clock for this one so the Timer can actually fire.
         let real = Harness(now: Date())

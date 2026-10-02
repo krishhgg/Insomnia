@@ -11,8 +11,8 @@ import XCTest
 /// launchctl) and its app-bundle / sudoers paths rewritten to point inside
 /// the fixture, so nothing privileged runs, no real process is signaled, and
 /// no real home, LaunchAgent, sudoers file, or installed app is read or
-/// written. plutil, lockf, and date are the real tools. The fakes record
-/// every call.
+/// written. plutil, lockf, cmp, and date are the real tools. The fakes
+/// record every call.
 final class RecoveryScriptTests: XCTestCase {
     private var fx: ScriptFixture!
 
@@ -543,6 +543,127 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(display.sets.last, 0.6)
         let after = try XCTUnwrap(try Store(paths: paths).loadState())
         XCTAssertFalse(after.isDirty, "\(after)")
+    }
+
+    // MARK: backstop.sh: a session.json that cannot be removed
+
+    /// session.json is immutable, so the run that ends the session cannot
+    /// remove it. It records the end in ended-session.json, a copy of the
+    /// file's bytes, and still restores sleep. Later runs end the session
+    /// again without reading the battery or the heat, even with the app
+    /// alive, and retry the removal; once it works the record goes too.
+    func testEndThatCannotRemoveSessionJSONRecordsItAndLaterRunsFinish() throws {
+        try writeLiveSession()
+        try setImmutable(fx.session, true)
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 1, r.stderr + fx.log())
+        XCTAssertEqual(calls(), [sleepRestored], "sleep is restored all the same")
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, false)
+        XCTAssertTrue(fx.exists(fx.session))
+        XCTAssertEqual(try Data(contentsOf: fx.endedSession), try Data(contentsOf: fx.session), "the record is the file's exact bytes")
+        XCTAssertTrue(fx.log().contains("its end is recorded in"), fx.log())
+
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+        fx.clearCalls()
+        let again = try fx.run(fx.backstop)
+
+        XCTAssertEqual(again.status, 1, again.stderr + fx.log())
+        XCTAssertEqual(calls(), [], "a session recorded as ended is not checked again")
+        XCTAssertTrue(fx.log().contains("already ended (recorded in"), fx.log())
+        XCTAssertTrue(fx.exists(fx.endedSession))
+
+        try setImmutable(fx.session, false)
+        let last = try fx.run(fx.backstop)
+
+        XCTAssertEqual(last.status, 0, last.stderr + fx.log())
+        XCTAssertFalse(fx.exists(fx.session))
+        XCTAssertFalse(fx.exists(fx.endedSession), "the record goes with the file it copies")
+    }
+
+    /// Neither session.json nor the record can be written: nothing on disk
+    /// says the session is over. Sleep is restored anyway, but its journal
+    /// entry stays as evidence and the run exits 1.
+    func testEndThatCanNeitherRemoveNorRecordKeepsTheSleepEntry() throws {
+        try writeLiveSession()
+        try setImmutable(fx.session, true)
+        try "{}".write(to: fx.endedSession, atomically: true, encoding: .utf8)
+        try setImmutable(fx.endedSession, true)
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 1, r.stderr + fx.log())
+        XCTAssertEqual(calls(), [sleepRestored])
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, true, "evidence kept while the session still reads as valid")
+        XCTAssertTrue(fx.exists(fx.session))
+        XCTAssertEqual(try String(contentsOf: fx.endedSession, encoding: .utf8), "{}")
+        let log = fx.log()
+        XCTAssertTrue(log.contains("could not remove \(fx.session.path) or record its end"), log)
+        XCTAssertTrue(log.contains("still journaled: sleepDisabledByUs is kept although sleep is restored"), log)
+    }
+
+    /// A record left from an earlier session.json matches nothing: it goes,
+    /// and the live session is checked as usual.
+    func testStaleEndRecordIsRemovedAndDoesNotEndTheSession() throws {
+        try writeLiveSession()
+        try #"{"endsAt":"2001-01-01T00:00:00Z","startedAt":"2001-01-01T00:00:00Z"}"#.write(to: fx.endedSession, atomically: true, encoding: .utf8)
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+
+        try assertSessionKept(try fx.run(fx.backstop))
+
+        XCTAssertEqual(calls(), [batteryRead, thermalRead])
+        XCTAssertFalse(fx.exists(fx.endedSession))
+    }
+
+    /// The relaunch the record exists for. The backstop ends the session of
+    /// an app that died and cannot remove session.json. Insomnia launched
+    /// afterwards finds a valid session.json, sees the record and restores
+    /// instead of resuming. Once the file can be removed, its next reconcile
+    /// removes both.
+    @MainActor
+    func testAppRelaunchedAfterAnEndRecordRestoresInsteadOfResuming() async throws {
+        // Written by the app's Store, so the app reads it as a valid session.
+        try Store(paths: Paths(root: fx.home)).saveSession(Session(startedAt: Date(timeIntervalSinceNow: -600), endsAt: Date(timeIntervalSinceNow: 3600)))
+        try fx.writeState(journalWithSavedBrightness)
+        try setImmutable(fx.session, true)
+        XCTAssertEqual(try fx.run(fx.backstop).status, 1, fx.log())
+        XCTAssertTrue(fx.exists(fx.endedSession))
+
+        setenv(Paths.environmentKey, fx.home.path, 1)
+        defer { unsetenv(Paths.environmentKey) }
+        let paths = Paths.fromEnvironment()
+        let sleepGuard = FakeSleepGuard()
+        let display = FakeDisplayDimmer(brightness: 0)
+        let notifier = RecordingNotifier()
+        let m = SessionManager(
+            paths: paths,
+            sleepGuard: sleepGuard,
+            processControl: FakeProcessControl(),
+            backstop: FakeBackstop(),
+            display: display,
+            notifier: notifier,
+            clamshell: { false },
+            recoveryLockTimeout: 2,
+            recoveryRetryDelay: 3600,
+            reassertDelay: .seconds(3600)
+        )
+        await m.reconcile()
+
+        XCTAssertNil(m.session, "the ended session must not come back")
+        XCTAssertFalse(sleepGuard.calls.contains("disablesleep 1"), "\(sleepGuard.calls)")
+        XCTAssertEqual(display.sets.last, 0.6)
+        XCTAssertFalse(try XCTUnwrap(try Store(paths: paths).loadState()).isDirty)
+        XCTAssertTrue(notifier.posts.contains { $0.body.contains("its end is recorded, so a relaunch will not resume it") }, "\(notifier.posts)")
+
+        try setImmutable(fx.session, false)
+        await m.reconcile()
+
+        XCTAssertFalse(fx.exists(fx.session))
+        XCTAssertFalse(fx.exists(fx.endedSession))
+        XCTAssertFalse(sleepGuard.calls.contains("disablesleep 1"), "\(sleepGuard.calls)")
     }
 
     func testExpiredSessionRestoresEverythingAndClearsJournal() throws {
@@ -1867,6 +1988,7 @@ private final class ScriptFixture {
     var install: URL { repoScripts.appendingPathComponent("install.sh") }
     var installRedirected: URL { repoScripts.appendingPathComponent("install.redirected.sh") }
     var session: URL { home.appendingPathComponent("session.json") }
+    var endedSession: URL { home.appendingPathComponent("ended-session.json") }
     var state: URL { home.appendingPathComponent("state.json") }
     var config: URL { home.appendingPathComponent("config.json") }
     var lock: URL { home.appendingPathComponent(".recovery.lock") }
@@ -1897,6 +2019,9 @@ private final class ScriptFixture {
 
     func destroy() {
         releaseCommand()
+        // A test that failed before clearing the flag must not leave its
+        // temp home behind.
+        for file in [session, endedSession] { try? setImmutable(file, false) }
         try? fm.removeItem(at: root)
     }
 

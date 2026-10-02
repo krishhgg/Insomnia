@@ -507,6 +507,13 @@ struct Harness {
     }
 }
 
+/// Sets or clears the user immutable flag (chflags uchg) on a test file, so
+/// unlink and rename onto it fail with EPERM, as for a file a person locked.
+/// Tests clear it again before their temp home is removed.
+func setImmutable(_ url: URL, _ on: Bool) throws {
+    try FileManager.default.setAttributes([.immutable: on], ofItemAtPath: url.path)
+}
+
 /// Let tasks created just now run up to their first suspension (the
 /// lifecycle queue), so the request order is fixed before a held operation
 /// is released. Serialized tests must release the held operation and only

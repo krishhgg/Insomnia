@@ -57,6 +57,11 @@ struct Paths: Sendable, Equatable {
     }
 
     var sessionFile: URL { appSupport.appendingPathComponent("session.json") }
+    /// Written when a session is ended but session.json cannot be removed (an
+    /// immutable file): a copy of that file's exact bytes. While the two
+    /// match, the session is over whatever its endsAt says. backstop.sh
+    /// writes and honours the same file.
+    var endedSessionFile: URL { appSupport.appendingPathComponent("ended-session.json") }
     var stateFile: URL { appSupport.appendingPathComponent("state.json") }
     var configFile: URL { appSupport.appendingPathComponent("config.json") }
     /// Installed copy of scripts/backstop.sh, placed there by install.sh.

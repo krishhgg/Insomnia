@@ -41,6 +41,12 @@
 #     so an undo that cannot finish (saved brightness only the app restores,
 #     a failing or hung pmset) never leaves a session a relaunched app would
 #     resume. What is left stays in state.json for the next run and the app.
+#     A session.json that cannot be removed (an immutable file) is recorded
+#     as ended in ended-session.json, a copy of its bytes. While the two
+#     match, the app restores that session instead of resuming it, and every
+#     run ends it again without the checks and retries the removal. If the
+#     record cannot be written either, sleep is still restored but its
+#     journal entry stays, and the run exits 1.
 #   - state.json missing or clean: nothing is undone and nothing privileged
 #     runs; an expired session.json is removed. Exit 0.
 #   - state.json dirty: undo each journaled entry from the journal alone:
@@ -88,6 +94,7 @@ PS=/bin/ps
 KILL=/bin/kill
 SYSCTL=/usr/sbin/sysctl
 NOTIFYUTIL=/usr/bin/notifyutil
+CMP=/usr/bin/cmp
 LOCK_TIMEOUT_SECONDS=10
 # com.apple.system.thermalpressurelevel at or above this ends a session. On
 # macOS the levels are 0 nominal, 1 moderate, 2 heavy, 3 trapping, 4 sleeping
@@ -116,6 +123,7 @@ else
   LOG_DIR="$HOME/Library/Logs/Insomnia"
 fi
 SESSION="$APP_SUPPORT/session.json"
+ENDED="$APP_SUPPORT/ended-session.json"
 STATE="$APP_SUPPORT/state.json"
 CONFIG="$APP_SUPPORT/config.json"
 LOCK="$APP_SUPPORT/.recovery.lock"
@@ -362,6 +370,22 @@ if [[ -f "$SESSION" ]]; then
   fi
 fi
 
+# --- Was this session already ended? -----------------------------------------
+# A run or the app that ends a valid session but cannot remove session.json
+# records the end in $ENDED, a copy of the file's exact bytes (record_end).
+# While the two match, that session is over whatever its endsAt says: this
+# run ends it again without the checks below and retries the removal. A
+# record that matches nothing (its session.json was removed or replaced) is
+# stale and goes; it could only ever match the file it copied.
+ended_before=0
+if [[ -e "$ENDED" ]]; then
+  if [[ -f "$SESSION" ]] && "$CMP" -s "$SESSION" "$ENDED"; then
+    ended_before=1
+  else
+    rm -f "$ENDED" 2>/dev/null || true
+  fi
+fi
+
 # --- Is a valid session still live? ------------------------------------------
 # A future deadline alone does not keep sleep disabled: the app must be
 # running and the machine within the floors the app would enforce itself.
@@ -476,7 +500,9 @@ thermal_cutoff() {
 
 cutoff=""
 if [[ "$session_state" == valid ]] && (( force == 0 )); then
-  if ! app_alive; then
+  if (( ended_before == 1 )); then
+    cutoff="already ended (recorded in $ENDED) but session.json could not be removed"
+  elif ! app_alive; then
     cutoff="Insomnia is not running"
   elif battery_cutoff; then
     cutoff="$battery_reason"
@@ -496,8 +522,42 @@ fi
 # that was stopped or hung would never see the end (it ends its side when
 # session.json is gone). What the undo cannot finish stays in state.json,
 # which the next run and the app's reconcile complete without a session.
-if [[ "$session_state" == valid ]] && ! rm -f "$SESSION"; then
-  log error "could not remove $SESSION; until it is gone a relaunched Insomnia could resume the session this run ends"
+#
+# A session.json that cannot be removed is recorded as ended instead, and
+# the app and every later run honour the record until the file is gone. If
+# the record cannot be written either, nothing on disk says the session is
+# over: sleep is still restored below, since leaving it disabled is worse,
+# but its journal entry stays, so the journal reads dirty, uninstall.sh
+# stops, and every run exits 1 until a person makes the file removable.
+
+# Remove session.json, then the record of its end, which means something
+# only while the file it copies is there. False when session.json stays.
+remove_session() {
+  rm -f "$SESSION" 2>/dev/null || return 1
+  rm -f "$ENDED" 2>/dev/null || true
+}
+
+# Record that the session in session.json is over: a copy of its exact bytes
+# in $ENDED, written beside it and renamed into place. True only when the
+# record reads back identical to the file.
+record_end() {
+  local tmp="$ENDED.tmp.$$"
+  if [[ -f "$ENDED" ]] && "$CMP" -s "$SESSION" "$ENDED"; then return 0; fi
+  if cat "$SESSION" > "$tmp" 2>/dev/null; then mv -f "$tmp" "$ENDED" 2>/dev/null || true; fi
+  rm -f "$tmp" 2>/dev/null || true
+  [[ -f "$ENDED" ]] && "$CMP" -s "$SESSION" "$ENDED"
+}
+
+session_left=0      # 1 when the valid session this run ends is still on disk
+keep_sleep_entry=0  # 1 when nothing on disk records that end
+if [[ "$session_state" == valid ]] && ! remove_session; then
+  session_left=1
+  if record_end; then
+    log error "could not remove $SESSION; its end is recorded in $ENDED, so Insomnia restores the session instead of resuming it. Every run retries the removal"
+  else
+    keep_sleep_entry=1
+    log error "could not remove $SESSION or record its end in $ENDED; a relaunched Insomnia could resume the session. Sleep is restored anyway, but sleepDisabledByUs stays journaled and every run exits 1 until the file can be removed (ls -lO shows its flags)"
+  fi
 fi
 
 # --- Read the journal --------------------------------------------------------
@@ -566,7 +626,12 @@ if [[ "$journal_state" != dirty ]]; then
     else
       log info "$session_note; journal already clean"
     fi
-    rm -f "$SESSION"
+    # A valid session was removed (or recorded as ended) above.
+    if [[ "$session_state" == valid ]]; then exit "$session_left"; fi
+    if ! remove_session; then
+      log error "could not remove $SESSION; will retry on the next run"
+      exit 1
+    fi
   fi
   exit 0
 fi
@@ -581,7 +646,11 @@ new_sleep="$sleep_held"
 if [[ "$sleep_held" == true ]]; then
   if run_bounded "$SUDO" -n "$PMSET" -a disablesleep 0; then
     log info "pmset -a disablesleep 0 ok"
-    new_sleep=false; changed=1
+    if (( keep_sleep_entry == 1 )); then
+      failures+=("sleepDisabledByUs is kept although sleep is restored: $SESSION could not be removed and its end could not be recorded")
+    else
+      new_sleep=false; changed=1
+    fi
   else
     if (( command_alive )); then stop_transaction "pmset -a disablesleep 0"; fi
     log error "pmset -a disablesleep 0 failed (sudoers rule missing? run install.sh); keeping journal entry for retry"
@@ -753,6 +822,14 @@ if [[ "$session_state" == malformed ]]; then
   log error "journal cleared, but session.json is unreadable and kept as evidence. Open Insomnia or remove it by hand"
   exit 1
 fi
-rm -f "$SESSION"
+# A valid session was removed (or recorded as ended) above.
+if [[ "$session_state" == valid ]] && (( session_left == 1 )); then
+  log error "journal cleared, but $SESSION could not be removed; will retry on the next run"
+  exit 1
+fi
+if [[ "$session_state" != valid ]] && ! remove_session; then
+  log error "journal cleared, but could not remove $SESSION; will retry on the next run"
+  exit 1
+fi
 log info "journal cleared"
 exit 0

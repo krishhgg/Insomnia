@@ -352,6 +352,40 @@ final class RecoverySafetyTests: XCTestCase {
         XCTAssertFalse(h.guardFake.calls.dropFirst(2).contains("disablesleep 1"), "\(h.guardFake.calls)")
     }
 
+    /// The end the app could not finish by removing session.json is still
+    /// durable: it records the end, and the next launch restores instead of
+    /// holding sleep again, even while the file stays.
+    func testAnEndThatCannotRemoveSessionJSONRecordsItForTheNextLaunch() async throws {
+        let m = h.makeManager()
+        await m.start(duration: 3600)
+        let file = h.home.paths.sessionFile
+        try setImmutable(file, true)
+        defer { try? setImmutable(file, false) }
+
+        let outcome = await m.end(reason: .user)
+
+        XCTAssertEqual(outcome, .sessionRetained)
+        XCTAssertTrue(h.store.sessionEndIsRecorded())
+        let last = try XCTUnwrap(h.notifier.posts.last)
+        XCTAssertTrue(last.body.contains("its end is recorded, so a relaunch will not resume it"), last.body)
+
+        let relaunched = h.makeManager()
+        await relaunched.reconcile()
+
+        XCTAssertFalse(relaunched.isActive)
+        XCTAssertEqual(h.guardFake.calls.filter { $0 == "disablesleep 1" }.count, 1, "\(h.guardFake.calls)")
+
+        // Both pending ends finish once the file can go, which also stops
+        // their retry timers.
+        try setImmutable(file, false)
+        let relaunchedEnd = await relaunched.end(reason: .user)
+        XCTAssertEqual(relaunchedEnd, .restored)
+        let firstEnd = await m.end(reason: .user)
+        XCTAssertEqual(firstEnd, .restored)
+        XCTAssertNil(try h.store.loadSession())
+        XCTAssertFalse(FileManager.default.fileExists(atPath: h.home.paths.endedSessionFile.path))
+    }
+
     // MARK: Cross-process lock: fail closed
 
     /// The backstop holds the recovery lock. An end must change nothing:

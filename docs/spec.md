@@ -373,6 +373,13 @@ Backstop, independent of the app:
   cannot finish (a failing or hung `pmset`, saved audio or brightness only the
   app restores) leaves journal entries, never a session a relaunched app would
   resume. The app ends its side when it sees `session.json` gone.
+- A `session.json` that cannot be removed (an immutable file) is recorded as
+  ended in `ended-session.json`, a copy of its bytes. The app writes the same
+  record when its own end cannot remove the file. While the two files match,
+  the app restores that session instead of resuming it, and each agent run
+  ends it again and retries the removal. If the record cannot be written
+  either, the agent still restores sleep but keeps the `sleepDisabledByUs`
+  entry and exits 1, so the journal stays dirty and uninstall stops.
 - The battery and thermal reads have the undo commands' time limit but never
   hold the lock: they run with its descriptor closed, and one that ignores
   SIGTERM gets SIGKILL. A hung read fails only its own check, never the next

@@ -37,7 +37,10 @@ struct Store: Sendable {
 
     /// Atomic write: temp file + rename(2).
     func write<T: Encodable>(_ value: T, to url: URL) throws {
-        let data = try Store.makeEncoder().encode(value)
+        try write(data: Store.makeEncoder().encode(value), to: url)
+    }
+
+    private func write(data: Data, to url: URL) throws {
         let dir = url.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let tmp = dir.appendingPathComponent(".\(url.lastPathComponent).tmp-\(UUID().uuidString)")
@@ -59,7 +62,36 @@ struct Store: Sendable {
 
     func loadSession() throws -> Session? { try read(Session.self, from: paths.sessionFile) }
     func saveSession(_ s: Session) throws { try write(s, to: paths.sessionFile) }
-    func deleteSession() throws { try remove(at: paths.sessionFile) }
+    /// Removes session.json, then the record of its end, which means
+    /// something only while the file it copies is there. A record that
+    /// cannot be removed is left: it matches no later session.json.
+    func deleteSession() throws {
+        try remove(at: paths.sessionFile)
+        try? remove(at: paths.endedSessionFile)
+    }
+
+    /// Whether session.json is a session already ended: ended-session.json
+    /// holds its exact bytes (`recordSessionEnd`, or backstop.sh's
+    /// record_end). False when either file is missing or unreadable.
+    func sessionEndIsRecorded() -> Bool {
+        guard let recorded = try? Data(contentsOf: paths.endedSessionFile),
+              let current = try? Data(contentsOf: paths.sessionFile) else { return false }
+        return recorded == current
+    }
+
+    /// For an end that could not remove session.json: copies its bytes to
+    /// ended-session.json, so this app after a relaunch and backstop.sh treat
+    /// the session as over. True only when the record now matches the file.
+    func recordSessionEnd() -> Bool {
+        if sessionEndIsRecorded() { return true }
+        guard let current = try? Data(contentsOf: paths.sessionFile) else { return false }
+        do {
+            try write(data: current, to: paths.endedSessionFile)
+        } catch {
+            return false
+        }
+        return sessionEndIsRecorded()
+    }
 
     /// Non-mutating. A journal that does not decode stays exactly where it
     /// is: it is the only record of what a previous run changed, and moving
