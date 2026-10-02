@@ -93,6 +93,9 @@ CANDIDATE_DIR=""
 
 step() { printf '\n==> %s\n' "$*"; }
 usage() { echo "usage: $0 [--app /path/to/Insomnia.app [--allow-unverified-origin]]" >&2; }
+# A command for the user to paste, each word quoted for the shell, so a space,
+# quote or $ in a path stays part of that path.
+command_line() { local line; line="$(printf '%q ' "$@")"; printf '%s' "${line% }"; }
 
 PREBUILT=""
 ALLOW_UNVERIFIED_ORIGIN=0
@@ -205,7 +208,7 @@ This install.sh cannot tell where the bundle came from, and installing it would 
 at login and every 60 s. Nothing was changed.
 Verify the zip yourself first ('shasum -a 256 -c SHA256SUMS' and 'gh attestation verify' with --signer-workflow,
 see the README), then rerun with the flag that says so:
-  $0 --allow-unverified-origin --app "$PREBUILT"
+  $(command_line "$0" --allow-unverified-origin --app "$PREBUILT")
 REFUSE
     exit 1
   fi
@@ -425,8 +428,8 @@ schedule it runs was not verified here; check with 'launchctl print gui/$UID_NUM
   # copy is deleted when this script exits; the original may have changed
   # since the check, so the step is this script again, which checks a new copy.
   if [[ -n "$PREBUILT" ]]; then
-    rerun="$0 --app \"$PREBUILT\""
-    if (( ALLOW_UNVERIFIED_ORIGIN )); then rerun="$0 --allow-unverified-origin --app \"$PREBUILT\""; fi
+    rerun="$(command_line "$0" --app "$PREBUILT")"
+    if (( ALLOW_UNVERIFIED_ORIGIN )); then rerun="$(command_line "$0" --allow-unverified-origin --app "$PREBUILT")"; fi
     manual_step="or rerun this script. It checks a new private
 copy of the bundle and runs that copy's recovery before it replaces the app
 or the LaunchAgent:

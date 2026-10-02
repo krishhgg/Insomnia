@@ -1114,13 +1114,13 @@ final class RecoveryScriptTests: XCTestCase {
         // A zip install has no scripts/ directory. The checked copy of the bundle is gone when the
         // script exits and the original was never checked in place, so the hint runs no script from
         // either; it names this installer again, which checks a new copy first.
-        let prebuilt = try fx.writePrebuiltApp()
+        let prebuilt = try writePrebuiltAppAtAnAwkwardPath()
         let zip = try fx.run(fx.installRedirected, ["--allow-unverified-origin", "--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
 
         XCTAssertEqual(zip.status, 1, zip.stderr + zip.stdout)
         XCTAssertFalse(zip.stderr.contains("/bin/bash"), "no hand-run backstop.sh: \(zip.stderr)")
-        XCTAssertFalse(zip.stderr.contains("\(prebuilt.path)/Contents"), "nothing inside the unchecked bundle is named: \(zip.stderr)")
-        XCTAssertTrue(zip.stderr.contains("\(fx.installRedirected.path) --allow-unverified-origin --app \"\(prebuilt.path)\""), "manual step reruns the installer on the bundle: \(zip.stderr)")
+        XCTAssertFalse(zip.stderr.contains("backstop.sh\" --force"), "nothing inside the unchecked bundle is run: \(zip.stderr)")
+        XCTAssertEqual(try pastedWords(of: printedCommand(in: zip.stderr)), [fx.installRedirected.path, "--allow-unverified-origin", "--app", prebuilt.path], "manual step reruns the installer on the bundle")
         XCTAssertEqual(try fx.installedBinaryFirstLine(), "previous")
     }
 
@@ -1224,6 +1224,35 @@ final class RecoveryScriptTests: XCTestCase {
 
     /// The private copy install.sh --app checks and installs, read from the
     /// first deep verify in the recorded calls. Never the path passed in.
+    /// A prebuilt bundle in a directory whose name has a space, double quotes
+    /// and a `$`, all of which a command printed for pasting has to keep.
+    private func writePrebuiltAppAtAnAwkwardPath() throws -> URL {
+        let dir = fx.root.appendingPathComponent(#"My "dl" $HOME"#, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let app = dir.appendingPathComponent("Insomnia.app", isDirectory: true)
+        try FileManager.default.moveItem(at: try fx.writePrebuiltApp(), to: app)
+        return app
+    }
+
+    /// The indented `... --app ...` line an install.sh message gives the user to paste.
+    private func printedCommand(in output: String) throws -> String {
+        let line = try XCTUnwrap(output.split(separator: "\n").first { $0.hasPrefix("  ") && $0.contains(" --app ") }, output)
+        return line.trimmingCharacters(in: .whitespaces)
+    }
+
+    /// The words bash and zsh (the default login shell) read from a pasted
+    /// command line; set -- only assigns them, nothing runs.
+    private func pastedWords(of line: String) throws -> [String] {
+        var read: [[String]] = []
+        for shell in [["/bin/bash"], ["/bin/zsh", "-f"]] {
+            let r = try fx.runTool(shell[0], Array(shell.dropFirst()) + ["-c", #"eval "set -- $1" && printf '%s\n' "$@""#, "sh", line])
+            XCTAssertEqual(r.status, 0, "\(shell[0]): \(r.output)")
+            read.append(r.output.split(separator: "\n").map(String.init))
+        }
+        XCTAssertEqual(read[0], read[1], "bash and zsh read the same words from \(line)")
+        return read[0]
+    }
+
     private func checkedCopy(of prebuilt: URL) throws -> String {
         let prefix = "codesign --verify --strict --deep "
         let call = try XCTUnwrap(fx.calls().first { $0.hasPrefix(prefix) }, "\(fx.calls())")
@@ -1310,7 +1339,7 @@ final class RecoveryScriptTests: XCTestCase {
     /// install.sh refuses it before the password prompt and names the flag.
     func testInstallFromPrebuiltAppRefusesAnUnverifiedOriginWithoutTheOptIn() throws {
         try fx.prepareInstall()
-        let prebuilt = try fx.writePrebuiltApp()
+        let prebuilt = try writePrebuiltAppAtAnAwkwardPath()
 
         let adhoc = try fx.run(fx.installRedirected, ["--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
 
@@ -1318,7 +1347,7 @@ final class RecoveryScriptTests: XCTestCase {
         let copy = try checkedCopy(of: prebuilt)
         XCTAssertEqual(fx.calls(), ["codesign --verify --strict --deep \(copy)", "codesign -dvv \(copy)"], "\(fx.calls())")
         XCTAssertTrue(adhoc.stderr.contains("The origin of Insomnia 0.1.0 at \(prebuilt.path) is not verified: ad-hoc signed"), adhoc.stderr)
-        XCTAssertTrue(adhoc.stderr.contains("--allow-unverified-origin --app \"\(prebuilt.path)\""), "names the flag: \(adhoc.stderr)")
+        XCTAssertEqual(try pastedWords(of: printedCommand(in: adhoc.stderr)), [fx.installRedirected.path, "--allow-unverified-origin", "--app", prebuilt.path], "names the flag")
         XCTAssertTrue(adhoc.stderr.contains("Nothing was changed"), adhoc.stderr)
         XCTAssertFalse(fx.exists(fx.app))
         XCTAssertFalse(fx.exists(fx.sudoers))
