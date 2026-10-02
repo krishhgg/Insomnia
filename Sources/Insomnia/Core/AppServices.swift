@@ -119,7 +119,6 @@ final class AppServices {
         }
 
         (notifier as? Notifier)?.requestAuthorizationIfNeeded()
-        AppNap.disable(for: config.agentList)
 
         lidActions = LidActions(manager: manager, freezer: freezer, docker: docker, audio: audio, display: display, keyboard: keyboard, sampler: sampler)
         floors = FloorRuleDriver(manager: manager, notifier: notifier)

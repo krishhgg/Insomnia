@@ -39,6 +39,7 @@ enum StatusMenu {
         actions: String?,
         throttledBrowsers: [String],
         error: String?,
+        foreignSleep: String? = nil,
         lidSimulationBuild: Bool = false
     ) -> [Item] {
         var out: [Item] = []
@@ -65,6 +66,11 @@ enum StatusMenu {
         }
         if let error = present(error) {
             out.append(Item(title: "\u{26A0} \(error)", kind: .warning))
+        }
+        // Its own line, after the error: a restore that failed and a bit
+        // someone else set can both be true of the same reconcile.
+        if let foreignSleep = present(foreignSleep) {
+            out.append(Item(title: "\u{26A0} \(foreignSleep)", kind: .warning))
         }
         if !out.isEmpty {
             out.append(Item(title: "", kind: .separator))

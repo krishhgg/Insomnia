@@ -1,5 +1,4 @@
 import AppKit
-import ServiceManagement
 import SwiftUI
 
 /// The settings window (spec 10). Every change is written straight through
@@ -8,6 +7,8 @@ struct SettingsView: View {
     let manager: SessionManager
     let secrets: any HotspotSecretStore
     let locationPermission: LocationPermission
+    /// Launch at login as macOS reports it, not as config.json remembers it.
+    let loginItem: LoginItem
 
     @State private var newPreset = ""
     @State private var presetError: String?
@@ -16,7 +17,6 @@ struct SettingsView: View {
     @State private var newTmuxTarget = ""
     @State private var hotspotPassword = ""
     @State private var hotspotSaved = false
-    @State private var loginItemError: String?
     /// Names of the apps the automatic lid-close scope would freeze right
     /// now (the freeze list excluded); refreshed on appear and toggle.
     @State private var wouldFreeze: [String] = []
@@ -36,6 +36,10 @@ struct SettingsView: View {
         .onAppear {
             hotspotPassword = (try? secrets.load()) ?? ""
             refreshWouldFreeze()
+            // The user may have approved or removed the item in System
+            // Settings since the launch-time check (LoginItem also re-reads
+            // whenever the app becomes active, for a window left open).
+            loginItem.refresh()
         }
         // The preview depends on the toggle, both lists and what is running:
         // recompute on any config change and whenever an app launches or quits.
@@ -71,6 +75,16 @@ struct SettingsView: View {
         guard c != manager.config else { return }
         manager.config = c
         save()
+    }
+
+    /// The floor steppers go through the Config setters, which move the
+    /// other floor when the two would cross.
+    private var lowPowerFloor: Binding<Int> {
+        Binding(get: { manager.config.lowPowerFloor }, set: { v in update { $0.setLowPowerFloor(v) } })
+    }
+
+    private var endFloor: Binding<Int> {
+        Binding(get: { manager.config.endFloor }, set: { v in update { $0.setEndFloor(v) } })
     }
 
     // MARK: Sections
@@ -165,6 +179,10 @@ struct SettingsView: View {
                 add: { id in update { if !$0.agentList.contains(id) { $0.agentList.append(id) } } },
                 remove: { id in update { $0.agentList.removeAll { $0 == id } } }
             )
+            Toggle("Turn App Nap off for these apps during a session", isOn: bind(\.disableAppNapForAgents))
+            Text("Writes NSAppSleepDisabled = YES into each listed app's preferences when a session starts and puts the previous value back when it ends.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
         } header: {
             Text("Agent apps")
         } footer: {
@@ -184,12 +202,15 @@ struct SettingsView: View {
 
     private var powerSection: some View {
         Section("Battery and thermal") {
-            Stepper(value: bind(\.lowPowerFloor), in: 0...100, step: 5) {
+            Stepper(value: lowPowerFloor, in: 0...100, step: Config.floorStep) {
                 LabeledContent("Low Power Mode below", value: "\(manager.config.lowPowerFloor)%")
             }
-            Stepper(value: bind(\.endFloor), in: 0...100, step: 5) {
+            Stepper(value: endFloor, in: 0...Config.maxEndFloor, step: Config.floorStep) {
                 LabeledContent("End session below", value: "\(manager.config.endFloor)%")
             }
+            Text("0 turns the battery end off. The end floor stays below the Low Power Mode floor. Moving one onto the other moves it along.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
             Toggle("Thermal rules (Low Power Mode when hot, end when critical)", isOn: bind(\.thermalRules))
         }
     }
@@ -279,9 +300,7 @@ struct SettingsView: View {
     private var appSection: some View {
         Section("App") {
             Toggle("Launch at login", isOn: launchAtLogin)
-            if let loginItemError {
-                Text(loginItemError).font(.caption).foregroundStyle(.red)
-            }
+            loginItemNote
             LabeledContent("Config") {
                 Text(manager.paths.configFile.path)
                     .font(.caption)
@@ -296,25 +315,41 @@ struct SettingsView: View {
         }
     }
 
+    /// The switch shows what macOS has on file (`LoginItem.isRegistered`:
+    /// enabled or waiting for approval), so a registration that an upgrade
+    /// dropped reads as off even while config.json still says on, and a
+    /// pending one can be withdrawn by turning the switch off; the note
+    /// below explains the state.
     private var launchAtLogin: Binding<Bool> {
         Binding(
-            get: { manager.config.launchAtLogin },
+            get: { loginItem.isRegistered },
             set: { on in
-                do {
-                    if on {
-                        try SMAppService.mainApp.register()
-                    } else {
-                        try SMAppService.mainApp.unregister()
-                    }
-                    loginItemError = nil
-                    // Persist only what macOS actually applied.
-                    update { $0.launchAtLogin = on }
-                } catch {
-                    loginItemError = "Login item: \(error.localizedDescription)"
-                    Log.error("launch at login \(on ? "register" : "unregister") failed: \(error.localizedDescription)")
-                }
+                // Persist only what macOS accepted; a refused change leaves
+                // the flag as it was and its error on screen.
+                update { config in _ = loginItem.set(on, config: &config) }
             }
         )
+    }
+
+    /// One line under the switch: the last error, a pending approval with
+    /// the button that opens Login Items, or a flag macOS no longer honours.
+    @ViewBuilder
+    private var loginItemNote: some View {
+        if let error = loginItem.error {
+            Text("Login item: \(error)").font(.caption).foregroundStyle(.red)
+        } else if loginItem.needsApproval {
+            HStack {
+                Text("Waiting for approval in System Settings > General > Login Items. Turn the switch off to withdraw it.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("Open Login Items") { loginItem.openLoginItems() }
+            }
+        } else if manager.config.launchAtLogin, !loginItem.isRegistered {
+            Text("Login item: macOS reports it \(loginItem.status.description). Turn the switch on to register it again.")
+                .font(.caption)
+                .foregroundStyle(.orange)
+        }
     }
 
     // MARK: Bundle id lists
