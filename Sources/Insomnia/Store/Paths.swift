@@ -79,8 +79,8 @@ struct Paths: Sendable, Equatable {
     /// 0700 (an existing one is tightened); the LaunchAgents directory is
     /// shared with every other login agent, so it is only created.
     func createDirectories() throws {
-        try OwnerOnly.createDirectory(appSupport)
-        try OwnerOnly.createDirectory(logs)
+        if let problem = try OwnerOnly.createDirectory(appSupport) { OwnerOnly.reportOnce(problem) }
+        if let problem = try OwnerOnly.createDirectory(logs) { OwnerOnly.reportOnce(problem) }
         try FileManager.default.createDirectory(at: launchAgents, withIntermediateDirectories: true)
     }
 }

@@ -435,7 +435,7 @@ final class NetworkFailover {
         do {
             try OwnerOnly.appendToLog(line + "\n", at: paths.handoffsLog)
         } catch {
-            Log.error("handoffs.log append failed: \(error.localizedDescription)")
+            Log.error("handoffs.log: \(error.localizedDescription)")
         }
     }
 }

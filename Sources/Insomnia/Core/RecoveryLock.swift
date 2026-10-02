@@ -57,7 +57,7 @@ struct RecoveryLock: Sendable {
         // tightened in place, never replaced (same inode for both sides).
         let fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, OwnerOnly.fileMode)
         guard fd >= 0 else { throw RecoveryLockError.open(path: path, errno: errno) }
-        OwnerOnly.tighten(fd: fd)
+        if let problem = OwnerOnly.tighten(fd: fd, path: path) { OwnerOnly.reportOnce(problem) }
         if flock(fd, LOCK_EX | LOCK_NB) == 0 { return RecoveryLockHandle(fd: fd) }
         let err = errno
         close(fd)

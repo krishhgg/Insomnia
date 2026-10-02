@@ -30,10 +30,12 @@ enum Log {
         defer { lock.unlock() }
         do {
             // Owner-only, and rotated to insomnia.log.1 past OwnerOnly.maxLogBytes.
+            // A chmod or rotation that fails is thrown after the line is
+            // written, so it reaches the unified log below.
             try OwnerOnly.appendToLog(line, at: paths.logFile)
         } catch {
             // The description carries a path under the home directory.
-            logger.error("log append failed: \(error.localizedDescription, privacy: .private)")
+            logger.error("insomnia.log: \(error.localizedDescription, privacy: .private)")
         }
     }
 }

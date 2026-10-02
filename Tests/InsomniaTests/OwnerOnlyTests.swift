@@ -91,6 +91,143 @@ final class OwnerOnlyTests: XCTestCase {
         XCTAssertEqual(try mode(OwnerOnly.rotated(log)), 0o600, "the rotated file keeps the owner-only mode")
     }
 
+    // MARK: Rotation races and failures that must be reported
+
+    /// Two processes can both find the log oversized. The one that gets to
+    /// rotate second must not rename the fresh log over the retained copy.
+    /// The test plays the first process: it holds the file lock the appender
+    /// waits on, rotates, writes its own line, and only then lets go.
+    func testRotationByAnotherProcessIsNoticedAndTheRetainedCopyKept() throws {
+        let log = home.paths.logs.appendingPathComponent("race.log")
+        let big = "0123456789ABCDEF\n"
+        try OwnerOnly.appendToLog(big, at: log)
+        let held = open(log.path, O_RDONLY)
+        XCTAssertGreaterThanOrEqual(held, 0)
+        XCTAssertEqual(flock(held, LOCK_EX), 0)
+        let done = DispatchSemaphore(value: 0)
+        let failure = Locked<String?>(nil)
+        DispatchQueue.global().async {
+            do {
+                try OwnerOnly.appendToLog("second\n", at: log, maxBytes: 10)
+            } catch {
+                failure.value = "\(error)"
+            }
+            done.signal()
+        }
+        // The appender opens the oversized file and waits for its lock.
+        Thread.sleep(forTimeInterval: 0.3)
+        XCTAssertEqual(done.wait(timeout: .now()), .timedOut, "the appender should be waiting for the lock")
+
+        XCTAssertEqual(rename(log.path, OwnerOnly.rotated(log).path), 0)
+        try OwnerOnly.appendToLog("first\n", at: log, maxBytes: 10)
+        XCTAssertEqual(flock(held, LOCK_UN), 0)
+        close(held)
+
+        XCTAssertEqual(done.wait(timeout: .now() + 5), .success)
+        XCTAssertNil(failure.value)
+        XCTAssertEqual(try String(contentsOf: OwnerOnly.rotated(log), encoding: .utf8), big, "the retained copy was replaced")
+        XCTAssertEqual(try String(contentsOf: log, encoding: .utf8), "first\nsecond\n")
+    }
+
+    /// A legacy 0644 log that is already past the cap is tightened before it
+    /// becomes `.1`, so the retained copy is owner-only too.
+    func testLooseLogPastTheCapIsTightenedBeforeItIsRotated() throws {
+        let log = home.paths.logs.appendingPathComponent("legacy.log")
+        try writeLoose(String(repeating: "x", count: 20), to: log)
+        XCTAssertEqual(try mode(log), 0o644)
+
+        try OwnerOnly.appendToLog("y", at: log, maxBytes: 10)
+
+        XCTAssertEqual(try mode(OwnerOnly.rotated(log)), 0o600)
+        XCTAssertEqual(try mode(log), 0o600)
+        XCTAssertEqual(try String(contentsOf: log, encoding: .utf8), "y")
+    }
+
+    /// A rotation that cannot happen (here `.1` is a directory) is thrown
+    /// after the line is written, so the caller can say why the cap no
+    /// longer holds; the line itself is not lost.
+    func testFailedRotationIsThrownAfterTheLineIsWritten() throws {
+        let log = home.paths.logs.appendingPathComponent("stuck.log")
+        try OwnerOnly.appendToLog("0123456789A", at: log, maxBytes: 10)
+        try FileManager.default.createDirectory(at: OwnerOnly.rotated(log), withIntermediateDirectories: true)
+
+        XCTAssertThrowsError(try OwnerOnly.appendToLog("B", at: log, maxBytes: 10)) { error in
+            guard case .rotate(let path, _)? = error as? OwnerOnlyError else { return XCTFail("\(error)") }
+            XCTAssertEqual(path, log.path)
+            XCTAssertTrue(error.localizedDescription.hasPrefix("could not rotate \(log.path) to \(log.path).1: "), error.localizedDescription)
+        }
+        XCTAssertEqual(try String(contentsOf: log, encoding: .utf8), "0123456789AB")
+    }
+
+    /// A file this user cannot chmod (here: immutable) is still read, and
+    /// the failure is logged once, not on every transaction.
+    func testUnfixableLooseFileIsReportedOnceAndStillRead() throws {
+        try writeLoose(#"{"lowPowerFloor": 25}"#, to: home.paths.configFile)
+        XCTAssertEqual(chflags(home.paths.configFile.path, UInt32(UF_IMMUTABLE)), 0)
+        defer { _ = chflags(home.paths.configFile.path, 0) }
+        let store = Store(paths: home.paths)
+
+        XCTAssertEqual(try store.loadConfig()?.lowPowerFloor, 25)
+        XCTAssertEqual(try store.loadConfig()?.lowPowerFloor, 25)
+
+        XCTAssertEqual(try mode(home.paths.configFile), 0o644, "chmod cannot succeed on an immutable file")
+        let log = try String(contentsOf: home.paths.logFile, encoding: .utf8)
+        let lines = log.split(whereSeparator: \.isNewline).filter { $0.contains("config.json") }
+        XCTAssertEqual(lines.count, 1, log)
+        XCTAssertTrue(lines.first?.hasSuffix("[error] insomnia: could not make \(home.paths.configFile.path) owner-only: Operation not permitted") ?? false, log)
+    }
+
+    /// The log's own directory: the line is still written and the chmod
+    /// failure is thrown afterwards for the caller to report.
+    func testUnfixableLogDirectoryIsThrownAfterTheLineIsWritten() throws {
+        let log = home.paths.logs.appendingPathComponent("held.log")
+        try writeLoose("", to: log)
+        XCTAssertEqual(try mode(home.paths.logs), 0o755)
+        XCTAssertEqual(chflags(home.paths.logs.path, UInt32(UF_IMMUTABLE)), 0)
+        defer { _ = chflags(home.paths.logs.path, 0) }
+
+        XCTAssertThrowsError(try OwnerOnly.appendToLog("line\n", at: log)) { error in
+            guard case .chmod(let path, _)? = error as? OwnerOnlyError else { return XCTFail("\(error)") }
+            XCTAssertEqual(path, home.paths.logs.path)
+        }
+        XCTAssertEqual(try String(contentsOf: log, encoding: .utf8), "line\n")
+        XCTAssertEqual(try mode(home.paths.logs), 0o755)
+    }
+
+    /// A symlinked config.json is read, but the target's mode is not
+    /// touched: it may be shared with other users or programs. Same for a
+    /// Logs directory that is a symlink elsewhere.
+    func testSymlinkedFileAndDirectoryAreLeftAlone() throws {
+        let shared = home.root.appendingPathComponent("shared-config.json")
+        try writeLoose(#"{"lowPowerFloor": 25}"#, to: shared)
+        try FileManager.default.createDirectory(at: home.paths.appSupport, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: home.paths.configFile, withDestinationURL: shared)
+        let store = Store(paths: home.paths)
+
+        XCTAssertEqual(try store.loadConfig()?.lowPowerFloor, 25)
+
+        XCTAssertEqual(try mode(shared), 0o644)
+        let elsewhere = home.root.appendingPathComponent("elsewhere")
+        try FileManager.default.createDirectory(at: elsewhere, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o755])
+        try? FileManager.default.removeItem(at: home.paths.logs)
+        try FileManager.default.createSymbolicLink(at: home.paths.logs, withDestinationURL: elsewhere)
+
+        Log.append(level: "info", "via symlink", paths: home.paths)
+
+        XCTAssertEqual(try mode(elsewhere), 0o755)
+        XCTAssertTrue(try String(contentsOf: home.paths.logFile, encoding: .utf8).hasSuffix("insomnia: via symlink\n"))
+
+        let sharedLog = home.root.appendingPathComponent("shared.log")
+        try writeLoose("", to: sharedLog)
+        try FileManager.default.removeItem(at: home.paths.logFile)
+        try FileManager.default.createSymbolicLink(at: home.paths.logFile, withDestinationURL: sharedLog)
+
+        Log.append(level: "info", "via symlinked file", paths: home.paths)
+
+        XCTAssertEqual(try mode(sharedLog), 0o644)
+        XCTAssertTrue(try String(contentsOf: sharedLog, encoding: .utf8).hasSuffix("insomnia: via symlinked file\n"))
+    }
+
     // MARK: Journal, session, config
 
     func testStoreCreatesItsFilesAndDirectoryOwnerOnly() throws {
