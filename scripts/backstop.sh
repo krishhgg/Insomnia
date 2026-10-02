@@ -67,6 +67,7 @@ LOCKF=/usr/bin/lockf
 PS=/bin/ps
 KILL=/bin/kill
 SYSCTL=/usr/sbin/sysctl
+CHMOD=/bin/chmod
 LOCK_TIMEOUT_SECONDS=10
 # Longest a single undo command (sudo pmset) may run before it is sent
 # SIGTERM, and how long it then gets to exit before this run fails closed.
@@ -111,7 +112,7 @@ tighten() { # mode path...
   local p
   for p in "$@"; do
     if [[ -e "$p" && ! -L "$p" ]]; then
-      chmod "$mode" "$p" 2>/dev/null || true
+      "$CHMOD" "$mode" "$p" 2>/dev/null || true
     fi
   done
 }

@@ -555,6 +555,9 @@ final class RecoveryScriptTests: XCTestCase {
             XCTAssertEqual(try fx.mode(file), 0o600, file.lastPathComponent)
         }
         XCTAssertTrue(fx.log().hasPrefix("old line\n"), "the loose log was replaced instead of kept")
+        XCTAssertEqual(fx.chmodCalls(), ["chmod 700 \(fx.home.path)", "chmod 700 \(logsDir.path)"]
+            + [fx.logFile, fx.lock, fx.state, fx.session].map { "chmod 600 \($0.path)" },
+            "the backstop changes modes through its fixed CHMOD path")
     }
 
     // MARK: - Journal shape (typed corruption)
@@ -1561,6 +1564,7 @@ private final class ScriptFixture {
             "PS": bin.appendingPathComponent("ps").path,
             "KILL": bin.appendingPathComponent("kill").path,
             "SYSCTL": bin.appendingPathComponent("sysctl").path,
+            "CHMOD": bin.appendingPathComponent("chmod").path,
             "LOCK_TIMEOUT_SECONDS": "1",
             "COMMAND_TIMEOUT_SECONDS": "1",
             "KILL_GRACE_SECONDS": "1",
@@ -1735,6 +1739,12 @@ private final class ScriptFixture {
         try writeFake("sysctl", """
         cat "\(r)/boot.uuid"
         """)
+        // chmod: recorded in chmod.calls, apart from calls.log, then run for
+        // real so the modes still change.
+        try writeFake("chmod", """
+        printf 'chmod %s\\n' "$*" >> "\(r)/chmod.calls"
+        exec /bin/chmod "$@"
+        """)
         // pgrep: pgrep.mode holds one exit status per line, consumed in
         // order; the last line repeats. Default 1 (not running).
         try writeFake("pgrep", """
@@ -1882,6 +1892,11 @@ private final class ScriptFixture {
 
     func calls() -> [String] {
         guard let text = try? String(contentsOf: callsLog, encoding: .utf8) else { return [] }
+        return text.split(separator: "\n").map(String.init)
+    }
+
+    func chmodCalls() -> [String] {
+        guard let text = try? String(contentsOf: root.appendingPathComponent("chmod.calls"), encoding: .utf8) else { return [] }
         return text.split(separator: "\n").map(String.init)
     }
 
