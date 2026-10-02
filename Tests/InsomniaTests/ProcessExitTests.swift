@@ -33,7 +33,8 @@ final class ProcessExitTests: XCTestCase {
     }
 
     /// The RecoveryLockTests shape without the lock: launch on a cooperative
-    /// thread, suspend, then await the exit wherever the task resumes.
+    /// thread, suspend, then await the exit wherever the task resumes. Either
+    /// path in `exited()` may run here; the next two tests pin one each.
     func testExitedResumesAfterASuspensionBetweenLaunchAndWait() async throws {
         for _ in 0..<20 {
             let p = Self.process("/bin/sh", ["-c", "exit 3"])
@@ -48,42 +49,66 @@ final class ProcessExitTests: XCTestCase {
         }
     }
 
+    /// `exited()` called after the exit handler ran returns without
+    /// suspending.
     func testExitedResumesForAChildThatExitedBeforeTheCall() async throws {
         let p = Self.process("/bin/sh", ["-c", "exit 4"])
         let childExit = ProcessExit(p)
         try p.run()
-        let deadline = Date().addingTimeInterval(10)
-        while p.isRunning, Date() < deadline {
-            try await Task.sleep(for: .milliseconds(10))
+        // wait() returns only after the handler has recorded the exit, so the
+        // call below takes the already-exited path.
+        let reaped = XCTestExpectation(description: "wait() returned")
+        Thread {
+            childExit.wait()
+            reaped.fulfill()
+        }.start()
+        guard await XCTWaiter().fulfillment(of: [reaped], timeout: 10) == .completed else {
+            return XCTFail("wait() did not return within 10 s")
         }
-        XCTAssertFalse(p.isRunning, "the child did not exit within 10 s")
-        try await Task.sleep(for: .milliseconds(50))
         guard await childExit.exited(within: 10) else {
             return XCTFail("exited() did not return within 10 s")
         }
         XCTAssertEqual(p.terminationStatus, 4)
     }
 
-    /// A child that is still running when the wait starts, and is ended by a
-    /// signal: the reason ShellTimeout classifies by is final after the wait.
-    /// Two blocking waiters and one awaiting caller all return.
+    /// A child that is still running when every wait starts, and is ended by
+    /// a signal: the reason ShellTimeout classifies by is final after the
+    /// wait. Two blocking waiters and one suspended caller all return.
     func testEveryWaiterReturnsForAChildThatExitsAfterTheCall() async throws {
         let p = Self.process("/bin/sleep", ["30"])
         let childExit = ProcessExit(p)
         try p.run()
+        defer { if p.isRunning { p.terminate() } }
+
+        // wait() has one path whether the exit comes before or after the
+        // call, so the blocking waiters only need to have called it.
+        let blockingCalled = (0..<2).map { XCTestExpectation(description: "blocking waiter \($0) called wait()") }
         let blockingReturned = (0..<2).map { XCTestExpectation(description: "blocking waiter \($0) returned") }
-        for returned in blockingReturned {
+        for i in 0..<2 {
             Thread {
+                blockingCalled[i].fulfill()
                 childExit.wait()
-                returned.fulfill()
+                blockingReturned[i].fulfill()
             }.start()
         }
-        try await Task.sleep(for: .milliseconds(100))
-        XCTAssertTrue(p.isRunning)
+        // exited() has two paths. The child exits only once this caller has
+        // suspended, so the handler has to resume it.
+        let awaitReturned = XCTestExpectation(description: "exited() returned")
+        Task {
+            await childExit.exited()
+            awaitReturned.fulfill()
+        }
+        guard await XCTWaiter().fulfillment(of: blockingCalled, timeout: 10) == .completed else {
+            return XCTFail("the blocking waiters did not start within 10 s")
+        }
+        guard try await Self.poll(within: 10, until: { childExit.suspendedCount == 1 }) else {
+            return XCTFail("exited() did not suspend within 10 s")
+        }
+        XCTAssertTrue(p.isRunning, "the child exited before every wait had started")
+
         p.terminate()
-        let exited = await childExit.exited(within: 10)
-        XCTAssertTrue(exited, "exited() did not return within 10 s")
-        await fulfillment(of: blockingReturned, timeout: 10)
+        await fulfillment(of: blockingReturned + [awaitReturned], timeout: 10)
+        XCTAssertEqual(childExit.suspendedCount, 0)
         XCTAssertEqual(p.terminationReason, .uncaughtSignal)
         XCTAssertEqual(p.terminationStatus, SIGTERM)
     }
@@ -107,6 +132,16 @@ final class ProcessExitTests: XCTestCase {
         p.standardOutput = FileHandle.nullDevice
         p.standardError = FileHandle.nullDevice
         return p
+    }
+
+    /// Checks `condition` every 5 ms for at most `seconds`.
+    private static func poll(within seconds: TimeInterval, until condition: () -> Bool) async throws -> Bool {
+        let deadline = Date().addingTimeInterval(seconds)
+        while !condition() {
+            if Date() >= deadline { return false }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        return true
     }
 }
 

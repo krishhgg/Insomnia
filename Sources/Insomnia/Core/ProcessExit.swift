@@ -60,4 +60,8 @@ final class ProcessExit: @unchecked Sendable {
             if already { continuation.resume() }
         }
     }
+
+    /// How many `exited()` callers are suspended right now. Tests read it to
+    /// let the child exit only after a caller has suspended.
+    var suspendedCount: Int { lock.withLock { suspended.count } }
 }
