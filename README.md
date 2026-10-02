@@ -97,9 +97,12 @@ the agent, not against a process running as you: that process can edit the
 plist, load its own agent, quit the app and launch a replacement, and run the
 four `pmset` commands itself.
 
-An upgrade asks the running app to quit and stops if it refuses. Unresolved
-recovery prevents replacing the existing recovery agent; follow the reported
-instructions before retrying.
+An upgrade asks the running app to quit and stops if it refuses. The new
+bundle is built in a staging directory next to the app and moved into place in
+the same step that replaces the recovery agent; if the new agent cannot be
+loaded, the previous bundle is put back, so the loaded agent always matches
+the installed app. Unresolved recovery prevents replacing either; follow the
+reported instructions before retrying.
 
 </details>
 

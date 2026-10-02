@@ -329,6 +329,11 @@ Backstop, independent of the app:
   whose bundle no longer verifies is never reported as armed, and a bundle
   re-signed under the running app is never re-pinned. A `swift run` build
   outside any bundle pins the installed bundle from disk.
+- install.sh replaces the bundle and the agent in one locked step (new
+  bundle staged next to the app, swapped in after the previous job is
+  unloaded and before the new one is loaded) and puts the previous bundle
+  back when the new agent cannot be loaded, so the agent on disk always
+  pins the bundle at `~/Applications/Insomnia.app`.
 - App and script transactions must coordinate through a shared lock. Failure
   to acquire it must not permit an unprotected journal write or side effect.
 - Successful restores may clear their entries; failures must stay journaled.
