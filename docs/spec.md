@@ -242,8 +242,12 @@ last held while it was on was the battery or thermal floor, not the lid.
   write succeeded. Settings shows the toggle, the list of apps it affects,
   and what it changes.
 - Values written by builds before this were never recorded and are not
-  guessed at: uninstall lists each agent app whose key is `YES` with no
-  journal entry, prints the `defaults delete` command for it, and continues.
+  guessed at: uninstall reads the key for every app on the shipped agent
+  list and on config.json's (an app taken off the list may still carry one),
+  lists each whose key is `YES` with no journal entry, prints the
+  shell-quoted `defaults delete` command for it, and continues. The summary
+  says how many apps were checked; an app whose key cannot be read is
+  reported, not counted.
 - Browser throttling: Chromium browsers throttle windows macOS reports as
   occluded, which is every window once the lid is closed with no external
   display. Timers drop to 1 Hz, animation frames stop, pages report hidden.
@@ -335,8 +339,9 @@ Backstop, independent of the app:
   and state when restoration is incomplete, including saved audio.
 - The shell puts `appNapOverrides` back with `defaults write <id>
   NSAppSleepDisabled -bool <previous>` or `defaults delete` when the key was
-  absent. A delete that fails counts as done only after a `defaults read`
-  confirms the key is gone; any other failure keeps the entry.
+  absent. A delete that fails counts as done only when `defaults read` then
+  says the key does not exist; a read that succeeds or fails any other way
+  keeps the entry.
 - The agent is a recovery mechanism, not a guarantee of crash/reboot behavior
   or a replacement for battery/thermal observers. These scenarios require
   the separate hardware validation record.

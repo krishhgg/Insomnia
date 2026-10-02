@@ -32,21 +32,28 @@ struct AppNapError: Error, LocalizedError, Sendable {
 
 enum AppNap {
     static let key = "NSAppSleepDisabled"
+
+    /// The key's value as the Bool it will be written back as: nil when the
+    /// key is absent, true or false for a CFBoolean, which is what
+    /// `defaults write -bool` and a plist `<true/>` store. Anything else
+    /// throws: an integer from `defaults write -int 0`, a string "YES". Such
+    /// a value would come back as a boolean, not as what it was, so it is
+    /// never overwritten and the app is skipped.
+    static func sleepDisabled(from value: CFPropertyList?, bundleId: String) throws -> Bool? {
+        guard let value else { return nil }
+        guard CFGetTypeID(value) == CFBooleanGetTypeID() else {
+            throw AppNapError(bundleId: bundleId, detail: "is not a boolean; left alone")
+        }
+        return CFEqual(value, kCFBooleanTrue)
+    }
 }
 
 /// CFPreferences on the app's own domain.
 struct CFAppNapPreferences: AppNapPreferencing {
     func readSleepDisabled(bundleId: String) throws -> Bool? {
-        guard let value = CFPreferencesCopyValue(AppNap.key as CFString, bundleId as CFString, kCFPreferencesCurrentUser, kCFPreferencesAnyHost) else {
-            return nil
-        }
-        // `defaults write -bool` stores a CFBoolean and `-int 1` a CFNumber;
-        // both bridge to NSNumber. Anything else (a string "YES", say) is
-        // not ours to rewrite.
-        guard let number = value as? NSNumber else {
-            throw AppNapError(bundleId: bundleId, detail: "is not a boolean; left alone")
-        }
-        return number.boolValue
+        try AppNap.sleepDisabled(
+            from: CFPreferencesCopyValue(AppNap.key as CFString, bundleId as CFString, kCFPreferencesCurrentUser, kCFPreferencesAnyHost),
+            bundleId: bundleId)
     }
 
     func writeSleepDisabled(_ value: Bool?, bundleId: String) throws {

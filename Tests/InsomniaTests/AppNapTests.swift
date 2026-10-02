@@ -290,6 +290,30 @@ final class AppNapTests: XCTestCase {
 
     /// With the lid closed at relaunch the lid actions wait, but App Nap is
     /// not a lid action: a valid session re-applies it regardless.
+    /// Only a CFBoolean is read as the Bool it will be written back as.
+    /// An integer (`defaults write -int 0`), a string or anything else
+    /// would come back as a boolean, not as what it was, so the read
+    /// refuses and the app is skipped rather than rewritten.
+    func testOnlyACFBooleanIsReadAsTheValueToPutBack() throws {
+        XCTAssertNil(try AppNap.sleepDisabled(from: nil, bundleId: chrome))
+        XCTAssertEqual(try AppNap.sleepDisabled(from: kCFBooleanTrue, bundleId: chrome), true)
+        XCTAssertEqual(try AppNap.sleepDisabled(from: kCFBooleanFalse, bundleId: chrome), false)
+        XCTAssertEqual(try AppNap.sleepDisabled(from: NSNumber(value: true), bundleId: chrome), true, "a BOOL NSNumber is the same CFBoolean object")
+        let notBooleans: [(String, CFTypeRef)] = [
+            ("-int 0", NSNumber(value: 0)),
+            ("-int 1", NSNumber(value: 1)),
+            ("-float 1", NSNumber(value: 1.0)),
+            ("-string YES", "YES" as CFString),
+            ("-string 1", "1" as CFString),
+            ("-array", [kCFBooleanTrue] as CFArray),
+        ]
+        for (label, value) in notBooleans {
+            XCTAssertThrowsError(try AppNap.sleepDisabled(from: value, bundleId: chrome), label) { error in
+                XCTAssertEqual(error.localizedDescription, "NSAppSleepDisabled for com.google.Chrome is not a boolean; left alone", label)
+            }
+        }
+    }
+
     func testReconcileValidSessionLidClosedStillAppliesAppNap() async throws {
         let now = h.clock.now
         try h.store.saveSession(Session(startedAt: now.addingTimeInterval(-600), endsAt: now.addingTimeInterval(3600)))

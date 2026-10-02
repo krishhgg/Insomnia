@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 import XCTest
+@testable import Insomnia
 
 /// Behavioural tests for scripts/backstop.sh and scripts/uninstall.sh.
 ///
@@ -377,6 +378,40 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(fx.log().contains("com.apple.Terminal NSAppSleepDisabled failed and the key is still set"), fx.log())
     }
 
+    /// A failed delete followed by a read that fails for any reason other
+    /// than "does not exist" (cfprefsd not answering, say) proves nothing
+    /// about the key. The entry stays, the run fails, and the next run
+    /// finishes the job once `defaults` answers again.
+    func testDeleteAndReadBothFailingKeepsTheEntryForTheNextRun() throws {
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"appNapOverrides":[{"bundleId":"com.google.Chrome"}]}"#)
+        try fx.defaultsTable([("com.google.Chrome", "1")])
+        fx.setMode("defaults", "unreachable")
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertNotEqual(r.status, 0)
+        XCTAssertEqual(fx.calls(), [
+            "defaults delete com.google.Chrome NSAppSleepDisabled",
+            "defaults read com.google.Chrome NSAppSleepDisabled",
+        ])
+        XCTAssertEqual(fx.defaultsValues(), ["com.google.Chrome": "1"], "nothing changed")
+        let kept = try XCTUnwrap(try fx.stateJSON()["appNapOverrides"] as? [[String: Any]])
+        XCTAssertEqual(kept.map { $0["bundleId"] as? String }, ["com.google.Chrome"], "the entry is kept, not cleared as absent")
+        XCTAssertTrue(fx.exists(fx.session), "evidence stays while the journal is dirty")
+        XCTAssertTrue(fx.log().contains("defaults read could not tell whether the key is still set"), fx.log())
+        XCTAssertFalse(fx.log().contains("already absent"), fx.log())
+        XCTAssertFalse(fx.log().contains("journal cleared"), fx.log())
+
+        fx.setMode("defaults", "ok")
+        fx.clearCalls()
+        let after = try fx.run(fx.backstop)
+        XCTAssertEqual(after.status, 0, after.stderr + fx.log())
+        XCTAssertEqual(fx.calls(), ["defaults delete com.google.Chrome NSAppSleepDisabled"])
+        XCTAssertEqual(fx.defaultsValues(), [:])
+        XCTAssertEqual((try fx.stateJSON()["appNapOverrides"] as? [Any])?.count, 0)
+    }
+
     /// An entry without a usable bundle id is never passed to `defaults`
     /// (a leading dash would be read as an option) and stays journaled.
     func testAppNapEntryWithoutUsableBundleIdIsKeptWithoutCommands() throws {
@@ -535,6 +570,31 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(r.stderr.contains("defaults write"), r.stderr)
     }
 
+    /// The same with the key recorded as absent: a delete and a read that
+    /// both fail leave the entry, and uninstall stops with it on screen
+    /// instead of treating the key as gone.
+    func testUninstallAbortsWhenDeleteAndReadBothFail() throws {
+        try fx.installMachinery()
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"appNapOverrides":[{"bundleId":"com.google.Chrome"}]}"#)
+        try fx.defaultsTable([("com.google.Chrome", "1")])
+        fx.setMode("defaults", "unreachable")
+
+        let r = try fx.run(fx.uninstall, ["--purge"])
+
+        XCTAssertNotEqual(r.status, 0)
+        XCTAssertEqual(fx.calls().filter { $0.hasPrefix("defaults") }, [
+            "defaults delete com.google.Chrome NSAppSleepDisabled",
+            "defaults read com.google.Chrome NSAppSleepDisabled",
+        ], "the legacy listing never runs while the journal is dirty")
+        XCTAssertEqual(fx.defaultsValues(), ["com.google.Chrome": "1"])
+        XCTAssertTrue(fx.exists(fx.plist))
+        XCTAssertTrue(fx.exists(fx.app))
+        XCTAssertTrue(fx.exists(fx.config))
+        XCTAssertEqual((try fx.stateJSON()["appNapOverrides"] as? [Any])?.count, 1)
+        XCTAssertTrue(r.stderr.contains("App Nap settings (NSAppSleepDisabled) are not put back"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("com.google.Chrome"), r.stderr)
+    }
+
     /// Even an older backstop that exits 0 without touching the entries
     /// cannot get App Nap entries past uninstall's own check.
     func testUninstallRejectsAppNapEntriesEvenWhenBackstopExitsZero() throws {
@@ -581,12 +641,10 @@ final class RecoveryScriptTests: XCTestCase {
 
         XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
         let defaultsCalls = fx.calls().filter { $0.hasPrefix("defaults") }
-        XCTAssertEqual(defaultsCalls, [
-            "defaults read com.google.Chrome NSAppSleepDisabled",
-            "defaults read com.apple.Terminal NSAppSleepDisabled",
-            "defaults read dev.zed.Zed NSAppSleepDisabled",
-            "defaults read com.todesktop.230313mzl4w4u92 NSAppSleepDisabled",
-        ], "read only: nothing is written or deleted without a record")
+        XCTAssertTrue(defaultsCalls.allSatisfy { $0.hasPrefix("defaults read ") }, "read only: nothing is written or deleted without a record: \(defaultsCalls)")
+        for id in ["com.google.Chrome", "com.apple.Terminal", "dev.zed.Zed", "com.todesktop.230313mzl4w4u92"] {
+            XCTAssertEqual(defaultsCalls.filter { $0 == "defaults read \(id) NSAppSleepDisabled" }.count, 1, "\(id) is read once: \(defaultsCalls)")
+        }
         XCTAssertEqual(fx.defaultsValues(), ["com.google.Chrome": "1", "com.apple.Terminal": "0", "com.todesktop.230313mzl4w4u92": "1"], "left as they were")
         XCTAssertTrue(r.stdout.contains("no record of"), r.stdout)
         XCTAssertTrue(r.stdout.contains("  defaults delete com.google.Chrome NSAppSleepDisabled\n"), r.stdout)
@@ -597,19 +655,74 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(fx.exists(fx.app))
     }
 
-    /// Nothing to list: the check still runs and says so.
+    /// Nothing to list: the check still runs, reads the shipped list plus
+    /// config.json's (each once), and says how many it checked rather than
+    /// claiming nothing is left anywhere.
     func testUninstallReportsNoUnrecordedAppNapWhenNoneIsSet() throws {
         try fx.installMachinery()
         try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
-        try fx.writeConfig(#"{"agentList":["com.google.Chrome"]}"#)
+        try fx.writeConfig(#"{"agentList":["com.google.Chrome","com.example.extra"]}"#)
 
         let r = try fx.run(fx.uninstall)
 
         XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
-        XCTAssertEqual(fx.calls().filter { $0.hasPrefix("defaults") }, ["defaults read com.google.Chrome NSAppSleepDisabled"])
+        let expected = (Config.defaultAgentList + ["com.example.extra"]).map { "defaults read \($0) NSAppSleepDisabled" }
+        XCTAssertEqual(fx.calls().filter { $0.hasPrefix("defaults") }, expected)
         XCTAssertTrue(r.stdout.contains("Checking App Nap settings of agent apps"), r.stdout)
-        XCTAssertTrue(r.stdout.contains("none left behind"), r.stdout)
+        XCTAssertTrue(r.stdout.contains("none of the \(expected.count) agent apps checked has NSAppSleepDisabled set"), r.stdout)
         XCTAssertFalse(r.stdout.contains("defaults delete"), r.stdout)
+    }
+
+    /// An app the user took off the list may still carry a value an older
+    /// build set. The shipped list is checked as well, so it is listed.
+    func testUninstallListsUnrecordedAppNapForAgentsRemovedFromTheList() throws {
+        try fx.installMachinery()
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        try fx.writeConfig(#"{"agentList":["com.apple.Terminal"]}"#)
+        try fx.defaultsTable([("com.google.Chrome", "1")])
+
+        let r = try fx.run(fx.uninstall, ["--purge"])
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertTrue(r.stdout.contains("  defaults delete com.google.Chrome NSAppSleepDisabled\n"), r.stdout)
+        XCTAssertFalse(r.stdout.contains("none of the"), r.stdout)
+        XCTAssertEqual(fx.defaultsValues(), ["com.google.Chrome": "1"], "listed, not changed")
+        XCTAssertFalse(fx.exists(fx.config))
+    }
+
+    /// The list editor takes any string, so the printed command is
+    /// shell-quoted; an id a `defaults read` cannot settle is reported
+    /// rather than counted as clear.
+    func testUninstallQuotesPrintedCommandsAndReportsUnreadableIds() throws {
+        try fx.installMachinery()
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        try fx.writeConfig(#"{"agentList":["com.example.My App","com.example.Broken"]}"#)
+        try fx.defaultsTable([("com.example.My App", "1")])
+        fx.setMode("defaults", "unreachable:com.example.Broken")
+
+        let r = try fx.run(fx.uninstall)
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertTrue(r.stdout.contains("  defaults delete com.example.My\\ App NSAppSleepDisabled\n"), r.stdout)
+        XCTAssertTrue(r.stdout.contains("could not read NSAppSleepDisabled for com.example.Broken; check it yourself with: defaults read com.example.Broken NSAppSleepDisabled"), r.stdout)
+        XCTAssertTrue(r.stdout.contains("1 could not be read"), r.stdout)
+        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("defaults write") || $0.hasPrefix("defaults delete") }, "\(fx.calls())")
+    }
+
+    /// uninstall.sh carries a copy of the shipped agent list so its check
+    /// covers apps the user later removed from config.json. The copy must
+    /// match Config.defaultAgentList, in order.
+    func testUninstallShippedAgentListMatchesTheAppsDefault() throws {
+        let text = try String(contentsOf: ScriptFixture.productionScripts.appendingPathComponent("uninstall.sh"), encoding: .utf8)
+        guard let start = text.range(of: "\nDEFAULT_AGENTS=(\n"),
+              let end = text.range(of: "\n)\n", range: start.upperBound..<text.endIndex) else {
+            return XCTFail("DEFAULT_AGENTS=( ... ) not found in uninstall.sh")
+        }
+        let ids = text[start.upperBound..<end.lowerBound].split(separator: "\n").compactMap { line -> String? in
+            let id = line.split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false)[0].trimmingCharacters(in: .whitespaces)
+            return id.isEmpty ? nil : id
+        }
+        XCTAssertEqual(ids, Config.defaultAgentList)
     }
 
     func testUninstallAbortsOnMalformedJournal() throws {
@@ -1721,7 +1834,7 @@ private final class ScriptFixture {
 
     // MARK: Scripts
 
-    private static var productionScripts: URL {
+    static var productionScripts: URL {
         // .../Tests/InsomniaTests/RecoveryScriptTests.swift -> .../scripts
         URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
@@ -1918,7 +2031,10 @@ private final class ScriptFixture {
         // or 0). `read` prints it or fails like the real tool when absent;
         // `write -bool` and `delete` edit the table, and `delete` of an
         // absent key fails like the real tool. Mode "fail" makes every
-        // write and delete fail; "fail:<domain>" only that domain's.
+        // write and delete fail; "fail:<domain>" only that domain's. Mode
+        // "unreachable" (or "unreachable:<domain>") fails every command,
+        // read included, the way a cfprefsd that does not answer would:
+        // non-zero without the "does not exist" message.
         try writeFake("defaults", """
         printf 'defaults %s\\n' "$*" >> "\(calls)"
         mode="$(cat "\(r)/defaults.mode" 2>/dev/null || echo ok)"
@@ -1938,6 +2054,9 @@ private final class ScriptFixture {
           awk -F'|' -v d="$domain" '$1 != d' "$table" > "$table.next" && mv "$table.next" "$table"
         }
         failing() { [[ "$mode" == fail || "$mode" == "fail:$domain" ]]; }
+        if [[ "$mode" == unreachable || "$mode" == "unreachable:$domain" ]]; then
+          echo "fake defaults: cfprefsd did not answer for $domain" >&2; exit 1
+        fi
         case "$cmd" in
           read)
             v="$(lookup)" || { echo "The domain/default pair of ($domain, $key) does not exist" >&2; exit 1; }

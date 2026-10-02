@@ -61,6 +61,33 @@ PLIST="$LAUNCH_AGENTS/$LABEL.plist"
 SESSION="$APP_SUPPORT/session.json"
 STATE="$APP_SUPPORT/state.json"
 CONFIG="$APP_SUPPORT/config.json"
+# The agent list the app ships with (Config.defaultAgentList in
+# Sources/Insomnia/Model/Config.swift; a test keeps this copy in step). An
+# older build may have set NSAppSleepDisabled for any of these, even one the
+# user later took off the list in config.json, so the check below covers
+# both lists.
+DEFAULT_AGENTS=(
+  com.t3tools.t3code              # T3 Code (Nightly)
+  com.t3tools.t3code.reasoning    # T3 Code (Reasoning)
+  com.conductor.app               # Conductor
+  com.apple.Terminal              # Terminal
+  com.googlecode.iterm2           # iTerm2
+  com.mitchellh.ghostty           # Ghostty
+  dev.warp.Warp-Stable            # Warp
+  com.google.Chrome               # Google Chrome
+  org.chromium.Chromium           # Chromium
+  company.thebrowser.Browser      # Arc
+  com.docker.docker               # Docker Desktop
+  com.microsoft.VSCode            # Visual Studio Code
+  com.todesktop.230313mzl4w4u92   # Cursor
+  dev.zed.Zed                     # Zed
+  com.google.antigravity          # Antigravity
+  com.anthropic.claudefordesktop  # Claude
+  com.openai.codex                # ChatGPT (hosts Codex and computer use)
+  io.tailscale.ipn.macsys         # Tailscale
+  ai.elementlabs.lmstudio         # LM Studio
+  com.electron.ollama             # Ollama
+)
 LOCK="$APP_SUPPORT/.recovery.lock"
 UID_NUM="$(id -u)"
 
@@ -199,15 +226,33 @@ journal_problems() {
 # Agent apps whose NSAppSleepDisabled is YES with no journal entry: set by a
 # build that did not record the previous value, or by the user. Nothing is
 # known to put back, so nothing is changed; the exact command to undo each
-# one is printed instead. The list comes from config.json's agentList; an
-# install that never launched the app has no config.json and wrote nothing.
+# one is printed instead, shell-quoted, since the list editor takes any
+# string. Checked: the shipped list plus config.json's agentList. Only a
+# read that says "does not exist" counts as clear; a read that fails any
+# other way is reported, not counted.
 list_unrecorded_app_nap() {
-  [[ -f "$CONFIG" ]] || return 0
-  local i=0 id value found=0
-  while id="$(extract "$CONFIG" "agentList.$i")"; do
-    i=$((i + 1))
+  local ids="" i=0 id value rc found=0 checked=0 unreadable=0
+  for id in "${DEFAULT_AGENTS[@]}"; do ids="$ids$id"$'\n'; done
+  if [[ -f "$CONFIG" ]]; then
+    while id="$(extract "$CONFIG" "agentList.$i")"; do
+      i=$((i + 1))
+      ids="$ids$id"$'\n'
+    done
+  fi
+  while IFS= read -r id; do
     [[ -n "$id" && "$id" != -* ]] || continue
-    value="$("$DEFAULTS" read "$id" NSAppSleepDisabled 2>/dev/null || true)"
+    rc=0
+    value="$("$DEFAULTS" read "$id" NSAppSleepDisabled 2>&1)" || rc=$?
+    if (( rc != 0 )); then
+      if [[ "$value" == *"does not exist"* ]]; then
+        checked=$((checked + 1))
+      else
+        unreadable=$((unreadable + 1))
+        printf 'could not read NSAppSleepDisabled for %s; check it yourself with: defaults read %q NSAppSleepDisabled\n' "$id" "$id"
+      fi
+      continue
+    fi
+    checked=$((checked + 1))
     [[ "$value" == 1 ]] || continue
     if (( found == 0 )); then
       found=1
@@ -217,9 +262,14 @@ what it was before (an older build set it without recording). They are left
 as they are. To turn App Nap back on for one, run:
 MSG
     fi
-    printf '  defaults delete %s NSAppSleepDisabled\n' "$id"
-  done
-  (( found == 1 )) || echo "none left behind"
+    printf '  defaults delete %q NSAppSleepDisabled\n' "$id"
+  done < <(printf '%s' "$ids" | awk '!seen[$0]++')
+  if (( found == 0 )); then
+    echo "none of the $checked agent apps checked has NSAppSleepDisabled set"
+  fi
+  if (( unreadable > 0 )); then
+    echo "$unreadable could not be read; see above"
+  fi
 }
 
 abort_incomplete() { # backstop exit status, problem lines...
