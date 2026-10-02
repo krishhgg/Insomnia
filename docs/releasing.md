@@ -34,9 +34,10 @@ only in the signature.
    it, attests the zip and creates the GitHub Release with notes that include
    the checksum and the verify commands.
 4. Download the zip from the release and check it the way a user would (see
-   below), then install it with `./install.sh --app ./Insomnia.app` on a Mac
-   you can afford to reinstall on. Record the result in
-   `docs/release-validation.md`.
+   below), then install it with the command in the release notes
+   (`./install.sh --app ./Insomnia.app`, with `--allow-unverified-origin`
+   while `EXPECTED_TEAM_ID` is empty) on a Mac you can afford to reinstall
+   on. Record the result in `docs/release-validation.md`.
 
 A manual run (Actions, Release, Run workflow) builds and packages the current
 branch and uploads the zip and `SHA256SUMS` as a workflow artifact. It does
@@ -44,7 +45,11 @@ not attest or publish anything, so it is the way to try the pipeline.
 
 ## Signing and notarization
 
-Signing is decided by which repository secrets exist. All are optional.
+Signing is decided by the repository secrets. Either all six exist or none:
+the first step of the workflow fails the run when the signing secrets exist
+without the notary secrets or the reverse, or when a set is incomplete. A
+Developer ID build that is not notarized is blocked by Gatekeeper and refused
+by `install.sh --app`, so it is never published.
 
 | Secret | What it is |
 | --- | --- |
@@ -61,16 +66,20 @@ keychain created for the run and deleted at the end; it never enters the
 login keychain. With the three notary secrets as well, the workflow submits
 the app with `notarytool --wait`, staples the ticket and checks `spctl`.
 
-Without the signing secrets the bundle is ad-hoc signed. The release is then
-marked a prerelease and its notes say it is experimental: macOS blocks the
-first launch of a downloaded ad-hoc app until the user allows it in System
-Settings. A Developer ID build without notarization is also a prerelease,
-because Gatekeeper blocks it too.
+Without the secrets the bundle is ad-hoc signed. The release is then marked
+a prerelease and its notes say it is experimental: macOS blocks the first
+launch of a downloaded ad-hoc app until the user allows it in System
+Settings.
 
 Once a Developer ID is in use, put its Team ID in `EXPECTED_TEAM_ID` in
-`scripts/install.sh`. From then on `install.sh --app` refuses a Developer ID
-bundle from any other team. While it is empty, the team is printed and not
-checked.
+`scripts/install.sh`. From then on `install.sh --app` treats a Developer ID
+bundle from that team, with Gatekeeper's verdict, as verified in origin,
+installs it without any flag, and refuses one from any other team. The
+workflow fails a release signed by a team other than `EXPECTED_TEAM_ID`,
+since the `install.sh` in its own zip would refuse it. While it is empty,
+nothing establishes origin for the installer: it installs a bundle only with
+`--allow-unverified-origin`, the workflow prints a warning, and the release
+notes carry that flag in the install command.
 
 The app needs no entitlements under the hardened runtime today: it spawns
 helpers (`sudo`, `pmset`, `tmux`, `docker`), uses CoreWLAN with the location
@@ -81,20 +90,38 @@ needs one, `build-app.sh` is where the entitlements file would be passed.
 
 ```bash
 shasum -a 256 -c SHA256SUMS
-gh attestation verify Insomnia-<version>-macos.zip -R krishhgg/Insomnia
+gh attestation verify Insomnia-<version>-macos.zip -R krishhgg/Insomnia \
+  --signer-workflow krishhgg/Insomnia/.github/workflows/release.yml \
+  --source-ref refs/tags/v<version>
 ```
 
 The first line checks the zip against the checksum published with it. The
 second asks GitHub for the attestation signed when the workflow ran and
-checks that this zip is its subject and that the workflow belongs to this
-repository. Together they show the bytes are what the Release workflow built
-from the tagged commit. They do not show the code is safe; the README's
-warnings apply to every build.
+checks that this zip is its subject, that the signing workflow is this
+repository's `release.yml` (`--signer-workflow`; with `-R` alone any workflow
+of the repository would do) and that it ran for the tag (`--source-ref`).
+Together they show the bytes are what the Release workflow built from the
+tagged commit. They do not show the code is safe; the README's warnings
+apply to every build.
 
 `install.sh --app` then runs `codesign --verify --strict --deep` on the
 bundle, checks the bundle identifier and version, and for a Developer ID
 signature runs `spctl --assess --type execute` and compares the team, all
-before the password prompt.
+before the password prompt. The copy it puts in `~/Applications` is checked
+once more against the requirement the recovery agent pins.
+
+What is verified while `EXPECTED_TEAM_ID` is empty and releases are ad-hoc
+signed: the checksum shows the zip was not altered after `SHA256SUMS` was
+written; the attestation shows this repository's Release workflow built this
+exact zip from the tag; `install.sh --app` shows the bundle inside is intact
+(signature and resource seal), has the expected identifier and a version,
+and carries the sealed backstop. What is not: `install.sh` cannot tell an
+ad-hoc bundle from this repository apart from one anyone else signed with
+the same identifier, so it refuses to install without
+`--allow-unverified-origin`, the flag that says you ran the two commands
+above yourself. Once `EXPECTED_TEAM_ID` is set and releases are Developer ID
+signed and notarized, `install.sh --app` verifies origin on its own and the
+flag is not needed.
 
 ## What is not automated
 

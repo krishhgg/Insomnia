@@ -21,10 +21,12 @@ name: Release
 #   INSOMNIA_NOTARY_KEY_BASE64  App Store Connect API key (.p8), base64-encoded
 #   INSOMNIA_NOTARY_KEY_ID      that key's ID
 #   INSOMNIA_NOTARY_ISSUER_ID   that key's issuer ID
-# Without the three signing secrets the bundle is ad-hoc signed and the
-# release is a prerelease described as experimental. Without the three
-# notary secrets a Developer ID build is not notarized and is also a
-# prerelease, because Gatekeeper blocks it on download.
+# Without them the bundle is ad-hoc signed and the release is a prerelease
+# described as experimental. The six are set together or not at all: the
+# first step fails the run when the signing secrets exist without the
+# notary secrets or the reverse, or when a set is incomplete, because a
+# Developer ID build that is not notarized is blocked by Gatekeeper and
+# refused by install.sh --app, so it must never be published.
 #
 # The certificate goes into a keychain created for the run and deleted at
 # the end, never into the login keychain. Every action is pinned to a commit.
@@ -53,12 +55,31 @@ jobs:
     env:
       HAVE_SIGNING: ${{ secrets.INSOMNIA_SIGN_P12_BASE64 != '' && secrets.INSOMNIA_SIGN_P12_PASSWORD != '' && secrets.INSOMNIA_SIGN_IDENTITY != '' }}
       HAVE_NOTARY: ${{ secrets.INSOMNIA_NOTARY_KEY_BASE64 != '' && secrets.INSOMNIA_NOTARY_KEY_ID != '' && secrets.INSOMNIA_NOTARY_ISSUER_ID != '' }}
+      ANY_SIGNING: ${{ secrets.INSOMNIA_SIGN_P12_BASE64 != '' || secrets.INSOMNIA_SIGN_P12_PASSWORD != '' || secrets.INSOMNIA_SIGN_IDENTITY != '' }}
+      ANY_NOTARY: ${{ secrets.INSOMNIA_NOTARY_KEY_BASE64 != '' || secrets.INSOMNIA_NOTARY_KEY_ID != '' || secrets.INSOMNIA_NOTARY_ISSUER_ID != '' }}
     outputs:
       version: ${{ steps.version.outputs.version }}
       signed: ${{ steps.build.outputs.signed }}
       notarized: ${{ steps.notarize.outputs.notarized }}
       team: ${{ steps.build.outputs.team }}
+      origin_verified: ${{ steps.build.outputs.origin_verified }}
     steps:
+      - name: Check that the signing and notary secrets are all set or all absent
+        run: |
+          if [[ "$ANY_SIGNING" == true && "$HAVE_SIGNING" != true ]]; then
+            echo "::error::Some of INSOMNIA_SIGN_P12_BASE64, INSOMNIA_SIGN_P12_PASSWORD and INSOMNIA_SIGN_IDENTITY are set, but not all three."
+            exit 1
+          fi
+          if [[ "$ANY_NOTARY" == true && "$HAVE_NOTARY" != true ]]; then
+            echo "::error::Some of INSOMNIA_NOTARY_KEY_BASE64, INSOMNIA_NOTARY_KEY_ID and INSOMNIA_NOTARY_ISSUER_ID are set, but not all three."
+            exit 1
+          fi
+          if [[ "$HAVE_SIGNING" != "$HAVE_NOTARY" ]]; then
+            echo "::error::The signing secrets and the notary secrets must be set together (signing: $HAVE_SIGNING, notarization: $HAVE_NOTARY). A Developer ID build that is not notarized is blocked by Gatekeeper and refused by install.sh --app, so it is never published. Set all six secrets or none."
+            exit 1
+          fi
+          echo "signing: $HAVE_SIGNING, notarization: $HAVE_NOTARY"
+
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -127,7 +148,9 @@ jobs:
           # Let codesign use the key without a UI prompt.
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain" >/dev/null
           # Search this keychain too; the login keychain stays as it is.
-          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          existing=()
+          while IFS= read -r line; do existing+=("$line"); done < <(security list-keychains -d user | sed -e 's/^ *"//' -e 's/"$//')
+          security list-keychains -d user -s "$keychain" "${existing[@]}"
           security find-identity -v -p codesigning "$keychain"
           echo "SIGNING_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
 
@@ -138,14 +161,29 @@ jobs:
         run: |
           scripts/build-app.sh --output dist
           team="$(codesign -dvv dist/Insomnia.app 2>&1 | sed -n 's/^TeamIdentifier=//p' | head -n 1)"
+          # The team install.sh --app expects. While it is empty install.sh
+          # cannot verify where a download came from and needs
+          # --allow-unverified-origin; the release notes then say so.
+          expected_team="$(sed -n 's/^EXPECTED_TEAM_ID="\(.*\)"$/\1/p' scripts/install.sh)"
+          origin_verified=false
           if [[ -n "$INSOMNIA_SIGN_IDENTITY" ]]; then
             echo "signed=true" >> "$GITHUB_OUTPUT"
             echo "team=$team" >> "$GITHUB_OUTPUT"
+            if [[ -n "$expected_team" && "$expected_team" != "$team" ]]; then
+              echo "::error::scripts/install.sh expects team $expected_team, but the bundle is signed by team $team; the install.sh in the zip would refuse this release."
+              exit 1
+            fi
+            if [[ -n "$expected_team" ]]; then
+              origin_verified=true
+            else
+              echo "::warning::EXPECTED_TEAM_ID is empty in scripts/install.sh, so install.sh --app cannot verify this release's origin and needs --allow-unverified-origin. Set it to $team (docs/releasing.md)."
+            fi
           else
             echo "signed=false" >> "$GITHUB_OUTPUT"
             echo "team=" >> "$GITHUB_OUTPUT"
             echo "::notice::No Developer ID secrets: Insomnia.app is ad-hoc signed. This build is an experimental prerelease."
           fi
+          echo "origin_verified=$origin_verified" >> "$GITHUB_OUTPUT"
 
       - name: Notarize and staple
         id: notarize
@@ -196,8 +234,9 @@ jobs:
   release:
     name: Attest and publish the GitHub Release
     needs: build
-    # Tags only: a manual run stops at the artifact.
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Pushed tags only. A manual run stops at the artifact, even one started
+    # on a tag ref, which a check of the ref alone would let through.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -209,6 +248,7 @@ jobs:
       SIGNED: ${{ needs.build.outputs.signed }}
       NOTARIZED: ${{ needs.build.outputs.notarized }}
       TEAM: ${{ needs.build.outputs.team }}
+      ORIGIN_VERIFIED: ${{ needs.build.outputs.origin_verified }}
     steps:
       - name: Download the package
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -232,6 +272,13 @@ jobs:
           else
             signing="Prerelease: ad-hoc signed, experimental. No Developer ID and no notarization; macOS blocks the first launch until you allow it in System Settings > Privacy & Security. The checksum and attestation below still show this zip is what the Release workflow built from the tagged commit."
           fi
+          if [[ "$ORIGIN_VERIFIED" == true ]]; then
+            install_flags=""
+            install_note="The installer checks the bundle's signature, identifier and version, and that it is Developer ID signed by team $TEAM, the team its install.sh expects, before asking for your password. It then installs the app, the recovery agent and the sudoers rule described in the README."
+          else
+            install_flags="--allow-unverified-origin "
+            install_note="The installer checks the bundle's signature, identifier and version before asking for your password, but it cannot verify where this bundle came from: that is what the checksum and the attestation above are for, and \`--allow-unverified-origin\` says you checked them. It then installs the app, the recovery agent and the sudoers rule described in the README."
+          fi
           {
             echo "Insomnia $VERSION for macOS 26 or later."
             echo
@@ -241,8 +288,10 @@ jobs:
             echo
             echo '```bash'
             echo "shasum -a 256 -c SHA256SUMS"
-            echo "gh attestation verify $zip -R $GITHUB_REPOSITORY"
+            echo "gh attestation verify $zip -R $GITHUB_REPOSITORY --signer-workflow $GITHUB_REPOSITORY/.github/workflows/release.yml --source-ref $GITHUB_REF"
             echo '```'
+            echo
+            echo "The second command checks that this zip is the subject of an attestation signed by this repository's Release workflow for the tag \`$GITHUB_REF_NAME\`, not by just any workflow of this repository."
             echo
             echo "SHA-256 of \`$zip\`: \`$sum\`"
             echo
@@ -251,11 +300,11 @@ jobs:
             echo '```bash'
             echo "ditto -x -k $zip ."
             echo "cd ${zip%.zip}"
-            echo "./install.sh --app ./Insomnia.app"
+            echo "./install.sh ${install_flags}--app ./Insomnia.app"
             echo "open \"\$HOME/Applications/Insomnia.app\""
             echo '```'
             echo
-            echo "The installer checks the bundle's signature, identifier and version before asking for your password, then installs the app, the recovery agent and the sudoers rule described in the README."
+            echo "$install_note"
             echo
             echo "Built from \`$GITHUB_SHA\` by run $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID."
           } > notes.md
