@@ -199,7 +199,7 @@ final class AppServices {
 
         power.refreshBattery()
         syncPower()
-        Log.info("startup battery percent \(status.batteryPercent.map(String.init) ?? "unavailable")")
+        Log.info("startup battery \(PowerMonitor.describe(power.battery))")
         Log.info("startup thermal state \(PowerMonitor.name(status.thermalState))")
 
         Task { [weak self] in
@@ -298,7 +298,7 @@ final class AppServices {
     private func powerChanged() {
         syncPower()
         guard let floors else { return }
-        let percent = power.percent
+        let battery = power.battery
         let charging = power.isCharging
         let thermal = power.thermalState
         let lidClosed = status.lidClosed
@@ -306,7 +306,7 @@ final class AppServices {
         let task = Task { @MainActor in
             await previous?.value
             guard !Task.isCancelled, self.running else { return }
-            await floors.run(percent: percent, isCharging: charging, thermal: thermal, lidClosed: lidClosed)
+            await floors.run(battery: battery, isCharging: charging, thermal: thermal, lidClosed: lidClosed)
             guard !Task.isCancelled, self.running else { return }
             self.syncState()
         }
