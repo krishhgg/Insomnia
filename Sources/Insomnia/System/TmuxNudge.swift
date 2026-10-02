@@ -36,7 +36,8 @@ struct TmuxNudge: Sendable {
         "tmux set-option -p -t \(target) \(markOption) on"
     }
 
-    /// `pressEnter` says whether Enter follows `continue`.
+    /// `pressEnter` says whether Enter follows `continue`. Returns false
+    /// after logging why nothing was sent; the caller only counts.
     typealias Runner = @Sendable (_ target: String, _ pressEnter: Bool) async throws -> Bool
     /// Asked before each target; `false` ends the nudge because the session
     /// that requested it is gone.
@@ -71,8 +72,6 @@ struct TmuxNudge: Sendable {
                 if try await run(target, pressEnter) {
                     count += 1
                     Log.info("tmux nudge sent to \(target): continue\(pressEnter ? " + Enter" : "")")
-                } else {
-                    Log.error("tmux nudge to \(target) rejected")
                 }
             } catch {
                 Log.error("tmux nudge to \(target) failed: \(error.localizedDescription)")
@@ -137,8 +136,10 @@ struct TmuxNudge: Sendable {
             // an unset option print nothing with exit 0.
             try Task.checkCancellation()
             let mark = try await command.run(tmux, server + ["show-options", "-qpv", "-t", paneId, markOption], timeout: 5)
+            // An unmarked pane is the expected state of a target listed
+            // before marks existed, so this is a skip, not an error.
             guard mark.succeeded, isMarked(showOptionsOutput: mark.stdout) else {
-                Log.error("tmux nudge to \(target) skipped: pane \(paneId) is not marked for nudges (\(markCommand(target: paneId)))")
+                Log.info("tmux nudge to \(target) skipped: pane \(paneId) is not marked for nudges; mark it with: \(markCommand(target: paneId))")
                 return false
             }
             // Send to the concrete pane whose state was just read, never back

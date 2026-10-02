@@ -404,16 +404,26 @@ final class TmuxLiveRunnerTests: XCTestCase {
     }
 
     /// Without the pane mark nothing is sent, however the target was listed.
+    /// A target listed before marks existed is unmarked after an upgrade, so
+    /// the skip is one info line that says how to mark the pane, with no
+    /// error from the runner or from the nudge loop.
     func testUnmarkedPaneIsSkipped() async throws {
+        let home = TempHome()
+        defer { home.destroy() }
         try await startPane(command: "cat", marked: false)
-        let run = TmuxNudge.makeLiveRunner(socketName: socket)
+        let nudge = TmuxNudge(run: TmuxNudge.makeLiveRunner(socketName: socket))
 
-        let accepted = try await run("nudge:0.0", true)
+        let count = await nudge.nudge(targets: ["nudge:0.0"], pressEnter: true)
 
-        XCTAssertFalse(accepted, "nudge reported success for an unmarked pane")
+        XCTAssertEqual(count, 0, "nudge reported success for an unmarked pane")
         try await Task.sleep(for: .milliseconds(200))
         let seen = try await capture()
         XCTAssertFalse(seen.contains("continue"), seen)
+        let log = try String(contentsOf: home.paths.logFile, encoding: .utf8)
+        let lines = log.split(whereSeparator: \.isNewline).filter { $0.contains("nudge:0.0") }
+        XCTAssertEqual(lines.count, 1, log)
+        XCTAssertTrue(lines.first?.contains("[info] insomnia: tmux nudge to nudge:0.0 skipped: pane %0 is not marked for nudges; mark it with: tmux set-option -p -t %0 @insomnia-nudge on") ?? false, log)
+        XCTAssertFalse(log.contains("[error]"), log)
     }
 
     /// The mark must be on the pane itself. The same option set on the
