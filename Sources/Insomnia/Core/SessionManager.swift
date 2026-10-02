@@ -514,7 +514,8 @@ final class SessionManager {
     /// Requesting an end invalidates every start, extend or Low Power change
     /// still queued or in flight. If the recovery lock cannot be taken the
     /// end changes nothing and is retried in process. If the journal cannot
-    /// be read the end changes nothing and waits for a person.
+    /// be read the end changes nothing and is retried too, until a person
+    /// repairs the file or the agent ends the session.
     @discardableResult
     func end(reason: EndReason) async -> EndOutcome {
         endTicket += 1
@@ -528,22 +529,21 @@ final class SessionManager {
         case .failure(.journalUnreadable): outcome = .journalUnreadable
         }
         switch outcome {
-        case .restored, .incomplete(agentArmed: true):
-            pendingEnd = nil
+        case .restored, .incomplete, .sessionRetained:
+            // performEnd settled the pending end or scheduled its retry.
+            break
         case .locked:
             notifier.post(
                 title: Self.notEndedTitle,
                 body: "The recovery lock is held by another process, so nothing was changed. The session is still active; Insomnia retries in \(Int(recoveryRetryDelay)) s."
             )
             scheduleEndRetry(reason)
-        case .incomplete(agentArmed: false), .sessionRetained:
-            scheduleEndRetry(reason)
         case .journalUnreadable:
-            // No timer: a broken file does not heal by itself. The end stays
-            // pending, so new starts are refused and quit is deferred, until
-            // the next end request finds a readable journal.
-            pendingEnd = reason
-            quitRequested = false
+            // The end stays pending, so new starts are refused and quit is
+            // deferred. The retry ends the session once a person repairs the
+            // file; if the agent ends it first, the tick adopts that end. The
+            // notification goes out once per error, so a retry only logs.
+            scheduleEndRetry(reason)
         }
         return outcome
     }
@@ -601,11 +601,21 @@ final class SessionManager {
             // Reconcile and a failed start reach here without `end()`; the
             // retry is scheduled here so they are covered too (rescheduling
             // from `end()` is harmless).
-            if !armed { scheduleEndRetry(reason) }
+            if armed { settlePendingEnd() } else { scheduleEndRetry(reason) }
             return .incomplete(agentArmed: armed)
         }
         notifier.post(title: Self.endTitle(reason, had: had), body: endBody(reason))
+        settlePendingEnd()
         return .restored
+    }
+
+    /// An end that finished, or left the rest to an armed agent, resolves
+    /// any end still pending, whichever path ran it: `end()`, the adoption
+    /// of an end the agent made, or reconcile. Its retry timer is obsolete.
+    private func settlePendingEnd() {
+        pendingEnd = nil
+        retryTimer?.invalidate()
+        retryTimer = nil
     }
 
     private func scheduleEndRetry(_ reason: EndReason) {
