@@ -58,6 +58,10 @@ CANDIDATE=""
 CANDIDATE_DIR=""
 
 step() { printf '\n==> %s\n' "$*"; }
+# A command for the user to paste, each word quoted for the shell, so a space,
+# quote or $ in a path stays part of that path.
+command_line() { local line; line="$(printf '%q ' "$@")"; printf '%s' "${line% }"; }
+
 # `launchctl print` exits 0 when a job with the label is loaded and 113 when
 # none is. Anything else is unknown, not absent. Being loaded says nothing
 # about which plist or schedule that job runs (it may be an older one).
@@ -326,10 +330,11 @@ Install stopped: the backstop could not fully undo a previous session
 not replaced or unloaded, so they still match each other; the new build
 was discarded. Installed so far: $SUDOERS.
 $agent_note
-Check $LOG_DIR/insomnia.log and resolve what it reports (saved audio, display
-brightness or keyboard backlight needs the app; if one is installed: open
-"$APP"), or run the recovery by hand:
-  /bin/bash "$ROOT/scripts/backstop.sh" --force
+Check $LOG_DIR/insomnia.log and resolve what it reports. Saved audio, display
+brightness or keyboard backlight needs the app; if one is installed, open it:
+  $(command_line open "$APP")
+Or run the recovery by hand:
+  $(command_line /bin/bash "$ROOT/scripts/backstop.sh" --force)
 Then rerun this script to install the app and the LaunchAgent.
 FAIL
   exit 1
@@ -377,7 +382,7 @@ if [[ "$before" != no ]]; then
     reload_hint=""
     if [[ "$cleared" != yes && -f "$PLIST" ]]; then
       reload_hint="If no job is loaded, load the previous one again:
-  launchctl bootstrap gui/$UID_NUM '$PLIST'
+  $(command_line launchctl bootstrap "gui/$UID_NUM" "$PLIST")
 "
     fi
     cat >&2 <<FAIL
@@ -499,7 +504,7 @@ unknown: it may be the job that was loaded before this attempt. Check
       else
         outcome="The previous job could not be loaded again ('launchctl bootstrap' exited
 $reload_rc; launchctl print: $now); no job with label $LABEL is confirmed loaded. Run
-  launchctl bootstrap gui/$UID_NUM '$PLIST'
+  $(command_line launchctl bootstrap "gui/$UID_NUM" "$PLIST")
 yourself, or rerun this script."
       fi ;;
     no)
@@ -539,9 +544,9 @@ fi
 step "Installed"
 cat <<NEXT
 Next steps:
-  1. Launch:            open "$APP"
+  1. Launch:            $(command_line open "$APP")
   2. Optional:          System Settings > Wi-Fi > Ask to join hotspots: Automatically
   3. Config lives at:   $APP_SUPPORT/config.json
   4. Logs:              $LOG_DIR/insomnia.log
-  5. Uninstall:         $ROOT/scripts/uninstall.sh
+  5. Uninstall:         $(command_line "$ROOT/scripts/uninstall.sh")
 NEXT

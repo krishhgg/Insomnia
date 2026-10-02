@@ -1104,7 +1104,7 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(r.stderr.contains("left as it was"), r.stderr)
         XCTAssertTrue(r.stderr.contains("not verified"), "no schedule claim from print alone: \(r.stderr)")
         XCTAssertFalse(r.stderr.contains("every minute"), r.stderr)
-        XCTAssertTrue(r.stderr.contains("backstop.sh\" --force"), "manual step named: \(r.stderr)")
+        XCTAssertTrue(r.stderr.contains("/scripts/backstop.sh --force"), "manual step named: \(r.stderr)")
         XCTAssertTrue(r.stderr.contains("not replaced"), r.stderr)
         XCTAssertEqual(try fx.installedBinaryFirstLine(), "previous", "the bundle the retained agent pins stays in place")
         XCTAssertEqual(try fx.contents(of: fx.appsDir), ["Insomnia.app"], "the staged build is discarded and nothing is set aside")
@@ -1126,6 +1126,57 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(r.stderr.contains("No LaunchAgent"), r.stderr)
         XCTAssertTrue(r.stderr.contains("nothing retries"), r.stderr)
         XCTAssertFalse(r.stderr.contains("every minute"), "no retry is promised: \(r.stderr)")
+    }
+
+    /// The commands install.sh prints for pasting name paths inside the
+    /// checkout it runs from. Under a checkout whose path has a space, double
+    /// quotes and a `$`, bash and zsh still read each one back as that path.
+    func testInstallQuotesTheCheckoutPathsInTheCommandsItPrints() throws {
+        try fx.prepareInstall()
+        try fx.writePreviousApp()
+        try fx.writeAgentPlist()
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        let checkout = fx.root.appendingPathComponent(#"My "src" $HOME"#, isDirectory: true)
+        try FileManager.default.copyItem(at: fx.repoScripts.deletingLastPathComponent(), to: checkout)
+        let install = checkout.appendingPathComponent("scripts/install.redirected.sh")
+        fx.setMode("sudo", "fail")          // recovery stops the first run
+        fx.setMode("launchctl", "loaded")
+
+        let stopped = try fx.run(install, extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(stopped.status, 1, stopped.stderr + stopped.stdout)
+        XCTAssertEqual(
+            try pastedWords(of: printedCommand(in: stopped.stderr, containing: "backstop.sh")),
+            ["/bin/bash", checkout.appendingPathComponent("scripts/backstop.sh").path, "--force"],
+            "the manual recovery runs the checkout's backstop.sh"
+        )
+
+        fx.setMode("sudo", "ok")
+        let installed = try fx.run(install, extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(installed.status, 0, installed.stderr + installed.stdout)
+        let step = try XCTUnwrap(installed.stdout.split(separator: "\n").first { $0.contains("Uninstall:") }, installed.stdout)
+        let uninstall = String(step.split(separator: ":", maxSplits: 1)[1]).trimmingCharacters(in: .whitespaces)
+        XCTAssertEqual(try pastedWords(of: uninstall), [checkout.appendingPathComponent("scripts/uninstall.sh").path], "the uninstaller of the checkout")
+    }
+
+    /// The indented line an install.sh message gives the user to paste.
+    private func printedCommand(in output: String, containing marker: String) throws -> String {
+        let line = try XCTUnwrap(output.split(separator: "\n").first { $0.hasPrefix("  ") && $0.contains(marker) }, output)
+        return line.trimmingCharacters(in: .whitespaces)
+    }
+
+    /// The words bash and zsh (the default login shell) read from a pasted
+    /// command line; set -- only assigns them, nothing runs.
+    private func pastedWords(of line: String) throws -> [String] {
+        var read: [[String]] = []
+        for shell in [["/bin/bash"], ["/bin/zsh", "-f"]] {
+            let r = try fx.runTool(shell[0], Array(shell.dropFirst()) + ["-c", #"eval "set -- $1" && printf '%s\n' "$@""#, "sh", line])
+            XCTAssertEqual(r.status, 0, "\(shell[0]): \(r.output)")
+            read.append(r.output.split(separator: "\n").map(String.init))
+        }
+        XCTAssertEqual(read[0], read[1], "bash and zsh read the same words from \(line)")
+        return read[0]
     }
 
     /// An upgrade whose new agent cannot load: the previous plist is reloaded
@@ -1633,7 +1684,7 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(try fx.contents(of: fx.appsDir), ["Insomnia.app"], "the staged build is discarded")
         XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "trusted")
         XCTAssertTrue(r.stderr.contains("(launchctl print: unknown:1), so the app at \(fx.app.path) was not replaced"), r.stderr)
-        XCTAssertTrue(r.stderr.contains("launchctl bootstrap gui/\(fx.uid) '\(fx.plist.path)'"), "how to reload the previous job if it is gone: \(r.stderr)")
+        XCTAssertTrue(r.stderr.contains("  launchctl bootstrap gui/\(fx.uid) \(fx.plist.path)\n"), "how to reload the previous job if it is gone: \(r.stderr)")
         XCTAssertTrue(r.stderr.contains("unknown"), r.stderr)
         XCTAssertFalse(r.stderr.contains("No LaunchAgent"), "ambiguous is not absent: \(r.stderr)")
         XCTAssertFalse(r.stderr.contains("every minute"), r.stderr)
@@ -2521,6 +2572,23 @@ private final class ScriptFixture {
         return (p.terminationStatus,
                 (try? String(contentsOf: outURL, encoding: .utf8)) ?? "",
                 (try? String(contentsOf: errURL, encoding: .utf8)) ?? "")
+    }
+
+    /// Runs a real tool (not a script) with the fixture's environment, here
+    /// the shells that read back a command install.sh prints for pasting.
+    func runTool(_ exe: String, _ args: [String]) throws -> (status: Int32, output: String) {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: exe)
+        p.arguments = args
+        p.environment = childEnvironment
+        p.currentDirectoryURL = root
+        let out = Pipe()
+        p.standardOutput = out
+        p.standardError = out
+        try p.run()
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        return (p.terminationStatus, String(decoding: data, as: UTF8.self))
     }
 
     /// Holds the recovery lock from another process, the way a running app
