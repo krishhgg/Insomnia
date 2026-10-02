@@ -9,7 +9,7 @@
       "id": "journal-before-change",
       "severity": "high",
       "scope": ["Sources/Insomnia/Core/**", "Sources/Insomnia/System/**", "scripts/backstop.sh"],
-      "rule": "Any change to power state (sudo pmset disablesleep or lowpowermode), to another process (SIGSTOP), to audio output (volume or mute), or to display or keyboard brightness is written to state.json first, through Store.saveState (the journal helper in SessionManager), and that write has returned without error before the change is made. If the write fails the change is not made. The one exception is NSAppSleepDisabled in AppNap.swift, which docs/spec.md section 5 leaves unjournaled and persistent on purpose."
+      "rule": "Any change to power state (sudo pmset disablesleep or lowpowermode), to another process (SIGSTOP), to audio output (volume or mute), to display or keyboard brightness, or to another app's NSAppSleepDisabled (AppNap.swift, opt-in) is written to state.json first, through Store.saveState (the journal helper in SessionManager), and that write has returned without error before the change is made. If the write fails the change is not made."
     },
     {
       "id": "journal-cleared-only-after-confirmed-undo",
@@ -63,7 +63,7 @@
       "id": "scripts-call-tools-through-fixed-path-variables",
       "severity": "high",
       "scope": ["scripts/**/*.sh"],
-      "rule": "Every tool that changes the machine or reads process, power or launchd state is called through the absolute-path variable declared at the top of the script (PMSET, SUDO, PLUTIL, LOCKF, PS, KILL, SYSCTL, PGREP, OSASCRIPT, LAUNCHCTL, CODESIGN, SWIFT, SWIFTC, ICONUTIL), never by bare name through PATH. A new tool gets a new variable in that block, because RecoveryScriptTests and PackagingTests patch exactly those lines in a private copy of the script to substitute fakes."
+      "rule": "Every tool that changes the machine or reads process, power or launchd state is called through the absolute-path variable declared at the top of the script (PMSET, SUDO, PLUTIL, LOCKF, PS, KILL, SYSCTL, PGREP, OSASCRIPT, LAUNCHCTL, CODESIGN, SWIFT, SWIFTC, ICONUTIL), never by bare name through PATH. A new tool gets a new variable in that block, because RecoveryScriptTests and PackagingTests patch exactly those lines in a private copy of the script to substitute fakes. A script's own bounded-call helper may signal the child it started with the shell builtin `kill`; every signal to a process the script did not start goes through `$KILL`."
     },
     {
       "id": "sudoers-rule-is-four-exact-lines",

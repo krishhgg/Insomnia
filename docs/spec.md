@@ -55,6 +55,7 @@ RuntimeState {                // everything Insomnia changed and must undo
   savedDisplayBrightness:  Float?  // nil when darkening is off or lid is open
   savedKeyboardBrightness: Float?  // nil when there is no backlight, too
   displayRestoredUnderLowPower: Float?  // restored on open under our Low Power Mode; written again when it ends
+  appNapOverrides:    [{bundleId, previous?}]  // previous absent when the app had no NSAppSleepDisabled key
 }
 ```
 
@@ -228,12 +229,32 @@ last held while it was on was the battery or thermal floor, not the lid.
 - Built-in protection (section 4): the same editors, agent hosts, terminals,
   browsers, VPN and local model runtimes are protected from the automatic
   lid-close scope even on an install whose config.json predates these
-  defaults and never lists them. Only the agent list also disables App Nap;
-  only an explicit freeze-list entry overrides the built-in protection.
-- On session start Insomnia sets `NSAppSleepDisabled = YES` for each listed app
-  so App Nap never throttles them. This is a persistent per-app default and is
-  left in place after session end and uninstall. This changes the affected
-  apps' behavior outside an Insomnia session too.
+  defaults and never lists them. Only the agent list can also turn App Nap
+  off; only an explicit freeze-list entry overrides the built-in protection.
+- Turning App Nap off is opt-in (`disableAppNapForAgents`, default off). With
+  it off Insomnia never writes another app's preferences. With it on, session
+  start reads each listed app's `NSAppSleepDisabled`, journals the previous
+  value (absent, true or false) in `appNapOverrides`, and only then writes
+  `YES`. A journal write failure means no preference write. An app whose key
+  is already `YES` is skipped: there is nothing to put back. So is an entry
+  `defaults` would not read as that app's domain (a leading `-`, a path,
+  `NSGlobalDomain`, anything but ASCII letters, digits, `.`, `-` and `_`),
+  since the backstop could not put it back; it is logged. Session end,
+  reconcile, the backstop and uninstall write the recorded value back
+  (`defaults delete` when it was absent) and clear the entry only after that
+  write succeeded. Settings shows the toggle, the list of apps it affects,
+  and what it changes.
+- Values written by builds before this were never recorded and are not
+  guessed at: uninstall reads the key for every app on the shipped agent
+  list and on config.json's (an app taken off the list may still carry one),
+  lists each whose key is `YES` with no journal entry, prints the
+  shell-quoted `defaults delete` command for it, and continues. The summary
+  says how many apps were checked; an app whose key cannot be read is
+  reported, not counted. Each read has a 30 s limit, like every other call
+  uninstall makes under the recovery lock (`pgrep`, `launchctl`); a read
+  that does not answer ends the check with the command to run by hand, and
+  uninstall goes on. A call past its limit gets SIGTERM, then SIGKILL, and
+  never holds the lock.
 - Browser throttling: Chromium browsers throttle windows macOS reports as
   occluded, which is every window once the lid is closed with no external
   display. Timers drop to 1 Hz, animation frames stop, pages report hidden.
@@ -280,7 +301,7 @@ IOKit sends no event for a read that keeps failing.
 | condition | action | undo |
 |---|---|---|
 | battery below `lowPowerFloor` (default 40%) | `pmset -b lowpowermode 1` | charger connected, or session end |
-| battery below `endFloor` (default 10%) | end session, notify | — |
+| battery below `endFloor` (default 10%; 0 turns the end off) | end session, notify | — |
 | battery present but unreadable on two consecutive reads, on battery, `endFloor` above 0 | end session, notify | — |
 | thermal state `serious` | `lowpowermode 1` | thermal back to `nominal`/`fair`, or session end |
 | thermal state `critical` | end session, notify | — |
@@ -300,6 +321,14 @@ menu's own refresh reads the level but leaves the count where it is, so a
 menu opened during a transient miss is not the second one, and the count
 never moves without the floor rules running. An unreadable level never counts
 as below a floor, so it does not enable Low Power Mode by itself.
+
+A non-zero `endFloor` stays below `lowPowerFloor`, which gives Low Power Mode
+a chance to come on before the session ends. It is not a guarantee: a reading
+already below both floors, or one that crosses both between evaluations, ends
+the session without it. Settings enforces the order in 5% steps by moving the
+other floor when the two would cross (`endFloor` at most 95). A `config.json`
+that violates it is corrected at load by raising `lowPowerFloor` to `endFloor`
++ 5 (capped at 100), logged, and written back.
 
 Insomnia does not enable Low Power Mode merely because a session starts; the
 causes are the battery floor, a serious thermal state, and (by default) a closed
@@ -348,7 +377,8 @@ Invariants:
 Reconcile runs at every Insomnia launch:
 
 1. Session file missing or expired → restore journaled changes: sleep,
-   verified owned processes, Low Power Mode if we set it, and saved audio.
+   verified owned processes, Low Power Mode if we set it, saved audio, and
+   recorded App Nap values.
    Unverified entries and failed restoration remain unresolved, not successful.
 2. Session valid → establish the independent recovery agent before reapplying
    the sleep guard, then resume observers. If the lid is open, restore recorded
@@ -374,6 +404,11 @@ Backstop, independent of the app:
 - The shell does not restore CoreAudio settings. Saved audio must remain in
   the journal for the app to restore. Uninstall must preserve recovery tools
   and state when restoration is incomplete, including saved audio.
+- The shell puts `appNapOverrides` back with `defaults write <id>
+  NSAppSleepDisabled -bool <previous>` or `defaults delete` when the key was
+  absent. A delete that fails counts as done only when `defaults read` then
+  says the key does not exist; a read that succeeds or fails any other way
+  keeps the entry.
 - The agent is a recovery mechanism, not a guarantee of crash/reboot behavior
   or a replacement for battery/thermal observers. These scenarios require
   the separate hardware validation record.
@@ -394,11 +429,37 @@ small settings window:
 - presets, default preset
 - freeze list (bundle ids), freeze every other app on/off, Docker rule
   on/off, mute on lid close on/off
-- agent list (bundle ids)
+- agent list (bundle ids), turn App Nap off for them on/off (default off)
 - `lowPowerFloor`, `endFloor`, thermal rules on/off
 - hotspot SSID (password entered once, stored in Keychain), `nudgeThreshold`
 - tmux targets
-- launch at login (`SMAppService.mainApp`)
+- launch at login (`SMAppService.mainApp`). macOS ties the login item to
+  the bundle's signature and location, and `install.sh` ad-hoc signs a
+  fresh bundle on every run, so an upgrade can drop the registration.
+  config.json keeps `launchAtLoginInstall`, the code directory hash,
+  bundle path and executable file identity (inode and birth time) of the
+  install whose registration macOS last accepted. install.sh deletes the
+  bundle and copies the executable in fresh, so even an unchanged or
+  unsigned build reinstalled at the same path reads as a new install. At
+  launch, with the flag on and `SMAppService.mainApp.status` neither
+  enabled nor waiting for approval, that record decides: a different
+  install means the reinstall lost the registration and the app registers
+  again; the same install means the user removed the item in System
+  Settings, and the app turns the flag off rather than put it back; no
+  record (a config from before the field) means this is the first launch
+  of a build that keeps one, itself a reinstall, so the app registers once
+  and records the install. A user who removed the item while Insomnia's
+  switch stayed on gets it back that once.
+  Every outcome is logged. The Settings switch shows what macOS has on
+  file (enabled or waiting for approval), not the flag; a registration
+  waiting for approval shows a note with a button that opens System
+  Settings > General > Login Items, and turning the switch off withdraws
+  it; a register or unregister that throws shows its error under the
+  switch. The flag and the install are persisted only when macOS accepted
+  the change. The status is re-read when the Settings window appears and
+  whenever the app becomes active, so an approval or removal made in
+  System Settings shows without a relaunch. With the flag off nothing is
+  registered or unregistered at launch.
 
 ### 11. Menu bar UI: inline time entry
 
@@ -639,10 +700,19 @@ that any case passed; record results in the release validation record.
     during a session; the log shows `lid SIMULATED closed (file trigger)`.
     Quit while closed → both restored. Force-quit while closed, reopen the app
     → restored at reconcile, and `backstop.sh` alone leaves both keys in place.
+14. **App Nap.** With the setting on and Terminal on the agent list, `defaults
+    delete com.apple.Terminal NSAppSleepDisabled`, start a session → `defaults
+    read` shows 1 and `state.json` has an `appNapOverrides` entry without
+    `previous`. End → the key is gone, entry gone. Repeat with the key set to
+    0 → put back to 0. Force-quit during a session → `backstop.sh` alone puts
+    it back. Set the key to 1 by hand, empty `appNapOverrides`, run
+    `uninstall.sh` → it prints the `defaults delete` command and continues.
 
 ## Open decisions (defaults chosen, change if you disagree)
 
 - `pmset -a` (all power sources) rather than `-b` for `disablesleep`, so
   behaviour is identical whether or not a charger is attached.
 - Default `lowPowerFloor` 40%, `endFloor` 10%, `nudgeThreshold` 90 s.
-- App Nap defaults are left set after a session ends.
+- Turning App Nap off for agent apps is opt-in and the previous value is put
+  back at session end. Values older builds wrote without a record are listed
+  by uninstall, never deleted by it.

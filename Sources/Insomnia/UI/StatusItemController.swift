@@ -27,6 +27,10 @@ final class StatusItemController: NSObject {
     /// Asks before a browser is quit for a relaunch; true means go ahead.
     /// Injected so tests never see the NSAlert.
     private let confirmRelaunch: @MainActor (String) -> Bool
+    /// What the projected countdown reads the time from. Tests inject the
+    /// manager's fake clock so the text does not depend on when the tick
+    /// happens to run.
+    private let clock: @Sendable () -> Date
 
     private let statusItem: NSStatusItem
     private var hostingView: StatusHostingView?
@@ -65,13 +69,15 @@ final class StatusItemController: NSObject {
         status: any StatusSource,
         showSettings: @escaping () -> Void,
         makeWidthWriter: WidthWriterFactory? = nil,
-        confirmRelaunch: (@MainActor (String) -> Bool)? = nil
+        confirmRelaunch: (@MainActor (String) -> Bool)? = nil,
+        clock: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.manager = manager
         self.status = status
         self.showSettings = showSettings
         self.makeWidthWriter = makeWidthWriter
         self.confirmRelaunch = confirmRelaunch ?? Self.askBeforeRelaunch
+        self.clock = clock
         Self.seedPreferredPositionIfNeeded()
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.autosaveName = Self.autosaveName
@@ -491,7 +497,7 @@ final class StatusItemController: NSObject {
         // (`startErrorShown`), not cleared: its text keeps the label's room
         // in the layout until the slots leave, so the bar is written once,
         // then, and never under the folding pills.
-        let now = Date()
+        let now = clock()
         if mode == .extend, let s = manager.session {
             // The session is live, so the countdown stays up. Project the
             // session so the countdown already has the final shape while the
@@ -576,7 +582,9 @@ final class StatusItemController: NSObject {
 
     /// 1 Hz redraw of the projected countdown, aligned to whole wall-clock
     /// seconds like the manager's live one. Runs only while the phase is
-    /// `.starting`; stopped on confirmation, refusal or reopening.
+    /// `.starting`; stopped on confirmation, refusal or reopening. The timer
+    /// runs on the real run loop, so it is scheduled from `Date()`; the text
+    /// it draws reads `clock`.
     private func armPendingTick() {
         stopPendingTick()
         let first = SessionMath.nextSecondBoundary(after: Date())
@@ -598,7 +606,7 @@ final class StatusItemController: NSObject {
             stopPendingTick()
             return
         }
-        model.pendingCountdown = projection.countdown(at: Date())
+        model.pendingCountdown = projection.countdown(at: clock())
     }
 
     // MARK: Session actions

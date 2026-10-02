@@ -152,6 +152,11 @@ The defaults are worth knowing:
   until it is readable again. A desktop has no battery and no floor. Serious
   thermal state requests Low Power Mode; critical thermal state ends the
   session. These rules require the app to be running.
+  Setting the end floor to 0 turns the battery end off. Otherwise the end
+  floor stays below the Low Power Mode floor. The Settings steppers move the
+  other floor when the two would cross, and a hand-edited `config.json` with
+  the floors out of order is corrected at launch, and logged, by raising the
+  Low Power Mode floor.
 
 To exercise the lid actions without closing the lid, run
 `scripts/simulate-lid.sh closed` and then `scripts/simulate-lid.sh open` during
@@ -201,8 +206,11 @@ installation scenarios still need [release validation](docs/release-validation.m
   Ending an Insomnia session sets it to 0 whoever set it.
 - **Low Power Mode:** Insomnia checks the existing setting so it does not
   claim ownership of an already-enabled preference.
-- **App Nap:** preferences applied to configured agent apps intentionally
-  persist after session end and uninstall.
+- **App Nap:** off by default. When the setting is on, Insomnia journals each
+  agent app's previous `NSAppSleepDisabled` value before writing it and puts
+  it back at session end, in the backstop, and in uninstall. Values an older
+  build wrote without a record are not guessed at: uninstall prints the
+  `defaults delete` command for each one and continues.
 - **Uninstall:** refuses to remove recovery machinery while unresolved changes
   remain. A failed uninstall is not confirmation that power settings are normal.
 
