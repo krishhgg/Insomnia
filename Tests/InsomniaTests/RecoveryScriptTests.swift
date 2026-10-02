@@ -511,6 +511,25 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(r.stdout.contains("Kept \(fx.home.appendingPathComponent("Logs").path)"), r.stdout)
     }
 
+    func testUninstallPurgeKeepsADirectoryNamedLikeARotatedLogAndFinishes() throws {
+        try fx.installMachinery()
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        let rotatedDir = fx.home.appendingPathComponent("Logs/insomnia.log.1", isDirectory: true)
+        try FileManager.default.createDirectory(at: rotatedDir, withIntermediateDirectories: true)
+        try "theirs".write(to: rotatedDir.appendingPathComponent("a.txt"), atomically: true, encoding: .utf8)
+        try "older lines\n".write(to: fx.home.appendingPathComponent("Logs/handoffs.log.1"), atomically: true, encoding: .utf8)
+
+        let r = try fx.run(fx.uninstall, ["--purge"])
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertTrue(r.stdout.contains("Kept \(rotatedDir.path): it is a directory"), r.stdout)
+        XCTAssertTrue(r.stdout.hasSuffix("Done.\n"), r.stdout)
+        XCTAssertTrue(fx.exists(rotatedDir.appendingPathComponent("a.txt")))
+        for gone in [fx.state, fx.config, fx.logFile, fx.home.appendingPathComponent("Logs/handoffs.log.1")] {
+            XCTAssertFalse(fx.exists(gone), gone.path)
+        }
+    }
+
     // MARK: - Owner-only files
 
     /// `umask 077`: the log and its directory, the lock file and the
