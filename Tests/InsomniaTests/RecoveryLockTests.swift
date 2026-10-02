@@ -73,7 +73,8 @@ final class RecoveryLockTests: XCTestCase {
 
         XCTAssertNil(try lock.tryAcquire(), "flock did not see the lock lockf holds")
         holder.terminate()
-        await holderExit.exited()
+        let exited = await holderExit.exited(within: 10)
+        XCTAssertTrue(exited, "the lockf holder did not exit within 10 s of SIGTERM")
         XCTAssertNotNil(try lock.tryAcquire())
     }
 }

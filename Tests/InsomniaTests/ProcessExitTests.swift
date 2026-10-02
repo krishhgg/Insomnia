@@ -40,7 +40,9 @@ final class ProcessExitTests: XCTestCase {
             let childExit = ProcessExit(p)
             try p.run()
             try await Task.sleep(for: .milliseconds(5))
-            try await Self.awaitExit(childExit)
+            guard await childExit.exited(within: 10) else {
+                return XCTFail("exited() did not return within 10 s")
+            }
             XCTAssertEqual(p.terminationStatus, 3)
             XCTAssertEqual(p.terminationReason, .exit)
         }
@@ -56,7 +58,9 @@ final class ProcessExitTests: XCTestCase {
         }
         XCTAssertFalse(p.isRunning, "the child did not exit within 10 s")
         try await Task.sleep(for: .milliseconds(50))
-        try await Self.awaitExit(childExit)
+        guard await childExit.exited(within: 10) else {
+            return XCTFail("exited() did not return within 10 s")
+        }
         XCTAssertEqual(p.terminationStatus, 4)
     }
 
@@ -67,19 +71,19 @@ final class ProcessExitTests: XCTestCase {
         let p = Self.process("/bin/sleep", ["30"])
         let childExit = ProcessExit(p)
         try p.run()
-        let blocking = DispatchGroup()
-        for _ in 0..<2 {
-            blocking.enter()
+        let blockingReturned = (0..<2).map { XCTestExpectation(description: "blocking waiter \($0) returned") }
+        for returned in blockingReturned {
             Thread {
                 childExit.wait()
-                blocking.leave()
+                returned.fulfill()
             }.start()
         }
         try await Task.sleep(for: .milliseconds(100))
         XCTAssertTrue(p.isRunning)
         p.terminate()
-        try await Self.awaitExit(childExit)
-        XCTAssertEqual(blocking.wait(timeout: .now() + 10), .success, "a blocking waiter did not return")
+        let exited = await childExit.exited(within: 10)
+        XCTAssertTrue(exited, "exited() did not return within 10 s")
+        await fulfillment(of: blockingReturned, timeout: 10)
         XCTAssertEqual(p.terminationReason, .uncaughtSignal)
         XCTAssertEqual(p.terminationStatus, SIGTERM)
     }
@@ -104,16 +108,20 @@ final class ProcessExitTests: XCTestCase {
         p.standardError = FileHandle.nullDevice
         return p
     }
+}
 
-    /// Awaits `exited()` under a 10 s limit.
-    private static func awaitExit(_ childExit: ProcessExit) async throws {
-        try await withThrowingTaskGroup(of: Bool.self) { group in
-            group.addTask { await childExit.exited(); return true }
-            group.addTask { try await Task.sleep(for: .seconds(10)); return false }
-            let exited = try await group.next() ?? false
-            group.cancelAll()
-            if !exited { XCTFail("exited() did not return within 10 s") }
+extension ProcessExit {
+    /// Awaits `exited()` for at most `seconds` and says whether it returned.
+    /// The await runs in an unstructured task that nothing waits on, so if
+    /// `exited()` never resumes, the caller still gets `false` at the limit
+    /// instead of hanging the suite.
+    func exited(within seconds: TimeInterval) async -> Bool {
+        let returned = XCTestExpectation(description: "exited() returned")
+        Task {
+            await exited()
+            returned.fulfill()
         }
+        return await XCTWaiter().fulfillment(of: [returned], timeout: seconds) == .completed
     }
 }
 
