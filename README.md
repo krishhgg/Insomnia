@@ -79,7 +79,10 @@ An upgrade asks the running app to quit and stops if it refuses. A process
 is matched by its executable path (the installed bundle) or by its bundle id,
 not by its name, so the Insomnia API client, whose executable is also named
 Insomnia, is reported and left alone. A process named Insomnia whose bundle id
-cannot be read counts as this app and blocks the upgrade until it exits. A
+cannot be read counts as this app and blocks the upgrade until it exits. Once
+the installer holds the recovery lock it reads no Info.plist, so a bundle on a
+stalled volume cannot hold the lock; a process it first sees then counts as
+unverified and blocks. A
 copy running in another account, or a process there that cannot be told apart
 from one, stops the install before the sudoers rule is replaced, since that
 copy may need the rule; it is named and never asked to quit. A
@@ -297,7 +300,8 @@ rule. If recovery is incomplete or the app refuses to quit, it stops and names
 the pid and executable path of the copy still running; resolve the reported
 problem and retry. A process named Insomnia with another bundle id (the
 Insomnia API client) is reported and left alone; one whose bundle id cannot be
-read blocks the uninstall until it exits. A copy running in another account stops
+read, or whose Info.plist does not answer within the uninstaller's time limit
+for a call, blocks the uninstall until it exits. A copy running in another account stops
 the uninstall before anything is removed, and is never asked to quit. The
 sudoers rule is one file for the whole Mac and names the account that installed
 last. The uninstaller reads it through sudo and removes it only when it is

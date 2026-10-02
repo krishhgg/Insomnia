@@ -66,6 +66,23 @@ UNVERIFIED=()     # "pid N (path; why)" per process of this account that could n
 OTHER_ACCOUNT=()  # "pid N (uid U, path)" per copy, or process that could not be told apart from one, in another account
 OTHER_FOUND=()    # "pid N (path, bundle id X)" per process proven to be another app
 BLOCKING=()       # the first three: what must be gone before files are touched
+# Bundle ids read before the recovery lock, as "bundle|id", reused under it.
+# Once the lock is held (PLIST_READS=0) no Info.plist is read: one on a
+# stalled volume would hold the lock, and this script has no time limit for
+# a call. A bundle first seen then counts as unverified and blocks.
+KNOWN_IDS=()
+PLIST_READS=1
+known_id() { # bundle
+  local entry
+  (( ${#KNOWN_IDS[@]} > 0 )) || return 0
+  for entry in "${KNOWN_IDS[@]}"; do
+    if [[ "${entry%|*}" == "$1" ]]; then
+      printf '%s\n' "${entry##*|}"
+      return 0
+    fi
+  done
+  return 0
+}
 find_insomnia() {
   local pid owner exe bundle id desc this
   APP_FOUND=(); UNVERIFIED=(); OTHER_ACCOUNT=(); OTHER_FOUND=(); BLOCKING=()
@@ -78,8 +95,18 @@ find_insomnia() {
     desc="${exe:-executable path unknown}"   # what the messages say; gains the reason when unverified
     if [[ "$exe" == /*/Contents/MacOS/* ]]; then
       bundle="${exe%/Contents/MacOS/*}"
-      id="$("$PLUTIL" -extract CFBundleIdentifier raw -o - "$bundle/Contents/Info.plist" 2>/dev/null || true)"
-      [[ -n "$id" ]] || desc="$exe; no bundle id readable from $bundle/Contents/Info.plist"
+      id="$(known_id "$bundle")"
+      if [[ -z "$id" ]] && (( PLIST_READS == 1 )); then
+        id="$("$PLUTIL" -extract CFBundleIdentifier raw -o - "$bundle/Contents/Info.plist" 2>/dev/null || true)"
+        if [[ -n "$id" ]]; then KNOWN_IDS+=("$bundle|$id"); fi
+      fi
+      if [[ -z "$id" ]]; then
+        if (( PLIST_READS == 1 )); then
+          desc="$exe; no bundle id readable from $bundle/Contents/Info.plist"
+        else
+          desc="$exe; first seen under the recovery lock, where no Info.plist is read"
+        fi
+      fi
     elif [[ -n "$exe" ]]; then
       desc="$exe; not inside an app bundle, so no bundle id to read"
     fi
@@ -233,6 +260,7 @@ if (( lock_rc != 0 )); then
   echo "Wait a minute and rerun. The app, $APP_SUPPORT/backstop.sh and $SUDOERS are installed; the LaunchAgent was not touched." >&2
   exit 75
 fi
+PLIST_READS=0
 if app_running; then
   echo "Insomnia started again ($(list "${BLOCKING[@]}")); quit it and rerun. The LaunchAgent was not touched." >&2
   exit 1

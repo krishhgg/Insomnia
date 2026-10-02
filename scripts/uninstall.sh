@@ -436,8 +436,16 @@ find_insomnia() {
     desc="${exe:-executable path unknown}"   # what the messages say; gains the reason when unverified
     if [[ "$exe" == /*/Contents/MacOS/* ]]; then
       bundle="${exe%/Contents/MacOS/*}"
-      id="$("$PLUTIL" -extract CFBundleIdentifier raw -o - "$bundle/Contents/Info.plist" 2>/dev/null || true)"
-      [[ -n "$id" ]] || desc="$exe; no bundle id readable from $bundle/Contents/Info.plist"
+      # Bounded like every other call here: this check also runs under the
+      # recovery lock, and an Info.plist on a stalled volume must not hold it.
+      rc=0
+      bounded "$PLUTIL" -extract CFBundleIdentifier raw -o - "$bundle/Contents/Info.plist" || rc=$?
+      (( rc == 0 )) && id="${BOUNDED_OUTPUT%%$'\n'*}"
+      if (( rc == 124 )); then
+        desc="$exe; $bundle/Contents/Info.plist did not answer within ${CALL_TIMEOUT_SECONDS}s"
+      elif [[ -z "$id" ]]; then
+        desc="$exe; no bundle id readable from $bundle/Contents/Info.plist"
+      fi
     elif [[ -n "$exe" ]]; then
       desc="$exe; not inside an app bundle, so no bundle id to read"
     fi

@@ -11,8 +11,9 @@ import XCTest
 /// defaults) and its app-bundle / sudoers paths rewritten to point inside
 /// the fixture, so nothing privileged runs, no real process is signaled, no
 /// real app's preferences are read or written, and no real home,
-/// LaunchAgent, sudoers file, or installed app is read or written. plutil,
-/// lockf, date, and id are the real tools. The fakes record every call.
+/// LaunchAgent, sudoers file, or installed app is read or written. lockf,
+/// date, and id are the real tools, and so is plutil behind a wrapper that
+/// records Info.plist reads. The other fakes record every call.
 final class RecoveryScriptTests: XCTestCase {
     private var fx: ScriptFixture!
 
@@ -1833,6 +1834,70 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(r.stdout.contains("not this app"), r.stdout)
         XCTAssertTrue(r.stdout.contains("Installed"), r.stdout)
         XCTAssertTrue(fx.exists(fx.plist))
+        let clientPlist = client.deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("Info.plist").path
+        XCTAssertEqual(fx.plistReads().filter { $0 == clientPlist }.count, 1, "read once before the lock and reused under it: \(fx.plistReads())")
+    }
+
+    /// Under the recovery lock install.sh reads no Info.plist: one on a
+    /// stalled volume would hold the lock, and install.sh has no time limit
+    /// for a call. A process first seen there counts as unverified, even
+    /// one whose bundle id would have shown another app, and stops the
+    /// install before the LaunchAgent is touched.
+    func testInstallReadsNoInfoPlistUnderTheRecoveryLock() throws {
+        try fx.prepareInstall()
+        try "trusted".write(to: fx.plist, atomically: true, encoding: .utf8)
+        fx.setMode("launchctl", "loaded")
+        let client = try fx.otherBundle(in: "Applications-foreign", bundleId: "com.insomnia.app")
+        let clientPlist = client.deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("Info.plist").path
+        // Not running before the sudoers step or at the quit step, running
+        // under the lock.
+        fx.setMode("pgrep", "1\n1\n0\n")
+        try fx.psComm([(4242, client.path)])
+
+        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertTrue(r.stderr.contains("Insomnia started again (pid 4242 (\(client.path); first seen under the recovery lock, where no Info.plist is read))"), r.stderr)
+        XCTAssertFalse(fx.plistReads().contains(clientPlist), "\(fx.plistReads())")
+        let calls = fx.calls()
+        XCTAssertFalse(calls.contains { $0.hasPrefix("launchctl") }, "\(calls)")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("sudo -n \(fx.fakePmset)") }, "\(calls)")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("osascript") }, "\(calls)")
+        XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "trusted")
+        XCTAssertTrue(try fx.lockIsFree())
+    }
+
+    /// uninstall.sh bounds its Info.plist read like every other call. A
+    /// read that never answers under the recovery lock (a bundle on a
+    /// stalled volume) is stopped after CALL_TIMEOUT_SECONDS without the
+    /// lock, the process counts as unverified, and nothing is removed.
+    func testUninstallTreatsAnInfoPlistThatDoesNotAnswerUnderTheLockAsUnverified() throws {
+        try fx.installMachinery()
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        let stalled = try fx.otherBundle(in: "Volumes/Stalled", bundleId: "com.kgarg.insomnia")
+        let plist = stalled.deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("Info.plist")
+        try fx.hangPlutil(on: plist)
+        fx.setMode("pgrep", "1\n0\n")   // not running at the quit step, then running under the lock
+        try fx.pgrepPids([5151])
+        try fx.psComm([(5151, stalled.path)])
+
+        let started = Date()
+        let r = try fx.run(fx.uninstall)
+        let elapsed = Date().timeIntervalSince(started)
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertLessThan(elapsed, 20)
+        XCTAssertTrue(r.stderr.contains("Insomnia started again (pid 5151 (\(stalled.path); \(plist.path) did not answer within 1s))"), r.stderr)
+        XCTAssertEqual(fx.plistReads(), [plist.path])
+        XCTAssertTrue(fx.hungProcessGone("plutil"))
+        let calls = fx.calls()
+        XCTAssertFalse(calls.contains("plutil FD9-OPEN"), "\(calls)")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("osascript") || $0.hasPrefix("kill") || $0.hasPrefix("pkill") }, "\(calls)")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("sudo") || $0.hasPrefix("launchctl") }, "\(calls)")
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, true)
+        XCTAssertTrue(fx.exists(fx.plist))
+        XCTAssertTrue(fx.exists(fx.app))
+        XCTAssertTrue(try fx.lockIsFree())
     }
 
     func testUninstallIgnoresAForeignProcessNamedInsomnia() throws {
@@ -2382,6 +2447,7 @@ private final class ScriptFixture {
             "LAUNCHCTL": bin.appendingPathComponent("launchctl").path,
             "SUDO": bin.appendingPathComponent("sudo").path,
             "DEFAULTS": bin.appendingPathComponent("defaults").path,
+            "PLUTIL": bin.appendingPathComponent("plutil").path,
             "APP": app.path,
             "SUDOERS": sudoers.path,
             "LOCK_TIMEOUT_SECONDS": "1",
@@ -2406,6 +2472,7 @@ private final class ScriptFixture {
             "SUDO": bin.appendingPathComponent("sudo").path,
             "CODESIGN": bin.appendingPathComponent("codesign").path,
             "SWIFT": bin.appendingPathComponent("swift").path,
+            "PLUTIL": bin.appendingPathComponent("plutil").path,
             "LOCK_TIMEOUT_SECONDS": "1",
         ])
         try patchedInstall.write(to: install, atomically: true, encoding: .utf8)
@@ -2640,6 +2707,20 @@ private final class ScriptFixture {
         fi
         exit "${first:-1}"
         """)
+        // plutil: runs the real tool. Each argument that is an app's
+        // Info.plist is appended to plutil.reads first, and a read of one
+        // listed in plutil.hang never answers, like a bundle on a stalled
+        // volume; see hangHere.
+        try writeFake("plutil", """
+        \(hangHere("plutil"))
+        for a in "$@"; do
+          if [[ "$a" == */Contents/Info.plist ]]; then
+            printf '%s\\n' "$a" >> "\(r)/plutil.reads"
+            if [[ -f "\(r)/plutil.hang" ]] && /usr/bin/grep -qxF -- "$a" "\(r)/plutil.hang"; then hang_here; fi
+          fi
+        done
+        exec /usr/bin/plutil "$@"
+        """)
         for tool in ["pkill", "osascript"] {
             try writeFake(tool, """
             printf '\(tool) %s\\n' "$*" >> "\(calls)"
@@ -2719,6 +2800,17 @@ private final class ScriptFixture {
         try probe.run()
         probe.waitUntilExit()
         return probe.terminationStatus == 0
+    }
+
+    /// Every app Info.plist the plutil wrapper was asked to read, in order.
+    func plistReads() -> [String] {
+        ((try? String(contentsOf: root.appendingPathComponent("plutil.reads"), encoding: .utf8)) ?? "")
+            .split(separator: "\n").map(String.init)
+    }
+
+    /// Makes every plutil read of `plist` hang.
+    func hangPlutil(on plist: URL) throws {
+        try (plist.path + "\n").write(to: root.appendingPathComponent("plutil.hang"), atomically: true, encoding: .utf8)
     }
 
     func setMode(_ name: String, _ value: String) {
