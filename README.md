@@ -273,10 +273,12 @@ swift build
 swift test
 ```
 
-CI runs Swift tests, a release build, and ShellCheck. tmux integration tests
-need tmux installed; check skip counts rather than assuming missing integration
-coverage passed. Tests use injected dependencies and temporary fixtures—not
-live installation or power changes on a contributor's machine.
+CI runs Swift tests, a release build with warnings as errors, a bash 3.2
+syntax check of the scripts, ShellCheck, and actionlint plus zizmor over the
+workflows. tmux integration tests need tmux installed; check skip counts
+rather than assuming missing integration coverage passed. Tests use injected
+dependencies and temporary fixtures—not live installation or power changes
+on a contributor's machine.
 
 The app icon keeps the eye-and-moon [vector geometry](Sources/Insomnia/UI/EyeMoonGeometry.swift); the menu bar shows a [closed eye](Sources/Insomnia/UI/EyeMarkGeometry.swift) that opens while a session runs.
 After changing the artwork, run `./scripts/generate-app-icon.sh` to regenerate
