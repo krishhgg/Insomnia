@@ -385,7 +385,33 @@ small settings window:
 - `lowPowerFloor`, `endFloor`, thermal rules on/off
 - hotspot SSID (password entered once, stored in Keychain), `nudgeThreshold`
 - tmux targets
-- launch at login (`SMAppService.mainApp`)
+- launch at login (`SMAppService.mainApp`). macOS ties the login item to
+  the bundle's signature and location, and `install.sh` ad-hoc signs a
+  fresh bundle on every run, so an upgrade can drop the registration.
+  config.json keeps `launchAtLoginInstall`, the code directory hash,
+  bundle path and executable file identity (inode and birth time) of the
+  install whose registration macOS last accepted. install.sh deletes the
+  bundle and copies the executable in fresh, so even an unchanged or
+  unsigned build reinstalled at the same path reads as a new install. At
+  launch, with the flag on and `SMAppService.mainApp.status` neither
+  enabled nor waiting for approval, that record decides: a different
+  install means the reinstall lost the registration and the app registers
+  again; the same install means the user removed the item in System
+  Settings, and the app turns the flag off rather than put it back; no
+  record (a config from before the field) means this is the first launch
+  of a build that keeps one, itself a reinstall, so the app registers once
+  and records the install. A user who removed the item while Insomnia's
+  switch stayed on gets it back that once.
+  Every outcome is logged. The Settings switch shows what macOS has on
+  file (enabled or waiting for approval), not the flag; a registration
+  waiting for approval shows a note with a button that opens System
+  Settings > General > Login Items, and turning the switch off withdraws
+  it; a register or unregister that throws shows its error under the
+  switch. The flag and the install are persisted only when macOS accepted
+  the change. The status is re-read when the Settings window appears and
+  whenever the app becomes active, so an approval or removal made in
+  System Settings shows without a relaunch. With the flag off nothing is
+  registered or unregistered at launch.
 
 ### 11. Menu bar UI: inline time entry
 

@@ -194,6 +194,21 @@ final class ConfigTests: XCTestCase {
         let data = try Store.makeEncoder().encode(c)
         XCTAssertEqual(try Store.makeDecoder().decode(Config.self, from: data), c)
     }
+
+    /// The install on file for the login item is absent in configs written
+    /// before it existed, decodes as nil, and round-trips when set.
+    func testLaunchAtLoginInstallIsOptional() throws {
+        XCTAssertNil(Config().launchAtLoginInstall)
+        let old = try Store.makeDecoder().decode(Config.self, from: Data(#"{"launchAtLogin": true}"#.utf8))
+        XCTAssertTrue(old.launchAtLogin)
+        XCTAssertNil(old.launchAtLoginInstall)
+
+        var c = Config()
+        c.launchAtLogin = true
+        c.launchAtLoginInstall = "0b1c@/Users/me/Applications/Insomnia.app"
+        let data = try Store.makeEncoder().encode(c)
+        XCTAssertEqual(try Store.makeDecoder().decode(Config.self, from: data), c)
+    }
 }
 
 /// SessionManager normalizes the floors when it loads config.json.
