@@ -365,19 +365,35 @@ final class ReconcileTests: XCTestCase {
             sleepGuard: real.guardFake,
             processControl: real.procs,
             backstop: real.backstop,
+            notifier: real.notifier,
+            clamshell: { false },
             clock: { Date() }
         )
         // Bypass clamping by writing a near-expired session and reconciling.
-        try real.store.saveSession(Session(startedAt: Date(), endsAt: Date().addingTimeInterval(1.5)))
+        // session.json keeps whole seconds, so a fractional deadline would
+        // come back up to a second earlier than written.
+        let endsAt = Date(timeIntervalSince1970: (Date().timeIntervalSince1970 + 2).rounded(.up))
+        try real.store.saveSession(Session(startedAt: Date(), endsAt: endsAt))
         await m.reconcile()
         XCTAssertTrue(m.isActive)
-        let deadline = Date().addingTimeInterval(8)
-        while m.isActive && Date() < deadline {
-            try await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(m.scheduledDeadline, endsAt)
+
+        // Wait for the end to finish, not for it to start: `isActive` goes
+        // false at the top of the end, before `disablesleep 0` and the
+        // journal write. The notification is the end's last step.
+        for _ in 0..<1000 where !real.notifier.posts.contains(where: { $0.title == "Session ended" }) {
+            try await Task.sleep(for: .milliseconds(10))
         }
+        // When the restore was called, not when this loop noticed it: a poll
+        // that resumes late would hide an end that came early.
+        let restoredAt = try XCTUnwrap(real.guardFake.restoreCalledAt, "the end never restored sleep")
+        XCTAssertGreaterThanOrEqual(restoredAt, endsAt, "the session ended before its deadline")
+        XCTAssertEqual(real.notifier.posts.last?.body, "Time is up. Sleep is back to normal.")
         XCTAssertFalse(m.isActive)
         XCTAssertNil(try real.store.loadSession())
-        XCTAssertEqual(real.guardFake.calls.last, "disablesleep 0")
+        XCTAssertEqual(try real.store.loadState(), RuntimeState.clean)
+        XCTAssertEqual(real.guardFake.calls, ["disablesleep 1", "disablesleep 0"])
+        XCTAssertFalse(real.guardFake.sleepDisabled)
     }
 
     // MARK: Unreadable session.json
