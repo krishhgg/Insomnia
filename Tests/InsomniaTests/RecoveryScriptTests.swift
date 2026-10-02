@@ -1104,12 +1104,20 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(r.stderr.contains("left as it was"), r.stderr)
         XCTAssertTrue(r.stderr.contains("not verified"), "no schedule claim from print alone: \(r.stderr)")
         XCTAssertFalse(r.stderr.contains("every minute"), r.stderr)
-        XCTAssertTrue(r.stderr.contains("backstop.sh\" --force"), "manual step named: \(r.stderr)")
+        XCTAssertTrue(r.stderr.contains("/scripts/backstop.sh\" --force"), "manual step named, the checkout's copy: \(r.stderr)")
         XCTAssertTrue(r.stderr.contains("not replaced"), r.stderr)
         XCTAssertEqual(try fx.installedBinaryFirstLine(), "previous", "the bundle the retained agent pins stays in place")
         XCTAssertEqual(try fx.contents(of: fx.appsDir), ["Insomnia.app"], "the staged build is discarded and nothing is set aside")
         XCTAssertTrue(r.stderr.contains("discarded"), r.stderr)
         XCTAssertTrue(try fx.lockIsFree(), "the transaction ends with the script")
+
+        // A zip install has no scripts/ directory; the hint names the copy sealed in the downloaded bundle.
+        let prebuilt = try fx.writePrebuiltApp()
+        let zip = try fx.run(fx.installRedirected, ["--allow-unverified-origin", "--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(zip.status, 1, zip.stderr + zip.stdout)
+        XCTAssertTrue(zip.stderr.contains("\"\(prebuilt.path)/Contents/Resources/backstop.sh\" --force"), "manual step names the sealed copy: \(zip.stderr)")
+        XCTAssertEqual(try fx.installedBinaryFirstLine(), "previous")
     }
 
     func testInstallDoesNotClaimAnAgentRetriesWhenNoneIsLoaded() throws {
@@ -1213,13 +1221,15 @@ final class RecoveryScriptTests: XCTestCase {
     /// The prebuilt bundle is checked before the password prompt and
     /// installed as it is: no build, the signature verified with --deep,
     /// the identifier and version read, then the usual steps with the same
-    /// agent plist a source install writes.
+    /// agent plist a source install writes. An ad-hoc bundle's origin cannot
+    /// be verified, so this takes --allow-unverified-origin and the installer
+    /// says what that means.
     func testInstallFromPrebuiltAppVerifiesItBeforeSudoAndInstallsItWithoutBuilding() throws {
         try fx.prepareInstall()
         let prebuilt = try fx.writePrebuiltApp()
         fx.setMode("launchctl", "loaded")
 
-        let r = try fx.run(fx.installRedirected, ["--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
+        let r = try fx.run(fx.installRedirected, ["--allow-unverified-origin", "--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
 
         XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
         let calls = fx.calls()
@@ -1229,7 +1239,8 @@ final class RecoveryScriptTests: XCTestCase {
         let visudo = try XCTUnwrap(calls.firstIndex { $0.hasPrefix("sudo visudo") }, "\(calls)")
         XCTAssertLessThan(verify, visudo, "verified before the password prompt: \(calls)")
         XCTAssertFalse(calls.contains { $0.hasPrefix("spctl") }, "Gatekeeper is asked about Developer ID builds only: \(calls)")
-        XCTAssertTrue(r.stdout.contains("Insomnia 0.1.0: ad-hoc signed, an experimental build"), r.stdout)
+        XCTAssertTrue(r.stdout.contains("WARNING: the origin of Insomnia 0.1.0 is not verified: ad-hoc signed, an experimental build"), r.stdout)
+        XCTAssertTrue(r.stdout.contains("--allow-unverified-origin: installing it anyway"), r.stdout)
         XCTAssertEqual(try String(contentsOf: fx.app.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "prebuilt")
         XCTAssertTrue(fx.exists(fx.installedBackstop))
         XCTAssertTrue(fx.exists(prebuilt), "the source bundle is copied, not moved")
@@ -1237,6 +1248,36 @@ final class RecoveryScriptTests: XCTestCase {
         let expected = LaunchdBackstop.plistDictionary(label: "com.insomnia.backstop", target: BackstopTarget(bundle: fx.app, requirement: fx.requirement))
         XCTAssertTrue(NSDictionary(dictionary: plist).isEqual(to: expected), "same agent as a source install: \(plist)")
         XCTAssertTrue(r.stdout.contains("Uninstall:"), r.stdout)
+    }
+
+    /// Integrity is not origin: an ad-hoc bundle, or a Developer ID bundle
+    /// while EXPECTED_TEAM_ID is empty, passes every check on it and could
+    /// still have been made by anyone. Without --allow-unverified-origin
+    /// install.sh refuses it before the password prompt and names the flag.
+    func testInstallFromPrebuiltAppRefusesAnUnverifiedOriginWithoutTheOptIn() throws {
+        try fx.prepareInstall()
+        let prebuilt = try fx.writePrebuiltApp()
+
+        let adhoc = try fx.run(fx.installRedirected, ["--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(adhoc.status, 1, adhoc.stderr + adhoc.stdout)
+        XCTAssertEqual(fx.calls(), ["codesign --verify --strict --deep \(prebuilt.path)", "codesign -dvv \(prebuilt.path)"], "\(fx.calls())")
+        XCTAssertTrue(adhoc.stderr.contains("The origin of Insomnia 0.1.0 at \(prebuilt.path) is not verified: ad-hoc signed"), adhoc.stderr)
+        XCTAssertTrue(adhoc.stderr.contains("--allow-unverified-origin --app \"\(prebuilt.path)\""), "names the flag: \(adhoc.stderr)")
+        XCTAssertTrue(adhoc.stderr.contains("Nothing was changed"), adhoc.stderr)
+        XCTAssertFalse(fx.exists(fx.app))
+        XCTAssertFalse(fx.exists(fx.sudoers))
+
+        fx.setSigning("developer-id:ABCDE12345")
+        fx.clearCalls()
+        let unpinnedTeam = try fx.run(fx.installRedirected, ["--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(unpinnedTeam.status, 1, unpinnedTeam.stderr + unpinnedTeam.stdout)
+        XCTAssertTrue(fx.calls().contains("spctl --assess --type execute \(prebuilt.path)"), "\(fx.calls())")
+        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("sudo") }, "\(fx.calls())")
+        XCTAssertTrue(unpinnedTeam.stderr.contains("Developer ID signed by team ABCDE12345 and Gatekeeper accepts it, but EXPECTED_TEAM_ID is empty"), unpinnedTeam.stderr)
+        XCTAssertTrue(unpinnedTeam.stderr.contains("Nothing was changed"), unpinnedTeam.stderr)
+        XCTAssertFalse(fx.exists(fx.app))
     }
 
     func testInstallFromPrebuiltAppStopsBeforeSudoWhenItsSignatureDoesNotVerify() throws {
@@ -1278,28 +1319,30 @@ final class RecoveryScriptTests: XCTestCase {
     }
 
     /// A Developer ID bundle must also pass Gatekeeper (notarized, not
-    /// revoked). The team is printed, and checked once EXPECTED_TEAM_ID is
-    /// set in install.sh.
+    /// revoked). Its team establishes origin only once EXPECTED_TEAM_ID is
+    /// set in install.sh: while it is empty the bundle takes
+    /// --allow-unverified-origin and the warning says why; another team is
+    /// refused even with the flag; the expected team installs without it.
     func testInstallFromDeveloperIDAppAsksGatekeeperAndChecksTheTeamWhenOneIsExpected() throws {
         try fx.prepareInstall()
         let prebuilt = try fx.writePrebuiltApp()
         fx.setSigning("developer-id:ABCDE12345")
         fx.setMode("launchctl", "loaded")
 
-        let unpinned = try fx.run(fx.installRedirected, ["--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
+        let unpinned = try fx.run(fx.installRedirected, ["--allow-unverified-origin", "--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
 
         XCTAssertEqual(unpinned.status, 0, unpinned.stderr + unpinned.stdout)
         XCTAssertTrue(fx.calls().contains("spctl --assess --type execute \(prebuilt.path)"), "\(fx.calls())")
-        XCTAssertTrue(unpinned.stdout.contains("Developer ID signed by team ABCDE12345"), unpinned.stdout)
+        XCTAssertTrue(unpinned.stdout.contains("WARNING: the origin of Insomnia 0.1.0 is not verified: Developer ID signed by team ABCDE12345"), unpinned.stdout)
         XCTAssertTrue(unpinned.stdout.contains("EXPECTED_TEAM_ID is empty"), "says the team is not checked: \(unpinned.stdout)")
 
         try fx.writeInstallCopies(extraConstants: ["EXPECTED_TEAM_ID": "ZZZZZ99999"])
         fx.clearCalls()
-        let wrongTeam = try fx.run(fx.installRedirected, ["--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
+        let wrongTeam = try fx.run(fx.installRedirected, ["--allow-unverified-origin", "--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
 
         XCTAssertEqual(wrongTeam.status, 1, wrongTeam.stderr + wrongTeam.stdout)
         XCTAssertFalse(fx.calls().contains { $0.hasPrefix("sudo") }, "\(fx.calls())")
-        XCTAssertTrue(wrongTeam.stderr.contains("signed by team 'ABCDE12345', not ZZZZZ99999"), wrongTeam.stderr)
+        XCTAssertTrue(wrongTeam.stderr.contains("signed by team 'ABCDE12345', not ZZZZZ99999"), "refused even with the flag: \(wrongTeam.stderr)")
         XCTAssertTrue(wrongTeam.stderr.contains("Nothing was changed"), wrongTeam.stderr)
 
         try fx.writeInstallCopies(extraConstants: ["EXPECTED_TEAM_ID": "ABCDE12345"])
@@ -1307,8 +1350,8 @@ final class RecoveryScriptTests: XCTestCase {
         let pinned = try fx.run(fx.installRedirected, ["--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
 
         XCTAssertEqual(pinned.status, 0, pinned.stderr + pinned.stdout)
-        XCTAssertTrue(pinned.stdout.contains("Developer ID signed by team ABCDE12345, Gatekeeper accepts it"), pinned.stdout)
-        XCTAssertFalse(pinned.stdout.contains("EXPECTED_TEAM_ID is empty"), pinned.stdout)
+        XCTAssertTrue(pinned.stdout.contains("Insomnia 0.1.0: Developer ID signed by team ABCDE12345, the team this install.sh expects, and Gatekeeper accepts it"), pinned.stdout)
+        XCTAssertFalse(pinned.stdout.contains("WARNING"), "origin verified, no opt-in needed: \(pinned.stdout)")
     }
 
     func testInstallFromDeveloperIDAppStopsBeforeSudoWhenGatekeeperRejectsIt() throws {
@@ -1358,6 +1401,13 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(r.status, 2, r.stderr + r.stdout)
         XCTAssertEqual(fx.calls(), [])
         XCTAssertTrue(r.stderr.contains("usage:"), r.stderr)
+
+        let flagAlone = try fx.run(fx.installRedirected, ["--allow-unverified-origin"], extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(flagAlone.status, 2, flagAlone.stderr + flagAlone.stdout)
+        XCTAssertEqual(fx.calls(), [])
+        XCTAssertTrue(flagAlone.stderr.contains("applies to --app only"), flagAlone.stderr)
+        XCTAssertFalse(fx.exists(fx.sudoers))
     }
 
     /// The writable copy of installs before the sealed layout is removed

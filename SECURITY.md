@@ -41,9 +41,13 @@ the app, and invoke the four pmset commands directly.
 Release zips are built by the Release workflow from the tagged commit and
 published with a `SHA256SUMS` file and a GitHub build provenance attestation.
 Verify both before installing (`shasum -a 256 -c SHA256SUMS`,
-`gh attestation verify <zip> -R krishhgg/Insomnia`); `install.sh --app` then
-checks the bundle's signature, identifier and version before asking for a
-password. The attestation shows which workflow run produced the bytes, not
+`gh attestation verify <zip> -R krishhgg/Insomnia --signer-workflow
+krishhgg/Insomnia/.github/workflows/release.yml --source-ref
+refs/tags/v<version>`); `install.sh --app` then checks the bundle's
+signature, identifier and version before asking for a password, and refuses
+a bundle whose origin it cannot verify (a Developer ID signature from the
+team pinned in the script) unless `--allow-unverified-origin` is given. The
+attestation shows which workflow run produced the bytes, not
 that the code is free of defects. Until Developer ID signing and notarization
 are set up (see [docs/releasing.md](docs/releasing.md)), releases are ad-hoc
 signed and macOS blocks their first launch.

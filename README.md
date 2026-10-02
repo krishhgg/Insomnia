@@ -50,22 +50,33 @@ built from the tagged commit.
 
    ```bash
    shasum -a 256 -c SHA256SUMS
-   gh attestation verify Insomnia-<version>-macos.zip -R krishhgg/Insomnia
+   gh attestation verify Insomnia-<version>-macos.zip -R krishhgg/Insomnia \
+     --signer-workflow krishhgg/Insomnia/.github/workflows/release.yml \
+     --source-ref refs/tags/v<version>
    ```
+
+   The second command checks that this repository's Release workflow built
+   this exact zip for that tag.
 
 3. Unzip and run the installer that comes in the zip:
 
    ```bash
    ditto -x -k Insomnia-<version>-macos.zip .
    cd Insomnia-<version>-macos
-   ./install.sh --app ./Insomnia.app
+   ./install.sh --allow-unverified-origin --app ./Insomnia.app
    open "$HOME/Applications/Insomnia.app"
    ```
 
+   `--allow-unverified-origin` says you ran the two commands in step 2. Until
+   releases are Developer ID signed by the team pinned in `install.sh`, the
+   installer can check that the bundle is intact but not who made it, so it
+   refuses to install without the flag. The release notes give the exact
+   command for each release.
+
 The installer checks the bundle's signature, identifier and version (and, for
-a Developer ID build, Gatekeeper's verdict) before it asks for anything. It
-then installs the app and a background recovery agent, and asks for
-administrator access to install a narrowly scoped sudoers rule. It grants
+a Developer ID build, Gatekeeper's verdict and the team) before it asks for
+anything. It then installs the app and a background recovery agent, and asks
+for administrator access to install a narrowly scoped sudoers rule. It grants
 **your user account**, not just Insomnia, passwordless access to four
 power-setting commands. Review that permission before installing.
 

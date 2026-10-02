@@ -17,10 +17,14 @@
 #   ./install.sh --app /path/to/Insomnia.app  installs a prebuilt bundle, such
 #                                             as the one in a release zip, after
 #                                             checking its signature, bundle
-#                                             identifier and version (and, for
-#                                             a Developer ID signature,
-#                                             Gatekeeper's verdict and the
-#                                             team). Nothing of this checkout
+#                                             identifier and version. Its origin
+#                                             counts as verified only when it is
+#                                             Developer ID signed by the team in
+#                                             EXPECTED_TEAM_ID and Gatekeeper
+#                                             accepts it; any other bundle is
+#                                             refused unless
+#                                             --allow-unverified-origin is given
+#                                             as well. Nothing of this checkout
 #                                             is needed then; the zip carries
 #                                             this script.
 # Either way the bundle is checked before the password prompt, so a bad build
@@ -55,8 +59,10 @@ LOCK_TIMEOUT_SECONDS=10
 # What a prebuilt bundle (--app) must be.
 BUNDLE_ID=com.kgarg.insomnia
 # Apple Team ID of the Developer ID that signs releases. Empty until the
-# maintainer sets up release signing (docs/releasing.md); while empty, a
-# Developer ID bundle is accepted from any team and the team is printed.
+# maintainer sets up release signing (docs/releasing.md). A Developer ID
+# bundle from this team, accepted by Gatekeeper, is the only bundle whose
+# origin --app treats as verified; while this is empty, every bundle needs
+# --allow-unverified-origin.
 EXPECTED_TEAM_ID=""
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -85,16 +91,23 @@ CANDIDATE=""
 CANDIDATE_DIR=""
 
 step() { printf '\n==> %s\n' "$*"; }
-usage() { echo "usage: $0 [--app /path/to/Insomnia.app]" >&2; }
+usage() { echo "usage: $0 [--app /path/to/Insomnia.app [--allow-unverified-origin]]" >&2; }
 
 PREBUILT=""
+ALLOW_UNVERIFIED_ORIGIN=0
 while (( $# )); do
   case "$1" in
     --app) [[ $# -ge 2 ]] || { usage; exit 2; }; PREBUILT="$2"; shift 2 ;;
+    --allow-unverified-origin) ALLOW_UNVERIFIED_ORIGIN=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown argument: $1" >&2; usage; exit 2 ;;
   esac
 done
+if (( ALLOW_UNVERIFIED_ORIGIN )) && [[ -z "$PREBUILT" ]]; then
+  echo "--allow-unverified-origin applies to --app only; a source build has no download to vouch for." >&2
+  usage
+  exit 2
+fi
 
 cleanup() {
   if [[ -n "$TMP_SUDOERS" ]]; then rm -f "$TMP_SUDOERS"; fi
@@ -137,27 +150,53 @@ if [[ -n "$PREBUILT" ]]; then
     echo "$PREBUILT has no Contents/Resources/backstop.sh; the recovery agent needs the sealed copy. Nothing was changed." >&2
     exit 1
   fi
+  # Origin. The checks above show the bundle is intact, not where it came
+  # from: anyone can ad-hoc sign a bundle with this identifier, and while
+  # EXPECTED_TEAM_ID is empty no Developer ID team is expected either. Only
+  # a Developer ID signature from the expected team, with Gatekeeper's
+  # verdict (notarized, not revoked), establishes origin here. Everything
+  # else is installed only with --allow-unverified-origin, after the user
+  # verified the download with SHA256SUMS and the attestation themselves.
   SIGNING="$("$CODESIGN" -dvv "$PREBUILT" 2>&1 || true)"
+  TEAM="$(sed -n 's/^TeamIdentifier=//p' <<<"$SIGNING" | head -n 1)"
+  origin=""
+  unverified=""
   if grep -q '^Authority=Developer ID Application' <<<"$SIGNING"; then
-    # A Developer ID build is meant to pass Gatekeeper: notarized, not revoked.
     if ! "$SPCTL" --assess --type execute "$PREBUILT"; then
       echo "$PREBUILT is Developer ID signed but Gatekeeper rejects it (not notarized, or the certificate was revoked). Nothing was changed." >&2
       exit 1
     fi
-    TEAM="$(sed -n 's/^TeamIdentifier=//p' <<<"$SIGNING" | head -n 1)"
-    if [[ -n "$EXPECTED_TEAM_ID" && "$TEAM" != "$EXPECTED_TEAM_ID" ]]; then
-      echo "$PREBUILT is signed by team '${TEAM:-<none>}', not $EXPECTED_TEAM_ID (the team this install.sh expects). Nothing was changed." >&2
-      exit 1
-    fi
     if [[ -n "$EXPECTED_TEAM_ID" ]]; then
-      echo "Insomnia $PREBUILT_VERSION: Developer ID signed by team $TEAM, Gatekeeper accepts it"
+      if [[ "$TEAM" != "$EXPECTED_TEAM_ID" ]]; then
+        echo "$PREBUILT is signed by team '${TEAM:-<none>}', not $EXPECTED_TEAM_ID (the team this install.sh expects). Nothing was changed." >&2
+        exit 1
+      fi
+      origin="Developer ID signed by team $TEAM, the team this install.sh expects, and Gatekeeper accepts it"
     else
-      echo "Insomnia $PREBUILT_VERSION: Developer ID signed by team ${TEAM:-<none>}, Gatekeeper accepts it (EXPECTED_TEAM_ID is empty in this install.sh, so the team is not checked)"
+      unverified="Developer ID signed by team ${TEAM:-<none>} and Gatekeeper accepts it, but EXPECTED_TEAM_ID is empty in this install.sh, so no team is expected and this one is not checked"
     fi
   else
-    echo "Insomnia $PREBUILT_VERSION: ad-hoc signed, an experimental build. The signature covers the bundle but names no developer,"
-    echo "so verify the download with SHA256SUMS and 'gh attestation verify' (README, Install). macOS blocks the first launch"
-    echo "of a downloaded ad-hoc build until you allow it in System Settings > Privacy & Security."
+    unverified="ad-hoc signed, an experimental build. The signature covers the bundle but names no developer, and anyone can ad-hoc sign a bundle with this identifier"
+  fi
+  if [[ -n "$origin" ]]; then
+    echo "Insomnia $PREBUILT_VERSION: $origin"
+  elif (( ALLOW_UNVERIFIED_ORIGIN )); then
+    echo "WARNING: the origin of Insomnia $PREBUILT_VERSION is not verified: $unverified."
+    echo "--allow-unverified-origin: installing it anyway. Its backstop.sh will run as you at login and every 60 s."
+    echo "Continue only if you checked the zip yourself with SHA256SUMS and 'gh attestation verify' (README, Install)."
+    if [[ "$unverified" == ad-hoc* ]]; then
+      echo "macOS blocks the first launch of a downloaded ad-hoc build until you allow it in System Settings > Privacy & Security."
+    fi
+  else
+    cat >&2 <<REFUSE
+The origin of Insomnia $PREBUILT_VERSION at $PREBUILT is not verified: $unverified.
+This install.sh cannot tell where the bundle came from, and installing it would run its backstop.sh as you
+at login and every 60 s. Nothing was changed.
+Verify the zip yourself first ('shasum -a 256 -c SHA256SUMS' and 'gh attestation verify' with --signer-workflow,
+see the README), then rerun with the flag that says so:
+  $0 --allow-unverified-origin --app "$PREBUILT"
+REFUSE
+    exit 1
   fi
   SOURCE_APP="$PREBUILT"
 else
@@ -370,6 +409,10 @@ schedule it runs was not verified here; check with 'launchctl print gui/$UID_NUM
     no) agent_note="No LaunchAgent $LABEL is loaded, so nothing retries by itself." ;;
     *) agent_note="'launchctl print gui/$UID_NUM/$LABEL' exited ${before#unknown:}, so whether a LaunchAgent is loaded is unknown." ;;
   esac
+  # The copy of backstop.sh the user can run by hand: a zip carries it only
+  # inside the bundle; a checkout has it under scripts/.
+  manual_backstop="$ROOT/scripts/backstop.sh"
+  if [[ -n "$PREBUILT" ]]; then manual_backstop="$PREBUILT/Contents/Resources/backstop.sh"; fi
   cat >&2 <<FAIL
 
 Install stopped: the backstop could not fully undo a previous session
@@ -380,7 +423,7 @@ $agent_note
 Check $LOG_DIR/insomnia.log and resolve what it reports (saved audio, display
 brightness or keyboard backlight needs the app; if one is installed: open
 "$APP"), or run the recovery by hand:
-  /bin/bash "$ROOT/scripts/backstop.sh" --force
+  /bin/bash "$manual_backstop" --force
 Then rerun this script to install the app and the LaunchAgent.
 FAIL
   exit 1

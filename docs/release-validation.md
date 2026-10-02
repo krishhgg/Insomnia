@@ -132,7 +132,7 @@ is performed. Do not replace "not run" with "passed" based on source review.
 | Running app refuses to arm (session start refused, reason shown) after its installed bundle is edited or re-signed under it | Not run |
 | Upgrade whose new agent fails to load puts the previous bundle back and reloads the previous agent, on a working Mac | Not run |
 | Upgrade whose new agent plist cannot be saved, and a rerun after an install killed mid-swap, leave the app and the agent's plist matching, on a working Mac | Not run |
-| Install from a release zip with `install.sh --app` on a working Mac, first launch of the downloaded app | Not run |
+| Install from a release zip with `install.sh --allow-unverified-origin --app` on a working Mac, first launch of the downloaded app | Not run |
 | Release workflow end to end: tag push, tests, package, attestation, GitHub Release, `gh attestation verify` of the download | Not run |
 | Developer ID signing, notarization and stapling in the Release workflow | Not run |
 
