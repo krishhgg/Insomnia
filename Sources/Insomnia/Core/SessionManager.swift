@@ -70,6 +70,17 @@ final class SessionManager {
     private(set) var remainingText: String = ""
     /// Live `H:MM:SS` countdown for the status item, updated at 1 Hz.
     private(set) var countdownText: String = ""
+
+    /// Why the display or the keyboard backlight is left alone on lid close
+    /// on this Mac (a macOS the private calls were not measured on, a
+    /// private class that no longer looks as measured). Empty when both run.
+    /// Shown in Settings next to the darken toggle.
+    var darkenRefusals: [String] {
+        [
+            display.refusal().map { "Display: \($0)." },
+            keyboard.refusal().map { "Keyboard backlight: \($0)." },
+        ].compactMap { $0 }
+    }
     /// Last failure worth showing in the menu; cleared on the next success.
     private(set) var lastError: String?
 

@@ -104,6 +104,21 @@ close journals the trusted value or the sample, leaves the keyboard alone when
 neither exists, and the open re-asserts the restore 2 s after the wake. Unit
 tests with fakes only; the hardware rows below are unchanged.
 
+Measured on October 1, 2026 on the same machine (macOS 26.2, 25C56, arm64),
+read-only through the Objective-C runtime, the `KeyboardBrightnessClient`
+instance method type encodings: `copyKeyboardBacklightIDs` `@16@0:8`,
+`isKeyboardBuiltIn:` `B24@0:8Q16`, `brightnessForKeyboard:` `f24@0:8Q16`,
+`setBrightness:forKeyboard:` `B28@0:8f16Q20`,
+`isBacklightSuppressedOnKeyboard:` `B24@0:8Q16`,
+`isBacklightDimmedOnKeyboard:` `B24@0:8Q16`. `DisplayPower.swift` now
+refuses the DisplayServices calls on any macOS major other than 26, and the
+keyboard class when a required method is missing or an encoding (offsets
+removed) differs from these; on an Intel Mac `BOOL` encodes as `c`, so the
+keyboard backlight is refused there until measured. A refused device is
+skipped at lid close, journals nothing, and is named in Settings. Unit tests
+with an injected version and fake classes only; the rows below stay "Not
+run", and the guards do not stand in for them.
+
 ## Hardware validation still required
 
 None of the cases below is certified by the automated regression suite. Record
@@ -117,6 +132,8 @@ is performed. Do not replace "not run" with "passed" based on source review.
 | Reboot/login with active or dirty journals | Not run |
 | Lid-close/open and safe recovery of explicitly selected test processes | Not run |
 | Lid-close display/keyboard darkening and restore | Not run |
+| Darkening still runs under the private-call guards on macOS 26 (close the lid during a session: the log shows "display darkened" and "keyboard backlight off" and no "refused" line; Settings shows no note under the darken toggle) | Not run |
+| Darkening refused on an unmeasured macOS version (a macOS major other than 26, or a `KeyboardBrightnessClient` whose methods changed: the log shows the "refused" line once and "skipped" at lid close, nothing is journaled for that device, and Settings names the reason under the darken toggle) | Not run |
 | Freeze-all scope with agents running (Cursor/T3 Code/Claude untouched) | Not run |
 | Simulated lid close/open via scripts/simulate-lid.sh | Not run |
 | Existing Low Power Mode preference and saved audio restoration | Not run |

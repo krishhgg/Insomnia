@@ -116,6 +116,22 @@ Quit, or reconcile.
 | Low Power Mode | on (optional, default on) | off unless a battery or thermal floor still wants it |
 | Countdown redraw | stop timer | restart timer |
 
+The display and keyboard rows go through private frameworks with no ABI
+contract: the DisplayServices C functions and CoreBrightness's
+`KeyboardBrightnessClient`. Two guards run once per launch, before the
+first call. The DisplayServices functions are called only on a macOS major
+version they were measured on (26, `DisplayPower.measuredDisplayServicesMajors`);
+a C symbol carries no type information, so on any other major the display
+is left alone until someone measures again. The `KeyboardBrightnessClient`
+methods are read through the Objective-C runtime and compared with the type
+encodings measured on macOS 26 (`DisplayPower.measuredKeyboardClientEncodings`,
+stack offsets removed); a missing required method or a changed encoding
+refuses the keyboard backlight before anything is instantiated. A refused
+device is skipped at lid close with a log line, nothing is journaled for
+it, and Settings shows the reason under the darken toggle. The guards
+narrow the risk of calling a private function whose shape changed; they do
+not replace the hardware rows in docs/release-validation.md.
+
 Freeze scope rules:
 
 - Two scopes. The explicit freeze list: apps the user picks by bundle id from
