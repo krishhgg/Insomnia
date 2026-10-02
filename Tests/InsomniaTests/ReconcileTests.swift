@@ -397,7 +397,7 @@ final class ReconcileTests: XCTestCase {
         XCTAssertFalse(m.isActive)
         XCTAssertNil(try real.store.loadSession())
         XCTAssertEqual(try real.store.loadState(), RuntimeState.clean)
-        XCTAssertEqual(real.guardFake.calls, ["disablesleep 1", "disablesleep 0"])
+        XCTAssertEqual(real.guardFake.calls, ["pmset -g", "disablesleep 0"])
         XCTAssertFalse(real.guardFake.sleepDisabled)
     }
 }
