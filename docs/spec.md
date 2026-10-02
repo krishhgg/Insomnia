@@ -685,7 +685,8 @@ that any case passed; record results in the release validation record.
     running as the user cannot replay the lid actions. CI proves that on
     the binaries: `scripts/check-lid-simulation-gate.sh` builds the release
     both ways and checks the watcher class and its log lines are absent
-    from the plain binary and present with the define.
+    from the plain binary and present with the define. A binary nm or
+    strings cannot read fails the check rather than counting as absent.
     Quit while closed → both restored. Force-quit while closed, reopen the app
     → restored at reconcile, and `backstop.sh` alone leaves both keys in place.
 14. **App Nap.** With the setting on and Terminal on the agent list, `defaults

@@ -25,13 +25,41 @@ plain="$("$SWIFT" build "${RELEASE_FLAGS[@]}" --show-bin-path)/Insomnia"
 sim="$("$SWIFT" build "${RELEASE_FLAGS[@]}" --scratch-path "$SIM_SCRATCH" -Xswiftc -DINSOMNIA_LID_SIMULATION --show-bin-path)/Insomnia"
 
 failed=0
+# Prints how many lines of $2 contain $1, as a fixed string when $3 is
+# "fixed". grep exits 1 when nothing matches, which is a count of 0; a
+# grep that fails any other way stops the check instead of reading as 0.
+count() { # pattern text [fixed]
+  local n rc=0
+  if [[ ${3:-} == fixed ]]; then
+    n=$(grep -c -F -e "$1" <<<"$2") || rc=$?
+  else
+    n=$(grep -c -e "$1" <<<"$2") || rc=$?
+  fi
+  if (( rc > 1 )); then
+    echo "grep failed with status $rc counting \"$1\"" >&2
+    return 1
+  fi
+  echo "$n"
+}
+
 check() { # label binary present|absent
-  local label=$1 bin=$2 expect=$3 n text ok=1
-  n=$(nm "$bin" | grep -c "$SYMBOL" || true)
+  local label=$1 bin=$2 expect=$3 symbols texts n text ok=1
+  # Read the binary before counting. Piped straight into grep -c, an nm or
+  # strings that cannot read it counts 0, which passes the "absent" check
+  # for a binary nobody inspected. A read that prints nothing fails too.
+  if ! symbols=$(nm "$bin") || [[ -z $symbols ]]; then
+    echo "$label: nm could not read the binary" >&2
+    exit 1
+  fi
+  if ! texts=$(strings "$bin") || [[ -z $texts ]]; then
+    echo "$label: strings could not read the binary" >&2
+    exit 1
+  fi
+  n=$(count "$SYMBOL" "$symbols") || exit 1
   echo "$label: $n symbol(s) of the watcher class"
   if [[ $expect == present && $n -eq 0 ]] || [[ $expect == absent && $n -gt 0 ]]; then ok=0; fi
   for text in "${TEXTS[@]}"; do
-    n=$(strings "$bin" | grep -c -F "$text" || true)
+    n=$(count "$text" "$texts" fixed) || exit 1
     echo "$label: $n occurrence(s) of \"$text\""
     if [[ $expect == present && $n -eq 0 ]] || [[ $expect == absent && $n -gt 0 ]]; then ok=0; fi
   done
