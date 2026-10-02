@@ -400,6 +400,15 @@ if [[ -f "$SESSION" ]]; then
   fi
 fi
 
+# Remove the record. Once its session.json is gone it ends nothing, but it
+# is still a copy of that session's times, so one that cannot be removed is
+# logged on every run until a person removes it. Never fails the caller.
+remove_end_record() {
+  rm -f "$ENDED" 2>/dev/null && return 0
+  log warn "could not remove $ENDED; it matches no session.json, so it ends nothing, but it stays until removed by hand (ls -lO shows its flags)"
+  return 0
+}
+
 # --- Was this session already ended? -----------------------------------------
 # A run or the app that ends a valid session but cannot remove session.json
 # records the end in $ENDED, a copy of the file's exact bytes (record_end).
@@ -412,7 +421,7 @@ if [[ -e "$ENDED" ]]; then
   if [[ -f "$SESSION" ]] && "$CMP" -s "$SESSION" "$ENDED"; then
     ended_before=1
   else
-    rm -f "$ENDED" 2>/dev/null || true
+    remove_end_record
   fi
 fi
 
@@ -564,7 +573,7 @@ fi
 # only while the file it copies is there. False when session.json stays.
 remove_session() {
   rm -f "$SESSION" 2>/dev/null || return 1
-  rm -f "$ENDED" 2>/dev/null || true
+  remove_end_record
 }
 
 # Record that the session in session.json is over: a copy of its exact bytes

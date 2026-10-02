@@ -637,6 +637,21 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(fx.exists(fx.endedSession))
     }
 
+    /// A stale record that cannot be removed ends nothing, but it is a copy
+    /// of a session's times, so every run says it is still there.
+    func testStaleEndRecordThatCannotBeRemovedIsLogged() throws {
+        try writeLiveSession()
+        try "{}".write(to: fx.endedSession, atomically: true, encoding: .utf8)
+        try setImmutable(fx.endedSession, true)
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+
+        try assertSessionKept(try fx.run(fx.backstop))
+
+        XCTAssertTrue(fx.exists(fx.endedSession))
+        XCTAssertTrue(fx.log().contains("could not remove \(fx.endedSession.path)"), fx.log())
+    }
+
     /// The relaunch the record exists for. The backstop ends the session of
     /// an app that died and cannot remove session.json. Insomnia launched
     /// afterwards finds a valid session.json, sees the record and restores
@@ -1474,10 +1489,12 @@ final class RecoveryScriptTests: XCTestCase {
         try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
         try "handoffs\n".write(to: fx.home.appendingPathComponent("Logs/handoffs.log"), atomically: true, encoding: .utf8)
 
+        try "{}".write(to: fx.endedSession, atomically: true, encoding: .utf8)
+
         let r = try fx.run(fx.uninstall, ["--purge"])
 
         XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
-        for gone in [fx.state, fx.config, fx.logFile, fx.home.appendingPathComponent("Logs/handoffs.log"),
+        for gone in [fx.state, fx.config, fx.endedSession, fx.logFile, fx.home.appendingPathComponent("Logs/handoffs.log"),
                      fx.installedBackstop, fx.plist, fx.app, fx.sudoers] {
             XCTAssertFalse(fx.exists(gone), gone.path)
         }
@@ -1487,6 +1504,23 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(try fx.contents(of: fx.home), [".recovery.lock"], "nothing but the lock remains")
         XCTAssertTrue(fx.exists(fx.appsDir))
         XCTAssertTrue(fx.exists(fx.bin), "nothing outside the Insomnia tree is deleted")
+    }
+
+    /// An end record that cannot be removed survives the purge, and the
+    /// purge says so instead of reporting everything gone.
+    func testUninstallPurgeReportsAnEndRecordItCannotRemove() throws {
+        try fx.installMachinery()
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        try "{}".write(to: fx.endedSession, atomically: true, encoding: .utf8)
+        try setImmutable(fx.endedSession, true)
+
+        let r = try fx.run(fx.uninstall, ["--purge"])
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertTrue(fx.exists(fx.endedSession))
+        XCTAssertTrue(r.stdout.contains("Kept \(fx.endedSession.path): it could not be removed"), r.stdout)
+        XCTAssertFalse(fx.exists(fx.state))
+        XCTAssertFalse(fx.exists(fx.config))
     }
 
     func testUninstallPurgeNeverDeletesFilesItDidNotCreate() throws {

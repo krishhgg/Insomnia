@@ -459,6 +459,25 @@ final class RecoverySafetyTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: h.home.paths.endedSessionFile.path))
     }
 
+    /// A record whose session.json is gone but that cannot be removed
+    /// itself is logged, not dropped silently. The end still completes.
+    func testAnEndRecordThatCannotBeRemovedIsLogged() async throws {
+        let m = h.makeManager()
+        await m.start(duration: 3600)
+        XCTAssertTrue(h.store.recordSessionEnd())
+        let record = h.home.paths.endedSessionFile
+        try setImmutable(record, true)
+        defer { try? setImmutable(record, false) }
+
+        let outcome = await m.end(reason: .user)
+
+        XCTAssertEqual(outcome, .restored)
+        XCTAssertNil(try h.store.loadSession())
+        XCTAssertTrue(FileManager.default.fileExists(atPath: record.path))
+        let log = (try? String(contentsOf: h.home.paths.logFile, encoding: .utf8)) ?? ""
+        XCTAssertTrue(log.contains("could not remove \(record.path)"), log)
+    }
+
     // MARK: Cross-process lock: fail closed
 
     /// The backstop holds the recovery lock. An end must change nothing:

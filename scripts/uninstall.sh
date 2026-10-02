@@ -66,6 +66,7 @@ fi
 LABEL="com.insomnia.backstop"
 PLIST="$LAUNCH_AGENTS/$LABEL.plist"
 SESSION="$APP_SUPPORT/session.json"
+ENDED="$APP_SUPPORT/ended-session.json"
 STATE="$APP_SUPPORT/state.json"
 CONFIG="$APP_SUPPORT/config.json"
 # The agent list the app ships with (Config.defaultAgentList in
@@ -497,10 +498,20 @@ fi
 step "Removing app bundle"
 rm -rf "$APP"
 
+# The record backstop.sh writes for a session it ended but could not remove
+# (record_end there). The backstop run above removes it with session.json, or
+# as stale; one still here could not be removed. It ends nothing by now, but
+# it is a copy of that session's times, so it is reported, not skipped.
+remove_end_record() {
+  rm -f "$ENDED" 2>/dev/null && return 0
+  echo "Kept $ENDED: it could not be removed (ls -lO shows its flags). It ends nothing; remove it by hand."
+}
+
 if (( PURGE == 1 )); then
   step "Purging Insomnia's files in $APP_SUPPORT and $LOG_DIR"
   rm -f "$SESSION" "$STATE" "$APP_SUPPORT/config.json" "$APP_SUPPORT/backstop.sh" \
         "$LOG_DIR/insomnia.log" "$LOG_DIR/handoffs.log"
+  remove_end_record
   # The lock file itself is kept, even on purge: this process still holds
   # it, and anything that opened it a moment ago (a queued agent run, an app
   # launched after the check above) waits on this inode. Unlinking it would
@@ -512,6 +523,7 @@ if (( PURGE == 1 )); then
   [[ -d "$LOG_DIR" ]] && echo "Kept $LOG_DIR: it still holds files Insomnia did not create."
 else
   rm -f "$APP_SUPPORT/backstop.sh" "$SESSION" "$STATE"
+  remove_end_record
   echo "Kept $APP_SUPPORT/config.json and $LOG_DIR (use --purge to remove)."
 fi
 

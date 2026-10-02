@@ -64,10 +64,15 @@ struct Store: Sendable {
     func saveSession(_ s: Session) throws { try write(s, to: paths.sessionFile) }
     /// Removes session.json, then the record of its end, which means
     /// something only while the file it copies is there. A record that
-    /// cannot be removed is left: it matches no later session.json.
+    /// cannot be removed is left and logged: it matches no later
+    /// session.json, but it is still a copy of the session's times.
     func deleteSession() throws {
         try remove(at: paths.sessionFile)
-        try? remove(at: paths.endedSessionFile)
+        do {
+            try remove(at: paths.endedSessionFile)
+        } catch {
+            Log.error("could not remove \(paths.endedSessionFile.path) (\(error.localizedDescription)); it matches no session.json, so it ends nothing, but it stays until removed by hand")
+        }
     }
 
     /// Whether session.json is a session already ended: ended-session.json
