@@ -204,8 +204,10 @@ installation scenarios still need [release validation](docs/release-validation.m
   time and boot session. The app journals each pid before it sends SIGSTOP,
   and sends nothing when that write fails. The identity is added only after
   the kernel confirms Insomnia's own stop, so a process somebody else had
-  stopped is never resumed. If the confirming write fails, the app resumes
-  what it just stopped. If the app dies between the stop and that write,
+  stopped is never resumed. If the confirming write fails, the app sends
+  SIGCONT at once to each pid it just stopped whose identity still matches,
+  even one that does not show as stopped yet: SIGCONT also cancels a stop
+  that is still pending. If the app dies between the stop and that write,
   the stopped pids stay journaled without identity, like entries from builds
   that recorded the pid alone, and are not automatically resumed while
   stopped. Verify the live process and whether it should be resumed; never

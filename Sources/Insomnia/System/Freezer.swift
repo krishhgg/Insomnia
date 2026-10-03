@@ -297,6 +297,8 @@ protocol Freezing: Sendable {
     func plan(config: Config) -> [FreezeGroup]
     func suspend(_ processes: [FrozenProcess], expectedParents: [Int32: Int32]) -> SuspendReport
     func resume(_ processes: [FrozenProcess]) -> ResumeReport
+    /// See `ProcessSignaling.cancelStops`.
+    func cancelStops(_ processes: [FrozenProcess]) -> ResumeReport
 }
 
 extension Freezing {
@@ -342,6 +344,7 @@ struct Freezer: Freezing {
         control.suspend(processes, expectedParents: expectedParents)
     }
     func resume(_ processes: [FrozenProcess]) -> ResumeReport { control.resume(processes) }
+    func cancelStops(_ processes: [FrozenProcess]) -> ResumeReport { control.cancelStops(processes) }
 
     static func runningApps() -> [RunningApp] {
         NSWorkspace.shared.runningApplications.map {

@@ -249,10 +249,15 @@ final class LidActions {
             }
         } catch {
             // Nothing on disk can resume these stops, but this run still
-            // knows they are Insomnia's: undo them now. The provisional
-            // entries stay without identity; on lid open a resumed pid is
-            // running and clears as gone, and a skipped one is never signaled.
-            let undo = freezer.resume(confirmed)
+            // knows they are Insomnia's: undo them now. cancelStops checks
+            // each identity again and sends SIGCONT even to a process that
+            // does not show as stopped yet, since its SIGSTOP may still be
+            // pending; resume would call that one running and skip it,
+            // leaving it to stop a moment later with nothing to resume it.
+            // The provisional entries stay without identity; on lid open a
+            // resumed pid is running and clears as gone, and a skipped one
+            // is never signaled.
+            let undo = freezer.cancelStops(confirmed)
             let stuck = undo.failed + undo.unverifiable + undo.unobserved
             Log.error("could not confirm freeze of \(group.bundleId) in the journal: \(error.localizedDescription); resumed \(undo.resumed.count) of the \(confirmed.count) pid(s) it had just stopped" + (stuck.isEmpty ? "" : "; pid(s) \(stuck.map(String.init).joined(separator: ", ")) are still stopped, journaled without identity"))
             return

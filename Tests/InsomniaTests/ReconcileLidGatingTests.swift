@@ -23,6 +23,7 @@ final class ReconcileLidGatingTests: XCTestCase {
         st.savedDisplayBrightness = 0.8
         st.savedKeyboardBrightness = 0.3
         try h.store.saveState(st)
+        h.procs.stoppedNow = [111, 222]
         return s
     }
 
@@ -82,6 +83,7 @@ final class ReconcileLidGatingTests: XCTestCase {
 
         XCTAssertEqual(m.session, s)
         XCTAssertEqual(h.procs.resumed, [[111, 222]])
+        XCTAssertEqual(h.procs.signaled, [111, 222])
         XCTAssertEqual(h.audio.applied.count, 1)
         XCTAssertEqual(h.audio.applied.first?.volume, 0.4)
         XCTAssertEqual(h.display.wakes, 1)
@@ -114,10 +116,12 @@ final class ReconcileLidGatingTests: XCTestCase {
         st.sleepDisabledByUs = true
         st.frozenProcesses = [FrozenProcess(pid: 111, startedAt: 5)]
         try h.store.saveState(st)
+        h.procs.stoppedNow = [111]
         h.clamshell.closed = true
         let m = h.makeManager()
         await m.reconcile()
         XCTAssertEqual(h.procs.resumed, [[111]])
+        XCTAssertEqual(h.procs.signaled, [111])
         XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
         XCTAssertEqual(h.notifier.posts.last?.title, "Session restored")
     }

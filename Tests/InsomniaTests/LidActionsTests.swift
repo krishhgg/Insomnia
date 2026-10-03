@@ -1340,7 +1340,8 @@ final class LidActionsTests: XCTestCase {
         try FileManager.default.setAttributes([.immutable: false], ofItemAtPath: file)
 
         XCTAssertEqual(h.procs.suspended, [[100, 101, 102]])
-        XCTAssertEqual(h.procs.resumed, [[100, 102]], "the stops Insomnia made were not undone at once")
+        XCTAssertEqual(h.procs.cancelled, [[100, 102]], "the stops Insomnia made were not undone at once")
+        XCTAssertEqual(h.procs.resumed, [], "a rollback through resume skips a stop that is still pending")
         let after = try XCTUnwrap(try h.store.loadState())
         XCTAssertEqual(after.frozenProcesses, [
             FrozenProcess(pid: 100, startedAt: nil),
@@ -1357,6 +1358,34 @@ final class LidActionsTests: XCTestCase {
         await actions.onOpen()
         XCTAssertEqual(h.procs.signaled, [100, 102], "SIGCONT to a process Insomnia never stopped")
         XCTAssertEqual(try h.store.loadState()?.frozenProcesses, [FrozenProcess(pid: 101, startedAt: nil)])
+    }
+
+    /// The kernel can still hold a SIGSTOP when the confirming write fails,
+    /// so that target still looks running at the rollback. The rollback
+    /// sends it SIGCONT anyway, which discards the pending stop. A rollback
+    /// that signals only stopped processes would skip it, and it would stop
+    /// a moment later with no journal entry able to resume it.
+    func testAStopStillPendingWhenTheConfirmWriteFailsIsCancelled() async throws {
+        let (m, actions) = await make(dockerIdle: { false })
+        h.procs.delayedStops = [102]
+        await m.start(duration: 3600)
+        let file = h.home.paths.stateFile.path
+        h.procs.onSuspend = { _ in
+            try? FileManager.default.setAttributes([.immutable: true], ofItemAtPath: file)
+        }
+        defer { try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: file) }
+
+        await actions.onClose()
+        try FileManager.default.setAttributes([.immutable: false], ofItemAtPath: file)
+
+        XCTAssertEqual(h.procs.suspended, [[100, 101, 102]])
+        XCTAssertEqual(h.procs.cancelled, [[100, 101, 102]])
+        XCTAssertEqual(h.procs.signaled, [100, 101, 102])
+        XCTAssertEqual(h.procs.pendingStops, [], "the stop still pending at the rollback was not cancelled")
+        h.procs.deliverPendingStops()
+        XCTAssertEqual(h.procs.stoppedNow, [], "a pid stopped after the rollback, and nothing journaled can resume it")
+        let log = logText()
+        XCTAssertTrue(log.contains("resumed 3 of the 3 pid(s) it had just stopped"), log)
     }
 
     /// Entries without identity come from a build that journaled
