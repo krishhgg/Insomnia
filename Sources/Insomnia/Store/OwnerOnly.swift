@@ -6,8 +6,10 @@ import Foundation
 /// the journal, session and config files say what the machine is doing.
 /// Files are created 0600 and the directories Insomnia owns 0700. A file or
 /// directory that already exists with a looser mode (an older build, a
-/// copied tree, a wide umask) is tightened when it is next opened. A
-/// symlink is left alone, together with whatever it points at. A chmod that
+/// copied tree, a wide umask) is tightened when it is next opened.
+/// Tightening only clears bits: it never adds one, so a file its owner made
+/// unreadable stays that way. A symlink is left alone, together with
+/// whatever it points at. A chmod that
 /// fails is reported, not dropped: once per path through `reportOnce` for
 /// the journal, config and lock, and as an error thrown after the line is
 /// written for the two logs. backstop.sh does the same for what it creates
@@ -42,8 +44,9 @@ enum OwnerOnly {
         return tighten(path: dir.path, to: directoryMode)
     }
 
-    /// chmod(2) to `mode` when the current mode grants anything beyond it.
-    /// A symlink is skipped: its target may be shared with other users or
+    /// chmod(2) away every permission bit outside `mode`, when there is one.
+    /// No bit is added: 0644 becomes 0600 and 0444 becomes 0400. A symlink
+    /// is skipped: its target may be shared with other users or
     /// programs and is not Insomnia's to change. Returns the failure, if
     /// any; the read or write that follows goes ahead either way, and the
     /// caller reports the problem.
@@ -51,7 +54,7 @@ enum OwnerOnly {
         var st = stat()
         guard lstat(path, &st) == 0, (st.st_mode & S_IFMT) != S_IFLNK else { return nil }
         guard (st.st_mode & 0o777) & ~mode != 0 else { return nil }
-        return chmod(path, mode) == 0 ? nil : .chmod(path: path, errno: errno)
+        return chmod(path, st.st_mode & 0o777 & mode) == 0 ? nil : .chmod(path: path, errno: errno)
     }
 
     /// Same, on an open descriptor, so the file checked is the file held.
@@ -62,7 +65,7 @@ enum OwnerOnly {
         guard lstat(path, &st) != 0 || (st.st_mode & S_IFMT) != S_IFLNK else { return nil }
         guard fstat(fd, &st) == 0 else { return nil }
         guard (st.st_mode & 0o777) & ~mode != 0 else { return nil }
-        return fchmod(fd, mode) == 0 ? nil : .chmod(path: path, errno: errno)
+        return fchmod(fd, st.st_mode & 0o777 & mode) == 0 ? nil : .chmod(path: path, errno: errno)
     }
 
     /// Logs a chmod failure once per path per process. Store.read runs on

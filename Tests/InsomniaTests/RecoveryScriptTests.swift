@@ -993,9 +993,31 @@ final class RecoveryScriptTests: XCTestCase {
             XCTAssertEqual(try fx.mode(file), 0o600, file.lastPathComponent)
         }
         XCTAssertTrue(fx.log().hasPrefix("old line\n"), "the loose log was replaced instead of kept")
-        XCTAssertEqual(fx.chmodCalls(), ["chmod 700 \(fx.home.path)", "chmod 700 \(logsDir.path)"]
-            + [fx.logFile, fx.lock, fx.state, fx.session].map { "chmod 600 \($0.path)" },
+        XCTAssertEqual(fx.chmodCalls(), [fx.home, logsDir, fx.logFile, fx.lock, fx.state, fx.session].map { "chmod go-rwx \($0.path)" },
             "the backstop changes modes through its fixed CHMOD path")
+    }
+
+    /// Tightening only takes group and other access away. An owner bit an
+    /// older build or the user left off stays off: a write-only log stays
+    /// write-only (0244 becomes 0200, not 0600) and a Logs directory the
+    /// owner cannot list stays unlistable (0355 becomes 0300, not 0700).
+    func testBackstopTighteningNeverAddsAPermission() throws {
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        let logsDir = fx.logFile.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: logsDir, withIntermediateDirectories: true)
+        try "old line\n".write(to: fx.logFile, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o244], ofItemAtPath: fx.logFile.path)
+        try FileManager.default.setAttributes([.posixPermissions: 0o355], ofItemAtPath: logsDir.path)
+        defer {
+            _ = chmod(logsDir.path, 0o700)
+            _ = chmod(fx.logFile.path, 0o600)
+        }
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 0, r.stderr)
+        XCTAssertEqual(try fx.mode(fx.logFile), 0o200)
+        XCTAssertEqual(try fx.mode(logsDir), 0o300)
     }
 
     func testBackstopLogsAFailedTighteningAndStillRecovers() throws {

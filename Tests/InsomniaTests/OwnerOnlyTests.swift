@@ -186,6 +186,28 @@ final class OwnerOnlyTests: XCTestCase {
         XCTAssertTrue(lines.first?.hasSuffix("[error] insomnia: could not make \(home.paths.configFile.path) owner-only: Operation not permitted") ?? false, log)
     }
 
+    /// Tightening only clears bits outside the owner-only mode. It never
+    /// adds one: a file its owner made unreadable stays unreadable, a
+    /// directory without the owner's write bit keeps it off, and a
+    /// write-only log stays write-only.
+    func testTighteningNeverAddsAPermission() throws {
+        let file = home.root.appendingPathComponent("unreadable.json")
+        try writeLoose("{}", to: file, mode: 0o044)
+        let dir = home.root.appendingPathComponent("read-only", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o555])
+        let log = home.paths.logs.appendingPathComponent("write-only.log")
+        try writeLoose("", to: log, mode: 0o266)
+        defer { _ = chmod(log.path, 0o600) }
+
+        XCTAssertNil(OwnerOnly.tighten(path: file.path))
+        XCTAssertNil(OwnerOnly.tighten(path: dir.path, to: OwnerOnly.directoryMode))
+        try OwnerOnly.appendToLog("line\n", at: log)
+
+        XCTAssertEqual(try mode(file), 0o000, "tightening gave the owner read access")
+        XCTAssertEqual(try mode(dir), 0o500)
+        XCTAssertEqual(try mode(log), 0o200)
+    }
+
     /// The log's own directory: the line is still written and the chmod
     /// failure is thrown afterwards for the caller to report.
     func testUnfixableLogDirectoryIsThrownAfterTheLineIsWritten() throws {
