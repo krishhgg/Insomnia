@@ -103,7 +103,8 @@ final class SessionManager {
     private let display: any DisplayDimming
     private let keyboard: any KeyboardBacklighting
     private let appNap: any AppNapPreferencing
-    private let notifier: any Notifying
+    /// Not private: a copy that quits at launch (LaunchGate) posts through it.
+    let notifier: any Notifying
     private let clamshell: @Sendable () -> Bool?
     private let clock: @Sendable () -> Date
     /// The manager's idea of now (a fake in tests). UI decisions about the

@@ -60,20 +60,6 @@ final class AppAliveLock: @unchecked Sendable {
         }
     }
 
-    /// Polls until the lock is held, however long that takes, after a launch
-    /// found it held: the holder is another Insomnia, and this process must
-    /// count as alive the moment that one exits, or the backstop's next run
-    /// would end a session this one is running as "Insomnia is not running".
-    /// An attempt that fails for another reason (the file cannot be opened)
-    /// is retried the same way; the caller logged it once. Returns when the
-    /// lock is held or the task is cancelled.
-    func acquireEventually(pollEvery: Duration = .seconds(2)) async {
-        while !Task.isCancelled {
-            if (try? tryAcquire()) == true { return }
-            try? await Task.sleep(for: pollEvery)
-        }
-    }
-
     /// Lets the lock go. Releasing twice is harmless; going away releases.
     func release() {
         mutex.withLock {

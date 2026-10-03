@@ -420,6 +420,10 @@ Backstop, independent of the app:
   the loaded job for every extension and allow retries after a failure.
 - App and script transactions must coordinate through a shared lock. Failure
   to acquire it must not permit an unprotected journal write or side effect.
+- Only the Insomnia that holds `.app.alive` runs. A copy that cannot take it
+  within 2 s (`open -n`, or the binary run directly, while another copy
+  runs) does not reconcile, show the menu, start a session or end one on
+  quit; it posts a notification and quits.
 - A valid session is live only while the app holds `.app.alive`, an flock(2)
   taken at launch and released by the kernel when the process dies, and while
   the end floor and the critical thermal level (`notifyutil -g
@@ -469,7 +473,8 @@ Backstop, independent of the app:
 minutes before end, battery floor reached, battery unreadable twice in a row,
 thermal action taken, network gap recovered (with nudge summary), sleep
 restored by backstop, sleep disabled by something other than Insomnia
-(reconcile step 3, once per launch).
+(reconcile step 3, once per launch), config.json moved aside because it does
+not decode, and another copy already running (the copy quits).
 
 ### 10. Settings
 

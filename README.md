@@ -185,7 +185,8 @@ attempts to undo them. An independent `launchd` agent checks every minute and
 restores the journal once the saved deadline has passed. It also ends a valid
 session early, restoring the journal the same way, in three cases. No Insomnia
 process holds the liveness lock: `.app.alive` is an `flock(2)` the app takes at
-launch, and the kernel releases it when the process dies, however it dies. The
+launch, and the kernel releases it when the process dies, however it dies. A
+second copy that cannot take it quits at launch without changing anything. The
 Mac is on battery power with the charge below the end floor from `config.json`
 (default 10%); a battery that is present but cannot be read counts as below
 it. Or the thermal pressure level reported by `notifyutil` is critical. Each

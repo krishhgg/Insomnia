@@ -3,6 +3,13 @@ import UserNotifications
 
 protocol Notifying: Sendable {
     func post(title: String, body: String)
+    /// For a process about to exit: returns once the system has taken the
+    /// notification, not when it is only queued in this process.
+    func postBeforeExit(title: String, body: String) async
+}
+
+extension Notifying {
+    func postBeforeExit(title: String, body: String) async { post(title: title, body: body) }
 }
 
 /// Records posts; for tests and for SessionManager's default.
@@ -55,17 +62,32 @@ final class Notifier: Notifying, @unchecked Sendable {
     }
 
     func post(title: String, body: String) {
-        Log.info("notify: \(title) - \(body)")
-        guard available else { return }
-        requestAuthorizationIfNeeded()
-        let content = UNMutableNotificationContent()
-        content.title = title
-        content.body = body
-        let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+        guard let request = request(title: title, body: body) else { return }
         UNUserNotificationCenter.current().add(request) { error in
             if let error {
                 Log.error("notification post failed: \(error.localizedDescription)")
             }
         }
+    }
+
+    func postBeforeExit(title: String, body: String) async {
+        guard let request = request(title: title, body: body) else { return }
+        do {
+            try await UNUserNotificationCenter.current().add(request)
+        } catch {
+            Log.error("notification post failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// Logs the notification and builds its request; nil outside an app
+    /// bundle, where the log line is all there is.
+    private func request(title: String, body: String) -> UNNotificationRequest? {
+        Log.info("notify: \(title) - \(body)")
+        guard available else { return nil }
+        requestAuthorizationIfNeeded()
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        return UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
     }
 }

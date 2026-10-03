@@ -23,7 +23,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let secrets: any HotspotSecretStore
     let locationPermission: LocationPermission
     /// Held from launch to exit (see AppAliveLock): backstop.sh ends a valid
-    /// session once it can take this lock, because the app is then gone.
+    /// session once it can take this lock, because the app is then gone. A
+    /// launch that cannot take it quits (LaunchGate).
     let aliveLock: AppAliveLock
     let loginItem = LoginItem()
     private var statusItem: StatusItemController?
@@ -55,6 +56,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if LidSimulationBuild.isCompiledIn {
             Log.info(LidSimulationBuild.marker)
         }
+        let gate = LaunchGate(aliveLock: aliveLock, notifier: manager.notifier)
+        Task {
+            if await !gate.open(manager: manager, start: { self.start() }) {
+                NSApp.terminate(nil)
+            }
+        }
+    }
+
+    /// The rest of a launch, run only once this process holds the alive
+    /// lock, before reconcile.
+    private func start() {
         // The login item is tied to the bundle's signature, which install.sh
         // renews on every run: register again if the flag is on, macOS no
         // longer reports the item and the install changed; follow the user
@@ -82,36 +94,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem = StatusItemController(manager: manager, status: status) { [weak settings] in
             settings?.show()
         }
-        Task {
-            await takeAliveLock()
-            await manager.reconcile()
-        }
-    }
-
-    /// backstop.sh counts a session as over once it can take the alive lock
-    /// without waiting. Taken before reconcile, so the first backstop run
-    /// after launch already sees this process, and never released: the
-    /// kernel drops it when the process exits, however that happens. The
-    /// 2 s wait covers a backstop probe holding it for a moment; a hold that
-    /// outlasts it is another Insomnia, whose lock the backstop sees. This
-    /// instance then keeps trying for as long as it runs, so that when the
-    /// other one exits this one is counted as alive within 2 s, not never:
-    /// otherwise a session started here would be ended by the backstop's
-    /// next run as "Insomnia is not running".
-    private func takeAliveLock() async {
-        do {
-            if try await aliveLock.acquire(timeout: 2) {
-                Log.info("alive lock held")
-                return
-            }
-            Log.error("alive lock \(aliveLock.path) is held by another process (another Insomnia?); until it is free the backstop does not count this instance as running and ends any session it starts; retrying every 2 s")
-        } catch {
-            Log.error("could not take the alive lock: \(error.localizedDescription); until it is held the backstop ends any session within a minute; retrying every 2 s")
-        }
-        Task { [aliveLock] in
-            await aliveLock.acquireEventually(pollEvery: .seconds(2))
-            if aliveLock.isHeld { Log.info("alive lock held after waiting") }
-        }
     }
 
     /// Quitting always ends the session (spec 1). Terminate is deferred until
@@ -121,7 +103,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// left the journal dirty with no agent to retry, or could not remove
     /// session.json, the app stays so its own retry can finish the job;
     /// quitting then would abandon a live session.
+    ///
+    /// A copy without the alive lock never reconciled or started anything,
+    /// and an end there would restore the journal of the copy that holds
+    /// the lock, ending that copy's session. It quits at once.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard aliveLock.isHeld else { return .terminateNow }
         guard !terminating else { return .terminateCancel }
         terminating = true
         Task {
