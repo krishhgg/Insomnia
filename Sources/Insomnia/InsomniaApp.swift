@@ -94,8 +94,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// left the journal dirty with no agent to retry, or could not remove
     /// session.json, the app stays so its own retry can finish the job;
     /// quitting then would abandon a live session. It also stays while a
-    /// `sudo pmset` that ignored SIGTERM is alive: exiting would drop the
-    /// recovery lock held for it and let the backstop run beside it.
+    /// `sudo pmset` that ignored SIGTERM is alive. The recovery lock would
+    /// outlive a quit (the command holds it through its own descriptor),
+    /// but the end the command holds up would not: the app is what retries
+    /// it, and confirms an undo the command finishes, the moment it exits.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard !terminating else { return .terminateCancel }
         terminating = true
