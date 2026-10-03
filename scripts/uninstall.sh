@@ -580,7 +580,9 @@ fi
 # same value as in backstop.sh; a test keeps the two in step). An app that
 # does not declare it was installed together with its own backstop.sh in
 # APP_SUPPORT, the copy the LaunchAgent runs, so that copy is used instead
-# when it exists.
+# when it exists. Without it this checkout's backstop runs anyway: it keeps
+# the entries that need the binary, and step 4 stops before removing
+# anything.
 step "Restoring the machine via backstop --force"
 installed_version=""
 if [[ -f "$APP/Contents/Info.plist" ]]; then

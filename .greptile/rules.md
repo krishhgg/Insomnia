@@ -123,6 +123,8 @@ Flag a change that breaks one of these; do not flag the behavior itself.
   `Info.plist`. `uninstall.sh` runs the checkout's backstop only when the
   installed app declares that version, and otherwise the
   `APP_SUPPORT/backstop.sh` installed with the app, when there is one.
+  With no installed copy it runs the checkout's backstop anyway, which
+  keeps those entries, so uninstall stops before removing anything.
 - `backstop.sh`, kept entries. Saved audio, saved display and keyboard
   brightness, and `displayRestoredUnderLowPower` are kept for the app, not
   restored by the shell. Legacy `frozenPids` are never signaled or cleared

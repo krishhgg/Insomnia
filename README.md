@@ -232,7 +232,9 @@ installation scenarios still need [release validation](docs/release-validation.m
   recovery lock while it can still send a signal and ends itself after the
   same limit, so a backstop run that is killed mid-call leaves no helper
   that could act later without the lock. `uninstall.sh` uses the backstop
-  installed with an app that does not declare that version. Entries written by builds before
+  installed with an app that does not declare that version. With no such
+  copy, the checkout's backstop keeps those entries and uninstall stops
+  before removing anything. Entries written by builds before
   microseconds were recorded keep the one-second `ps` comparison in the
   shell. A lookup and a signal are still separate operations, one pid at a
   time.

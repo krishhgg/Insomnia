@@ -503,7 +503,10 @@ Backstop, independent of the app:
   and state when restoration is incomplete, including saved audio. It runs
   the checkout's backstop only when the installed app declares the
   `InsomniaResumeFrozenVersion` that backstop speaks; otherwise it runs the
-  backstop installed with that app, when there is one.
+  backstop installed with that app, when there is one. With no installed
+  copy it runs the checkout's backstop anyway, which keeps the entries that
+  need the binary without running it, so uninstall stops before removing
+  anything.
 - The shell puts `appNapOverrides` back with `defaults write <id>
   NSAppSleepDisabled -bool <previous>` or `defaults delete` when the key was
   absent. A delete that fails counts as done only when `defaults read` then
