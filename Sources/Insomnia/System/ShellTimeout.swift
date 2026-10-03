@@ -30,6 +30,7 @@ extension Shell {
                 let err = Pipe()
                 process.standardOutput = out
                 process.standardError = err
+                let childExit = ProcessExit(process)
 
                 do {
                     try process.run()
@@ -58,7 +59,7 @@ extension Shell {
                 }
                 let outData = out.fileHandleForReading.readDataToEndOfFile()
                 group.wait()
-                process.waitUntilExit()
+                childExit.wait()
                 let timedOut = !killer.isCancelled && process.terminationReason == .uncaughtSignal
                 killer.cancel()
 

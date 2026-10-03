@@ -22,6 +22,13 @@ skip count so missing tmux is not mistaken for integration coverage. Tests
 use private servers, not a contributor's existing panes.
 
 Use injected system dependencies and temporary journals for automated tests.
+The test bundle links the InsomniaTestHome target (Tests/InsomniaTestHome),
+whose constructor points `INSOMNIA_HOME` at a throwaway directory when the
+bundle loads, before XCTest runs anything and whatever `--filter` is used,
+so no test writes to the real ~/Library/Logs or ~/Library/Application
+Support. TestIsolationTests fails if INSOMNIA_HOME is unset or missing, or
+if any path the app resolves, such as the log a default-argument line goes
+to, falls outside it or inside the real ~/Library.
 Do not execute installation, uninstallation, power-setting changes, process
 freezing, or hotspot switching against a contributor's working machine as part
 of the test suite. Never embed credentials or personal SSIDs in fixtures or logs.
