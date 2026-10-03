@@ -768,6 +768,77 @@ final class ReconcileTests: XCTestCase {
         XCTAssertTrue(try XCTUnwrap(m.lastError).contains("left in place"), m.lastError ?? "")
     }
 
+    /// The same file, not a session and not movable, with a dirty journal:
+    /// the end reconcile runs restores the journal and is not finished
+    /// while the file stays, like one that could not be read. Every later
+    /// launch and the agent would read it again. Once the name is free the
+    /// retry moves it, bytes unchanged.
+    func testSessionThatIsNotASessionAndCannotBeMovedKeepsTheEndPendingUntilItMoves() async throws {
+        let bytes = Data("not json".utf8)
+        try bytes.write(to: h.home.paths.sessionFile)
+        let taken = h.home.paths.appSupport.appendingPathComponent("session.json.unreadable-20270115T080000Z")
+        try FileManager.default.createSymbolicLink(atPath: taken.path, withDestinationPath: h.home.paths.appSupport.appendingPathComponent("missing").path)
+        var st = RuntimeState()
+        st.sleepDisabledByUs = true
+        try h.store.saveState(st)
+        h.guardFake.sleepDisabled = true
+
+        let m = h.makeManager()
+        await m.reconcile()
+
+        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
+        XCTAssertEqual(m.pendingEnd, .backstop, "the end finished with the file in place")
+        let posts = h.notifier.posts.filter { $0.title == SessionManager.sessionFileTitle }
+        XCTAssertEqual(posts.count, 1, "\(h.notifier.posts)")
+        let body = posts.first?.body ?? ""
+        XCTAssertTrue(body.contains("is not a valid session file"), body)
+        XCTAssertTrue(body.contains("will not quit until it is gone"), body)
+        XCTAssertTrue(body.contains("Remove it or move it out of \(h.home.paths.appSupport.path)"), body)
+
+        let outcome = await m.end(reason: .user)
+
+        XCTAssertEqual(outcome, .sessionRetained)
+        XCTAssertEqual(try Data(contentsOf: h.home.paths.sessionFile), bytes)
+        let retained = try XCTUnwrap(h.notifier.posts.last)
+        XCTAssertEqual(retained.title, SessionManager.incompleteTitle)
+        XCTAssertTrue(retained.body.contains("is not a valid session file and could not be moved aside"), retained.body)
+
+        try FileManager.default.removeItem(at: taken)
+        let retried = await m.end(reason: .user)
+
+        XCTAssertEqual(retried, .restored)
+        XCTAssertNil(m.pendingEnd)
+        XCTAssertFalse(exists(h.home.paths.sessionFile))
+        XCTAssertEqual(try Data(contentsOf: taken), bytes, "the retry did not move session.json aside")
+        XCTAssertTrue(h.notifier.posts.contains { $0.title == SessionManager.sessionFileTitle && $0.body.contains("which is not a valid session file, was moved to \(taken.path)") }, "\(h.notifier.posts)")
+    }
+
+    /// With a clean journal reconcile runs no end, and the app goes on with
+    /// the file in place. A quit is refused until the rename works, as for
+    /// a file that could not be read.
+    func testQuitIsRefusedWhileASessionThatIsNotASessionStaysInPlace() async throws {
+        try Data("not json".utf8).write(to: h.home.paths.sessionFile)
+        let taken = h.home.paths.appSupport.appendingPathComponent("session.json.unreadable-20270115T080000Z")
+        try FileManager.default.createSymbolicLink(atPath: taken.path, withDestinationPath: h.home.paths.appSupport.appendingPathComponent("missing").path)
+        try h.store.saveState(RuntimeState())
+
+        let m = h.makeManager()
+        await m.reconcile()
+        XCTAssertNil(m.pendingEnd)
+
+        let quit = await m.end(reason: .quit)
+
+        XCTAssertEqual(quit, .sessionRetained, "quit went through with session.json in place")
+        XCTAssertEqual(m.pendingEnd, .quit)
+
+        try FileManager.default.removeItem(at: taken)
+        let retried = await m.end(reason: .quit)
+
+        XCTAssertEqual(retried, .restored)
+        XCTAssertFalse(exists(h.home.paths.sessionFile))
+        XCTAssertEqual(h.guardFake.calls.filter { $0 == "disablesleep 1" }, [])
+    }
+
     /// An earlier moved-aside file with the same stamp is never overwritten;
     /// the new one gets a -1 suffix.
     func testUnreadableSessionNeverOverwritesAnEarlierMovedAsideFile() async throws {
