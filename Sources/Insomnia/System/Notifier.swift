@@ -69,3 +69,31 @@ final class Notifier: Notifying, @unchecked Sendable {
         }
     }
 }
+
+/// Presents Insomnia's notifications while Insomnia is the active app.
+/// With no delegate asking for it, macOS does not show a notification from
+/// the frontmost app. Insomnia is frontmost right after a relaunch
+/// confirmation, which activates it to bring the alert forward, so a
+/// relaunch that failed within seconds would be reported to nobody. The
+/// notification center holds its delegate weakly; `shared` keeps it.
+final class ForegroundNotifications: NSObject, UNUserNotificationCenterDelegate, Sendable {
+    static let shared = ForegroundNotifications()
+    /// While Insomnia is frontmost, a notification is shown as it would be
+    /// otherwise.
+    static let presentation: UNNotificationPresentationOptions = [.banner, .list, .sound]
+
+    /// Becomes the notification center's delegate. Called before the app
+    /// finishes launching, as the delegate has to be; does nothing outside
+    /// an app bundle, where the notification center is not available.
+    static func install() {
+        guard Notifier.runningInsideAppBundle() else { return }
+        UNUserNotificationCenter.current().delegate = shared
+    }
+
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification
+    ) async -> UNNotificationPresentationOptions {
+        Self.presentation
+    }
+}
