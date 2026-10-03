@@ -2,9 +2,9 @@ import Foundation
 import XCTest
 @testable import Insomnia
 
-/// scripts/check-lid-simulation-gate.sh with `swift`, `nm` and `strings`
-/// replaced by stubs, so each case decides what the two "binaries" hold and
-/// whether they can be read. Nothing is built.
+/// A private copy of scripts/check-lid-simulation-gate.sh with its `SWIFT`,
+/// `NM` and `STRINGS` lines patched to stubs, so each case decides what the
+/// two "binaries" hold and whether they can be read. Nothing is built.
 final class LidSimulationGateScriptTests: XCTestCase {
     private static var repoRoot: URL {
         // .../Tests/InsomniaTests/LidSimulationGateScriptTests.swift -> repo root
@@ -29,8 +29,12 @@ final class LidSimulationGateScriptTests: XCTestCase {
         for dir in [scripts, bin, plain, sim] {
             try fm.createDirectory(at: dir, withIntermediateDirectories: true)
         }
-        try fm.copyItem(at: Self.repoRoot.appendingPathComponent("scripts/check-lid-simulation-gate.sh"),
-                        to: scripts.appendingPathComponent("check-lid-simulation-gate.sh"))
+        let script = try String(contentsOf: Self.repoRoot.appendingPathComponent("scripts/check-lid-simulation-gate.sh"), encoding: .utf8)
+        try Self.patch(script, [
+            "SWIFT": bin.appendingPathComponent("swift").path,
+            "NM": bin.appendingPathComponent("nm").path,
+            "STRINGS": bin.appendingPathComponent("strings").path,
+        ]).write(to: scripts.appendingPathComponent("check-lid-simulation-gate.sh"), atomically: true, encoding: .utf8)
         // `swift build` succeeds without building; --show-bin-path names the
         // plain directory, or the sim one for the opt-in scratch path.
         try stub("swift", """
@@ -102,6 +106,25 @@ final class LidSimulationGateScriptTests: XCTestCase {
 
     // MARK: - Fixture
 
+    /// Rewrites `NAME=...` lines. Each name must match exactly one line, so
+    /// a renamed variable fails here instead of the test running the real
+    /// tool.
+    private struct PatchError: Error, CustomStringConvertible {
+        let description: String
+    }
+
+    private static func patch(_ text: String, _ tools: [String: String]) throws -> String {
+        var lines = text.components(separatedBy: "\n")
+        for (name, path) in tools {
+            let hits = lines.indices.filter { lines[$0].hasPrefix("\(name)=") }
+            guard hits.count == 1 else {
+                throw PatchError(description: "expected exactly one '\(name)=' line in the gate script, found \(hits.count)")
+            }
+            lines[hits[0]] = "\(name)='\(path)'"
+        }
+        return lines.joined(separator: "\n")
+    }
+
     private func write(_ dir: URL, nm: String, strings: String) throws {
         try nm.write(to: dir.appendingPathComponent("nm.out"), atomically: true, encoding: .utf8)
         try strings.write(to: dir.appendingPathComponent("strings.out"), atomically: true, encoding: .utf8)
@@ -117,8 +140,8 @@ final class LidSimulationGateScriptTests: XCTestCase {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/bash")
         p.arguments = [root.appendingPathComponent("scripts/check-lid-simulation-gate.sh").path]
-        let bin = root.appendingPathComponent("bin").path
-        p.environment = ["PATH": "\(bin):/usr/bin:/bin", "SWIFT": "\(bin)/swift", "TMPDIR": NSTemporaryDirectory()]
+        // No stub on PATH: the script reaches them only through the patched lines.
+        p.environment = ["PATH": "/usr/bin:/bin", "TMPDIR": NSTemporaryDirectory()]
         // Capture to files rather than pipes: nothing to drain, nothing to deadlock.
         let outURL = root.appendingPathComponent("stdout")
         let errURL = root.appendingPathComponent("stderr")

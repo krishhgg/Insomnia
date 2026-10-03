@@ -10,7 +10,11 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-SWIFT=${SWIFT:-swift}
+# Tools by absolute path, as in the other scripts, never through PATH;
+# LidSimulationGateScriptTests patches these lines in a private copy.
+SWIFT=/usr/bin/swift
+NM=/usr/bin/nm
+STRINGS=/usr/bin/strings
 SIM_SCRATCH=.build/lid-simulation
 # The watcher class (Insomnia.LidSimulation, a class: mangled ...13LidSimulationC),
 # its log lines and the build marker shown in the status menu and Settings.
@@ -47,11 +51,11 @@ check() { # label binary present|absent
   # Read the binary before counting. Piped straight into grep -c, an nm or
   # strings that cannot read it counts 0, which passes the "absent" check
   # for a binary nobody inspected. A read that prints nothing fails too.
-  if ! symbols=$(nm "$bin") || [[ -z $symbols ]]; then
+  if ! symbols=$("$NM" "$bin") || [[ -z $symbols ]]; then
     echo "$label: nm could not read the binary" >&2
     exit 1
   fi
-  if ! texts=$(strings "$bin") || [[ -z $texts ]]; then
+  if ! texts=$("$STRINGS" "$bin") || [[ -z $texts ]]; then
     echo "$label: strings could not read the binary" >&2
     exit 1
   fi
