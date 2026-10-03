@@ -182,6 +182,14 @@ struct Store: Sendable {
     func loadConfig() throws -> Config? { try read(Config.self, from: paths.configFile) }
     func saveConfig(_ c: Config) throws { try write(c, to: paths.configFile) }
 
+    /// nil when there is none, or it cannot be read: it only names the
+    /// command in a message.
+    func loadUnfinishedCommand() -> UnfinishedCommandRecord? {
+        try? read(UnfinishedCommandRecord.self, from: paths.unfinishedCommandFile)
+    }
+    func saveUnfinishedCommand(_ r: UnfinishedCommandRecord) throws { try write(r, to: paths.unfinishedCommandFile) }
+    func removeUnfinishedCommand() throws { try remove(at: paths.unfinishedCommandFile) }
+
     /// One line about why decoding failed, fit for a notification.
     private static func brief(_ error: DecodingError) -> String {
         func path(_ c: DecodingError.Context) -> String {

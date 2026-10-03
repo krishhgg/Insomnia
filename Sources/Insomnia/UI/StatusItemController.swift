@@ -682,6 +682,7 @@ final class StatusItemController: NSObject {
             throttledBrowsers: status.throttledBrowsers,
             relaunchProblems: status.relaunchProblems,
             error: manager.lastError,
+            commandRunning: manager.commandWarning,
             foreignSleep: manager.foreignSleepWarning,
             lidSimulationBuild: LidSimulationBuild.isCompiledIn
         )

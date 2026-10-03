@@ -44,6 +44,7 @@ enum StatusMenu {
         throttledBrowsers: [ThrottledBrowser],
         relaunchProblems: [String] = [],
         error: String?,
+        commandRunning: String? = nil,
         foreignSleep: String? = nil,
         lidSimulationBuild: Bool = false
     ) -> [Item] {
@@ -71,6 +72,12 @@ enum StatusMenu {
         }
         for problem in relaunchProblems.compactMap(present) {
             out.append(Item(title: "\u{26A0} \(problem)", kind: .warning))
+        }
+        // The sudo pmset left running comes before the session error: it
+        // holds every change and quit until it exits, and the line goes
+        // away then.
+        if let command = present(commandRunning) {
+            out.append(Item(title: "\u{26A0} \(command)", kind: .warning))
         }
         if let error = present(error) {
             out.append(Item(title: "\u{26A0} \(error)", kind: .warning))

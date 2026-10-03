@@ -970,6 +970,23 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(r.stdout.contains("Kept 1 unreadable session.json file(s)"), r.stdout)
     }
 
+    /// The record of a `sudo pmset` left running is gone after an uninstall,
+    /// with or without --purge: uninstall holds the recovery lock, so the
+    /// command it names has exited.
+    func testUninstallRemovesTheRecordOfACommandLeftRunning() throws {
+        for purge in [false, true] {
+            try fx.installMachinery()
+            let record = fx.home.appendingPathComponent("unfinished-command.json")
+            try #"{"pid":4242,"command":"/usr/bin/sudo -n /usr/bin/pmset -a disablesleep 0","since":"2026-01-01T00:00:00Z"}"#
+                .write(to: record, atomically: true, encoding: .utf8)
+
+            let r = try fx.run(fx.uninstall, purge ? ["--purge"] : [])
+
+            XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+            XCTAssertFalse(fx.exists(record), "purge \(purge)")
+        }
+    }
+
     /// --purge removes the moved-aside copies, but only names of exactly the
     /// shape Insomnia produces. Anything else under the prefix stays.
     func testUninstallPurgeRemovesOnlyMovedAsideSessionFilesOfInsomniasShape() throws {

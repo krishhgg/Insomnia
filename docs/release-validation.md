@@ -136,6 +136,10 @@ is performed. Do not replace "not run" with "passed" based on source review.
 | Relaunch unthrottled: confirmation alert, profile arguments carried over, a browser that has not quit after 10 s is left as it is and the notification names it, a browser not running 5 s after `open` is reported | Not run |
 | Relaunch failure while Insomnia is frontmost: with notifications allowed, the "Browser not relaunched" banner shows without switching apps after the confirmation; with notifications off for Insomnia, the reason is a warning line in the right-click menu | Not run |
 | Battery/thermal event behavior on supported hardware | Not run |
+| A `sudo pmset` that ignores SIGTERM: left running, lock held, journal intact, quit refused until it exits | Not run |
+| The same command with the app force-quit: the backstop does not take the lock until the command exits; the relaunch names the pid from `unfinished-command.json` | Not run |
+| A left-running `disablesleep 0` that exits 0: the end finishes without running it again | Not run |
+| After that command exits: Low Power Mode ownership matches the mode, and a lid open made meanwhile is undone | Not run |
 | `SleepDisabled 1` set by hand with no session: left alone and reported at launch, not cleared | Not run |
 | Unreadable battery (IOKit miss) ends the session on a laptop after the second read; desktop unaffected | Not run |
 | Settings floor steppers keep the end floor below the Low Power Mode floor by moving the other stepper | Not run |

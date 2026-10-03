@@ -51,6 +51,36 @@ final class StatusMenuWarningTests: XCTestCase {
         XCTAssertEqual(items.map(\.kind), [.settings, .quit])
     }
 
+    /// The sudo pmset left running has its own line, above an unrelated
+    /// error, so its exit can remove it and leave the error in place.
+    func testCommandLineIsShownAboveTheLastError() {
+        let command = "`/usr/bin/sudo -n /usr/bin/pmset lowpowermode 1` (pid 4242) did not stop on SIGTERM; Insomnia holds the recovery lock and will not quit until it exits (sudo kill 4242 to stop it by hand)"
+        let items = StatusMenu.items(
+            sessionActive: false,
+            sleepHeld: false,
+            machine: nil,
+            actions: nil,
+            throttledBrowsers: [],
+            error: "could not remove session.json: permission denied",
+            commandRunning: command
+        )
+        XCTAssertEqual(items.map(\.kind), [.warning, .warning, .separator, .settings, .quit])
+        XCTAssertEqual(items[0].title, "\u{26A0} \(command)")
+        XCTAssertEqual(items[1].title, "\u{26A0} could not remove session.json: permission denied")
+
+        let afterExit = StatusMenu.items(
+            sessionActive: false,
+            sleepHeld: false,
+            machine: nil,
+            actions: nil,
+            throttledBrowsers: [],
+            error: "could not remove session.json: permission denied",
+            commandRunning: nil
+        )
+        XCTAssertEqual(afterExit.map(\.kind), [.warning, .separator, .settings, .quit])
+        XCTAssertEqual(afterExit[0].title, "\u{26A0} could not remove session.json: permission denied")
+    }
+
     /// The relaunch entry holds the browser itself, not just its name, so
     /// the click hands on the bundle id the menu was built with. Builds the
     /// NSMenu only; nothing is shown.
