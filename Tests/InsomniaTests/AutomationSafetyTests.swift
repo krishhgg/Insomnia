@@ -286,11 +286,13 @@ final class TmuxNudgeTests: XCTestCase {
     }
 
     /// `show-options -qpv -t %N @insomnia-nudge` prints the value, or
-    /// nothing when the pane option is unset. Only exactly `on` marks it.
+    /// nothing when the pane option is unset. Only exactly `on` marks it;
+    /// tmux prints a padded value as set, so padding is not trimmed away.
     func testMarkCheck() {
         XCTAssertTrue(TmuxNudge.isMarked(showOptionsOutput: "on\n"))
         XCTAssertTrue(TmuxNudge.isMarked(showOptionsOutput: "on"))
-        for unmarked in ["", "\n", "off\n", "ON\n", "on please\n", "1\n", "no such pane: %9\n"] {
+        for unmarked in ["", "\n", "off\n", "ON\n", "on please\n", "1\n", "no such pane: %9\n",
+                         " on \n", " on\n", "on \n", "\ton\n", "on\n\n", "\non\n", "on\r\n"] {
             XCTAssertFalse(TmuxNudge.isMarked(showOptionsOutput: unmarked), unmarked.debugDescription)
         }
         XCTAssertEqual(TmuxNudge.markCommand(), "tmux set-option -p -t <target> @insomnia-nudge on")
@@ -468,6 +470,25 @@ final class TmuxLiveRunnerTests: XCTestCase {
         XCTAssertEqual(lines.count, 1, log)
         XCTAssertTrue(lines.first?.contains("[error] insomnia: tmux show-options -t %0 (nudge:0.0): ") ?? false, log)
         XCTAssertFalse(log.contains("not marked"), log)
+    }
+
+    /// A value with spaces around `on` is not the mark. tmux shows it as
+    /// set, ` on `, and the runner must not trim it into `on` and send keys
+    /// that could submit whatever is already typed in that pane.
+    func testPaddedMarkIsNotAMark() async throws {
+        try await startPane(command: "cat", marked: false)
+        let padded = try await tmuxRun(["set-option", "-p", "-t", "nudge:0.0", TmuxNudge.markOption, " on "])
+        XCTAssertTrue(padded.succeeded, padded.stderr)
+        let shown = try await tmuxRun(["show-options", "-qpv", "-t", "nudge:0.0", TmuxNudge.markOption])
+        XCTAssertEqual(shown.stdout, " on \n", "fixture: tmux should show the padded value as set")
+        let run = TmuxNudge.makeLiveRunner(socketName: socket)
+
+        let accepted = try await run("nudge:0.0", true)
+
+        XCTAssertFalse(accepted, "a padded value was accepted as the pane mark")
+        try await Task.sleep(for: .milliseconds(200))
+        let seen = try await capture()
+        XCTAssertFalse(seen.contains("continue"), seen)
     }
 
     /// The mark must be on the pane itself. The same option set on the

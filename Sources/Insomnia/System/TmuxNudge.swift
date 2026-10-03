@@ -102,9 +102,11 @@ struct TmuxNudge: Sendable {
     }
 
     /// Whether `show-options -qpv -t <pane> @insomnia-nudge` output marks
-    /// the pane. Exactly `on`; an unset option prints nothing.
+    /// the pane. Exactly `on`, which tmux prints followed by one newline; an
+    /// unset option prints nothing. Nothing is trimmed: tmux prints the value
+    /// as set, and ` on ` is not the value `markCommand` tells the user to set.
     static func isMarked(showOptionsOutput output: String) -> Bool {
-        output.trimmingCharacters(in: .whitespacesAndNewlines) == "on"
+        output == "on\n" || output == "on"
     }
 
     static let liveRunner: Runner = makeLiveRunner()
