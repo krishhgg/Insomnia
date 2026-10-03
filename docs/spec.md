@@ -413,6 +413,29 @@ Reconcile runs at every Insomnia launch:
    verified owned processes, Low Power Mode if we set it, saved audio, and
    recorded App Nap values.
    Unverified entries and failed restoration remain unresolved, not successful.
+   A session file that does not decode counts as expired: it is renamed under
+   the lock to `session.json.unreadable-<UTC stamp>` (never deleted, never
+   overwriting an earlier copy), the user is told where, and the journal is
+   restored as with no session. `backstop.sh` does the same once the journal
+   is clean. A session file that decodes as JSON but lacks a key or type
+   the `Session` decoder needs (`startedAt`, `endsAt`, `extensions`) is not
+   a session either; `backstop.sh` checks the same keys and types, and
+   reads dates only in the form Store writes. A session file that exists
+   but cannot be read at all, or is not a regular file (never opened: a
+   FIFO would block under the lock), has no end time that can be enforced,
+   so it also counts as expired and the journal is restored. It may have
+   been a valid session, so it is never opened or removed: it is renamed
+   aside the same way (the app at once, `backstop.sh` once the journal is
+   clean), which keeps it as evidence and keeps a later launch from
+   resuming a session that was treated as ended. The app notifies with the
+   new path. If the rename fails the file stays and a start is refused
+   while it is there. Every end then restores the journal and tries the
+   rename again; while it fails the end is not finished, so quit is refused
+   and the end is retried, because the file would be resumed if it became
+   readable in place. The messages say to remove it or move it out of the
+   folder. `backstop.sh` tries the rename again on every run.
+   An unreadable journal still refuses every transaction and leaves both
+   files in place.
 2. Session valid → establish the independent recovery agent before reapplying
    the sleep guard, then resume observers. If the lid is open, restore recorded
    lid-close actions. Arming or restoration errors must remain visible.
