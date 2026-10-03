@@ -1,9 +1,9 @@
 import CoreGraphics
 
 /// The menu bar mark as pure geometry: the app icon's almond lens
-/// (`EyeMoonGeometry.eyeOutline`) with a lid that shades it, five lashes on
+/// (`EyeLensGeometry.eyeOutline`) with a lid that shades it, five lashes on
 /// that lid, and a pupil behind it. Same 24-unit grid and conventions as
-/// `EyeMoonGeometry`; CoreGraphics only.
+/// `EyeLensGeometry`; CoreGraphics only.
 ///
 /// The lid's `progress` runs from 0 (closed: the whole lens shaded, lashes
 /// below) to 1 (open: nothing shaded, lashes above). The lid's lower edge
@@ -20,9 +20,9 @@ enum EyeMarkGeometry {
         case below
     }
 
-    static let designSize = EyeMoonGeometry.designSize
+    static let designSize = EyeLensGeometry.designSize
     /// The eye's horizontal axis, through both corners.
-    static let axisY = EyeMoonGeometry.designSize / 2
+    static let axisY = EyeLensGeometry.designSize / 2
 
     // Lashes: five, at these fractions of the lens width, each starting
     // `lashGap` beyond the lid's centre line along its outward normal and
@@ -41,7 +41,7 @@ enum EyeMarkGeometry {
 
     /// The closed almond outline, meant to be stroked: the icon's lens.
     static func lens(in rect: CGRect) -> CGPath {
-        EyeMoonGeometry.eyeOutline(in: rect)
+        EyeLensGeometry.eyeOutline(in: rect)
     }
 
     /// The lid, meant to be filled: the region between the upper edge of the
@@ -49,7 +49,7 @@ enum EyeMarkGeometry {
     /// progress 0 to the upper lid curve at progress 1 (corners fixed,
     /// control points interpolated). One closed subpath.
     static func lid(in rect: CGRect, progress: CGFloat) -> CGPath {
-        let t = EyeMoonGeometry.gridTransform(in: rect)
+        let t = EyeLensGeometry.gridTransform(in: rect)
         let p = min(max(progress, 0), 1)
         let upper = upperLid, lower = lowerLid
         // The lower lid runs right to left, so it is already the return leg.
@@ -66,7 +66,7 @@ enum EyeMarkGeometry {
     /// Five lashes as five open subpaths, meant to be stroked. The lower set
     /// is the upper set mirrored about the axis; neither moves.
     static func lashes(in rect: CGRect, side: Side) -> CGPath {
-        let t = EyeMoonGeometry.gridTransform(in: rect)
+        let t = EyeLensGeometry.gridTransform(in: rect)
         let fold: CGFloat = side == .above ? 1 : -1
         let path = CGMutablePath()
         for (start, end) in upperLashes {
@@ -99,7 +99,7 @@ enum EyeMarkGeometry {
     /// the other, and the highlight's arc comes back through the disc. A
     /// single subpath keeps it independent of the fill rule.
     static func pupil(in rect: CGRect) -> CGPath {
-        let t = EyeMoonGeometry.gridTransform(in: rect)
+        let t = EyeLensGeometry.gridTransform(in: rect)
         let c = pupilCenter, h = highlightCenter
         let R = pupilRadius, r = highlightRadius
         let d = hypot(h.x - c.x, h.y - c.y)
@@ -163,7 +163,7 @@ enum EyeMarkGeometry {
     /// parse so that fallback never ships unnoticed.
     private static let lids: (upper: Cubic, lower: Cubic) = {
         let grid = CGRect(x: 0, y: 0, width: designSize, height: designSize)
-        let outline = EyeMoonGeometry.eyeOutline(in: grid)
+        let outline = EyeLensGeometry.eyeOutline(in: grid)
         var points: [CGPoint] = []
         outline.applyWithBlock { element in
             switch element.pointee.type {

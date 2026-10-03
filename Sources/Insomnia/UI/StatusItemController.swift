@@ -24,6 +24,9 @@ final class StatusItemController: NSObject {
     /// app delegate, which outlives any one status item.
     private let showSettings: () -> Void
     private let makeWidthWriter: WidthWriterFactory?
+    /// Asks before a browser is quit for a relaunch; true means go ahead.
+    /// Injected so tests never see the NSAlert.
+    private let confirmRelaunch: @MainActor (String) -> Bool
     /// What the projected countdown reads the time from. Tests inject the
     /// manager's fake clock so the text does not depend on when the tick
     /// happens to run.
@@ -66,12 +69,14 @@ final class StatusItemController: NSObject {
         status: any StatusSource,
         showSettings: @escaping () -> Void,
         makeWidthWriter: WidthWriterFactory? = nil,
+        confirmRelaunch: (@MainActor (String) -> Bool)? = nil,
         clock: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.manager = manager
         self.status = status
         self.showSettings = showSettings
         self.makeWidthWriter = makeWidthWriter
+        self.confirmRelaunch = confirmRelaunch ?? Self.askBeforeRelaunch
         self.clock = clock
         Self.seedPreferredPositionIfNeeded()
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -644,7 +649,7 @@ final class StatusItemController: NSObject {
         // next opening drop the line if sleep is enabled again.
         Task { await manager.recheckForeignSleep() }
         let menu = StatusMenu.menu(
-            menuItems(),
+            Self.menuItems(manager: manager, status: status),
             target: self,
             settings: #selector(menuOpenSettings),
             quit: #selector(menuQuit),
@@ -653,7 +658,9 @@ final class StatusItemController: NSObject {
         menu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.height + 4), in: button)
     }
 
-    private func menuItems() -> [StatusMenu.Item] {
+    /// The menu's lines from what the session and the status source report
+    /// now. Static, so a test can check them without a status item.
+    static func menuItems(manager: SessionManager, status: any StatusSource) -> [StatusMenu.Item] {
         StatusMenu.items(
             sessionActive: manager.isActive,
             sleepHeld: manager.state.sleepDisabledByUs,
@@ -673,6 +680,7 @@ final class StatusItemController: NSObject {
                 lastGap: status.lastGap
             ),
             throttledBrowsers: status.throttledBrowsers,
+            relaunchProblems: status.relaunchProblems,
             hotspotWarning: status.hotspotPasswordProblem?.menuLine,
             error: manager.lastError,
             foreignSleep: manager.foreignSleepWarning,
@@ -681,8 +689,32 @@ final class StatusItemController: NSObject {
     }
 
     @objc private func menuRelaunchBrowser(_ sender: NSMenuItem) {
-        guard let name = sender.representedObject as? String else { return }
-        status.relaunchUnthrottled(name)
+        guard let browser = sender.representedObject as? ThrottledBrowser else { return }
+        relaunchBrowser(browser)
+    }
+
+    /// The relaunch item: ask first, since the browser is quit and its
+    /// windows come back only through its own session restore. Cancel does
+    /// nothing. Confirming hands on the bundle id and name the item
+    /// carried; a scan that replaced the browser list while the alert was
+    /// up does not change them.
+    func relaunchBrowser(_ browser: ThrottledBrowser) {
+        guard confirmRelaunch(browser.name) else { return }
+        status.relaunchUnthrottled(browser)
+    }
+
+    private static func askBeforeRelaunch(_ name: String) -> Bool {
+        let prompt = RelaunchPrompt(browser: name)
+        let alert = NSAlert()
+        alert.messageText = prompt.title
+        alert.informativeText = prompt.message
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: RelaunchPrompt.confirmTitle)
+        alert.addButton(withTitle: RelaunchPrompt.cancelTitle)
+        // A menu bar app has no window to carry the alert; bring the app
+        // forward so the alert is not behind whatever is frontmost.
+        NSApp.activate(ignoringOtherApps: true)
+        return alert.runModal() == .alertFirstButtonReturn
     }
 
     @objc private func menuQuit() {

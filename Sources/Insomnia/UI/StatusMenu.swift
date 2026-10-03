@@ -15,8 +15,9 @@ enum StatusMenu {
             case settings
             case quit
             /// Relaunch this browser with the occlusion flags. Carries the
-            /// display name so the menu item knows what to relaunch.
-            case relaunchBrowser(String)
+            /// bundle id and name, so the item still names the same browser
+            /// after a scan replaces the list.
+            case relaunchBrowser(ThrottledBrowser)
         }
 
         let title: String
@@ -34,12 +35,16 @@ enum StatusMenu {
     /// `lidSimulationBuild` adds the line that marks a build with the
     /// scripts/simulate-lid.sh watcher compiled in (`LidSimulationBuild`),
     /// so such a build is never mistaken for a normal one.
+    /// `relaunchProblems` say why browser relaunches did not happen, one
+    /// line per browser; they follow the browser lines, since the browsers
+    /// they name may no longer be in them.
     static func items(
         sessionActive: Bool,
         sleepHeld: Bool,
         machine: String?,
         actions: String?,
-        throttledBrowsers: [String],
+        throttledBrowsers: [ThrottledBrowser],
+        relaunchProblems: [String] = [],
         hotspotWarning: String? = nil,
         error: String?,
         foreignSleep: String? = nil,
@@ -58,14 +63,17 @@ enum StatusMenu {
         if lidSimulationBuild {
             out.append(Item(title: LidSimulationBuild.marker, kind: .warning))
         }
-        if let throttle = present(StatusLines.throttleWarning(throttledBrowsers)) {
+        if let throttle = present(StatusLines.throttleWarning(throttledBrowsers.map(\.name))) {
             out.append(Item(title: throttle, kind: .warning))
             // The warning alone is a dead end; each throttled browser gets a
             // live item so the relaunch is still one click away, as it was
             // from the popover this menu replaced.
-            for name in throttledBrowsers {
-                out.append(Item(title: "Relaunch \(name) unthrottled", kind: .relaunchBrowser(name)))
+            for browser in throttledBrowsers {
+                out.append(Item(title: "Relaunch \(browser.name) unthrottled", kind: .relaunchBrowser(browser)))
             }
+        }
+        for problem in relaunchProblems.compactMap(present) {
+            out.append(Item(title: "\u{26A0} \(problem)", kind: .warning))
         }
         if let hotspot = present(hotspotWarning) {
             out.append(Item(title: hotspot, kind: .warning))
@@ -124,9 +132,9 @@ enum StatusMenu {
                 menu.addItem(action(title: item.title, selector: settings, key: ",", target: target))
             case .quit:
                 menu.addItem(action(title: item.title, selector: quit, key: "q", target: target))
-            case let .relaunchBrowser(name):
+            case let .relaunchBrowser(browser):
                 let entry = action(title: item.title, selector: relaunchBrowser, key: "", target: target)
-                entry.representedObject = name
+                entry.representedObject = browser
                 menu.addItem(entry)
             }
         }
@@ -140,5 +148,21 @@ enum StatusMenu {
         item.target = target
         item.isEnabled = true
         return item
+    }
+}
+
+/// What the menu asks before "Relaunch <browser> unthrottled" quits
+/// anything. Pure so the copy is testable; the controller shows it as an
+/// NSAlert.
+struct RelaunchPrompt: Equatable {
+    static let confirmTitle = "Quit and relaunch"
+    static let cancelTitle = "Cancel"
+
+    let title: String
+    let message: String
+
+    init(browser name: String) {
+        title = "Quit and relaunch \(name)?"
+        message = "Insomnia quits \(name) and opens it again with the two flags that stop it throttling hidden windows. Your windows and tabs come back only if \(name) is set to reopen them on startup. If \(name) has not quit after \(Int(BrowserThrottle.quitTimeout)) s, nothing is relaunched."
     }
 }

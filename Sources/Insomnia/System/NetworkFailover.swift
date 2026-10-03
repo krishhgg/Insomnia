@@ -1026,7 +1026,7 @@ final class NetworkFailover {
         let config = configProvider()
         if gap >= config.nudgeThreshold {
             // Each pane is only nudged while this session is still the live one.
-            let count = await nudge.nudge(targets: config.tmuxTargets) { [weak self] in self?.epoch == epoch }
+            let count = await nudge.nudge(targets: config.tmuxTargets, pressEnter: config.tmuxNudgePressesEnter) { [weak self] in self?.epoch == epoch }
             let stopped = self.epoch != epoch
             if stopped {
                 Log.info("network failover stopped during recovery; \(count) tmux pane(s) had already been nudged")

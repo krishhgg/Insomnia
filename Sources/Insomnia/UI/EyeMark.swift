@@ -119,7 +119,7 @@ struct EyeMarkView: View {
     }
 
     static func stroke(size: CGFloat) -> StrokeStyle {
-        StrokeStyle(lineWidth: EyeMoonGeometry.lineWidth(for: size), lineCap: .round, lineJoin: .round)
+        StrokeStyle(lineWidth: EyeLensGeometry.lineWidth(for: size), lineCap: .round, lineJoin: .round)
     }
 
     private var state: BlinkState { BlinkState(progress: progress, reduceMotion: reduceMotion) }
