@@ -166,7 +166,7 @@ struct SettingsView: View {
         } header: {
             Text("Lid-close actions")
         } footer: {
-            Text("Every Dock app that is not an agent app, an Apple app, Docker Desktop or a built-in protected app (editors, AI apps, Tailscale, local model servers) is stopped with SIGSTOP and resumed when the lid opens. Apps on the list above are always frozen; agent apps never are. The display brightness and keyboard backlight are saved, set to zero and restored when the lid opens. If Insomnia is not running when you open the lid, press the brightness-up key.")
+            Text("Apps on the list above are stopped with SIGSTOP while the lid is closed and resumed when it opens. With \"Freeze every other app\" on (off by default), every other Dock app is stopped too, except agent apps, Apple apps, Docker Desktop and built-in protected apps (editors, terminals, browsers, AI apps, password managers, local databases, Tailscale, local model servers). Agent apps are never frozen. The display brightness and keyboard backlight are saved, set to zero and restored when the lid opens. If Insomnia is not running when you open the lid, press the brightness-up key.")
         }
     }
 
@@ -186,12 +186,13 @@ struct SettingsView: View {
         } header: {
             Text("Agent apps")
         } footer: {
-            Text("Agent apps are never frozen or throttled. Editors, AI apps, terminals, agent-driven browsers, Tailscale and local model servers are also protected from the automatic lid-close scope even when they are not listed here; adding one to the freeze list above overrides that.")
+            Text("Agent apps are never frozen or throttled. Editors, AI apps, terminals, browsers, password managers, local databases, Tailscale and local model servers are also protected from the automatic lid-close scope even when they are not listed here; adding one to the freeze list above overrides that.")
         }
     }
 
     private var wouldFreezeText: String {
-        wouldFreeze.isEmpty ? "Would freeze now: nothing else" : "Would freeze now: \(wouldFreeze.joined(separator: ", "))"
+        guard manager.config.freezeAllApps else { return "Would freeze now: the list above only" }
+        return wouldFreeze.isEmpty ? "Would freeze now: nothing else" : "Would freeze now: \(wouldFreeze.joined(separator: ", "))"
     }
 
     /// Same planner as the lid-close action, over the apps running now.

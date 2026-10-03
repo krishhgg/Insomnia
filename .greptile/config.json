@@ -51,7 +51,7 @@
       "id": "only-verified-pids-are-resumed",
       "severity": "high",
       "scope": ["Sources/Insomnia/Core/ProcessControl.swift", "Sources/Insomnia/Core/LidActions.swift", "Sources/Insomnia/System/Freezer.swift", "scripts/backstop.sh"],
-      "rule": "SIGCONT is sent only to a journaled pid whose recorded identity still matches the live process: start time to the microsecond and boot session in the app, start time to the second and boot session in backstop.sh. Provisional entries (identity nil, written before the kernel confirmed the stop) and legacy frozenPids are never signaled and are never cleared by the shell. A pid that cannot be observed stays journaled."
+      "rule": "SIGCONT is sent only to a journaled pid whose recorded identity still matches the live process: start time to the microsecond and boot session in the app, start time to the second and boot session in backstop.sh. Provisional entries (identity nil, written before the kernel confirmed the stop) and legacy frozenPids are never signaled and are never cleared by the shell. A pid that cannot be observed stays journaled. One exception: when the write confirming a freeze fails, LidActions.freeze undoes the SIGSTOPs it sent moments earlier through cancelStops, checked against the identity it read before the SIGSTOP and still holds in memory (microseconds and boot session). That SIGCONT goes to a matching pid even if it does not show as stopped yet, because a SIGSTOP can still be pending and generating SIGCONT discards it. That rollback then removes the provisional entries of the pids it resumed, that are gone, or that the freeze never stopped, and keeps those it could not resume."
     },
     {
       "id": "no-shell-interpolation",

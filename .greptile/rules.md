@@ -99,7 +99,16 @@ Flag a change that breaks one of these; do not flag the behavior itself.
   Insomnia stopped are resumed, and only when the journaled identity still
   matches. Provisional entries written before the kernel confirmed the stop
   (identity nil) are never signaled and stay journaled for manual
-  inspection. An app launched while the lid is closed is left alone.
+  inspection. One exception: when the write that confirms a freeze fails,
+  `LidActions.freeze` undoes the stops it sent moments earlier through
+  `cancelStops`, checked against the identity it read before the SIGSTOP
+  and still holds in memory. That SIGCONT goes to a matching pid even if
+  it does not show as stopped yet, because a SIGSTOP can still be pending
+  and generating SIGCONT discards it. That rollback then removes the
+  provisional entries of the pids it resumed, that are gone, or that the
+  freeze never stopped, and keeps those it could not resume; until the disk
+  takes that write, the status menu leaves the removed ones out. An app
+  launched while the lid is closed is left alone.
   Electron apps are stopped as a whole process tree via the responsible pid.
 - `FloorRules.swift`, `LidActions.swift`. Low Power Mode is switched on at
   lid close whether or not the charger is connected, because with sleep

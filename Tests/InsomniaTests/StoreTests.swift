@@ -197,6 +197,41 @@ final class StoreTests: XCTestCase {
         XCTAssertTrue(text.contains("\"endsAt\" : \"2027-01-15T08:00:00Z\""), text)
     }
 
+    /// Store.parseDate takes `Z` or an offset and gives the same instant;
+    /// anything else is refused, including dates JSONDecoder's `.iso8601`
+    /// took. RecoveryScriptTests checks the scripts read the same table.
+    func testParseDateReadsOffsetsAndRefusesEverythingElse() {
+        let read: [(String, TimeInterval)] = [
+            ("2027-01-15T08:00:00Z", 1_800_000_000),
+            ("2027-01-15T10:00:00+02:00", 1_800_000_000),
+            ("2027-01-15T02:30:00-05:30", 1_800_000_000),
+            ("2027-01-16T07:59:00+23:59", 1_800_000_000),
+            ("2027-01-15T08:00:00-00:00", 1_800_000_000),
+            ("1970-01-01T00:30:00+01:00", -1800),
+            ("2028-02-29T00:00:00Z", 1_835_395_200),
+        ]
+        for (text, seconds) in read {
+            XCTAssertEqual(Store.parseDate(text)?.timeIntervalSince1970, seconds, text)
+        }
+        for text in ["2027-02-30T08:00:00Z", "2027-02-29T08:00:00Z", "2027-01-15T24:00:00Z", "2027-01-15T08:00:60Z",
+                     "2027-01-15T08:00:00Zjunk", "2027-01-15T08:00:00GMT", "2027-01-15T08:00:00+0200", "2027-01-15T08:00:00+02",
+                     "2027-01-15T08:00:00+24:00", "2027-01-15T08:00:00.5Z", "2027-01-15T08:00:00z", "2027-1-5T8:0:0Z",
+                     "1969-12-31T23:59:59Z", "10000-01-01T00:00:00Z", ""] {
+            XCTAssertNil(Store.parseDate(text), text)
+        }
+        let decoded = try? Store.makeDecoder().decode(Session.self, from: Data(#"{"startedAt":"2027-01-15T08:00:00Z","endsAt":"2027-02-30T08:00:00Z","extensions":[]}"#.utf8))
+        XCTAssertNil(decoded, "the decoder used .iso8601, which rolls February 30 over to March 2")
+    }
+
+    /// Every date the encoder writes, the decoder reads back.
+    func testEveryDateTheEncoderWritesIsReadBack() throws {
+        for seconds: TimeInterval in [0, 1_800_000_000, 1_835_395_200, 253_402_300_799] {
+            let t = Date(timeIntervalSince1970: seconds)
+            try store.saveSession(Session(startedAt: t, endsAt: t))
+            XCTAssertEqual(try store.loadSession()?.endsAt, t, "\(seconds)")
+        }
+    }
+
     func testAtomicWriteLeavesNoTempFile() throws {
         try store.saveState(RuntimeState())
         try store.saveState(RuntimeState())
