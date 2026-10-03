@@ -153,27 +153,34 @@ minute, and stop uninstall for good. It also does not hold back a new
 session or Quit. The app tries again at every lid open during a session,
 at every end, and at every launch, with or without a session. On a build
 or macOS where the guard allows the call, it reads the device first. Only
-a reading macOS is not holding down counts. A display asleep reads its
-idle-dim value, and a keyboard backlight suppressed after the wake, or
-idle-dimmed, reads 0 at any level. Such a reading decides nothing, and
-neither does a read that fails or a keyboard that reads as absent. The
-entry then stays as it is. The app reads it again every 3 s, 20 times, and
-then every minute for as long as it waits and the app runs, since outside
-a session nothing else acts on a lid open. While the lid is not known to
-be open it reads nothing, and the 3 s reads start again once it is. A busy
-recovery lock skips one read, not the rest. An end does not count a
-waiting entry as not restored, since nothing failed. The close left the
-device at 0, so a reading above 0 is a level set since, as the error
-asked: the darkening is already undone, and the entry is cleared without a
-write rather than overwrite that level. A device still at 0 gets the saved
-value and both keys are cleared. A failed write there clears the flag, and
-the entry is retried like any failed restore; if the flag cannot be
-cleared either, the end still counts the entry as not restored. A lid
-close that can read the device clears the flag too: it keeps the earlier
-saved value while the device reads 0, and saves the new level when it
-reads above 0. Uninstall goes ahead past a flagged entry, prints the saved
-level, and keeps state.json, even with `--purge`, so a later install that
-can make the call restores it.
+a reading taken with the lid known to be open, and that macOS is not
+holding down, counts. A closed lid leaves the device at 0 or turned off,
+and a write would light what the close keeps dark, so an end or a launch
+under a closed lid reads nothing and leaves the entry waiting. A display
+asleep reads its idle-dim value, and a keyboard backlight suppressed after
+the wake, or idle-dimmed, reads 0 at any level. Such a reading decides
+nothing, and neither does a read that fails or a keyboard that reads as
+absent. The entry then stays as it is. The app reads it again every 3 s,
+20 times, and then every minute for as long as it waits and the app runs,
+since outside a session nothing else acts on a lid open. While the lid is
+not known to be open it reads nothing, and the 3 s reads start again once
+it is. A busy recovery lock skips one read, not the rest. An end does not
+count a waiting entry as not restored, since nothing failed. The close
+left the device at 0, so a reading above 0 is a level set since, as the
+error asked: the darkening is already undone, and the entry is cleared
+without a write rather than overwrite that level. If state.json cannot
+take that clear, the entry still counts as done. The app retries only the
+clear, at the same pace, and reads and writes nothing for it, so a level
+the user lowers to 0 meanwhile stays at 0. A quit before the clear lands
+leaves the entry to the next launch, which reads the device again. A
+device still at 0 gets the saved value and both keys are cleared. A failed
+write there clears the flag, and the entry is retried like any failed
+restore; if the flag cannot be cleared either, the end still counts the
+entry as not restored. A lid close that can read the device clears the
+flag too: it keeps the earlier saved value while the device reads 0, and
+saves the new level when it reads above 0. Uninstall goes ahead past a
+flagged entry, prints the saved level, and keeps state.json, even with
+`--purge`, so a later install that can make the call restores it.
 
 The guards narrow the risk of calling a private function whose shape
 changed; they do not replace the hardware rows in

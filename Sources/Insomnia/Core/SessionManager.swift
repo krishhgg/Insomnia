@@ -178,6 +178,13 @@ final class SessionManager {
     /// failed to restore and its flag could not be cleared either, so on
     /// disk it still reads as refused and not dirty. An end counts it.
     @ObservationIgnored private var keptRestoreFailed = false
+    /// The saved value of a kept entry found set since whose clear from
+    /// the journal failed. The entry is done: only the clear is retried,
+    /// with no read and no write, so a later reading of 0 does not bring
+    /// the old value back over the level the user set. In memory only, so
+    /// a launch reads the device again.
+    @ObservationIgnored private var keptDisplayClearOwed: Float?
+    @ObservationIgnored private var keptKeyboardClearOwed: Float?
     /// Called just before Insomnia takes Low Power Mode over, before the
     /// ownership is journaled: `AppServices` samples the display brightness
     /// then, so the value journaled at a later lid close is the user's,
@@ -999,7 +1006,7 @@ final class SessionManager {
         if waiting.isEmpty {
             keptRecheckTask?.cancel()
         } else {
-            Log.info("\(waiting.joined(separator: "; ")); nothing written or cleared, read again in \(keptRecheckDelay)")
+            Log.info("\(waiting.joined(separator: "; ")); nothing written or cleared, tried again in \(keptRecheckDelay)")
             keptRecheckAttempt = 0
             keptRecheckSawLidClosed = false
             scheduleKeptRecheck(after: keptRecheckDelay)
@@ -1016,21 +1023,33 @@ final class SessionManager {
     /// and may be cleared without a write or left waiting: see keptLevel.
     private func restoreDisplay(saved: Float, waiting: inout [String], errors: inout [String]) -> Float? {
         if state.displayRestoreRefused {
+            let clear: (inout RuntimeState) -> Void = { s in
+                s.savedDisplayBrightness = nil
+                s.displayRestoreRefused = false
+            }
+            if keptDisplayClearOwed == saved {
+                if retryClear("display brightness", saved: saved, waiting: &waiting, clear: clear) {
+                    keptDisplayClearOwed = nil
+                }
+                return nil
+            }
+            keptDisplayClearOwed = nil
             switch keptLevel(read: { try display.readBrightness() },
                              untrusted: { display.isAsleep() ? "the display is asleep" : nil }) {
             case .undecided(let why):
                 waiting.append("display brightness \(saved), kept after a refused restore, not read: \(why)")
                 return nil
             case .setSince(let now):
-                clearSetSince("display brightness", saved: saved, now: now, errors: &errors) { s in
-                    s.savedDisplayBrightness = nil
-                    s.displayRestoreRefused = false
+                if !clearSetSince("display brightness", saved: saved, now: now, waiting: &waiting, errors: &errors, clear: clear) {
+                    keptDisplayClearOwed = saved
                 }
                 didSettleBrightness?(now, nil)
                 return nil
             case .dark:
                 break
             }
+        } else {
+            keptDisplayClearOwed = nil
         }
         do {
             try display.setBrightness(saved)
@@ -1059,21 +1078,33 @@ final class SessionManager {
     /// As restoreDisplay, for the keyboard backlight.
     private func restoreKeyboard(saved: Float, waiting: inout [String], errors: inout [String]) -> Float? {
         if state.keyboardRestoreRefused {
+            let clear: (inout RuntimeState) -> Void = { s in
+                s.savedKeyboardBrightness = nil
+                s.keyboardRestoreRefused = false
+            }
+            if keptKeyboardClearOwed == saved {
+                if retryClear("keyboard backlight", saved: saved, waiting: &waiting, clear: clear) {
+                    keptKeyboardClearOwed = nil
+                }
+                return nil
+            }
+            keptKeyboardClearOwed = nil
             switch keptLevel(read: { try keyboard.readBrightness() },
                              untrusted: { keyboard.isSuppressedOrDimmed() ? "macOS has the backlight suppressed or dimmed" : nil }) {
             case .undecided(let why):
                 waiting.append("keyboard backlight \(saved), kept after a refused restore, not read: \(why)")
                 return nil
             case .setSince(let now):
-                clearSetSince("keyboard backlight", saved: saved, now: now, errors: &errors) { s in
-                    s.savedKeyboardBrightness = nil
-                    s.keyboardRestoreRefused = false
+                if !clearSetSince("keyboard backlight", saved: saved, now: now, waiting: &waiting, errors: &errors, clear: clear) {
+                    keptKeyboardClearOwed = saved
                 }
                 didSettleBrightness?(nil, now)
                 return nil
             case .dark:
                 break
             }
+        } else {
+            keptKeyboardClearOwed = nil
         }
         do {
             try keyboard.setBrightness(saved)
@@ -1672,8 +1703,13 @@ final class SessionManager {
     /// keyboard that reads as absent: the entry stays as it is and is read
     /// again (see scheduleKeptRecheck). `untrusted` is asked before and
     /// after the read, so a device macOS took over in between does not
-    /// count either.
+    /// count either. Nor does any reading while the lid is not known to be
+    /// open: the closed lid left the device at 0 or macOS turned it off,
+    /// and a write would light what the close keeps dark. An end or launch
+    /// under a closed lid leaves the entry to the re-read, which waits for
+    /// the lid to open.
     private func keptLevel(read: () throws -> Float?, untrusted: () -> String?) -> KeptLevel {
+        guard clamshell() == false else { return .undecided("the lid is not known to be open") }
         if let why = untrusted() { return .undecided(why) }
         let now: Float?
         do {
@@ -1687,14 +1723,31 @@ final class SessionManager {
     }
 
     /// The level was set since the refused restore: the entry is done, and
-    /// is cleared without a write. If the journal cannot be written the
-    /// entry stays, and the next lid open or launch reads the device again.
-    private func clearSetSince(_ what: String, saved: Float, now: Float, errors: inout [String], clear: (inout RuntimeState) -> Void) {
+    /// is cleared without a write. Returns false if the journal cannot be
+    /// written: the entry stays on disk, waits, and only its clear is
+    /// retried (see `keptDisplayClearOwed`).
+    private func clearSetSince(_ what: String, saved: Float, now: Float, waiting: inout [String], errors: inout [String], clear: (inout RuntimeState) -> Void) -> Bool {
         Log.info("\(what) reads \(now), set since its restore to \(saved) was refused; left as set, and the saved value cleared")
         do {
             try journal(clear)
+            return true
         } catch {
             errors.append("\(what) was set since its restore was refused, but the saved value could not be cleared: \(error.localizedDescription); it will be retried")
+            waiting.append("\(what) \(saved), set since its refused restore, still to be cleared from the journal")
+            return false
+        }
+    }
+
+    /// A clear that failed after the level was found set since, tried
+    /// again with no read and no write. Returns true once it lands.
+    private func retryClear(_ what: String, saved: Float, waiting: inout [String], clear: (inout RuntimeState) -> Void) -> Bool {
+        do {
+            try journal(clear)
+            Log.info("\(what) \(saved), set since its refused restore, cleared from the journal")
+            return true
+        } catch {
+            waiting.append("\(what) \(saved), set since its refused restore, still to be cleared from the journal (\(error.localizedDescription))")
+            return false
         }
     }
 

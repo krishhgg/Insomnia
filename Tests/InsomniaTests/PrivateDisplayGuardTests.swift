@@ -481,7 +481,7 @@ final class RefusedDarkeningTests: XCTestCase {
         let waiting = try XCTUnwrap(try h.store.loadState())
         XCTAssertEqual(waiting.savedKeyboardBrightness, 0.3)
         XCTAssertTrue(waiting.keyboardRestoreRefused)
-        XCTAssertTrue(logText().contains("keyboard backlight 0.3, kept after a refused restore, not read: macOS has the backlight suppressed or dimmed; nothing written or cleared, read again in"), logText())
+        XCTAssertTrue(logText().contains("keyboard backlight 0.3, kept after a refused restore, not read: macOS has the backlight suppressed or dimmed; nothing written or cleared, tried again in"), logText())
 
         h.keyboard.brightness = 0.6
         h.keyboard.suppressedOrDimmed = false
@@ -715,6 +715,120 @@ final class RefusedDarkeningTests: XCTestCase {
         XCTAssertEqual(h.keyboard.sets, [], "the level set since is not overwritten")
         XCTAssertNil(try h.store.loadState()?.savedKeyboardBrightness)
         XCTAssertTrue(logText().contains("keyboard backlight reads 0.6, set since its restore to 0.3 was refused; left as set, and the saved value cleared"), logText())
+    }
+
+    /// A launch with no session and the lid closed: the display reads what
+    /// the closed lid leaves, and the keyboard 0 with nothing holding it
+    /// down. Neither reading decides anything, so nothing is written or
+    /// cleared. Once the lid opens the re-read writes the display, still
+    /// at 0, and clears the keyboard, set since, without a write.
+    func testALaunchUnderAClosedLidDecidesNothingUntilItOpens() async throws {
+        try seedSavedBrightness(sessionValid: false, refused: true)
+        h.clamshell.closed = true
+        h.display.brightness = 0.3
+        h.keyboard.brightness = 0
+        let m = h.makeManager(keptRecheckDelay: .milliseconds(50), keptRecheckSlowDelay: .milliseconds(20))
+
+        await m.reconcile()
+
+        XCTAssertEqual(h.display.sets, [], "a reading under the lid is not a level set since")
+        XCTAssertEqual(h.keyboard.sets, [], "nothing is written under the lid")
+        let waiting = try XCTUnwrap(try h.store.loadState())
+        XCTAssertEqual(waiting.savedDisplayBrightness, 0.8)
+        XCTAssertEqual(waiting.savedKeyboardBrightness, 0.3)
+        XCTAssertTrue(waiting.displayRestoreRefused)
+        XCTAssertTrue(waiting.keyboardRestoreRefused)
+        XCTAssertTrue(logText().contains("display brightness 0.8, kept after a refused restore, not read: the lid is not known to be open"), logText())
+        XCTAssertTrue(logText().contains("keyboard backlight 0.3, kept after a refused restore, not read: the lid is not known to be open"), logText())
+
+        h.display.brightness = 0
+        h.keyboard.brightness = 0.6
+        h.clamshell.closed = false
+        try await waitFor {
+            let s = try self.h.store.loadState()
+            return s?.savedDisplayBrightness == nil && s?.savedKeyboardBrightness == nil
+        }
+
+        XCTAssertEqual(h.display.sets.first, 0.8)
+        XCTAssertEqual(h.keyboard.sets, [], "the level set since is not overwritten")
+    }
+
+    /// As above for an expired session, whose end restores everything else
+    /// the journal holds, with the lid state unknown.
+    func testAnEndWithTheLidUnknownLeavesAKeptValueWaiting() async throws {
+        let now = h.clock.now
+        try h.store.saveSession(Session(startedAt: now.addingTimeInterval(-7200), endsAt: now.addingTimeInterval(-60)))
+        var st = RuntimeState()
+        st.savedKeyboardBrightness = 0.3
+        st.keyboardRestoreRefused = true
+        try h.store.saveState(st)
+        h.clamshell.closed = nil
+        h.keyboard.brightness = 0
+        let m = h.makeManager(keptRecheckDelay: .milliseconds(50), keptRecheckSlowDelay: .milliseconds(20))
+
+        await m.reconcile()
+
+        XCTAssertEqual(h.keyboard.sets, [])
+        XCTAssertEqual(try h.store.loadState()?.savedKeyboardBrightness, 0.3)
+        XCTAssertFalse(h.notifier.posts.contains { $0.title == SessionManager.incompleteTitle }, "\(h.notifier.posts)")
+        XCTAssertTrue(logText().contains("keyboard backlight 0.3, kept after a refused restore, not read: the lid is not known to be open"), logText())
+
+        h.clamshell.closed = false
+        try await waitFor { try self.h.store.loadState()?.savedKeyboardBrightness == nil }
+
+        XCTAssertEqual(h.keyboard.sets.first, 0.3, "still at 0 once the lid is open, so the kept value is written")
+    }
+
+    /// Both levels were set by hand, but state.json cannot take the clear.
+    /// The entries are done all the same: only the clear is retried, with
+    /// no read and no write, so when the user then turns both down to 0,
+    /// the old values do not come back over them. The clear lands once the
+    /// file can be written.
+    func testASetSinceWhoseClearFailsIsNeverWrittenAndClearedLater() async throws {
+        try seedSavedBrightness(sessionValid: false, refused: true)
+        h.clamshell.closed = false
+        h.display.brightness = 0.5
+        h.keyboard.brightness = 0.6
+        let m = h.makeManager(keptRecheckDelay: .milliseconds(50), keptRecheckSlowDelay: .milliseconds(20))
+        let file = h.home.paths.stateFile.path
+        try FileManager.default.setAttributes([.immutable: true], ofItemAtPath: file)
+        defer { try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: file) }
+
+        await m.reconcile()
+
+        XCTAssertEqual(h.display.sets, [])
+        XCTAssertEqual(h.keyboard.sets, [])
+        let error = try XCTUnwrap(m.lastError)
+        XCTAssertTrue(error.contains("display brightness was set since its restore was refused, but the saved value could not be cleared"), error)
+        XCTAssertTrue(error.contains("keyboard backlight was set since its restore was refused, but the saved value could not be cleared"), error)
+        XCTAssertTrue(logText().contains("display brightness 0.8, set since its refused restore, still to be cleared from the journal; keyboard backlight 0.3, set since its refused restore, still to be cleared from the journal; nothing written or cleared, tried again in"), logText())
+
+        h.display.brightness = 0
+        h.keyboard.brightness = 0
+        try await Task.sleep(for: .milliseconds(200))
+
+        XCTAssertEqual(h.display.sets, [], "the 0 the user set is not overwritten")
+        XCTAssertEqual(h.keyboard.sets, [], "the 0 the user set is not overwritten")
+        let kept = try XCTUnwrap(try h.store.loadState())
+        XCTAssertEqual(kept.savedDisplayBrightness, 0.8)
+        XCTAssertEqual(kept.savedKeyboardBrightness, 0.3)
+        XCTAssertTrue(kept.displayRestoreRefused)
+        XCTAssertTrue(kept.keyboardRestoreRefused)
+
+        try FileManager.default.setAttributes([.immutable: false], ofItemAtPath: file)
+        try await waitFor {
+            let s = try self.h.store.loadState()
+            return s?.savedDisplayBrightness == nil && s?.savedKeyboardBrightness == nil
+        }
+        try await Task.sleep(for: .milliseconds(100))
+
+        XCTAssertEqual(h.display.sets, [])
+        XCTAssertEqual(h.keyboard.sets, [])
+        let after = try XCTUnwrap(try h.store.loadState())
+        XCTAssertFalse(after.displayRestoreRefused)
+        XCTAssertFalse(after.keyboardRestoreRefused)
+        XCTAssertTrue(logText().contains("display brightness 0.8, set since its refused restore, cleared from the journal"), logText())
+        XCTAssertTrue(logText().contains("keyboard backlight 0.3, set since its refused restore, cleared from the journal"), logText())
     }
 
     /// The guard allows the call now but the write fails: an ordinary
