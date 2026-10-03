@@ -13,7 +13,8 @@
 #   ./scripts/install.sh                      builds it from this checkout
 #                                             (scripts/build-app.sh, ad-hoc
 #                                             signed unless INSOMNIA_SIGN_IDENTITY
-#                                             is set)
+#                                             is set); only from a checkout's
+#                                             scripts/ folder (in_checkout)
 #   ./install.sh --app /path/to/Insomnia.app  installs a prebuilt bundle, such
 #                                             as the one in a release zip, after
 #                                             checking its signature, bundle
@@ -75,13 +76,16 @@ BUNDLE_ID=com.kgarg.insomnia
 # --allow-unverified-origin.
 EXPECTED_TEAM_ID=""
 
-# The folder this script is in, and the only place its sibling scripts are
-# taken from. In a checkout that is scripts/, with build-app.sh and
-# backstop.sh beside it; in a release zip it is the unpacked folder, with
-# uninstall.sh beside it and no build script. Never its parent: a zip
-# unpacked at /tmp/Insomnia-<version> would make that /tmp, where any
-# account can create scripts/build-app.sh.
+# The folder this script is in. build-app.sh and backstop.sh are taken from
+# there, and only when it is the scripts/ folder of a source checkout, with
+# Package.swift one level up (in_checkout). A release zip's folder is not: it
+# holds Insomnia.app, install.sh and uninstall.sh, so a build-app.sh found
+# beside this script there was added after the zip was unpacked, for example
+# by another account that created the folder in /tmp beforehand. Never the
+# folder above either: a zip unpacked at /tmp/Insomnia-<version> would make
+# that /tmp, where any account can create scripts/build-app.sh.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+in_checkout() { [[ "${SCRIPT_DIR##*/}" == scripts && -f "${SCRIPT_DIR%/*}/Package.swift" ]]; }
 APP_DIR="$HOME/Applications"
 APP="$APP_DIR/Insomnia.app"
 APP_SUPPORT="$HOME/Library/Application Support/Insomnia"
@@ -349,8 +353,11 @@ REFUSE
   fi
   SOURCE_APP="$CHECKED_APP"
 else
-  if [[ ! -f "$SCRIPT_DIR/build-app.sh" ]]; then
-    echo "no build-app.sh beside this script in $SCRIPT_DIR, so there is no checkout to build from. To install the bundle of a release zip, pass it with --app (README, Install). Nothing was changed." >&2
+  if ! in_checkout || [[ ! -f "$SCRIPT_DIR/build-app.sh" ]]; then
+    echo "$SCRIPT_DIR is not the scripts folder of a source checkout (build-app.sh beside this script, Package.swift one level up), so there is nothing to build from. To install the bundle of a release zip, pass it with --app (README, Install). Nothing was changed." >&2
+    if [[ -e "$SCRIPT_DIR/build-app.sh" ]] && ! in_checkout; then
+      echo "$SCRIPT_DIR/build-app.sh was not run: a release zip has no build-app.sh, so it was added after the zip was unpacked." >&2
+    fi
     exit 1
   fi
   BUILD_DIR="$("$MKTEMP" -d)"

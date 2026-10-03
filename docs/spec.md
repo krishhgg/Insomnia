@@ -40,11 +40,14 @@ closed bag. Its design goals are to:
   `--app` after verifying it (one whose origin it cannot verify needs
   `--allow-unverified-origin`), to `~/Applications`. The Release workflow
   packages the same bundle (`docs/releasing.md`). `install.sh` and
-  `uninstall.sh` take sibling scripts (`build-app.sh`, `backstop.sh`) from
-  their own folder only, never the one above it: the release zip carries
+  `uninstall.sh` take sibling scripts (`build-app.sh`, `backstop.sh`) only
+  from a source checkout's `scripts/` folder, with `Package.swift` one level
+  up, and never from the folder above their own: the release zip carries
   both scripts at its top level, unpacked wherever the user chose, such as
-  `/tmp`. From a zip, `install.sh` without `--app` stops, and
-  `uninstall.sh` runs the verified bundle's sealed `backstop.sh`. The
+  `/tmp`, where another account may have created that folder first and
+  added files to it. Anywhere else, `install.sh` without `--app` stops and
+  runs no `build-app.sh` it finds, and `uninstall.sh` runs only the verified
+  bundle's sealed `backstop.sh`, or stops when the bundle has none. The
   staged copy of the bundle loses group and other write permission and
   every ACL before it is verified and installed (neither is part of the
   signature); extended attributes, the quarantine flag among them, stay.

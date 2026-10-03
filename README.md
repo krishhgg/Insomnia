@@ -93,9 +93,10 @@ open "$HOME/Applications/Insomnia.app"
 
 `scripts/install.sh` builds the same bundle the release workflow builds
 (`scripts/build-app.sh`), ad-hoc signed, and installs it the same way. It
-runs the `build-app.sh` in its own folder only, so the `install.sh` from a
-release zip, which has none beside it, stops and asks for `--app` instead of
-building.
+builds only when it runs from a checkout's `scripts` folder, with
+`Package.swift` one level up, and then runs the `build-app.sh` beside it. The
+`install.sh` from a release zip stops and asks for `--app` instead, even when
+a `build-app.sh` was added to its folder after unpacking.
 [docs/releasing.md](docs/releasing.md) describes the release pipeline.
 
 <details>
@@ -436,9 +437,12 @@ From your checkout:
 
 From the unpacked release zip, run `./uninstall.sh` (or `./uninstall.sh
 --purge`) in the `Insomnia-<version>-macos` folder. A checkout's uninstaller
-runs the `backstop.sh` beside it. The zip has none, so its uninstaller runs
+(in `scripts`, with `Package.swift` one level up) runs the `backstop.sh`
+beside it. Anywhere else, such as the zip's folder, the uninstaller runs only
 the copy sealed in the installed app, after `codesign --verify --strict`
-passes on the app. Neither looks in the folder above its own.
+passes on the app, and stops without removing anything when there is none.
+The zip has no `backstop.sh`, so one added beside its uninstaller is not run.
+Neither looks in the folder above its own.
 
 The uninstaller requests cleanup before removing the app, agent, and sudoers
 rule. If recovery is incomplete or the app refuses to quit, it stops; resolve

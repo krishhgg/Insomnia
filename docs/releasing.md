@@ -20,10 +20,13 @@ only in the signature. The workflow sets `INSOMNIA_LID_SIMULATION` empty, so
 a release never carries the `simulate-lid.sh` watcher.
 
 The two scripts sit at the zip's top level, so the folder above theirs is
-wherever the user unpacked it. They take sibling scripts from their own
-folder only (`ReleaseWorkflowTests` checks the ones the Package step
-copies): the zip's `install.sh` needs `--app`, and its `uninstall.sh` runs
-the `backstop.sh` sealed in the installed app after verifying the app.
+wherever the user unpacked it. They never take scripts from the folder
+above their own (`ReleaseWorkflowTests` checks the ones the Package step
+copies), and they take sibling scripts only from a source checkout's
+`scripts/` folder with `Package.swift` one level up. The zip's folder is not
+one, so its `install.sh` needs `--app`, and its `uninstall.sh` runs only the
+`backstop.sh` sealed in the installed app, after verifying the app. A
+`build-app.sh` or `backstop.sh` added to the unpacked folder is not run.
 
 ## Cutting a release
 

@@ -1678,6 +1678,69 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(fx.exists(fx.app))
     }
 
+    /// A backstop.sh added beside the zip's uninstall.sh (the zip has none),
+    /// as another account could do in a folder it created in /tmp before the
+    /// zip was unpacked there, is not run. Outside a source checkout
+    /// (scripts/ with Package.swift one level up) uninstall.sh runs only the
+    /// sealed copy, after the bundle verifies, and says it left the other
+    /// one alone. Also in a folder named scripts with no Package.swift above
+    /// it, and in a zip folder unpacked inside a checkout, which has
+    /// Package.swift above it but is not scripts/.
+    func testUninstallFromAZipRunsTheSealedCopyNotABackstopPlantedBesideIt() throws {
+        for folder in ["shared-tmp/Insomnia-0.1.0-macos", "shared-tmp/scripts", "repo/Insomnia-0.1.0-macos"] {
+            fx.destroy()
+            fx = try ScriptFixture()
+            try fx.installMachinery()
+            try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+            try fx.writeMarkerBackstop(at: fx.installedBackstop, name: "sealed")
+            let unpacked = fx.root.appendingPathComponent(folder, isDirectory: true)
+            try FileManager.default.createDirectory(at: unpacked, withIntermediateDirectories: true)
+            try FileManager.default.copyItem(at: fx.uninstall, to: unpacked.appendingPathComponent("uninstall.sh"))
+            let planted = unpacked.appendingPathComponent("backstop.sh")
+            try fx.writeMarkerBackstop(at: planted, name: "planted")
+
+            let r = try fx.run(unpacked.appendingPathComponent("uninstall.sh"))
+
+            XCTAssertEqual(r.status, 0, "\(folder): " + r.stderr + r.stdout)
+            XCTAssertEqual(fx.calls().filter { $0.hasPrefix("backstop ") }, ["backstop sealed --force"], "\(folder): \(fx.calls())")
+            XCTAssertTrue(r.stdout.contains("using \(fx.installedBackstop.path)"), r.stdout)
+            XCTAssertTrue(r.stderr.contains("not running \(planted.path): \(unpacked.path) is not the scripts folder of a source checkout"), r.stderr)
+            let verify = try XCTUnwrap(fx.calls().firstIndex(of: "codesign --verify --strict \(fx.app.path)"), "the sealed copy is verified: \(fx.calls())")
+            let ran = try XCTUnwrap(fx.calls().firstIndex(of: "backstop sealed --force"))
+            XCTAssertLessThan(verify, ran, "verified before it runs: \(fx.calls())")
+            XCTAssertFalse(fx.exists(fx.app))
+        }
+    }
+
+    /// From a zip folder, the sealed copy is the only one uninstall.sh runs.
+    /// With no sealed copy in the installed app, it runs neither a planted
+    /// backstop.sh beside it nor the writable copy an install before the
+    /// sealed layout left in Application Support, removes nothing, and
+    /// names the checkout's uninstaller (which still runs the writable copy,
+    /// see testUninstallRunsTheLegacyCopyWhenNeitherCheckoutNorBundleHasOne).
+    func testUninstallFromAZipRunsNoOtherCopyWhenTheBundleHasNoSealedOne() throws {
+        try fx.installMachinery()
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        try FileManager.default.removeItem(at: fx.installedBackstop)
+        try fx.writeMarkerBackstop(at: fx.legacyBackstop, name: "legacy")
+        let unpacked = fx.root.appendingPathComponent("shared-tmp/Insomnia-0.1.0-macos", isDirectory: true)
+        try FileManager.default.createDirectory(at: unpacked, withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: fx.uninstall, to: unpacked.appendingPathComponent("uninstall.sh"))
+        try fx.writeMarkerBackstop(at: unpacked.appendingPathComponent("backstop.sh"), name: "planted")
+
+        let r = try fx.run(unpacked.appendingPathComponent("uninstall.sh"), ["--purge"])
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("backstop ") }, "neither the planted nor the writable copy ran: \(fx.calls())")
+        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("launchctl") || $0.hasPrefix("sudo") }, "\(fx.calls())")
+        XCTAssertTrue(r.stderr.contains("no backstop.sh sealed in \(fx.app.path)/Contents/Resources, and outside a source checkout this script runs no other copy; nothing was removed."), r.stderr)
+        XCTAssertTrue(r.stderr.contains("Run scripts/uninstall.sh from a checkout of the source"), r.stderr)
+        for kept in [fx.plist, fx.sudoers, fx.app, fx.config, fx.legacyBackstop] {
+            XCTAssertTrue(fx.exists(kept), kept.path)
+        }
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, true)
+    }
+
     /// The sealed copy is covered by the bundle's resource seal; when the
     /// bundle no longer verifies (the script was edited, as the LaunchAgent
     /// would also find), uninstall does not run it and removes nothing. The
@@ -2561,10 +2624,41 @@ final class RecoveryScriptTests: XCTestCase {
 
         XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
         XCTAssertEqual(fx.callsBesideScratchFiles(), [], "nothing ran, the planted script included")
-        XCTAssertTrue(r.stderr.contains("no build-app.sh beside this script in \(unpacked.path)"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("\(unpacked.path) is not the scripts folder of a source checkout"), r.stderr)
         XCTAssertTrue(r.stderr.contains("pass it with --app"), r.stderr)
         XCTAssertFalse(fx.exists(fx.sudoers))
         XCTAssertFalse(fx.exists(fx.app))
+    }
+
+    /// A build-app.sh added beside the zip's install.sh, as another account
+    /// could do in a folder it created in /tmp before the zip was unpacked
+    /// there. Without --app, install.sh builds only in a source checkout
+    /// (scripts/ with Package.swift one level up), so it refuses, runs
+    /// nothing and says the script was not run. Also in a folder named
+    /// scripts with no Package.swift above it, and in a zip folder unpacked
+    /// inside a checkout, which has Package.swift above it but is not
+    /// scripts/.
+    func testInstallFromAZipRunsNoBuildScriptPlantedBesideIt() throws {
+        try fx.prepareInstall()
+        for folder in ["shared-tmp/Insomnia-0.1.0-macos", "shared-tmp/scripts", "repo/Insomnia-0.1.0-macos"] {
+            fx.clearCalls()
+            let unpacked = fx.root.appendingPathComponent(folder, isDirectory: true)
+            try FileManager.default.createDirectory(at: unpacked, withIntermediateDirectories: true)
+            try FileManager.default.copyItem(at: fx.installRedirected, to: unpacked.appendingPathComponent("install.sh"))
+            let planted = unpacked.appendingPathComponent("build-app.sh")
+            try "#!/bin/bash\nprintf 'planted build-app.sh %s\\n' \"$*\" >> \"\(fx.callsLog.path)\"\nexit 0\n"
+                .write(to: planted, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: planted.path)
+
+            let r = try fx.run(unpacked.appendingPathComponent("install.sh"), extraEnvironment: ["USER": "tester"])
+
+            XCTAssertEqual(r.status, 1, "\(folder): " + r.stderr + r.stdout)
+            XCTAssertEqual(fx.callsBesideScratchFiles(), [], "\(folder): nothing ran, the planted script included")
+            XCTAssertTrue(r.stderr.contains("\(unpacked.path) is not the scripts folder of a source checkout"), r.stderr)
+            XCTAssertTrue(r.stderr.contains("\(planted.path) was not run: a release zip has no build-app.sh"), r.stderr)
+            XCTAssertFalse(fx.exists(fx.sudoers))
+            XCTAssertFalse(fx.exists(fx.app))
+        }
     }
 
     /// Integrity is not origin: an ad-hoc bundle, or a Developer ID bundle
@@ -4137,6 +4231,9 @@ private final class ScriptFixture {
         for dir in [home, bin, repoScripts, appsDir] {
             try fm.createDirectory(at: dir, withIntermediateDirectories: true)
         }
+        // repo/ is a source checkout to install.sh and uninstall.sh: their
+        // folder is scripts/, with Package.swift one level up.
+        try "// swift-tools-version: 6.2\n".write(to: root.appendingPathComponent("repo/Package.swift"), atomically: true, encoding: .utf8)
         try writeFakes()
         try writeScriptCopies()
         try bootUUID.write(to: root.appendingPathComponent("boot.uuid"), atomically: true, encoding: .utf8)
