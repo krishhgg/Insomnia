@@ -253,9 +253,12 @@ password unreadable by this build" in the right-click menu and in Settings,
 and sends one notification per outage. Enter the password again in Settings
 and save; the save writes the new password before it removes the old item,
 and macOS may ask you to allow Insomnia to delete the old one, or to unlock
-the login keychain. The Save button reads "Saving…" until macOS answers,
-and "Saved" only while the SSID and password fields still hold what was
-saved. The rest of Insomnia, including the battery floor and End, keeps
+the login keychain. If that save is cut off after the old item is gone,
+the password reads as missing and you enter it once more: Insomnia never
+reads a half-finished save's copy. The Save button reads "Saving…" until
+macOS answers, and "Saved" only while the SSID and password fields still
+hold what was saved. A join or a Settings read that was waiting while you
+changed the SSID is dropped; the next retry uses the new SSID. The rest of Insomnia, including the battery floor and End, keeps
 running while the dialog is open. A build signed with a stable identity would keep
 the item readable across upgrades.
 

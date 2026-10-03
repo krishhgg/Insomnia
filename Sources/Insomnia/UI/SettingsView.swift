@@ -45,10 +45,10 @@ struct SettingsView: View {
         // The failover may find the saved password unreadable while the
         // window is open; the notice follows what it reports.
         .onChange(of: manager.services?.status.hotspotPasswordProblem) { _, problem in
-            let request = hotspot.startRead()
+            let request = hotspot.startRead(ssid: manager.config.hotspotSSID)
             Task {
                 let notice = await Self.hotspotNotice(reported: problem, reread: secrets.peek)
-                _ = hotspot.finishRead(request, notice: notice)
+                _ = hotspot.finishRead(request, ssid: manager.config.hotspotSSID, notice: notice)
             }
         }
         // The preview depends on the toggle, both lists and what is running:
@@ -290,12 +290,13 @@ struct SettingsView: View {
     /// Reads without a keychain prompt. An item this build may not read
     /// leaves the field empty and says why, so the user re-enters it;
     /// saving then replaces the item (see `KeychainStore`). The read can
-    /// wait behind a save, so anything typed meanwhile is kept.
+    /// wait behind a save, so anything typed meanwhile is kept, and a
+    /// password read for an SSID edited away meanwhile is not shown.
     private func loadPassword() {
-        let request = hotspot.startRead()
+        let request = hotspot.startRead(ssid: manager.config.hotspotSSID)
         Task {
             let loaded = await Self.loadedPassword(secrets.load)
-            guard hotspot.finishRead(request, notice: loaded.notice) else { return }
+            guard hotspot.finishRead(request, ssid: manager.config.hotspotSSID, notice: loaded.notice) else { return }
             if hotspotPassword.isEmpty { hotspotPassword = loaded.password }
         }
     }
@@ -328,15 +329,24 @@ struct SettingsView: View {
     /// until the keychain answers; one save at a time.
     private func savePassword() {
         guard hotspot.startSave() else { return }
-        if !manager.config.hotspotSSID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        if !HotspotSSID.normalized(manager.config.hotspotSSID).isEmpty {
             locationPermission.requestWhenInUse()
         }
         let password = hotspotPassword
         Task {
             let outcome = await Self.storePassword(password, in: secrets)
             hotspot.finishSave(outcome)
-            if outcome.notice == nil { manager.services?.hotspotPasswordChanged() }
+            Self.passwordStored(outcome, configuredSSID: manager.config.hotspotSSID, services: manager.services)
         }
+    }
+
+    /// A save or clear answered. The failover's report about the password
+    /// goes, and the next outage notifies afresh, only when it stored for
+    /// the hotspot configured now: after an SSID edit during the wait, the
+    /// report is about an SSID this save did not touch.
+    static func passwordStored(_ outcome: HotspotStoreOutcome, configuredSSID: String, services: AppServices?) {
+        guard outcome.isStored(for: configuredSSID) else { return }
+        services?.hotspotPasswordChanged()
     }
 
     /// Saves `password`, or clears the saved one when it is empty, and

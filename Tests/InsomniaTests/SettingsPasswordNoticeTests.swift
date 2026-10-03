@@ -130,6 +130,36 @@ final class SettingsPasswordSaveTests: XCTestCase {
         XCTAssertEqual(field.buttonTitle(ssid: "Phone", password: "pw"), "Saved")
     }
 
+    /// The SSID changes while a save waits, and the failover has reported
+    /// the hotspot's password missing. The save stored for the old SSID,
+    /// so the report about the hotspot configured now stays in the menu.
+    /// The same save answering with the SSID unchanged clears it.
+    func testASaveForAnSSIDEditedAwayLeavesTheFailoversReport() async throws {
+        let services = AppServices(
+            paths: h.home.paths,
+            notifier: RecordingNotifier(),
+            audio: FakeAudioControl(),
+            processControl: FakeProcessControl(),
+            locationPermission: LocationPermission(authorizationStatus: .authorizedAlways)
+        )
+        services.status.hotspotPasswordProblem = .missing
+        let keychain = BlockingKeychain()
+        let ssid = Locked("Phone")
+        let store = KeychainHotspotSecretStore(keychain: keychain, queue: KeychainQueue()) { ssid.value }
+        let saving = Task { await SettingsView.storePassword("pw", in: store) }
+        await fulfillment(of: [keychain.entered], timeout: 5)
+
+        ssid.value = "Other Phone"
+        keychain.release()
+        let outcome = await saving.value
+        SettingsView.passwordStored(outcome, configuredSSID: ssid.value, services: services)
+
+        XCTAssertEqual(services.status.hotspotPasswordProblem, .missing)
+        XCTAssertFalse(keychain.gaveUp)
+        SettingsView.passwordStored(outcome, configuredSSID: "Phone", services: services)
+        XCTAssertNil(services.status.hotspotPasswordProblem)
+    }
+
     /// A failed save says so under the field.
     func testAFailedSaveReturnsTheNotice() async {
         final class Refusing: KeychainStoring, @unchecked Sendable {
@@ -187,10 +217,10 @@ final class HotspotPasswordFieldTests: XCTestCase {
     func testARecheckStartedDuringASaveDoesNotHideItsFailure() {
         var field = HotspotPasswordField()
         _ = field.startSave()
-        let recheck = field.startRead()
+        let recheck = field.startRead(ssid: "Phone")
         field.finishSave(refused)
 
-        XCTAssertFalse(field.finishRead(recheck, notice: nil))
+        XCTAssertFalse(field.finishRead(recheck, ssid: "Phone", notice: nil))
         XCTAssertEqual(field.notice, refused.notice)
     }
 
@@ -199,10 +229,10 @@ final class HotspotPasswordFieldTests: XCTestCase {
     /// the clear, so its answer is dropped and does not refill the field.
     func testALoadStartedBeforeAClearDoesNotRefillTheField() {
         var field = HotspotPasswordField()
-        let load = field.startRead()
+        let load = field.startRead(ssid: "Phone")
         XCTAssertTrue(field.startSave())
 
-        XCTAssertFalse(field.finishRead(load, notice: nil), "the view fills the field only when this is true")
+        XCTAssertFalse(field.finishRead(load, ssid: "Phone", notice: nil), "the view fills the field only when this is true")
         field.finishSave(.stored(.init(ssid: "Phone", password: "")))
         XCTAssertNil(field.notice)
     }
@@ -213,24 +243,93 @@ final class HotspotPasswordFieldTests: XCTestCase {
         var field = HotspotPasswordField()
         _ = field.startSave()
         field.finishSave(refused)
-        let recheck = field.startRead()
+        let recheck = field.startRead(ssid: "Phone")
 
-        XCTAssertTrue(field.finishRead(recheck, notice: HotspotPasswordProblem.unreadable.settingsNotice))
+        XCTAssertTrue(field.finishRead(recheck, ssid: "Phone", notice: HotspotPasswordProblem.unreadable.settingsNotice))
         XCTAssertEqual(field.notice, HotspotPasswordProblem.unreadable.settingsNotice)
+    }
+
+    /// The SSID is edited while a load or recheck waits behind a save. Its
+    /// answer is about the old SSID's item, so it is dropped: the view
+    /// neither fills the field nor changes the notice. Spaces around the
+    /// SSID do not count as an edit.
+    func testAReadForAnSSIDEditedAwayIsDropped() {
+        var field = HotspotPasswordField()
+        let load = field.startRead(ssid: "Phone")
+        XCTAssertFalse(field.finishRead(load, ssid: "Other Phone", notice: "about Phone"))
+        XCTAssertNil(field.notice)
+
+        let recheck = field.startRead(ssid: "Phone")
+        XCTAssertTrue(field.finishRead(recheck, ssid: " Phone\n", notice: "about Phone"))
+        XCTAssertEqual(field.notice, "about Phone")
+    }
+
+    /// Only a save or clear that stored for the SSID configured now counts
+    /// as a new password for the failover.
+    func testOnlyAStoreForTheConfiguredSSIDCountsAsANewPassword() {
+        XCTAssertTrue(stored.isStored(for: "Phone"))
+        XCTAssertTrue(stored.isStored(for: " Phone\n"))
+        XCTAssertFalse(stored.isStored(for: "Other Phone"))
+        XCTAssertFalse(stored.isStored(for: ""))
+        XCTAssertFalse(refused.isStored(for: "Phone"))
     }
 
     /// Of two reads, only the newer one sets the notice, and a successful
     /// save clears it.
     func testOnlyTheNewestReadSetsTheNoticeAndASaveClearsIt() {
         var field = HotspotPasswordField()
-        let first = field.startRead()
-        let second = field.startRead()
-        XCTAssertTrue(field.finishRead(second, notice: "second"))
-        XCTAssertFalse(field.finishRead(first, notice: "first"))
+        let first = field.startRead(ssid: "Phone")
+        let second = field.startRead(ssid: "Phone")
+        XCTAssertTrue(field.finishRead(second, ssid: "Phone", notice: "second"))
+        XCTAssertFalse(field.finishRead(first, ssid: "Phone", notice: "first"))
         XCTAssertEqual(field.notice, "second")
 
         _ = field.startSave()
         field.finishSave(stored)
         XCTAssertNil(field.notice)
+    }
+}
+
+/// The fake the blocked-save tests rely on. Its wait ends on `release()`.
+/// A call on the main thread, where nothing could release it, does not
+/// wait, and the watchdog ends a wait nobody released; both set `gaveUp`.
+final class BlockingKeychainTests: XCTestCase {
+    func testAWaitEndsOnRelease() async throws {
+        let keychain = BlockingKeychain()
+        let saving = Task.detached { try keychain.set(service: "s", account: "a", value: "pw") }
+        await fulfillment(of: [keychain.entered], timeout: 5)
+
+        XCTAssertTrue(keychain.isWaiting)
+        XCTAssertNil(try keychain.get(service: "s", account: "a"))
+        keychain.release()
+        try await saving.value
+
+        XCTAssertFalse(keychain.isWaiting)
+        XCTAssertFalse(keychain.gaveUp)
+        XCTAssertFalse(keychain.calledOnMainThread)
+        XCTAssertEqual(try keychain.get(service: "s", account: "a"), "pw")
+    }
+
+    /// The watchdog is short here only so that a fake that did wait on
+    /// the main thread fails this test at once instead of after it.
+    @MainActor
+    func testACallOnTheMainThreadDoesNotWait() throws {
+        let keychain = BlockingKeychain(blocking: .delete, watchdog: .milliseconds(1), items: ["s/a": "pw"])
+
+        try keychain.delete(service: "s", account: "a")
+
+        XCTAssertTrue(keychain.calledOnMainThread)
+        XCTAssertTrue(keychain.gaveUp)
+        XCTAssertFalse(keychain.isWaiting)
+        XCTAssertNil(try keychain.get(service: "s", account: "a"))
+    }
+
+    func testTheWatchdogEndsAWaitNobodyReleased() async throws {
+        let keychain = BlockingKeychain(watchdog: .milliseconds(50))
+
+        try await Task.detached { try keychain.set(service: "s", account: "a", value: "pw") }.value
+
+        XCTAssertTrue(keychain.gaveUp)
+        XCTAssertFalse(keychain.calledOnMainThread)
     }
 }

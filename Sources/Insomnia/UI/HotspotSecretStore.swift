@@ -88,7 +88,7 @@ final class KeychainHotspotSecretStore: HotspotSecretStore {
     }
 
     private func currentSSID() -> String {
-        ssidProvider().trimmingCharacters(in: .whitespacesAndNewlines)
+        HotspotSSID.normalized(ssidProvider())
     }
 }
 

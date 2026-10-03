@@ -633,9 +633,15 @@ func settleQueuedRequests() async {
 
 /// A keychain whose `set`, or `delete`, blocks its thread until
 /// `release()`, the way a save or a clear waits while macOS shows a
-/// keychain dialog. The wait gives up after `limit` so a call made on the
-/// main actor fails a test instead of hanging it; `gaveUp` says it did.
-/// Reads, and the call that does not block, answer at once from memory.
+/// keychain dialog. `release()` is the only thing tests wait on; no test
+/// depends on how long the wait lasts. Two cases end it otherwise, and
+/// both set `gaveUp`, which every test checks: a call on the main thread
+/// does not wait at all, since the test that would release it runs there
+/// (a call that belongs on `KeychainQueue` made on the main actor), and
+/// the `watchdog` ends a wait no test released, so a broken test fails
+/// instead of hanging the suite. The watchdog is far longer than any of
+/// these tests takes. Reads, and the call that does not block, answer at
+/// once from memory.
 final class BlockingKeychain: KeychainStoring, @unchecked Sendable {
     enum Call { case set, delete }
 
@@ -643,22 +649,25 @@ final class BlockingKeychain: KeychainStoring, @unchecked Sendable {
     let entered = XCTestExpectation(description: "the keychain call is waiting")
     private let blocks: Call
     private let gate = DispatchSemaphore(value: 0)
-    private let limit: DispatchTimeInterval
+    private let watchdog: DispatchTimeInterval
     private let lock = NSLock()
     private var items: [String: String] = [:]
     private var waiting = false
     private var _gaveUp = false
+    private var _calledOnMainThread = false
 
-    init(blocking blocks: Call = .set, limit: DispatchTimeInterval = .seconds(5), items: [String: String] = [:]) {
+    init(blocking blocks: Call = .set, watchdog: DispatchTimeInterval = .seconds(120), items: [String: String] = [:]) {
         self.blocks = blocks
-        self.limit = limit
+        self.watchdog = watchdog
         self.items = items
         entered.assertForOverFulfill = false
     }
 
-    /// Whether a `set` is inside its wait right now.
+    /// Whether the blocking call is inside its wait right now.
     var isWaiting: Bool { lock.withLock { waiting } }
     var gaveUp: Bool { lock.withLock { _gaveUp } }
+    /// Whether the blocking call came on the main thread, and so did not wait.
+    var calledOnMainThread: Bool { lock.withLock { _calledOnMainThread } }
 
     func release() { gate.signal() }
 
@@ -677,9 +686,17 @@ final class BlockingKeychain: KeychainStoring, @unchecked Sendable {
     }
 
     private func wait() {
+        guard !Thread.isMainThread else {
+            lock.withLock {
+                _calledOnMainThread = true
+                _gaveUp = true
+            }
+            entered.fulfill()
+            return
+        }
         lock.withLock { waiting = true }
         entered.fulfill()
-        let answered = gate.wait(timeout: .now() + limit) == .success
+        let answered = gate.wait(timeout: .now() + watchdog) == .success
         lock.withLock {
             waiting = false
             if !answered { _gaveUp = true }

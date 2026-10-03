@@ -154,6 +154,15 @@ struct KeychainError: Error, LocalizedError, Sendable {
     }
 }
 
+/// The configured hotspot SSID as the keychain account: what the failover
+/// joins and Settings saves under. One rule for both, so a check that the
+/// SSID is still the same after a keychain wait compares like with like.
+enum HotspotSSID {
+    static func normalized(_ configured: String) -> String {
+        configured.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
 /// Why the failover has no hotspot password to join with. Shown in the
 /// menu, in Settings and in one notification per outage; the join is never
 /// skipped without one of these being surfaced.
@@ -404,23 +413,25 @@ struct SecurityItemCalls: KeychainItemCalls {
 /// build may not open fails with `KeychainError.isUnreadableWithoutPrompt`
 /// and the caller surfaces `HotspotPasswordProblem.unreadable`.
 ///
-/// A save never leaves the user without a password, and it writes to the
-/// keychain file that holds the item reads find, which need not be the
-/// default keychain. A locked keychain hides this build's items as well as
-/// another build's, so a save that finds the item unreadable first unlocks
-/// that keychain and starts over. An item this build can read already
-/// names this build in its access list, so only its value changes, in
-/// place. An item it still cannot read is another build's and needs a new
-/// access list, which the file-based keychain changes only by replacing
-/// the item: the new password goes beside it under
-/// `replacementService(for:)`, the old item is deleted, and the new one is
-/// renamed into its place. `get` reads the replacement when the item itself
-/// is missing or unreadable, so a save that fails or is cut off at any step
-/// leaves a password reads return, the one they returned before or the new
-/// one. The prompts a save may raise, the unlock and the delete of another
-/// build's item, are allowed because a save or clear is the user's own
-/// click in Settings. Every call can wait on such a prompt, so the app
-/// runs them on `KeychainQueue`.
+/// A save writes to the keychain file that holds the item reads find,
+/// which need not be the default keychain. A locked keychain hides this
+/// build's items as well as another build's, so a save that finds the
+/// item unreadable first unlocks that keychain and starts over. An item
+/// this build can read already names this build in its access list, so
+/// only its value changes, in place. An item it still cannot read is
+/// another build's and needs a new access list, which the file-based
+/// keychain changes only by replacing the item: the new password goes
+/// beside it under `replacementService(for:)`, the old item is deleted,
+/// and the new one is renamed into its place. `get` reads only the item
+/// itself, never a replacement, so it cannot return a password some other
+/// save left under that name, in this keychain or another one on the
+/// search list. The cost is one rare state: a save stopped between the
+/// delete and the rename leaves the new password where reads do not look,
+/// the password reads as missing, and the user enters it again; that save
+/// then finishes the swap. The prompts a save may raise, the unlock and
+/// the delete of another build's item, are allowed because a save or clear
+/// is the user's own click in Settings. Every call can wait on such a
+/// prompt, so the app runs them on `KeychainQueue`.
 ///
 /// `kSecAttrAccessible` (this device only, when unlocked) is not set: the
 /// file-based login keychain accepts and drops it (measured on a throwaway
@@ -470,25 +481,12 @@ struct KeychainStore: KeychainStoring, @unchecked Sendable {
         self.prompts = prompts
     }
 
+    /// The item itself only. A replacement is never read: which save left
+    /// it, and whether that save finished, is not known.
     func get(service: String, account: String) throws -> String? {
         let (status, data) = try read(service: service, account: account)
         if status == errSecSuccess { return data.map { String(decoding: $0, as: UTF8.self) } }
-        guard status == errSecItemNotFound || KeychainError(status: status).isUnreadableWithoutPrompt else {
-            throw KeychainError(status: status)
-        }
-        // A save that was replacing this item stopped before the rename:
-        // the replacement holds the newer password. A save puts it in the
-        // keychain that holds the item, so while the item is there only
-        // that keychain is read; a replacement in another keychain on the
-        // search list is left from some other save. With the item gone,
-        // its keychain is not known, and the search list is read.
-        let holder = status == errSecItemNotFound ? nil : try keychainHolding(service: service, account: account)
-        let (replacementStatus, replacement) = try read(service: Self.replacementService(for: service), account: account, in: holder)
-        if replacementStatus == errSecSuccess { return replacement.map { String(decoding: $0, as: UTF8.self) } }
-        if status == errSecItemNotFound {
-            if replacementStatus == errSecItemNotFound { return nil }
-            throw KeychainError(status: replacementStatus)
-        }
+        if status == errSecItemNotFound { return nil }
         throw KeychainError(status: status)
     }
 
@@ -523,8 +521,8 @@ struct KeychainStore: KeychainStoring, @unchecked Sendable {
             try replaceUnreadable(service: service, account: account, data: data, in: holder)
             return
         }
-        // A replacement left by an interrupted save is only read while this
-        // item is missing or unreadable; remove it if that needs no prompt.
+        // Reads never use a replacement left by an interrupted save; remove
+        // it if that needs no prompt.
         let leftover = query(service: Self.replacementService(for: service), account: account) as CFDictionary
         _ = try? withPrompts(false) { calls.delete(leftover) }
     }
@@ -534,18 +532,17 @@ struct KeychainStore: KeychainStoring, @unchecked Sendable {
         try deleteItem(service: Self.replacementService(for: service), account: account, in: nil)
     }
 
-    /// Another build's item, in an unlocked keychain. Each step leaves a
-    /// password `get` can find: what it found before until the new
-    /// password is written, the new one from then on. A replacement this
-    /// build can read, left by a save that stopped short, is what `get`
-    /// returns now, so it is never deleted first: its value changes in
-    /// place. One this build cannot read is another build's and is deleted
-    /// before the add. A refused delete of the old item (the user declined
-    /// the prompt) puts the replacement back as it was, removing one this
-    /// save added, and keeps the old item.
+    /// Another build's item, in an unlocked keychain. Until the old item
+    /// is deleted, reads find it, unreadable as before; after the rename
+    /// they find the new password. In between they find nothing, because
+    /// `get` never reads the replacement. A replacement this build can
+    /// read, left by a save that stopped short, has its value changed in
+    /// place. One this build cannot read is another build's and is
+    /// deleted before the add. A refused delete of the old item (the user
+    /// declined the prompt) removes the replacement and keeps the old item.
     private func replaceUnreadable(service: String, account: String, data: Data, in holder: SecKeychain?) throws {
         let replacement = Self.replacementService(for: service)
-        let (status, earlier) = try read(service: replacement, account: account, in: holder)
+        let (status, _) = try read(service: replacement, account: account, in: holder)
         switch status {
         case errSecSuccess:
             try updateValue(service: replacement, account: account, data: data, in: holder)
@@ -554,8 +551,8 @@ struct KeychainStore: KeychainStoring, @unchecked Sendable {
         default:
             guard KeychainError(status: status).isUnreadableWithoutPrompt else { throw KeychainError(status: status) }
             // Only while the keychain is unlocked does unreadable mean
-            // another build's; a keychain that locked again since the
-            // check could be hiding this build's replacement.
+            // another build's. One that locked again since the check stops
+            // the save here: the delete would ask to unlock it a second time.
             guard try !isLocked(holder) else { throw KeychainError(status: errSecInteractionNotAllowed) }
             try deleteItem(service: replacement, account: account, in: holder)
             try add(service: replacement, account: account, data: data, label: service, to: holder)
@@ -563,12 +560,10 @@ struct KeychainStore: KeychainStoring, @unchecked Sendable {
         do {
             try deleteItem(service: service, account: account, in: holder)
         } catch {
-            if status != errSecSuccess {
-                let added = query(service: replacement, account: account, in: holder) as CFDictionary
-                _ = try? withPrompts(false) { calls.delete(added) }
-            } else if let earlier {
-                try? updateValue(service: replacement, account: account, data: earlier, in: holder)
-            }
+            // This save wrote the replacement, so this build can delete it
+            // without a prompt.
+            let written = query(service: replacement, account: account, in: holder) as CFDictionary
+            _ = try? withPrompts(false) { calls.delete(written) }
             throw error
         }
         let renamed = query(service: replacement, account: account, in: holder) as CFDictionary
@@ -948,7 +943,7 @@ final class NetworkFailover {
 
     func joinHotspot() async {
         let config = configProvider()
-        let ssid = config.hotspotSSID.trimmingCharacters(in: .whitespaces)
+        let ssid = HotspotSSID.normalized(config.hotspotSSID)
         guard !ssid.isEmpty else {
             Log.info("hotspot join skipped: no hotspotSSID configured")
             return
@@ -958,7 +953,9 @@ final class NetworkFailover {
             return
         }
         // Off the main actor, behind any save Settings has running, which
-        // may be waiting on a keychain dialog.
+        // may be waiting on a keychain dialog. Everything the join depends
+        // on is checked again after the wait: the session, the outage and
+        // the configured SSID.
         let epoch = self.epoch
         let outage = self.outage
         let keychain = self.keychain
@@ -974,6 +971,13 @@ final class NetworkFailover {
         }
         guard self.outage == outage else {
             Log.info("hotspot join dropped: Wi-Fi recovered during the keychain read")
+            return
+        }
+        // Settings may have changed the hotspot meanwhile. The answer, a
+        // password or a problem, is about the old one; the retry timer
+        // stays, and the next tick reads the hotspot configured then.
+        guard HotspotSSID.normalized(configProvider().hotspotSSID) == ssid else {
+            Log.info("hotspot join dropped: the hotspot SSID changed during the keychain read")
             return
         }
         let password: String

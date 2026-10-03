@@ -10,6 +10,15 @@ enum HotspotStoreOutcome: Equatable, Sendable {
         if case let .failed(notice) = self { return notice }
         return nil
     }
+
+    /// Whether this stored the password for `configuredSSID`, the hotspot
+    /// set now. A save that began under an SSID edited away while it
+    /// waited stored for the old one, so the failover's report about the
+    /// current one still stands.
+    func isStored(for configuredSSID: String) -> Bool {
+        guard case let .stored(stored) = self else { return false }
+        return stored.ssid == HotspotSSID.normalized(configuredSSID)
+    }
 }
 
 /// The hotspot password field's state apart from the view, so the rules
@@ -21,6 +30,12 @@ struct HotspotPasswordField: Equatable {
     struct Stored: Equatable, Sendable {
         let ssid: String
         let password: String
+    }
+
+    /// A load or recheck in flight: its token and the SSID it read for.
+    struct Read: Equatable {
+        fileprivate let token: Int
+        let ssid: String
     }
 
     /// A save or clear is waiting on the keychain, which may be showing a
@@ -41,20 +56,23 @@ struct HotspotPasswordField: Equatable {
     /// reads "Save": that SSID has no password yet.
     func buttonTitle(ssid: String, password: String) -> String {
         if saving { return "Saving\u{2026}" }
-        let showing = Stored(ssid: ssid.trimmingCharacters(in: .whitespacesAndNewlines), password: password)
+        let showing = Stored(ssid: HotspotSSID.normalized(ssid), password: password)
         return stored == showing ? "Saved" : "Save"
     }
 
-    /// A load or recheck begins; pass the token to `finishRead`.
-    mutating func startRead() -> Int {
+    /// A load or recheck begins for the configured `ssid`; pass what this
+    /// returns to `finishRead`.
+    mutating func startRead(ssid: String) -> Read {
         request += 1
-        return request
+        return Read(token: request, ssid: HotspotSSID.normalized(ssid))
     }
 
-    /// A load or recheck answered. Its notice is used unless a newer read
-    /// began or a save answered since; returns whether it was.
-    mutating func finishRead(_ token: Int, notice: String?) -> Bool {
-        guard token == request else { return false }
+    /// A load or recheck answered; `ssid` is the one configured now. Its
+    /// notice is used unless a newer read began, a save answered, or the
+    /// SSID changed since: the answer is about the old SSID's item. Returns
+    /// whether it was used.
+    mutating func finishRead(_ read: Read, ssid: String, notice: String?) -> Bool {
+        guard read.token == request, read.ssid == HotspotSSID.normalized(ssid) else { return false }
         self.notice = notice
         return true
     }

@@ -300,6 +300,66 @@ final class NetworkFailoverDriverTests: XCTestCase {
         blocked.driver.stop()
     }
 
+    /// Settings changes the hotspot while a join's keychain read waits
+    /// behind a save. The read finds the old hotspot's password, but that
+    /// is not the hotspot to join any more: nothing joins or reports. The
+    /// retry the tick queued still comes, and joins the hotspot
+    /// configured then.
+    func testAJoinWhoseHotspotChangedDuringTheReadDoesNotJoinTheOldOne() async throws {
+        let keychain = BlockingKeychain(items: ["\(KeychainStore.service)/Phone": "old"])
+        let blocked = try await outageWithAJoinBehindABlockedSave(keychain: keychain, savingFor: "Other Phone")
+
+        blocked.hotspot.value = "Other Phone"
+        keychain.release()
+        _ = await blocked.saving.value
+        await blocked.tick.value
+
+        XCTAssertEqual(blocked.joiner.calls, [])
+        XCTAssertEqual(blocked.notifier.posts.map(\.title), [])
+        XCTAssertNil(blocked.driver.passwordProblem)
+        XCTAssertNotNil(blocked.driver.retryTimer, "the retry is still scheduled")
+
+        blocked.clock.advance(30)
+        await blocked.driver.fireTimer().value
+        XCTAssertEqual(blocked.joiner.calls, [.init(ssid: "Other Phone", password: "new", interfaceName: "en0")])
+        XCTAssertFalse(keychain.gaveUp)
+        blocked.driver.stop()
+    }
+
+    /// The same, but the read finds no password for the old hotspot. The
+    /// warning is about a hotspot no longer configured, so it is neither
+    /// shown nor notified, and the one notification of this outage is
+    /// still there when the next tick finds the new hotspot has no
+    /// password either. Clearing the SSID drops the answer the same way.
+    func testAWarningAboutTheOldHotspotIsDroppedWhenTheSSIDChanged() async throws {
+        for changed in ["Third Phone", " "] {
+            let keychain = BlockingKeychain()
+            let blocked = try await outageWithAJoinBehindABlockedSave(keychain: keychain, savingFor: "Other Phone")
+
+            blocked.hotspot.value = changed
+            keychain.release()
+            _ = await blocked.saving.value
+            await blocked.tick.value
+
+            XCTAssertEqual(blocked.notifier.posts.map(\.title), [], "SSID changed to \"\(changed)\"")
+            XCTAssertNil(blocked.driver.passwordProblem, "SSID changed to \"\(changed)\"")
+            XCTAssertNotNil(blocked.driver.retryTimer, "SSID changed to \"\(changed)\"")
+
+            blocked.clock.advance(30)
+            await blocked.driver.fireTimer().value
+            if HotspotSSID.normalized(changed).isEmpty {
+                XCTAssertEqual(blocked.notifier.posts.map(\.title), [], "no hotspot is configured")
+                XCTAssertNil(blocked.driver.passwordProblem)
+            } else {
+                XCTAssertEqual(blocked.notifier.posts.map(\.body), [HotspotPasswordProblem.missing.explanation])
+                XCTAssertEqual(blocked.driver.passwordProblem, .missing)
+            }
+            XCTAssertEqual(blocked.joiner.calls, [])
+            XCTAssertFalse(keychain.gaveUp)
+            blocked.driver.stop()
+        }
+    }
+
     private struct BlockedJoin {
         let driver: NetworkFailover
         let saving: Task<HotspotStoreOutcome, Never>
@@ -307,6 +367,8 @@ final class NetworkFailoverDriverTests: XCTestCase {
         let joiner: RecordingHotspotJoiner
         let notifier: RecordingNotifier
         let clock: FakeClock
+        /// The configured hotspot SSID, "Phone" until a test changes it.
+        let hotspot: Locked<String>
     }
 
     /// A save for `ssid` blocked inside `keychain`, then an outage on
@@ -323,8 +385,7 @@ final class NetworkFailoverDriverTests: XCTestCase {
         let clock = FakeClock(Date(timeIntervalSince1970: 1_800_000_000))
         let joining = expectation(description: "the join started")
         joining.assertForOverFulfill = false
-        var config = Config()
-        config.hotspotSSID = "Phone"
+        let hotspot = Locked("Phone")
         let n = NetworkFailover(
             paths: home.paths,
             keychain: keychain,
@@ -335,13 +396,15 @@ final class NetworkFailoverDriverTests: XCTestCase {
             clock: { clock.now }
         ) {
             joining.fulfill()
+            var config = Config()
+            config.hotspotSSID = hotspot.value
             return config
         }
         await n.simulate(satisfied: false)
         clock.advance(30)
         let tick = n.fireTimer()
         await fulfillment(of: [joining], timeout: 5)
-        return BlockedJoin(driver: n, saving: saving, tick: tick, joiner: joiner, notifier: notifier, clock: clock)
+        return BlockedJoin(driver: n, saving: saving, tick: tick, joiner: joiner, notifier: notifier, clock: clock, hotspot: hotspot)
     }
 
     private func driver(

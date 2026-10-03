@@ -336,9 +336,9 @@ provided by the standalone backstop. Performance effects depend on workload.
   `HotspotPasswordProblem`: a warning line in the right-click menu, a notice
   under the password field in Settings, and one notification per outage
   (re-armed on recovery, on stop and when the password is saved). A save in
-  Settings never leaves the user without a password, and it writes to the
-  keychain that holds the item reads find, which need not be the default
-  keychain (a new item goes to the default keychain). A locked keychain
+  Settings writes to the keychain that holds the item reads find, which
+  need not be the default keychain (a new item goes to the default
+  keychain). A locked keychain
   hides this build's items as well as another build's, so a save that
   finds the item unreadable first checks the keychain's lock state
   (`SecKeychainGetStatus`) and, if it is locked, unlocks it (the prompt)
@@ -349,19 +349,18 @@ provided by the standalone backstop. Performance effects depend on workload.
   `kSecAttrAccess` did not return when tried on a throwaway keychain): the
   new password is put beside the old item, in the same keychain, under
   service `insomnia-hotspot.replacing`; the old item is deleted; the new
-  one is renamed to `insomnia-hotspot`. Reads fall back to the
-  `.replacing` item when the main one is missing or unreadable, so a save
-  that fails or stops at any step leaves the password reads returned
-  before or the new one. When the main item is there but unreadable, the
-  fallback looks only in the keychain that holds it, where a save puts its
-  `.replacing` item; one left in another keychain on the search list is
-  older and is not read. A `.replacing` item the build can read, left by a
-  save that stopped short, is that password, so the next save changes its
-  value in place and never deletes it first; one it cannot read with the
-  keychain unlocked is another build's and is deleted, then added again. A
-  refused delete of the old item removes a `.replacing` item the save
-  added, or puts back the value of one it changed. Clearing the password
-  deletes both. Deleting another build's item, and unlocking the keychain
+  one is renamed to `insomnia-hotspot`. Reads use only `insomnia-hotspot`
+  and never fall back to a `.replacing` item: which save left it, and
+  whether that save finished, is not known, and one in another keychain
+  on the search list can hold an older password. Until the delete, the
+  password reads as unreadable, as before the save; after the rename, as
+  the new one. A save that stops in between (a failed rename, a crash)
+  leaves it reading as missing, and the user enters it again. A
+  `.replacing` item the build can read, left by such a save, has its value
+  changed in place by the next save; one it cannot read with the keychain
+  unlocked is another build's and is deleted, then added again. A refused
+  delete of the old item removes the `.replacing` item and keeps the old
+  one. Clearing the password deletes both. Deleting another build's item, and unlocking the keychain
   for a save, need the prompt, which is allowed only there.
   `kSecAttrAccessible` is not set: the file-based keychain drops it, and
   the data protection keychain needs an access-group entitlement.
@@ -378,10 +377,19 @@ provided by the standalone backstop. Performance effects depend on workload.
   the field even when the failover's report changed during the wait; the
   recheck that change started reads the keychain behind the save, and its
   answer is dropped. So is the answer of a load still running when a save
-  or clear begins, so it cannot refill a field the user just cleared. A join whose read waited behind a save does nothing
-  once the session has ended or Wi-Fi has come back: no join, no retry
-  timer, no warning, so the notification stays armed for the next
-  outage.
+  or clear begins, so it cannot refill a field the user just cleared.
+- Work that waits on `KeychainQueue` checks again, once the wait is over,
+  everything it acts on, and drops its answer if any of it changed. A
+  load or recheck in Settings whose SSID was edited meanwhile is dropped:
+  its answer is about the old SSID's item. A save clears the failover's
+  report and re-arms its notification only if it stored for the SSID
+  configured when it answers. A failover join whose read waited behind a
+  save does nothing if the session has ended, Wi-Fi has come back, or the
+  configured SSID has changed: no join and no warning, so the
+  notification stays armed. After a recovery or stop it schedules no
+  retry either; after an SSID change the retry stays, and the next tick
+  reads the SSID configured then. Inside a save, the unlock prompt is
+  followed by a fresh read of the item and its keychain.
 - macOS 26 requires Location Services permission before CoreWLAN exposes SSIDs
   or returns results for an SSID-filtered scan. Insomnia requests when-in-use
   access when the hotspot is saved or a configured session starts, never at
