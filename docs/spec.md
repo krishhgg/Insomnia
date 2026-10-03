@@ -356,7 +356,11 @@ When `pmset` lists no internal battery, the backstop asks `ioreg` for the
 is a desktop, and with one but no charger reported (`ExternalConnected`) the
 battery counts as unreadable and the session ends. It reads `endFloor` as the
 app decodes it, so a whole float such as `30.0` is 30, and clamps it to 0
-through 95 as `Config.normalizeFloors` does.
+through 95 as `Config.normalizeFloors` does. The backstop reads the scalar
+keys `endFloor` and `thermalRules` from config.json directly, not through the
+app's decoder, so it cannot tell whether the app accepted the file. The app
+therefore refuses to run a session on a config.json it rejected and could
+not move aside (section 10).
 Performance effects depend on workload.
 
 ### 7. Network failover
@@ -558,6 +562,24 @@ JSON, not a regular file) is never written over: the app renames it to
 config.json and posts a notification naming the copy. When the rename
 fails, the file stays as it is and the app runs on the defaults without
 writing them. `uninstall.sh` keeps these copies; `--purge` removes them.
+
+The backstop reads `endFloor` and `thermalRules` from config.json on every
+run (section 6). A file the app rejects can still hold valid values for
+those two keys, such as a 0% floor or thermal rules off, while the app
+enforces its defaults. So every transaction (reconcile, start, extend, end,
+and the lid, floor and Low Power changes) checks the file again. One that
+does not decode is renamed aside as at launch, and the settings the app runs
+on are written in its place. While a rejected file cannot be renamed, no
+session runs:
+
+- Start refuses and changes nothing. Its notification names the file and
+  says to make it writable or delete it.
+- A session already running ends at the next transaction, through the
+  normal end.
+- Reconcile ends a valid session on disk instead of resuming it.
+
+A file that decodes is not read again. A hand edit made while the app runs
+reaches the backstop at its next run and the app at its next launch.
 
 ### 11. Menu bar UI: inline time entry
 

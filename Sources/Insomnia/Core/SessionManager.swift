@@ -25,6 +25,10 @@ enum EndReason: String, Sendable {
     /// may still have been applied, so the start is undone from the journal
     /// like an end rather than rolled back from memory.
     case startFailed
+    /// config.json could not be read and could not be moved aside
+    /// (`rejectedConfigFile`). backstop.sh reads its cutoffs from that file
+    /// itself, so the session would run on cutoffs the app does not enforce.
+    case settingsFileRejected
 }
 
 /// What `end` achieved. Callers that are about to quit need to know whether
@@ -228,6 +232,13 @@ final class SessionManager {
     /// reconcile: init runs before the app has finished launching, and a
     /// second copy that never takes the alive lock never reconciles.
     @ObservationIgnored private var configNotice: String?
+    /// Why no session may run, set by every transaction while config.json
+    /// is there, the app rejects it, and it could not be moved aside.
+    /// backstop.sh reads the file's endFloor and thermalRules keys itself,
+    /// without the app's decoder, so it could enforce a 0% floor or no
+    /// thermal rule while the app enforces its defaults. Nil once the file
+    /// reads again, is gone, or was moved aside.
+    @ObservationIgnored private(set) var rejectedConfigFile: String?
 
     init(
         paths: Paths,
@@ -294,7 +305,8 @@ final class SessionManager {
             } catch let moveError {
                 keepConfigFile = true
                 Log.error("config.json could not be read (\(detail)) or moved aside (\(moveError.localizedDescription)); left in place; using default settings")
-                configNotice = "config.json could not be read (\(detail)) or moved aside (\(moveError.localizedDescription)). Insomnia is using default settings and left the file as it is; a change saved in Settings would replace it."
+                configNotice = Self.rejectedConfigMessage(paths.configFile.path, detail: detail, moveError: moveError.localizedDescription)
+                    + " Meanwhile Insomnia uses default settings and left the file as it is."
             }
         }
         if var c = loadedConfig {
@@ -383,6 +395,8 @@ final class SessionManager {
             }
             self.writeOwedEdits()
             if syncSession { await self.adoptAgentEnd() }
+            self.checkConfigFile()
+            if syncSession { await self.endIfConfigFileRejected() }
             return .success(await op())
         }
         lifecycleTail = Task { _ = await task.value }
@@ -415,6 +429,54 @@ final class SessionManager {
         }
         endTicket += 1
         _ = await performEnd(reason: .agentCutoff)
+    }
+
+    /// The launch's rules for config.json, applied again in every
+    /// transaction, because backstop.sh reads the file on every run. A file
+    /// the app rejects is moved aside and the settings the app runs on are
+    /// written in its place, so the agent and the app enforce the same
+    /// cutoffs. When the rename fails, `rejectedConfigFile` says why and no
+    /// session runs. A missing file, or one that decodes, is left alone.
+    private func checkConfigFile() {
+        let detail: String
+        do {
+            _ = try store.loadConfig()
+            if rejectedConfigFile != nil { Log.info("config.json reads again or is gone; sessions can start") }
+            rejectedConfigFile = nil
+            return
+        } catch let StoreError.unreadable(_, brief) {
+            detail = brief
+        } catch {
+            detail = error.localizedDescription
+        }
+        do {
+            let moved = try store.moveAsideUnreadableConfig(now: clock())
+            rejectedConfigFile = nil
+            do {
+                try store.saveConfig(config)
+                Log.error("config.json could not be read (\(detail)); moved to \(moved.path); the settings in use were written back")
+            } catch {
+                Log.error("config.json could not be read (\(detail)); moved to \(moved.path); the settings in use could not be written back: \(error.localizedDescription)")
+            }
+            notifier.post(title: Self.configFileTitle, body: "config.json could not be read (\(detail)). It was moved to \(moved.path), and Insomnia wrote the settings it is using back to config.json.")
+        } catch let moveError {
+            let why = Self.rejectedConfigMessage(paths.configFile.path, detail: detail, moveError: moveError.localizedDescription)
+            if rejectedConfigFile != why { Log.error(why) }
+            rejectedConfigFile = why
+        }
+    }
+
+    /// A session still running while config.json is rejected in place ends
+    /// through the normal path, as any other cutoff does.
+    private func endIfConfigFileRejected() async {
+        guard session != nil, let why = rejectedConfigFile else { return }
+        Log.error("ending the session: \(why)")
+        endTicket += 1
+        _ = await performEnd(reason: .settingsFileRejected)
+    }
+
+    private static func rejectedConfigMessage(_ path: String, detail: String, moveError: String) -> String {
+        "config.json could not be read (\(detail)) or moved aside (\(moveError)). The recovery agent reads its end floor and thermal rules from that file itself, so Insomnia runs no session until the file is fixed. Make \(path) writable or delete it."
     }
 
     /// The 1 Hz tick's look for a session the agent ended while the lid was
@@ -493,6 +555,11 @@ final class SessionManager {
         }
         guard endTicket == ticket, !quitRequested else {
             Log.info("start abandoned: an end was requested first")
+            return
+        }
+        if let why = rejectedConfigFile {
+            fail("start refused, nothing changed: \(why)")
+            notifier.post(title: Self.configFileTitle, body: "Insomnia did not start a session. \(why)")
             return
         }
         let now = clock()
@@ -1209,7 +1276,11 @@ final class SessionManager {
         // (ended-session.json holds its bytes) is over, deadline or not.
         let endedEarlier = onDisk != nil && store.sessionEndIsRecorded()
 
-        if let s = onDisk, !s.isExpired(at: now), !endedEarlier {
+        // A valid session is not resumed while config.json is rejected in
+        // place: the agent would enforce the file's cutoffs, not the app's.
+        let resumable = onDisk.map { !$0.isExpired(at: now) && !endedEarlier } ?? false
+
+        if let s = onDisk, resumable, rejectedConfigFile == nil {
             // Step 2: valid session. Arm first, then journal, then hold
             // sleep. Any failure ends the session rather than holding sleep
             // with nothing guaranteed to release it.
@@ -1257,10 +1328,14 @@ final class SessionManager {
             return
         }
 
-        // Step 1: missing, expired or ended earlier -> full end.
+        // Step 1: missing, expired, ended earlier, or not to be resumed ->
+        // full end.
         if endedEarlier {
             Log.info("reconcile: session.json holds a session already ended (recorded in ended-session.json); restoring, not resuming")
             _ = await performEnd(reason: .backstop)
+        } else if let s = onDisk, resumable, let why = rejectedConfigFile {
+            Log.error("reconcile: session valid until \(iso(s.endsAt)) not resumed: \(why)")
+            _ = await performEnd(reason: .settingsFileRejected)
         } else if onDisk != nil {
             Log.info("reconcile: session expired, restoring")
             _ = await performEnd(reason: .timer)
@@ -1571,6 +1646,7 @@ final class SessionManager {
         case .agentCutoff: "The recovery agent ended the session while Insomnia could not (see insomnia.log for its reason). Sleep is back to normal."
         case .recoveryUnavailable: "Insomnia could not arm its recovery agent for the session found on disk, so it ended the session. Sleep is back to normal."
         case .startFailed: "Insomnia could not disable sleep, so no session was started. Sleep is back to normal."
+        case .settingsFileRejected: "\(rejectedConfigFile ?? "config.json could not be read or moved aside.") Sleep is back to normal."
         }
     }
 }

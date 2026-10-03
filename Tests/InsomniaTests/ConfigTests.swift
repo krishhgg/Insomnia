@@ -497,22 +497,179 @@ final class ConfigLoadTests: XCTestCase {
     }
 
     /// When the rename fails, nothing is written over the file: the app runs
-    /// on defaults and says the file was left as it is.
+    /// on defaults and says the file was left as it is, and how to fix it.
+    /// The rename keeps failing in reconcile's transaction, which sets
+    /// `rejectedConfigFile` without a second notification.
     func testAConfigThatCannotBeMovedAsideIsLeftAsItIs() async throws {
-        let written = try writeConfig(#"{"configVersion": 2, "endFloor": "30"}"#)
-        let dir = h.home.paths.appSupport.path
-        XCTAssertEqual(chmod(dir, 0o500), 0)
-        defer { chmod(dir, 0o700) }
+        let written = try writeConfig(rejectedConfig)
+        let file = h.home.paths.configFile
+        try setImmutable(file, true)
+        defer { try? setImmutable(file, false) }
 
         let m = h.makeManager()
-        chmod(dir, 0o700)
 
         XCTAssertEqual(m.config, Config())
-        XCTAssertEqual(try Data(contentsOf: h.home.paths.configFile), written)
+        XCTAssertEqual(try Data(contentsOf: file), written)
         XCTAssertEqual(try movedAsideConfigs(), [])
         await m.reconcile()
+        XCTAssertNotNil(m.rejectedConfigFile)
         let notices = h.notifier.posts.filter { $0.title == SessionManager.configFileTitle }
         XCTAssertEqual(notices.count, 1, "\(notices)")
         XCTAssertTrue(notices.first?.body.contains("left the file as it is") == true, "\(notices)")
+        XCTAssertTrue(notices.first?.body.contains("Make \(file.path) writable or delete it.") == true, "\(notices)")
+    }
+
+    // MARK: config.json rejected in place
+
+    /// The app's decoder refuses this file (freezeList is not a list), but
+    /// its endFloor and thermalRules are valid scalars that backstop.sh
+    /// reads by itself: a 0% floor and no thermal rule.
+    private let rejectedConfig = #"{"endFloor": 0, "thermalRules": false, "freezeList": 42}"#
+
+    /// While a file the app rejects cannot be moved aside, the agent would
+    /// enforce its cutoffs, not the app's defaults, so Start changes nothing
+    /// and says which file to fix and how. Once the file can be renamed,
+    /// the next Start moves it aside, writes the settings in use back, and
+    /// starts.
+    func testStartIsRefusedWhileARejectedConfigCannotBeMovedAside() async throws {
+        let written = try writeConfig(rejectedConfig)
+        let file = h.home.paths.configFile
+        try setImmutable(file, true)
+        defer { try? setImmutable(file, false) }
+        let m = h.makeManager()
+        await m.reconcile()
+
+        await m.start(duration: 3600)
+
+        XCTAssertFalse(m.isActive)
+        XCTAssertNil(try h.store.loadSession())
+        XCTAssertEqual(try h.store.loadState() ?? .clean, RuntimeState.clean)
+        XCTAssertFalse(h.guardFake.calls.contains("disablesleep 1"), "\(h.guardFake.calls)")
+        XCTAssertEqual(h.backstop.arms, 0)
+        XCTAssertEqual(try Data(contentsOf: file), written)
+        XCTAssertEqual(try movedAsideConfigs(), [])
+        XCTAssertTrue(m.lastError?.hasPrefix("start refused, nothing changed: config.json could not be read (") == true, m.lastError ?? "nil")
+        let refusal = h.notifier.posts.last
+        XCTAssertEqual(refusal?.title, SessionManager.configFileTitle)
+        XCTAssertTrue(refusal?.body.hasPrefix("Insomnia did not start a session. config.json could not be read (") == true, "\(String(describing: refusal))")
+        XCTAssertTrue(refusal?.body.hasSuffix("Make \(file.path) writable or delete it.") == true, "\(String(describing: refusal))")
+
+        try setImmutable(file, false)
+        await m.start(duration: 3600)
+
+        XCTAssertTrue(m.isActive)
+        XCTAssertTrue(h.guardFake.calls.contains("disablesleep 1"))
+        XCTAssertNil(m.rejectedConfigFile)
+        let moved = h.home.paths.appSupport.appendingPathComponent("config.json.unreadable-20270115T080000Z")
+        XCTAssertEqual(try movedAsideConfigs(), [moved.lastPathComponent])
+        XCTAssertEqual(try Data(contentsOf: moved), written)
+        XCTAssertEqual(try h.store.loadConfig(), m.config)
+        XCTAssertTrue(h.notifier.posts.contains { $0.title == SessionManager.configFileTitle && $0.body.contains("It was moved to \(moved.path)") }, "\(h.notifier.posts)")
+    }
+
+    /// Deleting the file is the other fix. The agent then reads its
+    /// defaults, which are the settings the app fell back to, and Start
+    /// goes ahead.
+    func testStartGoesAheadOnceTheRejectedConfigIsDeleted() async throws {
+        _ = try writeConfig(rejectedConfig)
+        let file = h.home.paths.configFile
+        try setImmutable(file, true)
+        defer { try? setImmutable(file, false) }
+        let m = h.makeManager()
+        await m.reconcile()
+        await m.start(duration: 3600)
+        XCTAssertFalse(m.isActive)
+
+        try setImmutable(file, false)
+        try FileManager.default.removeItem(at: file)
+        await m.start(duration: 3600)
+
+        XCTAssertTrue(m.isActive)
+        XCTAssertEqual(m.config, Config())
+        XCTAssertEqual(try movedAsideConfigs(), [])
+    }
+
+    /// A session already running when config.json becomes a file the app
+    /// rejects and cannot move ends at the next transaction, through the
+    /// normal end: sleep restored, session.json removed, the journal clean,
+    /// and a notification that names the file. The file is left as it is,
+    /// and the next Start is refused.
+    func testARunningSessionEndsAtTheNextTransactionOnceConfigIsRejectedInPlace() async throws {
+        let m = h.makeManager()
+        await m.reconcile()
+        await m.start(duration: 3600)
+        XCTAssertTrue(m.isActive)
+        let written = try writeConfig(rejectedConfig)
+        let file = h.home.paths.configFile
+        try setImmutable(file, true)
+        defer { try? setImmutable(file, false) }
+
+        await m.extend(by: 600)
+
+        XCTAssertFalse(m.isActive)
+        XCTAssertNil(try h.store.loadSession())
+        XCTAssertEqual(try h.store.loadState() ?? .clean, RuntimeState.clean)
+        XCTAssertTrue(h.guardFake.calls.contains("disablesleep 0"), "\(h.guardFake.calls)")
+        XCTAssertFalse(h.guardFake.sleepDisabled)
+        XCTAssertEqual(try Data(contentsOf: file), written)
+        let end = h.notifier.posts.last
+        XCTAssertEqual(end?.title, "Session ended")
+        XCTAssertTrue(end?.body.contains("Make \(file.path) writable or delete it.") == true, "\(String(describing: end))")
+        XCTAssertTrue(log().contains("session end (settingsFileRejected)"), log())
+
+        await m.start(duration: 3600)
+        XCTAssertFalse(m.isActive)
+        XCTAssertEqual(h.guardFake.calls.filter { $0 == "disablesleep 1" }.count, 1)
+    }
+
+    /// At launch, a valid session on disk is not resumed while config.json
+    /// is rejected in place. Reconcile ends it from the journal instead.
+    func testReconcileEndsAValidSessionInsteadOfResumingItWhileConfigIsRejected() async throws {
+        let now = h.clock.now
+        try h.store.saveSession(Session(startedAt: now.addingTimeInterval(-600), endsAt: now.addingTimeInterval(3600)))
+        var st = RuntimeState()
+        st.sleepDisabledByUs = true
+        try h.store.saveState(st)
+        h.guardFake.sleepDisabled = true
+        _ = try writeConfig(rejectedConfig)
+        let file = h.home.paths.configFile
+        try setImmutable(file, true)
+        defer { try? setImmutable(file, false) }
+
+        let m = h.makeManager()
+        await m.reconcile()
+
+        XCTAssertFalse(m.isActive)
+        XCTAssertFalse(h.guardFake.calls.contains("disablesleep 1"), "\(h.guardFake.calls)")
+        XCTAssertTrue(h.guardFake.calls.contains("disablesleep 0"), "\(h.guardFake.calls)")
+        XCTAssertNil(try h.store.loadSession())
+        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
+        XCTAssertEqual(h.backstop.arms, 0)
+        let end = h.notifier.posts.last
+        XCTAssertEqual(end?.title, "Session restored")
+        XCTAssertTrue(end?.body.contains("Make \(file.path) writable or delete it.") == true, "\(String(describing: end))")
+    }
+
+    /// A file the app rejects that can be renamed is moved aside at the
+    /// next transaction, and the settings the app runs on are written in its
+    /// place, so the agent reads the app's cutoffs again. The session goes
+    /// on.
+    func testARejectedConfigThatCanBeMovedIsReplacedByTheSettingsInUse() async throws {
+        var mine = Config()
+        mine.endFloor = 30
+        try h.store.saveConfig(mine)
+        let m = h.makeManager()
+        await m.reconcile()
+        await m.start(duration: 3600)
+        let written = try writeConfig(rejectedConfig)
+
+        await m.extend(by: 600)
+
+        XCTAssertTrue(m.isActive)
+        XCTAssertEqual(m.config.endFloor, 30)
+        XCTAssertEqual(try h.store.loadConfig(), m.config)
+        let moved = h.home.paths.appSupport.appendingPathComponent("config.json.unreadable-20270115T080000Z")
+        XCTAssertEqual(try Data(contentsOf: moved), written)
+        XCTAssertTrue(h.notifier.posts.contains { $0.title == SessionManager.configFileTitle && $0.body.contains("It was moved to \(moved.path)") }, "\(h.notifier.posts)")
     }
 }

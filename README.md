@@ -324,7 +324,11 @@ Use Settings for the app's controls; [Config.swift](Sources/Insomnia/Model/Confi
 defines the full configuration and defaults. The app reads the file at
 launch. If a hand edit leaves it unreadable, the app renames it to
 `config.json.unreadable-<time>`, starts with the defaults and posts a
-notification; fix the copy, quit Insomnia and rename it back. Local logs can contain SSIDs,
+notification; fix the copy, quit Insomnia and rename it back. The backstop
+reads the end floor and thermal setting from the file directly, so while an
+unreadable file cannot be renamed (a locked file, for example), Insomnia
+starts no session and ends a running one. Make the file writable or delete
+it. Local logs can contain SSIDs,
 process metadata, and tmux targets. Check them before sharing publicly.
 Lines the app writes to `insomnia.log` also go to the unified log with their
 bodies marked private, so `log show` and other local programs see `<private>`
