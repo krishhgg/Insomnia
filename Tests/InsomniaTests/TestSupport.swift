@@ -75,6 +75,17 @@ final class TempHome {
     }
 }
 
+/// Points INSOMNIA_HOME at `home` for a test that does not own a TempHome,
+/// and returns the closure that puts back the value it had before (the
+/// loader's `ProcessTestHome.root` if it somehow had none). Call it in a
+/// defer. Never unsetenv instead: `Log.append` and `SessionManager.live`
+/// would then resolve the real ~/Library for the rest of the process.
+func pointInsomniaHome(at home: URL) -> () -> Void {
+    let previous = ProcessTestHome.current ?? ProcessTestHome.root.path
+    setenv(Paths.environmentKey, home.path, 1)
+    return { setenv(Paths.environmentKey, previous, 1) }
+}
+
 /// Records every call; can be told to throw.
 final class FakeSleepGuard: SleepGuarding, @unchecked Sendable {
     private let lock = NSLock()

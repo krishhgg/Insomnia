@@ -25,6 +25,14 @@ final class RecoveryScriptTests: XCTestCase {
     override func tearDown() {
         fx.destroy()
         fx = nil
+        // The app tests here point INSOMNIA_HOME at the fixture. Whatever a
+        // test did, the next one must start on the loader's throwaway home,
+        // never on an unset variable that resolves the real ~/Library.
+        let home = ProcessTestHome.current
+        if home != ProcessTestHome.root.path {
+            setenv(Paths.environmentKey, ProcessTestHome.root.path, 1)
+            XCTFail("the test left INSOMNIA_HOME at \(home ?? "unset"), not \(ProcessTestHome.root.path)")
+        }
     }
 
     // MARK: - backstop.sh
@@ -607,8 +615,8 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(fx.exists(fx.session))
 
         // The app logs into the fixture, not ~/Library/Logs/Insomnia.
-        setenv(Paths.environmentKey, fx.home.path, 1)
-        defer { unsetenv(Paths.environmentKey) }
+        let restoreHome = pointInsomniaHome(at: fx.home)
+        defer { restoreHome() }
         let paths = Paths.fromEnvironment()
         let sleepGuard = FakeSleepGuard()
         let display = FakeDisplayDimmer(brightness: 0)
@@ -735,8 +743,8 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(try fx.run(fx.backstop).status, 1, fx.log())
         XCTAssertTrue(fx.exists(fx.endedSession))
 
-        setenv(Paths.environmentKey, fx.home.path, 1)
-        defer { unsetenv(Paths.environmentKey) }
+        let restoreHome = pointInsomniaHome(at: fx.home)
+        defer { restoreHome() }
         let paths = Paths.fromEnvironment()
         let sleepGuard = FakeSleepGuard()
         let display = FakeDisplayDimmer(brightness: 0)
