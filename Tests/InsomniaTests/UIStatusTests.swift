@@ -205,7 +205,7 @@ final class UIStatusTests: XCTestCase {
         XCTAssertNil(s.instantWatts())
         s.refreshInstant()
         s.refreshOnDemand()
-        s.relaunchUnthrottled("Chrome")
+        s.relaunchUnthrottled(ThrottledBrowser(bundleId: "com.google.Chrome", name: "Chrome"))
     }
 
     func testMachineLine() {
@@ -243,7 +243,7 @@ final class UIStatusTests: XCTestCase {
             sleepHeld: true,
             machine: "Lid: closed \u{00B7} 82%",
             actions: "3 apps frozen",
-            throttledBrowsers: ["Chrome"],
+            throttledBrowsers: [Self.chrome],
             error: nil
         )
         XCTAssertEqual(items, [
@@ -251,7 +251,7 @@ final class UIStatusTests: XCTestCase {
             StatusMenu.Item(title: "Lid: closed \u{00B7} 82%", kind: .info),
             StatusMenu.Item(title: "3 apps frozen", kind: .info),
             StatusMenu.Item(title: "\u{26A0} Chrome is throttled", kind: .warning),
-            StatusMenu.Item(title: "Relaunch Chrome unthrottled", kind: .relaunchBrowser("Chrome")),
+            StatusMenu.Item(title: "Relaunch Chrome unthrottled", kind: .relaunchBrowser(Self.chrome)),
             StatusMenu.Item(title: "", kind: .separator),
             StatusMenu.Item(title: StatusMenu.settingsTitle, kind: .settings),
             StatusMenu.Item(title: StatusMenu.quitTitle, kind: .quit),
@@ -287,6 +287,56 @@ final class UIStatusTests: XCTestCase {
         XCTAssertEqual(items.map(\.kind), [.warning, .separator, .settings, .quit])
     }
 
+    /// The relaunch item asks first, since the browser is quit and its
+    /// windows come back only through its own session restore. Cancel
+    /// hands nothing on; confirming hands on the bundle id and name the
+    /// item carried, even when a scan emptied the list during the alert.
+    @MainActor
+    func testRelaunchAsksBeforeQuittingAndCancelDoesNothing() {
+        _ = NSApplication.shared
+        let h = Harness()
+        defer { h.home.destroy() }
+        let source = RecordingStatusSource()
+        source.throttledBrowsers = [Self.chrome, Self.arc]
+        let asked = Locked<[String]>([])
+        let answer = Locked(false)
+        let controller = StatusItemController(
+            manager: h.makeManager(),
+            status: source,
+            showSettings: {},
+            confirmRelaunch: { name in
+                asked.value.append(name)
+                source.throttledBrowsers = []
+                return answer.value
+            }
+        )
+
+        controller.relaunchBrowser(Self.chrome)
+        XCTAssertEqual(asked.value, ["Chrome"])
+        XCTAssertEqual(source.relaunched, [])
+
+        answer.value = true
+        controller.relaunchBrowser(Self.arc)
+        XCTAssertEqual(asked.value, ["Chrome", "Arc"])
+        XCTAssertEqual(source.relaunched, [Self.arc])
+    }
+
+    private static let chrome = ThrottledBrowser(bundleId: "com.google.Chrome", name: "Chrome")
+    private static let arc = ThrottledBrowser(bundleId: "company.thebrowser.Browser", name: "Arc")
+
+    /// The prompt names the browser, says the windows depend on the
+    /// browser's own startup setting, and gives the 10 s rule.
+    func testRelaunchPromptCopy() {
+        let prompt = RelaunchPrompt(browser: "Chrome")
+        XCTAssertEqual(prompt.title, "Quit and relaunch Chrome?")
+        XCTAssertEqual(
+            prompt.message,
+            "Insomnia quits Chrome and opens it again with the two flags that stop it throttling hidden windows. Your windows and tabs come back only if Chrome is set to reopen them on startup. If Chrome has not quit after 10 s, nothing is relaunched."
+        )
+        XCTAssertEqual(RelaunchPrompt.confirmTitle, "Quit and relaunch")
+        XCTAssertEqual(RelaunchPrompt.cancelTitle, "Cancel")
+    }
+
     /// Greptile caught this as a regression: replacing the popover with a
     /// menu left the throttle warning with no way to act on it.
     func testEveryThrottledBrowserGetsItsOwnRelaunchItem() {
@@ -295,14 +345,14 @@ final class UIStatusTests: XCTestCase {
             sleepHeld: true,
             machine: nil,
             actions: nil,
-            throttledBrowsers: ["Chrome", "Arc"],
+            throttledBrowsers: [Self.chrome, Self.arc],
             error: nil
         )
-        XCTAssertEqual(items.filter { $0.kind == .relaunchBrowser("Chrome") }.count, 1)
-        XCTAssertEqual(items.filter { $0.kind == .relaunchBrowser("Arc") }.count, 1)
+        XCTAssertEqual(items.filter { $0.kind == .relaunchBrowser(Self.chrome) }.count, 1)
+        XCTAssertEqual(items.filter { $0.kind == .relaunchBrowser(Self.arc) }.count, 1)
         XCTAssertEqual(
             items.map(\.kind),
-            [.info, .warning, .relaunchBrowser("Chrome"), .relaunchBrowser("Arc"), .separator, .settings, .quit]
+            [.info, .warning, .relaunchBrowser(Self.chrome), .relaunchBrowser(Self.arc), .separator, .settings, .quit]
         )
     }
 
@@ -1078,4 +1128,25 @@ final class UIStatusTests: XCTestCase {
         XCTAssertFalse(panel?.isVisible ?? true)
         XCTAssertFalse(NSApp.windows.contains { $0 is KeyCatcherPanel && $0.isVisible })
     }
+}
+
+/// A status source that records relaunch requests and reports nothing else.
+@MainActor
+@Observable
+final class RecordingStatusSource: StatusSource {
+    var lidClosed = false
+    var batteryPercent: Int? = nil
+    var isCharging = false
+    var wifiSSID: String? = nil
+    var lastGap: TimeInterval? = nil
+    var frozenCount = 0
+    var dockerPaused = false
+    var throttledBrowsers: [ThrottledBrowser] = []
+    var relaunchProblems: [String] = []
+    private(set) var relaunched: [ThrottledBrowser] = []
+
+    func refreshOnDemand() {}
+    func refreshInstant() {}
+    func instantWatts() -> Double? { nil }
+    func relaunchUnthrottled(_ browser: ThrottledBrowser) { relaunched.append(browser) }
 }
