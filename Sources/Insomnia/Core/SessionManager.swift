@@ -445,11 +445,15 @@ final class SessionManager {
     /// the mode or write the journal still replays the lid event and runs
     /// the floors now, on the flag it could not correct; they run again
     /// once a later check settles. A newer unfinished command settles it
-    /// when that one exits. Run by the holder; internal for tests.
+    /// when that one exits. An end that is pending (refused for a busy lock
+    /// or an unreadable journal) owes the cleanup instead and the pass is
+    /// dropped: the end restores Low Power Mode and the lid actions from
+    /// the journal, and the floors must not switch the mode on before it.
+    /// Run by the holder; internal for tests.
     func settleAfterCommand() async {
         settleRetry?.cancel()
         settleRetry = nil
-        guard session != nil else { return }
+        guard session != nil, pendingEnd == nil else { return }
         let checked: Bool
         switch await exclusive("low power check", { await self.performLowPowerCheck() }) {
         case let .success(settled):
@@ -462,7 +466,7 @@ final class SessionManager {
             // exits, and the lid event stays recorded until then.
             return
         }
-        guard session != nil else { return }
+        guard session != nil, pendingEnd == nil else { return }
         let replayLid = lidEventDeferred
         lidEventDeferred = false
         resyncAfterCommand?(replayLid)

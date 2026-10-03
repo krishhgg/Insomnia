@@ -601,4 +601,35 @@ final class StillRunningCommandTests: XCTestCase {
         XCTAssertEqual(try h.store.loadState()?.lowPowerSetByUs, true)
         XCTAssertEqual(h.guardFake.calls.suffix(3), ["pmset -g custom", "pmset -g custom", "lowpowermode 1"])
     }
+
+    /// An end refused for the unreadable journal is pending when the file
+    /// is fixed. The pass that was waiting for the journal does not check
+    /// the mode or run the floors, which would switch the mode on with the
+    /// session ending: the end owes the cleanup and restores it all.
+    func testPassWaitingForTheJournalLeavesAPendingEndTheCleanup() async throws {
+        let m = h.makeManager(retryDelay: 0.2)
+        let floorRuns = floorsOnBattery(m) {}
+        try await startWithRollbackLeftRunning(m)
+        let stateFile = h.home.paths.stateFile
+        let journal = try Data(contentsOf: stateFile)
+        try Data("{".utf8).write(to: stateFile)
+        h.guardFake.exitStuckCommands()
+        await waitUntil("the unreadable journal was never reported") {
+            self.h.notifier.posts.contains { $0.title == SessionManager.journalTitle }
+        }
+
+        let refused = await m.end(reason: .user)
+        XCTAssertEqual(refused, .journalUnreadable)
+        XCTAssertEqual(m.pendingEnd, .user)
+        try journal.write(to: stateFile)
+        let calls = h.guardFake.calls
+        try await Task.sleep(for: .milliseconds(600))
+
+        XCTAssertEqual(floorRuns.value, 0, "the floors ran with an end pending")
+        XCTAssertEqual(h.guardFake.calls, calls, "the pass ran with an end pending")
+        let ended = await m.end(reason: .user)
+        XCTAssertEqual(ended, .restored)
+        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
+        XCTAssertFalse(h.guardFake.lowPowerOn)
+    }
 }
