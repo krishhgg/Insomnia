@@ -113,14 +113,17 @@ final class UndoClearFailureTests: XCTestCase {
         try assertShown(m, "low power mode switched off after the failed enable")
     }
 
-    /// Lid open: audio written, frozen entries resumed or gone, the Docker
-    /// marker with nothing left frozen. Each clear that fails says so.
+    /// Lid open: audio, display and keyboard written, frozen entries
+    /// resumed or gone, the Docker marker with nothing left frozen. Each
+    /// clear that fails says so.
     func testLidUndoWhoseClearsFailSaysSo() async throws {
         let m = h.makeManager()
         let cases: [(String, (inout RuntimeState) -> Void)] = [
             ("audio restored", { $0.savedOutputVolume = 0.4; $0.savedMuted = true }),
             ("frozen processes resumed", { $0.frozenProcesses = [FrozenProcess(pid: 9001, identity: FakeSleepGuard.identity(of: 9001))] }),
             ("Docker Desktop has no frozen process left", { $0.dockerFrozen = true }),
+            ("display brightness restored", { $0.savedDisplayBrightness = 0.5 }),
+            ("keyboard backlight restored", { $0.savedKeyboardBrightness = 0.3 }),
         ]
         for (prefix, entry) in cases {
             var s = RuntimeState.clean
@@ -136,6 +139,8 @@ final class UndoClearFailureTests: XCTestCase {
             try h.store.saveState(.clean)
         }
         XCTAssertEqual(h.audio.applied.map(\.volume), [0.4])
+        XCTAssertEqual(h.display.sets.first, 0.5)
+        XCTAssertEqual(h.keyboard.sets.first, 0.3)
     }
 
     /// The line of a failed clear goes once a later write clears its entry,
