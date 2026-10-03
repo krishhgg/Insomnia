@@ -30,6 +30,13 @@ struct Store: Sendable {
     /// Returns nil when the file does not exist. Throws on unreadable or
     /// undecodable content.
     func read<T: Decodable>(_ type: T.Type, from url: URL) throws -> T? {
+        guard let data = try readData(from: url) else { return nil }
+        return try Store.makeDecoder().decode(T.self, from: data)
+    }
+
+    /// The file's bytes, or nil when it does not exist. Throws when it
+    /// cannot be read or is not a regular file.
+    func readData(from url: URL) throws -> Data? {
         guard FileManager.default.fileExists(atPath: url.path) else { return nil }
         // Only a regular file is opened. open(2) on a FIFO with no writer
         // blocks, and these reads run on the main actor under the recovery
@@ -41,8 +48,7 @@ struct Store: Sendable {
         if stat(url.path, &info) == 0, info.st_mode & S_IFMT != S_IFREG {
             throw StoreError.notRegularFile(file: url.path)
         }
-        let data = try Data(contentsOf: url)
-        return try Store.makeDecoder().decode(T.self, from: data)
+        return try Data(contentsOf: url)
     }
 
     /// Atomic write: temp file + rename(2).
@@ -95,10 +101,12 @@ struct Store: Sendable {
 
     /// Whether session.json is a session already ended: ended-session.json
     /// holds its exact bytes (`recordSessionEnd`, or backstop.sh's
-    /// record_end). False when either file is missing or unreadable.
+    /// record_end). False when either file is missing, unreadable, or not
+    /// a regular file; the 1 Hz tick calls this, so neither is ever opened
+    /// unless it is one.
     func sessionEndIsRecorded() -> Bool {
-        guard let recorded = try? Data(contentsOf: paths.endedSessionFile),
-              let current = try? Data(contentsOf: paths.sessionFile) else { return false }
+        guard let recorded = try? readData(from: paths.endedSessionFile),
+              let current = try? readData(from: paths.sessionFile) else { return false }
         return recorded == current
     }
 
@@ -107,7 +115,7 @@ struct Store: Sendable {
     /// the session as over. True only when the record now matches the file.
     func recordSessionEnd() -> Bool {
         if sessionEndIsRecorded() { return true }
-        guard let current = try? Data(contentsOf: paths.sessionFile) else { return false }
+        guard let current = try? readData(from: paths.sessionFile) else { return false }
         do {
             try write(data: current, to: paths.endedSessionFile)
         } catch {
