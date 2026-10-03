@@ -447,20 +447,24 @@ final class ResumeFrozenCommandTests: XCTestCase {
         let envp: [UnsafeMutablePointer<CChar>?] = environment.map { strdup($0) } + [nil]
         defer { (argv + envp).forEach { free($0) } }
 
+        // The clock starts before the spawn, so the time measured is never
+        // shorter than the binary's own: it cannot arm its alarm before
+        // `start`, however late the test gets to run again.
+        let start = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)
+        func elapsed() -> TimeInterval { TimeInterval(clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - start) / 1e9 }
         var pid: pid_t = 0
         let spawned = posix_spawn(&pid, arguments[0], &actions, &attr, argv, envp)
         guard spawned == 0, pid > 0 else { throw XCTSkip("posix_spawn failed: \(spawned)") }
-        let start = Date()
         var status: Int32 = 0
         var endedByItself = false
-        while Date().timeIntervalSince(start) < 15 {
+        while elapsed() < 15 {
             if waitpid(pid, &status, WNOHANG) == pid {
                 endedByItself = true
                 break
             }
             Thread.sleep(forTimeInterval: 0.02)
         }
-        let seconds = Date().timeIntervalSince(start)
+        let seconds = elapsed()
         if !endedByItself {
             close(writeEnd)
             writeOpen = false
