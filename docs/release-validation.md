@@ -122,7 +122,7 @@ is performed. Do not replace "not run" with "passed" based on source review.
 | Freeze-all scope with agents running (Cursor/T3 Code/Claude untouched) | Not run |
 | Freeze-all off on a fresh config.json (list only) and on with a terminal, a non-Chrome browser and a JetBrains IDE open (all untouched) | Not run |
 | Lid close with a freeze-list app stopped beforehand by `kill -STOP` (left stopped on lid open, not in the journal) | Not run |
-| Lid close with a read-only state.json: no process stopped, every app logged as left running | Not run |
+| Lid close during a session after `chflags uchg` on state.json (mode 0444 is not enough: the app writes a new file and renames it over state.json, and rename needs write access only to the folder): no process stopped, every app logged as left running; `chflags nouchg` before lid open | Not run |
 | Simulated lid close/open via scripts/simulate-lid.sh | Not run |
 | Existing Low Power Mode preference and saved audio restoration | Not run |
 | App Nap opt-in: previous `NSAppSleepDisabled` put back at session end, by the backstop after a force-quit, and by uninstall | Not run |
