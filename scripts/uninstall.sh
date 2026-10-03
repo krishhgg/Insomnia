@@ -251,15 +251,33 @@ journal_shape_problems() { # file
   fi
 }
 
-# Same rules as backstop.sh: a date as Store.swift writes it, and the keys
-# and types the app's Session decoder needs.
+# Same rules as backstop.sh: a date in the form Store.parseDate reads, and
+# the keys and types the app's Session decoder needs.
 epoch_of() { # string
-  local e
-  e="$("$DATE" -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$1" +%s 2>/dev/null)" || return 0
-  if [[ "$("$DATE" -u -r "$e" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)" == "$1" ]]; then
-    echo "$e"
+  local form='^([0-9]{4})-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(Z|([+-])([0-9]{2}):([0-9]{2}))$'
+  local clock offset=0 e
+  [[ "$1" =~ $form ]] || return 0
+  (( 10#${BASH_REMATCH[1]} >= 1970 )) || return 0
+  if [[ "${BASH_REMATCH[2]}" != Z ]]; then
+    (( 10#${BASH_REMATCH[4]} <= 23 && 10#${BASH_REMATCH[5]} <= 59 )) || return 0
+    offset=$(( 10#${BASH_REMATCH[4]} * 3600 + 10#${BASH_REMATCH[5]} * 60 ))
+    if [[ "${BASH_REMATCH[3]}" == - ]]; then offset=$(( -offset )); fi
+  fi
+  clock="${1:0:19}"
+  e="$("$DATE" -j -u -f '%Y-%m-%dT%H:%M:%S' "$clock" +%s 2>/dev/null)" || return 0
+  if [[ "$("$DATE" -u -r "$e" +%Y-%m-%dT%H:%M:%S 2>/dev/null)" == "$clock" ]]; then
+    echo $(( e - offset ))
   fi
   return 0
+}
+
+# Same as backstop.sh: epoch_of the string exactly as stored, with only
+# plutil's own trailing newline cut.
+epoch_at() { # file keypath
+  local v
+  v="$(extract "$1" "$2"; echo .)"
+  v="${v%.}"
+  epoch_of "${v%$'\n'}"
 }
 session_shape_problems() { # file
   local f="$1" key t i
@@ -276,8 +294,8 @@ session_shape_problems() { # file
       echo "$key is missing"
     elif [[ "$t" != string ]]; then
       echo "$key is a JSON $t, not a date string"
-    elif [[ -z "$(epoch_of "$(extract "$f" "$key" || true)")" ]]; then
-      echo "$key is not a UTC date in the form 2027-01-15T08:00:00Z"
+    elif [[ -z "$(epoch_at "$f" "$key")" ]]; then
+      echo "$key is not a date in the form 2027-01-15T08:00:00Z or 2027-01-15T10:00:00+02:00"
     fi
   done
   t="$(type_of "$f" extensions)"
