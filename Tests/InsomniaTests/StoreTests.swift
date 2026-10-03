@@ -56,6 +56,48 @@ final class StoreTests: XCTestCase {
         XCTAssertFalse(clean.contains("savedKeyboardBrightness"), clean)
     }
 
+    /// App Nap entries are flat objects with a string bundle id and an
+    /// optional bool, which is what backstop.sh reads with plutil; an
+    /// absent previous value stays absent in the JSON. They keep the
+    /// journal dirty on their own and are not lid actions.
+    func testAppNapOverridesRoundTripAsFlatKeysAndAreDirty() throws {
+        var st = RuntimeState()
+        st.appNapOverrides = [
+            AppNapOverride(bundleId: "com.google.Chrome", previous: nil),
+            AppNapOverride(bundleId: "com.apple.Terminal", previous: false),
+            AppNapOverride(bundleId: "dev.zed.Zed", previous: true),
+        ]
+        try store.saveState(st)
+        XCTAssertEqual(try store.loadState(), st)
+        XCTAssertTrue(st.isDirty)
+        XCTAssertFalse(st.hasLidActions)
+        let text = try String(contentsOf: home.paths.stateFile, encoding: .utf8)
+        XCTAssertTrue(text.contains("\"bundleId\" : \"com.google.Chrome\""), text)
+        XCTAssertTrue(text.contains("\"previous\" : false"), text)
+        XCTAssertTrue(text.contains("\"previous\" : true"), text)
+        XCTAssertEqual(text.components(separatedBy: "\"previous\"").count, 3, "an absent previous value is left out: \(text)")
+
+        try store.saveState(RuntimeState())
+        let clean = try String(contentsOf: home.paths.stateFile, encoding: .utf8)
+        XCTAssertTrue(clean.contains("\"appNapOverrides\" : [\n\n  ]") || clean.contains("\"appNapOverrides\" : []"), clean)
+    }
+
+    /// A journal written before App Nap was journaled has no key; a null
+    /// previous value means absent, the same as backstop.sh reads it.
+    func testLegacyJournalWithoutAppNapKeyDecodesAndNullPreviousIsAbsent() throws {
+        let legacy = Data(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#.utf8)
+        let st = try Store.makeDecoder().decode(RuntimeState.self, from: legacy)
+        XCTAssertEqual(st.appNapOverrides, [])
+        XCTAssertFalse(st.isDirty)
+        let withNull = Data(#"{"appNapOverrides":[{"bundleId":"com.google.Chrome","previous":null},{"bundleId":"dev.zed.Zed","previous":true}]}"#.utf8)
+        let decoded = try Store.makeDecoder().decode(RuntimeState.self, from: withNull)
+        XCTAssertEqual(decoded.appNapOverrides, [
+            AppNapOverride(bundleId: "com.google.Chrome", previous: nil),
+            AppNapOverride(bundleId: "dev.zed.Zed", previous: true),
+        ])
+        XCTAssertTrue(decoded.isDirty)
+    }
+
     /// A journal written before display darkening existed has neither key.
     func testLegacyJournalWithoutBrightnessKeysDecodes() throws {
         let data = Data(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"savedOutputVolume":0.5,"savedMuted":true}"#.utf8)
@@ -155,6 +197,41 @@ final class StoreTests: XCTestCase {
         XCTAssertTrue(text.contains("\"endsAt\" : \"2027-01-15T08:00:00Z\""), text)
     }
 
+    /// Store.parseDate takes `Z` or an offset and gives the same instant;
+    /// anything else is refused, including dates JSONDecoder's `.iso8601`
+    /// took. RecoveryScriptTests checks the scripts read the same table.
+    func testParseDateReadsOffsetsAndRefusesEverythingElse() {
+        let read: [(String, TimeInterval)] = [
+            ("2027-01-15T08:00:00Z", 1_800_000_000),
+            ("2027-01-15T10:00:00+02:00", 1_800_000_000),
+            ("2027-01-15T02:30:00-05:30", 1_800_000_000),
+            ("2027-01-16T07:59:00+23:59", 1_800_000_000),
+            ("2027-01-15T08:00:00-00:00", 1_800_000_000),
+            ("1970-01-01T00:30:00+01:00", -1800),
+            ("2028-02-29T00:00:00Z", 1_835_395_200),
+        ]
+        for (text, seconds) in read {
+            XCTAssertEqual(Store.parseDate(text)?.timeIntervalSince1970, seconds, text)
+        }
+        for text in ["2027-02-30T08:00:00Z", "2027-02-29T08:00:00Z", "2027-01-15T24:00:00Z", "2027-01-15T08:00:60Z",
+                     "2027-01-15T08:00:00Zjunk", "2027-01-15T08:00:00GMT", "2027-01-15T08:00:00+0200", "2027-01-15T08:00:00+02",
+                     "2027-01-15T08:00:00+24:00", "2027-01-15T08:00:00.5Z", "2027-01-15T08:00:00z", "2027-1-5T8:0:0Z",
+                     "1969-12-31T23:59:59Z", "10000-01-01T00:00:00Z", ""] {
+            XCTAssertNil(Store.parseDate(text), text)
+        }
+        let decoded = try? Store.makeDecoder().decode(Session.self, from: Data(#"{"startedAt":"2027-01-15T08:00:00Z","endsAt":"2027-02-30T08:00:00Z","extensions":[]}"#.utf8))
+        XCTAssertNil(decoded, "the decoder used .iso8601, which rolls February 30 over to March 2")
+    }
+
+    /// Every date the encoder writes, the decoder reads back.
+    func testEveryDateTheEncoderWritesIsReadBack() throws {
+        for seconds: TimeInterval in [0, 1_800_000_000, 1_835_395_200, 253_402_300_799] {
+            let t = Date(timeIntervalSince1970: seconds)
+            try store.saveSession(Session(startedAt: t, endsAt: t))
+            XCTAssertEqual(try store.loadSession()?.endsAt, t, "\(seconds)")
+        }
+    }
+
     func testAtomicWriteLeavesNoTempFile() throws {
         try store.saveState(RuntimeState())
         try store.saveState(RuntimeState())
@@ -201,6 +278,21 @@ final class StoreTests: XCTestCase {
     /// and every later read keeps failing until a person deals with it: the
     /// next reader (this app, backstop.sh, uninstall.sh) must not see "no
     /// journal" and call the machine clean.
+    /// A journal that is a FIFO is never opened (open(2) would block until a
+    /// writer appears). The read fails instead and the FIFO stays.
+    func testStateThatIsAFIFOIsNotOpenedAndFailsTheRead() throws {
+        try FileManager.default.createDirectory(at: home.paths.appSupport, withIntermediateDirectories: true)
+        let fifo = try FIFOWatch(at: home.paths.stateFile)
+        defer { fifo.stop() }
+
+        XCTAssertThrowsError(try store.loadState()) { error in
+            guard case StoreError.notRegularFile = error else { return XCTFail("\(error)") }
+            XCTAssertTrue(error.localizedDescription.contains(home.paths.stateFile.path), error.localizedDescription)
+        }
+        XCTAssertFalse(fifo.readerSeen, "state.json was opened although it is a FIFO")
+        XCTAssertTrue(fifo.isStillFIFO)
+    }
+
     func testCorruptStateIsLeftInPlaceAndKeepsFailing() throws {
         try Data("{not json".utf8).write(to: home.paths.stateFile)
         for _ in 0..<2 {

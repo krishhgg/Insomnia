@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="112" height="112" viewBox="100 100 824 824" role="img" aria-labelledby="eo-title eo-desc">
+  <title id="eo-title">Insomnia</title>
+  <desc id="eo-desc">The Insomnia mark: an open almond-shaped eye with a round pupil and five lashes above the upper lid, drawn in moon-white on a charcoal rounded tile.</desc>
+  <!-- scripts/generate-app-icon.sh writes this file from AppIconArtwork, and PackagingTests fails if the two differ, so edit the Swift drawing and rerun the script. The layout matches the app icon: an 824-unit tile inset 100 units in a 1024 canvas, corners at 22.37% of the tile, the 24-unit mark grid at 76% of the tile side. -->
+  <rect x="100" y="100" width="824" height="824" rx="184.3288" fill="#303336"/>
+  <!-- EyeMarkGeometry at progress 1 on its 24-unit grid. The paths are the lens, closed by two cubic lids, then the pupil with the highlight cut as a notch from its upper right edge, then the five lashes above the upper lid. -->
+  <g transform="translate(198.88 264.1133) scale(26.0933)">
+    <path d="M1.5 12 C7 4.5 17 4.5 22.5 12 C17 19.5 7 19.5 1.5 12 Z" fill="none" stroke="#E6E3DD" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M15.3953 9.8853 C16.5632 11.7605 15.9899 14.2274 14.1147 15.3953 C12.2395 16.5632 9.7726 15.9899 8.6047 14.1147 C7.4368 12.2395 8.0101 9.7726 9.8853 8.6047 C11.1798 7.7984 12.8202 7.7984 14.1147 8.6047 C13.3441 8.5414 12.6681 9.1147 12.6047 9.8853 C12.5414 10.6559 13.1147 11.3319 13.8853 11.3953 C14.6559 11.4586 15.3319 10.8853 15.3953 10.1147 C15.4016 10.0384 15.4016 9.9616 15.3953 9.8853 Z" fill="#E6E3DD"/>
+    <path d="M4.5499 6.1977 L3.1442 3.8341 M8.2636 4.6218 L7.5468 1.9668 M12 4.125 L12 1.375 M15.7364 4.6218 L16.4532 1.9668 M19.4501 6.1977 L20.8558 3.8341" fill="none" stroke="#E6E3DD" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+</svg>

@@ -74,10 +74,14 @@ Flag a change that breaks one of these; do not flag the behavior itself.
   more write by design; a padded fixed-width countdown is not wanted. The
   digit-boundary finding on PR #13 was withdrawn. A return to per-frame
   length writes is a regression and should be flagged.
-- `AppNap.swift`. `NSAppSleepDisabled` is written into each agent app's own
-  preferences domain at session start, is not journaled, and is never unset:
-  it persists after session end and uninstall (spec section 5 and open
-  decisions, README).
+- `AppNap.swift`. Writing `NSAppSleepDisabled` into agent apps' preferences
+  is opt-in and off by default. With it on, the previous value is journaled
+  in `appNapOverrides` before each write and put back at session end,
+  reconcile, by backstop.sh and by uninstall. A key already YES, a value
+  that is not a boolean and an id `defaults` would not read as that app's
+  domain are left alone and not journaled. Values written by builds before
+  the journal were never recorded: uninstall lists them with the command to
+  remove them and does not delete them (spec section 5).
 - `backstop.sh`, `run_bounded`. A `sudo -n pmset` that is still running
   after SIGTERM plus 3 s is not killed. The run returns 125, stops the
   transaction with the journal and session exactly as read, and the
@@ -92,7 +96,16 @@ Flag a change that breaks one of these; do not flag the behavior itself.
   Insomnia stopped are resumed, and only when the journaled identity still
   matches. Provisional entries written before the kernel confirmed the stop
   (identity nil) are never signaled and stay journaled for manual
-  inspection. An app launched while the lid is closed is left alone.
+  inspection. One exception: when the write that confirms a freeze fails,
+  `LidActions.freeze` undoes the stops it sent moments earlier through
+  `cancelStops`, checked against the identity it read before the SIGSTOP
+  and still holds in memory. That SIGCONT goes to a matching pid even if
+  it does not show as stopped yet, because a SIGSTOP can still be pending
+  and generating SIGCONT discards it. That rollback then removes the
+  provisional entries of the pids it resumed, that are gone, or that the
+  freeze never stopped, and keeps those it could not resume; until the disk
+  takes that write, the status menu leaves the removed ones out. An app
+  launched while the lid is closed is left alone.
   Electron apps are stopped as a whole process tree via the responsible pid.
 - `FloorRules.swift`, `LidActions.swift`. Low Power Mode is switched on at
   lid close whether or not the charger is connected, because with sleep

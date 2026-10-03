@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+import InsomniaTestHome
 @testable import Insomnia
 
 actor AsyncGate {
@@ -30,7 +31,32 @@ actor AsyncGate {
     }
 }
 
+/// The throwaway INSOMNIA_HOME the InsomniaTestHome loader set when this
+/// bundle loaded, before XCTest discovered any test. `Log.append` and
+/// `SessionManager.live` read the variable at call time and fall back to
+/// the real ~/Library when it is unset, so it is set at load and never
+/// unset again. A TempHome moves it to a per-test directory and moves it
+/// back here on destroy, so work that outlives its test (a lifecycle task
+/// draining after teardown, a reassert timer) still lands in a temp
+/// directory. The loader removes the directory when the process exits.
+enum ProcessTestHome {
+    static let root: URL = {
+        guard let raw = insomnia_test_home_root() else {
+            fatalError("InsomniaTestHome did not run at load; refusing to test against the real ~/Library")
+        }
+        return URL(fileURLWithPath: String(cString: raw), isDirectory: true)
+    }()
+
+    /// Where INSOMNIA_HOME points right now, as the app would resolve it.
+    static var current: String? {
+        guard let value = getenv(Paths.environmentKey) else { return nil }
+        return String(cString: value)
+    }
+}
+
 /// Creates a temp INSOMNIA_HOME and points the process environment at it.
+/// `destroy()` hands the variable back to `ProcessTestHome` rather than
+/// unsetting it, so nothing falls through to the real ~/Library afterwards.
 final class TempHome {
     let root: URL
     let paths: Paths
@@ -44,7 +70,7 @@ final class TempHome {
     }
 
     func destroy() {
-        unsetenv(Paths.environmentKey)
+        setenv(Paths.environmentKey, ProcessTestHome.root.path, 1)
         try? FileManager.default.removeItem(at: root)
     }
 }
@@ -57,6 +83,8 @@ final class FakeSleepGuard: SleepGuarding, @unchecked Sendable {
     private var _lowPowerOn = false
     private var _lowPowerGate: AsyncGate?
     private var _sleepGate: AsyncGate?
+    private var _restoreGate: AsyncGate?
+    private var _restoreCalledAt: Date?
     private var _readGate: AsyncGate?
     var throwOn: Set<String> = []
     /// Commands that take effect and *then* fail (a timeout after pmset
@@ -83,6 +111,13 @@ final class FakeSleepGuard: SleepGuarding, @unchecked Sendable {
         get { lock.withLock { _sleepGate } }
         set { lock.withLock { _sleepGate = newValue } }
     }
+    /// Holds `disablesleep 0` after the call is recorded, before it takes effect.
+    var restoreGate: AsyncGate? {
+        get { lock.withLock { _restoreGate } }
+        set { lock.withLock { _restoreGate = newValue } }
+    }
+    /// Wall-clock time of the latest `disablesleep 0` call, taken as it arrives.
+    var restoreCalledAt: Date? { lock.withLock { _restoreCalledAt } }
     /// Holds `pmset -g` after the call is recorded, before it answers.
     var readGate: AsyncGate? {
         get { lock.withLock { _readGate } }
@@ -103,8 +138,10 @@ final class FakeSleepGuard: SleepGuarding, @unchecked Sendable {
     }
 
     func setSleepDisabled(_ disabled: Bool) async throws {
+        if !disabled { lock.withLock { _restoreCalledAt = Date() } }
         try record("disablesleep \(disabled ? 1 : 0)")
         if disabled, let gate = sleepGate { await gate.wait() }
+        if !disabled, let gate = restoreGate { await gate.wait() }
         sleepDisabled = disabled
         try afterEffect("disablesleep \(disabled ? 1 : 0)")
     }
@@ -130,18 +167,29 @@ final class FakeSleepGuard: SleepGuarding, @unchecked Sendable {
 
 /// Signal layer double. Records what it was asked to signal; the identity
 /// checks themselves live in `SignalProcessControl` and are tested there.
-/// It honours the protocol contract that an entry without identity is never
-/// signaled, and can be told that SIGCONT fails for particular pids, that
-/// SIGSTOP is refused for some, or that some pids are stopped right now.
+/// It keeps a small model of the kernel: which pids are stopped and which
+/// have a SIGSTOP still pending. `suspend` stops each pid it does not
+/// refuse, or leaves the stop pending for pids in `delayedStops`. `resume`
+/// signals only a pid that is stopped right now, as the real one does, and
+/// reports any other pid as gone. `cancelStops` signals every entry with
+/// identity, stopped or not, and its SIGCONT discards a pending stop. An
+/// entry without identity is never signaled. It can also be told that
+/// SIGCONT fails for particular pids or that SIGSTOP is refused for some.
 final class FakeProcessControl: ProcessSignaling, @unchecked Sendable {
     private let lock = NSLock()
     private var _resumed: [[Int32]] = []
+    private var _cancelled: [[Int32]] = []
     private var _signaled: [Int32] = []
     private var _suspended: [[Int32]] = []
     private var _failResume: Set<Int32> = []
     private var _refuseSuspend: Set<Int32> = []
+    private var _delayedStops: Set<Int32> = []
+    private var _pendingStops: Set<Int32> = []
     private var _stoppedNow: Set<Int32> = []
+    /// Pids passed to each `resume` call.
     var resumed: [[Int32]] { lock.withLock { _resumed } }
+    /// Pids passed to each `cancelStops` call.
+    var cancelled: [[Int32]] { lock.withLock { _cancelled } }
     /// Pids actually reported resumed (SIGCONT delivered), across all calls.
     var signaled: [Int32] { lock.withLock { _signaled } }
     var suspended: [[Int32]] { lock.withLock { _suspended } }
@@ -155,8 +203,18 @@ final class FakeProcessControl: ProcessSignaling, @unchecked Sendable {
         get { lock.withLock { _refuseSuspend } }
         set { lock.withLock { _refuseSuspend = newValue } }
     }
-    /// Pids currently stopped in the fake kernel. An identity-less entry for
-    /// one of these is unverifiable; for any other pid it is gone.
+    /// Pids whose SIGSTOP the fake kernel accepts but has not delivered
+    /// when `suspend` returns: they still look running until
+    /// `deliverPendingStops`.
+    var delayedStops: Set<Int32> {
+        get { lock.withLock { _delayedStops } }
+        set { lock.withLock { _delayedStops = newValue } }
+    }
+    /// SIGSTOPs sent but not delivered yet.
+    var pendingStops: Set<Int32> { lock.withLock { _pendingStops } }
+    /// Pids currently stopped in the fake kernel. `suspend` adds to it and a
+    /// delivered SIGCONT removes from it; a test seeds it for pids stopped
+    /// before the test began (by an earlier run, or by somebody else).
     var stoppedNow: Set<Int32> {
         get { lock.withLock { _stoppedNow } }
         set { lock.withLock { _stoppedNow = newValue } }
@@ -164,32 +222,74 @@ final class FakeProcessControl: ProcessSignaling, @unchecked Sendable {
     /// Called synchronously inside `suspend`, so a test can inspect disk
     /// at the moment the side effect happens.
     var onSuspend: (@Sendable ([Int32]) -> Void)?
+    /// Called synchronously at the start of `cancelStops`.
+    var onCancelStops: (@Sendable ([Int32]) -> Void)?
+
+    /// The pending SIGSTOPs take effect.
+    func deliverPendingStops() {
+        lock.withLock {
+            _stoppedNow.formUnion(_pendingStops)
+            _pendingStops = []
+        }
+    }
 
     func resume(_ processes: [FrozenProcess]) -> ResumeReport {
-        lock.withLock { _resumed.append(processes.map(\.pid)) }
-        var report = ResumeReport()
-        for p in processes {
-            if p.identity == nil {
-                if stoppedNow.contains(p.pid) { report.unverifiable.append(p.pid) } else { report.gone.append(p.pid) }
-            } else if failResume.contains(p.pid) {
-                report.failed.append(p.pid)
-            } else {
-                report.resumed.append(p.pid)
+        lock.withLock {
+            _resumed.append(processes.map(\.pid))
+            var report = ResumeReport()
+            for p in processes {
+                if !_stoppedNow.contains(p.pid) {
+                    report.gone.append(p.pid) // running (perhaps with a stop still pending) or exited
+                } else if p.identity == nil {
+                    report.unverifiable.append(p.pid)
+                } else {
+                    sigcont(p.pid, into: &report)
+                }
             }
+            return report
         }
-        lock.withLock { _signaled.append(contentsOf: report.resumed) }
-        return report
+    }
+
+    func cancelStops(_ processes: [FrozenProcess]) -> ResumeReport {
+        onCancelStops?(processes.map(\.pid))
+        return lock.withLock {
+            _cancelled.append(processes.map(\.pid))
+            var report = ResumeReport()
+            for p in processes {
+                if p.identity == nil { report.unverifiable.append(p.pid) } else { sigcont(p.pid, into: &report) }
+            }
+            return report
+        }
+    }
+
+    /// Caller holds `lock`.
+    private func sigcont(_ pid: Int32, into report: inout ResumeReport) {
+        if _failResume.contains(pid) {
+            report.failed.append(pid)
+            return
+        }
+        _stoppedNow.remove(pid)
+        _pendingStops.remove(pid)
+        report.resumed.append(pid)
+        _signaled.append(pid)
     }
 
     func suspend(_ processes: [FrozenProcess], expectedParents: [Int32: Int32]) -> SuspendReport {
         let pids = processes.map(\.pid)
         lock.withLock { _suspended.append(pids) }
         onSuspend?(pids)
-        var report = SuspendReport()
-        for pid in pids {
-            if refuseSuspend.contains(pid) { report.skipped.append(pid) } else { report.suspended.append(pid) }
+        return lock.withLock {
+            var report = SuspendReport()
+            for pid in pids {
+                if _refuseSuspend.contains(pid) {
+                    report.skipped.append(pid)
+                } else {
+                    report.suspended.append(pid)
+                    if _delayedStops.contains(pid) { _pendingStops.insert(pid) } else { _stoppedNow.insert(pid) }
+                }
+            }
+            return report
         }
-        return report
     }
 }
 
@@ -340,6 +440,54 @@ final class FakeKeyboardBacklight: KeyboardBacklighting, @unchecked Sendable {
     }
 }
 
+/// In-memory `NSAppSleepDisabled` per bundle id, with a hook fired inside
+/// each write so a test can inspect disk at the moment of the side effect.
+final class FakeAppNapPreferences: AppNapPreferencing, @unchecked Sendable {
+    private let lock = NSLock()
+    private var _values: [String: Bool]
+    private var _writes: [(bundleId: String, value: Bool?)] = []
+    private var _unreadable: Set<String> = []
+    private var _failWrites: Set<String> = []
+    /// Called synchronously inside `writeSleepDisabled`.
+    var onWrite: (@Sendable (String, Bool?) -> Void)?
+
+    init(values: [String: Bool] = [:]) {
+        _values = values
+    }
+
+    /// The key per bundle id as it stands now; absent ids have no key.
+    var values: [String: Bool] {
+        get { lock.withLock { _values } }
+        set { lock.withLock { _values = newValue } }
+    }
+    /// Every write, in order; nil means the key was deleted.
+    var writes: [(bundleId: String, value: Bool?)] { lock.withLock { _writes } }
+    /// Bundle ids whose value reads as something that is not a boolean.
+    var unreadable: Set<String> {
+        get { lock.withLock { _unreadable } }
+        set { lock.withLock { _unreadable = newValue } }
+    }
+    /// Bundle ids whose writes fail (cfprefsd refused the synchronize).
+    var failWrites: Set<String> {
+        get { lock.withLock { _failWrites } }
+        set { lock.withLock { _failWrites = newValue } }
+    }
+
+    func readSleepDisabled(bundleId: String) throws -> Bool? {
+        if unreadable.contains(bundleId) { throw AppNapError(bundleId: bundleId, detail: "is not a boolean; left alone") }
+        return lock.withLock { _values[bundleId] }
+    }
+
+    func writeSleepDisabled(_ value: Bool?, bundleId: String) throws {
+        if failWrites.contains(bundleId) { throw AppNapError(bundleId: bundleId, detail: "could not be written") }
+        lock.withLock {
+            _values[bundleId] = value
+            _writes.append((bundleId, value))
+        }
+        onWrite?(bundleId, value)
+    }
+}
+
 /// Freezer over an injected process snapshot; signals go to a FakeProcessControl.
 final class FakeFreezer: Freezing, @unchecked Sendable {
     private let lock = NSLock()
@@ -374,6 +522,7 @@ final class FakeFreezer: Freezing, @unchecked Sendable {
         control.suspend(processes, expectedParents: expectedParents)
     }
     func resume(_ processes: [FrozenProcess]) -> ResumeReport { control.resume(processes) }
+    func cancelStops(_ processes: [FrozenProcess]) -> ResumeReport { control.cancelStops(processes) }
 }
 
 // MARK: Identity conveniences for fixtures
@@ -461,6 +610,7 @@ struct Harness {
     let audio: FakeAudioControl
     let display: FakeDisplayDimmer
     let keyboard: FakeKeyboardBacklight
+    let appNap: FakeAppNapPreferences
     let notifier: RecordingNotifier
     let clamshell: FakeClamshell
 
@@ -474,6 +624,7 @@ struct Harness {
         audio = FakeAudioControl()
         display = FakeDisplayDimmer()
         keyboard = FakeKeyboardBacklight()
+        appNap = FakeAppNapPreferences()
         notifier = RecordingNotifier()
         clamshell = FakeClamshell(false)
     }
@@ -497,6 +648,7 @@ struct Harness {
             audio: audio,
             display: display,
             keyboard: keyboard,
+            appNap: appNap,
             notifier: notifier,
             clamshell: { lid.closed },
             clock: { c.now },
@@ -507,11 +659,84 @@ struct Harness {
     }
 }
 
-/// Let tasks created just now run up to their first suspension (the
-/// lifecycle queue), so the request order is fixed before a held operation
-/// is released. Serialized tests must release the held operation and only
-/// then await the operation queued behind it.
+/// Runs `request` in a new main-actor task and returns that task once the
+/// request has been called and the task has let go of the main actor: at
+/// its first suspension, or because it finished. Lifecycle requests join
+/// the queue before their first suspension, so a request made while an
+/// earlier operation is held is queued behind it when this returns. Fails
+/// the test if the task never ran. Release the held operation, then await
+/// the returned task; awaiting it first would deadlock.
+@MainActor
+func runUntilSuspended<T: Sendable>(
+    _ request: @escaping @MainActor @Sendable () async -> T,
+    file: StaticString = #filePath, line: UInt = #line
+) async -> Task<T, Never> {
+    let called = MainActorFlag()
+    let task = Task { @MainActor in
+        called.isSet = true
+        return await request()
+    }
+    for _ in 0..<1000 where !called.isSet { await Task.yield() }
+    XCTAssertTrue(called.isSet, "the request never ran", file: file, line: line)
+    return task
+}
+
+@MainActor
+private final class MainActorFlag {
+    var isSet = false
+}
+
+/// Yields a few times so that tasks created just now can run. Nothing
+/// confirms they did, so use it only where the test has no handle on the
+/// request (controller actions that start their own tasks), and
+/// `runUntilSuspended` everywhere else.
 @MainActor
 func settleQueuedRequests() async {
     for _ in 0..<5 { await Task.yield() }
+}
+
+/// A FIFO at `url`, and a watchdog for it. Correct code never opens it. If
+/// something does, open(2) blocks until a writer appears; the watchdog opens
+/// the FIFO for writing once a second, which lets a blocked reader through
+/// (it reads EOF) and records that a reader was there. A regression then
+/// fails its test instead of hanging the suite.
+final class FIFOWatch: @unchecked Sendable {
+    let url: URL
+    private let lock = NSLock()
+    private var stopped = false
+    private var seen = false
+
+    init(at url: URL) throws {
+        self.url = url
+        guard mkfifo(url.path, 0o600) == 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        let path = url.path
+        Thread.detachNewThread { [self] in
+            for _ in 0..<120 {
+                Thread.sleep(forTimeInterval: 1)
+                if self.isStopped { return }
+                // Succeeds only while a reader has the FIFO open.
+                let fd = open(path, O_WRONLY | O_NONBLOCK)
+                if fd >= 0 {
+                    close(fd)
+                    self.markSeen()
+                }
+            }
+        }
+    }
+
+    /// True when something opened the FIFO for reading.
+    var readerSeen: Bool { lock.lock(); defer { lock.unlock() }; return seen }
+
+    /// True when the path is still this FIFO, not moved or replaced.
+    var isStillFIFO: Bool {
+        var info = stat()
+        return lstat(url.path, &info) == 0 && info.st_mode & S_IFMT == S_IFIFO
+    }
+
+    func stop() { lock.lock(); stopped = true; lock.unlock() }
+
+    private var isStopped: Bool { lock.lock(); defer { lock.unlock() }; return stopped }
+    private func markSeen() { lock.lock(); seen = true; lock.unlock() }
 }

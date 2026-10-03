@@ -9,7 +9,7 @@
       "id": "journal-before-change",
       "severity": "high",
       "scope": ["Sources/Insomnia/Core/**", "Sources/Insomnia/System/**", "scripts/backstop.sh"],
-      "rule": "Any change to power state (sudo pmset disablesleep or lowpowermode), to another process (SIGSTOP), to audio output (volume or mute), or to display or keyboard brightness is written to state.json first, through Store.saveState (the journal helper in SessionManager), and that write has returned without error before the change is made. If the write fails the change is not made. The one exception is NSAppSleepDisabled in AppNap.swift, which docs/spec.md section 5 leaves unjournaled and persistent on purpose."
+      "rule": "Any change to power state (sudo pmset disablesleep or lowpowermode), to another process (SIGSTOP), to audio output (volume or mute), to display or keyboard brightness, or to another app's NSAppSleepDisabled (AppNap.swift, opt-in) is written to state.json first, through Store.saveState (the journal helper in SessionManager), and that write has returned without error before the change is made. If the write fails the change is not made."
     },
     {
       "id": "journal-cleared-only-after-confirmed-undo",
@@ -45,7 +45,7 @@
       "id": "only-verified-pids-are-resumed",
       "severity": "high",
       "scope": ["Sources/Insomnia/Core/ProcessControl.swift", "Sources/Insomnia/Core/LidActions.swift", "Sources/Insomnia/System/Freezer.swift", "scripts/backstop.sh"],
-      "rule": "SIGCONT is sent only to a journaled pid whose recorded identity still matches the live process: start time to the microsecond and boot session in the app, start time to the second and boot session in backstop.sh. Provisional entries (identity nil, written before the kernel confirmed the stop) and legacy frozenPids are never signaled and are never cleared by the shell. A pid that cannot be observed stays journaled."
+      "rule": "SIGCONT is sent only to a journaled pid whose recorded identity still matches the live process: start time to the microsecond and boot session in the app, start time to the second and boot session in backstop.sh. Provisional entries (identity nil, written before the kernel confirmed the stop) and legacy frozenPids are never signaled and are never cleared by the shell. A pid that cannot be observed stays journaled. One exception: when the write confirming a freeze fails, LidActions.freeze undoes the SIGSTOPs it sent moments earlier through cancelStops, checked against the identity it read before the SIGSTOP and still holds in memory (microseconds and boot session). That SIGCONT goes to a matching pid even if it does not show as stopped yet, because a SIGSTOP can still be pending and generating SIGCONT discards it. That rollback then removes the provisional entries of the pids it resumed, that are gone, or that the freeze never stopped, and keeps those it could not resume."
     },
     {
       "id": "no-shell-interpolation",
@@ -63,7 +63,7 @@
       "id": "scripts-call-tools-through-fixed-path-variables",
       "severity": "high",
       "scope": ["scripts/**/*.sh"],
-      "rule": "Every tool that changes the machine or reads process, power or launchd state is called through the absolute-path variable declared at the top of the script (PMSET, SUDO, PLUTIL, LOCKF, PS, KILL, SYSCTL, PGREP, OSASCRIPT, LAUNCHCTL, CODESIGN, SWIFT, SWIFTC, ICONUTIL), never by bare name through PATH. A new tool gets a new variable in that block, because RecoveryScriptTests and PackagingTests patch exactly those lines in a private copy of the script to substitute fakes."
+      "rule": "Every tool that changes the machine or reads process, power or launchd state is called through the absolute-path variable declared at the top of the script (PMSET, SUDO, PLUTIL, LOCKF, PS, KILL, SYSCTL, PGREP, OSASCRIPT, LAUNCHCTL, CODESIGN, SWIFT, SWIFTC, ICONUTIL), never by bare name through PATH. A new tool gets a new variable in that block, because RecoveryScriptTests and PackagingTests patch exactly those lines in a private copy of the script to substitute fakes. A script's own bounded-call helper may signal the child it started with the shell builtin `kill`; every signal to a process the script did not start goes through `$KILL`."
     },
     {
       "id": "sudoers-rule-is-four-exact-lines",

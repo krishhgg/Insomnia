@@ -84,6 +84,38 @@ final class SessionManager {
 
     var isActive: Bool { session != nil }
 
+    /// Journal edits owed by a freeze that `LidActions` undid because the
+    /// write confirming it failed (`clearUndoneFreeze`).
+    struct UndoneFreeze: Equatable, Sendable {
+        /// Pids whose provisional entry (identity nil) no longer describes
+        /// a stop: resumed, gone, or never stopped by that freeze.
+        var pids: Set<Int32> = []
+        /// That freeze set `dockerFrozen`, and none of it is still stopped.
+        var docker = false
+
+        var isEmpty: Bool { pids.isEmpty && !docker }
+
+        func apply(to s: inout RuntimeState) {
+            s.frozenProcesses.removeAll { $0.identity == nil && pids.contains($0.pid) }
+            if docker { s.dockerFrozen = false }
+        }
+    }
+
+    /// Edits not on disk yet because the disk refused them too. Applied
+    /// before every journal write and dropped once one succeeds, and tried
+    /// on their own at the start of every transaction. In memory only:
+    /// after a relaunch, reconcile finds those pids running and clears
+    /// their entries itself.
+    private var owedEdits = UndoneFreeze()
+
+    /// The journal as it reads once the owed edits are written: what is
+    /// frozen right now. The status menu shows this, not `state`.
+    var effectiveState: RuntimeState {
+        var s = state
+        owedEdits.apply(to: &s)
+        return s
+    }
+
     /// Fire date of the single deadline timer, exposed for tests and the menu.
     private(set) var scheduledDeadline: Date?
 
@@ -95,6 +127,7 @@ final class SessionManager {
     private let audio: any AudioControlling
     private let display: any DisplayDimming
     private let keyboard: any KeyboardBacklighting
+    private let appNap: any AppNapPreferencing
     private let notifier: any Notifying
     private let clamshell: @Sendable () -> Bool?
     private let clock: @Sendable () -> Date
@@ -156,6 +189,24 @@ final class SessionManager {
     /// bit Insomnia did not set (reconcile step 3), so a bit that stays set
     /// is announced once, not on every reconcile.
     @ObservationIgnored private var announcedForeignSleep = false
+    /// Set by reconcile when session.json could not be read, or was not a
+    /// session, and could not be moved aside either. The file is evidence,
+    /// never deleted. Left under its own name, every later launch and the
+    /// recovery agent read it again: one that could not read it may find a
+    /// future end time once it can and resume it, and a reader that decodes
+    /// a session differently from this one (an older Insomnia) could act on
+    /// one that is not a session here. So an end restores the journal,
+    /// tries the rename again and, while that fails, is not finished: quit
+    /// is refused and the end is retried. Cleared by the next reconcile, and
+    /// by a start, whose own session.json replaces it.
+    @ObservationIgnored private var keptSessionFile: KeptSessionFile?
+
+    private enum KeptSessionFile {
+        /// Opening or reading it failed, or it is not a regular file.
+        case cannotBeRead
+        /// Its bytes were read and are not a session.
+        case notASession
+    }
 
     init(
         paths: Paths,
@@ -165,6 +216,7 @@ final class SessionManager {
         audio: any AudioControlling = NoopAudioControl(),
         display: any DisplayDimming = NoopDisplayDimmer(),
         keyboard: any KeyboardBacklighting = NoopKeyboardBacklight(),
+        appNap: any AppNapPreferencing = NoopAppNapPreferences(),
         notifier: any Notifying = RecordingNotifier(),
         clamshell: @escaping @Sendable () -> Bool? = { LidObserver.readClamshellState() },
         clock: @escaping @Sendable () -> Date = { Date() },
@@ -180,6 +232,7 @@ final class SessionManager {
         self.audio = audio
         self.display = display
         self.keyboard = keyboard
+        self.appNap = appNap
         self.notifier = notifier
         self.clamshell = clamshell
         self.clock = clock
@@ -201,7 +254,19 @@ final class SessionManager {
         }
         self.state = loadedState ?? .clean
         self.lastError = loadError
-        if let c = (try? store.loadConfig()) ?? nil {
+        if var c = (try? store.loadConfig()) ?? nil {
+            // Settings keeps the end floor below the Low Power Mode floor; a
+            // hand-edited config.json may not. Fix it here and write it back.
+            if let change = c.normalizeFloors() {
+                do {
+                    try store.saveConfig(c)
+                    Log.info("config.json: \(change); saved")
+                } catch {
+                    // The corrected floors apply in memory either way; the
+                    // file stays as it was and is corrected again next launch.
+                    Log.error("config.json: \(change); could not save the correction: \(error.localizedDescription)")
+                }
+            }
             self.config = c
         } else {
             self.config = Config()
@@ -224,6 +289,7 @@ final class SessionManager {
             audio: audio,
             display: display,
             keyboard: keyboard,
+            appNap: CFAppNapPreferences(),
             notifier: notifier
         )
         let services = AppServices(
@@ -265,6 +331,7 @@ final class SessionManager {
                 self.refuseForUnreadableJournal(what, error)
                 return .failure(.journalUnreadable(error.localizedDescription))
             }
+            self.writeOwedEdits()
             return .success(await op())
         }
         lifecycleTail = Task { _ = await task.value }
@@ -339,10 +406,21 @@ final class SessionManager {
         // rollback puts exactly this back: an entry an earlier failed restore
         // left behind is evidence, not something this start may clear.
         let journalBefore = state
-        let sessionBefore = (try? store.loadSession()) ?? nil
+        let sessionBefore: Session?
+        do {
+            sessionBefore = try store.loadSession()
+        } catch {
+            // A session.json this start cannot read is never replaced: it
+            // appeared or lost its permissions after reconcile, or reconcile
+            // could not move it aside. It may be a valid session, and a
+            // rollback could not put it back.
+            fail("start refused, nothing changed: session.json could not be read (\(error.localizedDescription)). Remove it or move it out of \(paths.appSupport.path), then start again")
+            return
+        }
 
         do {
             try store.saveSession(new)
+            keptSessionFile = nil
             try journal { $0.sleepDisabledByUs = true }
         } catch {
             fail("could not write session: \(error.localizedDescription)")
@@ -386,7 +464,8 @@ final class SessionManager {
         foreignSleepWarning = nil
         Log.info("session started until \(iso(new.endsAt)) (\(Int(duration))s requested)")
         await armDeadline(new.endsAt)
-        // App Nap defaults and every observer live in AppServices.
+        applyAppNapInJournal()
+        // Every observer lives in AppServices.
         services?.start(for: self)
         // PR3: schedule "5 minutes left" notification.
     }
@@ -474,18 +553,23 @@ final class SessionManager {
         scheduledDeadline = nil
         remainingText = ""
         countdownText = ""
-        var deletionError: String?
-        do {
-            try store.deleteSession()
-        } catch {
-            deletionError = error.localizedDescription
-            fail("could not remove session.json: \(error.localizedDescription)")
+        // Why session.json is still in place when a relaunch could act on
+        // it; the end is then retried and quit refused.
+        var retainedBecause: String?
+        if let kept = keptSessionFile {
+            retainedBecause = retryMovingAsideKeptSessionFile(kept)
+        } else {
+            do {
+                try store.deleteSession()
+            } catch {
+                retainedBecause = "session.json could not be removed (\(error.localizedDescription)); a relaunch would hold sleep again for it."
+                fail("could not remove session.json: \(error.localizedDescription)")
+            }
         }
         await restoreAll()
-        // App Nap defaults are intentionally left set (spec: open decisions).
         services?.stop()
 
-        if state.isDirty || deletionError != nil {
+        if state.isDirty || retainedBecause != nil {
             // The journal is the retry list. Make sure something will read it.
             var armed = true
             if state.isDirty {
@@ -496,13 +580,13 @@ final class SessionManager {
                     fail("recovery agent could not be confirmed: \(error.localizedDescription)")
                 }
             }
-            if let deletionError {
+            if let retainedBecause {
                 // The agent enforces deadlines, it does not remove a live
                 // session file; only this process can, so it stays to retry.
                 let journalNote = state.isDirty ? " Some changes are also still journaled." : ""
                 notifier.post(
                     title: Self.incompleteTitle,
-                    body: "session.json could not be removed (\(deletionError)); a relaunch would hold sleep again for it.\(journalNote) Insomnia retries in \(Int(recoveryRetryDelay)) s; do not quit until it is removed."
+                    body: "\(retainedBecause)\(journalNote) Insomnia retries in \(Int(recoveryRetryDelay)) s; do not quit until it is gone."
                 )
                 scheduleEndRetry(reason)
                 return .sessionRetained
@@ -543,8 +627,28 @@ final class SessionManager {
     /// skip the side effect.
     func journal(_ mutate: (inout RuntimeState) -> Void) throws {
         var s = state
+        owedEdits.apply(to: &s)
         mutate(&s)
         try persistState(s)
+        owedEdits = UndoneFreeze()
+    }
+
+    /// Take the entries of an undone freeze off the journal now, or with
+    /// the next journal write that succeeds. Only for `LidActions.freeze`,
+    /// inside its transaction.
+    func clearUndoneFreeze(_ undone: UndoneFreeze) {
+        owedEdits.pids.formUnion(undone.pids)
+        owedEdits.docker = owedEdits.docker || undone.docker
+        writeOwedEdits()
+    }
+
+    private func writeOwedEdits() {
+        guard !owedEdits.isEmpty else { return }
+        do {
+            try journal { _ in }
+        } catch {
+            Log.error("could not clear the entries of an undone freeze from the journal: \(error.localizedDescription); the status leaves them out, and the next journal write takes them off")
+        }
     }
 
     /// Low Power Mode with journaling: the flag is written before `pmset -b
@@ -671,10 +775,89 @@ final class SessionManager {
         }
 
         undoLidActionsInJournal()
+        restoreAppNapInJournal()
         // After the undo: a restore just written with the mode off owes
         // nothing more (its journal write clears the entry), and a lid
         // still open gets its second write now.
         if lowPowerJustCleared { settleDisplayAfterLowPower() }
+    }
+
+    // MARK: App Nap (spec section 5)
+
+    /// `NSAppSleepDisabled = YES` for each agent app, when the user opted
+    /// in. Journal first: the value the key has now (absent, true or false)
+    /// is on disk before the preference is touched, so a crash between the
+    /// two still restores it, and a journal write that fails means no
+    /// preference write. A key already YES is left alone and not journaled,
+    /// since there is nothing to put back; a value that is not a boolean is
+    /// left alone too. An app already journaled (reconcile after a crash)
+    /// keeps its recorded value and is set to YES again. An id backstop.sh
+    /// could not restore (`AppNap.isRestorable`) is skipped before anything
+    /// is journaled.
+    private func applyAppNapInJournal() {
+        guard config.disableAppNapForAgents else { return }
+        var seen = Set<String>()
+        var written = 0
+        var alreadyOff = 0
+        for id in config.agentList where !id.isEmpty && seen.insert(id).inserted {
+            guard AppNap.isRestorable(bundleId: id) else {
+                Log.error("app nap: \(id.debugDescription) is not a bundle id the recovery agent can restore; left alone")
+                continue
+            }
+            if !state.appNapOverrides.contains(where: { $0.bundleId == id }) {
+                let previous: Bool?
+                do {
+                    previous = try appNap.readSleepDisabled(bundleId: id)
+                } catch {
+                    Log.error("app nap: \(error.localizedDescription)")
+                    continue
+                }
+                if previous == true {
+                    alreadyOff += 1
+                    continue
+                }
+                do {
+                    try journal { $0.appNapOverrides.append(AppNapOverride(bundleId: id, previous: previous)) }
+                } catch {
+                    fail("could not journal the App Nap setting of \(id): \(error.localizedDescription); its preferences are left unchanged")
+                    break
+                }
+            }
+            do {
+                try appNap.writeSleepDisabled(true, bundleId: id)
+                written += 1
+            } catch {
+                // Already journaled: the restore puts the recorded value
+                // back whether or not this write landed.
+                fail("app nap: \(error.localizedDescription); kept in the journal to restore")
+            }
+        }
+        if written > 0 || alreadyOff > 0 {
+            Log.info("app nap disabled for \(written) app(s); \(alreadyOff) already had it off")
+        }
+    }
+
+    /// Put back what `applyAppNapInJournal` recorded: the previous value,
+    /// or delete the key when it was absent. An entry is cleared only after
+    /// its write succeeded; a failed one stays for the next end, reconcile
+    /// or the backstop (`defaults write` / `defaults delete`).
+    private func restoreAppNapInJournal() {
+        guard !state.appNapOverrides.isEmpty else { return }
+        var restored = 0
+        for entry in state.appNapOverrides {
+            do {
+                try appNap.writeSleepDisabled(entry.previous, bundleId: entry.bundleId)
+                restored += 1
+                do {
+                    try journal { $0.appNapOverrides.removeAll { $0.bundleId == entry.bundleId } }
+                } catch {
+                    fail("App Nap restored for \(entry.bundleId) but the journal entry could not be cleared: \(error.localizedDescription); it will be retried")
+                }
+            } catch {
+                fail("could not restore App Nap for \(entry.bundleId): \(error.localizedDescription); kept in the journal to retry")
+            }
+        }
+        Log.info("app nap restored for \(restored) app(s)")
     }
 
     /// Shared body of lid open, reconcile (lid open) and `restoreAll()`;
@@ -699,7 +882,7 @@ final class SessionManager {
             }
             if !report.unverifiable.isEmpty {
                 let list = report.unverifiable.map(String.init).joined(separator: ", ")
-                fail("pid(s) \(list) are stopped but journaled without identity (a legacy entry from an older build, or a freeze interrupted before the kernel confirmed the stop), so Insomnia cannot prove it froze them and will not resume them. Check each one first, for example `ps -o pid,stat,lstart,command -p <pid>`, and only if it is a process you expected Insomnia to freeze run `kill -CONT <pid>`; the entry stays in the journal until resumed or gone")
+                fail("pid(s) \(list) are stopped but journaled without identity, so Insomnia cannot prove it froze them and will not resume them. Either an older build recorded the pid alone, or a freeze stopped the pid and Insomnia quit, crashed or failed to write before the stop was confirmed in the journal. Check each one first, for example `ps -o pid,stat,lstart,command -p <pid>`, and only if it is a process you expected Insomnia to freeze run `kill -CONT <pid>`; the entry stays in the journal until resumed or gone")
             }
         } else if state.dockerFrozen {
             try? journal { $0.dockerFrozen = false }
@@ -882,11 +1065,30 @@ final class SessionManager {
 
     private func performReconcile() async {
         let now = clock()
+        keptSessionFile = nil
         var onDisk: Session?
         do {
             onDisk = try store.loadSession()
+        } catch StoreError.unreadable(_, let detail) {
+            // The bytes were read and are not a session, so nothing in them
+            // can be trusted and nothing in them is needed: the journal, not
+            // the session file, says what to undo. Moved aside (never
+            // deleted or overwritten) and treated as no session; a dirty
+            // journal is still restored below. An unreadable state.json
+            // never gets here: exclusive() refuses the transaction first,
+            // and the session file stays with it.
+            moveAsideUnreadableSession(detail)
+            onDisk = nil
         } catch {
-            Log.error("session.json unreadable (\(error.localizedDescription)); treating as expired")
+            // The file exists but could not be read at all (permissions,
+            // I/O, or not a regular file, which Store never opens). Its end
+            // time is unknown, and sleep is never held without a deadline
+            // that can be enforced, so it counts as expired: a dirty journal
+            // is restored below. It may have been a valid session, so it is
+            // kept as evidence, renamed aside without being opened. Left
+            // under its own name, a later launch that could read it would
+            // resume the session this one treated as ended.
+            moveAsideSessionThatCannotBeRead(error.localizedDescription)
             onDisk = nil
         }
 
@@ -933,6 +1135,7 @@ final class SessionManager {
                 Log.info("reconcile: lid \(lidClosed == nil ? "unknown" : "closed"), keeping lid-close actions")
             }
             await armDeadline(s.endsAt)
+            applyAppNapInJournal()
             services?.start(for: self)
             return
         }
@@ -942,7 +1145,9 @@ final class SessionManager {
             Log.info("reconcile: session expired, restoring")
             _ = await performEnd(reason: .timer)
         } else if state.isDirty {
-            Log.info("reconcile: no session but dirty state, restoring")
+            Log.info(keptSessionFile != nil
+                ? "reconcile: session.json kept in place, restoring the journal as for an expired session"
+                : "reconcile: no session but dirty state, restoring")
             _ = await performEnd(reason: .backstop)
         } else if state.displayRestoredUnderLowPower != nil {
             dropDisplayWrite(reason: "no session and the mode is not ours")
@@ -970,6 +1175,86 @@ final class SessionManager {
             }
         } catch {
             Log.error("reconcile: sleep check failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// The outcome of restoring the journal is reported by the end itself,
+    /// not here: this only says where the file went.
+    private func moveAsideUnreadableSession(_ detail: String) {
+        do {
+            let moved = try store.moveAsideUnreadableSession(now: clock())
+            Log.error("session.json unreadable (\(detail)); moved to \(moved.path) and treated as no session")
+            notifier.post(
+                title: Self.sessionFileTitle,
+                body: "session.json is not a valid session file (\(detail)). It was moved to \(moved.path); Insomnia treats it as no session."
+            )
+        } catch let moveError {
+            // Kept, not deleted. A start is refused while it is there, and
+            // every end restores the journal, tries the rename again, and
+            // stays unfinished while it fails.
+            keptSessionFile = .notASession
+            fail("session.json unreadable (\(detail)) and could not be moved aside: \(moveError.localizedDescription); left in place and treated as no session")
+            notifier.post(
+                title: Self.sessionFileTitle,
+                body: "session.json is not a valid session file (\(detail)). It could not be moved aside (\(moveError.localizedDescription)) and was left in place; Insomnia treats it as no session. Insomnia retries the rename and will not quit until it is gone. Remove it or move it out of \(paths.appSupport.path)."
+            )
+        }
+    }
+
+    /// session.json that could not be read at all, renamed without being
+    /// opened; a FIFO or a file without read permission moves the same way.
+    /// The restore of a dirty journal reports its own outcome.
+    private func moveAsideSessionThatCannotBeRead(_ detail: String) {
+        let expired = "session.json could not be read (\(detail)), so its end time is unknown. Insomnia treats the session as expired and undoes what its journal recorded."
+        do {
+            let moved = try store.moveAsideUnreadableSession(now: clock())
+            Log.error("session.json could not be read (\(detail)); treated as expired and moved, unopened, to \(moved.path)")
+            notifier.post(title: Self.sessionFileTitle, body: "\(expired) The file was moved, unopened, to \(moved.path).")
+        } catch let moveError {
+            // Kept, not deleted. A start is refused while it is there, and
+            // every end restores the journal, tries the rename again, and
+            // stays unfinished while it fails.
+            keptSessionFile = .cannotBeRead
+            fail("session.json could not be read (\(detail)) and could not be moved aside: \(moveError.localizedDescription); treated as expired and left in place")
+            notifier.post(
+                title: Self.sessionFileTitle,
+                body: "\(expired) The file could not be moved aside (\(moveError.localizedDescription)) and was left in place. If it became readable there, a relaunch would resume it, so Insomnia retries the rename and will not quit until it is gone. Remove it or move it out of \(paths.appSupport.path)."
+            )
+        }
+    }
+
+    /// An end's second try at renaming a session.json reconcile could not
+    /// move aside. The rename never opens it. Nil once nothing is left at
+    /// session.json (renamed now, or removed by a person); otherwise why it
+    /// is still there.
+    private func retryMovingAsideKeptSessionFile(_ kept: KeptSessionFile) -> String? {
+        let which = kept == .cannotBeRead ? "could not be read" : "is not a session"
+        guard store.sessionEntryExists() else {
+            keptSessionFile = nil
+            Log.info("session.json that \(which) is gone")
+            return nil
+        }
+        do {
+            let moved = try store.moveAsideUnreadableSession(now: clock())
+            keptSessionFile = nil
+            switch kept {
+            case .cannotBeRead:
+                Log.info("session.json that could not be read moved, unopened, to \(moved.path)")
+                notifier.post(title: Self.sessionFileTitle, body: "session.json, which could not be read, was moved, unopened, to \(moved.path).")
+            case .notASession:
+                Log.info("session.json that is not a session moved to \(moved.path)")
+                notifier.post(title: Self.sessionFileTitle, body: "session.json, which is not a valid session file, was moved to \(moved.path).")
+            }
+            return nil
+        } catch {
+            switch kept {
+            case .cannotBeRead:
+                fail("session.json could not be read and still could not be moved aside: \(error.localizedDescription)")
+                return "session.json could not be read or moved aside (\(error.localizedDescription)). If it became readable where it is, a relaunch would resume it and hold sleep again. Remove it or move it out of \(paths.appSupport.path)."
+            case .notASession:
+                fail("session.json is not a session and still could not be moved aside: \(error.localizedDescription); left in place")
+                return "session.json is not a valid session file and could not be moved aside (\(error.localizedDescription)). Where it is, every launch and the recovery agent read it again. Remove it or move it out of \(paths.appSupport.path)."
+            }
         }
     }
 
@@ -1122,7 +1407,9 @@ final class SessionManager {
         state = s
     }
 
-    private func fail(_ message: String) {
+    /// Logs `message` and shows it in the status menu until the next
+    /// success clears it.
+    func fail(_ message: String) {
         lastError = message
         Log.error(message)
     }
@@ -1134,6 +1421,7 @@ final class SessionManager {
     static let incompleteTitle = "Restore incomplete"
     static let notEndedTitle = "Session not ended"
     static let journalTitle = "Recovery journal unreadable"
+    static let sessionFileTitle = "Session file unreadable"
     static let foreignSleepTitle = "Sleep is disabled by something else"
     static let foreignSleepCommand = "sudo pmset -a disablesleep 0"
     static let foreignSleepLine = "Sleep is disabled by something other than Insomnia; to re-enable it: \(foreignSleepCommand)"

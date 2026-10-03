@@ -55,6 +55,7 @@ RuntimeState {                // everything Insomnia changed and must undo
   savedDisplayBrightness:  Float?  // nil when darkening is off or lid is open
   savedKeyboardBrightness: Float?  // nil when there is no backlight, too
   displayRestoredUnderLowPower: Float?  // restored on open under our Low Power Mode; written again when it ends
+  appNapOverrides:    [{bundleId, previous?}]  // previous absent when the app had no NSAppSleepDisabled key
 }
 ```
 
@@ -120,26 +121,49 @@ Freeze scope rules:
 
 - Two scopes. The explicit freeze list: apps the user picks by bundle id from
   a list of currently running apps; always frozen. The automatic scope
-  (`freezeAllApps`, default on): every running app with a regular activation
-  policy (a Dock app) and a bundle id, so that only agents keep running while
-  the lid is closed. Menu-bar (accessory) and background apps are never picked
-  up automatically; they can be put on the explicit list by hand. With the
+  (`freezeAllApps`, default off, also for a config.json without the key):
+  every running app with a regular activation policy (a Dock app) and a
+  bundle id, so that only agents keep running while the lid is closed.
+  Menu-bar (accessory) and background apps are never picked up
+  automatically; they can be put on the explicit list by hand. With the
   toggle off the explicit list is the whole scope.
 - Hard denylist that can never be frozen, from either scope: `com.apple.*`,
   Insomnia itself, Docker Desktop (handled by the Docker rule), and any bundle
   id in the agent list (below).
-- Built-in protected set (`FreezePlanner.builtInProtected`): editors and agent
-  hosts (VS Code, Cursor, Zed, Antigravity, Claude, ChatGPT/Codex, Conductor,
-  T3 Code, Windsurf, JetBrains IDEs), terminals (Warp, Ghostty, iTerm),
-  browsers agents drive (Arc, Chrome, Chromium), Tailscale, LM Studio, Ollama
-  and Docker Desktop's Electron front end. The automatic scope leaves them
-  alone even when they are not on the agent list. Code level and not
-  persisted: an existing config.json already carries its own agent list, so
-  new agent-list defaults never reach it. An explicit freeze-list entry
-  overrides this set; the hard denylist does not.
+- Built-in protected set (`FreezePlanner.builtInProtected`, checked through
+  `isBuiltInProtected`): editors and agent hosts (VS Code and Insiders,
+  VSCodium, Cursor, Windsurf, Zed, Antigravity and Antigravity IDE, Android
+  Studio, Sublime Text, Nova, Claude, ChatGPT/Codex, Conductor, T3 Code),
+  every JetBrains IDE by the `com.jetbrains.` prefix
+  (`builtInProtectedPrefixes`), terminals (Warp, Ghostty, iTerm, Alacritty,
+  kitty, WezTerm, Tabby, Hyper), browsers (Arc, Chrome, Chromium, Edge, Brave,
+  Vivaldi, Opera, Firefox with its Developer and Nightly editions, Zen),
+  Tailscale, LM Studio, Ollama, Docker Desktop's Electron front end,
+  1Password, Bitwarden, Postgres.app and OrbStack. Every id is verified
+  against an installed copy or the Homebrew cask metadata named in the
+  comment next to it. The automatic scope leaves them alone even when they
+  are not on the agent list. Code level and not persisted: an existing
+  config.json already carries its own agent list, so new agent-list defaults
+  never reach it. An explicit freeze-list entry overrides this set; the hard
+  denylist does not.
 - Order: the explicit list first, in its own order, then the automatic
   candidates by app name, de-duplicated. One info log line names the
   automatic candidates on each close.
+- Each app's pids are journaled before the SIGSTOP, without identity; if
+  that write fails the app is left running and the status menu shows the
+  failure. Recovery never signals an entry without identity. After the
+  SIGSTOP one write gives the pids the kernel stopped their identity (start
+  time to the microsecond, boot session) and drops the pids it would not
+  stop, so a process somebody else had stopped is never claimed. If that
+  write fails, the app sends SIGCONT to each pid it just stopped whose
+  identity still matches, stopped yet or not (SIGCONT also cancels a stop
+  that is still pending), then removes that app's entries and any Docker
+  flag the freeze set, keeping only pids it could not resume. The status
+  menu shows the failure and counts only those pids as frozen, even while
+  the disk refuses the removal; the next journal write that succeeds
+  carries it. If the app dies before the confirming write, the stopped
+  pids stay journaled without identity and are reported for a person to
+  check.
 - Only pids Insomnia stopped are resumed. An app launched while the lid is
   closed is left alone.
 - Electron apps are stopped as a whole process tree (main + helpers), found
@@ -226,14 +250,35 @@ last held while it was on was the battery or thermal floor, not the lid.
   Ghostty, Warp, Chrome, Chromium, Arc, Docker Desktop, VS Code, Cursor, Zed,
   Antigravity, Claude, ChatGPT/Codex, Tailscale, LM Studio, Ollama). Editable.
 - Built-in protection (section 4): the same editors, agent hosts, terminals,
-  browsers, VPN and local model runtimes are protected from the automatic
-  lid-close scope even on an install whose config.json predates these
-  defaults and never lists them. Only the agent list also disables App Nap;
-  only an explicit freeze-list entry overrides the built-in protection.
-- On session start Insomnia sets `NSAppSleepDisabled = YES` for each listed app
-  so App Nap never throttles them. This is a persistent per-app default and is
-  left in place after session end and uninstall. This changes the affected
-  apps' behavior outside an Insomnia session too.
+  browsers, VPN and local model runtimes, plus password managers, local
+  databases and OrbStack, are protected from the automatic lid-close scope
+  even on an install whose config.json predates these defaults and never
+  lists them. Only the agent list can also turn App Nap off; only an
+  explicit freeze-list entry overrides the built-in protection.
+- Turning App Nap off is opt-in (`disableAppNapForAgents`, default off). With
+  it off Insomnia never writes another app's preferences. With it on, session
+  start reads each listed app's `NSAppSleepDisabled`, journals the previous
+  value (absent, true or false) in `appNapOverrides`, and only then writes
+  `YES`. A journal write failure means no preference write. An app whose key
+  is already `YES` is skipped: there is nothing to put back. So is an entry
+  `defaults` would not read as that app's domain (a leading `-`, a path,
+  `NSGlobalDomain`, anything but ASCII letters, digits, `.`, `-` and `_`),
+  since the backstop could not put it back; it is logged. Session end,
+  reconcile, the backstop and uninstall write the recorded value back
+  (`defaults delete` when it was absent) and clear the entry only after that
+  write succeeded. Settings shows the toggle, the list of apps it affects,
+  and what it changes.
+- Values written by builds before this were never recorded and are not
+  guessed at: uninstall reads the key for every app on the shipped agent
+  list and on config.json's (an app taken off the list may still carry one),
+  lists each whose key is `YES` with no journal entry, prints the
+  shell-quoted `defaults delete` command for it, and continues. The summary
+  says how many apps were checked; an app whose key cannot be read is
+  reported, not counted. Each read has a 30 s limit, like every other call
+  uninstall makes under the recovery lock (`pgrep`, `launchctl`); a read
+  that does not answer ends the check with the command to run by hand, and
+  uninstall goes on. A call past its limit gets SIGTERM, then SIGKILL, and
+  never holds the lock.
 - Browser throttling: Chromium browsers throttle windows macOS reports as
   occluded, which is every window once the lid is closed with no external
   display. Timers drop to 1 Hz, animation frames stop, pages report hidden.
@@ -244,6 +289,41 @@ last held while it was on was the battery or thermal floor, not the lid.
   - If a browser is running without them, the menu shows a warning and a
     "Relaunch <browser> unthrottled" item that quits and relaunches it with
     both flags and the same profile.
+  - The item asks for confirmation first (the browser is quit; its windows
+    return only through its own session restore). The item carries the
+    browser's bundle id and name from when the menu was built, and
+    confirming hands those on, so a browser scan that replaces the list
+    while the alert is up cannot change or drop the browser; one that has
+    quit by then is reported as not running. The profile arguments are
+    read before the quit, and unreadable arguments (including empty `ps`
+    output) stop the relaunch before anything is quit. So does a main
+    process that exits during the read, checked by `NSRunningApplication`
+    and by the kernel's start time for the pid, since `ps` reads by pid and
+    the pid may have gone to another process. A start time that cannot be
+    read counts the same way: nothing confirms the pid is still the
+    browser, so the arguments are not read and nothing is quit. The quit
+    goes to the `NSRunningApplication` objects found before the read, never
+    to a fresh lookup of their pids. After the quit request Insomnia waits up
+    to 10 s, then reads the running list again: any instance still there
+    means nothing is launched, and the notification says the browser may
+    still quit later and then has to be opened by hand.
+    After `open` returns 0 the running list is polled for up to 5 s; a
+    browser not running by then is reported too. A session that ends during
+    that wait cancels it at once and nothing is reported, since the user
+    ended the session. The 10 s quit wait does not stop on a cancel, so a
+    relaunch whose session ended during it reports nothing either when the
+    wait is over. Only the newest relaunch of a browser reports, so one
+    that a newer relaunch of the same browser overtook reports nothing
+    either. Every other outcome short of a relaunch is a "Browser not
+    relaunched" notification naming the browser, and the same text stays
+    in the menu as a warning line, one per browser, until that browser's
+    next relaunch or the next session start, because notifications can be
+    off for Insomnia.
+    Insomnia is the notification center's delegate and asks for banners
+    while it is frontmost, as it is right after the confirmation; without
+    that, macOS drops a notification from the frontmost app. The process
+    side (`BrowserProcessControlling`) is injected so the tests quit
+    nothing.
   - Headless Playwright is unaffected and needs nothing.
   - **Must be verified on the real machine with the lid shut** (see test plan).
     If macOS 26 does not mark windows occluded in this state, the feature is
@@ -259,7 +339,7 @@ IOKit sends no event for a read that keeps failing.
 | condition | action | undo |
 |---|---|---|
 | battery below `lowPowerFloor` (default 40%) | `pmset -b lowpowermode 1` | charger connected, or session end |
-| battery below `endFloor` (default 10%) | end session, notify | — |
+| battery below `endFloor` (default 10%; 0 turns the end off) | end session, notify | — |
 | battery present but unreadable on two consecutive reads, on battery, `endFloor` above 0 | end session, notify | — |
 | thermal state `serious` | `lowpowermode 1` | thermal back to `nominal`/`fair`, or session end |
 | thermal state `critical` | end session, notify | — |
@@ -279,6 +359,14 @@ menu's own refresh reads the level but leaves the count where it is, so a
 menu opened during a transient miss is not the second one, and the count
 never moves without the floor rules running. An unreadable level never counts
 as below a floor, so it does not enable Low Power Mode by itself.
+
+A non-zero `endFloor` stays below `lowPowerFloor`, which gives Low Power Mode
+a chance to come on before the session ends. It is not a guarantee: a reading
+already below both floors, or one that crosses both between evaluations, ends
+the session without it. Settings enforces the order in 5% steps by moving the
+other floor when the two would cross (`endFloor` at most 95). A `config.json`
+that violates it is corrected at load by raising `lowPowerFloor` to `endFloor`
++ 5 (capped at 100), logged, and written back.
 
 Insomnia does not enable Low Power Mode merely because a session starts; the
 causes are the battery floor, a serious thermal state, and (by default) a closed
@@ -309,8 +397,14 @@ provided by the standalone backstop. Performance effects depend on workload.
 - Each outage is logged with start, end, and gap length to
   `~/Library/Logs/Insomnia/handoffs.log`. The menu shows the last gap.
 - Path satisfied again after a gap longer than `nudgeThreshold` (default 90 s):
-  - For every tagged tmux target (`session:window.pane`), run
-    `tmux send-keys -t <target> "continue" Enter`.
+  - For every configured tmux target (`session:window.pane`), resolve the
+    concrete pane, read its state and then its mark, the pane-scoped user
+    option `@insomnia-nudge` (`show-options -qpv -t %N`, without `-A`, so
+    a session or window option never counts). Only a pane marked `on` by
+    the user (`tmux set-option -p -t <target> @insomnia-nudge on`) gets
+    `tmux send-keys -t %N continue`, followed by `Enter` only when
+    `tmuxNudgePressesEnter` is on (default off). An unmarked pane is
+    skipped and logged.
   - Post a notification: "Network was down 2m 10s. Nudged 2 tmux panes.
     Check GUI agents."
 - Recommended one-time setting, documented in the README: System Settings >
@@ -327,8 +421,36 @@ Invariants:
 Reconcile runs at every Insomnia launch:
 
 1. Session file missing or expired → restore journaled changes: sleep,
-   verified owned processes, Low Power Mode if we set it, and saved audio.
+   verified owned processes, Low Power Mode if we set it, saved audio, and
+   recorded App Nap values.
    Unverified entries and failed restoration remain unresolved, not successful.
+   A session file that does not decode counts as expired: it is renamed under
+   the lock to `session.json.unreadable-<UTC stamp>` (never deleted, never
+   overwriting an earlier copy), the user is told where, and the journal is
+   restored as with no session. `backstop.sh` does the same once the journal
+   is clean. A session file that decodes as JSON but lacks a key or type
+   the `Session` decoder needs (`startedAt`, `endsAt`, `extensions`) is not
+   a session either; `backstop.sh` checks the same keys and types. The app
+   and both scripts read a date in one form only: `2027-01-15T08:00:00Z`,
+   as Store writes it, or the same with an offset such as `+02:00` in place
+   of `Z`, in whole seconds, naming a date and time that exist, years 1970
+   to 9999 (`Store.parseDate`, `epoch_of` in the scripts). A session file that exists
+   but cannot be read at all, or is not a regular file (never opened: a
+   FIFO would block under the lock), has no end time that can be enforced,
+   so it also counts as expired and the journal is restored. It may have
+   been a valid session, so it is never opened or removed: it is renamed
+   aside the same way (the app at once, `backstop.sh` once the journal is
+   clean), which keeps it as evidence and keeps a later launch from
+   resuming a session that was treated as ended. The app notifies with the
+   new path. If either rename fails the file stays and a start is refused
+   while it is there. Every end then restores the journal and tries the
+   rename again; while it fails the end is not finished, so quit is refused
+   and the end is retried. A file that could not be read would be resumed
+   if it became readable in place, and every later launch and the agent
+   read either kind again. The messages say to remove it or move it out of
+   the folder. `backstop.sh` tries the rename again on every run.
+   An unreadable journal still refuses every transaction and leaves both
+   files in place.
 2. Session valid → establish the independent recovery agent before reapplying
    the sleep guard, then resume observers. If the lid is open, restore recorded
    lid-close actions. Arming or restoration errors must remain visible.
@@ -353,6 +475,11 @@ Backstop, independent of the app:
 - The shell does not restore CoreAudio settings. Saved audio must remain in
   the journal for the app to restore. Uninstall must preserve recovery tools
   and state when restoration is incomplete, including saved audio.
+- The shell puts `appNapOverrides` back with `defaults write <id>
+  NSAppSleepDisabled -bool <previous>` or `defaults delete` when the key was
+  absent. A delete that fails counts as done only when `defaults read` then
+  says the key does not exist; a read that succeeds or fails any other way
+  keeps the entry.
 - The agent is a recovery mechanism, not a guarantee of crash/reboot behavior
   or a replacement for battery/thermal observers. These scenarios require
   the separate hardware validation record.
@@ -371,13 +498,39 @@ JSON at `~/Library/Application Support/Insomnia/config.json`, edited through a
 small settings window:
 
 - presets, default preset
-- freeze list (bundle ids), freeze every other app on/off, Docker rule
-  on/off, mute on lid close on/off
-- agent list (bundle ids)
+- freeze list (bundle ids), freeze every other app on/off (default off),
+  Docker rule on/off, mute on lid close on/off
+- agent list (bundle ids), turn App Nap off for them on/off (default off)
 - `lowPowerFloor`, `endFloor`, thermal rules on/off
 - hotspot SSID (password entered once, stored in Keychain), `nudgeThreshold`
-- tmux targets
-- launch at login (`SMAppService.mainApp`)
+- tmux targets, `tmuxNudgePressesEnter` (default off)
+- launch at login (`SMAppService.mainApp`). macOS ties the login item to
+  the bundle's signature and location, and `install.sh` ad-hoc signs a
+  fresh bundle on every run, so an upgrade can drop the registration.
+  config.json keeps `launchAtLoginInstall`, the code directory hash,
+  bundle path and executable file identity (inode and birth time) of the
+  install whose registration macOS last accepted. install.sh deletes the
+  bundle and copies the executable in fresh, so even an unchanged or
+  unsigned build reinstalled at the same path reads as a new install. At
+  launch, with the flag on and `SMAppService.mainApp.status` neither
+  enabled nor waiting for approval, that record decides: a different
+  install means the reinstall lost the registration and the app registers
+  again; the same install means the user removed the item in System
+  Settings, and the app turns the flag off rather than put it back; no
+  record (a config from before the field) means this is the first launch
+  of a build that keeps one, itself a reinstall, so the app registers once
+  and records the install. A user who removed the item while Insomnia's
+  switch stayed on gets it back that once.
+  Every outcome is logged. The Settings switch shows what macOS has on
+  file (enabled or waiting for approval), not the flag; a registration
+  waiting for approval shows a note with a button that opens System
+  Settings > General > Login Items, and turning the switch off withdraws
+  it; a register or unregister that throws shows its error under the
+  switch. The flag and the install are persisted only when macOS accepted
+  the change. The status is re-read when the Settings window appears and
+  whenever the app becomes active, so an approval or removal made in
+  System Settings shows without a relaunch. With the flag off nothing is
+  registered or unregistered at launch.
 
 ### 11. Menu bar UI: inline time entry
 
@@ -561,7 +714,8 @@ Insomnia/
     install.sh             build, bundle, codesign, sudoers, launchd, login item
     uninstall.sh           reverse all of the above, restore sleep
     backstop.sh            standalone restore from JSON
-    simulate-lid.sh        file trigger for the lid-close action path
+    simulate-lid.sh        file trigger for the lid-close action path (debug and
+                           INSOMNIA_LID_SIMULATION=1 builds only)
   docs/spec.md
   README.md                setup, hotspot setting, Chrome note
 ```
@@ -610,8 +764,11 @@ that any case passed; record results in the release validation record.
    shows the SSID. Turn off the router or walk away, watch `handoffs.log`, and
    confirm the hotspot join works within ~10 s and a Claude Code turn in flight
    completes.
-10. **Nudge.** Gap forced above threshold → tagged tmux pane receives
-   "continue", notification posted.
+10. **Nudge.** Mark a disposable pane (`tmux set-option -p -t <target>
+   @insomnia-nudge on`). Gap forced above threshold → that pane receives
+   "continue" and no Enter; an unmarked listed pane receives nothing;
+   with "Press Enter after continue" on, the line is submitted.
+   Notification posted.
 11. **Floors.** Set `lowPowerFloor` above current charge → Low Power Mode on.
     Plug in charger → off. Set `endFloor` above current charge → session ends.
 12. **Thermal.** Exercise injected thermal events first; verify responses to
@@ -621,12 +778,30 @@ that any case passed; record results in the release validation record.
     `savedKeyboardBrightness`). Open → both back, journal entries gone. Repeat
     with the lid open using `scripts/simulate-lid.sh closed` then `open`
     during a session; the log shows `lid SIMULATED closed (file trigger)`.
+    That needs a build with the watcher compiled in (installed with
+    `INSOMNIA_LID_SIMULATION=1 ./scripts/install.sh`; it logs "Lid
+    simulation build" at launch). A normal install ignores the trigger:
+    the watcher is compiled out so a file written by any other program
+    running as the user cannot replay the lid actions. CI proves that on
+    the binaries: `scripts/check-lid-simulation-gate.sh` builds the release
+    both ways and checks the watcher class and its log lines are absent
+    from the plain binary and present with the define. A binary nm or
+    strings cannot read fails the check rather than counting as absent.
     Quit while closed → both restored. Force-quit while closed, reopen the app
     → restored at reconcile, and `backstop.sh` alone leaves both keys in place.
+14. **App Nap.** With the setting on and Terminal on the agent list, `defaults
+    delete com.apple.Terminal NSAppSleepDisabled`, start a session → `defaults
+    read` shows 1 and `state.json` has an `appNapOverrides` entry without
+    `previous`. End → the key is gone, entry gone. Repeat with the key set to
+    0 → put back to 0. Force-quit during a session → `backstop.sh` alone puts
+    it back. Set the key to 1 by hand, empty `appNapOverrides`, run
+    `uninstall.sh` → it prints the `defaults delete` command and continues.
 
 ## Open decisions (defaults chosen, change if you disagree)
 
 - `pmset -a` (all power sources) rather than `-b` for `disablesleep`, so
   behaviour is identical whether or not a charger is attached.
 - Default `lowPowerFloor` 40%, `endFloor` 10%, `nudgeThreshold` 90 s.
-- App Nap defaults are left set after a session ends.
+- Turning App Nap off for agent apps is opt-in and the previous value is put
+  back at session end. Values older builds wrote without a record are listed
+  by uninstall, never deleted by it.
