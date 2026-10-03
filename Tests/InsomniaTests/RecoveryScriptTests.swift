@@ -1494,8 +1494,9 @@ final class RecoveryScriptTests: XCTestCase {
     }
 
     /// A session written with offsets is a session for the backstop too: a
-    /// future one keeps sleep disabled and nothing runs, a past one is
-    /// undone like any expired session.
+    /// future one with the app running keeps sleep disabled, and only the
+    /// battery and thermal reads run. A past one is undone like any expired
+    /// session.
     func testSessionWithOffsetDatesIsReadLikeTheApp() throws {
         let dirty = #"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#
         let f = DateFormatter()
@@ -1510,13 +1511,16 @@ final class RecoveryScriptTests: XCTestCase {
 
         try write(endsAt: Date(timeIntervalSinceNow: 3600))
         try fx.writeState(dirty)
+        let app = try fx.holdAliveLock()
         let future = try fx.run(fx.backstop)
+        app.release()
 
         XCTAssertEqual(future.status, 0, future.stderr + fx.log())
-        XCTAssertEqual(fx.calls(), [])
+        XCTAssertEqual(calls(), [batteryRead, thermalRead])
         XCTAssertTrue(fx.exists(fx.session))
         XCTAssertEqual(try String(contentsOf: fx.state, encoding: .utf8), dirty)
 
+        fx.clearCalls()
         try write(endsAt: Date(timeIntervalSinceNow: -60))
         let past = try fx.run(fx.backstop)
 
