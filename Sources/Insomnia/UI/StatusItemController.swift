@@ -681,7 +681,8 @@ final class StatusItemController: NSObject {
             ),
             throttledBrowsers: status.throttledBrowsers,
             relaunchProblems: status.relaunchProblems,
-            hotspotWarning: status.hotspotPasswordProblem?.menuLine,
+            // A report about an SSID edited away since is not shown.
+            hotspotWarning: status.hotspotPasswordReport?.problem(for: manager.config.hotspotSSID)?.menuLine,
             error: manager.lastError,
             foreignSleep: manager.foreignSleepWarning,
             lidSimulationBuild: LidSimulationBuild.isCompiledIn

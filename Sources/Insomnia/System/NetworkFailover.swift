@@ -214,6 +214,30 @@ enum HotspotPasswordProblem: Equatable, Sendable {
     }
 }
 
+/// A problem the failover reported, with the hotspot SSID it read for.
+/// The menu and Settings show it only while that hotspot is the one
+/// configured: after an SSID edit it is about an item no join reads.
+struct HotspotPasswordReport: Equatable, Sendable {
+    let ssid: String
+    let problem: HotspotPasswordProblem
+
+    /// The problem, if this report is about `configuredSSID`.
+    func problem(for configuredSSID: String) -> HotspotPasswordProblem? {
+        ssid == HotspotSSID.normalized(configuredSSID) ? problem : nil
+    }
+
+    /// Whether the report still stands after Settings saved or cleared the
+    /// password for `savedSSID`. A save writes that SSID's item and
+    /// removes the one the window loaded, so a report about either is
+    /// out of date. The one report that stands is about the hotspot
+    /// configured now when the save was for another SSID, one edited away
+    /// while the save waited.
+    func stands(afterSaveFor savedSSID: String, configuredSSID: String) -> Bool {
+        let configured = HotspotSSID.normalized(configuredSSID)
+        return ssid == configured && savedSSID != configured
+    }
+}
+
 /// The file-based keychain calls this store needs that the SDK marks
 /// deprecated since macOS 10.10 but still ships: the process-wide prompt
 /// switch, the per-item access list and the keychain an item lives in.
@@ -711,22 +735,25 @@ final class NetworkFailover {
 
     /// Called after every recovery with the gap length.
     var onRecovered: ((TimeInterval) -> Void)?
-    /// Called when the password problem changes: set when a join is skipped
+    /// Called when the password report changes: set when a join is skipped
     /// for want of a readable password, nil once a read succeeds or the
     /// password is saved again.
-    var onPasswordProblem: ((HotspotPasswordProblem?) -> Void)?
+    var onPasswordReport: ((HotspotPasswordReport?) -> Void)?
 
     private(set) var machine = FailoverMachine()
     private(set) var wifiInterface: String?
     private(set) var lastGap: TimeInterval?
-    /// Why the last join was skipped before the join itself, if it was.
-    private(set) var passwordProblem: HotspotPasswordProblem? {
-        didSet { if passwordProblem != oldValue { onPasswordProblem?(passwordProblem) } }
+    /// Why the last join was skipped before the join itself, if it was,
+    /// and for which hotspot.
+    private(set) var passwordReport: HotspotPasswordReport? {
+        didSet { if passwordReport != oldValue { onPasswordReport?(passwordReport) } }
     }
-    /// Whether this outage's skipped join has been notified, so the retries
-    /// (every 5 to 30 s) do not repeat it. Cleared on recovery, so the next
-    /// outage is notified again, and on stop and on a saved password.
-    private var notifiedThisOutage = false
+    /// The hotspots whose skipped join this outage has notified, so the
+    /// retries (every 5 to 30 s) do not repeat it. A hotspot configured
+    /// during the outage is notified for itself. Cleared on recovery, so
+    /// the next outage is notified again, and on stop and on a saved
+    /// password.
+    private var notifiedThisOutage: Set<String> = []
 
     private let paths: Paths
     private let keychain: any KeychainStoring
@@ -806,15 +833,19 @@ final class NetworkFailover {
         outage += 1
         machine = FailoverMachine()
         // The session is over: the menu line about the password goes with it.
-        passwordProblem = nil
-        notifiedThisOutage = false
+        passwordReport = nil
+        notifiedThisOutage = []
     }
 
-    /// Settings saved or cleared the password: forget the problem so the
-    /// menu line goes and the next outage reports afresh.
-    func passwordChanged() {
-        passwordProblem = nil
-        notifiedThisOutage = false
+    /// Settings saved or cleared the password for `ssid`: forget the
+    /// report unless it still stands (`HotspotPasswordReport.stands`), so
+    /// the menu line goes, and forget the notifications of every other
+    /// hotspot, so a problem that comes back is notified afresh.
+    func passwordChanged(savedFor ssid: String, configuredSSID: String) {
+        if passwordReport?.stands(afterSaveFor: ssid, configuredSSID: configuredSSID) != true {
+            passwordReport = nil
+        }
+        notifiedThisOutage = notifiedThisOutage.filter { $0 == passwordReport?.ssid }
     }
 
     /// Current SSID via `networksetup -getairportnetwork`; nil when unknown.
@@ -915,7 +946,7 @@ final class NetworkFailover {
             case let .recovered(start, gap):
                 self.outage += 1
                 cancelTimer()
-                notifiedThisOutage = false
+                notifiedThisOutage = []
                 await recovered(start: start, gap: gap)
             }
         }
@@ -984,15 +1015,15 @@ final class NetworkFailover {
         switch read {
         case let .success(p?):
             password = p
-            passwordProblem = nil
+            passwordReport = nil
         case .success(nil):
-            report(.missing)
+            report(.missing, for: ssid)
             return
         case let .failure(error as KeychainError):
-            report(error.problem)
+            report(error.problem, for: ssid)
             return
         case let .failure(error):
-            report(.error(error.localizedDescription))
+            report(.error(error.localizedDescription), for: ssid)
             return
         }
         Log.info("joining hotspot \(ssid) on \(iface) (attempt \(machine.joins))")
@@ -1007,12 +1038,11 @@ final class NetworkFailover {
     }
 
     /// The join is skipped: log it, show it in the menu, and notify once per
-    /// outage. The log line names the problem, not the SSID.
-    private func report(_ problem: HotspotPasswordProblem) {
+    /// outage and hotspot. The log line names the problem, not the SSID.
+    private func report(_ problem: HotspotPasswordProblem, for ssid: String) {
         Log.error("hotspot join skipped: \(problem.explanation)")
-        passwordProblem = problem
-        guard !notifiedThisOutage else { return }
-        notifiedThisOutage = true
+        passwordReport = HotspotPasswordReport(ssid: ssid, problem: problem)
+        guard notifiedThisOutage.insert(ssid).inserted else { return }
         notifier.post(title: "Hotspot not joined", body: problem.explanation)
     }
 

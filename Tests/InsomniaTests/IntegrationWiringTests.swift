@@ -156,6 +156,37 @@ final class IntegrationWiringTests: XCTestCase {
         XCTAssertTrue(items.contains(StatusMenu.Item(title: "\u{26A0} \(reason)", kind: .warning)), "\(items.map(\.title))")
     }
 
+    /// The failover's report about the hotspot password is a menu line
+    /// while that hotspot is the one configured. After an SSID edit it is
+    /// about an item no join reads, and the line goes; editing the SSID
+    /// back brings it back, since nothing has changed that item.
+    @MainActor
+    func testTheMenuShowsTheHotspotReportOnlyForTheConfiguredSSID() {
+        let h = Harness()
+        defer { h.home.destroy() }
+        let services = AppServices(
+            paths: h.home.paths,
+            notifier: RecordingNotifier(),
+            audio: FakeAudioControl(),
+            processControl: FakeProcessControl(),
+            locationPermission: LocationPermission(authorizationStatus: .notDetermined)
+        )
+        let source = LiveStatusSource(services: services)
+        let manager = h.makeManager()
+        manager.config.hotspotSSID = "Phone"
+        services.status.hotspotPasswordReport = HotspotPasswordReport(ssid: "Phone", problem: .unreadable)
+        // A debug build also has the lid simulation line.
+        func warnings() -> [String] {
+            StatusItemController.menuItems(manager: manager, status: source).map(\.title).filter { $0.contains("Hotspot") }
+        }
+
+        XCTAssertEqual(warnings(), [HotspotPasswordProblem.unreadable.menuLine])
+        manager.config.hotspotSSID = "Other Phone"
+        XCTAssertEqual(warnings(), [])
+        manager.config.hotspotSSID = " Phone "
+        XCTAssertEqual(warnings(), [HotspotPasswordProblem.unreadable.menuLine])
+    }
+
     /// The line belongs to the last relaunch. Starting another clears it
     /// while that one runs, and one that relaunches the browser leaves no
     /// line.

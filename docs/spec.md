@@ -392,9 +392,12 @@ provided by the standalone backstop. Performance effects depend on workload.
   the build may not read fails with `errSecAuthFailed` (another build's item,
   or a locked keychain; the file-based keychain cannot tell them apart), and
   a missing item with `errSecItemNotFound`. Either skips the join and sets
-  `HotspotPasswordProblem`: a warning line in the right-click menu, a notice
-  under the password field in Settings, and one notification per outage
-  (re-armed on recovery, on stop and when the password is saved). A save in
+  a `HotspotPasswordReport`, the `HotspotPasswordProblem` and the SSID it
+  was read for: a warning line in the right-click menu and a notice under
+  the password field in Settings, both only while that SSID is the one
+  configured, and one notification per outage and hotspot (re-armed on
+  recovery, on stop and when the password is saved). Settings checks the
+  notice again whenever the configured SSID changes. A save in
   Settings writes to the keychain that holds the item reads find, which
   need not be the default keychain (a new item goes to the default
   keychain). A locked keychain
@@ -436,7 +439,11 @@ provided by the standalone backstop. Performance effects depend on workload.
   the field even when the failover's report changed during the wait; the
   recheck that change started reads the keychain behind the save, and its
   answer is dropped. So is the answer of a load still running when a save
-  or clear begins, so it cannot refill a field the user just cleared.
+  or clear begins, so it cannot refill a field the user just cleared. A
+  load fills the field only if the field was empty when it began and
+  nobody has edited it since, not even by typing and deleting it again. A
+  recheck that begins meanwhile (the report changed, or the SSID was
+  edited) sets the notice instead of the load, but does not stop the fill.
 - Work that waits on `KeychainQueue` checks again, once the wait is over,
   everything it acts on, and drops its answer if any of it changed. A
   load or recheck in Settings whose SSID was edited meanwhile is dropped,
@@ -444,8 +451,10 @@ provided by the standalone backstop. Performance effects depend on workload.
   now is read instead, so the field is not left empty with no notice.
   That read is a peek: the SSID a later save moves the password from
   stays the one the window loaded, as after any SSID edit. A save clears
-  the failover's report and re-arms its notification only if it stored
-  for the SSID configured when it answers. A failover join whose read waited behind a
+  the failover's report and re-arms its notification unless the report is
+  about the SSID configured when it answers and the save stored for
+  another one; a save that stored for an SSID edited away meanwhile then
+  checks the notice for the SSID configured now. A failover join whose read waited behind a
   save does nothing if the session has ended, Wi-Fi has come back, or the
   configured SSID has changed: no join and no warning, so the
   notification stays armed. After a recovery or stop it schedules no

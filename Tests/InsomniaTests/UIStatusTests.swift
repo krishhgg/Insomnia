@@ -202,7 +202,7 @@ final class UIStatusTests: XCTestCase {
         XCTAssertEqual(s.frozenCount, 0)
         XCTAssertFalse(s.dockerPaused)
         XCTAssertTrue(s.throttledBrowsers.isEmpty)
-        XCTAssertNil(s.hotspotPasswordProblem)
+        XCTAssertNil(s.hotspotPasswordReport)
         XCTAssertNil(s.instantWatts())
         s.refreshInstant()
         s.refreshOnDemand()
@@ -1187,7 +1187,7 @@ final class RecordingStatusSource: StatusSource {
     var dockerPaused = false
     var throttledBrowsers: [ThrottledBrowser] = []
     var relaunchProblems: [String] = []
-    var hotspotPasswordProblem: HotspotPasswordProblem? = nil
+    var hotspotPasswordReport: HotspotPasswordReport? = nil
     private(set) var relaunched: [ThrottledBrowser] = []
 
     func refreshOnDemand() {}

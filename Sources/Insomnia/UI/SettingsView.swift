@@ -15,8 +15,8 @@ struct SettingsView: View {
     @State private var newFreezeBundle = ""
     @State private var newAgentBundle = ""
     @State private var newTmuxTarget = ""
-    @State private var hotspotPassword = ""
-    /// Saving, what was saved, and the notice under the field.
+    /// The password field, saving, what was saved, and the notice under
+    /// the field.
     @State private var hotspot = HotspotPasswordField()
     /// Names of the apps the automatic lid-close scope would freeze right
     /// now (the freeze list excluded); refreshed on appear and toggle.
@@ -43,18 +43,10 @@ struct SettingsView: View {
             loginItem.refresh()
         }
         // The failover may find the saved password unreadable while the
-        // window is open; the notice follows what it reports.
-        .onChange(of: manager.services?.status.hotspotPasswordProblem) { _, problem in
-            let request = hotspot.startRead(ssid: manager.config.hotspotSSID)
-            Task {
-                _ = await Self.readForField(
-                    request,
-                    first: { ("", await Self.hotspotNotice(reported: problem, reread: secrets.peek)) },
-                    secrets: secrets,
-                    finish: { hotspot.finishRead($0, ssid: manager.config.hotspotSSID, notice: $1) }
-                )
-            }
-        }
+        // window is open, and an SSID edit makes the notice about another
+        // hotspot's item: the notice follows both.
+        .onChange(of: manager.services?.status.hotspotPasswordReport) { recheckPassword() }
+        .onChange(of: HotspotSSID.normalized(manager.config.hotspotSSID)) { recheckPassword() }
         // The preview depends on the toggle, both lists and what is running:
         // recompute on any config change and whenever an app launches or quits.
         .onChange(of: manager.config) { refreshWouldFreeze() }
@@ -234,10 +226,10 @@ struct SettingsView: View {
         Section {
             TextField("Hotspot SSID", text: bind(\.hotspotSSID))
             HStack {
-                SecureField("Hotspot password", text: $hotspotPassword)
+                SecureField("Hotspot password", text: Binding(get: { hotspot.password }, set: { hotspot.edit($0) }))
                     .onSubmit(savePassword)
-                Button(hotspot.buttonTitle(ssid: manager.config.hotspotSSID, password: hotspotPassword), action: savePassword)
-                    .disabled(hotspotPassword.isEmpty || hotspot.saving)
+                Button(hotspot.buttonTitle(ssid: manager.config.hotspotSSID), action: savePassword)
+                    .disabled(hotspot.password.isEmpty || hotspot.saving)
             }
             if let notice = hotspot.notice {
                 Text(notice).font(.caption).foregroundStyle(.orange)
@@ -302,51 +294,80 @@ struct SettingsView: View {
         )
     }
 
-    /// Reads without a keychain prompt. An item this build may not read
-    /// leaves the field empty and says why, so the user re-enters it;
-    /// saving then replaces the item (see `KeychainStore`). The read can
-    /// wait behind a save, so anything typed meanwhile is kept, and a
-    /// password read for an SSID edited away meanwhile is not shown: the
-    /// SSID configured now is read instead (`readForField`).
+    /// Fills the field when the window appears (`loadForField`).
     private func loadPassword() {
-        let request = hotspot.startRead(ssid: manager.config.hotspotSSID)
+        let request = hotspot.startLoad(ssid: manager.config.hotspotSSID)
         Task {
-            let password = await Self.readForField(
-                request,
-                first: { await Self.loadedPassword(secrets.load) },
-                secrets: secrets,
-                finish: { hotspot.finishRead($0, ssid: manager.config.hotspotSSID, notice: $1) }
-            )
-            if let password, hotspotPassword.isEmpty { hotspotPassword = password }
+            await Self.loadForField(request, secrets: secrets) {
+                hotspot.finishRead($0, ssid: manager.config.hotspotSSID, password: $1.password, notice: $1.notice)
+            }
         }
     }
 
+    /// Reads the notice again for the hotspot configured now, without a
+    /// prompt and without touching the field.
+    private func recheckPassword() {
+        recheckPassword(hotspot.startRead(ssid: manager.config.hotspotSSID))
+    }
+
+    private func recheckPassword(_ request: HotspotPasswordField.Read) {
+        Task {
+            await Self.readForField(
+                request,
+                first: { await recheckedNotice() },
+                again: { await recheckedNotice() },
+                finish: { hotspot.finishRead($0, ssid: manager.config.hotspotSSID, password: $1.password, notice: $1.notice) }
+            )
+        }
+    }
+
+    private func recheckedNotice() async -> (password: String, notice: String?) {
+        let notice = await Self.hotspotNotice(
+            reported: manager.services?.status.hotspotPasswordReport,
+            ssid: manager.config.hotspotSSID,
+            reread: secrets.peek
+        )
+        return ("", notice)
+    }
+
+    /// Loads the saved password into the field, without a keychain prompt.
+    /// An item this build may not read leaves the field empty and says
+    /// why, so the user re-enters it; saving then replaces the item (see
+    /// `KeychainStore`). The read can wait behind a save, so a field
+    /// edited meanwhile is kept, even one typed in and emptied again, and
+    /// a password read for an SSID edited away meanwhile is not shown: the
+    /// SSID configured now is read instead. That read is a peek: the
+    /// account a later save moves the password from stays the one the
+    /// window loaded, as it does for any SSID edit, so the old SSID's item
+    /// is still removed.
+    static func loadForField(
+        _ request: HotspotPasswordField.Read,
+        secrets: any HotspotSecretStore,
+        finish: @MainActor (HotspotPasswordField.Read, (password: String, notice: String?)) -> HotspotPasswordField.ReadAnswer
+    ) async {
+        await readForField(
+            request,
+            first: { await loadedPassword(secrets.load) },
+            again: { await loadedPassword(secrets.peek) },
+            finish: finish
+        )
+    }
+
     /// Runs a load or recheck for the field: `first` reads, and `finish`
-    /// takes the notice. While the SSID was edited during the read,
-    /// `finish` drops the answer, and the SSID configured now is read
-    /// again. That read is a peek: the account a later save moves the
-    /// password from stays the one the window loaded, as it does for any
-    /// SSID edit, so the old SSID's item is still removed. Returns the
-    /// password of the read whose notice was used, or nil if a newer read,
-    /// save or clear took over.
+    /// takes the answer. While the SSID was edited during the read,
+    /// `finish` drops the answer, and `again` reads the SSID configured
+    /// now, until an answer is used or dropped.
     static func readForField(
         _ request: HotspotPasswordField.Read,
         first: @MainActor () async -> (password: String, notice: String?),
-        secrets: any HotspotSecretStore,
-        finish: @MainActor (HotspotPasswordField.Read, String?) -> HotspotPasswordField.ReadAnswer
-    ) async -> String? {
-        var loaded = await first()
+        again: @MainActor () async -> (password: String, notice: String?),
+        finish: @MainActor (HotspotPasswordField.Read, (password: String, notice: String?)) -> HotspotPasswordField.ReadAnswer
+    ) async {
+        var answer = await first()
         var request = request
-        while true {
-            switch finish(request, loaded.notice) {
-            case .used:
-                return loaded.password
-            case .dropped:
-                return nil
-            case let .readAgain(next):
-                request = next
-                loaded = await loadedPassword(secrets.peek)
-            }
+        while case let .readAgain(next) = finish(request, answer) {
+            request = next
+            answer = await again()
         }
     }
 
@@ -362,15 +383,17 @@ struct SettingsView: View {
         }
     }
 
-    /// The notice under the password field. A problem the failover reports
-    /// shows as it is. A cleared report is not taken as "readable": it
-    /// also clears when the session ends, so the keychain is read again,
+    /// The notice under the password field for the hotspot `ssid`
+    /// configured now. A problem the failover reports about that hotspot
+    /// shows as it is. A report about another SSID, one edited away since,
+    /// does not apply, and a cleared report is not taken as "readable": it
+    /// also clears when the session ends. Then the keychain is read again,
     /// without a prompt, and the notice says what that read finds. The
     /// field is left as the user has it, and the reread is a peek: a load
     /// would make an SSID typed since then the account a save moves the
     /// password from, and the old SSID's item would stay behind.
-    static func hotspotNotice(reported: HotspotPasswordProblem?, reread: () async throws -> String?) async -> String? {
-        if let reported { return reported.settingsNotice }
+    static func hotspotNotice(reported: HotspotPasswordReport?, ssid: String, reread: () async throws -> String?) async -> String? {
+        if let problem = reported?.problem(for: ssid) { return problem.settingsNotice }
         return await loadedPassword(reread).notice
     }
 
@@ -381,21 +404,23 @@ struct SettingsView: View {
         if !HotspotSSID.normalized(manager.config.hotspotSSID).isEmpty {
             locationPermission.requestWhenInUse()
         }
-        let password = hotspotPassword
+        let password = hotspot.password
         Task {
             let outcome = await Self.storePassword(password, in: secrets)
-            hotspot.finishSave(outcome)
+            if let recheck = hotspot.finishSave(outcome, ssid: manager.config.hotspotSSID) {
+                recheckPassword(recheck)
+            }
             Self.passwordStored(outcome, configuredSSID: manager.config.hotspotSSID, services: manager.services)
         }
     }
 
-    /// A save or clear answered. The failover's report about the password
-    /// goes, and the next outage notifies afresh, only when it stored for
-    /// the hotspot configured now: after an SSID edit during the wait, the
-    /// report is about an SSID this save did not touch.
+    /// A save or clear answered. The failover's report goes, and the next
+    /// outage notifies afresh, unless the report is about the hotspot
+    /// configured now and the save stored for another SSID, one edited
+    /// away while it waited (`HotspotPasswordReport.stands`).
     static func passwordStored(_ outcome: HotspotStoreOutcome, configuredSSID: String, services: AppServices?) {
-        guard outcome.isStored(for: configuredSSID) else { return }
-        services?.hotspotPasswordChanged()
+        guard case let .stored(stored) = outcome else { return }
+        services?.hotspotPasswordChanged(savedFor: stored.ssid, configuredSSID: configuredSSID)
     }
 
     /// Saves `password`, or clears the saved one when it is empty, and

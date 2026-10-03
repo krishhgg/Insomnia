@@ -223,7 +223,7 @@ final class NetworkFailoverDriverTests: XCTestCase {
             joiner.calls,
             [.init(ssid: "Phone", password: "top secret", interfaceName: "en0")]
         )
-        XCTAssertNil(n.passwordProblem)
+        XCTAssertNil(n.passwordReport?.problem)
     }
 
     /// A join whose keychain read waits behind a save in Settings (stuck
@@ -268,7 +268,7 @@ final class NetworkFailoverDriverTests: XCTestCase {
 
         XCTAssertEqual(joiner.calls, [])
         XCTAssertEqual(notifier.posts.map(\.title), [])
-        XCTAssertNil(n.passwordProblem)
+        XCTAssertNil(n.passwordReport?.problem)
         XCTAssertFalse(keychain.gaveUp)
     }
 
@@ -290,7 +290,7 @@ final class NetworkFailoverDriverTests: XCTestCase {
         XCTAssertEqual(blocked.joiner.calls, [])
         XCTAssertNil(blocked.driver.retryTimer, "a retry was scheduled after the outage ended")
         XCTAssertEqual(blocked.notifier.posts.map(\.title), [])
-        XCTAssertNil(blocked.driver.passwordProblem)
+        XCTAssertNil(blocked.driver.passwordReport?.problem)
         XCTAssertEqual(blocked.driver.lastGap, 30)
         XCTAssertFalse(keychain.gaveUp)
         blocked.driver.stop()
@@ -309,7 +309,7 @@ final class NetworkFailoverDriverTests: XCTestCase {
         await blocked.tick.value
 
         XCTAssertEqual(blocked.notifier.posts.map(\.title), [])
-        XCTAssertNil(blocked.driver.passwordProblem)
+        XCTAssertNil(blocked.driver.passwordReport?.problem)
         XCTAssertNil(blocked.driver.retryTimer)
 
         await blocked.driver.simulate(satisfied: false)
@@ -318,7 +318,7 @@ final class NetworkFailoverDriverTests: XCTestCase {
 
         XCTAssertEqual(blocked.notifier.posts.map(\.title), ["Hotspot not joined"])
         XCTAssertEqual(blocked.notifier.posts.map(\.body), [HotspotPasswordProblem.missing.explanation])
-        XCTAssertEqual(blocked.driver.passwordProblem, .missing)
+        XCTAssertEqual(blocked.driver.passwordReport, HotspotPasswordReport(ssid: "Phone", problem: .missing))
         XCTAssertEqual(blocked.joiner.calls, [])
         blocked.driver.stop()
     }
@@ -339,7 +339,7 @@ final class NetworkFailoverDriverTests: XCTestCase {
 
         XCTAssertEqual(blocked.joiner.calls, [])
         XCTAssertEqual(blocked.notifier.posts.map(\.title), [])
-        XCTAssertNil(blocked.driver.passwordProblem)
+        XCTAssertNil(blocked.driver.passwordReport?.problem)
         XCTAssertNotNil(blocked.driver.retryTimer, "the retry is still scheduled")
 
         blocked.clock.advance(30)
@@ -365,17 +365,17 @@ final class NetworkFailoverDriverTests: XCTestCase {
             await blocked.tick.value
 
             XCTAssertEqual(blocked.notifier.posts.map(\.title), [], "SSID changed to \"\(changed)\"")
-            XCTAssertNil(blocked.driver.passwordProblem, "SSID changed to \"\(changed)\"")
+            XCTAssertNil(blocked.driver.passwordReport?.problem, "SSID changed to \"\(changed)\"")
             XCTAssertNotNil(blocked.driver.retryTimer, "SSID changed to \"\(changed)\"")
 
             blocked.clock.advance(30)
             await blocked.driver.fireTimer().value
             if HotspotSSID.normalized(changed).isEmpty {
                 XCTAssertEqual(blocked.notifier.posts.map(\.title), [], "no hotspot is configured")
-                XCTAssertNil(blocked.driver.passwordProblem)
+                XCTAssertNil(blocked.driver.passwordReport?.problem)
             } else {
                 XCTAssertEqual(blocked.notifier.posts.map(\.body), [HotspotPasswordProblem.missing.explanation])
-                XCTAssertEqual(blocked.driver.passwordProblem, .missing)
+                XCTAssertEqual(blocked.driver.passwordReport, HotspotPasswordReport(ssid: "Third Phone", problem: .missing))
             }
             XCTAssertEqual(blocked.joiner.calls, [])
             XCTAssertFalse(keychain.gaveUp)
@@ -434,18 +434,21 @@ final class NetworkFailoverDriverTests: XCTestCase {
         keychain: FakeKeychainStore,
         joiner: RecordingHotspotJoiner,
         notifier: RecordingNotifier,
-        clock: FakeClock
+        clock: FakeClock,
+        hotspot: Locked<String> = Locked("Phone")
     ) -> NetworkFailover {
-        var config = Config()
-        config.hotspotSSID = "Phone"
-        return NetworkFailover(
+        NetworkFailover(
             paths: home.paths,
             keychain: keychain,
             hotspotJoiner: joiner,
             notifier: notifier,
             wifiInterface: "en0",
             clock: { clock.now }
-        ) { config }
+        ) {
+            var config = Config()
+            config.hotspotSSID = hotspot.value
+            return config
+        }
     }
 
     /// A join with no saved password is not a silent skip: the problem is
@@ -456,7 +459,7 @@ final class NetworkFailoverDriverTests: XCTestCase {
         let clock = FakeClock(Date(timeIntervalSince1970: 1_800_000_000))
         let n = driver(keychain: FakeKeychainStore(), joiner: joiner, notifier: notifier, clock: clock)
         let published = Locked<[HotspotPasswordProblem?]>([])
-        n.onPasswordProblem = { published.value.append($0) }
+        n.onPasswordReport = { published.value.append($0?.problem) }
 
         await n.simulate(satisfied: false)
         for _ in 0..<3 {
@@ -465,7 +468,7 @@ final class NetworkFailoverDriverTests: XCTestCase {
         }
 
         XCTAssertEqual(joiner.calls, [])
-        XCTAssertEqual(n.passwordProblem, .missing)
+        XCTAssertEqual(n.passwordReport, HotspotPasswordReport(ssid: "Phone", problem: .missing))
         XCTAssertEqual(published.value, [.missing])
         XCTAssertEqual(notifier.posts.map(\.title), ["Hotspot not joined"])
         XCTAssertEqual(notifier.posts.map(\.body), ["No hotspot password is saved. Enter it in Settings."])
@@ -484,8 +487,8 @@ final class NetworkFailoverDriverTests: XCTestCase {
         await n.joinHotspot()
 
         XCTAssertEqual(joiner.calls, [])
-        XCTAssertEqual(n.passwordProblem, .unreadable)
-        XCTAssertEqual(n.passwordProblem?.menuLine, "\u{26A0} Hotspot password unreadable by this build: enter it again in Settings")
+        XCTAssertEqual(n.passwordReport?.problem, .unreadable)
+        XCTAssertEqual(n.passwordReport?.problem.menuLine, "\u{26A0} Hotspot password unreadable by this build: enter it again in Settings")
         XCTAssertEqual(notifier.posts.map(\.body), [HotspotPasswordProblem.unreadable.explanation])
         XCTAssertTrue(HotspotPasswordProblem.unreadable.explanation.contains("Enter it again in Settings"))
     }
@@ -499,23 +502,86 @@ final class NetworkFailoverDriverTests: XCTestCase {
         let notifier = RecordingNotifier()
         let n = driver(keychain: keychain, joiner: joiner, notifier: notifier, clock: FakeClock(Date()))
         let published = Locked<[HotspotPasswordProblem?]>([])
-        n.onPasswordProblem = { published.value.append($0) }
+        n.onPasswordReport = { published.value.append($0?.problem) }
 
         await n.joinHotspot()
-        XCTAssertEqual(n.passwordProblem, .missing)
-        n.passwordChanged()
-        XCTAssertNil(n.passwordProblem)
+        XCTAssertEqual(n.passwordReport?.problem, .missing)
+        n.passwordChanged(savedFor: "Phone", configuredSSID: "Phone")
+        XCTAssertNil(n.passwordReport?.problem)
         XCTAssertEqual(published.value, [.missing, nil])
 
         try keychain.set(service: KeychainStore.service, account: "Phone", value: "pw")
         await n.joinHotspot()
-        XCTAssertNil(n.passwordProblem)
+        XCTAssertNil(n.passwordReport?.problem)
         XCTAssertEqual(joiner.calls.map(\.password), ["pw"])
 
         try keychain.delete(service: KeychainStore.service, account: "Phone")
         await n.joinHotspot()
-        XCTAssertEqual(n.passwordProblem, .missing)
+        XCTAssertEqual(n.passwordReport?.problem, .missing)
         XCTAssertEqual(notifier.posts.count, 2, "the problem returned after a save, so it is notified again")
+    }
+
+    /// The user configures another hotspot during the outage. Its problem
+    /// is reported for it, and notified once for it too: the notification
+    /// about the first hotspot did not tell the user about this one.
+    /// Going back to the first hotspot in the same outage notifies
+    /// nothing new.
+    func testAHotspotConfiguredDuringTheOutageIsNotifiedForItself() async throws {
+        let keychain = FakeKeychainStore()
+        try keychain.set(service: KeychainStore.service, account: "Other Phone", value: "old build's secret")
+        keychain.unreadable = ["\(KeychainStore.service)/Other Phone"]
+        let notifier = RecordingNotifier()
+        let clock = FakeClock(Date(timeIntervalSince1970: 1_800_000_000))
+        let hotspot = Locked("Phone")
+        let n = driver(keychain: keychain, joiner: RecordingHotspotJoiner(), notifier: notifier, clock: clock, hotspot: hotspot)
+        func tick() async {
+            clock.advance(30)
+            await n.fireTimer().value
+        }
+
+        await n.simulate(satisfied: false)
+        await tick()
+        hotspot.value = "Other Phone"
+        await tick()
+        await tick()
+
+        XCTAssertEqual(n.passwordReport, HotspotPasswordReport(ssid: "Other Phone", problem: .unreadable))
+        XCTAssertEqual(notifier.posts.map(\.body), [HotspotPasswordProblem.missing.explanation, HotspotPasswordProblem.unreadable.explanation])
+
+        hotspot.value = "Phone"
+        await tick()
+        XCTAssertEqual(n.passwordReport, HotspotPasswordReport(ssid: "Phone", problem: .missing))
+        XCTAssertEqual(notifier.posts.count, 2)
+        n.stop()
+    }
+
+    /// A save in Settings for another SSID, one edited away while it
+    /// waited, leaves the report about the hotspot configured now, and
+    /// its notification: neither is about the item the save wrote. Any
+    /// other save clears the report: one for the configured hotspot, and
+    /// one whose report is about an SSID no longer configured, whose item
+    /// the save may have written or moved.
+    func testASaveClearsEveryReportButOneAboutTheConfiguredHotspotItDidNotStore() async throws {
+        let notifier = RecordingNotifier()
+        let n = driver(keychain: FakeKeychainStore(), joiner: RecordingHotspotJoiner(), notifier: notifier, clock: FakeClock(Date()))
+        let phone = HotspotPasswordReport(ssid: "Phone", problem: .missing)
+
+        await n.joinHotspot()
+        n.passwordChanged(savedFor: "Other Phone", configuredSSID: "Phone")
+        XCTAssertEqual(n.passwordReport, phone)
+        await n.joinHotspot()
+        XCTAssertEqual(notifier.posts.count, 1, "the report stood, and so did its notification")
+
+        n.passwordChanged(savedFor: "Phone", configuredSSID: " Phone ")
+        XCTAssertNil(n.passwordReport)
+        await n.joinHotspot()
+        XCTAssertEqual(notifier.posts.count, 2)
+
+        n.passwordChanged(savedFor: "Phone", configuredSSID: "Other Phone")
+        XCTAssertNil(n.passwordReport, "the save wrote the reported hotspot's item")
+        await n.joinHotspot()
+        n.passwordChanged(savedFor: "Other Phone", configuredSSID: "Other Phone")
+        XCTAssertNil(n.passwordReport, "the save may have moved the reported hotspot's item")
     }
 
     /// stop() ends the session: the problem goes (and with it the menu
@@ -525,13 +591,13 @@ final class NetworkFailoverDriverTests: XCTestCase {
         let notifier = RecordingNotifier()
         let n = driver(keychain: FakeKeychainStore(), joiner: joiner, notifier: notifier, clock: FakeClock(Date()))
         let published = Locked<[HotspotPasswordProblem?]>([])
-        n.onPasswordProblem = { published.value.append($0) }
+        n.onPasswordReport = { published.value.append($0?.problem) }
 
         await n.joinHotspot()
         await n.joinHotspot()
         XCTAssertEqual(notifier.posts.count, 1)
         n.stop()
-        XCTAssertNil(n.passwordProblem)
+        XCTAssertNil(n.passwordReport?.problem)
         XCTAssertEqual(published.value, [.missing, nil])
         await n.joinHotspot()
         XCTAssertEqual(notifier.posts.count, 2)
