@@ -29,9 +29,12 @@
 #       battery    -> pmset -g batt: an internal battery is present, the Mac
 #                     draws from 'Battery Power', and the percentage is below
 #                     endFloor in config.json (default 10, strict, so 0
-#                     disables it). A battery present but unreadable, or a
-#                     failing pmset, ends too (fail closed). No battery: no
-#                     battery rule.
+#                     disables it; read and clamped to 0...95 as the app
+#                     reads it). A battery present but unreadable, or a
+#                     failing pmset, ends too (fail closed). No battery in
+#                     pmset: ioreg shows whether an AppleSmartBattery service
+#                     exists, as the app checks. None is a desktop, with no
+#                     battery rule; one without a charger reported ends.
 #       thermal    -> notifyutil -g com.apple.system.thermalpressurelevel at
 #                     3 (trapping) or above, with thermalRules on (default).
 #                     Unreadable: a warning, not an end on that alone.
@@ -120,6 +123,7 @@ PS=/bin/ps
 KILL=/bin/kill
 SYSCTL=/usr/sbin/sysctl
 NOTIFYUTIL=/usr/bin/notifyutil
+IOREG=/usr/sbin/ioreg
 CMP=/usr/bin/cmp
 DEFAULTS=/usr/bin/defaults
 DATE=/bin/date
@@ -537,15 +541,25 @@ app_alive() {
 }
 
 # A setting from config.json, or the default when the file or key is missing
-# or the value is not of the JSON type the app decodes (Int, Bool): a string
-# "false" or "30" is rejected here as the app rejects it, so both enforce the
-# same rule. plutil -extract raw prints a string and a number alike; the type
-# comes from plutil -type.
+# or the value is not one the app decodes (Int, Bool): a string "false" or
+# "30" is rejected here as the app rejects it, so both enforce the same rule.
+# plutil -extract raw prints a string and a number alike; the type comes from
+# plutil -type. JSONDecoder reads any number that is exactly an integer as an
+# Int (30.0, 3e1), so a float counts when it is whole. Its raw form is
+# rounded to six places, so the test reads the XML form, which prints the
+# shortest exact value ("30", "0.0", "30.000000100000001"). More than 18
+# digits is past what the shell can compare; the default stands for it.
 config_int() { # key default
-  local v
-  v="$(extract "$CONFIG" "$1" || true)"
-  if [[ "$(type_of "$CONFIG" "$1")" == integer && "$v" =~ ^[0-9]+$ ]]; then
-    echo "$((10#$v))"
+  local t v=""
+  t="$(type_of "$CONFIG" "$1")"
+  if [[ "$t" == integer ]]; then
+    v="$(extract "$CONFIG" "$1" || true)"
+  elif [[ "$t" == float ]]; then
+    v="$("$PLUTIL" -extract "$1" xml1 -o - "$CONFIG" 2>/dev/null | sed -n 's:.*<real>\(.*\)</real>.*:\1:p' || true)"
+    [[ "$v" == 0.0 || "$v" == -0.0 ]] && v=0
+  fi
+  if [[ "$v" =~ ^(-?)([0-9]{1,18})$ ]]; then
+    echo "${BASH_REMATCH[1]}$((10#${BASH_REMATCH[2]}))"
   else
     echo "$2"
   fi
@@ -567,7 +581,8 @@ config_bool() { # key default
 # disables the rule, as in FloorRules.swift, and nothing is read then); or
 # pmset fails or hangs; or a battery is present but its source or percentage
 # cannot be read (fail closed, the app's rule for an unreadable battery). No
-# InternalBattery line is a desktop: no battery rule. A pmset that fails
+# InternalBattery line goes to battery_without_row, which tells a desktop
+# (no battery rule) from a laptop missing from the list. A pmset that fails
 # cannot tell a desktop from a laptop, so with the floor on it ends.
 battery_reason=""
 battery_cutoff() {
@@ -575,6 +590,9 @@ battery_cutoff() {
   local source_re="Now drawing from '([^']*)'" percent_re='[[:space:]]([0-9]+)%;'
   battery_reason=""
   floor="$(config_int endFloor 10)"
+  # The app clamps the end floor to 0...95 (Config.normalizeFloors), so a
+  # negative one is off, as 0 is.
+  (( floor > 95 )) && floor=95
   (( floor > 0 )) || return 1
   run_read out "$PMSET" -g batt || rc=$?
   if (( rc == 124 )); then
@@ -585,7 +603,10 @@ battery_cutoff() {
     return 0
   fi
   line="$(grep -m 1 InternalBattery <<< "$out" || true)"
-  [[ -n "$line" ]] || return 1
+  if [[ -z "$line" ]]; then
+    battery_without_row
+    return
+  fi
   source=""; percent=""
   [[ "$out" =~ $source_re ]] && source="${BASH_REMATCH[1]}"
   [[ "$line" =~ $percent_re ]] && percent="${BASH_REMATCH[1]}"
@@ -599,6 +620,30 @@ battery_cutoff() {
     return 0
   fi
   return 1
+}
+
+# pmset listed no internal battery. That proves a desktop only when the I/O
+# Registry has no AppleSmartBattery service either, which is what the app's
+# PowerMonitor.classify checks: a laptop whose power source list lost its
+# battery row still has the service. Its level is then unknown, and like
+# the app the run ends the session unless the battery driver reports a
+# charger (ExternalConnected = Yes). ioreg prints nothing, and exits 0, when
+# no service matches. One that fails or hangs cannot prove a desktop, so
+# the session ends then too, as for a failing pmset.
+battery_without_row() {
+  local reg="" rc=0
+  run_read reg "$IOREG" -r -c AppleSmartBattery -d 1 || rc=$?
+  if (( rc == 124 )); then
+    battery_reason="no battery in pmset -g batt, and ioreg did not finish within ${COMMAND_TIMEOUT_SECONDS}s to show there is none"
+    return 0
+  elif (( rc != 0 )); then
+    battery_reason="no battery in pmset -g batt, and ioreg exit $rc could not show there is none"
+    return 0
+  fi
+  grep -q '^+-o ' <<< "$reg" || return 1
+  grep -q '"ExternalConnected" = Yes' <<< "$reg" && return 1
+  battery_reason="battery present (AppleSmartBattery) but missing from pmset -g batt, and no charger reported"
+  return 0
 }
 
 # notifyutil -g prints "com.apple.system.thermalpressurelevel N" (levels at

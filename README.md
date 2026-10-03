@@ -155,7 +155,8 @@ The defaults are worth knowing:
   do not: the `launchd` backstop reads the battery and the thermal pressure
   level once a minute and ends the session itself when the app is gone, the
   charge is below the end floor on battery power or cannot be read, or the
-  thermal level is critical (see "How recovery works").
+  thermal level is critical (see "How recovery works"). Like the app, it
+  treats a Mac as a desktop only when the I/O Registry has no battery.
   Setting the end floor to 0 turns the battery end off. Otherwise the end
   floor stays below the Low Power Mode floor. The Settings steppers move the
   other floor when the two would cross, and a hand-edited `config.json` with

@@ -327,6 +327,12 @@ The Low Power Mode rules run only while the app is alive. The three ends are
 also enforced by the standalone backstop once a minute (section 8), so they
 hold after a crash. The backstop reads the battery with `pmset -g batt` and
 ends on the first read it cannot use, where the app tolerates one IOKit miss.
+When `pmset` lists no internal battery, the backstop asks `ioreg` for the
+`AppleSmartBattery` service, as `PowerMonitor` does: with no service the Mac
+is a desktop, and with one but no charger reported (`ExternalConnected`) the
+battery counts as unreadable and the session ends. It reads `endFloor` as the
+app decodes it, so a whole float such as `30.0` is 30, and clamps it to 0
+through 95 as `Config.normalizeFloors` does.
 Performance effects depend on workload.
 
 ### 7. Network failover

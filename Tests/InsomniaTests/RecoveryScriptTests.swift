@@ -7,8 +7,8 @@ import XCTest
 ///
 /// Each test runs a private COPY of the production script against a
 /// throwaway INSOMNIA_HOME. The copy has its fixed tool-path constants
-/// (sudo, pmset, ps, kill, sysctl, notifyutil, pgrep, pkill, osascript,
-/// launchctl, defaults) and its app-bundle / sudoers paths rewritten to
+/// (sudo, pmset, ps, kill, sysctl, notifyutil, ioreg, pgrep, pkill,
+/// osascript, launchctl, defaults) and its app-bundle / sudoers paths rewritten to
 /// point inside the fixture, so nothing privileged runs, no real process is
 /// signaled, no real app's preferences are read or written, and no real
 /// home, LaunchAgent, sudoers file, or installed app is read or written.
@@ -77,6 +77,7 @@ final class RecoveryScriptTests: XCTestCase {
     private let sleepRestored = "sudo -n PMSET -a disablesleep 0"
     private let batteryRead = "pmset -g batt"
     private let thermalRead = "notifyutil -g com.apple.system.thermalpressurelevel"
+    private let batteryServiceRead = "ioreg -r -c AppleSmartBattery -d 1"
 
     /// A session with an hour left and sleep journaled as ours: what the
     /// backstop sees every minute while the app runs.
@@ -221,8 +222,8 @@ final class RecoveryScriptTests: XCTestCase {
         }
     }
 
-    /// No InternalBattery line is a desktop: there is no battery rule, and
-    /// the thermal check still runs.
+    /// No InternalBattery line and no AppleSmartBattery service is a
+    /// desktop: there is no battery rule, and the thermal check still runs.
     func testDesktopWithoutABatteryHasNoBatteryRule() throws {
         try writeLiveSession()
         let app = try fx.holdAliveLock()
@@ -232,7 +233,37 @@ final class RecoveryScriptTests: XCTestCase {
         let r = try fx.run(fx.backstop)
 
         try assertSessionKept(r)
-        XCTAssertEqual(calls(), [batteryRead, thermalRead])
+        XCTAssertEqual(calls(), [batteryRead, batteryServiceRead, thermalRead])
+    }
+
+    /// A laptop whose power source list lost its battery row still has the
+    /// AppleSmartBattery service, as the app's PowerMonitor.classify checks.
+    /// Its level is unknown, so the session ends unless the driver reports a
+    /// charger. An ioreg that fails or hangs cannot show a desktop either.
+    func testABatteryMissingFromPmsetIsJudgedByTheBatteryService() throws {
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+        let ended: [(mode: String, reason: String)] = [
+            ("BATTERY", "battery present (AppleSmartBattery) but missing from pmset -g batt, and no charger reported"),
+            ("BATTERY_NOKEY", "battery present (AppleSmartBattery) but missing from pmset -g batt, and no charger reported"),
+            ("FAIL", "no battery in pmset -g batt, and ioreg exit 1 could not show there is none"),
+            ("HANG", "no battery in pmset -g batt, and ioreg did not finish within 1s"),
+        ]
+        for c in ended {
+            try writeLiveSession()
+            fx.clearCalls()
+            fx.clearLog()
+            fx.setBattery("Now drawing from 'AC Power'\n")
+            fx.setBatteryService(c.mode)
+            try assertSessionEnded(try fx.run(fx.backstop), reason: c.reason)
+            XCTAssertTrue(calls().contains(batteryServiceRead), "\(calls())")
+        }
+
+        try writeLiveSession()
+        fx.clearCalls()
+        fx.setBatteryService("BATTERY_AC")
+        try assertSessionKept(try fx.run(fx.backstop))
+        XCTAssertEqual(calls(), [batteryRead, batteryServiceRead, thermalRead])
     }
 
     /// endFloor comes from config.json like the app's; 0 disables the rule;
@@ -262,6 +293,43 @@ final class RecoveryScriptTests: XCTestCase {
         fx.clearCalls()
         try fx.writeConfig("not json at all")
         try assertSessionEnded(try fx.run(fx.backstop), reason: "below the 10% end floor")
+    }
+
+    /// JSONDecoder reads a number that is exactly an integer as an Int, so
+    /// 30.0 and 3e1 are a 30% floor in the app and 0.0 turns the rule off; a
+    /// fraction fails the app's decode, which then uses the default 10. The
+    /// app clamps the floor to 0...95 (Config.normalizeFloors). The backstop
+    /// enforces the same floor in every case.
+    func testNumericEndFloorsAreReadAsTheAppDecodesAndClampsThem() throws {
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+        let ended: [(config: String, percent: Int, floor: Int)] = [
+            (#"{"configVersion": 2, "endFloor": 30.0}"#, 25, 30),
+            (#"{"endFloor": 3e1}"#, 25, 30),
+            (#"{"endFloor": 30.5}"#, 9, 10),
+            (#"{"endFloor": 30.0000001}"#, 9, 10),
+            (#"{"endFloor": 200}"#, 90, 95),
+        ]
+        for c in ended {
+            try writeLiveSession()
+            fx.clearCalls()
+            fx.clearLog()
+            try fx.writeConfig(c.config)
+            fx.setBattery(fx.battery(source: "Battery Power", percent: c.percent))
+            try assertSessionEnded(try fx.run(fx.backstop), reason: "battery at \(c.percent)% on battery power, below the \(c.floor)% end floor")
+        }
+        let kept: [(config: String, percent: Int)] = [
+            (#"{"endFloor": 30.5}"#, 25),
+            (#"{"endFloor": 0.0}"#, 1),
+            (#"{"endFloor": -5}"#, 1),
+        ]
+        for c in kept {
+            try writeLiveSession()
+            fx.clearCalls()
+            try fx.writeConfig(c.config)
+            fx.setBattery(fx.battery(source: "Battery Power", percent: c.percent))
+            try assertSessionKept(try fx.run(fx.backstop))
+        }
     }
 
     /// With the floor off nothing is read, so a failing pmset cannot end a
@@ -3091,6 +3159,7 @@ private final class ScriptFixture {
             "KILL": bin.appendingPathComponent("kill").path,
             "SYSCTL": bin.appendingPathComponent("sysctl").path,
             "NOTIFYUTIL": bin.appendingPathComponent("notifyutil").path,
+            "IOREG": bin.appendingPathComponent("ioreg").path,
             "DEFAULTS": bin.appendingPathComponent("defaults").path,
             "DATE": bin.appendingPathComponent("date").path,
             "LOCK_TIMEOUT_SECONDS": "1",
@@ -3275,6 +3344,29 @@ private final class ScriptFixture {
         fi
         [[ "$mode" == GARBAGE ]] && { echo "something unexpected"; exit 0; }
         echo "${2:-} $mode"
+        """)
+        // ioreg -r -c AppleSmartBattery -d 1, by battery_service.mode.
+        // "NONE" (the default): no service, so nothing is printed. "BATTERY":
+        // the service, on battery power. "BATTERY_AC": the service with a
+        // charger. "BATTERY_NOKEY": the service without ExternalConnected.
+        // "FAIL": exit 1. "HANG": never returns.
+        try writeFake("ioreg", """
+        printf 'ioreg %s\\n' "$*" >> "\(calls)"
+        mode="$(cat "\(r)/battery_service.mode" 2>/dev/null || echo NONE)"
+        case "$mode" in
+          FAIL) exit 1 ;;
+          HANG) exec /bin/sleep 60 ;;
+          NONE) exit 0 ;;
+        esac
+        echo '+-o AppleSmartBattery  <class AppleSmartBattery, id 0x100000a1b, registered, matched, active, busy 0 (25 ms), retain 9>'
+        echo '    {'
+        echo '      "AppleRawExternalConnected" = No'
+        case "$mode" in
+          BATTERY) echo '      "ExternalConnected" = No' ;;
+          BATTERY_AC) echo '      "ExternalConnected" = Yes' ;;
+        esac
+        echo '      "BatteryInstalled" = Yes'
+        echo '    }'
         """)
         // swift / codesign: install.sh's build and signing steps, redirected
         // to a fake binary inside the fixture.
@@ -3496,6 +3588,13 @@ private final class ScriptFixture {
         setMode("thermal", mode)
     }
 
+    /// What the fake ioreg reports for AppleSmartBattery: "NONE" (the
+    /// default, a desktop), "BATTERY", "BATTERY_AC", "BATTERY_NOKEY",
+    /// "FAIL" or "HANG".
+    func setBatteryService(_ mode: String) {
+        setMode("battery_service", mode)
+    }
+
     func writeConfig(_ json: String) throws {
         try json.write(to: config, atomically: true, encoding: .utf8)
     }
@@ -3621,6 +3720,12 @@ private final class ScriptFixture {
 
     func clearCalls() {
         try? fm.removeItem(at: callsLog)
+    }
+
+    /// Removes the backstop's log, so a loop's next case cannot pass on a
+    /// line an earlier case wrote.
+    func clearLog() {
+        try? fm.removeItem(at: logFile)
     }
 
     func log() -> String {
