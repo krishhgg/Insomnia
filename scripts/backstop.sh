@@ -17,7 +17,39 @@
 # the lock file's inode.
 #
 # Decision, driven only by what the journal says was changed:
-#   - session.json valid (endsAt in the future) and no --force: exit 0.
+#   - session.json valid (endsAt in the future) and no --force: the session
+#     is live only while Insomnia is running and the machine is within the
+#     floors the app enforces itself (FloorRules.swift). Three checks, any
+#     of which ends the session exactly as --force would, with a log line
+#     naming the reason:
+#       app alive  -> the app holds an flock(2) on APP_SUPPORT/.app.alive for
+#                     its whole lifetime (AppAliveLock.swift). Taking that
+#                     lock here without waiting means no app holds it: it
+#                     crashed, was force-quit, or has not started yet.
+#       battery    -> pmset -g batt: an internal battery is present, the Mac
+#                     draws from 'Battery Power', and the percentage is below
+#                     endFloor in config.json (default 10, strict, so 0
+#                     disables it; read and clamped to 0...95 as the app
+#                     reads it). A battery present but unreadable, or a
+#                     failing pmset, ends too (fail closed). No battery in
+#                     pmset: ioreg shows whether an AppleSmartBattery service
+#                     exists, as the app checks. None is a desktop, with no
+#                     battery rule; one without a charger reported ends.
+#       thermal    -> notifyutil -g com.apple.system.thermalpressurelevel at
+#                     3 (trapping) or above, with thermalRules on (default).
+#                     Unreadable: a warning, not an end on that alone.
+#     All three pass: exit 0, nothing logged.
+#   - A valid session this run ends (a check above, or --force) is over
+#     from that decision: session.json is removed before anything is undone,
+#     so an undo that cannot finish (saved brightness only the app restores,
+#     a failing or hung pmset) never leaves a session a relaunched app would
+#     resume. What is left stays in state.json for the next run and the app.
+#     A session.json that cannot be removed (an immutable file) is recorded
+#     as ended in ended-session.json, a copy of its bytes. While the two
+#     match, the app restores that session instead of resuming it, and every
+#     run ends it again without the checks and retries the removal. If the
+#     record cannot be written either, sleep is still restored but its
+#     journal entry stays, and the run exits 1.
 #   - state.json missing or clean: nothing is undone and nothing privileged
 #     runs; an expired session.json is removed. Exit 0.
 #   - state.json dirty: undo each journaled entry from the journal alone:
@@ -90,6 +122,9 @@ LOCKF=/usr/bin/lockf
 PS=/bin/ps
 KILL=/bin/kill
 SYSCTL=/usr/sbin/sysctl
+NOTIFYUTIL=/usr/bin/notifyutil
+IOREG=/usr/sbin/ioreg
+CMP=/usr/bin/cmp
 DEFAULTS=/usr/bin/defaults
 DATE=/bin/date
 MKDIR=/bin/mkdir
@@ -97,6 +132,11 @@ RM=/bin/rm
 MV=/bin/mv
 CP=/bin/cp
 LOCK_TIMEOUT_SECONDS=10
+# com.apple.system.thermalpressurelevel at or above this ends a session. On
+# macOS the levels are 0 nominal, 1 moderate, 2 heavy, 3 trapping, 4 sleeping
+# (libkern/OSThermalNotification.h); ProcessInfo reports .critical from
+# trapping up, which is where the app's FloorRules end the session.
+THERMAL_CRITICAL_LEVEL=3
 # Longest a single undo command (sudo pmset, defaults) may run before it is
 # sent SIGTERM, and how long it then gets to exit before this run fails closed.
 COMMAND_TIMEOUT_SECONDS=30
@@ -119,12 +159,19 @@ else
   LOG_DIR="$HOME/Library/Logs/Insomnia"
 fi
 SESSION="$APP_SUPPORT/session.json"
+ENDED="$APP_SUPPORT/ended-session.json"
 STATE="$APP_SUPPORT/state.json"
+CONFIG="$APP_SUPPORT/config.json"
 LOCK="$APP_SUPPORT/.recovery.lock"
+ALIVE="$APP_SUPPORT/.app.alive"
 LOG="$LOG_DIR/insomnia.log"
 
 log() { # level message
   "$MKDIR" -p "$LOG_DIR"
+  # Append only to a regular file, or create one. open(2) on a FIFO with no
+  # reader blocks, and most lines are written while this run holds the
+  # recovery lock. A line with nowhere to go is dropped.
+  if [[ -e "$LOG" && ! -f "$LOG" ]]; then return 0; fi
   printf '%s [%s] backstop: %s\n' "$("$DATE" -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" >> "$LOG"
 }
 
@@ -218,7 +265,7 @@ run_bounded() { # command args...
   if ! wait_for_status "$rcfile" "$COMMAND_TIMEOUT_SECONDS"; then
     cpid="$(cat "$pidfile" 2>/dev/null || true)"
     if [[ -n "$cpid" ]]; then
-      kill -TERM "$cpid" 2>/dev/null || true
+      "$KILL" -TERM "$cpid" 2>/dev/null || true
     fi
     if ! wait_for_status "$rcfile" "$KILL_GRACE_SECONDS"; then
       log error "'$*' (pid ${cpid:-?}) did not finish within ${COMMAND_TIMEOUT_SECONDS}s and did not stop on SIGTERM. It is not killed, because that could leave a root pmset running outside the transaction. It keeps the recovery lock until it ends, so Insomnia cannot start and recovery cannot run until then; stop it by hand (sudo kill ${cpid:-<pid>}) and the next run will retry"
@@ -236,11 +283,61 @@ run_bounded() { # command args...
   return "$rc"
 }
 
+# Run one read (pmset -g batt, notifyutil -g) with the undo commands' time
+# limit and put its stdout in the variable named by $1. A read changes
+# nothing, so unlike an undo command it has no reason to hold the recovery
+# lock: its supervisor closes fd 9 before starting it, so neither holds the
+# lock and a read that hangs can only fail itself, never a later run or the
+# app. For the same reason a read that ignores SIGTERM gets SIGKILL: it runs
+# unprivileged and has nothing to leave half done. This run never waits for
+# it past that. Returns the read's exit status, or 124 when it was stopped.
+run_read() { # varname command args...
+  local name="$1" pidfile rcfile outfile cpid rc supervisor
+  shift
+  bounded_calls=$((bounded_calls + 1))
+  pidfile="$APP_SUPPORT/.backstop.$$.$bounded_calls.pid"
+  rcfile="$APP_SUPPORT/.backstop.$$.$bounded_calls.rc"
+  outfile="$APP_SUPPORT/.backstop.$$.$bounded_calls.out"
+  if (( bounded_calls == 1 )); then
+    "$RM" -f "$APP_SUPPORT"/.backstop.*.pid "$APP_SUPPORT"/.backstop.*.rc "$APP_SUPPORT"/.backstop.*.out
+  fi
+  (
+    "$@" </dev/null >"$outfile" 2>/dev/null &
+    cpid=$!
+    echo "$cpid" > "$pidfile"
+    rc=0
+    wait "$cpid" || rc=$?
+    echo "$rc" > "$rcfile"
+  ) 9>&- </dev/null >/dev/null 2>&1 &
+  supervisor=$!
+  if wait_for_status "$rcfile" "$COMMAND_TIMEOUT_SECONDS"; then
+    rc="$(cat "$rcfile")"
+  else
+    cpid="$(cat "$pidfile" 2>/dev/null || true)"
+    if [[ -n "$cpid" ]]; then "$KILL" -TERM "$cpid" 2>/dev/null || true; fi
+    if wait_for_status "$rcfile" "$KILL_GRACE_SECONDS"; then
+      log error "'$*' did not finish within ${COMMAND_TIMEOUT_SECONDS}s; terminated with SIGTERM (pid ${cpid:-?})"
+    else
+      if [[ -n "$cpid" ]]; then "$KILL" -KILL "$cpid" 2>/dev/null || true; fi
+      log error "'$*' did not finish within ${COMMAND_TIMEOUT_SECONDS}s and ignored SIGTERM; sent SIGKILL (pid ${cpid:-?}). A read holds no lock, so nothing waits for it"
+      wait_for_status "$rcfile" "$KILL_GRACE_SECONDS" || true
+    fi
+    rc=124
+  fi
+  # A supervisor that wrote a status is done; one whose read survived even
+  # SIGKILL is left behind without the lock.
+  if [[ -s "$rcfile" ]]; then wait "$supervisor" 2>/dev/null || true; fi
+  printf -v "$name" '%s' "$(cat "$outfile" 2>/dev/null)"
+  "$RM" -f "$pidfile" "$rcfile" "$outfile"
+  return "$rc"
+}
+
 # End this run right after a timed-out undo command that is still alive:
-# nothing else is undone, the journal and session stay exactly as read, and
-# the lock stays with the live command's supervisor.
+# nothing else is undone, the journal stays exactly as read (a session this
+# run decided to end is already gone), and the lock stays with the live
+# command's supervisor.
 stop_transaction() { # what
-  log error "recovery stopped after '$1' (still running); no further undo this run, journal and session kept unchanged until it ends"
+  log error "recovery stopped after '$1' (still running); no further undo this run, journal kept unchanged until it ends"
   exit 1
 }
 
@@ -421,8 +518,266 @@ if [[ -e "$SESSION" ]]; then
   fi
 fi
 
+# Whether $ENDED records the end of the session in $SESSION: it holds that
+# file's exact bytes. cmp opens both files, and open(2) on a FIFO with no
+# writer blocks while this run holds the recovery lock, which would keep
+# both this script and the app from ever ending the session. So only two
+# regular files are compared, as session.json and state.json are only read
+# as regular files. The app and record_end both write the record by
+# rename, so anything else at $ENDED is not a record and matches nothing.
+end_recorded() {
+  [[ -f "$SESSION" && -f "$ENDED" ]] && "$CMP" -s "$SESSION" "$ENDED"
+}
+
+# Remove the record. Once its session.json is gone it ends nothing, but it
+# is still a copy of that session's times, so one that cannot be removed is
+# logged on every run until a person removes it. Never fails the caller.
+remove_end_record() {
+  "$RM" -f "$ENDED" 2>/dev/null && return 0
+  log warn "could not remove $ENDED; it matches no session.json, so it ends nothing, but it stays until removed by hand (ls -lO shows its flags)"
+  return 0
+}
+
+# --- Was this session already ended? -----------------------------------------
+# A run or the app that ends a valid session but cannot remove session.json
+# records the end in $ENDED, a copy of the file's exact bytes (record_end).
+# While the two match, that session is over whatever its endsAt says: this
+# run ends it again without the checks below and retries the removal. A
+# record that matches nothing (its session.json was removed or replaced) is
+# stale and goes; it could only ever match the file it copied. rm unlinks
+# a FIFO there without opening it.
+ended_before=0
+if [[ -e "$ENDED" ]]; then
+  if end_recorded; then
+    ended_before=1
+  else
+    remove_end_record
+  fi
+fi
+
+# --- Is a valid session still live? ------------------------------------------
+# A future deadline alone does not keep sleep disabled: the app must be
+# running and the machine within the floors the app would enforce itself.
+# The app's own floors fire first while it is healthy; these catch a crashed,
+# force-quit or stopped app. Nothing here changes the machine: the checks
+# only decide whether the session counts as over, and the undo below is the
+# same as for an expired one.
+
+# The app holds an exclusive flock on $ALIVE for its whole lifetime
+# (AppAliveLock.swift). The probe takes the lock without waiting and gives it
+# back at once (the command runs under it and exits), so it can only succeed
+# when nobody else holds it: lockf exits 75 (EX_TEMPFAIL) when the lock is
+# held, the one outcome that proves an app is there. -k keeps the file, so
+# the app and every later probe lock the same inode. A probe that fails some
+# other way (the file cannot be created, lockf itself fails) counts as not
+# alive: sleep must not stay disabled on a guess.
+app_alive() {
+  local rc=0
+  "$LOCKF" -k -s -t 0 "$ALIVE" /usr/bin/true 2>/dev/null || rc=$?
+  (( rc == 75 )) && return 0
+  (( rc == 0 )) || log warn "alive lock probe on $ALIVE failed (lockf exit $rc); counting Insomnia as not running"
+  return 1
+}
+
+# A setting from config.json, or the default when the file or key is missing
+# or the value is not one the app decodes (Int, Bool): a string "false" or
+# "30" is rejected here as the app rejects it, so both enforce the same rule.
+# plutil -extract raw prints a string and a number alike; the type comes from
+# plutil -type. JSONDecoder reads any number that is exactly an integer as an
+# Int (30.0, 3e1), so a float counts when it is whole. Its raw form is
+# rounded to six places, so the test reads the XML form, which prints the
+# shortest exact value ("30", "0.0", "30.000000100000001"). More than 18
+# digits is past what the shell can compare; the default stands for it.
+#
+# config.json is opened only when it is a regular file, as session.json and
+# state.json are: open(2) on a FIFO with no writer blocks while this run
+# holds the recovery lock. Anything else reads as a missing file, as the app
+# treats it (Store.readData; the app then moves it aside).
+config_is_file() { [[ -f "$CONFIG" ]]; }
+config_int() { # key default
+  local t="" v=""
+  config_is_file && t="$(type_of "$CONFIG" "$1")"
+  if [[ "$t" == integer ]]; then
+    v="$(extract "$CONFIG" "$1" || true)"
+  elif [[ "$t" == float ]]; then
+    v="$("$PLUTIL" -extract "$1" xml1 -o - "$CONFIG" 2>/dev/null | sed -n 's:.*<real>\(.*\)</real>.*:\1:p' || true)"
+    [[ "$v" == 0.0 || "$v" == -0.0 ]] && v=0
+  fi
+  if [[ "$v" =~ ^(-?)([0-9]{1,18})$ ]]; then
+    echo "${BASH_REMATCH[1]}$((10#${BASH_REMATCH[2]}))"
+  else
+    echo "$2"
+  fi
+}
+config_bool() { # key default
+  local v=""
+  config_is_file || { echo "$2"; return; }
+  v="$(extract "$CONFIG" "$1" || true)"
+  if [[ "$(type_of "$CONFIG" "$1")" == bool ]]; then
+    case "$v" in true|false) echo "$v"; return ;; esac
+  fi
+  echo "$2"
+}
+
+# pmset -g batt prints the source ("Now drawing from 'Battery Power'" or 'AC
+# Power') and one line per battery ("-InternalBattery-0 (id=...) 26%;
+# discharging; 0:41 remaining present: true"). Sets battery_reason and
+# returns 0 when the session must end: an internal battery is present, the
+# Mac draws from it, and the percentage is below endFloor (strict, so 0
+# disables the rule, as in FloorRules.swift, and nothing is read then); or
+# pmset fails or hangs; or a battery is present but its source or percentage
+# cannot be read (fail closed, the app's rule for an unreadable battery). No
+# InternalBattery line goes to battery_without_row, which tells a desktop
+# (no battery rule) from a laptop missing from the list. A pmset that fails
+# cannot tell a desktop from a laptop, so with the floor on it ends.
+battery_reason=""
+battery_cutoff() {
+  local out="" rc=0 floor percent source line
+  local source_re="Now drawing from '([^']*)'" percent_re='[[:space:]]([0-9]+)%;'
+  battery_reason=""
+  floor="$(config_int endFloor 10)"
+  # The app clamps the end floor to 0...95 (Config.normalizeFloors), so a
+  # negative one is off, as 0 is.
+  (( floor > 95 )) && floor=95
+  (( floor > 0 )) || return 1
+  run_read out "$PMSET" -g batt || rc=$?
+  if (( rc == 124 )); then
+    battery_reason="battery state unreadable (pmset -g batt did not finish within ${COMMAND_TIMEOUT_SECONDS}s)"
+    return 0
+  elif (( rc != 0 )); then
+    battery_reason="battery state unreadable (pmset -g batt exit $rc)"
+    return 0
+  fi
+  line="$(grep -m 1 InternalBattery <<< "$out" || true)"
+  if [[ -z "$line" ]]; then
+    battery_without_row
+    return
+  fi
+  source=""; percent=""
+  [[ "$out" =~ $source_re ]] && source="${BASH_REMATCH[1]}"
+  [[ "$line" =~ $percent_re ]] && percent="${BASH_REMATCH[1]}"
+  if [[ -z "$percent" || ( "$source" != "Battery Power" && "$source" != "AC Power" ) ]]; then
+    battery_reason="battery present but unreadable (source '${source:-?}', charge '${percent:-?}')"
+    return 0
+  fi
+  [[ "$source" == "Battery Power" ]] || return 1
+  if (( 10#$percent < floor )); then
+    battery_reason="battery at ${percent}% on battery power, below the ${floor}% end floor"
+    return 0
+  fi
+  return 1
+}
+
+# pmset listed no internal battery. That proves a desktop only when the I/O
+# Registry has no AppleSmartBattery service either, which is what the app's
+# PowerMonitor.classify checks: a laptop whose power source list lost its
+# battery row still has the service. Its level is then unknown, and like
+# the app the run ends the session unless the battery driver reports a
+# charger (ExternalConnected = Yes). ioreg prints nothing, and exits 0, when
+# no service matches. One that fails or hangs cannot prove a desktop, so
+# the session ends then too, as for a failing pmset.
+battery_without_row() {
+  local reg="" rc=0
+  run_read reg "$IOREG" -r -c AppleSmartBattery -d 1 || rc=$?
+  if (( rc == 124 )); then
+    battery_reason="no battery in pmset -g batt, and ioreg did not finish within ${COMMAND_TIMEOUT_SECONDS}s to show there is none"
+    return 0
+  elif (( rc != 0 )); then
+    battery_reason="no battery in pmset -g batt, and ioreg exit $rc could not show there is none"
+    return 0
+  fi
+  grep -q '^+-o ' <<< "$reg" || return 1
+  grep -q '"ExternalConnected" = Yes' <<< "$reg" && return 1
+  battery_reason="battery present (AppleSmartBattery) but missing from pmset -g batt, and no charger reported"
+  return 0
+}
+
+# notifyutil -g prints "com.apple.system.thermalpressurelevel N" (levels at
+# THERMAL_CRITICAL_LEVEL). Sets thermal_reason and returns 0 when the
+# session must end. Off with thermalRules false in config.json. Unreadable
+# (failed, hung, or not a level): a warning, never an end on that alone; the
+# alive and battery checks stand.
+thermal_reason=""
+thermal_cutoff() {
+  local out="" level
+  thermal_reason=""
+  [[ "$(config_bool thermalRules true)" == true ]] || return 1
+  run_read out "$NOTIFYUTIL" -g com.apple.system.thermalpressurelevel || out=""
+  level="${out##* }"
+  if [[ -z "$out" || ! "$level" =~ ^[0-9]+$ ]]; then
+    log warn "thermal pressure level unreadable (notifyutil printed '${out:-nothing}'); not ending the session on that alone"
+    return 1
+  fi
+  if (( 10#$level >= THERMAL_CRITICAL_LEVEL )); then
+    thermal_reason="thermal pressure level $level (critical from $THERMAL_CRITICAL_LEVEL up)"
+    return 0
+  fi
+  return 1
+}
+
+cutoff=""
 if [[ "$session_state" == valid ]] && (( force == 0 )); then
-  exit 0
+  if (( ended_before == 1 )); then
+    cutoff="already ended (recorded in $ENDED) but session.json could not be removed"
+  elif ! app_alive; then
+    cutoff="Insomnia is not running"
+  elif battery_cutoff; then
+    cutoff="$battery_reason"
+  elif thermal_cutoff; then
+    cutoff="$thermal_reason"
+  else
+    exit 0
+  fi
+  log warn "ending the session before its deadline (endsAt=$ends_at): $cutoff"
+fi
+
+# A valid session this run ends (a cutoff above, or --force) is over from
+# here, whatever the undo below achieves, so session.json goes now, under the
+# lock. Left in place after a partial undo (saved brightness only the app can
+# restore, a failing or hung pmset), it would still read as valid: a
+# relaunched Insomnia would resume it and disable sleep again, and an app
+# that was stopped or hung would never see the end (it ends its side when
+# session.json is gone). What the undo cannot finish stays in state.json,
+# which the next run and the app's reconcile complete without a session.
+#
+# A session.json that cannot be removed is recorded as ended instead, and
+# the app and every later run honour the record until the file is gone. If
+# the record cannot be written either, nothing on disk says the session is
+# over: sleep is still restored below, since leaving it disabled is worse,
+# but its journal entry stays, so the journal reads dirty, uninstall.sh
+# stops, and every run exits 1 until a person makes the file removable.
+
+# Remove session.json, then the record of its end, which means something
+# only while the file it copies is there. False when session.json stays.
+remove_session() {
+  "$RM" -f "$SESSION" 2>/dev/null || return 1
+  remove_end_record
+}
+
+# Record that the session in session.json is over: a copy of its exact bytes
+# in $ENDED, written beside it and renamed into place. True only when the
+# record reads back identical to the file.
+record_end() {
+  local tmp="$ENDED.tmp.$$"
+  if end_recorded; then return 0; fi
+  # The name carries this run's PID, so anything already there was left by
+  # an earlier process. It goes unopened: writing through a FIFO blocks.
+  "$RM" -f "$tmp" 2>/dev/null || true
+  if [[ -f "$SESSION" ]] && cat "$SESSION" > "$tmp" 2>/dev/null; then "$MV" -f "$tmp" "$ENDED" 2>/dev/null || true; fi
+  "$RM" -f "$tmp" 2>/dev/null || true
+  end_recorded
+}
+
+session_left=0      # 1 when the valid session this run ends is still on disk
+keep_sleep_entry=0  # 1 when nothing on disk records that end
+if [[ "$session_state" == valid ]] && ! remove_session; then
+  session_left=1
+  if record_end; then
+    log error "could not remove $SESSION; its end is recorded in $ENDED, so Insomnia restores the session instead of resuming it. Every run retries the removal"
+  else
+    keep_sleep_entry=1
+    log error "could not remove $SESSION or record its end in $ENDED; a relaunched Insomnia could resume the session. Sleep is restored anyway, but sleepDisabledByUs stays journaled and every run exits 1 until the file can be removed (ls -lO shows its flags)"
+  fi
 fi
 
 # --- Read the journal --------------------------------------------------------
@@ -507,7 +862,11 @@ quarantine_session() {
 
 case "$session_state" in
   none)       session_note="no session" ;;
-  valid)      session_note="forced end of session (endsAt=$ends_at)" ;;
+  valid)      if [[ -n "$cutoff" ]]; then
+                session_note="session ended early, $cutoff (endsAt=$ends_at)"
+              else
+                session_note="forced end of session (endsAt=$ends_at)"
+              fi ;;
   expired)    session_note="session expired (endsAt=$ends_at)" ;;
   malformed)  session_note="session.json unreadable" ;;
   unreadable) session_note="session.json cannot be read ($unreadable_why), so its end time is unknown; treated as expired" ;;
@@ -528,7 +887,12 @@ if [[ "$journal_state" != dirty ]]; then
     else
       log info "$session_note; journal already clean"
     fi
-    "$RM" -f "$SESSION"
+    # A valid session was removed (or recorded as ended) above.
+    if [[ "$session_state" == valid ]]; then exit "$session_left"; fi
+    if ! remove_session; then
+      log error "could not remove $SESSION; will retry on the next run"
+      exit 1
+    fi
   fi
   exit 0
 fi
@@ -543,7 +907,11 @@ new_sleep="$sleep_held"
 if [[ "$sleep_held" == true ]]; then
   if run_bounded "$SUDO" -n "$PMSET" -a disablesleep 0; then
     log info "pmset -a disablesleep 0 ok"
-    new_sleep=false; changed=1
+    if (( keep_sleep_entry == 1 )); then
+      failures+=("sleepDisabledByUs is kept although sleep is restored: $SESSION could not be removed and its end could not be recorded")
+    else
+      new_sleep=false; changed=1
+    fi
   else
     if (( command_alive )); then stop_transaction "pmset -a disablesleep 0"; fi
     log error "pmset -a disablesleep 0 failed (sudoers rule missing? run install.sh); keeping journal entry for retry"
@@ -745,6 +1113,8 @@ fi
 if (( changed == 1 )); then
   tmp="$APP_SUPPORT/.state.json.backstop.$$"
   publish_ok=1
+  # As in record_end: a leftover at this PID's name goes unopened first.
+  "$RM" -f "$tmp" 2>/dev/null || true
   "$CP" "$STATE" "$tmp" || publish_ok=0
   if (( publish_ok == 1 )) && [[ "$new_sleep" != "$sleep_held" ]]; then
     "$PLUTIL" -replace sleepDisabledByUs -bool "$new_sleep" "$tmp" >/dev/null 2>&1 || publish_ok=0
@@ -783,9 +1153,19 @@ if (( ${#failures[@]} > 0 )); then
   exit 1
 fi
 
+# A valid session was removed (or recorded as ended) above.
+if [[ "$session_state" == valid ]] && (( session_left == 1 )); then
+  log error "journal cleared, but $SESSION could not be removed; will retry on the next run"
+  exit 1
+fi
 log info "journal cleared"
 case "$session_state" in
   malformed|unreadable) quarantine_session || exit 1 ;;
-  *)                    "$RM" -f "$SESSION" ;;
+  valid)                ;;
+  *)
+    if ! remove_session; then
+      log error "journal cleared, but could not remove $SESSION; will retry on the next run"
+      exit 1
+    fi ;;
 esac
 exit 0

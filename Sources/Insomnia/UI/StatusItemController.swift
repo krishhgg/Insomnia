@@ -480,10 +480,16 @@ final class StatusItemController: NSObject {
         // Nothing to commit once the monitors are down: Enter has already
         // been pressed (or Esc), and the slots are retracting.
         guard keyCatcher != nil else { return }
-        switch MenuBarModel.commitAction(mode: mode, typed: model.input.total, defaultPreset: manager.config.defaultPreset) {
+        let remaining = mode == .extend ? (manager.session?.remaining(at: manager.now) ?? 0) : 0
+        switch MenuBarModel.commitAction(mode: mode, typed: model.input.total, defaultPreset: manager.config.defaultPreset, maxDuration: manager.config.maxDuration, remaining: remaining) {
         case let .run(duration):
             run(mode: mode, duration: duration)
         case .reject:
+            model.rejectBounce += 1
+        case let .tooLong(allowed):
+            // Said beside the pills, as a refused start is (layout state,
+            // outside any animation); the typed value stays for editing.
+            model.startError = MenuBarModel.tooLongText(allowed: allowed)
             model.rejectBounce += 1
         }
     }

@@ -75,6 +75,17 @@ final class TempHome {
     }
 }
 
+/// Points INSOMNIA_HOME at `home` for a test that does not own a TempHome,
+/// and returns the closure that puts back the value it had before (the
+/// loader's `ProcessTestHome.root` if it somehow had none). Call it in a
+/// defer. Never unsetenv instead: `Log.append` and `SessionManager.live`
+/// would then resolve the real ~/Library for the rest of the process.
+func pointInsomniaHome(at home: URL) -> () -> Void {
+    let previous = ProcessTestHome.current ?? ProcessTestHome.root.path
+    setenv(Paths.environmentKey, home.path, 1)
+    return { setenv(Paths.environmentKey, previous, 1) }
+}
+
 /// Records every call; can be told to throw.
 final class FakeSleepGuard: SleepGuarding, @unchecked Sendable {
     private let lock = NSLock()
@@ -657,6 +668,13 @@ struct Harness {
             reassertDelay: reassertDelay
         )
     }
+}
+
+/// Sets or clears the user immutable flag (chflags uchg) on a test file, so
+/// unlink and rename onto it fail with EPERM, as for a file a person locked.
+/// Tests clear it again before their temp home is removed.
+func setImmutable(_ url: URL, _ on: Bool) throws {
+    try FileManager.default.setAttributes([.immutable: on], ofItemAtPath: url.path)
 }
 
 /// Runs `request` in a new main-actor task and returns that task once the

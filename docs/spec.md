@@ -69,7 +69,18 @@ recovery; newly written journals use `frozenProcesses`.
 ### 1. Timed sessions (the only way to keep the Mac awake)
 
 - Time is entered inline in the menu bar as Days / Hours / Minutes pills.
-  Enter with empty fields uses the configured default preset. Maximum 30 days.
+  Enter with empty fields uses the configured default preset. Maximum 24
+  hours by default (`maxDuration` in config.json, which also caps presets and
+  extensions). A time past the maximum is refused with the allowance shown
+  beside the pills ("Up to 1d", "Up to 23h30m"); it is never shortened
+  without saying so. Current builds write `configVersion` 2 into
+  config.json. In a file without it, written by an older build, that build's
+  defaults (30 days, a 3-day preset) read as the current defaults and any
+  other saved value is kept. When the user never set the ceiling, presets
+  above 24 hours are dropped and a default above it moves to the largest
+  preset left (the 4-hour stock default if none is), so bare Enter still
+  starts. The app writes such a file back once at launch, so a 30-day
+  ceiling typed in later is the user's and stays.
 - While active the menu bar shows a second-resolution countdown. The redraw
   timer runs at 1 Hz and stops while the lid is closed.
 - Click the cup/countdown to enter an extension; hold the end control to end.
@@ -371,8 +382,21 @@ that violates it is corrected at load by raising `lowPowerFloor` to `endFloor`
 Insomnia does not enable Low Power Mode merely because a session starts; the
 causes are the battery floor, a serious thermal state, and (by default) a closed
 lid. One evaluation owns the mode: it is switched off only when no cause holds.
-Battery and thermal rules run only while the app is alive; they are not
-provided by the standalone backstop. Performance effects depend on workload.
+The Low Power Mode rules run only while the app is alive. The three ends are
+also enforced by the standalone backstop once a minute (section 8), so they
+hold after a crash. The backstop reads the battery with `pmset -g batt` and
+ends on the first read it cannot use, where the app tolerates one IOKit miss.
+When `pmset` lists no internal battery, the backstop asks `ioreg` for the
+`AppleSmartBattery` service, as `PowerMonitor` does: with no service the Mac
+is a desktop, and with one but no charger reported (`ExternalConnected`) the
+battery counts as unreadable and the session ends. It reads `endFloor` as the
+app decodes it, so a whole float such as `30.0` is 30, and clamps it to 0
+through 95 as `Config.normalizeFloors` does. The backstop reads the scalar
+keys `endFloor` and `thermalRules` from config.json directly, not through the
+app's decoder, so it cannot tell whether the app accepted the file. The app
+therefore refuses to run a session on a config.json it rejected and could
+not move aside (section 10).
+Performance effects depend on workload.
 
 ### 7. Network failover
 
@@ -469,6 +493,33 @@ Backstop, independent of the app:
   the loaded job for every extension and allow retries after a failure.
 - App and script transactions must coordinate through a shared lock. Failure
   to acquire it must not permit an unprotected journal write or side effect.
+- Only the Insomnia that holds `.app.alive` runs. A copy that cannot take it
+  within 2 s (`open -n`, or the binary run directly, while another copy
+  runs) does not reconcile, show the menu, start a session or end one on
+  quit; it posts a notification and quits.
+- A valid session is live only while the app holds `.app.alive`, an flock(2)
+  taken at launch and released by the kernel when the process dies, and while
+  the end floor and the critical thermal level (`notifyutil -g
+  com.apple.system.thermalpressurelevel`, 3 and up) are not crossed. The
+  agent ends the session otherwise, exactly as `--force` does, and logs the
+  reason. A present battery that cannot be read fails closed; an unreadable
+  thermal level only warns. `--force` runs none of these checks.
+- An end the agent decides is final from that decision. It removes
+  `session.json` under the lock before it undoes anything, so an undo it
+  cannot finish (a failing or hung `pmset`, saved audio or brightness only the
+  app restores) leaves journal entries, never a session a relaunched app would
+  resume. The app ends its side when it sees `session.json` gone.
+- A `session.json` that cannot be removed (an immutable file) is recorded as
+  ended in `ended-session.json`, a copy of its bytes. The app writes the same
+  record when its own end cannot remove the file. While the two files match,
+  the app restores that session instead of resuming it, and each agent run
+  ends it again and retries the removal. If the record cannot be written
+  either, the agent still restores sleep but keeps the `sleepDisabledByUs`
+  entry and exits 1, so the journal stays dirty and uninstall stops.
+- The battery and thermal reads have the undo commands' time limit but never
+  hold the lock: they run with its descriptor closed, and one that ignores
+  SIGTERM gets SIGKILL. A hung read fails only its own check, never the next
+  run or the app.
 - Successful restores may clear their entries; failures must stay journaled.
   Process recovery must verify identity and avoid resuming a process that
   Insomnia did not stop. Old PID-only entries need conservative handling.
@@ -480,9 +531,14 @@ Backstop, independent of the app:
   absent. A delete that fails counts as done only when `defaults read` then
   says the key does not exist; a read that succeeds or fails any other way
   keeps the entry.
-- The agent is a recovery mechanism, not a guarantee of crash/reboot behavior
-  or a replacement for battery/thermal observers. These scenarios require
-  the separate hardware validation record.
+- The agent is a recovery mechanism, not a guarantee of crash/reboot behavior.
+  Its battery and thermal checks cover the two ends once a minute, not Low
+  Power Mode or notifications. A reboot alone does not end a session whose
+  deadline is still ahead. If no Insomnia holds the alive lock when the agent
+  first runs after login, the agent ends it. With launch at login on, the app can
+  start first; its reconcile then resumes the session as on any launch (step
+  2), and a healthy agent run keeps it until its deadline or a cutoff. These
+  scenarios require the separate hardware validation record.
 
 ### 9. Notifications
 
@@ -490,7 +546,8 @@ Backstop, independent of the app:
 minutes before end, battery floor reached, battery unreadable twice in a row,
 thermal action taken, network gap recovered (with nudge summary), sleep
 restored by backstop, sleep disabled by something other than Insomnia
-(reconcile step 3, once per launch).
+(reconcile step 3, once per launch), config.json moved aside because it does
+not decode, and another copy already running (the copy quits).
 
 ### 10. Settings
 
@@ -532,6 +589,33 @@ small settings window:
   System Settings shows without a relaunch. With the flag off nothing is
   registered or unregistered at launch.
 
+The app reads config.json once, at launch. A missing key takes its
+default, and `configVersion` counts by its presence alone, whatever its
+value. A file that does not decode (a value of the wrong type, broken
+JSON, not a regular file) is never written over: the app renames it to
+`config.json.unreadable-<UTC stamp>`, runs on the defaults, writes them to
+config.json and posts a notification naming the copy. When the rename
+fails, the file stays as it is and the app runs on the defaults without
+writing them. `uninstall.sh` keeps these copies; `--purge` removes them.
+
+The backstop reads `endFloor` and `thermalRules` from config.json on every
+run (section 6). A file the app rejects can still hold valid values for
+those two keys, such as a 0% floor or thermal rules off, while the app
+enforces its defaults. So every transaction (reconcile, start, extend, end,
+and the lid, floor and Low Power changes) checks the file again. One that
+does not decode is renamed aside as at launch, and the settings the app runs
+on are written in its place. While a rejected file cannot be renamed, no
+session runs:
+
+- Start refuses and changes nothing. Its notification names the file and
+  says to make it writable or delete it.
+- A session already running ends at the next transaction, through the
+  normal end.
+- Reconcile ends a valid session on disk instead of resuming it.
+
+A file that decodes is not read again. A hand edit made while the app runs
+reaches the backstop at its next run and the app at its next launch.
+
 ### 11. Menu bar UI: inline time entry
 
 Reference: the attached screenshot (coffee icon, then three rounded pill
@@ -555,7 +639,8 @@ one after another with a short stagger.
   replaces it with the number and the pill grows to fit. Tab and Shift-Tab
   move between pills, Enter starts the session, Esc collapses.
 - The "?" badge on each pill is a help affordance: hover shows a tooltip
-  ("Up to 30 days" etc.). It is not an input.
+  ("Up to 1d per session" on Days, from `maxDuration`; the range 0 to 23 on
+  Hours and 0 to 59 on Minutes). It is not an input.
 - The current interface uses inline entry, not the preset-popover proposal
   from the original design. Empty-field Enter starts the default preset.
 
@@ -742,11 +827,16 @@ that any case passed; record results in the release validation record.
    sleep still disabled until end.
 3. **Restores.** End now → `pmset -g` shows no `SleepDisabled`. Quit → same.
    Timer expiry → same, plus notification.
-4. **Backstop.** Force-quit a supervised disposable session, then verify
-   deadline recovery and retry after an injected restore failure. Separately
-   test reboot/login with valid, expired, and dirty journals; the polling
-   agent honors a valid future deadline rather than unconditionally ending
-   every session at login. Saved audio requires the app to reopen.
+4. **Backstop.** Force-quit a supervised disposable session: the agent ends it
+   within a minute (log line "Insomnia is not running"). Verify retry after an
+   injected restore failure. With the app stopped (`kill -STOP`) and the Mac
+   on battery below the end floor, the agent ends the session on its own;
+   drive the thermal end with an injected reading against a patched copy of
+   the script, not the installed agent. Separately test reboot/login with
+   valid, expired, and dirty journals. With launch at login off, the agent
+   ends a valid session at login, since no app holds the alive lock. With it
+   on, the app may resume the session first, and it then lasts until its
+   deadline or a cutoff. Saved audio requires the app to reopen.
 5. **Freeze.** Slack and WhatsApp on list, close lid, `ps -o stat` shows `T`
    for their whole trees. Open lid → running, reconnected, no relaunch.
 6. **Docker rule.** No containers → paused on close. One container → untouched.

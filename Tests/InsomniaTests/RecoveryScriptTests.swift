@@ -7,13 +7,14 @@ import XCTest
 ///
 /// Each test runs a private COPY of the production script against a
 /// throwaway INSOMNIA_HOME. The copy has its fixed tool-path constants
-/// (sudo, pmset, ps, kill, sysctl, pgrep, pkill, osascript, launchctl,
-/// defaults) and its app-bundle / sudoers paths rewritten to point inside
-/// the fixture, so nothing privileged runs, no real process is signaled, no
-/// real app's preferences are read or written, and no real home,
-/// LaunchAgent, sudoers file, or installed app is read or written. plutil
-/// and lockf are the real tools, and so is date, except for the backstop's
-/// moved-aside stamp, which a test can freeze. The fakes record every call.
+/// (sudo, pmset, ps, kill, sysctl, notifyutil, ioreg, pgrep, pkill,
+/// osascript, launchctl, defaults) and its app-bundle / sudoers paths rewritten to
+/// point inside the fixture, so nothing privileged runs, no real process is
+/// signaled, no real app's preferences are read or written, and no real
+/// home, LaunchAgent, sudoers file, or installed app is read or written.
+/// plutil, lockf and cmp are the real tools, and so is date, except for the
+/// backstop's moved-aside stamp, which a test can freeze. The fakes record
+/// every call.
 final class RecoveryScriptTests: XCTestCase {
     private var fx: ScriptFixture!
 
@@ -24,6 +25,14 @@ final class RecoveryScriptTests: XCTestCase {
     override func tearDown() {
         fx.destroy()
         fx = nil
+        // The app tests here point INSOMNIA_HOME at the fixture. Whatever a
+        // test did, the next one must start on the loader's throwaway home,
+        // never on an unset variable that resolves the real ~/Library.
+        let home = ProcessTestHome.current
+        if home != ProcessTestHome.root.path {
+            setenv(Paths.environmentKey, ProcessTestHome.root.path, 1)
+            XCTFail("the test left INSOMNIA_HOME at \(home ?? "unset"), not \(ProcessTestHome.root.path)")
+        }
     }
 
     // MARK: - backstop.sh
@@ -70,17 +79,437 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(fx.exists(fx.state), "must not seed a journal")
     }
 
-    func testValidFutureSessionIsNoOpWithoutForce() throws {
+    // MARK: backstop.sh: a valid session is live only while the app and the floors say so
+
+    private let liveJournal = #"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#
+    private let sleepRestored = "sudo -n PMSET -a disablesleep 0"
+    private let batteryRead = "pmset -g batt"
+    private let thermalRead = "notifyutil -g com.apple.system.thermalpressurelevel"
+    private let batteryServiceRead = "ioreg -r -c AppleSmartBattery -d 1"
+
+    /// A session with an hour left and sleep journaled as ours: what the
+    /// backstop sees every minute while the app runs.
+    private func writeLiveSession() throws {
         try fx.writeSession(endsAt: Date(timeIntervalSinceNow: 3600))
-        let dirty = #"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#
-        try fx.writeState(dirty)
+        try fx.writeState(liveJournal)
+    }
+
+    private func calls() -> [String] {
+        fx.calls().map { $0.replacingOccurrences(of: fx.fakePmset, with: "PMSET") }
+    }
+
+    private func assertSessionEnded(_ r: (status: Int32, stdout: String, stderr: String), reason: String, file: StaticString = #filePath, line: UInt = #line) throws {
+        XCTAssertEqual(r.status, 0, r.stderr + fx.log(), file: file, line: line)
+        XCTAssertTrue(calls().contains(sleepRestored), "\(calls())", file: file, line: line)
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, false, file: file, line: line)
+        XCTAssertFalse(fx.exists(fx.session), "session.json must go with the session", file: file, line: line)
+        XCTAssertTrue(fx.log().contains("ending the session before its deadline"), fx.log(), file: file, line: line)
+        XCTAssertTrue(fx.log().contains(reason), fx.log(), file: file, line: line)
+    }
+
+    private func assertSessionKept(_ r: (status: Int32, stdout: String, stderr: String), file: StaticString = #filePath, line: UInt = #line) throws {
+        XCTAssertEqual(r.status, 0, r.stderr + fx.log(), file: file, line: line)
+        XCTAssertFalse(calls().contains { $0.hasPrefix("sudo") || $0.hasPrefix("kill -CONT") }, "\(calls())", file: file, line: line)
+        XCTAssertEqual(try String(contentsOf: fx.state, encoding: .utf8), liveJournal, "journal must not be rewritten", file: file, line: line)
+        XCTAssertTrue(fx.exists(fx.session), "the session must stand", file: file, line: line)
+    }
+
+    /// The app holds the alive lock, the Mac is on AC power and cool: the
+    /// minute tick reads the battery and the heat and leaves the session
+    /// alone, without a word in the log.
+    func testValidSessionWithTheAppAliveAndAHealthyMachineIsLeftAlone() throws {
+        try writeLiveSession()
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+
+        let r = try fx.run(fx.backstop)
+
+        try assertSessionKept(r)
+        XCTAssertEqual(calls(), [batteryRead, thermalRead], "reads only, nothing privileged")
+        XCTAssertFalse(fx.exists(fx.logFile), "a healthy minute must not spam the log")
+    }
+
+    /// Nobody holds the alive lock: the app crashed, was force-quit or has
+    /// not started yet. The deadline no longer matters; the session ends
+    /// as if --force had been given, and the battery and heat are not even
+    /// read.
+    func testAppNotRunningEndsAValidSession() throws {
+        try writeLiveSession()
+
+        let r = try fx.run(fx.backstop)
+
+        try assertSessionEnded(r, reason: "Insomnia is not running")
+        XCTAssertEqual(calls(), [sleepRestored])
+        XCTAssertTrue(fx.exists(fx.alive), "the probe creates the lock file and keeps it (lockf -k)")
+        XCTAssertTrue(fx.log().contains("journal cleared"), fx.log())
+    }
+
+    /// The probe gives the lock back when it exits: the app can take it
+    /// right after a run, and the next run then sees it held.
+    func testAliveProbeReleasesTheLockItTook() throws {
+        try writeLiveSession()
+        XCTAssertEqual(try fx.run(fx.backstop).status, 0)
+        XCTAssertFalse(fx.exists(fx.session))
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+        try writeLiveSession()
+        fx.clearCalls()
+        try assertSessionKept(try fx.run(fx.backstop))
+    }
+
+    /// The lock the app takes (AppAliveLock.swift) is the lock the script
+    /// probes: held in this process, the session stands; released, as the
+    /// kernel does when the process dies, the next run ends it.
+    func testAppAliveLockTakenByTheAppIsSeenByTheBackstop() throws {
+        try writeLiveSession()
+        let lock = AppAliveLock(url: fx.alive)
+        XCTAssertTrue(try lock.tryAcquire())
+
+        try assertSessionKept(try fx.run(fx.backstop))
+
+        lock.release()
+        fx.clearCalls()
+        try assertSessionEnded(try fx.run(fx.backstop), reason: "Insomnia is not running")
+    }
+
+    /// A valid session whose journal is clean (the app died between writing
+    /// session.json and pmset) is removed without running anything.
+    func testAppNotRunningWithACleanJournalRemovesTheSessionOnly() throws {
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: 3600))
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
 
         let r = try fx.run(fx.backstop)
 
         XCTAssertEqual(r.status, 0, r.stderr)
-        XCTAssertEqual(fx.calls(), [])
-        XCTAssertEqual(try String(contentsOf: fx.state, encoding: .utf8), dirty)
-        XCTAssertTrue(fx.exists(fx.session))
+        XCTAssertEqual(calls(), [])
+        XCTAssertFalse(fx.exists(fx.session))
+        XCTAssertTrue(fx.log().contains("Insomnia is not running"), fx.log())
+        XCTAssertTrue(fx.log().contains("journal already clean"), fx.log())
+    }
+
+    func testBatteryBelowTheEndFloorOnBatteryPowerEndsTheSession() throws {
+        try writeLiveSession()
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+        fx.setBattery(fx.battery(source: "Battery Power", percent: 9))
+
+        let r = try fx.run(fx.backstop)
+
+        try assertSessionEnded(r, reason: "battery at 9% on battery power, below the 10% end floor")
+        XCTAssertEqual(calls(), [batteryRead, sleepRestored], "no thermal read once the battery has decided")
+    }
+
+    /// Strict less-than, as in FloorRules.swift: at the floor is not below
+    /// it. On AC power the charge does not matter at all.
+    func testBatteryAtTheFloorOrOnACPowerKeepsTheSession() throws {
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+        for (source, percent, state) in [("Battery Power", 10, "discharging"), ("AC Power", 3, "charging"), ("AC Power", 0, "charging")] {
+            try writeLiveSession()
+            fx.setBattery(fx.battery(source: source, percent: percent, state: state))
+            try assertSessionKept(try fx.run(fx.backstop))
+        }
+    }
+
+    /// Fail closed: a battery that is there but cannot be read, or a pmset
+    /// that fails, ends the session; sleep must not stay disabled on a guess.
+    func testBatteryUnreadableOrPmsetFailingEndsTheSession() throws {
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+        let cases: [(output: String, reason: String)] = [
+            ("FAIL", "battery state unreadable (pmset -g batt exit 1)"),
+            ("Now drawing from 'Battery Power'\n -InternalBattery-0 (id=1)\t(no estimate) present: true\n", "battery present but unreadable"),
+            ("Now drawing from 'UPS Power'\n -InternalBattery-0 (id=1)\t50%; discharging; present: true\n", "battery present but unreadable"),
+            (" -InternalBattery-0 (id=1)\t50%; discharging; present: true\n", "battery present but unreadable"),
+        ]
+        for c in cases {
+            try writeLiveSession()
+            fx.clearCalls()
+            fx.setBattery(c.output)
+            try assertSessionEnded(try fx.run(fx.backstop), reason: c.reason)
+        }
+    }
+
+    /// No InternalBattery line and no AppleSmartBattery service is a
+    /// desktop: there is no battery rule, and the thermal check still runs.
+    func testDesktopWithoutABatteryHasNoBatteryRule() throws {
+        try writeLiveSession()
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+        fx.setBattery("Now drawing from 'AC Power'\n")
+
+        let r = try fx.run(fx.backstop)
+
+        try assertSessionKept(r)
+        XCTAssertEqual(calls(), [batteryRead, batteryServiceRead, thermalRead])
+    }
+
+    /// A laptop whose power source list lost its battery row still has the
+    /// AppleSmartBattery service, as the app's PowerMonitor.classify checks.
+    /// Its level is unknown, so the session ends unless the driver reports a
+    /// charger. An ioreg that fails or hangs cannot show a desktop either.
+    func testABatteryMissingFromPmsetIsJudgedByTheBatteryService() throws {
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+        let ended: [(mode: String, reason: String)] = [
+            ("BATTERY", "battery present (AppleSmartBattery) but missing from pmset -g batt, and no charger reported"),
+            ("BATTERY_NOKEY", "battery present (AppleSmartBattery) but missing from pmset -g batt, and no charger reported"),
+            ("FAIL", "no battery in pmset -g batt, and ioreg exit 1 could not show there is none"),
+            ("HANG", "no battery in pmset -g batt, and ioreg did not finish within 1s"),
+        ]
+        for c in ended {
+            try writeLiveSession()
+            fx.clearCalls()
+            fx.clearLog()
+            fx.setBattery("Now drawing from 'AC Power'\n")
+            fx.setBatteryService(c.mode)
+            try assertSessionEnded(try fx.run(fx.backstop), reason: c.reason)
+            XCTAssertTrue(calls().contains(batteryServiceRead), "\(calls())")
+        }
+
+        try writeLiveSession()
+        fx.clearCalls()
+        fx.setBatteryService("BATTERY_AC")
+        try assertSessionKept(try fx.run(fx.backstop))
+        XCTAssertEqual(calls(), [batteryRead, batteryServiceRead, thermalRead])
+    }
+
+    /// endFloor comes from config.json like the app's; 0 disables the rule;
+    /// a value that is not a whole number falls back to the default 10.
+    func testEndFloorIsReadFromConfigAndZeroDisablesIt() throws {
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+
+        try writeLiveSession()
+        try fx.writeConfig(#"{"endFloor": 30}"#)
+        fx.setBattery(fx.battery(source: "Battery Power", percent: 25))
+        try assertSessionEnded(try fx.run(fx.backstop), reason: "battery at 25% on battery power, below the 30% end floor")
+
+        try writeLiveSession()
+        fx.clearCalls()
+        try fx.writeConfig(#"{"endFloor": 0}"#)
+        fx.setBattery(fx.battery(source: "Battery Power", percent: 1))
+        try assertSessionKept(try fx.run(fx.backstop))
+
+        try writeLiveSession()
+        fx.clearCalls()
+        try fx.writeConfig(#"{"endFloor": "ten"}"#)
+        fx.setBattery(fx.battery(source: "Battery Power", percent: 9))
+        try assertSessionEnded(try fx.run(fx.backstop), reason: "below the 10% end floor")
+
+        try writeLiveSession()
+        fx.clearCalls()
+        try fx.writeConfig("not json at all")
+        try assertSessionEnded(try fx.run(fx.backstop), reason: "below the 10% end floor")
+    }
+
+    /// JSONDecoder reads a number that is exactly an integer as an Int, so
+    /// 30.0 and 3e1 are a 30% floor in the app and 0.0 turns the rule off; a
+    /// fraction fails the app's decode, which then uses the default 10. The
+    /// app clamps the floor to 0...95 (Config.normalizeFloors). The backstop
+    /// enforces the same floor in every case.
+    func testNumericEndFloorsAreReadAsTheAppDecodesAndClampsThem() throws {
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+        let ended: [(config: String, percent: Int, floor: Int)] = [
+            (#"{"configVersion": 2, "endFloor": 30.0}"#, 25, 30),
+            (#"{"endFloor": 3e1}"#, 25, 30),
+            (#"{"endFloor": 30.5}"#, 9, 10),
+            (#"{"endFloor": 30.0000001}"#, 9, 10),
+            (#"{"endFloor": 200}"#, 90, 95),
+        ]
+        for c in ended {
+            try writeLiveSession()
+            fx.clearCalls()
+            fx.clearLog()
+            try fx.writeConfig(c.config)
+            fx.setBattery(fx.battery(source: "Battery Power", percent: c.percent))
+            try assertSessionEnded(try fx.run(fx.backstop), reason: "battery at \(c.percent)% on battery power, below the \(c.floor)% end floor")
+        }
+        let kept: [(config: String, percent: Int)] = [
+            (#"{"endFloor": 30.5}"#, 25),
+            (#"{"endFloor": 0.0}"#, 1),
+            (#"{"endFloor": -5}"#, 1),
+        ]
+        for c in kept {
+            try writeLiveSession()
+            fx.clearCalls()
+            try fx.writeConfig(c.config)
+            fx.setBattery(fx.battery(source: "Battery Power", percent: c.percent))
+            try assertSessionKept(try fx.run(fx.backstop))
+        }
+    }
+
+    /// With the floor off nothing is read, so a failing pmset cannot end a
+    /// session the user exempted from the battery rule.
+    func testEndFloorZeroSkipsTheBatteryReadSoAFailingPmsetCannotEnd() throws {
+        try writeLiveSession()
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+        try fx.writeConfig(#"{"endFloor": 0}"#)
+        fx.setBattery("FAIL")
+
+        let r = try fx.run(fx.backstop)
+
+        try assertSessionKept(r)
+        XCTAssertEqual(calls(), [thermalRead], "no battery read with the floor off")
+    }
+
+    /// A JSON string is not the Int or Bool the app decodes: "30" and
+    /// "false" fall back to the defaults here as they do in the app, so both
+    /// sides enforce the same floor and the same thermal rule.
+    func testStringTypedConfigValuesAreIgnoredLikeTheAppDoes() throws {
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+
+        try writeLiveSession()
+        try fx.writeConfig(#"{"endFloor": "30"}"#)
+        fx.setBattery(fx.battery(source: "Battery Power", percent: 25))
+        try assertSessionKept(try fx.run(fx.backstop))
+
+        try writeLiveSession()
+        fx.clearCalls()
+        try fx.writeConfig(#"{"endFloor": "30"}"#)
+        fx.setBattery(fx.battery(source: "Battery Power", percent: 9))
+        try assertSessionEnded(try fx.run(fx.backstop), reason: "below the 10% end floor")
+
+        try writeLiveSession()
+        fx.clearCalls()
+        try fx.writeConfig(#"{"thermalRules": "false", "endFloor": 10.0}"#)
+        fx.setBattery(fx.battery(source: "AC Power", percent: 50, state: "charging"))
+        fx.setThermal("4")
+        try assertSessionEnded(try fx.run(fx.backstop), reason: "thermal pressure level 4")
+    }
+
+    /// The reads are bounded like the undo commands (COMMAND_TIMEOUT_SECONDS,
+    /// 1 s in this fixture). A battery read that hangs is terminated and
+    /// counts as unreadable: the session ends. A thermal read that hangs
+    /// only warns.
+    func testHungReadsAreBoundedBatteryFailsClosedThermalWarns() throws {
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+
+        try writeLiveSession()
+        fx.setBattery("HANG")
+        var started = Date()
+        try assertSessionEnded(try fx.run(fx.backstop), reason: "pmset -g batt did not finish within 1s")
+        XCTAssertLessThan(Date().timeIntervalSince(started), 20, "the hung read must not hold the run for its whole minute")
+        XCTAssertTrue(fx.log().contains("did not finish within 1s; terminated with SIGTERM"), fx.log())
+        XCTAssertTrue(fx.calls().contains { $0.hasPrefix("kill -TERM ") }, "the timeout signal goes through $KILL: \(fx.calls())")
+
+        try writeLiveSession()
+        fx.clearCalls()
+        fx.setBattery(fx.battery(source: "AC Power", percent: 100, state: "charged"))
+        fx.setThermal("HANG")
+        started = Date()
+        try assertSessionKept(try fx.run(fx.backstop))
+        XCTAssertLessThan(Date().timeIntervalSince(started), 20)
+        XCTAssertTrue(fx.log().contains("thermal pressure level unreadable"), fx.log())
+        let leftovers = try FileManager.default.contentsOfDirectory(atPath: fx.home.path).filter { $0.hasPrefix(".backstop.") }
+        XCTAssertEqual(leftovers, [], "status and capture files are cleaned up")
+    }
+
+    /// A read never holds the recovery lock: its supervisor closes fd 9
+    /// before starting it, so neither has it while the run holds the lock.
+    /// The fake looks with lsof, which can take seconds on a busy machine,
+    /// so this run gets a 30 s time limit; the read answers as soon as it
+    /// has looked, so the limit never fires.
+    func testReadsRunWithoutTheLockDescriptor() throws {
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+        try writeLiveSession()
+        try fx.setCommandTimeout(30)
+        fx.setThermal("CHECK_FD9")
+
+        try assertSessionKept(try fx.run(fx.backstop))
+
+        XCTAssertTrue(fx.calls().contains("notifyutil checked fd 9"), "\(fx.calls())")
+        XCTAssertFalse(fx.calls().contains { $0.hasSuffix("had fd 9") }, "neither the read nor its supervisor may inherit the lock: \(fx.calls())")
+        XCTAssertFalse(fx.log().contains("did not finish"), fx.log())
+    }
+
+    /// A read that ignores SIGTERM and leaves a child behind is killed, and
+    /// the lock is free the moment the run exits, so the next minute's run
+    /// takes it and can still end the session.
+    func testReadThatIgnoresSigtermLeavesTheLockToTheNextRun() throws {
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+        try writeLiveSession()
+        fx.setThermal("IGNORE_TERM")
+
+        try assertSessionKept(try fx.run(fx.backstop))
+
+        XCTAssertTrue(fx.log().contains("ignored SIGTERM; sent SIGKILL"), fx.log())
+        XCTAssertTrue(fx.calls().contains { $0.hasPrefix("kill -KILL ") }, "the timeout signal goes through $KILL: \(fx.calls())")
+        XCTAssertTrue(fx.log().contains("thermal pressure level unreadable"), fx.log())
+        XCTAssertTrue(try fx.lockIsFree(), "nothing the read started holds the lock")
+
+        fx.clearCalls()
+        fx.setThermal("3")
+        try assertSessionEnded(try fx.run(fx.backstop), reason: "thermal pressure level 3")
+        let leftovers = try FileManager.default.contentsOfDirectory(atPath: fx.home.path).filter { $0.hasPrefix(".backstop.") }
+        XCTAssertEqual(leftovers, [])
+    }
+
+    /// Levels 0 to 2 (nominal, moderate, heavy) keep the session; 3 and 4
+    /// (trapping, sleeping) are what ProcessInfo reports as critical and
+    /// end it.
+    func testThermalPressureAtTrappingOrAboveEndsTheSession() throws {
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+        for level in 0...2 {
+            try writeLiveSession()
+            fx.setThermal("\(level)")
+            try assertSessionKept(try fx.run(fx.backstop))
+        }
+        for level in 3...4 {
+            try writeLiveSession()
+            fx.clearCalls()
+            fx.setThermal("\(level)")
+            try assertSessionEnded(try fx.run(fx.backstop), reason: "thermal pressure level \(level) (critical")
+            XCTAssertEqual(calls(), [batteryRead, thermalRead, sleepRestored])
+        }
+    }
+
+    /// Heat is read best effort: a failing or nonsensical notifyutil is a
+    /// warning in the log, never an end on its own.
+    func testThermalUnreadableWarnsWithoutEndingTheSession() throws {
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+        for mode in ["FAIL", "GARBAGE"] {
+            try writeLiveSession()
+            fx.setThermal(mode)
+            try assertSessionKept(try fx.run(fx.backstop))
+            XCTAssertTrue(fx.log().contains("thermal pressure level unreadable"), fx.log())
+            XCTAssertFalse(fx.log().contains("ending the session before its deadline"), fx.log())
+        }
+    }
+
+    func testThermalRulesOffIgnoresCriticalHeat() throws {
+        try writeLiveSession()
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+        try fx.writeConfig(#"{"thermalRules": false}"#)
+        fx.setThermal("4")
+
+        let r = try fx.run(fx.backstop)
+
+        try assertSessionKept(r)
+        XCTAssertEqual(calls(), [batteryRead], "with the rule off the level is not even read")
+    }
+
+    /// A thermal end is logged with the level, and the log names the reason
+    /// in the same line as the restore, so one grep tells the story.
+    func testCutoffReasonIsInTheRestoreLogLine() throws {
+        try writeLiveSession()
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+        fx.setThermal("3")
+
+        _ = try fx.run(fx.backstop)
+
+        XCTAssertTrue(fx.log().contains("session ended early, thermal pressure level 3 (critical from 3 up) (endsAt="), fx.log())
+        XCTAssertTrue(fx.log().contains("restoring from journal"), fx.log())
     }
 
     func testForceEndsValidSession() throws {
@@ -93,6 +522,359 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(fx.calls(), ["sudo -n \(fx.fakePmset) -a disablesleep 0"])
         XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, false)
         XCTAssertFalse(fx.exists(fx.session))
+    }
+
+    // MARK: backstop.sh: an early end is final even when its undo is not
+
+    private let journalWithSavedBrightness = #"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"savedDisplayBrightness":0.6}"#
+
+    /// Saved brightness is the app's to restore, so the run that ends the
+    /// session of an app that died cannot clear the journal. The session
+    /// ends anyway: session.json goes, and what is left stays journaled.
+    func testEarlyEndWithAnUndoOnlyTheAppCanFinishStillRemovesTheSession() throws {
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: 3600))
+        try fx.writeState(journalWithSavedBrightness)
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 1, r.stderr + fx.log())
+        XCTAssertEqual(calls(), [sleepRestored])
+        XCTAssertFalse(fx.exists(fx.session), "a relaunched app must find no session to resume")
+        let s = try fx.stateJSON()
+        XCTAssertEqual(s["sleepDisabledByUs"] as? Bool, false)
+        XCTAssertEqual((s["savedDisplayBrightness"] as? NSNumber)?.doubleValue, 0.6, "kept for the app")
+        XCTAssertTrue(fx.log().contains("Insomnia is not running"), fx.log())
+    }
+
+    /// A pmset that fails leaves sleep journaled, not the session. The next
+    /// run finds no session to check and undoes what is journaled.
+    func testEarlyEndWithAFailingPmsetRemovesTheSessionAndTheNextRunFinishes() throws {
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+        try writeLiveSession()
+        fx.setBattery(fx.battery(source: "Battery Power", percent: 9))
+        fx.setMode("sudo", "fail")
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 1, r.stderr + fx.log())
+        XCTAssertFalse(fx.exists(fx.session))
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, true, "a failed pmset stays journaled")
+        XCTAssertTrue(fx.log().contains("journal kept dirty"), fx.log())
+
+        fx.setMode("sudo", "ok")
+        fx.clearCalls()
+        let next = try fx.run(fx.backstop)
+
+        XCTAssertEqual(next.status, 0, next.stderr + fx.log())
+        XCTAssertEqual(calls(), [sleepRestored], "no session left, so nothing is read before the undo")
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, false)
+    }
+
+    /// --force (install.sh, uninstall.sh) ends a valid session the same way.
+    func testForcedEndWithAFailingPmsetStillRemovesTheSession() throws {
+        try writeLiveSession()
+        fx.setMode("sudo", "fail")
+
+        let r = try fx.run(fx.backstop, ["--force"])
+
+        XCTAssertEqual(r.status, 1, r.stderr + fx.log())
+        XCTAssertFalse(fx.exists(fx.session))
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, true)
+        XCTAssertTrue(fx.log().contains("forced end of session"), fx.log())
+    }
+
+    /// An undo that hangs stops the run with the journal as read and the
+    /// lock with the live command. The session it ended is gone all the
+    /// same, so the app sees the end and nothing can resume it.
+    func testEarlyEndWhoseUndoHangsStillRemovesTheSession() throws {
+        try writeLiveSession()
+        fx.setMode("sudo", "ignore-term")
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertNotEqual(r.status, 0)
+        XCTAssertFalse(fx.exists(fx.session))
+        XCTAssertEqual(try String(contentsOf: fx.state, encoding: .utf8), liveJournal, "journal unchanged while the command runs")
+        XCTAssertFalse(try fx.lockIsFree(), "the live command keeps the lock")
+        fx.releaseCommand()
+        XCTAssertTrue(try fx.waitUntilLockIsFree())
+    }
+
+    /// The relaunch the early end must not undo. The backstop ends the
+    /// session of an app that died; its pmset fails and the saved
+    /// brightness is the app's to restore. Insomnia launched afterwards
+    /// finds no session, so it does not disable sleep again: it restores
+    /// what the journal still holds and leaves it clean.
+    @MainActor
+    func testAppRelaunchedAfterAPartialEarlyEndRestoresInsteadOfResuming() async throws {
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: 3600))
+        try fx.writeState(journalWithSavedBrightness)
+        fx.setMode("sudo", "fail")
+        XCTAssertEqual(try fx.run(fx.backstop).status, 1, fx.log())
+        XCTAssertFalse(fx.exists(fx.session))
+
+        // The app logs into the fixture, not ~/Library/Logs/Insomnia.
+        let restoreHome = pointInsomniaHome(at: fx.home)
+        defer { restoreHome() }
+        let paths = Paths.fromEnvironment()
+        let sleepGuard = FakeSleepGuard()
+        let display = FakeDisplayDimmer(brightness: 0)
+        let m = SessionManager(
+            paths: paths,
+            sleepGuard: sleepGuard,
+            processControl: FakeProcessControl(),
+            backstop: FakeBackstop(),
+            display: display,
+            clamshell: { false },
+            recoveryLockTimeout: 2,
+            recoveryRetryDelay: 3600,
+            reassertDelay: .seconds(3600)
+        )
+        await m.reconcile()
+
+        XCTAssertNil(m.session, "the ended session must not come back")
+        XCTAssertFalse(sleepGuard.calls.contains("disablesleep 1"), "\(sleepGuard.calls)")
+        XCTAssertTrue(sleepGuard.calls.contains("disablesleep 0"), "\(sleepGuard.calls)")
+        XCTAssertEqual(display.sets.last, 0.6)
+        let after = try XCTUnwrap(try Store(paths: paths).loadState())
+        XCTAssertFalse(after.isDirty, "\(after)")
+    }
+
+    // MARK: backstop.sh: a session.json that cannot be removed
+
+    /// session.json is immutable, so the run that ends the session cannot
+    /// remove it. It records the end in ended-session.json, a copy of the
+    /// file's bytes, and still restores sleep. Later runs end the session
+    /// again without reading the battery or the heat, even with the app
+    /// alive, and retry the removal; once it works the record goes too.
+    func testEndThatCannotRemoveSessionJSONRecordsItAndLaterRunsFinish() throws {
+        try writeLiveSession()
+        try setImmutable(fx.session, true)
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 1, r.stderr + fx.log())
+        XCTAssertEqual(calls(), [sleepRestored], "sleep is restored all the same")
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, false)
+        XCTAssertTrue(fx.exists(fx.session))
+        XCTAssertEqual(try Data(contentsOf: fx.endedSession), try Data(contentsOf: fx.session), "the record is the file's exact bytes")
+        XCTAssertTrue(fx.log().contains("its end is recorded in"), fx.log())
+
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+        fx.clearCalls()
+        let again = try fx.run(fx.backstop)
+
+        XCTAssertEqual(again.status, 1, again.stderr + fx.log())
+        XCTAssertEqual(calls(), [], "a session recorded as ended is not checked again")
+        XCTAssertTrue(fx.log().contains("already ended (recorded in"), fx.log())
+        XCTAssertTrue(fx.exists(fx.endedSession))
+
+        try setImmutable(fx.session, false)
+        let last = try fx.run(fx.backstop)
+
+        XCTAssertEqual(last.status, 0, last.stderr + fx.log())
+        XCTAssertFalse(fx.exists(fx.session))
+        XCTAssertFalse(fx.exists(fx.endedSession), "the record goes with the file it copies")
+    }
+
+    /// Neither session.json nor the record can be written: nothing on disk
+    /// says the session is over. Sleep is restored anyway, but its journal
+    /// entry stays as evidence and the run exits 1.
+    func testEndThatCanNeitherRemoveNorRecordKeepsTheSleepEntry() throws {
+        try writeLiveSession()
+        try setImmutable(fx.session, true)
+        try "{}".write(to: fx.endedSession, atomically: true, encoding: .utf8)
+        try setImmutable(fx.endedSession, true)
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 1, r.stderr + fx.log())
+        XCTAssertEqual(calls(), [sleepRestored])
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, true, "evidence kept while the session still reads as valid")
+        XCTAssertTrue(fx.exists(fx.session))
+        XCTAssertEqual(try String(contentsOf: fx.endedSession, encoding: .utf8), "{}")
+        let log = fx.log()
+        XCTAssertTrue(log.contains("could not remove \(fx.session.path) or record its end"), log)
+        XCTAssertTrue(log.contains("still journaled: sleepDisabledByUs is kept although sleep is restored"), log)
+    }
+
+    /// A record left from an earlier session.json matches nothing: it goes,
+    /// and the live session is checked as usual.
+    func testStaleEndRecordIsRemovedAndDoesNotEndTheSession() throws {
+        try writeLiveSession()
+        try #"{"endsAt":"2001-01-01T00:00:00Z","startedAt":"2001-01-01T00:00:00Z"}"#.write(to: fx.endedSession, atomically: true, encoding: .utf8)
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+
+        try assertSessionKept(try fx.run(fx.backstop))
+
+        XCTAssertEqual(calls(), [batteryRead, thermalRead])
+        XCTAssertFalse(fx.exists(fx.endedSession))
+    }
+
+    /// A stale record that cannot be removed ends nothing, but it is a copy
+    /// of a session's times, so every run says it is still there.
+    func testStaleEndRecordThatCannotBeRemovedIsLogged() throws {
+        try writeLiveSession()
+        try "{}".write(to: fx.endedSession, atomically: true, encoding: .utf8)
+        try setImmutable(fx.endedSession, true)
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+
+        try assertSessionKept(try fx.run(fx.backstop))
+
+        XCTAssertTrue(fx.exists(fx.endedSession))
+        XCTAssertTrue(fx.log().contains("could not remove \(fx.endedSession.path)"), fx.log())
+    }
+
+    /// A FIFO at ended-session.json is never opened: cmp would block on it
+    /// while the run holds the recovery lock, and then neither this script
+    /// nor the app could ever end the session. It is not a record, so it
+    /// matches nothing and goes, and the session is judged as usual: with no
+    /// app alive it ends and sleep is restored.
+    func testEndRecordThatIsAFIFOIsNeverOpenedAndTheSessionStillEnds() throws {
+        try writeLiveSession()
+        let fifo = try FIFOWatch(at: fx.endedSession)
+        defer { fifo.stop() }
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertFalse(fifo.readerSeen, "ended-session.json was opened although it is a FIFO")
+        try assertSessionEnded(r, reason: "Insomnia is not running")
+        XCTAssertEqual(calls(), [sleepRestored])
+        XCTAssertFalse(fx.exists(fx.session))
+        XCTAssertFalse(fx.exists(fx.endedSession))
+    }
+
+    /// The same FIFO with the app alive: the session stands, the reads run,
+    /// and the FIFO goes without being opened.
+    func testEndRecordThatIsAFIFODoesNotEndALiveAppsSession() throws {
+        try writeLiveSession()
+        let fifo = try FIFOWatch(at: fx.endedSession)
+        defer { fifo.stop() }
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+
+        try assertSessionKept(try fx.run(fx.backstop))
+
+        XCTAssertFalse(fifo.readerSeen, "ended-session.json was opened although it is a FIFO")
+        XCTAssertEqual(calls(), [batteryRead, thermalRead])
+        XCTAssertFalse(fx.exists(fx.endedSession))
+    }
+
+    /// A FIFO there that cannot be removed either, with session.json that
+    /// cannot be removed: recording the end compares and replaces, and
+    /// neither opens the FIFO. Sleep is restored and the run exits 1.
+    func testEndRecordFIFOThatCannotBeReplacedIsNeverOpenedWhenRecordingTheEnd() throws {
+        try writeLiveSession()
+        try setImmutable(fx.session, true)
+        let fifo = try FIFOWatch(at: fx.endedSession)
+        defer { fifo.stop() }
+        try setImmutable(fx.endedSession, true)
+        defer { try? setImmutable(fx.endedSession, false) }
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 1, r.stderr + fx.log())
+        XCTAssertFalse(fifo.readerSeen, "ended-session.json was opened although it is a FIFO")
+        XCTAssertTrue(fifo.isStillFIFO)
+        XCTAssertEqual(calls(), [sleepRestored])
+        XCTAssertTrue(fx.log().contains("could not remove \(fx.session.path) or record its end"), fx.log())
+    }
+
+    /// config.json is read only as a regular file, like session.json and
+    /// state.json. A FIFO there reads as a missing file: the defaults apply
+    /// (10% floor, thermal rules on), so both reads run and the session
+    /// stands. plutil on macOS 26 refuses a FIFO by itself, so this pins
+    /// the outcome; the regular-file check does not rely on that.
+    func testConfigThatIsAFIFOIsNeverOpenedAndTheDefaultsApply() throws {
+        try writeLiveSession()
+        let fifo = try FIFOWatch(at: fx.config)
+        defer { fifo.stop() }
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+
+        try assertSessionKept(try fx.run(fx.backstop))
+
+        XCTAssertFalse(fifo.readerSeen, "config.json was opened although it is a FIFO")
+        XCTAssertTrue(fifo.isStillFIFO)
+        XCTAssertEqual(calls(), [batteryRead, thermalRead])
+    }
+
+    /// The log is appended to only as a regular file. Most lines are written
+    /// under the recovery lock, and open(2) for writing on a FIFO with no
+    /// reader blocks. The test holds a read end open, so a write lands in
+    /// the FIFO's buffer instead of hanging the run, and the buffer must
+    /// stay empty. The lines are dropped; the session still ends.
+    func testLogThatIsAFIFOIsNeverWrittenAndTheSessionStillEnds() throws {
+        try writeLiveSession()
+        try FileManager.default.createDirectory(at: fx.logFile.deletingLastPathComponent(), withIntermediateDirectories: true)
+        XCTAssertEqual(mkfifo(fx.logFile.path, 0o600), 0)
+        let reader = open(fx.logFile.path, O_RDONLY | O_NONBLOCK)
+        XCTAssertGreaterThanOrEqual(reader, 0)
+        defer { close(reader) }
+
+        let r = try fx.run(fx.backstop)
+
+        var buffer = [UInt8](repeating: 0, count: 4096)
+        let n = read(reader, &buffer, buffer.count)
+        XCTAssertLessThanOrEqual(n, 0, "the log FIFO was written: \(String(decoding: buffer.prefix(max(n, 0)), as: UTF8.self))")
+        XCTAssertEqual(r.status, 0, r.stderr)
+        XCTAssertEqual(calls(), [sleepRestored])
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, false)
+        XCTAssertFalse(fx.exists(fx.session))
+        var info = stat()
+        XCTAssertTrue(lstat(fx.logFile.path, &info) == 0 && info.st_mode & S_IFMT == S_IFIFO)
+    }
+
+    /// The relaunch the record exists for. The backstop ends the session of
+    /// an app that died and cannot remove session.json. Insomnia launched
+    /// afterwards finds a valid session.json, sees the record and restores
+    /// instead of resuming. Once the file can be removed, its next reconcile
+    /// removes both.
+    @MainActor
+    func testAppRelaunchedAfterAnEndRecordRestoresInsteadOfResuming() async throws {
+        // Written by the app's Store, so the app reads it as a valid session.
+        try Store(paths: Paths(root: fx.home)).saveSession(Session(startedAt: Date(timeIntervalSinceNow: -600), endsAt: Date(timeIntervalSinceNow: 3600)))
+        try fx.writeState(journalWithSavedBrightness)
+        try setImmutable(fx.session, true)
+        XCTAssertEqual(try fx.run(fx.backstop).status, 1, fx.log())
+        XCTAssertTrue(fx.exists(fx.endedSession))
+
+        let restoreHome = pointInsomniaHome(at: fx.home)
+        defer { restoreHome() }
+        let paths = Paths.fromEnvironment()
+        let sleepGuard = FakeSleepGuard()
+        let display = FakeDisplayDimmer(brightness: 0)
+        let notifier = RecordingNotifier()
+        let m = SessionManager(
+            paths: paths,
+            sleepGuard: sleepGuard,
+            processControl: FakeProcessControl(),
+            backstop: FakeBackstop(),
+            display: display,
+            notifier: notifier,
+            clamshell: { false },
+            recoveryLockTimeout: 2,
+            recoveryRetryDelay: 3600,
+            reassertDelay: .seconds(3600)
+        )
+        await m.reconcile()
+
+        XCTAssertNil(m.session, "the ended session must not come back")
+        XCTAssertFalse(sleepGuard.calls.contains("disablesleep 1"), "\(sleepGuard.calls)")
+        XCTAssertEqual(display.sets.last, 0.6)
+        XCTAssertFalse(try XCTUnwrap(try Store(paths: paths).loadState()).isDirty)
+        XCTAssertTrue(notifier.posts.contains { $0.body.contains("its end is recorded, so a relaunch will not resume it") }, "\(notifier.posts)")
+
+        try setImmutable(fx.session, false)
+        await m.reconcile()
+
+        XCTAssertFalse(fx.exists(fx.session))
+        XCTAssertFalse(fx.exists(fx.endedSession))
+        XCTAssertFalse(sleepGuard.calls.contains("disablesleep 1"), "\(sleepGuard.calls)")
     }
 
     func testExpiredSessionRestoresEverythingAndClearsJournal() throws {
@@ -609,15 +1391,18 @@ final class RecoveryScriptTests: XCTestCase {
     }
 
     /// The fixture's own session, which has every field the decoder needs,
-    /// is a session: a future one keeps sleep disabled and nothing runs.
+    /// is a session: a future one, with the app holding the alive lock,
+    /// keeps sleep disabled, and only the battery and thermal reads run.
     func testCompleteSessionWithAFutureEndsAtIsValid() throws {
         try fx.writeSession(endsAt: Date(timeIntervalSinceNow: 3600))
         try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
 
         let r = try fx.run(fx.backstop)
 
         XCTAssertEqual(r.status, 0, r.stderr + fx.log())
-        XCTAssertEqual(fx.calls(), [])
+        XCTAssertEqual(calls(), [batteryRead, thermalRead], "reads only, nothing privileged")
         XCTAssertTrue(fx.exists(fx.session))
         XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, true)
     }
@@ -709,8 +1494,9 @@ final class RecoveryScriptTests: XCTestCase {
     }
 
     /// A session written with offsets is a session for the backstop too: a
-    /// future one keeps sleep disabled and nothing runs, a past one is
-    /// undone like any expired session.
+    /// future one with the app running keeps sleep disabled, and only the
+    /// battery and thermal reads run. A past one is undone like any expired
+    /// session.
     func testSessionWithOffsetDatesIsReadLikeTheApp() throws {
         let dirty = #"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#
         let f = DateFormatter()
@@ -725,13 +1511,16 @@ final class RecoveryScriptTests: XCTestCase {
 
         try write(endsAt: Date(timeIntervalSinceNow: 3600))
         try fx.writeState(dirty)
+        let app = try fx.holdAliveLock()
         let future = try fx.run(fx.backstop)
+        app.release()
 
         XCTAssertEqual(future.status, 0, future.stderr + fx.log())
-        XCTAssertEqual(fx.calls(), [])
+        XCTAssertEqual(calls(), [batteryRead, thermalRead])
         XCTAssertTrue(fx.exists(fx.session))
         XCTAssertEqual(try String(contentsOf: fx.state, encoding: .utf8), dirty)
 
+        fx.clearCalls()
         try write(endsAt: Date(timeIntervalSinceNow: -60))
         let past = try fx.run(fx.backstop)
 
@@ -984,6 +1773,38 @@ final class RecoveryScriptTests: XCTestCase {
 
         XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
         XCTAssertEqual(try movedAsideSessions(), [notOurs])
+    }
+
+    /// The app renames a config.json it cannot decode to the same shape
+    /// (Store.moveAsideUnreadableConfig). A plain uninstall keeps those
+    /// copies, as it keeps config.json; --purge removes them, and only them:
+    /// another name under the prefix and a directory named like a copy stay.
+    func testUninstallKeepsMovedAsideConfigCopiesAndPurgeRemovesOnlyThose() throws {
+        func movedAsideConfigs() throws -> [String] {
+            try fx.contents(of: fx.home).filter { $0.hasPrefix("config.json.unreadable-") }.sorted()
+        }
+        try fx.installMachinery()
+        let ours = ["config.json.unreadable-20260101T000000Z", "config.json.unreadable-20260101T000000Z-2"]
+        let notOurs = "config.json.unreadable-notes.txt"
+        for name in ours + [notOurs] {
+            try "x".write(to: fx.home.appendingPathComponent(name), atomically: true, encoding: .utf8)
+        }
+        let dir = fx.home.appendingPathComponent("config.json.unreadable-20260101T000000Z-1")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+
+        let kept = try fx.run(fx.uninstall)
+
+        XCTAssertEqual(kept.status, 0, kept.stderr + kept.stdout)
+        XCTAssertEqual(try movedAsideConfigs().count, 4)
+        XCTAssertTrue(kept.stdout.contains("Kept 2 unreadable config.json file(s) moved aside"), kept.stdout)
+        XCTAssertTrue(kept.stdout.contains("Kept \(dir.path): it is named like a moved-aside config.json but is not a regular file"), kept.stdout)
+
+        try fx.installMachinery()
+        let purged = try fx.run(fx.uninstall, ["--purge"])
+
+        XCTAssertEqual(purged.status, 0, purged.stderr + purged.stdout)
+        XCTAssertEqual(try movedAsideConfigs(), [dir.lastPathComponent, notOurs].sorted())
+        XCTAssertTrue(purged.stdout.contains("Left \(dir.path): it is named like a moved-aside config.json but is not a regular file"), purged.stdout)
     }
 
     /// Something that is not a regular file but has a moved-aside name (here
@@ -1489,10 +2310,12 @@ final class RecoveryScriptTests: XCTestCase {
         try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
         try "handoffs\n".write(to: fx.home.appendingPathComponent("Logs/handoffs.log"), atomically: true, encoding: .utf8)
 
+        try "{}".write(to: fx.endedSession, atomically: true, encoding: .utf8)
+
         let r = try fx.run(fx.uninstall, ["--purge"])
 
         XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
-        for gone in [fx.state, fx.config, fx.logFile, fx.home.appendingPathComponent("Logs/handoffs.log"),
+        for gone in [fx.state, fx.config, fx.endedSession, fx.logFile, fx.home.appendingPathComponent("Logs/handoffs.log"),
                      fx.installedBackstop, fx.plist, fx.app, fx.sudoers] {
             XCTAssertFalse(fx.exists(gone), gone.path)
         }
@@ -1502,6 +2325,25 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(try fx.contents(of: fx.home), [".recovery.lock"], "nothing but the lock remains")
         XCTAssertTrue(fx.exists(fx.appsDir))
         XCTAssertTrue(fx.exists(fx.bin), "nothing outside the Insomnia tree is deleted")
+    }
+
+    /// An end record that cannot be removed survives the purge, and the
+    /// purge names it and fails, as for any file it owns, instead of
+    /// reporting everything gone. The rest is still removed.
+    func testUninstallPurgeReportsAnEndRecordItCannotRemove() throws {
+        try fx.installMachinery()
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        try "{}".write(to: fx.endedSession, atomically: true, encoding: .utf8)
+        try setImmutable(fx.endedSession, true)
+
+        let r = try fx.run(fx.uninstall, ["--purge"])
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertTrue(fx.exists(fx.endedSession))
+        XCTAssertTrue(r.stderr.contains("Could not remove \(fx.endedSession.path); left in place."), r.stderr)
+        XCTAssertTrue(r.stderr.contains("Done, except 1 file(s) that could not be removed"), r.stderr)
+        XCTAssertFalse(fx.exists(fx.state))
+        XCTAssertFalse(fx.exists(fx.config))
     }
 
     func testUninstallPurgeNeverDeletesFilesItDidNotCreate() throws {
@@ -1930,7 +2772,8 @@ final class RecoveryScriptTests: XCTestCase {
 
         XCTAssertNotEqual(r.status, 0)
         XCTAssertNil(fx.commandEnded(), "the script returned while the first command was still alive (not released)")
-        XCTAssertEqual(fx.calls(), ["sudo -n \(fx.fakePmset) -a disablesleep 0"], "no second undo while the first is alive")
+        XCTAssertEqual(fx.calls().filter { !$0.hasPrefix("kill -TERM ") }, ["sudo -n \(fx.fakePmset) -a disablesleep 0"], "no second undo while the first is alive, and no SIGKILL")
+        XCTAssertEqual(fx.calls().filter { $0.hasPrefix("kill -TERM ") }.count, 1, "\(fx.calls())")
         let s = try fx.stateJSON()
         XCTAssertEqual(s["sleepDisabledByUs"] as? Bool, true)
         XCTAssertEqual(s["lowPowerSetByUs"] as? Bool, true)
@@ -2476,9 +3319,11 @@ private final class ScriptFixture {
     var install: URL { repoScripts.appendingPathComponent("install.sh") }
     var installRedirected: URL { repoScripts.appendingPathComponent("install.redirected.sh") }
     var session: URL { home.appendingPathComponent("session.json") }
+    var endedSession: URL { home.appendingPathComponent("ended-session.json") }
     var state: URL { home.appendingPathComponent("state.json") }
     var config: URL { home.appendingPathComponent("config.json") }
     var lock: URL { home.appendingPathComponent(".recovery.lock") }
+    var alive: URL { home.appendingPathComponent(".app.alive") }
     var installedBackstop: URL { home.appendingPathComponent("backstop.sh") }
     var logFile: URL { home.appendingPathComponent("Logs/insomnia.log") }
     var plist: URL { home.appendingPathComponent("LaunchAgents/com.insomnia.backstop.plist") }
@@ -2505,6 +3350,9 @@ private final class ScriptFixture {
 
     func destroy() {
         releaseCommand()
+        // A test that failed before clearing the flag must not leave its
+        // temp home behind.
+        for file in [session, endedSession] { try? setImmutable(file, false) }
         try? fm.removeItem(at: root)
     }
 
@@ -2574,6 +3422,8 @@ private final class ScriptFixture {
             "PS": bin.appendingPathComponent("ps").path,
             "KILL": bin.appendingPathComponent("kill").path,
             "SYSCTL": bin.appendingPathComponent("sysctl").path,
+            "NOTIFYUTIL": bin.appendingPathComponent("notifyutil").path,
+            "IOREG": bin.appendingPathComponent("ioreg").path,
             "DEFAULTS": bin.appendingPathComponent("defaults").path,
             "DATE": bin.appendingPathComponent("date").path,
             "LOCK_TIMEOUT_SECONDS": "1",
@@ -2714,9 +3564,73 @@ private final class ScriptFixture {
           *) exit 1 ;;
         esac
         """)
+        // pmset: `-g batt` is the only form the script may run directly. It
+        // prints pmset.batt when the test wrote one ("FAIL": exit 1 with no
+        // output), else a MacBook on AC power at 100%. Any other direct call
+        // is recorded as DIRECT and fails: power changes go through sudo.
         try writeFake("pmset", """
+        if [[ "${1:-}" == -g && "${2:-}" == batt ]]; then
+          printf 'pmset -g batt\\n' >> "\(calls)"
+          if [[ -f "\(r)/pmset.batt" ]]; then
+            [[ "$(cat "\(r)/pmset.batt")" == FAIL ]] && exit 1
+            [[ "$(cat "\(r)/pmset.batt")" == HANG ]] && exec /bin/sleep 60
+            cat "\(r)/pmset.batt"; exit 0
+          fi
+          printf "Now drawing from 'AC Power'\\n -InternalBattery-0 (id=1)\\t100%%; charged; 0:00 remaining present: true\\n"
+          exit 0
+        fi
         printf 'pmset DIRECT %s\\n' "$*" >> "\(calls)"
         exit 99
+        """)
+        // notifyutil -g <key>: prints "<key> <level>" with the level from
+        // thermal.mode (default 0). "FAIL": exit 1 with no output. "GARBAGE":
+        // exit 0 with a line that has no level in it. "HANG": never returns.
+        // "IGNORE_TERM": never returns and ignores SIGTERM; it leaves a child
+        // behind that would keep any descriptor it inherited. "CHECK_FD9":
+        // records whether it or its parent (the read's supervisor) has fd 9
+        // open, then prints level 0. lsof can take seconds on a busy machine,
+        // so a test using it raises the time limit (setCommandTimeout).
+        try writeFake("notifyutil", """
+        printf 'notifyutil %s\\n' "$*" >> "\(calls)"
+        mode="$(cat "\(r)/thermal.mode" 2>/dev/null || echo 0)"
+        [[ "$mode" == FAIL ]] && exit 1
+        [[ "$mode" == HANG ]] && exec /bin/sleep 60
+        if [[ "$mode" == IGNORE_TERM ]]; then
+          trap '' TERM
+          /bin/sleep 5 </dev/null >/dev/null 2>&1 &
+          exec /bin/sleep 60
+        fi
+        if [[ "$mode" == CHECK_FD9 ]]; then
+          [[ -e /dev/fd/9 ]] && printf 'notifyutil had fd 9\\n' >> "\(calls)"
+          [[ -n "$(/usr/sbin/lsof -a -p "$PPID" -d 9 -t 2>/dev/null)" ]] && printf 'notifyutil supervisor had fd 9\\n' >> "\(calls)"
+          printf 'notifyutil checked fd 9\\n' >> "\(calls)"
+          echo "${2:-} 0"; exit 0
+        fi
+        [[ "$mode" == GARBAGE ]] && { echo "something unexpected"; exit 0; }
+        echo "${2:-} $mode"
+        """)
+        // ioreg -r -c AppleSmartBattery -d 1, by battery_service.mode.
+        // "NONE" (the default): no service, so nothing is printed. "BATTERY":
+        // the service, on battery power. "BATTERY_AC": the service with a
+        // charger. "BATTERY_NOKEY": the service without ExternalConnected.
+        // "FAIL": exit 1. "HANG": never returns.
+        try writeFake("ioreg", """
+        printf 'ioreg %s\\n' "$*" >> "\(calls)"
+        mode="$(cat "\(r)/battery_service.mode" 2>/dev/null || echo NONE)"
+        case "$mode" in
+          FAIL) exit 1 ;;
+          HANG) exec /bin/sleep 60 ;;
+          NONE) exit 0 ;;
+        esac
+        echo '+-o AppleSmartBattery  <class AppleSmartBattery, id 0x100000a1b, registered, matched, active, busy 0 (25 ms), retain 9>'
+        echo '    {'
+        echo '      "AppleRawExternalConnected" = No'
+        case "$mode" in
+          BATTERY) echo '      "ExternalConnected" = No' ;;
+          BATTERY_AC) echo '      "ExternalConnected" = Yes' ;;
+        esac
+        echo '      "BatteryInstalled" = Yes'
+        echo '    }'
         """)
         // swift / codesign: install.sh's build and signing steps, redirected
         // to a fake binary inside the fixture.
@@ -2743,10 +3657,20 @@ private final class ScriptFixture {
         done < "\(r)/ps.table"
         exit 1
         """)
+        // kill: a timeout's -TERM or -KILL goes on to the real kill only
+        // for a command the run under test started (its pid is in one of
+        // the run's .backstop.*.pid files), so that command really stops.
+        // Any other pid, such as a journal's frozen pid, is never signalled.
         try writeFake("kill", """
         printf 'kill %s\\n' "$*" >> "\(calls)"
         fail="$(cat "\(r)/kill.fail.mode" 2>/dev/null || true)"
         for f in $fail; do [[ "$f" == "${2:-}" ]] && exit 1; done
+        case "${1:-}" in
+          -TERM|-KILL)
+            if [[ -n "${2:-}" ]] && cat "\(home.path)"/.backstop.*.pid 2>/dev/null | grep -qx -- "$2"; then
+              exec /bin/kill "$1" "$2"
+            fi ;;
+        esac
         exit 0
         """)
         try writeFake("sysctl", """
@@ -2910,6 +3834,43 @@ private final class ScriptFixture {
         try? value.write(to: root.appendingPathComponent("\(name).mode"), atomically: true, encoding: .utf8)
     }
 
+    /// What the fake `pmset -g batt` prints ("FAIL": it fails instead;
+    /// "HANG": it never returns). The fixture default is a MacBook on AC
+    /// power at 100%.
+    func setBattery(_ output: String) {
+        try? output.write(to: root.appendingPathComponent("pmset.batt"), atomically: true, encoding: .utf8)
+    }
+
+    /// `pmset -g batt` as a MacBook prints it, tab and all.
+    func battery(source: String, percent: Int, state: String = "discharging") -> String {
+        "Now drawing from '\(source)'\n -InternalBattery-0 (id=22610019)\t\(percent)%; \(state); 0:41 remaining present: true\n"
+    }
+
+    /// The thermal pressure level the fake notifyutil reports (default 0),
+    /// or "FAIL" / "GARBAGE" / "HANG".
+    func setThermal(_ mode: String) {
+        setMode("thermal", mode)
+    }
+
+    /// What the fake ioreg reports for AppleSmartBattery: "NONE" (the
+    /// default, a desktop), "BATTERY", "BATTERY_AC", "BATTERY_NOKEY",
+    /// "FAIL" or "HANG".
+    func setBatteryService(_ mode: String) {
+        setMode("battery_service", mode)
+    }
+
+    func writeConfig(_ json: String) throws {
+        try json.write(to: config, atomically: true, encoding: .utf8)
+    }
+
+    /// Sets COMMAND_TIMEOUT_SECONDS in this fixture's copy of backstop.sh,
+    /// for a fake command that needs more than the default 1 s to look
+    /// around before it answers.
+    func setCommandTimeout(_ seconds: Int) throws {
+        let text = try String(contentsOf: backstop, encoding: .utf8)
+        try Self.patch(text, ["COMMAND_TIMEOUT_SECONDS": "\(seconds)"]).write(to: backstop, atomically: true, encoding: .utf8)
+    }
+
     func psTable(_ rows: [(pid: Int, lstart: String, stat: String, uid: String)]) throws {
         let text = rows.map { "\($0.pid)|\($0.lstart)|\($0.stat)|\($0.uid)" }.joined(separator: "\n") + "\n"
         try text.write(to: root.appendingPathComponent("ps.table"), atomically: true, encoding: .utf8)
@@ -2983,10 +3944,6 @@ private final class ScriptFixture {
         try json.write(to: state, atomically: true, encoding: .utf8)
     }
 
-    func writeConfig(_ json: String) throws {
-        try json.write(to: config, atomically: true, encoding: .utf8)
-    }
-
     func writeSession(endsAt: Date) throws {
         let f = DateFormatter()
         f.locale = Locale(identifier: "en_US_POSIX")
@@ -3027,6 +3984,12 @@ private final class ScriptFixture {
 
     func clearCalls() {
         try? fm.removeItem(at: callsLog)
+    }
+
+    /// Removes the backstop's log, so a loop's next case cannot pass on a
+    /// line an earlier case wrote.
+    func clearLog() {
+        try? fm.removeItem(at: logFile)
     }
 
     func log() -> String {
@@ -3079,6 +4042,15 @@ private final class ScriptFixture {
         return (p.terminationStatus,
                 (try? String(contentsOf: outURL, encoding: .utf8)) ?? "",
                 (try? String(contentsOf: errURL, encoding: .utf8)) ?? "")
+    }
+
+    /// Holds the alive lock the way the running app does, with its own type
+    /// (AppAliveLock.swift), in this process until the test releases it. No
+    /// timer: it cannot run out between the script runs of a slow test.
+    func holdAliveLock() throws -> AppAliveLock {
+        let lock = AppAliveLock(url: alive)
+        guard try lock.tryAcquire() else { throw FixtureError("could not take \(alive.lastPathComponent): another holder has it") }
+        return lock
     }
 
     /// A lockf process that holds the recovery lock.

@@ -57,10 +57,18 @@ struct Paths: Sendable, Equatable {
     }
 
     var sessionFile: URL { appSupport.appendingPathComponent("session.json") }
+    /// Written when a session is ended but session.json cannot be removed (an
+    /// immutable file): a copy of that file's exact bytes. While the two
+    /// match, the session is over whatever its endsAt says. backstop.sh
+    /// writes and honours the same file.
+    var endedSessionFile: URL { appSupport.appendingPathComponent("ended-session.json") }
     /// Where an unreadable session.json goes: this prefix, a UTC stamp
     /// (yyyyMMddTHHmmssZ) and, if that name is taken, -1, -2, ... The same
     /// shape is produced by backstop.sh and removed by `uninstall.sh --purge`.
     static let unreadableSessionPrefix = "session.json.unreadable-"
+    /// Where a config.json that does not decode goes at launch, named the
+    /// same way. Only the app moves it; `uninstall.sh --purge` removes it.
+    static let unreadableConfigPrefix = "config.json.unreadable-"
     var stateFile: URL { appSupport.appendingPathComponent("state.json") }
     var configFile: URL { appSupport.appendingPathComponent("config.json") }
     /// Installed copy of scripts/backstop.sh, placed there by install.sh.
@@ -68,6 +76,10 @@ struct Paths: Sendable, Equatable {
     /// flock(2) file shared with backstop.sh (`lockf -k` on the same path).
     /// Created once, never unlinked, so both sides lock the same inode.
     var recoveryLock: URL { appSupport.appendingPathComponent(".recovery.lock") }
+    /// flock(2) file the app holds for its whole lifetime (`AppAliveLock`).
+    /// backstop.sh probes it without waiting: acquiring it means no Insomnia
+    /// process is alive, and a valid session is then ended. Never unlinked.
+    var appAliveFile: URL { appSupport.appendingPathComponent(".app.alive") }
     /// Written by scripts/simulate-lid.sh ("closed" or "open") to drive the
     /// lid-close action path without touching the hinge. See LidSimulation.
     var simulateLidFile: URL { appSupport.appendingPathComponent("simulate-lid") }

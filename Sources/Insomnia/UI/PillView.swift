@@ -19,6 +19,8 @@ struct PillView: View {
     let focusBounce: Int
     let rejectBounce: Int
     let reduceMotion: Bool
+    /// `Config.maxDuration`, for the Days tooltip.
+    let maxDuration: TimeInterval
     let onTap: () -> Void
 
     private var shape: RoundedRectangle { RoundedRectangle(cornerRadius: 7, style: .continuous) }
@@ -58,7 +60,7 @@ struct PillView: View {
         }
         .environment(\.colorScheme, .dark)
         .contentShape(Rectangle())
-        .help(field.help)
+        .help(field.help(maxDuration: maxDuration))
         .onTapGesture(perform: onTap)
         .phaseAnimator([CGFloat(1), Motion.bounceScale(reduceMotion: reduceMotion), 1], trigger: focused ? focusBounce : 0) { content, scale in
             content.scaleEffect(scale)

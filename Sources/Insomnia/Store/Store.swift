@@ -85,6 +85,13 @@ struct Store: Sendable {
     /// Returns nil when the file does not exist. Throws on unreadable or
     /// undecodable content.
     func read<T: Decodable>(_ type: T.Type, from url: URL) throws -> T? {
+        guard let data = try readData(from: url) else { return nil }
+        return try Store.makeDecoder().decode(T.self, from: data)
+    }
+
+    /// The file's bytes, or nil when it does not exist. Throws when it
+    /// cannot be read or is not a regular file.
+    func readData(from url: URL) throws -> Data? {
         guard FileManager.default.fileExists(atPath: url.path) else { return nil }
         // Only a regular file is opened. open(2) on a FIFO with no writer
         // blocks, and these reads run on the main actor under the recovery
@@ -96,13 +103,15 @@ struct Store: Sendable {
         if stat(url.path, &info) == 0, info.st_mode & S_IFMT != S_IFREG {
             throw StoreError.notRegularFile(file: url.path)
         }
-        let data = try Data(contentsOf: url)
-        return try Store.makeDecoder().decode(T.self, from: data)
+        return try Data(contentsOf: url)
     }
 
     /// Atomic write: temp file + rename(2).
     func write<T: Encodable>(_ value: T, to url: URL) throws {
-        let data = try Store.makeEncoder().encode(value)
+        try write(data: Store.makeEncoder().encode(value), to: url)
+    }
+
+    private func write(data: Data, to url: URL) throws {
         let dir = url.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let tmp = dir.appendingPathComponent(".\(url.lastPathComponent).tmp-\(UUID().uuidString)")
@@ -132,7 +141,44 @@ struct Store: Sendable {
         }
     }
     func saveSession(_ s: Session) throws { try write(s, to: paths.sessionFile) }
-    func deleteSession() throws { try remove(at: paths.sessionFile) }
+    /// Removes session.json, then the record of its end, which means
+    /// something only while the file it copies is there. A record that
+    /// cannot be removed is left and logged: it matches no later
+    /// session.json, but it is still a copy of the session's times.
+    func deleteSession() throws {
+        try remove(at: paths.sessionFile)
+        do {
+            try remove(at: paths.endedSessionFile)
+        } catch {
+            Log.error("could not remove \(paths.endedSessionFile.path) (\(error.localizedDescription)); it matches no session.json, so it ends nothing, but it stays until removed by hand")
+        }
+    }
+
+    /// Whether session.json is a session already ended: ended-session.json
+    /// holds its exact bytes (`recordSessionEnd`, or backstop.sh's
+    /// record_end). False when either file is missing, unreadable, or not
+    /// a regular file; the 1 Hz tick calls this, so neither is ever opened
+    /// unless it is one.
+    func sessionEndIsRecorded() -> Bool {
+        guard let recorded = try? readData(from: paths.endedSessionFile),
+              let current = try? readData(from: paths.sessionFile) else { return false }
+        return recorded == current
+    }
+
+    /// For an end that could not remove session.json: copies its bytes to
+    /// ended-session.json, so this app after a relaunch and backstop.sh treat
+    /// the session as over. True only when the record now matches the file.
+    func recordSessionEnd() -> Bool {
+        if sessionEndIsRecorded() { return true }
+        guard let current = try? readData(from: paths.sessionFile) else { return false }
+        do {
+            try write(data: current, to: paths.endedSessionFile)
+        } catch {
+            return false
+        }
+        return sessionEndIsRecorded()
+    }
+
     /// Whether anything is at session.json, a dangling symlink included.
     /// lstat(2) only: the entry is never opened.
     func sessionEntryExists() -> Bool {
@@ -146,14 +192,25 @@ struct Store: Sendable {
     /// Never overwrites: a taken name gets -1, -2, ..., and the rename
     /// itself fails rather than replace a file that appeared meanwhile.
     func moveAsideUnreadableSession(now: Date) throws -> URL {
-        let base = Paths.unreadableSessionPrefix + Self.stamp(now)
+        try moveAside(paths.sessionFile, prefix: Paths.unreadableSessionPrefix, now: now)
+    }
+
+    /// The same for a config.json that does not decode (see Paths.
+    /// unreadableConfigPrefix): it holds the user's settings, so it is kept
+    /// for a person to fix rather than written over with defaults.
+    func moveAsideUnreadableConfig(now: Date) throws -> URL {
+        try moveAside(paths.configFile, prefix: Paths.unreadableConfigPrefix, now: now)
+    }
+
+    private func moveAside(_ file: URL, prefix: String, now: Date) throws -> URL {
+        let base = prefix + Self.stamp(now)
         var dest = paths.appSupport.appendingPathComponent(base)
         var n = 0
         while FileManager.default.fileExists(atPath: dest.path) {
             n += 1
             dest = paths.appSupport.appendingPathComponent("\(base)-\(n)")
         }
-        try FileManager.default.moveItem(at: paths.sessionFile, to: dest)
+        try FileManager.default.moveItem(at: file, to: dest)
         return dest
     }
 
@@ -179,8 +236,22 @@ struct Store: Sendable {
     }
     func saveState(_ s: RuntimeState) throws { try write(s, to: paths.stateFile) }
 
-    func loadConfig() throws -> Config? { try read(Config.self, from: paths.configFile) }
+    /// Throws StoreError.unreadable, with a one-line reason, when the file
+    /// does not decode.
+    func loadConfig() throws -> Config? {
+        do {
+            return try read(Config.self, from: paths.configFile)
+        } catch let error as DecodingError {
+            throw StoreError.unreadable(file: paths.configFile.path, detail: Self.brief(error))
+        }
+    }
     func saveConfig(_ c: Config) throws { try write(c, to: paths.configFile) }
+
+    /// False for a config.json written before `configVersion` existed.
+    func configHasVersion() throws -> Bool {
+        let object = try JSONSerialization.jsonObject(with: Data(contentsOf: paths.configFile))
+        return (object as? [String: Any])?["configVersion"] != nil
+    }
 
     /// One line about why decoding failed, fit for a notification.
     private static func brief(_ error: DecodingError) -> String {

@@ -13,7 +13,12 @@ the sensitive details, and wait for the maintainer to arrange one.
 
 The installer grants the user account passwordless access to four exact pmset
 commands listed in the README. This grant is not exclusive to the Insomnia app:
-other processes running as that user can invoke them too. The app is not
+other processes running as that user can invoke them too. The liveness lock
+the backstop probes (`.app.alive` in Application Support) is an flock(2) any
+process running as that user can hold; a process holding it stops the backstop
+from noticing that Insomnia has quit. Only that check is lost: the backstop
+still ends the session at its deadline, below the battery end floor, or at
+critical thermal pressure. The app is not
 sandboxed; local logs can contain SSIDs, process metadata, and tmux target names.
 The lines the app writes to `insomnia.log` also reach the unified log with the
 body marked private, so programs reading `log show` see `<private>` instead of

@@ -4,11 +4,13 @@ import XCTest
 final class ConfigTests: XCTestCase {
     func testDefaults() {
         let c = Config()
-        XCTAssertEqual(c.presets, [1800, 3600, 7200, 14400, 28800, 43200, 86400, 259200])
+        XCTAssertEqual(c.presets, [1800, 3600, 7200, 14400, 28800, 43200, 86400])
         XCTAssertEqual(c.lowPowerFloor, 40)
         XCTAssertEqual(c.endFloor, 10)
         XCTAssertEqual(c.nudgeThreshold, 90)
-        XCTAssertEqual(c.maxDuration, 30 * 24 * 3600)
+        XCTAssertEqual(c.maxDuration, 24 * 3600)
+        XCTAssertTrue(c.presets.allSatisfy { $0 <= c.maxDuration }, "no shipped preset may exceed the maximum")
+        XCTAssertLessThanOrEqual(c.defaultPreset, c.maxDuration)
         XCTAssertEqual(c.freezeList, ["com.tinyspeck.slackmacgap", "net.whatsapp.WhatsApp", "com.hnc.Discord"])
         XCTAssertTrue(c.agentList.contains("com.apple.Terminal"))
         XCTAssertTrue(c.agentList.contains("com.t3tools.t3code"))
@@ -155,6 +157,125 @@ final class ConfigTests: XCTestCase {
         let old = try Store.makeDecoder().decode(Config.self, from: Data(#"{"muteOnLidClose": true}"#.utf8))
         XCTAssertTrue(old.lowPowerOnLidClose)
         XCTAssertTrue(old.muteOnLidClose)
+    }
+
+    /// The 24-hour ceiling is the decoder's default too, so an older
+    /// config.json without the key gets it; a written value is kept, so a
+    /// user who raised it in config.json keeps the longer sessions.
+    func testMaxDurationDefaultsTo24HoursAndAnExplicitValueIsKept() throws {
+        let old = try Store.makeDecoder().decode(Config.self, from: Data(#"{"lowPowerFloor": 25}"#.utf8))
+        XCTAssertEqual(old.maxDuration, 24 * 3600)
+        let raised = try Store.makeDecoder().decode(Config.self, from: Data(#"{"maxDuration": 604800}"#.utf8))
+        XCTAssertEqual(raised.maxDuration, 7 * 24 * 3600)
+    }
+
+    /// Settings saves the whole struct, so every ordinary config.json from an
+    /// older build holds that build's defaults (30 days, a 3-day preset) as
+    /// explicit values. Exactly those read as the current defaults; any other
+    /// value was chosen by hand and is kept, a 3-day preset included, unless
+    /// the ceiling it sits under was not (see the next test).
+    func testLegacyDefaultsSavedByOlderBuildsReadAsTheCurrentDefaults() throws {
+        let saved = #"{"maxDuration": 2592000, "presets": [1800, 3600, 7200, 14400, 28800, 43200, 86400, 259200]}"#
+        let migrated = try Store.makeDecoder().decode(Config.self, from: Data(saved.utf8))
+        XCTAssertEqual(migrated.maxDuration, 24 * 3600)
+        XCTAssertEqual(migrated.presets, Config.defaultPresets)
+        XCTAssertEqual(migrated, Config())
+
+        let custom = #"{"maxDuration": 604800, "presets": [3600, 259200]}"#
+        let kept = try Store.makeDecoder().decode(Config.self, from: Data(custom.utf8))
+        XCTAssertEqual(kept.maxDuration, 7 * 24 * 3600)
+        XCTAssertEqual(kept.presets, [3600, 259200])
+
+        // A customized list that still has the old default's shape minus one
+        // entry is not the old default: it is kept, minus the entry above
+        // the 24-hour ceiling it now sits under.
+        let trimmed = #"{"presets": [1800, 3600, 7200, 14400, 28800, 43200, 259200]}"#
+        XCTAssertEqual(try Store.makeDecoder().decode(Config.self, from: Data(trimmed.utf8)).presets, [1800, 3600, 7200, 14400, 28800, 43200])
+    }
+
+    /// An older build could have the 3-day preset as its default. Once the
+    /// 30-day ceiling the user never chose becomes 24 hours, that default
+    /// would make bare Enter refuse, so it moves to the largest preset left
+    /// under the ceiling, and presets above the ceiling go (Settings refuses
+    /// to add them). A ceiling the user set keeps everything as it was.
+    @MainActor
+    func testADefaultAboveTheMigratedCeilingMovesToTheLargestPresetUnderIt() throws {
+        func decode(_ json: String) throws -> Config {
+            try Store.makeDecoder().decode(Config.self, from: Data(json.utf8))
+        }
+        func bareEnter(_ c: Config) -> MenuBarModel.CommitAction {
+            MenuBarModel.commitAction(mode: .start, typed: nil, defaultPreset: c.defaultPreset, maxDuration: c.maxDuration)
+        }
+
+        let stock = try decode(#"{"maxDuration": 2592000, "presets": [1800, 3600, 7200, 14400, 28800, 43200, 86400, 259200], "defaultPreset": 259200}"#)
+        XCTAssertEqual(stock.maxDuration, 24 * 3600)
+        XCTAssertEqual(stock.presets, Config.defaultPresets)
+        XCTAssertEqual(stock.defaultPreset, 24 * 3600)
+        XCTAssertEqual(bareEnter(stock), .run(24 * 3600))
+
+        let trimmed = try decode(#"{"maxDuration": 2592000, "presets": [1800, 3600, 7200, 14400, 28800, 43200, 259200], "defaultPreset": 259200}"#)
+        XCTAssertEqual(trimmed.presets, [1800, 3600, 7200, 14400, 28800, 43200])
+        XCTAssertEqual(trimmed.defaultPreset, 12 * 3600)
+        XCTAssertEqual(bareEnter(trimmed), .run(12 * 3600))
+
+        // Nothing left under the ceiling: the stock default.
+        let onlyLong = try decode(#"{"presets": [259200], "defaultPreset": 259200}"#)
+        XCTAssertEqual(onlyLong.presets, [])
+        XCTAssertEqual(onlyLong.defaultPreset, Config().defaultPreset)
+        XCTAssertEqual(bareEnter(onlyLong), .run(Config().defaultPreset))
+
+        // A default that still fits stays where the user put it.
+        let fits = try decode(#"{"maxDuration": 2592000, "presets": [1800, 3600, 7200, 14400, 28800, 43200, 86400, 259200], "defaultPreset": 7200}"#)
+        XCTAssertEqual(fits.defaultPreset, 7200)
+
+        // A ceiling set by hand keeps the 3-day default; only the stock list changes.
+        let raised = try decode(#"{"maxDuration": 604800, "presets": [1800, 3600, 7200, 14400, 28800, 43200, 86400, 259200], "defaultPreset": 259200}"#)
+        XCTAssertEqual(raised.maxDuration, 7 * 24 * 3600)
+        XCTAssertEqual(raised.presets, Config.defaultPresets)
+        XCTAssertEqual(raised.defaultPreset, 3 * 24 * 3600)
+        XCTAssertEqual(bareEnter(raised), .run(3 * 24 * 3600))
+    }
+
+    /// Only a file without `configVersion` can hold an older build's stock
+    /// values. A current file's 30-day ceiling was set by hand and is kept,
+    /// with the presets and default under it.
+    func testACurrentFileKeepsA30DayCeilingSetByHand() throws {
+        let json = #"{"configVersion": 2, "maxDuration": 2592000, "presets": [1800, 3600, 7200, 14400, 28800, 43200, 86400, 259200], "defaultPreset": 259200}"#
+        let c = try Store.makeDecoder().decode(Config.self, from: Data(json.utf8))
+        XCTAssertEqual(c.maxDuration, 30 * 24 * 3600)
+        XCTAssertEqual(c.presets, Config.legacyPresets)
+        XCTAssertEqual(c.defaultPreset, 3 * 24 * 3600)
+
+        let written = try XCTUnwrap(JSONSerialization.jsonObject(with: Store.makeEncoder().encode(Config())) as? [String: Any])
+        XCTAssertEqual(written["configVersion"] as? Int, 2)
+    }
+
+    /// The app reads an older file with the stock values migrated and writes
+    /// it back once with the marker, so a 30-day ceiling typed into that file
+    /// afterwards is the user's. A current file is not rewritten at launch.
+    @MainActor
+    func testAnOlderFileIsWrittenBackOnceSoALaterHandEditIsKept() throws {
+        let h = Harness()
+        defer { h.home.destroy() }
+        let url = h.home.paths.configFile
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data(#"{"maxDuration": 2592000, "presets": [1800, 3600, 7200, 14400, 28800, 43200, 86400, 259200], "defaultPreset": 259200, "endFloor": 15}"#.utf8).write(to: url)
+
+        let upgraded = h.makeManager()
+        XCTAssertEqual(upgraded.config.maxDuration, 24 * 3600)
+        XCTAssertEqual(upgraded.config.defaultPreset, 24 * 3600)
+        XCTAssertEqual(upgraded.config.endFloor, 15)
+        var onDisk = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
+        XCTAssertEqual(onDisk["configVersion"] as? Int, 2)
+        XCTAssertEqual(onDisk["maxDuration"] as? Double, 24 * 3600)
+        XCTAssertEqual(onDisk["endFloor"] as? Int, 15)
+
+        onDisk["maxDuration"] = 2592000
+        let handEdited = try JSONSerialization.data(withJSONObject: onDisk)
+        try handEdited.write(to: url)
+        let later = h.makeManager()
+        XCTAssertEqual(later.config.maxDuration, 30 * 24 * 3600)
+        XCTAssertEqual(try Data(contentsOf: url), handEdited, "a current file is read, not rewritten")
     }
 
     func testEmptyObjectIsDefaults() throws {
@@ -312,5 +433,243 @@ final class ConfigLoadTests: XCTestCase {
 
         XCTAssertEqual(m.config, fine)
         XCTAssertFalse(log().contains("battery floors corrected"), log())
+    }
+
+    private func writeConfig(_ json: String) throws -> Data {
+        try h.home.paths.createDirectories()
+        let data = Data(json.utf8)
+        try data.write(to: h.home.paths.configFile)
+        return data
+    }
+
+    private func movedAsideConfigs() throws -> [String] {
+        try FileManager.default.contentsOfDirectory(atPath: h.home.paths.appSupport.path)
+            .filter { $0.hasPrefix(Paths.unreadableConfigPrefix) }.sorted()
+    }
+
+    /// The marker's presence is what makes a file current; its value is
+    /// never read. A hand-edited "2" keeps every setting, the 30-day
+    /// ceiling included, and the file is neither migrated nor rewritten.
+    func testAVersionMarkerOfAnotherTypeKeepsTheSettings() async throws {
+        let json = #"{"configVersion": "2", "maxDuration": 2592000, "endFloor": 30, "lowPowerFloor": 40, "freezeAllApps": false}"#
+        let written = try writeConfig(json)
+
+        let m = h.makeManager()
+        await m.reconcile()
+
+        XCTAssertEqual(m.config.maxDuration, 30 * 24 * 3600)
+        XCTAssertEqual([m.config.endFloor, m.config.lowPowerFloor], [30, 40])
+        XCTAssertFalse(m.config.freezeAllApps)
+        XCTAssertEqual(try Data(contentsOf: h.home.paths.configFile), written)
+        XCTAssertEqual(try movedAsideConfigs(), [])
+        XCTAssertFalse(h.notifier.posts.contains { $0.title == SessionManager.configFileTitle })
+    }
+
+    /// A file this build cannot decode is the user's settings with one bad
+    /// value or a typo. It is renamed aside with its bytes, never written
+    /// over; config.json then holds the defaults the app runs on, and the
+    /// first reconcile says where the file went, once.
+    func testAConfigThatDoesNotDecodeIsMovedAsideNotOverwritten() async throws {
+        let cases = [
+            #"{"configVersion": 2, "endFloor": "30", "freezeAllApps": false}"#,
+            #"{"configVersion": 2, "endFloor": 30"#,
+        ]
+        for json in cases {
+            h.home.destroy()
+            h = Harness()
+            let written = try writeConfig(json)
+
+            let m = h.makeManager()
+
+            XCTAssertEqual(m.config, Config(), json)
+            XCTAssertEqual(try movedAsideConfigs(), ["config.json.unreadable-20270115T080000Z"], json)
+            let moved = h.home.paths.appSupport.appendingPathComponent("config.json.unreadable-20270115T080000Z")
+            XCTAssertEqual(try Data(contentsOf: moved), written, json)
+            XCTAssertEqual(try h.store.loadConfig(), Config(), json)
+            XCTAssertTrue(log().contains("[error] insomnia: config.json could not be read ("), log())
+
+            await m.reconcile()
+            await m.reconcile()
+            let notices = h.notifier.posts.filter { $0.title == SessionManager.configFileTitle }
+            XCTAssertEqual(notices.count, 1, "\(notices)")
+            XCTAssertTrue(notices.first?.body.contains("It was moved to \(moved.path)") == true, "\(notices)")
+        }
+    }
+
+    /// When the rename fails, nothing is written over the file: the app runs
+    /// on defaults and says the file was left as it is, and how to fix it.
+    /// The rename keeps failing in reconcile's transaction, which sets
+    /// `rejectedConfigFile` without a second notification.
+    func testAConfigThatCannotBeMovedAsideIsLeftAsItIs() async throws {
+        let written = try writeConfig(rejectedConfig)
+        let file = h.home.paths.configFile
+        try setImmutable(file, true)
+        defer { try? setImmutable(file, false) }
+
+        let m = h.makeManager()
+
+        XCTAssertEqual(m.config, Config())
+        XCTAssertEqual(try Data(contentsOf: file), written)
+        XCTAssertEqual(try movedAsideConfigs(), [])
+        await m.reconcile()
+        XCTAssertNotNil(m.rejectedConfigFile)
+        let notices = h.notifier.posts.filter { $0.title == SessionManager.configFileTitle }
+        XCTAssertEqual(notices.count, 1, "\(notices)")
+        XCTAssertTrue(notices.first?.body.contains("left the file as it is") == true, "\(notices)")
+        XCTAssertTrue(notices.first?.body.contains("Make \(file.path) writable or delete it.") == true, "\(notices)")
+    }
+
+    // MARK: config.json rejected in place
+
+    /// The app's decoder refuses this file (freezeList is not a list), but
+    /// its endFloor and thermalRules are valid scalars that backstop.sh
+    /// reads by itself: a 0% floor and no thermal rule.
+    private let rejectedConfig = #"{"endFloor": 0, "thermalRules": false, "freezeList": 42}"#
+
+    /// While a file the app rejects cannot be moved aside, the agent would
+    /// enforce its cutoffs, not the app's defaults, so Start changes nothing
+    /// and says which file to fix and how. Once the file can be renamed,
+    /// the next Start moves it aside, writes the settings in use back, and
+    /// starts.
+    func testStartIsRefusedWhileARejectedConfigCannotBeMovedAside() async throws {
+        let written = try writeConfig(rejectedConfig)
+        let file = h.home.paths.configFile
+        try setImmutable(file, true)
+        defer { try? setImmutable(file, false) }
+        let m = h.makeManager()
+        await m.reconcile()
+
+        await m.start(duration: 3600)
+
+        XCTAssertFalse(m.isActive)
+        XCTAssertNil(try h.store.loadSession())
+        XCTAssertEqual(try h.store.loadState() ?? .clean, RuntimeState.clean)
+        XCTAssertFalse(h.guardFake.calls.contains("disablesleep 1"), "\(h.guardFake.calls)")
+        XCTAssertEqual(h.backstop.arms, 0)
+        XCTAssertEqual(try Data(contentsOf: file), written)
+        XCTAssertEqual(try movedAsideConfigs(), [])
+        XCTAssertTrue(m.lastError?.hasPrefix("start refused, nothing changed: config.json could not be read (") == true, m.lastError ?? "nil")
+        let refusal = h.notifier.posts.last
+        XCTAssertEqual(refusal?.title, SessionManager.configFileTitle)
+        XCTAssertTrue(refusal?.body.hasPrefix("Insomnia did not start a session. config.json could not be read (") == true, "\(String(describing: refusal))")
+        XCTAssertTrue(refusal?.body.hasSuffix("Make \(file.path) writable or delete it.") == true, "\(String(describing: refusal))")
+
+        try setImmutable(file, false)
+        await m.start(duration: 3600)
+
+        XCTAssertTrue(m.isActive)
+        XCTAssertTrue(h.guardFake.calls.contains("disablesleep 1"))
+        XCTAssertNil(m.rejectedConfigFile)
+        let moved = h.home.paths.appSupport.appendingPathComponent("config.json.unreadable-20270115T080000Z")
+        XCTAssertEqual(try movedAsideConfigs(), [moved.lastPathComponent])
+        XCTAssertEqual(try Data(contentsOf: moved), written)
+        XCTAssertEqual(try h.store.loadConfig(), m.config)
+        XCTAssertTrue(h.notifier.posts.contains { $0.title == SessionManager.configFileTitle && $0.body.contains("It was moved to \(moved.path)") }, "\(h.notifier.posts)")
+    }
+
+    /// Deleting the file is the other fix. The agent then reads its
+    /// defaults, which are the settings the app fell back to, and Start
+    /// goes ahead.
+    func testStartGoesAheadOnceTheRejectedConfigIsDeleted() async throws {
+        _ = try writeConfig(rejectedConfig)
+        let file = h.home.paths.configFile
+        try setImmutable(file, true)
+        defer { try? setImmutable(file, false) }
+        let m = h.makeManager()
+        await m.reconcile()
+        await m.start(duration: 3600)
+        XCTAssertFalse(m.isActive)
+
+        try setImmutable(file, false)
+        try FileManager.default.removeItem(at: file)
+        await m.start(duration: 3600)
+
+        XCTAssertTrue(m.isActive)
+        XCTAssertEqual(m.config, Config())
+        XCTAssertEqual(try movedAsideConfigs(), [])
+    }
+
+    /// A session already running when config.json becomes a file the app
+    /// rejects and cannot move ends at the next transaction, through the
+    /// normal end: sleep restored, session.json removed, the journal clean,
+    /// and a notification that names the file. The file is left as it is,
+    /// and the next Start is refused.
+    func testARunningSessionEndsAtTheNextTransactionOnceConfigIsRejectedInPlace() async throws {
+        let m = h.makeManager()
+        await m.reconcile()
+        await m.start(duration: 3600)
+        XCTAssertTrue(m.isActive)
+        let written = try writeConfig(rejectedConfig)
+        let file = h.home.paths.configFile
+        try setImmutable(file, true)
+        defer { try? setImmutable(file, false) }
+
+        await m.extend(by: 600)
+
+        XCTAssertFalse(m.isActive)
+        XCTAssertNil(try h.store.loadSession())
+        XCTAssertEqual(try h.store.loadState() ?? .clean, RuntimeState.clean)
+        XCTAssertTrue(h.guardFake.calls.contains("disablesleep 0"), "\(h.guardFake.calls)")
+        XCTAssertFalse(h.guardFake.sleepDisabled)
+        XCTAssertEqual(try Data(contentsOf: file), written)
+        let end = h.notifier.posts.last
+        XCTAssertEqual(end?.title, "Session ended")
+        XCTAssertTrue(end?.body.contains("Make \(file.path) writable or delete it.") == true, "\(String(describing: end))")
+        XCTAssertTrue(log().contains("session end (settingsFileRejected)"), log())
+
+        await m.start(duration: 3600)
+        XCTAssertFalse(m.isActive)
+        XCTAssertEqual(h.guardFake.calls.filter { $0 == "disablesleep 1" }.count, 1)
+    }
+
+    /// At launch, a valid session on disk is not resumed while config.json
+    /// is rejected in place. Reconcile ends it from the journal instead.
+    func testReconcileEndsAValidSessionInsteadOfResumingItWhileConfigIsRejected() async throws {
+        let now = h.clock.now
+        try h.store.saveSession(Session(startedAt: now.addingTimeInterval(-600), endsAt: now.addingTimeInterval(3600)))
+        var st = RuntimeState()
+        st.sleepDisabledByUs = true
+        try h.store.saveState(st)
+        h.guardFake.sleepDisabled = true
+        _ = try writeConfig(rejectedConfig)
+        let file = h.home.paths.configFile
+        try setImmutable(file, true)
+        defer { try? setImmutable(file, false) }
+
+        let m = h.makeManager()
+        await m.reconcile()
+
+        XCTAssertFalse(m.isActive)
+        XCTAssertFalse(h.guardFake.calls.contains("disablesleep 1"), "\(h.guardFake.calls)")
+        XCTAssertTrue(h.guardFake.calls.contains("disablesleep 0"), "\(h.guardFake.calls)")
+        XCTAssertNil(try h.store.loadSession())
+        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
+        XCTAssertEqual(h.backstop.arms, 0)
+        let end = h.notifier.posts.last
+        XCTAssertEqual(end?.title, "Session restored")
+        XCTAssertTrue(end?.body.contains("Make \(file.path) writable or delete it.") == true, "\(String(describing: end))")
+    }
+
+    /// A file the app rejects that can be renamed is moved aside at the
+    /// next transaction, and the settings the app runs on are written in its
+    /// place, so the agent reads the app's cutoffs again. The session goes
+    /// on.
+    func testARejectedConfigThatCanBeMovedIsReplacedByTheSettingsInUse() async throws {
+        var mine = Config()
+        mine.endFloor = 30
+        try h.store.saveConfig(mine)
+        let m = h.makeManager()
+        await m.reconcile()
+        await m.start(duration: 3600)
+        let written = try writeConfig(rejectedConfig)
+
+        await m.extend(by: 600)
+
+        XCTAssertTrue(m.isActive)
+        XCTAssertEqual(m.config.endFloor, 30)
+        XCTAssertEqual(try h.store.loadConfig(), m.config)
+        let moved = h.home.paths.appSupport.appendingPathComponent("config.json.unreadable-20270115T080000Z")
+        XCTAssertEqual(try Data(contentsOf: moved), written)
+        XCTAssertTrue(h.notifier.posts.contains { $0.title == SessionManager.configFileTitle && $0.body.contains("It was moved to \(moved.path)") }, "\(h.notifier.posts)")
     }
 }

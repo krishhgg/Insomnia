@@ -105,7 +105,7 @@ struct SettingsView: View {
                 }
             }
             HStack {
-                TextField("Add preset (30m, 2h, 1h30m, 3d)", text: $newPreset)
+                TextField("Add preset (30m, 2h, 1h30m, 12h)", text: $newPreset)
                     .textFieldStyle(.roundedBorder)
                     .onSubmit(addPreset)
                 Button("Add", action: addPreset)
@@ -125,6 +125,9 @@ struct SettingsView: View {
             LabeledContent("Maximum session") {
                 Text(chipLabel(for: manager.config.maxDuration)).foregroundStyle(.secondary)
             }
+            Text("Sessions and extensions end no later than this. Edit maxDuration in config.json to change it.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
     }
 

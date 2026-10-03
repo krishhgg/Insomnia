@@ -114,8 +114,16 @@ is performed. Do not replace "not run" with "passed" based on source review.
 | --- | --- |
 | Normal end, deadline expiry, and repeated Quit restore live power state | Not run for release fixes |
 | Force-quit followed by launchd deadline recovery and retry after failure | Not run |
+| Backstop ends a valid session within a minute of the app being force-quit (alive lock released) | Not run |
+| A second copy started with `open -n` while one runs (with and without a session) posts "Insomnia is already running" and quits; the first copy's session, journal and menu are unchanged | Not run |
+| Backstop battery end with the app stopped (`kill -STOP`), on battery power below the end floor | Not run |
+| Backstop thermal end via an injected thermal pressure reading (patched script copy) | Not run |
+| Reboot with an active session and launch at login off: the agent ends it at login because no app holds the alive lock | Not run |
+| Reboot with an active session and launch at login on: whichever runs first decides; if the app resumes the session, it lasts until its deadline or a cutoff | Not run |
 | Unreadable session.json moved aside by the app at launch and by the agent, then uninstall with and without --purge | Not run |
 | session.json without read permission during a session: the agent restores sleep within a minute and renames the file to session.json.unreadable-<time>, or the app does both at launch and notifies; after fixing the copy's permissions, a relaunch does not resume the session | Not run |
+| Hand-edited config.json that does not decode: at launch the app renames it to config.json.unreadable-<time>, runs on defaults and notifies; the settings come back after fixing the copy, quitting and renaming it to config.json | Not run |
+| Locked config.json that does not decode (`chflags uchg`): Start refuses and its notification names the file; with a session running, the next extend ends it; after `chflags nouchg`, Start moves the file aside and starts | Not run |
 | Reboot/login with active or dirty journals | Not run |
 | Lid-close/open and safe recovery of explicitly selected test processes | Not run |
 | Lid-close display/keyboard darkening and restore | Not run |
