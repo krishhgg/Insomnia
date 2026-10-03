@@ -1,7 +1,7 @@
 import Darwin
 import Foundation
 
-/// `Insomnia --resume-frozen`, journal entries on standard input
+/// `Insomnia --resume-frozen <seconds>`, journal entries on standard input
 ///
 /// One-shot mode for backstop.sh. The shell can read a process's start time
 /// only to the second (`ps -o lstart`), so for the journal entries that
@@ -10,8 +10,16 @@ import Foundation
 /// turn, one kernel lookup (start time to the microsecond, boot session,
 /// stopped state) immediately followed by that entry's SIGCONT, before the
 /// next entry is looked up. One launch covers every entry. Nothing else
-/// runs: no AppKit, no journal, no lock (the caller holds the recovery
-/// lock and rewrites the journal from the answer).
+/// runs: no AppKit, no journal, no lock of its own (the caller holds the
+/// recovery lock and rewrites the journal from the answer).
+///
+/// `<seconds>` is how long this process may live, a whole number from 1 to
+/// 300. Before it reads anything it arranges to end itself with SIGALRM
+/// that many seconds later, whatever SIGALRM disposition and mask it
+/// inherited. backstop.sh passes its own time limit and runs this mode with
+/// the recovery lock open on fd 9, so the lock stays held for as long as
+/// this process can send a signal, even when the shell that started it dies
+/// first; the time limit then frees the lock without anyone waiting for it.
 ///
 /// Standard input holds one entry per line, `<pid> <startedAt>
 /// <startedAtMicros> <bootSession>`: four fields, one space between them,
@@ -25,16 +33,26 @@ import Foundation
 ///     unobserved    the kernel would not say what the pid is; try again later
 ///     unverifiable  the fallthrough for an answer with no boot session to compare; never signaled
 ///
-/// Exits 0 when every entry is `resumed` or `gone`, 1 when any is not. Any
-/// argument after the flag, empty input, or a malformed line prints the
-/// single line `usage` (details on stderr), checks nothing, and exits 64.
-/// The shell clears an entry on `resumed` and `gone` and keeps it
-/// otherwise, and keeps every entry when the answer is not exactly this
-/// shape.
+/// Exits 0 when every entry is `resumed` or `gone`, 1 when any is not. A
+/// missing or malformed `<seconds>`, any further argument, empty input, or
+/// a malformed line prints the single line `usage` (details on stderr),
+/// checks nothing, and exits 64. The shell clears an entry on `resumed` and
+/// `gone` and keeps it otherwise, and keeps every entry when the answer is
+/// not exactly this shape.
+///
+/// The app bundle declares this interface as `InsomniaResumeFrozenVersion`
+/// (`version`) in its Info.plist. backstop.sh runs the binary only when the
+/// installed bundle declares the version the script speaks, so it never
+/// starts an older build, which would open the menu bar app instead.
 enum ResumeFrozenCommand {
     static let flag = "--resume-frozen"
+    /// `InsomniaResumeFrozenVersion` in Resources/Info.plist, and
+    /// RESUME_FROZEN_VERSION in backstop.sh and uninstall.sh.
+    static let version = 1
     /// EX_USAGE from sysexits(3).
     static let usageStatus: Int32 = 64
+    /// The longest lifetime the caller may ask for.
+    static let maxLifetimeSeconds: UInt32 = 300
 
     enum Answer: String, Sendable {
         case resumed, gone, failed, unobserved, unverifiable
@@ -49,20 +67,21 @@ enum ResumeFrozenCommand {
     }
 
     /// nil when `arguments` (the command line without the executable) do
-    /// not ask for this mode. `input` is read only once they do.
+    /// not ask for this mode. `endAfter` gets the lifetime once the
+    /// arguments are valid, before `input` is read (`endProcess` in the
+    /// binary).
     static func run(
         _ arguments: [String],
         input: () -> Data = { FileHandle.standardInput.readDataToEndOfFile() },
-        control: any ProcessSignaling = SignalProcessControl()
+        control: any ProcessSignaling = SignalProcessControl(),
+        endAfter: (UInt32) -> Void
     ) -> Output? {
         guard arguments.first == flag else { return nil }
-        guard arguments.count == 1,
-              let text = String(data: input(), encoding: .utf8),
+        guard arguments.count == 2, let seconds = lifetime(arguments[1]) else { return usage() }
+        endAfter(seconds)
+        guard let text = String(data: input(), encoding: .utf8),
               let entries = parse(text)
-        else {
-            FileHandle.standardError.write(Data("usage: Insomnia \(flag) < entries, one line each: <pid> <startedAt> <startedAtMicros> <bootSession>\n".utf8))
-            return Output(lines: ["usage"], status: usageStatus)
-        }
+        else { return usage() }
         var lines: [String] = []
         var settled = true
         for entry in entries {
@@ -72,6 +91,35 @@ enum ResumeFrozenCommand {
             if !answer.settled { settled = false }
         }
         return Output(lines: lines, status: settled ? 0 : 1)
+    }
+
+    private static func usage() -> Output {
+        FileHandle.standardError.write(Data("usage: Insomnia \(flag) <seconds 1-\(maxLifetimeSeconds)> < entries, one line each: <pid> <startedAt> <startedAtMicros> <bootSession>\n".utf8))
+        return Output(lines: ["usage"], status: usageStatus)
+    }
+
+    /// The lifetime argument: one to three ASCII digits, 1 to
+    /// `maxLifetimeSeconds`; nil otherwise.
+    static func lifetime(_ text: String) -> UInt32? {
+        guard (1...3).contains(text.utf8.count),
+              text.utf8.allSatisfy({ (UInt8(ascii: "0")...UInt8(ascii: "9")).contains($0) }),
+              let seconds = UInt32(text),
+              (1...maxLifetimeSeconds).contains(seconds)
+        else { return nil }
+        return seconds
+    }
+
+    /// Ends this process with SIGALRM `seconds` from now. A disposition of
+    /// SIG_IGN and a blocked mask both survive exec, so a parent that
+    /// ignored or blocked SIGALRM must not make the limit void: the default
+    /// action and an unblocked mask are restored first.
+    static func endProcess(after seconds: UInt32) {
+        signal(SIGALRM, SIG_DFL)
+        var alarmOnly = sigset_t()
+        sigemptyset(&alarmOnly)
+        sigaddset(&alarmOnly, SIGALRM)
+        pthread_sigmask(SIG_UNBLOCK, &alarmOnly, nil)
+        alarm(seconds)
     }
 
     /// The journal entries the input describes, in order; nil unless it has

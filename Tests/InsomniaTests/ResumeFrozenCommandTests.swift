@@ -19,9 +19,10 @@ final class ResumeFrozenCommandTests: XCTestCase {
 
     private let line = "4242 1789388423 17 0F0F0F0F-1111-2222-3333-444444444444\n"
 
-    /// Runs the mode with `input` as standard input.
-    private func run(_ input: String, _ control: SignalProcessControl, arguments: [String] = ["--resume-frozen"]) -> ResumeFrozenCommand.Output? {
-        ResumeFrozenCommand.run(arguments, input: { Data(input.utf8) }, control: control)
+    /// Runs the mode with `input` as standard input. The lifetime is
+    /// recorded, never armed: an alarm would end the test runner.
+    private func run(_ input: String, _ control: SignalProcessControl, arguments: [String] = ["--resume-frozen", "30"]) -> ResumeFrozenCommand.Output? {
+        ResumeFrozenCommand.run(arguments, input: { Data(input.utf8) }, control: control, endAfter: { _ in })
     }
 
     /// Other command lines are not this mode, and standard input is not
@@ -30,18 +31,21 @@ final class ResumeFrozenCommandTests: XCTestCase {
         let sent = Sent([])
         let read = Locked(0)
         let c = control({ _ in .absent }, sent: sent)
+        let armed = Locked<[UInt32]>([])
         let input: () -> Data = { read.value += 1; return Data(self.line.utf8) }
-        XCTAssertNil(ResumeFrozenCommand.run([], input: input, control: c))
-        XCTAssertNil(ResumeFrozenCommand.run(["-NSDocumentRevisionsDebugMode", "YES"], input: input, control: c))
-        XCTAssertNil(ResumeFrozenCommand.run(["4242", "--resume-frozen"], input: input, control: c))
+        let arm: (UInt32) -> Void = { armed.value.append($0) }
+        XCTAssertNil(ResumeFrozenCommand.run([], input: input, control: c, endAfter: arm))
+        XCTAssertNil(ResumeFrozenCommand.run(["-NSDocumentRevisionsDebugMode", "YES"], input: input, control: c, endAfter: arm))
+        XCTAssertNil(ResumeFrozenCommand.run(["4242", "--resume-frozen", "30"], input: input, control: c, endAfter: arm))
         XCTAssertEqual(read.value, 0)
+        XCTAssertEqual(armed.value, [], "the menu bar app must never get a lifetime")
         XCTAssertEqual(sent.value.count, 0)
     }
 
     /// Bad input answers the single line "usage" with EX_USAGE and never
-    /// reaches the kernel, even when an earlier line is well formed. An
-    /// argument after the flag is a usage error before standard input is
-    /// read.
+    /// reaches the kernel, even when an earlier line is well formed. A
+    /// missing or malformed lifetime, or any argument after it, is a usage
+    /// error before standard input is read.
     func testMalformedInputIsAUsageErrorWithoutALookup() {
         let looked = Locked(0)
         let sent = Sent([])
@@ -70,14 +74,51 @@ final class ResumeFrozenCommandTests: XCTestCase {
         for input in bad {
             XCTAssertEqual(run(input, c), .init(lines: ["usage"], status: 64), input.debugDescription)
         }
-        XCTAssertEqual(ResumeFrozenCommand.run(["--resume-frozen"], input: { Data([0x34, 0xFF, 0x0A]) }, control: c), .init(lines: ["usage"], status: 64), "not UTF-8")
+        XCTAssertEqual(ResumeFrozenCommand.run(["--resume-frozen", "30"], input: { Data([0x34, 0xFF, 0x0A]) }, control: c, endAfter: { _ in }), .init(lines: ["usage"], status: 64), "not UTF-8")
 
         let read = Locked(0)
-        let extra = ResumeFrozenCommand.run(["--resume-frozen", "4242"], input: { read.value += 1; return Data(self.line.utf8) }, control: c)
-        XCTAssertEqual(extra, .init(lines: ["usage"], status: 64))
+        let armed = Locked<[UInt32]>([])
+        let badArguments: [[String]] = [
+            ["--resume-frozen"],
+            ["--resume-frozen", "30", "4242"],
+            ["--resume-frozen", ""],
+            ["--resume-frozen", "0"],
+            ["--resume-frozen", "301"],
+            ["--resume-frozen", "1000"],
+            ["--resume-frozen", "+5"],
+            ["--resume-frozen", "-1"],
+            ["--resume-frozen", " 5"],
+            ["--resume-frozen", "5 "],
+            ["--resume-frozen", "5s"],
+            ["--resume-frozen", "\u{0663}"],
+        ]
+        for arguments in badArguments {
+            let output = ResumeFrozenCommand.run(arguments, input: { read.value += 1; return Data(self.line.utf8) }, control: c, endAfter: { armed.value.append($0) })
+            XCTAssertEqual(output, .init(lines: ["usage"], status: 64), arguments.debugDescription)
+        }
         XCTAssertEqual(read.value, 0, "standard input read although the arguments were already wrong")
+        XCTAssertEqual(armed.value, [], "a lifetime armed from bad arguments")
         XCTAssertEqual(looked.value, 0)
         XCTAssertEqual(sent.value.count, 0)
+    }
+
+    /// The lifetime is armed with the caller's number of seconds before
+    /// standard input is read, so a process that blocks on its input still
+    /// ends on time.
+    func testTheLifetimeIsArmedBeforeStandardInputIsRead() {
+        let events = Locked<[String]>([])
+        let c = control({ _ in .absent }, sent: Sent([]))
+        for (argument, seconds) in [("1", UInt32(1)), ("33", 33), ("300", 300), ("007", 7)] {
+            events.value = []
+            let output = ResumeFrozenCommand.run(
+                ["--resume-frozen", argument],
+                input: { events.value.append("read"); return Data(self.line.utf8) },
+                control: c,
+                endAfter: { events.value.append("end after \($0)") }
+            )
+            XCTAssertEqual(output, .init(lines: ["4242 gone"], status: 0), argument)
+            XCTAssertEqual(events.value, ["end after \(seconds)", "read"], argument)
+        }
     }
 
     func testParseBuildsTheExactJournalEntries() {
@@ -221,7 +262,7 @@ final class ResumeFrozenCommandTests: XCTestCase {
     /// with INSOMNIA_HOME in a temp dir so its log line (if any) never
     /// touches ~/Library. Standard input, output and error are files: nothing
     /// to drain, nothing to deadlock, whatever the size.
-    private func runBinary(_ arguments: [String] = ["--resume-frozen"], input: String) throws -> (status: Int32, stdout: String, stderr: String) {
+    private func runBinary(_ arguments: [String] = ["--resume-frozen", "30"], input: String) throws -> (status: Int32, stdout: String, stderr: String) {
         let home = TempHome()
         defer { home.destroy() }
         let inURL = home.root.appendingPathComponent("stdin")
@@ -335,6 +376,97 @@ final class ResumeFrozenCommandTests: XCTestCase {
         XCTAssertEqual(answer.status, 0, answer.stderr)
         XCTAssertEqual(answer.stdout, "\(exited.processIdentifier) gone\n\(pid) resumed\n")
         XCTAssertNotNil(waitForInfo(pid) { $0.pbi_status != UInt32(SSTOP) }, "the binary answered resumed but the child is still stopped")
+    }
+
+    /// The built binary ends itself with SIGALRM once its lifetime is up,
+    /// here 1 s while it waits for standard input that never ends. That
+    /// holds when its parent ignored SIGALRM and when its parent blocked
+    /// it, since both survive exec. The test sends no signal: a binary that
+    /// did not end gets end of input when the test closes the pipe, exits
+    /// 64, and fails the SIGALRM assertion.
+    func testBuiltBinaryEndsItselfWhenItsLifetimeIsUp() throws {
+        guard FileManager.default.isExecutableFile(atPath: builtBinary.path) else {
+            throw XCTSkip("no built Insomnia executable at \(builtBinary.path)")
+        }
+        for parent in [ParentAlarm.default, .ignored, .blocked] {
+            let end = try spawnWithOpenInput(lifetime: "1", parent: parent)
+            XCTAssertTrue(end.endedByItself, "\(parent): still running after 15 s")
+            XCTAssertEqual(end.status & 0x7f, SIGALRM, "\(parent): wait status \(end.status)")
+            XCTAssertGreaterThan(end.seconds, 0.5, "\(parent): ended before its lifetime")
+        }
+    }
+
+    private enum ParentAlarm { case `default`, ignored, blocked }
+
+    /// Spawns the built binary with `--resume-frozen <lifetime>` and a pipe
+    /// on standard input that stays open, and waits up to 15 s for it to
+    /// end. `parent` is the SIGALRM state it inherits: the default, ignored
+    /// (a bash that runs `trap '' ALRM` and then execs it), or blocked (the
+    /// spawn mask). If it is still running then, the pipe is closed and it
+    /// is reaped once it exits on end of input.
+    private func spawnWithOpenInput(lifetime: String, parent: ParentAlarm) throws -> (status: Int32, seconds: TimeInterval, endedByItself: Bool) {
+        let home = TempHome()
+        defer { home.destroy() }
+        var fds: [Int32] = [0, 0]
+        guard pipe(&fds) == 0 else { throw XCTSkip("pipe failed: errno \(errno)") }
+        let (readEnd, writeEnd) = (fds[0], fds[1])
+        var writeOpen = true
+        defer {
+            close(readEnd)
+            if writeOpen { close(writeEnd) }
+        }
+
+        var actions: posix_spawn_file_actions_t?
+        posix_spawn_file_actions_init(&actions)
+        defer { posix_spawn_file_actions_destroy(&actions) }
+        posix_spawn_file_actions_adddup2(&actions, readEnd, 0)
+        posix_spawn_file_actions_addclose(&actions, readEnd)
+        posix_spawn_file_actions_addclose(&actions, writeEnd)
+        posix_spawn_file_actions_addopen(&actions, 1, "/dev/null", O_WRONLY, 0)
+        posix_spawn_file_actions_addopen(&actions, 2, "/dev/null", O_WRONLY, 0)
+
+        var attr: posix_spawnattr_t?
+        posix_spawnattr_init(&attr)
+        defer { posix_spawnattr_destroy(&attr) }
+        var mask = sigset_t()
+        sigemptyset(&mask)
+        if parent == .blocked { sigaddset(&mask, SIGALRM) }
+        var defaults = sigset_t()
+        sigemptyset(&defaults)
+        sigaddset(&defaults, SIGALRM)
+        posix_spawnattr_setsigmask(&attr, &mask)
+        posix_spawnattr_setsigdefault(&attr, &defaults)
+        posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF))
+
+        let binary = builtBinary.path
+        let arguments = parent == .ignored
+            ? ["/bin/bash", "-c", #"trap '' ALRM; exec "$0" "$@""#, binary, "--resume-frozen", lifetime]
+            : [binary, "--resume-frozen", lifetime]
+        let argv: [UnsafeMutablePointer<CChar>?] = arguments.map { strdup($0) } + [nil]
+        let environment = ["INSOMNIA_HOME=\(home.root.path)", "PATH=/usr/bin:/bin"]
+        let envp: [UnsafeMutablePointer<CChar>?] = environment.map { strdup($0) } + [nil]
+        defer { (argv + envp).forEach { free($0) } }
+
+        var pid: pid_t = 0
+        let spawned = posix_spawn(&pid, arguments[0], &actions, &attr, argv, envp)
+        guard spawned == 0, pid > 0 else { throw XCTSkip("posix_spawn failed: \(spawned)") }
+        let start = Date()
+        var status: Int32 = 0
+        var endedByItself = false
+        while Date().timeIntervalSince(start) < 15 {
+            if waitpid(pid, &status, WNOHANG) == pid {
+                endedByItself = true
+                break
+            }
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+        let seconds = Date().timeIntervalSince(start)
+        if !endedByItself {
+            close(writeEnd)
+            writeOpen = false
+            while waitpid(pid, &status, 0) == -1 && errno == EINTR {}
+        }
+        return (status, seconds, endedByItself)
     }
 
     /// The child's BSD info, or nil when the kernel has none for it.

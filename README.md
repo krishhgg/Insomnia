@@ -210,7 +210,13 @@ installation scenarios still need [release validation](docs/release-validation.m
   30-second limit. The entries go to the binary on standard input, so a long
   journal cannot exceed the argument size limit. The backstop never signals those entries itself. It keeps
   them when the binary is missing, does not finish in time, or answers
-  anything but one expected line per entry. Entries written by builds before
+  anything but one expected line per entry. It runs the binary only when the
+  installed bundle declares `InsomniaResumeFrozenVersion` in its
+  `Info.plist`, so it never starts an older build. The binary holds the
+  recovery lock while it can still send a signal and ends itself after the
+  same limit, so a backstop run that is killed mid-call leaves no helper
+  that could act later without the lock. `uninstall.sh` uses the backstop
+  installed with an app that does not declare that version. Entries written by builds before
   microseconds were recorded keep the one-second `ps` comparison in the
   shell. A lookup and a signal are still separate operations, one pid at a
   time.

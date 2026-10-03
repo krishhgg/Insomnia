@@ -26,14 +26,20 @@
 #       frozenProcesses     -> SIGCONT, but only to a pid verified to be the
 #                              process the app froze. Entries that record
 #                              startedAtMicros are handed to the installed
-#                              app binary (INSOMNIA_BIN --resume-frozen) in
-#                              one call with a time limit, one line per
-#                              entry on its standard input. For each entry in
-#                              turn it does one kernel lookup (start time to
-#                              the microsecond, boot session, stopped state)
-#                              immediately followed by that entry's SIGCONT;
-#                              this script never signals such an entry
-#                              itself. When the binary is missing, cannot
+#                              app binary (INSOMNIA_BIN --resume-frozen
+#                              <seconds>) in one call with a time limit, one
+#                              line per entry on its standard input. For
+#                              each entry in turn it does one kernel lookup
+#                              (start time to the microsecond, boot session,
+#                              stopped state) immediately followed by that
+#                              entry's SIGCONT; this script never signals
+#                              such an entry itself. The binary runs only
+#                              when the bundle's Info.plist declares the
+#                              interface version this script speaks
+#                              (InsomniaResumeFrozenVersion), and it keeps
+#                              the lock on fd 9 until it exits, which it does
+#                              by itself after <seconds>. When the binary is
+#                              missing, does not declare that version, cannot
 #                              run, times out, or answers anything but one
 #                              documented line per entry, those entries are
 #                              kept and not signaled. An entry
@@ -117,9 +123,14 @@ MV=/bin/mv
 CP=/bin/cp
 MKTEMP=/usr/bin/mktemp
 # The installed app binary, for the microsecond identity check of
-# frozenProcesses entries (see above). A fixed path like the tools, never
-# PATH. install.sh puts the bundle here.
+# frozenProcesses entries (see above), and the bundle's Info.plist, which
+# must declare InsomniaResumeFrozenVersion RESUME_FROZEN_VERSION before the
+# binary is run: an older build has no such mode and would open the menu bar
+# app instead. Fixed paths like the tools, never PATH. install.sh puts the
+# bundle here, copying the binary before Info.plist.
 INSOMNIA_BIN="${HOME:-}/Applications/Insomnia.app/Contents/MacOS/Insomnia"
+INSOMNIA_INFO="${HOME:-}/Applications/Insomnia.app/Contents/Info.plist"
+RESUME_FROZEN_VERSION=1
 LOCK_TIMEOUT_SECONDS=10
 # Longest a single undo command (sudo pmset, defaults) may run before it is
 # sent SIGTERM, and how long it then gets to exit before this run fails closed.
@@ -273,12 +284,16 @@ run_bounded() { # command args...
 # after the job has left bash's running list. Unlike a power command this is
 # our own unprivileged binary, so when SIGTERM does not end it within
 # KILL_GRACE_SECONDS it gets SIGKILL: from then on it runs no more of its own
-# code and so cannot send another signal. The binary does not get fd 9, so
-# one the kernel has not reaped yet cannot hold the recovery lock after this
-# run ends. Returns the binary's exit status, or 124 when it did not finish
-# in time. The function's stderr is /dev/null because bash reports a job
-# that a signal ended ("Terminated: 15") on its own stderr; the log says what
-# happened instead.
+# code and so cannot send another signal.
+# The binary inherits fd 9, so the recovery lock stays held for as long as it
+# runs, also after this shell is gone: a run killed mid-call leaves no helper
+# that could resume a process a later session froze while the lock was free.
+# The binary ends itself after its lifetime argument (resume_via_app passes
+# COMMAND_TIMEOUT_SECONDS + KILL_GRACE_SECONDS), so such a helper frees the
+# lock on its own. Returns the binary's exit status, or 124 when it did not
+# finish in time. The function's stderr is /dev/null because bash reports a
+# job that a signal ended ("Terminated: 15") on its own stderr; the log says
+# what happened instead.
 app_answer_dir=""
 job_running() { # pid
   local p
@@ -302,7 +317,7 @@ signal_job() { # signal pid
 }
 run_app_bounded() { # command args...
   local cpid rc=0
-  "$@" <"$app_answer_dir/in" >"$app_answer_dir/out" 9>&- &
+  "$@" <"$app_answer_dir/in" >"$app_answer_dir/out" &
   cpid=$!
   if wait_for_job "$cpid" "$COMMAND_TIMEOUT_SECONDS"; then
     wait "$cpid" || rc=$?
@@ -319,7 +334,7 @@ run_app_bounded() { # command args...
     wait "$cpid" || rc=$?
     log error "'$1 --resume-frozen' (pid $cpid) did not answer within ${COMMAND_TIMEOUT_SECONDS}s and was still running ${KILL_GRACE_SECONDS}s after SIGTERM; sent SIGKILL, and it ended (wait status $rc)"
   else
-    log error "'$1 --resume-frozen' (pid $cpid) did not answer within ${COMMAND_TIMEOUT_SECONDS}s and has not exited ${KILL_GRACE_SECONDS}s after SIGKILL; it runs no further code and holds no lock"
+    log error "'$1 --resume-frozen' (pid $cpid) did not answer within ${COMMAND_TIMEOUT_SECONDS}s and has not exited ${KILL_GRACE_SECONDS}s after SIGKILL; it runs no further code, and it keeps the recovery lock until the kernel ends it"
   fi
   return 124
 } 2>/dev/null
@@ -665,7 +680,7 @@ app_pid=()
 app_args=()
 # Ask the app binary about every collected entry in one bounded call (see
 # the frozenProcesses rule in the header). It answers one line per entry, in
-# argument order, "<pid> <word>", and exits 0 when every word is resumed or
+# input order, "<pid> <word>", and exits 0 when every word is resumed or
 # gone and 1 otherwise. The answer is checked whole: exactly one line per
 # entry, each with that entry's pid, one space and a known word and nothing
 # else, and an exit status that agrees with the words. Anything else, a
@@ -673,13 +688,26 @@ app_args=()
 # binary may have resumed some of them before it went wrong; the next run
 # finds those running and clears them.
 resume_via_app() {
-  local n=${#app_pid[@]} k rc=0 valid=1 settled=1 expected=0 size line word excerpt="" p answer
+  local n=${#app_pid[@]} k rc=0 valid=1 settled=1 expected=0 size line word excerpt="" p answer declared
   local -a words
   words=()
   if [[ ! -x "$INSOMNIA_BIN" ]]; then
     for (( k = 0; k < n; k++ )); do
       log error "pid ${app_pid[k]} needs the app binary for its microsecond identity check, but $INSOMNIA_BIN is missing or not executable; kept, not signaled"
       failures+=("pid ${app_pid[k]} was not resumed: app binary missing at $INSOMNIA_BIN")
+      keep_entry "${app_index[k]}"
+    done
+    return 0
+  fi
+  # A regular file only: a FIFO there could block this run under the lock.
+  declared=""
+  if [[ -f "$INSOMNIA_INFO" ]]; then
+    declared="$(extract "$INSOMNIA_INFO" InsomniaResumeFrozenVersion || true)"
+  fi
+  if [[ "$declared" != "$RESUME_FROZEN_VERSION" ]]; then
+    for (( k = 0; k < n; k++ )); do
+      log error "pid ${app_pid[k]} needs the app binary for its microsecond identity check, but $INSOMNIA_INFO declares InsomniaResumeFrozenVersion '${declared}', not $RESUME_FROZEN_VERSION (an older or newer build); the binary was not run; kept, not signaled"
+      failures+=("pid ${app_pid[k]} was not resumed: the installed app does not declare --resume-frozen version $RESUME_FROZEN_VERSION")
       keep_entry "${app_index[k]}"
     done
     return 0
@@ -697,7 +725,7 @@ resume_via_app() {
     log error "could not write the app binary's input in $app_answer_dir"
     rc=125
   else
-    run_app_bounded "$INSOMNIA_BIN" --resume-frozen || rc=$?
+    run_app_bounded "$INSOMNIA_BIN" --resume-frozen "$((COMMAND_TIMEOUT_SECONDS + KILL_GRACE_SECONDS))" || rc=$?
   fi
   if (( rc == 125 )) || [[ ! -f "$app_answer_dir/out" ]]; then
     valid=0

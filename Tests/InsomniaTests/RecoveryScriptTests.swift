@@ -110,7 +110,7 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(fx.calls(), [
             "sudo -n \(fx.fakePmset) -a disablesleep 0",
             "sudo -n \(fx.fakePmset) -b lowpowermode 0",
-            "Insomnia --resume-frozen < 4242 \(started) 17 \(fx.bootUUID)",
+            "Insomnia --resume-frozen 2 < 4242 \(started) 17 \(fx.bootUUID)",
         ], "an entry with microseconds is resumed by the app binary, never by ps and kill")
         let s = try fx.stateJSON()
         XCTAssertEqual(s["sleepDisabledByUs"] as? Bool, false)
@@ -138,7 +138,7 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertNotEqual(r.status, 0)
         XCTAssertEqual(fx.calls(), [
             "sudo -n \(fx.fakePmset) -a disablesleep 0",
-            "Insomnia --resume-frozen < 111 \(started) 1 \(fx.bootUUID); 222 \(started) 2 \(fx.bootUUID)",
+            "Insomnia --resume-frozen 2 < 111 \(started) 1 \(fx.bootUUID); 222 \(started) 2 \(fx.bootUUID)",
         ], "both entries in one call, no ps and no kill")
         let s = try fx.stateJSON()
         XCTAssertEqual(s["sleepDisabledByUs"] as? Bool, false, "an unrelated stuck pid must not hold sleep disabled")
@@ -1299,6 +1299,72 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(ids, Config.defaultAgentList)
     }
 
+    /// The --resume-frozen interface version is the same in the binary, in
+    /// the bundle's Info.plist, and in the two scripts that check it.
+    func testTheResumeFrozenVersionIsTheSameEverywhere() throws {
+        let scripts = ScriptFixture.productionScripts
+        let info = scripts.deletingLastPathComponent().appendingPathComponent("Resources/Info.plist")
+        let plist = try XCTUnwrap(try PropertyListSerialization.propertyList(from: Data(contentsOf: info), format: nil) as? [String: Any])
+        XCTAssertEqual(plist["InsomniaResumeFrozenVersion"] as? Int, ResumeFrozenCommand.version)
+        for name in ["backstop.sh", "uninstall.sh"] {
+            let text = try String(contentsOf: scripts.appendingPathComponent(name), encoding: .utf8)
+            let lines = text.split(separator: "\n").filter { $0.hasPrefix("RESUME_FROZEN_VERSION=") }
+            XCTAssertEqual(lines, ["RESUME_FROZEN_VERSION=\(ResumeFrozenCommand.version)"], name)
+        }
+    }
+
+    /// uninstall.sh from a newer checkout must not run its own backstop.sh
+    /// against an installed app that lacks the --resume-frozen mode that
+    /// backstop needs. When the installed Info.plist does not declare the
+    /// version, the backstop.sh installed with that app (the copy the
+    /// LaunchAgent runs) restores the machine instead. Here that copy is a
+    /// stand-in that records its run.
+    func testUninstallUsesTheInstalledBackstopWhenTheAppDoesNotDeclareTheVersion() throws {
+        for version in [nil, "2"] as [String?] {
+            let f = try ScriptFixture()
+            defer { f.destroy() }
+            try f.installMachinery()
+            try ScriptFixture.infoPlist(resumeFrozenVersion: version).write(to: f.appInfo, atomically: true, encoding: .utf8)
+            try "printf 'installed backstop %s\\n' \"$*\" >> '\(f.callsLog.path)'\n".write(to: f.installedBackstop, atomically: true, encoding: .utf8)
+            try f.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+
+            let r = try f.run(f.uninstall)
+
+            let label = version ?? "no key"
+            XCTAssertEqual(r.status, 0, "\(label): \(r.stderr)")
+            XCTAssertTrue(f.calls().contains("installed backstop --force"), "\(label): \(f.calls())")
+            XCTAssertTrue(r.stdout.contains("does not declare InsomniaResumeFrozenVersion 1; using the backstop installed with it, \(f.installedBackstop.path)"), "\(label): \(r.stdout)")
+        }
+    }
+
+    /// An installed app that declares the version gets this checkout's
+    /// backstop.sh, which hands the frozen entry to the app binary. With no
+    /// installed copy to fall back on, the checkout's backstop runs too.
+    func testUninstallUsesTheCheckoutBackstopWhenTheAppDeclaresTheVersionOrNoCopyIsInstalled() throws {
+        for declares in [true, false] {
+            let f = try ScriptFixture()
+            defer { f.destroy() }
+            try f.installMachinery()
+            if declares {
+                try "printf 'installed backstop %s\\n' \"$*\" >> '\(f.callsLog.path)'\n".write(to: f.installedBackstop, atomically: true, encoding: .utf8)
+            } else {
+                try ScriptFixture.infoPlist(resumeFrozenVersion: nil).write(to: f.appInfo, atomically: true, encoding: .utf8)
+                try FileManager.default.removeItem(at: f.installedBackstop)
+            }
+            try f.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+            try f.writeState("""
+            {"sleepDisabledByUs":false,"lowPowerSetByUs":false,"dockerFrozen":false,
+             "frozenProcesses":[{"pid":5311,"startedAt":1789388423,"startedAtMicros":11,"bootSession":"\(f.bootUUID)"}]}
+            """)
+
+            let r = try f.run(f.uninstall)
+
+            XCTAssertEqual(r.status, 0, "declares \(declares): \(r.stderr) \(f.log())")
+            XCTAssertFalse(f.calls().contains("installed backstop --force"), "declares \(declares): \(f.calls())")
+            XCTAssertTrue(f.calls().contains("Insomnia --resume-frozen 2 < 5311 1789388423 11 \(f.bootUUID)"), "declares \(declares): \(f.calls())")
+        }
+    }
+
     func testUninstallAbortsOnMalformedJournal() throws {
         try fx.installMachinery()
         let broken = "{\"sleepDisabledByUs\":tru"
@@ -1577,6 +1643,17 @@ final class RecoveryScriptTests: XCTestCase {
         (try fx.stateJSON()["frozenProcesses"] as? [[String: Any]])?.first
     }
 
+    /// Polls `condition` every 0.05 s; false if it does not hold within
+    /// `seconds`.
+    private func waitUntil(_ seconds: Double, _ condition: () -> Bool) -> Bool {
+        let deadline = Date(timeIntervalSinceNow: seconds)
+        while Date() < deadline {
+            if condition() { return true }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        return condition()
+    }
+
     /// The shell passes the four identity fields through unchanged, as one
     /// line on the binary's standard input, and never runs ps or kill for
     /// such an entry. "resumed" clears it. The binary's parent is the
@@ -1590,7 +1667,7 @@ final class RecoveryScriptTests: XCTestCase {
         let r = try fx.run(fx.backstop)
 
         XCTAssertEqual(r.status, 0, r.stderr)
-        XCTAssertEqual(fx.calls(), ["Insomnia --resume-frozen < 5100 \(started) 654321 \(fx.bootUUID)"])
+        XCTAssertEqual(fx.calls(), ["Insomnia --resume-frozen 2 < 5100 \(started) 654321 \(fx.bootUUID)"])
         XCTAssertEqual((try fx.stateJSON()["frozenProcesses"] as? [Any])?.count, 0)
         XCTAssertEqual(try fx.stateJSON()["dockerFrozen"] as? Bool, false)
         XCTAssertTrue(fx.log().contains("SIGCONT sent to pid 5100 by the app binary"), fx.log())
@@ -1607,7 +1684,7 @@ final class RecoveryScriptTests: XCTestCase {
         let r = try fx.run(fx.backstop)
 
         XCTAssertEqual(r.status, 0, r.stderr)
-        XCTAssertEqual(fx.calls(), ["Insomnia --resume-frozen < 5101 \(started) 0 \(fx.bootUUID)"])
+        XCTAssertEqual(fx.calls(), ["Insomnia --resume-frozen 2 < 5101 \(started) 0 \(fx.bootUUID)"])
     }
 
     func testAppBinaryGoneClearsTheEntryWithoutSignal() throws {
@@ -1751,7 +1828,7 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(fx.calls(), [
             "ps -o lstart=,stat=,uid= -p 5109",
             "kill -CONT 5109",
-            "Insomnia --resume-frozen < 5108 \(started) 8 \(fx.bootUUID)",
+            "Insomnia --resume-frozen 2 < 5108 \(started) 8 \(fx.bootUUID)",
         ])
         XCTAssertEqual((try fx.stateJSON()["frozenProcesses"] as? [Any])?.count, 0)
     }
@@ -1781,7 +1858,7 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertNotEqual(r.status, 0)
         XCTAssertEqual(fx.calls(), [
             "ps -o lstart=,stat=,uid= -p 5204",
-            "Insomnia --resume-frozen < 5201 \(started) 1 \(fx.bootUUID); 5203 \(started) 3 \(fx.bootUUID); 5205 \(started) 5 \(fx.bootUUID); 5206 \(started) 6 \(fx.bootUUID)",
+            "Insomnia --resume-frozen 2 < 5201 \(started) 1 \(fx.bootUUID); 5203 \(started) 3 \(fx.bootUUID); 5205 \(started) 5 \(fx.bootUUID); 5206 \(started) 6 \(fx.bootUUID)",
         ])
         let frozen = try XCTUnwrap(try fx.stateJSON()["frozenProcesses"] as? [[String: Any]])
         XCTAssertEqual(frozen.map { $0["pid"] as? Int }, [5201, 5202, 5205], "journal order, not settle order")
@@ -1845,10 +1922,13 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(r.stderr, "", "bash's own report of the signaled job must not reach the caller")
     }
 
-    /// The binary never inherits the recovery lock, also when a caller
-    /// handed its lock down on fd 9 (the uninstall path).
-    func testAppBinaryNeverHoldsTheRecoveryLock() throws {
+    /// The binary runs with the recovery lock open on its fd 9, also when a
+    /// caller handed its lock down on fd 9 (the uninstall path), and is
+    /// told to end itself after COMMAND_TIMEOUT_SECONDS +
+    /// KILL_GRACE_SECONDS (1 + 1 here).
+    func testAppBinaryRunsWithTheRecoveryLockOnFd9() throws {
         try Data().write(to: fx.lock)
+        let lockInode = try XCTUnwrap(try FileManager.default.attributesOfItem(atPath: fx.lock.path)[.systemFileNumber] as? Int)
         let wrapper = fx.root.appendingPathComponent("holder-then-backstop.sh")
         try """
         #!/bin/bash
@@ -1863,7 +1943,70 @@ final class RecoveryScriptTests: XCTestCase {
             fx.clearCalls()
             let r = try run()
             XCTAssertEqual(r.status, 0, r.stderr + fx.log())
-            XCTAssertEqual(fx.calls(), ["Insomnia --resume-frozen < 5304 1789388423 4 \(fx.bootUUID)"], "the binary saw fd 9")
+            XCTAssertEqual(fx.calls(), ["Insomnia --resume-frozen 2 < 5304 1789388423 4 \(fx.bootUUID)"])
+            let fd9 = try String(contentsOf: fx.root.appendingPathComponent("insomnia.fd9"), encoding: .utf8)
+            XCTAssertEqual(fd9.trimmingCharacters(in: .whitespacesAndNewlines), String(lockInode), "the binary did not get the lock on fd 9")
+        }
+    }
+
+    /// A backstop run that dies abruptly while the binary is still working
+    /// must not free the recovery lock, or the binary could resume a
+    /// process that a session started after that freezes. The binary keeps
+    /// the lock on its fd 9 until it exits. The
+    /// only process this test signals is the backstop shell it spawned
+    /// itself, with SIGKILL, while that shell is still waiting for the
+    /// binary (its limit is 30 s here). The fake binary is never signaled:
+    /// it ends on its own once the test creates insomnia.release.
+    func testABackstopKilledMidCallLeavesTheLockHeldUntilTheBinaryEnds() throws {
+        try writeMicrosecondEntry(pid: 5309, started: 1_789_388_423, micros: 9)
+        fx.setMode("insomnia", "hold")
+        let release = fx.root.appendingPathComponent("insomnia.release")
+        defer { try? Data().write(to: release) }
+        let slow = fx.root.appendingPathComponent("backstop-30s.sh")
+        try ScriptFixture.patch(try String(contentsOf: fx.backstop, encoding: .utf8), ["COMMAND_TIMEOUT_SECONDS": "30"])
+            .write(to: slow, atomically: true, encoding: .utf8)
+
+        let shell = try fx.launch(slow)
+        let call = "Insomnia --resume-frozen 31 < 5309 1789388423 9 \(fx.bootUUID)"
+        XCTAssertTrue(waitUntil(10) { self.fx.calls().contains(call) }, "the binary never started: \(fx.calls()) \(fx.log())")
+        XCTAssertTrue(shell.process.isRunning, "the backstop ended before the test could kill it")
+        XCTAssertEqual(kill(shell.process.processIdentifier, SIGKILL), 0)
+        shell.exit.wait()
+        XCTAssertEqual(shell.process.terminationReason, .uncaughtSignal)
+
+        XCTAssertFalse(try fx.lockIsFree(), "the lock was free while the binary of a killed run could still send SIGCONT")
+        XCTAssertFalse(fx.calls().contains("Insomnia released"))
+
+        try Data().write(to: release)
+        XCTAssertTrue(try fx.waitUntilLockIsFree(10), "the lock stayed held after the binary ended")
+        XCTAssertTrue(fx.calls().contains("Insomnia released"))
+        XCTAssertEqual(try onlyFrozenEntry()?["pid"] as? Int, 5309, "the killed run published nothing")
+    }
+
+    /// The binary of an older build has no --resume-frozen mode and would
+    /// start the menu bar app. The backstop runs the binary only when the
+    /// bundle's Info.plist declares the interface version it speaks;
+    /// otherwise it keeps every entry without running anything.
+    func testAppThatDoesNotDeclareTheResumeFrozenVersionIsNeverRun() throws {
+        let cases: [(String, () throws -> Void)] = [
+            ("no Info.plist", {}),
+            ("no key", { try ScriptFixture.infoPlist(resumeFrozenVersion: nil).write(to: self.fx.fakeInsomniaInfo, atomically: true, encoding: .utf8) }),
+            ("version 2", { try ScriptFixture.infoPlist(resumeFrozenVersion: "2").write(to: self.fx.fakeInsomniaInfo, atomically: true, encoding: .utf8) }),
+            ("a directory", { try FileManager.default.createDirectory(at: self.fx.fakeInsomniaInfo, withIntermediateDirectories: false) }),
+        ]
+        for (label, setUp) in cases {
+            try? FileManager.default.removeItem(at: fx.fakeInsomniaInfo)
+            try setUp()
+            try writeMicrosecondEntry(pid: 5310, started: 1_789_388_423, micros: 10)
+            fx.clearCalls()
+
+            let r = try fx.run(fx.backstop)
+
+            XCTAssertNotEqual(r.status, 0, label)
+            XCTAssertEqual(fx.calls(), [], "\(label): the binary ran")
+            XCTAssertEqual(try onlyFrozenEntry()?["pid"] as? Int, 5310, label)
+            XCTAssertTrue(fx.log().contains("pid 5310 needs the app binary for its microsecond identity check, but \(fx.fakeInsomniaInfo.path) declares InsomniaResumeFrozenVersion"), "\(label): \(fx.log())")
+            XCTAssertTrue(try fx.lockIsFree(), label)
         }
     }
 
@@ -2639,6 +2782,11 @@ private final class ScriptFixture {
     var fakePmset: String { bin.appendingPathComponent("pmset").path }
     /// The fake app binary backstop.sh calls for `--resume-frozen`.
     var fakeInsomnia: URL { bin.appendingPathComponent("Insomnia") }
+    /// The Info.plist backstop.sh reads before it runs the fake binary;
+    /// writeFakes makes it declare InsomniaResumeFrozenVersion 1.
+    var fakeInsomniaInfo: URL { bin.appendingPathComponent("Info.plist") }
+    /// The installed bundle's Info.plist, which uninstall.sh reads.
+    var appInfo: URL { app.appendingPathComponent("Contents/Info.plist") }
 
     private let fm = FileManager.default
 
@@ -2731,6 +2879,7 @@ private final class ScriptFixture {
             "KILL": bin.appendingPathComponent("kill").path,
             "SYSCTL": bin.appendingPathComponent("sysctl").path,
             "INSOMNIA_BIN": fakeInsomnia.path,
+            "INSOMNIA_INFO": fakeInsomniaInfo.path,
             "DEFAULTS": bin.appendingPathComponent("defaults").path,
             "DATE": bin.appendingPathComponent("date").path,
             "LOCK_TIMEOUT_SECONDS": "1",
@@ -2803,6 +2952,18 @@ private final class ScriptFixture {
     }
 
     // MARK: Fakes
+
+    /// An app bundle's Info.plist, with InsomniaResumeFrozenVersion set to
+    /// `resumeFrozenVersion` as an integer, or without the key when nil.
+    static func infoPlist(resumeFrozenVersion: String?) -> String {
+        let key = resumeFrozenVersion.map { "<key>InsomniaResumeFrozenVersion</key><integer>\($0)</integer>" } ?? ""
+        return """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0"><dict><key>CFBundleExecutable</key><string>Insomnia</string>\(key)</dict></plist>
+
+        """
+    }
 
     private func writeFake(_ name: String, _ body: String) throws {
         let url = bin.appendingPathComponent(name)
@@ -2915,13 +3076,16 @@ private final class ScriptFixture {
         // "<pid> <word>" line per entry, the word from insomnia.table
         // (pid|word) or "resumed" for a pid without a row; exit 0 when every
         // word is resumed or gone, 1 otherwise. Writes its parent's pid to
-        // insomnia.ppid. A binary that inherited fd 9 (the recovery lock)
-        // records HOLDS-FD9. Modes: "raw" prints insomnia.output verbatim and
+        // insomnia.ppid, and the inode of the file open on its fd 9 to
+        // insomnia.fd9 (empty without an fd 9). Modes: "raw" prints insomnia.output verbatim and
         // exits with insomnia.status. "hang" prints its answer and then
-        // sleeps for 300 s, so only a signal ends it in time. A test that
+        // sleeps for 300 s, so only a signal ends it in time. "hold" waits
+        // until insomnia.release exists (30 s at most), records "Insomnia
+        // released", and then answers as usual. A test that
         // needs SIGTERM ignored runs the backstop with it ignored (see
         // ScriptFixture.run): the fake inherits that from its first
         // instruction, so no trap has to be in place before the signal.
+        try Self.infoPlist(resumeFrozenVersion: "1").write(to: fakeInsomniaInfo, atomically: true, encoding: .utf8)
         try writeFake("Insomnia", """
         input=()
         while IFS= read -r line || [[ -n "$line" ]]; do input+=("$line"); done
@@ -2929,8 +3093,15 @@ private final class ScriptFixture {
         for line in "${input[@]}"; do joined="${joined:+$joined; }$line"; done
         printf 'Insomnia %s < %s\\n' "$*" "$joined" >> "\(calls)"
         echo "$PPID" > "\(r)/insomnia.ppid"
-        [[ -e /dev/fd/9 ]] && printf 'Insomnia HOLDS-FD9\\n' >> "\(calls)"
+        if [[ -e /dev/fd/9 ]]; then stat -f %i /dev/fd/9 > "\(r)/insomnia.fd9"; else : > "\(r)/insomnia.fd9"; fi
         mode="$(cat "\(r)/insomnia.mode" 2>/dev/null || echo ok)"
+        if [[ "$mode" == hold ]]; then
+          for (( i = 0; i < 300; i++ )); do
+            [[ -f "\(r)/insomnia.release" ]] && break
+            /bin/sleep 0.1
+          done
+          printf 'Insomnia released\\n' >> "\(calls)"
+        fi
         if [[ "$mode" == raw ]]; then
           cat "\(r)/insomnia.output"
           exit "$(cat "\(r)/insomnia.status")"
@@ -3219,6 +3390,7 @@ private final class ScriptFixture {
     func installMachinery() throws {
         try fm.createDirectory(at: app.appendingPathComponent("Contents/MacOS"), withIntermediateDirectories: true)
         try "binary".write(to: app.appendingPathComponent("Contents/MacOS/Insomnia"), atomically: true, encoding: .utf8)
+        try Self.infoPlist(resumeFrozenVersion: "1").write(to: appInfo, atomically: true, encoding: .utf8)
         try fm.createDirectory(at: sudoers.deletingLastPathComponent(), withIntermediateDirectories: true)
         try "rule".write(to: sudoers, atomically: true, encoding: .utf8)
         try fm.createDirectory(at: plist.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -3300,6 +3472,27 @@ private final class ScriptFixture {
         return (p.terminationStatus,
                 (try? String(contentsOf: outURL, encoding: .utf8)) ?? "",
                 (try? String(contentsOf: errURL, encoding: .utf8)) ?? "")
+    }
+
+    /// A script started in the background by `launch`.
+    struct Launched {
+        let process: Process
+        let exit: ProcessExit
+    }
+
+    /// Starts `script` with the same environment as `run`, output
+    /// discarded, and returns without waiting for it.
+    func launch(_ script: URL) throws -> Launched {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/bash")
+        p.arguments = [script.path]
+        p.environment = childEnvironment
+        p.currentDirectoryURL = root
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        let launched = Launched(process: p, exit: ProcessExit(p))
+        try p.run()
+        return launched
     }
 
     /// A lockf process that holds the recovery lock.

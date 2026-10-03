@@ -59,6 +59,9 @@ QUIT_WAIT_SECONDS=10
 CALL_TIMEOUT_SECONDS=30
 APP="$HOME/Applications/Insomnia.app"
 SUDOERS=/etc/sudoers.d/insomnia
+# The --resume-frozen interface version this checkout's backstop.sh speaks
+# (see step 3).
+RESUME_FROZEN_VERSION=1
 
 if [[ -n "${INSOMNIA_HOME:-}" ]]; then
   APP_SUPPORT="$INSOMNIA_HOME"
@@ -551,13 +554,27 @@ if app_running; then
   exit 1
 fi
 
-# 3. Undo everything via the current backstop ---------------------------------
+# 3. Undo everything via a backstop that matches the installed app ----------
 # The backstop inherits fd 9 and shares this lock instead of waiting on it.
+# This checkout's backstop.sh hands frozen entries that record microseconds
+# to the installed app binary, and runs that binary only when the bundle's
+# Info.plist declares InsomniaResumeFrozenVersion RESUME_FROZEN_VERSION (the
+# same value as in backstop.sh; a test keeps the two in step). An app that
+# does not declare it was installed together with its own backstop.sh in
+# APP_SUPPORT, the copy the LaunchAgent runs, so that copy is used instead
+# when it exists.
 step "Restoring the machine via backstop --force"
-if [[ -f "$ROOT/scripts/backstop.sh" ]]; then
+installed_version=""
+if [[ -f "$APP/Contents/Info.plist" ]]; then
+  installed_version="$(extract "$APP/Contents/Info.plist" InsomniaResumeFrozenVersion || true)"
+fi
+if [[ -f "$ROOT/scripts/backstop.sh" ]] && { [[ "$installed_version" == "$RESUME_FROZEN_VERSION" ]] || [[ ! -f "$APP_SUPPORT/backstop.sh" ]]; }; then
   BACKSTOP="$ROOT/scripts/backstop.sh"
 elif [[ -f "$APP_SUPPORT/backstop.sh" ]]; then
   BACKSTOP="$APP_SUPPORT/backstop.sh"
+  if [[ -f "$ROOT/scripts/backstop.sh" ]]; then
+    echo "$APP does not declare InsomniaResumeFrozenVersion $RESUME_FROZEN_VERSION; using the backstop installed with it, $BACKSTOP"
+  fi
 else
   echo "no backstop.sh found in $ROOT/scripts or $APP_SUPPORT; nothing was removed" >&2
   exit 1

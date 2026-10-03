@@ -39,13 +39,13 @@
       "id": "recovery-lock-held-while-a-command-may-run",
       "severity": "high",
       "scope": ["Sources/Insomnia/Core/RecoveryLock.swift", "Sources/Insomnia/Core/SessionManager.swift", "Sources/Insomnia/Core/SleepGuard.swift", "scripts/backstop.sh", "scripts/uninstall.sh"],
-      "rule": "The recovery lock (.recovery.lock: flock in RecoveryLock.swift, lockf on fd 9 in the scripts) is not released, and no further undo runs, while a privileged command started under it may still be running. The lock file is never unlinked or replaced, so every holder locks the same inode. Failing to acquire the lock means doing nothing, never proceeding unlocked."
+      "rule": "The recovery lock (.recovery.lock: flock in RecoveryLock.swift, lockf on fd 9 in the scripts) is not released, and no further undo runs, while a privileged command started under it may still be running, or while the app binary that backstop.sh runs for --resume-frozen may still send a signal: that binary keeps the lock on fd 9 and ends itself after the lifetime the shell passes. The lock file is never unlinked or replaced, so every holder locks the same inode. Failing to acquire the lock means doing nothing, never proceeding unlocked."
     },
     {
       "id": "only-verified-pids-are-resumed",
       "severity": "high",
       "scope": ["Sources/Insomnia/Core/ProcessControl.swift", "Sources/Insomnia/Core/LidActions.swift", "Sources/Insomnia/Core/ResumeFrozenCommand.swift", "Sources/Insomnia/System/Freezer.swift", "scripts/backstop.sh"],
-      "rule": "SIGCONT is sent only to a journaled pid whose recorded identity still matches the live process: start time to the microsecond and boot session in the app, and in the app binary that backstop.sh runs for entries that record startedAtMicros (Insomnia --resume-frozen, with a time limit; a timeout or any answer that is not exactly one expected line per entry keeps the entries); start time to the second and boot session in backstop.sh only for entries without startedAtMicros. Provisional entries (identity nil, written before the kernel confirmed the stop) and legacy frozenPids are never signaled and are never cleared by the shell. A pid that cannot be observed stays journaled."
+      "rule": "SIGCONT is sent only to a journaled pid whose recorded identity still matches the live process: start time to the microsecond and boot session in the app, and in the app binary that backstop.sh runs for entries that record startedAtMicros (Insomnia --resume-frozen, with a time limit, run only when the installed bundle's Info.plist declares InsomniaResumeFrozenVersion equal to RESUME_FROZEN_VERSION; a timeout, a missing declaration, or any answer that is not exactly one expected line per entry keeps the entries); start time to the second and boot session in backstop.sh only for entries without startedAtMicros. Provisional entries (identity nil, written before the kernel confirmed the stop) and legacy frozenPids are never signaled and are never cleared by the shell. A pid that cannot be observed stays journaled."
     },
     {
       "id": "no-shell-interpolation",

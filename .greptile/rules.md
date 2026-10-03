@@ -24,8 +24,12 @@ missing or expired it runs `sudo -n pmset -a disablesleep 0` and
 journaled pid that still exists, is stopped, started in this boot session at
 the journaled second, and belongs to this user. Entries that record
 `startedAtMicros` it never signals itself: it hands them to the installed
-app binary (`Insomnia --resume-frozen`), which checks each to the
-microsecond and signals it, and keeps them on any unexpected answer. It keeps, and never
+app binary (`Insomnia --resume-frozen <seconds>`), which checks each to the
+microsecond and signals it, and keeps them on any unexpected answer. It runs
+the binary only when the bundle's `Info.plist` declares
+`InsomniaResumeFrozenVersion` equal to its `RESUME_FROZEN_VERSION`, and the
+binary keeps the recovery lock on fd 9 until it ends itself after
+`<seconds>`. It keeps, and never
 restores, `savedOutputVolume`, `savedMuted`, `savedDisplayBrightness`,
 `savedKeyboardBrightness` and `displayRestoredUnderLowPower`: CoreAudio and
 the private brightness frameworks need the app. Legacy `frozenPids` entries
@@ -102,9 +106,23 @@ Flag a change that breaks one of these; do not flag the behavior itself.
   sent only while bash has not reaped the child. This is the bounded-call
   exception in the fixed-path rule, so it is not `$KILL`. The entries go on
   standard input, one line each, so no journal size can exceed the argument
-  limit. It runs without fd 9, so it never holds the lock. A timeout, or
-  any answer that is not exactly one `<pid> <word>` line per entry with a
-  matching exit status, keeps every entry of the call.
+  limit. A timeout, or any answer that is not exactly one `<pid> <word>`
+  line per entry with a matching exit status, keeps every entry of the call.
+- `backstop.sh`, `run_app_bounded`, fd 9. The binary inherits fd 9, so the
+  recovery lock stays held for as long as it can send a signal, also when
+  the backstop shell died first. It ends itself with SIGALRM after the
+  lifetime the shell passes (`COMMAND_TIMEOUT_SECONDS +
+  KILL_GRACE_SECONDS`), after resetting SIGALRM to its default action and
+  unblocking it, so an orphaned binary frees the lock on its own. One that
+  is still alive after SIGKILL keeps the lock until the kernel ends it.
+- `backstop.sh`, `resume_via_app`, and `uninstall.sh`, step 3. The shell
+  runs the binary only when `INSOMNIA_INFO` declares
+  `InsomniaResumeFrozenVersion` equal to `RESUME_FROZEN_VERSION`; otherwise
+  it keeps those entries without running anything, because an older build
+  would start the menu bar app. `install.sh` copies the binary before
+  `Info.plist`. `uninstall.sh` runs the checkout's backstop only when the
+  installed app declares that version, and otherwise the
+  `APP_SUPPORT/backstop.sh` installed with the app, when there is one.
 - `backstop.sh`, kept entries. Saved audio, saved display and keyboard
   brightness, and `displayRestoredUnderLowPower` are kept for the app, not
   restored by the shell. Legacy `frozenPids` are never signaled or cleared
