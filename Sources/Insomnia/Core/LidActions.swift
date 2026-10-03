@@ -235,26 +235,32 @@ final class LidActions {
         }
         guard !candidates.isEmpty else { return }
         let candidatePids = Set(candidates.map(\.pid))
-        // Journal first, but without identity: an entry with no identity is
-        // never resumed by the app or backstop.sh, so until the kernel has
-        // said which pids it actually stopped the journal claims none of
-        // them. Identity is added below only for the confirmed stops.
+        // Journal first, without identity. Neither the app nor backstop.sh
+        // ever signals an entry without identity, so until the kernel has
+        // said which pids Insomnia itself stopped, the journal claims none
+        // of them: a pid somebody else stopped, which the SIGSTOP below
+        // skips, cannot be resumed from this entry wherever the app dies.
+        // If this write fails nothing is signaled.
         let provisional = candidates.map { FrozenProcess(pid: $0.pid, identity: nil) }
+        // Whether this freeze is the one that sets the Docker flag, so an
+        // undo below clears only a flag it set.
+        let setsDockerFlag = docker && !manager.effectiveState.dockerFrozen
         do {
             try manager.journal { s in
                 s.frozenProcesses.append(contentsOf: provisional)
                 if docker { s.dockerFrozen = true }
             }
         } catch {
-            Log.error("could not journal freeze of \(group.bundleId): \(error.localizedDescription); left running")
+            manager.fail("lid close: could not journal the freeze of \(group.name) (\(group.bundleId)): \(error.localizedDescription); its \(candidates.count) pid(s) were left running")
             return
         }
         let report = freezer.suspend(candidates, expectedParents: group.expectedParents)
-        // One write replaces the provisional entries: confirmed stops gain
-        // their identity, skipped pids (already stopped, gone, reparented,
-        // reused) leave. If this write fails the provisional entries stay
-        // on disk, still without identity, so nothing later resumes them;
-        // any that really are stopped are reported for manual recovery.
+        // One write promotes the stops Insomnia made: they gain their
+        // identity (start time to the microsecond, boot session) and become
+        // resumable. Skipped pids (already stopped, gone, reparented,
+        // reused) leave. If the app dies before this write, the stopped
+        // pids keep entries without identity and are reported for a person
+        // to check instead of being resumed.
         let suspended = Set(report.suspended)
         let confirmed = candidates.filter { suspended.contains($0.pid) }
         do {
@@ -264,7 +270,31 @@ final class LidActions {
                 if docker, confirmed.isEmpty { s.dockerFrozen = false }
             }
         } catch {
-            Log.error("could not confirm freeze of \(group.bundleId) in the journal: \(error.localizedDescription); \(candidates.count) pid(s) stay journaled without identity and will not be resumed automatically")
+            // Nothing on disk can resume these stops, but this run still
+            // knows they are Insomnia's: undo them now. cancelStops checks
+            // each identity again and sends SIGCONT even to a process that
+            // does not show as stopped yet, since its SIGSTOP may still be
+            // pending; resume would call that one running and skip it,
+            // leaving it to stop a moment later with nothing to resume it.
+            let undo = freezer.cancelStops(confirmed)
+            let stuck = undo.failed + undo.unverifiable + undo.unobserved
+            // Every provisional entry but the stuck ones now names a pid
+            // that runs: resumed, gone, or never stopped by this freeze.
+            // They leave the journal, and so does a Docker flag this
+            // freeze set, unless part of Docker is still stopped. If the
+            // disk refuses that write too, the status leaves them out
+            // until a later write takes them off. The stuck ones stay
+            // without identity, are never signaled, and lid open reports
+            // them if they are still stopped.
+            manager.clearUndoneFreeze(.init(
+                pids: candidatePids.subtracting(stuck),
+                docker: setsDockerFlag && stuck.isEmpty
+            ))
+            let outcome = stuck.isEmpty
+                ? "so this freeze of \(group.name) is undone"
+                : "and pid(s) \(stuck.map(String.init).joined(separator: ", ")) may still be stopped; they stay journaled without identity, so Insomnia will not resume them, and lid open reports the ones still stopped"
+            manager.fail("lid close: could not confirm the freeze of \(group.name) (\(group.bundleId)) in the journal: \(error.localizedDescription); resumed \(undo.resumed.count) of the \(confirmed.count) pid(s) it had just stopped, \(outcome)")
+            return
         }
         Log.info("froze \(group.name) (\(report.suspended.count) pid(s), \(report.skipped.count) skipped)")
     }

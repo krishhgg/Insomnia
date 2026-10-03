@@ -1224,26 +1224,41 @@ final class LidActionsTests: XCTestCase {
         XCTAssertEqual(h.procs.resumed, [[100, 102]])
     }
 
-    // MARK: Provisional freeze entries
+    /// A fresh config does not opt in to the automatic scope: with Dock
+    /// apps running, only the freeze list (and idle Docker) is frozen.
+    func testFreezeAllIsOffByDefault() async throws {
+        addDockAndAccessoryApps()
+        let (m, actions) = await make()
+        XCTAssertFalse(m.config.freezeAllApps)
+        await m.start(duration: 3600)
 
-    /// Until the kernel has reported which pids it stopped, the journal must
-    /// not claim any of them. Entries are written without identity first
-    /// and only the confirmed SIGSTOPs gain one.
-    func testCandidatesAreJournaledWithoutIdentityUntilTheKernelConfirmsTheStop() async throws {
+        await actions.onClose()
+
+        XCTAssertEqual(h.procs.suspended, [[100, 101, 102], [400, 401]])
+        XCTAssertEqual(try h.store.loadState()?.frozenPids, [100, 101, 102, 400, 401])
+    }
+
+    // MARK: Journal before signal
+
+    /// Every candidate is on disk when its SIGSTOP goes out, but without
+    /// identity, so the disk at that moment holds nothing recovery would
+    /// resume. The confirming write gives Insomnia's own stops their
+    /// identity and drops the pid the kernel refused.
+    func testCandidatesAreJournaledWithoutIdentityBeforeTheStop() async throws {
         let (m, actions) = await make()
         h.procs.refuseSuspend = [101]
         await m.start(duration: 3600)
         let store = h.store
-        let provisional = Locked(true)
+        let journaledFirst = Locked(true)
         h.procs.onSuspend = { pids in
             let s = (try? store.loadState()) ?? nil
             let mine = (s?.frozenProcesses ?? []).filter { pids.contains($0.pid) }
-            if mine.map(\.pid) != pids || !mine.allSatisfy({ $0.identity == nil }) { provisional.value = false }
+            if mine.map(\.pid) != pids || !mine.allSatisfy({ $0.identity == nil }) { journaledFirst.value = false }
         }
 
         await actions.onClose()
 
-        XCTAssertTrue(provisional.value, "candidates were journaled as owned before the kernel confirmed the stop")
+        XCTAssertTrue(journaledFirst.value, "SIGSTOP went out before the pid was on disk, or the entry already had an identity")
         let s = try XCTUnwrap(try store.loadState())
         XCTAssertEqual(s.frozenProcesses, [
             FrozenProcess(pid: 100, startedAt: 1000),
@@ -1255,18 +1270,95 @@ final class LidActionsTests: XCTestCase {
         XCTAssertEqual(m.state, s)
     }
 
-    /// Greptile P1: a skipped pid whose removal from the journal fails must
-    /// not stay recorded as owned, or the next resume SIGCONTs a process
-    /// Insomnia never stopped. Whatever the failed confirmation leaves on
-    /// disk has to be non-resumable.
-    func testSkippedPidWhoseConfirmationSaveFailsIsNeverResumed() async throws {
+    /// The app can die between any two steps of a freeze: before the
+    /// journal write, between that write and the SIGSTOP, between the
+    /// SIGSTOP and the confirming write, or after it. The disk does not
+    /// change across the signal itself, so three snapshots cover every gap.
+    /// Pid 101 was stopped by somebody else before the close, so the
+    /// SIGSTOP skipped it. A relaunch from any snapshot must never resume
+    /// it, and resumes 100 and 102 only once their stop was confirmed.
+    func testAppDeathBetweenAnyTwoFreezeStepsNeverResumesASkippedPid() async throws {
+        let (m, actions) = await make(dockerIdle: { false })
+        h.procs.refuseSuspend = [101]
+        await m.start(duration: 3600)
+        let store = h.store
+        let atSignal = Locked<RuntimeState?>(nil)
+        h.procs.onSuspend = { _ in atSignal.value = (try? store.loadState()) ?? nil }
+        let beforeClose = try XCTUnwrap(try store.loadState())
+
+        await actions.onClose()
+
+        let snapshots: [(moment: String, disk: RuntimeState, resumed: [Int32])] = [
+            ("before the journal write", beforeClose, []),
+            ("between the journal write and the confirming write", try XCTUnwrap(atSignal.value), []),
+            ("after the confirming write", try XCTUnwrap(try store.loadState()), [100, 102]),
+        ]
+        for (moment, disk, resumed) in snapshots {
+            let relaunch = Harness()
+            defer { relaunch.home.destroy() }
+            try relaunch.store.saveState(disk)
+            // 101 is stopped by its other owner; 100 and 102 are stopped
+            // if Insomnia's SIGSTOP went out before the death.
+            relaunch.procs.stoppedNow = [100, 101, 102]
+
+            let m2 = relaunch.makeManager()
+            await m2.reconcile()
+
+            XCTAssertFalse(relaunch.procs.signaled.contains(101), "\(moment): SIGCONT to a process Insomnia never stopped")
+            XCTAssertEqual(relaunch.procs.signaled, resumed, moment)
+            let kept = try XCTUnwrap(try relaunch.store.loadState(), moment).frozenProcesses
+            XCTAssertTrue(kept.allSatisfy { $0.identity == nil }, "\(moment): \(kept)")
+            if !kept.isEmpty {
+                let err = try XCTUnwrap(m2.lastError, moment)
+                XCTAssertTrue(err.contains("Check each one first"), "\(moment): \(err)")
+            }
+        }
+    }
+
+    /// Fail closed: when the journal cannot be written, no SIGSTOP is sent.
+    /// Nothing may be stopped without a durable record that resumes it.
+    func testJournalWriteFailureBeforeTheStopSignalsNothing() async throws {
+        let (m, actions) = await make(mute: false)
+        m.config.darkenDisplayOnLidClose = false
+        await m.start(duration: 3600)
+        let file = h.home.paths.stateFile.path
+        // Rename over an immutable state.json is refused.
+        try FileManager.default.setAttributes([.immutable: true], ofItemAtPath: file)
+        defer { try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: file) }
+
+        await actions.onClose()
+        try FileManager.default.setAttributes([.immutable: false], ofItemAtPath: file)
+
+        XCTAssertEqual(h.procs.suspended, [], "SIGSTOP sent although the freeze could not be journaled")
+        let s = try XCTUnwrap(try h.store.loadState())
+        XCTAssertEqual(s.frozenProcesses, [])
+        XCTAssertFalse(s.dockerFrozen)
+        XCTAssertEqual(m.state, s)
+        let log = logText()
+        XCTAssertTrue(log.contains("could not journal the freeze of Slack (com.tinyspeck.slackmacgap)"), log)
+        XCTAssertTrue(log.contains("its 3 pid(s) were left running"), log)
+        // The status menu shows it, not only the log; Docker failed last.
+        let warning = try XCTUnwrap(m.lastError)
+        XCTAssertTrue(warning.contains("could not journal the freeze of Docker (com.docker.docker)"), warning)
+
+        await actions.onOpen()
+        XCTAssertEqual(h.procs.signaled, [])
+    }
+
+    /// The confirming write fails after the SIGSTOPs went out. Nothing on
+    /// disk could resume those stops, so the app resumes them at once. The
+    /// disk refuses the cleanup write too, so the provisional entries stay
+    /// on disk, but the status counts nothing frozen and shows the failure.
+    /// The skipped pid is never signaled, then or on lid open. The first
+    /// write the disk takes (here at lid open) drops all three entries, the
+    /// skipped one included: that freeze never stopped it, as the
+    /// confirming write would have recorded.
+    func testStopsAreUndoneAtOnceWhenTheConfirmWriteFails() async throws {
         let (m, actions) = await make(dockerIdle: { false })
         h.procs.refuseSuspend = [101]
         await m.start(duration: 3600)
         let file = h.home.paths.stateFile.path
         h.procs.onSuspend = { _ in
-            // The confirmation write after SIGSTOP fails: rename over an
-            // immutable state.json is refused.
             try? FileManager.default.setAttributes([.immutable: true], ofItemAtPath: file)
         }
         defer { try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: file) }
@@ -1275,34 +1367,199 @@ final class LidActionsTests: XCTestCase {
         try FileManager.default.setAttributes([.immutable: false], ofItemAtPath: file)
 
         XCTAssertEqual(h.procs.suspended, [[100, 101, 102]])
+        XCTAssertEqual(h.procs.cancelled, [[100, 102]], "the stops Insomnia made were not undone at once")
+        XCTAssertEqual(h.procs.resumed, [], "a rollback through resume skips a stop that is still pending")
         let after = try XCTUnwrap(try h.store.loadState())
-        XCTAssertEqual(after.frozenPids, [100, 101, 102])
-        XCTAssertTrue(after.frozenProcesses.allSatisfy { $0.identity == nil },
-                      "failed confirmation left ownership evidence on disk: \(after.frozenProcesses)")
+        XCTAssertEqual(after.frozenProcesses, [
+            FrozenProcess(pid: 100, startedAt: nil),
+            FrozenProcess(pid: 101, startedAt: nil),
+            FrozenProcess(pid: 102, startedAt: nil),
+        ], "the disk refused every write, so the provisional entries are still there")
         XCTAssertEqual(m.state, after)
+        XCTAssertEqual(m.effectiveState.frozenProcesses, [], "the status still counts the undone freeze")
+        XCTAssertNil(StatusLines.actions(frozenCount: m.effectiveState.frozenPids.count, dockerPaused: m.effectiveState.dockerFrozen, lastGap: nil))
+        let warning = try XCTUnwrap(m.lastError, "the failure is only in the log")
+        XCTAssertTrue(warning.contains("could not confirm the freeze of Slack (com.tinyspeck.slackmacgap) in the journal"), warning)
+        XCTAssertTrue(warning.contains("resumed 2 of the 2 pid(s) it had just stopped, so this freeze of Slack is undone"), warning)
+        XCTAssertTrue(logText().contains("could not clear the entries of an undone freeze from the journal"))
 
-        // 100 and 102 were stopped by Insomnia. 101 is stopped too, but by
-        // somebody else: that is why the kernel refused our SIGSTOP. Nothing
-        // on disk distinguishes them, so none may be resumed.
-        h.procs.stoppedNow = [100, 101, 102]
+        // 101 is still stopped by its other owner; 100 and 102 run again.
+        h.procs.stoppedNow = [101]
         await actions.onOpen()
-        XCTAssertFalse(h.procs.signaled.contains(101), "SIGCONT sent to a process Insomnia never stopped")
-        XCTAssertEqual(h.procs.signaled, [], "provisional entries were treated as ownership")
-        let opened = try XCTUnwrap(try h.store.loadState())
-        XCTAssertEqual(opened.frozenPids, [100, 101, 102], "stopped pids without proof must all stay for manual recovery")
-        XCTAssertTrue(opened.frozenProcesses.allSatisfy { $0.identity == nil }, "\(opened.frozenProcesses)")
-        let err = try XCTUnwrap(m.lastError)
-        XCTAssertTrue(err.contains("100, 101, 102"), err)
-        XCTAssertTrue(err.contains("interrupted"), "message must name an unconfirmed freeze as a cause: \(err)")
-        XCTAssertTrue(err.contains("Check each one first"), "message must ask for verification before any CONT: \(err)")
+        XCTAssertEqual(h.procs.signaled, [100, 102], "SIGCONT to a process Insomnia never stopped")
+        XCTAssertEqual(try h.store.loadState()?.frozenProcesses, [])
+        XCTAssertEqual(m.effectiveState, m.state)
+        XCTAssertFalse(m.lastError?.contains("journaled without identity") ?? false, "lid open reported a pid this freeze never stopped: \(m.lastError ?? "")")
     }
 
-    /// A crash between the provisional write and the confirmation leaves
-    /// identity-less entries. The next launch must not resume them.
-    func testProvisionalEntriesLeftByACrashAreNotResumedAfterRestart() async throws {
-        var crashed = RuntimeState()
-        crashed.frozenProcesses = [FrozenProcess(pid: 100, startedAt: nil), FrozenProcess(pid: 101, startedAt: nil)]
-        try h.store.saveState(crashed)
+    /// The confirming write fails once and the disk takes the next write:
+    /// the cleanup removes the undone entries right away, so the journal
+    /// and the status agree, and the warning stays in the status menu.
+    func testAnUndoneFreezeLeavesTheJournalWhenTheNextWriteSucceeds() async throws {
+        let (m, actions) = await make(dockerIdle: { false })
+        h.procs.refuseSuspend = [101]
+        await m.start(duration: 3600)
+        let file = h.home.paths.stateFile.path
+        h.procs.onSuspend = { _ in
+            try? FileManager.default.setAttributes([.immutable: true], ofItemAtPath: file)
+        }
+        h.procs.onCancelStops = { _ in
+            try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: file)
+        }
+        defer { try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: file) }
+
+        await actions.onClose()
+
+        XCTAssertEqual(h.procs.cancelled, [[100, 102]])
+        let after = try XCTUnwrap(try h.store.loadState())
+        XCTAssertEqual(after.frozenProcesses, [])
+        XCTAssertEqual(m.state, after)
+        XCTAssertEqual(m.effectiveState, after)
+        let warning = try XCTUnwrap(m.lastError)
+        XCTAssertTrue(warning.contains("so this freeze of Slack is undone"), warning)
+        XCTAssertFalse(logText().contains("could not clear the entries of an undone freeze"))
+    }
+
+    /// Docker's freeze is undone while Slack's stands. The status counts
+    /// Slack's three pids and no paused Docker, although the disk kept the
+    /// Docker flag and Docker's provisional entries.
+    func testAnUndoneDockerFreezeIsNotShownAsPaused() async throws {
+        let (m, actions) = await make(mute: false)
+        m.config.darkenDisplayOnLidClose = false
+        await m.start(duration: 3600)
+        let file = h.home.paths.stateFile.path
+        h.procs.onSuspend = { pids in
+            if pids.contains(400) { try? FileManager.default.setAttributes([.immutable: true], ofItemAtPath: file) }
+        }
+        defer { try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: file) }
+
+        await actions.onClose()
+
+        XCTAssertEqual(h.procs.cancelled, [[400, 401]])
+        let disk = try XCTUnwrap(try h.store.loadState())
+        XCTAssertTrue(disk.dockerFrozen)
+        XCTAssertEqual(disk.frozenPids, [100, 101, 102, 400, 401])
+        let status = m.effectiveState
+        XCTAssertFalse(status.dockerFrozen, "Docker runs again but the status says paused")
+        XCTAssertEqual(status.frozenPids, [100, 101, 102])
+        XCTAssertEqual(StatusLines.actions(frozenCount: status.frozenPids.count, dockerPaused: status.dockerFrozen, lastGap: nil), "3 apps frozen")
+        let warning = try XCTUnwrap(m.lastError)
+        XCTAssertTrue(warning.contains("so this freeze of Docker is undone"), warning)
+    }
+
+    /// A pid the undo could not resume stays counted as frozen, and so does
+    /// Docker, since part of it may still be stopped. The warning names it.
+    func testAPidTheUndoCouldNotResumeStaysInTheStatus() async throws {
+        let (m, actions) = await make(mute: false)
+        m.config.darkenDisplayOnLidClose = false
+        await m.start(duration: 3600)
+        h.procs.failResume = [401]
+        let file = h.home.paths.stateFile.path
+        h.procs.onSuspend = { pids in
+            if pids.contains(400) { try? FileManager.default.setAttributes([.immutable: true], ofItemAtPath: file) }
+        }
+        defer { try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: file) }
+
+        await actions.onClose()
+
+        XCTAssertEqual(h.procs.signaled, [400])
+        let status = m.effectiveState
+        XCTAssertEqual(status.frozenPids, [100, 101, 102, 401])
+        XCTAssertTrue(status.dockerFrozen)
+        let warning = try XCTUnwrap(m.lastError)
+        XCTAssertTrue(warning.contains("resumed 1 of the 2 pid(s) it had just stopped, and pid(s) 401 may still be stopped"), warning)
+    }
+
+    /// The Docker flag was already set by an earlier freeze whose pid is
+    /// still stopped (a lid open could not resume it). Undoing this
+    /// close's freeze of a new Docker child leaves that flag alone.
+    func testAnUndoneFreezeKeepsADockerFlagItDidNotSet() async throws {
+        let (m, actions) = await make(mute: false)
+        m.config.darkenDisplayOnLidClose = false
+        m.config.freezeList = []
+        await m.start(duration: 3600)
+        var earlier = try XCTUnwrap(try h.store.loadState())
+        earlier.frozenProcesses = [FrozenProcess(pid: 400, startedAt: 4000)]
+        earlier.dockerFrozen = true
+        try h.store.saveState(earlier)
+        h.procs.stoppedNow = [400]
+        let file = h.home.paths.stateFile.path
+        h.procs.onSuspend = { _ in
+            try? FileManager.default.setAttributes([.immutable: true], ofItemAtPath: file)
+        }
+        defer { try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: file) }
+
+        await actions.onClose()
+
+        XCTAssertEqual(h.procs.cancelled, [[401]])
+        let status = m.effectiveState
+        XCTAssertEqual(status.frozenProcesses, [FrozenProcess(pid: 400, startedAt: 4000)])
+        XCTAssertTrue(status.dockerFrozen, "the undo cleared a Docker flag an earlier freeze set")
+    }
+
+    /// Owed edits go out before the write that carries them, so a Docker
+    /// freeze journaled afterwards keeps its flag.
+    func testOwedEditsAreWrittenBeforeTheNextChange() async throws {
+        let m = h.makeManager()
+        await m.start(duration: 3600)
+        try m.journal { s in
+            s.frozenProcesses = [FrozenProcess(pid: 400, startedAt: nil)]
+            s.dockerFrozen = true
+        }
+        let file = h.home.paths.stateFile.path
+        try FileManager.default.setAttributes([.immutable: true], ofItemAtPath: file)
+        m.clearUndoneFreeze(.init(pids: [400], docker: true))
+        try FileManager.default.setAttributes([.immutable: false], ofItemAtPath: file)
+        XCTAssertEqual(try h.store.loadState()?.frozenPids, [400])
+        XCTAssertEqual(m.effectiveState.frozenPids, [])
+        XCTAssertFalse(m.effectiveState.dockerFrozen)
+
+        try m.journal { s in
+            s.frozenProcesses.append(FrozenProcess(pid: 500, startedAt: nil))
+            s.dockerFrozen = true
+        }
+
+        let disk = try XCTUnwrap(try h.store.loadState())
+        XCTAssertEqual(disk.frozenPids, [500])
+        XCTAssertTrue(disk.dockerFrozen)
+        XCTAssertEqual(m.effectiveState, disk)
+    }
+
+    /// The kernel can still hold a SIGSTOP when the confirming write fails,
+    /// so that target still looks running at the rollback. The rollback
+    /// sends it SIGCONT anyway, which discards the pending stop. A rollback
+    /// that signals only stopped processes would skip it, and it would stop
+    /// a moment later with no journal entry able to resume it.
+    func testAStopStillPendingWhenTheConfirmWriteFailsIsCancelled() async throws {
+        let (m, actions) = await make(dockerIdle: { false })
+        h.procs.delayedStops = [102]
+        await m.start(duration: 3600)
+        let file = h.home.paths.stateFile.path
+        h.procs.onSuspend = { _ in
+            try? FileManager.default.setAttributes([.immutable: true], ofItemAtPath: file)
+        }
+        defer { try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: file) }
+
+        await actions.onClose()
+        try FileManager.default.setAttributes([.immutable: false], ofItemAtPath: file)
+
+        XCTAssertEqual(h.procs.suspended, [[100, 101, 102]])
+        XCTAssertEqual(h.procs.cancelled, [[100, 101, 102]])
+        XCTAssertEqual(h.procs.signaled, [100, 101, 102])
+        XCTAssertEqual(h.procs.pendingStops, [], "the stop still pending at the rollback was not cancelled")
+        h.procs.deliverPendingStops()
+        XCTAssertEqual(h.procs.stoppedNow, [], "a pid stopped after the rollback, and nothing journaled can resume it")
+        let log = logText()
+        XCTAssertTrue(log.contains("resumed 3 of the 3 pid(s) it had just stopped"), log)
+    }
+
+    /// Entries without identity come from a build that journaled
+    /// `frozenPids`, or from a freeze whose stop was never confirmed. The
+    /// next launch must not resume them, and the message names both causes.
+    func testIdentityLessEntriesFromAnOlderBuildAreNotResumedAfterRestart() async throws {
+        var legacy = RuntimeState()
+        legacy.frozenProcesses = [FrozenProcess(pid: 100, startedAt: nil), FrozenProcess(pid: 101, startedAt: nil)]
+        try h.store.saveState(legacy)
         h.procs.stoppedNow = [100]
 
         let m = h.makeManager()
@@ -1311,7 +1568,10 @@ final class LidActionsTests: XCTestCase {
         XCTAssertEqual(h.procs.signaled, [], "restart resumed a pid it cannot prove it stopped")
         let s = try XCTUnwrap(try h.store.loadState())
         XCTAssertEqual(s.frozenProcesses, [FrozenProcess(pid: 100, startedAt: nil)], "the stopped one stays for a person; the running one is gone")
-        XCTAssertNotNil(m.lastError)
+        let err = try XCTUnwrap(m.lastError)
+        XCTAssertTrue(err.contains("older build"), err)
+        XCTAssertTrue(err.contains("before the stop was confirmed in the journal"), err)
+        XCTAssertTrue(err.contains("Check each one first"), "message must ask for verification before any CONT: \(err)")
     }
 }
 
