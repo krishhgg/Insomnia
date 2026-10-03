@@ -128,13 +128,18 @@ on a reading taken with the lid known to be open, the display awake and
 the keyboard backlight neither suppressed nor dimmed, keeps the entry
 when the read fails, and reads again every 3 s for a minute, then every
 minute while the entry waits, reading nothing while the lid is not known
-to be open. An entry found set since that state.json cannot clear is not
-read or written again, and only its clear is retried. The sampler takes
-no reading of a device whose brightness is journaled, and each level
-written from the journal or found set since becomes its sample, so a
-close right after a late restore journals that level. Unit tests with an
-injected version and fake classes only; the rows below stay "Not run",
-and the guards do not stand in for them.
+to be open. An entry found set since, or written, that state.json cannot
+clear is not read or written again, and only its clear is retried; the
+clear goes into the journal ahead of any later write, so a lid close
+journals the level the device reads. When the write fails and state.json
+cannot take the cleared flag either, backstop.sh would pass over the
+entry, so Insomnia retries it in process and holds Quit until the write
+lands or the flag is on disk. The sampler takes no reading of a device
+whose brightness is journaled, and each level written from the journal
+or found set since becomes its sample, so a close right after a late
+restore journals that level. Unit tests with an injected version and
+fake classes only; the rows below stay "Not run", and the guards do not
+stand in for them.
 
 ## Hardware validation still required
 

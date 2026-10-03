@@ -697,6 +697,7 @@ final class LidActionsTests: XCTestCase {
         XCTAssertEqual(h.keyboard.sets, [0, 0.5, 0.5])
         XCTAssertNil(try h.store.loadState()?.savedDisplayBrightness)
         XCTAssertNil(try h.store.loadState()?.savedKeyboardBrightness)
+        XCTAssertFalse(logText().contains("restored, cleared from the journal"), "only a flagged entry owes its clear: \(logText())")
     }
 
     // MARK: Display and keyboard backlight

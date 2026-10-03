@@ -415,17 +415,19 @@ final class AppServices {
 extension BrightnessSampler {
     /// Ties the sampler to `manager`'s journal (spec section 4). A device
     /// whose brightness is journaled is not read: it is at the 0 a lid
-    /// close left, or at a level not yet decided, until its restore. The
+    /// close left, or at a level not yet decided, until its restore. An
+    /// entry the manager settled but the journal has not taken yet does not
+    /// count (`effectiveState`): the device is the user's again. The
     /// display is also not read under Insomnia's own Low Power Mode. Each
     /// level the manager writes from the journal, or finds set since in
     /// place of a kept value, becomes the sample, so a lid close soon
     /// after journals that level and not a reading from before it.
     func follow(_ manager: SessionManager) {
         displayHeld = { [weak manager] in
-            guard let s = manager?.state else { return false }
+            guard let s = manager?.effectiveState else { return false }
             return s.lowPowerSetByUs || s.savedDisplayBrightness != nil
         }
-        keyboardHeld = { [weak manager] in manager?.state.savedKeyboardBrightness != nil }
+        keyboardHeld = { [weak manager] in manager?.effectiveState.savedKeyboardBrightness != nil }
         manager.didSettleBrightness = { [weak self] display, keyboard in
             self?.record(display: display, keyboard: keyboard)
         }

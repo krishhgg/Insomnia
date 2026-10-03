@@ -853,10 +853,13 @@ final class RefusedDarkeningTests: XCTestCase {
 
     /// The guard allows the call, the write fails, and state.json cannot
     /// take the cleared flag either, so on disk the entry still reads as
-    /// refused and not dirty. The end counts it anyway, since the undo
-    /// records the failure: "Restore incomplete" and the agent armed, not
-    /// a restore.
-    func testAFailedRestoreWhoseFlagCannotBeClearedIsNotReportedRestored() async throws {
+    /// refused and not dirty, which the agent passes over. The end counts
+    /// it anyway and keeps it in this process: "Restore incomplete" without
+    /// "the recovery agent retries", the end left pending, and quit held
+    /// back. Once the journal takes writes again, the flag goes first, so
+    /// the agent sees an ordinary failed restore and quit goes ahead; the
+    /// write itself lands later.
+    func testAFailedRestoreWhoseFlagCannotBeClearedHoldsQuitUntilTheJournalTakesIt() async throws {
         let now = h.clock.now
         try h.store.saveSession(Session(startedAt: now.addingTimeInterval(-7200), endsAt: now.addingTimeInterval(-60)))
         var st = RuntimeState()
@@ -872,15 +875,227 @@ final class RefusedDarkeningTests: XCTestCase {
         defer { try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: file) }
 
         await m.reconcile()
-        try FileManager.default.setAttributes([.immutable: false], ofItemAtPath: file)
 
+        let hidden = try XCTUnwrap(try h.store.loadState())
+        XCTAssertEqual(hidden.savedDisplayBrightness, 0.8)
+        XCTAssertTrue(hidden.displayRestoreRefused, "the flag could not be cleared")
+        XCTAssertFalse(hidden.isDirty)
+        XCTAssertEqual(h.backstop.arms, 1)
+        let body = try XCTUnwrap(h.notifier.posts.last { $0.title == SessionManager.incompleteTitle }?.body)
+        XCTAssertTrue(body.contains("do not quit until it is restored"), body)
+        XCTAssertFalse(body.contains("The recovery agent retries every minute"), body)
+        XCTAssertEqual(m.pendingEnd, .timer)
+        XCTAssertTrue(try XCTUnwrap(m.lastError).contains("could not mark the display brightness for retry"), m.lastError ?? "")
+
+        let held = await m.end(reason: .quit)
+        XCTAssertEqual(held, .incomplete(agentArmed: false), "quit waits while the disk hides the failed restore")
+        XCTAssertNotNil(m.pendingEnd)
+
+        try FileManager.default.setAttributes([.immutable: false], ofItemAtPath: file)
+        let handedOn = await m.end(reason: .quit)
+
+        XCTAssertEqual(handedOn, .incomplete(agentArmed: true))
+        XCTAssertNil(m.pendingEnd)
+        let dirty = try XCTUnwrap(try h.store.loadState())
+        XCTAssertEqual(dirty.savedDisplayBrightness, 0.8)
+        XCTAssertFalse(dirty.displayRestoreRefused)
+        XCTAssertTrue(dirty.isDirty, "an ordinary failed restore the agent retries")
+        XCTAssertTrue(logText().contains("display brightness 0.8, whose restore failed, marked in the journal for retry"), logText())
+
+        h.display.throwOnSet = false
+        let restored = await m.end(reason: .user)
+
+        XCTAssertEqual(restored, .restored)
+        XCTAssertEqual(h.display.sets.last, 0.8)
+        XCTAssertNil(try h.store.loadState()?.savedDisplayBrightness)
+    }
+
+    /// The same double failure, and then the write lands while state.json
+    /// still refuses every change. The panel is asleep, which would leave a
+    /// refused entry waiting, but this one is an ordinary failed restore
+    /// now and is written. The device holds the value, so quit goes ahead
+    /// even though the disk still flags the entry, and its clear lands at
+    /// the next transaction once the journal takes writes.
+    func testAKeptValueWrittenWhileTheJournalRefusesItsClearLetsQuitGo() async throws {
+        let now = h.clock.now
+        try h.store.saveSession(Session(startedAt: now.addingTimeInterval(-7200), endsAt: now.addingTimeInterval(-60)))
+        var st = RuntimeState()
+        st.savedDisplayBrightness = 0.8
+        st.displayRestoreRefused = true
+        try h.store.saveState(st)
+        h.clamshell.closed = false
+        h.display.brightness = 0
+        h.display.throwOnSet = true
+        let m = h.makeManager(retryDelay: 3600)
+        let file = h.home.paths.stateFile.path
+        try FileManager.default.setAttributes([.immutable: true], ofItemAtPath: file)
+        defer { try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: file) }
+        await m.reconcile()
+        XCTAssertEqual(m.pendingEnd, .timer)
+
+        h.display.throwOnSet = false
+        h.display.asleep = true
+        let outcome = await m.end(reason: .quit)
+
+        XCTAssertEqual(h.display.sets.last, 0.8)
+        XCTAssertEqual(outcome, .restored, "the device holds the value, and the disk shows nothing dirty")
+        XCTAssertNil(m.pendingEnd)
+        XCTAssertTrue(try XCTUnwrap(try h.store.loadState()).displayRestoreRefused, "the disk still refuses the clear")
+        XCTAssertFalse(m.effectiveState.brightnessJournaled)
+
+        try FileManager.default.setAttributes([.immutable: false], ofItemAtPath: file)
+        let later = await m.end(reason: .user)
+
+        XCTAssertEqual(later, .restored)
+        XCTAssertEqual(h.display.sets, [0.8], "written once")
+        let after = try XCTUnwrap(try h.store.loadState())
+        XCTAssertNil(after.savedDisplayBrightness)
+        XCTAssertFalse(after.displayRestoreRefused)
+        XCTAssertTrue(logText().contains("display brightness 0.8, restored, cleared from the journal"), logText())
+    }
+
+    /// A launch with no session retries a kept keyboard value, and both
+    /// the write and the clearing of its flag fail. Nothing else would
+    /// retry it, and the agent cannot see it, so the launch ends as for a
+    /// dirty journal and this process retries it until the write lands.
+    func testAKeptValueThatFailsAtALaunchWithNoSessionIsRetriedInProcess() async throws {
+        var st = RuntimeState()
+        st.savedKeyboardBrightness = 0.3
+        st.keyboardRestoreRefused = true
+        try h.store.saveState(st)
+        h.clamshell.closed = false
+        h.keyboard.brightness = 0
+        h.keyboard.throwOnSet = true
+        let m = h.makeManager(retryDelay: 0.1)
+        let file = h.home.paths.stateFile.path
+        try FileManager.default.setAttributes([.immutable: true], ofItemAtPath: file)
+        defer { try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: file) }
+
+        await m.reconcile()
+
+        XCTAssertEqual(m.pendingEnd, .backstop, "this process keeps the entry the agent cannot see")
+        let body = try XCTUnwrap(h.notifier.posts.last { $0.title == SessionManager.incompleteTitle }?.body)
+        XCTAssertTrue(body.contains("do not quit until it is restored"), body)
+        XCTAssertTrue(logText().contains("reconcile: a kept brightness failed to restore; ending as for a dirty journal"), logText())
+        XCTAssertTrue(try XCTUnwrap(try h.store.loadState()).keyboardRestoreRefused)
+
+        h.keyboard.throwOnSet = false
+        try FileManager.default.setAttributes([.immutable: false], ofItemAtPath: file)
+        try await waitFor { self.h.keyboard.sets.contains(0.3) && m.pendingEnd == nil }
+
+        XCTAssertNil(m.pendingEnd)
+        let after = try XCTUnwrap(try h.store.loadState())
+        XCTAssertNil(after.savedKeyboardBrightness)
+        XCTAssertFalse(after.keyboardRestoreRefused)
+    }
+
+    /// With no session, a re-read finds the display still at 0 and its
+    /// write fails. The cleared flag makes it an ordinary failed restore,
+    /// and the re-read ends as for a dirty journal, so the agent is armed
+    /// for it and told to retry.
+    func testAReReadWhoseWriteFailsHandsTheEntryToTheAgent() async throws {
+        var st = RuntimeState()
+        st.savedDisplayBrightness = 0.8
+        st.displayRestoreRefused = true
+        try h.store.saveState(st)
+        h.clamshell.closed = false
+        h.display.brightness = 0
+        h.display.asleep = true
+        let m = h.makeManager(keptRecheckDelay: .milliseconds(50))
+
+        await m.reconcile()
+        XCTAssertEqual(h.backstop.arms, 0)
+
+        h.display.throwOnSet = true
+        h.display.asleep = false
+        // The end arms the agent before it posts, so wait for both.
+        try await waitFor { self.h.backstop.arms == 1 && self.h.notifier.posts.contains { $0.title == SessionManager.incompleteTitle } }
+
+        XCTAssertEqual(h.backstop.arms, 1)
+        XCTAssertNil(m.pendingEnd)
         let after = try XCTUnwrap(try h.store.loadState())
         XCTAssertEqual(after.savedDisplayBrightness, 0.8)
-        XCTAssertTrue(after.displayRestoreRefused, "the flag could not be cleared")
-        XCTAssertFalse(after.isDirty)
-        XCTAssertEqual(h.backstop.arms, 1)
-        XCTAssertTrue(h.notifier.posts.contains { $0.title == SessionManager.incompleteTitle }, "\(h.notifier.posts)")
-        XCTAssertTrue(try XCTUnwrap(m.lastError).contains("could not mark the display brightness for retry"), m.lastError ?? "")
+        XCTAssertFalse(after.displayRestoreRefused)
+        XCTAssertTrue(after.isDirty)
+        let body = try XCTUnwrap(h.notifier.posts.last { $0.title == SessionManager.incompleteTitle }?.body)
+        XCTAssertTrue(body.contains("The recovery agent retries every minute"), body)
+        XCTAssertTrue(logText().contains("brightness re-check: a kept value failed to restore; ending as for a dirty journal"), logText())
+    }
+
+    /// During a session a lid open finds both kept levels set by hand, but
+    /// state.json refuses the clear. The user then turns the display down
+    /// to 0.2 and the backlight off. A lid open while the file is still
+    /// read-only writes nothing, and the sampler, no longer held by the
+    /// settled entries, takes the new levels. Once the journal takes writes
+    /// again, the lid close clears the old entries first and journals the
+    /// levels the user chose, so the open brings back 0.2 and 0, never the
+    /// old 0.8 and 0.3.
+    func testACloseAfterAClearTheJournalRefusedJournalsTheLevelChosenSince() async throws {
+        try seedSavedBrightness(sessionValid: false, refused: true)
+        h.clamshell.closed = false
+        h.display.brightness = 0
+        h.display.asleep = true
+        h.keyboard.brightness = 0
+        h.keyboard.suppressedOrDimmed = true
+        let m = h.makeManager()
+        m.config.muteOnLidClose = false
+        m.config.freezeList = []
+        m.config.freezeAllApps = false
+        let sampler = BrightnessSampler(display: h.display, keyboard: h.keyboard, idleSeconds: { 1 })
+        sampler.follow(m)
+        let freezer = FakeFreezer(apps: [], processes: [], control: h.procs)
+        let actions = LidActions(
+            manager: m,
+            freezer: freezer,
+            docker: DockerRule(freezer: freezer, probe: { true }),
+            audio: h.audio,
+            display: h.display,
+            keyboard: h.keyboard,
+            sampler: sampler
+        )
+        await m.reconcile()
+        await m.start(duration: 3600)
+        h.display.asleep = false
+        h.display.brightness = 0.5
+        h.keyboard.suppressedOrDimmed = false
+        h.keyboard.brightness = 0.6
+        let file = h.home.paths.stateFile.path
+        try FileManager.default.setAttributes([.immutable: true], ofItemAtPath: file)
+        defer { try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: file) }
+
+        await actions.onOpen()
+
+        XCTAssertTrue(try XCTUnwrap(try h.store.loadState()).hasRefusedBrightness, "still on disk")
+        XCTAssertFalse(m.effectiveState.brightnessJournaled, "settled in this process")
+
+        h.display.brightness = 0.2
+        h.keyboard.brightness = 0
+        await actions.onOpen()
+        sampler.sample()
+
+        XCTAssertEqual(h.display.sets, [])
+        XCTAssertEqual(h.keyboard.sets, [])
+        XCTAssertEqual(sampler.last?.display, 0.2)
+        XCTAssertEqual(sampler.last?.keyboard, 0)
+
+        try FileManager.default.setAttributes([.immutable: false], ofItemAtPath: file)
+        h.clamshell.closed = true
+        await actions.onClose()
+
+        let closed = try XCTUnwrap(try h.store.loadState())
+        XCTAssertEqual(closed.savedDisplayBrightness, 0.2)
+        XCTAssertEqual(closed.savedKeyboardBrightness, 0)
+        XCTAssertFalse(closed.displayRestoreRefused)
+        XCTAssertFalse(closed.keyboardRestoreRefused)
+        XCTAssertTrue(logText().contains("keyboard backlight 0.3, set since its refused restore, cleared from the journal"), logText())
+
+        h.clamshell.closed = false
+        await actions.onOpen()
+
+        XCTAssertFalse(h.display.sets.contains(0.8), "\(h.display.sets)")
+        XCTAssertFalse(h.keyboard.sets.contains(0.3), "\(h.keyboard.sets)")
+        XCTAssertEqual(h.display.brightness, 0.2)
+        XCTAssertEqual(h.keyboard.brightness, 0)
     }
 
     /// The display refused, the keyboard's write failing: the report keeps
