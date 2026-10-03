@@ -28,7 +28,11 @@ restores, `savedOutputVolume`, `savedMuted`, `savedDisplayBrightness`,
 the private brightness frameworks need the app. A saved brightness flagged
 `displayRestoreRefused` or `keyboardRestoreRefused` (the app's private-call
 guard refused that restore on this macOS) stays journaled but is not dirty
-for the app, the backstop or uninstall, which keeps state.json for it. Legacy `frozenPids` entries
+for the backstop or uninstall, which keeps state.json for it, nor for the
+app while the guard refuses that device. A build whose guard allows the call
+writes the flagged value only while the device still reads 0, the level the
+lid close left: a higher reading means the user already undid the darkening
+by hand, so the entry is cleared without a write. Legacy `frozenPids` entries
 are never signaled or cleared by the shell. A flag is cleared only after
 its undo succeeded; a journal that is unreadable or has a known key of the
 wrong type is left untouched and the run exits 1.

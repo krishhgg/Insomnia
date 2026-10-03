@@ -137,9 +137,13 @@ final class LidActions {
             }
             try manager.journal { s in
                 // Keep an earlier save if a previous close was never undone.
-                // The device answered, so one kept after a refused restore
-                // is an ordinary entry again.
-                if s.savedDisplayBrightness == nil { s.savedDisplayBrightness = value }
+                // One kept after a refused restore gives way to a level
+                // above 0: the user was told to set it by hand, so that is
+                // the level to come back to. The device answered, so the
+                // entry is an ordinary one again.
+                if s.savedDisplayBrightness == nil || (s.displayRestoreRefused && value > 0) {
+                    s.savedDisplayBrightness = value
+                }
                 s.displayRestoreRefused = false
             }
             do {
@@ -166,7 +170,10 @@ final class LidActions {
                 }
                 if let value {
                     try manager.journal { s in
-                        if s.savedKeyboardBrightness == nil { s.savedKeyboardBrightness = value }
+                        // As for the display above.
+                        if s.savedKeyboardBrightness == nil || (s.keyboardRestoreRefused && value > 0) {
+                            s.savedKeyboardBrightness = value
+                        }
                         s.keyboardRestoreRefused = false
                     }
                     do {
