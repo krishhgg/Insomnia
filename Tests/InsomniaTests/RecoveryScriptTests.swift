@@ -2518,6 +2518,94 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(edited.stderr.contains("Nothing was changed"), edited.stderr)
     }
 
+    /// A zip unpacked by a tool that keeps group and other write bits, or a
+    /// download given an ACL, leaves a bundle other accounts could edit.
+    /// Neither is part of the signature: the bundle verifies with them, and
+    /// the installed copy loses both, keeps the quarantine flag and still
+    /// passes the real codesign and the requirement the agent pins.
+    func testInstallFromAPrebuiltAppDropsOtherAccountsWriteAccessButKeepsTheSignatureAndQuarantine() throws {
+        try fx.prepareInstall()
+        try fx.writeInstallCopies(extraConstants: ["CODESIGN": "/usr/bin/codesign"])
+        let prebuilt = try fx.writePrebuiltApp(machO: true)
+        let sign = try fx.runTool("/usr/bin/codesign", ["--force", "--sign", "-", prebuilt.path])
+        XCTAssertEqual(sign.status, 0, sign.output)
+        let loosen = try fx.runTool("/bin/chmod", ["-R", "go+w", prebuilt.path])
+        XCTAssertEqual(loosen.status, 0, loosen.output)
+        let resources = prebuilt.appendingPathComponent("Contents/Resources")
+        for (path, rule) in [(resources.path, "everyone allow add_file,delete_child"),
+                             (resources.appendingPathComponent("backstop.sh").path, "everyone allow write,append")] {
+            let acl = try fx.runTool("/bin/chmod", ["+a", rule, path])
+            XCTAssertEqual(acl.status, 0, acl.output)
+        }
+        let mark = try fx.runTool("/usr/bin/xattr", ["-w", "com.apple.quarantine", "0081;66f00000;Safari;", prebuilt.path])
+        XCTAssertEqual(mark.status, 0, mark.output)
+        XCTAssertFalse(try writableByOthers(prebuilt).isEmpty)
+        XCTAssertEqual(try aclEntries(prebuilt).count, 2, "the ACLs are in place before the install")
+        let before = try fx.runTool("/usr/bin/codesign", ["--verify", "--strict", "--deep", prebuilt.path])
+        XCTAssertEqual(before.status, 0, "modes and ACLs are not part of the signature: \(before.output)")
+        fx.setMode("launchctl", "loaded")
+
+        let r = try fx.run(fx.installRedirected, ["--allow-unverified-origin", "--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertEqual(try writableByOthers(fx.app), [], "no group or other write bit is left")
+        XCTAssertEqual(try aclEntries(fx.app), [], "no ACL entry is left")
+        let quarantine = try fx.runTool("/usr/bin/xattr", ["-p", "com.apple.quarantine", fx.app.path])
+        XCTAssertEqual(quarantine.status, 0, "the quarantine flag stays: \(quarantine.output)")
+        XCTAssertFalse(quarantine.output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        let installed = try fx.runTool("/usr/bin/codesign", ["--verify", "--strict", "--deep", fx.app.path])
+        XCTAssertEqual(installed.status, 0, "the installed copy still verifies: \(installed.output)")
+        let requirement = try CodeRequirement.designated(ofCodeAt: prebuilt)
+        XCTAssertTrue(r.stdout.contains("LaunchAgent will require: \(requirement)"), r.stdout)
+        XCTAssertNoThrow(try CodeRequirement.verify(codeAt: fx.app, satisfies: requirement))
+    }
+
+    /// A source build made under umask 002 has group-writable files and
+    /// folders; the installed bundle has none.
+    func testInstallFromSourceUnderAGroupWritableUmaskLeavesNothingGroupWritable() throws {
+        try fx.prepareInstall()
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        fx.setMode("launchctl", "loaded")
+        let wrapper = fx.root.appendingPathComponent("umask-002.sh")
+        try "umask 0002\nexec /bin/bash \"\(fx.installRedirected.path)\" \"$@\"\n".write(to: wrapper, atomically: true, encoding: .utf8)
+
+        let r = try fx.run(wrapper, extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertTrue(fx.exists(fx.installedBackstop))
+        XCTAssertEqual(try writableByOthers(fx.app), [], "no group or other write bit is left")
+    }
+
+    /// Every path in `bundle`, itself included.
+    private func bundlePaths(_ bundle: URL) throws -> [String] {
+        let walk = try XCTUnwrap(FileManager.default.enumerator(atPath: bundle.path))
+        var paths = [bundle.path]
+        while let relative = walk.nextObject() as? String {
+            paths.append(bundle.appendingPathComponent(relative).path)
+        }
+        return paths
+    }
+
+    /// The paths in `bundle` (symbolic links aside) that group or other may write.
+    private func writableByOthers(_ bundle: URL) throws -> [String] {
+        try bundlePaths(bundle).filter { path in
+            let attributes = try FileManager.default.attributesOfItem(atPath: path)
+            guard attributes[.type] as? FileAttributeType != .typeSymbolicLink else { return false }
+            let mode = (attributes[.posixPermissions] as? NSNumber)?.intValue ?? 0
+            return mode & 0o022 != 0
+        }
+    }
+
+    /// The ACL entries `ls -led` prints for the paths in `bundle`, such as
+    /// " 0: group:everyone allow write,append".
+    private func aclEntries(_ bundle: URL) throws -> [String] {
+        try bundlePaths(bundle).flatMap { path in
+            let ls = try fx.runTool("/bin/ls", ["-led", path])
+            XCTAssertEqual(ls.status, 0, ls.output)
+            return ls.output.split(separator: "\n").map(String.init).filter { $0.range(of: #"^ \d+: "#, options: .regularExpression) != nil }
+        }
+    }
+
     func testInstallFromPrebuiltAppStopsBeforeSudoWhenItsSignatureDoesNotVerify() throws {
         try fx.prepareInstall()
         try fx.installMachinery()

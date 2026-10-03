@@ -125,10 +125,14 @@ the installed bundle's code requirement (for an ad-hoc build, the cdhash of
 that build) and runs `codesign --verify --strict` against it before executing
 the `backstop.sh` sealed inside the bundle. An edited bundle or script fails
 that check: the agent writes one line to `insomnia.log` and runs nothing until
-you reinstall. No executable is kept in a writable support directory. The plist
-in `~/Library/LaunchAgents` is still a per-user file that any program running
-as you can edit, like every LaunchAgent; the app rewrites it at the next
-session start when it does not match, which is a repair, not a tamper check.
+you reinstall. So no other account can edit it, the installer removes group
+and other write permission and every ACL from the bundle it installs. The
+signature covers neither, so the bundle still verifies, and extended
+attributes such as a download's quarantine flag are kept. No executable is
+kept in a writable support directory. The plist in `~/Library/LaunchAgents`
+is still a per-user file that any program running as you can edit, like
+every LaunchAgent; the app rewrites it at the next session start when it does
+not match, which is a repair, not a tamper check.
 
 What the app pins is the requirement of the code it is itself running, read
 through the Security framework after checking that the bundle on disk is still

@@ -44,7 +44,10 @@ closed bag. Its design goals are to:
   their own folder only, never the one above it: the release zip carries
   both scripts at its top level, unpacked wherever the user chose, such as
   `/tmp`. From a zip, `install.sh` without `--app` stops, and
-  `uninstall.sh` runs the verified bundle's sealed `backstop.sh`.
+  `uninstall.sh` runs the verified bundle's sealed `backstop.sh`. The
+  staged copy of the bundle loses group and other write permission and
+  every ACL before it is verified and installed (neither is part of the
+  signature); extended attributes, the quarantine flag among them, stay.
 
 ## Core model
 

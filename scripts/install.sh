@@ -54,6 +54,7 @@ PLUTIL=/usr/bin/plutil
 CODESIGN=/usr/bin/codesign
 SPCTL=/usr/bin/spctl
 DITTO=/usr/bin/ditto
+CHMOD=/bin/chmod
 LOCKF=/usr/bin/lockf
 MV=/bin/mv
 LOCK_TIMEOUT_SECONDS=10
@@ -325,6 +326,18 @@ NEW_APP="$STAGE/Insomnia.app"
 # ditto keeps the signature's resource seal and every attribute intact (a
 # downloaded bundle keeps its quarantine flag; Gatekeeper decides at launch).
 "$DITTO" "$SOURCE_APP" "$NEW_APP"
+# It keeps the source's modes and ACLs as well. A zip unpacked by a tool
+# that keeps group or other write bits, a build made under umask 002, or a
+# bundle given an ACL would let other accounts edit the installed bundle.
+# An edited backstop.sh breaks the seal, so the agent stops running any
+# recovery. The signature covers neither mode bits nor ACLs: both go here
+# and the bundle still verifies (the check below runs on this copy).
+# Extended attributes, the quarantine flag among them, stay. chmod -R
+# skips symbolic links.
+if ! "$CHMOD" -R go-w "$NEW_APP" || ! "$CHMOD" -R -N "$NEW_APP"; then
+  echo "could not remove group and other write permission and ACLs from the staged bundle $NEW_APP (see the error above). $SUDOERS is installed; the app at $APP and the LaunchAgent were not touched." >&2
+  exit 1
+fi
 # backstop.sh was sealed into the bundle before signing (build-app.sh), so
 # the signature's resource seal covers it. The LaunchAgent below verifies
 # the whole bundle against the requirement read here and only then runs this
