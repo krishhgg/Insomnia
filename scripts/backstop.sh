@@ -291,7 +291,7 @@ run_read() { # varname command args...
   rcfile="$APP_SUPPORT/.backstop.$$.$bounded_calls.rc"
   outfile="$APP_SUPPORT/.backstop.$$.$bounded_calls.out"
   if (( bounded_calls == 1 )); then
-    rm -f "$APP_SUPPORT"/.backstop.*.pid "$APP_SUPPORT"/.backstop.*.rc "$APP_SUPPORT"/.backstop.*.out
+    "$RM" -f "$APP_SUPPORT"/.backstop.*.pid "$APP_SUPPORT"/.backstop.*.rc "$APP_SUPPORT"/.backstop.*.out
   fi
   (
     "$@" </dev/null >"$outfile" 2>/dev/null &
@@ -320,7 +320,7 @@ run_read() { # varname command args...
   # SIGKILL is left behind without the lock.
   if [[ -s "$rcfile" ]]; then wait "$supervisor" 2>/dev/null || true; fi
   printf -v "$name" '%s' "$(cat "$outfile" 2>/dev/null)"
-  rm -f "$pidfile" "$rcfile" "$outfile"
+  "$RM" -f "$pidfile" "$rcfile" "$outfile"
   return "$rc"
 }
 
@@ -491,7 +491,7 @@ fi
 # is still a copy of that session's times, so one that cannot be removed is
 # logged on every run until a person removes it. Never fails the caller.
 remove_end_record() {
-  rm -f "$ENDED" 2>/dev/null && return 0
+  "$RM" -f "$ENDED" 2>/dev/null && return 0
   log warn "could not remove $ENDED; it matches no session.json, so it ends nothing, but it stays until removed by hand (ls -lO shows its flags)"
   return 0
 }
@@ -659,7 +659,7 @@ fi
 # Remove session.json, then the record of its end, which means something
 # only while the file it copies is there. False when session.json stays.
 remove_session() {
-  rm -f "$SESSION" 2>/dev/null || return 1
+  "$RM" -f "$SESSION" 2>/dev/null || return 1
   remove_end_record
 }
 
@@ -669,8 +669,8 @@ remove_session() {
 record_end() {
   local tmp="$ENDED.tmp.$$"
   if [[ -f "$ENDED" ]] && "$CMP" -s "$SESSION" "$ENDED"; then return 0; fi
-  if cat "$SESSION" > "$tmp" 2>/dev/null; then mv -f "$tmp" "$ENDED" 2>/dev/null || true; fi
-  rm -f "$tmp" 2>/dev/null || true
+  if cat "$SESSION" > "$tmp" 2>/dev/null; then "$MV" -f "$tmp" "$ENDED" 2>/dev/null || true; fi
+  "$RM" -f "$tmp" 2>/dev/null || true
   [[ -f "$ENDED" ]] && "$CMP" -s "$SESSION" "$ENDED"
 }
 
