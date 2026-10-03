@@ -1,9 +1,11 @@
 #!/bin/bash
 # Reverse install.sh. Quits the app, takes the recovery lock, runs the current
-# backstop with --force under that same lock, verifies for itself that the
-# journal is clean, and only then removes the LaunchAgent, the sudoers rule,
-# the app bundle, and the journal. Keeps config.json and the logs unless
-# --purge. Everything after the quit happens while this process holds
+# backstop with --force under that same lock (the checkout's copy, else the
+# one sealed in the installed bundle, else the writable copy older installs
+# left in Application Support), verifies for itself that the journal is
+# clean, and only then removes the LaunchAgent, the sudoers rule, the app
+# bundle (backstop.sh included), and the journal. Keeps config.json and the
+# logs unless --purge. Everything after the quit happens while this process holds
 # APP_SUPPORT/.recovery.lock, so neither a queued periodic backstop nor a
 # relaunched app can republish the journal while it is being removed.
 #
@@ -17,7 +19,10 @@
 # exact shape), and then rmdir's its own directories only if they are empty.
 # Only regular files are removed; anything else at one of those paths is
 # left with a message. The lock file is never unlinked, so --purge leaves
-# APP_SUPPORT/.recovery.lock (and therefore APP_SUPPORT).
+# APP_SUPPORT/.recovery.lock (and therefore APP_SUPPORT). The bundle trees
+# removed are the installed app and install.sh's own leftovers beside it,
+# matched by the exact names install.sh gives them, and the agent plist goes
+# with the candidate plists install.sh and the app stage it from.
 #
 # Honours INSOMNIA_HOME with the same layout as the app (see Paths.swift).
 set -euo pipefail
@@ -40,8 +45,10 @@ OSASCRIPT=/usr/bin/osascript
 LAUNCHCTL=/bin/launchctl
 SUDO=/usr/bin/sudo
 PLUTIL=/usr/bin/plutil
+CODESIGN=/usr/bin/codesign
 LOCKF=/usr/bin/lockf
 DEFAULTS=/usr/bin/defaults
+KILL=/bin/kill
 DATE=/bin/date
 MKDIR=/bin/mkdir
 RM=/bin/rm
@@ -51,10 +58,10 @@ LOCK_TIMEOUT_SECONDS=10
 # How long to wait for the app to exit after asking it to quit.
 QUIT_WAIT_SECONDS=10
 # Longest one external call made by this script itself (pgrep, defaults,
-# launchctl) may run before it is stopped with SIGTERM, then SIGKILL. These
-# are unprivileged and never touch the journal, and they run with the lock
-# descriptor closed, so a call that hangs is reported and can never keep the
-# recovery lock. backstop.sh bounds its own commands; the two sudo calls
+# launchctl, codesign) may run before it is stopped with SIGTERM, then
+# SIGKILL. These are unprivileged and never touch the journal, and they run
+# with the lock descriptor closed, so a call that hangs is reported and can
+# never keep the recovery lock. backstop.sh bounds its own commands; the two sudo calls
 # prompt for a password and are left to sudo's own prompt timeout.
 CALL_TIMEOUT_SECONDS=30
 APP="$HOME/Applications/Insomnia.app"
@@ -571,15 +578,36 @@ fi
 
 # 3. Undo everything via the current backstop ---------------------------------
 # The backstop inherits fd 9 and shares this lock instead of waiting on it.
+# Newest first: the checkout's script, then the copy install.sh sealed into
+# the bundle, then the writable copy installs before that layout left in
+# $APP_SUPPORT. The sealed copy runs only while the bundle's signature still
+# verifies: its resource seal covers the script, so this is the check the
+# LaunchAgent runs (without the pinned requirement, which this script does
+# not have), and an edited copy is refused the same way.
 step "Restoring the machine via backstop --force"
 if [[ -f "$ROOT/scripts/backstop.sh" ]]; then
   BACKSTOP="$ROOT/scripts/backstop.sh"
+elif [[ -f "$APP/Contents/Resources/backstop.sh" ]]; then
+  verify_rc=0
+  bounded "$CODESIGN" --verify --strict "$APP" || verify_rc=$?
+  if (( verify_rc == 124 )); then
+    echo "'codesign --verify --strict $APP' did not answer within ${CALL_TIMEOUT_SECONDS}s, so the backstop.sh sealed in it was not run." >&2
+    echo "Nothing was removed. Run this script from a checkout of the source (its scripts/backstop.sh is used first), or rerun once codesign answers." >&2
+    exit 1
+  elif (( verify_rc != 0 )); then
+    echo "$APP does not pass 'codesign --verify --strict' (exit $verify_rc: ${BOUNDED_OUTPUT:-no detail}), so the backstop.sh sealed in it was not run." >&2
+    echo "Nothing was removed. Run this script from a checkout of the source (its scripts/backstop.sh is used first), or reinstall with scripts/install.sh and rerun." >&2
+    exit 1
+  fi
+  echo "$APP verifies"
+  BACKSTOP="$APP/Contents/Resources/backstop.sh"
 elif [[ -f "$APP_SUPPORT/backstop.sh" ]]; then
   BACKSTOP="$APP_SUPPORT/backstop.sh"
 else
-  echo "no backstop.sh found in $ROOT/scripts or $APP_SUPPORT; nothing was removed" >&2
+  echo "no backstop.sh found in $ROOT/scripts, $APP/Contents/Resources or $APP_SUPPORT; nothing was removed" >&2
   exit 1
 fi
+echo "using $BACKSTOP"
 recovery_rc=0
 /bin/bash "$BACKSTOP" --force || recovery_rc=$?
 
@@ -629,6 +657,16 @@ if (( print_rc != 113 )); then
   exit 1
 fi
 "$RM" -f "$PLIST"
+# Candidate plists install.sh and the app write before a load and rename
+# into place after it: in the staging directory beside the plist, and in
+# $LAUNCH_AGENTS itself for older builds. Only files with the label's
+# candidate prefix, the same ones both of them sweep; the staging directory
+# goes only once empty.
+CANDIDATE_DIR="$LAUNCH_AGENTS/.$LABEL.staging"
+for candidate in "$CANDIDATE_DIR/$LABEL.candidate-"* "$LAUNCH_AGENTS/$LABEL.candidate-"*; do
+  if [[ -f "$candidate" && ! -L "$candidate" ]]; then "$RM" -f "$candidate"; fi
+done
+if [[ -d "$CANDIDATE_DIR" && ! -L "$CANDIDATE_DIR" ]]; then "$RMDIR" "$CANDIDATE_DIR" 2>/dev/null || true; fi
 
 step "Removing $SUDOERS (requires your password)"
 if [[ -e "$SUDOERS" ]] || "$SUDO" test -e "$SUDOERS"; then
@@ -637,7 +675,35 @@ fi
 
 step "Removing app bundle"
 "$RM" -rf "$APP"
+# install.sh's leftovers beside the bundle, by the exact names it gives them.
+# An upgrade sets the previous bundle aside at .Insomnia.app.previous during
+# its swap and assembles the new one in .Insomnia.app.staging.<pid>.<six
+# letters and digits> (mktemp). The swap runs under the recovery lock, which
+# this script holds, so a set-aside bundle belongs to a run that was stopped.
+# A staging directory whose run is still alive belongs to an install that
+# has not reached the lock yet, and stays. kill -0 only asks whether the
+# process exists; it sends no signal. Symlinks and any other name are left.
+APP_DIR="$(dirname "$APP")"
+PREVIOUS_APP="$APP_DIR/.Insomnia.app.previous"
+if [[ -d "$PREVIOUS_APP" && ! -L "$PREVIOUS_APP" ]]; then
+  "$RM" -rf "$PREVIOUS_APP"
+  echo "removed $PREVIOUS_APP, the previous bundle an interrupted install set aside"
+fi
+staging_re='^\.Insomnia\.app\.staging\.([0-9]+)\.[A-Za-z0-9]{6}$'
+for dir in "$APP_DIR"/.Insomnia.app.staging.*; do
+  [[ -d "$dir" && ! -L "$dir" ]] || continue
+  [[ "${dir##*/}" =~ $staging_re ]] || continue
+  owner="${BASH_REMATCH[1]}"
+  if "$KILL" -0 "$owner" 2>/dev/null; then
+    echo "kept $dir: the install.sh run that made it (pid $owner) is still running"
+    continue
+  fi
+  "$RM" -rf "$dir"
+  echo "removed $dir, left by an install.sh run that is gone"
+done
 
+# $APP_SUPPORT/backstop.sh below is the writable copy of older installs; the
+# current one went with the bundle.
 if (( PURGE == 1 )); then
   step "Purging Insomnia's files in $APP_SUPPORT and $LOG_DIR"
   remove_owned "$SESSION" "$STATE" "$APP_SUPPORT/config.json" "$APP_SUPPORT/backstop.sh" \
