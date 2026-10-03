@@ -1,10 +1,30 @@
 #!/bin/bash
 # Build Insomnia, assemble ~/Applications/Insomnia.app, install the backstop
-# script + LaunchAgent, and write the sudoers rule. Idempotent; asks for sudo
-# once (for /etc/sudoers.d/insomnia), before anything of a previous install
-# is touched. Not atomic: a failure after the sudoers step says exactly what
+# script + LaunchAgent, and write the sudoers rule. Idempotent; shows the
+# sudoers rule, asks once, then asks for sudo once (for
+# /etc/sudoers.d/insomnia), before anything of a previous install is
+# touched. Not atomic: a failure after the sudoers step says exactly what
 # was replaced so far.
+#
+# --yes: install the rule shown without asking (for a run with no terminal).
+# sudo still has to authenticate, and with no terminal it cannot ask, so
+# the credentials must already be cached (`sudo -v` first, in the same
+# shell) or the account must have a passwordless rule; this is checked
+# before anything is written.
 set -euo pipefail
+
+ASSUME_YES=0
+for arg in "$@"; do
+  case "$arg" in
+    --yes) ASSUME_YES=1 ;;
+    -h|--help)
+      echo "usage: $0 [--yes]"
+      echo "  --yes  install the sudoers rule shown without asking. With no terminal, sudo must"
+      echo "         already be authenticated: run 'sudo -v' first in the same shell."
+      exit 0 ;;
+    *) echo "unknown option: $arg" >&2; exit 2 ;;
+  esac
+done
 
 # Installation always uses the standard per-user layout. A relocated
 # INSOMNIA_HOME would make the backstop run here act on one tree while the
@@ -12,6 +32,48 @@ set -euo pipefail
 if [[ -n "${INSOMNIA_HOME:-}" ]]; then
   echo "INSOMNIA_HOME is set ($INSOMNIA_HOME). install.sh only supports the standard layout under ~/Library;" >&2
   echo "unset INSOMNIA_HOME and rerun. Nothing was changed." >&2
+  exit 1
+fi
+
+# Who this install is for. The sudoers rule names the account that is about
+# to type its password, taken from the password database (id -un), never
+# from $USER: any caller can set that to anything, including more sudoers
+# syntax, and visudo only checks syntax. The name must be plain (letters,
+# digits, underscore, dot, dash) so the rule can only ever be the lines
+# built in step 2, and $HOME must be that account's home directory, since
+# every other path written below is derived from it. Root is refused: under
+# sudo the account and $HOME are root's, and the app and the rule would
+# land in the wrong account. These two tool paths are fixed like the ones
+# below and patched the same way in tests.
+ID=/usr/bin/id
+DSCL=/usr/bin/dscl
+if [[ "$("$ID" -u)" == 0 ]]; then
+  echo "install.sh must not run as root (do not use sudo with it). Run it as the user who will use Insomnia;" >&2
+  echo "it asks for your password itself, once, for the sudoers rule. Nothing was changed." >&2
+  exit 1
+fi
+ACCOUNT="$("$ID" -un)"
+if [[ ! "$ACCOUNT" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]]; then
+  echo "the account name '$ACCOUNT' (from id -un) has characters outside A-Z a-z 0-9 _ . - and cannot be written" >&2
+  echo "into a sudoers rule safely. Nothing was changed." >&2
+  exit 1
+fi
+if ! dscl_out="$("$DSCL" /Search -read "/Users/$ACCOUNT" NFSHomeDirectory 2>&1)"; then
+  echo "could not look up the home directory of $ACCOUNT (dscl /Search -read /Users/$ACCOUNT NFSHomeDirectory failed: ${dscl_out:-no output}). Nothing was changed." >&2
+  exit 1
+fi
+ACCOUNT_HOME="$(sed -n 's/^NFSHomeDirectory: //p' <<< "$dscl_out")"
+# The same directory, not the same string: HOME may name it through a
+# symlink (/var is one) or with a trailing slash.
+canonical_dir() { # prints the real path of a directory; nothing if it is not one
+  [[ -n "$1" && -d "$1" ]] || return 0
+  (cd -P -- "$1" 2>/dev/null && pwd -P) || true
+}
+HOME_REAL="$(canonical_dir "${HOME:-}")"
+ACCOUNT_HOME_REAL="$(canonical_dir "$ACCOUNT_HOME")"
+if [[ -z "$ACCOUNT_HOME" || -z "$HOME_REAL" || "$HOME_REAL" != "$ACCOUNT_HOME_REAL" ]]; then
+  echo "HOME is '${HOME:-}' but the home directory of $ACCOUNT is '${ACCOUNT_HOME:-unknown}'. The installer writes under HOME" >&2
+  echo "and grants $ACCOUNT, so both must belong to the same account. Nothing was changed." >&2
   exit 1
 fi
 
@@ -66,20 +128,77 @@ BIN="$("$SWIFT" build -c release ${BUILD_FLAGS[@]+"${BUILD_FLAGS[@]}"} --show-bi
 #    The password prompt comes first: until the rule is installed and proven
 #    effective, the running app is not asked to quit and neither the bundle,
 #    the installed backstop.sh nor the LaunchAgent are touched.
+#
+#    The commands the rule grants, and nothing else. The whole rule is built
+#    from this list and $ACCOUNT: shown to the user, written to a temp file,
+#    compared byte for byte with what was meant, checked by visudo,
+#    installed, read back through sudo and compared again. So the file on
+#    disk can only ever be these lines, whatever the environment held.
+SUDOERS_COMMANDS=(
+  "/usr/bin/pmset -a disablesleep 1"
+  "/usr/bin/pmset -a disablesleep 0"
+  "/usr/bin/pmset -b lowpowermode 1"
+  "/usr/bin/pmset -b lowpowermode 0"
+)
+sudoers_rule() { # prints the exact file content
+  local c
+  echo "# Installed by Insomnia install.sh. Exactly ${#SUDOERS_COMMANDS[@]} commands, nothing else."
+  for c in "${SUDOERS_COMMANDS[@]}"; do
+    echo "$ACCOUNT ALL=(root) NOPASSWD: $c"
+  done
+}
+
+step "Sudoers rule for $SUDOERS"
+cat <<INTRO
+Insomnia's recovery agent needs these ${#SUDOERS_COMMANDS[@]} pmset commands to run without a
+password, so it can restore sleep when the app is not running. This rule
+will be written to $SUDOERS. It applies to everything running as
+$ACCOUNT, not only to Insomnia:
+
+INTRO
+sudoers_rule | sed 's/^/    /'
+echo
+if (( ASSUME_YES == 0 )); then
+  if [[ ! -t 0 ]]; then
+    echo "No terminal to confirm the rule on. Rerun from a terminal, or with --yes to install the rule shown above without asking (sudo must then be authenticated already: run 'sudo -v' first). Nothing was changed." >&2
+    exit 1
+  fi
+  answer=""
+  read -r -p "Install this rule? It asks for your password once. [y/N] " answer || true
+  case "$answer" in
+    y|Y|yes|Yes|YES) ;;
+    *) echo "Not installed. Nothing was changed."; exit 1 ;;
+  esac
+fi
+# With no terminal sudo cannot ask for a password either. `sudo -n -v` only
+# refreshes cached credentials, or fails when a password would be needed.
+if [[ ! -t 0 ]] && ! "$SUDO" -n -v 2>/dev/null; then
+  echo "sudo needs a password and there is no terminal to ask on. Run 'sudo -v' first in this shell (its credentials stay cached for a few minutes), or rerun from a terminal. Nothing was changed." >&2
+  exit 1
+fi
+
 step "Writing $SUDOERS (requires your password once)"
 TMP_SUDOERS="$(mktemp)"
 trap 'rm -f "$TMP_SUDOERS"' EXIT
-cat > "$TMP_SUDOERS" <<SUDO
-# Installed by Insomnia install.sh. Exactly four commands, nothing else.
-$USER ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 1
-$USER ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0
-$USER ALL=(root) NOPASSWD: /usr/bin/pmset -b lowpowermode 1
-$USER ALL=(root) NOPASSWD: /usr/bin/pmset -b lowpowermode 0
-SUDO
+sudoers_rule > "$TMP_SUDOERS"
+# The temp file must hold exactly the rule shown (a short write, or
+# something else writing to the path, would otherwise reach visudo).
+if ! cmp -s "$TMP_SUDOERS" <(sudoers_rule); then
+  echo "the sudoers file written to $TMP_SUDOERS is not the rule shown above; not installed. Nothing was changed." >&2
+  exit 1
+fi
 if "$SUDO" visudo -cf "$TMP_SUDOERS" >/dev/null; then
   "$SUDO" install -m 0440 -o root -g wheel "$TMP_SUDOERS" "$SUDOERS"
 else
   echo "sudoers file failed validation (or sudo did not authenticate); not installed. Nothing was changed." >&2
+  exit 1
+fi
+# What is on disk must be the rule shown, byte for byte. It is root-only,
+# so it is read back through sudo. A difference means the install step did
+# not write what it was given, and that file is not trusted as policy.
+if ! "$SUDO" cat "$SUDOERS" | cmp -s - <(sudoers_rule); then
+  echo "$SUDOERS does not match the rule shown above after installation (or could not be read back)." >&2
+  echo "Remove it with 'sudo rm $SUDOERS', check what happened, then rerun. The app, backstop.sh and LaunchAgent were not touched." >&2
   exit 1
 fi
 # `sudo -l <command>` checks the rule without running pmset (nothing on the

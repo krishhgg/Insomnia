@@ -117,6 +117,7 @@ is performed. Do not replace "not run" with "passed" based on source review.
 | Unreadable session.json moved aside by the app at launch and by the agent, then uninstall with and without --purge | Not run |
 | session.json without read permission during a session: the agent restores sleep within a minute and renames the file to session.json.unreadable-<time>, or the app does both at launch and notifies; after fixing the copy's permissions, a relaunch does not resume the session | Not run |
 | Reboot/login with active or dirty journals | Not run |
+| Install from a terminal (confirmation prompt), with `--yes`, and without a terminal | Not run |
 | Lid-close/open and safe recovery of explicitly selected test processes | Not run |
 | Lid-close display/keyboard darkening and restore | Not run |
 | Freeze-all scope with agents running (Cursor/T3 Code/Claude untouched) | Not run |

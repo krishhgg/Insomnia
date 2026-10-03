@@ -7,10 +7,10 @@ import XCTest
 ///
 /// Each test runs a private COPY of the production script against a
 /// throwaway INSOMNIA_HOME. The copy has its fixed tool-path constants
-/// (sudo, pmset, ps, kill, sysctl, pgrep, pkill, osascript, launchctl,
-/// defaults) and its app-bundle / sudoers paths rewritten to point inside
-/// the fixture, so nothing privileged runs, no real process is signaled, no
-/// real app's preferences are read or written, and no real home,
+/// (sudo, pmset, ps, kill, sysctl, pgrep, pkill, osascript, launchctl, id,
+/// dscl, defaults) and its app-bundle / sudoers paths rewritten to point
+/// inside the fixture, so nothing privileged runs, no real process is
+/// signaled, no real app's preferences are read or written, and no real home,
 /// LaunchAgent, sudoers file, or installed app is read or written. plutil
 /// and lockf are the real tools, and so is date, except for the backstop's
 /// moved-aside stamp, which a test can freeze. The fakes record every call.
@@ -1913,7 +1913,7 @@ final class RecoveryScriptTests: XCTestCase {
         fx.setMode("sudo", "fail")          // pmset undo fails; `sudo -n -l` still passes
         fx.setMode("launchctl", "loaded")   // an older agent is loaded
 
-        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+        let r = try fx.run(fx.installRedirected, ["--yes"])
 
         XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
         let calls = fx.calls()
@@ -1936,7 +1936,7 @@ final class RecoveryScriptTests: XCTestCase {
         fx.setMode("sudo", "fail")
         // launchctl mode ok: `print` exits 113, nothing is loaded
 
-        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+        let r = try fx.run(fx.installRedirected, ["--yes"])
 
         XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
         XCTAssertFalse(fx.calls().contains { $0.hasPrefix("launchctl bootstrap") || $0.hasPrefix("launchctl bootout") }, "\(fx.calls())")
@@ -1952,7 +1952,7 @@ final class RecoveryScriptTests: XCTestCase {
         try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
         fx.setMode("launchctl", "loaded-bootstrap-fails-once")
 
-        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+        let r = try fx.run(fx.installRedirected, ["--yes"])
 
         XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
         let bootstraps = fx.calls().filter { $0.hasPrefix("launchctl bootstrap") }
@@ -1976,7 +1976,7 @@ final class RecoveryScriptTests: XCTestCase {
         try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
         fx.setMode("launchctl", "loaded")
 
-        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+        let r = try fx.run(fx.installRedirected, ["--yes"])
 
         XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
         let calls = fx.calls()
@@ -1998,7 +1998,7 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(fx.exists(fx.sudoers))
         XCTAssertTrue(fx.exists(fx.app.appendingPathComponent("Contents/Info.plist")))
         XCTAssertTrue(fx.exists(fx.app.appendingPathComponent("Contents/Resources/AppIcon.icns")), "the app icon is bundled")
-        XCTAssertTrue(r.stdout.contains("Installed"), r.stdout)
+        XCTAssertTrue(r.stdout.contains("==> Installed"), r.stdout)
         XCTAssertEqual(try fx.contents(of: fx.plist.deletingLastPathComponent()), ["com.insomnia.backstop.plist"])
     }
 
@@ -2011,14 +2011,14 @@ final class RecoveryScriptTests: XCTestCase {
         try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
         fx.setMode("launchctl", "loaded")
 
-        let plain = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+        let plain = try fx.run(fx.installRedirected, ["--yes"])
         XCTAssertEqual(plain.status, 0, plain.stderr + plain.stdout)
         let plainBuilds = fx.calls().filter { $0.hasPrefix("swift build") }
         XCTAssertEqual(plainBuilds, ["swift build -c release", "swift build -c release --show-bin-path"], "\(fx.calls())")
         XCTAssertFalse(plain.stdout.contains("lid simulation compiled in"), plain.stdout)
 
         fx.clearCalls()
-        let simulated = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester", "INSOMNIA_LID_SIMULATION": "1"])
+        let simulated = try fx.run(fx.installRedirected, ["--yes"], extraEnvironment: ["INSOMNIA_LID_SIMULATION": "1"])
         XCTAssertEqual(simulated.status, 0, simulated.stderr + simulated.stdout)
         let simulatedBuilds = fx.calls().filter { $0.hasPrefix("swift build") }
         XCTAssertEqual(simulatedBuilds, [
@@ -2029,7 +2029,7 @@ final class RecoveryScriptTests: XCTestCase {
 
         // Any other value is "off": the define is a deliberate opt-in.
         fx.clearCalls()
-        let other = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester", "INSOMNIA_LID_SIMULATION": "yes"])
+        let other = try fx.run(fx.installRedirected, ["--yes"], extraEnvironment: ["INSOMNIA_LID_SIMULATION": "yes"])
         XCTAssertEqual(other.status, 0, other.stderr + other.stdout)
         XCTAssertEqual(fx.calls().filter { $0.hasPrefix("swift build") }.first, "swift build -c release", "\(fx.calls())")
     }
@@ -2040,7 +2040,7 @@ final class RecoveryScriptTests: XCTestCase {
         try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
         fx.setMode("launchctl", "loaded-then-lost")
 
-        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+        let r = try fx.run(fx.installRedirected, ["--yes"])
 
         XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
         XCTAssertEqual(fx.calls().filter { $0.hasPrefix("launchctl bootstrap") }.count, 2, "\(fx.calls())")
@@ -2057,7 +2057,7 @@ final class RecoveryScriptTests: XCTestCase {
         try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
         fx.setMode("launchctl", "ambiguous")   // print and bootout fail with errors; bootstrap fails
 
-        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+        let r = try fx.run(fx.installRedirected, ["--yes"])
 
         XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
         XCTAssertEqual(fx.calls().filter { $0.hasPrefix("launchctl bootstrap") }.count, 1, "no reload attempt when the prior state is unknown: \(fx.calls())")
@@ -2075,7 +2075,7 @@ final class RecoveryScriptTests: XCTestCase {
         try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
         fx.setMode("launchctl", "no-then-error")
 
-        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+        let r = try fx.run(fx.installRedirected, ["--yes"])
 
         XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
         XCTAssertEqual(fx.calls().filter { $0.hasPrefix("launchctl bootstrap") }.count, 1, "no reload when nothing was loaded before: \(fx.calls())")
@@ -2096,7 +2096,7 @@ final class RecoveryScriptTests: XCTestCase {
         try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
         fx.setMode("launchctl", "loaded-bootstrap-always-fails")
 
-        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+        let r = try fx.run(fx.installRedirected, ["--yes"])
 
         XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
         XCTAssertEqual(fx.calls().filter { $0.hasPrefix("launchctl bootstrap") }.count, 2, "\(fx.calls())")
@@ -2114,13 +2114,13 @@ final class RecoveryScriptTests: XCTestCase {
         try "trusted".write(to: fx.plist, atomically: true, encoding: .utf8)
         try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
 
-        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+        let r = try fx.run(fx.installRedirected, ["--yes"])
 
         XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
         XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "trusted", "nothing is published without a confirmed load")
         XCTAssertEqual(try fx.contents(of: fx.plist.deletingLastPathComponent()), ["com.insomnia.backstop.plist"])
         XCTAssertTrue(r.stderr.contains("not confirmed"), r.stderr)
-        XCTAssertFalse(r.stdout.contains("Installed"), r.stdout)
+        XCTAssertFalse(r.stdout.contains("==> Installed"), r.stdout)
     }
 
     func testInstallRefusesWhileRecoveryLockIsHeld() throws {
@@ -2130,7 +2130,7 @@ final class RecoveryScriptTests: XCTestCase {
         let holder = try fx.holdLock()
         defer { holder.stop() }
 
-        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+        let r = try fx.run(fx.installRedirected, ["--yes"])
 
         XCTAssertEqual(r.status, 75, r.stderr + r.stdout)
         let calls = fx.calls()
@@ -2148,7 +2148,7 @@ final class RecoveryScriptTests: XCTestCase {
         fx.setMode("pgrep", "1\n0\n")   // not running at the quit step, running again under the lock
         fx.setMode("launchctl", "loaded")
 
-        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+        let r = try fx.run(fx.installRedirected, ["--yes"])
 
         XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
         let calls = fx.calls()
@@ -2170,6 +2170,189 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(r.stdout.contains("==>"), "no step ran: \(r.stdout)")
     }
 
+    // MARK: - Installer identity and the sudoers rule
+
+    /// Under sudo, $HOME and the account are root's: the app and the rule
+    /// would land in the wrong account. Refused before anything runs.
+    func testInstallRefusesToRunAsRoot() throws {
+        try fx.prepareInstall()
+        try fx.installMachinery()
+        fx.setMode("id.uid", "0")
+
+        let r = try fx.run(fx.installRedirected, ["--yes"])
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertTrue(r.stderr.contains("root"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("sudo"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("Nothing was changed"), r.stderr)
+        XCTAssertEqual(fx.calls(), [], "no build, no sudo, nothing")
+        XCTAssertFalse(r.stdout.contains("==>"), "no step ran: \(r.stdout)")
+        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), "rule")
+    }
+
+    /// The rule names the account from the password database. A name that
+    /// could carry sudoers syntax is refused rather than written.
+    func testInstallRefusesAnAccountNameThatCouldCarrySudoersSyntax() throws {
+        try fx.prepareInstall()
+        try fx.installMachinery()
+        fx.setMode("id.name", "tester ALL=(ALL) NOPASSWD: ALL")
+
+        let r = try fx.run(fx.installRedirected, ["--yes"])
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertTrue(r.stderr.contains("account name"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("Nothing was changed"), r.stderr)
+        XCTAssertEqual(fx.calls(), [])
+        XCTAssertFalse(r.stdout.contains("==>"), r.stdout)
+        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), "rule")
+    }
+
+    /// Every path written is derived from HOME and the rule grants the
+    /// account, so the two must agree.
+    func testInstallRefusesWhenHomeIsNotTheAccountsHome() throws {
+        try fx.prepareInstall()
+        try fx.installMachinery()
+        let elsewhere = fx.root.appendingPathComponent("elsewhere").path
+
+        let r = try fx.run(fx.installRedirected, ["--yes"], extraEnvironment: ["HOME": elsewhere])
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertTrue(r.stderr.contains(elsewhere), r.stderr)
+        XCTAssertTrue(r.stderr.contains(fx.home.path), "names the account's real home: \(r.stderr)")
+        XCTAssertTrue(r.stderr.contains("Nothing was changed"), r.stderr)
+        XCTAssertEqual(fx.calls(), [])
+        XCTAssertFalse(r.stdout.contains("==>"), r.stdout)
+    }
+
+    /// The installed file is exactly the lines the installer printed: one
+    /// comment, then one NOPASSWD line per pmset command for the account
+    /// from `id -un`. $USER, which any caller controls, is not consulted.
+    func testInstallWritesExactlyTheRuleItShowsForTheAccountFromId() throws {
+        try fx.prepareInstall()
+        fx.setMode("launchctl", "loaded")
+        let hostile = "evil ALL=(ALL) NOPASSWD: ALL"
+
+        let r = try fx.run(fx.installRedirected, ["--yes"], extraEnvironment: ["USER": hostile])
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        let shown = r.stdout.split(separator: "\n").filter { $0.hasPrefix("    ") }.map { String($0.dropFirst(4)) }
+        let installed = try String(contentsOf: fx.sudoers, encoding: .utf8)
+        let lines = installed.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        XCTAssertEqual(lines.last, "", "the file ends with a newline")
+        let fileLines = Array(lines.dropLast())
+        XCTAssertEqual(fileLines, shown, "what was shown is what was installed")
+        XCTAssertTrue(fileLines.first?.hasPrefix("# Installed by Insomnia install.sh.") == true, installed)
+        let grants = fileLines.dropFirst()
+        XCTAssertFalse(grants.isEmpty, installed)
+        for line in grants {
+            XCTAssertTrue(line.hasPrefix("tester ALL=(root) NOPASSWD: /usr/bin/pmset "), line)
+        }
+        XCTAssertEqual(Set(grants).count, grants.count, "no duplicate grants")
+        XCTAssertTrue(fileLines.first?.contains("Exactly \(grants.count) commands") == true, "the comment counts the grants: \(installed)")
+        XCTAssertFalse(installed.contains("evil"), "$USER reached the sudoers file: \(installed)")
+        XCTAssertTrue(fx.calls().contains("sudo cat \(fx.sudoers.path)"), "the installed file is read back: \(fx.calls())")
+        XCTAssertTrue(r.stdout.contains("applies to everything running as"), "the grant's scope is stated: \(r.stdout)")
+    }
+
+    /// With no terminal and no --yes there is nobody to confirm the rule
+    /// with: refused before sudo, with the way out named.
+    func testInstallRefusesWithoutATerminalUnlessYes() throws {
+        try fx.prepareInstall()
+        try fx.installMachinery()
+
+        let r = try fx.run(fx.installRedirected)
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertTrue(r.stderr.contains("--yes"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("Nothing was changed"), r.stderr)
+        XCTAssertTrue(r.stdout.contains("NOPASSWD: /usr/bin/pmset"), "the rule is shown before the refusal: \(r.stdout)")
+        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("sudo") }, "\(fx.calls())")
+        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), "rule")
+        XCTAssertEqual(try String(contentsOf: fx.app.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "binary")
+    }
+
+    func testInstallRejectsAnUnknownOption() throws {
+        try fx.prepareInstall()
+        let r = try fx.run(fx.installRedirected, ["--force"])
+        XCTAssertEqual(r.status, 2, r.stderr + r.stdout)
+        XCTAssertEqual(fx.calls(), [])
+    }
+
+    /// --yes removes the prompt, not the password. With no terminal and
+    /// nothing cached, sudo could never authenticate, so the installer says
+    /// what to run instead of failing inside visudo.
+    func testInstallWithYesAndNoTerminalStopsWhenSudoHasNoCachedCredentials() throws {
+        try fx.prepareInstall()
+        try fx.installMachinery()
+        fx.setMode("sudo", "no-cached-credentials")
+
+        let r = try fx.run(fx.installRedirected, ["--yes"])
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertTrue(r.stderr.contains("sudo -v"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("Nothing was changed"), r.stderr)
+        let calls = fx.calls()
+        XCTAssertTrue(calls.contains("sudo -n -v"), "\(calls)")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("sudo visudo") || $0.hasPrefix("sudo install") || $0.hasPrefix("osascript") }, "\(calls)")
+        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), "rule")
+        XCTAssertEqual(try String(contentsOf: fx.app.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "binary")
+    }
+
+    /// When the directory service cannot answer, the refusal says so and
+    /// quotes the error, instead of `set -e` ending the script silently.
+    func testInstallExplainsWhenTheAccountLookupFails() throws {
+        try fx.prepareInstall()
+        try fx.installMachinery()
+        fx.setMode("dscl", "fail")
+
+        let r = try fx.run(fx.installRedirected, ["--yes"])
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertTrue(r.stderr.contains("could not look up the home directory of tester"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("eDSRecordNotFound"), "dscl's own error is shown: \(r.stderr)")
+        XCTAssertTrue(r.stderr.contains("Nothing was changed"), r.stderr)
+        XCTAssertEqual(fx.calls(), [])
+        XCTAssertFalse(r.stdout.contains("==>"), r.stdout)
+    }
+
+    /// HOME and the account's home are compared as directories: a symlink
+    /// to it with a trailing slash is the same place and installs.
+    func testInstallAcceptsHomeNamedThroughASymlinkWithATrailingSlash() throws {
+        try fx.prepareInstall()
+        fx.setMode("launchctl", "loaded")
+        let link = fx.root.appendingPathComponent("homelink")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: fx.home)
+
+        let r = try fx.run(fx.installRedirected, ["--yes"], extraEnvironment: ["HOME": link.path + "/"])
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertTrue(r.stdout.contains("==> Installed"), r.stdout)
+    }
+
+    /// The file on disk is read back through sudo and must be the rule
+    /// shown. Anything else is not trusted as policy, and nothing of the
+    /// previous install is touched.
+    func testInstallRefusesWhenTheInstalledRuleDiffersFromTheOneShown() throws {
+        try fx.prepareInstall()
+        try fx.installMachinery()
+        try "old helper".write(to: fx.installedBackstop, atomically: true, encoding: .utf8)
+        fx.setMode("pgrep", "0\n")
+        fx.setMode("sudo", "tamper")
+
+        let r = try fx.run(fx.installRedirected, ["--yes"])
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertTrue(r.stderr.contains("does not match"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("sudo rm \(fx.sudoers.path)"), r.stderr)
+        let calls = fx.calls()
+        XCTAssertTrue(calls.contains { $0.hasPrefix("sudo install") }, "\(calls)")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("osascript") || $0.hasPrefix("launchctl") }, "\(calls)")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("sudo -n -l") }, "the rule is not checked for effect once its content is wrong: \(calls)")
+        XCTAssertEqual(try String(contentsOf: fx.app.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "binary")
+        XCTAssertEqual(try String(contentsOf: fx.installedBackstop, encoding: .utf8), "old helper")
+        XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "plist")
+    }
+
     /// Same regression as LaunchdBackstopTests: launchctl refuses a path
     /// without a `.plist` suffix (EIO) for bootstrap and bootout alike, and
     /// login's directory-level load ignores subdirectories. The installer's
@@ -2181,7 +2364,7 @@ final class RecoveryScriptTests: XCTestCase {
         try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
         fx.setMode("launchctl", "loaded")
 
-        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+        let r = try fx.run(fx.installRedirected, ["--yes"])
 
         XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
         let calls = fx.calls()
@@ -2208,7 +2391,7 @@ final class RecoveryScriptTests: XCTestCase {
         fx.setMode("pgrep", "0\n")          // the app is running the whole time
         fx.setMode("sudo", "auth-fail")     // wrong password / no sudo rights
 
-        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+        let r = try fx.run(fx.installRedirected, ["--yes"])
 
         XCTAssertNotEqual(r.status, 0, r.stdout)
         let calls = fx.calls()
@@ -2231,7 +2414,7 @@ final class RecoveryScriptTests: XCTestCase {
         fx.setMode("pgrep", "0\n")
         fx.setMode("sudo", "rule-not-effective")
 
-        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+        let r = try fx.run(fx.installRedirected, ["--yes"])
 
         XCTAssertNotEqual(r.status, 0, r.stdout)
         let calls = fx.calls()
@@ -2255,7 +2438,7 @@ final class RecoveryScriptTests: XCTestCase {
         // pgrep default: not running at any check
         fx.setMode("sudo", "auth-fail")
 
-        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+        let r = try fx.run(fx.installRedirected, ["--yes"])
 
         XCTAssertNotEqual(r.status, 0, r.stdout)
         let calls = fx.calls()
@@ -2280,7 +2463,7 @@ final class RecoveryScriptTests: XCTestCase {
         // pgrep default: not running at any check
         fx.setMode("sudo", "rule-not-effective")
 
-        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+        let r = try fx.run(fx.installRedirected, ["--yes"])
 
         XCTAssertNotEqual(r.status, 0, r.stdout)
         let calls = fx.calls()
@@ -2304,7 +2487,7 @@ final class RecoveryScriptTests: XCTestCase {
         try "old helper".write(to: fx.installedBackstop, atomically: true, encoding: .utf8)
         fx.setMode("pgrep", "0\n")          // running, and it stays running
 
-        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+        let r = try fx.run(fx.installRedirected, ["--yes"])
 
         XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
         let calls = fx.calls()
@@ -2336,9 +2519,9 @@ private struct FixtureError: Error, CustomStringConvertible {
 ///   root/repo/scripts      patched copies of backstop.sh and uninstall.sh
 ///   root/Applications      fake Insomnia.app bundle
 ///   root/etc/sudoers.d     fake sudoers rule
-/// The child gets no HOME at all: every $HOME-derived constant is patched in
-/// the copy, and a stray $HOME would fail under `set -u` instead of reaching
-/// the real home directory.
+/// The child's HOME is root/home, not the real one: every $HOME-derived
+/// constant is patched in the copy, so a stray $HOME could only reach the
+/// fixture.
 private final class ScriptFixture {
     let root: URL
     let home: URL
@@ -2379,6 +2562,7 @@ private final class ScriptFixture {
             try fm.createDirectory(at: dir, withIntermediateDirectories: true)
         }
         try writeFakes()
+        try writeIdentityFakes()
         try writeScriptCopies()
         try bootUUID.write(to: root.appendingPathComponent("boot.uuid"), atomically: true, encoding: .utf8)
     }
@@ -2492,6 +2676,8 @@ private final class ScriptFixture {
             "CODESIGN": bin.appendingPathComponent("codesign").path,
             "SWIFT": bin.appendingPathComponent("swift").path,
             "LOCK_TIMEOUT_SECONDS": "1",
+            "ID": bin.appendingPathComponent("id").path,
+            "DSCL": bin.appendingPathComponent("dscl").path,
         ])
         try patchedInstall.write(to: install, atomically: true, encoding: .utf8)
         // The redirected copy runs past the INSOMNIA_HOME refusal: that
@@ -2544,6 +2730,10 @@ private final class ScriptFixture {
         // fails like a wrong password, and `-n` forms fail as unpermitted.
         // Mode "rule-not-effective": authentication passes and the rule is
         // installed, but `sudo -n -l <pmset ...>` still says no.
+        // Mode "tamper": `install` writes the file with one extra line, so
+        // what is on disk is not what the installer was given.
+        // Mode "no-cached-credentials": `sudo -n -v` fails, as it does when
+        // a password would be needed and -n forbids asking.
         // visudo checks the candidate file exists, is non-empty and grants
         // pmset, so an installer that validated the wrong path or an empty
         // heredoc cannot pass here.
@@ -2559,6 +2749,9 @@ private final class ScriptFixture {
         case "${1:-}" in
           -n) if [[ "${2:-}" == -l ]]; then
                 case "$mode" in auth-fail|rule-not-effective) exit 1 ;; *) exit 0 ;; esac
+              fi
+              if [[ "${2:-}" == -v ]]; then
+                case "$mode" in no-cached-credentials) exit 1 ;; *) exit 0 ;; esac
               fi
               case "$mode" in
                 ok) exit 0 ;;
@@ -2584,9 +2777,11 @@ private final class ScriptFixture {
             if [[ "$mode" == auth-fail ]]; then echo "sudo: 3 incorrect password attempts" >&2; exit 1; fi
             src=""; dst=""
             for a in "$@"; do src="$dst"; dst="$a"; done
-            case "$dst" in "\(r)"/*) mkdir -p "$(dirname "$dst")"; cp "$src" "$dst"; exit 0 ;; esac
+            case "$dst" in "\(r)"/*) mkdir -p "$(dirname "$dst")"; cp "$src" "$dst"
+              if [[ "$mode" == tamper ]]; then echo "tester ALL=(ALL) NOPASSWD: ALL" >> "$dst"; fi
+              exit 0 ;; esac
             printf 'sudo REFUSED %s\\n' "$*" >> "\(calls)"; exit 1 ;;
-          rm|test)
+          rm|test|cat)
             for a in "$@"; do
               case "$a" in "\(r)"/*) exec "$@" ;; esac
             done
@@ -2773,6 +2968,29 @@ private final class ScriptFixture {
         """)
     }
 
+    /// Account identity as install.sh reads it: `id -u` is 501 unless id.uid
+    /// says otherwise (never the real uid, so a suite run as root still
+    /// installs), `id -un` is "tester" unless id.name says otherwise, and
+    /// dscl reports the fixture home for any account unless dscl.home says
+    /// otherwise, or fails in mode "fail". Neither is recorded in calls.log.
+    private func writeIdentityFakes() throws {
+        let r = root.path
+        try writeFake("id", """
+        case "${1:-}" in
+          -u) if [[ -f "\(r)/id.uid.mode" ]]; then cat "\(r)/id.uid.mode"; else echo 501; fi ;;
+          -un) if [[ -f "\(r)/id.name.mode" ]]; then cat "\(r)/id.name.mode"; else echo tester; fi ;;
+          *) exit 1 ;;
+        esac
+        """)
+        try writeFake("dscl", """
+        if [[ "$(cat "\(r)/dscl.mode" 2>/dev/null)" == fail ]]; then
+          echo "<dscl_cmd> DS Error: -14136 (eDSRecordNotFound)" >&2; exit 56
+        fi
+        if [[ -f "\(r)/dscl.home.mode" ]]; then h="$(cat "\(r)/dscl.home.mode")"; else h='\(home.path)'; fi
+        echo "NFSHomeDirectory: $h"
+        """)
+    }
+
     /// True when nobody holds the recovery lock right now.
     func lockIsFree() throws -> Bool {
         let probe = Process()
@@ -2914,12 +3132,14 @@ private final class ScriptFixture {
     }
 
     /// Environment for the child: no inheritance, so neither the real HOME
-    /// nor a TempHome's INSOMNIA_HOME can leak in. HOME is deliberately
-    /// unset (see the class comment).
+    /// nor a TempHome's INSOMNIA_HOME can leak in. HOME is the fixture home:
+    /// the patched copies derive no path from it, and install.sh compares
+    /// it with the account's home as the fake dscl reports it.
     private var childEnvironment: [String: String] {
         [
             "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
             "INSOMNIA_HOME": home.path,
+            "HOME": home.path,
         ]
     }
 
@@ -2943,6 +3163,9 @@ private final class ScriptFixture {
         }
         p.environment = childEnvironment.merging(extraEnvironment) { $1 }
         p.currentDirectoryURL = root
+        // Never a terminal, whatever `swift test` was started from: the
+        // installer's confirmation prompt must see no TTY here.
+        p.standardInput = FileHandle.nullDevice
         // Capture to files rather than pipes: nothing to drain, nothing to deadlock.
         let outURL = root.appendingPathComponent("stdout.\(UUID().uuidString)")
         let errURL = root.appendingPathComponent("stderr.\(UUID().uuidString)")
