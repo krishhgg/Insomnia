@@ -398,7 +398,9 @@ final class TmuxLiveRunnerTests: XCTestCase {
         let received = FileManager.default.temporaryDirectory
             .appendingPathComponent("insomnia-nudge-\(UUID().uuidString).txt")
         defer { try? FileManager.default.removeItem(at: received) }
-        try await startPane(command: "cat > '\(received.path)'")
+        // tmux runs the command through sh -c: quote the path for it.
+        let quoted = received.path.replacingOccurrences(of: "'", with: "'\\''")
+        try await startPane(command: "cat > '\(quoted)'")
         let run = TmuxNudge.makeLiveRunner(socketName: socket)
 
         let accepted = try await run("nudge:0.0", false)
