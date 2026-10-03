@@ -114,6 +114,8 @@ is performed. Do not replace "not run" with "passed" based on source review.
 | --- | --- |
 | Normal end, deadline expiry, and repeated Quit restore live power state | Not run for release fixes |
 | Force-quit followed by launchd deadline recovery and retry after failure | Not run |
+| Unreadable session.json moved aside by the app at launch and by the agent, then uninstall with and without --purge | Not run |
+| session.json without read permission during a session: the agent restores sleep within a minute and renames the file to session.json.unreadable-<time>, or the app does both at launch and notifies; after fixing the copy's permissions, a relaunch does not resume the session | Not run |
 | Reboot/login with active or dirty journals | Not run |
 | Lid-close/open and safe recovery of explicitly selected test processes | Not run |
 | Lid-close display/keyboard darkening and restore | Not run |
@@ -123,14 +125,22 @@ is performed. Do not replace "not run" with "passed" based on source review.
 | Lid close with a read-only state.json: no process stopped, every app logged as left running | Not run |
 | Simulated lid close/open via scripts/simulate-lid.sh | Not run |
 | Existing Low Power Mode preference and saved audio restoration | Not run |
+| App Nap opt-in: previous `NSAppSleepDisabled` put back at session end, by the backstop after a force-quit, and by uninstall | Not run |
 | Docker Desktop idle/busy behavior with another Docker context selected | Not run |
 | Hotspot permission, association, cancellation, and reconnect | Not run |
 | Settings location note matches what System Settings shows after the grant | Not run |
 | tmux cancellation with a dedicated disposable pane | Not run |
 | Headed-browser throttling with the lid closed | Not run |
 | Battery/thermal event behavior on supported hardware | Not run |
+| `SleepDisabled 1` set by hand with no session: left alone and reported at launch, not cleared | Not run |
 | Unreadable battery (IOKit miss) ends the session on a laptop after the second read; desktop unaffected | Not run |
+| Settings floor steppers keep the end floor below the Low Power Mode floor by moving the other stepper | Not run |
 | Install/upgrade/uninstall with recoverable failure conditions | Not run |
+| Launch at login survives a reinstall by install.sh, including a second install.sh run on the same unchanged build (switch on, reinstall, relaunch: the log shows the launch-time check, System Settings > General > Login Items lists Insomnia as enabled, and the Settings switch reads on; a pending approval shows the note and the Open Login Items button) | Not run |
+| Launch at login heals on the first upgrade from a build without the install record (switch on in the previous build, upgrade with install.sh, relaunch: the log shows "registering once and recording the install", Login Items lists Insomnia, and config.json has `launchAtLoginInstall`) | Not run |
+| Launch at login removed in System Settings stays removed (switch on, relaunch once so the install is on file, remove Insomnia under System Settings > General > Login Items, relaunch: the log says the removal was respected, the Settings switch is off, and Login Items does not list Insomnia again) | Not run |
+| Pending approval withdrawn from Settings (switch on while macOS reports it waiting for approval, turn the switch off: Login Items no longer lists Insomnia and the next launch does not register it) | Not run |
+| Approval given in System Settings shows in an open Settings window (turn the switch on, approve under Login Items, click back into the Settings window: the pending note goes away without reopening the window) | Not run |
 
 Hardware tests must be supervised and must not endanger active user work. Use
 a stable, ventilated surface, not an enclosure. Do not intentionally overheat a

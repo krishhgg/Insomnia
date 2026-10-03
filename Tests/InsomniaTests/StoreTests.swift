@@ -56,6 +56,48 @@ final class StoreTests: XCTestCase {
         XCTAssertFalse(clean.contains("savedKeyboardBrightness"), clean)
     }
 
+    /// App Nap entries are flat objects with a string bundle id and an
+    /// optional bool, which is what backstop.sh reads with plutil; an
+    /// absent previous value stays absent in the JSON. They keep the
+    /// journal dirty on their own and are not lid actions.
+    func testAppNapOverridesRoundTripAsFlatKeysAndAreDirty() throws {
+        var st = RuntimeState()
+        st.appNapOverrides = [
+            AppNapOverride(bundleId: "com.google.Chrome", previous: nil),
+            AppNapOverride(bundleId: "com.apple.Terminal", previous: false),
+            AppNapOverride(bundleId: "dev.zed.Zed", previous: true),
+        ]
+        try store.saveState(st)
+        XCTAssertEqual(try store.loadState(), st)
+        XCTAssertTrue(st.isDirty)
+        XCTAssertFalse(st.hasLidActions)
+        let text = try String(contentsOf: home.paths.stateFile, encoding: .utf8)
+        XCTAssertTrue(text.contains("\"bundleId\" : \"com.google.Chrome\""), text)
+        XCTAssertTrue(text.contains("\"previous\" : false"), text)
+        XCTAssertTrue(text.contains("\"previous\" : true"), text)
+        XCTAssertEqual(text.components(separatedBy: "\"previous\"").count, 3, "an absent previous value is left out: \(text)")
+
+        try store.saveState(RuntimeState())
+        let clean = try String(contentsOf: home.paths.stateFile, encoding: .utf8)
+        XCTAssertTrue(clean.contains("\"appNapOverrides\" : [\n\n  ]") || clean.contains("\"appNapOverrides\" : []"), clean)
+    }
+
+    /// A journal written before App Nap was journaled has no key; a null
+    /// previous value means absent, the same as backstop.sh reads it.
+    func testLegacyJournalWithoutAppNapKeyDecodesAndNullPreviousIsAbsent() throws {
+        let legacy = Data(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#.utf8)
+        let st = try Store.makeDecoder().decode(RuntimeState.self, from: legacy)
+        XCTAssertEqual(st.appNapOverrides, [])
+        XCTAssertFalse(st.isDirty)
+        let withNull = Data(#"{"appNapOverrides":[{"bundleId":"com.google.Chrome","previous":null},{"bundleId":"dev.zed.Zed","previous":true}]}"#.utf8)
+        let decoded = try Store.makeDecoder().decode(RuntimeState.self, from: withNull)
+        XCTAssertEqual(decoded.appNapOverrides, [
+            AppNapOverride(bundleId: "com.google.Chrome", previous: nil),
+            AppNapOverride(bundleId: "dev.zed.Zed", previous: true),
+        ])
+        XCTAssertTrue(decoded.isDirty)
+    }
+
     /// A journal written before display darkening existed has neither key.
     func testLegacyJournalWithoutBrightnessKeysDecodes() throws {
         let data = Data(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"savedOutputVolume":0.5,"savedMuted":true}"#.utf8)
@@ -201,6 +243,21 @@ final class StoreTests: XCTestCase {
     /// and every later read keeps failing until a person deals with it: the
     /// next reader (this app, backstop.sh, uninstall.sh) must not see "no
     /// journal" and call the machine clean.
+    /// A journal that is a FIFO is never opened (open(2) would block until a
+    /// writer appears). The read fails instead and the FIFO stays.
+    func testStateThatIsAFIFOIsNotOpenedAndFailsTheRead() throws {
+        try FileManager.default.createDirectory(at: home.paths.appSupport, withIntermediateDirectories: true)
+        let fifo = try FIFOWatch(at: home.paths.stateFile)
+        defer { fifo.stop() }
+
+        XCTAssertThrowsError(try store.loadState()) { error in
+            guard case StoreError.notRegularFile = error else { return XCTFail("\(error)") }
+            XCTAssertTrue(error.localizedDescription.contains(home.paths.stateFile.path), error.localizedDescription)
+        }
+        XCTAssertFalse(fifo.readerSeen, "state.json was opened although it is a FIFO")
+        XCTAssertTrue(fifo.isStillFIFO)
+    }
+
     func testCorruptStateIsLeftInPlaceAndKeepsFailing() throws {
         try Data("{not json".utf8).write(to: home.paths.stateFile)
         for _ in 0..<2 {
