@@ -13,11 +13,13 @@ protocol HotspotSecretStore: AnyObject, Sendable {
     /// The same read without changing that account: a check, not a load
     /// into the field.
     func peek() async throws -> String?
-    /// Saves for the current SSID and returns that SSID, read when the
-    /// save began: one typed while it waited on the keychain is not it.
-    @discardableResult func save(_ password: String) async throws -> String
-    /// Clears the current SSID's password and returns that SSID.
-    @discardableResult func delete() async throws -> String
+    /// Saves for the current SSID, read when the save began (one typed
+    /// while it waited on the keychain is not it), and returns that SSID
+    /// and the loaded account it removed.
+    @discardableResult func save(_ password: String) async throws -> HotspotPasswordChange
+    /// Clears the current SSID's password and the loaded account's, and
+    /// returns both.
+    @discardableResult func delete() async throws -> HotspotPasswordChange
 }
 
 /// Login-keychain implementation. The SSID provider keeps the Keychain
@@ -53,33 +55,33 @@ final class KeychainHotspotSecretStore: HotspotSecretStore {
     }
 
     @discardableResult
-    func save(_ password: String) async throws -> String {
+    func save(_ password: String) async throws -> HotspotPasswordChange {
         let ssid = currentSSID()
-        let previous = selectedSSID
+        let previous = selectedSSID.flatMap { $0 == ssid ? nil : $0 }
         let keychain = self.keychain
         try await queue.run {
             try keychain.set(service: KeychainStore.service, account: ssid, value: password)
-            if let previous, previous != ssid {
+            if let previous {
                 try keychain.delete(service: KeychainStore.service, account: previous)
             }
         }
         selectedSSID = ssid
-        return ssid
+        return HotspotPasswordChange(ssid: ssid, removed: previous)
     }
 
     @discardableResult
-    func delete() async throws -> String {
+    func delete() async throws -> HotspotPasswordChange {
         let current = currentSSID()
-        let previous = selectedSSID
+        let previous = selectedSSID.flatMap { $0 == current ? nil : $0 }
         let keychain = self.keychain
         try await queue.run {
             try keychain.delete(service: KeychainStore.service, account: current)
-            if let previous, previous != current {
+            if let previous {
                 try keychain.delete(service: KeychainStore.service, account: previous)
             }
         }
         selectedSSID = current
-        return current
+        return HotspotPasswordChange(ssid: current, removed: previous)
     }
 
     private func read(_ ssid: String) async throws -> String? {
@@ -102,14 +104,14 @@ final class InMemoryHotspotSecretStore: HotspotSecretStore {
     func load() async throws -> String? { password }
     func peek() async throws -> String? { password }
     @discardableResult
-    func save(_ password: String) async throws -> String {
+    func save(_ password: String) async throws -> HotspotPasswordChange {
         self.password = password
-        return ""
+        return HotspotPasswordChange(ssid: "")
     }
 
     @discardableResult
-    func delete() async throws -> String {
+    func delete() async throws -> HotspotPasswordChange {
         password = nil
-        return ""
+        return HotspotPasswordChange(ssid: "")
     }
 }

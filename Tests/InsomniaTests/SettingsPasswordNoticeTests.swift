@@ -186,6 +186,47 @@ final class SettingsPasswordSaveTests: XCTestCase {
         XCTAssertNil(services.status.hotspotPasswordReport)
     }
 
+    /// Greptile's case: the window loaded "Phone", the SSID is edited to
+    /// "Other Phone" and saved, then edited back to "Phone" while the
+    /// save waits. The save stored for "Other Phone" and removed "Phone",
+    /// the account the window loaded, so the report that "Phone" is
+    /// unreadable is out of date and goes, and the notice is read again
+    /// for "Phone", whose item is now missing.
+    func testASaveThatRemovedTheConfiguredHotspotsItemClearsItsReport() async throws {
+        let services = AppServices(
+            paths: h.home.paths,
+            notifier: RecordingNotifier(),
+            audio: FakeAudioControl(),
+            processControl: FakeProcessControl(),
+            locationPermission: LocationPermission(authorizationStatus: .authorizedAlways)
+        )
+        services.status.hotspotPasswordReport = HotspotPasswordReport(ssid: "Phone", problem: .unreadable)
+        let keychain = BlockingKeychain(items: ["\(KeychainStore.service)/Phone": "old"])
+        let ssid = Locked("Phone")
+        let store = KeychainHotspotSecretStore(keychain: keychain, queue: KeychainQueue()) { ssid.value }
+        _ = try await store.load()
+        var field = HotspotPasswordField()
+        ssid.value = "Other Phone"
+        field.edit("pw")
+        XCTAssertTrue(field.startSave())
+        let saving = Task { await SettingsView.storePassword("pw", in: store) }
+        await fulfillment(of: [keychain.entered], timeout: 5)
+
+        ssid.value = "Phone"
+        keychain.release()
+        let outcome = await saving.value
+        let recheck = field.finishSave(outcome, ssid: ssid.value)
+        SettingsView.passwordStored(outcome, configuredSSID: ssid.value, services: services)
+
+        XCTAssertEqual(outcome, .stored(.init(ssid: "Other Phone", password: "pw", removed: "Phone")))
+        XCTAssertNil(try keychain.get(service: KeychainStore.service, account: "Phone"), "the save removed the loaded account")
+        XCTAssertNil(services.status.hotspotPasswordReport, "the reported item is gone")
+        XCTAssertEqual(recheck?.ssid, "Phone")
+        let notice = await SettingsView.hotspotNotice(reported: services.status.hotspotPasswordReport, ssid: ssid.value, reread: store.peek)
+        XCTAssertNil(notice, "a missing item needs no notice")
+        XCTAssertFalse(keychain.gaveUp)
+    }
+
     /// A failed save says so under the field.
     func testAFailedSaveReturnsTheNotice() async {
         final class Refusing: KeychainStoring, @unchecked Sendable {
@@ -474,17 +515,20 @@ final class HotspotPasswordFieldTests: XCTestCase {
     }
 
     /// A report applies to the hotspot it was read for, and a save leaves
-    /// only a report about the configured hotspot that it did not store.
+    /// only a report about the configured hotspot whose item it neither
+    /// stored nor removed.
     func testAReportIsAboutTheHotspotItWasReadFor() {
         let report = HotspotPasswordReport(ssid: "Phone", problem: .unreadable)
         XCTAssertEqual(report.problem(for: " Phone\n"), .unreadable)
         XCTAssertNil(report.problem(for: "Other Phone"))
         XCTAssertNil(report.problem(for: ""))
 
-        XCTAssertTrue(report.stands(afterSaveFor: "Other Phone", configuredSSID: " Phone "))
-        XCTAssertFalse(report.stands(afterSaveFor: "Phone", configuredSSID: "Phone"))
-        XCTAssertFalse(report.stands(afterSaveFor: "Phone", configuredSSID: "Other Phone"))
-        XCTAssertFalse(report.stands(afterSaveFor: "Other Phone", configuredSSID: "Other Phone"))
+        XCTAssertTrue(report.stands(after: .init(ssid: "Other Phone"), configuredSSID: " Phone "))
+        XCTAssertTrue(report.stands(after: .init(ssid: "Other Phone", removed: "Third Phone"), configuredSSID: "Phone"))
+        XCTAssertFalse(report.stands(after: .init(ssid: "Other Phone", removed: "Phone"), configuredSSID: "Phone"), "the save removed its item")
+        XCTAssertFalse(report.stands(after: .init(ssid: "Phone"), configuredSSID: "Phone"))
+        XCTAssertFalse(report.stands(after: .init(ssid: "Phone"), configuredSSID: "Other Phone"))
+        XCTAssertFalse(report.stands(after: .init(ssid: "Other Phone"), configuredSSID: "Other Phone"))
     }
 
     /// Only a save or clear that stored for the SSID configured now counts

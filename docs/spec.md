@@ -450,11 +450,14 @@ provided by the standalone backstop. Performance effects depend on workload.
   since its answer is about the old SSID's item, and the SSID configured
   now is read instead, so the field is not left empty with no notice.
   That read is a peek: the SSID a later save moves the password from
-  stays the one the window loaded, as after any SSID edit. A save clears
-  the failover's report and re-arms its notification unless the report is
-  about the SSID configured when it answers and the save stored for
-  another one; a save that stored for an SSID edited away meanwhile then
-  checks the notice for the SSID configured now. A failover join whose read waited behind a
+  stays the one the window loaded, as after any SSID edit. A save writes
+  the item for the SSID configured when it began and removes the item of
+  the SSID the window loaded, if that SSID was edited since, and returns
+  both. It clears the failover's report and re-arms its notification
+  unless the report is about the SSID configured when it answers and the
+  save touched neither of that SSID's items. A save that stored for an
+  SSID edited away meanwhile then checks the notice for the SSID
+  configured now. A failover join whose read waited behind a
   save does nothing if the session has ended, Wi-Fi has come back, or the
   configured SSID has changed: no join and no warning, so the
   notification stays armed. After a recovery or stop it schedules no

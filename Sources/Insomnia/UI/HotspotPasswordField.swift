@@ -26,10 +26,21 @@ enum HotspotStoreOutcome: Equatable, Sendable {
 /// the button reads "Saved", can be tested without a window.
 struct HotspotPasswordField: Equatable {
     /// What a save stored. The SSID is the one the store used, read when
-    /// the save began.
+    /// the save began; `removed` is the loaded account the save removed.
     struct Stored: Equatable, Sendable {
         let ssid: String
         let password: String
+        let removed: String?
+
+        init(ssid: String, password: String, removed: String? = nil) {
+            self.ssid = ssid
+            self.password = password
+            self.removed = removed
+        }
+
+        var change: HotspotPasswordChange {
+            HotspotPasswordChange(ssid: ssid, removed: removed)
+        }
     }
 
     /// A load or recheck in flight: its token, the SSID it read for, and
@@ -78,8 +89,8 @@ struct HotspotPasswordField: Equatable {
     /// reads "Save": that SSID has no password yet.
     func buttonTitle(ssid: String) -> String {
         if saving { return "Saving\u{2026}" }
-        let showing = Stored(ssid: HotspotSSID.normalized(ssid), password: password)
-        return stored == showing ? "Saved" : "Save"
+        let showing = stored?.ssid == HotspotSSID.normalized(ssid) && stored?.password == password
+        return showing ? "Saved" : "Save"
     }
 
     /// The user changed the password field. A load still waiting will not

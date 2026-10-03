@@ -226,15 +226,34 @@ struct HotspotPasswordReport: Equatable, Sendable {
         ssid == HotspotSSID.normalized(configuredSSID) ? problem : nil
     }
 
-    /// Whether the report still stands after Settings saved or cleared the
-    /// password for `savedSSID`. A save writes that SSID's item and
-    /// removes the one the window loaded, so a report about either is
-    /// out of date. The one report that stands is about the hotspot
-    /// configured now when the save was for another SSID, one edited away
-    /// while the save waited.
-    func stands(afterSaveFor savedSSID: String, configuredSSID: String) -> Bool {
+    /// Whether the report still stands after a save or clear in Settings
+    /// made `change`. A report about either item the save wrote or removed
+    /// is out of date. The one report that stands is about the hotspot
+    /// configured now, when the save touched neither of its items: it
+    /// stored for an SSID edited away while it waited, and the window had
+    /// not loaded the configured one.
+    func stands(after change: HotspotPasswordChange, configuredSSID: String) -> Bool {
         let configured = HotspotSSID.normalized(configuredSSID)
-        return ssid == configured && savedSSID != configured
+        return ssid == configured && !change.touches(configured)
+    }
+}
+
+/// The keychain items a save or clear in Settings changed: the one it
+/// stored or cleared for `ssid`, read when it began, and the one it
+/// removed for `removed`, the SSID the window had loaded, when the SSID
+/// was edited since the load.
+struct HotspotPasswordChange: Equatable, Sendable {
+    let ssid: String
+    let removed: String?
+
+    init(ssid: String, removed: String? = nil) {
+        self.ssid = ssid
+        self.removed = removed
+    }
+
+    /// Whether the save wrote or removed the item for `ssid`.
+    func touches(_ ssid: String) -> Bool {
+        ssid == self.ssid || ssid == removed
     }
 }
 
@@ -837,12 +856,12 @@ final class NetworkFailover {
         notifiedThisOutage = []
     }
 
-    /// Settings saved or cleared the password for `ssid`: forget the
-    /// report unless it still stands (`HotspotPasswordReport.stands`), so
-    /// the menu line goes, and forget the notifications of every other
+    /// Settings saved or cleared the password and made `change`: forget
+    /// the report unless it still stands (`HotspotPasswordReport.stands`),
+    /// so the menu line goes, and forget the notifications of every other
     /// hotspot, so a problem that comes back is notified afresh.
-    func passwordChanged(savedFor ssid: String, configuredSSID: String) {
-        if passwordReport?.stands(afterSaveFor: ssid, configuredSSID: configuredSSID) != true {
+    func passwordChanged(_ change: HotspotPasswordChange, configuredSSID: String) {
+        if passwordReport?.stands(after: change, configuredSSID: configuredSSID) != true {
             passwordReport = nil
         }
         notifiedThisOutage = notifiedThisOutage.filter { $0 == passwordReport?.ssid }

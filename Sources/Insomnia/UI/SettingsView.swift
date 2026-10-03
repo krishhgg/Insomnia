@@ -407,36 +407,36 @@ struct SettingsView: View {
         let password = hotspot.password
         Task {
             let outcome = await Self.storePassword(password, in: secrets)
-            if let recheck = hotspot.finishSave(outcome, ssid: manager.config.hotspotSSID) {
-                recheckPassword(recheck)
-            }
+            let recheck = hotspot.finishSave(outcome, ssid: manager.config.hotspotSSID)
+            // The failover's report first, so the recheck reads it as the
+            // save left it.
             Self.passwordStored(outcome, configuredSSID: manager.config.hotspotSSID, services: manager.services)
+            if let recheck { recheckPassword(recheck) }
         }
     }
 
     /// A save or clear answered. The failover's report goes, and the next
     /// outage notifies afresh, unless the report is about the hotspot
-    /// configured now and the save stored for another SSID, one edited
-    /// away while it waited (`HotspotPasswordReport.stands`).
+    /// configured now and the save neither stored for it nor removed its
+    /// item (`HotspotPasswordReport.stands`).
     static func passwordStored(_ outcome: HotspotStoreOutcome, configuredSSID: String, services: AppServices?) {
         guard case let .stored(stored) = outcome else { return }
-        services?.hotspotPasswordChanged(savedFor: stored.ssid, configuredSSID: configuredSSID)
+        services?.hotspotPasswordChanged(stored.change, configuredSSID: configuredSSID)
     }
 
     /// Saves `password`, or clears the saved one when it is empty, and
-    /// returns what was stored under which SSID, or the notice for a
-    /// failure. The store does the keychain work on `KeychainQueue`, so a
+    /// returns what was stored under which SSID and which loaded account
+    /// it removed, or the notice for a failure. The store does the keychain work on `KeychainQueue`, so a
     /// save waiting on a keychain dialog waits there while the main actor
     /// (the battery floor, the deadline timer, End) carries on.
     static func storePassword(_ password: String, in secrets: any HotspotSecretStore) async -> HotspotStoreOutcome {
         do {
-            let ssid: String
-            if password.isEmpty {
-                ssid = try await secrets.delete()
+            let change = if password.isEmpty {
+                try await secrets.delete()
             } else {
-                ssid = try await secrets.save(password)
+                try await secrets.save(password)
             }
-            return .stored(.init(ssid: ssid, password: password))
+            return .stored(.init(ssid: change.ssid, password: password, removed: change.removed))
         } catch {
             Log.error("could not save hotspot password: \(error.localizedDescription)")
             return .failed(notice: "Could not save the hotspot password: \(error.localizedDescription)")

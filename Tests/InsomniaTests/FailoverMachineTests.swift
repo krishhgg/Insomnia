@@ -506,7 +506,7 @@ final class NetworkFailoverDriverTests: XCTestCase {
 
         await n.joinHotspot()
         XCTAssertEqual(n.passwordReport?.problem, .missing)
-        n.passwordChanged(savedFor: "Phone", configuredSSID: "Phone")
+        n.passwordChanged(.init(ssid: "Phone"), configuredSSID: "Phone")
         XCTAssertNil(n.passwordReport?.problem)
         XCTAssertEqual(published.value, [.missing, nil])
 
@@ -557,30 +557,36 @@ final class NetworkFailoverDriverTests: XCTestCase {
 
     /// A save in Settings for another SSID, one edited away while it
     /// waited, leaves the report about the hotspot configured now, and
-    /// its notification: neither is about the item the save wrote. Any
-    /// other save clears the report: one for the configured hotspot, and
-    /// one whose report is about an SSID no longer configured, whose item
-    /// the save may have written or moved.
+    /// its notification, if the save did not remove that hotspot's item
+    /// either. Any other save clears the report and re-arms the
+    /// notification: one that removed the configured hotspot's item (the
+    /// account the window loaded), one for the configured hotspot, and one
+    /// whose report is about an SSID no longer configured.
     func testASaveClearsEveryReportButOneAboutTheConfiguredHotspotItDidNotStore() async throws {
         let notifier = RecordingNotifier()
         let n = driver(keychain: FakeKeychainStore(), joiner: RecordingHotspotJoiner(), notifier: notifier, clock: FakeClock(Date()))
         let phone = HotspotPasswordReport(ssid: "Phone", problem: .missing)
 
         await n.joinHotspot()
-        n.passwordChanged(savedFor: "Other Phone", configuredSSID: "Phone")
+        n.passwordChanged(.init(ssid: "Other Phone"), configuredSSID: "Phone")
         XCTAssertEqual(n.passwordReport, phone)
         await n.joinHotspot()
         XCTAssertEqual(notifier.posts.count, 1, "the report stood, and so did its notification")
 
-        n.passwordChanged(savedFor: "Phone", configuredSSID: " Phone ")
+        n.passwordChanged(.init(ssid: "Other Phone", removed: "Phone"), configuredSSID: "Phone")
+        XCTAssertNil(n.passwordReport, "the save removed the reported hotspot's item")
+        await n.joinHotspot()
+        XCTAssertEqual(notifier.posts.count, 2, "what the next read finds is notified afresh")
+
+        n.passwordChanged(.init(ssid: "Phone"), configuredSSID: " Phone ")
         XCTAssertNil(n.passwordReport)
         await n.joinHotspot()
-        XCTAssertEqual(notifier.posts.count, 2)
+        XCTAssertEqual(notifier.posts.count, 3)
 
-        n.passwordChanged(savedFor: "Phone", configuredSSID: "Other Phone")
+        n.passwordChanged(.init(ssid: "Phone"), configuredSSID: "Other Phone")
         XCTAssertNil(n.passwordReport, "the save wrote the reported hotspot's item")
         await n.joinHotspot()
-        n.passwordChanged(savedFor: "Other Phone", configuredSSID: "Other Phone")
+        n.passwordChanged(.init(ssid: "Other Phone"), configuredSSID: "Other Phone")
         XCTAssertNil(n.passwordReport, "the save may have moved the reported hotspot's item")
     }
 

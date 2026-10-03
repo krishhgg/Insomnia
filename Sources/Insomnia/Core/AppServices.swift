@@ -304,16 +304,16 @@ final class AppServices {
         await task.value
     }
 
-    /// Settings saved or cleared the hotspot password for `ssid`: the menu
-    /// line about the old one no longer applies, unless it is about the
-    /// hotspot configured now and the save was for another SSID
-    /// (`HotspotPasswordReport.stands`), and the next outage reports
-    /// afresh.
-    func hotspotPasswordChanged(savedFor ssid: String, configuredSSID: String) {
-        if status.hotspotPasswordReport?.stands(afterSaveFor: ssid, configuredSSID: configuredSSID) != true {
+    /// Settings saved or cleared the hotspot password and made `change`:
+    /// the menu line about the old one no longer applies, unless it is
+    /// about the hotspot configured now and the save touched neither of
+    /// its items (`HotspotPasswordReport.stands`), and the next outage
+    /// reports afresh.
+    func hotspotPasswordChanged(_ change: HotspotPasswordChange, configuredSSID: String) {
+        if status.hotspotPasswordReport?.stands(after: change, configuredSSID: configuredSSID) != true {
             status.hotspotPasswordReport = nil
         }
-        network?.passwordChanged(savedFor: ssid, configuredSSID: configuredSSID)
+        network?.passwordChanged(change, configuredSSID: configuredSSID)
     }
 
     /// Re-run the floors with the current inputs. Settings that change a

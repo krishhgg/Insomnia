@@ -440,13 +440,22 @@ final class IntegrationWiringTests: XCTestCase {
         let keychain = FakeKeychainStore()
         let ssid = Locked("Old Phone")
         let store = KeychainHotspotSecretStore(keychain: keychain, queue: KeychainQueue()) { ssid.value }
-        try await store.save("first")
+        let first = try await store.save("first")
+        XCTAssertEqual(first, HotspotPasswordChange(ssid: "Old Phone"))
 
         ssid.value = "New Phone"
-        try await store.save("replacement")
+        let moved = try await store.save("replacement")
 
+        XCTAssertEqual(moved, HotspotPasswordChange(ssid: "New Phone", removed: "Old Phone"), "the save says which item it removed")
         XCTAssertNil(try keychain.get(service: KeychainStore.service, account: "Old Phone"))
         XCTAssertEqual(try keychain.get(service: KeychainStore.service, account: "New Phone"), "replacement")
+        let again = try await store.save("again")
+        XCTAssertEqual(again, HotspotPasswordChange(ssid: "New Phone"))
+
+        ssid.value = "Third Phone"
+        let cleared = try await store.delete()
+        XCTAssertEqual(cleared, HotspotPasswordChange(ssid: "Third Phone", removed: "New Phone"), "a clear says which item it removed too")
+        XCTAssertNil(try keychain.get(service: KeychainStore.service, account: "New Phone"))
     }
 
     /// Settings rereads the password when the failover's report clears.
