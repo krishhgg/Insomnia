@@ -630,3 +630,49 @@ private final class MainActorFlag {
 func settleQueuedRequests() async {
     for _ in 0..<5 { await Task.yield() }
 }
+
+/// A FIFO at `url`, and a watchdog for it. Correct code never opens it. If
+/// something does, open(2) blocks until a writer appears; the watchdog opens
+/// the FIFO for writing once a second, which lets a blocked reader through
+/// (it reads EOF) and records that a reader was there. A regression then
+/// fails its test instead of hanging the suite.
+final class FIFOWatch: @unchecked Sendable {
+    let url: URL
+    private let lock = NSLock()
+    private var stopped = false
+    private var seen = false
+
+    init(at url: URL) throws {
+        self.url = url
+        guard mkfifo(url.path, 0o600) == 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        let path = url.path
+        Thread.detachNewThread { [self] in
+            for _ in 0..<120 {
+                Thread.sleep(forTimeInterval: 1)
+                if self.isStopped { return }
+                // Succeeds only while a reader has the FIFO open.
+                let fd = open(path, O_WRONLY | O_NONBLOCK)
+                if fd >= 0 {
+                    close(fd)
+                    self.markSeen()
+                }
+            }
+        }
+    }
+
+    /// True when something opened the FIFO for reading.
+    var readerSeen: Bool { lock.lock(); defer { lock.unlock() }; return seen }
+
+    /// True when the path is still this FIFO, not moved or replaced.
+    var isStillFIFO: Bool {
+        var info = stat()
+        return lstat(url.path, &info) == 0 && info.st_mode & S_IFMT == S_IFIFO
+    }
+
+    func stop() { lock.lock(); stopped = true; lock.unlock() }
+
+    private var isStopped: Bool { lock.lock(); defer { lock.unlock() }; return stopped }
+    private func markSeen() { lock.lock(); seen = true; lock.unlock() }
+}
