@@ -137,7 +137,10 @@ struct Config: Codable, Equatable, Sendable {
         maxDuration = savedMax ?? d.maxDuration
         // In a current file every value was written by this build or by
         // hand, a 30-day ceiling included; only an older file is migrated.
-        if try c.decodeIfPresent(Int.self, forKey: .configVersion) == nil {
+        // The key alone marks a current file, as in Store.configHasVersion:
+        // its value is never decoded, so a hand-edited "2" cannot fail the
+        // whole file.
+        if !c.contains(.configVersion) {
             if presets == Config.legacyPresets { presets = d.presets }
             if maxDuration == Config.legacyMaxDuration { maxDuration = d.maxDuration }
             // A ceiling the user never set is now 24 hours, not the 30 days

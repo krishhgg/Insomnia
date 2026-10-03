@@ -183,6 +183,10 @@ final class SessionManager {
     /// would resume it, so an end tries the rename again and, while that
     /// fails, is not finished: quit is refused and the end is retried.
     @ObservationIgnored private var unreadSessionInPlace = false
+    /// What init found wrong with config.json, posted by the first
+    /// reconcile: init runs before the app has finished launching, and a
+    /// second copy that never takes the alive lock never reconciles.
+    @ObservationIgnored private var configNotice: String?
 
     init(
         paths: Paths,
@@ -230,7 +234,29 @@ final class SessionManager {
         }
         self.state = loadedState ?? .clean
         self.lastError = loadError
-        if var c = (try? store.loadConfig()) ?? nil {
+        var loadedConfig: Config?
+        var keepConfigFile = false
+        do {
+            loadedConfig = try store.loadConfig()
+        } catch {
+            // The file is the user's settings with something this build
+            // cannot decode (a hand edit's typo or wrong type), or it could
+            // not be read at all. Defaults written over it would lose those
+            // settings for good, so it is renamed aside first, and when the
+            // rename fails nothing is written over it.
+            var detail = error.localizedDescription
+            if case let StoreError.unreadable(_, brief) = error { detail = brief }
+            do {
+                let moved = try store.moveAsideUnreadableConfig(now: clock())
+                Log.error("config.json could not be read (\(detail)); moved to \(moved.path); using default settings")
+                configNotice = "config.json could not be read (\(detail)). It was moved to \(moved.path), and Insomnia is using default settings. To get yours back, quit Insomnia, fix that file and rename it to config.json."
+            } catch let moveError {
+                keepConfigFile = true
+                Log.error("config.json could not be read (\(detail)) or moved aside (\(moveError.localizedDescription)); left in place; using default settings")
+                configNotice = "config.json could not be read (\(detail)) or moved aside (\(moveError.localizedDescription)). Insomnia is using default settings and left the file as it is; a change saved in Settings would replace it."
+            }
+        }
+        if var c = loadedConfig {
             // Settings keeps the end floor below the Low Power Mode floor; a
             // hand-edited config.json may not. Fix it here and write it back.
             if let change = c.normalizeFloors() {
@@ -250,7 +276,7 @@ final class SessionManager {
             if (try? store.configHasVersion()) == false { try? store.saveConfig(c) }
         } else {
             self.config = Config()
-            try? store.saveConfig(self.config)
+            if !keepConfigFile { try? store.saveConfig(self.config) }
         }
     }
 
@@ -1084,6 +1110,10 @@ final class SessionManager {
     // MARK: Reconcile (spec section 8)
 
     func reconcile() async {
+        if let configNotice {
+            self.configNotice = nil
+            notifier.post(title: Self.configFileTitle, body: configNotice)
+        }
         _ = await exclusive("reconcile") { await self.performReconcile() }
     }
 
@@ -1440,6 +1470,7 @@ final class SessionManager {
     static let notEndedTitle = "Session not ended"
     static let journalTitle = "Recovery journal unreadable"
     static let sessionFileTitle = "Session file unreadable"
+    static let configFileTitle = "Settings file unreadable"
     static let foreignSleepTitle = "Sleep is disabled by something else"
     static let foreignSleepCommand = "sudo pmset -a disablesleep 0"
     static let foreignSleepLine = "Sleep is disabled by something other than Insomnia; to re-enable it: \(foreignSleepCommand)"

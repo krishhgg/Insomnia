@@ -511,6 +511,15 @@ small settings window:
   System Settings shows without a relaunch. With the flag off nothing is
   registered or unregistered at launch.
 
+The app reads config.json once, at launch. A missing key takes its
+default, and `configVersion` counts by its presence alone, whatever its
+value. A file that does not decode (a value of the wrong type, broken
+JSON, not a regular file) is never written over: the app renames it to
+`config.json.unreadable-<UTC stamp>`, runs on the defaults, writes them to
+config.json and posts a notification naming the copy. When the rename
+fails, the file stays as it is and the app runs on the defaults without
+writing them. `uninstall.sh` keeps these copies; `--purge` removes them.
+
 ### 11. Menu bar UI: inline time entry
 
 Reference: the attached screenshot (coffee icon, then three rounded pill

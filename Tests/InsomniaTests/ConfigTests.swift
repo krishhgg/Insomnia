@@ -411,4 +411,85 @@ final class ConfigLoadTests: XCTestCase {
         XCTAssertEqual(m.config, fine)
         XCTAssertFalse(log().contains("battery floors corrected"), log())
     }
+
+    private func writeConfig(_ json: String) throws -> Data {
+        try h.home.paths.createDirectories()
+        let data = Data(json.utf8)
+        try data.write(to: h.home.paths.configFile)
+        return data
+    }
+
+    private func movedAsideConfigs() throws -> [String] {
+        try FileManager.default.contentsOfDirectory(atPath: h.home.paths.appSupport.path)
+            .filter { $0.hasPrefix(Paths.unreadableConfigPrefix) }.sorted()
+    }
+
+    /// The marker's presence is what makes a file current; its value is
+    /// never read. A hand-edited "2" keeps every setting, the 30-day
+    /// ceiling included, and the file is neither migrated nor rewritten.
+    func testAVersionMarkerOfAnotherTypeKeepsTheSettings() async throws {
+        let json = #"{"configVersion": "2", "maxDuration": 2592000, "endFloor": 30, "lowPowerFloor": 40, "freezeAllApps": false}"#
+        let written = try writeConfig(json)
+
+        let m = h.makeManager()
+        await m.reconcile()
+
+        XCTAssertEqual(m.config.maxDuration, 30 * 24 * 3600)
+        XCTAssertEqual([m.config.endFloor, m.config.lowPowerFloor], [30, 40])
+        XCTAssertFalse(m.config.freezeAllApps)
+        XCTAssertEqual(try Data(contentsOf: h.home.paths.configFile), written)
+        XCTAssertEqual(try movedAsideConfigs(), [])
+        XCTAssertFalse(h.notifier.posts.contains { $0.title == SessionManager.configFileTitle })
+    }
+
+    /// A file this build cannot decode is the user's settings with one bad
+    /// value or a typo. It is renamed aside with its bytes, never written
+    /// over; config.json then holds the defaults the app runs on, and the
+    /// first reconcile says where the file went, once.
+    func testAConfigThatDoesNotDecodeIsMovedAsideNotOverwritten() async throws {
+        let cases = [
+            #"{"configVersion": 2, "endFloor": "30", "freezeAllApps": false}"#,
+            #"{"configVersion": 2, "endFloor": 30"#,
+        ]
+        for json in cases {
+            h.home.destroy()
+            h = Harness()
+            let written = try writeConfig(json)
+
+            let m = h.makeManager()
+
+            XCTAssertEqual(m.config, Config(), json)
+            XCTAssertEqual(try movedAsideConfigs(), ["config.json.unreadable-20270115T080000Z"], json)
+            let moved = h.home.paths.appSupport.appendingPathComponent("config.json.unreadable-20270115T080000Z")
+            XCTAssertEqual(try Data(contentsOf: moved), written, json)
+            XCTAssertEqual(try h.store.loadConfig(), Config(), json)
+            XCTAssertTrue(log().contains("[error] insomnia: config.json could not be read ("), log())
+
+            await m.reconcile()
+            await m.reconcile()
+            let notices = h.notifier.posts.filter { $0.title == SessionManager.configFileTitle }
+            XCTAssertEqual(notices.count, 1, "\(notices)")
+            XCTAssertTrue(notices.first?.body.contains("It was moved to \(moved.path)") == true, "\(notices)")
+        }
+    }
+
+    /// When the rename fails, nothing is written over the file: the app runs
+    /// on defaults and says the file was left as it is.
+    func testAConfigThatCannotBeMovedAsideIsLeftAsItIs() async throws {
+        let written = try writeConfig(#"{"configVersion": 2, "endFloor": "30"}"#)
+        let dir = h.home.paths.appSupport.path
+        XCTAssertEqual(chmod(dir, 0o500), 0)
+        defer { chmod(dir, 0o700) }
+
+        let m = h.makeManager()
+        chmod(dir, 0o700)
+
+        XCTAssertEqual(m.config, Config())
+        XCTAssertEqual(try Data(contentsOf: h.home.paths.configFile), written)
+        XCTAssertEqual(try movedAsideConfigs(), [])
+        await m.reconcile()
+        let notices = h.notifier.posts.filter { $0.title == SessionManager.configFileTitle }
+        XCTAssertEqual(notices.count, 1, "\(notices)")
+        XCTAssertTrue(notices.first?.body.contains("left the file as it is") == true, "\(notices)")
+    }
 }

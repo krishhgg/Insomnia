@@ -1543,6 +1543,38 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(try movedAsideSessions(), [notOurs])
     }
 
+    /// The app renames a config.json it cannot decode to the same shape
+    /// (Store.moveAsideUnreadableConfig). A plain uninstall keeps those
+    /// copies, as it keeps config.json; --purge removes them, and only them:
+    /// another name under the prefix and a directory named like a copy stay.
+    func testUninstallKeepsMovedAsideConfigCopiesAndPurgeRemovesOnlyThose() throws {
+        func movedAsideConfigs() throws -> [String] {
+            try fx.contents(of: fx.home).filter { $0.hasPrefix("config.json.unreadable-") }.sorted()
+        }
+        try fx.installMachinery()
+        let ours = ["config.json.unreadable-20260101T000000Z", "config.json.unreadable-20260101T000000Z-2"]
+        let notOurs = "config.json.unreadable-notes.txt"
+        for name in ours + [notOurs] {
+            try "x".write(to: fx.home.appendingPathComponent(name), atomically: true, encoding: .utf8)
+        }
+        let dir = fx.home.appendingPathComponent("config.json.unreadable-20260101T000000Z-1")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+
+        let kept = try fx.run(fx.uninstall)
+
+        XCTAssertEqual(kept.status, 0, kept.stderr + kept.stdout)
+        XCTAssertEqual(try movedAsideConfigs().count, 4)
+        XCTAssertTrue(kept.stdout.contains("Kept 2 unreadable config.json file(s) moved aside"), kept.stdout)
+        XCTAssertTrue(kept.stdout.contains("Kept \(dir.path): it is named like a moved-aside config.json but is not a regular file"), kept.stdout)
+
+        try fx.installMachinery()
+        let purged = try fx.run(fx.uninstall, ["--purge"])
+
+        XCTAssertEqual(purged.status, 0, purged.stderr + purged.stdout)
+        XCTAssertEqual(try movedAsideConfigs(), [dir.lastPathComponent, notOurs].sorted())
+        XCTAssertTrue(purged.stdout.contains("Left \(dir.path): it is named like a moved-aside config.json but is not a regular file"), purged.stdout)
+    }
+
     /// Something that is not a regular file but has a moved-aside name (here
     /// a directory with a file in it) is not Insomnia's. --purge says so,
     /// leaves it with its contents, and still finishes: the copies beside it

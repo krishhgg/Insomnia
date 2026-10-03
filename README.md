@@ -298,7 +298,10 @@ app will keep working while the lid is closed.
 
 Configuration lives in `~/Library/Application Support/Insomnia/config.json`.
 Use Settings for the app's controls; [Config.swift](Sources/Insomnia/Model/Config.swift)
-defines the full configuration and defaults. Local logs can contain SSIDs,
+defines the full configuration and defaults. The app reads the file at
+launch. If a hand edit leaves it unreadable, the app renames it to
+`config.json.unreadable-<time>`, starts with the defaults and posts a
+notification; fix the copy, quit Insomnia and rename it back. Local logs can contain SSIDs,
 process metadata, and tmux targets. Check them before sharing publicly.
 Lines the app writes to `insomnia.log` also go to the unified log with their
 bodies marked private, so `log show` and other local programs see `<private>`

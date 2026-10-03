@@ -137,14 +137,25 @@ struct Store: Sendable {
     /// Never overwrites: a taken name gets -1, -2, ..., and the rename
     /// itself fails rather than replace a file that appeared meanwhile.
     func moveAsideUnreadableSession(now: Date) throws -> URL {
-        let base = Paths.unreadableSessionPrefix + Self.stamp(now)
+        try moveAside(paths.sessionFile, prefix: Paths.unreadableSessionPrefix, now: now)
+    }
+
+    /// The same for a config.json that does not decode (see Paths.
+    /// unreadableConfigPrefix): it holds the user's settings, so it is kept
+    /// for a person to fix rather than written over with defaults.
+    func moveAsideUnreadableConfig(now: Date) throws -> URL {
+        try moveAside(paths.configFile, prefix: Paths.unreadableConfigPrefix, now: now)
+    }
+
+    private func moveAside(_ file: URL, prefix: String, now: Date) throws -> URL {
+        let base = prefix + Self.stamp(now)
         var dest = paths.appSupport.appendingPathComponent(base)
         var n = 0
         while FileManager.default.fileExists(atPath: dest.path) {
             n += 1
             dest = paths.appSupport.appendingPathComponent("\(base)-\(n)")
         }
-        try FileManager.default.moveItem(at: paths.sessionFile, to: dest)
+        try FileManager.default.moveItem(at: file, to: dest)
         return dest
     }
 
@@ -170,7 +181,15 @@ struct Store: Sendable {
     }
     func saveState(_ s: RuntimeState) throws { try write(s, to: paths.stateFile) }
 
-    func loadConfig() throws -> Config? { try read(Config.self, from: paths.configFile) }
+    /// Throws StoreError.unreadable, with a one-line reason, when the file
+    /// does not decode.
+    func loadConfig() throws -> Config? {
+        do {
+            return try read(Config.self, from: paths.configFile)
+        } catch let error as DecodingError {
+            throw StoreError.unreadable(file: paths.configFile.path, detail: Self.brief(error))
+        }
+    }
     func saveConfig(_ c: Config) throws { try write(c, to: paths.configFile) }
 
     /// False for a config.json written before `configVersion` existed.

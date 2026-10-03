@@ -13,8 +13,10 @@
 #
 # Deletion is by exact owned file, never by directory tree: --purge removes
 # the files Insomnia writes (see Paths.swift), the session.json copies the
-# app or backstop.sh moved aside (session.json.unreadable-<stamp>, only that
-# exact shape), and then rmdir's its own directories only if they are empty.
+# app or backstop.sh moved aside and the config.json copies the app moved
+# aside (session.json.unreadable-<stamp> and config.json.unreadable-<stamp>,
+# only that exact shape), and then rmdir's its own directories only if they
+# are empty.
 # Only regular files are removed; anything else at one of those paths is
 # left with a message. The lock file is never unlinked, so --purge leaves
 # APP_SUPPORT/.recovery.lock (and therefore APP_SUPPORT).
@@ -424,22 +426,25 @@ MSG
   fi
 }
 
-# Copies of session.json that the app or backstop.sh moved aside, taken
+# Copies of session.json that the app or backstop.sh moved aside, or of
+# config.json that the app moved aside (the argument names which), taken
 # straight from the glob into MOVED_ASIDE, so a path holding a newline stays
 # one path. A copy is a regular file whose name has exactly the shape the
 # move writes (prefix, UTC stamp, optional -n). Anything else with such a
 # name (a directory, a FIFO, a symlink) goes to NOT_MOVED_ASIDE and is never
-# removed, even when the app or backstop.sh renamed it there: a session.json
-# that cannot be read is moved without being opened, whatever it is, and
+# removed, even when the app or backstop.sh renamed it there: a file that
+# cannot be read is moved without being opened, whatever it is, and
 # Insomnia did not create its contents. Other names under the prefix are
 # not Insomnia's and are skipped.
-collect_moved_aside_sessions() {
-  local f
+collect_moved_aside() { # session.json | config.json
+  local f stamp
   MOVED_ASIDE=()
   NOT_MOVED_ASIDE=()
-  for f in "$APP_SUPPORT"/session.json.unreadable-*; do
+  for f in "$APP_SUPPORT/$1".unreadable-*; do
     [[ -e "$f" || -L "$f" ]] || continue
-    [[ "${f##*/}" =~ ^session\.json\.unreadable-[0-9]{8}T[0-9]{6}Z(-[0-9]+)?$ ]] || continue
+    stamp="${f##*/}"
+    stamp="${stamp#"$1".unreadable-}"
+    [[ "$stamp" =~ ^[0-9]{8}T[0-9]{6}Z(-[0-9]+)?$ ]] || continue
     if [[ -f "$f" && ! -L "$f" ]]; then
       MOVED_ASIDE+=("$f")
     else
@@ -630,15 +635,17 @@ if (( PURGE == 1 )); then
   step "Purging Insomnia's files in $APP_SUPPORT and $LOG_DIR"
   remove_owned "$SESSION" "$ENDED" "$STATE" "$APP_SUPPORT/config.json" "$APP_SUPPORT/backstop.sh" \
         "$LOG_DIR/insomnia.log" "$LOG_DIR/handoffs.log"
-  collect_moved_aside_sessions
-  if (( ${#MOVED_ASIDE[@]} > 0 )); then
-    remove_owned "${MOVED_ASIDE[@]}"
-  fi
-  if (( ${#NOT_MOVED_ASIDE[@]} > 0 )); then
-    for f in "${NOT_MOVED_ASIDE[@]}"; do
-      echo "Left $f: it is named like a moved-aside session.json but is not a regular file, so purge does not remove it. Remove it yourself if you do not need it."
-    done
-  fi
+  for name in session.json config.json; do
+    collect_moved_aside "$name"
+    if (( ${#MOVED_ASIDE[@]} > 0 )); then
+      remove_owned "${MOVED_ASIDE[@]}"
+    fi
+    if (( ${#NOT_MOVED_ASIDE[@]} > 0 )); then
+      for f in "${NOT_MOVED_ASIDE[@]}"; do
+        echo "Left $f: it is named like a moved-aside $name but is not a regular file, so purge does not remove it. Remove it yourself if you do not need it."
+      done
+    fi
+  done
   # The lock file itself is kept, even on purge: this process still holds
   # it, and anything that opened it a moment ago (a queued agent run, an app
   # launched after the check above) waits on this inode. Unlinking it would
@@ -651,15 +658,17 @@ if (( PURGE == 1 )); then
 else
   remove_owned "$APP_SUPPORT/backstop.sh" "$SESSION" "$ENDED" "$STATE"
   echo "Kept $APP_SUPPORT/config.json and $LOG_DIR (use --purge to remove)."
-  collect_moved_aside_sessions
-  if (( ${#MOVED_ASIDE[@]} > 0 )); then
-    echo "Kept ${#MOVED_ASIDE[@]} unreadable session.json file(s) moved aside in $APP_SUPPORT (use --purge to remove)."
-  fi
-  if (( ${#NOT_MOVED_ASIDE[@]} > 0 )); then
-    for f in "${NOT_MOVED_ASIDE[@]}"; do
-      echo "Kept $f: it is named like a moved-aside session.json but is not a regular file, so purge does not remove it either. Remove it yourself if you do not need it."
-    done
-  fi
+  for name in session.json config.json; do
+    collect_moved_aside "$name"
+    if (( ${#MOVED_ASIDE[@]} > 0 )); then
+      echo "Kept ${#MOVED_ASIDE[@]} unreadable $name file(s) moved aside in $APP_SUPPORT (use --purge to remove)."
+    fi
+    if (( ${#NOT_MOVED_ASIDE[@]} > 0 )); then
+      for f in "${NOT_MOVED_ASIDE[@]}"; do
+        echo "Kept $f: it is named like a moved-aside $name but is not a regular file, so purge does not remove it either. Remove it yourself if you do not need it."
+      done
+    fi
+  done
 fi
 
 if (( remove_failures > 0 )); then
