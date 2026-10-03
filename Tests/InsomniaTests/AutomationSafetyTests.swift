@@ -386,21 +386,33 @@ final class TmuxLiveRunnerTests: XCTestCase {
         XCTAssertEqual(lines, 2, seen)
     }
 
-    /// Default: `continue` is typed and nothing submits it. The pty echo
-    /// shows the word once; `cat` never prints it back because no Enter came.
+    /// Default: `continue` is typed and nothing submits it. The pane's `cat`
+    /// writes each line the terminal hands it to a file. After the nudge the
+    /// test types `X` and Enter: the file then reads `continueX` if the nudge
+    /// sent no Enter, and `continue` and `X` on two lines if it did. Keys
+    /// reach the pane in order, so once `X` is in the file, everything the
+    /// nudge sent is too, however slow the pane.
     func testLivePaneGetsContinueWithoutEnterByDefault() async throws {
-        try await startPane(command: "cat")
+        let received = FileManager.default.temporaryDirectory
+            .appendingPathComponent("insomnia-nudge-\(UUID().uuidString).txt")
+        defer { try? FileManager.default.removeItem(at: received) }
+        try await startPane(command: "cat > '\(received.path)'")
         let run = TmuxNudge.makeLiveRunner(socketName: socket)
 
         let accepted = try await run("nudge:0.0", false)
 
         XCTAssertTrue(accepted)
-        let (lines, seen) = try await continueLines(atLeast: 1)
-        XCTAssertEqual(lines, 1, seen)
-        // Give a stray Enter time to show up as a second line.
-        try await Task.sleep(for: .milliseconds(300))
-        let later = try await continueLines(atLeast: 1)
-        XCTAssertEqual(later.count, 1, "Enter was sent without being enabled: \(later.seen)")
+        let marker = try await tmuxRun(["send-keys", "-t", "nudge:0.0", "-l", "X"])
+        XCTAssertTrue(marker.succeeded, marker.stderr)
+        let enter = try await tmuxRun(["send-keys", "-t", "nudge:0.0", "Enter"])
+        XCTAssertTrue(enter.succeeded, enter.stderr)
+        var text = ""
+        for _ in 0..<250 {
+            text = (try? String(contentsOf: received, encoding: .utf8)) ?? ""
+            if text.hasSuffix("X\n") { break }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertEqual(text, "continueX\n", "the pane did not get exactly `continue` with no Enter")
     }
 
     /// Without the pane mark nothing is sent, however the target was listed.
