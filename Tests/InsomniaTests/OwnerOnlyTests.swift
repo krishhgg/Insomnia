@@ -226,6 +226,18 @@ final class OwnerOnlyTests: XCTestCase {
 
         XCTAssertEqual(try mode(sharedLog), 0o644)
         XCTAssertTrue(try String(contentsOf: sharedLog, encoding: .utf8).hasSuffix("insomnia: via symlinked file\n"))
+
+        // Past the cap, the symlinked log is not rotated: a rename would move
+        // the link to `.1` and the next line would start a plain file.
+        XCTAssertThrowsError(try OwnerOnly.appendToLog("past the cap\n", at: home.paths.logFile, maxBytes: 10)) { error in
+            guard case .symlinkNotRotated = error as? OwnerOnlyError else { return XCTFail("\(error)") }
+        }
+        XCTAssertNoThrow(try OwnerOnly.appendToLog("again\n", at: home.paths.logFile, maxBytes: 10), "reported once per path")
+
+        XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: home.paths.logFile.path), sharedLog.path)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: OwnerOnly.rotated(home.paths.logFile).path))
+        XCTAssertTrue(try String(contentsOf: sharedLog, encoding: .utf8).hasSuffix("past the cap\nagain\n"))
+        XCTAssertEqual(try mode(sharedLog), 0o644)
     }
 
     // MARK: Journal, session, config

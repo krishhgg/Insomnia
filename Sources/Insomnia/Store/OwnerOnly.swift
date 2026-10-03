@@ -18,8 +18,9 @@ import Foundation
 /// file. The rename runs under flock(2) on the file, with a check that the
 /// file held is still the one at the path, so two processes that both find
 /// the log oversized cannot rotate it twice and rename the fresh log over
-/// the retained copy. The backstop appends with `>>` and never rotates, so
-/// it simply creates the fresh file.
+/// the retained copy. A log that is a symlink is never rotated, since the
+/// rename would move the link itself; that is reported once. The backstop
+/// appends with `>>` and never rotates, so it simply creates the fresh file.
 enum OwnerOnly {
     static let fileMode: mode_t = 0o600
     static let directoryMode: mode_t = 0o700
@@ -74,6 +75,7 @@ enum OwnerOnly {
     }
 
     private static let reported = PathSet()
+    private static let symlinkedLogs = PathSet()
 
     private final class PathSet: @unchecked Sendable {
         private let lock = NSLock()
@@ -109,10 +111,11 @@ enum OwnerOnly {
         if let problem = tighten(fd: fd, path: url.path) { problems.append(problem) }
         if size(of: fd) > maxBytes {
             beforeRotating()
-            if let problem = rotateHeld(fd, at: url, maxBytes: maxBytes) {
+            switch rotateHeld(fd, at: url, maxBytes: maxBytes) {
+            case let .keep(problem):
                 // The held file is still the log: keep writing to it.
-                problems.append(problem)
-            } else {
+                if let problem { problems.append(problem) }
+            case .reopen:
                 // Rotated, by this process or another: the path is a fresh file.
                 close(fd)
                 fd = -1
@@ -139,29 +142,41 @@ enum OwnerOnly {
     /// `<name>.1` next to the log: insomnia.log.1, handoffs.log.1.
     static func rotated(_ url: URL) -> URL { url.appendingPathExtension("1") }
 
+    /// What `rotateHeld` leaves the appender to do.
+    private enum Rotation {
+        /// The path names a fresh file, whoever rotated: open it.
+        case reopen
+        /// The held file is still the log: write to it, and report the
+        /// problem, if any.
+        case keep(OwnerOnlyError?)
+    }
+
     /// rename(2) the held file over the previous `.1`, under flock(2) on it.
     /// Two processes can both find the log oversized; the one that locks
     /// first renames, and the other then sees that the path no longer names
-    /// the file it holds and leaves the fresh log alone. Returns nil when
-    /// the path is a fresh file afterwards, whoever rotated, and the error
-    /// when the rename failed and the held file is still the log. A rename
-    /// keeps the inode and its mode; the backstop may still have a line in
-    /// flight to it, which then lands in `.1`.
-    private static func rotateHeld(_ fd: Int32, at url: URL, maxBytes: UInt64) -> OwnerOnlyError? {
-        guard flock(fd, LOCK_EX) == 0 else { return .rotate(path: url.path, errno: errno) }
+    /// the file it holds and leaves the fresh log alone. The path is read
+    /// with lstat(2): a symlinked log is not renamed, because rename moves
+    /// the link, not its target, and the next open would start a plain file
+    /// in its place. A rename keeps the inode and its mode; the backstop may
+    /// still have a line in flight to it, which then lands in `.1`.
+    private static func rotateHeld(_ fd: Int32, at url: URL, maxBytes: UInt64) -> Rotation {
+        guard flock(fd, LOCK_EX) == 0 else { return .keep(.rotate(path: url.path, errno: errno)) }
         defer { flock(fd, LOCK_UN) }
         var held = stat()
         var named = stat()
-        guard fstat(fd, &held) == 0 else { return .rotate(path: url.path, errno: errno) }
-        if stat(url.path, &named) != 0 {
+        guard fstat(fd, &held) == 0 else { return .keep(.rotate(path: url.path, errno: errno)) }
+        if lstat(url.path, &named) != 0 {
             // Gone from the path: another process rotated it and has not
             // written yet. Nothing to rename.
-            return errno == ENOENT ? nil : .rotate(path: url.path, errno: errno)
+            return errno == ENOENT ? .reopen : .keep(.rotate(path: url.path, errno: errno))
         }
-        guard held.st_ino == named.st_ino, held.st_dev == named.st_dev else { return nil }
-        guard UInt64(max(0, held.st_size)) > maxBytes else { return nil }
-        guard rename(url.path, rotated(url).path) == 0 else { return .rotate(path: url.path, errno: errno) }
-        return nil
+        if (named.st_mode & S_IFMT) == S_IFLNK {
+            return .keep(symlinkedLogs.insert(url.path) ? .symlinkNotRotated(path: url.path) : nil)
+        }
+        guard held.st_ino == named.st_ino, held.st_dev == named.st_dev else { return .reopen }
+        guard UInt64(max(0, held.st_size)) > maxBytes else { return .keep(nil) }
+        guard rename(url.path, rotated(url).path) == 0 else { return .keep(.rotate(path: url.path, errno: errno)) }
+        return .reopen
     }
 
     /// Creates `url` holding `data`, mode 0600 from the first byte. Fails
@@ -194,10 +209,13 @@ enum OwnerOnlyError: Error, LocalizedError {
     case write(path: String, errno: Int32)
     case chmod(path: String, errno: Int32)
     case rotate(path: String, errno: Int32)
+    case symlinkNotRotated(path: String)
 
     var path: String {
         switch self {
         case let .open(path, _), let .write(path, _), let .chmod(path, _), let .rotate(path, _):
+            return path
+        case let .symlinkNotRotated(path):
             return path
         }
     }
@@ -208,6 +226,7 @@ enum OwnerOnlyError: Error, LocalizedError {
         case let .write(path, errno): return "could not write \(path): \(String(cString: strerror(errno)))"
         case let .chmod(path, errno): return "could not make \(path) owner-only: \(String(cString: strerror(errno)))"
         case let .rotate(path, errno): return "could not rotate \(path) to \(path).1: \(String(cString: strerror(errno)))"
+        case let .symlinkNotRotated(path): return "not rotating \(path): it is a symlink, so its target can grow past the cap"
         }
     }
 }
