@@ -358,8 +358,14 @@ Performance effects depend on workload.
 - Each outage is logged with start, end, and gap length to
   `~/Library/Logs/Insomnia/handoffs.log`. The menu shows the last gap.
 - Path satisfied again after a gap longer than `nudgeThreshold` (default 90 s):
-  - For every tagged tmux target (`session:window.pane`), run
-    `tmux send-keys -t <target> "continue" Enter`.
+  - For every configured tmux target (`session:window.pane`), resolve the
+    concrete pane, read its state and then its mark, the pane-scoped user
+    option `@insomnia-nudge` (`show-options -qpv -t %N`, without `-A`, so
+    a session or window option never counts). Only a pane marked `on` by
+    the user (`tmux set-option -p -t <target> @insomnia-nudge on`) gets
+    `tmux send-keys -t %N continue`, followed by `Enter` only when
+    `tmuxNudgePressesEnter` is on (default off). An unmarked pane is
+    skipped and logged.
   - Post a notification: "Network was down 2m 10s. Nudged 2 tmux panes.
     Check GUI agents."
 - Recommended one-time setting, documented in the README: System Settings >
@@ -487,7 +493,7 @@ small settings window:
 - agent list (bundle ids), turn App Nap off for them on/off (default off)
 - `lowPowerFloor`, `endFloor`, thermal rules on/off
 - hotspot SSID (password entered once, stored in Keychain), `nudgeThreshold`
-- tmux targets
+- tmux targets, `tmuxNudgePressesEnter` (default off)
 - launch at login (`SMAppService.mainApp`). macOS ties the login item to
   the bundle's signature and location, and `install.sh` ad-hoc signs a
   fresh bundle on every run, so an upgrade can drop the registration.
@@ -758,8 +764,11 @@ that any case passed; record results in the release validation record.
    shows the SSID. Turn off the router or walk away, watch `handoffs.log`, and
    confirm the hotspot join works within ~10 s and a Claude Code turn in flight
    completes.
-10. **Nudge.** Gap forced above threshold → tagged tmux pane receives
-   "continue", notification posted.
+10. **Nudge.** Mark a disposable pane (`tmux set-option -p -t <target>
+   @insomnia-nudge on`). Gap forced above threshold → that pane receives
+   "continue" and no Enter; an unmarked listed pane receives nothing;
+   with "Press Enter after continue" on, the line is submitted.
+   Notification posted.
 11. **Floors.** Set `lowPowerFloor` above current charge → Low Power Mode on.
     Plug in charger → off. Set `endFloor` above current charge → session ends.
 12. **Thermal.** Exercise injected thermal events first; verify responses to

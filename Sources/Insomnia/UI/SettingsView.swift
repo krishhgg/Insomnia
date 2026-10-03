@@ -247,6 +247,16 @@ struct SettingsView: View {
             Stepper(value: nudgeSeconds, in: 10...900, step: 10) {
                 LabeledContent("Nudge tmux after", value: "\(Int(manager.config.nudgeThreshold)) s offline")
             }
+            Text("After that long offline, Insomnia types \"continue\" into each pane listed below. Only a pane you have marked with this tmux command is nudged. Mark a dedicated pane, not one you type in.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text(TmuxNudge.markCommand())
+                .font(.system(.caption, design: .monospaced))
+                .textSelection(.enabled)
+            Toggle("Press Enter after continue", isOn: bind(\.tmuxNudgePressesEnter))
+            Text("Enter submits whatever is already typed in that pane, including a line that was never finished. When off, \"continue\" is typed and nothing submits it.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
             ForEach(manager.config.tmuxTargets, id: \.self) { t in
                 HStack {
                     Text(t).font(.system(.body, design: .monospaced))
