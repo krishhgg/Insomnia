@@ -998,6 +998,20 @@ final class RecoveryScriptTests: XCTestCase {
             "the backstop changes modes through its fixed CHMOD path")
     }
 
+    func testBackstopLogsAFailedTighteningAndStillRecovers() throws {
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: fx.state.path)
+        try fx.state.path.write(to: fx.root.appendingPathComponent("chmod.fail"), atomically: true, encoding: .utf8)
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 0, r.stderr)
+        XCTAssertEqual(fx.calls(), ["sudo -n \(fx.fakePmset) -a disablesleep 0"], "recovery went on after the failed chmod")
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, false)
+        XCTAssertTrue(fx.log().contains("[error] backstop: could not make \(fx.state.path) owner-only: chmod: \(fx.state.path): Operation not permitted\n"), fx.log())
+        XCTAssertEqual(fx.log().components(separatedBy: "owner-only").count, 2, "only the failed path is reported: \(fx.log())")
+    }
+
     // MARK: - Journal shape (typed corruption)
 
     func testTypedCorruptJournalIsRejectedByBackstopWithoutCommands() throws {
@@ -2186,9 +2200,14 @@ private final class ScriptFixture {
         cat "\(r)/boot.uuid"
         """)
         // chmod: recorded in chmod.calls, apart from calls.log, then run for
-        // real so the modes still change.
+        // real so the modes still change. A path listed in chmod.fail fails
+        // the way an immutable file does.
         try writeFake("chmod", """
         printf 'chmod %s\\n' "$*" >> "\(r)/chmod.calls"
+        if [[ -f "\(r)/chmod.fail" ]] && grep -qxF -- "${2:-}" "\(r)/chmod.fail"; then
+          echo "chmod: ${2:-}: Operation not permitted" >&2
+          exit 1
+        fi
         exec /bin/chmod "$@"
         """)
         // defaults: an NSAppSleepDisabled table per domain (defaults.table,

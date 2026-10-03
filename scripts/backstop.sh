@@ -116,14 +116,18 @@ mkdir -p "$APP_SUPPORT"
 # An upgrade over an older build: tighten what it left loose (0644 files,
 # 0755 directories), since this run may write to them before the upgraded
 # app has opened them. umask only covers what this run creates. A symlink
-# is left alone, as the app leaves it.
+# is left alone, as the app leaves it. A chmod that fails is logged as an
+# error and recovery goes on: a loose mode is no reason to leave the
+# machine changed.
 tighten() { # mode path...
   local mode="$1"
   shift
-  local p
+  local p err
   for p in "$@"; do
     if [[ -e "$p" && ! -L "$p" ]]; then
-      "$CHMOD" "$mode" "$p" 2>/dev/null || true
+      if ! err="$("$CHMOD" "$mode" "$p" 2>&1)"; then
+        log error "could not make $p owner-only: ${err:-chmod failed}" || true
+      fi
     fi
   done
 }
