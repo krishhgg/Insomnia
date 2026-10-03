@@ -103,7 +103,7 @@ and check the status menu and `~/Library/Logs/Insomnia/insomnia.log` afterward.
 ## What happens when the lid closes
 
 <p align="center">
-  <img src="docs/assets/lid-actions.svg" alt="Illustrated Settings defaults: Slack, WhatsApp, and Discord on the freeze list, Docker's idle rule on, mute off. During a session, lid close applies configured actions; reopening attempts to resume verified owned freezes and restore saved audio. The session continues. Without an active session, lid changes do nothing." width="880">
+  <img src="docs/assets/lid-actions.svg" alt="Illustrated Settings defaults: Slack, WhatsApp, and Discord on the freeze list, Docker's idle rule off, mute off. During a session, lid close applies configured actions; reopening attempts to resume verified owned freezes and restore saved audio. The session continues. Without an active session, lid changes do nothing." width="880">
 </p>
 
 During a session, Insomnia turns the display and keyboard backlight off
@@ -136,9 +136,13 @@ The defaults are worth knowing:
   apps are never picked up automatically; add them to the freeze list if you
   want them paused. Settings shows a "Would freeze now" line listing what the
   automatic scope would pause at that moment.
-- **Docker rule:** enabled, with a separate local Docker Desktop idle check.
-  Container startup can race that check; disable the rule for important Docker
-  workloads where an unexpected pause would be disruptive.
+- **Docker rule:** off. Turn it on to pause Docker Desktop on lid close when
+  no container is running. The local Desktop socket is asked once to pick
+  Docker up and once more right before the pause; a busy answer, a failed
+  `docker ps` or a timeout at either point leaves Docker running. A container
+  that starts between the second check and the pause is still paused with
+  Desktop, so leave the rule off for Docker workloads an unexpected pause
+  would hurt.
 - **Mute on close:** off.
 - **Display and keyboard backlight:** on ("Turn off the display and keyboard
   backlight" in Settings). Both values are saved to the journal before they

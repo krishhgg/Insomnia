@@ -63,7 +63,7 @@ final class LidActions {
 
             let groups = freezer.plan(config: config)
             for group in groups {
-                freeze(group, docker: false, manager: manager)
+                await freeze(group, docker: false, manager: manager)
             }
 
             let dockerGroup = await docker.idleDockerGroup(config: config)
@@ -71,9 +71,24 @@ final class LidActions {
             // behind this transaction and must not find a fresh freeze.
             guard manager.isActive, manager.endTicket == ticket, !Task.isCancelled else { return }
             if let dockerGroup {
-                freeze(dockerGroup, docker: true, manager: manager)
+                // The idle answer above is already stale by the time the
+                // journal write is done, so Docker is asked once more right
+                // before its SIGSTOP; busy, a failed probe or a timeout
+                // leaves it running. The end check repeats for the same
+                // reason as above.
+                await freeze(dockerGroup, docker: true, manager: manager) { [docker] in
+                    guard await docker.isStillIdle() else { return false }
+                    guard manager.isActive, manager.endTicket == ticket, !Task.isCancelled else {
+                        Log.info("docker rule: session ending during the second check, Docker left alone")
+                        return false
+                    }
+                    return true
+                }
             }
 
+            // A session whose end arrived during this transaction has no
+            // countdown left to pause; its end is queued right behind.
+            guard manager.isActive, manager.endTicket == ticket, !Task.isCancelled else { return }
             manager.pauseCountdown()
         }
         if !ran { Log.error("lid close actions skipped: recovery lock busy") }
@@ -204,7 +219,10 @@ final class LidActions {
         }
     }
 
-    private func freeze(_ group: FreezeGroup, docker: Bool, manager: SessionManager) {
+    /// `beforeSignal`, when given, runs after the journal write and right
+    /// before the SIGSTOP; false means leave the group running and take its
+    /// entries out of the journal again.
+    private func freeze(_ group: FreezeGroup, docker: Bool, manager: SessionManager, beforeSignal: (() async -> Bool)? = nil) async {
         let already = Set(manager.state.frozenPids)
         var candidates: [FrozenProcess] = []
         for pid in group.pids where !already.contains(pid) {
@@ -233,6 +251,20 @@ final class LidActions {
             }
         } catch {
             manager.fail("lid close: could not journal the freeze of \(group.name) (\(group.bundleId)): \(error.localizedDescription); its \(candidates.count) pid(s) were left running")
+            return
+        }
+        if let beforeSignal, await !beforeSignal() {
+            do {
+                try manager.journal { s in
+                    s.frozenProcesses.removeAll { candidatePids.contains($0.pid) }
+                    if setsDockerFlag { s.dockerFrozen = false }
+                }
+            } catch {
+                // Entries without identity are never signaled, and a running
+                // pid is cleared as gone on the next resume.
+                Log.error("could not drop the unsignaled entries of \(group.bundleId) from the journal: \(error.localizedDescription); \(candidates.count) pid(s) stay journaled without identity")
+            }
+            Log.info("\(group.name) left running: the check before the signal said no")
             return
         }
         let report = freezer.suspend(candidates, expectedParents: group.expectedParents)

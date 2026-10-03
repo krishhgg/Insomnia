@@ -159,6 +159,9 @@ struct SettingsView: View {
                 .font(.callout)
                 .foregroundStyle(.secondary)
             Toggle("Pause Docker Desktop when no containers are running", isOn: bind(\.dockerRule))
+            Text("Off by default. When on, Docker Desktop is paused only if a second check right before the pause still finds no running container; a container that starts in that last moment is paused with it.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
             Toggle("Mute audio on lid close", isOn: bind(\.muteOnLidClose))
             Toggle("Low Power Mode while the lid is closed", isOn: bind(\.lowPowerOnLidClose))
                 // A floor input: apply it now if the lid is already closed.
