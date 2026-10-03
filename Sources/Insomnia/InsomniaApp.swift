@@ -44,10 +44,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         super.init()
     }
 
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        // Before launch finishes, so the first notification already shows
+        // while Insomnia is frontmost.
+        ForegroundNotifications.install()
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         // No Dock icon even when run from `swift run` (the bundle has LSUIElement).
         NSApp.setActivationPolicy(.accessory)
         Log.info("launched")
+        if LidSimulationBuild.isCompiledIn {
+            Log.info(LidSimulationBuild.marker)
+        }
         // The login item is tied to the bundle's signature, which install.sh
         // renews on every run: register again if the flag is on, macOS no
         // longer reports the item and the install changed; follow the user

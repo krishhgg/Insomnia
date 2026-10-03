@@ -1,17 +1,69 @@
 import Foundation
 
+/// Whether the file trigger behind scripts/simulate-lid.sh is compiled into
+/// this build. It is in debug builds (`swift build`, `swift test`) and in
+/// release builds made with `INSOMNIA_LID_SIMULATION=1 ./scripts/install.sh`,
+/// which passes `-Xswiftc -DINSOMNIA_LID_SIMULATION`. A normal release
+/// build has no watcher at all: nothing in the app reads the trigger file,
+/// so a file written to the support directory cannot replay the lid-close
+/// actions (darken, mute, freeze, pause Docker) during a session. A build
+/// that has it says so in the log at launch, in the status menu and in
+/// Settings.
+enum LidSimulationBuild {
+    static let isCompiledIn: Bool = {
+        #if DEBUG || INSOMNIA_LID_SIMULATION
+        return true
+        #else
+        return false
+        #endif
+    }()
+
+    /// The watcher for `AppServices`, or nil when it is compiled out.
+    @MainActor
+    static func makeWatcher() -> (any LidSimulating)? {
+        #if DEBUG || INSOMNIA_LID_SIMULATION
+        return LidSimulation()
+        #else
+        return nil
+        #endif
+    }
+
+    /// One line for the log, the status menu and Settings. Every use is
+    /// behind `isCompiledIn`, but whether the text is left out of a plain
+    /// release binary then depends on what the optimizer inlines, and
+    /// scripts/check-lid-simulation-gate.sh fails on any copy. So the text
+    /// is compiled in only with the watcher.
+    #if DEBUG || INSOMNIA_LID_SIMULATION
+    static let marker = "Lid simulation build: scripts/simulate-lid.sh is honoured during sessions"
+    #else
+    static let marker = ""
+    #endif
+}
+
+/// What `AppServices` needs from the watcher, so a test can inject a fake
+/// and prove the wiring is never started when the build flag is off.
+@MainActor
+protocol LidSimulating: AnyObject {
+    /// Called on the main actor with `true` for closed.
+    var onEvent: ((Bool) -> Void)? { get set }
+    func start(directory: URL, file: URL)
+    func stop()
+}
+
+#if DEBUG || INSOMNIA_LID_SIMULATION
 /// File trigger for the lid-close action path, for release validation on a
 /// machine whose lid stays open (scripts/simulate-lid.sh). Watches the
 /// support directory; when the trigger file appears it is read, deleted
 /// and delivered as a lid event. Same trust boundary as config.json: only
 /// this user can write the directory. Only active while AppServices runs,
-/// that is while a session is active.
+/// that is while a session is active, and only in builds that compile it
+/// in (`LidSimulationBuild`).
 ///
 /// The hardware reading (`LidObserver.readClamshellState`, used by
 /// `refreshInstant` and reconcile) still reflects the real lid; this only
 /// drives the close/open actions.
 @MainActor
-final class LidSimulation {
+final class LidSimulation: LidSimulating {
     /// Called on the main actor with `true` for closed.
     var onEvent: ((Bool) -> Void)?
 
@@ -92,3 +144,4 @@ final class LidSimulation {
         return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
+#endif

@@ -594,7 +594,7 @@ final class RecoveryScriptTests: XCTestCase {
             </dict></plist>
             """,
         ]
-        let problems = ["startedAt is a JSON integer, not a date string", "extensions[0] is a JSON string, not a number", "endsAt is not a UTC date in the form 2027-01-15T08:00:00Z", "extensions is a JSON dictionary, not an array", "session.json is not a JSON object", "session.json is not a JSON object"]
+        let problems = ["startedAt is a JSON integer, not a date string", "extensions[0] is a JSON string, not a number", "endsAt is not a date in the form 2027-01-15T08:00:00Z or 2027-01-15T10:00:00+02:00", "extensions is a JSON dictionary, not an array", "session.json is not a JSON object", "session.json is not a JSON object"]
         for (json, problem) in zip(cases, problems) {
             try json.write(to: fx.session, atomically: true, encoding: .utf8)
             try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
@@ -622,6 +622,126 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(fx.calls(), [])
         XCTAssertTrue(fx.exists(fx.session))
         XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, true)
+    }
+
+    /// Dates the app and both scripts must read alike. Each one is written
+    /// into a session.json and read back the way each script reads it
+    /// (plutil, then epoch_at and epoch_of cut from the script), and the
+    /// second it gives must be the one the app's Session decoder gives, or
+    /// both must refuse. Most refused ones are dates JSONDecoder's
+    /// `.iso8601` took on macOS 26 while the scripts did not, so the app
+    /// could keep a deadline that the backstop ended every minute. The
+    /// whitespace ones check the read itself: command substitution would
+    /// strip a stored trailing newline.
+    func testScriptsAndAppReadTheSameSessionDates() throws {
+        let cases = [
+            "2027-01-15T08:00:00Z", "2027-01-15T10:00:00+02:00", "2027-01-15T02:30:00-05:30", "2027-01-15T08:00:00+00:00",
+            "2027-01-15T08:00:00-00:00", "2027-01-16T07:59:00+23:59", "2028-02-29T08:00:00Z", "1970-01-01T00:30:00+01:00",
+            "1970-01-01T00:00:00Z", "9999-12-31T23:59:59Z", "9999-12-31T23:59:59-23:59",
+            "1969-12-31T23:59:59Z", "1900-01-01T00:00:00Z", "2027-02-29T08:00:00Z", "2027-02-30T08:00:00Z", "2027-04-31T08:00:00Z",
+            "2027-01-15T24:00:00Z", "2027-01-15T25:00:00Z", "2027-01-15T08:61:00Z", "2027-01-15T08:00:60Z", "2027-13-01T08:00:00Z",
+            "2027-00-10T08:00:00Z", "2027-01-15T08:00:00+24:00", "2027-01-15T08:00:00+02:60", "2027-01-15T08:00:00+0200",
+            "2027-01-15T08:00:00+02", "2027-01-15T08:00:00+2:00", "2027-01-15T08:00:00.5Z", "2027-01-15T08:00:00.123+02:00",
+            "2027-01-15T08:00:00z", "2027-01-15t08:00:00Z", "2027-01-15T08:00:00GMT", "2027-01-15T08:00:00UTC",
+            "2027-01-15T08:00:00Zjunk", "2027-01-15T08:00:00Z ", " 2027-01-15T08:00:00Z", "2027-01-15T08:00:00+02:00:00",
+            "2027-1-5T8:0:0Z", "2027-01-15 08:00:00Z", "2027-01-15T08:00:00", "2027-01-15T08:00Z", "10000-01-01T00:00:00Z",
+            "+2027-01-15T08:00:00Z", "\u{FF12}\u{FF10}\u{FF12}\u{FF17}-01-15T08:00:00Z", "2027-01-15T08:00:00\u{2212}02:00", "",
+            "2027-01-15T08:00:00Z\n", "2027-01-15T08:00:00Z\n\n", "\n2027-01-15T08:00:00Z", "2027-01-15T08:00:00Z\r",
+            "2027-01-15T08:00:00Z\t", "2027-01-15T08:00:00+02:00\n",
+        ]
+        let dir = fx.root.appendingPathComponent("dates", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        var files: [String] = []
+        var app: [String] = []
+        for (i, text) in cases.enumerated() {
+            let data = try JSONSerialization.data(withJSONObject: ["startedAt": "2027-01-15T08:00:00Z", "endsAt": text, "extensions": [Int]()])
+            let file = dir.appendingPathComponent("\(i).json")
+            try data.write(to: file)
+            files.append(file.path)
+            app.append((try? Store.makeDecoder().decode(Session.self, from: data)).map { String(Int($0.endsAt.timeIntervalSince1970)) } ?? "")
+        }
+        XCTAssertEqual(app.filter { !$0.isEmpty }.count, 11, "the app reads the first eleven: \(Array(zip(cases, app)))")
+        for script in [fx.backstop, fx.uninstall] {
+            let text = try String(contentsOf: script, encoding: .utf8)
+            var functions = ""
+            for name in ["extract", "epoch_of", "epoch_at"] {
+                let start = try XCTUnwrap(text.range(of: "\n\(name)() {"), "\(name) in \(script.lastPathComponent)")
+                let end = try XCTUnwrap(text.range(of: "\n}\n", range: start.upperBound..<text.endIndex))
+                functions += text[start.lowerBound..<end.upperBound]
+            }
+            let harness = fx.root.appendingPathComponent("epoch_at.\(script.lastPathComponent)")
+            try ("set -euo pipefail\nPLUTIL=/usr/bin/plutil\nDATE=/bin/date" + functions
+                + #"for f in "$@"; do printf '[%s]\n' "$(epoch_at "$f" endsAt)"; done"# + "\n")
+                .write(to: harness, atomically: true, encoding: .utf8)
+
+            let r = try fx.run(harness, files)
+
+            XCTAssertEqual(r.status, 0, r.stderr)
+            let shell = r.stdout.split(separator: "\n", omittingEmptySubsequences: false).dropLast().map { String($0.dropFirst().dropLast()) }
+            XCTAssertEqual(shell.count, cases.count, r.stdout)
+            for (i, text) in cases.enumerated() where i < shell.count {
+                XCTAssertEqual(shell[i], app[i], "\(script.lastPathComponent) and the app read \(text.debugDescription) differently")
+            }
+        }
+    }
+
+    /// A future endsAt with a newline stored after it is not a date for the
+    /// app, so it is not one for the backstop either: the session is
+    /// malformed, the journal is undone and the file moved aside, as the
+    /// app does.
+    func testFutureEndsAtWithAStoredTrailingNewlineIsNotASession() throws {
+        let f = ISO8601DateFormatter()
+        let data = try JSONSerialization.data(withJSONObject: [
+            "startedAt": f.string(from: Date(timeIntervalSinceNow: -60)),
+            "endsAt": f.string(from: Date(timeIntervalSinceNow: 3600)) + "\n",
+            "extensions": [Int](),
+        ])
+        XCTAssertNil(try? Store.makeDecoder().decode(Session.self, from: data), "the app reads it")
+        try data.write(to: fx.session)
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 0, r.stderr + fx.log())
+        XCTAssertEqual(fx.calls(), ["sudo -n \(fx.fakePmset) -a disablesleep 0"])
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, false)
+        XCTAssertFalse(fx.exists(fx.session))
+        XCTAssertEqual(try movedAsideSessions().count, 1)
+        XCTAssertTrue(fx.log().contains("endsAt is not a date in the form"), fx.log())
+    }
+
+    /// A session written with offsets is a session for the backstop too: a
+    /// future one keeps sleep disabled and nothing runs, a past one is
+    /// undone like any expired session.
+    func testSessionWithOffsetDatesIsReadLikeTheApp() throws {
+        let dirty = #"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = TimeZone(secondsFromGMT: -5 * 3600 - 1800)
+        f.dateFormat = "yyyy-MM-dd'T'HH:mm:ssxxx"
+        func write(endsAt: Date) throws {
+            let json = #"{"startedAt":"\#(f.string(from: endsAt.addingTimeInterval(-3600)))","endsAt":"\#(f.string(from: endsAt))","extensions":[]}"#
+            XCTAssertTrue(json.contains("-05:30"), json)
+            try json.write(to: fx.session, atomically: true, encoding: .utf8)
+        }
+
+        try write(endsAt: Date(timeIntervalSinceNow: 3600))
+        try fx.writeState(dirty)
+        let future = try fx.run(fx.backstop)
+
+        XCTAssertEqual(future.status, 0, future.stderr + fx.log())
+        XCTAssertEqual(fx.calls(), [])
+        XCTAssertTrue(fx.exists(fx.session))
+        XCTAssertEqual(try String(contentsOf: fx.state, encoding: .utf8), dirty)
+
+        try write(endsAt: Date(timeIntervalSinceNow: -60))
+        let past = try fx.run(fx.backstop)
+
+        XCTAssertEqual(past.status, 0, past.stderr + fx.log())
+        XCTAssertEqual(fx.calls(), ["sudo -n \(fx.fakePmset) -a disablesleep 0"])
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, false)
+        XCTAssertFalse(fx.exists(fx.session))
+        XCTAssertEqual(try movedAsideSessions(), [], "an expired session is removed, not moved aside as malformed")
     }
 
     /// A session.json that exists but cannot be read at all (here: it is a
@@ -2498,6 +2618,38 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(fx.exists(fx.app.appendingPathComponent("Contents/Resources/AppIcon.icns")), "the app icon is bundled")
         XCTAssertTrue(r.stdout.contains("Installed"), r.stdout)
         XCTAssertEqual(try fx.contents(of: fx.plist.deletingLastPathComponent()), ["com.insomnia.backstop.plist"])
+    }
+
+    /// The scripts/simulate-lid.sh watcher is compiled out of a release
+    /// build unless the installer is told to compile it in: only
+    /// INSOMNIA_LID_SIMULATION=1 adds the define to the swift build lines,
+    /// and the installer says so.
+    func testInstallCompilesTheLidSimulationInOnlyWhenAsked() throws {
+        try fx.prepareInstall()
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        fx.setMode("launchctl", "loaded")
+
+        let plain = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+        XCTAssertEqual(plain.status, 0, plain.stderr + plain.stdout)
+        let plainBuilds = fx.calls().filter { $0.hasPrefix("swift build") }
+        XCTAssertEqual(plainBuilds, ["swift build -c release", "swift build -c release --show-bin-path"], "\(fx.calls())")
+        XCTAssertFalse(plain.stdout.contains("lid simulation compiled in"), plain.stdout)
+
+        fx.clearCalls()
+        let simulated = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester", "INSOMNIA_LID_SIMULATION": "1"])
+        XCTAssertEqual(simulated.status, 0, simulated.stderr + simulated.stdout)
+        let simulatedBuilds = fx.calls().filter { $0.hasPrefix("swift build") }
+        XCTAssertEqual(simulatedBuilds, [
+            "swift build -c release -Xswiftc -DINSOMNIA_LID_SIMULATION",
+            "swift build -c release -Xswiftc -DINSOMNIA_LID_SIMULATION --show-bin-path",
+        ], "\(fx.calls())")
+        XCTAssertTrue(simulated.stdout.contains("lid simulation compiled in (INSOMNIA_LID_SIMULATION=1)"), simulated.stdout)
+
+        // Any other value is "off": the define is a deliberate opt-in.
+        fx.clearCalls()
+        let other = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester", "INSOMNIA_LID_SIMULATION": "yes"])
+        XCTAssertEqual(other.status, 0, other.stderr + other.stdout)
+        XCTAssertEqual(fx.calls().filter { $0.hasPrefix("swift build") }.first, "swift build -c release", "\(fx.calls())")
     }
 
     func testInstallLeavesTrustedPlistWhenBootstrapAndReloadBothFail() throws {
