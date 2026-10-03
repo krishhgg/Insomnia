@@ -1,13 +1,15 @@
 #!/bin/bash
 # Reverse install.sh. Quits the app, takes the recovery lock, runs the current
-# backstop with --force under that same lock (the checkout's copy, else the
-# one sealed in the installed bundle, else the writable copy older installs
-# left in Application Support), verifies for itself that the journal is
-# clean, and only then removes the LaunchAgent, the sudoers rule, the app
-# bundle (backstop.sh included), and the journal. Keeps config.json and the
-# logs unless --purge. Everything after the quit happens while this process holds
-# APP_SUPPORT/.recovery.lock, so neither a queued periodic backstop nor a
-# relaunched app can republish the journal while it is being removed.
+# backstop with --force under that same lock (from a source checkout: the
+# checkout's copy, else the one sealed in the installed bundle, else the
+# writable copy older installs left in Application Support; from anywhere
+# else, such as a release zip: the sealed copy only), verifies for itself
+# that the journal is clean, and only then removes the LaunchAgent, the
+# sudoers rule, the app bundle (backstop.sh included), and the journal.
+# Keeps config.json and the logs unless --purge. Everything after the quit
+# happens while this process holds APP_SUPPORT/.recovery.lock, so neither a
+# queued periodic backstop nor a relaunched app can republish the journal
+# while it is being removed.
 #
 # If anything Insomnia changed is still journaled, nothing is removed: the
 # LaunchAgent keeps retrying every minute, the sudoers rule keeps pmset
@@ -36,7 +38,16 @@ for arg in "$@"; do
   esac
 done
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# The folder this script is in. backstop.sh is taken from there only when it
+# is the scripts/ folder of a source checkout, with Package.swift one level
+# up (in_checkout). A release zip's folder is not, and the zip has no
+# backstop.sh, so one found beside its uninstall.sh was added after the zip
+# was unpacked, for example by another account that created the folder in
+# /tmp beforehand. Never the folder above either: a zip unpacked at
+# /tmp/Insomnia-<version> would make that /tmp, where any account can create
+# scripts/backstop.sh.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+in_checkout() { [[ "${SCRIPT_DIR##*/}" == scripts && -f "${SCRIPT_DIR%/*}/Package.swift" ]]; }
 
 # Fixed tool paths: never taken from PATH or the environment. Tests patch
 # these lines in a private copy of the script.
@@ -578,33 +589,44 @@ fi
 
 # 3. Undo everything via the current backstop ---------------------------------
 # The backstop inherits fd 9 and shares this lock instead of waiting on it.
-# Newest first: the checkout's script, then the copy install.sh sealed into
-# the bundle, then the writable copy installs before that layout left in
-# $APP_SUPPORT. The sealed copy runs only while the bundle's signature still
-# verifies: its resource seal covers the script, so this is the check the
-# LaunchAgent runs (without the pinned requirement, which this script does
-# not have), and an edited copy is refused the same way.
+# Newest first. From a source checkout: the checkout's script beside this
+# one, then the copy install.sh sealed into the bundle, then the writable
+# copy installs before that layout left in $APP_SUPPORT. From anywhere else,
+# such as a release zip's folder, the sealed copy or nothing: a backstop.sh
+# beside this script there is not from the zip (see SCRIPT_DIR), and the
+# writable copy is older than release zips. The sealed copy runs only while
+# the bundle's signature still verifies: its resource seal covers the
+# script, so this is the check the LaunchAgent runs (without the pinned
+# requirement, which this script does not have), and an edited copy is
+# refused the same way.
 step "Restoring the machine via backstop --force"
-if [[ -f "$ROOT/scripts/backstop.sh" ]]; then
-  BACKSTOP="$ROOT/scripts/backstop.sh"
+if [[ -e "$SCRIPT_DIR/backstop.sh" ]] && ! in_checkout; then
+  echo "not running $SCRIPT_DIR/backstop.sh: $SCRIPT_DIR is not the scripts folder of a source checkout, and a release zip has no backstop.sh, so it was added after the zip was unpacked." >&2
+fi
+if in_checkout && [[ -f "$SCRIPT_DIR/backstop.sh" ]]; then
+  BACKSTOP="$SCRIPT_DIR/backstop.sh"
 elif [[ -f "$APP/Contents/Resources/backstop.sh" ]]; then
   verify_rc=0
   bounded "$CODESIGN" --verify --strict "$APP" || verify_rc=$?
   if (( verify_rc == 124 )); then
     echo "'codesign --verify --strict $APP' did not answer within ${CALL_TIMEOUT_SECONDS}s, so the backstop.sh sealed in it was not run." >&2
-    echo "Nothing was removed. Run this script from a checkout of the source (its scripts/backstop.sh is used first), or rerun once codesign answers." >&2
+    echo "Nothing was removed. Run scripts/uninstall.sh from a checkout of the source (the backstop.sh beside it is used first), or rerun once codesign answers." >&2
     exit 1
   elif (( verify_rc != 0 )); then
     echo "$APP does not pass 'codesign --verify --strict' (exit $verify_rc: ${BOUNDED_OUTPUT:-no detail}), so the backstop.sh sealed in it was not run." >&2
-    echo "Nothing was removed. Run this script from a checkout of the source (its scripts/backstop.sh is used first), or reinstall with scripts/install.sh and rerun." >&2
+    echo "Nothing was removed. Run scripts/uninstall.sh from a checkout of the source (the backstop.sh beside it is used first), or reinstall with scripts/install.sh and rerun." >&2
     exit 1
   fi
   echo "$APP verifies"
   BACKSTOP="$APP/Contents/Resources/backstop.sh"
-elif [[ -f "$APP_SUPPORT/backstop.sh" ]]; then
+elif in_checkout && [[ -f "$APP_SUPPORT/backstop.sh" ]]; then
   BACKSTOP="$APP_SUPPORT/backstop.sh"
+elif in_checkout; then
+  echo "no backstop.sh found in $SCRIPT_DIR, $APP/Contents/Resources or $APP_SUPPORT; nothing was removed" >&2
+  exit 1
 else
-  echo "no backstop.sh found in $ROOT/scripts, $APP/Contents/Resources or $APP_SUPPORT; nothing was removed" >&2
+  echo "no backstop.sh sealed in $APP/Contents/Resources, and outside a source checkout this script runs no other copy; nothing was removed." >&2
+  echo "Run scripts/uninstall.sh from a checkout of the source (the backstop.sh beside it is used first)." >&2
   exit 1
 fi
 echo "using $BACKSTOP"

@@ -33,9 +33,26 @@ closed bag. Its design goals are to:
 - macOS 26 on Apple Silicon (built and tested on MacBook Pro M5).
 - Swift 6, SwiftUI content hosted in a custom `NSStatusItem`, Swift Package.
   No Xcode project.
-- `install.sh` assembles a minimal `Insomnia.app` bundle (`LSUIElement = true`,
-  no Dock icon) with `backstop.sh` sealed under `Contents/Resources`, ad-hoc
-  codesigns it, and installs it to `~/Applications`.
+- `build-app.sh` assembles a minimal `Insomnia.app` bundle (`LSUIElement =
+  true`, no Dock icon) with `backstop.sh` sealed under `Contents/Resources`
+  and signs it (ad-hoc, or with a Developer ID when `INSOMNIA_SIGN_IDENTITY`
+  is set). `install.sh` installs that build, or a prebuilt bundle passed with
+  `--app` after verifying it (one whose origin it cannot verify needs
+  `--allow-unverified-origin`), to `~/Applications`. The Release workflow
+  packages the same bundle (`docs/releasing.md`), built for arm64 only;
+  `install.sh --app` stops unless `sysctl -n hw.optional.arm64` reads 1
+  (true on Apple Silicon, also under Rosetta). `install.sh` and
+  `uninstall.sh` take sibling scripts (`build-app.sh`, `backstop.sh`) only
+  from a source checkout's `scripts/` folder, with `Package.swift` one level
+  up, and never from the folder above their own: the release zip carries
+  both scripts at its top level, unpacked wherever the user chose, such as
+  `/tmp`, where another account may have created that folder first and
+  added files to it. Anywhere else, `install.sh` without `--app` stops and
+  runs no `build-app.sh` it finds, and `uninstall.sh` runs only the verified
+  bundle's sealed `backstop.sh`, or stops when the bundle has none. The
+  staged copy of the bundle loses group and other write permission and
+  every ACL before it is verified and installed (neither is part of the
+  signature); extended attributes, the quarantine flag among them, stay.
 
 ## Core model
 
@@ -774,7 +791,8 @@ Insomnia/
     TestSupport.swift
     UIStatusTests.swift
   scripts/
-    install.sh             build, bundle (backstop.sh sealed inside), codesign, sudoers, launchd
+    build-app.sh           build, bundle (backstop.sh sealed inside), codesign
+    install.sh             build-app.sh or a verified --app bundle, sudoers, launchd
     uninstall.sh           reverse all of the above, restore sleep
     backstop.sh            standalone restore from JSON
     simulate-lid.sh        file trigger for the lid-close action path (debug and
@@ -837,7 +855,8 @@ that any case passed; record results in the release validation record.
     with the lid open using `scripts/simulate-lid.sh closed` then `open`
     during a session; the log shows `lid SIMULATED closed (file trigger)`.
     That needs a build with the watcher compiled in (installed with
-    `INSOMNIA_LID_SIMULATION=1 ./scripts/install.sh`; it logs "Lid
+    `INSOMNIA_LID_SIMULATION=1 ./scripts/install.sh`, which `build-app.sh`
+    reads; install.sh refuses it with `--app`; it logs "Lid
     simulation build" at launch). A normal install ignores the trigger:
     the watcher is compiled out so a file written by any other program
     running as the user cannot replay the lid actions. CI proves that on

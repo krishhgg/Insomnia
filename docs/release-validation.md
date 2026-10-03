@@ -146,6 +146,13 @@ is performed. Do not replace "not run" with "passed" based on source review.
 | Upgrade whose new agent plist cannot be saved, and a rerun after an install killed mid-swap, leave the app and the agent's plist matching, on a working Mac | Not run |
 | Upgrade whose bundle rename is refused (the new build cannot be moved in, or the previous app cannot be moved back) puts the previous app back and reloads its agent, or keeps both bundles and prints the commands, on a working Mac | Not run |
 | Install whose `sudo -n -l` check or `launchctl` call stalls while it holds the recovery lock (for example a directory-service lookup that does not answer) stops after 30 s and releases the lock, and the agent's next run can take it, on a working Mac | Not run |
+| Install from a release zip with `install.sh --allow-unverified-origin --app` on a working Mac, first launch of the downloaded app | Not run |
+| Installed bundle from a release zip has no group or other write bit and no ACL (`ls -leR ~/Applications/Insomnia.app`), keeps its quarantine flag (`xattr -p com.apple.quarantine`) and passes `codesign --verify --strict --deep`, on a working Mac | Not run |
+| `uninstall.sh` run from a release zip unpacked in `/tmp` runs the installed app's sealed `backstop.sh` after `codesign --verify`, on a working Mac | Not run |
+| `install.sh` and `uninstall.sh` from a release zip unpacked in `/tmp`, with a `build-app.sh` and a `backstop.sh` added to the unpacked folder, run neither (install without `--app` stops, uninstall runs the sealed copy), on a working Mac | Not run |
+| `install.sh --app` from a release zip stops with the Apple Silicon message on an Intel Mac, and installs on an Apple Silicon Mac from a Terminal running under Rosetta | Not run |
+| Release workflow end to end: tag push, tests, package, attestation, GitHub Release, `gh attestation verify` of the download | Not run |
+| Developer ID signing, notarization and stapling in the Release workflow | Not run |
 | Launch at login survives a reinstall by install.sh, including a second install.sh run on the same unchanged build (switch on, reinstall, relaunch: the log shows the launch-time check, System Settings > General > Login Items lists Insomnia as enabled, and the Settings switch reads on; a pending approval shows the note and the Open Login Items button) | Not run |
 | Launch at login heals on the first upgrade from a build without the install record (switch on in the previous build, upgrade with install.sh, relaunch: the log shows "registering once and recording the install", Login Items lists Insomnia, and config.json has `launchAtLoginInstall`) | Not run |
 | Launch at login removed in System Settings stays removed (switch on, relaunch once so the install is on file, remove Insomnia under System Settings > General > Login Items, relaunch: the log says the removal was respected, the Settings switch is off, and Login Items does not list Insomnia again) | Not run |
@@ -171,7 +178,16 @@ working Mac.
 
 ## Distribution boundary
 
-Local source builds use ad-hoc signing. Developer ID signing, notarization,
-download packaging, and a consumer installation/recovery walkthrough have not
-been completed. Open-source availability and a passing PR are not equivalent
-to readiness for a signed public binary release.
+Packaging is automated: `scripts/build-app.sh` makes the bundle, and the
+Release workflow tests, packages, checksums, attests and publishes it for a
+`v*` tag (`docs/releasing.md`). PackagingTests run a patched copy of
+`build-app.sh` with the real codesign, RecoveryScriptTests run `install.sh
+--app` against prebuilt fixtures, one of them ad-hoc signed by the real
+codesign, and ReleaseWorkflowTests check that every action in the workflows
+is pinned to a commit and that no job has more than read access except the
+one that publishes. No release has been produced with it yet. Developer ID
+signing and notarization run only once the maintainer adds the secrets;
+until then releases are ad-hoc signed prereleases. A
+consumer installation and recovery walkthrough from a downloaded zip has not
+been done. Open-source availability and a passing PR are not equivalent to
+readiness for a signed public binary release.

@@ -1,13 +1,37 @@
 #!/bin/bash
-# Build Insomnia, assemble ~/Applications/Insomnia.app with backstop.sh sealed
-# inside it, install the LaunchAgent that verifies the bundle and runs that
-# script, and write the sudoers rule. Idempotent; asks for sudo once (for
+# Install Insomnia: put Insomnia.app (with backstop.sh sealed inside it) in
+# ~/Applications, install the LaunchAgent that verifies the bundle and runs
+# that script, and write the sudoers rule. Idempotent; asks for sudo once (for
 # /etc/sudoers.d/insomnia), before anything of a previous install is touched.
 # The bundle and the LaunchAgent are replaced together, in one locked step
 # (the agent pins one build, so the two must match at every moment), and a
 # run that stops after that step began puts the previous bundle back. Not
 # atomic beyond that: a failure after the sudoers step says exactly what was
 # replaced so far.
+#
+# Where the bundle comes from:
+#   ./scripts/install.sh                      builds it from this checkout
+#                                             (scripts/build-app.sh, ad-hoc
+#                                             signed unless INSOMNIA_SIGN_IDENTITY
+#                                             is set); only from a checkout's
+#                                             scripts/ folder (in_checkout)
+#   ./install.sh --app /path/to/Insomnia.app  installs a prebuilt bundle, such
+#                                             as the one in a release zip
+#                                             (arm64 only, so this stops on a
+#                                             Mac without Apple Silicon), after
+#                                             checking its signature, bundle
+#                                             identifier and version. Its origin
+#                                             counts as verified only when it is
+#                                             Developer ID signed by the team in
+#                                             EXPECTED_TEAM_ID and Gatekeeper
+#                                             accepts it; any other bundle is
+#                                             refused unless
+#                                             --allow-unverified-origin is given
+#                                             as well. Nothing of this checkout
+#                                             is needed then; the zip carries
+#                                             this script.
+# Either way the bundle is checked before the password prompt, so a bad build
+# or download changes nothing.
 set -euo pipefail
 
 # Installation always uses the standard per-user layout. A relocated
@@ -31,7 +55,10 @@ LAUNCHCTL=/bin/launchctl
 SUDO=/usr/bin/sudo
 PLUTIL=/usr/bin/plutil
 CODESIGN=/usr/bin/codesign
-SWIFT=/usr/bin/swift
+SPCTL=/usr/bin/spctl
+DITTO=/usr/bin/ditto
+CHMOD=/bin/chmod
+SYSCTL=/usr/sbin/sysctl
 LOCKF=/usr/bin/lockf
 MV=/bin/mv
 RM=/bin/rm
@@ -43,7 +70,25 @@ LOCK_TIMEOUT_SECONDS=10
 # bounded() below.
 CALL_TIMEOUT_SECONDS=30
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# What a prebuilt bundle (--app) must be.
+BUNDLE_ID=com.kgarg.insomnia
+# Apple Team ID of the Developer ID that signs releases. Empty until the
+# maintainer sets up release signing (docs/releasing.md). A Developer ID
+# bundle from this team, accepted by Gatekeeper, is the only bundle whose
+# origin --app treats as verified; while this is empty, every bundle needs
+# --allow-unverified-origin.
+EXPECTED_TEAM_ID=""
+
+# The folder this script is in. build-app.sh and backstop.sh are taken from
+# there, and only when it is the scripts/ folder of a source checkout, with
+# Package.swift one level up (in_checkout). A release zip's folder is not: it
+# holds Insomnia.app, install.sh and uninstall.sh, so a build-app.sh found
+# beside this script there was added after the zip was unpacked, for example
+# by another account that created the folder in /tmp beforehand. Never the
+# folder above either: a zip unpacked at /tmp/Insomnia-<version> would make
+# that /tmp, where any account can create scripts/build-app.sh.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+in_checkout() { [[ "${SCRIPT_DIR##*/}" == scripts && -f "${SCRIPT_DIR%/*}/Package.swift" ]]; }
 APP_DIR="$HOME/Applications"
 APP="$APP_DIR/Insomnia.app"
 APP_SUPPORT="$HOME/Library/Application Support/Insomnia"
@@ -61,12 +106,15 @@ UID_NUM="$(id -u)"
 PREVIOUS_APP="$APP_DIR/.Insomnia.app.previous"
 STAGE=""
 NEW_APP=""
+# Where build-app.sh writes a source build before it is staged.
+BUILD_DIR=""
 TMP_SUDOERS=""
 CANDIDATE=""
 CANDIDATE_DIR=""
 WORK=""
 
 step() { printf '\n==> %s\n' "$*"; }
+usage() { echo "usage: $0 [--app /path/to/Insomnia.app [--allow-unverified-origin]]" >&2; }
 # A command for the user to paste, each word quoted for the shell, so a space,
 # quote or $ in a path stays part of that path.
 command_line() { local line; line="$(printf '%q ' "$@")"; printf '%s' "${line% }"; }
@@ -150,6 +198,26 @@ loaded_state() { # -> yes | no | unknown:<rc>
   esac
 }
 
+PREBUILT=""
+ALLOW_UNVERIFIED_ORIGIN=0
+while (( $# )); do
+  case "$1" in
+    --app) [[ $# -ge 2 ]] || { usage; exit 2; }; PREBUILT="$2"; shift 2 ;;
+    --allow-unverified-origin) ALLOW_UNVERIFIED_ORIGIN=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "unknown argument: $1" >&2; usage; exit 2 ;;
+  esac
+done
+if (( ALLOW_UNVERIFIED_ORIGIN )) && [[ -z "$PREBUILT" ]]; then
+  echo "--allow-unverified-origin applies to --app only; a source build has no download to vouch for." >&2
+  usage
+  exit 2
+fi
+if [[ "${INSOMNIA_LID_SIMULATION:-}" == 1 && -n "$PREBUILT" ]]; then
+  echo "INSOMNIA_LID_SIMULATION=1 applies to a source build only; the bundle given with --app is already compiled. Nothing was changed." >&2
+  exit 2
+fi
+
 # Moves a bundle with one rename. Every path passed here is inside $APP_DIR,
 # one filesystem, so a rename that fails leaves both paths as they were.
 # Refuses when something is at the destination: mv would move the bundle
@@ -186,6 +254,7 @@ cleanup() {
   if [[ -n "$CANDIDATE" ]]; then "$RM" -f "$CANDIDATE"; fi
   if [[ -n "$CANDIDATE_DIR" ]]; then "$RMDIR" "$CANDIDATE_DIR" 2>/dev/null || true; fi
   if [[ -n "$STAGE" ]]; then "$RM" -rf "$STAGE"; fi
+  if [[ -n "$BUILD_DIR" ]]; then "$RM" -rf "$BUILD_DIR"; fi
   if [[ -n "$WORK" ]]; then
     "$RM" -f "$WORK"/call.* 2>/dev/null || true
     "$RMDIR" "$WORK" 2>/dev/null || true
@@ -195,24 +264,118 @@ trap cleanup EXIT
 # Scratch space for bounded(): this run's own directory, emptied on exit.
 WORK="$("$MKTEMP" -d "${TMPDIR:-/tmp}/insomnia-install.XXXXXX")"
 
-# 1. Build -------------------------------------------------------------------
-step "Building (release)"
-cd "$ROOT"
-# INSOMNIA_LID_SIMULATION=1 compiles the scripts/simulate-lid.sh file trigger
-# (LidSimulation.swift) into this release build, for release validation on
-# a machine whose lid stays open. A normal build has no watcher: nothing
-# reads the trigger file. Such a build says so in the log at launch, in the
-# status menu and in Settings.
-BUILD_FLAGS=()
-if [[ "${INSOMNIA_LID_SIMULATION:-}" == 1 ]]; then
-  BUILD_FLAGS+=(-Xswiftc -DINSOMNIA_LID_SIMULATION)
-  echo "lid simulation compiled in (INSOMNIA_LID_SIMULATION=1): scripts/simulate-lid.sh will drive the lid actions during sessions"
+# 1. The bundle to install ---------------------------------------------------
+#    Built or verified before the password prompt: nothing on the machine has
+#    changed when this step fails.
+if [[ -n "$PREBUILT" ]]; then
+  step "Checking the prebuilt bundle $PREBUILT"
+  # Release bundles are built for arm64 only (the Release workflow runs on
+  # Apple Silicon). hw.optional.arm64 describes the hardware, so a shell
+  # running under Rosetta on an Apple Silicon Mac still reads 1; an Intel
+  # Mac reads 0 or has no such key.
+  arm64="$("$SYSCTL" -n hw.optional.arm64 2>/dev/null || true)"
+  if [[ "$arm64" != 1 ]]; then
+    echo "Release bundles of Insomnia run on Apple Silicon Macs only, and this Mac is not one ('sysctl -n hw.optional.arm64' gave ${arm64:-no value}). Build and install from a source checkout instead (README, Build from source). Nothing was changed." >&2
+    exit 1
+  fi
+  if [[ ! -d "$PREBUILT" || ! -f "$PREBUILT/Contents/Info.plist" ]]; then
+    echo "$PREBUILT is not an app bundle (no Contents/Info.plist). Nothing was changed." >&2
+    exit 1
+  fi
+  # Every check below runs on a private copy, and that copy is what step 3
+  # stages and pins. $PREBUILT may sit where someone else can write (a
+  # shared folder, /tmp); a bundle swapped there while the password prompt
+  # waits is never copied in. BUILD_DIR is removed at exit, as for a build.
+  BUILD_DIR="$("$MKTEMP" -d)"
+  CHECKED_APP="$BUILD_DIR/Insomnia.app"
+  if ! "$DITTO" "$PREBUILT" "$CHECKED_APP"; then
+    echo "could not copy $PREBUILT to check it. Nothing was changed." >&2
+    exit 1
+  fi
+  INFO_PLIST="$CHECKED_APP/Contents/Info.plist"
+  # Signature first: nothing below is read from the bundle until it is known
+  # to be intact. --strict rejects what newer codesign would, --deep covers
+  # nested code should a later build add any.
+  if ! "$CODESIGN" --verify --strict --deep "$CHECKED_APP"; then
+    echo "$PREBUILT fails 'codesign --verify --strict --deep': the download is damaged or was modified. Nothing was changed." >&2
+    echo "Check the zip against SHA256SUMS and 'gh attestation verify' (README, Install) and download it again." >&2
+    exit 1
+  fi
+  PREBUILT_ID="$("$PLUTIL" -extract CFBundleIdentifier raw -o - "$INFO_PLIST" 2>/dev/null || true)"
+  if [[ "$PREBUILT_ID" != "$BUNDLE_ID" ]]; then
+    echo "$PREBUILT has bundle identifier '${PREBUILT_ID:-<none>}', not $BUNDLE_ID. Nothing was changed." >&2
+    exit 1
+  fi
+  PREBUILT_VERSION="$("$PLUTIL" -extract CFBundleShortVersionString raw -o - "$INFO_PLIST" 2>/dev/null || true)"
+  if [[ ! "$PREBUILT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "$PREBUILT has no usable CFBundleShortVersionString ('${PREBUILT_VERSION:-<none>}'). Nothing was changed." >&2
+    exit 1
+  fi
+  if [[ ! -f "$CHECKED_APP/Contents/Resources/backstop.sh" ]]; then
+    echo "$PREBUILT has no Contents/Resources/backstop.sh; the recovery agent needs the sealed copy. Nothing was changed." >&2
+    exit 1
+  fi
+  # Origin. The checks above show the bundle is intact, not where it came
+  # from: anyone can ad-hoc sign a bundle with this identifier, and while
+  # EXPECTED_TEAM_ID is empty no Developer ID team is expected either. Only
+  # a Developer ID signature from the expected team, with Gatekeeper's
+  # verdict (notarized, not revoked), establishes origin here. Everything
+  # else is installed only with --allow-unverified-origin, after the user
+  # verified the download with SHA256SUMS and the attestation themselves.
+  SIGNING="$("$CODESIGN" -dvv "$CHECKED_APP" 2>&1 || true)"
+  TEAM="$(sed -n 's/^TeamIdentifier=//p' <<<"$SIGNING" | head -n 1)"
+  origin=""
+  unverified=""
+  if grep -q '^Authority=Developer ID Application' <<<"$SIGNING"; then
+    if ! "$SPCTL" --assess --type execute "$CHECKED_APP"; then
+      echo "$PREBUILT is Developer ID signed but Gatekeeper rejects it (not notarized, or the certificate was revoked). Nothing was changed." >&2
+      exit 1
+    fi
+    if [[ -n "$EXPECTED_TEAM_ID" ]]; then
+      if [[ "$TEAM" != "$EXPECTED_TEAM_ID" ]]; then
+        echo "$PREBUILT is signed by team '${TEAM:-<none>}', not $EXPECTED_TEAM_ID (the team this install.sh expects). Nothing was changed." >&2
+        exit 1
+      fi
+      origin="Developer ID signed by team $TEAM, the team this install.sh expects, and Gatekeeper accepts it"
+    else
+      unverified="Developer ID signed by team ${TEAM:-<none>} and Gatekeeper accepts it, but EXPECTED_TEAM_ID is empty in this install.sh, so no team is expected and this one is not checked"
+    fi
+  else
+    unverified="ad-hoc signed, an experimental build. The signature covers the bundle but names no developer, and anyone can ad-hoc sign a bundle with this identifier"
+  fi
+  if [[ -n "$origin" ]]; then
+    echo "Insomnia $PREBUILT_VERSION: $origin"
+  elif (( ALLOW_UNVERIFIED_ORIGIN )); then
+    echo "WARNING: the origin of Insomnia $PREBUILT_VERSION is not verified: $unverified."
+    echo "--allow-unverified-origin: installing it anyway. Its backstop.sh will run as you at login and every 60 s."
+    echo "Continue only if you checked the zip yourself with SHA256SUMS and 'gh attestation verify' (README, Install)."
+    if [[ "$unverified" == ad-hoc* ]]; then
+      echo "macOS blocks the first launch of a downloaded ad-hoc build until you allow it in System Settings > Privacy & Security."
+    fi
+  else
+    cat >&2 <<REFUSE
+The origin of Insomnia $PREBUILT_VERSION at $PREBUILT is not verified: $unverified.
+This install.sh cannot tell where the bundle came from, and installing it would run its backstop.sh as you
+at login and every 60 s. Nothing was changed.
+Verify the zip yourself first ('shasum -a 256 -c SHA256SUMS' and 'gh attestation verify' with --signer-workflow,
+see the README), then rerun with the flag that says so:
+  $(command_line "$0" --allow-unverified-origin --app "$PREBUILT")
+REFUSE
+    exit 1
+  fi
+  SOURCE_APP="$CHECKED_APP"
+else
+  if ! in_checkout || [[ ! -f "$SCRIPT_DIR/build-app.sh" ]]; then
+    echo "$SCRIPT_DIR is not the scripts folder of a source checkout (build-app.sh beside this script, Package.swift one level up), so there is nothing to build from. To install the bundle of a release zip, pass it with --app (README, Install). Nothing was changed." >&2
+    if [[ -e "$SCRIPT_DIR/build-app.sh" ]] && ! in_checkout; then
+      echo "$SCRIPT_DIR/build-app.sh was not run: a release zip has no build-app.sh, so it was added after the zip was unpacked." >&2
+    fi
+    exit 1
+  fi
+  BUILD_DIR="$("$MKTEMP" -d)"
+  "$SCRIPT_DIR/build-app.sh" --output "$BUILD_DIR"
+  SOURCE_APP="$BUILD_DIR/Insomnia.app"
 fi
-# ${arr[@]+"${arr[@]}"}: an empty array expands to nothing under set -u on
-# the bash 3.2 that ships with macOS.
-"$SWIFT" build -c release ${BUILD_FLAGS[@]+"${BUILD_FLAGS[@]}"}
-BIN="$("$SWIFT" build -c release ${BUILD_FLAGS[@]+"${BUILD_FLAGS[@]}"} --show-bin-path)/Insomnia"
-[[ -x "$BIN" ]] || { echo "binary not found at $BIN" >&2; exit 1; }
 
 # 2. sudoers -----------------------------------------------------------------
 #    The password prompt comes first: until the rule is installed and proven
@@ -248,11 +411,11 @@ else
 fi
 
 # 3. Bundle ------------------------------------------------------------------
-#    Assembled and signed in a staging directory inside $APP_DIR. $APP itself
-#    is replaced in step 6, in the same locked step as the LaunchAgent: the
+#    Copied into a staging directory inside $APP_DIR. $APP itself is
+#    replaced in step 6, in the same locked step as the LaunchAgent: the
 #    agent pins one build's requirement, so the bundle at $APP and the loaded
 #    agent must be a matching pair before, during and after a failed run.
-step "Assembling Insomnia.app"
+step "Staging Insomnia.app"
 # Ask the app to quit and wait until it has actually exited. It refuses to
 # quit while it has unresolved recovery work; that refusal stands (no pkill),
 # and nothing of the old install is overwritten while it is still running.
@@ -272,29 +435,35 @@ fi
 mkdir -p "$APP_DIR"
 STAGE="$("$MKTEMP" -d "$APP_DIR/.Insomnia.app.staging.$$.XXXXXX")"
 NEW_APP="$STAGE/Insomnia.app"
-mkdir -p "$NEW_APP/Contents/MacOS"
-cp "$BIN" "$NEW_APP/Contents/MacOS/Insomnia"
-cp "$ROOT/Resources/Info.plist" "$NEW_APP/Contents/Info.plist"
-mkdir -p "$NEW_APP/Contents/Resources"
-cp "$ROOT/Resources/AppIcon.icns" "$NEW_APP/Contents/Resources/AppIcon.icns"
-# backstop.sh goes into the bundle before it is signed, so the signature's
-# resource seal covers it. The LaunchAgent below verifies the whole bundle
-# against the requirement read after signing and only then runs this copy;
-# an edited script fails that check. No executable is left in a writable
-# directory.
+# ditto keeps the signature's resource seal and every attribute intact (a
+# downloaded bundle keeps its quarantine flag; Gatekeeper decides at launch).
+"$DITTO" "$SOURCE_APP" "$NEW_APP"
+# It keeps the source's modes and ACLs as well. A zip unpacked by a tool
+# that keeps group or other write bits, a build made under umask 002, or a
+# bundle given an ACL would let other accounts edit the installed bundle.
+# An edited backstop.sh breaks the seal, so the agent stops running any
+# recovery. The signature covers neither mode bits nor ACLs: both go here
+# and the bundle still verifies (the check below runs on this copy).
+# Extended attributes, the quarantine flag among them, stay. chmod -R
+# skips symbolic links.
+if ! "$CHMOD" -R go-w "$NEW_APP" || ! "$CHMOD" -R -N "$NEW_APP"; then
+  echo "could not remove group and other write permission and ACLs from the staged bundle $NEW_APP (see the error above). $SUDOERS is installed; the app at $APP and the LaunchAgent were not touched." >&2
+  exit 1
+fi
+# backstop.sh was sealed into the bundle before signing (build-app.sh), so
+# the signature's resource seal covers it. The LaunchAgent below verifies
+# the whole bundle against the requirement read here and only then runs this
+# copy; an edited script fails that check. No executable is left in a
+# writable directory.
 BACKSTOP="$NEW_APP/Contents/Resources/backstop.sh"
-cp "$ROOT/scripts/backstop.sh" "$BACKSTOP"
-chmod 755 "$BACKSTOP"
-"$PLUTIL" -lint "$NEW_APP/Contents/Info.plist" >/dev/null
-"$CODESIGN" --force --sign - --deep "$NEW_APP"
 echo "signed $("$CODESIGN" -dv "$NEW_APP" 2>&1 | grep -i identifier || true)"
 # What the agent pins: the bundle's designated requirement, in the form
 # `codesign -d -r-` prints (an implicit one carries a leading "# "). For an
 # ad-hoc signature that is the cdhash of this build, so no other build and
-# no edited bundle satisfies it, and it does not depend on the path, so it
-# still holds once the bundle is at $APP. The app reads the same text
-# through the Security framework (CodeRequirement.swift) to recognise this
-# plist.
+# no edited bundle satisfies it; for a Developer ID signature it names the
+# identifier and the team. It does not depend on the path, so it still holds
+# once the bundle is at $APP. The app reads the same text through the
+# Security framework (CodeRequirement.swift) to recognise this plist.
 REQUIREMENT="$("$CODESIGN" -d -r- "$NEW_APP" 2>&1 | sed -n 's/^#\{0,1\} *designated => //p' | head -n 1)"
 if [[ -z "$REQUIREMENT" ]]; then
   echo "could not read the designated requirement of the new bundle ('codesign -d -r-'); the LaunchAgent cannot pin it. $SUDOERS is installed; the app at $APP and the LaunchAgent were not touched." >&2
@@ -465,6 +634,22 @@ $pins_unknown_note"
     pair_note="The app at $APP and the LaunchAgent were not replaced or unloaded,
 so they still match each other; the new build was discarded."
   fi
+  # How to run the recovery again. A checkout has backstop.sh under scripts/.
+  # A zip has it only inside the bundle at $PREBUILT, and the checked private
+  # copy is deleted when this script exits; the original may have changed
+  # since the check, so the step is this script again, which checks a new copy.
+  if [[ -n "$PREBUILT" ]]; then
+    rerun="$(command_line "$0" --app "$PREBUILT")"
+    if (( ALLOW_UNVERIFIED_ORIGIN )); then rerun="$(command_line "$0" --allow-unverified-origin --app "$PREBUILT")"; fi
+    manual_step="Or rerun this script. It checks a new private
+copy of the bundle and runs that copy's recovery before it replaces the app
+or the LaunchAgent:
+  $rerun"
+  else
+    manual_step="Or run the recovery by hand:
+  $(command_line /bin/bash "$SCRIPT_DIR/backstop.sh" --force)
+Then rerun this script to install the app and the LaunchAgent."
+  fi
   cat >&2 <<FAIL
 
 Install stopped: the backstop could not fully undo a previous session
@@ -474,9 +659,7 @@ $agent_note
 Check $LOG_DIR/insomnia.log and resolve what it reports. Saved audio, display
 brightness or keyboard backlight needs the app; if one is installed, open it:
   $(command_line open "$APP")
-Or run the recovery by hand:
-  $(command_line /bin/bash "$ROOT/scripts/backstop.sh" --force)
-Then rerun this script to install the app and the LaunchAgent.
+$manual_step
 FAIL
   exit 1
 fi
@@ -910,11 +1093,14 @@ fi
 
 # 7. Done --------------------------------------------------------------------
 step "Installed"
+# The uninstaller shipped beside this script: scripts/ in a checkout, the
+# zip's top level in a release (which may be unpacked inside a checkout).
+UNINSTALL="$SCRIPT_DIR/uninstall.sh"
 cat <<NEXT
 Next steps:
   1. Launch:            $(command_line open "$APP")
   2. Optional:          System Settings > Wi-Fi > Ask to join hotspots: Automatically
   3. Config lives at:   $APP_SUPPORT/config.json
   4. Logs:              $LOG_DIR/insomnia.log
-  5. Uninstall:         $(command_line "$ROOT/scripts/uninstall.sh")
+  5. Uninstall:         $(command_line "$UNINSTALL")
 NEXT
