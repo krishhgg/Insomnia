@@ -36,6 +36,7 @@ struct CancellableCommand: Sendable {
                     let err = Pipe()
                     process.standardOutput = out
                     process.standardError = err
+                    let childExit = ProcessExit(process)
 
                     switch state.launch(process) {
                     case .cancelled:
@@ -61,7 +62,7 @@ struct CancellableCommand: Sendable {
                     }
                     let outData = out.fileHandleForReading.readDataToEndOfFile()
                     group.wait()
-                    process.waitUntilExit()
+                    childExit.wait()
                     killer.cancel()
 
                     // Classified by what *this* runner did to the child, not by

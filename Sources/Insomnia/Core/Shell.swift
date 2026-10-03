@@ -38,6 +38,7 @@ enum Shell {
                 let err = Pipe()
                 process.standardOutput = out
                 process.standardError = err
+                let childExit = ProcessExit(process)
 
                 do {
                     try process.run()
@@ -57,7 +58,7 @@ enum Shell {
                 }
                 let outData = out.fileHandleForReading.readDataToEndOfFile()
                 group.wait()
-                process.waitUntilExit()
+                childExit.wait()
 
                 continuation.resume(returning: ShellResult(
                     status: process.terminationStatus,

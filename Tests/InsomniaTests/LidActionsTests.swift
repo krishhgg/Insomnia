@@ -1083,8 +1083,7 @@ final class LidActionsTests: XCTestCase {
 
         // The end queues behind the lid-close transaction; release the probe
         // first, then wait for both.
-        let end = Task { await m.end(reason: .user) }
-        await settleQueuedRequests()
+        let end = await runUntilSuspended { await m.end(reason: .user) }
         await probe.open()
         await close.value
         _ = await end.value
