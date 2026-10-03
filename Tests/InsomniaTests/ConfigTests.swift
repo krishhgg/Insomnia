@@ -21,7 +21,7 @@ final class ConfigTests: XCTestCase {
         XCTAssertTrue(c.dockerRule)
         XCTAssertFalse(c.muteOnLidClose)
         XCTAssertTrue(c.darkenDisplayOnLidClose)
-        XCTAssertTrue(c.freezeAllApps)
+        XCTAssertFalse(c.freezeAllApps, "freeze-all is opt in")
         XCTAssertTrue(c.lowPowerOnLidClose)
         XCTAssertTrue(c.thermalRules)
         XCTAssertFalse(c.disableAppNapForAgents, "writing other apps' preferences is opt-in")
@@ -297,19 +297,22 @@ final class ConfigTests: XCTestCase {
         XCTAssertEqual(try Store.makeDecoder().decode(Config.self, from: data), off)
     }
 
-    /// A config.json written before the freeze-all toggle existed keeps the
-    /// default (on); an explicit false is honoured.
+    /// A config.json without the freeze-all key (written before the toggle
+    /// existed, or by hand) gets the default, off: nobody is opted in to the
+    /// automatic scope by an upgrade. An explicit true is honoured.
     func testFreezeAllAppsDecodesTolerantly() throws {
         let legacy = try Store.makeDecoder().decode(Config.self, from: Data(#"{"freezeList": ["com.hnc.Discord"]}"#.utf8))
-        XCTAssertTrue(legacy.freezeAllApps)
+        XCTAssertFalse(legacy.freezeAllApps, "a missing key must not opt the user in")
         XCTAssertEqual(legacy.freezeList, ["com.hnc.Discord"])
+        let on = try Store.makeDecoder().decode(Config.self, from: Data(#"{"freezeAllApps": true}"#.utf8))
+        XCTAssertTrue(on.freezeAllApps)
+        var expected = Config()
+        expected.freezeAllApps = true
+        XCTAssertEqual(on, expected)
+        let data = try Store.makeEncoder().encode(on)
+        XCTAssertEqual(try Store.makeDecoder().decode(Config.self, from: data), on)
         let off = try Store.makeDecoder().decode(Config.self, from: Data(#"{"freezeAllApps": false}"#.utf8))
         XCTAssertFalse(off.freezeAllApps)
-        var expected = Config()
-        expected.freezeAllApps = false
-        XCTAssertEqual(off, expected)
-        let data = try Store.makeEncoder().encode(off)
-        XCTAssertEqual(try Store.makeDecoder().decode(Config.self, from: data), off)
     }
 
     /// A config.json written before the App Nap opt-in existed keeps the
@@ -336,6 +339,10 @@ final class ConfigTests: XCTestCase {
             for id in ids {
                 XCTAssertNotNil(id.range(of: pattern, options: .regularExpression), "\(name): \(id) does not look like a bundle id")
             }
+        }
+        for prefix in FreezePlanner.builtInProtectedPrefixes {
+            XCTAssertTrue(prefix.hasSuffix("."), "a protected prefix must end at a label boundary: \(prefix)")
+            XCTAssertNotNil(String(prefix.dropLast()).range(of: pattern, options: .regularExpression), "builtInProtectedPrefixes: \(prefix) does not look like a bundle id prefix")
         }
     }
 

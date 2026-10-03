@@ -24,6 +24,7 @@ final class ReconcileTests: XCTestCase {
         st.dockerFrozen = true
         try h.store.saveState(st)
         h.guardFake.sleepDisabled = true
+        h.procs.stoppedNow = [111, 222]
 
         let m = h.makeManager()
         await m.reconcile()
@@ -37,6 +38,7 @@ final class ReconcileTests: XCTestCase {
         XCTAssertTrue(h.guardFake.calls.contains("lowpowermode 0"))
         XCTAssertFalse(h.guardFake.calls.contains("disablesleep 1"))
         XCTAssertEqual(h.procs.resumed, [[111, 222]])
+        XCTAssertEqual(h.procs.signaled, [111, 222])
         // A clean end needs no launchd work; the agent stays loaded as installed.
         XCTAssertEqual(h.backstop.arms, 0)
         XCTAssertFalse(h.guardFake.sleepDisabled)

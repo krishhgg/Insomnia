@@ -23,12 +23,14 @@ final class RecoverySafetyTests: XCTestCase {
         st.sleepDisabledByUs = true
         st.frozenProcesses = [FrozenProcess(pid: 111, startedAt: 5), FrozenProcess(pid: 222, startedAt: 6)]
         try h.store.saveState(st)
+        h.procs.stoppedNow = [111, 222]
         h.procs.failResume = [222]
 
         let m = h.makeManager()
         await m.reconcile()
 
         XCTAssertEqual(h.procs.resumed, [[111, 222]])
+        XCTAssertEqual(h.procs.signaled, [111])
         let after = try XCTUnwrap(try h.store.loadState())
         XCTAssertEqual(after.frozenProcesses, [FrozenProcess(pid: 222, startedAt: 6)])
         XCTAssertFalse(after.sleepDisabledByUs, "a stuck pid must not hold sleep disabled")

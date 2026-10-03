@@ -91,6 +91,38 @@ final class SessionManager {
 
     var isActive: Bool { session != nil }
 
+    /// Journal edits owed by a freeze that `LidActions` undid because the
+    /// write confirming it failed (`clearUndoneFreeze`).
+    struct UndoneFreeze: Equatable, Sendable {
+        /// Pids whose provisional entry (identity nil) no longer describes
+        /// a stop: resumed, gone, or never stopped by that freeze.
+        var pids: Set<Int32> = []
+        /// That freeze set `dockerFrozen`, and none of it is still stopped.
+        var docker = false
+
+        var isEmpty: Bool { pids.isEmpty && !docker }
+
+        func apply(to s: inout RuntimeState) {
+            s.frozenProcesses.removeAll { $0.identity == nil && pids.contains($0.pid) }
+            if docker { s.dockerFrozen = false }
+        }
+    }
+
+    /// Edits not on disk yet because the disk refused them too. Applied
+    /// before every journal write and dropped once one succeeds, and tried
+    /// on their own at the start of every transaction. In memory only:
+    /// after a relaunch, reconcile finds those pids running and clears
+    /// their entries itself.
+    private var owedEdits = UndoneFreeze()
+
+    /// The journal as it reads once the owed edits are written: what is
+    /// frozen right now. The status menu shows this, not `state`.
+    var effectiveState: RuntimeState {
+        var s = state
+        owedEdits.apply(to: &s)
+        return s
+    }
+
     /// Fire date of the single deadline timer, exposed for tests and the menu.
     private(set) var scheduledDeadline: Date?
 
@@ -349,6 +381,7 @@ final class SessionManager {
                 self.refuseForUnreadableJournal(what, error)
                 return .failure(.journalUnreadable(error.localizedDescription))
             }
+            self.writeOwedEdits()
             if syncSession { await self.adoptAgentEnd() }
             return .success(await op())
         }
@@ -703,8 +736,28 @@ final class SessionManager {
     /// skip the side effect.
     func journal(_ mutate: (inout RuntimeState) -> Void) throws {
         var s = state
+        owedEdits.apply(to: &s)
         mutate(&s)
         try persistState(s)
+        owedEdits = UndoneFreeze()
+    }
+
+    /// Take the entries of an undone freeze off the journal now, or with
+    /// the next journal write that succeeds. Only for `LidActions.freeze`,
+    /// inside its transaction.
+    func clearUndoneFreeze(_ undone: UndoneFreeze) {
+        owedEdits.pids.formUnion(undone.pids)
+        owedEdits.docker = owedEdits.docker || undone.docker
+        writeOwedEdits()
+    }
+
+    private func writeOwedEdits() {
+        guard !owedEdits.isEmpty else { return }
+        do {
+            try journal { _ in }
+        } catch {
+            Log.error("could not clear the entries of an undone freeze from the journal: \(error.localizedDescription); the status leaves them out, and the next journal write takes them off")
+        }
     }
 
     /// Low Power Mode with journaling: the flag is written before `pmset -b
@@ -938,7 +991,7 @@ final class SessionManager {
             }
             if !report.unverifiable.isEmpty {
                 let list = report.unverifiable.map(String.init).joined(separator: ", ")
-                fail("pid(s) \(list) are stopped but journaled without identity (a legacy entry from an older build, or a freeze interrupted before the kernel confirmed the stop), so Insomnia cannot prove it froze them and will not resume them. Check each one first, for example `ps -o pid,stat,lstart,command -p <pid>`, and only if it is a process you expected Insomnia to freeze run `kill -CONT <pid>`; the entry stays in the journal until resumed or gone")
+                fail("pid(s) \(list) are stopped but journaled without identity, so Insomnia cannot prove it froze them and will not resume them. Either an older build recorded the pid alone, or a freeze stopped the pid and Insomnia quit, crashed or failed to write before the stop was confirmed in the journal. Check each one first, for example `ps -o pid,stat,lstart,command -p <pid>`, and only if it is a process you expected Insomnia to freeze run `kill -CONT <pid>`; the entry stays in the journal until resumed or gone")
             }
         } else if state.dockerFrozen {
             try? journal { $0.dockerFrozen = false }
@@ -1478,7 +1531,9 @@ final class SessionManager {
         state = s
     }
 
-    private func fail(_ message: String) {
+    /// Logs `message` and shows it in the status menu until the next
+    /// success clears it.
+    func fail(_ message: String) {
         lastError = message
         Log.error(message)
     }

@@ -20,8 +20,9 @@ struct Config: Codable, Equatable, Sendable {
     var freezeList: [String] = Config.defaultFreezeList
     /// Also SIGSTOP every other Dock app that is not an agent app, an Apple
     /// app, Docker Desktop or built-in protected (`FreezePlanner.builtInProtected`).
-    /// Off: the freeze list only.
-    var freezeAllApps: Bool = true
+    /// Off by default (and for a config.json without the key): a fresh
+    /// install freezes only the freeze list until the user opts in.
+    var freezeAllApps: Bool = false
     var dockerRule: Bool = true
     var muteOnLidClose: Bool = false
     /// Save the display brightness and keyboard backlight, set both to zero
