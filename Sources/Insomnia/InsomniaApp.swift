@@ -44,6 +44,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         super.init()
     }
 
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        // Before launch finishes, so the first notification already shows
+        // while Insomnia is frontmost.
+        ForegroundNotifications.install()
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         // No Dock icon even when run from `swift run` (the bundle has LSUIElement).
         NSApp.setActivationPolicy(.accessory)

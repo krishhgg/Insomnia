@@ -57,7 +57,14 @@ DITTO=/usr/bin/ditto
 CHMOD=/bin/chmod
 LOCKF=/usr/bin/lockf
 MV=/bin/mv
+RM=/bin/rm
+RMDIR=/bin/rmdir
+MKTEMP=/usr/bin/mktemp
 LOCK_TIMEOUT_SECONDS=10
+# The limit for one call to sudo, pgrep, launchctl or codesign made while this
+# run holds the recovery lock (and for the sudoers check before it); see
+# bounded() below.
+CALL_TIMEOUT_SECONDS=30
 
 # What a prebuilt bundle (--app) must be.
 BUNDLE_ID=com.kgarg.insomnia
@@ -97,18 +104,86 @@ BUILD_DIR=""
 TMP_SUDOERS=""
 CANDIDATE=""
 CANDIDATE_DIR=""
+WORK=""
 
 step() { printf '\n==> %s\n' "$*"; }
 usage() { echo "usage: $0 [--app /path/to/Insomnia.app [--allow-unverified-origin]]" >&2; }
 # A command for the user to paste, each word quoted for the shell, so a space,
 # quote or $ in a path stays part of that path.
 command_line() { local line; line="$(printf '%q ' "$@")"; printf '%s' "${line% }"; }
+
+# Run one external call with a time limit, so a call that stalls (a sudo
+# policy or directory-service lookup, a launchd that does not answer) cannot
+# keep this run, and the recovery lock it holds, waiting forever. Its
+# combined output is left in BOUNDED_OUTPUT (trailing newline removed) and
+# its exit status returned, or 124 when it did not finish within
+# CALL_TIMEOUT_SECONDS: it is then sent SIGTERM, and SIGKILL a second later
+# if it is still there. A supervising subshell waits for the call and writes
+# its status to a file; both run with fd 9 (the recovery lock) closed, so
+# nothing left behind by a stuck call holds the lock once this script exits.
+# Each call's files get a name from mktemp, so a call made inside $(...)
+# cannot reuse another's.
+BOUNDED_OUTPUT=""
+bounded() { # command args...
+  local base supervisor cpid rc i
+  base="$("$MKTEMP" "$WORK/call.XXXXXX")"
+  BOUNDED_OUTPUT=""
+  (
+    "$@" </dev/null >"$base.out" 2>&1 &
+    echo "$!" > "$base.pid"
+    rc=0
+    wait "$!" || rc=$?
+    echo "$rc" > "$base.rc"
+  ) </dev/null >/dev/null 2>&1 9>&- &
+  supervisor=$!
+  for (( i = 0; i < CALL_TIMEOUT_SECONDS * 100; i++ )); do
+    if [[ -s "$base.rc" ]]; then break; fi
+    sleep 0.01
+  done
+  if [[ ! -s "$base.rc" ]]; then
+    cpid="$(cat "$base.pid" 2>/dev/null || true)"
+    if [[ -n "$cpid" ]]; then kill -TERM "$cpid" 2>/dev/null || true; fi
+    for (( i = 0; i < 10; i++ )); do
+      if [[ -s "$base.rc" ]]; then break; fi
+      sleep 0.1
+    done
+    if [[ ! -s "$base.rc" && -n "$cpid" ]]; then
+      kill -KILL "$cpid" 2>/dev/null || true
+      for (( i = 0; i < 10; i++ )); do
+        if [[ -s "$base.rc" ]]; then break; fi
+        sleep 0.1
+      done
+    fi
+    # Reap the supervisor once it has written the status; one that is
+    # still waiting on an unkillable call is left behind without the lock.
+    if [[ -s "$base.rc" ]]; then wait "$supervisor" 2>/dev/null || true; fi
+    return 124
+  fi
+  read -r rc < "$base.rc"
+  wait "$supervisor" 2>/dev/null || true
+  IFS= read -r -d '' BOUNDED_OUTPUT < "$base.out" || true
+  BOUNDED_OUTPUT="${BOUNDED_OUTPUT%$'\n'}"
+  return "$rc"
+}
+# How a bounded call's exit status reads in a message.
+call_result() { # status
+  if (( $1 == 124 )); then
+    printf 'did not answer within %ss' "$CALL_TIMEOUT_SECONDS"
+  else
+    printf 'exited %s' "$1"
+  fi
+}
+
 # `launchctl print` exits 0 when a job with the label is loaded and 113 when
-# none is. Anything else is unknown, not absent. Being loaded says nothing
-# about which plist or schedule that job runs (it may be an older one).
+# none is. Anything else is unknown, not absent, and so is a print that did
+# not answer in time (unknown:124). Being loaded says nothing about which
+# plist or schedule that job runs (it may be an older one).
 loaded_state() { # -> yes | no | unknown:<rc>
   local rc=0
-  "$LAUNCHCTL" print "gui/$UID_NUM/$LABEL" >/dev/null 2>&1 || rc=$?
+  bounded "$LAUNCHCTL" print "gui/$UID_NUM/$LABEL" || rc=$?
+  if (( rc == 124 )); then
+    echo "'launchctl print gui/$UID_NUM/$LABEL' did not answer within ${CALL_TIMEOUT_SECONDS}s; whether the job is loaded is unknown (unknown:124)." >&2
+  fi
   case "$rc" in
     0) echo yes ;;
     113) echo no ;;
@@ -151,23 +226,36 @@ move_bundle() { # from to
 }
 
 # Whether sudo grants the four pmset commands of the rule without a
-# password. `sudo -n -l <command>` checks the rule without running pmset
-# (nothing on the machine changes).
+# password: 0 when it does, 124 when a check did not answer within
+# CALL_TIMEOUT_SECONDS, 1 otherwise. `sudo -n -l <command>` checks the rule
+# without running pmset (nothing on the machine changes).
+pmset_rule_check() { # pmset arguments
+  local rc=0
+  bounded "$SUDO" -n -l /usr/bin/pmset "$@" || rc=$?
+  if (( rc == 0 || rc == 124 )); then return "$rc"; fi
+  return 1
+}
 pmset_rule_effective() {
-  "$SUDO" -n -l /usr/bin/pmset -a disablesleep 1 >/dev/null 2>&1 \
-    && "$SUDO" -n -l /usr/bin/pmset -a disablesleep 0 >/dev/null 2>&1 \
-    && "$SUDO" -n -l /usr/bin/pmset -b lowpowermode 1 >/dev/null 2>&1 \
-    && "$SUDO" -n -l /usr/bin/pmset -b lowpowermode 0 >/dev/null 2>&1
+  pmset_rule_check -a disablesleep 1 \
+    && pmset_rule_check -a disablesleep 0 \
+    && pmset_rule_check -b lowpowermode 1 \
+    && pmset_rule_check -b lowpowermode 0
 }
 
 cleanup() {
-  if [[ -n "$TMP_SUDOERS" ]]; then rm -f "$TMP_SUDOERS"; fi
-  if [[ -n "$CANDIDATE" ]]; then rm -f "$CANDIDATE"; fi
-  if [[ -n "$CANDIDATE_DIR" ]]; then rmdir "$CANDIDATE_DIR" 2>/dev/null || true; fi
-  if [[ -n "$STAGE" ]]; then rm -rf "$STAGE"; fi
-  if [[ -n "$BUILD_DIR" ]]; then rm -rf "$BUILD_DIR"; fi
+  if [[ -n "$TMP_SUDOERS" ]]; then "$RM" -f "$TMP_SUDOERS"; fi
+  if [[ -n "$CANDIDATE" ]]; then "$RM" -f "$CANDIDATE"; fi
+  if [[ -n "$CANDIDATE_DIR" ]]; then "$RMDIR" "$CANDIDATE_DIR" 2>/dev/null || true; fi
+  if [[ -n "$STAGE" ]]; then "$RM" -rf "$STAGE"; fi
+  if [[ -n "$BUILD_DIR" ]]; then "$RM" -rf "$BUILD_DIR"; fi
+  if [[ -n "$WORK" ]]; then
+    "$RM" -f "$WORK"/call.* 2>/dev/null || true
+    "$RMDIR" "$WORK" 2>/dev/null || true
+  fi
 }
 trap cleanup EXIT
+# Scratch space for bounded(): this run's own directory, emptied on exit.
+WORK="$("$MKTEMP" -d "${TMPDIR:-/tmp}/insomnia-install.XXXXXX")"
 
 # 1. The bundle to install ---------------------------------------------------
 #    Built or verified before the password prompt: nothing on the machine has
@@ -182,7 +270,7 @@ if [[ -n "$PREBUILT" ]]; then
   # stages and pins. $PREBUILT may sit where someone else can write (a
   # shared folder, /tmp); a bundle swapped there while the password prompt
   # waits is never copied in. BUILD_DIR is removed at exit, as for a build.
-  BUILD_DIR="$(mktemp -d)"
+  BUILD_DIR="$("$MKTEMP" -d)"
   CHECKED_APP="$BUILD_DIR/Insomnia.app"
   if ! "$DITTO" "$PREBUILT" "$CHECKED_APP"; then
     echo "could not copy $PREBUILT to check it. Nothing was changed." >&2
@@ -265,7 +353,7 @@ else
     echo "no build-app.sh beside this script in $SCRIPT_DIR, so there is no checkout to build from. To install the bundle of a release zip, pass it with --app (README, Install). Nothing was changed." >&2
     exit 1
   fi
-  BUILD_DIR="$(mktemp -d)"
+  BUILD_DIR="$("$MKTEMP" -d)"
   "$SCRIPT_DIR/build-app.sh" --output "$BUILD_DIR"
   SOURCE_APP="$BUILD_DIR/Insomnia.app"
 fi
@@ -275,7 +363,7 @@ fi
 #    effective, the running app is not asked to quit and neither the bundle
 #    (backstop.sh included) nor the LaunchAgent are touched.
 step "Writing $SUDOERS (requires your password once)"
-TMP_SUDOERS="$(mktemp)"
+TMP_SUDOERS="$("$MKTEMP")"
 cat > "$TMP_SUDOERS" <<SUDO
 # Installed by Insomnia install.sh. Exactly four commands, nothing else.
 $USER ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 1
@@ -291,8 +379,13 @@ else
 fi
 # The backstop cannot undo anything without the rule, so stop here. Checked
 # again once this run holds the recovery lock (step 5).
-if pmset_rule_effective; then
+rule_rc=0
+pmset_rule_effective || rule_rc=$?
+if (( rule_rc == 0 )); then
   echo "sudoers rule verified"
+elif (( rule_rc == 124 )); then
+  echo "'sudo -n -l', which checks the rule, did not answer within ${CALL_TIMEOUT_SECONDS}s, so the rule in $SUDOERS is not verified. The app (with backstop.sh) and the LaunchAgent were not touched; rerun once sudo answers." >&2
+  exit 1
 else
   echo "'sudo -n pmset' is still not permitted; check $SUDOERS. The app (with backstop.sh) and the LaunchAgent were not touched." >&2
   exit 1
@@ -321,7 +414,7 @@ if "$PGREP" -x Insomnia >/dev/null 2>&1; then
   fi
 fi
 mkdir -p "$APP_DIR"
-STAGE="$(mktemp -d "$APP_DIR/.Insomnia.app.staging.$$.XXXXXX")"
+STAGE="$("$MKTEMP" -d "$APP_DIR/.Insomnia.app.staging.$$.XXXXXX")"
 NEW_APP="$STAGE/Insomnia.app"
 # ditto keeps the signature's resource seal and every attribute intact (a
 # downloaded bundle keeps its quarantine flag; Gatekeeper decides at launch).
@@ -385,8 +478,17 @@ if (( lock_rc != 0 )); then
   echo "Wait a minute and rerun. $SUDOERS is installed; the app at $APP and the LaunchAgent were not touched." >&2
   exit 75
 fi
-if "$PGREP" -x Insomnia >/dev/null 2>&1; then
+# From here on every sudo, pgrep, launchctl and codesign call goes through
+# bounded(): one that stalls ends this run, which lets go of the lock, so
+# the app and the agent's backstop can take it again and undo a session.
+# A pgrep that cannot answer does not say the app is gone, so the run stops.
+pgrep_rc=0
+bounded "$PGREP" -x Insomnia || pgrep_rc=$?
+if (( pgrep_rc == 0 )); then
   echo "Insomnia started again; quit it and rerun. The app at $APP and the LaunchAgent were not touched." >&2
+  exit 1
+elif (( pgrep_rc != 1 )); then
+  echo "pgrep $(call_result "$pgrep_rc"), so whether Insomnia started again is unknown. The app at $APP and the LaunchAgent were not touched; rerun." >&2
   exit 1
 fi
 # The rule was verified in step 2, before this run waited for the lock. An
@@ -395,7 +497,20 @@ fi
 # the rule. Without it no session can undo pmset. Checked here, under the
 # lock that uninstall.sh also needs, and this run holds the lock until the
 # new pair is published.
-if ! pmset_rule_effective; then
+rule_rc=0
+pmset_rule_effective || rule_rc=$?
+if (( rule_rc == 124 )); then
+  cat >&2 <<FAIL
+
+Install stopped: 'sudo -n -l', which checks the rule in $SUDOERS again now that
+this run holds the recovery lock, did not answer within ${CALL_TIMEOUT_SECONDS}s. The check was
+stopped and this run exits, which lets go of the lock, so the app and the
+LaunchAgent's backstop can take it again and undo a session left over. The app
+at $APP and the LaunchAgent were not touched; the new build was discarded.
+Rerun this script once sudo answers.
+FAIL
+  exit 1
+elif (( rule_rc != 0 )); then
   cat >&2 <<FAIL
 
 Install stopped: 'sudo -n pmset' was permitted when $SUDOERS was installed above,
@@ -446,18 +561,28 @@ for dir in "$APP_DIR"/.Insomnia.app.staging.*; do
   if "$KILL" -0 "${BASH_REMATCH[1]}" 2>/dev/null; then
     continue
   fi
-  rm -rf "$dir"
+  "$RM" -rf "$dir"
 done
 
-# True when the plist on disk, the one launchd loads at the next login, pins
-# the bundle at $PREVIOUS_APP and not the one at $APP.
+# Whether the plist on disk, the one launchd loads at the next login, pins
+# the bundle at $PREVIOUS_APP and not the one at $APP: 0 when it does, 1
+# when it does not, 124 when a codesign check did not answer in time, so
+# it is not known which of the two it pins.
 plist_pins_previous() {
-  local pinned
+  local pinned rc
   pinned="$("$PLUTIL" -extract ProgramArguments.4 raw -o - "$PLIST" 2>/dev/null || true)"
-  [[ -n "$pinned" ]] \
-    && ! "$CODESIGN" --verify --strict "-R=$pinned" "$APP" >/dev/null 2>&1 \
-    && "$CODESIGN" --verify --strict "-R=$pinned" "$PREVIOUS_APP" >/dev/null 2>&1
+  [[ -n "$pinned" ]] || return 1
+  rc=0
+  bounded "$CODESIGN" --verify --strict "-R=$pinned" "$APP" || rc=$?
+  if (( rc == 0 )); then return 1; fi
+  if (( rc == 124 )); then return 124; fi
+  rc=0
+  bounded "$CODESIGN" --verify --strict "-R=$pinned" "$PREVIOUS_APP" || rc=$?
+  if (( rc == 0 || rc == 124 )); then return "$rc"; fi
+  return 1
 }
+pins_unknown_note="'codesign --verify', which tells which of the two bundles $PLIST pins,
+did not answer within ${CALL_TIMEOUT_SECONDS}s."
 
 step "Ending any stale session and checking the recovery journal"
 recovery_rc=0
@@ -469,17 +594,22 @@ if (( recovery_rc != 0 )); then
     yes) agent_note="A LaunchAgent job with label $LABEL is loaded and was left as it was. Which plist and
 schedule it runs was not verified here; check with 'launchctl print gui/$UID_NUM/$LABEL'." ;;
     no) agent_note="No LaunchAgent $LABEL is loaded, so nothing retries by itself." ;;
-    *) agent_note="'launchctl print gui/$UID_NUM/$LABEL' exited ${held#unknown:}, so whether a LaunchAgent is loaded is unknown." ;;
+    *) agent_note="'launchctl print gui/$UID_NUM/$LABEL' $(call_result "${held#unknown:}"), so whether a LaunchAgent is loaded is unknown." ;;
   esac
   if [[ -d "$PREVIOUS_APP" ]]; then
     pair_note="An interrupted install left a build at $APP and set the previous app aside at
 $PREVIOUS_APP. Neither bundle was moved and no LaunchAgent job was unloaded or
 replaced, so a loaded job still finds the build it pins; the new build was discarded."
-    if plist_pins_previous; then
+    pins_rc=0
+    plist_pins_previous || pins_rc=$?
+    if (( pins_rc == 0 )); then
       pair_note="$pair_note
 $PLIST pins the previous app, so the agent the next login loads refuses the
 build at $APP. Before you log out, resolve the recovery and rerun this script,
 which puts the previous app back."
+    elif (( pins_rc == 124 )); then
+      pair_note="$pair_note
+$pins_unknown_note"
     fi
   else
     pair_note="The app at $APP and the LaunchAgent were not replaced or unloaded,
@@ -518,7 +648,22 @@ fi
 # Recovery is resolved, so a loaded job has nothing left to retry, and the
 # rest of the repair may unload it and move bundles.
 if [[ -d "$PREVIOUS_APP" ]]; then
-  if plist_pins_previous; then
+  pins_rc=0
+  plist_pins_previous || pins_rc=$?
+  if (( pins_rc == 124 )); then
+    # Which bundle goes back is not known, so neither moves and no job is
+    # unloaded: whatever job is loaded keeps the build it pins.
+    cat >&2 <<FAIL
+
+Install stopped: an interrupted run left a build at $APP and set the previous app
+aside at $PREVIOUS_APP, and $pins_unknown_note
+Neither bundle was moved and no LaunchAgent job was unloaded; the new build was
+discarded. Installed so far: $SUDOERS. The recovery journal was clean when
+checked above. Rerun this script once codesign answers.
+FAIL
+    exit 1
+  fi
+  if (( pins_rc == 0 )); then
     # Stopped after the second rename but before the new plist was
     # published: $PLIST still pins the previous bundle, so that one goes
     # back and the interrupted run's build is discarded with this run's
@@ -530,7 +675,7 @@ if [[ -d "$PREVIOUS_APP" ]]; then
     # moves and the job keeps the build it pins.
     held="$(loaded_state)"
     if [[ "$held" != no ]]; then
-      "$LAUNCHCTL" bootout "gui/$UID_NUM/$LABEL" >/dev/null 2>&1 || true
+      bounded "$LAUNCHCTL" bootout "gui/$UID_NUM/$LABEL" || true
       cleared="$(loaded_state)"
       if [[ "$cleared" != no ]]; then
         cat >&2 <<FAIL
@@ -592,11 +737,11 @@ FAIL
       # place, so a failure in step 6 reloads that one. Unless print confirms
       # the reload, nothing below may count on a loaded job, so the run stops.
       reload_rc=0
-      "$LAUNCHCTL" bootstrap "gui/$UID_NUM" "$PLIST" >/dev/null 2>&1 || reload_rc=$?
+      bounded "$LAUNCHCTL" bootstrap "gui/$UID_NUM" "$PLIST" || reload_rc=$?
       now="$(loaded_state)"
       if (( reload_rc != 0 )) || [[ "$now" != yes ]]; then
         if (( reload_rc != 0 )); then
-          reload_reason="'launchctl bootstrap' exited $reload_rc"
+          reload_reason="'launchctl bootstrap' $(call_result "$reload_rc")"
         else
           reload_reason="'launchctl bootstrap' reported success, but launchctl print says $now"
         fi
@@ -626,7 +771,7 @@ FAIL
   else
     # $APP is what the plist pins (the interrupted run got as far as
     # publishing it), or nothing pins either: the set-aside copy is spare.
-    rm -rf "$PREVIOUS_APP"
+    "$RM" -rf "$PREVIOUS_APP"
     echo "removed the bundle an interrupted run had set aside; $APP stays"
   fi
 fi
@@ -657,7 +802,7 @@ CANDIDATE="$CANDIDATE_DIR/$LABEL.candidate-$$.plist"
 mkdir -p "$CANDIDATE_DIR"
 # Leftovers of earlier attempts, including an older build's candidates in
 # $LAUNCH_AGENTS itself (those make launchd's login load report an error).
-rm -f "$CANDIDATE_DIR/$LABEL.candidate-"* "$LAUNCH_AGENTS/$LABEL.candidate-"*
+"$RM" -f "$CANDIDATE_DIR/$LABEL.candidate-"* "$LAUNCH_AGENTS/$LABEL.candidate-"*
 
 before="$(loaded_state)"
 
@@ -696,7 +841,7 @@ PLIST
 # no agent is ever loaded against the other build's bundle, and any job
 # loaded after the swap is this run's. On failure that job is unloaded
 # (print confirms it) before the swap is undone and anything is reloaded.
-"$LAUNCHCTL" bootout "gui/$UID_NUM/$LABEL" >/dev/null 2>&1 || true
+bounded "$LAUNCHCTL" bootout "gui/$UID_NUM/$LABEL" || true
 if [[ "$before" != no ]]; then
   cleared="$(loaded_state)"
   if [[ "$cleared" != no ]]; then
@@ -745,7 +890,8 @@ bootstrap_rc=0
 after=no
 published=0
 if (( swapped )); then
-  "$LAUNCHCTL" bootstrap "gui/$UID_NUM" "$CANDIDATE" || bootstrap_rc=$?
+  bounded "$LAUNCHCTL" bootstrap "gui/$UID_NUM" "$CANDIDATE" || bootstrap_rc=$?
+  if [[ -n "$BOUNDED_OUTPUT" ]]; then printf '%s\n' "$BOUNDED_OUTPUT" >&2; fi
   after="$(loaded_state)"
   if (( bootstrap_rc == 0 )) && [[ "$after" == yes ]] && "$MV" -f "$CANDIDATE" "$PLIST"; then
     published=1
@@ -755,7 +901,7 @@ fi
 if (( published )); then
   echo "LaunchAgent $LABEL loaded (launchctl print confirms); $PLIST published"
   if (( set_aside )); then
-    if rm -rf "$PREVIOUS_APP"; then
+    if "$RM" -rf "$PREVIOUS_APP"; then
       echo "replaced the previous $APP"
     else
       echo "replaced the previous $APP, but its copy at $PREVIOUS_APP could not be removed; the next run of this script removes it" >&2
@@ -764,7 +910,7 @@ if (( published )); then
   # Installs before this layout ran a writable copy from $APP_SUPPORT. The
   # agent just loaded runs the sealed one, so that copy goes now, not before.
   if [[ -e "$APP_SUPPORT/backstop.sh" ]]; then
-    rm -f "$APP_SUPPORT/backstop.sh"
+    "$RM" -f "$APP_SUPPORT/backstop.sh"
     echo "removed the previous install's $APP_SUPPORT/backstop.sh (the agent now runs the copy sealed in the bundle)"
   fi
 else
@@ -773,7 +919,7 @@ else
     reason="$swap_reason (see the error above)"
     fix_note="Fix what kept the bundle from moving and rerun."
   elif (( bootstrap_rc != 0 )); then
-    reason="'launchctl bootstrap' exited $bootstrap_rc for the new LaunchAgent"
+    reason="'launchctl bootstrap' $(call_result "$bootstrap_rc") for the new LaunchAgent"
   elif [[ "$after" != yes ]]; then
     reason="'launchctl bootstrap' reported success, but the job is not confirmed loaded (launchctl print: $after)"
   else
@@ -788,7 +934,7 @@ where the next login loads it from"
   unloaded=no
   stopped="Install stopped: $reason."
   if [[ "$after" != no ]]; then
-    "$LAUNCHCTL" bootout "gui/$UID_NUM/$LABEL" >/dev/null 2>&1 || true
+    bounded "$LAUNCHCTL" bootout "gui/$UID_NUM/$LABEL" || true
     unloaded="$(loaded_state)"
     stopped="$stopped
 The new job was unloaded again (launchctl print confirms)."
@@ -876,19 +1022,19 @@ FAIL
   case "$before" in
     yes)
       reload_rc=0
-      "$LAUNCHCTL" bootstrap "gui/$UID_NUM" "$PLIST" >/dev/null 2>&1 || reload_rc=$?
+      bounded "$LAUNCHCTL" bootstrap "gui/$UID_NUM" "$PLIST" || reload_rc=$?
       now="$(loaded_state)"
       if (( reload_rc == 0 )) && [[ "$now" == yes ]]; then
         outcome="A job with label $LABEL is loaded again from the previous plist $PLIST
 (launchctl bootstrap succeeded and launchctl print confirms; its schedule was not verified here)."
       elif [[ "$now" == yes ]]; then
-        outcome="The reload of the previous plist was not confirmed ('launchctl bootstrap' exited
-$reload_rc). A job with label $LABEL is loaded (launchctl print), but which plist it runs is
+        outcome="The reload of the previous plist was not confirmed ('launchctl bootstrap'
+$(call_result "$reload_rc")). A job with label $LABEL is loaded (launchctl print), but which plist it runs is
 unknown: it may be the job that was loaded before this attempt. Check
 'launchctl print gui/$UID_NUM/$LABEL' yourself, or rerun this script."
       else
-        outcome="The previous job could not be loaded again ('launchctl bootstrap' exited
-$reload_rc; launchctl print: $now); no job with label $LABEL is confirmed loaded. Run
+        outcome="The previous job could not be loaded again ('launchctl bootstrap'
+$(call_result "$reload_rc"); launchctl print: $now); no job with label $LABEL is confirmed loaded. Run
   $(command_line launchctl bootstrap "gui/$UID_NUM" "$PLIST")
 yourself, or rerun this script."
       fi ;;
@@ -900,11 +1046,11 @@ attempt. It pins the new build, which is not installed, so it refuses to run; un
 'launchctl bootout gui/$UID_NUM/$LABEL' or rerun this script." ;;
         no) outcome="No job with label $LABEL was loaded before and none is loaded now." ;;
         *) outcome="No job was loaded before; whether one is loaded now is unknown ('launchctl print'
-exited ${now#unknown:}), so it is not confirmed either way. Check
+$(call_result "${now#unknown:}")), so it is not confirmed either way. Check
 'launchctl print gui/$UID_NUM/$LABEL' yourself." ;;
       esac ;;
     *)
-      outcome="Whether a job was loaded before is unknown (launchctl print exited ${before#unknown:}),
+      outcome="Whether a job was loaded before is unknown (launchctl print $(call_result "${before#unknown:}")),
 so nothing was reloaded. Check 'launchctl print gui/$UID_NUM/$LABEL' and, if no job is
 loaded, load the previous one yourself:
   $(command_line launchctl bootstrap "gui/$UID_NUM" "$PLIST")" ;;

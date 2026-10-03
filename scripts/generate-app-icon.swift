@@ -2,32 +2,22 @@ import CoreGraphics
 import Foundation
 import ImageIO
 
-/// Renders the Insomnia app icon from the same geometry and palette the app
-/// draws with. Not part of the SwiftPM targets: scripts/generate-app-icon.sh
-/// compiles this file together with Sources/Insomnia/UI/EyeMoonGeometry.swift
-/// and BrandPalette.swift, so there is one drawing and no pixel art to keep
-/// in step.
+/// Writes the Insomnia app icon files from the drawing the app carries.
+/// Not part of the SwiftPM targets: scripts/generate-app-icon.sh compiles
+/// this file together with Sources/Insomnia/UI/AppIconArtwork.swift, the
+/// geometry it draws (EyeLensGeometry.swift, EyeMarkGeometry.swift) and
+/// BrandPalette.swift, so there is one drawing and no pixel art to keep in
+/// step.
 ///
-///   generate-app-icon --png PATH --iconset DIR
+///   generate-app-icon --png PATH --iconset DIR --svg PATH
 ///
-/// Writes the 1024x1024 master PNG to PATH and every size `iconutil` needs
-/// into DIR (an .iconset folder), each rendered straight from the vector
-/// geometry at its own pixel size rather than downscaled. Output depends
-/// only on this source, so re-running it reproduces the checked-in bytes.
+/// Writes the 1024x1024 master PNG to the PNG path, every size `iconutil`
+/// needs into DIR (an .iconset folder), each rendered straight from the
+/// vector geometry at its own pixel size rather than downscaled, and the
+/// README's SVG of the same mark to the SVG path. Output depends only on
+/// the sources, so re-running it reproduces the checked-in bytes.
 @main
 struct GenerateAppIcon {
-    /// Apple's macOS icon layout: a rounded tile inset in the 1024 canvas
-    /// (the margin is where the system draws its shadow), corners rounded
-    /// at a fixed share of the tile side.
-    static let canvas: CGFloat = 1024
-    static let tileInset: CGFloat = 100
-    static let cornerShare: CGFloat = 0.2237
-    /// The 24-unit design grid's side as a share of the tile side.
-    static let markShare: CGFloat = 0.76
-    /// The outline never gets thinner than one device pixel, so the 16 and
-    /// 32 pixel sizes keep a readable eye instead of a grey smudge.
-    static let minimumStrokePixels: CGFloat = 1
-
     /// File name and pixel size of each iconset member.
     static let iconset: [(name: String, pixels: Int)] = [
         ("icon_16x16", 16), ("icon_16x16@2x", 32),
@@ -37,6 +27,8 @@ struct GenerateAppIcon {
         ("icon_512x512", 512), ("icon_512x512@2x", 1024),
     ]
 
+    static let usage = "usage: generate-app-icon --png PATH --iconset DIR --svg PATH"
+
     struct Failure: Error, CustomStringConvertible {
         let description: String
     }
@@ -45,6 +37,7 @@ struct GenerateAppIcon {
         var args = Array(CommandLine.arguments.dropFirst())
         var png: String?
         var iconsetDir: String?
+        var svg: String?
         while !args.isEmpty {
             let flag = args.removeFirst()
             switch (flag, args.first) {
@@ -54,60 +47,28 @@ struct GenerateAppIcon {
             case ("--iconset", .some(let value)):
                 iconsetDir = value
                 args.removeFirst()
+            case ("--svg", .some(let value)):
+                svg = value
+                args.removeFirst()
             default:
-                throw Failure(description: "usage: generate-app-icon --png PATH --iconset DIR")
+                throw Failure(description: usage)
             }
         }
-        guard let png, let iconsetDir else {
-            throw Failure(description: "usage: generate-app-icon --png PATH --iconset DIR")
+        guard let png, let iconsetDir, let svg else {
+            throw Failure(description: usage)
         }
 
-        try write(render(pixels: Int(canvas)), to: URL(fileURLWithPath: png))
+        try write(render(pixels: Int(AppIconArtwork.canvas)), to: URL(fileURLWithPath: png))
         let dir = URL(fileURLWithPath: iconsetDir, isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         for member in iconset {
             try write(render(pixels: member.pixels), to: dir.appendingPathComponent("\(member.name).png"))
         }
+        try AppIconArtwork.svg().write(to: URL(fileURLWithPath: svg), atomically: true, encoding: .utf8)
     }
 
-    /// The whole icon at `pixels` square: charcoal tile, moon-white mark.
     static func render(pixels: Int) throws -> CGImage {
-        guard let ctx = CGContext(
-            data: nil,
-            width: pixels,
-            height: pixels,
-            bitsPerComponent: 8,
-            bytesPerRow: 0,
-            space: CGColorSpace(name: CGColorSpace.sRGB)!,
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        ) else {
-            throw Failure(description: "could not create a \(pixels)px context")
-        }
-        // Work in canvas units, y-down like the geometry.
-        let scale = CGFloat(pixels) / canvas
-        ctx.translateBy(x: 0, y: CGFloat(pixels))
-        ctx.scaleBy(x: scale, y: -scale)
-
-        let tile = CGRect(x: tileInset, y: tileInset, width: canvas - 2 * tileInset, height: canvas - 2 * tileInset)
-        let corner = tile.width * cornerShare
-        ctx.addPath(CGPath(roundedRect: tile, cornerWidth: corner, cornerHeight: corner, transform: nil))
-        ctx.setFillColor(BrandPalette.midnight.cgColor)
-        ctx.fillPath()
-
-        let side = tile.width * markShare
-        let mark = CGRect(x: tile.midX - side / 2, y: tile.midY - side / 2, width: side, height: side)
-        let stroke = max(EyeMoonGeometry.lineWidth(for: side), minimumStrokePixels / scale)
-        ctx.setStrokeColor(BrandPalette.moonWhite.cgColor)
-        ctx.setLineWidth(stroke)
-        ctx.setLineCap(.round)
-        ctx.setLineJoin(.round)
-        ctx.addPath(EyeMoonGeometry.eyeOutline(in: mark))
-        ctx.strokePath()
-        ctx.setFillColor(BrandPalette.moonWhite.cgColor)
-        ctx.addPath(EyeMoonGeometry.crescent(in: mark))
-        ctx.fillPath()
-
-        guard let image = ctx.makeImage() else {
+        guard let image = AppIconArtwork.render(pixels: pixels) else {
             throw Failure(description: "could not rasterise the \(pixels)px icon")
         }
         return image
