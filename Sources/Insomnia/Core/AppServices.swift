@@ -16,10 +16,18 @@ final class SystemStatus {
     var lastGap: TimeInterval?
     var frozenCount: Int = 0
     var dockerPaused: Bool = false
-    /// Display names of running Chromium browsers missing the two flags.
-    var throttledBrowsers: [String] = []
+    /// Running Chromium browsers missing the two flags.
+    var throttledBrowsers: [ThrottledBrowser] = []
     /// Full detail for the relaunch item (bundle id + name).
     var browsers: [BrowserStatus] = []
+    /// Why each browser's last relaunch did not happen, by bundle id: the
+    /// text the notification carries, which names the browser. The menu
+    /// shows each as a warning line, because a notification can be turned
+    /// off for Insomnia, and one that is not presented is gone. A
+    /// browser's line is cleared when its next relaunch starts, and every
+    /// line when a session starts; the end of a session leaves them, since
+    /// the browsers they name may still be closed.
+    var relaunchProblems: [String: String] = [:]
 
     @ObservationIgnored var refresher: (@MainActor () async -> Void)?
 
@@ -73,6 +81,10 @@ final class AppServices {
     private var lidTasks: [Task<Void, Never>] = []
     private var floorTasks: [Task<Void, Never>] = []
     private var browserTasks: [Task<Void, Never>] = []
+    /// Relaunches started so far, and the newest one of each browser, by
+    /// bundle id. Only the newest relaunch of a browser reports its outcome.
+    private var relaunchCount = 0
+    private var newestRelaunch: [String: Int] = [:]
     private var sampleTimer: (any DispatchSourceTimer)?
     private var postOpenSampleTask: Task<Void, Never>?
     /// The state of the last lid event, from the hinge or the simulation
@@ -91,6 +103,7 @@ final class AppServices {
         keyboard: any KeyboardBacklighting = NoopKeyboardBacklight(),
         keychain: any KeychainStoring = KeychainStore(),
         locationPermission: LocationPermission = LocationPermission(),
+        browser: BrowserThrottle? = nil,
         idleSeconds: @escaping @Sendable () -> Double = { UserInput.secondsSinceLastInput() },
         lidSimulation: (any LidSimulating)? = LidSimulationBuild.makeWatcher(),
         lidSimulationEnabled: Bool = LidSimulationBuild.isCompiledIn
@@ -107,7 +120,7 @@ final class AppServices {
         self.docker = DockerRule(freezer: freezer)
         self.keychain = keychain
         self.locationPermission = locationPermission
-        self.browser = BrowserThrottle()
+        self.browser = browser ?? BrowserThrottle()
         status.refresher = { [weak self] in await self?.refreshOnDemand() }
     }
 
@@ -118,6 +131,7 @@ final class AppServices {
         self.manager = manager
         let config = manager.config
         status.lastGap = nil
+        status.relaunchProblems = [:]
 
         if !config.hotspotSSID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             locationPermission.requestWhenInUse()
@@ -191,8 +205,7 @@ final class AppServices {
         lidTasks.removeAll()
         for task in floorTasks { task.cancel() }
         floorTasks.removeAll()
-        for task in browserTasks { task.cancel() }
-        browserTasks.removeAll()
+        cancelBrowserTasks()
         network?.stop()
         network = nil
         lidActions = nil
@@ -245,11 +258,45 @@ final class AppServices {
         power.instantWatts()
     }
 
+    /// Cancel browser scans and relaunches in flight. `stop()` calls this
+    /// when the session ends; a relaunch waiting for the browser to start
+    /// then returns at once and posts nothing.
+    func cancelBrowserTasks() {
+        for task in browserTasks { task.cancel() }
+        browserTasks.removeAll()
+    }
+
     /// Quit and relaunch a Chromium browser with both anti-throttle flags.
-    func relaunchUnthrottled(_ bundleId: String) async {
+    /// The outcome lands seconds after the menu click, so anything short of
+    /// a relaunch goes out as a notification naming the browser, and stays
+    /// in the menu in `status.relaunchProblems` until that browser's next
+    /// relaunch. The bundle id and name are the ones the user confirmed,
+    /// never looked up again in `status.browsers`, which a scan can replace
+    /// at any point. The throttle checks the running processes itself, and
+    /// a browser that is gone by then is reported as not running.
+    ///
+    /// The quit and start waits take seconds, and the wait for a browser to
+    /// quit goes on after a cancel. When the wait is over, the outcome is
+    /// reported only if the session that asked for it has not ended (a
+    /// cancelled task) and no newer relaunch of the same browser has
+    /// started; otherwise it is dropped, with no line and no notification,
+    /// so an old outcome never stands in for a newer one.
+    func relaunchUnthrottled(_ target: ThrottledBrowser) async {
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
-            await self.browser.relaunchUnthrottled(bundleId: bundleId)
+            self.relaunchCount += 1
+            let relaunch = self.relaunchCount
+            self.newestRelaunch[target.bundleId] = relaunch
+            self.status.relaunchProblems[target.bundleId] = nil
+            let outcome = await self.browser.relaunchUnthrottled(bundleId: target.bundleId)
+            guard !Task.isCancelled, self.newestRelaunch[target.bundleId] == relaunch else {
+                Log.info("relaunch of \(target.bundleId) outlived its session or a newer relaunch; its outcome is dropped")
+                return
+            }
+            if let body = outcome.explanation(browser: target.name) {
+                self.status.relaunchProblems[target.bundleId] = body
+                self.notifier.post(title: "Browser not relaunched", body: body)
+            }
             guard !Task.isCancelled else { return }
             try? await Task.sleep(for: .seconds(2))
             guard !Task.isCancelled else { return }

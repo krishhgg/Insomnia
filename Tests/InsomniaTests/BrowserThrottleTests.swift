@@ -1,3 +1,4 @@
+import AppKit
 import XCTest
 @testable import Insomnia
 
@@ -55,5 +56,451 @@ final class BrowserThrottleTests: XCTestCase {
         XCTAssertTrue(ids.contains("com.example.chromeagent"))
         XCTAssertTrue(ids.contains("dev.some.Chromium-Fork"))
         XCTAssertFalse(ids.contains("com.apple.Safari"))
+    }
+
+    // MARK: Relaunch
+
+    @MainActor
+    private func throttle(args: String, processes: FakeBrowserProcesses) -> BrowserThrottle {
+        BrowserThrottle(readArgs: { _ in args }, processes: processes)
+    }
+
+    /// The happy path: every instance is asked to quit, the wait ends with
+    /// none running, and `open` gets both flags plus the profile arguments.
+    @MainActor
+    func testRelaunchQuitsWaitsThenLaunchesWithTheFlagsAndTheProfile() async {
+        let processes = FakeBrowserProcesses(pids: [42, 43])
+        let throttle = throttle(args: "\(chrome) --user-data-dir=/tmp/p --profile-directory=Work --no-first-run", processes: processes)
+
+        let outcome = await throttle.relaunchUnthrottled(bundleId: "com.google.Chrome")
+
+        XCTAssertEqual(outcome, .relaunched)
+        XCTAssertEqual(processes.terminated, [[42, 43]])
+        XCTAssertEqual(processes.launches.map(\.bundleId), ["com.google.Chrome"])
+        XCTAssertEqual(processes.startWaits, ["com.google.Chrome"])
+        XCTAssertEqual(
+            processes.launches.first?.arguments,
+            ChromiumFlags.required + ["--user-data-dir=/tmp/p", "--profile-directory=Work"]
+        )
+    }
+
+    /// The finding: a browser still running when the wait ends must not be
+    /// launched again, or a second copy opens beside the first.
+    @MainActor
+    func testAStillRunningBrowserIsNotLaunchedAgain() async {
+        let processes = FakeBrowserProcesses(pids: [42])
+        processes.quits = false
+        let throttle = throttle(args: chrome, processes: processes)
+
+        let outcome = await throttle.relaunchUnthrottled(bundleId: "com.google.Chrome")
+
+        XCTAssertEqual(outcome, .stillRunning)
+        XCTAssertEqual(processes.terminated, [[42]])
+        XCTAssertEqual(processes.launches.count, 0)
+    }
+
+    /// The waiter's verdict is not enough on its own: the running list is
+    /// read again after the wait, and an instance there blocks the launch.
+    @MainActor
+    func testAnInstanceSeenAfterTheWaitAlsoBlocksTheLaunch() async {
+        let processes = FakeBrowserProcesses(pids: [42])
+        processes.pidsAfterQuit = [77]
+        let throttle = throttle(args: chrome, processes: processes)
+
+        let outcome = await throttle.relaunchUnthrottled(bundleId: "com.google.Chrome")
+
+        XCTAssertEqual(outcome, .stillRunning)
+        XCTAssertEqual(processes.launches.count, 0)
+    }
+
+    /// Unreadable arguments stop the relaunch before anything is quit; a
+    /// relaunch without them could open another profile. Empty `ps` output
+    /// counts as unreadable.
+    @MainActor
+    func testUnreadableArgumentsStopBeforeAnythingIsQuit() async {
+        let failing = FakeBrowserProcesses(pids: [42])
+        let throttle = BrowserThrottle(readArgs: { _ in throw BrowserProcessError(detail: "ps timed out") }, processes: failing)
+
+        let outcome = await throttle.relaunchUnthrottled(bundleId: "com.google.Chrome")
+
+        XCTAssertEqual(outcome, .argumentsUnreadable("ps timed out"))
+        XCTAssertEqual(failing.terminated.count, 0)
+        XCTAssertEqual(failing.launches.count, 0)
+
+        let empty = FakeBrowserProcesses(pids: [42])
+        let outcomeOfEmpty = await self.throttle(args: " \n", processes: empty).relaunchUnthrottled(bundleId: "com.google.Chrome")
+
+        XCTAssertEqual(outcomeOfEmpty, .argumentsUnreadable("ps printed nothing for pid 42"))
+        XCTAssertEqual(empty.terminated.count, 0)
+        XCTAssertEqual(empty.launches.count, 0)
+    }
+
+    @MainActor
+    func testNothingHappensWhenTheBrowserIsNotRunning() async {
+        let processes = FakeBrowserProcesses(pids: [])
+        let throttle = throttle(args: chrome, processes: processes)
+
+        let outcome = await throttle.relaunchUnthrottled(bundleId: "com.google.Chrome")
+
+        XCTAssertEqual(outcome, .notRunning)
+        XCTAssertEqual(processes.terminated.count, 0)
+        XCTAssertEqual(processes.launches.count, 0)
+    }
+
+    /// `open` failing after the quit is the one outcome that leaves the
+    /// browser down, and it says so.
+    @MainActor
+    func testAFailedOpenIsReportedAfterTheQuit() async {
+        let processes = FakeBrowserProcesses(pids: [42])
+        processes.launchFailure = "LSOpenURLsWithRole() failed with error -10810"
+        let throttle = throttle(args: chrome, processes: processes)
+
+        let outcome = await throttle.relaunchUnthrottled(bundleId: "com.google.Chrome")
+
+        XCTAssertEqual(outcome, .launchFailed("LSOpenURLsWithRole() failed with error -10810"))
+        XCTAssertEqual(processes.terminated, [[42]])
+        XCTAssertEqual(processes.launches.count, 1)
+        XCTAssertEqual(processes.startWaits, [])
+    }
+
+    /// `open` returning 0 only means LaunchServices accepted the request.
+    /// A browser that is not in the running list afterwards is reported,
+    /// not announced as relaunched.
+    @MainActor
+    func testABrowserThatDoesNotShowUpAfterOpenIsReported() async {
+        let processes = FakeBrowserProcesses(pids: [42])
+        processes.startWait = .neverAppears
+        let throttle = throttle(args: chrome, processes: processes)
+
+        let outcome = await throttle.relaunchUnthrottled(bundleId: "com.google.Chrome")
+
+        XCTAssertEqual(outcome, .didNotStart)
+        XCTAssertEqual(processes.terminated, [[42]])
+        XCTAssertEqual(processes.launches.count, 1)
+        XCTAssertEqual(processes.startWaits, ["com.google.Chrome"])
+    }
+
+    /// The finding: a session that ends during the start wait cancels the
+    /// relaunch task. The wait must end at once rather than keep checking,
+    /// and the outcome is not a failure to report. The test waits for the
+    /// relaunch to be inside the wait, not for a time; the wait's own
+    /// sleeps last until cancelled, so no deadline can end it instead.
+    @MainActor
+    func testACancelledStartWaitEndsAtOnceAndIsNotAFailure() async {
+        let processes = FakeBrowserProcesses(pids: [42])
+        processes.startWait = .pollsUntilCancelled
+        let throttle = throttle(args: chrome, processes: processes)
+
+        let relaunch = Task { await throttle.relaunchUnthrottled(bundleId: "com.google.Chrome") }
+        await fulfillment(of: [processes.insideStartWait], timeout: 60)
+        let checksAtCancel = processes.startChecks
+        relaunch.cancel()
+        let outcome = await relaunch.value
+
+        XCTAssertEqual(outcome, .cancelled)
+        XCTAssertLessThanOrEqual(processes.startChecks, checksAtCancel + 1, "the wait kept checking after the cancel")
+        XCTAssertEqual(processes.launches.count, 1)
+    }
+
+    /// The loop itself: once its task is cancelled it checks at most once
+    /// more and throws, where ignoring the sleep's error kept it checking
+    /// as fast as it could. The sleep is the test's: it reports that the
+    /// loop is asleep and then lasts until the task is cancelled.
+    @MainActor
+    func testThePollStopsCheckingWhenItsTaskIsCancelled() async {
+        let checks = Locked(0)
+        let asleep = expectation(description: "the poll is asleep")
+        asleep.assertForOverFulfill = false
+        let poll = Task { @MainActor in
+            try await WorkspaceBrowserProcesses.poll(timeout: 60, every: .milliseconds(20), sleep: { _ in
+                asleep.fulfill()
+                try await Task.sleep(for: .seconds(3600))
+            }) {
+                checks.value += 1
+                return false
+            }
+        }
+        await fulfillment(of: [asleep], timeout: 60)
+        let checksAtCancel = checks.value
+        poll.cancel()
+        let result = await poll.result
+
+        XCTAssertThrowsError(try result.get()) { XCTAssertTrue($0 is CancellationError, "\($0)") }
+        XCTAssertLessThanOrEqual(checks.value, checksAtCancel + 1)
+    }
+
+    /// Without a cancel the poll gives up after `timeout` worth of sleeps,
+    /// and stops as soon as the condition holds; no clock is read.
+    @MainActor
+    func testThePollCountsItsSleeps() async throws {
+        let slept = Locked<[Duration]>([])
+        let gaveUp = try await WorkspaceBrowserProcesses.poll(timeout: 1, every: .milliseconds(250), sleep: { slept.value.append($0) }) { false }
+        XCTAssertFalse(gaveUp)
+        XCTAssertEqual(slept.value, Array(repeating: .milliseconds(250), count: 4))
+
+        let checks = Locked(0)
+        let found = try await WorkspaceBrowserProcesses.poll(timeout: 1, sleep: { _ in }) {
+            checks.value += 1
+            return checks.value == 3
+        }
+        XCTAssertTrue(found)
+        XCTAssertEqual(checks.value, 3)
+    }
+
+    /// The main process exits while its arguments are read and another app
+    /// gets its pid. `ps` may have read that app's arguments, so nothing is
+    /// quit, and the app now holding the pid is left alone.
+    @MainActor
+    func testAMainProcessThatExitsDuringTheReadStopsTheRelaunch() async {
+        let processes = FakeBrowserProcesses(pids: [42])
+        let throttle = BrowserThrottle(readArgs: { _ in
+            await MainActor.run {
+                processes.exit(pid: 42)
+                processes.start(bundleId: "com.apple.finder", pid: 42)
+            }
+            return "/System/Library/CoreServices/Finder.app/Contents/MacOS/Finder"
+        }, processes: processes)
+
+        let outcome = await throttle.relaunchUnthrottled(bundleId: "com.google.Chrome")
+
+        XCTAssertEqual(outcome, .argumentsUnreadable("pid 42 exited while they were read, or could not be checked"))
+        XCTAssertEqual(processes.terminated, [])
+        XCTAssertEqual(processes.launches.count, 0)
+        XCTAssertEqual(processes.processes.filter { $0.bundleId == "com.apple.finder" }.map(\.running), [true])
+    }
+
+    /// A main process whose start time could not be read cannot be tied to
+    /// what `ps` prints for its pid, so its arguments are not read at all
+    /// and nothing is quit; the user is told, as for any unreadable read.
+    @MainActor
+    func testAMainProcessWithoutAStartTimeIsNotReadOrQuit() async {
+        let processes = FakeBrowserProcesses(pids: [42])
+        processes.processes[0].identity = nil
+        let reads = Locked(0)
+        let throttle = BrowserThrottle(readArgs: { [chrome] _ in
+            reads.value += 1
+            return chrome
+        }, processes: processes)
+
+        let outcome = await throttle.relaunchUnthrottled(bundleId: "com.google.Chrome")
+
+        XCTAssertEqual(outcome, .argumentsUnreadable("the start time of pid 42 could not be read to check them"))
+        XCTAssertEqual(reads.value, 0)
+        XCTAssertEqual(processes.terminated, [])
+        XCTAssertEqual(processes.launches.count, 0)
+        XCTAssertEqual(
+            outcome.explanation(browser: "Chrome"),
+            "Could not read Chrome's profile arguments (the start time of pid 42 could not be read to check them), so a relaunch could have opened the wrong profile. Chrome was not quit."
+        )
+    }
+
+    /// The app's check, run on the test process's own pid, which stays
+    /// alive for the whole test: confirmed only when the application has
+    /// not terminated and a start time was recorded that still matches.
+    /// Another app could exit between two reads and fail the test for no
+    /// fault of the check. Read-only; nothing is signalled, quit or
+    /// launched.
+    @MainActor
+    func testTheWorkspaceCheckFailsClosedWithoutAStartTime() throws {
+        let pid = ProcessInfo.processInfo.processIdentifier
+        guard case let .present(state) = SignalProcessControl.kernelState(pid: pid) else {
+            return XCTFail("the test process's own start time could not be read")
+        }
+        let identity = state.identity
+        let other = ProcessIdentity(startedAt: identity.startedAt - 1, startedAtMicros: 0, bootSession: identity.bootSession)
+
+        XCTAssertTrue(WorkspaceBrowserProcesses.isRunning(terminated: false, recorded: identity, pid: pid))
+        XCTAssertFalse(WorkspaceBrowserProcesses.isRunning(terminated: false, recorded: nil, pid: pid), "no start time recorded")
+        XCTAssertFalse(WorkspaceBrowserProcesses.isRunning(terminated: false, recorded: other, pid: pid), "another process's start time")
+        XCTAssertFalse(WorkspaceBrowserProcesses.isRunning(terminated: true, recorded: identity, pid: pid), "the workspace says it terminated")
+        XCTAssertFalse(
+            WorkspaceBrowserProcesses().isRunning(BrowserInstance(pid: pid, process: NSObject(), identity: identity)),
+            "not an application object"
+        )
+    }
+
+    /// Another instance exits during the read and its pid goes to another
+    /// app. The quit goes to the instances the list returned, so that app
+    /// is not asked to quit.
+    @MainActor
+    func testTheQuitGoesToTheInstancesFoundNotToTheirPids() async {
+        let processes = FakeBrowserProcesses(pids: [42, 43])
+        let found = processes.processes
+        let throttle = BrowserThrottle(readArgs: { [chrome] _ in
+            await MainActor.run {
+                processes.exit(pid: 43)
+                processes.start(bundleId: "com.apple.finder", pid: 43)
+            }
+            return chrome
+        }, processes: processes)
+
+        let outcome = await throttle.relaunchUnthrottled(bundleId: "com.google.Chrome")
+
+        XCTAssertEqual(outcome, .relaunched)
+        XCTAssertEqual(processes.quitRequests.count, 1)
+        XCTAssertTrue(zip(processes.quitRequests.first ?? [], found).allSatisfy { $0 === $1 }, "the quit went to other objects")
+        XCTAssertEqual(processes.processes.filter { $0.bundleId == "com.apple.finder" }.map(\.running), [true], "the app that took pid 43 was quit")
+    }
+
+    /// Every outcome short of a relaunch has a notification body naming the
+    /// browser and saying what was and was not done.
+    func testOutcomeMessagesNameTheBrowser() {
+        XCTAssertNil(RelaunchOutcome.relaunched.explanation(browser: "Chrome"))
+        XCTAssertNil(RelaunchOutcome.cancelled.explanation(browser: "Chrome"))
+        XCTAssertEqual(
+            RelaunchOutcome.stillRunning.explanation(browser: "Chrome"),
+            "Chrome did not quit within 10 s, so nothing was relaunched. It may still quit later. If it does, open it again yourself."
+        )
+        XCTAssertEqual(
+            RelaunchOutcome.notRunning.explanation(browser: "Arc"),
+            "Arc is not running. Nothing was quit or relaunched."
+        )
+        XCTAssertEqual(
+            RelaunchOutcome.argumentsUnreadable("ps timed out").explanation(browser: "Arc"),
+            "Could not read Arc's profile arguments (ps timed out), so a relaunch could have opened the wrong profile. Arc was not quit."
+        )
+        XCTAssertEqual(
+            RelaunchOutcome.launchFailed("open exited with status 1").explanation(browser: "Chromium"),
+            "Chromium quit but could not be relaunched: open exited with status 1. Open it yourself."
+        )
+        XCTAssertEqual(
+            RelaunchOutcome.didNotStart.explanation(browser: "Chromium"),
+            "Chromium quit and was asked to open again, but it was not running after 5 s. Open it yourself."
+        )
+    }
+}
+
+/// A running list of fake processes; records what the relaunch asked for.
+/// Nothing real is quit or launched.
+@MainActor
+final class FakeBrowserProcesses: BrowserProcessControlling {
+    /// One process. The object is its identity: a later process given the
+    /// same pid is another object.
+    final class Process {
+        let bundleId: String
+        let pid: Int32
+        fileprivate(set) var running = true
+        /// What the list reports as the kernel start time; nil plays an
+        /// unreadable one.
+        var identity: ProcessIdentity?
+
+        init(bundleId: String, pid: Int32, startedAt: Int64) {
+            self.bundleId = bundleId
+            self.pid = pid
+            identity = ProcessIdentity(startedAt: startedAt, startedAtMicros: 0, bootSession: "fake")
+        }
+    }
+
+    /// Every process the fake has known, running or not.
+    private(set) var processes: [Process]
+    /// Whether a quit request makes the instances exit.
+    var quits = true
+    /// Pids of new instances that appear during the quit wait.
+    var pidsAfterQuit: [Int32]?
+    /// Makes `launch` throw with this detail.
+    var launchFailure: String?
+    /// Runs during the quit wait, before it ends.
+    var duringQuit: (@MainActor () -> Void)?
+    /// Holds the next quit wait until `releaseQuit()`, cancelled or not,
+    /// the way the app's wait for a browser to quit goes on after a
+    /// cancel. `insideQuitWait` is fulfilled once it holds.
+    var holdsNextQuit = false
+    let insideQuitWait: XCTestExpectation = {
+        let e = XCTestExpectation(description: "the relaunch is inside the quit wait")
+        e.assertForOverFulfill = false
+        return e
+    }()
+    private var heldQuit: CheckedContinuation<Void, Never>?
+    enum StartWait {
+        /// An instance is running as soon as the wait begins.
+        case appears
+        /// The wait reports that none appeared.
+        case neverAppears
+        /// The app's own poll loop runs against a list that stays empty,
+        /// with sleeps that last until the task is cancelled, so only a
+        /// cancel ends the wait. `insideStartWait` is fulfilled at the
+        /// first sleep.
+        case pollsUntilCancelled
+    }
+
+    /// What the wait after `launch` sees.
+    var startWait = StartWait.appears
+    /// Pids of each quit request, in order.
+    var terminated: [[Int32]] { quitRequests.map { $0.map(\.pid) } }
+    private(set) var quitRequests: [[Process]] = []
+    private(set) var launches: [(bundleId: String, arguments: [String])] = []
+    private(set) var startWaits: [String] = []
+    /// How often the `.pollsUntilCancelled` wait has checked the list.
+    private(set) var startChecks = 0
+    let insideStartWait: XCTestExpectation = {
+        let e = XCTestExpectation(description: "the relaunch is inside the start wait")
+        e.assertForOverFulfill = false
+        return e
+    }()
+
+    init(pids: [Int32], bundleId: String = "com.google.Chrome") {
+        processes = pids.enumerated().map { Process(bundleId: bundleId, pid: $1, startedAt: Int64($0)) }
+    }
+
+    @discardableResult
+    func start(bundleId: String = "com.google.Chrome", pid: Int32) -> Process {
+        let process = Process(bundleId: bundleId, pid: pid, startedAt: Int64(processes.count))
+        processes.append(process)
+        return process
+    }
+
+    func exit(pid: Int32) {
+        for process in processes where process.pid == pid { process.running = false }
+    }
+
+    func runningInstances(bundleId: String) -> [BrowserInstance] {
+        processes.filter { $0.bundleId == bundleId && $0.running }
+            .map { BrowserInstance(pid: $0.pid, process: $0, identity: $0.identity) }
+    }
+
+    /// Fails closed like the app's: no start time, no confirmation.
+    func isRunning(_ instance: BrowserInstance) -> Bool {
+        guard let process = instance.process as? Process, instance.identity != nil else { return false }
+        return process.running && process.identity == instance.identity
+    }
+
+    func terminateAndWait(_ instances: [BrowserInstance], timeout: TimeInterval) async -> Bool {
+        let asked = instances.compactMap { $0.process as? Process }
+        quitRequests.append(asked)
+        let quit = quits
+        if quit { asked.forEach { $0.running = false } }
+        for pid in pidsAfterQuit ?? [] { start(pid: pid) }
+        duringQuit?()
+        if holdsNextQuit {
+            holdsNextQuit = false
+            await withCheckedContinuation { heldQuit = $0; insideQuitWait.fulfill() }
+        }
+        return quit
+    }
+
+    func releaseQuit() {
+        heldQuit?.resume()
+        heldQuit = nil
+    }
+
+    func launch(bundleId: String, arguments: [String]) async throws {
+        launches.append((bundleId, arguments))
+        if let launchFailure { throw BrowserProcessError(detail: launchFailure) }
+    }
+
+    func waitUntilRunning(bundleId: String, timeout: TimeInterval) async throws -> Bool {
+        startWaits.append(bundleId)
+        switch startWait {
+        case .appears: return true
+        case .neverAppears: return false
+        case .pollsUntilCancelled:
+            return try await WorkspaceBrowserProcesses.poll(timeout: 3600, sleep: { [insideStartWait] _ in
+                insideStartWait.fulfill()
+                try await Task.sleep(for: .seconds(3600))
+            }) {
+                startChecks += 1
+                return false
+            }
+        }
     }
 }

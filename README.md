@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/eye-moon.svg" alt="Insomnia: an eye with a right-opening crescent moon" width="112">
+  <img src="docs/assets/eye-open.svg" alt="Insomnia: an open eye with a round pupil and five lashes above it" width="112">
 </p>
 
 <h1 align="center">Insomnia</h1>
@@ -308,8 +308,22 @@ pending automation but cannot retract keystrokes already sent.
 Chromium browsers can throttle windows macOS considers occluded, including
 when the lid is closed. Insomnia detects supported running browsers missing
 `--disable-backgrounding-occluded-windows` or `--disable-renderer-backgrounding`
-and offers **Relaunch [browser] unthrottled** in the right-click menu. Relaunch
-preserves browser profile arguments. This is not a guarantee that every web
+and offers **Relaunch [browser] unthrottled** in the right-click menu. The item
+asks first, because the browser is quit and its windows and tabs come back only
+if it is set to reopen them on startup. If the browser has quit by the time you
+confirm, nothing is quit or launched and a notification says so. Insomnia reads the browser's profile
+arguments before quitting and carries them over. If it cannot read them, cannot
+read the kernel's start time that ties them to the browser, or the browser
+quits on its own while they are read, it quits nothing and says so. If the
+browser has not quit after 10 s, nothing is launched, and a notification says
+so: a second copy beside the first would be worse than a throttled one. The
+quit request stands, so a browser that closes later has to be opened again by
+hand. After `open` returns, Insomnia waits up to 5 s for the browser to show up
+as running and notifies if it does not. Each of these reasons also stays in the
+right-click menu as a warning line, one per browser, until that browser's next
+relaunch or the next session, so it is there even with notifications off. A
+relaunch that ends after its session ended, or after a newer relaunch of the
+same browser started, reports nothing. This is not a guarantee that every web
 app will keep working while the lid is closed.
 
 </details>
@@ -363,9 +377,10 @@ rather than assuming missing integration coverage passed. Tests use injected
 dependencies and temporary fixtures—not live installation or power changes
 on a contributor's machine.
 
-The app icon keeps the eye-and-moon [vector geometry](Sources/Insomnia/UI/EyeMoonGeometry.swift); the menu bar shows a [closed eye](Sources/Insomnia/UI/EyeMarkGeometry.swift) that opens while a session runs.
+The app icon is the menu bar's open eye on a charcoal tile: [AppIconArtwork](Sources/Insomnia/UI/AppIconArtwork.swift) draws it from the same [vector geometry](Sources/Insomnia/UI/EyeMarkGeometry.swift) as the menu bar's closed eye, which opens while a session runs.
 After changing the artwork, run `./scripts/generate-app-icon.sh` to regenerate
-the packaged PNG and ICNS assets. No image-generation service is needed.
+the packaged PNG and ICNS assets and the README's SVG. The script draws them
+offline with Xcode's swiftc and iconutil.
 
 [Contributing](CONTRIBUTING.md) · [Security reporting](SECURITY.md) ·
 [Release validation](docs/release-validation.md) · [Design notes](docs/spec.md)

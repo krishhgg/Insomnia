@@ -289,6 +289,41 @@ last held while it was on was the battery or thermal floor, not the lid.
   - If a browser is running without them, the menu shows a warning and a
     "Relaunch <browser> unthrottled" item that quits and relaunches it with
     both flags and the same profile.
+  - The item asks for confirmation first (the browser is quit; its windows
+    return only through its own session restore). The item carries the
+    browser's bundle id and name from when the menu was built, and
+    confirming hands those on, so a browser scan that replaces the list
+    while the alert is up cannot change or drop the browser; one that has
+    quit by then is reported as not running. The profile arguments are
+    read before the quit, and unreadable arguments (including empty `ps`
+    output) stop the relaunch before anything is quit. So does a main
+    process that exits during the read, checked by `NSRunningApplication`
+    and by the kernel's start time for the pid, since `ps` reads by pid and
+    the pid may have gone to another process. A start time that cannot be
+    read counts the same way: nothing confirms the pid is still the
+    browser, so the arguments are not read and nothing is quit. The quit
+    goes to the `NSRunningApplication` objects found before the read, never
+    to a fresh lookup of their pids. After the quit request Insomnia waits up
+    to 10 s, then reads the running list again: any instance still there
+    means nothing is launched, and the notification says the browser may
+    still quit later and then has to be opened by hand.
+    After `open` returns 0 the running list is polled for up to 5 s; a
+    browser not running by then is reported too. A session that ends during
+    that wait cancels it at once and nothing is reported, since the user
+    ended the session. The 10 s quit wait does not stop on a cancel, so a
+    relaunch whose session ended during it reports nothing either when the
+    wait is over. Only the newest relaunch of a browser reports, so one
+    that a newer relaunch of the same browser overtook reports nothing
+    either. Every other outcome short of a relaunch is a "Browser not
+    relaunched" notification naming the browser, and the same text stays
+    in the menu as a warning line, one per browser, until that browser's
+    next relaunch or the next session start, because notifications can be
+    off for Insomnia.
+    Insomnia is the notification center's delegate and asks for banners
+    while it is frontmost, as it is right after the confirmation; without
+    that, macOS drops a notification from the frontmost app. The process
+    side (`BrowserProcessControlling`) is injected so the tests quit
+    nothing.
   - Headless Playwright is unaffected and needs nothing.
   - **Must be verified on the real machine with the lid shut** (see test plan).
     If macOS 26 does not mark windows occluded in this state, the feature is
