@@ -155,9 +155,10 @@ final class PackagingTests: XCTestCase {
         let out = Pipe()
         p.standardOutput = out
         p.standardError = out
+        let childExit = ProcessExit(p)
         try p.run()
         let data = out.fileHandleForReading.readDataToEndOfFile()
-        p.waitUntilExit()
+        childExit.wait()
         return (p.terminationStatus, String(decoding: data, as: UTF8.self))
     }
 

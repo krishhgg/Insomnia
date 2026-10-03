@@ -195,7 +195,12 @@ The defaults are worth knowing:
 
 To exercise the lid actions without closing the lid, run
 `scripts/simulate-lid.sh closed` and then `scripts/simulate-lid.sh open` during
-a session; the app runs the same actions it would on a real lid event.
+a session; the app runs the same actions it would on a real lid event. Only a
+build with the file watcher compiled in reads that trigger: a debug build, or
+a release build installed with `INSOMNIA_LID_SIMULATION=1 ./scripts/install.sh`.
+A normal install has no watcher, so no program running as your user can replay
+the lid actions by writing a file. A build that has it logs "Lid simulation
+build" at launch and shows the same line in the status menu and in Settings.
 
 ## How recovery works
 
@@ -210,7 +215,19 @@ has passed. It leaves a valid, unexpired session alone.
 
 The app and backstop use the same lock so they do not restore and rewrite the
 journal over one another. Failed restoration keeps the relevant entries;
-unreadable journals are preserved instead of treated as clean.
+unreadable journals are preserved instead of treated as clean. A session file
+that does not parse counts as expired and is renamed to
+`session.json.unreadable-<time>` beside it, never deleting or overwriting
+anything: the app does this at launch, before restoring whatever the journal
+holds, and says where the file went; the agent does it once the journal is
+clean. A session file that cannot be read at all (permissions, or not a
+regular file, which is never opened) also counts as expired, since its end
+time is unknown: the journal is restored and the file is renamed the same
+way without being opened, so a later launch cannot resume a session that
+was treated as ended. The app says where it went. If the rename fails, the
+app keeps trying it and will not quit until the file is gone.
+`uninstall.sh --purge` removes the renamed copies that are regular files;
+without `--purge` they stay.
 
 **Recovery is not “everything always gets undone.”** The backstop does not
 monitor battery or temperature. Saved audio needs the app to reopen, and
