@@ -452,6 +452,12 @@ Invariants:
   replaced (a copy could have been swapped in after the root command
   locked the original) or missing (it went without the lock) is not
   counted as voided, so the transaction waits for the dialog to exit.
+  Deleters that did not write the marker (a transaction after a relaunch,
+  `backstop.sh`, `uninstall.sh`) have no identity to compare, so a copy
+  swapped in before their open while the root command holds the original
+  would be deleted in its place. Only a process running as the user can
+  make that swap, and it can already clear `sleepDisabledByUs` in
+  `state.json` directly.
 - `sleepDisabledByUs` is cleared only by a transaction that removed
   `pending-start` before it restored sleep. A marker that cannot be locked
   within its timeout or cannot be deleted leaves recovery incomplete: sleep
