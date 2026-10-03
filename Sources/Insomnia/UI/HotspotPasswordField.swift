@@ -38,6 +38,18 @@ struct HotspotPasswordField: Equatable {
         let ssid: String
     }
 
+    /// What `finishRead` made of an answer.
+    enum ReadAnswer: Equatable {
+        /// The notice is set; a load fills the field with the password.
+        case used
+        /// A newer read, a save or a clear began since. Nothing changes.
+        case dropped
+        /// The SSID was edited while the read waited, and nothing newer
+        /// began. The answer is about the old SSID's item and is dropped;
+        /// read the SSID configured now with this read instead.
+        case readAgain(Read)
+    }
+
     /// A save or clear is waiting on the keychain, which may be showing a
     /// dialog. One at a time.
     private(set) var saving = false
@@ -68,13 +80,15 @@ struct HotspotPasswordField: Equatable {
     }
 
     /// A load or recheck answered; `ssid` is the one configured now. Its
-    /// notice is used unless a newer read began, a save answered, or the
-    /// SSID changed since: the answer is about the old SSID's item. Returns
-    /// whether it was used.
-    mutating func finishRead(_ read: Read, ssid: String, notice: String?) -> Bool {
-        guard read.token == request, read.ssid == HotspotSSID.normalized(ssid) else { return false }
+    /// notice is used unless a newer read began or a save answered since.
+    /// An SSID edited meanwhile drops it too, since the answer is about the
+    /// old SSID's item, and begins the read for the new SSID, so the field
+    /// is not left empty with no notice.
+    mutating func finishRead(_ read: Read, ssid: String, notice: String?) -> ReadAnswer {
+        guard read.token == request else { return .dropped }
+        guard read.ssid == HotspotSSID.normalized(ssid) else { return .readAgain(startRead(ssid: ssid)) }
         self.notice = notice
-        return true
+        return .used
     }
 
     /// A save or clear begins; false while one is still waiting. A load

@@ -380,10 +380,13 @@ provided by the standalone backstop. Performance effects depend on workload.
   or clear begins, so it cannot refill a field the user just cleared.
 - Work that waits on `KeychainQueue` checks again, once the wait is over,
   everything it acts on, and drops its answer if any of it changed. A
-  load or recheck in Settings whose SSID was edited meanwhile is dropped:
-  its answer is about the old SSID's item. A save clears the failover's
-  report and re-arms its notification only if it stored for the SSID
-  configured when it answers. A failover join whose read waited behind a
+  load or recheck in Settings whose SSID was edited meanwhile is dropped,
+  since its answer is about the old SSID's item, and the SSID configured
+  now is read instead, so the field is not left empty with no notice.
+  That read is a peek: the SSID a later save moves the password from
+  stays the one the window loaded, as after any SSID edit. A save clears
+  the failover's report and re-arms its notification only if it stored
+  for the SSID configured when it answers. A failover join whose read waited behind a
   save does nothing if the session has ended, Wi-Fi has come back, or the
   configured SSID has changed: no join and no warning, so the
   notification stays armed. After a recovery or stop it schedules no

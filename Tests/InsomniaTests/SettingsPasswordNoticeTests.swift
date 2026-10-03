@@ -220,7 +220,7 @@ final class HotspotPasswordFieldTests: XCTestCase {
         let recheck = field.startRead(ssid: "Phone")
         field.finishSave(refused)
 
-        XCTAssertFalse(field.finishRead(recheck, ssid: "Phone", notice: nil))
+        XCTAssertEqual(field.finishRead(recheck, ssid: "Phone", notice: nil), .dropped)
         XCTAssertEqual(field.notice, refused.notice)
     }
 
@@ -232,7 +232,7 @@ final class HotspotPasswordFieldTests: XCTestCase {
         let load = field.startRead(ssid: "Phone")
         XCTAssertTrue(field.startSave())
 
-        XCTAssertFalse(field.finishRead(load, ssid: "Phone", notice: nil), "the view fills the field only when this is true")
+        XCTAssertEqual(field.finishRead(load, ssid: "Phone", notice: nil), .dropped, "the view fills the field only when this is .used")
         field.finishSave(.stored(.init(ssid: "Phone", password: "")))
         XCTAssertNil(field.notice)
     }
@@ -245,23 +245,107 @@ final class HotspotPasswordFieldTests: XCTestCase {
         field.finishSave(refused)
         let recheck = field.startRead(ssid: "Phone")
 
-        XCTAssertTrue(field.finishRead(recheck, ssid: "Phone", notice: HotspotPasswordProblem.unreadable.settingsNotice))
+        XCTAssertEqual(field.finishRead(recheck, ssid: "Phone", notice: HotspotPasswordProblem.unreadable.settingsNotice), .used)
         XCTAssertEqual(field.notice, HotspotPasswordProblem.unreadable.settingsNotice)
     }
 
     /// The SSID is edited while a load or recheck waits behind a save. Its
-    /// answer is about the old SSID's item, so it is dropped: the view
-    /// neither fills the field nor changes the notice. Spaces around the
-    /// SSID do not count as an edit.
-    func testAReadForAnSSIDEditedAwayIsDropped() {
+    /// answer is about the old SSID's item, so it is dropped: the notice
+    /// stays, and the read for the new SSID begins, so the field is not
+    /// left empty for an SSID that has a password. Spaces around the SSID
+    /// do not count as an edit.
+    func testAReadForAnSSIDEditedAwayIsDroppedAndTheNewSSIDIsRead() {
         var field = HotspotPasswordField()
         let load = field.startRead(ssid: "Phone")
-        XCTAssertFalse(field.finishRead(load, ssid: "Other Phone", notice: "about Phone"))
+        guard case let .readAgain(next) = field.finishRead(load, ssid: "Other Phone", notice: "about Phone") else {
+            return XCTFail("an answer for an SSID edited away was used, or dropped with no new read")
+        }
         XCTAssertNil(field.notice)
+        XCTAssertEqual(next.ssid, "Other Phone")
+        XCTAssertEqual(field.finishRead(load, ssid: "Other Phone", notice: "about Phone"), .dropped, "the old read is superseded")
+        XCTAssertEqual(field.finishRead(next, ssid: "Other Phone", notice: "about Other Phone"), .used)
+        XCTAssertEqual(field.notice, "about Other Phone")
 
         let recheck = field.startRead(ssid: "Phone")
-        XCTAssertTrue(field.finishRead(recheck, ssid: " Phone\n", notice: "about Phone"))
+        XCTAssertEqual(field.finishRead(recheck, ssid: " Phone\n", notice: "about Phone"), .used)
         XCTAssertEqual(field.notice, "about Phone")
+
+        let beforeSave = field.startRead(ssid: "Phone")
+        XCTAssertTrue(field.startSave())
+        XCTAssertEqual(field.finishRead(beforeSave, ssid: "Other Phone", notice: nil), .dropped, "a save began: no new read either")
+    }
+
+    /// The SSID is edited while the window loads the password. The load's
+    /// answer, the old SSID's password, is dropped, and the new SSID's
+    /// password fills the field. The second read is a peek: a save after
+    /// it still moves the password from the SSID the window loaded, so
+    /// that SSID's item does not stay behind.
+    @MainActor
+    func testALoadForAnSSIDEditedAwayShowsTheNewSSIDsPassword() async throws {
+        let edit = SSIDEdits(["Other Phone"])
+        let keychain = BlockingKeychain(items: ["\(KeychainStore.service)/Phone": "old", "\(KeychainStore.service)/Other Phone": "new"])
+        let store = KeychainHotspotSecretStore(keychain: keychain, queue: KeychainQueue()) { edit.readAndEdit() }
+        var field = HotspotPasswordField()
+
+        let password = await SettingsView.readForField(
+            field.startRead(ssid: edit.configured),
+            first: { await SettingsView.loadedPassword(store.load) },
+            secrets: store,
+            finish: { field.finishRead($0, ssid: edit.configured, notice: $1) }
+        )
+
+        XCTAssertEqual(password, "new")
+        XCTAssertEqual(edit.reads, ["Phone", "Other Phone"])
+        keychain.release()
+        try await store.save("new")
+        XCTAssertFalse(keychain.gaveUp)
+        XCTAssertNil(try keychain.get(service: KeychainStore.service, account: "Phone"), "the second read changed the account a save moves from")
+        XCTAssertEqual(try keychain.get(service: KeychainStore.service, account: "Other Phone"), "new")
+    }
+
+    /// The SSID is edited during the load and edited back during the read
+    /// that followed. The field gets the password of the SSID configured
+    /// in the end.
+    @MainActor
+    func testAnSSIDEditedBackDuringTheSecondReadIsReadAgain() async {
+        let edit = SSIDEdits(["Other Phone", "Phone"])
+        let keychain = BlockingKeychain(items: ["\(KeychainStore.service)/Phone": "old", "\(KeychainStore.service)/Other Phone": "new"])
+        let store = KeychainHotspotSecretStore(keychain: keychain, queue: KeychainQueue()) { edit.readAndEdit() }
+        var field = HotspotPasswordField()
+
+        let password = await SettingsView.readForField(
+            field.startRead(ssid: edit.configured),
+            first: { await SettingsView.loadedPassword(store.load) },
+            secrets: store,
+            finish: { field.finishRead($0, ssid: edit.configured, notice: $1) }
+        )
+
+        XCTAssertEqual(password, "old")
+        XCTAssertEqual(edit.reads, ["Phone", "Other Phone", "Phone"])
+    }
+
+    /// The failover reported the old SSID's password unreadable, and the
+    /// SSID was edited before the recheck answered. The report is about
+    /// the old SSID, so the notice comes from a read of the new one.
+    @MainActor
+    func testARecheckForAnSSIDEditedAwayTakesItsNoticeFromTheNewSSID() async {
+        let edit = SSIDEdits([])
+        let keychain = BlockingKeychain(items: ["\(KeychainStore.service)/Other Phone": "new"])
+        let store = KeychainHotspotSecretStore(keychain: keychain, queue: KeychainQueue()) { edit.readAndEdit() }
+        var field = HotspotPasswordField()
+
+        _ = await SettingsView.readForField(
+            field.startRead(ssid: edit.configured),
+            first: {
+                edit.configured = "Other Phone"
+                return ("", await SettingsView.hotspotNotice(reported: .unreadable, reread: store.peek))
+            },
+            secrets: store,
+            finish: { field.finishRead($0, ssid: edit.configured, notice: $1) }
+        )
+
+        XCTAssertNil(field.notice)
+        XCTAssertEqual(edit.reads, ["Other Phone"])
     }
 
     /// Only a save or clear that stored for the SSID configured now counts
@@ -280,13 +364,32 @@ final class HotspotPasswordFieldTests: XCTestCase {
         var field = HotspotPasswordField()
         let first = field.startRead(ssid: "Phone")
         let second = field.startRead(ssid: "Phone")
-        XCTAssertTrue(field.finishRead(second, ssid: "Phone", notice: "second"))
-        XCTAssertFalse(field.finishRead(first, ssid: "Phone", notice: "first"))
+        XCTAssertEqual(field.finishRead(second, ssid: "Phone", notice: "second"), .used)
+        XCTAssertEqual(field.finishRead(first, ssid: "Phone", notice: "first"), .dropped)
         XCTAssertEqual(field.notice, "second")
 
         _ = field.startSave()
         field.finishSave(stored)
         XCTAssertNil(field.notice)
+    }
+}
+
+/// The configured SSID for `KeychainHotspotSecretStore`, which asks for
+/// it once per keychain read. Each ask records the SSID and then applies
+/// the next edit, as if the user typed it while the read waited.
+@MainActor
+private final class SSIDEdits {
+    var configured = "Phone"
+    private(set) var reads: [String] = []
+    private var edits: [String]
+
+    init(_ edits: [String]) { self.edits = edits }
+
+    func readAndEdit() -> String {
+        let read = configured
+        reads.append(read)
+        if !edits.isEmpty { configured = edits.removeFirst() }
+        return read
     }
 }
 

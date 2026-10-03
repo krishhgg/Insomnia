@@ -47,8 +47,12 @@ struct SettingsView: View {
         .onChange(of: manager.services?.status.hotspotPasswordProblem) { _, problem in
             let request = hotspot.startRead(ssid: manager.config.hotspotSSID)
             Task {
-                let notice = await Self.hotspotNotice(reported: problem, reread: secrets.peek)
-                _ = hotspot.finishRead(request, ssid: manager.config.hotspotSSID, notice: notice)
+                _ = await Self.readForField(
+                    request,
+                    first: { ("", await Self.hotspotNotice(reported: problem, reread: secrets.peek)) },
+                    secrets: secrets,
+                    finish: { hotspot.finishRead($0, ssid: manager.config.hotspotSSID, notice: $1) }
+                )
             }
         }
         // The preview depends on the toggle, both lists and what is running:
@@ -291,13 +295,47 @@ struct SettingsView: View {
     /// leaves the field empty and says why, so the user re-enters it;
     /// saving then replaces the item (see `KeychainStore`). The read can
     /// wait behind a save, so anything typed meanwhile is kept, and a
-    /// password read for an SSID edited away meanwhile is not shown.
+    /// password read for an SSID edited away meanwhile is not shown: the
+    /// SSID configured now is read instead (`readForField`).
     private func loadPassword() {
         let request = hotspot.startRead(ssid: manager.config.hotspotSSID)
         Task {
-            let loaded = await Self.loadedPassword(secrets.load)
-            guard hotspot.finishRead(request, ssid: manager.config.hotspotSSID, notice: loaded.notice) else { return }
-            if hotspotPassword.isEmpty { hotspotPassword = loaded.password }
+            let password = await Self.readForField(
+                request,
+                first: { await Self.loadedPassword(secrets.load) },
+                secrets: secrets,
+                finish: { hotspot.finishRead($0, ssid: manager.config.hotspotSSID, notice: $1) }
+            )
+            if let password, hotspotPassword.isEmpty { hotspotPassword = password }
+        }
+    }
+
+    /// Runs a load or recheck for the field: `first` reads, and `finish`
+    /// takes the notice. While the SSID was edited during the read,
+    /// `finish` drops the answer, and the SSID configured now is read
+    /// again. That read is a peek: the account a later save moves the
+    /// password from stays the one the window loaded, as it does for any
+    /// SSID edit, so the old SSID's item is still removed. Returns the
+    /// password of the read whose notice was used, or nil if a newer read,
+    /// save or clear took over.
+    static func readForField(
+        _ request: HotspotPasswordField.Read,
+        first: @MainActor () async -> (password: String, notice: String?),
+        secrets: any HotspotSecretStore,
+        finish: @MainActor (HotspotPasswordField.Read, String?) -> HotspotPasswordField.ReadAnswer
+    ) async -> String? {
+        var loaded = await first()
+        var request = request
+        while true {
+            switch finish(request, loaded.notice) {
+            case .used:
+                return loaded.password
+            case .dropped:
+                return nil
+            case let .readAgain(next):
+                request = next
+                loaded = await loadedPassword(secrets.peek)
+            }
         }
     }
 

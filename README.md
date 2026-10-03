@@ -257,9 +257,11 @@ the login keychain. If that save is cut off after the old item is gone,
 the password reads as missing and you enter it once more: Insomnia never
 reads a half-finished save's copy. The Save button reads "Saving…" until
 macOS answers, and "Saved" only while the SSID and password fields still
-hold what was saved. A join or a Settings read that was waiting while you
-changed the SSID is dropped; the next retry uses the new SSID. The rest of Insomnia, including the battery floor and End, keeps
-running while the dialog is open. A build signed with a stable identity would keep
+hold what was saved. A join that was waiting while you changed the SSID is
+dropped, and the next retry uses the new SSID. A Settings read that was
+waiting is dropped too, and Settings reads the new SSID's password instead.
+The rest of Insomnia, including the battery floor and End, keeps running
+while the dialog is open. A build signed with a stable identity would keep
 the item readable across upgrades.
 
 macOS requires Location Services permission to reveal network names. Insomnia
