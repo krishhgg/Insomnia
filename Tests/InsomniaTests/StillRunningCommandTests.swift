@@ -939,4 +939,126 @@ final class StillRunningCommandTests: XCTestCase {
         XCTAssertEqual(h.display.brightness, 0.6)
         XCTAssertNil(try h.store.loadState()?.displayRestoredUnderLowPower)
     }
+
+    // MARK: A late undo whose journal entry cannot be cleared
+
+    /// Rename over an immutable state.json is refused, so no journal write
+    /// lands; the file still reads.
+    private func lockJournal(_ locked: Bool) throws {
+        let file = h.home.paths.stateFile.path
+        if locked { addTeardownBlock { try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: file) } }
+        try FileManager.default.setAttributes([.immutable: locked], ofItemAtPath: file)
+    }
+
+    /// A `lowpowermode 0` left running exits 0, and the write that would
+    /// clear its entry fails. The command's line goes with the exit; the
+    /// menu says instead that the entry stays and is retried. The check
+    /// that follows cannot read the mode here, which it only logs, so that
+    /// line stays in the menu. Once the journal takes writes and the mode
+    /// reads again, the retried check switches the mode off and clears the
+    /// entry.
+    func testLateSwitchOffWhoseClearFailsIsShownInTheMenu() async throws {
+        let m = h.makeManager(retryDelay: 0.2)
+        m.resyncAfterCommand = { _ in }
+        try await startWithRollbackLeftRunning(m)
+        let before = h.guardFake.calls
+        try lockJournal(true)
+        h.guardFake.throwOn = ["pmset -g custom"]
+
+        h.guardFake.exitStuckCommands()
+
+        await waitUntil("the lock never went with the exit") { m.unfinishedCommand == nil }
+        XCTAssertNil(m.commandWarning)
+        let error = try XCTUnwrap(m.lastError, "the failed clear left the menu silent")
+        XCTAssertTrue(error.hasPrefix("low power mode switched off (`/usr/bin/sudo -n /usr/bin/pmset lowpowermode 0` (pid 4242) exited 0) but the journal entry could not be cleared"), error)
+        XCTAssertTrue(error.hasSuffix("it will be retried"), error)
+        XCTAssertEqual(try h.store.loadState()?.lowPowerSetByUs, true)
+        XCTAssertFalse(h.guardFake.lowPowerOn)
+        try await Task.sleep(for: .milliseconds(500))
+        XCTAssertEqual(m.lastError, error, "a retried check that only logs took the line away")
+
+        try lockJournal(false)
+        h.guardFake.throwOn = []
+        await waitUntil("the retried check never cleared the entry") { (try? self.h.store.loadState()?.lowPowerSetByUs) == false }
+        let after = Array(h.guardFake.calls.dropFirst(before.count))
+        XCTAssertEqual(after.filter { $0 != "pmset -g custom" }, ["lowpowermode 0"], "the switch-off the retried check confirms with")
+        XCTAssertEqual(after.suffix(2), ["pmset -g custom", "lowpowermode 0"])
+        XCTAssertFalse(try lockIsHeld())
+    }
+
+    /// The rollback exits 1, so the check runs its own `lowpowermode 0`;
+    /// that exits 0 and its clear fails. The menu says so.
+    func testCheckWhoseClearFailsIsShownInTheMenu() async throws {
+        let m = h.makeManager()
+        m.resyncAfterCommand = { _ in }
+        try await startWithRollbackLeftRunning(m)
+        let before = h.guardFake.calls
+        try lockJournal(true)
+
+        exitTheRollback()
+
+        await waitUntil("the check never ran") { h.guardFake.calls.count == before.count + 2 && m.unfinishedCommand == nil }
+        await waitUntil("the failed clear left the menu silent") { m.lastError?.hasPrefix("low power mode confirmed off after the power command but the journal entry could not be cleared") == true }
+        XCTAssertEqual(Array(h.guardFake.calls.dropFirst(before.count)), ["pmset -g custom", "lowpowermode 0"])
+        XCTAssertEqual(try h.store.loadState()?.lowPowerSetByUs, true)
+        XCTAssertNil(m.commandWarning)
+    }
+
+    /// An end's `disablesleep 0` left running exits 0, and the clear fails.
+    /// The command's line goes with the exit and the menu says the entry
+    /// stays. The retried end runs the undo again (held at the fake's gate
+    /// while the menu is read), and finishes once the journal takes writes.
+    func testLateUndoOfAnEndWhoseClearFailsIsShownAndRunAgain() async throws {
+        let m = h.makeManager()
+        await m.start(duration: 3600)
+        let before = h.guardFake.calls
+        h.guardFake.stillRunning = ["disablesleep 0"]
+        _ = await m.end(reason: .user)
+        XCTAssertEqual(m.pendingEnd, .user)
+        // The stuck call never reached the gate; the retry's waits there.
+        let gate = AsyncGate()
+        h.guardFake.restoreGate = gate
+        try lockJournal(true)
+
+        h.guardFake.stillRunning = []
+        h.guardFake.exitStuckCommands()
+
+        await gate.waitUntilStarted()
+        XCTAssertNil(m.commandWarning)
+        let error = try XCTUnwrap(m.lastError, "the failed clear left the menu silent")
+        XCTAssertTrue(error.hasPrefix("sleep restored (`/usr/bin/sudo -n /usr/bin/pmset disablesleep 0` (pid 4242) exited 0) but the journal entry could not be cleared"), error)
+        XCTAssertTrue(error.hasSuffix("it will be retried"), error)
+        XCTAssertEqual(try h.store.loadState()?.sleepDisabledByUs, true)
+
+        try lockJournal(false)
+        await gate.open()
+        await waitUntil("the retried end never finished") { m.pendingEnd == nil && (try? self.h.store.loadState()) == RuntimeState.clean }
+        XCTAssertEqual(h.guardFake.calls, before + ["disablesleep 0", "disablesleep 0"], "the unconfirmed undo was not run again")
+        XCTAssertFalse(try lockIsHeld())
+    }
+
+    /// A `lowpowermode 0` left running exits 0 while state.json does not
+    /// decode: nothing is cleared or overwritten, and the menu says the
+    /// entry could not be cleared. No session, so no check runs after.
+    func testLateSwitchOffOnAnUnreadableJournalIsShownInTheMenu() async throws {
+        var st = RuntimeState.clean
+        st.lowPowerSetByUs = true
+        try h.store.saveState(st)
+        h.guardFake.lowPowerOn = true
+        let m = h.makeManager()
+        h.guardFake.stillRunning = ["lowpowermode 0"]
+        _ = await m.setLowPower(false)
+        XCTAssertEqual(m.unfinishedCommand?.pid, 4242)
+        let broken = Data("{ not json".utf8)
+        try broken.write(to: h.home.paths.stateFile)
+
+        h.guardFake.stillRunning = []
+        h.guardFake.exitStuckCommands()
+
+        await waitUntil("the lock never went with the exit") { m.unfinishedCommand == nil }
+        let error = try XCTUnwrap(m.lastError, "the unreadable journal left the menu silent")
+        XCTAssertTrue(error.hasPrefix("`/usr/bin/sudo -n /usr/bin/pmset lowpowermode 0` (pid 4242) exited 0, but the journal could not be read to clear its entry"), error)
+        XCTAssertEqual(try Data(contentsOf: h.home.paths.stateFile), broken, "an unreadable journal was overwritten")
+        XCTAssertFalse(try lockIsHeld())
+    }
 }

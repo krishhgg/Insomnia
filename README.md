@@ -242,7 +242,8 @@ installation scenarios still need [release validation](docs/release-validation.m
   exits, Insomnia refuses to quit or start a session, and records any end
   or lid event it refuses. A `disablesleep 0` or `lowpowermode 0` that
   exits 0 counts as done: its journal entry is cleared before the lock is
-  released, and the command is not run again. Any other exit counts as a
+  released, and the command is not run again. If that journal write fails,
+  the menu says so and the undo runs again. Any other exit counts as a
   failure. Then a pending end runs again. Otherwise Insomnia reads Low
   Power Mode. If it reads off, Insomnia runs its own `lowpowermode 0` and
   forgets the mode only once that succeeds. Then it replays a refused lid

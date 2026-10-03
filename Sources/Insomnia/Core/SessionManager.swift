@@ -513,22 +513,41 @@ final class SessionManager {
     /// retry would run the same command again, and one that is as slow
     /// every time would be reported as left running every time and never
     /// confirmed. The journal is read from disk first, as by a transaction.
-    /// If it cannot be read or written, the entry stays and the retry runs
-    /// the undo again.
+    /// If it cannot be read or written, the entry stays, the retry runs the
+    /// undo again, and the menu says so (`clearUndone`) in place of the
+    /// command's line, which goes with the exit.
     private func confirmUndo(_ undo: PendingUndo, by command: UnfinishedCommand) {
         do {
             try loadJournal()
-            switch undo {
-            case .sleepRestored:
-                try journal { $0.sleepDisabledByUs = false }
-                Log.info("sleep restored: \(command.description) exited 0")
-            case .lowPowerOff:
-                try journal { $0.lowPowerSetByUs = false }
-                Log.info("low power mode off: \(command.description) exited 0")
-                settleDisplayAfterLowPower()
-            }
         } catch {
-            Log.error("\(command.description) exited 0, but the journal could not be read or updated; the entry stays and the undo runs again: \(error.localizedDescription)")
+            fail("\(command.description) exited 0, but the journal could not be read to clear its entry: \(error.localizedDescription); it will be retried")
+            return
+        }
+        switch undo {
+        case .sleepRestored:
+            guard clearUndone("sleep restored (\(command.description) exited 0)", { $0.sleepDisabledByUs = false }) else { return }
+            Log.info("sleep restored: \(command.description) exited 0")
+        case .lowPowerOff:
+            guard clearUndone("low power mode switched off (\(command.description) exited 0)", { $0.lowPowerSetByUs = false }) else { return }
+            Log.info("low power mode off: \(command.description) exited 0")
+            settleDisplayAfterLowPower()
+        }
+    }
+
+    /// Clear the journal entry of an undo that has been confirmed (the
+    /// pmset command exited 0, the pid resumed, the audio or brightness
+    /// written), and say whether it was cleared. A write that fails leaves
+    /// the entry, so the undo is retried, and is shown in the menu as well
+    /// as logged: until it is cleared, the journal still claims a change
+    /// that has been undone.
+    @discardableResult
+    private func clearUndone(_ what: String, _ mutate: (inout RuntimeState) -> Void) -> Bool {
+        do {
+            try journal(mutate)
+            return true
+        } catch {
+            fail("\(what) but the journal entry could not be cleared: \(error.localizedDescription); it will be retried")
+            return false
         }
     }
 
@@ -678,12 +697,7 @@ final class SessionManager {
             Log.error("low power mode reads off after the power command, but lowpowermode 0 failed; ownership kept in the journal and checked again in \(Int(recoveryRetryDelay)) s: \(error.localizedDescription)")
             return false
         }
-        do {
-            try journal { $0.lowPowerSetByUs = false }
-        } catch {
-            Log.error("low power mode confirmed off after the power command, but the journal could not be updated; checked again in \(Int(recoveryRetryDelay)) s: \(error.localizedDescription)")
-            return false
-        }
+        guard clearUndone("low power mode confirmed off after the power command", { $0.lowPowerSetByUs = false }) else { return false }
         Log.info("low power mode confirmed off after the power command; ownership cleared from the journal")
         settleDisplayAfterLowPower()
         return true
@@ -1112,7 +1126,7 @@ final class SessionManager {
                 fail("could not enable low power mode: \(error.localizedDescription)")
                 do {
                     try await sleepGuard.setLowPowerMode(false)
-                    try? journal { $0.lowPowerSetByUs = false }
+                    clearUndone("low power mode switched off after the failed enable") { $0.lowPowerSetByUs = false }
                 } catch let still as CommandStillRunningError {
                     // The rollback itself is left running, and the lock
                     // stays with it. Ownership stays journaled until it has
@@ -1138,7 +1152,7 @@ final class SessionManager {
             dropDisplayWriteIfMoved()
             do {
                 try await sleepGuard.setLowPowerMode(false)
-                try? journal { $0.lowPowerSetByUs = false }
+                clearUndone("low power mode switched off") { $0.lowPowerSetByUs = false }
                 Log.info("low power mode off")
                 settleDisplayAfterLowPower()
                 return true
@@ -1169,8 +1183,10 @@ final class SessionManager {
     /// transaction's lock. Each undo is journaled as soon as it succeeds,
     /// through the live journal rather than a copy, so a write that lands
     /// while pmset is running (a lid-close freeze, say) is never overwritten.
-    /// Failures are logged and the entry is left set so the next end,
-    /// reconcile or the backstop retries it.
+    /// Failures, a journal entry that could not be cleared after its undo
+    /// included (`clearUndone`), are logged and shown in the menu, and the
+    /// entry is left set so the next end, reconcile or the backstop
+    /// retries it.
     ///
     /// A `sudo pmset` that does not stop on SIGTERM ends the restore right
     /// there, as stop_transaction does in backstop.sh: no later undo runs
@@ -1181,7 +1197,7 @@ final class SessionManager {
         if state.sleepDisabledByUs {
             do {
                 try await sleepGuard.setSleepDisabled(false)
-                try? journal { $0.sleepDisabledByUs = false }
+                clearUndone("sleep restored") { $0.sleepDisabledByUs = false }
                 Log.info("sleep restored")
             } catch let still as CommandStillRunningError {
                 stopTransaction(for: still, thenEnd: nil, undoes: .sleepRestored)
@@ -1196,7 +1212,7 @@ final class SessionManager {
             dropDisplayWriteIfMoved()
             do {
                 try await sleepGuard.setLowPowerMode(false)
-                try? journal { $0.lowPowerSetByUs = false }
+                clearUndone("low power mode cleared") { $0.lowPowerSetByUs = false }
                 Log.info("low power mode cleared")
                 lowPowerJustCleared = true
             } catch let still as CommandStillRunningError {
@@ -1304,7 +1320,7 @@ final class SessionManager {
             // Only entries that still need a retry, or that a person has to
             // look at, stay journaled. Gone and resumed entries are done.
             let keep = Set(report.failed + report.unverifiable + report.unobserved)
-            try? journal { s in
+            clearUndone("frozen processes resumed") { s in
                 s.frozenProcesses.removeAll { !keep.contains($0.pid) }
                 // Docker Desktop is frozen via its pids too; the flag is only a marker.
                 if s.frozenProcesses.isEmpty { s.dockerFrozen = false }
@@ -1321,7 +1337,7 @@ final class SessionManager {
                 fail("pid(s) \(list) are stopped but journaled without identity, so Insomnia cannot prove it froze them and will not resume them. Either an older build recorded the pid alone, or a freeze stopped the pid and Insomnia quit, crashed or failed to write before the stop was confirmed in the journal. Check each one first, for example `ps -o pid,stat,lstart,command -p <pid>`, and only if it is a process you expected Insomnia to freeze run `kill -CONT <pid>`; the entry stays in the journal until resumed or gone")
             }
         } else if state.dockerFrozen {
-            try? journal { $0.dockerFrozen = false }
+            clearUndone("Docker Desktop has no frozen process left") { $0.dockerFrozen = false }
         }
 
         if state.savedOutputVolume != nil || state.savedMuted != nil {
@@ -1331,7 +1347,7 @@ final class SessionManager {
                 let muted = state.savedMuted ?? current.muted
                 try audio.apply(volume: volume, muted: muted)
                 Log.info("audio restored (volume \(volume), muted \(muted))")
-                try? journal { s in
+                clearUndone("audio restored") { s in
                     s.savedOutputVolume = nil
                     s.savedMuted = nil
                 }
@@ -1358,13 +1374,9 @@ final class SessionManager {
                 // Written under our Low Power Mode: written again once the
                 // mode is off, since the mode's end rescales the panel.
                 let underLowPower = state.lowPowerSetByUs
-                do {
-                    try journal { s in
-                        s.savedDisplayBrightness = nil
-                        s.displayRestoredUnderLowPower = underLowPower ? saved : nil
-                    }
-                } catch {
-                    fail("display brightness restored but the journal entry could not be cleared: \(error.localizedDescription); it will be retried")
+                clearUndone("display brightness restored") { s in
+                    s.savedDisplayBrightness = nil
+                    s.displayRestoredUnderLowPower = underLowPower ? saved : nil
                 }
             } catch {
                 fail("could not restore display brightness: \(error.localizedDescription)")
@@ -1375,11 +1387,7 @@ final class SessionManager {
                 try keyboard.setBrightness(saved)
                 Log.info("keyboard backlight restored (brightness \(saved))")
                 restoredKeyboard = saved
-                do {
-                    try journal { $0.savedKeyboardBrightness = nil }
-                } catch {
-                    fail("keyboard backlight restored but the journal entry could not be cleared: \(error.localizedDescription); it will be retried")
-                }
+                clearUndone("keyboard backlight restored") { $0.savedKeyboardBrightness = nil }
             } catch {
                 fail("could not restore keyboard backlight: \(error.localizedDescription)")
             }

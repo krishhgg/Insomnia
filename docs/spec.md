@@ -493,8 +493,10 @@ Backstop, independent of the app:
   lid open refused meanwhile is recorded at the refusal. An undo
   (`disablesleep 0`, `lowpowermode 0`) that exits 0 is confirmed: its
   entry is cleared under the lock before the lock is released, and a
-  display write owed for the end of the mode is done then. Any other exit
-  confirms nothing. When the command exits the app retries a pending end.
+  display write owed for the end of the mode is done then. If the journal
+  cannot be read or written then, the entry stays, the undo runs again,
+  and the menu says so. Any other exit confirms nothing. When the command
+  exits the app retries a pending end.
   Otherwise it reads Low Power Mode under the lock. A mode that reads on
   stays journaled as Insomnia's. A mode that reads off is switched off
   once more with the app's own `lowpowermode 0`, and the ownership is
@@ -509,6 +511,8 @@ Backstop, independent of the app:
   mode, switch the mode off, or write the journal runs again after the
   retry delay while the session lasts.
 - Successful restores may clear their entries; failures must stay journaled.
+  A journal write that fails to clear the entry of a successful restore is
+  shown in the menu as well as logged, and the restore is retried.
   Process recovery must verify identity and avoid resuming a process that
   Insomnia did not stop. Old PID-only entries need conservative handling.
 - The shell does not restore CoreAudio settings. Saved audio must remain in
