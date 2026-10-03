@@ -34,6 +34,9 @@ CODESIGN=/usr/bin/codesign
 SWIFT=/usr/bin/swift
 LOCKF=/usr/bin/lockf
 MV=/bin/mv
+RM=/bin/rm
+RMDIR=/bin/rmdir
+MKTEMP=/usr/bin/mktemp
 LOCK_TIMEOUT_SECONDS=10
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -101,10 +104,10 @@ pmset_rule_effective() {
 }
 
 cleanup() {
-  if [[ -n "$TMP_SUDOERS" ]]; then rm -f "$TMP_SUDOERS"; fi
-  if [[ -n "$CANDIDATE" ]]; then rm -f "$CANDIDATE"; fi
-  if [[ -n "$CANDIDATE_DIR" ]]; then rmdir "$CANDIDATE_DIR" 2>/dev/null || true; fi
-  if [[ -n "$STAGE" ]]; then rm -rf "$STAGE"; fi
+  if [[ -n "$TMP_SUDOERS" ]]; then "$RM" -f "$TMP_SUDOERS"; fi
+  if [[ -n "$CANDIDATE" ]]; then "$RM" -f "$CANDIDATE"; fi
+  if [[ -n "$CANDIDATE_DIR" ]]; then "$RMDIR" "$CANDIDATE_DIR" 2>/dev/null || true; fi
+  if [[ -n "$STAGE" ]]; then "$RM" -rf "$STAGE"; fi
 }
 trap cleanup EXIT
 
@@ -132,7 +135,7 @@ BIN="$("$SWIFT" build -c release ${BUILD_FLAGS[@]+"${BUILD_FLAGS[@]}"} --show-bi
 #    effective, the running app is not asked to quit and neither the bundle
 #    (backstop.sh included) nor the LaunchAgent are touched.
 step "Writing $SUDOERS (requires your password once)"
-TMP_SUDOERS="$(mktemp)"
+TMP_SUDOERS="$("$MKTEMP")"
 cat > "$TMP_SUDOERS" <<SUDO
 # Installed by Insomnia install.sh. Exactly four commands, nothing else.
 $USER ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 1
@@ -178,7 +181,7 @@ if "$PGREP" -x Insomnia >/dev/null 2>&1; then
   fi
 fi
 mkdir -p "$APP_DIR"
-STAGE="$(mktemp -d "$APP_DIR/.Insomnia.app.staging.$$.XXXXXX")"
+STAGE="$("$MKTEMP" -d "$APP_DIR/.Insomnia.app.staging.$$.XXXXXX")"
 NEW_APP="$STAGE/Insomnia.app"
 mkdir -p "$NEW_APP/Contents/MacOS"
 cp "$BIN" "$NEW_APP/Contents/MacOS/Insomnia"
@@ -297,7 +300,7 @@ for dir in "$APP_DIR"/.Insomnia.app.staging.*; do
   if "$KILL" -0 "${BASH_REMATCH[1]}" 2>/dev/null; then
     continue
   fi
-  rm -rf "$dir"
+  "$RM" -rf "$dir"
 done
 
 # True when the plist on disk, the one launchd loads at the next login, pins
@@ -463,7 +466,7 @@ FAIL
   else
     # $APP is what the plist pins (the interrupted run got as far as
     # publishing it), or nothing pins either: the set-aside copy is spare.
-    rm -rf "$PREVIOUS_APP"
+    "$RM" -rf "$PREVIOUS_APP"
     echo "removed the bundle an interrupted run had set aside; $APP stays"
   fi
 fi
@@ -494,7 +497,7 @@ CANDIDATE="$CANDIDATE_DIR/$LABEL.candidate-$$.plist"
 mkdir -p "$CANDIDATE_DIR"
 # Leftovers of earlier attempts, including an older build's candidates in
 # $LAUNCH_AGENTS itself (those make launchd's login load report an error).
-rm -f "$CANDIDATE_DIR/$LABEL.candidate-"* "$LAUNCH_AGENTS/$LABEL.candidate-"*
+"$RM" -f "$CANDIDATE_DIR/$LABEL.candidate-"* "$LAUNCH_AGENTS/$LABEL.candidate-"*
 
 before="$(loaded_state)"
 
@@ -592,7 +595,7 @@ fi
 if (( published )); then
   echo "LaunchAgent $LABEL loaded (launchctl print confirms); $PLIST published"
   if (( set_aside )); then
-    if rm -rf "$PREVIOUS_APP"; then
+    if "$RM" -rf "$PREVIOUS_APP"; then
       echo "replaced the previous $APP"
     else
       echo "replaced the previous $APP, but its copy at $PREVIOUS_APP could not be removed; the next run of this script removes it" >&2
@@ -601,7 +604,7 @@ if (( published )); then
   # Installs before this layout ran a writable copy from $APP_SUPPORT. The
   # agent just loaded runs the sealed one, so that copy goes now, not before.
   if [[ -e "$APP_SUPPORT/backstop.sh" ]]; then
-    rm -f "$APP_SUPPORT/backstop.sh"
+    "$RM" -f "$APP_SUPPORT/backstop.sh"
     echo "removed the previous install's $APP_SUPPORT/backstop.sh (the agent now runs the copy sealed in the bundle)"
   fi
 else

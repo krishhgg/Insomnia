@@ -2416,6 +2416,7 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(pinsCurrent.status, 1, pinsCurrent.stderr + pinsCurrent.stdout)
         XCTAssertEqual(try fx.installedBinaryFirstLine(), "interrupted", "$APP satisfies the plist, so it stays")
         XCTAssertEqual(try fx.contents(of: fx.appsDir), ["Insomnia.app"], "the set-aside copy is removed")
+        XCTAssertTrue(fx.calls().contains("rm -rf \(previous.path)"), "removed through $RM: \(fx.calls())")
         XCTAssertTrue(pinsCurrent.stdout.contains("removed the bundle an interrupted run had set aside"), pinsCurrent.stdout)
     }
 
@@ -2597,6 +2598,50 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(try fx.contents(of: fx.appsDir), ([live, link, "Insomnia.app"] + unlike).sorted(), "the dead run's staging is gone, the live run's stays")
         XCTAssertTrue(fx.exists(elsewhere.appendingPathComponent("Insomnia.app/Contents/MacOS/Insomnia")), "a symlink's target is never touched")
         XCTAssertTrue(fx.calls().contains("kill -0 4242") && fx.calls().contains("kill -0 4343"), "asked through $KILL: \(fx.calls())")
+    }
+
+    /// Every file install.sh removes, and every scratch file or directory
+    /// it creates, goes through RM, RMDIR and MKTEMP, the fixed-path
+    /// variables the fixture points at logging fakes: a dead run's staging
+    /// directory, an older build's candidate plist, the set-aside previous
+    /// app, the legacy writable backstop.sh, and on exit the sudoers
+    /// candidate, the candidate directory and this run's staging directory.
+    func testInstallRemovesAndCreatesFilesOnlyThroughItsFixedPathTools() throws {
+        try fx.prepareInstall()
+        try fx.writePreviousApp()
+        try "trusted".write(to: fx.plist, atomically: true, encoding: .utf8)
+        try fx.writeMarkerBackstop(at: fx.legacyBackstop, name: "legacy")
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        fx.setMode("launchctl", "loaded")
+        fx.setMode("kill.fail", "4242")   // the fake kill: 4242 is gone
+        let dead = fx.appsDir.appendingPathComponent(".Insomnia.app.staging.4242.AAAAAA")
+        try fx.writeBundle(at: dead.appendingPathComponent("Insomnia.app"), marker: "staged")
+        let olderCandidate = fx.plist.deletingLastPathComponent().appendingPathComponent("com.insomnia.backstop.candidate-1.plist")
+        try "older".write(to: olderCandidate, atomically: true, encoding: .utf8)
+        let candidateDir = fx.plist.deletingLastPathComponent().appendingPathComponent(".com.insomnia.backstop.staging")
+        let tmp = try fx.privateTmp()
+
+        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester", "TMPDIR": tmp.path])
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        let calls = fx.calls()
+        let staging = fx.appsDir.path + "/.Insomnia.app.staging."
+        XCTAssertTrue(calls.contains("mktemp"), "the sudoers candidate: \(calls)")
+        XCTAssertTrue(calls.contains { $0.hasPrefix("mktemp -d \(staging)") && $0.hasSuffix(".XXXXXX") }, "this run's staging directory: \(calls)")
+        XCTAssertTrue(calls.contains("rm -rf \(dead.path)"), "\(calls)")
+        XCTAssertTrue(calls.contains { $0.hasPrefix("rm -f ") && $0.hasSuffix(" \(olderCandidate.path)") }, "\(calls)")
+        XCTAssertTrue(calls.contains("rm -rf \(fx.appsDir.path)/.Insomnia.app.previous"), "\(calls)")
+        XCTAssertTrue(calls.contains("rm -f \(fx.legacyBackstop.path)"), "\(calls)")
+        let visudo = try XCTUnwrap(calls.first { $0.hasPrefix("sudo visudo -cf ") }, "\(calls)")
+        XCTAssertTrue(calls.contains("rm -f \(visudo.dropFirst("sudo visudo -cf ".count))"), "the sudoers candidate, on exit: \(calls)")
+        let bootstrap = try XCTUnwrap(calls.first { $0.hasPrefix("launchctl bootstrap gui/\(fx.uid) ") }, "\(calls)")
+        XCTAssertTrue(calls.contains("rm -f \(bootstrap.dropFirst("launchctl bootstrap gui/\(fx.uid) ".count))"), "the candidate, on exit: \(calls)")
+        XCTAssertTrue(calls.contains("rmdir \(candidateDir.path)"), "\(calls)")
+        XCTAssertTrue(calls.contains { $0.hasPrefix("rm -rf \(staging)") && $0 != "rm -rf \(dead.path)" }, "this run's staging directory, on exit: \(calls)")
+        XCTAssertEqual(try fx.contents(of: fx.appsDir), ["Insomnia.app"])
+        XCTAssertEqual(try fx.contents(of: fx.plist.deletingLastPathComponent()), ["com.insomnia.backstop.plist"])
+        XCTAssertFalse(fx.exists(fx.legacyBackstop))
+        XCTAssertEqual(try fx.contents(of: tmp), [], "no scratch file is left")
     }
 
     /// The new agent loads but its plist cannot be moved into place (the
@@ -3526,6 +3571,9 @@ private final class ScriptFixture {
             "CODESIGN": bin.appendingPathComponent("codesign").path,
             "SWIFT": bin.appendingPathComponent("swift").path,
             "MV": bin.appendingPathComponent("mv").path,
+            "RM": bin.appendingPathComponent("rm").path,
+            "RMDIR": bin.appendingPathComponent("rmdir").path,
+            "MKTEMP": bin.appendingPathComponent("mktemp").path,
             "LOCK_TIMEOUT_SECONDS": "1",
         ])
         try patchedInstall.write(to: install, atomically: true, encoding: .utf8)
@@ -3666,6 +3714,16 @@ private final class ScriptFixture {
         fi
         exec /bin/mv "$@"
         """)
+        // rm, rmdir, mktemp: install.sh's RM, RMDIR and MKTEMP. Each call is
+        // logged and then made by the real tool, so a test can tell a file
+        // removed or created through the fixed-path variable from one
+        // removed or created by a bare name.
+        for (tool, real) in [("rm", "/bin/rm"), ("rmdir", "/bin/rmdir"), ("mktemp", "/usr/bin/mktemp")] {
+            try writeFake(tool, """
+            printf '\(tool)%s\\n' "${*:+ $*}" >> "\(calls)"
+            exec \(real) "$@"
+            """)
+        }
         // codesign: signing is recorded and succeeds. `-d -r-` prints a
         // fixed designated requirement the way codesign does (on stderr,
         // with the "# " an implicit requirement carries). `--verify` passes
