@@ -46,8 +46,20 @@ step() { printf '\n==> %s\n' "$*"; }
 # 1. Build -------------------------------------------------------------------
 step "Building (release)"
 cd "$ROOT"
-"$SWIFT" build -c release
-BIN="$("$SWIFT" build -c release --show-bin-path)/Insomnia"
+# INSOMNIA_LID_SIMULATION=1 compiles the scripts/simulate-lid.sh file trigger
+# (LidSimulation.swift) into this release build, for release validation on
+# a machine whose lid stays open. A normal build has no watcher: nothing
+# reads the trigger file. Such a build says so in the log at launch, in the
+# status menu and in Settings.
+BUILD_FLAGS=()
+if [[ "${INSOMNIA_LID_SIMULATION:-}" == 1 ]]; then
+  BUILD_FLAGS+=(-Xswiftc -DINSOMNIA_LID_SIMULATION)
+  echo "lid simulation compiled in (INSOMNIA_LID_SIMULATION=1): scripts/simulate-lid.sh will drive the lid actions during sessions"
+fi
+# ${arr[@]+"${arr[@]}"}: an empty array expands to nothing under set -u on
+# the bash 3.2 that ships with macOS.
+"$SWIFT" build -c release ${BUILD_FLAGS[@]+"${BUILD_FLAGS[@]}"}
+BIN="$("$SWIFT" build -c release ${BUILD_FLAGS[@]+"${BUILD_FLAGS[@]}"} --show-bin-path)/Insomnia"
 [[ -x "$BIN" ]] || { echo "binary not found at $BIN" >&2; exit 1; }
 
 # 2. sudoers -----------------------------------------------------------------
