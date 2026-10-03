@@ -16,15 +16,8 @@ struct SettingsView: View {
     @State private var newAgentBundle = ""
     @State private var newTmuxTarget = ""
     @State private var hotspotPassword = ""
-    @State private var hotspotSaved = false
-    /// A save or clear is waiting on the keychain, which may be showing a
-    /// dialog.
-    @State private var hotspotSaving = false
-    /// Bumped by every load, recheck and save, so a keychain answer that
-    /// arrives after a newer request was made does not overwrite it.
-    @State private var hotspotRequest = 0
-    /// Why the saved password could not be loaded or saved; under the field.
-    @State private var hotspotNotice: String?
+    /// Saving, what was saved, and the notice under the field.
+    @State private var hotspot = HotspotPasswordField()
     /// Names of the apps the automatic lid-close scope would freeze right
     /// now (the freeze list excluded); refreshed on appear and toggle.
     @State private var wouldFreeze: [String] = []
@@ -52,11 +45,10 @@ struct SettingsView: View {
         // The failover may find the saved password unreadable while the
         // window is open; the notice follows what it reports.
         .onChange(of: manager.services?.status.hotspotPasswordProblem) { _, problem in
-            hotspotRequest += 1
-            let request = hotspotRequest
+            let request = hotspot.startRead()
             Task {
                 let notice = await Self.hotspotNotice(reported: problem, reread: secrets.peek)
-                if request == hotspotRequest { hotspotNotice = notice }
+                _ = hotspot.finishRead(request, notice: notice)
             }
         }
         // The preview depends on the toggle, both lists and what is running:
@@ -239,11 +231,11 @@ struct SettingsView: View {
             HStack {
                 SecureField("Hotspot password", text: $hotspotPassword)
                     .onSubmit(savePassword)
-                Button(hotspotSaving ? "Saving\u{2026}" : hotspotSaved ? "Saved" : "Save", action: savePassword)
-                    .disabled(hotspotPassword.isEmpty || hotspotSaving)
+                Button(hotspot.buttonTitle(ssid: manager.config.hotspotSSID, password: hotspotPassword), action: savePassword)
+                    .disabled(hotspotPassword.isEmpty || hotspot.saving)
             }
-            if let hotspotNotice {
-                Text(hotspotNotice).font(.caption).foregroundStyle(.orange)
+            if let notice = hotspot.notice {
+                Text(notice).font(.caption).foregroundStyle(.orange)
             }
             VStack(alignment: .leading, spacing: 2) {
                 HStack {
@@ -300,13 +292,11 @@ struct SettingsView: View {
     /// saving then replaces the item (see `KeychainStore`). The read can
     /// wait behind a save, so anything typed meanwhile is kept.
     private func loadPassword() {
-        hotspotRequest += 1
-        let request = hotspotRequest
+        let request = hotspot.startRead()
         Task {
             let loaded = await Self.loadedPassword(secrets.load)
-            guard request == hotspotRequest else { return }
+            guard hotspot.finishRead(request, notice: loaded.notice) else { return }
             if hotspotPassword.isEmpty { hotspotPassword = loaded.password }
-            hotspotNotice = loaded.notice
         }
     }
 
@@ -337,39 +327,35 @@ struct SettingsView: View {
     /// Saves, or clears for an empty field. The button shows "Saving..."
     /// until the keychain answers; one save at a time.
     private func savePassword() {
-        guard !hotspotSaving else { return }
+        guard hotspot.startSave() else { return }
         if !manager.config.hotspotSSID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             locationPermission.requestWhenInUse()
         }
-        hotspotSaving = true
-        hotspotRequest += 1
-        let request = hotspotRequest
         let password = hotspotPassword
         Task {
-            let failure = await Self.storePassword(password, in: secrets)
-            hotspotSaving = false
-            hotspotSaved = failure == nil
-            if request == hotspotRequest { hotspotNotice = failure }
-            if failure == nil { manager.services?.hotspotPasswordChanged() }
+            let outcome = await Self.storePassword(password, in: secrets)
+            hotspot.finishSave(outcome)
+            if outcome.notice == nil { manager.services?.hotspotPasswordChanged() }
         }
     }
 
     /// Saves `password`, or clears the saved one when it is empty, and
-    /// returns the notice for a failure. The store does the keychain work
-    /// on `KeychainQueue`, so a save waiting on a keychain dialog waits
-    /// there while the main actor (the battery floor, the deadline timer,
-    /// End) carries on.
-    static func storePassword(_ password: String, in secrets: any HotspotSecretStore) async -> String? {
+    /// returns what was stored under which SSID, or the notice for a
+    /// failure. The store does the keychain work on `KeychainQueue`, so a
+    /// save waiting on a keychain dialog waits there while the main actor
+    /// (the battery floor, the deadline timer, End) carries on.
+    static func storePassword(_ password: String, in secrets: any HotspotSecretStore) async -> HotspotStoreOutcome {
         do {
+            let ssid: String
             if password.isEmpty {
-                try await secrets.delete()
+                ssid = try await secrets.delete()
             } else {
-                try await secrets.save(password)
+                ssid = try await secrets.save(password)
             }
-            return nil
+            return .stored(.init(ssid: ssid, password: password))
         } catch {
             Log.error("could not save hotspot password: \(error.localizedDescription)")
-            return "Could not save the hotspot password: \(error.localizedDescription)"
+            return .failed(notice: "Could not save the hotspot password: \(error.localizedDescription)")
         }
     }
 

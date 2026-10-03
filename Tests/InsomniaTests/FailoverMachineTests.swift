@@ -249,6 +249,101 @@ final class NetworkFailoverDriverTests: XCTestCase {
         XCTAssertFalse(keychain.gaveUp)
     }
 
+    /// Wi-Fi recovers while a join's keychain read waits behind a save in
+    /// Settings. Once the save is answered the read finds the password,
+    /// but the outage is over: nothing joins, so the recovered connection
+    /// is not moved to the hotspot, and the retry the tick queued after
+    /// the join is not scheduled.
+    func testAJoinWaitingBehindABlockedSaveDoesNothingAfterWiFiRecovers() async throws {
+        let keychain = BlockingKeychain(items: ["\(KeychainStore.service)/Phone": "old"])
+        let blocked = try await outageWithAJoinBehindABlockedSave(keychain: keychain, savingFor: "Phone")
+
+        await blocked.driver.simulate(satisfied: true)
+        XCTAssertTrue(keychain.isWaiting, "Wi-Fi recovered while the save was still waiting")
+        keychain.release()
+        _ = await blocked.saving.value
+        await blocked.tick.value
+
+        XCTAssertEqual(blocked.joiner.calls, [])
+        XCTAssertNil(blocked.driver.retryTimer, "a retry was scheduled after the outage ended")
+        XCTAssertEqual(blocked.notifier.posts.map(\.title), [])
+        XCTAssertNil(blocked.driver.passwordProblem)
+        XCTAssertEqual(blocked.driver.lastGap, 30)
+        XCTAssertFalse(keychain.gaveUp)
+        blocked.driver.stop()
+    }
+
+    /// The same wait, but the read then fails: there is no password for
+    /// the hotspot. The outage is over, so nothing is reported, and the
+    /// notification is still there for the next outage.
+    func testAReadThatFailsAfterWiFiRecoveredLeavesTheNoticeForTheNextOutage() async throws {
+        let keychain = BlockingKeychain()
+        let blocked = try await outageWithAJoinBehindABlockedSave(keychain: keychain, savingFor: "Other Phone")
+
+        await blocked.driver.simulate(satisfied: true)
+        keychain.release()
+        _ = await blocked.saving.value
+        await blocked.tick.value
+
+        XCTAssertEqual(blocked.notifier.posts.map(\.title), [])
+        XCTAssertNil(blocked.driver.passwordProblem)
+        XCTAssertNil(blocked.driver.retryTimer)
+
+        await blocked.driver.simulate(satisfied: false)
+        blocked.clock.advance(30)
+        await blocked.driver.fireTimer().value
+
+        XCTAssertEqual(blocked.notifier.posts.map(\.title), ["Hotspot not joined"])
+        XCTAssertEqual(blocked.notifier.posts.map(\.body), [HotspotPasswordProblem.missing.explanation])
+        XCTAssertEqual(blocked.driver.passwordProblem, .missing)
+        XCTAssertEqual(blocked.joiner.calls, [])
+        blocked.driver.stop()
+    }
+
+    private struct BlockedJoin {
+        let driver: NetworkFailover
+        let saving: Task<HotspotStoreOutcome, Never>
+        let tick: Task<Void, Never>
+        let joiner: RecordingHotspotJoiner
+        let notifier: RecordingNotifier
+        let clock: FakeClock
+    }
+
+    /// A save for `ssid` blocked inside `keychain`, then an outage on
+    /// hotspot "Phone" whose first join has started and queued its read
+    /// behind that save.
+    private func outageWithAJoinBehindABlockedSave(keychain: BlockingKeychain, savingFor ssid: String) async throws -> BlockedJoin {
+        let queue = KeychainQueue()
+        let store = KeychainHotspotSecretStore(keychain: keychain, queue: queue) { ssid }
+        let saving = Task { await SettingsView.storePassword("new", in: store) }
+        await fulfillment(of: [keychain.entered], timeout: 5)
+
+        let joiner = RecordingHotspotJoiner()
+        let notifier = RecordingNotifier()
+        let clock = FakeClock(Date(timeIntervalSince1970: 1_800_000_000))
+        let joining = expectation(description: "the join started")
+        joining.assertForOverFulfill = false
+        var config = Config()
+        config.hotspotSSID = "Phone"
+        let n = NetworkFailover(
+            paths: home.paths,
+            keychain: keychain,
+            keychainQueue: queue,
+            hotspotJoiner: joiner,
+            notifier: notifier,
+            wifiInterface: "en0",
+            clock: { clock.now }
+        ) {
+            joining.fulfill()
+            return config
+        }
+        await n.simulate(satisfied: false)
+        clock.advance(30)
+        let tick = n.fireTimer()
+        await fulfillment(of: [joining], timeout: 5)
+        return BlockedJoin(driver: n, saving: saving, tick: tick, joiner: joiner, notifier: notifier, clock: clock)
+    }
+
     private func driver(
         keychain: FakeKeychainStore,
         joiner: RecordingHotspotJoiner,

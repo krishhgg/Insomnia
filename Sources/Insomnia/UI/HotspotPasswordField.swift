@@ -1,0 +1,85 @@
+import Foundation
+
+/// What a save or clear in Settings did: the SSID and password it stored,
+/// or the notice saying why it failed.
+enum HotspotStoreOutcome: Equatable, Sendable {
+    case stored(HotspotPasswordField.Stored)
+    case failed(notice: String)
+
+    var notice: String? {
+        if case let .failed(notice) = self { return notice }
+        return nil
+    }
+}
+
+/// The hotspot password field's state apart from the view, so the rules
+/// for which keychain answer sets the notice, and when the button reads
+/// "Saved", can be tested without a window.
+struct HotspotPasswordField: Equatable {
+    /// What a save stored. The SSID is the one the store used, read when
+    /// the save began.
+    struct Stored: Equatable, Sendable {
+        let ssid: String
+        let password: String
+    }
+
+    /// A save or clear is waiting on the keychain, which may be showing a
+    /// dialog. One at a time.
+    private(set) var saving = false
+    /// What the last successful save or clear stored; nil after a failed
+    /// one, which may have left either password.
+    private(set) var stored: Stored?
+    /// Why the saved password could not be loaded or saved; under the field.
+    private(set) var notice: String?
+    /// Bumped by every load, recheck and save answer, so an answer that
+    /// arrives after a newer one does not overwrite it.
+    private var request = 0
+
+    /// "Saved" only while both fields hold what the last save stored. An
+    /// SSID typed while the save waited, or either field edited since,
+    /// reads "Save": that SSID has no password yet.
+    func buttonTitle(ssid: String, password: String) -> String {
+        if saving { return "Saving\u{2026}" }
+        let showing = Stored(ssid: ssid.trimmingCharacters(in: .whitespacesAndNewlines), password: password)
+        return stored == showing ? "Saved" : "Save"
+    }
+
+    /// A load or recheck begins; pass the token to `finishRead`.
+    mutating func startRead() -> Int {
+        request += 1
+        return request
+    }
+
+    /// A load or recheck answered. Its notice is used unless a newer read
+    /// began or a save answered since; returns whether it was.
+    mutating func finishRead(_ token: Int, notice: String?) -> Bool {
+        guard token == request else { return false }
+        self.notice = notice
+        return true
+    }
+
+    /// A save or clear begins; false while one is still waiting.
+    mutating func startSave() -> Bool {
+        guard !saving else { return false }
+        saving = true
+        return true
+    }
+
+    /// The save answered. Its outcome always sets the notice: it is the
+    /// user's latest action. A recheck that began while it waited (the
+    /// failover's report changed) read the keychain behind it on the one
+    /// queue, so its answer arrives later and is dropped, instead of
+    /// hiding why the save failed.
+    mutating func finishSave(_ outcome: HotspotStoreOutcome) {
+        saving = false
+        request += 1
+        switch outcome {
+        case let .stored(stored):
+            self.stored = stored
+            notice = nil
+        case let .failed(notice):
+            stored = nil
+            self.notice = notice
+        }
+    }
+}

@@ -631,13 +631,17 @@ func settleQueuedRequests() async {
     for _ in 0..<5 { await Task.yield() }
 }
 
-/// A keychain whose `set` blocks its thread until `release()`, the way a
-/// save waits while macOS shows a keychain dialog. The wait gives up after
-/// `limit` so a call made on the main actor fails a test instead of hanging
-/// it; `gaveUp` says it did. Reads and deletes answer at once from memory.
+/// A keychain whose `set`, or `delete`, blocks its thread until
+/// `release()`, the way a save or a clear waits while macOS shows a
+/// keychain dialog. The wait gives up after `limit` so a call made on the
+/// main actor fails a test instead of hanging it; `gaveUp` says it did.
+/// Reads, and the call that does not block, answer at once from memory.
 final class BlockingKeychain: KeychainStoring, @unchecked Sendable {
-    /// Fulfilled once `set` is inside its wait.
-    let entered = XCTestExpectation(description: "the save is waiting")
+    enum Call { case set, delete }
+
+    /// Fulfilled once the blocking call is inside its wait.
+    let entered = XCTestExpectation(description: "the keychain call is waiting")
+    private let blocks: Call
     private let gate = DispatchSemaphore(value: 0)
     private let limit: DispatchTimeInterval
     private let lock = NSLock()
@@ -645,7 +649,8 @@ final class BlockingKeychain: KeychainStoring, @unchecked Sendable {
     private var waiting = false
     private var _gaveUp = false
 
-    init(limit: DispatchTimeInterval = .seconds(5), items: [String: String] = [:]) {
+    init(blocking blocks: Call = .set, limit: DispatchTimeInterval = .seconds(5), items: [String: String] = [:]) {
+        self.blocks = blocks
         self.limit = limit
         self.items = items
         entered.assertForOverFulfill = false
@@ -662,18 +667,23 @@ final class BlockingKeychain: KeychainStoring, @unchecked Sendable {
     }
 
     func set(service: String, account: String, value: String) throws {
+        if blocks == .set { wait() }
+        lock.withLock { items["\(service)/\(account)"] = value }
+    }
+
+    func delete(service: String, account: String) throws {
+        if blocks == .delete { wait() }
+        _ = lock.withLock { items.removeValue(forKey: "\(service)/\(account)") }
+    }
+
+    private func wait() {
         lock.withLock { waiting = true }
         entered.fulfill()
         let answered = gate.wait(timeout: .now() + limit) == .success
         lock.withLock {
             waiting = false
             if !answered { _gaveUp = true }
-            items["\(service)/\(account)"] = value
         }
-    }
-
-    func delete(service: String, account: String) throws {
-        _ = lock.withLock { items.removeValue(forKey: "\(service)/\(account)") }
     }
 }
 

@@ -352,7 +352,10 @@ provided by the standalone backstop. Performance effects depend on workload.
   one is renamed to `insomnia-hotspot`. Reads fall back to the
   `.replacing` item when the main one is missing or unreadable, so a save
   that fails or stops at any step leaves the password reads returned
-  before or the new one. A `.replacing` item the build can read, left by a
+  before or the new one. When the main item is there but unreadable, the
+  fallback looks only in the keychain that holds it, where a save puts its
+  `.replacing` item; one left in another keychain on the search list is
+  older and is not read. A `.replacing` item the build can read, left by a
   save that stopped short, is that password, so the next save changes its
   value in place and never deletes it first; one it cannot read with the
   keychain unlocked is another build's and is deleted, then added again. A
@@ -368,8 +371,16 @@ provided by the standalone backstop. Performance effects depend on workload.
   keychain prompt for as long as the user leaves it open, and the battery
   floor, the deadline timer and End keep running meanwhile; one queue also
   keeps two calls from setting the process-wide prompt switch at once. The
-  Save button reads "Saving…" until the keychain answers. A join whose
-  read waited behind a save does nothing once the session has ended.
+  Save button reads "Saving…" until the keychain answers, then "Saved"
+  only while the SSID and password fields hold what the save stored: the
+  save uses the SSID that was in the field when it began, so an SSID typed
+  during the wait has no password yet. A failed save's notice stays under
+  the field even when the failover's report changed during the wait; the
+  recheck that change started reads the keychain behind the save, and its
+  answer is dropped. A join whose read waited behind a save does nothing
+  once the session has ended or Wi-Fi has come back: no join, no retry
+  timer, no warning, so the notification stays armed for the next
+  outage.
 - macOS 26 requires Location Services permission before CoreWLAN exposes SSIDs
   or returns results for an SSID-filtered scan. Insomnia requests when-in-use
   access when the hotspot is saved or a configured session starts, never at

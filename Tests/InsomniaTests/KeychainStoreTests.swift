@@ -219,6 +219,22 @@ final class KeychainStoreTests: XCTestCase {
         XCTAssertEqual(try trusting.map { try $0.map(trustedApplicationData) }, [[me]])
     }
 
+    /// Two keychains on the search list. The first has a readable
+    /// replacement left from some other save; the second holds another
+    /// build's item and, beside it, the replacement a save just wrote.
+    /// Reads take the replacement from the item's own keychain.
+    func testReadsTakeTheReplacementFromTheItemsOwnKeychain() throws {
+        let other = try ThrowawayKeychain()
+        self.other = other
+        try KeychainStore(keychain: other.keychain, prompts: try .refusingPrompts())
+            .set(service: replacement, account: "Phone", value: "stale")
+        try addItem(account: "Phone", value: "theirs", trusting: [])
+        try store.set(service: replacement, account: "Phone", value: "fresh")
+        let both = KeychainStore(searchList: [other.keychain, throwaway.keychain], newItems: throwaway.keychain, prompts: try .refusingPrompts())
+
+        XCTAssertEqual(try both.get(service: service, account: "Phone"), "fresh")
+    }
+
     /// The lock check only reads the keychain's status.
     func testTheLockStateIsReadWithoutAPrompt() throws {
         XCTAssertFalse(try LegacyKeychain.isLocked(throwaway.keychain))
@@ -754,12 +770,15 @@ final class KeychainStoreReplaceTests: XCTestCase {
     }
 
     /// While the old build's item and the replacement are both there, the
-    /// replacement is what reads return.
+    /// replacement is what reads return, read in the item's own keychain,
+    /// which a reference lookup finds without a prompt.
     func testReadsPreferTheReplacementOverAnItemThisBuildCannotOpen() throws {
         let keychain = KeychainModel([service: .init(value: "old", ours: false), replacement: .init(value: "new", ours: true)])
 
         XCTAssertEqual(try store(keychain).get(service: service, account: "Phone"), "new")
-        XCTAssertEqual(keychain.calls, [.init(.read, service, prompts: false), .init(.read, replacement, prompts: false)])
+        XCTAssertEqual(keychain.calls, [
+            .init(.read, service, prompts: false), .init(.find, service, prompts: false), .init(.read, replacement, prompts: false),
+        ])
     }
 
     /// A replacement this build cannot open is reported as unreadable, not

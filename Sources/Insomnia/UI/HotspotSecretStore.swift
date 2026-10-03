@@ -13,8 +13,11 @@ protocol HotspotSecretStore: AnyObject, Sendable {
     /// The same read without changing that account: a check, not a load
     /// into the field.
     func peek() async throws -> String?
-    func save(_ password: String) async throws
-    func delete() async throws
+    /// Saves for the current SSID and returns that SSID, read when the
+    /// save began: one typed while it waited on the keychain is not it.
+    @discardableResult func save(_ password: String) async throws -> String
+    /// Clears the current SSID's password and returns that SSID.
+    @discardableResult func delete() async throws -> String
 }
 
 /// Login-keychain implementation. The SSID provider keeps the Keychain
@@ -49,7 +52,8 @@ final class KeychainHotspotSecretStore: HotspotSecretStore {
         try await read(currentSSID())
     }
 
-    func save(_ password: String) async throws {
+    @discardableResult
+    func save(_ password: String) async throws -> String {
         let ssid = currentSSID()
         let previous = selectedSSID
         let keychain = self.keychain
@@ -60,9 +64,11 @@ final class KeychainHotspotSecretStore: HotspotSecretStore {
             }
         }
         selectedSSID = ssid
+        return ssid
     }
 
-    func delete() async throws {
+    @discardableResult
+    func delete() async throws -> String {
         let current = currentSSID()
         let previous = selectedSSID
         let keychain = self.keychain
@@ -73,6 +79,7 @@ final class KeychainHotspotSecretStore: HotspotSecretStore {
             }
         }
         selectedSSID = current
+        return current
     }
 
     private func read(_ ssid: String) async throws -> String? {
@@ -94,6 +101,15 @@ final class InMemoryHotspotSecretStore: HotspotSecretStore {
 
     func load() async throws -> String? { password }
     func peek() async throws -> String? { password }
-    func save(_ password: String) async throws { self.password = password }
-    func delete() async throws { password = nil }
+    @discardableResult
+    func save(_ password: String) async throws -> String {
+        self.password = password
+        return ""
+    }
+
+    @discardableResult
+    func delete() async throws -> String {
+        password = nil
+        return ""
+    }
 }

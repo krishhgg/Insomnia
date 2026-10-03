@@ -477,8 +477,13 @@ struct KeychainStore: KeychainStoring, @unchecked Sendable {
             throw KeychainError(status: status)
         }
         // A save that was replacing this item stopped before the rename:
-        // the replacement holds the newer password.
-        let (replacementStatus, replacement) = try read(service: Self.replacementService(for: service), account: account)
+        // the replacement holds the newer password. A save puts it in the
+        // keychain that holds the item, so while the item is there only
+        // that keychain is read; a replacement in another keychain on the
+        // search list is left from some other save. With the item gone,
+        // its keychain is not known, and the search list is read.
+        let holder = status == errSecItemNotFound ? nil : try keychainHolding(service: service, account: account)
+        let (replacementStatus, replacement) = try read(service: Self.replacementService(for: service), account: account, in: holder)
         if replacementStatus == errSecSuccess { return replacement.map { String(decoding: $0, as: UTF8.self) } }
         if status == errSecItemNotFound {
             if replacementStatus == errSecItemNotFound { return nil }
@@ -743,6 +748,13 @@ final class NetworkFailover {
     /// Bumped by `stop()`. Work that started under an older epoch (a
     /// recovery mid-nudge) stops issuing commands as soon as it notices.
     private var epoch = 0
+    /// Bumped when an outage ends, by recovery or by `stop()`. A join, and
+    /// the retry its timer tick queued after it, belong to the outage they
+    /// started in: a join whose keychain read waited behind a save can
+    /// finish after Wi-Fi came back, and then it must not move the
+    /// recovered connection to the hotspot, report a problem, or start
+    /// another retry timer.
+    private var outage = 0
     /// Path/timer work spawned by the driver, cancelled by `stop()`.
     private var inflight: [UUID: Task<Void, Never>] = [:]
 
@@ -796,6 +808,7 @@ final class NetworkFailover {
         for task in inflight.values { task.cancel() }
         inflight.removeAll()
         epoch += 1
+        outage += 1
         machine = FailoverMachine()
         // The session is over: the menu line about the password goes with it.
         passwordProblem = nil
@@ -884,6 +897,7 @@ final class NetworkFailover {
 
     private func apply(_ outputs: [FailoverMachine.Output]) async {
         let epoch = self.epoch
+        let outage = self.outage
         for o in outputs {
             // A join or recovery above may have been awaited across stop():
             // the machine is reset by then, so the remaining outputs (a retry
@@ -892,12 +906,19 @@ final class NetworkFailover {
                 Log.info("network failover: dropping queued outputs after stop")
                 return
             }
+            // The same for a join awaited across a recovery: its retry
+            // belongs to the outage that just ended.
+            guard self.outage == outage else {
+                Log.info("network failover: dropping queued outputs after recovery")
+                return
+            }
             switch o {
             case let .scheduleRetry(after):
                 schedule(after: after)
             case .joinHotspot:
                 await joinHotspot()
             case let .recovered(start, gap):
+                self.outage += 1
                 cancelTimer()
                 notifiedThisOutage = false
                 await recovered(start: start, gap: gap)
@@ -939,6 +960,7 @@ final class NetworkFailover {
         // Off the main actor, behind any save Settings has running, which
         // may be waiting on a keychain dialog.
         let epoch = self.epoch
+        let outage = self.outage
         let keychain = self.keychain
         let read: Result<String?, any Error>
         do {
@@ -948,6 +970,10 @@ final class NetworkFailover {
         }
         guard !Task.isCancelled, self.epoch == epoch else {
             Log.info("hotspot join dropped: the session ended during the keychain read")
+            return
+        }
+        guard self.outage == outage else {
+            Log.info("hotspot join dropped: Wi-Fi recovered during the keychain read")
             return
         }
         let password: String
