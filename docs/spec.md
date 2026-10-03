@@ -91,6 +91,14 @@ recovery; newly written journals use `frozenProcesses`.
   - `/usr/bin/pmset -a disablesleep 0`
   - `/usr/bin/pmset -b lowpowermode 1`
   - `/usr/bin/pmset -b lowpowermode 0`
+- The file is one per Mac and names one account, the last to install.
+  `uninstall.sh` reads it through sudo and removes it only when every line
+  is blank, the header comment, or one of those four grants to the calling
+  account (`id -un`); a grant to another account, or any other line, keeps it with a
+  message. While Insomnia runs in another account (`ps -o uid=`), or a
+  process there named Insomnia cannot be told apart from it, `install.sh`
+  stops before the sudoers step and `uninstall.sh` before removing anything.
+  That process is named and never asked to quit or signalled.
 - Nothing else runs as root.
 
 ### 3. Lid observer

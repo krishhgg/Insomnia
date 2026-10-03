@@ -36,12 +36,14 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # Fixed tool paths: never taken from PATH or the environment. Tests patch
 # these lines in a private copy of the script.
 PGREP=/usr/bin/pgrep
+PS=/bin/ps
 OSASCRIPT=/usr/bin/osascript
 LAUNCHCTL=/bin/launchctl
 SUDO=/usr/bin/sudo
 PLUTIL=/usr/bin/plutil
 LOCKF=/usr/bin/lockf
 DEFAULTS=/usr/bin/defaults
+ID=/usr/bin/id
 DATE=/bin/date
 MKDIR=/bin/mkdir
 RM=/bin/rm
@@ -50,8 +52,8 @@ MKTEMP=/usr/bin/mktemp
 LOCK_TIMEOUT_SECONDS=10
 # How long to wait for the app to exit after asking it to quit.
 QUIT_WAIT_SECONDS=10
-# Longest one external call made by this script itself (pgrep, defaults,
-# launchctl) may run before it is stopped with SIGTERM, then SIGKILL. These
+# Longest one external call made by this script itself (pgrep, ps,
+# defaults, launchctl) may run before it is stopped with SIGTERM, then SIGKILL. These
 # are unprivileged and never touch the journal, and they run with the lock
 # descriptor closed, so a call that hangs is reported and can never keep the
 # recovery lock. backstop.sh bounds its own commands; the two sudo calls
@@ -59,6 +61,10 @@ QUIT_WAIT_SECONDS=10
 CALL_TIMEOUT_SECONDS=30
 APP="$HOME/Applications/Insomnia.app"
 SUDOERS=/etc/sudoers.d/insomnia
+BUNDLE_ID=com.kgarg.insomnia
+# The Insomnia API client, whose executable is also named Insomnia. Its
+# bundle id is the only one that proves a process is not this app.
+CLIENT_BUNDLE_ID=com.insomnia.app
 
 if [[ -n "${INSOMNIA_HOME:-}" ]]; then
   APP_SUPPORT="$INSOMNIA_HOME"
@@ -104,7 +110,8 @@ DEFAULT_AGENTS=(
   com.electron.ollama             # Ollama
 )
 LOCK="$APP_SUPPORT/.recovery.lock"
-UID_NUM="$(id -u)"
+UID_NUM="$("$ID" -u)"
+ACCOUNT="$("$ID" -un)"
 
 step() { printf '\n==> %s\n' "$*"; }
 
@@ -525,32 +532,180 @@ MSG
   exit 1
 }
 
-# A pgrep that does not answer in time counts as "running": fail closed.
-app_running() {
-  local rc=0
+# Running copies of this app, in this account or any other. `pgrep -x
+# Insomnia` matches every process named Insomnia, and the Insomnia API
+# client's executable has that name too, so each pid is checked by its
+# executable path (`ps -o comm=`, the full path for an app LaunchServices
+# launched): it is this app when the path is the installed bundle's binary
+# or lies in a bundle whose Info.plist declares $BUNDLE_ID. A process whose
+# bundle id reads as $CLIENT_BUNDLE_ID is the API client and is left alone.
+# Any other bundle id proves nothing: a copy of this app with an edited
+# Info.plist would still use this account's journal. Such a process, and
+# one whose identity cannot be read (no path, a path outside any bundle, an
+# Info.plist that does not parse), might be this app, so it counts as this
+# app until it exits: it is never signalled, but nothing is replaced or
+# removed while it runs. A copy in another account (`ps -o uid=`), or a
+# process there that cannot be told apart from one, blocks as well: the
+# rule at $SUDOERS is one file for the whole Mac, and that copy may need it
+# to undo its own session. It is reported, and never asked to quit or
+# signalled; only its own account can quit it.
+APP_FOUND=()      # "pid N (path)" per running copy of this app in this account
+UNVERIFIED=()     # "pid N (path; why)" per process of this account that could not be told apart from it
+OTHER_ACCOUNT=()  # "pid N (uid U, path)" per copy, or process that could not be told apart from one, in another account
+OTHER_FOUND=()    # "pid N (path, bundle id X)" per process proven to be the API client
+BLOCKING=()       # the first three: what must be gone before files are touched
+find_insomnia() {
+  local pid pids rc owner exe bundle id desc this
+  APP_FOUND=(); UNVERIFIED=(); OTHER_ACCOUNT=(); OTHER_FOUND=(); BLOCKING=()
+  # A pgrep that does not answer in time counts as "running": fail closed.
+  rc=0
   bounded "$PGREP" -x Insomnia || rc=$?
+  pids="$BOUNDED_OUTPUT"
   if (( rc == 124 )); then
     echo "pgrep did not answer within ${CALL_TIMEOUT_SECONDS}s; treating Insomnia as running." >&2
+    UNVERIFIED+=("pgrep did not answer within ${CALL_TIMEOUT_SECONDS}s")
+    BLOCKING+=("pgrep did not answer within ${CALL_TIMEOUT_SECONDS}s")
     return 0
   fi
-  return "$rc"
+  (( rc == 0 )) || pids=""
+  for pid in $pids; do
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    rc=0
+    bounded "$PS" -o uid= -p "$pid" || rc=$?
+    owner=""
+    (( rc == 0 )) && owner="${BOUNDED_OUTPUT//[[:space:]]/}"
+    rc=0
+    bounded "$PS" -o comm= -p "$pid" || rc=$?
+    exe=""
+    (( rc == 0 )) && exe="$BOUNDED_OUTPUT"
+    id=""
+    desc="${exe:-executable path unknown}"   # what the messages say; gains the reason when unverified
+    if [[ "$exe" == /*/Contents/MacOS/* ]]; then
+      bundle="${exe%/Contents/MacOS/*}"
+      # Bounded like every other call here: this check also runs under the
+      # recovery lock, and an Info.plist on a stalled volume must not hold it.
+      rc=0
+      bounded "$PLUTIL" -extract CFBundleIdentifier raw -o - "$bundle/Contents/Info.plist" || rc=$?
+      (( rc == 0 )) && id="${BOUNDED_OUTPUT%%$'\n'*}"
+      if (( rc == 124 )); then
+        desc="$exe; $bundle/Contents/Info.plist did not answer within ${CALL_TIMEOUT_SECONDS}s"
+      elif [[ -z "$id" ]]; then
+        desc="$exe; no bundle id readable from $bundle/Contents/Info.plist"
+      fi
+    elif [[ -n "$exe" ]]; then
+      desc="$exe; not inside an app bundle, so no bundle id to read"
+    fi
+    if [[ "$exe" == "$APP/Contents/MacOS/Insomnia" || "$id" == "$BUNDLE_ID" ]]; then
+      this=1
+    elif [[ "$id" == "$CLIENT_BUNDLE_ID" ]]; then
+      OTHER_FOUND+=("pid $pid ($exe, bundle id $id)")
+      continue
+    else
+      this=0
+      if [[ -n "$id" ]]; then desc="$exe; bundle id $id is neither this app's nor the Insomnia API client's"; fi
+    fi
+    # No uid (the process just exited, or ps failed) is not proof of
+    # another account; such a pid is judged as one of this account's.
+    if [[ -n "$owner" && "$owner" != "$UID_NUM" ]]; then
+      OTHER_ACCOUNT+=("pid $pid (uid $owner, $desc)")
+      BLOCKING+=("pid $pid (uid $owner, $desc)")
+    elif (( this == 1 )); then
+      APP_FOUND+=("pid $pid ($exe)")
+      BLOCKING+=("pid $pid ($exe)")
+    else
+      UNVERIFIED+=("pid $pid ($desc)")
+      BLOCKING+=("pid $pid ($desc)")
+    fi
+  done
+}
+app_running() {
+  find_insomnia
+  (( ${#BLOCKING[@]} > 0 ))
+}
+# Comma-separated list, for messages. Call only with at least one argument:
+# bash 3.2 (/bin/bash) treats an empty array as unbound under `set -u`.
+list() { local IFS=', '; echo "$*"; }
+report_others() {
+  (( ${#OTHER_FOUND[@]} > 0 )) || return 0
+  echo "Ignoring ${#OTHER_FOUND[@]} process(es) named Insomnia that are not this app: $(list "${OTHER_FOUND[@]}")."
+}
+report_unverified() {
+  (( ${#UNVERIFIED[@]} > 0 )) || return 0
+  echo "Cannot tell whether ${#UNVERIFIED[@]} process(es) named Insomnia are this app, so they count as it until they exit: $(list "${UNVERIFIED[@]}")."
+}
+# /etc/sudoers.d/insomnia is one file for the whole Mac, and each install
+# writes its own account into it. When another account installed Insomnia
+# after this one, the file holds that account's rule, and removing it would
+# leave that account's app and agent unable to undo a session. So the file
+# goes only when it is the rule install.sh writes for this account: its
+# header comment and grants of Insomnia's pmset commands to $ACCOUNT, and
+# nothing else but blank lines. Lines are compared exactly. Prints why the
+# text is not that rule (starting "grants <name>" when it grants those
+# commands to another account), or nothing when it is.
+sudoers_not_ours() { # file content
+  local line grants=0
+  while IFS= read -r line; do
+    case "$line" in
+      "" | "# Installed by Insomnia install.sh."*) continue ;;
+    esac
+    case "${line#* }" in
+      "ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 1" | \
+      "ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0" | \
+      "ALL=(root) NOPASSWD: /usr/bin/pmset -b lowpowermode 1" | \
+      "ALL=(root) NOPASSWD: /usr/bin/pmset -b lowpowermode 0")
+        if [[ "${line%% *}" == "$ACCOUNT" ]]; then
+          grants=$((grants + 1))
+          continue
+        fi
+        echo "grants ${line%% *}"
+        return 0 ;;
+    esac
+    echo "it has a line install.sh does not write: $line"
+    return 0
+  done <<< "$1"
+  (( grants > 0 )) || echo "it grants nothing"
+  return 0
+}
+
+# Stops the run when Insomnia runs in another account. Nothing has been
+# changed by then, and nothing is sent to that process.
+stop_for_other_accounts() {
+  (( ${#OTHER_ACCOUNT[@]} > 0 )) || return 0
+  echo "Insomnia is running in another account, or a process named Insomnia there could not be told apart from it: $(list "${OTHER_ACCOUNT[@]}")." >&2
+  echo "$SUDOERS is shared by every account on this Mac and that copy may need it, so it is left alone and not asked to quit." >&2
+  echo "Quit Insomnia in that account, then rerun. Nothing was removed." >&2
+  exit 1
 }
 
 # 1. Quit the app --------------------------------------------------------------
 # Ask politely and wait. The app refuses to quit while it has unresolved
-# recovery work, and that refusal must stand: no pkill, no force.
+# recovery work, and that refusal must stand: no pkill, no force. This app
+# counts, and so does a process named Insomnia that cannot be told apart
+# from it (find_insomnia); one proven to be another app is reported and
+# left alone. A copy in another account stops the run at once.
 step "Quitting Insomnia"
 if app_running; then
-  "$OSASCRIPT" -e 'tell application id "com.kgarg.insomnia" to quit' >/dev/null 2>&1 || true
+  report_others
+  stop_for_other_accounts
+  report_unverified
+  # The quit goes only to a copy identified as this app in this account. An
+  # unverified process is waited for, but its presence alone never asks the
+  # real app to quit.
+  if (( ${#APP_FOUND[@]} > 0 )); then
+    echo "Insomnia is running ($(list "${APP_FOUND[@]}")); asking it to quit."
+    "$OSASCRIPT" -e "tell application id \"$BUNDLE_ID\" to quit" >/dev/null 2>&1 || true
+  fi
   for (( i = 0; i < QUIT_WAIT_SECONDS; i++ )); do
     app_running || break
     sleep 1
   done
   if app_running; then
-    echo "Insomnia is still running (it may be refusing to quit until its own recovery finishes)." >&2
-    echo "Let it finish or quit it from its menu, then rerun. Nothing was removed." >&2
+    echo "Insomnia is still running (it may be refusing to quit until its own recovery finishes, or a process named Insomnia could not be identified): $(list "${BLOCKING[@]}")." >&2
+    echo "Let it finish or quit it from its menu, quit any process listed as unverified, then rerun. Nothing was removed." >&2
     exit 1
   fi
+else
+  report_others
 fi
 
 # 2. Take the recovery lock and keep it to the end ---------------------------
@@ -565,7 +720,7 @@ if (( lock_rc != 0 )); then
   exit 75
 fi
 if app_running; then
-  echo "Insomnia started again; quit it and rerun. Nothing was removed." >&2
+  echo "Insomnia started again ($(list "${BLOCKING[@]}")); quit it and rerun. Nothing was removed." >&2
   exit 1
 fi
 
@@ -597,7 +752,7 @@ if (( ${#problems[@]} > 0 )); then
 fi
 echo "journal clean"
 if app_running; then
-  echo "Insomnia started again; quit it and rerun. Nothing was removed." >&2
+  echo "Insomnia started again ($(list "${BLOCKING[@]}")); quit it and rerun. Nothing was removed." >&2
   exit 1
 fi
 
@@ -632,7 +787,21 @@ fi
 
 step "Removing $SUDOERS (requires your password)"
 if [[ -e "$SUDOERS" ]] || "$SUDO" test -e "$SUDOERS"; then
-  "$SUDO" rm -f "$SUDOERS"
+  # Root-only, so it is read through sudo. A read that fails (a wrong
+  # password, say) stops here, as the removal itself would have.
+  if ! sudoers_text="$("$SUDO" cat "$SUDOERS")"; then
+    echo "Could not read $SUDOERS through sudo, so it was kept. The LaunchAgent is already removed; the app at $APP is not." >&2
+    echo "Rerun this script, or check the file and remove it yourself with 'sudo rm $SUDOERS'." >&2
+    exit 1
+  fi
+  sudoers_why="$(sudoers_not_ours "$sudoers_text")"
+  if [[ -z "$sudoers_why" ]]; then
+    "$SUDO" rm -f "$SUDOERS"
+  elif [[ "$sudoers_why" == grants\ * ]]; then
+    echo "Kept $SUDOERS: it $sudoers_why, not $ACCOUNT. Another account installed Insomnia after this one, and its app and agent need that rule to undo a session. Uninstall Insomnia in that account to remove it."
+  else
+    echo "Kept $SUDOERS: it is not the rule install.sh writes for $ACCOUNT ($sudoers_why). Check it, and remove it with 'sudo rm $SUDOERS' if nothing else needs it." >&2
+  fi
 fi
 
 step "Removing app bundle"
