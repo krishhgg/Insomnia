@@ -675,7 +675,8 @@ final class StatusItemController: NSObject {
             throttledBrowsers: status.throttledBrowsers,
             hotspotWarning: status.hotspotPasswordProblem?.menuLine,
             error: manager.lastError,
-            foreignSleep: manager.foreignSleepWarning
+            foreignSleep: manager.foreignSleepWarning,
+            lidSimulationBuild: LidSimulationBuild.isCompiledIn
         )
     }
 

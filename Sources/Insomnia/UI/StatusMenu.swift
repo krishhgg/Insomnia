@@ -31,6 +31,9 @@ enum StatusMenu {
     /// precedes it, so the menu never opens with a stray rule at the top.
     /// `hotspotWarning` is the line about a hotspot password the failover
     /// could not use (`HotspotPasswordProblem.menuLine`).
+    /// `lidSimulationBuild` adds the line that marks a build with the
+    /// scripts/simulate-lid.sh watcher compiled in (`LidSimulationBuild`),
+    /// so such a build is never mistaken for a normal one.
     static func items(
         sessionActive: Bool,
         sleepHeld: Bool,
@@ -39,7 +42,8 @@ enum StatusMenu {
         throttledBrowsers: [String],
         hotspotWarning: String? = nil,
         error: String?,
-        foreignSleep: String? = nil
+        foreignSleep: String? = nil,
+        lidSimulationBuild: Bool = false
     ) -> [Item] {
         var out: [Item] = []
         if let held = SleepHeldLine.line(sessionActive: sessionActive, sleepHeld: sleepHeld) {
@@ -50,6 +54,9 @@ enum StatusMenu {
         }
         if let actions = present(actions) {
             out.append(Item(title: actions, kind: .info))
+        }
+        if lidSimulationBuild {
+            out.append(Item(title: LidSimulationBuild.marker, kind: .warning))
         }
         if let throttle = present(StatusLines.throttleWarning(throttledBrowsers)) {
             out.append(Item(title: throttle, kind: .warning))
