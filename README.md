@@ -220,8 +220,24 @@ installation scenarios still need [release validation](docs/release-validation.m
   stopped. Verify the live process and whether it should be resumed; never
   blindly signal a PID from an old log.
 - **Identity is not an atomic guarantee:** the app checks start time to the
-  microsecond; the shell checks to the second. A lookup and a signal are still
-  separate operations.
+  microsecond, and the backstop asks the installed app binary
+  (`Insomnia --resume-frozen`) to do the same check and send the signal for
+  every entry that records microseconds, all such entries in one call with a
+  30-second limit. The entries go to the binary on standard input, so a long
+  journal cannot exceed the argument size limit. The backstop never signals those entries itself. It keeps
+  them when the binary is missing, does not finish in time, or answers
+  anything but one expected line per entry. It runs the binary only when the
+  installed bundle declares `InsomniaResumeFrozenVersion` in its
+  `Info.plist`, so it never starts an older build. The binary holds the
+  recovery lock while it can still send a signal and ends itself after the
+  same limit, so a backstop run that is killed mid-call leaves no helper
+  that could act later without the lock. `uninstall.sh` uses the backstop
+  installed with an app that does not declare that version. With no such
+  copy, the checkout's backstop keeps those entries and uninstall stops
+  before removing anything. Entries written by builds before
+  microseconds were recorded keep the one-second `ps` comparison in the
+  shell. A lookup and a signal are still separate operations, one pid at a
+  time.
 - **Stuck power commands:** a command that survives its timeout keeps the
   recovery lock until it exits. Other recovery attempts or new sessions wait
   or fail with a warning instead of running alongside it.

@@ -4,8 +4,8 @@ import SwiftUI
 /// Menu bar app. The status item is an `NSStatusItem` hosting SwiftUI, and
 /// the settings window is an `NSWindow` this app opens itself (see
 /// `SettingsWindow`), so there is no SwiftUI scene with any content in it.
-/// `App` still requires one, hence the empty `Settings`.
-@main
+/// `App` still requires one, hence the empty `Settings`. main.swift starts
+/// this app unless the command line asks for a one-shot mode first.
 struct InsomniaApp: App {
     @NSApplicationDelegateAdaptor private var delegate: AppDelegate
 
