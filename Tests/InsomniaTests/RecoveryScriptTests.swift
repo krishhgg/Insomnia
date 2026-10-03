@@ -1479,14 +1479,41 @@ final class RecoveryScriptTests: XCTestCase {
             XCTAssertEqual(try fx.mode(file), 0o600, file.lastPathComponent)
         }
         XCTAssertTrue(fx.log().hasPrefix("old line\n"), "the loose log was replaced instead of kept")
-        XCTAssertEqual(fx.chmodCalls(), [fx.home, logsDir, fx.logFile, fx.lock, fx.state, fx.session].map { "chmod go-rwx \($0.path)" },
-            "the backstop changes modes through its fixed CHMOD path")
+        XCTAssertEqual(fx.chmodCalls(), [fx.home, logsDir, fx.logFile, fx.lock, fx.state, fx.session].flatMap { ["chmod go-rwx \($0.path)", "chmod -N \($0.path)"] },
+            "the backstop changes modes and removes ACLs through its fixed CHMOD path")
     }
 
     /// Tightening only takes group and other access away. An owner bit an
     /// older build or the user left off stays off: a write-only log stays
     /// write-only (0244 becomes 0200, not 0600) and a Logs directory the
     /// owner cannot list stays unlistable (0355 becomes 0300, not 0700).
+    /// macOS checks an ACL before the mode, so go-rwx alone would leave an
+    /// entry that lets another account in. A tree copied with an inheritable
+    /// entry for a made-up group: the backstop removes it from the two
+    /// directories and the files it tightens, and the journal it writes
+    /// while undoing inherits nothing. The fixture root above INSOMNIA_HOME
+    /// is not Insomnia's, so its entry stays.
+    func testBackstopRemovesACLsFromItsOwnFilesOnly() throws {
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        let logsDir = fx.logFile.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: logsDir, withIntermediateDirectories: true)
+        try "old line\n".write(to: fx.logFile, atomically: true, encoding: .utf8)
+        try "".write(to: fx.lock, atomically: true, encoding: .utf8)
+        try TestACL.grantMadeUpGroup(fx.root, inherit: true)
+        for url in [fx.home, logsDir] { try TestACL.grantMadeUpGroup(url, inherit: true) }
+        for url in [fx.logFile, fx.lock, fx.state] { try TestACL.grantMadeUpGroup(url) }
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 0, r.stderr + fx.log())
+        XCTAssertEqual(fx.calls(), ["sudo -n \(fx.fakePmset) -a disablesleep 0"])
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, false)
+        for url in [fx.home, logsDir, fx.logFile, fx.lock, fx.state] {
+            XCTAssertEqual(TestACL.entries(url), 0, url.path)
+        }
+        XCTAssertEqual(TestACL.entries(fx.root), 1, "the fixture root is not Insomnia's")
+    }
+
     func testBackstopTighteningNeverAddsAPermission() throws {
         try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
         let logsDir = fx.logFile.deletingLastPathComponent()

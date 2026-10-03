@@ -133,19 +133,25 @@ log() { # level message
 }
 
 # --- Lock --------------------------------------------------------------------
-"$MKDIR" -p "$APP_SUPPORT"
+"$MKDIR" -p "$APP_SUPPORT" "$LOG_DIR"
 # An upgrade over an older build: tighten what it left loose (0644 files,
 # 0755 directories), since this run may write to them before the upgraded
 # app has opened them. umask only covers what this run creates. go-rwx
 # only takes group and other access away and never adds a permission, so a
-# file its owner cannot read stays unreadable. A symlink is left alone, as
-# the app leaves it. A chmod that fails is logged as an error and recovery
-# goes on: a loose mode is no reason to leave the machine changed.
+# file its owner cannot read stays unreadable. chmod -N then removes any
+# access control list: macOS checks it before the mode, so an entry that
+# lets another account read or search, inherited from a parent directory
+# or copied with the tree, would outlast go-rwx, and a new file in a
+# directory with an inheritable entry gets it whatever the umask. Both
+# directories exist by now, so what this run creates in them inherits
+# nothing. A symlink is left alone, as the app leaves it. A chmod that
+# fails is logged as an error and recovery goes on: a loose mode is no
+# reason to leave the machine changed.
 tighten() { # path...
   local p err
   for p in "$@"; do
     if [[ -e "$p" && ! -L "$p" ]]; then
-      if ! err="$("$CHMOD" go-rwx "$p" 2>&1)"; then
+      if ! err="$("$CHMOD" go-rwx "$p" 2>&1)" || ! err="$("$CHMOD" -N "$p" 2>&1)"; then
         log error "could not make $p owner-only: ${err:-chmod failed}" || true
       fi
     fi
