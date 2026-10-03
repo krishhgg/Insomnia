@@ -7,6 +7,15 @@
 # APP_SUPPORT/.recovery.lock, so neither a queued periodic backstop nor a
 # relaunched app can republish the journal while it is being removed.
 #
+# Right after the lock it deletes APP_SUPPORT/pending-start itself, because
+# the backstop it runs may be an older copy that does not know the file: a
+# password dialog left from an abandoned start must not turn sleep off once
+# the rule that turns it back on is gone. It takes the marker's own lockf
+# lock first, the lock the root command behind that dialog holds while it
+# runs, and deletes it only while its path still names the locked file, so
+# the marker never goes while that command is past its check. A
+# marker that cannot be deleted stops the uninstall (see journal_problems).
+#
 # If anything Insomnia changed is still journaled, nothing is removed: the
 # LaunchAgent keeps retrying every minute, the sudoers rule keeps pmset
 # undoable, and state.json keeps the evidence. The message says what to do.
@@ -41,13 +50,20 @@ LAUNCHCTL=/bin/launchctl
 SUDO=/usr/bin/sudo
 PLUTIL=/usr/bin/plutil
 LOCKF=/usr/bin/lockf
+RM=/bin/rm
 DEFAULTS=/usr/bin/defaults
+# sudo is given test and rm by full path. Given a bare name, it would search
+# the caller's PATH and run whatever it finds there as root.
+TEST=/bin/test
+STAT=/usr/bin/stat
 DATE=/bin/date
 MKDIR=/bin/mkdir
-RM=/bin/rm
 RMDIR=/bin/rmdir
 MKTEMP=/usr/bin/mktemp
 LOCK_TIMEOUT_SECONDS=10
+# How long to wait for the root command behind a password dialog to let go
+# of the pending-start marker.
+PENDING_LOCK_TIMEOUT_SECONDS=10
 # How long to wait for the app to exit after asking it to quit.
 QUIT_WAIT_SECONDS=10
 # Longest one external call made by this script itself (pgrep, defaults,
@@ -75,6 +91,7 @@ LABEL="com.insomnia.backstop"
 PLIST="$LAUNCH_AGENTS/$LABEL.plist"
 SESSION="$APP_SUPPORT/session.json"
 STATE="$APP_SUPPORT/state.json"
+PENDING="$APP_SUPPORT/pending-start"
 CONFIG="$APP_SUPPORT/config.json"
 # The agent list the app ships with (Config.defaultAgentList in
 # Sources/Insomnia/Model/Config.swift; a test keeps this copy in step). An
@@ -331,6 +348,9 @@ journal_problems() {
       echo "session.json is still present"
     fi
   fi
+  if [[ -e "$PENDING" || -L "$PENDING" ]]; then
+    echo "pending-start is still present, so a password dialog left from an abandoned start could still turn sleep off"
+  fi
   [[ -e "$STATE" ]] || return 0
   if [[ ! -f "$STATE" ]]; then
     echo "state.json is not a regular file, so it was not opened"
@@ -568,6 +588,49 @@ if app_running; then
   echo "Insomnia started again; quit it and rerun. Nothing was removed." >&2
   exit 1
 fi
+# Deletes pending-start under its own lock, as Store.removePendingStart
+# does. The marker is opened on fd 8 and locked through it: lockf given a
+# descriptor locks this shell's open file, and the lock lasts until fd 8
+# closes. Then the path must still name the locked file (stat of fd 8
+# against stat -L of the path), because lockf locks a file and rm goes by
+# path: a file put in the marker's place after the open is not covered by
+# the lock, so it is left alone. Only a regular file is opened; open(2) on
+# a FIFO with no writer blocks, and this runs under the recovery lock. A
+# link to nothing is removed: the root command cannot open it either.
+# Sets marker_rc: 0 deleted or gone, 75 still locked after
+# PENDING_LOCK_TIMEOUT_SECONDS, 3 replaced after the open, 4 not a regular
+# file, anything else from the open or rm.
+delete_pending_marker() {
+  local locked
+  marker_rc=0
+  if [[ -L "$PENDING" && ! -e "$PENDING" ]]; then
+    "$RM" -f "$PENDING" 2>/dev/null || marker_rc=$?
+    return 0
+  fi
+  [[ -e "$PENDING" ]] || return 0
+  if [[ ! -f "$PENDING" ]]; then
+    marker_rc=4
+    return 0
+  fi
+  { exec 8<"$PENDING"; } 2>/dev/null || { marker_rc=$?; return 0; }
+  "$LOCKF" -s -t "$PENDING_LOCK_TIMEOUT_SECONDS" 8 2>/dev/null || marker_rc=$?
+  if (( marker_rc == 0 )); then
+    locked="$("$STAT" -f '%d:%i' <&8 2>/dev/null)" || locked=""
+    if [[ -n "$locked" && "$locked" == "$("$STAT" -L -f '%d:%i' "$PENDING" 2>/dev/null)" ]]; then
+      "$RM" -f "$PENDING" 2>/dev/null || marker_rc=$?
+    else
+      marker_rc=3
+    fi
+  fi
+  exec 8<&-
+}
+
+# No start is waiting on a password dialog while this process holds the
+# lock, so a marker here is an abandoned start's (see the header). One that
+# stays stops the uninstall in step 4 (journal_problems).
+if [[ -e "$PENDING" || -L "$PENDING" ]]; then
+  delete_pending_marker
+fi
 
 # 3. Undo everything via the current backstop ---------------------------------
 # The backstop inherits fd 9 and shares this lock instead of waiting on it.
@@ -631,8 +694,8 @@ fi
 "$RM" -f "$PLIST"
 
 step "Removing $SUDOERS (requires your password)"
-if [[ -e "$SUDOERS" ]] || "$SUDO" test -e "$SUDOERS"; then
-  "$SUDO" rm -f "$SUDOERS"
+if [[ -e "$SUDOERS" ]] || "$SUDO" "$TEST" -e "$SUDOERS"; then
+  "$SUDO" "$RM" -f "$SUDOERS"
 fi
 
 step "Removing app bundle"

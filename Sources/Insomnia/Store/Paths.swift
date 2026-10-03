@@ -5,12 +5,12 @@ import Foundation
 /// the same variable with the same layout).
 ///
 /// Default layout:
-///   ~/Library/Application Support/Insomnia/{session.json,state.json,config.json,backstop.sh}
+///   ~/Library/Application Support/Insomnia/{session.json,state.json,config.json,backstop.sh,pending-start}
 ///   ~/Library/Logs/Insomnia/{insomnia.log,handoffs.log}
 ///   ~/Library/LaunchAgents/com.insomnia.backstop.plist
 ///
 /// With INSOMNIA_HOME=/x:
-///   /x/{session.json,state.json,config.json,backstop.sh}
+///   /x/{session.json,state.json,config.json,backstop.sh,pending-start}
 ///   /x/Logs/{insomnia.log,handoffs.log}
 ///   /x/LaunchAgents/com.insomnia.backstop.plist
 struct Paths: Sendable, Equatable {
@@ -68,6 +68,12 @@ struct Paths: Sendable, Equatable {
     /// flock(2) file shared with backstop.sh (`lockf -k` on the same path).
     /// Created once, never unlinked, so both sides lock the same inode.
     var recoveryLock: URL { appSupport.appendingPathComponent(".recovery.lock") }
+    /// The nonce a Start writes just before the password dialog and deletes
+    /// before it releases the recovery lock (see PendingStart). backstop.sh
+    /// and uninstall.sh delete it under the same lock. Every deleter also
+    /// locks the file itself first (`lockf` or flock(2)), the lock the
+    /// dialog's root command holds while it runs.
+    var pendingStartFile: URL { appSupport.appendingPathComponent("pending-start") }
     /// Written by scripts/simulate-lid.sh ("closed" or "open") to drive the
     /// lid-close action path without touching the hinge. See LidSimulation.
     var simulateLidFile: URL { appSupport.appendingPathComponent("simulate-lid") }

@@ -35,7 +35,7 @@ final class TestIsolationTests: XCTestCase {
         [
             paths.appSupport, paths.logs, paths.launchAgents,
             paths.sessionFile, paths.stateFile, paths.configFile, paths.backstopScript,
-            paths.recoveryLock, paths.simulateLidFile,
+            paths.recoveryLock, paths.pendingStartFile, paths.simulateLidFile,
             paths.logFile, paths.handoffsLog, paths.backstopPlist,
         ]
     }

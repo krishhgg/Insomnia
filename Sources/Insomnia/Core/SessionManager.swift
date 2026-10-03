@@ -12,13 +12,19 @@ enum EndReason: String, Sendable {
     case thermalCritical
     case backstop
     /// Reconcile found a session on disk but could not arm the recovery
-    /// agent, journal, or hold sleep for it, so it ended the session instead
-    /// of holding sleep with nothing to release it.
+    /// agent, read the sleep setting, or journal for it, so it ended the
+    /// session instead of holding sleep with nothing to release it.
     case recoveryUnavailable
-    /// `pmset disablesleep 1` failed or timed out during start. The setting
-    /// may still have been applied, so the start is undone from the journal
-    /// like an end rather than rolled back from memory.
+    /// The administrator password dialog that turns sleep off was cancelled,
+    /// answered wrongly, timed out, or pmset failed behind it, during start.
+    /// The setting may still have been applied, so the start is undone from
+    /// the journal like an end rather than rolled back from memory.
     case startFailed
+    /// Reconcile found a valid session on disk but `pmset -g` no longer
+    /// reports SleepDisabled: something turned sleep back on while Insomnia
+    /// was not running. Turning it off again needs a password, which a
+    /// relaunch must never ask for, so the session ends instead.
+    case sleepReenabled
 }
 
 /// What `end` achieved. Callers that are about to quit need to know whether
@@ -81,6 +87,11 @@ final class SessionManager {
     /// visible beside it. Cleared by a session start, or by
     /// `recheckForeignSleep()` once the bit reads 0 again.
     private(set) var foreignSleepWarning: String?
+    /// Why this transaction could not remove the pending-start marker, or
+    /// nil once it is gone. While it is set, a dialog from an earlier start
+    /// could still turn sleep off, so `restoreAll` keeps the sleep entry
+    /// journaled, starts are refused, and the menu keeps the line.
+    @ObservationIgnored private(set) var markerProblem: String?
 
     var isActive: Bool { session != nil }
 
@@ -134,6 +145,10 @@ final class SessionManager {
     private let recoveryLock: RecoveryLock
     private let recoveryLockTimeout: TimeInterval
     private let recoveryRetryDelay: TimeInterval
+    /// How long a transaction waits for the root command behind a password
+    /// dialog to let go of the pending-start marker before it gives up on
+    /// removing it for this run. pmset itself takes well under a second.
+    private let markerLockTimeout: TimeInterval
     /// How long after a display/keyboard restore the same values are
     /// written once more. powerd re-applies its own remembered brightness
     /// asynchronously after the wake and can override the first write.
@@ -219,6 +234,7 @@ final class SessionManager {
         clock: @escaping @Sendable () -> Date = { Date() },
         recoveryLockTimeout: TimeInterval = 10,
         recoveryRetryDelay: TimeInterval = 30,
+        markerLockTimeout: TimeInterval = 10,
         reassertDelay: Duration = .seconds(2)
     ) {
         self.paths = paths
@@ -236,6 +252,7 @@ final class SessionManager {
         self.recoveryLock = RecoveryLock(url: paths.recoveryLock)
         self.recoveryLockTimeout = recoveryLockTimeout
         self.recoveryRetryDelay = recoveryRetryDelay
+        self.markerLockTimeout = markerLockTimeout
         self.reassertDelay = reassertDelay
 
         try? paths.createDirectories()
@@ -322,6 +339,12 @@ final class SessionManager {
                 return .failure(.lockBusy(error.localizedDescription))
             }
             defer { handle.release() }
+            // Holding the lock means no start is waiting on a password
+            // dialog, so a marker left on disk belongs to an abandoned one.
+            // One that cannot be removed does not stop the transaction:
+            // restores still run, and `markerProblem` holds back only the
+            // clearing of the sleep entry and any new start.
+            await self.clearPendingStart()
             do {
                 try self.loadJournal()
             } catch {
@@ -369,12 +392,16 @@ final class SessionManager {
     /// Start a session of `duration` seconds (clamped to `config.maxDuration`).
     /// Ignored if a session is already active; use `extend`.
     ///
-    /// Ordering: session.json, then state.json, then the recovery agent,
-    /// then `pmset disablesleep 1`. A failure before pmset is rolled back:
-    /// nothing has touched the machine. A pmset failure is ambiguous (the
-    /// setting may have been applied before the error or timeout), so it is
-    /// undone from the journal like an end, and the journal keeps the entry
-    /// until that undo is confirmed.
+    /// Ordering: a check that the installed backstop.sh can void the
+    /// dialog (BackstopVersion), then session.json, then state.json, then
+    /// the recovery agent, then the pending-start marker, then the password
+    /// dialog that runs `pmset disablesleep 1`. A failure before the dialog is rolled back:
+    /// nothing has touched the machine. So is a cancelled dialog or an
+    /// osascript that never started, which ran nothing as root: no pmset
+    /// runs, so a sleep setting someone else owns is left alone. Any other
+    /// failure is ambiguous (the setting may have been applied before the
+    /// error or timeout), so it is undone from the journal like an end, and
+    /// the journal keeps the entry until that undo is confirmed.
     func start(duration: TimeInterval) async {
         guard !quitRequested else {
             Log.info("start ignored: quit requested")
@@ -395,6 +422,40 @@ final class SessionManager {
         }
         guard endTicket == ticket, !quitRequested else {
             Log.info("start abandoned: an end was requested first")
+            return
+        }
+        if let problem = markerProblem {
+            // The dialog behind that marker may still turn sleep off, or
+            // its command may still be running. Nothing is written.
+            // The menu keeps the marker's own line, which goes with it.
+            let text = Self.markerProblemText(problem)
+            Log.error("start refused, nothing changed")
+            fail(text)
+            notifier.post(title: Self.endTitle(.startFailed, had: false), body: "Nothing was changed: \(text)")
+            return
+        }
+        do {
+            // Only a backstop.sh that deletes the marker can void the
+            // dialog below if this process dies under it.
+            try backstop.checkVoidsPrompts()
+        } catch {
+            fail("start refused, nothing changed: \(error.localizedDescription)")
+            notifier.post(title: Self.endTitle(.startFailed, had: false), body: "Nothing was changed: \(error.localizedDescription).")
+            return
+        }
+        do {
+            // Once the dialog has turned sleep off, only the passwordless
+            // rule can turn it back on: this app's end and backstop.sh
+            // both run `sudo -n`. Without the rule they would fail at the
+            // deadline and leave sleep off, so no dialog is shown. The
+            // check runs that restore while sleep is on, or when the
+            // journal already owes it, and otherwise refuses while sleep
+            // is off: a setting someone else made stays, as it does after
+            // a cancelled dialog.
+            try await sleepGuard.checkPasswordlessRestore(sleepOffIsOurs: state.sleepDisabledByUs)
+        } catch {
+            fail("start refused, nothing changed: \(error.localizedDescription)")
+            notifier.post(title: Self.endTitle(.startFailed, had: false), body: "Nothing was changed: \(error.localizedDescription).")
             return
         }
         let now = clock()
@@ -440,13 +501,96 @@ final class SessionManager {
             return
         }
 
+        // The pending-start marker: the command the dialog runs as root
+        // turns sleep off only while this file holds this attempt's nonce,
+        // and keeps it locked until pmset exits. It is deleted below on
+        // every outcome, before this transaction lets go of the lock, and
+        // by whoever takes the lock next if this process dies first, so a
+        // dialog answered after its start was abandoned changes nothing.
+        // The command is also given the session's end and refuses after
+        // it, so a password typed too late changes nothing either.
+        let pending = PendingStart(marker: store.paths.pendingStartFile, nonce: UUID().uuidString, deadline: new.endsAt)
+        let markerFile: FileIdentity
         do {
-            try await sleepGuard.setSleepDisabled(true)
+            markerFile = try store.savePendingStart(pending.nonce)
         } catch {
+            // No marker with this nonce exists, so no dialog was shown.
+            await clearPendingStart()
+            rollBackStart(journal: journalBefore, session: sessionBefore)
+            fail("could not write the pending-start marker: \(error.localizedDescription)")
+            return
+        }
+
+        // The administrator password dialog. This is the only call that can
+        // prompt, and Start is the only path that reaches it: the user just
+        // pressed Enter, so someone is at the keyboard. A cancel, a wrong
+        // password, a timeout or a pmset failure all land here.
+        // The marker goes on every outcome below before anything is
+        // restored, and a marker that cannot go keeps the sleep entry
+        // journaled (see restoreAll).
+        do {
+            try await sleepGuard.disableSleep(pending)
+        } catch let AdministratorPromptError.stillRunning(prompt, grace) {
+            // The prompt's process did not stop on SIGTERM. Nothing is
+            // killed. The marker goes first, under its lock, so an answer
+            // that still comes cannot turn sleep off. Only the file this
+            // start wrote counts: one put in its place may have been
+            // swapped in after the command locked the original.
+            let voided = await clearPendingStart(expecting: markerFile)
+            let alive = prompt.osascriptAlive
+            if voided {
+                // The command behind the dialog now finds no marker and
+                // changes nothing, whenever it runs, so nothing here waits
+                // for it: the start is rolled back now and the recovery
+                // lock goes with this transaction. The leftover process is
+                // reported, and watched on its own until it exits.
+                reportStuckPrompt(prompt, grace: grace, osascriptAlive: alive, voided: true)
+                watchVoidedPrompt(prompt, grace: grace)
+                _ = await performEnd(reason: .startFailed)
+                return
+            }
+            // A root command already past its check holds the marker's
+            // lock and may still run pmset (or the marker cannot be
+            // deleted): nothing is rolled back beside it. session.json, the
+            // journal entry and the recovery lock stay until the prompt
+            // exits, the same rule a stuck `sudo pmset` gets. The user is
+            // told what is running and, while it is osascript itself, how
+            // to stop it. Then the rollback.
+            reportStuckPrompt(prompt, grace: grace, osascriptAlive: alive, voided: false)
+            if alive {
+                // The pid is ours to name only until osascript exits; a
+                // root command it started can keep its output open longer.
+                await prompt.waitUntilOsascriptExits()
+                if prompt.isRunning {
+                    fail("start: \(Self.stuckPromptText(prompt, grace: grace, osascriptAlive: false, voided: false))")
+                }
+            }
+            await prompt.waitUntilExit()
+            // The command that held the marker's lock has exited with the
+            // prompt, so the marker can go before the undo reads the result.
+            await clearPendingStart()
+            fail("could not disable sleep: \(prompt) did not finish in time and has now exited; rolling the start back")
+            _ = await performEnd(reason: .startFailed)
+            return
+        } catch let error as AdministratorPromptError where error.nothingRan {
+            // Cancelled, or osascript never started: nothing ran as root.
+            // The journal and session.json go back exactly as they were and
+            // no pmset runs, so a sleep setting another tool owns is left
+            // alone. Nothing can use this attempt's marker any more, so one
+            // that cannot be deleted does not hold the rollback back; it is
+            // reported, and the next transaction tries it again.
+            await clearPendingStart()
+            rollBackStart(journal: journalBefore, session: sessionBefore)
+            fail("could not disable sleep: \(error.localizedDescription)")
+            notifier.post(title: Self.endTitle(.startFailed, had: false), body: "No session was started, and nothing was changed: \(error.localizedDescription).")
+            return
+        } catch {
+            await clearPendingStart()
             fail("could not disable sleep: \(error.localizedDescription)")
             _ = await performEnd(reason: .startFailed)
             return
         }
+        await clearPendingStart()
         guard endTicket == ticket else {
             // Sleep is disabled and journaled as ours. The end that was
             // requested runs next and restores from that journal; the session
@@ -456,7 +600,7 @@ final class SessionManager {
         }
 
         session = new
-        lastError = nil
+        clearLastError()
         foreignSleepWarning = nil
         Log.info("session started until \(iso(new.endsAt)) (\(Int(duration))s requested)")
         await armDeadline(new.endsAt)
@@ -494,7 +638,7 @@ final class SessionManager {
             return
         }
         session = updated
-        lastError = nil
+        clearLastError()
         Log.info("session extended by \(Int(extra))s until \(iso(updated.endsAt))")
         await armDeadline(updated.endsAt)
     }
@@ -743,12 +887,30 @@ final class SessionManager {
     /// while pmset is running (a lid-close freeze, say) is never overwritten.
     /// Failures are logged and the entry is left set so the next end,
     /// reconcile or the backstop retries it.
+    ///
+    /// The sleep entry is cleared only when this transaction removed the
+    /// pending-start marker before the restore. Otherwise a dialog left on
+    /// screen could still turn sleep off after this point, or its root
+    /// command may still be running: sleep is restored all the same, but
+    /// the entry stays as the record that the bit may be Insomnia's, so the
+    /// end reports itself incomplete and every later run retries.
     func restoreAll() async {
         if state.sleepDisabledByUs {
             do {
-                try await sleepGuard.setSleepDisabled(false)
-                try? journal { $0.sleepDisabledByUs = false }
+                try await sleepGuard.enableSleep()
                 Log.info("sleep restored")
+                if let problem = markerProblem {
+                    Log.error("sleep restored, but its journal entry is kept")
+                    fail(Self.markerProblemText(problem))
+                } else {
+                    do {
+                        try journal { $0.sleepDisabledByUs = false }
+                    } catch {
+                        // The entry stays: the end reports itself incomplete
+                        // and the next run restores sleep again.
+                        fail("sleep restored but the journal entry could not be cleared: \(error.localizedDescription); it will be retried")
+                    }
+                }
             } catch {
                 fail("could not restore sleep: \(error.localizedDescription)")
             }
@@ -1088,15 +1250,33 @@ final class SessionManager {
         }
 
         if let s = onDisk, !s.isExpired(at: now) {
-            // Step 2: valid session. Arm first, then journal, then hold
-            // sleep. Any failure ends the session rather than holding sleep
-            // with nothing guaranteed to release it.
+            // Step 2: valid session. Arm first, then check that sleep is
+            // still off, then journal. Any failure ends the session rather
+            // than holding sleep with nothing guaranteed to release it.
             session = s
             do {
                 try await backstop.arm()
             } catch {
                 fail("could not arm recovery agent for the session on disk: \(error.localizedDescription); ending it")
                 _ = await performEnd(reason: .recoveryUnavailable)
+                return
+            }
+            // Never re-applied: `disablesleep 1` needs the administrator
+            // password, and a relaunch (login, a crash) has nobody at the
+            // keyboard to type it. The session continues only if sleep is
+            // still off; if it was turned back on meanwhile the session ends
+            // and says so.
+            let sleepStillOff: Bool
+            do {
+                sleepStillOff = try await sleepGuard.isSleepDisabled()
+            } catch {
+                fail("could not read the sleep setting for the session on disk: \(error.localizedDescription); ending it")
+                _ = await performEnd(reason: .recoveryUnavailable)
+                return
+            }
+            guard sleepStillOff else {
+                Log.info("reconcile: sleep was turned back on while Insomnia was not running; ending the session")
+                _ = await performEnd(reason: .sleepReenabled)
                 return
             }
             if !state.sleepDisabledByUs {
@@ -1108,14 +1288,7 @@ final class SessionManager {
                     return
                 }
             }
-            do {
-                try await sleepGuard.setSleepDisabled(true)
-                lastError = nil
-            } catch {
-                fail("could not re-apply sleep guard: \(error.localizedDescription); ending session")
-                _ = await performEnd(reason: .recoveryUnavailable)
-                return
-            }
+            clearLastError()
             Log.info("reconcile: session valid until \(iso(s.endsAt))")
             if !state.lowPowerSetByUs, state.displayRestoredUnderLowPower != nil {
                 dropDisplayWrite(reason: "the mode is not ours")
@@ -1257,9 +1430,9 @@ final class SessionManager {
     /// entry: something other than Insomnia disabled sleep, and only its
     /// owner should re-enable it. Shown on its own menu line on every
     /// reconcile that finds it, and posted as a notification once per
-    /// launch. The line is cleared by the next session start, whose end
-    /// sets `disablesleep 0` whoever set the bit, or by a recheck that
-    /// reads the bit as 0.
+    /// launch. Start is refused while the bit reads 1 (see
+    /// `checkPasswordlessRestore`), so the line is cleared by a recheck
+    /// that reads it as 0, or by a session start that found it 0.
     private func reportForeignSleepDisable() {
         foreignSleepWarning = Self.foreignSleepLine
         guard !announcedForeignSleep else {
@@ -1270,7 +1443,7 @@ final class SessionManager {
         Log.info("reconcile: \(Self.foreignSleepLine)")
         notifier.post(
             title: Self.foreignSleepTitle,
-            body: "pmset reports SleepDisabled 1, but Insomnia has no session and did not set it, so it is left alone. To re-enable sleep: \(Self.foreignSleepCommand). Ending an Insomnia session also sets it to 0."
+            body: "pmset reports SleepDisabled 1, but Insomnia has no session and did not set it, so it is left alone. To re-enable sleep: \(Self.foreignSleepCommand). Insomnia cannot start a session until then."
         )
     }
 
@@ -1409,6 +1582,89 @@ final class SessionManager {
         Log.error(message)
     }
 
+    /// Posted once per stuck prompt: the notification and the menu's
+    /// warning line say what is running and what Insomnia does about it.
+    /// `kill <pid>` is only offered while the pid is osascript's own, and
+    /// only on the menu line: that line is replaced as soon as osascript
+    /// exits, while a notification stays in Notification Center after the
+    /// pid is gone and possibly reused.
+    private func reportStuckPrompt(_ prompt: UnfinishedPrompt, grace: TimeInterval, osascriptAlive: Bool, voided: Bool) {
+        let body = Self.stuckPromptText(prompt, grace: grace, osascriptAlive: osascriptAlive, voided: voided)
+        if osascriptAlive {
+            fail("start: \(body) To stop it by hand while it runs: kill \(prompt.pid)")
+            notifier.post(title: Self.promptStuckTitle, body: "\(body) The Insomnia menu shows how to stop it while it runs.")
+        } else {
+            fail("start: \(body)")
+            notifier.post(title: Self.promptStuckTitle, body: body)
+        }
+    }
+
+    private static func stuckPromptText(_ prompt: UnfinishedPrompt, grace: TimeInterval, osascriptAlive: Bool, voided: Bool) -> String {
+        let what = osascriptAlive
+            ? "osascript (pid \(prompt.pid)), the process behind the password dialog, did not stop within \(Int(grace)) s."
+            : "osascript (pid \(prompt.pid)) stopped, but a command it started as root is still running."
+        if voided {
+            return "\(what) Its start is void, so it can no longer turn sleep off; the start is rolled back without waiting for it."
+        }
+        return "\(what) Insomnia keeps the session record and waits for it before rolling the start back; nothing else runs until then."
+    }
+
+    /// Outside any transaction, keeps the menu line `reportStuckPrompt`
+    /// set for a voided prompt true until the prompt is gone: the kill hint
+    /// goes when osascript exits, the whole line when the prompt has
+    /// exited. A line something else has set since is left alone.
+    private func watchVoidedPrompt(_ prompt: UnfinishedPrompt, grace: TimeInterval) {
+        let reported = lastError
+        Task { @MainActor [weak self] in
+            var line = reported
+            await prompt.waitUntilOsascriptExits()
+            if let self, line != nil, self.lastError == line, prompt.isRunning {
+                line = "start: \(Self.stuckPromptText(prompt, grace: grace, osascriptAlive: false, voided: true))"
+                self.lastError = line
+            }
+            await prompt.waitUntilExit()
+            if let self, line != nil, self.lastError == line { self.lastError = nil }
+            Log.info("\(prompt), whose start was voided, has exited")
+        }
+    }
+
+    /// Locks, then deletes the pending-start marker (see PendingStart and
+    /// `Store.removePendingStart`), and records the outcome in
+    /// `markerProblem`. False when the root command behind a dialog still
+    /// held the marker's lock after `markerLockTimeout`, or the file could
+    /// not be deleted (an immutable flag, a deny-delete ACL, a directory in
+    /// its place), or, with `expecting`, the file at the path is not the
+    /// one this start wrote. The failure is logged and shown in the menu,
+    /// and every later transaction, backstop run and uninstall tries again.
+    @discardableResult
+    private func clearPendingStart(expecting written: FileIdentity? = nil) async -> Bool {
+        do {
+            if try await store.removePendingStart(timeout: markerLockTimeout, expecting: written) {
+                Log.info("deleted the pending-start marker; a password dialog left from that start can no longer turn sleep off")
+            }
+            if let old = markerProblem {
+                markerProblem = nil
+                if lastError == Self.markerProblemText(old) { lastError = nil }
+            }
+            return true
+        } catch {
+            markerProblem = error.localizedDescription
+            fail(Self.markerProblemText(error.localizedDescription))
+            return false
+        }
+    }
+
+    /// The menu's error line goes away after a success, except for a
+    /// pending-start marker that is still in place, which keeps its line
+    /// until a transaction removes it.
+    private func clearLastError() {
+        lastError = markerProblem.map(Self.markerProblemText)
+    }
+
+    static func markerProblemText(_ problem: String) -> String {
+        "the pending-start marker could not be removed (\(problem)). A password dialog left from an earlier start could still turn sleep off, so the sleep entry stays in the journal, new starts are refused, and every run retries. If no Insomnia password dialog is open, delete the file by hand"
+    }
+
     private func iso(_ d: Date) -> String {
         ISO8601DateFormatter().string(from: d)
     }
@@ -1416,6 +1672,7 @@ final class SessionManager {
     static let incompleteTitle = "Restore incomplete"
     static let notEndedTitle = "Session not ended"
     static let journalTitle = "Recovery journal unreadable"
+    static let promptStuckTitle = "Password prompt still running"
     static let sessionFileTitle = "Session file unreadable"
     static let foreignSleepTitle = "Sleep is disabled by something else"
     static let foreignSleepCommand = "sudo pmset -a disablesleep 0"
@@ -1438,8 +1695,9 @@ final class SessionManager {
         case .batteryUnreadable: "The battery level could not be read twice in a row, so the \(config.endFloor)% floor could not be applied. Sleep is back to normal."
         case .thermalCritical: "Thermal state is critical. Sleep is back to normal."
         case .backstop: "A previous session left changes behind; everything has been undone."
-        case .recoveryUnavailable: "Insomnia could not arm its recovery agent for the session found on disk, so it ended the session. Sleep is back to normal."
-        case .startFailed: "Insomnia could not disable sleep, so no session was started. Sleep is back to normal."
+        case .recoveryUnavailable: "Insomnia could not confirm its recovery agent or the sleep setting for the session found on disk, so it ended the session. Sleep is back to normal."
+        case .startFailed: "The administrator password prompt was cancelled or failed, so no session was started. Sleep is back to normal."
+        case .sleepReenabled: "Sleep was turned back on while Insomnia was not running, so the session ended."
         }
     }
 }

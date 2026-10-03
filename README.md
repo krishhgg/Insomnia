@@ -51,7 +51,10 @@ open "$HOME/Applications/Insomnia.app"
 The installer builds and ad-hoc signs the app, installs a background recovery
 agent, and asks for administrator access to install a narrowly scoped sudoers
 rule. It grants **your user account**, not just Insomnia, passwordless access to
-four power-setting commands. Review that permission before installing.
+three power-setting commands, none of which can keep the Mac awake: they turn
+sleep back on and switch battery Low Power Mode on or off. Turning sleep off is
+not in the rule; Insomnia asks for your administrator password each time you
+start a session. Review that permission before installing.
 
 <details>
 <summary><strong>Exactly what gets installed</strong></summary>
@@ -62,18 +65,32 @@ four power-setting commands. Review that permission before installing.
 | `~/Library/Application Support/Insomnia/` | Configuration, session/recovery journals, and `backstop.sh` |
 | `~/Library/LaunchAgents/com.insomnia.backstop.plist` | Per-user recovery agent |
 | `~/Library/Logs/Insomnia/` | `insomnia.log` and `handoffs.log` |
-| `/etc/sudoers.d/insomnia` | Permission for the four commands below |
+| `/etc/sudoers.d/insomnia` | Permission for the three commands below |
 
 ```text
-/usr/bin/pmset -a disablesleep 1
 /usr/bin/pmset -a disablesleep 0
 /usr/bin/pmset -b lowpowermode 1
 /usr/bin/pmset -b lowpowermode 0
 ```
 
-The grant is available to other processes running as your user. Insomnia is not
-sandboxed. The app, scripts, and journals are local; hotspot passwords use the
-login Keychain, not the configuration file.
+The grant is available to other processes running as your user. It lets them
+turn sleep back on and toggle Low Power Mode on battery, and nothing else; the
+command that keeps the Mac awake, `pmset -a disablesleep 1`, always goes
+through the standard macOS administrator password dialog. A reinstall over an
+older install replaces the file, so the old `disablesleep 1` line is removed.
+The installer never writes that line, on any path. It asks for your password
+before it quits a running Insomnia, so cancelling the password prompt changes
+nothing and a running session keeps going. When a session is running it says
+the upgrade will end it before asking, and in a terminal it asks whether to
+continue. It stops with nothing changed if the app will not quit. Next it
+replaces `backstop.sh` and waits up to 30 s for any run of the old script to
+finish; if one is still running it stops before it writes the rule, so the
+installed app keeps working, and says to rerun. Only then does it write the
+rule and replace the app. If it stops between the two, an older build left
+installed cannot start a session until you rerun `./scripts/install.sh`, and
+the installer says so.
+Insomnia is not sandboxed. The app, scripts, and journals are local; hotspot
+passwords use the login Keychain, not the configuration file.
 
 An upgrade asks the running app to quit and stops if it refuses. Unresolved
 recovery prevents replacing the existing recovery agent; follow the reported
@@ -84,7 +101,28 @@ instructions before retrying.
 ## Using it
 
 1. **Start:** click the eye in the menu bar, enter Days / Hours / Minutes, and
-   press Enter.
+   press Enter. macOS asks for your administrator password to turn system
+   sleep off. It asks only while sleep is on: if another tool has already
+   turned sleep off, Start changes nothing and shows the command that turns
+   it back on, so that tool's setting stays. Cancelling the dialog starts
+   no session and changes nothing. A wrong password, no answer within 120
+   seconds, or a pmset failure also starts no session, but Insomnia cannot
+   tell whether pmset ran first, so it runs `pmset -a disablesleep 0`,
+   which puts sleep back on as it was when the dialog appeared. A
+   password typed after the session would already have ended turns nothing
+   off. If the dialog's process will not close, Insomnia voids its start so
+   it can no longer turn sleep off, rolls the start back at once, and names
+   the process with its pid in the menu until it exits; only a command that
+   is already turning sleep off when the time runs out is waited for. A
+   dialog left on screen after Insomnia crashed or was force-quit does
+   nothing when you answer it, once Insomnia has relaunched or the recovery
+   agent has run (within a minute). Insomnia shows no dialog at all while
+   the installed `backstop.sh` is older than the app, because an older one
+   cannot void such a dialog: Start then says to run `./scripts/install.sh`
+   again. If the `pending-start` file that guards such a dialog cannot be deleted,
+   Insomnia still turns sleep back on, but says so in the menu and a
+   notification, keeps the journal entry, refuses new sessions, and retries
+   until the file is gone.
 2. **Extend:** click the eye or countdown during a session and enter more time.
 3. **End early:** press and hold the end control beside the countdown.
 4. **Inspect or configure:** right-click for status, recovery warnings,
@@ -180,6 +218,22 @@ attempts to undo them. An independent `launchd` agent checks every minute and
 can attempt recovery after the app exits unexpectedly, once the saved deadline
 has passed. It leaves a valid, unexpired session alone.
 
+Undoing never needs a password: the sudoers rule covers turning sleep back on,
+so the app, the agent, and the uninstaller can all restore sleep unattended.
+Turning sleep off is the only step that asks, and only when you press Enter.
+Before it asks, the app proves that turning sleep back on still needs no
+password by doing it: it runs `sudo -k -n /usr/bin/pmset -a disablesleep 0`
+while sleep is on, where the command changes nothing. `-k` makes sudo ignore
+a password you typed into it recently, so only the sudoers rule can let the
+command through. If `/etc/sudoers.d/insomnia` is gone or not in effect, no
+dialog appears, nothing is changed, and Insomnia tells you to run
+`scripts/install.sh` again.
+When Insomnia starts up (login, or a relaunch after a crash) and finds a valid
+session on disk, it checks whether sleep is still off. If it is, the session
+continues; if something turned sleep back on in the meantime, the session ends
+with a notification instead of asking for a password with nobody at the
+keyboard.
+
 The app and backstop use the same lock so they do not restore and rewrite the
 journal over one another. Failed restoration keeps the relevant entries;
 unreadable journals are preserved instead of treated as clean. A session file
@@ -224,14 +278,18 @@ installation scenarios still need [release validation](docs/release-validation.m
   separate operations.
 - **Stuck power commands:** a command that survives its timeout keeps the
   recovery lock until it exits. Other recovery attempts or new sessions wait
-  or fail with a warning instead of running alongside it.
+  or fail with a warning instead of running alongside it. The one exception
+  is a password dialog whose start was voided: it can no longer change
+  anything, so the start rolls back at once and the menu names it until it
+  exits.
 - **Audio:** the backstop preserves volume/mute entries but cannot restore
   CoreAudio. Reopen the app for recovery.
 - **Sleep disabled by something else:** at launch, with no session and no
   journal entry, a `SleepDisabled 1` in `pmset -g` is left alone: Insomnia
   did not set it and only its owner should undo it. The menu shows a warning
   and a notification gives the command, `sudo pmset -a disablesleep 0`.
-  Ending an Insomnia session sets it to 0 whoever set it.
+  Start is refused until it reads 0 again, since proving the passwordless
+  restore would turn sleep back on.
 - **Low Power Mode:** Insomnia checks the existing setting so it does not
   claim ownership of an already-enabled preference.
 - **App Nap:** off by default. When the setting is on, Insomnia journals each

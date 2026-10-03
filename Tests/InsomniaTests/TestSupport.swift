@@ -75,8 +75,94 @@ final class TempHome {
     }
 }
 
-/// Records every call; can be told to throw.
+/// The administrator password dialog as a fake. Answers at once in
+/// `.succeed`, `.cancel`, `.fail` and `.launchFail` (osascript could not
+/// be started); in `.hang` it waits on `gate` like a
+/// dialog nobody answers and then reports the timeout osascript's SIGTERM
+/// would produce; in `.stuck` it reports osascript (pid 4242) as still
+/// running after SIGTERM and hands out `unfinished`, which the test ends
+/// with `markExited()`. `.succeed` keeps the root command's rule: it fails
+/// with exit 3 unless the marker holds the nonce. `onShow` runs when the
+/// dialog is shown, before the mode's answer. Never shows anything and
+/// never runs pmset.
+final class FakeAdministratorPrompt: AdministratorPromptRunning, @unchecked Sendable {
+    enum Mode { case succeed, cancel, fail, launchFail, hang, stuck }
+
+    static let stuckPid: pid_t = 4242
+
+    private let lock = NSLock()
+    private var _mode: Mode = .succeed
+    private var _shown = 0
+    private var _unfinished: UnfinishedPrompt?
+    private var _starts: [PendingStart] = []
+    private var _markerAtShow: [String?] = []
+    private var _onShow: (@Sendable (PendingStart) -> Void)?
+    private var _now: @Sendable () -> Date = { Date() }
+    /// Opened by the test to end a `.hang`.
+    let gate = AsyncGate()
+
+    var mode: Mode {
+        get { lock.withLock { _mode } }
+        set { lock.withLock { _mode = newValue } }
+    }
+    /// How many times the dialog was shown.
+    var shown: Int { lock.withLock { _shown } }
+    /// The handle a `.stuck` prompt threw, once it has.
+    var unfinished: UnfinishedPrompt? { lock.withLock { _unfinished } }
+    /// The start each dialog was shown for, in order.
+    var starts: [PendingStart] { lock.withLock { _starts } }
+    /// The marker's content when each dialog was shown (nil: no file).
+    var markerAtShow: [String?] { lock.withLock { _markerAtShow } }
+    var onShow: (@Sendable (PendingStart) -> Void)? {
+        get { lock.withLock { _onShow } }
+        set { lock.withLock { _onShow = newValue } }
+    }
+    /// The clock a `.succeed` answer compares the start's deadline with,
+    /// as the root command compares it with the system clock.
+    var now: @Sendable () -> Date {
+        get { lock.withLock { _now } }
+        set { lock.withLock { _now = newValue } }
+    }
+
+    func disableSleep(_ start: PendingStart) async throws {
+        let marker = try? String(contentsOf: start.marker, encoding: .utf8)
+        lock.withLock {
+            _shown += 1
+            _starts.append(start)
+            _markerAtShow.append(marker)
+        }
+        onShow?(start)
+        switch mode {
+        case .succeed:
+            guard marker == start.nonce else {
+                throw AdministratorPromptError.failed(status: 1, stderr: "execution error: the start that asked for this password is over; sleep was not turned off (3)")
+            }
+            guard now() < start.deadline else {
+                throw AdministratorPromptError.failed(status: 1, stderr: "execution error: the session this password was for has already ended; sleep was not turned off (4)")
+            }
+            return
+        case .cancel:
+            throw AdministratorPromptError.cancelled
+        case .fail:
+            throw AdministratorPromptError.failed(status: 1, stderr: "execution error: The administrator user name or password was incorrect.")
+        case .launchFail:
+            throw AdministratorPromptError.launchFailed("The file osascript does not exist.")
+        case .hang:
+            await gate.wait()
+            throw AdministratorPromptError.timedOut(seconds: AdministratorPrompt.timeout)
+        case .stuck:
+            let handle = UnfinishedPrompt(pid: Self.stuckPid, osascriptAlive: true)
+            lock.withLock { _unfinished = handle }
+            throw AdministratorPromptError.stillRunning(handle, grace: AdministratorPrompt.stopGrace)
+        }
+    }
+}
+
+/// Records every call; can be told to throw. `disablesleep 1` goes through
+/// `prompt`, the way PmsetSleepGuard routes it through the administrator
+/// dialog, so a test can see whether a path would have prompted.
 final class FakeSleepGuard: SleepGuarding, @unchecked Sendable {
+    let prompt = FakeAdministratorPrompt()
     private let lock = NSLock()
     private var _calls: [String] = []
     private var _sleepDisabled = false
@@ -86,6 +172,10 @@ final class FakeSleepGuard: SleepGuarding, @unchecked Sendable {
     private var _restoreGate: AsyncGate?
     private var _restoreCalledAt: Date?
     private var _readGate: AsyncGate?
+    private var _restoreChecks = 0
+    private var _restoreRuleMissing = false
+    private var _onRestoreCheck: (@Sendable () -> Void)?
+    private var _lastSleepOffIsOurs: Bool?
     var throwOn: Set<String> = []
     /// Commands that take effect and *then* fail (a timeout after pmset
     /// already applied the setting): the ambiguous failure shape.
@@ -124,6 +214,39 @@ final class FakeSleepGuard: SleepGuarding, @unchecked Sendable {
         set { lock.withLock { _readGate = newValue } }
     }
 
+    /// `checkPasswordlessRestore()` calls. Kept out of `calls`, which
+    /// tests compare as sequences of pmset commands.
+    var restoreChecks: Int { lock.withLock { _restoreChecks } }
+    /// /etc/sudoers.d/insomnia is missing: the check fails the way
+    /// `sudo -k -n` does when it would need a password.
+    var restoreRuleMissing: Bool {
+        get { lock.withLock { _restoreRuleMissing } }
+        set { lock.withLock { _restoreRuleMissing = newValue } }
+    }
+    /// What the latest check was told about the journal.
+    var lastSleepOffIsOurs: Bool? { lock.withLock { _lastSleepOffIsOurs } }
+    /// Runs inside every check, so a test can look at what had happened
+    /// by then.
+    var onRestoreCheck: (@Sendable () -> Void)? {
+        get { lock.withLock { _onRestoreCheck } }
+        set { lock.withLock { _onRestoreCheck = newValue } }
+    }
+
+    /// Fails as PmsetSleepGuard's does: refused while sleep is off and
+    /// the journal does not own that, and otherwise refused without the
+    /// rule. It never changes `sleepDisabled`, so a test still sees what
+    /// an end did; the run's effect is tested with the real guard.
+    func checkPasswordlessRestore(sleepOffIsOurs: Bool) async throws {
+        let (missing, off, hook) = lock.withLock {
+            _restoreChecks += 1
+            _lastSleepOffIsOurs = sleepOffIsOurs
+            return (_restoreRuleMissing, _sleepDisabled, _onRestoreCheck)
+        }
+        hook?()
+        if off, !sleepOffIsOurs { throw PasswordlessRestoreError.sleepAlreadyOff }
+        if missing { throw PasswordlessRestoreError.notConfirmed("exit 1: sudo: a password is required") }
+    }
+
     private func record(_ c: String) throws {
         lock.withLock { _calls.append(c) }
         if throwOn.contains(c) {
@@ -137,13 +260,20 @@ final class FakeSleepGuard: SleepGuarding, @unchecked Sendable {
         }
     }
 
-    func setSleepDisabled(_ disabled: Bool) async throws {
-        if !disabled { lock.withLock { _restoreCalledAt = Date() } }
-        try record("disablesleep \(disabled ? 1 : 0)")
-        if disabled, let gate = sleepGate { await gate.wait() }
-        if !disabled, let gate = restoreGate { await gate.wait() }
-        sleepDisabled = disabled
-        try afterEffect("disablesleep \(disabled ? 1 : 0)")
+    func disableSleep(_ start: PendingStart) async throws {
+        try record("disablesleep 1")
+        try await prompt.disableSleep(start)
+        if let gate = sleepGate { await gate.wait() }
+        sleepDisabled = true
+        try afterEffect("disablesleep 1")
+    }
+
+    func enableSleep() async throws {
+        lock.withLock { _restoreCalledAt = Date() }
+        try record("disablesleep 0")
+        if let gate = restoreGate { await gate.wait() }
+        sleepDisabled = false
+        try afterEffect("disablesleep 0")
     }
 
     func isSleepDisabled() async throws -> Bool {
@@ -585,6 +715,19 @@ final class FakeBackstop: BackstopScheduling, @unchecked Sendable {
         if failArm { throw BackstopError(message: "fake launchd refused") }
         lock.withLock { _arms += 1 }
     }
+    private var _outdatedScript = false
+    private var _checks = 0
+    /// The installed backstop.sh is one that cannot void a dialog.
+    var outdatedScript: Bool {
+        get { lock.withLock { _outdatedScript } }
+        set { lock.withLock { _outdatedScript = newValue } }
+    }
+    /// `checkVoidsPrompts()` calls, passed or not.
+    var checks: Int { lock.withLock { _checks } }
+    func checkVoidsPrompts() throws {
+        let outdated = lock.withLock { _checks += 1; return _outdatedScript }
+        if outdated { throw BackstopError(message: "the installed backstop.sh is older than this build; run scripts/install.sh again") }
+    }
 }
 
 /// A mutable fake clock usable from the @Sendable clock closure.
@@ -603,6 +746,8 @@ final class FakeClock: @unchecked Sendable {
 struct Harness {
     let home: TempHome
     let guardFake: FakeSleepGuard
+    /// The administrator dialog behind `guardFake`'s `disablesleep 1`.
+    var prompt: FakeAdministratorPrompt { guardFake.prompt }
     let procs: FakeProcessControl
     let backstop: FakeBackstop
     let clock: FakeClock
@@ -627,22 +772,28 @@ struct Harness {
         appNap = FakeAppNapPreferences()
         notifier = RecordingNotifier()
         clamshell = FakeClamshell(false)
+        let c = clock
+        guardFake.prompt.now = { c.now }
     }
 
     /// `lockTimeout` is short so contention tests fail closed quickly;
     /// `retryDelay` is long so the in-process retry never fires by accident;
     /// `reassertDelay` likewise, so the second display/keyboard write after
     /// a restore never lands in a test that did not ask for it.
+    /// `sleepGuard` replaces `guardFake` for a test that drives the real
+    /// PmsetSleepGuard against a fake sudo and pmset.
     func makeManager(
         lockTimeout: TimeInterval = 0.3,
         retryDelay: TimeInterval = 60,
-        reassertDelay: Duration = .seconds(3600)
+        markerLockTimeout: TimeInterval = 0.3,
+        reassertDelay: Duration = .seconds(3600),
+        sleepGuard: (any SleepGuarding)? = nil
     ) -> SessionManager {
         let c = clock
         let lid = clamshell
         return SessionManager(
             paths: home.paths,
-            sleepGuard: guardFake,
+            sleepGuard: sleepGuard ?? guardFake,
             processControl: procs,
             backstop: backstop,
             audio: audio,
@@ -654,6 +805,7 @@ struct Harness {
             clock: { c.now },
             recoveryLockTimeout: lockTimeout,
             recoveryRetryDelay: retryDelay,
+            markerLockTimeout: markerLockTimeout,
             reassertDelay: reassertDelay
         )
     }
@@ -693,6 +845,207 @@ private final class MainActorFlag {
 @MainActor
 func settleQueuedRequests() async {
     for _ in 0..<5 { await Task.yield() }
+}
+
+/// What `AdministratorPrompt.rootCommand` did in one run.
+struct RootCommandRun {
+    let status: Int32
+    let stderr: String
+    /// Arguments of each pmset call, in order.
+    let pmsetCalls: [String]
+}
+
+/// AppleScript's `quoted form of`: single quotes, each `'` as `'\''`.
+func appleScriptQuotedForm(_ s: String) -> String {
+    "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
+}
+
+/// The command the dialog runs as root, started the way the dialog starts
+/// it: `/bin/sh -c` on the line `do shell script` builds, `<markerLock>
+/// '<marker>' /bin/sh -c '<rootCommand>' insomnia '<marker>' '<nonce>'
+/// '<deadline>'`, quoted as `quoted form of` quotes it. The deadline is an
+/// hour from now unless given. The real /usr/bin/lockf takes the marker's
+/// lock and the real /bin/date tells the time. It runs as the current user with `dir` as its working
+/// directory, and `/usr/bin/pmset` is replaced by a fake in `dir` that
+/// records its arguments. With `holdPmset` the fake pmset, once called,
+/// waits until `release()` (60 s at most, and only while `dir` exists), so
+/// a test can act while the command holds the marker's lock.
+final class RootCommandProcess {
+    private let process = Process()
+    private let childExit: ProcessExit
+    private let err = Pipe()
+    private let calls: URL
+    private let started: URL
+    private let releaseFile: URL
+
+    init(marker: URL, nonce: String, deadline: String? = nil, in dir: URL, holdPmset: Bool = false) throws {
+        let fake = dir.appendingPathComponent("fake-pmset")
+        calls = dir.appendingPathComponent("pmset-calls")
+        started = dir.appendingPathComponent("pmset-started")
+        releaseFile = dir.appendingPathComponent("pmset-release")
+        for file in [calls, started, releaseFile] { try? FileManager.default.removeItem(at: file) }
+        try """
+        #!/bin/bash
+        printf '%s\\n' "$*" >> "$FAKE_PMSET_CALLS"
+        : > "$FAKE_PMSET_STARTED"
+        if [[ -n "${FAKE_PMSET_HOLD:-}" ]]; then
+          i=0; while [[ ! -e "$FAKE_PMSET_HOLD" && -d "${FAKE_PMSET_HOLD%/*}" && $i -lt 1200 ]]; do sleep 0.05; i=$((i + 1)); done
+        fi
+        exit 0
+        """.write(to: fake, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fake.path)
+
+        let real = "/usr/bin/pmset"
+        let command = AdministratorPrompt.rootCommand
+        XCTAssertEqual(command.components(separatedBy: real).count - 1, 1, "the command calls pmset once, by absolute path")
+        XCTAssertFalse(fake.path.contains(" "), "the fake replaces an unquoted word")
+        let line = AdministratorPrompt.markerLock + " " + appleScriptQuotedForm(marker.path)
+            + " /bin/sh -c " + appleScriptQuotedForm(command.replacingOccurrences(of: real, with: fake.path))
+            + " insomnia " + appleScriptQuotedForm(marker.path) + " " + appleScriptQuotedForm(nonce)
+            + " " + appleScriptQuotedForm(deadline ?? Self.inAnHour)
+
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = ["-c", line]
+        process.currentDirectoryURL = dir
+        var env = ProcessInfo.processInfo.environment
+        env["FAKE_PMSET_CALLS"] = calls.path
+        env["FAKE_PMSET_STARTED"] = started.path
+        env["FAKE_PMSET_HOLD"] = holdPmset ? releaseFile.path : ""
+        process.environment = env
+        process.standardInput = FileHandle.nullDevice
+        process.standardError = err
+        childExit = ProcessExit(process)
+        try process.run()
+    }
+
+    var pid: pid_t { process.processIdentifier }
+
+    static var inAnHour: String {
+        PendingStart(marker: URL(fileURLWithPath: "/"), nonce: "", deadline: Date().addingTimeInterval(3600)).deadlineArgument
+    }
+
+    /// Waits (10 s at most) until the fake pmset has been called.
+    func waitUntilPmsetRuns() -> Bool {
+        let limit = Date().addingTimeInterval(10)
+        while !FileManager.default.fileExists(atPath: started.path) {
+            if Date() > limit { return false }
+            usleep(10_000)
+        }
+        return true
+    }
+
+    func release() {
+        FileManager.default.createFile(atPath: releaseFile.path, contents: nil)
+    }
+
+    func wait() -> RootCommandRun {
+        let errData = err.fileHandleForReading.readDataToEndOfFile()
+        childExit.wait()
+        let recorded = (try? String(contentsOf: calls, encoding: .utf8)) ?? ""
+        return RootCommandRun(
+            status: process.terminationStatus,
+            stderr: String(decoding: errData, as: UTF8.self),
+            pmsetCalls: recorded.split(separator: "\n").map(String.init)
+        )
+    }
+}
+
+/// Waits (10 s at most) until `pid`, or a child of it, is /usr/bin/lockf
+/// blocked in the kernel: every thread waiting and not one system call
+/// made across five looks 10 ms apart. lockf blocks in exactly one place,
+/// the open(2) with O_EXLOCK that takes the lock, and that open has
+/// resolved the path to its file before it waits: from then on the waiter
+/// holds the marker itself, and deleting the path cannot stop it from
+/// getting the lock on that file.
+func waitUntilLockfWaits(under pid: pid_t) -> Bool {
+    func path(_ pid: pid_t) -> String? {
+        var buf = [UInt8](repeating: 0, count: 4 * Int(MAXPATHLEN))
+        let n = proc_pidpath(pid, &buf, UInt32(buf.count))
+        return n > 0 ? String(decoding: buf.prefix(Int(n)), as: UTF8.self) : nil
+    }
+    func children(_ pid: pid_t) -> [pid_t] {
+        var pids = [pid_t](repeating: 0, count: 64)
+        let n = proc_listchildpids(pid, &pids, Int32(pids.count * MemoryLayout<pid_t>.size))
+        return n > 0 ? Array(pids.prefix(Int(n))) : []
+    }
+    /// Unix system calls made so far, or nil unless every thread is waiting.
+    func blockedSyscalls(_ pid: pid_t) -> Int32? {
+        var tids = [UInt64](repeating: 0, count: 16)
+        let bytes = proc_pidinfo(pid, PROC_PIDLISTTHREADS, 0, &tids, Int32(tids.count * MemoryLayout<UInt64>.size))
+        guard bytes > 0 else { return nil }
+        for tid in tids.prefix(Int(bytes) / MemoryLayout<UInt64>.size) {
+            var info = proc_threadinfo()
+            guard proc_pidinfo(pid, PROC_PIDTHREADINFO, tid, &info, Int32(MemoryLayout<proc_threadinfo>.size)) > 0,
+                  info.pth_run_state == TH_STATE_WAITING else { return nil }
+        }
+        var task = proc_taskinfo()
+        guard proc_pidinfo(pid, PROC_PIDTASKINFO, 0, &task, Int32(MemoryLayout<proc_taskinfo>.size)) > 0 else { return nil }
+        return task.pti_syscalls_unix
+    }
+    let limit = Date().addingTimeInterval(10)
+    var last: (pid: pid_t, syscalls: Int32)?
+    var steady = 0
+    while Date() < limit {
+        let lockf = ([pid] + children(pid)).first { path($0) == "/usr/bin/lockf" }
+        if let lockf, let count = blockedSyscalls(lockf) {
+            steady = (last?.pid == lockf && last?.syscalls == count) ? steady + 1 : 0
+            last = (lockf, count)
+            if steady == 4 { return true }
+        } else {
+            steady = 0
+            last = nil
+        }
+        usleep(10_000)
+    }
+    return false
+}
+
+/// Runs the root command to the end (see RootCommandProcess).
+func runRootCommand(marker: URL, nonce: String, deadline: String? = nil, in dir: URL) throws -> RootCommandRun {
+    try RootCommandProcess(marker: marker, nonce: nonce, deadline: deadline, in: dir).wait()
+}
+
+/// Holds an flock(2) lock on `url` from this process, the way the root
+/// command's lockf holds the marker, until `release()`.
+final class FileLockHolder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var fd: Int32
+
+    init(_ url: URL) throws {
+        fd = open(url.path, O_RDONLY | O_CLOEXEC)
+        guard fd >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        guard flock(fd, LOCK_EX | LOCK_NB) == 0 else {
+            let err = errno
+            close(fd)
+            throw POSIXError(POSIXErrorCode(rawValue: err) ?? .EIO)
+        }
+    }
+
+    func release() {
+        lock.withLock {
+            guard fd >= 0 else { return }
+            close(fd)
+            fd = -1
+        }
+    }
+
+    deinit { release() }
+}
+
+/// A FileLockHolder a `@Sendable` callback can create and a test can
+/// release later.
+final class LockHolderBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var holder: FileLockHolder?
+
+    func hold(_ url: URL) {
+        let h = try? FileLockHolder(url)
+        lock.withLock { holder = h }
+    }
+
+    func release() {
+        lock.withLock { holder?.release() }
+    }
 }
 
 /// A FIFO at `url`, and a watchdog for it. Correct code never opens it. If

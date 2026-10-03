@@ -13,7 +13,10 @@ keeps sleep disabled, and `state.json` (`RuntimeState`), the journal of
 everything Insomnia changed and must undo. Every change is journaled before
 it is made and undone from the journal, never from memory. A session starts
 by writing both files, arming the launchd backstop, and only then running
-`sudo -n pmset -a disablesleep 1`; it never starts without the backstop.
+`pmset -a disablesleep 1` through the macOS administrator password prompt
+(`AdministratorPrompt.swift`); it never starts without the backstop. Only an
+explicit Start shows that prompt. The sudoers rule covers turning sleep back
+on and Low Power Mode, never turning sleep off.
 
 The app undoes the journal itself at session end, Quit, lid open, and at
 every launch (reconcile). `scripts/backstop.sh`, installed by `install.sh`
@@ -115,8 +118,72 @@ Flag a change that breaks one of these; do not flag the behavior itself.
   announced (spec sections 4 and 6, PR #10).
 - `SessionManager.swift`, `performStart`. `session.json` and
   `sleepDisabledByUs` are written and `LaunchdBackstop.arm()` has succeeded
-  before `pmset -a disablesleep 1` runs. Quitting the app always ends the
-  session; there is no keep-awake after quit (spec section 1).
+  before `pmset -a disablesleep 1` runs through the administrator password
+  prompt. Quitting the app always ends the session; there is no keep-awake
+  after quit (spec section 1).
+- `install.sh`, `SleepGuard.swift`, `AdministratorPrompt.swift`. The
+  sudoers rule has three NOPASSWD lines and none for `disablesleep 1`:
+  turning sleep off asks for the administrator password at every Start, so
+  nothing running as the user can keep the Mac awake unattended. Reconcile
+  at launch reads `pmset -g` and never prompts or turns sleep off again; a
+  session whose sleep was turned back on while the app was not running ends
+  (`EndReason.sleepReenabled`). No install path, failure paths included,
+  writes a passwordless `disablesleep 1` line (PR #32).
+- `AdministratorPrompt.swift`, `SessionManager.swift`. The password prompt
+  gets SIGTERM at 120 s and is never sent SIGKILL. One still running 3 s
+  later is reported with its pid and its marker is deleted under the
+  marker's lock. Once that succeeds its root command can no longer run
+  pmset, so the start rolls back at once and releases the recovery lock;
+  the prompt is watched outside the transaction, and the menu line offers
+  `kill <pid>` until osascript exits and goes once the prompt has. Only
+  while the root command holds the marker's lock (past its checks, maybe in
+  pmset) or the marker cannot be deleted does the start keep the recovery
+  lock, `session.json` and the journal entry until the prompt exits, the
+  same rule as a stuck `sudo -n pmset`.
+- `AdministratorPrompt.swift`, `SessionManager.swift`, `backstop.sh`,
+  `uninstall.sh`. A prompt can outlive its start (the app crashes or is
+  force-quit under the dialog, the start rolls back after a stuck prompt).
+  Its root command therefore runs under `lockf -k -n` on `pending-start`
+  and runs `pmset -a disablesleep 1` only while the file holds that start's
+  nonce and `/bin/date +%s` is below the session's end, passed as `$3`; a
+  `$3` that `[` cannot compare refuses too. The start deletes the file before it releases the recovery lock;
+  every other lock holder deletes it before it touches the journal, and
+  every deleter (Store.removePendingStart, backstop.sh, uninstall.sh)
+  takes the file's own lock first and deletes only while the path still
+  names the locked file (device and inode of the locked descriptor against
+  the path; the scripts lock the marker through fd 8 to have one), so the
+  file never goes between the nonce check and the end of pmset. Voiding a
+  stuck prompt also needs the locked file to be the one that start wrote. The file is written with no newline
+  and compared, never run. A marker that cannot be written rolls the start
+  back with no prompt. One that cannot be locked in time or deleted keeps
+  `sleepDisabledByUs` journaled after sleep is restored (the app and the
+  backstop both gate the clearing on it), is reported, refuses new starts,
+  and makes `uninstall.sh` refuse to remove anything. A cancelled dialog or
+  an osascript that never launched ran nothing as root: the start restores
+  the journal and session.json exactly and runs no pmset.
+- `BackstopVersion.swift`, `backstop.sh`, `install.sh`. Start reads the
+  installed `backstop.sh`'s `# insomnia-backstop-version:` line and shows no
+  dialog below version 2, the first that deletes `pending-start`; the user
+  is told to run `install.sh` again. It also shows no dialog unless
+  `SleepGuarding.checkPasswordlessRestore` passes first, with nothing
+  written before it: without the passwordless restore every undo would
+  fail and leave sleep off. The check runs the restore itself, `sudo -k -n
+  /usr/bin/pmset -a disablesleep 0`, because only a run shows whether sudo
+  wants a password (`-k` ignores a cached credential; `sudo -l` lists
+  commands the admin group may run with its password). It runs only while
+  `pmset -g` reports `SleepDisabled 0` or the journal already owes that
+  restore; a `SleepDisabled 1` the journal does not claim refuses Start
+  with nothing run, deliberately, so a setting another tool made stays.
+  `install.sh` checks the rule the same way after writing it, and leaves
+  the check to the app while `SleepDisabled` does not read 0. `install.sh` installs `backstop.sh`
+  under the recovery lock before the bundle (`install -S`, so a running old
+  script keeps its inode) and waits up to `RETIRE_WAIT_SECONDS` for runs of
+  the old script to exit, stopping before the sudoers rule if one stays. A
+  run is a process whose arguments are exactly `/bin/bash`, the installed
+  path and at most `--force`. The wait cannot use the recovery lock: the
+  installer holds it, and an old run is waiting on it. Bump the
+  version line and `BackstopVersion.required` together whenever the app
+  starts relying on new backstop behavior.
 - `DisplayPower.swift`, `LidActions.swift`. On lid close, brightness 0 is
   the primary mechanism; the display sleep request (`IORequestIdle`) is
   best effort and is ignored while any process holds a display assertion,
@@ -136,6 +203,11 @@ Flag a change that breaks one of these; do not flag the behavior itself.
   trust boundary as `config.json`: anyone who can write the support
   directory already controls the app. A trigger left over from before the
   session started is drained and logged as stale, not delivered.
-- `install.sh`. Not atomic. It asks for sudo once, for the sudoers file,
-  before anything of a previous install is touched, and a failure after
-  that step says exactly what was installed so far.
+- `install.sh`. Not atomic. It asks for the password (`sudo -v`) before a
+  running app is asked to quit, so a cancelled password changes nothing and
+  a running session keeps going; when a session is running it says so first
+  and, in a terminal, asks to continue. It then quits the app and, under the
+  recovery lock, installs `backstop.sh`, waits for older runs of it, writes
+  the sudoers file on the cached credential, and looks for a reopened app
+  right before it replaces the bundle. Every stop says what was installed so
+  far; one after the rule is written gives the rerun command.

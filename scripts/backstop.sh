@@ -16,12 +16,29 @@
 # instead of deadlocking against it; fd 9 is accepted only if its inode is
 # the lock file's inode.
 #
+# First thing under the lock, every run deletes APP_SUPPORT/pending-start.
+# The app holds the lock for as long as a Start waits on its password
+# dialog, so a marker found here belongs to a start that was abandoned (the
+# app died under its dialog). The root command behind that dialog turns
+# sleep off only while the marker holds its nonce, so answering the dialog
+# after this point changes nothing. That command also holds a lockf lock on
+# the marker from before its nonce check until pmset exits, and the marker
+# is deleted only under the same lock, and only while its path still names
+# the locked file: it goes before the check, or after pmset, whose effect
+# the journal entry still covers. A marker that cannot
+# be locked within PENDING_LOCK_TIMEOUT_SECONDS or cannot be deleted means
+# that dialog could still turn sleep off later: sleep is still restored,
+# but sleepDisabledByUs stays journaled and the run exits 1, so the next run
+# retries.
+#
 # Decision, driven only by what the journal says was changed:
-#   - session.json valid (endsAt in the future) and no --force: exit 0.
+#   - session.json valid (endsAt in the future) and no --force: exit 0
+#     (1 while pending-start is still present).
 #   - state.json missing or clean: nothing is undone and nothing privileged
 #     runs; an expired session.json is removed. Exit 0.
 #   - state.json dirty: undo each journaled entry from the journal alone:
-#       sleepDisabledByUs   -> sudo -n pmset -a disablesleep 0
+#       sleepDisabledByUs   -> sudo -n pmset -a disablesleep 0 (the entry is
+#                              cleared only if pending-start is gone)
 #       lowPowerSetByUs     -> sudo -n pmset -b lowpowermode 0
 #       frozenProcesses     -> SIGCONT, but only to a pid that is observed to
 #                              exist, be stopped, have started in this boot
@@ -78,6 +95,13 @@
 # (used by install.sh / uninstall.sh to end a stale session deliberately).
 #
 # Honours INSOMNIA_HOME with the same layout as the app (see Paths.swift).
+#
+# The line below says which recovery contract this copy implements. The app
+# reads it from the installed script before every password dialog and
+# refuses Start when it is missing or lower than it needs
+# (BackstopVersion.swift). 2: pending-start is deleted under its lock, as
+# described above. Raise it when the app comes to rely on something new here.
+# insomnia-backstop-version: 2
 set -euo pipefail
 export LC_ALL=C TZ=UTC
 
@@ -96,7 +120,11 @@ MKDIR=/bin/mkdir
 RM=/bin/rm
 MV=/bin/mv
 CP=/bin/cp
+STAT=/usr/bin/stat
 LOCK_TIMEOUT_SECONDS=10
+# How long to wait for the root command behind a password dialog to let go
+# of the pending-start marker (pmset takes well under a second).
+PENDING_LOCK_TIMEOUT_SECONDS=10
 # Longest a single undo command (sudo pmset, defaults) may run before it is
 # sent SIGTERM, and how long it then gets to exit before this run fails closed.
 COMMAND_TIMEOUT_SECONDS=30
@@ -120,6 +148,7 @@ else
 fi
 SESSION="$APP_SUPPORT/session.json"
 STATE="$APP_SUPPORT/state.json"
+PENDING="$APP_SUPPORT/pending-start"
 LOCK="$APP_SUPPORT/.recovery.lock"
 LOG="$LOG_DIR/insomnia.log"
 
@@ -130,7 +159,7 @@ log() { # level message
 
 # --- Lock --------------------------------------------------------------------
 "$MKDIR" -p "$APP_SUPPORT"
-inode() { stat -f %i "$1" 2>/dev/null; }
+inode() { "$STAT" -f %i "$1" 2>/dev/null; }
 if [[ -e /dev/fd/9 && -e "$LOCK" && -n "$(inode "$LOCK")" && "$(inode /dev/fd/9)" == "$(inode "$LOCK")" ]]; then
   : # fd 9 is the caller's handle on the lock file; share its lock.
 else
@@ -143,6 +172,73 @@ if (( lock_rc != 0 )); then
   exit 75
 fi
 # From here on this process holds the lock until it exits (fd 9 closes).
+
+# Deletes pending-start under its own lock, as Store.removePendingStart
+# does. The marker is opened on fd 8 and locked through it: lockf given a
+# descriptor locks this shell's open file, and the lock lasts until fd 8
+# closes. Then the path must still name the locked file (stat of fd 8
+# against stat -L of the path), because lockf locks a file and rm goes by
+# path: a file put in the marker's place after the open is not covered by
+# the lock, so it is left alone. Only a regular file is opened; open(2) on
+# a FIFO with no writer blocks, and this runs under the recovery lock. A
+# link to nothing is removed: the root command cannot open it either.
+# Sets marker_rc: 0 deleted or gone, 75 still locked after
+# PENDING_LOCK_TIMEOUT_SECONDS, 3 replaced after the open, 4 not a regular
+# file, anything else from the open or rm.
+delete_pending_marker() {
+  local locked
+  marker_rc=0
+  if [[ -L "$PENDING" && ! -e "$PENDING" ]]; then
+    "$RM" -f "$PENDING" 2>/dev/null || marker_rc=$?
+    return 0
+  fi
+  [[ -e "$PENDING" ]] || return 0
+  if [[ ! -f "$PENDING" ]]; then
+    marker_rc=4
+    return 0
+  fi
+  { exec 8<"$PENDING"; } 2>/dev/null || { marker_rc=$?; return 0; }
+  "$LOCKF" -s -t "$PENDING_LOCK_TIMEOUT_SECONDS" 8 2>/dev/null || marker_rc=$?
+  if (( marker_rc == 0 )); then
+    locked="$("$STAT" -f '%d:%i' <&8 2>/dev/null)" || locked=""
+    if [[ -n "$locked" && "$locked" == "$("$STAT" -L -f '%d:%i' "$PENDING" 2>/dev/null)" ]]; then
+      "$RM" -f "$PENDING" 2>/dev/null || marker_rc=$?
+    else
+      marker_rc=3
+    fi
+  fi
+  exec 8<&-
+}
+
+# A pending-start marker under the lock belongs to an abandoned start: void
+# the password dialog it was written for, under the marker's own lock (see
+# the header).
+marker_stuck=0
+if [[ -e "$PENDING" || -L "$PENDING" ]]; then
+  delete_pending_marker
+  if [[ -e "$PENDING" || -L "$PENDING" ]]; then
+    marker_stuck=1
+    case "$marker_rc" in
+      75) why="still locked after ${PENDING_LOCK_TIMEOUT_SECONDS}s by the command a password dialog started as root" ;;
+      3) why="was replaced after it was opened, so its lock does not cover the file now at that path" ;;
+      4) why="is not a regular file, so it was not opened" ;;
+      *) why="could not be deleted (exit $marker_rc)" ;;
+    esac
+    log error "$PENDING $why; a password dialog left from an abandoned start could still turn sleep off, so sleepDisabledByUs stays journaled until a later run deletes it"
+  else
+    log info "deleted $PENDING; a password dialog left from an abandoned start can no longer turn sleep off"
+  fi
+fi
+# Every exit 0 from here on goes through this: a marker still present is a
+# failure whatever else the run found, so it is retried and the caller sees
+# it.
+exit_unless_marker_stuck() { # what the run found
+  if (( marker_stuck )); then
+    log error "$1, but $PENDING is still present; will retry on the next run"
+    exit 1
+  fi
+  exit 0
+}
 
 # --- Helpers -----------------------------------------------------------------
 
@@ -422,7 +518,7 @@ if [[ -e "$SESSION" ]]; then
 fi
 
 if [[ "$session_state" == valid ]] && (( force == 0 )); then
-  exit 0
+  exit_unless_marker_stuck "session.json is valid until $ends_at"
 fi
 
 # --- Read the journal --------------------------------------------------------
@@ -520,9 +616,7 @@ if [[ "$journal_state" != dirty ]]; then
   fi
   if [[ "$session_state" == malformed || "$session_state" == unreadable ]]; then
     quarantine_session || exit 1
-    exit 0
-  fi
-  if [[ "$session_state" != none ]]; then
+  elif [[ "$session_state" != none ]]; then
     if [[ "$journal_state" == missing ]]; then
       log warn "$session_note; no journal on disk, nothing recorded to undo"
     else
@@ -530,7 +624,7 @@ if [[ "$journal_state" != dirty ]]; then
     fi
     "$RM" -f "$SESSION"
   fi
-  exit 0
+  exit_unless_marker_stuck "journal is clean"
 fi
 
 # --- Undo --------------------------------------------------------------------
@@ -543,7 +637,11 @@ new_sleep="$sleep_held"
 if [[ "$sleep_held" == true ]]; then
   if run_bounded "$SUDO" -n "$PMSET" -a disablesleep 0; then
     log info "pmset -a disablesleep 0 ok"
-    new_sleep=false; changed=1
+    if (( marker_stuck )); then
+      log error "sleep restored, but sleepDisabledByUs stays journaled while $PENDING is present"
+    else
+      new_sleep=false; changed=1
+    fi
   else
     if (( command_alive )); then stop_transaction "pmset -a disablesleep 0"; fi
     log error "pmset -a disablesleep 0 failed (sudoers rule missing? run install.sh); keeping journal entry for retry"
@@ -777,6 +875,9 @@ if (( changed == 1 )); then
 fi
 
 # --- Report ------------------------------------------------------------------
+if (( marker_stuck )); then
+  failures+=("$PENDING is still present, so a password dialog left from an abandoned start could still turn sleep off")
+fi
 if (( ${#failures[@]} > 0 )); then
   for f in "${failures[@]}"; do log error "still journaled: $f"; done
   log error "journal kept dirty (${#failures[@]} item(s)); will retry on the next run"

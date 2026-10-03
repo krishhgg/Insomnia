@@ -74,10 +74,59 @@ recovery; newly written journals use `frozenProcesses`.
   timer runs at 1 Hz and stops while the lid is closed.
 - Click the cup/countdown to enter an extension; hold the end control to end.
   Right-click opens the status, browser actions, Settings, and Quit menu.
-- Session start: write session + state to disk, arm the launchd backstop, and
-  only then run `sudo pmset -a disablesleep 1`. A session never starts unless
-  the backstop is armed. If pmset fails, delete the session file and surface
-  the error. The journal and backstop always exist before sleep is disabled.
+- Session start: check that the installed `backstop.sh` declares
+  `# insomnia-backstop-version: 2` or later (`BackstopVersion.swift`; 2 is
+  the first that deletes `pending-start`) and refuse with nothing written,
+  asking for `scripts/install.sh` again, if not. Then prove, without
+  prompting, that sleep can be turned back on with no password by running
+  the restore: `sudo -k -n /usr/bin/pmset -a disablesleep 0` must exit 0
+  (`SleepGuarding.checkPasswordlessRestore`). `-k` ignores a cached
+  credential and `-n` fails instead of prompting. `sudo -l` is not used: it
+  lists commands the admin group may run with its password, and lists
+  without one whenever any passwordless entry exists. Otherwise refuse the
+  same way, since the end, the backstop and uninstall all restore with
+  `sudo -n` and would leave sleep off. The run happens only while
+  `pmset -g` reports `SleepDisabled 0`, where it changes nothing, or when
+  the journal already has `sleepDisabledByUs` (a failed restore is owed
+  anyway). A `SleepDisabled 1` the journal does not claim is left alone,
+  as after a cancelled dialog: run nothing and refuse, giving
+  `sudo pmset -a disablesleep 0`. An unreadable `pmset -g` refuses too.
+  Then write session + state
+  to disk, arm the launchd backstop,
+  write a fresh random nonce to `pending-start`, and only then run `pmset -a
+  disablesleep 1` through the macOS administrator password dialog
+  (`osascript` running a fixed `do shell script ... with administrator
+  privileges` literal; 120 s limit, SIGTERM only at the deadline). The
+  marker path, the nonce and the session's `endsAt` (whole seconds since
+  1970, rounded down) are the script's only inputs, passed as positional
+  parameters; the root command runs under `lockf` on the marker and runs
+  pmset only while the marker holds the nonce and `/bin/date +%s` is below
+  `endsAt` (section 8). A
+  session never starts unless the backstop is armed, and a start is refused
+  while a `pending-start` from an earlier start cannot be removed. If the
+  dialog is cancelled or osascript cannot be launched, nothing ran as root:
+  put session.json and the journal back exactly as they were read, run no
+  pmset (a `SleepDisabled` set by another tool stays), and surface the
+  error. If the password is wrong, it times out, or pmset fails, pmset may
+  have run, so undo from the journal like an end, delete the session file
+  and surface the error. The start deletes `pending-start` on every outcome
+  before it lets go of the recovery lock. The wait is bounded: if the
+  dialog's process has not finished 3 s after the SIGTERM, Insomnia kills
+  nothing and deletes the marker under its lock. Once that succeeds the
+  dialog's command can no longer change anything, so the start is rolled
+  back at once and the recovery lock released; the process is watched on
+  its own, and the menu line names its pid until osascript exits and goes
+  when the whole prompt has. While the dialog's root command holds the
+  marker's lock (it is past its checks and may be in pmset), or the marker
+  cannot be deleted, Insomnia instead keeps session.json, the journal entry
+  and the recovery lock until the prompt exits, and rolls back then;
+  starts, ends and the agent wait behind it, the same rule as a `sudo
+  pmset` that will not stop. Either way a notification and the menu line
+  name the pid while osascript runs.
+  The journal and backstop always exist before sleep is disabled, so a
+  crash while the dialog is up leaves recovery a record. Only an explicit
+  Start reaches the dialog; there is no auto-start, URL scheme or scheduled
+  start, and launch at login only reconciles.
 - Session end (timer, End now, Quit, battery floor, thermal critical):
   `sudo pmset -a disablesleep 0`, undo every RuntimeState entry, delete
   session, notify.
@@ -87,10 +136,39 @@ recovery; newly written journals use `frozenProcesses`.
 
 - `install.sh` writes `/etc/sudoers.d/insomnia` allowing the user to run,
   without a password, exactly:
-  - `/usr/bin/pmset -a disablesleep 1`
   - `/usr/bin/pmset -a disablesleep 0`
   - `/usr/bin/pmset -b lowpowermode 1`
   - `/usr/bin/pmset -b lowpowermode 0`
+- `/usr/bin/pmset -a disablesleep 1` is deliberately absent. With a
+  passwordless line, any process running as the user could keep the Mac
+  awake, unjournaled, with Insomnia not running. Turning sleep off goes
+  through the administrator password dialog instead
+  (`AdministratorPrompt.swift`).
+- Turning sleep back on and the Low Power Mode floor stay passwordless so the
+  app, `backstop.sh` and `uninstall.sh` can recover unattended: ending a
+  stuck or crashed session must never need a password.
+- `install.sh` never writes `disablesleep 1`, on any path. When
+  `session.json` holds a future deadline it first says the upgrade will end
+  the session and, in a terminal, asks to continue. It asks for the password
+  (`sudo -v`) before anything else, so a cancelled or failed password
+  changes nothing and a running session keeps going. Then it asks a running
+  app to quit and stops with nothing changed, the sudoers file included, if
+  the app is still running after 15 s, and asks for the password once more
+  if sudo's cached credential expired during the quit. Then it takes the
+  recovery lock, checks that the app was not opened again meanwhile, and
+  replaces `backstop.sh` (atomically, so a run of the old script keeps its
+  own copy). It waits up to 30 s until no process runs the old script, and
+  stops before the rule if one still does or the check fails, so the
+  installed app keeps the rule it was installed with. A run is a process
+  whose arguments are exactly `/bin/bash`, the installed path and at most
+  `--force`; a process that only names the path (an editor, a `tail`) is
+  not one. Only then does it write the three-line rule, look once more for
+  a reopened app, and replace the bundle, so a new app never runs beside a
+  backstop that cannot void its dialog. A build older than this rule
+  starts sessions with `sudo -n pmset -a disablesleep 1`, so any stop between
+  the rule and the new bundle leaves that build unable to start a session;
+  the installer says so and prints the rerun command. A successful install
+  writes the file once.
 - Nothing else runs as root.
 
 ### 3. Lid observer
@@ -415,6 +493,47 @@ provided by the standalone backstop. Performance effects depend on workload.
 Invariants:
 
 - Sleep is never disabled unless a session file with a future `endsAt` exists.
+- A password dialog turns sleep off only for the start that showed it,
+  only while that start still holds the recovery lock, and only before
+  that session's `endsAt`. The start writes a
+  fresh nonce to `pending-start` before the dialog and deletes it before it
+  releases the lock. Every other holder of the lock (any app transaction,
+  reconcile at launch, `backstop.sh`, `uninstall.sh`) deletes it first,
+  before it reads or clears the journal. The root command runs as `lockf
+  -k -n <marker> /bin/sh -c ...`: it holds the marker's flock from before
+  its nonce check until pmset exits, and every deleter takes that lock
+  before it unlinks the file. A lock belongs to a file, and the unlink goes
+  by path, so a deleter unlinks only while the path still names the file it
+  locked (device and inode of the locked descriptor against `stat` of the
+  path; the scripts open the marker on fd 8 and lock that descriptor). The
+  marker therefore goes either before the
+  check, which then fails, or after pmset, while the journal entry still
+  covers it, so a dialog answered after its start was abandoned (crash or
+  force-quit under the dialog, rollback, a newer start) cannot leave sleep
+  off once the journal entry is gone. No dialog is shown unless the
+  installed `backstop.sh` declares a version that deletes the marker.
+- A transaction holds the recovery lock while a command it started may
+  still change something. A stuck dialog whose marker this transaction
+  deleted under the marker's lock can no longer change anything, so it does
+  not hold the lock. That holds only for the file the start wrote:
+  `savePendingStart` returns its device and inode, and a marker found
+  replaced (a copy could have been swapped in after the root command
+  locked the original) or missing (it went without the lock) is not
+  counted as voided, so the transaction waits for the dialog to exit.
+  Deleters that did not write the marker (a transaction after a relaunch,
+  `backstop.sh`, `uninstall.sh`) have no identity to compare, so a copy
+  swapped in before their open while the root command holds the original
+  would be deleted in its place. Only a process running as the user can
+  make that swap, and it can already clear `sleepDisabledByUs` in
+  `state.json` directly.
+- `sleepDisabledByUs` is cleared only by a transaction that removed
+  `pending-start` before it restored sleep. A marker that cannot be locked
+  within its timeout or cannot be deleted leaves recovery incomplete: sleep
+  is still restored, the entry stays, the app reports it (log, "Restore
+  incomplete" notification, menu line) and refuses new starts, the agent
+  exits 1, and every later run retries. A journal write that fails after
+  sleep was restored is reported the same way, and the entry it could not
+  clear is retried.
 - Every change Insomnia makes is in RuntimeState before it is made, and is
   undone from RuntimeState, never from memory.
 
@@ -451,17 +570,23 @@ Reconcile runs at every Insomnia launch:
    the folder. `backstop.sh` tries the rename again on every run.
    An unreadable journal still refuses every transaction and leaves both
    files in place.
-2. Session valid → establish the independent recovery agent before reapplying
-   the sleep guard, then resume observers. If the lid is open, restore recorded
-   lid-close actions. Arming or restoration errors must remain visible.
+2. Session valid → establish the independent recovery agent, then read
+   `pmset -g`. `SleepDisabled 1`: journal ownership if missing and resume
+   observers; the guard is never re-applied, since that needs the
+   administrator password and a relaunch has nobody at the keyboard.
+   `SleepDisabled 0` (something turned sleep back on while Insomnia was not
+   running): end the session with a notification, no prompt. If the lid is
+   open, restore recorded lid-close actions. Arming, read or restoration
+   errors must remain visible.
 3. `pmset -g` reports `SleepDisabled 1` with no session and no journal
    entry → leave it. Step 1 has already undone a disable Insomnia journaled,
    so this one was set by something else (a hand-run `pmset`, another tool)
    and is not Insomnia's to undo. Log it, show it on the menu's warning line,
-   and notify once per launch with `sudo pmset -a disablesleep 0`. A bit
-   still journaled as ours after a failed restore is retried from the
-   journal, not from this check. Nothing clears `SleepDisabled` without a
-   journal entry, in the app or in the agent.
+   and notify once per launch with `sudo pmset -a disablesleep 0`. Start is
+   refused while it stays (section 2). A bit still journaled as ours after
+   a failed restore is retried from the journal, not from this check.
+   Nothing clears `SleepDisabled` without a journal entry, in the app or in
+   the agent.
 
 Backstop, independent of the app:
 
@@ -486,11 +611,15 @@ Backstop, independent of the app:
 
 ### 9. Notifications
 
-`UNUserNotificationCenter`: session ended (with reason), extend reminder 5
-minutes before end, battery floor reached, battery unreadable twice in a row,
-thermal action taken, network gap recovered (with nudge summary), sleep
-restored by backstop, sleep disabled by something other than Insomnia
-(reconcile step 3, once per launch).
+`UNUserNotificationCenter`: session ended (with reason), session not started
+(the password dialog was cancelled or failed, or a `pending-start` that
+cannot be removed refused the start), password prompt still running
+(osascript's pid, while it runs), session ended because sleep was
+turned back on while Insomnia was not running, extend reminder 5 minutes
+before end, battery floor reached, battery unreadable twice in a row, thermal
+action taken, network gap recovered (with nudge summary), sleep restored by
+backstop, sleep disabled by something other than Insomnia (reconcile step 3,
+once per launch).
 
 ### 10. Settings
 
@@ -728,6 +857,8 @@ git clone https://github.com/kgarg2468/Insomnia.git && cd Insomnia
 ```
 
 Then set the hotspot in Settings, pick a freeze list, and start a session.
+Each start asks for the administrator password (that is the `disablesleep 1`
+the sudoers file does not cover).
 
 ## Manual test plan
 
@@ -737,9 +868,15 @@ that any case passed; record results in the release validation record.
 
 1. **First launch.** Confirm the status item is visible to the right of the
    notch on first launch.
-2. **Stays awake.** Start 30m session, close lid, wait 5 minutes, ping the Mac
+2. **Stays awake.** Start 30m session; the administrator password dialog
+   appears and names what it does. Close lid, wait 5 minutes, ping the Mac
    from the phone or check the heartbeat log. Open lid: session still running,
-   sleep still disabled until end.
+   sleep still disabled until end. Separately: Enter, then Cancel in the
+   dialog → no session, `pmset -g` unchanged (no `SleepDisabled`),
+   session.json and the journal are clean, and the "Session not started"
+   notification says nothing was changed. With `SleepDisabled 1` set by
+   hand first, Enter shows no dialog, changes nothing and gives the command
+   that turns sleep back on.
 3. **Restores.** End now → `pmset -g` shows no `SleepDisabled`. Quit → same.
    Timer expiry → same, plus notification.
 4. **Backstop.** Force-quit a supervised disposable session, then verify
