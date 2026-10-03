@@ -1072,6 +1072,40 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(fx.log().contains("journal is clean, but \(fx.pendingStart.path) is still present"), fx.log())
     }
 
+    /// A session that is still valid ends the run early, but not with
+    /// success while the marker stays.
+    func testBackstopFailsOnAStuckMarkerWhileTheSessionIsValid() throws {
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: 3600))
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        try FileManager.default.createDirectory(at: fx.pendingStart, withIntermediateDirectories: false)
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 1, r.stderr)
+        XCTAssertEqual(fx.calls(), [], "a valid session is left alone")
+        XCTAssertTrue(fx.exists(fx.session))
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, true)
+        XCTAssertTrue(fx.log().contains("is not a regular file, so it was not opened"), fx.log())
+        XCTAssertTrue(fx.log().contains("session.json is valid until "), fx.log())
+        XCTAssertTrue(fx.log().contains("but \(fx.pendingStart.path) is still present"), fx.log())
+    }
+
+    /// The same after a session.json that is not a session is moved aside
+    /// with nothing journaled.
+    func testBackstopFailsOnAStuckMarkerAfterMovingASessionAside() throws {
+        try "not json".write(to: fx.session, atomically: true, encoding: .utf8)
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        try FileManager.default.createDirectory(at: fx.pendingStart, withIntermediateDirectories: false)
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 1, r.stderr)
+        XCTAssertEqual(fx.calls(), [])
+        XCTAssertFalse(fx.exists(fx.session), "session.json is still moved aside")
+        XCTAssertEqual(try movedAsideSessions().count, 1)
+        XCTAssertTrue(fx.log().contains("journal is clean, but \(fx.pendingStart.path) is still present"), fx.log())
+    }
+
     /// A session that is still valid is left alone, but the dialog of the
     /// start that died is voided all the same.
     func testBackstopVoidsAnAbandonedDialogEvenWhileTheSessionIsValid() throws {

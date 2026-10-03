@@ -32,7 +32,8 @@
 # retries.
 #
 # Decision, driven only by what the journal says was changed:
-#   - session.json valid (endsAt in the future) and no --force: exit 0.
+#   - session.json valid (endsAt in the future) and no --force: exit 0
+#     (1 while pending-start is still present).
 #   - state.json missing or clean: nothing is undone and nothing privileged
 #     runs; an expired session.json is removed. Exit 0.
 #   - state.json dirty: undo each journaled entry from the journal alone:
@@ -228,6 +229,16 @@ if [[ -e "$PENDING" || -L "$PENDING" ]]; then
     log info "deleted $PENDING; a password dialog left from an abandoned start can no longer turn sleep off"
   fi
 fi
+# Every exit 0 from here on goes through this: a marker still present is a
+# failure whatever else the run found, so it is retried and the caller sees
+# it.
+exit_unless_marker_stuck() { # what the run found
+  if (( marker_stuck )); then
+    log error "$1, but $PENDING is still present; will retry on the next run"
+    exit 1
+  fi
+  exit 0
+}
 
 # --- Helpers -----------------------------------------------------------------
 
@@ -484,7 +495,7 @@ if [[ -e "$SESSION" ]]; then
 fi
 
 if [[ "$session_state" == valid ]] && (( force == 0 )); then
-  exit 0
+  exit_unless_marker_stuck "session.json is valid until $ends_at"
 fi
 
 # --- Read the journal --------------------------------------------------------
@@ -582,9 +593,7 @@ if [[ "$journal_state" != dirty ]]; then
   fi
   if [[ "$session_state" == malformed || "$session_state" == unreadable ]]; then
     quarantine_session || exit 1
-    exit 0
-  fi
-  if [[ "$session_state" != none ]]; then
+  elif [[ "$session_state" != none ]]; then
     if [[ "$journal_state" == missing ]]; then
       log warn "$session_note; no journal on disk, nothing recorded to undo"
     else
@@ -592,11 +601,7 @@ if [[ "$journal_state" != dirty ]]; then
     fi
     "$RM" -f "$SESSION"
   fi
-  if (( marker_stuck )); then
-    log error "journal is clean, but $PENDING is still present; will retry on the next run"
-    exit 1
-  fi
-  exit 0
+  exit_unless_marker_stuck "journal is clean"
 fi
 
 # --- Undo --------------------------------------------------------------------
