@@ -432,8 +432,7 @@ restored by backstop, sleep disabled by something other than Insomnia
 JSON at `~/Library/Application Support/Insomnia/config.json`, edited through a
 small settings window. Like `session.json`, `state.json` and the recovery
 lock it is created mode 0600 in a 0700 directory, and a looser file from an
-older build is tightened (group and other access and any ACL removed) when
-the app reads it:
+older build is tightened when the app reads it:
 
 - presets, default preset
 - freeze list (bundle ids), freeze every other app on/off, Docker rule
