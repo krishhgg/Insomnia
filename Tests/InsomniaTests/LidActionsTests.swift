@@ -1212,6 +1212,19 @@ final class LidActionsTests: XCTestCase {
         XCTAssertFalse(log.contains("second check"), log)
     }
 
+    /// Returns once `m.end` has been entered: its first statement bumps
+    /// endTicket, the value the close transaction checks after the second
+    /// probe. Opening the probe gate before that would run the two requests
+    /// one after the other and test nothing; a fixed number of yields does
+    /// not guarantee the end task has run.
+    private func waitUntilEndIsRequested(_ m: SessionManager, after ticket: Int, file: StaticString = #filePath, line: UInt = #line) async throws {
+        let deadline = Date().addingTimeInterval(5)
+        while m.endTicket == ticket, Date() < deadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertEqual(m.endTicket, ticket + 1, "the end was not requested while the second probe was held", file: file, line: line)
+    }
+
     /// An end requested while the second probe is running wins, as it does
     /// for the first one: Docker is not frozen and the end finds nothing
     /// of it in the journal.
@@ -1227,8 +1240,9 @@ final class LidActionsTests: XCTestCase {
         let close = Task { await actions.onClose() }
         await gate.waitUntilStarted()
 
+        let ticket = m.endTicket
         let end = Task { await m.end(reason: .user) }
-        await settleQueuedRequests()
+        try await waitUntilEndIsRequested(m, after: ticket)
         await gate.open()
         await close.value
         _ = await end.value
@@ -1256,8 +1270,9 @@ final class LidActionsTests: XCTestCase {
         await m.start(duration: 3600)
         let close = Task { await actions.onClose() }
         await gate.waitUntilStarted()
+        let ticket = m.endTicket
         let end = Task { await m.end(reason: .user) }
-        await settleQueuedRequests()
+        try await waitUntilEndIsRequested(m, after: ticket)
         await gate.open()
         await close.value
         _ = await end.value
