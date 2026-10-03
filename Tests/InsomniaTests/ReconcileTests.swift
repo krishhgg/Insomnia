@@ -191,6 +191,27 @@ final class ReconcileTests: XCTestCase {
         XCTAssertNil(m.lastError)
     }
 
+    // (c2'') the same journal also grants another account read. The owner
+    // bits fall short, so the whole ACL stays: recovery still turns sleep
+    // back on, and one warning names the journal.
+    func testJournalWhoseACLIsKeptIsRestoredWithAWarning() async throws {
+        var st = RuntimeState()
+        st.sleepDisabledByUs = true
+        try h.store.saveState(st)
+        let journal = h.home.paths.stateFile
+        XCTAssertEqual(chmod(journal.path, 0o200), 0)
+        try TestACL.grantOwnerRead(journal)
+        try TestACL.grantMadeUpGroup(journal)
+        h.guardFake.sleepDisabled = true
+        let m = h.makeManager()
+        await m.reconcile()
+        XCTAssertEqual(h.guardFake.calls, ["disablesleep 0", "pmset -g"])
+        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
+        XCTAssertNil(m.lastError)
+        let log = try String(contentsOf: h.home.paths.logFile, encoding: .utf8)
+        XCTAssertEqual(log.components(separatedBy: "[warning] insomnia: kept the access control list on \(journal.path):").count, 2, log)
+    }
+
     // (c3) journaled as ours and the restore fails -> the bit is ours, still
     // journaled for the retry, and not reported as someone else's.
     func testFailedJournaledRestoreIsNotReportedAsForeign() async throws {

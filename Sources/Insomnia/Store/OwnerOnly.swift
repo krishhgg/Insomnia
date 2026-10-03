@@ -9,13 +9,24 @@ import Foundation
 /// copied tree, a wide umask) is tightened when it is next opened.
 /// Tightening only clears bits: it never adds one, so a file its owner made
 /// unreadable stays that way. A symlink is left alone, together with
-/// whatever it points at. So is an access control list: an entry can be
-/// what lets the owner read a 0200 journal, and a journal recovery cannot
-/// read leaves sleep disabled. A chmod that fails is reported, not
-/// dropped: once per path through `reportOnce` for
-/// the journal, config and lock, and as an error thrown after the line is
-/// written for the two logs. backstop.sh does the same for what it creates
-/// with `umask 077`, and tightens what an older build left loose.
+/// whatever it points at.
+///
+/// macOS checks an access control list before the mode, so an entry
+/// inherited from a parent folder or copied with the tree can let another
+/// account in whatever the mode says. Tightening removes the ACL, but only
+/// when the owner's mode bits already give the owner everything Insomnia
+/// needs: read and write on a file, and search too on a directory. Then no
+/// entry is what lets Insomnia in. Otherwise an entry may be exactly that,
+/// as on a 0200 journal its owner reads through an ACL, and a journal
+/// recovery cannot read leaves sleep disabled; so the ACL stays and a
+/// warning names the path once. A new file is checked the same way before
+/// its first byte, since it inherits whatever its folder passes down.
+///
+/// A chmod or ACL removal that fails is reported, not dropped: once per
+/// path through `reportOnce` for the journal, config and lock, and as an
+/// error thrown after the line is written for the two logs. backstop.sh
+/// does the same for what it creates with `umask 077`, and tightens what an
+/// older build left loose.
 ///
 /// The two logs are also capped: past `maxLogBytes` the file is renamed to
 /// `<name>.1`, replacing the previous `.1`, and the next line starts a new
@@ -37,8 +48,8 @@ enum OwnerOnly {
 
     /// Creates `dir` and any missing parents, then makes `dir` itself 0700.
     /// Parents are left alone: only Insomnia's own directory is tightened.
-    /// Throws when the directory cannot be created; returns the chmod
-    /// failure, if any, for the caller to report.
+    /// Throws when the directory cannot be created; returns the chmod or
+    /// ACL problem, if any, for the caller to report.
     @discardableResult
     static func createDirectory(_ dir: URL) throws -> OwnerOnlyError? {
         try FileManager.default.createDirectory(
@@ -49,17 +60,25 @@ enum OwnerOnly {
         return tighten(path: dir.path, to: directoryMode)
     }
 
-    /// chmod(2) away every permission bit outside `mode`, when there is one.
-    /// No bit is added: 0644 becomes 0600 and 0444 becomes 0400. A symlink
-    /// is skipped: its target may be shared with other users or
-    /// programs and is not Insomnia's to change. Returns the failure, if
-    /// any; the read or write that follows goes ahead either way, and the
-    /// caller reports the problem.
+    /// chmod(2) away every permission bit outside `mode`, when there is one,
+    /// then remove the ACL if `removeACL` finds that safe. No bit is added:
+    /// 0644 becomes 0600 and 0444 becomes 0400. A symlink is skipped: its
+    /// target may be shared with other users or programs and is not
+    /// Insomnia's to change. Returns the failure or warning, if any; the
+    /// read or write that follows goes ahead either way, and the caller
+    /// reports the problem.
     static func tighten(path: String, to mode: mode_t = fileMode) -> OwnerOnlyError? {
         var st = stat()
         guard lstat(path, &st) == 0, (st.st_mode & S_IFMT) != S_IFLNK else { return nil }
-        guard (st.st_mode & 0o777) & ~mode != 0 else { return nil }
-        return chmod(path, st.st_mode & 0o777 & mode) == 0 ? nil : .chmod(path: path, errno: errno)
+        if (st.st_mode & 0o777) & ~mode != 0, chmod(path, st.st_mode & 0o777 & mode) != 0 {
+            return .chmod(path: path, errno: errno)
+        }
+        return removeACL(
+            path: path,
+            mode: st.st_mode,
+            get: { acl_get_link_np(path, ACL_TYPE_EXTENDED) },
+            set: { acl_set_link_np(path, ACL_TYPE_EXTENDED, $0) }
+        )
     }
 
     /// Same, on an open descriptor, so the file checked is the file held.
@@ -69,21 +88,62 @@ enum OwnerOnly {
         var st = stat()
         guard lstat(path, &st) != 0 || (st.st_mode & S_IFMT) != S_IFLNK else { return nil }
         guard fstat(fd, &st) == 0 else { return nil }
-        guard (st.st_mode & 0o777) & ~mode != 0 else { return nil }
-        return fchmod(fd, st.st_mode & 0o777 & mode) == 0 ? nil : .chmod(path: path, errno: errno)
+        if (st.st_mode & 0o777) & ~mode != 0, fchmod(fd, st.st_mode & 0o777 & mode) != 0 {
+            return .chmod(path: path, errno: errno)
+        }
+        return removeACL(
+            path: path,
+            mode: st.st_mode,
+            get: { acl_get_fd_np(fd, ACL_TYPE_EXTENDED) },
+            set: { acl_set_fd_np(fd, $0, ACL_TYPE_EXTENDED) }
+        )
     }
 
-    /// Logs a chmod failure once per path per process. Store.read runs on
-    /// every transaction and a file this user cannot chmod stays that way,
-    /// so one line says it. Not for the logs' own paths: `appendToLog` runs
-    /// under the log lock and throws instead.
+    /// Removes the ACL, every entry, as `chmod -N` does, when `mode` (the
+    /// file's own st_mode) gives its owner read and write, and search too
+    /// for a directory. Then the owner needs no entry, and removing them
+    /// takes away only what they gave other accounts. When the owner bits
+    /// fall short, an entry may be what lets Insomnia read or write the
+    /// file, so the ACL stays and that is returned once per path as a
+    /// warning. Only the mode decides; the entries are never read. A file
+    /// without an ACL is left as it is.
+    private static func removeACL(
+        path: String,
+        mode: mode_t,
+        get: () -> acl_t?,
+        set: (acl_t) -> Int32
+    ) -> OwnerOnlyError? {
+        guard let acl = get() else { return nil }
+        var entry: acl_entry_t?
+        let hasEntries = acl_get_entry(acl, ACL_FIRST_ENTRY.rawValue, &entry) == 0
+        acl_free(UnsafeMutableRawPointer(acl))
+        guard hasEntries else { return nil }
+        let needed: mode_t = (mode & S_IFMT) == S_IFDIR ? S_IRWXU : S_IRUSR | S_IWUSR
+        guard mode & needed == needed else {
+            return keptACLs.insert(path) ? .aclKept(path: path) : nil
+        }
+        guard let empty = acl_init(0) else { return .acl(path: path, errno: errno) }
+        defer { acl_free(UnsafeMutableRawPointer(empty)) }
+        return set(empty) == 0 ? nil : .acl(path: path, errno: errno)
+    }
+
+    /// Logs a chmod or ACL problem once per path per process, a kept ACL
+    /// as a warning. Store.read runs on every transaction and a file this
+    /// user cannot chmod stays that way, so one line says it. Not for the
+    /// logs' own paths: `appendToLog` runs under the log lock and throws
+    /// instead.
     static func reportOnce(_ problem: OwnerOnlyError) {
         guard reported.insert(problem.path) else { return }
-        Log.error(problem.localizedDescription)
+        if case .aclKept = problem {
+            Log.warning(problem.localizedDescription)
+        } else {
+            Log.error(problem.localizedDescription)
+        }
     }
 
     private static let reported = PathSet()
     private static let symlinkedLogs = PathSet()
+    private static let keptACLs = PathSet()
 
     private final class PathSet: @unchecked Sendable {
         private let lock = NSLock()
@@ -100,8 +160,9 @@ enum OwnerOnly {
     /// Appends `text` to the log at `url`: the directory is created 0700,
     /// the file 0600 (an existing file is tightened), and a file already
     /// past `maxBytes` is rotated first so the line lands in a new file.
-    /// The line is written even when a chmod or the rotation fails; the
-    /// first such failure is then thrown so the caller can report it.
+    /// The line is written even when a chmod, the ACL step or the rotation
+    /// fails; the first such problem is then thrown so the caller can
+    /// report it.
     /// `beforeRotating` runs once the file held is found past the cap and
     /// before its lock is taken; a throw from it ends the append there, with
     /// nothing rotated or written. Tests use it to rotate from outside first.
@@ -188,13 +249,19 @@ enum OwnerOnly {
         return .reopen
     }
 
-    /// Creates `url` holding `data`, mode 0600 from the first byte. Fails
+    /// Creates `url` holding `data`, mode 0600 from the first byte. An ACL
+    /// the new file inherited from its folder goes through `tighten` before
+    /// any byte is written. The write goes ahead whatever that finds, and
+    /// the problem, if any, is returned for the caller to report. Fails
     /// when the file exists: callers pass a fresh temp name and rename it.
-    static func createFile(at url: URL, contents data: Data) throws {
+    @discardableResult
+    static func createFile(at url: URL, contents data: Data) throws -> OwnerOnlyError? {
         let fd = open(url.path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, fileMode)
         guard fd >= 0 else { throw OwnerOnlyError.open(path: url.path, errno: errno) }
         defer { close(fd) }
+        let problem = tighten(fd: fd, path: url.path)
         try writeAll(data, to: fd, path: url.path)
+        return problem
     }
 
     private static func writeAll(_ data: Data, to fd: Int32, path: String) throws {
@@ -219,12 +286,14 @@ enum OwnerOnlyError: Error, LocalizedError {
     case chmod(path: String, errno: Int32)
     case rotate(path: String, errno: Int32)
     case symlinkNotRotated(path: String)
+    case acl(path: String, errno: Int32)
+    case aclKept(path: String)
 
     var path: String {
         switch self {
-        case let .open(path, _), let .write(path, _), let .chmod(path, _), let .rotate(path, _):
+        case let .open(path, _), let .write(path, _), let .chmod(path, _), let .rotate(path, _), let .acl(path, _):
             return path
-        case let .symlinkNotRotated(path):
+        case let .symlinkNotRotated(path), let .aclKept(path):
             return path
         }
     }
@@ -236,6 +305,8 @@ enum OwnerOnlyError: Error, LocalizedError {
         case let .chmod(path, errno): return "could not make \(path) owner-only: \(String(cString: strerror(errno)))"
         case let .rotate(path, errno): return "could not rotate \(path) to \(path).1: \(String(cString: strerror(errno)))"
         case let .symlinkNotRotated(path): return "not rotating \(path): it is a symlink, so its target can grow past the cap"
+        case let .acl(path, errno): return "could not remove the access control list on \(path): \(String(cString: strerror(errno)))"
+        case let .aclKept(path): return "kept the access control list on \(path): its mode does not give its owner read and write (and search, for a folder), so an entry may be what lets Insomnia use it. Any access it gives other accounts stays"
         }
     }
 }

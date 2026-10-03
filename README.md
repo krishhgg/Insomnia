@@ -322,11 +322,15 @@ backstop's lines go only to `insomnia.log`, which keeps the full text of both.
 The files in Application Support/Insomnia and Logs/Insomnia (config, session,
 journal, recovery lock, the two logs) are owner-only, mode 0600 with those two
 directories 0700, and one left looser by an older build is tightened the next
-time the app or the backstop opens it. Only the mode changes: an access
-control list on these files or folders, such as one inherited from a parent
-folder, stays and can still let another account read them (`ls -le` shows it).
-Insomnia leaves it because an entry can also be what lets Insomnia read its
-own journal. The LaunchAgent plist and the installed
+time the app or the backstop opens it. An access control list (ACL) on them,
+such as one inherited from a parent folder or copied with the files, can let
+another account in whatever the mode says, so tightening also removes it, as
+`chmod -N` does, when the owner's mode bits already give you read and write
+(and search, for a folder). When they do not, an ACL entry may be what lets
+Insomnia read the file, as with a journal set to 0200, so the ACL stays and
+`insomnia.log` gets a warning naming the path. New files are checked the same
+way before anything is written to them. `ls -le` shows any entries. The
+LaunchAgent plist and the installed
 scripts hold no private data and keep the modes the installer gives them.
 `insomnia.log` and `handoffs.log` are capped at 1 MiB: a
 log past the cap is renamed to `insomnia.log.1` or `handoffs.log.1`,

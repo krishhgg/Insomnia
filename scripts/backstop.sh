@@ -94,6 +94,8 @@ PS=/bin/ps
 KILL=/bin/kill
 SYSCTL=/usr/sbin/sysctl
 CHMOD=/bin/chmod
+STAT=/usr/bin/stat
+LS=/bin/ls
 DEFAULTS=/usr/bin/defaults
 DATE=/bin/date
 MKDIR=/bin/mkdir
@@ -129,36 +131,74 @@ LOG="$LOG_DIR/insomnia.log"
 
 log() { # level message
   "$MKDIR" -p "$LOG_DIR"
+  if [[ ! -e "$LOG" && ! -L "$LOG" ]]; then
+    # A new log can inherit an ACL from its folder: check it before the
+    # first line, as tighten checks an old one.
+    : >> "$LOG"
+    drop_acl "$LOG"
+  fi
   printf '%s [%s] backstop: %s\n' "$("$DATE" -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" >> "$LOG"
 }
 
 # --- Lock --------------------------------------------------------------------
+# Both directories first, so the tightening below covers them before this
+# run creates anything in them. Logs failing here is not a reason to stop
+# before recovery; log() tries again.
 "$MKDIR" -p "$APP_SUPPORT"
+"$MKDIR" -p "$LOG_DIR" || true
 # An upgrade over an older build: tighten what it left loose (0644 files,
 # 0755 directories), since this run may write to them before the upgraded
 # app has opened them. umask only covers what this run creates. go-rwx
 # only takes group and other access away and never adds a permission, so a
 # file its owner cannot read stays unreadable. A symlink is left alone, as
-# the app leaves it, and so is an access control list: an entry can be what
-# lets the owner read a 0200 journal, which recovery must read. A chmod that
-# fails is logged as an error and recovery goes on: a loose mode is no
-# reason to leave the machine changed.
+# the app leaves it. A chmod that fails is logged as an error and recovery
+# goes on: a loose mode is no reason to leave the machine changed.
 tighten() { # path...
   local p err
   for p in "$@"; do
     if [[ -e "$p" && ! -L "$p" ]]; then
       if ! err="$("$CHMOD" go-rwx "$p" 2>&1)"; then
         log error "could not make $p owner-only: ${err:-chmod failed}" || true
+      else
+        drop_acl "$p"
       fi
     fi
   done
+}
+# macOS checks an access control list before the mode, so an entry inherited
+# from a parent folder or copied with the tree can let another account in
+# whatever the mode says. As in the app, the ACL is removed only when the
+# owner's mode bits already give the owner read and write, and search too
+# for a directory: then the owner needs no entry. Otherwise an entry may be
+# what lets recovery read a 0200 journal, so the ACL stays and a warning
+# names the path. Only the mode decides. ls -lde says whether there are
+# entries at all (it prints a line for each after the first); their text
+# is never read. A removal that fails is logged and recovery goes on.
+drop_acl() { # path
+  local mode need err
+  [[ "$("$LS" -lde "$1" 2>/dev/null)" == *$'\n'* ]] || return 0
+  mode="$("$STAT" -f %Lp "$1" 2>/dev/null)" || mode=0
+  [[ "$mode" =~ ^[0-7]+$ ]] || mode=0
+  need=6
+  if [[ -d "$1" ]]; then need=7; fi
+  if (( ((8#$mode >> 6) & need) != need )); then
+    log warning "kept the access control list on $1: its mode does not give its owner read and write (and search, for a folder), so an entry may be what lets recovery use it. Any access it gives other accounts stays" || true
+    return 0
+  fi
+  if ! err="$("$CHMOD" -N "$1" 2>&1)"; then
+    log error "could not remove the access control list on $1: ${err:-chmod -N failed}" || true
+  fi
 }
 tighten "$APP_SUPPORT" "$LOG_DIR" "$LOG" "$LOCK" "$STATE" "$SESSION"
 inode() { stat -f %i "$1" 2>/dev/null; }
 if [[ -e /dev/fd/9 && -e "$LOCK" && -n "$(inode "$LOCK")" && "$(inode /dev/fd/9)" == "$(inode "$LOCK")" ]]; then
   : # fd 9 is the caller's handle on the lock file; share its lock.
 else
+  new_lock=0
+  if [[ ! -e "$LOCK" && ! -L "$LOCK" ]]; then new_lock=1; fi
   exec 9<>"$LOCK"
+  # A new lock can inherit an ACL from its folder, like a new log.
+  if (( new_lock == 1 )); then drop_acl "$LOCK"; fi
 fi
 lock_rc=0
 "$LOCKF" -t "$LOCK_TIMEOUT_SECONDS" 9 2>/dev/null || lock_rc=$?
@@ -769,7 +809,14 @@ fi
 if (( changed == 1 )); then
   tmp="$APP_SUPPORT/.state.json.backstop.$$"
   publish_ok=1
-  "$CP" "$STATE" "$tmp" || publish_ok=0
+  # The copy is a new file: create it empty and check its ACL, as for a new
+  # log, before cp writes the journal into it.
+  if : > "$tmp"; then
+    drop_acl "$tmp"
+    "$CP" "$STATE" "$tmp" || publish_ok=0
+  else
+    publish_ok=0
+  fi
   if (( publish_ok == 1 )) && [[ "$new_sleep" != "$sleep_held" ]]; then
     "$PLUTIL" -replace sleepDisabledByUs -bool "$new_sleep" "$tmp" >/dev/null 2>&1 || publish_ok=0
   fi
