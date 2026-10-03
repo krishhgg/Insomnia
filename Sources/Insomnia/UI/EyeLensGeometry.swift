@@ -1,10 +1,9 @@
 import CoreGraphics
 
-/// The eye's lens as pure geometry: an almond-shaped outline, two pointed
-/// corners on the axis and one cubic curve per lid, and the 24-unit grid it
-/// is laid out on. `EyeMarkGeometry` adds the lid, pupil and lashes that
-/// make it the menu bar mark; `AppIconArtwork` draws that mark, open, as
-/// the app icon.
+/// The eye's lens as pure geometry: an almond-shaped outline with two
+/// pointed corners on the axis and one cubic curve per lid, on a 24-unit
+/// grid. `EyeMarkGeometry` adds the lid, pupil and lashes for the menu bar
+/// mark, and `AppIconArtwork` draws the open mark as the app icon.
 ///
 /// Everything is laid out on a 24-unit grid and scaled into whatever rect it
 /// is asked for, so the same numbers draw the 17-point status item and the

@@ -112,24 +112,28 @@ final class PackagingTests: XCTestCase {
         XCTAssertLessThan(differences, 1024 * 1024 / 1000, "AppIcon-1024.png differs from the artwork at \(differences) pixels; run scripts/generate-app-icon.sh")
     }
 
-    func testIcnsMembersAreTheArtworkRenderedAtTheirOwnSizes() throws {
+    /// Every member iconutil wrote, both densities at 32, 256 and 512
+    /// pixels included, is the artwork drawn at that member's pixel size.
+    /// ImageIO lists all ten members and tells the densities apart by DPI,
+    /// 72 for a 1x member and 144 for a 2x one.
+    func testEveryIcnsMemberIsTheArtworkRenderedAtItsOwnSize() throws {
         let url = resources.appendingPathComponent("AppIcon.icns")
-        let image = try XCTUnwrap(NSImage(contentsOf: url))
-        for pixels in [16, 32, 64, 128, 256, 512, 1024] {
-            let rep = try XCTUnwrap(image.representations.first { $0.pixelsWide == pixels && $0.pixelsHigh == pixels }, "no \(pixels)px member")
-            let ctx = try XCTUnwrap(CGContext(
-                data: nil, width: pixels, height: pixels, bitsPerComponent: 8, bytesPerRow: 0,
-                space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-            ))
-            NSGraphicsContext.saveGraphicsState()
-            NSGraphicsContext.current = NSGraphicsContext(cgContext: ctx, flipped: false)
-            XCTAssertTrue(rep.draw(in: NSRect(x: 0, y: 0, width: pixels, height: pixels)), "\(pixels)px member does not draw")
-            NSGraphicsContext.restoreGraphicsState()
-            let member = IconPixels(try XCTUnwrap(ctx.makeImage()))
+        let source = try XCTUnwrap(CGImageSourceCreateWithURL(url as CFURL, nil))
+        var members: [String] = []
+        for index in 0..<CGImageSourceGetCount(source) {
+            let image = try XCTUnwrap(CGImageSourceCreateImageAtIndex(source, index, nil), "member \(index) does not decode")
+            let properties = CGImageSourceCopyPropertiesAtIndex(source, index, nil) as? [CFString: Any]
+            let dpi = (properties?[kCGImagePropertyDPIWidth] as? NSNumber)?.intValue ?? 0
+            let pixels = image.width
+            let member = "\(pixels)px at \(dpi) dpi"
+            members.append(member)
+            XCTAssertEqual(image.height, pixels, "the \(member) member is not square")
             let drawn = IconPixels(try XCTUnwrap(AppIconArtwork.render(pixels: pixels)))
-            let differences = member.differences(from: drawn, tolerance: 32)
-            XCTAssertLessThan(differences, max(pixels * pixels / 1000, 3), "the \(pixels)px member differs from the artwork at \(differences) pixels; run scripts/generate-app-icon.sh")
+            let differences = IconPixels(image).differences(from: drawn, tolerance: 32)
+            XCTAssertLessThan(differences, max(pixels * pixels / 1000, 3), "the \(member) member differs from the artwork at \(differences) pixels; run scripts/generate-app-icon.sh")
         }
+        let expected = [(16, 72), (32, 72), (32, 144), (64, 144), (128, 72), (256, 72), (256, 144), (512, 72), (512, 144), (1024, 144)]
+        XCTAssertEqual(members.sorted(), expected.map { "\($0.0)px at \($0.1) dpi" }.sorted())
     }
 
     func testReadmeSvgIsTheArtworkWrittenOut() throws {
@@ -167,7 +171,7 @@ final class PackagingTests: XCTestCase {
     /// A patched copy of scripts/generate-app-icon.sh in a temporary tree,
     /// with fake swiftc and iconutil, replaces the PNG, ICNS and SVG
     /// together on success and leaves all three as they were when any step
-    /// fails, without staged copies left beside them.
+    /// fails, without staged copies or backups left beside them.
     func testRegenerationReplacesAllThreeAssetsOrNone() throws {
         let fixture = try IconScriptFixture()
         defer { fixture.remove() }
@@ -193,6 +197,61 @@ final class PackagingTests: XCTestCase {
         XCTAssertEqual(ok.status, 0, ok.stderr)
         XCTAssertEqual(try fixture.contents(), ["new png", "new icns", "new svg"])
         XCTAssertEqual(try fixture.leftovers(), [])
+    }
+
+    /// The script renames the PNG, then the ICNS, then the SVG into place.
+    /// When one of those renames fails, as it does over a file locked in
+    /// Finder (the immutable flag), the exit trap renames the backups back
+    /// over the assets already replaced.
+    func testAFailedRenameDuringTheSwapPutsBackTheAssetsAlreadyReplaced() throws {
+        let fixture = try IconScriptFixture()
+        defer { fixture.remove() }
+        let old = ["old png", "old icns", "old svg"]
+
+        // A locked ICNS: the PNG is already new when the second rename fails.
+        try fixture.lock(fixture.icns, true)
+        let icnsLocked = try fixture.run()
+        try fixture.lock(fixture.icns, false)
+        XCTAssertNotEqual(icnsLocked.status, 0, "a locked ICNS fails the run")
+        XCTAssertEqual(try fixture.contents(), old, icnsLocked.stderr)
+        XCTAssertEqual(try fixture.leftovers(), [])
+        XCTAssertTrue(icnsLocked.stderr.contains("put back "), icnsLocked.stderr)
+        XCTAssertTrue(icnsLocked.stderr.contains("Resources/AppIcon-1024.png\n"), icnsLocked.stderr)
+
+        // A locked SVG, the last rename: the PNG and ICNS both go back.
+        try fixture.lock(fixture.svg, true)
+        let svgLocked = try fixture.run()
+        try fixture.lock(fixture.svg, false)
+        XCTAssertNotEqual(svgLocked.status, 0, "a locked SVG fails the run")
+        XCTAssertEqual(try fixture.contents(), old, svgLocked.stderr)
+        XCTAssertEqual(try fixture.leftovers(), [])
+
+        // A PNG that did not exist before the run is removed again.
+        try FileManager.default.removeItem(at: fixture.png)
+        try fixture.lock(fixture.icns, true)
+        let noPng = try fixture.run()
+        try fixture.lock(fixture.icns, false)
+        XCTAssertNotEqual(noPng.status, 0)
+        XCTAssertEqual(try fixture.contents(), ["missing", "old icns", "old svg"], noPng.stderr)
+        XCTAssertEqual(try fixture.leftovers(), [])
+        try "old png".write(to: fixture.png, atomically: true, encoding: .utf8)
+
+        // Renaming the PNG's backup back fails as well: the backup stays
+        // beside the PNG with the old contents, and the message names it.
+        try fixture.lock(fixture.icns, true)
+        try fixture.failMoves(from: "*/AppIcon-1024.png.backup.*")
+        let stuck = try fixture.run()
+        try fixture.failMoves(from: nil)
+        try fixture.lock(fixture.icns, false)
+        XCTAssertNotEqual(stuck.status, 0)
+        XCTAssertEqual(try fixture.contents(), ["new png", "old icns", "old svg"], stuck.stderr)
+        let kept = try fixture.leftovers()
+        XCTAssertEqual(kept.count, 1, "only the PNG's backup stays: \(kept)")
+        let backup = try XCTUnwrap(kept.first)
+        XCTAssertTrue(backup.hasPrefix("AppIcon-1024.png.backup."), backup)
+        XCTAssertEqual(try String(contentsOf: fixture.resources.appendingPathComponent(backup), encoding: .utf8), "old png")
+        XCTAssertTrue(stuck.stderr.contains("its previous contents are in "), stuck.stderr)
+        XCTAssertTrue(stuck.stderr.contains("Resources/\(backup)\n"), stuck.stderr)
     }
 
     // MARK: - Helpers
@@ -254,23 +313,25 @@ final class PackagingTests: XCTestCase {
 }
 
 /// A throwaway tree for scripts/generate-app-icon.sh:
-///   root/scripts/generate-app-icon.sh   copy with SWIFTC and ICONUTIL patched to the fakes
+///   root/scripts/generate-app-icon.sh   copy with SWIFTC, ICONUTIL and MV patched to the fakes
 ///   root/Resources, root/docs/assets    the three assets, holding "old ..."
-///   root/bin                            fake swiftc and iconutil
+///   root/bin                            fake swiftc, iconutil and mv
 ///   root/tmp                            TMPDIR for the script's mktemp
 /// The fake swiftc writes a fake generator that writes "new png", one
 /// iconset member, and "new svg" through a file beside the target the way
 /// the real generator's atomic String write does; the fake iconutil writes
-/// "new icns", or fails while root/iconutil-fails exists.
+/// "new icns", or fails while root/iconutil-fails exists. The fake mv runs
+/// /bin/mv unless an argument matches a pattern in root/mv-fails.
 private struct IconScriptFixture {
     let root: URL
     var script: URL { root.appendingPathComponent("scripts/generate-app-icon.sh") }
     var resources: URL { root.appendingPathComponent("Resources", isDirectory: true) }
     var assets: URL { root.appendingPathComponent("docs/assets", isDirectory: true) }
+    var png: URL { resources.appendingPathComponent("AppIcon-1024.png") }
+    var icns: URL { resources.appendingPathComponent("AppIcon.icns") }
+    var svg: URL { assets.appendingPathComponent("eye-open.svg") }
     private var bin: URL { root.appendingPathComponent("bin", isDirectory: true) }
-    private var assetFiles: [URL] {
-        [resources.appendingPathComponent("AppIcon-1024.png"), resources.appendingPathComponent("AppIcon.icns"), assets.appendingPathComponent("eye-open.svg")]
-    }
+    private var assetFiles: [URL] { [png, icns, svg] }
     private let fm = FileManager.default
 
     init() throws {
@@ -283,12 +344,13 @@ private struct IconScriptFixture {
         }
         let source = PackagingTests.repoRoot.appendingPathComponent("scripts/generate-app-icon.sh")
         var text = try String(contentsOf: source, encoding: .utf8)
-        for (name, fake) in [("SWIFTC", "swiftc"), ("ICONUTIL", "iconutil")] {
-            let line = "\(name)=/usr/bin/\(fake)"
+        for (name, tool) in [("SWIFTC", "/usr/bin/swiftc"), ("ICONUTIL", "/usr/bin/iconutil"), ("MV", "/bin/mv")] {
+            let line = "\(name)=\(tool)"
             guard text.components(separatedBy: "\n").filter({ $0 == line }).count == 1 else {
                 throw NSError(domain: "IconScriptFixture", code: 1, userInfo: [NSLocalizedDescriptionKey: "expected one '\(line)' line"])
             }
-            text = text.replacingOccurrences(of: line, with: "\(name)='\(bin.appendingPathComponent(fake).path)'")
+            let fake = bin.appendingPathComponent(URL(fileURLWithPath: tool).lastPathComponent)
+            text = text.replacingOccurrences(of: line, with: "\(name)='\(fake.path)'")
         }
         try text.write(to: script, atomically: true, encoding: .utf8)
         try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
@@ -319,6 +381,17 @@ private struct IconScriptFixture {
         [ "$1" = -c ] && [ "$2" = icns ] && [ -d "$3" ] && [ "$4" = -o ] || exit 2
         printf 'new icns' > "$5"
         """)
+        try writeFake("mv", """
+        flag='\(root.appendingPathComponent("mv-fails").path)'
+        if [ -e "$flag" ]; then
+          while IFS= read -r pattern; do
+            for arg in "$@"; do
+              case "$arg" in $pattern) echo "mv: refusing $arg" >&2; exit 1 ;; esac
+            done
+          done < "$flag"
+        fi
+        exec /bin/mv "$@"
+        """)
     }
 
     private func writeFake(_ name: String, _ body: String) throws {
@@ -336,9 +409,27 @@ private struct IconScriptFixture {
         if fail { fm.createFile(atPath: flag.path, contents: Data()) } else { try? fm.removeItem(at: flag) }
     }
 
-    /// The PNG, ICNS and SVG, in that order.
+    /// Makes the fake mv fail when an argument matches the shell `pattern`,
+    /// or run /bin/mv for every call when `pattern` is nil.
+    func failMoves(from pattern: String?) throws {
+        let flag = root.appendingPathComponent("mv-fails")
+        if let pattern {
+            try (pattern + "\n").write(to: flag, atomically: true, encoding: .utf8)
+        } else if fm.fileExists(atPath: flag.path) {
+            try fm.removeItem(at: flag)
+        }
+    }
+
+    /// Sets or clears the immutable flag that Finder's Locked checkbox sets.
+    /// Renaming another file over a locked one fails with EPERM.
+    func lock(_ file: URL, _ locked: Bool) throws {
+        try fm.setAttributes([.immutable: locked], ofItemAtPath: file.path)
+    }
+
+    /// The PNG, ICNS and SVG, in that order, with "missing" for one that
+    /// does not exist.
     func contents() throws -> [String] {
-        try assetFiles.map { try String(contentsOf: $0, encoding: .utf8) }
+        try assetFiles.map { fm.fileExists(atPath: $0.path) ? try String(contentsOf: $0, encoding: .utf8) : "missing" }
     }
 
     /// Anything in the two asset folders besides the three assets.
@@ -367,6 +458,11 @@ private struct IconScriptFixture {
 
     func remove() {
         try? setWritable(assets, true)
+        for dir in [resources, assets] {
+            for name in (try? fm.contentsOfDirectory(atPath: dir.path)) ?? [] {
+                try? lock(dir.appendingPathComponent(name), false)
+            }
+        }
         try? fm.removeItem(at: root)
     }
 }

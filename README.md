@@ -306,8 +306,8 @@ on a contributor's machine.
 
 The app icon is the menu bar's open eye on a charcoal tile: [AppIconArtwork](Sources/Insomnia/UI/AppIconArtwork.swift) draws it from the same [vector geometry](Sources/Insomnia/UI/EyeMarkGeometry.swift) as the menu bar's closed eye, which opens while a session runs.
 After changing the artwork, run `./scripts/generate-app-icon.sh` to regenerate
-the packaged PNG and ICNS assets and the README's SVG. No image-generation
-service is needed.
+the packaged PNG and ICNS assets and the README's SVG. The script draws them
+offline with Xcode's swiftc and iconutil.
 
 [Contributing](CONTRIBUTING.md) · [Security reporting](SECURITY.md) ·
 [Release validation](docs/release-validation.md) · [Design notes](docs/spec.md)
