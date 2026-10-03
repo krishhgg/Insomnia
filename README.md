@@ -102,7 +102,13 @@ the same step that replaces the recovery agent. That step starts only after
 `launchctl print` confirms the previous agent is unloaded; otherwise nothing is
 replaced. If the new agent cannot be loaded, or its plist cannot be saved, the
 installer unloads it, waits for `launchctl print` to confirm that, and puts the
-previous bundle back, so the loaded agent always matches the installed app. If
+previous bundle back, so the loaded agent always matches the installed app. A
+bundle that cannot be moved during that step is handled the same way: the
+previous bundle goes back and its agent is loaded again. If the previous bundle
+itself cannot be moved back, nothing is deleted: it stays at
+`~/Applications/.Insomnia.app.previous`, the installer prints the two commands
+that put it back and load its agent, and until then the agent finds no app, so
+run them or rerun the installer before you log out. If
 the unload is not confirmed, the new bundle stays with the agent that pins it
 and the installer asks you to rerun it. After that, or after an install killed
 in the middle of that step, the next run keeps whichever bundle the agent's

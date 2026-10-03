@@ -422,7 +422,13 @@ Backstop, independent of the app:
   When the new job cannot be loaded or its plist cannot be published,
   install.sh unloads any job that may be loaded, confirms that with print,
   and puts the previous bundle back; if the unload is not confirmed, the
-  new bundle stays, because that job pins it. A rerun after an interrupted
+  new bundle stays, because that job pins it. Every bundle rename is checked
+  (`mv`, refused when the destination exists): when one of the swap or its
+  undo fails, the previous bundle goes back and its job is loaded again as
+  after a failed load, and when the previous bundle cannot go back, no
+  bundle is deleted, no job is loaded against an empty app path, and the
+  message prints the `mv` and `launchctl bootstrap` that restore the pair.
+  The same holds for the renames of the repair below. A rerun after an interrupted
   or failed swap keeps the bundle the plist on disk pins. It runs its
   forced recovery first, with the loaded job and the bundles as the earlier
   run left them, and stops there if recovery fails. Only then does it

@@ -2761,6 +2761,209 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(r.stderr.contains("launchctl bootstrap gui/"), "the job is still loaded, so there is nothing to reload: \(r.stderr)")
     }
 
+    // A rename of the swap or of its undo that fails. Each one is handled:
+    // the previous app goes back to $APP and its job is loaded again, and
+    // when the previous app cannot go back, no bundle is deleted and the
+    // message says how to put it back. Before, set -e exited at the failed
+    // rename with the previous job unloaded, and cleanup deleted the
+    // staged build.
+
+    /// The previous pair of an earlier install: its app at $APP, the
+    /// trusted plist, a clean journal, and its job loaded.
+    private func writePreviousPair() throws {
+        try fx.prepareInstall()
+        try fx.writePreviousApp()
+        try "trusted".write(to: fx.plist, atomically: true, encoding: .utf8)
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        fx.setMode("launchctl", "loaded")
+    }
+
+    private var stagedBuildPattern: String { fx.appsDir.path + "/.Insomnia.app.staging.*/Insomnia.app" }
+    private var setAside: URL { fx.appsDir.appendingPathComponent(".Insomnia.app.previous", isDirectory: true) }
+
+    /// The staging directories left in $APP_DIR.
+    private func stagingDirs() throws -> [URL] {
+        try fx.contents(of: fx.appsDir).filter { $0.hasPrefix(".Insomnia.app.staging.") }.map { fx.appsDir.appendingPathComponent($0) }
+    }
+
+    /// The new build cannot be moved in after the previous app was set
+    /// aside: the previous app goes back and its job is loaded again.
+    func testInstallPutsThePreviousPairBackWhenTheNewBuildCannotBeMovedIn() throws {
+        try writePreviousPair()
+        try fx.failMoves([(stagedBuildPattern, fx.app.path)])
+
+        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        let calls = fx.calls()
+        XCTAssertTrue(calls.contains { $0.hasPrefix("mv FAILED ") && $0.hasSuffix(" \(fx.app.path)") }, "\(calls)")
+        XCTAssertEqual(calls.filter { $0.hasPrefix("launchctl bootstrap") }, ["launchctl bootstrap gui/\(fx.uid) \(fx.plist.path)"], "only the previous plist is loaded again: \(calls)")
+        XCTAssertEqual(calls.filter { $0.hasPrefix("launchctl APP-") }, ["launchctl APP-BINARY=previous during bootstrap"], "the previous app is back before its job is loaded: \(calls)")
+        XCTAssertEqual(try fx.installedBinaryFirstLine(), "previous")
+        XCTAssertEqual(try fx.contents(of: fx.appsDir), ["Insomnia.app"], "nothing is left set aside or staged")
+        XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "trusted")
+        XCTAssertTrue(r.stderr.contains("the new build could not be moved from"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("The previous app was put back at \(fx.app.path)"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("loaded again from the previous plist"), r.stderr)
+    }
+
+    /// The previous app cannot be moved aside: it never left $APP, and its
+    /// job, already unloaded for the swap, is loaded again.
+    func testInstallLoadsThePreviousJobAgainWhenThePreviousAppCannotBeMovedAside() throws {
+        try writePreviousPair()
+        try fx.failMoves([(fx.app.path, setAside.path)])
+
+        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        let calls = fx.calls()
+        let unload = try XCTUnwrap(calls.firstIndex(of: "launchctl bootout gui/\(fx.uid)/com.insomnia.backstop"), "\(calls)")
+        XCTAssertEqual(calls[unload...].filter { $0.hasPrefix("launchctl bootstrap") }, ["launchctl bootstrap gui/\(fx.uid) \(fx.plist.path)"], "\(calls)")
+        XCTAssertEqual(calls.filter { $0.hasPrefix("launchctl APP-") }, ["launchctl APP-BINARY=previous during bootstrap"], "\(calls)")
+        XCTAssertEqual(try fx.installedBinaryFirstLine(), "previous")
+        XCTAssertEqual(try fx.contents(of: fx.appsDir), ["Insomnia.app"])
+        XCTAssertTrue(r.stderr.contains("could not be moved aside to \(setAside.path)"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("The previous app was never moved from \(fx.app.path)"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("loaded again from the previous plist"), r.stderr)
+    }
+
+    /// Neither the new build nor the previous app can be moved to $APP, so
+    /// nothing is there. Both bundles are kept, no job is loaded against an
+    /// empty $APP, the message gives the two commands that restore the
+    /// pair, and a rerun puts the previous app back first and installs.
+    func testInstallDeletesNoBundleWhenThePreviousAppCannotBePutBack() throws {
+        try writePreviousPair()
+        try fx.failMoves([(stagedBuildPattern, fx.app.path), (setAside.path, fx.app.path)])
+
+        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("launchctl bootstrap") }, "\(fx.calls())")
+        XCTAssertFalse(fx.exists(fx.app))
+        XCTAssertEqual(try String(contentsOf: setAside.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "previous\n")
+        let staged = try XCTUnwrap(try stagingDirs().first, "the new build is kept: \(String(describing: try? fx.contents(of: fx.appsDir)))")
+        XCTAssertTrue(fx.exists(staged.appendingPathComponent("Insomnia.app/Contents/Resources/backstop.sh")), "the kept build still carries its backstop.sh")
+        XCTAssertTrue(r.stderr.contains("nothing is at \(fx.app.path)"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("neither was deleted"), r.stderr)
+        XCTAssertEqual(try pastedWords(of: printedCommand(in: r.stderr, containing: "mv ")), ["mv", setAside.path, fx.app.path])
+        XCTAssertEqual(try pastedWords(of: printedCommand(in: r.stderr, containing: "launchctl bootstrap")), ["launchctl", "bootstrap", "gui/\(fx.uid)", fx.plist.path])
+
+        try FileManager.default.removeItem(at: fx.root.appendingPathComponent("mv.fail"))
+        fx.clearCalls()
+        let rerun = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(rerun.status, 0, rerun.stderr + rerun.stdout)
+        XCTAssertTrue(rerun.stdout.contains("restored \(fx.app.path), which an interrupted run had set aside"), rerun.stdout)
+        XCTAssertEqual(try fx.installedBinaryFirstLine(), "#!/bin/bash")
+        XCTAssertFalse(fx.exists(setAside))
+    }
+
+    /// The new job failed to load and is not loaded, but the new build
+    /// cannot be moved out of $APP: it stays there and the previous app
+    /// stays set aside, the state the next run's repair handles. Nothing
+    /// is loaded against the build that is not the previous one.
+    func testInstallKeepsTheNewBuildWhenItCannotBeMovedBackAfterAFailedLoad() throws {
+        try writePreviousPair()
+        fx.setMode("launchctl", "loaded-bootstrap-fails-once")
+        try fx.failMoves([(fx.app.path, stagedBuildPattern)])
+
+        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        let calls = fx.calls()
+        XCTAssertEqual(calls.filter { $0.hasPrefix("launchctl bootstrap") }.count, 1, "the candidate only, no reload: \(calls)")
+        XCTAssertTrue(calls.contains { $0.hasPrefix("mv FAILED \(fx.app.path) ") }, "\(calls)")
+        XCTAssertEqual(try fx.installedBinaryFirstLine(), "#!/bin/bash")
+        XCTAssertEqual(try String(contentsOf: setAside.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "previous\n")
+        XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "trusted")
+        XCTAssertTrue(r.stderr.contains("so it stays there"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("kept at \(setAside.path)"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("rerun before you log out"), r.stderr)
+    }
+
+    /// The new job failed to load and the new build was moved out, but the
+    /// previous app cannot be moved back: nothing is at $APP. Both bundles
+    /// are kept and the previous job is not loaded against an empty $APP.
+    func testInstallDeletesNoBundleWhenThePreviousAppCannotBePutBackAfterAFailedLoad() throws {
+        try writePreviousPair()
+        fx.setMode("launchctl", "loaded-bootstrap-fails-once")
+        try fx.failMoves([(setAside.path, fx.app.path)])
+
+        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertEqual(fx.calls().filter { $0.hasPrefix("launchctl bootstrap") }.count, 1, "the candidate only, no reload: \(fx.calls())")
+        XCTAssertFalse(fx.exists(fx.app))
+        XCTAssertEqual(try String(contentsOf: setAside.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "previous\n")
+        let staged = try XCTUnwrap(try stagingDirs().first, "the new build is kept: \(String(describing: try? fx.contents(of: fx.appsDir)))")
+        XCTAssertTrue(fx.exists(staged.appendingPathComponent("Insomnia.app/Contents/Resources/backstop.sh")))
+        XCTAssertTrue(r.stderr.contains("'launchctl bootstrap' exited 5"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("neither was deleted"), r.stderr)
+        XCTAssertEqual(try pastedWords(of: printedCommand(in: r.stderr, containing: "mv ")), ["mv", setAside.path, fx.app.path])
+    }
+
+    /// The repair of an interrupted swap cannot move that run's build out
+    /// of $APP: neither bundle moves, and the message says the job that run
+    /// left was unloaded and that the next login would not match.
+    func testInstallStopsWhenTheRepairCannotMoveTheInterruptedBuildAside() throws {
+        let previous = try writeInterruptedSwap()
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        fx.setMode("launchctl", "loaded")
+        try fx.failMoves([(fx.app.path, "*/Interrupted.app")])
+
+        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("launchctl bootstrap") }, "\(fx.calls())")
+        XCTAssertEqual(try fx.installedBinaryFirstLine(), "interrupted")
+        XCTAssertEqual(try String(contentsOf: previous.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "previous\n")
+        XCTAssertTrue(r.stderr.contains("moving that build out of \(fx.app.path) failed"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("The job that run left was unloaded"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("Neither bundle was moved"), r.stderr)
+    }
+
+    /// The repair moved the interrupted build out but cannot move the
+    /// previous app back: nothing is at $APP, both bundles are kept, and
+    /// the message gives the commands that restore the previous pair.
+    func testInstallDeletesNoBundleWhenTheRepairCannotPutThePreviousAppBack() throws {
+        let previous = try writeInterruptedSwap()
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        fx.setMode("launchctl", "loaded")
+        try fx.failMoves([(previous.path, fx.app.path)])
+
+        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("launchctl bootstrap") }, "\(fx.calls())")
+        XCTAssertFalse(fx.exists(fx.app))
+        XCTAssertEqual(try String(contentsOf: previous.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "previous\n")
+        let staged = try XCTUnwrap(try stagingDirs().first, "\(String(describing: try? fx.contents(of: fx.appsDir)))")
+        XCTAssertEqual(try String(contentsOf: staged.appendingPathComponent("Interrupted.app/Contents/MacOS/Insomnia"), encoding: .utf8), "interrupted\n")
+        XCTAssertTrue(fx.exists(staged.appendingPathComponent("Insomnia.app")), "the new build is kept too")
+        XCTAssertEqual(try pastedWords(of: printedCommand(in: r.stderr, containing: "mv ")), ["mv", previous.path, fx.app.path])
+        XCTAssertEqual(try pastedWords(of: printedCommand(in: r.stderr, containing: "launchctl bootstrap")), ["launchctl", "bootstrap", "gui/\(fx.uid)", fx.plist.path])
+    }
+
+    /// Nothing is at $APP and the set-aside bundle cannot be put back: the
+    /// run stops before the recovery and touches no job.
+    func testInstallStopsWhenTheSetAsideBundleCannotBePutBack() throws {
+        try fx.prepareInstall()
+        try fx.writeBundle(at: setAside, marker: "previous")
+        try "trusted".write(to: fx.plist, atomically: true, encoding: .utf8)
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        fx.setMode("launchctl", "loaded")
+        try fx.failMoves([(setAside.path, fx.app.path)])
+
+        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("launchctl") }, "\(fx.calls())")
+        XCTAssertFalse(fx.exists(fx.app))
+        XCTAssertEqual(try String(contentsOf: setAside.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "previous\n")
+        XCTAssertTrue(r.stderr.contains("putting back the previous app"), r.stderr)
+        XCTAssertEqual(try pastedWords(of: printedCommand(in: r.stderr, containing: "mv ")), ["mv", setAside.path, fx.app.path])
+    }
+
     /// The scripts/simulate-lid.sh watcher is compiled out of a release
     /// build unless the installer is told to compile it in: only
     /// INSOMNIA_LID_SIMULATION=1 adds the define to the swift build lines,
@@ -3302,6 +3505,7 @@ private final class ScriptFixture {
             "SUDO": bin.appendingPathComponent("sudo").path,
             "CODESIGN": bin.appendingPathComponent("codesign").path,
             "SWIFT": bin.appendingPathComponent("swift").path,
+            "MV": bin.appendingPathComponent("mv").path,
             "LOCK_TIMEOUT_SECONDS": "1",
         ])
         try patchedInstall.write(to: install, atomically: true, encoding: .utf8)
@@ -3415,6 +3619,24 @@ private final class ScriptFixture {
         printf 'swift %s\\n' "$*" >> "\(calls)"
         for a in "$@"; do [[ "$a" == --show-bin-path ]] && { echo "\(r)/binroot"; exit 0; }; done
         exit 0
+        """)
+        // mv: install.sh's MV. Runs /bin/mv unless a line of mv.fail,
+        // "<from pattern>|<to pattern>" (bash globs), matches the move; then
+        // it logs "mv FAILED <from> <to>" and exits 1 like a refused rename,
+        // and both paths stay as they were.
+        try writeFake("mv", """
+        args=(); for a in "$@"; do [[ "$a" == -* ]] || args+=("$a"); done
+        from="${args[0]:-}"; to="${args[1]:-}"
+        if [[ -f "\(r)/mv.fail" ]]; then
+          while IFS='|' read -r f t; do
+            if [[ -n "$f" && "$from" == $f && "$to" == $t ]]; then
+              printf 'mv FAILED %s %s\\n' "$from" "$to" >> "\(calls)"
+              echo "mv: rename $from to $to: Permission denied" >&2
+              exit 1
+            fi
+          done < "\(r)/mv.fail"
+        fi
+        exec /bin/mv "$@"
         """)
         // codesign: signing is recorded and succeeds. `-d -r-` prints a
         // fixed designated requirement the way codesign does (on stderr,
@@ -3673,6 +3895,13 @@ private final class ScriptFixture {
         let dict = LaunchdBackstop.plistDictionary(label: "com.insomnia.backstop", target: BackstopTarget(bundle: app, requirement: requirement))
         let data = try PropertyListSerialization.data(fromPropertyList: dict, format: .xml, options: 0)
         try data.write(to: plist)
+    }
+
+    /// Makes the fake mv refuse every move whose source and destination
+    /// match one of these bash glob patterns.
+    func failMoves(_ rules: [(from: String, to: String)]) throws {
+        try rules.map { "\($0.from)|\($0.to)\n" }.joined()
+            .write(to: root.appendingPathComponent("mv.fail"), atomically: true, encoding: .utf8)
     }
 
     func setMode(_ name: String, _ value: String) {

@@ -33,6 +33,7 @@ PLUTIL=/usr/bin/plutil
 CODESIGN=/usr/bin/codesign
 SWIFT=/usr/bin/swift
 LOCKF=/usr/bin/lockf
+MV=/bin/mv
 LOCK_TIMEOUT_SECONDS=10
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -73,6 +74,20 @@ loaded_state() { # -> yes | no | unknown:<rc>
     113) echo no ;;
     *) echo "unknown:$rc" ;;
   esac
+}
+
+# Moves a bundle with one rename. Every path passed here is inside $APP_DIR,
+# one filesystem, so a rename that fails leaves both paths as they were.
+# Refuses when something is at the destination: mv would move the bundle
+# into it instead. Each caller handles a failure itself; under set -e an
+# unhandled one would exit with the previous job unloaded and let cleanup
+# delete the staged build.
+move_bundle() { # from to
+  if [[ -e "$2" || -L "$2" ]]; then
+    echo "not moving $1: $2 already exists" >&2
+    return 1
+  fi
+  "$MV" "$1" "$2"
 }
 
 cleanup() {
@@ -229,7 +244,18 @@ fi
 # staging directory.
 if [[ -d "$PREVIOUS_APP" && ! -e "$APP" ]]; then
   # Stopped between the two renames: nothing at $APP.
-  mv "$PREVIOUS_APP" "$APP"
+  if ! move_bundle "$PREVIOUS_APP" "$APP"; then
+    cat >&2 <<FAIL
+
+Install stopped: nothing is at $APP, and putting back the previous app that an
+interrupted run set aside at $PREVIOUS_APP failed. It stays there; nothing else
+was moved or unloaded, and the new build was discarded. Installed so far: $SUDOERS.
+The LaunchAgent finds no app at $APP until it is back. Before you log out, move
+it back and rerun this script:
+  $(command_line mv "$PREVIOUS_APP" "$APP")
+FAIL
+    exit 1
+  fi
   echo "restored $APP, which an interrupted run had set aside"
 fi
 # Staging directories of runs that are gone, matched by the exact name step 3
@@ -332,8 +358,44 @@ FAIL
         exit 1
       fi
     fi
-    mv "$APP" "$STAGE/Interrupted.app"
-    mv "$PREVIOUS_APP" "$APP"
+    unloaded_note=""
+    if [[ "$held" != no ]]; then
+      unloaded_note="The job that run left was unloaded (launchctl print confirms), and none is loaded now.
+"
+    fi
+    if ! move_bundle "$APP" "$STAGE/Interrupted.app"; then
+      cat >&2 <<FAIL
+
+Install stopped: an interrupted run left its build at $APP and the previous app
+at $PREVIOUS_APP, which $PLIST pins, and moving that build out of $APP failed.
+Neither bundle was moved; the new build was discarded. Installed so far: $SUDOERS.
+${unloaded_note}The next login loads $PLIST, which does not match the app at $APP.
+Before you log out, fix what kept the bundle from moving (see the error above)
+and rerun this script, which puts the previous app back.
+FAIL
+      exit 1
+    fi
+    if ! move_bundle "$PREVIOUS_APP" "$APP"; then
+      # Nothing is at $APP now. The previous app stays set aside, and the
+      # staging directory is kept, with the interrupted run's build and this
+      # run's: no bundle is deleted while none is at $APP.
+      kept="$STAGE"
+      STAGE=""
+      cat >&2 <<FAIL
+
+Install stopped: an interrupted run left its build at $APP and the previous app
+at $PREVIOUS_APP, which $PLIST pins. That build was moved out of the way, but
+moving the previous app back to $APP failed, so nothing is at $APP.
+The previous app stays at $PREVIOUS_APP; the interrupted run's build and the new
+build are kept in $kept. Installed so far: $SUDOERS.
+${unloaded_note}The LaunchAgent finds no app at $APP until the previous one is back. Before
+you log out, move it back and load its agent:
+  $(command_line mv "$PREVIOUS_APP" "$APP")
+  $(command_line launchctl bootstrap "gui/$UID_NUM" "$PLIST")
+or rerun this script, which puts it back first.
+FAIL
+      exit 1
+    fi
     echo "restored $APP, which an interrupted run had set aside; $PLIST pins it"
     if [[ "$held" != no ]]; then
       # A job was loaded when this run started; the previous plist takes its
@@ -465,25 +527,49 @@ FAIL
     exit 1
   fi
 fi
+# A rename that fails is handled like a failed load: no job of this run was
+# loaded, and the failure branch below puts back what moved and reloads the
+# previous job.
 had_app=0
+set_aside=0
+swapped=0
+swap_reason=""
 if [[ -e "$APP" ]]; then
-  mv "$APP" "$PREVIOUS_APP"
   had_app=1
+  if move_bundle "$APP" "$PREVIOUS_APP"; then
+    set_aside=1
+  else
+    swap_reason="the previous app at $APP could not be moved aside to $PREVIOUS_APP"
+  fi
 fi
-mv "$NEW_APP" "$APP"
+if [[ -z "$swap_reason" ]]; then
+  if move_bundle "$NEW_APP" "$APP"; then
+    swapped=1
+  else
+    swap_reason="the new build could not be moved from $NEW_APP to $APP"
+  fi
+fi
 bootstrap_rc=0
-"$LAUNCHCTL" bootstrap "gui/$UID_NUM" "$CANDIDATE" || bootstrap_rc=$?
-after="$(loaded_state)"
+# Without a swap nothing was loaded: the previous job is confirmed unloaded
+# above (or none was loaded), and the new one is loaded only after the swap.
+after=no
 published=0
-if (( bootstrap_rc == 0 )) && [[ "$after" == yes ]] && mv -f "$CANDIDATE" "$PLIST"; then
-  published=1
+if (( swapped )); then
+  "$LAUNCHCTL" bootstrap "gui/$UID_NUM" "$CANDIDATE" || bootstrap_rc=$?
+  after="$(loaded_state)"
+  if (( bootstrap_rc == 0 )) && [[ "$after" == yes ]] && "$MV" -f "$CANDIDATE" "$PLIST"; then
+    published=1
+  fi
 fi
 
 if (( published )); then
   echo "LaunchAgent $LABEL loaded (launchctl print confirms); $PLIST published"
-  if (( had_app )); then
-    rm -rf "$PREVIOUS_APP"
-    echo "replaced the previous $APP"
+  if (( set_aside )); then
+    if rm -rf "$PREVIOUS_APP"; then
+      echo "replaced the previous $APP"
+    else
+      echo "replaced the previous $APP, but its copy at $PREVIOUS_APP could not be removed; the next run of this script removes it" >&2
+    fi
   fi
   # Installs before this layout ran a writable copy from $APP_SUPPORT. The
   # agent just loaded runs the sealed one, so that copy goes now, not before.
@@ -493,7 +579,10 @@ if (( published )); then
   fi
 else
   fix_note="Fix the launchctl error and rerun."
-  if (( bootstrap_rc != 0 )); then
+  if [[ -n "$swap_reason" ]]; then
+    reason="$swap_reason (see the error above)"
+    fix_note="Fix what kept the bundle from moving and rerun."
+  elif (( bootstrap_rc != 0 )); then
     reason="'launchctl bootstrap' exited $bootstrap_rc for the new LaunchAgent"
   elif [[ "$after" != yes ]]; then
     reason="'launchctl bootstrap' reported success, but the job is not confirmed loaded (launchctl print: $after)"
@@ -514,13 +603,25 @@ where the next login loads it from"
     stopped="$stopped
 The new job was unloaded again (launchctl print confirms)."
   fi
+  # Undo the swap first, so whatever job runs next (the previous plist
+  # reloaded below, or loaded at the next login) finds the build it pins.
+  # Unless the new job is confirmed unloaded it stays with the build it
+  # pins: putting the previous app back would leave it refusing every run.
+  kept_why=""
   if [[ "$unloaded" != no ]]; then
-    # The new job may still be loaded, and it pins the new build: putting
-    # the previous app back would leave it refusing every run. The swap
-    # stays and the previous bundle stays set aside, which is the state an
-    # install killed mid-swap leaves; the rerun's repair above handles it.
-    if (( had_app )); then
-      kept_note="The previous app is kept at $PREVIOUS_APP; the rerun unloads the job
+    kept_why="The new job may still be loaded: unloading it was not confirmed (launchctl print: $unloaded).
+The new build stays at $APP, because that job pins it and would refuse the
+previous app."
+  elif (( swapped )) && ! move_bundle "$APP" "$NEW_APP"; then
+    kept_why="No job of this run is loaded (launchctl print confirms), but moving the new
+build out of $APP failed (see the error above), so it stays there."
+  fi
+  if [[ -n "$kept_why" ]]; then
+    # The swap stays and the previous bundle stays set aside, which is the
+    # state an install killed mid-swap leaves; the rerun's repair above
+    # handles it.
+    if (( set_aside )); then
+      kept_note="The previous app is kept at $PREVIOUS_APP; the rerun unloads any job
 and puts the previous app back if $PLIST still pins it."
     else
       kept_note="No app was installed at $APP before this run."
@@ -534,21 +635,46 @@ next login loads would refuse to run."
     cat >&2 <<FAIL
 
 Install stopped: $reason.
-The new job may still be loaded: unloading it was not confirmed (launchctl print: $unloaded).
-The new build stays at $APP, because that job pins it and would refuse the
-previous app. $kept_note
+$kept_why $kept_note
 $plist_note
 $SUDOERS is installed and the recovery journal was clean when checked above.
 ${fix_note%.} before you log out.
 FAIL
     exit 1
   fi
-  # Undo the swap first, so whatever job runs next (the previous plist
-  # reloaded below, or loaded at the next login) finds the build it pins.
-  mv "$APP" "$NEW_APP"
-  if (( had_app )); then
-    mv "$PREVIOUS_APP" "$APP"
+  if (( set_aside )); then
+    if ! move_bundle "$PREVIOUS_APP" "$APP"; then
+      # Nothing is at $APP now. The previous app stays set aside and the
+      # new build stays staged: no bundle is deleted while none is at $APP.
+      # Its job is not reloaded, since it would find no app to run.
+      STAGE=""
+      if [[ -f "$PLIST" ]]; then
+        plist_note="The plist at $PLIST was not modified."
+        restore="move it back and load its agent:
+  $(command_line mv "$PREVIOUS_APP" "$APP")
+  $(command_line launchctl bootstrap "gui/$UID_NUM" "$PLIST")"
+      else
+        plist_note="No plist exists at $PLIST."
+        restore="move it back:
+  $(command_line mv "$PREVIOUS_APP" "$APP")"
+      fi
+      cat >&2 <<FAIL
+
+$stopped
+Putting the previous app back at $APP then failed (see the error above), so
+nothing is at $APP. The previous app stays at $PREVIOUS_APP and the new build
+at $NEW_APP; neither was deleted.
+$plist_note
+$SUDOERS is installed and the recovery journal was clean when checked above.
+The LaunchAgent finds no app at $APP until the previous one is back. Before you
+log out, $restore
+or rerun this script, which puts it back first.
+FAIL
+      exit 1
+    fi
     app_note="The previous app was put back at $APP; the new build was discarded."
+  elif (( had_app )); then
+    app_note="The previous app was never moved from $APP; the new build was discarded."
   else
     app_note="No app was installed at $APP before and none is now; the new build was discarded."
   fi
