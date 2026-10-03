@@ -649,7 +649,7 @@ final class StatusItemController: NSObject {
         // next opening drop the line if sleep is enabled again.
         Task { await manager.recheckForeignSleep() }
         let menu = StatusMenu.menu(
-            menuItems(),
+            Self.menuItems(manager: manager, status: status),
             target: self,
             settings: #selector(menuOpenSettings),
             quit: #selector(menuQuit),
@@ -658,7 +658,9 @@ final class StatusItemController: NSObject {
         menu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.height + 4), in: button)
     }
 
-    private func menuItems() -> [StatusMenu.Item] {
+    /// The menu's lines from what the session and the status source report
+    /// now. Static, so a test can check them without a status item.
+    static func menuItems(manager: SessionManager, status: any StatusSource) -> [StatusMenu.Item] {
         StatusMenu.items(
             sessionActive: manager.isActive,
             sleepHeld: manager.state.sleepDisabledByUs,
@@ -678,6 +680,7 @@ final class StatusItemController: NSObject {
                 lastGap: status.lastGap
             ),
             throttledBrowsers: status.throttledBrowsers,
+            relaunchProblem: status.relaunchProblem,
             error: manager.lastError,
             foreignSleep: manager.foreignSleepWarning,
             lidSimulationBuild: LidSimulationBuild.isCompiledIn

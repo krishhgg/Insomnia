@@ -130,6 +130,7 @@ is performed. Do not replace "not run" with "passed" based on source review.
 | tmux cancellation with a dedicated disposable pane | Not run |
 | Headed-browser throttling with the lid closed | Not run |
 | Relaunch unthrottled: confirmation alert, profile arguments carried over, a browser that has not quit after 10 s is left as it is and the notification names it, a browser not running 5 s after `open` is reported | Not run |
+| Relaunch failure while Insomnia is frontmost: with notifications allowed, the "Browser not relaunched" banner shows without switching apps after the confirmation; with notifications off for Insomnia, the reason is a warning line in the right-click menu | Not run |
 | Battery/thermal event behavior on supported hardware | Not run |
 | `SleepDisabled 1` set by hand with no session: left alone and reported at launch, not cleared | Not run |
 | Unreadable battery (IOKit miss) ends the session on a laptop after the second read; desktop unaffected | Not run |

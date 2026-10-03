@@ -16,6 +16,8 @@ protocol StatusSource: AnyObject, Observable {
     var dockerPaused: Bool { get }
     /// Browsers running without the occlusion flags.
     var throttledBrowsers: [ThrottledBrowser] { get }
+    /// Why the last relaunch did not happen; a menu warning line.
+    var relaunchProblem: String? { get }
 
     /// Called when the menu opens; observers refresh anything not pushed.
     func refreshOnDemand()
@@ -40,6 +42,7 @@ final class PlaceholderStatus: StatusSource {
     var frozenCount: Int = 0
     var dockerPaused: Bool = false
     var throttledBrowsers: [ThrottledBrowser] = []
+    var relaunchProblem: String? = nil
 
     init() {}
 

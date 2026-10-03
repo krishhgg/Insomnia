@@ -67,4 +67,24 @@ final class StatusMenuWarningTests: XCTestCase {
         let entry = menu.items.first { $0.title == "Relaunch Arc unthrottled" }
         XCTAssertEqual(entry?.representedObject as? ThrottledBrowser, arc)
     }
+
+    /// The reason the last relaunch stopped short follows the browser
+    /// lines and comes before the session error. It is shown with no
+    /// throttled browser left too: a browser that quit and did not open
+    /// again is in no browser line.
+    func testTheRelaunchProblemFollowsTheBrowserLines() throws {
+        let arc = ThrottledBrowser(bundleId: "company.thebrowser.Browser", name: "Arc")
+        let problem = "Arc did not quit within 10 s, so nothing was relaunched."
+        let items = StatusMenu.items(sessionActive: true, sleepHeld: true, machine: nil, actions: nil, throttledBrowsers: [arc], relaunchProblem: problem, error: "restore failed")
+        let throttle = try XCTUnwrap(StatusLines.throttleWarning(["Arc"]))
+        XCTAssertEqual(items.map(\.title).filter { $0.contains("Arc") || $0.contains("restore") }, [
+            throttle,
+            "Relaunch Arc unthrottled",
+            "\u{26A0} \(problem)",
+            "\u{26A0} restore failed",
+        ])
+
+        let closed = StatusMenu.items(sessionActive: false, sleepHeld: false, machine: nil, actions: nil, throttledBrowsers: [], relaunchProblem: problem, error: nil)
+        XCTAssertEqual(closed.filter { $0.kind == .warning }.map(\.title), ["\u{26A0} \(problem)"])
+    }
 }

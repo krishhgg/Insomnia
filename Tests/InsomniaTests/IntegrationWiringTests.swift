@@ -119,11 +119,89 @@ final class IntegrationWiringTests: XCTestCase {
 
         XCTAssertEqual(notifier.posts.map(\.title), ["Browser not relaunched"])
         XCTAssertEqual(notifier.posts.map(\.body), ["Chrome is not running. Nothing was quit or relaunched."])
+        XCTAssertEqual(services.status.relaunchProblem, "Chrome is not running. Nothing was quit or relaunched.")
         XCTAssertEqual(processes.quitRequests.count, 0)
         XCTAssertEqual(processes.launches.count, 0)
     }
 
     private static let chrome = ThrottledBrowser(bundleId: "com.google.Chrome", name: "Chrome")
+
+    /// Notifications can be off for Insomnia, so the reason a relaunch
+    /// stopped short is also a warning line in the menu, built the way the
+    /// status item builds it. Here the browser quit and `open` failed: the
+    /// browser is closed, and the line says to open it by hand.
+    @MainActor
+    func testARelaunchWhoseOpenFailsLeavesTheReasonInTheMenu() async {
+        let h = Harness()
+        defer { h.home.destroy() }
+        let processes = FakeBrowserProcesses(pids: [42])
+        processes.launchFailure = "LSOpenURLsWithRole() failed with error -10810"
+        let services = AppServices(
+            paths: h.home.paths,
+            notifier: RecordingNotifier(),
+            audio: FakeAudioControl(),
+            processControl: FakeProcessControl(),
+            locationPermission: LocationPermission(authorizationStatus: .notDetermined),
+            browser: BrowserThrottle(readArgs: { _ in "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" }, processes: processes)
+        )
+        let source = LiveStatusSource(services: services)
+
+        await services.relaunchUnthrottled(Self.chrome)
+
+        let reason = "Chrome quit but could not be relaunched: LSOpenURLsWithRole() failed with error -10810. Open it yourself."
+        XCTAssertEqual(source.relaunchProblem, reason)
+        let items = StatusItemController.menuItems(manager: h.makeManager(), status: source)
+        // The scan after the relaunch lists whatever browsers this Mac is
+        // running, so only the line itself is checked.
+        XCTAssertTrue(items.contains(StatusMenu.Item(title: "\u{26A0} \(reason)", kind: .warning)), "\(items.map(\.title))")
+    }
+
+    /// The line belongs to the last relaunch. Starting another clears it
+    /// while that one runs, and one that relaunches the browser leaves no
+    /// line.
+    @MainActor
+    func testTheNextRelaunchReplacesTheMenuLine() async {
+        let home = TempHome()
+        defer { home.destroy() }
+        let processes = FakeBrowserProcesses(pids: [42])
+        processes.quits = false
+        let services = AppServices(
+            paths: home.paths,
+            notifier: RecordingNotifier(),
+            audio: FakeAudioControl(),
+            processControl: FakeProcessControl(),
+            locationPermission: LocationPermission(authorizationStatus: .notDetermined),
+            browser: BrowserThrottle(readArgs: { _ in "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" }, processes: processes)
+        )
+        await services.relaunchUnthrottled(Self.chrome)
+        XCTAssertNotNil(services.status.relaunchProblem)
+
+        processes.quits = true
+        processes.startWait = .pollsUntilCancelled
+        let waiting = Task { await services.relaunchUnthrottled(Self.chrome) }
+        await fulfillment(of: [processes.insideStartWait], timeout: 60)
+        XCTAssertNil(services.status.relaunchProblem, "a relaunch in progress still showed the last one's failure")
+        services.cancelBrowserTasks()
+        await waiting.value
+
+        processes.startWait = .appears
+        processes.start(pid: 43)
+        services.status.relaunchProblem = "left by an earlier relaunch"
+        await services.relaunchUnthrottled(Self.chrome)
+        XCTAssertNil(services.status.relaunchProblem)
+        XCTAssertEqual(processes.launches.count, 2)
+    }
+
+    /// Without a delegate asking for them, macOS drops notifications while
+    /// Insomnia is frontmost, as it is right after the relaunch
+    /// confirmation. The delegate asks for the same presentation as when
+    /// another app is frontmost. `install()` needs the notification center,
+    /// which only an app bundle has, so here it must do nothing.
+    func testNotificationsAreShownWhileInsomniaIsFrontmost() {
+        XCTAssertEqual(ForegroundNotifications.presentation, [.banner, .list, .sound])
+        XCTAssertFalse(Notifier.runningInsideAppBundle())
+        ForegroundNotifications.install()
+    }
 
     /// A relaunch that stops short (here the browser is still running when
     /// the wait ends) reaches the user as a notification naming the browser,

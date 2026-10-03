@@ -287,9 +287,14 @@ last held while it was on was the battery or thermal floor, not the lid.
     browser not running by then is reported too. A session that ends during
     that wait cancels it at once and nothing is reported, since the user
     ended the session. Every other outcome short of a relaunch is a
-    "Browser not relaunched" notification naming the browser;
-    the process side (`BrowserProcessControlling`) is injected so the tests
-    quit nothing.
+    "Browser not relaunched" notification naming the browser, and the same
+    text stays in the menu as a warning line until the next relaunch or
+    the next session start, because notifications can be off for Insomnia.
+    Insomnia is the notification center's delegate and asks for banners
+    while it is frontmost, as it is right after the confirmation; without
+    that, macOS drops a notification from the frontmost app. The process
+    side (`BrowserProcessControlling`) is injected so the tests quit
+    nothing.
   - Headless Playwright is unaffected and needs nothing.
   - **Must be verified on the real machine with the lid shut** (see test plan).
     If macOS 26 does not mark windows occluded in this state, the feature is
