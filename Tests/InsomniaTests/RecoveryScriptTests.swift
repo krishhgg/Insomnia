@@ -592,7 +592,7 @@ final class RecoveryScriptTests: XCTestCase {
             </dict></plist>
             """,
         ]
-        let problems = ["startedAt is a JSON integer, not a date string", "extensions[0] is a JSON string, not a number", "endsAt is not a UTC date in the form 2027-01-15T08:00:00Z", "extensions is a JSON dictionary, not an array", "session.json is not a JSON object", "session.json is not a JSON object"]
+        let problems = ["startedAt is a JSON integer, not a date string", "extensions[0] is a JSON string, not a number", "endsAt is not a date in the form 2027-01-15T08:00:00Z or 2027-01-15T10:00:00+02:00", "extensions is a JSON dictionary, not an array", "session.json is not a JSON object", "session.json is not a JSON object"]
         for (json, problem) in zip(cases, problems) {
             try json.write(to: fx.session, atomically: true, encoding: .utf8)
             try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
@@ -620,6 +620,85 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(fx.calls(), [])
         XCTAssertTrue(fx.exists(fx.session))
         XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, true)
+    }
+
+    /// Dates the app and both scripts must read alike: each script's
+    /// epoch_of gives the second the app's Session decoder gives, or both
+    /// refuse. Most refused ones are dates JSONDecoder's `.iso8601` took on
+    /// macOS 26 while the scripts did not, so the app could keep a deadline
+    /// that the backstop ended every minute.
+    func testScriptsAndAppReadTheSameSessionDates() throws {
+        let cases = [
+            "2027-01-15T08:00:00Z", "2027-01-15T10:00:00+02:00", "2027-01-15T02:30:00-05:30", "2027-01-15T08:00:00+00:00",
+            "2027-01-15T08:00:00-00:00", "2027-01-16T07:59:00+23:59", "2028-02-29T08:00:00Z", "1970-01-01T00:30:00+01:00",
+            "1970-01-01T00:00:00Z", "9999-12-31T23:59:59Z", "9999-12-31T23:59:59-23:59",
+            "1969-12-31T23:59:59Z", "1900-01-01T00:00:00Z", "2027-02-29T08:00:00Z", "2027-02-30T08:00:00Z", "2027-04-31T08:00:00Z",
+            "2027-01-15T24:00:00Z", "2027-01-15T25:00:00Z", "2027-01-15T08:61:00Z", "2027-01-15T08:00:60Z", "2027-13-01T08:00:00Z",
+            "2027-00-10T08:00:00Z", "2027-01-15T08:00:00+24:00", "2027-01-15T08:00:00+02:60", "2027-01-15T08:00:00+0200",
+            "2027-01-15T08:00:00+02", "2027-01-15T08:00:00+2:00", "2027-01-15T08:00:00.5Z", "2027-01-15T08:00:00.123+02:00",
+            "2027-01-15T08:00:00z", "2027-01-15t08:00:00Z", "2027-01-15T08:00:00GMT", "2027-01-15T08:00:00UTC",
+            "2027-01-15T08:00:00Zjunk", "2027-01-15T08:00:00Z ", " 2027-01-15T08:00:00Z", "2027-01-15T08:00:00+02:00:00",
+            "2027-1-5T8:0:0Z", "2027-01-15 08:00:00Z", "2027-01-15T08:00:00", "2027-01-15T08:00Z", "10000-01-01T00:00:00Z",
+            "+2027-01-15T08:00:00Z", "\u{FF12}\u{FF10}\u{FF12}\u{FF17}-01-15T08:00:00Z", "2027-01-15T08:00:00\u{2212}02:00", "",
+        ]
+        let app: [String] = cases.map { text in
+            let json = #"{"startedAt":"2027-01-15T08:00:00Z","endsAt":"\#(text)","extensions":[]}"#
+            guard let s = try? Store.makeDecoder().decode(Session.self, from: Data(json.utf8)) else { return "" }
+            return String(Int(s.endsAt.timeIntervalSince1970))
+        }
+        XCTAssertEqual(app.filter { !$0.isEmpty }.count, 11, "the app reads the first eleven: \(Array(zip(cases, app)))")
+        for script in [fx.backstop, fx.uninstall] {
+            let text = try String(contentsOf: script, encoding: .utf8)
+            let start = try XCTUnwrap(text.range(of: "\nepoch_of() {"), script.lastPathComponent)
+            let end = try XCTUnwrap(text.range(of: "\n}\n", range: start.upperBound..<text.endIndex))
+            let harness = fx.root.appendingPathComponent("epoch_of.\(script.lastPathComponent)")
+            try ("set -euo pipefail\nDATE=/bin/date" + text[start.lowerBound..<end.upperBound]
+                + #"for s in "$@"; do printf '[%s]\n' "$(epoch_of "$s")"; done"# + "\n")
+                .write(to: harness, atomically: true, encoding: .utf8)
+
+            let r = try fx.run(harness, cases)
+
+            XCTAssertEqual(r.status, 0, r.stderr)
+            let shell = r.stdout.split(separator: "\n", omittingEmptySubsequences: false).dropLast().map { String($0.dropFirst().dropLast()) }
+            XCTAssertEqual(shell.count, cases.count, r.stdout)
+            for (i, text) in cases.enumerated() where i < shell.count {
+                XCTAssertEqual(shell[i], app[i], "\(script.lastPathComponent) and the app read \(text.debugDescription) differently")
+            }
+        }
+    }
+
+    /// A session written with offsets is a session for the backstop too: a
+    /// future one keeps sleep disabled and nothing runs, a past one is
+    /// undone like any expired session.
+    func testSessionWithOffsetDatesIsReadLikeTheApp() throws {
+        let dirty = #"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = TimeZone(secondsFromGMT: -5 * 3600 - 1800)
+        f.dateFormat = "yyyy-MM-dd'T'HH:mm:ssxxx"
+        func write(endsAt: Date) throws {
+            let json = #"{"startedAt":"\#(f.string(from: endsAt.addingTimeInterval(-3600)))","endsAt":"\#(f.string(from: endsAt))","extensions":[]}"#
+            XCTAssertTrue(json.contains("-05:30"), json)
+            try json.write(to: fx.session, atomically: true, encoding: .utf8)
+        }
+
+        try write(endsAt: Date(timeIntervalSinceNow: 3600))
+        try fx.writeState(dirty)
+        let future = try fx.run(fx.backstop)
+
+        XCTAssertEqual(future.status, 0, future.stderr + fx.log())
+        XCTAssertEqual(fx.calls(), [])
+        XCTAssertTrue(fx.exists(fx.session))
+        XCTAssertEqual(try String(contentsOf: fx.state, encoding: .utf8), dirty)
+
+        try write(endsAt: Date(timeIntervalSinceNow: -60))
+        let past = try fx.run(fx.backstop)
+
+        XCTAssertEqual(past.status, 0, past.stderr + fx.log())
+        XCTAssertEqual(fx.calls(), ["sudo -n \(fx.fakePmset) -a disablesleep 0"])
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, false)
+        XCTAssertFalse(fx.exists(fx.session))
+        XCTAssertEqual(try movedAsideSessions(), [], "an expired session is removed, not moved aside as malformed")
     }
 
     /// A session.json that exists but cannot be read at all (here: it is a

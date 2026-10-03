@@ -417,6 +417,40 @@ final class ReconcileTests: XCTestCase {
         return lstat(url.path, &info) == 0 ? info.st_mode & S_IFMT : 0
     }
 
+    /// A session.json whose dates carry an offset in place of Z (a person
+    /// may write one by hand) is the same session, and backstop.sh reads
+    /// the same dates (RecoveryScriptTests), so the app resumes it.
+    func testSessionWithOffsetDatesIsResumed() async throws {
+        // h.clock.now is 2027-01-15T08:00:00Z; the end is an hour later.
+        let json = #"{"startedAt":"2027-01-15T09:50:00+02:00","endsAt":"2027-01-15T11:00:00+02:00","extensions":[]}"#
+        try Data(json.utf8).write(to: h.home.paths.sessionFile)
+        try h.store.saveState(RuntimeState())
+
+        let m = h.makeManager()
+        await m.reconcile()
+
+        XCTAssertEqual(m.session?.endsAt, h.clock.now.addingTimeInterval(3600))
+        XCTAssertEqual(m.scheduledDeadline, h.clock.now.addingTimeInterval(3600))
+        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1"])
+        XCTAssertEqual(try movedAsideSessions, [])
+    }
+
+    /// A date JSONDecoder's `.iso8601` took but backstop.sh refuses (here,
+    /// text after the zone) is not a session for the app either. Before,
+    /// the app resumed it while the agent undid it every minute.
+    func testSessionWithADateTheScriptsRefuseIsNotResumed() async throws {
+        let json = #"{"startedAt":"2027-01-15T07:50:00Z","endsAt":"2027-01-15T09:00:00Zjunk","extensions":[]}"#
+        try Data(json.utf8).write(to: h.home.paths.sessionFile)
+        try h.store.saveState(RuntimeState())
+
+        let m = h.makeManager()
+        await m.reconcile()
+
+        XCTAssertNil(m.session)
+        XCTAssertFalse(h.guardFake.calls.contains("disablesleep 1"), "\(h.guardFake.calls)")
+        XCTAssertEqual(try movedAsideSessions, ["session.json.unreadable-20270115T080000Z"])
+    }
+
     /// A session.json that is not a session says nothing about what to undo
     /// (the journal does). It is renamed to a timestamped sibling under the
     /// lock, the user is told where, and reconcile goes on as with no

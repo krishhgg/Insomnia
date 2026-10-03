@@ -371,8 +371,11 @@ Reconcile runs at every Insomnia launch:
    restored as with no session. `backstop.sh` does the same once the journal
    is clean. A session file that decodes as JSON but lacks a key or type
    the `Session` decoder needs (`startedAt`, `endsAt`, `extensions`) is not
-   a session either; `backstop.sh` checks the same keys and types, and
-   reads dates only in the form Store writes. A session file that exists
+   a session either; `backstop.sh` checks the same keys and types. The app
+   and both scripts read a date in one form only: `2027-01-15T08:00:00Z`,
+   as Store writes it, or the same with an offset such as `+02:00` in place
+   of `Z`, in whole seconds, naming a date and time that exist, years 1970
+   to 9999 (`Store.parseDate`, `epoch_of` in the scripts). A session file that exists
    but cannot be read at all, or is not a regular file (never opened: a
    FIFO would block under the lock), has no end time that can be enforced,
    so it also counts as expired and the journal is restored. It may have
