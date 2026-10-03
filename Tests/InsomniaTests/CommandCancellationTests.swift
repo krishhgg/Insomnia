@@ -26,11 +26,19 @@ final class CommandCancellationTests: XCTestCase {
 
     private func file(_ name: String) -> String { dir.appendingPathComponent(name).path }
 
+    /// Shell that writes the script's pid to `pidFile` under another name
+    /// and renames it into place: a redirection creates the file before
+    /// `printf` writes to it, so a reader that sees it appear could read it
+    /// empty. The rename makes it appear with the pid in it.
+    private func publishPid(_ pidFile: String) -> String {
+        "printf '%s' $$ > '\(pidFile).partial' && mv '\(pidFile).partial' '\(pidFile)'"
+    }
+
     /// A script that records its own pid and then *becomes* `sleep`, so the
     /// recorded pid is the one the runner signals.
     private func sleeper() throws -> (exe: String, pidFile: String) {
         let pidFile = file("pid")
-        let exe = try script("sleeper", "printf '%s' $$ > '\(pidFile)'\nexec sleep 30")
+        let exe = try script("sleeper", "\(publishPid(pidFile))\nexec sleep 30")
         return (exe, pidFile)
     }
 
@@ -121,7 +129,7 @@ final class CommandCancellationTests: XCTestCase {
     /// appears only once the trap is in place.
     private func termIgnorer() throws -> (exe: String, pidFile: String) {
         let pidFile = file("pid")
-        let exe = try script("ignorer", "trap '' TERM\nprintf '%s' $$ > '\(pidFile)'\nexec sleep 30")
+        let exe = try script("ignorer", "trap '' TERM\n\(publishPid(pidFile))\nexec sleep 30")
         return (exe, pidFile)
     }
 
