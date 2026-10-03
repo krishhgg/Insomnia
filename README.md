@@ -252,11 +252,22 @@ when-in-use grant, so System Settings records it as Location Services access
 for Insomnia. Insomnia uses it only to read Wi-Fi network names through
 CoreWLAN and never requests your location.
 
-Configured tmux targets opt into sending `continue` followed by Enter after a
-long outage (90 seconds by default). The default target list is empty. Use
-dedicated, disposable agent panes: pending text is opaque to Insomnia, and
-Enter can submit it too. Ending a session cancels pending automation but cannot
-retract keystrokes already sent.
+After a long outage (90 seconds by default) Insomnia types `continue` into
+each configured tmux target. The default target list is empty, and a listed
+pane is only nudged if you have marked it yourself, with a pane option that
+is read again before every send:
+
+```bash
+tmux set-option -p -t <session:window.pane> @insomnia-nudge on
+```
+
+Mark a dedicated, disposable agent pane, not one you type in, because pending
+text is opaque to Insomnia. Enter is off by default, so the word is typed and
+nothing submits it. Turn on "Press Enter after continue" in Settings to submit
+it, knowing that Enter also submits anything already typed in that pane. The
+option must be on the pane itself (`-p`). One set on the session or window
+does not count. Pane options need tmux 3.0 or later. Ending a session cancels
+pending automation but cannot retract keystrokes already sent.
 
 </details>
 
