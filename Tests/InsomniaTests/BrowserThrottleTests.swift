@@ -294,23 +294,29 @@ final class BrowserThrottleTests: XCTestCase {
         )
     }
 
-    /// The app's check, on whichever app the workspace lists first with a
-    /// readable start time: confirmed only with a start time recorded and
-    /// still matching. Read-only; nothing is signalled, quit or launched.
+    /// The app's check, run on the test process's own pid, which stays
+    /// alive for the whole test: confirmed only when the application has
+    /// not terminated and a start time was recorded that still matches.
+    /// Another app could exit between two reads and fail the test for no
+    /// fault of the check. Read-only; nothing is signalled, quit or
+    /// launched.
     @MainActor
     func testTheWorkspaceCheckFailsClosedWithoutAStartTime() throws {
-        let found = NSWorkspace.shared.runningApplications.lazy.compactMap { app -> (NSRunningApplication, ProcessIdentity)? in
-            guard !app.isTerminated, case let .present(state) = SignalProcessControl.kernelState(pid: app.processIdentifier) else { return nil }
-            return (app, state.identity)
-        }.first
-        guard let (app, identity) = found else { throw XCTSkip("no running app with a readable start time") }
-        let workspace = WorkspaceBrowserProcesses()
-        let pid = app.processIdentifier
+        let pid = ProcessInfo.processInfo.processIdentifier
+        guard case let .present(state) = SignalProcessControl.kernelState(pid: pid) else {
+            return XCTFail("the test process's own start time could not be read")
+        }
+        let identity = state.identity
         let other = ProcessIdentity(startedAt: identity.startedAt - 1, startedAtMicros: 0, bootSession: identity.bootSession)
 
-        XCTAssertTrue(workspace.isRunning(BrowserInstance(pid: pid, process: app, identity: identity)))
-        XCTAssertFalse(workspace.isRunning(BrowserInstance(pid: pid, process: app, identity: nil)), "no start time recorded")
-        XCTAssertFalse(workspace.isRunning(BrowserInstance(pid: pid, process: app, identity: other)), "another process's start time")
+        XCTAssertTrue(WorkspaceBrowserProcesses.isRunning(terminated: false, recorded: identity, pid: pid))
+        XCTAssertFalse(WorkspaceBrowserProcesses.isRunning(terminated: false, recorded: nil, pid: pid), "no start time recorded")
+        XCTAssertFalse(WorkspaceBrowserProcesses.isRunning(terminated: false, recorded: other, pid: pid), "another process's start time")
+        XCTAssertFalse(WorkspaceBrowserProcesses.isRunning(terminated: true, recorded: identity, pid: pid), "the workspace says it terminated")
+        XCTAssertFalse(
+            WorkspaceBrowserProcesses().isRunning(BrowserInstance(pid: pid, process: NSObject(), identity: identity)),
+            "not an application object"
+        )
     }
 
     /// Another instance exits during the read and its pid goes to another

@@ -21,7 +21,7 @@ final class IntegrationWiringTests: XCTestCase {
         services.status.lastGap = 12
         services.status.frozenCount = 3
         services.status.dockerPaused = true
-        services.status.throttledBrowsers = ["Chrome"]
+        services.status.throttledBrowsers = [ThrottledBrowser(bundleId: "com.google.Chrome", name: "Chrome")]
 
         let source = LiveStatusSource(services: services)
 
@@ -32,7 +32,7 @@ final class IntegrationWiringTests: XCTestCase {
         XCTAssertEqual(source.lastGap, 12)
         XCTAssertEqual(source.frozenCount, 3)
         XCTAssertTrue(source.dockerPaused)
-        XCTAssertEqual(source.throttledBrowsers, ["Chrome"])
+        XCTAssertEqual(source.throttledBrowsers, [ThrottledBrowser(bundleId: "com.google.Chrome", name: "Chrome")])
         XCTAssertEqual(source.locationPermission.authorizationStatus, .authorizedAlways)
     }
 
@@ -63,16 +63,67 @@ final class IntegrationWiringTests: XCTestCase {
         XCTAssertEqual(notifier.posts.count, 0)
     }
 
+    /// A scan that finishes while the confirmation is up can replace the
+    /// browser list without the browser in it (a `ps` read that failed
+    /// once). The relaunch goes by the bundle id the menu item carried,
+    /// not by a lookup in that list, so the confirmed browser is still
+    /// quit and opened again.
     @MainActor
-    func testLiveStatusSourceMapsBrowserDisplayNameToBundleID() {
-        let statuses = [
-            BrowserStatus(bundleId: "com.google.Chrome", name: "Chrome", pid: 10, unthrottled: false),
-            BrowserStatus(bundleId: "company.thebrowser.Browser", name: "Arc", pid: 11, unthrottled: false),
-        ]
+    func testAConfirmedRelaunchDoesNotLookTheBrowserUpInTheList() async {
+        let home = TempHome()
+        defer { home.destroy() }
+        let processes = FakeBrowserProcesses(pids: [42])
+        processes.startWait = .pollsUntilCancelled
+        let services = AppServices(
+            paths: home.paths,
+            notifier: RecordingNotifier(),
+            audio: FakeAudioControl(),
+            processControl: FakeProcessControl(),
+            locationPermission: LocationPermission(authorizationStatus: .notDetermined),
+            browser: BrowserThrottle(readArgs: { _ in "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" }, processes: processes)
+        )
+        services.status.browsers = []
+        services.status.throttledBrowsers = []
 
-        XCTAssertEqual(LiveStatusSource.bundleID(forDisplayName: "Arc", in: statuses), "company.thebrowser.Browser")
-        XCTAssertNil(LiveStatusSource.bundleID(forDisplayName: "Safari", in: statuses))
+        LiveStatusSource(services: services).relaunchUnthrottled(Self.chrome)
+        await fulfillment(of: [processes.insideStartWait], timeout: 60)
+        services.cancelBrowserTasks()
+
+        XCTAssertEqual(processes.terminated, [[42]])
+        XCTAssertEqual(processes.launches.map(\.bundleId), ["com.google.Chrome"])
     }
+
+    /// The confirmed browser quit before the relaunch ran. The throttle
+    /// finds no instance of it, quits and launches nothing, and the user
+    /// is told, by the name the menu showed, even though the browser list
+    /// no longer has it.
+    @MainActor
+    func testAConfirmedRelaunchOfABrowserThatHasGoneSaysSo() async {
+        let home = TempHome()
+        defer { home.destroy() }
+        let notifier = ExpectingNotifier()
+        let processes = FakeBrowserProcesses(pids: [])
+        let services = AppServices(
+            paths: home.paths,
+            notifier: notifier,
+            audio: FakeAudioControl(),
+            processControl: FakeProcessControl(),
+            locationPermission: LocationPermission(authorizationStatus: .notDetermined),
+            browser: BrowserThrottle(readArgs: { _ in "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" }, processes: processes)
+        )
+        services.status.browsers = []
+
+        LiveStatusSource(services: services).relaunchUnthrottled(Self.chrome)
+        await fulfillment(of: [notifier.posted], timeout: 60)
+        services.cancelBrowserTasks()
+
+        XCTAssertEqual(notifier.posts.map(\.title), ["Browser not relaunched"])
+        XCTAssertEqual(notifier.posts.map(\.body), ["Chrome is not running. Nothing was quit or relaunched."])
+        XCTAssertEqual(processes.quitRequests.count, 0)
+        XCTAssertEqual(processes.launches.count, 0)
+    }
+
+    private static let chrome = ThrottledBrowser(bundleId: "com.google.Chrome", name: "Chrome")
 
     /// A relaunch that stops short (here the browser is still running when
     /// the wait ends) reaches the user as a notification naming the browser,
@@ -94,7 +145,7 @@ final class IntegrationWiringTests: XCTestCase {
         )
         services.status.browsers = [BrowserStatus(bundleId: "com.google.Chrome", name: "Chrome", pid: 42, unthrottled: false)]
 
-        await services.relaunchUnthrottled("com.google.Chrome")
+        await services.relaunchUnthrottled(Self.chrome)
 
         XCTAssertEqual(notifier.posts.map(\.title), ["Browser not relaunched"])
         XCTAssertEqual(notifier.posts.map(\.body), ["Chrome did not quit within 10 s, so nothing was relaunched. It may still quit later. If it does, open it again yourself."])
@@ -123,7 +174,7 @@ final class IntegrationWiringTests: XCTestCase {
         )
         services.status.browsers = [BrowserStatus(bundleId: "com.google.Chrome", name: "Chrome", pid: 42, unthrottled: false)]
 
-        let relaunch = Task { await services.relaunchUnthrottled("com.google.Chrome") }
+        let relaunch = Task { await services.relaunchUnthrottled(Self.chrome) }
         await fulfillment(of: [processes.insideStartWait], timeout: 60)
         let checksAtCancel = processes.startChecks
         services.cancelBrowserTasks()
@@ -136,7 +187,8 @@ final class IntegrationWiringTests: XCTestCase {
 
     /// A browser scan that finishes during the relaunch replaces the
     /// browser list, and the quit browser is not in it. The notification
-    /// still names the browser, not its bundle id.
+    /// still names the browser, not its bundle id: the name is the one the
+    /// user confirmed.
     @MainActor
     func testARelaunchFailureNamesTheBrowserAfterTheListChanged() async {
         let home = TempHome()
@@ -155,7 +207,7 @@ final class IntegrationWiringTests: XCTestCase {
         services.status.browsers = [BrowserStatus(bundleId: "com.google.Chrome", name: "Chrome", pid: 42, unthrottled: false)]
         processes.duringQuit = { services.status.browsers = [] }
 
-        await services.relaunchUnthrottled("com.google.Chrome")
+        await services.relaunchUnthrottled(Self.chrome)
 
         XCTAssertEqual(processes.quitRequests.count, 1, "the list was cleared during the quit wait")
         XCTAssertEqual(notifier.posts.map(\.body), ["Chrome did not quit within 10 s, so nothing was relaunched. It may still quit later. If it does, open it again yourself."])
@@ -217,5 +269,22 @@ final class IntegrationWiringTests: XCTestCase {
         let undetermined = LocationPermission(authorizationStatus: .notDetermined)
         XCTAssertFalse(undetermined.isAuthorized)
         XCTAssertEqual(undetermined.statusDescription, "Not requested")
+    }
+}
+
+/// Records posts like `RecordingNotifier` and fulfills `posted` at the
+/// first, for a test that waits on a task it cannot await.
+final class ExpectingNotifier: Notifying, @unchecked Sendable {
+    private let recorder = RecordingNotifier()
+    let posted: XCTestExpectation = {
+        let e = XCTestExpectation(description: "a notification was posted")
+        e.assertForOverFulfill = false
+        return e
+    }()
+    var posts: [(title: String, body: String)] { recorder.posts }
+
+    func post(title: String, body: String) {
+        recorder.post(title: title, body: body)
+        posted.fulfill()
     }
 }

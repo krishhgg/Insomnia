@@ -16,8 +16,8 @@ final class SystemStatus {
     var lastGap: TimeInterval?
     var frozenCount: Int = 0
     var dockerPaused: Bool = false
-    /// Display names of running Chromium browsers missing the two flags.
-    var throttledBrowsers: [String] = []
+    /// Running Chromium browsers missing the two flags.
+    var throttledBrowsers: [ThrottledBrowser] = []
     /// Full detail for the relaunch item (bundle id + name).
     var browsers: [BrowserStatus] = []
 
@@ -246,15 +246,16 @@ final class AppServices {
 
     /// Quit and relaunch a Chromium browser with both anti-throttle flags.
     /// The outcome lands seconds after the menu click, so anything short of
-    /// a relaunch goes out as a notification naming the browser. The name
-    /// is taken before the relaunch starts: a scan that finishes meanwhile
-    /// replaces `status.browsers`, and the browser is not running then.
-    func relaunchUnthrottled(_ bundleId: String) async {
-        let name = status.browsers.first { $0.bundleId == bundleId }?.name ?? bundleId
+    /// a relaunch goes out as a notification naming the browser. The bundle
+    /// id and name are the ones the user confirmed, never looked up again
+    /// in `status.browsers`, which a scan can replace at any point. The
+    /// throttle checks the running processes itself, and a browser that
+    /// is gone by then is reported as not running.
+    func relaunchUnthrottled(_ target: ThrottledBrowser) async {
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
-            let outcome = await self.browser.relaunchUnthrottled(bundleId: bundleId)
-            if let body = outcome.explanation(browser: name) {
+            let outcome = await self.browser.relaunchUnthrottled(bundleId: target.bundleId)
+            if let body = outcome.explanation(browser: target.name) {
                 self.notifier.post(title: "Browser not relaunched", body: body)
             }
             guard !Task.isCancelled else { return }

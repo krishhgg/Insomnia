@@ -685,16 +685,18 @@ final class StatusItemController: NSObject {
     }
 
     @objc private func menuRelaunchBrowser(_ sender: NSMenuItem) {
-        guard let name = sender.representedObject as? String else { return }
-        relaunchBrowser(named: name)
+        guard let browser = sender.representedObject as? ThrottledBrowser else { return }
+        relaunchBrowser(browser)
     }
 
     /// The relaunch item: ask first, since the browser is quit and its
     /// windows come back only through its own session restore. Cancel does
-    /// nothing.
-    func relaunchBrowser(named name: String) {
-        guard confirmRelaunch(name) else { return }
-        status.relaunchUnthrottled(name)
+    /// nothing. Confirming hands on the bundle id and name the item
+    /// carried; a scan that replaced the browser list while the alert was
+    /// up does not change them.
+    func relaunchBrowser(_ browser: ThrottledBrowser) {
+        guard confirmRelaunch(browser.name) else { return }
+        status.relaunchUnthrottled(browser)
     }
 
     private static func askBeforeRelaunch(_ name: String) -> Bool {

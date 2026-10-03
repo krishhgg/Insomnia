@@ -266,7 +266,11 @@ last held while it was on was the battery or thermal floor, not the lid.
     "Relaunch <browser> unthrottled" item that quits and relaunches it with
     both flags and the same profile.
   - The item asks for confirmation first (the browser is quit; its windows
-    return only through its own session restore). The profile arguments are
+    return only through its own session restore). The item carries the
+    browser's bundle id and name from when the menu was built, and
+    confirming hands those on, so a browser scan that replaces the list
+    while the alert is up cannot change or drop the browser; one that has
+    quit by then is reported as not running. The profile arguments are
     read before the quit, and unreadable arguments (including empty `ps`
     output) stop the relaunch before anything is quit. So does a main
     process that exits during the read, checked by `NSRunningApplication`

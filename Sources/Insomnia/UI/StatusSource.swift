@@ -14,8 +14,8 @@ protocol StatusSource: AnyObject, Observable {
     var lastGap: TimeInterval? { get }
     var frozenCount: Int { get }
     var dockerPaused: Bool { get }
-    /// Display names of browsers running without the occlusion flags.
-    var throttledBrowsers: [String] { get }
+    /// Browsers running without the occlusion flags.
+    var throttledBrowsers: [ThrottledBrowser] { get }
 
     /// Called when the menu opens; observers refresh anything not pushed.
     func refreshOnDemand()
@@ -24,7 +24,8 @@ protocol StatusSource: AnyObject, Observable {
     func refreshInstant()
     /// Battery draw read on demand from AppleSmartBattery. Never polled.
     func instantWatts() -> Double?
-    func relaunchUnthrottled(_ name: String)
+    /// Relaunch the browser the user confirmed, as the menu item named it.
+    func relaunchUnthrottled(_ browser: ThrottledBrowser)
 }
 
 /// Stand-in until the system layer is plugged in. Reports nothing.
@@ -38,14 +39,14 @@ final class PlaceholderStatus: StatusSource {
     var lastGap: TimeInterval? = nil
     var frozenCount: Int = 0
     var dockerPaused: Bool = false
-    var throttledBrowsers: [String] = []
+    var throttledBrowsers: [ThrottledBrowser] = []
 
     init() {}
 
     func refreshOnDemand() {}
     func refreshInstant() {}
     func instantWatts() -> Double? { nil }
-    func relaunchUnthrottled(_ name: String) {}
+    func relaunchUnthrottled(_ browser: ThrottledBrowser) {}
 }
 
 /// Pure formatting for the menu's status block, kept out of the views so

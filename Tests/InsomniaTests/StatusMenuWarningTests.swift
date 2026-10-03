@@ -50,4 +50,21 @@ final class StatusMenuWarningTests: XCTestCase {
         )
         XCTAssertEqual(items.map(\.kind), [.settings, .quit])
     }
+
+    /// The relaunch entry holds the browser itself, not just its name, so
+    /// the click hands on the bundle id the menu was built with. Builds the
+    /// NSMenu only; nothing is shown.
+    func testTheRelaunchEntryCarriesTheBundleIDAndName() {
+        let arc = ThrottledBrowser(bundleId: "company.thebrowser.Browser", name: "Arc")
+        let items = StatusMenu.items(sessionActive: true, sleepHeld: true, machine: nil, actions: nil, throttledBrowsers: [arc], error: nil)
+        let menu = StatusMenu.menu(
+            items,
+            target: nil,
+            settings: #selector(NSObject.description),
+            quit: #selector(NSObject.description),
+            relaunchBrowser: #selector(NSObject.description)
+        )
+        let entry = menu.items.first { $0.title == "Relaunch Arc unthrottled" }
+        XCTAssertEqual(entry?.representedObject as? ThrottledBrowser, arc)
+    }
 }

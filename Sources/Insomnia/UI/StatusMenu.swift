@@ -15,8 +15,9 @@ enum StatusMenu {
             case settings
             case quit
             /// Relaunch this browser with the occlusion flags. Carries the
-            /// display name so the menu item knows what to relaunch.
-            case relaunchBrowser(String)
+            /// bundle id and name, so the item still names the same browser
+            /// after a scan replaces the list.
+            case relaunchBrowser(ThrottledBrowser)
         }
 
         let title: String
@@ -37,7 +38,7 @@ enum StatusMenu {
         sleepHeld: Bool,
         machine: String?,
         actions: String?,
-        throttledBrowsers: [String],
+        throttledBrowsers: [ThrottledBrowser],
         error: String?,
         foreignSleep: String? = nil,
         lidSimulationBuild: Bool = false
@@ -55,13 +56,13 @@ enum StatusMenu {
         if lidSimulationBuild {
             out.append(Item(title: LidSimulationBuild.marker, kind: .warning))
         }
-        if let throttle = present(StatusLines.throttleWarning(throttledBrowsers)) {
+        if let throttle = present(StatusLines.throttleWarning(throttledBrowsers.map(\.name))) {
             out.append(Item(title: throttle, kind: .warning))
             // The warning alone is a dead end; each throttled browser gets a
             // live item so the relaunch is still one click away, as it was
             // from the popover this menu replaced.
-            for name in throttledBrowsers {
-                out.append(Item(title: "Relaunch \(name) unthrottled", kind: .relaunchBrowser(name)))
+            for browser in throttledBrowsers {
+                out.append(Item(title: "Relaunch \(browser.name) unthrottled", kind: .relaunchBrowser(browser)))
             }
         }
         if let error = present(error) {
@@ -118,9 +119,9 @@ enum StatusMenu {
                 menu.addItem(action(title: item.title, selector: settings, key: ",", target: target))
             case .quit:
                 menu.addItem(action(title: item.title, selector: quit, key: "q", target: target))
-            case let .relaunchBrowser(name):
+            case let .relaunchBrowser(browser):
                 let entry = action(title: item.title, selector: relaunchBrowser, key: "", target: target)
-                entry.representedObject = name
+                entry.representedObject = browser
                 menu.addItem(entry)
             }
         }

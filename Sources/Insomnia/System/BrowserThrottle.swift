@@ -87,6 +87,16 @@ struct BrowserStatus: Sendable, Equatable {
     let unthrottled: Bool
 }
 
+/// A browser the menu offers to relaunch: the bundle id the relaunch acts
+/// on and the name the prompt and any notification show. The menu item
+/// keeps both as they were when the menu was built, so a scan that
+/// replaces the browser list while the confirmation is up cannot change or
+/// drop the browser the user confirmed.
+struct ThrottledBrowser: Sendable, Hashable {
+    let bundleId: String
+    let name: String
+}
+
 /// Waits for AppKit termination notifications with one timeout event. This
 /// keeps relaunch event-driven instead of waking every few hundred ms.
 @MainActor
@@ -206,9 +216,15 @@ final class WorkspaceBrowserProcesses: BrowserProcessControlling {
     /// time, or with one that cannot be read now, nothing confirms it, so
     /// the answer is no.
     func isRunning(_ instance: BrowserInstance) -> Bool {
-        guard let application = instance.process as? NSRunningApplication, !application.isTerminated,
-              let identity = instance.identity else { return false }
-        return Self.identity(of: instance.pid) == identity
+        guard let application = instance.process as? NSRunningApplication else { return false }
+        return Self.isRunning(terminated: application.isTerminated, recorded: instance.identity, pid: instance.pid)
+    }
+
+    /// The check itself, apart from the application object, so a test can
+    /// run it on the test process's own pid, which stays alive throughout.
+    static func isRunning(terminated: Bool, recorded: ProcessIdentity?, pid: Int32) -> Bool {
+        guard !terminated, let recorded else { return false }
+        return identity(of: pid) == recorded
     }
 
     /// Quits the application objects the list returned, as found. One whose
@@ -315,8 +331,10 @@ final class BrowserThrottle {
     nonisolated static let startTimeout: TimeInterval = 5
 
     private(set) var statuses: [BrowserStatus] = []
-    /// Display names of running Chromium browsers missing either flag.
-    var throttledBrowsers: [String] { statuses.filter { !$0.unthrottled }.map(\.name) }
+    /// Running Chromium browsers missing either flag.
+    var throttledBrowsers: [ThrottledBrowser] {
+        statuses.filter { !$0.unthrottled }.map { ThrottledBrowser(bundleId: $0.bundleId, name: $0.name) }
+    }
 
     private let readArgs: ArgsReader
     private let processes: any BrowserProcessControlling
@@ -344,7 +362,7 @@ final class BrowserThrottle {
         }
         statuses = out
         if !throttledBrowsers.isEmpty {
-            Log.info("throttled browsers: \(throttledBrowsers.joined(separator: ", "))")
+            Log.info("throttled browsers: \(throttledBrowsers.map(\.name).joined(separator: ", "))")
         }
         return out
     }

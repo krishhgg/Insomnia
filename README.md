@@ -268,7 +268,8 @@ when the lid is closed. Insomnia detects supported running browsers missing
 `--disable-backgrounding-occluded-windows` or `--disable-renderer-backgrounding`
 and offers **Relaunch [browser] unthrottled** in the right-click menu. The item
 asks first, because the browser is quit and its windows and tabs come back only
-if it is set to reopen them on startup. Insomnia reads the browser's profile
+if it is set to reopen them on startup. If the browser has quit by the time you
+confirm, nothing is quit or launched and a notification says so. Insomnia reads the browser's profile
 arguments before quitting and carries them over. If it cannot read them, cannot
 read the kernel's start time that ties them to the browser, or the browser
 quits on its own while they are read, it quits nothing and says so. If the
