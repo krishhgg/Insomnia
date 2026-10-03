@@ -12,8 +12,9 @@ import XCTest
 /// point inside the fixture, so nothing privileged runs, no real process is
 /// signaled, no real app's preferences are read or written, and no real
 /// home, LaunchAgent, sudoers file, or installed app is read or written.
-/// plutil, lockf, cmp, and date are the real tools. The fakes record every
-/// call.
+/// plutil, lockf and cmp are the real tools, and so is date, except for the
+/// backstop's moved-aside stamp, which a test can freeze. The fakes record
+/// every call.
 final class RecoveryScriptTests: XCTestCase {
     private var fx: ScriptFixture!
 
@@ -1056,15 +1057,503 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(fx.exists(fx.state))
     }
 
-    func testMalformedSessionWithCleanJournalIsReportedAndKept() throws {
+    // MARK: - Unreadable session.json
+
+    /// Names in APP_SUPPORT of the shape the app and backstop.sh give a
+    /// moved-aside session.json.
+    private func movedAsideSessions() throws -> [String] {
+        try fx.contents(of: fx.home).filter { $0.hasPrefix("session.json.unreadable-") }.sorted()
+    }
+
+    private static let stampFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = TimeZone(identifier: "UTC")
+        f.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
+        return f
+    }()
+
+    /// A session.json that is not a session, with a clean journal: nothing
+    /// to undo, the file is renamed to a timestamped sibling so the next run
+    /// sees no session, and that next run is idle.
+    func testMalformedSessionWithCleanJournalIsMovedAsideAndNextRunIsIdle() throws {
         try "not json".write(to: fx.session, atomically: true, encoding: .utf8)
         try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
 
         let r = try fx.run(fx.backstop)
 
+        XCTAssertEqual(r.status, 0, r.stderr + fx.log())
+        XCTAssertEqual(fx.calls(), [], "nothing journaled means nothing privileged")
+        XCTAssertFalse(fx.exists(fx.session), "session.json left in place")
+        let moved = try movedAsideSessions()
+        XCTAssertEqual(moved.count, 1, "\(moved)")
+        let name = try XCTUnwrap(moved.first)
+        XCTAssertNotNil(name.range(of: #"^session\.json\.unreadable-[0-9]{8}T[0-9]{6}Z$"#, options: .regularExpression), name)
+        XCTAssertEqual(try String(contentsOf: fx.home.appendingPathComponent(name), encoding: .utf8), "not json", "bytes kept as they were")
+        XCTAssertTrue(fx.log().contains("[warn] backstop: session.json unreadable; moved to \(fx.home.appendingPathComponent(name).path)"), fx.log())
+
+        let again = try fx.run(fx.backstop)
+        XCTAssertEqual(again.status, 0, again.stderr)
+        XCTAssertEqual(try movedAsideSessions(), [name], "a second run moved something else")
+    }
+
+    /// While the journal stays dirty the file stays too: the next run must
+    /// still see a session that is not valid, not a machine with nothing
+    /// pending.
+    func testMalformedSessionIsKeptWhileTheJournalStaysDirty() throws {
+        try "not json".write(to: fx.session, atomically: true, encoding: .utf8)
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        fx.setMode("sudo", "fail")
+
+        let r = try fx.run(fx.backstop)
+
         XCTAssertNotEqual(r.status, 0)
+        XCTAssertTrue(fx.exists(fx.session), "session.json moved although the undo failed")
+        XCTAssertEqual(try movedAsideSessions(), [])
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, true)
+    }
+
+    /// After the undo succeeds the journal is clean, and the file is moved
+    /// aside in the same run instead of being left for a person.
+    func testMalformedSessionIsMovedAsideAfterASuccessfulUndo() throws {
+        try "not json".write(to: fx.session, atomically: true, encoding: .utf8)
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 0, r.stderr + fx.log())
+        XCTAssertTrue(fx.calls().contains { $0.contains("disablesleep 0") }, "\(fx.calls())")
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, false)
+        XCTAssertFalse(fx.exists(fx.session))
+        XCTAssertEqual(try movedAsideSessions().count, 1)
+        XCTAssertTrue(fx.log().contains("journal cleared"), fx.log())
+    }
+
+    /// A moved-aside file is never replaced: with the stamp already taken
+    /// the new one gets -1, and with -1 taken too, -2. The stamp is frozen,
+    /// so the names taken first are exactly the ones the script tries.
+    func testMalformedSessionNeverOverwritesAnEarlierMovedAsideFile() throws {
+        try "not json".write(to: fx.session, atomically: true, encoding: .utf8)
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        fx.setMode("date", "20260101T000000Z")
+        let taken = ["session.json.unreadable-20260101T000000Z", "session.json.unreadable-20260101T000000Z-1"]
+        for name in taken {
+            try "earlier".write(to: fx.home.appendingPathComponent(name), atomically: true, encoding: .utf8)
+        }
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 0, r.stderr + fx.log())
+        XCTAssertFalse(fx.exists(fx.session))
+        for name in taken {
+            XCTAssertEqual(try String(contentsOf: fx.home.appendingPathComponent(name), encoding: .utf8), "earlier", "\(name) was overwritten")
+        }
+        XCTAssertEqual(try movedAsideSessions(), taken + ["session.json.unreadable-20260101T000000Z-2"])
+        XCTAssertEqual(try String(contentsOf: fx.home.appendingPathComponent("session.json.unreadable-20260101T000000Z-2"), encoding: .utf8), "not json")
+    }
+
+    /// A session.json whose endsAt parses but that lacks what the app's
+    /// Session decoder requires is not a session. Its endsAt is in the
+    /// future, which used to count as a valid session and leave sleep
+    /// disabled; now the journal is undone and the file moved aside, each
+    /// problem logged.
+    func testSessionWithAFutureEndsAtButMissingFieldsIsNotASession() throws {
+        let f = ISO8601DateFormatter()
+        let json = #"{"endsAt":"\#(f.string(from: Date(timeIntervalSinceNow: 3600)))"}"#
+        try json.write(to: fx.session, atomically: true, encoding: .utf8)
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 0, r.stderr + fx.log())
+        XCTAssertEqual(fx.calls(), ["sudo -n \(fx.fakePmset) -a disablesleep 0"])
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, false)
+        XCTAssertFalse(fx.exists(fx.session))
+        let moved = try movedAsideSessions()
+        XCTAssertEqual(moved.count, 1, "\(moved)")
+        XCTAssertEqual(try String(contentsOf: fx.home.appendingPathComponent(moved[0]), encoding: .utf8), json, "bytes kept as they were")
+        XCTAssertTrue(fx.log().contains("startedAt is missing"), fx.log())
+        XCTAssertTrue(fx.log().contains("extensions is missing"), fx.log())
+    }
+
+    /// Keys of the wrong type, the way the decoder refuses them: a number
+    /// for a date, an array element that is not a number, a date that is
+    /// not in the form Store.swift writes, a property list instead of JSON.
+    /// Nothing journaled, so nothing runs; the file is moved aside.
+    func testSessionWithFieldsOfTheWrongTypeIsNotASession() throws {
+        let cases = [
+            #"{"startedAt":12,"endsAt":"2099-01-01T00:00:00Z","extensions":[]}"#,
+            #"{"startedAt":"2026-01-01T00:00:00Z","endsAt":"2099-01-01T00:00:00Z","extensions":["600"]}"#,
+            #"{"startedAt":"2026-01-01T00:00:00Z","endsAt":"2099-01-01T00:00:00Zjunk","extensions":[]}"#,
+            #"{"startedAt":"2026-01-01T00:00:00Z","endsAt":"2099-01-01T00:00:00Z","extensions":{}}"#,
+            #"["2099-01-01T00:00:00Z"]"#,
+            // A property list plutil reads with every key right; the app's
+            // JSONDecoder refuses it, so the shell must too.
+            """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <plist version="1.0"><dict>
+            <key>startedAt</key><string>2026-01-01T00:00:00Z</string>
+            <key>endsAt</key><string>2099-01-01T00:00:00Z</string>
+            <key>extensions</key><array/>
+            </dict></plist>
+            """,
+        ]
+        let problems = ["startedAt is a JSON integer, not a date string", "extensions[0] is a JSON string, not a number", "endsAt is not a UTC date in the form 2027-01-15T08:00:00Z", "extensions is a JSON dictionary, not an array", "session.json is not a JSON object", "session.json is not a JSON object"]
+        for (json, problem) in zip(cases, problems) {
+            try json.write(to: fx.session, atomically: true, encoding: .utf8)
+            try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+            for name in try movedAsideSessions() { try FileManager.default.removeItem(at: fx.home.appendingPathComponent(name)) }
+
+            let r = try fx.run(fx.backstop)
+
+            XCTAssertEqual(r.status, 0, json + r.stderr + fx.log())
+            XCTAssertEqual(fx.calls(), [], json)
+            XCTAssertFalse(fx.exists(fx.session), json)
+            XCTAssertEqual(try movedAsideSessions().count, 1, json)
+            XCTAssertTrue(fx.log().contains(problem), problem + "\n" + fx.log())
+        }
+    }
+
+    /// The fixture's own session, which has every field the decoder needs,
+    /// is a session: a future one, with the app holding the alive lock,
+    /// keeps sleep disabled, and only the battery and thermal reads run.
+    func testCompleteSessionWithAFutureEndsAtIsValid() throws {
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: 3600))
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 0, r.stderr + fx.log())
+        XCTAssertEqual(calls(), [batteryRead, thermalRead], "reads only, nothing privileged")
+        XCTAssertTrue(fx.exists(fx.session))
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, true)
+    }
+
+    /// A session.json that exists but cannot be read at all (here: it is a
+    /// directory) has no end time anyone can enforce, so it counts as
+    /// expired: the journal is undone. It may have been a valid session, so
+    /// once the journal is clean it is renamed aside with its contents,
+    /// never removed, and no later run sees a session.
+    func testSessionThatCannotBeReadAtAllIsTreatedAsExpiredAndMovedAside() throws {
+        try FileManager.default.createDirectory(at: fx.session, withIntermediateDirectories: true)
+        try "inside".write(to: fx.session.appendingPathComponent("note"), atomically: true, encoding: .utf8)
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 0, r.stderr + fx.log())
+        XCTAssertEqual(fx.calls(), ["sudo -n \(fx.fakePmset) -a disablesleep 0"])
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, false)
+        XCTAssertFalse(fx.exists(fx.session))
+        let moved = try movedAsideSessions()
+        XCTAssertEqual(moved.count, 1, "\(moved)")
+        let copy = fx.home.appendingPathComponent(moved.first ?? "")
+        XCTAssertEqual(try String(contentsOf: copy.appendingPathComponent("note"), encoding: .utf8), "inside")
+        XCTAssertTrue(fx.log().contains("session.json cannot be read (it is not a regular file, so it is not opened), so its end time is unknown; treated as expired"), fx.log())
+        XCTAssertTrue(fx.log().contains("journal cleared"), fx.log())
+        XCTAssertTrue(fx.log().contains("session.json cannot be read (it is not a regular file, so it is not opened); moved to \(copy.path)"), fx.log())
+
+        // The next run finds no session and nothing to undo.
+        fx.clearCalls()
+        let again = try fx.run(fx.backstop)
+        XCTAssertEqual(again.status, 0, again.stderr + fx.log())
         XCTAssertEqual(fx.calls(), [])
-        XCTAssertTrue(fx.exists(fx.session), "unreadable evidence is kept")
+        XCTAssertEqual(try movedAsideSessions(), moved)
+    }
+
+    /// With nothing journaled there is nothing to undo, and the file is
+    /// still renamed aside, so the agent does not report it every minute.
+    func testSessionThatCannotBeReadWithACleanJournalIsMovedAsideAndNothingRuns() throws {
+        try FileManager.default.createDirectory(at: fx.session, withIntermediateDirectories: true)
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 0, r.stderr + fx.log())
+        XCTAssertEqual(fx.calls(), [])
+        XCTAssertFalse(fx.exists(fx.session))
+        XCTAssertEqual(try movedAsideSessions().count, 1)
+        XCTAssertTrue(fx.log().contains("treated as expired; nothing journaled to undo"), fx.log())
+    }
+
+    /// When the rename fails (an immutable entry here) the file stays, the
+    /// run exits nonzero, and the log says to remove it or move it rather
+    /// than make it readable. The next run tries the rename again.
+    func testSessionThatCannotBeReadOrRenamedIsKeptAndRetriedOnTheNextRun() throws {
+        try FileManager.default.createDirectory(at: fx.session, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes([.immutable: true], ofItemAtPath: fx.session.path)
+        defer { try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: fx.session.path) }
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertNotEqual(r.status, 0, r.stderr + fx.log())
+        XCTAssertEqual(fx.calls(), [])
+        XCTAssertTrue(fx.exists(fx.session))
+        XCTAssertEqual(try movedAsideSessions(), [])
+        let log = fx.log()
+        XCTAssertTrue(log.contains("kept in place, and the next run tries again"), log)
+        XCTAssertTrue(log.contains("Remove it or move it out of \(fx.home.path): if it became readable there, the app would resume it"), log)
+
+        try FileManager.default.setAttributes([.immutable: false], ofItemAtPath: fx.session.path)
+        let next = try fx.run(fx.backstop)
+
+        XCTAssertEqual(next.status, 0, next.stderr + fx.log())
+        XCTAssertFalse(fx.exists(fx.session))
+        XCTAssertEqual(try movedAsideSessions().count, 1)
+    }
+
+    /// A regular session.json without read permission, holding a session
+    /// whose end is still ahead: the same. Its bytes move unchanged, so
+    /// once its permissions are fixed it is still not session.json and no
+    /// run reads it back as a session.
+    func testSessionWithoutReadPermissionIsTreatedAsExpiredAndMovedAside() throws {
+        try XCTSkipIf(getuid() == 0, "root reads a mode-000 file")
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: 3600))
+        let bytes = try Data(contentsOf: fx.session)
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: fx.session.path)
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 0, r.stderr + fx.log())
+        XCTAssertEqual(fx.calls(), ["sudo -n \(fx.fakePmset) -a disablesleep 0"])
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, false)
+        XCTAssertFalse(fx.exists(fx.session))
+        let moved = try movedAsideSessions()
+        XCTAssertEqual(moved.count, 1, "\(moved)")
+        let copy = fx.home.appendingPathComponent(moved.first ?? "")
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: copy.path) }
+        XCTAssertTrue(fx.log().contains("session.json cannot be read (permissions or I/O)"), fx.log())
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: copy.path)
+        XCTAssertEqual(try Data(contentsOf: copy), bytes)
+    }
+
+    /// Uninstall runs the backstop first, which undoes the journal and moves
+    /// the unreadable file aside, so it no longer blocks. A directory is
+    /// not something purge removes, so it is kept and named.
+    func testUninstallProceedsPastASessionThatCannotBeReadOnceTheBackstopMovesItAside() throws {
+        try fx.installMachinery()
+        try FileManager.default.createDirectory(at: fx.session, withIntermediateDirectories: true)
+        try "inside".write(to: fx.session.appendingPathComponent("note"), atomically: true, encoding: .utf8)
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+
+        let r = try fx.run(fx.uninstall)
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertTrue(fx.calls().contains("sudo -n \(fx.fakePmset) -a disablesleep 0"), "\(fx.calls())")
+        XCTAssertFalse(fx.exists(fx.session))
+        XCTAssertFalse(fx.exists(fx.app))
+        let moved = try movedAsideSessions()
+        XCTAssertEqual(moved.count, 1, "\(moved)")
+        let copy = fx.home.appendingPathComponent(moved.first ?? "")
+        XCTAssertEqual(try String(contentsOf: copy.appendingPathComponent("note"), encoding: .utf8), "inside")
+        XCTAssertTrue(r.stdout.contains("Kept \(copy.path): it is named like a moved-aside session.json but is not a regular file"), r.stdout)
+    }
+
+    /// When the undo fails, the journal stays dirty and the file stays where
+    /// it is. Uninstall stops before removing anything, names the problem as
+    /// an access failure, and says what would have moved it.
+    func testUninstallStopsWhenSessionCannotBeReadAndTheUndoFails() throws {
+        try fx.installMachinery()
+        try FileManager.default.createDirectory(at: fx.session, withIntermediateDirectories: true)
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        fx.setMode("sudo", "fail")
+
+        let r = try fx.run(fx.uninstall)
+
+        XCTAssertNotEqual(r.status, 0)
+        XCTAssertTrue(fx.exists(fx.session))
+        XCTAssertEqual(try movedAsideSessions(), [])
+        XCTAssertTrue(fx.exists(fx.plist))
+        XCTAssertTrue(fx.exists(fx.sudoers))
+        XCTAssertTrue(fx.exists(fx.app))
+        XCTAssertTrue(r.stderr.contains("session.json is still present and cannot be read"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("rename it to session.json.unreadable-<time> without opening it"), r.stderr)
+    }
+
+    /// A session.json that is a FIFO is never opened by the backstop: open(2)
+    /// would block while it holds the recovery lock, and neither the app nor
+    /// a later run could recover. It counts as expired, so the dirty journal
+    /// is undone, and then the FIFO is renamed aside, still a FIFO.
+    func testSessionThatIsAFIFOIsNeverOpenedByTheBackstopAndIsMovedAside() throws {
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        let fifo = try FIFOWatch(at: fx.session)
+        defer { fifo.stop() }
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 0, r.stderr + fx.log())
+        XCTAssertFalse(fifo.readerSeen, "session.json was opened although it is a FIFO")
+        XCTAssertFalse(fx.exists(fx.session))
+        XCTAssertEqual(fx.calls(), ["sudo -n \(fx.fakePmset) -a disablesleep 0"])
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, false)
+        let moved = try movedAsideSessions()
+        XCTAssertEqual(moved.count, 1, "\(moved)")
+        var info = stat()
+        XCTAssertEqual(lstat(fx.home.appendingPathComponent(moved.first ?? "").path, &info), 0)
+        XCTAssertEqual(info.st_mode & S_IFMT, S_IFIFO, "the FIFO was replaced instead of renamed")
+        XCTAssertTrue(fx.log().contains("not a regular file"), fx.log())
+        XCTAssertTrue(fx.log().contains("treated as expired"), fx.log())
+    }
+
+    /// The same for state.json: never opened, reported as malformed, nothing
+    /// undone, and the session file stays.
+    func testJournalThatIsAFIFOIsNeverOpenedByTheBackstop() throws {
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        let fifo = try FIFOWatch(at: fx.state)
+        defer { fifo.stop() }
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 1, r.stderr + fx.log())
+        XCTAssertFalse(fifo.readerSeen, "state.json was opened although it is a FIFO")
+        XCTAssertTrue(fifo.isStillFIFO)
+        XCTAssertEqual(fx.calls(), [])
+        XCTAssertTrue(fx.exists(fx.session))
+        XCTAssertTrue(fx.log().contains("not a regular file"), fx.log())
+    }
+
+    /// Uninstall with both files as FIFOs: neither the backstop it runs nor
+    /// its own journal check opens them, and it stops before removing
+    /// anything.
+    func testUninstallNeverOpensSessionOrJournalFIFOs() throws {
+        try fx.installMachinery()
+        let session = try FIFOWatch(at: fx.session)
+        let state = try FIFOWatch(at: fx.state)
+        defer { session.stop(); state.stop() }
+
+        let r = try fx.run(fx.uninstall)
+
+        XCTAssertNotEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertFalse(session.readerSeen, "session.json was opened although it is a FIFO")
+        XCTAssertFalse(state.readerSeen, "state.json was opened although it is a FIFO")
+        XCTAssertTrue(session.isStillFIFO)
+        XCTAssertTrue(state.isStillFIFO)
+        XCTAssertTrue(r.stderr.contains("session.json is still present and cannot be read: it is not a regular file"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("state.json is not a regular file"), r.stderr)
+        XCTAssertTrue(fx.exists(fx.plist))
+        XCTAssertTrue(fx.exists(fx.sudoers))
+        XCTAssertTrue(fx.exists(fx.app))
+    }
+
+    /// Uninstall runs the backstop first, which moves the file aside, so an
+    /// unreadable session.json with a clean journal no longer blocks it.
+    /// Without --purge the moved-aside copy is kept and said so.
+    func testUninstallProceedsPastAnUnreadableSessionWithACleanJournalAndKeepsTheCopy() throws {
+        try fx.installMachinery()
+        try "not json".write(to: fx.session, atomically: true, encoding: .utf8)
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+
+        let r = try fx.run(fx.uninstall)
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertFalse(fx.exists(fx.plist))
+        XCTAssertFalse(fx.exists(fx.sudoers))
+        XCTAssertFalse(fx.exists(fx.app))
+        XCTAssertFalse(fx.exists(fx.session))
+        let moved = try movedAsideSessions()
+        XCTAssertEqual(moved.count, 1, "\(moved)")
+        XCTAssertTrue(r.stdout.contains("Kept 1 unreadable session.json file(s)"), r.stdout)
+    }
+
+    /// --purge removes the moved-aside copies, but only names of exactly the
+    /// shape Insomnia produces. Anything else under the prefix stays.
+    func testUninstallPurgeRemovesOnlyMovedAsideSessionFilesOfInsomniasShape() throws {
+        try fx.installMachinery()
+        let ours = ["session.json.unreadable-20260101T000000Z", "session.json.unreadable-20260101T000000Z-3"]
+        let notOurs = "session.json.unreadable-notes.txt"
+        for name in ours + [notOurs] {
+            try "x".write(to: fx.home.appendingPathComponent(name), atomically: true, encoding: .utf8)
+        }
+
+        let r = try fx.run(fx.uninstall, ["--purge"])
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertEqual(try movedAsideSessions(), [notOurs])
+    }
+
+    /// Something that is not a regular file but has a moved-aside name (here
+    /// a directory with a file in it) is not Insomnia's. --purge says so,
+    /// leaves it with its contents, and still finishes: the copies beside it
+    /// and Insomnia's own files go, and the exit status is 0.
+    func testUninstallPurgeLeavesADirectoryNamedLikeAMovedAsideCopyAndFinishes() throws {
+        try fx.installMachinery()
+        try fx.writeConfig("{}")
+        let dir = fx.home.appendingPathComponent("session.json.unreadable-20260101T000000Z")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try "keep".write(to: dir.appendingPathComponent("inside"), atomically: true, encoding: .utf8)
+        let ours = "session.json.unreadable-20260101T000000Z-1"
+        try "x".write(to: fx.home.appendingPathComponent(ours), atomically: true, encoding: .utf8)
+
+        let r = try fx.run(fx.uninstall, ["--purge"])
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertTrue(r.stdout.contains("Left \(dir.path): it is named like a moved-aside session.json but is not a regular file"), r.stdout)
+        XCTAssertEqual(try String(contentsOf: dir.appendingPathComponent("inside"), encoding: .utf8), "keep")
+        XCTAssertFalse(fx.exists(fx.home.appendingPathComponent(ours)))
+        XCTAssertFalse(fx.exists(fx.config))
+        XCTAssertFalse(fx.exists(fx.app))
+        XCTAssertTrue(r.stdout.contains("Done."), r.stdout)
+    }
+
+    /// The same for Insomnia's own file names: a directory at config.json
+    /// is left with a message instead of stopping the purge halfway.
+    func testUninstallPurgeLeavesADirectoryAtAnOwnedPathAndFinishes() throws {
+        try fx.installMachinery()
+        try? FileManager.default.removeItem(at: fx.config)
+        try FileManager.default.createDirectory(at: fx.config, withIntermediateDirectories: true)
+
+        let r = try fx.run(fx.uninstall, ["--purge"])
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertTrue(r.stdout.contains("Left \(fx.config.path): it is not a regular file, so Insomnia did not write it."), r.stdout)
+        XCTAssertTrue(fx.exists(fx.config))
+        XCTAssertFalse(fx.exists(fx.app))
+    }
+
+    /// Paths come from the glob, never from text split on newlines: with a
+    /// newline in the home directory's name, the old listing would split a
+    /// copy's path in two and remove a same-named file relative to the
+    /// working directory. Now only the copy itself goes.
+    func testUninstallPurgeHandlesANewlineInTheHomePath() throws {
+        let home = fx.root.appendingPathComponent("nl\nvictim", isDirectory: true)
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        let name = "session.json.unreadable-20260101T000000Z"
+        try "x".write(to: home.appendingPathComponent(name), atomically: true, encoding: .utf8)
+        let victimDir = fx.root.appendingPathComponent("victim", isDirectory: true)
+        try FileManager.default.createDirectory(at: victimDir, withIntermediateDirectories: true)
+        let victim = victimDir.appendingPathComponent(name)
+        try "not Insomnia's".write(to: victim, atomically: true, encoding: .utf8)
+
+        let r = try fx.run(fx.uninstall, ["--purge"], extraEnvironment: ["INSOMNIA_HOME": home.path])
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertFalse(fx.exists(home.appendingPathComponent(name)))
+        XCTAssertEqual(try String(contentsOf: victim, encoding: .utf8), "not Insomnia's")
+    }
+
+    /// With the journal still dirty the uninstall stops as before, names the
+    /// unreadable session file as such, and says what will happen to it
+    /// rather than asking for a repair.
+    func testUninstallAbortMessageIsAccurateAboutAnUnreadableSessionWhileTheJournalIsDirty() throws {
+        try fx.installMachinery()
+        try "not json".write(to: fx.session, atomically: true, encoding: .utf8)
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        fx.setMode("sudo", "fail")
+
+        let r = try fx.run(fx.uninstall)
+
+        XCTAssertNotEqual(r.status, 0)
+        XCTAssertTrue(fx.exists(fx.session))
+        XCTAssertTrue(fx.exists(fx.plist))
+        XCTAssertTrue(fx.exists(fx.sudoers))
+        XCTAssertTrue(r.stderr.contains("session.json is still present and is not a session"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("sleepDisabledByUs is still true"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("renames it to"), r.stderr)
+        XCTAssertFalse(r.stderr.contains("repair the file"), r.stderr)
     }
 
     func testLockContentionFailsClosed() throws {
@@ -1073,7 +1562,7 @@ final class RecoveryScriptTests: XCTestCase {
         try fx.writeState(dirty)
 
         let holder = try fx.holdLock()
-        defer { holder.terminate(); holder.waitUntilExit() }
+        defer { holder.stop() }
 
         let r = try fx.run(fx.backstop)
 
@@ -1507,7 +1996,8 @@ final class RecoveryScriptTests: XCTestCase {
     }
 
     /// An end record that cannot be removed survives the purge, and the
-    /// purge says so instead of reporting everything gone.
+    /// purge names it and fails, as for any file it owns, instead of
+    /// reporting everything gone. The rest is still removed.
     func testUninstallPurgeReportsAnEndRecordItCannotRemove() throws {
         try fx.installMachinery()
         try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
@@ -1516,9 +2006,10 @@ final class RecoveryScriptTests: XCTestCase {
 
         let r = try fx.run(fx.uninstall, ["--purge"])
 
-        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
         XCTAssertTrue(fx.exists(fx.endedSession))
-        XCTAssertTrue(r.stdout.contains("Kept \(fx.endedSession.path): it could not be removed"), r.stdout)
+        XCTAssertTrue(r.stderr.contains("Could not remove \(fx.endedSession.path); left in place."), r.stderr)
+        XCTAssertTrue(r.stderr.contains("Done, except 1 file(s) that could not be removed"), r.stderr)
         XCTAssertFalse(fx.exists(fx.state))
         XCTAssertFalse(fx.exists(fx.config))
     }
@@ -1706,7 +2197,7 @@ final class RecoveryScriptTests: XCTestCase {
         try fx.installMachinery()
         try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
         let holder = try fx.holdLock()
-        defer { holder.terminate(); holder.waitUntilExit() }
+        defer { holder.stop() }
 
         let r = try fx.run(fx.uninstall)
 
@@ -1774,7 +2265,7 @@ final class RecoveryScriptTests: XCTestCase {
         try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
         try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
         let holder = try fx.holdLock()
-        defer { holder.terminate(); holder.waitUntilExit() }
+        defer { holder.stop() }
         let other = fx.root.appendingPathComponent("other.file")
         try Data().write(to: other)
 
@@ -2142,6 +2633,38 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(try fx.contents(of: fx.plist.deletingLastPathComponent()), ["com.insomnia.backstop.plist"])
     }
 
+    /// The scripts/simulate-lid.sh watcher is compiled out of a release
+    /// build unless the installer is told to compile it in: only
+    /// INSOMNIA_LID_SIMULATION=1 adds the define to the swift build lines,
+    /// and the installer says so.
+    func testInstallCompilesTheLidSimulationInOnlyWhenAsked() throws {
+        try fx.prepareInstall()
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        fx.setMode("launchctl", "loaded")
+
+        let plain = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+        XCTAssertEqual(plain.status, 0, plain.stderr + plain.stdout)
+        let plainBuilds = fx.calls().filter { $0.hasPrefix("swift build") }
+        XCTAssertEqual(plainBuilds, ["swift build -c release", "swift build -c release --show-bin-path"], "\(fx.calls())")
+        XCTAssertFalse(plain.stdout.contains("lid simulation compiled in"), plain.stdout)
+
+        fx.clearCalls()
+        let simulated = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester", "INSOMNIA_LID_SIMULATION": "1"])
+        XCTAssertEqual(simulated.status, 0, simulated.stderr + simulated.stdout)
+        let simulatedBuilds = fx.calls().filter { $0.hasPrefix("swift build") }
+        XCTAssertEqual(simulatedBuilds, [
+            "swift build -c release -Xswiftc -DINSOMNIA_LID_SIMULATION",
+            "swift build -c release -Xswiftc -DINSOMNIA_LID_SIMULATION --show-bin-path",
+        ], "\(fx.calls())")
+        XCTAssertTrue(simulated.stdout.contains("lid simulation compiled in (INSOMNIA_LID_SIMULATION=1)"), simulated.stdout)
+
+        // Any other value is "off": the define is a deliberate opt-in.
+        fx.clearCalls()
+        let other = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester", "INSOMNIA_LID_SIMULATION": "yes"])
+        XCTAssertEqual(other.status, 0, other.stderr + other.stdout)
+        XCTAssertEqual(fx.calls().filter { $0.hasPrefix("swift build") }.first, "swift build -c release", "\(fx.calls())")
+    }
+
     func testInstallLeavesTrustedPlistWhenBootstrapAndReloadBothFail() throws {
         try fx.prepareInstall()
         try "trusted".write(to: fx.plist, atomically: true, encoding: .utf8)
@@ -2236,7 +2759,7 @@ final class RecoveryScriptTests: XCTestCase {
         try "trusted".write(to: fx.plist, atomically: true, encoding: .utf8)
         try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
         let holder = try fx.holdLock()
-        defer { holder.terminate(); holder.waitUntilExit() }
+        defer { holder.stop() }
 
         let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
 
@@ -2569,6 +3092,7 @@ private final class ScriptFixture {
             "SYSCTL": bin.appendingPathComponent("sysctl").path,
             "NOTIFYUTIL": bin.appendingPathComponent("notifyutil").path,
             "DEFAULTS": bin.appendingPathComponent("defaults").path,
+            "DATE": bin.appendingPathComponent("date").path,
             "LOCK_TIMEOUT_SECONDS": "1",
             "COMMAND_TIMEOUT_SECONDS": "1",
             "KILL_GRACE_SECONDS": "1",
@@ -2796,6 +3320,16 @@ private final class ScriptFixture {
         try writeFake("sysctl", """
         cat "\(r)/boot.uuid"
         """)
+        // date: the real tool, except that with date.mode present the stamp
+        // a moved-aside session.json is named after (`-u +%Y%m%dT%H%M%SZ`)
+        // is the mode's text, so a test can take that exact name first.
+        // Not logged: it changes nothing.
+        try writeFake("date", """
+        if [[ "$*" == "-u +%Y%m%dT%H%M%SZ" && -f "\(r)/date.mode" ]]; then
+          cat "\(r)/date.mode"; echo; exit 0
+        fi
+        exec /bin/date "$@"
+        """)
         // defaults: an NSAppSleepDisabled table per domain (defaults.table,
         // `domain|value` with the value as `defaults read` prints a bool: 1
         // or 0). `read` prints it or fails like the real tool when absent;
@@ -2934,8 +3468,9 @@ private final class ScriptFixture {
         probe.arguments = ["-k", "-s", "-t", "0", lock.path, "/usr/bin/true"]
         probe.standardOutput = FileHandle.nullDevice
         probe.standardError = FileHandle.nullDevice
+        let probeExit = ProcessExit(probe)
         try probe.run()
-        probe.waitUntilExit()
+        probeExit.wait()
         return probe.terminationStatus == 0
     }
 
@@ -3051,7 +3586,7 @@ private final class ScriptFixture {
         f.locale = Locale(identifier: "en_US_POSIX")
         f.timeZone = TimeZone(identifier: "UTC")
         f.dateFormat = "yyyy-MM-dd'T'HH:mm:ss'Z'"
-        let json = #"{"startedAt":"\#(f.string(from: endsAt.addingTimeInterval(-3600)))","endsAt":"\#(f.string(from: endsAt))"}"#
+        let json = #"{"startedAt":"\#(f.string(from: endsAt.addingTimeInterval(-3600)))","endsAt":"\#(f.string(from: endsAt))","extensions":[]}"#
         try json.write(to: session, atomically: true, encoding: .utf8)
     }
 
@@ -3132,8 +3667,9 @@ private final class ScriptFixture {
         defer { try? out.close(); try? err.close() }
         p.standardOutput = out
         p.standardError = err
+        let childExit = ProcessExit(p)
         try p.run()
-        p.waitUntilExit()
+        childExit.wait()
         return (p.terminationStatus,
                 (try? String(contentsOf: outURL, encoding: .utf8)) ?? "",
                 (try? String(contentsOf: errURL, encoding: .utf8)) ?? "")
@@ -3148,9 +3684,21 @@ private final class ScriptFixture {
         return lock
     }
 
+    /// A lockf process that holds the recovery lock.
+    struct LockHolder {
+        let process: Process
+        let exit: ProcessExit
+
+        /// Terminates the holder and returns once it has exited.
+        func stop() {
+            process.terminate()
+            exit.wait()
+        }
+    }
+
     /// Holds the recovery lock from another process, the way a running app
-    /// or a concurrent backstop would, until terminated.
-    func holdLock() throws -> Process {
+    /// or a concurrent backstop would, until stopped.
+    func holdLock() throws -> LockHolder {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/lockf")
         // The holder waits (not -t 0): a probe below may briefly own the lock
@@ -3162,6 +3710,7 @@ private final class ScriptFixture {
         defer { try? diag.close() }
         p.standardOutput = diag
         p.standardError = diag
+        let holder = LockHolder(process: p, exit: ProcessExit(p))
         try p.run()
         // Wait until the holder really owns the lock.
         var probes: [Int32] = []
@@ -3171,10 +3720,11 @@ private final class ScriptFixture {
             probe.arguments = ["-k", "-s", "-t", "0", lock.path, "/usr/bin/true"]
             probe.standardOutput = diag
             probe.standardError = diag
+            let probeExit = ProcessExit(probe)
             try probe.run()
-            probe.waitUntilExit()
+            probeExit.wait()
             probes.append(probe.terminationStatus)
-            if probe.terminationStatus == 75 { return p }
+            if probe.terminationStatus == 75 { return holder }
             Thread.sleep(forTimeInterval: 0.05)
         }
         p.terminate()

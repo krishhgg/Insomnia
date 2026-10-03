@@ -83,6 +83,22 @@
 #     the failure is visible and the next periodic run retries.
 #   - state.json unreadable, not a JSON object, or with a known key of the
 #     wrong type: nothing is touched, exit 1.
+#   - session.json present but not a session: readable, but not the shape
+#     the app's Session decoder accepts (session_shape_problems). It is
+#     treated as expired. Once the journal is clean (already, or after the
+#     undo above succeeded) the file is renamed to
+#     session.json.unreadable-<UTC stamp>, never deleted or overwritten, so
+#     the next run sees no session. While the journal stays dirty it stays.
+#   - session.json present but not readable at all (permissions, I/O), or
+#     not a regular file (a FIFO or device is never opened: open(2) could
+#     block while this run holds the lock): its end time is unknown, and
+#     sleep is never held without a deadline that can be enforced, so it is
+#     treated as expired and the journal is undone as above. The file is
+#     never opened, read or removed: it may have been a valid session. Once
+#     the journal is clean it is renamed aside like a malformed one, so its
+#     bytes stay as evidence and no later run, of this script or the app,
+#     can read it back as a session that was already treated as ended. A
+#     state.json that is not a regular file is malformed.
 #
 # Limitation: the shell compares process start time to the second and the
 # boot session; only the app also compares the microseconds.
@@ -106,6 +122,11 @@ SYSCTL=/usr/sbin/sysctl
 NOTIFYUTIL=/usr/bin/notifyutil
 CMP=/usr/bin/cmp
 DEFAULTS=/usr/bin/defaults
+DATE=/bin/date
+MKDIR=/bin/mkdir
+RM=/bin/rm
+MV=/bin/mv
+CP=/bin/cp
 LOCK_TIMEOUT_SECONDS=10
 # com.apple.system.thermalpressurelevel at or above this ends a session. On
 # macOS the levels are 0 nominal, 1 moderate, 2 heavy, 3 trapping, 4 sleeping
@@ -142,12 +163,12 @@ ALIVE="$APP_SUPPORT/.app.alive"
 LOG="$LOG_DIR/insomnia.log"
 
 log() { # level message
-  mkdir -p "$LOG_DIR"
-  printf '%s [%s] backstop: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" >> "$LOG"
+  "$MKDIR" -p "$LOG_DIR"
+  printf '%s [%s] backstop: %s\n' "$("$DATE" -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" >> "$LOG"
 }
 
 # --- Lock --------------------------------------------------------------------
-mkdir -p "$APP_SUPPORT"
+"$MKDIR" -p "$APP_SUPPORT"
 inode() { stat -f %i "$1" 2>/dev/null; }
 if [[ -e /dev/fd/9 && -e "$LOCK" && -n "$(inode "$LOCK")" && "$(inode /dev/fd/9)" == "$(inode "$LOCK")" ]]; then
   : # fd 9 is the caller's handle on the lock file; share its lock.
@@ -222,7 +243,7 @@ run_bounded() { # command args...
   if (( bounded_calls == 1 )); then
     # Status files left by an earlier run that had to fail closed. Their
     # supervisor held the lock while it lived, so they are stale by now.
-    rm -f "$APP_SUPPORT"/.backstop.*.pid "$APP_SUPPORT"/.backstop.*.rc
+    "$RM" -f "$APP_SUPPORT"/.backstop.*.pid "$APP_SUPPORT"/.backstop.*.rc
   fi
   (
     "$@" </dev/null >"${bounded_output:-/dev/null}" 2>&1 &
@@ -245,12 +266,12 @@ run_bounded() { # command args...
     fi
     log error "'$*' did not finish within ${COMMAND_TIMEOUT_SECONDS}s; terminated with SIGTERM (pid ${cpid:-?})"
     wait "$supervisor" 2>/dev/null || true
-    rm -f "$pidfile" "$rcfile"
+    "$RM" -f "$pidfile" "$rcfile"
     return 124
   fi
   rc="$(cat "$rcfile")"
   wait "$supervisor" 2>/dev/null || true
-  rm -f "$pidfile" "$rcfile"
+  "$RM" -f "$pidfile" "$rcfile"
   return "$rc"
 }
 
@@ -383,19 +404,85 @@ journal_shape_problems() { # file
   fi
 }
 
+# Seconds since the epoch for a date as Store.swift writes it (ISO 8601 in
+# UTC, no fractional seconds), or nothing. `date -j -f` accepts trailing
+# characters with only a warning, so the result is formatted back and must
+# match the input exactly.
+epoch_of() { # string
+  local e
+  e="$("$DATE" -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$1" +%s 2>/dev/null)" || return 0
+  if [[ "$("$DATE" -u -r "$e" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)" == "$1" ]]; then
+    echo "$e"
+  fi
+  return 0
+}
+
+# Prints one line per way session.json does not have the shape the app's
+# Session decoder needs (Session.swift): a JSON object whose startedAt and
+# endsAt are dates as Store.swift writes them and whose extensions is an
+# array of numbers. All three are required; extra keys are ignored, as in
+# Swift. The app refuses a file with any of these problems, so the shell
+# does not act on its endsAt either.
+session_shape_problems() { # file
+  local f="$1" key t i
+  # plutil also reads XML and binary property lists, which the app's
+  # JSONDecoder refuses, so the file itself must start with "{" too.
+  if [[ "$(LC_ALL=C tr -d ' \t\r\n' < "$f" 2>/dev/null | head -c 1)" != "{" ]] \
+     || [[ "$("$PLUTIL" -convert json -o - "$f" 2>/dev/null | head -c 1)" != "{" ]]; then
+    echo "session.json is not a JSON object"
+    return 0
+  fi
+  for key in startedAt endsAt; do
+    t="$(type_of "$f" "$key")"
+    if [[ -z "$t" ]]; then
+      echo "$key is missing"
+    elif [[ "$t" != string ]]; then
+      echo "$key is a JSON $t, not a date string"
+    elif [[ -z "$(epoch_of "$(extract "$f" "$key" || true)")" ]]; then
+      echo "$key is not a UTC date in the form 2027-01-15T08:00:00Z"
+    fi
+  done
+  t="$(type_of "$f" extensions)"
+  if [[ -z "$t" ]]; then
+    echo "extensions is missing"
+  elif [[ "$t" != array ]]; then
+    echo "extensions is a JSON $t, not an array"
+  else
+    i=0
+    while [[ -n "$(type_of "$f" "extensions.$i")" ]]; do
+      t="$(type_of "$f" "extensions.$i")"
+      [[ "$t" == integer || "$t" == float ]] || echo "extensions[$i] is a JSON $t, not a number"
+      i=$((i + 1))
+    done
+  fi
+}
+
 # --- Read the session --------------------------------------------------------
-# session_state: none | valid | expired | malformed
+# session_state: none | valid | expired | malformed | unreadable
 session_state=none
 ends_at=""
-if [[ -f "$SESSION" ]]; then
-  session_state=malformed
-  ends_at="$(extract "$SESSION" endsAt || true)"
-  if [[ -n "$ends_at" ]]; then
-    # Store.swift writes ISO 8601 UTC without fractional seconds.
-    ends_epoch="$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$ends_at" +%s 2>/dev/null || true)"
-    now_epoch="$(date -u +%s)"
-    if [[ -n "$ends_epoch" ]]; then
-      if (( ends_epoch > now_epoch )); then session_state=valid; else session_state=expired; fi
+unreadable_why=""
+session_problems=""
+if [[ -e "$SESSION" ]]; then
+  # Only a regular file is opened: open(2) on a FIFO with no writer, or on
+  # some devices, blocks, and this run holds the recovery lock.
+  if [[ ! -f "$SESSION" ]]; then
+    session_state=unreadable
+    unreadable_why="it is not a regular file, so it is not opened"
+  elif ! cat "$SESSION" >/dev/null 2>&1; then
+    session_state=unreadable
+    unreadable_why="permissions or I/O"
+  else
+    session_problems="$(session_shape_problems "$SESSION")"
+    if [[ -n "$session_problems" ]]; then
+      session_state=malformed
+    else
+      ends_at="$(extract "$SESSION" endsAt || true)"
+      if (( $(epoch_of "$ends_at") > $("$DATE" -u +%s) )); then
+        session_state=valid
+      else
+        session_state=expired
+      fi
     fi
   fi
 fi
@@ -603,6 +690,10 @@ fi
 # journal_state: missing | malformed | clean | dirty
 if [[ ! -e "$STATE" ]]; then
   journal_state=missing
+elif [[ ! -f "$STATE" ]]; then
+  # Never opened, for the same reason as session.json above.
+  journal_state=malformed
+  shape_problems="not a regular file"
 elif ! "$PLUTIL" -convert json -o /dev/null "$STATE" >/dev/null 2>&1; then
   journal_state=malformed
   shape_problems="not valid JSON"
@@ -645,22 +736,56 @@ if [[ "$journal_state" == clean ]]; then
   fi
 fi
 
+# session.json that is not a session, or cannot be read. Its bytes are
+# kept beside it under a name the app writes too and `uninstall.sh --purge`
+# removes; the next run then sees no session. A rename never opens the
+# file, so a FIFO or a file without read permission moves the same way.
+# Called only once the journal is clean, so nothing recorded is lost with
+# it. Never overwrites: a taken name gets -1, -2, ... and `mv -n` declines
+# rather than replace a file that appeared meanwhile (it exits 0 then,
+# hence the check of both paths afterwards).
+quarantine_session() {
+  local base dest n line what
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && log warn "$SESSION: $line"
+  done <<< "$session_problems"
+  what="session.json unreadable"
+  [[ "$session_state" == unreadable ]] && what="session.json cannot be read ($unreadable_why)"
+  base="$SESSION.unreadable-$("$DATE" -u +%Y%m%dT%H%M%SZ)"
+  dest="$base"; n=0
+  while [[ -e "$dest" || -L "$dest" ]]; do n=$((n + 1)); dest="$base-$n"; done
+  if "$MV" -n "$SESSION" "$dest" 2>/dev/null && [[ ! -e "$SESSION" && ! -L "$SESSION" ]] && [[ -e "$dest" || -L "$dest" ]]; then
+    log warn "$what; moved to $dest and treated as no session"
+    return 0
+  fi
+  if [[ "$session_state" == unreadable ]]; then
+    log error "$what and could not be moved to $dest; kept in place, and the next run tries again. Remove it or move it out of $APP_SUPPORT: if it became readable there, the app would resume it: $SESSION"
+  else
+    log error "$what and could not be moved to $dest; kept in place"
+  fi
+  return 1
+}
+
 case "$session_state" in
-  none)      session_note="no session" ;;
-  valid)     if [[ -n "$cutoff" ]]; then
-               session_note="session ended early, $cutoff (endsAt=$ends_at)"
-             else
-               session_note="forced end of session (endsAt=$ends_at)"
-             fi ;;
-  expired)   session_note="session expired (endsAt=$ends_at)" ;;
-  malformed) session_note="session.json unreadable" ;;
+  none)       session_note="no session" ;;
+  valid)      if [[ -n "$cutoff" ]]; then
+                session_note="session ended early, $cutoff (endsAt=$ends_at)"
+              else
+                session_note="forced end of session (endsAt=$ends_at)"
+              fi ;;
+  expired)    session_note="session expired (endsAt=$ends_at)" ;;
+  malformed)  session_note="session.json unreadable" ;;
+  unreadable) session_note="session.json cannot be read ($unreadable_why), so its end time is unknown; treated as expired" ;;
 esac
 
 if [[ "$journal_state" != dirty ]]; then
   # Nothing journaled: nothing to undo, and nothing privileged runs.
-  if [[ "$session_state" == malformed ]]; then
-    log error "$session_note; journal is clean but session.json is kept as evidence. Open Insomnia or remove it by hand"
-    exit 1
+  if [[ "$session_state" == unreadable ]]; then
+    log info "$session_note; nothing journaled to undo"
+  fi
+  if [[ "$session_state" == malformed || "$session_state" == unreadable ]]; then
+    quarantine_session || exit 1
+    exit 0
   fi
   if [[ "$session_state" != none ]]; then
     if [[ "$journal_state" == missing ]]; then
@@ -738,7 +863,7 @@ observe() { # pid
   local w mon day time year stat uid rest
   read -r w mon day time year stat uid rest <<< "$out"
   [[ -n "$w" && -n "$mon" && -n "$day" && -n "$time" && -n "$year" && -n "$stat" && -n "$uid" ]] || return 0
-  p_epoch="$(date -j -u -f '%a %b %d %H:%M:%S %Y' "$w $mon $day $time $year" +%s 2>/dev/null || true)"
+  p_epoch="$("$DATE" -j -u -f '%a %b %d %H:%M:%S %Y' "$w $mon $day $time $year" +%s 2>/dev/null || true)"
   [[ -n "$p_epoch" ]] && [[ "$uid" =~ ^[0-9]+$ ]] || return 0
   p_stat="$stat"; p_uid="$uid"
   observation=seen
@@ -857,7 +982,7 @@ if (( app_nap_count > 0 )); then
         read_rc=0
         run_bounded "$DEFAULTS" read "$bundle" NSAppSleepDisabled || read_rc=$?
         bounded_output=""
-        if (( command_alive )); then rm -f "$probe"; stop_transaction "defaults read $bundle NSAppSleepDisabled"; fi
+        if (( command_alive )); then "$RM" -f "$probe"; stop_transaction "defaults read $bundle NSAppSleepDisabled"; fi
         if (( read_rc == 0 )); then
           log error "defaults delete $bundle NSAppSleepDisabled failed and the key is still set; keeping journal entry for retry"
           failures+=("App Nap is still off for $bundle: defaults delete failed")
@@ -870,7 +995,7 @@ if (( app_nap_count > 0 )); then
           failures+=("App Nap may still be off for $bundle: defaults delete failed and the key could not be read")
           keep_app_nap_entry "$i"
         fi
-        rm -f "$probe"
+        "$RM" -f "$probe"
       fi
     fi
     i=$((i + 1))
@@ -894,7 +1019,7 @@ fi
 if (( changed == 1 )); then
   tmp="$APP_SUPPORT/.state.json.backstop.$$"
   publish_ok=1
-  cp "$STATE" "$tmp" || publish_ok=0
+  "$CP" "$STATE" "$tmp" || publish_ok=0
   if (( publish_ok == 1 )) && [[ "$new_sleep" != "$sleep_held" ]]; then
     "$PLUTIL" -replace sleepDisabledByUs -bool "$new_sleep" "$tmp" >/dev/null 2>&1 || publish_ok=0
   fi
@@ -916,10 +1041,10 @@ if (( changed == 1 )); then
     [[ "$(head -c 1 "$tmp")" == "{" ]] || publish_ok=0
   fi
   if (( publish_ok == 1 )); then
-    mv -f "$tmp" "$STATE" || publish_ok=0
+    "$MV" -f "$tmp" "$STATE" || publish_ok=0
   fi
   if (( publish_ok == 0 )); then
-    rm -f "$tmp"
+    "$RM" -f "$tmp"
     log error "could not publish the updated journal to $STATE; previous journal kept, will retry"
     exit 1
   fi
@@ -932,18 +1057,19 @@ if (( ${#failures[@]} > 0 )); then
   exit 1
 fi
 
-if [[ "$session_state" == malformed ]]; then
-  log error "journal cleared, but session.json is unreadable and kept as evidence. Open Insomnia or remove it by hand"
-  exit 1
-fi
 # A valid session was removed (or recorded as ended) above.
 if [[ "$session_state" == valid ]] && (( session_left == 1 )); then
   log error "journal cleared, but $SESSION could not be removed; will retry on the next run"
   exit 1
 fi
-if [[ "$session_state" != valid ]] && ! remove_session; then
-  log error "journal cleared, but could not remove $SESSION; will retry on the next run"
-  exit 1
-fi
 log info "journal cleared"
+case "$session_state" in
+  malformed|unreadable) quarantine_session || exit 1 ;;
+  valid)                ;;
+  *)
+    if ! remove_session; then
+      log error "journal cleared, but could not remove $SESSION; will retry on the next run"
+      exit 1
+    fi ;;
+esac
 exit 0

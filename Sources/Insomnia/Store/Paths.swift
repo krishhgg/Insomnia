@@ -62,6 +62,10 @@ struct Paths: Sendable, Equatable {
     /// match, the session is over whatever its endsAt says. backstop.sh
     /// writes and honours the same file.
     var endedSessionFile: URL { appSupport.appendingPathComponent("ended-session.json") }
+    /// Where an unreadable session.json goes: this prefix, a UTC stamp
+    /// (yyyyMMddTHHmmssZ) and, if that name is taken, -1, -2, ... The same
+    /// shape is produced by backstop.sh and removed by `uninstall.sh --purge`.
+    static let unreadableSessionPrefix = "session.json.unreadable-"
     var stateFile: URL { appSupport.appendingPathComponent("state.json") }
     var configFile: URL { appSupport.appendingPathComponent("config.json") }
     /// Installed copy of scripts/backstop.sh, placed there by install.sh.
