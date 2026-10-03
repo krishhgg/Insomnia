@@ -50,16 +50,27 @@ struct Store: Sendable {
         try writeAtomically(try Store.makeEncoder().encode(value), to: url)
     }
 
-    private func writeAtomically(_ data: Data, to url: URL) throws {
+    /// Returns the identity of the file now at `url`, taken from the temp
+    /// file before the rename (rename(2) keeps the inode), so nothing that
+    /// replaces `url` afterwards can lend it its own.
+    @discardableResult
+    private func writeAtomically(_ data: Data, to url: URL) throws -> FileIdentity {
         let dir = url.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let tmp = dir.appendingPathComponent(".\(url.lastPathComponent).tmp-\(UUID().uuidString)")
         try data.write(to: tmp, options: [])
+        var info = stat()
+        guard lstat(tmp.path, &info) == 0 else {
+            let err = errno
+            try? FileManager.default.removeItem(at: tmp)
+            throw StoreError.open(path: tmp.path, errno: err)
+        }
         if rename(tmp.path, url.path) != 0 {
             let err = errno
             try? FileManager.default.removeItem(at: tmp)
             throw StoreError.rename(from: tmp.path, to: url.path, errno: err)
         }
+        return FileIdentity(info)
     }
 
     /// Removes the file; a missing file is not an error.
@@ -129,7 +140,10 @@ struct Store: Sendable {
 
     /// The pending-start marker holds the nonce as plain bytes, no newline,
     /// written atomically so the root command never reads half of it.
-    func savePendingStart(_ nonce: String) throws {
+    /// Returns the identity of the file written, for
+    /// `removePendingStart(expecting:)`.
+    @discardableResult
+    func savePendingStart(_ nonce: String) throws -> FileIdentity {
         try writeAtomically(Data(nonce.utf8), to: paths.pendingStartFile)
     }
 
@@ -142,13 +156,32 @@ struct Store: Sendable {
     /// file, as lockf follows it, and the wait is polled so the caller is
     /// never blocked. Returns whether a marker was there.
     ///
+    /// The lock belongs to the file, but everything else here goes by path.
+    /// Once the lock is held, the path must still name the locked file, or
+    /// the lock says nothing about what would be deleted: the file is let
+    /// go and looked up again. With `expecting`, the identity
+    /// `savePendingStart` returned, the locked file must also be the one
+    /// that start wrote. Something that replaced it (or deleted it without
+    /// the lock) may have done so after the root command locked the
+    /// original, and that command could still be running pmset, so nothing
+    /// is deleted. A path check alone cannot see that: the replacement is
+    /// unlocked, and it is what the path names.
+    ///
     /// Throws `.markerBusy` when the lock is still held after `timeout`,
-    /// and `.unlink` when the file cannot be deleted (an immutable flag, a
-    /// deny-delete ACL, a directory in its place). unlink(2) never removes
-    /// a tree. The marker then stays, and callers must treat the dialog it
-    /// belongs to as still able to turn sleep off.
+    /// `.markerReplaced` when the file at the path is not the expected one
+    /// or kept changing until `timeout`, and `.unlink` when the file cannot
+    /// be deleted (an immutable flag, a deny-delete ACL, a directory in its
+    /// place). unlink(2) never removes a tree. The marker then stays, and
+    /// callers must treat the dialog it belongs to as still able to turn
+    /// sleep off. `onLocked` is for tests: it runs each time the lock is
+    /// taken, before the path is checked.
     @discardableResult
-    func removePendingStart(timeout: TimeInterval, pollEvery: Duration = .milliseconds(50)) async throws -> Bool {
+    func removePendingStart(
+        timeout: TimeInterval,
+        expecting written: FileIdentity? = nil,
+        pollEvery: Duration = .milliseconds(50),
+        onLocked: (() -> Void)? = nil
+    ) async throws -> Bool {
         let path = paths.pendingStartFile.path
         let deadline = ContinuousClock.now + .seconds(timeout)
         while true {
@@ -157,19 +190,32 @@ struct Store: Sendable {
             if fd < 0 {
                 let err = errno
                 guard err == ENOENT else { throw StoreError.open(path: path, errno: err) }
+                // The file that start wrote went without its lock.
+                if written != nil { throw StoreError.markerReplaced(path: path) }
                 // Missing, or a link to nothing, which lockf cannot open
                 // either; the link itself still goes.
                 return try Self.unlinkMarker(path)
             }
+            let busy: Bool
             if flock(fd, LOCK_EX | LOCK_NB) == 0 {
                 defer { close(fd) }
-                return try Self.unlinkMarker(path)
+                onLocked?()
+                let locked = FileIdentity(of: fd)
+                if let written, locked != written { throw StoreError.markerReplaced(path: path) }
+                // stat(2) follows a link, as open(2) and lockf do.
+                if let locked, locked == FileIdentity(atPath: path) {
+                    return try Self.unlinkMarker(path)
+                }
+                busy = false
+            } else {
+                let err = errno
+                close(fd)
+                guard err == EWOULDBLOCK else { throw StoreError.lock(path: path, errno: err) }
+                busy = true
             }
-            let err = errno
-            close(fd)
-            guard err == EWOULDBLOCK else { throw StoreError.lock(path: path, errno: err) }
             guard ContinuousClock.now < deadline else {
-                throw StoreError.markerBusy(path: path, seconds: timeout)
+                if busy { throw StoreError.markerBusy(path: path, seconds: timeout) }
+                throw StoreError.markerReplaced(path: path)
             }
             try await Task.sleep(for: pollEvery)
         }
@@ -201,6 +247,31 @@ struct Store: Sendable {
     }
 }
 
+/// A file's device and inode: what flock(2) locks, whatever path led to it.
+struct FileIdentity: Equatable, Sendable {
+    let device: dev_t
+    let inode: ino_t
+
+    init(_ info: stat) {
+        device = info.st_dev
+        inode = info.st_ino
+    }
+
+    /// The open file `fd`; nil if fstat(2) fails.
+    init?(of fd: Int32) {
+        var info = stat()
+        guard fstat(fd, &info) == 0 else { return nil }
+        self.init(info)
+    }
+
+    /// The file `path` names now, following a link; nil if there is none.
+    init?(atPath path: String) {
+        var info = stat()
+        guard stat(path, &info) == 0 else { return nil }
+        self.init(info)
+    }
+}
+
 enum StoreError: Error, LocalizedError {
     case rename(from: String, to: String, errno: Int32)
     case corrupt(file: String, detail: String)
@@ -208,6 +279,7 @@ enum StoreError: Error, LocalizedError {
     case open(path: String, errno: Int32)
     case lock(path: String, errno: Int32)
     case markerBusy(path: String, seconds: TimeInterval)
+    case markerReplaced(path: String)
     case unreadable(file: String, detail: String)
     case notRegularFile(file: String)
 
@@ -221,6 +293,8 @@ enum StoreError: Error, LocalizedError {
             return "locking \(path) failed: \(String(cString: strerror(errno)))"
         case let .markerBusy(path, seconds):
             return "\(path) was still locked after \(String(format: "%g", seconds)) s by the command a password dialog started as root"
+        case let .markerReplaced(path):
+            return "\(path) was replaced or removed by something other than Insomnia, so its lock cannot show that the command a password dialog started as root is done with it"
         case let .rename(from, to, errno):
             return "rename \(from) -> \(to) failed: \(String(cString: strerror(errno)))"
         case let .corrupt(file, detail):

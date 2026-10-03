@@ -467,8 +467,9 @@ final class SessionManager {
         // The command is also given the session's end and refuses after
         // it, so a password typed too late changes nothing either.
         let pending = PendingStart(marker: store.paths.pendingStartFile, nonce: UUID().uuidString, deadline: new.endsAt)
+        let markerFile: FileIdentity
         do {
-            try store.savePendingStart(pending.nonce)
+            markerFile = try store.savePendingStart(pending.nonce)
         } catch {
             // No marker with this nonce exists, so no dialog was shown.
             await clearPendingStart()
@@ -489,8 +490,10 @@ final class SessionManager {
         } catch let AdministratorPromptError.stillRunning(prompt, grace) {
             // The prompt's process did not stop on SIGTERM. Nothing is
             // killed. The marker goes first, under its lock, so an answer
-            // that still comes cannot turn sleep off.
-            let voided = await clearPendingStart()
+            // that still comes cannot turn sleep off. Only the file this
+            // start wrote counts: one put in its place may have been
+            // swapped in after the command locked the original.
+            let voided = await clearPendingStart(expecting: markerFile)
             let alive = prompt.osascriptAlive
             if voided {
                 // The command behind the dialog now finds no marker and
@@ -1552,12 +1555,13 @@ final class SessionManager {
     /// `markerProblem`. False when the root command behind a dialog still
     /// held the marker's lock after `markerLockTimeout`, or the file could
     /// not be deleted (an immutable flag, a deny-delete ACL, a directory in
-    /// its place). The failure is logged and shown in the menu, and every
-    /// later transaction, backstop run and uninstall tries again.
+    /// its place), or, with `expecting`, the file at the path is not the
+    /// one this start wrote. The failure is logged and shown in the menu,
+    /// and every later transaction, backstop run and uninstall tries again.
     @discardableResult
-    private func clearPendingStart() async -> Bool {
+    private func clearPendingStart(expecting written: FileIdentity? = nil) async -> Bool {
         do {
-            if try await store.removePendingStart(timeout: markerLockTimeout) {
+            if try await store.removePendingStart(timeout: markerLockTimeout, expecting: written) {
                 Log.info("deleted the pending-start marker; a password dialog left from that start can no longer turn sleep off")
             }
             if let old = markerProblem {

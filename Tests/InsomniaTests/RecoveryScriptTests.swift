@@ -1155,6 +1155,65 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(fx.exists(fx.app))
     }
 
+    /// A file put in the marker's place after the backstop opened and
+    /// locked it is not covered by that lock, so it is not deleted: sleep
+    /// is restored, the entry stays, the run exits 1 and says why. The next
+    /// run locks the file that is there and deletes it.
+    func testBackstopLeavesAMarkerReplacedAfterItWasLocked() throws {
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        try Data(UUID().uuidString.utf8).write(to: fx.pendingStart)
+        let plain = try String(contentsOf: fx.backstop, encoding: .utf8)
+        try fx.swapMarkerAfterItsLock(in: fx.backstop)
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 1, r.stderr)
+        XCTAssertEqual(fx.calls(), ["sudo -n \(fx.fakePmset) -a disablesleep 0"], "sleep itself is still restored")
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, true)
+        XCTAssertEqual(try String(contentsOf: fx.pendingStart, encoding: .utf8), "copy", "the copy is not deleted")
+        XCTAssertTrue(fx.log().contains("pending-start was replaced after it was opened, so its lock does not cover the file now at that path"), fx.log())
+
+        try plain.write(to: fx.backstop, atomically: true, encoding: .utf8)
+        let again = try fx.run(fx.backstop)
+        XCTAssertEqual(again.status, 0, again.stderr)
+        XCTAssertFalse(fx.exists(fx.pendingStart))
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, false)
+    }
+
+    /// uninstall.sh checks the same way, and the marker it leaves stops it.
+    func testUninstallLeavesAMarkerReplacedAfterItWasLocked() throws {
+        try fx.installMachinery()
+        try Data(UUID().uuidString.utf8).write(to: fx.pendingStart)
+        // A stub backstop, so only uninstall.sh's own deletion acts.
+        try "#!/bin/bash\nexit 0\n".write(to: fx.backstop, atomically: true, encoding: .utf8)
+        try fx.swapMarkerAfterItsLock(in: fx.uninstall)
+
+        let r = try fx.run(fx.uninstall)
+
+        XCTAssertNotEqual(r.status, 0, r.stdout)
+        XCTAssertTrue((r.stderr + r.stdout).contains("pending-start is still present"), r.stderr + r.stdout)
+        XCTAssertEqual(try String(contentsOf: fx.pendingStart, encoding: .utf8), "copy", "the copy is not deleted")
+        XCTAssertTrue(fx.exists(fx.sudoers))
+        XCTAssertTrue(fx.exists(fx.app))
+    }
+
+    /// A FIFO in the marker's place is never opened (open(2) would block
+    /// under the recovery lock): it is reported and left, and the entry
+    /// stays.
+    func testBackstopDoesNotOpenAFIFOAtTheMarker() throws {
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        let watch = try FIFOWatch(at: fx.pendingStart)
+        defer { watch.stop() }
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 1, r.stderr)
+        XCTAssertFalse(watch.readerSeen, "the FIFO was opened")
+        XCTAssertTrue(watch.isStillFIFO)
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, true)
+        XCTAssertTrue(fx.log().contains("pending-start is not a regular file, so it was not opened"), fx.log())
+    }
+
     /// Both scripts delete the marker through RM=/bin/rm, never an rm found
     /// on PATH: one first on PATH that leaves the marker in place changes
     /// nothing, for a plain marker (deleted under lockf) and for a link to
@@ -3609,6 +3668,26 @@ private final class ScriptFixture {
         try "log\n".write(to: logFile, atomically: true, encoding: .utf8)
         try "{}".write(to: config, atomically: true, encoding: .utf8)
         try fm.copyItem(at: backstop, to: installedBackstop)
+    }
+
+    /// Points `script`'s LOCKF at a wrapper around the real lockf. Once it
+    /// has locked a descriptor (`lockf -s -t N 8`, the scripts' lock on
+    /// pending-start), a copy takes the marker's place, as another process
+    /// could put one there between the open and the check.
+    func swapMarkerAfterItsLock(in script: URL) throws {
+        let wrapper = bin.appendingPathComponent("lockf-swap")
+        let copy = root.appendingPathComponent("marker-copy")
+        try """
+        #!/bin/bash
+        /usr/bin/lockf "$@"; rc=$?
+        if (( rc == 0 )) && [[ "${!#}" == 8 ]]; then
+          printf copy > '\(copy.path)' && /bin/mv -f '\(copy.path)' '\(pendingStart.path)'
+        fi
+        exit $rc
+        """.write(to: wrapper, atomically: true, encoding: .utf8)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: wrapper.path)
+        let text = try String(contentsOf: script, encoding: .utf8)
+        try Self.patch(text, ["LOCKF": wrapper.path]).write(to: script, atomically: true, encoding: .utf8)
     }
 
     // MARK: Running

@@ -23,8 +23,9 @@
 # sleep off only while the marker holds its nonce, so answering the dialog
 # after this point changes nothing. That command also holds a lockf lock on
 # the marker from before its nonce check until pmset exits, and the marker
-# is deleted only under the same lock: it goes before the check, or after
-# pmset, whose effect the journal entry still covers. A marker that cannot
+# is deleted only under the same lock, and only while its path still names
+# the locked file: it goes before the check, or after pmset, whose effect
+# the journal entry still covers. A marker that cannot
 # be locked within PENDING_LOCK_TIMEOUT_SECONDS or cannot be deleted means
 # that dialog could still turn sleep off later: sleep is still restored,
 # but sleepDisabledByUs stays journaled and the run exits 1, so the next run
@@ -118,6 +119,7 @@ MKDIR=/bin/mkdir
 RM=/bin/rm
 MV=/bin/mv
 CP=/bin/cp
+STAT=/usr/bin/stat
 LOCK_TIMEOUT_SECONDS=10
 # How long to wait for the root command behind a password dialog to let go
 # of the pending-start marker (pmset takes well under a second).
@@ -156,7 +158,7 @@ log() { # level message
 
 # --- Lock --------------------------------------------------------------------
 "$MKDIR" -p "$APP_SUPPORT"
-inode() { stat -f %i "$1" 2>/dev/null; }
+inode() { "$STAT" -f %i "$1" 2>/dev/null; }
 if [[ -e /dev/fd/9 && -e "$LOCK" && -n "$(inode "$LOCK")" && "$(inode /dev/fd/9)" == "$(inode "$LOCK")" ]]; then
   : # fd 9 is the caller's handle on the lock file; share its lock.
 else
@@ -170,25 +172,57 @@ if (( lock_rc != 0 )); then
 fi
 # From here on this process holds the lock until it exits (fd 9 closes).
 
+# Deletes pending-start under its own lock, as Store.removePendingStart
+# does. The marker is opened on fd 8 and locked through it: lockf given a
+# descriptor locks this shell's open file, and the lock lasts until fd 8
+# closes. Then the path must still name the locked file (stat of fd 8
+# against stat -L of the path), because lockf locks a file and rm goes by
+# path: a file put in the marker's place after the open is not covered by
+# the lock, so it is left alone. Only a regular file is opened; open(2) on
+# a FIFO with no writer blocks, and this runs under the recovery lock. A
+# link to nothing is removed: the root command cannot open it either.
+# Sets marker_rc: 0 deleted or gone, 75 still locked after
+# PENDING_LOCK_TIMEOUT_SECONDS, 3 replaced after the open, 4 not a regular
+# file, anything else from the open or rm.
+delete_pending_marker() {
+  local locked
+  marker_rc=0
+  if [[ -L "$PENDING" && ! -e "$PENDING" ]]; then
+    "$RM" -f "$PENDING" 2>/dev/null || marker_rc=$?
+    return 0
+  fi
+  [[ -e "$PENDING" ]] || return 0
+  if [[ ! -f "$PENDING" ]]; then
+    marker_rc=4
+    return 0
+  fi
+  { exec 8<"$PENDING"; } 2>/dev/null || { marker_rc=$?; return 0; }
+  "$LOCKF" -s -t "$PENDING_LOCK_TIMEOUT_SECONDS" 8 2>/dev/null || marker_rc=$?
+  if (( marker_rc == 0 )); then
+    locked="$("$STAT" -f '%d:%i' <&8 2>/dev/null)" || locked=""
+    if [[ -n "$locked" && "$locked" == "$("$STAT" -L -f '%d:%i' "$PENDING" 2>/dev/null)" ]]; then
+      "$RM" -f "$PENDING" 2>/dev/null || marker_rc=$?
+    else
+      marker_rc=3
+    fi
+  fi
+  exec 8<&-
+}
+
 # A pending-start marker under the lock belongs to an abandoned start: void
 # the password dialog it was written for, under the marker's own lock (see
-# the header). lockf -n exits 69 when there is nothing to open: the marker
-# went meanwhile, or it is a link to nothing, which the root command cannot
-# open either, so the link itself is removed.
+# the header).
 marker_stuck=0
 if [[ -e "$PENDING" || -L "$PENDING" ]]; then
-  marker_rc=0
-  "$LOCKF" -k -n -s -t "$PENDING_LOCK_TIMEOUT_SECONDS" "$PENDING" "$RM" -f "$PENDING" 2>/dev/null || marker_rc=$?
-  if (( marker_rc == 69 )); then
-    "$RM" -f "$PENDING" 2>/dev/null || true
-  fi
+  delete_pending_marker
   if [[ -e "$PENDING" || -L "$PENDING" ]]; then
     marker_stuck=1
-    if (( marker_rc == 75 )); then
-      why="still locked after ${PENDING_LOCK_TIMEOUT_SECONDS}s by the command a password dialog started as root"
-    else
-      why="could not be deleted (lockf exit $marker_rc)"
-    fi
+    case "$marker_rc" in
+      75) why="still locked after ${PENDING_LOCK_TIMEOUT_SECONDS}s by the command a password dialog started as root" ;;
+      3) why="was replaced after it was opened, so its lock does not cover the file now at that path" ;;
+      4) why="is not a regular file, so it was not opened" ;;
+      *) why="could not be deleted (exit $marker_rc)" ;;
+    esac
     log error "$PENDING $why; a password dialog left from an abandoned start could still turn sleep off, so sleepDisabledByUs stays journaled until a later run deletes it"
   else
     log info "deleted $PENDING; a password dialog left from an abandoned start can no longer turn sleep off"

@@ -430,7 +430,11 @@ Invariants:
   before it reads or clears the journal. The root command runs as `lockf
   -k -n <marker> /bin/sh -c ...`: it holds the marker's flock from before
   its nonce check until pmset exits, and every deleter takes that lock
-  before it unlinks the file. The marker therefore goes either before the
+  before it unlinks the file. A lock belongs to a file, and the unlink goes
+  by path, so a deleter unlinks only while the path still names the file it
+  locked (device and inode of the locked descriptor against `stat` of the
+  path; the scripts open the marker on fd 8 and lock that descriptor). The
+  marker therefore goes either before the
   check, which then fails, or after pmset, while the journal entry still
   covers it, so a dialog answered after its start was abandoned (crash or
   force-quit under the dialog, rollback, a newer start) cannot leave sleep
@@ -439,7 +443,11 @@ Invariants:
 - A transaction holds the recovery lock while a command it started may
   still change something. A stuck dialog whose marker this transaction
   deleted under the marker's lock can no longer change anything, so it does
-  not hold the lock.
+  not hold the lock. That holds only for the file the start wrote:
+  `savePendingStart` returns its device and inode, and a marker found
+  replaced (a copy could have been swapped in after the root command
+  locked the original) or missing (it went without the lock) is not
+  counted as voided, so the transaction waits for the dialog to exit.
 - `sleepDisabledByUs` is cleared only by a transaction that removed
   `pending-start` before it restored sleep. A marker that cannot be locked
   within its timeout or cannot be deleted leaves recovery incomplete: sleep

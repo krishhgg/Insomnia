@@ -409,6 +409,33 @@ final class RootCommandTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
     }
 
+    /// Greptile's case: the command holds the lock on the marker it opened
+    /// and runs pmset, and a copy with the same nonce takes the marker's
+    /// place. The copy is not locked, so a removal by path alone would
+    /// delete it while pmset runs. The start knows which file it wrote and
+    /// deletes nothing else.
+    func testAReplacedMarkerIsNotDeletedWhilePmsetRuns() async throws {
+        let written = try store.savePendingStart("nonce-1")
+        let command = try RootCommandProcess(marker: marker, nonce: "nonce-1", in: dir, holdPmset: true)
+        XCTAssertTrue(command.waitUntilPmsetRuns())
+        let copy = dir.appendingPathComponent("copy")
+        try Data("nonce-1".utf8).write(to: copy)
+        XCTAssertEqual(rename(copy.path, marker.path), 0)
+
+        do {
+            try await store.removePendingStart(timeout: 0.3, expecting: written)
+            XCTFail("the copy must not stand in for the locked marker")
+        } catch StoreError.markerReplaced {
+            // expected
+        }
+        XCTAssertEqual(try String(contentsOf: marker, encoding: .utf8), "nonce-1")
+
+        command.release()
+        let r = command.wait()
+        XCTAssertEqual(r.status, 0, r.stderr)
+        XCTAssertEqual(r.pmsetCalls, ["-a disablesleep 1"])
+    }
+
     /// The other order: a remover holds the lock when the answer comes.
     /// The command has opened the marker and waits for the lock, and by
     /// the time it has it the marker is gone, so nothing runs. The marker
@@ -517,6 +544,82 @@ final class PendingStartRemovalTests: XCTestCase {
             // expected
         }
         XCTAssertTrue(FileManager.default.fileExists(atPath: marker.appendingPathComponent("keep").path))
+    }
+
+    /// Puts a new file with `content` in the marker's place, the way
+    /// another process or an editor's save would: written aside, then
+    /// renamed onto the path.
+    private func replaceMarker(with content: String) throws {
+        let tmp = dir.appendingPathComponent("replacement-\(UUID().uuidString)")
+        try Data(content.utf8).write(to: tmp)
+        XCTAssertEqual(rename(tmp.path, marker.path), 0)
+    }
+
+    func testTheMarkerAStartWroteIsRemoved() async throws {
+        let written = try store.savePendingStart("n")
+        XCTAssertEqual(written, FileIdentity(atPath: marker.path))
+        let removed = try await store.removePendingStart(timeout: 1, expecting: written)
+        XCTAssertTrue(removed)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+    }
+
+    /// A copy in the marker's place is not the file the start wrote. The
+    /// root command may hold the original's lock and still run pmset, so
+    /// nothing is deleted, even though the copy itself is not locked.
+    func testAReplacedMarkerIsNotTakenForTheOneWritten() async throws {
+        let written = try store.savePendingStart("n")
+        try replaceMarker(with: "n")
+        do {
+            try await store.removePendingStart(timeout: 1, expecting: written)
+            XCTFail("must throw")
+        } catch StoreError.markerReplaced {
+            // expected
+        }
+        XCTAssertEqual(try String(contentsOf: marker, encoding: .utf8), "n", "the copy stays")
+    }
+
+    /// The marker the start wrote, deleted without its lock: nothing shows
+    /// that the command behind its dialog is done with it.
+    func testAMarkerDeletedWithoutItsLockDoesNotCountAsRemoved() async throws {
+        let written = try store.savePendingStart("n")
+        try FileManager.default.removeItem(at: marker)
+        do {
+            try await store.removePendingStart(timeout: 1, expecting: written)
+            XCTFail("must throw")
+        } catch StoreError.markerReplaced {
+            // expected
+        }
+    }
+
+    /// Once the lock is held the path must still name the locked file. A
+    /// file swapped in after the open is not deleted under the old file's
+    /// lock: it is looked up again, and goes once its own lock is held.
+    func testAFileSwappedInAfterTheOpenIsLockedBeforeItGoes() async throws {
+        try Data("n".utf8).write(to: marker)
+        let locks = Locked(0)
+        let removed = try await store.removePendingStart(timeout: 5, pollEvery: .milliseconds(10), onLocked: {
+            locks.value += 1
+            if locks.value == 1 { try? self.replaceMarker(with: "m") }
+        })
+        XCTAssertTrue(removed)
+        XCTAssertEqual(locks.value, 2, "the swapped-in file was locked before it went")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+    }
+
+    /// A path that names another file each time the lock is taken is
+    /// never deleted, and the failure says why.
+    func testAMarkerThatKeepsBeingReplacedIsReported() async throws {
+        try Data("n".utf8).write(to: marker)
+        do {
+            try await store.removePendingStart(timeout: 0.3, pollEvery: .milliseconds(10), onLocked: {
+                try? self.replaceMarker(with: "m")
+            })
+            XCTFail("must throw")
+        } catch let error as StoreError {
+            guard case .markerReplaced = error else { return XCTFail("\(error)") }
+            XCTAssertTrue(error.localizedDescription.contains("replaced or removed by something other than Insomnia"), error.localizedDescription)
+        }
+        XCTAssertEqual(try String(contentsOf: marker, encoding: .utf8), "m")
     }
 
     /// A link to nothing cannot be opened by lockf either; the link goes.
@@ -1251,6 +1354,42 @@ final class SleepPromptLifecycleTests: XCTestCase {
         XCTAssertEqual(h.guardFake.calls, ["disablesleep 1", "disablesleep 0"])
         XCTAssertTrue(h.notifier.posts.contains { $0.title == "Session not started" })
         XCTAssertEqual(h.prompt.shown, 1)
+    }
+
+    /// The stuck prompt's command holds the lock on the marker this start
+    /// wrote, and a copy has taken its place. The copy is unlocked, but it
+    /// is not the file the start wrote, so the prompt is not counted as
+    /// voided: nothing is rolled back beside the command, and the rollback
+    /// runs once the prompt has exited.
+    func testStuckPromptWhoseMarkerWasReplacedIsWaitedFor() async throws {
+        let box = LockHolderBox()
+        h.prompt.onShow = { start in
+            box.hold(start.marker)
+            let copy = start.marker.deletingLastPathComponent().appendingPathComponent("copy")
+            try? Data(start.nonce.utf8).write(to: copy)
+            _ = rename(copy.path, start.marker.path)
+        }
+        h.prompt.mode = .stuck
+        let m = h.makeManager()
+
+        let start = Task { await m.start(duration: 1800) }
+        try await waitUntil("the stuck prompt is reported") {
+            h.notifier.posts.contains { $0.title == "Password prompt still running" }
+        }
+        let handle = try XCTUnwrap(h.prompt.unfinished)
+        XCTAssertTrue(markerExists, "the copy is not deleted")
+        let problem = try XCTUnwrap(m.markerProblem)
+        XCTAssertTrue(problem.contains("replaced or removed by something other than Insomnia"), problem)
+        XCTAssertEqual(try h.store.loadState()?.sleepDisabledByUs, true, "the journal entry stays")
+        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1"], "nothing is rolled back beside a command that may still run")
+        XCTAssertNil(try RecoveryLock(url: h.home.paths.recoveryLock).tryAcquire(), "the recovery lock stays held")
+
+        box.release()
+        handle.markExited()
+        await start.value
+        try assertRolledBackClean(m)
+        XCTAssertNil(m.markerProblem)
+        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1", "disablesleep 0"])
     }
 
     /// The same, and the user has started again since: the old dialog's

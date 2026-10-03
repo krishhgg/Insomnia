@@ -140,8 +140,11 @@ Flag a change that breaks one of these; do not flag the behavior itself.
   `$3` that `[` cannot compare refuses too. The start deletes the file before it releases the recovery lock;
   every other lock holder deletes it before it touches the journal, and
   every deleter (Store.removePendingStart, backstop.sh, uninstall.sh)
-  takes the file's own lock first, so the file never goes between the
-  nonce check and the end of pmset. The file is written with no newline
+  takes the file's own lock first and deletes only while the path still
+  names the locked file (device and inode of the locked descriptor against
+  the path; the scripts lock the marker through fd 8 to have one), so the
+  file never goes between the nonce check and the end of pmset. Voiding a
+  stuck prompt also needs the locked file to be the one that start wrote. The file is written with no newline
   and compared, never run. A marker that cannot be written rolls the start
   back with no prompt. One that cannot be locked in time or deleted keeps
   `sleepDisabledByUs` journaled after sleep is restored (the app and the

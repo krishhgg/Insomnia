@@ -25,8 +25,13 @@ which it receives as an argument and compares with the clock as root; it
 holds a `lockf` lock on that file from before the checks until pmset exits.
 The start deletes the file when it finishes, and the app at launch, the recovery agent and uninstall delete it
 under the recovery lock before they undo anything; every one of them takes the
-file's own lock first, so the file never goes while that command is past its
-check. A dialog answered after its start was abandoned (the app died, recovery
+file's own lock first, and deletes it only while its path still names the
+file it locked, so the file never goes while that command is past its
+check. A start that gave up on a stuck dialog counts it as voided only if
+the file it locked is the one it wrote. The scripts cannot make that last
+check, since they never wrote the file: a process running as you that puts
+a copy in its place while the command runs could get it deleted early. Such
+a process could already clear the journal entry in `state.json` directly. A dialog answered after its start was abandoned (the app died, recovery
 ran, the start rolled back, a newer start began) runs nothing. The app shows
 the dialog only when the installed `backstop.sh` declares, in its
 `# insomnia-backstop-version:` line, a version that deletes `pending-start`,
