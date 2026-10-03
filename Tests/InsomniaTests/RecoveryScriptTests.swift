@@ -1696,7 +1696,9 @@ final class RecoveryScriptTests: XCTestCase {
 
     /// The 0200 journal from the test above, with an entry for another
     /// account too. The owner bits fall short, so the whole ACL stays, a
-    /// warning names the journal, and recovery still runs.
+    /// warning names the journal, and recovery still runs. The journal
+    /// stays dirty, as above, so the next run undoes it again, but the log
+    /// already has the warning and does not get it a second time.
     func testBackstopKeepsAnACLWithAWarningWhenTheOwnerBitsFallShort() throws {
         try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
         XCTAssertEqual(chmod(fx.state.path, 0o200), 0)
@@ -1704,8 +1706,9 @@ final class RecoveryScriptTests: XCTestCase {
         try TestACL.grantMadeUpGroup(fx.state)
 
         _ = try fx.run(fx.backstop)
+        _ = try fx.run(fx.backstop)
 
-        XCTAssertEqual(fx.calls(), ["sudo -n \(fx.fakePmset) -a disablesleep 0"], fx.log())
+        XCTAssertEqual(fx.calls(), Array(repeating: "sudo -n \(fx.fakePmset) -a disablesleep 0", count: 2), fx.log())
         XCTAssertEqual(TestACL.entries(fx.state), 2)
         XCTAssertEqual(fx.log().components(separatedBy: "[warning] backstop: kept the access control list on \(fx.state.path):").count, 2, fx.log())
     }

@@ -96,6 +96,7 @@ SYSCTL=/usr/sbin/sysctl
 CHMOD=/bin/chmod
 STAT=/usr/bin/stat
 LS=/bin/ls
+GREP=/usr/bin/grep
 DEFAULTS=/usr/bin/defaults
 DATE=/bin/date
 MKDIR=/bin/mkdir
@@ -171,9 +172,11 @@ tighten() { # path...
 # owner's mode bits already give the owner read and write, and search too
 # for a directory: then the owner needs no entry. Otherwise an entry may be
 # what lets recovery read a 0200 journal, so the ACL stays and a warning
-# names the path. Only the mode decides. ls -lde says whether there are
-# entries at all (it prints a line for each after the first); their text
-# is never read. A removal that fails is logged and recovery goes on.
+# names the path. The LaunchAgent starts this script every minute, so the
+# warning is skipped when the current log already has it for that path.
+# Only the mode decides. ls -lde says whether there are entries at all (it
+# prints a line for each after the first); their text is never read. A
+# removal that fails is logged and recovery goes on.
 drop_acl() { # path
   local mode need err
   [[ "$("$LS" -lde "$1" 2>/dev/null)" == *$'\n'* ]] || return 0
@@ -182,7 +185,9 @@ drop_acl() { # path
   need=6
   if [[ -d "$1" ]]; then need=7; fi
   if (( ((8#$mode >> 6) & need) != need )); then
-    log warning "kept the access control list on $1: its mode does not give its owner read and write (and search, for a folder), so an entry may be what lets recovery use it. Any access it gives other accounts stays" || true
+    if ! "$GREP" -qF -- "backstop: kept the access control list on $1:" "$LOG" 2>/dev/null; then
+      log warning "kept the access control list on $1: its mode does not give its owner read and write (and search, for a folder), so an entry may be what lets recovery use it. Any access it gives other accounts stays" || true
+    fi
     return 0
   fi
   if ! err="$("$CHMOD" -N "$1" 2>&1)"; then
