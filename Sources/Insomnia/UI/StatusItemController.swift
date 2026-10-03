@@ -674,6 +674,7 @@ final class StatusItemController: NSObject {
             ),
             throttledBrowsers: status.throttledBrowsers,
             error: manager.lastError,
+            commandRunning: manager.commandWarning,
             foreignSleep: manager.foreignSleepWarning
         )
     }

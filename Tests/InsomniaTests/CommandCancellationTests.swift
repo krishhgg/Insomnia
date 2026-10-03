@@ -113,9 +113,6 @@ final class CommandCancellationTests: XCTestCase {
         try await assertGone(try recordedPid(pidFile))
     }
 
-    /// The window Greptile flagged: the caller has already passed its
-    /// cancellation check, the launch is queued, and the task is cancelled
-    /// before `Process.run`. The child must never start.
     // MARK: StopPolicy.terminateOnly (privileged commands: sudo pmset)
 
     /// A script that ignores SIGTERM (the disposition survives exec), then
@@ -132,23 +129,29 @@ final class CommandCancellationTests: XCTestCase {
         kill(pid, 0) == 0 || errno != ESRCH
     }
 
-    /// The backstop's rule, now in the app: a privileged child that ignores
-    /// SIGTERM is never SIGKILLed. The call reports it as still running,
-    /// with the pid, as soon as the grace is over, not when it finally
-    /// exits, and the handle resolves once it does.
-    func testTerminateOnlyNeverSendsSigkillAndReportsTheChildAsStillRunning() async throws {
-        let (exe, pidFile) = try termIgnorer()
+    /// A runner whose deadline starts counting only once the child has
+    /// written `pidFile`, which `termIgnorer` does after `trap '' TERM`: the
+    /// SIGTERM always finds the trap in place, however slow the spawn.
+    /// Bounded, so a child that never starts fails the caller's assertions
+    /// instead of hanging. `ready` is when the deadline started.
+    private func runnerStartingAtReadiness(_ pidFile: String) -> (runner: CancellableCommand, ready: Locked<Date?>) {
         let ready = Locked<Date?>(nil)
-        // The deadline starts counting only once the child has written its
-        // pid, which it does after `trap '' TERM`: the SIGTERM always finds
-        // the trap in place, however slow the spawn. Bounded, so a child
-        // that never starts fails the assertions below instead of hanging.
         let runner = CancellableCommand(beforeDeadline: {
             for _ in 0..<1000 where !FileManager.default.fileExists(atPath: pidFile) {
                 try? await Task.sleep(for: .milliseconds(10))
             }
             ready.value = Date()
         })
+        return (runner, ready)
+    }
+
+    /// The backstop's rule, now in the app: a privileged child that ignores
+    /// SIGTERM is never SIGKILLed. The call reports it as still running,
+    /// with the pid, as soon as the grace is over, not when it finally
+    /// exits, and the handle resolves once it does.
+    func testTerminateOnlyNeverSendsSigkillAndReportsTheChildAsStillRunning() async throws {
+        let (exe, pidFile) = try termIgnorer()
+        let (runner, ready) = runnerStartingAtReadiness(pidFile)
         var reported: UnfinishedCommand?
         do {
             _ = try await runner.run(exe, [], timeout: 1, stop: .terminateOnly(grace: 0.5))
@@ -222,16 +225,27 @@ final class CommandCancellationTests: XCTestCase {
     }
 
     /// Non-privileged callers keep the escalation: a child that ignores TERM
-    /// is SIGKILLed a second later and the call is a timeout.
+    /// is SIGKILLed a second later and the call is a timeout. The child
+    /// would sleep 30 s on its own, and the call returns once it has been
+    /// reaped, so the call must end within the timeout and the kill grace
+    /// (2 s, bounded at 10 for a slow machine) of the trap being in place:
+    /// without the SIGKILL it ends only when the sleep does.
     func testDefaultPolicyStillKillsAChildThatIgnoresTerm() async throws {
         let (exe, pidFile) = try termIgnorer()
+        let (runner, ready) = runnerStartingAtReadiness(pidFile)
         do {
-            _ = try await CancellableCommand().run(exe, [], timeout: 1)
+            _ = try await runner.run(exe, [], timeout: 1)
             XCTFail("command outlived its timeout")
         } catch is ShellTimeoutError {}
+        let readyAt = try XCTUnwrap(ready.value, "the deadline never started")
+        let elapsed = Date().timeIntervalSince(readyAt)
+        XCTAssertLessThan(elapsed, 10, "the child was not SIGKILLed: it ended with its own sleep")
         try await assertGone(try recordedPid(pidFile))
     }
 
+    /// The window Greptile flagged: the caller has already passed its
+    /// cancellation check, the launch is queued, and the task is cancelled
+    /// before `Process.run`. The child must never start.
     func testCancelBeforeLaunchNeverRunsTheChild() async throws {
         let sentinel = file("ran")
         let exe = try script("sentinel", "printf '' > '\(sentinel)'")

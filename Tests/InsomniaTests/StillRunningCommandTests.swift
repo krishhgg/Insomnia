@@ -55,7 +55,8 @@ final class StillRunningCommandTests: XCTestCase {
         let last = try XCTUnwrap(h.notifier.posts.last)
         XCTAssertEqual(last.title, SessionManager.commandRunningTitle)
         XCTAssertTrue(last.body.contains("sudo kill 4242"), last.body)
-        XCTAssertTrue(try XCTUnwrap(m.lastError).contains("pid 4242"), m.lastError ?? "")
+        XCTAssertTrue(try XCTUnwrap(m.commandWarning).contains("sudo kill 4242"), m.commandWarning ?? "")
+        XCTAssertNil(m.lastError, "the live command reported as a failure the next success would not clear")
         let postsBefore = h.notifier.posts.count
 
         // Quit is refused without running anything, and a start is refused.
@@ -66,11 +67,16 @@ final class StillRunningCommandTests: XCTestCase {
         XCTAssertNil(m.session)
         XCTAssertEqual(h.guardFake.calls, before + ["disablesleep 0"], "a transaction ran while the lock was held for the command")
         XCTAssertEqual(h.notifier.posts.count, postsBefore, "told again on every refused transaction")
+        XCTAssertTrue(try XCTUnwrap(m.commandWarning).hasPrefix("end skipped"), m.commandWarning ?? "")
+        XCTAssertTrue(try XCTUnwrap(m.commandWarning).contains("sudo kill 4242"), m.commandWarning ?? "")
+        let startRefused = try XCTUnwrap(m.lastError, "the start refused for the pending end said nothing")
 
         // The command exits: the lock is released and the end retried.
         h.guardFake.stillRunning = []
         h.guardFake.exitStuckCommands()
         await waitUntil("pending end never retried") { m.pendingEnd == nil }
+        XCTAssertNil(m.commandWarning, "the menu still names a command that has exited")
+        XCTAssertEqual(m.lastError, startRefused, "the exit took a newer error with the command's line")
         XCTAssertEqual(h.guardFake.calls, before + ["disablesleep 0", "disablesleep 0", "lowpowermode 0"])
         XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
         XCTAssertFalse(h.guardFake.sleepDisabled)
@@ -241,6 +247,9 @@ final class StillRunningCommandTests: XCTestCase {
         XCTAssertEqual(m.unfinishedCommand?.pid, 4242)
         XCTAssertEqual(try h.store.loadState()?.lowPowerSetByUs, true, "ownership dropped with the rollback still running")
         XCTAssertTrue(try lockIsHeld(), "recovery lock released with the rollback still running")
+        let enableFailed = try XCTUnwrap(m.lastError)
+        XCTAssertTrue(enableFailed.hasPrefix("could not enable low power mode"), enableFailed)
+        XCTAssertTrue(try XCTUnwrap(m.commandWarning).contains("sudo kill 4242"), m.commandWarning ?? "")
         var ran = false
         let admitted = await m.runExclusive("probe") { ran = true }
         XCTAssertFalse(admitted)
@@ -260,6 +269,8 @@ final class StillRunningCommandTests: XCTestCase {
         XCTAssertEqual(try h.store.loadState()?.lowPowerSetByUs, true)
         XCTAssertEqual(h.notifier.posts.last?.title, "Low Power Mode on")
         XCTAssertFalse(try lockIsHeld())
+        XCTAssertNil(m.commandWarning, "the menu still names the rollback after it exited")
+        XCTAssertEqual(m.lastError, enableFailed)
 
         let ended = await m.end(reason: .user)
         XCTAssertEqual(ended, .restored)
@@ -349,9 +360,9 @@ final class StillRunningCommandTests: XCTestCase {
         h.guardFake.stillRunning = []
         let pendingAtRefusal = Locked<EndReason?>(nil)
         withObservationTracking {
-            _ = m.lastError
+            _ = m.commandWarning
         } onChange: { [guardFake = h.guardFake] in
-            // The refusal reports through `lastError`: this runs inside it.
+            // The refusal reports through `commandWarning`: this runs inside it.
             MainActor.assumeIsolated { pendingAtRefusal.value = m.pendingEnd }
             guardFake.exitStuckCommands()
         }
@@ -477,5 +488,117 @@ final class StillRunningCommandTests: XCTestCase {
         other.release()
         await waitUntil("check never ran again after the busy lock") { resyncs.value == [false] }
         XCTAssertEqual(try h.store.loadState()?.lowPowerSetByUs, false)
+    }
+
+    /// The rollback `lowpowermode 0` is left running and goes through, as
+    /// above, so the flag claims a mode that is off. Started with the flag
+    /// journaled and the floors running on it, as AppServices runs them.
+    private func startWithRollbackLeftRunning(_ m: SessionManager) async throws {
+        h.guardFake.throwOn = ["lowpowermode 1"]
+        h.guardFake.stillRunning = ["lowpowermode 0"]
+        await m.start(duration: 3600)
+        let changed = await m.setLowPower(true)
+        XCTAssertFalse(changed)
+        XCTAssertEqual(m.unfinishedCommand?.pid, 4242)
+        XCTAssertEqual(try h.store.loadState()?.lowPowerSetByUs, true)
+        h.guardFake.stillRunning = []
+        h.guardFake.throwOn = []
+    }
+
+    private func floorsOnBattery(_ m: SessionManager, before run: @escaping @MainActor () -> Void) -> Locked<Int> {
+        let driver = FloorRuleDriver(manager: m, notifier: h.notifier)
+        let floorRuns = Locked(0)
+        m.resyncAfterCommand = { _ in
+            run()
+            Task { @MainActor in
+                await driver.run(battery: .percent(30), isCharging: false, thermal: .nominal, lidClosed: false)
+                floorRuns.value += 1
+            }
+        }
+        return floorRuns
+    }
+
+    /// The check after the exit cannot read the mode. The flag stays, the
+    /// floors run on it at once (and do nothing, trusting it), and the
+    /// check runs again after the retry delay instead of leaving the stale
+    /// flag for the rest of the session: the mode reads off, the ownership
+    /// is cleared, and the floors run again and switch the mode on.
+    func testCheckThatCouldNotReadTheModeRunsAgain() async throws {
+        let m = h.makeManager(retryDelay: 0.2)
+        let floorRuns = floorsOnBattery(m) { [guardFake = h.guardFake] in
+            // Each pass reads the mode before the floors run; only the
+            // first read fails.
+            guardFake.throwOn = []
+        }
+        try await startWithRollbackLeftRunning(m)
+        let before = h.guardFake.calls
+
+        h.guardFake.throwOn = ["pmset -g custom"]
+        h.guardFake.exitStuckCommands()
+
+        await waitUntil("the check never ran again after the failed read") { floorRuns.value == 2 }
+        XCTAssertEqual(
+            Array(h.guardFake.calls.dropFirst(before.count)),
+            ["pmset -g custom", "pmset -g custom", "pmset -g custom", "lowpowermode 1"],
+            "the failed read, the retried check, then the floors' enable on the corrected journal"
+        )
+        XCTAssertTrue(h.guardFake.lowPowerOn)
+        XCTAssertEqual(try h.store.loadState()?.lowPowerSetByUs, true)
+        XCTAssertEqual(h.notifier.posts.last?.title, "Low Power Mode on")
+        XCTAssertFalse(try lockIsHeld())
+    }
+
+    /// The check reads the mode off but cannot write the journal. The flag
+    /// stays on disk, and the check runs again after the retry delay; once
+    /// the journal takes the write the floors switch the mode on again.
+    func testCheckThatCouldNotWriteTheJournalRunsAgain() async throws {
+        let m = h.makeManager(retryDelay: 0.2)
+        let dir = h.home.paths.appSupport.path
+        addTeardownBlock { _ = chmod(dir, 0o755) }
+        let floorRuns = floorsOnBattery(m) {
+            // The journal takes writes again from the second pass on.
+            _ = chmod(dir, 0o755)
+        }
+        try await startWithRollbackLeftRunning(m)
+        let before = h.guardFake.calls
+
+        // Read-only: state.json cannot be replaced; it and the lock file
+        // still open.
+        XCTAssertEqual(chmod(dir, 0o500), 0)
+        h.guardFake.exitStuckCommands()
+
+        await waitUntil("the check never ran again after the failed journal write") { floorRuns.value == 2 }
+        XCTAssertEqual(
+            Array(h.guardFake.calls.dropFirst(before.count)),
+            ["pmset -g custom", "pmset -g custom", "pmset -g custom", "lowpowermode 1"],
+            "the check whose write failed, the retried check, then the floors' enable"
+        )
+        XCTAssertTrue(h.guardFake.lowPowerOn)
+        XCTAssertEqual(try h.store.loadState()?.lowPowerSetByUs, true)
+        XCTAssertFalse(try lockIsHeld())
+    }
+
+    /// The journal does not decode when the command exits: nothing is
+    /// checked or replayed, and the pass runs again after the retry delay
+    /// until the file is fixed, instead of being dropped.
+    func testCheckAfterTheCommandRunsAgainOnceTheJournalReadsAgain() async throws {
+        let m = h.makeManager(retryDelay: 0.2)
+        let floorRuns = floorsOnBattery(m) {}
+        try await startWithRollbackLeftRunning(m)
+        let stateFile = h.home.paths.stateFile
+        let journal = try Data(contentsOf: stateFile)
+        try Data("{".utf8).write(to: stateFile)
+
+        h.guardFake.exitStuckCommands()
+
+        await waitUntil("the unreadable journal was never reported") {
+            self.h.notifier.posts.contains { $0.title == SessionManager.journalTitle }
+        }
+        XCTAssertEqual(floorRuns.value, 0, "the floors ran on a journal that could not be read")
+        try journal.write(to: stateFile)
+        await waitUntil("the check never ran again after the journal was fixed") { floorRuns.value == 1 }
+        XCTAssertTrue(h.guardFake.lowPowerOn)
+        XCTAssertEqual(try h.store.loadState()?.lowPowerSetByUs, true)
+        XCTAssertEqual(h.guardFake.calls.suffix(3), ["pmset -g custom", "pmset -g custom", "lowpowermode 1"])
     }
 }

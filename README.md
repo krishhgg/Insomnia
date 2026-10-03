@@ -199,12 +199,14 @@ installation scenarios still need [release validation](docs/release-validation.m
   changing power settings after the journal has moved on. If it is still
   running 3 s later the transaction stops where it is, as the backstop's
   does: nothing else is undone, the journal keeps its entries, and the
-  recovery lock stays held until the command exits. A notification and the
-  menu warning give the pid and `sudo kill <pid>`. Until it exits, Insomnia
-  refuses to quit or start a session, and records any end or lid event it
-  refuses. When the command exits, a pending end runs again. Otherwise
-  Insomnia reads Low Power Mode, corrects the journal to it, replays a
-  refused lid event and runs the floor rules again.
+  recovery lock stays held until the command exits. A notification and a
+  menu warning give the pid and `sudo kill <pid>`; the warning goes away
+  when the command exits. Until then, Insomnia refuses to quit or start a
+  session, and records any end or lid event it refuses. When the command
+  exits, a pending end runs again. Otherwise Insomnia reads Low Power Mode,
+  corrects the journal to it, replays a refused lid event and runs the
+  floor rules again. If the mode cannot be read or the journal written, it
+  tries again every 30 s while the session lasts.
 - **Audio:** the backstop preserves volume/mute entries but cannot restore
   CoreAudio. Reopen the app for recovery.
 - **Sleep disabled by something else:** at launch, with no session and no

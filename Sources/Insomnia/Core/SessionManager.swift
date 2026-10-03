@@ -92,6 +92,11 @@ final class SessionManager {
     /// visible beside it. Cleared by a session start, or by
     /// `recheckForeignSleep()` once the bit reads 0 again.
     private(set) var foreignSleepWarning: String?
+    /// The sudo pmset left running (`unfinishedCommand`), what it holds up
+    /// and the pid to stop it by hand. Kept apart from `lastError` so the
+    /// command's exit removes it without touching a newer failure: the task
+    /// holding the lock for the command clears it then (`holdLock`).
+    private(set) var commandWarning: String?
 
     var isActive: Bool { session != nil }
 
@@ -325,7 +330,7 @@ final class SessionManager {
                 case nil:
                     break
                 }
-                self.fail("\(what) skipped, nothing changed: \(stuck.description) is still running and holds the recovery lock until it exits")
+                self.warnAboutCommand("\(what) skipped, nothing changed: \(stuck.description) is still running and holds the recovery lock until it exits (sudo kill \(stuck.pid) to stop it by hand)")
                 return .failure(.commandRunning(pid: stuck.pid))
             }
             let handle: RecoveryLockHandle
@@ -393,7 +398,10 @@ final class SessionManager {
             handle.release()
             Log.info("\(command.description) exited with status \(command.terminationStatus.map(String.init) ?? "?"); recovery lock released")
             guard let self else { return }
-            if self.unfinishedCommand === command { self.unfinishedCommand = nil }
+            if self.unfinishedCommand === command {
+                self.unfinishedCommand = nil
+                self.commandWarning = nil
+            }
             await self.settle(after: command)
         }
     }
@@ -416,31 +424,38 @@ final class SessionManager {
     /// lock (`performLowPowerCheck`), then `resyncAfterCommand` replays a
     /// lid event refused meanwhile and runs the floor rules on the
     /// corrected journal, which also asks again for any Low Power change
-    /// refused meanwhile. A busy lock (another process's transaction)
-    /// leaves all of it owed and tries again after `recoveryRetryDelay`; a
-    /// newer unfinished command settles it when that one exits. Run by the
-    /// holder; internal for tests.
+    /// refused meanwhile.
+    ///
+    /// The pass is owed until the check settles, and runs again after
+    /// `recoveryRetryDelay` while the session lasts: nothing else would
+    /// run it, unlike an end, which the next end request retries. Refused
+    /// for a busy lock (another process's transaction) or an unreadable
+    /// journal, it checks and replays nothing. A check that could not read
+    /// the mode or write the journal still replays the lid event and runs
+    /// the floors now, on the flag it could not correct; they run again
+    /// once a later check settles. A newer unfinished command settles it
+    /// when that one exits. Run by the holder; internal for tests.
     func settleAfterCommand() async {
+        settleRetry?.cancel()
+        settleRetry = nil
         guard session != nil else { return }
+        let checked: Bool
         switch await exclusive("low power check", { await self.performLowPowerCheck() }) {
-        case .success:
-            break
-        case .failure(.lockBusy):
+        case let .success(settled):
+            checked = settled
+        case .failure(.lockBusy), .failure(.journalUnreadable):
             scheduleSettleRetry()
             return
         case .failure(.commandRunning):
             // A newer command holds the lock; its holder settles when it
             // exits, and the lid event stays recorded until then.
             return
-        case .failure(.journalUnreadable):
-            // Every transaction waits for a person to fix the file, as for
-            // an end; the session end undoes the lid actions from it then.
-            return
         }
         guard session != nil else { return }
         let replayLid = lidEventDeferred
         lidEventDeferred = false
         resyncAfterCommand?(replayLid)
+        if !checked { scheduleSettleRetry() }
     }
 
     private func scheduleSettleRetry() {
@@ -449,6 +464,7 @@ final class SessionManager {
         settleRetry = Task { @MainActor [weak self] in
             try? await Task.sleep(for: .seconds(delay))
             guard let self, !Task.isCancelled else { return }
+            self.settleRetry = nil
             Log.info("retrying the low power check after the power command")
             await self.settleAfterCommand()
         }
@@ -463,27 +479,29 @@ final class SessionManager {
     /// on again. Off: nobody holds it, so the flag is cleared and a display
     /// write owed for the end of the mode is done, as after any switch-off.
     /// On: it stays journaled as ours, for the floors or the end to switch
-    /// off. Unreadable: the flag stays; the `lowpowermode 0` it leads to at
-    /// the end is harmless.
-    private func performLowPowerCheck() async {
-        guard session != nil, state.lowPowerSetByUs else { return }
+    /// off. True once the flag matches the mode; false when the mode could
+    /// not be read, or read off with a journal that could not be written:
+    /// the flag stays, and `settleAfterCommand` checks again.
+    private func performLowPowerCheck() async -> Bool {
+        guard session != nil, state.lowPowerSetByUs else { return true }
         do {
             if try await sleepGuard.isLowPowerModeOn() {
                 Log.info("low power mode reads on after the power command; still journaled as ours")
-                return
+                return true
             }
         } catch {
-            Log.error("could not read low power mode after the power command; ownership kept in the journal: \(error.localizedDescription)")
-            return
+            Log.error("could not read low power mode after the power command; ownership kept in the journal and checked again in \(Int(recoveryRetryDelay)) s: \(error.localizedDescription)")
+            return false
         }
         do {
             try journal { $0.lowPowerSetByUs = false }
         } catch {
-            Log.error("low power mode reads off after the power command, but the journal could not be updated: \(error.localizedDescription)")
-            return
+            Log.error("low power mode reads off after the power command, but the journal could not be updated; checked again in \(Int(recoveryRetryDelay)) s: \(error.localizedDescription)")
+            return false
         }
         Log.info("low power mode reads off after the power command; ownership cleared from the journal")
         settleDisplayAfterLowPower()
+        return true
     }
 
     /// A `sudo pmset` did not stop on SIGTERM (`CommandStillRunningError`).
@@ -491,14 +509,15 @@ final class SessionManager {
     /// nothing else is undone or changed, the journal keeps every entry it
     /// had (the flag written before the command stays, so the next run
     /// retries it), and `exclusive` hands the lock to the command. The user
-    /// is told once, with the pid. `thenEnd` is the end that owes the
+    /// is notified once, and `commandWarning` keeps the pid in the menu
+    /// until the command exits. `thenEnd` is the end that owes the
     /// cleanup once the command has exited; it is retried then, and starts
     /// are refused and quit deferred meanwhile. Without one the session
     /// goes on, and is checked against the mode once the command has
     /// exited (`settleAfterCommand`).
     private func stopTransaction(for error: CommandStillRunningError, thenEnd reason: EndReason?) {
         unfinishedCommand = error.command
-        fail("\(error.localizedDescription); Insomnia holds the recovery lock and will not quit until it exits (sudo kill \(error.command.pid) to stop it by hand)")
+        warnAboutCommand("\(error.localizedDescription); Insomnia holds the recovery lock and will not quit until it exits (sudo kill \(error.command.pid) to stop it by hand)")
         notifier.post(
             title: Self.commandRunningTitle,
             body: "\(error.command.description) did not stop on SIGTERM and is left running, because killing it could leave a root pmset changing power settings outside the transaction. Nothing else was changed and the journal keeps its entries. Insomnia holds the recovery lock until it exits and will not quit or start a session before then. To stop it by hand: sudo kill \(error.command.pid)."
@@ -706,8 +725,12 @@ final class SessionManager {
         stopTimers()
         session = nil
         // Every lid action is undone from the journal below, or by the
-        // retry of this end: a lid event refused earlier owes nothing.
+        // retry of this end, and Low Power Mode restored from it: a lid
+        // event refused earlier and a settle pass waiting to run again
+        // owe nothing.
         lidEventDeferred = false
+        settleRetry?.cancel()
+        settleRetry = nil
         scheduledDeadline = nil
         remainingText = ""
         countdownText = ""
@@ -1492,6 +1515,11 @@ final class SessionManager {
 
     private func fail(_ message: String) {
         lastError = message
+        Log.error(message)
+    }
+
+    private func warnAboutCommand(_ message: String) {
+        commandWarning = message
         Log.error(message)
     }
 

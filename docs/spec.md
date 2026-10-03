@@ -383,12 +383,15 @@ Backstop, independent of the app:
   after SIGTERM stops the transaction where it is, in the app as in the
   agent's `run_bounded`: nothing else is undone, the journal keeps every
   entry it had, and the recovery lock stays held until the command exits.
-  The app reports the pid with the `sudo kill` command and refuses to quit or
-  start a session until then. An end, lid close or lid open refused
-  meanwhile is recorded at the refusal. When the command exits the app
-  retries a pending end. Otherwise it reads Low Power Mode under the lock,
-  corrects the journal's ownership to it, replays a refused lid event for
-  the lid's latest state, and runs the floor rules again.
+  The app reports the pid with the `sudo kill` command, in a menu line of
+  its own that the exit removes, and refuses to quit or start a session
+  until then. An end, lid close or lid open refused meanwhile is recorded at
+  the refusal. When the command exits the app retries a pending end.
+  Otherwise it reads Low Power Mode under the lock, corrects the journal's
+  ownership to it, replays a refused lid event for the lid's latest state,
+  and runs the floor rules again. A check that cannot take the lock, read
+  the journal or the mode, or write the journal runs again after the retry
+  delay while the session lasts.
 - Successful restores may clear their entries; failures must stay journaled.
   Process recovery must verify identity and avoid resuming a process that
   Insomnia did not stop. Old PID-only entries need conservative handling.

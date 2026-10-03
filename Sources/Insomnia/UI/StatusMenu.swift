@@ -36,6 +36,7 @@ enum StatusMenu {
         actions: String?,
         throttledBrowsers: [String],
         error: String?,
+        commandRunning: String? = nil,
         foreignSleep: String? = nil
     ) -> [Item] {
         var out: [Item] = []
@@ -56,6 +57,11 @@ enum StatusMenu {
             for name in throttledBrowsers {
                 out.append(Item(title: "Relaunch \(name) unthrottled", kind: .relaunchBrowser(name)))
             }
+        }
+        // The sudo pmset left running goes first: it holds every change
+        // and quit until it exits, and the line goes away then.
+        if let command = present(commandRunning) {
+            out.append(Item(title: "\u{26A0} \(command)", kind: .warning))
         }
         if let error = present(error) {
             out.append(Item(title: "\u{26A0} \(error)", kind: .warning))
