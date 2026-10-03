@@ -137,9 +137,9 @@ final class SessionManager {
     /// Called once an unfinished command has exited, no end is pending and
     /// Low Power Mode has been checked against the journal
     /// (`settleAfterCommand`): `AppServices` replays a lid event refused
-    /// while the command ran, for the lid's latest state (`replayLid`),
-    /// and runs the floor rules on the corrected journal. nil in tests that
-    /// do not wire it.
+    /// while the command ran (`replayLid`), for the state of the latest lid
+    /// event once the lid debounce has settled, and runs the floor rules
+    /// on the corrected journal. nil in tests that do not wire it.
     var resyncAfterCommand: (@MainActor (_ replayLid: Bool) -> Void)?
     /// How far the panel may have drifted from a value written under Low
     /// Power Mode (auto-brightness moves it slowly) and still count as
@@ -442,10 +442,11 @@ final class SessionManager {
     /// run it, unlike an end, which the next end request retries. Refused
     /// for a busy lock (another process's transaction) or an unreadable
     /// journal, it checks and replays nothing. A check that could not read
-    /// the mode or write the journal still replays the lid event and runs
-    /// the floors now, on the flag it could not correct; they run again
-    /// once a later check settles. A newer unfinished command settles it
-    /// when that one exits. An end that is pending (refused for a busy lock
+    /// the mode, confirm it off or write the journal still replays the lid
+    /// event and runs the floors now, on the flag it could not correct;
+    /// they run again once a later check settles. A newer unfinished
+    /// command, the check's own `lowpowermode 0` included, settles it when
+    /// that one exits. An end that is pending (refused for a busy lock
     /// or an unreadable journal) owes the cleanup instead and the pass is
     /// dropped: the end restores Low Power Mode and the lid actions from
     /// the journal, and the floors must not switch the mode on before it.
@@ -466,7 +467,10 @@ final class SessionManager {
             // exits, and the lid event stays recorded until then.
             return
         }
-        guard session != nil, pendingEnd == nil else { return }
+        // A `lowpowermode 0` the check ran was left running: its holder
+        // runs this pass again when it exits, and the lid event stays
+        // recorded until then.
+        guard session != nil, pendingEnd == nil, unfinishedCommand == nil else { return }
         let replayLid = lidEventDeferred
         lidEventDeferred = false
         resyncAfterCommand?(replayLid)
@@ -491,12 +495,23 @@ final class SessionManager {
     /// mode that is off: a `lowpowermode 1` that failed in the end, or a
     /// rollback `lowpowermode 0` that went through. The floors and
     /// `performSetLowPower` trust the flag and would never switch the mode
-    /// on again. Off: nobody holds it, so the flag is cleared and a display
-    /// write owed for the end of the mode is done, as after any switch-off.
+    /// on again.
+    ///
     /// On: it stays journaled as ours, for the floors or the end to switch
-    /// off. True once the flag matches the mode; false when the mode could
-    /// not be read, or read off with a journal that could not be written:
-    /// the flag stays, and `settleAfterCommand` checks again.
+    /// off. Off: a reading is no confirmed undo, and neither is a command
+    /// that failed or was not watched to the end, so the check runs a
+    /// `lowpowermode 0` of its own and clears the flag only once that has
+    /// exited 0, as `restoreAll` does. A display write owed for the end of
+    /// the mode is done then, as after any switch-off, unless the panel
+    /// has moved since it was written: the user may have set it while the
+    /// command ran, so the movement check runs again first.
+    ///
+    /// True once nothing is left for this pass to retry: the flag matches
+    /// the mode, or the `lowpowermode 0` was itself left running, and the
+    /// task holding the lock for it runs the pass again when it exits.
+    /// False when the mode could not be read, the `lowpowermode 0` failed,
+    /// or the journal could not be written: the flag stays, and
+    /// `settleAfterCommand` checks again.
     private func performLowPowerCheck() async -> Bool {
         guard session != nil, state.lowPowerSetByUs else { return true }
         do {
@@ -508,13 +523,23 @@ final class SessionManager {
             Log.error("could not read low power mode after the power command; ownership kept in the journal and checked again in \(Int(recoveryRetryDelay)) s: \(error.localizedDescription)")
             return false
         }
+        dropDisplayWriteIfMoved()
+        do {
+            try await sleepGuard.setLowPowerMode(false)
+        } catch let still as CommandStillRunningError {
+            stopTransaction(for: still, thenEnd: nil)
+            return true
+        } catch {
+            Log.error("low power mode reads off after the power command, but lowpowermode 0 failed; ownership kept in the journal and checked again in \(Int(recoveryRetryDelay)) s: \(error.localizedDescription)")
+            return false
+        }
         do {
             try journal { $0.lowPowerSetByUs = false }
         } catch {
-            Log.error("low power mode reads off after the power command, but the journal could not be updated; checked again in \(Int(recoveryRetryDelay)) s: \(error.localizedDescription)")
+            Log.error("low power mode confirmed off after the power command, but the journal could not be updated; checked again in \(Int(recoveryRetryDelay)) s: \(error.localizedDescription)")
             return false
         }
-        Log.info("low power mode reads off after the power command; ownership cleared from the journal")
+        Log.info("low power mode confirmed off after the power command; ownership cleared from the journal")
         settleDisplayAfterLowPower()
         return true
     }
@@ -903,8 +928,9 @@ final class SessionManager {
                 try await sleepGuard.setLowPowerMode(true)
             } catch let still as CommandStillRunningError {
                 // No rollback beside a live pmset. Ownership stays journaled
-                // until the command has exited; the mode is read then and
-                // the journal corrected to it (`performLowPowerCheck`).
+                // until the command has exited; the mode is read then, and
+                // a mode that reads off is switched off once more before
+                // the ownership is cleared (`performLowPowerCheck`).
                 stopTransaction(for: still, thenEnd: nil)
                 return false
             } catch {

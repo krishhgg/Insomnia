@@ -410,11 +410,16 @@ Backstop, independent of the app:
   its own that the exit removes, and refuses to quit or start a session
   until then. An end, lid close or lid open refused meanwhile is recorded at
   the refusal. When the command exits the app retries a pending end.
-  Otherwise it reads Low Power Mode under the lock, corrects the journal's
-  ownership to it, replays a refused lid event for the lid's latest state,
-  and runs the floor rules again. A check that cannot take the lock, read
-  the journal or the mode, or write the journal runs again after the retry
-  delay while the session lasts.
+  Otherwise it reads Low Power Mode under the lock. A mode that reads on
+  stays journaled as Insomnia's. A mode that reads off is switched off
+  once more with the app's own `lowpowermode 0`, and the ownership is
+  cleared only when that exits 0; a display write owed for the end of the
+  mode is dropped first if the panel has moved since. Then the app replays
+  a refused lid event for the state of the latest lid event, after any
+  change still in the 2 s lid debounce has settled, and runs the floor
+  rules again. A check that cannot take the lock, read the journal or the
+  mode, switch the mode off, or write the journal runs again after the
+  retry delay while the session lasts.
 - Successful restores may clear their entries; failures must stay journaled.
   Process recovery must verify identity and avoid resuming a process that
   Insomnia did not stop. Old PID-only entries need conservative handling.

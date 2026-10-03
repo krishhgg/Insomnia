@@ -75,6 +75,11 @@ final class AppServices {
     private var browserTasks: [Task<Void, Never>] = []
     private var sampleTimer: (any DispatchSourceTimer)?
     private var postOpenSampleTask: Task<Void, Never>?
+    /// The state of the last lid event, from the hinge or the simulation
+    /// trigger, run or refused. `status.lidClosed` is no stand-in for it:
+    /// the menu's `refreshInstant` writes the raw registry there, which
+    /// can hold a change the observer then drops as a flap.
+    private var lastLidEvent: Bool?
     private(set) var running = false
 
     init(
@@ -172,6 +177,7 @@ final class AppServices {
         running = false
         lid.stop()
         lid.onChange = nil
+        lastLidEvent = nil
         stopLidSimulation()
         power.stop()
         power.onChange = nil
@@ -287,14 +293,28 @@ final class AppServices {
 
     /// An unfinished power command has exited and the manager has checked
     /// Low Power Mode against the journal. A lid event refused while it ran
-    /// is replayed for the lid's latest state, which runs the floors after
-    /// it; otherwise the floors run now, on the corrected journal, and ask
-    /// again for any Low Power change refused meanwhile.
+    /// is replayed for the state of the latest lid event, which runs the
+    /// floors after it; otherwise the floors run now, on the corrected
+    /// journal, and ask again for any Low Power change refused meanwhile.
+    ///
+    /// The replay waits for a hinge change still in the observer's 2 s
+    /// debounce. Delivered, that change runs the actions for the new state
+    /// itself, and a replay before it would run them for the state it
+    /// replaces (darken and freeze with the lid open, or restore with it
+    /// closed). Dropped as a flap, the replay runs then.
     private func resyncAfterCommand(replayLid: Bool) {
-        if replayLid { lidChanged(status.lidClosed) } else { powerChanged() }
+        guard replayLid else {
+            powerChanged()
+            return
+        }
+        lid.whenSettled { [weak self] delivered in
+            guard let self, self.running, !delivered else { return }
+            self.lidChanged(self.lastLidEvent ?? self.status.lidClosed)
+        }
     }
 
     private func lidChanged(_ closed: Bool) {
+        lastLidEvent = closed
         status.lidClosed = closed
         guard let actions = lidActions else { return }
         let previous = lidTasks.last

@@ -153,13 +153,16 @@ final class StillRunningCommandTests: XCTestCase {
         XCTAssertNil(m.unfinishedCommand)
         XCTAssertNotNil(m.session, "session ended though nothing was pending")
         XCTAssertNil(m.pendingEnd)
-        XCTAssertEqual(h.guardFake.calls.suffix(2), ["lowpowermode 1", "pmset -g custom"])
+        XCTAssertEqual(
+            h.guardFake.calls.suffix(3), ["lowpowermode 1", "pmset -g custom", "lowpowermode 0"],
+            "the mode read off, then switched off by the check before the ownership is cleared"
+        )
         XCTAssertEqual(try h.store.loadState()?.lowPowerSetByUs, false, "ownership of a mode that is off kept after the command exited")
         XCTAssertFalse(try lockIsHeld())
 
         let ended = await m.end(reason: .user)
         XCTAssertEqual(ended, .restored)
-        XCTAssertEqual(h.guardFake.calls.suffix(2), ["pmset -g custom", "disablesleep 0"])
+        XCTAssertEqual(h.guardFake.calls.suffix(2), ["lowpowermode 0", "disablesleep 0"])
         XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
     }
 
@@ -223,7 +226,8 @@ final class StillRunningCommandTests: XCTestCase {
     /// the command left running: it is tracked like any other, so the lock
     /// stays with it and ownership stays journaled while it runs. The
     /// rollback goes through in the end: the mode reads off after the exit,
-    /// the ownership is cleared, and the floors run on the corrected
+    /// the check's own `lowpowermode 0` exits 0, the ownership is cleared,
+    /// and the floors run on the corrected
     /// journal and switch the mode on again, which a stale flag would have
     /// stopped them doing.
     func testLowPowerRollbackLeftRunningKeepsTheLockAndIsCheckedWhenItExits() async throws {
@@ -262,8 +266,8 @@ final class StillRunningCommandTests: XCTestCase {
         XCTAssertNotNil(m.session)
         XCTAssertEqual(
             h.guardFake.calls,
-            ["disablesleep 1", "pmset -g custom", "lowpowermode 1", "lowpowermode 0", "pmset -g custom", "pmset -g custom", "lowpowermode 1"],
-            "the check, then the floors' enable on a journal that no longer claims the mode"
+            ["disablesleep 1", "pmset -g custom", "lowpowermode 1", "lowpowermode 0", "pmset -g custom", "lowpowermode 0", "pmset -g custom", "lowpowermode 1"],
+            "the check and its own switch-off, then the floors' enable on a journal that no longer claims the mode"
         )
         XCTAssertTrue(h.guardFake.lowPowerOn)
         XCTAssertEqual(try h.store.loadState()?.lowPowerSetByUs, true)
@@ -539,8 +543,8 @@ final class StillRunningCommandTests: XCTestCase {
         await waitUntil("the check never ran again after the failed read") { floorRuns.value == 2 }
         XCTAssertEqual(
             Array(h.guardFake.calls.dropFirst(before.count)),
-            ["pmset -g custom", "pmset -g custom", "pmset -g custom", "lowpowermode 1"],
-            "the failed read, the retried check, then the floors' enable on the corrected journal"
+            ["pmset -g custom", "pmset -g custom", "lowpowermode 0", "pmset -g custom", "lowpowermode 1"],
+            "the failed read, the retried check and its switch-off, then the floors' enable on the corrected journal"
         )
         XCTAssertTrue(h.guardFake.lowPowerOn)
         XCTAssertEqual(try h.store.loadState()?.lowPowerSetByUs, true)
@@ -548,7 +552,8 @@ final class StillRunningCommandTests: XCTestCase {
         XCTAssertFalse(try lockIsHeld())
     }
 
-    /// The check reads the mode off but cannot write the journal. The flag
+    /// The check reads the mode off and switches it off, but cannot write
+    /// the journal. The flag
     /// stays on disk, and the check runs again after the retry delay; once
     /// the journal takes the write the floors switch the mode on again.
     func testCheckThatCouldNotWriteTheJournalRunsAgain() async throws {
@@ -570,7 +575,7 @@ final class StillRunningCommandTests: XCTestCase {
         await waitUntil("the check never ran again after the failed journal write") { floorRuns.value == 2 }
         XCTAssertEqual(
             Array(h.guardFake.calls.dropFirst(before.count)),
-            ["pmset -g custom", "pmset -g custom", "pmset -g custom", "lowpowermode 1"],
+            ["pmset -g custom", "lowpowermode 0", "pmset -g custom", "lowpowermode 0", "pmset -g custom", "lowpowermode 1"],
             "the check whose write failed, the retried check, then the floors' enable"
         )
         XCTAssertTrue(h.guardFake.lowPowerOn)
@@ -599,7 +604,7 @@ final class StillRunningCommandTests: XCTestCase {
         await waitUntil("the check never ran again after the journal was fixed") { floorRuns.value == 1 }
         XCTAssertTrue(h.guardFake.lowPowerOn)
         XCTAssertEqual(try h.store.loadState()?.lowPowerSetByUs, true)
-        XCTAssertEqual(h.guardFake.calls.suffix(3), ["pmset -g custom", "pmset -g custom", "lowpowermode 1"])
+        XCTAssertEqual(h.guardFake.calls.suffix(4), ["pmset -g custom", "lowpowermode 0", "pmset -g custom", "lowpowermode 1"])
     }
 
     /// An end refused for the unreadable journal is pending when the file
@@ -631,5 +636,100 @@ final class StillRunningCommandTests: XCTestCase {
         XCTAssertEqual(ended, .restored)
         XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
         XCTAssertFalse(h.guardFake.lowPowerOn)
+    }
+
+    /// The mode reads off after the exit, but the check's own
+    /// `lowpowermode 0` fails. A reading is no confirmed undo, so the
+    /// ownership stays journaled for the floors' pass that runs at once,
+    /// and the check runs again after the retry delay: that switch-off
+    /// exits 0, the ownership is cleared, and the floors switch the mode
+    /// on again.
+    func testCheckWhoseSwitchOffFailsKeepsTheOwnershipAndRunsAgain() async throws {
+        let m = h.makeManager(retryDelay: 0.2)
+        let flags = Locked<[Bool?]>([])
+        let floorRuns = floorsOnBattery(m) { [guardFake = h.guardFake, store = h.store] in
+            flags.value.append(try? store.loadState()?.lowPowerSetByUs)
+            guardFake.throwOn = []
+        }
+        try await startWithRollbackLeftRunning(m)
+        let before = h.guardFake.calls
+
+        h.guardFake.throwOn = ["lowpowermode 0"]
+        h.guardFake.exitStuckCommands()
+
+        await waitUntil("the check never ran again after the failed switch-off") { floorRuns.value == 2 }
+        XCTAssertEqual(flags.value, [true, false], "ownership cleared on a lowpowermode 0 that failed")
+        XCTAssertEqual(
+            Array(h.guardFake.calls.dropFirst(before.count)),
+            ["pmset -g custom", "lowpowermode 0", "pmset -g custom", "lowpowermode 0", "pmset -g custom", "lowpowermode 1"],
+            "the failed switch-off, the retried check, then the floors' enable"
+        )
+        XCTAssertTrue(h.guardFake.lowPowerOn)
+        XCTAssertEqual(try h.store.loadState()?.lowPowerSetByUs, true)
+        XCTAssertFalse(try lockIsHeld())
+    }
+
+    /// The check's own `lowpowermode 0` is left running in turn. It is
+    /// tracked like any other: the ownership stays, the lock goes to it,
+    /// and nothing is replayed or run beside it. When it exits, the pass
+    /// runs again, clears the ownership and runs the floors.
+    func testCheckWhoseSwitchOffIsLeftRunningRunsAgainWhenItExits() async throws {
+        let m = h.makeManager()
+        let floorRuns = floorsOnBattery(m) {}
+        try await startWithRollbackLeftRunning(m)
+        let before = h.guardFake.calls
+
+        h.guardFake.stillRunning = ["lowpowermode 0"]
+        h.guardFake.exitStuckCommands()
+
+        await waitUntil("the check's switch-off was never tracked") { m.unfinishedCommand?.pid == 4243 }
+        XCTAssertEqual(Array(h.guardFake.calls.dropFirst(before.count)), ["pmset -g custom", "lowpowermode 0"])
+        XCTAssertEqual(try h.store.loadState()?.lowPowerSetByUs, true, "ownership cleared beside the live switch-off")
+        XCTAssertTrue(try lockIsHeld(), "recovery lock released with the check's switch-off still running")
+        XCTAssertTrue(try XCTUnwrap(m.commandWarning).contains("sudo kill 4243"), m.commandWarning ?? "")
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertEqual(floorRuns.value, 0, "the floors ran beside the live switch-off")
+
+        h.guardFake.stillRunning = []
+        h.guardFake.exitStuckCommands()
+        await waitUntil("the pass never ran again after the switch-off exited") { floorRuns.value == 1 }
+        XCTAssertEqual(
+            Array(h.guardFake.calls.dropFirst(before.count)),
+            ["pmset -g custom", "lowpowermode 0", "pmset -g custom", "lowpowermode 0", "pmset -g custom", "lowpowermode 1"]
+        )
+        XCTAssertTrue(h.guardFake.lowPowerOn)
+        XCTAssertNil(m.commandWarning)
+        XCTAssertFalse(try lockIsHeld())
+    }
+
+    /// A display write is owed for the end of the mode, and the
+    /// `lowpowermode 0` that would settle it is left running. The user
+    /// sets the panel meanwhile. The check after the exit sees the panel
+    /// moved and drops the write instead of putting the old value back.
+    func testCheckDropsTheDisplayWriteIfThePanelMovedWhileTheCommandRan() async throws {
+        let m = h.makeManager()
+        m.resyncAfterCommand = { _ in }
+        await m.start(duration: 3600)
+        let on = await m.setLowPower(true)
+        XCTAssertTrue(on)
+        var st = try XCTUnwrap(try h.store.loadState())
+        st.displayRestoredUnderLowPower = 0.6
+        try h.store.saveState(st)
+        h.display.brightness = 0.6
+        h.guardFake.stillRunning = ["lowpowermode 0"]
+
+        let off = await m.setLowPower(false)
+
+        XCTAssertFalse(off)
+        XCTAssertEqual(try h.store.loadState()?.displayRestoredUnderLowPower, 0.6, "write dropped though the panel had not moved")
+        h.display.brightness = 0.3
+        // The switch-off went through before it exited.
+        h.guardFake.lowPowerOn = false
+        h.guardFake.stillRunning = []
+        h.guardFake.exitStuckCommands()
+        await waitUntil("ownership never cleared after the exit") { (try? self.h.store.loadState()?.lowPowerSetByUs) == false }
+        XCTAssertEqual(h.display.sets, [], "the old value written over the panel the user moved")
+        XCTAssertEqual(h.display.brightness, 0.3)
+        XCTAssertNil(try h.store.loadState()?.displayRestoredUnderLowPower)
     }
 }
