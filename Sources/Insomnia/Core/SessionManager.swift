@@ -132,12 +132,16 @@ final class SessionManager {
     /// schedule for one device does not drop the other's second write.
     private var pendingReassert: (display: Float?, keyboard: Float?) = (nil, nil)
     /// How often, and how many times, a brightness kept after a refused
-    /// restore is read again while macOS holds the device down (see
-    /// scheduleKeptRecheck).
+    /// restore is read again while macOS holds the device down, and how
+    /// often after that (see scheduleKeptRecheck).
     private let keptRecheckDelay: Duration
     private let keptRecheckAttempts: Int
+    private let keptRecheckSlowDelay: Duration
     @ObservationIgnored private var keptRecheckTask: Task<Void, Never>?
     @ObservationIgnored private var keptRecheckAttempt = 0
+    /// The re-read has logged that the lid is not known to be open, so the
+    /// reads at the slow pace while it stays so log nothing.
+    @ObservationIgnored private var keptRecheckSawLidClosed = false
     /// Set by the last undo when a kept value this build could write
     /// failed to restore and its flag could not be cleared either, so on
     /// disk it still reads as refused and not dirty. An end counts it.
@@ -211,7 +215,8 @@ final class SessionManager {
         recoveryRetryDelay: TimeInterval = 30,
         reassertDelay: Duration = .seconds(2),
         keptRecheckDelay: Duration = .seconds(3),
-        keptRecheckAttempts: Int = 20
+        keptRecheckAttempts: Int = 20,
+        keptRecheckSlowDelay: Duration = .seconds(60)
     ) {
         self.paths = paths
         self.store = Store(paths: paths)
@@ -231,6 +236,7 @@ final class SessionManager {
         self.reassertDelay = reassertDelay
         self.keptRecheckDelay = keptRecheckDelay
         self.keptRecheckAttempts = keptRecheckAttempts
+        self.keptRecheckSlowDelay = keptRecheckSlowDelay
 
         try? paths.createDirectories()
         var loadedState: RuntimeState?
@@ -931,7 +937,9 @@ final class SessionManager {
             keptRecheckTask?.cancel()
         } else {
             Log.info("\(waiting.joined(separator: "; ")); nothing written or cleared, read again in \(keptRecheckDelay)")
-            scheduleKeptRecheck(restart: true)
+            keptRecheckAttempt = 0
+            keptRecheckSawLidClosed = false
+            scheduleKeptRecheck(after: keptRecheckDelay)
         }
         // powerd applies its own remembered "pre-dim" brightness a moment
         // after the wake and can override the write above, so the same
@@ -1022,40 +1030,54 @@ final class SessionManager {
 
     /// The keyboard backlight stays suppressed for a moment after the wake,
     /// and a display asleep reads its idle-dim value, so a kept value whose
-    /// reading decided nothing is read again every `keptRecheckDelay`, as
-    /// its own transaction under the recovery lock, up to
-    /// `keptRecheckAttempts` times. Still undecided after that, it stays
-    /// kept, blocking nothing, for the next lid open, lid close or launch.
-    /// `restart` begins a new count, for an undo.
-    private func scheduleKeptRecheck(restart: Bool) {
-        if restart { keptRecheckAttempt = 0 }
-        keptRecheckAttempt += 1
+    /// reading decided nothing is read again, each time as its own
+    /// transaction under the recovery lock: every `keptRecheckDelay` for
+    /// `keptRecheckAttempts` readings, then every `keptRecheckSlowDelay`
+    /// for as long as it waits and the app runs. The re-read keeps itself
+    /// going: outside a session no lid service runs, so no lid open would
+    /// start it again. A busy lock skips one read, not the ones after it.
+    /// An unreadable journal ends it, as it refuses every transaction until
+    /// the file is fixed; the next launch reads again.
+    private func scheduleKeptRecheck(after delay: Duration) {
         keptRecheckTask?.cancel()
-        let delay = keptRecheckDelay
         keptRecheckTask = Task { @MainActor [weak self] in
             try? await Task.sleep(for: delay)
             guard let self, !Task.isCancelled else { return }
-            _ = await self.exclusive("brightness re-check") { self.recheckKeptBrightness() }
+            let result = await self.exclusive("brightness re-check") { self.recheckKeptBrightness() }
+            if case .failure(.lockBusy) = result, !Task.isCancelled {
+                self.scheduleKeptRecheck(after: self.keptRecheckSlowDelay)
+            }
         }
     }
 
     /// Only the kept values the guard allows: the rest of the journal is
     /// for a lid open, an end or the backstop. Only with the lid known to
     /// be open, as reconcile undoes lid actions: under a closed lid a write
-    /// would light what the close keeps dark, and the open reads again.
+    /// would light what the close keeps dark. Until the lid is known open
+    /// nothing is read, at the slow pace, and the first reading after that
+    /// starts a new count, since the wake holds the backlight down again.
     private func recheckKeptBrightness() {
+        let rereadDisplay = state.savedDisplayBrightness != nil && state.displayRestoreRefused && display.refusal() == nil
+        let rereadKeyboard = state.savedKeyboardBrightness != nil && state.keyboardRestoreRefused && keyboard.refusal() == nil
+        guard rereadDisplay || rereadKeyboard else { return }
         guard clamshell() == false else {
-            Log.info("brightness re-check stopped: the lid is not known to be open; the kept value waits for the next lid open, lid close or launch")
+            if !keptRecheckSawLidClosed {
+                keptRecheckSawLidClosed = true
+                Log.info("brightness re-check: the lid is not known to be open, so the kept value is not read; checked again every \(keptRecheckSlowDelay) until it is")
+            }
+            keptRecheckAttempt = 0
+            scheduleKeptRecheck(after: keptRecheckSlowDelay)
             return
         }
+        keptRecheckSawLidClosed = false
         var waiting: [String] = []
         var errors: [String] = []
         var restoredDisplay: Float?
         var restoredKeyboard: Float?
-        if let saved = state.savedDisplayBrightness, state.displayRestoreRefused, display.refusal() == nil {
+        if rereadDisplay, let saved = state.savedDisplayBrightness {
             restoredDisplay = restoreDisplay(saved: saved, waiting: &waiting, errors: &errors)
         }
-        if let saved = state.savedKeyboardBrightness, state.keyboardRestoreRefused, keyboard.refusal() == nil {
+        if rereadKeyboard, let saved = state.savedKeyboardBrightness {
             restoredKeyboard = restoreKeyboard(saved: saved, waiting: &waiting, errors: &errors)
         }
         if !errors.isEmpty {
@@ -1063,11 +1085,15 @@ final class SessionManager {
         }
         scheduleReassert(display: restoredDisplay, keyboard: restoredKeyboard)
         guard !waiting.isEmpty else { return }
+        keptRecheckAttempt += 1
         if keptRecheckAttempt < keptRecheckAttempts {
-            scheduleKeptRecheck(restart: false)
-        } else {
-            Log.info("\(waiting.joined(separator: "; ")); still so after \(keptRecheckAttempt) readings, so it stays kept for the next lid open, lid close or launch")
+            scheduleKeptRecheck(after: keptRecheckDelay)
+            return
         }
+        if keptRecheckAttempt == keptRecheckAttempts {
+            Log.info("\(waiting.joined(separator: "; ")); still so after \(keptRecheckAttempt) readings, so it is read again every \(keptRecheckSlowDelay) while it waits")
+        }
+        scheduleKeptRecheck(after: keptRecheckSlowDelay)
     }
 
     /// Insomnia's own Low Power Mode has just been switched off. A display

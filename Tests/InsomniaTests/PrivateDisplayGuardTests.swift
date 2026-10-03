@@ -528,40 +528,55 @@ final class RefusedDarkeningTests: XCTestCase {
 
     /// The lid closed before the re-read: it writes nothing, though the
     /// keyboard now reads 0 and is no longer held down, since the backlight
-    /// would light under the lid. The entry waits for the lid open.
-    func testTheReReadWritesNothingUnderAClosedLid() async throws {
+    /// would light under the lid. No session runs, so no lid service would
+    /// report the open: the re-read goes on by itself, logs the closed lid
+    /// once, and decides the entry once the lid is open.
+    func testTheReReadWritesNothingUnderAClosedLidAndDecidesOnceItOpens() async throws {
         try seedSavedBrightness(sessionValid: false, refused: true)
         h.clamshell.closed = false
         h.display.brightness = 0.6
         h.keyboard.brightness = 0
         h.keyboard.suppressedOrDimmed = true
-        let m = h.makeManager(keptRecheckDelay: .milliseconds(50))
+        let m = h.makeManager(keptRecheckDelay: .milliseconds(50), keptRecheckSlowDelay: .milliseconds(20))
 
         await m.reconcile()
         h.clamshell.closed = true
         h.keyboard.suppressedOrDimmed = false
-        try await waitFor { self.logText().contains("brightness re-check stopped: the lid is not known to be open") }
+        let closed = "brightness re-check: the lid is not known to be open, so the kept value is not read"
+        try await waitFor { self.logText().contains(closed) }
+        try await Task.sleep(for: .milliseconds(200))
 
-        XCTAssertTrue(logText().contains("brightness re-check stopped: the lid is not known to be open"), logText())
-        XCTAssertEqual(h.keyboard.sets, [])
-        let after = try XCTUnwrap(try h.store.loadState())
-        XCTAssertEqual(after.savedKeyboardBrightness, 0.3)
-        XCTAssertTrue(after.keyboardRestoreRefused)
+        XCTAssertEqual(h.keyboard.sets, [], "nothing is written under the lid")
+        XCTAssertEqual(logText().components(separatedBy: closed).count - 1, 1, "logged once, not at every read: \(logText())")
+        let waiting = try XCTUnwrap(try h.store.loadState())
+        XCTAssertEqual(waiting.savedKeyboardBrightness, 0.3)
+        XCTAssertTrue(waiting.keyboardRestoreRefused)
+
+        h.keyboard.brightness = 0.6
+        h.clamshell.closed = false
+        try await waitFor { try self.h.store.loadState()?.savedKeyboardBrightness == nil }
+
+        XCTAssertEqual(h.keyboard.sets, [], "the level set since is not overwritten")
+        XCTAssertFalse(try XCTUnwrap(try h.store.loadState()).keyboardRestoreRefused)
+        XCTAssertTrue(logText().contains("keyboard backlight reads 0.6, set since its restore to 0.3 was refused; left as set, and the saved value cleared"), logText())
     }
 
     /// A read that fails decides nothing either: the kept value is not
-    /// written over a level that may have been set, the entry stays, and
-    /// after the last re-read it waits for the next lid open, lid close or
-    /// launch. The display, read fine at 0, is restored as before.
-    func testAKeptValueWhoseReadFailsIsKept() async throws {
+    /// written over a level that may have been set, and the entry stays.
+    /// After the last quick re-read it is read at the slow pace, so once a
+    /// read works the entry is decided with no lid open, end or launch.
+    /// The display, read fine at 0, is restored as before.
+    func testAKeptValueWhoseReadFailsIsKeptAndReadAgainSlowly() async throws {
         try seedSavedBrightness(sessionValid: false, refused: true)
         h.clamshell.closed = false
         h.display.brightness = 0
         h.keyboard.throwOnRead = true
-        let m = h.makeManager(keptRecheckDelay: .milliseconds(20), keptRecheckAttempts: 2)
+        let m = h.makeManager(keptRecheckDelay: .milliseconds(20), keptRecheckAttempts: 2, keptRecheckSlowDelay: .milliseconds(20))
 
         await m.reconcile()
-        try await waitFor { self.logText().contains("still so after 2 readings") }
+        let last = "still so after 2 readings, so it is read again every"
+        try await waitFor { self.logText().contains(last) }
+        try await Task.sleep(for: .milliseconds(100))
 
         XCTAssertEqual(h.keyboard.sets, [])
         XCTAssertEqual(h.display.sets.first, 0.8)
@@ -570,8 +585,42 @@ final class RefusedDarkeningTests: XCTestCase {
         XCTAssertTrue(after.keyboardRestoreRefused)
         XCTAssertNil(after.savedDisplayBrightness)
         XCTAssertTrue(logText().contains("keyboard backlight 0.3, kept after a refused restore, not read: it could not be read"), logText())
-        XCTAssertTrue(logText().contains("still so after 2 readings, so it stays kept for the next lid open, lid close or launch"), logText())
+        XCTAssertEqual(logText().components(separatedBy: last).count - 1, 1, "logged once, not at every slow read: \(logText())")
         XCTAssertFalse(after.isDirty)
+
+        h.keyboard.throwOnRead = false
+        h.keyboard.brightness = 0
+        try await waitFor { try self.h.store.loadState()?.savedKeyboardBrightness == nil }
+
+        XCTAssertEqual(h.keyboard.sets.first, 0.3, "still at the level the close left, so the kept value is written")
+        XCTAssertFalse(try XCTUnwrap(try h.store.loadState()).keyboardRestoreRefused)
+    }
+
+    /// The recovery lock is busy at a re-read: that read is skipped, not
+    /// the ones after it, and the entry is decided once the lock is free.
+    func testABusyLockSkipsOneReReadNotTheRest() async throws {
+        try seedSavedBrightness(sessionValid: false, refused: true)
+        h.clamshell.closed = false
+        h.display.brightness = 0.6
+        h.keyboard.brightness = 0
+        h.keyboard.suppressedOrDimmed = true
+        let m = h.makeManager(lockTimeout: 0.05, keptRecheckDelay: .milliseconds(50), keptRecheckSlowDelay: .milliseconds(20))
+
+        await m.reconcile()
+        let held = try XCTUnwrap(try RecoveryLock(url: h.home.paths.recoveryLock).tryAcquire())
+        h.keyboard.brightness = 0.6
+        h.keyboard.suppressedOrDimmed = false
+        try await waitFor { self.logText().contains("brightness re-check skipped, nothing changed") }
+
+        XCTAssertTrue(logText().contains("brightness re-check skipped, nothing changed"), logText())
+        XCTAssertEqual(try h.store.loadState()?.savedKeyboardBrightness, 0.3)
+
+        held.release()
+        try await waitFor { try self.h.store.loadState()?.savedKeyboardBrightness == nil }
+
+        XCTAssertEqual(h.keyboard.sets, [], "the level set since is not overwritten")
+        XCTAssertNil(try h.store.loadState()?.savedKeyboardBrightness)
+        XCTAssertTrue(logText().contains("keyboard backlight reads 0.6, set since its restore to 0.3 was refused; left as set, and the saved value cleared"), logText())
     }
 
     /// The guard allows the call now but the write fails: an ordinary

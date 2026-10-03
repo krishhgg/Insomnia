@@ -150,22 +150,25 @@ for backstop.sh or uninstall.sh, nor for the app while the guard refuses
 its device. Nothing on that build can restore it, and counting it would
 post "Restore incomplete" at every end and launch, fail the backstop every
 minute, and stop uninstall for good. It also does not hold back a new
-session or Quit. The app tries again at every lid open and launch, with or
-without a session. On a build or macOS where the guard allows the call, it
-reads the device first. Only a reading macOS is not holding down counts. A
-display asleep reads its idle-dim value, and a keyboard backlight
-suppressed after the wake, or idle-dimmed, reads 0 at any level. Such a
-reading decides nothing, and neither does a read that fails or a keyboard
-that reads as absent. The entry then stays as it is. The app reads it
-again every 3 s, up to 20 times, while the lid is known to be open, and
-after that at the next lid open, lid close or launch. An end does not
-count a waiting entry as not restored, since nothing failed. The close
-left the device at 0, so a reading above 0 is a level set since, as the
-error asked: the darkening is already undone, and the entry is cleared
-without a write rather than overwrite that level. A device still at 0 gets
-the saved value and both keys are cleared. A failed write there clears the
-flag, and the entry is retried like any failed restore; if the flag cannot
-be cleared either, the end still counts the entry as not restored. A lid
+session or Quit. The app tries again at every lid open during a session,
+at every end, and at every launch, with or without a session. On a build
+or macOS where the guard allows the call, it reads the device first. Only
+a reading macOS is not holding down counts. A display asleep reads its
+idle-dim value, and a keyboard backlight suppressed after the wake, or
+idle-dimmed, reads 0 at any level. Such a reading decides nothing, and
+neither does a read that fails or a keyboard that reads as absent. The
+entry then stays as it is. The app reads it again every 3 s, 20 times, and
+then every minute for as long as it waits and the app runs, since outside
+a session nothing else acts on a lid open. While the lid is not known to
+be open it reads nothing, and the 3 s reads start again once it is. A busy
+recovery lock skips one read, not the rest. An end does not count a
+waiting entry as not restored, since nothing failed. The close left the
+device at 0, so a reading above 0 is a level set since, as the error
+asked: the darkening is already undone, and the entry is cleared without a
+write rather than overwrite that level. A device still at 0 gets the saved
+value and both keys are cleared. A failed write there clears the flag, and
+the entry is retried like any failed restore; if the flag cannot be
+cleared either, the end still counts the entry as not restored. A lid
 close that can read the device clears the flag too: it keeps the earlier
 saved value while the device reads 0, and saves the new level when it
 reads above 0. Uninstall goes ahead past a flagged entry, prints the saved

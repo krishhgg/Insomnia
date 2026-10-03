@@ -569,7 +569,8 @@ struct Harness {
     /// `retryDelay` is long so the in-process retry never fires by accident;
     /// `reassertDelay` likewise, so the second display/keyboard write after
     /// a restore never lands in a test that did not ask for it, and
-    /// `keptRecheckDelay` for the re-read of a kept brightness.
+    /// `keptRecheckDelay` and `keptRecheckSlowDelay` for the re-read of a
+    /// kept brightness.
     /// `display` and `keyboard` replace the harness fakes, for a device
     /// the private-call guard refuses.
     func makeManager(
@@ -578,6 +579,7 @@ struct Harness {
         reassertDelay: Duration = .seconds(3600),
         keptRecheckDelay: Duration = .seconds(3600),
         keptRecheckAttempts: Int = 20,
+        keptRecheckSlowDelay: Duration = .seconds(3600),
         display: (any DisplayDimming)? = nil,
         keyboard: (any KeyboardBacklighting)? = nil
     ) -> SessionManager {
@@ -599,7 +601,8 @@ struct Harness {
             recoveryRetryDelay: retryDelay,
             reassertDelay: reassertDelay,
             keptRecheckDelay: keptRecheckDelay,
-            keptRecheckAttempts: keptRecheckAttempts
+            keptRecheckAttempts: keptRecheckAttempts,
+            keptRecheckSlowDelay: keptRecheckSlowDelay
         )
     }
 }
