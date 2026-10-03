@@ -212,7 +212,9 @@ installation scenarios still need [release validation](docs/release-validation.m
   stopped is never resumed. If the confirming write fails, the app sends
   SIGCONT at once to each pid it just stopped whose identity still matches,
   even one that does not show as stopped yet: SIGCONT also cancels a stop
-  that is still pending. If the app dies between the stop and that write,
+  that is still pending. It then drops those entries from the journal,
+  shows the failure in the status menu, and stops counting them as frozen
+  even if the disk refuses that write too. If the app dies between the stop and that write,
   the stopped pids stay journaled without identity, like entries from builds
   that recorded the pid alone, and are not automatically resumed while
   stopped. Verify the live process and whether it should be resumed; never

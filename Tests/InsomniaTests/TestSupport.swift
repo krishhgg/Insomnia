@@ -222,6 +222,8 @@ final class FakeProcessControl: ProcessSignaling, @unchecked Sendable {
     /// Called synchronously inside `suspend`, so a test can inspect disk
     /// at the moment the side effect happens.
     var onSuspend: (@Sendable ([Int32]) -> Void)?
+    /// Called synchronously at the start of `cancelStops`.
+    var onCancelStops: (@Sendable ([Int32]) -> Void)?
 
     /// The pending SIGSTOPs take effect.
     func deliverPendingStops() {
@@ -249,7 +251,8 @@ final class FakeProcessControl: ProcessSignaling, @unchecked Sendable {
     }
 
     func cancelStops(_ processes: [FrozenProcess]) -> ResumeReport {
-        lock.withLock {
+        onCancelStops?(processes.map(\.pid))
+        return lock.withLock {
             _cancelled.append(processes.map(\.pid))
             var report = ResumeReport()
             for p in processes {

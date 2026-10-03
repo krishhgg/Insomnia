@@ -150,13 +150,20 @@ Freeze scope rules:
   candidates by app name, de-duplicated. One info log line names the
   automatic candidates on each close.
 - Each app's pids are journaled before the SIGSTOP, without identity; if
-  that write fails the app is left running. Recovery never signals an entry
-  without identity. After the SIGSTOP one write gives the pids the kernel
-  stopped their identity (start time to the microsecond, boot session) and
-  drops the pids it would not stop, so a process somebody else had stopped
-  is never claimed. If that write fails, the app resumes the pids it just
-  stopped. If the app dies before it, the stopped pids stay journaled
-  without identity and are reported for a person to check.
+  that write fails the app is left running and the status menu shows the
+  failure. Recovery never signals an entry without identity. After the
+  SIGSTOP one write gives the pids the kernel stopped their identity (start
+  time to the microsecond, boot session) and drops the pids it would not
+  stop, so a process somebody else had stopped is never claimed. If that
+  write fails, the app sends SIGCONT to each pid it just stopped whose
+  identity still matches, stopped yet or not (SIGCONT also cancels a stop
+  that is still pending), then removes that app's entries and any Docker
+  flag the freeze set, keeping only pids it could not resume. The status
+  menu shows the failure and counts only those pids as frozen, even while
+  the disk refuses the removal; the next journal write that succeeds
+  carries it. If the app dies before the confirming write, the stopped
+  pids stay journaled without identity and are reported for a person to
+  check.
 - Only pids Insomnia stopped are resumed. An app launched while the lid is
   closed is left alone.
 - Electron apps are stopped as a whole process tree (main + helpers), found

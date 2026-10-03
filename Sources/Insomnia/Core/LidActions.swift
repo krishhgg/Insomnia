@@ -223,13 +223,16 @@ final class LidActions {
         // skips, cannot be resumed from this entry wherever the app dies.
         // If this write fails nothing is signaled.
         let provisional = candidates.map { FrozenProcess(pid: $0.pid, identity: nil) }
+        // Whether this freeze is the one that sets the Docker flag, so an
+        // undo below clears only a flag it set.
+        let setsDockerFlag = docker && !manager.effectiveState.dockerFrozen
         do {
             try manager.journal { s in
                 s.frozenProcesses.append(contentsOf: provisional)
                 if docker { s.dockerFrozen = true }
             }
         } catch {
-            Log.error("could not journal freeze of \(group.bundleId): \(error.localizedDescription); \(candidates.count) pid(s) left running")
+            manager.fail("lid close: could not journal the freeze of \(group.name) (\(group.bundleId)): \(error.localizedDescription); its \(candidates.count) pid(s) were left running")
             return
         }
         let report = freezer.suspend(candidates, expectedParents: group.expectedParents)
@@ -254,12 +257,24 @@ final class LidActions {
             // does not show as stopped yet, since its SIGSTOP may still be
             // pending; resume would call that one running and skip it,
             // leaving it to stop a moment later with nothing to resume it.
-            // The provisional entries stay without identity; on lid open a
-            // resumed pid is running and clears as gone, and a skipped one
-            // is never signaled.
             let undo = freezer.cancelStops(confirmed)
             let stuck = undo.failed + undo.unverifiable + undo.unobserved
-            Log.error("could not confirm freeze of \(group.bundleId) in the journal: \(error.localizedDescription); resumed \(undo.resumed.count) of the \(confirmed.count) pid(s) it had just stopped" + (stuck.isEmpty ? "" : "; pid(s) \(stuck.map(String.init).joined(separator: ", ")) are still stopped, journaled without identity"))
+            // Every provisional entry but the stuck ones now names a pid
+            // that runs: resumed, gone, or never stopped by this freeze.
+            // They leave the journal, and so does a Docker flag this
+            // freeze set, unless part of Docker is still stopped. If the
+            // disk refuses that write too, the status leaves them out
+            // until a later write takes them off. The stuck ones stay
+            // without identity, are never signaled, and lid open reports
+            // them if they are still stopped.
+            manager.clearUndoneFreeze(.init(
+                pids: candidatePids.subtracting(stuck),
+                docker: setsDockerFlag && stuck.isEmpty
+            ))
+            let outcome = stuck.isEmpty
+                ? "so this freeze of \(group.name) is undone"
+                : "and pid(s) \(stuck.map(String.init).joined(separator: ", ")) may still be stopped; they stay journaled without identity, so Insomnia will not resume them, and lid open reports the ones still stopped"
+            manager.fail("lid close: could not confirm the freeze of \(group.name) (\(group.bundleId)) in the journal: \(error.localizedDescription); resumed \(undo.resumed.count) of the \(confirmed.count) pid(s) it had just stopped, \(outcome)")
             return
         }
         Log.info("froze \(group.name) (\(report.suspended.count) pid(s), \(report.skipped.count) skipped)")
