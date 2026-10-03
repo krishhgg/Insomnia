@@ -111,7 +111,7 @@ final class NetworkFailoverDriverTests: XCTestCase {
     /// whose tmux runner is a fake. The NWPathMonitor itself is not started.
     func testRecoveryAboveThresholdNudgesAndNotifies() async throws {
         let nudged = Locked<[String]>([])
-        let nudge = TmuxNudge { target in
+        let nudge = TmuxNudge { target, _ in
             nudged.value.append(target)
             return true
         }
@@ -136,9 +136,32 @@ final class NetworkFailoverDriverTests: XCTestCase {
         XCTAssertTrue(log.contains("gap=130s"), log)
     }
 
+    /// Whether Enter follows `continue` is read from the config at nudge
+    /// time and handed to the runner; the default is no Enter.
+    func testNudgePassesTheEnterSettingFromConfig() async throws {
+        for pressEnter in [false, true] {
+            let seen = Locked<[Bool]>([])
+            let nudge = TmuxNudge { _, enter in
+                seen.value.append(enter)
+                return true
+            }
+            var config = Config()
+            config.tmuxTargets = ["agents:0.0"]
+            config.tmuxNudgePressesEnter = pressEnter
+            let clock = FakeClock(Date(timeIntervalSince1970: 1_800_000_000))
+            let n = NetworkFailover(paths: home.paths, keychain: FakeKeychainStore(), nudge: nudge, notifier: RecordingNotifier(), clock: { clock.now }) { config }
+
+            await n.simulate(satisfied: false)
+            clock.advance(130)
+            await n.simulate(satisfied: true)
+
+            XCTAssertEqual(seen.value, [pressEnter])
+        }
+    }
+
     func testRecoveryBelowThresholdLogsOnly() async throws {
         let nudged = Locked<[String]>([])
-        let nudge = TmuxNudge { target in
+        let nudge = TmuxNudge { target, _ in
             nudged.value.append(target)
             return true
         }
@@ -161,7 +184,7 @@ final class NetworkFailoverDriverTests: XCTestCase {
 
     func testRecoveryAtThresholdNudgesAndNotifies() async throws {
         let nudged = Locked<[String]>([])
-        let nudge = TmuxNudge { target in
+        let nudge = TmuxNudge { target, _ in
             nudged.value.append(target)
             return true
         }

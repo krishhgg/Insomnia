@@ -169,7 +169,12 @@ The defaults are worth knowing:
 
 To exercise the lid actions without closing the lid, run
 `scripts/simulate-lid.sh closed` and then `scripts/simulate-lid.sh open` during
-a session; the app runs the same actions it would on a real lid event.
+a session; the app runs the same actions it would on a real lid event. Only a
+build with the file watcher compiled in reads that trigger: a debug build, or
+a release build installed with `INSOMNIA_LID_SIMULATION=1 ./scripts/install.sh`.
+A normal install has no watcher, so no program running as your user can replay
+the lid actions by writing a file. A build that has it logs "Lid simulation
+build" at launch and shows the same line in the status menu and in Settings.
 
 ## How recovery works
 
@@ -184,7 +189,19 @@ has passed. It leaves a valid, unexpired session alone.
 
 The app and backstop use the same lock so they do not restore and rewrite the
 journal over one another. Failed restoration keeps the relevant entries;
-unreadable journals are preserved instead of treated as clean.
+unreadable journals are preserved instead of treated as clean. A session file
+that does not parse counts as expired and is renamed to
+`session.json.unreadable-<time>` beside it, never deleting or overwriting
+anything: the app does this at launch, before restoring whatever the journal
+holds, and says where the file went; the agent does it once the journal is
+clean. A session file that cannot be read at all (permissions, or not a
+regular file, which is never opened) also counts as expired, since its end
+time is unknown: the journal is restored and the file is renamed the same
+way without being opened, so a later launch cannot resume a session that
+was treated as ended. The app says where it went. If the rename fails, the
+app keeps trying it and will not quit until the file is gone.
+`uninstall.sh --purge` removes the renamed copies that are regular files;
+without `--purge` they stay.
 
 **Recovery is not “everything always gets undone.”** The backstop does not
 monitor battery or temperature. Saved audio needs the app to reopen, and
@@ -244,11 +261,22 @@ when-in-use grant, so System Settings records it as Location Services access
 for Insomnia. Insomnia uses it only to read Wi-Fi network names through
 CoreWLAN and never requests your location.
 
-Configured tmux targets opt into sending `continue` followed by Enter after a
-long outage (90 seconds by default). The default target list is empty. Use
-dedicated, disposable agent panes: pending text is opaque to Insomnia, and
-Enter can submit it too. Ending a session cancels pending automation but cannot
-retract keystrokes already sent.
+After a long outage (90 seconds by default) Insomnia types `continue` into
+each configured tmux target. The default target list is empty, and a listed
+pane is only nudged if you have marked it yourself, with a pane option that
+is read again before every send:
+
+```bash
+tmux set-option -p -t <session:window.pane> @insomnia-nudge on
+```
+
+Mark a dedicated, disposable agent pane, not one you type in, because pending
+text is opaque to Insomnia. Enter is off by default, so the word is typed and
+nothing submits it. Turn on "Press Enter after continue" in Settings to submit
+it, knowing that Enter also submits anything already typed in that pane. The
+option must be on the pane itself (`-p`). One set on the session or window
+does not count. Pane options need tmux 3.0 or later. Ending a session cancels
+pending automation but cannot retract keystrokes already sent.
 
 </details>
 

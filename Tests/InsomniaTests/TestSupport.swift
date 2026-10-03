@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+import InsomniaTestHome
 @testable import Insomnia
 
 actor AsyncGate {
@@ -30,7 +31,32 @@ actor AsyncGate {
     }
 }
 
+/// The throwaway INSOMNIA_HOME the InsomniaTestHome loader set when this
+/// bundle loaded, before XCTest discovered any test. `Log.append` and
+/// `SessionManager.live` read the variable at call time and fall back to
+/// the real ~/Library when it is unset, so it is set at load and never
+/// unset again. A TempHome moves it to a per-test directory and moves it
+/// back here on destroy, so work that outlives its test (a lifecycle task
+/// draining after teardown, a reassert timer) still lands in a temp
+/// directory. The loader removes the directory when the process exits.
+enum ProcessTestHome {
+    static let root: URL = {
+        guard let raw = insomnia_test_home_root() else {
+            fatalError("InsomniaTestHome did not run at load; refusing to test against the real ~/Library")
+        }
+        return URL(fileURLWithPath: String(cString: raw), isDirectory: true)
+    }()
+
+    /// Where INSOMNIA_HOME points right now, as the app would resolve it.
+    static var current: String? {
+        guard let value = getenv(Paths.environmentKey) else { return nil }
+        return String(cString: value)
+    }
+}
+
 /// Creates a temp INSOMNIA_HOME and points the process environment at it.
+/// `destroy()` hands the variable back to `ProcessTestHome` rather than
+/// unsetting it, so nothing falls through to the real ~/Library afterwards.
 final class TempHome {
     let root: URL
     let paths: Paths
@@ -44,7 +70,7 @@ final class TempHome {
     }
 
     func destroy() {
-        unsetenv(Paths.environmentKey)
+        setenv(Paths.environmentKey, ProcessTestHome.root.path, 1)
         try? FileManager.default.removeItem(at: root)
     }
 }
@@ -603,4 +629,50 @@ private final class MainActorFlag {
 @MainActor
 func settleQueuedRequests() async {
     for _ in 0..<5 { await Task.yield() }
+}
+
+/// A FIFO at `url`, and a watchdog for it. Correct code never opens it. If
+/// something does, open(2) blocks until a writer appears; the watchdog opens
+/// the FIFO for writing once a second, which lets a blocked reader through
+/// (it reads EOF) and records that a reader was there. A regression then
+/// fails its test instead of hanging the suite.
+final class FIFOWatch: @unchecked Sendable {
+    let url: URL
+    private let lock = NSLock()
+    private var stopped = false
+    private var seen = false
+
+    init(at url: URL) throws {
+        self.url = url
+        guard mkfifo(url.path, 0o600) == 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        let path = url.path
+        Thread.detachNewThread { [self] in
+            for _ in 0..<120 {
+                Thread.sleep(forTimeInterval: 1)
+                if self.isStopped { return }
+                // Succeeds only while a reader has the FIFO open.
+                let fd = open(path, O_WRONLY | O_NONBLOCK)
+                if fd >= 0 {
+                    close(fd)
+                    self.markSeen()
+                }
+            }
+        }
+    }
+
+    /// True when something opened the FIFO for reading.
+    var readerSeen: Bool { lock.lock(); defer { lock.unlock() }; return seen }
+
+    /// True when the path is still this FIFO, not moved or replaced.
+    var isStillFIFO: Bool {
+        var info = stat()
+        return lstat(url.path, &info) == 0 && info.st_mode & S_IFMT == S_IFIFO
+    }
+
+    func stop() { lock.lock(); stopped = true; lock.unlock() }
+
+    private var isStopped: Bool { lock.lock(); defer { lock.unlock() }; return stopped }
+    private func markSeen() { lock.lock(); seen = true; lock.unlock() }
 }

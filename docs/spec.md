@@ -338,8 +338,14 @@ provided by the standalone backstop. Performance effects depend on workload.
 - Each outage is logged with start, end, and gap length to
   `~/Library/Logs/Insomnia/handoffs.log`. The menu shows the last gap.
 - Path satisfied again after a gap longer than `nudgeThreshold` (default 90 s):
-  - For every tagged tmux target (`session:window.pane`), run
-    `tmux send-keys -t <target> "continue" Enter`.
+  - For every configured tmux target (`session:window.pane`), resolve the
+    concrete pane, read its state and then its mark, the pane-scoped user
+    option `@insomnia-nudge` (`show-options -qpv -t %N`, without `-A`, so
+    a session or window option never counts). Only a pane marked `on` by
+    the user (`tmux set-option -p -t <target> @insomnia-nudge on`) gets
+    `tmux send-keys -t %N continue`, followed by `Enter` only when
+    `tmuxNudgePressesEnter` is on (default off). An unmarked pane is
+    skipped and logged.
   - Post a notification: "Network was down 2m 10s. Nudged 2 tmux panes.
     Check GUI agents."
 - Recommended one-time setting, documented in the README: System Settings >
@@ -359,6 +365,29 @@ Reconcile runs at every Insomnia launch:
    verified owned processes, Low Power Mode if we set it, saved audio, and
    recorded App Nap values.
    Unverified entries and failed restoration remain unresolved, not successful.
+   A session file that does not decode counts as expired: it is renamed under
+   the lock to `session.json.unreadable-<UTC stamp>` (never deleted, never
+   overwriting an earlier copy), the user is told where, and the journal is
+   restored as with no session. `backstop.sh` does the same once the journal
+   is clean. A session file that decodes as JSON but lacks a key or type
+   the `Session` decoder needs (`startedAt`, `endsAt`, `extensions`) is not
+   a session either; `backstop.sh` checks the same keys and types, and
+   reads dates only in the form Store writes. A session file that exists
+   but cannot be read at all, or is not a regular file (never opened: a
+   FIFO would block under the lock), has no end time that can be enforced,
+   so it also counts as expired and the journal is restored. It may have
+   been a valid session, so it is never opened or removed: it is renamed
+   aside the same way (the app at once, `backstop.sh` once the journal is
+   clean), which keeps it as evidence and keeps a later launch from
+   resuming a session that was treated as ended. The app notifies with the
+   new path. If the rename fails the file stays and a start is refused
+   while it is there. Every end then restores the journal and tries the
+   rename again; while it fails the end is not finished, so quit is refused
+   and the end is retried, because the file would be resumed if it became
+   readable in place. The messages say to remove it or move it out of the
+   folder. `backstop.sh` tries the rename again on every run.
+   An unreadable journal still refuses every transaction and leaves both
+   files in place.
 2. Session valid → establish the independent recovery agent before reapplying
    the sleep guard, then resume observers. If the lid is open, restore recorded
    lid-close actions. Arming or restoration errors must remain visible.
@@ -411,7 +440,7 @@ small settings window:
 - agent list (bundle ids), turn App Nap off for them on/off (default off)
 - `lowPowerFloor`, `endFloor`, thermal rules on/off
 - hotspot SSID (password entered once, stored in Keychain), `nudgeThreshold`
-- tmux targets
+- tmux targets, `tmuxNudgePressesEnter` (default off)
 - launch at login (`SMAppService.mainApp`). macOS ties the login item to
   the bundle's signature and location, and `install.sh` ad-hoc signs a
   fresh bundle on every run, so an upgrade can drop the registration.
@@ -622,7 +651,8 @@ Insomnia/
     install.sh             build, bundle, codesign, sudoers, launchd, login item
     uninstall.sh           reverse all of the above, restore sleep
     backstop.sh            standalone restore from JSON
-    simulate-lid.sh        file trigger for the lid-close action path
+    simulate-lid.sh        file trigger for the lid-close action path (debug and
+                           INSOMNIA_LID_SIMULATION=1 builds only)
   docs/spec.md
   README.md                setup, hotspot setting, Chrome note
 ```
@@ -666,8 +696,11 @@ that any case passed; record results in the release validation record.
    shows the SSID. Turn off the router or walk away, watch `handoffs.log`, and
    confirm the hotspot join works within ~10 s and a Claude Code turn in flight
    completes.
-10. **Nudge.** Gap forced above threshold → tagged tmux pane receives
-   "continue", notification posted.
+10. **Nudge.** Mark a disposable pane (`tmux set-option -p -t <target>
+   @insomnia-nudge on`). Gap forced above threshold → that pane receives
+   "continue" and no Enter; an unmarked listed pane receives nothing;
+   with "Press Enter after continue" on, the line is submitted.
+   Notification posted.
 11. **Floors.** Set `lowPowerFloor` above current charge → Low Power Mode on.
     Plug in charger → off. Set `endFloor` above current charge → session ends.
 12. **Thermal.** Exercise injected thermal events first; verify responses to
@@ -677,6 +710,15 @@ that any case passed; record results in the release validation record.
     `savedKeyboardBrightness`). Open → both back, journal entries gone. Repeat
     with the lid open using `scripts/simulate-lid.sh closed` then `open`
     during a session; the log shows `lid SIMULATED closed (file trigger)`.
+    That needs a build with the watcher compiled in (installed with
+    `INSOMNIA_LID_SIMULATION=1 ./scripts/install.sh`; it logs "Lid
+    simulation build" at launch). A normal install ignores the trigger:
+    the watcher is compiled out so a file written by any other program
+    running as the user cannot replay the lid actions. CI proves that on
+    the binaries: `scripts/check-lid-simulation-gate.sh` builds the release
+    both ways and checks the watcher class and its log lines are absent
+    from the plain binary and present with the define. A binary nm or
+    strings cannot read fails the check rather than counting as absent.
     Quit while closed → both restored. Force-quit while closed, reopen the app
     → restored at reconcile, and `backstop.sh` alone leaves both keys in place.
 14. **App Nap.** With the setting on and Terminal on the agent list, `defaults
