@@ -108,10 +108,21 @@ final class ReleaseWorkflowTests: XCTestCase {
         let buildStart = try XCTUnwrap(ls.firstIndex(of: "  build:"))
         let releaseStart = try XCTUnwrap(ls.firstIndex(of: "  release:"))
         XCTAssertLessThan(buildStart, releaseStart)
-        let build = ls[buildStart..<releaseStart].joined(separator: "\n")
+        let buildLines = Array(ls[buildStart..<releaseStart])
+        let build = buildLines.joined(separator: "\n")
         let release = ls[releaseStart...].joined(separator: "\n")
-        XCTAssertTrue(build.contains("    permissions:\n      contents: read\n"), "build job is read-only")
-        XCTAssertNil(build.range(of: #"^\s+[\w-]+: write"#, options: .regularExpression), "no write scope in the build job")
+        // The build job's one permissions key is a block whose entries are
+        // exactly `contents: read`, so a scope added on any later line, or
+        // an inline map or write-all in its place, fails here.
+        let keys = buildLines.indices.filter { buildLines[$0].hasPrefix("    permissions:") }
+        XCTAssertEqual(keys.count, 1, "one permissions key in the build job")
+        let key = try XCTUnwrap(keys.first)
+        XCTAssertEqual(buildLines[key], "    permissions:", "a block, not an inline map or write-all")
+        let scopes = buildLines[(key + 1)...]
+            .prefix { $0.hasPrefix("      ") }
+            .map { $0.split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false)[0].trimmingCharacters(in: .whitespaces) }
+        XCTAssertEqual(scopes, ["contents: read"], "the build job only reads the repository")
+        XCTAssertNil(build.range(of: #"(?m)^\s+[\w-]+:\s*write"#, options: .regularExpression), "no write scope on any line of the build job")
         for scope in ["contents: write", "id-token: write", "attestations: write"] {
             XCTAssertTrue(release.contains("      \(scope)"), "release job needs \(scope)")
         }
