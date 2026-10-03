@@ -83,7 +83,7 @@ final class ReconcileTests: XCTestCase {
 
     // (c) no session, no journal entry, but pmset reports SleepDisabled:
     // something else set it. Left alone, reported once with the command to
-    // undo it; an Insomnia session's end still sets it to 0 as always.
+    // undo it, and Start is refused while it stays.
     func testNoSessionButSleepDisabledIsLeftAloneAndReported() async throws {
         h.guardFake.sleepDisabled = true
         let m = h.makeManager()
@@ -102,8 +102,19 @@ final class ReconcileTests: XCTestCase {
         XCTAssertEqual(h.notifier.posts.count, 1)
         XCTAssertEqual(m.foreignSleepWarning, SessionManager.foreignSleepLine)
 
-        // Insomnia's own session clears the line, and its end sets the bit to 0.
+        // Start leaves the bit alone too: it is refused with nothing run.
         await m.start(duration: 3600)
+        XCTAssertNil(m.session)
+        XCTAssertEqual(h.guardFake.calls.filter { $0.hasPrefix("disablesleep") }, [])
+        XCTAssertTrue(h.guardFake.sleepDisabled)
+        XCTAssertEqual(m.foreignSleepWarning, SessionManager.foreignSleepLine)
+        XCTAssertTrue(try XCTUnwrap(m.lastError).contains("sleep is already off"), m.lastError ?? "")
+
+        // Once its owner turns sleep back on, a session starts and clears
+        // the line, and its end sets the bit to 0.
+        h.guardFake.sleepDisabled = false
+        await m.start(duration: 3600)
+        XCTAssertTrue(m.isActive)
         XCTAssertNil(m.foreignSleepWarning)
         XCTAssertNil(m.lastError)
         _ = await m.end(reason: .user)

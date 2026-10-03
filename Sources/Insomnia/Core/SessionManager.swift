@@ -447,8 +447,12 @@ final class SessionManager {
             // Once the dialog has turned sleep off, only the passwordless
             // rule can turn it back on: this app's end and backstop.sh
             // both run `sudo -n`. Without the rule they would fail at the
-            // deadline and leave sleep off, so no dialog is shown.
-            try await sleepGuard.checkPasswordlessRestore()
+            // deadline and leave sleep off, so no dialog is shown. The
+            // check runs that restore while sleep is on, or when the
+            // journal already owes it, and otherwise refuses while sleep
+            // is off: a setting someone else made stays, as it does after
+            // a cancelled dialog.
+            try await sleepGuard.checkPasswordlessRestore(sleepOffIsOurs: state.sleepDisabledByUs)
         } catch {
             fail("start refused, nothing changed: \(error.localizedDescription)")
             notifier.post(title: Self.endTitle(.startFailed, had: false), body: "Nothing was changed: \(error.localizedDescription).")
@@ -1426,9 +1430,9 @@ final class SessionManager {
     /// entry: something other than Insomnia disabled sleep, and only its
     /// owner should re-enable it. Shown on its own menu line on every
     /// reconcile that finds it, and posted as a notification once per
-    /// launch. The line is cleared by the next session start, whose end
-    /// sets `disablesleep 0` whoever set the bit, or by a recheck that
-    /// reads the bit as 0.
+    /// launch. Start is refused while the bit reads 1 (see
+    /// `checkPasswordlessRestore`), so the line is cleared by a recheck
+    /// that reads it as 0, or by a session start that found it 0.
     private func reportForeignSleepDisable() {
         foreignSleepWarning = Self.foreignSleepLine
         guard !announcedForeignSleep else {
@@ -1439,7 +1443,7 @@ final class SessionManager {
         Log.info("reconcile: \(Self.foreignSleepLine)")
         notifier.post(
             title: Self.foreignSleepTitle,
-            body: "pmset reports SleepDisabled 1, but Insomnia has no session and did not set it, so it is left alone. To re-enable sleep: \(Self.foreignSleepCommand). Ending an Insomnia session also sets it to 0."
+            body: "pmset reports SleepDisabled 1, but Insomnia has no session and did not set it, so it is left alone. To re-enable sleep: \(Self.foreignSleepCommand). Insomnia cannot start a session until then."
         )
     }
 

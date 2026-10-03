@@ -633,6 +633,96 @@ final class PendingStartRemovalTests: XCTestCase {
 
 /// PmsetSleepGuard routes only `disablesleep 1` through the dialog. Its
 /// `sudo -n` paths run the real sudo and are not exercised here.
+/// A fake sudo and a fake pmset in a temp directory, for PmsetSleepGuard's
+/// restore check. Both record their arguments; neither runs anything.
+///
+/// The sudo answers the way the sudoers policy named by `policy` would:
+/// - `rule`: /etc/sudoers.d/insomnia is in effect, so the restore runs
+///   without a password.
+/// - `list-only`: no rule, but another passwordless entry lets `sudo -l`
+///   list without a password, and the admin group's password rule covers
+///   pmset, so running it needs the password.
+/// - `cached`: the same after a recent sudo in a terminal left a cached
+///   credential: everything passes unless `-k` makes sudo ignore it.
+/// - anything else: everything needs a password.
+/// Without `-n` it would have prompted, which fails too.
+///
+/// The pmset prints `SleepDisabled` as `sleepDisabled` says, or exits 1
+/// for `fail`.
+final class FakeRestoreTools: @unchecked Sendable {
+    let sudo: String
+    let pmset: String
+    private let sudoLog: URL
+    private let pmsetLog: URL
+    private let policyFile: URL
+    private let stateFile: URL
+
+    init(in dir: URL) throws {
+        sudo = dir.appendingPathComponent("fake-sudo").path
+        pmset = dir.appendingPathComponent("fake-pmset").path
+        sudoLog = dir.appendingPathComponent("sudo-calls")
+        pmsetLog = dir.appendingPathComponent("pmset-calls")
+        policyFile = dir.appendingPathComponent("sudo-policy")
+        stateFile = dir.appendingPathComponent("pmset-sleep-disabled")
+        try """
+        #!/bin/bash
+        printf '%s\\n' "$*" >> '\(sudoLog.path)'
+        policy="$(cat '\(policyFile.path)' 2>/dev/null)"
+        k=0; l=0; n=0
+        while [[ "$1" == -* ]]; do
+          case "$1" in -k) k=1 ;; -l) l=1 ;; -n) n=1 ;; esac
+          shift
+        done
+        if (( !n )); then echo "fake sudo: would have prompted" >&2; exit 2; fi
+        case "$policy" in
+          rule) exit 0 ;;
+          list-only) if (( l )); then echo "$*"; exit 0; fi ;;
+          cached) if (( l || !k )); then exit 0; fi ;;
+        esac
+        echo "sudo: a password is required" >&2
+        exit 1
+        """.write(toFile: sudo, atomically: true, encoding: .utf8)
+        try """
+        #!/bin/bash
+        printf '%s\\n' "$*" >> '\(pmsetLog.path)'
+        state="$(cat '\(stateFile.path)' 2>/dev/null)"
+        if [[ "$state" == fail ]]; then echo "pmset: could not read the settings" >&2; exit 1; fi
+        printf 'System-wide power settings:\\n SleepDisabled\\t\\t%s\\n' "${state:-0}"
+        """.write(toFile: pmset, atomically: true, encoding: .utf8)
+        for path in [sudo, pmset] {
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: path)
+        }
+    }
+
+    var policy: String {
+        get { (try? String(contentsOf: policyFile, encoding: .utf8)) ?? "" }
+        set { try! Data(newValue.utf8).write(to: policyFile) }
+    }
+
+    /// What the fake pmset reports: `0` (the default), `1` or `fail`.
+    var sleepDisabled: String {
+        get { (try? String(contentsOf: stateFile, encoding: .utf8)) ?? "0" }
+        set { try! Data(newValue.utf8).write(to: stateFile) }
+    }
+
+    func sudoCalls() -> [String] { Self.lines(sudoLog) }
+    func pmsetCalls() -> [String] { Self.lines(pmsetLog) }
+
+    func clearCalls() {
+        try? FileManager.default.removeItem(at: sudoLog)
+        try? FileManager.default.removeItem(at: pmsetLog)
+    }
+
+    func sleepGuard(prompt: any AdministratorPromptRunning = FakeAdministratorPrompt()) -> PmsetSleepGuard {
+        PmsetSleepGuard(prompt: prompt, sudoPath: sudo, pmsetPath: pmset)
+    }
+
+    private static func lines(_ url: URL) -> [String] {
+        guard let text = try? String(contentsOf: url, encoding: .utf8) else { return [] }
+        return text.split(separator: "\n").map(String.init)
+    }
+}
+
 final class PmsetSleepGuardPromptTests: XCTestCase {
     private var dir: URL!
 
@@ -652,56 +742,130 @@ final class PmsetSleepGuardPromptTests: XCTestCase {
         return start
     }
 
-    /// A sudo that records its arguments and answers as the mode file
-    /// says: `ok` as with the rule installed, anything else as `sudo -n`
-    /// does when a password would be needed.
-    private func fakeSudo() throws -> (path: String, calls: URL, mode: URL) {
-        let fake = dir.appendingPathComponent("fake-sudo")
-        let calls = dir.appendingPathComponent("sudo-calls")
-        let mode = dir.appendingPathComponent("sudo-mode")
-        try """
-        #!/bin/bash
-        printf '%s\\n' "$*" >> '\(calls.path)'
-        if [[ "$(cat '\(mode.path)' 2>/dev/null)" == ok ]]; then echo "$3 $4 $5 $6"; exit 0; fi
-        echo "sudo: a password is required" >&2
-        exit 1
-        """.write(to: fake, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fake.path)
-        return (fake.path, calls, mode)
+    /// The check runs, with -k and -n, the exact command `enableSleep`
+    /// runs, and only after `pmset -g` read SleepDisabled 0.
+    func testRestoreCheckRunsTheExactRestoreCommandWhileSleepIsOn() async throws {
+        let tools = try FakeRestoreTools(in: dir)
+        tools.policy = "rule"
+        try await tools.sleepGuard().checkPasswordlessRestore(sleepOffIsOurs: false)
+        XCTAssertEqual(tools.pmsetCalls(), ["-g"])
+        XCTAssertEqual(tools.sudoCalls(), ["-k -n /usr/bin/pmset -a disablesleep 0"])
+        XCTAssertEqual(PmsetSleepGuard.restoreArguments, ["-a", "disablesleep", "0"])
+        XCTAssertEqual(PmsetSleepGuard.restoreCheckCommand, "/usr/bin/sudo -k -n /usr/bin/pmset -a disablesleep 0")
     }
 
-    /// The check asks sudo, with -n, only to list the exact command
-    /// `enableSleep` runs; pmset itself is never run.
-    func testRestoreCheckListsTheExactRestoreCommand() async throws {
-        let sudo = try fakeSudo()
-        try Data("ok".utf8).write(to: sudo.mode)
-        let sleepGuard = PmsetSleepGuard(prompt: FakeAdministratorPrompt(), sudoPath: sudo.path)
-        try await sleepGuard.checkPasswordlessRestore()
-        XCTAssertEqual(try String(contentsOf: sudo.calls, encoding: .utf8), "-n -l /usr/bin/pmset -a disablesleep 0\n")
-        XCTAssertEqual(PmsetSleepGuard.restoreArguments, ["-a", "disablesleep", "0"])
+    /// No rule, but another passwordless entry lets `sudo -l` list the
+    /// command without a password while running it needs one: the check
+    /// fails, and it never lists.
+    func testRestoreCheckFailsWhenListingPassesButRunningNeedsAPassword() async throws {
+        let tools = try FakeRestoreTools(in: dir)
+        tools.policy = "list-only"
+        let listed = try await CancellableCommand().run(tools.sudo, ["-n", "-l", "/usr/bin/pmset", "-a", "disablesleep", "0"], timeout: 10)
+        XCTAssertTrue(listed.succeeded, "the fake must list without a password here, as sudo would")
+        tools.clearCalls()
+
+        do {
+            try await tools.sleepGuard().checkPasswordlessRestore(sleepOffIsOurs: false)
+            XCTFail("must throw")
+        } catch let PasswordlessRestoreError.notConfirmed(detail) {
+            XCTAssertEqual(detail, "exit 1: sudo: a password is required")
+        }
+        XCTAssertEqual(tools.sudoCalls(), ["-k -n /usr/bin/pmset -a disablesleep 0"])
+    }
+
+    /// A credential cached by a recent sudo would let the command run
+    /// without the rule; -k makes sudo ignore it, so the check fails.
+    func testRestoreCheckIgnoresACachedCredential() async throws {
+        let tools = try FakeRestoreTools(in: dir)
+        tools.policy = "cached"
+        let cached = try await CancellableCommand().run(tools.sudo, ["-n", "/usr/bin/pmset", "-a", "disablesleep", "0"], timeout: 10)
+        XCTAssertTrue(cached.succeeded, "the fake must run without -k here, as sudo would")
+        tools.clearCalls()
+
+        do {
+            try await tools.sleepGuard().checkPasswordlessRestore(sleepOffIsOurs: false)
+            XCTFail("must throw")
+        } catch let PasswordlessRestoreError.notConfirmed(detail) {
+            XCTAssertEqual(detail, "exit 1: sudo: a password is required")
+        }
+        XCTAssertEqual(tools.sudoCalls(), ["-k -n /usr/bin/pmset -a disablesleep 0"])
+    }
+
+    /// While sleep is already off the restore would change the setting, so
+    /// nothing is run and the check fails.
+    func testRestoreCheckRunsNothingWhileSleepIsAlreadyOff() async throws {
+        let tools = try FakeRestoreTools(in: dir)
+        tools.policy = "rule"
+        tools.sleepDisabled = "1"
+        do {
+            try await tools.sleepGuard().checkPasswordlessRestore(sleepOffIsOurs: false)
+            XCTFail("must throw")
+        } catch PasswordlessRestoreError.sleepAlreadyOff {
+            // expected
+        }
+        XCTAssertEqual(tools.pmsetCalls(), ["-g"])
+        XCTAssertEqual(tools.sudoCalls(), [])
+    }
+
+    /// A restore the journal owes is what the next end runs anyway, so it
+    /// runs without reading the setting, and still needs the rule.
+    func testRestoreCheckRunsTheRestoreTheJournalOwes() async throws {
+        let tools = try FakeRestoreTools(in: dir)
+        tools.policy = "rule"
+        tools.sleepDisabled = "1"
+        try await tools.sleepGuard().checkPasswordlessRestore(sleepOffIsOurs: true)
+        XCTAssertEqual(tools.pmsetCalls(), [])
+        XCTAssertEqual(tools.sudoCalls(), ["-k -n /usr/bin/pmset -a disablesleep 0"])
+
+        tools.policy = "list-only"
+        tools.clearCalls()
+        do {
+            try await tools.sleepGuard().checkPasswordlessRestore(sleepOffIsOurs: true)
+            XCTFail("must throw")
+        } catch PasswordlessRestoreError.notConfirmed {
+            // expected
+        }
+        XCTAssertEqual(tools.sudoCalls(), ["-k -n /usr/bin/pmset -a disablesleep 0"])
+    }
+
+    /// An unreadable setting is not taken for 0: nothing is run.
+    func testRestoreCheckRunsNothingWhenTheSleepSettingCannotBeRead() async throws {
+        let tools = try FakeRestoreTools(in: dir)
+        tools.policy = "rule"
+        tools.sleepDisabled = "fail"
+        do {
+            try await tools.sleepGuard().checkPasswordlessRestore(sleepOffIsOurs: false)
+            XCTFail("must throw")
+        } catch let error as PasswordlessRestoreError {
+            guard case .sleepSettingUnreadable = error else { return XCTFail("\(error)") }
+            let text = try XCTUnwrap(error.errorDescription)
+            XCTAssertTrue(text.hasPrefix("`pmset -g` could not be read ("), text)
+        }
+        XCTAssertEqual(tools.sudoCalls(), [])
     }
 
     /// A sudo that would want a password fails the check, and the error
-    /// carries what sudo said and the way to fix it.
+    /// carries the command, what sudo said and the way to fix it.
     func testRestoreCheckFailsWithoutTheRule() async throws {
-        let sudo = try fakeSudo()
-        let sleepGuard = PmsetSleepGuard(prompt: FakeAdministratorPrompt(), sudoPath: sudo.path)
+        let tools = try FakeRestoreTools(in: dir)
         do {
-            try await sleepGuard.checkPasswordlessRestore()
+            try await tools.sleepGuard().checkPasswordlessRestore(sleepOffIsOurs: false)
             XCTFail("must throw")
         } catch let error as PasswordlessRestoreError {
             let text = try XCTUnwrap(error.errorDescription)
+            XCTAssertTrue(text.contains("`/usr/bin/sudo -k -n /usr/bin/pmset -a disablesleep 0` did not confirm that"), text)
             XCTAssertTrue(text.contains("(exit 1: sudo: a password is required)"), text)
             XCTAssertTrue(text.hasSuffix("run scripts/install.sh again"), text)
         }
-        XCTAssertEqual(try String(contentsOf: sudo.calls, encoding: .utf8), "-n -l /usr/bin/pmset -a disablesleep 0\n")
+        XCTAssertEqual(tools.sudoCalls(), ["-k -n /usr/bin/pmset -a disablesleep 0"])
     }
 
     /// A sudo that cannot be started fails the check too.
     func testRestoreCheckFailsWhenSudoCannotRun() async throws {
-        let sleepGuard = PmsetSleepGuard(prompt: FakeAdministratorPrompt(), sudoPath: dir.appendingPathComponent("no-such-sudo").path)
+        let tools = try FakeRestoreTools(in: dir)
+        let sleepGuard = PmsetSleepGuard(prompt: FakeAdministratorPrompt(), sudoPath: dir.appendingPathComponent("no-such-sudo").path, pmsetPath: tools.pmset)
         do {
-            try await sleepGuard.checkPasswordlessRestore()
+            try await sleepGuard.checkPasswordlessRestore(sleepOffIsOurs: false)
             XCTFail("must throw")
         } catch let error as PasswordlessRestoreError {
             let text = try XCTUnwrap(error.errorDescription)
@@ -861,7 +1025,7 @@ final class SleepPromptLifecycleTests: XCTestCase {
         XCTAssertFalse(markerExists)
         let err = try XCTUnwrap(m.lastError)
         XCTAssertTrue(err.hasPrefix("start refused, nothing changed: sleep can only be turned off while it can be turned back on without a password"), err)
-        XCTAssertTrue(err.contains("sudo -n -l /usr/bin/pmset -a disablesleep 0"), err)
+        XCTAssertTrue(err.contains("/usr/bin/sudo -k -n /usr/bin/pmset -a disablesleep 0"), err)
         XCTAssertTrue(err.hasSuffix("run scripts/install.sh again"), err)
         let post = try XCTUnwrap(h.notifier.posts.last)
         XCTAssertEqual(post.title, "Session not started")
@@ -898,7 +1062,109 @@ final class SleepPromptLifecycleTests: XCTestCase {
         XCTAssertTrue(m.isActive)
         XCTAssertEqual(h.guardFake.restoreChecks, 1)
         XCTAssertEqual(seen.value, [], "the check ran after the start had begun to change things")
+        XCTAssertEqual(h.guardFake.lastSleepOffIsOurs, false)
         XCTAssertEqual(h.prompt.shown, 1)
+    }
+
+    // MARK: Start with the real restore check
+
+    /// The real PmsetSleepGuard against a fake sudo and pmset, with the
+    /// harness's dialog.
+    private func realGuard(policy: String, sleepDisabled: String = "0") throws -> FakeRestoreTools {
+        let dir = h.home.root.appendingPathComponent("fake-tools", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let tools = try FakeRestoreTools(in: dir)
+        tools.policy = policy
+        tools.sleepDisabled = sleepDisabled
+        return tools
+    }
+
+    private func assertRefusedUntouched(_ m: SessionManager, file: StaticString = #filePath, line: UInt = #line) throws {
+        XCTAssertEqual(h.prompt.shown, 0, "a dialog was shown", file: file, line: line)
+        XCTAssertEqual(h.backstop.arms, 0, file: file, line: line)
+        XCTAssertNil(m.session, file: file, line: line)
+        XCTAssertNil(try h.store.loadSession(), "session.json written", file: file, line: line)
+        XCTAssertNil(try h.store.loadState(), "state.json written", file: file, line: line)
+        XCTAssertFalse(markerExists, "pending-start written", file: file, line: line)
+        let post = try XCTUnwrap(h.notifier.posts.last, file: file, line: line)
+        XCTAssertEqual(post.title, "Session not started", file: file, line: line)
+        XCTAssertTrue(post.body.hasPrefix("Nothing was changed: "), post.body, file: file, line: line)
+    }
+
+    /// With the rule in effect the check runs the restore while sleep is
+    /// on, then the dialog turns sleep off, and the end runs the same
+    /// command without -k.
+    func testStartWithTheRuleRunsTheRestoreBeforeThePrompt() async throws {
+        let tools = try realGuard(policy: "rule")
+        let m = h.makeManager(sleepGuard: tools.sleepGuard(prompt: h.prompt))
+        await m.start(duration: 1800)
+
+        XCTAssertTrue(m.isActive)
+        XCTAssertEqual(h.prompt.shown, 1)
+        XCTAssertEqual(tools.pmsetCalls(), ["-g"])
+        XCTAssertEqual(tools.sudoCalls(), ["-k -n /usr/bin/pmset -a disablesleep 0"])
+        await m.end(reason: .user)
+        XCTAssertEqual(tools.sudoCalls(), ["-k -n /usr/bin/pmset -a disablesleep 0", "-n /usr/bin/pmset -a disablesleep 0"])
+    }
+
+    /// No rule, but another passwordless entry makes `sudo -l` succeed
+    /// while running the restore needs a password: Start is refused with
+    /// nothing written and no dialog.
+    func testStartIsRefusedWhenListingPassesButTheRestoreNeedsAPassword() async throws {
+        let tools = try realGuard(policy: "list-only")
+        let m = h.makeManager(sleepGuard: tools.sleepGuard(prompt: h.prompt))
+        await m.start(duration: 1800)
+
+        try assertRefusedUntouched(m)
+        XCTAssertEqual(tools.sudoCalls(), ["-k -n /usr/bin/pmset -a disablesleep 0"])
+        let err = try XCTUnwrap(m.lastError)
+        XCTAssertTrue(err.hasPrefix("start refused, nothing changed: sleep can only be turned off while it can be turned back on without a password"), err)
+        XCTAssertTrue(err.contains("(exit 1: sudo: a password is required)"), err)
+        XCTAssertTrue(err.hasSuffix("run scripts/install.sh again"), err)
+    }
+
+    /// A credential cached by a recent sudo in a terminal does not stand in
+    /// for the rule: -k makes sudo ignore it, and Start is refused.
+    func testStartIsRefusedWhenOnlyACachedCredentialWouldRunTheRestore() async throws {
+        let tools = try realGuard(policy: "cached")
+        let m = h.makeManager(sleepGuard: tools.sleepGuard(prompt: h.prompt))
+        await m.start(duration: 1800)
+
+        try assertRefusedUntouched(m)
+        XCTAssertEqual(tools.sudoCalls(), ["-k -n /usr/bin/pmset -a disablesleep 0"])
+        XCTAssertTrue(try XCTUnwrap(m.lastError).contains("(exit 1: sudo: a password is required)"), m.lastError ?? "")
+    }
+
+    /// SleepDisabled already 1: the restore check runs nothing as root, so
+    /// the setting stays, and Start is refused with the command to run.
+    func testStartWhileSleepIsAlreadyOffRunsNothing() async throws {
+        let tools = try realGuard(policy: "rule", sleepDisabled: "1")
+        let m = h.makeManager(sleepGuard: tools.sleepGuard(prompt: h.prompt))
+        await m.start(duration: 1800)
+
+        try assertRefusedUntouched(m)
+        XCTAssertEqual(tools.pmsetCalls(), ["-g"])
+        XCTAssertEqual(tools.sudoCalls(), [], "sudo ran while sleep was off")
+        let err = try XCTUnwrap(m.lastError)
+        XCTAssertTrue(err.hasPrefix("start refused, nothing changed: sleep is already off (pmset reports SleepDisabled 1)"), err)
+        XCTAssertTrue(err.hasSuffix("To re-enable sleep: sudo pmset -a disablesleep 0, then start again"), err)
+    }
+
+    /// SleepDisabled 1 that the journal says Insomnia set, after a restore
+    /// that failed: every end and backstop.sh run would set it to 0, so
+    /// the check runs that restore without reading, and Start goes on.
+    func testStartRunsTheRestoreTheJournalOwesBeforeThePrompt() async throws {
+        var earlier = RuntimeState()
+        earlier.sleepDisabledByUs = true
+        try h.store.saveState(earlier)
+        let tools = try realGuard(policy: "rule", sleepDisabled: "1")
+        let m = h.makeManager(sleepGuard: tools.sleepGuard(prompt: h.prompt))
+        await m.start(duration: 1800)
+
+        XCTAssertTrue(m.isActive)
+        XCTAssertEqual(h.prompt.shown, 1)
+        XCTAssertEqual(tools.pmsetCalls(), [])
+        XCTAssertEqual(tools.sudoCalls(), ["-k -n /usr/bin/pmset -a disablesleep 0"])
     }
 
     /// Every attempt gets its own nonce, so a dialog left from one start
@@ -958,32 +1224,46 @@ final class SleepPromptLifecycleTests: XCTestCase {
         XCTAssertEqual(last.body, "No session was started, and nothing was changed: the administrator password prompt was cancelled.")
     }
 
-    /// The README's promise: cancelling leaves sleep as it was, so a
-    /// SleepDisabled bit another tool set before the start stays set.
-    func testCancelLeavesASleepSettingSomeoneElseOwns() async throws {
-        h.prompt.mode = .cancel
+    /// The README's promise: a SleepDisabled bit another tool set stays
+    /// set. The restore check would turn it off, so Start is refused
+    /// before it runs anything, writes anything or shows the dialog.
+    func testStartLeavesASleepSettingSomeoneElseOwns() async throws {
         h.guardFake.sleepDisabled = true
         let m = h.makeManager()
         await m.start(duration: 1800)
 
-        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1"])
-        XCTAssertTrue(h.guardFake.sleepDisabled, "another tool's setting must survive a cancel")
-        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
+        XCTAssertEqual(h.guardFake.restoreChecks, 1)
+        XCTAssertEqual(h.prompt.shown, 0)
+        XCTAssertEqual(h.guardFake.calls, [])
+        XCTAssertTrue(h.guardFake.sleepDisabled, "another tool's setting must survive a start")
+        XCTAssertEqual(h.backstop.arms, 0)
+        XCTAssertNil(try h.store.loadState())
         XCTAssertNil(try h.store.loadSession())
         XCTAssertFalse(markerExists)
         XCTAssertNil(m.session)
+        let err = try XCTUnwrap(m.lastError)
+        XCTAssertTrue(err.hasPrefix("start refused, nothing changed: sleep is already off (pmset reports SleepDisabled 1)"), err)
+        XCTAssertTrue(err.hasSuffix("To re-enable sleep: sudo pmset -a disablesleep 0, then start again"), err)
+        let post = try XCTUnwrap(h.notifier.posts.last)
+        XCTAssertEqual(post.title, "Session not started")
+        XCTAssertTrue(post.body.hasPrefix("Nothing was changed: sleep is already off"), post.body)
+
+        // Once whoever set it turns sleep back on, Start works.
+        h.guardFake.sleepDisabled = false
+        await m.start(duration: 1800)
+        XCTAssertTrue(m.isActive)
+        XCTAssertEqual(h.prompt.shown, 1)
     }
 
     /// osascript never started, so nothing ran as root: the same exact
     /// rollback with no pmset.
     func testLaunchFailureRollsBackWithoutPmset() async throws {
         h.prompt.mode = .launchFail
-        h.guardFake.sleepDisabled = true
         let m = h.makeManager()
         await m.start(duration: 1800)
 
         XCTAssertEqual(h.guardFake.calls, ["disablesleep 1"])
-        XCTAssertTrue(h.guardFake.sleepDisabled)
+        XCTAssertFalse(h.guardFake.sleepDisabled)
         XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
         XCTAssertNil(try h.store.loadSession())
         XCTAssertFalse(markerExists)
@@ -1003,6 +1283,7 @@ final class SleepPromptLifecycleTests: XCTestCase {
         await m.start(duration: 1800)
 
         XCTAssertEqual(h.guardFake.calls, ["disablesleep 1"])
+        XCTAssertEqual(h.guardFake.lastSleepOffIsOurs, true, "the check was not told the journal owes a restore")
         XCTAssertEqual(try h.store.loadState(), earlier)
         XCTAssertNil(try h.store.loadSession())
     }

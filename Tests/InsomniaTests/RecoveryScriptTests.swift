@@ -2354,7 +2354,7 @@ final class RecoveryScriptTests: XCTestCase {
         try fx.prepareInstall()
         try "trusted".write(to: fx.plist, atomically: true, encoding: .utf8)
         try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
-        fx.setMode("sudo", "fail")          // pmset undo fails; `sudo -n -l` still passes
+        fx.setMode("sudo", "fail")          // pmset undo fails; install.sh's check still passes
         fx.setMode("launchctl", "loaded")   // an older agent is loaded
 
         let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
@@ -3156,8 +3156,65 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(try sudoersRules(), Self.passwordlessLines)
         let text = try String(contentsOf: fx.sudoers, encoding: .utf8)
         XCTAssertFalse(text.contains("disablesleep 1"), "a passwordless way to keep the Mac awake: \(text)")
-        XCTAssertTrue(fx.calls().contains("sudo -n -l /usr/bin/pmset -a disablesleep 0"), "the undo line is the one verified: \(fx.calls())")
+        let calls = fx.calls()
+        let read = try XCTUnwrap(calls.firstIndex(of: "pmset -g"), "\(calls)")
+        let check = try XCTUnwrap(calls.firstIndex(of: "sudo -k -n /usr/bin/pmset -a disablesleep 0"), "the undo line is the one run: \(calls)")
+        XCTAssertLessThan(read, check, "the check runs only after SleepDisabled read 0: \(calls)")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("sudo -n -l") }, "a listing proves nothing about a password: \(calls)")
         XCTAssertEqual(fx.calls().filter { $0.hasPrefix("sudo /usr/bin/install") }.count, 1, "written once, never through a four-line state: \(fx.calls())")
+    }
+
+    /// An administrator without the rule: `sudo -v` cached a credential,
+    /// so a listing or a plain `sudo -n` would pass. The check runs the
+    /// restore with -k, which ignores that credential, so the install stops
+    /// before the bundle and says the rule is not in effect.
+    func testInstallStopsWhenOnlyTheCachedCredentialWouldRunTheRestore() throws {
+        try fx.prepareInstall()
+        try fx.installMachinery()
+        fx.setMode("sudo", "no-rule-cached")
+
+        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        let calls = fx.calls()
+        XCTAssertTrue(calls.contains("sudo -k -n /usr/bin/pmset -a disablesleep 0"), "\(calls)")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("sudo -n -l") }, "\(calls)")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("launchctl") }, "\(calls)")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("codesign SIGN") }, "the bundle was replaced: \(calls)")
+        XCTAssertEqual(try String(contentsOf: fx.app.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "binary")
+        XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "plist")
+        XCTAssertTrue(r.stderr.contains("'sudo -k -n /usr/bin/pmset -a disablesleep 0' is still not permitted without a password"), r.stderr)
+        assertRerunNote(r.stderr)
+    }
+
+    /// While pmset reports SleepDisabled 1 the check would turn sleep back
+    /// on, and while pmset cannot be read it is not known whether it would,
+    /// so it is not run: the install goes on and says the app checks the
+    /// rule before every Start. A `pmset -g` without the line reads as 0,
+    /// as the app reads it, and the check runs.
+    func testInstallRunsTheCheckOnlyWhileSleepReadsOn() throws {
+        try fx.prepareInstall()
+        fx.setMode("launchctl", "loaded")
+        let cases = [
+            ("1", false, "sudoers rule not checked: pmset reports SleepDisabled 1, and the check would turn sleep back on."),
+            ("fail", false, "sudoers rule not checked: pmset -g could not be read."),
+            ("none", true, "sudoers rule verified"),
+            ("0", true, "sudoers rule verified"),
+        ]
+        for (mode, checked, said) in cases {
+            fx.clearCalls()
+            fx.setMode("pmset", mode)
+
+            let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+
+            XCTAssertEqual(r.status, 0, "\(mode): " + r.stderr + r.stdout)
+            let calls = fx.calls()
+            XCTAssertTrue(calls.contains("pmset -g"), "\(mode): \(calls)")
+            XCTAssertEqual(calls.contains("sudo -k -n /usr/bin/pmset -a disablesleep 0"), checked, "\(mode): \(calls)")
+            XCTAssertFalse(calls.contains { $0.hasPrefix("sudo -n -l") || $0.hasPrefix("pmset DIRECT") }, "\(mode): \(calls)")
+            XCTAssertTrue(r.stdout.contains(said), "\(mode): " + r.stdout)
+            XCTAssertEqual(try sudoersRules(), Self.passwordlessLines)
+        }
     }
 
     /// A reinstall over the four-line rule of an older build replaces the
@@ -3420,6 +3477,7 @@ private final class ScriptFixture {
             "OSASCRIPT": bin.appendingPathComponent("osascript").path,
             "LAUNCHCTL": bin.appendingPathComponent("launchctl").path,
             "SUDO": bin.appendingPathComponent("sudo").path,
+            "PMSET": fakePmset,
             "CODESIGN": bin.appendingPathComponent("codesign").path,
             "SWIFT": bin.appendingPathComponent("swift").path,
             "LOCK_TIMEOUT_SECONDS": "1",
@@ -3477,7 +3535,12 @@ private final class ScriptFixture {
         // Mode "auth-fail": every form that would prompt (visudo, install)
         // fails like a wrong password, and `-n` forms fail as unpermitted.
         // Mode "rule-not-effective": authentication passes and the rule is
-        // installed, but `sudo -n -l <pmset ...>` still says no.
+        // installed, but install.sh's check, `sudo -k -n <pmset ...>`,
+        // still says no. Mode "no-rule-cached": the same, but the way an
+        // administrator without the rule sees it: `sudo -n -l` and `sudo -n
+        // <cmd>` pass on the credential `sudo -v` cached, and only `-k`,
+        // which ignores that credential, fails. Any other mode passes the
+        // check, "fail" included, which fails only the backstop's undo.
         // `sudo -v` authenticates and `sudo -n -v` checks the cached
         // credential. Mode "cache-expires": the credential has expired by
         // the time `-n -v` asks, and `-v` succeeds again. Mode
@@ -3508,6 +3571,13 @@ private final class ScriptFixture {
                   exit 0 ;;
                 *) exit 0 ;;
               esac ;;
+          -k) if [[ "${2:-}" == -n ]]; then
+                case "$mode" in
+                  auth-fail|rule-not-effective|no-rule-cached) echo "sudo: a password is required" >&2; exit 1 ;;
+                  *) exit 0 ;;
+                esac
+              fi
+              exit 1 ;;
           -n) if [[ "${2:-}" == -v ]]; then
                 case "$mode" in auth-fail|cache-expires|reauth-fails) exit 1 ;; *) exit 0 ;; esac
               fi
@@ -3515,7 +3585,7 @@ private final class ScriptFixture {
                 case "$mode" in auth-fail|rule-not-effective) exit 1 ;; *) exit 0 ;; esac
               fi
               case "$mode" in
-                ok) exit 0 ;;
+                ok|no-rule-cached) exit 0 ;;
                 hang) exec /bin/sleep 60 ;;
                 ignore-term) trap '' TERM; deadline=$(( $(date +%s) + 60 ))
                   while [[ ! -e "\(r)/release" && -d "\(r)" && $(date +%s) -lt $deadline ]]; do /bin/sleep 0.1; done
@@ -3556,7 +3626,21 @@ private final class ScriptFixture {
           *) exit 1 ;;
         esac
         """)
+        // pmset: only `pmset -g` may run without sudo. It reports
+        // SleepDisabled as pmset.mode says: 0 (the default), 1, "none" (no
+        // such line) or "fail" (exit 1). Anything else is recorded as a
+        // DIRECT call and fails.
         try writeFake("pmset", """
+        if [[ "$*" == -g ]]; then
+          printf 'pmset -g\\n' >> "\(calls)"
+          case "$(cat "\(r)/pmset.mode" 2>/dev/null || echo 0)" in
+            fail) echo "pmset: could not read the settings" >&2; exit 1 ;;
+            none) printf 'System-wide power settings:\\n' ;;
+            1) printf 'System-wide power settings:\\n SleepDisabled\\t\\t1\\n' ;;
+            *) printf 'System-wide power settings:\\n SleepDisabled\\t\\t0\\n' ;;
+          esac
+          exit 0
+        fi
         printf 'pmset DIRECT %s\\n' "$*" >> "\(calls)"
         exit 99
         """)

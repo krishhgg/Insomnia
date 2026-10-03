@@ -24,6 +24,9 @@ PGREP=/usr/bin/pgrep
 OSASCRIPT=/usr/bin/osascript
 LAUNCHCTL=/bin/launchctl
 SUDO=/usr/bin/sudo
+# Read with -g only. What sudo runs is always /usr/bin/pmset, the path the
+# sudoers rule names.
+PMSET=/usr/bin/pmset
 PLUTIL=/usr/bin/plutil
 CODESIGN=/usr/bin/codesign
 SWIFT=/usr/bin/swift
@@ -83,9 +86,10 @@ BIN="$("$SWIFT" build -c release ${BUILD_FLAGS[@]+"${BUILD_FLAGS[@]}"} --show-bi
 #    nothing changed. Nothing is written before step 3 holds the recovery
 #    lock.
 
-# Whether session.json holds a deadline still in the future, read the way
-# backstop.sh reads it. A file whose deadline cannot be read counts as a
-# running session: it may be one.
+# Whether session.json holds a deadline still in the future. Only the Z
+# form the app writes is read here; a deadline this cannot read (one with
+# an offset in place of Z included) counts as a running session: it may
+# be one, and the cost is one question.
 session_running() {
   local f="$APP_SUPPORT/session.json" ends ends_epoch
   [[ -f "$f" ]] || return 1
@@ -285,12 +289,30 @@ else
   backstop_only_note
   exit 1
 fi
-# `sudo -l <command>` checks the rule without running pmset (nothing on the
-# machine changes). The backstop cannot undo anything without it, so stop here.
-if "$SUDO" -n -l /usr/bin/pmset -a disablesleep 0 >/dev/null 2>&1; then
+# Only running the restore shows whether sudo would ask for a password:
+# `sudo -l` lists a command the admin group may run with its password, and
+# the credential step 2 cached lets it list without one. `-k` ignores that
+# credential and `-n` fails instead of prompting. Turning sleep back on
+# changes nothing while sleep is on, so it runs only while `pmset -g`
+# reports SleepDisabled 0 or leaves the line out, as the app reads it.
+# Otherwise the check is left to the app, which makes it before every
+# Start. The backstop cannot undo anything without the rule, so a failed
+# check stops here.
+sleep_disabled=unreadable
+if pmset_settings="$("$PMSET" -g 2>/dev/null)"; then
+  sleep_disabled=0
+  while read -r key value _; do
+    if [[ "$key" == SleepDisabled ]]; then sleep_disabled="$value"; break; fi
+  done <<< "$pmset_settings"
+fi
+if [[ "$sleep_disabled" == unreadable ]]; then
+  echo "sudoers rule not checked: pmset -g could not be read. Insomnia checks the rule again before every Start."
+elif [[ "$sleep_disabled" != 0 ]]; then
+  echo "sudoers rule not checked: pmset reports SleepDisabled $sleep_disabled, and the check would turn sleep back on. Insomnia checks the rule again before every Start."
+elif "$SUDO" -k -n /usr/bin/pmset -a disablesleep 0 >/dev/null 2>&1; then
   echo "sudoers rule verified"
 else
-  echo "'sudo -n pmset' is still not permitted; check $SUDOERS. The app and the LaunchAgent were not touched." >&2
+  echo "'sudo -k -n /usr/bin/pmset -a disablesleep 0' is still not permitted without a password; check $SUDOERS. The app and the LaunchAgent were not touched." >&2
   exit 1
 fi
 

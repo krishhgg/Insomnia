@@ -38,15 +38,21 @@ the dialog only when the installed `backstop.sh` declares, in its
 `# insomnia-backstop-version:` line, a version that deletes `pending-start`,
 and the installer installs that script before the app, so recovery after a
 crash under the dialog never depends on an older script. It also shows the
-dialog only after `sudo -n -l /usr/bin/pmset -a disablesleep 0` has
-confirmed, without a password, that sleep can be turned back on; without
-the rule (an uninstall that stopped part way, a hand-deleted file) Start is
+dialog only after running the restore itself, `sudo -k -n /usr/bin/pmset -a
+disablesleep 0`, with exit 0: `-k` ignores a credential cached by a recent
+sudo and `-n` fails instead of prompting, so only a sudoers rule that lets
+that exact command run as root without a password passes. `sudo -l` is not
+used: it lists commands the admin group may run with its password, and lists
+without one whenever the account has any passwordless entry. Without the
+rule (an uninstall that stopped part way, a hand-deleted file) Start is
 refused with nothing changed and the user is told to rerun the installer.
-`sudo -l` says whether a command is allowed, not whether it needs a
-password: an administrator account that has some other passwordless sudoers
-entry passes this check without the rule, because the admin group's
-password rule covers pmset. Such a session's end then reports that sleep
-could not be turned back on. A file that
+The run happens only while `pmset -g` reports SleepDisabled 0, where it
+changes nothing, or while the journal already owes that restore after one
+failed. A SleepDisabled 1 the journal does not claim is left alone: Start
+runs nothing as root, is refused, and gives the command that turns sleep
+back on. A tool that sets SleepDisabled between that read and the run is
+the one case the run changes. The installer checks the rule the same way
+right after writing it, only while SleepDisabled reads 0. A file that
 cannot be deleted (its command is still running, an immutable flag, an ACL)
 does not stop sleep from being turned back on, but the journal keeps the sleep
 entry, the app and the agent report it and retry, and new sessions are refused

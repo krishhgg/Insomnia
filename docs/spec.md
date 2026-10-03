@@ -77,15 +77,21 @@ recovery; newly written journals use `frozenProcesses`.
 - Session start: check that the installed `backstop.sh` declares
   `# insomnia-backstop-version: 2` or later (`BackstopVersion.swift`; 2 is
   the first that deletes `pending-start`) and refuse with nothing written,
-  asking for `scripts/install.sh` again, if not. Then confirm, without
-  running pmset or prompting, that sleep can be turned back on with no
-  password: `sudo -n -l /usr/bin/pmset -a disablesleep 0` must exit 0
-  (`SleepGuarding.checkPasswordlessRestore`). Otherwise refuse the same
-  way, since the end, the backstop and uninstall all restore with
-  `sudo -n` and would leave sleep off. `sudo -l` does not say whether a
-  password is needed, so an administrator account with some other
-  passwordless entry passes without the rule; that session's end reports
-  the failed restore. Then write session + state
+  asking for `scripts/install.sh` again, if not. Then prove, without
+  prompting, that sleep can be turned back on with no password by running
+  the restore: `sudo -k -n /usr/bin/pmset -a disablesleep 0` must exit 0
+  (`SleepGuarding.checkPasswordlessRestore`). `-k` ignores a cached
+  credential and `-n` fails instead of prompting. `sudo -l` is not used: it
+  lists commands the admin group may run with its password, and lists
+  without one whenever any passwordless entry exists. Otherwise refuse the
+  same way, since the end, the backstop and uninstall all restore with
+  `sudo -n` and would leave sleep off. The run happens only while
+  `pmset -g` reports `SleepDisabled 0`, where it changes nothing, or when
+  the journal already has `sleepDisabledByUs` (a failed restore is owed
+  anyway). A `SleepDisabled 1` the journal does not claim is left alone,
+  as after a cancelled dialog: run nothing and refuse, giving
+  `sudo pmset -a disablesleep 0`. An unreadable `pmset -g` refuses too.
+  Then write session + state
   to disk, arm the launchd backstop,
   write a fresh random nonce to `pending-start`, and only then run `pmset -a
   disablesleep 1` through the macOS administrator password dialog
@@ -541,10 +547,11 @@ Reconcile runs at every Insomnia launch:
    entry → leave it. Step 1 has already undone a disable Insomnia journaled,
    so this one was set by something else (a hand-run `pmset`, another tool)
    and is not Insomnia's to undo. Log it, show it on the menu's warning line,
-   and notify once per launch with `sudo pmset -a disablesleep 0`. A bit
-   still journaled as ours after a failed restore is retried from the
-   journal, not from this check. Nothing clears `SleepDisabled` without a
-   journal entry, in the app or in the agent.
+   and notify once per launch with `sudo pmset -a disablesleep 0`. Start is
+   refused while it stays (section 2). A bit still journaled as ours after
+   a failed restore is retried from the journal, not from this check.
+   Nothing clears `SleepDisabled` without a journal entry, in the app or in
+   the agent.
 
 Backstop, independent of the app:
 
@@ -830,10 +837,11 @@ that any case passed; record results in the release validation record.
    appears and names what it does. Close lid, wait 5 minutes, ping the Mac
    from the phone or check the heartbeat log. Open lid: session still running,
    sleep still disabled until end. Separately: Enter, then Cancel in the
-   dialog → no session, `pmset -g` unchanged (no `SleepDisabled` unless
-   something else had set it, and then it stays), session.json and the
-   journal are clean, and the "Session not started" notification says
-   nothing was changed.
+   dialog → no session, `pmset -g` unchanged (no `SleepDisabled`),
+   session.json and the journal are clean, and the "Session not started"
+   notification says nothing was changed. With `SleepDisabled 1` set by
+   hand first, Enter shows no dialog, changes nothing and gives the command
+   that turns sleep back on.
 3. **Restores.** End now → `pmset -g` shows no `SleepDisabled`. Quit → same.
    Timer expiry → same, plus notification.
 4. **Backstop.** Force-quit a supervised disposable session, then verify

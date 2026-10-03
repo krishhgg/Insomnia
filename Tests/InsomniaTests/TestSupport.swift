@@ -175,6 +175,7 @@ final class FakeSleepGuard: SleepGuarding, @unchecked Sendable {
     private var _restoreChecks = 0
     private var _restoreRuleMissing = false
     private var _onRestoreCheck: (@Sendable () -> Void)?
+    private var _lastSleepOffIsOurs: Bool?
     var throwOn: Set<String> = []
     /// Commands that take effect and *then* fail (a timeout after pmset
     /// already applied the setting): the ambiguous failure shape.
@@ -217,11 +218,13 @@ final class FakeSleepGuard: SleepGuarding, @unchecked Sendable {
     /// tests compare as sequences of pmset commands.
     var restoreChecks: Int { lock.withLock { _restoreChecks } }
     /// /etc/sudoers.d/insomnia is missing: the check fails the way
-    /// `sudo -n -l` does.
+    /// `sudo -k -n` does when it would need a password.
     var restoreRuleMissing: Bool {
         get { lock.withLock { _restoreRuleMissing } }
         set { lock.withLock { _restoreRuleMissing = newValue } }
     }
+    /// What the latest check was told about the journal.
+    var lastSleepOffIsOurs: Bool? { lock.withLock { _lastSleepOffIsOurs } }
     /// Runs inside every check, so a test can look at what had happened
     /// by then.
     var onRestoreCheck: (@Sendable () -> Void)? {
@@ -229,13 +232,19 @@ final class FakeSleepGuard: SleepGuarding, @unchecked Sendable {
         set { lock.withLock { _onRestoreCheck = newValue } }
     }
 
-    func checkPasswordlessRestore() async throws {
-        let (missing, hook) = lock.withLock {
+    /// Fails as PmsetSleepGuard's does: refused while sleep is off and
+    /// the journal does not own that, and otherwise refused without the
+    /// rule. It never changes `sleepDisabled`, so a test still sees what
+    /// an end did; the run's effect is tested with the real guard.
+    func checkPasswordlessRestore(sleepOffIsOurs: Bool) async throws {
+        let (missing, off, hook) = lock.withLock {
             _restoreChecks += 1
-            return (_restoreRuleMissing, _onRestoreCheck)
+            _lastSleepOffIsOurs = sleepOffIsOurs
+            return (_restoreRuleMissing, _sleepDisabled, _onRestoreCheck)
         }
         hook?()
-        if missing { throw PasswordlessRestoreError(detail: "exit 1: sudo: a password is required") }
+        if off, !sleepOffIsOurs { throw PasswordlessRestoreError.sleepAlreadyOff }
+        if missing { throw PasswordlessRestoreError.notConfirmed("exit 1: sudo: a password is required") }
     }
 
     private func record(_ c: String) throws {
@@ -771,17 +780,20 @@ struct Harness {
     /// `retryDelay` is long so the in-process retry never fires by accident;
     /// `reassertDelay` likewise, so the second display/keyboard write after
     /// a restore never lands in a test that did not ask for it.
+    /// `sleepGuard` replaces `guardFake` for a test that drives the real
+    /// PmsetSleepGuard against a fake sudo and pmset.
     func makeManager(
         lockTimeout: TimeInterval = 0.3,
         retryDelay: TimeInterval = 60,
         markerLockTimeout: TimeInterval = 0.3,
-        reassertDelay: Duration = .seconds(3600)
+        reassertDelay: Duration = .seconds(3600),
+        sleepGuard: (any SleepGuarding)? = nil
     ) -> SessionManager {
         let c = clock
         let lid = clamshell
         return SessionManager(
             paths: home.paths,
-            sleepGuard: guardFake,
+            sleepGuard: sleepGuard ?? guardFake,
             processControl: procs,
             backstop: backstop,
             audio: audio,

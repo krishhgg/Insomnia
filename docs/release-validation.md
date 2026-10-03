@@ -139,7 +139,8 @@ is performed. Do not replace "not run" with "passed" based on source review.
 | Settings floor steppers keep the end floor below the Low Power Mode floor by moving the other stepper | Not run |
 | Install/upgrade/uninstall with recoverable failure conditions | Not run |
 | Start shows the administrator password dialog (names Insomnia's purpose, not just osascript) and `pmset -g` shows `SleepDisabled 1` after it | Not run |
-| Cancel in the dialog rolls the start back with no pmset: no session, journal clean, a `SleepDisabled 1` set by hand beforehand still set, "Session not started" notification saying nothing was changed | Not run |
+| Cancel in the dialog rolls the start back with no pmset: no session, journal clean, `SleepDisabled` still absent, "Session not started" notification saying nothing was changed | Not run |
+| With `SleepDisabled 1` set by hand (`sudo pmset -a disablesleep 1`), Start shows no dialog, `pmset -g` still shows `SleepDisabled 1`, no session.json, and the message gives `sudo pmset -a disablesleep 0`; after that command Start shows the dialog | Not run |
 | A wrong password and no answer for 120 s each roll the start back through `disablesleep 0`: no session, `SleepDisabled` absent, journal clean, "Session not started" notification; the dialog closes when the 120 s SIGTERM lands | Not run |
 | Relaunch (and login) with a valid session and `SleepDisabled 1` keeps the session without a prompt | Not run |
 | Relaunch with a valid session after `sudo pmset -a disablesleep 0` by hand ends the session with the "turned back on" notification, no prompt | Not run |
@@ -148,6 +149,8 @@ is performed. Do not replace "not run" with "passed" based on source review.
 | A one-minute session whose password is entered after 70 s: the dialog's command reports the session has already ended, `pmset -g` shows no `SleepDisabled 1`, "Session not started" | Not run |
 | With `backstop.sh` replaced by a copy from before this change (no `# insomnia-backstop-version:` line), Start shows no password dialog and says to run `scripts/install.sh` again; after the rerun Start shows the dialog | Not run |
 | With `/etc/sudoers.d/insomnia` moved aside by hand (`sudo mv`), Start shows no password dialog, changes nothing (no session.json, `pmset -g` unchanged) and says to run `scripts/install.sh` again; after the rerun Start shows the dialog | Not run |
+| The same with the rule moved aside, another passwordless sudoers entry of your own in place (so `sudo -n -l /usr/bin/pmset -a disablesleep 0` exits 0) and a `sudo -v` in Terminal just before: Start still shows no dialog and names `sudo -k -n /usr/bin/pmset -a disablesleep 0` | Not run |
+| `scripts/install.sh` run while `SleepDisabled 1` is set by hand prints "sudoers rule not checked" and finishes; run with sleep on it prints "sudoers rule verified" | Not run |
 | An upgrade from a build before this change replaces `backstop.sh` before the bundle (the script's mtime is earlier than the bundle's) and the first Start shows the dialog | Not run |
 | Force-quit Insomnia while its password dialog is up, then relaunch it (or wait a minute for the agent), then enter the password in the old dialog: `pending-start` is gone, the dialog's command reports the start is over, and `pmset -g` shows no `SleepDisabled 1` | Not run |
 | `chflags uchg` on `pending-start` while a password dialog is up, then force-quit and relaunch: sleep restored, "Restore incomplete" names the file, the journal keeps `sleepDisabledByUs`, Start is refused; after `chflags nouchg` the next agent run or relaunch deletes the file and clears the entry | Not run |

@@ -165,10 +165,17 @@ Flag a change that breaks one of these; do not flag the behavior itself.
   installed `backstop.sh`'s `# insomnia-backstop-version:` line and shows no
   dialog below version 2, the first that deletes `pending-start`; the user
   is told to run `install.sh` again. It also shows no dialog unless
-  `SleepGuarding.checkPasswordlessRestore` passes first (`sudo -n -l
-  /usr/bin/pmset -a disablesleep 0`, nothing run, nothing written before
-  it): without the passwordless restore every undo would fail and leave
-  sleep off. `install.sh` installs `backstop.sh`
+  `SleepGuarding.checkPasswordlessRestore` passes first, with nothing
+  written before it: without the passwordless restore every undo would
+  fail and leave sleep off. The check runs the restore itself, `sudo -k -n
+  /usr/bin/pmset -a disablesleep 0`, because only a run shows whether sudo
+  wants a password (`-k` ignores a cached credential; `sudo -l` lists
+  commands the admin group may run with its password). It runs only while
+  `pmset -g` reports `SleepDisabled 0` or the journal already owes that
+  restore; a `SleepDisabled 1` the journal does not claim refuses Start
+  with nothing run, deliberately, so a setting another tool made stays.
+  `install.sh` checks the rule the same way after writing it, and leaves
+  the check to the app while `SleepDisabled` does not read 0. `install.sh` installs `backstop.sh`
   under the recovery lock before the bundle (`install -S`, so a running old
   script keeps its inode) and waits up to `RETIRE_WAIT_SECONDS` for runs of
   the old script to exit, stopping before the sudoers rule if one stays. A
