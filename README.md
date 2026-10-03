@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/eye-moon.svg" alt="Insomnia: an eye with a right-opening crescent moon" width="112">
+  <img src="docs/assets/eye-open.svg" alt="Insomnia: an open eye with a round pupil and five lashes above it" width="112">
 </p>
 
 <h1 align="center">Insomnia</h1>
@@ -401,9 +401,10 @@ rather than assuming missing integration coverage passed. Tests use injected
 dependencies and temporary fixtures—not live installation or power changes
 on a contributor's machine.
 
-The app icon keeps the eye-and-moon [vector geometry](Sources/Insomnia/UI/EyeMoonGeometry.swift); the menu bar shows a [closed eye](Sources/Insomnia/UI/EyeMarkGeometry.swift) that opens while a session runs.
+The app icon is the menu bar's open eye on a charcoal tile: [AppIconArtwork](Sources/Insomnia/UI/AppIconArtwork.swift) draws it from the same [vector geometry](Sources/Insomnia/UI/EyeMarkGeometry.swift) as the menu bar's closed eye, which opens while a session runs.
 After changing the artwork, run `./scripts/generate-app-icon.sh` to regenerate
-the packaged PNG and ICNS assets. No image-generation service is needed.
+the packaged PNG and ICNS assets and the README's SVG. The script draws them
+offline with Xcode's swiftc and iconutil.
 
 [Contributing](CONTRIBUTING.md) · [Security reporting](SECURITY.md) ·
 [Release validation](docs/release-validation.md) · [Design notes](docs/spec.md)
