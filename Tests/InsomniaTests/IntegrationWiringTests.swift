@@ -156,6 +156,37 @@ final class IntegrationWiringTests: XCTestCase {
         XCTAssertTrue(items.contains(StatusMenu.Item(title: "\u{26A0} \(reason)", kind: .warning)), "\(items.map(\.title))")
     }
 
+    /// The failover's report about the hotspot password is a menu line
+    /// while that hotspot is the one configured. After an SSID edit it is
+    /// about an item no join reads, and the line goes; editing the SSID
+    /// back brings it back, since nothing has changed that item.
+    @MainActor
+    func testTheMenuShowsTheHotspotReportOnlyForTheConfiguredSSID() {
+        let h = Harness()
+        defer { h.home.destroy() }
+        let services = AppServices(
+            paths: h.home.paths,
+            notifier: RecordingNotifier(),
+            audio: FakeAudioControl(),
+            processControl: FakeProcessControl(),
+            locationPermission: LocationPermission(authorizationStatus: .notDetermined)
+        )
+        let source = LiveStatusSource(services: services)
+        let manager = h.makeManager()
+        manager.config.hotspotSSID = "Phone"
+        services.status.hotspotPasswordReport = HotspotPasswordReport(ssid: "Phone", problem: .unreadable)
+        // A debug build also has the lid simulation line.
+        func warnings() -> [String] {
+            StatusItemController.menuItems(manager: manager, status: source).map(\.title).filter { $0.contains("Hotspot") }
+        }
+
+        XCTAssertEqual(warnings(), [HotspotPasswordProblem.unreadable.menuLine])
+        manager.config.hotspotSSID = "Other Phone"
+        XCTAssertEqual(warnings(), [])
+        manager.config.hotspotSSID = " Phone "
+        XCTAssertEqual(warnings(), [HotspotPasswordProblem.unreadable.menuLine])
+    }
+
     /// The line belongs to the last relaunch. Starting another clears it
     /// while that one runs, and one that relaunches the browser leaves no
     /// line.
@@ -387,28 +418,62 @@ final class IntegrationWiringTests: XCTestCase {
         XCTAssertEqual(notifier.posts.map(\.body), ["Chrome did not quit within 10 s, so nothing was relaunched. It may still quit later. If it does, open it again yourself."])
     }
 
-    func testKeychainSecretStoreUsesFailoverServiceAndCurrentSSID() throws {
+    @MainActor
+    func testKeychainSecretStoreUsesFailoverServiceAndCurrentSSID() async throws {
         let keychain = FakeKeychainStore()
-        var ssid = "Phone"
-        let store = KeychainHotspotSecretStore(keychain: keychain) { ssid }
+        let ssid = Locked("Phone")
+        let store = KeychainHotspotSecretStore(keychain: keychain, queue: KeychainQueue()) { ssid.value }
 
-        try store.save("secret")
+        try await store.save("secret")
 
         XCTAssertEqual(try keychain.get(service: KeychainStore.service, account: "Phone"), "secret")
-        XCTAssertEqual(try store.load(), "secret")
+        let loaded = try await store.load()
+        XCTAssertEqual(loaded, "secret")
 
-        ssid = "Other Phone"
-        XCTAssertNil(try store.load())
+        ssid.value = "Other Phone"
+        let other = try await store.load()
+        XCTAssertNil(other)
     }
 
-    func testKeychainSecretStoreMovesPasswordWhenSSIDChanges() throws {
+    @MainActor
+    func testKeychainSecretStoreMovesPasswordWhenSSIDChanges() async throws {
         let keychain = FakeKeychainStore()
-        var ssid = "Old Phone"
-        let store = KeychainHotspotSecretStore(keychain: keychain) { ssid }
-        try store.save("first")
+        let ssid = Locked("Old Phone")
+        let store = KeychainHotspotSecretStore(keychain: keychain, queue: KeychainQueue()) { ssid.value }
+        let first = try await store.save("first")
+        XCTAssertEqual(first, HotspotPasswordChange(ssid: "Old Phone"))
 
-        ssid = "New Phone"
-        try store.save("replacement")
+        ssid.value = "New Phone"
+        let moved = try await store.save("replacement")
+
+        XCTAssertEqual(moved, HotspotPasswordChange(ssid: "New Phone", removed: "Old Phone"), "the save says which item it removed")
+        XCTAssertNil(try keychain.get(service: KeychainStore.service, account: "Old Phone"))
+        XCTAssertEqual(try keychain.get(service: KeychainStore.service, account: "New Phone"), "replacement")
+        let again = try await store.save("again")
+        XCTAssertEqual(again, HotspotPasswordChange(ssid: "New Phone"))
+
+        ssid.value = "Third Phone"
+        let cleared = try await store.delete()
+        XCTAssertEqual(cleared, HotspotPasswordChange(ssid: "Third Phone", removed: "New Phone"), "a clear says which item it removed too")
+        XCTAssertNil(try keychain.get(service: KeychainStore.service, account: "New Phone"))
+    }
+
+    /// Settings rereads the password when the failover's report clears.
+    /// That check must not change which account a save moves the password
+    /// from, or an SSID typed meanwhile leaves the old item behind.
+    @MainActor
+    func testAPeekAfterAnSSIDChangeStillLetsASaveMoveThePassword() async throws {
+        let keychain = FakeKeychainStore()
+        let ssid = Locked("Old Phone")
+        let store = KeychainHotspotSecretStore(keychain: keychain, queue: KeychainQueue()) { ssid.value }
+        try await store.save("first")
+        let loaded = try await store.load()
+        XCTAssertEqual(loaded, "first")
+
+        ssid.value = "New Phone"
+        let peeked = try await store.peek()
+        XCTAssertNil(peeked)
+        try await store.save("replacement")
 
         XCTAssertNil(try keychain.get(service: KeychainStore.service, account: "Old Phone"))
         XCTAssertEqual(try keychain.get(service: KeychainStore.service, account: "New Phone"), "replacement")

@@ -30,6 +30,8 @@ enum StatusMenu {
     /// Disabled status lines, a separator, then Settings… and Quit. Empty
     /// lines are dropped, and the separator only appears when something
     /// precedes it, so the menu never opens with a stray rule at the top.
+    /// `hotspotWarning` is the line about a hotspot password the failover
+    /// could not use (`HotspotPasswordProblem.menuLine`).
     /// `lidSimulationBuild` adds the line that marks a build with the
     /// scripts/simulate-lid.sh watcher compiled in (`LidSimulationBuild`),
     /// so such a build is never mistaken for a normal one.
@@ -43,6 +45,7 @@ enum StatusMenu {
         actions: String?,
         throttledBrowsers: [ThrottledBrowser],
         relaunchProblems: [String] = [],
+        hotspotWarning: String? = nil,
         error: String?,
         foreignSleep: String? = nil,
         lidSimulationBuild: Bool = false
@@ -71,6 +74,9 @@ enum StatusMenu {
         }
         for problem in relaunchProblems.compactMap(present) {
             out.append(Item(title: "\u{26A0} \(problem)", kind: .warning))
+        }
+        if let hotspot = present(hotspotWarning) {
+            out.append(Item(title: hotspot, kind: .warning))
         }
         if let error = present(error) {
             out.append(Item(title: "\u{26A0} \(error)", kind: .warning))
