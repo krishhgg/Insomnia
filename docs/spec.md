@@ -479,8 +479,10 @@ Backstop, independent of the app:
   lock file as its stdin, so a crash or force quit of the app does not
   free the lock while the command runs; the agent's supervising subshell
   keeps it the same way. The app runs no `sudo pmset` outside a
-  transaction. It reports the pid with the `sudo kill` command, in a menu
-  line of its own that the exit removes, and refuses to quit or start a
+  transaction. Every one goes through `PmsetSleepGuard.sudoPmset`,
+  including a check that runs a sudoers command only to see whether it
+  passes. It reports the pid with the `sudo kill` command, in a menu line
+  of its own that the exit removes, and refuses to quit or start a
   session until then. It also records the command in
   `unfinished-command.json`, with the start time and boot session read
   from the process table when the command was left running. The exit

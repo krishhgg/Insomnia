@@ -127,6 +127,10 @@ struct PmsetSleepGuard: SleepGuarding {
         return nil
     }
 
+    /// The one path for every `sudo pmset` the app runs, including a check
+    /// that runs one of the sudoers commands only to see that it passes
+    /// (`sudoOptions` such as `-k` go before the `-n` that is always there).
+    ///
     /// Throws `CommandStillRunningError` when sudo does not stop on SIGTERM
     /// within `stopGrace`: the child is never SIGKILLed, because that would
     /// orphan a root pmset that can still change power state after the
@@ -138,9 +142,10 @@ struct PmsetSleepGuard: SleepGuarding {
     /// crashes or is force-quit while it runs, the backstop still cannot
     /// run an undo beside it, or before it, and have it change power state
     /// afterwards with no journal entry left.
-    private func sudoPmset(_ args: [String]) async throws {
+    func sudoPmset(_ args: [String], sudoOptions: [String] = []) async throws {
         let full = [pmsetPath] + args
-        let command = "sudo -n \(full.joined(separator: " "))"
+        let options = sudoOptions + ["-n"]
+        let command = "sudo \(options.joined(separator: " ")) \(full.joined(separator: " "))"
         guard let lock = RecoveryLock.held else {
             throw SleepGuardError(command: command, status: -1, stderr: "not run: no recovery transaction holds the lock")
         }
@@ -148,7 +153,7 @@ struct PmsetSleepGuard: SleepGuarding {
         // that had to be stopped at the deadline as a timeout even if the
         // child exits 0 on SIGTERM, and a caller cancelled mid-flight stops
         // the child instead of leaving it running.
-        let r = try await runner.run(sudoPath, ["-n"] + full, timeout: commandTimeout, stop: .terminateOnly(grace: grace), holding: lock)
+        let r = try await runner.run(sudoPath, options + full, timeout: commandTimeout, stop: .terminateOnly(grace: grace), holding: lock)
         guard r.succeeded else {
             throw SleepGuardError(command: command, status: r.status, stderr: r.stderr)
         }

@@ -143,6 +143,41 @@ final class PrivilegedCommandLockTests: XCTestCase {
         XCTAssertTrue(try lockIsFree(), "the lock stayed held after the command exited")
     }
 
+    /// A check that runs a sudoers command only to see that it passes goes
+    /// through the same path: its extra sudo options come before `-n`, the
+    /// command holds the lock through a crash, and a failure names the
+    /// command as it was run.
+    func testCheckWithExtraSudoOptionsHoldsTheLockLikeAnyOther() async throws {
+        let sudo = try waiter("sudo")
+        let pmset = PmsetSleepGuard(sudo: sudo, pmset: "/usr/bin/pmset", timeout: 10, stopGrace: 1)
+        let handle = try XCTUnwrap(try lock.tryAcquire())
+        let check = Task {
+            try await RecoveryLock.$held.withValue(handle) { try await pmset.sudoPmset(["-a", "disablesleep", "0"], sudoOptions: ["-k"]) }
+        }
+        try await waitForFile(file("ready"))
+        XCTAssertEqual(try String(contentsOfFile: file("args"), encoding: .utf8), "-k -n /usr/bin/pmset -a disablesleep 0")
+
+        handle.release()
+
+        XCTAssertFalse(try lockIsFree(), "the crash freed the lock beside the live check")
+        FileManager.default.createFile(atPath: file("go"), contents: nil)
+        try await check.value
+        XCTAssertTrue(try lockIsFree(), "the lock stayed held after the check exited")
+
+        let failing = try script("sudo-fails", "echo 'a password is required' >&2; exit 1")
+        let refused = PmsetSleepGuard(sudo: failing, pmset: "/usr/bin/pmset", timeout: 10, stopGrace: 1)
+        let again = try XCTUnwrap(try lock.tryAcquire())
+        defer { again.release() }
+        do {
+            try await RecoveryLock.$held.withValue(again) { try await refused.sudoPmset(["-a", "disablesleep", "0"], sudoOptions: ["-k"]) }
+            XCTFail("a failed check returned")
+        } catch let error as SleepGuardError {
+            XCTAssertEqual(error.command, "sudo -k -n /usr/bin/pmset -a disablesleep 0")
+            XCTAssertEqual(error.status, 1)
+            XCTAssertTrue(error.stderr.contains("a password is required"), error.stderr)
+        }
+    }
+
     /// Outside a recovery transaction no `sudo pmset` runs at all: it
     /// could not hold the lock.
     func testPmsetIsNotRunWithoutTheLock() async throws {
