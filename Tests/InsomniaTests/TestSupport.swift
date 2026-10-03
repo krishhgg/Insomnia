@@ -740,3 +740,64 @@ final class FIFOWatch: @unchecked Sendable {
     private var isStopped: Bool { lock.lock(); defer { lock.unlock() }; return stopped }
     private func markSeen() { lock.lock(); seen = true; lock.unlock() }
 }
+
+/// Access control lists for the owner-only tests. `grantMadeUpGroup` uses a
+/// group UUID that names no group on any Mac, so no real account gains
+/// anything.
+enum TestACL {
+    static let madeUpGroup = UUID(uuidString: "6B1E2F3A-0000-4000-8000-1A2B3C4D5E6F")!
+
+    /// Adds one entry letting the made-up group read `url` (list and
+    /// search, for a directory), after any entries already there. With
+    /// `inherit`, files and directories created under it later get the
+    /// entry too. Does not follow a symlink.
+    static func grantMadeUpGroup(_ url: URL, inherit: Bool = false) throws {
+        var acl: acl_t? = acl_get_link_np(url.path, ACL_TYPE_EXTENDED) ?? acl_init(1)
+        defer { acl_free(UnsafeMutableRawPointer(acl)) }
+        var entry: acl_entry_t?
+        var group = madeUpGroup.uuid
+        var perms: acl_permset_t?
+        guard acl_create_entry(&acl, &entry) == 0,
+              acl_set_tag_type(entry, ACL_EXTENDED_ALLOW) == 0,
+              withUnsafeBytes(of: &group, { acl_set_qualifier(entry, $0.baseAddress) }) == 0,
+              acl_get_permset(entry, &perms) == 0 else { throw POSIXError(.EINVAL) }
+        for perm in [ACL_READ_DATA, ACL_EXECUTE, ACL_READ_ATTRIBUTES] { acl_add_perm(perms, perm) }
+        acl_set_permset(entry, perms)
+        if inherit {
+            var flags: acl_flagset_t?
+            acl_get_flagset_np(UnsafeMutableRawPointer(entry), &flags)
+            acl_add_flag_np(flags, ACL_ENTRY_FILE_INHERIT)
+            acl_add_flag_np(flags, ACL_ENTRY_DIRECTORY_INHERIT)
+            acl_set_flagset_np(UnsafeMutableRawPointer(entry), flags)
+        }
+        guard acl_set_link_np(url.path, ACL_TYPE_EXTENDED, acl) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+    }
+
+    /// Gives `url` one entry letting its owner, the user running the tests,
+    /// read it. On a 0200 file that entry is the only way to read it.
+    static func grantOwnerRead(_ url: URL) throws {
+        let chmod = Process()
+        chmod.executableURL = URL(fileURLWithPath: "/bin/chmod")
+        chmod.arguments = ["+a", "user:\(String(cString: getpwuid(getuid()).pointee.pw_name)) allow read", url.path]
+        let exit = ProcessExit(chmod)
+        try chmod.run()
+        exit.wait()
+        guard chmod.terminationStatus == 0 else { throw POSIXError(.EPERM) }
+    }
+
+    /// How many ACL entries `url` has, without following a symlink.
+    static func entries(_ url: URL) -> Int {
+        guard let acl = acl_get_link_np(url.path, ACL_TYPE_EXTENDED) else { return 0 }
+        defer { acl_free(UnsafeMutableRawPointer(acl)) }
+        var count = 0
+        var entry: acl_entry_t?
+        var which = ACL_FIRST_ENTRY.rawValue
+        while acl_get_entry(acl, which, &entry) == 0 {
+            count += 1
+            which = ACL_NEXT_ENTRY.rawValue
+        }
+        return count
+    }
+}

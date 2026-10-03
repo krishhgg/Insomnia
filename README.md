@@ -61,7 +61,7 @@ four power-setting commands. Review that permission before installing.
 | `~/Applications/Insomnia.app` | The menu bar app |
 | `~/Library/Application Support/Insomnia/` | Configuration, session/recovery journals, and `backstop.sh` |
 | `~/Library/LaunchAgents/com.insomnia.backstop.plist` | Per-user recovery agent |
-| `~/Library/Logs/Insomnia/` | `insomnia.log` and `handoffs.log` |
+| `~/Library/Logs/Insomnia/` | `insomnia.log` and `handoffs.log`, each capped at 1 MiB with one older copy kept as `.1`, unless you replace it with a symlink |
 | `/etc/sudoers.d/insomnia` | Permission for the four commands below |
 
 ```text
@@ -319,6 +319,26 @@ Lines the app writes to `insomnia.log` also go to the unified log with their
 bodies marked private, so `log show` and other local programs see `<private>`
 in place of the text unless private data logging is enabled on the Mac. The
 backstop's lines go only to `insomnia.log`, which keeps the full text of both.
+The files in Application Support/Insomnia and Logs/Insomnia (config, session,
+journal, recovery lock, the two logs) are owner-only, mode 0600 with those two
+directories 0700, and one left looser by an older build is tightened the next
+time the app or the backstop opens it. An access control list (ACL) on them,
+such as one inherited from a parent folder or copied with the files, can let
+another account in whatever the mode says, so tightening also removes it, as
+`chmod -N` does, when the owner's mode bits already give you read and write
+(and search, for a folder). When they do not, an ACL entry may be what lets
+Insomnia read the file, as with a journal set to 0200, so the ACL stays and
+`insomnia.log` gets a warning naming the path. New files are checked the same
+way before anything is written to them. `ls -le` shows any entries. The
+LaunchAgent plist and the installed
+scripts hold no private data and keep the modes the installer gives them.
+`insomnia.log` and `handoffs.log` are capped at 1 MiB: a
+log past the cap is renamed to `insomnia.log.1` or `handoffs.log.1`,
+replacing the previous copy, and a new file starts. The cap does not apply
+to a log you replace with a symlink. Insomnia writes through the link and
+never rotates it, since the rename would move the link and not the file it
+points to, and it logs that once. You set up the link, so trimming the file
+it points to is up to you.
 
 `INSOMNIA_HOME` relocates app support files, logs, and LaunchAgents for testing.
 It is **not an installation sandbox**: installation/removal also involves the

@@ -1487,12 +1487,15 @@ final class RecoveryScriptTests: XCTestCase {
     func testUninstallPurgeRemovesOwnedFilesAndEmptyDirectoriesOnly() throws {
         try fx.installMachinery()
         try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
-        try "handoffs\n".write(to: fx.home.appendingPathComponent("Logs/handoffs.log"), atomically: true, encoding: .utf8)
+        for rotated in ["Logs/handoffs.log", "Logs/insomnia.log.1", "Logs/handoffs.log.1"] {
+            try "older lines\n".write(to: fx.home.appendingPathComponent(rotated), atomically: true, encoding: .utf8)
+        }
 
         let r = try fx.run(fx.uninstall, ["--purge"])
 
         XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
         for gone in [fx.state, fx.config, fx.logFile, fx.home.appendingPathComponent("Logs/handoffs.log"),
+                     fx.home.appendingPathComponent("Logs/insomnia.log.1"), fx.home.appendingPathComponent("Logs/handoffs.log.1"),
                      fx.installedBackstop, fx.plist, fx.app, fx.sudoers] {
             XCTAssertFalse(fx.exists(gone), gone.path)
         }
@@ -1531,6 +1534,249 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(fx.exists(fx.lock))
         XCTAssertFalse(fx.exists(fx.plist))
         XCTAssertTrue(r.stdout.contains("Kept \(fx.home.appendingPathComponent("Logs").path)"), r.stdout)
+    }
+
+    func testUninstallPurgeKeepsADirectoryNamedLikeARotatedLogAndFinishes() throws {
+        try fx.installMachinery()
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        let rotatedDir = fx.home.appendingPathComponent("Logs/insomnia.log.1", isDirectory: true)
+        try FileManager.default.createDirectory(at: rotatedDir, withIntermediateDirectories: true)
+        try "theirs".write(to: rotatedDir.appendingPathComponent("a.txt"), atomically: true, encoding: .utf8)
+        try "older lines\n".write(to: fx.home.appendingPathComponent("Logs/handoffs.log.1"), atomically: true, encoding: .utf8)
+
+        let r = try fx.run(fx.uninstall, ["--purge"])
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertTrue(r.stdout.contains("Left \(rotatedDir.path): it is not a regular file, so Insomnia did not write it."), r.stdout)
+        XCTAssertTrue(r.stdout.hasSuffix("Done.\n"), r.stdout)
+        XCTAssertTrue(fx.exists(rotatedDir.appendingPathComponent("a.txt")))
+        for gone in [fx.state, fx.config, fx.logFile, fx.home.appendingPathComponent("Logs/handoffs.log.1")] {
+            XCTAssertFalse(fx.exists(gone), gone.path)
+        }
+    }
+
+    // MARK: - Owner-only files
+
+    /// `umask 077`: the log and its directory, the lock file and the
+    /// republished journal are owner-only even when the journal the run
+    /// started from was world-readable.
+    func testBackstopCreatesOwnerOnlyFilesAndRepublishesTheJournalOwnerOnly() throws {
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: fx.state.path)
+        XCTAssertFalse(fx.exists(fx.lock), "the fixture starts without a lock file")
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 0, r.stderr)
+        XCTAssertEqual(try fx.mode(fx.logFile), 0o600)
+        XCTAssertEqual(try fx.mode(fx.logFile.deletingLastPathComponent()), 0o700)
+        XCTAssertEqual(try fx.mode(fx.lock), 0o600)
+        XCTAssertEqual(try fx.mode(fx.state), 0o600, "the published journal must not inherit 0644 from the old one")
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, false)
+    }
+
+    /// An upgrade over an older build: the log, lock, journal, session and
+    /// the two directories it left loose are tightened by the backstop too,
+    /// since it may run before the upgraded app has opened them.
+    func testBackstopTightensWhatAnOlderBuildLeftLoose() throws {
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: 3600))
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        let logsDir = fx.logFile.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: logsDir, withIntermediateDirectories: true)
+        try "old line\n".write(to: fx.logFile, atomically: true, encoding: .utf8)
+        try "".write(to: fx.lock, atomically: true, encoding: .utf8)
+        for (url, mode) in [(fx.home, 0o755), (logsDir, 0o755), (fx.logFile, 0o644), (fx.lock, 0o644), (fx.state, 0o644), (fx.session, 0o644)] {
+            try FileManager.default.setAttributes([.posixPermissions: mode], ofItemAtPath: url.path)
+        }
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 0, r.stderr)
+        XCTAssertEqual(try fx.mode(fx.home), 0o700)
+        XCTAssertEqual(try fx.mode(logsDir), 0o700)
+        for file in [fx.logFile, fx.lock, fx.state, fx.session] {
+            XCTAssertEqual(try fx.mode(file), 0o600, file.lastPathComponent)
+        }
+        XCTAssertTrue(fx.log().hasPrefix("old line\n"), "the loose log was replaced instead of kept")
+        XCTAssertEqual(fx.chmodCalls(), [fx.home, logsDir, fx.logFile, fx.lock, fx.state, fx.session].map { "chmod go-rwx \($0.path)" },
+            "the backstop changes modes through its fixed CHMOD path")
+    }
+
+    /// Tightening only takes group and other access away. An owner bit an
+    /// older build or the user left off stays off: a write-only log stays
+    /// write-only (0244 becomes 0200, not 0600) and a Logs directory the
+    /// owner cannot list stays unlistable (0355 becomes 0300, not 0700).
+    func testBackstopTighteningNeverAddsAPermission() throws {
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        let logsDir = fx.logFile.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: logsDir, withIntermediateDirectories: true)
+        try "old line\n".write(to: fx.logFile, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o244], ofItemAtPath: fx.logFile.path)
+        try FileManager.default.setAttributes([.posixPermissions: 0o355], ofItemAtPath: logsDir.path)
+        defer {
+            _ = chmod(logsDir.path, 0o700)
+            _ = chmod(fx.logFile.path, 0o600)
+        }
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 0, r.stderr)
+        XCTAssertEqual(try fx.mode(fx.logFile), 0o200)
+        XCTAssertEqual(try fx.mode(logsDir), 0o300)
+    }
+
+    // The journal is mode 0200 and only an ACL entry lets its owner read
+    // it. Tightening leaves the entry, so the backstop still reads the
+    // journal and turns sleep back on. Publishing the cleared journal still
+    // fails, as it does on main: the entry lets the owner read the file's
+    // data but not its extended attributes, and cp fails copying those.
+    // The journal is kept for the next run, so the exit status is not
+    // checked here.
+    func testBackstopKeepsAnOwnerACLAndStillUndoesTheJournal() throws {
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        XCTAssertEqual(chmod(fx.state.path, 0o200), 0)
+        try TestACL.grantOwnerRead(fx.state)
+        XCTAssertTrue(FileManager.default.isReadableFile(atPath: fx.state.path))
+
+        _ = try fx.run(fx.backstop)
+
+        XCTAssertEqual(fx.calls(), ["sudo -n \(fx.fakePmset) -a disablesleep 0"], fx.log())
+        XCTAssertFalse(fx.log().contains("unreadable or malformed"), fx.log())
+        XCTAssertEqual(TestACL.entries(fx.state), 1)
+    }
+
+    /// A tree copied with an entry for another account: 0700 directories
+    /// that pass it down, and a 0600 log, lock and journal. The owner bits
+    /// give the backstop all it needs, so it removes every one of them, and
+    /// the journal it publishes while undoing has none. The fixture root
+    /// above INSOMNIA_HOME is not Insomnia's, so its entry stays.
+    func testBackstopRemovesAnACLWhenTheOwnerBitsGiveItAccess() throws {
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        let logsDir = fx.logFile.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: logsDir, withIntermediateDirectories: true)
+        try "old line\n".write(to: fx.logFile, atomically: true, encoding: .utf8)
+        try "".write(to: fx.lock, atomically: true, encoding: .utf8)
+        for (url, mode) in [(fx.home, 0o700), (logsDir, 0o700), (fx.logFile, 0o600), (fx.lock, 0o600), (fx.state, 0o600)] {
+            XCTAssertEqual(chmod(url.path, mode_t(mode)), 0)
+            try TestACL.grantMadeUpGroup(url, inherit: url.hasDirectoryPath)
+        }
+        try TestACL.grantMadeUpGroup(fx.root, inherit: true)
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 0, r.stderr + fx.log())
+        XCTAssertEqual(fx.calls(), ["sudo -n \(fx.fakePmset) -a disablesleep 0"])
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, false)
+        for url in [fx.home, logsDir, fx.logFile, fx.lock, fx.state] {
+            XCTAssertEqual(TestACL.entries(url), 0, url.path)
+        }
+        XCTAssertEqual(TestACL.entries(fx.root), 1, "the fixture root is not Insomnia's")
+        XCTAssertFalse(fx.log().contains("access control list"), fx.log())
+    }
+
+    /// A 0700 INSOMNIA_HOME that passes an entry for another account down.
+    /// The Logs folder the backstop creates in it inherits the entry and
+    /// loses it, and the log, lock and journal it then writes have none.
+    func testBackstopRemovesAnInheritedACLFromTheFolderItCreates() throws {
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        XCTAssertEqual(chmod(fx.home.path, 0o700), 0)
+        try TestACL.grantMadeUpGroup(fx.home, inherit: true)
+        let logsDir = fx.logFile.deletingLastPathComponent()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: logsDir.path))
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 0, r.stderr + fx.log())
+        XCTAssertEqual(fx.calls(), ["sudo -n \(fx.fakePmset) -a disablesleep 0"])
+        for url in [fx.home, logsDir, fx.logFile, fx.lock, fx.state] {
+            XCTAssertEqual(TestACL.entries(url), 0, url.path)
+        }
+    }
+
+    /// The 0200 journal from the test above, with an entry for another
+    /// account too. The owner bits fall short, so the whole ACL stays, a
+    /// warning names the journal, and recovery still runs. The journal
+    /// stays dirty, as above, so the next run undoes it again, but the log
+    /// already has the warning and does not get it a second time.
+    func testBackstopKeepsAnACLWithAWarningWhenTheOwnerBitsFallShort() throws {
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        XCTAssertEqual(chmod(fx.state.path, 0o200), 0)
+        try TestACL.grantOwnerRead(fx.state)
+        try TestACL.grantMadeUpGroup(fx.state)
+
+        _ = try fx.run(fx.backstop)
+        _ = try fx.run(fx.backstop)
+
+        XCTAssertEqual(fx.calls(), Array(repeating: "sudo -n \(fx.fakePmset) -a disablesleep 0", count: 2), fx.log())
+        XCTAssertEqual(TestACL.entries(fx.state), 2)
+        XCTAssertEqual(fx.log().components(separatedBy: "[warning] backstop: kept the access control list on \(fx.state.path):").count, 2, fx.log())
+    }
+
+    /// INSOMNIA_HOME and Logs both keep their ACL (0300: the owner cannot
+    /// list them) and pass an entry for another account down. Each is
+    /// warned about, and every file the backstop creates in them (the lock,
+    /// the log and the journal it publishes) loses the inherited entry
+    /// before anything is written to it.
+    func testBackstopChecksWhatItCreatesInAFolderThatKeepsItsACL() throws {
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        let logsDir = fx.logFile.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: logsDir, withIntermediateDirectories: true)
+        for dir in [fx.home, logsDir] {
+            try TestACL.grantMadeUpGroup(dir, inherit: true)
+        }
+        XCTAssertEqual(chmod(logsDir.path, 0o300), 0)
+        XCTAssertEqual(chmod(fx.home.path, 0o300), 0)
+        defer {
+            _ = chmod(fx.home.path, 0o700)
+            _ = chmod(logsDir.path, 0o700)
+        }
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 0, r.stderr + fx.log())
+        XCTAssertEqual(fx.calls(), ["sudo -n \(fx.fakePmset) -a disablesleep 0"])
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, false)
+        for url in [fx.lock, fx.logFile, fx.state] {
+            XCTAssertEqual(TestACL.entries(url), 0, url.path)
+        }
+        for dir in [fx.home, logsDir] {
+            XCTAssertEqual(TestACL.entries(dir), 1, dir.path)
+            XCTAssertEqual(fx.log().components(separatedBy: "[warning] backstop: kept the access control list on \(dir.path):").count, 2, fx.log())
+        }
+    }
+
+    /// A Logs folder that is a symlink to a folder passing an entry for
+    /// another account down. Tightening skips the link and its target, so
+    /// the log the backstop creates there is checked on its own before its
+    /// first line and loses the inherited entry. The target keeps its own.
+    func testBackstopChecksANewLogInASymlinkedLogsFolder() throws {
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        let elsewhere = fx.root.appendingPathComponent("elsewhere", isDirectory: true)
+        try FileManager.default.createDirectory(at: elsewhere, withIntermediateDirectories: true)
+        try TestACL.grantMadeUpGroup(elsewhere, inherit: true)
+        try FileManager.default.createSymbolicLink(at: fx.logFile.deletingLastPathComponent(), withDestinationURL: elsewhere)
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 0, r.stderr + fx.log())
+        XCTAssertFalse(fx.log().isEmpty)
+        XCTAssertEqual(TestACL.entries(elsewhere.appendingPathComponent("insomnia.log")), 0)
+        XCTAssertEqual(TestACL.entries(elsewhere), 1, "the link's target is not Insomnia's")
+    }
+
+    func testBackstopLogsAFailedTighteningAndStillRecovers() throws {
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: fx.state.path)
+        try fx.state.path.write(to: fx.root.appendingPathComponent("chmod.fail"), atomically: true, encoding: .utf8)
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 0, r.stderr)
+        XCTAssertEqual(fx.calls(), ["sudo -n \(fx.fakePmset) -a disablesleep 0"], "recovery went on after the failed chmod")
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, false)
+        XCTAssertTrue(fx.log().contains("[error] backstop: could not make \(fx.state.path) owner-only: chmod: \(fx.state.path): Operation not permitted\n"), fx.log())
+        XCTAssertEqual(fx.log().components(separatedBy: "owner-only").count, 2, "only the failed path is reported: \(fx.log())")
     }
 
     // MARK: - Journal shape (typed corruption)
@@ -2574,6 +2820,7 @@ private final class ScriptFixture {
             "PS": bin.appendingPathComponent("ps").path,
             "KILL": bin.appendingPathComponent("kill").path,
             "SYSCTL": bin.appendingPathComponent("sysctl").path,
+            "CHMOD": bin.appendingPathComponent("chmod").path,
             "DEFAULTS": bin.appendingPathComponent("defaults").path,
             "DATE": bin.appendingPathComponent("date").path,
             "LOCK_TIMEOUT_SECONDS": "1",
@@ -2751,6 +2998,17 @@ private final class ScriptFixture {
         """)
         try writeFake("sysctl", """
         cat "\(r)/boot.uuid"
+        """)
+        // chmod: recorded in chmod.calls, apart from calls.log, then run for
+        // real so the modes still change. A path listed in chmod.fail fails
+        // the way an immutable file does.
+        try writeFake("chmod", """
+        printf 'chmod %s\\n' "$*" >> "\(r)/chmod.calls"
+        if [[ -f "\(r)/chmod.fail" ]] && grep -qxF -- "${2:-}" "\(r)/chmod.fail"; then
+          echo "chmod: ${2:-}: Operation not permitted" >&2
+          exit 1
+        fi
+        exec /bin/chmod "$@"
         """)
         // date: the real tool, except that with date.mode present the stamp
         // a moved-aside session.json is named after (`-u +%Y%m%dT%H%M%SZ`)
@@ -3025,6 +3283,11 @@ private final class ScriptFixture {
         return text.split(separator: "\n").map(String.init)
     }
 
+    func chmodCalls() -> [String] {
+        guard let text = try? String(contentsOf: root.appendingPathComponent("chmod.calls"), encoding: .utf8) else { return [] }
+        return text.split(separator: "\n").map(String.init)
+    }
+
     func clearCalls() {
         try? fm.removeItem(at: callsLog)
     }
@@ -3041,6 +3304,13 @@ private final class ScriptFixture {
             "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
             "INSOMNIA_HOME": home.path,
         ]
+    }
+
+    /// POSIX mode bits of a file or directory.
+    func mode(_ url: URL) throws -> Int {
+        let attrs = try fm.attributesOfItem(atPath: url.path)
+        guard let m = attrs[.posixPermissions] as? Int else { throw FixtureError("no mode for \(url.path)") }
+        return m
     }
 
     /// Inode of a file, to prove the lock file was retained rather than replaced.

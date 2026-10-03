@@ -17,13 +17,22 @@ other processes running as that user can invoke them too. The app is not
 sandboxed; local logs can contain SSIDs, process metadata, and tmux target names.
 The lines the app writes to `insomnia.log` also reach the unified log with the
 body marked private, so programs reading `log show` see `<private>` instead of
-those names unless private data logging is enabled on the Mac. Hotspot
-passwords are stored in the login Keychain. Location Services access is
-requested only when a hotspot is saved or a session starts with one
-configured; it is used to read Wi-Fi network names and the app never requests
-location updates. With the App Nap setting on (off by default), the app writes
-`NSAppSleepDisabled` into the preferences of each app on the agent list, after
-recording the previous value in its journal, and puts it back at session end.
+those names unless private data logging is enabled on the Mac. The files
+Insomnia creates (logs, journal, session, config, recovery lock) are mode 0600
+and its directories 0700; the backstop runs with `umask 077`. An access
+control list on them, such as one inherited from a parent folder, is removed,
+new files included, when the owner's mode bits already give the owner read and
+write (and search, for a directory). When they do not, an entry may be what
+lets recovery read its journal, so the ACL stays, a warning in the log names
+the path, and any access it gives another account stays with it. Logs are capped at
+1 MiB with one older copy kept. A log the user replaced with a symlink is not
+rotated: the file it points to is the user's to manage. Hotspot passwords are stored in the login
+Keychain. Location Services access is requested only when a hotspot is saved or
+a session starts with one configured; it is used to read Wi-Fi network names and
+the app never requests location updates. With the App Nap setting on (off by
+default), the app writes `NSAppSleepDisabled` into the preferences of each app
+on the agent list, after recording the previous value in its journal, and puts
+it back at session end.
 
 Passing automated checks or a secret scan does not establish the absence of
 vulnerabilities. Do not probe recovery by disrupting someone else's processes,

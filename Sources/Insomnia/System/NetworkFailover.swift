@@ -430,19 +430,12 @@ final class NetworkFailover {
         onRecovered?(gap)
     }
 
+    /// Owner-only, rotated to handoffs.log.1 past OwnerOnly.maxLogBytes.
     private func appendHandoff(_ line: String) {
         do {
-            try FileManager.default.createDirectory(at: paths.logs, withIntermediateDirectories: true)
-            let url = paths.handoffsLog
-            if !FileManager.default.fileExists(atPath: url.path) {
-                FileManager.default.createFile(atPath: url.path, contents: nil)
-            }
-            let h = try FileHandle(forWritingTo: url)
-            defer { try? h.close() }
-            try h.seekToEnd()
-            try h.write(contentsOf: Data((line + "\n").utf8))
+            try OwnerOnly.appendToLog(line + "\n", at: paths.handoffsLog)
         } catch {
-            Log.error("handoffs.log append failed: \(error.localizedDescription)")
+            Log.error("handoffs.log: \(error.localizedDescription)")
         }
     }
 }
