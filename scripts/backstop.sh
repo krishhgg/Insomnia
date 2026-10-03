@@ -340,6 +340,17 @@ epoch_of() { # string
   return 0
 }
 
+# epoch_of the string at a keypath, read exactly as the app's decoder sees
+# it. Command substitution strips every trailing newline, stored ones too,
+# so a sentinel follows plutil's output and only plutil's own newline is
+# cut: "...Z\n" in the file is refused here as it is in the app.
+epoch_at() { # file keypath
+  local v
+  v="$(extract "$1" "$2"; echo .)"
+  v="${v%.}"
+  epoch_of "${v%$'\n'}"
+}
+
 # Prints one line per way session.json does not have the shape the app's
 # Session decoder needs (Session.swift): a JSON object whose startedAt and
 # endsAt are dates as Store.swift writes them and whose extensions is an
@@ -361,7 +372,7 @@ session_shape_problems() { # file
       echo "$key is missing"
     elif [[ "$t" != string ]]; then
       echo "$key is a JSON $t, not a date string"
-    elif [[ -z "$(epoch_of "$(extract "$f" "$key" || true)")" ]]; then
+    elif [[ -z "$(epoch_at "$f" "$key")" ]]; then
       echo "$key is not a date in the form 2027-01-15T08:00:00Z or 2027-01-15T10:00:00+02:00"
     fi
   done
@@ -401,7 +412,7 @@ if [[ -e "$SESSION" ]]; then
       session_state=malformed
     else
       ends_at="$(extract "$SESSION" endsAt || true)"
-      if (( $(epoch_of "$ends_at") > $("$DATE" -u +%s) )); then
+      if (( $(epoch_at "$SESSION" endsAt) > $("$DATE" -u +%s) )); then
         session_state=valid
       else
         session_state=expired

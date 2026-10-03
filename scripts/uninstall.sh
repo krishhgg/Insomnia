@@ -270,6 +270,15 @@ epoch_of() { # string
   fi
   return 0
 }
+
+# Same as backstop.sh: epoch_of the string exactly as stored, with only
+# plutil's own trailing newline cut.
+epoch_at() { # file keypath
+  local v
+  v="$(extract "$1" "$2"; echo .)"
+  v="${v%.}"
+  epoch_of "${v%$'\n'}"
+}
 session_shape_problems() { # file
   local f="$1" key t i
   # plutil also reads XML and binary property lists, which the app's
@@ -285,7 +294,7 @@ session_shape_problems() { # file
       echo "$key is missing"
     elif [[ "$t" != string ]]; then
       echo "$key is a JSON $t, not a date string"
-    elif [[ -z "$(epoch_of "$(extract "$f" "$key" || true)")" ]]; then
+    elif [[ -z "$(epoch_at "$f" "$key")" ]]; then
       echo "$key is not a date in the form 2027-01-15T08:00:00Z or 2027-01-15T10:00:00+02:00"
     fi
   done

@@ -622,11 +622,15 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, true)
     }
 
-    /// Dates the app and both scripts must read alike: each script's
-    /// epoch_of gives the second the app's Session decoder gives, or both
-    /// refuse. Most refused ones are dates JSONDecoder's `.iso8601` took on
-    /// macOS 26 while the scripts did not, so the app could keep a deadline
-    /// that the backstop ended every minute.
+    /// Dates the app and both scripts must read alike. Each one is written
+    /// into a session.json and read back the way each script reads it
+    /// (plutil, then epoch_at and epoch_of cut from the script), and the
+    /// second it gives must be the one the app's Session decoder gives, or
+    /// both must refuse. Most refused ones are dates JSONDecoder's
+    /// `.iso8601` took on macOS 26 while the scripts did not, so the app
+    /// could keep a deadline that the backstop ended every minute. The
+    /// whitespace ones check the read itself: command substitution would
+    /// strip a stored trailing newline.
     func testScriptsAndAppReadTheSameSessionDates() throws {
         let cases = [
             "2027-01-15T08:00:00Z", "2027-01-15T10:00:00+02:00", "2027-01-15T02:30:00-05:30", "2027-01-15T08:00:00+00:00",
@@ -640,23 +644,35 @@ final class RecoveryScriptTests: XCTestCase {
             "2027-01-15T08:00:00Zjunk", "2027-01-15T08:00:00Z ", " 2027-01-15T08:00:00Z", "2027-01-15T08:00:00+02:00:00",
             "2027-1-5T8:0:0Z", "2027-01-15 08:00:00Z", "2027-01-15T08:00:00", "2027-01-15T08:00Z", "10000-01-01T00:00:00Z",
             "+2027-01-15T08:00:00Z", "\u{FF12}\u{FF10}\u{FF12}\u{FF17}-01-15T08:00:00Z", "2027-01-15T08:00:00\u{2212}02:00", "",
+            "2027-01-15T08:00:00Z\n", "2027-01-15T08:00:00Z\n\n", "\n2027-01-15T08:00:00Z", "2027-01-15T08:00:00Z\r",
+            "2027-01-15T08:00:00Z\t", "2027-01-15T08:00:00+02:00\n",
         ]
-        let app: [String] = cases.map { text in
-            let json = #"{"startedAt":"2027-01-15T08:00:00Z","endsAt":"\#(text)","extensions":[]}"#
-            guard let s = try? Store.makeDecoder().decode(Session.self, from: Data(json.utf8)) else { return "" }
-            return String(Int(s.endsAt.timeIntervalSince1970))
+        let dir = fx.root.appendingPathComponent("dates", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        var files: [String] = []
+        var app: [String] = []
+        for (i, text) in cases.enumerated() {
+            let data = try JSONSerialization.data(withJSONObject: ["startedAt": "2027-01-15T08:00:00Z", "endsAt": text, "extensions": [Int]()])
+            let file = dir.appendingPathComponent("\(i).json")
+            try data.write(to: file)
+            files.append(file.path)
+            app.append((try? Store.makeDecoder().decode(Session.self, from: data)).map { String(Int($0.endsAt.timeIntervalSince1970)) } ?? "")
         }
         XCTAssertEqual(app.filter { !$0.isEmpty }.count, 11, "the app reads the first eleven: \(Array(zip(cases, app)))")
         for script in [fx.backstop, fx.uninstall] {
             let text = try String(contentsOf: script, encoding: .utf8)
-            let start = try XCTUnwrap(text.range(of: "\nepoch_of() {"), script.lastPathComponent)
-            let end = try XCTUnwrap(text.range(of: "\n}\n", range: start.upperBound..<text.endIndex))
-            let harness = fx.root.appendingPathComponent("epoch_of.\(script.lastPathComponent)")
-            try ("set -euo pipefail\nDATE=/bin/date" + text[start.lowerBound..<end.upperBound]
-                + #"for s in "$@"; do printf '[%s]\n' "$(epoch_of "$s")"; done"# + "\n")
+            var functions = ""
+            for name in ["extract", "epoch_of", "epoch_at"] {
+                let start = try XCTUnwrap(text.range(of: "\n\(name)() {"), "\(name) in \(script.lastPathComponent)")
+                let end = try XCTUnwrap(text.range(of: "\n}\n", range: start.upperBound..<text.endIndex))
+                functions += text[start.lowerBound..<end.upperBound]
+            }
+            let harness = fx.root.appendingPathComponent("epoch_at.\(script.lastPathComponent)")
+            try ("set -euo pipefail\nPLUTIL=/usr/bin/plutil\nDATE=/bin/date" + functions
+                + #"for f in "$@"; do printf '[%s]\n' "$(epoch_at "$f" endsAt)"; done"# + "\n")
                 .write(to: harness, atomically: true, encoding: .utf8)
 
-            let r = try fx.run(harness, cases)
+            let r = try fx.run(harness, files)
 
             XCTAssertEqual(r.status, 0, r.stderr)
             let shell = r.stdout.split(separator: "\n", omittingEmptySubsequences: false).dropLast().map { String($0.dropFirst().dropLast()) }
@@ -665,6 +681,31 @@ final class RecoveryScriptTests: XCTestCase {
                 XCTAssertEqual(shell[i], app[i], "\(script.lastPathComponent) and the app read \(text.debugDescription) differently")
             }
         }
+    }
+
+    /// A future endsAt with a newline stored after it is not a date for the
+    /// app, so it is not one for the backstop either: the session is
+    /// malformed, the journal is undone and the file moved aside, as the
+    /// app does.
+    func testFutureEndsAtWithAStoredTrailingNewlineIsNotASession() throws {
+        let f = ISO8601DateFormatter()
+        let data = try JSONSerialization.data(withJSONObject: [
+            "startedAt": f.string(from: Date(timeIntervalSinceNow: -60)),
+            "endsAt": f.string(from: Date(timeIntervalSinceNow: 3600)) + "\n",
+            "extensions": [Int](),
+        ])
+        XCTAssertNil(try? Store.makeDecoder().decode(Session.self, from: data), "the app reads it")
+        try data.write(to: fx.session)
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 0, r.stderr + fx.log())
+        XCTAssertEqual(fx.calls(), ["sudo -n \(fx.fakePmset) -a disablesleep 0"])
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, false)
+        XCTAssertFalse(fx.exists(fx.session))
+        XCTAssertEqual(try movedAsideSessions().count, 1)
+        XCTAssertTrue(fx.log().contains("endsAt is not a date in the form"), fx.log())
     }
 
     /// A session written with offsets is a session for the backstop too: a
