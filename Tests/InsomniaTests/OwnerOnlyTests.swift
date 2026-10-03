@@ -353,7 +353,7 @@ final class HandoffsLogPermissionTests: XCTestCase {
 
     func testHandoffsLogIsCreatedOwnerOnly() async throws {
         let clock = FakeClock(Date(timeIntervalSince1970: 1_800_000_000))
-        let n = NetworkFailover(paths: home.paths, keychain: FakeKeychainStore(), nudge: TmuxNudge { _ in true }, notifier: RecordingNotifier(), clock: { clock.now }) { Config() }
+        let n = NetworkFailover(paths: home.paths, keychain: FakeKeychainStore(), nudge: TmuxNudge { _, _ in true }, notifier: RecordingNotifier(), clock: { clock.now }) { Config() }
 
         await n.simulate(satisfied: false)
         clock.advance(20)
