@@ -2011,14 +2011,14 @@ final class RecoveryScriptTests: XCTestCase {
         try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
         fx.setMode("launchctl", "loaded")
 
-        let plain = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+        let plain = try fx.run(fx.installRedirected, ["--yes"])
         XCTAssertEqual(plain.status, 0, plain.stderr + plain.stdout)
         let plainBuilds = fx.calls().filter { $0.hasPrefix("swift build") }
         XCTAssertEqual(plainBuilds, ["swift build -c release", "swift build -c release --show-bin-path"], "\(fx.calls())")
         XCTAssertFalse(plain.stdout.contains("lid simulation compiled in"), plain.stdout)
 
         fx.clearCalls()
-        let simulated = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester", "INSOMNIA_LID_SIMULATION": "1"])
+        let simulated = try fx.run(fx.installRedirected, ["--yes"], extraEnvironment: ["INSOMNIA_LID_SIMULATION": "1"])
         XCTAssertEqual(simulated.status, 0, simulated.stderr + simulated.stdout)
         let simulatedBuilds = fx.calls().filter { $0.hasPrefix("swift build") }
         XCTAssertEqual(simulatedBuilds, [
@@ -2029,7 +2029,7 @@ final class RecoveryScriptTests: XCTestCase {
 
         // Any other value is "off": the define is a deliberate opt-in.
         fx.clearCalls()
-        let other = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester", "INSOMNIA_LID_SIMULATION": "yes"])
+        let other = try fx.run(fx.installRedirected, ["--yes"], extraEnvironment: ["INSOMNIA_LID_SIMULATION": "yes"])
         XCTAssertEqual(other.status, 0, other.stderr + other.stdout)
         XCTAssertEqual(fx.calls().filter { $0.hasPrefix("swift build") }.first, "swift build -c release", "\(fx.calls())")
     }
