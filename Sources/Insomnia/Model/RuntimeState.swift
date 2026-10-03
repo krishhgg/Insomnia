@@ -63,6 +63,21 @@ struct FrozenProcess: Codable, Equatable, Hashable, Sendable {
     }
 }
 
+/// One agent app whose `NSAppSleepDisabled` Insomnia set to YES for the
+/// session (spec section 5), and the value the key had in that domain
+/// before: nil when it was absent, so the restore deletes the key. Flat
+/// keys so backstop.sh can read them with plutil; `previous` is left out
+/// of the JSON when nil.
+struct AppNapOverride: Codable, Equatable, Hashable, Sendable {
+    let bundleId: String
+    let previous: Bool?
+
+    init(bundleId: String, previous: Bool?) {
+        self.bundleId = bundleId
+        self.previous = previous
+    }
+}
+
 /// Everything Insomnia has changed on the machine and must undo.
 /// Written to disk *before* each change is made and undone from disk, never
 /// from memory (spec section 8 invariants).
@@ -87,6 +102,10 @@ struct RuntimeState: Codable, Equatable, Sendable {
     /// backstop ignores it and keeps it, and the app drops it if it finds
     /// the mode cleared by someone else.
     var displayRestoredUnderLowPower: Float? = nil
+    /// Agent apps whose App Nap preference Insomnia set for the session,
+    /// each with the value to put back. Not a lid action: restored at
+    /// session end, at reconcile, or by the backstop with `defaults`.
+    var appNapOverrides: [AppNapOverride] = []
 
     /// Bare pids of every journaled freeze, for display and de-duplication.
     var frozenPids: [Int32] { frozenProcesses.map(\.pid) }
@@ -96,7 +115,7 @@ struct RuntimeState: Codable, Equatable, Sendable {
 
     /// True when at least one entry still needs undoing.
     var isDirty: Bool {
-        sleepDisabledByUs || lowPowerSetByUs || hasLidActions
+        sleepDisabledByUs || lowPowerSetByUs || hasLidActions || !appNapOverrides.isEmpty
     }
 
     /// True when a lid close left something to undo on lid open: freezes,
@@ -110,6 +129,7 @@ struct RuntimeState: Codable, Equatable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case sleepDisabledByUs, lowPowerSetByUs, frozenProcesses, frozenPids, dockerFrozen, savedOutputVolume, savedMuted
         case savedDisplayBrightness, savedKeyboardBrightness, displayRestoredUnderLowPower
+        case appNapOverrides
     }
 
     // Tolerate missing keys so a state.json written by an older build, or by
@@ -133,6 +153,7 @@ struct RuntimeState: Codable, Equatable, Sendable {
         savedDisplayBrightness = try c.decodeIfPresent(Float.self, forKey: .savedDisplayBrightness)
         savedKeyboardBrightness = try c.decodeIfPresent(Float.self, forKey: .savedKeyboardBrightness)
         displayRestoredUnderLowPower = try c.decodeIfPresent(Float.self, forKey: .displayRestoredUnderLowPower)
+        appNapOverrides = try c.decodeIfPresent([AppNapOverride].self, forKey: .appNapOverrides) ?? []
     }
 
     /// `frozenPids` is read for migration only and never written again, so
@@ -148,5 +169,6 @@ struct RuntimeState: Codable, Equatable, Sendable {
         try c.encodeIfPresent(savedDisplayBrightness, forKey: .savedDisplayBrightness)
         try c.encodeIfPresent(savedKeyboardBrightness, forKey: .savedKeyboardBrightness)
         try c.encodeIfPresent(displayRestoredUnderLowPower, forKey: .displayRestoredUnderLowPower)
+        try c.encode(appNapOverrides, forKey: .appNapOverrides)
     }
 }
