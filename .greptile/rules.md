@@ -32,10 +32,13 @@ for the backstop or uninstall, which keeps state.json for it, nor for the
 app while the guard refuses that device. A build whose guard allows the call
 writes the flagged value only while the device still reads 0, the level the
 lid close left: a higher reading means the user already undid the darkening
-by hand, so the entry is cleared without a write. Legacy `frozenPids` entries
-are never signaled or cleared by the shell. A flag is cleared only after
-its undo succeeded; a journal that is unreadable or has a known key of the
-wrong type is left untouched and the run exits 1.
+by hand, so the entry is cleared without a write. Only a reading taken while
+macOS is not holding the device down counts: the display awake, the keyboard
+backlight neither suppressed nor dimmed. A reading taken while macOS holds it
+down, or a read that fails, leaves the entry as it is for a later read. Legacy
+`frozenPids` entries are never signaled or cleared by the shell. A flag is
+cleared only after its undo succeeded; a journal that is unreadable or has a
+known key of the wrong type is left untouched and the run exits 1.
 
 The app and the script serialize on one `flock(2)` lock,
 `.recovery.lock`, which is never unlinked so both lock the same inode

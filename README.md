@@ -122,7 +122,8 @@ on whatever version. If either check refuses a device, Insomnia leaves it
 alone and Settings says why under the toggle. A level saved before an update
 that the check now refuses stays saved for a version that can restore it, and
 the menu says to set it with the brightness keys meanwhile. That version leaves
-a level you set by hand alone.
+a level you set by hand alone, and decides only on a reading taken with the
+display awake and the keys not dimmed.
 The display comes back to the brightness sampled while the lid was open, not
 the reading at the moment of closing (auto-brightness has already dimmed the
 panel under the closing lid by then, and Low Power Mode rescales it), and if

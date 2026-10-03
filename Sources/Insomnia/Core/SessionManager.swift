@@ -131,6 +131,17 @@ final class SessionManager {
     /// What the pending re-assert will write, per device, so a new
     /// schedule for one device does not drop the other's second write.
     private var pendingReassert: (display: Float?, keyboard: Float?) = (nil, nil)
+    /// How often, and how many times, a brightness kept after a refused
+    /// restore is read again while macOS holds the device down (see
+    /// scheduleKeptRecheck).
+    private let keptRecheckDelay: Duration
+    private let keptRecheckAttempts: Int
+    @ObservationIgnored private var keptRecheckTask: Task<Void, Never>?
+    @ObservationIgnored private var keptRecheckAttempt = 0
+    /// Set by the last undo when a kept value this build could write
+    /// failed to restore and its flag could not be cleared either, so on
+    /// disk it still reads as refused and not dirty. An end counts it.
+    @ObservationIgnored private var keptRestoreFailed = false
     /// Called just before Insomnia takes Low Power Mode over, before the
     /// ownership is journaled: `AppServices` samples the display brightness
     /// then, so the value journaled at a later lid close is the user's,
@@ -198,7 +209,9 @@ final class SessionManager {
         clock: @escaping @Sendable () -> Date = { Date() },
         recoveryLockTimeout: TimeInterval = 10,
         recoveryRetryDelay: TimeInterval = 30,
-        reassertDelay: Duration = .seconds(2)
+        reassertDelay: Duration = .seconds(2),
+        keptRecheckDelay: Duration = .seconds(3),
+        keptRecheckAttempts: Int = 20
     ) {
         self.paths = paths
         self.store = Store(paths: paths)
@@ -216,6 +229,8 @@ final class SessionManager {
         self.recoveryLockTimeout = recoveryLockTimeout
         self.recoveryRetryDelay = recoveryRetryDelay
         self.reassertDelay = reassertDelay
+        self.keptRecheckDelay = keptRecheckDelay
+        self.keptRecheckAttempts = keptRecheckAttempts
 
         try? paths.createDirectories()
         var loadedState: RuntimeState?
@@ -583,14 +598,12 @@ final class SessionManager {
 
     /// What an end checks before it reports a restore. A brightness kept
     /// after a refused restore is left out of `isDirty`, since no build
-    /// whose guard refuses it can restore it. It counts here once the live
-    /// guard allows its device: this build could make the call and the
-    /// entry is still there, so the restore failed, and so did the journal
-    /// write that would have cleared the flag.
+    /// whose guard refuses it can restore it, and so is one waiting for a
+    /// reading it can trust: nothing failed, and it is read again. It
+    /// counts here only when this build wrote it, the write failed, and so
+    /// did the journal write that would have cleared the flag.
     private var journalNeedsRestore: Bool {
-        state.isDirty
-            || (state.savedDisplayBrightness != nil && state.displayRestoreRefused && display.refusal() == nil)
-            || (state.savedKeyboardBrightness != nil && state.keyboardRestoreRefused && keyboard.refusal() == nil)
+        state.isDirty || keptRestoreFailed
     }
 
     private func scheduleEndRetry(_ reason: EndReason) {
@@ -892,63 +905,20 @@ final class SessionManager {
         // not written and not dropped: see keepRefusedRestore. Both devices
         // go into one message, so neither saved level hides the other. A
         // kept value on a build that can make the call is written only if
-        // nobody has set the level since: see levelSetSinceRefusal.
+        // a reading macOS is not holding down shows nobody set the level
+        // since: see keptLevel.
+        keptRestoreFailed = false
         var refused: [String] = []
+        var waiting: [String] = []
         if let saved = state.savedDisplayBrightness, let why = display.refusal() {
             refused.append(keepRefusedRestore("Display brightness", saved: saved, why: why, flag: \.displayRestoreRefused))
-        } else if let saved = state.savedDisplayBrightness, state.displayRestoreRefused,
-                  let now = levelSetSinceRefusal("display brightness", read: { try display.readBrightness() }) {
-            clearSetSince("display brightness", saved: saved, now: now, errors: &errors) { s in
-                s.savedDisplayBrightness = nil
-                s.displayRestoreRefused = false
-            }
         } else if let saved = state.savedDisplayBrightness {
-            do {
-                try display.setBrightness(saved)
-                Log.info("display restored (brightness \(saved))")
-                restoredDisplay = saved
-                // Written under our Low Power Mode: written again once the
-                // mode is off, since the mode's end rescales the panel.
-                let underLowPower = state.lowPowerSetByUs
-                do {
-                    try journal { s in
-                        s.savedDisplayBrightness = nil
-                        s.displayRestoreRefused = false
-                        s.displayRestoredUnderLowPower = underLowPower ? saved : nil
-                    }
-                } catch {
-                    errors.append("display brightness restored but the journal entry could not be cleared: \(error.localizedDescription); it will be retried")
-                }
-            } catch {
-                errors.append("could not restore display brightness: \(error.localizedDescription)")
-                makeRetryable("display brightness", flag: \.displayRestoreRefused, errors: &errors)
-            }
+            restoredDisplay = restoreDisplay(saved: saved, waiting: &waiting, errors: &errors)
         }
         if let saved = state.savedKeyboardBrightness, let why = keyboard.refusal() {
             refused.append(keepRefusedRestore("Keyboard backlight", saved: saved, why: why, flag: \.keyboardRestoreRefused))
-        } else if let saved = state.savedKeyboardBrightness, state.keyboardRestoreRefused,
-                  let now = levelSetSinceRefusal("keyboard backlight", read: { try keyboard.readBrightness() }) {
-            clearSetSince("keyboard backlight", saved: saved, now: now, errors: &errors) { s in
-                s.savedKeyboardBrightness = nil
-                s.keyboardRestoreRefused = false
-            }
         } else if let saved = state.savedKeyboardBrightness {
-            do {
-                try keyboard.setBrightness(saved)
-                Log.info("keyboard backlight restored (brightness \(saved))")
-                restoredKeyboard = saved
-                do {
-                    try journal { s in
-                        s.savedKeyboardBrightness = nil
-                        s.keyboardRestoreRefused = false
-                    }
-                } catch {
-                    errors.append("keyboard backlight restored but the journal entry could not be cleared: \(error.localizedDescription); it will be retried")
-                }
-            } catch {
-                errors.append("could not restore keyboard backlight: \(error.localizedDescription)")
-                makeRetryable("keyboard backlight", flag: \.keyboardRestoreRefused, errors: &errors)
-            }
+            restoredKeyboard = restoreKeyboard(saved: saved, waiting: &waiting, errors: &errors)
         }
         if !refused.isEmpty {
             let one = refused.count == 1
@@ -957,10 +927,147 @@ final class SessionManager {
         if !errors.isEmpty {
             fail(errors.joined(separator: ". "))
         }
+        if waiting.isEmpty {
+            keptRecheckTask?.cancel()
+        } else {
+            Log.info("\(waiting.joined(separator: "; ")); nothing written or cleared, read again in \(keptRecheckDelay)")
+            scheduleKeptRecheck(restart: true)
+        }
         // powerd applies its own remembered "pre-dim" brightness a moment
         // after the wake and can override the write above, so the same
         // values go out once more.
         scheduleReassert(display: restoredDisplay, keyboard: restoredKeyboard)
+    }
+
+    /// The display's saved brightness, on a build whose guard allows the
+    /// call: written, and the entry cleared. Returns the value written, for
+    /// the re-assert. A value kept after a refused restore is read first,
+    /// and may be cleared without a write or left waiting: see keptLevel.
+    private func restoreDisplay(saved: Float, waiting: inout [String], errors: inout [String]) -> Float? {
+        if state.displayRestoreRefused {
+            switch keptLevel(read: { try display.readBrightness() },
+                             untrusted: { display.isAsleep() ? "the display is asleep" : nil }) {
+            case .undecided(let why):
+                waiting.append("display brightness \(saved), kept after a refused restore, not read: \(why)")
+                return nil
+            case .setSince(let now):
+                clearSetSince("display brightness", saved: saved, now: now, errors: &errors) { s in
+                    s.savedDisplayBrightness = nil
+                    s.displayRestoreRefused = false
+                }
+                return nil
+            case .dark:
+                break
+            }
+        }
+        do {
+            try display.setBrightness(saved)
+        } catch {
+            errors.append("could not restore display brightness: \(error.localizedDescription)")
+            makeRetryable("display brightness", flag: \.displayRestoreRefused, errors: &errors)
+            return nil
+        }
+        Log.info("display restored (brightness \(saved))")
+        // Written under our Low Power Mode: written again once the
+        // mode is off, since the mode's end rescales the panel.
+        let underLowPower = state.lowPowerSetByUs
+        do {
+            try journal { s in
+                s.savedDisplayBrightness = nil
+                s.displayRestoreRefused = false
+                s.displayRestoredUnderLowPower = underLowPower ? saved : nil
+            }
+        } catch {
+            errors.append("display brightness restored but the journal entry could not be cleared: \(error.localizedDescription); it will be retried")
+        }
+        return saved
+    }
+
+    /// As restoreDisplay, for the keyboard backlight.
+    private func restoreKeyboard(saved: Float, waiting: inout [String], errors: inout [String]) -> Float? {
+        if state.keyboardRestoreRefused {
+            switch keptLevel(read: { try keyboard.readBrightness() },
+                             untrusted: { keyboard.isSuppressedOrDimmed() ? "macOS has the backlight suppressed or dimmed" : nil }) {
+            case .undecided(let why):
+                waiting.append("keyboard backlight \(saved), kept after a refused restore, not read: \(why)")
+                return nil
+            case .setSince(let now):
+                clearSetSince("keyboard backlight", saved: saved, now: now, errors: &errors) { s in
+                    s.savedKeyboardBrightness = nil
+                    s.keyboardRestoreRefused = false
+                }
+                return nil
+            case .dark:
+                break
+            }
+        }
+        do {
+            try keyboard.setBrightness(saved)
+        } catch {
+            errors.append("could not restore keyboard backlight: \(error.localizedDescription)")
+            makeRetryable("keyboard backlight", flag: \.keyboardRestoreRefused, errors: &errors)
+            return nil
+        }
+        Log.info("keyboard backlight restored (brightness \(saved))")
+        do {
+            try journal { s in
+                s.savedKeyboardBrightness = nil
+                s.keyboardRestoreRefused = false
+            }
+        } catch {
+            errors.append("keyboard backlight restored but the journal entry could not be cleared: \(error.localizedDescription); it will be retried")
+        }
+        return saved
+    }
+
+    /// The keyboard backlight stays suppressed for a moment after the wake,
+    /// and a display asleep reads its idle-dim value, so a kept value whose
+    /// reading decided nothing is read again every `keptRecheckDelay`, as
+    /// its own transaction under the recovery lock, up to
+    /// `keptRecheckAttempts` times. Still undecided after that, it stays
+    /// kept, blocking nothing, for the next lid open, lid close or launch.
+    /// `restart` begins a new count, for an undo.
+    private func scheduleKeptRecheck(restart: Bool) {
+        if restart { keptRecheckAttempt = 0 }
+        keptRecheckAttempt += 1
+        keptRecheckTask?.cancel()
+        let delay = keptRecheckDelay
+        keptRecheckTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: delay)
+            guard let self, !Task.isCancelled else { return }
+            _ = await self.exclusive("brightness re-check") { self.recheckKeptBrightness() }
+        }
+    }
+
+    /// Only the kept values the guard allows: the rest of the journal is
+    /// for a lid open, an end or the backstop. Only with the lid known to
+    /// be open, as reconcile undoes lid actions: under a closed lid a write
+    /// would light what the close keeps dark, and the open reads again.
+    private func recheckKeptBrightness() {
+        guard clamshell() == false else {
+            Log.info("brightness re-check stopped: the lid is not known to be open; the kept value waits for the next lid open, lid close or launch")
+            return
+        }
+        var waiting: [String] = []
+        var errors: [String] = []
+        var restoredDisplay: Float?
+        var restoredKeyboard: Float?
+        if let saved = state.savedDisplayBrightness, state.displayRestoreRefused, display.refusal() == nil {
+            restoredDisplay = restoreDisplay(saved: saved, waiting: &waiting, errors: &errors)
+        }
+        if let saved = state.savedKeyboardBrightness, state.keyboardRestoreRefused, keyboard.refusal() == nil {
+            restoredKeyboard = restoreKeyboard(saved: saved, waiting: &waiting, errors: &errors)
+        }
+        if !errors.isEmpty {
+            fail(errors.joined(separator: ". "))
+        }
+        scheduleReassert(display: restoredDisplay, keyboard: restoredKeyboard)
+        guard !waiting.isEmpty else { return }
+        if keptRecheckAttempt < keptRecheckAttempts {
+            scheduleKeptRecheck(restart: false)
+        } else {
+            Log.info("\(waiting.joined(separator: "; ")); still so after \(keptRecheckAttempt) readings, so it stays kept for the next lid open, lid close or launch")
+        }
     }
 
     /// Insomnia's own Low Power Mode has just been switched off. A display
@@ -1434,20 +1541,38 @@ final class SessionManager {
         }
     }
 
+    private enum KeptLevel {
+        /// Still 0 as the close left it: the kept value is written.
+        case dark
+        /// Above 0: set since, and left as it is.
+        case setSince(Float)
+        /// Nothing to go on yet: the entry waits.
+        case undecided(String)
+    }
+
     /// A value kept after a refused restore, on a build whose guard allows
     /// the call. The user was told to set the level by hand, and the close
     /// left the device at 0, so a reading above 0 is a level set since: the
     /// darkening is already undone, and the old value would overwrite that
-    /// choice. Returns that reading; nil when the device still reads 0, or
-    /// cannot be read, and the saved value is written as usual.
-    private func levelSetSinceRefusal(_ what: String, read: () throws -> Float?) -> Float? {
+    /// choice. Only a reading macOS is not holding down decides. A display
+    /// asleep reads its idle-dim value, and a keyboard backlight suppressed
+    /// after the wake, or idle-dimmed, reads 0 whatever its level. Such a
+    /// reading decides nothing, and neither does a read that fails or a
+    /// keyboard that reads as absent: the entry stays as it is and is read
+    /// again (see scheduleKeptRecheck). `untrusted` is asked before and
+    /// after the read, so a device macOS took over in between does not
+    /// count either.
+    private func keptLevel(read: () throws -> Float?, untrusted: () -> String?) -> KeptLevel {
+        if let why = untrusted() { return .undecided(why) }
+        let now: Float?
         do {
-            guard let now = try read(), now > 0 else { return nil }
-            return now
+            now = try read()
         } catch {
-            Log.info("\(what) could not be read before writing the value kept after a refused restore (\(error.localizedDescription)); writing it")
-            return nil
+            return .undecided("it could not be read (\(error.localizedDescription))")
         }
+        if let why = untrusted() { return .undecided(why) }
+        guard let now else { return .undecided("it reads as absent") }
+        return now > 0 ? .setSince(now) : .dark
     }
 
     /// The level was set since the refused restore: the entry is done, and
@@ -1465,12 +1590,13 @@ final class SessionManager {
     /// A value kept after a refusal that this build may write after all,
     /// and the write failed: it is retried like any failed restore from
     /// now on, so the flag goes. If the flag cannot be cleared, an end
-    /// still counts the entry through `journalNeedsRestore`.
+    /// still counts the entry, through `keptRestoreFailed`.
     private func makeRetryable(_ what: String, flag: WritableKeyPath<RuntimeState, Bool>, errors: inout [String]) {
         guard state[keyPath: flag] else { return }
         do {
             try journal { $0[keyPath: flag] = false }
         } catch {
+            keptRestoreFailed = true
             errors.append("could not mark the \(what) for retry: \(error.localizedDescription); it still counts as not restored")
         }
     }

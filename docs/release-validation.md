@@ -123,7 +123,10 @@ flagged as refused so it no longer counts as dirty, with an error that
 names each saved level and says to set it by hand; backstop.sh and
 uninstall.sh read the flag. A later build that can make the call writes
 the kept value only while the device still reads 0, the level the close
-left, so a level set by hand since is not overwritten.
+left, so a level set by hand since is not overwritten. It decides only
+on a reading taken with the display awake and the keyboard backlight
+neither suppressed nor dimmed, keeps the entry when the read fails, and
+reads again every 3 s for up to a minute.
 Unit tests with an injected version and fake classes only; the rows
 below stay "Not run", and the guards do not stand in for them.
 
@@ -144,6 +147,7 @@ is performed. Do not replace "not run" with "passed" based on source review.
 | Lid-close display/keyboard darkening and restore | Not run |
 | Darkening still runs under the private-call guards on macOS 26 (close the lid during a session: the log shows "display darkened" and "keyboard backlight off" and no "refused" line; Settings shows no note under the darken toggle) | Not run |
 | Darkening refused on an unmeasured macOS version (a macOS major other than 26, or a `KeyboardBrightnessClient` whose methods changed: the log shows the "refused" line once and "skipped" at lid close, nothing is journaled for that device, and Settings names the reason under the darken toggle; with both refused the log shows "display sleep not requested" and the panel is lit when the lid opens; a level saved by the earlier build stays in state.json with `displayRestoreRefused` or `keyboardRestoreRefused` after the first open or launch, the menu says it could not be restored on this macOS build and names each saved level, Settings shows the saved level under the darken toggle, no "Restore incomplete" follows, and the backstop log does not fail for it) | Not run |
+| A kept brightness on a build that can make the call (after a refused restore, set the keyboard backlight by hand, put the display to sleep, then launch that build and wake the display): the log shows "not read: macOS has the backlight suppressed or dimmed" and then "set since its restore", and the backlight stays at the level set | Not run |
 | Freeze-all scope with agents running (Cursor/T3 Code/Claude untouched) | Not run |
 | Simulated lid close/open via scripts/simulate-lid.sh | Not run |
 | Existing Low Power Mode preference and saved audio restoration | Not run |
