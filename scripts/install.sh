@@ -90,6 +90,16 @@ move_bundle() { # from to
   "$MV" "$1" "$2"
 }
 
+# Whether sudo grants the four pmset commands of the rule without a
+# password. `sudo -n -l <command>` checks the rule without running pmset
+# (nothing on the machine changes).
+pmset_rule_effective() {
+  "$SUDO" -n -l /usr/bin/pmset -a disablesleep 1 >/dev/null 2>&1 \
+    && "$SUDO" -n -l /usr/bin/pmset -a disablesleep 0 >/dev/null 2>&1 \
+    && "$SUDO" -n -l /usr/bin/pmset -b lowpowermode 1 >/dev/null 2>&1 \
+    && "$SUDO" -n -l /usr/bin/pmset -b lowpowermode 0 >/dev/null 2>&1
+}
+
 cleanup() {
   if [[ -n "$TMP_SUDOERS" ]]; then rm -f "$TMP_SUDOERS"; fi
   if [[ -n "$CANDIDATE" ]]; then rm -f "$CANDIDATE"; fi
@@ -136,9 +146,9 @@ else
   echo "sudoers file failed validation (or sudo did not authenticate); not installed. Nothing was changed." >&2
   exit 1
 fi
-# `sudo -l <command>` checks the rule without running pmset (nothing on the
-# machine changes). The backstop cannot undo anything without it, so stop here.
-if "$SUDO" -n -l /usr/bin/pmset -a disablesleep 0 >/dev/null 2>&1; then
+# The backstop cannot undo anything without the rule, so stop here. Checked
+# again once this run holds the recovery lock (step 5).
+if pmset_rule_effective; then
   echo "sudoers rule verified"
 else
   echo "'sudo -n pmset' is still not permitted; check $SUDOERS. The app (with backstop.sh) and the LaunchAgent were not touched." >&2
@@ -228,6 +238,23 @@ if (( lock_rc != 0 )); then
 fi
 if "$PGREP" -x Insomnia >/dev/null 2>&1; then
   echo "Insomnia started again; quit it and rerun. The app at $APP and the LaunchAgent were not touched." >&2
+  exit 1
+fi
+# The rule was verified in step 2, before this run waited for the lock. An
+# uninstall.sh that took the lock first removes $SUDOERS under it, and its
+# recovery leaves no journal, so the recovery below would succeed without
+# the rule. Without it no session can undo pmset. Checked here, under the
+# lock that uninstall.sh also needs, and this run holds the lock until the
+# new pair is published.
+if ! pmset_rule_effective; then
+  cat >&2 <<FAIL
+
+Install stopped: 'sudo -n pmset' was permitted when $SUDOERS was installed above,
+but is not now that this run holds the recovery lock. Something removed or changed
+the rule while this run waited (uninstall.sh removes it under the same lock), and
+without it no session can undo pmset. The app at $APP and the LaunchAgent were not
+touched; the new build was discarded. Rerun this script to install the rule again.
+FAIL
   exit 1
 fi
 

@@ -438,7 +438,11 @@ Backstop, independent of the app:
   and no step after a failed bootstrap counts on a loaded job. Before
   recovery the run only puts a set-aside bundle back when nothing is at the
   app's path, and removes staging directories whose owning install is gone
-  (matched by the exact name install.sh gives them). uninstall.sh runs the
+  (matched by the exact name install.sh gives them). Right after taking the
+  lock it checks the sudoers rule again with `sudo -n -l` for each of the
+  four commands and stops if it no longer holds: an uninstall.sh that took
+  the lock first removes the rule and leaves no journal, so the recovery
+  alone would pass. uninstall.sh runs the
   bundle's sealed backstop.sh only after `codesign --verify --strict`
   passes on the bundle (a bounded call, like its other calls under the
   lock). Once recovery is confirmed and print confirms the agent unloaded,

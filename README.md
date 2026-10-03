@@ -118,7 +118,9 @@ one retrying it, so the installer stops without unloading that agent or
 moving either bundle. Once recovery succeeds, it unloads that agent, moves the
 bundle back and loads the plist on disk again, and it stops if `launchctl
 print` does not confirm the unload or the reload. Unresolved recovery prevents
-replacing either; follow the reported instructions before retrying.
+replacing either; follow the reported instructions before retrying. The
+installer checks the sudoers rule again once it holds the recovery lock, and
+stops if the rule is gone, as after an `uninstall.sh` that took the lock first.
 
 </details>
 

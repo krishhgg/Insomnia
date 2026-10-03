@@ -2964,6 +2964,26 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(try pastedWords(of: printedCommand(in: r.stderr, containing: "mv ")), ["mv", setAside.path, fx.app.path])
     }
 
+    /// The rule verified before the recovery lock is gone once this run
+    /// holds it, as after an uninstall.sh that took the lock first. The
+    /// recovery would pass without a journal, so the run checks the rule
+    /// again under the lock and stops before touching the previous pair.
+    func testInstallStopsWhenTheSudoersRuleIsGoneOnceItHoldsTheLock() throws {
+        try writePreviousPair()
+        fx.setMode("sudo", "rule-gone-under-lock")
+
+        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertTrue(r.stdout.contains("sudoers rule verified"), "the check before the lock passed: \(r.stdout)")
+        XCTAssertTrue(r.stderr.contains("is not now that this run holds the recovery lock"), r.stderr)
+        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("launchctl") }, "\(fx.calls())")
+        XCTAssertEqual(try fx.installedBinaryFirstLine(), "previous")
+        XCTAssertEqual(try fx.contents(of: fx.appsDir), ["Insomnia.app"], "the new build is discarded")
+        XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "trusted")
+        XCTAssertTrue(try fx.lockIsFree())
+    }
+
     /// The scripts/simulate-lid.sh watcher is compiled out of a release
     /// build unless the installer is told to compile it in: only
     /// INSOMNIA_LID_SIMULATION=1 adds the define to the swift build lines,
@@ -3558,7 +3578,11 @@ private final class ScriptFixture {
         // Mode "auth-fail": every form that would prompt (visudo, install)
         // fails like a wrong password, and `-n` forms fail as unpermitted.
         // Mode "rule-not-effective": authentication passes and the rule is
-        // installed, but `sudo -n -l <pmset ...>` still says no.
+        // installed, but `sudo -n -l <pmset ...>` still says no. Mode
+        // "rule-gone-under-lock": `sudo -n -l` says yes while fd 9 is closed
+        // and no once it is open, the way a rule removed by an uninstall.sh
+        // that held the recovery lock first answers to a run that then takes
+        // it (install.sh opens fd 9 only to take that lock).
         // visudo checks the candidate file exists, is non-empty and grants
         // pmset, so an installer that validated the wrong path or an empty
         // heredoc cannot pass here.
@@ -3573,7 +3597,11 @@ private final class ScriptFixture {
         # command that is still alive (no file) from one that ended, and why.
         case "${1:-}" in
           -n) if [[ "${2:-}" == -l ]]; then
-                case "$mode" in auth-fail|rule-not-effective) exit 1 ;; *) exit 0 ;; esac
+                case "$mode" in
+                  auth-fail|rule-not-effective) exit 1 ;;
+                  rule-gone-under-lock) if { : >&9; } 2>/dev/null; then exit 1; fi; exit 0 ;;
+                  *) exit 0 ;;
+                esac
               fi
               case "$mode" in
                 ok) exit 0 ;;
