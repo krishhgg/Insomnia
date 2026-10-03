@@ -82,7 +82,10 @@ recovery; newly written journals use `frozenProcesses`.
   password: `sudo -n -l /usr/bin/pmset -a disablesleep 0` must exit 0
   (`SleepGuarding.checkPasswordlessRestore`). Otherwise refuse the same
   way, since the end, the backstop and uninstall all restore with
-  `sudo -n` and would leave sleep off. Then write session + state
+  `sudo -n` and would leave sleep off. `sudo -l` does not say whether a
+  password is needed, so an administrator account with some other
+  passwordless entry passes without the rule; that session's end reports
+  the failed restore. Then write session + state
   to disk, arm the launchd backstop,
   write a fresh random nonce to `pending-start`, and only then run `pmset -a
   disablesleep 1` through the macOS administrator password dialog
