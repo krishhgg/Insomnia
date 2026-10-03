@@ -161,6 +161,9 @@ jobs:
         id: build
         env:
           INSOMNIA_SIGN_IDENTITY: ${{ env.HAVE_SIGNING == 'true' && secrets.INSOMNIA_SIGN_IDENTITY || '' }}
+          # build-app.sh compiles the simulate-lid.sh watcher in for "1"; a
+          # release never carries it.
+          INSOMNIA_LID_SIMULATION: ""
         run: |
           scripts/build-app.sh --output dist
           team="$(codesign -dvv dist/Insomnia.app 2>&1 | sed -n 's/^TeamIdentifier=//p' | head -n 1)"

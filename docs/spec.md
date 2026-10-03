@@ -364,6 +364,29 @@ Reconcile runs at every Insomnia launch:
    verified owned processes, Low Power Mode if we set it, saved audio, and
    recorded App Nap values.
    Unverified entries and failed restoration remain unresolved, not successful.
+   A session file that does not decode counts as expired: it is renamed under
+   the lock to `session.json.unreadable-<UTC stamp>` (never deleted, never
+   overwriting an earlier copy), the user is told where, and the journal is
+   restored as with no session. `backstop.sh` does the same once the journal
+   is clean. A session file that decodes as JSON but lacks a key or type
+   the `Session` decoder needs (`startedAt`, `endsAt`, `extensions`) is not
+   a session either; `backstop.sh` checks the same keys and types, and
+   reads dates only in the form Store writes. A session file that exists
+   but cannot be read at all, or is not a regular file (never opened: a
+   FIFO would block under the lock), has no end time that can be enforced,
+   so it also counts as expired and the journal is restored. It may have
+   been a valid session, so it is never opened or removed: it is renamed
+   aside the same way (the app at once, `backstop.sh` once the journal is
+   clean), which keeps it as evidence and keeps a later launch from
+   resuming a session that was treated as ended. The app notifies with the
+   new path. If the rename fails the file stays and a start is refused
+   while it is there. Every end then restores the journal and tries the
+   rename again; while it fails the end is not finished, so quit is refused
+   and the end is retried, because the file would be resumed if it became
+   readable in place. The messages say to remove it or move it out of the
+   folder. `backstop.sh` tries the rename again on every run.
+   An unreadable journal still refuses every transaction and leaves both
+   files in place.
 2. Session valid → establish the independent recovery agent before reapplying
    the sleep guard, then resume observers. If the lid is open, restore recorded
    lid-close actions. Arming or restoration errors must remain visible.
@@ -403,7 +426,13 @@ Backstop, independent of the app:
   When the new job cannot be loaded or its plist cannot be published,
   install.sh unloads any job that may be loaded, confirms that with print,
   and puts the previous bundle back; if the unload is not confirmed, the
-  new bundle stays, because that job pins it. A rerun after an interrupted
+  new bundle stays, because that job pins it. Every bundle rename is checked
+  (`mv`, refused when the destination exists): when one of the swap or its
+  undo fails, the previous bundle goes back and its job is loaded again as
+  after a failed load, and when the previous bundle cannot go back, no
+  bundle is deleted, no job is loaded against an empty app path, and the
+  message prints the `mv` and `launchctl bootstrap` that restore the pair.
+  The same holds for the renames of the repair below. A rerun after an interrupted
   or failed swap keeps the bundle the plist on disk pins. It runs its
   forced recovery first, with the loaded job and the bundles as the earlier
   run left them, and stops there if recovery fails. Only then does it
@@ -413,7 +442,11 @@ Backstop, independent of the app:
   and no step after a failed bootstrap counts on a loaded job. Before
   recovery the run only puts a set-aside bundle back when nothing is at the
   app's path, and removes staging directories whose owning install is gone
-  (matched by the exact name install.sh gives them). uninstall.sh runs the
+  (matched by the exact name install.sh gives them). Right after taking the
+  lock it checks the sudoers rule again with `sudo -n -l` for each of the
+  four commands and stops if it no longer holds: an uninstall.sh that took
+  the lock first removes the rule and leaves no journal, so the recovery
+  alone would pass. uninstall.sh runs the
   bundle's sealed backstop.sh only after `codesign --verify --strict`
   passes on the bundle (a bounded call, like its other calls under the
   lock). Once recovery is confirmed and print confirms the agent unloaded,
@@ -672,7 +705,8 @@ Insomnia/
     install.sh             build-app.sh or a verified --app bundle, sudoers, launchd
     uninstall.sh           reverse all of the above, restore sleep
     backstop.sh            standalone restore from JSON
-    simulate-lid.sh        file trigger for the lid-close action path
+    simulate-lid.sh        file trigger for the lid-close action path (debug and
+                           INSOMNIA_LID_SIMULATION=1 builds only)
   docs/spec.md
   README.md                setup, hotspot setting, Chrome note
 ```
@@ -727,6 +761,16 @@ that any case passed; record results in the release validation record.
     `savedKeyboardBrightness`). Open → both back, journal entries gone. Repeat
     with the lid open using `scripts/simulate-lid.sh closed` then `open`
     during a session; the log shows `lid SIMULATED closed (file trigger)`.
+    That needs a build with the watcher compiled in (installed with
+    `INSOMNIA_LID_SIMULATION=1 ./scripts/install.sh`, which `build-app.sh`
+    reads; install.sh refuses it with `--app`; it logs "Lid
+    simulation build" at launch). A normal install ignores the trigger:
+    the watcher is compiled out so a file written by any other program
+    running as the user cannot replay the lid actions. CI proves that on
+    the binaries: `scripts/check-lid-simulation-gate.sh` builds the release
+    both ways and checks the watcher class and its log lines are absent
+    from the plain binary and present with the define. A binary nm or
+    strings cannot read fails the check rather than counting as absent.
     Quit while closed → both restored. Force-quit while closed, reopen the app
     → restored at reconcile, and `backstop.sh` alone leaves both keys in place.
 14. **App Nap.** With the setting on and Terminal on the agent list, `defaults

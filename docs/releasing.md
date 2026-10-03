@@ -16,7 +16,8 @@ The bundle is the one `scripts/build-app.sh` makes: the release binary,
 `Resources/Info.plist`, the icon, and `backstop.sh` sealed under
 `Contents/Resources` before signing. `install.sh` builds the same bundle
 for a source install, so a downloaded app and a source-built app differ
-only in the signature.
+only in the signature. The workflow sets `INSOMNIA_LID_SIMULATION` empty, so
+a release never carries the `simulate-lid.sh` watcher.
 
 ## Cutting a release
 

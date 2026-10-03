@@ -141,6 +141,13 @@ jobs:
         # so a warning fails this build instead of scrolling past.
         run: swift build -c release -Xswiftc -warnings-as-errors
 
+      - name: Check the lid simulation is compiled out of the release binary
+        # Looks at the binaries, not the compilation condition: the plain
+        # release build above must lack the simulate-lid.sh watcher, and a
+        # build with -DINSOMNIA_LID_SIMULATION (what build-app.sh adds
+        # for INSOMNIA_LID_SIMULATION=1) must have it.
+        run: scripts/check-lid-simulation-gate.sh
+
   shellcheck:
     name: ShellCheck scripts
     # shellcheck ships preinstalled on ubuntu-24.04; the macOS image has none.

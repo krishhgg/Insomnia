@@ -144,7 +144,13 @@ the same step that replaces the recovery agent. That step starts only after
 `launchctl print` confirms the previous agent is unloaded; otherwise nothing is
 replaced. If the new agent cannot be loaded, or its plist cannot be saved, the
 installer unloads it, waits for `launchctl print` to confirm that, and puts the
-previous bundle back, so the loaded agent always matches the installed app. If
+previous bundle back, so the loaded agent always matches the installed app. A
+bundle that cannot be moved during that step is handled the same way: the
+previous bundle goes back and its agent is loaded again. If the previous bundle
+itself cannot be moved back, nothing is deleted: it stays at
+`~/Applications/.Insomnia.app.previous`, the installer prints the two commands
+that put it back and load its agent, and until then the agent finds no app, so
+run them or rerun the installer before you log out. If
 the unload is not confirmed, the new bundle stays with the agent that pins it
 and the installer asks you to rerun it. After that, or after an install killed
 in the middle of that step, the next run keeps whichever bundle the agent's
@@ -154,7 +160,9 @@ one retrying it, so the installer stops without unloading that agent or
 moving either bundle. Once recovery succeeds, it unloads that agent, moves the
 bundle back and loads the plist on disk again, and it stops if `launchctl
 print` does not confirm the unload or the reload. Unresolved recovery prevents
-replacing either; follow the reported instructions before retrying.
+replacing either; follow the reported instructions before retrying. The
+installer checks the sudoers rule again once it holds the recovery lock, and
+stops if the rule is gone, as after an `uninstall.sh` that took the lock first.
 
 </details>
 
@@ -237,7 +245,12 @@ The defaults are worth knowing:
 
 To exercise the lid actions without closing the lid, run
 `scripts/simulate-lid.sh closed` and then `scripts/simulate-lid.sh open` during
-a session; the app runs the same actions it would on a real lid event.
+a session; the app runs the same actions it would on a real lid event. Only a
+build with the file watcher compiled in reads that trigger: a debug build, or
+a release build installed with `INSOMNIA_LID_SIMULATION=1 ./scripts/install.sh`.
+A normal install has no watcher, so no program running as your user can replay
+the lid actions by writing a file. A build that has it logs "Lid simulation
+build" at launch and shows the same line in the status menu and in Settings.
 
 ## How recovery works
 
@@ -252,7 +265,19 @@ has passed. It leaves a valid, unexpired session alone.
 
 The app and backstop use the same lock so they do not restore and rewrite the
 journal over one another. Failed restoration keeps the relevant entries;
-unreadable journals are preserved instead of treated as clean.
+unreadable journals are preserved instead of treated as clean. A session file
+that does not parse counts as expired and is renamed to
+`session.json.unreadable-<time>` beside it, never deleting or overwriting
+anything: the app does this at launch, before restoring whatever the journal
+holds, and says where the file went; the agent does it once the journal is
+clean. A session file that cannot be read at all (permissions, or not a
+regular file, which is never opened) also counts as expired, since its end
+time is unknown: the journal is restored and the file is renamed the same
+way without being opened, so a later launch cannot resume a session that
+was treated as ended. The app says where it went. If the rename fails, the
+app keeps trying it and will not quit until the file is gone.
+`uninstall.sh --purge` removes the renamed copies that are regular files;
+without `--purge` they stay.
 
 **Recovery is not “everything always gets undone.”** The backstop does not
 monitor battery or temperature. Saved audio needs the app to reopen, and
