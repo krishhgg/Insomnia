@@ -172,6 +172,9 @@ final class FakeSleepGuard: SleepGuarding, @unchecked Sendable {
     private var _restoreGate: AsyncGate?
     private var _restoreCalledAt: Date?
     private var _readGate: AsyncGate?
+    private var _restoreChecks = 0
+    private var _restoreRuleMissing = false
+    private var _onRestoreCheck: (@Sendable () -> Void)?
     var throwOn: Set<String> = []
     /// Commands that take effect and *then* fail (a timeout after pmset
     /// already applied the setting): the ambiguous failure shape.
@@ -208,6 +211,31 @@ final class FakeSleepGuard: SleepGuarding, @unchecked Sendable {
     var readGate: AsyncGate? {
         get { lock.withLock { _readGate } }
         set { lock.withLock { _readGate = newValue } }
+    }
+
+    /// `checkPasswordlessRestore()` calls. Kept out of `calls`, which
+    /// tests compare as sequences of pmset commands.
+    var restoreChecks: Int { lock.withLock { _restoreChecks } }
+    /// /etc/sudoers.d/insomnia is missing: the check fails the way
+    /// `sudo -n -l` does.
+    var restoreRuleMissing: Bool {
+        get { lock.withLock { _restoreRuleMissing } }
+        set { lock.withLock { _restoreRuleMissing = newValue } }
+    }
+    /// Runs inside every check, so a test can look at what had happened
+    /// by then.
+    var onRestoreCheck: (@Sendable () -> Void)? {
+        get { lock.withLock { _onRestoreCheck } }
+        set { lock.withLock { _onRestoreCheck = newValue } }
+    }
+
+    func checkPasswordlessRestore() async throws {
+        let (missing, hook) = lock.withLock {
+            _restoreChecks += 1
+            return (_restoreRuleMissing, _onRestoreCheck)
+        }
+        hook?()
+        if missing { throw PasswordlessRestoreError(detail: "exit 1: sudo: a password is required") }
     }
 
     private func record(_ c: String) throws {

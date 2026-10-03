@@ -216,6 +216,10 @@ has passed. It leaves a valid, unexpired session alone.
 Undoing never needs a password: the sudoers rule covers turning sleep back on,
 so the app, the agent, and the uninstaller can all restore sleep unattended.
 Turning sleep off is the only step that asks, and only when you press Enter.
+Before it asks, the app checks with `sudo -n -l` that turning sleep back on
+still needs no password. If `/etc/sudoers.d/insomnia` is gone, no dialog
+appears, nothing is changed, and Insomnia tells you to run
+`scripts/install.sh` again.
 When Insomnia starts up (login, or a relaunch after a crash) and finds a valid
 session on disk, it checks whether sleep is still off. If it is, the session
 continues; if something turned sleep back on in the meantime, the session ends

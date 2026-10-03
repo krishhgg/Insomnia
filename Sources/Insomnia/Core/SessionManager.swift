@@ -403,6 +403,17 @@ final class SessionManager {
             notifier.post(title: Self.endTitle(.startFailed, had: false), body: "Nothing was changed: \(error.localizedDescription).")
             return
         }
+        do {
+            // Once the dialog has turned sleep off, only the passwordless
+            // rule can turn it back on: this app's end and backstop.sh
+            // both run `sudo -n`. Without the rule they would fail at the
+            // deadline and leave sleep off, so no dialog is shown.
+            try await sleepGuard.checkPasswordlessRestore()
+        } catch {
+            fail("start refused, nothing changed: \(error.localizedDescription)")
+            notifier.post(title: Self.endTitle(.startFailed, had: false), body: "Nothing was changed: \(error.localizedDescription).")
+            return
+        }
         let now = clock()
         let new = SessionMath.newSession(now: now, duration: duration, maxDuration: config.maxDuration)
         // What was on disk before this attempt, read under the lock. A

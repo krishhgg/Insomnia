@@ -549,6 +549,63 @@ final class PmsetSleepGuardPromptTests: XCTestCase {
         return start
     }
 
+    /// A sudo that records its arguments and answers as the mode file
+    /// says: `ok` as with the rule installed, anything else as `sudo -n`
+    /// does when a password would be needed.
+    private func fakeSudo() throws -> (path: String, calls: URL, mode: URL) {
+        let fake = dir.appendingPathComponent("fake-sudo")
+        let calls = dir.appendingPathComponent("sudo-calls")
+        let mode = dir.appendingPathComponent("sudo-mode")
+        try """
+        #!/bin/bash
+        printf '%s\\n' "$*" >> '\(calls.path)'
+        if [[ "$(cat '\(mode.path)' 2>/dev/null)" == ok ]]; then echo "$3 $4 $5 $6"; exit 0; fi
+        echo "sudo: a password is required" >&2
+        exit 1
+        """.write(to: fake, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fake.path)
+        return (fake.path, calls, mode)
+    }
+
+    /// The check asks sudo, with -n, only to list the exact command
+    /// `enableSleep` runs; pmset itself is never run.
+    func testRestoreCheckListsTheExactRestoreCommand() async throws {
+        let sudo = try fakeSudo()
+        try Data("ok".utf8).write(to: sudo.mode)
+        let sleepGuard = PmsetSleepGuard(prompt: FakeAdministratorPrompt(), sudoPath: sudo.path)
+        try await sleepGuard.checkPasswordlessRestore()
+        XCTAssertEqual(try String(contentsOf: sudo.calls, encoding: .utf8), "-n -l /usr/bin/pmset -a disablesleep 0\n")
+        XCTAssertEqual(PmsetSleepGuard.restoreArguments, ["-a", "disablesleep", "0"])
+    }
+
+    /// A sudo that would want a password fails the check, and the error
+    /// carries what sudo said and the way to fix it.
+    func testRestoreCheckFailsWithoutTheRule() async throws {
+        let sudo = try fakeSudo()
+        let sleepGuard = PmsetSleepGuard(prompt: FakeAdministratorPrompt(), sudoPath: sudo.path)
+        do {
+            try await sleepGuard.checkPasswordlessRestore()
+            XCTFail("must throw")
+        } catch let error as PasswordlessRestoreError {
+            let text = try XCTUnwrap(error.errorDescription)
+            XCTAssertTrue(text.contains("(exit 1: sudo: a password is required)"), text)
+            XCTAssertTrue(text.hasSuffix("run scripts/install.sh again"), text)
+        }
+        XCTAssertEqual(try String(contentsOf: sudo.calls, encoding: .utf8), "-n -l /usr/bin/pmset -a disablesleep 0\n")
+    }
+
+    /// A sudo that cannot be started fails the check too.
+    func testRestoreCheckFailsWhenSudoCannotRun() async throws {
+        let sleepGuard = PmsetSleepGuard(prompt: FakeAdministratorPrompt(), sudoPath: dir.appendingPathComponent("no-such-sudo").path)
+        do {
+            try await sleepGuard.checkPasswordlessRestore()
+            XCTFail("must throw")
+        } catch let error as PasswordlessRestoreError {
+            let text = try XCTUnwrap(error.errorDescription)
+            XCTAssertTrue(text.contains("could not be run: "), text)
+        }
+    }
+
     func testDisableSleepGoesThroughThePromptWithItsStart() async throws {
         let prompt = FakeAdministratorPrompt()
         let sleepGuard = PmsetSleepGuard(prompt: prompt)
@@ -680,6 +737,64 @@ final class SleepPromptLifecycleTests: XCTestCase {
         h.backstop.outdatedScript = false
         await m.start(duration: 1800)
         XCTAssertTrue(m.isActive)
+        XCTAssertEqual(h.prompt.shown, 1)
+    }
+
+    /// Without the passwordless rule nothing could turn sleep back on once
+    /// the dialog turned it off: Start is refused before anything is
+    /// written or shown, and the user is told to run install.sh again.
+    func testStartWithoutThePasswordlessRestoreShowsNoPrompt() async throws {
+        h.guardFake.restoreRuleMissing = true
+        let m = h.makeManager()
+        await m.start(duration: 1800)
+
+        XCTAssertEqual(h.guardFake.restoreChecks, 1)
+        XCTAssertEqual(h.prompt.shown, 0)
+        XCTAssertEqual(h.guardFake.calls, [])
+        XCTAssertEqual(h.backstop.arms, 0)
+        XCTAssertNil(m.session)
+        XCTAssertNil(try h.store.loadSession())
+        XCTAssertNil(try h.store.loadState())
+        XCTAssertFalse(markerExists)
+        let err = try XCTUnwrap(m.lastError)
+        XCTAssertTrue(err.hasPrefix("start refused, nothing changed: sleep can only be turned off while it can be turned back on without a password"), err)
+        XCTAssertTrue(err.contains("sudo -n -l /usr/bin/pmset -a disablesleep 0"), err)
+        XCTAssertTrue(err.hasSuffix("run scripts/install.sh again"), err)
+        let post = try XCTUnwrap(h.notifier.posts.last)
+        XCTAssertEqual(post.title, "Session not started")
+        XCTAssertTrue(post.body.hasPrefix("Nothing was changed: "), post.body)
+        XCTAssertTrue(post.body.contains("run scripts/install.sh again"), post.body)
+
+        h.guardFake.restoreRuleMissing = false
+        await m.start(duration: 1800)
+        XCTAssertTrue(m.isActive)
+        XCTAssertEqual(h.guardFake.restoreChecks, 2)
+        XCTAssertEqual(h.prompt.shown, 1)
+    }
+
+    /// With the rule in place the check passes, once per start, before
+    /// session.json, the journal, the backstop or the marker exist.
+    func testThePasswordlessRestoreIsCheckedBeforeAnythingIsWritten() async throws {
+        let paths = h.home.paths
+        let prompt = h.prompt
+        let backstop = h.backstop
+        let seen = Locked<[String]?>(nil)
+        h.guardFake.onRestoreCheck = {
+            var found: [String] = []
+            for (name, url) in [("session.json", paths.sessionFile), ("state.json", paths.stateFile), ("pending-start", paths.pendingStartFile)]
+            where FileManager.default.fileExists(atPath: url.path) {
+                found.append(name)
+            }
+            if prompt.shown > 0 { found.append("prompt") }
+            if backstop.arms > 0 { found.append("arm") }
+            seen.value = found
+        }
+        let m = h.makeManager()
+        await m.start(duration: 1800)
+
+        XCTAssertTrue(m.isActive)
+        XCTAssertEqual(h.guardFake.restoreChecks, 1)
+        XCTAssertEqual(seen.value, [], "the check ran after the start had begun to change things")
         XCTAssertEqual(h.prompt.shown, 1)
     }
 

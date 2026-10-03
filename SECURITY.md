@@ -31,7 +31,11 @@ ran, the start rolled back, a newer start began) runs nothing. The app shows
 the dialog only when the installed `backstop.sh` declares, in its
 `# insomnia-backstop-version:` line, a version that deletes `pending-start`,
 and the installer installs that script before the app, so recovery after a
-crash under the dialog never depends on an older script. A file that
+crash under the dialog never depends on an older script. It also shows the
+dialog only after `sudo -n -l /usr/bin/pmset -a disablesleep 0` has
+confirmed, without a password, that sleep can be turned back on; without
+the rule (an uninstall that stopped part way, a hand-deleted file) Start is
+refused with nothing changed and the user is told to rerun the installer. A file that
 cannot be deleted (its command is still running, an immutable flag, an ACL)
 does not stop sleep from being turned back on, but the journal keeps the sleep
 entry, the app and the agent report it and retry, and new sessions are refused

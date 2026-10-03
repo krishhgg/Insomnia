@@ -152,7 +152,11 @@ Flag a change that breaks one of these; do not flag the behavior itself.
 - `BackstopVersion.swift`, `backstop.sh`, `install.sh`. Start reads the
   installed `backstop.sh`'s `# insomnia-backstop-version:` line and shows no
   dialog below version 2, the first that deletes `pending-start`; the user
-  is told to run `install.sh` again. `install.sh` installs `backstop.sh`
+  is told to run `install.sh` again. It also shows no dialog unless
+  `SleepGuarding.checkPasswordlessRestore` passes first (`sudo -n -l
+  /usr/bin/pmset -a disablesleep 0`, nothing run, nothing written before
+  it): without the passwordless restore every undo would fail and leave
+  sleep off. `install.sh` installs `backstop.sh`
   under the recovery lock before the bundle (`install -S`, so a running old
   script keeps its inode) and waits up to `RETIRE_WAIT_SECONDS` for runs of
   the old script to exit, stopping before the bundle if one stays. Bump the

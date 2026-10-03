@@ -77,7 +77,12 @@ recovery; newly written journals use `frozenProcesses`.
 - Session start: check that the installed `backstop.sh` declares
   `# insomnia-backstop-version: 2` or later (`BackstopVersion.swift`; 2 is
   the first that deletes `pending-start`) and refuse with nothing written,
-  asking for `scripts/install.sh` again, if not. Then write session + state
+  asking for `scripts/install.sh` again, if not. Then confirm, without
+  running pmset or prompting, that sleep can be turned back on with no
+  password: `sudo -n -l /usr/bin/pmset -a disablesleep 0` must exit 0
+  (`SleepGuarding.checkPasswordlessRestore`). Otherwise refuse the same
+  way, since the end, the backstop and uninstall all restore with
+  `sudo -n` and would leave sleep off. Then write session + state
   to disk, arm the launchd backstop,
   write a fresh random nonce to `pending-start`, and only then run `pmset -a
   disablesleep 1` through the macOS administrator password dialog
