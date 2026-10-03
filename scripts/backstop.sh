@@ -315,17 +315,40 @@ journal_shape_problems() { # file
   fi
 }
 
-# Seconds since the epoch for a date as Store.swift writes it (ISO 8601 in
-# UTC, no fractional seconds), or nothing. `date -j -f` accepts trailing
-# characters with only a warning, so the result is formatted back and must
-# match the input exactly.
+# Seconds since the epoch for a date in the one form session.json may hold,
+# or nothing. Store.parseDate in the app reads exactly this form:
+# 2027-01-15T08:00:00Z, which is what Store.swift writes, or the same with
+# an offset such as +02:00 or -05:30 in place of Z. Whole seconds, a date
+# and time that exist, years 1970 to 9999, offsets up to 23:59. `date -j -f`
+# rolls an impossible day or second over, so the result is formatted back
+# and must match.
 epoch_of() { # string
-  local e
-  e="$("$DATE" -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$1" +%s 2>/dev/null)" || return 0
-  if [[ "$("$DATE" -u -r "$e" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)" == "$1" ]]; then
-    echo "$e"
+  local form='^([0-9]{4})-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(Z|([+-])([0-9]{2}):([0-9]{2}))$'
+  local clock offset=0 e
+  [[ "$1" =~ $form ]] || return 0
+  (( 10#${BASH_REMATCH[1]} >= 1970 )) || return 0
+  if [[ "${BASH_REMATCH[2]}" != Z ]]; then
+    (( 10#${BASH_REMATCH[4]} <= 23 && 10#${BASH_REMATCH[5]} <= 59 )) || return 0
+    offset=$(( 10#${BASH_REMATCH[4]} * 3600 + 10#${BASH_REMATCH[5]} * 60 ))
+    if [[ "${BASH_REMATCH[3]}" == - ]]; then offset=$(( -offset )); fi
+  fi
+  clock="${1:0:19}"
+  e="$("$DATE" -j -u -f '%Y-%m-%dT%H:%M:%S' "$clock" +%s 2>/dev/null)" || return 0
+  if [[ "$("$DATE" -u -r "$e" +%Y-%m-%dT%H:%M:%S 2>/dev/null)" == "$clock" ]]; then
+    echo $(( e - offset ))
   fi
   return 0
+}
+
+# epoch_of the string at a keypath, read exactly as the app's decoder sees
+# it. Command substitution strips every trailing newline, stored ones too,
+# so a sentinel follows plutil's output and only plutil's own newline is
+# cut: "...Z\n" in the file is refused here as it is in the app.
+epoch_at() { # file keypath
+  local v
+  v="$(extract "$1" "$2"; echo .)"
+  v="${v%.}"
+  epoch_of "${v%$'\n'}"
 }
 
 # Prints one line per way session.json does not have the shape the app's
@@ -349,8 +372,8 @@ session_shape_problems() { # file
       echo "$key is missing"
     elif [[ "$t" != string ]]; then
       echo "$key is a JSON $t, not a date string"
-    elif [[ -z "$(epoch_of "$(extract "$f" "$key" || true)")" ]]; then
-      echo "$key is not a UTC date in the form 2027-01-15T08:00:00Z"
+    elif [[ -z "$(epoch_at "$f" "$key")" ]]; then
+      echo "$key is not a date in the form 2027-01-15T08:00:00Z or 2027-01-15T10:00:00+02:00"
     fi
   done
   t="$(type_of "$f" extensions)"
@@ -389,7 +412,7 @@ if [[ -e "$SESSION" ]]; then
       session_state=malformed
     else
       ends_at="$(extract "$SESSION" endsAt || true)"
-      if (( $(epoch_of "$ends_at") > $("$DATE" -u +%s) )); then
+      if (( $(epoch_at "$SESSION" endsAt) > $("$DATE" -u +%s) )); then
         session_state=valid
       else
         session_state=expired

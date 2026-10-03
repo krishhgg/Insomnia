@@ -371,8 +371,11 @@ Reconcile runs at every Insomnia launch:
    restored as with no session. `backstop.sh` does the same once the journal
    is clean. A session file that decodes as JSON but lacks a key or type
    the `Session` decoder needs (`startedAt`, `endsAt`, `extensions`) is not
-   a session either; `backstop.sh` checks the same keys and types, and
-   reads dates only in the form Store writes. A session file that exists
+   a session either; `backstop.sh` checks the same keys and types. The app
+   and both scripts read a date in one form only: `2027-01-15T08:00:00Z`,
+   as Store writes it, or the same with an offset such as `+02:00` in place
+   of `Z`, in whole seconds, naming a date and time that exist, years 1970
+   to 9999 (`Store.parseDate`, `epoch_of` in the scripts). A session file that exists
    but cannot be read at all, or is not a regular file (never opened: a
    FIFO would block under the lock), has no end time that can be enforced,
    so it also counts as expired and the journal is restored. It may have
@@ -380,12 +383,13 @@ Reconcile runs at every Insomnia launch:
    aside the same way (the app at once, `backstop.sh` once the journal is
    clean), which keeps it as evidence and keeps a later launch from
    resuming a session that was treated as ended. The app notifies with the
-   new path. If the rename fails the file stays and a start is refused
+   new path. If either rename fails the file stays and a start is refused
    while it is there. Every end then restores the journal and tries the
    rename again; while it fails the end is not finished, so quit is refused
-   and the end is retried, because the file would be resumed if it became
-   readable in place. The messages say to remove it or move it out of the
-   folder. `backstop.sh` tries the rename again on every run.
+   and the end is retried. A file that could not be read would be resumed
+   if it became readable in place, and every later launch and the agent
+   read either kind again. The messages say to remove it or move it out of
+   the folder. `backstop.sh` tries the rename again on every run.
    An unreadable journal still refuses every transaction and leaves both
    files in place.
 2. Session valid → establish the independent recovery agent before reapplying
