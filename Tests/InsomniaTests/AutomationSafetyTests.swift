@@ -530,12 +530,16 @@ final class TmuxLiveRunnerTests: XCTestCase {
 
     /// A pane whose program has exited (`remain-on-exit`) also takes
     /// `send-keys` with exit 0 and nowhere for the keys to go.
+    /// The pane's program waits for a line, so it cannot exit (and take the
+    /// server with it) before remain-on-exit is on; Enter then ends it.
     func testDeadPaneIsSkipped() async throws {
-        try await startPane(command: "sleep 0.2")
+        try await startPane(command: "read _")
         let keep = try await tmuxRun(["set-option", "-t", "nudge", "remain-on-exit", "on"])
         XCTAssertTrue(keep.succeeded, keep.stderr)
+        let end = try await tmuxRun(["send-keys", "-t", "nudge:0.0", "Enter"])
+        XCTAssertTrue(end.succeeded, end.stderr)
         var dead = false
-        for _ in 0..<50 {
+        for _ in 0..<250 {
             let flags = try await tmuxRun(["display-message", "-p", "-t", "nudge:0.0", "-F", "#{pane_dead}"])
             if flags.stdout.hasPrefix("1") { dead = true; break }
             try await Task.sleep(for: .milliseconds(20))
