@@ -47,7 +47,13 @@ final class AppServices {
     private let docker: DockerRule
     private let keychain: any KeychainStoring
     private let lid = LidObserver()
-    private let lidSimulation = LidSimulation()
+    /// The file trigger behind scripts/simulate-lid.sh. Compiled into debug
+    /// builds and INSOMNIA_LID_SIMULATION release builds only
+    /// (`LidSimulationBuild`); nil in every other build, and only started
+    /// when `lidSimulationEnabled` is true, so a normal release build never
+    /// watches the support directory for lid events.
+    private let lidSimulation: (any LidSimulating)?
+    private let lidSimulationEnabled: Bool
     private let power = PowerMonitor()
     private let browser: BrowserThrottle
     /// Last trusted display/keyboard brightness for the lid close (spec
@@ -80,13 +86,17 @@ final class AppServices {
         keyboard: any KeyboardBacklighting = NoopKeyboardBacklight(),
         keychain: any KeychainStoring = KeychainStore(),
         locationPermission: LocationPermission = LocationPermission(),
-        idleSeconds: @escaping @Sendable () -> Double = { UserInput.secondsSinceLastInput() }
+        idleSeconds: @escaping @Sendable () -> Double = { UserInput.secondsSinceLastInput() },
+        lidSimulation: (any LidSimulating)? = LidSimulationBuild.makeWatcher(),
+        lidSimulationEnabled: Bool = LidSimulationBuild.isCompiledIn
     ) {
         self.paths = paths
         self.notifier = notifier
         self.audio = audio
         self.display = display
         self.keyboard = keyboard
+        self.lidSimulation = lidSimulation
+        self.lidSimulationEnabled = lidSimulationEnabled
         self.sampler = BrightnessSampler(display: display, keyboard: keyboard, idleSeconds: idleSeconds)
         self.freezer = Freezer(control: processControl)
         self.docker = DockerRule(freezer: freezer)
@@ -129,11 +139,7 @@ final class AppServices {
         }
         sampleTimer = timer
         timer.resume()
-        // scripts/simulate-lid.sh drives the same action path as the hinge.
-        // The hardware reading in refreshInstant/reconcile still reflects
-        // the real lid; the trigger only runs the close/open actions.
-        lidSimulation.onEvent = { [weak self] closed in self?.lidChanged(closed) }
-        lidSimulation.start(directory: paths.appSupport, file: paths.simulateLidFile)
+        startLidSimulation()
 
         power.onChange = { [weak self] in self?.powerChanged() }
         power.start()
@@ -163,8 +169,7 @@ final class AppServices {
         running = false
         lid.stop()
         lid.onChange = nil
-        lidSimulation.stop()
-        lidSimulation.onEvent = nil
+        stopLidSimulation()
         power.stop()
         power.onChange = nil
         sampleTimer?.cancel()
@@ -251,6 +256,28 @@ final class AppServices {
     /// chain like a power event; a no-op outside a session.
     func reevaluateFloors() {
         powerChanged()
+    }
+
+    // MARK: Lid simulation
+
+    /// scripts/simulate-lid.sh drives the same action path as the hinge.
+    /// The hardware reading in refreshInstant/reconcile still reflects the
+    /// real lid; the trigger only runs the close/open actions. Nothing is
+    /// wired unless the build compiled the watcher in: a release build
+    /// without INSOMNIA_LID_SIMULATION has no watcher and leaves the
+    /// trigger file alone. Called by `start`; internal so a test can drive
+    /// it with an injected watcher.
+    func startLidSimulation() {
+        guard lidSimulationEnabled, let lidSimulation else { return }
+        lidSimulation.onEvent = { [weak self] closed in self?.lidChanged(closed) }
+        lidSimulation.start(directory: paths.appSupport, file: paths.simulateLidFile)
+    }
+
+    /// Called by `stop`; internal for the same reason.
+    func stopLidSimulation() {
+        guard let lidSimulation else { return }
+        lidSimulation.stop()
+        lidSimulation.onEvent = nil
     }
 
     // MARK: Private
