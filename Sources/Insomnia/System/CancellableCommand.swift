@@ -100,6 +100,12 @@ final class UnfinishedCommand: @unchecked Sendable, CustomStringConvertible {
 ///
 /// Only the direct child is signalled. A grandchild that keeps the output
 /// pipe open delays completion until it exits.
+///
+/// With `holding`, the child's stdin is a descriptor on the locked recovery
+/// lock file instead of /dev/null, so the lock is not free while the child
+/// runs, even if this process exits first. sudo keeps descriptors 0 to 2
+/// and passes them to the command it runs (it closes 3 and up), so a
+/// `sudo pmset` and its pmset both hold it until they exit.
 struct CancellableCommand: Sendable {
     typealias Hook = @Sendable () async -> Void
 
@@ -117,7 +123,7 @@ struct CancellableCommand: Sendable {
         self.beforeDeadline = beforeDeadline
     }
 
-    func run(_ exe: String, _ args: [String], timeout: TimeInterval, stop: StopPolicy = .terminateThenKill) async throws -> ShellResult {
+    func run(_ exe: String, _ args: [String], timeout: TimeInterval, stop: StopPolicy = .terminateThenKill, holding lock: RecoveryLockHandle? = nil) async throws -> ShellResult {
         if let beforeLaunch { await beforeLaunch() }
         let state = LaunchState(exe: exe, args: args, policy: stop, timeout: timeout)
         return try await withTaskCancellationHandler {
@@ -127,14 +133,29 @@ struct CancellableCommand: Sendable {
                     let process = Process()
                     process.executableURL = URL(fileURLWithPath: exe)
                     process.arguments = args
-                    process.standardInput = FileHandle.nullDevice
+                    var lockCopy: Int32?
+                    if let lock {
+                        guard let copy = lock.descriptorForChild() else {
+                            state.finish(.failure(ShellError.launchFailed(exe: exe, underlying: "the recovery lock it must hold was already released")))
+                            return
+                        }
+                        lockCopy = copy
+                        process.standardInput = FileHandle(fileDescriptor: copy, closeOnDealloc: false)
+                    } else {
+                        process.standardInput = FileHandle.nullDevice
+                    }
                     let out = Pipe()
                     let err = Pipe()
                     process.standardOutput = out
                     process.standardError = err
                     let childExit = ProcessExit(process)
 
-                    switch state.launch(process) {
+                    let launched = state.launch(process)
+                    // The child has its own descriptor now, or was never
+                    // started; this process's copy goes either way, so only
+                    // the transaction's handle and the child hold the lock.
+                    if let lockCopy { close(lockCopy) }
+                    switch launched {
                     case .cancelled:
                         state.finish(.failure(CancellationError()))
                         return

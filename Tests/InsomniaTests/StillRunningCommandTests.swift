@@ -32,7 +32,9 @@ final class StillRunningCommandTests: XCTestCase {
 
     /// The end stops at the live `disablesleep 0`: Low Power Mode is not
     /// touched, both journal flags stay, the lock stays held, quit and start
-    /// are refused. When the command exits the end runs again and finishes.
+    /// are refused. The command exits 0: its undo is journaled as done under
+    /// the lock, and the end runs again for what is left, without running
+    /// the same command a second time.
     func testEndStopsAtTheLiveCommandAndFinishesWhenItExits() async throws {
         let m = h.makeManager()
         await m.start(duration: 3600)
@@ -57,6 +59,9 @@ final class StillRunningCommandTests: XCTestCase {
         XCTAssertTrue(last.body.contains("sudo kill 4242"), last.body)
         XCTAssertTrue(try XCTUnwrap(m.commandWarning).contains("sudo kill 4242"), m.commandWarning ?? "")
         XCTAssertNil(m.lastError, "the live command reported as a failure the next success would not clear")
+        let record = try XCTUnwrap(h.store.loadUnfinishedCommand(), "nothing on disk names the command if Insomnia dies first")
+        XCTAssertEqual(record.pid, 4242)
+        XCTAssertEqual(record.command, "/usr/bin/sudo -n /usr/bin/pmset disablesleep 0")
         let postsBefore = h.notifier.posts.count
 
         // Quit is refused without running anything, and a start is refused.
@@ -77,14 +82,129 @@ final class StillRunningCommandTests: XCTestCase {
         await waitUntil("pending end never retried") { m.pendingEnd == nil }
         XCTAssertNil(m.commandWarning, "the menu still names a command that has exited")
         XCTAssertEqual(m.lastError, startRefused, "the exit took a newer error with the command's line")
-        XCTAssertEqual(h.guardFake.calls, before + ["disablesleep 0", "disablesleep 0", "lowpowermode 0"])
+        XCTAssertEqual(h.guardFake.calls, before + ["disablesleep 0", "lowpowermode 0"], "an undo that exited 0 was run again")
         XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
+        XCTAssertNil(h.store.loadUnfinishedCommand(), "the record outlived the command")
+        XCTAssertEqual(h.guardFake.unlockedPrivilegedCalls, [], "a sudo pmset ran without the recovery lock")
         XCTAssertFalse(h.guardFake.sleepDisabled)
         XCTAssertFalse(h.guardFake.lowPowerOn)
         XCTAssertNil(m.unfinishedCommand)
         XCTAssertFalse(try lockIsHeld(), "recovery lock still held after the command exited")
         XCTAssertNil(try h.store.loadSession())
         XCTAssertEqual(h.notifier.posts.last?.title, "Session restored")
+    }
+
+    /// The same live `disablesleep 0` exits 1: nothing is confirmed, and the
+    /// end runs it again before it goes on.
+    func testEndRunsAnUndoAgainIfItExitsNonzero() async throws {
+        let m = h.makeManager()
+        await m.start(duration: 3600)
+        let lowPower = await m.setLowPower(true)
+        XCTAssertTrue(lowPower)
+        let before = h.guardFake.calls
+        h.guardFake.stillRunning = ["disablesleep 0"]
+        _ = await m.end(reason: .user)
+        XCTAssertEqual(m.pendingEnd, .user)
+
+        h.guardFake.stillRunning = []
+        h.guardFake.exitStuckCommands(status: 1)
+        await waitUntil("pending end never retried") { m.pendingEnd == nil }
+        XCTAssertEqual(h.guardFake.calls, before + ["disablesleep 0", "disablesleep 0", "lowpowermode 0"])
+        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
+        XCTAssertFalse(h.guardFake.sleepDisabled)
+        XCTAssertFalse(try lockIsHeld())
+    }
+
+    /// Every undo is slower than the deadline and grace, and every one goes
+    /// through: each is left running, then exits 0. Each is journaled as
+    /// done when it exits, so the end finishes. Run again, any of them would
+    /// be left running again, and its exit would start it once more, for
+    /// ever.
+    func testUndosThatEachExit0LateAreNotRunAgain() async throws {
+        let m = h.makeManager()
+        await m.start(duration: 3600)
+        let lowPower = await m.setLowPower(true)
+        XCTAssertTrue(lowPower)
+        var st = try XCTUnwrap(try h.store.loadState())
+        st.displayRestoredUnderLowPower = 0.6
+        try h.store.saveState(st)
+        h.display.brightness = 0.6
+        let before = h.guardFake.calls
+        h.guardFake.stillRunning = ["disablesleep 0", "lowpowermode 0"]
+
+        let outcome = await m.end(reason: .user)
+        XCTAssertEqual(outcome, .privilegedCommandRunning(pid: 4242))
+        h.guardFake.exitStuckCommands()
+        await waitUntil("the end never reached the second undo") { m.unfinishedCommand?.pid == 4243 }
+        XCTAssertEqual(try h.store.loadState()?.sleepDisabledByUs, false, "the first undo exited 0 and was not journaled")
+        XCTAssertEqual(try h.store.loadState()?.lowPowerSetByUs, true)
+        h.display.brightness = 0.45
+        h.guardFake.exitStuckCommands()
+
+        await waitUntil("the end never finished") { m.pendingEnd == nil }
+        XCTAssertEqual(h.guardFake.calls, before + ["disablesleep 0", "lowpowermode 0"])
+        XCTAssertEqual(h.guardFake.stuck.count, 0)
+        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
+        XCTAssertEqual(h.display.sets, [0.6], "the display write owed for the end of the mode was lost")
+        XCTAssertFalse(h.guardFake.sleepDisabled)
+        XCTAssertFalse(h.guardFake.lowPowerOn)
+        XCTAssertNil(m.unfinishedCommand)
+        XCTAssertFalse(try lockIsHeld())
+        XCTAssertEqual(h.notifier.posts.last?.title, "Session restored")
+        XCTAssertEqual(h.guardFake.unlockedPrivilegedCalls, [])
+    }
+
+    /// After a crash or force quit, the command the earlier run left
+    /// running holds the lock (stood in for by another handle here). The
+    /// relaunch changes nothing, names the recorded command and pid in the
+    /// menu, and notifies once, not on every refusal. Once the lock is
+    /// free, the next transaction removes the record.
+    func testBusyLockNamesTheCommandAnEarlierRunLeftRunning() async throws {
+        try h.store.saveUnfinishedCommand(UnfinishedCommandRecord(
+            pid: 4321,
+            command: "/usr/bin/sudo -n /usr/bin/pmset -a disablesleep 0",
+            since: h.clock.now
+        ))
+        let other = try XCTUnwrap(try RecoveryLock(url: h.home.paths.recoveryLock).tryAcquire())
+        let m = h.makeManager()
+
+        await m.reconcile()
+
+        let error = try XCTUnwrap(m.lastError)
+        XCTAssertTrue(error.hasPrefix("reconcile skipped, nothing changed"), error)
+        XCTAssertTrue(error.contains("/usr/bin/sudo -n /usr/bin/pmset -a disablesleep 0` (pid 4321)"), error)
+        XCTAssertTrue(error.contains("ps -p 4321"), error)
+        XCTAssertTrue(error.contains("sudo kill 4321"), error)
+        let notices = h.notifier.posts.filter { $0.title == SessionManager.commandRunningTitle }
+        XCTAssertEqual(notices.count, 1)
+        XCTAssertTrue(notices.first?.body.contains("pid 4321") == true, notices.first?.body ?? "")
+        await m.start(duration: 60)
+        XCTAssertTrue(try XCTUnwrap(m.lastError).contains("pid 4321"), m.lastError ?? "")
+        XCTAssertEqual(h.notifier.posts.filter { $0.title == SessionManager.commandRunningTitle }.count, 1, "announced again on every refusal")
+        XCTAssertEqual(h.guardFake.calls, [])
+        XCTAssertNotNil(h.store.loadUnfinishedCommand())
+
+        other.release()
+        await m.reconcile()
+        XCTAssertNil(h.store.loadUnfinishedCommand(), "a record of a command that no longer holds the lock was kept")
+    }
+
+    /// The record goes when the command exits, before the lock is
+    /// released, not only when a later transaction finds it stale: here
+    /// nothing runs after the exit (no session, nothing pending).
+    func testRecordIsRemovedWhenTheCommandExits() async throws {
+        let m = h.makeManager()
+        h.guardFake.stillRunning = ["lowpowermode 1"]
+        _ = await m.setLowPower(true)
+        XCTAssertEqual(h.store.loadUnfinishedCommand()?.pid, 4242)
+
+        h.guardFake.stillRunning = []
+        h.guardFake.exitStuckCommands()
+        await waitUntil("the lock was never released") { m.unfinishedCommand == nil }
+
+        XCTAssertNil(h.store.loadUnfinishedCommand(), "the record outlived the command")
+        XCTAssertEqual(h.guardFake.calls, ["pmset -g custom", "lowpowermode 1"], "a transaction ran after the exit")
+        XCTAssertFalse(try lockIsHeld())
     }
 
     /// A start whose `disablesleep 1` is left running is not surfaced, and
@@ -194,7 +314,7 @@ final class StillRunningCommandTests: XCTestCase {
     /// Reconcile restoring an expired session, with that `disablesleep 0`
     /// left running: step 3 must not run a second one beside it. Nothing
     /// else runs, the lock goes to the command, and the end runs again
-    /// once it has exited.
+    /// once it has exited; it exited 0, so there is nothing left to undo.
     func testReconcileRestoreStopsAtTheLiveCommandAndRunsNoSecondOne() async throws {
         let now = h.clock.now
         try h.store.saveSession(Session(startedAt: now.addingTimeInterval(-7200), endsAt: now.addingTimeInterval(-60)))
@@ -216,7 +336,7 @@ final class StillRunningCommandTests: XCTestCase {
         h.guardFake.stillRunning = []
         h.guardFake.exitStuckCommands()
         await waitUntil("pending end never retried") { m.pendingEnd == nil }
-        XCTAssertEqual(h.guardFake.calls, ["disablesleep 0", "disablesleep 0"])
+        XCTAssertEqual(h.guardFake.calls, ["disablesleep 0"])
         XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
         XCTAssertFalse(h.guardFake.sleepDisabled)
         XCTAssertFalse(try lockIsHeld())
@@ -225,11 +345,9 @@ final class StillRunningCommandTests: XCTestCase {
     /// `lowpowermode 1` fails outright and the rollback `lowpowermode 0` is
     /// the command left running: it is tracked like any other, so the lock
     /// stays with it and ownership stays journaled while it runs. The
-    /// rollback goes through in the end: the mode reads off after the exit,
-    /// the check's own `lowpowermode 0` exits 0, the ownership is cleared,
-    /// and the floors run on the corrected
-    /// journal and switch the mode on again, which a stale flag would have
-    /// stopped them doing.
+    /// rollback exits 0 in the end: the ownership is cleared under the
+    /// lock, and the floors run on the corrected journal and switch the
+    /// mode on again, which a stale flag would have stopped them doing.
     func testLowPowerRollbackLeftRunningKeepsTheLockAndIsCheckedWhenItExits() async throws {
         h.guardFake.throwOn = ["lowpowermode 1"]
         h.guardFake.stillRunning = ["lowpowermode 0"]
@@ -266,8 +384,8 @@ final class StillRunningCommandTests: XCTestCase {
         XCTAssertNotNil(m.session)
         XCTAssertEqual(
             h.guardFake.calls,
-            ["disablesleep 1", "pmset -g custom", "lowpowermode 1", "lowpowermode 0", "pmset -g custom", "lowpowermode 0", "pmset -g custom", "lowpowermode 1"],
-            "the check and its own switch-off, then the floors' enable on a journal that no longer claims the mode"
+            ["disablesleep 1", "pmset -g custom", "lowpowermode 1", "lowpowermode 0", "pmset -g custom", "lowpowermode 1"],
+            "the floors' enable on a journal that no longer claims the mode, and no second switch-off"
         )
         XCTAssertTrue(h.guardFake.lowPowerOn)
         XCTAssertEqual(try h.store.loadState()?.lowPowerSetByUs, true)
@@ -298,6 +416,9 @@ final class StillRunningCommandTests: XCTestCase {
         XCTAssertTrue(lowPower)
         h.guardFake.stillRunning = ["disablesleep 0"]
         h.guardFake.stuckExitsAtOnce = true
+        // Exit 1, so the retry runs the command again and shows where the
+        // first end stopped.
+        h.guardFake.stuckExitStatus = 1
 
         let outcome = await m.end(reason: .user)
 
@@ -494,9 +615,11 @@ final class StillRunningCommandTests: XCTestCase {
         XCTAssertEqual(try h.store.loadState()?.lowPowerSetByUs, false)
     }
 
-    /// The rollback `lowpowermode 0` is left running and goes through, as
-    /// above, so the flag claims a mode that is off. Started with the flag
-    /// journaled and the floors running on it, as AppServices runs them.
+    /// The rollback `lowpowermode 0` is left running, as above. The tests
+    /// that use this end it with a nonzero exit (`exitTheRollback`) while
+    /// the mode reads off, so the flag claims a mode that is off and only
+    /// the check can correct it. Started with the flag journaled and the
+    /// floors running on it, as AppServices runs them.
     private func startWithRollbackLeftRunning(_ m: SessionManager) async throws {
         h.guardFake.throwOn = ["lowpowermode 1"]
         h.guardFake.stillRunning = ["lowpowermode 0"]
@@ -507,6 +630,12 @@ final class StillRunningCommandTests: XCTestCase {
         XCTAssertEqual(try h.store.loadState()?.lowPowerSetByUs, true)
         h.guardFake.stillRunning = []
         h.guardFake.throwOn = []
+    }
+
+    /// Exit 1 confirms nothing; the mode reads off all the same (the
+    /// `lowpowermode 1` it rolls back never took effect).
+    private func exitTheRollback() {
+        h.guardFake.exitStuckCommands(status: 1)
     }
 
     private func floorsOnBattery(_ m: SessionManager, before run: @escaping @MainActor () -> Void) -> Locked<Int> {
@@ -538,7 +667,7 @@ final class StillRunningCommandTests: XCTestCase {
         let before = h.guardFake.calls
 
         h.guardFake.throwOn = ["pmset -g custom"]
-        h.guardFake.exitStuckCommands()
+        exitTheRollback()
 
         await waitUntil("the check never ran again after the failed read") { floorRuns.value == 2 }
         XCTAssertEqual(
@@ -552,10 +681,12 @@ final class StillRunningCommandTests: XCTestCase {
         XCTAssertFalse(try lockIsHeld())
     }
 
-    /// The check reads the mode off and switches it off, but cannot write
-    /// the journal. The flag
-    /// stays on disk, and the check runs again after the retry delay; once
-    /// the journal takes the write the floors switch the mode on again.
+    /// The rollback exits 0, but the journal cannot be written, so its
+    /// undo cannot be journaled as done. The check after it reads the mode
+    /// off and switches it off, and cannot write the journal either. The
+    /// flag stays on disk, and the check runs again after the retry delay;
+    /// once the journal takes the write the floors switch the mode on
+    /// again.
     func testCheckThatCouldNotWriteTheJournalRunsAgain() async throws {
         let m = h.makeManager(retryDelay: 0.2)
         let dir = h.home.paths.appSupport.path
@@ -594,7 +725,7 @@ final class StillRunningCommandTests: XCTestCase {
         let journal = try Data(contentsOf: stateFile)
         try Data("{".utf8).write(to: stateFile)
 
-        h.guardFake.exitStuckCommands()
+        exitTheRollback()
 
         await waitUntil("the unreadable journal was never reported") {
             self.h.notifier.posts.contains { $0.title == SessionManager.journalTitle }
@@ -618,7 +749,7 @@ final class StillRunningCommandTests: XCTestCase {
         let stateFile = h.home.paths.stateFile
         let journal = try Data(contentsOf: stateFile)
         try Data("{".utf8).write(to: stateFile)
-        h.guardFake.exitStuckCommands()
+        exitTheRollback()
         await waitUntil("the unreadable journal was never reported") {
             self.h.notifier.posts.contains { $0.title == SessionManager.journalTitle }
         }
@@ -655,7 +786,7 @@ final class StillRunningCommandTests: XCTestCase {
         let before = h.guardFake.calls
 
         h.guardFake.throwOn = ["lowpowermode 0"]
-        h.guardFake.exitStuckCommands()
+        exitTheRollback()
 
         await waitUntil("the check never ran again after the failed switch-off") { floorRuns.value == 2 }
         XCTAssertEqual(flags.value, [true, false], "ownership cleared on a lowpowermode 0 that failed")
@@ -671,8 +802,8 @@ final class StillRunningCommandTests: XCTestCase {
 
     /// The check's own `lowpowermode 0` is left running in turn. It is
     /// tracked like any other: the ownership stays, the lock goes to it,
-    /// and nothing is replayed or run beside it. When it exits, the pass
-    /// runs again, clears the ownership and runs the floors.
+    /// and nothing is replayed or run beside it. It exits 0: the ownership
+    /// is cleared under its lock, and the pass runs the floors.
     func testCheckWhoseSwitchOffIsLeftRunningRunsAgainWhenItExits() async throws {
         let m = h.makeManager()
         let floorRuns = floorsOnBattery(m) {}
@@ -680,7 +811,7 @@ final class StillRunningCommandTests: XCTestCase {
         let before = h.guardFake.calls
 
         h.guardFake.stillRunning = ["lowpowermode 0"]
-        h.guardFake.exitStuckCommands()
+        exitTheRollback()
 
         await waitUntil("the check's switch-off was never tracked") { m.unfinishedCommand?.pid == 4243 }
         XCTAssertEqual(Array(h.guardFake.calls.dropFirst(before.count)), ["pmset -g custom", "lowpowermode 0"])
@@ -695,7 +826,7 @@ final class StillRunningCommandTests: XCTestCase {
         await waitUntil("the pass never ran again after the switch-off exited") { floorRuns.value == 1 }
         XCTAssertEqual(
             Array(h.guardFake.calls.dropFirst(before.count)),
-            ["pmset -g custom", "lowpowermode 0", "pmset -g custom", "lowpowermode 0", "pmset -g custom", "lowpowermode 1"]
+            ["pmset -g custom", "lowpowermode 0", "pmset -g custom", "lowpowermode 1"]
         )
         XCTAssertTrue(h.guardFake.lowPowerOn)
         XCTAssertNil(m.commandWarning)
@@ -703,10 +834,10 @@ final class StillRunningCommandTests: XCTestCase {
     }
 
     /// A display write is owed for the end of the mode, and the
-    /// `lowpowermode 0` that would settle it is left running. The user
-    /// sets the panel meanwhile. The check after the exit sees the panel
-    /// moved and drops the write instead of putting the old value back.
-    func testCheckDropsTheDisplayWriteIfThePanelMovedWhileTheCommandRan() async throws {
+    /// `lowpowermode 0` that would settle it is left running and goes
+    /// through, so powerd rescales the panel. Exit 0 confirms the switch-off
+    /// and the owed value is written, rescaled panel or not.
+    func testSwitchOffThatExits0WritesTheOwedDisplayOverTheRescale() async throws {
         let m = h.makeManager()
         m.resyncAfterCommand = { _ in }
         await m.start(duration: 3600)
@@ -722,14 +853,12 @@ final class StillRunningCommandTests: XCTestCase {
 
         XCTAssertFalse(off)
         XCTAssertEqual(try h.store.loadState()?.displayRestoredUnderLowPower, 0.6, "write dropped though the panel had not moved")
-        h.display.brightness = 0.3
-        // The switch-off went through before it exited.
-        h.guardFake.lowPowerOn = false
+        h.display.brightness = 0.45
         h.guardFake.stillRunning = []
         h.guardFake.exitStuckCommands()
         await waitUntil("ownership never cleared after the exit") { (try? self.h.store.loadState()?.lowPowerSetByUs) == false }
-        XCTAssertEqual(h.display.sets, [], "the old value written over the panel the user moved")
-        XCTAssertEqual(h.display.brightness, 0.3)
+        XCTAssertEqual(h.display.sets, [0.6], "the panel left at powerd's rescaled value")
+        XCTAssertEqual(h.display.brightness, 0.6)
         XCTAssertNil(try h.store.loadState()?.displayRestoredUnderLowPower)
     }
 }

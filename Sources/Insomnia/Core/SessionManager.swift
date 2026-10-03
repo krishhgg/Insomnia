@@ -43,10 +43,11 @@ enum EndOutcome: Sendable, Equatable {
     /// A `sudo pmset` did not stop on SIGTERM and is still running (pid).
     /// It is never SIGKILLed: that could leave a root pmset changing power
     /// state after the journal moved on. Nothing after it was undone, the
-    /// journal keeps every entry it had, and the recovery lock stays held on
-    /// the command's behalf until it exits; the end is retried then and
-    /// quit is refused meanwhile, since the app exiting would drop the lock
-    /// and let the backstop run a second pmset beside the live one.
+    /// journal keeps every entry it had, and the recovery lock stays held
+    /// until the command exits: by this process, and by the command itself,
+    /// so a crash or force quit cannot free it beside the live pmset. The
+    /// end is retried when the command exits, and quit is refused meanwhile
+    /// so the app is still there to retry it.
     case privilegedCommandRunning(pid: Int32)
 }
 
@@ -55,7 +56,7 @@ enum TransactionRefusal: Error, Sendable {
     case lockBusy(String)
     case journalUnreadable(String)
     /// A `sudo pmset` from an earlier transaction is still running and holds
-    /// the recovery lock through this process (see `EndOutcome`).
+    /// the recovery lock (see `EndOutcome`).
     case commandRunning(pid: Int32)
 }
 
@@ -181,6 +182,12 @@ final class SessionManager {
     /// the command exits. Mirrors run_bounded / stop_transaction in
     /// scripts/backstop.sh.
     @ObservationIgnored private(set) var unfinishedCommand: UnfinishedCommand?
+    /// The journal entry `unfinishedCommand` undoes, cleared under its lock
+    /// if it exits 0 (`holdLock`).
+    @ObservationIgnored private var unfinishedUndo: PendingUndo?
+    /// The pid of the recorded command last announced for a busy lock, so
+    /// a command that holds the lock across many refusals is announced once.
+    @ObservationIgnored private var announcedLockHolder: Int32?
     /// A lid close or open refused while `unfinishedCommand` ran. Replayed
     /// for the lid's latest state once it has exited; cleared then, or by
     /// a session end, which undoes every lid action in the journal.
@@ -314,6 +321,16 @@ final class SessionManager {
         case lidEvent
     }
 
+    /// What a `sudo pmset` left running undoes, if it exits 0
+    /// (`stopTransaction`, `holdLock`).
+    private enum PendingUndo {
+        /// `disablesleep 0`: `sleepDisabledByUs`.
+        case sleepRestored
+        /// `lowpowermode 0`: `lowPowerSetByUs`, then the display write owed
+        /// for the end of the mode.
+        case lowPowerOff
+    }
+
     /// Runs `op` after every earlier lifecycle operation, holding the
     /// recovery lock, with `state` freshly read from disk under that lock.
     /// `op` is not run at all when the lock cannot be taken within the
@@ -348,11 +365,20 @@ final class SessionManager {
             do {
                 handle = try await self.recoveryLock.acquire(timeout: self.recoveryLockTimeout)
             } catch {
-                self.fail("\(what) skipped, nothing changed: \(error.localizedDescription)")
+                self.fail("\(what) skipped, nothing changed: \(error.localizedDescription)\(self.recordedLockHolder(error))")
                 return .failure(.lockBusy(error.localizedDescription))
             }
             var lockHandedOver = false
             defer { if !lockHandedOver { handle.release() } }
+            // Nothing else holds the lock, so a command recorded as holding
+            // it has exited: the record is from a run that crashed or was
+            // force-quit while it ran.
+            self.announcedLockHolder = nil
+            do {
+                try self.store.removeUnfinishedCommand()
+            } catch {
+                Log.error("could not remove \(self.paths.unfinishedCommandFile.path): \(error.localizedDescription)")
+            }
             do {
                 try self.loadJournal()
             } catch {
@@ -360,14 +386,18 @@ final class SessionManager {
                 return .failure(.journalUnreadable(error.localizedDescription))
             }
             let before = self.unfinishedCommand
-            let result = await op()
+            // Every `sudo pmset` `op` runs is handed this lock
+            // (`PmsetSleepGuard`) and holds it until it exits.
+            let result = await RecoveryLock.$held.withValue(handle) { await op() }
             if let stuck = self.unfinishedCommand, stuck !== before {
                 // A sudo pmset this transaction ran did not stop on SIGTERM.
-                // The lock goes with it, not with the transaction: releasing
-                // it now would let the backstop run a second pmset beside the
-                // live one. stop_transaction in backstop.sh keeps it the same
-                // way. Handed over even if it has exited since it was
-                // reported: the holder is what settles afterwards.
+                // The lock goes with it, not with the transaction: the
+                // command holds it through its own descriptor, and this
+                // process keeps one too, so its exit is journaled under the
+                // lock before anything else can run (`holdLock`).
+                // stop_transaction in backstop.sh keeps it the same way.
+                // Handed over even if it has exited since it was reported:
+                // the holder is what settles afterwards.
                 lockHandedOver = true
                 self.holdLock(handle, until: stuck)
             }
@@ -402,19 +432,76 @@ final class SessionManager {
     /// (`settle(after:)`): no timer could know when the command would exit.
     /// The pid is logged the way backstop.sh logs it, so the two logs read
     /// the same.
+    ///
+    /// Before the release, still under the lock, an undo that exited 0 is
+    /// journaled as done (`confirmUndo`) and the record of the command is
+    /// removed. Any other exit, a signal included, confirms nothing, and
+    /// the retry runs the undo again.
     private func holdLock(_ handle: RecoveryLockHandle, until command: UnfinishedCommand) {
         Log.error("recovery lock kept for \(command.description) until it exits; Insomnia cannot start, end or recover until then; stop it by hand (sudo kill \(command.pid)) and the end is retried when it exits")
         Task { @MainActor [weak self] in
             await command.waitUntilExit()
+            let status = command.terminationStatus
+            Log.info("\(command.description) exited with status \(status.map(String.init) ?? "?")")
+            if let self, self.unfinishedCommand === command {
+                if status == 0, let undo = self.unfinishedUndo { self.confirmUndo(undo, by: command) }
+                do {
+                    try self.store.removeUnfinishedCommand()
+                } catch {
+                    Log.error("could not remove \(self.paths.unfinishedCommandFile.path): \(error.localizedDescription)")
+                }
+            }
             handle.release()
-            Log.info("\(command.description) exited with status \(command.terminationStatus.map(String.init) ?? "?"); recovery lock released")
+            Log.info("recovery lock released")
             guard let self else { return }
             if self.unfinishedCommand === command {
                 self.unfinishedCommand = nil
+                self.unfinishedUndo = nil
                 self.commandWarning = nil
             }
             await self.settle(after: command)
         }
+    }
+
+    /// `command`, left running with `undo` owed, has exited 0: the undo is
+    /// done, so its entry is cleared before the lock goes. Left set, the
+    /// retry would run the same command again, and one that is as slow
+    /// every time would be reported as left running every time and never
+    /// confirmed. The journal is read from disk first, as by a transaction.
+    /// If it cannot be read or written, the entry stays and the retry runs
+    /// the undo again.
+    private func confirmUndo(_ undo: PendingUndo, by command: UnfinishedCommand) {
+        do {
+            try loadJournal()
+            switch undo {
+            case .sleepRestored:
+                try journal { $0.sleepDisabledByUs = false }
+                Log.info("sleep restored: \(command.description) exited 0")
+            case .lowPowerOff:
+                try journal { $0.lowPowerSetByUs = false }
+                Log.info("low power mode off: \(command.description) exited 0")
+                settleDisplayAfterLowPower()
+            }
+        } catch {
+            Log.error("\(command.description) exited 0, but the journal could not be read or updated; the entry stays and the undo runs again: \(error.localizedDescription)")
+        }
+    }
+
+    /// For a busy lock: the command recorded as holding it, if any, so the
+    /// message names what to stop. After a crash or force quit, that is a
+    /// `sudo pmset` the earlier run left running, and nothing else would
+    /// say why the lock stays busy. Announced once per command.
+    private func recordedLockHolder(_ error: Error) -> String {
+        guard case .busy? = error as? RecoveryLockError, let record = store.loadUnfinishedCommand() else { return "" }
+        let line = "`\(record.command)` (pid \(record.pid)), left running by Insomnia since \(iso(record.since)), may still hold it; if ps -p \(record.pid) still shows it, stop it by hand with sudo kill \(record.pid)"
+        if announcedLockHolder != record.pid {
+            announcedLockHolder = record.pid
+            notifier.post(
+                title: Self.commandRunningTitle,
+                body: "The recovery lock is busy, and \(line). Insomnia changes nothing until the lock is free."
+            )
+        }
+        return "; \(line)"
     }
 
     /// Re-establish a consistent state once `command` has exited and its
@@ -499,16 +586,17 @@ final class SessionManager {
     ///
     /// On: it stays journaled as ours, for the floors or the end to switch
     /// off. Off: a reading is no confirmed undo, and neither is a command
-    /// that failed or was not watched to the end, so the check runs a
-    /// `lowpowermode 0` of its own and clears the flag only once that has
-    /// exited 0, as `restoreAll` does. A display write owed for the end of
-    /// the mode is done then, as after any switch-off, unless the panel
-    /// has moved since it was written: the user may have set it while the
-    /// command ran, so the movement check runs again first.
+    /// that failed, so the check runs a `lowpowermode 0` of its own and
+    /// clears the flag only once that has exited 0, as `restoreAll` does.
+    /// A display write owed for the end of the mode is done then, as after
+    /// any switch-off, unless the panel has moved since it was written: the
+    /// user may have set it while the command ran, so the movement check
+    /// runs again first.
     ///
     /// True once nothing is left for this pass to retry: the flag matches
     /// the mode, or the `lowpowermode 0` was itself left running, and the
-    /// task holding the lock for it runs the pass again when it exits.
+    /// task holding the lock for it confirms it if it exits 0, or runs the
+    /// pass again.
     /// False when the mode could not be read, the `lowpowermode 0` failed,
     /// or the journal could not be written: the flag stays, and
     /// `settleAfterCommand` checks again.
@@ -527,7 +615,7 @@ final class SessionManager {
         do {
             try await sleepGuard.setLowPowerMode(false)
         } catch let still as CommandStillRunningError {
-            stopTransaction(for: still, thenEnd: nil)
+            stopTransaction(for: still, thenEnd: nil, undoes: .lowPowerOff)
             return true
         } catch {
             Log.error("low power mode reads off after the power command, but lowpowermode 0 failed; ownership kept in the journal and checked again in \(Int(recoveryRetryDelay)) s: \(error.localizedDescription)")
@@ -550,13 +638,25 @@ final class SessionManager {
     /// had (the flag written before the command stays, so the next run
     /// retries it), and `exclusive` hands the lock to the command. The user
     /// is notified once, and `commandWarning` keeps the pid in the menu
-    /// until the command exits. `thenEnd` is the end that owes the
-    /// cleanup once the command has exited; it is retried then, and starts
-    /// are refused and quit deferred meanwhile. Without one the session
-    /// goes on, and is checked against the mode once the command has
-    /// exited (`settleAfterCommand`).
-    private func stopTransaction(for error: CommandStillRunningError, thenEnd reason: EndReason?) {
+    /// until the command exits; the command is also recorded on disk, for
+    /// a relaunch to name if this process exits first. `thenEnd` is the end
+    /// that owes the cleanup once the command has exited; it is retried
+    /// then, and starts are refused and quit deferred meanwhile. Without
+    /// one the session goes on, and is checked against the mode once the
+    /// command has exited (`settleAfterCommand`). `undoes` is the entry the
+    /// command clears if it exits 0 (`holdLock`).
+    private func stopTransaction(for error: CommandStillRunningError, thenEnd reason: EndReason?, undoes undo: PendingUndo? = nil) {
         unfinishedCommand = error.command
+        unfinishedUndo = undo
+        do {
+            try store.saveUnfinishedCommand(UnfinishedCommandRecord(
+                pid: error.command.pid,
+                command: ([error.command.exe] + error.command.args).joined(separator: " "),
+                since: clock()
+            ))
+        } catch {
+            Log.error("could not record the command left running in \(paths.unfinishedCommandFile.path): \(error.localizedDescription)")
+        }
         warnAboutCommand("\(error.localizedDescription); Insomnia holds the recovery lock and will not quit until it exits (sudo kill \(error.command.pid) to stop it by hand)")
         notifier.post(
             title: Self.commandRunningTitle,
@@ -941,8 +1041,9 @@ final class SessionManager {
                 } catch let still as CommandStillRunningError {
                     // The rollback itself is left running, and the lock
                     // stays with it. Ownership stays journaled until it has
-                    // exited; the mode is read then (`performLowPowerCheck`).
-                    stopTransaction(for: still, thenEnd: nil)
+                    // exited: cleared if it exits 0, the mode read otherwise
+                    // (`performLowPowerCheck`).
+                    stopTransaction(for: still, thenEnd: nil, undoes: .lowPowerOff)
                 } catch {
                     fail("low power mode may be on and could not be switched off: \(error.localizedDescription); kept in the journal to retry")
                     do { try await backstop.arm() } catch { Log.error("recovery agent could not be confirmed: \(error.localizedDescription)") }
@@ -967,9 +1068,10 @@ final class SessionManager {
                 settleDisplayAfterLowPower()
                 return true
             } catch let still as CommandStillRunningError {
-                // Ownership stays journaled until the command has exited;
-                // the mode is read then and the floors run again.
-                stopTransaction(for: still, thenEnd: nil)
+                // Ownership stays journaled until the command has exited:
+                // cleared if it exits 0, the mode read otherwise; the
+                // floors run again either way.
+                stopTransaction(for: still, thenEnd: nil, undoes: .lowPowerOff)
                 return false
             } catch {
                 Log.error("could not disable low power mode: \(error.localizedDescription)")
@@ -1007,7 +1109,7 @@ final class SessionManager {
                 try? journal { $0.sleepDisabledByUs = false }
                 Log.info("sleep restored")
             } catch let still as CommandStillRunningError {
-                stopTransaction(for: still, thenEnd: nil)
+                stopTransaction(for: still, thenEnd: nil, undoes: .sleepRestored)
                 return still.command
             } catch {
                 fail("could not restore sleep: \(error.localizedDescription)")
@@ -1023,7 +1125,7 @@ final class SessionManager {
                 Log.info("low power mode cleared")
                 lowPowerJustCleared = true
             } catch let still as CommandStillRunningError {
-                stopTransaction(for: still, thenEnd: nil)
+                stopTransaction(for: still, thenEnd: nil, undoes: .lowPowerOff)
                 return still.command
             } catch {
                 fail("could not clear low power mode: \(error.localizedDescription)")

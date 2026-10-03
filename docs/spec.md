@@ -406,10 +406,22 @@ Backstop, independent of the app:
   after SIGTERM stops the transaction where it is, in the app as in the
   agent's `run_bounded`: nothing else is undone, the journal keeps every
   entry it had, and the recovery lock stays held until the command exits.
-  The app reports the pid with the `sudo kill` command, in a menu line of
-  its own that the exit removes, and refuses to quit or start a session
-  until then. An end, lid close or lid open refused meanwhile is recorded at
-  the refusal. When the command exits the app retries a pending end.
+  In the app the command holds the lock itself, with a descriptor on the
+  lock file as its stdin, so a crash or force quit of the app does not
+  free the lock while the command runs; the agent's supervising subshell
+  keeps it the same way. The app runs no `sudo pmset` outside a
+  transaction. It reports the pid with the `sudo kill` command, in a menu
+  line of its own that the exit removes, and refuses to quit or start a
+  session until then. It also records the command in
+  `unfinished-command.json`. The exit removes the record, and so does the
+  next transaction that takes the lock. A transaction refused for a busy
+  lock names the recorded command, and the first such refusal for a pid
+  also notifies. An end, lid close or lid open refused meanwhile is
+  recorded at the refusal. An undo (`disablesleep 0`, `lowpowermode 0`)
+  that exits 0 is confirmed: its entry is cleared under the lock before
+  the lock is released, and a display write owed for the end of the mode
+  is done then. Any other exit confirms nothing. When the command exits the
+  app retries a pending end.
   Otherwise it reads Low Power Mode under the lock. A mode that reads on
   stays journaled as Insomnia's. A mode that reads off is switched off
   once more with the app's own `lowpowermode 0`, and the ownership is

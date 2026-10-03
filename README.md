@@ -216,16 +216,24 @@ installation scenarios still need [release validation](docs/release-validation.m
   changing power settings after the journal has moved on. If it is still
   running 3 s later the transaction stops where it is, as the backstop's
   does: nothing else is undone, the journal keeps its entries, and the
-  recovery lock stays held until the command exits. A notification and a
-  menu warning give the pid and `sudo kill <pid>`; the warning goes away
-  when the command exits. Until then, Insomnia refuses to quit or start a
-  session, and records any end or lid event it refuses. When the command
-  exits, a pending end runs again. Otherwise Insomnia reads Low Power Mode.
-  If it reads off, Insomnia runs its own `lowpowermode 0` and forgets the
-  mode only once that succeeds. Then it replays a refused lid event, after
-  waiting out the 2 s lid debounce, and runs the floor rules again. If the
-  mode cannot be read or switched off, or the journal cannot be written,
-  it tries again every 30 s while the session lasts.
+  recovery lock stays held until the command exits. The command holds the
+  lock itself (its stdin is a descriptor on the lock file), so if Insomnia
+  crashes or is force-quit meanwhile, the backstop still waits for the
+  command instead of running an undo the command would then override. A
+  notification and a menu warning give the pid and `sudo kill <pid>`; the
+  warning goes away when the command exits. The pid is also written to
+  `unfinished-command.json`, and a relaunch that finds the lock busy names
+  the command in the menu and in one notification. Until the command
+  exits, Insomnia refuses to quit or start a session, and records any end
+  or lid event it refuses. A `disablesleep 0` or `lowpowermode 0` that
+  exits 0 counts as done: its journal entry is cleared before the lock is
+  released, and the command is not run again. Any other exit counts as a
+  failure. Then a pending end runs again. Otherwise Insomnia reads Low
+  Power Mode. If it reads off, Insomnia runs its own `lowpowermode 0` and
+  forgets the mode only once that succeeds. Then it replays a refused lid
+  event, after waiting out the 2 s lid debounce, and runs the floor rules
+  again. If the mode cannot be read or switched off, or the journal cannot
+  be written, it tries again every 30 s while the session lasts.
 - **Audio:** the backstop preserves volume/mute entries but cannot restore
   CoreAudio. Reopen the app for recovery.
 - **Sleep disabled by something else:** at launch, with no session and no

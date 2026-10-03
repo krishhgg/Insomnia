@@ -40,6 +40,28 @@ struct PmsetSleepGuard: SleepGuarding {
     /// scripts/backstop.sh.
     static let stopGrace: TimeInterval = 3
 
+    /// The app uses the defaults; tests point `sudo` at a fake, shorten the
+    /// limits, and start the deadline once the fake is ready.
+    let sudoPath: String
+    let pmsetPath: String
+    let commandTimeout: TimeInterval
+    let grace: TimeInterval
+    let runner: CancellableCommand
+
+    init(
+        sudo: String = Self.sudo,
+        pmset: String = Self.pmset,
+        timeout: TimeInterval = Self.timeout,
+        stopGrace: TimeInterval = Self.stopGrace,
+        runner: CancellableCommand = CancellableCommand()
+    ) {
+        sudoPath = sudo
+        pmsetPath = pmset
+        commandTimeout = timeout
+        grace = stopGrace
+        self.runner = runner
+    }
+
     func setSleepDisabled(_ disabled: Bool) async throws {
         try await sudoPmset(["-a", "disablesleep", disabled ? "1" : "0"])
     }
@@ -49,7 +71,7 @@ struct PmsetSleepGuard: SleepGuarding {
     }
 
     func isSleepDisabled() async throws -> Bool {
-        let r = try await CancellableCommand().run(Self.pmset, ["-g"], timeout: Self.timeout)
+        let r = try await runner.run(pmsetPath, ["-g"], timeout: commandTimeout)
         guard r.succeeded else {
             throw SleepGuardError(command: "pmset -g", status: r.status, stderr: r.stderr)
         }
@@ -57,7 +79,7 @@ struct PmsetSleepGuard: SleepGuarding {
     }
 
     func isLowPowerModeOn() async throws -> Bool {
-        let r = try await CancellableCommand().run(Self.pmset, ["-g", "custom"], timeout: Self.timeout)
+        let r = try await runner.run(pmsetPath, ["-g", "custom"], timeout: commandTimeout)
         guard r.succeeded else {
             throw SleepGuardError(command: "pmset -g custom", status: r.status, stderr: r.stderr)
         }
@@ -110,15 +132,25 @@ struct PmsetSleepGuard: SleepGuarding {
     /// orphan a root pmset that can still change power state after the
     /// journal has moved on. The caller must keep its lock and journal
     /// entry until `error.command.waitUntilExit()` returns.
+    ///
+    /// Runs only inside a recovery transaction (`RecoveryLock.held`), and
+    /// the command holds that lock itself until it exits: if Insomnia
+    /// crashes or is force-quit while it runs, the backstop still cannot
+    /// run an undo beside it, or before it, and have it change power state
+    /// afterwards with no journal entry left.
     private func sudoPmset(_ args: [String]) async throws {
-        let full = [Self.pmset] + args
+        let full = [pmsetPath] + args
+        let command = "sudo -n \(full.joined(separator: " "))"
+        guard let lock = RecoveryLock.held else {
+            throw SleepGuardError(command: command, status: -1, stderr: "not run: no recovery transaction holds the lock")
+        }
         // CancellableCommand, not Shell.run(timeout:): it reports a child
         // that had to be stopped at the deadline as a timeout even if the
         // child exits 0 on SIGTERM, and a caller cancelled mid-flight stops
         // the child instead of leaving it running.
-        let r = try await CancellableCommand().run(Self.sudo, ["-n"] + full, timeout: Self.timeout, stop: .terminateOnly(grace: Self.stopGrace))
+        let r = try await runner.run(sudoPath, ["-n"] + full, timeout: commandTimeout, stop: .terminateOnly(grace: grace), holding: lock)
         guard r.succeeded else {
-            throw SleepGuardError(command: "sudo -n \(full.joined(separator: " "))", status: r.status, stderr: r.stderr)
+            throw SleepGuardError(command: command, status: r.status, stderr: r.stderr)
         }
     }
 }

@@ -92,8 +92,10 @@ final class FakeSleepGuard: SleepGuarding, @unchecked Sendable {
     var throwAfterEffect: Set<String> = []
     private var _stillRunning: Set<String> = []
     private var _stuckExitsAtOnce = false
-    private var _stuck: [UnfinishedCommand] = []
+    private var _stuckExitStatus: Int32 = 0
+    private var _stuck: [(child: UnfinishedCommand, command: String)] = []
     private var _nextPid: Int32 = 4242
+    private var _unlocked: [String] = []
 
     var calls: [String] { lock.withLock { _calls } }
     var sleepDisabled: Bool {
@@ -129,8 +131,8 @@ final class FakeSleepGuard: SleepGuarding, @unchecked Sendable {
     }
 
     /// Commands reported as still running after SIGTERM
-    /// (`CommandStillRunningError`): recorded, no effect, and a fake child
-    /// in `stuck` that stays alive until `exitStuckCommands()`.
+    /// (`CommandStillRunningError`): recorded, no effect yet, and a fake
+    /// child in `stuck` that stays alive until `exitStuckCommands()`.
     var stillRunning: Set<String> {
         get { lock.withLock { _stillRunning } }
         set { lock.withLock { _stillRunning = newValue } }
@@ -145,22 +147,48 @@ final class FakeSleepGuard: SleepGuarding, @unchecked Sendable {
         get { lock.withLock { _stuckExitsAtOnce } }
         set { lock.withLock { _stuckExitsAtOnce = newValue } }
     }
+    /// The status a `stuckExitsAtOnce` child exits with.
+    var stuckExitStatus: Int32 {
+        get { lock.withLock { _stuckExitStatus } }
+        set { lock.withLock { _stuckExitStatus = newValue } }
+    }
 
     /// Fake children reported as still running, oldest first.
-    var stuck: [UnfinishedCommand] { lock.withLock { _stuck } }
+    var stuck: [UnfinishedCommand] { lock.withLock { _stuck.map(\.child) } }
+
+    /// `sudo pmset` calls made with no recovery lock held
+    /// (`RecoveryLock.held`); the real guard refuses to run them.
+    var unlockedPrivilegedCalls: [String] { lock.withLock { _unlocked } }
 
     /// The operator ended them (or they finished): every stuck child exits
-    /// with `status`.
+    /// with `status`. Exit 0 is a command that went through in the end, so
+    /// its setting takes effect first; any other status changes nothing.
     func exitStuckCommands(status: Int32 = 0) {
-        let children: [UnfinishedCommand] = lock.withLock {
+        let children: [(child: UnfinishedCommand, command: String)] = lock.withLock {
             defer { _stuck.removeAll() }
             return _stuck
         }
-        for child in children { child.markExited(status: status) }
+        for (child, command) in children {
+            if status == 0 { apply(command) }
+            child.markExited(status: status)
+        }
+    }
+
+    private func apply(_ command: String) {
+        switch command {
+        case "disablesleep 1": sleepDisabled = true
+        case "disablesleep 0": sleepDisabled = false
+        case "lowpowermode 1": lowPowerOn = true
+        case "lowpowermode 0": lowPowerOn = false
+        default: break
+        }
     }
 
     private func record(_ c: String) throws {
         lock.withLock { _calls.append(c) }
+        if !c.hasPrefix("pmset -g"), RecoveryLock.held == nil {
+            lock.withLock { _unlocked.append(c) }
+        }
         if throwOn.contains(c) {
             throw SleepGuardError(command: c, status: 1, stderr: "sudo: a password is required")
         }
@@ -169,12 +197,12 @@ final class FakeSleepGuard: SleepGuarding, @unchecked Sendable {
             let pid = _nextPid
             _nextPid += 1
             let child = UnfinishedCommand(exe: "/usr/bin/sudo", args: ["-n", "/usr/bin/pmset"] + c.split(separator: " ").map(String.init), pid: pid)
-            _stuck.append(child)
+            _stuck.append((child, c))
             if _stuckExitsAtOnce { _stillRunning.remove(c) }
             return (child, _stuckExitsAtOnce)
         }
         if let reported {
-            if reported.exitsAtOnce { exitStuckCommands() }
+            if reported.exitsAtOnce { exitStuckCommands(status: stuckExitStatus) }
             throw CommandStillRunningError(command: reported.child, reason: .timeout(seconds: 20), grace: 3)
         }
     }
