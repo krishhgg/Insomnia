@@ -861,4 +861,35 @@ final class StillRunningCommandTests: XCTestCase {
         XCTAssertEqual(h.display.brightness, 0.6)
         XCTAssertNil(try h.store.loadState()?.displayRestoredUnderLowPower)
     }
+
+    /// The same, but the switch-off exits 1 after switching the mode off,
+    /// and powerd rescales the panel. The check reads the mode off and runs
+    /// its own `lowpowermode 0`. It does not compare the panel with the
+    /// owed value first: with the mode off, the rescale looks the same as a
+    /// user's change. The owed value is written once the switch-off is
+    /// confirmed.
+    func testCheckKeepsTheOwedDisplayWriteThroughTheRescale() async throws {
+        let m = h.makeManager()
+        m.resyncAfterCommand = { _ in }
+        await m.start(duration: 3600)
+        let on = await m.setLowPower(true)
+        XCTAssertTrue(on)
+        var st = try XCTUnwrap(try h.store.loadState())
+        st.displayRestoredUnderLowPower = 0.6
+        try h.store.saveState(st)
+        h.display.brightness = 0.6
+        h.guardFake.stillRunning = ["lowpowermode 0"]
+        _ = await m.setLowPower(false)
+        let before = h.guardFake.calls
+
+        h.guardFake.lowPowerOn = false
+        h.display.brightness = 0.45
+        h.guardFake.stillRunning = []
+        h.guardFake.exitStuckCommands(status: 1)
+        await waitUntil("ownership never cleared after the check") { (try? self.h.store.loadState()?.lowPowerSetByUs) == false }
+        XCTAssertEqual(Array(h.guardFake.calls.dropFirst(before.count)), ["pmset -g custom", "lowpowermode 0"])
+        XCTAssertEqual(h.display.sets, [0.6], "the rescale was taken for a user's change and the owed write dropped")
+        XCTAssertEqual(h.display.brightness, 0.6)
+        XCTAssertNil(try h.store.loadState()?.displayRestoredUnderLowPower)
+    }
 }

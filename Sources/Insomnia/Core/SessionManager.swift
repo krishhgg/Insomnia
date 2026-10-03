@@ -589,9 +589,10 @@ final class SessionManager {
     /// that failed, so the check runs a `lowpowermode 0` of its own and
     /// clears the flag only once that has exited 0, as `restoreAll` does.
     /// A display write owed for the end of the mode is done then, as after
-    /// any switch-off, unless the panel has moved since it was written: the
-    /// user may have set it while the command ran, so the movement check
-    /// runs again first.
+    /// any switch-off. The panel is not checked for movement first: with
+    /// the mode already off it may read the value powerd rescaled it to,
+    /// which looks the same as a user's change, so the owed value is kept
+    /// until the switch-off is confirmed.
     ///
     /// True once nothing is left for this pass to retry: the flag matches
     /// the mode, or the `lowpowermode 0` was itself left running, and the
@@ -611,7 +612,6 @@ final class SessionManager {
             Log.error("could not read low power mode after the power command; ownership kept in the journal and checked again in \(Int(recoveryRetryDelay)) s: \(error.localizedDescription)")
             return false
         }
-        dropDisplayWriteIfMoved()
         do {
             try await sleepGuard.setLowPowerMode(false)
         } catch let still as CommandStillRunningError {

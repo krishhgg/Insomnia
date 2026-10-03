@@ -425,8 +425,11 @@ Backstop, independent of the app:
   Otherwise it reads Low Power Mode under the lock. A mode that reads on
   stays journaled as Insomnia's. A mode that reads off is switched off
   once more with the app's own `lowpowermode 0`, and the ownership is
-  cleared only when that exits 0; a display write owed for the end of the
-  mode is dropped first if the panel has moved since. Then the app replays
+  cleared only when that exits 0. A display write owed for the end of the
+  mode is kept through the check and done then: with the mode already off,
+  powerd's rescale of the panel cannot be told apart from a user's change,
+  so the panel is compared with the owed value only before a switch-off,
+  while the mode is still on. Then the app replays
   a refused lid event for the state of the latest lid event, after any
   change still in the 2 s lid debounce has settled, and runs the floor
   rules again. A check that cannot take the lock, read the journal or the
