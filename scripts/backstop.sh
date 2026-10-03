@@ -168,6 +168,10 @@ LOG="$LOG_DIR/insomnia.log"
 
 log() { # level message
   "$MKDIR" -p "$LOG_DIR"
+  # Append only to a regular file, or create one. open(2) on a FIFO with no
+  # reader blocks, and most lines are written while this run holds the
+  # recovery lock. A line with nowhere to go is dropped.
+  if [[ -e "$LOG" && ! -f "$LOG" ]]; then return 0; fi
   printf '%s [%s] backstop: %s\n' "$("$DATE" -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" >> "$LOG"
 }
 
@@ -491,6 +495,17 @@ if [[ -e "$SESSION" ]]; then
   fi
 fi
 
+# Whether $ENDED records the end of the session in $SESSION: it holds that
+# file's exact bytes. cmp opens both files, and open(2) on a FIFO with no
+# writer blocks while this run holds the recovery lock, which would keep
+# both this script and the app from ever ending the session. So only two
+# regular files are compared, as session.json and state.json are only read
+# as regular files. The app and record_end both write the record by
+# rename, so anything else at $ENDED is not a record and matches nothing.
+end_recorded() {
+  [[ -f "$SESSION" && -f "$ENDED" ]] && "$CMP" -s "$SESSION" "$ENDED"
+}
+
 # Remove the record. Once its session.json is gone it ends nothing, but it
 # is still a copy of that session's times, so one that cannot be removed is
 # logged on every run until a person removes it. Never fails the caller.
@@ -506,10 +521,11 @@ remove_end_record() {
 # While the two match, that session is over whatever its endsAt says: this
 # run ends it again without the checks below and retries the removal. A
 # record that matches nothing (its session.json was removed or replaced) is
-# stale and goes; it could only ever match the file it copied.
+# stale and goes; it could only ever match the file it copied. rm unlinks
+# a FIFO there without opening it.
 ended_before=0
 if [[ -e "$ENDED" ]]; then
-  if [[ -f "$SESSION" ]] && "$CMP" -s "$SESSION" "$ENDED"; then
+  if end_recorded; then
     ended_before=1
   else
     remove_end_record
@@ -549,9 +565,15 @@ app_alive() {
 # rounded to six places, so the test reads the XML form, which prints the
 # shortest exact value ("30", "0.0", "30.000000100000001"). More than 18
 # digits is past what the shell can compare; the default stands for it.
+#
+# config.json is opened only when it is a regular file, as session.json and
+# state.json are: open(2) on a FIFO with no writer blocks while this run
+# holds the recovery lock. Anything else reads as a missing file, as the app
+# treats it (Store.readData; the app then moves it aside).
+config_is_file() { [[ -f "$CONFIG" ]]; }
 config_int() { # key default
-  local t v=""
-  t="$(type_of "$CONFIG" "$1")"
+  local t="" v=""
+  config_is_file && t="$(type_of "$CONFIG" "$1")"
   if [[ "$t" == integer ]]; then
     v="$(extract "$CONFIG" "$1" || true)"
   elif [[ "$t" == float ]]; then
@@ -565,7 +587,8 @@ config_int() { # key default
   fi
 }
 config_bool() { # key default
-  local v
+  local v=""
+  config_is_file || { echo "$2"; return; }
   v="$(extract "$CONFIG" "$1" || true)"
   if [[ "$(type_of "$CONFIG" "$1")" == bool ]]; then
     case "$v" in true|false) echo "$v"; return ;; esac
@@ -713,10 +736,13 @@ remove_session() {
 # record reads back identical to the file.
 record_end() {
   local tmp="$ENDED.tmp.$$"
-  if [[ -f "$ENDED" ]] && "$CMP" -s "$SESSION" "$ENDED"; then return 0; fi
-  if cat "$SESSION" > "$tmp" 2>/dev/null; then "$MV" -f "$tmp" "$ENDED" 2>/dev/null || true; fi
+  if end_recorded; then return 0; fi
+  # The name carries this run's PID, so anything already there was left by
+  # an earlier process. It goes unopened: writing through a FIFO blocks.
   "$RM" -f "$tmp" 2>/dev/null || true
-  [[ -f "$ENDED" ]] && "$CMP" -s "$SESSION" "$ENDED"
+  if [[ -f "$SESSION" ]] && cat "$SESSION" > "$tmp" 2>/dev/null; then "$MV" -f "$tmp" "$ENDED" 2>/dev/null || true; fi
+  "$RM" -f "$tmp" 2>/dev/null || true
+  end_recorded
 }
 
 session_left=0      # 1 when the valid session this run ends is still on disk
@@ -1064,6 +1090,8 @@ fi
 if (( changed == 1 )); then
   tmp="$APP_SUPPORT/.state.json.backstop.$$"
   publish_ok=1
+  # As in record_end: a leftover at this PID's name goes unopened first.
+  "$RM" -f "$tmp" 2>/dev/null || true
   "$CP" "$STATE" "$tmp" || publish_ok=0
   if (( publish_ok == 1 )) && [[ "$new_sleep" != "$sleep_held" ]]; then
     "$PLUTIL" -replace sleepDisabledByUs -bool "$new_sleep" "$tmp" >/dev/null 2>&1 || publish_ok=0

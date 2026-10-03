@@ -729,6 +729,106 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(fx.log().contains("could not remove \(fx.endedSession.path)"), fx.log())
     }
 
+    /// A FIFO at ended-session.json is never opened: cmp would block on it
+    /// while the run holds the recovery lock, and then neither this script
+    /// nor the app could ever end the session. It is not a record, so it
+    /// matches nothing and goes, and the session is judged as usual: with no
+    /// app alive it ends and sleep is restored.
+    func testEndRecordThatIsAFIFOIsNeverOpenedAndTheSessionStillEnds() throws {
+        try writeLiveSession()
+        let fifo = try FIFOWatch(at: fx.endedSession)
+        defer { fifo.stop() }
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertFalse(fifo.readerSeen, "ended-session.json was opened although it is a FIFO")
+        try assertSessionEnded(r, reason: "Insomnia is not running")
+        XCTAssertEqual(calls(), [sleepRestored])
+        XCTAssertFalse(fx.exists(fx.session))
+        XCTAssertFalse(fx.exists(fx.endedSession))
+    }
+
+    /// The same FIFO with the app alive: the session stands, the reads run,
+    /// and the FIFO goes without being opened.
+    func testEndRecordThatIsAFIFODoesNotEndALiveAppsSession() throws {
+        try writeLiveSession()
+        let fifo = try FIFOWatch(at: fx.endedSession)
+        defer { fifo.stop() }
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+
+        try assertSessionKept(try fx.run(fx.backstop))
+
+        XCTAssertFalse(fifo.readerSeen, "ended-session.json was opened although it is a FIFO")
+        XCTAssertEqual(calls(), [batteryRead, thermalRead])
+        XCTAssertFalse(fx.exists(fx.endedSession))
+    }
+
+    /// A FIFO there that cannot be removed either, with session.json that
+    /// cannot be removed: recording the end compares and replaces, and
+    /// neither opens the FIFO. Sleep is restored and the run exits 1.
+    func testEndRecordFIFOThatCannotBeReplacedIsNeverOpenedWhenRecordingTheEnd() throws {
+        try writeLiveSession()
+        try setImmutable(fx.session, true)
+        let fifo = try FIFOWatch(at: fx.endedSession)
+        defer { fifo.stop() }
+        try setImmutable(fx.endedSession, true)
+        defer { try? setImmutable(fx.endedSession, false) }
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 1, r.stderr + fx.log())
+        XCTAssertFalse(fifo.readerSeen, "ended-session.json was opened although it is a FIFO")
+        XCTAssertTrue(fifo.isStillFIFO)
+        XCTAssertEqual(calls(), [sleepRestored])
+        XCTAssertTrue(fx.log().contains("could not remove \(fx.session.path) or record its end"), fx.log())
+    }
+
+    /// config.json is read only as a regular file, like session.json and
+    /// state.json. A FIFO there reads as a missing file: the defaults apply
+    /// (10% floor, thermal rules on), so both reads run and the session
+    /// stands. plutil on macOS 26 refuses a FIFO by itself, so this pins
+    /// the outcome; the regular-file check does not rely on that.
+    func testConfigThatIsAFIFOIsNeverOpenedAndTheDefaultsApply() throws {
+        try writeLiveSession()
+        let fifo = try FIFOWatch(at: fx.config)
+        defer { fifo.stop() }
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+
+        try assertSessionKept(try fx.run(fx.backstop))
+
+        XCTAssertFalse(fifo.readerSeen, "config.json was opened although it is a FIFO")
+        XCTAssertTrue(fifo.isStillFIFO)
+        XCTAssertEqual(calls(), [batteryRead, thermalRead])
+    }
+
+    /// The log is appended to only as a regular file. Most lines are written
+    /// under the recovery lock, and open(2) for writing on a FIFO with no
+    /// reader blocks. The test holds a read end open, so a write lands in
+    /// the FIFO's buffer instead of hanging the run, and the buffer must
+    /// stay empty. The lines are dropped; the session still ends.
+    func testLogThatIsAFIFOIsNeverWrittenAndTheSessionStillEnds() throws {
+        try writeLiveSession()
+        try FileManager.default.createDirectory(at: fx.logFile.deletingLastPathComponent(), withIntermediateDirectories: true)
+        XCTAssertEqual(mkfifo(fx.logFile.path, 0o600), 0)
+        let reader = open(fx.logFile.path, O_RDONLY | O_NONBLOCK)
+        XCTAssertGreaterThanOrEqual(reader, 0)
+        defer { close(reader) }
+
+        let r = try fx.run(fx.backstop)
+
+        var buffer = [UInt8](repeating: 0, count: 4096)
+        let n = read(reader, &buffer, buffer.count)
+        XCTAssertLessThanOrEqual(n, 0, "the log FIFO was written: \(String(decoding: buffer.prefix(max(n, 0)), as: UTF8.self))")
+        XCTAssertEqual(r.status, 0, r.stderr)
+        XCTAssertEqual(calls(), [sleepRestored])
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, false)
+        XCTAssertFalse(fx.exists(fx.session))
+        var info = stat()
+        XCTAssertTrue(lstat(fx.logFile.path, &info) == 0 && info.st_mode & S_IFMT == S_IFIFO)
+    }
+
     /// The relaunch the record exists for. The backstop ends the session of
     /// an app that died and cannot remove session.json. Insomnia launched
     /// afterwards finds a valid session.json, sees the record and restores
