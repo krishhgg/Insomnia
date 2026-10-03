@@ -2188,18 +2188,57 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "plist", "LaunchAgent replaced")
     }
 
-    /// One grant to another account among this account's lines is enough,
-    /// and a line that names no account (a group, an alias, Defaults) is
-    /// refused too: the new file would drop it.
+    /// `#502` at the start of a line is a user ID to sudoers, not a comment,
+    /// so the same rule written for another account's uid is refused the
+    /// same way.
+    func testInstallRefusesWhenTheRuleGrantsAnotherUserID() throws {
+        try fx.prepareInstall()
+        try fx.installMachinery()
+        let theirs = ScriptFixture.sudoersRule(for: "#\(ScriptFixture.otherUid)")
+        try theirs.write(to: fx.sudoers, atomically: true, encoding: .utf8)
+        fx.setMode("launchctl", "loaded")
+
+        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": ScriptFixture.account])
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertTrue(r.stderr.contains("\(fx.sudoers.path) grants user ID \(ScriptFixture.otherUid), not \(ScriptFixture.account)."), r.stderr)
+        XCTAssertTrue(r.stderr.contains("Nothing was changed."), r.stderr)
+        let calls = fx.calls()
+        XCTAssertFalse(calls.contains { $0.hasPrefix("sudo visudo") || $0.hasPrefix("sudo install") || $0.hasPrefix("sudo -n") }, "\(calls)")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("osascript") || $0.hasPrefix("launchctl") }, "\(calls)")
+        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), theirs)
+        XCTAssertEqual(try String(contentsOf: fx.installedExecutable, encoding: .utf8), "binary", "old bundle replaced")
+    }
+
+    /// One grant to another account among this account's lines is enough.
+    /// Any user field other than this account's name or `#` and its uid is
+    /// refused, including forms that name no single account (a group, a
+    /// netgroup, an alias, a list, a quoted name, Defaults, an include): the
+    /// new file would drop the line. A line that only continues the one
+    /// above it is refused too.
     func testInstallRefusesARuleWithAnyLineNotForThisAccount() throws {
         try fx.prepareInstall()
-        let mine = ScriptFixture.sudoersRule(for: ScriptFixture.account)
+        let me = ScriptFixture.account
+        let mine = ScriptFixture.sudoersRule(for: me)
+        let other = ScriptFixture.otherUid
         for (extra, expected) in [
-            ("bob ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0", "grants bob, not \(ScriptFixture.account)."),
-            ("%admin ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0", "has a line that is not for \(ScriptFixture.account): %admin ALL="),
-            ("Defaults:bob !authenticate", "has a line that is not for \(ScriptFixture.account): Defaults:bob"),
-            ("ALL ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0", "has a line that is not for \(ScriptFixture.account): ALL ALL="),
-            ("#include /private/etc/sudoers.d/other", "has a line that is not for \(ScriptFixture.account): #include"),
+            ("bob ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0", "grants bob, not \(me)."),
+            ("#\(other) ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0", "grants user ID \(other), not \(me)."),
+            ("#-1 ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0", "has a line that is not for \(me): #-1 ALL="),
+            ("%admin ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0", "has a line that is not for \(me): %admin ALL="),
+            ("%#20 ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0", "has a line that is not for \(me): %#20 ALL="),
+            ("+staff ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0", "has a line that is not for \(me): +staff ALL="),
+            ("SLEEPERS ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0", "has a line that is not for \(me): SLEEPERS ALL="),
+            ("User_Alias SLEEPERS = bob", "has a line that is not for \(me): User_Alias SLEEPERS"),
+            ("\"\(me)\" ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0", "has a line that is not for \(me): \"\(me)\" ALL="),
+            ("\(me),bob ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0", "has a line that is not for \(me): \(me),bob ALL="),
+            ("\(me) , bob ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0", "has a line that is not for \(me): \(me) , bob ALL="),
+            ("Defaults:bob !authenticate", "has a line that is not for \(me): Defaults:bob"),
+            ("ALL ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0", "has a line that is not for \(me): ALL ALL="),
+            ("#include /private/etc/sudoers.d/other", "has a line that is not for \(me): #include"),
+            ("#includedir /private/etc/sudoers.d/more", "has a line that is not for \(me): #includedir"),
+            ("@include /private/etc/sudoers.d/other", "has a line that is not for \(me): @include"),
+            ("\(me) ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0, \\\n    /usr/bin/pmset -g", "has a line that is not for \(me): /usr/bin/pmset -g"),
         ] {
             try FileManager.default.createDirectory(at: fx.sudoers.deletingLastPathComponent(), withIntermediateDirectories: true)
             let rule = mine + "  " + extra + "\n"
@@ -2219,14 +2258,18 @@ final class RecoveryScriptTests: XCTestCase {
     /// The check goes by the account a line names, not by its commands, so
     /// this account's own rule from any version of install.sh (here three
     /// grants under another comment, as a later rule might be) is replaced.
+    /// A grant to `#` and this account's uid is its own too, and a `#` that
+    /// is not followed by a digit still starts a comment.
     func testInstallReplacesThisAccountsOwnRuleWhateverItsCommands() throws {
         try fx.prepareInstall()
         let account = ScriptFixture.account
         let older = """
         # Installed by Insomnia install.sh. Three commands.
+        #
+        #--- 502 is not a user ID here
         \(account) ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0
-        \(account) ALL=(root) NOPASSWD: /usr/bin/pmset -b lowpowermode 1
-        \(account) ALL=(root) NOPASSWD: /usr/bin/pmset -b lowpowermode 0
+        \(account)\tALL=(root) NOPASSWD: /usr/bin/pmset -b lowpowermode 1
+          #\(getuid()) ALL=(root) NOPASSWD: /usr/bin/pmset -b lowpowermode 0
 
         """
         try FileManager.default.createDirectory(at: fx.sudoers.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -2888,6 +2931,22 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(r.stdout.contains("Uninstall Insomnia in that account"), r.stdout)
         XCTAssertFalse(fx.exists(fx.app))
         XCTAssertFalse(fx.exists(fx.plist))
+    }
+
+    /// The same rule written for another account's uid (`#502`) is not this
+    /// account's either, so it is kept.
+    func testUninstallKeepsARuleThatGrantsAnotherUserID() throws {
+        try fx.installMachinery()
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        let theirs = ScriptFixture.sudoersRule(for: "#\(ScriptFixture.otherUid)")
+        try theirs.write(to: fx.sudoers, atomically: true, encoding: .utf8)
+
+        let r = try fx.run(fx.uninstall)
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("sudo rm") }, "\(fx.calls())")
+        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), theirs)
+        XCTAssertTrue(r.stdout.contains("Kept \(fx.sudoers.path): it grants #\(ScriptFixture.otherUid), not \(ScriptFixture.account)."), r.stdout)
     }
 
     /// A file that is not exactly what install.sh writes for this account

@@ -155,34 +155,46 @@ report_unverified() {
   (( ${#UNVERIFIED[@]} > 0 )) || return 0
   echo "Cannot tell whether ${#UNVERIFIED[@]} process(es) named Insomnia are this app, so they count as it until they exit: $(list "${UNVERIFIED[@]}")."
 }
-# Stops the run when Insomnia runs in another account; nothing is sent to
-# that process. The argument says what this run has changed so far.
 # Why replacing the rule at $SUDOERS would take access away from someone
-# other than $USER, or nothing when every line is a comment or names $USER.
-# Judged by the account a line names (its first field), not by its
-# commands, so a rule from any version of this script passes for its own
-# account. A line for another name, a group, an alias, Defaults or an
-# include counts, since the new file would drop it.
+# other than $USER, or nothing when every line is a comment or is for
+# $USER. Judged by the user field a line starts with, not by its commands,
+# so a rule from any version of this script passes for its own account.
+# A line is this account's only when that field is exactly $USER or
+# #$UID_NUM (sudoers' form for a user ID) and no comma after it carries on
+# the user list. Any other field counts, so the check fails closed: another
+# name or user ID, %group, %#gid, +netgroup, an alias, ALL, a quoted name,
+# Defaults, an include, a continued line. The new file would drop it.
+# "#" starts a comment as it does for sudo: not when a digit, or "-" and a
+# digit, follows (a user ID), and not in #include or #includedir.
 sudoers_for_others() { # file content
-  local line name
+  local line name rest
   while IFS= read -r line; do
     line="${line#"${line%%[![:space:]]*}"}"
     case "$line" in
       "") continue ;;
-      "#include"*) ;;
+      "#include"* | "#"[[:digit:]]* | "#-"[[:digit:]]* | "#-") ;;
       "#"*) continue ;;
     esac
     name="${line%%[[:space:]]*}"
-    [[ "$name" == "$USER" ]] && continue
-    case "$name" in
-      ALL | Defaults* | *_Alias | "#include"* | "@include"*) ;;
-      *) if [[ "$name" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]]; then echo "grants $name"; return 0; fi ;;
-    esac
+    rest="${line#"$name"}"
+    rest="${rest#"${rest%%[![:space:]]*}"}"
+    if [[ ( "$name" == "$USER" || "$name" == "#$UID_NUM" ) && "$rest" != ,* ]]; then
+      continue
+    fi
+    if [[ "$rest" != ,* ]]; then
+      case "$name" in
+        Defaults* | *_Alias) ;;
+        "#"*) if [[ "$name" =~ ^#(0|[1-9][[:digit:]]*)$ ]]; then echo "grants user ID ${name#?}"; return 0; fi ;;
+        *) if [[ "$name" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ && ! "$name" =~ ^[[:upper:]][[:upper:][:digit:]_]*$ ]]; then echo "grants $name"; return 0; fi ;;
+      esac
+    fi
     echo "has a line that is not for $USER: $line"
     return 0
   done <<< "$1"
   return 0
 }
+# Stops the run when Insomnia runs in another account; nothing is sent to
+# that process. The argument says what this run has changed so far.
 stop_for_other_accounts() { # what was changed
   (( ${#OTHER_ACCOUNT[@]} > 0 )) || return 0
   echo "Insomnia is running in another account, or a process named Insomnia there could not be told apart from it: $(list "${OTHER_ACCOUNT[@]}")." >&2
