@@ -536,8 +536,19 @@ final class TmuxTargetResolutionTests: XCTestCase {
 // MARK: - DockerRule second check
 
 final class DockerRuleSecondCheckTests: XCTestCase {
+    /// Docker Desktop runs as pid 400 with one child, so planning finds its
+    /// group and only the rule setting decides whether the probe runs.
     private func rule(_ probe: @escaping DockerRule.ContainerProbe) -> DockerRule {
-        DockerRule(freezer: FakeFreezer(apps: [], processes: [], control: FakeProcessControl()), probe: probe)
+        let freezer = FakeFreezer(
+            apps: [RunningApp(pid: 400, bundleId: DockerRule.bundleId, name: "Docker")],
+            processes: [
+                ProcessEntry(pid: 1, ppid: 0, startedAt: 1),
+                ProcessEntry(pid: 400, ppid: 1, startedAt: 4000),
+                ProcessEntry(pid: 401, ppid: 400, startedAt: 4001),
+            ],
+            control: FakeProcessControl()
+        )
+        return DockerRule(freezer: freezer, probe: probe)
     }
 
     /// Only a clean idle answer lets the SIGSTOP go ahead. Busy, a failed
@@ -553,14 +564,24 @@ final class DockerRuleSecondCheckTests: XCTestCase {
         XCTAssertFalse(timedOut)
     }
 
-    /// The rule off: no group, and the probe never runs.
+    /// The rule off: no group, and the probe never runs, while Docker
+    /// Desktop is running. The same fixture with the rule on probes once
+    /// and returns Desktop's group, so the first half cannot pass just
+    /// because no Docker was running.
     func testRuleOffNeverProbes() async {
         let probes = Locked(0)
+        let docker = rule { probes.value += 1; return true }
         var config = Config()
         config.dockerRule = false
-        let group = await rule { probes.value += 1; return true }.idleDockerGroup(config: config)
-        XCTAssertNil(group)
-        XCTAssertEqual(probes.value, 0)
+        let off = await docker.idleDockerGroup(config: config)
+        XCTAssertNil(off)
+        XCTAssertEqual(probes.value, 0, "the probe ran with the rule off")
+
+        config.dockerRule = true
+        let on = await docker.idleDockerGroup(config: config)
+        XCTAssertEqual(on?.bundleId, DockerRule.bundleId)
+        XCTAssertEqual(on?.pids, [400, 401])
+        XCTAssertEqual(probes.value, 1)
     }
 }
 
