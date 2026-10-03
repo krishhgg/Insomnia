@@ -1871,6 +1871,33 @@ final class RecoveryScriptTests: XCTestCase {
     /// read that never answers under the recovery lock (a bundle on a
     /// stalled volume) is stopped after CALL_TIMEOUT_SECONDS without the
     /// lock, the process counts as unverified, and nothing is removed.
+    /// Ids kept from before the lock belong to the processes they were read
+    /// for. A process that took the API client's place (another pid at the
+    /// same path, such as a copy of this app) is not taken for the client
+    /// under the lock: it counts as first seen there and stops the install.
+    func testInstallDoesNotCarryAnIdentityOverToANewProcessAtTheSamePath() throws {
+        try fx.prepareInstall()
+        try "trusted".write(to: fx.plist, atomically: true, encoding: .utf8)
+        fx.setMode("launchctl", "loaded")
+        let client = try fx.otherBundle(in: "Applications-foreign", bundleId: "com.insomnia.app")
+        let clientPlist = client.deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("Info.plist").path
+        // The client before the sudoers step and at the quit step, another
+        // process at its path under the lock.
+        fx.setMode("pgrep", "pids:4242\npids:4242\npids:5151\n")
+        try fx.psComm([(4242, client.path), (5151, client.path)])
+
+        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertTrue(r.stdout.contains("Ignoring 1 process(es) named Insomnia that are not this app: pid 4242"), r.stdout)
+        XCTAssertTrue(r.stderr.contains("Insomnia started again (pid 5151 (\(client.path); first seen under the recovery lock, where no Info.plist is read))"), r.stderr)
+        XCTAssertEqual(fx.plistReads().filter { $0 == clientPlist }.count, 1, "\(fx.plistReads())")
+        let calls = fx.calls()
+        XCTAssertFalse(calls.contains { $0.hasPrefix("launchctl") }, "\(calls)")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("osascript") }, "\(calls)")
+        XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "trusted")
+    }
+
     func testUninstallTreatsAnInfoPlistThatDoesNotAnswerUnderTheLockAsUnverified() throws {
         try fx.installMachinery()
         try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
@@ -2744,6 +2771,7 @@ private final class ScriptFixture {
         // order; the last line repeats. Default 1 (not running). A match
         // (exit 0) prints the pids in pgrep.pids, one per line (default
         // 4242, which ps.comm maps to the installed bundle's binary). A
+        // line "pids:A,B" is a match that prints those pids instead. A
         // line "hang" never answers; see hangHere.
         try writeFake("pgrep", """
         printf 'pgrep %s\\n' "$*" >> "\(calls)"
@@ -2753,6 +2781,7 @@ private final class ScriptFixture {
         if (( $(wc -l < "$f") > 1 )); then tail -n +2 "$f" > "$f.next" && mv "$f.next" "$f"; fi
         \(hangHere("pgrep"))
         if [[ "$first" == hang ]]; then hang_here; fi
+        if [[ "$first" == pids:* ]]; then tr ',' '\\n' <<< "${first#pids:}"; exit 0; fi
         if [[ "${first:-1}" == 0 ]]; then
           if [[ -f "\(r)/pgrep.pids" ]]; then cat "\(r)/pgrep.pids"; else echo 4242; fi
         fi

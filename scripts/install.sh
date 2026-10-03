@@ -71,17 +71,19 @@ UNVERIFIED=()     # "pid N (path; why)" per process of this account that could n
 OTHER_ACCOUNT=()  # "pid N (uid U, path)" per copy, or process that could not be told apart from one, in another account
 OTHER_FOUND=()    # "pid N (path, bundle id X)" per process proven to be the API client
 BLOCKING=()       # the first three: what must be gone before files are touched
-# Bundle ids read before the recovery lock, as "bundle|id", reused under it.
-# Once the lock is held (PLIST_READS=0) no Info.plist is read: one on a
-# stalled volume would hold the lock, and this script has no time limit for
-# a call. A bundle first seen then counts as unverified and blocks.
+# Bundle ids read before the recovery lock, as "pid|bundle|id", reused for
+# the same process only: one that took a bundle's place since has another
+# pid and is not taken for what ran there before. Once the lock is held
+# (PLIST_READS=0) no Info.plist is read: one on a stalled volume would hold
+# the lock, and this script has no time limit for a call. A process first
+# seen then counts as unverified and blocks.
 KNOWN_IDS=()
 PLIST_READS=1
-known_id() { # bundle
+known_id() { # pid bundle
   local entry
   (( ${#KNOWN_IDS[@]} > 0 )) || return 0
   for entry in "${KNOWN_IDS[@]}"; do
-    if [[ "${entry%|*}" == "$1" ]]; then
+    if [[ "${entry%|*}" == "$1|$2" ]]; then
       printf '%s\n' "${entry##*|}"
       return 0
     fi
@@ -100,10 +102,10 @@ find_insomnia() {
     desc="${exe:-executable path unknown}"   # what the messages say; gains the reason when unverified
     if [[ "$exe" == /*/Contents/MacOS/* ]]; then
       bundle="${exe%/Contents/MacOS/*}"
-      id="$(known_id "$bundle")"
+      id="$(known_id "$pid" "$bundle")"
       if [[ -z "$id" ]] && (( PLIST_READS == 1 )); then
         id="$("$PLUTIL" -extract CFBundleIdentifier raw -o - "$bundle/Contents/Info.plist" 2>/dev/null || true)"
-        if [[ -n "$id" ]]; then KNOWN_IDS+=("$bundle|$id"); fi
+        if [[ -n "$id" ]]; then KNOWN_IDS+=("$pid|$bundle|$id"); fi
       fi
       if [[ -z "$id" ]]; then
         if (( PLIST_READS == 1 )); then
