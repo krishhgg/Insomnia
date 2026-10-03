@@ -287,7 +287,7 @@ jobs:
             install_note="The installer checks the bundle's signature, identifier and version before asking for your password, but it cannot verify where this bundle came from: that is what the checksum and the attestation above are for, and \`--allow-unverified-origin\` says you checked them. It then installs the app, the recovery agent and the sudoers rule described in the README."
           fi
           {
-            echo "Insomnia $VERSION for macOS 26 or later."
+            echo "Insomnia $VERSION for Apple Silicon Macs with macOS 26 or later. The app is built for arm64 only, so the installer stops on an Intel Mac."
             echo
             echo "$signing"
             echo

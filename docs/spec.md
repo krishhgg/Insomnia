@@ -39,7 +39,9 @@ closed bag. Its design goals are to:
   is set). `install.sh` installs that build, or a prebuilt bundle passed with
   `--app` after verifying it (one whose origin it cannot verify needs
   `--allow-unverified-origin`), to `~/Applications`. The Release workflow
-  packages the same bundle (`docs/releasing.md`). `install.sh` and
+  packages the same bundle (`docs/releasing.md`), built for arm64 only;
+  `install.sh --app` stops unless `sysctl -n hw.optional.arm64` reads 1
+  (true on Apple Silicon, also under Rosetta). `install.sh` and
   `uninstall.sh` take sibling scripts (`build-app.sh`, `backstop.sh`) only
   from a source checkout's `scripts/` folder, with `Package.swift` one level
   up, and never from the folder above their own: the release zip carries

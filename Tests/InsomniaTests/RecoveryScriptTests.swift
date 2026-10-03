@@ -2661,6 +2661,36 @@ final class RecoveryScriptTests: XCTestCase {
         }
     }
 
+    /// Release bundles are arm64 only. On a Mac whose hardware is not Apple
+    /// Silicon (sysctl reads 0, or has no hw.optional.arm64), install.sh
+    /// --app refuses before it copies or checks the bundle, and names the
+    /// source build. A source build on the same Mac does not ask.
+    func testInstallFromPrebuiltAppRefusesOnAMacThatIsNotAppleSilicon() throws {
+        try fx.prepareInstall()
+        let prebuilt = try fx.writePrebuiltApp()
+        fx.setMode("launchctl", "loaded")
+        for (mode, read) in [("intel-0", "0"), ("intel-missing", "no value")] {
+            fx.clearCalls()
+            fx.setMode("sysctl", mode)
+
+            let r = try fx.run(fx.installRedirected, ["--allow-unverified-origin", "--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
+
+            XCTAssertEqual(r.status, 1, "\(mode): " + r.stderr + r.stdout)
+            XCTAssertEqual(fx.callsBesideScratchFiles(), ["sysctl -n hw.optional.arm64"], "\(mode): nothing else ran: \(fx.calls())")
+            XCTAssertTrue(r.stderr.contains("Release bundles of Insomnia run on Apple Silicon Macs only, and this Mac is not one ('sysctl -n hw.optional.arm64' gave \(read))."), r.stderr)
+            XCTAssertTrue(r.stderr.contains("Build and install from a source checkout instead (README, Build from source). Nothing was changed."), r.stderr)
+            XCTAssertFalse(fx.exists(fx.sudoers))
+            XCTAssertFalse(fx.exists(fx.app))
+        }
+
+        fx.clearCalls()
+        let built = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(built.status, 0, built.stderr + built.stdout)
+        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("sysctl") }, "a source build fits the Mac it is built on: \(fx.calls())")
+        XCTAssertTrue(fx.exists(fx.app))
+    }
+
     /// Integrity is not origin: an ad-hoc bundle, or a Developer ID bundle
     /// while EXPECTED_TEAM_ID is empty, passes every check on it and could
     /// still have been made by anyone. Without --allow-unverified-origin
@@ -2673,7 +2703,7 @@ final class RecoveryScriptTests: XCTestCase {
 
         XCTAssertEqual(adhoc.status, 1, adhoc.stderr + adhoc.stdout)
         let copy = try checkedCopy(of: prebuilt)
-        XCTAssertEqual(fx.callsBesideScratchFiles(), ["codesign --verify --strict --deep \(copy)", "codesign -dvv \(copy)"], "\(fx.calls())")
+        XCTAssertEqual(fx.callsBesideScratchFiles(), ["sysctl -n hw.optional.arm64", "codesign --verify --strict --deep \(copy)", "codesign -dvv \(copy)"], "\(fx.calls())")
         XCTAssertTrue(adhoc.stderr.contains("The origin of Insomnia 0.1.0 at \(prebuilt.path) is not verified: ad-hoc signed"), adhoc.stderr)
         XCTAssertEqual(try pastedWords(of: printedCommand(in: adhoc.stderr, containing: " --app ")), [fx.installRedirected.path, "--allow-unverified-origin", "--app", prebuilt.path], "names the flag")
         XCTAssertTrue(adhoc.stderr.contains("Nothing was changed"), adhoc.stderr)
@@ -2727,7 +2757,7 @@ final class RecoveryScriptTests: XCTestCase {
         let edited = try fx.run(fx.installRedirected, ["--allow-unverified-origin", "--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
 
         XCTAssertEqual(edited.status, 1, edited.stderr + edited.stdout)
-        XCTAssertEqual(fx.callsBesideScratchFiles(), [], "the real codesign refused before any fake tool ran: \(fx.calls())")
+        XCTAssertEqual(fx.callsBesideScratchFiles(), ["sysctl -n hw.optional.arm64"], "the real codesign refused before any other fake tool ran: \(fx.calls())")
         XCTAssertTrue(edited.stderr.contains("fails 'codesign --verify --strict --deep'"), edited.stderr)
         XCTAssertTrue(edited.stderr.contains("Nothing was changed"), edited.stderr)
     }
@@ -2830,7 +2860,7 @@ final class RecoveryScriptTests: XCTestCase {
 
         XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
         let calls = fx.callsBesideScratchFiles()
-        XCTAssertEqual(calls, ["codesign --verify --strict --deep \(try checkedCopy(of: prebuilt))"], "nothing after the failed check: \(fx.calls())")
+        XCTAssertEqual(calls, ["sysctl -n hw.optional.arm64", "codesign --verify --strict --deep \(try checkedCopy(of: prebuilt))"], "nothing after the failed check: \(fx.calls())")
         XCTAssertTrue(r.stderr.contains("Nothing was changed"), r.stderr)
         XCTAssertTrue(r.stderr.contains("SHA256SUMS"), "points at the download checks: \(r.stderr)")
         XCTAssertEqual(try String(contentsOf: fx.app.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "binary", "old bundle kept")
@@ -4395,6 +4425,7 @@ private final class ScriptFixture {
             "SUDO": bin.appendingPathComponent("sudo").path,
             "CODESIGN": bin.appendingPathComponent("codesign").path,
             "SPCTL": bin.appendingPathComponent("spctl").path,
+            "SYSCTL": bin.appendingPathComponent("sysctl").path,
             "MV": bin.appendingPathComponent("mv").path,
             "RM": bin.appendingPathComponent("rm").path,
             "RMDIR": bin.appendingPathComponent("rmdir").path,
@@ -4671,7 +4702,22 @@ private final class ScriptFixture {
         for f in $fail; do [[ "$f" == "${2:-}" ]] && exit 1; done
         exit 0
         """)
+        // sysctl: `-n kern.bootsessionuuid` reads boot.uuid and is not
+        // logged (backstop.sh asks on every run; it changes nothing).
+        // `-n hw.optional.arm64` is logged and reads 1, an Apple Silicon Mac
+        // (also what a shell under Rosetta reads there). Mode "intel-0"
+        // reads 0; "intel-missing" fails the way sysctl does for a key the
+        // Mac lacks.
         try writeFake("sysctl", """
+        if [[ "$*" == "-n hw.optional.arm64" ]]; then
+          printf 'sysctl %s\\n' "$*" >> "\(calls)"
+          case "$(cat "\(r)/sysctl.mode" 2>/dev/null || echo ok)" in
+            intel-0) echo 0 ;;
+            intel-missing) echo "sysctl: unknown oid 'hw.optional.arm64'" >&2; exit 1 ;;
+            *) echo 1 ;;
+          esac
+          exit 0
+        fi
         cat "\(r)/boot.uuid"
         """)
         // date: the real tool, except that with date.mode present the stamp

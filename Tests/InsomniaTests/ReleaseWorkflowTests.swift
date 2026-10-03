@@ -120,6 +120,20 @@ final class ReleaseWorkflowTests: XCTestCase {
         XCTAssertFalse(release.contains("uses: actions/checkout"), "publishing needs no checkout")
     }
 
+    /// Release bundles are arm64 only (no universal build), so the notes'
+    /// first line and the README's Install section say a release needs an
+    /// Apple Silicon Mac. RecoveryScriptTests checks that install.sh --app
+    /// stops on any other Mac.
+    func testTheNotesAndTheReadmeStateTheAppleSiliconRequirement() throws {
+        let text = try XCTUnwrap(try workflows().first { $0.name == "release.yml" }).text
+        XCTAssertTrue(text.contains(#"echo "Insomnia $VERSION for Apple Silicon Macs with macOS 26 or later."#), "the notes' first line")
+        let repo = workflowsDir.deletingLastPathComponent().deletingLastPathComponent()
+        let readme = try String(contentsOf: repo.appendingPathComponent("README.md"), encoding: .utf8)
+        let install = try XCTUnwrap(readme.range(of: "\n## Install\n"), "README has no Install section")
+        let end = readme.range(of: "\n## ", range: install.upperBound..<readme.endIndex)?.lowerBound ?? readme.endIndex
+        XCTAssertTrue(readme[install.upperBound..<end].contains("Apple Silicon"), "the README's Install section")
+    }
+
     /// The scripts the zip carries sit at its top level, so the folder above
     /// theirs is wherever the user unpacked it (/tmp, Downloads). They take
     /// sibling scripts from their own folder only; a path built from the

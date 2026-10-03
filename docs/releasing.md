@@ -12,6 +12,12 @@ files are attached to the GitHub Release, and the zip carries a GitHub build
 provenance attestation that names the repository, the tag and the workflow
 run that produced it.
 
+The binary is arm64 only, because the build job runs on an Apple Silicon
+runner and no universal build is made. A release therefore runs on Apple
+Silicon Macs only: the release notes and the README say so, and
+`install.sh --app` stops on a Mac where `sysctl -n hw.optional.arm64` does not
+read 1.
+
 The bundle is the one `scripts/build-app.sh` makes: the release binary,
 `Resources/Info.plist`, the icon, and `backstop.sh` sealed under
 `Contents/Resources` before signing. `install.sh` builds the same bundle

@@ -38,11 +38,14 @@
 
 ## Install
 
-Requires **macOS 26 or later**. Until Developer ID signing is set up, releases
-are ad-hoc signed experimental prereleases: macOS blocks the first launch until
-you allow it in System Settings > Privacy & Security. The checksum and the
-build attestation below still show that the zip is what the Release workflow
-built from the tagged commit.
+Requires **macOS 26 or later on an Apple Silicon Mac**. Release zips are built
+for arm64 only, and their `install.sh --app` stops on an Intel Mac. On Intel,
+building from source (below) is the only option, and it is untested there.
+Until Developer ID signing is set up, releases are ad-hoc signed experimental
+prereleases: macOS blocks the first launch until you allow it in System
+Settings > Privacy & Security. The checksum and the build attestation below
+still show that the zip is what the Release workflow built from the tagged
+commit.
 
 1. Download `Insomnia-<version>-macos.zip` and `SHA256SUMS` from the
    [latest release](https://github.com/krishhgg/Insomnia/releases).
