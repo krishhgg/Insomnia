@@ -31,8 +31,9 @@ struct HotspotPasswordField: Equatable {
     private(set) var stored: Stored?
     /// Why the saved password could not be loaded or saved; under the field.
     private(set) var notice: String?
-    /// Bumped by every load, recheck and save answer, so an answer that
-    /// arrives after a newer one does not overwrite it.
+    /// Bumped by every load and recheck, and when a save begins and
+    /// answers, so an answer that arrives after a newer one does not
+    /// overwrite it.
     private var request = 0
 
     /// "Saved" only while both fields hold what the last save stored. An
@@ -58,10 +59,15 @@ struct HotspotPasswordField: Equatable {
         return true
     }
 
-    /// A save or clear begins; false while one is still waiting.
+    /// A save or clear begins; false while one is still waiting. A load
+    /// or recheck that began before it read the keychain ahead of it on
+    /// the one queue, so its answer is from before the save and is
+    /// dropped: a load would otherwise refill a field the user had just
+    /// cleared, and a later Save would store the old password again.
     mutating func startSave() -> Bool {
         guard !saving else { return false }
         saving = true
+        request += 1
         return true
     }
 

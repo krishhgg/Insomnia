@@ -377,7 +377,8 @@ provided by the standalone backstop. Performance effects depend on workload.
   during the wait has no password yet. A failed save's notice stays under
   the field even when the failover's report changed during the wait; the
   recheck that change started reads the keychain behind the save, and its
-  answer is dropped. A join whose read waited behind a save does nothing
+  answer is dropped. So is the answer of a load still running when a save
+  or clear begins, so it cannot refill a field the user just cleared. A join whose read waited behind a save does nothing
   once the session has ended or Wi-Fi has come back: no join, no retry
   timer, no warning, so the notification stays armed for the next
   outage.

@@ -194,6 +194,19 @@ final class HotspotPasswordFieldTests: XCTestCase {
         XCTAssertEqual(field.notice, refused.notice)
     }
 
+    /// Settings is still loading the saved password when the user clears
+    /// the field and presses Return. The load read the keychain before
+    /// the clear, so its answer is dropped and does not refill the field.
+    func testALoadStartedBeforeAClearDoesNotRefillTheField() {
+        var field = HotspotPasswordField()
+        let load = field.startRead()
+        XCTAssertTrue(field.startSave())
+
+        XCTAssertFalse(field.finishRead(load, notice: nil), "the view fills the field only when this is true")
+        field.finishSave(.stored(.init(ssid: "Phone", password: "")))
+        XCTAssertNil(field.notice)
+    }
+
     /// A recheck that begins after the save answered is newer, and its
     /// notice replaces the save's.
     func testARecheckAfterTheSaveStillUpdatesTheNotice() {
