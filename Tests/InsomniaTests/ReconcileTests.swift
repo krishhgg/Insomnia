@@ -431,14 +431,18 @@ final class ReconcileTests: XCTestCase {
         // h.clock.now is 2027-01-15T08:00:00Z; the end is an hour later.
         let json = #"{"startedAt":"2027-01-15T09:50:00+02:00","endsAt":"2027-01-15T11:00:00+02:00","extensions":[]}"#
         try Data(json.utf8).write(to: h.home.paths.sessionFile)
-        try h.store.saveState(RuntimeState())
+        var st = RuntimeState()
+        st.sleepDisabledByUs = true
+        try h.store.saveState(st)
+        h.guardFake.sleepDisabled = true
 
         let m = h.makeManager()
         await m.reconcile()
 
         XCTAssertEqual(m.session?.endsAt, h.clock.now.addingTimeInterval(3600))
         XCTAssertEqual(m.scheduledDeadline, h.clock.now.addingTimeInterval(3600))
-        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1"])
+        XCTAssertEqual(h.guardFake.calls, ["pmset -g"])
+        XCTAssertEqual(h.prompt.shown, 0)
         XCTAssertEqual(try movedAsideSessions, [])
     }
 
