@@ -116,20 +116,65 @@ final class BrandingTests: XCTestCase {
     }
 
     /// The 24-unit grid is 76% of the tile and centred across it, and sits
-    /// down the tile so that the inked mark (lashes above, lens below) is
-    /// centred rather than the grid.
+    /// down the tile so that what is drawn is centred rather than the grid:
+    /// lower with the lashes (lashes above, lens below), and on the tile's
+    /// centre without them (lens and pupil on the axis).
     func testTheMarkKeepsItsShareOfTheTileAndItsInkIsCentredOnIt() {
-        let tile = AppIconArtwork.tile, mark = AppIconArtwork.mark
-        XCTAssertEqual(mark.width, tile.width * 0.76, accuracy: 0.001)
-        XCTAssertEqual(mark.height, mark.width)
-        XCTAssertEqual(mark.midX, tile.midX, accuracy: 0.001)
-        let inked = AppIconArtwork.inked(in: mark)
-        XCTAssertEqual(inked.midX, tile.midX, accuracy: 0.01, "the ink is centred across the tile")
-        XCTAssertEqual(inked.midY, tile.midY, accuracy: 0.01, "the ink is centred down the tile")
-        XCTAssertGreaterThan(mark.midY, tile.midY, "the grid sits low so the lashes do not push the eye up")
-        XCTAssertTrue(tile.insetBy(dx: 40, dy: 40).contains(inked), "the ink stays well inside the tile: \(inked)")
+        let tile = AppIconArtwork.tile
+        for (mark, lashes) in [(AppIconArtwork.mark, true), (AppIconArtwork.markWithoutLashes, false)] {
+            XCTAssertEqual(mark.width, tile.width * 0.76, accuracy: 0.001)
+            XCTAssertEqual(mark.height, mark.width)
+            XCTAssertEqual(mark.midX, tile.midX, accuracy: 0.001)
+            let inked = AppIconArtwork.inked(in: mark, lashes: lashes)
+            XCTAssertEqual(inked.midX, tile.midX, accuracy: 0.01, "lashes \(lashes): the ink is centred across the tile")
+            XCTAssertEqual(inked.midY, tile.midY, accuracy: 0.01, "lashes \(lashes): the ink is centred down the tile")
+            XCTAssertTrue(tile.insetBy(dx: 40, dy: 40).contains(inked), "lashes \(lashes): the ink stays well inside the tile: \(inked)")
+        }
+        XCTAssertGreaterThan(AppIconArtwork.mark.midY, tile.midY, "the grid sits low so the lashes do not push the eye up")
+        XCTAssertEqual(AppIconArtwork.markWithoutLashes.midY, tile.midY, accuracy: 0.01, "without lashes the eye's axis is the tile's centre line")
         XCTAssertEqual(tile, CGRect(x: 100, y: 100, width: 824, height: 824))
         XCTAssertEqual(AppIconArtwork.cornerShare, 0.2237)
+    }
+
+    /// At 16 pixels the icon is the lens and pupil alone, placed on the
+    /// tile's centre: pixel for pixel the lash-free drawing, and its ink
+    /// balanced about the tile's centre line. The placement worked out for
+    /// the lashes would put it about a pixel low.
+    func testThe16PixelIconIsTheLashFreeEyeCentredOnTheTile() throws {
+        let pixels = 16
+        let drawn = IconPixels(try XCTUnwrap(AppIconArtwork.render(pixels: pixels)))
+        let scale = CGFloat(pixels) / AppIconArtwork.canvas
+        let mark = AppIconArtwork.markWithoutLashes
+        let expected = Raster(size: pixels) { ctx in
+            ctx.scaleBy(x: scale, y: scale)
+            ctx.setLineWidth(max(EyeLensGeometry.lineWidth(for: mark.width), AppIconArtwork.minimumStrokePixels / scale))
+            ctx.setLineCap(.round)
+            ctx.setLineJoin(.round)
+            ctx.addPath(EyeMarkGeometry.lens(in: mark))
+            ctx.strokePath()
+            ctx.addPath(EyeMarkGeometry.pupil(in: mark))
+            ctx.fillPath()
+        }
+        let tileInk = luminance(BrandPalette.midnight), markInk = luminance(BrandPalette.moonWhite)
+        var mismatches = 0
+        var weight: CGFloat = 0, weightedY: CGFloat = 0
+        for y in 0..<pixels {
+            for x in 0..<pixels where drawn.alpha(x, y) > 0.99 {
+                let coverage = min(max((drawn.luminance(x, y) - tileInk) / (markInk - tileInk), 0), 1)
+                // Coverage against coverage, not each against a half-way
+                // threshold: the eye's axis falls on a pixel boundary at
+                // this size, so many edge pixels are half covered.
+                if abs(coverage - expected.alpha(x, y)) > 0.1 { mismatches += 1 }
+                weight += coverage
+                weightedY += coverage * (CGFloat(y) + 0.5)
+            }
+        }
+        XCTAssertEqual(mismatches, 0, "the 16px icon differs from the lash-free eye at \(mismatches) pixels")
+        XCTAssertGreaterThan(weight, 20, "the eye is drawn at 16 pixels")
+        // The pupil's highlight takes a little ink from above the axis,
+        // which moves the balance down by a few hundredths of a pixel.
+        let centre = AppIconArtwork.tile.midY * scale
+        XCTAssertEqual(weightedY / weight, centre, accuracy: 0.25, "the eye's ink is centred down the 16px tile")
     }
 
     /// The lashes are kept from 32 pixels up, where they still read as five
@@ -137,21 +182,26 @@ final class BrandingTests: XCTestCase {
     /// nine-pixel eye.
     func testTheLashesAreDrawnFrom32PixelsAndLeftOutAt16() throws {
         XCTAssertEqual(AppIconArtwork.lashesFromPixels, 32)
-        // Each lash's midpoint, which at 16 pixels is still a full pixel
-        // clear of the outline's one-pixel floor stroke.
-        let ends = points(of: AppIconArtwork.lashes)
-        XCTAssertEqual(ends.count, 10)
-        var midpoints: [CGPoint] = []
-        for i in stride(from: 0, to: ends.count, by: 2) {
-            let a = ends[i], b = ends[i + 1]
-            midpoints.append(CGPoint(x: (a.x + b.x) / 2, y: (a.y + b.y) / 2))
+        // Each lash's midpoint, placed where the lashes would go on the eye
+        // drawn at that size, which at 16 pixels is still a full pixel clear
+        // of the outline's one-pixel floor stroke.
+        func midpoints(_ mark: CGRect) -> [CGPoint] {
+            let ends = points(of: EyeMarkGeometry.lashes(in: mark, side: .above))
+            XCTAssertEqual(ends.count, 10)
+            var midpoints: [CGPoint] = []
+            for i in stride(from: 0, to: ends.count, by: 2) {
+                let a = ends[i], b = ends[i + 1]
+                midpoints.append(CGPoint(x: (a.x + b.x) / 2, y: (a.y + b.y) / 2))
+            }
+            return midpoints
         }
         /// The brightest of each midpoint's pixel and its two horizontal neighbours.
         func lashLight(_ pixels: Int) throws -> [CGFloat] {
             let px = IconPixels(try XCTUnwrap(AppIconArtwork.render(pixels: pixels)))
             let scale = CGFloat(pixels) / AppIconArtwork.canvas
+            let mark = pixels < AppIconArtwork.lashesFromPixels ? AppIconArtwork.markWithoutLashes : AppIconArtwork.mark
             var lights: [CGFloat] = []
-            for mid in midpoints {
+            for mid in midpoints(mark) {
                 let x = Int(mid.x * scale), y = Int(mid.y * scale)
                 var brightest: CGFloat = 0
                 for dx in -1...1 { brightest = max(brightest, px.luminance(x + dx, y)) }

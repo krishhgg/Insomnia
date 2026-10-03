@@ -7,7 +7,7 @@ import XCTest
 /// The checked-in icon artifacts and the bundle wiring that points at them.
 /// These read the real files and decode them; nothing here greps sources.
 final class PackagingTests: XCTestCase {
-    private static var repoRoot: URL {
+    fileprivate static var repoRoot: URL {
         // .../Tests/InsomniaTests/PackagingTests.swift -> repo root
         URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
@@ -115,7 +115,7 @@ final class PackagingTests: XCTestCase {
     func testIcnsMembersAreTheArtworkRenderedAtTheirOwnSizes() throws {
         let url = resources.appendingPathComponent("AppIcon.icns")
         let image = try XCTUnwrap(NSImage(contentsOf: url))
-        for pixels in [16, 32, 1024] {
+        for pixels in [16, 32, 64, 128, 256, 512, 1024] {
             let rep = try XCTUnwrap(image.representations.first { $0.pixelsWide == pixels && $0.pixelsHigh == pixels }, "no \(pixels)px member")
             let ctx = try XCTUnwrap(CGContext(
                 data: nil, width: pixels, height: pixels, bitsPerComponent: 8, bytesPerRow: 0,
@@ -160,6 +160,39 @@ final class PackagingTests: XCTestCase {
         XCTAssertEqual(AppIconArtwork.number(184.32880), "184.3288")
         XCTAssertEqual(AppIconArtwork.number(12), "12")
         XCTAssertEqual(AppIconArtwork.number(-0.00001), "0")
+    }
+
+    // MARK: - Regeneration
+
+    /// A patched copy of scripts/generate-app-icon.sh in a temporary tree,
+    /// with fake swiftc and iconutil, replaces the PNG, ICNS and SVG
+    /// together on success and leaves all three as they were when any step
+    /// fails, without staged copies left beside them.
+    func testRegenerationReplacesAllThreeAssetsOrNone() throws {
+        let fixture = try IconScriptFixture()
+        defer { fixture.remove() }
+
+        // An unwritable docs/assets: the SVG cannot be staged, and the PNG
+        // and ICNS, already staged in Resources, must not be swapped in.
+        try fixture.setWritable(fixture.assets, false)
+        let blocked = try fixture.run()
+        try fixture.setWritable(fixture.assets, true)
+        XCTAssertNotEqual(blocked.status, 0, "an unwritable docs/assets fails the run: \(blocked.stderr)")
+        XCTAssertEqual(try fixture.contents(), ["old png", "old icns", "old svg"])
+        XCTAssertEqual(try fixture.leftovers(), [])
+
+        // iconutil fails: nothing is replaced.
+        fixture.failIconutil(true)
+        let noIcns = try fixture.run()
+        fixture.failIconutil(false)
+        XCTAssertNotEqual(noIcns.status, 0, "a failed iconutil fails the run")
+        XCTAssertEqual(try fixture.contents(), ["old png", "old icns", "old svg"])
+        XCTAssertEqual(try fixture.leftovers(), [])
+
+        let ok = try fixture.run()
+        XCTAssertEqual(ok.status, 0, ok.stderr)
+        XCTAssertEqual(try fixture.contents(), ["new png", "new icns", "new svg"])
+        XCTAssertEqual(try fixture.leftovers(), [])
     }
 
     // MARK: - Helpers
@@ -217,5 +250,123 @@ final class PackagingTests: XCTestCase {
             let r = Double(data[o]) / a, g = Double(data[o + 1]) / a, b = Double(data[o + 2]) / a
             return 0.2126 * r + 0.7152 * g + 0.0722 * b
         }
+    }
+}
+
+/// A throwaway tree for scripts/generate-app-icon.sh:
+///   root/scripts/generate-app-icon.sh   copy with SWIFTC and ICONUTIL patched to the fakes
+///   root/Resources, root/docs/assets    the three assets, holding "old ..."
+///   root/bin                            fake swiftc and iconutil
+///   root/tmp                            TMPDIR for the script's mktemp
+/// The fake swiftc writes a fake generator that writes "new png", one
+/// iconset member, and "new svg" through a file beside the target the way
+/// the real generator's atomic String write does; the fake iconutil writes
+/// "new icns", or fails while root/iconutil-fails exists.
+private struct IconScriptFixture {
+    let root: URL
+    var script: URL { root.appendingPathComponent("scripts/generate-app-icon.sh") }
+    var resources: URL { root.appendingPathComponent("Resources", isDirectory: true) }
+    var assets: URL { root.appendingPathComponent("docs/assets", isDirectory: true) }
+    private var bin: URL { root.appendingPathComponent("bin", isDirectory: true) }
+    private var assetFiles: [URL] {
+        [resources.appendingPathComponent("AppIcon-1024.png"), resources.appendingPathComponent("AppIcon.icns"), assets.appendingPathComponent("eye-open.svg")]
+    }
+    private let fm = FileManager.default
+
+    init() throws {
+        root = FileManager.default.temporaryDirectory.appendingPathComponent("icon-script-\(UUID().uuidString)", isDirectory: true)
+        for dir in ["scripts", "Resources", "docs/assets", "bin", "tmp"] {
+            try fm.createDirectory(at: root.appendingPathComponent(dir, isDirectory: true), withIntermediateDirectories: true)
+        }
+        for (file, text) in zip(assetFiles, ["old png", "old icns", "old svg"]) {
+            try text.write(to: file, atomically: true, encoding: .utf8)
+        }
+        let source = PackagingTests.repoRoot.appendingPathComponent("scripts/generate-app-icon.sh")
+        var text = try String(contentsOf: source, encoding: .utf8)
+        for (name, fake) in [("SWIFTC", "swiftc"), ("ICONUTIL", "iconutil")] {
+            let line = "\(name)=/usr/bin/\(fake)"
+            guard text.components(separatedBy: "\n").filter({ $0 == line }).count == 1 else {
+                throw NSError(domain: "IconScriptFixture", code: 1, userInfo: [NSLocalizedDescriptionKey: "expected one '\(line)' line"])
+            }
+            text = text.replacingOccurrences(of: line, with: "\(name)='\(bin.appendingPathComponent(fake).path)'")
+        }
+        try text.write(to: script, atomically: true, encoding: .utf8)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+
+        try writeFake("swiftc", #"""
+        out=""
+        while [ $# -gt 0 ]; do
+          if [ "$1" = "-o" ]; then out="$2"; shift; fi
+          shift
+        done
+        cat > "$out" <<'GENERATOR'
+        #!/bin/bash
+        set -e
+        while [ $# -gt 0 ]; do
+          case "$1" in
+            --png) printf 'new png' > "$2" ;;
+            --iconset) mkdir -p "$2"; printf 'member' > "$2/icon_16x16.png" ;;
+            --svg) printf 'new svg' > "$2.tmp.$$" || exit 1; mv -f "$2.tmp.$$" "$2" ;;
+            *) exit 2 ;;
+          esac
+          shift 2
+        done
+        GENERATOR
+        chmod +x "$out"
+        """#)
+        try writeFake("iconutil", """
+        [ -e '\(root.appendingPathComponent("iconutil-fails").path)' ] && exit 1
+        [ "$1" = -c ] && [ "$2" = icns ] && [ -d "$3" ] && [ "$4" = -o ] || exit 2
+        printf 'new icns' > "$5"
+        """)
+    }
+
+    private func writeFake(_ name: String, _ body: String) throws {
+        let url = bin.appendingPathComponent(name)
+        try ("#!/bin/bash\n" + body + "\n").write(to: url, atomically: true, encoding: .utf8)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+    }
+
+    func setWritable(_ dir: URL, _ writable: Bool) throws {
+        try fm.setAttributes([.posixPermissions: writable ? 0o755 : 0o555], ofItemAtPath: dir.path)
+    }
+
+    func failIconutil(_ fail: Bool) {
+        let flag = root.appendingPathComponent("iconutil-fails")
+        if fail { fm.createFile(atPath: flag.path, contents: Data()) } else { try? fm.removeItem(at: flag) }
+    }
+
+    /// The PNG, ICNS and SVG, in that order.
+    func contents() throws -> [String] {
+        try assetFiles.map { try String(contentsOf: $0, encoding: .utf8) }
+    }
+
+    /// Anything in the two asset folders besides the three assets.
+    func leftovers() throws -> [String] {
+        let names = Set(assetFiles.map(\.lastPathComponent))
+        return try [resources, assets].flatMap { try fm.contentsOfDirectory(atPath: $0.path) }.filter { !names.contains($0) }.sorted()
+    }
+
+    func run() throws -> (status: Int32, stderr: String) {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/bash")
+        p.arguments = [script.path]
+        p.environment = ["PATH": "/usr/bin:/bin", "TMPDIR": root.appendingPathComponent("tmp").path]
+        p.currentDirectoryURL = root
+        let errURL = root.appendingPathComponent("stderr.\(UUID().uuidString)")
+        fm.createFile(atPath: errURL.path, contents: nil)
+        let err = try FileHandle(forWritingTo: errURL)
+        defer { try? err.close() }
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = err
+        let exit = ProcessExit(p)
+        try p.run()
+        exit.wait()
+        return (p.terminationStatus, (try? String(contentsOf: errURL, encoding: .utf8)) ?? "")
+    }
+
+    func remove() {
+        try? setWritable(assets, true)
+        try? fm.removeItem(at: root)
     }
 }

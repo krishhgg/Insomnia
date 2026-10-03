@@ -29,32 +29,39 @@ enum AppIconArtwork {
     /// The tile, in canvas units.
     static let tile = CGRect(x: tileInset, y: tileInset, width: canvas - 2 * tileInset, height: canvas - 2 * tileInset)
 
+    /// The mark's square for the full drawing, lashes included: every
+    /// size from `lashesFromPixels` up, and the README SVG.
+    static let mark = placement(lashes: true)
+    /// The mark's square for the drawing without lashes, at 16 pixels. The
+    /// lens and pupil are centred on the eye's axis, so this is the grid
+    /// centred on the tile.
+    static let markWithoutLashes = placement(lashes: false)
+
     /// The mark's square, in canvas units: the 24-unit grid at `markShare`
-    /// of the tile, centred across it, and placed so that what is drawn
-    /// (the stroked lens and lashes together) is centred down it. The open
-    /// eye's lashes stand above the axis with nothing below, so a grid
-    /// centred on the tile would leave the mark sitting high.
-    static let mark: CGRect = {
+    /// of the tile, centred across it, and placed so that what is drawn is
+    /// centred down it. The open eye's lashes stand above the axis with
+    /// nothing below, so with lashes a grid centred on the tile would leave
+    /// the mark sitting high; without them the same lift would leave the
+    /// lens sitting low.
+    static func placement(lashes: Bool) -> CGRect {
         let side = tile.width * markShare
         let grid = CGRect(x: 0, y: 0, width: EyeLensGeometry.designSize, height: EyeLensGeometry.designSize)
-        let lift = (grid.midY - inked(in: grid).midY) * side / EyeLensGeometry.designSize
+        let lift = (grid.midY - inked(in: grid, lashes: lashes).midY) * side / EyeLensGeometry.designSize
         return CGRect(x: tile.midX - side / 2, y: tile.midY - side / 2 + lift, width: side, height: side)
-    }()
-
-    /// The box the mark's strokes and fills cover when drawn into `rect`:
-    /// the lens and the lashes grown by half the line weight for their
-    /// round caps, and the pupil, which lies inside the lens.
-    static func inked(in rect: CGRect) -> CGRect {
-        let half = EyeLensGeometry.lineWidth(for: rect.width) / 2
-        return EyeMarkGeometry.lens(in: rect).boundingBoxOfPath
-            .union(EyeMarkGeometry.lashes(in: rect, side: .above).boundingBoxOfPath)
-            .insetBy(dx: -half, dy: -half)
     }
 
-    /// The pieces of the mark, as paths in canvas units.
-    static var lens: CGPath { EyeMarkGeometry.lens(in: mark) }
-    static var pupil: CGPath { EyeMarkGeometry.pupil(in: mark) }
-    static var lashes: CGPath { EyeMarkGeometry.lashes(in: mark, side: .above) }
+    /// The box the mark's strokes and fills cover when drawn into `rect`:
+    /// the lens, and the lashes when they are drawn, grown by half the line
+    /// weight for their round caps, and the pupil, which lies inside the
+    /// lens.
+    static func inked(in rect: CGRect, lashes: Bool) -> CGRect {
+        let half = EyeLensGeometry.lineWidth(for: rect.width) / 2
+        var box = EyeMarkGeometry.lens(in: rect).boundingBoxOfPath
+        if lashes {
+            box = box.union(EyeMarkGeometry.lashes(in: rect, side: .above).boundingBoxOfPath)
+        }
+        return box.insetBy(dx: -half, dy: -half)
+    }
 
     /// The whole icon at `pixels` square, or nil if no bitmap context of
     /// that size can be made.
@@ -87,19 +94,20 @@ enum AppIconArtwork {
         ctx.setFillColor(BrandPalette.midnight.cgColor)
         ctx.fillPath()
 
-        let stroke = max(EyeLensGeometry.lineWidth(for: mark.width), minimumStrokePixels / scale)
+        let square = lashes ? mark : markWithoutLashes
+        let stroke = max(EyeLensGeometry.lineWidth(for: square.width), minimumStrokePixels / scale)
         ctx.setStrokeColor(BrandPalette.moonWhite.cgColor)
         ctx.setLineWidth(stroke)
         ctx.setLineCap(.round)
         ctx.setLineJoin(.round)
-        ctx.addPath(lens)
+        ctx.addPath(EyeMarkGeometry.lens(in: square))
         ctx.strokePath()
         if lashes {
-            ctx.addPath(Self.lashes)
+            ctx.addPath(EyeMarkGeometry.lashes(in: square, side: .above))
             ctx.strokePath()
         }
         ctx.setFillColor(BrandPalette.moonWhite.cgColor)
-        ctx.addPath(pupil)
+        ctx.addPath(EyeMarkGeometry.pupil(in: square))
         ctx.fillPath()
     }
 
