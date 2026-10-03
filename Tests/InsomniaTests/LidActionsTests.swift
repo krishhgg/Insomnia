@@ -482,6 +482,47 @@ final class LidActionsTests: XCTestCase {
         XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
     }
 
+    /// A relaunch under our mode starts a sampler with nothing, held by the
+    /// mode. When the mode ends, the value written again is its sample, so
+    /// a close before the next 30 s sample journals that value, not the
+    /// read under the closing lid.
+    func testTheWriteAfterTheModeIsTheSampleOfARelaunchedSampler() async throws {
+        let idle = Locked<Double>(3)
+        let sampler = makeSampler(idle: idle)
+        let (m, actions) = await make(sampler: sampler)
+        sampler.follow(m)
+        m.willEnableLowPower = { sampler.sample() }
+        await m.start(duration: 3600)
+        h.display.brightness = 0.75
+        let driver = FloorRuleDriver(manager: m, notifier: h.notifier)
+        await driver.run(battery: .percent(35), isCharging: false, thermal: .nominal, lidClosed: false)
+        await actions.onClose()
+        await actions.onOpen()
+        XCTAssertEqual(try h.store.loadState()?.displayRestoredUnderLowPower, 0.75)
+
+        // Relaunch over the same journal, with a new sampler.
+        let relaunched = h.makeManager()
+        relaunched.config.muteOnLidClose = false
+        relaunched.config.freezeList = []
+        let fresh = makeSampler(idle: idle)
+        fresh.follow(relaunched)
+        await relaunched.reconcile()
+        XCTAssertTrue(relaunched.isActive, "the session on disk is still valid")
+        fresh.sample()
+        XCTAssertNil(fresh.last?.display, "held by the mode")
+
+        let relaunchedDriver = FloorRuleDriver(manager: relaunched, notifier: h.notifier)
+        await relaunchedDriver.run(battery: .percent(35), isCharging: true, thermal: .nominal, lidClosed: false)
+        XCTAssertFalse(h.guardFake.lowPowerOn)
+        XCTAssertTrue(logText().contains("display restored again after low power mode (brightness 0.75)"), logText())
+        XCTAssertEqual(fresh.last?.display, 0.75)
+
+        let freshActions = LidActions(manager: relaunched, freezer: freezer, docker: DockerRule(freezer: freezer, probe: { true }), audio: h.audio, display: h.display, keyboard: h.keyboard, sampler: fresh)
+        h.display.brightness = 0.335
+        await freshActions.onClose()
+        XCTAssertEqual(try h.store.loadState()?.savedDisplayBrightness, 0.75, "the value written after the mode, not the read under the closing lid")
+    }
+
     /// An entry left behind after the mode was released (its clear failed)
     /// is not a value to journal at a close: with no sample the close takes
     /// the current read, as before.

@@ -127,7 +127,10 @@ left, so a level set by hand since is not overwritten. It decides only
 on a reading taken with the display awake and the keyboard backlight
 neither suppressed nor dimmed, keeps the entry when the read fails, and
 reads again every 3 s for a minute, then every minute while the entry
-waits, reading nothing while the lid is not known to be open.
+waits, reading nothing while the lid is not known to be open. The
+sampler takes no reading of a device whose brightness is journaled,
+and each level written from the journal or found set since becomes
+its sample, so a close right after a late restore journals that level.
 Unit tests with an injected version and fake classes only; the rows
 below stay "Not run", and the guards do not stand in for them.
 
@@ -150,6 +153,7 @@ is performed. Do not replace "not run" with "passed" based on source review.
 | Darkening refused on an unmeasured macOS version (a macOS major other than 26, or a `KeyboardBrightnessClient` whose methods changed: the log shows the "refused" line once and "skipped" at lid close, nothing is journaled for that device, and Settings names the reason under the darken toggle; with both refused the log shows "display sleep not requested" and the panel is lit when the lid opens; a level saved by the earlier build stays in state.json with `displayRestoreRefused` or `keyboardRestoreRefused` after the first open or launch, the menu says it could not be restored on this macOS build and names each saved level, Settings shows the saved level under the darken toggle, no "Restore incomplete" follows, and the backstop log does not fail for it) | Not run |
 | A kept brightness on a build that can make the call (after a refused restore, set the keyboard backlight by hand, put the display to sleep, then launch that build and wake the display): the log shows "not read: macOS has the backlight suppressed or dimmed" and then "set since its restore", and the backlight stays at the level set | Not run |
 | A kept keyboard backlight when a session ends with the lid closed, on a build that can make the call: the log shows "the lid is not known to be open, so the kept value is not read", and about a minute or less after the lid opens, with no session, "set since its restore" or "keyboard backlight restored" | Not run |
+| A kept display brightness restored late during a session (launch with the display asleep after a refused restore, wake it, start a session at once, wait for "display restored", then close and open the lid within 30 s): the close logs "display darkened (was brightness" with the restored level, and the open brings the panel back at that level, not black | Not run |
 | Freeze-all scope with agents running (Cursor/T3 Code/Claude untouched) | Not run |
 | Freeze-all off on a fresh config.json (list only) and on with a terminal, a non-Chrome browser and a JetBrains IDE open (all untouched) | Not run |
 | Lid close with a freeze-list app stopped beforehand by `kill -STOP` (left stopped on lid open, not in the journal) | Not run |

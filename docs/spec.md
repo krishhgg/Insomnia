@@ -269,7 +269,13 @@ dim or not, since a dim panel on open beats a black one.
 While Low Power Mode is on because Insomnia switched it on (the journal's
 `lowPowerSetByUs`), the display sample is held: the panel reads the mode's
 value, and the sample taken just before the mode went on is the one to
-restore. The keyboard journals the current
+restore. Each device's sample is also held while the journal has a saved
+brightness for it, since the device then reads the 0 a close left or a
+level not yet decided. Each level the app writes from the journal, or
+finds set since in place of a kept value, becomes that device's sample,
+so a close soon after a restore that came late, from the re-read of a
+kept value or after the mode, journals the restored level and not a 0
+sampled before it. The keyboard journals the current
 read if trusted now, else its last sample; when nothing trustworthy is
 known for it, it is left to macOS entirely (no journal entry, no write),
 because restoring a suppressed 0 would leave the backlight off. On open the

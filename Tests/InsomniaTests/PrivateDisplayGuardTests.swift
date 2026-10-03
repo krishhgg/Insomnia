@@ -596,6 +596,100 @@ final class RefusedDarkeningTests: XCTestCase {
         XCTAssertFalse(try XCTUnwrap(try h.store.loadState()).keyboardRestoreRefused)
     }
 
+    /// Launch recovery leaves both kept values waiting, the display asleep
+    /// and the keyboard backlight suppressed, and a session starts. Once
+    /// both come back, still at the 0 the old close left, the sampler takes
+    /// no reading of them while they are journaled, and the re-read's
+    /// restore becomes its sample. A lid close soon after, with the panel
+    /// pulled down by auto-brightness and the backlight suppressed again,
+    /// journals 0.8 and 0.3, not 0, and the open restores them.
+    func testADelayedRestoreIsTheSampleTheNextCloseJournals() async throws {
+        try seedSavedBrightness(sessionValid: false, refused: true)
+        h.clamshell.closed = false
+        h.display.brightness = 0
+        h.display.asleep = true
+        h.keyboard.brightness = 0
+        h.keyboard.suppressedOrDimmed = true
+        let m = h.makeManager(keptRecheckDelay: .milliseconds(50))
+        m.config.muteOnLidClose = false
+        m.config.freezeList = []
+        m.config.freezeAllApps = false
+        let sampler = BrightnessSampler(display: h.display, keyboard: h.keyboard, idleSeconds: { 1 })
+        sampler.follow(m)
+        let freezer = FakeFreezer(apps: [], processes: [], control: h.procs)
+        let actions = LidActions(
+            manager: m,
+            freezer: freezer,
+            docker: DockerRule(freezer: freezer, probe: { true }),
+            audio: h.audio,
+            display: h.display,
+            keyboard: h.keyboard,
+            sampler: sampler
+        )
+
+        await m.reconcile()
+        await m.start(duration: 3600)
+        // One main-actor turn, so the re-read cannot run in between.
+        h.display.asleep = false
+        h.keyboard.suppressedOrDimmed = false
+        sampler.sample()
+        XCTAssertNil(sampler.last, "the 0 the close left is not the user's level")
+
+        try await waitFor {
+            let s = try self.h.store.loadState()
+            return s?.savedDisplayBrightness == nil && s?.savedKeyboardBrightness == nil
+        }
+        XCTAssertEqual(h.display.sets.first, 0.8)
+        XCTAssertEqual(h.keyboard.sets.first, 0.3)
+        XCTAssertEqual(sampler.last?.display, 0.8)
+        XCTAssertEqual(sampler.last?.keyboard, 0.3)
+
+        h.clamshell.closed = true
+        h.display.brightness = 0.335
+        h.keyboard.brightness = 0
+        h.keyboard.suppressedOrDimmed = true
+        await actions.onClose()
+
+        let closed = try XCTUnwrap(try h.store.loadState())
+        XCTAssertEqual(closed.savedDisplayBrightness, 0.8, "the restored level, not a stale 0 or the pulled-down read")
+        XCTAssertEqual(closed.savedKeyboardBrightness, 0.3)
+
+        h.clamshell.closed = false
+        await actions.onOpen()
+
+        XCTAssertEqual(h.display.sets.last, 0.8)
+        XCTAssertEqual(h.keyboard.sets.last, 0.3)
+        XCTAssertEqual(h.display.brightness, 0.8)
+    }
+
+    /// Both kept values were set by hand since, the display at once and the
+    /// keyboard once its backlight comes back. Each reading that clears an
+    /// entry is the sampler's sample from then on, though the sampler's own
+    /// reads are not trusted here, with no input for ten minutes.
+    func testAKeptValueSetSinceIsTheSample() async throws {
+        try seedSavedBrightness(sessionValid: false, refused: true)
+        h.clamshell.closed = false
+        h.display.brightness = 0.6
+        h.keyboard.brightness = 0
+        h.keyboard.suppressedOrDimmed = true
+        let m = h.makeManager(keptRecheckDelay: .milliseconds(50))
+        let sampler = BrightnessSampler(display: h.display, keyboard: h.keyboard, idleSeconds: { 600 })
+        sampler.follow(m)
+
+        await m.reconcile()
+        XCTAssertEqual(h.display.sets, [])
+        XCTAssertEqual(sampler.last?.display, 0.6)
+        XCTAssertNil(sampler.last?.keyboard, "still waiting")
+
+        h.keyboard.brightness = 0.4
+        h.keyboard.suppressedOrDimmed = false
+        try await waitFor { try self.h.store.loadState()?.savedKeyboardBrightness == nil }
+
+        XCTAssertEqual(h.keyboard.sets, [])
+        XCTAssertEqual(sampler.last?.keyboard, 0.4)
+        XCTAssertEqual(sampler.last?.display, 0.6)
+    }
+
     /// The recovery lock is busy at a re-read: that read is skipped, not
     /// the ones after it, and the entry is decided once the lock is free.
     func testABusyLockSkipsOneReReadNotTheRest() async throws {

@@ -183,6 +183,12 @@ final class SessionManager {
     /// then, so the value journaled at a later lid close is the user's,
     /// not the mode's rescaled one. nil in tests that do not wire it.
     var willEnableLowPower: (@MainActor () -> Void)?
+    /// Called with each brightness level known to be the user's: a value
+    /// written from the journal, and the reading that finds a kept value
+    /// set since. `AppServices` gives it to the sampler, which does not
+    /// read a device while its brightness is journaled
+    /// (`BrightnessSampler.follow`). nil in tests that do not wire it.
+    var didSettleBrightness: (@MainActor (_ display: Float?, _ keyboard: Float?) -> Void)?
     /// How far the panel may have drifted from a value written under Low
     /// Power Mode (auto-brightness moves it slowly) and still count as
     /// untouched by the user when the mode ends. A larger difference is a
@@ -1020,6 +1026,7 @@ final class SessionManager {
                     s.savedDisplayBrightness = nil
                     s.displayRestoreRefused = false
                 }
+                didSettleBrightness?(now, nil)
                 return nil
             case .dark:
                 break
@@ -1033,6 +1040,7 @@ final class SessionManager {
             return nil
         }
         Log.info("display restored (brightness \(saved))")
+        didSettleBrightness?(saved, nil)
         // Written under our Low Power Mode: written again once the
         // mode is off, since the mode's end rescales the panel.
         let underLowPower = state.lowPowerSetByUs
@@ -1061,6 +1069,7 @@ final class SessionManager {
                     s.savedKeyboardBrightness = nil
                     s.keyboardRestoreRefused = false
                 }
+                didSettleBrightness?(nil, now)
                 return nil
             case .dark:
                 break
@@ -1074,6 +1083,7 @@ final class SessionManager {
             return nil
         }
         Log.info("keyboard backlight restored (brightness \(saved))")
+        didSettleBrightness?(nil, saved)
         do {
             try journal { s in
                 s.savedKeyboardBrightness = nil
@@ -1173,6 +1183,7 @@ final class SessionManager {
         do {
             try display.setBrightness(value)
             Log.info("display restored again after low power mode (brightness \(value))")
+            didSettleBrightness?(value, nil)
             try? journal { $0.displayRestoredUnderLowPower = nil }
             scheduleReassert(display: value, keyboard: nil)
         } catch {
