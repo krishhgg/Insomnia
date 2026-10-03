@@ -2531,6 +2531,33 @@ final class RecoveryScriptTests: XCTestCase {
         return previous
     }
 
+    /// After an interrupted swap, `codesign --verify` decides which bundle
+    /// the plist on disk pins. When it never answers, that is unknown, so
+    /// the run moves neither bundle, unloads no job, and exits instead of
+    /// holding the lock. Deleting the set-aside copy here would lose the
+    /// bundle the plist may pin.
+    func testInstallMovesNeitherBundleWhenCodesignDoesNotAnswerDuringTheRepair() throws {
+        let previous = try writeInterruptedSwap()
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        fx.setMode("launchctl", "loaded")
+        fx.setMode("codesign", "verify-hangs-under-lock")
+
+        let started = Date()
+        let r = try fx.run(fx.installShortTimeout, extraEnvironment: ["USER": "tester"])
+        let elapsed = Date().timeIntervalSince(started)
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertLessThan(elapsed, 20)
+        XCTAssertTrue(r.stderr.contains("aside at \(previous.path), and 'codesign --verify', which tells which of the two bundles \(fx.plist.path) pins,\ndid not answer within 1s.\nNeither bundle was moved"), r.stderr)
+        let calls = fx.calls()
+        XCTAssertFalse(calls.contains("codesign FD9-OPEN"), "\(calls)")
+        XCTAssertTrue(fx.hungProcessGone("codesign"))
+        XCTAssertFalse(calls.contains { $0.hasPrefix("launchctl") }, "\(calls)")
+        XCTAssertEqual(try fx.installedBinaryFirstLine(), "interrupted")
+        XCTAssertEqual(try String(contentsOf: previous.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "previous\n")
+        XCTAssertTrue(try fx.lockIsFree())
+    }
+
     /// As above, but the job cannot be unloaded: print still lists it after
     /// the bootout. It pins the build at $APP, so neither bundle moves, and
     /// the run stops and says how to finish.
@@ -3029,6 +3056,111 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(try fx.lockIsFree())
     }
 
+    /// The sudoers check under the lock never answers (a sudo policy or
+    /// directory-service lookup that stalls). The run stops it after the
+    /// limit, exits and lets go of the lock, so the app and the agent's
+    /// backstop can take it again; the stuck call ran without fd 9, so it
+    /// does not hold the lock either. Nothing was replaced or recovered.
+    func testInstallStopsAndLetsGoOfTheLockWhenTheSudoersRecheckDoesNotAnswer() throws {
+        try writePreviousPair()
+        fx.setMode("sudo", "rule-check-hangs-under-lock")
+
+        let started = Date()
+        let tmp = try fx.privateTmp()
+        let r = try fx.run(fx.installShortTimeout, extraEnvironment: ["USER": "tester", "TMPDIR": tmp.path])
+        let elapsed = Date().timeIntervalSince(started)
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertLessThan(elapsed, 20, "one bounded check, not the fake's 60 s hang")
+        XCTAssertTrue(r.stdout.contains("sudoers rule verified"), "the check before the lock passed: \(r.stdout)")
+        XCTAssertTrue(r.stderr.contains("holds the recovery lock, did not answer within 1s. The check was\nstopped and this run exits, which lets go of the lock"), r.stderr)
+        let calls = fx.calls()
+        XCTAssertFalse(calls.contains("sudo FD9-OPEN"), "the check runs without the lock descriptor: \(calls)")
+        XCTAssertTrue(fx.hungProcessGone("sudo"), "the check ignored SIGTERM, so it was killed")
+        XCTAssertTrue(try fx.lockIsFree())
+        XCTAssertEqual(calls.filter { $0 == "sudo -n -l /usr/bin/pmset -a disablesleep 1" }.count, 2, "\(calls)")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("sudo -n \(fx.fakePmset)") }, "no recovery ran: \(calls)")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("launchctl") }, "\(calls)")
+        XCTAssertEqual(try fx.installedBinaryFirstLine(), "previous")
+        XCTAssertEqual(try fx.contents(of: fx.appsDir), ["Insomnia.app"], "the new build is discarded")
+        XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "trusted")
+        XCTAssertEqual(try fx.contents(of: tmp), [], "the scratch directory is gone, including the stopped call's files")
+    }
+
+    /// The same check before the lock (step 2) never answers: the run stops
+    /// there, before it asks the app to quit or touches the previous pair.
+    func testInstallStopsWhenTheSudoersCheckBeforeTheLockDoesNotAnswer() throws {
+        try writePreviousPair()
+        fx.setMode("sudo", "rule-check-hangs")
+
+        let started = Date()
+        let r = try fx.run(fx.installShortTimeout, extraEnvironment: ["USER": "tester"])
+        let elapsed = Date().timeIntervalSince(started)
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertLessThan(elapsed, 20)
+        XCTAssertTrue(r.stderr.contains("'sudo -n -l', which checks the rule, did not answer within 1s, so the rule in \(fx.sudoers.path) is not verified."), r.stderr)
+        XCTAssertFalse(r.stdout.contains("sudoers rule verified"), r.stdout)
+        let calls = fx.calls()
+        XCTAssertTrue(fx.hungProcessGone("sudo"))
+        XCTAssertEqual(calls.filter { $0.hasPrefix("sudo -n -l") }, ["sudo -n -l /usr/bin/pmset -a disablesleep 1"], "the chain stops at the check that did not answer: \(calls)")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("pgrep") || $0.hasPrefix("osascript") || $0.hasPrefix("launchctl") }, "\(calls)")
+        XCTAssertEqual(try fx.installedBinaryFirstLine(), "previous")
+        XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "trusted")
+        XCTAssertTrue(try fx.lockIsFree())
+    }
+
+    /// A `pgrep` that never answers under the lock does not show the app is
+    /// gone, so the run stops before recovery and lets go of the lock.
+    func testInstallTreatsAPgrepThatDoesNotAnswerUnderTheLockAsUnknown() throws {
+        try writePreviousPair()
+        fx.setMode("pgrep", "1\nhang\n")   // not running at the quit step, then no answer
+
+        let started = Date()
+        let r = try fx.run(fx.installShortTimeout, extraEnvironment: ["USER": "tester"])
+        let elapsed = Date().timeIntervalSince(started)
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertLessThan(elapsed, 20)
+        XCTAssertTrue(r.stderr.contains("pgrep did not answer within 1s, so whether Insomnia started again is unknown."), r.stderr)
+        let calls = fx.calls()
+        XCTAssertFalse(calls.contains("pgrep FD9-OPEN"), "\(calls)")
+        XCTAssertTrue(fx.hungProcessGone("pgrep"))
+        XCTAssertFalse(calls.contains { $0.hasPrefix("sudo -n \(fx.fakePmset)") || $0.hasPrefix("launchctl") }, "\(calls)")
+        XCTAssertEqual(try fx.installedBinaryFirstLine(), "previous")
+        XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "trusted")
+        XCTAssertTrue(try fx.lockIsFree())
+    }
+
+    /// `launchctl print` never answers under the lock: the previous job's
+    /// state is unknown, before the bootout and after it, so the bundle is
+    /// not replaced. Each print is stopped at the limit, and the run exits
+    /// and lets go of the lock instead of waiting on launchd.
+    func testInstallStopsAndLetsGoOfTheLockWhenLaunchctlPrintDoesNotAnswer() throws {
+        try writePreviousPair()
+        fx.setMode("launchctl", "print-hangs")
+
+        let started = Date()
+        let tmp = try fx.privateTmp()
+        let r = try fx.run(fx.installShortTimeout, extraEnvironment: ["USER": "tester", "TMPDIR": tmp.path])
+        let elapsed = Date().timeIntervalSince(started)
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertLessThan(elapsed, 30, "two bounded prints, not two 60 s hangs")
+        XCTAssertTrue(r.stderr.contains("'launchctl print gui/\(fx.uid)/com.insomnia.backstop' did not answer within 1s; whether the job is loaded is unknown (unknown:124)."), r.stderr)
+        XCTAssertTrue(r.stderr.contains("Install stopped: unloading the previous LaunchAgent job was not confirmed\n(launchctl print: unknown:124)"), r.stderr)
+        let calls = fx.calls()
+        XCTAssertFalse(calls.contains("launchctl FD9-OPEN"), "\(calls)")
+        XCTAssertTrue(fx.hungProcessGone("launchctl"))
+        XCTAssertEqual(calls.filter { $0.hasPrefix("launchctl print") }.count, 2, "\(calls)")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("launchctl bootstrap") }, "\(calls)")
+        XCTAssertEqual(try fx.installedBinaryFirstLine(), "previous")
+        XCTAssertEqual(try fx.contents(of: fx.appsDir), ["Insomnia.app"])
+        XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "trusted")
+        XCTAssertTrue(try fx.lockIsFree())
+        XCTAssertEqual(try fx.contents(of: tmp), [], "the scratch directory is gone, including the stopped calls' files")
+    }
+
     /// The scripts/simulate-lid.sh watcher is compiled out of a release
     /// build unless the installer is told to compile it in: only
     /// INSOMNIA_LID_SIMULATION=1 adds the define to the swift build lines,
@@ -3397,6 +3529,8 @@ private final class ScriptFixture {
     var uninstall: URL { repoScripts.appendingPathComponent("uninstall.sh") }
     var install: URL { repoScripts.appendingPathComponent("install.sh") }
     var installRedirected: URL { repoScripts.appendingPathComponent("install.redirected.sh") }
+    /// installRedirected with a 1 s limit for each bounded call.
+    var installShortTimeout: URL { repoScripts.appendingPathComponent("install.short-timeout.sh") }
     var session: URL { home.appendingPathComponent("session.json") }
     var state: URL { home.appendingPathComponent("state.json") }
     var config: URL { home.appendingPathComponent("config.json") }
@@ -3575,13 +3709,19 @@ private final class ScriptFixture {
             "RMDIR": bin.appendingPathComponent("rmdir").path,
             "MKTEMP": bin.appendingPathComponent("mktemp").path,
             "LOCK_TIMEOUT_SECONDS": "1",
+            "CALL_TIMEOUT_SECONDS": "5",
         ])
         try patchedInstall.write(to: install, atomically: true, encoding: .utf8)
         // The redirected copy runs past the INSOMNIA_HOME refusal: that
         // variable is what makes the backstop copy it installs act on the
         // fixture instead of ~/Library. The plain copy keeps the refusal.
-        try Self.replaceOnce(patchedInstall, #"if [[ -n "${INSOMNIA_HOME:-}" ]]; then"#, with: "if false; then")
-            .write(to: installRedirected, atomically: true, encoding: .utf8)
+        let redirected = try Self.replaceOnce(patchedInstall, #"if [[ -n "${INSOMNIA_HOME:-}" ]]; then"#, with: "if false; then")
+        try redirected.write(to: installRedirected, atomically: true, encoding: .utf8)
+        // Tests of a call that never answers use a 1 s limit. The others
+        // keep 5 s, so a fake that starts late under load is not taken for
+        // one that hangs.
+        try Self.replaceOnce(redirected, "CALL_TIMEOUT_SECONDS='5'", with: "CALL_TIMEOUT_SECONDS='1'")
+            .write(to: installShortTimeout, atomically: true, encoding: .utf8)
     }
 
     /// Rewrites `NAME=...` constant lines. Every name must match exactly one
@@ -3627,16 +3767,20 @@ private final class ScriptFixture {
         // fails like a wrong password, and `-n` forms fail as unpermitted.
         // Mode "rule-not-effective": authentication passes and the rule is
         // installed, but `sudo -n -l <pmset ...>` still says no. Mode
-        // "rule-gone-under-lock": `sudo -n -l` says yes while fd 9 is closed
-        // and no once it is open, the way a rule removed by an uninstall.sh
-        // that held the recovery lock first answers to a run that then takes
-        // it (install.sh opens fd 9 only to take that lock).
+        // "rule-gone-under-lock": `sudo -n -l` says yes while nobody holds
+        // the recovery lock and no while someone does, the way a rule removed
+        // by an uninstall.sh that held the lock first answers to a run that
+        // then takes it. Modes "rule-check-hangs" and
+        // "rule-check-hangs-under-lock": `sudo -n -l` never answers (see
+        // hangHere), always or only while the lock is held.
         // visudo checks the candidate file exists, is non-empty and grants
         // pmset, so an installer that validated the wrong path or an empty
         // heredoc cannot pass here.
         try writeFake("sudo", """
         printf 'sudo %s\\n' "$*" >> "\(calls)"
         mode="$(cat "\(r)/sudo.mode" 2>/dev/null || echo ok)"
+        \(hangHere("sudo"))
+        \(lockHeldHere())
         # "ignore-term" and "closes-fd9" behave like a pmset that ignores
         # SIGTERM: they live until the test creates the release file (or the
         # fixture is destroyed, or a 60 s wall-clock watchdog), so a test decides when
@@ -3647,7 +3791,9 @@ private final class ScriptFixture {
           -n) if [[ "${2:-}" == -l ]]; then
                 case "$mode" in
                   auth-fail|rule-not-effective) exit 1 ;;
-                  rule-gone-under-lock) if { : >&9; } 2>/dev/null; then exit 1; fi; exit 0 ;;
+                  rule-gone-under-lock) if lock_held; then exit 1; fi; exit 0 ;;
+                  rule-check-hangs) hang_here ;;
+                  rule-check-hangs-under-lock) if lock_held; then hang_here; fi; exit 0 ;;
                   *) exit 0 ;;
                 esac
               fi
@@ -3729,17 +3875,20 @@ private final class ScriptFixture {
         // with the "# " an implicit requirement carries). `--verify` passes
         // unless mode "verify-fails", or the path is listed in
         // codesign.rejects (see `rejectSignature(of:)`). Mode "verify-hangs":
-        // `--verify` never answers (see hangHere).
+        // `--verify` never answers (see hangHere); "verify-hangs-under-lock":
+        // only while someone holds the recovery lock.
         try writeFake("codesign", """
         printf 'codesign %s\\n' "$*" >> "\(calls)"
         mode="$(cat "\(r)/codesign.mode" 2>/dev/null || echo ok)"
         \(hangHere("codesign"))
+        \(lockHeldHere())
         last=""; for a in "$@"; do last="$a"; done
         for a in "$@"; do
           case "$a" in
             -r-) echo "Executable=$last/Contents/MacOS/Insomnia" >&2; echo '# designated => \(requirement)' >&2; exit 0 ;;
             --verify)
               if [[ "$mode" == verify-hangs ]]; then hang_here; fi
+              if [[ "$mode" == verify-hangs-under-lock ]] && lock_held; then hang_here; fi
               if [[ -f "\(r)/codesign.rejects" ]] && grep -qxF -- "$last" "\(r)/codesign.rejects"; then echo "$last: does not satisfy its designated Requirement" >&2; exit 3; fi
               if [[ "$mode" == verify-fails ]]; then echo "$last: a sealed resource is missing or invalid" >&2; exit 1; fi
               exit 0 ;;
@@ -4019,6 +4168,17 @@ private final class ScriptFixture {
           echo $$ > "\(root.path)/\(tool).hung.pid"
           trap '' TERM
           exec /bin/sleep 60
+        }
+        """
+    }
+
+    /// Shell function for a fake: `lock_held` succeeds while someone holds
+    /// the recovery lock. It asks lockf for the lock without waiting and
+    /// without creating the file, the way lockIsFree does from the test.
+    func lockHeldHere() -> String {
+        """
+        lock_held() {
+          [[ -e "\(lock.path)" ]] && ! /usr/bin/lockf -k -s -t 0 "\(lock.path)" /usr/bin/true 2>/dev/null
         }
         """
     }

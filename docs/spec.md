@@ -442,7 +442,15 @@ Backstop, independent of the app:
   lock it checks the sudoers rule again with `sudo -n -l` for each of the
   four commands and stops if it no longer holds: an uninstall.sh that took
   the lock first removes the rule and leaves no journal, so the recovery
-  alone would pass. uninstall.sh runs the
+  alone would pass. Under the lock every `sudo -n -l`, `pgrep`, `launchctl`
+  and `codesign --verify` call has a 30 s limit (the sudoers check before
+  the lock has it too) and runs with fd 9 closed; a call past it gets
+  SIGTERM, then SIGKILL. A sudoers check or `pgrep` that does not answer
+  stops the run, which releases the lock so the app and the agent can
+  recover. A `launchctl print` that does not answer counts as unknown, never
+  as unloaded. A `codesign --verify` that does not answer leaves it unknown
+  which bundle the plist on disk pins, so the run stops and moves neither
+  bundle. uninstall.sh runs the
   bundle's sealed backstop.sh only after `codesign --verify --strict`
   passes on the bundle (a bounded call, like its other calls under the
   lock). Once recovery is confirmed and print confirms the agent unloaded,
