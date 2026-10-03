@@ -95,12 +95,13 @@ enum OwnerOnly {
     /// The line is written even when a chmod or the rotation fails; the
     /// first such failure is then thrown so the caller can report it.
     /// `beforeRotating` runs once the file held is found past the cap and
-    /// before its lock is taken; tests use it to rotate from outside first.
+    /// before its lock is taken; a throw from it ends the append there, with
+    /// nothing rotated or written. Tests use it to rotate from outside first.
     static func appendToLog(
         _ text: String,
         at url: URL,
         maxBytes: UInt64 = maxLogBytes,
-        beforeRotating: () -> Void = {}
+        beforeRotating: () throws -> Void = {}
     ) throws {
         var problems: [OwnerOnlyError] = []
         if let problem = try createDirectory(url.deletingLastPathComponent()) { problems.append(problem) }
@@ -110,7 +111,7 @@ enum OwnerOnly {
         // becomes `.1`.
         if let problem = tighten(fd: fd, path: url.path) { problems.append(problem) }
         if size(of: fd) > maxBytes {
-            beforeRotating()
+            try beforeRotating()
             switch rotateHeld(fd, at: url, maxBytes: maxBytes) {
             case let .keep(problem):
                 // The held file is still the log: keep writing to it.

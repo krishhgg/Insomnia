@@ -97,33 +97,42 @@ final class OwnerOnlyTests: XCTestCase {
     /// rotate second must not rename the fresh log over the retained copy.
     /// The appender is stopped after it has found the file it holds past the
     /// cap; the test then plays the other process, rotating and writing its
-    /// own line, and only then lets the appender go on.
+    /// own line, and only then opens the gate that lets the appender go on.
     func testRotationByAnotherProcessIsNoticedAndTheRetainedCopyKept() throws {
         let log = home.paths.logs.appendingPathComponent("race.log")
         let big = "0123456789ABCDEF\n"
         try OwnerOnly.appendToLog(big, at: log)
         let reached = DispatchSemaphore(value: 0)
-        let proceed = DispatchSemaphore(value: 0)
-        let done = DispatchSemaphore(value: 0)
+        let gate = Gate()
+        let appender = DispatchGroup()
         let failure = Locked<String?>(nil)
+        appender.enter()
         DispatchQueue.global().async {
             do {
                 try OwnerOnly.appendToLog("second\n", at: log, maxBytes: 10) {
                     reached.signal()
-                    _ = proceed.wait(timeout: .now() + 5)
+                    try gate.pass()
                 }
             } catch {
                 failure.value = "\(error)"
             }
-            done.signal()
+            appender.leave()
         }
-        XCTAssertEqual(reached.wait(timeout: .now() + 5), .success, "the appender never found the log past the cap")
+        // Every way out of the test closes the gate, which stops the
+        // appender before it rotates, and waits for the appender to end.
+        defer {
+            gate.close()
+            _ = appender.wait(timeout: .now() + 60)
+        }
+        guard reached.wait(timeout: .now() + 60) == .success else {
+            return XCTFail("the appender never found the log past the cap")
+        }
 
         XCTAssertEqual(rename(log.path, OwnerOnly.rotated(log).path), 0)
         try OwnerOnly.appendToLog("first\n", at: log, maxBytes: 10)
-        proceed.signal()
+        gate.open()
 
-        XCTAssertEqual(done.wait(timeout: .now() + 5), .success)
+        XCTAssertEqual(appender.wait(timeout: .now() + 60), .success)
         XCTAssertNil(failure.value)
         XCTAssertEqual(try String(contentsOf: OwnerOnly.rotated(log), encoding: .utf8), big, "the retained copy was replaced")
         XCTAssertEqual(try String(contentsOf: log, encoding: .utf8), "first\nsecond\n")
@@ -333,5 +342,33 @@ final class HandoffsLogPermissionTests: XCTestCase {
         let logsAttrs = try FileManager.default.attributesOfItem(atPath: home.paths.logs.path)
         XCTAssertEqual(logsAttrs[.posixPermissions] as? Int, 0o700)
         XCTAssertTrue(try String(contentsOf: home.paths.handoffsLog, encoding: .utf8).contains("gap=20s"))
+    }
+}
+
+/// Holds a worker until the test decides. Only `open` lets it through;
+/// `close`, or no decision before the wait runs out, makes `pass` throw so
+/// the worker stops where it is. The first decision stands.
+private final class Gate: @unchecked Sendable {
+    struct Closed: Error {}
+
+    private let lock = NSLock()
+    private let decided = DispatchSemaphore(value: 0)
+    private var isOpen: Bool?
+
+    func open() { decide(true) }
+    func close() { decide(false) }
+
+    func pass(timeout: TimeInterval = 60) throws {
+        guard decided.wait(timeout: .now() + timeout) == .success, lock.withLock({ isOpen == true }) else {
+            throw Closed()
+        }
+    }
+
+    private func decide(_ open: Bool) {
+        lock.withLock {
+            guard isOpen == nil else { return }
+            isOpen = open
+            decided.signal()
+        }
     }
 }
