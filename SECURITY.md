@@ -49,7 +49,9 @@ was installed). The installer never writes a passwordless `disablesleep 1`
 line, on any path, including failed upgrades. It asks for the password before
 it quits a running Insomnia, so a cancelled password changes nothing, and it
 quits the app before it writes the rule, stopping with nothing changed if the
-app will not quit. If it stops after the rule is written but before the app is replaced, an
+app will not quit. It writes the rule only after every run of the previous
+`backstop.sh` has exited, so a stop while one is still running leaves the
+previous rule beside the previous app. If it stops after the rule is written but before the app is replaced, an
 older build left installed cannot start a session until the installer is
 rerun; it fails closed and the installer prints the rerun command. The
 uninstaller removes the file. The app is not sandboxed; local logs can contain

@@ -162,7 +162,10 @@ Flag a change that breaks one of these; do not flag the behavior itself.
   sleep off. `install.sh` installs `backstop.sh`
   under the recovery lock before the bundle (`install -S`, so a running old
   script keeps its inode) and waits up to `RETIRE_WAIT_SECONDS` for runs of
-  the old script to exit, stopping before the bundle if one stays. Bump the
+  the old script to exit, stopping before the sudoers rule if one stays. A
+  run is a process whose arguments are exactly `/bin/bash`, the installed
+  path and at most `--force`. The wait cannot use the recovery lock: the
+  installer holds it, and an old run is waiting on it. Bump the
   version line and `BackstopVersion.required` together whenever the app
   starts relying on new backstop behavior.
 - `DisplayPower.swift`, `LidActions.swift`. On lid close, brightness 0 is
@@ -187,7 +190,8 @@ Flag a change that breaks one of these; do not flag the behavior itself.
 - `install.sh`. Not atomic. It asks for the password (`sudo -v`) before a
   running app is asked to quit, so a cancelled password changes nothing and
   a running session keeps going; when a session is running it says so first
-  and, in a terminal, asks to continue. It then quits the app, writes the
-  sudoers file on the cached credential, and only then replaces the bundle.
-  A failure after the rule is written says exactly what was installed so far
-  and gives the rerun command.
+  and, in a terminal, asks to continue. It then quits the app and, under the
+  recovery lock, installs `backstop.sh`, waits for older runs of it, writes
+  the sudoers file on the cached credential, and looks for a reopened app
+  right before it replaces the bundle. Every stop says what was installed so
+  far; one after the rule is written gives the rerun command.

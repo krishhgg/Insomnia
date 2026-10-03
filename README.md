@@ -82,12 +82,13 @@ The installer never writes that line, on any path. It asks for your password
 before it quits a running Insomnia, so cancelling the password prompt changes
 nothing and a running session keeps going. When a session is running it says
 the upgrade will end it before asking, and in a terminal it asks whether to
-continue. It stops with nothing changed if the app will not quit. If it stops
-after writing the rule but before replacing the app, an older build left
+continue. It stops with nothing changed if the app will not quit. Next it
+replaces `backstop.sh` and waits up to 30 s for any run of the old script to
+finish; if one is still running it stops before it writes the rule, so the
+installed app keeps working, and says to rerun. Only then does it write the
+rule and replace the app. If it stops between the two, an older build left
 installed cannot start a session until you rerun `./scripts/install.sh`, and
-the installer says so. The installer replaces `backstop.sh` before the app and
-waits up to 30 s for any run of the old script to finish; if one is still
-running it stops before the app is replaced and says to rerun.
+the installer says so.
 Insomnia is not sandboxed. The app, scripts, and journals are local; hotspot
 passwords use the login Keychain, not the configuration file.
 

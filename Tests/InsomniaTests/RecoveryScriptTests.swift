@@ -2468,7 +2468,10 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(calls.contains { $0.hasPrefix("codesign") }, "no bundle is built beside the lock holder: \(calls)")
         XCTAssertEqual(try String(contentsOf: fx.app.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "binary")
         XCTAssertEqual(try String(contentsOf: fx.installedBackstop, encoding: .utf8), "old helper")
-        assertRerunNote(r.stderr)
+        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), "rule", "the rule is written only under the lock")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("sudo /usr/sbin/visudo") }, "\(calls)")
+        XCTAssertTrue(r.stderr.contains("Nothing was changed"), r.stderr)
+        XCTAssertFalse(r.stderr.contains("already holds the new three-line rule"), r.stderr)
     }
 
     func testInstallStopsWhenAppStartsAgainUnderTheLock() throws {
@@ -2477,7 +2480,7 @@ final class RecoveryScriptTests: XCTestCase {
         try "old helper".write(to: fx.installedBackstop, atomically: true, encoding: .utf8)
         try "trusted".write(to: fx.plist, atomically: true, encoding: .utf8)
         try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
-        fx.setMode("pgrep", "1\n1\n0\n")   // not running at the quit step or after the rule, running again under the lock
+        fx.setMode("pgrep", "1\n0\n")   // not running at the quit step, running again under the lock
         fx.setMode("launchctl", "loaded")
 
         let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
@@ -2491,11 +2494,14 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(calls.contains { $0.hasPrefix("codesign") }, "\(calls)")
         XCTAssertEqual(try String(contentsOf: fx.app.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "binary")
         XCTAssertEqual(try String(contentsOf: fx.installedBackstop, encoding: .utf8), "old helper")
+        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), "rule")
+        XCTAssertTrue(r.stderr.contains("Nothing was changed"), r.stderr)
     }
 
     /// The new backstop.sh is in place, mode 0755, and the recovery lock is
-    /// held, before the new bundle is signed: the new app never exists
-    /// beside an older script, and no app can show a dialog meanwhile.
+    /// held, before the rule is written and before the new bundle is
+    /// signed: the new app never exists beside an older script, and no app
+    /// can show a dialog meanwhile.
     func testInstallReplacesTheBackstopBeforeTheBundleUnderTheLock() throws {
         try fx.prepareInstall()
         try fx.installMachinery()
@@ -2509,6 +2515,7 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
         let calls = fx.calls()
         XCTAssertEqual(calls.filter { $0.hasPrefix("codesign SIGN") }, ["codesign SIGN backstop=new lock=held"], "\(calls)")
+        XCTAssertEqual(try String(contentsOf: fx.root.appendingPathComponent("at-visudo"), encoding: .utf8), "backstop=new lock=held\n")
         let look = try XCTUnwrap(calls.firstIndex(of: "pgrep -lf backstop\\.sh"), "\(calls)")
         let sign = try XCTUnwrap(calls.firstIndex { $0.hasPrefix("codesign --force") }, "\(calls)")
         XCTAssertLessThan(look, sign, "older runs are looked for before the bundle")
@@ -2519,8 +2526,7 @@ final class RecoveryScriptTests: XCTestCase {
     }
 
     /// A run of the previous backstop.sh still alive after the copy is
-    /// waited for, under the lock, before the bundle. A process whose
-    /// arguments only mention backstop.sh is not one.
+    /// waited for, under the lock, before the rule and the bundle.
     func testInstallWaitsForAnOlderBackstopRunBeforeTheBundle() throws {
         try fx.prepareInstall()
         try "trusted".write(to: fx.plist, atomically: true, encoding: .utf8)
@@ -2534,14 +2540,46 @@ final class RecoveryScriptTests: XCTestCase {
         let calls = fx.calls()
         let looks = calls.indices.filter { calls[$0] == "pgrep -lf backstop\\.sh" }
         XCTAssertEqual(looks.count, 2, "\(calls)")
+        let rule = try XCTUnwrap(calls.firstIndex { $0.hasPrefix("sudo /usr/sbin/visudo") }, "\(calls)")
         let sign = try XCTUnwrap(calls.firstIndex { $0.hasPrefix("codesign --force") }, "\(calls)")
-        XCTAssertLessThan(try XCTUnwrap(looks.last), sign)
+        XCTAssertLessThan(try XCTUnwrap(looks.last), rule, "the rule is written once older runs are over")
+        XCTAssertLessThan(rule, sign)
         XCTAssertTrue(calls.contains("codesign SIGN backstop=new lock=held"), "\(calls)")
     }
 
+    /// The same for a run started with --force (install.sh and
+    /// uninstall.sh start the installed script that way).
+    func testInstallWaitsForAnOlderForcedBackstopRun() throws {
+        try fx.prepareInstall()
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        fx.setMode("launchctl", "loaded")
+        fx.setBackstopRuns("1 force")
+
+        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertEqual(fx.calls().filter { $0 == "pgrep -lf backstop\\.sh" }.count, 2, "\(fx.calls())")
+    }
+
+    /// Only a run counts. Processes whose arguments name backstop.sh, the
+    /// installed path included (an editor, a tail), are not waited for:
+    /// one look and the install goes on.
+    func testInstallDoesNotWaitForAProcessThatOnlyNamesTheBackstop() throws {
+        try fx.prepareInstall()
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        fx.setMode("launchctl", "loaded")
+
+        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertEqual(fx.calls().filter { $0 == "pgrep -lf backstop\\.sh" }.count, 1, "\(fx.calls())")
+        XCTAssertFalse(r.stderr.contains("still running"), r.stderr)
+    }
+
     /// One that outlasts RETIRE_WAIT_SECONDS stops the install before the
-    /// bundle: the new backstop.sh stays, the old app, the LaunchAgent and
-    /// the journal are untouched, and the stop names the pid and says how
+    /// rule: the new backstop.sh stays, the sudoers file, the old app, the
+    /// LaunchAgent and the journal are untouched, so the old app keeps the
+    /// rule it was installed with, and the stop names the pid and says how
     /// to finish.
     func testInstallStopsBeforeTheBundleWhileAnOlderBackstopRunStays() throws {
         try fx.prepareInstall()
@@ -2562,8 +2600,11 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: fx.installedBackstop), try Data(contentsOf: fx.backstop))
         XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "plist")
         XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, true)
+        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), "rule", "the new rule beside the old app")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("sudo /usr/sbin/visudo") }, "\(calls)")
         XCTAssertTrue(r.stderr.contains("still running after 2s (pid 4321)"), r.stderr)
-        assertRerunNote(r.stderr)
+        XCTAssertTrue(r.stderr.contains("Only the new \(fx.installedBackstop.path) was installed"), r.stderr)
+        XCTAssertFalse(r.stderr.contains("already holds the new three-line rule"), r.stderr)
         XCTAssertTrue(try fx.lockIsFree())
     }
 
@@ -2579,12 +2620,13 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
         XCTAssertFalse(fx.calls().contains { $0.hasPrefix("codesign") }, "\(fx.calls())")
         XCTAssertEqual(try String(contentsOf: fx.app.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "binary")
+        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), "rule")
         XCTAssertTrue(r.stderr.contains("pgrep failed"), r.stderr)
     }
 
     /// Both of install.sh's exit traps delete its temporary sudoers file
     /// through RM=/bin/rm. An rm first on PATH that keeps mktemp's files
-    /// changes nothing, on a stop in step 2 (the first trap) and on a full
+    /// changes nothing, on a stop in step 5 (the first trap) and on a full
     /// install (the second). The bundle, backstop.sh and the LaunchAgent
     /// are written through fixed paths too: a full install calls none of
     /// the file tools first on PATH for them. The temporary sudoers file is
@@ -2864,10 +2906,11 @@ final class RecoveryScriptTests: XCTestCase {
     }
 
     /// Authentication passes, the app quits, but the rule it installed does
-    /// not grant the pmset commands: nothing else of the previous install is
-    /// replaced, and the message says the old build cannot start a session
-    /// until the rerun.
-    func testInstallStopsBeforeReplacingAnythingWhenSudoersRuleIsNotEffective() throws {
+    /// not grant the pmset commands: only backstop.sh, installed before the
+    /// rule, is new; the bundle and the LaunchAgent are as they were, and
+    /// the message says the old build cannot start a session until the
+    /// rerun.
+    func testInstallStopsBeforeTheBundleWhenSudoersRuleIsNotEffective() throws {
         try fx.prepareInstall()
         try fx.installMachinery()
         try "old helper".write(to: fx.installedBackstop, atomically: true, encoding: .utf8)
@@ -2885,7 +2928,7 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertLessThan(quit, visudo, "the app is quit before the rule is written: \(calls)")
         XCTAssertFalse(calls.contains { $0.hasPrefix("launchctl") }, "\(calls)")
         XCTAssertEqual(try String(contentsOf: fx.app.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "binary")
-        XCTAssertEqual(try String(contentsOf: fx.installedBackstop, encoding: .utf8), "old helper")
+        XCTAssertEqual(try Data(contentsOf: fx.installedBackstop), try Data(contentsOf: fx.backstop))
         XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "plist")
         XCTAssertTrue(r.stderr.contains("still not permitted"), r.stderr)
         assertRerunNote(r.stderr)
@@ -2918,9 +2961,9 @@ final class RecoveryScriptTests: XCTestCase {
     }
 
     /// Same with the app not running: authentication passes and the rule is
-    /// installed, but it does not grant pmset. The bundle, helper and plist
-    /// are still untouched.
-    func testInstallWithNoAppRunningStopsBeforeReplacingAnythingWhenSudoersRuleIsNotEffective() throws {
+    /// installed, but it does not grant pmset. The bundle and plist are
+    /// still untouched.
+    func testInstallWithNoAppRunningStopsBeforeTheBundleWhenSudoersRuleIsNotEffective() throws {
         try fx.prepareInstall()
         try fx.installMachinery()
         try "old helper".write(to: fx.installedBackstop, atomically: true, encoding: .utf8)
@@ -2936,7 +2979,6 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(calls.contains { $0.hasPrefix("osascript") }, "nothing to quit: \(calls)")
         XCTAssertFalse(calls.contains { $0.hasPrefix("launchctl") }, "\(calls)")
         XCTAssertEqual(try String(contentsOf: fx.app.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "binary", "old bundle replaced")
-        XCTAssertEqual(try String(contentsOf: fx.installedBackstop, encoding: .utf8), "old helper", "installed backstop.sh replaced")
         XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "plist", "trusted plist touched")
         XCTAssertTrue(try String(contentsOf: fx.sudoers, encoding: .utf8).contains("NOPASSWD: /usr/bin/pmset"), "the new rule is what was installed")
         XCTAssertTrue(r.stderr.contains("still not permitted"), r.stderr)
@@ -3021,27 +3063,52 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(fx.calls().filter { $0.hasPrefix("sudo /usr/bin/install") }.count, 1, "written once: \(fx.calls())")
     }
 
-    /// The app is opened again while the password prompt is up. The rule
-    /// is already written, so the stop says the old build cannot start a
-    /// session and gives the rerun command; the bundle is not replaced under
-    /// a running app.
-    func testInstallStopsAfterTheRuleWhenTheAppIsOpenedDuringThePasswordPrompt() throws {
+    /// The app is opened again during the wait for older backstop runs.
+    /// The look after the wait stops the install before the rule, so the
+    /// old app keeps the rule it can start sessions with.
+    func testInstallStopsBeforeTheRuleWhenTheAppIsOpenedDuringTheWait() throws {
         try fx.prepareInstall()
         try fx.installMachinery()
         try "old helper".write(to: fx.installedBackstop, atomically: true, encoding: .utf8)
-        fx.setMode("pgrep", "1\n0\n")       // not running at the quit step, running after the rule
+        fx.setMode("pgrep", "1\n1\n0\n")   // not running at the quit step or under the lock, running after the wait
+
+        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        let calls = fx.calls()
+        XCTAssertFalse(calls.contains { $0.hasPrefix("sudo /usr/sbin/visudo") }, "\(calls)")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("launchctl") }, "\(calls)")
+        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), "rule")
+        XCTAssertEqual(try String(contentsOf: fx.app.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "binary")
+        XCTAssertEqual(try Data(contentsOf: fx.installedBackstop), try Data(contentsOf: fx.backstop))
+        XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "plist")
+        XCTAssertTrue(r.stderr.contains("opened again"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("Only the new \(fx.installedBackstop.path) was installed"), r.stderr)
+        XCTAssertFalse(r.stderr.contains("already holds the new three-line rule"), r.stderr)
+    }
+
+    /// The app is opened again after the rule is written. The installer
+    /// looks once more right before it removes the bundle: the bundle of a
+    /// running app is not replaced, and since the rule is already written
+    /// the stop says the old build cannot start a session and gives the
+    /// rerun command.
+    func testInstallStopsAfterTheRuleWhenTheAppIsOpenedBeforeTheBundle() throws {
+        try fx.prepareInstall()
+        try fx.installMachinery()
+        fx.setMode("pgrep", "1\n1\n1\n0\n")   // not running at the quit step, under the lock or after the wait; running at the bundle
 
         let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
 
         XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
         let calls = fx.calls()
         XCTAssertEqual(calls.filter { $0.hasPrefix("sudo /usr/bin/install") }.count, 1, "\(calls)")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("codesign") }, "\(calls)")
         XCTAssertFalse(calls.contains { $0.hasPrefix("launchctl") }, "\(calls)")
         XCTAssertEqual(try sudoersRules(), Self.passwordlessLines)
         XCTAssertEqual(try String(contentsOf: fx.app.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "binary", "the bundle of a running app was replaced")
-        XCTAssertEqual(try String(contentsOf: fx.installedBackstop, encoding: .utf8), "old helper")
         XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "plist")
         XCTAssertTrue(r.stderr.contains("opened again"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("The app was not replaced"), r.stderr)
         assertRerunNote(r.stderr)
     }
 
@@ -3299,7 +3366,9 @@ private final class ScriptFixture {
         // pmset, so an installer that validated the wrong path or an empty
         // heredoc cannot pass here. visudo and install are only known by the
         // full paths install.sh passes; a bare name, which real sudo would
-        // look up in PATH, fails like an unknown command.
+        // look up in PATH, fails like an unknown command. visudo also
+        // records in at-visudo whether the recovery lock is held and the
+        // installed backstop.sh is already the new one at that moment.
         try writeFake("sudo", """
         printf 'sudo %s\\n' "$*" >> "\(calls)"
         if [[ -e "\(pendingStart.path)" ]]; then echo present; else echo absent; fi >> "\(r)/marker-at-sudo"
@@ -3341,6 +3410,9 @@ private final class ScriptFixture {
                 *) exit 1 ;;
               esac ;;
           /usr/sbin/visudo)
+            if cmp -s "\(installedBackstop.path)" "\(backstop.path)"; then b=new; else b=old; fi
+            if /usr/bin/lockf -k -s -t 0 "\(lock.path)" /usr/bin/true 2>/dev/null; then l=free; else l=held; fi
+            echo "backstop=$b lock=$l" > "\(r)/at-visudo"
             if [[ "$mode" == auth-fail ]]; then echo "sudo: 3 incorrect password attempts" >&2; exit 1; fi
             f=""; for a in "$@"; do f="$a"; done
             [[ -s "$f" ]] && grep -q 'NOPASSWD: /usr/bin/pmset' "$f" || { printf 'sudo VISUDO-REJECTED %s\\n' "$*" >> "\(calls)"; exit 1; }
@@ -3474,21 +3546,28 @@ private final class ScriptFixture {
         // order; the last line repeats. Default 1 (not running).
         // `pgrep -lf` (install.sh's look for backstop.sh runs) answers from
         // backstop.runs instead: a count of calls that still list a run of
-        // the installed script, "always", or "fail". Every listing also
-        // carries an unrelated process whose arguments only mention
-        // backstop.sh.
+        // the installed script, "always", or "fail", optionally followed by
+        // "force" for a run started with --force. Every listing also
+        // carries unrelated processes whose arguments mention backstop.sh,
+        // one of them the installed path itself.
         try writeFake("pgrep", """
         printf 'pgrep %s\\n' "$*" >> "\(calls)"
         if [[ "${1:-}" == -lf ]]; then
-          n="$(cat "\(r)/backstop.runs" 2>/dev/null || echo 0)"
+          n=0; form=""
+          if [[ -f "\(r)/backstop.runs" ]]; then read -r n form < "\(r)/backstop.runs" || true; fi
           echo "4322 /usr/bin/vi notes-on-backstop.sh"
+          echo "4323 /usr/bin/tail -f \(installedBackstop.path)"
           case "$n" in
             fail) echo "pgrep: cannot read the process table" >&2; exit 3 ;;
             always) ;;
             0) exit 0 ;;
-            *) echo $(( n - 1 )) > "\(r)/backstop.runs" ;;
+            *) echo "$(( n - 1 )) ${form:-}" > "\(r)/backstop.runs" ;;
           esac
-          echo "4321 /bin/bash \(installedBackstop.path)"
+          if [[ "${form:-}" == force ]]; then
+            echo "4321 /bin/bash \(installedBackstop.path) --force"
+          else
+            echo "4321 /bin/bash \(installedBackstop.path)"
+          fi
           exit 0
         fi
         f="\(r)/pgrep.mode"

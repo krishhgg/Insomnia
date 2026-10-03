@@ -144,14 +144,18 @@ recovery; newly written journals use `frozenProcesses`.
   (`sudo -v`) before anything else, so a cancelled or failed password
   changes nothing and a running session keeps going. Then it asks a running
   app to quit and stops with nothing changed, the sudoers file included, if
-  the app is still running after 15 s. Then it writes the three-line rule on
-  sudo's cached credential (asking once more if it expired during the
-  quit), checks that the app was not opened again meanwhile, takes the
-  recovery lock, and replaces `backstop.sh` (atomically, so a run of the old
-  script keeps its own copy). It waits up to 30 s until no process runs
-  the old script, and stops before the bundle if one still does or the
-  check fails; only then does it replace the bundle, so a new app never
-  runs beside a backstop that cannot void its dialog. A build older than this rule
+  the app is still running after 15 s, and asks for the password once more
+  if sudo's cached credential expired during the quit. Then it takes the
+  recovery lock, checks that the app was not opened again meanwhile, and
+  replaces `backstop.sh` (atomically, so a run of the old script keeps its
+  own copy). It waits up to 30 s until no process runs the old script, and
+  stops before the rule if one still does or the check fails, so the
+  installed app keeps the rule it was installed with. A run is a process
+  whose arguments are exactly `/bin/bash`, the installed path and at most
+  `--force`; a process that only names the path (an editor, a `tail`) is
+  not one. Only then does it write the three-line rule, look once more for
+  a reopened app, and replace the bundle, so a new app never runs beside a
+  backstop that cannot void its dialog. A build older than this rule
   starts sessions with `sudo -n pmset -a disablesleep 1`, so any stop between
   the rule and the new bundle leaves that build unable to start a session;
   the installer says so and prints the rerun command. A successful install
