@@ -182,4 +182,34 @@ final class UndoClearFailureTests: XCTestCase {
         XCTAssertNil(try h.store.loadState()?.savedOutputVolume)
         XCTAssertEqual(m.lastError, "a newer failure")
     }
+
+    /// A display restored under Insomnia's Low Power Mode whose clear
+    /// fails, retried once the mode is off: the retry clears the entry
+    /// with no write owed after the mode, while the failed clear would
+    /// have owed one. That write is not an undo entry, so the line goes.
+    func testFailedDisplayClearLineGoesWhenTheRetryOwesNoWriteAfterTheMode() async throws {
+        let m = h.makeManager()
+        await m.start(duration: 3600)
+        let on = await m.setLowPower(true)
+        XCTAssertTrue(on)
+        var s = try XCTUnwrap(h.store.loadState())
+        s.savedDisplayBrightness = 0.5
+        try h.store.saveState(s)
+        try lockJournal(true)
+        await m.undoLidActions()
+        try lockJournal(false)
+        try assertShown(m, "display brightness restored")
+
+        let off = await m.setLowPower(false)
+        XCTAssertTrue(off)
+        XCTAssertEqual(try h.store.loadState()?.savedDisplayBrightness, 0.5)
+        try assertShown(m, "display brightness restored")
+
+        await m.undoLidActions()
+        let after = try XCTUnwrap(h.store.loadState())
+        XCTAssertNil(after.savedDisplayBrightness)
+        XCTAssertNil(after.displayRestoredUnderLowPower)
+        XCTAssertTrue(after.sleepDisabledByUs)
+        XCTAssertNil(m.lastError, "the line still says a clear that went through will be retried")
+    }
 }

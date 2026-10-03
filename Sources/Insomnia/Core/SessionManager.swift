@@ -1875,13 +1875,15 @@ final class SessionManager {
     private func persistState(_ s: RuntimeState) throws {
         try store.saveState(s)
         state = s
-        // The entry a failed clear left is gone once its clear changes
-        // nothing on what was written, or nothing is left to undo,
-        // whichever write did it.
+        // The entry a failed clear left is gone once its clear changes no
+        // undo entry of what was written, or nothing is left to undo,
+        // whichever write did it. The display write owed after Low Power
+        // Mode is left out: a retry made once the mode is off owes none,
+        // where the failed clear did.
         if let (message, clear) = uncleared {
             var cleared = s
             clear(&cleared)
-            if cleared == s || !s.isDirty {
+            if cleared.undoEntries == s.undoEntries || !s.isDirty {
                 if lastError == message { lastError = nil }
                 uncleared = nil
             }
