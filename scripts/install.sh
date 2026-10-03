@@ -157,6 +157,32 @@ report_unverified() {
 }
 # Stops the run when Insomnia runs in another account; nothing is sent to
 # that process. The argument says what this run has changed so far.
+# Why replacing the rule at $SUDOERS would take access away from someone
+# other than $USER, or nothing when every line is a comment or names $USER.
+# Judged by the account a line names (its first field), not by its
+# commands, so a rule from any version of this script passes for its own
+# account. A line for another name, a group, an alias, Defaults or an
+# include counts, since the new file would drop it.
+sudoers_for_others() { # file content
+  local line name
+  while IFS= read -r line; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    case "$line" in
+      "") continue ;;
+      "#include"*) ;;
+      "#"*) continue ;;
+    esac
+    name="${line%%[[:space:]]*}"
+    [[ "$name" == "$USER" ]] && continue
+    case "$name" in
+      ALL | Defaults* | *_Alias | "#include"* | "@include"*) ;;
+      *) if [[ "$name" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]]; then echo "grants $name"; return 0; fi ;;
+    esac
+    echo "has a line that is not for $USER: $line"
+    return 0
+  done <<< "$1"
+  return 0
+}
 stop_for_other_accounts() { # what was changed
   (( ${#OTHER_ACCOUNT[@]} > 0 )) || return 0
   echo "Insomnia is running in another account, or a process named Insomnia there could not be told apart from it: $(list "${OTHER_ACCOUNT[@]}")." >&2
@@ -189,10 +215,29 @@ BIN="$("$SWIFT" build -c release ${BUILD_FLAGS[@]+"${BUILD_FLAGS[@]}"} --show-bi
 #    effective, the running app is not asked to quit and neither the bundle,
 #    the installed backstop.sh nor the LaunchAgent are touched. A copy
 #    running in another account stops the install before the rule is
-#    replaced (find_insomnia).
+#    replaced (find_insomnia), and so does a rule that grants another
+#    account: that account's agent needs it to undo a session even after
+#    its app crashed, when no process of it is left to find.
 find_insomnia
 stop_for_other_accounts "Nothing was changed."
 step "Writing $SUDOERS (requires your password once)"
+if [[ -e "$SUDOERS" ]] || "$SUDO" test -e "$SUDOERS"; then
+  # Root-only, so it is read through sudo, the same way uninstall.sh reads it.
+  if ! sudoers_text="$("$SUDO" cat "$SUDOERS")"; then
+    echo "Could not read $SUDOERS through sudo, so it was not replaced. Nothing was changed." >&2
+    exit 1
+  fi
+  sudoers_why="$(sudoers_for_others "$sudoers_text")"
+  if [[ "$sudoers_why" == grants\ * ]]; then
+    echo "$SUDOERS $sudoers_why, not $USER. Another account installed Insomnia, and its recovery agent needs that rule to undo a session, even one whose app crashed. This Mac has room for one rule, so this install would take it away." >&2
+    echo "Uninstall Insomnia in that account first. If that account no longer exists, remove the rule with 'sudo rm $SUDOERS', then rerun. Nothing was changed." >&2
+    exit 1
+  elif [[ -n "$sudoers_why" ]]; then
+    echo "$SUDOERS $sudoers_why. Replacing the file would drop that line." >&2
+    echo "Check it, remove the file with 'sudo rm $SUDOERS' if nothing needs it, then rerun. Nothing was changed." >&2
+    exit 1
+  fi
+fi
 TMP_SUDOERS="$(mktemp)"
 trap 'rm -f "$TMP_SUDOERS"' EXIT
 cat > "$TMP_SUDOERS" <<SUDO
