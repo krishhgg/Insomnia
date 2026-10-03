@@ -143,24 +143,27 @@ cleared only after its undo. It stays in the journal with
 each such device with its saved level, says it could not be restored on
 this macOS build, and says to set the level with the brightness keys or
 Control Center; Settings also shows each saved level under the darken
-toggle. A flagged entry is not dirty for backstop.sh or uninstall.sh, nor
-for the app while the guard refuses its device. Nothing on that build can
-restore it, and counting it would post "Restore incomplete" at every end
-and launch, fail the backstop every minute, and stop uninstall for good.
-It also does not hold back a new session or Quit. The app tries again at
-every lid open and launch, with or without a session. On a build or macOS
-where the guard allows the call, it reads the device first. The close left
-it at 0, so a reading above 0 is a level set since, as the error asked:
-the darkening is already undone, and the entry is cleared without a write
-rather than overwrite that level. A device still at 0 gets the saved value
-and both keys are cleared. A failed write there clears the flag, and the
-entry is retried like any failed restore; if the flag cannot be cleared
-either, an end still counts the entry as not restored, since the live
-guard allows its device. A lid close that can read the device clears the
-flag too: it keeps the earlier saved value while the device reads 0, and
-saves the new level when it reads above 0. Uninstall goes ahead past a
-flagged entry, prints the saved level, and keeps state.json, even with
-`--purge`, so a later install that can make the call restores it.
+toggle. That error goes into one report with every other failure of the
+same undo, such as a failed resume, audio restore or write on the other
+device, since it comes up at every lid open. A flagged entry is not dirty
+for backstop.sh or uninstall.sh, nor for the app while the guard refuses
+its device. Nothing on that build can restore it, and counting it would
+post "Restore incomplete" at every end and launch, fail the backstop every
+minute, and stop uninstall for good. It also does not hold back a new
+session or Quit. The app tries again at every lid open and launch, with or
+without a session. On a build or macOS where the guard allows the call, it
+reads the device first. The close left it at 0, so a reading above 0 is a
+level set since, as the error asked: the darkening is already undone, and
+the entry is cleared without a write rather than overwrite that level. A
+device still at 0 gets the saved value and both keys are cleared. A failed
+write there clears the flag, and the entry is retried like any failed
+restore; if the flag cannot be cleared either, an end still counts the
+entry as not restored, since the live guard allows its device. A lid close
+that can read the device clears the flag too: it keeps the earlier saved
+value while the device reads 0, and saves the new level when it reads
+above 0. Uninstall goes ahead past a flagged entry, prints the saved
+level, and keeps state.json, even with `--purge`, so a later install that
+can make the call restores it.
 
 The guards narrow the risk of calling a private function whose shape
 changed; they do not replace the hardware rows in

@@ -801,6 +801,10 @@ final class SessionManager {
     /// Shared body of lid open, reconcile (lid open) and `restoreAll()`;
     /// each entry is journaled as soon as it is undone.
     private func undoLidActionsInJournal() {
+        // Every error of this undo goes into one report at the end, so a
+        // refused brightness restore, which recurs at every lid open and
+        // launch, does not hide a failed resume, audio or write beside it.
+        var errors: [String] = []
         if !state.frozenProcesses.isEmpty {
             let report = processControl.resume(state.frozenProcesses)
             // Only entries that still need a retry, or that a person has to
@@ -813,14 +817,14 @@ final class SessionManager {
             }
             Log.info("resumed \(report.resumed.count) frozen pid(s); \(report.gone.count) gone, \(report.failed.count) failed, \(report.unverifiable.count) unverifiable, \(report.unobserved.count) unobserved")
             if !report.failed.isEmpty {
-                fail("could not resume pid(s) \(report.failed.map(String.init).joined(separator: ", ")); kept in the journal to retry")
+                errors.append("could not resume pid(s) \(report.failed.map(String.init).joined(separator: ", ")); kept in the journal to retry")
             }
             if !report.unobserved.isEmpty {
-                fail("could not read the state of pid(s) \(report.unobserved.map(String.init).joined(separator: ", ")); kept in the journal to retry")
+                errors.append("could not read the state of pid(s) \(report.unobserved.map(String.init).joined(separator: ", ")); kept in the journal to retry")
             }
             if !report.unverifiable.isEmpty {
                 let list = report.unverifiable.map(String.init).joined(separator: ", ")
-                fail("pid(s) \(list) are stopped but journaled without identity (a legacy entry from an older build, or a freeze interrupted before the kernel confirmed the stop), so Insomnia cannot prove it froze them and will not resume them. Check each one first, for example `ps -o pid,stat,lstart,command -p <pid>`, and only if it is a process you expected Insomnia to freeze run `kill -CONT <pid>`; the entry stays in the journal until resumed or gone")
+                errors.append("pid(s) \(list) are stopped but journaled without identity (a legacy entry from an older build, or a freeze interrupted before the kernel confirmed the stop), so Insomnia cannot prove it froze them and will not resume them. Check each one first, for example `ps -o pid,stat,lstart,command -p <pid>`, and only if it is a process you expected Insomnia to freeze run `kill -CONT <pid>`; the entry stays in the journal until resumed or gone")
             }
         } else if state.dockerFrozen {
             try? journal { $0.dockerFrozen = false }
@@ -838,7 +842,7 @@ final class SessionManager {
                     s.savedMuted = nil
                 }
             } catch {
-                fail("could not restore audio: \(error.localizedDescription)")
+                errors.append("could not restore audio: \(error.localizedDescription)")
             }
         }
 
@@ -863,7 +867,7 @@ final class SessionManager {
             refused.append(keepRefusedRestore("Display brightness", saved: saved, why: why, flag: \.displayRestoreRefused))
         } else if let saved = state.savedDisplayBrightness, state.displayRestoreRefused,
                   let now = levelSetSinceRefusal("display brightness", read: { try display.readBrightness() }) {
-            clearSetSince("display brightness", saved: saved, now: now) { s in
+            clearSetSince("display brightness", saved: saved, now: now, errors: &errors) { s in
                 s.savedDisplayBrightness = nil
                 s.displayRestoreRefused = false
             }
@@ -882,18 +886,18 @@ final class SessionManager {
                         s.displayRestoredUnderLowPower = underLowPower ? saved : nil
                     }
                 } catch {
-                    fail("display brightness restored but the journal entry could not be cleared: \(error.localizedDescription); it will be retried")
+                    errors.append("display brightness restored but the journal entry could not be cleared: \(error.localizedDescription); it will be retried")
                 }
             } catch {
-                fail("could not restore display brightness: \(error.localizedDescription)")
-                makeRetryable("display brightness", flag: \.displayRestoreRefused)
+                errors.append("could not restore display brightness: \(error.localizedDescription)")
+                makeRetryable("display brightness", flag: \.displayRestoreRefused, errors: &errors)
             }
         }
         if let saved = state.savedKeyboardBrightness, let why = keyboard.refusal() {
             refused.append(keepRefusedRestore("Keyboard backlight", saved: saved, why: why, flag: \.keyboardRestoreRefused))
         } else if let saved = state.savedKeyboardBrightness, state.keyboardRestoreRefused,
                   let now = levelSetSinceRefusal("keyboard backlight", read: { try keyboard.readBrightness() }) {
-            clearSetSince("keyboard backlight", saved: saved, now: now) { s in
+            clearSetSince("keyboard backlight", saved: saved, now: now, errors: &errors) { s in
                 s.savedKeyboardBrightness = nil
                 s.keyboardRestoreRefused = false
             }
@@ -908,16 +912,19 @@ final class SessionManager {
                         s.keyboardRestoreRefused = false
                     }
                 } catch {
-                    fail("keyboard backlight restored but the journal entry could not be cleared: \(error.localizedDescription); it will be retried")
+                    errors.append("keyboard backlight restored but the journal entry could not be cleared: \(error.localizedDescription); it will be retried")
                 }
             } catch {
-                fail("could not restore keyboard backlight: \(error.localizedDescription)")
-                makeRetryable("keyboard backlight", flag: \.keyboardRestoreRefused)
+                errors.append("could not restore keyboard backlight: \(error.localizedDescription)")
+                makeRetryable("keyboard backlight", flag: \.keyboardRestoreRefused, errors: &errors)
             }
         }
         if !refused.isEmpty {
             let one = refused.count == 1
-            fail("could not restore the brightness saved before the lid closed on this macOS build. \(refused.joined(separator: " ")) Set \(one ? "the level" : "the levels") with the brightness keys or Control Center; the saved \(one ? "value stays" : "values stay") in the journal for a version that can restore \(one ? "it" : "them")")
+            errors.append("could not restore the brightness saved before the lid closed on this macOS build. \(refused.joined(separator: " ")) Set \(one ? "the level" : "the levels") with the brightness keys or Control Center; the saved \(one ? "value stays" : "values stay") in the journal for a version that can restore \(one ? "it" : "them")")
+        }
+        if !errors.isEmpty {
+            fail(errors.joined(separator: ". "))
         }
         // powerd applies its own remembered "pre-dim" brightness a moment
         // after the wake and can override the write above, so the same
@@ -1329,12 +1336,12 @@ final class SessionManager {
     /// The level was set since the refused restore: the entry is done, and
     /// is cleared without a write. If the journal cannot be written the
     /// entry stays, and the next lid open or launch reads the device again.
-    private func clearSetSince(_ what: String, saved: Float, now: Float, clear: (inout RuntimeState) -> Void) {
+    private func clearSetSince(_ what: String, saved: Float, now: Float, errors: inout [String], clear: (inout RuntimeState) -> Void) {
         Log.info("\(what) reads \(now), set since its restore to \(saved) was refused; left as set, and the saved value cleared")
         do {
             try journal(clear)
         } catch {
-            fail("\(what) was set since its restore was refused, but the saved value could not be cleared: \(error.localizedDescription); it will be retried")
+            errors.append("\(what) was set since its restore was refused, but the saved value could not be cleared: \(error.localizedDescription); it will be retried")
         }
     }
 
@@ -1342,12 +1349,12 @@ final class SessionManager {
     /// and the write failed: it is retried like any failed restore from
     /// now on, so the flag goes. If the flag cannot be cleared, an end
     /// still counts the entry through `journalNeedsRestore`.
-    private func makeRetryable(_ what: String, flag: WritableKeyPath<RuntimeState, Bool>) {
+    private func makeRetryable(_ what: String, flag: WritableKeyPath<RuntimeState, Bool>, errors: inout [String]) {
         guard state[keyPath: flag] else { return }
         do {
             try journal { $0[keyPath: flag] = false }
         } catch {
-            fail("could not mark the \(what) for retry: \(error.localizedDescription); it still counts as not restored")
+            errors.append("could not mark the \(what) for retry: \(error.localizedDescription); it still counts as not restored")
         }
     }
 

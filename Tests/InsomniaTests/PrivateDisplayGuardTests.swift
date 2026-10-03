@@ -505,6 +505,52 @@ final class RefusedDarkeningTests: XCTestCase {
         XCTAssertTrue(try XCTUnwrap(m.lastError).contains("could not mark the display brightness for retry"), m.lastError ?? "")
     }
 
+    /// The display refused, the keyboard's write failing: the report keeps
+    /// both, so "Restore incomplete" names the device the app still has to
+    /// retry as well as the one to set by hand.
+    func testARefusalDoesNotHideAFailedWriteOnTheOtherDevice() async throws {
+        let now = h.clock.now
+        try h.store.saveSession(Session(startedAt: now.addingTimeInterval(-7200), endsAt: now.addingTimeInterval(-60)))
+        var st = RuntimeState()
+        st.savedDisplayBrightness = 0.8
+        st.savedKeyboardBrightness = 0.3
+        try h.store.saveState(st)
+        h.clamshell.closed = false
+        h.keyboard.throwOnSet = true
+        let m = h.makeManager(display: refusedDisplay, keyboard: h.keyboard)
+
+        await m.reconcile()
+
+        let incomplete = try XCTUnwrap(h.notifier.posts.first { $0.title == SessionManager.incompleteTitle }, "\(h.notifier.posts)")
+        XCTAssertTrue(incomplete.body.contains("could not restore keyboard backlight"), incomplete.body)
+        XCTAssertTrue(incomplete.body.contains("Display brightness 0.8: DisplayServices brightness calls were measured on macOS 26 only"), incomplete.body)
+        let after = try XCTUnwrap(try h.store.loadState())
+        XCTAssertEqual(after.savedKeyboardBrightness, 0.3, "the failed write keeps its entry")
+        XCTAssertTrue(after.displayRestoreRefused)
+    }
+
+    /// The refusal comes up at every lid open, so it must not hide a failed
+    /// audio restore from earlier in the same undo either.
+    func testARefusalDoesNotHideAFailedAudioRestore() async throws {
+        let now = h.clock.now
+        try h.store.saveSession(Session(startedAt: now.addingTimeInterval(-7200), endsAt: now.addingTimeInterval(-60)))
+        var st = RuntimeState()
+        st.savedDisplayBrightness = 0.8
+        st.savedOutputVolume = 0.4
+        st.savedMuted = false
+        try h.store.saveState(st)
+        h.clamshell.closed = false
+        h.audio.throwOnApply = true
+        let m = h.makeManager(display: refusedDisplay)
+
+        await m.reconcile()
+
+        let incomplete = try XCTUnwrap(h.notifier.posts.first { $0.title == SessionManager.incompleteTitle }, "\(h.notifier.posts)")
+        XCTAssertTrue(incomplete.body.contains("could not restore audio"), incomplete.body)
+        XCTAssertTrue(incomplete.body.contains("Display brightness 0.8: DisplayServices brightness calls were measured on macOS 26 only"), incomplete.body)
+        XCTAssertEqual(m.lastError.map { incomplete.body.hasPrefix($0) }, true, "\(String(describing: m.lastError))")
+    }
+
     /// Only a refusal keeps an entry out of the dirty set: a measured
     /// device whose write fails keeps it dirty for the retry, as before.
     func testAFailedWriteOnAMeasuredDeviceStillKeepsTheEntry() async throws {
