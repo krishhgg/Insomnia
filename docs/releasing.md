@@ -19,6 +19,12 @@ for a source install, so a downloaded app and a source-built app differ
 only in the signature. The workflow sets `INSOMNIA_LID_SIMULATION` empty, so
 a release never carries the `simulate-lid.sh` watcher.
 
+The two scripts sit at the zip's top level, so the folder above theirs is
+wherever the user unpacked it. They take sibling scripts from their own
+folder only (`ReleaseWorkflowTests` checks the ones the Package step
+copies): the zip's `install.sh` needs `--app`, and its `uninstall.sh` runs
+the `backstop.sh` sealed in the installed app after verifying the app.
+
 ## Cutting a release
 
 1. Set `CFBundleShortVersionString` in `Resources/Info.plist` to the new

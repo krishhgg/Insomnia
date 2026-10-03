@@ -1533,6 +1533,31 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(fx.exists(fx.legacyBackstop), "the writable copy goes with the rest")
     }
 
+    /// A release zip has no backstop.sh beside its uninstall.sh. Unpacked
+    /// at /tmp/Insomnia-<version>, the parent folder is /tmp, where any
+    /// account can create scripts/backstop.sh; uninstall runs the sealed
+    /// copy after verifying the bundle and never one from the parent.
+    func testUninstallFromAZipRunsTheSealedCopyNotABackstopInTheParentFolder() throws {
+        try fx.installMachinery()
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        try fx.writeMarkerBackstop(at: fx.installedBackstop, name: "sealed")
+        let shared = fx.root.appendingPathComponent("shared-tmp", isDirectory: true)
+        let unpacked = shared.appendingPathComponent("Insomnia-0.1.0-macos", isDirectory: true)
+        try FileManager.default.createDirectory(at: unpacked, withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: fx.uninstall, to: unpacked.appendingPathComponent("uninstall.sh"))
+        try fx.writeMarkerBackstop(at: shared.appendingPathComponent("scripts/backstop.sh"), name: "planted")
+
+        let r = try fx.run(unpacked.appendingPathComponent("uninstall.sh"))
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertEqual(fx.calls().filter { $0.hasPrefix("backstop ") }, ["backstop sealed --force"], "\(fx.calls())")
+        XCTAssertTrue(r.stdout.contains("using \(fx.installedBackstop.path)"), r.stdout)
+        let verify = try XCTUnwrap(fx.calls().firstIndex(of: "codesign --verify --strict \(fx.app.path)"), "the sealed copy is verified: \(fx.calls())")
+        let ran = try XCTUnwrap(fx.calls().firstIndex(of: "backstop sealed --force"))
+        XCTAssertLessThan(verify, ran, "verified before it runs: \(fx.calls())")
+        XCTAssertFalse(fx.exists(fx.app))
+    }
+
     /// The sealed copy is covered by the bundle's resource seal; when the
     /// bundle no longer verifies (the script was edited, as the LaunchAgent
     /// would also find), uninstall does not run it and removes nothing. The
@@ -2394,6 +2419,32 @@ final class RecoveryScriptTests: XCTestCase {
 
         XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
         XCTAssertTrue(r.stdout.contains("Uninstall:         \(unpacked.path)/uninstall.sh"), r.stdout)
+    }
+
+    /// A release zip has install.sh but no build-app.sh. Run without --app
+    /// from a zip unpacked at /tmp/Insomnia-<version>, install.sh refuses
+    /// before anything runs instead of running a scripts/build-app.sh that
+    /// any account could have put in the parent folder.
+    func testInstallFromAZipWithoutTheAppFlagRefusesAndRunsNoBuildScriptFromTheParentFolder() throws {
+        try fx.prepareInstall()
+        let shared = fx.root.appendingPathComponent("shared-tmp", isDirectory: true)
+        let unpacked = shared.appendingPathComponent("Insomnia-0.1.0-macos", isDirectory: true)
+        try FileManager.default.createDirectory(at: unpacked, withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: fx.installRedirected, to: unpacked.appendingPathComponent("install.sh"))
+        let planted = shared.appendingPathComponent("scripts/build-app.sh")
+        try FileManager.default.createDirectory(at: planted.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try "#!/bin/bash\nprintf 'planted build-app.sh %s\\n' \"$*\" >> \"\(fx.callsLog.path)\"\nexit 1\n"
+            .write(to: planted, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: planted.path)
+
+        let r = try fx.run(unpacked.appendingPathComponent("install.sh"), extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertEqual(fx.calls(), [], "nothing ran, the planted script included")
+        XCTAssertTrue(r.stderr.contains("no build-app.sh beside this script in \(unpacked.path)"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("pass it with --app"), r.stderr)
+        XCTAssertFalse(fx.exists(fx.sudoers))
+        XCTAssertFalse(fx.exists(fx.app))
     }
 
     /// Integrity is not origin: an ad-hoc bundle, or a Developer ID bundle

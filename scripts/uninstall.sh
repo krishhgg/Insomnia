@@ -36,7 +36,11 @@ for arg in "$@"; do
   esac
 done
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# The folder this script is in. In a checkout that is scripts/, beside
+# backstop.sh; in a release zip it is the unpacked folder, which has no
+# backstop.sh. Never its parent: a zip unpacked at /tmp/Insomnia-<version>
+# would make that /tmp, where any account can create scripts/backstop.sh.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Fixed tool paths: never taken from PATH or the environment. Tests patch
 # these lines in a private copy of the script.
@@ -560,25 +564,26 @@ fi
 
 # 3. Undo everything via the current backstop ---------------------------------
 # The backstop inherits fd 9 and shares this lock instead of waiting on it.
-# Newest first: the checkout's script, then the copy install.sh sealed into
-# the bundle, then the writable copy installs before that layout left in
-# $APP_SUPPORT. The sealed copy runs only while the bundle's signature still
+# Newest first: the checkout's script beside this one, then the copy
+# install.sh sealed into the bundle, then the writable copy installs before
+# that layout left in $APP_SUPPORT. A release zip has no backstop.sh beside
+# uninstall.sh, so from a zip the sealed copy is the first choice. The sealed copy runs only while the bundle's signature still
 # verifies: its resource seal covers the script, so this is the check the
 # LaunchAgent runs (without the pinned requirement, which this script does
 # not have), and an edited copy is refused the same way.
 step "Restoring the machine via backstop --force"
-if [[ -f "$ROOT/scripts/backstop.sh" ]]; then
-  BACKSTOP="$ROOT/scripts/backstop.sh"
+if [[ -f "$SCRIPT_DIR/backstop.sh" ]]; then
+  BACKSTOP="$SCRIPT_DIR/backstop.sh"
 elif [[ -f "$APP/Contents/Resources/backstop.sh" ]]; then
   verify_rc=0
   bounded "$CODESIGN" --verify --strict "$APP" || verify_rc=$?
   if (( verify_rc == 124 )); then
     echo "'codesign --verify --strict $APP' did not answer within ${CALL_TIMEOUT_SECONDS}s, so the backstop.sh sealed in it was not run." >&2
-    echo "Nothing was removed. Run this script from a checkout of the source (its scripts/backstop.sh is used first), or rerun once codesign answers." >&2
+    echo "Nothing was removed. Run scripts/uninstall.sh from a checkout of the source (the backstop.sh beside it is used first), or rerun once codesign answers." >&2
     exit 1
   elif (( verify_rc != 0 )); then
     echo "$APP does not pass 'codesign --verify --strict' (exit $verify_rc: ${BOUNDED_OUTPUT:-no detail}), so the backstop.sh sealed in it was not run." >&2
-    echo "Nothing was removed. Run this script from a checkout of the source (its scripts/backstop.sh is used first), or reinstall with scripts/install.sh and rerun." >&2
+    echo "Nothing was removed. Run scripts/uninstall.sh from a checkout of the source (the backstop.sh beside it is used first), or reinstall with scripts/install.sh and rerun." >&2
     exit 1
   fi
   echo "$APP verifies"
@@ -586,7 +591,7 @@ elif [[ -f "$APP/Contents/Resources/backstop.sh" ]]; then
 elif [[ -f "$APP_SUPPORT/backstop.sh" ]]; then
   BACKSTOP="$APP_SUPPORT/backstop.sh"
 else
-  echo "no backstop.sh found in $ROOT/scripts, $APP/Contents/Resources or $APP_SUPPORT; nothing was removed" >&2
+  echo "no backstop.sh found in $SCRIPT_DIR, $APP/Contents/Resources or $APP_SUPPORT; nothing was removed" >&2
   exit 1
 fi
 echo "using $BACKSTOP"

@@ -39,7 +39,12 @@ closed bag. Its design goals are to:
   is set). `install.sh` installs that build, or a prebuilt bundle passed with
   `--app` after verifying it (one whose origin it cannot verify needs
   `--allow-unverified-origin`), to `~/Applications`. The Release workflow
-  packages the same bundle (`docs/releasing.md`).
+  packages the same bundle (`docs/releasing.md`). `install.sh` and
+  `uninstall.sh` take sibling scripts (`build-app.sh`, `backstop.sh`) from
+  their own folder only, never the one above it: the release zip carries
+  both scripts at its top level, unpacked wherever the user chose, such as
+  `/tmp`. From a zip, `install.sh` without `--app` stops, and
+  `uninstall.sh` runs the verified bundle's sealed `backstop.sh`.
 
 ## Core model
 

@@ -67,7 +67,12 @@ BUNDLE_ID=com.kgarg.insomnia
 # --allow-unverified-origin.
 EXPECTED_TEAM_ID=""
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# The folder this script is in, and the only place its sibling scripts are
+# taken from. In a checkout that is scripts/, with build-app.sh and
+# backstop.sh beside it; in a release zip it is the unpacked folder, with
+# uninstall.sh beside it and no build script. Never its parent: a zip
+# unpacked at /tmp/Insomnia-<version> would make that /tmp, where any
+# account can create scripts/build-app.sh.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_DIR="$HOME/Applications"
 APP="$APP_DIR/Insomnia.app"
@@ -255,8 +260,12 @@ REFUSE
   fi
   SOURCE_APP="$CHECKED_APP"
 else
+  if [[ ! -f "$SCRIPT_DIR/build-app.sh" ]]; then
+    echo "no build-app.sh beside this script in $SCRIPT_DIR, so there is no checkout to build from. To install the bundle of a release zip, pass it with --app (README, Install). Nothing was changed." >&2
+    exit 1
+  fi
   BUILD_DIR="$(mktemp -d)"
-  "$ROOT/scripts/build-app.sh" --output "$BUILD_DIR"
+  "$SCRIPT_DIR/build-app.sh" --output "$BUILD_DIR"
   SOURCE_APP="$BUILD_DIR/Insomnia.app"
 fi
 
@@ -476,7 +485,7 @@ or the LaunchAgent:
   $rerun"
   else
     manual_step="Or run the recovery by hand:
-  $(command_line /bin/bash "$ROOT/scripts/backstop.sh" --force)
+  $(command_line /bin/bash "$SCRIPT_DIR/backstop.sh" --force)
 Then rerun this script to install the app and the LaunchAgent."
   fi
   cat >&2 <<FAIL

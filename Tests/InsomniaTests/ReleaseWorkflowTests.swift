@@ -119,4 +119,22 @@ final class ReleaseWorkflowTests: XCTestCase {
         XCTAssertFalse(release.contains("actions: write"), release)
         XCTAssertFalse(release.contains("uses: actions/checkout"), "publishing needs no checkout")
     }
+
+    /// The scripts the zip carries sit at its top level, so the folder above
+    /// theirs is wherever the user unpacked it (/tmp, Downloads). They take
+    /// sibling scripts from their own folder only; a path built from the
+    /// parent of the script's folder would run whatever another account put
+    /// there. RecoveryScriptTests runs both from a zip layout.
+    func testTheZipsScriptsTakeNothingFromTheFolderAboveTheirOwn() throws {
+        let text = try XCTUnwrap(try workflows().first { $0.name == "release.yml" }).text
+        let copy = try XCTUnwrap(lines(text).first { $0.contains(#""release/$pkg/""#) && $0.contains("cp ") }, "no cp into the package folder")
+        let shipped = copy.split(separator: " ").map(String.init).filter { $0.hasPrefix("scripts/") }
+        XCTAssertEqual(shipped, ["scripts/install.sh", "scripts/uninstall.sh"])
+        let repo = workflowsDir.deletingLastPathComponent().deletingLastPathComponent()
+        for path in shipped {
+            let script = try String(contentsOf: repo.appendingPathComponent(path), encoding: .utf8)
+            XCTAssertFalse(script.contains(#"BASH_SOURCE[0]}")/.."#), "\(path) resolves a path from the parent of its folder")
+            XCTAssertTrue(script.contains(#"SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)""#), "\(path) has no SCRIPT_DIR")
+        }
+    }
 }
