@@ -175,6 +175,11 @@ final class CommandCancellationTests: XCTestCase {
         XCTAssertLessThan(Date().timeIntervalSince(readyAt), 5, "the call waited for the child instead of reporting it")
         let pid = try recordedPid(pidFile)
         XCTAssertEqual(command.pid, pid)
+        if case let .present(live) = SignalProcessControl.processTableState(pid: pid) {
+            XCTAssertEqual(command.identity, live.identity, "a later process could not tell the pid apart from this command")
+        } else {
+            XCTFail("the child left running could not be read")
+        }
         XCTAssertTrue(command.isRunning)
         XCTAssertNil(command.terminationStatus)
         // Still alive well after the second a SIGKILL would have landed.

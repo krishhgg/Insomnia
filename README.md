@@ -233,8 +233,12 @@ installation scenarios still need [release validation](docs/release-validation.m
   command instead of running an undo the command would then override. A
   notification and a menu warning give the pid and `sudo kill <pid>`; the
   warning goes away when the command exits. The pid is also written to
-  `unfinished-command.json`, and a relaunch that finds the lock busy names
-  the command in the menu and in one notification. Until the command
+  `unfinished-command.json` with the command's start time and boot
+  session. A relaunch that finds the lock busy names the command in the
+  menu. It gives the pid and `sudo kill`, in one notification as well,
+  only while that pid still has the recorded start time and boot session;
+  otherwise it says the command has exited, since the pid may now belong
+  to another process. Until the command
   exits, Insomnia refuses to quit or start a session, and records any end
   or lid event it refuses. A `disablesleep 0` or `lowpowermode 0` that
   exits 0 counts as done: its journal entry is cleared before the lock is

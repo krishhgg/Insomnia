@@ -48,15 +48,22 @@ final class UnfinishedCommand: @unchecked Sendable, CustomStringConvertible {
     let exe: String
     let args: [String]
     let pid: pid_t
+    /// The child's start time and boot session, read from the process
+    /// table the moment it was found still running after its grace, so the
+    /// pid was still the child's. nil if it could not be read. After a
+    /// crash, another process uses it to tell whether the pid still is
+    /// this command (`UnfinishedCommandRecord`).
+    let identity: ProcessIdentity?
 
     private let lock = NSLock()
     private var status: Int32?
     private var waiters: [CheckedContinuation<Void, Never>] = []
 
-    init(exe: String, args: [String], pid: pid_t) {
+    init(exe: String, args: [String], pid: pid_t, identity: ProcessIdentity? = nil) {
         self.exe = exe
         self.args = args
         self.pid = pid
+        self.identity = identity
     }
 
     var description: String { "`\(([exe] + args).joined(separator: " "))` (pid \(pid))" }
@@ -331,7 +338,10 @@ struct CancellableCommand: Sendable {
         private func graceExpired(_ p: Process, grace: TimeInterval) {
             let (c, error): (CheckedContinuation<ShellResult, Error>?, CommandStillRunningError?) = lock.withLock {
                 guard continuation != nil, p.isRunning else { return (nil, nil) }
-                let handle = UnfinishedCommand(exe: exe, args: args, pid: p.processIdentifier)
+                let pid = p.processIdentifier
+                var identity: ProcessIdentity?
+                if case let .present(found) = SignalProcessControl.processTableState(pid: pid) { identity = found.identity }
+                let handle = UnfinishedCommand(exe: exe, args: args, pid: pid, identity: identity)
                 unfinished = handle
                 let reason: CommandStillRunningError.Reason = cancelled ? .cancelled : .timeout(seconds: timeout)
                 defer { continuation = nil }

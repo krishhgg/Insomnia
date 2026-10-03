@@ -482,15 +482,19 @@ Backstop, independent of the app:
   transaction. It reports the pid with the `sudo kill` command, in a menu
   line of its own that the exit removes, and refuses to quit or start a
   session until then. It also records the command in
-  `unfinished-command.json`. The exit removes the record, and so does the
-  next transaction that takes the lock. A transaction refused for a busy
-  lock names the recorded command, and the first such refusal for a pid
-  also notifies. An end, lid close or lid open refused meanwhile is
-  recorded at the refusal. An undo (`disablesleep 0`, `lowpowermode 0`)
-  that exits 0 is confirmed: its entry is cleared under the lock before
-  the lock is released, and a display write owed for the end of the mode
-  is done then. Any other exit confirms nothing. When the command exits the
-  app retries a pending end.
+  `unfinished-command.json`, with the start time and boot session read
+  from the process table when the command was left running. The exit
+  removes the record, and so does the next transaction that takes the
+  lock. A transaction refused for a busy lock names the recorded command.
+  It gives the pid and `sudo kill` only while the live pid still has that
+  start time and boot session, and the first such refusal for a pid also
+  notifies; otherwise it says the command has exited, or that the pid
+  cannot be confirmed, and names no process to stop. An end, lid close or
+  lid open refused meanwhile is recorded at the refusal. An undo
+  (`disablesleep 0`, `lowpowermode 0`) that exits 0 is confirmed: its
+  entry is cleared under the lock before the lock is released, and a
+  display write owed for the end of the mode is done then. Any other exit
+  confirms nothing. When the command exits the app retries a pending end.
   Otherwise it reads Low Power Mode under the lock. A mode that reads on
   stays journaled as Insomnia's. A mode that reads off is switched off
   once more with the app's own `lowpowermode 0`, and the ownership is

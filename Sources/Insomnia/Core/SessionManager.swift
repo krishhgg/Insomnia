@@ -148,6 +148,9 @@ final class SessionManager {
     private let notifier: any Notifying
     private let clamshell: @Sendable () -> Bool?
     private let clock: @Sendable () -> Date
+    /// What the process table says a pid is now. Read only, to tell whether
+    /// a recorded command is still running (`recordedLockHolder`).
+    private let processLookup: @Sendable (Int32) -> ProcessLookup
     private let recoveryLock: RecoveryLock
     private let recoveryLockTimeout: TimeInterval
     private let recoveryRetryDelay: TimeInterval
@@ -261,6 +264,7 @@ final class SessionManager {
         notifier: any Notifying = RecordingNotifier(),
         clamshell: @escaping @Sendable () -> Bool? = { LidObserver.readClamshellState() },
         clock: @escaping @Sendable () -> Date = { Date() },
+        processLookup: @escaping @Sendable (Int32) -> ProcessLookup = { SignalProcessControl.processTableState(pid: $0) },
         recoveryLockTimeout: TimeInterval = 10,
         recoveryRetryDelay: TimeInterval = 30,
         reassertDelay: Duration = .seconds(2)
@@ -277,6 +281,7 @@ final class SessionManager {
         self.notifier = notifier
         self.clamshell = clamshell
         self.clock = clock
+        self.processLookup = processLookup
         self.recoveryLock = RecoveryLock(url: paths.recoveryLock)
         self.recoveryLockTimeout = recoveryLockTimeout
         self.recoveryRetryDelay = recoveryRetryDelay
@@ -527,21 +532,33 @@ final class SessionManager {
         }
     }
 
-    /// For a busy lock: the command recorded as holding it, if any, so the
-    /// message names what to stop. After a crash or force quit, that is a
-    /// `sudo pmset` the earlier run left running, and nothing else would
-    /// say why the lock stays busy. Announced once per command.
+    /// For a busy lock: the command recorded as holding it, if any. After a
+    /// crash or force quit, that is a `sudo pmset` the earlier run left
+    /// running, and nothing else would say why the lock stays busy. The
+    /// pid, and `sudo kill` for it, are named only while the live process
+    /// has the start time and boot session recorded for the command: once
+    /// the command has exited, the pid can belong to an unrelated process.
+    /// A record whose command has exited stays until a transaction holds
+    /// the lock and removes it (`exclusive`). Announced once per command.
     private func recordedLockHolder(_ error: Error) -> String {
         guard case .busy? = error as? RecoveryLockError, let record = store.loadUnfinishedCommand() else { return "" }
-        let line = "`\(record.command)` (pid \(record.pid)), left running by Insomnia since \(iso(record.since)), may still hold it; if ps -p \(record.pid) still shows it, stop it by hand with sudo kill \(record.pid)"
-        if announcedLockHolder != record.pid {
-            announcedLockHolder = record.pid
-            notifier.post(
-                title: Self.commandRunningTitle,
-                body: "The recovery lock is busy, and \(line). Insomnia changes nothing until the lock is free."
-            )
+        let command = "`\(record.command)`, left running by Insomnia since \(iso(record.since)),"
+        switch (record.identity, processLookup(record.pid)) {
+        case let (recorded?, .present(live)) where live.identity == recorded:
+            let line = "\(command) still runs as pid \(record.pid) and holds it; stop it by hand with sudo kill \(record.pid)"
+            if announcedLockHolder != record.pid {
+                announcedLockHolder = record.pid
+                notifier.post(
+                    title: Self.commandRunningTitle,
+                    body: "The recovery lock is busy: \(line). Insomnia changes nothing until the lock is free."
+                )
+            }
+            return "; \(line)"
+        case (_?, .absent), (_?, .present):
+            return "; \(command) has exited since, so another process holds it"
+        case (nil, _), (_?, .unreadable):
+            return "; \(command) may still hold it, but Insomnia cannot confirm that pid \(record.pid) is still that command, so it names no process to stop"
         }
-        return "; \(line)"
     }
 
     /// Re-establish a consistent state once `command` has exited and its
@@ -692,7 +709,8 @@ final class SessionManager {
             try store.saveUnfinishedCommand(UnfinishedCommandRecord(
                 pid: error.command.pid,
                 command: ([error.command.exe] + error.command.args).joined(separator: " "),
-                since: clock()
+                since: clock(),
+                identity: error.command.identity
             ))
         } catch {
             Log.error("could not record the command left running in \(paths.unfinishedCommandFile.path): \(error.localizedDescription)")

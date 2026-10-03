@@ -153,6 +153,12 @@ final class FakeSleepGuard: SleepGuarding, @unchecked Sendable {
         set { lock.withLock { _stuckExitStatus = newValue } }
     }
 
+    /// The start time and boot session a fake child with `pid` is reported
+    /// with.
+    static func identity(of pid: Int32) -> ProcessIdentity {
+        ProcessIdentity(startedAt: 1_700_000_000 + Int64(pid), startedAtMicros: 250, bootSession: "fake-boot")
+    }
+
     /// Fake children reported as still running, oldest first.
     var stuck: [UnfinishedCommand] { lock.withLock { _stuck.map(\.child) } }
 
@@ -196,7 +202,7 @@ final class FakeSleepGuard: SleepGuarding, @unchecked Sendable {
             guard _stillRunning.contains(c) else { return nil }
             let pid = _nextPid
             _nextPid += 1
-            let child = UnfinishedCommand(exe: "/usr/bin/sudo", args: ["-n", "/usr/bin/pmset"] + c.split(separator: " ").map(String.init), pid: pid)
+            let child = UnfinishedCommand(exe: "/usr/bin/sudo", args: ["-n", "/usr/bin/pmset"] + c.split(separator: " ").map(String.init), pid: pid, identity: Self.identity(of: pid))
             _stuck.append((child, c))
             if _stuckExitsAtOnce { _stillRunning.remove(c) }
             return (child, _stuckExitsAtOnce)
@@ -640,6 +646,23 @@ final class FakeClamshell: @unchecked Sendable {
     }
 }
 
+/// What the process table holds, for `SessionManager.processLookup`: a pid
+/// not listed is gone.
+final class FakeProcessTable: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _entries: [Int32: ProcessLookup] = [:]
+    var entries: [Int32: ProcessLookup] {
+        get { lock.withLock { _entries } }
+        set { lock.withLock { _entries = newValue } }
+    }
+    func lookup(_ pid: Int32) -> ProcessLookup { entries[pid] ?? .absent }
+
+    /// `pid` is running as a process with `identity`.
+    func run(_ pid: Int32, as identity: ProcessIdentity) {
+        entries[pid] = .present(ProcessSignalState(ppid: 1, stopped: false, identity: identity))
+    }
+}
+
 final class FakeBackstop: BackstopScheduling, @unchecked Sendable {
     private let lock = NSLock()
     private var _arms = 0
@@ -689,6 +712,7 @@ struct Harness {
     let appNap: FakeAppNapPreferences
     let notifier: RecordingNotifier
     let clamshell: FakeClamshell
+    let processes: FakeProcessTable
 
     init(now: Date = Date(timeIntervalSince1970: 1_800_000_000)) {
         home = TempHome()
@@ -703,6 +727,7 @@ struct Harness {
         appNap = FakeAppNapPreferences()
         notifier = RecordingNotifier()
         clamshell = FakeClamshell(false)
+        processes = FakeProcessTable()
     }
 
     /// `lockTimeout` is short so contention tests fail closed quickly;
@@ -716,6 +741,7 @@ struct Harness {
     ) -> SessionManager {
         let c = clock
         let lid = clamshell
+        let table = processes
         return SessionManager(
             paths: home.paths,
             sleepGuard: guardFake,
@@ -728,6 +754,7 @@ struct Harness {
             notifier: notifier,
             clamshell: { lid.closed },
             clock: { c.now },
+            processLookup: { table.lookup($0) },
             recoveryLockTimeout: lockTimeout,
             recoveryRetryDelay: retryDelay,
             reassertDelay: reassertDelay

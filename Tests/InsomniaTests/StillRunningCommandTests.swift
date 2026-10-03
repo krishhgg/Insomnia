@@ -62,6 +62,7 @@ final class StillRunningCommandTests: XCTestCase {
         let record = try XCTUnwrap(h.store.loadUnfinishedCommand(), "nothing on disk names the command if Insomnia dies first")
         XCTAssertEqual(record.pid, 4242)
         XCTAssertEqual(record.command, "/usr/bin/sudo -n /usr/bin/pmset disablesleep 0")
+        XCTAssertEqual(record.identity, FakeSleepGuard.identity(of: 4242), "nothing tells the pid apart once the command has exited")
         let postsBefore = h.notifier.posts.count
 
         // Quit is refused without running anything, and a start is refused.
@@ -155,16 +156,20 @@ final class StillRunningCommandTests: XCTestCase {
     }
 
     /// After a crash or force quit, the command the earlier run left
-    /// running holds the lock (stood in for by another handle here). The
+    /// running holds the lock (stood in for by another handle here), and
+    /// its pid still has the recorded start time and boot session. The
     /// relaunch changes nothing, names the recorded command and pid in the
-    /// menu, and notifies once, not on every refusal. Once the lock is
-    /// free, the next transaction removes the record.
+    /// menu with `sudo kill`, and notifies once, not on every refusal. Once
+    /// the lock is free, the next transaction removes the record.
     func testBusyLockNamesTheCommandAnEarlierRunLeftRunning() async throws {
+        let identity = FakeSleepGuard.identity(of: 4321)
         try h.store.saveUnfinishedCommand(UnfinishedCommandRecord(
             pid: 4321,
             command: "/usr/bin/sudo -n /usr/bin/pmset -a disablesleep 0",
-            since: h.clock.now
+            since: h.clock.now,
+            identity: identity
         ))
+        h.processes.run(4321, as: identity)
         let other = try XCTUnwrap(try RecoveryLock(url: h.home.paths.recoveryLock).tryAcquire())
         let m = h.makeManager()
 
@@ -172,14 +177,14 @@ final class StillRunningCommandTests: XCTestCase {
 
         let error = try XCTUnwrap(m.lastError)
         XCTAssertTrue(error.hasPrefix("reconcile skipped, nothing changed"), error)
-        XCTAssertTrue(error.contains("/usr/bin/sudo -n /usr/bin/pmset -a disablesleep 0` (pid 4321)"), error)
-        XCTAssertTrue(error.contains("ps -p 4321"), error)
+        XCTAssertTrue(error.contains("`/usr/bin/sudo -n /usr/bin/pmset -a disablesleep 0`, left running by Insomnia since"), error)
+        XCTAssertTrue(error.contains("still runs as pid 4321"), error)
         XCTAssertTrue(error.contains("sudo kill 4321"), error)
         let notices = h.notifier.posts.filter { $0.title == SessionManager.commandRunningTitle }
         XCTAssertEqual(notices.count, 1)
-        XCTAssertTrue(notices.first?.body.contains("pid 4321") == true, notices.first?.body ?? "")
+        XCTAssertTrue(notices.first?.body.contains("sudo kill 4321") == true, notices.first?.body ?? "")
         await m.start(duration: 60)
-        XCTAssertTrue(try XCTUnwrap(m.lastError).contains("pid 4321"), m.lastError ?? "")
+        XCTAssertTrue(try XCTUnwrap(m.lastError).contains("sudo kill 4321"), m.lastError ?? "")
         XCTAssertEqual(h.notifier.posts.filter { $0.title == SessionManager.commandRunningTitle }.count, 1, "announced again on every refusal")
         XCTAssertEqual(h.guardFake.calls, [])
         XCTAssertNotNil(h.store.loadUnfinishedCommand())
@@ -187,6 +192,48 @@ final class StillRunningCommandTests: XCTestCase {
         other.release()
         await m.reconcile()
         XCTAssertNil(h.store.loadUnfinishedCommand(), "a record of a command that no longer holds the lock was kept")
+    }
+
+    /// The lock is busy, but the recorded pid is not provably the command
+    /// any more: gone, given to a process with another start time or boot
+    /// session, not readable, or recorded without them by an older build.
+    /// No pid is offered for `sudo kill` and nothing is announced: the
+    /// advice could stop an unrelated process. The record stays until a
+    /// transaction holds the lock.
+    func testBusyLockNamesNoPidTheCommandNoLongerProvablyHas() async throws {
+        let recorded = FakeSleepGuard.identity(of: 4321)
+        let reused = ProcessIdentity(startedAt: recorded.startedAt + 90, startedAtMicros: recorded.startedAtMicros, bootSession: recorded.bootSession)
+        let otherBoot = ProcessIdentity(startedAt: recorded.startedAt, startedAtMicros: recorded.startedAtMicros, bootSession: "another-boot")
+        let running: (ProcessIdentity) -> ProcessLookup = { .present(ProcessSignalState(ppid: 1, stopped: false, identity: $0)) }
+        let cases: [(name: String, identity: ProcessIdentity?, live: ProcessLookup, says: String)] = [
+            ("gone", recorded, .absent, "has exited since, so another process holds it"),
+            ("reused", recorded, running(reused), "has exited since, so another process holds it"),
+            ("other boot", recorded, running(otherBoot), "has exited since, so another process holds it"),
+            ("unreadable", recorded, .unreadable(EPERM), "cannot confirm that pid 4321 is still that command, so it names no process to stop"),
+            ("no identity", nil, running(recorded), "cannot confirm that pid 4321 is still that command, so it names no process to stop"),
+        ]
+        let other = try XCTUnwrap(try RecoveryLock(url: h.home.paths.recoveryLock).tryAcquire())
+        defer { other.release() }
+        let m = h.makeManager()
+        for c in cases {
+            try h.store.saveUnfinishedCommand(UnfinishedCommandRecord(
+                pid: 4321,
+                command: "/usr/bin/sudo -n /usr/bin/pmset -a disablesleep 0",
+                since: h.clock.now,
+                identity: c.identity
+            ))
+            h.processes.entries = [4321: c.live]
+
+            await m.reconcile()
+
+            let error = try XCTUnwrap(m.lastError, c.name)
+            XCTAssertTrue(error.hasPrefix("reconcile skipped, nothing changed"), "\(c.name): \(error)")
+            XCTAssertTrue(error.contains(c.says), "\(c.name): \(error)")
+            XCTAssertFalse(error.contains("kill"), "\(c.name): a kill offered for an unverified pid: \(error)")
+            XCTAssertNotNil(h.store.loadUnfinishedCommand(), "\(c.name): the record went without the lock")
+        }
+        XCTAssertEqual(h.notifier.posts.filter { $0.title == SessionManager.commandRunningTitle }.count, 0, "announced a pid that is not the command")
+        XCTAssertEqual(h.guardFake.calls, [])
     }
 
     /// The record goes when the command exits, before the lock is
