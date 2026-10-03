@@ -94,10 +94,11 @@ instructions before retrying.
 You do not need to close the lid to use a timed session. Opening the lid does
 not end it, and a sleeping display is not the same as a sleeping Mac.
 
-Before the first session, review the settings—some lid actions are enabled by
-default, including pausing every Dock app that is not an agent app while the
-lid is closed. Start with a short, supervised session on a ventilated surface and
-check the status menu and `~/Library/Logs/Insomnia/insomnia.log` afterward.
+Before the first session, review the settings. Some lid actions are on by
+default, including pausing the apps on the freeze list (Slack, WhatsApp and
+Discord) while the lid is closed; pausing every other Dock app is off until
+you turn it on. Start with a short, supervised session on a ventilated surface
+and check the status menu and `~/Library/Logs/Insomnia/insomnia.log` afterward.
 
 ## What happens when the lid closes
 
@@ -106,9 +107,9 @@ check the status menu and `~/Library/Logs/Insomnia/insomnia.log` afterward.
 </p>
 
 During a session, Insomnia turns the display and keyboard backlight off
-(saving their brightness first), pauses the apps on the freeze list and, by
-default, every other Dock app that is not an agent app, checks whether Docker
-Desktop is idle before pausing it, and can save then mute audio.
+(saving their brightness first), pauses the apps on the freeze list (and, if
+you opt in, every other Dock app that is not an agent app), checks whether
+Docker Desktop is idle before pausing it, and can save then mute audio.
 Reopening the lid attempts to undo those lid actions. **The timer keeps
 counting down while the lid is closed**; only its on-screen redraw pauses.
 
@@ -126,14 +127,15 @@ The defaults are worth knowing:
 
 - **Selected apps:** Slack, WhatsApp, and Discord are on the freeze list.
   Configured agent apps are excluded from this ordinary list.
-- **Every other app:** "Freeze every other app while the lid is closed" is on.
-  Every Dock app that is not an agent app, an Apple app, Docker Desktop or a
-  built-in protected app (editors, AI apps, Tailscale, local model servers) is
-  paused too, so only agents keep running with the lid shut. Menu-bar apps are
-  never picked up automatically; add them to the freeze list if you want them
-  paused. Settings shows a "Would freeze now" line listing what the automatic
-  scope would pause at that moment. Turn the toggle off to pause the freeze
-  list only.
+- **Every other app:** "Freeze every other app while the lid is closed" is
+  off, so a fresh install pauses the freeze list only. Turn it on to also pause
+  every Dock app that is not an agent app, an Apple app, Docker Desktop or a
+  built-in protected app (editors, terminals, browsers, AI apps, password
+  managers, local databases, Tailscale, local model servers; JetBrains IDEs by
+  bundle-id prefix), so only agents keep running with the lid shut. Menu-bar
+  apps are never picked up automatically; add them to the freeze list if you
+  want them paused. Settings shows a "Would freeze now" line listing what the
+  automatic scope would pause at that moment.
 - **Docker rule:** enabled, with a separate local Docker Desktop idle check.
   Container startup can race that check; disable the rule for important Docker
   workloads where an unexpected pause would be disruptive.
@@ -204,10 +206,19 @@ installation scenarios still need [release validation](docs/release-validation.m
 <summary><strong>Recovery limits and manual attention</strong></summary>
 
 - **Process ownership:** automatic resume checks the recorded process start
-  time and boot session. Old identity-less entries, or a crash/write failure
-  before a freeze is confirmed, are not automatically resumed while stopped.
-  Verify the live process and whether it should be resumed; never blindly
-  signal a PID from an old log.
+  time and boot session. The app journals each pid before it sends SIGSTOP,
+  and sends nothing when that write fails. The identity is added only after
+  the kernel confirms Insomnia's own stop, so a process somebody else had
+  stopped is never resumed. If the confirming write fails, the app sends
+  SIGCONT at once to each pid it just stopped whose identity still matches,
+  even one that does not show as stopped yet: SIGCONT also cancels a stop
+  that is still pending. It then drops those entries from the journal,
+  shows the failure in the status menu, and stops counting them as frozen
+  even if the disk refuses that write too. If the app dies between the stop and that write,
+  the stopped pids stay journaled without identity, like entries from builds
+  that recorded the pid alone, and are not automatically resumed while
+  stopped. Verify the live process and whether it should be resumed; never
+  blindly signal a PID from an old log.
 - **Identity is not an atomic guarantee:** the app checks start time to the
   microsecond; the shell checks to the second. A lookup and a signal are still
   separate operations.

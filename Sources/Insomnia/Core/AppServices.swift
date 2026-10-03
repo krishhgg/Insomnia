@@ -346,7 +346,7 @@ final class AppServices {
     }
 
     private func syncState() {
-        let s = manager?.state ?? .clean
+        let s = manager?.effectiveState ?? .clean
         status.frozenCount = s.frozenPids.count
         status.dockerPaused = s.dockerFrozen
     }
