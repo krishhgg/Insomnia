@@ -238,18 +238,19 @@ installation scenarios still need [release validation](docs/release-validation.m
   menu. It gives the pid and `sudo kill`, in one notification as well,
   only while that pid still has the recorded start time and boot session;
   otherwise it says the command has exited, since the pid may now belong
-  to another process. Until the command
-  exits, Insomnia refuses to quit or start a session, and records any end
-  or lid event it refuses. A `disablesleep 0` or `lowpowermode 0` that
-  exits 0 counts as done: its journal entry is cleared before the lock is
-  released, and the command is not run again. If that journal write fails,
-  the menu says so and the undo runs again. Any other exit counts as a
-  failure. Then a pending end runs again. Otherwise Insomnia reads Low
-  Power Mode. If it reads off, Insomnia runs its own `lowpowermode 0` and
-  forgets the mode only once that succeeds. Then it replays a refused lid
-  event, after waiting out the 2 s lid debounce, and runs the floor rules
-  again. If the mode cannot be read or switched off, or the journal cannot
-  be written, it tries again every 30 s while the session lasts.
+  to another process. Until the command exits, Insomnia refuses to quit
+  or start a session, and records any end or lid event it refuses. A
+  `disablesleep 0` or `lowpowermode 0` that exits 0 counts as done: its
+  journal entry is cleared before the lock is released, and the command
+  is not run again. If that journal write fails, the menu says so and the
+  undo runs again; the line goes once a later write clears the entry. Any
+  other exit counts as a failure. Then a pending end runs again.
+  Otherwise Insomnia reads Low Power Mode. If it reads off, Insomnia runs
+  its own `lowpowermode 0` and forgets the mode only once that succeeds.
+  Then it replays a refused lid event, after waiting out the 2 s lid
+  debounce, and runs the floor rules again. If the mode cannot be read or
+  switched off, or the journal cannot be written, it tries again every
+  30 s while the session lasts.
 - **Audio:** the backstop preserves volume/mute entries but cannot restore
   CoreAudio. Reopen the app for recovery.
 - **Sleep disabled by something else:** at launch, with no session and no

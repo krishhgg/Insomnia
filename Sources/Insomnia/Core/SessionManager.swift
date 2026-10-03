@@ -223,6 +223,11 @@ final class SessionManager {
     /// The pid of the recorded command last announced for a busy lock, so
     /// a command that holds the lock across many refusals is announced once.
     @ObservationIgnored private var announcedLockHolder: Int32?
+    /// The menu line of the last undo whose journal entry could not be
+    /// cleared (`clearUndone`), with the clear it owes. The line goes once
+    /// a journal write has that entry cleared, if it is still the one
+    /// shown: it says the clear will be retried (`persistState`).
+    @ObservationIgnored private var uncleared: (message: String, clear: (inout RuntimeState) -> Void)?
     /// A lid close or open refused while `unfinishedCommand` ran. Replayed
     /// for the lid's latest state once it has exited; cleared then, or by
     /// a session end, which undoes every lid action in the journal.
@@ -517,18 +522,23 @@ final class SessionManager {
     /// undo again, and the menu says so (`clearUndone`) in place of the
     /// command's line, which goes with the exit.
     private func confirmUndo(_ undo: PendingUndo, by command: UnfinishedCommand) {
+        let clear: (inout RuntimeState) -> Void
+        switch undo {
+        case .sleepRestored: clear = { $0.sleepDisabledByUs = false }
+        case .lowPowerOff: clear = { $0.lowPowerSetByUs = false }
+        }
         do {
             try loadJournal()
         } catch {
-            fail("\(command.description) exited 0, but the journal could not be read to clear its entry: \(error.localizedDescription); it will be retried")
+            failUncleared("\(command.description) exited 0, but the journal could not be read to clear its entry: \(error.localizedDescription); it will be retried", clear)
             return
         }
         switch undo {
         case .sleepRestored:
-            guard clearUndone("sleep restored (\(command.description) exited 0)", { $0.sleepDisabledByUs = false }) else { return }
+            guard clearUndone("sleep restored (\(command.description) exited 0)", clear) else { return }
             Log.info("sleep restored: \(command.description) exited 0")
         case .lowPowerOff:
-            guard clearUndone("low power mode switched off (\(command.description) exited 0)", { $0.lowPowerSetByUs = false }) else { return }
+            guard clearUndone("low power mode switched off (\(command.description) exited 0)", clear) else { return }
             Log.info("low power mode off: \(command.description) exited 0")
             settleDisplayAfterLowPower()
         }
@@ -541,14 +551,21 @@ final class SessionManager {
     /// as logged: until it is cleared, the journal still claims a change
     /// that has been undone.
     @discardableResult
-    private func clearUndone(_ what: String, _ mutate: (inout RuntimeState) -> Void) -> Bool {
+    private func clearUndone(_ what: String, _ mutate: @escaping (inout RuntimeState) -> Void) -> Bool {
         do {
             try journal(mutate)
             return true
         } catch {
-            fail("\(what) but the journal entry could not be cleared: \(error.localizedDescription); it will be retried")
+            failUncleared("\(what) but the journal entry could not be cleared: \(error.localizedDescription); it will be retried", mutate)
             return false
         }
+    }
+
+    /// `fail` for an entry left on disk after its undo went through. The
+    /// line goes by itself once the entry is cleared (`persistState`).
+    private func failUncleared(_ message: String, _ clear: @escaping (inout RuntimeState) -> Void) {
+        fail(message)
+        uncleared = (message, clear)
     }
 
     /// For a busy lock: the command recorded as holding it, if any. After a
@@ -1858,6 +1875,17 @@ final class SessionManager {
     private func persistState(_ s: RuntimeState) throws {
         try store.saveState(s)
         state = s
+        // The entry a failed clear left is gone once its clear changes
+        // nothing on what was written, or nothing is left to undo,
+        // whichever write did it.
+        if let (message, clear) = uncleared {
+            var cleared = s
+            clear(&cleared)
+            if cleared == s || !s.isDirty {
+                if lastError == message { lastError = nil }
+                uncleared = nil
+            }
+        }
     }
 
     /// Logs `message` and shows it in the status menu until the next

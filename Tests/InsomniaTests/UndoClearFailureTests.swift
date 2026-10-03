@@ -27,7 +27,7 @@ final class UndoClearFailureTests: XCTestCase {
 
     /// The end's `disablesleep 0` exits 0 and the clear fails: the end is
     /// incomplete, its notification carries the reason, and the next end
-    /// runs the undo again and finishes.
+    /// runs the undo again and finishes, which takes the line away.
     func testEndWhoseSleepClearFailsSaysSoAndRunsTheUndoAgain() async throws {
         let m = h.makeManager()
         await m.start(duration: 3600)
@@ -47,6 +47,7 @@ final class UndoClearFailureTests: XCTestCase {
         XCTAssertEqual(again, .restored)
         XCTAssertEqual(h.guardFake.calls, ["disablesleep 1", "disablesleep 0", "disablesleep 0"])
         XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
+        XCTAssertNil(m.lastError, "the line still says a clear that went through will be retried")
     }
 
     /// The end's `lowpowermode 0` exits 0 and the clear fails.
@@ -135,5 +136,45 @@ final class UndoClearFailureTests: XCTestCase {
             try h.store.saveState(.clean)
         }
         XCTAssertEqual(h.audio.applied.map(\.volume), [0.4])
+    }
+
+    /// The line of a failed clear goes once a later write clears its entry,
+    /// with the session's own entry still journaled. A write that leaves
+    /// the entry keeps the line, and a newer error shown in its place is
+    /// left alone.
+    func testFailedClearLineGoesOnlyWithItsEntry() async throws {
+        let m = h.makeManager()
+        await m.start(duration: 3600)
+        func journalAudio() throws {
+            var s = try XCTUnwrap(h.store.loadState())
+            s.savedOutputVolume = 0.4
+            try h.store.saveState(s)
+        }
+        try journalAudio()
+        try lockJournal(true)
+        await m.undoLidActions()
+        try lockJournal(false)
+        try assertShown(m, "audio restored")
+        let line = m.lastError
+
+        let on = await m.setLowPower(true)
+        XCTAssertTrue(on)
+        XCTAssertEqual(try h.store.loadState()?.savedOutputVolume, 0.4)
+        XCTAssertEqual(m.lastError, line, "a write that left the entry took the line away")
+
+        await m.undoLidActions()
+        XCTAssertNil(try h.store.loadState()?.savedOutputVolume)
+        XCTAssertEqual(try h.store.loadState()?.sleepDisabledByUs, true)
+        XCTAssertNil(m.lastError, "the line still says a clear that went through will be retried")
+
+        try journalAudio()
+        try lockJournal(true)
+        await m.undoLidActions()
+        try lockJournal(false)
+        try assertShown(m, "audio restored")
+        m.fail("a newer failure")
+        await m.undoLidActions()
+        XCTAssertNil(try h.store.loadState()?.savedOutputVolume)
+        XCTAssertEqual(m.lastError, "a newer failure")
     }
 }

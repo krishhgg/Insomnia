@@ -956,7 +956,7 @@ final class StillRunningCommandTests: XCTestCase {
     /// that follows cannot read the mode here, which it only logs, so that
     /// line stays in the menu. Once the journal takes writes and the mode
     /// reads again, the retried check switches the mode off and clears the
-    /// entry.
+    /// entry, and the line goes with it while the session still runs.
     func testLateSwitchOffWhoseClearFailsIsShownInTheMenu() async throws {
         let m = h.makeManager(retryDelay: 0.2)
         m.resyncAfterCommand = { _ in }
@@ -983,6 +983,8 @@ final class StillRunningCommandTests: XCTestCase {
         let after = Array(h.guardFake.calls.dropFirst(before.count))
         XCTAssertEqual(after.filter { $0 != "pmset -g custom" }, ["lowpowermode 0"], "the switch-off the retried check confirms with")
         XCTAssertEqual(after.suffix(2), ["pmset -g custom", "lowpowermode 0"])
+        XCTAssertNil(m.lastError, "the line still says a clear that went through will be retried")
+        XCTAssertEqual(try h.store.loadState()?.sleepDisabledByUs, true)
         XCTAssertFalse(try lockIsHeld())
     }
 
@@ -1007,7 +1009,8 @@ final class StillRunningCommandTests: XCTestCase {
     /// An end's `disablesleep 0` left running exits 0, and the clear fails.
     /// The command's line goes with the exit and the menu says the entry
     /// stays. The retried end runs the undo again (held at the fake's gate
-    /// while the menu is read), and finishes once the journal takes writes.
+    /// while the menu is read), and finishes once the journal takes writes;
+    /// the line goes then.
     func testLateUndoOfAnEndWhoseClearFailsIsShownAndRunAgain() async throws {
         let m = h.makeManager()
         await m.start(duration: 3600)
@@ -1034,12 +1037,14 @@ final class StillRunningCommandTests: XCTestCase {
         await gate.open()
         await waitUntil("the retried end never finished") { m.pendingEnd == nil && (try? self.h.store.loadState()) == RuntimeState.clean }
         XCTAssertEqual(h.guardFake.calls, before + ["disablesleep 0", "disablesleep 0"], "the unconfirmed undo was not run again")
+        XCTAssertNil(m.lastError, "the line still says a clear that went through will be retried")
         XCTAssertFalse(try lockIsHeld())
     }
 
     /// A `lowpowermode 0` left running exits 0 while state.json does not
     /// decode: nothing is cleared or overwritten, and the menu says the
-    /// entry could not be cleared. No session, so no check runs after.
+    /// entry could not be cleared. No session, so no check runs after; the
+    /// line goes once the file is fixed and a switch-off clears the entry.
     func testLateSwitchOffOnAnUnreadableJournalIsShownInTheMenu() async throws {
         var st = RuntimeState.clean
         st.lowPowerSetByUs = true
@@ -1060,5 +1065,11 @@ final class StillRunningCommandTests: XCTestCase {
         XCTAssertTrue(error.hasPrefix("`/usr/bin/sudo -n /usr/bin/pmset lowpowermode 0` (pid 4242) exited 0, but the journal could not be read to clear its entry"), error)
         XCTAssertEqual(try Data(contentsOf: h.home.paths.stateFile), broken, "an unreadable journal was overwritten")
         XCTAssertFalse(try lockIsHeld())
+
+        try h.store.saveState(st)
+        let off = await m.setLowPower(false)
+        XCTAssertTrue(off)
+        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
+        XCTAssertNil(m.lastError, "the line still says a clear that went through will be retried")
     }
 }

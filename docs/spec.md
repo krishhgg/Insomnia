@@ -514,7 +514,9 @@ Backstop, independent of the app:
   retry delay while the session lasts.
 - Successful restores may clear their entries; failures must stay journaled.
   A journal write that fails to clear the entry of a successful restore is
-  shown in the menu as well as logged, and the restore is retried.
+  shown in the menu as well as logged, and the restore is retried. The
+  line goes once a later write clears that entry, unless a newer error
+  has replaced it.
   Process recovery must verify identity and avoid resuming a process that
   Insomnia did not stop. Old PID-only entries need conservative handling.
 - The shell does not restore CoreAudio settings. Saved audio must remain in
