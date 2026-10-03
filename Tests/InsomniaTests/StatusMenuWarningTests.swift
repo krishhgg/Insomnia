@@ -68,23 +68,25 @@ final class StatusMenuWarningTests: XCTestCase {
         XCTAssertEqual(entry?.representedObject as? ThrottledBrowser, arc)
     }
 
-    /// The reason the last relaunch stopped short follows the browser
-    /// lines and comes before the session error. It is shown with no
-    /// throttled browser left too: a browser that quit and did not open
-    /// again is in no browser line.
-    func testTheRelaunchProblemFollowsTheBrowserLines() throws {
+    /// The reasons relaunches stopped short, one line per browser, follow
+    /// the browser lines and come before the session error. They are shown
+    /// with no throttled browser left too: a browser that quit and did not
+    /// open again is in no browser line.
+    func testTheRelaunchProblemsFollowTheBrowserLines() throws {
         let arc = ThrottledBrowser(bundleId: "company.thebrowser.Browser", name: "Arc")
         let problem = "Arc did not quit within 10 s, so nothing was relaunched."
-        let items = StatusMenu.items(sessionActive: true, sleepHeld: true, machine: nil, actions: nil, throttledBrowsers: [arc], relaunchProblem: problem, error: "restore failed")
+        let other = "Chrome quit but could not be relaunched: boom. Open it yourself."
+        let items = StatusMenu.items(sessionActive: true, sleepHeld: true, machine: nil, actions: nil, throttledBrowsers: [arc], relaunchProblems: [problem, other], error: "restore failed")
         let throttle = try XCTUnwrap(StatusLines.throttleWarning(["Arc"]))
-        XCTAssertEqual(items.map(\.title).filter { $0.contains("Arc") || $0.contains("restore") }, [
+        XCTAssertEqual(items.map(\.title).filter { $0.contains("Arc") || $0.contains("Chrome") || $0.contains("restore") }, [
             throttle,
             "Relaunch Arc unthrottled",
             "\u{26A0} \(problem)",
+            "\u{26A0} \(other)",
             "\u{26A0} restore failed",
         ])
 
-        let closed = StatusMenu.items(sessionActive: false, sleepHeld: false, machine: nil, actions: nil, throttledBrowsers: [], relaunchProblem: problem, error: nil)
+        let closed = StatusMenu.items(sessionActive: false, sleepHeld: false, machine: nil, actions: nil, throttledBrowsers: [], relaunchProblems: [problem], error: nil)
         XCTAssertEqual(closed.filter { $0.kind == .warning }.map(\.title), ["\u{26A0} \(problem)"])
     }
 }

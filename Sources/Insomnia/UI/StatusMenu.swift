@@ -33,16 +33,16 @@ enum StatusMenu {
     /// `lidSimulationBuild` adds the line that marks a build with the
     /// scripts/simulate-lid.sh watcher compiled in (`LidSimulationBuild`),
     /// so such a build is never mistaken for a normal one.
-    /// `relaunchProblem` is why the last browser relaunch did not happen;
-    /// it follows the browser lines, since the browser it names may no
-    /// longer be in them.
+    /// `relaunchProblems` say why browser relaunches did not happen, one
+    /// line per browser; they follow the browser lines, since the browsers
+    /// they name may no longer be in them.
     static func items(
         sessionActive: Bool,
         sleepHeld: Bool,
         machine: String?,
         actions: String?,
         throttledBrowsers: [ThrottledBrowser],
-        relaunchProblem: String? = nil,
+        relaunchProblems: [String] = [],
         error: String?,
         foreignSleep: String? = nil,
         lidSimulationBuild: Bool = false
@@ -69,8 +69,8 @@ enum StatusMenu {
                 out.append(Item(title: "Relaunch \(browser.name) unthrottled", kind: .relaunchBrowser(browser)))
             }
         }
-        if let relaunchProblem = present(relaunchProblem) {
-            out.append(Item(title: "\u{26A0} \(relaunchProblem)", kind: .warning))
+        for problem in relaunchProblems.compactMap(present) {
+            out.append(Item(title: "\u{26A0} \(problem)", kind: .warning))
         }
         if let error = present(error) {
             out.append(Item(title: "\u{26A0} \(error)", kind: .warning))

@@ -286,10 +286,15 @@ last held while it was on was the battery or thermal floor, not the lid.
     After `open` returns 0 the running list is polled for up to 5 s; a
     browser not running by then is reported too. A session that ends during
     that wait cancels it at once and nothing is reported, since the user
-    ended the session. Every other outcome short of a relaunch is a
-    "Browser not relaunched" notification naming the browser, and the same
-    text stays in the menu as a warning line until the next relaunch or
-    the next session start, because notifications can be off for Insomnia.
+    ended the session. The 10 s quit wait does not stop on a cancel, so a
+    relaunch whose session ended during it reports nothing either when the
+    wait is over. Only the newest relaunch of a browser reports, so one
+    that a newer relaunch of the same browser overtook reports nothing
+    either. Every other outcome short of a relaunch is a "Browser not
+    relaunched" notification naming the browser, and the same text stays
+    in the menu as a warning line, one per browser, until that browser's
+    next relaunch or the next session start, because notifications can be
+    off for Insomnia.
     Insomnia is the notification center's delegate and asks for banners
     while it is frontmost, as it is right after the confirmation; without
     that, macOS drops a notification from the frontmost app. The process

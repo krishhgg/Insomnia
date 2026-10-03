@@ -20,13 +20,14 @@ final class SystemStatus {
     var throttledBrowsers: [ThrottledBrowser] = []
     /// Full detail for the relaunch item (bundle id + name).
     var browsers: [BrowserStatus] = []
-    /// Why the last browser relaunch did not happen, naming the browser,
-    /// the same text the notification carries. The menu shows it as a
-    /// warning line, because a notification can be turned off for
-    /// Insomnia, and one that is not presented is gone. Cleared when the
-    /// next relaunch starts and when a session starts; the end of a
-    /// session leaves it, since the browser it names may still be closed.
-    var relaunchProblem: String?
+    /// Why each browser's last relaunch did not happen, by bundle id: the
+    /// text the notification carries, which names the browser. The menu
+    /// shows each as a warning line, because a notification can be turned
+    /// off for Insomnia, and one that is not presented is gone. A
+    /// browser's line is cleared when its next relaunch starts, and every
+    /// line when a session starts; the end of a session leaves them, since
+    /// the browsers they name may still be closed.
+    var relaunchProblems: [String: String] = [:]
 
     @ObservationIgnored var refresher: (@MainActor () async -> Void)?
 
@@ -80,6 +81,10 @@ final class AppServices {
     private var lidTasks: [Task<Void, Never>] = []
     private var floorTasks: [Task<Void, Never>] = []
     private var browserTasks: [Task<Void, Never>] = []
+    /// Relaunches started so far, and the newest one of each browser, by
+    /// bundle id. Only the newest relaunch of a browser reports its outcome.
+    private var relaunchCount = 0
+    private var newestRelaunch: [String: Int] = [:]
     private var sampleTimer: (any DispatchSourceTimer)?
     private var postOpenSampleTask: Task<Void, Never>?
     private(set) var running = false
@@ -121,7 +126,7 @@ final class AppServices {
         self.manager = manager
         let config = manager.config
         status.lastGap = nil
-        status.relaunchProblem = nil
+        status.relaunchProblems = [:]
 
         if !config.hotspotSSID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             locationPermission.requestWhenInUse()
@@ -255,18 +260,32 @@ final class AppServices {
     /// Quit and relaunch a Chromium browser with both anti-throttle flags.
     /// The outcome lands seconds after the menu click, so anything short of
     /// a relaunch goes out as a notification naming the browser, and stays
-    /// in the menu as `status.relaunchProblem` until the next relaunch. The
-    /// bundle id and name are the ones the user confirmed, never looked up
-    /// again in `status.browsers`, which a scan can replace at any point. The
-    /// throttle checks the running processes itself, and a browser that
-    /// is gone by then is reported as not running.
+    /// in the menu in `status.relaunchProblems` until that browser's next
+    /// relaunch. The bundle id and name are the ones the user confirmed,
+    /// never looked up again in `status.browsers`, which a scan can replace
+    /// at any point. The throttle checks the running processes itself, and
+    /// a browser that is gone by then is reported as not running.
+    ///
+    /// The quit and start waits take seconds, and the wait for a browser to
+    /// quit goes on after a cancel. When the wait is over, the outcome is
+    /// reported only if the session that asked for it has not ended (a
+    /// cancelled task) and no newer relaunch of the same browser has
+    /// started; otherwise it is dropped, with no line and no notification,
+    /// so an old outcome never stands in for a newer one.
     func relaunchUnthrottled(_ target: ThrottledBrowser) async {
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
-            self.status.relaunchProblem = nil
+            self.relaunchCount += 1
+            let relaunch = self.relaunchCount
+            self.newestRelaunch[target.bundleId] = relaunch
+            self.status.relaunchProblems[target.bundleId] = nil
             let outcome = await self.browser.relaunchUnthrottled(bundleId: target.bundleId)
+            guard !Task.isCancelled, self.newestRelaunch[target.bundleId] == relaunch else {
+                Log.info("relaunch of \(target.bundleId) outlived its session or a newer relaunch; its outcome is dropped")
+                return
+            }
             if let body = outcome.explanation(browser: target.name) {
-                self.status.relaunchProblem = body
+                self.status.relaunchProblems[target.bundleId] = body
                 self.notifier.post(title: "Browser not relaunched", body: body)
             }
             guard !Task.isCancelled else { return }

@@ -1142,7 +1142,7 @@ final class RecordingStatusSource: StatusSource {
     var frozenCount = 0
     var dockerPaused = false
     var throttledBrowsers: [ThrottledBrowser] = []
-    var relaunchProblem: String? = nil
+    var relaunchProblems: [String] = []
     private(set) var relaunched: [ThrottledBrowser] = []
 
     func refreshOnDemand() {}

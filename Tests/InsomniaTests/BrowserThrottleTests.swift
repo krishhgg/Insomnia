@@ -401,6 +401,16 @@ final class FakeBrowserProcesses: BrowserProcessControlling {
     var launchFailure: String?
     /// Runs during the quit wait, before it ends.
     var duringQuit: (@MainActor () -> Void)?
+    /// Holds the next quit wait until `releaseQuit()`, cancelled or not,
+    /// the way the app's wait for a browser to quit goes on after a
+    /// cancel. `insideQuitWait` is fulfilled once it holds.
+    var holdsNextQuit = false
+    let insideQuitWait: XCTestExpectation = {
+        let e = XCTestExpectation(description: "the relaunch is inside the quit wait")
+        e.assertForOverFulfill = false
+        return e
+    }()
+    private var heldQuit: CheckedContinuation<Void, Never>?
     enum StartWait {
         /// An instance is running as soon as the wait begins.
         case appears
@@ -457,10 +467,20 @@ final class FakeBrowserProcesses: BrowserProcessControlling {
     func terminateAndWait(_ instances: [BrowserInstance], timeout: TimeInterval) async -> Bool {
         let asked = instances.compactMap { $0.process as? Process }
         quitRequests.append(asked)
-        if quits { asked.forEach { $0.running = false } }
+        let quit = quits
+        if quit { asked.forEach { $0.running = false } }
         for pid in pidsAfterQuit ?? [] { start(pid: pid) }
         duringQuit?()
-        return quits
+        if holdsNextQuit {
+            holdsNextQuit = false
+            await withCheckedContinuation { heldQuit = $0; insideQuitWait.fulfill() }
+        }
+        return quit
+    }
+
+    func releaseQuit() {
+        heldQuit?.resume()
+        heldQuit = nil
     }
 
     func launch(bundleId: String, arguments: [String]) async throws {

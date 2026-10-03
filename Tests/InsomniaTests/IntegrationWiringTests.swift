@@ -119,7 +119,7 @@ final class IntegrationWiringTests: XCTestCase {
 
         XCTAssertEqual(notifier.posts.map(\.title), ["Browser not relaunched"])
         XCTAssertEqual(notifier.posts.map(\.body), ["Chrome is not running. Nothing was quit or relaunched."])
-        XCTAssertEqual(services.status.relaunchProblem, "Chrome is not running. Nothing was quit or relaunched.")
+        XCTAssertEqual(services.status.relaunchProblems, ["com.google.Chrome": "Chrome is not running. Nothing was quit or relaunched."])
         XCTAssertEqual(processes.quitRequests.count, 0)
         XCTAssertEqual(processes.launches.count, 0)
     }
@@ -149,7 +149,7 @@ final class IntegrationWiringTests: XCTestCase {
         await services.relaunchUnthrottled(Self.chrome)
 
         let reason = "Chrome quit but could not be relaunched: LSOpenURLsWithRole() failed with error -10810. Open it yourself."
-        XCTAssertEqual(source.relaunchProblem, reason)
+        XCTAssertEqual(source.relaunchProblems, [reason])
         let items = StatusItemController.menuItems(manager: h.makeManager(), status: source)
         // The scan after the relaunch lists whatever browsers this Mac is
         // running, so only the line itself is checked.
@@ -174,22 +174,118 @@ final class IntegrationWiringTests: XCTestCase {
             browser: BrowserThrottle(readArgs: { _ in "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" }, processes: processes)
         )
         await services.relaunchUnthrottled(Self.chrome)
-        XCTAssertNotNil(services.status.relaunchProblem)
+        XCTAssertNotNil(services.status.relaunchProblems["com.google.Chrome"])
 
         processes.quits = true
         processes.startWait = .pollsUntilCancelled
         let waiting = Task { await services.relaunchUnthrottled(Self.chrome) }
         await fulfillment(of: [processes.insideStartWait], timeout: 60)
-        XCTAssertNil(services.status.relaunchProblem, "a relaunch in progress still showed the last one's failure")
+        XCTAssertNil(services.status.relaunchProblems["com.google.Chrome"], "a relaunch in progress still showed the last one's failure")
         services.cancelBrowserTasks()
         await waiting.value
 
         processes.startWait = .appears
         processes.start(pid: 43)
-        services.status.relaunchProblem = "left by an earlier relaunch"
+        services.status.relaunchProblems["com.google.Chrome"] = "left by an earlier relaunch"
         await services.relaunchUnthrottled(Self.chrome)
-        XCTAssertNil(services.status.relaunchProblem)
+        XCTAssertEqual(services.status.relaunchProblems, [:])
         XCTAssertEqual(processes.launches.count, 2)
+    }
+
+    /// Two relaunches of the same browser overlap: the first still waits
+    /// for the browser to quit when the second relaunches it. The first
+    /// then ends without its quit. Its outcome is not the latest word on
+    /// that browser, so it leaves no line and posts nothing.
+    @MainActor
+    func testAnOlderRelaunchOfTheSameBrowserThatEndsLastIsDropped() async {
+        let home = TempHome()
+        defer { home.destroy() }
+        let notifier = RecordingNotifier()
+        let processes = FakeBrowserProcesses(pids: [42])
+        let services = Self.services(home: home, notifier: notifier, processes: processes)
+        processes.quits = false
+        processes.holdsNextQuit = true
+        let first = Task { await services.relaunchUnthrottled(Self.chrome) }
+        await fulfillment(of: [processes.insideQuitWait], timeout: 60)
+
+        processes.quits = true
+        await services.relaunchUnthrottled(Self.chrome)
+        processes.releaseQuit()
+        await first.value
+
+        XCTAssertEqual(processes.launches.count, 1, "the second relaunch opened the browser")
+        XCTAssertEqual(notifier.posts.map(\.body), [])
+        XCTAssertEqual(services.status.relaunchProblems, [:])
+    }
+
+    /// Relaunches of two browsers overlap and both stop short. Each is the
+    /// newest relaunch of its browser, so each keeps its own line, beside
+    /// a line an earlier relaunch of a third browser left, and each is
+    /// notified.
+    @MainActor
+    func testOverlappingRelaunchesOfTwoBrowsersEachKeepTheirLine() async {
+        let home = TempHome()
+        defer { home.destroy() }
+        let notifier = RecordingNotifier()
+        let processes = FakeBrowserProcesses(pids: [42])
+        processes.start(bundleId: "com.brave.Browser", pid: 50)
+        let services = Self.services(home: home, notifier: notifier, processes: processes)
+        services.status.relaunchProblems["com.microsoft.edgemac"] = "Edge is not running. Nothing was quit or relaunched."
+        processes.quits = false
+        processes.holdsNextQuit = true
+        let first = Task { await services.relaunchUnthrottled(Self.chrome) }
+        await fulfillment(of: [processes.insideQuitWait], timeout: 60)
+
+        processes.quits = true
+        processes.launchFailure = "boom"
+        await services.relaunchUnthrottled(ThrottledBrowser(bundleId: "com.brave.Browser", name: "Brave"))
+        processes.releaseQuit()
+        await first.value
+
+        let brave = "Brave quit but could not be relaunched: boom. Open it yourself."
+        let chrome = "Chrome did not quit within 10 s, so nothing was relaunched. It may still quit later. If it does, open it again yourself."
+        XCTAssertEqual(notifier.posts.map(\.body), [brave, chrome])
+        XCTAssertEqual(LiveStatusSource(services: services).relaunchProblems, [
+            brave, chrome, "Edge is not running. Nothing was quit or relaunched.",
+        ])
+    }
+
+    /// The session ends while a relaunch waits for the browser to quit.
+    /// `stop()` cancels the relaunch, but the wait for the quit goes on;
+    /// when it ends, its outcome belongs to a session that is over, so it
+    /// leaves no line, which a new session's menu would otherwise show,
+    /// and posts nothing.
+    @MainActor
+    func testARelaunchWhoseSessionEndedDuringTheQuitWaitReportsNothing() async {
+        let home = TempHome()
+        defer { home.destroy() }
+        let notifier = RecordingNotifier()
+        let processes = FakeBrowserProcesses(pids: [42])
+        let services = Self.services(home: home, notifier: notifier, processes: processes)
+        processes.quits = false
+        processes.holdsNextQuit = true
+        let relaunch = Task { await services.relaunchUnthrottled(Self.chrome) }
+        await fulfillment(of: [processes.insideQuitWait], timeout: 60)
+
+        services.cancelBrowserTasks()
+        processes.releaseQuit()
+        await relaunch.value
+
+        XCTAssertEqual(processes.terminated, [[42]])
+        XCTAssertEqual(notifier.posts.map(\.body), [])
+        XCTAssertEqual(services.status.relaunchProblems, [:])
+    }
+
+    @MainActor
+    private static func services(home: TempHome, notifier: RecordingNotifier, processes: FakeBrowserProcesses) -> AppServices {
+        AppServices(
+            paths: home.paths,
+            notifier: notifier,
+            audio: FakeAudioControl(),
+            processControl: FakeProcessControl(),
+            locationPermission: LocationPermission(authorizationStatus: .notDetermined),
+            browser: BrowserThrottle(readArgs: { _ in "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" }, processes: processes)
+        )
     }
 
     /// Without a delegate asking for them, macOS drops notifications while

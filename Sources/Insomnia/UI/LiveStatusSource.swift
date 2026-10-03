@@ -19,7 +19,9 @@ final class LiveStatusSource: StatusSource {
     var frozenCount: Int { services.status.frozenCount }
     var dockerPaused: Bool { services.status.dockerPaused }
     var throttledBrowsers: [ThrottledBrowser] { services.status.throttledBrowsers }
-    var relaunchProblem: String? { services.status.relaunchProblem }
+    var relaunchProblems: [String] {
+        services.status.relaunchProblems.sorted { $0.key < $1.key }.map(\.value)
+    }
     var locationPermission: LocationPermission { services.locationPermission }
 
     func refreshOnDemand() {

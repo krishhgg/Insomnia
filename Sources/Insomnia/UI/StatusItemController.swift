@@ -680,7 +680,7 @@ final class StatusItemController: NSObject {
                 lastGap: status.lastGap
             ),
             throttledBrowsers: status.throttledBrowsers,
-            relaunchProblem: status.relaunchProblem,
+            relaunchProblems: status.relaunchProblems,
             error: manager.lastError,
             foreignSleep: manager.foreignSleepWarning,
             lidSimulationBuild: LidSimulationBuild.isCompiledIn
