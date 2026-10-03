@@ -632,11 +632,20 @@ struct Harness {
     /// `lockTimeout` is short so contention tests fail closed quickly;
     /// `retryDelay` is long so the in-process retry never fires by accident;
     /// `reassertDelay` likewise, so the second display/keyboard write after
-    /// a restore never lands in a test that did not ask for it.
+    /// a restore never lands in a test that did not ask for it, and
+    /// `keptRecheckDelay` and `keptRecheckSlowDelay` for the re-read of a
+    /// kept brightness.
+    /// `display` and `keyboard` replace the harness fakes, for a device
+    /// the private-call guard refuses.
     func makeManager(
         lockTimeout: TimeInterval = 0.3,
         retryDelay: TimeInterval = 60,
-        reassertDelay: Duration = .seconds(3600)
+        reassertDelay: Duration = .seconds(3600),
+        keptRecheckDelay: Duration = .seconds(3600),
+        keptRecheckAttempts: Int = 20,
+        keptRecheckSlowDelay: Duration = .seconds(3600),
+        display: (any DisplayDimming)? = nil,
+        keyboard: (any KeyboardBacklighting)? = nil
     ) -> SessionManager {
         let c = clock
         let lid = clamshell
@@ -646,15 +655,18 @@ struct Harness {
             processControl: procs,
             backstop: backstop,
             audio: audio,
-            display: display,
-            keyboard: keyboard,
+            display: display ?? self.display,
+            keyboard: keyboard ?? self.keyboard,
             appNap: appNap,
             notifier: notifier,
             clamshell: { lid.closed },
             clock: { c.now },
             recoveryLockTimeout: lockTimeout,
             recoveryRetryDelay: retryDelay,
-            reassertDelay: reassertDelay
+            reassertDelay: reassertDelay,
+            keptRecheckDelay: keptRecheckDelay,
+            keptRecheckAttempts: keptRecheckAttempts,
+            keptRecheckSlowDelay: keptRecheckSlowDelay
         )
     }
 }

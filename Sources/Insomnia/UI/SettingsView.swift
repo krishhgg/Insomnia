@@ -147,6 +147,11 @@ struct SettingsView: View {
     private var lidSection: some View {
         Section {
             Toggle("Turn off the display and keyboard backlight", isOn: bind(\.darkenDisplayOnLidClose))
+            ForEach(manager.darkenRefusals, id: \.self) { reason in
+                Text(reason)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
             bundleList(
                 title: "Freeze while the lid is closed",
                 items: manager.config.freezeList,

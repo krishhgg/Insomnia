@@ -135,6 +135,42 @@ final class StoreTests: XCTestCase {
         XCTAssertTrue(st.isDirty)
     }
 
+    /// A saved brightness kept after a refused restore stays in the file
+    /// with its flag, flat for the scripts, and is not dirty. The flags are
+    /// written only while set, and a journal without them decodes as not
+    /// refused.
+    func testRefusedBrightnessRoundTripsAndIsNotDirty() throws {
+        var st = RuntimeState()
+        st.savedDisplayBrightness = 0.8
+        st.displayRestoreRefused = true
+        st.savedKeyboardBrightness = 0.3
+        st.keyboardRestoreRefused = true
+        try store.saveState(st)
+        XCTAssertEqual(try store.loadState(), st)
+        let text = try String(contentsOf: home.paths.stateFile, encoding: .utf8)
+        XCTAssertTrue(text.contains("\"displayRestoreRefused\" : true"), text)
+        XCTAssertTrue(text.contains("\"keyboardRestoreRefused\" : true"), text)
+        XCTAssertTrue(st.brightnessJournaled, "the open still wakes a display a close may have put to sleep")
+        XCTAssertTrue(st.hasRefusedBrightness)
+        XCTAssertFalse(st.hasLidActions)
+        XCTAssertFalse(st.isDirty)
+
+        st.keyboardRestoreRefused = false
+        XCTAssertTrue(st.isDirty, "an unflagged entry is still one to restore")
+
+        var plain = RuntimeState()
+        plain.savedDisplayBrightness = 0.5
+        try store.saveState(plain)
+        let plainText = try String(contentsOf: home.paths.stateFile, encoding: .utf8)
+        XCTAssertFalse(plainText.contains("RestoreRefused"), plainText)
+        XCTAssertFalse(try XCTUnwrap(try store.loadState()).displayRestoreRefused)
+
+        var flagOnly = RuntimeState()
+        flagOnly.displayRestoreRefused = true
+        XCTAssertFalse(flagOnly.hasRefusedBrightness, "a flag without a value keeps nothing")
+        XCTAssertFalse(flagOnly.isDirty)
+    }
+
     /// Reconcile keeps lid-close actions while the lid is closed; every
     /// entry a lid close can write must count, not only freezes and audio.
     func testHasLidActionsCoversEveryLidCloseEntry() throws {

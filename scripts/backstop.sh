@@ -39,6 +39,11 @@
 #                              and keyboard backlight the app set to 0 on lid
 #                              close; only the app can restore these (private
 #                              frameworks). Kept for the app's reconcile.
+#                              With displayRestoreRefused / keyboardRestore-
+#                              Refused true, the app's private-call guard
+#                              refused that restore on this macOS: kept, and
+#                              not dirty, since no run here or of that app
+#                              build can restore it.
 #       appNapOverrides     -> NSAppSleepDisabled the app set to YES in an
 #                              agent app's preferences, with the value it had
 #                              before: defaults write <bundleId>
@@ -253,7 +258,7 @@ journal_shape_problems() { # file
     echo "state.json is not a JSON object"
     return 0
   fi
-  for key in sleepDisabledByUs lowPowerSetByUs dockerFrozen savedMuted; do
+  for key in sleepDisabledByUs lowPowerSetByUs dockerFrozen savedMuted displayRestoreRefused keyboardRestoreRefused; do
     t="$(type_of "$f" "$key")"
     [[ -z "$t" || "$t" == bool || "$t" == "(any)" ]] || echo "$key is a $t, not a bool"
   done
@@ -450,7 +455,7 @@ if [[ "$journal_state" == malformed ]]; then
 fi
 
 sleep_held=false; low_power=false; docker_frozen=false; has_audio=0
-has_display=0; has_keyboard=0
+has_display=0; has_keyboard=0; refused_display=0; refused_keyboard=0
 frozen_count=0; legacy_count=0; app_nap_count=0
 if [[ "$journal_state" == clean ]]; then
   is_true "$STATE" sleepDisabledByUs && sleep_held=true
@@ -458,8 +463,12 @@ if [[ "$journal_state" == clean ]]; then
   is_true "$STATE" dockerFrozen && docker_frozen=true
   extract "$STATE" savedOutputVolume >/dev/null && has_audio=1
   extract "$STATE" savedMuted >/dev/null && has_audio=1
-  extract "$STATE" savedDisplayBrightness >/dev/null && has_display=1
-  extract "$STATE" savedKeyboardBrightness >/dev/null && has_keyboard=1
+  if extract "$STATE" savedDisplayBrightness >/dev/null; then
+    if is_true "$STATE" displayRestoreRefused; then refused_display=1; else has_display=1; fi
+  fi
+  if extract "$STATE" savedKeyboardBrightness >/dev/null; then
+    if is_true "$STATE" keyboardRestoreRefused; then refused_keyboard=1; else has_keyboard=1; fi
+  fi
   while extract_json "$STATE" "frozenProcesses.$frozen_count" >/dev/null; do
     frozen_count=$((frozen_count + 1))
   done
@@ -473,6 +482,17 @@ if [[ "$journal_state" == clean ]]; then
      || (( has_audio == 1 || has_display == 1 || has_keyboard == 1 || frozen_count > 0 || legacy_count > 0 || app_nap_count > 0 )); then
     journal_state=dirty
   fi
+fi
+
+# Brightness the app kept after its private-call guard refused the
+# restore: it stays in the journal for a build that can make the call, and
+# is not dirty, since neither this script nor that app build can restore it.
+refused_note=""
+if (( refused_display == 1 || refused_keyboard == 1 )); then
+  refused=()
+  (( refused_display == 1 )) && refused+=("saved display brightness")
+  (( refused_keyboard == 1 )) && refused+=("saved keyboard backlight")
+  refused_note="$(IFS=,; echo "${refused[*]}") kept: the app's private-call guard refused that restore on this macOS, so nothing here or in that app build can restore it; set the level with the brightness keys"
 fi
 
 # session.json that is not a session, or cannot be read. Its bytes are
@@ -519,6 +539,7 @@ if [[ "$journal_state" != dirty ]]; then
     log info "$session_note; nothing journaled to undo"
   fi
   if [[ "$session_state" == malformed || "$session_state" == unreadable ]]; then
+    [[ -n "$refused_note" ]] && log info "$refused_note"
     quarantine_session || exit 1
     exit 0
   fi
@@ -528,6 +549,7 @@ if [[ "$journal_state" != dirty ]]; then
     else
       log info "$session_note; journal already clean"
     fi
+    [[ -n "$refused_note" ]] && log info "$refused_note"
     "$RM" -f "$SESSION"
   fi
   exit 0
@@ -738,6 +760,7 @@ if (( has_audio == 1 || has_display == 1 || has_keyboard == 1 )); then
   log error "$(IFS=,; echo "${pending[*]}") can only be restored by the app; kept. Open Insomnia"
   failures+=("saved audio, display brightness or keyboard backlight settings need the app: open Insomnia to restore them")
 fi
+[[ -n "$refused_note" ]] && log info "$refused_note"
 
 # --- Publish -----------------------------------------------------------------
 # Edit a private copy, verify it, then rename it over state.json so readers

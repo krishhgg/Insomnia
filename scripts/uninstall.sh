@@ -10,6 +10,10 @@
 # If anything Insomnia changed is still journaled, nothing is removed: the
 # LaunchAgent keeps retrying every minute, the sudoers rule keeps pmset
 # undoable, and state.json keeps the evidence. The message says what to do.
+# A brightness the app kept because its private-call guard refused the
+# restore on this macOS does not stop the uninstall, since nothing here can
+# restore it; state.json is kept, even with --purge, so a later Insomnia
+# that can make the call restores it at launch.
 #
 # Deletion is by exact owned file, never by directory tree: --purge removes
 # the files Insomnia writes (see Paths.swift), the session.json copies the
@@ -189,7 +193,7 @@ journal_shape_problems() { # file
     echo "state.json is not a JSON object"
     return 0
   fi
-  for key in sleepDisabledByUs lowPowerSetByUs dockerFrozen savedMuted; do
+  for key in sleepDisabledByUs lowPowerSetByUs dockerFrozen savedMuted displayRestoreRefused keyboardRestoreRefused; do
     t="$(type_of "$f" "$key")"
     [[ -z "$t" || "$t" == bool || "$t" == "(any)" ]] || echo "$key is a $t, not a bool"
   done
@@ -248,6 +252,24 @@ journal_shape_problems() { # file
         i=$((i + 1))
       done
     fi
+  fi
+}
+
+is_refused() { # key
+  [[ "$(extract "$STATE" "$1" || true)" == "true" ]]
+}
+
+# Brightness the app kept after its private-call guard refused the restore
+# on this macOS, one line per device with the saved level. Not a problem
+# for uninstall: no step here can restore it.
+refused_brightness() {
+  local value
+  [[ -f "$STATE" ]] || return 0
+  if is_refused displayRestoreRefused && value="$(extract "$STATE" savedDisplayBrightness)"; then
+    echo "display brightness $value"
+  fi
+  if is_refused keyboardRestoreRefused && value="$(extract "$STATE" savedKeyboardBrightness)"; then
+    echo "keyboard backlight $value"
   fi
 }
 
@@ -362,10 +384,10 @@ journal_problems() {
   if extract "$STATE" savedOutputVolume >/dev/null || extract "$STATE" savedMuted >/dev/null; then
     echo "saved audio settings (volume/mute) are not restored; only the app can do that"
   fi
-  if extract "$STATE" savedDisplayBrightness >/dev/null; then
+  if extract "$STATE" savedDisplayBrightness >/dev/null && ! is_refused displayRestoreRefused; then
     echo "saved display brightness is not restored; only the app can do that"
   fi
-  if extract "$STATE" savedKeyboardBrightness >/dev/null; then
+  if extract "$STATE" savedKeyboardBrightness >/dev/null && ! is_refused keyboardRestoreRefused; then
     echo "saved keyboard backlight is not restored; only the app can do that"
   fi
   value="$(extract_json "$STATE" appNapOverrides || true)"
@@ -596,6 +618,17 @@ if (( ${#problems[@]} > 0 )); then
   abort_incomplete "$recovery_rc" "${problems[@]}"
 fi
 echo "journal clean"
+kept_brightness=()
+while IFS= read -r line; do
+  [[ -n "$line" ]] && kept_brightness+=("$line")
+done < <(refused_brightness)
+if (( ${#kept_brightness[@]} > 0 )); then
+  echo "Not restored, and kept in $STATE:"
+  for line in "${kept_brightness[@]}"; do echo "  - $line"; done
+  echo "Insomnia's private-call guard refused that restore on this macOS, so nothing here can"
+  echo "make it. Set the level with the brightness keys or Control Center. The file stays so a"
+  echo "later Insomnia that can make the call restores it at launch."
+fi
 if app_running; then
   echo "Insomnia started again; quit it and rerun. Nothing was removed." >&2
   exit 1
@@ -640,8 +673,9 @@ step "Removing app bundle"
 
 if (( PURGE == 1 )); then
   step "Purging Insomnia's files in $APP_SUPPORT and $LOG_DIR"
-  remove_owned "$SESSION" "$STATE" "$APP_SUPPORT/config.json" "$APP_SUPPORT/backstop.sh" \
+  remove_owned "$SESSION" "$APP_SUPPORT/config.json" "$APP_SUPPORT/backstop.sh" \
         "$LOG_DIR/insomnia.log" "$LOG_DIR/handoffs.log"
+  (( ${#kept_brightness[@]} > 0 )) || remove_owned "$STATE"
   collect_moved_aside_sessions
   if (( ${#MOVED_ASIDE[@]} > 0 )); then
     remove_owned "${MOVED_ASIDE[@]}"
@@ -661,7 +695,8 @@ if (( PURGE == 1 )); then
   echo "Kept $LOCK (the recovery lock is never unlinked; delete $APP_SUPPORT by hand if you want it gone)."
   [[ -d "$LOG_DIR" ]] && echo "Kept $LOG_DIR: it still holds files Insomnia did not create."
 else
-  remove_owned "$APP_SUPPORT/backstop.sh" "$SESSION" "$STATE"
+  remove_owned "$APP_SUPPORT/backstop.sh" "$SESSION"
+  (( ${#kept_brightness[@]} > 0 )) || remove_owned "$STATE"
   echo "Kept $APP_SUPPORT/config.json and $LOG_DIR (use --purge to remove)."
   collect_moved_aside_sessions
   if (( ${#MOVED_ASIDE[@]} > 0 )); then
@@ -673,6 +708,7 @@ else
     done
   fi
 fi
+(( ${#kept_brightness[@]} == 0 )) || echo "Kept $STATE: it holds the brightness listed above."
 
 if (( remove_failures > 0 )); then
   echo "Done, except $remove_failures file(s) that could not be removed (named above)." >&2

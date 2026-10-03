@@ -137,7 +137,14 @@ final class LidActions {
             }
             try manager.journal { s in
                 // Keep an earlier save if a previous close was never undone.
-                if s.savedDisplayBrightness == nil { s.savedDisplayBrightness = value }
+                // One kept after a refused restore gives way to a level
+                // above 0: the user was told to set it by hand, so that is
+                // the level to come back to. The device answered, so the
+                // entry is an ordinary one again.
+                if s.savedDisplayBrightness == nil || (s.displayRestoreRefused && value > 0) {
+                    s.savedDisplayBrightness = value
+                }
+                s.displayRestoreRefused = false
             }
             do {
                 try display.setBrightness(0)
@@ -163,7 +170,11 @@ final class LidActions {
                 }
                 if let value {
                     try manager.journal { s in
-                        if s.savedKeyboardBrightness == nil { s.savedKeyboardBrightness = value }
+                        // As for the display above.
+                        if s.savedKeyboardBrightness == nil || (s.keyboardRestoreRefused && value > 0) {
+                            s.savedKeyboardBrightness = value
+                        }
+                        s.keyboardRestoreRefused = false
                     }
                     do {
                         try keyboard.setBrightness(0)
@@ -181,6 +192,14 @@ final class LidActions {
             Log.error("keyboard backlight on lid close skipped: \(error.localizedDescription)")
         }
 
+        // The wake that undoes this request runs on open, and on reconcile
+        // after a relaunch, only for a journaled brightness. With nothing
+        // journaled (both devices refused or unreadable) nothing would wake
+        // a panel this put to sleep, so it is not asked to sleep.
+        guard manager.state.brightnessJournaled else {
+            Log.info("display sleep not requested: no display or keyboard brightness is journaled, so nothing would wake the display on open")
+            return
+        }
         do {
             try display.requestSleep()
             Log.info("display sleep requested")

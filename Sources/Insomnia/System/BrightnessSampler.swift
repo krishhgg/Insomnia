@@ -37,12 +37,16 @@ final class BrightnessSampler {
     private let clock: @Sendable () -> Date
     private let maxIdle: Double
 
-    /// While true, display readings are not taken: Insomnia's own Low Power
-    /// Mode is on and the panel reads the mode's rescaled value, not the
-    /// user's, so the sample taken just before the mode went on is kept.
-    /// The keyboard is unaffected. Wired to the session journal's Low Power
-    /// ownership by `AppServices`.
+    /// While true, display readings are not taken. Either Insomnia's own
+    /// Low Power Mode is on and the panel reads the mode's rescaled value,
+    /// not the user's, so the sample taken just before the mode went on is
+    /// kept; or the journal holds a saved display brightness, so the panel
+    /// reads the 0 a lid close left or a level not yet decided. Wired to
+    /// the session journal by `follow`.
     var displayHeld: () -> Bool = { false }
+    /// The same for the keyboard backlight: true while the journal holds a
+    /// saved keyboard brightness.
+    var keyboardHeld: () -> Bool = { false }
 
     private(set) var last: BrightnessSample?
 
@@ -83,15 +87,28 @@ final class BrightnessSampler {
         if !displayHeld(), displayReadIsTrusted, let value = try? display.readBrightness() {
             taken.display = value
         }
-        if keyboardReadIsTrusted, let value = (try? keyboard.readBrightness()) ?? nil {
+        if !keyboardHeld(), keyboardReadIsTrusted, let value = (try? keyboard.readBrightness()) ?? nil {
             taken.keyboard = value
         }
         guard taken.display != nil || taken.keyboard != nil else { return nil }
+        merge(taken)
+        return taken
+    }
+
+    /// A level known to be the user's without a reading of its own: one
+    /// written from the journal, or one that a kept value's trusted
+    /// reading found set since. Taken even while the device is held, since
+    /// the hold only keeps out readings that may not be the user's.
+    func record(display: Float?, keyboard: Float?) {
+        guard display != nil || keyboard != nil else { return }
+        merge(BrightnessSample(display: display, keyboard: keyboard, takenAt: clock()))
+    }
+
+    private func merge(_ taken: BrightnessSample) {
         var merged = last ?? taken
         merged.takenAt = taken.takenAt
         if let value = taken.display { merged.display = value }
         if let value = taken.keyboard { merged.keyboard = value }
         last = merged
-        return taken
     }
 }

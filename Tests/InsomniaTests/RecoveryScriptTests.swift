@@ -272,6 +272,71 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(fx.log().contains("journal cleared"), fx.log())
     }
 
+    /// A brightness the app kept because its private-call guard refused
+    /// the restore on this macOS is kept here too, with its flag, but does
+    /// not keep the journal dirty: the rest is undone, the run succeeds,
+    /// and the log says why the value stays instead of asking to open the
+    /// app, which could not restore it either.
+    func testRefusedBrightnessIsKeptWithoutKeepingTheJournalDirty() throws {
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"savedDisplayBrightness":0.75,"displayRestoreRefused":true,"savedKeyboardBrightness":0.25,"keyboardRestoreRefused":true}"#)
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 0, r.stderr + fx.log())
+        XCTAssertEqual(fx.calls().count, 1, fx.calls().description)
+        XCTAssertTrue(fx.calls().first?.hasSuffix("pmset -a disablesleep 0") ?? false, fx.calls().description)
+        let s = try fx.stateJSON()
+        XCTAssertEqual(s["sleepDisabledByUs"] as? Bool, false)
+        XCTAssertEqual(s["savedDisplayBrightness"] as? Double, 0.75)
+        XCTAssertEqual(s["displayRestoreRefused"] as? Bool, true)
+        XCTAssertEqual(s["savedKeyboardBrightness"] as? Double, 0.25)
+        XCTAssertEqual(s["keyboardRestoreRefused"] as? Bool, true)
+        XCTAssertTrue(fx.log().contains("saved display brightness,saved keyboard backlight kept: the app's private-call guard refused that restore on this macOS"), fx.log())
+        XCTAssertFalse(fx.log().contains("Open Insomnia"), fx.log())
+        XCTAssertFalse(fx.log().contains("[error]"), fx.log())
+    }
+
+    /// Only refused brightness left: the journal counts as clean, an
+    /// expired session is removed, nothing privileged runs, and with no
+    /// session the periodic run exits 0 without a word, instead of failing
+    /// every minute for something it can never restore.
+    func testRefusedBrightnessAloneIsNotDirty() throws {
+        let json = #"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"savedDisplayBrightness":0.6,"displayRestoreRefused":true}"#
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        try fx.writeState(json)
+
+        let expired = try fx.run(fx.backstop)
+
+        XCTAssertEqual(expired.status, 0, expired.stderr + fx.log())
+        XCTAssertEqual(fx.calls(), [])
+        XCTAssertFalse(fx.exists(fx.session))
+        XCTAssertEqual(try String(contentsOf: fx.state, encoding: .utf8), json, "the journal is not rewritten")
+        XCTAssertTrue(fx.log().contains("journal already clean"), fx.log())
+        XCTAssertTrue(fx.log().contains("saved display brightness kept: the app's private-call guard refused that restore"), fx.log())
+
+        let before = fx.log()
+        let periodic = try fx.run(fx.backstop)
+
+        XCTAssertEqual(periodic.status, 0, periodic.stderr + fx.log())
+        XCTAssertEqual(fx.calls(), [])
+        XCTAssertEqual(fx.log(), before, "nothing to report on a run with nothing to do")
+    }
+
+    /// The flag covers only its own device: an unflagged keyboard entry
+    /// next to a refused display still needs the app.
+    func testAnUnflaggedEntryNextToARefusedOneStillNeedsTheApp() throws {
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"savedDisplayBrightness":0.6,"displayRestoreRefused":true,"savedKeyboardBrightness":0.4}"#)
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertNotEqual(r.status, 0, r.stderr + fx.log())
+        XCTAssertTrue(fx.log().contains("saved keyboard backlight can only be restored by the app; kept. Open Insomnia"), fx.log())
+        XCTAssertTrue(fx.log().contains("saved display brightness kept: the app's private-call guard refused"), fx.log())
+        XCTAssertEqual(try fx.stateJSON()["savedKeyboardBrightness"] as? Double, 0.4)
+    }
+
     // MARK: App Nap
 
     /// `NSAppSleepDisabled` the app set for agent apps is put back with the
@@ -489,6 +554,24 @@ final class RecoveryScriptTests: XCTestCase {
         let again = try fx.run(fx.backstop)
         XCTAssertEqual(again.status, 0, again.stderr)
         XCTAssertEqual(try movedAsideSessions(), [name], "a second run moved something else")
+    }
+
+    /// A brightness kept after a refused restore is not dirty, so it does
+    /// not hold back the move; it stays in the journal, and the log says
+    /// why, as it does when an expired session is removed.
+    func testMalformedSessionNextToARefusedBrightnessIsMovedAsideAndTheValueKept() throws {
+        let json = #"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"savedDisplayBrightness":0.6,"displayRestoreRefused":true}"#
+        try "not json".write(to: fx.session, atomically: true, encoding: .utf8)
+        try fx.writeState(json)
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 0, r.stderr + fx.log())
+        XCTAssertEqual(fx.calls(), [])
+        XCTAssertFalse(fx.exists(fx.session), "session.json left in place")
+        XCTAssertEqual(try movedAsideSessions().count, 1)
+        XCTAssertEqual(try String(contentsOf: fx.state, encoding: .utf8), json, "the journal is not rewritten")
+        XCTAssertTrue(fx.log().contains("saved display brightness kept: the app's private-call guard refused that restore"), fx.log())
     }
 
     /// While the journal stays dirty the file stays too: the next run must
@@ -1138,6 +1221,33 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(r.stderr.contains("open Insomnia.app"), r.stderr)
     }
 
+    /// A brightness the app kept after a refused restore does not stop the
+    /// uninstall, since nothing can restore it on this macOS, but
+    /// state.json stays, even with --purge, so a later Insomnia that can
+    /// make the call restores it. The output names the level to set.
+    func testUninstallCompletesPastARefusedBrightnessAndKeepsTheJournal() throws {
+        for purge in [false, true] {
+            let f = try ScriptFixture()
+            defer { f.destroy() }
+            try f.installMachinery()
+            try f.writeConfig(#"{"agentList":[]}"#)
+            try f.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"savedDisplayBrightness":0.6,"displayRestoreRefused":true}"#)
+
+            let r = try f.run(f.uninstall, purge ? ["--purge"] : [])
+
+            XCTAssertEqual(r.status, 0, "purge \(purge): " + r.stderr + r.stdout)
+            XCTAssertFalse(f.exists(f.plist), "purge \(purge)")
+            XCTAssertFalse(f.exists(f.app), "purge \(purge)")
+            XCTAssertTrue(f.exists(f.state), "purge \(purge)")
+            XCTAssertEqual(try f.stateJSON()["savedDisplayBrightness"] as? Double, 0.6)
+            XCTAssertEqual(try f.stateJSON()["displayRestoreRefused"] as? Bool, true)
+            XCTAssertEqual(f.exists(f.config), !purge, "purge \(purge)")
+            XCTAssertTrue(r.stdout.contains("  - display brightness 0.6"), r.stdout)
+            XCTAssertTrue(r.stdout.contains("Set the level with the brightness keys or Control Center"), r.stdout)
+            XCTAssertTrue(r.stdout.contains("Kept \(f.state.path): it holds the brightness listed above."), r.stdout)
+        }
+    }
+
     func testUninstallAbortsOnSavedDisplayBrightnessAndExplainsReopeningTheApp() throws {
         try fx.installMachinery()
         try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"savedDisplayBrightness":0.6}"#)
@@ -1547,6 +1657,8 @@ final class RecoveryScriptTests: XCTestCase {
             #"{"sleepDisabledByUs":false,"savedMuted":1}"#,
             #"{"sleepDisabledByUs":false,"savedDisplayBrightness":"bright"}"#,
             #"{"sleepDisabledByUs":false,"savedKeyboardBrightness":true}"#,
+            #"{"sleepDisabledByUs":false,"savedDisplayBrightness":0.5,"displayRestoreRefused":"yes"}"#,
+            #"{"sleepDisabledByUs":false,"savedKeyboardBrightness":0.5,"keyboardRestoreRefused":1}"#,
             #"{"sleepDisabledByUs":false,"appNapOverrides":"com.google.Chrome"}"#,
             #"{"sleepDisabledByUs":false,"appNapOverrides":["com.google.Chrome"]}"#,
             #"{"sleepDisabledByUs":false,"appNapOverrides":[{"previous":true}]}"#,
@@ -1606,6 +1718,7 @@ final class RecoveryScriptTests: XCTestCase {
             #"{"sleepDisabledByUs":"true"}"#,
             #"{"sleepDisabledByUs":false,"frozenProcesses":"garbage"}"#,
             #"{"sleepDisabledByUs":false,"savedDisplayBrightness":"bright"}"#,
+            #"{"sleepDisabledByUs":false,"savedDisplayBrightness":0.5,"displayRestoreRefused":"yes"}"#,
             #"{"sleepDisabledByUs":false,"appNapOverrides":[{"previous":true}]}"#,
         ] {
             let f = try ScriptFixture()
