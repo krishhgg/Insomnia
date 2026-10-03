@@ -338,7 +338,9 @@ provided by the standalone backstop. Performance effects depend on workload.
 - Each outage is logged with start, end, and gap length to
   `~/Library/Logs/Insomnia/handoffs.log`. The menu shows the last gap.
   Like `insomnia.log`, the file is owner-only (0600) and is renamed to
-  `handoffs.log.1` once it passes 1 MiB (`OwnerOnly.swift`).
+  `handoffs.log.1` once it passes 1 MiB (`OwnerOnly.swift`). A log the user
+  replaced with a symlink is never rotated, so the cap does not hold for it:
+  the file it points to is the user's to manage.
 - Path satisfied again after a gap longer than `nudgeThreshold` (default 90 s):
   - For every tagged tmux target (`session:window.pane`), run
     `tmux send-keys -t <target> "continue" Enter`.

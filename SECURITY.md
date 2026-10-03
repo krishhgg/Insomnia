@@ -20,7 +20,8 @@ body marked private, so programs reading `log show` see `<private>` instead of
 those names unless private data logging is enabled on the Mac. The files
 Insomnia creates (logs, journal, session, config, recovery lock) are mode 0600
 and its directories 0700; the backstop runs with `umask 077`. Logs are capped at
-1 MiB with one older copy kept. Hotspot passwords are stored in the login
+1 MiB with one older copy kept. A log the user replaced with a symlink is not
+rotated: the file it points to is the user's to manage. Hotspot passwords are stored in the login
 Keychain. Location Services access is requested only when a hotspot is saved or
 a session starts with one configured; it is used to read Wi-Fi network names and
 the app never requests location updates. With the App Nap setting on (off by

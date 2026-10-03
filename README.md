@@ -61,7 +61,7 @@ four power-setting commands. Review that permission before installing.
 | `~/Applications/Insomnia.app` | The menu bar app |
 | `~/Library/Application Support/Insomnia/` | Configuration, session/recovery journals, and `backstop.sh` |
 | `~/Library/LaunchAgents/com.insomnia.backstop.plist` | Per-user recovery agent |
-| `~/Library/Logs/Insomnia/` | `insomnia.log` and `handoffs.log`, each capped at 1 MiB with one older copy kept as `.1` |
+| `~/Library/Logs/Insomnia/` | `insomnia.log` and `handoffs.log`, each capped at 1 MiB with one older copy kept as `.1`, unless you replace it with a symlink |
 | `/etc/sudoers.d/insomnia` | Permission for the four commands below |
 
 ```text
@@ -290,7 +290,11 @@ time the app or the backstop opens it. The LaunchAgent plist and the installed
 scripts hold no private data and keep the modes the installer gives them.
 `insomnia.log` and `handoffs.log` are capped at 1 MiB: a
 log past the cap is renamed to `insomnia.log.1` or `handoffs.log.1`,
-replacing the previous copy, and a new file starts.
+replacing the previous copy, and a new file starts. The cap does not apply
+to a log you replace with a symlink. Insomnia writes through the link and
+never rotates it, since the rename would move the link and not the file it
+points to, and it logs that once. You set up the link, so trimming the file
+it points to is up to you.
 
 `INSOMNIA_HOME` relocates app support files, logs, and LaunchAgents for testing.
 It is **not an installation sandbox**: installation/removal also involves the

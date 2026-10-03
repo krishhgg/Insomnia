@@ -21,13 +21,16 @@ import Foundation
 /// file held is still the one at the path, so two processes that both find
 /// the log oversized cannot rotate it twice and rename the fresh log over
 /// the retained copy. A log that is a symlink is never rotated, since the
-/// rename would move the link itself; that is reported once. The backstop
-/// appends with `>>` and never rotates, so it simply creates the fresh file.
+/// rename would move the link itself; that is reported once, and the cap
+/// does not hold for it. The user set up the link, so the file it points to
+/// is theirs to trim. The backstop appends with `>>` and never rotates, so
+/// it simply creates the fresh file.
 enum OwnerOnly {
     static let fileMode: mode_t = 0o600
     static let directoryMode: mode_t = 0o700
     /// 1 MiB. Insomnia writes a few lines a minute at most, so this is weeks
-    /// of history, and `.1` doubles it.
+    /// of history, and `.1` doubles it. Not enforced for a symlinked log;
+    /// see above.
     static let maxLogBytes: UInt64 = 1 << 20
 
     /// Creates `dir` and any missing parents, then makes `dir` itself 0700.
