@@ -1,7 +1,7 @@
 import Darwin
 import Foundation
 
-/// `Insomnia --resume-frozen <pid> <startedAt> <startedAtMicros> <bootSession> [...]`
+/// `Insomnia --resume-frozen`, journal entries on standard input
 ///
 /// One-shot mode for backstop.sh. The shell can read a process's start time
 /// only to the second (`ps -o lstart`), so for the journal entries that
@@ -13,8 +13,11 @@ import Foundation
 /// runs: no AppKit, no journal, no lock (the caller holds the recovery
 /// lock and rewrites the journal from the answer).
 ///
-/// The arguments are groups of four fields, one group per entry. Prints
-/// one line per entry, in argument order, `<pid> <word>`:
+/// Standard input holds one entry per line, `<pid> <startedAt>
+/// <startedAtMicros> <bootSession>`: four fields, one space between them,
+/// every line ending in a newline. Standard input has no size limit, unlike
+/// the argument list (ARG_MAX), so a journal of any length fits in one
+/// call. Prints one line per entry, in input order, `<pid> <word>`:
 ///
 ///     resumed       identity matched, the process was stopped, SIGCONT delivered
 ///     gone          no such pid, running, or a different process: nothing to do
@@ -22,11 +25,12 @@ import Foundation
 ///     unobserved    the kernel would not say what the pid is; try again later
 ///     unverifiable  the fallthrough for an answer with no boot session to compare; never signaled
 ///
-/// Exits 0 when every entry is `resumed` or `gone`, 1 when any is not. Wrong
-/// arguments print the single line `usage` (details on stderr), check
-/// nothing, and exit 64. The shell clears an entry on `resumed` and `gone`
-/// and keeps it otherwise, and keeps every entry when the answer is not
-/// exactly this shape.
+/// Exits 0 when every entry is `resumed` or `gone`, 1 when any is not. Any
+/// argument after the flag, empty input, or a malformed line prints the
+/// single line `usage` (details on stderr), checks nothing, and exits 64.
+/// The shell clears an entry on `resumed` and `gone` and keeps it
+/// otherwise, and keeps every entry when the answer is not exactly this
+/// shape.
 enum ResumeFrozenCommand {
     static let flag = "--resume-frozen"
     /// EX_USAGE from sysexits(3).
@@ -45,11 +49,18 @@ enum ResumeFrozenCommand {
     }
 
     /// nil when `arguments` (the command line without the executable) do
-    /// not ask for this mode.
-    static func run(_ arguments: [String], control: any ProcessSignaling = SignalProcessControl()) -> Output? {
+    /// not ask for this mode. `input` is read only once they do.
+    static func run(
+        _ arguments: [String],
+        input: () -> Data = { FileHandle.standardInput.readDataToEndOfFile() },
+        control: any ProcessSignaling = SignalProcessControl()
+    ) -> Output? {
         guard arguments.first == flag else { return nil }
-        guard let entries = parse(Array(arguments.dropFirst())) else {
-            FileHandle.standardError.write(Data("usage: Insomnia \(flag) <pid> <startedAt> <startedAtMicros> <bootSession> [<pid> <startedAt> <startedAtMicros> <bootSession> ...]\n".utf8))
+        guard arguments.count == 1,
+              let text = String(data: input(), encoding: .utf8),
+              let entries = parse(text)
+        else {
+            FileHandle.standardError.write(Data("usage: Insomnia \(flag) < entries, one line each: <pid> <startedAt> <startedAtMicros> <bootSession>\n".utf8))
             return Output(lines: ["usage"], status: usageStatus)
         }
         var lines: [String] = []
@@ -63,13 +74,16 @@ enum ResumeFrozenCommand {
         return Output(lines: lines, status: settled ? 0 : 1)
     }
 
-    /// The journal entries the arguments describe, in order; nil unless
-    /// there is at least one group and every group of four is well formed.
-    static func parse(_ fields: [String]) -> [FrozenProcess]? {
-        guard !fields.isEmpty, fields.count % 4 == 0 else { return nil }
+    /// The journal entries the input describes, in order; nil unless it has
+    /// at least one line, every line ends in a newline, and every line is
+    /// four well-formed fields with one space between them.
+    static func parse(_ text: String) -> [FrozenProcess]? {
+        let scalars = text.unicodeScalars
+        guard scalars.last == "\n" else { return nil }
         var entries: [FrozenProcess] = []
-        for start in stride(from: 0, to: fields.count, by: 4) {
-            guard let entry = entry(Array(fields[start..<start + 4])) else { return nil }
+        for line in scalars.dropLast().split(separator: "\n", omittingEmptySubsequences: false) {
+            let fields = line.split(separator: " ", omittingEmptySubsequences: false).map { String($0) }
+            guard let entry = entry(fields) else { return nil }
             entries.append(entry)
         }
         return entries
@@ -77,13 +91,14 @@ enum ResumeFrozenCommand {
 
     /// One entry from its four fields; nil unless the pid is positive, the
     /// start second non-negative, the microseconds below one million and
-    /// the boot session non-empty.
+    /// the boot session non-empty without white space.
     static func entry(_ fields: [String]) -> FrozenProcess? {
         guard fields.count == 4,
               let pid = Int32(fields[0]), pid > 0,
               let startedAt = Int64(fields[1]), startedAt >= 0,
               let micros = Int32(fields[2]), (0..<1_000_000).contains(micros),
-              !fields[3].isEmpty
+              !fields[3].isEmpty,
+              !fields[3].unicodeScalars.contains(where: { CharacterSet.whitespacesAndNewlines.contains($0) })
         else { return nil }
         return FrozenProcess(pid: pid, identity: ProcessIdentity(startedAt: startedAt, startedAtMicros: micros, bootSession: fields[3]))
     }

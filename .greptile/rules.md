@@ -95,8 +95,15 @@ Flag a change that breaks one of these; do not flag the behavior itself.
   is killed with SIGKILL when SIGTERM plus 3 s does not end it, unlike
   `run_bounded`: it is the user's own unprivileged binary, and once SIGKILL
   is delivered it runs no more code, so it cannot signal anything later.
-  It runs without fd 9, so it never holds the lock. A timeout, or any
-  answer that is not exactly one `<pid> <word>` line per entry with a
+  The backstop shell starts the binary as its own background job, with no
+  supervisor process in between, and signals it with the shell builtin
+  `kill %+` after checking that `%+` is that pid. Bash reaps the child by
+  itself, so a signal by pid could reach a reused pid; a jobspec signal is
+  sent only while bash has not reaped the child. This is the bounded-call
+  exception in the fixed-path rule, so it is not `$KILL`. The entries go on
+  standard input, one line each, so no journal size can exceed the argument
+  limit. It runs without fd 9, so it never holds the lock. A timeout, or
+  any answer that is not exactly one `<pid> <word>` line per entry with a
   matching exit status, keeps every entry of the call.
 - `backstop.sh`, kept entries. Saved audio, saved display and keyboard
   brightness, and `displayRestoredUnderLowPower` are kept for the app, not

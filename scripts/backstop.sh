@@ -27,7 +27,8 @@
 #                              process the app froze. Entries that record
 #                              startedAtMicros are handed to the installed
 #                              app binary (INSOMNIA_BIN --resume-frozen) in
-#                              one call with a time limit. For each entry in
+#                              one call with a time limit, one line per
+#                              entry on its standard input. For each entry in
 #                              turn it does one kernel lookup (start time to
 #                              the microsecond, boot session, stopped state)
 #                              immediately followed by that entry's SIGCONT;
@@ -114,6 +115,7 @@ MKDIR=/bin/mkdir
 RM=/bin/rm
 MV=/bin/mv
 CP=/bin/cp
+MKTEMP=/usr/bin/mktemp
 # The installed app binary, for the microsecond identity check of
 # frozenProcesses entries (see above). A fixed path like the tools, never
 # PATH. install.sh puts the bundle here.
@@ -259,65 +261,68 @@ run_bounded() { # command args...
 }
 
 # Run the app binary's --resume-frozen check (see resume_via_app) with the
-# same time limit, its standard output saved to app_answer_file. Unlike a
-# power command this is our own unprivileged binary, so when SIGTERM does not
-# end it within KILL_GRACE_SECONDS it gets SIGKILL: from then on it runs no
-# more of its own code and so cannot send another signal. Neither the binary
-# nor its supervisor gets fd 9, so a binary the kernel has not reaped yet
-# cannot hold the recovery lock after this run ends. Its files live in a
-# fresh private directory (app_answer_dir), so a late write from an earlier
-# run's supervisor cannot land in this one's. Returns the binary's exit
-# status, 124 when it did not finish in time, or 125 when it could not be
-# started. The caller removes app_answer_dir.
+# same time limit, standard input from app_answer_dir/in and standard output
+# to app_answer_dir/out. This shell starts the binary as its own background
+# job and is the only process that signals it; no supervisor stands between
+# them. Bash reaps a finished child on its own (in its SIGCHLD handler), so a
+# signal sent by pid could reach whatever process gets that pid next. Each
+# signal therefore names the job (%+) once signal_job has checked that %+ is
+# this pid: bash's kill looks the job up with SIGCHLD blocked and signals it
+# only if bash has not reaped it yet, and a child that has not been reaped
+# keeps its pid, as a zombie at worst. The exit status is read with wait only
+# after the job has left bash's running list. Unlike a power command this is
+# our own unprivileged binary, so when SIGTERM does not end it within
+# KILL_GRACE_SECONDS it gets SIGKILL: from then on it runs no more of its own
+# code and so cannot send another signal. The binary does not get fd 9, so
+# one the kernel has not reaped yet cannot hold the recovery lock after this
+# run ends. Returns the binary's exit status, or 124 when it did not finish
+# in time. The function's stderr is /dev/null because bash reports a job
+# that a signal ended ("Terminated: 15") on its own stderr; the log says what
+# happened instead.
 app_answer_dir=""
-app_answer_file=""
+job_running() { # pid
+  local p
+  for p in $(jobs -rp); do
+    [[ "$p" == "$1" ]] && return 0
+  done
+  return 1
+}
+# True once job pid $1 has left bash's running list; polls for $2 seconds.
+wait_for_job() { # pid seconds
+  local i
+  for (( i = 0; i < $2 * 10; i++ )); do
+    job_running "$1" || return 0
+    sleep 0.1
+  done
+  ! job_running "$1"
+}
+signal_job() { # signal pid
+  [[ "$(jobs -p %+)" == "$2" ]] || return 1
+  kill -"$1" %+
+}
 run_app_bounded() { # command args...
-  local cpid rc pidfile rcfile supervisor
-  app_answer_file=""
-  # Directories left by an earlier run that was itself killed mid-call.
-  rm -rf "$APP_SUPPORT"/.backstop-resume.*
-  if ! app_answer_dir="$(mktemp -d "$APP_SUPPORT/.backstop-resume.XXXXXX" 2>/dev/null)"; then
-    app_answer_dir=""
-    log error "could not create a private directory in $APP_SUPPORT for the app binary's answer"
-    return 125
-  fi
-  pidfile="$app_answer_dir/pid"
-  rcfile="$app_answer_dir/rc"
-  app_answer_file="$app_answer_dir/out"
-  (
-    "$@" </dev/null >"$app_answer_file" 2>/dev/null &
-    cpid=$!
-    echo "$cpid" > "$pidfile"
-    rc=0
+  local cpid rc=0
+  "$@" <"$app_answer_dir/in" >"$app_answer_dir/out" 9>&- &
+  cpid=$!
+  if wait_for_job "$cpid" "$COMMAND_TIMEOUT_SECONDS"; then
     wait "$cpid" || rc=$?
-    echo "$rc" > "$rcfile"
-  ) </dev/null >/dev/null 2>&1 9>&- &
-  supervisor=$!
-  if wait_for_status "$rcfile" "$COMMAND_TIMEOUT_SECONDS"; then
-    rc="$(cat "$rcfile")"
-    wait "$supervisor" 2>/dev/null || true
     return "$rc"
   fi
-  cpid="$(cat "$pidfile" 2>/dev/null || true)"
-  if [[ -n "$cpid" ]]; then
-    kill -TERM "$cpid" 2>/dev/null || true
-  fi
-  if wait_for_status "$rcfile" "$KILL_GRACE_SECONDS"; then
-    log error "'$1 --resume-frozen' (pid ${cpid:-?}) did not answer within ${COMMAND_TIMEOUT_SECONDS}s; terminated with SIGTERM"
-    wait "$supervisor" 2>/dev/null || true
+  signal_job TERM "$cpid" || true
+  if wait_for_job "$cpid" "$KILL_GRACE_SECONDS"; then
+    wait "$cpid" || rc=$?
+    log error "'$1 --resume-frozen' (pid $cpid) did not answer within ${COMMAND_TIMEOUT_SECONDS}s; sent SIGTERM, and it ended (wait status $rc)"
     return 124
   fi
-  if [[ -n "$cpid" ]]; then
-    kill -KILL "$cpid" 2>/dev/null || true
-  fi
-  if wait_for_status "$rcfile" "$KILL_GRACE_SECONDS"; then
-    log error "'$1 --resume-frozen' (pid ${cpid:-?}) did not answer within ${COMMAND_TIMEOUT_SECONDS}s and ignored SIGTERM; killed with SIGKILL"
-    wait "$supervisor" 2>/dev/null || true
+  signal_job KILL "$cpid" || true
+  if wait_for_job "$cpid" "$KILL_GRACE_SECONDS"; then
+    wait "$cpid" || rc=$?
+    log error "'$1 --resume-frozen' (pid $cpid) did not answer within ${COMMAND_TIMEOUT_SECONDS}s and was still running ${KILL_GRACE_SECONDS}s after SIGTERM; sent SIGKILL, and it ended (wait status $rc)"
   else
-    log error "'$1 --resume-frozen' (pid ${cpid:-?}) did not answer within ${COMMAND_TIMEOUT_SECONDS}s and has not exited after SIGKILL; it runs no further code and holds no lock"
+    log error "'$1 --resume-frozen' (pid $cpid) did not answer within ${COMMAND_TIMEOUT_SECONDS}s and has not exited ${KILL_GRACE_SECONDS}s after SIGKILL; it runs no further code and holds no lock"
   fi
   return 124
-}
+} 2>/dev/null
 
 # End this run right after a timed-out undo command that is still alive:
 # nothing else is undone, the journal and session stay exactly as read, and
@@ -668,7 +673,7 @@ app_args=()
 # binary may have resumed some of them before it went wrong; the next run
 # finds those running and clears them.
 resume_via_app() {
-  local n=${#app_pid[@]} k rc=0 valid=1 settled=1 expected=0 size line word excerpt="" p
+  local n=${#app_pid[@]} k rc=0 valid=1 settled=1 expected=0 size line word excerpt="" p answer
   local -a words
   words=()
   if [[ ! -x "$INSOMNIA_BIN" ]]; then
@@ -679,12 +684,27 @@ resume_via_app() {
     done
     return 0
   fi
-  run_app_bounded "$INSOMNIA_BIN" --resume-frozen "${app_args[@]}" || rc=$?
-  if [[ -z "$app_answer_file" || ! -f "$app_answer_file" ]]; then
+  # A private directory with a fresh name for the binary's input and answer,
+  # after removing any left by an earlier run that was itself killed
+  # mid-call. One line per entry on standard input: there is no limit on its
+  # size, unlike the binary's argument list.
+  "$RM" -rf "$APP_SUPPORT"/.backstop-resume.*
+  if ! app_answer_dir="$("$MKTEMP" -d "$APP_SUPPORT/.backstop-resume.XXXXXX" 2>/dev/null)"; then
+    app_answer_dir=""
+    log error "could not create a private directory in $APP_SUPPORT for the app binary's input and answer"
+    rc=125
+  elif ! printf '%s %s %s %s\n' "${app_args[@]}" > "$app_answer_dir/in" 2>/dev/null; then
+    log error "could not write the app binary's input in $app_answer_dir"
+    rc=125
+  else
+    run_app_bounded "$INSOMNIA_BIN" --resume-frozen || rc=$?
+  fi
+  if (( rc == 125 )) || [[ ! -f "$app_answer_dir/out" ]]; then
     valid=0
   else
-    size="$(stat -f %z "$app_answer_file" 2>/dev/null || echo 0)"
-    excerpt="$(head -c 200 "$app_answer_file" | tr -c '[:print:]' ' ')"
+    answer="$app_answer_dir/out"
+    size="$(stat -f %z "$answer" 2>/dev/null || echo 0)"
+    excerpt="$(head -c 200 "$answer" | tr -c '[:print:]' ' ')"
     # A valid line is at most 24 bytes ("<10-digit pid> unverifiable\n").
     if (( size > n * 32 )); then
       valid=0
@@ -700,11 +720,11 @@ resume_via_app() {
         esac
         words+=("$word")
         k=$((k + 1))
-      done < "$app_answer_file"
+      done < "$answer"
       (( k == n )) || valid=0
     fi
   fi
-  if [[ -n "$app_answer_dir" ]]; then rm -rf "$app_answer_dir"; fi
+  if [[ -n "$app_answer_dir" ]]; then "$RM" -rf "$app_answer_dir"; fi
   (( settled )) || expected=1
   (( rc == expected )) || valid=0
   if (( valid == 0 )); then

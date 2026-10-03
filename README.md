@@ -207,7 +207,8 @@ installation scenarios still need [release validation](docs/release-validation.m
   microsecond, and the backstop asks the installed app binary
   (`Insomnia --resume-frozen`) to do the same check and send the signal for
   every entry that records microseconds, all such entries in one call with a
-  30-second limit. The backstop never signals those entries itself. It keeps
+  30-second limit. The entries go to the binary on standard input, so a long
+  journal cannot exceed the argument size limit. The backstop never signals those entries itself. It keeps
   them when the binary is missing, does not finish in time, or answers
   anything but one expected line per entry. Entries written by builds before
   microseconds were recorded keep the one-second `ps` comparison in the

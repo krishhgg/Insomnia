@@ -403,14 +403,18 @@ Backstop, independent of the app:
 - Successful restores may clear their entries; failures must stay journaled.
   Process recovery must verify identity and avoid resuming a process that
   Insomnia did not stop. The entries that record `startedAtMicros` go to
-  the installed app binary in one call (`Insomnia --resume-frozen` followed
-  by `<pid> <startedAt> <startedAtMicros> <bootSession>` once per entry,
-  answered before AppKit starts), so the comparison is to the microsecond
-  and each entry's signal follows its own lookup in one process. The binary
-  prints one line per entry in argument order, `<pid> <word>`, and exits 0
-  when every word is `resumed` or `gone`, 1 otherwise. The script runs it
-  with the same 30-second limit as a power command, then SIGTERM, then
-  SIGKILL, and without the lock descriptor. It checks the whole answer:
+  the installed app binary in one call (`Insomnia --resume-frozen`, with
+  one line `<pid> <startedAt> <startedAtMicros> <bootSession>` per entry on
+  standard input, which has no size limit, answered before AppKit starts),
+  so the comparison is to the microsecond and each entry's signal follows
+  its own lookup in one process. The binary prints one line per entry in
+  input order, `<pid> <word>`, and exits 0 when every word is `resumed` or
+  `gone`, 1 otherwise. Any argument after the flag, empty input or a
+  malformed line is a usage error (exit 64) that checks nothing. The script
+  runs it with the same 30-second limit as a power command, then SIGTERM,
+  then SIGKILL, and without the lock descriptor. The script starts the
+  binary as its own background job and is the only process that signals
+  it, by jobspec, so a signal never reaches a pid bash has already reaped. It checks the whole answer:
   one line per entry with that entry's pid and a known word and nothing
   else, and an exit status that agrees with the words. `resumed` and `gone`
   clear an entry, the other words keep it, and a missing binary, a timeout

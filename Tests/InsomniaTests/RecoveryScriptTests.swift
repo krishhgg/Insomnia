@@ -110,7 +110,7 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(fx.calls(), [
             "sudo -n \(fx.fakePmset) -a disablesleep 0",
             "sudo -n \(fx.fakePmset) -b lowpowermode 0",
-            "Insomnia --resume-frozen 4242 \(started) 17 \(fx.bootUUID)",
+            "Insomnia --resume-frozen < 4242 \(started) 17 \(fx.bootUUID)",
         ], "an entry with microseconds is resumed by the app binary, never by ps and kill")
         let s = try fx.stateJSON()
         XCTAssertEqual(s["sleepDisabledByUs"] as? Bool, false)
@@ -138,7 +138,7 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertNotEqual(r.status, 0)
         XCTAssertEqual(fx.calls(), [
             "sudo -n \(fx.fakePmset) -a disablesleep 0",
-            "Insomnia --resume-frozen 111 \(started) 1 \(fx.bootUUID) 222 \(started) 2 \(fx.bootUUID)",
+            "Insomnia --resume-frozen < 111 \(started) 1 \(fx.bootUUID); 222 \(started) 2 \(fx.bootUUID)",
         ], "both entries in one call, no ps and no kill")
         let s = try fx.stateJSON()
         XCTAssertEqual(s["sleepDisabledByUs"] as? Bool, false, "an unrelated stuck pid must not hold sleep disabled")
@@ -1577,8 +1577,11 @@ final class RecoveryScriptTests: XCTestCase {
         (try fx.stateJSON()["frozenProcesses"] as? [[String: Any]])?.first
     }
 
-    /// The shell passes the four identity fields through unchanged and
-    /// never runs ps or kill for such an entry. "resumed" clears it.
+    /// The shell passes the four identity fields through unchanged, as one
+    /// line on the binary's standard input, and never runs ps or kill for
+    /// such an entry. "resumed" clears it. The binary's parent is the
+    /// backstop shell itself: no supervisor process sits between them that
+    /// could reap it before the shell decides whether to signal it.
     func testMicrosecondEntryIsHandedToTheAppBinaryWithItsFullIdentity() throws {
         let started = 1_789_388_423
         try writeMicrosecondEntry(pid: 5100, started: started, micros: 654_321)
@@ -1587,10 +1590,12 @@ final class RecoveryScriptTests: XCTestCase {
         let r = try fx.run(fx.backstop)
 
         XCTAssertEqual(r.status, 0, r.stderr)
-        XCTAssertEqual(fx.calls(), ["Insomnia --resume-frozen 5100 \(started) 654321 \(fx.bootUUID)"])
+        XCTAssertEqual(fx.calls(), ["Insomnia --resume-frozen < 5100 \(started) 654321 \(fx.bootUUID)"])
         XCTAssertEqual((try fx.stateJSON()["frozenProcesses"] as? [Any])?.count, 0)
         XCTAssertEqual(try fx.stateJSON()["dockerFrozen"] as? Bool, false)
         XCTAssertTrue(fx.log().contains("SIGCONT sent to pid 5100 by the app binary"), fx.log())
+        let parent = try String(contentsOf: fx.root.appendingPathComponent("insomnia.ppid"), encoding: .utf8)
+        XCTAssertEqual(parent.trimmingCharacters(in: .whitespacesAndNewlines), String(fx.lastPid), "the binary is not a direct child of the backstop shell")
     }
 
     /// Microseconds of 0 are an identity too (the key is present), not a
@@ -1602,7 +1607,7 @@ final class RecoveryScriptTests: XCTestCase {
         let r = try fx.run(fx.backstop)
 
         XCTAssertEqual(r.status, 0, r.stderr)
-        XCTAssertEqual(fx.calls(), ["Insomnia --resume-frozen 5101 \(started) 0 \(fx.bootUUID)"])
+        XCTAssertEqual(fx.calls(), ["Insomnia --resume-frozen < 5101 \(started) 0 \(fx.bootUUID)"])
     }
 
     func testAppBinaryGoneClearsTheEntryWithoutSignal() throws {
@@ -1746,7 +1751,7 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(fx.calls(), [
             "ps -o lstart=,stat=,uid= -p 5109",
             "kill -CONT 5109",
-            "Insomnia --resume-frozen 5108 \(started) 8 \(fx.bootUUID)",
+            "Insomnia --resume-frozen < 5108 \(started) 8 \(fx.bootUUID)",
         ])
         XCTAssertEqual((try fx.stateJSON()["frozenProcesses"] as? [Any])?.count, 0)
     }
@@ -1776,7 +1781,7 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertNotEqual(r.status, 0)
         XCTAssertEqual(fx.calls(), [
             "ps -o lstart=,stat=,uid= -p 5204",
-            "Insomnia --resume-frozen 5201 \(started) 1 \(fx.bootUUID) 5203 \(started) 3 \(fx.bootUUID) 5205 \(started) 5 \(fx.bootUUID) 5206 \(started) 6 \(fx.bootUUID)",
+            "Insomnia --resume-frozen < 5201 \(started) 1 \(fx.bootUUID); 5203 \(started) 3 \(fx.bootUUID); 5205 \(started) 5 \(fx.bootUUID); 5206 \(started) 6 \(fx.bootUUID)",
         ])
         let frozen = try XCTUnwrap(try fx.stateJSON()["frozenProcesses"] as? [[String: Any]])
         XCTAssertEqual(frozen.map { $0["pid"] as? Int }, [5201, 5202, 5205], "journal order, not settle order")
@@ -1788,9 +1793,11 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(log.contains("pid 5206 is gone, running, or not the process we froze (app binary: gone)"), log)
     }
 
-    /// A binary that prints a correct answer but does not exit in time is
-    /// terminated, and its answer is not used: every entry of the call is
-    /// kept and the lock is free afterwards.
+    /// A binary that prints a correct answer but does not exit in time gets
+    /// SIGTERM, and its answer is not used: every entry of the call is kept
+    /// and the lock is free afterwards. The wait status in the log (143,
+    /// 128 + SIGTERM) is the kernel's record that SIGTERM ended the fake,
+    /// which sleeps for 300 s otherwise; no wall-clock bound is needed.
     func testAppBinaryThatDoesNotExitInTimeKeepsEveryEntry() throws {
         try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
         let started = 1_789_388_423
@@ -1801,39 +1808,41 @@ final class RecoveryScriptTests: XCTestCase {
            {"pid":5302,"startedAt":\(started),"startedAtMicros":2,"bootSession":"\(fx.bootUUID)"}]}
         """)
         fx.setMode("insomnia", "hang")
-        let clock = Date()
 
         let r = try fx.run(fx.backstop)
 
         XCTAssertNotEqual(r.status, 0)
-        XCTAssertLessThan(Date().timeIntervalSince(clock), 8, "a 1 s limit, not the 30 s the binary would take")
         let frozen = try XCTUnwrap(try fx.stateJSON()["frozenProcesses"] as? [[String: Any]])
         XCTAssertEqual(frozen.map { $0["pid"] as? Int }, [5301, 5302])
         XCTAssertTrue(fx.exists(fx.session))
         XCTAssertTrue(try fx.lockIsFree())
         let log = fx.log()
-        XCTAssertTrue(log.contains("did not answer within 1s; terminated with SIGTERM"), log)
+        XCTAssertTrue(log.contains("did not answer within 1s; sent SIGTERM, and it ended (wait status 143)"), log)
+        XCTAssertFalse(log.contains("SIGKILL"), log)
         XCTAssertTrue(log.contains("unexpected answer from \(fx.fakeInsomnia.path) for pid(s) 5301 5302 (exit 124"), log)
-        XCTAssertEqual(try fx.contents(of: fx.home).filter { $0.hasPrefix(".backstop") }, [], "answer and status files removed")
+        XCTAssertEqual(try fx.contents(of: fx.home).filter { $0.hasPrefix(".backstop") }, [], "input and answer files removed")
+        XCTAssertEqual(r.stderr, "", "bash's own report of the signaled job must not reach the caller")
     }
 
     /// A binary that ignores SIGTERM gets SIGKILL: the run still ends, the
-    /// entry is kept, and the lock is free.
+    /// entry is kept, and the lock is free. The backstop runs with SIGTERM
+    /// ignored, so the fake inherits SIG_IGN from its first instruction
+    /// instead of racing to install a trap before the signal arrives. Wait
+    /// status 137 (128 + SIGKILL) shows SIGKILL ended it.
     func testAppBinaryThatIgnoresSigtermIsKilled() throws {
         try writeMicrosecondEntry(pid: 5303, started: 1_789_388_423, micros: 3)
-        fx.setMode("insomnia", "ignore-term")
-        let clock = Date()
+        fx.setMode("insomnia", "hang")
 
-        let r = try fx.run(fx.backstop)
+        let r = try fx.run(fx.backstop, ignoringTerm: true)
 
         XCTAssertNotEqual(r.status, 0)
-        XCTAssertLessThan(Date().timeIntervalSince(clock), 10, "1 s limit plus two 1 s grace periods")
         XCTAssertEqual(try onlyFrozenEntry()?["pid"] as? Int, 5303)
         XCTAssertTrue(try fx.lockIsFree())
         let log = fx.log()
-        XCTAssertTrue(log.contains("ignored SIGTERM; killed with SIGKILL"), log)
+        XCTAssertTrue(log.contains("did not answer within 1s and was still running 1s after SIGTERM; sent SIGKILL, and it ended (wait status 137)"), log)
         XCTAssertTrue(log.contains("(exit 124"), log)
-        XCTAssertEqual(try fx.contents(of: fx.home).filter { $0.hasPrefix(".backstop") }, [], "answer and status files removed")
+        XCTAssertEqual(try fx.contents(of: fx.home).filter { $0.hasPrefix(".backstop") }, [], "input and answer files removed")
+        XCTAssertEqual(r.stderr, "", "bash's own report of the signaled job must not reach the caller")
     }
 
     /// The binary never inherits the recovery lock, also when a caller
@@ -1854,7 +1863,7 @@ final class RecoveryScriptTests: XCTestCase {
             fx.clearCalls()
             let r = try run()
             XCTAssertEqual(r.status, 0, r.stderr + fx.log())
-            XCTAssertEqual(fx.calls(), ["Insomnia --resume-frozen 5304 1789388423 4 \(fx.bootUUID)"], "the binary saw fd 9")
+            XCTAssertEqual(fx.calls(), ["Insomnia --resume-frozen < 5304 1789388423 4 \(fx.bootUUID)"], "the binary saw fd 9")
         }
     }
 
@@ -2900,38 +2909,43 @@ private final class ScriptFixture {
         try writeFake("sysctl", """
         cat "\(r)/boot.uuid"
         """)
-        // Insomnia --resume-frozen <pid> <startedAt> <micros> <boot> [...]:
-        // one "<pid> <word>" line per group of four, the word from
-        // insomnia.table (pid|word) or "resumed" for a pid without a row;
-        // exit 0 when every word is resumed or gone, 1 otherwise. A binary
-        // that inherited fd 9 (the recovery lock) records HOLDS-FD9.
-        // Modes: "raw" prints insomnia.output verbatim and exits with
-        // insomnia.status. "hang" prints its answer and then never exits
-        // (until SIGTERM). "ignore-term" does the same but ignores SIGTERM,
-        // so only SIGKILL ends it.
+        // Insomnia --resume-frozen: reads its entries from standard input,
+        // one "<pid> <startedAt> <micros> <boot>" line each, and records the
+        // call as "Insomnia <arguments> < <line>; <line>; ...". Answers one
+        // "<pid> <word>" line per entry, the word from insomnia.table
+        // (pid|word) or "resumed" for a pid without a row; exit 0 when every
+        // word is resumed or gone, 1 otherwise. Writes its parent's pid to
+        // insomnia.ppid. A binary that inherited fd 9 (the recovery lock)
+        // records HOLDS-FD9. Modes: "raw" prints insomnia.output verbatim and
+        // exits with insomnia.status. "hang" prints its answer and then
+        // sleeps for 300 s, so only a signal ends it in time. A test that
+        // needs SIGTERM ignored runs the backstop with it ignored (see
+        // ScriptFixture.run): the fake inherits that from its first
+        // instruction, so no trap has to be in place before the signal.
         try writeFake("Insomnia", """
-        printf 'Insomnia %s\\n' "$*" >> "\(calls)"
+        input=()
+        while IFS= read -r line || [[ -n "$line" ]]; do input+=("$line"); done
+        joined=""
+        for line in "${input[@]}"; do joined="${joined:+$joined; }$line"; done
+        printf 'Insomnia %s < %s\\n' "$*" "$joined" >> "\(calls)"
+        echo "$PPID" > "\(r)/insomnia.ppid"
         [[ -e /dev/fd/9 ]] && printf 'Insomnia HOLDS-FD9\\n' >> "\(calls)"
         mode="$(cat "\(r)/insomnia.mode" 2>/dev/null || echo ok)"
         if [[ "$mode" == raw ]]; then
           cat "\(r)/insomnia.output"
           exit "$(cat "\(r)/insomnia.status")"
         fi
-        shift
         status=0
-        while (( $# >= 4 )); do
+        for line in "${input[@]}"; do
+          pid="${line%% *}"
           word=resumed
           if [[ -f "\(r)/insomnia.table" ]]; then
-            while IFS='|' read -r p w; do [[ "$p" == "$1" ]] && word="$w"; done < "\(r)/insomnia.table"
+            while IFS='|' read -r p w; do [[ "$p" == "$pid" ]] && word="$w"; done < "\(r)/insomnia.table"
           fi
-          printf '%s %s\\n' "$1" "$word"
+          printf '%s %s\\n' "$pid" "$word"
           case "$word" in resumed|gone) ;; *) status=1 ;; esac
-          shift 4
         done
-        case "$mode" in
-          hang) exec /bin/sleep 30 ;;
-          ignore-term) trap '' TERM; exec /bin/sleep 30 ;;
-        esac
+        [[ "$mode" == hang ]] && exec /bin/sleep 300
         exit "$status"
         """)
         // date: the real tool, except that with date.mode present the stamp
@@ -3248,13 +3262,22 @@ private final class ScriptFixture {
 
     /// Runs a script copy. `fd9` opens that file on descriptor 9 of the child
     /// first, the way uninstall.sh hands its lock handle to the backstop.
+    /// `ignoringTerm` starts the script with SIGTERM ignored, which every
+    /// process it starts inherits (not combined with `fd9`).
     /// `extraEnvironment` is for install.sh's refusal test and for a
-    /// private TMPDIR (see privateTmp).
-    func run(_ script: URL, _ args: [String] = [], fd9: URL? = nil, extraEnvironment: [String: String] = [:]) throws -> (status: Int32, stdout: String, stderr: String) {
+    /// private TMPDIR (see privateTmp). `lastPid` is the script's pid
+    /// afterwards: the wrappers exec it, so it is the pid of the process
+    /// started here.
+    private(set) var lastPid: Int32 = 0
+
+    func run(_ script: URL, _ args: [String] = [], fd9: URL? = nil, ignoringTerm: Bool = false, extraEnvironment: [String: String] = [:]) throws -> (status: Int32, stdout: String, stderr: String) {
+        precondition(fd9 == nil || !ignoringTerm, "fd9 and ignoringTerm are not combined")
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/bash")
         if let fd9 {
             p.arguments = ["-c", #"exec 9<>"$0" && exec /bin/bash "$@""#, fd9.path, script.path] + args
+        } else if ignoringTerm {
+            p.arguments = ["-c", #"trap '' TERM && exec /bin/bash "$@""#, "bash", script.path] + args
         } else {
             p.arguments = [script.path] + args
         }
@@ -3272,6 +3295,7 @@ private final class ScriptFixture {
         p.standardError = err
         let childExit = ProcessExit(p)
         try p.run()
+        lastPid = p.processIdentifier
         childExit.wait()
         return (p.terminationStatus,
                 (try? String(contentsOf: outURL, encoding: .utf8)) ?? "",
