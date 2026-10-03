@@ -31,6 +31,16 @@ struct Store: Sendable {
     /// undecodable content.
     func read<T: Decodable>(_ type: T.Type, from url: URL) throws -> T? {
         guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        // Only a regular file is opened. open(2) on a FIFO with no writer
+        // blocks, and these reads run on the main actor under the recovery
+        // lock. Data(contentsOf:) on macOS 26 refuses a FIFO with EACCES,
+        // which reads as a permissions problem; this check names the real
+        // cause and does not rely on that. stat(2) follows a symlink, as
+        // Data(contentsOf:) does.
+        var info = stat()
+        if stat(url.path, &info) == 0, info.st_mode & S_IFMT != S_IFREG {
+            throw StoreError.notRegularFile(file: url.path)
+        }
         let data = try Data(contentsOf: url)
         return try Store.makeDecoder().decode(T.self, from: data)
     }
@@ -60,9 +70,48 @@ struct Store: Sendable {
 
     // MARK: Typed helpers
 
-    func loadSession() throws -> Session? { try read(Session.self, from: paths.sessionFile) }
+    /// Throws StoreError.unreadable, with a one-line reason, when the file
+    /// does not decode.
+    func loadSession() throws -> Session? {
+        do {
+            return try read(Session.self, from: paths.sessionFile)
+        } catch let error as DecodingError {
+            throw StoreError.unreadable(file: paths.sessionFile.path, detail: Self.brief(error))
+        }
+    }
     func saveSession(_ s: Session) throws { try write(s, to: paths.sessionFile) }
     func deleteSession() throws { try remove(at: paths.sessionFile) }
+    /// Whether anything is at session.json, a dangling symlink included.
+    /// lstat(2) only: the entry is never opened.
+    func sessionEntryExists() -> Bool {
+        var st = stat()
+        return lstat(paths.sessionFile.path, &st) == 0
+    }
+
+    /// Renames an unreadable session.json to a timestamped sibling (see
+    /// Paths.unreadableSessionPrefix) and returns the new location. The
+    /// bytes are kept for inspection; the next reader sees no session.
+    /// Never overwrites: a taken name gets -1, -2, ..., and the rename
+    /// itself fails rather than replace a file that appeared meanwhile.
+    func moveAsideUnreadableSession(now: Date) throws -> URL {
+        let base = Paths.unreadableSessionPrefix + Self.stamp(now)
+        var dest = paths.appSupport.appendingPathComponent(base)
+        var n = 0
+        while FileManager.default.fileExists(atPath: dest.path) {
+            n += 1
+            dest = paths.appSupport.appendingPathComponent("\(base)-\(n)")
+        }
+        try FileManager.default.moveItem(at: paths.sessionFile, to: dest)
+        return dest
+    }
+
+    private static func stamp(_ date: Date) -> String {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = TimeZone(identifier: "UTC")
+        f.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
+        return f.string(from: date)
+    }
 
     /// Non-mutating. A journal that does not decode stays exactly where it
     /// is: it is the only record of what a previous run changed, and moving
@@ -159,6 +208,8 @@ enum StoreError: Error, LocalizedError {
     case open(path: String, errno: Int32)
     case lock(path: String, errno: Int32)
     case markerBusy(path: String, seconds: TimeInterval)
+    case unreadable(file: String, detail: String)
+    case notRegularFile(file: String)
 
     var errorDescription: String? {
         switch self {
@@ -174,6 +225,10 @@ enum StoreError: Error, LocalizedError {
             return "rename \(from) -> \(to) failed: \(String(cString: strerror(errno)))"
         case let .corrupt(file, detail):
             return "\(file) could not be decoded (\(detail)); it was left in place"
+        case let .unreadable(file, detail):
+            return "\(file) could not be decoded (\(detail))"
+        case let .notRegularFile(file):
+            return "\(file) is not a regular file; it was not opened"
         }
     }
 }
