@@ -1315,6 +1315,152 @@ final class LidActionsTests: XCTestCase {
         XCTAssertNotEqual(m.countdownText, before, "the countdown did not tick")
     }
 
+    /// Whether `task` finishes within `seconds`. It is not cancelled
+    /// either way: a test that gets false opens its gate so the task ends.
+    private func finishes(_ task: Task<Void, Never>, within seconds: Double) async -> Bool {
+        let done = Locked(false)
+        Task { await task.value; done.value = true }
+        let deadline = Date().addingTimeInterval(seconds)
+        while !done.value, Date() < deadline {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return done.value
+    }
+
+    /// The lid opens while the second probe runs (a slow `docker ps`).
+    /// AppServices numbers the open as it arrives and queues its undo
+    /// behind the close, as here. The close stops waiting at once: Docker
+    /// is never stopped, its entries leave the journal, and the open's undo
+    /// runs while the probe is still out. The probe's late idle answer
+    /// changes nothing.
+    func testLidOpenDuringTheSecondCheckLeavesDockerAloneWithoutWaitingForTheProbe() async throws {
+        let gate = AsyncGate()
+        let calls = Locked(0)
+        let (m, actions) = await make(dockerIdle: {
+            calls.value += 1
+            if calls.value == 2 { await gate.wait() }
+            return true
+        })
+        await m.start(duration: 3600)
+        let close = Task { await actions.onClose() }
+        await gate.waitUntilStarted()
+
+        actions.lidEventArrived()
+        let open = Task {
+            await close.value
+            await actions.onOpen()
+        }
+        let undone = await finishes(open, within: 5)
+        await gate.open()
+        await open.value
+
+        XCTAssertTrue(undone, "the lid open waited for the second probe")
+        XCTAssertEqual(h.procs.suspended, [[100, 101, 102]], "Docker was stopped after the lid opened")
+        XCTAssertEqual(h.procs.resumed, [[100, 101, 102]])
+        let s = try XCTUnwrap(try h.store.loadState())
+        XCTAssertEqual(s.frozenProcesses, [])
+        XCTAssertFalse(s.dockerFrozen)
+        let log = logText()
+        XCTAssertTrue(log.contains("docker rule: lid opened during the second check, Docker left alone"), log)
+
+        // The probe's idle answer arrives after the gate opened. It is
+        // still logged by the probe, but nothing acts on it.
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(h.procs.suspended, [[100, 101, 102]])
+        XCTAssertEqual(try h.store.loadState()?.frozenProcesses, [])
+    }
+
+    /// The lid opens while the first probe runs: Docker is not asked again
+    /// and not journaled, and the close does not pause the countdown of a
+    /// session whose lid is open again.
+    func testLidOpenDuringTheFirstCheckLeavesDockerAloneAndTheCountdownRunning() async throws {
+        let gate = AsyncGate()
+        let calls = Locked(0)
+        let (m, actions) = await make(dockerIdle: {
+            calls.value += 1
+            if calls.value == 1 { await gate.wait() }
+            return true
+        })
+        await m.start(duration: 3600)
+        let close = Task { await actions.onClose() }
+        await gate.waitUntilStarted()
+
+        actions.lidEventArrived()
+        let closed = await finishes(close, within: 5)
+        await gate.open()
+        await close.value
+
+        XCTAssertTrue(closed, "the close waited for the first probe after the lid opened")
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(calls.value, 1, "Docker was asked again after the lid opened")
+        XCTAssertEqual(h.procs.suspended, [[100, 101, 102]])
+        let s = try XCTUnwrap(try h.store.loadState())
+        XCTAssertEqual(s.frozenPids, [100, 101, 102])
+        XCTAssertFalse(s.dockerFrozen)
+        XCTAssertTrue(m.countdownTimerArmed, "a close the lid open overtook paused the countdown")
+        XCTAssertTrue(logText().contains("docker rule: lid opened during the first check, Docker left alone"), logText())
+
+        await actions.onOpen()
+        XCTAssertEqual(h.procs.resumed, [[100, 101, 102]])
+        XCTAssertEqual(try h.store.loadState()?.frozenProcesses, [])
+    }
+
+    /// A close still queued (behind the recovery lock or an earlier lid
+    /// event) when the lid opens again does nothing when its turn comes:
+    /// no darkening, no mute, no freeze, no countdown pause.
+    func testACloseTheLidOpenOvertookBeforeItRanDoesNothing() async throws {
+        let (m, actions) = await make()
+        await m.start(duration: 3600)
+        let close = actions.lidEventArrived()
+        actions.lidEventArrived()
+
+        await actions.onClose(event: close)
+
+        XCTAssertEqual(h.procs.suspended, [])
+        XCTAssertEqual(h.audio.mutes, 0)
+        XCTAssertEqual(h.display.sets, [])
+        XCTAssertEqual(h.keyboard.sets, [])
+        XCTAssertEqual(try h.store.loadState()?.frozenProcesses, [])
+        XCTAssertNil(try h.store.loadState()?.savedDisplayBrightness)
+        XCTAssertTrue(m.countdownTimerArmed)
+        XCTAssertTrue(logText().contains("lid close actions skipped: the lid opened again before they ran"), logText())
+    }
+
+    /// The lid observer reports changes only, so a session started with the
+    /// lid already closed (an external display, a remote start) gets no
+    /// close call. Its countdown starts paused from the lid reading, and
+    /// the next lid open starts it.
+    func testASessionStartedUnderAClosedLidHasNoCountdownTimerUntilTheLidOpens() async throws {
+        let (m, actions) = await make()
+        h.clamshell.closed = true
+        await m.start(duration: 3600)
+
+        XCTAssertTrue(m.isActive)
+        XCTAssertFalse(m.countdownTimerArmed, "a session started under a closed lid redraws every second")
+
+        h.clamshell.closed = false
+        await actions.onOpen()
+        XCTAssertTrue(m.countdownTimerArmed)
+    }
+
+    /// A session ends with the lid shut and the next one starts before it
+    /// opens: the new session's countdown stays paused until the open.
+    func testASessionStartedAfterAnEndUnderTheStillClosedLidKeepsTheCountdownPaused() async throws {
+        let (m, actions) = await make(dockerIdle: { false })
+        await m.start(duration: 3600)
+        h.clamshell.closed = true
+        await actions.onClose()
+        await m.end(reason: .timer)
+
+        await m.start(duration: 3600)
+
+        XCTAssertTrue(m.isActive)
+        XCTAssertFalse(m.countdownTimerArmed, "the lid is still closed, but the countdown redraws every second")
+        h.clamshell.closed = false
+        await actions.onOpen()
+        XCTAssertTrue(m.countdownTimerArmed)
+    }
+
     /// Older than the Docker rule: a session that ends with the lid shut
     /// gets no lid open call (there is no session left), so the pause from
     /// its close must not carry into the next session.

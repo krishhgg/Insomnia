@@ -110,8 +110,11 @@ During a session, Insomnia turns the display and keyboard backlight off
 (saving their brightness first), pauses the apps on the freeze list (and, if
 you opt in, every other Dock app that is not an agent app), checks whether
 Docker Desktop is idle before pausing it, and can save then mute audio.
-Reopening the lid attempts to undo those lid actions. **The timer keeps
-counting down while the lid is closed**; only its on-screen redraw pauses.
+Reopening the lid attempts to undo those lid actions. If the lid opens
+while Insomnia is still checking Docker, Docker is left running and the undo
+starts right away. **The timer keeps counting down while the lid is
+closed**; only its on-screen redraw pauses, also for a session started with
+the lid already closed.
 
 The display step exists because the sleep guard stops macOS from doing it:
 with sleep disabled, closing the lid no longer turns the panel or the keys off

@@ -22,6 +22,13 @@ final class LidActions {
     /// open. nil (tests) means the device's own asleep/suppressed reading
     /// decides alone.
     private let sampler: BrightnessSampler?
+    /// Lid events numbered in the order they arrive, before their actions
+    /// queue behind earlier ones (`AppServices.lidChanged`). A close whose
+    /// number is no longer the last one is stale: the lid has opened since.
+    private(set) var lidEvents = 0
+    /// Set only while a close transaction waits on a Docker probe: hands it
+    /// a nil answer at once when the next lid event arrives.
+    private var interruptProbe: (() -> Void)?
 
     init(
         manager: SessionManager,
@@ -41,7 +48,23 @@ final class LidActions {
         self.sampler = sampler
     }
 
-    func onClose() async {
+    /// Records a lid event as it arrives and returns its number. Every
+    /// close before it is stale from then on. A close still queued does
+    /// nothing when its turn comes. A close waiting on a Docker probe stops
+    /// waiting at once, takes Docker's entries out of the journal again,
+    /// and signals nothing more, so the open queued behind it runs its undo
+    /// without waiting for the probe.
+    @discardableResult
+    func lidEventArrived() -> Int {
+        lidEvents += 1
+        interruptProbe?()
+        return lidEvents
+    }
+
+    /// `event` is the number `lidEventArrived` gave this close; nil (tests
+    /// that call this directly) records a new event here.
+    func onClose(event: Int? = nil) async {
+        let event = event ?? lidEventArrived()
         guard let manager, manager.isActive, !Task.isCancelled else {
             Log.info("lid closed: no session, nothing to do")
             return
@@ -50,8 +73,18 @@ final class LidActions {
         // under the recovery lock, after any end already in flight.
         let ran = await manager.runExclusive("lid close") { [self, manager] in
             guard manager.isActive, !Task.isCancelled else { return }
+            guard lidEvents == event else {
+                Log.info("lid close actions skipped: the lid opened again before they ran")
+                return
+            }
             let ticket = manager.endTicket
             let config = manager.config
+            // False once an end was requested or the lid opened again during
+            // this transaction. Checked after every await: either one is
+            // queued right behind and must not find a fresh freeze.
+            let stillCurrent = { [self] in
+                manager.isActive && manager.endTicket == ticket && lidEvents == event && !Task.isCancelled
+            }
 
             if config.darkenDisplayOnLidClose {
                 darkenSavingCurrent(manager)
@@ -63,32 +96,40 @@ final class LidActions {
 
             let groups = freezer.plan(config: config)
             for group in groups {
+                guard stillCurrent() else { return }
                 await freeze(group, docker: false, manager: manager)
             }
 
-            let dockerGroup = await docker.idleDockerGroup(config: config)
-            // An end requested while the probe ran wins: it is queued right
-            // behind this transaction and must not find a fresh freeze.
-            guard manager.isActive, manager.endTicket == ticket, !Task.isCancelled else { return }
+            guard stillCurrent() else { return }
+            let dockerGroup = await untilNextLidEvent(after: event) { [docker] in
+                await docker.idleDockerGroup(config: config)
+            } ?? nil
+            guard stillCurrent() else {
+                if lidEvents != event { Log.info("docker rule: lid opened during the first check, Docker left alone") }
+                return
+            }
             if let dockerGroup {
                 // The idle answer above is already stale by the time the
                 // journal write is done, so Docker is asked once more right
                 // before its SIGSTOP; busy, a failed probe or a timeout
-                // leaves it running. The end check repeats for the same
-                // reason as above.
-                await freeze(dockerGroup, docker: true, manager: manager) { [docker] in
-                    guard await docker.isStillIdle() else { return false }
-                    guard manager.isActive, manager.endTicket == ticket, !Task.isCancelled else {
-                        Log.info("docker rule: session ending during the second check, Docker left alone")
+                // leaves it running. An end or a lid open during that
+                // probe leaves it running too.
+                await freeze(dockerGroup, docker: true, manager: manager) { [self, docker] in
+                    let idle = await untilNextLidEvent(after: event) { await docker.isStillIdle() }
+                    guard stillCurrent() else {
+                        Log.info(lidEvents != event
+                            ? "docker rule: lid opened during the second check, Docker left alone"
+                            : "docker rule: session ending during the second check, Docker left alone")
                         return false
                     }
-                    return true
+                    return idle == true
                 }
             }
 
             // A session whose end arrived during this transaction has no
-            // countdown left to pause; its end is queued right behind.
-            guard manager.isActive, manager.endTicket == ticket, !Task.isCancelled else { return }
+            // countdown left to pause; its end is queued right behind. After
+            // a lid open the countdown keeps running.
+            guard stillCurrent() else { return }
             manager.pauseCountdown()
         }
         if !ran { Log.error("lid close actions skipped: recovery lock busy") }
@@ -105,6 +146,22 @@ final class LidActions {
     }
 
     // MARK: Private
+
+    /// The answer of `probe`, or nil as soon as a lid event after `event`
+    /// arrives (or one already has). The probe then runs on in its own task
+    /// and its answer is dropped: it only reads (`docker ps`, bounded by
+    /// `DockerRule.timeout`).
+    private func untilNextLidEvent<T: Sendable>(after event: Int, _ probe: @escaping @Sendable () async -> T) async -> T? {
+        guard lidEvents == event else { return nil }
+        let race = ProbeRace<T>()
+        let answer = await withCheckedContinuation { (continuation: CheckedContinuation<T?, Never>) in
+            race.continuation = continuation
+            interruptProbe = { race.finish(nil) }
+            Task { @MainActor in race.finish(await probe()) }
+        }
+        interruptProbe = nil
+        return answer
+    }
 
     /// With `pmset disablesleep 1` macOS never turns the built-in panel or
     /// the keyboard backlight off on lid close, so this does. Brightness 0
@@ -310,5 +367,17 @@ final class LidActions {
             return
         }
         Log.info("froze \(group.name) (\(report.suspended.count) pid(s), \(report.skipped.count) skipped)")
+    }
+}
+
+/// Hands a close transaction whichever comes first, a probe's answer or a
+/// lid event; the later one finds the continuation gone.
+@MainActor
+private final class ProbeRace<T: Sendable> {
+    var continuation: CheckedContinuation<T?, Never>?
+
+    func finish(_ answer: T?) {
+        continuation?.resume(returning: answer)
+        continuation = nil
     }
 }

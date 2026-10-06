@@ -129,6 +129,7 @@ is performed. Do not replace "not run" with "passed" based on source review.
 | App Nap opt-in: previous `NSAppSleepDisabled` put back at session end, by the backstop after a force-quit, and by uninstall | Not run |
 | Docker Desktop idle/busy behavior with another Docker context selected | Not run |
 | Docker rule off on a fresh config.json (no `docker ps`, Docker untouched) and on with a container started between the two idle checks (Docker untouched, both checks logged with their answers) | Not run |
+| Docker rule on, lid opened while an idle check is still running (Docker never paused, the display and frozen apps restored without waiting for `docker ps`, insomnia.log says the lid opened during that check), and a session started with the lid already closed (no countdown redraw until the lid opens) | Not run |
 | Hotspot permission, association, cancellation, and reconnect | Not run |
 | Settings location note matches what System Settings shows after the grant | Not run |
 | tmux cancellation with a dedicated disposable pane | Not run |

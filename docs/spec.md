@@ -101,6 +101,12 @@ recovery; newly written journals use `frozenProcesses`.
 - 2-second debounce to ignore flapping.
 - Lid close and open each run a fixed, reversible action list (below).
 - Lid events do nothing when no session is active.
+- Each lid event is numbered as it arrives, before its actions queue behind
+  earlier ones. An open makes every earlier close stale. A close still
+  queued does nothing when its turn comes. A close waiting on a Docker probe
+  stops waiting at once, leaves Docker running, takes Docker's entries out
+  of the journal and signals nothing more, so the open's undo runs without
+  waiting for `docker ps`. The probe's late answer is logged and not used.
 
 ### 4. Lid-close actions (battery)
 
@@ -112,10 +118,15 @@ Quit, or reconcile.
 | Display (optional, default on) | save brightness, set it to 0, request display sleep (best effort) | wake the display, restore the saved brightness |
 | Keyboard backlight (optional, same toggle) | save brightness, set it to 0 | restore the saved brightness |
 | Freeze scope | `SIGSTOP` every process whose responsible app is in the freeze scope (rules below) | `SIGCONT` the recorded pids only |
-| Docker rule (default off) | if Docker Desktop is running and `docker ps -q` is empty, journal its tree, ask `docker ps -q` once more right before the SIGSTOP and freeze it only on a second clean empty answer; busy, a failed probe or a timeout at either point leaves it running | resume |
+| Docker rule (default off) | if Docker Desktop is running and `docker ps -q` is empty, journal its tree, ask `docker ps -q` once more right before the SIGSTOP and freeze it only on a second clean empty answer; busy, a failed probe, a timeout, a lid open or a session end at either point leaves it running | resume |
 | Mute (optional) | save volume and mute state, then mute | restore both exactly |
 | Low Power Mode | on (optional, default on) | off unless a battery or thermal floor still wants it |
 | Countdown redraw | stop timer | restart timer |
+
+A session that starts, or that reconcile resumes at launch, while the lid
+reads closed starts with the countdown redraw stopped: the lid observer
+reports changes only, so no close event arrives for it. The next lid open
+restarts the redraw.
 
 Freeze scope rules:
 
