@@ -813,3 +813,32 @@ final class FIFOWatch: @unchecked Sendable {
     private var isStopped: Bool { lock.lock(); defer { lock.unlock() }; return stopped }
     private func markSeen() { lock.lock(); seen = true; lock.unlock() }
 }
+
+/// Access control lists for the tests that check Insomnia leaves them alone.
+enum TestACL {
+    /// Gives `url` one entry letting its owner, the user running the tests,
+    /// read it. On a 0200 file that entry is the only way to read it.
+    static func grantOwnerRead(_ url: URL) throws {
+        let chmod = Process()
+        chmod.executableURL = URL(fileURLWithPath: "/bin/chmod")
+        chmod.arguments = ["+a", "user:\(String(cString: getpwuid(getuid()).pointee.pw_name)) allow read", url.path]
+        let exit = ProcessExit(chmod)
+        try chmod.run()
+        exit.wait()
+        guard chmod.terminationStatus == 0 else { throw POSIXError(.EPERM) }
+    }
+
+    /// How many ACL entries `url` has, without following a symlink.
+    static func entries(_ url: URL) -> Int {
+        guard let acl = acl_get_link_np(url.path, ACL_TYPE_EXTENDED) else { return 0 }
+        defer { acl_free(UnsafeMutableRawPointer(acl)) }
+        var count = 0
+        var entry: acl_entry_t?
+        var which = ACL_FIRST_ENTRY.rawValue
+        while acl_get_entry(acl, which, &entry) == 0 {
+            count += 1
+            which = ACL_NEXT_ENTRY.rawValue
+        }
+        return count
+    }
+}

@@ -17,7 +17,13 @@ other processes running as that user can invoke them too. The app is not
 sandboxed; local logs can contain SSIDs, process metadata, and tmux target names.
 The lines the app writes to `insomnia.log` also reach the unified log with the
 body marked private, so programs reading `log show` see `<private>` instead of
-those names unless private data logging is enabled on the Mac. Location
+those names unless private data logging is enabled on the Mac. The files
+Insomnia creates (logs, journal, session, config, recovery lock) are mode 0600
+and its directories 0700; the backstop runs with `umask 077`. Insomnia sets
+only these modes and leaves any access control list (ACL) on these files as it
+is, so an ACL someone added can still give another account access. Logs are capped at
+1 MiB with one older copy kept. A log the user replaced with a symlink is not
+rotated: the file it points to is the user's to manage. Location
 Services access is requested only when a hotspot is saved or a session starts
 with one configured; it is used to read Wi-Fi network names and the app never
 requests location updates. With the App Nap setting on (off by default), the

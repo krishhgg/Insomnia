@@ -477,6 +477,10 @@ provided by the standalone backstop. Performance effects depend on workload.
   the body; `insomnia.log` keeps the text.
 - Each outage is logged with start, end, and gap length to
   `~/Library/Logs/Insomnia/handoffs.log`. The menu shows the last gap.
+  Like `insomnia.log`, the file is owner-only (0600) and is renamed to
+  `handoffs.log.1` once it passes 1 MiB (`OwnerOnly.swift`). A log the user
+  replaced with a symlink is never rotated, so the cap does not hold for it:
+  the file it points to is the user's to manage.
 - Path satisfied again after a gap longer than `nudgeThreshold` (default 90 s):
   - For every configured tmux target (`session:window.pane`), resolve the
     concrete pane, read its state and then its mark, the pane-scoped user
@@ -608,7 +612,9 @@ restored by backstop, sleep disabled by something other than Insomnia
 ### 10. Settings
 
 JSON at `~/Library/Application Support/Insomnia/config.json`, edited through a
-small settings window:
+small settings window. Like `session.json`, `state.json` and the recovery
+lock it is created mode 0600 in a 0700 directory, and a looser file from an
+older build is tightened when the app reads it:
 
 - presets, default preset
 - freeze list (bundle ids), freeze every other app on/off (default off),
