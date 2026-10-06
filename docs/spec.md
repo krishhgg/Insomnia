@@ -383,6 +383,87 @@ provided by the standalone backstop. Performance effects depend on workload.
   SSID) and is never placed in process arguments. Retry with backoff (5 s,
   10 s, 20 s, 30 s, then every 30 s) until the path is satisfied or the
   session ends.
+- The Keychain item is created with an access list naming only the saving
+  build (`SecAccessCreate` with the running code as the sole trusted
+  application; under ad-hoc signing that is the build's cdhash). Reads run
+  with the process-wide Keychain prompt switch off
+  (`SecKeychainSetUserInteractionAllowed`, put back after each call), since
+  the per-query no-UI keys only govern the data protection keychain. An item
+  the build may not read fails with `errSecAuthFailed` (another build's item,
+  or a locked keychain; the file-based keychain cannot tell them apart), and
+  a missing item with `errSecItemNotFound`. Either skips the join and sets
+  a `HotspotPasswordReport`, the `HotspotPasswordProblem` and the SSID it
+  was read for: a warning line in the right-click menu and a notice under
+  the password field in Settings, both only while that SSID is the one
+  configured, and one notification per outage and hotspot (re-armed on
+  recovery, on stop and when the password is saved). Settings checks the
+  notice again whenever the configured SSID changes. A save in
+  Settings writes to the keychain that holds the item reads find, which
+  need not be the default keychain (a new item goes to the default
+  keychain). A locked keychain
+  hides this build's items as well as another build's, so a save that
+  finds the item unreadable first checks the keychain's lock state
+  (`SecKeychainGetStatus`) and, if it is locked, unlocks it (the prompt)
+  and starts over. An item the build can read already names it, so only
+  the value changes, in place (`SecItemUpdate`). An item it still cannot
+  read is another build's and needs a new access list, and the file-based
+  keychain changes that only by replacing the item (an in-place update of
+  `kSecAttrAccess` did not return when tried on a throwaway keychain): the
+  new password is put beside the old item, in the same keychain, under
+  service `insomnia-hotspot.replacing`; the old item is deleted; the new
+  one is renamed to `insomnia-hotspot`. Reads use only `insomnia-hotspot`
+  and never fall back to a `.replacing` item: which save left it, and
+  whether that save finished, is not known, and one in another keychain
+  on the search list can hold an older password. Until the delete, the
+  password reads as unreadable, as before the save; after the rename, as
+  the new one. A save that stops in between (a failed rename, a crash)
+  leaves it reading as missing, and the user enters it again. A
+  `.replacing` item the build can read, left by such a save, has its value
+  changed in place by the next save; one it cannot read with the keychain
+  unlocked is another build's and is deleted, then added again. A refused
+  delete of the old item removes the `.replacing` item and keeps the old
+  one. Clearing the password deletes both. Deleting another build's item, and unlocking the keychain
+  for a save, need the prompt, which is allowed only there.
+  `kSecAttrAccessible` is not set: the file-based keychain drops it, and
+  the data protection keychain needs an access-group entitlement.
+- Every keychain call the app makes, the failover's reads and the saves
+  and clears in Settings, runs on one serial dispatch queue
+  (`KeychainQueue`), never on the main actor. A save can wait on a
+  keychain prompt for as long as the user leaves it open, and the battery
+  floor, the deadline timer and End keep running meanwhile; one queue also
+  keeps two calls from setting the process-wide prompt switch at once. The
+  Save button reads "Saving…" until the keychain answers, then "Saved"
+  only while the SSID and password fields hold what the save stored: the
+  save uses the SSID that was in the field when it began, so an SSID typed
+  during the wait has no password yet. A failed save's notice stays under
+  the field even when the failover's report changed during the wait; the
+  recheck that change started reads the keychain behind the save, and its
+  answer is dropped. So is the answer of a load still running when a save
+  or clear begins, so it cannot refill a field the user just cleared. A
+  load fills the field only if the field was empty when it began and
+  nobody has edited it since, not even by typing and deleting it again. A
+  recheck that begins meanwhile (the report changed, or the SSID was
+  edited) sets the notice instead of the load, but does not stop the fill.
+- Work that waits on `KeychainQueue` checks again, once the wait is over,
+  everything it acts on, and drops its answer if any of it changed. A
+  load or recheck in Settings whose SSID was edited meanwhile is dropped,
+  since its answer is about the old SSID's item, and the SSID configured
+  now is read instead, so the field is not left empty with no notice.
+  That read is a peek: the SSID a later save moves the password from
+  stays the one the window loaded, as after any SSID edit. A save writes
+  the item for the SSID configured when it began and removes the item of
+  the SSID the window loaded, if that SSID was edited since, and returns
+  both. It clears the failover's report and re-arms its notification
+  unless the report is about the SSID configured when it answers and the
+  save touched neither of that SSID's items. A save that stored for an
+  SSID edited away meanwhile then checks the notice for the SSID
+  configured now. A failover join whose read waited behind a
+  save does nothing if the session has ended, Wi-Fi has come back, or the
+  configured SSID has changed: no join and no warning, so the
+  notification stays armed. After a recovery or stop it schedules no
+  retry either; after an SSID change the retry stays, and the next tick
+  reads the SSID configured then. Inside a save, the unlock prompt is
+  followed by a fresh read of the item and its keychain.
 - macOS 26 requires Location Services permission before CoreWLAN exposes SSIDs
   or returns results for an SSID-filtered scan. Insomnia requests when-in-use
   access when the hotspot is saved or a configured session starts, never at
@@ -761,7 +842,7 @@ Insomnia/
 ## Install
 
 ```
-git clone https://github.com/kgarg2468/Insomnia.git && cd Insomnia
+git clone https://github.com/krishhgg/Insomnia.git && cd Insomnia
 ./scripts/install.sh      # asks for sudo once, for the sudoers file
 ```
 
