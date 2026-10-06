@@ -794,7 +794,7 @@ final class SessionManager {
             dropDisplayWrite(reason: "the mode was cleared by someone else")
         }
 
-        undoLidActionsInJournal()
+        undoLidActionsInJournal(endingSession: true)
         restoreAppNapInJournal()
         // After the undo: a restore just written with the mode off owes
         // nothing more (its journal write clears the entry), and a lid
@@ -880,9 +880,52 @@ final class SessionManager {
         Log.info("app nap restored for \(restored) app(s)")
     }
 
-    /// Shared body of lid open, reconcile (lid open) and `restoreAll()`;
-    /// each entry is journaled as soon as it is undone.
-    private func undoLidActionsInJournal() {
+    /// Restores the volume and mute lid close saved, on the device it read
+    /// them from. The default output never stands in for a device that is
+    /// not connected. During a session that entry is kept for the next lid
+    /// open or reconcile. At the session end it is dropped, so the end does
+    /// not wait on a device that may not come back, and the menu says that
+    /// device is still muted.
+    private func restoreAudioInJournal(endingSession: Bool) {
+        let device = state.savedOutputDeviceUID
+        do {
+            var volume = state.savedOutputVolume
+            var muted = state.savedMuted
+            if volume == nil || muted == nil {
+                // Half an entry (a hand edit): the missing value is the
+                // default output's current one.
+                let current = try audio.read()
+                volume = volume ?? current.volume
+                muted = muted ?? current.muted
+            }
+            let v = volume ?? 1
+            let m = muted ?? false
+            try audio.apply(volume: v, muted: m, deviceUID: device)
+            Log.info("audio restored on \(device ?? "the default output") (volume \(v), muted \(m))")
+            try? journal { s in
+                s.savedOutputVolume = nil
+                s.savedMuted = nil
+                s.savedOutputDeviceUID = nil
+            }
+        } catch let missing as AudioDeviceMissingError {
+            guard endingSession else {
+                Log.info("audio: \(missing.deviceUID), muted at lid close, is not connected; the current output is left alone and the saved volume is kept for the next lid open")
+                return
+            }
+            try? journal { s in
+                s.savedOutputVolume = nil
+                s.savedMuted = nil
+                s.savedOutputDeviceUID = nil
+            }
+            fail("the output muted at lid close (\(missing.deviceUID)) was not connected when the session ended, so it is still muted; unmute it after reconnecting it")
+        } catch {
+            fail("could not restore audio: \(error.localizedDescription)")
+        }
+    }
+
+    /// Shared body of lid open, reconcile (lid open) and `restoreAll()`
+    /// (`endingSession`); each entry is journaled as soon as it is undone.
+    private func undoLidActionsInJournal(endingSession: Bool = false) {
         if !state.frozenProcesses.isEmpty {
             let report = processControl.resume(state.frozenProcesses)
             // Only entries that still need a retry, or that a person has to
@@ -909,19 +952,7 @@ final class SessionManager {
         }
 
         if state.savedOutputVolume != nil || state.savedMuted != nil {
-            do {
-                let current = try audio.read()
-                let volume = state.savedOutputVolume ?? current.volume
-                let muted = state.savedMuted ?? current.muted
-                try audio.apply(volume: volume, muted: muted)
-                Log.info("audio restored (volume \(volume), muted \(muted))")
-                try? journal { s in
-                    s.savedOutputVolume = nil
-                    s.savedMuted = nil
-                }
-            } catch {
-                fail("could not restore audio: \(error.localizedDescription)")
-            }
+            restoreAudioInJournal(endingSession: endingSession)
         }
 
         // Display and keyboard were darkened by us (spec section 4), not by

@@ -973,6 +973,89 @@ final class LidActionsTests: XCTestCase {
         XCTAssertEqual(m.remainingText, "58m")
     }
 
+    /// Lid open restores the device lid close muted, even when another
+    /// output became the default while the lid was shut: the speakers get
+    /// their volume back and the headset is left as it is.
+    func testOpenRestoresTheMutedDeviceNotTheNewDefault() async throws {
+        let (m, actions) = await make()
+        await m.start(duration: 3600)
+        await actions.onClose()
+        XCTAssertEqual(try h.store.loadState()?.savedOutputDeviceUID, FakeAudioControl.speakers)
+        XCTAssertEqual(h.audio.device(FakeAudioControl.speakers)?.muted, true)
+        h.audio.connect("usb-headset", volume: 0.3)
+
+        await actions.onOpen()
+
+        XCTAssertEqual(h.audio.applied.map { $0.deviceUID }, [FakeAudioControl.speakers])
+        XCTAssertEqual(h.audio.device(FakeAudioControl.speakers)?.volume, 0.6)
+        XCTAssertEqual(h.audio.device(FakeAudioControl.speakers)?.muted, false)
+        XCTAssertEqual(h.audio.device("usb-headset")?.volume, 0.3)
+        XCTAssertEqual(h.audio.device("usb-headset")?.muted, false)
+        let s = try XCTUnwrap(try h.store.loadState())
+        XCTAssertNil(s.savedOutputVolume)
+        XCTAssertNil(s.savedMuted)
+        XCTAssertNil(s.savedOutputDeviceUID)
+    }
+
+    /// A muted device that is gone at lid open is not stood in for by the
+    /// default output. The entry waits, a close in the meantime mutes
+    /// nothing else, and the next lid open with the device back restores it.
+    func testOpenKeepsTheEntryWhileTheMutedDeviceIsDisconnected() async throws {
+        let (m, actions) = await make()
+        h.audio.connect("usb-headset", volume: 0.3)
+        await m.start(duration: 3600)
+        await actions.onClose()
+        XCTAssertEqual(h.audio.device("usb-headset")?.muted, true)
+        h.audio.disconnect("usb-headset")
+
+        await actions.onOpen()
+        XCTAssertEqual(h.audio.applied.count, 0)
+        XCTAssertEqual(h.audio.volume, 0.6, "the speakers are left alone")
+        XCTAssertFalse(h.audio.muted, "the speakers are left alone")
+        var s = try XCTUnwrap(try h.store.loadState())
+        XCTAssertEqual(s.savedOutputDeviceUID, "usb-headset")
+        XCTAssertEqual(s.savedOutputVolume, 0.3)
+        XCTAssertEqual(s.savedMuted, false)
+        XCTAssertNil(m.lastError)
+
+        await actions.onClose()
+        XCTAssertEqual(h.audio.mutes, 1, "the speakers are not muted while the headset's volume is owed")
+        XCTAssertFalse(h.audio.muted)
+        XCTAssertEqual(try h.store.loadState()?.savedOutputDeviceUID, "usb-headset")
+
+        // macOS keeps a device's mute, so the headset comes back muted.
+        h.audio.connect("usb-headset", volume: 0.3, muted: true)
+        await actions.onOpen()
+        XCTAssertEqual(h.audio.applied.map { $0.deviceUID }, ["usb-headset"])
+        XCTAssertEqual(h.audio.device("usb-headset")?.muted, false)
+        s = try XCTUnwrap(try h.store.loadState())
+        XCTAssertNil(s.savedOutputVolume)
+        XCTAssertNil(s.savedMuted)
+        XCTAssertNil(s.savedOutputDeviceUID)
+    }
+
+    /// At the session end a muted device that is still gone is dropped from
+    /// the journal, so the end completes, and the menu says it is muted.
+    /// The default output is not touched.
+    func testSessionEndWithTheMutedDeviceDisconnectedDropsItAndSaysSo() async throws {
+        let (m, actions) = await make()
+        h.audio.connect("usb-headset", volume: 0.3)
+        await m.start(duration: 3600)
+        await actions.onClose()
+        h.audio.disconnect("usb-headset")
+
+        await m.end(reason: .timer)
+
+        XCTAssertEqual(h.audio.applied.count, 0)
+        XCTAssertFalse(h.audio.muted)
+        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
+        XCTAssertFalse(m.isActive)
+        let error = try XCTUnwrap(m.lastError)
+        XCTAssertTrue(error.contains("usb-headset"), error)
+        XCTAssertTrue(error.contains("still muted"), error)
+        XCTAssertFalse(h.notifier.posts.contains { $0.title == SessionManager.incompleteTitle })
+    }
+
     /// The whole lid-close transaction, each journal write and the side
     /// effect that follows it, runs under the recovery lock: a backstop that
     /// wakes up in between cannot restore from a journal whose SIGSTOP or

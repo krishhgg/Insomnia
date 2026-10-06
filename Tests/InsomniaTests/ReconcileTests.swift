@@ -237,6 +237,7 @@ final class ReconcileTests: XCTestCase {
         XCTAssertEqual(h.audio.applied.count, 1)
         XCTAssertEqual(h.audio.applied.first?.volume, 0.6)
         XCTAssertEqual(h.audio.applied.first?.muted, false)
+        XCTAssertNil(h.audio.applied.first?.deviceUID ?? nil, "an entry without a device restores the default output")
         XCTAssertEqual(m.state, after)
     }
 

@@ -94,6 +94,10 @@ struct RuntimeState: Codable, Equatable, Sendable {
     /// nil when mute is off or the lid is open.
     var savedOutputVolume: Float? = nil
     var savedMuted: Bool? = nil
+    /// UID of the output device the two values above were read from and
+    /// that lid close muted. nil in an entry from a build that did not
+    /// record it, which restores the default output device.
+    var savedOutputDeviceUID: String? = nil
     /// Built-in display brightness (0...1) before the lid close set it to 0;
     /// nil when darkening is off or the lid is open.
     var savedDisplayBrightness: Float? = nil
@@ -132,7 +136,7 @@ struct RuntimeState: Codable, Equatable, Sendable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case sleepDisabledByUs, lowPowerSetByUs, frozenProcesses, frozenPids, dockerFrozen, savedOutputVolume, savedMuted
+        case sleepDisabledByUs, lowPowerSetByUs, frozenProcesses, frozenPids, dockerFrozen, savedOutputVolume, savedMuted, savedOutputDeviceUID
         case savedDisplayBrightness, savedKeyboardBrightness, displayRestoredUnderLowPower
         case appNapOverrides
     }
@@ -155,6 +159,7 @@ struct RuntimeState: Codable, Equatable, Sendable {
         dockerFrozen = try c.decodeIfPresent(Bool.self, forKey: .dockerFrozen) ?? false
         savedOutputVolume = try c.decodeIfPresent(Float.self, forKey: .savedOutputVolume)
         savedMuted = try c.decodeIfPresent(Bool.self, forKey: .savedMuted)
+        savedOutputDeviceUID = try c.decodeIfPresent(String.self, forKey: .savedOutputDeviceUID)
         savedDisplayBrightness = try c.decodeIfPresent(Float.self, forKey: .savedDisplayBrightness)
         savedKeyboardBrightness = try c.decodeIfPresent(Float.self, forKey: .savedKeyboardBrightness)
         displayRestoredUnderLowPower = try c.decodeIfPresent(Float.self, forKey: .displayRestoredUnderLowPower)
@@ -171,6 +176,7 @@ struct RuntimeState: Codable, Equatable, Sendable {
         try c.encode(dockerFrozen, forKey: .dockerFrozen)
         try c.encodeIfPresent(savedOutputVolume, forKey: .savedOutputVolume)
         try c.encodeIfPresent(savedMuted, forKey: .savedMuted)
+        try c.encodeIfPresent(savedOutputDeviceUID, forKey: .savedOutputDeviceUID)
         try c.encodeIfPresent(savedDisplayBrightness, forKey: .savedDisplayBrightness)
         try c.encodeIfPresent(savedKeyboardBrightness, forKey: .savedKeyboardBrightness)
         try c.encodeIfPresent(displayRestoredUnderLowPower, forKey: .displayRestoredUnderLowPower)

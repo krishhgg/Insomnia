@@ -52,6 +52,7 @@ RuntimeState {                // everything Insomnia changed and must undo
   dockerFrozen:       Bool
   savedOutputVolume:  Float?  // nil when mute is off or lid is open
   savedMuted:         Bool?
+  savedOutputDeviceUID: String?  // the output device both were read from and lid close muted; absent in older entries (default output)
   savedDisplayBrightness:  Float?  // nil when darkening is off or lid is open
   savedKeyboardBrightness: Float?  // nil when there is no backlight, too
   displayRestoredUnderLowPower: Float?  // restored on open under our Low Power Mode; written again when it ends
@@ -119,7 +120,7 @@ Quit, or reconcile.
 | Keyboard backlight (optional, same toggle) | save brightness, set it to 0 | restore the saved brightness |
 | Freeze scope | `SIGSTOP` every process whose responsible app is in the freeze scope (rules below) | `SIGCONT` the recorded pids only |
 | Docker rule (default off) | if Docker Desktop is running and `docker ps -q` is empty, journal its tree, ask `docker ps -q` once more right before the SIGSTOP and freeze it only on a second clean empty answer; busy, a failed probe, a timeout, a lid open or a session end at either point leaves it running | resume |
-| Mute (optional, default on) | save volume and mute state, then mute | restore both exactly |
+| Mute (optional, default on) | save the default output's volume, mute state and device UID, then mute that device | restore both on that device, never on another output; if it is not connected the entry waits for the next lid open, and at session end it is dropped with a menu line saying that device is still muted |
 | Low Power Mode | on (optional, default on) | off unless a battery or thermal floor still wants it |
 | Countdown redraw | stop timer | restart timer |
 

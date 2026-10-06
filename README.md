@@ -160,7 +160,10 @@ The defaults are worth knowing:
   that starts between the second check and the pause is still paused with
   Desktop, so leave the rule off for Docker workloads an unexpected pause
   would hurt.
-- **Mute on close:** on, so sound stops when the lid closes.
+- **Mute on close:** on, so sound stops when the lid closes. Lid open
+  restores the output that was muted, even if another one is in use by then.
+  If that output is not connected when the session ends, it stays muted and
+  the menu says so.
 - **Microphone:** on Mac laptops with Apple silicon or a T2 chip, closing the
   lid disconnects the built-in microphone in hardware. Recording a meeting
   with the lid closed needs AirPods or an external mic; Settings says the same
