@@ -69,7 +69,7 @@ four power-setting commands. Review that permission before installing.
 | `~/Applications/Insomnia.app` | The menu bar app, with `backstop.sh` sealed inside it at `Contents/Resources` |
 | `~/Library/Application Support/Insomnia/` | Configuration and the session/recovery journals |
 | `~/Library/LaunchAgents/com.insomnia.backstop.plist` | Per-user recovery agent: verifies the app's code signature, then runs the sealed `backstop.sh` |
-| `~/Library/Logs/Insomnia/` | `insomnia.log` and `handoffs.log` |
+| `~/Library/Logs/Insomnia/` | `insomnia.log` and `handoffs.log`, each capped at 1 MiB with one older copy kept as `.1`, unless you replace it with a symlink |
 | `/etc/sudoers.d/insomnia` | Permission for the four commands below |
 
 ```text
@@ -163,15 +163,18 @@ and check the status menu and `~/Library/Logs/Insomnia/insomnia.log` afterward.
 ## What happens when the lid closes
 
 <p align="center">
-  <img src="docs/assets/lid-actions.svg" alt="Illustrated Settings defaults: Slack, WhatsApp, and Discord on the freeze list, Docker's idle rule on, mute off. During a session, lid close applies configured actions; reopening attempts to resume verified owned freezes and restore saved audio. The session continues. Without an active session, lid changes do nothing." width="880">
+  <img src="docs/assets/lid-actions.svg" alt="Illustrated Settings defaults: Slack, WhatsApp, and Discord on the freeze list, Docker's idle rule off, mute off. During a session, lid close applies configured actions; reopening attempts to resume verified owned freezes and restore saved audio. The session continues. Without an active session, lid changes do nothing." width="880">
 </p>
 
 During a session, Insomnia turns the display and keyboard backlight off
 (saving their brightness first), pauses the apps on the freeze list (and, if
 you opt in, every other Dock app that is not an agent app), checks whether
 Docker Desktop is idle before pausing it, and can save then mute audio.
-Reopening the lid attempts to undo those lid actions. **The timer keeps
-counting down while the lid is closed**; only its on-screen redraw pauses.
+Reopening the lid attempts to undo those lid actions. If the lid opens
+while Insomnia is still checking Docker, Docker is left running and the undo
+starts right away. **The timer keeps counting down while the lid is
+closed**; only its on-screen redraw pauses, also for a session started with
+the lid already closed.
 
 The display step exists because the sleep guard stops macOS from doing it:
 with sleep disabled, closing the lid no longer turns the panel or the keys off
@@ -196,9 +199,13 @@ The defaults are worth knowing:
   apps are never picked up automatically; add them to the freeze list if you
   want them paused. Settings shows a "Would freeze now" line listing what the
   automatic scope would pause at that moment.
-- **Docker rule:** enabled, with a separate local Docker Desktop idle check.
-  Container startup can race that check; disable the rule for important Docker
-  workloads where an unexpected pause would be disruptive.
+- **Docker rule:** off. Turn it on to pause Docker Desktop on lid close when
+  no container is running. The local Desktop socket is asked once to pick
+  Docker up and once more right before the pause; a busy answer, a failed
+  `docker ps` or a timeout at either point leaves Docker running. A container
+  that starts between the second check and the pause is still paused with
+  Desktop, so leave the rule off for Docker workloads an unexpected pause
+  would hurt.
 - **Mute on close:** off.
 - **Display and keyboard backlight:** on ("Turn off the display and keyboard
   backlight" in Settings). Both values are saved to the journal before they
@@ -419,6 +426,21 @@ Lines the app writes to `insomnia.log` also go to the unified log with their
 bodies marked private, so `log show` and other local programs see `<private>`
 in place of the text unless private data logging is enabled on the Mac. The
 backstop's lines go only to `insomnia.log`, which keeps the full text of both.
+The files in Application Support/Insomnia and Logs/Insomnia (config, session,
+journal, recovery lock, the two logs) are owner-only, mode 0600 with those two
+directories 0700, and one left looser by an older build is tightened the next
+time the app or the backstop opens it. Insomnia sets only these modes and
+leaves any access control list (ACL) on these files and folders as it is, so
+an ACL someone added, or one inherited from a parent folder, can still give
+another account access (`ls -le` shows it). The LaunchAgent plist and the installed
+scripts hold no private data and keep the modes the installer gives them.
+`insomnia.log` and `handoffs.log` are capped at 1 MiB: a
+log past the cap is renamed to `insomnia.log.1` or `handoffs.log.1`,
+replacing the previous copy, and a new file starts. The cap does not apply
+to a log you replace with a symlink. Insomnia writes through the link and
+never rotates it, since the rename would move the link and not the file it
+points to, and it logs that once. You set up the link, so trimming the file
+it points to is up to you.
 
 `INSOMNIA_HOME` relocates app support files, logs, and LaunchAgents for testing.
 It is **not an installation sandbox**: installation/removal also involves the
