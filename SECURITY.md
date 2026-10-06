@@ -19,12 +19,9 @@ The lines the app writes to `insomnia.log` also reach the unified log with the
 body marked private, so programs reading `log show` see `<private>` instead of
 those names unless private data logging is enabled on the Mac. The files
 Insomnia creates (logs, journal, session, config, recovery lock) are mode 0600
-and its directories 0700; the backstop runs with `umask 077`. An access
-control list on them, such as one inherited from a parent folder, is removed,
-new files included, when the owner's mode bits already give the owner read and
-write (and search, for a directory). When they do not, an entry may be what
-lets recovery read its journal, so the ACL stays, a warning in the log names
-the path, and any access it gives another account stays with it. Logs are capped at
+and its directories 0700; the backstop runs with `umask 077`. Insomnia sets
+only these modes and leaves any access control list (ACL) on these files as it
+is, so an ACL someone added can still give another account access. Logs are capped at
 1 MiB with one older copy kept. A log the user replaced with a symlink is not
 rotated: the file it points to is the user's to manage. Hotspot passwords are stored in the login
 Keychain. Location Services access is requested only when a hotspot is saved or

@@ -111,7 +111,7 @@ struct Store: Sendable {
         if let problem = try OwnerOnly.createDirectory(dir) { OwnerOnly.reportOnce(problem) }
         let tmp = dir.appendingPathComponent(".\(url.lastPathComponent).tmp-\(UUID().uuidString)")
         do {
-            if let problem = try OwnerOnly.createFile(at: tmp, contents: data) { OwnerOnly.reportOnce(problem) }
+            try OwnerOnly.createFile(at: tmp, contents: data)
         } catch {
             try? FileManager.default.removeItem(at: tmp)
             throw error

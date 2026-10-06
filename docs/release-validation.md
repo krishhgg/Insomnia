@@ -140,7 +140,7 @@ is performed. Do not replace "not run" with "passed" based on source review.
 | Unreadable battery (IOKit miss) ends the session on a laptop after the second read; desktop unaffected | Not run |
 | Settings floor steppers keep the end floor below the Low Power Mode floor by moving the other stepper | Not run |
 | Install/upgrade/uninstall with recoverable failure conditions | Not run |
-| First launch over an existing install tightens Application Support/Insomnia and Logs/Insomnia to 0700 and their files to 0600, and removes any ACL on them (`ls -le` shows no entries) | Not run |
+| First launch over an existing install tightens Application Support/Insomnia and Logs/Insomnia to 0700 and their files to 0600 | Not run |
 | Launch at login survives a reinstall by install.sh, including a second install.sh run on the same unchanged build (switch on, reinstall, relaunch: the log shows the launch-time check, System Settings > General > Login Items lists Insomnia as enabled, and the Settings switch reads on; a pending approval shows the note and the Open Login Items button) | Not run |
 | Launch at login heals on the first upgrade from a build without the install record (switch on in the previous build, upgrade with install.sh, relaunch: the log shows "registering once and recording the install", Login Items lists Insomnia, and config.json has `launchAtLoginInstall`) | Not run |
 | Launch at login removed in System Settings stays removed (switch on, relaunch once so the install is on file, remove Insomnia under System Settings > General > Login Items, relaunch: the log says the removal was respected, the Settings switch is off, and Login Items does not list Insomnia again) | Not run |

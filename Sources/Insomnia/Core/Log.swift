@@ -18,11 +18,6 @@ enum Log {
         append(level: "info", message)
     }
 
-    static func warning(_ message: String) {
-        logger.warning("\(message, privacy: .private)")
-        append(level: "warning", message)
-    }
-
     static func error(_ message: String) {
         logger.error("\(message, privacy: .private)")
         append(level: "error", message)

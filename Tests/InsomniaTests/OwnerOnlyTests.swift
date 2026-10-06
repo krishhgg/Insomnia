@@ -225,13 +225,12 @@ final class OwnerOnlyTests: XCTestCase {
         XCTAssertEqual(try mode(home.paths.logs), 0o755)
     }
 
-    /// A symlinked config.json is read, but the target's mode and ACL are
-    /// not touched: it may be shared with other users or programs. Same for
-    /// a Logs directory that is a symlink elsewhere.
+    /// A symlinked config.json is read, but the target's mode is not
+    /// touched: it may be shared with other users or programs. Same for a
+    /// Logs directory that is a symlink elsewhere.
     func testSymlinkedFileAndDirectoryAreLeftAlone() throws {
         let shared = home.root.appendingPathComponent("shared-config.json")
         try writeLoose(#"{"lowPowerFloor": 25}"#, to: shared)
-        try TestACL.grantMadeUpGroup(shared)
         try FileManager.default.createDirectory(at: home.paths.appSupport, withIntermediateDirectories: true)
         try FileManager.default.createSymbolicLink(at: home.paths.configFile, withDestinationURL: shared)
         let store = Store(paths: home.paths)
@@ -241,7 +240,6 @@ final class OwnerOnlyTests: XCTestCase {
         XCTAssertEqual(try mode(shared), 0o644)
         let elsewhere = home.root.appendingPathComponent("elsewhere")
         try FileManager.default.createDirectory(at: elsewhere, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o755])
-        try TestACL.grantMadeUpGroup(elsewhere, inherit: true)
         try? FileManager.default.removeItem(at: home.paths.logs)
         try FileManager.default.createSymbolicLink(at: home.paths.logs, withDestinationURL: elsewhere)
 
@@ -249,11 +247,9 @@ final class OwnerOnlyTests: XCTestCase {
 
         XCTAssertEqual(try mode(elsewhere), 0o755)
         XCTAssertTrue(try String(contentsOf: home.paths.logFile, encoding: .utf8).hasSuffix("insomnia: via symlink\n"))
-        XCTAssertEqual(TestACL.entries(home.paths.logFile), 0, "the log Insomnia created there kept the entry it inherited")
 
         let sharedLog = home.root.appendingPathComponent("shared.log")
         try writeLoose("", to: sharedLog)
-        try TestACL.grantMadeUpGroup(sharedLog)
         try FileManager.default.removeItem(at: home.paths.logFile)
         try FileManager.default.createSymbolicLink(at: home.paths.logFile, withDestinationURL: sharedLog)
 
@@ -273,119 +269,6 @@ final class OwnerOnlyTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: OwnerOnly.rotated(home.paths.logFile).path))
         XCTAssertTrue(try String(contentsOf: sharedLog, encoding: .utf8).hasSuffix("past the cap\nagain\n"))
         XCTAssertEqual(try mode(sharedLog), 0o644)
-        for target in [shared, elsewhere, sharedLog] {
-            XCTAssertEqual(TestACL.entries(target), 1, "\(target.path) is not Insomnia's")
-        }
-    }
-
-    // MARK: Access control lists
-
-    /// A tree copied with an ACL entry for another account on each
-    /// directory and file. The owner bits give Insomnia all it needs (0700
-    /// directories; a 0600 log, config and lock), so the owner needs no
-    /// entry, and each ACL goes when Insomnia next opens the file or
-    /// creates the directory.
-    func testACLIsRemovedWhenTheOwnerBitsGiveInsomniaAccess() throws {
-        try writeLoose(#"{"lowPowerFloor": 25}"#, to: home.paths.configFile, mode: 0o600)
-        try writeLoose("old line\n", to: home.paths.logFile, mode: 0o600)
-        try writeLoose("", to: home.paths.recoveryLock, mode: 0o600)
-        let tree = [home.paths.appSupport, home.paths.logs, home.paths.configFile, home.paths.logFile, home.paths.recoveryLock]
-        for url in tree {
-            try TestACL.grantMadeUpGroup(url, inherit: url.hasDirectoryPath)
-            XCTAssertEqual(TestACL.entries(url), 1, url.path)
-        }
-
-        try home.paths.createDirectories()
-        XCTAssertEqual(try Store(paths: home.paths).loadConfig()?.lowPowerFloor, 25)
-        try OwnerOnly.appendToLog("new line\n", at: home.paths.logFile)
-        let handle = try XCTUnwrap(try RecoveryLock(url: home.paths.recoveryLock).tryAcquire())
-        handle.release()
-
-        for url in tree {
-            XCTAssertEqual(TestACL.entries(url), 0, url.path)
-        }
-        XCTAssertEqual(try String(contentsOf: home.paths.logFile, encoding: .utf8), "old line\nnew line\n")
-    }
-
-    /// The standard layout, under a stand-in for ~/Library whose
-    /// Application Support and Logs folders (not Insomnia's) carry an
-    /// inheritable entry for another account. Insomnia's 0700 directories
-    /// inherit it and lose it; every file Insomnia creates in them has
-    /// none, and a file created straight in such a folder loses its
-    /// inherited entry before the first byte. The two parents keep theirs.
-    func testInheritedACLIsRemovedFromWhatInsomniaCreates() throws {
-        let library = home.root.appendingPathComponent("Library", isDirectory: true)
-        let paths = Paths(
-            appSupport: library.appendingPathComponent("Application Support/Insomnia", isDirectory: true),
-            logs: library.appendingPathComponent("Logs/Insomnia", isDirectory: true),
-            launchAgents: library.appendingPathComponent("LaunchAgents", isDirectory: true)
-        )
-        let parents = [paths.appSupport.deletingLastPathComponent(), paths.logs.deletingLastPathComponent()]
-        for parent in parents {
-            try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
-            try TestACL.grantMadeUpGroup(parent, inherit: true)
-        }
-
-        XCTAssertNil(try OwnerOnly.createDirectory(paths.appSupport))
-        try paths.createDirectories()
-        try Store(paths: paths).saveConfig(Config())
-        try OwnerOnly.appendToLog("line\n", at: paths.logFile)
-        let handle = try XCTUnwrap(try RecoveryLock(url: paths.recoveryLock).tryAcquire())
-        handle.release()
-        let direct = parents[0].appendingPathComponent("direct.json")
-        XCTAssertNil(try OwnerOnly.createFile(at: direct, contents: Data("{}".utf8)))
-
-        for url in [paths.appSupport, paths.logs, paths.configFile, paths.logFile, paths.recoveryLock, direct] {
-            XCTAssertEqual(TestACL.entries(url), 0, url.path)
-        }
-        for parent in parents {
-            XCTAssertEqual(TestACL.entries(parent), 1, "\(parent.path) is not Insomnia's")
-        }
-    }
-
-    /// A 0200 journal its owner reads only through an ACL entry: the owner
-    /// bits fall short, so the ACL stays, the other account's entry with
-    /// it, and one warning names the path over two reads.
-    func testACLStaysWithAWarningWhenTheOwnerBitsFallShort() throws {
-        let store = Store(paths: home.paths)
-        var dirty = RuntimeState()
-        dirty.sleepDisabledByUs = true
-        try store.saveState(dirty)
-        let journal = home.paths.stateFile
-        XCTAssertEqual(chmod(journal.path, 0o200), 0)
-        try TestACL.grantOwnerRead(journal)
-        try TestACL.grantMadeUpGroup(journal)
-
-        XCTAssertEqual(try store.loadState(), dirty)
-        XCTAssertEqual(try store.loadState(), dirty)
-
-        XCTAssertEqual(TestACL.entries(journal), 2)
-        XCTAssertEqual(try mode(journal), 0o200)
-        let log = try String(contentsOf: home.paths.logFile, encoding: .utf8)
-        let warnings = log.split(separator: "\n").filter { $0.contains("access control list") }
-        XCTAssertEqual(warnings.count, 1, log)
-        XCTAssertTrue(warnings.first?.hasSuffix("[warning] insomnia: \(OwnerOnlyError.aclKept(path: journal.path).localizedDescription)") ?? false, log)
-    }
-
-    /// A Logs folder whose ACL stays (0300: the owner cannot list it) and
-    /// passes an entry for another account down to new files. The new log
-    /// is checked before its first line and loses the inherited entry; the
-    /// folder's kept ACL is thrown once, after the line is written.
-    func testNewLogInAFolderThatKeepsItsACLIsCheckedBeforeTheFirstLine() throws {
-        try FileManager.default.createDirectory(at: home.paths.logs, withIntermediateDirectories: true)
-        try TestACL.grantMadeUpGroup(home.paths.logs, inherit: true)
-        XCTAssertEqual(chmod(home.paths.logs.path, 0o300), 0)
-        defer { _ = chmod(home.paths.logs.path, 0o700) }
-
-        XCTAssertThrowsError(try OwnerOnly.appendToLog("line\n", at: home.paths.logFile)) { error in
-            guard case .aclKept(let path)? = error as? OwnerOnlyError else { return XCTFail("\(error)") }
-            XCTAssertEqual(path, home.paths.logs.path)
-        }
-        XCTAssertNoThrow(try OwnerOnly.appendToLog("again\n", at: home.paths.logFile), "warned once per path")
-
-        XCTAssertEqual(TestACL.entries(home.paths.logFile), 0)
-        XCTAssertEqual(TestACL.entries(home.paths.logs), 1)
-        XCTAssertEqual(try String(contentsOf: home.paths.logFile, encoding: .utf8), "line\nagain\n")
     }
 
     // MARK: Journal, session, config
