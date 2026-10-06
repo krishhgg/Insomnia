@@ -28,6 +28,10 @@ final class SystemStatus {
     /// line when a session starts; the end of a session leaves them, since
     /// the browsers they name may still be closed.
     var relaunchProblems: [String: String] = [:]
+    /// Why the failover could not join the hotspot this session, if a join
+    /// was skipped for want of a readable password, and for which SSID.
+    /// The menu shows it while that SSID is the one configured.
+    var hotspotPasswordReport: HotspotPasswordReport?
 
     @ObservationIgnored var refresher: (@MainActor () async -> Void)?
 
@@ -131,6 +135,7 @@ final class AppServices {
         self.manager = manager
         let config = manager.config
         status.lastGap = nil
+        status.hotspotPasswordReport = nil
         status.relaunchProblems = [:]
 
         if !config.hotspotSSID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -173,6 +178,7 @@ final class AppServices {
             manager?.config ?? Config()
         }
         net.onRecovered = { [weak self] gap in self?.status.lastGap = gap }
+        net.onPasswordReport = { [weak self] report in self?.status.hotspotPasswordReport = report }
         network = net
         networkTask = Task { [weak self, weak net] in
             guard let self, let net else { return }
@@ -208,6 +214,7 @@ final class AppServices {
         cancelBrowserTasks()
         network?.stop()
         network = nil
+        status.hotspotPasswordReport = nil
         lidActions = nil
         floors = nil
         syncState()
@@ -304,6 +311,18 @@ final class AppServices {
         }
         browserTasks.append(task)
         await task.value
+    }
+
+    /// Settings saved or cleared the hotspot password and made `change`:
+    /// the menu line about the old one no longer applies, unless it is
+    /// about the hotspot configured now and the save touched neither of
+    /// its items (`HotspotPasswordReport.stands`), and the next outage
+    /// reports afresh.
+    func hotspotPasswordChanged(_ change: HotspotPasswordChange, configuredSSID: String) {
+        if status.hotspotPasswordReport?.stands(after: change, configuredSSID: configuredSSID) != true {
+            status.hotspotPasswordReport = nil
+        }
+        network?.passwordChanged(change, configuredSSID: configuredSSID)
     }
 
     /// Re-run the floors with the current inputs. Settings that change a

@@ -39,10 +39,18 @@
 ## Install
 
 Requires **macOS 26 or later** and **Xcode with Swift 6.2 or later**. Installation
-currently means building from source:
+currently means building from source.
+
+Paste this into your coding agent:
+
+```text
+Install Insomnia from https://github.com/krishhgg/Insomnia by following its README. If a step needs my password, give me the command to run in Terminal.
+```
+
+Or run it yourself:
 
 ```bash
-git clone https://github.com/kgarg2468/Insomnia.git
+git clone https://github.com/krishhgg/Insomnia.git
 cd Insomnia
 ./scripts/install.sh
 open "$HOME/Applications/Insomnia.app"
@@ -220,8 +228,24 @@ installation scenarios still need [release validation](docs/release-validation.m
   stopped. Verify the live process and whether it should be resumed; never
   blindly signal a PID from an old log.
 - **Identity is not an atomic guarantee:** the app checks start time to the
-  microsecond; the shell checks to the second. A lookup and a signal are still
-  separate operations.
+  microsecond, and the backstop asks the installed app binary
+  (`Insomnia --resume-frozen`) to do the same check and send the signal for
+  every entry that records microseconds, all such entries in one call with a
+  30-second limit. The entries go to the binary on standard input, so a long
+  journal cannot exceed the argument size limit. The backstop never signals those entries itself. It keeps
+  them when the binary is missing, does not finish in time, or answers
+  anything but one expected line per entry. It runs the binary only when the
+  installed bundle declares `InsomniaResumeFrozenVersion` in its
+  `Info.plist`, so it never starts an older build. The binary holds the
+  recovery lock while it can still send a signal and ends itself after the
+  same limit, so a backstop run that is killed mid-call leaves no helper
+  that could act later without the lock. `uninstall.sh` uses the backstop
+  installed with an app that does not declare that version. With no such
+  copy, the checkout's backstop keeps those entries and uninstall stops
+  before removing anything. Entries written by builds before
+  microseconds were recorded keep the one-second `ps` comparison in the
+  shell. A lookup and a signal are still separate operations, one pid at a
+  time.
 - **Stuck power commands:** a `sudo pmset` that has not finished after 20 s
   is sent SIGTERM, never SIGKILL: killing sudo could leave a root pmset
   changing power settings after the journal has moved on. If it is still
@@ -280,6 +304,30 @@ enter the hotspot SSID and password in Insomnia Settings. The password is
 stored in the login Keychain under service `insomnia-hotspot`. Insomnia uses
 CoreWLAN to find and join that network without putting the password in process
 arguments.
+
+The Keychain item's access list names only the build of Insomnia that saved
+it, and Insomnia reads it with Keychain prompts switched off, so a join during
+an outage never raises a dialog. The installer signs each build ad hoc, which
+gives every install a new identity: after a reinstall the saved password is
+unreadable by the new build. Insomnia then skips the join, shows "Hotspot
+password unreadable by this build" in the right-click menu and in Settings,
+and sends one notification per outage. The warning belongs to the SSID it was
+read for. Change the SSID and it goes, and Settings checks the new SSID's
+saved password instead. Enter the password again in Settings and save; the
+save writes the new password before it removes the old item,
+and macOS may ask you to allow Insomnia to delete the old one, or to unlock
+the login keychain. If that save is cut off after the old item is gone,
+the password reads as missing and you enter it once more: Insomnia never
+reads a half-finished save's copy. The Save button reads "Saving…" until
+macOS answers, and "Saved" only while the SSID and password fields still
+hold what was saved. A join that was waiting while you changed the SSID is
+dropped, and the next retry uses the new SSID. A Settings read that was
+waiting is dropped too, and Settings reads the new SSID's password instead.
+Anything you type in the password field while Settings is still loading the
+saved one stays, even if you delete it again. The rest of Insomnia,
+including the battery floor and End, keeps running while the dialog is open.
+A build signed with a stable identity would keep the item readable across
+upgrades.
 
 macOS requires Location Services permission to reveal network names. Insomnia
 requests it on the first hotspot save, or when starting a session with a
