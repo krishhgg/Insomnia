@@ -163,7 +163,7 @@ struct SettingsView: View {
                     Text(notice.settingsLine)
                         .font(.callout)
                     Spacer()
-                    Button("Dismiss") { update { $0.lidCloseDefaultsNotice = nil } }
+                    Button("Dismiss") { manager.dismissLidCloseNotice() }
                 }
             }
             Toggle("Turn off the display and keyboard backlight", isOn: bind(\.darkenDisplayOnLidClose))

@@ -451,6 +451,29 @@ final class ConfigLoadTests: XCTestCase {
         XCTAssertEqual(h.notifier.posts.filter { $0.title == LidCloseDefaultsChange.title }.count, 1)
     }
 
+    /// Settings' Dismiss clears the notice in config.json, and a relaunch
+    /// neither brings the line back nor posts the notification again.
+    func testDismissingTheLidCloseNoticeIsSavedAndStaysDismissed() async throws {
+        try writeEarlierBuildConfig(#"{"freezeAllApps": true, "muteOnLidClose": false}"#)
+        let m = h.makeManager()
+        await m.reconcile()
+        XCTAssertNotNil(m.config.lidCloseDefaultsNotice)
+
+        m.dismissLidCloseNotice()
+
+        XCTAssertNil(m.config.lidCloseDefaultsNotice)
+        let saved = try XCTUnwrap(try h.store.loadConfig())
+        XCTAssertNil(saved.lidCloseDefaultsNotice, "the dismissal was not saved")
+        XCTAssertTrue(saved.lidCloseDefaultsApplied)
+        XCTAssertFalse(saved.freezeAllApps, "dismissing changes only the notice")
+        XCTAssertTrue(saved.muteOnLidClose, "dismissing changes only the notice")
+
+        let again = h.makeManager()
+        await again.reconcile()
+        XCTAssertNil(again.config.lidCloseDefaultsNotice)
+        XCTAssertEqual(h.notifier.posts.count, 1, "only the first launch announces the update")
+    }
+
     /// A user who turns either setting back after the update is never
     /// overridden again.
     func testASettingTurnedBackAfterTheUpdateStaysBack() async throws {

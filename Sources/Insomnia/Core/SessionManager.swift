@@ -1088,6 +1088,19 @@ final class SessionManager {
         notifier.post(title: LidCloseDefaultsChange.title, body: change.notificationBody)
     }
 
+    /// Settings' Dismiss on the lid-close update line. Saved to config.json,
+    /// whose mark keeps the update from running again, so the line stays
+    /// gone after a relaunch. A failed save leaves it dismissed for this run.
+    func dismissLidCloseNotice() {
+        guard config.lidCloseDefaultsNotice != nil else { return }
+        config.lidCloseDefaultsNotice = nil
+        do {
+            try store.saveConfig(config)
+        } catch {
+            Log.error("could not save config: \(error.localizedDescription)")
+        }
+    }
+
     private func performReconcile() async {
         let now = clock()
         keptSessionFile = nil

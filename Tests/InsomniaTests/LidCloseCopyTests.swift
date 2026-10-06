@@ -54,6 +54,6 @@ final class LidCloseCopyTests: XCTestCase {
         let lid = try lidSection()
         XCTAssertTrue(lid.contains("if let notice = manager.config.lidCloseDefaultsNotice"))
         XCTAssertTrue(lid.contains("Text(notice.settingsLine)"))
-        XCTAssertTrue(lid.contains(#"Button("Dismiss") { update { $0.lidCloseDefaultsNotice = nil } }"#))
+        XCTAssertTrue(lid.contains(#"Button("Dismiss") { manager.dismissLidCloseNotice() }"#))
     }
 }
