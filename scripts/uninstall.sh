@@ -1,11 +1,12 @@
 #!/bin/bash
 # Reverse install.sh. Quits the app, takes the recovery lock, runs the current
-# backstop with --force under that same lock (the checkout's copy, else the
-# one sealed in the installed bundle, else the writable copy older installs
-# left in Application Support), verifies for itself that the journal is
-# clean, and only then removes the LaunchAgent, the sudoers rule, the app
-# bundle (backstop.sh included), and the journal. Keeps config.json and the
-# logs unless --purge. Everything after the quit happens while this process holds
+# backstop with --force under that same lock (the checkout's copy when the
+# installed app declares the interface version it speaks, else the app's own:
+# the one sealed in the bundle, else the writable copy older installs left in
+# Application Support), verifies for itself that the journal is clean, and
+# only then removes the LaunchAgent, the sudoers rule, the app bundle
+# (backstop.sh included), and the journal. Keeps config.json and the logs
+# unless --purge. Everything after the quit happens while this process holds
 # APP_SUPPORT/.recovery.lock, so neither a queued periodic backstop nor a
 # relaunched app can republish the journal while it is being removed.
 #
@@ -66,6 +67,9 @@ QUIT_WAIT_SECONDS=10
 CALL_TIMEOUT_SECONDS=30
 APP="$HOME/Applications/Insomnia.app"
 SUDOERS=/etc/sudoers.d/insomnia
+# The --resume-frozen interface version this checkout's backstop.sh speaks
+# (see step 3).
+RESUME_FROZEN_VERSION=1
 
 if [[ -n "${INSOMNIA_HOME:-}" ]]; then
   APP_SUPPORT="$INSOMNIA_HOME"
@@ -592,16 +596,29 @@ if app_running; then
   exit 1
 fi
 
-# 3. Undo everything via the current backstop ---------------------------------
+# 3. Undo everything via a backstop that matches the installed app ----------
 # The backstop inherits fd 9 and shares this lock instead of waiting on it.
-# Newest first: the checkout's script, then the copy install.sh sealed into
-# the bundle, then the writable copy installs before that layout left in
-# $APP_SUPPORT. The sealed copy runs only while the bundle's signature still
-# verifies: its resource seal covers the script, so this is the check the
-# LaunchAgent runs (without the pinned requirement, which this script does
-# not have), and an edited copy is refused the same way.
+# This checkout's backstop.sh hands frozen entries that record microseconds
+# to the installed app binary, and runs that binary only when the bundle's
+# Info.plist declares InsomniaResumeFrozenVersion RESUME_FROZEN_VERSION (the
+# same value as in backstop.sh; a test keeps the two in step). So the
+# checkout's copy runs when the app declares that version. An app that does
+# not was installed together with its own backstop.sh, which speaks its
+# version: the copy install.sh sealed into the bundle, or for installs before
+# that layout the writable copy in $APP_SUPPORT that the LaunchAgent runs.
+# That copy is used instead when it exists. The sealed copy runs only while
+# the bundle's signature still verifies: its resource seal covers the
+# script, so this is the check the LaunchAgent runs (without the pinned
+# requirement, which this script does not have), and an edited copy is
+# refused the same way. With neither copy this checkout's backstop runs
+# anyway: it keeps the entries that need the binary, and step 4 stops before
+# removing anything.
 step "Restoring the machine via backstop --force"
-if [[ -f "$ROOT/scripts/backstop.sh" ]]; then
+installed_version=""
+if [[ -f "$APP/Contents/Info.plist" ]]; then
+  installed_version="$(extract "$APP/Contents/Info.plist" InsomniaResumeFrozenVersion || true)"
+fi
+if [[ -f "$ROOT/scripts/backstop.sh" ]] && { [[ "$installed_version" == "$RESUME_FROZEN_VERSION" ]] || { [[ ! -f "$APP/Contents/Resources/backstop.sh" ]] && [[ ! -f "$APP_SUPPORT/backstop.sh" ]]; }; }; then
   BACKSTOP="$ROOT/scripts/backstop.sh"
 elif [[ -f "$APP/Contents/Resources/backstop.sh" ]]; then
   verify_rc=0
@@ -622,6 +639,9 @@ elif [[ -f "$APP_SUPPORT/backstop.sh" ]]; then
 else
   echo "no backstop.sh found in $ROOT/scripts, $APP/Contents/Resources or $APP_SUPPORT; nothing was removed" >&2
   exit 1
+fi
+if [[ "$BACKSTOP" != "$ROOT/scripts/backstop.sh" && -f "$ROOT/scripts/backstop.sh" ]]; then
+  echo "$APP does not declare InsomniaResumeFrozenVersion $RESUME_FROZEN_VERSION; using the backstop installed with it, $BACKSTOP"
 fi
 echo "using $BACKSTOP"
 recovery_rc=0

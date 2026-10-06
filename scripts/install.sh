@@ -306,6 +306,10 @@ fi
 mkdir -p "$APP_DIR"
 STAGE="$("$MKTEMP" -d "$APP_DIR/.Insomnia.app.staging.$$.XXXXXX")"
 NEW_APP="$STAGE/Insomnia.app"
+# The bundle is built here and reaches $APP whole, in one rename under the
+# recovery lock (step 5), so backstop.sh never sees this binary beside an
+# older Info.plist or the reverse (it runs the binary's --resume-frozen mode
+# only once Info.plist declares InsomniaResumeFrozenVersion).
 mkdir -p "$NEW_APP/Contents/MacOS"
 cp "$BIN" "$NEW_APP/Contents/MacOS/Insomnia"
 cp "$ROOT/Resources/Info.plist" "$NEW_APP/Contents/Info.plist"

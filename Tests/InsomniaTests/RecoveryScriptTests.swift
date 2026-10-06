@@ -110,9 +110,8 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(fx.calls(), [
             "sudo -n \(fx.fakePmset) -a disablesleep 0",
             "sudo -n \(fx.fakePmset) -b lowpowermode 0",
-            "ps -o lstart=,stat=,uid= -p 4242",
-            "kill -CONT 4242",
-        ])
+            "Insomnia --resume-frozen 2 < 4242 \(started) 17 \(fx.bootUUID)",
+        ], "an entry with microseconds is resumed by the app binary, never by ps and kill")
         let s = try fx.stateJSON()
         XCTAssertEqual(s["sleepDisabledByUs"] as? Bool, false)
         XCTAssertEqual(s["lowPowerSetByUs"] as? Bool, false)
@@ -132,14 +131,15 @@ final class RecoveryScriptTests: XCTestCase {
            {"pid":111,"startedAt":\(started),"startedAtMicros":1,"bootSession":"\(fx.bootUUID)"},
            {"pid":222,"startedAt":\(started),"startedAtMicros":2,"bootSession":"\(fx.bootUUID)","note":"custom"}]}
         """)
-        try fx.psTable([(111, fx.lstart(started), "T", fx.uid), (222, fx.lstart(started), "T+", fx.uid)])
-        fx.setMode("kill.fail", "222")
+        try fx.insomniaTable([(222, "failed")])
 
         let r = try fx.run(fx.backstop)
 
         XCTAssertNotEqual(r.status, 0)
-        XCTAssertTrue(fx.calls().contains("kill -CONT 111"))
-        XCTAssertTrue(fx.calls().contains("kill -CONT 222"))
+        XCTAssertEqual(fx.calls(), [
+            "sudo -n \(fx.fakePmset) -a disablesleep 0",
+            "Insomnia --resume-frozen 2 < 111 \(started) 1 \(fx.bootUUID); 222 \(started) 2 \(fx.bootUUID)",
+        ], "both entries in one call, no ps and no kill")
         let s = try fx.stateJSON()
         XCTAssertEqual(s["sleepDisabledByUs"] as? Bool, false, "an unrelated stuck pid must not hold sleep disabled")
         let frozen = try XCTUnwrap(s["frozenProcesses"] as? [[String: Any]])
@@ -172,17 +172,19 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(fx.log().contains("444"), fx.log())
     }
 
+    /// Entries without microseconds (an older build) keep the one-second
+    /// ps comparison in the shell.
     func testGoneRunningOrMismatchedProcessesClearWithoutSignal() throws {
         try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
         let started = 1_789_388_423
         try fx.writeState("""
         {"sleepDisabledByUs":false,"lowPowerSetByUs":false,"dockerFrozen":true,
          "frozenProcesses":[
-           {"pid":301,"startedAt":\(started),"startedAtMicros":0,"bootSession":"\(fx.bootUUID)"},
-           {"pid":302,"startedAt":\(started),"startedAtMicros":0,"bootSession":"\(fx.bootUUID)"},
-           {"pid":303,"startedAt":\(started),"startedAtMicros":0,"bootSession":"\(fx.bootUUID)"},
-           {"pid":304,"startedAt":\(started),"startedAtMicros":0,"bootSession":"other-boot"},
-           {"pid":305,"startedAt":\(started),"startedAtMicros":0,"bootSession":"\(fx.bootUUID)"}]}
+           {"pid":301,"startedAt":\(started),"bootSession":"\(fx.bootUUID)"},
+           {"pid":302,"startedAt":\(started),"bootSession":"\(fx.bootUUID)"},
+           {"pid":303,"startedAt":\(started),"bootSession":"\(fx.bootUUID)"},
+           {"pid":304,"startedAt":\(started),"bootSession":"other-boot"},
+           {"pid":305,"startedAt":\(started),"bootSession":"\(fx.bootUUID)"}]}
         """)
         try fx.psTable([
             // 301 is gone (not in the table).
@@ -195,7 +197,7 @@ final class RecoveryScriptTests: XCTestCase {
         let r = try fx.run(fx.backstop)
 
         XCTAssertEqual(r.status, 0, r.stderr)
-        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("kill") }, "\(fx.calls())")
+        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("kill") || $0.hasPrefix("Insomnia") }, "\(fx.calls())")
         XCTAssertFalse(fx.calls().contains("ps -o lstart=,stat=,uid= -p 304"), "another boot needs no lookup")
         let s = try fx.stateJSON()
         XCTAssertEqual((s["frozenProcesses"] as? [Any])?.count, 0)
@@ -1418,6 +1420,119 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(ids, Config.defaultAgentList)
     }
 
+    /// The --resume-frozen interface version is the same in the binary, in
+    /// the bundle's Info.plist, and in the two scripts that check it.
+    func testTheResumeFrozenVersionIsTheSameEverywhere() throws {
+        let scripts = ScriptFixture.productionScripts
+        let info = scripts.deletingLastPathComponent().appendingPathComponent("Resources/Info.plist")
+        let plist = try XCTUnwrap(try PropertyListSerialization.propertyList(from: Data(contentsOf: info), format: nil) as? [String: Any])
+        XCTAssertEqual(plist["InsomniaResumeFrozenVersion"] as? Int, ResumeFrozenCommand.version)
+        for name in ["backstop.sh", "uninstall.sh"] {
+            let text = try String(contentsOf: scripts.appendingPathComponent(name), encoding: .utf8)
+            let lines = text.split(separator: "\n").filter { $0.hasPrefix("RESUME_FROZEN_VERSION=") }
+            XCTAssertEqual(lines, ["RESUME_FROZEN_VERSION=\(ResumeFrozenCommand.version)"], name)
+        }
+    }
+
+    /// uninstall.sh from a newer checkout must not run its own backstop.sh
+    /// against an installed app that lacks the --resume-frozen mode that
+    /// backstop needs. When the installed Info.plist does not declare the
+    /// version, the backstop.sh installed with that app restores the
+    /// machine instead: the copy sealed in its bundle, or for an install
+    /// before that layout the writable copy in Application Support (each
+    /// the copy its LaunchAgent runs). Here that copy is a stand-in that
+    /// records its run.
+    func testUninstallUsesTheInstalledBackstopWhenTheAppDoesNotDeclareTheVersion() throws {
+        for version in [nil, "2"] as [String?] {
+            for sealed in [true, false] {
+                let f = try ScriptFixture()
+                defer { f.destroy() }
+                try f.installMachinery()
+                try ScriptFixture.infoPlist(resumeFrozenVersion: version).write(to: f.appInfo, atomically: true, encoding: .utf8)
+                let copy = sealed ? f.installedBackstop : f.legacyBackstop
+                if !sealed { try FileManager.default.removeItem(at: f.installedBackstop) }
+                try "printf 'installed backstop %s\\n' \"$*\" >> '\(f.callsLog.path)'\n".write(to: copy, atomically: true, encoding: .utf8)
+                try f.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+
+                let r = try f.run(f.uninstall)
+
+                let label = "\(version ?? "no key"), \(sealed ? "sealed" : "legacy") copy"
+                XCTAssertEqual(r.status, 0, "\(label): \(r.stderr)")
+                XCTAssertTrue(f.calls().contains("installed backstop --force"), "\(label): \(f.calls())")
+                XCTAssertTrue(r.stdout.contains("does not declare InsomniaResumeFrozenVersion 1; using the backstop installed with it, \(copy.path)"), "\(label): \(r.stdout)")
+            }
+        }
+    }
+
+    /// An installed app that declares the version gets this checkout's
+    /// backstop.sh, which reads the same Info.plist, hands the frozen entry
+    /// to the app binary and clears it. That holds with installed copies
+    /// present (stand-ins, sealed and legacy, that must not run) and with
+    /// no installed copy.
+    func testUninstallUsesTheCheckoutBackstopWhenTheAppDeclaresTheVersion() throws {
+        for installedCopy in [true, false] {
+            let f = try ScriptFixture()
+            defer { f.destroy() }
+            try f.installMachinery()
+            if installedCopy {
+                for copy in [f.installedBackstop, f.legacyBackstop] {
+                    try "printf 'installed backstop %s\\n' \"$*\" >> '\(f.callsLog.path)'\n".write(to: copy, atomically: true, encoding: .utf8)
+                }
+            } else {
+                try FileManager.default.removeItem(at: f.installedBackstop)
+            }
+            try writeFrozenEntryForUninstall(f)
+
+            let r = try f.run(f.uninstall)
+
+            let label = installedCopy ? "installed copy" : "no installed copy"
+            XCTAssertEqual(r.status, 0, "\(label): \(r.stderr) \(f.log())")
+            XCTAssertFalse(f.calls().contains("installed backstop --force"), "\(label): \(f.calls())")
+            XCTAssertTrue(f.calls().contains("Insomnia --resume-frozen 2 < 5311 1789388423 11 \(f.bootUUID)"), "\(label): \(f.calls())")
+            XCTAssertFalse(f.exists(f.app), label)
+            XCTAssertFalse(f.exists(f.state), label)
+        }
+    }
+
+    /// An installed app that does not declare the version, with no
+    /// installed backstop to fall back on: the checkout's backstop reads the
+    /// same Info.plist, so it never runs the binary and keeps the frozen
+    /// entry, and uninstall stops before removing anything.
+    func testUninstallKeepsEverythingWhenTheAppDoesNotDeclareTheVersionAndNoCopyIsInstalled() throws {
+        for version in [nil, "2"] as [String?] {
+            let f = try ScriptFixture()
+            defer { f.destroy() }
+            try f.installMachinery()
+            try ScriptFixture.infoPlist(resumeFrozenVersion: version).write(to: f.appInfo, atomically: true, encoding: .utf8)
+            try FileManager.default.removeItem(at: f.installedBackstop)
+            try writeFrozenEntryForUninstall(f)
+
+            let r = try f.run(f.uninstall)
+
+            let label = version ?? "no key"
+            XCTAssertNotEqual(r.status, 0, label)
+            XCTAssertEqual(f.calls().filter { $0.hasPrefix("Insomnia ") }, [], "\(label): the binary ran")
+            XCTAssertTrue(f.log().contains("pid 5311 needs the app binary for its microsecond identity check, but \(f.appInfo.path) declares InsomniaResumeFrozenVersion"), "\(label): \(f.log())")
+            XCTAssertTrue(r.stderr.contains("Uninstall stopped BEFORE removing anything"), "\(label): \(r.stderr)")
+            XCTAssertTrue(r.stderr.contains("frozen processes are still journaled"), "\(label): \(r.stderr)")
+            let entries = try XCTUnwrap(f.stateJSON()["frozenProcesses"] as? [[String: Any]], label)
+            XCTAssertEqual(entries.map { $0["pid"] as? Int }, [5311], label)
+            for kept in [f.app, f.plist, f.sudoers, f.session] {
+                XCTAssertTrue(f.exists(kept), "\(label): \(kept.lastPathComponent) was removed")
+            }
+        }
+    }
+
+    /// An expired session and one frozen entry with a microsecond identity,
+    /// for the uninstall tests above.
+    private func writeFrozenEntryForUninstall(_ f: ScriptFixture) throws {
+        try f.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        try f.writeState("""
+        {"sleepDisabledByUs":false,"lowPowerSetByUs":false,"dockerFrozen":false,
+         "frozenProcesses":[{"pid":5311,"startedAt":1789388423,"startedAtMicros":11,"bootSession":"\(f.bootUUID)"}]}
+        """)
+    }
+
     func testUninstallAbortsOnMalformedJournal() throws {
         try fx.installMachinery()
         let broken = "{\"sleepDisabledByUs\":tru"
@@ -1731,10 +1846,7 @@ final class RecoveryScriptTests: XCTestCase {
         try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
         fx.setMode("launchctl", "bootout-hangs")
 
-        let running = try fx.start(fx.uninstall)
-        let pid = try XCTUnwrap(fx.hungPid("launchctl", within: 60), "the bootout started")
-        kill(running.process.processIdentifier, SIGKILL)
-        running.exit.wait()
+        let pid = try killDuringHungBootout(fx.uninstall)
 
         try assertLockHeldUntilGone(pid, within: 20)
         XCTAssertTrue(fx.calls().contains("launchctl FD9-OPEN"), "\(fx.calls())")
@@ -1867,14 +1979,14 @@ final class RecoveryScriptTests: XCTestCase {
         }
     }
 
-    // MARK: - Process observation failures
+    // MARK: - Process observation failures (entries without microseconds)
 
     func testPsCommandFailureKeepsEntryWithoutSignal() throws {
         try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
         let started = 1_789_388_423
         try fx.writeState("""
         {"sleepDisabledByUs":false,"lowPowerSetByUs":false,"dockerFrozen":true,
-         "frozenProcesses":[{"pid":777,"startedAt":\(started),"startedAtMicros":0,"bootSession":"\(fx.bootUUID)"}]}
+         "frozenProcesses":[{"pid":777,"startedAt":\(started),"bootSession":"\(fx.bootUUID)"}]}
         """)
         fx.setMode("ps", "fail")
 
@@ -1894,7 +2006,7 @@ final class RecoveryScriptTests: XCTestCase {
         let started = 1_789_388_423
         try fx.writeState("""
         {"sleepDisabledByUs":false,"lowPowerSetByUs":false,"dockerFrozen":false,
-         "frozenProcesses":[{"pid":778,"startedAt":\(started),"startedAtMicros":0,"bootSession":"\(fx.bootUUID)"}]}
+         "frozenProcesses":[{"pid":778,"startedAt":\(started),"bootSession":"\(fx.bootUUID)"}]}
         """)
         fx.setMode("ps", "garbage")
 
@@ -1921,6 +2033,398 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertNotEqual(r.status, 0)
         XCTAssertEqual(fx.calls(), [], "no ps lookup and no signal without a boot session to compare")
         XCTAssertEqual((try fx.stateJSON()["frozenProcesses"] as? [[String: Any]])?.first?["pid"] as? Int, 779)
+    }
+
+    // MARK: - Microsecond identity through the app binary
+
+    private func writeMicrosecondEntry(pid: Int, started: Int, micros: Int, boot: String? = nil, extra: String = "") throws {
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        try fx.writeState("""
+        {"sleepDisabledByUs":false,"lowPowerSetByUs":false,"dockerFrozen":true,
+         "frozenProcesses":[{"pid":\(pid),"startedAt":\(started),"startedAtMicros":\(micros),"bootSession":"\(boot ?? fx.bootUUID)"\(extra)}]}
+        """)
+    }
+
+    private func onlyFrozenEntry() throws -> [String: Any]? {
+        (try fx.stateJSON()["frozenProcesses"] as? [[String: Any]])?.first
+    }
+
+    /// Polls `condition` every 0.05 s; false if it does not hold within
+    /// `seconds`.
+    private func waitUntil(_ seconds: Double, _ condition: () -> Bool) -> Bool {
+        let deadline = Date(timeIntervalSinceNow: seconds)
+        while Date() < deadline {
+            if condition() { return true }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        return condition()
+    }
+
+    /// The shell passes the four identity fields through unchanged, as one
+    /// line on the binary's standard input, and never runs ps or kill for
+    /// such an entry. "resumed" clears it. The binary's parent is the
+    /// backstop shell itself: no supervisor process sits between them that
+    /// could reap it before the shell decides whether to signal it.
+    func testMicrosecondEntryIsHandedToTheAppBinaryWithItsFullIdentity() throws {
+        let started = 1_789_388_423
+        try writeMicrosecondEntry(pid: 5100, started: started, micros: 654_321)
+        try fx.psTable([(5100, fx.lstart(started), "T", fx.uid)])
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 0, r.stderr)
+        XCTAssertEqual(fx.calls(), ["Insomnia --resume-frozen 2 < 5100 \(started) 654321 \(fx.bootUUID)"])
+        XCTAssertEqual((try fx.stateJSON()["frozenProcesses"] as? [Any])?.count, 0)
+        XCTAssertEqual(try fx.stateJSON()["dockerFrozen"] as? Bool, false)
+        XCTAssertTrue(fx.log().contains("SIGCONT sent to pid 5100 by the app binary"), fx.log())
+        let parent = try String(contentsOf: fx.root.appendingPathComponent("insomnia.ppid"), encoding: .utf8)
+        XCTAssertEqual(parent.trimmingCharacters(in: .whitespacesAndNewlines), String(fx.lastPid), "the binary is not a direct child of the backstop shell")
+    }
+
+    /// Microseconds of 0 are an identity too (the key is present), not a
+    /// missing value: the binary is asked, ps is not.
+    func testZeroMicrosecondsStillUsesTheAppBinary() throws {
+        let started = 1_789_388_423
+        try writeMicrosecondEntry(pid: 5101, started: started, micros: 0)
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 0, r.stderr)
+        XCTAssertEqual(fx.calls(), ["Insomnia --resume-frozen 2 < 5101 \(started) 0 \(fx.bootUUID)"])
+    }
+
+    func testAppBinaryGoneClearsTheEntryWithoutSignal() throws {
+        try writeMicrosecondEntry(pid: 5102, started: 1_789_388_423, micros: 5)
+        try fx.insomniaTable([(5102, "gone")])
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 0, r.stderr)
+        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("kill") }, "\(fx.calls())")
+        XCTAssertEqual((try fx.stateJSON()["frozenProcesses"] as? [Any])?.count, 0)
+        XCTAssertTrue(fx.log().contains("pid 5102 is gone, running, or not the process we froze"), fx.log())
+        XCTAssertFalse(fx.exists(fx.session))
+    }
+
+    /// failed, unobserved and unverifiable keep the entry verbatim for the
+    /// next run, with the journal dirty and the session file in place.
+    func testAppBinaryFailedUnobservedAndUnverifiableKeepTheEntry() throws {
+        for (word, expectation) in [("failed", "SIGCONT failed"), ("unobserved", "could not be verified"), ("unverifiable", "could not be verified")] {
+            fx.destroy()
+            fx = try ScriptFixture()
+            try writeMicrosecondEntry(pid: 5103, started: 1_789_388_423, micros: 9, extra: #","note":"custom""#)
+            try fx.insomniaTable([(5103, word)])
+
+            let r = try fx.run(fx.backstop)
+
+            XCTAssertNotEqual(r.status, 0, word)
+            let entry = try XCTUnwrap(try onlyFrozenEntry(), word)
+            XCTAssertEqual(entry["pid"] as? Int, 5103, word)
+            XCTAssertEqual(entry["startedAtMicros"] as? Int, 9, "\(word): identity must survive for the next attempt")
+            XCTAssertEqual(entry["note"] as? String, "custom", word)
+            XCTAssertEqual(try fx.stateJSON()["dockerFrozen"] as? Bool, true, word)
+            XCTAssertTrue(fx.exists(fx.session), word)
+            XCTAssertTrue(fx.log().contains(expectation), "\(word): \(fx.log())")
+        }
+    }
+
+    /// No app binary at the fixed path: the entry is kept, nothing is
+    /// signaled, and the log names the path. The shell does not fall back
+    /// to its one-second comparison.
+    func testMissingAppBinaryKeepsTheEntryWithoutSignal() throws {
+        let started = 1_789_388_423
+        try writeMicrosecondEntry(pid: 5104, started: started, micros: 1)
+        try fx.psTable([(5104, fx.lstart(started), "T", fx.uid)])
+        try FileManager.default.removeItem(at: fx.fakeInsomnia)
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertNotEqual(r.status, 0)
+        XCTAssertEqual(fx.calls(), [], "ps or kill ran although the identity check needs the app binary")
+        XCTAssertEqual(try onlyFrozenEntry()?["pid"] as? Int, 5104)
+        XCTAssertTrue(fx.log().contains("\(fx.fakeInsomnia.path) is missing or not executable"), fx.log())
+        XCTAssertTrue(fx.exists(fx.session))
+    }
+
+    /// The answer is checked whole. A word the shell does not know, a known
+    /// word with the wrong exit status, the wrong pid, anything before or
+    /// after the word, or a missing or extra line is not acted on: the entry
+    /// is kept, nothing is signaled, and the log carries the answer.
+    func testUnexpectedAppBinaryAnswerKeepsTheEntry() throws {
+        let cases: [(output: String, status: Int)] = [
+            ("5105 bogus\n", 0),
+            ("5105 resumed\n", 1),
+            ("5105 gone\n", 1),
+            ("5105 failed\n", 0),
+            ("", 0),
+            ("", 70),
+            ("usage\n", 64),
+            ("resumed\n", 0),
+            ("5106 resumed\n", 0),
+            ("5105 resumed extra\n", 0),
+            ("5105 resumed\nextra\n", 0),
+            ("5105 resumed\n5105 resumed\n", 0),
+            ("5105 resumed\n\n", 0),
+            (" 5105 resumed\n", 0),
+            ("5105  resumed\n", 0),
+            ("5105 resumed\r\n", 0),
+            ("05105 resumed\n", 0),
+        ]
+        for (output, status) in cases {
+            let label = "\(output.debugDescription) exit \(status)"
+            fx.destroy()
+            fx = try ScriptFixture()
+            try writeMicrosecondEntry(pid: 5105, started: 1_789_388_423, micros: 2)
+            try fx.insomniaRaw(output, status: status)
+
+            let r = try fx.run(fx.backstop)
+
+            XCTAssertNotEqual(r.status, 0, label)
+            XCTAssertEqual(fx.calls().filter { !$0.hasPrefix("Insomnia --resume-frozen") }, [], label)
+            XCTAssertEqual(try onlyFrozenEntry()?["pid"] as? Int, 5105, label)
+            XCTAssertEqual(try fx.stateJSON()["dockerFrozen"] as? Bool, true, label)
+            XCTAssertTrue(fx.exists(fx.session), label)
+            XCTAssertTrue(fx.log().contains("unexpected answer from \(fx.fakeInsomnia.path) for pid(s) 5105 (exit \(status), output '"), "\(label): \(fx.log())")
+        }
+        // Control characters are logged as spaces, on one line.
+        XCTAssertTrue(fx.log().contains("output '05105 resumed '"), fx.log())
+    }
+
+    /// Another boot session is settled by the shell: cleared without a
+    /// lookup, so the binary is not run.
+    func testMicrosecondEntryFromAnotherBootIsClearedWithoutRunningTheBinary() throws {
+        try writeMicrosecondEntry(pid: 5106, started: 1_789_388_423, micros: 3, boot: "other-boot")
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 0, r.stderr)
+        XCTAssertEqual(fx.calls(), [])
+        XCTAssertEqual((try fx.stateJSON()["frozenProcesses"] as? [Any])?.count, 0)
+    }
+
+    /// Negative microseconds pass the shape check (an integer) but are not
+    /// an identity the binary accepts: kept, binary not run.
+    func testNegativeMicrosecondsKeepTheEntryWithoutRunningTheBinary() throws {
+        try writeMicrosecondEntry(pid: 5107, started: 1_789_388_423, micros: -1)
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertNotEqual(r.status, 0)
+        XCTAssertEqual(fx.calls(), [])
+        XCTAssertEqual(try onlyFrozenEntry()?["pid"] as? Int, 5107)
+        XCTAssertTrue(fx.log().contains("startedAtMicros (-1); kept, not signaled"), fx.log())
+    }
+
+    /// Mixed journal: the entry without microseconds keeps the ps path in
+    /// the loop, the entry with microseconds goes to the binary after it.
+    func testEntriesWithAndWithoutMicrosecondsTakeTheirOwnPath() throws {
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        let started = 1_789_388_423
+        try fx.writeState("""
+        {"sleepDisabledByUs":false,"lowPowerSetByUs":false,"dockerFrozen":false,
+         "frozenProcesses":[
+           {"pid":5108,"startedAt":\(started),"startedAtMicros":8,"bootSession":"\(fx.bootUUID)"},
+           {"pid":5109,"startedAt":\(started),"bootSession":"\(fx.bootUUID)"}]}
+        """)
+        try fx.psTable([(5108, fx.lstart(started), "T", fx.uid), (5109, fx.lstart(started), "T", fx.uid)])
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 0, r.stderr)
+        XCTAssertEqual(fx.calls(), [
+            "ps -o lstart=,stat=,uid= -p 5109",
+            "kill -CONT 5109",
+            "Insomnia --resume-frozen 2 < 5108 \(started) 8 \(fx.bootUUID)",
+        ])
+        XCTAssertEqual((try fx.stateJSON()["frozenProcesses"] as? [Any])?.count, 0)
+    }
+
+    /// Every entry with microseconds goes to the binary in one call, after
+    /// the shell-path entries. Kept entries are republished in journal
+    /// order, not in the order they were settled.
+    func testMicrosecondEntriesShareOneCallAndKeptEntriesKeepJournalOrder() throws {
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        let started = 1_789_388_423
+        try fx.writeState("""
+        {"sleepDisabledByUs":false,"lowPowerSetByUs":false,"dockerFrozen":true,
+         "frozenProcesses":[
+           {"pid":5201,"startedAt":\(started),"startedAtMicros":1,"bootSession":"\(fx.bootUUID)","note":"a"},
+           {"pid":5202},
+           {"pid":5203,"startedAt":\(started),"startedAtMicros":3,"bootSession":"\(fx.bootUUID)"},
+           {"pid":5204,"startedAt":\(started),"bootSession":"\(fx.bootUUID)"},
+           {"pid":5205,"startedAt":\(started),"startedAtMicros":5,"bootSession":"\(fx.bootUUID)","note":"e"},
+           {"pid":5206,"startedAt":\(started),"startedAtMicros":6,"bootSession":"\(fx.bootUUID)"}]}
+        """)
+        // 5204 (no microseconds) is gone; 5201 failed, 5203 resumed, 5205
+        // unobserved, 5206 gone.
+        try fx.insomniaTable([(5201, "failed"), (5205, "unobserved"), (5206, "gone")])
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertNotEqual(r.status, 0)
+        XCTAssertEqual(fx.calls(), [
+            "ps -o lstart=,stat=,uid= -p 5204",
+            "Insomnia --resume-frozen 2 < 5201 \(started) 1 \(fx.bootUUID); 5203 \(started) 3 \(fx.bootUUID); 5205 \(started) 5 \(fx.bootUUID); 5206 \(started) 6 \(fx.bootUUID)",
+        ])
+        let frozen = try XCTUnwrap(try fx.stateJSON()["frozenProcesses"] as? [[String: Any]])
+        XCTAssertEqual(frozen.map { $0["pid"] as? Int }, [5201, 5202, 5205], "journal order, not settle order")
+        XCTAssertEqual(frozen.map { $0["note"] as? String }, ["a", nil, "e"], "kept verbatim")
+        let log = fx.log()
+        XCTAssertTrue(log.contains("SIGCONT to pid 5201 failed (app binary: failed)"), log)
+        XCTAssertTrue(log.contains("SIGCONT sent to pid 5203 by the app binary"), log)
+        XCTAssertTrue(log.contains("pid 5205 could not be verified (app binary: unobserved)"), log)
+        XCTAssertTrue(log.contains("pid 5206 is gone, running, or not the process we froze (app binary: gone)"), log)
+    }
+
+    /// A binary that prints a correct answer but does not exit in time gets
+    /// SIGTERM, and its answer is not used: every entry of the call is kept
+    /// and the lock is free afterwards. The wait status in the log (143,
+    /// 128 + SIGTERM) is the kernel's record that SIGTERM ended the fake,
+    /// which sleeps for 300 s otherwise; no wall-clock bound is needed.
+    func testAppBinaryThatDoesNotExitInTimeKeepsEveryEntry() throws {
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        let started = 1_789_388_423
+        try fx.writeState("""
+        {"sleepDisabledByUs":false,"lowPowerSetByUs":false,"dockerFrozen":true,
+         "frozenProcesses":[
+           {"pid":5301,"startedAt":\(started),"startedAtMicros":1,"bootSession":"\(fx.bootUUID)"},
+           {"pid":5302,"startedAt":\(started),"startedAtMicros":2,"bootSession":"\(fx.bootUUID)"}]}
+        """)
+        fx.setMode("insomnia", "hang")
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertNotEqual(r.status, 0)
+        let frozen = try XCTUnwrap(try fx.stateJSON()["frozenProcesses"] as? [[String: Any]])
+        XCTAssertEqual(frozen.map { $0["pid"] as? Int }, [5301, 5302])
+        XCTAssertTrue(fx.exists(fx.session))
+        XCTAssertTrue(try fx.lockIsFree())
+        let log = fx.log()
+        XCTAssertTrue(log.contains("did not answer within 1s; sent SIGTERM, and it ended (wait status 143)"), log)
+        XCTAssertFalse(log.contains("SIGKILL"), log)
+        XCTAssertTrue(log.contains("unexpected answer from \(fx.fakeInsomnia.path) for pid(s) 5301 5302 (exit 124"), log)
+        XCTAssertEqual(try fx.contents(of: fx.home).filter { $0.hasPrefix(".backstop") }, [], "input and answer files removed")
+        XCTAssertEqual(r.stderr, "", "bash's own report of the signaled job must not reach the caller")
+    }
+
+    /// A binary that ignores SIGTERM gets SIGKILL: the run still ends, the
+    /// entry is kept, and the lock is free. The backstop runs with SIGTERM
+    /// ignored, so the fake inherits SIG_IGN from its first instruction
+    /// instead of racing to install a trap before the signal arrives. Wait
+    /// status 137 (128 + SIGKILL) shows SIGKILL ended it.
+    func testAppBinaryThatIgnoresSigtermIsKilled() throws {
+        try writeMicrosecondEntry(pid: 5303, started: 1_789_388_423, micros: 3)
+        fx.setMode("insomnia", "hang")
+
+        let r = try fx.run(fx.backstop, ignoringTerm: true)
+
+        XCTAssertNotEqual(r.status, 0)
+        XCTAssertEqual(try onlyFrozenEntry()?["pid"] as? Int, 5303)
+        XCTAssertTrue(try fx.lockIsFree())
+        let log = fx.log()
+        XCTAssertTrue(log.contains("did not answer within 1s and was still running 1s after SIGTERM; sent SIGKILL, and it ended (wait status 137)"), log)
+        XCTAssertTrue(log.contains("(exit 124"), log)
+        XCTAssertEqual(try fx.contents(of: fx.home).filter { $0.hasPrefix(".backstop") }, [], "input and answer files removed")
+        XCTAssertEqual(r.stderr, "", "bash's own report of the signaled job must not reach the caller")
+    }
+
+    /// The binary runs with the recovery lock open on its fd 9, also when a
+    /// caller handed its lock down on fd 9 (the uninstall path), and is
+    /// told to end itself after COMMAND_TIMEOUT_SECONDS +
+    /// KILL_GRACE_SECONDS (1 + 1 here).
+    func testAppBinaryRunsWithTheRecoveryLockOnFd9() throws {
+        try Data().write(to: fx.lock)
+        let lockInode = try XCTUnwrap(try FileManager.default.attributesOfItem(atPath: fx.lock.path)[.systemFileNumber] as? Int)
+        let wrapper = fx.root.appendingPathComponent("holder-then-backstop.sh")
+        try """
+        #!/bin/bash
+        set -eu
+        exec 9<>"\(fx.lock.path)"
+        /usr/bin/lockf -t 0 9
+        /bin/bash "\(fx.backstop.path)"
+        """.write(to: wrapper, atomically: true, encoding: .utf8)
+
+        for run in [{ try self.fx.run(self.fx.backstop) }, { try self.fx.run(wrapper) }] {
+            try writeMicrosecondEntry(pid: 5304, started: 1_789_388_423, micros: 4)
+            fx.clearCalls()
+            let r = try run()
+            XCTAssertEqual(r.status, 0, r.stderr + fx.log())
+            XCTAssertEqual(fx.calls(), ["Insomnia --resume-frozen 2 < 5304 1789388423 4 \(fx.bootUUID)"])
+            let fd9 = try String(contentsOf: fx.root.appendingPathComponent("insomnia.fd9"), encoding: .utf8)
+            XCTAssertEqual(fd9.trimmingCharacters(in: .whitespacesAndNewlines), String(lockInode), "the binary did not get the lock on fd 9")
+        }
+    }
+
+    /// A backstop run that dies abruptly while the binary is still working
+    /// must not free the recovery lock, or the binary could resume a
+    /// process that a session started after that freezes. The binary keeps
+    /// the lock on its fd 9 until it exits. The
+    /// only process this test signals is the backstop shell it spawned
+    /// itself, with SIGKILL, while that shell is still waiting for the
+    /// binary (its limit is 30 s here). The shell is posix_spawned and
+    /// reaped only after the signal, so its pid cannot have been reused,
+    /// and if the binary never starts or the shell has already exited the
+    /// test fails without signaling anything. The fake binary is never
+    /// signaled: it ends on its own once the test creates insomnia.release.
+    func testABackstopKilledMidCallLeavesTheLockHeldUntilTheBinaryEnds() throws {
+        try writeMicrosecondEntry(pid: 5309, started: 1_789_388_423, micros: 9)
+        fx.setMode("insomnia", "hold")
+        let release = fx.root.appendingPathComponent("insomnia.release")
+        let slow = fx.root.appendingPathComponent("backstop-30s.sh")
+        try ScriptFixture.patch(try String(contentsOf: fx.backstop, encoding: .utf8), ["COMMAND_TIMEOUT_SECONDS": "30"])
+            .write(to: slow, atomically: true, encoding: .utf8)
+
+        let shell = try fx.spawn(slow)
+        // The release first: a shell still running waits for the binary.
+        defer {
+            try? Data().write(to: release)
+            shell.wait()
+        }
+        let call = "Insomnia --resume-frozen 31 < 5309 1789388423 9 \(fx.bootUUID)"
+        guard waitUntil(10, { self.fx.calls().contains(call) }) else {
+            return XCTFail("the binary never started, so the backstop was not signaled: \(fx.calls()) \(fx.log())")
+        }
+        guard !shell.hasExited else {
+            return XCTFail("the backstop ended before the test could kill it (wait status \(shell.wait())), so it was not signaled: \(fx.log())")
+        }
+        XCTAssertEqual(shell.signal(SIGKILL), 0)
+        let status = shell.wait()
+        XCTAssertEqual(status & 0x7f, SIGKILL, "the backstop did not end by SIGKILL (wait status \(status))")
+
+        XCTAssertFalse(try fx.lockIsFree(), "the lock was free while the binary of a killed run could still send SIGCONT")
+        XCTAssertFalse(fx.calls().contains("Insomnia released"))
+
+        try Data().write(to: release)
+        XCTAssertTrue(try fx.waitUntilLockIsFree(10), "the lock stayed held after the binary ended")
+        XCTAssertTrue(fx.calls().contains("Insomnia released"))
+        XCTAssertEqual(try onlyFrozenEntry()?["pid"] as? Int, 5309, "the killed run published nothing")
+    }
+
+    /// The binary of an older build has no --resume-frozen mode and would
+    /// start the menu bar app. The backstop runs the binary only when the
+    /// bundle's Info.plist declares the interface version it speaks;
+    /// otherwise it keeps every entry without running anything.
+    func testAppThatDoesNotDeclareTheResumeFrozenVersionIsNeverRun() throws {
+        let cases: [(String, () throws -> Void)] = [
+            ("no Info.plist", {}),
+            ("no key", { try ScriptFixture.infoPlist(resumeFrozenVersion: nil).write(to: self.fx.appInfo, atomically: true, encoding: .utf8) }),
+            ("version 2", { try ScriptFixture.infoPlist(resumeFrozenVersion: "2").write(to: self.fx.appInfo, atomically: true, encoding: .utf8) }),
+            ("a directory", { try FileManager.default.createDirectory(at: self.fx.appInfo, withIntermediateDirectories: false) }),
+        ]
+        for (label, setUp) in cases {
+            try? FileManager.default.removeItem(at: fx.appInfo)
+            try setUp()
+            try writeMicrosecondEntry(pid: 5310, started: 1_789_388_423, micros: 10)
+            fx.clearCalls()
+
+            let r = try fx.run(fx.backstop)
+
+            XCTAssertNotEqual(r.status, 0, label)
+            XCTAssertEqual(fx.calls(), [], "\(label): the binary ran")
+            XCTAssertEqual(try onlyFrozenEntry()?["pid"] as? Int, 5310, label)
+            XCTAssertTrue(fx.log().contains("pid 5310 needs the app binary for its microsecond identity check, but \(fx.appInfo.path) declares InsomniaResumeFrozenVersion"), "\(label): \(fx.log())")
+            XCTAssertTrue(try fx.lockIsFree(), label)
+        }
     }
 
     // MARK: - Uninstall locking and interleaving
@@ -3364,13 +3868,31 @@ final class RecoveryScriptTests: XCTestCase {
         try writePreviousPair()
         fx.setMode("launchctl", "bootout-hangs")
 
-        let running = try fx.start(fx.installRedirected, extraEnvironment: ["USER": "tester"])
-        let pid = try XCTUnwrap(fx.hungPid("launchctl", within: 60), "the bootout started")
-        kill(running.process.processIdentifier, SIGKILL)
-        running.exit.wait()
+        let pid = try killDuringHungBootout(fx.installRedirected, extraEnvironment: ["USER": "tester"])
 
         try assertLockHeldUntilGone(pid, within: 20)
         XCTAssertTrue(fx.calls().contains("launchctl FD9-OPEN"), "\(fx.calls())")
+    }
+
+    /// Starts `script`, waits for its `launchctl bootout` to hang, and kills
+    /// the script with SIGKILL; returns the hung bootout's pid. The only
+    /// process signaled is the script shell, posix_spawned and reaped only
+    /// after the signal, so its pid cannot have been reused. Throws if the
+    /// bootout never starts or the script ends before it can be killed.
+    func killDuringHungBootout(_ script: URL, extraEnvironment: [String: String] = [:]) throws -> pid_t {
+        let shell = try fx.spawn(script, extraEnvironment: extraEnvironment)
+        defer { shell.wait() }
+        guard let pid = fx.hungPid("launchctl", within: 60) else {
+            _ = shell.signal(SIGKILL)
+            throw FixtureError("the bootout never started: \(fx.calls())")
+        }
+        guard !shell.hasExited else {
+            throw FixtureError("the script ended before the test could kill it (wait status \(shell.wait())), so it was not signaled: \(fx.calls())")
+        }
+        XCTAssertEqual(shell.signal(SIGKILL), 0)
+        let status = shell.wait()
+        XCTAssertEqual(status & 0x7f, SIGKILL, "the script did not end by SIGKILL (wait status \(status))")
+        return pid
     }
 
     /// Samples the lock until it is free: whenever it is, the hung fake
@@ -3770,6 +4292,15 @@ private final class ScriptFixture {
     var logFile: URL { home.appendingPathComponent("Logs/insomnia.log") }
     var plist: URL { home.appendingPathComponent("LaunchAgents/com.insomnia.backstop.plist") }
     var fakePmset: String { bin.appendingPathComponent("pmset").path }
+    /// The fake app binary backstop.sh calls for `--resume-frozen`.
+    var fakeInsomnia: URL { bin.appendingPathComponent("Insomnia") }
+    /// The installed bundle's Info.plist. As in production, both scripts
+    /// read this one file: uninstall.sh to pick a backstop, and the
+    /// backstop copies before they run the fake binary. writeFakes makes it
+    /// declare InsomniaResumeFrozenVersion 1. The fake binary itself stays
+    /// in `bin`, so installMachinery and install.sh can put their own
+    /// Contents/MacOS/Insomnia in the bundle.
+    var appInfo: URL { app.appendingPathComponent("Contents/Info.plist") }
 
     private let fm = FileManager.default
 
@@ -3821,6 +4352,10 @@ private final class ScriptFixture {
     /// Resources/Info.plist, Resources/AppIcon.icns and a binary at the fake
     /// swift's bin path.
     func prepareInstall() throws {
+        // An install test starts with nothing at $APP unless it writes a
+        // bundle there: the Info.plist written for the backstop's binary
+        // check would otherwise leave a bundle with no binary at $APP.
+        try fm.removeItem(at: app)
         let resources = repoScripts.deletingLastPathComponent().appendingPathComponent("Resources", isDirectory: true)
         try fm.createDirectory(at: resources, withIntermediateDirectories: true)
         try """
@@ -3890,6 +4425,8 @@ private final class ScriptFixture {
             "PS": bin.appendingPathComponent("ps").path,
             "KILL": bin.appendingPathComponent("kill").path,
             "SYSCTL": bin.appendingPathComponent("sysctl").path,
+            "INSOMNIA_BIN": fakeInsomnia.path,
+            "INSOMNIA_INFO": appInfo.path,
             "DEFAULTS": bin.appendingPathComponent("defaults").path,
             "DATE": bin.appendingPathComponent("date").path,
             "LOCK_TIMEOUT_SECONDS": "1",
@@ -3970,6 +4507,18 @@ private final class ScriptFixture {
     }
 
     // MARK: Fakes
+
+    /// An app bundle's Info.plist, with InsomniaResumeFrozenVersion set to
+    /// `resumeFrozenVersion` as an integer, or without the key when nil.
+    static func infoPlist(resumeFrozenVersion: String?) -> String {
+        let key = resumeFrozenVersion.map { "<key>InsomniaResumeFrozenVersion</key><integer>\($0)</integer>" } ?? ""
+        return """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0"><dict><key>CFBundleExecutable</key><string>Insomnia</string>\(key)</dict></plist>
+
+        """
+    }
 
     private func writeFake(_ name: String, _ body: String) throws {
         let url = bin.appendingPathComponent(name)
@@ -4142,6 +4691,56 @@ private final class ScriptFixture {
         """)
         try writeFake("sysctl", """
         cat "\(r)/boot.uuid"
+        """)
+        // Insomnia --resume-frozen: reads its entries from standard input,
+        // one "<pid> <startedAt> <micros> <boot>" line each, and records the
+        // call as "Insomnia <arguments> < <line>; <line>; ...". Answers one
+        // "<pid> <word>" line per entry, the word from insomnia.table
+        // (pid|word) or "resumed" for a pid without a row; exit 0 when every
+        // word is resumed or gone, 1 otherwise. Writes its parent's pid to
+        // insomnia.ppid, and the inode of the file open on its fd 9 to
+        // insomnia.fd9 (empty without an fd 9). Modes: "raw" prints insomnia.output verbatim and
+        // exits with insomnia.status. "hang" prints its answer and then
+        // sleeps for 300 s, so only a signal ends it in time. "hold" waits
+        // until insomnia.release exists (30 s at most), records "Insomnia
+        // released", and then answers as usual. A test that
+        // needs SIGTERM ignored runs the backstop with it ignored (see
+        // ScriptFixture.run): the fake inherits that from its first
+        // instruction, so no trap has to be in place before the signal.
+        try fm.createDirectory(at: appInfo.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Self.infoPlist(resumeFrozenVersion: "1").write(to: appInfo, atomically: true, encoding: .utf8)
+        try writeFake("Insomnia", """
+        input=()
+        while IFS= read -r line || [[ -n "$line" ]]; do input+=("$line"); done
+        joined=""
+        for line in "${input[@]}"; do joined="${joined:+$joined; }$line"; done
+        printf 'Insomnia %s < %s\\n' "$*" "$joined" >> "\(calls)"
+        echo "$PPID" > "\(r)/insomnia.ppid"
+        if [[ -e /dev/fd/9 ]]; then stat -f %i /dev/fd/9 > "\(r)/insomnia.fd9"; else : > "\(r)/insomnia.fd9"; fi
+        mode="$(cat "\(r)/insomnia.mode" 2>/dev/null || echo ok)"
+        if [[ "$mode" == hold ]]; then
+          for (( i = 0; i < 300; i++ )); do
+            [[ -f "\(r)/insomnia.release" ]] && break
+            /bin/sleep 0.1
+          done
+          printf 'Insomnia released\\n' >> "\(calls)"
+        fi
+        if [[ "$mode" == raw ]]; then
+          cat "\(r)/insomnia.output"
+          exit "$(cat "\(r)/insomnia.status")"
+        fi
+        status=0
+        for line in "${input[@]}"; do
+          pid="${line%% *}"
+          word=resumed
+          if [[ -f "\(r)/insomnia.table" ]]; then
+            while IFS='|' read -r p w; do [[ "$p" == "$pid" ]] && word="$w"; done < "\(r)/insomnia.table"
+          fi
+          printf '%s %s\\n' "$pid" "$word"
+          case "$word" in resumed|gone) ;; *) status=1 ;; esac
+        done
+        [[ "$mode" == hang ]] && exec /bin/sleep 300
+        exit "$status"
         """)
         // date: the real tool, except that with date.mode present the stamp
         // a moved-aside session.json is named after (`-u +%Y%m%dT%H%M%SZ`)
@@ -4370,6 +4969,21 @@ private final class ScriptFixture {
         try? value.write(to: root.appendingPathComponent("\(name).mode"), atomically: true, encoding: .utf8)
     }
 
+    /// The word the fake app binary answers per pid; the exit status follows
+    /// from the words.
+    func insomniaTable(_ rows: [(pid: Int, word: String)]) throws {
+        let text = rows.map { "\($0.pid)|\($0.word)" }.joined(separator: "\n") + "\n"
+        try text.write(to: root.appendingPathComponent("insomnia.table"), atomically: true, encoding: .utf8)
+    }
+
+    /// Makes the fake app binary print exactly `output` and exit `status`,
+    /// whatever it is asked.
+    func insomniaRaw(_ output: String, status: Int) throws {
+        setMode("insomnia", "raw")
+        try output.write(to: root.appendingPathComponent("insomnia.output"), atomically: true, encoding: .utf8)
+        try String(status).write(to: root.appendingPathComponent("insomnia.status"), atomically: true, encoding: .utf8)
+    }
+
     func psTable(_ rows: [(pid: Int, lstart: String, stat: String, uid: String)]) throws {
         let text = rows.map { "\($0.pid)|\($0.lstart)|\($0.stat)|\($0.uid)" }.joined(separator: "\n") + "\n"
         try text.write(to: root.appendingPathComponent("ps.table"), atomically: true, encoding: .utf8)
@@ -4506,6 +5120,7 @@ private final class ScriptFixture {
     func installMachinery() throws {
         try fm.createDirectory(at: app.appendingPathComponent("Contents/MacOS"), withIntermediateDirectories: true)
         try "binary".write(to: app.appendingPathComponent("Contents/MacOS/Insomnia"), atomically: true, encoding: .utf8)
+        try Self.infoPlist(resumeFrozenVersion: "1").write(to: appInfo, atomically: true, encoding: .utf8)
         try fm.createDirectory(at: sudoers.deletingLastPathComponent(), withIntermediateDirectories: true)
         try "rule".write(to: sudoers, atomically: true, encoding: .utf8)
         try fm.createDirectory(at: plist.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -4550,13 +5165,22 @@ private final class ScriptFixture {
 
     /// Runs a script copy. `fd9` opens that file on descriptor 9 of the child
     /// first, the way uninstall.sh hands its lock handle to the backstop.
+    /// `ignoringTerm` starts the script with SIGTERM ignored, which every
+    /// process it starts inherits (not combined with `fd9`).
     /// `extraEnvironment` is for install.sh's refusal test and for a
-    /// private TMPDIR (see privateTmp).
-    func run(_ script: URL, _ args: [String] = [], fd9: URL? = nil, extraEnvironment: [String: String] = [:]) throws -> (status: Int32, stdout: String, stderr: String) {
+    /// private TMPDIR (see privateTmp). `lastPid` is the script's pid
+    /// afterwards: the wrappers exec it, so it is the pid of the process
+    /// started here.
+    private(set) var lastPid: Int32 = 0
+
+    func run(_ script: URL, _ args: [String] = [], fd9: URL? = nil, ignoringTerm: Bool = false, extraEnvironment: [String: String] = [:]) throws -> (status: Int32, stdout: String, stderr: String) {
+        precondition(fd9 == nil || !ignoringTerm, "fd9 and ignoringTerm are not combined")
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/bash")
         if let fd9 {
             p.arguments = ["-c", #"exec 9<>"$0" && exec /bin/bash "$@""#, fd9.path, script.path] + args
+        } else if ignoringTerm {
+            p.arguments = ["-c", #"trap '' TERM && exec /bin/bash "$@""#, "bash", script.path] + args
         } else {
             p.arguments = [script.path] + args
         }
@@ -4574,36 +5198,11 @@ private final class ScriptFixture {
         p.standardError = err
         let childExit = ProcessExit(p)
         try p.run()
+        lastPid = p.processIdentifier
         childExit.wait()
         return (p.terminationStatus,
                 (try? String(contentsOf: outURL, encoding: .utf8)) ?? "",
                 (try? String(contentsOf: errURL, encoding: .utf8)) ?? "")
-    }
-
-    /// A script copy started by start, still running or killed by the test.
-    struct RunningScript {
-        let process: Process
-        let exit: ProcessExit
-    }
-
-    /// Starts a script copy the way run does, without waiting for it, for a
-    /// test that kills the script partway. Its output goes to files in the
-    /// fixture.
-    func start(_ script: URL, _ args: [String] = [], extraEnvironment: [String: String] = [:]) throws -> RunningScript {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/bin/bash")
-        p.arguments = [script.path] + args
-        p.environment = childEnvironment.merging(extraEnvironment) { $1 }
-        p.currentDirectoryURL = root
-        let outURL = root.appendingPathComponent("stdout.\(UUID().uuidString)")
-        fm.createFile(atPath: outURL.path, contents: nil)
-        let out = try FileHandle(forWritingTo: outURL)
-        defer { try? out.close() }
-        p.standardOutput = out
-        p.standardError = out
-        let running = RunningScript(process: p, exit: ProcessExit(p))
-        try p.run()
-        return running
     }
 
     /// The pid a hung fake of `tool` recorded (see hangHere), once it has
@@ -4636,6 +5235,84 @@ private final class ScriptFixture {
         let data = out.fileHandleForReading.readDataToEndOfFile()
         toolExit.wait()
         return (p.terminationStatus, String(decoding: data, as: UTF8.self))
+    }
+
+    /// A script started in the background by `spawn`. Nothing in the test
+    /// process reaps it but `wait`: Foundation reaps only the Processes it
+    /// started, and nothing else here calls waitpid. Until `wait`, its pid
+    /// stays its own even after it exits (as a zombie), so `signal` reaches
+    /// this child or nothing, never a process that reused the pid.
+    final class Spawned {
+        let pid: pid_t
+        private(set) var status: Int32?
+
+        init(pid: pid_t) { self.pid = pid }
+
+        /// Whether the child has exited, checked without reaping it.
+        var hasExited: Bool {
+            guard status == nil else { return true }
+            var info = siginfo_t()
+            return waitid(P_PID, id_t(pid), &info, WEXITED | WNOHANG | WNOWAIT) == 0 && info.si_pid == pid
+        }
+
+        /// Sends `sig` to the child. Refuses with -1 once `wait` has reaped
+        /// it, since the pid may then belong to another process.
+        func signal(_ sig: Int32) -> Int32 {
+            guard status == nil else { return -1 }
+            return kill(pid, sig)
+        }
+
+        /// Waits for the child to exit, reaps it, and returns its wait
+        /// status (-1 if waitpid failed).
+        @discardableResult
+        func wait() -> Int32 {
+            if let status { return status }
+            var raw: Int32 = 0
+            var reaped: pid_t
+            repeat { reaped = waitpid(pid, &raw, 0) } while reaped == -1 && errno == EINTR
+            let result = reaped == pid ? raw : -1
+            status = result
+            return result
+        }
+    }
+
+    /// Starts `script` under /bin/bash with the same environment (plus
+    /// `extraEnvironment`) and working directory as `run`, standard input and output on /dev/null,
+    /// and returns without waiting for it. Like a Process, the child gets
+    /// no other descriptor of the test process, an empty signal mask and
+    /// default signal actions.
+    func spawn(_ script: URL, extraEnvironment: [String: String] = [:]) throws -> Spawned {
+        var actions: posix_spawn_file_actions_t?
+        posix_spawn_file_actions_init(&actions)
+        defer { posix_spawn_file_actions_destroy(&actions) }
+        posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", O_RDONLY, 0)
+        posix_spawn_file_actions_addopen(&actions, 1, "/dev/null", O_WRONLY, 0)
+        posix_spawn_file_actions_addopen(&actions, 2, "/dev/null", O_WRONLY, 0)
+        posix_spawn_file_actions_addchdir(&actions, root.path)
+
+        var attr: posix_spawnattr_t?
+        posix_spawnattr_init(&attr)
+        defer { posix_spawnattr_destroy(&attr) }
+        var mask = sigset_t()
+        sigemptyset(&mask)
+        var defaults = sigset_t()
+        sigfillset(&defaults)
+        sigdelset(&defaults, SIGKILL)
+        sigdelset(&defaults, SIGSTOP)
+        posix_spawnattr_setsigmask(&attr, &mask)
+        posix_spawnattr_setsigdefault(&attr, &defaults)
+        posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF))
+
+        let arguments = ["/bin/bash", script.path]
+        let argv: [UnsafeMutablePointer<CChar>?] = arguments.map { strdup($0) } + [nil]
+        let environment = childEnvironment.merging(extraEnvironment) { $1 }.map { "\($0.key)=\($0.value)" }
+        let envp: [UnsafeMutablePointer<CChar>?] = environment.map { strdup($0) } + [nil]
+        defer { (argv + envp).forEach { free($0) } }
+
+        var pid: pid_t = 0
+        let spawned = posix_spawn(&pid, "/bin/bash", &actions, &attr, argv, envp)
+        guard spawned == 0, pid > 0 else { throw FixtureError("posix_spawn /bin/bash \(script.path) failed: \(spawned)") }
+        return Spawned(pid: pid)
     }
 
     /// A lockf process that holds the recovery lock.

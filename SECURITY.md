@@ -17,13 +17,27 @@ other processes running as that user can invoke them too. The app is not
 sandboxed; local logs can contain SSIDs, process metadata, and tmux target names.
 The lines the app writes to `insomnia.log` also reach the unified log with the
 body marked private, so programs reading `log show` see `<private>` instead of
-those names unless private data logging is enabled on the Mac. Hotspot
-passwords are stored in the login Keychain. Location Services access is
-requested only when a hotspot is saved or a session starts with one
-configured; it is used to read Wi-Fi network names and the app never requests
-location updates. With the App Nap setting on (off by default), the app writes
-`NSAppSleepDisabled` into the preferences of each app on the agent list, after
-recording the previous value in its journal, and puts it back at session end.
+those names unless private data logging is enabled on the Mac. Location
+Services access is requested only when a hotspot is saved or a session starts
+with one configured; it is used to read Wi-Fi network names and the app never
+requests location updates. With the App Nap setting on (off by default), the
+app writes `NSAppSleepDisabled` into the preferences of each app on the agent
+list, after recording the previous value in its journal, and puts it back at
+session end.
+
+The hotspot password is a generic-password item in the login Keychain
+(service `insomnia-hotspot`). Its access list names only the Insomnia build
+that saved it, so any other program asking for it gets the system Keychain
+prompt, which you can refuse. Insomnia itself reads the item with prompts
+switched off: an item it may not read is reported in the menu and in Settings
+instead of being prompted for or silently ignored. Two limits remain. Ad-hoc
+signing gives every install a new code identity, so the access list pins one
+build and the password must be entered again after a reinstall; a stable
+signing identity (Developer ID) would let the access list name every build
+signed with it. And the item lives in the file-based login Keychain, which
+ignores the data-protection accessibility classes (this device only, when
+unlocked); using that Keychain needs an access-group entitlement, which needs
+a team id. Both wait on a signed release.
 
 The recovery LaunchAgent runs only the `backstop.sh` sealed inside the signed
 app bundle, after `codesign --verify --strict` passes against the code
