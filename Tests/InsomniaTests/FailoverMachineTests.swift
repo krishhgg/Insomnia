@@ -223,5 +223,416 @@ final class NetworkFailoverDriverTests: XCTestCase {
             joiner.calls,
             [.init(ssid: "Phone", password: "top secret", interfaceName: "en0")]
         )
+        XCTAssertNil(n.passwordReport?.problem)
+    }
+
+    /// A join whose keychain read waits behind a save in Settings (stuck
+    /// on a keychain dialog) does not hold up stop(), and once the session
+    /// has ended the read's answer neither joins nor reports anything.
+    func testAJoinWaitingBehindABlockedSaveDoesNothingAfterTheSessionEnds() async throws {
+        let queue = KeychainQueue()
+        let keychain = BlockingKeychain(items: ["\(KeychainStore.service)/Phone": "old"])
+        let store = KeychainHotspotSecretStore(keychain: keychain, queue: queue) { "Phone" }
+        let saving = Task { await SettingsView.storePassword("new", in: store) }
+        await fulfillment(of: [keychain.entered], timeout: 5)
+
+        let joiner = RecordingHotspotJoiner()
+        let notifier = RecordingNotifier()
+        let clock = FakeClock(Date(timeIntervalSince1970: 1_800_000_000))
+        let joining = expectation(description: "the join started")
+        joining.assertForOverFulfill = false
+        var config = Config()
+        config.hotspotSSID = "Phone"
+        let n = NetworkFailover(
+            paths: home.paths,
+            keychain: keychain,
+            keychainQueue: queue,
+            hotspotJoiner: joiner,
+            notifier: notifier,
+            wifiInterface: "en0",
+            clock: { clock.now }
+        ) {
+            joining.fulfill()
+            return config
+        }
+        await n.simulate(satisfied: false)
+        clock.advance(30)
+        let tick = n.fireTimer()
+        await fulfillment(of: [joining], timeout: 5)
+
+        n.stop()
+        XCTAssertTrue(keychain.isWaiting, "stop() ran while the save was still waiting")
+        keychain.release()
+        _ = await saving.value
+        await tick.value
+
+        XCTAssertEqual(joiner.calls, [])
+        XCTAssertEqual(notifier.posts.map(\.title), [])
+        XCTAssertNil(n.passwordReport?.problem)
+        XCTAssertFalse(keychain.gaveUp)
+    }
+
+    /// Wi-Fi recovers while a join's keychain read waits behind a save in
+    /// Settings. Once the save is answered the read finds the password,
+    /// but the outage is over: nothing joins, so the recovered connection
+    /// is not moved to the hotspot, and the retry the tick queued after
+    /// the join is not scheduled.
+    func testAJoinWaitingBehindABlockedSaveDoesNothingAfterWiFiRecovers() async throws {
+        let keychain = BlockingKeychain(items: ["\(KeychainStore.service)/Phone": "old"])
+        let blocked = try await outageWithAJoinBehindABlockedSave(keychain: keychain, savingFor: "Phone")
+
+        await blocked.driver.simulate(satisfied: true)
+        XCTAssertTrue(keychain.isWaiting, "Wi-Fi recovered while the save was still waiting")
+        keychain.release()
+        _ = await blocked.saving.value
+        await blocked.tick.value
+
+        XCTAssertEqual(blocked.joiner.calls, [])
+        XCTAssertNil(blocked.driver.retryTimer, "a retry was scheduled after the outage ended")
+        XCTAssertEqual(blocked.notifier.posts.map(\.title), [])
+        XCTAssertNil(blocked.driver.passwordReport?.problem)
+        XCTAssertEqual(blocked.driver.lastGap, 30)
+        XCTAssertFalse(keychain.gaveUp)
+        blocked.driver.stop()
+    }
+
+    /// The same wait, but the read then fails: there is no password for
+    /// the hotspot. The outage is over, so nothing is reported, and the
+    /// notification is still there for the next outage.
+    func testAReadThatFailsAfterWiFiRecoveredLeavesTheNoticeForTheNextOutage() async throws {
+        let keychain = BlockingKeychain()
+        let blocked = try await outageWithAJoinBehindABlockedSave(keychain: keychain, savingFor: "Other Phone")
+
+        await blocked.driver.simulate(satisfied: true)
+        keychain.release()
+        _ = await blocked.saving.value
+        await blocked.tick.value
+
+        XCTAssertEqual(blocked.notifier.posts.map(\.title), [])
+        XCTAssertNil(blocked.driver.passwordReport?.problem)
+        XCTAssertNil(blocked.driver.retryTimer)
+
+        await blocked.driver.simulate(satisfied: false)
+        blocked.clock.advance(30)
+        await blocked.driver.fireTimer().value
+
+        XCTAssertEqual(blocked.notifier.posts.map(\.title), ["Hotspot not joined"])
+        XCTAssertEqual(blocked.notifier.posts.map(\.body), [HotspotPasswordProblem.missing.explanation])
+        XCTAssertEqual(blocked.driver.passwordReport, HotspotPasswordReport(ssid: "Phone", problem: .missing))
+        XCTAssertEqual(blocked.joiner.calls, [])
+        blocked.driver.stop()
+    }
+
+    /// Settings changes the hotspot while a join's keychain read waits
+    /// behind a save. The read finds the old hotspot's password, but that
+    /// is not the hotspot to join any more: nothing joins or reports. The
+    /// retry the tick queued still comes, and joins the hotspot
+    /// configured then.
+    func testAJoinWhoseHotspotChangedDuringTheReadDoesNotJoinTheOldOne() async throws {
+        let keychain = BlockingKeychain(items: ["\(KeychainStore.service)/Phone": "old"])
+        let blocked = try await outageWithAJoinBehindABlockedSave(keychain: keychain, savingFor: "Other Phone")
+
+        blocked.hotspot.value = "Other Phone"
+        keychain.release()
+        _ = await blocked.saving.value
+        await blocked.tick.value
+
+        XCTAssertEqual(blocked.joiner.calls, [])
+        XCTAssertEqual(blocked.notifier.posts.map(\.title), [])
+        XCTAssertNil(blocked.driver.passwordReport?.problem)
+        XCTAssertNotNil(blocked.driver.retryTimer, "the retry is still scheduled")
+
+        blocked.clock.advance(30)
+        await blocked.driver.fireTimer().value
+        XCTAssertEqual(blocked.joiner.calls, [.init(ssid: "Other Phone", password: "new", interfaceName: "en0")])
+        XCTAssertFalse(keychain.gaveUp)
+        blocked.driver.stop()
+    }
+
+    /// The same, but the read finds no password for the old hotspot. The
+    /// warning is about a hotspot no longer configured, so it is neither
+    /// shown nor notified, and the one notification of this outage is
+    /// still there when the next tick finds the new hotspot has no
+    /// password either. Clearing the SSID drops the answer the same way.
+    func testAWarningAboutTheOldHotspotIsDroppedWhenTheSSIDChanged() async throws {
+        for changed in ["Third Phone", " "] {
+            let keychain = BlockingKeychain()
+            let blocked = try await outageWithAJoinBehindABlockedSave(keychain: keychain, savingFor: "Other Phone")
+
+            blocked.hotspot.value = changed
+            keychain.release()
+            _ = await blocked.saving.value
+            await blocked.tick.value
+
+            XCTAssertEqual(blocked.notifier.posts.map(\.title), [], "SSID changed to \"\(changed)\"")
+            XCTAssertNil(blocked.driver.passwordReport?.problem, "SSID changed to \"\(changed)\"")
+            XCTAssertNotNil(blocked.driver.retryTimer, "SSID changed to \"\(changed)\"")
+
+            blocked.clock.advance(30)
+            await blocked.driver.fireTimer().value
+            if HotspotSSID.normalized(changed).isEmpty {
+                XCTAssertEqual(blocked.notifier.posts.map(\.title), [], "no hotspot is configured")
+                XCTAssertNil(blocked.driver.passwordReport?.problem)
+            } else {
+                XCTAssertEqual(blocked.notifier.posts.map(\.body), [HotspotPasswordProblem.missing.explanation])
+                XCTAssertEqual(blocked.driver.passwordReport, HotspotPasswordReport(ssid: "Third Phone", problem: .missing))
+            }
+            XCTAssertEqual(blocked.joiner.calls, [])
+            XCTAssertFalse(keychain.gaveUp)
+            blocked.driver.stop()
+        }
+    }
+
+    private struct BlockedJoin {
+        let driver: NetworkFailover
+        let saving: Task<HotspotStoreOutcome, Never>
+        let tick: Task<Void, Never>
+        let joiner: RecordingHotspotJoiner
+        let notifier: RecordingNotifier
+        let clock: FakeClock
+        /// The configured hotspot SSID, "Phone" until a test changes it.
+        let hotspot: Locked<String>
+    }
+
+    /// A save for `ssid` blocked inside `keychain`, then an outage on
+    /// hotspot "Phone" whose first join has started and queued its read
+    /// behind that save.
+    private func outageWithAJoinBehindABlockedSave(keychain: BlockingKeychain, savingFor ssid: String) async throws -> BlockedJoin {
+        let queue = KeychainQueue()
+        let store = KeychainHotspotSecretStore(keychain: keychain, queue: queue) { ssid }
+        let saving = Task { await SettingsView.storePassword("new", in: store) }
+        await fulfillment(of: [keychain.entered], timeout: 5)
+
+        let joiner = RecordingHotspotJoiner()
+        let notifier = RecordingNotifier()
+        let clock = FakeClock(Date(timeIntervalSince1970: 1_800_000_000))
+        let joining = expectation(description: "the join started")
+        joining.assertForOverFulfill = false
+        let hotspot = Locked("Phone")
+        let n = NetworkFailover(
+            paths: home.paths,
+            keychain: keychain,
+            keychainQueue: queue,
+            hotspotJoiner: joiner,
+            notifier: notifier,
+            wifiInterface: "en0",
+            clock: { clock.now }
+        ) {
+            joining.fulfill()
+            var config = Config()
+            config.hotspotSSID = hotspot.value
+            return config
+        }
+        await n.simulate(satisfied: false)
+        clock.advance(30)
+        let tick = n.fireTimer()
+        await fulfillment(of: [joining], timeout: 5)
+        return BlockedJoin(driver: n, saving: saving, tick: tick, joiner: joiner, notifier: notifier, clock: clock, hotspot: hotspot)
+    }
+
+    private func driver(
+        keychain: FakeKeychainStore,
+        joiner: RecordingHotspotJoiner,
+        notifier: RecordingNotifier,
+        clock: FakeClock,
+        hotspot: Locked<String> = Locked("Phone")
+    ) -> NetworkFailover {
+        NetworkFailover(
+            paths: home.paths,
+            keychain: keychain,
+            hotspotJoiner: joiner,
+            notifier: notifier,
+            wifiInterface: "en0",
+            clock: { clock.now }
+        ) {
+            var config = Config()
+            config.hotspotSSID = hotspot.value
+            return config
+        }
+    }
+
+    /// A join with no saved password is not a silent skip: the problem is
+    /// published for the menu and notified once, not on every retry.
+    func testMissingPasswordIsSurfacedOnceAndNoJoinIsAttempted() async throws {
+        let joiner = RecordingHotspotJoiner()
+        let notifier = RecordingNotifier()
+        let clock = FakeClock(Date(timeIntervalSince1970: 1_800_000_000))
+        let n = driver(keychain: FakeKeychainStore(), joiner: joiner, notifier: notifier, clock: clock)
+        let published = Locked<[HotspotPasswordProblem?]>([])
+        n.onPasswordReport = { published.value.append($0?.problem) }
+
+        await n.simulate(satisfied: false)
+        for _ in 0..<3 {
+            clock.advance(30)
+            await n.fireTimer().value
+        }
+
+        XCTAssertEqual(joiner.calls, [])
+        XCTAssertEqual(n.passwordReport, HotspotPasswordReport(ssid: "Phone", problem: .missing))
+        XCTAssertEqual(published.value, [.missing])
+        XCTAssertEqual(notifier.posts.map(\.title), ["Hotspot not joined"])
+        XCTAssertEqual(notifier.posts.map(\.body), ["No hotspot password is saved. Enter it in Settings."])
+    }
+
+    /// The item exists but belongs to another build (the keychain refuses
+    /// it with prompts forbidden): same surfacing, with the re-enter wording.
+    func testUnreadablePasswordIsSurfacedWithTheReenterWording() async throws {
+        let keychain = FakeKeychainStore()
+        try keychain.set(service: KeychainStore.service, account: "Phone", value: "old build's secret")
+        keychain.unreadable = ["\(KeychainStore.service)/Phone"]
+        let joiner = RecordingHotspotJoiner()
+        let notifier = RecordingNotifier()
+        let n = driver(keychain: keychain, joiner: joiner, notifier: notifier, clock: FakeClock(Date()))
+
+        await n.joinHotspot()
+
+        XCTAssertEqual(joiner.calls, [])
+        XCTAssertEqual(n.passwordReport?.problem, .unreadable)
+        XCTAssertEqual(n.passwordReport?.problem.menuLine, "\u{26A0} Hotspot password unreadable by this build: enter it again in Settings")
+        XCTAssertEqual(notifier.posts.map(\.body), [HotspotPasswordProblem.unreadable.explanation])
+        XCTAssertTrue(HotspotPasswordProblem.unreadable.explanation.contains("Enter it again in Settings"))
+    }
+
+    /// Saving in Settings clears the problem at once, and a read that then
+    /// succeeds keeps it clear; a problem that comes back after a save is
+    /// notified again.
+    func testSavingThePasswordClearsTheProblemAndRearmsTheNotification() async throws {
+        let keychain = FakeKeychainStore()
+        let joiner = RecordingHotspotJoiner()
+        let notifier = RecordingNotifier()
+        let n = driver(keychain: keychain, joiner: joiner, notifier: notifier, clock: FakeClock(Date()))
+        let published = Locked<[HotspotPasswordProblem?]>([])
+        n.onPasswordReport = { published.value.append($0?.problem) }
+
+        await n.joinHotspot()
+        XCTAssertEqual(n.passwordReport?.problem, .missing)
+        n.passwordChanged(.init(ssid: "Phone"), configuredSSID: "Phone")
+        XCTAssertNil(n.passwordReport?.problem)
+        XCTAssertEqual(published.value, [.missing, nil])
+
+        try keychain.set(service: KeychainStore.service, account: "Phone", value: "pw")
+        await n.joinHotspot()
+        XCTAssertNil(n.passwordReport?.problem)
+        XCTAssertEqual(joiner.calls.map(\.password), ["pw"])
+
+        try keychain.delete(service: KeychainStore.service, account: "Phone")
+        await n.joinHotspot()
+        XCTAssertEqual(n.passwordReport?.problem, .missing)
+        XCTAssertEqual(notifier.posts.count, 2, "the problem returned after a save, so it is notified again")
+    }
+
+    /// The user configures another hotspot during the outage. Its problem
+    /// is reported for it, and notified once for it too: the notification
+    /// about the first hotspot did not tell the user about this one.
+    /// Going back to the first hotspot in the same outage notifies
+    /// nothing new.
+    func testAHotspotConfiguredDuringTheOutageIsNotifiedForItself() async throws {
+        let keychain = FakeKeychainStore()
+        try keychain.set(service: KeychainStore.service, account: "Other Phone", value: "old build's secret")
+        keychain.unreadable = ["\(KeychainStore.service)/Other Phone"]
+        let notifier = RecordingNotifier()
+        let clock = FakeClock(Date(timeIntervalSince1970: 1_800_000_000))
+        let hotspot = Locked("Phone")
+        let n = driver(keychain: keychain, joiner: RecordingHotspotJoiner(), notifier: notifier, clock: clock, hotspot: hotspot)
+        func tick() async {
+            clock.advance(30)
+            await n.fireTimer().value
+        }
+
+        await n.simulate(satisfied: false)
+        await tick()
+        hotspot.value = "Other Phone"
+        await tick()
+        await tick()
+
+        XCTAssertEqual(n.passwordReport, HotspotPasswordReport(ssid: "Other Phone", problem: .unreadable))
+        XCTAssertEqual(notifier.posts.map(\.body), [HotspotPasswordProblem.missing.explanation, HotspotPasswordProblem.unreadable.explanation])
+
+        hotspot.value = "Phone"
+        await tick()
+        XCTAssertEqual(n.passwordReport, HotspotPasswordReport(ssid: "Phone", problem: .missing))
+        XCTAssertEqual(notifier.posts.count, 2)
+        n.stop()
+    }
+
+    /// A save in Settings for another SSID, one edited away while it
+    /// waited, leaves the report about the hotspot configured now, and
+    /// its notification, if the save did not remove that hotspot's item
+    /// either. Any other save clears the report and re-arms the
+    /// notification: one that removed the configured hotspot's item (the
+    /// account the window loaded), one for the configured hotspot, and one
+    /// whose report is about an SSID no longer configured.
+    func testASaveClearsEveryReportButOneAboutTheConfiguredHotspotItDidNotStore() async throws {
+        let notifier = RecordingNotifier()
+        let n = driver(keychain: FakeKeychainStore(), joiner: RecordingHotspotJoiner(), notifier: notifier, clock: FakeClock(Date()))
+        let phone = HotspotPasswordReport(ssid: "Phone", problem: .missing)
+
+        await n.joinHotspot()
+        n.passwordChanged(.init(ssid: "Other Phone"), configuredSSID: "Phone")
+        XCTAssertEqual(n.passwordReport, phone)
+        await n.joinHotspot()
+        XCTAssertEqual(notifier.posts.count, 1, "the report stood, and so did its notification")
+
+        n.passwordChanged(.init(ssid: "Other Phone", removed: "Phone"), configuredSSID: "Phone")
+        XCTAssertNil(n.passwordReport, "the save removed the reported hotspot's item")
+        await n.joinHotspot()
+        XCTAssertEqual(notifier.posts.count, 2, "what the next read finds is notified afresh")
+
+        n.passwordChanged(.init(ssid: "Phone"), configuredSSID: " Phone ")
+        XCTAssertNil(n.passwordReport)
+        await n.joinHotspot()
+        XCTAssertEqual(notifier.posts.count, 3)
+
+        n.passwordChanged(.init(ssid: "Phone"), configuredSSID: "Other Phone")
+        XCTAssertNil(n.passwordReport, "the save wrote the reported hotspot's item")
+        await n.joinHotspot()
+        n.passwordChanged(.init(ssid: "Other Phone"), configuredSSID: "Other Phone")
+        XCTAssertNil(n.passwordReport, "the save may have moved the reported hotspot's item")
+    }
+
+    /// stop() ends the session: the problem goes (and with it the menu
+    /// line), and the once-per-outage guard does not outlive the session.
+    func testStopClearsTheProblemAndRearmsTheNotification() async throws {
+        let joiner = RecordingHotspotJoiner()
+        let notifier = RecordingNotifier()
+        let n = driver(keychain: FakeKeychainStore(), joiner: joiner, notifier: notifier, clock: FakeClock(Date()))
+        let published = Locked<[HotspotPasswordProblem?]>([])
+        n.onPasswordReport = { published.value.append($0?.problem) }
+
+        await n.joinHotspot()
+        await n.joinHotspot()
+        XCTAssertEqual(notifier.posts.count, 1)
+        n.stop()
+        XCTAssertNil(n.passwordReport?.problem)
+        XCTAssertEqual(published.value, [.missing, nil])
+        await n.joinHotspot()
+        XCTAssertEqual(notifier.posts.count, 2)
+    }
+
+    /// A second outage in the same session is notified again: recovery
+    /// re-arms the once-per-outage guard.
+    func testANewOutageAfterRecoveryIsNotifiedAgain() async throws {
+        let joiner = RecordingHotspotJoiner()
+        let notifier = RecordingNotifier()
+        let clock = FakeClock(Date(timeIntervalSince1970: 1_800_000_000))
+        let n = driver(keychain: FakeKeychainStore(), joiner: joiner, notifier: notifier, clock: clock)
+        func skipped() -> Int { notifier.posts.filter { $0.title == "Hotspot not joined" }.count }
+
+        await n.simulate(satisfied: false)
+        for _ in 0..<2 {
+            clock.advance(30)
+            await n.fireTimer().value
+        }
+        XCTAssertEqual(skipped(), 1)
+
+        clock.advance(30)
+        await n.simulate(satisfied: true)
+        XCTAssertEqual(skipped(), 1, "recovery itself reports nothing about the password")
+
+        await n.simulate(satisfied: false)
+        clock.advance(30)
+        await n.fireTimer().value
+        XCTAssertEqual(skipped(), 2)
+        XCTAssertEqual(joiner.calls, [])
     }
 }
