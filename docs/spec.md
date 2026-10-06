@@ -723,7 +723,7 @@ Insomnia/
 ## Install
 
 ```
-git clone https://github.com/kgarg2468/Insomnia.git && cd Insomnia
+git clone https://github.com/krishhgg/Insomnia.git && cd Insomnia
 ./scripts/install.sh      # asks for sudo once, for the sudoers file
 ```
 

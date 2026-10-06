@@ -39,10 +39,18 @@
 ## Install
 
 Requires **macOS 26 or later** and **Xcode with Swift 6.2 or later**. Installation
-currently means building from source:
+currently means building from source.
+
+Paste this into your coding agent:
+
+```text
+Install Insomnia from https://github.com/krishhgg/Insomnia by following its README. If a step needs my password, give me the command to run in Terminal.
+```
+
+Or run it yourself:
 
 ```bash
-git clone https://github.com/kgarg2468/Insomnia.git
+git clone https://github.com/krishhgg/Insomnia.git
 cd Insomnia
 ./scripts/install.sh
 open "$HOME/Applications/Insomnia.app"
