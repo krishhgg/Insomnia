@@ -475,10 +475,42 @@ Backstop, independent of the app:
   to acquire it must not permit an unprotected journal write or side effect.
 - Successful restores may clear their entries; failures must stay journaled.
   Process recovery must verify identity and avoid resuming a process that
-  Insomnia did not stop. Old PID-only entries need conservative handling.
+  Insomnia did not stop. The entries that record `startedAtMicros` go to
+  the installed app binary in one call (`Insomnia --resume-frozen
+  <seconds>`, with one line `<pid> <startedAt> <startedAtMicros>
+  <bootSession>` per entry on standard input, which has no size limit,
+  answered before AppKit starts),
+  so the comparison is to the microsecond and each entry's signal follows
+  its own lookup in one process. The binary prints one line per entry in
+  input order, `<pid> <word>`, and exits 0 when every word is `resumed` or
+  `gone`, 1 otherwise. A missing or malformed `<seconds>` (1 to 300), any
+  further argument, empty input or a malformed line is a usage error (exit
+  64) that checks nothing. The script runs the binary only when the bundle's
+  `Info.plist` declares `InsomniaResumeFrozenVersion` equal to the version
+  the script speaks, because an older build would start the menu bar app
+  instead; otherwise it keeps those entries. It runs it with the same
+  30-second limit as a power command, then SIGTERM, then SIGKILL, and with
+  the lock descriptor: the binary keeps the recovery lock while it can
+  still send a signal, even if the script dies first, and ends itself with
+  SIGALRM after `<seconds>` (the script's limit plus the SIGTERM grace), so
+  the lock is freed without anyone waiting for it. The script starts the
+  binary as its own background job and is the only process that signals
+  it, by jobspec, so a signal never reaches a pid bash has already reaped. It checks the whole answer:
+  one line per entry with that entry's pid and a known word and nothing
+  else, and an exit status that agrees with the words. `resumed` and `gone`
+  clear an entry, the other words keep it, and a missing binary, a timeout
+  or any other answer keeps every entry of the call. Entries without
+  microseconds keep the shell's one-second `ps` comparison. Old PID-only
+  entries need conservative handling.
 - The shell does not restore CoreAudio settings. Saved audio must remain in
   the journal for the app to restore. Uninstall must preserve recovery tools
-  and state when restoration is incomplete, including saved audio.
+  and state when restoration is incomplete, including saved audio. It runs
+  the checkout's backstop only when the installed app declares the
+  `InsomniaResumeFrozenVersion` that backstop speaks; otherwise it runs the
+  backstop installed with that app, when there is one. With no installed
+  copy it runs the checkout's backstop anyway, which keeps the entries that
+  need the binary without running it, so uninstall stops before removing
+  anything.
 - The shell puts `appNapOverrides` back with `defaults write <id>
   NSAppSleepDisabled -bool <previous>` or `defaults delete` when the key was
   absent. A delete that fails counts as done only when `defaults read` then
