@@ -105,6 +105,9 @@
 # Honours INSOMNIA_HOME with the same layout as the app (see Paths.swift).
 set -euo pipefail
 export LC_ALL=C TZ=UTC
+# Everything this run creates (log lines, the lock file, the published
+# journal, the directories) is owner-only, like the files the app writes.
+umask 077
 
 # Fixed tool paths: never taken from PATH or the environment. Tests patch
 # these lines in a private copy of the script.
@@ -115,6 +118,7 @@ LOCKF=/usr/bin/lockf
 PS=/bin/ps
 KILL=/bin/kill
 SYSCTL=/usr/sbin/sysctl
+CHMOD=/bin/chmod
 DEFAULTS=/usr/bin/defaults
 DATE=/bin/date
 MKDIR=/bin/mkdir
@@ -165,6 +169,27 @@ log() { # level message
 
 # --- Lock --------------------------------------------------------------------
 "$MKDIR" -p "$APP_SUPPORT"
+# An upgrade over an older build: tighten what it left loose (0644 files,
+# 0755 directories), since this run may write to them before the upgraded
+# app has opened them. umask only covers what this run creates. go-rwx
+# only takes group and other access away and never adds a permission, so a
+# file its owner cannot read stays unreadable. A symlink is left alone, as
+# the app leaves it, and so is an access control list: removing entries
+# changes what recovery can read, such as a 0200 journal its owner reads
+# through an allow entry, or a session a deny entry keeps unreadable, which
+# recovery treats as ended. A chmod that fails is logged as an error and
+# recovery goes on: a loose mode is no reason to leave the machine changed.
+tighten() { # path...
+  local p err
+  for p in "$@"; do
+    if [[ -e "$p" && ! -L "$p" ]]; then
+      if ! err="$("$CHMOD" go-rwx "$p" 2>&1)"; then
+        log error "could not make $p owner-only: ${err:-chmod failed}" || true
+      fi
+    fi
+  done
+}
+tighten "$APP_SUPPORT" "$LOG_DIR" "$LOG" "$LOCK" "$STATE" "$SESSION"
 inode() { stat -f %i "$1" 2>/dev/null; }
 if [[ -e /dev/fd/9 && -e "$LOCK" && -n "$(inode "$LOCK")" && "$(inode /dev/fd/9)" == "$(inode "$LOCK")" ]]; then
   : # fd 9 is the caller's handle on the lock file; share its lock.

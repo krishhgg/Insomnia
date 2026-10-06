@@ -81,8 +81,11 @@ struct RecoveryLock: Sendable {
     func tryAcquire() throws -> RecoveryLockHandle? {
         // O_CLOEXEC: no child inherits the lock by accident. One that must
         // keep it is given its own descriptor (`descriptorForChild()`).
-        let fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0o644)
+        // Owner-only like every other file here; an older 0644 lock is
+        // tightened in place, never replaced (same inode for both sides).
+        let fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, OwnerOnly.fileMode)
         guard fd >= 0 else { throw RecoveryLockError.open(path: path, errno: errno) }
+        if let problem = OwnerOnly.tighten(fd: fd, path: path) { OwnerOnly.reportOnce(problem) }
         if flock(fd, LOCK_EX | LOCK_NB) == 0 { return RecoveryLockHandle(fd: fd) }
         let err = errno
         close(fd)
