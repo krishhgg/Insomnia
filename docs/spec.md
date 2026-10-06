@@ -395,7 +395,8 @@ through 95 as `Config.normalizeFloors` does. The backstop reads the scalar
 keys `endFloor` and `thermalRules` from config.json directly, not through the
 app's decoder, so it cannot tell whether the app accepted the file. The app
 therefore refuses to run a session on a config.json it rejected and could
-not move aside (section 10).
+not move aside, or moved aside without writing its settings in its place
+(section 10).
 Performance effects depend on workload.
 
 ### 7. Network failover
@@ -723,11 +724,14 @@ those two keys, such as a 0% floor or thermal rules off, while the app
 enforces its defaults. So every transaction (reconcile, start, extend, end,
 and the lid, floor and Low Power changes) checks the file again. One that
 does not decode is renamed aside as at launch, and the settings the app runs
-on are written in its place. While a rejected file cannot be renamed, no
-session runs:
+on are written in its place. With no file the backstop enforces its own
+defaults, so a write that fails, as on a full disk, is tried again in every
+transaction until it succeeds. While a rejected file cannot be renamed, or
+its replacement is not written yet, no session runs:
 
 - Start refuses and changes nothing. Its notification names the file and
-  says to make it writable or delete it.
+  says to make it writable or delete it, or, when the replacement could not
+  be written, to free disk space or make its folder writable.
 - A session already running ends at the next transaction, through the
   normal end.
 - Reconcile ends a valid session on disk instead of resuming it.

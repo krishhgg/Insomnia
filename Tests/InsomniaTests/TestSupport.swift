@@ -837,9 +837,28 @@ enum TestACL {
     /// Gives `url` one entry letting its owner, the user running the tests,
     /// read it. On a 0200 file that entry is the only way to read it.
     static func grantOwnerRead(_ url: URL) throws {
+        try chmod(["+a", "user:\(owner) allow read", url.path])
+    }
+
+    /// Gives directory `dir` one entry that stops its owner creating files
+    /// in it, so the temp file of an atomic write fails as on a full disk.
+    /// A directory inside can still be renamed: that needs
+    /// add_subdirectory, which the entry leaves allowed.
+    static func denyNewFiles(in dir: URL) throws {
+        try chmod(["+a", "user:\(owner) deny add_file", dir.path])
+    }
+
+    /// Removes every ACL entry from `url`.
+    static func removeAll(_ url: URL) throws {
+        try chmod(["-N", url.path])
+    }
+
+    private static var owner: String { String(cString: getpwuid(getuid()).pointee.pw_name) }
+
+    private static func chmod(_ arguments: [String]) throws {
         let chmod = Process()
         chmod.executableURL = URL(fileURLWithPath: "/bin/chmod")
-        chmod.arguments = ["+a", "user:\(String(cString: getpwuid(getuid()).pointee.pw_name)) allow read", url.path]
+        chmod.arguments = arguments
         let exit = ProcessExit(chmod)
         try chmod.run()
         exit.wait()

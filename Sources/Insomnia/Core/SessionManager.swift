@@ -25,7 +25,8 @@ enum EndReason: String, Sendable {
     /// may still have been applied, so the start is undone from the journal
     /// like an end rather than rolled back from memory.
     case startFailed
-    /// config.json could not be read and could not be moved aside
+    /// config.json could not be read and could not be moved aside, or was
+    /// moved aside and the settings in use could not be written in its place
     /// (`rejectedConfigFile`). backstop.sh reads its cutoffs from that file
     /// itself, so the session would run on cutoffs the app does not enforce.
     case settingsFileRejected
@@ -233,12 +234,17 @@ final class SessionManager {
     /// second copy that never takes the alive lock never reconciles.
     @ObservationIgnored private var configNotice: String?
     /// Why no session may run, set by every transaction while config.json
-    /// is there, the app rejects it, and it could not be moved aside.
-    /// backstop.sh reads the file's endFloor and thermalRules keys itself,
-    /// without the app's decoder, so it could enforce a 0% floor or no
-    /// thermal rule while the app enforces its defaults. Nil once the file
-    /// reads again, is gone, or was moved aside.
+    /// is there, the app rejects it, and it could not be moved aside, or
+    /// while the write that replaces a moved file is owed. backstop.sh reads
+    /// the file's endFloor and thermalRules keys itself, without the app's
+    /// decoder, so it could enforce a 0% floor or no thermal rule while the
+    /// app enforces its defaults, and with no file it enforces its own
+    /// defaults, not the app's settings. Nil once the file reads again or is
+    /// gone and no write is owed.
     @ObservationIgnored private(set) var rejectedConfigFile: String?
+    /// config.json was moved aside and the settings in use are not yet
+    /// written in its place. Every transaction tries the write again.
+    @ObservationIgnored private var configWriteOwed = false
 
     init(
         paths: Paths,
@@ -435,14 +441,20 @@ final class SessionManager {
     /// transaction, because backstop.sh reads the file on every run. A file
     /// the app rejects is moved aside and the settings the app runs on are
     /// written in its place, so the agent and the app enforce the same
-    /// cutoffs. When the rename fails, `rejectedConfigFile` says why and no
-    /// session runs. A missing file, or one that decodes, is left alone.
+    /// cutoffs. When the rename fails, or until that write succeeds,
+    /// `rejectedConfigFile` says why and no session runs. A file that
+    /// decodes is left alone, and so is a missing one unless the write is
+    /// owed.
     private func checkConfigFile() {
         let detail: String
         do {
-            _ = try store.loadConfig()
+            if try store.loadConfig() == nil, configWriteOwed {
+                writeOwedConfig()
+                return
+            }
             if rejectedConfigFile != nil { Log.info("config.json reads again or is gone; sessions can start") }
             rejectedConfigFile = nil
+            configWriteOwed = false
             return
         } catch let StoreError.unreadable(_, brief) {
             detail = brief
@@ -451,14 +463,14 @@ final class SessionManager {
         }
         do {
             let moved = try store.moveAsideUnreadableConfig(now: clock())
-            rejectedConfigFile = nil
-            do {
-                try store.saveConfig(config)
-                Log.error("config.json could not be read (\(detail)); moved to \(moved.path); the settings in use were written back")
-            } catch {
-                Log.error("config.json could not be read (\(detail)); moved to \(moved.path); the settings in use could not be written back: \(error.localizedDescription)")
+            Log.error("config.json could not be read (\(detail)); moved to \(moved.path)")
+            configWriteOwed = true
+            writeOwedConfig()
+            if let why = rejectedConfigFile {
+                notifier.post(title: Self.configFileTitle, body: "config.json could not be read (\(detail)) and was moved to \(moved.path). \(why)")
+            } else {
+                notifier.post(title: Self.configFileTitle, body: "config.json could not be read (\(detail)). It was moved to \(moved.path), and Insomnia wrote the settings it is using back to config.json.")
             }
-            notifier.post(title: Self.configFileTitle, body: "config.json could not be read (\(detail)). It was moved to \(moved.path), and Insomnia wrote the settings it is using back to config.json.")
         } catch let moveError {
             let why = Self.rejectedConfigMessage(paths.configFile.path, detail: detail, moveError: moveError.localizedDescription)
             if rejectedConfigFile != why { Log.error(why) }
@@ -466,8 +478,26 @@ final class SessionManager {
         }
     }
 
-    /// A session still running while config.json is rejected in place ends
-    /// through the normal path, as any other cutoff does.
+    /// Writes the settings in use where config.json was moved aside. Only a
+    /// write that succeeds lets sessions run again: until then the agent
+    /// finds no file and enforces its own defaults, whatever the app's end
+    /// floor and thermal rules are.
+    private func writeOwedConfig() {
+        do {
+            try store.saveConfig(config)
+            Log.info("the settings in use were written to config.json" + (rejectedConfigFile != nil ? "; sessions can start" : ""))
+            configWriteOwed = false
+            rejectedConfigFile = nil
+        } catch {
+            let why = "Insomnia could not write the settings it uses to config.json. The recovery agent reads its end floor and thermal rules from that file and uses its own defaults while the file is missing, so Insomnia runs no session until the file is written. Free some disk space or make \(paths.appSupport.path) writable."
+            if rejectedConfigFile != why { Log.error("\(why) (\(error.localizedDescription))") }
+            rejectedConfigFile = why
+        }
+    }
+
+    /// A session still running while config.json is rejected in place, or
+    /// while its replacement is owed, ends through the normal path, as any
+    /// other cutoff does.
     private func endIfConfigFileRejected() async {
         guard session != nil, let why = rejectedConfigFile else { return }
         Log.error("ending the session: \(why)")

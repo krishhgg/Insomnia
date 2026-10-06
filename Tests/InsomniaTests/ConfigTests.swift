@@ -672,4 +672,53 @@ final class ConfigLoadTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: moved), written)
         XCTAssertTrue(h.notifier.posts.contains { $0.title == SessionManager.configFileTitle && $0.body.contains("It was moved to \(moved.path)") }, "\(h.notifier.posts)")
     }
+
+    /// A rejected file moved aside whose replacement cannot be written, as
+    /// on a full disk, leaves no config.json: the agent would enforce its
+    /// 10% default floor while the app enforces 30%. The running session
+    /// ends, Start is refused, and every transaction writes again until the
+    /// file is there. config.json is a directory here, which the rename
+    /// moves under the ACL entry that stops the write's temp file.
+    func testSessionsWaitForTheSettingsInUseToBeWrittenWhereTheRejectedConfigWas() async throws {
+        var mine = Config()
+        mine.endFloor = 30
+        try h.store.saveConfig(mine)
+        let m = h.makeManager()
+        await m.reconcile()
+        await m.start(duration: 3600)
+        XCTAssertTrue(m.isActive)
+        let file = h.home.paths.configFile
+        let dir = h.home.paths.appSupport
+        try FileManager.default.removeItem(at: file)
+        try FileManager.default.createDirectory(at: file, withIntermediateDirectories: false)
+        try TestACL.denyNewFiles(in: dir)
+        defer { try? TestACL.removeAll(dir) }
+
+        await m.extend(by: 600)
+
+        XCTAssertFalse(m.isActive)
+        XCTAssertTrue(h.guardFake.calls.contains("disablesleep 0"), "\(h.guardFake.calls)")
+        XCTAssertNil(try h.store.loadSession())
+        XCTAssertFalse(FileManager.default.fileExists(atPath: file.path))
+        XCTAssertEqual(try movedAsideConfigs(), ["config.json.unreadable-20270115T080000Z"])
+        let why = try XCTUnwrap(m.rejectedConfigFile)
+        XCTAssertTrue(why.hasSuffix("Free some disk space or make \(dir.path) writable."), why)
+        let moved = dir.appendingPathComponent("config.json.unreadable-20270115T080000Z")
+        XCTAssertTrue(h.notifier.posts.contains { $0.title == SessionManager.configFileTitle && $0.body.hasSuffix("was moved to \(moved.path). \(why)") }, "\(h.notifier.posts)")
+
+        await m.start(duration: 3600)
+
+        XCTAssertFalse(m.isActive)
+        XCTAssertEqual(h.guardFake.calls.filter { $0 == "disablesleep 1" }.count, 1)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: file.path))
+        XCTAssertEqual(h.notifier.posts.last?.body, "Insomnia did not start a session. \(why)")
+
+        try TestACL.removeAll(dir)
+        await m.reconcile()
+
+        XCTAssertNil(m.rejectedConfigFile)
+        XCTAssertEqual(try h.store.loadConfig()?.endFloor, 30)
+        await m.start(duration: 3600)
+        XCTAssertTrue(m.isActive)
+    }
 }
