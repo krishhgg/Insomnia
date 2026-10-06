@@ -300,6 +300,41 @@ last held while it was on was the battery or thermal floor, not the lid.
   - If a browser is running without them, the menu shows a warning and a
     "Relaunch <browser> unthrottled" item that quits and relaunches it with
     both flags and the same profile.
+  - The item asks for confirmation first (the browser is quit; its windows
+    return only through its own session restore). The item carries the
+    browser's bundle id and name from when the menu was built, and
+    confirming hands those on, so a browser scan that replaces the list
+    while the alert is up cannot change or drop the browser; one that has
+    quit by then is reported as not running. The profile arguments are
+    read before the quit, and unreadable arguments (including empty `ps`
+    output) stop the relaunch before anything is quit. So does a main
+    process that exits during the read, checked by `NSRunningApplication`
+    and by the kernel's start time for the pid, since `ps` reads by pid and
+    the pid may have gone to another process. A start time that cannot be
+    read counts the same way: nothing confirms the pid is still the
+    browser, so the arguments are not read and nothing is quit. The quit
+    goes to the `NSRunningApplication` objects found before the read, never
+    to a fresh lookup of their pids. After the quit request Insomnia waits up
+    to 10 s, then reads the running list again: any instance still there
+    means nothing is launched, and the notification says the browser may
+    still quit later and then has to be opened by hand.
+    After `open` returns 0 the running list is polled for up to 5 s; a
+    browser not running by then is reported too. A session that ends during
+    that wait cancels it at once and nothing is reported, since the user
+    ended the session. The 10 s quit wait does not stop on a cancel, so a
+    relaunch whose session ended during it reports nothing either when the
+    wait is over. Only the newest relaunch of a browser reports, so one
+    that a newer relaunch of the same browser overtook reports nothing
+    either. Every other outcome short of a relaunch is a "Browser not
+    relaunched" notification naming the browser, and the same text stays
+    in the menu as a warning line, one per browser, until that browser's
+    next relaunch or the next session start, because notifications can be
+    off for Insomnia.
+    Insomnia is the notification center's delegate and asks for banners
+    while it is frontmost, as it is right after the confirmation; without
+    that, macOS drops a notification from the frontmost app. The process
+    side (`BrowserProcessControlling`) is injected so the tests quit
+    nothing.
   - Headless Playwright is unaffected and needs nothing.
   - **Must be verified on the real machine with the lid shut** (see test plan).
     If macOS 26 does not mark windows occluded in this state, the feature is
@@ -372,6 +407,87 @@ Performance effects depend on workload.
   SSID) and is never placed in process arguments. Retry with backoff (5 s,
   10 s, 20 s, 30 s, then every 30 s) until the path is satisfied or the
   session ends.
+- The Keychain item is created with an access list naming only the saving
+  build (`SecAccessCreate` with the running code as the sole trusted
+  application; under ad-hoc signing that is the build's cdhash). Reads run
+  with the process-wide Keychain prompt switch off
+  (`SecKeychainSetUserInteractionAllowed`, put back after each call), since
+  the per-query no-UI keys only govern the data protection keychain. An item
+  the build may not read fails with `errSecAuthFailed` (another build's item,
+  or a locked keychain; the file-based keychain cannot tell them apart), and
+  a missing item with `errSecItemNotFound`. Either skips the join and sets
+  a `HotspotPasswordReport`, the `HotspotPasswordProblem` and the SSID it
+  was read for: a warning line in the right-click menu and a notice under
+  the password field in Settings, both only while that SSID is the one
+  configured, and one notification per outage and hotspot (re-armed on
+  recovery, on stop and when the password is saved). Settings checks the
+  notice again whenever the configured SSID changes. A save in
+  Settings writes to the keychain that holds the item reads find, which
+  need not be the default keychain (a new item goes to the default
+  keychain). A locked keychain
+  hides this build's items as well as another build's, so a save that
+  finds the item unreadable first checks the keychain's lock state
+  (`SecKeychainGetStatus`) and, if it is locked, unlocks it (the prompt)
+  and starts over. An item the build can read already names it, so only
+  the value changes, in place (`SecItemUpdate`). An item it still cannot
+  read is another build's and needs a new access list, and the file-based
+  keychain changes that only by replacing the item (an in-place update of
+  `kSecAttrAccess` did not return when tried on a throwaway keychain): the
+  new password is put beside the old item, in the same keychain, under
+  service `insomnia-hotspot.replacing`; the old item is deleted; the new
+  one is renamed to `insomnia-hotspot`. Reads use only `insomnia-hotspot`
+  and never fall back to a `.replacing` item: which save left it, and
+  whether that save finished, is not known, and one in another keychain
+  on the search list can hold an older password. Until the delete, the
+  password reads as unreadable, as before the save; after the rename, as
+  the new one. A save that stops in between (a failed rename, a crash)
+  leaves it reading as missing, and the user enters it again. A
+  `.replacing` item the build can read, left by such a save, has its value
+  changed in place by the next save; one it cannot read with the keychain
+  unlocked is another build's and is deleted, then added again. A refused
+  delete of the old item removes the `.replacing` item and keeps the old
+  one. Clearing the password deletes both. Deleting another build's item, and unlocking the keychain
+  for a save, need the prompt, which is allowed only there.
+  `kSecAttrAccessible` is not set: the file-based keychain drops it, and
+  the data protection keychain needs an access-group entitlement.
+- Every keychain call the app makes, the failover's reads and the saves
+  and clears in Settings, runs on one serial dispatch queue
+  (`KeychainQueue`), never on the main actor. A save can wait on a
+  keychain prompt for as long as the user leaves it open, and the battery
+  floor, the deadline timer and End keep running meanwhile; one queue also
+  keeps two calls from setting the process-wide prompt switch at once. The
+  Save button reads "Saving…" until the keychain answers, then "Saved"
+  only while the SSID and password fields hold what the save stored: the
+  save uses the SSID that was in the field when it began, so an SSID typed
+  during the wait has no password yet. A failed save's notice stays under
+  the field even when the failover's report changed during the wait; the
+  recheck that change started reads the keychain behind the save, and its
+  answer is dropped. So is the answer of a load still running when a save
+  or clear begins, so it cannot refill a field the user just cleared. A
+  load fills the field only if the field was empty when it began and
+  nobody has edited it since, not even by typing and deleting it again. A
+  recheck that begins meanwhile (the report changed, or the SSID was
+  edited) sets the notice instead of the load, but does not stop the fill.
+- Work that waits on `KeychainQueue` checks again, once the wait is over,
+  everything it acts on, and drops its answer if any of it changed. A
+  load or recheck in Settings whose SSID was edited meanwhile is dropped,
+  since its answer is about the old SSID's item, and the SSID configured
+  now is read instead, so the field is not left empty with no notice.
+  That read is a peek: the SSID a later save moves the password from
+  stays the one the window loaded, as after any SSID edit. A save writes
+  the item for the SSID configured when it began and removes the item of
+  the SSID the window loaded, if that SSID was edited since, and returns
+  both. It clears the failover's report and re-arms its notification
+  unless the report is about the SSID configured when it answers and the
+  save touched neither of that SSID's items. A save that stored for an
+  SSID edited away meanwhile then checks the notice for the SSID
+  configured now. A failover join whose read waited behind a
+  save does nothing if the session has ended, Wi-Fi has come back, or the
+  configured SSID has changed: no join and no warning, so the
+  notification stays armed. After a recovery or stop it schedules no
+  retry either; after an SSID change the retry stays, and the next tick
+  reads the SSID configured then. Inside a save, the unlock prompt is
+  followed by a fresh read of the item and its keychain.
 - macOS 26 requires Location Services permission before CoreWLAN exposes SSIDs
   or returns results for an SSID-filtered scan. Insomnia requests when-in-use
   access when the hotspot is saved or a configured session starts, never at
@@ -385,6 +501,10 @@ Performance effects depend on workload.
   the body; `insomnia.log` keeps the text.
 - Each outage is logged with start, end, and gap length to
   `~/Library/Logs/Insomnia/handoffs.log`. The menu shows the last gap.
+  Like `insomnia.log`, the file is owner-only (0600) and is renamed to
+  `handoffs.log.1` once it passes 1 MiB (`OwnerOnly.swift`). A log the user
+  replaced with a symlink is never rotated, so the cap does not hold for it:
+  the file it points to is the user's to manage.
 - Path satisfied again after a gap longer than `nudgeThreshold` (default 90 s):
   - For every configured tmux target (`session:window.pane`), resolve the
     concrete pane, read its state and then its mark, the pane-scoped user
@@ -487,10 +607,42 @@ Backstop, independent of the app:
   run or the app.
 - Successful restores may clear their entries; failures must stay journaled.
   Process recovery must verify identity and avoid resuming a process that
-  Insomnia did not stop. Old PID-only entries need conservative handling.
+  Insomnia did not stop. The entries that record `startedAtMicros` go to
+  the installed app binary in one call (`Insomnia --resume-frozen
+  <seconds>`, with one line `<pid> <startedAt> <startedAtMicros>
+  <bootSession>` per entry on standard input, which has no size limit,
+  answered before AppKit starts),
+  so the comparison is to the microsecond and each entry's signal follows
+  its own lookup in one process. The binary prints one line per entry in
+  input order, `<pid> <word>`, and exits 0 when every word is `resumed` or
+  `gone`, 1 otherwise. A missing or malformed `<seconds>` (1 to 300), any
+  further argument, empty input or a malformed line is a usage error (exit
+  64) that checks nothing. The script runs the binary only when the bundle's
+  `Info.plist` declares `InsomniaResumeFrozenVersion` equal to the version
+  the script speaks, because an older build would start the menu bar app
+  instead; otherwise it keeps those entries. It runs it with the same
+  30-second limit as a power command, then SIGTERM, then SIGKILL, and with
+  the lock descriptor: the binary keeps the recovery lock while it can
+  still send a signal, even if the script dies first, and ends itself with
+  SIGALRM after `<seconds>` (the script's limit plus the SIGTERM grace), so
+  the lock is freed without anyone waiting for it. The script starts the
+  binary as its own background job and is the only process that signals
+  it, by jobspec, so a signal never reaches a pid bash has already reaped. It checks the whole answer:
+  one line per entry with that entry's pid and a known word and nothing
+  else, and an exit status that agrees with the words. `resumed` and `gone`
+  clear an entry, the other words keep it, and a missing binary, a timeout
+  or any other answer keeps every entry of the call. Entries without
+  microseconds keep the shell's one-second `ps` comparison. Old PID-only
+  entries need conservative handling.
 - The shell does not restore CoreAudio settings. Saved audio must remain in
   the journal for the app to restore. Uninstall must preserve recovery tools
-  and state when restoration is incomplete, including saved audio.
+  and state when restoration is incomplete, including saved audio. It runs
+  the checkout's backstop only when the installed app declares the
+  `InsomniaResumeFrozenVersion` that backstop speaks; otherwise it runs the
+  backstop installed with that app, when there is one. With no installed
+  copy it runs the checkout's backstop anyway, which keeps the entries that
+  need the binary without running it, so uninstall stops before removing
+  anything.
 - The shell puts `appNapOverrides` back with `defaults write <id>
   NSAppSleepDisabled -bool <previous>` or `defaults delete` when the key was
   absent. A delete that fails counts as done only when `defaults read` then
@@ -517,7 +669,9 @@ not decode, and another copy already running (the copy quits).
 ### 10. Settings
 
 JSON at `~/Library/Application Support/Insomnia/config.json`, edited through a
-small settings window:
+small settings window. Like `session.json`, `state.json` and the recovery
+lock it is created mode 0600 in a 0700 directory, and a looser file from an
+older build is tightened when the app reads it:
 
 - presets, default preset
 - freeze list (bundle ids), freeze every other app on/off (default off),
@@ -773,7 +927,7 @@ Insomnia/
 ## Install
 
 ```
-git clone https://github.com/kgarg2468/Insomnia.git && cd Insomnia
+git clone https://github.com/krishhgg/Insomnia.git && cd Insomnia
 ./scripts/install.sh      # asks for sudo once, for the sudoers file
 ```
 

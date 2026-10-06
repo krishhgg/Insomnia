@@ -254,7 +254,7 @@ struct SignalProcessControl: ProcessSignaling {
         return String(decoding: bytes, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
     }()
 
-    private static func kernelState(pid: Int32) -> ProcessLookup {
+    static func kernelState(pid: Int32) -> ProcessLookup {
         guard pid > 0 else { return .absent }
         var info = proc_bsdinfo()
         let size = Int32(MemoryLayout<proc_bsdinfo>.size)

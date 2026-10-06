@@ -125,6 +125,7 @@ is performed. Do not replace "not run" with "passed" based on source review.
 | Hand-edited config.json that does not decode: at launch the app renames it to config.json.unreadable-<time>, runs on defaults and notifies; the settings come back after fixing the copy, quitting and renaming it to config.json | Not run |
 | Locked config.json that does not decode (`chflags uchg`): Start refuses and its notification names the file; with a session running, the next extend ends it; after `chflags nouchg`, Start moves the file aside and starts | Not run |
 | Reboot/login with active or dirty journals | Not run |
+| Backstop resuming a frozen test process through the installed `Insomnia --resume-frozen`, and keeping the entry when the bundle is removed or its Info.plist lacks `InsomniaResumeFrozenVersion` | Not run |
 | Lid-close/open and safe recovery of explicitly selected test processes | Not run |
 | Lid-close display/keyboard darkening and restore | Not run |
 | Freeze-all scope with agents running (Cursor/T3 Code/Claude untouched) | Not run |
@@ -137,15 +138,19 @@ is performed. Do not replace "not run" with "passed" based on source review.
 | App Nap opt-in: previous `NSAppSleepDisabled` put back at session end, by the backstop after a force-quit, and by uninstall | Not run |
 | Docker Desktop idle/busy behavior with another Docker context selected | Not run |
 | Hotspot permission, association, cancellation, and reconnect | Not run |
+| Hotspot password after a reinstall: menu and Settings report it unreadable, no prompt during an outage, re-save replaces the item (prompt on Save allowed) | Not run |
 | Settings location note matches what System Settings shows after the grant | Not run |
 | tmux cancellation with a dedicated disposable pane | Not run |
 | tmux nudge on the user's own tmux server: marked pane gets `continue` only, Enter toggle submits it, unmarked pane untouched | Not run |
 | Headed-browser throttling with the lid closed | Not run |
+| Relaunch unthrottled: confirmation alert, profile arguments carried over, a browser that has not quit after 10 s is left as it is and the notification names it, a browser not running 5 s after `open` is reported | Not run |
+| Relaunch failure while Insomnia is frontmost: with notifications allowed, the "Browser not relaunched" banner shows without switching apps after the confirmation; with notifications off for Insomnia, the reason is a warning line in the right-click menu | Not run |
 | Battery/thermal event behavior on supported hardware | Not run |
 | `SleepDisabled 1` set by hand with no session: left alone and reported at launch, not cleared | Not run |
 | Unreadable battery (IOKit miss) ends the session on a laptop after the second read; desktop unaffected | Not run |
 | Settings floor steppers keep the end floor below the Low Power Mode floor by moving the other stepper | Not run |
 | Install/upgrade/uninstall with recoverable failure conditions | Not run |
+| First launch over an existing install tightens Application Support/Insomnia and Logs/Insomnia to 0700 and their files to 0600 | Not run |
 | Launch at login survives a reinstall by install.sh, including a second install.sh run on the same unchanged build (switch on, reinstall, relaunch: the log shows the launch-time check, System Settings > General > Login Items lists Insomnia as enabled, and the Settings switch reads on; a pending approval shows the note and the Open Login Items button) | Not run |
 | Launch at login heals on the first upgrade from a build without the install record (switch on in the previous build, upgrade with install.sh, relaunch: the log shows "registering once and recording the install", Login Items lists Insomnia, and config.json has `launchAtLoginInstall`) | Not run |
 | Launch at login removed in System Settings stays removed (switch on, relaunch once so the install is on file, remove Insomnia under System Settings > General > Login Items, relaunch: the log says the removal was respected, the Settings switch is off, and Login Items does not list Insomnia again) | Not run |

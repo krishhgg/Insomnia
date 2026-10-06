@@ -18,7 +18,11 @@ final class LiveStatusSource: StatusSource {
     var lastGap: TimeInterval? { services.status.lastGap }
     var frozenCount: Int { services.status.frozenCount }
     var dockerPaused: Bool { services.status.dockerPaused }
-    var throttledBrowsers: [String] { services.status.throttledBrowsers }
+    var throttledBrowsers: [ThrottledBrowser] { services.status.throttledBrowsers }
+    var relaunchProblems: [String] {
+        services.status.relaunchProblems.sorted { $0.key < $1.key }.map(\.value)
+    }
+    var hotspotPasswordReport: HotspotPasswordReport? { services.status.hotspotPasswordReport }
     var locationPermission: LocationPermission { services.locationPermission }
 
     func refreshOnDemand() {
@@ -35,17 +39,9 @@ final class LiveStatusSource: StatusSource {
         services.instantWatts()
     }
 
-    func relaunchUnthrottled(_ name: String) {
-        guard let bundleID = Self.bundleID(forDisplayName: name, in: services.status.browsers) else {
-            Log.error("relaunch: no bundle id for browser named \(name)")
-            return
-        }
+    func relaunchUnthrottled(_ browser: ThrottledBrowser) {
         Task { @MainActor [services] in
-            await services.relaunchUnthrottled(bundleID)
+            await services.relaunchUnthrottled(browser)
         }
-    }
-
-    static func bundleID(forDisplayName name: String, in browsers: [BrowserStatus]) -> String? {
-        browsers.first { $0.name == name }?.bundleId
     }
 }

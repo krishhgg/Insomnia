@@ -28,8 +28,16 @@ enum LidSimulationBuild {
         #endif
     }
 
-    /// One line for the log, the status menu and Settings.
+    /// One line for the log, the status menu and Settings. Every use is
+    /// behind `isCompiledIn`, but whether the text is left out of a plain
+    /// release binary then depends on what the optimizer inlines, and
+    /// scripts/check-lid-simulation-gate.sh fails on any copy. So the text
+    /// is compiled in only with the watcher.
+    #if DEBUG || INSOMNIA_LID_SIMULATION
     static let marker = "Lid simulation build: scripts/simulate-lid.sh is honoured during sessions"
+    #else
+    static let marker = ""
+    #endif
 }
 
 /// What `AppServices` needs from the watcher, so a test can inject a fake
