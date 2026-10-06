@@ -279,7 +279,10 @@ last held while it was on was the battery or thermal floor, not the lid.
   uninstall makes under the recovery lock (`pgrep`, `launchctl`,
   `codesign`); a read that does not answer ends the check with the command
   to run by hand, and uninstall goes on. A call past its limit gets SIGTERM,
-  then SIGKILL, and never holds the lock.
+  then SIGKILL a second later. Each call keeps the lock until it has exited
+  or been stopped, and a supervising process enforces the limit even if
+  uninstall is killed while it waits, so its `launchctl bootout` is not
+  still running when the app takes the lock and loads its agent.
 - Browser throttling: Chromium browsers throttle windows macOS reports as
   occluded, which is every window once the lid is closed with no external
   display. Timers drop to 1 Hz, animation frames stop, pages report hidden.
@@ -513,10 +516,14 @@ Backstop, independent of the app:
   the lock first removes the rule and leaves no journal, so the recovery
   alone would pass. Under the lock every `sudo -n -l`, `pgrep`, `launchctl`
   and `codesign --verify` call has a 30 s limit (the sudoers check before
-  the lock has it too) and runs with fd 9 closed; a call past it gets
-  SIGTERM, then SIGKILL. A sudoers check or `pgrep` that does not answer
-  stops the run, which releases the lock so the app and the agent can
-  recover. A `launchctl print` that does not answer counts as unknown, never
+  the lock has it too). A supervising process enforces it, even if the
+  installer is killed while it waits, and the call keeps fd 9, so the lock
+  is held until the call has exited or been stopped: no `launchctl bootout`
+  or `bootstrap` it started is still running once the lock is released. A call past the
+  limit gets SIGTERM, then SIGKILL a second later; `sudo` only ever gets
+  SIGTERM, and one that ignores it keeps the lock until it ends, reported
+  with its pid. A sudoers check or `pgrep` that does not answer stops the
+  run, which releases the lock so the app and the agent can recover. A `launchctl print` that does not answer counts as unknown, never
   as unloaded. A `codesign --verify` that does not answer leaves it unknown
   which bundle the plist on disk pins, so the run stops and moves neither
   bundle. uninstall.sh runs the

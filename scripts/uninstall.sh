@@ -59,9 +59,9 @@ LOCK_TIMEOUT_SECONDS=10
 QUIT_WAIT_SECONDS=10
 # Longest one external call made by this script itself (pgrep, defaults,
 # launchctl, codesign) may run before it is stopped with SIGTERM, then
-# SIGKILL. These are unprivileged and never touch the journal, and they run
-# with the lock descriptor closed, so a call that hangs is reported and can
-# never keep the recovery lock. backstop.sh bounds its own commands; the two sudo calls
+# SIGKILL. A call made under the recovery lock keeps the lock until it has
+# exited or been stopped, even if this run is killed first (see bounded()).
+# backstop.sh bounds its own commands; the two sudo calls
 # prompt for a password and are left to sudo's own prompt timeout.
 CALL_TIMEOUT_SECONDS=30
 APP="$HOME/Applications/Insomnia.app"
@@ -121,57 +121,73 @@ trap '"$RM" -f "$WORK"/call.* 2>/dev/null; "$RMDIR" "$WORK" 2>/dev/null || true'
 
 # Run one external call with a time limit. Its combined output is left in
 # BOUNDED_OUTPUT (trailing newline removed) and its exit status returned, or
-# 124 when it did not finish within CALL_TIMEOUT_SECONDS: it is then sent
-# SIGTERM, and SIGKILL a second later if it is still there. A supervising
-# subshell waits for the call and writes its status to a file; both run with
-# fd 9 (the recovery lock) closed, so nothing left behind by a stuck call
-# holds the lock once this script exits. Called directly, not in $(...), so
-# the counter that names each call's files stays unique.
-bounded_calls=0
+# 124 when it did not finish within CALL_TIMEOUT_SECONDS and was stopped, or
+# 125 when it is sudo and still running (pid in BOUNDED_PID; this script
+# bounds no sudo call). The same helper as install.sh's, which says more.
+# supervise() enforces the limit itself, even if this run is killed while it
+# waits: SIGTERM at the limit, SIGKILL a second later, never SIGKILL for
+# sudo. The supervisor and the call keep fd 9 (the recovery lock) until the
+# call has exited, so a launchctl bootout made under the lock cannot unload
+# an agent the app confirms after this run is gone.
 BOUNDED_OUTPUT=""
+BOUNDED_PID=""
+# shellcheck disable=SC2034  # BOUNDED_PID is for sudo, and this script bounds none
 bounded() { # command args...
-  local base supervisor cpid rc i
-  bounded_calls=$((bounded_calls + 1))
-  base="$WORK/call.$bounded_calls"
+  local base supervisor rc i
+  base="$("$MKTEMP" "$WORK/call.XXXXXX")"
   BOUNDED_OUTPUT=""
-  (
-    "$@" </dev/null >"$base.out" 2>&1 &
-    echo "$!" > "$base.pid"
-    rc=0
-    wait "$!" || rc=$?
-    echo "$rc" > "$base.rc"
-  ) </dev/null >/dev/null 2>&1 9>&- &
+  BOUNDED_PID=""
+  supervise "$base" "$@" </dev/null >/dev/null 2>&1 &
   supervisor=$!
-  # Polled every 10 ms: a check makes some 30 calls, so a coarser poll
-  # would add seconds to an uninstall that is otherwise instant.
-  for (( i = 0; i < CALL_TIMEOUT_SECONDS * 100; i++ )); do
-    if [[ -s "$base.rc" ]]; then break; fi
-    sleep 0.01
-  done
-  if [[ ! -s "$base.rc" ]]; then
-    cpid="$(cat "$base.pid" 2>/dev/null || true)"
-    if [[ -n "$cpid" ]]; then kill -TERM "$cpid" 2>/dev/null || true; fi
-    for (( i = 0; i < 10; i++ )); do
+  if [[ "$1" == "$SUDO" ]]; then
+    # The limit, then up to two seconds for sudo to stop on SIGTERM.
+    for (( i = 0; i < (CALL_TIMEOUT_SECONDS + 2) * 100; i++ )); do
       if [[ -s "$base.rc" ]]; then break; fi
-      sleep 0.1
+      sleep 0.01
     done
-    if [[ ! -s "$base.rc" && -n "$cpid" ]]; then
-      kill -KILL "$cpid" 2>/dev/null || true
-      for (( i = 0; i < 10; i++ )); do
-        if [[ -s "$base.rc" ]]; then break; fi
-        sleep 0.1
-      done
+    if [[ ! -s "$base.rc" ]]; then
+      BOUNDED_PID="$(cat "$base.pid" 2>/dev/null || true)"
+      return 125
     fi
-    # Reap the supervisor once it has written the status; one that is
-    # still waiting on an unkillable call is left behind without the lock.
-    if [[ -s "$base.rc" ]]; then wait "$supervisor" 2>/dev/null || true; fi
-    return 124
   fi
-  read -r rc < "$base.rc"
+  # Any other call is killed a second after the limit, so this wait ends.
   wait "$supervisor" 2>/dev/null || true
+  rc=124
+  if [[ -s "$base.rc" ]]; then read -r rc < "$base.rc"; fi
   IFS= read -r -d '' BOUNDED_OUTPUT < "$base.out" || true
   BOUNDED_OUTPUT="${BOUNDED_OUTPUT%$'\n'}"
   return "$rc"
+}
+# The supervising process of one bounded() call; it runs in the background.
+# The call is its only job, so `kill %1` signals the call, and the shell
+# skips a job it has already reaped: a reused pid is never signalled. The
+# status file is written once the call has been reaped.
+supervise() { # base command args...
+  local base="$1" cpid rc=0 i
+  shift
+  "$@" </dev/null >"$base.out" 2>&1 &
+  cpid=$!
+  echo "$cpid" > "$base.pid"
+  for (( i = 0; i < CALL_TIMEOUT_SECONDS * 100; i++ )); do
+    kill -0 "$cpid" 2>/dev/null || break
+    sleep 0.01
+  done
+  # At the limit, and the shell has not reaped the call: it is still there.
+  if (( i == CALL_TIMEOUT_SECONDS * 100 )) && [[ -n "$(jobs -rp)" ]]; then
+    kill -TERM %1 2>/dev/null || true
+    if [[ "$1" != "$SUDO" ]]; then
+      for (( i = 0; i < 100; i++ )); do
+        if [[ -z "$(jobs -rp)" ]]; then break; fi
+        sleep 0.01
+      done
+      if [[ -n "$(jobs -rp)" ]]; then kill -KILL %1 2>/dev/null || true; fi
+    fi
+    wait "$cpid" 2>/dev/null || true
+    echo 124 > "$base.rc"
+    return
+  fi
+  wait "$cpid" || rc=$?
+  echo "$rc" > "$base.rc"
 }
 
 # Fail closed on paths that are not the exact things install.sh created.

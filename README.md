@@ -122,10 +122,14 @@ replacing either; follow the reported instructions before retrying. The
 installer checks the sudoers rule again once it holds the recovery lock, and
 stops if the rule is gone, as after an `uninstall.sh` that took the lock first.
 Each call it makes to `sudo`, `pgrep`, `launchctl` or `codesign` while it
-holds the lock has a 30 s limit and runs without the lock's file descriptor.
-A call that does not answer in time is stopped and the install stops with
-it, so the lock is released and the app and the agent's backstop can take it
-again to undo a session.
+holds the lock has a 30 s limit, which a supervising process enforces even
+if the installer is killed meanwhile. The call keeps the lock until it has
+exited or been stopped, so no `launchctl bootout` it started is still
+running once the lock is released. A call that does not answer in time gets SIGTERM, then SIGKILL
+a second later, and the install stops, so the lock is released and the app
+and the agent's backstop can take it again to undo a session. `sudo` only
+ever gets SIGTERM: one that ignores it keeps the lock until it ends, and the
+installer prints its pid.
 
 </details>
 
