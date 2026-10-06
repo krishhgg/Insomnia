@@ -4,9 +4,12 @@ import Foundation
 /// the microsecond and the boot session it started in. A reused pid, or the
 /// same pid after a reboot, cannot match all three.
 ///
-/// backstop.sh can only read whole seconds from `ps -o lstart`, so the shell
-/// compares `startedAt` and `bootSession` and treats that as one-second
-/// identity, not an exact match. Only the app compares the microseconds.
+/// backstop.sh can only read whole seconds from `ps -o lstart`, so for an
+/// entry that records `startedAtMicros` it asks the installed app binary
+/// (`Insomnia --resume-frozen`, see `ResumeFrozenCommand`) to compare all
+/// three and signal; the shell never signals such an entry itself. Only an
+/// entry written without microseconds (an older build) is compared by the
+/// shell on `startedAt` and `bootSession`, a one-second identity.
 struct ProcessIdentity: Codable, Equatable, Hashable, Sendable {
     /// Seconds since the epoch, the same value `ps -o lstart` prints.
     let startedAt: Int64
@@ -21,11 +24,13 @@ struct ProcessIdentity: Codable, Equatable, Hashable, Sendable {
     }
 }
 
-/// One journaled SIGSTOP. `identity` is nil for entries written by an older
-/// build as `frozenPids`, which recorded the pid alone, and for provisional
-/// entries `LidActions.freeze` writes before the kernel has confirmed the
-/// stop. Either way such an entry is never signaled, because nothing proves
-/// the stopped process is ours.
+/// One journaled SIGSTOP. `LidActions.freeze` writes the entry without
+/// identity before the signal and adds the identity only after the kernel
+/// confirmed that Insomnia's own SIGSTOP stopped the process. `identity` is
+/// nil for such a provisional entry (the app died or the write failed
+/// before the confirmation) and for entries written by an older build as
+/// `frozenPids`, which recorded the pid alone. An entry without identity is
+/// never signaled, because nothing proves the stopped process is ours.
 struct FrozenProcess: Codable, Equatable, Hashable, Sendable {
     let pid: Int32
     let identity: ProcessIdentity?

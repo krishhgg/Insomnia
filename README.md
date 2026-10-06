@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/eye-moon.svg" alt="Insomnia: an eye with a right-opening crescent moon" width="112">
+  <img src="docs/assets/eye-open.svg" alt="Insomnia: an open eye with a round pupil and five lashes above it" width="112">
 </p>
 
 <h1 align="center">Insomnia</h1>
@@ -39,10 +39,18 @@
 ## Install
 
 Requires **macOS 26 or later** and **Xcode with Swift 6.2 or later**. Installation
-currently means building from source:
+currently means building from source.
+
+Paste this into your coding agent:
+
+```text
+Install Insomnia from https://github.com/krishhgg/Insomnia by following its README. If a step needs my password, give me the command to run in Terminal.
+```
+
+Or run it yourself:
 
 ```bash
-git clone https://github.com/kgarg2468/Insomnia.git
+git clone https://github.com/krishhgg/Insomnia.git
 cd Insomnia
 ./scripts/install.sh
 open "$HOME/Applications/Insomnia.app"
@@ -61,7 +69,7 @@ four power-setting commands. Review that permission before installing.
 | `~/Applications/Insomnia.app` | The menu bar app |
 | `~/Library/Application Support/Insomnia/` | Configuration, session/recovery journals, and `backstop.sh` |
 | `~/Library/LaunchAgents/com.insomnia.backstop.plist` | Per-user recovery agent |
-| `~/Library/Logs/Insomnia/` | `insomnia.log` and `handoffs.log` |
+| `~/Library/Logs/Insomnia/` | `insomnia.log` and `handoffs.log`, each capped at 1 MiB with one older copy kept as `.1`, unless you replace it with a symlink |
 | `/etc/sudoers.d/insomnia` | Permission for the four commands below |
 
 ```text
@@ -106,10 +114,11 @@ instructions before retrying.
 You do not need to close the lid to use a timed session. Opening the lid does
 not end it, and a sleeping display is not the same as a sleeping Mac.
 
-Before the first session, review the settings—some lid actions are enabled by
-default, including pausing every Dock app that is not an agent app while the
-lid is closed. Start with a short, supervised session on a ventilated surface and
-check the status menu and `~/Library/Logs/Insomnia/insomnia.log` afterward.
+Before the first session, review the settings. Some lid actions are on by
+default, including pausing the apps on the freeze list (Slack, WhatsApp and
+Discord) while the lid is closed; pausing every other Dock app is off until
+you turn it on. Start with a short, supervised session on a ventilated surface
+and check the status menu and `~/Library/Logs/Insomnia/insomnia.log` afterward.
 
 ## What happens when the lid closes
 
@@ -118,9 +127,9 @@ check the status menu and `~/Library/Logs/Insomnia/insomnia.log` afterward.
 </p>
 
 During a session, Insomnia turns the display and keyboard backlight off
-(saving their brightness first), pauses the apps on the freeze list and, by
-default, every other Dock app that is not an agent app, checks whether Docker
-Desktop is idle before pausing it, and can save then mute audio.
+(saving their brightness first), pauses the apps on the freeze list (and, if
+you opt in, every other Dock app that is not an agent app), checks whether
+Docker Desktop is idle before pausing it, and can save then mute audio.
 Reopening the lid attempts to undo those lid actions. **The timer keeps
 counting down while the lid is closed**; only its on-screen redraw pauses.
 
@@ -138,14 +147,15 @@ The defaults are worth knowing:
 
 - **Selected apps:** Slack, WhatsApp, and Discord are on the freeze list.
   Configured agent apps are excluded from this ordinary list.
-- **Every other app:** "Freeze every other app while the lid is closed" is on.
-  Every Dock app that is not an agent app, an Apple app, Docker Desktop or a
-  built-in protected app (editors, AI apps, Tailscale, local model servers) is
-  paused too, so only agents keep running with the lid shut. Menu-bar apps are
-  never picked up automatically; add them to the freeze list if you want them
-  paused. Settings shows a "Would freeze now" line listing what the automatic
-  scope would pause at that moment. Turn the toggle off to pause the freeze
-  list only.
+- **Every other app:** "Freeze every other app while the lid is closed" is
+  off, so a fresh install pauses the freeze list only. Turn it on to also pause
+  every Dock app that is not an agent app, an Apple app, Docker Desktop or a
+  built-in protected app (editors, terminals, browsers, AI apps, password
+  managers, local databases, Tailscale, local model servers; JetBrains IDEs by
+  bundle-id prefix), so only agents keep running with the lid shut. Menu-bar
+  apps are never picked up automatically; add them to the freeze list if you
+  want them paused. Settings shows a "Would freeze now" line listing what the
+  automatic scope would pause at that moment.
 - **Docker rule:** enabled, with a separate local Docker Desktop idle check.
   Container startup can race that check; disable the rule for important Docker
   workloads where an unexpected pause would be disruptive.
@@ -216,13 +226,38 @@ installation scenarios still need [release validation](docs/release-validation.m
 <summary><strong>Recovery limits and manual attention</strong></summary>
 
 - **Process ownership:** automatic resume checks the recorded process start
-  time and boot session. Old identity-less entries, or a crash/write failure
-  before a freeze is confirmed, are not automatically resumed while stopped.
-  Verify the live process and whether it should be resumed; never blindly
-  signal a PID from an old log.
+  time and boot session. The app journals each pid before it sends SIGSTOP,
+  and sends nothing when that write fails. The identity is added only after
+  the kernel confirms Insomnia's own stop, so a process somebody else had
+  stopped is never resumed. If the confirming write fails, the app sends
+  SIGCONT at once to each pid it just stopped whose identity still matches,
+  even one that does not show as stopped yet: SIGCONT also cancels a stop
+  that is still pending. It then drops those entries from the journal,
+  shows the failure in the status menu, and stops counting them as frozen
+  even if the disk refuses that write too. If the app dies between the stop and that write,
+  the stopped pids stay journaled without identity, like entries from builds
+  that recorded the pid alone, and are not automatically resumed while
+  stopped. Verify the live process and whether it should be resumed; never
+  blindly signal a PID from an old log.
 - **Identity is not an atomic guarantee:** the app checks start time to the
-  microsecond; the shell checks to the second. A lookup and a signal are still
-  separate operations.
+  microsecond, and the backstop asks the installed app binary
+  (`Insomnia --resume-frozen`) to do the same check and send the signal for
+  every entry that records microseconds, all such entries in one call with a
+  30-second limit. The entries go to the binary on standard input, so a long
+  journal cannot exceed the argument size limit. The backstop never signals those entries itself. It keeps
+  them when the binary is missing, does not finish in time, or answers
+  anything but one expected line per entry. It runs the binary only when the
+  installed bundle declares `InsomniaResumeFrozenVersion` in its
+  `Info.plist`, so it never starts an older build. The binary holds the
+  recovery lock while it can still send a signal and ends itself after the
+  same limit, so a backstop run that is killed mid-call leaves no helper
+  that could act later without the lock. `uninstall.sh` uses the backstop
+  installed with an app that does not declare that version. With no such
+  copy, the checkout's backstop keeps those entries and uninstall stops
+  before removing anything. Entries written by builds before
+  microseconds were recorded keep the one-second `ps` comparison in the
+  shell. A lookup and a signal are still separate operations, one pid at a
+  time.
 - **Stuck power commands:** a command that survives its timeout keeps the
   recovery lock until it exits. Other recovery attempts or new sessions wait
   or fail with a warning instead of running alongside it.
@@ -255,6 +290,30 @@ enter the hotspot SSID and password in Insomnia Settings. The password is
 stored in the login Keychain under service `insomnia-hotspot`. Insomnia uses
 CoreWLAN to find and join that network without putting the password in process
 arguments.
+
+The Keychain item's access list names only the build of Insomnia that saved
+it, and Insomnia reads it with Keychain prompts switched off, so a join during
+an outage never raises a dialog. The installer signs each build ad hoc, which
+gives every install a new identity: after a reinstall the saved password is
+unreadable by the new build. Insomnia then skips the join, shows "Hotspot
+password unreadable by this build" in the right-click menu and in Settings,
+and sends one notification per outage. The warning belongs to the SSID it was
+read for. Change the SSID and it goes, and Settings checks the new SSID's
+saved password instead. Enter the password again in Settings and save; the
+save writes the new password before it removes the old item,
+and macOS may ask you to allow Insomnia to delete the old one, or to unlock
+the login keychain. If that save is cut off after the old item is gone,
+the password reads as missing and you enter it once more: Insomnia never
+reads a half-finished save's copy. The Save button reads "Saving…" until
+macOS answers, and "Saved" only while the SSID and password fields still
+hold what was saved. A join that was waiting while you changed the SSID is
+dropped, and the next retry uses the new SSID. A Settings read that was
+waiting is dropped too, and Settings reads the new SSID's password instead.
+Anything you type in the password field while Settings is still loading the
+saved one stays, even if you delete it again. The rest of Insomnia,
+including the battery floor and End, keeps running while the dialog is open.
+A build signed with a stable identity would keep the item readable across
+upgrades.
 
 macOS requires Location Services permission to reveal network names. Insomnia
 requests it on the first hotspot save, or when starting a session with a
@@ -289,8 +348,22 @@ pending automation but cannot retract keystrokes already sent.
 Chromium browsers can throttle windows macOS considers occluded, including
 when the lid is closed. Insomnia detects supported running browsers missing
 `--disable-backgrounding-occluded-windows` or `--disable-renderer-backgrounding`
-and offers **Relaunch [browser] unthrottled** in the right-click menu. Relaunch
-preserves browser profile arguments. This is not a guarantee that every web
+and offers **Relaunch [browser] unthrottled** in the right-click menu. The item
+asks first, because the browser is quit and its windows and tabs come back only
+if it is set to reopen them on startup. If the browser has quit by the time you
+confirm, nothing is quit or launched and a notification says so. Insomnia reads the browser's profile
+arguments before quitting and carries them over. If it cannot read them, cannot
+read the kernel's start time that ties them to the browser, or the browser
+quits on its own while they are read, it quits nothing and says so. If the
+browser has not quit after 10 s, nothing is launched, and a notification says
+so: a second copy beside the first would be worse than a throttled one. The
+quit request stands, so a browser that closes later has to be opened again by
+hand. After `open` returns, Insomnia waits up to 5 s for the browser to show up
+as running and notifies if it does not. Each of these reasons also stays in the
+right-click menu as a warning line, one per browser, until that browser's next
+relaunch or the next session, so it is there even with notifications off. A
+relaunch that ends after its session ended, or after a newer relaunch of the
+same browser started, reports nothing. This is not a guarantee that every web
 app will keep working while the lid is closed.
 
 </details>
@@ -306,6 +379,21 @@ Lines the app writes to `insomnia.log` also go to the unified log with their
 bodies marked private, so `log show` and other local programs see `<private>`
 in place of the text unless private data logging is enabled on the Mac. The
 backstop's lines go only to `insomnia.log`, which keeps the full text of both.
+The files in Application Support/Insomnia and Logs/Insomnia (config, session,
+journal, recovery lock, the two logs) are owner-only, mode 0600 with those two
+directories 0700, and one left looser by an older build is tightened the next
+time the app or the backstop opens it. Insomnia sets only these modes and
+leaves any access control list (ACL) on these files and folders as it is, so
+an ACL someone added, or one inherited from a parent folder, can still give
+another account access (`ls -le` shows it). The LaunchAgent plist and the installed
+scripts hold no private data and keep the modes the installer gives them.
+`insomnia.log` and `handoffs.log` are capped at 1 MiB: a
+log past the cap is renamed to `insomnia.log.1` or `handoffs.log.1`,
+replacing the previous copy, and a new file starts. The cap does not apply
+to a log you replace with a symlink. Insomnia writes through the link and
+never rotates it, since the rename would move the link and not the file it
+points to, and it logs that once. You set up the link, so trimming the file
+it points to is up to you.
 
 `INSOMNIA_HOME` relocates app support files, logs, and LaunchAgents for testing.
 It is **not an installation sandbox**: installation/removal also involves the
@@ -353,9 +441,10 @@ rather than assuming missing integration coverage passed. Tests use injected
 dependencies and temporary fixtures—not live installation or power changes
 on a contributor's machine.
 
-The app icon keeps the eye-and-moon [vector geometry](Sources/Insomnia/UI/EyeMoonGeometry.swift); the menu bar shows a [closed eye](Sources/Insomnia/UI/EyeMarkGeometry.swift) that opens while a session runs.
+The app icon is the menu bar's open eye on a charcoal tile: [AppIconArtwork](Sources/Insomnia/UI/AppIconArtwork.swift) draws it from the same [vector geometry](Sources/Insomnia/UI/EyeMarkGeometry.swift) as the menu bar's closed eye, which opens while a session runs.
 After changing the artwork, run `./scripts/generate-app-icon.sh` to regenerate
-the packaged PNG and ICNS assets. No image-generation service is needed.
+the packaged PNG and ICNS assets and the README's SVG. The script draws them
+offline with Xcode's swiftc and iconutil.
 
 [Contributing](CONTRIBUTING.md) · [Security reporting](SECURITY.md) ·
 [Release validation](docs/release-validation.md) · [Design notes](docs/spec.md)

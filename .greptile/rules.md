@@ -22,7 +22,14 @@ and run by a per-user LaunchAgent at load and every 60 s with macOS
 missing or expired it runs `sudo -n pmset -a disablesleep 0` and
 `-b lowpowermode 0` for the journaled flags and sends SIGCONT only to a
 journaled pid that still exists, is stopped, started in this boot session at
-the journaled second, and belongs to this user. It keeps, and never
+the journaled second, and belongs to this user. Entries that record
+`startedAtMicros` it never signals itself: it hands them to the installed
+app binary (`Insomnia --resume-frozen <seconds>`), which checks each to the
+microsecond and signals it, and keeps them on any unexpected answer. It runs
+the binary only when the bundle's `Info.plist` declares
+`InsomniaResumeFrozenVersion` equal to its `RESUME_FROZEN_VERSION`, and the
+binary keeps the recovery lock on fd 9 until it ends itself after
+`<seconds>`. It keeps, and never
 restores, `savedOutputVolume`, `savedMuted`, `savedDisplayBrightness`,
 `savedKeyboardBrightness` and `displayRestoredUnderLowPower`: CoreAudio and
 the private brightness frameworks need the app. Legacy `frozenPids` entries
@@ -88,6 +95,36 @@ Flag a change that breaks one of these; do not flag the behavior itself.
   supervising subshell keeps the lock until the command ends, so every later
   app start and backstop run is refused as "lock held" until then. Killing
   sudo would orphan a root pmset outside any transaction.
+- `backstop.sh`, `run_app_bounded`. The `Insomnia --resume-frozen` call
+  is killed with SIGKILL when SIGTERM plus 3 s does not end it, unlike
+  `run_bounded`: it is the user's own unprivileged binary, and once SIGKILL
+  is delivered it runs no more code, so it cannot signal anything later.
+  The backstop shell starts the binary as its own background job, with no
+  supervisor process in between, and signals it with the shell builtin
+  `kill %+` after checking that `%+` is that pid. Bash reaps the child by
+  itself, so a signal by pid could reach a reused pid; a jobspec signal is
+  sent only while bash has not reaped the child. This is the bounded-call
+  exception in the fixed-path rule, so it is not `$KILL`. The entries go on
+  standard input, one line each, so no journal size can exceed the argument
+  limit. A timeout, or any answer that is not exactly one `<pid> <word>`
+  line per entry with a matching exit status, keeps every entry of the call.
+- `backstop.sh`, `run_app_bounded`, fd 9. The binary inherits fd 9, so the
+  recovery lock stays held for as long as it can send a signal, also when
+  the backstop shell died first. It ends itself with SIGALRM after the
+  lifetime the shell passes (`COMMAND_TIMEOUT_SECONDS +
+  KILL_GRACE_SECONDS`), after resetting SIGALRM to its default action and
+  unblocking it, so an orphaned binary frees the lock on its own. One that
+  is still alive after SIGKILL keeps the lock until the kernel ends it.
+- `backstop.sh`, `resume_via_app`, and `uninstall.sh`, step 3. The shell
+  runs the binary only when `INSOMNIA_INFO` declares
+  `InsomniaResumeFrozenVersion` equal to `RESUME_FROZEN_VERSION`; otherwise
+  it keeps those entries without running anything, because an older build
+  would start the menu bar app. `install.sh` copies the binary before
+  `Info.plist`. `uninstall.sh` runs the checkout's backstop only when the
+  installed app declares that version, and otherwise the
+  `APP_SUPPORT/backstop.sh` installed with the app, when there is one.
+  With no installed copy it runs the checkout's backstop anyway, which
+  keeps those entries, so uninstall stops before removing anything.
 - `backstop.sh`, kept entries. Saved audio, saved display and keyboard
   brightness, and `displayRestoredUnderLowPower` are kept for the app, not
   restored by the shell. Legacy `frozenPids` are never signaled or cleared
@@ -96,7 +133,16 @@ Flag a change that breaks one of these; do not flag the behavior itself.
   Insomnia stopped are resumed, and only when the journaled identity still
   matches. Provisional entries written before the kernel confirmed the stop
   (identity nil) are never signaled and stay journaled for manual
-  inspection. An app launched while the lid is closed is left alone.
+  inspection. One exception: when the write that confirms a freeze fails,
+  `LidActions.freeze` undoes the stops it sent moments earlier through
+  `cancelStops`, checked against the identity it read before the SIGSTOP
+  and still holds in memory. That SIGCONT goes to a matching pid even if
+  it does not show as stopped yet, because a SIGSTOP can still be pending
+  and generating SIGCONT discards it. That rollback then removes the
+  provisional entries of the pids it resumed, that are gone, or that the
+  freeze never stopped, and keeps those it could not resume; until the disk
+  takes that write, the status menu leaves the removed ones out. An app
+  launched while the lid is closed is left alone.
   Electron apps are stopped as a whole process tree via the responsible pid.
 - `FloorRules.swift`, `LidActions.swift`. Low Power Mode is switched on at
   lid close whether or not the charger is connected, because with sleep

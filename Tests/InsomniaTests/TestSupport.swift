@@ -167,18 +167,29 @@ final class FakeSleepGuard: SleepGuarding, @unchecked Sendable {
 
 /// Signal layer double. Records what it was asked to signal; the identity
 /// checks themselves live in `SignalProcessControl` and are tested there.
-/// It honours the protocol contract that an entry without identity is never
-/// signaled, and can be told that SIGCONT fails for particular pids, that
-/// SIGSTOP is refused for some, or that some pids are stopped right now.
+/// It keeps a small model of the kernel: which pids are stopped and which
+/// have a SIGSTOP still pending. `suspend` stops each pid it does not
+/// refuse, or leaves the stop pending for pids in `delayedStops`. `resume`
+/// signals only a pid that is stopped right now, as the real one does, and
+/// reports any other pid as gone. `cancelStops` signals every entry with
+/// identity, stopped or not, and its SIGCONT discards a pending stop. An
+/// entry without identity is never signaled. It can also be told that
+/// SIGCONT fails for particular pids or that SIGSTOP is refused for some.
 final class FakeProcessControl: ProcessSignaling, @unchecked Sendable {
     private let lock = NSLock()
     private var _resumed: [[Int32]] = []
+    private var _cancelled: [[Int32]] = []
     private var _signaled: [Int32] = []
     private var _suspended: [[Int32]] = []
     private var _failResume: Set<Int32> = []
     private var _refuseSuspend: Set<Int32> = []
+    private var _delayedStops: Set<Int32> = []
+    private var _pendingStops: Set<Int32> = []
     private var _stoppedNow: Set<Int32> = []
+    /// Pids passed to each `resume` call.
     var resumed: [[Int32]] { lock.withLock { _resumed } }
+    /// Pids passed to each `cancelStops` call.
+    var cancelled: [[Int32]] { lock.withLock { _cancelled } }
     /// Pids actually reported resumed (SIGCONT delivered), across all calls.
     var signaled: [Int32] { lock.withLock { _signaled } }
     var suspended: [[Int32]] { lock.withLock { _suspended } }
@@ -192,8 +203,18 @@ final class FakeProcessControl: ProcessSignaling, @unchecked Sendable {
         get { lock.withLock { _refuseSuspend } }
         set { lock.withLock { _refuseSuspend = newValue } }
     }
-    /// Pids currently stopped in the fake kernel. An identity-less entry for
-    /// one of these is unverifiable; for any other pid it is gone.
+    /// Pids whose SIGSTOP the fake kernel accepts but has not delivered
+    /// when `suspend` returns: they still look running until
+    /// `deliverPendingStops`.
+    var delayedStops: Set<Int32> {
+        get { lock.withLock { _delayedStops } }
+        set { lock.withLock { _delayedStops = newValue } }
+    }
+    /// SIGSTOPs sent but not delivered yet.
+    var pendingStops: Set<Int32> { lock.withLock { _pendingStops } }
+    /// Pids currently stopped in the fake kernel. `suspend` adds to it and a
+    /// delivered SIGCONT removes from it; a test seeds it for pids stopped
+    /// before the test began (by an earlier run, or by somebody else).
     var stoppedNow: Set<Int32> {
         get { lock.withLock { _stoppedNow } }
         set { lock.withLock { _stoppedNow = newValue } }
@@ -201,32 +222,74 @@ final class FakeProcessControl: ProcessSignaling, @unchecked Sendable {
     /// Called synchronously inside `suspend`, so a test can inspect disk
     /// at the moment the side effect happens.
     var onSuspend: (@Sendable ([Int32]) -> Void)?
+    /// Called synchronously at the start of `cancelStops`.
+    var onCancelStops: (@Sendable ([Int32]) -> Void)?
+
+    /// The pending SIGSTOPs take effect.
+    func deliverPendingStops() {
+        lock.withLock {
+            _stoppedNow.formUnion(_pendingStops)
+            _pendingStops = []
+        }
+    }
 
     func resume(_ processes: [FrozenProcess]) -> ResumeReport {
-        lock.withLock { _resumed.append(processes.map(\.pid)) }
-        var report = ResumeReport()
-        for p in processes {
-            if p.identity == nil {
-                if stoppedNow.contains(p.pid) { report.unverifiable.append(p.pid) } else { report.gone.append(p.pid) }
-            } else if failResume.contains(p.pid) {
-                report.failed.append(p.pid)
-            } else {
-                report.resumed.append(p.pid)
+        lock.withLock {
+            _resumed.append(processes.map(\.pid))
+            var report = ResumeReport()
+            for p in processes {
+                if !_stoppedNow.contains(p.pid) {
+                    report.gone.append(p.pid) // running (perhaps with a stop still pending) or exited
+                } else if p.identity == nil {
+                    report.unverifiable.append(p.pid)
+                } else {
+                    sigcont(p.pid, into: &report)
+                }
             }
+            return report
         }
-        lock.withLock { _signaled.append(contentsOf: report.resumed) }
-        return report
+    }
+
+    func cancelStops(_ processes: [FrozenProcess]) -> ResumeReport {
+        onCancelStops?(processes.map(\.pid))
+        return lock.withLock {
+            _cancelled.append(processes.map(\.pid))
+            var report = ResumeReport()
+            for p in processes {
+                if p.identity == nil { report.unverifiable.append(p.pid) } else { sigcont(p.pid, into: &report) }
+            }
+            return report
+        }
+    }
+
+    /// Caller holds `lock`.
+    private func sigcont(_ pid: Int32, into report: inout ResumeReport) {
+        if _failResume.contains(pid) {
+            report.failed.append(pid)
+            return
+        }
+        _stoppedNow.remove(pid)
+        _pendingStops.remove(pid)
+        report.resumed.append(pid)
+        _signaled.append(pid)
     }
 
     func suspend(_ processes: [FrozenProcess], expectedParents: [Int32: Int32]) -> SuspendReport {
         let pids = processes.map(\.pid)
         lock.withLock { _suspended.append(pids) }
         onSuspend?(pids)
-        var report = SuspendReport()
-        for pid in pids {
-            if refuseSuspend.contains(pid) { report.skipped.append(pid) } else { report.suspended.append(pid) }
+        return lock.withLock {
+            var report = SuspendReport()
+            for pid in pids {
+                if _refuseSuspend.contains(pid) {
+                    report.skipped.append(pid)
+                } else {
+                    report.suspended.append(pid)
+                    if _delayedStops.contains(pid) { _pendingStops.insert(pid) } else { _stoppedNow.insert(pid) }
+                }
+            }
+            return report
         }
-        return report
     }
 }
 
@@ -459,6 +522,7 @@ final class FakeFreezer: Freezing, @unchecked Sendable {
         control.suspend(processes, expectedParents: expectedParents)
     }
     func resume(_ processes: [FrozenProcess]) -> ResumeReport { control.resume(processes) }
+    func cancelStops(_ processes: [FrozenProcess]) -> ResumeReport { control.cancelStops(processes) }
 }
 
 // MARK: Identity conveniences for fixtures
@@ -631,6 +695,79 @@ func settleQueuedRequests() async {
     for _ in 0..<5 { await Task.yield() }
 }
 
+/// A keychain whose `set`, or `delete`, blocks its thread until
+/// `release()`, the way a save or a clear waits while macOS shows a
+/// keychain dialog. `release()` is the only thing tests wait on; no test
+/// depends on how long the wait lasts. Two cases end it otherwise, and
+/// both set `gaveUp`, which every test checks: a call on the main thread
+/// does not wait at all, since the test that would release it runs there
+/// (a call that belongs on `KeychainQueue` made on the main actor), and
+/// the `watchdog` ends a wait no test released, so a broken test fails
+/// instead of hanging the suite. The watchdog is far longer than any of
+/// these tests takes. Reads, and the call that does not block, answer at
+/// once from memory.
+final class BlockingKeychain: KeychainStoring, @unchecked Sendable {
+    enum Call { case set, delete }
+
+    /// Fulfilled once the blocking call is inside its wait.
+    let entered = XCTestExpectation(description: "the keychain call is waiting")
+    private let blocks: Call
+    private let gate = DispatchSemaphore(value: 0)
+    private let watchdog: DispatchTimeInterval
+    private let lock = NSLock()
+    private var items: [String: String] = [:]
+    private var waiting = false
+    private var _gaveUp = false
+    private var _calledOnMainThread = false
+
+    init(blocking blocks: Call = .set, watchdog: DispatchTimeInterval = .seconds(120), items: [String: String] = [:]) {
+        self.blocks = blocks
+        self.watchdog = watchdog
+        self.items = items
+        entered.assertForOverFulfill = false
+    }
+
+    /// Whether the blocking call is inside its wait right now.
+    var isWaiting: Bool { lock.withLock { waiting } }
+    var gaveUp: Bool { lock.withLock { _gaveUp } }
+    /// Whether the blocking call came on the main thread, and so did not wait.
+    var calledOnMainThread: Bool { lock.withLock { _calledOnMainThread } }
+
+    func release() { gate.signal() }
+
+    func get(service: String, account: String) throws -> String? {
+        lock.withLock { items["\(service)/\(account)"] }
+    }
+
+    func set(service: String, account: String, value: String) throws {
+        if blocks == .set { wait() }
+        lock.withLock { items["\(service)/\(account)"] = value }
+    }
+
+    func delete(service: String, account: String) throws {
+        if blocks == .delete { wait() }
+        _ = lock.withLock { items.removeValue(forKey: "\(service)/\(account)") }
+    }
+
+    private func wait() {
+        guard !Thread.isMainThread else {
+            lock.withLock {
+                _calledOnMainThread = true
+                _gaveUp = true
+            }
+            entered.fulfill()
+            return
+        }
+        lock.withLock { waiting = true }
+        entered.fulfill()
+        let answered = gate.wait(timeout: .now() + watchdog) == .success
+        lock.withLock {
+            waiting = false
+            if !answered { _gaveUp = true }
+        }
+    }
+}
+
 /// A FIFO at `url`, and a watchdog for it. Correct code never opens it. If
 /// something does, open(2) blocks until a writer appears; the watchdog opens
 /// the FIFO for writing once a second, which lets a blocked reader through
@@ -675,4 +812,33 @@ final class FIFOWatch: @unchecked Sendable {
 
     private var isStopped: Bool { lock.lock(); defer { lock.unlock() }; return stopped }
     private func markSeen() { lock.lock(); seen = true; lock.unlock() }
+}
+
+/// Access control lists for the tests that check Insomnia leaves them alone.
+enum TestACL {
+    /// Gives `url` one entry letting its owner, the user running the tests,
+    /// read it. On a 0200 file that entry is the only way to read it.
+    static func grantOwnerRead(_ url: URL) throws {
+        let chmod = Process()
+        chmod.executableURL = URL(fileURLWithPath: "/bin/chmod")
+        chmod.arguments = ["+a", "user:\(String(cString: getpwuid(getuid()).pointee.pw_name)) allow read", url.path]
+        let exit = ProcessExit(chmod)
+        try chmod.run()
+        exit.wait()
+        guard chmod.terminationStatus == 0 else { throw POSIXError(.EPERM) }
+    }
+
+    /// How many ACL entries `url` has, without following a symlink.
+    static func entries(_ url: URL) -> Int {
+        guard let acl = acl_get_link_np(url.path, ACL_TYPE_EXTENDED) else { return 0 }
+        defer { acl_free(UnsafeMutableRawPointer(acl)) }
+        var count = 0
+        var entry: acl_entry_t?
+        var which = ACL_FIRST_ENTRY.rawValue
+        while acl_get_entry(acl, which, &entry) == 0 {
+            count += 1
+            which = ACL_NEXT_ENTRY.rawValue
+        }
+        return count
+    }
 }

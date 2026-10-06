@@ -83,6 +83,112 @@ final class ProcessIdentityTests: XCTestCase {
         XCTAssertEqual(report.failed, [])
     }
 
+    // MARK: Undo a stop just sent
+
+    /// A kernel that accepts SIGSTOP without stopping the target until
+    /// `deliver()`, and where SIGCONT discards a pending stop, as POSIX
+    /// requires. 300 is running, ours, with parent 1.
+    private final class DelayedStopKernel: @unchecked Sendable {
+        let sent = Sent([])
+        let state = Locked<[Int32: ProcessSignalState]>([
+            300: ProcessSignalState(ppid: 1, stopped: false, startedAt: 1000),
+        ])
+        let pending = Locked<Set<Int32>>([])
+
+        var control: SignalProcessControl {
+            SignalProcessControl(stateLookup: { [state] in state.value[$0].map(ProcessLookup.present) ?? .absent }, send: { [self] pid, sig in
+                sent.value.append((pid, sig))
+                if sig == SIGSTOP { pending.value.insert(pid) }
+                if sig == SIGCONT {
+                    pending.value.remove(pid)
+                    setStopped(pid, false)
+                }
+                return 0
+            })
+        }
+
+        func deliver() {
+            for pid in pending.value { setStopped(pid, true) }
+            pending.value = []
+        }
+
+        func stopped(_ pid: Int32) -> Bool { state.value[pid]?.stopped ?? false }
+
+        private func setStopped(_ pid: Int32, _ stopped: Bool) {
+            guard let s = state.value[pid] else { return }
+            state.value[pid] = ProcessSignalState(ppid: s.ppid, stopped: stopped, identity: s.identity)
+        }
+    }
+
+    /// The freeze rollback runs right after its own SIGSTOP, which may not
+    /// have taken effect yet. `resume` sees a running process and leaves
+    /// it, so it stops a moment later. `cancelStops` sends SIGCONT, which
+    /// discards the pending stop.
+    func testCancelStopsUndoesAStopThatHasNotTakenEffectYet() {
+        let entry = FrozenProcess(pid: 300, startedAt: 1000)
+
+        let viaResume = DelayedStopKernel()
+        XCTAssertEqual(viaResume.control.suspend([entry], expectedParents: [300: 1]).suspended, [300])
+        XCTAssertFalse(viaResume.stopped(300), "the fixture must look running while the stop is pending")
+        XCTAssertEqual(viaResume.control.resume([entry]).gone, [300])
+        viaResume.deliver()
+        XCTAssertTrue(viaResume.stopped(300), "the fixture must show what resume leaves behind")
+
+        let viaCancel = DelayedStopKernel()
+        XCTAssertEqual(viaCancel.control.suspend([entry], expectedParents: [300: 1]).suspended, [300])
+        let report = viaCancel.control.cancelStops([entry])
+        XCTAssertEqual(report.resumed, [300])
+        XCTAssertEqual(viaCancel.sent.value.map { "\($0.pid):\($0.sig)" }, ["300:\(SIGSTOP)", "300:\(SIGCONT)"])
+        viaCancel.deliver()
+        XCTAssertFalse(viaCancel.stopped(300), "the pending stop took effect after the rollback")
+    }
+
+    /// `cancelStops` skips only the stopped-state check. Before each SIGCONT
+    /// it still requires the same start time to the microsecond and the
+    /// same boot session, and never signals an entry without identity.
+    func testCancelStopsSignalsOnlyAnExactIdentityMatch() {
+        let sent = Sent([])
+        // 400: running, ours. 401: stopped, ours. 402: running, started
+        // later (pid reused). 403: gone. 404: same second and boot,
+        // different microseconds. 405: same start in another boot session.
+        // 406: unreadable. 407: the kernel side has no boot session.
+        let kernel: [Int32: ProcessSignalState] = [
+            400: ProcessSignalState(ppid: 1, stopped: false, startedAt: 1000),
+            401: ProcessSignalState(ppid: 1, stopped: true, startedAt: 1000),
+            402: ProcessSignalState(ppid: 1, stopped: false, startedAt: 2000),
+            404: ProcessSignalState(ppid: 1, stopped: false, identity: ProcessIdentity(startedAt: 1000, startedAtMicros: 7, bootSession: "boot")),
+            405: ProcessSignalState(ppid: 1, stopped: false, identity: ProcessIdentity(startedAt: 1000, startedAtMicros: 0, bootSession: "other-boot")),
+            407: ProcessSignalState(ppid: 1, stopped: false, identity: ProcessIdentity(startedAt: 1000, startedAtMicros: 0, bootSession: "")),
+        ]
+        let c = SignalProcessControl(stateLookup: { pid in
+            pid == 406 ? .unreadable(EPERM) : kernel[pid].map(ProcessLookup.present) ?? .absent
+        }, send: { pid, sig in
+            sent.value.append((pid, sig))
+            return 0
+        })
+        let report = c.cancelStops([400, 401, 402, 403, 404, 405, 406, 407].map { FrozenProcess(pid: $0, startedAt: 1000) } + [
+            FrozenProcess(pid: 400, startedAt: nil),
+            FrozenProcess(pid: 400, identity: ProcessIdentity(startedAt: 1000, startedAtMicros: 0, bootSession: "")),
+        ])
+        XCTAssertEqual(sent.value.map { "\($0.pid):\($0.sig)" }, ["400:\(SIGCONT)", "401:\(SIGCONT)"])
+        XCTAssertEqual(report.resumed, [400, 401])
+        XCTAssertEqual(report.gone, [402, 403, 404, 405])
+        XCTAssertEqual(report.unobserved, [406, 407])
+        XCTAssertEqual(report.unverifiable, [400, 400])
+        XCTAssertEqual(report.failed, [])
+    }
+
+    func testCancelStopsReportsAFailedOrRacingSignal() {
+        let entry = FrozenProcess(pid: 400, startedAt: 1000)
+        let kernel: [Int32: ProcessSignalState] = [400: ProcessSignalState(ppid: 1, stopped: false, startedAt: 1000)]
+        let failed = control(kernel, sent: Sent([]), result: EPERM).cancelStops([entry])
+        XCTAssertEqual(failed.failed, [400])
+        XCTAssertEqual(failed.resumed, [])
+        let exited = control(kernel, sent: Sent([]), result: ESRCH).cancelStops([entry])
+        XCTAssertEqual(exited.gone, [400])
+        XCTAssertEqual(exited.failed, [])
+    }
+
     // MARK: Suspend
 
     // 200: running, ours. 201: already stopped by someone else. 202: pid
@@ -212,6 +318,74 @@ final class ProcessIdentityTests: XCTestCase {
         XCTAssertEqual(sent.value.map(\.pid), [100], "pid 101 was signaled from a stale batch snapshot")
         XCTAssertEqual(report.resumed, [100])
         XCTAssertEqual(report.gone, [101])
+    }
+
+    /// Pins the order the ownership rule depends on: for each pid, one
+    /// lookup immediately followed by its signal, before the next pid is
+    /// looked up. A pid that gets no signal costs exactly one lookup.
+    /// Never all lookups first and the signals after.
+    func testEveryResumeSignalIsImmediatelyPrecededByItsOwnLookup() {
+        let events = Locked<[String]>([])
+        let kernel: [Int32: ProcessSignalState] = [
+            100: ProcessSignalState(ppid: 1, stopped: true, startedAt: 1000),
+            101: ProcessSignalState(ppid: 1, stopped: true, startedAt: 1001),
+            102: ProcessSignalState(ppid: 1, stopped: false, startedAt: 1002),
+        ]
+        let c = SignalProcessControl(
+            stateLookup: { pid in
+                events.value.append("lookup \(pid)")
+                return kernel[pid].map(ProcessLookup.present) ?? .absent
+            },
+            send: { pid, sig in
+                events.value.append("send \(pid) \(sig == SIGCONT ? "CONT" : "other")")
+                return 0
+            }
+        )
+        let report = c.resume([
+            FrozenProcess(pid: 100, startedAt: 1000),
+            FrozenProcess(pid: 103, startedAt: 1003),
+            FrozenProcess(pid: 101, startedAt: 1001),
+            FrozenProcess(pid: 102, startedAt: 1002),
+        ])
+        XCTAssertEqual(events.value, [
+            "lookup 100", "send 100 CONT",
+            "lookup 103",
+            "lookup 101", "send 101 CONT",
+            "lookup 102",
+        ])
+        XCTAssertEqual(report.resumed, [100, 101])
+        XCTAssertEqual(report.gone, [103, 102])
+    }
+
+    func testEverySuspendSignalIsImmediatelyPrecededByItsOwnLookup() {
+        let events = Locked<[String]>([])
+        let kernel: [Int32: ProcessSignalState] = [
+            100: ProcessSignalState(ppid: 1, stopped: false, startedAt: 1000),
+            101: ProcessSignalState(ppid: 100, stopped: false, startedAt: 1001),
+            102: ProcessSignalState(ppid: 100, stopped: true, startedAt: 1002),
+        ]
+        let c = SignalProcessControl(
+            stateLookup: { pid in
+                events.value.append("lookup \(pid)")
+                return kernel[pid].map(ProcessLookup.present) ?? .absent
+            },
+            send: { pid, sig in
+                events.value.append("send \(pid) \(sig == SIGSTOP ? "STOP" : "other")")
+                return 0
+            }
+        )
+        let report = c.suspend([
+            FrozenProcess(pid: 100, startedAt: 1000),
+            FrozenProcess(pid: 102, startedAt: 1002),
+            FrozenProcess(pid: 101, startedAt: 1001),
+        ], expectedParents: [100: 1, 101: 100, 102: 100])
+        XCTAssertEqual(events.value, [
+            "lookup 100", "send 100 STOP",
+            "lookup 102",
+            "lookup 101", "send 101 STOP",
+        ])
+        XCTAssertEqual(report.suspended, [100, 101])
+        XCTAssertEqual(report.skipped, [102])
     }
 
     // MARK: Planner

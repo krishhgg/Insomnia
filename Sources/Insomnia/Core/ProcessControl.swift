@@ -21,10 +21,21 @@ protocol ProcessSignaling: Sendable {
     /// SIGCONT each journaled process that is still stopped and still the
     /// same process. The report says what needs to stay journaled.
     func resume(_ processes: [FrozenProcess]) -> ResumeReport
+    /// Undo SIGSTOPs this run sent moments ago: SIGCONT each process that is
+    /// still the same process (identity to the microsecond, boot session),
+    /// whether or not it shows as stopped yet. A stop signal can still be
+    /// pending when the target is looked up, so it may look running; POSIX
+    /// discards a pending stop when SIGCONT is generated, so the SIGCONT
+    /// cancels it either way. Never signals an entry without identity, a
+    /// different process, or a pid that is gone. Only for stops this
+    /// process just sent; a journaled entry from an earlier run goes
+    /// through `resume`, which signals only a stopped process.
+    func cancelStops(_ processes: [FrozenProcess]) -> ResumeReport
 }
 
 struct SuspendReport: Sendable, Equatable {
-    /// SIGSTOP delivered; these are ours to resume.
+    /// SIGSTOP sent; these are ours to resume. The stop may still be
+    /// pending when this returns, so the target can still look running.
     var suspended: [Int32] = []
     /// Already stopped, exited, reparented, reused, or the signal failed:
     /// not ours, must not stay journaled.
@@ -105,10 +116,20 @@ struct SignalProcessControl: ProcessSignaling {
     }
 
     func resume(_ processes: [FrozenProcess]) -> ResumeReport {
+        continueEach(processes) { Self.resumeDecision($0, stateLookup: stateLookup) }
+    }
+
+    func cancelStops(_ processes: [FrozenProcess]) -> ResumeReport {
+        continueEach(processes) { Self.cancelDecision($0, stateLookup: stateLookup) }
+    }
+
+    /// SIGCONT per process as `decide` says, each signal right after that
+    /// process's own lookup.
+    private func continueEach(_ processes: [FrozenProcess], decide: (FrozenProcess) -> ResumeDecision) -> ResumeReport {
         var report = ResumeReport()
         for p in processes {
             // Lookup and signal back to back, per process.
-            switch Self.resumeDecision(p, stateLookup: stateLookup) {
+            switch decide(p) {
             case .gone:
                 report.gone.append(p.pid)
             case .unverifiable:
@@ -183,6 +204,23 @@ struct SignalProcessControl: ProcessSignaling {
         return state.identity == identity ? .signal : .gone // reused pid
     }
 
+    /// `resumeDecision` for a stop this process just sent (`cancelStops`):
+    /// the same identity check, but a matching process that does not show
+    /// as stopped is signaled too, because its SIGSTOP may still be pending.
+    /// An entry without identity is never signaled.
+    static func cancelDecision(_ p: FrozenProcess, stateLookup: StateLookup) -> ResumeDecision {
+        guard p.pid > 0 else { return .gone }
+        guard let identity = p.identity, !identity.bootSession.isEmpty else { return .unverifiable }
+        let state: ProcessSignalState
+        switch stateLookup(p.pid) {
+        case .absent: return .gone
+        case .unreadable: return .unobserved
+        case let .present(s): state = s
+        }
+        guard !state.identity.bootSession.isEmpty else { return .unobserved }
+        return state.identity == identity ? .signal : .gone // exited and reused
+    }
+
     /// Batch form of `resumeDecision`, for tests.
     static func resumePlan(
         _ processes: [FrozenProcess],
@@ -216,7 +254,7 @@ struct SignalProcessControl: ProcessSignaling {
         return String(decoding: bytes, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
     }()
 
-    private static func kernelState(pid: Int32) -> ProcessLookup {
+    static func kernelState(pid: Int32) -> ProcessLookup {
         guard pid > 0 else { return .absent }
         var info = proc_bsdinfo()
         let size = Int32(MemoryLayout<proc_bsdinfo>.size)
