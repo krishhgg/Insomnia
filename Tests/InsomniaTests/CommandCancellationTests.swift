@@ -79,10 +79,11 @@ final class CommandCancellationTests: XCTestCase {
 
     func testTimeoutKillsChildAndThrows() async throws {
         let (exe, pidFile) = try sleeper()
-        // One second leaves room for a slow spawn under parallel test load;
-        // the script still records its pid long before the limit.
+        // The second counts from the pid file, not the spawn: a slow spawn
+        // under parallel test load cannot reach the deadline unrecorded.
+        let (runner, _) = runnerStartingAtReadiness(pidFile)
         do {
-            _ = try await CancellableCommand().run(exe, [], timeout: 1)
+            _ = try await runner.run(exe, [], timeout: 1)
             XCTFail("command outlived its timeout")
         } catch is ShellTimeoutError {}
         XCTAssertTrue(FileManager.default.fileExists(atPath: pidFile), "child never recorded its pid before the timeout")
@@ -138,10 +139,12 @@ final class CommandCancellationTests: XCTestCase {
     }
 
     /// A runner whose deadline starts counting only once the child has
-    /// written `pidFile`, which `termIgnorer` does after `trap '' TERM`: the
-    /// SIGTERM always finds the trap in place, however slow the spawn.
-    /// Bounded, so a child that never starts fails the caller's assertions
-    /// instead of hanging. `ready` is when the deadline started.
+    /// written `pidFile`, however slow the spawn. `termIgnorer` writes it
+    /// after `trap '' TERM`, so the SIGTERM always finds the trap in place,
+    /// and `sleeper` writes it before it becomes `sleep`, so a timeout never
+    /// stops it before its pid is recorded. Bounded, so a child that never
+    /// starts fails the caller's assertions instead of hanging. `ready` is
+    /// when the deadline started.
     private func runnerStartingAtReadiness(_ pidFile: String) -> (runner: CancellableCommand, ready: Locked<Date?>) {
         let ready = Locked<Date?>(nil)
         let runner = CancellableCommand(beforeDeadline: {
@@ -199,8 +202,9 @@ final class CommandCancellationTests: XCTestCase {
     /// before; nothing is reported as running.
     func testTerminateOnlyStillReportsATimeoutWhenTheChildStopsOnTerm() async throws {
         let (exe, pidFile) = try sleeper()
+        let (runner, _) = runnerStartingAtReadiness(pidFile)
         do {
-            _ = try await CancellableCommand().run(exe, [], timeout: 1, stop: .terminateOnly(grace: 3))
+            _ = try await runner.run(exe, [], timeout: 1, stop: .terminateOnly(grace: 3))
             XCTFail("command outlived its timeout")
         } catch is ShellTimeoutError {}
         try await assertGone(try recordedPid(pidFile))
