@@ -72,15 +72,19 @@ struct Paths: Sendable, Equatable {
     /// lid-close action path without touching the hinge. See LidSimulation.
     var simulateLidFile: URL { appSupport.appendingPathComponent("simulate-lid") }
 
+    /// Both logs are owner-only and rotate to `<name>.1` past
+    /// `OwnerOnly.maxLogBytes`; uninstall.sh --purge removes the `.1` too.
     var logFile: URL { logs.appendingPathComponent("insomnia.log") }
     var handoffsLog: URL { logs.appendingPathComponent("handoffs.log") }
 
     var backstopPlist: URL { launchAgents.appendingPathComponent("\(Paths.backstopLabel).plist") }
 
-    /// Create every directory Insomnia writes into.
+    /// Create every directory Insomnia writes into. Its own two are made
+    /// 0700 (an existing one is tightened); the LaunchAgents directory is
+    /// shared with every other login agent, so it is only created.
     func createDirectories() throws {
-        for dir in [appSupport, logs, launchAgents] {
-            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        }
+        if let problem = try OwnerOnly.createDirectory(appSupport) { OwnerOnly.reportOnce(problem) }
+        if let problem = try OwnerOnly.createDirectory(logs) { OwnerOnly.reportOnce(problem) }
+        try FileManager.default.createDirectory(at: launchAgents, withIntermediateDirectories: true)
     }
 }

@@ -166,6 +166,12 @@ final class SessionManager {
     /// Whether the 1 Hz redraw is currently on the run loop. Tests assert on
     /// this to prove an idle session leaves no repeating wakeup behind.
     var countdownTimerArmed: Bool { countdownTimer != nil }
+    /// Set by a lid close, cleared by a lid open. A session that becomes
+    /// active (start, or reconcile at launch) takes it from the lid as it
+    /// reads then: the lid observer reports changes only, so a session that
+    /// starts under a closed lid gets no close call to pause it, and one
+    /// that starts after an end with the lid shut must not inherit that
+    /// session's pause. Every end clears it.
     @ObservationIgnored private var countdownPaused = false
 
     /// Counts end requests. Start, extend and Low Power changes capture it
@@ -474,6 +480,7 @@ final class SessionManager {
 
         session = new
         lastError = nil
+        countdownPaused = clamshell() == true
         foreignSleepWarning = nil
         Log.info("session started until \(iso(new.endsAt)) (\(Int(duration))s requested)")
         await armDeadline(new.endsAt)
@@ -561,6 +568,7 @@ final class SessionManager {
         let had = session != nil
         Log.info("session end (\(reason.rawValue))")
         stopTimers()
+        countdownPaused = false
         session = nil
         scheduledDeadline = nil
         remainingText = ""
@@ -1172,6 +1180,7 @@ final class SessionManager {
             } else if state.hasLidActions {
                 Log.info("reconcile: lid \(lidClosed == nil ? "unknown" : "closed"), keeping lid-close actions")
             }
+            countdownPaused = lidClosed == true
             await armDeadline(s.endsAt)
             applyAppNapInJournal()
             services?.start(for: self)

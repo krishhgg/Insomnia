@@ -26,7 +26,7 @@ final class ConfigTests: XCTestCase {
         XCTAssertTrue(c.agentList.contains("com.microsoft.VSCode"))
         XCTAssertTrue(c.agentList.contains("com.todesktop.230313mzl4w4u92"))
         XCTAssertTrue(c.agentList.contains("io.tailscale.ipn.macsys"))
-        XCTAssertTrue(c.dockerRule)
+        XCTAssertFalse(c.dockerRule, "the Docker rule is opt in")
         XCTAssertTrue(c.muteOnLidClose, "mute on lid close is on by default")
         XCTAssertTrue(c.lidCloseDefaultsApplied, "a config this build creates never needs the lid-close update")
         XCTAssertNil(c.lidCloseDefaultsNotice)
@@ -167,6 +167,23 @@ final class ConfigTests: XCTestCase {
         let old = try Store.makeDecoder().decode(Config.self, from: Data(#"{"muteOnLidClose": true}"#.utf8))
         XCTAssertTrue(old.lowPowerOnLidClose)
         XCTAssertTrue(old.muteOnLidClose)
+    }
+
+    /// A config.json without the key (older build, or written by hand)
+    /// gets the default, off: an upgrade never opts anyone in. An explicit
+    /// true is honoured and round-trips.
+    func testDockerRuleDecodesTolerantly() throws {
+        let legacy = try Store.makeDecoder().decode(Config.self, from: Data(#"{"muteOnLidClose": true}"#.utf8))
+        XCTAssertFalse(legacy.dockerRule, "a missing key must not opt the user in")
+        let on = try Store.makeDecoder().decode(Config.self, from: Data(#"{"dockerRule": true}"#.utf8))
+        XCTAssertTrue(on.dockerRule)
+        var expected = earlierBuild()
+        expected.dockerRule = true
+        XCTAssertEqual(on, expected)
+        let data = try Store.makeEncoder().encode(on)
+        XCTAssertEqual(try Store.makeDecoder().decode(Config.self, from: data), on)
+        let off = try Store.makeDecoder().decode(Config.self, from: Data(#"{"dockerRule": false}"#.utf8))
+        XCTAssertFalse(off.dockerRule)
     }
 
     /// An empty object is what an earlier build saved minus every key. It
