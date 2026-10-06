@@ -150,8 +150,22 @@ struct SettingsView: View {
         newPreset = ""
     }
 
+    /// Under the mute toggle and in the README. Apple Platform Security,
+    /// "Hardware microphone disconnect".
+    static let microphoneNote = "On Mac laptops with Apple silicon or a T2 chip, closing the lid disconnects the built-in microphone in hardware. Recording a meeting with the lid closed needs AirPods or an external mic."
+
     private var lidSection: some View {
         Section {
+            // The one-time lid-close update, for a user who has
+            // notifications turned off. Stays until dismissed.
+            if let notice = manager.config.lidCloseDefaultsNotice {
+                HStack(alignment: .firstTextBaseline) {
+                    Text(notice.settingsLine)
+                        .font(.callout)
+                    Spacer()
+                    Button("Dismiss") { update { $0.lidCloseDefaultsNotice = nil } }
+                }
+            }
             Toggle("Turn off the display and keyboard backlight", isOn: bind(\.darkenDisplayOnLidClose))
             bundleList(
                 title: "Freeze while the lid is closed",
@@ -166,13 +180,16 @@ struct SettingsView: View {
                 .foregroundStyle(.secondary)
             Toggle("Pause Docker Desktop when no containers are running", isOn: bind(\.dockerRule))
             Toggle("Mute audio on lid close", isOn: bind(\.muteOnLidClose))
+            Text(Self.microphoneNote)
+                .font(.callout)
+                .foregroundStyle(.secondary)
             Toggle("Low Power Mode while the lid is closed", isOn: bind(\.lowPowerOnLidClose))
                 // A floor input: apply it now if the lid is already closed.
                 .onChange(of: manager.config.lowPowerOnLidClose) { manager.services?.reevaluateFloors() }
         } header: {
             Text("Lid-close actions")
         } footer: {
-            Text("Apps on the list above are stopped with SIGSTOP while the lid is closed and resumed when it opens. With \"Freeze every other app\" on (off by default), every other Dock app is stopped too, except agent apps, Apple apps, Docker Desktop and built-in protected apps (editors, terminals, browsers, AI apps, password managers, local databases, Tailscale, local model servers). Agent apps are never frozen. The display brightness and keyboard backlight are saved, set to zero and restored when the lid opens. If Insomnia is not running when you open the lid, press the brightness-up key.")
+            Text("Apps on the list above are stopped with SIGSTOP while the lid is closed and resumed when it opens. With \"Freeze every other app\" on (off by default), every other Dock app is stopped too, except agent apps, Apple apps, Docker Desktop and built-in protected apps (editors, terminals, browsers, AI apps, password managers, local databases, Tailscale, local model servers, and meeting, recording and dictation apps such as Zoom, Teams, Webex, Wispr Flow, Granola, Otter, OBS and Loom). Agent apps are never frozen. The display brightness and keyboard backlight are saved, set to zero and restored when the lid opens. If Insomnia is not running when you open the lid, press the brightness-up key.")
         }
     }
 
@@ -192,7 +209,7 @@ struct SettingsView: View {
         } header: {
             Text("Agent apps")
         } footer: {
-            Text("Agent apps are never frozen or throttled. Editors, AI apps, terminals, browsers, password managers, local databases, Tailscale and local model servers are also protected from the automatic lid-close scope even when they are not listed here; adding one to the freeze list above overrides that.")
+            Text("Agent apps are never frozen or throttled. Editors, AI apps, terminals, browsers, password managers, local databases, Tailscale, local model servers, and meeting, recording and dictation apps are also protected from the automatic lid-close scope even when they are not listed here; adding one to the freeze list above overrides that.")
         }
     }
 

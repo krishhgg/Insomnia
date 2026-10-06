@@ -113,7 +113,7 @@ Quit, or reconcile.
 | Keyboard backlight (optional, same toggle) | save brightness, set it to 0 | restore the saved brightness |
 | Freeze scope | `SIGSTOP` every process whose responsible app is in the freeze scope (rules below) | `SIGCONT` the recorded pids only |
 | Docker rule | if Docker Desktop is running and `docker ps -q` is empty, freeze it | resume |
-| Mute (optional) | save volume and mute state, then mute | restore both exactly |
+| Mute (optional, default on) | save volume and mute state, then mute | restore both exactly |
 | Low Power Mode | on (optional, default on) | off unless a battery or thermal floor still wants it |
 | Countdown redraw | stop timer | restart timer |
 
@@ -139,9 +139,16 @@ Freeze scope rules:
   kitty, WezTerm, Tabby, Hyper), browsers (Arc, Chrome, Chromium, Edge, Brave,
   Vivaldi, Opera, Firefox with its Developer and Nightly editions, Zen),
   Tailscale, LM Studio, Ollama, Docker Desktop's Electron front end,
-  1Password, Bitwarden, Postgres.app and OrbStack. Every id is verified
-  against an installed copy or the Homebrew cask metadata named in the
-  comment next to it. The automatic scope leaves them alone even when they
+  1Password, Bitwarden, Postgres.app and OrbStack, and meeting, recording
+  and dictation apps (`meetingApps`): Zoom, Microsoft Teams (new and
+  classic), Webex, the older Webex Meetings app with its meeting window and
+  plugin agent, Wispr Flow, Granola, Otter, OBS and Loom. Their helper apps
+  are matched by prefix: each of those ids followed by a dot, plus `us.zoom.`
+  and `com.cisco.webex.` (`meetingAppPrefixes`). Helpers an app starts are
+  its child processes and are left out with it. FaceTime is
+  `com.apple.FaceTime`, already on the hard denylist. Every id is verified
+  against an installed copy, the Homebrew cask metadata or the page named in
+  the comment next to it. The automatic scope leaves them alone even when they
   are not on the agent list. Code level and not persisted: an existing
   config.json already carries its own agent list, so new agent-list defaults
   never reach it. An explicit freeze-list entry overrides this set; the hard
@@ -603,7 +610,8 @@ Backstop, independent of the app:
 minutes before end, battery floor reached, battery unreadable twice in a row,
 thermal action taken, network gap recovered (with nudge summary), sleep
 restored by backstop, sleep disabled by something other than Insomnia
-(reconcile step 3, once per launch).
+(reconcile step 3, once per launch), lid-close settings changed by the
+one-time update (section 10, once).
 
 ### 10. Settings
 
@@ -612,7 +620,23 @@ small settings window:
 
 - presets, default preset
 - freeze list (bundle ids), freeze every other app on/off (default off),
-  Docker rule on/off, mute on lid close on/off
+  Docker rule on/off, mute on lid close on/off (default on). Under the mute
+  toggle: on Mac laptops with Apple silicon or a T2 chip, closing the lid
+  disconnects the built-in microphone in hardware, so recording with the lid
+  closed needs AirPods or an external mic.
+- one-time lid-close update. A config.json without `lidCloseDefaultsApplied`
+  was saved by an earlier build. At launch it gets `freezeAllApps` off and
+  `muteOnLidClose` on, the mark set, and is written back. When either value
+  changed, the launch reconcile posts one "Lid-close settings changed"
+  notification naming each change and where to change it back (Settings,
+  Lid-close actions). It posts before taking the recovery lock, so a busy
+  lock or an unreadable journal does not hold it back, and after the app
+  installs its notification delegate. The app keeps the change in `lidCloseDefaultsNotice` so Settings
+  shows the same line at the top of Lid-close actions until dismissed. The
+  mark stays set, so a setting the user turns back is never changed again. A
+  missing `muteOnLidClose` in a config without the mark reads as off, as the
+  earlier builds read it. A fresh install writes a config.json with the mark
+  and the new defaults and shows no notice.
 - agent list (bundle ids), turn App Nap off for them on/off (default off)
 - `lowPowerFloor`, `endFloor`, thermal rules on/off
 - hotspot SSID (password entered once, stored in Keychain), `nudgeThreshold`
@@ -904,6 +928,17 @@ that any case passed; record results in the release validation record.
     0 → put back to 0. Force-quit during a session → `backstop.sh` alone puts
     it back. Set the key to 1 by hand, empty `appNapOverrides`, run
     `uninstall.sh` → it prints the `defaults delete` command and continues.
+15. **Meeting apps.** Freeze-all on, a Zoom or Teams call running on AirPods
+    and Wispr Flow or Granola taking notes. Close the lid → none of their
+    processes shows `T` in `ps -o stat`, the call and the notes continue,
+    other Dock apps are frozen, sound is muted.
+16. **Upgrade notice.** Install over a build whose config.json has
+    `freezeAllApps: true` and `muteOnLidClose: false`. First launch → one
+    "Lid-close settings changed" notification, the same line at the top of
+    Lid-close actions in Settings, both toggles changed, config.json has
+    `lidCloseDefaultsApplied: true`. Turn freeze-all back on, relaunch → no
+    notice, still on. Dismiss removes the Settings line. A fresh install
+    shows no notice.
 
 ## Open decisions (defaults chosen, change if you disagree)
 

@@ -111,13 +111,13 @@ and check the status menu and `~/Library/Logs/Insomnia/insomnia.log` afterward.
 ## What happens when the lid closes
 
 <p align="center">
-  <img src="docs/assets/lid-actions.svg" alt="Illustrated Settings defaults: Slack, WhatsApp, and Discord on the freeze list, Docker's idle rule on, mute off. During a session, lid close applies configured actions; reopening attempts to resume verified owned freezes and restore saved audio. The session continues. Without an active session, lid changes do nothing." width="880">
+  <img src="docs/assets/lid-actions.svg" alt="Illustrated Settings defaults: Slack, WhatsApp, and Discord on the freeze list, Docker's idle rule on, mute on. During a session, lid close applies configured actions; reopening attempts to resume verified owned freezes and restore saved audio. The session continues. Without an active session, lid changes do nothing." width="880">
 </p>
 
 During a session, Insomnia turns the display and keyboard backlight off
 (saving their brightness first), pauses the apps on the freeze list (and, if
 you opt in, every other Dock app that is not an agent app), checks whether
-Docker Desktop is idle before pausing it, and can save then mute audio.
+Docker Desktop is idle before pausing it, and saves then mutes audio.
 Reopening the lid attempts to undo those lid actions. **The timer keeps
 counting down while the lid is closed**; only its on-screen redraw pauses.
 
@@ -144,10 +144,20 @@ The defaults are worth knowing:
   apps are never picked up automatically; add them to the freeze list if you
   want them paused. Settings shows a "Would freeze now" line listing what the
   automatic scope would pause at that moment.
+- **Meeting, recording and dictation apps:** never frozen by "Freeze every
+  other app", with their helper apps: Zoom, Microsoft Teams (new and classic),
+  Webex (and the older Webex Meetings app), FaceTime, Wispr Flow, Granola,
+  Otter, OBS and Loom. Freezing one ends the call, the recording or the
+  meeting notes when the lid closes. Putting one on the freeze list by hand
+  still freezes it, except FaceTime, which is an Apple app.
 - **Docker rule:** enabled, with a separate local Docker Desktop idle check.
   Container startup can race that check; disable the rule for important Docker
   workloads where an unexpected pause would be disruptive.
-- **Mute on close:** off.
+- **Mute on close:** on, so sound stops when the lid closes.
+- **Microphone:** on Mac laptops with Apple silicon or a T2 chip, closing the
+  lid disconnects the built-in microphone in hardware. Recording a meeting
+  with the lid closed needs AirPods or an external mic; Settings says the same
+  next to the lid-close options.
 - **Display and keyboard backlight:** on ("Turn off the display and keyboard
   backlight" in Settings). Both values are saved to the journal before they
   are changed.
@@ -167,6 +177,16 @@ The defaults are worth knowing:
   other floor when the two would cross, and a hand-edited `config.json` with
   the floors out of order is corrected at launch, and logged, by raising the
   Low Power Mode floor.
+
+Upgrading from an earlier build changes two of these once. On the first
+launch of this version, a config.json saved by an earlier build gets "Freeze
+every other app" turned off and "Mute audio on lid close" turned on, and
+Insomnia posts a notification naming what changed. Settings shows the same
+line at the top of Lid-close actions until you dismiss it, for anyone with
+notifications off. The toggles are right below it. config.json records that
+the update ran (`lidCloseDefaultsApplied`), so a setting you turn back stays
+the way you set it. A fresh install starts with the new defaults and no
+notice.
 
 To exercise the lid actions without closing the lid, run
 `scripts/simulate-lid.sh closed` and then `scripts/simulate-lid.sh open` during

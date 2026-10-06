@@ -197,6 +197,11 @@ final class SessionManager {
     /// is refused and the end is retried. Cleared by the next reconcile, and
     /// by a start, whose own session.json replaces it.
     @ObservationIgnored private var keptSessionFile: KeptSessionFile?
+    /// What the one-time lid-close update changed at init, posted by the
+    /// launch reconcile (`announceLidCloseUpdate`). Settings shows the same
+    /// change (`Config.lidCloseDefaultsNotice`) for a user who has
+    /// notifications turned off.
+    @ObservationIgnored private var pendingLidCloseNotice: LidCloseDefaultsChange?
 
     private enum KeptSessionFile {
         /// Opening or reading it failed, or it is not a regular file.
@@ -254,18 +259,30 @@ final class SessionManager {
         if var c = (try? store.loadConfig()) ?? nil {
             // Settings keeps the end floor below the Low Power Mode floor; a
             // hand-edited config.json may not. Fix it here and write it back.
-            if let change = c.normalizeFloors() {
+            var corrections = c.normalizeFloors().map { [$0] } ?? []
+            // Once for a config.json an earlier build saved: written back
+            // with the mark, so a setting the user turns back stays back.
+            let earlierBuild = !c.lidCloseDefaultsApplied
+            let lidClose = c.applyLidCloseDefaults()
+            if earlierBuild {
+                corrections.append("lid-close update: " + (lidClose.map(\.changes) ?? "nothing to change"))
+            }
+            if !corrections.isEmpty {
+                let change = corrections.joined(separator: "; ")
                 do {
                     try store.saveConfig(c)
                     Log.info("config.json: \(change); saved")
                 } catch {
-                    // The corrected floors apply in memory either way; the
-                    // file stays as it was and is corrected again next launch.
+                    // The corrections apply in memory either way; the file
+                    // stays as it was and is corrected again next launch.
                     Log.error("config.json: \(change); could not save the correction: \(error.localizedDescription)")
                 }
             }
             self.config = c
+            self.pendingLidCloseNotice = lidClose
         } else {
+            // A fresh install: the defaults already are the update, and
+            // `Config()` carries its mark, so there is nothing to announce.
             self.config = Config()
             try? store.saveConfig(self.config)
         }
@@ -1055,7 +1072,20 @@ final class SessionManager {
     // MARK: Reconcile (spec section 8)
 
     func reconcile() async {
+        announceLidCloseUpdate()
         _ = await exclusive("reconcile") { await self.performReconcile() }
+    }
+
+    /// Posts the lid-close update's notification once, before the
+    /// transaction, so a busy lock or an unreadable journal cannot hold it
+    /// back. Not from init: the app builds the manager before it installs
+    /// its notification delegate (`ForegroundNotifications`), which is what
+    /// shows a notification while Insomnia is the active app, and the
+    /// launch reconcile runs after that.
+    private func announceLidCloseUpdate() {
+        guard let change = pendingLidCloseNotice else { return }
+        pendingLidCloseNotice = nil
+        notifier.post(title: LidCloseDefaultsChange.title, body: change.notificationBody)
     }
 
     private func performReconcile() async {

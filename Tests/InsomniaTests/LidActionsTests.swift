@@ -1104,12 +1104,12 @@ final class LidActionsTests: XCTestCase {
 
     // MARK: Freeze every other app
 
-    /// Figma (600 + helper 601) and Wispr Flow (700) are Dock apps not on
+    /// Figma (600 + helper 601) and Spotify (700) are Dock apps not on
     /// any list; Bartender (800) is a menu-bar (accessory) app.
     private func addDockAndAccessoryApps() {
         freezer.apps = apps + [
             RunningApp(pid: 600, bundleId: "com.figma.Desktop", name: "Figma"),
-            RunningApp(pid: 700, bundleId: "com.electron.wispr-flow", name: "Wispr Flow"),
+            RunningApp(pid: 700, bundleId: "com.spotify.client", name: "Spotify"),
             RunningApp(pid: 800, bundleId: "com.surteesstudios.Bartender", name: "Bartender", activationPolicy: .accessory),
         ]
         freezer.processes = processes + [
@@ -1160,6 +1160,39 @@ final class LidActionsTests: XCTestCase {
 
         XCTAssertEqual(h.procs.suspended, [[100, 101, 102], [400, 401]])
         XCTAssertEqual(try h.store.loadState()?.frozenPids, [100, 101, 102, 400, 401])
+    }
+
+    /// The defect behind the meeting-app list: with freeze-all on, a lid
+    /// close stopped all 13 of Wispr Flow's processes and the meeting notes
+    /// it was taking. Meeting, recording and dictation apps and their
+    /// helpers keep running; the other Dock apps are still frozen.
+    func testFreezeAllLeavesMeetingAndDictationAppsRunning() async throws {
+        addDockAndAccessoryApps()
+        // Wispr Flow (1000) with 12 helper processes, Zoom (1100), Zoom's
+        // CptHost (1101) given a Dock app's policy so that only the helper
+        // prefix keeps it out, and OBS (1200).
+        freezer.apps += [
+            RunningApp(pid: 1000, bundleId: "com.electron.wispr-flow", name: "Wispr Flow"),
+            RunningApp(pid: 1100, bundleId: "us.zoom.xos", name: "zoom.us"),
+            RunningApp(pid: 1101, bundleId: "us.zoom.CptHost", name: "CptHost"),
+            RunningApp(pid: 1200, bundleId: "com.obsproject.obs-studio", name: "OBS"),
+        ]
+        let wisprFlow: [Int32] = Array(1000...1012)
+        freezer.processes += wisprFlow.map { ProcessEntry(pid: $0, ppid: $0 == 1000 ? 1 : 1000, startedAt: Int64($0) * 10) } + [
+            ProcessEntry(pid: 1100, ppid: 1, startedAt: 11000),
+            ProcessEntry(pid: 1101, ppid: 1, startedAt: 11010),
+            ProcessEntry(pid: 1200, ppid: 1, startedAt: 12000),
+        ]
+        let (m, actions) = await make()
+        m.config.freezeAllApps = true
+        await m.start(duration: 3600)
+
+        await actions.onClose()
+
+        XCTAssertEqual(h.procs.suspended, [[100, 101, 102], [600, 601], [700], [400, 401]])
+        let meeting = Set(wisprFlow + [1100, 1101, 1200])
+        XCTAssertTrue(meeting.isDisjoint(with: h.procs.suspended.flatMap { $0 }), "a meeting or dictation process was stopped")
+        XCTAssertEqual(try h.store.loadState()?.frozenPids, [100, 101, 102, 600, 601, 700, 400, 401])
     }
 
     /// A helper that was already stopped before the lid closed (a debugger,
