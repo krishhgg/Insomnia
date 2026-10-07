@@ -509,6 +509,42 @@ final class ReconcileTests: XCTestCase {
         XCTAssertTrue(h.notifier.posts.last?.body.contains("recovery agent") ?? false, "\(h.notifier.posts)")
     }
 
+    /// The same backoff for a journal that does not decode: the first tick
+    /// that sees the agent's end is refused, and later ticks inside the
+    /// retry delay start no transaction and log nothing. Once the journal
+    /// is repaired, the first tick after the delay ends the session.
+    func testTheTickWaitsTheRetryDelayWhileTheJournalIsUnreadable() async throws {
+        let m = h.makeManager(retryDelay: 60)
+        await m.start(duration: 3600)
+        try h.store.deleteSession()
+        try Data("{unreadable journal".utf8).write(to: h.home.paths.stateFile)
+        let calls = h.guardFake.calls
+        func refused() -> Int {
+            let log = (try? String(contentsOf: h.home.paths.logFile, encoding: .utf8)) ?? ""
+            return log.components(separatedBy: "agent end refused, nothing changed:").count - 1
+        }
+
+        await m.noticeAgentEnd()
+        await m.noticeAgentEnd()
+        h.clock.advance(59)
+        await m.noticeAgentEnd()
+        XCTAssertEqual(refused(), 1, "one attempt inside the retry delay")
+        XCTAssertTrue(m.isActive)
+        XCTAssertEqual(h.guardFake.calls, calls, "nothing changed")
+
+        try h.store.saveState(.clean)
+        await m.noticeAgentEnd()
+        XCTAssertTrue(m.isActive, "repaired, but still inside the delay")
+
+        h.clock.advance(1)
+        await m.noticeAgentEnd()
+        XCTAssertFalse(m.isActive)
+        XCTAssertEqual(refused(), 1)
+        XCTAssertNil(try h.store.loadSession())
+        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
+        XCTAssertTrue(h.notifier.posts.last?.body.contains("recovery agent") ?? false, "\(h.notifier.posts)")
+    }
+
     // MARK: A session.json recorded as ended
 
     /// The agent ended the session but could not remove session.json, so it

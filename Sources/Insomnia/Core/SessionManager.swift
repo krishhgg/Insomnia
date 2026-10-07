@@ -239,11 +239,13 @@ final class SessionManager {
     @ObservationIgnored private var countdownTimer: Timer?
     @ObservationIgnored private var retryTimer: Timer?
     @ObservationIgnored private var checkingAgentEnd = false
-    /// The tick's next look for the agent's end after one found the recovery
-    /// lock held. backstop.sh removes session.json before its undo, so an
-    /// undo command that hangs keeps the lock past the end; the tick then
-    /// asks again after `recoveryRetryDelay`, not on every second with a new
-    /// lock wait and log line each time.
+    /// The tick's next look for the agent's end after a transaction for it
+    /// was refused: the recovery lock was held, state.json did not decode,
+    /// or an unfinished command held the lock. backstop.sh removes
+    /// session.json before its undo, so an undo command that hangs keeps
+    /// the lock past the end, and a journal stays unreadable until a person
+    /// repairs it. The tick then asks again after `recoveryRetryDelay`, not
+    /// on every second with a new lock wait and log line each time.
     @ObservationIgnored private var agentEndRetryAt = Date.distantPast
     /// Whether the 1 Hz redraw is currently on the run loop. Tests assert on
     /// this to prove an idle session leaves no repeating wakeup behind.
@@ -729,7 +731,7 @@ final class SessionManager {
         checkingAgentEnd = true
         defer { checkingAgentEnd = false }
         let result = await exclusive("agent end") {}
-        if case .failure(.lockBusy) = result {
+        if case .failure = result {
             agentEndRetryAt = now.addingTimeInterval(recoveryRetryDelay)
         }
     }
