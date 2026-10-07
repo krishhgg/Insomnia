@@ -1,14 +1,16 @@
 #!/bin/bash
 # Reverse install.sh. Quits the app, takes the recovery lock, runs the current
-# backstop with --force under that same lock (the checkout's copy when the
-# installed app declares the interface version it speaks, else the app's own:
-# the one sealed in the bundle, else the writable copy older installs left in
-# Application Support), verifies for itself that the journal is clean, and
-# only then removes the LaunchAgent, the sudoers rule, the app bundle
-# (backstop.sh included), and the journal. Keeps config.json and the logs
-# unless --purge. Everything after the quit happens while this process holds
-# APP_SUPPORT/.recovery.lock, so neither a queued periodic backstop nor a
-# relaunched app can republish the journal while it is being removed.
+# backstop with --force under that same lock (from a source checkout: the
+# checkout's copy when the installed app declares the interface version it
+# speaks, else the app's own: the one sealed in the bundle, else the writable
+# copy older installs left in Application Support; from anywhere else, such
+# as a release zip: the sealed copy only), verifies for itself that the
+# journal is clean, and only then removes the LaunchAgent, the sudoers rule,
+# the app bundle (backstop.sh included), and the journal. Keeps config.json
+# and the logs unless --purge. Everything after the quit happens while this
+# process holds APP_SUPPORT/.recovery.lock, so neither a queued periodic
+# backstop nor a relaunched app can republish the journal while it is being
+# removed.
 #
 # Right after the lock it deletes APP_SUPPORT/pending-start itself, because
 # the backstop it runs may be an older copy that does not know the file: a
@@ -46,7 +48,16 @@ for arg in "$@"; do
   esac
 done
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# The folder this script is in. backstop.sh is taken from there only when it
+# is the scripts/ folder of a source checkout, with Package.swift one level
+# up (in_checkout). A release zip's folder is not, and the zip has no
+# backstop.sh, so one found beside its uninstall.sh was added after the zip
+# was unpacked, for example by another account that created the folder in
+# /tmp beforehand. Never the folder above either: a zip unpacked at
+# /tmp/Insomnia-<version> would make that /tmp, where any account can create
+# scripts/backstop.sh.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+in_checkout() { [[ "${SCRIPT_DIR##*/}" == scripts && -f "${SCRIPT_DIR%/*}/Package.swift" ]]; }
 
 # Fixed tool paths: never taken from PATH or the environment. Tests patch
 # these lines in a private copy of the script.
@@ -696,49 +707,63 @@ fi
 
 # 3. Undo everything via a backstop that matches the installed app ----------
 # The backstop inherits fd 9 and shares this lock instead of waiting on it.
-# This checkout's backstop.sh hands frozen entries that record microseconds
-# to the installed app binary, and runs that binary only when the bundle's
-# Info.plist declares InsomniaResumeFrozenVersion RESUME_FROZEN_VERSION (the
-# same value as in backstop.sh; a test keeps the two in step). So the
-# checkout's copy runs when the app declares that version. An app that does
-# not was installed together with its own backstop.sh, which speaks its
-# version: the copy install.sh sealed into the bundle, or for installs before
-# that layout the writable copy in $APP_SUPPORT that the LaunchAgent runs.
-# That copy is used instead when it exists. The sealed copy runs only while
-# the bundle's signature still verifies: its resource seal covers the
-# script, so this is the check the LaunchAgent runs (without the pinned
-# requirement, which this script does not have), and an edited copy is
-# refused the same way. With neither copy this checkout's backstop runs
-# anyway: it keeps the entries that need the binary, and step 4 stops before
-# removing anything.
+# From a source checkout, the checkout's backstop.sh hands frozen entries
+# that record microseconds to the installed app binary, and runs that binary
+# only when the bundle's Info.plist declares InsomniaResumeFrozenVersion
+# RESUME_FROZEN_VERSION (the same value as in backstop.sh; a test keeps the
+# two in step). So the checkout's copy runs when the app declares that
+# version. An app that does not was installed together with its own
+# backstop.sh, which speaks its version: the copy install.sh sealed into the
+# bundle, or for installs before that layout the writable copy in
+# $APP_SUPPORT that the LaunchAgent runs. That copy is used instead when it
+# exists. With neither copy the checkout's backstop runs anyway: it keeps the
+# entries that need the binary, and step 4 stops before removing anything.
+# From anywhere else, such as a release zip's folder, the sealed copy or
+# nothing: a backstop.sh beside this script there is not from the zip (see
+# SCRIPT_DIR), and the writable copy is older than release zips. The sealed
+# copy runs only while the bundle's signature still verifies: its resource
+# seal covers the script, so this is the check the LaunchAgent runs (without
+# the pinned requirement, which this script does not have), and an edited
+# copy is refused the same way.
 step "Restoring the machine via backstop --force"
+if [[ -e "$SCRIPT_DIR/backstop.sh" ]] && ! in_checkout; then
+  echo "not running $SCRIPT_DIR/backstop.sh: $SCRIPT_DIR is not the scripts folder of a source checkout, and a release zip has no backstop.sh, so it was added after the zip was unpacked." >&2
+fi
+CHECKOUT_BACKSTOP=""
+if in_checkout && [[ -f "$SCRIPT_DIR/backstop.sh" ]]; then
+  CHECKOUT_BACKSTOP="$SCRIPT_DIR/backstop.sh"
+fi
 installed_version=""
 if [[ -f "$APP/Contents/Info.plist" ]]; then
   installed_version="$(extract "$APP/Contents/Info.plist" InsomniaResumeFrozenVersion || true)"
 fi
-if [[ -f "$ROOT/scripts/backstop.sh" ]] && { [[ "$installed_version" == "$RESUME_FROZEN_VERSION" ]] || { [[ ! -f "$APP/Contents/Resources/backstop.sh" ]] && [[ ! -f "$APP_SUPPORT/backstop.sh" ]]; }; }; then
-  BACKSTOP="$ROOT/scripts/backstop.sh"
+if [[ -n "$CHECKOUT_BACKSTOP" ]] && { [[ "$installed_version" == "$RESUME_FROZEN_VERSION" ]] || { [[ ! -f "$APP/Contents/Resources/backstop.sh" ]] && [[ ! -f "$APP_SUPPORT/backstop.sh" ]]; }; }; then
+  BACKSTOP="$CHECKOUT_BACKSTOP"
 elif [[ -f "$APP/Contents/Resources/backstop.sh" ]]; then
   verify_rc=0
   bounded "$CODESIGN" --verify --strict "$APP" || verify_rc=$?
   if (( verify_rc == 124 )); then
     echo "'codesign --verify --strict $APP' did not answer within ${CALL_TIMEOUT_SECONDS}s, so the backstop.sh sealed in it was not run." >&2
-    echo "Nothing was removed. Run this script from a checkout of the source (its scripts/backstop.sh is used first), or rerun once codesign answers." >&2
+    echo "Nothing was removed. Rerun once codesign answers, or run scripts/uninstall.sh from a checkout of the source: it runs its own backstop.sh when this app declares InsomniaResumeFrozenVersion $RESUME_FROZEN_VERSION." >&2
     exit 1
   elif (( verify_rc != 0 )); then
     echo "$APP does not pass 'codesign --verify --strict' (exit $verify_rc: ${BOUNDED_OUTPUT:-no detail}), so the backstop.sh sealed in it was not run." >&2
-    echo "Nothing was removed. Run this script from a checkout of the source (its scripts/backstop.sh is used first), or reinstall with scripts/install.sh and rerun." >&2
+    echo "Nothing was removed. Reinstall and rerun, or run scripts/uninstall.sh from a checkout of the source: it runs its own backstop.sh when this app declares InsomniaResumeFrozenVersion $RESUME_FROZEN_VERSION." >&2
     exit 1
   fi
   echo "$APP verifies"
   BACKSTOP="$APP/Contents/Resources/backstop.sh"
-elif [[ -f "$APP_SUPPORT/backstop.sh" ]]; then
+elif in_checkout && [[ -f "$APP_SUPPORT/backstop.sh" ]]; then
   BACKSTOP="$APP_SUPPORT/backstop.sh"
+elif in_checkout; then
+  echo "no backstop.sh found in $SCRIPT_DIR, $APP/Contents/Resources or $APP_SUPPORT; nothing was removed" >&2
+  exit 1
 else
-  echo "no backstop.sh found in $ROOT/scripts, $APP/Contents/Resources or $APP_SUPPORT; nothing was removed" >&2
+  echo "no backstop.sh sealed in $APP/Contents/Resources, and outside a source checkout this script runs no other copy; nothing was removed." >&2
+  echo "Run scripts/uninstall.sh from a checkout of the source." >&2
   exit 1
 fi
-if [[ "$BACKSTOP" != "$ROOT/scripts/backstop.sh" && -f "$ROOT/scripts/backstop.sh" ]]; then
+if [[ -n "$CHECKOUT_BACKSTOP" && "$BACKSTOP" != "$CHECKOUT_BACKSTOP" ]]; then
   echo "$APP does not declare InsomniaResumeFrozenVersion $RESUME_FROZEN_VERSION; using the backstop installed with it, $BACKSTOP"
 fi
 echo "using $BACKSTOP"
