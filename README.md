@@ -66,9 +66,9 @@ four power-setting commands. Review that permission before installing.
 
 | Location | Purpose |
 | --- | --- |
-| `~/Applications/Insomnia.app` | The menu bar app |
-| `~/Library/Application Support/Insomnia/` | Configuration, session/recovery journals, and `backstop.sh` |
-| `~/Library/LaunchAgents/com.insomnia.backstop.plist` | Per-user recovery agent |
+| `~/Applications/Insomnia.app` | The menu bar app, with `backstop.sh` sealed inside it at `Contents/Resources` |
+| `~/Library/Application Support/Insomnia/` | Configuration and the session/recovery journals |
+| `~/Library/LaunchAgents/com.insomnia.backstop.plist` | Per-user recovery agent: verifies the app's code signature, then runs the sealed `backstop.sh` |
 | `~/Library/Logs/Insomnia/` | `insomnia.log` and `handoffs.log`, each capped at 1 MiB with one older copy kept as `.1`, unless you replace it with a symlink |
 | `/etc/sudoers.d/insomnia` | Permission for the four commands below |
 
@@ -83,9 +83,61 @@ The grant is available to other processes running as your user. Insomnia is not
 sandboxed. The app, scripts, and journals are local; hotspot passwords use the
 login Keychain, not the configuration file.
 
-An upgrade asks the running app to quit and stops if it refuses. Unresolved
-recovery prevents replacing the existing recovery agent; follow the reported
-instructions before retrying.
+The recovery agent runs at login and every 60 seconds. Its command line pins
+the installed bundle's code requirement (for an ad-hoc build, the cdhash of
+that build) and runs `codesign --verify --strict` against it before executing
+the `backstop.sh` sealed inside the bundle. An edited bundle or script fails
+that check: the agent writes one line to `insomnia.log` and runs nothing until
+you reinstall. No executable is kept in a writable support directory. The plist
+in `~/Library/LaunchAgents` is still a per-user file that any program running
+as you can edit, like every LaunchAgent; the app rewrites it at the next
+session start when it does not match, which is a repair, not a tamper check.
+
+What the app pins is the requirement of the code it is itself running, read
+through the Security framework after checking that the bundle on disk is still
+that code and still passes the agent's check. A bundle whose sealed script was
+edited, or that was re-signed under the running app, is refused rather than
+pinned: the app does not start a session, or reports the end as incomplete,
+and names the reason, until you reinstall. With ad-hoc signatures this guards
+against accidental edits and against the app relaying a tampered bundle into
+the agent, not against a process running as you: that process can edit the
+plist, load its own agent, quit the app and launch a replacement, and run the
+four `pmset` commands itself.
+
+An upgrade asks the running app to quit and stops if it refuses. The new
+bundle is built in a staging directory next to the app and moved into place in
+the same step that replaces the recovery agent. That step starts only after
+`launchctl print` confirms the previous agent is unloaded; otherwise nothing is
+replaced. If the new agent cannot be loaded, or its plist cannot be saved, the
+installer unloads it, waits for `launchctl print` to confirm that, and puts the
+previous bundle back, so the loaded agent always matches the installed app. A
+bundle that cannot be moved during that step is handled the same way: the
+previous bundle goes back and its agent is loaded again. If the previous bundle
+itself cannot be moved back, nothing is deleted: it stays at
+`~/Applications/.Insomnia.app.previous`, the installer prints the two commands
+that put it back and load its agent, and until then the agent finds no app, so
+run them or rerun the installer before you log out. If
+the unload is not confirmed, the new bundle stays with the agent that pins it
+and the installer asks you to rerun it. After that, or after an install killed
+in the middle of that step, the next run keeps whichever bundle the agent's
+plist on disk pins. It does that only after its own recovery step succeeds:
+while recovery is unresolved, an agent the earlier run left loaded may be the
+one retrying it, so the installer stops without unloading that agent or
+moving either bundle. Once recovery succeeds, it unloads that agent, moves the
+bundle back and loads the plist on disk again, and it stops if `launchctl
+print` does not confirm the unload or the reload. Unresolved recovery prevents
+replacing either; follow the reported instructions before retrying. The
+installer checks the sudoers rule again once it holds the recovery lock, and
+stops if the rule is gone, as after an `uninstall.sh` that took the lock first.
+Each call it makes to `sudo`, `pgrep`, `launchctl` or `codesign` while it
+holds the lock has a 30 s limit, which a supervising process enforces even
+if the installer is killed meanwhile. The call keeps the lock until it has
+exited or been stopped, so no `launchctl bootout` it started is still
+running once the lock is released. A call that does not answer in time gets SIGTERM, then SIGKILL
+one to two seconds later, and the install stops, so the lock is released and the app
+and the agent's backstop can take it again to undo a session. `sudo` only
+ever gets SIGTERM: one that ignores it keeps the lock until it ends, and the
+installer prints its pid.
 
 </details>
 
@@ -471,7 +523,10 @@ From your checkout:
 
 The uninstaller requests cleanup before removing the app, agent, and sudoers
 rule. If recovery is incomplete or the app refuses to quit, it stops; resolve
-the reported problem and retry. Purge removes owned files, not arbitrary
+the reported problem and retry. With the app it removes what an interrupted
+install left beside it: `~/Applications/.Insomnia.app.previous`, and
+`.Insomnia.app.staging.*` directories of installs that are no longer running.
+Nothing else in `~/Applications` is touched. Purge removes owned files, not arbitrary
 directory contents. A small shared lock file is retained to keep concurrent
 recovery operations coordinated.
 

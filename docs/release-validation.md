@@ -152,6 +152,13 @@ is performed. Do not replace "not run" with "passed" based on source review.
 | Unreadable battery (IOKit miss) ends the session on a laptop after the second read; desktop unaffected | Not run |
 | Settings floor steppers keep the end floor below the Low Power Mode floor by moving the other stepper | Not run |
 | Install/upgrade/uninstall with recoverable failure conditions | Not run |
+| Recovery agent refuses to run after the installed bundle or its sealed backstop.sh is modified, and logs why | Not run |
+| Running app refuses to arm (session start refused, reason shown) after its installed bundle is edited or re-signed under it | Not run |
+| Upgrade whose new agent fails to load puts the previous bundle back and reloads the previous agent, on a working Mac | Not run |
+| Upgrade whose new agent plist cannot be saved, and a rerun after an install killed mid-swap, leave the app and the agent's plist matching, on a working Mac | Not run |
+| Upgrade whose bundle rename is refused (the new build cannot be moved in, or the previous app cannot be moved back) puts the previous app back and reloads its agent, or keeps both bundles and prints the commands, on a working Mac | Not run |
+| Install whose `sudo -n -l` check or `launchctl` call stalls while it holds the recovery lock (for example a directory-service lookup that does not answer) stops after 30 s and releases the lock, and the agent's next run can take it, on a working Mac | Not run |
+| Install or uninstall whose own process is killed (`kill -9 <pid>`) during a `launchctl bootout` keeps the recovery lock until that bootout has ended or been stopped, about 33 s at most, and the app started afterwards keeps its agent loaded, on a working Mac | Not run |
 | First launch over an existing install tightens Application Support/Insomnia and Logs/Insomnia to 0700 and their files to 0600 | Not run |
 | Launch at login survives a reinstall by install.sh, including a second install.sh run on the same unchanged build (switch on, reinstall, relaunch: the log shows the launch-time check, System Settings > General > Login Items lists Insomnia as enabled, and the Settings switch reads on; a pending approval shows the note and the Open Login Items button) | Not run |
 | Launch at login heals on the first upgrade from a build without the install record (switch on in the previous build, upgrade with install.sh, relaunch: the log shows "registering once and recording the install", Login Items lists Insomnia, and config.json has `launchAtLoginInstall`) | Not run |
@@ -165,10 +172,16 @@ machine to validate thermal handling; exercise injected thermal events first.
 
 Launchd sequencing tests use a fake command runner. Actual bootstrap of the
 private candidate plist, login loading, and crash recovery must still be
-checked on the supported macOS release. Installer tests redirect every app,
-LaunchAgent, sudoers, and command target into a temporary fixture. Real build,
-signing, privileged installation, and quit refusal by a running app have not
-been exercised as an end-to-end installation on a working Mac.
+checked on the supported macOS release. PackagingTests run the agent's
+verify-then-exec command line against a scratch ad-hoc bundle with the real
+codesign: an intact bundle runs its sealed script, and an edited script or
+another build's requirement is refused and logged. Whether launchd runs that
+command line as installed, and whether the installed app's plist is the one
+install.sh wrote, has not been checked on a working Mac. Installer tests
+redirect every app, LaunchAgent, sudoers, and command target into a temporary
+fixture. Real build, signing, privileged installation, and quit refusal by a
+running app have not been exercised as an end-to-end installation on a
+working Mac.
 
 ## Distribution boundary
 
