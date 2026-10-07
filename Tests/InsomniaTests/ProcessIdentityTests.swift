@@ -320,6 +320,74 @@ final class ProcessIdentityTests: XCTestCase {
         XCTAssertEqual(report.gone, [101])
     }
 
+    /// Pins the order the ownership rule depends on: for each pid, one
+    /// lookup immediately followed by its signal, before the next pid is
+    /// looked up. A pid that gets no signal costs exactly one lookup.
+    /// Never all lookups first and the signals after.
+    func testEveryResumeSignalIsImmediatelyPrecededByItsOwnLookup() {
+        let events = Locked<[String]>([])
+        let kernel: [Int32: ProcessSignalState] = [
+            100: ProcessSignalState(ppid: 1, stopped: true, startedAt: 1000),
+            101: ProcessSignalState(ppid: 1, stopped: true, startedAt: 1001),
+            102: ProcessSignalState(ppid: 1, stopped: false, startedAt: 1002),
+        ]
+        let c = SignalProcessControl(
+            stateLookup: { pid in
+                events.value.append("lookup \(pid)")
+                return kernel[pid].map(ProcessLookup.present) ?? .absent
+            },
+            send: { pid, sig in
+                events.value.append("send \(pid) \(sig == SIGCONT ? "CONT" : "other")")
+                return 0
+            }
+        )
+        let report = c.resume([
+            FrozenProcess(pid: 100, startedAt: 1000),
+            FrozenProcess(pid: 103, startedAt: 1003),
+            FrozenProcess(pid: 101, startedAt: 1001),
+            FrozenProcess(pid: 102, startedAt: 1002),
+        ])
+        XCTAssertEqual(events.value, [
+            "lookup 100", "send 100 CONT",
+            "lookup 103",
+            "lookup 101", "send 101 CONT",
+            "lookup 102",
+        ])
+        XCTAssertEqual(report.resumed, [100, 101])
+        XCTAssertEqual(report.gone, [103, 102])
+    }
+
+    func testEverySuspendSignalIsImmediatelyPrecededByItsOwnLookup() {
+        let events = Locked<[String]>([])
+        let kernel: [Int32: ProcessSignalState] = [
+            100: ProcessSignalState(ppid: 1, stopped: false, startedAt: 1000),
+            101: ProcessSignalState(ppid: 100, stopped: false, startedAt: 1001),
+            102: ProcessSignalState(ppid: 100, stopped: true, startedAt: 1002),
+        ]
+        let c = SignalProcessControl(
+            stateLookup: { pid in
+                events.value.append("lookup \(pid)")
+                return kernel[pid].map(ProcessLookup.present) ?? .absent
+            },
+            send: { pid, sig in
+                events.value.append("send \(pid) \(sig == SIGSTOP ? "STOP" : "other")")
+                return 0
+            }
+        )
+        let report = c.suspend([
+            FrozenProcess(pid: 100, startedAt: 1000),
+            FrozenProcess(pid: 102, startedAt: 1002),
+            FrozenProcess(pid: 101, startedAt: 1001),
+        ], expectedParents: [100: 1, 101: 100, 102: 100])
+        XCTAssertEqual(events.value, [
+            "lookup 100", "send 100 STOP",
+            "lookup 102",
+            "lookup 101", "send 101 STOP",
+        ])
+        XCTAssertEqual(report.suspended, [100, 101])
+        XCTAssertEqual(report.skipped, [102])
+    }
+
     // MARK: Planner
 
     func testPlannerRecordsIdentityForEveryPidAndLeavesOutStoppedOnes() {
@@ -335,5 +403,39 @@ final class ProcessIdentityTests: XCTestCase {
         XCTAssertEqual(groups[0].pids, [100, 101])
         XCTAssertEqual(groups[0].identities, [100: ProcessIdentity(startedAt: 1000), 101: ProcessIdentity(startedAt: 1001)])
         XCTAssertEqual(groups[0].expectedParents, [100: 1, 101: 100])
+    }
+    // MARK: Process table lookup (a root process too)
+
+    /// `processTableState` reads the same identity as `kernelState` for a
+    /// process both can see, and still answers for a root process, which
+    /// proc_pidinfo refuses: `sudo pmset` runs as root. pid 1 (launchd) is
+    /// only read.
+    func testTheProcessTableAnswersForTheTestProcessAndForARootProcess() {
+        let me = ProcessInfo.processInfo.processIdentifier
+        guard case let .present(direct) = SignalProcessControl.kernelState(pid: me),
+              case let .present(table) = SignalProcessControl.processTableState(pid: me) else {
+            return XCTFail("the test process could not be read")
+        }
+        XCTAssertEqual(table.identity, direct.identity)
+        XCTAssertFalse(table.identity.bootSession.isEmpty)
+
+        guard case .unreadable = SignalProcessControl.kernelState(pid: 1) else {
+            return XCTFail("proc_pidinfo read launchd; this test no longer shows why the process table is used")
+        }
+        guard case let .present(root) = SignalProcessControl.processTableState(pid: 1) else {
+            return XCTFail("the process table did not answer for a root process")
+        }
+        XCTAssertGreaterThan(root.identity.startedAt, 0)
+    }
+
+    /// A child that has exited and been reaped is absent, not unreadable.
+    func testTheProcessTableReportsAReapedChildAsAbsent() throws {
+        let child = Process()
+        child.executableURL = URL(fileURLWithPath: "/usr/bin/true")
+        let exit = ProcessExit(child)
+        try child.run()
+        exit.wait()
+        XCTAssertEqual(SignalProcessControl.processTableState(pid: child.processIdentifier), .absent)
+        XCTAssertEqual(SignalProcessControl.processTableState(pid: 0), .absent)
     }
 }

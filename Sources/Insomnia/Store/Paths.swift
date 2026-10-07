@@ -5,12 +5,14 @@ import Foundation
 /// the same variable with the same layout).
 ///
 /// Default layout:
-///   ~/Library/Application Support/Insomnia/{session.json,state.json,config.json,backstop.sh}
+///   ~/Applications/Insomnia.app/Contents/Resources/backstop.sh
+///   ~/Library/Application Support/Insomnia/{session.json,state.json,config.json,unfinished-command.json}
 ///   ~/Library/Logs/Insomnia/{insomnia.log,handoffs.log}
 ///   ~/Library/LaunchAgents/com.insomnia.backstop.plist
 ///
 /// With INSOMNIA_HOME=/x:
-///   /x/{session.json,state.json,config.json,backstop.sh}
+///   /x/Insomnia.app/Contents/Resources/backstop.sh
+///   /x/{session.json,state.json,config.json,unfinished-command.json}
 ///   /x/Logs/{insomnia.log,handoffs.log}
 ///   /x/LaunchAgents/com.insomnia.backstop.plist
 struct Paths: Sendable, Equatable {
@@ -21,11 +23,14 @@ struct Paths: Sendable, Equatable {
     let appSupport: URL
     let logs: URL
     let launchAgents: URL
+    /// Where install.sh puts the app bundle. backstop.sh is sealed inside it.
+    let appBundle: URL
 
-    init(appSupport: URL, logs: URL, launchAgents: URL) {
+    init(appSupport: URL, logs: URL, launchAgents: URL, appBundle: URL) {
         self.appSupport = appSupport
         self.logs = logs
         self.launchAgents = launchAgents
+        self.appBundle = appBundle
     }
 
     /// Relocated layout rooted at one directory (used for INSOMNIA_HOME).
@@ -33,7 +38,8 @@ struct Paths: Sendable, Equatable {
         self.init(
             appSupport: root,
             logs: root.appendingPathComponent("Logs", isDirectory: true),
-            launchAgents: root.appendingPathComponent("LaunchAgents", isDirectory: true)
+            launchAgents: root.appendingPathComponent("LaunchAgents", isDirectory: true),
+            appBundle: root.appendingPathComponent("Insomnia.app", isDirectory: true)
         )
     }
 
@@ -44,7 +50,8 @@ struct Paths: Sendable, Equatable {
         return Paths(
             appSupport: library.appendingPathComponent("Application Support/Insomnia", isDirectory: true),
             logs: library.appendingPathComponent("Logs/Insomnia", isDirectory: true),
-            launchAgents: library.appendingPathComponent("LaunchAgents", isDirectory: true)
+            launchAgents: library.appendingPathComponent("LaunchAgents", isDirectory: true),
+            appBundle: home.appendingPathComponent("Applications/Insomnia.app", isDirectory: true)
         )
     }
 
@@ -63,24 +70,38 @@ struct Paths: Sendable, Equatable {
     static let unreadableSessionPrefix = "session.json.unreadable-"
     var stateFile: URL { appSupport.appendingPathComponent("state.json") }
     var configFile: URL { appSupport.appendingPathComponent("config.json") }
-    /// Installed copy of scripts/backstop.sh, placed there by install.sh.
-    var backstopScript: URL { appSupport.appendingPathComponent("backstop.sh") }
+    /// scripts/backstop.sh as install.sh seals it into a bundle, under
+    /// Contents/Resources, before the bundle is signed. The LaunchAgent
+    /// verifies the bundle's signature before running it (LaunchdBackstop).
+    static func backstopScript(inBundle bundle: URL) -> URL {
+        bundle.appendingPathComponent("Contents/Resources/backstop.sh")
+    }
+    /// The sealed backstop.sh of the installed bundle.
+    var backstopScript: URL { Self.backstopScript(inBundle: appBundle) }
     /// flock(2) file shared with backstop.sh (`lockf -k` on the same path).
     /// Created once, never unlinked, so both sides lock the same inode.
     var recoveryLock: URL { appSupport.appendingPathComponent(".recovery.lock") }
+    /// The `sudo pmset` left running that holds the recovery lock, written
+    /// while it runs so a relaunch after a crash can name it. Removed when
+    /// it exits, and by the next transaction that takes the lock.
+    var unfinishedCommandFile: URL { appSupport.appendingPathComponent("unfinished-command.json") }
     /// Written by scripts/simulate-lid.sh ("closed" or "open") to drive the
     /// lid-close action path without touching the hinge. See LidSimulation.
     var simulateLidFile: URL { appSupport.appendingPathComponent("simulate-lid") }
 
+    /// Both logs are owner-only and rotate to `<name>.1` past
+    /// `OwnerOnly.maxLogBytes`; uninstall.sh --purge removes the `.1` too.
     var logFile: URL { logs.appendingPathComponent("insomnia.log") }
     var handoffsLog: URL { logs.appendingPathComponent("handoffs.log") }
 
     var backstopPlist: URL { launchAgents.appendingPathComponent("\(Paths.backstopLabel).plist") }
 
-    /// Create every directory Insomnia writes into.
+    /// Create every directory Insomnia writes into. Its own two are made
+    /// 0700 (an existing one is tightened); the LaunchAgents directory is
+    /// shared with every other login agent, so it is only created.
     func createDirectories() throws {
-        for dir in [appSupport, logs, launchAgents] {
-            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        }
+        if let problem = try OwnerOnly.createDirectory(appSupport) { OwnerOnly.reportOnce(problem) }
+        if let problem = try OwnerOnly.createDirectory(logs) { OwnerOnly.reportOnce(problem) }
+        try FileManager.default.createDirectory(at: launchAgents, withIntermediateDirectories: true)
     }
 }

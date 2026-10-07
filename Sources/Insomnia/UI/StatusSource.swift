@@ -19,6 +19,9 @@ protocol StatusSource: AnyObject, Observable {
     /// Why each browser's last relaunch did not happen, ordered by
     /// bundle id; one menu warning line each.
     var relaunchProblems: [String] { get }
+    /// Why a hotspot join was skipped this session, if one was, and for
+    /// which SSID.
+    var hotspotPasswordReport: HotspotPasswordReport? { get }
 
     /// Called when the menu opens; observers refresh anything not pushed.
     func refreshOnDemand()
@@ -44,6 +47,7 @@ final class PlaceholderStatus: StatusSource {
     var dockerPaused: Bool = false
     var throttledBrowsers: [ThrottledBrowser] = []
     var relaunchProblems: [String] = []
+    var hotspotPasswordReport: HotspotPasswordReport? = nil
 
     init() {}
 

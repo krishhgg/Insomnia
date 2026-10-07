@@ -6,8 +6,15 @@ import Foundation
 ///
 /// Kernel `flock(2)` on `Paths.recoveryLock`, a file that is never unlinked
 /// during ordinary runs so both sides always lock the same inode. The lock
-/// dies with its holder, so a crash can never leave it stuck. backstop.sh
-/// takes the same lock with `lockf -k` on the same path.
+/// belongs to the open file description, and the kernel drops it once every
+/// descriptor on that description is closed, so a crash can never leave it
+/// stuck. backstop.sh takes the same lock with `lockf -k` on the same path.
+///
+/// A privileged command a transaction runs gets one of those descriptors
+/// (`RecoveryLockHandle.descriptorForChild()`), so the lock outlives this
+/// process for as long as that command runs: a crash or a force quit
+/// cannot free it beside a live `sudo pmset`. backstop.sh keeps it the
+/// same way, in the subshell that supervises each command.
 enum RecoveryLockError: Error, LocalizedError, Equatable {
     case busy(path: String, seconds: TimeInterval)
     case open(path: String, errno: Int32)
@@ -32,12 +39,27 @@ final class RecoveryLockHandle: @unchecked Sendable {
 
     fileprivate init(fd: Int32) { self.fd = fd }
 
+    /// Closes this process's descriptor, as exiting would. No `LOCK_UN`:
+    /// that would unlock the description for every descriptor on it, a
+    /// child's included. A child that still holds one keeps the lock until
+    /// it exits; with none, the lock is free once this returns.
     func release() {
         mutex.withLock {
             guard fd >= 0 else { return }
-            flock(fd, LOCK_UN)
             close(fd)
             fd = -1
+        }
+    }
+
+    /// A new close-on-exec descriptor on the locked file, for a child that
+    /// must keep the lock while it runs: the spawn installs it without the
+    /// flag. The caller closes its copy once the child has been started.
+    /// nil once released.
+    func descriptorForChild() -> Int32? {
+        mutex.withLock {
+            guard fd >= 0 else { return nil }
+            let copy = fcntl(fd, F_DUPFD_CLOEXEC, 0)
+            return copy >= 0 ? copy : nil
         }
     }
 
@@ -47,14 +69,23 @@ final class RecoveryLockHandle: @unchecked Sendable {
 struct RecoveryLock: Sendable {
     let path: String
 
+    /// The lock the current transaction holds, set by `SessionManager` for
+    /// the length of the transaction. `PmsetSleepGuard` hands it to every
+    /// `sudo pmset` and runs none without it.
+    @TaskLocal static var held: RecoveryLockHandle?
+
     init(url: URL) { path = url.path }
 
     /// nil when another holder (any process, or another handle in this one)
     /// has it. Never blocks.
     func tryAcquire() throws -> RecoveryLockHandle? {
-        // O_CLOEXEC: children such as pmset must not inherit the lock.
-        let fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0o644)
+        // O_CLOEXEC: no child inherits the lock by accident. One that must
+        // keep it is given its own descriptor (`descriptorForChild()`).
+        // Owner-only like every other file here; an older 0644 lock is
+        // tightened in place, never replaced (same inode for both sides).
+        let fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, OwnerOnly.fileMode)
         guard fd >= 0 else { throw RecoveryLockError.open(path: path, errno: errno) }
+        if let problem = OwnerOnly.tighten(fd: fd, path: path) { OwnerOnly.reportOnce(problem) }
         if flock(fd, LOCK_EX | LOCK_NB) == 0 { return RecoveryLockHandle(fd: fd) }
         let err = errno
         close(fd)

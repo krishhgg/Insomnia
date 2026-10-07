@@ -18,6 +18,11 @@ enum StatusMenu {
             /// bundle id and name, so the item still names the same browser
             /// after a scan replaces the list.
             case relaunchBrowser(ThrottledBrowser)
+            /// Drop the saved volume of this output device: it is not
+            /// connected, and Insomnia stops waiting for it. Carries the
+            /// save the item was built for, its save ID included, so a
+            /// later one is not dropped.
+            case stopWaitingForOutput(SavedAudioOutput)
         }
 
         let title: String
@@ -30,12 +35,17 @@ enum StatusMenu {
     /// Disabled status lines, a separator, then Settings… and Quit. Empty
     /// lines are dropped, and the separator only appears when something
     /// precedes it, so the menu never opens with a stray rule at the top.
+    /// `hotspotWarning` is the line about a hotspot password the failover
+    /// could not use (`HotspotPasswordProblem.menuLine`).
     /// `lidSimulationBuild` adds the line that marks a build with the
     /// scripts/simulate-lid.sh watcher compiled in (`LidSimulationBuild`),
     /// so such a build is never mistaken for a normal one.
     /// `relaunchProblems` say why browser relaunches did not happen, one
     /// line per browser; they follow the browser lines, since the browsers
     /// they name may no longer be in them.
+    /// `outputsWaiting` are output devices still muted from a lid close
+    /// because they were not connected to get their volume back; each gets
+    /// a line and an item to stop waiting for it.
     static func items(
         sessionActive: Bool,
         sleepHeld: Bool,
@@ -43,8 +53,11 @@ enum StatusMenu {
         actions: String?,
         throttledBrowsers: [ThrottledBrowser],
         relaunchProblems: [String] = [],
+        hotspotWarning: String? = nil,
         error: String?,
+        commandRunning: String? = nil,
         foreignSleep: String? = nil,
+        outputsWaiting: [SavedAudioOutput] = [],
         lidSimulationBuild: Bool = false
     ) -> [Item] {
         var out: [Item] = []
@@ -72,6 +85,15 @@ enum StatusMenu {
         for problem in relaunchProblems.compactMap(present) {
             out.append(Item(title: "\u{26A0} \(problem)", kind: .warning))
         }
+        if let hotspot = present(hotspotWarning) {
+            out.append(Item(title: hotspot, kind: .warning))
+        }
+        // The sudo pmset left running comes before the session error: it
+        // holds every change and quit until it exits, and the line goes
+        // away then.
+        if let command = present(commandRunning) {
+            out.append(Item(title: "\u{26A0} \(command)", kind: .warning))
+        }
         if let error = present(error) {
             out.append(Item(title: "\u{26A0} \(error)", kind: .warning))
         }
@@ -79,6 +101,10 @@ enum StatusMenu {
         // someone else set can both be true of the same reconcile.
         if let foreignSleep = present(foreignSleep) {
             out.append(Item(title: "\u{26A0} \(foreignSleep)", kind: .warning))
+        }
+        for waiting in outputsWaiting {
+            out.append(Item(title: "\u{26A0} \(SessionManager.stillMutedLine(waiting))", kind: .warning))
+            out.append(Item(title: "Stop waiting for \(waiting.label)", kind: .stopWaitingForOutput(waiting)))
         }
         if !out.isEmpty {
             out.append(Item(title: "", kind: .separator))
@@ -102,7 +128,8 @@ enum StatusMenu {
         target: AnyObject?,
         settings: Selector,
         quit: Selector,
-        relaunchBrowser: Selector
+        relaunchBrowser: Selector,
+        stopWaitingForOutput: Selector
     ) -> NSMenu {
         let menu = NSMenu()
         menu.autoenablesItems = false
@@ -129,6 +156,10 @@ enum StatusMenu {
             case let .relaunchBrowser(browser):
                 let entry = action(title: item.title, selector: relaunchBrowser, key: "", target: target)
                 entry.representedObject = browser
+                menu.addItem(entry)
+            case let .stopWaitingForOutput(waiting):
+                let entry = action(title: item.title, selector: stopWaitingForOutput, key: "", target: target)
+                entry.representedObject = waiting
                 menu.addItem(entry)
             }
         }

@@ -1,8 +1,8 @@
 #!/bin/bash
 # Proves on the built binaries, not on the compilation condition, that the
 # scripts/simulate-lid.sh watcher is compiled out of a plain release build
-# and in only with -DINSOMNIA_LID_SIMULATION (what install.sh adds for
-# INSOMNIA_LID_SIMULATION=1). CI runs this after its release build step,
+# and in only with -DINSOMNIA_LID_SIMULATION (what build-app.sh adds
+# for INSOMNIA_LID_SIMULATION=1). CI runs this after its release build step,
 # with the same flags, so the plain build here is that binary rather than
 # a rebuild; it can be run locally the same way. It builds into .build
 # only and installs nothing. The opt-in build uses its own scratch path so

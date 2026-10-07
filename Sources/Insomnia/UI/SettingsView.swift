@@ -15,8 +15,9 @@ struct SettingsView: View {
     @State private var newFreezeBundle = ""
     @State private var newAgentBundle = ""
     @State private var newTmuxTarget = ""
-    @State private var hotspotPassword = ""
-    @State private var hotspotSaved = false
+    /// The password field, saving, what was saved, and the notice under
+    /// the field.
+    @State private var hotspot = HotspotPasswordField()
     /// Names of the apps the automatic lid-close scope would freeze right
     /// now (the freeze list excluded); refreshed on appear and toggle.
     @State private var wouldFreeze: [String] = []
@@ -34,13 +35,18 @@ struct SettingsView: View {
         .frame(width: 520)
         .frame(minHeight: 560, idealHeight: 720)
         .onAppear {
-            hotspotPassword = (try? secrets.load()) ?? ""
+            loadPassword()
             refreshWouldFreeze()
             // The user may have approved or removed the item in System
             // Settings since the launch-time check (LoginItem also re-reads
             // whenever the app becomes active, for a window left open).
             loginItem.refresh()
         }
+        // The failover may find the saved password unreadable while the
+        // window is open, and an SSID edit makes the notice about another
+        // hotspot's item: the notice follows both.
+        .onChange(of: manager.services?.status.hotspotPasswordReport) { recheckPassword() }
+        .onChange(of: HotspotSSID.normalized(manager.config.hotspotSSID)) { recheckPassword() }
         // The preview depends on the toggle, both lists and what is running:
         // recompute on any config change and whenever an app launches or quits.
         .onChange(of: manager.config) { refreshWouldFreeze() }
@@ -144,8 +150,22 @@ struct SettingsView: View {
         newPreset = ""
     }
 
+    /// Under the mute toggle and in the README. Apple Platform Security,
+    /// "Hardware microphone disconnect".
+    static let microphoneNote = "On Mac laptops with Apple silicon or a T2 chip, closing the lid disconnects the built-in microphone in hardware. Recording a meeting with the lid closed needs AirPods or an external mic."
+
     private var lidSection: some View {
         Section {
+            // The one-time lid-close update, for a user who has
+            // notifications turned off. Stays until dismissed.
+            if let notice = manager.config.lidCloseDefaultsNotice {
+                HStack(alignment: .firstTextBaseline) {
+                    Text(notice.settingsLine)
+                        .font(.callout)
+                    Spacer()
+                    Button("Dismiss") { manager.dismissLidCloseNotice() }
+                }
+            }
             Toggle("Turn off the display and keyboard backlight", isOn: bind(\.darkenDisplayOnLidClose))
             ForEach(manager.darkenRefusals, id: \.self) { reason in
                 Text(reason)
@@ -164,14 +184,20 @@ struct SettingsView: View {
                 .font(.callout)
                 .foregroundStyle(.secondary)
             Toggle("Pause Docker Desktop when no containers are running", isOn: bind(\.dockerRule))
+            Text("Off by default. When on, Docker Desktop is paused only if a second check right before the pause still finds no running container; a container that starts in that last moment is paused with it.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
             Toggle("Mute audio on lid close", isOn: bind(\.muteOnLidClose))
+            Text(Self.microphoneNote)
+                .font(.callout)
+                .foregroundStyle(.secondary)
             Toggle("Low Power Mode while the lid is closed", isOn: bind(\.lowPowerOnLidClose))
                 // A floor input: apply it now if the lid is already closed.
                 .onChange(of: manager.config.lowPowerOnLidClose) { manager.services?.reevaluateFloors() }
         } header: {
             Text("Lid-close actions")
         } footer: {
-            Text("Apps on the list above are stopped with SIGSTOP while the lid is closed and resumed when it opens. With \"Freeze every other app\" on (off by default), every other Dock app is stopped too, except agent apps, Apple apps, Docker Desktop and built-in protected apps (editors, terminals, browsers, AI apps, password managers, local databases, Tailscale, local model servers). Agent apps are never frozen. The display brightness and keyboard backlight are saved, set to zero and restored when the lid opens. If Insomnia is not running when you open the lid, press the brightness-up key.")
+            Text("Apps on the list above are stopped with SIGSTOP while the lid is closed and resumed when it opens. With \"Freeze every other app\" on (off by default), every other Dock app is stopped too, except agent apps, Apple apps, Docker Desktop and built-in protected apps (editors, terminals, browsers, AI apps, password managers, local databases, Tailscale, local model servers, and meeting, recording and dictation apps such as Zoom, Teams, Webex, Wispr Flow, Granola, Otter, OBS and Loom). Agent apps are never frozen. The display brightness and keyboard backlight are saved, set to zero and restored when the lid opens. If Insomnia is not running when you open the lid, press the brightness-up key.")
         }
     }
 
@@ -191,7 +217,7 @@ struct SettingsView: View {
         } header: {
             Text("Agent apps")
         } footer: {
-            Text("Agent apps are never frozen or throttled. Editors, AI apps, terminals, browsers, password managers, local databases, Tailscale and local model servers are also protected from the automatic lid-close scope even when they are not listed here; adding one to the freeze list above overrides that.")
+            Text("Agent apps are never frozen or throttled. Editors, AI apps, terminals, browsers, password managers, local databases, Tailscale, local model servers, and meeting, recording and dictation apps are also protected from the automatic lid-close scope even when they are not listed here; adding one to the freeze list above overrides that.")
         }
     }
 
@@ -225,10 +251,13 @@ struct SettingsView: View {
         Section {
             TextField("Hotspot SSID", text: bind(\.hotspotSSID))
             HStack {
-                SecureField("Hotspot password", text: $hotspotPassword)
+                SecureField("Hotspot password", text: Binding(get: { hotspot.password }, set: { hotspot.edit($0) }))
                     .onSubmit(savePassword)
-                Button(hotspotSaved ? "Saved" : "Save", action: savePassword)
-                    .disabled(hotspotPassword.isEmpty)
+                Button(hotspot.buttonTitle(ssid: manager.config.hotspotSSID), action: savePassword)
+                    .disabled(hotspot.password.isEmpty || hotspot.saving)
+            }
+            if let notice = hotspot.notice {
+                Text(notice).font(.caption).foregroundStyle(.orange)
             }
             VStack(alignment: .leading, spacing: 2) {
                 HStack {
@@ -279,7 +308,7 @@ struct SettingsView: View {
         } header: {
             Text("Network failover")
         } footer: {
-            Text("The password is kept in the login keychain. Location permission lets macOS reveal Wi-Fi network names and find the configured hotspot.")
+            Text("The password is kept in the login keychain, readable without a prompt only by the build of Insomnia that saved it; after a reinstall, enter it again. Location permission lets macOS reveal Wi-Fi network names and find the configured hotspot.")
         }
     }
 
@@ -290,19 +319,152 @@ struct SettingsView: View {
         )
     }
 
+    /// Fills the field when the window appears (`loadForField`).
+    private func loadPassword() {
+        let request = hotspot.startLoad(ssid: manager.config.hotspotSSID)
+        Task {
+            await Self.loadForField(request, secrets: secrets) {
+                hotspot.finishRead($0, ssid: manager.config.hotspotSSID, password: $1.password, notice: $1.notice)
+            }
+        }
+    }
+
+    /// Reads the notice again for the hotspot configured now, without a
+    /// prompt and without touching the field.
+    private func recheckPassword() {
+        recheckPassword(hotspot.startRead(ssid: manager.config.hotspotSSID))
+    }
+
+    private func recheckPassword(_ request: HotspotPasswordField.Read) {
+        Task {
+            await Self.readForField(
+                request,
+                first: { await recheckedNotice() },
+                again: { await recheckedNotice() },
+                finish: { hotspot.finishRead($0, ssid: manager.config.hotspotSSID, password: $1.password, notice: $1.notice) }
+            )
+        }
+    }
+
+    private func recheckedNotice() async -> (password: String, notice: String?) {
+        let notice = await Self.hotspotNotice(
+            reported: manager.services?.status.hotspotPasswordReport,
+            ssid: manager.config.hotspotSSID,
+            reread: secrets.peek
+        )
+        return ("", notice)
+    }
+
+    /// Loads the saved password into the field, without a keychain prompt.
+    /// An item this build may not read leaves the field empty and says
+    /// why, so the user re-enters it; saving then replaces the item (see
+    /// `KeychainStore`). The read can wait behind a save, so a field
+    /// edited meanwhile is kept, even one typed in and emptied again, and
+    /// a password read for an SSID edited away meanwhile is not shown: the
+    /// SSID configured now is read instead. That read is a peek: the
+    /// account a later save moves the password from stays the one the
+    /// window loaded, as it does for any SSID edit, so the old SSID's item
+    /// is still removed.
+    static func loadForField(
+        _ request: HotspotPasswordField.Read,
+        secrets: any HotspotSecretStore,
+        finish: @MainActor (HotspotPasswordField.Read, (password: String, notice: String?)) -> HotspotPasswordField.ReadAnswer
+    ) async {
+        await readForField(
+            request,
+            first: { await loadedPassword(secrets.load) },
+            again: { await loadedPassword(secrets.peek) },
+            finish: finish
+        )
+    }
+
+    /// Runs a load or recheck for the field: `first` reads, and `finish`
+    /// takes the answer. While the SSID was edited during the read,
+    /// `finish` drops the answer, and `again` reads the SSID configured
+    /// now, until an answer is used or dropped.
+    static func readForField(
+        _ request: HotspotPasswordField.Read,
+        first: @MainActor () async -> (password: String, notice: String?),
+        again: @MainActor () async -> (password: String, notice: String?),
+        finish: @MainActor (HotspotPasswordField.Read, (password: String, notice: String?)) -> HotspotPasswordField.ReadAnswer
+    ) async {
+        var answer = await first()
+        var request = request
+        while case let .readAgain(next) = finish(request, answer) {
+            request = next
+            answer = await again()
+        }
+    }
+
+    /// A prompt-free load: the password for the field, or an empty field
+    /// and a notice saying why it cannot be shown.
+    static func loadedPassword(_ load: () async throws -> String?) async -> (password: String, notice: String?) {
+        do {
+            return (try await load() ?? "", nil)
+        } catch let error as KeychainError {
+            return ("", error.problem.settingsNotice)
+        } catch {
+            return ("", HotspotPasswordProblem.error(error.localizedDescription).settingsNotice)
+        }
+    }
+
+    /// The notice under the password field for the hotspot `ssid`
+    /// configured now. A problem the failover reports about that hotspot
+    /// shows as it is. A report about another SSID, one edited away since,
+    /// does not apply, and a cleared report is not taken as "readable": it
+    /// also clears when the session ends. Then the keychain is read again,
+    /// without a prompt, and the notice says what that read finds. The
+    /// field is left as the user has it, and the reread is a peek: a load
+    /// would make an SSID typed since then the account a save moves the
+    /// password from, and the old SSID's item would stay behind.
+    static func hotspotNotice(reported: HotspotPasswordReport?, ssid: String, reread: () async throws -> String?) async -> String? {
+        if let problem = reported?.problem(for: ssid) { return problem.settingsNotice }
+        return await loadedPassword(reread).notice
+    }
+
+    /// Saves, or clears for an empty field. The button shows "Saving..."
+    /// until the keychain answers; one save at a time.
     private func savePassword() {
-        if !manager.config.hotspotSSID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        guard hotspot.startSave() else { return }
+        if !HotspotSSID.normalized(manager.config.hotspotSSID).isEmpty {
             locationPermission.requestWhenInUse()
         }
+        let password = hotspot.password
+        Task {
+            let outcome = await Self.storePassword(password, in: secrets)
+            let recheck = hotspot.finishSave(outcome, ssid: manager.config.hotspotSSID)
+            // The failover's report first, so the recheck reads it as the
+            // save left it.
+            Self.passwordStored(outcome, configuredSSID: manager.config.hotspotSSID, services: manager.services)
+            if let recheck { recheckPassword(recheck) }
+        }
+    }
+
+    /// A save or clear answered. The failover's report goes, and the next
+    /// outage notifies afresh, unless the report is about the hotspot
+    /// configured now and the save neither stored for it nor removed its
+    /// item (`HotspotPasswordReport.stands`).
+    static func passwordStored(_ outcome: HotspotStoreOutcome, configuredSSID: String, services: AppServices?) {
+        guard case let .stored(stored) = outcome else { return }
+        services?.hotspotPasswordChanged(stored.change, configuredSSID: configuredSSID)
+    }
+
+    /// Saves `password`, or clears the saved one when it is empty, and
+    /// returns what was stored under which SSID and which loaded account
+    /// it removed, or the notice for a failure. The store does the keychain work on `KeychainQueue`, so a
+    /// save waiting on a keychain dialog waits there while the main actor
+    /// (the battery floor, the deadline timer, End) carries on.
+    static func storePassword(_ password: String, in secrets: any HotspotSecretStore) async -> HotspotStoreOutcome {
         do {
-            if hotspotPassword.isEmpty {
-                try secrets.delete()
+            let change = if password.isEmpty {
+                try await secrets.delete()
             } else {
-                try secrets.save(hotspotPassword)
+                try await secrets.save(password)
             }
-            hotspotSaved = true
+            return .stored(.init(ssid: change.ssid, password: password, removed: change.removed))
         } catch {
             Log.error("could not save hotspot password: \(error.localizedDescription)")
+            return .failed(notice: "Could not save the hotspot password: \(error.localizedDescription)")
         }
     }
 

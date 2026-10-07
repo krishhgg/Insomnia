@@ -38,6 +38,27 @@ final class StatusMenuWarningTests: XCTestCase {
         XCTAssertEqual(items[0].title, "\u{26A0} \(SessionManager.foreignSleepLine)")
     }
 
+    /// The hotspot password line, the session error and the foreign-sleep
+    /// line can all be up at once. Each keeps its own line, in that order.
+    func testHotspotErrorAndForeignSleepLinesKeepTheirOrder() {
+        let items = StatusMenu.items(
+            sessionActive: false,
+            sleepHeld: false,
+            machine: nil,
+            actions: nil,
+            throttledBrowsers: [],
+            hotspotWarning: HotspotPasswordProblem.unreadable.menuLine,
+            error: "sudo: a password is required",
+            foreignSleep: SessionManager.foreignSleepLine
+        )
+        XCTAssertEqual(items.map(\.kind), [.warning, .warning, .warning, .separator, .settings, .quit])
+        XCTAssertEqual(items.prefix(3).map(\.title), [
+            HotspotPasswordProblem.unreadable.menuLine,
+            "\u{26A0} sudo: a password is required",
+            "\u{26A0} \(SessionManager.foreignSleepLine)",
+        ])
+    }
+
     func testBlankForeignSleepLineIsDropped() {
         let items = StatusMenu.items(
             sessionActive: false,
@@ -51,6 +72,36 @@ final class StatusMenuWarningTests: XCTestCase {
         XCTAssertEqual(items.map(\.kind), [.settings, .quit])
     }
 
+    /// The sudo pmset left running has its own line, above an unrelated
+    /// error, so its exit can remove it and leave the error in place.
+    func testCommandLineIsShownAboveTheLastError() {
+        let command = "`/usr/bin/sudo -n /usr/bin/pmset lowpowermode 1` (pid 4242) did not stop on SIGTERM; Insomnia holds the recovery lock and will not quit until it exits (sudo kill 4242 to stop it by hand)"
+        let items = StatusMenu.items(
+            sessionActive: false,
+            sleepHeld: false,
+            machine: nil,
+            actions: nil,
+            throttledBrowsers: [],
+            error: "could not remove session.json: permission denied",
+            commandRunning: command
+        )
+        XCTAssertEqual(items.map(\.kind), [.warning, .warning, .separator, .settings, .quit])
+        XCTAssertEqual(items[0].title, "\u{26A0} \(command)")
+        XCTAssertEqual(items[1].title, "\u{26A0} could not remove session.json: permission denied")
+
+        let afterExit = StatusMenu.items(
+            sessionActive: false,
+            sleepHeld: false,
+            machine: nil,
+            actions: nil,
+            throttledBrowsers: [],
+            error: "could not remove session.json: permission denied",
+            commandRunning: nil
+        )
+        XCTAssertEqual(afterExit.map(\.kind), [.warning, .separator, .settings, .quit])
+        XCTAssertEqual(afterExit[0].title, "\u{26A0} could not remove session.json: permission denied")
+    }
+
     /// The relaunch entry holds the browser itself, not just its name, so
     /// the click hands on the bundle id the menu was built with. Builds the
     /// NSMenu only; nothing is shown.
@@ -62,10 +113,38 @@ final class StatusMenuWarningTests: XCTestCase {
             target: nil,
             settings: #selector(NSObject.description),
             quit: #selector(NSObject.description),
-            relaunchBrowser: #selector(NSObject.description)
+            relaunchBrowser: #selector(NSObject.description),
+            stopWaitingForOutput: #selector(NSObject.description)
         )
         let entry = menu.items.first { $0.title == "Relaunch Arc unthrottled" }
         XCTAssertEqual(entry?.representedObject as? ThrottledBrowser, arc)
+    }
+
+    /// Each output device still muted from a lid close gets a warning line
+    /// and a live item that carries the save the menu showed, its save ID
+    /// included, so the click drops that save and no later one. Builds the
+    /// NSMenu only.
+    func testEachWaitingOutputHasALineAndAStopWaitingItem() {
+        let headset = SavedAudioOutput(deviceUID: "usb-headset", name: "USB Headset", volume: 0.3, muted: false, saveID: "save-2")
+        let unnamed = SavedAudioOutput(deviceUID: "70-8C-F2:output", name: nil, volume: 0.5, muted: false, saveID: nil)
+        let items = StatusMenu.items(sessionActive: false, sleepHeld: false, machine: nil, actions: nil, throttledBrowsers: [], error: nil, outputsWaiting: [headset, unnamed])
+        XCTAssertEqual(Array(items.prefix(4)), [
+            StatusMenu.Item(title: "\u{26A0} USB Headset is still muted from a lid close; Insomnia restores it when it reconnects", kind: .warning),
+            StatusMenu.Item(title: "Stop waiting for USB Headset", kind: .stopWaitingForOutput(headset)),
+            StatusMenu.Item(title: "\u{26A0} 70-8C-F2:output is still muted from a lid close; Insomnia restores it when it reconnects", kind: .warning),
+            StatusMenu.Item(title: "Stop waiting for 70-8C-F2:output", kind: .stopWaitingForOutput(unnamed)),
+        ])
+        let menu = StatusMenu.menu(
+            items,
+            target: nil,
+            settings: #selector(NSObject.description),
+            quit: #selector(NSObject.description),
+            relaunchBrowser: #selector(NSObject.description),
+            stopWaitingForOutput: #selector(NSObject.description)
+        )
+        let entry = menu.items.first { $0.title == "Stop waiting for USB Headset" }
+        XCTAssertEqual(entry?.representedObject as? SavedAudioOutput, headset)
+        XCTAssertEqual(entry?.isEnabled, true)
     }
 
     /// The reasons relaunches stopped short, one line per browser, follow

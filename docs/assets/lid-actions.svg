@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1000" height="460" viewBox="0 0 1000 460" role="img" aria-labelledby="la-title la-desc">
   <title id="la-title">Insomnia lid actions during a session</title>
-  <desc id="la-desc">A simplified three-column diagram. Left, an illustrated Settings excerpt titled Lid-close actions: the freeze list contains Slack, WhatsApp and Discord; Pause idle Docker is on; Mute audio is off. Arrows lead to the middle column, Lid closes: freeze selected apps, pause idle Docker, mute if enabled. Docker is paused only if a check finds no containers running, and a container that is still starting can slip past that check. Muting saves your volume first. An arrow leads to the right column, Lid opens: try to restore, session continues. Insomnia resumes only the freezes it can verify it made, resumes Docker only if this rule paused it, and restores the saved volume. The timer never stopped; only its on-screen redraw paused. This repeats every time the lid closes and opens. Without an active session the lid does nothing. The Settings panel is a simplified illustration, not a screenshot.</desc>
+  <desc id="la-desc">A simplified three-column diagram. Left, an illustrated Settings excerpt titled Lid-close actions: the freeze list contains Slack, WhatsApp and Discord; Pause idle Docker is off; Mute audio is on. Arrows lead to the middle column, Lid closes: freeze selected apps, pause idle Docker, mute if enabled. Docker is paused only if the rule is on and two checks, the second right before the pause, find no containers running; a container that is still starting can slip past the second check. Muting saves your volume first. An arrow leads to the right column, Lid opens: try to restore, session continues. Insomnia resumes only the freezes it can verify it made, resumes Docker only if this rule paused it, and restores the saved volume. The timer never stopped; only its on-screen redraw paused. This repeats every time the lid closes and opens. Without an active session the lid does nothing. The Settings panel is a simplified illustration, not a screenshot.</desc>
   <style>
     svg { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Helvetica, Arial, sans-serif; }
     .bg { fill: #F3F2EF; }
@@ -77,15 +77,15 @@
 
     <path class="sep" d="M52 250 H312"/>
 
-    <!-- Docker toggle: on -->
+    <!-- Docker toggle: off -->
     <text class="t" x="52" y="290" font-size="19">Pause idle Docker</text>
-    <rect class="on" x="260" y="268" width="52" height="30" rx="15"/>
-    <circle class="knob" cx="297" cy="283" r="12"/>
+    <rect class="off" x="260" y="268" width="52" height="30" rx="15"/>
+    <circle class="knob" cx="275" cy="283" r="12"/>
 
-    <!-- Mute toggle: off -->
+    <!-- Mute toggle: on -->
     <text class="t" x="52" y="348" font-size="19">Mute audio</text>
-    <rect class="off" x="260" y="326" width="52" height="30" rx="15"/>
-    <circle class="knob" cx="275" cy="341" r="12"/>
+    <rect class="on" x="260" y="326" width="52" height="30" rx="15"/>
+    <circle class="knob" cx="297" cy="341" r="12"/>
   </g>
   <text class="m" x="32" y="406" font-size="17">Simplified Settings</text>
 

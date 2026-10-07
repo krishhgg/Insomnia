@@ -991,8 +991,8 @@ final class RefusedDarkeningTests: XCTestCase {
 
     /// With no session, a re-read finds the display still at 0 and its
     /// write fails. The cleared flag makes it an ordinary failed restore,
-    /// and the re-read ends as for a dirty journal, so the agent is armed
-    /// for it and told to retry.
+    /// and the re-read ends as for a dirty journal: the agent is armed and
+    /// counts it dirty, and the notice says only the app can restore it.
     func testAReReadWhoseWriteFailsHandsTheEntryToTheAgent() async throws {
         var st = RuntimeState()
         st.savedDisplayBrightness = 0.8
@@ -1018,7 +1018,8 @@ final class RefusedDarkeningTests: XCTestCase {
         XCTAssertFalse(after.displayRestoreRefused)
         XCTAssertTrue(after.isDirty)
         let body = try XCTUnwrap(h.notifier.posts.last { $0.title == SessionManager.incompleteTitle }?.body)
-        XCTAssertTrue(body.contains("The recovery agent retries every minute"), body)
+        XCTAssertTrue(body.contains(SessionManager.brightnessRetrySentence), body)
+        XCTAssertFalse(body.contains("The recovery agent retries every minute"), body)
         XCTAssertTrue(logText().contains("brightness re-check: a kept value failed to restore; ending as for a dirty journal"), logText())
     }
 
