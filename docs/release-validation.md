@@ -130,6 +130,10 @@ is performed. Do not replace "not run" with "passed" based on source review.
 | Lid-close display/keyboard darkening and restore | Not run |
 | Freeze-all scope with agents running (Cursor/T3 Code/Claude untouched) | Not run |
 | Freeze-all off on a fresh config.json (list only) and on with a terminal, a non-Chrome browser and a JetBrains IDE open (all untouched) | Not run |
+| Real lid close with freeze-all on during a Zoom or Teams call on AirPods, with Wispr Flow or Granola taking notes: none of their processes stopped (`ps -o stat` shows no `T`), the call and the notes continue, other Dock apps frozen, sound muted | Not run |
+| Upgrade notice: install over a build whose config.json has `freezeAllApps: true` and `muteOnLidClose: false`; the first launch posts one "Lid-close settings changed" notification and shows the same line in Settings (also with notifications off for Insomnia), both settings change and config.json gets `lidCloseDefaultsApplied: true`; a setting turned back stays back after a relaunch with no second notice; Dismiss removes the line; a fresh install shows no notice | Not run |
+| Mute with a changing output: close the lid on AirPods, put them in the case so the speakers take over, open the lid; the speakers keep their volume and mute and the AirPods are unmuted when reconnected. Close the lid again on the speakers while the AirPods are still away: the speakers are muted too, and the next lid open restores them | Not run |
+| Output away at session end: close the lid on AirPods, put them in the case, choose End; sleep is restored, the notification and the menu say the AirPods are still muted. Take them out with Insomnia running: their volume comes back and the menu line goes. Again with Quit instead of End, then launch Insomnia with the AirPods connected: restored at launch. "Stop waiting for AirPods" drops the entry and leaves them muted; uninstall stops while one is waiting | Not run |
 | Lid close with a freeze-list app stopped beforehand by `kill -STOP` (left stopped on lid open, not in the journal) | Not run |
 | Lid close during a session after `chflags uchg` on state.json (mode 0444 is not enough: the app writes a new file and renames it over state.json, and rename needs write access only to the folder): no process stopped, every app logged as left running; `chflags nouchg` before lid open | Not run |
 | Simulated lid close/open via scripts/simulate-lid.sh on a build installed with `INSOMNIA_LID_SIMULATION=1 ./scripts/install.sh` (the launch log, status menu and Settings show "Lid simulation build") | Not run |
@@ -148,10 +152,21 @@ is performed. Do not replace "not run" with "passed" based on source review.
 | Relaunch unthrottled: confirmation alert, profile arguments carried over, a browser that has not quit after 10 s is left as it is and the notification names it, a browser not running 5 s after `open` is reported | Not run |
 | Relaunch failure while Insomnia is frontmost: with notifications allowed, the "Browser not relaunched" banner shows without switching apps after the confirmation; with notifications off for Insomnia, the reason is a warning line in the right-click menu | Not run |
 | Battery/thermal event behavior on supported hardware | Not run |
+| A `sudo pmset` that ignores SIGTERM: left running, lock held, journal intact, quit refused until it exits | Not run |
+| The same command with the app force-quit: the backstop does not take the lock until the command exits; the relaunch names the pid from `unfinished-command.json`, and at its next retry after the command exits (retries start 30 s after each refusal) resumes the session with its battery floors | Not run |
+| A left-running `disablesleep 0` that exits 0: the end finishes without running it again | Not run |
+| After that command exits: Low Power Mode ownership matches the mode, and a lid open made meanwhile is undone | Not run |
 | `SleepDisabled 1` set by hand with no session: left alone and reported at launch, not cleared | Not run |
 | Unreadable battery (IOKit miss) ends the session on a laptop after the second read; desktop unaffected | Not run |
 | Settings floor steppers keep the end floor below the Low Power Mode floor by moving the other stepper | Not run |
 | Install/upgrade/uninstall with recoverable failure conditions | Not run |
+| Recovery agent refuses to run after the installed bundle or its sealed backstop.sh is modified, and logs why | Not run |
+| Running app refuses to arm (session start refused, reason shown) after its installed bundle is edited or re-signed under it | Not run |
+| Upgrade whose new agent fails to load puts the previous bundle back and reloads the previous agent, on a working Mac | Not run |
+| Upgrade whose new agent plist cannot be saved, and a rerun after an install killed mid-swap, leave the app and the agent's plist matching, on a working Mac | Not run |
+| Upgrade whose bundle rename is refused (the new build cannot be moved in, or the previous app cannot be moved back) puts the previous app back and reloads its agent, or keeps both bundles and prints the commands, on a working Mac | Not run |
+| Install whose `sudo -n -l` check or `launchctl` call stalls while it holds the recovery lock (for example a directory-service lookup that does not answer) stops after 30 s and releases the lock, and the agent's next run can take it, on a working Mac | Not run |
+| Install or uninstall whose own process is killed (`kill -9 <pid>`) during a `launchctl bootout` keeps the recovery lock until that bootout has ended or been stopped, about 33 s at most, and the app started afterwards keeps its agent loaded, on a working Mac | Not run |
 | First launch over an existing install tightens Application Support/Insomnia and Logs/Insomnia to 0700 and their files to 0600 | Not run |
 | Launch at login survives a reinstall by install.sh, including a second install.sh run on the same unchanged build (switch on, reinstall, relaunch: the log shows the launch-time check, System Settings > General > Login Items lists Insomnia as enabled, and the Settings switch reads on; a pending approval shows the note and the Open Login Items button) | Not run |
 | Launch at login heals on the first upgrade from a build without the install record (switch on in the previous build, upgrade with install.sh, relaunch: the log shows "registering once and recording the install", Login Items lists Insomnia, and config.json has `launchAtLoginInstall`) | Not run |
@@ -165,10 +180,16 @@ machine to validate thermal handling; exercise injected thermal events first.
 
 Launchd sequencing tests use a fake command runner. Actual bootstrap of the
 private candidate plist, login loading, and crash recovery must still be
-checked on the supported macOS release. Installer tests redirect every app,
-LaunchAgent, sudoers, and command target into a temporary fixture. Real build,
-signing, privileged installation, and quit refusal by a running app have not
-been exercised as an end-to-end installation on a working Mac.
+checked on the supported macOS release. PackagingTests run the agent's
+verify-then-exec command line against a scratch ad-hoc bundle with the real
+codesign: an intact bundle runs its sealed script, and an edited script or
+another build's requirement is refused and logged. Whether launchd runs that
+command line as installed, and whether the installed app's plist is the one
+install.sh wrote, has not been checked on a working Mac. Installer tests
+redirect every app, LaunchAgent, sudoers, and command target into a temporary
+fixture. Real build, signing, privileged installation, and quit refusal by a
+running app have not been exercised as an end-to-end installation on a
+working Mac.
 
 ## Distribution boundary
 

@@ -3,6 +3,16 @@
 # Runs from launchd (RunAtLoad + StartInterval 60, installed by install.sh)
 # and from install.sh / uninstall.sh. Needs no Insomnia process and no Swift.
 #
+# Where it lives: install.sh copies this file into the app bundle at
+# Insomnia.app/Contents/Resources/backstop.sh before signing the bundle, so
+# the signature's resource seal covers it. The LaunchAgent's command line
+# runs `codesign --verify --strict` on the bundle against the requirement
+# pinned in the plist (for an ad-hoc build, the cdhash of that build) and
+# execs this file only when that passes; an edited copy makes the check fail
+# and the agent logs one line and runs nothing. Nothing executable is kept in
+# Application Support (installs before this layout ran a writable copy from
+# there; install.sh removes it once the new agent is loaded).
+#
 # Every run is one transaction under APP_SUPPORT/.recovery.lock, an flock(2)
 # exclusive lock on the same file the app locks: read session.json and
 # state.json, decide, undo, publish the new journal atomically, release. If
@@ -51,7 +61,8 @@
 #     record cannot be written either, sleep is still restored but its
 #     journal entry stays, and the run exits 1.
 #   - state.json missing or clean: nothing is undone and nothing privileged
-#     runs; an expired session.json is removed. Exit 0.
+#     runs; an expired session.json is removed. Exit 0. Entries in
+#     savedAudioOutputs alone count as clean (see below).
 #   - state.json dirty: undo each journaled entry from the journal alone:
 #       sleepDisabledByUs   -> sudo -n pmset -a disablesleep 0
 #       lowPowerSetByUs     -> sudo -n pmset -b lowpowermode 0
@@ -90,6 +101,16 @@
 #                              process is ours. Only the app resolves them.
 #       savedOutputVolume / savedMuted -> CoreAudio; only the app can restore
 #                              these. Kept for the app's reconcile.
+#       savedAudioOutputs   -> CoreAudio volume and mute of each output
+#                              device a lid close muted, by device UID; only
+#                              the app can restore these, and only while the
+#                              device is connected. Kept for the app, and on
+#                              their own they leave the journal clean: an
+#                              entry can wait days for its device, the app's
+#                              menu shows it, and an error every minute here
+#                              would only fill the log. They are logged once
+#                              when this run removes a session or undoes
+#                              something else.
 #       savedDisplayBrightness / savedKeyboardBrightness -> display brightness
 #                              and keyboard backlight the app set to 0 on lid
 #                              close; only the app can restore these (private
@@ -520,6 +541,29 @@ journal_shape_problems() { # file
       done
     fi
   fi
+  t="$(type_of "$f" savedAudioOutputs)"
+  if [[ -n "$t" && "$t" != "(any)" ]]; then
+    if [[ "$t" != array ]]; then
+      echo "savedAudioOutputs is a $t, not an array"
+    else
+      i=0
+      while [[ -n "$(type_of "$f" "savedAudioOutputs.$i")" ]]; do
+        if [[ "$(type_of "$f" "savedAudioOutputs.$i")" != dictionary ]]; then
+          echo "savedAudioOutputs[$i] is not an object"
+        else
+          [[ "$(type_of "$f" "savedAudioOutputs.$i.deviceUID")" == string ]] || echo "savedAudioOutputs[$i].deviceUID is not a string"
+          t="$(type_of "$f" "savedAudioOutputs.$i.volume")"
+          [[ "$t" == float || "$t" == integer ]] || echo "savedAudioOutputs[$i].volume is not a number"
+          [[ "$(type_of "$f" "savedAudioOutputs.$i.muted")" == bool ]] || echo "savedAudioOutputs[$i].muted is not a bool"
+          t="$(type_of "$f" "savedAudioOutputs.$i.name")"
+          [[ -z "$t" || "$t" == string || "$t" == "(any)" ]] || echo "savedAudioOutputs[$i].name is a $t, not a string"
+          t="$(type_of "$f" "savedAudioOutputs.$i.saveID")"
+          [[ -z "$t" || "$t" == string || "$t" == "(any)" ]] || echo "savedAudioOutputs[$i].saveID is a $t, not a string"
+        fi
+        i=$((i + 1))
+      done
+    fi
+  fi
   t="$(type_of "$f" appNapOverrides)"
   if [[ -n "$t" && "$t" != "(any)" ]]; then
     if [[ "$t" != array ]]; then
@@ -934,7 +978,7 @@ fi
 
 sleep_held=false; low_power=false; docker_frozen=false; has_audio=0
 has_display=0; has_keyboard=0
-frozen_count=0; legacy_count=0; app_nap_count=0
+frozen_count=0; legacy_count=0; app_nap_count=0; output_count=0
 if [[ "$journal_state" == clean ]]; then
   is_true "$STATE" sleepDisabledByUs && sleep_held=true
   is_true "$STATE" lowPowerSetByUs && low_power=true
@@ -951,6 +995,10 @@ if [[ "$journal_state" == clean ]]; then
   done
   while extract_json "$STATE" "appNapOverrides.$app_nap_count" >/dev/null; do
     app_nap_count=$((app_nap_count + 1))
+  done
+  # Kept for the app and not counted as dirty; see the header.
+  while extract_json "$STATE" "savedAudioOutputs.$output_count" >/dev/null; do
+    output_count=$((output_count + 1))
   done
   if [[ "$sleep_held" == true || "$low_power" == true || "$docker_frozen" == true ]] \
      || (( has_audio == 1 || has_display == 1 || has_keyboard == 1 || frozen_count > 0 || legacy_count > 0 || app_nap_count > 0 )); then
@@ -1000,8 +1048,13 @@ case "$session_state" in
   unreadable) session_note="session.json cannot be read ($unreadable_why), so its end time is unknown; treated as expired" ;;
 esac
 
+outputs_note="saved audio for $output_count output device(s), kept for the app, which restores each once it is connected"
+
 if [[ "$journal_state" != dirty ]]; then
   # Nothing journaled: nothing to undo, and nothing privileged runs.
+  if [[ "$session_state" != none ]] && (( output_count > 0 )); then
+    log info "journal clean apart from $outputs_note"
+  fi
   if [[ "$session_state" == unreadable ]]; then
     log info "$session_note; nothing journaled to undo"
   fi
@@ -1424,7 +1477,11 @@ if [[ "$session_state" == valid ]] && (( session_left == 1 )); then
   log error "journal cleared, but $SESSION could not be removed; will retry on the next run"
   exit 1
 fi
-log info "journal cleared"
+if (( output_count > 0 )); then
+  log info "journal cleared apart from $outputs_note"
+else
+  log info "journal cleared"
+fi
 case "$session_state" in
   malformed|unreadable) quarantine_session || exit 1 ;;
   valid)                ;;

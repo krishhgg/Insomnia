@@ -83,6 +83,35 @@ struct AppNapOverride: Codable, Equatable, Hashable, Sendable {
     }
 }
 
+/// One output device lid close muted, and its volume and mute before
+/// (spec section 4). Restored on that device only, never on another
+/// output; kept while the device is not connected. `name` is for the
+/// warning that names a device still waiting, and left out of the JSON
+/// when it could not be read. `saveID` is drawn afresh by each lid close
+/// that writes an entry, so a later save for the same device, with the
+/// same values or not, is never taken for this one, whichever copy of the
+/// app wrote it. nil, and left out of the JSON, in an entry written
+/// before entries had one. Flat keys so backstop.sh can check them with
+/// plutil.
+struct SavedAudioOutput: Codable, Equatable, Hashable, Sendable {
+    let deviceUID: String
+    let name: String?
+    let volume: Float
+    let muted: Bool
+    let saveID: String?
+
+    init(deviceUID: String, name: String?, volume: Float, muted: Bool, saveID: String?) {
+        self.deviceUID = deviceUID
+        self.name = name
+        self.volume = volume
+        self.muted = muted
+        self.saveID = saveID
+    }
+
+    /// The name, or the UID when the name could not be read.
+    var label: String { name ?? deviceUID }
+}
+
 /// Everything Insomnia has changed on the machine and must undo.
 /// Written to disk *before* each change is made and undone from disk, never
 /// from memory (spec section 8 invariants).
@@ -91,7 +120,12 @@ struct RuntimeState: Codable, Equatable, Sendable {
     var lowPowerSetByUs: Bool = false
     var frozenProcesses: [FrozenProcess] = []
     var dockerFrozen: Bool = false
-    /// nil when mute is off or the lid is open.
+    /// Output devices lid close muted, one entry per device, each restored
+    /// on its own device. Empty when mute is off or nothing is owed.
+    var savedAudioOutputs: [SavedAudioOutput] = []
+    /// The entry an earlier build wrote, without the device: restored on
+    /// the default output, as that build did. Never written by a lid close
+    /// now; nil once restored.
     var savedOutputVolume: Float? = nil
     var savedMuted: Bool? = nil
     /// Built-in display brightness (0...1) before the lid close set it to 0;
@@ -118,6 +152,16 @@ struct RuntimeState: Codable, Equatable, Sendable {
     /// A state with nothing left to undo.
     static let clean = RuntimeState()
 
+    /// The undo entries alone: the state without
+    /// `displayRestoredUnderLowPower`, a write owed after the mode rather
+    /// than something to undo. Two states with equal entries owe the same
+    /// undos.
+    var undoEntries: RuntimeState {
+        var entries = self
+        entries.displayRestoredUnderLowPower = nil
+        return entries
+    }
+
     /// True when at least one entry still needs undoing.
     var isDirty: Bool {
         sleepDisabledByUs || lowPowerSetByUs || hasLidActions || !appNapOverrides.isEmpty
@@ -127,12 +171,35 @@ struct RuntimeState: Codable, Equatable, Sendable {
     /// the Docker marker, saved audio, saved display or keyboard brightness.
     var hasLidActions: Bool {
         !frozenProcesses.isEmpty || dockerFrozen
-            || savedOutputVolume != nil || savedMuted != nil
+            || !savedAudioOutputs.isEmpty || savedOutputVolume != nil || savedMuted != nil
             || savedDisplayBrightness != nil || savedKeyboardBrightness != nil
     }
 
+    /// `isDirty` with the saved audio of these output devices left out. A
+    /// device that is not connected does not hold up the end of a session:
+    /// its entry stays for when it reconnects.
+    func isDirty(leavingOutAudioOf devices: Set<String>) -> Bool {
+        var rest = self
+        rest.savedAudioOutputs.removeAll { devices.contains($0.deviceUID) }
+        return rest.isDirty
+    }
+
+    /// `isDirty` with every saved output volume, display brightness and
+    /// keyboard backlight left out: the recovery agent keeps those but only
+    /// the app can restore them (CoreAudio, private frameworks).
+    var isDirtyApartFromAppOnlyEntries: Bool {
+        var rest = self
+        rest.savedAudioOutputs = []
+        rest.savedOutputVolume = nil
+        rest.savedMuted = nil
+        rest.savedDisplayBrightness = nil
+        rest.savedKeyboardBrightness = nil
+        return rest.isDirty
+    }
+
     private enum CodingKeys: String, CodingKey {
-        case sleepDisabledByUs, lowPowerSetByUs, frozenProcesses, frozenPids, dockerFrozen, savedOutputVolume, savedMuted
+        case sleepDisabledByUs, lowPowerSetByUs, frozenProcesses, frozenPids, dockerFrozen
+        case savedAudioOutputs, savedOutputVolume, savedMuted
         case savedDisplayBrightness, savedKeyboardBrightness, displayRestoredUnderLowPower
         case appNapOverrides
     }
@@ -153,6 +220,7 @@ struct RuntimeState: Codable, Equatable, Sendable {
             frozenProcesses.append(FrozenProcess(pid: pid, identity: nil))
         }
         dockerFrozen = try c.decodeIfPresent(Bool.self, forKey: .dockerFrozen) ?? false
+        savedAudioOutputs = try c.decodeIfPresent([SavedAudioOutput].self, forKey: .savedAudioOutputs) ?? []
         savedOutputVolume = try c.decodeIfPresent(Float.self, forKey: .savedOutputVolume)
         savedMuted = try c.decodeIfPresent(Bool.self, forKey: .savedMuted)
         savedDisplayBrightness = try c.decodeIfPresent(Float.self, forKey: .savedDisplayBrightness)
@@ -169,6 +237,7 @@ struct RuntimeState: Codable, Equatable, Sendable {
         try c.encode(lowPowerSetByUs, forKey: .lowPowerSetByUs)
         try c.encode(frozenProcesses, forKey: .frozenProcesses)
         try c.encode(dockerFrozen, forKey: .dockerFrozen)
+        try c.encode(savedAudioOutputs, forKey: .savedAudioOutputs)
         try c.encodeIfPresent(savedOutputVolume, forKey: .savedOutputVolume)
         try c.encodeIfPresent(savedMuted, forKey: .savedMuted)
         try c.encodeIfPresent(savedDisplayBrightness, forKey: .savedDisplayBrightness)

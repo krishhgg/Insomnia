@@ -261,6 +261,13 @@ struct Store: Sendable {
         let object = try JSONSerialization.jsonObject(with: Data(contentsOf: paths.configFile))
         return (object as? [String: Any])?["configVersion"] != nil
     }
+    /// nil when there is none, or it cannot be read: it only names the
+    /// command in a message.
+    func loadUnfinishedCommand() -> UnfinishedCommandRecord? {
+        try? read(UnfinishedCommandRecord.self, from: paths.unfinishedCommandFile)
+    }
+    func saveUnfinishedCommand(_ r: UnfinishedCommandRecord) throws { try write(r, to: paths.unfinishedCommandFile) }
+    func removeUnfinishedCommand() throws { try remove(at: paths.unfinishedCommandFile) }
 
     /// One line about why decoding failed, fit for a notification.
     private static func brief(_ error: DecodingError) -> String {

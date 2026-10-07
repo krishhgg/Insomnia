@@ -1,9 +1,12 @@
 #!/bin/bash
 # Reverse install.sh. Quits the app, takes the recovery lock, runs the current
-# backstop with --force under that same lock, verifies for itself that the
-# journal is clean, and only then removes the LaunchAgent, the sudoers rule,
-# the app bundle, and the journal. Keeps config.json and the logs unless
-# --purge. Everything after the quit happens while this process holds
+# backstop with --force under that same lock (the checkout's copy when the
+# installed app declares the interface version it speaks, else the app's own:
+# the one sealed in the bundle, else the writable copy older installs left in
+# Application Support), verifies for itself that the journal is clean, and
+# only then removes the LaunchAgent, the sudoers rule, the app bundle
+# (backstop.sh included), and the journal. Keeps config.json and the logs
+# unless --purge. Everything after the quit happens while this process holds
 # APP_SUPPORT/.recovery.lock, so neither a queued periodic backstop nor a
 # relaunched app can republish the journal while it is being removed.
 #
@@ -19,7 +22,10 @@
 # are empty.
 # Only regular files are removed; anything else at one of those paths is
 # left with a message. The lock file is never unlinked, so --purge leaves
-# APP_SUPPORT/.recovery.lock (and therefore APP_SUPPORT).
+# APP_SUPPORT/.recovery.lock (and therefore APP_SUPPORT). The bundle trees
+# removed are the installed app and install.sh's own leftovers beside it,
+# matched by the exact names install.sh gives them, and the agent plist goes
+# with the candidate plists install.sh and the app stage it from.
 #
 # Honours INSOMNIA_HOME with the same layout as the app (see Paths.swift).
 set -euo pipefail
@@ -42,8 +48,10 @@ OSASCRIPT=/usr/bin/osascript
 LAUNCHCTL=/bin/launchctl
 SUDO=/usr/bin/sudo
 PLUTIL=/usr/bin/plutil
+CODESIGN=/usr/bin/codesign
 LOCKF=/usr/bin/lockf
 DEFAULTS=/usr/bin/defaults
+KILL=/bin/kill
 DATE=/bin/date
 MKDIR=/bin/mkdir
 RM=/bin/rm
@@ -53,10 +61,10 @@ LOCK_TIMEOUT_SECONDS=10
 # How long to wait for the app to exit after asking it to quit.
 QUIT_WAIT_SECONDS=10
 # Longest one external call made by this script itself (pgrep, defaults,
-# launchctl) may run before it is stopped with SIGTERM, then SIGKILL. These
-# are unprivileged and never touch the journal, and they run with the lock
-# descriptor closed, so a call that hangs is reported and can never keep the
-# recovery lock. backstop.sh bounds its own commands; the two sudo calls
+# launchctl, codesign) may run before it is stopped with SIGTERM, then
+# SIGKILL. A call made under the recovery lock keeps the lock until it has
+# exited or been stopped, even if this run is killed first (see bounded()).
+# backstop.sh bounds its own commands; the two sudo calls
 # prompt for a password and are left to sudo's own prompt timeout.
 CALL_TIMEOUT_SECONDS=30
 APP="$HOME/Applications/Insomnia.app"
@@ -125,57 +133,75 @@ trap '"$RM" -f "$WORK"/call.* 2>/dev/null; "$RMDIR" "$WORK" 2>/dev/null || true'
 
 # Run one external call with a time limit. Its combined output is left in
 # BOUNDED_OUTPUT (trailing newline removed) and its exit status returned, or
-# 124 when it did not finish within CALL_TIMEOUT_SECONDS: it is then sent
-# SIGTERM, and SIGKILL a second later if it is still there. A supervising
-# subshell waits for the call and writes its status to a file; both run with
-# fd 9 (the recovery lock) closed, so nothing left behind by a stuck call
-# holds the lock once this script exits. Called directly, not in $(...), so
-# the counter that names each call's files stays unique.
-bounded_calls=0
+# 124 when it did not finish within CALL_TIMEOUT_SECONDS and was stopped, or
+# 125 when it is sudo and still running (pid in BOUNDED_PID; this script
+# bounds no sudo call). The same helper as install.sh's, which says more.
+# supervise() enforces the limit itself, even if this run is killed while it
+# waits: SIGTERM once the limit has passed on bash's SECONDS clock, SIGKILL
+# one to two seconds later, never SIGKILL for sudo. The supervisor and the call keep fd 9 (the recovery lock) until the
+# call has exited, so a launchctl bootout made under the lock cannot unload
+# an agent the app confirms after this run is gone.
 BOUNDED_OUTPUT=""
+BOUNDED_PID=""
+# shellcheck disable=SC2034  # BOUNDED_PID is for sudo, and this script bounds none
 bounded() { # command args...
-  local base supervisor cpid rc i
-  bounded_calls=$((bounded_calls + 1))
-  base="$WORK/call.$bounded_calls"
+  local base supervisor rc deadline
+  base="$("$MKTEMP" "$WORK/call.XXXXXX")"
   BOUNDED_OUTPUT=""
-  (
-    "$@" </dev/null >"$base.out" 2>&1 &
-    echo "$!" > "$base.pid"
-    rc=0
-    wait "$!" || rc=$?
-    echo "$rc" > "$base.rc"
-  ) </dev/null >/dev/null 2>&1 9>&- &
+  BOUNDED_PID=""
+  supervise "$base" "$@" </dev/null >/dev/null 2>&1 &
   supervisor=$!
-  # Polled every 10 ms: a check makes some 30 calls, so a coarser poll
-  # would add seconds to an uninstall that is otherwise instant.
-  for (( i = 0; i < CALL_TIMEOUT_SECONDS * 100; i++ )); do
-    if [[ -s "$base.rc" ]]; then break; fi
-    sleep 0.01
-  done
-  if [[ ! -s "$base.rc" ]]; then
-    cpid="$(cat "$base.pid" 2>/dev/null || true)"
-    if [[ -n "$cpid" ]]; then kill -TERM "$cpid" 2>/dev/null || true; fi
-    for (( i = 0; i < 10; i++ )); do
-      if [[ -s "$base.rc" ]]; then break; fi
-      sleep 0.1
+  if [[ "$1" == "$SUDO" ]]; then
+    # The supervisor's limit (at most a second over), then at least two
+    # seconds for sudo to stop on SIGTERM.
+    deadline=$(( SECONDS + CALL_TIMEOUT_SECONDS + 3 ))
+    while [[ ! -s "$base.rc" ]] && (( SECONDS <= deadline )); do
+      sleep 0.01
     done
-    if [[ ! -s "$base.rc" && -n "$cpid" ]]; then
-      kill -KILL "$cpid" 2>/dev/null || true
-      for (( i = 0; i < 10; i++ )); do
-        if [[ -s "$base.rc" ]]; then break; fi
-        sleep 0.1
-      done
+    if [[ ! -s "$base.rc" ]]; then
+      BOUNDED_PID="$(cat "$base.pid" 2>/dev/null || true)"
+      return 125
     fi
-    # Reap the supervisor once it has written the status; one that is
-    # still waiting on an unkillable call is left behind without the lock.
-    if [[ -s "$base.rc" ]]; then wait "$supervisor" 2>/dev/null || true; fi
-    return 124
   fi
-  read -r rc < "$base.rc"
+  # Any other call gets SIGKILL at most two seconds after its SIGTERM, so
+  # this wait ends.
   wait "$supervisor" 2>/dev/null || true
+  rc=124
+  if [[ -s "$base.rc" ]]; then read -r rc < "$base.rc"; fi
   IFS= read -r -d '' BOUNDED_OUTPUT < "$base.out" || true
   BOUNDED_OUTPUT="${BOUNDED_OUTPUT%$'\n'}"
   return "$rc"
+}
+# The supervising process of one bounded() call; it runs in the background.
+# The call is its only job, so `kill %1` signals the call, and the shell
+# skips a job it has already reaped: a reused pid is never signalled. The
+# status file is written once the call has been reaped.
+supervise() { # base command args...
+  local base="$1" cpid rc=0 deadline
+  shift
+  "$@" </dev/null >"$base.out" 2>&1 &
+  cpid=$!
+  echo "$cpid" > "$base.pid"
+  deadline=$(( SECONDS + CALL_TIMEOUT_SECONDS ))
+  while kill -0 "$cpid" 2>/dev/null && (( SECONDS <= deadline )); do
+    sleep 0.01
+  done
+  # Past the limit, and the shell has not reaped the call: it is still there.
+  if (( SECONDS > deadline )) && [[ -n "$(jobs -rp)" ]]; then
+    kill -TERM %1 2>/dev/null || true
+    if [[ "$1" != "$SUDO" ]]; then
+      deadline=$(( SECONDS + 1 ))
+      while [[ -n "$(jobs -rp)" ]] && (( SECONDS <= deadline )); do
+        sleep 0.01
+      done
+      if [[ -n "$(jobs -rp)" ]]; then kill -KILL %1 2>/dev/null || true; fi
+    fi
+    wait "$cpid" 2>/dev/null || true
+    echo 124 > "$base.rc"
+    return
+  fi
+  wait "$cpid" || rc=$?
+  echo "$rc" > "$base.rc"
 }
 
 # Fail closed on paths that are not the exact things install.sh created.
@@ -238,6 +264,29 @@ journal_shape_problems() { # file
       i=0
       while [[ -n "$(type_of "$f" "frozenPids.$i")" ]]; do
         [[ "$(type_of "$f" "frozenPids.$i")" == integer ]] || echo "frozenPids[$i] is not an integer"
+        i=$((i + 1))
+      done
+    fi
+  fi
+  t="$(type_of "$f" savedAudioOutputs)"
+  if [[ -n "$t" && "$t" != "(any)" ]]; then
+    if [[ "$t" != array ]]; then
+      echo "savedAudioOutputs is a $t, not an array"
+    else
+      i=0
+      while [[ -n "$(type_of "$f" "savedAudioOutputs.$i")" ]]; do
+        if [[ "$(type_of "$f" "savedAudioOutputs.$i")" != dictionary ]]; then
+          echo "savedAudioOutputs[$i] is not an object"
+        else
+          [[ "$(type_of "$f" "savedAudioOutputs.$i.deviceUID")" == string ]] || echo "savedAudioOutputs[$i].deviceUID is not a string"
+          t="$(type_of "$f" "savedAudioOutputs.$i.volume")"
+          [[ "$t" == float || "$t" == integer ]] || echo "savedAudioOutputs[$i].volume is not a number"
+          [[ "$(type_of "$f" "savedAudioOutputs.$i.muted")" == bool ]] || echo "savedAudioOutputs[$i].muted is not a bool"
+          t="$(type_of "$f" "savedAudioOutputs.$i.name")"
+          [[ -z "$t" || "$t" == string || "$t" == "(any)" ]] || echo "savedAudioOutputs[$i].name is a $t, not a string"
+          t="$(type_of "$f" "savedAudioOutputs.$i.saveID")"
+          [[ -z "$t" || "$t" == string || "$t" == "(any)" ]] || echo "savedAudioOutputs[$i].saveID is a $t, not a string"
+        fi
         i=$((i + 1))
       done
     fi
@@ -327,7 +376,7 @@ session_shape_problems() { # file
 # Independent check of the journal: prints one line per unresolved item.
 # Trusts nothing about the backstop that just ran (it may be an older copy).
 journal_problems() {
-  local key value shape
+  local key value shape i
   if [[ -e "$SESSION" ]]; then
     shape=""
     # Only a regular file is opened: open(2) on a FIFO with no writer
@@ -373,6 +422,12 @@ journal_problems() {
   if extract "$STATE" savedOutputVolume >/dev/null || extract "$STATE" savedMuted >/dev/null; then
     echo "saved audio settings (volume/mute) are not restored; only the app can do that"
   fi
+  i=0
+  while extract_json "$STATE" "savedAudioOutputs.$i" >/dev/null; do
+    value="$(extract "$STATE" "savedAudioOutputs.$i.name" || extract "$STATE" "savedAudioOutputs.$i.deviceUID" || true)"
+    echo "$value is still muted from a lid close; only the app can restore its volume, once the device is connected"
+    i=$((i + 1))
+  done
   if extract "$STATE" savedDisplayBrightness >/dev/null; then
     echo "saved display brightness is not restored; only the app can do that"
   fi
@@ -513,6 +568,10 @@ What to do, then rerun this script:
   - Saved audio (volume/mute), display brightness or keyboard backlight:
     open Insomnia.app; it restores them from the journal at launch. If the
     display is dark, press the brightness-up key first.
+  - An output device still muted from a lid close: connect it and open
+    Insomnia.app, which restores its volume. If the device is gone for
+    good, open Insomnia.app and choose "Stop waiting for <device>" in its
+    menu; the device then stays as it is.
   - pmset failures (sleep / Low Power Mode): check $SUDOERS
     (rerun scripts/install.sh to reinstall it), or run
     'sudo pmset -a disablesleep 0' / 'sudo pmset -b lowpowermode 0' yourself.
@@ -588,28 +647,49 @@ fi
 # This checkout's backstop.sh hands frozen entries that record microseconds
 # to the installed app binary, and runs that binary only when the bundle's
 # Info.plist declares InsomniaResumeFrozenVersion RESUME_FROZEN_VERSION (the
-# same value as in backstop.sh; a test keeps the two in step). An app that
-# does not declare it was installed together with its own backstop.sh in
-# APP_SUPPORT, the copy the LaunchAgent runs, so that copy is used instead
-# when it exists. Without it this checkout's backstop runs anyway: it keeps
-# the entries that need the binary, and step 4 stops before removing
-# anything.
+# same value as in backstop.sh; a test keeps the two in step). So the
+# checkout's copy runs when the app declares that version. An app that does
+# not was installed together with its own backstop.sh, which speaks its
+# version: the copy install.sh sealed into the bundle, or for installs before
+# that layout the writable copy in $APP_SUPPORT that the LaunchAgent runs.
+# That copy is used instead when it exists. The sealed copy runs only while
+# the bundle's signature still verifies: its resource seal covers the
+# script, so this is the check the LaunchAgent runs (without the pinned
+# requirement, which this script does not have), and an edited copy is
+# refused the same way. With neither copy this checkout's backstop runs
+# anyway: it keeps the entries that need the binary, and step 4 stops before
+# removing anything.
 step "Restoring the machine via backstop --force"
 installed_version=""
 if [[ -f "$APP/Contents/Info.plist" ]]; then
   installed_version="$(extract "$APP/Contents/Info.plist" InsomniaResumeFrozenVersion || true)"
 fi
-if [[ -f "$ROOT/scripts/backstop.sh" ]] && { [[ "$installed_version" == "$RESUME_FROZEN_VERSION" ]] || [[ ! -f "$APP_SUPPORT/backstop.sh" ]]; }; then
+if [[ -f "$ROOT/scripts/backstop.sh" ]] && { [[ "$installed_version" == "$RESUME_FROZEN_VERSION" ]] || { [[ ! -f "$APP/Contents/Resources/backstop.sh" ]] && [[ ! -f "$APP_SUPPORT/backstop.sh" ]]; }; }; then
   BACKSTOP="$ROOT/scripts/backstop.sh"
+elif [[ -f "$APP/Contents/Resources/backstop.sh" ]]; then
+  verify_rc=0
+  bounded "$CODESIGN" --verify --strict "$APP" || verify_rc=$?
+  if (( verify_rc == 124 )); then
+    echo "'codesign --verify --strict $APP' did not answer within ${CALL_TIMEOUT_SECONDS}s, so the backstop.sh sealed in it was not run." >&2
+    echo "Nothing was removed. Run this script from a checkout of the source (its scripts/backstop.sh is used first), or rerun once codesign answers." >&2
+    exit 1
+  elif (( verify_rc != 0 )); then
+    echo "$APP does not pass 'codesign --verify --strict' (exit $verify_rc: ${BOUNDED_OUTPUT:-no detail}), so the backstop.sh sealed in it was not run." >&2
+    echo "Nothing was removed. Run this script from a checkout of the source (its scripts/backstop.sh is used first), or reinstall with scripts/install.sh and rerun." >&2
+    exit 1
+  fi
+  echo "$APP verifies"
+  BACKSTOP="$APP/Contents/Resources/backstop.sh"
 elif [[ -f "$APP_SUPPORT/backstop.sh" ]]; then
   BACKSTOP="$APP_SUPPORT/backstop.sh"
-  if [[ -f "$ROOT/scripts/backstop.sh" ]]; then
-    echo "$APP does not declare InsomniaResumeFrozenVersion $RESUME_FROZEN_VERSION; using the backstop installed with it, $BACKSTOP"
-  fi
 else
-  echo "no backstop.sh found in $ROOT/scripts or $APP_SUPPORT; nothing was removed" >&2
+  echo "no backstop.sh found in $ROOT/scripts, $APP/Contents/Resources or $APP_SUPPORT; nothing was removed" >&2
   exit 1
 fi
+if [[ "$BACKSTOP" != "$ROOT/scripts/backstop.sh" && -f "$ROOT/scripts/backstop.sh" ]]; then
+  echo "$APP does not declare InsomniaResumeFrozenVersion $RESUME_FROZEN_VERSION; using the backstop installed with it, $BACKSTOP"
+fi
+echo "using $BACKSTOP"
 recovery_rc=0
 /bin/bash "$BACKSTOP" --force || recovery_rc=$?
 
@@ -659,6 +739,16 @@ if (( print_rc != 113 )); then
   exit 1
 fi
 "$RM" -f "$PLIST"
+# Candidate plists install.sh and the app write before a load and rename
+# into place after it: in the staging directory beside the plist, and in
+# $LAUNCH_AGENTS itself for older builds. Only files with the label's
+# candidate prefix, the same ones both of them sweep; the staging directory
+# goes only once empty.
+CANDIDATE_DIR="$LAUNCH_AGENTS/.$LABEL.staging"
+for candidate in "$CANDIDATE_DIR/$LABEL.candidate-"* "$LAUNCH_AGENTS/$LABEL.candidate-"*; do
+  if [[ -f "$candidate" && ! -L "$candidate" ]]; then "$RM" -f "$candidate"; fi
+done
+if [[ -d "$CANDIDATE_DIR" && ! -L "$CANDIDATE_DIR" ]]; then "$RMDIR" "$CANDIDATE_DIR" 2>/dev/null || true; fi
 
 step "Removing $SUDOERS (requires your password)"
 if [[ -e "$SUDOERS" ]] || "$SUDO" test -e "$SUDOERS"; then
@@ -667,10 +757,39 @@ fi
 
 step "Removing app bundle"
 "$RM" -rf "$APP"
+# install.sh's leftovers beside the bundle, by the exact names it gives them.
+# An upgrade sets the previous bundle aside at .Insomnia.app.previous during
+# its swap and assembles the new one in .Insomnia.app.staging.<pid>.<six
+# letters and digits> (mktemp). The swap runs under the recovery lock, which
+# this script holds, so a set-aside bundle belongs to a run that was stopped.
+# A staging directory whose run is still alive belongs to an install that
+# has not reached the lock yet, and stays. kill -0 only asks whether the
+# process exists; it sends no signal. Symlinks and any other name are left.
+APP_DIR="$(dirname "$APP")"
+PREVIOUS_APP="$APP_DIR/.Insomnia.app.previous"
+if [[ -d "$PREVIOUS_APP" && ! -L "$PREVIOUS_APP" ]]; then
+  "$RM" -rf "$PREVIOUS_APP"
+  echo "removed $PREVIOUS_APP, the previous bundle an interrupted install set aside"
+fi
+staging_re='^\.Insomnia\.app\.staging\.([0-9]+)\.[A-Za-z0-9]{6}$'
+for dir in "$APP_DIR"/.Insomnia.app.staging.*; do
+  [[ -d "$dir" && ! -L "$dir" ]] || continue
+  [[ "${dir##*/}" =~ $staging_re ]] || continue
+  owner="${BASH_REMATCH[1]}"
+  if "$KILL" -0 "$owner" 2>/dev/null; then
+    echo "kept $dir: the install.sh run that made it (pid $owner) is still running"
+    continue
+  fi
+  "$RM" -rf "$dir"
+  echo "removed $dir, left by an install.sh run that is gone"
+done
 
+# $APP_SUPPORT/backstop.sh below is the writable copy of older installs; the
+# current one went with the bundle.
 if (( PURGE == 1 )); then
   step "Purging Insomnia's files in $APP_SUPPORT and $LOG_DIR"
   remove_owned "$SESSION" "$ENDED" "$STATE" "$APP_SUPPORT/config.json" "$APP_SUPPORT/backstop.sh" \
+        "$APP_SUPPORT/unfinished-command.json" \
         "$LOG_DIR/insomnia.log" "$LOG_DIR/insomnia.log.1" \
         "$LOG_DIR/handoffs.log" "$LOG_DIR/handoffs.log.1"
   for name in session.json config.json; do
@@ -694,7 +813,9 @@ if (( PURGE == 1 )); then
   echo "Kept $LOCK (the recovery lock is never unlinked; delete $APP_SUPPORT by hand if you want it gone)."
   [[ -d "$LOG_DIR" ]] && echo "Kept $LOG_DIR: it still holds files Insomnia did not create."
 else
-  remove_owned "$APP_SUPPORT/backstop.sh" "$SESSION" "$ENDED" "$STATE"
+  # unfinished-command.json names a sudo pmset that held the recovery lock;
+  # this run holds it now, so that command has exited.
+  remove_owned "$APP_SUPPORT/backstop.sh" "$SESSION" "$ENDED" "$STATE" "$APP_SUPPORT/unfinished-command.json"
   echo "Kept $APP_SUPPORT/config.json and $LOG_DIR (use --purge to remove)."
   for name in session.json config.json; do
     collect_moved_aside "$name"

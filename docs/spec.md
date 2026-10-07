@@ -34,7 +34,8 @@ closed bag. Its design goals are to:
 - Swift 6, SwiftUI content hosted in a custom `NSStatusItem`, Swift Package.
   No Xcode project.
 - `install.sh` assembles a minimal `Insomnia.app` bundle (`LSUIElement = true`,
-  no Dock icon), ad-hoc codesigns it, and installs it to `~/Applications`.
+  no Dock icon) with `backstop.sh` sealed under `Contents/Resources`, ad-hoc
+  codesigns it, and installs it to `~/Applications`.
 
 ## Core model
 
@@ -50,8 +51,9 @@ RuntimeState {                // everything Insomnia changed and must undo
   lowPowerSetByUs:    Bool
   frozenProcesses:    [{pid, startedAt, startedAtMicros, bootSession}]
   dockerFrozen:       Bool
-  savedOutputVolume:  Float?  // nil when mute is off or lid is open
-  savedMuted:         Bool?
+  savedAudioOutputs:  [{deviceUID, name?, volume, muted, saveID?}]  // each output device a lid close muted, with what it had; saveID is a UUID drawn for each save; empty when mute is off or every device is restored
+  savedOutputVolume:  Float?  // legacy: an earlier build's entry, restored on the default output; never written now
+  savedMuted:         Bool?   // legacy, the same
   savedDisplayBrightness:  Float?  // nil when darkening is off or lid is open
   savedKeyboardBrightness: Float?  // nil when there is no backlight, too
   displayRestoredUnderLowPower: Float?  // restored on open under our Low Power Mode; written again when it ends
@@ -130,9 +132,45 @@ Quit, or reconcile.
 | Keyboard backlight (optional, same toggle) | save brightness, set it to 0 | restore the saved brightness |
 | Freeze scope | `SIGSTOP` every process whose responsible app is in the freeze scope (rules below) | `SIGCONT` the recorded pids only |
 | Docker rule (default off) | if Docker Desktop is running and `docker ps -q` is empty, journal its tree, ask `docker ps -q` once more right before the SIGSTOP and freeze it only on a second clean empty answer; busy, a failed probe, a timeout, a lid open or a session end at either point leaves it running | resume |
-| Mute (optional) | save volume and mute state, then mute | restore both exactly |
+| Mute (optional, default on) | journal the default output's UID, name, volume and mute state as its own entry, unless that device already has one, then mute that device; another device's entry never stops it | restore each entry on its own device, never on another output, and clear only that entry; a device the user unmuted meanwhile is left as it is; a device that is not connected keeps its entry (see below) |
 | Low Power Mode | on (optional, default on) | off unless a battery or thermal floor still wants it |
 | Countdown redraw | stop timer | restart timer |
+
+An output device that is not connected when its entry is restored keeps the
+entry, and the restore of everything else goes on. Each restore decides
+again whether a device is connected: only a device CoreAudio reports as not
+connected on that try counts as away. An away device does not hold up the
+end of a session: End and Quit restore sleep and the rest, the end
+notification names each device that is still muted, and the menu shows a
+line for each with a "Stop waiting for <device>" item, which drops that
+entry and leaves the device as it is. The item drops nothing if, when it
+runs, the device reads as connected or the entry is a later lid close's
+save rather than the one the menu showed. Each save has an ID of its own
+(`saveID`, drawn by the lid close that writes the entry), and the item
+compares it with the journal on disk under the lock, so a later save with
+the same values, written by this or another copy of the app, is not
+dropped. An entry written before entries had an ID has none and is
+compared by its values. While Insomnia runs, a device that
+connects again gets its volume back at once (a CoreAudio device-list
+listener), or at the next lid open if a session is running with the lid
+closed. Each device change reads the journal on disk under the lock, so a
+copy of the app with nothing saved in memory also restores a save another
+copy wrote. Before the launch reconcile has taken a session over, a session.json
+that has not expired, or cannot be read, counts as a running session for
+this. A later launch restores every connected device at reconcile.
+
+A restore that fails on a connected device, or a cleared entry that cannot
+be written, is reported and the entry stays. It makes the end incomplete,
+as any failed restore does. The recovery agent keeps these entries but
+cannot restore CoreAudio settings, so the incomplete-restore notification
+says Insomnia tries again itself. That retry runs in process after 30 s,
+reads the journal again and checks the lid again. A device change that
+could not run at all (the recovery lock was busy, a `sudo pmset` left
+running still held it, or state.json did not decode) is retried the same
+way. The retry stops after 10 tries in a row; the next device change, lid
+open, end or launch tries again. The menu line that a refused device change
+or a failed restore put up goes once a later restore leaves nothing to
+retry, unless a newer failure has taken its place.
 
 A session that starts, or that reconcile resumes at launch, while the lid
 reads closed starts with the countdown redraw stopped: the lid observer
@@ -161,9 +199,16 @@ Freeze scope rules:
   kitty, WezTerm, Tabby, Hyper), browsers (Arc, Chrome, Chromium, Edge, Brave,
   Vivaldi, Opera, Firefox with its Developer and Nightly editions, Zen),
   Tailscale, LM Studio, Ollama, Docker Desktop's Electron front end,
-  1Password, Bitwarden, Postgres.app and OrbStack. Every id is verified
-  against an installed copy or the Homebrew cask metadata named in the
-  comment next to it. The automatic scope leaves them alone even when they
+  1Password, Bitwarden, Postgres.app and OrbStack, and meeting, recording
+  and dictation apps (`meetingApps`): Zoom, Microsoft Teams (new and
+  classic), Webex, the older Webex Meetings app with its meeting window and
+  plugin agent, Wispr Flow, Granola, Otter, OBS and Loom. Their helper apps
+  are matched by prefix: each of those ids followed by a dot, plus `us.zoom.`
+  and `com.cisco.webex.` (`meetingAppPrefixes`). Helpers an app starts are
+  its child processes and are left out with it. FaceTime is
+  `com.apple.FaceTime`, already on the hard denylist. Every id is verified
+  against an installed copy, the Homebrew cask metadata or the page named in
+  the comment next to it. The automatic scope leaves them alone even when they
   are not on the agent list. Code level and not persisted: an existing
   config.json already carries its own agent list, so new agent-list defaults
   never reach it. An explicit freeze-list entry overrides this set; the hard
@@ -205,7 +250,9 @@ is best effort. Display brightness 0 does not switch the keyboard backlight
 off; it is set separately. Both values are journaled before they are changed
 and restored on open, session end, Quit, or reconcile with the lid open; the
 backstop keeps the entries and only the app restores them (private
-frameworks). What is journaled is the user's value, not whatever the device
+frameworks). An end that could not restore one says so in its
+incomplete-restore notification, without promising the recovery agent's
+retry: a later session's end or the next launch tries again. What is journaled is the user's value, not whatever the device
 reads at that instant. A reading is trusted only when the last keyboard,
 mouse or trackpad input was under 30 s ago (`CGEventSource`; the idle dim
 never starts sooner) and the panel is awake (`CGDisplayIsAsleep`, else it
@@ -297,10 +344,13 @@ last held while it was on was the battery or thermal floor, not the lid.
   shell-quoted `defaults delete` command for it, and continues. The summary
   says how many apps were checked; an app whose key cannot be read is
   reported, not counted. Each read has a 30 s limit, like every other call
-  uninstall makes under the recovery lock (`pgrep`, `launchctl`); a read
-  that does not answer ends the check with the command to run by hand, and
-  uninstall goes on. A call past its limit gets SIGTERM, then SIGKILL, and
-  never holds the lock.
+  uninstall makes under the recovery lock (`pgrep`, `launchctl`,
+  `codesign`); a read that does not answer ends the check with the command
+  to run by hand, and uninstall goes on. A call past its limit gets SIGTERM,
+  then SIGKILL one to two seconds later. Each call keeps the lock until it has exited
+  or been stopped, and a supervising process enforces the limit even if
+  uninstall is killed while it waits, so its `launchctl bootout` is not
+  still running when the app takes the lock and loads its agent.
 - Browser throttling: Chromium browsers throttle windows macOS reports as
   occluded, which is every window once the lid is closed with no external
   display. Timers drop to 1 Hz, animation frames stop, pages report hidden.
@@ -566,7 +616,9 @@ Reconcile runs at every Insomnia launch:
    new path. If either rename fails the file stays and a start is refused
    while it is there. Every end then restores the journal and tries the
    rename again; while it fails the end is not finished, so quit is refused
-   and the end is retried. A file that could not be read would be resumed
+   and the end is retried. The launch that kept the file runs that end
+   itself when the journal holds any entry, saved output volumes alone
+   included. A file that could not be read would be resumed
    if it became readable in place, and every later launch and the agent
    read either kind again. The messages say to remove it or move it out of
    the folder. `backstop.sh` tries the rename again on every run.
@@ -584,10 +636,90 @@ Reconcile runs at every Insomnia launch:
    journal, not from this check. Nothing clears `SleepDisabled` without a
    journal entry, in the app or in the agent.
 
+A reconcile refused for a busy lock or an unreadable journal changes
+nothing and runs again after the retry delay until it goes through, unless
+a start has made a session active or an end has been requested since. The
+lock can stay busy for as long as a `sudo pmset` an earlier run left
+running, and without the retry a session still live on disk would hold
+sleep with no battery floor until its deadline. If `unfinished-command.json`
+was on disk, that command has exited by the time the reconcile holds the
+lock, so a session it resumes is checked against Low Power Mode as after a
+command the app itself left running (below). The check stays owed when a
+later attempt is refused for an unreadable journal, although that refusal
+removes the record. A start that makes a session active before the retry
+runs the check for that session instead. An end restores the mode from the
+journal and owes no check.
+
 Backstop, independent of the app:
 
 - The agent reads the saved deadline; recurring recovery checks avoid replacing
   the loaded job for every extension and allow retries after a failure.
+- The agent runs only the `backstop.sh` sealed in the signed bundle. Its
+  command line verifies the bundle against the code requirement pinned in the
+  plist (`codesign --verify --strict -R=...`; for an ad-hoc build, that
+  build's cdhash) and execs the script when that passes; otherwise it logs
+  one line and exits without running anything. No executable lives in a
+  writable directory. The plist is a per-user file like any LaunchAgent; at
+  the next arm the app rewrites a plist that does not match, and reloads a
+  loaded job whose command line or run interval (the `arguments` and `run
+  interval` that `launchctl print` lists) differs from the plist's.
+- What the app pins is the requirement of the code it is running
+  (SecCodeCopySelf), read after SecCodeCheckValidity confirmed the bundle on
+  disk is that code, and the bundle must pass the agent's own check against
+  it at every arm. Otherwise arm() fails with the reason: a loaded agent
+  whose bundle no longer verifies is never reported as armed, and a bundle
+  re-signed under the running app is never re-pinned. A `swift run` build
+  outside any bundle pins the installed bundle from disk.
+- install.sh replaces the bundle and the agent in one locked step: the new
+  bundle is staged next to the app and swapped in only after `launchctl
+  print` confirms the previous job is unloaded, then the new job is loaded.
+  So any job loaded after the swap is this run's and pins the new bundle.
+  When the new job cannot be loaded or its plist cannot be published,
+  install.sh unloads any job that may be loaded, confirms that with print,
+  and puts the previous bundle back; if the unload is not confirmed, the
+  new bundle stays, because that job pins it. Every bundle rename is checked
+  (`mv`, refused when the destination exists): when one of the swap or its
+  undo fails, the previous bundle goes back and its job is loaded again as
+  after a failed load, and when the previous bundle cannot go back, no
+  bundle is deleted, no job is loaded against an empty app path, and the
+  message prints the `mv` and `launchctl bootstrap` that restore the pair.
+  The same holds for the renames of the repair below. A rerun after an interrupted
+  or failed swap keeps the bundle the plist on disk pins. It runs its
+  forced recovery first, with the loaded job and the bundles as the earlier
+  run left them, and stops there if recovery fails. Only then does it
+  unload and confirm any loaded job, move a bundle and load the plist on
+  disk again; it stops when print does not confirm the unload or that
+  reload. A loaded job is never left pinning a bundle that was moved away,
+  and no step after a failed bootstrap counts on a loaded job. Before
+  recovery the run only puts a set-aside bundle back when nothing is at the
+  app's path, and removes staging directories whose owning install is gone
+  (matched by the exact name install.sh gives them). Right after taking the
+  lock it checks the sudoers rule again with `sudo -n -l` for each of the
+  four commands and stops if it no longer holds: an uninstall.sh that took
+  the lock first removes the rule and leaves no journal, so the recovery
+  alone would pass. Under the lock every `sudo -n -l`, `pgrep`, `launchctl`
+  and `codesign --verify` call has a 30 s limit (the sudoers check before
+  the lock has it too). A supervising process enforces it, even if the
+  installer is killed while it waits, and the call keeps fd 9, so the lock
+  is held until the call has exited or been stopped: no `launchctl bootout`
+  or `bootstrap` it started is still running once the lock is released. A call past the
+  limit gets SIGTERM, then SIGKILL one to two seconds later; `sudo` only ever gets
+  SIGTERM, and one that ignores it keeps the lock until it ends, reported
+  with its pid. A sudoers check or `pgrep` that does not answer stops the
+  run, which releases the lock so the app and the agent can recover. A `launchctl print` that does not answer counts as unknown, never
+  as unloaded. A `codesign --verify` that does not answer leaves it unknown
+  which bundle the plist on disk pins, so the run stops and moves neither
+  bundle. uninstall.sh runs the
+  bundle's sealed backstop.sh only after `codesign --verify --strict`
+  passes on the bundle (a bounded call, like its other calls under the
+  lock). Once recovery is confirmed and print confirms the agent unloaded,
+  it removes the bundle and install.sh's leftovers beside it, by their exact
+  names: `.Insomnia.app.previous`, and `.Insomnia.app.staging.<pid>.<six
+  letters and digits>` directories whose run `kill -0` reports gone (a live
+  run's stays). Symlinks and other names are left. With the agent plist go
+  the candidate plists install.sh and the app stage it from
+  (`com.insomnia.backstop.candidate-*` in `.com.insomnia.backstop.staging`
+  and, from older builds, in the LaunchAgents directory).
 - App and script transactions must coordinate through a shared lock. Failure
   to acquire it must not permit an unprotected journal write or side effect.
 - Only the Insomnia that holds `.app.alive` runs. A copy that cannot take it
@@ -617,7 +749,54 @@ Backstop, independent of the app:
   hold the lock: they run with its descriptor closed, and one that ignores
   SIGTERM gets SIGKILL. A hung read fails only its own check, never the next
   run or the app.
+- A `sudo pmset` is sent SIGTERM at its timeout (20 s in the app, 30 s in the
+  agent), never SIGKILL: a killed sudo can orphan a root pmset that still
+  changes power state later, outside any transaction. One still running 3 s
+  after SIGTERM stops the transaction where it is, in the app as in the
+  agent's `run_bounded`: nothing else is undone, the journal keeps every
+  entry it had, and the recovery lock stays held until the command exits.
+  In the app the command holds the lock itself, with a descriptor on the
+  lock file as its stdin, so a crash or force quit of the app does not
+  free the lock while the command runs; the agent's supervising subshell
+  keeps it the same way. The app runs no `sudo pmset` outside a
+  transaction. Every one goes through `PmsetSleepGuard.sudoPmset`,
+  including a check that runs a sudoers command only to see whether it
+  passes. It reports the pid with the `sudo kill` command, in a menu line
+  of its own that the exit removes, and refuses to quit or start a
+  session until then. It also records the command in
+  `unfinished-command.json`, with the start time and boot session read
+  from the process table when the command was left running. The exit
+  removes the record, and so does the next transaction that takes the
+  lock. A transaction refused for a busy lock names the recorded command.
+  It gives the pid and `sudo kill` only while the live pid still has that
+  start time and boot session, and the first such refusal for a pid also
+  notifies; otherwise it says the command has exited, or that the pid
+  cannot be confirmed, and names no process to stop. An end, lid close or
+  lid open refused meanwhile is recorded at the refusal. An undo
+  (`disablesleep 0`, `lowpowermode 0`) that exits 0 is confirmed: its
+  entry is cleared under the lock before the lock is released, and a
+  display write owed for the end of the mode is done then. If the journal
+  cannot be read or written then, the entry stays, the undo runs again,
+  and the menu says so. Any other exit confirms nothing. When the command
+  exits the app retries a pending end.
+  Otherwise it reads Low Power Mode under the lock. A mode that reads on
+  stays journaled as Insomnia's. A mode that reads off is switched off
+  once more with the app's own `lowpowermode 0`, and the ownership is
+  cleared only when that exits 0. A display write owed for the end of the
+  mode is kept through the check and done then: with the mode already off,
+  powerd's rescale of the panel cannot be told apart from a user's change,
+  so the panel is compared with the owed value only before a switch-off,
+  while the mode is still on. Then the app replays
+  a refused lid event for the state of the latest lid event, after any
+  change still in the 2 s lid debounce has settled, and runs the floor
+  rules again. A check that cannot take the lock, read the journal or the
+  mode, switch the mode off, or write the journal runs again after the
+  retry delay while the session lasts.
 - Successful restores may clear their entries; failures must stay journaled.
+  A journal write that fails to clear the entry of a successful restore is
+  shown in the menu as well as logged, and the restore is retried. The
+  line goes once a later write clears that entry, unless a newer error
+  has replaced it.
   Process recovery must verify identity and avoid resuming a process that
   Insomnia did not stop. The entries that record `startedAtMicros` go to
   the installed app binary in one call (`Insomnia --resume-frozen
@@ -647,12 +826,20 @@ Backstop, independent of the app:
   microseconds keep the shell's one-second `ps` comparison. Old PID-only
   entries need conservative handling.
 - The shell does not restore CoreAudio settings. Saved audio must remain in
-  the journal for the app to restore. Uninstall must preserve recovery tools
+  the journal for the app to restore. Legacy `savedOutputVolume` /
+  `savedMuted` count as unresolved, so the run exits 1 and says to open
+  Insomnia. `savedAudioOutputs` entries are checked for shape and kept, but
+  on their own they leave the journal clean: an entry can wait days for its
+  device, the app's menu shows it, and an error every minute would only
+  fill the log. The backstop logs them once, when it removes a session or
+  undoes something else. Uninstall must preserve recovery tools
   and state when restoration is incomplete, including saved audio. It runs
   the checkout's backstop only when the installed app declares the
   `InsomniaResumeFrozenVersion` that backstop speaks; otherwise it runs the
-  backstop installed with that app, when there is one. With no installed
-  copy it runs the checkout's backstop anyway, which keeps the entries that
+  backstop installed with that app, when there is one: the copy sealed in
+  its bundle, once `codesign --verify --strict` passes, else the writable
+  copy older installs left in Application Support. With no installed copy
+  it runs the checkout's backstop anyway, which keeps the entries that
   need the binary without running it, so uninstall stops before removing
   anything.
 - The shell puts `appNapOverrides` back with `defaults write <id>
@@ -676,7 +863,8 @@ minutes before end, battery floor reached, battery unreadable twice in a row,
 thermal action taken, network gap recovered (with nudge summary), sleep
 restored by backstop, sleep disabled by something other than Insomnia
 (reconcile step 3, once per launch), config.json moved aside because it does
-not decode, and another copy already running (the copy quits).
+not decode, another copy already running (the copy quits), and lid-close
+settings changed by the one-time update (section 10, once).
 
 ### 10. Settings
 
@@ -687,7 +875,23 @@ older build is tightened when the app reads it:
 
 - presets, default preset
 - freeze list (bundle ids), freeze every other app on/off (default off),
-  Docker rule on/off, mute on lid close on/off
+  Docker rule on/off, mute on lid close on/off (default on). Under the mute
+  toggle: on Mac laptops with Apple silicon or a T2 chip, closing the lid
+  disconnects the built-in microphone in hardware, so recording with the lid
+  closed needs AirPods or an external mic.
+- one-time lid-close update. A config.json without `lidCloseDefaultsApplied`
+  was saved by an earlier build. At launch it gets `freezeAllApps` off and
+  `muteOnLidClose` on, the mark set, and is written back. When either value
+  changed, the launch reconcile posts one "Lid-close settings changed"
+  notification naming each change and where to change it back (Settings,
+  Lid-close actions). It posts before taking the recovery lock, so a busy
+  lock or an unreadable journal does not hold it back, and after the app
+  installs its notification delegate. The app keeps the change in `lidCloseDefaultsNotice` so Settings
+  shows the same line at the top of Lid-close actions until dismissed. The
+  mark stays set, so a setting the user turns back is never changed again. A
+  missing `muteOnLidClose` in a config without the mark reads as off, as the
+  earlier builds read it. A fresh install writes a config.json with the mark
+  and the new defaults and shows no notice.
 - agent list (bundle ids), turn App Nap off for them on/off (default off)
 - `lowPowerFloor`, `endFloor`, thermal rules on/off
 - hotspot SSID (password entered once, stored in Keychain), `nudgeThreshold`
@@ -930,7 +1134,7 @@ Insomnia/
     TestSupport.swift
     UIStatusTests.swift
   scripts/
-    install.sh             build, bundle, codesign, sudoers, launchd, login item
+    install.sh             build, bundle (backstop.sh sealed inside), codesign, sudoers, launchd
     uninstall.sh           reverse all of the above, restore sleep
     backstop.sh            standalone restore from JSON
     simulate-lid.sh        file trigger for the lid-close action path (debug and
@@ -979,7 +1183,12 @@ that any case passed; record results in the release validation record.
    containers running". A container started between the two checks →
    untouched, log has the first check finding none and "second check found
    containers running".
-7. **Mute.** Volume 60%, close lid → muted. Open → 60%, unmuted.
+7. **Mute.** Volume 60%, close lid → muted. Open → 60%, unmuted. With a
+   headset as the output, close the lid, unplug the headset, open the lid
+   and choose End: the notification and the menu name the headset as still
+   muted. Plug it back in → its volume comes back and the menu line goes.
+   Repeat, but Quit with the headset unplugged, plug it in, then launch
+   Insomnia → restored at launch.
 8. **Chrome occlusion.** Lid closed, Playwright attached to headed Chrome:
    read `document.visibilityState` and measure `setInterval` drift. Repeat with
    both flags. Decide whether feature 5's browser section stays.
@@ -1020,6 +1229,17 @@ that any case passed; record results in the release validation record.
     0 → put back to 0. Force-quit during a session → `backstop.sh` alone puts
     it back. Set the key to 1 by hand, empty `appNapOverrides`, run
     `uninstall.sh` → it prints the `defaults delete` command and continues.
+15. **Meeting apps.** Freeze-all on, a Zoom or Teams call running on AirPods
+    and Wispr Flow or Granola taking notes. Close the lid → none of their
+    processes shows `T` in `ps -o stat`, the call and the notes continue,
+    other Dock apps are frozen, sound is muted.
+16. **Upgrade notice.** Install over a build whose config.json has
+    `freezeAllApps: true` and `muteOnLidClose: false`. First launch → one
+    "Lid-close settings changed" notification, the same line at the top of
+    Lid-close actions in Settings, both toggles changed, config.json has
+    `lidCloseDefaultsApplied: true`. Turn freeze-all back on, relaunch → no
+    notice, still on. Dismiss removes the Settings line. A fresh install
+    shows no notice.
 
 ## Open decisions (defaults chosen, change if you disagree)
 
