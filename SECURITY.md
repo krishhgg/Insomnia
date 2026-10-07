@@ -1,8 +1,8 @@
 # Security
 
-Insomnia is experimental source-built software. There is no security-response
-SLA or supported binary release series yet. Report suspected vulnerabilities
-against the current main branch, including the affected revision and a minimal,
+Insomnia is experimental software. There is no security-response SLA. Report
+suspected vulnerabilities against the current main branch
+or a release tag, including the affected revision and a minimal,
 non-destructive reproduction.
 
 Do not publish passwords, Keychain data, personal logs, or weaponized exploit
@@ -43,7 +43,7 @@ signing identity (Developer ID) would let the access list name every build
 signed with it. And the item lives in the file-based login Keychain, which
 ignores the data-protection accessibility classes (this device only, when
 unlocked); using that Keychain needs an access-group entitlement, which needs
-a team id. Both wait on a signed release.
+a team id. Releases are ad-hoc signed, so both limits stay.
 
 The recovery LaunchAgent runs only the `backstop.sh` sealed inside the signed
 app bundle, after `codesign --verify --strict` passes against the code
@@ -58,6 +58,20 @@ checks are integrity against accidents and against the app relaying a
 tampered bundle; they are not a boundary against a process running as the
 same user, which can edit the plist, load its own agent, replace and relaunch
 the app, and invoke the four pmset commands directly.
+
+Release zips are built by the Release workflow from the tagged commit and
+published with a `SHA256SUMS` file and a GitHub build provenance attestation.
+Verify both before installing (`shasum -a 256 -c SHA256SUMS`,
+`gh attestation verify <zip> -R krishhgg/Insomnia --signer-workflow
+krishhgg/Insomnia/.github/workflows/release.yml --source-ref
+refs/tags/v<version>`); `install.sh --app` then checks the signature,
+identifier and version of a private copy of the bundle before asking for a
+password, installs that copy, and refuses
+it unless `--allow-unverified-origin` is given, because it cannot verify where
+a bundle came from, whatever its signature names. The attestation shows which workflow run produced
+the bytes, not that the code is free of defects. Releases are ad-hoc signed and
+not notarized ([docs/releasing.md](docs/releasing.md)), so macOS blocks their
+first launch.
 
 Passing automated checks or a secret scan does not establish the absence of
 vulnerabilities. Do not probe recovery by disrupting someone else's processes,

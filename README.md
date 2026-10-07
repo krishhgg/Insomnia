@@ -28,8 +28,8 @@
 </p>
 
 > **Use a stable, well-ventilated surface—not a closed bag.** Insomnia is
-> experimental, source-built software, not a signed and notarized consumer
-> download. Recovery can fail; a running timer is not a safety guarantee.
+> experimental software. Recovery can fail; a running timer is not a safety
+> guarantee.
 > [Validation status](docs/release-validation.md) · [Apple's ventilation guidance](https://support.apple.com/en-us/102336)
 
 <p align="center">
@@ -38,8 +38,7 @@
 
 ## Install
 
-Requires **macOS 26 or later** and **Xcode with Swift 6.2 or later**. Installation
-currently means building from source.
+Requires **macOS 26 or later on an Apple Silicon Mac**.
 
 Paste this into your coding agent:
 
@@ -49,17 +48,67 @@ Install Insomnia from https://github.com/krishhgg/Insomnia by following its READ
 
 Or run it yourself:
 
+1. Download `Insomnia-<version>-macos.zip` and `SHA256SUMS` from the newest
+   release on the [releases page](https://github.com/krishhgg/Insomnia/releases)
+   (releases are marked Pre-release). If the page has no release yet, build
+   from source (below).
+2. Verify the download (`gh` is the [GitHub CLI](https://cli.github.com)):
+
+   ```bash
+   shasum -a 256 -c SHA256SUMS
+   gh attestation verify Insomnia-<version>-macos.zip -R krishhgg/Insomnia \
+     --signer-workflow krishhgg/Insomnia/.github/workflows/release.yml \
+     --source-ref refs/tags/v<version>
+   ```
+
+   The second command checks that this repository's Release workflow built
+   this exact zip for that tag.
+
+3. Unzip and run the installer that comes in the zip:
+
+   ```bash
+   ditto -x -k Insomnia-<version>-macos.zip .
+   cd Insomnia-<version>-macos
+   ./install.sh --allow-unverified-origin --app ./Insomnia.app
+   open "$HOME/Applications/Insomnia.app"
+   ```
+
+   Releases are ad-hoc signed and not notarized. The installer can check that
+   the bundle is intact but not who made it, so it refuses to install without
+   `--allow-unverified-origin`, which says you ran the two commands in step 2.
+   macOS blocks the first launch of a downloaded copy until you allow it in
+   System Settings > Privacy & Security.
+
+The installer checks the bundle's signature, identifier and version before it
+asks for anything. It then installs the app and a background recovery agent,
+and asks for administrator access to install a narrowly scoped sudoers rule. It grants
+**your user account**, not just Insomnia, passwordless access to four
+power-setting commands. Review that permission before installing.
+
+Release zips are built for arm64 only, and their `install.sh --app` stops on
+an Intel Mac. On Intel, building from source (below) is the only option, and
+it is untested there.
+
+### Build from source (experimental)
+
+Requires **Xcode with Swift 6.2 or later**. Clone the newest release tag
+rather than `main`. While no release exists, leave out `--branch v<version>`
+to build `main`:
+
 ```bash
-git clone https://github.com/krishhgg/Insomnia.git
+git clone --branch v<version> --depth 1 https://github.com/krishhgg/Insomnia.git
 cd Insomnia
 ./scripts/install.sh
 open "$HOME/Applications/Insomnia.app"
 ```
 
-The installer builds and ad-hoc signs the app, installs a background recovery
-agent, and asks for administrator access to install a narrowly scoped sudoers
-rule. It grants **your user account**, not just Insomnia, passwordless access to
-four power-setting commands. Review that permission before installing.
+`scripts/install.sh` builds the same bundle the release workflow builds
+(`scripts/build-app.sh`), ad-hoc signed, and installs it the same way. It
+builds only when it runs from a checkout's `scripts` folder, with
+`Package.swift` one level up, and then runs the `build-app.sh` beside it. The
+`install.sh` from a release zip stops and asks for `--app` instead, even when
+a `build-app.sh` was added to its folder after unpacking.
+[docs/releasing.md](docs/releasing.md) describes the release pipeline.
 
 <details>
 <summary><strong>Exactly what gets installed</strong></summary>
@@ -88,10 +137,14 @@ the installed bundle's code requirement (for an ad-hoc build, the cdhash of
 that build) and runs `codesign --verify --strict` against it before executing
 the `backstop.sh` sealed inside the bundle. An edited bundle or script fails
 that check: the agent writes one line to `insomnia.log` and runs nothing until
-you reinstall. No executable is kept in a writable support directory. The plist
-in `~/Library/LaunchAgents` is still a per-user file that any program running
-as you can edit, like every LaunchAgent; the app rewrites it at the next
-session start when it does not match, which is a repair, not a tamper check.
+you reinstall. So no other account can edit it, the installer removes group
+and other write permission and every ACL from the bundle it installs. The
+signature covers neither, so the bundle still verifies, and extended
+attributes such as a download's quarantine flag are kept. No executable is
+kept in a writable support directory. The plist in `~/Library/LaunchAgents`
+is still a per-user file that any program running as you can edit, like
+every LaunchAgent; the app rewrites it at the next session start when it does
+not match, which is a repair, not a tamper check.
 
 What the app pins is the requirement of the code it is itself running, read
 through the Security framework after checking that the bundle on disk is still
@@ -520,6 +573,15 @@ From your checkout:
 # Also remove Insomnia-owned configuration and logs:
 ./scripts/uninstall.sh --purge
 ```
+
+From the unpacked release zip, run `./uninstall.sh` (or `./uninstall.sh
+--purge`) in the `Insomnia-<version>-macos` folder. A checkout's uninstaller
+(in `scripts`, with `Package.swift` one level up) runs the `backstop.sh`
+beside it. Anywhere else, such as the zip's folder, the uninstaller runs only
+the copy sealed in the installed app, after `codesign --verify --strict`
+passes on the app, and stops without removing anything when there is none.
+The zip has no `backstop.sh`, so one added beside its uninstaller is not run.
+Neither looks in the folder above its own.
 
 The uninstaller requests cleanup before removing the app, agent, and sudoers
 rule. If recovery is incomplete or the app refuses to quit, it stops; resolve

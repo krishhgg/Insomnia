@@ -1857,6 +1857,94 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(fx.exists(fx.legacyBackstop), "the writable copy goes with the rest")
     }
 
+    /// A release zip has no backstop.sh beside its uninstall.sh. Unpacked
+    /// at /tmp/Insomnia-<version>, the parent folder is /tmp, where any
+    /// account can create scripts/backstop.sh; uninstall runs the sealed
+    /// copy after verifying the bundle and never one from the parent.
+    func testUninstallFromAZipRunsTheSealedCopyNotABackstopInTheParentFolder() throws {
+        try fx.installMachinery()
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        try fx.writeMarkerBackstop(at: fx.installedBackstop, name: "sealed")
+        let shared = fx.root.appendingPathComponent("shared-tmp", isDirectory: true)
+        let unpacked = shared.appendingPathComponent("Insomnia-0.1.0-macos", isDirectory: true)
+        try FileManager.default.createDirectory(at: unpacked, withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: fx.uninstall, to: unpacked.appendingPathComponent("uninstall.sh"))
+        try fx.writeMarkerBackstop(at: shared.appendingPathComponent("scripts/backstop.sh"), name: "planted")
+
+        let r = try fx.run(unpacked.appendingPathComponent("uninstall.sh"))
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertEqual(fx.calls().filter { $0.hasPrefix("backstop ") }, ["backstop sealed --force"], "\(fx.calls())")
+        XCTAssertTrue(r.stdout.contains("using \(fx.installedBackstop.path)"), r.stdout)
+        let verify = try XCTUnwrap(fx.calls().firstIndex(of: "codesign --verify --strict \(fx.app.path)"), "the sealed copy is verified: \(fx.calls())")
+        let ran = try XCTUnwrap(fx.calls().firstIndex(of: "backstop sealed --force"))
+        XCTAssertLessThan(verify, ran, "verified before it runs: \(fx.calls())")
+        XCTAssertFalse(fx.exists(fx.app))
+    }
+
+    /// A backstop.sh added beside the zip's uninstall.sh (the zip has none),
+    /// as another account could do in a folder it created in /tmp before the
+    /// zip was unpacked there, is not run. Outside a source checkout
+    /// (scripts/ with Package.swift one level up) uninstall.sh runs only the
+    /// sealed copy, after the bundle verifies, and says it left the other
+    /// one alone. Also in a folder named scripts with no Package.swift above
+    /// it, and in a zip folder unpacked inside a checkout, which has
+    /// Package.swift above it but is not scripts/.
+    func testUninstallFromAZipRunsTheSealedCopyNotABackstopPlantedBesideIt() throws {
+        for folder in ["shared-tmp/Insomnia-0.1.0-macos", "shared-tmp/scripts", "repo/Insomnia-0.1.0-macos"] {
+            fx.destroy()
+            fx = try ScriptFixture()
+            try fx.installMachinery()
+            try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+            try fx.writeMarkerBackstop(at: fx.installedBackstop, name: "sealed")
+            let unpacked = fx.root.appendingPathComponent(folder, isDirectory: true)
+            try FileManager.default.createDirectory(at: unpacked, withIntermediateDirectories: true)
+            try FileManager.default.copyItem(at: fx.uninstall, to: unpacked.appendingPathComponent("uninstall.sh"))
+            let planted = unpacked.appendingPathComponent("backstop.sh")
+            try fx.writeMarkerBackstop(at: planted, name: "planted")
+
+            let r = try fx.run(unpacked.appendingPathComponent("uninstall.sh"))
+
+            XCTAssertEqual(r.status, 0, "\(folder): " + r.stderr + r.stdout)
+            XCTAssertEqual(fx.calls().filter { $0.hasPrefix("backstop ") }, ["backstop sealed --force"], "\(folder): \(fx.calls())")
+            XCTAssertTrue(r.stdout.contains("using \(fx.installedBackstop.path)"), r.stdout)
+            XCTAssertTrue(r.stderr.contains("not running \(planted.path): \(unpacked.path) is not the scripts folder of a source checkout"), r.stderr)
+            let verify = try XCTUnwrap(fx.calls().firstIndex(of: "codesign --verify --strict \(fx.app.path)"), "the sealed copy is verified: \(fx.calls())")
+            let ran = try XCTUnwrap(fx.calls().firstIndex(of: "backstop sealed --force"))
+            XCTAssertLessThan(verify, ran, "verified before it runs: \(fx.calls())")
+            XCTAssertFalse(fx.exists(fx.app))
+        }
+    }
+
+    /// From a zip folder, the sealed copy is the only one uninstall.sh runs.
+    /// With no sealed copy in the installed app, it runs neither a planted
+    /// backstop.sh beside it nor the writable copy an install before the
+    /// sealed layout left in Application Support, removes nothing, and
+    /// names the checkout's uninstaller (which still runs the writable copy,
+    /// see testUninstallRunsTheLegacyCopyWhenNeitherCheckoutNorBundleHasOne).
+    func testUninstallFromAZipRunsNoOtherCopyWhenTheBundleHasNoSealedOne() throws {
+        try fx.installMachinery()
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        try FileManager.default.removeItem(at: fx.installedBackstop)
+        try fx.writeMarkerBackstop(at: fx.legacyBackstop, name: "legacy")
+        let unpacked = fx.root.appendingPathComponent("shared-tmp/Insomnia-0.1.0-macos", isDirectory: true)
+        try FileManager.default.createDirectory(at: unpacked, withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: fx.uninstall, to: unpacked.appendingPathComponent("uninstall.sh"))
+        try fx.writeMarkerBackstop(at: unpacked.appendingPathComponent("backstop.sh"), name: "planted")
+
+        let r = try fx.run(unpacked.appendingPathComponent("uninstall.sh"), ["--purge"])
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("backstop ") }, "neither the planted nor the writable copy ran: \(fx.calls())")
+        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("launchctl") || $0.hasPrefix("sudo") }, "\(fx.calls())")
+        XCTAssertTrue(r.stderr.contains("no backstop.sh sealed in \(fx.app.path)/Contents/Resources, and outside a source checkout this script runs no other copy; nothing was removed."), r.stderr)
+        XCTAssertTrue(r.stderr.contains("Run scripts/uninstall.sh from a checkout of the source"), r.stderr)
+        for kept in [fx.plist, fx.sudoers, fx.app, fx.config, fx.legacyBackstop] {
+            XCTAssertTrue(fx.exists(kept), kept.path)
+        }
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, true)
+    }
+
     /// The sealed copy is covered by the bundle's resource seal; when the
     /// bundle no longer verifies (the script was edited, as the LaunchAgent
     /// would also find), uninstall does not run it and removes nothing. The
@@ -3045,12 +3133,24 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(r.stderr.contains("left as it was"), r.stderr)
         XCTAssertTrue(r.stderr.contains("not verified"), "no schedule claim from print alone: \(r.stderr)")
         XCTAssertFalse(r.stderr.contains("every minute"), r.stderr)
-        XCTAssertTrue(r.stderr.contains("/scripts/backstop.sh --force"), "manual step named: \(r.stderr)")
+        XCTAssertTrue(r.stderr.contains("/scripts/backstop.sh --force"), "manual step named, the checkout's copy: \(r.stderr)")
         XCTAssertTrue(r.stderr.contains("not replaced"), r.stderr)
         XCTAssertEqual(try fx.installedBinaryFirstLine(), "previous", "the bundle the retained agent pins stays in place")
         XCTAssertEqual(try fx.contents(of: fx.appsDir), ["Insomnia.app"], "the staged build is discarded and nothing is set aside")
         XCTAssertTrue(r.stderr.contains("discarded"), r.stderr)
         XCTAssertTrue(try fx.lockIsFree(), "the transaction ends with the script")
+
+        // A zip install has no scripts/ directory. The checked copy of the bundle is gone when the
+        // script exits and the original was never checked in place, so the hint runs no script from
+        // either; it names this installer again, which checks a new copy first.
+        let prebuilt = try writePrebuiltAppAtAnAwkwardPath()
+        let zip = try fx.run(fx.installRedirected, ["--allow-unverified-origin", "--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(zip.status, 1, zip.stderr + zip.stdout)
+        XCTAssertFalse(zip.stderr.contains("/bin/bash"), "no hand-run backstop.sh: \(zip.stderr)")
+        XCTAssertFalse(zip.stderr.contains("backstop.sh --force"), "nothing inside the unchecked bundle is run: \(zip.stderr)")
+        XCTAssertEqual(try pastedWords(of: printedCommand(in: zip.stderr, containing: " --app ")), [fx.installRedirected.path, "--allow-unverified-origin", "--app", prebuilt.path], "manual step reruns the installer on the bundle")
+        XCTAssertEqual(try fx.installedBinaryFirstLine(), "previous")
     }
 
     func testInstallDoesNotClaimAnAgentRetriesWhenNoneIsLoaded() throws {
@@ -3200,6 +3300,434 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(try fx.contents(of: fx.plist.deletingLastPathComponent()), ["com.insomnia.backstop.plist"])
     }
 
+    // MARK: - install.sh --app (a prebuilt bundle, as from a release zip)
+
+    /// The private copy install.sh --app checks and installs, read from the
+    /// first deep verify in the recorded calls. Never the path passed in.
+    /// A prebuilt bundle in a directory whose name has a space, double quotes
+    /// and a `$`, all of which a command printed for pasting has to keep.
+    private func writePrebuiltAppAtAnAwkwardPath() throws -> URL {
+        let dir = fx.root.appendingPathComponent(#"My "dl" $HOME"#, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let app = dir.appendingPathComponent("Insomnia.app", isDirectory: true)
+        try FileManager.default.moveItem(at: try fx.writePrebuiltApp(), to: app)
+        return app
+    }
+
+    private func checkedCopy(of prebuilt: URL) throws -> String {
+        let prefix = "codesign --verify --strict --deep "
+        let call = try XCTUnwrap(fx.calls().first { $0.hasPrefix(prefix) }, "\(fx.calls())")
+        let path = String(call.dropFirst(prefix.count))
+        XCTAssertNotEqual(path, prebuilt.path, "checked at the path passed in")
+        XCTAssertTrue(path.hasSuffix("/Insomnia.app"), path)
+        return path
+    }
+
+    /// The prebuilt bundle is checked before the password prompt and
+    /// installed as it is: no build, the signature verified with --deep,
+    /// the identifier and version read, then the usual steps with the same
+    /// agent plist a source install writes. An ad-hoc bundle's origin cannot
+    /// be verified, so this takes --allow-unverified-origin and the installer
+    /// says what that means.
+    func testInstallFromPrebuiltAppVerifiesItBeforeSudoAndInstallsItWithoutBuilding() throws {
+        try fx.prepareInstall()
+        let prebuilt = try fx.writePrebuiltApp()
+        fx.setMode("launchctl", "loaded")
+
+        let r = try fx.run(fx.installRedirected, ["--allow-unverified-origin", "--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        let calls = fx.calls()
+        XCTAssertFalse(calls.contains { $0.hasPrefix("swift") }, "nothing is built: \(calls)")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("codesign --force") }, "the bundle is installed as signed: \(calls)")
+        let copy = try checkedCopy(of: prebuilt)
+        let verify = try XCTUnwrap(calls.firstIndex(of: "codesign --verify --strict --deep \(copy)"), "\(calls)")
+        let visudo = try XCTUnwrap(calls.firstIndex { $0.hasPrefix("sudo visudo") }, "\(calls)")
+        XCTAssertLessThan(verify, visudo, "verified before the password prompt: \(calls)")
+        XCTAssertTrue(r.stdout.contains("WARNING: the origin of Insomnia 0.1.0 is not verified. Its signature shows the bundle is intact, not who made it."), r.stdout)
+        XCTAssertTrue(r.stdout.contains("--allow-unverified-origin: installing it anyway"), r.stdout)
+        XCTAssertTrue(r.stdout.contains("macOS blocks the first launch"), r.stdout)
+        XCTAssertEqual(try String(contentsOf: fx.app.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "prebuilt")
+        XCTAssertTrue(fx.exists(fx.installedBackstop))
+        XCTAssertTrue(fx.exists(prebuilt), "the source bundle is copied, not moved")
+        let plist = try fx.plistOnDisk()
+        let expected = LaunchdBackstop.plistDictionary(label: "com.insomnia.backstop", target: BackstopTarget(bundle: fx.app, requirement: fx.requirement))
+        XCTAssertTrue(NSDictionary(dictionary: plist).isEqual(to: expected), "same agent as a source install: \(plist)")
+        XCTAssertTrue(r.stdout.contains("Uninstall:"), r.stdout)
+    }
+
+    /// The checks run on a private copy, and that copy is what gets staged
+    /// and pinned. A bundle swapped at the --app path while the password
+    /// prompt waits (the fake sudo does it during visudo) is never copied in.
+    func testInstallFromPrebuiltAppInstallsTheCopyItCheckedNotABundleSwappedDuringThePrompt() throws {
+        try fx.prepareInstall()
+        let prebuilt = try fx.writePrebuiltApp()
+        fx.setMode("launchctl", "loaded")
+        fx.setMode("sudo", "swap-prebuilt")
+
+        let r = try fx.run(fx.installRedirected, ["--allow-unverified-origin", "--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertEqual(try String(contentsOf: prebuilt.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "swapped", "the bundle at the --app path was replaced during the prompt")
+        XCTAssertEqual(try String(contentsOf: fx.app.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "prebuilt", "the checked copy is installed")
+        let copy = try checkedCopy(of: prebuilt)
+        let calls = fx.calls()
+        XCTAssertFalse(calls.contains { $0.hasSuffix(" \(prebuilt.path)") }, "no tool reads the --app path itself: \(calls)")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: copy), "the private copy is removed at exit")
+    }
+
+    /// A release zip unpacked inside a source checkout: the uninstaller the
+    /// installer names is the one beside it, not the checkout's.
+    func testInstallFromAZipInsideACheckoutNamesTheUninstallerBesideIt() throws {
+        try fx.prepareInstall()
+        let prebuilt = try fx.writePrebuiltApp()
+        fx.setMode("launchctl", "loaded")
+        let unpacked = fx.repoScripts.deletingLastPathComponent().appendingPathComponent("Insomnia-0.1.0-macos", isDirectory: true)
+        try FileManager.default.createDirectory(at: unpacked, withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: fx.installRedirected, to: unpacked.appendingPathComponent("install.sh"))
+        try "# the zip's uninstaller\n".write(to: unpacked.appendingPathComponent("uninstall.sh"), atomically: true, encoding: .utf8)
+        XCTAssertTrue(fx.exists(fx.repoScripts.appendingPathComponent("uninstall.sh")), "the checkout around it has one too")
+
+        let r = try fx.run(unpacked.appendingPathComponent("install.sh"), ["--allow-unverified-origin", "--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertTrue(r.stdout.contains("Uninstall:         \(unpacked.path)/uninstall.sh"), r.stdout)
+    }
+
+    /// A release zip has install.sh but no build-app.sh. Run without --app
+    /// from a zip unpacked at /tmp/Insomnia-<version>, install.sh refuses
+    /// before anything runs instead of running a scripts/build-app.sh that
+    /// any account could have put in the parent folder.
+    func testInstallFromAZipWithoutTheAppFlagRefusesAndRunsNoBuildScriptFromTheParentFolder() throws {
+        try fx.prepareInstall()
+        let shared = fx.root.appendingPathComponent("shared-tmp", isDirectory: true)
+        let unpacked = shared.appendingPathComponent("Insomnia-0.1.0-macos", isDirectory: true)
+        try FileManager.default.createDirectory(at: unpacked, withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: fx.installRedirected, to: unpacked.appendingPathComponent("install.sh"))
+        let planted = shared.appendingPathComponent("scripts/build-app.sh")
+        try FileManager.default.createDirectory(at: planted.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try "#!/bin/bash\nprintf 'planted build-app.sh %s\\n' \"$*\" >> \"\(fx.callsLog.path)\"\nexit 1\n"
+            .write(to: planted, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: planted.path)
+
+        let r = try fx.run(unpacked.appendingPathComponent("install.sh"), extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertEqual(fx.callsBesideScratchFiles(), [], "nothing ran, the planted script included")
+        XCTAssertTrue(r.stderr.contains("\(unpacked.path) is not the scripts folder of a source checkout"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("pass it with --app"), r.stderr)
+        XCTAssertFalse(fx.exists(fx.sudoers))
+        XCTAssertFalse(fx.exists(fx.app))
+    }
+
+    /// A build-app.sh added beside the zip's install.sh, as another account
+    /// could do in a folder it created in /tmp before the zip was unpacked
+    /// there. Without --app, install.sh builds only in a source checkout
+    /// (scripts/ with Package.swift one level up), so it refuses, runs
+    /// nothing and says the script was not run. Also in a folder named
+    /// scripts with no Package.swift above it, and in a zip folder unpacked
+    /// inside a checkout, which has Package.swift above it but is not
+    /// scripts/.
+    func testInstallFromAZipRunsNoBuildScriptPlantedBesideIt() throws {
+        try fx.prepareInstall()
+        for folder in ["shared-tmp/Insomnia-0.1.0-macos", "shared-tmp/scripts", "repo/Insomnia-0.1.0-macos"] {
+            fx.clearCalls()
+            let unpacked = fx.root.appendingPathComponent(folder, isDirectory: true)
+            try FileManager.default.createDirectory(at: unpacked, withIntermediateDirectories: true)
+            try FileManager.default.copyItem(at: fx.installRedirected, to: unpacked.appendingPathComponent("install.sh"))
+            let planted = unpacked.appendingPathComponent("build-app.sh")
+            try "#!/bin/bash\nprintf 'planted build-app.sh %s\\n' \"$*\" >> \"\(fx.callsLog.path)\"\nexit 0\n"
+                .write(to: planted, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: planted.path)
+
+            let r = try fx.run(unpacked.appendingPathComponent("install.sh"), extraEnvironment: ["USER": "tester"])
+
+            XCTAssertEqual(r.status, 1, "\(folder): " + r.stderr + r.stdout)
+            XCTAssertEqual(fx.callsBesideScratchFiles(), [], "\(folder): nothing ran, the planted script included")
+            XCTAssertTrue(r.stderr.contains("\(unpacked.path) is not the scripts folder of a source checkout"), r.stderr)
+            XCTAssertTrue(r.stderr.contains("\(planted.path) was not run: a release zip has no build-app.sh"), r.stderr)
+            XCTAssertFalse(fx.exists(fx.sudoers))
+            XCTAssertFalse(fx.exists(fx.app))
+        }
+    }
+
+    /// Release bundles are arm64 only. On a Mac whose hardware is not Apple
+    /// Silicon (sysctl reads 0, or has no hw.optional.arm64), install.sh
+    /// --app refuses before it copies or checks the bundle, and names the
+    /// source build. A source build on the same Mac does not ask.
+    func testInstallFromPrebuiltAppRefusesOnAMacThatIsNotAppleSilicon() throws {
+        try fx.prepareInstall()
+        let prebuilt = try fx.writePrebuiltApp()
+        fx.setMode("launchctl", "loaded")
+        for (mode, read) in [("intel-0", "0"), ("intel-missing", "no value")] {
+            fx.clearCalls()
+            fx.setMode("sysctl", mode)
+
+            let r = try fx.run(fx.installRedirected, ["--allow-unverified-origin", "--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
+
+            XCTAssertEqual(r.status, 1, "\(mode): " + r.stderr + r.stdout)
+            XCTAssertEqual(fx.callsBesideScratchFiles(), ["sysctl -n hw.optional.arm64"], "\(mode): nothing else ran: \(fx.calls())")
+            XCTAssertTrue(r.stderr.contains("Release bundles of Insomnia run on Apple Silicon Macs only, and this Mac is not one ('sysctl -n hw.optional.arm64' gave \(read))."), r.stderr)
+            XCTAssertTrue(r.stderr.contains("Build and install from a source checkout instead (README, Build from source). Nothing was changed."), r.stderr)
+            XCTAssertFalse(fx.exists(fx.sudoers))
+            XCTAssertFalse(fx.exists(fx.app))
+        }
+
+        fx.clearCalls()
+        let built = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(built.status, 0, built.stderr + built.stdout)
+        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("sysctl") }, "a source build fits the Mac it is built on: \(fx.calls())")
+        XCTAssertTrue(fx.exists(fx.app))
+    }
+
+    /// Integrity is not origin: a bundle that passes every check on it could
+    /// still have been signed by anyone, and install.sh does not take the
+    /// signer's word for where it came from. Whatever the signature names
+    /// (ad-hoc, or a Developer ID certificate and team), without
+    /// --allow-unverified-origin install.sh refuses it before the password
+    /// prompt and names the flag. With the flag the Developer ID bundle gets
+    /// the same warning as an ad-hoc one, not a verified origin.
+    func testInstallFromPrebuiltAppNeedsTheOptInWhateverItsSignatureNames() throws {
+        try fx.prepareInstall()
+        let prebuilt = try writePrebuiltAppAtAnAwkwardPath()
+        fx.setMode("launchctl", "loaded")
+
+        for signing in ["adhoc", "developer-id:ABCDE12345"] {
+            fx.setSigning(signing)
+            fx.clearCalls()
+            let r = try fx.run(fx.installRedirected, ["--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
+
+            XCTAssertEqual(r.status, 1, "\(signing): \(r.stderr + r.stdout)")
+            let copy = try checkedCopy(of: prebuilt)
+            XCTAssertEqual(fx.callsBesideScratchFiles(), ["sysctl -n hw.optional.arm64", "codesign --verify --strict --deep \(copy)"], "\(signing): \(fx.calls())")
+            XCTAssertTrue(r.stderr.contains("The origin of Insomnia 0.1.0 at \(prebuilt.path) is not verified."), "\(signing): \(r.stderr)")
+            XCTAssertEqual(try pastedWords(of: printedCommand(in: r.stderr, containing: " --app ")), [fx.installRedirected.path, "--allow-unverified-origin", "--app", prebuilt.path], "\(signing): names the flag")
+            XCTAssertTrue(r.stderr.contains("Nothing was changed"), "\(signing): \(r.stderr)")
+            XCTAssertFalse(fx.exists(fx.app), signing)
+            XCTAssertFalse(fx.exists(fx.sudoers), signing)
+        }
+
+        fx.clearCalls()
+        let flagged = try fx.run(fx.installRedirected, ["--allow-unverified-origin", "--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(flagged.status, 0, flagged.stderr + flagged.stdout)
+        XCTAssertTrue(flagged.stdout.contains("WARNING: the origin of Insomnia 0.1.0 is not verified."), flagged.stdout)
+        XCTAssertEqual(try String(contentsOf: fx.app.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "prebuilt")
+        XCTAssertTrue(fx.exists(fx.installedBackstop))
+    }
+
+    /// The release-install path with the real codesign: a bundle ad-hoc
+    /// signed with `codesign -s -` inside the fixture (every other tool stays
+    /// a fake) verifies before the password prompt, the copy ditto makes at
+    /// the installed path verifies again against the requirement codesign
+    /// read from it, and the agent plist pins that real cdhash. After the
+    /// sealed script is edited the same bundle is refused before sudo with
+    /// codesign's reason.
+    func testInstallFromAnAdHocSignedPrebuiltAppVerifiesTheRealSignatureAndItsDittoCopy() throws {
+        try fx.prepareInstall()
+        try fx.writeInstallCopies(extraConstants: ["CODESIGN": "/usr/bin/codesign"])
+        let prebuilt = try fx.writePrebuiltApp(machO: true)
+        let sign = try fx.runTool("/usr/bin/codesign", ["--force", "--sign", "-", prebuilt.path])
+        XCTAssertEqual(sign.status, 0, sign.output)
+        fx.setMode("launchctl", "loaded")
+
+        let r = try fx.run(fx.installRedirected, ["--allow-unverified-origin", "--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        let requirement = try CodeRequirement.designated(ofCodeAt: prebuilt)
+        XCTAssertTrue(requirement.hasPrefix("cdhash H\""), requirement)
+        XCTAssertTrue(r.stdout.contains("LaunchAgent will require: \(requirement)"), r.stdout)
+        let installed = try fx.runTool("/usr/bin/codesign", ["--verify", "--strict", "--deep", fx.app.path])
+        XCTAssertEqual(installed.status, 0, "the ditto copy at the installed path verifies: \(installed.output)")
+        XCTAssertNoThrow(try CodeRequirement.verify(codeAt: fx.app, satisfies: requirement))
+        let plist = try fx.plistOnDisk()
+        let expected = LaunchdBackstop.plistDictionary(label: "com.insomnia.backstop", target: BackstopTarget(bundle: fx.app, requirement: requirement))
+        XCTAssertTrue(NSDictionary(dictionary: plist).isEqual(to: expected), "the agent pins the real requirement: \(plist)")
+        XCTAssertTrue(fx.calls().contains { $0.hasPrefix("launchctl bootstrap") }, "\(fx.calls())")
+
+        let sealed = prebuilt.appendingPathComponent("Contents/Resources/backstop.sh")
+        try (String(contentsOf: sealed, encoding: .utf8) + "# edited\n").write(to: sealed, atomically: true, encoding: .utf8)
+        fx.clearCalls()
+        let edited = try fx.run(fx.installRedirected, ["--allow-unverified-origin", "--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(edited.status, 1, edited.stderr + edited.stdout)
+        XCTAssertEqual(fx.callsBesideScratchFiles(), ["sysctl -n hw.optional.arm64"], "the real codesign refused before any other fake tool ran: \(fx.calls())")
+        XCTAssertTrue(edited.stderr.contains("fails 'codesign --verify --strict --deep'"), edited.stderr)
+        XCTAssertTrue(edited.stderr.contains("Nothing was changed"), edited.stderr)
+    }
+
+    /// A zip unpacked by a tool that keeps group and other write bits, or a
+    /// download given an ACL, leaves a bundle other accounts could edit.
+    /// Neither is part of the signature: the bundle verifies with them, and
+    /// the installed copy loses both, keeps the quarantine flag and still
+    /// passes the real codesign and the requirement the agent pins.
+    func testInstallFromAPrebuiltAppDropsOtherAccountsWriteAccessButKeepsTheSignatureAndQuarantine() throws {
+        try fx.prepareInstall()
+        try fx.writeInstallCopies(extraConstants: ["CODESIGN": "/usr/bin/codesign"])
+        let prebuilt = try fx.writePrebuiltApp(machO: true)
+        let sign = try fx.runTool("/usr/bin/codesign", ["--force", "--sign", "-", prebuilt.path])
+        XCTAssertEqual(sign.status, 0, sign.output)
+        let loosen = try fx.runTool("/bin/chmod", ["-R", "go+w", prebuilt.path])
+        XCTAssertEqual(loosen.status, 0, loosen.output)
+        let resources = prebuilt.appendingPathComponent("Contents/Resources")
+        for (path, rule) in [(resources.path, "everyone allow add_file,delete_child"),
+                             (resources.appendingPathComponent("backstop.sh").path, "everyone allow write,append")] {
+            let acl = try fx.runTool("/bin/chmod", ["+a", rule, path])
+            XCTAssertEqual(acl.status, 0, acl.output)
+        }
+        let mark = try fx.runTool("/usr/bin/xattr", ["-w", "com.apple.quarantine", "0081;66f00000;Safari;", prebuilt.path])
+        XCTAssertEqual(mark.status, 0, mark.output)
+        XCTAssertFalse(try writableByOthers(prebuilt).isEmpty)
+        XCTAssertEqual(try aclEntries(prebuilt).count, 2, "the ACLs are in place before the install")
+        let before = try fx.runTool("/usr/bin/codesign", ["--verify", "--strict", "--deep", prebuilt.path])
+        XCTAssertEqual(before.status, 0, "modes and ACLs are not part of the signature: \(before.output)")
+        fx.setMode("launchctl", "loaded")
+
+        let r = try fx.run(fx.installRedirected, ["--allow-unverified-origin", "--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertEqual(try writableByOthers(fx.app), [], "no group or other write bit is left")
+        XCTAssertEqual(try aclEntries(fx.app), [], "no ACL entry is left")
+        let quarantine = try fx.runTool("/usr/bin/xattr", ["-p", "com.apple.quarantine", fx.app.path])
+        XCTAssertEqual(quarantine.status, 0, "the quarantine flag stays: \(quarantine.output)")
+        XCTAssertFalse(quarantine.output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        let installed = try fx.runTool("/usr/bin/codesign", ["--verify", "--strict", "--deep", fx.app.path])
+        XCTAssertEqual(installed.status, 0, "the installed copy still verifies: \(installed.output)")
+        let requirement = try CodeRequirement.designated(ofCodeAt: prebuilt)
+        XCTAssertTrue(r.stdout.contains("LaunchAgent will require: \(requirement)"), r.stdout)
+        XCTAssertNoThrow(try CodeRequirement.verify(codeAt: fx.app, satisfies: requirement))
+    }
+
+    /// A source build made under umask 002 has group-writable files and
+    /// folders; the installed bundle has none.
+    func testInstallFromSourceUnderAGroupWritableUmaskLeavesNothingGroupWritable() throws {
+        try fx.prepareInstall()
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        fx.setMode("launchctl", "loaded")
+        let wrapper = fx.root.appendingPathComponent("umask-002.sh")
+        try "umask 0002\nexec /bin/bash \"\(fx.installRedirected.path)\" \"$@\"\n".write(to: wrapper, atomically: true, encoding: .utf8)
+
+        let r = try fx.run(wrapper, extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertTrue(fx.exists(fx.installedBackstop))
+        XCTAssertEqual(try writableByOthers(fx.app), [], "no group or other write bit is left")
+    }
+
+    /// Every path in `bundle`, itself included.
+    private func bundlePaths(_ bundle: URL) throws -> [String] {
+        let walk = try XCTUnwrap(FileManager.default.enumerator(atPath: bundle.path))
+        var paths = [bundle.path]
+        while let relative = walk.nextObject() as? String {
+            paths.append(bundle.appendingPathComponent(relative).path)
+        }
+        return paths
+    }
+
+    /// The paths in `bundle` (symbolic links aside) that group or other may write.
+    private func writableByOthers(_ bundle: URL) throws -> [String] {
+        try bundlePaths(bundle).filter { path in
+            let attributes = try FileManager.default.attributesOfItem(atPath: path)
+            guard attributes[.type] as? FileAttributeType != .typeSymbolicLink else { return false }
+            let mode = (attributes[.posixPermissions] as? NSNumber)?.intValue ?? 0
+            return mode & 0o022 != 0
+        }
+    }
+
+    /// The ACL entries `ls -led` prints for the paths in `bundle`, such as
+    /// " 0: group:everyone allow write,append".
+    private func aclEntries(_ bundle: URL) throws -> [String] {
+        try bundlePaths(bundle).flatMap { path in
+            let ls = try fx.runTool("/bin/ls", ["-led", path])
+            XCTAssertEqual(ls.status, 0, ls.output)
+            return ls.output.split(separator: "\n").map(String.init).filter { $0.range(of: #"^ \d+: "#, options: .regularExpression) != nil }
+        }
+    }
+
+    /// The integrity checks below hold with --allow-unverified-origin: the
+    /// flag vouches for where a bundle came from, never for a bundle that
+    /// fails them.
+    func testInstallFromPrebuiltAppStopsBeforeSudoWhenItsSignatureDoesNotVerify() throws {
+        try fx.prepareInstall()
+        try fx.installMachinery()
+        let prebuilt = try fx.writePrebuiltApp()
+        fx.setMode("codesign", "deep-verify-fails")
+
+        let r = try fx.run(fx.installRedirected, ["--allow-unverified-origin", "--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        let calls = fx.callsBesideScratchFiles()
+        XCTAssertEqual(calls, ["sysctl -n hw.optional.arm64", "codesign --verify --strict --deep \(try checkedCopy(of: prebuilt))"], "nothing after the failed check: \(fx.calls())")
+        XCTAssertTrue(r.stderr.contains("fails 'codesign --verify --strict --deep'"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("Nothing was changed"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("SHA256SUMS"), "points at the download checks: \(r.stderr)")
+        XCTAssertEqual(try String(contentsOf: fx.app.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "binary", "old bundle kept")
+        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), "rule", "sudoers rule kept")
+        XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "plist", "trusted plist kept")
+    }
+
+    func testInstallFromPrebuiltAppRefusesAnotherIdentifierAVersionlessBundleAndAMissingBackstop() throws {
+        try fx.prepareInstall()
+        let cases: [(String, String, (ScriptFixture) throws -> URL)] = [
+            ("identifier", "has bundle identifier 'com.example.other', not com.kgarg.insomnia", { try $0.writePrebuiltApp(bundleID: "com.example.other") }),
+            ("version", "has no usable CFBundleShortVersionString ('dev')", { try $0.writePrebuiltApp(version: "dev") }),
+            ("backstop", "has no Contents/Resources/backstop.sh", { try $0.writePrebuiltApp(withBackstop: false) }),
+        ]
+        for (name, reason, make) in cases {
+            let bundle = try make(fx)
+            fx.clearCalls()
+            let r = try fx.run(fx.installRedirected, ["--allow-unverified-origin", "--app", bundle.path], extraEnvironment: ["USER": "tester"])
+            XCTAssertEqual(r.status, 1, "\(name): \(r.stderr + r.stdout)")
+            XCTAssertFalse(fx.calls().contains { $0.hasPrefix("sudo") }, "\(name): \(fx.calls())")
+            XCTAssertTrue(r.stderr.contains(reason), "\(name): \(r.stderr)")
+            XCTAssertTrue(r.stderr.contains("Nothing was changed"), "\(name): \(r.stderr)")
+            XCTAssertFalse(fx.exists(fx.app), name)
+            XCTAssertFalse(fx.exists(fx.sudoers), name)
+            try FileManager.default.removeItem(at: bundle)
+        }
+    }
+
+    /// A source install builds through build-app.sh into a staging
+    /// directory before the password prompt; the installed bundle is that
+    /// build, and the staging directory is gone afterwards.
+    func testInstallFromSourceBuildsBeforeSudoAndInstallsTheStagedBundle() throws {
+        try fx.prepareInstall()
+        fx.setMode("launchctl", "loaded")
+
+        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        let calls = fx.calls()
+        let build = try XCTUnwrap(calls.firstIndex(of: "swift build -c release"), "\(calls)")
+        let sign = try XCTUnwrap(calls.firstIndex { $0.hasPrefix("codesign --force --sign - ") }, "ad-hoc, no identity in the environment: \(calls)")
+        let visudo = try XCTUnwrap(calls.firstIndex { $0.hasPrefix("sudo visudo") }, "\(calls)")
+        XCTAssertLessThan(build, sign)
+        XCTAssertLessThan(sign, visudo, "built and signed before the password prompt: \(calls)")
+        XCTAssertFalse(calls[sign].contains(fx.app.path), "signed in staging, not in place: \(calls[sign])")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("codesign --verify --strict --deep") }, "the prebuilt checks are for --app only: \(calls)")
+        XCTAssertTrue(fx.exists(fx.app.appendingPathComponent("Contents/MacOS/Insomnia")))
+        XCTAssertTrue(fx.exists(fx.installedBackstop))
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: fx.appsDir.path), ["Insomnia.app"])
+    }
+
+    func testInstallRejectsUnknownArguments() throws {
+        try fx.prepareInstall()
+
+        let r = try fx.run(fx.installRedirected, ["--bogus"], extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 2, r.stderr + r.stdout)
+        XCTAssertEqual(fx.calls(), [])
+        XCTAssertTrue(r.stderr.contains("usage:"), r.stderr)
+
+        let flagAlone = try fx.run(fx.installRedirected, ["--allow-unverified-origin"], extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(flagAlone.status, 2, flagAlone.stderr + flagAlone.stdout)
+        XCTAssertEqual(fx.calls(), [])
+        XCTAssertTrue(flagAlone.stderr.contains("applies to --app only"), flagAlone.stderr)
+        XCTAssertFalse(fx.exists(fx.sudoers))
+    }
+
     /// The writable copy of installs before the sealed layout is removed
     /// once the verifying agent is confirmed loaded, not before: until then
     /// the previous agent (which runs that copy) is what retries.
@@ -3227,16 +3755,18 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(fx.exists(fx.installedBackstop))
     }
 
-    /// install.sh runs the agent's own check once, right after signing. A
-    /// bundle that fails it would give an agent that always refuses, so the
-    /// agent is not installed and the previous one is left alone.
+    /// install.sh runs the agent's own check (`--verify -R=<requirement>`)
+    /// once, on the installed copy. A bundle that fails it would give an
+    /// agent that always refuses, so the agent is not installed and the
+    /// previous one is left alone. (build-app.sh's plain `--verify` passed
+    /// before the password prompt; only the pinned check fails here.)
     func testInstallStopsBeforeTheAgentWhenTheBundleFailsItsOwnRequirementCheck() throws {
         try fx.prepareInstall()
         try fx.writePreviousApp()
         try "trusted".write(to: fx.plist, atomically: true, encoding: .utf8)
         try fx.writeMarkerBackstop(at: fx.legacyBackstop, name: "legacy")
         try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
-        fx.setMode("codesign", "verify-fails")
+        fx.setMode("codesign", "requirement-verify-fails")
 
         let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
 
@@ -3581,18 +4111,20 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(try fx.contents(of: tmp), [], "no scratch file is left")
     }
 
-    /// install.sh assembles the bundle in its staging directory, and makes
-    /// the folders it installs into, only through MKDIR, CP and CHMOD. The
-    /// run has `mkdir`, `cp` and `chmod` stubs first on PATH that log and
-    /// fail, and none of them runs; each staging step reaches the fixture's
-    /// logging fakes, and the installed bundle has every file in place.
+    /// install.sh makes the folders it installs into and fixes the staged
+    /// bundle's modes only through MKDIR and CHMOD; build-app.sh assembles
+    /// the bundle through its own fixed paths and install.sh copies it with
+    /// DITTO. The run has `mkdir`, `cp`, `chmod` and `ditto` stubs first on
+    /// PATH that log and fail, and none of them runs; install.sh's calls
+    /// reach the fixture's logging fakes, and the installed bundle has every
+    /// file in place.
     func testInstallAssemblesTheBundleOnlyThroughItsFixedPathTools() throws {
         try fx.prepareInstall()
         try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
         fx.setMode("launchctl", "loaded")
         let shadow = fx.root.appendingPathComponent("shadow", isDirectory: true)
         try FileManager.default.createDirectory(at: shadow, withIntermediateDirectories: true)
-        for tool in ["mkdir", "cp", "chmod"] {
+        for tool in ["mkdir", "cp", "chmod", "ditto"] {
             let stub = shadow.appendingPathComponent(tool)
             try "#!/bin/bash\nprintf 'PATH \(tool) %s\\n' \"$*\" >> \"\(fx.callsLog.path)\"\nexit 1\n".write(to: stub, atomically: true, encoding: .utf8)
             try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: stub.path)
@@ -3604,22 +4136,17 @@ final class RecoveryScriptTests: XCTestCase {
         let calls = fx.calls()
         XCTAssertEqual(calls.filter { $0.hasPrefix("PATH ") }, [], "a tool from PATH ran")
         let staging = fx.appsDir.path + "/.Insomnia.app.staging."
-        let macOS = try XCTUnwrap(calls.first { $0.hasPrefix("mkdir -p \(staging)") && $0.hasSuffix("/Insomnia.app/Contents/MacOS") }, "\(calls)")
-        let newApp = String(macOS.dropFirst("mkdir -p ".count).dropLast("/Contents/MacOS".count))
-        let checkout = fx.repoScripts.deletingLastPathComponent().path
+        let goW = try XCTUnwrap(fx.chmodCalls().first { $0.hasPrefix("chmod -R go-w \(staging)") }, "\(fx.chmodCalls())")
+        let newApp = String(goW.dropFirst("chmod -R go-w ".count))
+        XCTAssertTrue(newApp.hasSuffix("/Insomnia.app"), newApp)
+        XCTAssertTrue(fx.chmodCalls().contains("chmod -R -N \(newApp)"), "\(fx.chmodCalls())")
         for call in [
             "mkdir -p \(fx.appsDir.path)",
-            "cp \(fx.root.path)/binroot/Insomnia \(newApp)/Contents/MacOS/Insomnia",
-            "cp \(checkout)/Resources/Info.plist \(newApp)/Contents/Info.plist",
-            "mkdir -p \(newApp)/Contents/Resources",
-            "cp \(checkout)/Resources/AppIcon.icns \(newApp)/Contents/Resources/AppIcon.icns",
-            "cp \(checkout)/scripts/backstop.sh \(newApp)/Contents/Resources/backstop.sh",
             "mkdir -p \(fx.home.path) \(fx.home.path)/Logs \(fx.plist.deletingLastPathComponent().path)",
             "mkdir -p \(fx.plist.deletingLastPathComponent().path)/.com.insomnia.backstop.staging",
         ] {
             XCTAssertTrue(calls.contains(call), "\(call) not in \(calls)")
         }
-        XCTAssertTrue(fx.chmodCalls().contains("chmod 755 \(newApp)/Contents/Resources/backstop.sh"), "\(fx.chmodCalls())")
         XCTAssertEqual(try fx.installedBinaryFirstLine(), "#!/bin/bash", "the built binary is installed")
         XCTAssertTrue(fx.exists(fx.app.appendingPathComponent("Contents/Info.plist")))
         XCTAssertTrue(fx.exists(fx.app.appendingPathComponent("Contents/Resources/AppIcon.icns")))
@@ -4277,6 +4804,16 @@ final class RecoveryScriptTests: XCTestCase {
         let other = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester", "INSOMNIA_LID_SIMULATION": "yes"])
         XCTAssertEqual(other.status, 0, other.stderr + other.stdout)
         XCTAssertEqual(fx.calls().filter { $0.hasPrefix("swift build") }.first, "swift build -c release", "\(fx.calls())")
+
+        // A prebuilt bundle is already compiled: asking for the watcher with
+        // --app is refused before anything runs, instead of installing a
+        // build without it.
+        fx.clearCalls()
+        let prebuilt = try fx.writePrebuiltApp()
+        let withApp = try fx.run(fx.installRedirected, ["--allow-unverified-origin", "--app", prebuilt.path], extraEnvironment: ["USER": "tester", "INSOMNIA_LID_SIMULATION": "1"])
+        XCTAssertEqual(withApp.status, 2, withApp.stderr + withApp.stdout)
+        XCTAssertEqual(fx.calls(), [])
+        XCTAssertTrue(withApp.stderr.contains("INSOMNIA_LID_SIMULATION=1 applies to a source build only"), withApp.stderr)
     }
 
     func testInstallLeavesTrustedPlistWhenBootstrapAndReloadBothFail() throws {
@@ -4653,6 +5190,9 @@ private final class ScriptFixture {
         for dir in [home, bin, repoScripts, appsDir] {
             try fm.createDirectory(at: dir, withIntermediateDirectories: true)
         }
+        // repo/ is a source checkout to install.sh and uninstall.sh: their
+        // folder is scripts/, with Package.swift one level up.
+        try "// swift-tools-version: 6.2\n".write(to: root.appendingPathComponent("repo/Package.swift"), atomically: true, encoding: .utf8)
         try writeFakes()
         try writeScriptCopies()
         try bootUUID.write(to: root.appendingPathComponent("boot.uuid"), atomically: true, encoding: .utf8)
@@ -4788,9 +5328,25 @@ private final class ScriptFixture {
             "CALL_TIMEOUT_SECONDS": "5",
         ]).write(to: uninstall, atomically: true, encoding: .utf8)
 
-        // install.sh: every $HOME-derived path and every tool is redirected
-        // into the fixture (build, signing, sudo, launchctl included).
-        let installText = try String(contentsOf: src.appendingPathComponent("install.sh"), encoding: .utf8)
+        // build-app.sh (run by install.sh from $ROOT/scripts): build and
+        // signing go to the fakes.
+        let buildText = try String(contentsOf: src.appendingPathComponent("build-app.sh"), encoding: .utf8)
+        let buildApp = repoScripts.appendingPathComponent("build-app.sh")
+        try Self.patch(buildText, [
+            "SWIFT": bin.appendingPathComponent("swift").path,
+            "CODESIGN": bin.appendingPathComponent("codesign").path,
+        ]).write(to: buildApp, atomically: true, encoding: .utf8)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: buildApp.path)
+
+        try writeInstallCopies(extraConstants: [:])
+    }
+
+    /// install.sh: every $HOME-derived path and every tool is redirected
+    /// into the fixture (signing, sudo, launchctl included; the build goes
+    /// through the patched build-app.sh above). Tests that need another
+    /// constant (the real CODESIGN) rewrite both copies with it.
+    func writeInstallCopies(extraConstants: [String: String]) throws {
+        let installText = try String(contentsOf: Self.productionScripts.appendingPathComponent("install.sh"), encoding: .utf8)
         let patchedInstall = try Self.patch(installText, [
             "QUIT_WAIT_SECONDS": "1",
             "APP_DIR": appsDir.path,
@@ -4804,23 +5360,59 @@ private final class ScriptFixture {
             "LAUNCHCTL": bin.appendingPathComponent("launchctl").path,
             "SUDO": bin.appendingPathComponent("sudo").path,
             "CODESIGN": bin.appendingPathComponent("codesign").path,
-            "SWIFT": bin.appendingPathComponent("swift").path,
+            "SYSCTL": bin.appendingPathComponent("sysctl").path,
             "MV": bin.appendingPathComponent("mv").path,
             "RM": bin.appendingPathComponent("rm").path,
             "RMDIR": bin.appendingPathComponent("rmdir").path,
             "MKTEMP": bin.appendingPathComponent("mktemp").path,
             "MKDIR": bin.appendingPathComponent("mkdir").path,
-            "CP": bin.appendingPathComponent("cp").path,
             "CHMOD": bin.appendingPathComponent("chmod").path,
             "LOCK_TIMEOUT_SECONDS": "1",
             "CALL_TIMEOUT_SECONDS": "5",
-        ])
+        ].merging(extraConstants) { $1 })
         try patchedInstall.write(to: install, atomically: true, encoding: .utf8)
         // The redirected copy runs past the INSOMNIA_HOME refusal: that
         // variable is what makes the backstop copy it installs act on the
         // fixture instead of ~/Library. The plain copy keeps the refusal.
         let redirected = try Self.replaceOnce(patchedInstall, #"if [[ -n "${INSOMNIA_HOME:-}" ]]; then"#, with: "if false; then")
         try redirected.write(to: installRedirected, atomically: true, encoding: .utf8)
+    }
+
+    /// A bundle the way a release zip carries it: Info.plist, a marker
+    /// executable (or a real Mach-O, a copy of /usr/bin/true, when `machO`
+    /// is set so the real codesign can sign the bundle) and the sealed
+    /// backstop (the fixture's patched copy, so install.sh's recovery step
+    /// acts on the fixture). What the fake codesign says about its signature
+    /// is set with `setMode("codesign", ...)` and `setSigning(...)`.
+    func writePrebuiltApp(bundleID: String = "com.kgarg.insomnia", version: String = "0.1.0", withBackstop: Bool = true, machO: Bool = false) throws -> URL {
+        let app = root.appendingPathComponent("dist/Insomnia.app", isDirectory: true)
+        try fm.createDirectory(at: app.appendingPathComponent("Contents/MacOS"), withIntermediateDirectories: true)
+        try fm.createDirectory(at: app.appendingPathComponent("Contents/Resources"), withIntermediateDirectories: true)
+        try """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0"><dict>
+        <key>CFBundleExecutable</key><string>Insomnia</string>
+        <key>CFBundleIdentifier</key><string>\(bundleID)</string>
+        <key>CFBundlePackageType</key><string>APPL</string>
+        <key>CFBundleShortVersionString</key><string>\(version)</string>
+        </dict></plist>
+        """.write(to: app.appendingPathComponent("Contents/Info.plist"), atomically: true, encoding: .utf8)
+        if machO {
+            try fm.copyItem(atPath: "/usr/bin/true", toPath: app.appendingPathComponent("Contents/MacOS/Insomnia").path)
+        } else {
+            try "prebuilt".write(to: app.appendingPathComponent("Contents/MacOS/Insomnia"), atomically: true, encoding: .utf8)
+        }
+        if withBackstop {
+            try fm.copyItem(at: backstop, to: app.appendingPathComponent("Contents/Resources/backstop.sh"))
+        }
+        return app
+    }
+
+    /// What the fake codesign reports for `-dvv`: "adhoc", or
+    /// "developer-id:<team>" for a Developer ID Application signature.
+    func setSigning(_ value: String) {
+        try? value.write(to: root.appendingPathComponent("codesign.signing"), atomically: true, encoding: .utf8)
     }
 
     /// Rewrites `NAME=...` constant lines. Every name must match exactly one
@@ -4928,6 +5520,9 @@ private final class ScriptFixture {
               esac ;;
           visudo)
             if [[ "$mode" == auth-fail ]]; then echo "sudo: 3 incorrect password attempts" >&2; exit 1; fi
+            # "swap-prebuilt": someone replaces the --app bundle at its path
+            # (writePrebuiltApp's dist/Insomnia.app) while the password prompt waits.
+            if [[ "$mode" == swap-prebuilt ]]; then printf 'swapped' > "\(r)/dist/Insomnia.app/Contents/MacOS/Insomnia"; fi
             f=""; for a in "$@"; do f="$a"; done
             [[ -s "$f" ]] && grep -q 'NOPASSWD: /usr/bin/pmset' "$f" || { printf 'sudo VISUDO-REJECTED %s\\n' "$*" >> "\(calls)"; exit 1; }
             exit 0 ;;
@@ -4974,12 +5569,11 @@ private final class ScriptFixture {
         fi
         exec /bin/mv "$@"
         """)
-        // rm, rmdir, mktemp, mkdir, cp: install.sh's RM, RMDIR, MKTEMP, MKDIR
-        // and CP. Each call is logged and then made by the real tool, so a
-        // test can tell a file removed, created or copied through the
-        // fixed-path variable from one handled by a bare name. (Its CHMOD is
-        // the chmod fake below.)
-        for (tool, real) in [("rm", "/bin/rm"), ("rmdir", "/bin/rmdir"), ("mktemp", "/usr/bin/mktemp"), ("mkdir", "/bin/mkdir"), ("cp", "/bin/cp")] {
+        // rm, rmdir, mktemp, mkdir: install.sh's RM, RMDIR, MKTEMP and MKDIR.
+        // Each call is logged and then made by the real tool, so a test can
+        // tell a file removed or created through the fixed-path variable from
+        // one handled by a bare name. (Its CHMOD is the chmod fake below.)
+        for (tool, real) in [("rm", "/bin/rm"), ("rmdir", "/bin/rmdir"), ("mktemp", "/usr/bin/mktemp"), ("mkdir", "/bin/mkdir")] {
             try writeFake(tool, """
             printf '\(tool)%s\\n' "${*:+ $*}" >> "\(calls)"
             exec \(real) "$@"
@@ -4987,25 +5581,40 @@ private final class ScriptFixture {
         }
         // codesign: signing is recorded and succeeds. `-d -r-` prints a
         // fixed designated requirement the way codesign does (on stderr,
-        // with the "# " an implicit requirement carries). `--verify` passes
-        // unless mode "verify-fails", or the path is listed in
-        // codesign.rejects (see `rejectSignature(of:)`). Mode "verify-hangs":
-        // `--verify` never answers (see hangHere); "verify-hangs-under-lock":
-        // only while someone holds the recovery lock.
+        // with the "# " an implicit requirement carries). `-dvv` describes
+        // the signature per codesign.signing (adhoc | developer-id:<team>).
+        // `--verify` passes unless mode "verify-fails"; mode
+        // "deep-verify-fails" fails only the `--deep` form install.sh runs
+        // on a prebuilt bundle, and "requirement-verify-fails" only the
+        // `-R=` form (the agent's pinned check). A path listed in
+        // codesign.rejects (see `rejectSignature(of:)`) fails every form.
+        // Mode "verify-hangs": `--verify` never answers (see hangHere);
+        // "verify-hangs-under-lock": only while someone holds the recovery
+        // lock.
         try writeFake("codesign", """
         printf 'codesign %s\\n' "$*" >> "\(calls)"
         mode="$(cat "\(r)/codesign.mode" 2>/dev/null || echo ok)"
         \(hangHere("codesign"))
         \(lockHeldHere())
-        last=""; for a in "$@"; do last="$a"; done
+        signing="$(cat "\(r)/codesign.signing" 2>/dev/null || echo adhoc)"
+        last=""; deep=0; pinned=0; for a in "$@"; do last="$a"; [[ "$a" == --deep ]] && deep=1; [[ "$a" == -R=* ]] && pinned=1; done
         for a in "$@"; do
           case "$a" in
             -r-) echo "Executable=$last/Contents/MacOS/Insomnia" >&2; echo '# designated => \(requirement)' >&2; exit 0 ;;
+            -dvv) echo "Executable=$last/Contents/MacOS/Insomnia" >&2; echo "Identifier=com.kgarg.insomnia" >&2
+                  case "$signing" in
+                    developer-id:*) echo "Authority=Developer ID Application: Tester (${signing#developer-id:})" >&2
+                                    echo "Authority=Developer ID Certification Authority" >&2
+                                    echo "Authority=Apple Root CA" >&2
+                                    echo "TeamIdentifier=${signing#developer-id:}" >&2 ;;
+                    *) echo "Signature=adhoc" >&2; echo "TeamIdentifier=not set" >&2 ;;
+                  esac
+                  exit 0 ;;
             --verify)
               if [[ "$mode" == verify-hangs ]]; then hang_here; fi
               if [[ "$mode" == verify-hangs-under-lock ]] && lock_held; then hang_here; fi
               if [[ -f "\(r)/codesign.rejects" ]] && grep -qxF -- "$last" "\(r)/codesign.rejects"; then echo "$last: does not satisfy its designated Requirement" >&2; exit 3; fi
-              if [[ "$mode" == verify-fails ]]; then echo "$last: a sealed resource is missing or invalid" >&2; exit 1; fi
+              if [[ "$mode" == verify-fails || ( "$mode" == deep-verify-fails && $deep == 1 ) || ( "$mode" == requirement-verify-fails && $pinned == 1 ) ]]; then echo "$last: a sealed resource is missing or invalid" >&2; exit 1; fi
               exit 0 ;;
           esac
         done
@@ -5031,7 +5640,22 @@ private final class ScriptFixture {
         for f in $fail; do [[ "$f" == "${2:-}" ]] && exit 1; done
         exit 0
         """)
+        // sysctl: `-n kern.bootsessionuuid` reads boot.uuid and is not
+        // logged (backstop.sh asks on every run; it changes nothing).
+        // `-n hw.optional.arm64` is logged and reads 1, an Apple Silicon Mac
+        // (also what a shell under Rosetta reads there). Mode "intel-0"
+        // reads 0; "intel-missing" fails the way sysctl does for a key the
+        // Mac lacks.
         try writeFake("sysctl", """
+        if [[ "$*" == "-n hw.optional.arm64" ]]; then
+          printf 'sysctl %s\\n' "$*" >> "\(calls)"
+          case "$(cat "\(r)/sysctl.mode" 2>/dev/null || echo ok)" in
+            intel-0) echo 0 ;;
+            intel-missing) echo "sysctl: unknown oid 'hw.optional.arm64'" >&2; exit 1 ;;
+            *) echo 1 ;;
+          esac
+          exit 0
+        fi
         cat "\(r)/boot.uuid"
         """)
         // chmod: recorded in chmod.calls, apart from calls.log, then run for
@@ -5487,9 +6111,19 @@ private final class ScriptFixture {
 
     // MARK: Running
 
+    /// Decoded lossily: the fake launchctl copies the first line of the
+    /// installed binary into the log, which is Mach-O bytes, not text, for
+    /// the fixture the real codesign signs.
     func calls() -> [String] {
-        guard let text = try? String(contentsOf: callsLog, encoding: .utf8) else { return [] }
-        return text.split(separator: "\n").map(String.init)
+        guard let data = try? Data(contentsOf: callsLog) else { return [] }
+        return String(decoding: data, as: UTF8.self).split(separator: "\n").map(String.init)
+    }
+
+    /// The calls besides those to the logging mktemp, rm, rmdir and mkdir,
+    /// which every install run makes for its own scratch files (see
+    /// bounded()) and the folders it installs into.
+    func callsBesideScratchFiles() -> [String] {
+        calls().filter { call in !["mktemp", "rm", "rmdir", "mkdir"].contains { call == $0 || call.hasPrefix($0 + " ") } }
     }
 
     func chmodCalls() -> [String] {
@@ -5609,8 +6243,9 @@ private final class ScriptFixture {
         return text.split(separator: "\n").count
     }
 
-    /// Runs a real tool (not a script) with the fixture's environment, here
-    /// the shells that read back a command install.sh prints for pasting.
+    /// Runs a real tool (not a script) with the fixture's environment: the
+    /// real codesign for the one test that signs its fixture, and the shells
+    /// that read back a command install.sh prints for pasting.
     func runTool(_ exe: String, _ args: [String]) throws -> (status: Int32, output: String) {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: exe)
