@@ -395,7 +395,12 @@ final class RecoveryScriptTests: XCTestCase {
         try assertSessionEnded(try fx.run(fx.backstop), reason: "pmset -g batt did not finish within 1s")
         XCTAssertLessThan(Date().timeIntervalSince(started), 20, "the hung read must not hold the run for its whole minute")
         XCTAssertTrue(fx.log().contains("did not finish within 1s; terminated with SIGTERM"), fx.log())
-        XCTAssertTrue(fx.calls().contains { $0.hasPrefix("kill -TERM ") }, "the timeout signal goes through $KILL: \(fx.calls())")
+        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("kill") }, "the read is signaled as this shell's job, never by a pid handed to $KILL: \(fx.calls())")
+        XCTAssertTrue(fx.hungReadIsGone(), "the hung read was stopped and reaped")
+        let seen = try String(contentsOf: fx.root.appendingPathComponent("read.files"), encoding: .utf8)
+            .split(separator: "\n").map(String.init)
+        XCTAssertEqual(seen.count, 1, "\(seen)")
+        XCTAssertTrue(seen.allSatisfy { $0.hasSuffix(".1.out") }, "a read has its output file and no .pid or .rc status files: \(seen)")
 
         try writeLiveSession()
         fx.clearCalls()
@@ -409,8 +414,8 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(leftovers, [], "status and capture files are cleaned up")
     }
 
-    /// A read never holds the recovery lock: its supervisor closes fd 9
-    /// before starting it, so neither has it while the run holds the lock.
+    /// A read never holds the recovery lock: it starts with fd 9 closed, so
+    /// it does not have it while the run holds the lock.
     /// The fake looks with lsof, which can take seconds on a busy machine,
     /// so this run gets a 30 s time limit; the read answers as soon as it
     /// has looked, so the limit never fires.
@@ -424,7 +429,7 @@ final class RecoveryScriptTests: XCTestCase {
         try assertSessionKept(try fx.run(fx.backstop))
 
         XCTAssertTrue(fx.calls().contains("notifyutil checked fd 9"), "\(fx.calls())")
-        XCTAssertFalse(fx.calls().contains { $0.hasSuffix("had fd 9") }, "neither the read nor its supervisor may inherit the lock: \(fx.calls())")
+        XCTAssertFalse(fx.calls().contains { $0.hasSuffix("had fd 9") }, "the read must not inherit the lock: \(fx.calls())")
         XCTAssertFalse(fx.log().contains("did not finish"), fx.log())
     }
 
@@ -440,7 +445,8 @@ final class RecoveryScriptTests: XCTestCase {
         try assertSessionKept(try fx.run(fx.backstop))
 
         XCTAssertTrue(fx.log().contains("ignored SIGTERM; sent SIGKILL"), fx.log())
-        XCTAssertTrue(fx.calls().contains { $0.hasPrefix("kill -KILL ") }, "the timeout signal goes through $KILL: \(fx.calls())")
+        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("kill") }, "the read is signaled as this shell's job, never by a pid handed to $KILL: \(fx.calls())")
+        XCTAssertTrue(fx.hungReadIsGone(), "the read that ignored SIGTERM was killed and reaped")
         XCTAssertTrue(fx.log().contains("thermal pressure level unreadable"), fx.log())
         XCTAssertTrue(try fx.lockIsFree(), "nothing the read started holds the lock")
 
@@ -449,6 +455,39 @@ final class RecoveryScriptTests: XCTestCase {
         try assertSessionEnded(try fx.run(fx.backstop), reason: "thermal pressure level 3")
         let leftovers = try FileManager.default.contentsOfDirectory(atPath: fx.home.path).filter { $0.hasPrefix(".backstop.") }
         XCTAssertEqual(leftovers, [])
+    }
+
+    /// The first read of a run cleans up like the first undo command (see
+    /// testStatusFilesGoWithTheirCallAndLeftoversOnlyUnderTheRunsOwnLock):
+    /// a run that took the lock itself removes the status and output files
+    /// earlier runs left, and a run that shares its caller's lock leaves
+    /// them, since an earlier run under that lock may still have a
+    /// supervisor waiting for its command. The read's own output file goes
+    /// with its call either way.
+    func testReadsRemoveLeftoversOnlyUnderTheRunsOwnLock() throws {
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+        try writeLiveSession()
+        let leftovers = [".backstop.4242.1.out", ".backstop.4242.1.pid", ".backstop.4242.1.rc"]
+        for name in leftovers {
+            try "4242\n".write(to: fx.home.appendingPathComponent(name), atomically: true, encoding: .utf8)
+        }
+        try Data().write(to: fx.lock)
+        let sharing = fx.root.appendingPathComponent("holder-then-backstop.sh")
+        try """
+        #!/bin/bash
+        set -eu
+        exec 9<>"\(fx.lock.path)"
+        /usr/bin/lockf -t 0 9
+        /bin/bash "\(fx.backstop.path)"
+        """.write(to: sharing, atomically: true, encoding: .utf8)
+
+        try assertSessionKept(try fx.run(sharing))
+        XCTAssertEqual(calls(), [batteryRead, thermalRead])
+        XCTAssertEqual(try fx.backstopFiles(), leftovers)
+
+        try assertSessionKept(try fx.run(fx.backstop))
+        XCTAssertEqual(try fx.backstopFiles(), [])
     }
 
     /// Levels 0 to 2 (nominal, moderate, heavy) keep the session; 3 and 4
@@ -3888,8 +3927,7 @@ final class RecoveryScriptTests: XCTestCase {
 
         XCTAssertNotEqual(r.status, 0)
         XCTAssertNil(fx.commandEnded(), "the script returned while the first command was still alive (not released)")
-        XCTAssertEqual(fx.calls().filter { !$0.hasPrefix("kill -TERM ") }, ["sudo -n \(fx.fakePmset) -a disablesleep 0"], "no second undo while the first is alive, and no SIGKILL")
-        XCTAssertEqual(fx.calls().filter { $0.hasPrefix("kill -TERM ") }.count, 1, "\(fx.calls())")
+        XCTAssertEqual(fx.calls(), ["sudo -n \(fx.fakePmset) -a disablesleep 0"], "no second undo while the first is alive")
         let s = try fx.stateJSON()
         XCTAssertEqual(s["sleepDisabledByUs"] as? Bool, true)
         XCTAssertEqual(s["lowPowerSetByUs"] as? Bool, true)
@@ -6304,7 +6342,8 @@ private final class ScriptFixture {
     }
 
     /// The backstop's files in INSOMNIA_HOME: each bounded call's .pid and
-    /// .rc status files, and the app binary's input and answer directory.
+    /// .rc status files, each read's .out file, and the app binary's input
+    /// and answer directory.
     func backstopFiles() throws -> [String] {
         try contents(of: home).filter { $0.hasPrefix(".backstop") }
     }
@@ -6352,6 +6391,14 @@ private final class ScriptFixture {
     func commandEnded() -> String? {
         (try? String(contentsOf: root.appendingPathComponent("command.ended"), encoding: .utf8))?
             .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Whether the read a fake recorded in read.hung.pid is gone: stopped
+    /// and reaped, so the pid names no process. False when no fake wrote it.
+    func hungReadIsGone() -> Bool {
+        guard let text = try? String(contentsOf: root.appendingPathComponent("read.hung.pid"), encoding: .utf8),
+              let pid = pid_t(text.trimmingCharacters(in: .whitespacesAndNewlines)) else { return false }
+        return kill(pid, 0) == -1 && errno == ESRCH
     }
 
     /// Polls until the recovery lock is free; false after `seconds`.
@@ -6716,14 +6763,20 @@ private final class ScriptFixture {
         """)
         // pmset: `-g batt` is the only form the script may run directly. It
         // prints pmset.batt when the test wrote one ("FAIL": exit 1 with no
-        // output), else a MacBook on AC power at 100%. Any other direct call
-        // is recorded as DIRECT and fails: power changes go through sudo.
+        // output; "HANG": never returns, after writing its pid to
+        // read.hung.pid and the names of the backstop's files it sees to
+        // read.files), else a MacBook on AC power at 100%. Any other direct
+        // call is recorded as DIRECT and fails: power changes go through sudo.
         try writeFake("pmset", """
         if [[ "${1:-}" == -g && "${2:-}" == batt ]]; then
           printf 'pmset -g batt\\n' >> "\(calls)"
           if [[ -f "\(r)/pmset.batt" ]]; then
             [[ "$(cat "\(r)/pmset.batt")" == FAIL ]] && exit 1
-            [[ "$(cat "\(r)/pmset.batt")" == HANG ]] && exec /bin/sleep 60
+            if [[ "$(cat "\(r)/pmset.batt")" == HANG ]]; then
+              echo $$ > "\(r)/read.hung.pid"
+              /bin/ls -A "\(home.path)" | /usr/bin/grep '^\\.backstop\\.' > "\(r)/read.files" || true
+              exec /bin/sleep 60
+            fi
             cat "\(r)/pmset.batt"; exit 0
           fi
           printf "Now drawing from 'AC Power'\\n -InternalBattery-0 (id=1)\\t100%%; charged; 0:00 remaining present: true\\n"
@@ -6735,11 +6788,12 @@ private final class ScriptFixture {
         // notifyutil -g <key>: prints "<key> <level>" with the level from
         // thermal.mode (default 0). "FAIL": exit 1 with no output. "GARBAGE":
         // exit 0 with a line that has no level in it. "HANG": never returns.
-        // "IGNORE_TERM": never returns and ignores SIGTERM; it leaves a child
-        // behind that would keep any descriptor it inherited. "CHECK_FD9":
-        // records whether it or its parent (the read's supervisor) has fd 9
-        // open, then prints level 0. lsof can take seconds on a busy machine,
-        // so a test using it raises the time limit (setCommandTimeout).
+        // "IGNORE_TERM": never returns and ignores SIGTERM, after writing its
+        // pid to read.hung.pid; it leaves a child behind that would keep any
+        // descriptor it inherited. "CHECK_FD9": records whether it has fd 9
+        // open, by its own descriptor table and by lsof, then prints level 0.
+        // lsof can take seconds on a busy machine, so a test using it raises
+        // the time limit (setCommandTimeout).
         try writeFake("notifyutil", """
         printf 'notifyutil %s\\n' "$*" >> "\(calls)"
         mode="$(cat "\(r)/thermal.mode" 2>/dev/null || echo 0)"
@@ -6747,12 +6801,13 @@ private final class ScriptFixture {
         [[ "$mode" == HANG ]] && exec /bin/sleep 60
         if [[ "$mode" == IGNORE_TERM ]]; then
           trap '' TERM
+          echo $$ > "\(r)/read.hung.pid"
           /bin/sleep 5 </dev/null >/dev/null 2>&1 &
           exec /bin/sleep 60
         fi
         if [[ "$mode" == CHECK_FD9 ]]; then
           [[ -e /dev/fd/9 ]] && printf 'notifyutil had fd 9\\n' >> "\(calls)"
-          [[ -n "$(/usr/sbin/lsof -a -p "$PPID" -d 9 -t 2>/dev/null)" ]] && printf 'notifyutil supervisor had fd 9\\n' >> "\(calls)"
+          [[ -n "$(/usr/sbin/lsof -a -p "$$" -d 9 -t 2>/dev/null)" ]] && printf 'notifyutil lsof had fd 9\\n' >> "\(calls)"
           printf 'notifyutil checked fd 9\\n' >> "\(calls)"
           echo "${2:-} 0"; exit 0
         fi
@@ -6872,20 +6927,10 @@ private final class ScriptFixture {
         done < "\(r)/ps.table"
         exit 1
         """)
-        // kill: a timeout's -TERM or -KILL goes on to the real kill only
-        // for a command the run under test started (its pid is in one of
-        // the run's .backstop.*.pid files), so that command really stops.
-        // Any other pid, such as a journal's frozen pid, is never signalled.
         try writeFake("kill", """
         printf 'kill %s\\n' "$*" >> "\(calls)"
         fail="$(cat "\(r)/kill.fail.mode" 2>/dev/null || true)"
         for f in $fail; do [[ "$f" == "${2:-}" ]] && exit 1; done
-        case "${1:-}" in
-          -TERM|-KILL)
-            if [[ -n "${2:-}" ]] && cat "\(home.path)"/.backstop.*.pid 2>/dev/null | grep -qx -- "$2"; then
-              exec /bin/kill "$1" "$2"
-            fi ;;
-        esac
         exit 0
         """)
         // sysctl: `-n kern.bootsessionuuid` reads boot.uuid and is not

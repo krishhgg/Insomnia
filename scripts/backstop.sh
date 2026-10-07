@@ -312,6 +312,16 @@ wait_for_status() { # file seconds
   [[ -s "$1" ]]
 }
 
+# The first run_bounded or run_read call of a run (bounded_calls counts both)
+# removes the status and output files earlier runs left, and only when this
+# run took the lock on its own handle (see run_bounded): a run that shares
+# its caller's lock may have a live supervisor from an earlier run under
+# that lock, whose files must stay.
+remove_stale_run_files() {
+  (( bounded_calls == 1 && ! lock_shared )) || return 0
+  "$RM" -f "$APP_SUPPORT"/.backstop.*.pid "$APP_SUPPORT"/.backstop.*.rc "$APP_SUPPORT"/.backstop.*.out
+}
+
 # Run one undo command (sudo -n pmset ..., defaults ...) inside the locked
 # transaction with a time limit. supervise_command (below) starts it in the
 # background, enforces the limit and writes one status line; this run waits
@@ -348,9 +358,7 @@ run_bounded() { # command args...
   local base status="" rc cpid="" supervisor answer_within
   bounded_calls=$((bounded_calls + 1))
   base="$APP_SUPPORT/.backstop.$$.$bounded_calls"
-  if (( bounded_calls == 1 && ! lock_shared )); then
-    "$RM" -f "$APP_SUPPORT"/.backstop.*.pid "$APP_SUPPORT"/.backstop.*.rc
-  fi
+  remove_stale_run_files
   supervise_command "$base" "$@" </dev/null >/dev/null 2>&1 &
   supervisor=$!
   # Each of the supervisor's two waits can end up to a second after its
@@ -440,54 +448,55 @@ supervise_command() { # base command args...
   log info "'$*' (pid $cpid), left running after SIGTERM, has exited (wait status $rc); its supervisor now lets go of the recovery lock, and the next run will retry"
 }
 
-# Run one read (pmset -g batt, notifyutil -g) with the undo commands' time
-# limit and put its stdout in the variable named by $1. A read changes
-# nothing, so unlike an undo command it has no reason to hold the recovery
-# lock: its supervisor closes fd 9 before starting it, so neither holds the
-# lock and a read that hangs can only fail itself, never a later run or the
-# app. For the same reason a read that ignores SIGTERM gets SIGKILL: it runs
-# unprivileged and has nothing to leave half done. This run never waits for
-# it past that. Returns the read's exit status, or 124 when it was stopped.
+# Run one read (pmset -g batt, ioreg, notifyutil -g) with the undo commands'
+# time limit and put its standard output in the variable named by $1. A read
+# changes nothing, so unlike an undo command it has no reason to hold the
+# recovery lock: it starts with fd 9 closed, so a read that hangs can only
+# fail itself, never a later run or the app. This shell starts it as its own
+# background job and is the only process that signals it, by jobspec once
+# signal_job has checked that the job is this read (see run_app_bounded), so
+# a signal never reaches a process that reused its pid; no pid is read back
+# from a file. Both limits are on the SECONDS clock (wait_for_job). A read
+# still running KILL_GRACE_SECONDS after SIGTERM gets SIGKILL: it runs
+# unprivileged and has nothing to leave half done. Returns the read's exit
+# status, or 124 when it was stopped. Its output goes through
+# .backstop.<this run's pid>.<call>.out, which this call removes, and the
+# first call of a run removes what earlier runs left (remove_stale_run_files).
+# The function's stderr is /dev/null because bash reports a job that a signal
+# ended on its own stderr; the log says what happened instead.
 run_read() { # varname command args...
-  local name="$1" pidfile rcfile outfile cpid rc supervisor
+  local name="$1" outfile cpid rc=0 read_output=""
   shift
   bounded_calls=$((bounded_calls + 1))
-  pidfile="$APP_SUPPORT/.backstop.$$.$bounded_calls.pid"
-  rcfile="$APP_SUPPORT/.backstop.$$.$bounded_calls.rc"
+  remove_stale_run_files
   outfile="$APP_SUPPORT/.backstop.$$.$bounded_calls.out"
-  if (( bounded_calls == 1 )); then
-    "$RM" -f "$APP_SUPPORT"/.backstop.*.pid "$APP_SUPPORT"/.backstop.*.rc "$APP_SUPPORT"/.backstop.*.out
-  fi
-  (
-    "$@" </dev/null >"$outfile" 2>/dev/null &
-    cpid=$!
-    echo "$cpid" > "$pidfile"
-    rc=0
+  # A leftover at this name goes unopened first, as in record_end.
+  "$RM" -f "$outfile" 2>/dev/null || true
+  "$@" </dev/null >"$outfile" 2>/dev/null 9>&- &
+  cpid=$!
+  if wait_for_job "$cpid" "$COMMAND_TIMEOUT_SECONDS"; then
     wait "$cpid" || rc=$?
-    echo "$rc" > "$rcfile"
-  ) 9>&- </dev/null >/dev/null 2>&1 &
-  supervisor=$!
-  if wait_for_status "$rcfile" "$COMMAND_TIMEOUT_SECONDS"; then
-    rc="$(cat "$rcfile")"
   else
-    cpid="$(cat "$pidfile" 2>/dev/null || true)"
-    if [[ -n "$cpid" ]]; then "$KILL" -TERM "$cpid" 2>/dev/null || true; fi
-    if wait_for_status "$rcfile" "$KILL_GRACE_SECONDS"; then
-      log error "'$*' did not finish within ${COMMAND_TIMEOUT_SECONDS}s; terminated with SIGTERM (pid ${cpid:-?})"
-    else
-      if [[ -n "$cpid" ]]; then "$KILL" -KILL "$cpid" 2>/dev/null || true; fi
-      log error "'$*' did not finish within ${COMMAND_TIMEOUT_SECONDS}s and ignored SIGTERM; sent SIGKILL (pid ${cpid:-?}). A read holds no lock, so nothing waits for it"
-      wait_for_status "$rcfile" "$KILL_GRACE_SECONDS" || true
-    fi
     rc=124
+    signal_job TERM "$cpid" || true
+    if wait_for_job "$cpid" "$KILL_GRACE_SECONDS"; then
+      wait "$cpid" || true
+      log error "'$*' did not finish within ${COMMAND_TIMEOUT_SECONDS}s; terminated with SIGTERM (pid $cpid)"
+    else
+      signal_job KILL "$cpid" || true
+      if wait_for_job "$cpid" "$KILL_GRACE_SECONDS"; then
+        wait "$cpid" || true
+        log error "'$*' did not finish within ${COMMAND_TIMEOUT_SECONDS}s and ignored SIGTERM; sent SIGKILL (pid $cpid). A read holds no lock, so nothing waits for it"
+      else
+        log error "'$*' did not finish within ${COMMAND_TIMEOUT_SECONDS}s, ignored SIGTERM and has not exited ${KILL_GRACE_SECONDS}s after SIGKILL (pid $cpid); it runs no further code and holds no lock"
+      fi
+    fi
   fi
-  # A supervisor that wrote a status is done; one whose read survived even
-  # SIGKILL is left behind without the lock.
-  if [[ -s "$rcfile" ]]; then wait "$supervisor" 2>/dev/null || true; fi
-  printf -v "$name" '%s' "$(cat "$outfile" 2>/dev/null)"
-  "$RM" -f "$pidfile" "$rcfile" "$outfile"
+  if (( rc != 124 )) && [[ -f "$outfile" ]]; then read_output="$(cat "$outfile")"; fi
+  printf -v "$name" '%s' "$read_output"
+  "$RM" -f "$outfile"
   return "$rc"
-}
+} 2>/dev/null
 
 # Run the app binary's --resume-frozen check (see resume_via_app) with the
 # same time limit, standard input from app_answer_dir/in and standard output
