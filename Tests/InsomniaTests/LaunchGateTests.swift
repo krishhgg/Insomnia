@@ -104,4 +104,78 @@ final class LaunchGateTests: XCTestCase {
         XCTAssertTrue(started)
         XCTAssertTrue(mine.isHeld)
     }
+
+    /// The journal the copy that owns the session left: a lid close muted
+    /// the USB headset, and the session ended while it was unplugged, so
+    /// its entry waits for it to reconnect. Returns the journal's bytes.
+    private func leaveAHeadsetOwedItsVolume() throws -> Data {
+        var st = RuntimeState()
+        st.savedAudioOutputs = [SavedAudioOutput(deviceUID: "usb-headset", name: "USB Headset", volume: 0.3, muted: false, saveID: UUID().uuidString)]
+        try h.store.saveState(st)
+        return try Data(contentsOf: h.home.paths.stateFile)
+    }
+
+    /// A second copy registers for CoreAudio's device changes only once it
+    /// holds the alive lock. The headset reconnects while the copy waits at
+    /// the gate and again after it is refused: it stays muted and the other
+    /// copy's journal is untouched.
+    func testACopyWaitingAtTheGateOrRefusedThereRestoresNoReconnectedDevice() async throws {
+        let journal = try leaveAHeadsetOwedItsVolume()
+        let other = AppAliveLock(url: h.home.paths.appAliveFile)
+        XCTAssertTrue(try other.tryAcquire())
+        defer { other.release() }
+        let mine = AppAliveLock(url: h.home.paths.appAliveFile)
+        let m = h.makeManager()
+        XCTAssertFalse(h.audio.watched, "init does not register")
+        let audio = h.audio
+        let reconnect = Task { @MainActor in
+            try await Task.sleep(for: .milliseconds(100))
+            audio.connect("usb-headset", name: "USB Headset", volume: 0.3, muted: true)
+            audio.fireDevicesChanged()
+        }
+
+        let opened = await gate(mine, timeout: 0.5).open(manager: m, start: {})
+        try await reconnect.value
+        h.audio.fireDevicesChanged()
+        try await Task.sleep(for: .milliseconds(300))
+
+        XCTAssertFalse(opened)
+        XCTAssertFalse(h.audio.watched)
+        XCTAssertEqual(h.audio.applied.count, 0)
+        XCTAssertEqual(h.audio.device("usb-headset")?.muted, true, "the headset stays muted")
+        XCTAssertEqual(try Data(contentsOf: h.home.paths.stateFile), journal)
+        XCTAssertEqual(h.guardFake.calls, [])
+    }
+
+    /// The copy that takes the lock registers before it reconciles: the
+    /// headset, unplugged at launch, gets its volume back when it
+    /// reconnects.
+    func testTheCopyThatTakesTheLockRestoresADeviceWhenItReconnects() async throws {
+        _ = try leaveAHeadsetOwedItsVolume()
+        let mine = AppAliveLock(url: h.home.paths.appAliveFile)
+        defer { mine.release() }
+        let m = h.makeManager()
+        let audio = h.audio
+        var watchedAtStart: Bool?
+
+        let opened = await gate(mine).open(manager: m, start: { watchedAtStart = audio.watched })
+
+        XCTAssertTrue(opened)
+        XCTAssertEqual(watchedAtStart, true, "registered once the lock is held, before start and reconcile")
+        XCTAssertEqual(h.audio.applied.count, 0, "unplugged at launch: the entry waits")
+        XCTAssertEqual(try h.store.loadState()?.savedAudioOutputs.map(\.deviceUID), ["usb-headset"])
+
+        h.audio.connect("usb-headset", name: "USB Headset", volume: 0.3, muted: true)
+        h.audio.fireDevicesChanged()
+        for _ in 0..<300 where h.audio.applied.isEmpty {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(h.audio.applied.map { $0.deviceUID }, ["usb-headset"])
+        XCTAssertEqual(h.audio.device("usb-headset")?.muted, false)
+        XCTAssertEqual(h.audio.device("usb-headset")?.volume, 0.3)
+        for _ in 0..<300 where (try? h.store.loadState()) != RuntimeState.clean {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
+    }
 }

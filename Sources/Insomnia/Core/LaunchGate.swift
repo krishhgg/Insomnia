@@ -19,18 +19,21 @@ struct LaunchGate {
     static let anotherCopyTitle = "Insomnia is already running"
     static let lockFailedTitle = "Insomnia did not start"
 
-    /// Takes the alive lock, then runs `start` and reconciles. Taken before
-    /// reconcile, so the first backstop run after launch already sees this
-    /// process, and never released: the kernel drops it when the process
-    /// exits, however that happens. Without the lock neither runs, the user
-    /// is told why, and the result is false for the caller to quit; the
-    /// notification has reached the system by then.
+    /// Takes the alive lock, then watches for output device changes, runs
+    /// `start` and reconciles. Taken before reconcile, so the first backstop
+    /// run after launch already sees this process, and never released: the
+    /// kernel drops it when the process exits, however that happens. Without
+    /// the lock none of these run (a device change during the wait or after
+    /// the refusal restores nothing), the user is told why, and the result
+    /// is false for the caller to quit; the notification has reached the
+    /// system by then.
     func open(manager: SessionManager, start: () -> Void) async -> Bool {
         let title: String
         let why: String
         do {
             if try await aliveLock.acquire(timeout: timeout) {
                 Log.info("alive lock held")
+                manager.watchOutputDevices()
                 start()
                 await manager.reconcile()
                 return true

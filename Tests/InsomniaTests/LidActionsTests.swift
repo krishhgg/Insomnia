@@ -1106,6 +1106,7 @@ final class LidActionsTests: XCTestCase {
     /// while Insomnia runs, CoreAudio's device change restores it.
     func testQuitKeepsTheEntryOfAnUnpluggedDeviceAndItsReconnectRestoresIt() async throws {
         let (m, _) = await closeOnTheHeadsetAndUnplugIt()
+        m.watchOutputDevices() // LaunchGate's call once the launch holds the alive lock
 
         let outcome = await m.end(reason: .quit)
 

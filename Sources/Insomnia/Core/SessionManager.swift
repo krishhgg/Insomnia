@@ -213,6 +213,9 @@ final class SessionManager {
     /// device change, lid open, end or launch tries again.
     @ObservationIgnored private var audioRetriesLeft = SessionManager.audioRetryLimit
     static let audioRetryLimit = 10
+    /// Set once `watchOutputDevices` has registered for CoreAudio's device
+    /// changes.
+    @ObservationIgnored private var watchingOutputDevices = false
     /// Called just before Insomnia takes Low Power Mode over, before the
     /// ownership is journaled: `AppServices` samples the display brightness
     /// then, so the value journaled at a later lid close is the user's,
@@ -462,6 +465,17 @@ final class SessionManager {
             self.config = Config()
             if !keepConfigFile { try? store.saveConfig(self.config) }
         }
+    }
+
+    /// Registers for CoreAudio's device changes, so an output device still
+    /// muted from a lid close gets its volume back when it reconnects
+    /// (`outputDevicesChanged`). LaunchGate calls it once this process holds
+    /// the alive lock, not init: a second copy of the app waiting at the
+    /// gate, or refused there, must not restore a device the copy that owns
+    /// the session muted. Registers once; later calls do nothing.
+    func watchOutputDevices() {
+        guard !watchingOutputDevices else { return }
+        watchingOutputDevices = true
         do {
             try audio.onDevicesChanged { [weak self] in
                 Task { @MainActor in await self?.outputDevicesChanged() }

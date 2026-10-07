@@ -450,6 +450,9 @@ final class FakeAudioControl: AudioControlling, @unchecked Sendable {
         lock.withLock { _devices[uid]?.volume = volume; _devices[uid]?.muted = muted }
     }
 
+    /// Whether SessionManager has registered for device changes.
+    var watched: Bool { lock.withLock { _devicesChanged != nil } }
+
     /// Calls the handler SessionManager registered, as CoreAudio does when
     /// a device connects or disconnects.
     func fireDevicesChanged() {
