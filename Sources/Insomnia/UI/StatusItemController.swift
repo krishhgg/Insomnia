@@ -684,6 +684,7 @@ final class StatusItemController: NSObject {
             // A report about an SSID edited away since is not shown.
             hotspotWarning: status.hotspotPasswordReport?.problem(for: manager.config.hotspotSSID)?.menuLine,
             error: manager.lastError,
+            commandRunning: manager.commandWarning,
             foreignSleep: manager.foreignSleepWarning,
             lidSimulationBuild: LidSimulationBuild.isCompiledIn
         )
