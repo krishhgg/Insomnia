@@ -254,6 +254,102 @@ final class StillRunningCommandTests: XCTestCase {
         XCTAssertFalse(try lockIsHeld())
     }
 
+    /// The session on disk, journaled with sleep and Low Power Mode as
+    /// Insomnia's, as an earlier run left it. Returns that session.
+    private func liveSessionOnDisk() throws -> Session {
+        let now = h.clock.now
+        let session = Session(startedAt: now.addingTimeInterval(-600), endsAt: now.addingTimeInterval(3600))
+        try h.store.saveSession(session)
+        var journal = RuntimeState()
+        journal.sleepDisabledByUs = true
+        journal.lowPowerSetByUs = true
+        try h.store.saveState(journal)
+        h.guardFake.sleepDisabled = true
+        return session
+    }
+
+    /// Insomnia crashed while a `lowpowermode 1` it ran was left running,
+    /// and the command keeps the lock past the relaunch's bound. The launch
+    /// reconcile changes nothing and runs again after each retry delay
+    /// while the lock stays busy, announcing the command once. Once the
+    /// command has exited, a retry resumes the session and checks the mode
+    /// the command left: it failed, so the mode is off, and the ownership
+    /// is cleared after a `lowpowermode 0` of Insomnia's own. The floors
+    /// then act on the session again: Low Power Mode goes on under its
+    /// floor, and a battery under the end floor ends the session.
+    func testLaunchReconcileRefusedForABusyLockRunsAgainOnceTheCommandExits() async throws {
+        let session = try liveSessionOnDisk()
+        let journal = try XCTUnwrap(try h.store.loadState())
+        let identity = FakeSleepGuard.identity(of: 4321)
+        try h.store.saveUnfinishedCommand(UnfinishedCommandRecord(
+            pid: 4321,
+            command: "/usr/bin/sudo -n /usr/bin/pmset -a lowpowermode 1",
+            since: h.clock.now,
+            identity: identity
+        ))
+        h.processes.run(4321, as: identity)
+        // Stands in for the command, which holds the lock through its stdin.
+        let command = try XCTUnwrap(try RecoveryLock(url: h.home.paths.recoveryLock).tryAcquire())
+        let m = h.makeManager(retryDelay: 0.1)
+        let resyncs = Locked<[Bool]>([])
+        m.resyncAfterCommand = { resyncs.value.append($0) }
+        let floors = FloorRuleDriver(manager: m, notifier: h.notifier)
+
+        await m.reconcile()
+        // Long enough for several refused retries: each waits out the
+        // 0.3 s lock bound, then 0.1 s.
+        try await Task.sleep(for: .seconds(1.5))
+
+        XCTAssertNil(m.session)
+        XCTAssertTrue(m.lastError?.hasPrefix("reconcile skipped, nothing changed") == true, m.lastError ?? "")
+        XCTAssertEqual(h.guardFake.calls, [], "pmset ran without the lock")
+        XCTAssertEqual(try h.store.loadSession(), session)
+        XCTAssertEqual(try h.store.loadState(), journal)
+        XCTAssertEqual(h.notifier.posts.filter { $0.title == SessionManager.commandRunningTitle }.count, 1, "announced again on every retry")
+
+        command.release()
+        h.processes.entries = [:]
+        await waitUntil("the reconcile never ran again once the lock was free") { resyncs.value == [false] }
+
+        XCTAssertEqual(m.session, session)
+        XCTAssertNil(h.store.loadUnfinishedCommand())
+        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1", "pmset -g custom", "lowpowermode 0"])
+        XCTAssertEqual(try h.store.loadState()?.lowPowerSetByUs, false, "ownership of a mode that is off was kept")
+
+        await floors.run(battery: .percent(30), isCharging: false, thermal: .nominal, lidClosed: false)
+        XCTAssertTrue(h.guardFake.lowPowerOn, "the Low Power Mode floor did not act on the resumed session")
+        await floors.run(battery: .percent(5), isCharging: false, thermal: .nominal, lidClosed: false)
+        XCTAssertFalse(m.isActive, "the end floor did not end the resumed session")
+        XCTAssertNil(try h.store.loadSession())
+        XCTAssertFalse(h.guardFake.sleepDisabled)
+        XCTAssertFalse(h.guardFake.lowPowerOn)
+    }
+
+    /// Quit is requested while the refused launch reconcile waits to run
+    /// again. The end restores the earlier run's journal once the lock
+    /// frees, and the reconcile is dropped: it would resume the session
+    /// the user quit, holding sleep for it.
+    func testLaunchReconcileWaitingToRunAgainIsDroppedForAnEnd() async throws {
+        _ = try liveSessionOnDisk()
+        let other = try XCTUnwrap(try RecoveryLock(url: h.home.paths.recoveryLock).tryAcquire())
+        let m = h.makeManager(retryDelay: 0.2)
+
+        await m.reconcile()
+        XCTAssertNil(m.session)
+        let quit = await m.end(reason: .quit)
+        XCTAssertEqual(quit, .locked)
+        other.release()
+        await waitUntil("the end was never retried") { m.pendingEnd == nil }
+        // Past the time any reconcile retry would have run.
+        try await Task.sleep(for: .seconds(1))
+
+        XCTAssertNil(m.session)
+        XCTAssertNil(try h.store.loadSession())
+        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
+        XCTAssertFalse(h.guardFake.calls.contains("disablesleep 1"), "the reconcile resumed a session the user quit: \(h.guardFake.calls)")
+        XCTAssertFalse(h.guardFake.sleepDisabled)
+    }
+
     /// A start whose `disablesleep 1` is left running is not surfaced, and
     /// nothing is rolled back: session.json and the journal entry stay so
     /// the backstop can honour the deadline if Insomnia dies first. The undo

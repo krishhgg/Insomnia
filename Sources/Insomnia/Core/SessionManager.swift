@@ -240,6 +240,8 @@ final class SessionManager {
     @ObservationIgnored private(set) var lidEventDeferred = false
     /// The settle pass waiting to run again after a busy lock.
     @ObservationIgnored private var settleRetry: Task<Void, Never>?
+    /// The launch reconcile waiting to run again after a refusal.
+    @ObservationIgnored private var reconcileRetry: Task<Void, Never>?
     /// Whether this launch has posted the notification for a SleepDisabled
     /// bit Insomnia did not set (reconcile step 3), so a bit that stays set
     /// is announced once, not on every reconcile.
@@ -1528,8 +1530,66 @@ final class SessionManager {
 
     // MARK: Reconcile (spec section 8)
 
+    /// Run at launch. A refused reconcile changed nothing and runs again
+    /// after `recoveryRetryDelay` until it goes through. Nothing else would
+    /// resume a session still live on disk: its sleep stays disabled until
+    /// the backstop's deadline, with no battery floor watching it. The lock
+    /// can stay busy past the bound for as long as a command an earlier run
+    /// left running takes to exit, and a journal that does not decode may
+    /// be fixed by hand.
+    ///
+    /// The command recorded by that run has exited once the reconcile holds
+    /// the lock, and may have changed Low Power Mode after the journal was
+    /// written. A session resumed after it is checked against the mode, as
+    /// after a command this process left running (`settleAfterCommand`).
     func reconcile() async {
-        _ = await exclusive("reconcile") { await self.performReconcile() }
+        reconcileRetry?.cancel()
+        reconcileRetry = nil
+        await reconcile(ticket: endTicket, isRetry: false)
+    }
+
+    private func reconcile(ticket: Int, isRetry: Bool) async {
+        // This process removes the record of its own command when that
+        // command exits, so a record on disk now was left by an earlier run.
+        let leftRunning = store.loadUnfinishedCommand() != nil
+        let result = await exclusive("reconcile") { () -> Bool in
+            if isRetry, !self.reconcileIsOwed(since: ticket) { return false }
+            await self.performReconcile()
+            return true
+        }
+        switch result {
+        case .success(true):
+            if leftRunning { await settleAfterCommand() }
+        case .success(false):
+            break
+        case .failure:
+            scheduleReconcileRetry(ticket: ticket)
+        }
+    }
+
+    private func scheduleReconcileRetry(ticket: Int) {
+        reconcileRetry?.cancel()
+        let delay = recoveryRetryDelay
+        reconcileRetry = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(delay))
+            guard let self, !Task.isCancelled else { return }
+            self.reconcileRetry = nil
+            guard self.reconcileIsOwed(since: ticket) else { return }
+            Log.info("retrying the launch reconcile")
+            await self.reconcile(ticket: ticket, isRetry: true)
+        }
+    }
+
+    /// A refused reconcile is moot once a start has made a session active
+    /// or an end has been requested: the start replaced the session on
+    /// disk, and restoring the journal is the end's job from then on.
+    /// Checked before the retry queues and again once it holds the lock.
+    private func reconcileIsOwed(since ticket: Int) -> Bool {
+        guard session == nil, endTicket == ticket else {
+            Log.info("launch reconcile dropped: a session was started or an end requested since it was refused")
+            return false
+        }
+        return true
     }
 
     private func performReconcile() async {

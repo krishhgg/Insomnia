@@ -559,6 +559,16 @@ Reconcile runs at every Insomnia launch:
    journal, not from this check. Nothing clears `SleepDisabled` without a
    journal entry, in the app or in the agent.
 
+A reconcile refused for a busy lock or an unreadable journal changes
+nothing and runs again after the retry delay until it goes through, unless
+a start has made a session active or an end has been requested since. The
+lock can stay busy for as long as a `sudo pmset` an earlier run left
+running, and without the retry a session still live on disk would hold
+sleep with no battery floor until its deadline. If `unfinished-command.json`
+was on disk, that command has exited by the time the reconcile holds the
+lock, so a session it resumes is checked against Low Power Mode as after a
+command the app itself left running (below).
+
 Backstop, independent of the app:
 
 - The agent reads the saved deadline; recurring recovery checks avoid replacing
