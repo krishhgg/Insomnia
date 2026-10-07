@@ -157,17 +157,23 @@ is performed. Do not replace "not run" with "passed" based on source review.
 | Reinstall over an older four-line `/etc/sudoers.d/insomnia` leaves exactly the three passwordless lines | Not run |
 | A dialog whose osascript has not exited 3 s after the 120 s SIGTERM is reported with its pid (notification and menu warning line) and nothing is killed; the start rolls back at once (no session, `SleepDisabled` absent, a new Start shows a new dialog), the menu line names the pid until osascript exits and goes once it has | Not run |
 | A one-minute session whose password is entered after 70 s: the dialog's command reports the session has already ended, `pmset -g` shows no `SleepDisabled 1`, "Session not started" | Not run |
-| With `backstop.sh` replaced by a copy from before this change (no `# insomnia-backstop-version:` line), Start shows no password dialog and says to run `scripts/install.sh` again; after the rerun Start shows the dialog | Not run |
 | With `/etc/sudoers.d/insomnia` moved aside by hand (`sudo mv`), Start shows no password dialog, changes nothing (no session.json, `pmset -g` unchanged) and says to run `scripts/install.sh` again; after the rerun Start shows the dialog | Not run |
 | The same with the rule moved aside, another passwordless sudoers entry of your own in place (so `sudo -n -l /usr/bin/pmset -a disablesleep 0` exits 0) and a `sudo -v` in Terminal just before: Start still shows no dialog and names `sudo -k -n /usr/bin/pmset -a disablesleep 0` | Not run |
-| `scripts/install.sh` run while `SleepDisabled 1` is set by hand prints "sudoers rule not checked" and finishes; run with sleep on it prints "sudoers rule verified" | Not run |
-| An upgrade from a build before this change replaces `backstop.sh` before the bundle (the script's mtime is earlier than the bundle's) and the first Start shows the dialog | Not run |
+| `scripts/install.sh` prints that `sudo -k -n -l` lists the three commands and runs no `pmset` command of its own: `pmset -g` before and after shows the same `SleepDisabled` value, also when it is set by hand | Not run |
+| An upgrade from a build before this change (four-line rule, `backstop.sh` in Application Support) leaves exactly the three passwordless lines, removes the old `backstop.sh`, and the first Start shows the dialog | Not run |
 | Force-quit Insomnia while its password dialog is up, then relaunch it (or wait a minute for the agent), then enter the password in the old dialog: `pending-start` is gone, the dialog's command reports the start is over, and `pmset -g` shows no `SleepDisabled 1` | Not run |
 | `chflags uchg` on `pending-start` while a password dialog is up, then force-quit and relaunch: sleep restored, "Restore incomplete" names the file, the journal keeps `sleepDisabledByUs`, Start is refused; after `chflags nouchg` the next agent run or relaunch deletes the file and clears the entry | Not run |
 | An upgrade whose running app refuses to quit stops after the password prompt and before the rule, and leaves `/etc/sudoers.d/insomnia` byte for byte as it was | Not run |
 | An upgrade stopped after the installer quit the app and before the rule (open the app again while the installer waits for the recovery lock, for example while a password dialog of a Start holds it) leaves `/etc/sudoers.d/insomnia` byte for byte as it was and keeps the old bundle, so the old build still starts sessions; the rerun finishes the install | Not run |
 | With a session running, the installer prints "A session is running and the upgrade will end it." before the password prompt; answering anything but y at "Continue?" in a terminal stops it with no password prompt, the app running and the session counting down | Not run |
 | Cancelling the installer's password prompt during a session leaves the app running and the session counting down; `/etc/sudoers.d/insomnia`, the bundle and the LaunchAgent are unchanged | Not run |
+| Recovery agent refuses to run after the installed bundle or its sealed backstop.sh is modified, and logs why | Not run |
+| Running app refuses to arm (session start refused, reason shown) after its installed bundle is edited or re-signed under it | Not run |
+| Upgrade whose new agent fails to load puts the previous bundle back and reloads the previous agent, on a working Mac | Not run |
+| Upgrade whose new agent plist cannot be saved, and a rerun after an install killed mid-swap, leave the app and the agent's plist matching, on a working Mac | Not run |
+| Upgrade whose bundle rename is refused (the new build cannot be moved in, or the previous app cannot be moved back) puts the previous app back and reloads its agent, or keeps both bundles and prints the commands, on a working Mac | Not run |
+| Install whose `sudo -k -n -l` check or `launchctl` call stalls while it holds the recovery lock (for example a directory-service lookup that does not answer) stops after 30 s and releases the lock, and the agent's next run can take it, on a working Mac | Not run |
+| Install or uninstall whose own process is killed (`kill -9 <pid>`) during a `launchctl bootout` keeps the recovery lock until that bootout has ended or been stopped, about 33 s at most, and the app started afterwards keeps its agent loaded, on a working Mac | Not run |
 | First launch over an existing install tightens Application Support/Insomnia and Logs/Insomnia to 0700 and their files to 0600 | Not run |
 | Launch at login survives a reinstall by install.sh, including a second install.sh run on the same unchanged build (switch on, reinstall, relaunch: the log shows the launch-time check, System Settings > General > Login Items lists Insomnia as enabled, and the Settings switch reads on; a pending approval shows the note and the Open Login Items button) | Not run |
 | Launch at login heals on the first upgrade from a build without the install record (switch on in the previous build, upgrade with install.sh, relaunch: the log shows "registering once and recording the install", Login Items lists Insomnia, and config.json has `launchAtLoginInstall`) | Not run |
@@ -181,10 +187,16 @@ machine to validate thermal handling; exercise injected thermal events first.
 
 Launchd sequencing tests use a fake command runner. Actual bootstrap of the
 private candidate plist, login loading, and crash recovery must still be
-checked on the supported macOS release. Installer tests redirect every app,
-LaunchAgent, sudoers, and command target into a temporary fixture. Real build,
-signing, privileged installation, and quit refusal by a running app have not
-been exercised as an end-to-end installation on a working Mac.
+checked on the supported macOS release. PackagingTests run the agent's
+verify-then-exec command line against a scratch ad-hoc bundle with the real
+codesign: an intact bundle runs its sealed script, and an edited script or
+another build's requirement is refused and logged. Whether launchd runs that
+command line as installed, and whether the installed app's plist is the one
+install.sh wrote, has not been checked on a working Mac. Installer tests
+redirect every app, LaunchAgent, sudoers, and command target into a temporary
+fixture. Real build, signing, privileged installation, and quit refusal by a
+running app have not been exercised as an end-to-end installation on a
+working Mac.
 
 ## Distribution boundary
 
