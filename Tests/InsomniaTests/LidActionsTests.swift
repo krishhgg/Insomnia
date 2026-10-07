@@ -1350,7 +1350,7 @@ final class LidActionsTests: XCTestCase {
         let held = try XCTUnwrap(try RecoveryLock(url: h.home.paths.recoveryLock).tryAcquire())
 
         await m.outputDevicesChanged()
-        let gaveUp = "still not restored after \(SessionManager.audioRetryLimit) retries"
+        let gaveUp = "still not checked or restored after \(SessionManager.audioRetryLimit) retries"
         for _ in 0..<1000 where !logText().contains(gaveUp) {
             try await Task.sleep(for: .milliseconds(10))
         }
@@ -1477,6 +1477,91 @@ final class LidActionsTests: XCTestCase {
         await first.stopWaitingForOutput(later)
 
         XCTAssertEqual(try h.store.loadState()?.savedAudioOutputs, [])
+    }
+
+    /// Two copies of the app share the journal. The first is idle and read
+    /// it clean at launch. The second closes the lid on the headset, the
+    /// headset is unplugged, and the second copy quits: sleep is restored
+    /// and the headset's save stays. When the headset is plugged back in,
+    /// the first copy's device change finds that save on disk and restores
+    /// it. The fake keeps one listener, so the test calls the first copy's
+    /// handler itself, as CoreAudio calls each app's.
+    func testAnIdleCopyRestoresAnotherCopysSaveWhenTheDeviceReconnects() async throws {
+        let idle = h.makeManager()
+        await idle.reconcile()
+        XCTAssertEqual(idle.state.savedAudioOutputs, [])
+        do {
+            let (writer, _) = await closeOnTheHeadsetAndUnplugIt()
+            let quit = await writer.end(reason: .quit)
+            XCTAssertEqual(quit, .restored)
+        }
+        XCTAssertEqual(try h.store.loadState()?.sleepDisabledByUs, false)
+        XCTAssertEqual(try h.store.loadState()?.savedAudioOutputs.map(\.withoutSaveID), [Self.headsetSaved])
+        XCTAssertEqual(idle.state.savedAudioOutputs, [], "the idle copy read the journal again")
+
+        h.audio.connect("usb-headset", name: "USB Headset", volume: 0.3, muted: true)
+        await idle.outputDevicesChanged()
+
+        XCTAssertEqual(h.audio.applied.map { $0.deviceUID }, ["usb-headset"])
+        XCTAssertEqual(h.audio.device("usb-headset")?.volume, 0.3)
+        XCTAssertEqual(h.audio.device("usb-headset")?.muted, false)
+        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
+        XCTAssertNil(idle.lastError)
+    }
+
+    /// The same two copies, with the second copy's session running and its
+    /// lid closed. The headset is plugged back in, and the idle copy, which
+    /// has not seen the save, leaves it muted: the session on disk has the
+    /// lid closed. The second copy's lid open restores it.
+    func testAnIdleCopyLeavesAnotherCopysSaveMutedUnderItsClosedLid() async throws {
+        let idle = h.makeManager()
+        await idle.reconcile()
+        let (writer, writerActions) = await closeOnTheHeadsetAndUnplugIt()
+        h.clamshell.closed = true
+        XCTAssertEqual(idle.state.savedAudioOutputs, [])
+
+        h.audio.connect("usb-headset", name: "USB Headset", volume: 0.3, muted: true)
+        await idle.outputDevicesChanged()
+
+        XCTAssertEqual(h.audio.applied.count, 0)
+        XCTAssertEqual(h.audio.device("usb-headset")?.muted, true)
+        XCTAssertEqual(try h.store.loadState()?.savedAudioOutputs.map(\.withoutSaveID), [Self.headsetSaved])
+        XCTAssertNil(idle.lastError)
+
+        h.clamshell.closed = false
+        await writerActions.onOpen()
+        XCTAssertEqual(h.audio.applied.map { $0.deviceUID }, ["usb-headset"])
+        XCTAssertEqual(h.audio.device("usb-headset")?.muted, false)
+        XCTAssertEqual(try h.store.loadState()?.savedAudioOutputs, [])
+        XCTAssertTrue(writer.isActive)
+    }
+
+    /// A device change with nothing saved changes nothing. Refused by a
+    /// busy lock, it cannot know that nothing is saved, so it says so in
+    /// the menu and is retried; the retry finds nothing and takes the line
+    /// down.
+    func testADeviceChangeWithNothingSavedChangesNothing() async throws {
+        let m = h.makeManager(lockTimeout: 0.05, retryDelay: 0.05)
+        await m.reconcile()
+        h.audio.connect("usb-headset", name: "USB Headset", volume: 0.3, muted: true)
+
+        await m.outputDevicesChanged()
+        XCTAssertEqual(h.audio.applied.count, 0)
+        XCTAssertEqual(h.audio.device("usb-headset")?.muted, true)
+        XCTAssertNil(m.lastError)
+
+        let held = try XCTUnwrap(try RecoveryLock(url: h.home.paths.recoveryLock).tryAcquire())
+        await m.outputDevicesChanged()
+        XCTAssertTrue(m.lastError?.hasPrefix("output device change skipped, nothing changed") == true, m.lastError ?? "nil")
+        held.release()
+        for _ in 0..<500 where m.lastError != nil {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+
+        XCTAssertNil(m.lastError)
+        XCTAssertEqual(h.audio.applied.count, 0)
+        XCTAssertEqual(h.audio.device("usb-headset")?.muted, true)
+        XCTAssertEqual(try h.store.loadState() ?? .clean, RuntimeState.clean)
     }
 
     /// The headset came back after the menu was built, and the click runs

@@ -1532,9 +1532,11 @@ final class SessionManager {
     /// owed its volume gets it back now if it is connected, unless a lid
     /// close may be in effect (`lidCloseMayBeInEffect`): the lid open
     /// restores it then. CoreAudio sends no second event, so a recovery
-    /// lock that refuses this one is retried in process.
+    /// lock that refuses this one is retried in process. Whether anything
+    /// is owed is decided in the transaction, on the journal as it is on
+    /// disk: another copy of the app may have saved an output since this
+    /// copy last read it.
     func outputDevicesChanged() async {
-        guard !state.savedAudioOutputs.isEmpty else { return }
         await restoreOwedAudio("output device change", retrying: false)
     }
 
@@ -1546,8 +1548,8 @@ final class SessionManager {
         let result = await exclusive(what) {
             let s = self.state
             guard !s.savedAudioOutputs.isEmpty || s.savedOutputVolume != nil || s.savedMuted != nil else {
-                // Restored meanwhile, by a lid open, an end or another copy
-                // of the app.
+                // Nothing saved, or restored meanwhile by a lid open, an
+                // end or another copy of the app.
                 self.clearAudioWarning()
                 return
             }
@@ -1597,7 +1599,7 @@ final class SessionManager {
         audioRetryTask?.cancel()
         audioRetryTask = nil
         guard audioRetriesLeft > 0 else {
-            Log.error("audio: saved output volume still not restored after \(Self.audioRetryLimit) retries; it stays in the journal, and the next device change, lid open, session end or launch tries again")
+            Log.error("audio: saved output volume still not checked or restored after \(Self.audioRetryLimit) retries; any saved volume stays in the journal, and the next device change, lid open, session end or launch tries again")
             return
         }
         audioRetriesLeft -= 1
@@ -2020,11 +2022,15 @@ final class SessionManager {
         // sudo pmset that did not stop on SIGTERM ends the reconcile too:
         // step 3 would run a second `disablesleep 0` beside the live one.
         // The lock goes to the command and the end is retried when it exits.
+        // A session.json kept in place is renamed by an end, which is
+        // retried until it moves, so saved output volumes alone then call
+        // for one too, as on any other dirty journal.
         let savedOutputs = Set(state.savedAudioOutputs.map(\.deviceUID))
+        let owesEnd = keptSessionFile != nil ? state.isDirty : state.isDirty(leavingOutAudioOf: savedOutputs)
         if onDisk != nil {
             Log.info("reconcile: session expired, restoring")
             if case .privilegedCommandRunning = await performEnd(reason: .timer) { return }
-        } else if state.isDirty(leavingOutAudioOf: savedOutputs) {
+        } else if owesEnd {
             Log.info(keptSessionFile != nil
                 ? "reconcile: session.json kept in place, restoring the journal as for an expired session"
                 : "reconcile: no session but dirty state, restoring")

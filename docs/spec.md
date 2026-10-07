@@ -142,7 +142,9 @@ dropped. An entry written before entries had an ID has none and is
 compared by its values. While Insomnia runs, a device that
 connects again gets its volume back at once (a CoreAudio device-list
 listener), or at the next lid open if a session is running with the lid
-closed. Before the launch reconcile has taken a session over, a session.json
+closed. Each device change reads the journal on disk under the lock, so a
+copy of the app with nothing saved in memory also restores a save another
+copy wrote. Before the launch reconcile has taken a session over, a session.json
 that has not expired, or cannot be read, counts as a running session for
 this. A later launch restores every connected device at reconcile.
 
@@ -589,7 +591,9 @@ Reconcile runs at every Insomnia launch:
    new path. If either rename fails the file stays and a start is refused
    while it is there. Every end then restores the journal and tries the
    rename again; while it fails the end is not finished, so quit is refused
-   and the end is retried. A file that could not be read would be resumed
+   and the end is retried. The launch that kept the file runs that end
+   itself when the journal holds any entry, saved output volumes alone
+   included. A file that could not be read would be resumed
    if it became readable in place, and every later launch and the agent
    read either kind again. The messages say to remove it or move it out of
    the folder. `backstop.sh` tries the rename again on every run.
