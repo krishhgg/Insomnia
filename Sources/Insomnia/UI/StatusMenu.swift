@@ -20,8 +20,9 @@ enum StatusMenu {
             case relaunchBrowser(ThrottledBrowser)
             /// Drop the saved volume of this output device: it is not
             /// connected, and Insomnia stops waiting for it. Carries the
-            /// save the item was built for, so a later one is not dropped.
-            case stopWaitingForOutput(SessionManager.WaitingOutput)
+            /// save the item was built for, its save ID included, so a
+            /// later one is not dropped.
+            case stopWaitingForOutput(SavedAudioOutput)
         }
 
         let title: String
@@ -56,7 +57,7 @@ enum StatusMenu {
         error: String?,
         commandRunning: String? = nil,
         foreignSleep: String? = nil,
-        outputsWaiting: [SessionManager.WaitingOutput] = [],
+        outputsWaiting: [SavedAudioOutput] = [],
         lidSimulationBuild: Bool = false
     ) -> [Item] {
         var out: [Item] = []
@@ -102,8 +103,8 @@ enum StatusMenu {
             out.append(Item(title: "\u{26A0} \(foreignSleep)", kind: .warning))
         }
         for waiting in outputsWaiting {
-            out.append(Item(title: "\u{26A0} \(SessionManager.stillMutedLine(waiting.entry))", kind: .warning))
-            out.append(Item(title: "Stop waiting for \(waiting.entry.label)", kind: .stopWaitingForOutput(waiting)))
+            out.append(Item(title: "\u{26A0} \(SessionManager.stillMutedLine(waiting))", kind: .warning))
+            out.append(Item(title: "Stop waiting for \(waiting.label)", kind: .stopWaitingForOutput(waiting)))
         }
         if !out.isEmpty {
             out.append(Item(title: "", kind: .separator))

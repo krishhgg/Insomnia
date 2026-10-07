@@ -54,7 +54,9 @@ enum EndOutcome: Sendable, Equatable {
     case privilegedCommandRunning(pid: Int32)
 }
 
-/// Why a lifecycle transaction did not run at all.
+/// Why a lifecycle transaction did not run at all. A busy lock and an
+/// unreadable journal carry the line the refusal put in the menu
+/// (`lastError`).
 enum TransactionRefusal: Error, Sendable {
     case lockBusy(String)
     case journalUnreadable(String)
@@ -107,27 +109,18 @@ final class SessionManager {
     /// longer in it. In memory: each launch finds them again at its first
     /// try.
     private(set) var audioDevicesNotConnected: Set<String> = []
-    /// Per device UID, how many of its saves this process has taken off the
-    /// journal, restored or dropped. Tells a save apart from a later one for
-    /// the same device (`WaitingOutput.save`).
-    private var outputSavesEnded: [String: Int] = [:]
-
-    /// An output device the menu names as waiting for its volume, and which
-    /// of its saves that is. A "Stop waiting" item built for one save then
-    /// cannot drop a later lid close's save for the same device, values
-    /// alike or not. In memory only, like the menu.
-    struct WaitingOutput: Equatable, Sendable {
-        let entry: SavedAudioOutput
-        let save: Int
-    }
+    /// The menu line (`lastError`) the restore of the saved output volumes
+    /// last put up: a device change or audio retry that was refused, or a
+    /// restore that failed. A later restore that leaves nothing to retry
+    /// takes it down, unless a newer failure has replaced it since
+    /// (`clearAudioWarning`).
+    @ObservationIgnored private var audioWarning: String?
 
     /// Output devices lid close muted that are still waiting to get their
     /// volume and mute back because they were not connected. The menu
     /// names each one, with a way to stop waiting.
-    var outputsWaitingForRestore: [WaitingOutput] {
-        state.savedAudioOutputs
-            .filter { audioDevicesNotConnected.contains($0.deviceUID) }
-            .map { WaitingOutput(entry: $0, save: outputSavesEnded[$0.deviceUID, default: 0]) }
+    var outputsWaitingForRestore: [SavedAudioOutput] {
+        state.savedAudioOutputs.filter { audioDevicesNotConnected.contains($0.deviceUID) }
     }
 
     var isActive: Bool { session != nil }
@@ -493,8 +486,9 @@ final class SessionManager {
             do {
                 handle = try await self.recoveryLock.acquire(timeout: self.recoveryLockTimeout)
             } catch {
-                self.fail("\(what) skipped, nothing changed: \(error.localizedDescription)\(self.recordedLockHolder(error))")
-                return .failure(.lockBusy(error.localizedDescription))
+                let line = "\(what) skipped, nothing changed: \(error.localizedDescription)\(self.recordedLockHolder(error))"
+                self.fail(line)
+                return .failure(.lockBusy(line))
             }
             var lockHandedOver = false
             defer { if !lockHandedOver { handle.release() } }
@@ -510,8 +504,7 @@ final class SessionManager {
             do {
                 try self.loadJournal()
             } catch {
-                self.refuseForUnreadableJournal(what, error)
-                return .failure(.journalUnreadable(error.localizedDescription))
+                return .failure(.journalUnreadable(self.refuseForUnreadableJournal(what, error)))
             }
             self.writeOwedEdits()
             let before = self.unfinishedCommand
@@ -542,14 +535,17 @@ final class SessionManager {
         state = try store.loadState() ?? .clean
     }
 
-    private func refuseForUnreadableJournal(_ what: String, _ error: Error) {
+    /// Returns the line put in the menu.
+    private func refuseForUnreadableJournal(_ what: String, _ error: Error) -> String {
         let message = Self.unreadableJournalMessage(error)
-        fail("\(what) refused, nothing changed: \(message)")
+        let line = "\(what) refused, nothing changed: \(message)"
+        fail(line)
         let detail = error.localizedDescription
         if announcedCorruption != detail {
             announcedCorruption = detail
             notifier.post(title: Self.journalTitle, body: message)
         }
+        return line
     }
 
     private static func unreadableJournalMessage(_ error: Error) -> String {
@@ -1090,7 +1086,7 @@ final class SessionManager {
         // An output device that is not connected does not hold up the end:
         // its saved volume stays journaled for when it reconnects, and the
         // notification and the menu name it.
-        let waiting = outputsWaitingForRestore.map(\.entry)
+        let waiting = outputsWaitingForRestore
         let waitingUIDs = Set(waiting.map(\.deviceUID))
         let dirty = state.isDirty(leavingOutAudioOf: waitingUIDs)
         if dirty || retainedBecause != nil {
@@ -1118,13 +1114,17 @@ final class SessionManager {
             let detail = lastError ?? "some changes could not be undone"
             let retry: String
             if armed {
-                // The agent keeps saved output volumes but cannot restore
-                // them (CoreAudio); this process retries them on its own.
+                // The agent keeps saved output volumes, display brightness
+                // and keyboard backlight but cannot restore them (CoreAudio,
+                // private frameworks). This process retries the volumes on
+                // its own; the brightness waits for a later end or launch.
                 let owesAudio = state.savedAudioOutputs.contains { !waitingUIDs.contains($0.deviceUID) }
                     || state.savedOutputVolume != nil || state.savedMuted != nil
+                let owesBrightness = state.savedDisplayBrightness != nil || state.savedKeyboardBrightness != nil
                 var sentences: [String] = []
-                if state.isDirtyApartFromAudio { sentences.append("The recovery agent retries every minute.") }
+                if state.isDirtyApartFromAppOnlyEntries { sentences.append("The recovery agent retries every minute.") }
                 if owesAudio { sentences.append(Self.audioRetrySentence(recoveryRetryDelay)) }
+                if owesBrightness { sentences.append(Self.brightnessRetrySentence) }
                 retry = sentences.joined(separator: " ")
             } else {
                 retry = "Insomnia retries in \(Int(recoveryRetryDelay)) s; do not quit until it is restored."
@@ -1446,7 +1446,8 @@ final class SessionManager {
     /// leaves the journal only once its restore went through. A restore
     /// that fails on a connected device, or whose journal clear fails, is
     /// tried again in process (`scheduleAudioRetry`); `retrying` says this
-    /// is that retry.
+    /// is that retry. A pass that leaves nothing to retry takes down the
+    /// menu line an earlier audio failure put up (`clearAudioWarning`).
     private func restoreAudioInJournal(retrying: Bool = false) {
         if !retrying { audioRetriesLeft = Self.audioRetryLimit }
         var retry = false
@@ -1468,14 +1469,12 @@ final class SessionManager {
                 }
                 continue
             } catch {
-                fail("could not restore audio on \(device): \(error.localizedDescription); kept in the journal to retry")
+                failAudio("could not restore audio on \(device): \(error.localizedDescription); kept in the journal to retry")
                 retry = true
                 continue
             }
             let uid = entry.deviceUID
-            if clearUndone("audio restored on \(device)", { $0.savedAudioOutputs.removeAll { $0.deviceUID == uid } }) {
-                outputSavesEnded[uid, default: 0] += 1
-            } else {
+            if !clearUndone("audio restored on \(device)", { $0.savedAudioOutputs.removeAll { $0.deviceUID == uid } }) {
                 retry = true
             }
         }
@@ -1501,7 +1500,7 @@ final class SessionManager {
                 }
                 if !cleared { retry = true }
             } catch {
-                fail("could not restore audio: \(error.localizedDescription)")
+                failAudio("could not restore audio: \(error.localizedDescription)")
                 retry = true
             }
         }
@@ -1511,7 +1510,22 @@ final class SessionManager {
         } else {
             audioRetryTask?.cancel()
             audioRetryTask = nil
+            clearAudioWarning()
         }
+    }
+
+    /// `fail` for the restore of the saved output volumes.
+    private func failAudio(_ message: String) {
+        fail(message)
+        audioWarning = message
+    }
+
+    /// The saved output volumes owe no retry now: the menu line their last
+    /// failure put up goes, if it is still the line shown. A newer failure
+    /// of anything else stays.
+    private func clearAudioWarning() {
+        if let line = audioWarning, lastError == line { lastError = nil }
+        audioWarning = nil
     }
 
     /// CoreAudio reports a device connected or gone. An output device still
@@ -1531,17 +1545,28 @@ final class SessionManager {
     private func restoreOwedAudio(_ what: String, retrying: Bool) async {
         let result = await exclusive(what) {
             let s = self.state
-            guard !s.savedAudioOutputs.isEmpty || s.savedOutputVolume != nil || s.savedMuted != nil else { return }
+            guard !s.savedAudioOutputs.isEmpty || s.savedOutputVolume != nil || s.savedMuted != nil else {
+                // Restored meanwhile, by a lid open, an end or another copy
+                // of the app.
+                self.clearAudioWarning()
+                return
+            }
             if self.lidCloseMayBeInEffect() {
                 Log.info("audio: \(what) while a lid close may be in effect; the saved volumes wait for the lid open")
                 return
             }
             self.restoreAudioInJournal(retrying: retrying)
         }
-        if case .failure = result {
-            if !retrying { audioRetriesLeft = Self.audioRetryLimit }
-            scheduleAudioRetry()
+        guard case let .failure(refusal) = result else { return }
+        switch refusal {
+        case let .lockBusy(line), let .journalUnreadable(line):
+            audioWarning = line
+        case .commandRunning:
+            // Its line is `commandWarning`, which goes when the command exits.
+            break
         }
+        if !retrying { audioRetriesLeft = Self.audioRetryLimit }
+        scheduleAudioRetry()
     }
 
     /// Whether a lid close may still be in effect, so a muted output must
@@ -1592,15 +1617,17 @@ final class SessionManager {
     /// back (a meeting room display, a borrowed speaker), whose entry would
     /// otherwise keep its menu line up for good and stop uninstall.sh. The
     /// menu item may be out of date by the time this runs, so both
-    /// conditions are checked again under the lock: the entry is still the
-    /// save the item was built for, and the device still reads as not
-    /// connected. Otherwise nothing is dropped. A later lid close's save
-    /// stays, and a device that came back gets its volume as usual.
-    func stopWaitingForOutput(_ waiting: WaitingOutput) async {
-        let deviceUID = waiting.entry.deviceUID
+    /// conditions are checked again under the lock, on the journal as it is
+    /// on disk: the entry is still the save the item was built for, its
+    /// save ID included, and the device still reads as not connected.
+    /// Otherwise nothing is dropped. A later lid close's save stays, even
+    /// one another copy of the app wrote with the same values, and a device
+    /// that came back gets its volume as usual.
+    func stopWaitingForOutput(_ waiting: SavedAudioOutput) async {
+        let deviceUID = waiting.deviceUID
         _ = await exclusive("stop waiting for an output") {
             guard let entry = self.state.savedAudioOutputs.first(where: { $0.deviceUID == deviceUID }) else { return }
-            guard self.outputSavesEnded[deviceUID, default: 0] == waiting.save else {
+            guard entry == waiting else {
                 Log.info("audio: stop waiting for \(entry.label) not done: the menu item was for an earlier save, already restored or dropped; the save from a later lid close stays")
                 return
             }
@@ -1618,7 +1645,6 @@ final class SessionManager {
             do {
                 try self.journal { $0.savedAudioOutputs.removeAll { $0.deviceUID == deviceUID } }
                 self.audioDevicesNotConnected.remove(deviceUID)
-                self.outputSavesEnded[deviceUID, default: 0] += 1
                 Log.info("audio: stopped waiting for \(entry.label) as asked; its saved volume \(entry.volume) and mute \(entry.muted) are dropped, and it stays muted")
             } catch {
                 self.fail("could not drop the saved volume of \(entry.label): \(error.localizedDescription)")
@@ -2338,6 +2364,10 @@ final class SessionManager {
     nonisolated static func audioRetrySentence(_ delay: TimeInterval) -> String {
         "The recovery agent cannot restore output volume. Insomnia tries again in \(Int(delay)) s while it runs, and at its next launch."
     }
+
+    /// The same for display brightness or keyboard backlight, which the
+    /// next end (`restoreAll`) or the launch reconcile restores.
+    nonisolated static let brightnessRetrySentence = "The recovery agent cannot restore display brightness or keyboard backlight. Insomnia tries again when a later session ends, and at its next launch."
 
     /// The menu line for an output device still waiting for its volume.
     nonisolated static func stillMutedLine(_ output: SavedAudioOutput) -> String {

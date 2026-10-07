@@ -790,13 +790,13 @@ final class StillRunningCommandTests: XCTestCase {
     /// in-process audio retry gives the headset its volume back once the
     /// command has exited.
     func testAReconnectRefusedWhileTheCommandRunsIsRetriedAfterItExits() async throws {
-        let headset = SavedAudioOutput(deviceUID: "usb-headset", name: "USB Headset", volume: 0.3, muted: false)
+        let headset = SavedAudioOutput(deviceUID: "usb-headset", name: "USB Headset", volume: 0.3, muted: false, saveID: "save-1")
         var earlier = RuntimeState()
         earlier.savedAudioOutputs = [headset]
         try h.store.saveState(earlier)
         let m = h.makeManager(retryDelay: 0.2)
         await m.reconcile()
-        XCTAssertEqual(m.outputsWaitingForRestore.map(\.entry), [headset])
+        XCTAssertEqual(m.outputsWaitingForRestore, [headset])
         await m.start(duration: 3600)
         h.guardFake.stillRunning = ["lowpowermode 1"]
         _ = await m.setLowPower(true)

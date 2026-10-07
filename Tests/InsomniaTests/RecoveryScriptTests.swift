@@ -226,7 +226,7 @@ final class RecoveryScriptTests: XCTestCase {
     /// does not log an error every minute, and an expired session goes.
     func testSavedOutputDeviceAudioIsKeptAndAloneLeavesTheJournalClean() throws {
         try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
-        let json = #"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"savedAudioOutputs":[{"deviceUID":"usb-headset","name":"USB Headset","volume":0.3,"muted":false},{"deviceUID":"BuiltInSpeakerDevice","name":null,"volume":1,"muted":true}]}"#
+        let json = #"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"savedAudioOutputs":[{"deviceUID":"usb-headset","name":"USB Headset","volume":0.3,"muted":false,"saveID":"5F2C9A10-7B3E-4D21-A8C4-0E6F1B2D3C4A"},{"deviceUID":"BuiltInSpeakerDevice","name":null,"volume":1,"muted":true,"saveID":null}]}"#
         try fx.writeState(json)
 
         let r = try fx.run(fx.backstop)
@@ -248,7 +248,7 @@ final class RecoveryScriptTests: XCTestCase {
     /// it was.
     func testSavedOutputDeviceAudioSurvivesTheUndoOfSleep() throws {
         try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
-        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"savedAudioOutputs":[{"deviceUID":"usb-headset","name":"USB Headset","volume":0.3,"muted":false}]}"#)
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"savedAudioOutputs":[{"deviceUID":"usb-headset","name":"USB Headset","volume":0.3,"muted":false,"saveID":"5F2C9A10-7B3E-4D21-A8C4-0E6F1B2D3C4A"}]}"#)
 
         let r = try fx.run(fx.backstop)
 
@@ -262,6 +262,7 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(outputs.first?["name"] as? String, "USB Headset")
         XCTAssertEqual(outputs.first?["volume"] as? Double, 0.3)
         XCTAssertEqual(outputs.first?["muted"] as? Bool, false)
+        XCTAssertEqual(outputs.first?["saveID"] as? String, "5F2C9A10-7B3E-4D21-A8C4-0E6F1B2D3C4A")
         XCTAssertTrue(fx.log().contains("journal cleared apart from saved audio for 1 output device(s)"), fx.log())
         XCTAssertFalse(fx.exists(fx.session))
     }
@@ -1897,6 +1898,7 @@ final class RecoveryScriptTests: XCTestCase {
         #"{"sleepDisabledByUs":false,"savedAudioOutputs":[{"deviceUID":"usb-headset","volume":0.3,"muted":1}]}"#,
         #"{"sleepDisabledByUs":false,"savedAudioOutputs":[{"deviceUID":"usb-headset","volume":0.3}]}"#,
         #"{"sleepDisabledByUs":false,"savedAudioOutputs":[{"deviceUID":"usb-headset","name":3,"volume":0.3,"muted":false}]}"#,
+        #"{"sleepDisabledByUs":false,"savedAudioOutputs":[{"deviceUID":"usb-headset","volume":0.3,"muted":false,"saveID":3}]}"#,
     ]
 
     func testNullOptionalFieldsCountAsAbsent() throws {

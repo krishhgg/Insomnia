@@ -87,19 +87,25 @@ struct AppNapOverride: Codable, Equatable, Hashable, Sendable {
 /// (spec section 4). Restored on that device only, never on another
 /// output; kept while the device is not connected. `name` is for the
 /// warning that names a device still waiting, and left out of the JSON
-/// when it could not be read. Flat keys so backstop.sh can check them with
+/// when it could not be read. `saveID` is drawn afresh by each lid close
+/// that writes an entry, so a later save for the same device, with the
+/// same values or not, is never taken for this one, whichever copy of the
+/// app wrote it. nil, and left out of the JSON, in an entry written
+/// before entries had one. Flat keys so backstop.sh can check them with
 /// plutil.
 struct SavedAudioOutput: Codable, Equatable, Hashable, Sendable {
     let deviceUID: String
     let name: String?
     let volume: Float
     let muted: Bool
+    let saveID: String?
 
-    init(deviceUID: String, name: String?, volume: Float, muted: Bool) {
+    init(deviceUID: String, name: String?, volume: Float, muted: Bool, saveID: String?) {
         self.deviceUID = deviceUID
         self.name = name
         self.volume = volume
         self.muted = muted
+        self.saveID = saveID
     }
 
     /// The name, or the UID when the name could not be read.
@@ -178,13 +184,16 @@ struct RuntimeState: Codable, Equatable, Sendable {
         return rest.isDirty
     }
 
-    /// `isDirty` with every saved output volume left out, which the recovery
-    /// agent keeps but only the app can restore.
-    var isDirtyApartFromAudio: Bool {
+    /// `isDirty` with every saved output volume, display brightness and
+    /// keyboard backlight left out: the recovery agent keeps those but only
+    /// the app can restore them (CoreAudio, private frameworks).
+    var isDirtyApartFromAppOnlyEntries: Bool {
         var rest = self
         rest.savedAudioOutputs = []
         rest.savedOutputVolume = nil
         rest.savedMuted = nil
+        rest.savedDisplayBrightness = nil
+        rest.savedKeyboardBrightness = nil
         return rest.isDirty
     }
 

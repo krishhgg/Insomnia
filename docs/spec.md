@@ -50,7 +50,7 @@ RuntimeState {                // everything Insomnia changed and must undo
   lowPowerSetByUs:    Bool
   frozenProcesses:    [{pid, startedAt, startedAtMicros, bootSession}]
   dockerFrozen:       Bool
-  savedAudioOutputs:  [{deviceUID, name?, volume, muted}]  // each output device a lid close muted, with what it had; empty when mute is off or every device is restored
+  savedAudioOutputs:  [{deviceUID, name?, volume, muted, saveID?}]  // each output device a lid close muted, with what it had; saveID is a UUID drawn for each save; empty when mute is off or every device is restored
   savedOutputVolume:  Float?  // legacy: an earlier build's entry, restored on the default output; never written now
   savedMuted:         Bool?   // legacy, the same
   savedDisplayBrightness:  Float?  // nil when darkening is off or lid is open
@@ -133,7 +133,12 @@ notification names each device that is still muted, and the menu shows a
 line for each with a "Stop waiting for <device>" item, which drops that
 entry and leaves the device as it is. The item drops nothing if, when it
 runs, the device reads as connected or the entry is a later lid close's
-save rather than the one the menu showed. While Insomnia runs, a device that
+save rather than the one the menu showed. Each save has an ID of its own
+(`saveID`, drawn by the lid close that writes the entry), and the item
+compares it with the journal on disk under the lock, so a later save with
+the same values, written by this or another copy of the app, is not
+dropped. An entry written before entries had an ID has none and is
+compared by its values. While Insomnia runs, a device that
 connects again gets its volume back at once (a CoreAudio device-list
 listener), or at the next lid open if a session is running with the lid
 closed. Before the launch reconcile has taken a session over, a session.json
@@ -149,7 +154,9 @@ reads the journal again and checks the lid again. A device change that
 could not run at all (the recovery lock was busy, a `sudo pmset` left
 running still held it, or state.json did not decode) is retried the same
 way. The retry stops after 10 tries in a row; the next device change, lid
-open, end or launch tries again.
+open, end or launch tries again. The menu line that a refused device change
+or a failed restore put up goes once a later restore leaves nothing to
+retry, unless a newer failure has taken its place.
 
 A session that starts, or that reconcile resumes at launch, while the lid
 reads closed starts with the countdown redraw stopped: the lid observer
@@ -229,7 +236,9 @@ is best effort. Display brightness 0 does not switch the keyboard backlight
 off; it is set separately. Both values are journaled before they are changed
 and restored on open, session end, Quit, or reconcile with the lid open; the
 backstop keeps the entries and only the app restores them (private
-frameworks). What is journaled is the user's value, not whatever the device
+frameworks). An end that could not restore one says so in its
+incomplete-restore notification, without promising the recovery agent's
+retry: a later session's end or the next launch tries again. What is journaled is the user's value, not whatever the device
 reads at that instant. A reading is trusted only when the last keyboard,
 mouse or trackpad input was under 30 s ago (`CGEventSource`; the idle dim
 never starts sooner) and the panel is awake (`CGDisplayIsAsleep`, else it

@@ -121,12 +121,12 @@ final class StatusMenuWarningTests: XCTestCase {
     }
 
     /// Each output device still muted from a lid close gets a warning line
-    /// and a live item that carries the device and which of its saves the
-    /// menu showed, so the click drops that save and no later one. Builds
-    /// the NSMenu only.
+    /// and a live item that carries the save the menu showed, its save ID
+    /// included, so the click drops that save and no later one. Builds the
+    /// NSMenu only.
     func testEachWaitingOutputHasALineAndAStopWaitingItem() {
-        let headset = SessionManager.WaitingOutput(entry: SavedAudioOutput(deviceUID: "usb-headset", name: "USB Headset", volume: 0.3, muted: false), save: 2)
-        let unnamed = SessionManager.WaitingOutput(entry: SavedAudioOutput(deviceUID: "70-8C-F2:output", name: nil, volume: 0.5, muted: false), save: 0)
+        let headset = SavedAudioOutput(deviceUID: "usb-headset", name: "USB Headset", volume: 0.3, muted: false, saveID: "save-2")
+        let unnamed = SavedAudioOutput(deviceUID: "70-8C-F2:output", name: nil, volume: 0.5, muted: false, saveID: nil)
         let items = StatusMenu.items(sessionActive: false, sleepHeld: false, machine: nil, actions: nil, throttledBrowsers: [], error: nil, outputsWaiting: [headset, unnamed])
         XCTAssertEqual(Array(items.prefix(4)), [
             StatusMenu.Item(title: "\u{26A0} USB Headset is still muted from a lid close; Insomnia restores it when it reconnects", kind: .warning),
@@ -143,7 +143,7 @@ final class StatusMenuWarningTests: XCTestCase {
             stopWaitingForOutput: #selector(NSObject.description)
         )
         let entry = menu.items.first { $0.title == "Stop waiting for USB Headset" }
-        XCTAssertEqual(entry?.representedObject as? SessionManager.WaitingOutput, headset)
+        XCTAssertEqual(entry?.representedObject as? SavedAudioOutput, headset)
         XCTAssertEqual(entry?.isEnabled, true)
     }
 

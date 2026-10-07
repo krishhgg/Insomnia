@@ -269,12 +269,14 @@ final class LidActions {
                 // it: a previous close muted it and was never undone, so
                 // what reads now is that mute. Entries for other devices,
                 // still waiting for theirs to reconnect, are left as they are.
+                // A new entry gets a save ID of its own (`SavedAudioOutput`).
                 if !s.savedAudioOutputs.contains(where: { $0.deviceUID == current.deviceUID }) {
                     s.savedAudioOutputs.append(SavedAudioOutput(
                         deviceUID: current.deviceUID,
                         name: current.name,
                         volume: current.volume,
-                        muted: current.muted
+                        muted: current.muted,
+                        saveID: UUID().uuidString
                     ))
                 }
             }

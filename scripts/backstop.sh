@@ -450,6 +450,8 @@ journal_shape_problems() { # file
           [[ "$(type_of "$f" "savedAudioOutputs.$i.muted")" == bool ]] || echo "savedAudioOutputs[$i].muted is not a bool"
           t="$(type_of "$f" "savedAudioOutputs.$i.name")"
           [[ -z "$t" || "$t" == string || "$t" == "(any)" ]] || echo "savedAudioOutputs[$i].name is a $t, not a string"
+          t="$(type_of "$f" "savedAudioOutputs.$i.saveID")"
+          [[ -z "$t" || "$t" == string || "$t" == "(any)" ]] || echo "savedAudioOutputs[$i].saveID is a $t, not a string"
         fi
         i=$((i + 1))
       done

@@ -375,6 +375,14 @@ final class FakeProcessControl: ProcessSignaling, @unchecked Sendable {
     }
 }
 
+extension SavedAudioOutput {
+    /// The entry without its save ID, which each lid close draws at random:
+    /// what a test compares against a fixture.
+    var withoutSaveID: SavedAudioOutput {
+        SavedAudioOutput(deviceUID: deviceUID, name: name, volume: volume, muted: muted, saveID: nil)
+    }
+}
+
 /// Fake output devices by UID, one of them the default output, with a hook
 /// fired inside `mute`. It starts with the built-in speakers only.
 final class FakeAudioControl: AudioControlling, @unchecked Sendable {

@@ -693,7 +693,7 @@ final class StatusItemController: NSObject {
     }
 
     @objc private func menuStopWaitingForOutput(_ sender: NSMenuItem) {
-        guard let waiting = sender.representedObject as? SessionManager.WaitingOutput else { return }
+        guard let waiting = sender.representedObject as? SavedAudioOutput else { return }
         Task { await manager.stopWaitingForOutput(waiting) }
     }
 
