@@ -191,7 +191,7 @@ final class ConfigTests: XCTestCase {
         let migrated = try Store.makeDecoder().decode(Config.self, from: Data(saved.utf8))
         XCTAssertEqual(migrated.maxDuration, 24 * 3600)
         XCTAssertEqual(migrated.presets, Config.defaultPresets)
-        XCTAssertEqual(migrated, Config())
+        XCTAssertEqual(migrated, earlierBuild())
 
         let custom = #"{"maxDuration": 604800, "presets": [3600, 259200]}"#
         let kept = try Store.makeDecoder().decode(Config.self, from: Data(custom.utf8))
