@@ -54,6 +54,7 @@ enum StatusMenu {
         relaunchProblems: [String] = [],
         hotspotWarning: String? = nil,
         error: String?,
+        commandRunning: String? = nil,
         foreignSleep: String? = nil,
         outputsWaiting: [SessionManager.WaitingOutput] = [],
         lidSimulationBuild: Bool = false
@@ -85,6 +86,12 @@ enum StatusMenu {
         }
         if let hotspot = present(hotspotWarning) {
             out.append(Item(title: hotspot, kind: .warning))
+        }
+        // The sudo pmset left running comes before the session error: it
+        // holds every change and quit until it exits, and the line goes
+        // away then.
+        if let command = present(commandRunning) {
+            out.append(Item(title: "\u{26A0} \(command)", kind: .warning))
         }
         if let error = present(error) {
             out.append(Item(title: "\u{26A0} \(error)", kind: .warning))

@@ -5,12 +5,12 @@ import Foundation
 /// the same variable with the same layout).
 ///
 /// Default layout:
-///   ~/Library/Application Support/Insomnia/{session.json,state.json,config.json,backstop.sh}
+///   ~/Library/Application Support/Insomnia/{session.json,state.json,config.json,backstop.sh,unfinished-command.json}
 ///   ~/Library/Logs/Insomnia/{insomnia.log,handoffs.log}
 ///   ~/Library/LaunchAgents/com.insomnia.backstop.plist
 ///
 /// With INSOMNIA_HOME=/x:
-///   /x/{session.json,state.json,config.json,backstop.sh}
+///   /x/{session.json,state.json,config.json,backstop.sh,unfinished-command.json}
 ///   /x/Logs/{insomnia.log,handoffs.log}
 ///   /x/LaunchAgents/com.insomnia.backstop.plist
 struct Paths: Sendable, Equatable {
@@ -68,6 +68,10 @@ struct Paths: Sendable, Equatable {
     /// flock(2) file shared with backstop.sh (`lockf -k` on the same path).
     /// Created once, never unlinked, so both sides lock the same inode.
     var recoveryLock: URL { appSupport.appendingPathComponent(".recovery.lock") }
+    /// The `sudo pmset` left running that holds the recovery lock, written
+    /// while it runs so a relaunch after a crash can name it. Removed when
+    /// it exits, and by the next transaction that takes the lock.
+    var unfinishedCommandFile: URL { appSupport.appendingPathComponent("unfinished-command.json") }
     /// Written by scripts/simulate-lid.sh ("closed" or "open") to drive the
     /// lid-close action path without touching the hinge. See LidSimulation.
     var simulateLidFile: URL { appSupport.appendingPathComponent("simulate-lid") }

@@ -275,6 +275,32 @@ struct SignalProcessControl: ProcessSignaling {
         ))
     }
 
+    /// The same answer as `kernelState`, read from the process table
+    /// (sysctl KERN_PROC_PID, as `ps` reads it), which answers for every
+    /// user's processes: proc_pidinfo refuses a root process such as `sudo`
+    /// or pmset with EPERM. A zombie counts as absent: it has exited and
+    /// holds nothing open.
+    static func processTableState(pid: Int32) -> ProcessLookup {
+        guard pid > 0 else { return .absent }
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+        var entry = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.stride
+        guard sysctl(&mib, UInt32(mib.count), &entry, &size, nil, 0) == 0 else { return .unreadable(errno) }
+        // No such pid: success with nothing written.
+        guard size == MemoryLayout<kinfo_proc>.stride, entry.kp_proc.p_pid == pid else { return .absent }
+        guard entry.kp_proc.p_stat != UInt8(SZOMB) else { return .absent }
+        let started = entry.kp_proc.p_starttime
+        return .present(ProcessSignalState(
+            ppid: entry.kp_eproc.e_ppid,
+            stopped: entry.kp_proc.p_stat == UInt8(SSTOP),
+            identity: ProcessIdentity(
+                startedAt: Int64(started.tv_sec),
+                startedAtMicros: Int32(truncatingIfNeeded: started.tv_usec),
+                bootSession: bootSession
+            )
+        ))
+    }
+
     private static func kernelSend(pid: Int32, sig: Int32) -> Int32 {
         guard pid > 0 else { return EINVAL }
         return kill(pid, sig) == 0 ? 0 : errno

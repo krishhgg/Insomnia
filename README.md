@@ -280,9 +280,40 @@ installation scenarios still need [release validation](docs/release-validation.m
   microseconds were recorded keep the one-second `ps` comparison in the
   shell. A lookup and a signal are still separate operations, one pid at a
   time.
-- **Stuck power commands:** a command that survives its timeout keeps the
-  recovery lock until it exits. Other recovery attempts or new sessions wait
-  or fail with a warning instead of running alongside it.
+- **Stuck power commands:** a `sudo pmset` that has not finished after 20 s
+  is sent SIGTERM, never SIGKILL: killing sudo could leave a root pmset
+  changing power settings after the journal has moved on. If it is still
+  running 3 s later the transaction stops where it is, as the backstop's
+  does: nothing else is undone, the journal keeps its entries, and the
+  recovery lock stays held until the command exits. The command holds the
+  lock itself (its stdin is a descriptor on the lock file), so if Insomnia
+  crashes or is force-quit meanwhile, the backstop still waits for the
+  command instead of running an undo the command would then override. A
+  notification and a menu warning give the pid and `sudo kill <pid>`; the
+  warning goes away when the command exits. The pid is also written to
+  `unfinished-command.json` with the command's start time and boot
+  session. A relaunch that finds the lock busy names the command in the
+  menu. It gives the pid and `sudo kill`, in one notification as well,
+  only while that pid still has the recorded start time and boot session;
+  otherwise it says the command has exited, since the pid may now belong
+  to another process. The relaunch tries again 30 s after each refusal.
+  Once the command has exited, it resumes a session that has not expired,
+  with its battery floors, and checks Low Power Mode the way it does after
+  its own command exits, described below. A session the user starts
+  before that next try gets the same check. Until the command exits,
+  Insomnia refuses to quit or start a session, and records any end or lid
+  event it refuses. A
+  `disablesleep 0` or `lowpowermode 0` that exits 0 counts as done: its
+  journal entry is cleared before the lock is released, and the command
+  is not run again. If that journal write fails, the menu says so and the
+  undo runs again; the line goes once a later write clears the entry. Any
+  other exit counts as a failure. Then a pending end runs again.
+  Otherwise Insomnia reads Low Power Mode. If it reads off, Insomnia runs
+  its own `lowpowermode 0` and forgets the mode only once that succeeds.
+  Then it replays a refused lid event, after waiting out the 2 s lid
+  debounce, and runs the floor rules again. If the mode cannot be read or
+  switched off, or the journal cannot be written, it tries again every
+  30 s while the session lasts.
 - **Audio:** the backstop preserves volume/mute entries but cannot restore
   CoreAudio. Reopen the app for recovery. An output device that is not
   connected keeps its entry until it reconnects, and uninstall stops while
@@ -405,9 +436,10 @@ bodies marked private, so `log show` and other local programs see `<private>`
 in place of the text unless private data logging is enabled on the Mac. The
 backstop's lines go only to `insomnia.log`, which keeps the full text of both.
 The files in Application Support/Insomnia and Logs/Insomnia (config, session,
-journal, recovery lock, the two logs) are owner-only, mode 0600 with those two
-directories 0700, and one left looser by an older build is tightened the next
-time the app or the backstop opens it. Insomnia sets only these modes and
+journal, recovery lock, the record of a power command left running, the two
+logs) are owner-only, mode 0600 with those two directories 0700, and one left
+looser by an older build is tightened the next time the app or the backstop
+opens it. Insomnia sets only these modes and
 leaves any access control list (ACL) on these files and folders as it is, so
 an ACL someone added, or one inherited from a parent folder, can still give
 another account access (`ls -le` shows it). The LaunchAgent plist and the installed

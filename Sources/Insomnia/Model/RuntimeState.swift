@@ -146,6 +146,16 @@ struct RuntimeState: Codable, Equatable, Sendable {
     /// A state with nothing left to undo.
     static let clean = RuntimeState()
 
+    /// The undo entries alone: the state without
+    /// `displayRestoredUnderLowPower`, a write owed after the mode rather
+    /// than something to undo. Two states with equal entries owe the same
+    /// undos.
+    var undoEntries: RuntimeState {
+        var entries = self
+        entries.displayRestoredUnderLowPower = nil
+        return entries
+    }
+
     /// True when at least one entry still needs undoing.
     var isDirty: Bool {
         sleepDisabledByUs || lowPowerSetByUs || hasLidActions || !appNapOverrides.isEmpty
