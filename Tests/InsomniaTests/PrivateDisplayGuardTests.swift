@@ -1213,6 +1213,289 @@ final class RefusedDarkeningTests: XCTestCase {
         XCTAssertFalse(try XCTUnwrap(try h.store.loadState()).brightnessJournaled)
     }
 
+    /// Lid actions with only darkening on, over the fake devices, for a
+    /// manager built by the test and the sampler given.
+    private func makeDarkening(_ m: SessionManager, sampler: BrightnessSampler?) -> LidActions {
+        m.config.muteOnLidClose = false
+        m.config.freezeList = []
+        m.config.freezeAllApps = false
+        let freezer = FakeFreezer(apps: [], processes: [], control: h.procs)
+        return LidActions(
+            manager: m,
+            freezer: freezer,
+            docker: DockerRule(freezer: freezer, probe: { true }),
+            audio: h.audio,
+            display: h.display,
+            keyboard: h.keyboard,
+            sampler: sampler
+        )
+    }
+
+    private func seedKeptDisplay() throws {
+        var st = RuntimeState()
+        st.savedDisplayBrightness = 0.8
+        st.displayRestoreRefused = true
+        try h.store.saveState(st)
+    }
+
+    /// A launch writes both kept values, still at 0, while state.json
+    /// refuses the clears. The restores are done all the same, so the
+    /// second write still goes out after powerd has put its own
+    /// remembered levels back following the wake.
+    func testARestoreWhoseClearIsOwedIsStillReasserted() async throws {
+        try seedSavedBrightness(sessionValid: false, refused: true)
+        h.clamshell.closed = false
+        h.display.brightness = 0
+        h.keyboard.brightness = 0
+        let m = h.makeManager(reassertDelay: .milliseconds(100))
+        let file = h.home.paths.stateFile.path
+        try FileManager.default.setAttributes([.immutable: true], ofItemAtPath: file)
+        defer { try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: file) }
+
+        await m.reconcile()
+
+        XCTAssertEqual(h.display.sets, [0.8])
+        XCTAssertEqual(h.keyboard.sets, [0.3])
+        XCTAssertTrue(try XCTUnwrap(try h.store.loadState()).hasRefusedBrightness, "the clears are still owed")
+        XCTAssertFalse(m.effectiveState.brightnessJournaled)
+        // powerd puts back its own remembered levels after the wake.
+        h.display.brightness = 0.35
+        h.keyboard.brightness = 0.1
+        try await waitFor { self.h.display.sets.count == 2 && self.h.keyboard.sets.count == 2 }
+
+        XCTAssertEqual(h.display.sets, [0.8, 0.8])
+        XCTAssertEqual(h.keyboard.sets, [0.3, 0.3])
+        XCTAssertEqual(h.display.brightness, 0.8)
+        XCTAssertEqual(h.keyboard.brightness, 0.3)
+        XCTAssertTrue(logText().contains("display restore re-asserted (brightness 0.8)"), logText())
+        XCTAssertTrue(logText().contains("keyboard restore re-asserted (brightness 0.3)"), logText())
+    }
+
+    /// The display was set by hand since its refused restore, and
+    /// state.json refused that clear. A close while the file still refuses
+    /// writes journals nothing and darkens nothing, and the settled entry
+    /// still on disk is no reason to ask the display to sleep: the open
+    /// would not wake it for an entry already settled.
+    func testACloseThatJournalsNothingDoesNotSleepTheDisplayForASettledEntry() async throws {
+        try seedKeptDisplay()
+        h.clamshell.closed = false
+        h.display.brightness = 0.5
+        let (m, actions) = makeDarkeningOnly(display: h.display, keyboard: h.keyboard)
+        await m.start(duration: 3600)
+        let file = h.home.paths.stateFile.path
+        try FileManager.default.setAttributes([.immutable: true], ofItemAtPath: file)
+        defer { try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: file) }
+
+        await actions.onOpen()
+
+        XCTAssertEqual(h.display.sets, [])
+        XCTAssertTrue(try XCTUnwrap(try h.store.loadState()).brightnessJournaled, "the clear is still owed")
+        XCTAssertFalse(m.effectiveState.brightnessJournaled)
+
+        h.clamshell.closed = true
+        await actions.onClose()
+
+        XCTAssertEqual(h.display.sets, [], "nothing journaled, so nothing darkened")
+        XCTAssertEqual(h.keyboard.sets, [])
+        XCTAssertEqual(h.display.sleepRequests, 0)
+        XCTAssertTrue(logText().contains("display sleep not requested: no display or keyboard brightness is journaled"), logText())
+    }
+
+    /// A lid open under Insomnia's Low Power Mode writes a kept display
+    /// value, still at 0, while state.json refuses the clear. The owed
+    /// clear keeps the write owed once the mode is off, as the clear
+    /// itself would have, so switching the mode off writes it once more.
+    func testAnOwedClearUnderOurLowPowerModeStillOwesTheWriteAfterIt() async throws {
+        try seedKeptDisplay()
+        h.clamshell.closed = false
+        h.display.brightness = 0
+        let (m, actions) = makeDarkeningOnly(display: h.display, keyboard: h.keyboard)
+        await m.start(duration: 3600)
+        let on = await m.setLowPower(true)
+        XCTAssertTrue(on)
+        let file = h.home.paths.stateFile.path
+        try FileManager.default.setAttributes([.immutable: true], ofItemAtPath: file)
+        defer { try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: file) }
+
+        await actions.onOpen()
+
+        XCTAssertEqual(h.display.sets, [0.8])
+        XCTAssertTrue(try XCTUnwrap(try h.store.loadState()).displayRestoreRefused, "the clear is still owed")
+        XCTAssertNil(m.effectiveState.savedDisplayBrightness)
+        XCTAssertEqual(m.effectiveState.displayRestoredUnderLowPower, 0.8)
+
+        try FileManager.default.setAttributes([.immutable: false], ofItemAtPath: file)
+        let off = await m.setLowPower(false)
+
+        XCTAssertTrue(off)
+        XCTAssertEqual(h.display.sets, [0.8, 0.8], "written once more after the mode")
+        XCTAssertTrue(logText().contains("display restored again after low power mode (brightness 0.8)"), logText())
+        let after = try XCTUnwrap(try h.store.loadState())
+        XCTAssertNil(after.savedDisplayBrightness)
+        XCTAssertFalse(after.displayRestoreRefused)
+        XCTAssertNil(after.displayRestoredUnderLowPower)
+    }
+
+    /// The user set the display to 0.5 by hand after its refused restore,
+    /// and Insomnia's Low Power Mode is on, so the panel reads the mode's
+    /// rescaled 0.3. A lid open and every re-read leave the entry waiting:
+    /// that reading is not the user's level, so it is not the sampler's
+    /// sample either. Once the mode is off the panel reads 0.5, the re-read
+    /// clears the entry without a write, and 0.5 is the sample the next
+    /// close journals and the open after it restores.
+    func testAKeptDisplayReadUnderOurLowPowerModeWaitsForTheModeToEnd() async throws {
+        try seedKeptDisplay()
+        h.clamshell.closed = false
+        h.display.brightness = 0.3
+        let m = h.makeManager(keptRecheckDelay: .milliseconds(20), keptRecheckSlowDelay: .milliseconds(20))
+        let sampler = BrightnessSampler(display: h.display, keyboard: h.keyboard, idleSeconds: { 1 })
+        sampler.follow(m)
+        let actions = makeDarkening(m, sampler: sampler)
+        await m.start(duration: 3600)
+        let on = await m.setLowPower(true)
+        XCTAssertTrue(on)
+
+        await actions.onOpen()
+        try await Task.sleep(for: .milliseconds(150))
+
+        XCTAssertEqual(h.display.sets, [])
+        let waiting = try XCTUnwrap(try h.store.loadState())
+        XCTAssertEqual(waiting.savedDisplayBrightness, 0.8)
+        XCTAssertTrue(waiting.displayRestoreRefused)
+        XCTAssertNil(sampler.last?.display, "the rescaled reading is not the user's level")
+        XCTAssertTrue(logText().contains("display brightness 0.8, kept after a refused restore, reads 0.3 while Insomnia's Low Power Mode is on"), logText())
+
+        // The mode's end gives the panel back the level the user set.
+        h.display.brightness = 0.5
+        let off = await m.setLowPower(false)
+        XCTAssertTrue(off)
+        try await waitFor { try self.h.store.loadState()?.savedDisplayBrightness == nil }
+
+        XCTAssertEqual(h.display.sets, [], "the level set since is not overwritten")
+        XCTAssertEqual(sampler.last?.display, 0.5)
+
+        h.clamshell.closed = true
+        h.display.brightness = 0.335
+        await actions.onClose()
+
+        XCTAssertEqual(try h.store.loadState()?.savedDisplayBrightness, 0.5)
+
+        h.clamshell.closed = false
+        await actions.onOpen()
+
+        XCTAssertEqual(h.display.sets, [0, 0.5])
+        XCTAssertEqual(h.display.brightness, 0.5)
+    }
+
+    /// A lid open writes a kept display value while state.json refuses
+    /// the clear, and the end that follows cannot clear the sleep entry
+    /// either. "Restore incomplete" says the agent retries the sleep entry
+    /// and does not say the brightness still waits for the app: it is
+    /// restored, with only its clear owed.
+    func testAnEndAfterAnOwedClearDoesNotSayTheBrightnessIsStillOwed() async throws {
+        try seedKeptDisplay()
+        h.clamshell.closed = false
+        h.display.brightness = 0
+        let (m, actions) = makeDarkeningOnly(display: h.display, keyboard: h.keyboard)
+        await m.start(duration: 3600)
+        let file = h.home.paths.stateFile.path
+        try FileManager.default.setAttributes([.immutable: true], ofItemAtPath: file)
+        defer { try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: file) }
+        await actions.onOpen()
+        XCTAssertEqual(h.display.sets, [0.8])
+
+        let outcome = await m.end(reason: .user)
+
+        XCTAssertEqual(outcome, .incomplete(agentArmed: true))
+        let body = try XCTUnwrap(h.notifier.posts.last { $0.title == SessionManager.incompleteTitle }?.body)
+        XCTAssertTrue(body.contains("The recovery agent retries every minute."), body)
+        XCTAssertFalse(body.contains(SessionManager.brightnessRetrySentence), body)
+    }
+
+    /// The same entry and mode, and the lid closes before the mode ends,
+    /// with no sample to go on: the panel's 0.3 is the mode's rescaled
+    /// value, so the kept 0.8 stays journaled, as an ordinary entry the
+    /// open restores. Written under the mode, it is written once more
+    /// after it.
+    func testACloseUnderOurLowPowerModeKeepsTheKeptValueOverTheRescaledRead() async throws {
+        try seedKeptDisplay()
+        h.display.brightness = 0.3
+        let (m, actions) = makeDarkeningOnly(display: h.display, keyboard: h.keyboard)
+        await m.start(duration: 3600)
+        let on = await m.setLowPower(true)
+        XCTAssertTrue(on)
+
+        h.clamshell.closed = true
+        await actions.onClose()
+
+        let closed = try XCTUnwrap(try h.store.loadState())
+        XCTAssertEqual(closed.savedDisplayBrightness, 0.8, "not the rescaled 0.3")
+        XCTAssertFalse(closed.displayRestoreRefused)
+        XCTAssertEqual(h.display.sets, [0])
+        XCTAssertTrue(logText().contains("display brightness reads 0.3 at the close under our low power mode, which rescales it; the value kept after a refused restore, 0.8, stays journaled"), logText())
+
+        h.clamshell.closed = false
+        await actions.onOpen()
+
+        XCTAssertEqual(h.display.sets, [0, 0.8])
+        XCTAssertEqual(try h.store.loadState()?.displayRestoredUnderLowPower, 0.8)
+
+        let off = await m.setLowPower(false)
+
+        XCTAssertTrue(off)
+        XCTAssertEqual(h.display.sets, [0, 0.8, 0.8])
+    }
+
+    /// With no sample and the panel asleep, the reading at the close is
+    /// its idle-dim value: the kept value stays journaled as well.
+    func testACloseOverASleepingDisplayKeepsTheKeptValue() async throws {
+        try seedKeptDisplay()
+        h.display.brightness = 0.2
+        h.display.asleep = true
+        let (m, actions) = makeDarkeningOnly(display: h.display, keyboard: h.keyboard)
+        await m.start(duration: 3600)
+
+        h.clamshell.closed = true
+        await actions.onClose()
+
+        let closed = try XCTUnwrap(try h.store.loadState())
+        XCTAssertEqual(closed.savedDisplayBrightness, 0.8, "not the idle-dim 0.2")
+        XCTAssertFalse(closed.displayRestoreRefused)
+        XCTAssertTrue(logText().contains("display brightness reads 0.2 at the close while dimmed or asleep; the value kept after a refused restore, 0.8, stays journaled"), logText())
+    }
+
+    /// A session ends with the entry still waiting under the mode. The end
+    /// switches the mode off and reads the panel a moment later, before it
+    /// has its level back: still not the user's level, so the entry waits
+    /// for the re-read, which finds 0.5 and clears it without a write. The
+    /// end is not incomplete.
+    func testAnEndThatSwitchesOurLowPowerModeOffLeavesTheReadingToTheReRead() async throws {
+        try seedKeptDisplay()
+        h.clamshell.closed = false
+        h.display.brightness = 0.3
+        let m = h.makeManager(keptRecheckDelay: .milliseconds(50))
+        let sampler = BrightnessSampler(display: h.display, keyboard: h.keyboard, idleSeconds: { 1 })
+        sampler.follow(m)
+        await m.start(duration: 3600)
+        let on = await m.setLowPower(true)
+        XCTAssertTrue(on)
+
+        let outcome = await m.end(reason: .user)
+
+        XCTAssertEqual(outcome, .restored)
+        XCTAssertFalse(h.guardFake.lowPowerOn)
+        XCTAssertEqual(try h.store.loadState()?.savedDisplayBrightness, 0.8, "not decided on the reading taken as the mode went off")
+        XCTAssertNil(sampler.last?.display)
+        XCTAssertTrue(logText().contains("display brightness 0.8, kept after a refused restore, reads 0.3 just after Insomnia's Low Power Mode went off"), logText())
+
+        h.display.brightness = 0.5
+        try await waitFor { try self.h.store.loadState()?.savedDisplayBrightness == nil }
+
+        XCTAssertEqual(h.display.sets, [])
+        XCTAssertEqual(sampler.last?.display, 0.5)
+        XCTAssertFalse(h.notifier.posts.contains { $0.title == SessionManager.incompleteTitle }, "\(h.notifier.posts)")
+    }
+
     func testSettingsSeesEveryRefusalWithItsDevice() {
         let m = SessionManager(
             paths: h.home.paths,

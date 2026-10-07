@@ -194,7 +194,13 @@ it is. A busy recovery lock skips one read, not the rest. An end does not
 count a waiting entry as not restored, since nothing failed. The close
 left the device at 0, so a reading above 0 is a level set since, as the
 error asked: the darkening is already undone, and the entry is cleared
-without a write rather than overwrite that level. If state.json cannot
+without a write rather than overwrite that level. A display reading above
+0 taken while Insomnia's own Low Power Mode is on, or just after an end
+switched the mode off, is the mode's rescaled value and not that level,
+so it would become the sample a later close journals. The entry waits,
+and the re-read decides once the mode is off. A display still at 0 under
+the mode gets the saved value, written once more after the mode as for
+any restore under it. If state.json cannot
 take that clear, the entry still counts as done in this process. The clear
 is owed: it goes into the journal ahead of any later write, and at the
 start of every lid close, lid open, end and launch, so none of them works
@@ -213,9 +219,17 @@ that lands while state.json still refuses the clear settles the entry in
 this process, with only the clear owed, so Quit goes ahead. A launch or
 re-read with no session whose write fails is ended as for a dirty journal,
 so the agent is armed for it, or the app keeps it while the flag is still
-owed. A lid close that can read the device clears the flag too: it keeps
-the earlier saved value while the device reads 0, and saves the new level
-when it reads above 0. Uninstall goes ahead past a flagged entry, prints
+owed. A write whose clear is owed is done all the same: the second write
+2 s later still goes out, and a display written under Insomnia's Low Power
+Mode still owes its write after the mode, as the clear would have
+journaled. A lid close that can read the device clears the flag too: it
+keeps the earlier saved value while the device reads 0, and saves the new
+level when it reads above 0. For the display that level must be trusted:
+the last sample, the value owed after the mode, or a current read taken
+outside Insomnia's Low Power Mode with the panel awake. A rescaled, dimmed
+or asleep read leaves the earlier value. A close whose journal write fails
+darkens nothing and asks the display to sleep only for an entry this
+process has not settled. Uninstall goes ahead past a flagged entry, prints
 the saved level, and keeps state.json, even with `--purge`, so a later
 install that can make the call restores it.
 
