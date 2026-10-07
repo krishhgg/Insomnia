@@ -563,6 +563,20 @@ Reconcile runs at every Insomnia launch:
    journal, not from this check. Nothing clears `SleepDisabled` without a
    journal entry, in the app or in the agent.
 
+A reconcile refused for a busy lock or an unreadable journal changes
+nothing and runs again after the retry delay until it goes through, unless
+a start has made a session active or an end has been requested since. The
+lock can stay busy for as long as a `sudo pmset` an earlier run left
+running, and without the retry a session still live on disk would hold
+sleep with no battery floor until its deadline. If `unfinished-command.json`
+was on disk, that command has exited by the time the reconcile holds the
+lock, so a session it resumes is checked against Low Power Mode as after a
+command the app itself left running (below). The check stays owed when a
+later attempt is refused for an unreadable journal, although that refusal
+removes the record. A start that makes a session active before the retry
+runs the check for that session instead. An end restores the mode from the
+journal and owes no check.
+
 Backstop, independent of the app:
 
 - The agent reads the saved deadline; recurring recovery checks avoid replacing
@@ -635,7 +649,54 @@ Backstop, independent of the app:
   and, from older builds, in the LaunchAgents directory).
 - App and script transactions must coordinate through a shared lock. Failure
   to acquire it must not permit an unprotected journal write or side effect.
+- A `sudo pmset` is sent SIGTERM at its timeout (20 s in the app, 30 s in the
+  agent), never SIGKILL: a killed sudo can orphan a root pmset that still
+  changes power state later, outside any transaction. One still running 3 s
+  after SIGTERM stops the transaction where it is, in the app as in the
+  agent's `run_bounded`: nothing else is undone, the journal keeps every
+  entry it had, and the recovery lock stays held until the command exits.
+  In the app the command holds the lock itself, with a descriptor on the
+  lock file as its stdin, so a crash or force quit of the app does not
+  free the lock while the command runs; the agent's supervising subshell
+  keeps it the same way. The app runs no `sudo pmset` outside a
+  transaction. Every one goes through `PmsetSleepGuard.sudoPmset`,
+  including a check that runs a sudoers command only to see whether it
+  passes. It reports the pid with the `sudo kill` command, in a menu line
+  of its own that the exit removes, and refuses to quit or start a
+  session until then. It also records the command in
+  `unfinished-command.json`, with the start time and boot session read
+  from the process table when the command was left running. The exit
+  removes the record, and so does the next transaction that takes the
+  lock. A transaction refused for a busy lock names the recorded command.
+  It gives the pid and `sudo kill` only while the live pid still has that
+  start time and boot session, and the first such refusal for a pid also
+  notifies; otherwise it says the command has exited, or that the pid
+  cannot be confirmed, and names no process to stop. An end, lid close or
+  lid open refused meanwhile is recorded at the refusal. An undo
+  (`disablesleep 0`, `lowpowermode 0`) that exits 0 is confirmed: its
+  entry is cleared under the lock before the lock is released, and a
+  display write owed for the end of the mode is done then. If the journal
+  cannot be read or written then, the entry stays, the undo runs again,
+  and the menu says so. Any other exit confirms nothing. When the command
+  exits the app retries a pending end.
+  Otherwise it reads Low Power Mode under the lock. A mode that reads on
+  stays journaled as Insomnia's. A mode that reads off is switched off
+  once more with the app's own `lowpowermode 0`, and the ownership is
+  cleared only when that exits 0. A display write owed for the end of the
+  mode is kept through the check and done then: with the mode already off,
+  powerd's rescale of the panel cannot be told apart from a user's change,
+  so the panel is compared with the owed value only before a switch-off,
+  while the mode is still on. Then the app replays
+  a refused lid event for the state of the latest lid event, after any
+  change still in the 2 s lid debounce has settled, and runs the floor
+  rules again. A check that cannot take the lock, read the journal or the
+  mode, switch the mode off, or write the journal runs again after the
+  retry delay while the session lasts.
 - Successful restores may clear their entries; failures must stay journaled.
+  A journal write that fails to clear the entry of a successful restore is
+  shown in the menu as well as logged, and the restore is retried. The
+  line goes once a later write clears that entry, unless a newer error
+  has replaced it.
   Process recovery must verify identity and avoid resuming a process that
   Insomnia did not stop. The entries that record `startedAtMicros` go to
   the installed app binary in one call (`Insomnia --resume-frozen
