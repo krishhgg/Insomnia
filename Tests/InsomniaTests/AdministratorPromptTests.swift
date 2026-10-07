@@ -495,6 +495,24 @@ final class RootCommandTests: XCTestCase {
         }
     }
 
+    /// The restore check can be slow (sudo may wait on a directory
+    /// service). A session that ends while it runs gets nothing turned
+    /// off: the clock is compared again before `disablesleep 1`, and the
+    /// only pmset that ran is the restore the undo runs anyway.
+    func testDoesNothingWhenTheSessionEndsDuringTheRestoreCheck() throws {
+        try Data("nonce-1".utf8).write(to: marker)
+        let deadline = Int(Date().timeIntervalSince1970) + 5
+        let command = try RootCommandProcess(marker: marker, nonce: "nonce-1", deadline: String(deadline), in: dir, holdPmset: true, holdAt: "-a disablesleep 0")
+        XCTAssertTrue(command.waitUntilPmsetRuns(), "the restore check never ran")
+        while Int(Date().timeIntervalSince1970) < deadline { usleep(50_000) }
+        command.release()
+        let r = command.wait()
+        XCTAssertEqual(r.status, 4, r.stderr)
+        XCTAssertEqual(r.sudoCalls, restoreCheck)
+        XCTAssertEqual(r.pmsetCalls, ["-a disablesleep 0"], "the restore ran, disablesleep 1 did not")
+        XCTAssertTrue(r.stderr.contains("the session this password was for ended while the restore was checked; sleep was not turned off"), r.stderr)
+    }
+
     /// A deadline that is not a plain number fails the comparison, which
     /// refuses: a malformed one can never mean "no deadline".
     func testAnUnreadableDeadlineNeverPasses() throws {

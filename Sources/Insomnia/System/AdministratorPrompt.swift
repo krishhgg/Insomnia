@@ -160,7 +160,7 @@ final class UnfinishedPrompt: @unchecked Sendable, CustomStringConvertible {
 /// cleared the journal: until the marker is gone, the journal keeps the
 /// sleep entry. Nor can an answer that comes after the session's end,
 /// `deadline`, turn sleep off: the root command compares it with the
-/// clock before pmset.
+/// clock before the restore check and again right before `disablesleep 1`.
 struct PendingStart: Sendable, Equatable {
     let marker: URL
     let nonce: String
@@ -222,9 +222,16 @@ enum AdministratorPrompt {
     /// off. The restore runs at a point the start has already journaled,
     /// and only right before `disablesleep 1`, so it never leaves a change
     /// the session's end would not make: either sleep is turned off next,
-    /// or the start fails and its undo runs the same restore. pmset is not
-    /// `exec`ed, so its own exit status can never read as 5.
-    static let rootCommand = ##"m=$(/usr/bin/head -c 64 "$1" 2>/dev/null); if [ -z "$2" ] || [ "$m" != "$2" ]; then echo "the start that asked for this password is over; sleep was not turned off" >&2; exit 3; fi; if ! [ "$(/bin/date +%s)" -lt "$3" ] 2>/dev/null; then echo "the session this password was for has already ended; sleep was not turned off" >&2; exit 4; fi; if ! [ "$4" -gt 0 ] 2>/dev/null || ! /usr/bin/sudo -n -u "#$4" /usr/bin/sudo -k -n /usr/bin/pmset -a disablesleep 0; then echo "turning sleep back on needs a password, so sleep was not turned off" >&2; exit 5; fi; /usr/bin/pmset -a disablesleep 1 || exit 1"##
+    /// or the start fails and its undo runs the same restore. The check can
+    /// take a while (sudo may look the user up in a directory service), so
+    /// the clock is compared with the deadline once more after it: past the
+    /// end, the command exits 4 without turning sleep off, and the start is
+    /// undone like an end. That leaves only the time pmset takes to start
+    /// between the last comparison and the change; a session that ended in
+    /// it ends at once, because the deadline timer the start arms next fires
+    /// immediately for a date in the past. pmset is not `exec`ed, so its own
+    /// exit status can never read as 5.
+    static let rootCommand = ##"m=$(/usr/bin/head -c 64 "$1" 2>/dev/null); if [ -z "$2" ] || [ "$m" != "$2" ]; then echo "the start that asked for this password is over; sleep was not turned off" >&2; exit 3; fi; if ! [ "$(/bin/date +%s)" -lt "$3" ] 2>/dev/null; then echo "the session this password was for has already ended; sleep was not turned off" >&2; exit 4; fi; if ! [ "$4" -gt 0 ] 2>/dev/null || ! /usr/bin/sudo -n -u "#$4" /usr/bin/sudo -k -n /usr/bin/pmset -a disablesleep 0; then echo "turning sleep back on needs a password, so sleep was not turned off" >&2; exit 5; fi; if ! [ "$(/bin/date +%s)" -lt "$3" ] 2>/dev/null; then echo "the session this password was for ended while the restore was checked; sleep was not turned off" >&2; exit 4; fi; /usr/bin/pmset -a disablesleep 1 || exit 1"##
     /// The whole AppleScript, as one literal: `markerLock`, `rootCommand`
     /// (each `"` escaped for AppleScript), the privilege flag and the
     /// dialog text are fixed at compile time. Its only inputs are the

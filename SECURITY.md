@@ -54,8 +54,10 @@ sudo, and `-n`, which fails instead of prompting. So only a sudoers rule
 that lets that user run that exact command without a password passes.
 `sudo -l` is not used: it lists commands the admin group may run with its
 password, and lists without one whenever the account has any passwordless
-entry. Only when the restore exits 0 does the root command run `pmset -a
-disablesleep 1`. Otherwise it exits 5 having run no pmset, and the start is
+entry. Only when the restore exits 0, and the session's end has still not
+passed once it has run, does the root command run `pmset -a disablesleep 1`.
+An end that passed during the restore exits 4, and the start is undone like
+an end. A failed restore exits 5 having run no pmset, and the start is
 rolled back with nothing to undo: no session, the journal and session.json
 as they were, and a message to rerun the installer. That happens without
 the rule (an uninstall that stopped part way, a hand-deleted file) and on a

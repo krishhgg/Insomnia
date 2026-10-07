@@ -215,8 +215,11 @@ Flag a change that breaks one of these; do not flag the behavior itself.
   the end can restore without a password is in the root command, after
   the nonce and deadline checks and under the marker's lock:
   `sudo -n -u "#$4" /usr/bin/sudo -k -n /usr/bin/pmset -a disablesleep 0`,
-  then `pmset -a disablesleep 1` only if that exited 0, else exit 5
-  (`restoreNeedsPassword`, rolled back with nothing to undo). Root's sudo
+  then the deadline compared again, since the check can be slow, and
+  `pmset -a disablesleep 1` only if the restore exited 0 and the deadline
+  has still not passed. A failed restore exits 5 (`restoreNeedsPassword`,
+  rolled back with nothing to undo); a deadline passed during it exits 4
+  (undone like an end). Root's sudo
   needs no password; the user's `-k` ignores a cached credential and `-n`
   never prompts, so only a rule that lets the user run that exact command
   passes. `sudo -l` is not proof (it lists commands the admin group may run

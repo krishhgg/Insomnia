@@ -125,8 +125,11 @@ recovery; newly written journals use `frozenProcesses`.
   command without a password passes. `sudo -l` is not used: it lists
   commands the admin group may run with its password, and lists without
   one whenever any passwordless entry exists. A uid that is not a positive
-  number fails without running sudo. Only on exit 0 does the root command
-  run `/usr/bin/pmset -a disablesleep 1`. Otherwise it exits 5 having run
+  number fails without running sudo. Only on exit 0, and with `/bin/date
+  +%s` still below `endsAt` when compared again after the restore, does
+  the root command run `/usr/bin/pmset -a disablesleep 1`; an end that
+  passed during the restore exits 4 and the start is undone like an end.
+  A failed restore exits 5 having run
   no pmset (`AdministratorPromptError.restoreNeedsPassword`, which tells
   the user to run `scripts/install.sh` again), since the end, the backstop
   and uninstall all restore with `sudo -n` and would leave sleep off. The
