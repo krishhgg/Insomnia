@@ -307,7 +307,7 @@ last held while it was on was the battery or thermal floor, not the lid.
   uninstall makes under the recovery lock (`pgrep`, `launchctl`,
   `codesign`); a read that does not answer ends the check with the command
   to run by hand, and uninstall goes on. A call past its limit gets SIGTERM,
-  then SIGKILL a second later. Each call keeps the lock until it has exited
+  then SIGKILL one to two seconds later. Each call keeps the lock until it has exited
   or been stopped, and a supervising process enforces the limit even if
   uninstall is killed while it waits, so its `launchctl bootout` is not
   still running when the app takes the lock and loads its agent.
@@ -633,7 +633,7 @@ Backstop, independent of the app:
   installer is killed while it waits, and the call keeps fd 9, so the lock
   is held until the call has exited or been stopped: no `launchctl bootout`
   or `bootstrap` it started is still running once the lock is released. A call past the
-  limit gets SIGTERM, then SIGKILL a second later; `sudo` only ever gets
+  limit gets SIGTERM, then SIGKILL one to two seconds later; `sudo` only ever gets
   SIGTERM, and one that ignores it keeps the lock until it ends, reported
   with its pid. A sudoers check or `pgrep` that does not answer stops the
   run, which releases the lock so the app and the agent can recover. A `launchctl print` that does not answer counts as unknown, never

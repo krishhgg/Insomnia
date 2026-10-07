@@ -1915,6 +1915,32 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(try fx.lockIsFree())
     }
 
+    /// The same hung `codesign --verify`, with every poll the script makes
+    /// a quarter second slower (see slowPollingPath). The limits are read
+    /// from bash's SECONDS clock, so the call is still stopped within three
+    /// seconds of its 5 s limit: SIGTERM once the limit has passed, SIGKILL
+    /// one to two seconds later. Limits counted in polls (100 a second) took
+    /// minutes here, and up to 36 s on a loaded CI runner.
+    func testUninstallStopsAHungCallOnTimeWhenEveryPollIsSlow() throws {
+        try fx.installMachinery()
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        try FileManager.default.removeItem(at: fx.backstop)
+        try fx.writeMarkerBackstop(at: fx.installedBackstop, name: "sealed")
+        fx.setMode("codesign", "verify-hangs")
+
+        let started = Date()
+        let r = try fx.run(fx.uninstall, ["--purge"], extraEnvironment: ["PATH": try fx.slowPollingPath()])
+        let elapsed = Date().timeIntervalSince(started)
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertGreaterThan(fx.slowPolls(), 0, "the script polled through the slow sleep")
+        XCTAssertGreaterThan(elapsed, 5, "the call had its whole limit")
+        XCTAssertLessThan(elapsed, 15, "the 5 s limit, at most a second more, at most two of grace, and a few slow polls")
+        XCTAssertTrue(r.stderr.contains("'codesign --verify --strict \(fx.app.path)' did not answer within 5s"), r.stderr)
+        XCTAssertTrue(fx.hungProcessGone("codesign", within: 0))
+        XCTAssertTrue(try fx.lockIsFree())
+    }
+
     /// install.sh and uninstall.sh make their calls through the same
     /// bounded() and supervise(), so a fix to one cannot miss the other.
     func testInstallAndUninstallShareTheBoundedCallHelper() throws {
@@ -4027,6 +4053,48 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(try fx.contents(of: tmp), [], "no scratch file is left")
     }
 
+    /// install.sh makes the folders it installs into and fixes the staged
+    /// bundle's modes only through MKDIR and CHMOD; build-app.sh assembles
+    /// the bundle through its own fixed paths and install.sh copies it with
+    /// DITTO. The run has `mkdir`, `cp`, `chmod` and `ditto` stubs first on
+    /// PATH that log and fail, and none of them runs; install.sh's calls
+    /// reach the fixture's logging fakes, and the installed bundle has every
+    /// file in place.
+    func testInstallAssemblesTheBundleOnlyThroughItsFixedPathTools() throws {
+        try fx.prepareInstall()
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        fx.setMode("launchctl", "loaded")
+        let shadow = fx.root.appendingPathComponent("shadow", isDirectory: true)
+        try FileManager.default.createDirectory(at: shadow, withIntermediateDirectories: true)
+        for tool in ["mkdir", "cp", "chmod", "ditto"] {
+            let stub = shadow.appendingPathComponent(tool)
+            try "#!/bin/bash\nprintf 'PATH \(tool) %s\\n' \"$*\" >> \"\(fx.callsLog.path)\"\nexit 1\n".write(to: stub, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: stub.path)
+        }
+
+        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester", "PATH": "\(shadow.path):/usr/bin:/bin:/usr/sbin:/sbin"])
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        let calls = fx.calls()
+        XCTAssertEqual(calls.filter { $0.hasPrefix("PATH ") }, [], "a tool from PATH ran")
+        let staging = fx.appsDir.path + "/.Insomnia.app.staging."
+        let goW = try XCTUnwrap(fx.chmodCalls().first { $0.hasPrefix("chmod -R go-w \(staging)") }, "\(fx.chmodCalls())")
+        let newApp = String(goW.dropFirst("chmod -R go-w ".count))
+        XCTAssertTrue(newApp.hasSuffix("/Insomnia.app"), newApp)
+        XCTAssertTrue(fx.chmodCalls().contains("chmod -R -N \(newApp)"), "\(fx.chmodCalls())")
+        for call in [
+            "mkdir -p \(fx.appsDir.path)",
+            "mkdir -p \(fx.home.path) \(fx.home.path)/Logs \(fx.plist.deletingLastPathComponent().path)",
+            "mkdir -p \(fx.plist.deletingLastPathComponent().path)/.com.insomnia.backstop.staging",
+        ] {
+            XCTAssertTrue(calls.contains(call), "\(call) not in \(calls)")
+        }
+        XCTAssertEqual(try fx.installedBinaryFirstLine(), "#!/bin/bash", "the built binary is installed")
+        XCTAssertTrue(fx.exists(fx.app.appendingPathComponent("Contents/Info.plist")))
+        XCTAssertTrue(fx.exists(fx.app.appendingPathComponent("Contents/Resources/AppIcon.icns")))
+        XCTAssertEqual(try fx.mode(fx.installedBackstop) & 0o777, 0o755, "the sealed backstop.sh is executable")
+    }
+
     /// The new agent loads but its plist cannot be moved into place (the
     /// LaunchAgents directory is read-only here). The next login would load
     /// the old plist, which pins the previous build, so the new job is
@@ -4477,6 +4545,31 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(fx.commandEnded(), "released")
     }
 
+    /// The sudoers check before the lock never answers and ignores SIGTERM,
+    /// with every poll slow (see slowPollingPath). The run still gives up on
+    /// it after the 5 s limit and at least two seconds for SIGTERM, within
+    /// four seconds of the limit, and leaves it running: sudo is never sent
+    /// SIGKILL.
+    func testInstallGivesUpOnAHungSudoOnTimeWhenEveryPollIsSlow() throws {
+        try writePreviousPair()
+        fx.setMode("sudo", "rule-check-hangs")
+
+        let started = Date()
+        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester", "PATH": try fx.slowPollingPath()])
+        let elapsed = Date().timeIntervalSince(started)
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertGreaterThan(fx.slowPolls(), 0, "the script polled through the slow sleep")
+        XCTAssertGreaterThan(elapsed, 8, "the limit, then at least two seconds after SIGTERM")
+        XCTAssertLessThan(elapsed, 15, "the 5 s limit, at most four seconds more, and a few slow polls")
+        let pid = try XCTUnwrap(fx.hungPid("sudo", within: 0))
+        XCTAssertTrue(r.stderr.contains("It was sent SIGTERM and is still running as pid \(pid). It is not killed"), r.stderr)
+        XCTAssertTrue(fx.calls().contains("sudo SIGTERM"), "\(fx.calls())")
+        XCTAssertFalse(fx.hungProcessGone("sudo", within: 2), "sudo is never sent SIGKILL")
+        fx.releaseCommand()
+        XCTAssertTrue(fx.hungProcessGone("sudo"))
+    }
+
     /// The sudoers check under the lock never answers and ignores SIGTERM.
     /// sudo is never sent SIGKILL, so it stays, and it keeps the recovery
     /// lock until it ends, as backstop.sh does with a sudo pmset: the run
@@ -4570,6 +4663,20 @@ final class RecoveryScriptTests: XCTestCase {
         let pid = try killDuringHungBootout(fx.installRedirected, extraEnvironment: ["USER": "tester"])
 
         try assertLockHeldUntilGone(pid, within: 20)
+        XCTAssertTrue(fx.calls().contains("launchctl FD9-OPEN"), "\(fx.calls())")
+    }
+
+    /// The killed install above, with every poll slow (see slowPollingPath).
+    /// The supervisor, alone once the run is gone, still stops the bootout
+    /// and lets go of the lock within three seconds of the 5 s limit.
+    func testAKilledInstallLetsGoOfTheLockOnTimeWhenEveryPollIsSlow() throws {
+        try writePreviousPair()
+        fx.setMode("launchctl", "bootout-hangs")
+
+        let pid = try killDuringHungBootout(fx.installRedirected, extraEnvironment: ["USER": "tester", "PATH": try fx.slowPollingPath()])
+
+        try assertLockHeldUntilGone(pid, within: 10)
+        XCTAssertGreaterThan(fx.slowPolls(), 0, "the script polled through the slow sleep")
         XCTAssertTrue(fx.calls().contains("launchctl FD9-OPEN"), "\(fx.calls())")
     }
 
@@ -5201,6 +5308,8 @@ private final class ScriptFixture {
             "RM": bin.appendingPathComponent("rm").path,
             "RMDIR": bin.appendingPathComponent("rmdir").path,
             "MKTEMP": bin.appendingPathComponent("mktemp").path,
+            "MKDIR": bin.appendingPathComponent("mkdir").path,
+            "CHMOD": bin.appendingPathComponent("chmod").path,
             "LOCK_TIMEOUT_SECONDS": "1",
             "CALL_TIMEOUT_SECONDS": "5",
         ].merging(extraConstants) { $1 })
@@ -5364,7 +5473,7 @@ private final class ScriptFixture {
             if [[ "$mode" == auth-fail ]]; then echo "sudo: 3 incorrect password attempts" >&2; exit 1; fi
             src=""; dst=""
             for a in "$@"; do src="$dst"; dst="$a"; done
-            case "$dst" in "\(r)"/*) mkdir -p "$(dirname "$dst")"; cp "$src" "$dst"; exit 0 ;; esac
+            case "$dst" in "\(r)"/*) /bin/mkdir -p "$(dirname "$dst")"; /bin/cp "$src" "$dst"; exit 0 ;; esac
             printf 'sudo REFUSED %s\\n' "$*" >> "\(calls)"; exit 1 ;;
           rm|test)
             for a in "$@"; do
@@ -5403,11 +5512,11 @@ private final class ScriptFixture {
         fi
         exec /bin/mv "$@"
         """)
-        // rm, rmdir, mktemp: install.sh's RM, RMDIR and MKTEMP. Each call is
-        // logged and then made by the real tool, so a test can tell a file
-        // removed or created through the fixed-path variable from one
-        // removed or created by a bare name.
-        for (tool, real) in [("rm", "/bin/rm"), ("rmdir", "/bin/rmdir"), ("mktemp", "/usr/bin/mktemp")] {
+        // rm, rmdir, mktemp, mkdir: install.sh's RM, RMDIR, MKTEMP and MKDIR.
+        // Each call is logged and then made by the real tool, so a test can
+        // tell a file removed or created through the fixed-path variable from
+        // one handled by a bare name. (Its CHMOD is the chmod fake below.)
+        for (tool, real) in [("rm", "/bin/rm"), ("rmdir", "/bin/rmdir"), ("mktemp", "/usr/bin/mktemp"), ("mkdir", "/bin/mkdir")] {
             try writeFake(tool, """
             printf '\(tool)%s\\n' "${*:+ $*}" >> "\(calls)"
             exec \(real) "$@"
@@ -5962,10 +6071,11 @@ private final class ScriptFixture {
         return String(decoding: data, as: UTF8.self).split(separator: "\n").map(String.init)
     }
 
-    /// The calls besides those to the logging mktemp, rm and rmdir, which
-    /// every install run makes for its own scratch files (see bounded()).
+    /// The calls besides those to the logging mktemp, rm, rmdir and mkdir,
+    /// which every install run makes for its own scratch files (see
+    /// bounded()) and the folders it installs into.
     func callsBesideScratchFiles() -> [String] {
-        calls().filter { call in !["mktemp", "rm", "rmdir"].contains { call == $0 || call.hasPrefix($0 + " ") } }
+        calls().filter { call in !["mktemp", "rm", "rmdir", "mkdir"].contains { call == $0 || call.hasPrefix($0 + " ") } }
     }
 
     func chmodCalls() -> [String] {
@@ -6058,6 +6168,31 @@ private final class ScriptFixture {
             Thread.sleep(forTimeInterval: 0.05)
         } while Date() < deadline
         return nil
+    }
+
+    /// A PATH whose `sleep` waits a quarter second before the sleep it was
+    /// asked for, so every poll install.sh and uninstall.sh make is slow, as
+    /// on a loaded machine where each fork takes long. The scripts call sleep
+    /// by name; the fakes call /bin/sleep. Each call is counted (slowPolls()).
+    func slowPollingPath() throws -> String {
+        let dir = root.appendingPathComponent("slow-poll", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let stub = dir.appendingPathComponent("sleep")
+        try """
+        #!/bin/bash
+        echo "$*" >> "\(root.path)/slow-poll.log"
+        /bin/sleep 0.25
+        exec /bin/sleep "$@"
+
+        """.write(to: stub, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: stub.path)
+        return "\(dir.path):/usr/bin:/bin:/usr/sbin:/sbin"
+    }
+
+    /// How many times the scripts called the slow `sleep`.
+    func slowPolls() -> Int {
+        let text = (try? String(contentsOf: root.appendingPathComponent("slow-poll.log"), encoding: .utf8)) ?? ""
+        return text.split(separator: "\n").count
     }
 
     /// Runs a real tool (not a script) with the fixture's environment: the
