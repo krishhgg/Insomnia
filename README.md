@@ -28,8 +28,8 @@
 </p>
 
 > **Use a stable, well-ventilated surface—not a closed bag.** Insomnia is
-> experimental, source-built software, not a signed and notarized consumer
-> download. Recovery can fail; a running timer is not a safety guarantee.
+> experimental software. Recovery can fail; a running timer is not a safety
+> guarantee.
 > [Validation status](docs/release-validation.md) · [Apple's ventilation guidance](https://support.apple.com/en-us/102336)
 
 <p align="center">

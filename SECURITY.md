@@ -43,7 +43,7 @@ signing identity (Developer ID) would let the access list name every build
 signed with it. And the item lives in the file-based login Keychain, which
 ignores the data-protection accessibility classes (this device only, when
 unlocked); using that Keychain needs an access-group entitlement, which needs
-a team id. Both wait on a signed release.
+a team id. Releases are ad-hoc signed, so both limits stay.
 
 The recovery LaunchAgent runs only the `backstop.sh` sealed inside the signed
 app bundle, after `codesign --verify --strict` passes against the code
