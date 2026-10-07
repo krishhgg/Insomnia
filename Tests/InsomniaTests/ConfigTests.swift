@@ -721,7 +721,8 @@ final class ConfigLoadTests: XCTestCase {
         XCTAssertFalse(m.isActive)
         XCTAssertEqual(h.guardFake.calls.filter { $0 == "disablesleep 1" }.count, 1)
         XCTAssertFalse(FileManager.default.fileExists(atPath: file.path))
-        let why = try XCTUnwrap(m.rejectedConfigFile)
+        let why = m.rejectedConfigFile ?? "no refusal"
+        XCTAssertTrue(why.hasSuffix("Free some disk space or make \(dir.path) writable."), why)
         XCTAssertEqual(h.notifier.posts.last?.body, "Insomnia did not start a session. \(why)")
 
         try TestACL.removeAll(dir)

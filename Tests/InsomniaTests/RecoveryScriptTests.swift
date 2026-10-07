@@ -2973,7 +2973,9 @@ final class RecoveryScriptTests: XCTestCase {
 
     /// An upgrade over an older build: the log, lock, journal, session and
     /// the two directories it left loose are tightened by the backstop too,
-    /// since it may run before the upgraded app has opened them.
+    /// since it may run before the upgraded app has opened them. The app is
+    /// running, so the session stands and session.json is still there to
+    /// check.
     func testBackstopTightensWhatAnOlderBuildLeftLoose() throws {
         try fx.writeSession(endsAt: Date(timeIntervalSinceNow: 3600))
         try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
@@ -2985,6 +2987,8 @@ final class RecoveryScriptTests: XCTestCase {
             try FileManager.default.setAttributes([.posixPermissions: mode], ofItemAtPath: url.path)
         }
 
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
         let r = try fx.run(fx.backstop)
 
         XCTAssertEqual(r.status, 0, r.stderr)
