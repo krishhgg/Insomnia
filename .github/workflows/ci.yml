@@ -144,8 +144,8 @@ jobs:
       - name: Check the lid simulation is compiled out of the release binary
         # Looks at the binaries, not the compilation condition: the plain
         # release build above must lack the simulate-lid.sh watcher, and a
-        # build with -DINSOMNIA_LID_SIMULATION (what install.sh adds for
-        # INSOMNIA_LID_SIMULATION=1) must have it.
+        # build with -DINSOMNIA_LID_SIMULATION (what build-app.sh adds
+        # for INSOMNIA_LID_SIMULATION=1) must have it.
         run: scripts/check-lid-simulation-gate.sh
 
   shellcheck:
