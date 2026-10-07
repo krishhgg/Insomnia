@@ -3,6 +3,16 @@
 # Runs from launchd (RunAtLoad + StartInterval 60, installed by install.sh)
 # and from install.sh / uninstall.sh. Needs no Insomnia process and no Swift.
 #
+# Where it lives: install.sh copies this file into the app bundle at
+# Insomnia.app/Contents/Resources/backstop.sh before signing the bundle, so
+# the signature's resource seal covers it. The LaunchAgent's command line
+# runs `codesign --verify --strict` on the bundle against the requirement
+# pinned in the plist (for an ad-hoc build, the cdhash of that build) and
+# execs this file only when that passes; an edited copy makes the check fail
+# and the agent logs one line and runs nothing. Nothing executable is kept in
+# Application Support (installs before this layout ran a writable copy from
+# there; install.sh removes it once the new agent is loaded).
+#
 # Every run is one transaction under APP_SUPPORT/.recovery.lock, an flock(2)
 # exclusive lock on the same file the app locks: read session.json and
 # state.json, decide, undo, publish the new journal atomically, release. If

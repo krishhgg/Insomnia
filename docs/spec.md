@@ -34,7 +34,8 @@ closed bag. Its design goals are to:
 - Swift 6, SwiftUI content hosted in a custom `NSStatusItem`, Swift Package.
   No Xcode project.
 - `install.sh` assembles a minimal `Insomnia.app` bundle (`LSUIElement = true`,
-  no Dock icon), ad-hoc codesigns it, and installs it to `~/Applications`.
+  no Dock icon) with `backstop.sh` sealed under `Contents/Resources`, ad-hoc
+  codesigns it, and installs it to `~/Applications`.
 
 ## Core model
 
@@ -286,10 +287,13 @@ last held while it was on was the battery or thermal floor, not the lid.
   shell-quoted `defaults delete` command for it, and continues. The summary
   says how many apps were checked; an app whose key cannot be read is
   reported, not counted. Each read has a 30 s limit, like every other call
-  uninstall makes under the recovery lock (`pgrep`, `launchctl`); a read
-  that does not answer ends the check with the command to run by hand, and
-  uninstall goes on. A call past its limit gets SIGTERM, then SIGKILL, and
-  never holds the lock.
+  uninstall makes under the recovery lock (`pgrep`, `launchctl`,
+  `codesign`); a read that does not answer ends the check with the command
+  to run by hand, and uninstall goes on. A call past its limit gets SIGTERM,
+  then SIGKILL one to two seconds later. Each call keeps the lock until it has exited
+  or been stopped, and a supervising process enforces the limit even if
+  uninstall is killed while it waits, so its `launchctl bootout` is not
+  still running when the app takes the lock and loads its agent.
 - Browser throttling: Chromium browsers throttle windows macOS reports as
   occluded, which is every window once the lid is closed with no external
   display. Timers drop to 1 Hz, animation frames stop, pages report hidden.
@@ -577,6 +581,72 @@ Backstop, independent of the app:
 
 - The agent reads the saved deadline; recurring recovery checks avoid replacing
   the loaded job for every extension and allow retries after a failure.
+- The agent runs only the `backstop.sh` sealed in the signed bundle. Its
+  command line verifies the bundle against the code requirement pinned in the
+  plist (`codesign --verify --strict -R=...`; for an ad-hoc build, that
+  build's cdhash) and execs the script when that passes; otherwise it logs
+  one line and exits without running anything. No executable lives in a
+  writable directory. The plist is a per-user file like any LaunchAgent; at
+  the next arm the app rewrites a plist that does not match, and reloads a
+  loaded job whose command line or run interval (the `arguments` and `run
+  interval` that `launchctl print` lists) differs from the plist's.
+- What the app pins is the requirement of the code it is running
+  (SecCodeCopySelf), read after SecCodeCheckValidity confirmed the bundle on
+  disk is that code, and the bundle must pass the agent's own check against
+  it at every arm. Otherwise arm() fails with the reason: a loaded agent
+  whose bundle no longer verifies is never reported as armed, and a bundle
+  re-signed under the running app is never re-pinned. A `swift run` build
+  outside any bundle pins the installed bundle from disk.
+- install.sh replaces the bundle and the agent in one locked step: the new
+  bundle is staged next to the app and swapped in only after `launchctl
+  print` confirms the previous job is unloaded, then the new job is loaded.
+  So any job loaded after the swap is this run's and pins the new bundle.
+  When the new job cannot be loaded or its plist cannot be published,
+  install.sh unloads any job that may be loaded, confirms that with print,
+  and puts the previous bundle back; if the unload is not confirmed, the
+  new bundle stays, because that job pins it. Every bundle rename is checked
+  (`mv`, refused when the destination exists): when one of the swap or its
+  undo fails, the previous bundle goes back and its job is loaded again as
+  after a failed load, and when the previous bundle cannot go back, no
+  bundle is deleted, no job is loaded against an empty app path, and the
+  message prints the `mv` and `launchctl bootstrap` that restore the pair.
+  The same holds for the renames of the repair below. A rerun after an interrupted
+  or failed swap keeps the bundle the plist on disk pins. It runs its
+  forced recovery first, with the loaded job and the bundles as the earlier
+  run left them, and stops there if recovery fails. Only then does it
+  unload and confirm any loaded job, move a bundle and load the plist on
+  disk again; it stops when print does not confirm the unload or that
+  reload. A loaded job is never left pinning a bundle that was moved away,
+  and no step after a failed bootstrap counts on a loaded job. Before
+  recovery the run only puts a set-aside bundle back when nothing is at the
+  app's path, and removes staging directories whose owning install is gone
+  (matched by the exact name install.sh gives them). Right after taking the
+  lock it checks the sudoers rule again with `sudo -n -l` for each of the
+  four commands and stops if it no longer holds: an uninstall.sh that took
+  the lock first removes the rule and leaves no journal, so the recovery
+  alone would pass. Under the lock every `sudo -n -l`, `pgrep`, `launchctl`
+  and `codesign --verify` call has a 30 s limit (the sudoers check before
+  the lock has it too). A supervising process enforces it, even if the
+  installer is killed while it waits, and the call keeps fd 9, so the lock
+  is held until the call has exited or been stopped: no `launchctl bootout`
+  or `bootstrap` it started is still running once the lock is released. A call past the
+  limit gets SIGTERM, then SIGKILL one to two seconds later; `sudo` only ever gets
+  SIGTERM, and one that ignores it keeps the lock until it ends, reported
+  with its pid. A sudoers check or `pgrep` that does not answer stops the
+  run, which releases the lock so the app and the agent can recover. A `launchctl print` that does not answer counts as unknown, never
+  as unloaded. A `codesign --verify` that does not answer leaves it unknown
+  which bundle the plist on disk pins, so the run stops and moves neither
+  bundle. uninstall.sh runs the
+  bundle's sealed backstop.sh only after `codesign --verify --strict`
+  passes on the bundle (a bounded call, like its other calls under the
+  lock). Once recovery is confirmed and print confirms the agent unloaded,
+  it removes the bundle and install.sh's leftovers beside it, by their exact
+  names: `.Insomnia.app.previous`, and `.Insomnia.app.staging.<pid>.<six
+  letters and digits>` directories whose run `kill -0` reports gone (a live
+  run's stays). Symlinks and other names are left. With the agent plist go
+  the candidate plists install.sh and the app stage it from
+  (`com.insomnia.backstop.candidate-*` in `.com.insomnia.backstop.staging`
+  and, from older builds, in the LaunchAgents directory).
 - App and script transactions must coordinate through a shared lock. Failure
   to acquire it must not permit an unprotected journal write or side effect.
 - A `sudo pmset` is sent SIGTERM at its timeout (20 s in the app, 30 s in the
@@ -660,8 +730,10 @@ Backstop, independent of the app:
   and state when restoration is incomplete, including saved audio. It runs
   the checkout's backstop only when the installed app declares the
   `InsomniaResumeFrozenVersion` that backstop speaks; otherwise it runs the
-  backstop installed with that app, when there is one. With no installed
-  copy it runs the checkout's backstop anyway, which keeps the entries that
+  backstop installed with that app, when there is one: the copy sealed in
+  its bundle, once `codesign --verify --strict` passes, else the writable
+  copy older installs left in Application Support. With no installed copy
+  it runs the checkout's backstop anyway, which keeps the entries that
   need the binary without running it, so uninstall stops before removing
   anything.
 - The shell puts `appNapOverrides` back with `defaults write <id>
@@ -902,7 +974,7 @@ Insomnia/
     TestSupport.swift
     UIStatusTests.swift
   scripts/
-    install.sh             build, bundle, codesign, sudoers, launchd, login item
+    install.sh             build, bundle (backstop.sh sealed inside), codesign, sudoers, launchd
     uninstall.sh           reverse all of the above, restore sleep
     backstop.sh            standalone restore from JSON
     simulate-lid.sh        file trigger for the lid-close action path (debug and
