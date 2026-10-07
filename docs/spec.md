@@ -50,9 +50,9 @@ RuntimeState {                // everything Insomnia changed and must undo
   lowPowerSetByUs:    Bool
   frozenProcesses:    [{pid, startedAt, startedAtMicros, bootSession}]
   dockerFrozen:       Bool
-  savedOutputVolume:  Float?  // nil when mute is off or lid is open
-  savedMuted:         Bool?
-  savedOutputDeviceUID: String?  // the output device both were read from and lid close muted; absent in older entries (default output)
+  savedAudioOutputs:  [{deviceUID, name?, volume, muted}]  // each output device a lid close muted, with what it had; empty when mute is off or every device is restored
+  savedOutputVolume:  Float?  // legacy: an earlier build's entry, restored on the default output; never written now
+  savedMuted:         Bool?   // legacy, the same
   savedDisplayBrightness:  Float?  // nil when darkening is off or lid is open
   savedKeyboardBrightness: Float?  // nil when there is no backlight, too
   displayRestoredUnderLowPower: Float?  // restored on open under our Low Power Mode; written again when it ends
@@ -120,9 +120,21 @@ Quit, or reconcile.
 | Keyboard backlight (optional, same toggle) | save brightness, set it to 0 | restore the saved brightness |
 | Freeze scope | `SIGSTOP` every process whose responsible app is in the freeze scope (rules below) | `SIGCONT` the recorded pids only |
 | Docker rule (default off) | if Docker Desktop is running and `docker ps -q` is empty, journal its tree, ask `docker ps -q` once more right before the SIGSTOP and freeze it only on a second clean empty answer; busy, a failed probe, a timeout, a lid open or a session end at either point leaves it running | resume |
-| Mute (optional, default on) | save the default output's volume, mute state and device UID, then mute that device | restore both on that device, never on another output; if it is not connected the entry waits for the next lid open, and at session end it is dropped with a menu line saying that device is still muted |
+| Mute (optional, default on) | journal the default output's UID, name, volume and mute state as its own entry, unless that device already has one, then mute that device; another device's entry never stops it | restore each entry on its own device, never on another output, and clear only that entry; a device the user unmuted meanwhile is left as it is; a device that is not connected keeps its entry (see below) |
 | Low Power Mode | on (optional, default on) | off unless a battery or thermal floor still wants it |
 | Countdown redraw | stop timer | restart timer |
+
+An output device that is not connected when its entry is restored keeps the
+entry, and the restore of everything else goes on. It does not hold up the
+end of a session: End and Quit restore sleep and the rest, the end
+notification names each device that is still muted, and the menu shows a
+line for each with a "Stop waiting for <device>" item, which drops that
+entry and leaves the device as it is. While Insomnia runs, a device that
+connects again gets its volume back at once (a CoreAudio device-list
+listener), or at the next lid open if a session is running with the lid
+closed. A later launch restores every connected device at reconcile. A
+restore that fails for another reason, or a cleared entry that cannot be
+written, is reported and the entry stays for a retry.
 
 A session that starts, or that reconcile resumes at launch, while the lid
 reads closed starts with the countdown redraw stopped: the lid observer
@@ -603,7 +615,13 @@ Backstop, independent of the app:
   microseconds keep the shell's one-second `ps` comparison. Old PID-only
   entries need conservative handling.
 - The shell does not restore CoreAudio settings. Saved audio must remain in
-  the journal for the app to restore. Uninstall must preserve recovery tools
+  the journal for the app to restore. Legacy `savedOutputVolume` /
+  `savedMuted` count as unresolved, so the run exits 1 and says to open
+  Insomnia. `savedAudioOutputs` entries are checked for shape and kept, but
+  on their own they leave the journal clean: an entry can wait days for its
+  device, the app's menu shows it, and an error every minute would only
+  fill the log. The backstop logs them once, when it removes a session or
+  undoes something else. Uninstall must preserve recovery tools
   and state when restoration is incomplete, including saved audio. It runs
   the checkout's backstop only when the installed app declares the
   `InsomniaResumeFrozenVersion` that backstop speaks; otherwise it runs the
@@ -910,7 +928,12 @@ that any case passed; record results in the release validation record.
    containers running". A container started between the two checks →
    untouched, log has the first check finding none and "second check found
    containers running".
-7. **Mute.** Volume 60%, close lid → muted. Open → 60%, unmuted.
+7. **Mute.** Volume 60%, close lid → muted. Open → 60%, unmuted. With a
+   headset as the output, close the lid, unplug the headset, open the lid
+   and choose End: the notification and the menu name the headset as still
+   muted. Plug it back in → its volume comes back and the menu line goes.
+   Repeat, but Quit with the headset unplugged, plug it in, then launch
+   Insomnia → restored at launch.
 8. **Chrome occlusion.** Lid closed, Playwright attached to headed Chrome:
    read `document.visibilityState` and measure `setInterval` drift. Repeat with
    both flags. Decide whether feature 5's browser section stays.

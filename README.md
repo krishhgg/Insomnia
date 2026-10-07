@@ -161,9 +161,11 @@ The defaults are worth knowing:
   Desktop, so leave the rule off for Docker workloads an unexpected pause
   would hurt.
 - **Mute on close:** on, so sound stops when the lid closes. Lid open
-  restores the output that was muted, even if another one is in use by then.
-  If that output is not connected when the session ends, it stays muted and
-  the menu says so.
+  restores each output that was muted, even if another one is in use by then.
+  An output that is not connected stays muted until it reconnects: Insomnia
+  restores it then if it is running, or at the next launch. Ending or
+  quitting a session does not wait for it. The end notification and the menu
+  name it, and the menu's "Stop waiting for <device>" leaves it as it is.
 - **Microphone:** on Mac laptops with Apple silicon or a T2 chip, closing the
   lid disconnects the built-in microphone in hardware. Recording a meeting
   with the lid closed needs AirPods or an external mic; Settings says the same
@@ -280,7 +282,10 @@ installation scenarios still need [release validation](docs/release-validation.m
   recovery lock until it exits. Other recovery attempts or new sessions wait
   or fail with a warning instead of running alongside it.
 - **Audio:** the backstop preserves volume/mute entries but cannot restore
-  CoreAudio. Reopen the app for recovery.
+  CoreAudio. Reopen the app for recovery. An output device that is not
+  connected keeps its entry until it reconnects, and uninstall stops while
+  one is waiting: connect it and open Insomnia, or choose "Stop waiting for
+  <device>" in the menu.
 - **Sleep disabled by something else:** at launch, with no session and no
   journal entry, a `SleepDisabled 1` in `pmset -g` is left alone: Insomnia
   did not set it and only its owner should undo it. The menu shows a warning

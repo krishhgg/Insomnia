@@ -917,9 +917,10 @@ final class LidActionsTests: XCTestCase {
 
         // The fake audio's mute sees state.json already holding the saved values.
         let sawSaved = Locked(false)
+        let speakers = Self.speakersSaved
         h.audio.onMute = {
             let s = (try? store.loadState()) ?? nil
-            sawSaved.value = s?.savedOutputVolume == 0.6 && s?.savedMuted == false
+            sawSaved.value = s?.savedAudioOutputs == [speakers]
         }
         // Each suspend sees its own pids already journaled.
         let sawPids = Locked(true)
@@ -944,8 +945,8 @@ final class LidActionsTests: XCTestCase {
             FrozenProcess(pid: 401, startedAt: 4001),
         ])
         XCTAssertTrue(s.dockerFrozen)
-        XCTAssertEqual(s.savedOutputVolume, 0.6)
-        XCTAssertEqual(s.savedMuted, false)
+        XCTAssertEqual(s.savedAudioOutputs, [Self.speakersSaved])
+        XCTAssertNil(s.savedOutputVolume, "a lid close no longer writes the entry without a device")
         XCTAssertEqual(m.state, s)
         XCTAssertTrue(m.isActive)
     }
@@ -966,11 +967,26 @@ final class LidActionsTests: XCTestCase {
         let s = try XCTUnwrap(try h.store.loadState())
         XCTAssertEqual(s.frozenProcesses, [])
         XCTAssertFalse(s.dockerFrozen)
-        XCTAssertNil(s.savedOutputVolume)
-        XCTAssertNil(s.savedMuted)
+        XCTAssertEqual(s.savedAudioOutputs, [])
         XCTAssertTrue(s.sleepDisabledByUs)
         XCTAssertTrue(m.isActive)
         XCTAssertEqual(m.remainingText, "58m")
+    }
+
+    static let speakersSaved = SavedAudioOutput(deviceUID: FakeAudioControl.speakers, name: FakeAudioControl.speakersName, volume: 0.6, muted: false)
+    static let headsetSaved = SavedAudioOutput(deviceUID: "usb-headset", name: "USB Headset", volume: 0.3, muted: false)
+
+    /// A session whose lid closed on the USB headset, which was then
+    /// unplugged: the speakers are the default output, the headset is
+    /// muted and owed its volume.
+    private func closeOnTheHeadsetAndUnplugIt() async -> (SessionManager, LidActions) {
+        let (m, actions) = await make()
+        h.audio.connect("usb-headset", name: "USB Headset", volume: 0.3)
+        await m.start(duration: 3600)
+        await actions.onClose()
+        XCTAssertEqual(h.audio.device("usb-headset")?.muted, true)
+        h.audio.disconnect("usb-headset")
+        return (m, actions)
     }
 
     /// Lid open restores the device lid close muted, even when another
@@ -980,7 +996,7 @@ final class LidActionsTests: XCTestCase {
         let (m, actions) = await make()
         await m.start(duration: 3600)
         await actions.onClose()
-        XCTAssertEqual(try h.store.loadState()?.savedOutputDeviceUID, FakeAudioControl.speakers)
+        XCTAssertEqual(try h.store.loadState()?.savedAudioOutputs, [Self.speakersSaved])
         XCTAssertEqual(h.audio.device(FakeAudioControl.speakers)?.muted, true)
         h.audio.connect("usb-headset", volume: 0.3)
 
@@ -991,69 +1007,217 @@ final class LidActionsTests: XCTestCase {
         XCTAssertEqual(h.audio.device(FakeAudioControl.speakers)?.muted, false)
         XCTAssertEqual(h.audio.device("usb-headset")?.volume, 0.3)
         XCTAssertEqual(h.audio.device("usb-headset")?.muted, false)
-        let s = try XCTUnwrap(try h.store.loadState())
-        XCTAssertNil(s.savedOutputVolume)
-        XCTAssertNil(s.savedMuted)
-        XCTAssertNil(s.savedOutputDeviceUID)
+        XCTAssertEqual(try h.store.loadState()?.savedAudioOutputs, [])
     }
 
-    /// A muted device that is gone at lid open is not stood in for by the
-    /// default output. The entry waits, a close in the meantime mutes
-    /// nothing else, and the next lid open with the device back restores it.
-    func testOpenKeepsTheEntryWhileTheMutedDeviceIsDisconnected() async throws {
-        let (m, actions) = await make()
-        h.audio.connect("usb-headset", volume: 0.3)
-        await m.start(duration: 3600)
-        await actions.onClose()
-        XCTAssertEqual(h.audio.device("usb-headset")?.muted, true)
-        h.audio.disconnect("usb-headset")
+    /// A headset unplugged under the closed lid keeps its entry at lid
+    /// open, and the speakers are left alone. A later close in the same
+    /// session still mutes the speakers, in an entry of their own, and the
+    /// next open restores them while the headset keeps waiting. The menu
+    /// names it; once it is plugged back in, the device change restores it.
+    func testAWaitingHeadsetDoesNotStopTheSpeakersBeingMuted() async throws {
+        let (m, actions) = await closeOnTheHeadsetAndUnplugIt()
 
         await actions.onOpen()
         XCTAssertEqual(h.audio.applied.count, 0)
         XCTAssertEqual(h.audio.volume, 0.6, "the speakers are left alone")
         XCTAssertFalse(h.audio.muted, "the speakers are left alone")
-        var s = try XCTUnwrap(try h.store.loadState())
-        XCTAssertEqual(s.savedOutputDeviceUID, "usb-headset")
-        XCTAssertEqual(s.savedOutputVolume, 0.3)
-        XCTAssertEqual(s.savedMuted, false)
+        XCTAssertEqual(try h.store.loadState()?.savedAudioOutputs, [Self.headsetSaved])
+        XCTAssertEqual(m.outputsWaitingForRestore, [Self.headsetSaved])
         XCTAssertNil(m.lastError)
 
         await actions.onClose()
-        XCTAssertEqual(h.audio.mutes, 1, "the speakers are not muted while the headset's volume is owed")
+        XCTAssertTrue(h.audio.muted, "the speakers are muted though the headset is still owed its volume")
+        XCTAssertEqual(try h.store.loadState()?.savedAudioOutputs, [Self.headsetSaved, Self.speakersSaved])
+
+        await actions.onOpen()
+        XCTAssertEqual(h.audio.applied.map { $0.deviceUID }, [FakeAudioControl.speakers])
+        XCTAssertEqual(h.audio.volume, 0.6)
         XCTAssertFalse(h.audio.muted)
-        XCTAssertEqual(try h.store.loadState()?.savedOutputDeviceUID, "usb-headset")
+        XCTAssertEqual(try h.store.loadState()?.savedAudioOutputs, [Self.headsetSaved])
+        let lines = StatusItemController.menuItems(manager: m, status: RecordingStatusSource()).map(\.title)
+        XCTAssertTrue(lines.contains("\u{26A0} USB Headset is still muted from a lid close; Insomnia restores it when it reconnects"), "\(lines)")
+        XCTAssertTrue(lines.contains("Stop waiting for USB Headset"), "\(lines)")
 
         // macOS keeps a device's mute, so the headset comes back muted.
-        h.audio.connect("usb-headset", volume: 0.3, muted: true)
-        await actions.onOpen()
-        XCTAssertEqual(h.audio.applied.map { $0.deviceUID }, ["usb-headset"])
+        h.audio.connect("usb-headset", name: "USB Headset", volume: 0.3, muted: true)
+        await m.outputDevicesChanged()
+        XCTAssertEqual(h.audio.applied.map { $0.deviceUID }, [FakeAudioControl.speakers, "usb-headset"])
+        XCTAssertEqual(h.audio.device("usb-headset")?.volume, 0.3)
         XCTAssertEqual(h.audio.device("usb-headset")?.muted, false)
-        s = try XCTUnwrap(try h.store.loadState())
-        XCTAssertNil(s.savedOutputVolume)
-        XCTAssertNil(s.savedMuted)
-        XCTAssertNil(s.savedOutputDeviceUID)
+        XCTAssertEqual(try h.store.loadState()?.savedAudioOutputs, [])
+        XCTAssertEqual(m.outputsWaitingForRestore, [])
+        XCTAssertTrue(m.isActive)
     }
 
-    /// At the session end a muted device that is still gone is dropped from
-    /// the journal, so the end completes, and the menu says it is muted.
-    /// The default output is not touched.
-    func testSessionEndWithTheMutedDeviceDisconnectedDropsItAndSaysSo() async throws {
-        let (m, actions) = await make()
-        h.audio.connect("usb-headset", volume: 0.3)
-        await m.start(duration: 3600)
+    /// While a lid close is in effect, a device that reconnects is not
+    /// unmuted: the lid open restores it with the rest.
+    func testADeviceThatReconnectsUnderTheClosedLidWaitsForTheLidOpen() async throws {
+        let (m, actions) = await closeOnTheHeadsetAndUnplugIt()
+        await actions.onOpen()
         await actions.onClose()
-        h.audio.disconnect("usb-headset")
+        h.clamshell.closed = true
+        h.audio.connect("usb-headset", name: "USB Headset", volume: 0.3, muted: true)
 
-        await m.end(reason: .timer)
+        await m.outputDevicesChanged()
+        XCTAssertEqual(h.audio.applied.count, 0)
+        XCTAssertEqual(h.audio.device("usb-headset")?.muted, true)
+        XCTAssertEqual(h.audio.device(FakeAudioControl.speakers)?.muted, true)
+
+        h.clamshell.closed = false
+        await actions.onOpen()
+        XCTAssertEqual(Set(h.audio.applied.compactMap { $0.deviceUID }), [FakeAudioControl.speakers, "usb-headset"])
+        XCTAssertEqual(h.audio.device("usb-headset")?.muted, false)
+        XCTAssertEqual(h.audio.device(FakeAudioControl.speakers)?.muted, false)
+        XCTAssertEqual(try h.store.loadState()?.savedAudioOutputs, [])
+    }
+
+    /// Quit with the muted headset unplugged: the session ends and sleep is
+    /// restored, Quit goes through, and the headset's entry stays in the
+    /// journal. The notification and the menu name it. Plugged back in
+    /// while Insomnia runs, CoreAudio's device change restores it.
+    func testQuitKeepsTheEntryOfAnUnpluggedDeviceAndItsReconnectRestoresIt() async throws {
+        let (m, _) = await closeOnTheHeadsetAndUnplugIt()
+
+        let outcome = await m.end(reason: .quit)
+
+        XCTAssertEqual(outcome, .restored, "a device that is not connected does not hold up the end")
+        XCTAssertFalse(m.isActive)
+        XCTAssertNil(try h.store.loadSession())
+        XCTAssertTrue(h.guardFake.calls.contains("disablesleep 0"), "\(h.guardFake.calls)")
+        let s = try XCTUnwrap(try h.store.loadState())
+        XCTAssertFalse(s.sleepDisabledByUs)
+        XCTAssertEqual(s.frozenProcesses, [])
+        XCTAssertEqual(s.savedAudioOutputs, [Self.headsetSaved])
+        XCTAssertEqual(h.audio.applied.count, 0)
+        XCTAssertFalse(h.audio.muted, "the speakers are not touched")
+        let post = try XCTUnwrap(h.notifier.posts.last)
+        XCTAssertEqual(post.title, "Session ended")
+        XCTAssertEqual(post.body, "Insomnia quit. Sleep is back to normal. USB Headset was not connected, so it is still muted. Insomnia restores its volume when it reconnects while Insomnia is running, or at the next launch.")
+        XCTAssertFalse(h.notifier.posts.contains { $0.title == SessionManager.incompleteTitle })
+        XCTAssertEqual(m.outputsWaitingForRestore, [Self.headsetSaved])
+
+        h.audio.connect("usb-headset", name: "USB Headset", volume: 0.3, muted: true)
+        h.audio.fireDevicesChanged()
+        for _ in 0..<300 where h.audio.applied.isEmpty {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(h.audio.applied.map { $0.deviceUID }, ["usb-headset"])
+        XCTAssertEqual(h.audio.device("usb-headset")?.muted, false)
+        for _ in 0..<300 where !m.outputsWaitingForRestore.isEmpty {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
+        XCTAssertEqual(m.outputsWaitingForRestore, [])
+    }
+
+    /// The headset was plugged back in while Insomnia was not running: the
+    /// next launch restores it, quietly. A launch with it still unplugged
+    /// keeps the entry and the menu line and posts nothing, so a device
+    /// that stays away is not announced at every launch.
+    func testALaterLaunchRestoresTheDeviceOnceItIsConnected() async throws {
+        let (m, _) = await closeOnTheHeadsetAndUnplugIt()
+        await m.end(reason: .quit)
+        let posted = h.notifier.posts.count
+
+        let away = h.makeManager()
+        await away.reconcile()
+        XCTAssertEqual(try h.store.loadState()?.savedAudioOutputs, [Self.headsetSaved])
+        XCTAssertEqual(away.outputsWaitingForRestore, [Self.headsetSaved])
+        XCTAssertEqual(h.notifier.posts.count, posted)
+        XCTAssertNil(away.lastError)
+
+        h.audio.connect("usb-headset", name: "USB Headset", volume: 0.3, muted: true)
+        let back = h.makeManager()
+        await back.reconcile()
+        XCTAssertEqual(h.audio.applied.map { $0.deviceUID }, ["usb-headset"])
+        XCTAssertEqual(h.audio.device("usb-headset")?.muted, false)
+        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
+        XCTAssertEqual(back.outputsWaitingForRestore, [])
+        XCTAssertEqual(h.notifier.posts.count, posted)
+    }
+
+    /// The device came back and the user unmuted it and set a volume before
+    /// Insomnia could restore it: that stands, and only the entry goes.
+    func testARestoreLeavesADeviceTheUserUnmutedAlone() async throws {
+        let (m, _) = await closeOnTheHeadsetAndUnplugIt()
+        await m.end(reason: .user)
+        h.audio.connect("usb-headset", name: "USB Headset", volume: 0.8, muted: false)
+
+        await m.outputDevicesChanged()
 
         XCTAssertEqual(h.audio.applied.count, 0)
-        XCTAssertFalse(h.audio.muted)
+        XCTAssertEqual(h.audio.device("usb-headset")?.volume, 0.8)
+        XCTAssertEqual(h.audio.device("usb-headset")?.muted, false)
         XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
-        XCTAssertFalse(m.isActive)
-        let error = try XCTUnwrap(m.lastError)
-        XCTAssertTrue(error.contains("usb-headset"), error)
-        XCTAssertTrue(error.contains("still muted"), error)
-        XCTAssertFalse(h.notifier.posts.contains { $0.title == SessionManager.incompleteTitle })
+    }
+
+    /// "Stop waiting for <device>" drops that entry, and only that one; the
+    /// device stays as it is when it comes back.
+    func testStopWaitingDropsOnlyThatDevicesEntry() async throws {
+        let (m, actions) = await closeOnTheHeadsetAndUnplugIt()
+        await actions.onOpen()
+        await actions.onClose()
+        XCTAssertEqual(try h.store.loadState()?.savedAudioOutputs, [Self.headsetSaved, Self.speakersSaved])
+
+        await m.stopWaitingForOutput("usb-headset")
+
+        XCTAssertEqual(try h.store.loadState()?.savedAudioOutputs, [Self.speakersSaved])
+        XCTAssertEqual(m.outputsWaitingForRestore, [])
+        h.audio.connect("usb-headset", name: "USB Headset", volume: 0.3, muted: true)
+        await actions.onOpen()
+        XCTAssertEqual(h.audio.applied.map { $0.deviceUID }, [FakeAudioControl.speakers])
+        XCTAssertEqual(h.audio.device("usb-headset")?.muted, true)
+        XCTAssertEqual(try h.store.loadState()?.savedAudioOutputs, [])
+    }
+
+    /// The restore went through but clearing its entry did not: reported,
+    /// not swallowed, and the entry stays. The retry finds the device
+    /// unmuted and clears it without writing again.
+    func testAnAudioRestoreWhoseJournalClearFailsIsReported() async throws {
+        let (m, actions) = await make()
+        await m.start(duration: 3600)
+        await actions.onClose()
+        let file = h.home.paths.stateFile.path
+        h.audio.onApply = { _ in try? FileManager.default.setAttributes([.immutable: true], ofItemAtPath: file) }
+        defer { try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: file) }
+
+        await actions.onOpen()
+        try FileManager.default.setAttributes([.immutable: false], ofItemAtPath: file)
+
+        XCTAssertFalse(h.audio.muted)
+        XCTAssertNotNil(m.lastError)
+        // The later lid-close entries fail to clear too and take lastError.
+        XCTAssertTrue(logText().contains("audio restored on MacBook Pro Speakers but the journal entry could not be cleared"), logText())
+        XCTAssertEqual(try h.store.loadState()?.savedAudioOutputs, [Self.speakersSaved])
+
+        h.audio.onApply = nil
+        await actions.onOpen()
+        XCTAssertEqual(h.audio.applied.count, 1)
+        XCTAssertEqual(try h.store.loadState()?.savedAudioOutputs, [])
+    }
+
+    /// An entry an earlier build wrote, without the device, is restored on
+    /// the default output as that build did, after the per-device ones.
+    func testAnEntryFromAnEarlierBuildRestoresTheDefaultOutput() async throws {
+        let (m, actions) = await make()
+        await m.start(duration: 3600)
+        try m.journal { s in
+            s.savedOutputVolume = 0.25
+            s.savedMuted = false
+        }
+        await actions.onClose()
+        XCTAssertEqual(try h.store.loadState()?.savedAudioOutputs, [Self.speakersSaved])
+
+        await actions.onOpen()
+
+        XCTAssertEqual(h.audio.applied.map { $0.deviceUID }, [FakeAudioControl.speakers, nil])
+        XCTAssertEqual(h.audio.volume, 0.25)
+        XCTAssertFalse(h.audio.muted)
+        let s = try XCTUnwrap(try h.store.loadState())
+        XCTAssertEqual(s.savedAudioOutputs, [])
+        XCTAssertNil(s.savedOutputVolume)
+        XCTAssertNil(s.savedMuted)
     }
 
     /// The whole lid-close transaction, each journal write and the side
@@ -1107,7 +1271,7 @@ final class LidActionsTests: XCTestCase {
         XCTAssertEqual(h.procs.suspended, [])
         XCTAssertEqual(h.procs.resumed, [])
         XCTAssertEqual(h.audio.mutes, 0)
-        XCTAssertNil(try h.store.loadState()?.savedOutputVolume)
+        XCTAssertEqual(try h.store.loadState()?.savedAudioOutputs ?? [], [])
     }
 
     func testMuteOffLeavesAudioAlone() async throws {
@@ -1115,7 +1279,7 @@ final class LidActionsTests: XCTestCase {
         await m.start(duration: 3600)
         await actions.onClose()
         XCTAssertEqual(h.audio.mutes, 0)
-        XCTAssertNil(try h.store.loadState()?.savedOutputVolume)
+        XCTAssertEqual(try h.store.loadState()?.savedAudioOutputs ?? [], [])
         await actions.onOpen()
         XCTAssertEqual(h.audio.applied.count, 0)
     }
@@ -1566,7 +1730,7 @@ final class LidActionsTests: XCTestCase {
         await m.start(duration: 3600)
         await actions.onClose()
         XCTAssertEqual(h.audio.mutes, 0)
-        XCTAssertNil(try h.store.loadState()?.savedOutputVolume)
+        XCTAssertEqual(try h.store.loadState()?.savedAudioOutputs ?? [], [])
         XCTAssertEqual(h.procs.suspended.count, 2)
     }
 

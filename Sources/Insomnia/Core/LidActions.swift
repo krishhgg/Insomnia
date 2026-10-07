@@ -264,19 +264,19 @@ final class LidActions {
     private func muteSavingCurrent(_ manager: SessionManager) {
         do {
             let current = try audio.read()
-            let owed = manager.state.savedOutputVolume != nil || manager.state.savedMuted != nil
-            if owed, let saved = manager.state.savedOutputDeviceUID, saved != current.deviceUID {
-                // The earlier save is still owed to that device. Muting this
-                // one would leave it muted with nothing saved to restore.
-                Log.info("not muting \(current.deviceUID): the volume saved for \(saved) at an earlier lid close is not restored yet")
-                return
-            }
             try manager.journal { s in
-                // Keep an earlier save if a previous close was never undone.
-                let fresh = s.savedOutputVolume == nil && s.savedMuted == nil
-                if s.savedOutputVolume == nil { s.savedOutputVolume = current.volume }
-                if s.savedMuted == nil { s.savedMuted = current.muted }
-                if fresh { s.savedOutputDeviceUID = current.deviceUID }
+                // One entry per device. A device that already has one keeps
+                // it: a previous close muted it and was never undone, so
+                // what reads now is that mute. Entries for other devices,
+                // still waiting for theirs to reconnect, are left as they are.
+                if !s.savedAudioOutputs.contains(where: { $0.deviceUID == current.deviceUID }) {
+                    s.savedAudioOutputs.append(SavedAudioOutput(
+                        deviceUID: current.deviceUID,
+                        name: current.name,
+                        volume: current.volume,
+                        muted: current.muted
+                    ))
+                }
             }
             // The device just read and journaled, even if the default output
             // has changed since.

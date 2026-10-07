@@ -653,7 +653,8 @@ final class StatusItemController: NSObject {
             target: self,
             settings: #selector(menuOpenSettings),
             quit: #selector(menuQuit),
-            relaunchBrowser: #selector(menuRelaunchBrowser(_:))
+            relaunchBrowser: #selector(menuRelaunchBrowser(_:)),
+            stopWaitingForOutput: #selector(menuStopWaitingForOutput(_:))
         )
         menu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.height + 4), in: button)
     }
@@ -685,8 +686,14 @@ final class StatusItemController: NSObject {
             hotspotWarning: status.hotspotPasswordReport?.problem(for: manager.config.hotspotSSID)?.menuLine,
             error: manager.lastError,
             foreignSleep: manager.foreignSleepWarning,
+            outputsWaiting: manager.outputsWaitingForRestore,
             lidSimulationBuild: LidSimulationBuild.isCompiledIn
         )
+    }
+
+    @objc private func menuStopWaitingForOutput(_ sender: NSMenuItem) {
+        guard let deviceUID = sender.representedObject as? String else { return }
+        Task { await manager.stopWaitingForOutput(deviceUID) }
     }
 
     @objc private func menuRelaunchBrowser(_ sender: NSMenuItem) {

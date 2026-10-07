@@ -83,10 +83,37 @@ final class StatusMenuWarningTests: XCTestCase {
             target: nil,
             settings: #selector(NSObject.description),
             quit: #selector(NSObject.description),
-            relaunchBrowser: #selector(NSObject.description)
+            relaunchBrowser: #selector(NSObject.description),
+            stopWaitingForOutput: #selector(NSObject.description)
         )
         let entry = menu.items.first { $0.title == "Relaunch Arc unthrottled" }
         XCTAssertEqual(entry?.representedObject as? ThrottledBrowser, arc)
+    }
+
+    /// Each output device still muted from a lid close gets a warning line
+    /// and a live item that carries its UID, so the click drops the entry
+    /// of the device the menu named. Builds the NSMenu only.
+    func testEachWaitingOutputHasALineAndAStopWaitingItem() {
+        let headset = SavedAudioOutput(deviceUID: "usb-headset", name: "USB Headset", volume: 0.3, muted: false)
+        let unnamed = SavedAudioOutput(deviceUID: "70-8C-F2:output", name: nil, volume: 0.5, muted: false)
+        let items = StatusMenu.items(sessionActive: false, sleepHeld: false, machine: nil, actions: nil, throttledBrowsers: [], error: nil, outputsWaiting: [headset, unnamed])
+        XCTAssertEqual(Array(items.prefix(4)), [
+            StatusMenu.Item(title: "\u{26A0} USB Headset is still muted from a lid close; Insomnia restores it when it reconnects", kind: .warning),
+            StatusMenu.Item(title: "Stop waiting for USB Headset", kind: .stopWaitingForOutput("usb-headset")),
+            StatusMenu.Item(title: "\u{26A0} 70-8C-F2:output is still muted from a lid close; Insomnia restores it when it reconnects", kind: .warning),
+            StatusMenu.Item(title: "Stop waiting for 70-8C-F2:output", kind: .stopWaitingForOutput("70-8C-F2:output")),
+        ])
+        let menu = StatusMenu.menu(
+            items,
+            target: nil,
+            settings: #selector(NSObject.description),
+            quit: #selector(NSObject.description),
+            relaunchBrowser: #selector(NSObject.description),
+            stopWaitingForOutput: #selector(NSObject.description)
+        )
+        let entry = menu.items.first { $0.title == "Stop waiting for USB Headset" }
+        XCTAssertEqual(entry?.representedObject as? String, "usb-headset")
+        XCTAssertEqual(entry?.isEnabled, true)
     }
 
     /// The reasons relaunches stopped short, one line per browser, follow

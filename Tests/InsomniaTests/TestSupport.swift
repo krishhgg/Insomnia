@@ -297,17 +297,21 @@ final class FakeProcessControl: ProcessSignaling, @unchecked Sendable {
 /// fired inside `mute`. It starts with the built-in speakers only.
 final class FakeAudioControl: AudioControlling, @unchecked Sendable {
     static let speakers = "BuiltInSpeakerDevice"
+    static let speakersName = "MacBook Pro Speakers"
     private let lock = NSLock()
-    private var _devices: [String: (volume: Float, muted: Bool)]
+    private var _devices: [String: (name: String?, volume: Float, muted: Bool)]
     private var _defaultUID = FakeAudioControl.speakers
     private var _applied: [(volume: Float, muted: Bool, deviceUID: String?)] = []
     private var _mutes = 0
+    private var _devicesChanged: (@Sendable () -> Void)?
     var throwOnRead = false
     var throwOnApply = false
     var onMute: (@Sendable () -> Void)?
+    /// Runs after an apply landed, with the UID it was for.
+    var onApply: (@Sendable (String?) -> Void)?
 
     init(volume: Float = 0.6, muted: Bool = false) {
-        _devices = [Self.speakers: (volume, muted)]
+        _devices = [Self.speakers: (Self.speakersName, volume, muted)]
     }
 
     /// The default output device's volume and mute.
@@ -317,13 +321,16 @@ final class FakeAudioControl: AudioControlling, @unchecked Sendable {
     var mutes: Int { lock.withLock { _mutes } }
 
     /// A connected device's volume and mute; nil when it is not connected.
-    func device(_ uid: String) -> (volume: Float, muted: Bool)? { lock.withLock { _devices[uid] } }
+    func device(_ uid: String) -> (volume: Float, muted: Bool)? {
+        lock.withLock { _devices[uid].map { ($0.volume, $0.muted) } }
+    }
 
     /// Connects a device and makes it the default output, as plugging in
-    /// a headset does.
-    func connect(_ uid: String, volume: Float, muted: Bool = false) {
+    /// a headset does. Does not call the devices-changed handler; tests
+    /// that need it call `fireDevicesChanged()`.
+    func connect(_ uid: String, name: String? = nil, volume: Float, muted: Bool = false) {
         lock.withLock {
-            _devices[uid] = (volume, muted)
+            _devices[uid] = (name, volume, muted)
             _defaultUID = uid
         }
     }
@@ -336,11 +343,32 @@ final class FakeAudioControl: AudioControlling, @unchecked Sendable {
         }
     }
 
+    /// Sets a connected device's volume and mute by hand, as the user does
+    /// in Sound settings; not recorded as an apply.
+    func set(_ uid: String, volume: Float, muted: Bool) {
+        lock.withLock { _devices[uid]?.volume = volume; _devices[uid]?.muted = muted }
+    }
+
+    /// Calls the handler SessionManager registered, as CoreAudio does when
+    /// a device connects or disconnects.
+    func fireDevicesChanged() {
+        let handler = lock.withLock { _devicesChanged }
+        handler?()
+    }
+
     func read() throws -> AudioOutput {
         if throwOnRead { throw AudioControlError(what: "read", status: -1) }
         return lock.withLock {
-            let d = _devices[_defaultUID] ?? (0, false)
-            return AudioOutput(deviceUID: _defaultUID, volume: d.volume, muted: d.muted)
+            let d = _devices[_defaultUID] ?? (nil, 0, false)
+            return AudioOutput(deviceUID: _defaultUID, name: d.name, volume: d.volume, muted: d.muted)
+        }
+    }
+
+    func read(deviceUID: String) throws -> AudioOutput {
+        if throwOnRead { throw AudioControlError(what: "read", status: -1) }
+        return try lock.withLock {
+            guard let d = _devices[deviceUID] else { throw AudioDeviceMissingError(deviceUID: deviceUID) }
+            return AudioOutput(deviceUID: deviceUID, name: d.name, volume: d.volume, muted: d.muted)
         }
     }
 
@@ -349,9 +377,11 @@ final class FakeAudioControl: AudioControlling, @unchecked Sendable {
         try lock.withLock {
             let uid = deviceUID ?? _defaultUID
             guard _devices[uid] != nil else { throw AudioDeviceMissingError(deviceUID: uid) }
-            _devices[uid] = (volume, muted)
+            _devices[uid]?.volume = volume
+            _devices[uid]?.muted = muted
             _applied.append((volume, muted, deviceUID))
         }
+        onApply?(deviceUID)
     }
 
     func mute(deviceUID: String) throws {
@@ -361,6 +391,10 @@ final class FakeAudioControl: AudioControlling, @unchecked Sendable {
             _mutes += 1
         }
         onMute?()
+    }
+
+    func onDevicesChanged(_ handler: @escaping @Sendable () -> Void) throws {
+        lock.withLock { _devicesChanged = handler }
     }
 }
 

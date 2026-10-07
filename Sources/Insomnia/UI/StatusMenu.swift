@@ -18,6 +18,9 @@ enum StatusMenu {
             /// bundle id and name, so the item still names the same browser
             /// after a scan replaces the list.
             case relaunchBrowser(ThrottledBrowser)
+            /// Drop the saved volume of this output device (its UID): it is
+            /// not connected, and Insomnia stops waiting for it.
+            case stopWaitingForOutput(String)
         }
 
         let title: String
@@ -38,6 +41,9 @@ enum StatusMenu {
     /// `relaunchProblems` say why browser relaunches did not happen, one
     /// line per browser; they follow the browser lines, since the browsers
     /// they name may no longer be in them.
+    /// `outputsWaiting` are output devices still muted from a lid close
+    /// because they were not connected to get their volume back; each gets
+    /// a line and an item to stop waiting for it.
     static func items(
         sessionActive: Bool,
         sleepHeld: Bool,
@@ -48,6 +54,7 @@ enum StatusMenu {
         hotspotWarning: String? = nil,
         error: String?,
         foreignSleep: String? = nil,
+        outputsWaiting: [SavedAudioOutput] = [],
         lidSimulationBuild: Bool = false
     ) -> [Item] {
         var out: [Item] = []
@@ -86,6 +93,10 @@ enum StatusMenu {
         if let foreignSleep = present(foreignSleep) {
             out.append(Item(title: "\u{26A0} \(foreignSleep)", kind: .warning))
         }
+        for output in outputsWaiting {
+            out.append(Item(title: "\u{26A0} \(SessionManager.stillMutedLine(output))", kind: .warning))
+            out.append(Item(title: "Stop waiting for \(output.label)", kind: .stopWaitingForOutput(output.deviceUID)))
+        }
         if !out.isEmpty {
             out.append(Item(title: "", kind: .separator))
         }
@@ -108,7 +119,8 @@ enum StatusMenu {
         target: AnyObject?,
         settings: Selector,
         quit: Selector,
-        relaunchBrowser: Selector
+        relaunchBrowser: Selector,
+        stopWaitingForOutput: Selector
     ) -> NSMenu {
         let menu = NSMenu()
         menu.autoenablesItems = false
@@ -135,6 +147,10 @@ enum StatusMenu {
             case let .relaunchBrowser(browser):
                 let entry = action(title: item.title, selector: relaunchBrowser, key: "", target: target)
                 entry.representedObject = browser
+                menu.addItem(entry)
+            case let .stopWaitingForOutput(deviceUID):
+                let entry = action(title: item.title, selector: stopWaitingForOutput, key: "", target: target)
+                entry.representedObject = deviceUID
                 menu.addItem(entry)
             }
         }

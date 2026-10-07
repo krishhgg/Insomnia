@@ -56,6 +56,46 @@ final class StoreTests: XCTestCase {
         XCTAssertFalse(clean.contains("savedKeyboardBrightness"), clean)
     }
 
+    /// Output device entries are flat objects that backstop.sh and
+    /// uninstall.sh check with plutil: a string UID, an optional string
+    /// name, a number and a bool.
+    func testSavedAudioOutputsAreWrittenFlatForTheScripts() throws {
+        var st = RuntimeState()
+        st.savedAudioOutputs = [
+            SavedAudioOutput(deviceUID: "usb-headset", name: "USB Headset", volume: 0.25, muted: false),
+            SavedAudioOutput(deviceUID: "70-8C-F2:output", name: nil, volume: 1, muted: true),
+        ]
+        try store.saveState(st)
+        XCTAssertEqual(try store.loadState()?.savedAudioOutputs, st.savedAudioOutputs)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: home.paths.stateFile)) as? [String: Any])
+        let outputs = try XCTUnwrap(json["savedAudioOutputs"] as? [[String: Any]])
+        XCTAssertEqual(outputs.first?["deviceUID"] as? String, "usb-headset")
+        XCTAssertEqual(outputs.first?["name"] as? String, "USB Headset")
+        XCTAssertEqual(outputs.first?["volume"] as? Double, 0.25)
+        XCTAssertEqual(outputs.first?["muted"] as? Bool, false)
+        XCTAssertNil(outputs.last?["name"])
+        XCTAssertTrue(st.isDirty)
+        XCTAssertFalse(st.isDirty(leavingOutAudioOf: ["usb-headset", "70-8C-F2:output"]))
+    }
+
+    /// A journal from before output device entries has no key, and a null
+    /// counts as absent, as the scripts read it. Every entry the scripts
+    /// call malformed, the app's decoder refuses too, so neither side
+    /// undoes a journal the other cannot read.
+    func testSavedAudioOutputsDecodeLikeTheScriptsCheckThem() throws {
+        for legacy in [
+            #"{"sleepDisabledByUs":false,"savedOutputVolume":0.5,"savedMuted":false}"#,
+            #"{"sleepDisabledByUs":false,"savedOutputVolume":0.5,"savedMuted":false,"savedAudioOutputs":null}"#,
+        ] {
+            let st = try Store.makeDecoder().decode(RuntimeState.self, from: Data(legacy.utf8))
+            XCTAssertEqual(st.savedAudioOutputs, [], legacy)
+            XCTAssertEqual(st.savedOutputVolume, 0.5, legacy)
+        }
+        for json in RecoveryScriptTests.corruptOutputJournals {
+            XCTAssertThrowsError(try Store.makeDecoder().decode(RuntimeState.self, from: Data(json.utf8)), json)
+        }
+    }
+
     /// App Nap entries are flat objects with a string bundle id and an
     /// optional bool, which is what backstop.sh reads with plutil; an
     /// absent previous value stays absent in the JSON. They keep the
