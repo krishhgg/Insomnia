@@ -37,6 +37,9 @@ MV=/bin/mv
 RM=/bin/rm
 RMDIR=/bin/rmdir
 MKTEMP=/usr/bin/mktemp
+MKDIR=/bin/mkdir
+CP=/bin/cp
+CHMOD=/bin/chmod
 LOCK_TIMEOUT_SECONDS=10
 # The limit for one call to sudo, pgrep, launchctl or codesign made while this
 # run holds the recovery lock (and for the sudoers check before it); see
@@ -303,26 +306,26 @@ if "$PGREP" -x Insomnia >/dev/null 2>&1; then
     exit 1
   fi
 fi
-mkdir -p "$APP_DIR"
+"$MKDIR" -p "$APP_DIR"
 STAGE="$("$MKTEMP" -d "$APP_DIR/.Insomnia.app.staging.$$.XXXXXX")"
 NEW_APP="$STAGE/Insomnia.app"
 # The bundle is built here and reaches $APP whole, in one rename under the
 # recovery lock (step 5), so backstop.sh never sees this binary beside an
 # older Info.plist or the reverse (it runs the binary's --resume-frozen mode
 # only once Info.plist declares InsomniaResumeFrozenVersion).
-mkdir -p "$NEW_APP/Contents/MacOS"
-cp "$BIN" "$NEW_APP/Contents/MacOS/Insomnia"
-cp "$ROOT/Resources/Info.plist" "$NEW_APP/Contents/Info.plist"
-mkdir -p "$NEW_APP/Contents/Resources"
-cp "$ROOT/Resources/AppIcon.icns" "$NEW_APP/Contents/Resources/AppIcon.icns"
+"$MKDIR" -p "$NEW_APP/Contents/MacOS"
+"$CP" "$BIN" "$NEW_APP/Contents/MacOS/Insomnia"
+"$CP" "$ROOT/Resources/Info.plist" "$NEW_APP/Contents/Info.plist"
+"$MKDIR" -p "$NEW_APP/Contents/Resources"
+"$CP" "$ROOT/Resources/AppIcon.icns" "$NEW_APP/Contents/Resources/AppIcon.icns"
 # backstop.sh goes into the bundle before it is signed, so the signature's
 # resource seal covers it. The LaunchAgent below verifies the whole bundle
 # against the requirement read after signing and only then runs this copy;
 # an edited script fails that check. No executable is left in a writable
 # directory.
 BACKSTOP="$NEW_APP/Contents/Resources/backstop.sh"
-cp "$ROOT/scripts/backstop.sh" "$BACKSTOP"
-chmod 755 "$BACKSTOP"
+"$CP" "$ROOT/scripts/backstop.sh" "$BACKSTOP"
+"$CHMOD" 755 "$BACKSTOP"
 "$PLUTIL" -lint "$NEW_APP/Contents/Info.plist" >/dev/null
 "$CODESIGN" --force --sign - --deep "$NEW_APP"
 echo "signed $("$CODESIGN" -dv "$NEW_APP" 2>&1 | grep -i identifier || true)"
@@ -348,7 +351,7 @@ echo "LaunchAgent will require: $REQUIREMENT"
 
 # 4. Directories -------------------------------------------------------------
 step "Creating $APP_SUPPORT, $LOG_DIR and $LAUNCH_AGENTS"
-mkdir -p "$APP_SUPPORT" "$LOG_DIR" "$LAUNCH_AGENTS"
+"$MKDIR" -p "$APP_SUPPORT" "$LOG_DIR" "$LAUNCH_AGENTS"
 
 # 5. Recovery and LaunchAgent replacement are one transaction under the
 #    recovery lock (the same flock(2) file the app and backstop use), so a
@@ -687,7 +690,7 @@ fi
 step "Installing LaunchAgent $LABEL"
 CANDIDATE_DIR="$LAUNCH_AGENTS/.$LABEL.staging"
 CANDIDATE="$CANDIDATE_DIR/$LABEL.candidate-$$.plist"
-mkdir -p "$CANDIDATE_DIR"
+"$MKDIR" -p "$CANDIDATE_DIR"
 # Leftovers of earlier attempts, including an older build's candidates in
 # $LAUNCH_AGENTS itself (those make launchd's login load report an error).
 "$RM" -f "$CANDIDATE_DIR/$LABEL.candidate-"* "$LAUNCH_AGENTS/$LABEL.candidate-"*

@@ -3455,6 +3455,51 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(try fx.contents(of: tmp), [], "no scratch file is left")
     }
 
+    /// install.sh assembles the bundle in its staging directory, and makes
+    /// the folders it installs into, only through MKDIR, CP and CHMOD. The
+    /// run has `mkdir`, `cp` and `chmod` stubs first on PATH that log and
+    /// fail, and none of them runs; each staging step reaches the fixture's
+    /// logging fakes, and the installed bundle has every file in place.
+    func testInstallAssemblesTheBundleOnlyThroughItsFixedPathTools() throws {
+        try fx.prepareInstall()
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        fx.setMode("launchctl", "loaded")
+        let shadow = fx.root.appendingPathComponent("shadow", isDirectory: true)
+        try FileManager.default.createDirectory(at: shadow, withIntermediateDirectories: true)
+        for tool in ["mkdir", "cp", "chmod"] {
+            let stub = shadow.appendingPathComponent(tool)
+            try "#!/bin/bash\nprintf 'PATH \(tool) %s\\n' \"$*\" >> \"\(fx.callsLog.path)\"\nexit 1\n".write(to: stub, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: stub.path)
+        }
+
+        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester", "PATH": "\(shadow.path):/usr/bin:/bin:/usr/sbin:/sbin"])
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        let calls = fx.calls()
+        XCTAssertEqual(calls.filter { $0.hasPrefix("PATH ") }, [], "a tool from PATH ran")
+        let staging = fx.appsDir.path + "/.Insomnia.app.staging."
+        let macOS = try XCTUnwrap(calls.first { $0.hasPrefix("mkdir -p \(staging)") && $0.hasSuffix("/Insomnia.app/Contents/MacOS") }, "\(calls)")
+        let newApp = String(macOS.dropFirst("mkdir -p ".count).dropLast("/Contents/MacOS".count))
+        let checkout = fx.repoScripts.deletingLastPathComponent().path
+        for call in [
+            "mkdir -p \(fx.appsDir.path)",
+            "cp \(fx.root.path)/binroot/Insomnia \(newApp)/Contents/MacOS/Insomnia",
+            "cp \(checkout)/Resources/Info.plist \(newApp)/Contents/Info.plist",
+            "mkdir -p \(newApp)/Contents/Resources",
+            "cp \(checkout)/Resources/AppIcon.icns \(newApp)/Contents/Resources/AppIcon.icns",
+            "cp \(checkout)/scripts/backstop.sh \(newApp)/Contents/Resources/backstop.sh",
+            "mkdir -p \(fx.home.path) \(fx.home.path)/Logs \(fx.plist.deletingLastPathComponent().path)",
+            "mkdir -p \(fx.plist.deletingLastPathComponent().path)/.com.insomnia.backstop.staging",
+        ] {
+            XCTAssertTrue(calls.contains(call), "\(call) not in \(calls)")
+        }
+        XCTAssertTrue(fx.chmodCalls().contains("chmod 755 \(newApp)/Contents/Resources/backstop.sh"), "\(fx.chmodCalls())")
+        XCTAssertEqual(try fx.installedBinaryFirstLine(), "#!/bin/bash", "the built binary is installed")
+        XCTAssertTrue(fx.exists(fx.app.appendingPathComponent("Contents/Info.plist")))
+        XCTAssertTrue(fx.exists(fx.app.appendingPathComponent("Contents/Resources/AppIcon.icns")))
+        XCTAssertEqual(try fx.mode(fx.installedBackstop) & 0o777, 0o755, "the sealed backstop.sh is executable")
+    }
+
     /// The new agent loads but its plist cannot be moved into place (the
     /// LaunchAgents directory is read-only here). The next login would load
     /// the old plist, which pins the previous build, so the new job is
@@ -4599,6 +4644,9 @@ private final class ScriptFixture {
             "RM": bin.appendingPathComponent("rm").path,
             "RMDIR": bin.appendingPathComponent("rmdir").path,
             "MKTEMP": bin.appendingPathComponent("mktemp").path,
+            "MKDIR": bin.appendingPathComponent("mkdir").path,
+            "CP": bin.appendingPathComponent("cp").path,
+            "CHMOD": bin.appendingPathComponent("chmod").path,
             "LOCK_TIMEOUT_SECONDS": "1",
             "CALL_TIMEOUT_SECONDS": "5",
         ])
@@ -4722,7 +4770,7 @@ private final class ScriptFixture {
             if [[ "$mode" == auth-fail ]]; then echo "sudo: 3 incorrect password attempts" >&2; exit 1; fi
             src=""; dst=""
             for a in "$@"; do src="$dst"; dst="$a"; done
-            case "$dst" in "\(r)"/*) mkdir -p "$(dirname "$dst")"; cp "$src" "$dst"; exit 0 ;; esac
+            case "$dst" in "\(r)"/*) /bin/mkdir -p "$(dirname "$dst")"; /bin/cp "$src" "$dst"; exit 0 ;; esac
             printf 'sudo REFUSED %s\\n' "$*" >> "\(calls)"; exit 1 ;;
           rm|test)
             for a in "$@"; do
@@ -4761,11 +4809,12 @@ private final class ScriptFixture {
         fi
         exec /bin/mv "$@"
         """)
-        // rm, rmdir, mktemp: install.sh's RM, RMDIR and MKTEMP. Each call is
-        // logged and then made by the real tool, so a test can tell a file
-        // removed or created through the fixed-path variable from one
-        // removed or created by a bare name.
-        for (tool, real) in [("rm", "/bin/rm"), ("rmdir", "/bin/rmdir"), ("mktemp", "/usr/bin/mktemp")] {
+        // rm, rmdir, mktemp, mkdir, cp: install.sh's RM, RMDIR, MKTEMP, MKDIR
+        // and CP. Each call is logged and then made by the real tool, so a
+        // test can tell a file removed, created or copied through the
+        // fixed-path variable from one handled by a bare name. (Its CHMOD is
+        // the chmod fake below.)
+        for (tool, real) in [("rm", "/bin/rm"), ("rmdir", "/bin/rmdir"), ("mktemp", "/usr/bin/mktemp"), ("mkdir", "/bin/mkdir"), ("cp", "/bin/cp")] {
             try writeFake(tool, """
             printf '\(tool)%s\\n' "${*:+ $*}" >> "\(calls)"
             exec \(real) "$@"
