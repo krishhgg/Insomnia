@@ -669,14 +669,14 @@ final class StillRunningCommandTests: XCTestCase {
         let actions = makeLidActions(m)
         await m.start(duration: 3600)
         await actions.onClose()
-        XCTAssertEqual(try h.store.loadState()?.savedOutputVolume, 0.6)
+        XCTAssertEqual(try h.store.loadState()?.savedAudioOutputs.first?.volume, 0.6)
         h.guardFake.stillRunning = ["lowpowermode 1"]
         _ = await m.setLowPower(true)
 
         await actions.onOpen()
 
         XCTAssertTrue(m.lidEventDeferred)
-        XCTAssertEqual(try h.store.loadState()?.savedOutputVolume, 0.6, "lid actions undone beside the live pmset")
+        XCTAssertEqual(try h.store.loadState()?.savedAudioOutputs.first?.volume, 0.6, "lid actions undone beside the live pmset")
         XCTAssertTrue(h.audio.applied.isEmpty)
 
         let replays = Locked<[Bool]>([])
@@ -708,7 +708,7 @@ final class StillRunningCommandTests: XCTestCase {
 
         XCTAssertTrue(m.lidEventDeferred)
         XCTAssertEqual(h.audio.mutes, 0, "muted beside the live pmset")
-        XCTAssertNil(try h.store.loadState()?.savedOutputVolume)
+        XCTAssertEqual(try h.store.loadState()?.savedAudioOutputs, [])
 
         let replays = Locked<[Bool]>([])
         m.resyncAfterCommand = { replay in
@@ -719,8 +719,40 @@ final class StillRunningCommandTests: XCTestCase {
         h.guardFake.exitStuckCommands()
         await waitUntil("refused lid close never replayed") { self.h.audio.mutes == 1 }
         XCTAssertEqual(replays.value, [true])
-        XCTAssertEqual(try h.store.loadState()?.savedOutputVolume, 0.6)
+        XCTAssertEqual(try h.store.loadState()?.savedAudioOutputs.first?.volume, 0.6)
         XCTAssertFalse(m.lidEventDeferred)
+    }
+
+    /// A reconnect refused while the command runs is not something the
+    /// command's exit replays, and CoreAudio sends no second event: the
+    /// in-process audio retry gives the headset its volume back once the
+    /// command has exited.
+    func testAReconnectRefusedWhileTheCommandRunsIsRetriedAfterItExits() async throws {
+        let headset = SavedAudioOutput(deviceUID: "usb-headset", name: "USB Headset", volume: 0.3, muted: false, saveID: "save-1")
+        var earlier = RuntimeState()
+        earlier.savedAudioOutputs = [headset]
+        try h.store.saveState(earlier)
+        let m = h.makeManager(retryDelay: 0.2)
+        await m.reconcile()
+        XCTAssertEqual(m.outputsWaitingForRestore, [headset])
+        await m.start(duration: 3600)
+        h.guardFake.stillRunning = ["lowpowermode 1"]
+        _ = await m.setLowPower(true)
+        h.audio.connect("usb-headset", name: "USB Headset", volume: 0.3, muted: true)
+
+        await m.outputDevicesChanged()
+
+        XCTAssertTrue(h.audio.applied.isEmpty, "restored beside the live pmset")
+        XCTAssertEqual(try h.store.loadState()?.savedAudioOutputs, [headset])
+
+        h.guardFake.stillRunning = []
+        h.guardFake.exitStuckCommands()
+        await waitUntil("refused reconnect never retried") {
+            (try? self.h.store.loadState())?.savedAudioOutputs.isEmpty == true
+        }
+        XCTAssertEqual(h.audio.device("usb-headset")?.volume, 0.3)
+        XCTAssertEqual(h.audio.device("usb-headset")?.muted, false)
+        XCTAssertNotNil(m.session)
     }
 
     /// With an end pending, the end runs first and alone: it undoes every

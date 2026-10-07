@@ -17,14 +17,20 @@ struct Config: Codable, Equatable, Sendable {
     /// Also SIGSTOP every other Dock app that is not an agent app, an Apple
     /// app, Docker Desktop or built-in protected (`FreezePlanner.builtInProtected`).
     /// Off by default (and for a config.json without the key): a fresh
-    /// install freezes only the freeze list until the user opts in.
+    /// install freezes only the freeze list until the user opts in. A
+    /// config.json an earlier build saved with it on gets it turned off
+    /// once (`applyLidCloseDefaults`).
     var freezeAllApps: Bool = false
     /// SIGSTOP Docker Desktop on lid close when `docker ps` finds no running
     /// container, checked once more right before the signal. Off by default
     /// (and for a config.json without the key): a container that starts
     /// between the last check and the signal is frozen with Desktop.
     var dockerRule: Bool = false
-    var muteOnLidClose: Bool = false
+    /// Mute the output on lid close and restore the volume on open. On by
+    /// default: with sleep disabled, sound otherwise keeps playing from the
+    /// closed laptop. A config.json an earlier build saved with it off gets
+    /// it turned on once (`applyLidCloseDefaults`).
+    var muteOnLidClose: Bool = true
     /// Save the display brightness and keyboard backlight, set both to zero
     /// on lid close and restore them on lid open. With sleep disabled macOS
     /// no longer turns the panel off itself.
@@ -74,6 +80,18 @@ struct Config: Codable, Equatable, Sendable {
     /// the app respects. nil in a config written before this field; the
     /// first launch with the flag on registers once and records it.
     var launchAtLoginInstall: String?
+
+    // One-time updates
+    /// Whether this config has had the lid-close update
+    /// (`applyLidCloseDefaults`). True for a config this build creates;
+    /// false for a config.json without the key, which an earlier build
+    /// saved. Once true it stays true, so a user who turns either setting
+    /// back is never overridden again.
+    var lidCloseDefaultsApplied: Bool = true
+    /// What that update changed, shown in Settings until the user dismisses
+    /// it. nil on a fresh install, when the update changed nothing, and
+    /// after dismissal.
+    var lidCloseDefaultsNotice: LidCloseDefaultsChange?
 
     static let defaultPresets: [TimeInterval] = [
         30 * 60,
@@ -129,7 +147,11 @@ struct Config: Codable, Equatable, Sendable {
         freezeList = try c.decodeIfPresent([String].self, forKey: .freezeList) ?? d.freezeList
         freezeAllApps = try c.decodeIfPresent(Bool.self, forKey: .freezeAllApps) ?? d.freezeAllApps
         dockerRule = try c.decodeIfPresent(Bool.self, forKey: .dockerRule) ?? d.dockerRule
-        muteOnLidClose = try c.decodeIfPresent(Bool.self, forKey: .muteOnLidClose) ?? d.muteOnLidClose
+        lidCloseDefaultsApplied = try c.decodeIfPresent(Bool.self, forKey: .lidCloseDefaultsApplied) ?? false
+        lidCloseDefaultsNotice = try c.decodeIfPresent(LidCloseDefaultsChange.self, forKey: .lidCloseDefaultsNotice)
+        // Earlier builds read a missing key as off, so the update below
+        // sees what such a config.json actually did.
+        muteOnLidClose = try c.decodeIfPresent(Bool.self, forKey: .muteOnLidClose) ?? (lidCloseDefaultsApplied && d.muteOnLidClose)
         darkenDisplayOnLidClose = try c.decodeIfPresent(Bool.self, forKey: .darkenDisplayOnLidClose) ?? d.darkenDisplayOnLidClose
         lowPowerOnLidClose = try c.decodeIfPresent(Bool.self, forKey: .lowPowerOnLidClose) ?? d.lowPowerOnLidClose
         agentList = try c.decodeIfPresent([String].self, forKey: .agentList) ?? d.agentList
@@ -143,6 +165,57 @@ struct Config: Codable, Equatable, Sendable {
         tmuxNudgePressesEnter = try c.decodeIfPresent(Bool.self, forKey: .tmuxNudgePressesEnter) ?? d.tmuxNudgePressesEnter
         launchAtLogin = try c.decodeIfPresent(Bool.self, forKey: .launchAtLogin) ?? d.launchAtLogin
         launchAtLoginInstall = try c.decodeIfPresent(String.self, forKey: .launchAtLoginInstall)
+    }
+}
+
+// MARK: Lid-close update
+
+extension Config {
+    /// The one-time lid-close update for a config.json an earlier build
+    /// saved: freeze-all off and mute on lid close on, the defaults since
+    /// freeze-all stopped a meeting notetaker and sound kept playing with
+    /// the lid closed. Marks the config either way, so it runs once.
+    /// Returns what it changed and records that for Settings; nil when the
+    /// config already had the update or both settings already matched.
+    mutating func applyLidCloseDefaults() -> LidCloseDefaultsChange? {
+        guard !lidCloseDefaultsApplied else { return nil }
+        lidCloseDefaultsApplied = true
+        let change = LidCloseDefaultsChange(turnedOffFreezeAll: freezeAllApps, turnedOnMute: !muteOnLidClose)
+        freezeAllApps = false
+        muteOnLidClose = true
+        guard change.turnedOffFreezeAll || change.turnedOnMute else { return nil }
+        lidCloseDefaultsNotice = change
+        return change
+    }
+}
+
+/// What `Config.applyLidCloseDefaults` changed. The notification and the
+/// line in Settings name each change and where to change it back.
+struct LidCloseDefaultsChange: Codable, Equatable, Sendable {
+    var turnedOffFreezeAll: Bool
+    var turnedOnMute: Bool
+
+    static let title = "Lid-close settings changed"
+
+    /// The changes as one clause, for example: "Mute audio on lid close"
+    /// is now on.
+    var changes: String {
+        var parts: [String] = []
+        if turnedOffFreezeAll { parts.append("\"Freeze every other app while the lid is closed\" is now off") }
+        if turnedOnMute { parts.append("\"Mute audio on lid close\" is now on") }
+        return parts.joined(separator: " and ")
+    }
+
+    private var both: Bool { turnedOffFreezeAll && turnedOnMute }
+
+    var notificationBody: String {
+        "This update changed \(both ? "two lid-close settings" : "a lid-close setting"): \(changes). "
+            + "To change \(both ? "them" : "it") back, choose Settings\u{2026} from the Insomnia menu bar icon and look under Lid-close actions."
+    }
+
+    var settingsLine: String {
+        "This update changed \(both ? "two lid-close settings" : "a lid-close setting"): \(changes). "
+            + "\(both ? "Both toggles are" : "The toggle is") below."
     }
 }
 

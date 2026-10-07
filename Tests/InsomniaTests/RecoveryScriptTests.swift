@@ -220,6 +220,53 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(fx.log().contains("journal cleared"), fx.log())
     }
 
+    /// An output device muted on lid close can wait days to be connected
+    /// again. Its entry stays byte for byte for the app, which shows it in
+    /// the menu; on its own it does not make the run fail, so the agent
+    /// does not log an error every minute, and an expired session goes.
+    func testSavedOutputDeviceAudioIsKeptAndAloneLeavesTheJournalClean() throws {
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        let json = #"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"savedAudioOutputs":[{"deviceUID":"usb-headset","name":"USB Headset","volume":0.3,"muted":false,"saveID":"5F2C9A10-7B3E-4D21-A8C4-0E6F1B2D3C4A"},{"deviceUID":"BuiltInSpeakerDevice","name":null,"volume":1,"muted":true,"saveID":null}]}"#
+        try fx.writeState(json)
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 0, r.stderr + fx.log())
+        XCTAssertEqual(fx.calls(), [])
+        XCTAssertFalse(fx.exists(fx.session))
+        XCTAssertEqual(try String(contentsOf: fx.state, encoding: .utf8), json)
+        XCTAssertTrue(fx.log().contains("saved audio for 2 output device(s), kept for the app"), fx.log())
+        XCTAssertFalse(fx.log().contains("[error]"), fx.log())
+
+        // With no session to remove, a later run says nothing.
+        let before = fx.log()
+        XCTAssertEqual(try fx.run(fx.backstop).status, 0)
+        XCTAssertEqual(fx.log(), before)
+    }
+
+    /// Undoing the rest of the journal keeps every output device entry as
+    /// it was.
+    func testSavedOutputDeviceAudioSurvivesTheUndoOfSleep() throws {
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"savedAudioOutputs":[{"deviceUID":"usb-headset","name":"USB Headset","volume":0.3,"muted":false,"saveID":"5F2C9A10-7B3E-4D21-A8C4-0E6F1B2D3C4A"}]}"#)
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 0, r.stderr + fx.log())
+        XCTAssertTrue(fx.calls().first?.hasSuffix("pmset -a disablesleep 0") ?? false, fx.calls().description)
+        let s = try fx.stateJSON()
+        XCTAssertEqual(s["sleepDisabledByUs"] as? Bool, false)
+        let outputs = try XCTUnwrap(s["savedAudioOutputs"] as? [[String: Any]])
+        XCTAssertEqual(outputs.count, 1)
+        XCTAssertEqual(outputs.first?["deviceUID"] as? String, "usb-headset")
+        XCTAssertEqual(outputs.first?["name"] as? String, "USB Headset")
+        XCTAssertEqual(outputs.first?["volume"] as? Double, 0.3)
+        XCTAssertEqual(outputs.first?["muted"] as? Bool, false)
+        XCTAssertEqual(outputs.first?["saveID"] as? String, "5F2C9A10-7B3E-4D21-A8C4-0E6F1B2D3C4A")
+        XCTAssertTrue(fx.log().contains("journal cleared apart from saved audio for 1 output device(s)"), fx.log())
+        XCTAssertFalse(fx.exists(fx.session))
+    }
+
     /// Display brightness and keyboard backlight saved on lid close are
     /// restored only by the app; the backstop keeps both keys, still undoes
     /// the rest, and says so.
@@ -1462,6 +1509,27 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(r.stderr.contains("open Insomnia.app"), r.stderr)
     }
 
+    /// The backstop leaves an output device entry alone and exits 0, but
+    /// removing Insomnia would leave that device muted for good: uninstall
+    /// names the device and says how to get it back or let it go.
+    func testUninstallAbortsOnAnOutputDeviceStillMutedAndNamesIt() throws {
+        try fx.installMachinery()
+        let json = #"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"savedAudioOutputs":[{"deviceUID":"usb-headset","name":"USB Headset","volume":0.3,"muted":false},{"deviceUID":"70-8C-F2:output","volume":0.5,"muted":false}]}"#
+        try fx.writeState(json)
+
+        let r = try fx.run(fx.uninstall, ["--purge"])
+
+        XCTAssertNotEqual(r.status, 0)
+        XCTAssertTrue(fx.exists(fx.plist))
+        XCTAssertTrue(fx.exists(fx.sudoers))
+        XCTAssertTrue(fx.exists(fx.app))
+        XCTAssertTrue(fx.exists(fx.home), "--purge must not run before recovery is verified")
+        XCTAssertEqual(try String(contentsOf: fx.state, encoding: .utf8), json)
+        XCTAssertTrue(r.stderr.contains("USB Headset is still muted from a lid close"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("70-8C-F2:output is still muted from a lid close"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("Stop waiting for <device>"), r.stderr)
+    }
+
     func testUninstallAbortsOnSavedDisplayBrightnessAndExplainsReopeningTheApp() throws {
         try fx.installMachinery()
         try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"savedDisplayBrightness":0.6}"#)
@@ -2399,7 +2467,7 @@ final class RecoveryScriptTests: XCTestCase {
             #"{"sleepDisabledByUs":false,"appNapOverrides":["com.google.Chrome"]}"#,
             #"{"sleepDisabledByUs":false,"appNapOverrides":[{"previous":true}]}"#,
             #"{"sleepDisabledByUs":false,"appNapOverrides":[{"bundleId":"com.google.Chrome","previous":"yes"}]}"#,
-        ]
+        ] + Self.corruptOutputJournals
         for json in corrupt {
             let f = try ScriptFixture()
             defer { f.destroy() }
@@ -2416,10 +2484,25 @@ final class RecoveryScriptTests: XCTestCase {
         }
     }
 
+    /// Output device entries the app's decoder refuses too (StoreTests
+    /// checks that side).
+    static let corruptOutputJournals = [
+        #"{"sleepDisabledByUs":false,"savedAudioOutputs":"usb-headset"}"#,
+        #"{"sleepDisabledByUs":false,"savedAudioOutputs":[null]}"#,
+        #"{"sleepDisabledByUs":false,"savedAudioOutputs":[{"volume":0.3,"muted":false}]}"#,
+        #"{"sleepDisabledByUs":false,"savedAudioOutputs":[{"deviceUID":7,"volume":0.3,"muted":false}]}"#,
+        #"{"sleepDisabledByUs":false,"savedAudioOutputs":[{"deviceUID":"usb-headset","volume":"loud","muted":false}]}"#,
+        #"{"sleepDisabledByUs":false,"savedAudioOutputs":[{"deviceUID":"usb-headset","muted":false}]}"#,
+        #"{"sleepDisabledByUs":false,"savedAudioOutputs":[{"deviceUID":"usb-headset","volume":0.3,"muted":1}]}"#,
+        #"{"sleepDisabledByUs":false,"savedAudioOutputs":[{"deviceUID":"usb-headset","volume":0.3}]}"#,
+        #"{"sleepDisabledByUs":false,"savedAudioOutputs":[{"deviceUID":"usb-headset","name":3,"volume":0.3,"muted":false}]}"#,
+        #"{"sleepDisabledByUs":false,"savedAudioOutputs":[{"deviceUID":"usb-headset","volume":0.3,"muted":false,"saveID":3}]}"#,
+    ]
+
     func testNullOptionalFieldsCountAsAbsent() throws {
         // Swift's decodeIfPresent treats null as nil; the shell must agree.
         try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
-        let json = #"{"sleepDisabledByUs":false,"lowPowerSetByUs":null,"frozenProcesses":[],"dockerFrozen":false,"savedOutputVolume":null,"savedMuted":null,"savedDisplayBrightness":null,"savedKeyboardBrightness":null,"frozenPids":null,"appNapOverrides":null}"#
+        let json = #"{"sleepDisabledByUs":false,"lowPowerSetByUs":null,"frozenProcesses":[],"dockerFrozen":false,"savedOutputVolume":null,"savedMuted":null,"savedDisplayBrightness":null,"savedKeyboardBrightness":null,"frozenPids":null,"appNapOverrides":null,"savedAudioOutputs":null}"#
         try fx.writeState(json)
 
         let r = try fx.run(fx.backstop)
@@ -2455,7 +2538,7 @@ final class RecoveryScriptTests: XCTestCase {
             #"{"sleepDisabledByUs":false,"frozenProcesses":"garbage"}"#,
             #"{"sleepDisabledByUs":false,"savedDisplayBrightness":"bright"}"#,
             #"{"sleepDisabledByUs":false,"appNapOverrides":[{"previous":true}]}"#,
-        ] {
+        ] + Self.corruptOutputJournals {
             let f = try ScriptFixture()
             defer { f.destroy() }
             try f.installMachinery()

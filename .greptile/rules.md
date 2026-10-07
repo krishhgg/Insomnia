@@ -33,9 +33,12 @@ the binary only when the bundle's `Info.plist` declares
 `InsomniaResumeFrozenVersion` equal to its `RESUME_FROZEN_VERSION`, and the
 binary keeps the recovery lock on fd 9 until it ends itself after
 `<seconds>`. It keeps, and never
-restores, `savedOutputVolume`, `savedMuted`, `savedDisplayBrightness`,
-`savedKeyboardBrightness` and `displayRestoredUnderLowPower`: CoreAudio and
-the private brightness frameworks need the app. Legacy `frozenPids` entries
+restores, `savedOutputVolume`, `savedMuted`, `savedAudioOutputs`,
+`savedDisplayBrightness`, `savedKeyboardBrightness` and
+`displayRestoredUnderLowPower`: CoreAudio and the private brightness
+frameworks need the app. `savedAudioOutputs` entries alone leave the
+journal clean for the backstop (an entry can wait days for its device), but
+uninstall stops on them. Legacy `frozenPids` entries
 are never signaled or cleared by the shell. A flag is cleared only after
 its undo succeeded; a journal that is unreadable or has a known key of the
 wrong type is left untouched and the run exits 1.

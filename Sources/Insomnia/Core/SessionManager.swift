@@ -30,7 +30,10 @@ enum EndReason: String, Sendable {
 /// What `end` achieved. Callers that are about to quit need to know whether
 /// leaving now abandons anything.
 enum EndOutcome: Sendable, Equatable {
-    /// Journal clean, machine restored.
+    /// Journal clean, machine restored. The one entry that may remain is
+    /// the saved volume of an output device that was not connected: it
+    /// waits for the device (`SessionManager.outputDevicesChanged`, or a
+    /// later launch) and the notification and the menu name it.
     case restored
     /// Some entries could not be undone and stay journaled. `agentArmed`
     /// says whether the polling agent is confirmed loaded to retry them.
@@ -57,7 +60,9 @@ enum EndOutcome: Sendable, Equatable {
     case privilegedCommandRunning(pid: Int32)
 }
 
-/// Why a lifecycle transaction did not run at all.
+/// Why a lifecycle transaction did not run at all. A busy lock and an
+/// unreadable journal carry the line the refusal put in the menu
+/// (`lastError`).
 enum TransactionRefusal: Error, Sendable {
     case lockBusy(String)
     case journalUnreadable(String)
@@ -109,6 +114,25 @@ final class SessionManager {
     /// command's exit removes it without touching a newer failure: the task
     /// holding the lock for the command clears it then (`holdLock`).
     private(set) var commandWarning: String?
+    /// UIDs of output devices whose saved volume could not be restored
+    /// because they were not connected at the last try. Each try decides
+    /// again: a device that came back and then failed to restore is no
+    /// longer in it. In memory: each launch finds them again at its first
+    /// try.
+    private(set) var audioDevicesNotConnected: Set<String> = []
+    /// The menu line (`lastError`) the restore of the saved output volumes
+    /// last put up: a device change or audio retry that was refused, or a
+    /// restore that failed. A later restore that leaves nothing to retry
+    /// takes it down, unless a newer failure has replaced it since
+    /// (`clearAudioWarning`).
+    @ObservationIgnored private var audioWarning: String?
+
+    /// Output devices lid close muted that are still waiting to get their
+    /// volume and mute back because they were not connected. The menu
+    /// names each one, with a way to stop waiting.
+    var outputsWaitingForRestore: [SavedAudioOutput] {
+        state.savedAudioOutputs.filter { audioDevicesNotConnected.contains($0.deviceUID) }
+    }
 
     var isActive: Bool { session != nil }
 
@@ -180,6 +204,13 @@ final class SessionManager {
     /// What the pending re-assert will write, per device, so a new
     /// schedule for one device does not drop the other's second write.
     private var pendingReassert: (display: Float?, keyboard: Float?) = (nil, nil)
+    /// The pending in-process retry of the saved output volumes
+    /// (`scheduleAudioRetry`). One at a time.
+    @ObservationIgnored private var audioRetryTask: Task<Void, Never>?
+    /// Retries left before `scheduleAudioRetry` stops, until the next
+    /// device change, lid open, end or launch tries again.
+    @ObservationIgnored private var audioRetriesLeft = SessionManager.audioRetryLimit
+    static let audioRetryLimit = 10
     /// Called just before Insomnia takes Low Power Mode over, before the
     /// ownership is journaled: `AppServices` samples the display brightness
     /// then, so the value journaled at a later lid close is the user's,
@@ -281,6 +312,11 @@ final class SessionManager {
     /// is refused and the end is retried. Cleared by the next reconcile, and
     /// by a start, whose own session.json replaces it.
     @ObservationIgnored private var keptSessionFile: KeptSessionFile?
+    /// What the one-time lid-close update changed at init, posted by the
+    /// launch reconcile (`announceLidCloseUpdate`). Settings shows the same
+    /// change (`Config.lidCloseDefaultsNotice`) for a user who has
+    /// notifications turned off.
+    @ObservationIgnored private var pendingLidCloseNotice: LidCloseDefaultsChange?
 
     private enum KeptSessionFile {
         /// Opening or reading it failed, or it is not a regular file.
@@ -342,20 +378,39 @@ final class SessionManager {
         if var c = (try? store.loadConfig()) ?? nil {
             // Settings keeps the end floor below the Low Power Mode floor; a
             // hand-edited config.json may not. Fix it here and write it back.
-            if let change = c.normalizeFloors() {
+            var corrections = c.normalizeFloors().map { [$0] } ?? []
+            // Once for a config.json an earlier build saved: written back
+            // with the mark, so a setting the user turns back stays back.
+            let earlierBuild = !c.lidCloseDefaultsApplied
+            let lidClose = c.applyLidCloseDefaults()
+            if earlierBuild {
+                corrections.append("lid-close update: " + (lidClose.map(\.changes) ?? "nothing to change"))
+            }
+            if !corrections.isEmpty {
+                let change = corrections.joined(separator: "; ")
                 do {
                     try store.saveConfig(c)
                     Log.info("config.json: \(change); saved")
                 } catch {
-                    // The corrected floors apply in memory either way; the
-                    // file stays as it was and is corrected again next launch.
+                    // The corrections apply in memory either way; the file
+                    // stays as it was and is corrected again next launch.
                     Log.error("config.json: \(change); could not save the correction: \(error.localizedDescription)")
                 }
             }
             self.config = c
+            self.pendingLidCloseNotice = lidClose
         } else {
+            // A fresh install: the defaults already are the update, and
+            // `Config()` carries its mark, so there is nothing to announce.
             self.config = Config()
             try? store.saveConfig(self.config)
+        }
+        do {
+            try audio.onDevicesChanged { [weak self] in
+                Task { @MainActor in await self?.outputDevicesChanged() }
+            }
+        } catch {
+            Log.error("\(error.localizedDescription); an output device still muted from a lid close gets its volume back at the next lid open, session end or launch instead of when it reconnects")
         }
     }
 
@@ -448,8 +503,9 @@ final class SessionManager {
             do {
                 handle = try await self.recoveryLock.acquire(timeout: self.recoveryLockTimeout)
             } catch {
-                self.fail("\(what) skipped, nothing changed: \(error.localizedDescription)\(self.recordedLockHolder(error))")
-                return .failure(.lockBusy(error.localizedDescription))
+                let line = "\(what) skipped, nothing changed: \(error.localizedDescription)\(self.recordedLockHolder(error))"
+                self.fail(line)
+                return .failure(.lockBusy(line))
             }
             var lockHandedOver = false
             defer { if !lockHandedOver { handle.release() } }
@@ -471,8 +527,7 @@ final class SessionManager {
             do {
                 try self.loadJournal()
             } catch {
-                self.refuseForUnreadableJournal(what, error)
-                return .failure(.journalUnreadable(error.localizedDescription))
+                return .failure(.journalUnreadable(self.refuseForUnreadableJournal(what, error)))
             }
             self.writeOwedEdits()
             let before = self.unfinishedCommand
@@ -503,14 +558,17 @@ final class SessionManager {
         state = try store.loadState() ?? .clean
     }
 
-    private func refuseForUnreadableJournal(_ what: String, _ error: Error) {
+    /// Returns the line put in the menu.
+    private func refuseForUnreadableJournal(_ what: String, _ error: Error) -> String {
         let message = Self.unreadableJournalMessage(error)
-        fail("\(what) refused, nothing changed: \(message)")
+        let line = "\(what) refused, nothing changed: \(message)"
+        fail(line)
         let detail = error.localizedDescription
         if announcedCorruption != detail {
             announcedCorruption = detail
             notifier.post(title: Self.journalTitle, body: message)
         }
+        return line
     }
 
     private static func unreadableJournalMessage(_ error: Error) -> String {
@@ -1171,10 +1229,16 @@ final class SessionManager {
             return .privilegedCommandRunning(pid: stuck.pid)
         }
 
-        if state.isDirty || retainedBecause != nil {
+        // An output device that is not connected does not hold up the end:
+        // its saved volume stays journaled for when it reconnects, and the
+        // notification and the menu name it.
+        let waiting = outputsWaitingForRestore
+        let waitingUIDs = Set(waiting.map(\.deviceUID))
+        let dirty = state.isDirty(leavingOutAudioOf: waitingUIDs)
+        if dirty || retainedBecause != nil {
             // The journal is the retry list. Make sure something will read it.
             var armed = true
-            if state.isDirty {
+            if dirty {
                 do {
                     try await backstop.arm()
                 } catch {
@@ -1185,7 +1249,7 @@ final class SessionManager {
             if let retainedBecause {
                 // The agent enforces deadlines, it does not remove a live
                 // session file; only this process can, so it stays to retry.
-                let journalNote = state.isDirty ? " Some changes are also still journaled." : ""
+                let journalNote = dirty ? " Some changes are also still journaled." : ""
                 notifier.post(
                     title: Self.incompleteTitle,
                     body: "\(retainedBecause)\(journalNote) Insomnia retries in \(Int(recoveryRetryDelay)) s; do not quit until it is gone."
@@ -1194,7 +1258,23 @@ final class SessionManager {
                 return .sessionRetained
             }
             let detail = lastError ?? "some changes could not be undone"
-            let retry = armed ? "The recovery agent retries every minute." : "Insomnia retries in \(Int(recoveryRetryDelay)) s; do not quit until it is restored."
+            let retry: String
+            if armed {
+                // The agent keeps saved output volumes, display brightness
+                // and keyboard backlight but cannot restore them (CoreAudio,
+                // private frameworks). This process retries the volumes on
+                // its own; the brightness waits for a later end or launch.
+                let owesAudio = state.savedAudioOutputs.contains { !waitingUIDs.contains($0.deviceUID) }
+                    || state.savedOutputVolume != nil || state.savedMuted != nil
+                let owesBrightness = state.savedDisplayBrightness != nil || state.savedKeyboardBrightness != nil
+                var sentences: [String] = []
+                if state.isDirtyApartFromAppOnlyEntries { sentences.append("The recovery agent retries every minute.") }
+                if owesAudio { sentences.append(Self.audioRetrySentence(recoveryRetryDelay)) }
+                if owesBrightness { sentences.append(Self.brightnessRetrySentence) }
+                retry = sentences.joined(separator: " ")
+            } else {
+                retry = "Insomnia retries in \(Int(recoveryRetryDelay)) s; do not quit until it is restored."
+            }
             notifier.post(title: Self.incompleteTitle, body: "\(detail). \(retry)")
             // Reconcile and a failed start reach here without `end()`; the
             // retry is scheduled here so they are covered too (rescheduling
@@ -1202,7 +1282,7 @@ final class SessionManager {
             if !armed { scheduleEndRetry(reason) }
             return .incomplete(agentArmed: armed)
         }
-        notifier.post(title: Self.endTitle(reason, had: had), body: endBody(reason))
+        notifier.post(title: Self.endTitle(reason, had: had), body: endBody(reason, waiting: waiting))
         return .restored
     }
 
@@ -1510,6 +1590,228 @@ final class SessionManager {
         Log.info("app nap restored for \(restored) app(s)")
     }
 
+    /// Restores each output device lid close muted, on that device only:
+    /// the default output never stands in for one that is not connected. A
+    /// device that reads unmuted was unmuted after the close, by the user
+    /// or by another app, so the volume it has now stands and only its
+    /// entry goes. A device that is not connected keeps its entry, at a lid
+    /// open as at the session end, and gets it back when it reconnects
+    /// (`outputDevicesChanged`) or at a later launch. Whether a device is
+    /// connected is decided afresh on each try: only this try's
+    /// `AudioDeviceMissingError` puts it in `audioDevicesNotConnected`. The
+    /// entry an earlier build wrote, without the device, is restored on the
+    /// default output, as that build did, after the others. Each entry
+    /// leaves the journal only once its restore went through. A restore
+    /// that fails on a connected device, or whose journal clear fails, is
+    /// tried again in process (`scheduleAudioRetry`); `retrying` says this
+    /// is that retry. A pass that leaves nothing to retry takes down the
+    /// menu line an earlier audio failure put up (`clearAudioWarning`).
+    private func restoreAudioInJournal(retrying: Bool = false) {
+        if !retrying { audioRetriesLeft = Self.audioRetryLimit }
+        var retry = false
+        for entry in state.savedAudioOutputs where state.savedAudioOutputs.contains(entry) {
+            let device = entry.label
+            let wasWaiting = audioDevicesNotConnected.remove(entry.deviceUID) != nil
+            do {
+                let now = try audio.read(deviceUID: entry.deviceUID)
+                if now.muted {
+                    try audio.apply(volume: entry.volume, muted: entry.muted, deviceUID: entry.deviceUID)
+                    Log.info("audio restored on \(device) (volume \(entry.volume), muted \(entry.muted))")
+                } else {
+                    Log.info("audio: \(device) was unmuted after the lid close; left at volume \(now.volume), the saved volume \(entry.volume) is dropped")
+                }
+            } catch is AudioDeviceMissingError {
+                audioDevicesNotConnected.insert(entry.deviceUID)
+                if !wasWaiting {
+                    Log.info("audio: \(device), muted at lid close, is not connected; its saved volume stays in the journal until it reconnects, and no other output is touched")
+                }
+                continue
+            } catch {
+                failAudio("could not restore audio on \(device): \(error.localizedDescription); kept in the journal to retry")
+                retry = true
+                continue
+            }
+            let uid = entry.deviceUID
+            if !clearUndone("audio restored on \(device)", { $0.savedAudioOutputs.removeAll { $0.deviceUID == uid } }) {
+                retry = true
+            }
+        }
+
+        if state.savedOutputVolume != nil || state.savedMuted != nil {
+            do {
+                var volume = state.savedOutputVolume
+                var muted = state.savedMuted
+                if volume == nil || muted == nil {
+                    // Half an entry (a hand edit): the missing value is the
+                    // default output's current one.
+                    let current = try audio.read()
+                    volume = volume ?? current.volume
+                    muted = muted ?? current.muted
+                }
+                let v = volume ?? 1
+                let m = muted ?? false
+                try audio.apply(volume: v, muted: m, deviceUID: nil)
+                Log.info("audio restored on the default output (volume \(v), muted \(m))")
+                let cleared = clearUndone("audio restored") { s in
+                    s.savedOutputVolume = nil
+                    s.savedMuted = nil
+                }
+                if !cleared { retry = true }
+            } catch {
+                failAudio("could not restore audio: \(error.localizedDescription)")
+                retry = true
+            }
+        }
+
+        if retry {
+            scheduleAudioRetry()
+        } else {
+            audioRetryTask?.cancel()
+            audioRetryTask = nil
+            clearAudioWarning()
+        }
+    }
+
+    /// `fail` for the restore of the saved output volumes.
+    private func failAudio(_ message: String) {
+        fail(message)
+        audioWarning = message
+    }
+
+    /// The saved output volumes owe no retry now: the menu line their last
+    /// failure put up goes, if it is still the line shown. A newer failure
+    /// of anything else stays.
+    private func clearAudioWarning() {
+        if let line = audioWarning, lastError == line { lastError = nil }
+        audioWarning = nil
+    }
+
+    /// CoreAudio reports a device connected or gone. An output device still
+    /// owed its volume gets it back now if it is connected, unless a lid
+    /// close may be in effect (`lidCloseMayBeInEffect`): the lid open
+    /// restores it then. CoreAudio sends no second event, so a recovery
+    /// lock that refuses this one is retried in process. Whether anything
+    /// is owed is decided in the transaction, on the journal as it is on
+    /// disk: another copy of the app may have saved an output since this
+    /// copy last read it.
+    func outputDevicesChanged() async {
+        await restoreOwedAudio("output device change", retrying: false)
+    }
+
+    /// One transaction over the journal as it is on disk: restores the saved
+    /// output volumes unless a lid close may be in effect, and schedules
+    /// the in-process retry when the transaction is refused (a busy lock,
+    /// a power command still running, an unreadable journal).
+    private func restoreOwedAudio(_ what: String, retrying: Bool) async {
+        let result = await exclusive(what) {
+            let s = self.state
+            guard !s.savedAudioOutputs.isEmpty || s.savedOutputVolume != nil || s.savedMuted != nil else {
+                // Nothing saved, or restored meanwhile by a lid open, an
+                // end or another copy of the app.
+                self.clearAudioWarning()
+                return
+            }
+            if self.lidCloseMayBeInEffect() {
+                Log.info("audio: \(what) while a lid close may be in effect; the saved volumes wait for the lid open")
+                return
+            }
+            self.restoreAudioInJournal(retrying: retrying)
+        }
+        guard case let .failure(refusal) = result else { return }
+        switch refusal {
+        case let .lockBusy(line), let .journalUnreadable(line):
+            audioWarning = line
+        case .commandRunning:
+            // Its line is `commandWarning`, which goes when the command exits.
+            break
+        }
+        if !retrying { audioRetriesLeft = Self.audioRetryLimit }
+        scheduleAudioRetry()
+    }
+
+    /// Whether a lid close may still be in effect, so a muted output must
+    /// wait for the lid open: the lid is closed or its state unknown, and a
+    /// session is running. Before the launch reconcile has taken a session
+    /// over, or when it could not, that session is only on disk, so
+    /// session.json is read here, under the transaction's lock. One that
+    /// has not expired, or that cannot be read, counts as running.
+    private func lidCloseMayBeInEffect() -> Bool {
+        guard clamshell() != false else { return false }
+        if session != nil { return true }
+        do {
+            guard let onDisk = try store.loadSession() else { return false }
+            return !onDisk.isExpired(at: clock())
+        } catch {
+            return true
+        }
+    }
+
+    /// Tries the saved output volumes again in `recoveryRetryDelay`, in
+    /// process: the recovery agent keeps these entries but cannot restore
+    /// them, and CoreAudio sends no second device event. One retry pending
+    /// at a time. It reads the journal afresh and checks the lid again
+    /// when it runs, and a restore that leaves nothing to retry cancels it.
+    /// After `audioRetryLimit` retries in a row it stops; the entries stay
+    /// for the next device change, lid open, end or launch.
+    private func scheduleAudioRetry() {
+        audioRetryTask?.cancel()
+        audioRetryTask = nil
+        guard audioRetriesLeft > 0 else {
+            Log.error("audio: saved output volume still not checked or restored after \(Self.audioRetryLimit) retries; any saved volume stays in the journal, and the next device change, lid open, session end or launch tries again")
+            return
+        }
+        audioRetriesLeft -= 1
+        let delay = recoveryRetryDelay
+        audioRetryTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(delay))
+            guard let self, !Task.isCancelled else { return }
+            self.audioRetryTask = nil
+            Log.info("retrying the restore of saved output volume")
+            await self.restoreOwedAudio("audio retry", retrying: true)
+        }
+    }
+
+    /// The menu's "Stop waiting for <device>": the saved volume of an output
+    /// device that is not connected leaves the journal, and the device
+    /// stays muted until someone unmutes it. For a device that will not be
+    /// back (a meeting room display, a borrowed speaker), whose entry would
+    /// otherwise keep its menu line up for good and stop uninstall.sh. The
+    /// menu item may be out of date by the time this runs, so both
+    /// conditions are checked again under the lock, on the journal as it is
+    /// on disk: the entry is still the save the item was built for, its
+    /// save ID included, and the device still reads as not connected.
+    /// Otherwise nothing is dropped. A later lid close's save stays, even
+    /// one another copy of the app wrote with the same values, and a device
+    /// that came back gets its volume as usual.
+    func stopWaitingForOutput(_ waiting: SavedAudioOutput) async {
+        let deviceUID = waiting.deviceUID
+        _ = await exclusive("stop waiting for an output") {
+            guard let entry = self.state.savedAudioOutputs.first(where: { $0.deviceUID == deviceUID }) else { return }
+            guard entry == waiting else {
+                Log.info("audio: stop waiting for \(entry.label) not done: the menu item was for an earlier save, already restored or dropped; the save from a later lid close stays")
+                return
+            }
+            do {
+                _ = try self.audio.read(deviceUID: deviceUID)
+                self.audioDevicesNotConnected.remove(deviceUID)
+                Log.info("audio: stop waiting for \(entry.label) not done: it is connected again, so its saved volume stays and is restored as usual")
+                return
+            } catch is AudioDeviceMissingError {
+                // Still not connected: the request stands.
+            } catch {
+                self.fail("could not check whether \(entry.label) is connected: \(error.localizedDescription); its saved volume stays")
+                return
+            }
+            do {
+                try self.journal { $0.savedAudioOutputs.removeAll { $0.deviceUID == deviceUID } }
+                self.audioDevicesNotConnected.remove(deviceUID)
+                Log.info("audio: stopped waiting for \(entry.label) as asked; its saved volume \(entry.volume) and mute \(entry.muted) are dropped, and it stays muted")
+            } catch {
+                self.fail("could not drop the saved volume of \(entry.label): \(error.localizedDescription)")
+            }
+        }
+    }
+
     /// Shared body of lid open, reconcile (lid open) and `restoreAll()`;
     /// each entry is journaled as soon as it is undone.
     private func undoLidActionsInJournal() {
@@ -1538,20 +1840,8 @@ final class SessionManager {
             clearUndone("Docker Desktop has no frozen process left") { $0.dockerFrozen = false }
         }
 
-        if state.savedOutputVolume != nil || state.savedMuted != nil {
-            do {
-                let current = try audio.read()
-                let volume = state.savedOutputVolume ?? current.volume
-                let muted = state.savedMuted ?? current.muted
-                try audio.apply(volume: volume, muted: muted)
-                Log.info("audio restored (volume \(volume), muted \(muted))")
-                clearUndone("audio restored") { s in
-                    s.savedOutputVolume = nil
-                    s.savedMuted = nil
-                }
-            } catch {
-                fail("could not restore audio: \(error.localizedDescription)")
-            }
+        if !state.savedAudioOutputs.isEmpty || state.savedOutputVolume != nil || state.savedMuted != nil {
+            restoreAudioInJournal()
         }
 
         // Display and keyboard were darkened by us (spec section 4), not by
@@ -1716,6 +2006,7 @@ final class SessionManager {
     /// The check stays owed across refusals, and goes to a session a start
     /// makes active first (`earlierCommandCheckOwed`).
     func reconcile() async {
+        announceLidCloseUpdate()
         reconcileRetry?.cancel()
         reconcileRetry = nil
         await reconcile(ticket: endTicket, isRetry: false)
@@ -1774,6 +2065,31 @@ final class SessionManager {
             return false
         }
         return true
+    }
+
+    /// Posts the lid-close update's notification once, before the
+    /// transaction, so a busy lock or an unreadable journal cannot hold it
+    /// back. Not from init: the app builds the manager before it installs
+    /// its notification delegate (`ForegroundNotifications`), which is what
+    /// shows a notification while Insomnia is the active app, and the
+    /// launch reconcile runs after that.
+    private func announceLidCloseUpdate() {
+        guard let change = pendingLidCloseNotice else { return }
+        pendingLidCloseNotice = nil
+        notifier.post(title: LidCloseDefaultsChange.title, body: change.notificationBody)
+    }
+
+    /// Settings' Dismiss on the lid-close update line. Saved to config.json,
+    /// whose mark keeps the update from running again, so the line stays
+    /// gone after a relaunch. A failed save leaves it dismissed for this run.
+    func dismissLidCloseNotice() {
+        guard config.lidCloseDefaultsNotice != nil else { return }
+        config.lidCloseDefaultsNotice = nil
+        do {
+            try store.saveConfig(config)
+        } catch {
+            Log.error("could not save config: \(error.localizedDescription)")
+        }
     }
 
     private func performReconcile() async {
@@ -1869,18 +2185,33 @@ final class SessionManager {
         // sudo pmset that did not stop on SIGTERM ends the reconcile too:
         // step 3 would run a second `disablesleep 0` beside the live one.
         // The lock goes to the command and the end is retried when it exits.
+        // A session.json kept in place is renamed by an end, which is
+        // retried until it moves, so saved output volumes alone then call
+        // for one too, as on any other dirty journal.
+        let savedOutputs = Set(state.savedAudioOutputs.map(\.deviceUID))
+        let owesEnd = keptSessionFile != nil ? state.isDirty : state.isDirty(leavingOutAudioOf: savedOutputs)
         if onDisk != nil {
             Log.info("reconcile: session expired, restoring")
             if case .privilegedCommandRunning = await performEnd(reason: .timer) { return }
-        } else if state.isDirty {
+        } else if owesEnd {
             Log.info(keptSessionFile != nil
                 ? "reconcile: session.json kept in place, restoring the journal as for an expired session"
                 : "reconcile: no session but dirty state, restoring")
             if case .privilegedCommandRunning = await performEnd(reason: .backstop) { return }
-        } else if state.displayRestoredUnderLowPower != nil {
-            dropDisplayWrite(reason: "no session and the mode is not ours")
         } else {
-            Log.info("reconcile: no session, nothing to restore")
+            // Only output volumes are owed, from an end that found their
+            // devices not connected. No session to end and nothing to
+            // announce on every launch: each device is tried, and one still
+            // not connected keeps its entry and its menu line.
+            if !savedOutputs.isEmpty {
+                Log.info("reconcile: no session; restoring the volume saved for \(savedOutputs.count) output device(s)")
+                restoreAudioInJournal()
+            }
+            if state.displayRestoredUnderLowPower != nil {
+                dropDisplayWrite(reason: "no session and the mode is not ours")
+            } else if savedOutputs.isEmpty {
+                Log.info("reconcile: no session, nothing to restore")
+            }
         }
 
         // Step 3: SleepDisabled set with no session. A disable Insomnia
@@ -2265,7 +2596,38 @@ final class SessionManager {
         }
     }
 
-    private func endBody(_ reason: EndReason) -> String {
+    private func endBody(_ reason: EndReason, waiting: [SavedAudioOutput]) -> String {
+        let body = endBody(reason, outputsWaiting: !waiting.isEmpty)
+        return waiting.isEmpty ? body : "\(body) \(Self.stillMutedSentence(waiting))"
+    }
+
+    /// The end notification's sentence about output devices that were not
+    /// connected to get their volume back.
+    nonisolated static func stillMutedSentence(_ waiting: [SavedAudioOutput]) -> String {
+        let names = waiting.map(\.label)
+        if names.count == 1 {
+            return "\(names[0]) was not connected, so it is still muted. Insomnia restores its volume when it reconnects while Insomnia is running, or at the next launch."
+        }
+        let list = names.dropLast().joined(separator: ", ") + " and " + names[names.count - 1]
+        return "\(list) were not connected, so they are still muted. Insomnia restores each one's volume when it reconnects while Insomnia is running, or at the next launch."
+    }
+
+    /// The incomplete-restore notification's sentence about saved output
+    /// volume that could not be restored on a connected device.
+    nonisolated static func audioRetrySentence(_ delay: TimeInterval) -> String {
+        "The recovery agent cannot restore output volume. Insomnia tries again in \(Int(delay)) s while it runs, and at its next launch."
+    }
+
+    /// The same for display brightness or keyboard backlight, which the
+    /// next end (`restoreAll`) or the launch reconcile restores.
+    nonisolated static let brightnessRetrySentence = "The recovery agent cannot restore display brightness or keyboard backlight. Insomnia tries again when a later session ends, and at its next launch."
+
+    /// The menu line for an output device still waiting for its volume.
+    nonisolated static func stillMutedLine(_ output: SavedAudioOutput) -> String {
+        "\(output.label) is still muted from a lid close; Insomnia restores it when it reconnects"
+    }
+
+    private func endBody(_ reason: EndReason, outputsWaiting: Bool) -> String {
         switch reason {
         case .timer: "Time is up. Sleep is back to normal."
         case .user: "Ended by you. Sleep is back to normal."
@@ -2273,7 +2635,9 @@ final class SessionManager {
         case .batteryFloor: "Battery fell below \(config.endFloor)%. Sleep is back to normal."
         case .batteryUnreadable: "The battery level could not be read twice in a row, so the \(config.endFloor)% floor could not be applied. Sleep is back to normal."
         case .thermalCritical: "Thermal state is critical. Sleep is back to normal."
-        case .backstop: "A previous session left changes behind; everything has been undone."
+        case .backstop: outputsWaiting
+            ? "A previous session left changes behind. Sleep is back to normal."
+            : "A previous session left changes behind; everything has been undone."
         case .recoveryUnavailable: "Insomnia could not confirm its recovery agent or the sleep setting for the session found on disk, so it ended the session. Sleep is back to normal."
         case .startFailed: "The administrator password prompt was cancelled or failed, so no session was started. Sleep is back to normal."
         case .sleepReenabled: "Sleep was turned back on while Insomnia was not running, so the session ended."

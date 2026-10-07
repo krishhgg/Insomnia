@@ -51,8 +51,9 @@ RuntimeState {                // everything Insomnia changed and must undo
   lowPowerSetByUs:    Bool
   frozenProcesses:    [{pid, startedAt, startedAtMicros, bootSession}]
   dockerFrozen:       Bool
-  savedOutputVolume:  Float?  // nil when mute is off or lid is open
-  savedMuted:         Bool?
+  savedAudioOutputs:  [{deviceUID, name?, volume, muted, saveID?}]  // each output device a lid close muted, with what it had; saveID is a UUID drawn for each save; empty when mute is off or every device is restored
+  savedOutputVolume:  Float?  // legacy: an earlier build's entry, restored on the default output; never written now
+  savedMuted:         Bool?   // legacy, the same
   savedDisplayBrightness:  Float?  // nil when darkening is off or lid is open
   savedKeyboardBrightness: Float?  // nil when there is no backlight, too
   displayRestoredUnderLowPower: Float?  // restored on open under our Low Power Mode; written again when it ends
@@ -210,9 +211,45 @@ Quit, or reconcile.
 | Keyboard backlight (optional, same toggle) | save brightness, set it to 0 | restore the saved brightness |
 | Freeze scope | `SIGSTOP` every process whose responsible app is in the freeze scope (rules below) | `SIGCONT` the recorded pids only |
 | Docker rule (default off) | if Docker Desktop is running and `docker ps -q` is empty, journal its tree, ask `docker ps -q` once more right before the SIGSTOP and freeze it only on a second clean empty answer; busy, a failed probe, a timeout, a lid open or a session end at either point leaves it running | resume |
-| Mute (optional) | save volume and mute state, then mute | restore both exactly |
+| Mute (optional, default on) | journal the default output's UID, name, volume and mute state as its own entry, unless that device already has one, then mute that device; another device's entry never stops it | restore each entry on its own device, never on another output, and clear only that entry; a device the user unmuted meanwhile is left as it is; a device that is not connected keeps its entry (see below) |
 | Low Power Mode | on (optional, default on) | off unless a battery or thermal floor still wants it |
 | Countdown redraw | stop timer | restart timer |
+
+An output device that is not connected when its entry is restored keeps the
+entry, and the restore of everything else goes on. Each restore decides
+again whether a device is connected: only a device CoreAudio reports as not
+connected on that try counts as away. An away device does not hold up the
+end of a session: End and Quit restore sleep and the rest, the end
+notification names each device that is still muted, and the menu shows a
+line for each with a "Stop waiting for <device>" item, which drops that
+entry and leaves the device as it is. The item drops nothing if, when it
+runs, the device reads as connected or the entry is a later lid close's
+save rather than the one the menu showed. Each save has an ID of its own
+(`saveID`, drawn by the lid close that writes the entry), and the item
+compares it with the journal on disk under the lock, so a later save with
+the same values, written by this or another copy of the app, is not
+dropped. An entry written before entries had an ID has none and is
+compared by its values. While Insomnia runs, a device that
+connects again gets its volume back at once (a CoreAudio device-list
+listener), or at the next lid open if a session is running with the lid
+closed. Each device change reads the journal on disk under the lock, so a
+copy of the app with nothing saved in memory also restores a save another
+copy wrote. Before the launch reconcile has taken a session over, a session.json
+that has not expired, or cannot be read, counts as a running session for
+this. A later launch restores every connected device at reconcile.
+
+A restore that fails on a connected device, or a cleared entry that cannot
+be written, is reported and the entry stays. It makes the end incomplete,
+as any failed restore does. The recovery agent keeps these entries but
+cannot restore CoreAudio settings, so the incomplete-restore notification
+says Insomnia tries again itself. That retry runs in process after 30 s,
+reads the journal again and checks the lid again. A device change that
+could not run at all (the recovery lock was busy, a `sudo pmset` left
+running still held it, or state.json did not decode) is retried the same
+way. The retry stops after 10 tries in a row; the next device change, lid
+open, end or launch tries again. The menu line that a refused device change
+or a failed restore put up goes once a later restore leaves nothing to
+retry, unless a newer failure has taken its place.
 
 A session that starts, or that reconcile resumes at launch, while the lid
 reads closed starts with the countdown redraw stopped: the lid observer
@@ -241,9 +278,16 @@ Freeze scope rules:
   kitty, WezTerm, Tabby, Hyper), browsers (Arc, Chrome, Chromium, Edge, Brave,
   Vivaldi, Opera, Firefox with its Developer and Nightly editions, Zen),
   Tailscale, LM Studio, Ollama, Docker Desktop's Electron front end,
-  1Password, Bitwarden, Postgres.app and OrbStack. Every id is verified
-  against an installed copy or the Homebrew cask metadata named in the
-  comment next to it. The automatic scope leaves them alone even when they
+  1Password, Bitwarden, Postgres.app and OrbStack, and meeting, recording
+  and dictation apps (`meetingApps`): Zoom, Microsoft Teams (new and
+  classic), Webex, the older Webex Meetings app with its meeting window and
+  plugin agent, Wispr Flow, Granola, Otter, OBS and Loom. Their helper apps
+  are matched by prefix: each of those ids followed by a dot, plus `us.zoom.`
+  and `com.cisco.webex.` (`meetingAppPrefixes`). Helpers an app starts are
+  its child processes and are left out with it. FaceTime is
+  `com.apple.FaceTime`, already on the hard denylist. Every id is verified
+  against an installed copy, the Homebrew cask metadata or the page named in
+  the comment next to it. The automatic scope leaves them alone even when they
   are not on the agent list. Code level and not persisted: an existing
   config.json already carries its own agent list, so new agent-list defaults
   never reach it. An explicit freeze-list entry overrides this set; the hard
@@ -285,7 +329,9 @@ is best effort. Display brightness 0 does not switch the keyboard backlight
 off; it is set separately. Both values are journaled before they are changed
 and restored on open, session end, Quit, or reconcile with the lid open; the
 backstop keeps the entries and only the app restores them (private
-frameworks). What is journaled is the user's value, not whatever the device
+frameworks). An end that could not restore one says so in its
+incomplete-restore notification, without promising the recovery agent's
+retry: a later session's end or the next launch tries again. What is journaled is the user's value, not whatever the device
 reads at that instant. A reading is trusted only when the last keyboard,
 mouse or trackpad input was under 30 s ago (`CGEventSource`; the idle dim
 never starts sooner) and the panel is awake (`CGDisplayIsAsleep`, else it
@@ -677,7 +723,9 @@ Reconcile runs at every Insomnia launch:
    new path. If either rename fails the file stays and a start is refused
    while it is there. Every end then restores the journal and tries the
    rename again; while it fails the end is not finished, so quit is refused
-   and the end is retried. A file that could not be read would be resumed
+   and the end is retried. The launch that kept the file runs that end
+   itself when the journal holds any entry, saved output volumes alone
+   included. A file that could not be read would be resumed
    if it became readable in place, and every later launch and the agent
    read either kind again. The messages say to remove it or move it out of
    the folder. `backstop.sh` tries the rename again on every run.
@@ -862,7 +910,13 @@ Backstop, independent of the app:
   microseconds keep the shell's one-second `ps` comparison. Old PID-only
   entries need conservative handling.
 - The shell does not restore CoreAudio settings. Saved audio must remain in
-  the journal for the app to restore. Uninstall must preserve recovery tools
+  the journal for the app to restore. Legacy `savedOutputVolume` /
+  `savedMuted` count as unresolved, so the run exits 1 and says to open
+  Insomnia. `savedAudioOutputs` entries are checked for shape and kept, but
+  on their own they leave the journal clean: an entry can wait days for its
+  device, the app's menu shows it, and an error every minute would only
+  fill the log. The backstop logs them once, when it removes a session or
+  undoes something else. Uninstall must preserve recovery tools
   and state when restoration is incomplete, including saved audio. It runs
   the checkout's backstop only when the installed app declares the
   `InsomniaResumeFrozenVersion` that backstop speaks; otherwise it runs the
@@ -891,7 +945,8 @@ turned back on while Insomnia was not running, extend reminder 5 minutes
 before end, battery floor reached, battery unreadable twice in a row, thermal
 action taken, network gap recovered (with nudge summary), sleep restored by
 backstop, sleep disabled by something other than Insomnia (reconcile step 3,
-once per launch).
+once per launch), lid-close settings changed by the one-time update
+(section 10, once).
 
 ### 10. Settings
 
@@ -902,7 +957,23 @@ older build is tightened when the app reads it:
 
 - presets, default preset
 - freeze list (bundle ids), freeze every other app on/off (default off),
-  Docker rule on/off, mute on lid close on/off
+  Docker rule on/off, mute on lid close on/off (default on). Under the mute
+  toggle: on Mac laptops with Apple silicon or a T2 chip, closing the lid
+  disconnects the built-in microphone in hardware, so recording with the lid
+  closed needs AirPods or an external mic.
+- one-time lid-close update. A config.json without `lidCloseDefaultsApplied`
+  was saved by an earlier build. At launch it gets `freezeAllApps` off and
+  `muteOnLidClose` on, the mark set, and is written back. When either value
+  changed, the launch reconcile posts one "Lid-close settings changed"
+  notification naming each change and where to change it back (Settings,
+  Lid-close actions). It posts before taking the recovery lock, so a busy
+  lock or an unreadable journal does not hold it back, and after the app
+  installs its notification delegate. The app keeps the change in `lidCloseDefaultsNotice` so Settings
+  shows the same line at the top of Lid-close actions until dismissed. The
+  mark stays set, so a setting the user turns back is never changed again. A
+  missing `muteOnLidClose` in a config without the mark reads as off, as the
+  earlier builds read it. A fresh install writes a config.json with the mark
+  and the new defaults and shows no notice.
 - agent list (bundle ids), turn App Nap off for them on/off (default off)
 - `lowPowerFloor`, `endFloor`, thermal rules on/off
 - hotspot SSID (password entered once, stored in Keychain), `nudgeThreshold`
@@ -1166,7 +1237,12 @@ that any case passed; record results in the release validation record.
    containers running". A container started between the two checks →
    untouched, log has the first check finding none and "second check found
    containers running".
-7. **Mute.** Volume 60%, close lid → muted. Open → 60%, unmuted.
+7. **Mute.** Volume 60%, close lid → muted. Open → 60%, unmuted. With a
+   headset as the output, close the lid, unplug the headset, open the lid
+   and choose End: the notification and the menu name the headset as still
+   muted. Plug it back in → its volume comes back and the menu line goes.
+   Repeat, but Quit with the headset unplugged, plug it in, then launch
+   Insomnia → restored at launch.
 8. **Chrome occlusion.** Lid closed, Playwright attached to headed Chrome:
    read `document.visibilityState` and measure `setInterval` drift. Repeat with
    both flags. Decide whether feature 5's browser section stays.
@@ -1207,6 +1283,17 @@ that any case passed; record results in the release validation record.
     0 → put back to 0. Force-quit during a session → `backstop.sh` alone puts
     it back. Set the key to 1 by hand, empty `appNapOverrides`, run
     `uninstall.sh` → it prints the `defaults delete` command and continues.
+15. **Meeting apps.** Freeze-all on, a Zoom or Teams call running on AirPods
+    and Wispr Flow or Granola taking notes. Close the lid → none of their
+    processes shows `T` in `ps -o stat`, the call and the notes continue,
+    other Dock apps are frozen, sound is muted.
+16. **Upgrade notice.** Install over a build whose config.json has
+    `freezeAllApps: true` and `muteOnLidClose: false`. First launch → one
+    "Lid-close settings changed" notification, the same line at the top of
+    Lid-close actions in Settings, both toggles changed, config.json has
+    `lidCloseDefaultsApplied: true`. Turn freeze-all back on, relaunch → no
+    notice, still on. Dismiss removes the Settings line. A fresh install
+    shows no notice.
 
 ## Open decisions (defaults chosen, change if you disagree)
 

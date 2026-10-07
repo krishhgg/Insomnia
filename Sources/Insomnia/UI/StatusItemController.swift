@@ -653,7 +653,8 @@ final class StatusItemController: NSObject {
             target: self,
             settings: #selector(menuOpenSettings),
             quit: #selector(menuQuit),
-            relaunchBrowser: #selector(menuRelaunchBrowser(_:))
+            relaunchBrowser: #selector(menuRelaunchBrowser(_:)),
+            stopWaitingForOutput: #selector(menuStopWaitingForOutput(_:))
         )
         menu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.height + 4), in: button)
     }
@@ -686,8 +687,14 @@ final class StatusItemController: NSObject {
             error: manager.lastError,
             commandRunning: manager.commandWarning,
             foreignSleep: manager.foreignSleepWarning,
+            outputsWaiting: manager.outputsWaitingForRestore,
             lidSimulationBuild: LidSimulationBuild.isCompiledIn
         )
+    }
+
+    @objc private func menuStopWaitingForOutput(_ sender: NSMenuItem) {
+        guard let waiting = sender.representedObject as? SavedAudioOutput else { return }
+        Task { await manager.stopWaitingForOutput(waiting) }
     }
 
     @objc private func menuRelaunchBrowser(_ sender: NSMenuItem) {

@@ -277,6 +277,29 @@ journal_shape_problems() { # file
       done
     fi
   fi
+  t="$(type_of "$f" savedAudioOutputs)"
+  if [[ -n "$t" && "$t" != "(any)" ]]; then
+    if [[ "$t" != array ]]; then
+      echo "savedAudioOutputs is a $t, not an array"
+    else
+      i=0
+      while [[ -n "$(type_of "$f" "savedAudioOutputs.$i")" ]]; do
+        if [[ "$(type_of "$f" "savedAudioOutputs.$i")" != dictionary ]]; then
+          echo "savedAudioOutputs[$i] is not an object"
+        else
+          [[ "$(type_of "$f" "savedAudioOutputs.$i.deviceUID")" == string ]] || echo "savedAudioOutputs[$i].deviceUID is not a string"
+          t="$(type_of "$f" "savedAudioOutputs.$i.volume")"
+          [[ "$t" == float || "$t" == integer ]] || echo "savedAudioOutputs[$i].volume is not a number"
+          [[ "$(type_of "$f" "savedAudioOutputs.$i.muted")" == bool ]] || echo "savedAudioOutputs[$i].muted is not a bool"
+          t="$(type_of "$f" "savedAudioOutputs.$i.name")"
+          [[ -z "$t" || "$t" == string || "$t" == "(any)" ]] || echo "savedAudioOutputs[$i].name is a $t, not a string"
+          t="$(type_of "$f" "savedAudioOutputs.$i.saveID")"
+          [[ -z "$t" || "$t" == string || "$t" == "(any)" ]] || echo "savedAudioOutputs[$i].saveID is a $t, not a string"
+        fi
+        i=$((i + 1))
+      done
+    fi
+  fi
   t="$(type_of "$f" appNapOverrides)"
   if [[ -n "$t" && "$t" != "(any)" ]]; then
     if [[ "$t" != array ]]; then
@@ -362,7 +385,7 @@ session_shape_problems() { # file
 # Independent check of the journal: prints one line per unresolved item.
 # Trusts nothing about the backstop that just ran (it may be an older copy).
 journal_problems() {
-  local key value shape
+  local key value shape i
   if [[ -e "$SESSION" ]]; then
     shape=""
     # Only a regular file is opened: open(2) on a FIFO with no writer
@@ -411,6 +434,12 @@ journal_problems() {
   if extract "$STATE" savedOutputVolume >/dev/null || extract "$STATE" savedMuted >/dev/null; then
     echo "saved audio settings (volume/mute) are not restored; only the app can do that"
   fi
+  i=0
+  while extract_json "$STATE" "savedAudioOutputs.$i" >/dev/null; do
+    value="$(extract "$STATE" "savedAudioOutputs.$i.name" || extract "$STATE" "savedAudioOutputs.$i.deviceUID" || true)"
+    echo "$value is still muted from a lid close; only the app can restore its volume, once the device is connected"
+    i=$((i + 1))
+  done
   if extract "$STATE" savedDisplayBrightness >/dev/null; then
     echo "saved display brightness is not restored; only the app can do that"
   fi
@@ -548,6 +577,10 @@ What to do, then rerun this script:
   - Saved audio (volume/mute), display brightness or keyboard backlight:
     open Insomnia.app; it restores them from the journal at launch. If the
     display is dark, press the brightness-up key first.
+  - An output device still muted from a lid close: connect it and open
+    Insomnia.app, which restores its volume. If the device is gone for
+    good, open Insomnia.app and choose "Stop waiting for <device>" in its
+    menu; the device then stays as it is.
   - pmset failures (sleep / Low Power Mode): check $SUDOERS
     (rerun scripts/install.sh to reinstall it), or run
     'sudo pmset -a disablesleep 0' / 'sudo pmset -b lowpowermode 0' yourself.
