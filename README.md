@@ -433,7 +433,10 @@ installation scenarios still need [release validation](docs/release-validation.m
   them when the binary is missing, does not finish in time, or answers
   anything but one expected line per entry. It runs the binary only when the
   installed bundle declares `InsomniaResumeFrozenVersion` in its
-  `Info.plist`, so it never starts an older build. The binary holds the
+  `Info.plist`, so it never starts an older build. During an upgrade,
+  `install.sh` runs the recovery of the bundle it staged and verified with
+  `--own-bundle`, so the binary and `Info.plist` checked are the staged
+  build's, not the build being replaced. The binary holds the
   recovery lock while it can still send a signal and ends itself after the
   same limit, so a backstop run that is killed mid-call leaves no helper
   that could act later without the lock. `uninstall.sh` uses the backstop

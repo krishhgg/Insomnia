@@ -32,8 +32,10 @@ microsecond and signals it, and keeps them on any unexpected answer. It runs
 the binary only when the bundle's `Info.plist` declares
 `InsomniaResumeFrozenVersion` equal to its `RESUME_FROZEN_VERSION`, and the
 binary keeps the recovery lock on fd 9 until it ends itself after
-`<seconds>`. It keeps, and never
-restores, `savedOutputVolume`, `savedMuted`, `savedAudioOutputs`,
+`<seconds>`. With `--own-bundle`, which `install.sh` passes to the copy in the
+bundle it staged, the binary and `Info.plist` are the ones beside that copy,
+so the pre-swap recovery never runs the older installed build. It keeps, and
+never restores, `savedOutputVolume`, `savedMuted`, `savedAudioOutputs`,
 `savedDisplayBrightness`, `savedKeyboardBrightness` and
 `displayRestoredUnderLowPower`: CoreAudio and the private brightness
 frameworks need the app. `savedAudioOutputs` entries alone leave the

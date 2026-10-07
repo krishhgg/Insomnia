@@ -916,7 +916,11 @@ Backstop, independent of the app:
   64) that checks nothing. The script runs the binary only when the bundle's
   `Info.plist` declares `InsomniaResumeFrozenVersion` equal to the version
   the script speaks, because an older build would start the menu bar app
-  instead; otherwise it keeps those entries. It runs it with the same
+  instead; otherwise it keeps those entries. `install.sh` runs the staged
+  bundle's backstop with `--own-bundle`, which takes the binary and
+  `Info.plist` beside that copy instead of the installed app's, so an
+  upgrade from a build without the interface still resumes these entries
+  before the swap. It runs it with the same
   30-second limit as a power command, then SIGTERM, then SIGKILL, and with
   the lock descriptor: the binary keeps the recovery lock while it can
   still send a signal, even if the script dies first, and ends itself with

@@ -3092,6 +3092,104 @@ final class RecoveryScriptTests: XCTestCase {
         }
     }
 
+    // MARK: - --own-bundle (install.sh's run of the staged copy)
+
+    /// A copy of the fixture's backstop sealed in a bundle at `bundle`: a
+    /// binary beside it records "OWN-BINARY <path it was run by>" and then
+    /// answers as the fake app binary does, and its Info.plist declares
+    /// InsomniaResumeFrozenVersion `version` (no key when nil). Returns the
+    /// copy's path.
+    private func writeOwnBundle(at bundle: URL, version: String?) throws -> URL {
+        let fm = FileManager.default
+        let script = bundle.appendingPathComponent("Contents/Resources/backstop.sh")
+        let binary = bundle.appendingPathComponent("Contents/MacOS/Insomnia")
+        try fm.createDirectory(at: script.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try fm.createDirectory(at: binary.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try fm.copyItem(at: fx.backstop, to: script)
+        try "#!/bin/bash\nprintf 'OWN-BINARY %s\\n' \"$0\" >> '\(fx.callsLog.path)'\nexec '\(fx.fakeInsomnia.path)' \"$@\"\n"
+            .write(to: binary, atomically: true, encoding: .utf8)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: binary.path)
+        try ScriptFixture.infoPlist(resumeFrozenVersion: version).write(to: bundle.appendingPathComponent("Contents/Info.plist"), atomically: true, encoding: .utf8)
+        return script
+    }
+
+    /// With --own-bundle the backstop runs the binary beside its own copy
+    /// and reads the Info.plist beside it, never the installed app's. The
+    /// installed app here declares the version and its binary answers, so a
+    /// run that fell back to it would resume the entry as well; only the
+    /// OWN-BINARY line tells them apart. When the Info.plist beside the copy
+    /// does not declare the version, no binary runs, the installed one
+    /// included, and the entry stays.
+    func testOwnBundleUsesTheBinaryAndInfoPlistBesideItsCopy() throws {
+        let script = try writeOwnBundle(at: fx.root.appendingPathComponent("staged/Insomnia.app"), version: "1")
+        try writeMicrosecondEntry(pid: 5320, started: 1_789_388_423, micros: 20)
+
+        let r = try fx.run(script, ["--own-bundle"])
+
+        XCTAssertEqual(r.status, 0, r.stderr + fx.log())
+        XCTAssertEqual(fx.calls(), [
+            "OWN-BINARY \(fx.root.path)/staged/Insomnia.app/Contents/MacOS/Insomnia",
+            "Insomnia --resume-frozen 2 < 5320 1789388423 20 \(fx.bootUUID)",
+        ])
+        XCTAssertEqual((try fx.stateJSON()["frozenProcesses"] as? [Any])?.count, 0)
+
+        let older = try writeOwnBundle(at: fx.root.appendingPathComponent("older/Insomnia.app"), version: nil)
+        try writeMicrosecondEntry(pid: 5321, started: 1_789_388_423, micros: 21)
+        fx.clearCalls()
+
+        let kept = try fx.run(older, ["--own-bundle"])
+
+        XCTAssertNotEqual(kept.status, 0)
+        XCTAssertEqual(fx.calls(), [], "a binary ran")
+        XCTAssertEqual(try onlyFrozenEntry()?["pid"] as? Int, 5321)
+        XCTAssertEqual(try onlyFrozenEntry()?["startedAtMicros"] as? Int, 21)
+        XCTAssertTrue(fx.log().contains("but \(fx.root.path)/older/Insomnia.app/Contents/Info.plist declares InsomniaResumeFrozenVersion '', not 1"), fx.log())
+    }
+
+    /// --own-bundle accepts only a copy run by a full path that ends in
+    /// .app/Contents/Resources/backstop.sh. The checkout's copy, a loose
+    /// copy, a copy elsewhere in a bundle and a bundle's copy run by a
+    /// relative path all stop with exit 2 before the lock file is opened or
+    /// the journal read: no binary runs, the installed app's included, and
+    /// the entry and its microseconds stay. The same bundle copy run by its
+    /// full path then resumes the entry, so the refusal came from the path.
+    func testOwnBundleRefusesACopyOutsideABundlesResources() throws {
+        let fm = FileManager.default
+        try writeMicrosecondEntry(pid: 5322, started: 1_789_388_423, micros: 22)
+        let journal = try Data(contentsOf: fx.state)
+        let loose = fx.root.appendingPathComponent("loose/backstop.sh")
+        let misplaced = fx.root.appendingPathComponent("odd/Insomnia.app/Contents/backstop.sh")
+        for copy in [loose, misplaced] {
+            try fm.createDirectory(at: copy.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try fm.copyItem(at: fx.backstop, to: copy)
+        }
+        let bundled = try writeOwnBundle(at: fx.root.appendingPathComponent("rel/Insomnia.app"), version: "1")
+        let runs: [(label: String, run: () throws -> (status: Int32, output: String))] = [
+            ("the checkout's copy", { let r = try self.fx.run(self.fx.backstop, ["--own-bundle"]); return (r.status, r.stdout + r.stderr) }),
+            ("a loose copy", { let r = try self.fx.run(loose, ["--own-bundle"]); return (r.status, r.stdout + r.stderr) }),
+            ("a copy outside Contents/Resources", { let r = try self.fx.run(misplaced, ["--own-bundle"]); return (r.status, r.stdout + r.stderr) }),
+            ("a bundle's copy by a relative path", {
+                try self.fx.runTool("/bin/bash", ["-c", #"cd "$1" && exec /bin/bash Insomnia.app/Contents/Resources/backstop.sh --own-bundle"#, "bash", self.fx.root.appendingPathComponent("rel").path])
+            }),
+        ]
+        for (label, run) in runs {
+            let r = try run()
+
+            XCTAssertEqual(r.status, 2, "\(label): \(r.output)")
+            XCTAssertTrue(r.output.contains("is not an absolute path ending in .app/Contents/Resources/backstop.sh; nothing was done"), "\(label): \(r.output)")
+            XCTAssertEqual(fx.calls(), [], "\(label): a binary ran")
+            XCTAssertEqual(try Data(contentsOf: fx.state), journal, label)
+            XCTAssertFalse(fx.exists(fx.lock), "\(label): the lock file was opened")
+            XCTAssertEqual(fx.log(), "", label)
+        }
+
+        let r = try fx.run(bundled, ["--own-bundle"])
+
+        XCTAssertEqual(r.status, 0, r.stderr + fx.log())
+        XCTAssertEqual(fx.calls().first, "OWN-BINARY \(fx.root.path)/rel/Insomnia.app/Contents/MacOS/Insomnia")
+        XCTAssertEqual((try fx.stateJSON()["frozenProcesses"] as? [Any])?.count, 0)
+    }
+
     // MARK: - Uninstall locking and interleaving
 
     func testUninstallRefusesWhileRecoveryLockIsHeld() throws {
@@ -3457,7 +3555,10 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(r.stderr.contains("left as it was"), r.stderr)
         XCTAssertTrue(r.stderr.contains("not verified"), "no schedule claim from print alone: \(r.stderr)")
         XCTAssertFalse(r.stderr.contains("every minute"), r.stderr)
-        XCTAssertTrue(r.stderr.contains("/scripts/backstop.sh --force"), "manual step named, the checkout's copy: \(r.stderr)")
+        // A hand-run scripts/backstop.sh would hand frozen processes to the build at $APP, which may
+        // predate --resume-frozen; the installer runs the staged build's copy with --own-bundle.
+        XCTAssertFalse(r.stderr.contains("backstop.sh --force"), "no hand-run backstop.sh: \(r.stderr)")
+        XCTAssertEqual(try pastedWords(of: printedCommand(in: r.stderr, containing: "install.sh")), [fx.install.path], "manual step reruns the installer")
         XCTAssertTrue(r.stderr.contains("not replaced"), r.stderr)
         XCTAssertEqual(try fx.installedBinaryFirstLine(), "previous", "the bundle the retained agent pins stays in place")
         XCTAssertEqual(try fx.contents(of: fx.appsDir), ["Insomnia.app"], "the staged build is discarded and nothing is set aside")
@@ -3511,9 +3612,9 @@ final class RecoveryScriptTests: XCTestCase {
 
         XCTAssertEqual(stopped.status, 1, stopped.stderr + stopped.stdout)
         XCTAssertEqual(
-            try pastedWords(of: printedCommand(in: stopped.stderr, containing: "backstop.sh")),
-            ["/bin/bash", checkout.appendingPathComponent("scripts/backstop.sh").path, "--force"],
-            "the manual recovery runs the checkout's backstop.sh"
+            try pastedWords(of: printedCommand(in: stopped.stderr, containing: "install.sh")),
+            [checkout.appendingPathComponent("scripts/install.sh").path],
+            "the manual step reruns the checkout's installer"
         )
 
         fx.setMode("sudo", "ok")
@@ -3622,6 +3723,191 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(fx.exists(fx.app.appendingPathComponent("Contents/Resources/AppIcon.icns")), "the app icon is bundled")
         XCTAssertTrue(r.stdout.contains("Installed"), r.stdout)
         XCTAssertEqual(try fx.contents(of: fx.plist.deletingLastPathComponent()), ["com.insomnia.backstop.plist"])
+    }
+
+    // MARK: - install.sh over a build from before --resume-frozen
+
+    /// The binary of an installed build from before --resume-frozen. Given
+    /// any argument it would open the menu bar app; here it records
+    /// "OLD-APP <arguments>".
+    private func oldAppBinary(_ f: ScriptFixture) -> String {
+        "#!/bin/bash\nprintf 'OLD-APP %s\\n' \"$*\" >> '\(f.callsLog.path)'\n"
+    }
+
+    /// The binary of the build being installed, a --resume-frozen
+    /// responder. It records whether the recovery lock is held and the path
+    /// it was run by ("STAGED-BINARY LOCK-HELD <path>"), then answers as the
+    /// fixture's fake app binary does, which records the call and the inode
+    /// on its fd 9.
+    private func newBuildBinary(_ f: ScriptFixture) -> String {
+        """
+        #!/bin/bash
+        \(f.lockHeldHere())
+        if lock_held; then held=LOCK-HELD; else held=LOCK-FREE; fi
+        printf 'STAGED-BINARY %s %s\\n' "$held" "$0" >> '\(f.callsLog.path)'
+        exec '\(f.fakeInsomnia.path)' "$@"
+
+        """
+    }
+
+    /// The Info.plist of the build being installed: what install.sh checks
+    /// in a release bundle, and InsomniaResumeFrozenVersion 1 when
+    /// `declares`, as Resources/Info.plist has it.
+    private static func newBuildInfoPlist(declares: Bool) -> String {
+        let key = declares ? "<key>InsomniaResumeFrozenVersion</key><integer>1</integer>" : ""
+        return """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0"><dict>
+        <key>CFBundleExecutable</key><string>Insomnia</string>
+        <key>CFBundleIdentifier</key><string>com.kgarg.insomnia</string>
+        <key>CFBundlePackageType</key><string>APPL</string>
+        <key>CFBundleShortVersionString</key><string>0.1.0</string>\(key)
+        </dict></plist>
+
+        """
+    }
+
+    /// An installed build from before --resume-frozen (an Info.plist
+    /// without InsomniaResumeFrozenVersion, and oldAppBinary), its agent
+    /// loaded from the plist that pins it, and the journal it left: an
+    /// expired session and two frozen processes recorded with microseconds.
+    /// The new build comes from this checkout (the fake swift's binroot) or,
+    /// with `prebuilt`, from a release bundle. Either way its binary is
+    /// newBuildBinary and its Info.plist declares the interface when
+    /// `declares`. Returns the arguments for install.sh.
+    private func writeUpgradeFromABuildWithoutResumeFrozen(_ f: ScriptFixture, prebuilt: Bool = false, declares: Bool = true) throws -> [String] {
+        let fm = FileManager.default
+        try f.prepareInstall()
+        let oldBinary = f.app.appendingPathComponent("Contents/MacOS/Insomnia")
+        try fm.createDirectory(at: oldBinary.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try oldAppBinary(f).write(to: oldBinary, atomically: true, encoding: .utf8)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: oldBinary.path)
+        try ScriptFixture.infoPlist(resumeFrozenVersion: nil).write(to: f.appInfo, atomically: true, encoding: .utf8)
+        try f.writeAgentPlist()
+        f.setMode("launchctl", "loaded")
+        try f.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        try f.writeState("""
+        {"sleepDisabledByUs":false,"lowPowerSetByUs":false,"dockerFrozen":false,
+         "frozenProcesses":[
+           {"pid":5401,"startedAt":1789388423,"startedAtMicros":401,"bootSession":"\(f.bootUUID)"},
+           {"pid":5402,"startedAt":1789388424,"startedAtMicros":402,"bootSession":"\(f.bootUUID)"}]}
+        """)
+        let info = Self.newBuildInfoPlist(declares: declares)
+        let bundle = try prebuilt ? f.writePrebuiltApp() : nil
+        let infoURL = bundle?.appendingPathComponent("Contents/Info.plist")
+            ?? f.repoScripts.deletingLastPathComponent().appendingPathComponent("Resources/Info.plist")
+        let binary = bundle?.appendingPathComponent("Contents/MacOS/Insomnia") ?? f.root.appendingPathComponent("binroot/Insomnia")
+        try info.write(to: infoURL, atomically: true, encoding: .utf8)
+        try newBuildBinary(f).write(to: binary, atomically: true, encoding: .utf8)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: binary.path)
+        return bundle.map { ["--allow-unverified-origin", "--app", $0.path] } ?? []
+    }
+
+    /// What a finished upgrade over that build shows. The staged binary,
+    /// run by its path inside the staging directory with the recovery lock
+    /// held on its fd 9, resumed both processes before the previous agent
+    /// was unloaded. The old binary never ran, and the new pair is in place.
+    private func assertUpgradeResumedWithTheStagedBinary(_ r: (status: Int32, stdout: String, stderr: String), file: StaticString = #filePath, line: UInt = #line) throws {
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout + fx.log(), file: file, line: line)
+        let calls = fx.calls()
+        XCTAssertFalse(calls.contains { $0.hasPrefix("OLD-APP") }, "the previous build's binary ran: \(calls)", file: file, line: line)
+        let staged = calls.filter { $0.hasPrefix("STAGED-BINARY ") }
+        XCTAssertEqual(staged.count, 1, "\(calls)", file: file, line: line)
+        let run = try XCTUnwrap(staged.first, file: file, line: line)
+        XCTAssertTrue(run.hasPrefix("STAGED-BINARY LOCK-HELD \(fx.appsDir.path)/.Insomnia.app.staging."), run, file: file, line: line)
+        XCTAssertTrue(run.hasSuffix("/Insomnia.app/Contents/MacOS/Insomnia"), run, file: file, line: line)
+        XCTAssertTrue(calls.contains("Insomnia --resume-frozen 2 < 5401 1789388423 401 \(fx.bootUUID); 5402 1789388424 402 \(fx.bootUUID)"), "\(calls)", file: file, line: line)
+        let fd9 = try String(contentsOf: fx.root.appendingPathComponent("insomnia.fd9"), encoding: .utf8)
+        XCTAssertEqual(fd9.trimmingCharacters(in: .whitespacesAndNewlines), String(try fx.inode(fx.lock)), "the binary did not get the recovery lock on fd 9", file: file, line: line)
+        let resumed = try XCTUnwrap(calls.firstIndex(of: run), file: file, line: line)
+        let bootout = try XCTUnwrap(calls.firstIndex(of: "launchctl bootout gui/\(fx.uid)/com.insomnia.backstop"), "\(calls)", file: file, line: line)
+        XCTAssertLessThan(resumed, bootout, "resumed before the previous agent and bundle were replaced: \(calls)", file: file, line: line)
+        XCTAssertEqual((try fx.stateJSON()["frozenProcesses"] as? [Any])?.count, 0, file: file, line: line)
+        for pid in [5401, 5402] {
+            XCTAssertTrue(fx.log().contains("SIGCONT sent to pid \(pid) by the app binary"), fx.log(), file: file, line: line)
+        }
+        XCTAssertEqual(try String(contentsOf: fx.app.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), newBuildBinary(fx), "the new build is at $APP", file: file, line: line)
+        XCTAssertEqual(try fx.contents(of: fx.appsDir), ["Insomnia.app"], file: file, line: line)
+        XCTAssertEqual(calls.filter { $0.hasPrefix("launchctl bootstrap") }.count, 1, "\(calls)", file: file, line: line)
+        XCTAssertTrue(try fx.lockIsFree(), file: file, line: line)
+    }
+
+    /// Greptile P1 (issue comment 6046657261): an upgrade over a build that
+    /// predates --resume-frozen, with processes it froze still journaled
+    /// with microseconds. install.sh runs the staged copy's recovery with
+    /// --own-bundle, so the staged binary, which declares the interface,
+    /// resumes them before the swap. Before, the staged copy asked the
+    /// installed bundle, which does not declare it, kept the entries and
+    /// stopped the install after the rule was narrowed.
+    func testUpgradeOverABuildWithoutResumeFrozenResumesWithTheStagedBinary() throws {
+        let args = try writeUpgradeFromABuildWithoutResumeFrozen(fx)
+
+        let r = try fx.run(fx.installRedirected, args, extraEnvironment: ["USER": "tester"])
+
+        try assertUpgradeResumedWithTheStagedBinary(r)
+    }
+
+    /// The same upgrade from a release bundle (--app): the staged binary is
+    /// the checked private copy's, staged, never the bundle at the --app
+    /// path or the installed one.
+    func testUpgradeFromAPrebuiltBundleOverABuildWithoutResumeFrozenResumesWithTheStagedBinary() throws {
+        let args = try writeUpgradeFromABuildWithoutResumeFrozen(fx, prebuilt: true)
+
+        let r = try fx.run(fx.installRedirected, args, extraEnvironment: ["USER": "tester"])
+
+        try assertUpgradeResumedWithTheStagedBinary(r)
+    }
+
+    /// When the staged build cannot settle an entry, the entry stays as it
+    /// was journaled, microseconds included, and the install stops at the
+    /// recovery. The previous bundle, its Info.plist and the agent plist
+    /// that pins it stay as they were, no agent is unloaded or loaded, the
+    /// staged build is discarded, and the old binary never runs. A failed
+    /// SIGCONT or an unverifiable process keeps that entry only; an answer
+    /// that is malformed or late keeps both; a staged Info.plist without
+    /// the interface runs no binary at all. Each case starts from a fresh
+    /// fixture.
+    func testUpgradeKeepsWhatTheStagedBinaryCannotResumeAndThePreviousPair() throws {
+        let cases: [(label: String, declares: Bool, kept: [Int], setUp: (ScriptFixture) throws -> Void)] = [
+            ("a failed SIGCONT", true, [5401], { try $0.insomniaTable([(5401, "failed")]) }),
+            ("an unverifiable process", true, [5402], { try $0.insomniaTable([(5402, "unverifiable")]) }),
+            ("a malformed answer", true, [5401, 5402], { try $0.insomniaRaw("5401 resumed\n5402 resumed now\n", status: 0) }),
+            ("no answer in time", true, [5401, 5402], { $0.setMode("insomnia", "hang") }),
+            ("a staged build without the interface", false, [5401, 5402], { _ in }),
+        ]
+        for c in cases {
+            let f = try ScriptFixture()
+            defer { f.destroy() }
+            let args = try writeUpgradeFromABuildWithoutResumeFrozen(f, declares: c.declares)
+            try c.setUp(f)
+            let agentPlist = try Data(contentsOf: f.plist)
+
+            let r = try f.run(f.installRedirected, args, extraEnvironment: ["USER": "tester"])
+
+            XCTAssertEqual(r.status, 1, "\(c.label): \(r.stderr)")
+            XCTAssertTrue(r.stderr.contains("Install stopped: the backstop could not fully undo a previous session"), "\(c.label): \(r.stderr)")
+            let calls = f.calls()
+            XCTAssertFalse(calls.contains { $0.hasPrefix("OLD-APP") }, "\(c.label): the previous build's binary ran: \(calls)")
+            let staged = calls.filter { $0.hasPrefix("STAGED-BINARY ") }
+            if c.declares {
+                XCTAssertEqual(staged.count, 1, "\(c.label): \(calls)")
+                XCTAssertTrue(staged.first?.hasPrefix("STAGED-BINARY LOCK-HELD \(f.appsDir.path)/.Insomnia.app.staging.") == true, "\(c.label): \(staged)")
+            } else {
+                XCTAssertEqual(staged, [], c.label)
+                XCTAssertTrue(f.log().contains("Insomnia.app/Contents/Info.plist declares InsomniaResumeFrozenVersion '', not 1"), "\(c.label): \(f.log())")
+            }
+            let entries = try XCTUnwrap(f.stateJSON()["frozenProcesses"] as? [[String: Any]], c.label)
+            XCTAssertEqual(entries.map { $0["pid"] as? Int }, c.kept.map { Int?($0) }, c.label)
+            XCTAssertEqual(entries.map { $0["startedAtMicros"] as? Int }, c.kept.map { Int?($0 - 5000) }, c.label)
+            XCTAssertEqual(try String(contentsOf: f.app.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), oldAppBinary(f), "\(c.label): the previous build left $APP")
+            XCTAssertEqual(try String(contentsOf: f.appInfo, encoding: .utf8), ScriptFixture.infoPlist(resumeFrozenVersion: nil), c.label)
+            XCTAssertEqual(try Data(contentsOf: f.plist), agentPlist, "\(c.label): the agent plist changed")
+            XCTAssertFalse(calls.contains { $0.hasPrefix("launchctl bootout") || $0.hasPrefix("launchctl bootstrap") }, "\(c.label): \(calls)")
+            XCTAssertEqual(try f.contents(of: f.appsDir), ["Insomnia.app"], "\(c.label): the staged build is discarded")
+            XCTAssertTrue(r.stderr.contains("Finish the install by rerunning"), "\(c.label): \(r.stderr)")
+            XCTAssertTrue(try f.lockIsFree(), c.label)
+        }
     }
 
     // MARK: - install.sh --app (a prebuilt bundle, as from a release zip)

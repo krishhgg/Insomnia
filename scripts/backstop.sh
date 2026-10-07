@@ -54,8 +54,9 @@
 #       frozenProcesses     -> SIGCONT, but only to a pid verified to be the
 #                              process the app froze. Entries that record
 #                              startedAtMicros are handed to the installed
-#                              app binary (INSOMNIA_BIN --resume-frozen
-#                              <seconds>) in one call with a time limit, one
+#                              app binary, or with --own-bundle to the one
+#                              beside this copy (INSOMNIA_BIN --resume-frozen
+#                              <seconds>), in one call with a time limit, one
 #                              line per entry on its standard input. For
 #                              each entry in turn it does one kernel lookup
 #                              (start time to the microsecond, boot session,
@@ -140,6 +141,20 @@
 # --force: treat the session as expired even if endsAt is in the future
 # (used by install.sh / uninstall.sh to end a stale session deliberately).
 #
+# --own-bundle: run --resume-frozen with the app binary and Info.plist of the
+# bundle this copy is sealed in (Contents/MacOS/Insomnia and
+# Contents/Info.plist, beside Contents/Resources/backstop.sh), never the
+# installed app's. install.sh passes it to the copy in the bundle it has just
+# staged and verified with codesign, and runs that copy's recovery before the
+# bundle replaces the installed one. The installed build may predate
+# --resume-frozen and would open the menu bar app instead; the staged binary
+# is the build this copy was sealed with. The path this copy was run by
+# (BASH_SOURCE, not the environment) must be absolute and end in
+# .app/Contents/Resources/backstop.sh, or the run refuses with exit 2 before
+# it takes the lock or reads the journal. That shape check does not verify
+# the bundle: the caller must run a copy it has verified. The Info.plist
+# check and every other rule above still apply to that binary.
+#
 # Honours INSOMNIA_HOME with the same layout as the app (see Paths.swift).
 #
 # The line below says which recovery contract this copy implements. The app
@@ -177,7 +192,8 @@ MKTEMP=/usr/bin/mktemp
 # must declare InsomniaResumeFrozenVersion RESUME_FROZEN_VERSION before the
 # binary is run: an older build has no such mode and would open the menu bar
 # app instead. Fixed paths like the tools, never PATH. install.sh puts the
-# bundle here, copying the binary before Info.plist.
+# bundle here, copying the binary before Info.plist. --own-bundle replaces
+# both with the paths beside this copy (see above).
 INSOMNIA_BIN="${HOME:-}/Applications/Insomnia.app/Contents/MacOS/Insomnia"
 INSOMNIA_INFO="${HOME:-}/Applications/Insomnia.app/Contents/Info.plist"
 RESUME_FROZEN_VERSION=1
@@ -191,13 +207,24 @@ COMMAND_TIMEOUT_SECONDS=30
 KILL_GRACE_SECONDS=3
 
 force=0
+own_bundle=0
 for arg in "$@"; do
   case "$arg" in
     --force) force=1 ;;
-    -h|--help) echo "usage: $0 [--force]"; exit 0 ;;
+    --own-bundle) own_bundle=1 ;;
+    -h|--help) echo "usage: $0 [--force] [--own-bundle]"; exit 0 ;;
     *) echo "unknown option: $arg" >&2; exit 2 ;;
   esac
 done
+if (( own_bundle )); then
+  own_path="${BASH_SOURCE[0]}"
+  if [[ "$own_path" != /*.app/Contents/Resources/backstop.sh ]]; then
+    echo "--own-bundle: $own_path is not an absolute path ending in .app/Contents/Resources/backstop.sh; nothing was done" >&2
+    exit 2
+  fi
+  INSOMNIA_BIN="${own_path%/Resources/backstop.sh}/MacOS/Insomnia"
+  INSOMNIA_INFO="${own_path%/Resources/backstop.sh}/Info.plist"
+fi
 
 if [[ -n "${INSOMNIA_HOME:-}" ]]; then
   APP_SUPPORT="$INSOMNIA_HOME"
@@ -906,7 +933,7 @@ resume_via_app() {
   if [[ "$declared" != "$RESUME_FROZEN_VERSION" ]]; then
     for (( k = 0; k < n; k++ )); do
       log error "pid ${app_pid[k]} needs the app binary for its microsecond identity check, but $INSOMNIA_INFO declares InsomniaResumeFrozenVersion '${declared}', not $RESUME_FROZEN_VERSION (an older or newer build); the binary was not run; kept, not signaled"
-      failures+=("pid ${app_pid[k]} was not resumed: the installed app does not declare --resume-frozen version $RESUME_FROZEN_VERSION")
+      failures+=("pid ${app_pid[k]} was not resumed: $INSOMNIA_INFO does not declare --resume-frozen version $RESUME_FROZEN_VERSION")
       keep_entry "${app_index[k]}"
     done
     return 0

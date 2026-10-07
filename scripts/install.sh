@@ -757,9 +757,15 @@ plist_pins_previous() {
 pins_unknown_note="'codesign --verify', which tells which of the two bundles $PLIST pins,
 did not answer within ${CALL_TIMEOUT_SECONDS}s."
 
+# The staged copy runs with --own-bundle: frozen entries that record
+# startedAtMicros go to the staged binary, which the codesign check above
+# covered with this script and whose Info.plist that copy checks for the
+# --resume-frozen version it speaks. The build still at $APP may predate that
+# interface, and it is never run here: an older binary would open the menu
+# bar app instead of answering.
 step "Ending any stale session and checking the recovery journal"
 recovery_rc=0
-/bin/bash "$BACKSTOP" --force || recovery_rc=$?
+/bin/bash "$BACKSTOP" --force --own-bundle || recovery_rc=$?
 
 if (( recovery_rc != 0 )); then
   held="$(loaded_state)"
@@ -788,20 +794,20 @@ $pins_unknown_note"
     pair_note="The app at $APP and the LaunchAgent were not replaced or unloaded,
 so they still match each other; the new build was discarded."
   fi
-  # How to run the recovery again. A checkout has backstop.sh under scripts/.
-  # A zip has it only inside the bundle at $PREBUILT, and the checked private
-  # copy is deleted when this script exits; the original may have changed
-  # since the check, so the step is this script again, which checks a new copy.
+  # How to run the recovery again: this script, which stages a new copy and
+  # runs that copy's recovery with --own-bundle, as above. A zip has
+  # backstop.sh only inside the bundle at $PREBUILT, which may have changed
+  # since the check, and the checked private copy is deleted when this script
+  # exits. A checkout's scripts/backstop.sh run by hand would hand frozen
+  # processes to the build at $APP, which may predate --resume-frozen.
   if [[ -n "$PREBUILT" ]]; then
-    manual_step="Or rerun this script. It checks a new private
-copy of the bundle and runs that copy's recovery before it replaces the app
-or the LaunchAgent:
-  $(command_line "$0" --allow-unverified-origin --app "$PREBUILT")"
+    again="checks a new private copy of the bundle"
   else
-    manual_step="Or run the recovery by hand:
-  $(command_line /bin/bash "$SCRIPT_DIR/backstop.sh" --force)
-Then rerun this script to install the app and the LaunchAgent."
+    again="builds and stages the bundle again"
   fi
+  manual_step="Or rerun this script. It $again and runs that
+copy's recovery before it replaces the app or the LaunchAgent:
+  $(rerun_command)"
   cat >&2 <<FAIL
 
 Install stopped: the backstop could not fully undo a previous session
