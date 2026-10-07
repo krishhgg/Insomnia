@@ -129,24 +129,25 @@ trap '"$RM" -f "$WORK"/call.* 2>/dev/null; "$RMDIR" "$WORK" 2>/dev/null || true'
 # 125 when it is sudo and still running (pid in BOUNDED_PID; this script
 # bounds no sudo call). The same helper as install.sh's, which says more.
 # supervise() enforces the limit itself, even if this run is killed while it
-# waits: SIGTERM at the limit, SIGKILL a second later, never SIGKILL for
-# sudo. The supervisor and the call keep fd 9 (the recovery lock) until the
+# waits: SIGTERM once the limit has passed on bash's SECONDS clock, SIGKILL
+# one to two seconds later, never SIGKILL for sudo. The supervisor and the call keep fd 9 (the recovery lock) until the
 # call has exited, so a launchctl bootout made under the lock cannot unload
 # an agent the app confirms after this run is gone.
 BOUNDED_OUTPUT=""
 BOUNDED_PID=""
 # shellcheck disable=SC2034  # BOUNDED_PID is for sudo, and this script bounds none
 bounded() { # command args...
-  local base supervisor rc i
+  local base supervisor rc deadline
   base="$("$MKTEMP" "$WORK/call.XXXXXX")"
   BOUNDED_OUTPUT=""
   BOUNDED_PID=""
   supervise "$base" "$@" </dev/null >/dev/null 2>&1 &
   supervisor=$!
   if [[ "$1" == "$SUDO" ]]; then
-    # The limit, then up to two seconds for sudo to stop on SIGTERM.
-    for (( i = 0; i < (CALL_TIMEOUT_SECONDS + 2) * 100; i++ )); do
-      if [[ -s "$base.rc" ]]; then break; fi
+    # The supervisor's limit (at most a second over), then at least two
+    # seconds for sudo to stop on SIGTERM.
+    deadline=$(( SECONDS + CALL_TIMEOUT_SECONDS + 3 ))
+    while [[ ! -s "$base.rc" ]] && (( SECONDS <= deadline )); do
       sleep 0.01
     done
     if [[ ! -s "$base.rc" ]]; then
@@ -154,7 +155,8 @@ bounded() { # command args...
       return 125
     fi
   fi
-  # Any other call is killed a second after the limit, so this wait ends.
+  # Any other call gets SIGKILL at most two seconds after its SIGTERM, so
+  # this wait ends.
   wait "$supervisor" 2>/dev/null || true
   rc=124
   if [[ -s "$base.rc" ]]; then read -r rc < "$base.rc"; fi
@@ -167,21 +169,21 @@ bounded() { # command args...
 # skips a job it has already reaped: a reused pid is never signalled. The
 # status file is written once the call has been reaped.
 supervise() { # base command args...
-  local base="$1" cpid rc=0 i
+  local base="$1" cpid rc=0 deadline
   shift
   "$@" </dev/null >"$base.out" 2>&1 &
   cpid=$!
   echo "$cpid" > "$base.pid"
-  for (( i = 0; i < CALL_TIMEOUT_SECONDS * 100; i++ )); do
-    kill -0 "$cpid" 2>/dev/null || break
+  deadline=$(( SECONDS + CALL_TIMEOUT_SECONDS ))
+  while kill -0 "$cpid" 2>/dev/null && (( SECONDS <= deadline )); do
     sleep 0.01
   done
-  # At the limit, and the shell has not reaped the call: it is still there.
-  if (( i == CALL_TIMEOUT_SECONDS * 100 )) && [[ -n "$(jobs -rp)" ]]; then
+  # Past the limit, and the shell has not reaped the call: it is still there.
+  if (( SECONDS > deadline )) && [[ -n "$(jobs -rp)" ]]; then
     kill -TERM %1 2>/dev/null || true
     if [[ "$1" != "$SUDO" ]]; then
-      for (( i = 0; i < 100; i++ )); do
-        if [[ -z "$(jobs -rp)" ]]; then break; fi
+      deadline=$(( SECONDS + 1 ))
+      while [[ -n "$(jobs -rp)" ]] && (( SECONDS <= deadline )); do
         sleep 0.01
       done
       if [[ -n "$(jobs -rp)" ]]; then kill -KILL %1 2>/dev/null || true; fi

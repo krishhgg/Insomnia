@@ -1827,6 +1827,32 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(try fx.lockIsFree())
     }
 
+    /// The same hung `codesign --verify`, with every poll the script makes
+    /// a quarter second slower (see slowPollingPath). The limits are read
+    /// from bash's SECONDS clock, so the call is still stopped within three
+    /// seconds of its 5 s limit: SIGTERM once the limit has passed, SIGKILL
+    /// one to two seconds later. Limits counted in polls (100 a second) took
+    /// minutes here, and up to 36 s on a loaded CI runner.
+    func testUninstallStopsAHungCallOnTimeWhenEveryPollIsSlow() throws {
+        try fx.installMachinery()
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        try FileManager.default.removeItem(at: fx.backstop)
+        try fx.writeMarkerBackstop(at: fx.installedBackstop, name: "sealed")
+        fx.setMode("codesign", "verify-hangs")
+
+        let started = Date()
+        let r = try fx.run(fx.uninstall, ["--purge"], extraEnvironment: ["PATH": try fx.slowPollingPath()])
+        let elapsed = Date().timeIntervalSince(started)
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertGreaterThan(fx.slowPolls(), 0, "the script polled through the slow sleep")
+        XCTAssertGreaterThan(elapsed, 5, "the call had its whole limit")
+        XCTAssertLessThan(elapsed, 15, "the 5 s limit, at most a second more, at most two of grace, and a few slow polls")
+        XCTAssertTrue(r.stderr.contains("'codesign --verify --strict \(fx.app.path)' did not answer within 5s"), r.stderr)
+        XCTAssertTrue(fx.hungProcessGone("codesign", within: 0))
+        XCTAssertTrue(try fx.lockIsFree())
+    }
+
     /// install.sh and uninstall.sh make their calls through the same
     /// bounded() and supervise(), so a fix to one cannot miss the other.
     func testInstallAndUninstallShareTheBoundedCallHelper() throws {
@@ -3950,6 +3976,31 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(fx.commandEnded(), "released")
     }
 
+    /// The sudoers check before the lock never answers and ignores SIGTERM,
+    /// with every poll slow (see slowPollingPath). The run still gives up on
+    /// it after the 5 s limit and at least two seconds for SIGTERM, within
+    /// four seconds of the limit, and leaves it running: sudo is never sent
+    /// SIGKILL.
+    func testInstallGivesUpOnAHungSudoOnTimeWhenEveryPollIsSlow() throws {
+        try writePreviousPair()
+        fx.setMode("sudo", "rule-check-hangs")
+
+        let started = Date()
+        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester", "PATH": try fx.slowPollingPath()])
+        let elapsed = Date().timeIntervalSince(started)
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertGreaterThan(fx.slowPolls(), 0, "the script polled through the slow sleep")
+        XCTAssertGreaterThan(elapsed, 8, "the limit, then at least two seconds after SIGTERM")
+        XCTAssertLessThan(elapsed, 15, "the 5 s limit, at most four seconds more, and a few slow polls")
+        let pid = try XCTUnwrap(fx.hungPid("sudo", within: 0))
+        XCTAssertTrue(r.stderr.contains("It was sent SIGTERM and is still running as pid \(pid). It is not killed"), r.stderr)
+        XCTAssertTrue(fx.calls().contains("sudo SIGTERM"), "\(fx.calls())")
+        XCTAssertFalse(fx.hungProcessGone("sudo", within: 2), "sudo is never sent SIGKILL")
+        fx.releaseCommand()
+        XCTAssertTrue(fx.hungProcessGone("sudo"))
+    }
+
     /// The sudoers check under the lock never answers and ignores SIGTERM.
     /// sudo is never sent SIGKILL, so it stays, and it keeps the recovery
     /// lock until it ends, as backstop.sh does with a sudo pmset: the run
@@ -4043,6 +4094,20 @@ final class RecoveryScriptTests: XCTestCase {
         let pid = try killDuringHungBootout(fx.installRedirected, extraEnvironment: ["USER": "tester"])
 
         try assertLockHeldUntilGone(pid, within: 20)
+        XCTAssertTrue(fx.calls().contains("launchctl FD9-OPEN"), "\(fx.calls())")
+    }
+
+    /// The killed install above, with every poll slow (see slowPollingPath).
+    /// The supervisor, alone once the run is gone, still stops the bootout
+    /// and lets go of the lock within three seconds of the 5 s limit.
+    func testAKilledInstallLetsGoOfTheLockOnTimeWhenEveryPollIsSlow() throws {
+        try writePreviousPair()
+        fx.setMode("launchctl", "bootout-hangs")
+
+        let pid = try killDuringHungBootout(fx.installRedirected, extraEnvironment: ["USER": "tester", "PATH": try fx.slowPollingPath()])
+
+        try assertLockHeldUntilGone(pid, within: 10)
+        XCTAssertGreaterThan(fx.slowPolls(), 0, "the script polled through the slow sleep")
         XCTAssertTrue(fx.calls().contains("launchctl FD9-OPEN"), "\(fx.calls())")
     }
 
@@ -5417,6 +5482,31 @@ private final class ScriptFixture {
             Thread.sleep(forTimeInterval: 0.05)
         } while Date() < deadline
         return nil
+    }
+
+    /// A PATH whose `sleep` waits a quarter second before the sleep it was
+    /// asked for, so every poll install.sh and uninstall.sh make is slow, as
+    /// on a loaded machine where each fork takes long. The scripts call sleep
+    /// by name; the fakes call /bin/sleep. Each call is counted (slowPolls()).
+    func slowPollingPath() throws -> String {
+        let dir = root.appendingPathComponent("slow-poll", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let stub = dir.appendingPathComponent("sleep")
+        try """
+        #!/bin/bash
+        echo "$*" >> "\(root.path)/slow-poll.log"
+        /bin/sleep 0.25
+        exec /bin/sleep "$@"
+
+        """.write(to: stub, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: stub.path)
+        return "\(dir.path):/usr/bin:/bin:/usr/sbin:/sbin"
+    }
+
+    /// How many times the scripts called the slow `sleep`.
+    func slowPolls() -> Int {
+        let text = (try? String(contentsOf: root.appendingPathComponent("slow-poll.log"), encoding: .utf8)) ?? ""
+        return text.split(separator: "\n").count
     }
 
     /// Runs a real tool (not a script) with the fixture's environment, here

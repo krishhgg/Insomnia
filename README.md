@@ -134,7 +134,7 @@ holds the lock has a 30 s limit, which a supervising process enforces even
 if the installer is killed meanwhile. The call keeps the lock until it has
 exited or been stopped, so no `launchctl bootout` it started is still
 running once the lock is released. A call that does not answer in time gets SIGTERM, then SIGKILL
-a second later, and the install stops, so the lock is released and the app
+one to two seconds later, and the install stops, so the lock is released and the app
 and the agent's backstop can take it again to undo a session. `sudo` only
 ever gets SIGTERM: one that ignores it keeps the lock until it ends, and the
 installer prints its pid.

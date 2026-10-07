@@ -82,31 +82,35 @@ command_line() { local line; line="$(printf '%q ' "$@")"; printf '%s' "${line% }
 # 125 when it is sudo and still running (pid in BOUNDED_PID).
 #
 # supervise() starts the call in the background and enforces the limit
-# itself, so the limit holds even if this run is killed while it waits. At
-# the limit the call gets SIGTERM, and SIGKILL a second later if it is still
-# there. sudo only ever gets SIGTERM: killing sudo would orphan what it runs
-# as root. The supervisor and the call keep fd 9 (the recovery lock, once
+# itself, so the limit holds even if this run is killed while it waits. Once
+# the limit has passed, the call gets SIGTERM, and SIGKILL one to two seconds
+# later if it is still there. sudo only ever gets SIGTERM: killing sudo would
+# orphan what it runs as root. Both waits are read from bash's SECONDS clock,
+# which counts whole seconds, so a call gets at least CALL_TIMEOUT_SECONDS
+# and at most a second more; a slow machine, where each poll takes longer,
+# does not stretch them. The supervisor and the call keep fd 9 (the recovery lock, once
 # this run holds it) until the call has exited, so no call made under the
 # lock outlives it: if this run is killed during a launchctl bootout, the
 # bootout is stopped and reaped before the lock goes, and cannot unload an
 # agent the app confirms after taking the lock. Every call but sudo is gone
-# by the limit plus about a second. A sudo that ignores SIGTERM keeps the
+# within three seconds of the limit. A sudo that ignores SIGTERM keeps the
 # lock until it ends, as backstop.sh does with sudo pmset.
 # Each call's files get a name from mktemp, so a call made inside $(...)
 # cannot reuse another's.
 BOUNDED_OUTPUT=""
 BOUNDED_PID=""
 bounded() { # command args...
-  local base supervisor rc i
+  local base supervisor rc deadline
   base="$("$MKTEMP" "$WORK/call.XXXXXX")"
   BOUNDED_OUTPUT=""
   BOUNDED_PID=""
   supervise "$base" "$@" </dev/null >/dev/null 2>&1 &
   supervisor=$!
   if [[ "$1" == "$SUDO" ]]; then
-    # The limit, then up to two seconds for sudo to stop on SIGTERM.
-    for (( i = 0; i < (CALL_TIMEOUT_SECONDS + 2) * 100; i++ )); do
-      if [[ -s "$base.rc" ]]; then break; fi
+    # The supervisor's limit (at most a second over), then at least two
+    # seconds for sudo to stop on SIGTERM.
+    deadline=$(( SECONDS + CALL_TIMEOUT_SECONDS + 3 ))
+    while [[ ! -s "$base.rc" ]] && (( SECONDS <= deadline )); do
       sleep 0.01
     done
     if [[ ! -s "$base.rc" ]]; then
@@ -114,7 +118,8 @@ bounded() { # command args...
       return 125
     fi
   fi
-  # Any other call is killed a second after the limit, so this wait ends.
+  # Any other call gets SIGKILL at most two seconds after its SIGTERM, so
+  # this wait ends.
   wait "$supervisor" 2>/dev/null || true
   rc=124
   if [[ -s "$base.rc" ]]; then read -r rc < "$base.rc"; fi
@@ -127,21 +132,21 @@ bounded() { # command args...
 # skips a job it has already reaped: a reused pid is never signalled. The
 # status file is written once the call has been reaped.
 supervise() { # base command args...
-  local base="$1" cpid rc=0 i
+  local base="$1" cpid rc=0 deadline
   shift
   "$@" </dev/null >"$base.out" 2>&1 &
   cpid=$!
   echo "$cpid" > "$base.pid"
-  for (( i = 0; i < CALL_TIMEOUT_SECONDS * 100; i++ )); do
-    kill -0 "$cpid" 2>/dev/null || break
+  deadline=$(( SECONDS + CALL_TIMEOUT_SECONDS ))
+  while kill -0 "$cpid" 2>/dev/null && (( SECONDS <= deadline )); do
     sleep 0.01
   done
-  # At the limit, and the shell has not reaped the call: it is still there.
-  if (( i == CALL_TIMEOUT_SECONDS * 100 )) && [[ -n "$(jobs -rp)" ]]; then
+  # Past the limit, and the shell has not reaped the call: it is still there.
+  if (( SECONDS > deadline )) && [[ -n "$(jobs -rp)" ]]; then
     kill -TERM %1 2>/dev/null || true
     if [[ "$1" != "$SUDO" ]]; then
-      for (( i = 0; i < 100; i++ )); do
-        if [[ -z "$(jobs -rp)" ]]; then break; fi
+      deadline=$(( SECONDS + 1 ))
+      while [[ -n "$(jobs -rp)" ]] && (( SECONDS <= deadline )); do
         sleep 0.01
       done
       if [[ -n "$(jobs -rp)" ]]; then kill -KILL %1 2>/dev/null || true; fi
