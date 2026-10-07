@@ -68,7 +68,7 @@ refs/tags/v<version>`); `install.sh --app` then checks the signature,
 identifier and version of a private copy of the bundle before asking for a
 password, installs that copy, and refuses
 it unless `--allow-unverified-origin` is given, because it cannot verify where
-an ad-hoc bundle came from. The attestation shows which workflow run produced
+a bundle came from, whatever its signature names. The attestation shows which workflow run produced
 the bytes, not that the code is free of defects. Releases are ad-hoc signed and
 not notarized ([docs/releasing.md](docs/releasing.md)), so macOS blocks their
 first launch.

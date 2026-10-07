@@ -37,8 +37,9 @@ closed bag. Its design goals are to:
   true`, no Dock icon) with `backstop.sh` sealed under `Contents/Resources`
   and signs it ad-hoc.
   `install.sh` installs that build, or a prebuilt bundle passed with
-  `--app` after verifying it (one whose origin it cannot verify needs
-  `--allow-unverified-origin`), to `~/Applications`. The Release workflow
+  `--app` after verifying its integrity (only with
+  `--allow-unverified-origin`, since it cannot verify where a bundle came
+  from), to `~/Applications`. The Release workflow
   packages the same bundle (`docs/releasing.md`), built for arm64 only;
   `install.sh --app` stops unless `sysctl -n hw.optional.arm64` reads 1
   (true on Apple Silicon, also under Rosetta). `install.sh` and

@@ -84,9 +84,13 @@ final class ReleaseWorkflowTests: XCTestCase {
     }
 
     /// Releases are ad-hoc signed and not notarized: the workflow reads no
-    /// secret, imports no certificate, notarizes nothing, and build-app.sh
-    /// has no Developer ID path (no signing identity from the environment,
-    /// no hardened runtime, no timestamp).
+    /// secret, imports no certificate, notarizes nothing, build-app.sh has
+    /// no Developer ID path (no signing identity from the environment, no
+    /// hardened runtime, no timestamp), and install.sh has no Developer ID
+    /// origin check (no Gatekeeper assessment, no expected team) that could
+    /// let a bundle skip --allow-unverified-origin. RecoveryScriptTests'
+    /// testInstallFromPrebuiltAppNeedsTheOptInWhateverItsSignatureNames
+    /// checks the behaviour.
     func testTheReleaseIsAdHocSignedWithNoSigningOrNotarizationStep() throws {
         let text = try XCTUnwrap(try workflows().first { $0.name == "release.yml" }).text
         for absent in ["secrets.", "security ", "create-keychain", "notarytool", "stapler", "INSOMNIA_SIGN", "INSOMNIA_NOTARY"] {
@@ -98,6 +102,10 @@ final class ReleaseWorkflowTests: XCTestCase {
             XCTAssertFalse(build.contains(absent), "build-app.sh contains \(absent)")
         }
         XCTAssertTrue(build.contains(#""$CODESIGN" --force --sign - "$APP""#), "build-app.sh signs ad-hoc")
+        let install = try String(contentsOf: repo.appendingPathComponent("scripts/install.sh"), encoding: .utf8)
+        for absent in ["spctl", "SPCTL", "EXPECTED_TEAM_ID", "TeamIdentifier"] {
+            XCTAssertFalse(install.contains(absent), "install.sh contains \(absent)")
+        }
     }
 
     /// The build job has read-only access; only the job

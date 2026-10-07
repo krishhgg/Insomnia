@@ -19,16 +19,17 @@
 #                                             (arm64 only, so this stops on a
 #                                             Mac without Apple Silicon), after
 #                                             checking its signature, bundle
-#                                             identifier and version. Its origin
-#                                             counts as verified only when it is
-#                                             Developer ID signed by the team in
-#                                             EXPECTED_TEAM_ID and Gatekeeper
-#                                             accepts it; any other bundle is
-#                                             refused unless
-#                                             --allow-unverified-origin is given
-#                                             as well. Nothing of this checkout
-#                                             is needed then; the zip carries
-#                                             this script.
+#                                             identifier and version. Those
+#                                             show the bundle is intact, not
+#                                             who made it, so it is refused
+#                                             unless --allow-unverified-origin
+#                                             is given as well: releases are
+#                                             ad-hoc signed and not notarized,
+#                                             and the checksum and attestation
+#                                             the user checks are what tie a
+#                                             zip to this repository. Nothing
+#                                             of this checkout is needed then;
+#                                             the zip carries this script.
 # Either way the bundle is checked before the password prompt, so a bad build
 # or download changes nothing.
 set -euo pipefail
@@ -54,7 +55,6 @@ LAUNCHCTL=/bin/launchctl
 SUDO=/usr/bin/sudo
 PLUTIL=/usr/bin/plutil
 CODESIGN=/usr/bin/codesign
-SPCTL=/usr/bin/spctl
 DITTO=/usr/bin/ditto
 CHMOD=/bin/chmod
 SYSCTL=/usr/sbin/sysctl
@@ -72,11 +72,6 @@ CALL_TIMEOUT_SECONDS=30
 
 # What a prebuilt bundle (--app) must be.
 BUNDLE_ID=com.kgarg.insomnia
-# Apple Team ID of a Developer ID whose bundles --app treats as verified in
-# origin, when Gatekeeper accepts them. Empty: releases are ad-hoc signed and
-# not notarized (docs/releasing.md), so every bundle needs
-# --allow-unverified-origin.
-EXPECTED_TEAM_ID=""
 
 # The folder this script is in. build-app.sh and backstop.sh are taken from
 # there, and only when it is the scripts/ folder of a source checkout, with
@@ -351,47 +346,23 @@ if [[ -n "$PREBUILT" ]]; then
     exit 1
   fi
   # Origin. The checks above show the bundle is intact, not where it came
-  # from: anyone can ad-hoc sign a bundle with this identifier, and while
-  # EXPECTED_TEAM_ID is empty no Developer ID team is expected either. Only
-  # a Developer ID signature from the expected team, with Gatekeeper's
-  # verdict (notarized, not revoked), establishes origin here. Everything
-  # else is installed only with --allow-unverified-origin, after the user
-  # verified the download with SHA256SUMS and the attestation themselves.
-  SIGNING="$("$CODESIGN" -dvv "$CHECKED_APP" 2>&1 || true)"
-  TEAM="$(sed -n 's/^TeamIdentifier=//p' <<<"$SIGNING" | head -n 1)"
-  origin=""
-  unverified=""
-  if grep -q '^Authority=Developer ID Application' <<<"$SIGNING"; then
-    if ! "$SPCTL" --assess --type execute "$CHECKED_APP"; then
-      echo "$PREBUILT is Developer ID signed but Gatekeeper rejects it (not notarized, or the certificate was revoked). Nothing was changed." >&2
-      exit 1
-    fi
-    if [[ -n "$EXPECTED_TEAM_ID" ]]; then
-      if [[ "$TEAM" != "$EXPECTED_TEAM_ID" ]]; then
-        echo "$PREBUILT is signed by team '${TEAM:-<none>}', not $EXPECTED_TEAM_ID (the team this install.sh expects). Nothing was changed." >&2
-        exit 1
-      fi
-      origin="Developer ID signed by team $TEAM, the team this install.sh expects, and Gatekeeper accepts it"
-    else
-      unverified="Developer ID signed by team ${TEAM:-<none>} and Gatekeeper accepts it, but EXPECTED_TEAM_ID is empty in this install.sh, so no team is expected and this one is not checked"
-    fi
-  else
-    unverified="ad-hoc signed, an experimental build. The signature covers the bundle but names no developer, and anyone can ad-hoc sign a bundle with this identifier"
-  fi
-  if [[ -n "$origin" ]]; then
-    echo "Insomnia $PREBUILT_VERSION: $origin"
-  elif (( ALLOW_UNVERIFIED_ORIGIN )); then
-    echo "WARNING: the origin of Insomnia $PREBUILT_VERSION is not verified: $unverified."
+  # from. A signature shows the bundle has not changed since it was signed,
+  # and anyone can sign a bundle with this identifier, so this script does
+  # not read who signed it. Releases are ad-hoc signed and not notarized
+  # (docs/releasing.md). What ties a zip to this repository's Release
+  # workflow is the checksum and the attestation, which only the user can
+  # check, so every prebuilt bundle needs --allow-unverified-origin, the flag
+  # that says they did.
+  if (( ALLOW_UNVERIFIED_ORIGIN )); then
+    echo "WARNING: the origin of Insomnia $PREBUILT_VERSION is not verified. Its signature shows the bundle is intact, not who made it."
     echo "--allow-unverified-origin: installing it anyway. Its backstop.sh will run as you at login and every 60 s."
     echo "Continue only if you checked the zip yourself with SHA256SUMS and 'gh attestation verify' (README, Install)."
-    if [[ "$unverified" == ad-hoc* ]]; then
-      echo "macOS blocks the first launch of a downloaded ad-hoc build until you allow it in System Settings > Privacy & Security."
-    fi
+    echo "Releases are not notarized, so macOS blocks the first launch of a downloaded one until you allow it in System Settings > Privacy & Security."
   else
     cat >&2 <<REFUSE
-The origin of Insomnia $PREBUILT_VERSION at $PREBUILT is not verified: $unverified.
-This install.sh cannot tell where the bundle came from, and installing it would run its backstop.sh as you
-at login and every 60 s. Nothing was changed.
+The origin of Insomnia $PREBUILT_VERSION at $PREBUILT is not verified. Its signature shows the bundle is
+intact, not who made it: anyone can sign a bundle with this identifier, and this install.sh cannot tell
+where it came from. Installing it would run its backstop.sh as you at login and every 60 s. Nothing was changed.
 Verify the zip yourself first ('shasum -a 256 -c SHA256SUMS' and 'gh attestation verify' with --signer-workflow,
 see the README), then rerun with the flag that says so:
   $(command_line "$0" --allow-unverified-origin --app "$PREBUILT")
@@ -501,9 +472,10 @@ BACKSTOP="$NEW_APP/Contents/Resources/backstop.sh"
 echo "signed $("$CODESIGN" -dv "$NEW_APP" 2>&1 | grep -i identifier || true)"
 # What the agent pins: the bundle's designated requirement, in the form
 # `codesign -d -r-` prints (an implicit one carries a leading "# "). For an
-# ad-hoc signature that is the cdhash of this build, so no other build and
-# no edited bundle satisfies it; for a Developer ID signature it names the
-# identifier and the team. It does not depend on the path, so it still holds
+# ad-hoc signature, which source builds and releases have, that is the cdhash
+# of this build, so no other build and no edited bundle satisfies it. A
+# bundle signed with a certificate pins what its own signature declares
+# instead. It does not depend on the path, so it still holds
 # once the bundle is at $APP. The app reads the same text through the
 # Security framework (CodeRequirement.swift) to recognise this plist.
 REQUIREMENT="$("$CODESIGN" -d -r- "$NEW_APP" 2>&1 | sed -n 's/^#\{0,1\} *designated => //p' | head -n 1)"
@@ -695,12 +667,10 @@ so they still match each other; the new build was discarded."
   # copy is deleted when this script exits; the original may have changed
   # since the check, so the step is this script again, which checks a new copy.
   if [[ -n "$PREBUILT" ]]; then
-    rerun="$(command_line "$0" --app "$PREBUILT")"
-    if (( ALLOW_UNVERIFIED_ORIGIN )); then rerun="$(command_line "$0" --allow-unverified-origin --app "$PREBUILT")"; fi
     manual_step="Or rerun this script. It checks a new private
 copy of the bundle and runs that copy's recovery before it replaces the app
 or the LaunchAgent:
-  $rerun"
+  $(command_line "$0" --allow-unverified-origin --app "$PREBUILT")"
   else
     manual_step="Or run the recovery by hand:
   $(command_line /bin/bash "$SCRIPT_DIR/backstop.sh" --force)

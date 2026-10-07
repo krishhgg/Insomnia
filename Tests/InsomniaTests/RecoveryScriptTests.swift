@@ -3261,9 +3261,9 @@ final class RecoveryScriptTests: XCTestCase {
         let verify = try XCTUnwrap(calls.firstIndex(of: "codesign --verify --strict --deep \(copy)"), "\(calls)")
         let visudo = try XCTUnwrap(calls.firstIndex { $0.hasPrefix("sudo visudo") }, "\(calls)")
         XCTAssertLessThan(verify, visudo, "verified before the password prompt: \(calls)")
-        XCTAssertFalse(calls.contains { $0.hasPrefix("spctl") }, "Gatekeeper is asked about Developer ID builds only: \(calls)")
-        XCTAssertTrue(r.stdout.contains("WARNING: the origin of Insomnia 0.1.0 is not verified: ad-hoc signed, an experimental build"), r.stdout)
+        XCTAssertTrue(r.stdout.contains("WARNING: the origin of Insomnia 0.1.0 is not verified. Its signature shows the bundle is intact, not who made it."), r.stdout)
         XCTAssertTrue(r.stdout.contains("--allow-unverified-origin: installing it anyway"), r.stdout)
+        XCTAssertTrue(r.stdout.contains("macOS blocks the first launch"), r.stdout)
         XCTAssertEqual(try String(contentsOf: fx.app.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "prebuilt")
         XCTAssertTrue(fx.exists(fx.installedBackstop))
         XCTAssertTrue(fx.exists(prebuilt), "the source bundle is copied, not moved")
@@ -3398,35 +3398,40 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(fx.exists(fx.app))
     }
 
-    /// Integrity is not origin: an ad-hoc bundle, or a Developer ID bundle
-    /// while EXPECTED_TEAM_ID is empty, passes every check on it and could
-    /// still have been made by anyone. Without --allow-unverified-origin
-    /// install.sh refuses it before the password prompt and names the flag.
-    func testInstallFromPrebuiltAppRefusesAnUnverifiedOriginWithoutTheOptIn() throws {
+    /// Integrity is not origin: a bundle that passes every check on it could
+    /// still have been signed by anyone, and install.sh does not take the
+    /// signer's word for where it came from. Whatever the signature names
+    /// (ad-hoc, or a Developer ID certificate and team), without
+    /// --allow-unverified-origin install.sh refuses it before the password
+    /// prompt and names the flag. With the flag the Developer ID bundle gets
+    /// the same warning as an ad-hoc one, not a verified origin.
+    func testInstallFromPrebuiltAppNeedsTheOptInWhateverItsSignatureNames() throws {
         try fx.prepareInstall()
         let prebuilt = try writePrebuiltAppAtAnAwkwardPath()
+        fx.setMode("launchctl", "loaded")
 
-        let adhoc = try fx.run(fx.installRedirected, ["--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
+        for signing in ["adhoc", "developer-id:ABCDE12345"] {
+            fx.setSigning(signing)
+            fx.clearCalls()
+            let r = try fx.run(fx.installRedirected, ["--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
 
-        XCTAssertEqual(adhoc.status, 1, adhoc.stderr + adhoc.stdout)
-        let copy = try checkedCopy(of: prebuilt)
-        XCTAssertEqual(fx.callsBesideScratchFiles(), ["sysctl -n hw.optional.arm64", "codesign --verify --strict --deep \(copy)", "codesign -dvv \(copy)"], "\(fx.calls())")
-        XCTAssertTrue(adhoc.stderr.contains("The origin of Insomnia 0.1.0 at \(prebuilt.path) is not verified: ad-hoc signed"), adhoc.stderr)
-        XCTAssertEqual(try pastedWords(of: printedCommand(in: adhoc.stderr, containing: " --app ")), [fx.installRedirected.path, "--allow-unverified-origin", "--app", prebuilt.path], "names the flag")
-        XCTAssertTrue(adhoc.stderr.contains("Nothing was changed"), adhoc.stderr)
-        XCTAssertFalse(fx.exists(fx.app))
-        XCTAssertFalse(fx.exists(fx.sudoers))
+            XCTAssertEqual(r.status, 1, "\(signing): \(r.stderr + r.stdout)")
+            let copy = try checkedCopy(of: prebuilt)
+            XCTAssertEqual(fx.callsBesideScratchFiles(), ["sysctl -n hw.optional.arm64", "codesign --verify --strict --deep \(copy)"], "\(signing): \(fx.calls())")
+            XCTAssertTrue(r.stderr.contains("The origin of Insomnia 0.1.0 at \(prebuilt.path) is not verified."), "\(signing): \(r.stderr)")
+            XCTAssertEqual(try pastedWords(of: printedCommand(in: r.stderr, containing: " --app ")), [fx.installRedirected.path, "--allow-unverified-origin", "--app", prebuilt.path], "\(signing): names the flag")
+            XCTAssertTrue(r.stderr.contains("Nothing was changed"), "\(signing): \(r.stderr)")
+            XCTAssertFalse(fx.exists(fx.app), signing)
+            XCTAssertFalse(fx.exists(fx.sudoers), signing)
+        }
 
-        fx.setSigning("developer-id:ABCDE12345")
         fx.clearCalls()
-        let unpinnedTeam = try fx.run(fx.installRedirected, ["--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
+        let flagged = try fx.run(fx.installRedirected, ["--allow-unverified-origin", "--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
 
-        XCTAssertEqual(unpinnedTeam.status, 1, unpinnedTeam.stderr + unpinnedTeam.stdout)
-        XCTAssertTrue(fx.calls().contains("spctl --assess --type execute \(try checkedCopy(of: prebuilt))"), "\(fx.calls())")
-        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("sudo") }, "\(fx.calls())")
-        XCTAssertTrue(unpinnedTeam.stderr.contains("Developer ID signed by team ABCDE12345 and Gatekeeper accepts it, but EXPECTED_TEAM_ID is empty"), unpinnedTeam.stderr)
-        XCTAssertTrue(unpinnedTeam.stderr.contains("Nothing was changed"), unpinnedTeam.stderr)
-        XCTAssertFalse(fx.exists(fx.app))
+        XCTAssertEqual(flagged.status, 0, flagged.stderr + flagged.stdout)
+        XCTAssertTrue(flagged.stdout.contains("WARNING: the origin of Insomnia 0.1.0 is not verified."), flagged.stdout)
+        XCTAssertEqual(try String(contentsOf: fx.app.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "prebuilt")
+        XCTAssertTrue(fx.exists(fx.installedBackstop))
     }
 
     /// The release-install path with the real codesign: a bundle ad-hoc
@@ -3557,17 +3562,21 @@ final class RecoveryScriptTests: XCTestCase {
         }
     }
 
+    /// The integrity checks below hold with --allow-unverified-origin: the
+    /// flag vouches for where a bundle came from, never for a bundle that
+    /// fails them.
     func testInstallFromPrebuiltAppStopsBeforeSudoWhenItsSignatureDoesNotVerify() throws {
         try fx.prepareInstall()
         try fx.installMachinery()
         let prebuilt = try fx.writePrebuiltApp()
         fx.setMode("codesign", "deep-verify-fails")
 
-        let r = try fx.run(fx.installRedirected, ["--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
+        let r = try fx.run(fx.installRedirected, ["--allow-unverified-origin", "--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
 
         XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
         let calls = fx.callsBesideScratchFiles()
         XCTAssertEqual(calls, ["sysctl -n hw.optional.arm64", "codesign --verify --strict --deep \(try checkedCopy(of: prebuilt))"], "nothing after the failed check: \(fx.calls())")
+        XCTAssertTrue(r.stderr.contains("fails 'codesign --verify --strict --deep'"), r.stderr)
         XCTAssertTrue(r.stderr.contains("Nothing was changed"), r.stderr)
         XCTAssertTrue(r.stderr.contains("SHA256SUMS"), "points at the download checks: \(r.stderr)")
         XCTAssertEqual(try String(contentsOf: fx.app.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "binary", "old bundle kept")
@@ -3577,74 +3586,23 @@ final class RecoveryScriptTests: XCTestCase {
 
     func testInstallFromPrebuiltAppRefusesAnotherIdentifierAVersionlessBundleAndAMissingBackstop() throws {
         try fx.prepareInstall()
-        let cases: [(String, (ScriptFixture) throws -> URL)] = [
-            ("identifier", { try $0.writePrebuiltApp(bundleID: "com.example.other") }),
-            ("version", { try $0.writePrebuiltApp(version: "dev") }),
-            ("backstop", { try $0.writePrebuiltApp(withBackstop: false) }),
+        let cases: [(String, String, (ScriptFixture) throws -> URL)] = [
+            ("identifier", "has bundle identifier 'com.example.other', not com.kgarg.insomnia", { try $0.writePrebuiltApp(bundleID: "com.example.other") }),
+            ("version", "has no usable CFBundleShortVersionString ('dev')", { try $0.writePrebuiltApp(version: "dev") }),
+            ("backstop", "has no Contents/Resources/backstop.sh", { try $0.writePrebuiltApp(withBackstop: false) }),
         ]
-        for (name, make) in cases {
+        for (name, reason, make) in cases {
             let bundle = try make(fx)
             fx.clearCalls()
-            let r = try fx.run(fx.installRedirected, ["--app", bundle.path], extraEnvironment: ["USER": "tester"])
+            let r = try fx.run(fx.installRedirected, ["--allow-unverified-origin", "--app", bundle.path], extraEnvironment: ["USER": "tester"])
             XCTAssertEqual(r.status, 1, "\(name): \(r.stderr + r.stdout)")
             XCTAssertFalse(fx.calls().contains { $0.hasPrefix("sudo") }, "\(name): \(fx.calls())")
+            XCTAssertTrue(r.stderr.contains(reason), "\(name): \(r.stderr)")
             XCTAssertTrue(r.stderr.contains("Nothing was changed"), "\(name): \(r.stderr)")
             XCTAssertFalse(fx.exists(fx.app), name)
             XCTAssertFalse(fx.exists(fx.sudoers), name)
             try FileManager.default.removeItem(at: bundle)
         }
-    }
-
-    /// A Developer ID bundle must also pass Gatekeeper (notarized, not
-    /// revoked). Its team establishes origin only once EXPECTED_TEAM_ID is
-    /// set in install.sh: while it is empty the bundle takes
-    /// --allow-unverified-origin and the warning says why; another team is
-    /// refused even with the flag; the expected team installs without it.
-    func testInstallFromDeveloperIDAppAsksGatekeeperAndChecksTheTeamWhenOneIsExpected() throws {
-        try fx.prepareInstall()
-        let prebuilt = try fx.writePrebuiltApp()
-        fx.setSigning("developer-id:ABCDE12345")
-        fx.setMode("launchctl", "loaded")
-
-        let unpinned = try fx.run(fx.installRedirected, ["--allow-unverified-origin", "--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
-
-        XCTAssertEqual(unpinned.status, 0, unpinned.stderr + unpinned.stdout)
-        XCTAssertTrue(fx.calls().contains("spctl --assess --type execute \(try checkedCopy(of: prebuilt))"), "\(fx.calls())")
-        XCTAssertTrue(unpinned.stdout.contains("WARNING: the origin of Insomnia 0.1.0 is not verified: Developer ID signed by team ABCDE12345"), unpinned.stdout)
-        XCTAssertTrue(unpinned.stdout.contains("EXPECTED_TEAM_ID is empty"), "says the team is not checked: \(unpinned.stdout)")
-
-        try fx.writeInstallCopies(extraConstants: ["EXPECTED_TEAM_ID": "ZZZZZ99999"])
-        fx.clearCalls()
-        let wrongTeam = try fx.run(fx.installRedirected, ["--allow-unverified-origin", "--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
-
-        XCTAssertEqual(wrongTeam.status, 1, wrongTeam.stderr + wrongTeam.stdout)
-        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("sudo") }, "\(fx.calls())")
-        XCTAssertTrue(wrongTeam.stderr.contains("signed by team 'ABCDE12345', not ZZZZZ99999"), "refused even with the flag: \(wrongTeam.stderr)")
-        XCTAssertTrue(wrongTeam.stderr.contains("Nothing was changed"), wrongTeam.stderr)
-
-        try fx.writeInstallCopies(extraConstants: ["EXPECTED_TEAM_ID": "ABCDE12345"])
-        fx.clearCalls()
-        let pinned = try fx.run(fx.installRedirected, ["--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
-
-        XCTAssertEqual(pinned.status, 0, pinned.stderr + pinned.stdout)
-        XCTAssertTrue(pinned.stdout.contains("Insomnia 0.1.0: Developer ID signed by team ABCDE12345, the team this install.sh expects, and Gatekeeper accepts it"), pinned.stdout)
-        XCTAssertFalse(pinned.stdout.contains("WARNING"), "origin verified, no opt-in needed: \(pinned.stdout)")
-    }
-
-    func testInstallFromDeveloperIDAppStopsBeforeSudoWhenGatekeeperRejectsIt() throws {
-        try fx.prepareInstall()
-        let prebuilt = try fx.writePrebuiltApp()
-        fx.setSigning("developer-id:ABCDE12345")
-        fx.setMode("spctl", "reject")
-
-        let r = try fx.run(fx.installRedirected, ["--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
-
-        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
-        XCTAssertTrue(fx.calls().contains("spctl --assess --type execute \(try checkedCopy(of: prebuilt))"), "\(fx.calls())")
-        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("sudo") }, "\(fx.calls())")
-        XCTAssertTrue(r.stderr.contains("Gatekeeper rejects it"), r.stderr)
-        XCTAssertTrue(r.stderr.contains("Nothing was changed"), r.stderr)
-        XCTAssertFalse(fx.exists(fx.app))
     }
 
     /// A source install builds through build-app.sh into a staging
@@ -5301,9 +5259,9 @@ private final class ScriptFixture {
     }
 
     /// install.sh: every $HOME-derived path and every tool is redirected
-    /// into the fixture (signing, Gatekeeper, sudo, launchctl included; the
-    /// build goes through the patched build-app.sh above). Tests that need
-    /// another constant (EXPECTED_TEAM_ID) rewrite both copies with it.
+    /// into the fixture (signing, sudo, launchctl included; the build goes
+    /// through the patched build-app.sh above). Tests that need another
+    /// constant (the real CODESIGN) rewrite both copies with it.
     func writeInstallCopies(extraConstants: [String: String]) throws {
         let installText = try String(contentsOf: Self.productionScripts.appendingPathComponent("install.sh"), encoding: .utf8)
         let patchedInstall = try Self.patch(installText, [
@@ -5319,7 +5277,6 @@ private final class ScriptFixture {
             "LAUNCHCTL": bin.appendingPathComponent("launchctl").path,
             "SUDO": bin.appendingPathComponent("sudo").path,
             "CODESIGN": bin.appendingPathComponent("codesign").path,
-            "SPCTL": bin.appendingPathComponent("spctl").path,
             "SYSCTL": bin.appendingPathComponent("sysctl").path,
             "MV": bin.appendingPathComponent("mv").path,
             "RM": bin.appendingPathComponent("rm").path,
@@ -5579,15 +5536,6 @@ private final class ScriptFixture {
           esac
         done
         exit 0
-        """)
-        // spctl: Gatekeeper's verdict on a Developer ID bundle. Mode
-        // "reject" is what an unnotarized or revoked signature gets.
-        try writeFake("spctl", """
-        printf 'spctl %s\\n' "$*" >> "\(calls)"
-        mode="$(cat "\(r)/spctl.mode" 2>/dev/null || echo ok)"
-        last=""; for a in "$@"; do last="$a"; done
-        if [[ "$mode" == reject ]]; then echo "$last: rejected" >&2; echo "source=Unnotarized Developer ID" >&2; exit 3; fi
-        echo "$last: accepted" >&2; echo "source=Notarized Developer ID" >&2; exit 0
         """)
         // ps: answers from ps.table. Modes: "fail" (exit 2 with an error
         // line, like a broken ps) and "garbage" (exit 0 with nonsense).

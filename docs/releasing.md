@@ -98,10 +98,11 @@ What is verified: the checksum shows the zip was not altered after
 workflow built this exact zip from the tag; `install.sh --app` shows the
 bundle inside is intact (signature and resource seal), has the expected
 identifier and a version, and carries the sealed backstop. What is not:
-`install.sh` cannot tell an ad-hoc bundle from this repository apart from one
-anyone else signed with the same identifier, so it refuses to install without
-`--allow-unverified-origin`, the flag that says you ran the two commands above
-yourself. The release notes carry that flag in the install command.
+`install.sh` cannot tell a bundle from this repository apart from one anyone
+else signed with the same identifier, and it does not take any signature,
+ad-hoc or not, as proof of where a bundle came from. So it refuses to install
+without `--allow-unverified-origin`, the flag that says you ran the two
+commands above yourself. The release notes carry that flag in the install command.
 
 ## What is not automated
 
