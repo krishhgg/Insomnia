@@ -40,13 +40,36 @@
 #       sleepDisabledByUs   -> sudo -n pmset -a disablesleep 0 (the entry is
 #                              cleared only if pending-start is gone)
 #       lowPowerSetByUs     -> sudo -n pmset -b lowpowermode 0
-#       frozenProcesses     -> SIGCONT, but only to a pid that is observed to
-#                              exist, be stopped, have started in this boot
-#                              session at the journaled second (ps -o lstart)
-#                              and belong to this user. A pid observed gone,
-#                              running, or not matching is cleared without a
-#                              signal. A pid that cannot be observed (ps
-#                              fails or prints something unparseable) is kept.
+#       frozenProcesses     -> SIGCONT, but only to a pid verified to be the
+#                              process the app froze. Entries that record
+#                              startedAtMicros are handed to the installed
+#                              app binary (INSOMNIA_BIN --resume-frozen
+#                              <seconds>) in one call with a time limit, one
+#                              line per entry on its standard input. For
+#                              each entry in turn it does one kernel lookup
+#                              (start time to the microsecond, boot session,
+#                              stopped state) immediately followed by that
+#                              entry's SIGCONT; this script never signals
+#                              such an entry itself. The binary runs only
+#                              when the bundle's Info.plist declares the
+#                              interface version this script speaks
+#                              (InsomniaResumeFrozenVersion), and it keeps
+#                              the lock on fd 9 until it exits, which it does
+#                              by itself after <seconds>. When the binary is
+#                              missing, does not declare that version, cannot
+#                              run, times out, or answers anything but one
+#                              documented line per entry, those entries are
+#                              kept and not signaled. An entry
+#                              without startedAtMicros (an older build) is
+#                              checked here instead: it must exist, be
+#                              stopped, have started in this boot session at
+#                              the journaled second (ps -o lstart) and belong
+#                              to this user. A pid observed gone, running, or
+#                              not matching is cleared without a signal. A pid
+#                              that cannot be observed (ps fails or prints
+#                              something unparseable) is kept. In both paths
+#                              an entry from another boot session is cleared
+#                              without a lookup.
 #       frozenPids (legacy)  -> never signaled and never cleared here, even if
 #                              the pid is gone: nothing proves the stopped
 #                              process is ours. Only the app resolves them.
@@ -88,8 +111,10 @@
 #     can read it back as a session that was already treated as ended. A
 #     state.json that is not a regular file is malformed.
 #
-# Limitation: the shell compares process start time to the second and the
-# boot session; only the app also compares the microseconds.
+# Limitation: for an entry without startedAtMicros the shell compares process
+# start time to the second only. For every entry a lookup and a signal are
+# still two operations, in the app binary as here; the binary does each
+# entry's lookup right before that entry's signal, never all lookups first.
 #
 # --force: treat the session as expired even if endsAt is in the future
 # (used by install.sh / uninstall.sh to end a stale session deliberately).
@@ -104,6 +129,9 @@
 # insomnia-backstop-version: 2
 set -euo pipefail
 export LC_ALL=C TZ=UTC
+# Everything this run creates (log lines, the lock file, the published
+# journal, the directories) is owner-only, like the files the app writes.
+umask 077
 
 # Fixed tool paths: never taken from PATH or the environment. Tests patch
 # these lines in a private copy of the script.
@@ -114,6 +142,7 @@ LOCKF=/usr/bin/lockf
 PS=/bin/ps
 KILL=/bin/kill
 SYSCTL=/usr/sbin/sysctl
+CHMOD=/bin/chmod
 DEFAULTS=/usr/bin/defaults
 DATE=/bin/date
 MKDIR=/bin/mkdir
@@ -121,6 +150,16 @@ RM=/bin/rm
 MV=/bin/mv
 CP=/bin/cp
 STAT=/usr/bin/stat
+MKTEMP=/usr/bin/mktemp
+# The installed app binary, for the microsecond identity check of
+# frozenProcesses entries (see above), and the bundle's Info.plist, which
+# must declare InsomniaResumeFrozenVersion RESUME_FROZEN_VERSION before the
+# binary is run: an older build has no such mode and would open the menu bar
+# app instead. Fixed paths like the tools, never PATH. install.sh puts the
+# bundle here, copying the binary before Info.plist.
+INSOMNIA_BIN="${HOME:-}/Applications/Insomnia.app/Contents/MacOS/Insomnia"
+INSOMNIA_INFO="${HOME:-}/Applications/Insomnia.app/Contents/Info.plist"
+RESUME_FROZEN_VERSION=1
 LOCK_TIMEOUT_SECONDS=10
 # How long to wait for the root command behind a password dialog to let go
 # of the pending-start marker (pmset takes well under a second).
@@ -159,6 +198,27 @@ log() { # level message
 
 # --- Lock --------------------------------------------------------------------
 "$MKDIR" -p "$APP_SUPPORT"
+# An upgrade over an older build: tighten what it left loose (0644 files,
+# 0755 directories), since this run may write to them before the upgraded
+# app has opened them. umask only covers what this run creates. go-rwx
+# only takes group and other access away and never adds a permission, so a
+# file its owner cannot read stays unreadable. A symlink is left alone, as
+# the app leaves it, and so is an access control list: removing entries
+# changes what recovery can read, such as a 0200 journal its owner reads
+# through an allow entry, or a session a deny entry keeps unreadable, which
+# recovery treats as ended. A chmod that fails is logged as an error and
+# recovery goes on: a loose mode is no reason to leave the machine changed.
+tighten() { # path...
+  local p err
+  for p in "$@"; do
+    if [[ -e "$p" && ! -L "$p" ]]; then
+      if ! err="$("$CHMOD" go-rwx "$p" 2>&1)"; then
+        log error "could not make $p owner-only: ${err:-chmod failed}" || true
+      fi
+    fi
+  done
+}
+tighten "$APP_SUPPORT" "$LOG_DIR" "$LOG" "$LOCK" "$STATE" "$SESSION"
 inode() { "$STAT" -f %i "$1" 2>/dev/null; }
 if [[ -e /dev/fd/9 && -e "$LOCK" && -n "$(inode "$LOCK")" && "$(inode /dev/fd/9)" == "$(inode "$LOCK")" ]]; then
   : # fd 9 is the caller's handle on the lock file; share its lock.
@@ -331,6 +391,74 @@ run_bounded() { # command args...
   "$RM" -f "$pidfile" "$rcfile"
   return "$rc"
 }
+
+# Run the app binary's --resume-frozen check (see resume_via_app) with the
+# same time limit, standard input from app_answer_dir/in and standard output
+# to app_answer_dir/out. This shell starts the binary as its own background
+# job and is the only process that signals it; no supervisor stands between
+# them. Bash reaps a finished child on its own (in its SIGCHLD handler), so a
+# signal sent by pid could reach whatever process gets that pid next. Each
+# signal therefore names the job (%+) once signal_job has checked that %+ is
+# this pid: bash's kill looks the job up with SIGCHLD blocked and signals it
+# only if bash has not reaped it yet, and a child that has not been reaped
+# keeps its pid, as a zombie at worst. The exit status is read with wait only
+# after the job has left bash's running list. Unlike a power command this is
+# our own unprivileged binary, so when SIGTERM does not end it within
+# KILL_GRACE_SECONDS it gets SIGKILL: from then on it runs no more of its own
+# code and so cannot send another signal.
+# The binary inherits fd 9, so the recovery lock stays held for as long as it
+# runs, also after this shell is gone: a run killed mid-call leaves no helper
+# that could resume a process a later session froze while the lock was free.
+# The binary ends itself after its lifetime argument (resume_via_app passes
+# COMMAND_TIMEOUT_SECONDS + KILL_GRACE_SECONDS), so such a helper frees the
+# lock on its own. Returns the binary's exit status, or 124 when it did not
+# finish in time. The function's stderr is /dev/null because bash reports a
+# job that a signal ended ("Terminated: 15") on its own stderr; the log says
+# what happened instead.
+app_answer_dir=""
+job_running() { # pid
+  local p
+  for p in $(jobs -rp); do
+    [[ "$p" == "$1" ]] && return 0
+  done
+  return 1
+}
+# True once job pid $1 has left bash's running list; polls for $2 seconds.
+wait_for_job() { # pid seconds
+  local i
+  for (( i = 0; i < $2 * 10; i++ )); do
+    job_running "$1" || return 0
+    sleep 0.1
+  done
+  ! job_running "$1"
+}
+signal_job() { # signal pid
+  [[ "$(jobs -p %+)" == "$2" ]] || return 1
+  kill -"$1" %+
+}
+run_app_bounded() { # command args...
+  local cpid rc=0
+  "$@" <"$app_answer_dir/in" >"$app_answer_dir/out" &
+  cpid=$!
+  if wait_for_job "$cpid" "$COMMAND_TIMEOUT_SECONDS"; then
+    wait "$cpid" || rc=$?
+    return "$rc"
+  fi
+  signal_job TERM "$cpid" || true
+  if wait_for_job "$cpid" "$KILL_GRACE_SECONDS"; then
+    wait "$cpid" || rc=$?
+    log error "'$1 --resume-frozen' (pid $cpid) did not answer within ${COMMAND_TIMEOUT_SECONDS}s; sent SIGTERM, and it ended (wait status $rc)"
+    return 124
+  fi
+  signal_job KILL "$cpid" || true
+  if wait_for_job "$cpid" "$KILL_GRACE_SECONDS"; then
+    wait "$cpid" || rc=$?
+    log error "'$1 --resume-frozen' (pid $cpid) did not answer within ${COMMAND_TIMEOUT_SECONDS}s and was still running ${KILL_GRACE_SECONDS}s after SIGTERM; sent SIGKILL, and it ended (wait status $rc)"
+  else
+    log error "'$1 --resume-frozen' (pid $cpid) did not answer within ${COMMAND_TIMEOUT_SECONDS}s and has not exited ${KILL_GRACE_SECONDS}s after SIGKILL; it runs no further code, and it keeps the recovery lock until the kernel ends it"
+  fi
+  return 124
+} 2>/dev/null
 
 # End this run right after a timed-out undo command that is still alive:
 # nothing else is undone, the journal and session stay exactly as read, and
@@ -663,13 +791,11 @@ fi
 
 # Frozen processes. Each entry is kept verbatim (unknown fields included)
 # unless it is observed gone, running, or mismatched, or successfully resumed.
-kept_frozen=""
-kept_frozen_count=0
+# kept[i] marks entry i as kept; the kept entries are republished in journal
+# order whatever order they were settled in.
+kept=()
 keep_entry() { # index
-  local entry
-  entry="$(extract_json "$STATE" "frozenProcesses.$1")"
-  if [[ -n "$kept_frozen" ]]; then kept_frozen="$kept_frozen,$entry"; else kept_frozen="$entry"; fi
-  kept_frozen_count=$((kept_frozen_count + 1))
+  kept[$1]=1
 }
 # Observe one pid. Sets observation to one of:
 #   gone      ps exited 1 and printed nothing (the only absence signal ps gives)
@@ -692,6 +818,117 @@ observe() { # pid
   p_stat="$stat"; p_uid="$uid"
   observation=seen
 }
+# Entries that record microseconds, collected in journal order during the
+# loop below and handed to the app binary together after it: app_index holds
+# each entry's index, app_pid its pid, app_args its four fields.
+app_index=()
+app_pid=()
+app_args=()
+# Ask the app binary about every collected entry in one bounded call (see
+# the frozenProcesses rule in the header). It answers one line per entry, in
+# input order, "<pid> <word>", and exits 0 when every word is resumed or
+# gone and 1 otherwise. The answer is checked whole: exactly one line per
+# entry, each with that entry's pid, one space and a known word and nothing
+# else, and an exit status that agrees with the words. Anything else, a
+# timeout included, keeps every entry of the call unsignaled by this run. The
+# binary may have resumed some of them before it went wrong; the next run
+# finds those running and clears them.
+resume_via_app() {
+  local n=${#app_pid[@]} k rc=0 valid=1 settled=1 expected=0 size line word excerpt="" p answer declared
+  local -a words
+  words=()
+  if [[ ! -x "$INSOMNIA_BIN" ]]; then
+    for (( k = 0; k < n; k++ )); do
+      log error "pid ${app_pid[k]} needs the app binary for its microsecond identity check, but $INSOMNIA_BIN is missing or not executable; kept, not signaled"
+      failures+=("pid ${app_pid[k]} was not resumed: app binary missing at $INSOMNIA_BIN")
+      keep_entry "${app_index[k]}"
+    done
+    return 0
+  fi
+  # A regular file only: a FIFO there could block this run under the lock.
+  declared=""
+  if [[ -f "$INSOMNIA_INFO" ]]; then
+    declared="$(extract "$INSOMNIA_INFO" InsomniaResumeFrozenVersion || true)"
+  fi
+  if [[ "$declared" != "$RESUME_FROZEN_VERSION" ]]; then
+    for (( k = 0; k < n; k++ )); do
+      log error "pid ${app_pid[k]} needs the app binary for its microsecond identity check, but $INSOMNIA_INFO declares InsomniaResumeFrozenVersion '${declared}', not $RESUME_FROZEN_VERSION (an older or newer build); the binary was not run; kept, not signaled"
+      failures+=("pid ${app_pid[k]} was not resumed: the installed app does not declare --resume-frozen version $RESUME_FROZEN_VERSION")
+      keep_entry "${app_index[k]}"
+    done
+    return 0
+  fi
+  # A private directory with a fresh name for the binary's input and answer,
+  # after removing any left by an earlier run that was itself killed
+  # mid-call. One line per entry on standard input: there is no limit on its
+  # size, unlike the binary's argument list.
+  "$RM" -rf "$APP_SUPPORT"/.backstop-resume.*
+  if ! app_answer_dir="$("$MKTEMP" -d "$APP_SUPPORT/.backstop-resume.XXXXXX" 2>/dev/null)"; then
+    app_answer_dir=""
+    log error "could not create a private directory in $APP_SUPPORT for the app binary's input and answer"
+    rc=125
+  elif ! printf '%s %s %s %s\n' "${app_args[@]}" > "$app_answer_dir/in" 2>/dev/null; then
+    log error "could not write the app binary's input in $app_answer_dir"
+    rc=125
+  else
+    run_app_bounded "$INSOMNIA_BIN" --resume-frozen "$((COMMAND_TIMEOUT_SECONDS + KILL_GRACE_SECONDS))" || rc=$?
+  fi
+  if (( rc == 125 )) || [[ ! -f "$app_answer_dir/out" ]]; then
+    valid=0
+  else
+    answer="$app_answer_dir/out"
+    size="$(stat -f %z "$answer" 2>/dev/null || echo 0)"
+    excerpt="$(head -c 200 "$answer" | tr -c '[:print:]' ' ')"
+    # A valid line is at most 24 bytes ("<10-digit pid> unverifiable\n").
+    if (( size > n * 32 )); then
+      valid=0
+    else
+      k=0
+      while IFS= read -r line || [[ -n "$line" ]]; do
+        if (( k >= n )) || [[ "$line" != "${app_pid[k]} "* ]]; then valid=0; break; fi
+        word="${line#"${app_pid[k]} "}"
+        case "$word" in
+          resumed|gone) ;;
+          failed|unobserved|unverifiable) settled=0 ;;
+          *) valid=0; break ;;
+        esac
+        words+=("$word")
+        k=$((k + 1))
+      done < "$answer"
+      (( k == n )) || valid=0
+    fi
+  fi
+  if [[ -n "$app_answer_dir" ]]; then "$RM" -rf "$app_answer_dir"; fi
+  (( settled )) || expected=1
+  (( rc == expected )) || valid=0
+  if (( valid == 0 )); then
+    log error "unexpected answer from $INSOMNIA_BIN for pid(s) ${app_pid[*]} (exit $rc, output '$excerpt'); all kept, not signaled"
+    for (( k = 0; k < n; k++ )); do
+      failures+=("pid ${app_pid[k]} was not resumed: unexpected answer from the app binary")
+      keep_entry "${app_index[k]}"
+    done
+    return 0
+  fi
+  for (( k = 0; k < n; k++ )); do
+    p="${app_pid[k]}"
+    case "${words[k]}" in
+      resumed)
+        log info "SIGCONT sent to pid $p by the app binary after a microsecond identity check"
+        changed=1 ;;
+      gone)
+        log info "pid $p is gone, running, or not the process we froze (app binary: gone); cleared without signal"
+        changed=1 ;;
+      failed)
+        log error "SIGCONT to pid $p failed (app binary: failed); keeping journal entry for retry"
+        failures+=("pid $p is still stopped: SIGCONT failed")
+        keep_entry "${app_index[k]}" ;;
+      *)
+        log error "pid $p could not be verified (app binary: ${words[k]}); kept, not signaled"
+        failures+=("pid $p could not be verified and was not resumed")
+        keep_entry "${app_index[k]}" ;;
+    esac
+  done
+}
 if (( frozen_count > 0 )); then
   boot_now="$("$SYSCTL" -n kern.bootsessionuuid 2>/dev/null || true)"
   uid_now="$(id -u)"
@@ -699,6 +936,7 @@ if (( frozen_count > 0 )); then
   while (( i < frozen_count )); do
     pid="$(extract "$STATE" "frozenProcesses.$i.pid" || true)"
     started="$(extract "$STATE" "frozenProcesses.$i.startedAt" || true)"
+    micros="$(extract "$STATE" "frozenProcesses.$i.startedAtMicros" || true)"
     boot="$(extract "$STATE" "frozenProcesses.$i.bootSession" || true)"
     if ! is_positive_int "$pid"; then
       log error "frozen entry $i has no valid pid (${pid:-?}); kept, not signaled"
@@ -715,6 +953,19 @@ if (( frozen_count > 0 )); then
     elif [[ "$boot" != "$boot_now" ]]; then
       log info "pid $pid belongs to a previous boot; cleared without signal"
       changed=1
+    elif [[ -n "$micros" ]]; then
+      # The binary accepts a pid that fits in 32 bits, a non-negative start
+      # second and microseconds below one million; anything else would make
+      # it reject the whole call, so such an entry is kept here instead.
+      if [[ "$micros" =~ ^[0-9]{1,6}$ && "$started" =~ ^[0-9]{1,18}$ ]] && (( ${#pid} <= 10 && 10#$pid <= 2147483647 )); then
+        app_index+=("$i")
+        app_pid+=("$pid")
+        app_args+=("$pid" "$started" "$micros" "$boot")
+      else
+        log error "pid $pid has an invalid startedAt ($started) or startedAtMicros ($micros); kept, not signaled"
+        failures+=("pid $pid has an invalid identity and was not resumed")
+        keep_entry "$i"
+      fi
     else
       observe "$pid"
       case "$observation" in
@@ -744,7 +995,22 @@ if (( frozen_count > 0 )); then
     fi
     i=$((i + 1))
   done
+  if (( ${#app_pid[@]} > 0 )); then
+    resume_via_app
+  fi
 fi
+
+kept_frozen=""
+kept_frozen_count=0
+for (( i = 0; i < frozen_count; i++ )); do
+  [[ -n "${kept[i]:-}" ]] || continue
+  if ! entry="$(extract_json "$STATE" "frozenProcesses.$i")" || [[ -z "$entry" ]]; then
+    log error "could not read frozen entry $i back from $STATE; previous journal kept, will retry"
+    exit 1
+  fi
+  if [[ -n "$kept_frozen" ]]; then kept_frozen="$kept_frozen,$entry"; else kept_frozen="$entry"; fi
+  kept_frozen_count=$((kept_frozen_count + 1))
+done
 
 if (( legacy_count > 0 )); then
   legacy_json="$(extract_json "$STATE" frozenPids || true)"

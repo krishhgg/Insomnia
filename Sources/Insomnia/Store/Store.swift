@@ -3,6 +3,9 @@ import Foundation
 /// Atomic JSON persistence for the three files Insomnia keeps on disk.
 /// Writes go to a temp file in the same directory and are renamed into place
 /// so a crash mid-write can never leave a truncated session or state file.
+/// The temp file is created mode 0600, so the published file is owner-only
+/// from its first byte; a file written by an older build is tightened when
+/// it is read.
 struct Store: Sendable {
     let paths: Paths
 
@@ -96,6 +99,7 @@ struct Store: Sendable {
         if stat(url.path, &info) == 0, info.st_mode & S_IFMT != S_IFREG {
             throw StoreError.notRegularFile(file: url.path)
         }
+        if let problem = OwnerOnly.tighten(path: url.path) { OwnerOnly.reportOnce(problem) }
         let data = try Data(contentsOf: url)
         return try Store.makeDecoder().decode(T.self, from: data)
     }
@@ -111,9 +115,14 @@ struct Store: Sendable {
     @discardableResult
     private func writeAtomically(_ data: Data, to url: URL) throws -> FileIdentity {
         let dir = url.deletingLastPathComponent()
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        if let problem = try OwnerOnly.createDirectory(dir) { OwnerOnly.reportOnce(problem) }
         let tmp = dir.appendingPathComponent(".\(url.lastPathComponent).tmp-\(UUID().uuidString)")
-        try data.write(to: tmp, options: [])
+        do {
+            try OwnerOnly.createFile(at: tmp, contents: data)
+        } catch {
+            try? FileManager.default.removeItem(at: tmp)
+            throw error
+        }
         var info = stat()
         guard lstat(tmp.path, &info) == 0 else {
             let err = errno
@@ -285,6 +294,14 @@ struct Store: Sendable {
 
     func loadConfig() throws -> Config? { try read(Config.self, from: paths.configFile) }
     func saveConfig(_ c: Config) throws { try write(c, to: paths.configFile) }
+
+    /// nil when there is none, or it cannot be read: it only names the
+    /// command in a message.
+    func loadUnfinishedCommand() -> UnfinishedCommandRecord? {
+        try? read(UnfinishedCommandRecord.self, from: paths.unfinishedCommandFile)
+    }
+    func saveUnfinishedCommand(_ r: UnfinishedCommandRecord) throws { try write(r, to: paths.unfinishedCommandFile) }
+    func removeUnfinishedCommand() throws { try remove(at: paths.unfinishedCommandFile) }
 
     /// One line about why decoding failed, fit for a notification.
     private static func brief(_ error: DecodingError) -> String {

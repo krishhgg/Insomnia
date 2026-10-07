@@ -75,6 +75,9 @@ QUIT_WAIT_SECONDS=10
 CALL_TIMEOUT_SECONDS=30
 APP="$HOME/Applications/Insomnia.app"
 SUDOERS=/etc/sudoers.d/insomnia
+# The --resume-frozen interface version this checkout's backstop.sh speaks
+# (see step 3).
+RESUME_FROZEN_VERSION=1
 
 if [[ -n "${INSOMNIA_HOME:-}" ]]; then
   APP_SUPPORT="$INSOMNIA_HOME"
@@ -632,13 +635,29 @@ if [[ -e "$PENDING" || -L "$PENDING" ]]; then
   delete_pending_marker
 fi
 
-# 3. Undo everything via the current backstop ---------------------------------
+# 3. Undo everything via a backstop that matches the installed app ----------
 # The backstop inherits fd 9 and shares this lock instead of waiting on it.
+# This checkout's backstop.sh hands frozen entries that record microseconds
+# to the installed app binary, and runs that binary only when the bundle's
+# Info.plist declares InsomniaResumeFrozenVersion RESUME_FROZEN_VERSION (the
+# same value as in backstop.sh; a test keeps the two in step). An app that
+# does not declare it was installed together with its own backstop.sh in
+# APP_SUPPORT, the copy the LaunchAgent runs, so that copy is used instead
+# when it exists. Without it this checkout's backstop runs anyway: it keeps
+# the entries that need the binary, and step 4 stops before removing
+# anything.
 step "Restoring the machine via backstop --force"
-if [[ -f "$ROOT/scripts/backstop.sh" ]]; then
+installed_version=""
+if [[ -f "$APP/Contents/Info.plist" ]]; then
+  installed_version="$(extract "$APP/Contents/Info.plist" InsomniaResumeFrozenVersion || true)"
+fi
+if [[ -f "$ROOT/scripts/backstop.sh" ]] && { [[ "$installed_version" == "$RESUME_FROZEN_VERSION" ]] || [[ ! -f "$APP_SUPPORT/backstop.sh" ]]; }; then
   BACKSTOP="$ROOT/scripts/backstop.sh"
 elif [[ -f "$APP_SUPPORT/backstop.sh" ]]; then
   BACKSTOP="$APP_SUPPORT/backstop.sh"
+  if [[ -f "$ROOT/scripts/backstop.sh" ]]; then
+    echo "$APP does not declare InsomniaResumeFrozenVersion $RESUME_FROZEN_VERSION; using the backstop installed with it, $BACKSTOP"
+  fi
 else
   echo "no backstop.sh found in $ROOT/scripts or $APP_SUPPORT; nothing was removed" >&2
   exit 1
@@ -704,7 +723,9 @@ step "Removing app bundle"
 if (( PURGE == 1 )); then
   step "Purging Insomnia's files in $APP_SUPPORT and $LOG_DIR"
   remove_owned "$SESSION" "$STATE" "$APP_SUPPORT/config.json" "$APP_SUPPORT/backstop.sh" \
-        "$LOG_DIR/insomnia.log" "$LOG_DIR/handoffs.log"
+        "$APP_SUPPORT/unfinished-command.json" \
+        "$LOG_DIR/insomnia.log" "$LOG_DIR/insomnia.log.1" \
+        "$LOG_DIR/handoffs.log" "$LOG_DIR/handoffs.log.1"
   collect_moved_aside_sessions
   if (( ${#MOVED_ASIDE[@]} > 0 )); then
     remove_owned "${MOVED_ASIDE[@]}"
@@ -724,7 +745,9 @@ if (( PURGE == 1 )); then
   echo "Kept $LOCK (the recovery lock is never unlinked; delete $APP_SUPPORT by hand if you want it gone)."
   [[ -d "$LOG_DIR" ]] && echo "Kept $LOG_DIR: it still holds files Insomnia did not create."
 else
-  remove_owned "$APP_SUPPORT/backstop.sh" "$SESSION" "$STATE"
+  # unfinished-command.json names a sudo pmset that held the recovery lock;
+  # this run holds it now, so that command has exited.
+  remove_owned "$APP_SUPPORT/backstop.sh" "$SESSION" "$STATE" "$APP_SUPPORT/unfinished-command.json"
   echo "Kept $APP_SUPPORT/config.json and $LOG_DIR (use --purge to remove)."
   collect_moved_aside_sessions
   if (( ${#MOVED_ASIDE[@]} > 0 )); then

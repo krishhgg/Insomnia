@@ -714,7 +714,7 @@ final class FakeRestoreTools: @unchecked Sendable {
     }
 
     func sleepGuard(prompt: any AdministratorPromptRunning = FakeAdministratorPrompt()) -> PmsetSleepGuard {
-        PmsetSleepGuard(prompt: prompt, sudoPath: sudo, pmsetPath: pmset)
+        PmsetSleepGuard(prompt: prompt, sudo: sudo, pmset: pmset)
     }
 
     private static func lines(_ url: URL) -> [String] {
@@ -863,7 +863,7 @@ final class PmsetSleepGuardPromptTests: XCTestCase {
     /// A sudo that cannot be started fails the check too.
     func testRestoreCheckFailsWhenSudoCannotRun() async throws {
         let tools = try FakeRestoreTools(in: dir)
-        let sleepGuard = PmsetSleepGuard(prompt: FakeAdministratorPrompt(), sudoPath: dir.appendingPathComponent("no-such-sudo").path, pmsetPath: tools.pmset)
+        let sleepGuard = PmsetSleepGuard(prompt: FakeAdministratorPrompt(), sudo: dir.appendingPathComponent("no-such-sudo").path, pmset: tools.pmset)
         do {
             try await sleepGuard.checkPasswordlessRestore(sleepOffIsOurs: false)
             XCTFail("must throw")

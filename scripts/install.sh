@@ -328,6 +328,10 @@ fi
 step "Assembling $APP"
 "$RM" -rf "$APP"
 "$MKDIR" -p "$APP/Contents/MacOS"
+# The binary goes in before Info.plist: backstop.sh runs the binary's
+# --resume-frozen mode only once Info.plist declares it
+# (InsomniaResumeFrozenVersion), so a backstop that runs mid-copy never
+# starts a binary older than that declaration.
 "$CP" "$BIN" "$APP/Contents/MacOS/Insomnia"
 "$CP" "$ROOT/Resources/Info.plist" "$APP/Contents/Info.plist"
 "$MKDIR" -p "$APP/Contents/Resources"

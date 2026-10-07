@@ -4,8 +4,8 @@ import SwiftUI
 /// Menu bar app. The status item is an `NSStatusItem` hosting SwiftUI, and
 /// the settings window is an `NSWindow` this app opens itself (see
 /// `SettingsWindow`), so there is no SwiftUI scene with any content in it.
-/// `App` still requires one, hence the empty `Settings`.
-@main
+/// `App` still requires one, hence the empty `Settings`. main.swift starts
+/// this app unless the command line asks for a one-shot mode first.
 struct InsomniaApp: App {
     @NSApplicationDelegateAdaptor private var delegate: AppDelegate
 
@@ -93,7 +93,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// If the end could not run (recovery lock busy, journal unreadable),
     /// left the journal dirty with no agent to retry, or could not remove
     /// session.json, the app stays so its own retry can finish the job;
-    /// quitting then would abandon a live session.
+    /// quitting then would abandon a live session. It also stays while a
+    /// `sudo pmset` that ignored SIGTERM is alive. The recovery lock would
+    /// outlive a quit (the command holds it through its own descriptor),
+    /// but the end the command holds up would not: the app is what retries
+    /// it, and confirms an undo the command finishes, the moment it exits.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard !terminating else { return .terminateCancel }
         terminating = true
@@ -102,7 +106,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             switch outcome {
             case .restored, .incomplete(agentArmed: true):
                 sender.reply(toApplicationShouldTerminate: true)
-            case .locked, .incomplete(agentArmed: false), .sessionRetained, .journalUnreadable:
+            case .locked, .incomplete(agentArmed: false), .sessionRetained, .journalUnreadable, .privilegedCommandRunning:
                 Log.error("quit deferred: recovery still pending (\(outcome)); staying to retry")
                 terminating = false
                 sender.reply(toApplicationShouldTerminate: false)

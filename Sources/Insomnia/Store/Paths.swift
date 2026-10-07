@@ -5,12 +5,12 @@ import Foundation
 /// the same variable with the same layout).
 ///
 /// Default layout:
-///   ~/Library/Application Support/Insomnia/{session.json,state.json,config.json,backstop.sh,pending-start}
+///   ~/Library/Application Support/Insomnia/{session.json,state.json,config.json,backstop.sh,pending-start,unfinished-command.json}
 ///   ~/Library/Logs/Insomnia/{insomnia.log,handoffs.log}
 ///   ~/Library/LaunchAgents/com.insomnia.backstop.plist
 ///
 /// With INSOMNIA_HOME=/x:
-///   /x/{session.json,state.json,config.json,backstop.sh,pending-start}
+///   /x/{session.json,state.json,config.json,backstop.sh,pending-start,unfinished-command.json}
 ///   /x/Logs/{insomnia.log,handoffs.log}
 ///   /x/LaunchAgents/com.insomnia.backstop.plist
 struct Paths: Sendable, Equatable {
@@ -74,19 +74,27 @@ struct Paths: Sendable, Equatable {
     /// locks the file itself first (`lockf` or flock(2)), the lock the
     /// dialog's root command holds while it runs.
     var pendingStartFile: URL { appSupport.appendingPathComponent("pending-start") }
+    /// The `sudo pmset` left running that holds the recovery lock, written
+    /// while it runs so a relaunch after a crash can name it. Removed when
+    /// it exits, and by the next transaction that takes the lock.
+    var unfinishedCommandFile: URL { appSupport.appendingPathComponent("unfinished-command.json") }
     /// Written by scripts/simulate-lid.sh ("closed" or "open") to drive the
     /// lid-close action path without touching the hinge. See LidSimulation.
     var simulateLidFile: URL { appSupport.appendingPathComponent("simulate-lid") }
 
+    /// Both logs are owner-only and rotate to `<name>.1` past
+    /// `OwnerOnly.maxLogBytes`; uninstall.sh --purge removes the `.1` too.
     var logFile: URL { logs.appendingPathComponent("insomnia.log") }
     var handoffsLog: URL { logs.appendingPathComponent("handoffs.log") }
 
     var backstopPlist: URL { launchAgents.appendingPathComponent("\(Paths.backstopLabel).plist") }
 
-    /// Create every directory Insomnia writes into.
+    /// Create every directory Insomnia writes into. Its own two are made
+    /// 0700 (an existing one is tightened); the LaunchAgents directory is
+    /// shared with every other login agent, so it is only created.
     func createDirectories() throws {
-        for dir in [appSupport, logs, launchAgents] {
-            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        }
+        if let problem = try OwnerOnly.createDirectory(appSupport) { OwnerOnly.reportOnce(problem) }
+        if let problem = try OwnerOnly.createDirectory(logs) { OwnerOnly.reportOnce(problem) }
+        try FileManager.default.createDirectory(at: launchAgents, withIntermediateDirectories: true)
     }
 }
