@@ -473,9 +473,9 @@ app decodes it, so a whole float such as `30.0` is 30, and clamps it to 0
 through 95 as `Config.normalizeFloors` does. The backstop reads the scalar
 keys `endFloor` and `thermalRules` from config.json directly, not through the
 app's decoder, so it cannot tell whether the app accepted the file. The app
-therefore runs no session while a config.json it rejected stays in place,
-or until it has written its settings where a rejected file was moved aside
-or deleted (section 10).
+therefore takes those two values from a file that decodes, runs no session
+while a config.json it rejected stays in place, and writes its settings
+where the file is missing (section 10).
 Performance effects depend on workload.
 
 ### 7. Network failover
@@ -758,11 +758,19 @@ Backstop, independent of the app:
   resume. The app ends its side when it sees `session.json` gone.
 - A `session.json` that cannot be removed (an immutable file) is recorded as
   ended in `ended-session.json`, a copy of its bytes. The app writes the same
-  record when its own end cannot remove the file. While the two files match,
-  the app restores that session instead of resuming it, and each agent run
-  ends it again and retries the removal. If the record cannot be written
-  either, the agent still restores sleep but keeps the `sleepDisabledByUs`
-  entry and exits 1, so the journal stays dirty and uninstall stops.
+  record when its own end cannot remove the file. When `ended-session.json`
+  cannot be written either (an unrelated record there that cannot be
+  replaced), the end is recorded in the journal instead: `endedSession` in
+  `state.json`, the same bytes in base64. The agent and the app write the
+  record before they undo anything. While a record matches the file, the app
+  restores that session instead of resuming it, and each agent run ends it
+  again and retries the removal. `endedSession` is not an undo entry and
+  never makes the journal dirty; the app removes it before it writes a new
+  `session.json` and after it removes one, so a record of one session never
+  ends another. If no record can be written, the agent still restores sleep
+  but keeps the `sleepDisabledByUs` entry and exits 1, so the journal stays
+  dirty and uninstall stops. The app writes the journal before it resumes
+  any session, so it resumes none while `state.json` cannot be written.
 - The battery and thermal reads have the undo commands' time limit but never
   hold the lock: they run with its descriptor closed, and one that ignores
   SIGTERM gets SIGKILL. A hung read fails only its own check, never the next
@@ -951,26 +959,41 @@ older build is tightened when the app reads it:
   System Settings shows without a relaunch. With the flag off nothing is
   registered or unregistered at launch.
 
-The app reads config.json once, at launch. A missing key takes its
-default, and `configVersion` counts by its presence alone, whatever its
-value. A file that does not decode (a value of the wrong type, broken
-JSON, not a regular file) is never written over: the app renames it to
+The app reads config.json at launch. A missing key takes its default, and
+`configVersion` counts by its presence alone, whatever its value. A file
+that does not decode (a value of the wrong type, broken JSON, not a regular
+file) is never written over: the app renames it to
 `config.json.unreadable-<UTC stamp>`, runs on the defaults, writes them to
 config.json and posts a notification naming the copy. When the rename
 fails, the file stays as it is and the app runs on the defaults without
-writing them. `uninstall.sh` keeps these copies; `--purge` removes them.
+writing them. `uninstall.sh` keeps these copies; `--purge` removes them. A
+missing config.json is not written at launch but by the first transaction,
+under the recovery lock (below).
 
 The backstop reads `endFloor` and `thermalRules` from config.json on every
-run (section 6). A file the app rejects can still hold valid values for
-those two keys, such as a 0% floor or thermal rules off, while the app
-enforces its defaults. So every transaction (reconcile, start, extend, end,
-and the lid, floor and Low Power changes) checks the file again. One that
-does not decode is renamed aside as at launch, and the settings the app runs
-on are written in its place. With no file the backstop enforces its own
-defaults, so a write that fails, as on a full disk, is tried again in every
-transaction until it succeeds. A rejected file that cannot be renamed and
-that a person then deletes gets the same write. While a rejected file cannot
-be renamed, or its replacement is not written yet, no session runs:
+run (section 6), so the app and the backstop must enforce the same two
+values before a session starts, resumes or goes on. Every transaction
+(reconcile, start, extend, end, and the lid, floor and Low Power changes)
+checks the file again:
+
+- A file that decodes is what the backstop enforces. When its end floor or
+  thermal rule differs from the app's (a hand edit, a repair after a
+  rejection), the app takes those two values from the file, raises the Low
+  Power Mode floor above the end floor if needed, and logs the change. No
+  other setting changes, and the file is not rewritten.
+- A missing file (deleted, or never written) gets the settings the app runs
+  on written in its place. While it is missing, the backstop enforces its
+  own defaults (10%, thermal rules on). When the write fails, as on a full
+  disk, and the app's end floor and thermal rule are those defaults, both
+  sides agree: the session goes on, the failure is logged once, and every
+  transaction writes again. When they differ, no session runs (below).
+- A file that does not decode is renamed aside as at launch, and the
+  settings the app runs on are written in its place. A rejected file that
+  cannot be renamed and that a person then deletes gets the same write.
+
+While a rejected file cannot be renamed, or its replacement is not written
+yet, or a missing file is not written while the app's cutoffs differ from
+the backstop's defaults, no session runs:
 
 - Start refuses and changes nothing. Its notification names the file and
   says to make it writable or delete it, or, when the replacement could not
@@ -979,8 +1002,21 @@ be renamed, or its replacement is not written yet, no session runs:
   normal end.
 - Reconcile ends a valid session on disk instead of resuming it.
 
-A file that decodes is not read again. A hand edit made while the app runs
-reaches the backstop at its next run and the app at its next launch.
+Settings changes the end floor and the thermal rule only through
+config.json: the change is written first and takes effect once the write
+succeeds. A write that fails changes neither side; Settings shows the error
+under the power settings, and both keep the old values. Any other setting
+takes effect at once and is written behind it; a write that fails is
+logged, and the next save writes it.
+
+While a session runs, the app's 1 Hz tick also looks at config.json. A file
+that is missing, does not decode, or holds another end floor or thermal rule
+than the app runs the check above within a second; one still in that state
+afterwards (a write that failed, a busy lock) is looked at again after the
+retry delay. With the lid closed there is no tick, so a hand edit then
+reaches the app at its next transaction (a lid event, a floor change, the
+deadline). A backstop run that read config.json before a change uses the
+old values for that run only.
 
 ### 11. Menu bar UI: inline time entry
 

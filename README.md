@@ -326,7 +326,7 @@ build" at launch and shows the same line in the status menu and in Settings.
 <p align="center">
   <img src="docs/assets/recovery-flow.svg" alt="The app and a launchd backstop coordinate through a shared lock and recovery journal. The app handles normal cleanup. The backstop checks every minute: it restores once the deadline has passed, and it ends a valid session early when no app holds the liveness lock, the battery is below the end floor on battery power, or the thermal level is critical. Failed or unreadable recovery evidence stays on disk; saved audio needs the app and unconfirmed stopped processes need inspection." width="880">
   <br>
-  <sub>The drawing shows the two paths back to normal. It predates the backstop's own early ends (app gone, end floor, critical heat), which the text below describes.</sub>
+  <sub>The drawing shows the two paths back to normal. The backstop's own early ends (app gone, end floor, critical heat) are described in the text below.</sub>
 </p>
 
 Insomnia records pending changes in a recovery journal. On session end, the app
@@ -343,9 +343,12 @@ early end is logged with its reason, and the saved session is deleted before
 the restore starts. A restore that cannot finish leaves entries in the journal
 for the next run and the app, never a session that a relaunched app would
 resume. If the saved session cannot be deleted, its end is recorded beside it
-in `ended-session.json`, and the app restores that session instead of resuming
-it. Otherwise the session stands until its deadline, and sessions are
-capped at 24 hours by default (`maxDuration`).
+in `ended-session.json`, or, when that file cannot be written either, in the
+journal (`endedSession` in `state.json`). The record is written before
+anything is restored, and the app restores that session instead of resuming
+it. If no record can be written, the app still resumes nothing while it
+cannot write the journal itself. Otherwise the session stands until its
+deadline, and sessions are capped at 24 hours by default (`maxDuration`).
 
 The app and backstop use the same lock so they do not restore and rewrite the
 journal over one another. Failed restoration keeps the relevant entries;
@@ -556,16 +559,21 @@ app will keep working while the lid is closed.
 
 Configuration lives in `~/Library/Application Support/Insomnia/config.json`.
 Use Settings for the app's controls; [Config.swift](Sources/Insomnia/Model/Config.swift)
-defines the full configuration and defaults. The app reads the file at
-launch. If a hand edit leaves it unreadable, the app renames it to
+defines the full configuration and defaults. The backstop reads the end
+floor and thermal setting from the file directly, so the file decides those
+two for both. The app checks it whenever it starts, extends or ends a
+session, and every second while one runs with the lid open: a hand edit to
+either value is taken into the app, and a change to either in Settings that
+cannot be saved does not take effect (Settings says why). If a hand edit
+leaves the file unreadable, the app renames it to
 `config.json.unreadable-<time>`, starts with the defaults and posts a
-notification; fix the copy, quit Insomnia and rename it back. The backstop
-reads the end floor and thermal setting from the file directly, so while an
+notification; fix the copy, quit Insomnia and rename it back. While an
 unreadable file cannot be renamed (a locked file, for example), Insomnia
 starts no session and ends a running one. Make the file writable or delete
 it. After a rename or a delete, the app writes the settings it runs on in the
-file's place, and no session runs until that write succeeds. A full disk can
-block it, for example. Local logs can contain SSIDs,
+file's place. When that write fails (a full disk, for example), no session
+runs unless the app's end floor and thermal setting are the defaults the
+backstop uses without the file (10%, on). Local logs can contain SSIDs,
 process metadata, and tmux targets. Check them before sharing publicly.
 Lines the app writes to `insomnia.log` also go to the unified log with their
 bodies marked private, so `log show` and other local programs see `<private>`

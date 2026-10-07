@@ -124,6 +124,9 @@ is performed. Do not replace "not run" with "passed" based on source review.
 | session.json without read permission during a session: the agent restores sleep within a minute and renames the file to session.json.unreadable-<time>, or the app does both at launch and notifies; after fixing the copy's permissions, a relaunch does not resume the session | Not run |
 | Hand-edited config.json that does not decode: at launch the app renames it to config.json.unreadable-<time>, runs on defaults and notifies; the settings come back after fixing the copy, quitting and renaming it to config.json | Not run |
 | Locked config.json that does not decode (`chflags uchg`): Start refuses and its notification names the file; with a session running, the next extend ends it; after `chflags nouchg`, Start moves the file aside and starts | Not run |
+| A hand edit to the end floor or thermal setting in config.json while a session runs with the lid open: the app takes it within a second, and the backstop's next run uses the same value | Not run |
+| A Settings change to the end floor or thermal setting while config.json cannot be written (`chflags uchg`): Settings says why, and the app and the backstop keep the old value | Not run |
+| Backstop end while session.json and an unrelated ended-session.json are both locked (`chflags uchg`): state.json gets endedSession before sleep is restored, a relaunch restores instead of resuming, and after `chflags nouchg` on session.json the next run removes it | Not run |
 | Reboot/login with active or dirty journals | Not run |
 | Backstop resuming a frozen test process through the installed `Insomnia --resume-frozen`, and keeping the entry when the bundle is removed or its Info.plist lacks `InsomniaResumeFrozenVersion` | Not run |
 | Lid-close/open and safe recovery of explicitly selected test processes | Not run |
