@@ -383,11 +383,14 @@ final class AppServices {
         lastLidEvent = closed
         status.lidClosed = closed
         guard let actions = lidActions else { return }
+        // Numbered now, not when its turn comes: an open makes a close that
+        // is still queued or waiting on a Docker probe stale at once.
+        let event = actions.lidEventArrived()
         let previous = lidTasks.last
         let task = Task { @MainActor in
             await previous?.value
             guard !Task.isCancelled, self.running else { return }
-            if closed { await actions.onClose() } else { await actions.onOpen() }
+            if closed { await actions.onClose(event: event) } else { await actions.onOpen() }
             guard !Task.isCancelled, self.running else { return }
             self.syncState()
             // The lid is a Low Power Mode cause (spec section 4): re-run the
