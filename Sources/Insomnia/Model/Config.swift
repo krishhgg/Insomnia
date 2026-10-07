@@ -303,3 +303,31 @@ extension Config {
         return "battery floors corrected: lowPowerFloor \(before.0) -> \(lowPowerFloor), endFloor \(before.1) -> \(endFloor)"
     }
 }
+
+// MARK: Cutoffs the recovery agent enforces
+
+/// The two settings backstop.sh reads from config.json and enforces on its
+/// own while a session runs: the end floor and the thermal rule.
+struct AgentCutoffs: Equatable, Sendable {
+    /// 0...`Config.maxEndFloor`; 0 is off.
+    let endFloor: Int
+    let thermalRules: Bool
+
+    var description: String {
+        "end floor \(endFloor == 0 ? "off" : "\(endFloor)%"), thermal rules \(thermalRules ? "on" : "off")"
+    }
+}
+
+extension Config {
+    /// The cutoffs as the agent reads them from this config: the end floor
+    /// clamped as the script clamps it (above `maxEndFloor` is
+    /// `maxEndFloor`, 0 or below is off), as `normalizeFloors` clamps it.
+    var agentCutoffs: AgentCutoffs {
+        AgentCutoffs(endFloor: min(max(endFloor, 0), Config.maxEndFloor), thermalRules: thermalRules)
+    }
+
+    /// What the agent enforces while config.json is missing:
+    /// `config_int endFloor 10` and `config_bool thermalRules true`, the
+    /// app's defaults.
+    static let agentDefaultCutoffs = AgentCutoffs(endFloor: 10, thermalRules: true)
+}

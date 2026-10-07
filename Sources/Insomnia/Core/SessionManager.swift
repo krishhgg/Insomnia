@@ -25,8 +25,9 @@ enum EndReason: String, Sendable {
     /// may still have been applied, so the start is undone from the journal
     /// like an end rather than rolled back from memory.
     case startFailed
-    /// config.json could not be read and could not be moved aside, or was
-    /// moved aside and the settings in use could not be written in its place
+    /// config.json could not be read and could not be moved aside, or is
+    /// missing and the settings in use, whose cutoffs differ from the
+    /// agent's defaults, could not be written in its place
     /// (`rejectedConfigFile`). backstop.sh reads its cutoffs from that file
     /// itself, so the session would run on cutoffs the app does not enforce.
     case settingsFileRejected
@@ -345,12 +346,13 @@ final class SessionManager {
     @ObservationIgnored private var configNotice: String?
     /// Why no session may run, set by every transaction while config.json
     /// is there, the app rejects it, and it could not be moved aside, or
-    /// while the write that replaces a moved file is owed. backstop.sh reads
-    /// the file's endFloor and thermalRules keys itself, without the app's
-    /// decoder, so it could enforce a 0% floor or no thermal rule while the
-    /// app enforces its defaults, and with no file it enforces its own
-    /// defaults, not the app's settings. Nil once the file reads again or
-    /// the settings in use are written where it was.
+    /// while it is missing and the settings in use cannot be written there
+    /// (`publishConfig`). backstop.sh reads the file's endFloor and
+    /// thermalRules keys itself, without the app's decoder, so it could
+    /// enforce a 0% floor or no thermal rule while the app enforces its
+    /// defaults, and with no file it enforces its own defaults, not the
+    /// app's settings. Nil once the file reads again or the settings in use
+    /// are written where it was.
     @ObservationIgnored private(set) var rejectedConfigFile: String?
     /// config.json was rejected and the settings in use are not yet written
     /// in its place. Set when the file is moved aside, and also when it
@@ -359,6 +361,20 @@ final class SessionManager {
     /// on its own settings. Every transaction that finds no file tries the
     /// write again.
     @ObservationIgnored private var configWriteOwed = false
+    /// Why the last change Settings made to the end floor or the thermal
+    /// rules did not take effect: config.json could not be written
+    /// (`updateConfig`). Settings shows it under those controls. Nil once a
+    /// change is saved.
+    private(set) var configSaveError: String?
+    /// The last failure to write the settings in use where config.json is
+    /// missing, when the agent's defaults are the app's cutoffs and nothing
+    /// is refused; kept so each transaction does not log it again.
+    @ObservationIgnored private var configPublishFailure: String?
+    @ObservationIgnored private var checkingConfigFile = false
+    /// The tick's next look at config.json after a transaction left it
+    /// missing, unreadable or carrying other cutoffs (a write that failed,
+    /// a busy lock): `recoveryRetryDelay` later, not every second.
+    @ObservationIgnored private var configCheckRetryAt = Date.distantPast
 
     init(
         paths: Paths,
@@ -409,7 +425,6 @@ final class SessionManager {
         self.state = loadedState ?? .clean
         self.lastError = loadError
         var loadedConfig: Config?
-        var keepConfigFile = false
         do {
             loadedConfig = try store.loadConfig()
         } catch {
@@ -425,7 +440,6 @@ final class SessionManager {
                 Log.error("config.json could not be read (\(detail)); moved to \(moved.path); using default settings")
                 configNotice = "config.json could not be read (\(detail)). It was moved to \(moved.path), and Insomnia is using default settings. To get yours back, quit Insomnia, fix that file and rename it to config.json."
             } catch let moveError {
-                keepConfigFile = true
                 Log.error("config.json could not be read (\(detail)) or moved aside (\(moveError.localizedDescription)); left in place; using default settings")
                 configNotice = Self.rejectedConfigMessage(paths.configFile.path, detail: detail, moveError: moveError.localizedDescription)
                     + " Meanwhile Insomnia uses default settings and left the file as it is."
@@ -462,8 +476,13 @@ final class SessionManager {
         } else {
             // A fresh install: the defaults already are the update, and
             // `Config()` carries its mark, so there is nothing to announce.
+            // Not written here: init runs before LaunchGate, and a second
+            // copy that the gate refuses would write its defaults over a
+            // config.json the running copy has yet to write back. The first
+            // transaction after the gate writes the settings in use
+            // (`checkConfigFile`); until then the agent's defaults are
+            // these.
             self.config = Config()
-            if !keepConfigFile { try? store.saveConfig(self.config) }
         }
     }
 
@@ -661,24 +680,31 @@ final class SessionManager {
         _ = await performEnd(reason: .agentCutoff)
     }
 
-    /// The launch's rules for config.json, applied again in every
-    /// transaction, because backstop.sh reads the file on every run. A file
-    /// the app rejects is moved aside and the settings the app runs on are
-    /// written in its place, so the agent and the app enforce the same
-    /// cutoffs. When the rename fails, or until that write succeeds,
-    /// `rejectedConfigFile` says why and no session runs. A rejected file
-    /// that a person deletes is replaced the same way. A file that decodes
-    /// is left alone, and so is a missing one unless the write is owed.
+    /// The rules for config.json, applied in every transaction, because
+    /// backstop.sh reads the file's endFloor and thermalRules on every run
+    /// and enforces them itself. Both sides must enforce the same cutoffs
+    /// before a session starts, resumes or goes on:
+    /// - A file that decodes is what the agent enforces, so its end floor
+    ///   and thermal rule are taken into the settings in use when they
+    ///   differ (a hand edit, a repair after a rejection); every other
+    ///   setting stays as it is (`adoptConfigFileCutoffs`).
+    /// - A missing file (deleted, moved aside below, or never written) gets
+    ///   the settings in use written in its place (`publishConfig`).
+    /// - A file the app rejects is moved aside and replaced the same way.
+    ///   When the rename fails, `rejectedConfigFile` says why and no
+    ///   session runs.
     private func checkConfigFile() {
         let detail: String
         do {
-            if try store.loadConfig() == nil, configWriteOwed {
-                writeOwedConfig()
+            guard let onDisk = try store.loadConfig() else {
+                publishConfig()
                 return
             }
+            if onDisk.agentCutoffs != config.agentCutoffs { adoptConfigFileCutoffs(onDisk) }
             if rejectedConfigFile != nil { Log.info("config.json reads again; sessions can start") }
             rejectedConfigFile = nil
             configWriteOwed = false
+            configPublishFailure = nil
             return
         } catch let StoreError.unreadable(_, brief) {
             detail = brief
@@ -689,7 +715,7 @@ final class SessionManager {
             let moved = try store.moveAsideUnreadableConfig(now: clock())
             Log.error("config.json could not be read (\(detail)); moved to \(moved.path)")
             configWriteOwed = true
-            writeOwedConfig()
+            publishConfig()
             if let why = rejectedConfigFile {
                 notifier.post(title: Self.configFileTitle, body: "config.json could not be read (\(detail)) and was moved to \(moved.path). \(why)")
             } else {
@@ -703,21 +729,86 @@ final class SessionManager {
         }
     }
 
-    /// Writes the settings in use where a rejected config.json was moved
-    /// aside or deleted. Only a write that succeeds lets sessions run
-    /// again: until then the agent finds no file and enforces its own
-    /// defaults, whatever the app's end floor and thermal rules are.
-    private func writeOwedConfig() {
+    /// Takes the end floor and thermal rule of a config.json that decodes,
+    /// which the agent enforces, into the settings in use. The Low Power
+    /// Mode floor is raised above the new end floor if needed
+    /// (`normalizeFloors`); nothing else changes, and the file is not
+    /// rewritten. The floors run again so the change applies now.
+    private func adoptConfigFileCutoffs(_ onDisk: Config) {
+        let before = config.agentCutoffs
+        var c = config
+        c.endFloor = onDisk.endFloor
+        c.thermalRules = onDisk.thermalRules
+        let corrected = c.normalizeFloors()
+        config = c
+        Log.info("config.json has \(c.agentCutoffs.description), the app had \(before.description): the recovery agent enforces the file, so the app does too" + (corrected.map { "; \($0)" } ?? ""))
+        services?.reevaluateFloors()
+    }
+
+    /// Writes the settings in use where config.json is missing. While it is
+    /// missing the agent enforces its own defaults (`agentDefaultCutoffs`).
+    /// A write that fails stops sessions (`rejectedConfigFile`) when the
+    /// app's cutoffs differ from those defaults, or when the file was
+    /// rejected (`configWriteOwed`): the settings the app fell back to are
+    /// not on disk anywhere. Otherwise both enforce the same cutoffs, and
+    /// the next transaction writes again.
+    private func publishConfig() {
         do {
             try store.saveConfig(config)
             Log.info("the settings in use were written to config.json" + (rejectedConfigFile != nil ? "; sessions can start" : ""))
             configWriteOwed = false
             rejectedConfigFile = nil
+            configPublishFailure = nil
         } catch {
+            let detail = error.localizedDescription
+            guard configWriteOwed || config.agentCutoffs != Config.agentDefaultCutoffs else {
+                if rejectedConfigFile != nil { Log.info("config.json is missing and the recovery agent's defaults are the app's cutoffs; sessions can start") }
+                rejectedConfigFile = nil
+                if configPublishFailure != detail {
+                    Log.error("could not write the settings in use to the missing config.json (\(detail)); the recovery agent enforces its defaults, which are the app's \(config.agentCutoffs.description)")
+                }
+                configPublishFailure = detail
+                return
+            }
             let why = "Insomnia could not write the settings it uses to config.json. The recovery agent reads its end floor and thermal rules from that file and uses its own defaults while the file is missing, so Insomnia runs no session until the file is written. Free some disk space or make \(paths.appSupport.path) writable."
-            if rejectedConfigFile != why { Log.error("\(why) (\(error.localizedDescription))") }
+            if rejectedConfigFile != why { Log.error("\(why) (\(detail))") }
             rejectedConfigFile = why
         }
+    }
+
+    /// Settings' way to change the settings. A change to the end floor or
+    /// the thermal rule (`Config.agentCutoffs`) is written to config.json
+    /// first and takes effect only once that write succeeds: the agent
+    /// reads the file, so a cutoff only the app knew would let the agent
+    /// keep a session the app ends, or end one the app keeps. A write that
+    /// fails leaves both on the old cutoffs, says so in `configSaveError`,
+    /// and returns false. Any other change takes effect at once and is
+    /// written behind it; a write that fails is logged, and the next save
+    /// writes it.
+    @discardableResult
+    func updateConfig(_ change: (inout Config) -> Void) -> Bool {
+        var c = config
+        change(&c)
+        guard c != config else { return true }
+        let cutoffsChange = c.agentCutoffs != config.agentCutoffs
+        do {
+            try store.saveConfig(c)
+        } catch {
+            let detail = error.localizedDescription
+            guard cutoffsChange else {
+                Log.error("could not save config: \(detail)")
+                config = c
+                return false
+            }
+            let line = "Could not save the change to config.json (\(detail)). The recovery agent reads the end floor and thermal rules from that file, so both stay at \(config.agentCutoffs.description)."
+            Log.error("settings: \(c.agentCutoffs.description) not applied: \(line)")
+            configSaveError = line
+            return false
+        }
+        config = c
+        configSaveError = nil
+        if cutoffsChange { services?.reevaluateFloors() }
+        return true
     }
 
     /// A session still running while config.json is rejected in place, or
@@ -748,6 +839,31 @@ final class SessionManager {
         if case .failure = result {
             agentEndRetryAt = now.addingTimeInterval(recoveryRetryDelay)
         }
+    }
+
+    /// The 1 Hz tick's look at config.json while a session runs: a file that
+    /// is missing, does not decode, or carries another end floor or thermal
+    /// rule than the app (a hand edit, a deletion) goes through a
+    /// transaction (`checkConfigFile`), so the app and the agent agree
+    /// within a second, not at the next Start, lid event or extend. A file
+    /// still in that state after the transaction (a write that failed, a
+    /// busy lock) is looked at again after `recoveryRetryDelay`. Internal so
+    /// tests can run one tick at a time.
+    func noticeConfigFileChange() async {
+        guard session != nil, !checkingConfigFile, now >= configCheckRetryAt, configFileDiffers() else { return }
+        checkingConfigFile = true
+        defer { checkingConfigFile = false }
+        _ = await exclusive("settings check") {}
+        if configFileDiffers() {
+            configCheckRetryAt = now.addingTimeInterval(recoveryRetryDelay)
+        }
+    }
+
+    /// config.json is missing, does not decode, or has other cutoffs than
+    /// the settings in use.
+    private func configFileDiffers() -> Bool {
+        guard let onDisk = try? store.loadConfig() else { return true }
+        return onDisk.agentCutoffs != config.agentCutoffs
     }
 
     /// Disk is the source of truth. Missing means clean; anything that does
@@ -2549,6 +2665,7 @@ final class SessionManager {
                 guard let self else { return }
                 self.refreshCountdown()
                 await self.noticeAgentEnd()
+                await self.noticeConfigFileChange()
             }
         }
         timer.tolerance = 0.1

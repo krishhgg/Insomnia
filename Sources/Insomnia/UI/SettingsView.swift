@@ -1,8 +1,10 @@
 import AppKit
 import SwiftUI
 
-/// The settings window (spec 10). Every change is written straight through
-/// `manager.config` to config.json.
+/// The settings window (spec 10). Every change goes through
+/// `SessionManager.updateConfig`, which writes it to config.json; a change to
+/// the end floor or the thermal rules takes effect only once that write
+/// succeeds.
 struct SettingsView: View {
     let manager: SessionManager
     let secrets: any HotspotSecretStore
@@ -59,28 +61,12 @@ struct SettingsView: View {
     private func bind<T: Equatable>(_ keyPath: WritableKeyPath<Config, T>) -> Binding<T> {
         Binding(
             get: { manager.config[keyPath: keyPath] },
-            set: { value in
-                guard manager.config[keyPath: keyPath] != value else { return }
-                manager.config[keyPath: keyPath] = value
-                save()
-            }
+            set: { value in update { $0[keyPath: keyPath] = value } }
         )
     }
 
-    private func save() {
-        do {
-            try manager.store.saveConfig(manager.config)
-        } catch {
-            Log.error("could not save config: \(error.localizedDescription)")
-        }
-    }
-
     private func update(_ change: (inout Config) -> Void) {
-        var c = manager.config
-        change(&c)
-        guard c != manager.config else { return }
-        manager.config = c
-        save()
+        manager.updateConfig(change)
     }
 
     /// The floor steppers go through the Config setters, which move the
@@ -242,6 +228,11 @@ struct SettingsView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
             Toggle("Thermal rules (Low Power Mode when hot, end when critical)", isOn: bind(\.thermalRules))
+            if let error = manager.configSaveError {
+                Text(error)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
         }
     }
 

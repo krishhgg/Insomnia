@@ -570,8 +570,9 @@ final class ConfigLoadTests: XCTestCase {
 
     /// A file this build cannot decode is the user's settings with one bad
     /// value or a typo. It is renamed aside with its bytes, never written
-    /// over; config.json then holds the defaults the app runs on, and the
-    /// first reconcile says where the file went, once.
+    /// over. The first reconcile, which runs only once the launch holds the
+    /// alive lock, writes the defaults the app runs on to config.json and
+    /// says where the file went, once.
     func testAConfigThatDoesNotDecodeIsMovedAsideNotOverwritten() async throws {
         let cases = [
             #"{"configVersion": 2, "endFloor": "30", "freezeAllApps": false}"#,
@@ -588,10 +589,11 @@ final class ConfigLoadTests: XCTestCase {
             XCTAssertEqual(try movedAsideConfigs(), ["config.json.unreadable-20270115T080000Z"], json)
             let moved = h.home.paths.appSupport.appendingPathComponent("config.json.unreadable-20270115T080000Z")
             XCTAssertEqual(try Data(contentsOf: moved), written, json)
-            XCTAssertEqual(try h.store.loadConfig(), Config(), json)
+            XCTAssertNil(try h.store.loadConfig(), "init writes nothing: it runs before LaunchGate")
             XCTAssertTrue(log().contains("[error] insomnia: config.json could not be read ("), log())
 
             await m.reconcile()
+            XCTAssertEqual(try h.store.loadConfig(), Config(), json)
             await m.reconcile()
             let notices = h.notifier.posts.filter { $0.title == SessionManager.configFileTitle }
             XCTAssertEqual(notices.count, 1, "\(notices)")
