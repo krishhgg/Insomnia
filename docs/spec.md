@@ -473,9 +473,9 @@ app decodes it, so a whole float such as `30.0` is 30, and clamps it to 0
 through 95 as `Config.normalizeFloors` does. The backstop reads the scalar
 keys `endFloor` and `thermalRules` from config.json directly, not through the
 app's decoder, so it cannot tell whether the app accepted the file. The app
-therefore refuses to run a session on a config.json it rejected and could
-not move aside, or moved aside without writing its settings in its place
-(section 10).
+therefore runs no session while a config.json it rejected stays in place,
+or until it has written its settings where a rejected file was moved aside
+or deleted (section 10).
 Performance effects depend on workload.
 
 ### 7. Network failover
@@ -959,8 +959,9 @@ and the lid, floor and Low Power changes) checks the file again. One that
 does not decode is renamed aside as at launch, and the settings the app runs
 on are written in its place. With no file the backstop enforces its own
 defaults, so a write that fails, as on a full disk, is tried again in every
-transaction until it succeeds. While a rejected file cannot be renamed, or
-its replacement is not written yet, no session runs:
+transaction until it succeeds. A rejected file that cannot be renamed and
+that a person then deletes gets the same write. While a rejected file cannot
+be renamed, or its replacement is not written yet, no session runs:
 
 - Start refuses and changes nothing. Its notification names the file and
   says to make it writable or delete it, or, when the replacement could not

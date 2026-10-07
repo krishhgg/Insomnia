@@ -344,11 +344,15 @@ final class SessionManager {
     /// the file's endFloor and thermalRules keys itself, without the app's
     /// decoder, so it could enforce a 0% floor or no thermal rule while the
     /// app enforces its defaults, and with no file it enforces its own
-    /// defaults, not the app's settings. Nil once the file reads again or is
-    /// gone and no write is owed.
+    /// defaults, not the app's settings. Nil once the file reads again or
+    /// the settings in use are written where it was.
     @ObservationIgnored private(set) var rejectedConfigFile: String?
-    /// config.json was moved aside and the settings in use are not yet
-    /// written in its place. Every transaction tries the write again.
+    /// config.json was rejected and the settings in use are not yet written
+    /// in its place. Set when the file is moved aside, and also when it
+    /// cannot be: a person who then deletes it, as the refusal suggests,
+    /// would otherwise leave the agent on its defaults while the app runs
+    /// on its own settings. Every transaction that finds no file tries the
+    /// write again.
     @ObservationIgnored private var configWriteOwed = false
 
     init(
@@ -646,9 +650,9 @@ final class SessionManager {
     /// the app rejects is moved aside and the settings the app runs on are
     /// written in its place, so the agent and the app enforce the same
     /// cutoffs. When the rename fails, or until that write succeeds,
-    /// `rejectedConfigFile` says why and no session runs. A file that
-    /// decodes is left alone, and so is a missing one unless the write is
-    /// owed.
+    /// `rejectedConfigFile` says why and no session runs. A rejected file
+    /// that a person deletes is replaced the same way. A file that decodes
+    /// is left alone, and so is a missing one unless the write is owed.
     private func checkConfigFile() {
         let detail: String
         do {
@@ -656,7 +660,7 @@ final class SessionManager {
                 writeOwedConfig()
                 return
             }
-            if rejectedConfigFile != nil { Log.info("config.json reads again or is gone; sessions can start") }
+            if rejectedConfigFile != nil { Log.info("config.json reads again; sessions can start") }
             rejectedConfigFile = nil
             configWriteOwed = false
             return
@@ -679,13 +683,14 @@ final class SessionManager {
             let why = Self.rejectedConfigMessage(paths.configFile.path, detail: detail, moveError: moveError.localizedDescription)
             if rejectedConfigFile != why { Log.error(why) }
             rejectedConfigFile = why
+            configWriteOwed = true
         }
     }
 
-    /// Writes the settings in use where config.json was moved aside. Only a
-    /// write that succeeds lets sessions run again: until then the agent
-    /// finds no file and enforces its own defaults, whatever the app's end
-    /// floor and thermal rules are.
+    /// Writes the settings in use where a rejected config.json was moved
+    /// aside or deleted. Only a write that succeeds lets sessions run
+    /// again: until then the agent finds no file and enforces its own
+    /// defaults, whatever the app's end floor and thermal rules are.
     private func writeOwedConfig() {
         do {
             try store.saveConfig(config)

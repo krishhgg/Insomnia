@@ -552,8 +552,9 @@ final class ConfigLoadTests: XCTestCase {
     /// The marker's presence is what makes a file current; its value is
     /// never read. A hand-edited "2" keeps every setting, the 30-day
     /// ceiling included, and the file is neither migrated nor rewritten.
+    /// The file has had the lid-close update, which would write it once.
     func testAVersionMarkerOfAnotherTypeKeepsTheSettings() async throws {
-        let json = #"{"configVersion": "2", "maxDuration": 2592000, "endFloor": 30, "lowPowerFloor": 40, "freezeAllApps": false}"#
+        let json = #"{"configVersion": "2", "lidCloseDefaultsApplied": true, "maxDuration": 2592000, "endFloor": 30, "lowPowerFloor": 40, "freezeAllApps": false}"#
         let written = try writeConfig(json)
 
         let m = h.makeManager()
@@ -669,9 +670,9 @@ final class ConfigLoadTests: XCTestCase {
         XCTAssertTrue(h.notifier.posts.contains { $0.title == SessionManager.configFileTitle && $0.body.contains("It was moved to \(moved.path)") }, "\(h.notifier.posts)")
     }
 
-    /// Deleting the file is the other fix. The agent then reads its
-    /// defaults, which are the settings the app fell back to, and Start
-    /// goes ahead.
+    /// Deleting the file is the other fix. Start writes the settings the
+    /// app fell back to in its place, so the agent reads them, and goes
+    /// ahead.
     func testStartGoesAheadOnceTheRejectedConfigIsDeleted() async throws {
         _ = try writeConfig(rejectedConfig)
         let file = h.home.paths.configFile
@@ -688,6 +689,47 @@ final class ConfigLoadTests: XCTestCase {
 
         XCTAssertTrue(m.isActive)
         XCTAssertEqual(m.config, Config())
+        XCTAssertEqual(try h.store.loadConfig(), m.config)
+        XCTAssertEqual(try movedAsideConfigs(), [])
+    }
+
+    /// The same fix after the file turned bad during a session, while the
+    /// app runs on a 30% floor: without a file the agent would enforce its
+    /// own 10%. So the deleted file is replaced by the settings in use
+    /// before a session runs, and while that write fails Start is refused.
+    func testADeletedRejectedConfigIsReplacedByTheSettingsInUseBeforeAStart() async throws {
+        var mine = Config()
+        mine.endFloor = 30
+        try h.store.saveConfig(mine)
+        let m = h.makeManager()
+        await m.reconcile()
+        await m.start(duration: 3600)
+        _ = try writeConfig(rejectedConfig)
+        let file = h.home.paths.configFile
+        let dir = h.home.paths.appSupport
+        try setImmutable(file, true)
+        defer { try? setImmutable(file, false) }
+        await m.extend(by: 600)
+        XCTAssertFalse(m.isActive)
+
+        try setImmutable(file, false)
+        try FileManager.default.removeItem(at: file)
+        try TestACL.denyNewFiles(in: dir)
+        defer { try? TestACL.removeAll(dir) }
+        await m.start(duration: 3600)
+
+        XCTAssertFalse(m.isActive)
+        XCTAssertEqual(h.guardFake.calls.filter { $0 == "disablesleep 1" }.count, 1)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: file.path))
+        let why = try XCTUnwrap(m.rejectedConfigFile)
+        XCTAssertEqual(h.notifier.posts.last?.body, "Insomnia did not start a session. \(why)")
+
+        try TestACL.removeAll(dir)
+        await m.start(duration: 3600)
+
+        XCTAssertTrue(m.isActive)
+        XCTAssertNil(m.rejectedConfigFile)
+        XCTAssertEqual(try h.store.loadConfig()?.endFloor, 30)
         XCTAssertEqual(try movedAsideConfigs(), [])
     }
 
@@ -915,6 +957,38 @@ final class ConfigLoadTests: XCTestCase {
         XCTAssertTrue(again.config.freezeAllApps)
         XCTAssertFalse(again.config.muteOnLidClose)
         XCTAssertEqual(h.notifier.posts.count, 1, "only the first launch announces the update")
+    }
+
+    /// A config.json from before both one-time updates gets each once: the
+    /// stock 30-day ceiling becomes 24 hours and the lid-close settings
+    /// change, with one notice, while a value the user set is kept. The
+    /// file is written back with both marks, so a 30-day ceiling the user
+    /// then sets and a dismissed notice stay as they are after a relaunch.
+    func testAnOlderConfigGetsTheDurationAndLidCloseUpdatesOnceEach() async throws {
+        try writeEarlierBuildConfig(#"{"maxDuration": 2592000, "endFloor": 30, "freezeAllApps": true, "muteOnLidClose": false}"#)
+
+        let m = h.makeManager()
+        await m.reconcile()
+
+        XCTAssertEqual(m.config.maxDuration, 24 * 3600)
+        XCTAssertEqual(m.config.endFloor, 30)
+        XCTAssertFalse(m.config.freezeAllApps)
+        XCTAssertTrue(m.config.muteOnLidClose)
+        XCTAssertNotNil(m.config.lidCloseDefaultsNotice)
+        XCTAssertEqual(try h.store.loadConfig(), m.config)
+        XCTAssertTrue(try h.store.configHasVersion())
+        XCTAssertEqual(h.notifier.posts.map(\.title), [LidCloseDefaultsChange.title])
+
+        m.config.maxDuration = 30 * 24 * 3600
+        try h.store.saveConfig(m.config)
+        m.dismissLidCloseNotice()
+        let again = h.makeManager()
+        await again.reconcile()
+
+        XCTAssertEqual(again.config.maxDuration, 30 * 24 * 3600)
+        XCTAssertNil(again.config.lidCloseDefaultsNotice)
+        XCTAssertEqual(again.config, m.config)
+        XCTAssertEqual(h.notifier.posts.count, 1)
     }
 
     /// A fresh install gets the new defaults, a config.json with the mark,
