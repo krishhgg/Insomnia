@@ -404,4 +404,38 @@ final class ProcessIdentityTests: XCTestCase {
         XCTAssertEqual(groups[0].identities, [100: ProcessIdentity(startedAt: 1000), 101: ProcessIdentity(startedAt: 1001)])
         XCTAssertEqual(groups[0].expectedParents, [100: 1, 101: 100])
     }
+    // MARK: Process table lookup (a root process too)
+
+    /// `processTableState` reads the same identity as `kernelState` for a
+    /// process both can see, and still answers for a root process, which
+    /// proc_pidinfo refuses: `sudo pmset` runs as root. pid 1 (launchd) is
+    /// only read.
+    func testTheProcessTableAnswersForTheTestProcessAndForARootProcess() {
+        let me = ProcessInfo.processInfo.processIdentifier
+        guard case let .present(direct) = SignalProcessControl.kernelState(pid: me),
+              case let .present(table) = SignalProcessControl.processTableState(pid: me) else {
+            return XCTFail("the test process could not be read")
+        }
+        XCTAssertEqual(table.identity, direct.identity)
+        XCTAssertFalse(table.identity.bootSession.isEmpty)
+
+        guard case .unreadable = SignalProcessControl.kernelState(pid: 1) else {
+            return XCTFail("proc_pidinfo read launchd; this test no longer shows why the process table is used")
+        }
+        guard case let .present(root) = SignalProcessControl.processTableState(pid: 1) else {
+            return XCTFail("the process table did not answer for a root process")
+        }
+        XCTAssertGreaterThan(root.identity.startedAt, 0)
+    }
+
+    /// A child that has exited and been reaped is absent, not unreadable.
+    func testTheProcessTableReportsAReapedChildAsAbsent() throws {
+        let child = Process()
+        child.executableURL = URL(fileURLWithPath: "/usr/bin/true")
+        let exit = ProcessExit(child)
+        try child.run()
+        exit.wait()
+        XCTAssertEqual(SignalProcessControl.processTableState(pid: child.processIdentifier), .absent)
+        XCTAssertEqual(SignalProcessControl.processTableState(pid: 0), .absent)
+    }
 }

@@ -660,6 +660,7 @@ step "Removing app bundle"
 if (( PURGE == 1 )); then
   step "Purging Insomnia's files in $APP_SUPPORT and $LOG_DIR"
   remove_owned "$SESSION" "$STATE" "$APP_SUPPORT/config.json" "$APP_SUPPORT/backstop.sh" \
+        "$APP_SUPPORT/unfinished-command.json" \
         "$LOG_DIR/insomnia.log" "$LOG_DIR/insomnia.log.1" \
         "$LOG_DIR/handoffs.log" "$LOG_DIR/handoffs.log.1"
   collect_moved_aside_sessions
@@ -681,7 +682,9 @@ if (( PURGE == 1 )); then
   echo "Kept $LOCK (the recovery lock is never unlinked; delete $APP_SUPPORT by hand if you want it gone)."
   [[ -d "$LOG_DIR" ]] && echo "Kept $LOG_DIR: it still holds files Insomnia did not create."
 else
-  remove_owned "$APP_SUPPORT/backstop.sh" "$SESSION" "$STATE"
+  # unfinished-command.json names a sudo pmset that held the recovery lock;
+  # this run holds it now, so that command has exited.
+  remove_owned "$APP_SUPPORT/backstop.sh" "$SESSION" "$STATE" "$APP_SUPPORT/unfinished-command.json"
   echo "Kept $APP_SUPPORT/config.json and $LOG_DIR (use --purge to remove)."
   collect_moved_aside_sessions
   if (( ${#MOVED_ASIDE[@]} > 0 )); then
