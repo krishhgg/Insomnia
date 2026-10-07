@@ -237,6 +237,7 @@ final class ReconcileTests: XCTestCase {
         XCTAssertEqual(h.audio.applied.count, 1)
         XCTAssertEqual(h.audio.applied.first?.volume, 0.6)
         XCTAssertEqual(h.audio.applied.first?.muted, false)
+        XCTAssertNil(h.audio.applied.first?.deviceUID ?? nil, "an entry without a device restores the default output")
         XCTAssertEqual(m.state, after)
     }
 
@@ -859,6 +860,48 @@ final class ReconcileTests: XCTestCase {
         XCTAssertEqual(retried, .restored)
         XCTAssertFalse(exists(h.home.paths.sessionFile))
         XCTAssertEqual(h.guardFake.calls.filter { $0 == "disablesleep 1" }, [])
+    }
+
+    /// The journal holds only saved output volumes: a headset that is
+    /// connected and a display that is not. session.json can be neither
+    /// read nor moved aside. The launch restores the headset and runs the
+    /// end that renames the file, which stays pending while the rename
+    /// fails. Once the name is free, the retry moves the file by itself,
+    /// the display keeps its entry without holding up that end, and a
+    /// start goes through.
+    func testAKeptSessionFileIsRetriedWhenOnlyOutputVolumesAreOwed() async throws {
+        try FileManager.default.createDirectory(at: h.home.paths.sessionFile, withIntermediateDirectories: true)
+        let taken = h.home.paths.appSupport.appendingPathComponent("session.json.unreadable-20270115T080000Z")
+        try FileManager.default.createSymbolicLink(atPath: taken.path, withDestinationPath: h.home.paths.appSupport.appendingPathComponent("missing").path)
+        var st = RuntimeState()
+        st.savedAudioOutputs = [
+            SavedAudioOutput(deviceUID: "usb-headset", name: "USB Headset", volume: 0.3, muted: false, saveID: "headset-save"),
+            SavedAudioOutput(deviceUID: "room-display", name: "Room Display", volume: 0.5, muted: false, saveID: "display-save"),
+        ]
+        try h.store.saveState(st)
+        h.audio.connect("usb-headset", name: "USB Headset", volume: 0.3, muted: true)
+        let m = h.makeManager(retryDelay: 0.05)
+
+        await m.reconcile()
+
+        XCTAssertEqual(h.audio.device("usb-headset")?.muted, false)
+        XCTAssertEqual(try h.store.loadState()?.savedAudioOutputs.map(\.deviceUID), ["room-display"])
+        XCTAssertEqual(m.pendingEnd, .backstop, "no end is left to retry the rename")
+        XCTAssertEqual(fileType(h.home.paths.sessionFile), S_IFDIR)
+
+        try FileManager.default.removeItem(at: taken)
+        for _ in 0..<500 where m.pendingEnd != nil {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+
+        XCTAssertNil(m.pendingEnd)
+        XCTAssertFalse(exists(h.home.paths.sessionFile))
+        XCTAssertEqual(fileType(taken), S_IFDIR, "the retry did not move session.json aside")
+        XCTAssertEqual(try h.store.loadState()?.savedAudioOutputs.map(\.deviceUID), ["room-display"])
+        XCTAssertEqual(m.outputsWaitingForRestore.map(\.deviceUID), ["room-display"])
+
+        await m.start(duration: 3600)
+        XCTAssertTrue(m.isActive, m.lastError ?? "")
     }
 
     /// An earlier moved-aside file with the same stamp is never overwritten;

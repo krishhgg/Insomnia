@@ -265,12 +265,25 @@ final class LidActions {
         do {
             let current = try audio.read()
             try manager.journal { s in
-                // Keep an earlier save if a previous close was never undone.
-                if s.savedOutputVolume == nil { s.savedOutputVolume = current.volume }
-                if s.savedMuted == nil { s.savedMuted = current.muted }
+                // One entry per device. A device that already has one keeps
+                // it: a previous close muted it and was never undone, so
+                // what reads now is that mute. Entries for other devices,
+                // still waiting for theirs to reconnect, are left as they are.
+                // A new entry gets a save ID of its own (`SavedAudioOutput`).
+                if !s.savedAudioOutputs.contains(where: { $0.deviceUID == current.deviceUID }) {
+                    s.savedAudioOutputs.append(SavedAudioOutput(
+                        deviceUID: current.deviceUID,
+                        name: current.name,
+                        volume: current.volume,
+                        muted: current.muted,
+                        saveID: UUID().uuidString
+                    ))
+                }
             }
-            try audio.mute()
-            Log.info("muted (was volume \(current.volume), muted \(current.muted))")
+            // The device just read and journaled, even if the default output
+            // has changed since.
+            try audio.mute(deviceUID: current.deviceUID)
+            Log.info("muted \(current.deviceUID) (was volume \(current.volume), muted \(current.muted))")
         } catch {
             Log.error("mute on lid close failed: \(error.localizedDescription)")
         }

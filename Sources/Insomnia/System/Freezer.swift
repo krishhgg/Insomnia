@@ -78,8 +78,9 @@ enum FreezePlanner {
 
     /// Apps the automatic lid-close scope (`Config.freezeAllApps`) leaves
     /// alone even when they are not on the agent list: agent hosts, editors,
-    /// terminals, browsers, password managers, local databases, VPN and
-    /// local model runtimes. Code level, not persisted, because an existing
+    /// terminals, browsers, password managers, local databases, VPN, local
+    /// model runtimes, and meeting, recording and dictation apps
+    /// (`meetingApps`). Code level, not persisted, because an existing
     /// config.json already carries its own agent list and new defaults never
     /// reach it. An explicit freeze-list entry overrides this set; the hard
     /// denylist does not. Membership is checked with `isBuiltInProtected`,
@@ -91,7 +92,7 @@ enum FreezePlanner {
     /// named Homebrew cask (`brew info --cask --json=v2 <cask>`), read on
     /// October 1, 2026. Apple's own apps are covered by the `com.apple.`
     /// rule in `isDenied` and do not belong here.
-    static let builtInProtected: Set<String> = [
+    static let builtInProtected: Set<String> = Set([
         // Editors and agent hosts
         "com.microsoft.VSCode",             // Visual Studio Code (installed)
         "com.microsoft.VSCodeInsiders",     // Visual Studio Code Insiders (cask visual-studio-code@insiders)
@@ -145,7 +146,42 @@ enum FreezePlanner {
         "com.bitwarden.desktop",            // Bitwarden (cask bitwarden)
         "com.postgresapp.Postgres2",        // Postgres.app (cask postgres-app)
         "dev.kdrag0n.MacVirt",              // OrbStack (cask orbstack)
+    ]).union(meetingApps)
+
+    /// Meeting, recording and dictation apps. Freezing one ends a call, a
+    /// recording or a meeting notetaker at the lid close: with freeze-all on,
+    /// a lid close stopped all 13 of Wispr Flow's processes. FaceTime
+    /// (`com.apple.FaceTime`, installed) needs no entry: the `com.apple.`
+    /// rule in `isDenied` already covers it, explicit list included.
+    /// "installed" as above, read on October 6, 2026; the other ids come
+    /// from the page named, read the same day.
+    static let meetingApps: Set<String> = [
+        "us.zoom.xos",                      // Zoom (installed)
+        "com.microsoft.teams2",             // Microsoft Teams (Microsoft Learn, "Bulk deploy the Microsoft Teams desktop client": the Mac preference domain)
+        "com.microsoft.teams",              // Microsoft Teams classic (msb365.blog/?p=5429)
+        "Cisco-Systems.Spark",              // Webex (installed)
+        "com.cisco.washost",                // Webex helper (installed, inside Webex.app)
+        "com.cisco.webexmeetingsapp",       // Webex Meetings, the older desktop app (Jamf Community, "PPPC for Webex")
+        "com.webex.meetingmanager",         // Webex Meetings' meeting window (same thread)
+        "com.webex.pluginagent",            // Webex plugin agent that starts meetings (same thread)
+        "com.electron.wispr-flow",          // Wispr Flow (installed)
+        "com.granola.app",                  // Granola (appcatalog.cloud/apps/granola)
+        "com.otterai.desktop",              // Otter (appcatalog.cloud/apps/otter)
+        "com.obsproject.obs-studio",        // OBS (installed)
+        "com.loom.desktop",                 // Loom (doesitarm.com/app/loom, the app's Info.plist)
     ]
+
+    /// Helper apps of `meetingApps`. Helpers an app starts are its child
+    /// processes, so leaving the app out leaves them out too; these
+    /// prefixes cover a helper that runs as an app of its own. Most
+    /// register under the app's id plus a suffix (installed:
+    /// `com.electron.wispr-flow.helper`,
+    /// `com.electron.wispr-flow.accessibility-mac-app`,
+    /// `com.obsproject.obs-studio.helper.gpu`), so each id followed by a dot
+    /// is a prefix. Zoom's are `us.zoom.<name>` (installed: `us.zoom.CptHost`,
+    /// `us.zoom.ZoomCefHelper`, `us.zoom.caphost`) and Webex's capture helper
+    /// is `com.cisco.webex.CaptureHost` (installed).
+    static let meetingAppPrefixes: [String] = meetingApps.sorted().map { $0 + "." } + ["us.zoom.", "com.cisco.webex."]
 
     /// Bundle-id prefixes protected the same way. Every JetBrains IDE is
     /// `com.jetbrains.<product>` (cask intellij-idea com.jetbrains.intellij,
@@ -154,7 +190,8 @@ enum FreezePlanner {
     /// com.jetbrains.rider, phpstorm com.jetbrains.PhpStorm, rubymine
     /// com.jetbrains.rubymine, datagrip com.jetbrains.datagrip; the
     /// Community editions add `.ce`), so one prefix covers the family.
-    static let builtInProtectedPrefixes: [String] = ["com.jetbrains."]
+    /// The helper prefixes of `meetingApps` follow.
+    static let builtInProtectedPrefixes: [String] = ["com.jetbrains."] + meetingAppPrefixes
 
     static func isBuiltInProtected(_ bundleId: String) -> Bool {
         builtInProtected.contains(bundleId) || builtInProtectedPrefixes.contains { bundleId.hasPrefix($0) }

@@ -137,7 +137,7 @@ final class FreezerTests: XCTestCase {
 
     // MARK: Lid-close scope (freeze every other app)
 
-    let wispr = RunningApp(pid: 600, bundleId: "com.electron.wispr-flow", name: "Wispr Flow")
+    let spotify = RunningApp(pid: 600, bundleId: "com.spotify.client", name: "Spotify")
     let figma = RunningApp(pid: 700, bundleId: "com.figma.Desktop", name: "Figma")
     let chatGPT = RunningApp(pid: 800, bundleId: "com.openai.codex", name: "ChatGPT")
     let bartender = RunningApp(pid: 900, bundleId: "com.surteesstudios.Bartender", name: "Bartender", activationPolicy: .accessory)
@@ -159,21 +159,21 @@ final class FreezerTests: XCTestCase {
         var c = Config()
         c.freezeAllApps = true
         c.freezeList = ["com.tinyspeck.slackmacgap"]
-        XCTAssertEqual(scope(c, apps + [wispr, figma]), ["com.tinyspeck.slackmacgap", "com.figma.Desktop", "com.electron.wispr-flow"])
+        XCTAssertEqual(scope(c, apps + [spotify, figma]), ["com.tinyspeck.slackmacgap", "com.figma.Desktop", "com.spotify.client"])
     }
 
     func testLidCloseScopeExcludesAccessoryAndProhibitedApps() {
         var c = Config()
         c.freezeAllApps = true
         c.freezeList = []
-        XCTAssertEqual(scope(c, [wispr, bartender, daemon]), ["com.electron.wispr-flow"])
+        XCTAssertEqual(scope(c, [spotify, bartender, daemon]), ["com.spotify.client"])
     }
 
     func testLidCloseScopeExcludesAppsWithoutBundleId() {
         var c = Config()
         c.freezeAllApps = true
         c.freezeList = []
-        XCTAssertEqual(scope(c, [nameless, wispr]), ["com.electron.wispr-flow"])
+        XCTAssertEqual(scope(c, [nameless, spotify]), ["com.spotify.client"])
     }
 
     func testLidCloseScopeExcludesApple() {
@@ -205,12 +205,12 @@ final class FreezerTests: XCTestCase {
     func testLidCloseScopeExcludesAgentListEvenWhenOnFreezeList() {
         var c = Config()
         c.freezeAllApps = true
-        c.freezeList = ["com.electron.wispr-flow"]
-        c.agentList = ["com.electron.wispr-flow"]
-        let ids = scope(c, [wispr, figma])
-        XCTAssertEqual(ids.filter { $0 != "com.electron.wispr-flow" }, ["com.figma.Desktop"], "an agent must never be an automatic candidate")
+        c.freezeList = ["com.spotify.client"]
+        c.agentList = ["com.spotify.client"]
+        let ids = scope(c, [spotify, figma])
+        XCTAssertEqual(ids.filter { $0 != "com.spotify.client" }, ["com.figma.Desktop"], "an agent must never be an automatic candidate")
         let procs = processes + [ProcessEntry(pid: 600, ppid: 1, startedAt: 6000), ProcessEntry(pid: 700, ppid: 1, startedAt: 7000)]
-        let groups = FreezePlanner.groups(bundleIds: ids, apps: apps + [wispr, figma], processes: procs, config: c)
+        let groups = FreezePlanner.groups(bundleIds: ids, apps: apps + [spotify, figma], processes: procs, config: c)
         XCTAssertEqual(groups.map(\.bundleId), ["com.figma.Desktop"], "the hard denylist wins over an explicit entry")
     }
 
@@ -220,9 +220,9 @@ final class FreezerTests: XCTestCase {
         c.freezeAllApps = true
         c.freezeList = []
         c.agentList = []
-        XCTAssertEqual(scope(c, [chatGPT, wispr]), ["com.electron.wispr-flow"])
+        XCTAssertEqual(scope(c, [chatGPT, spotify]), ["com.spotify.client"])
         c.freezeList = ["com.openai.codex"]
-        XCTAssertEqual(scope(c, [chatGPT, wispr]), ["com.openai.codex", "com.electron.wispr-flow"])
+        XCTAssertEqual(scope(c, [chatGPT, spotify]), ["com.openai.codex", "com.spotify.client"])
     }
 
     func testBuiltInProtectedCoversVerifiedIdsAndNoneIsApple() {
@@ -259,9 +259,49 @@ final class FreezerTests: XCTestCase {
         c.freezeList = []
         c.agentList = []
         let idea = RunningApp(pid: 1100, bundleId: "com.jetbrains.intellij", name: "IntelliJ IDEA")
-        XCTAssertEqual(scope(c, [idea, wispr]), ["com.electron.wispr-flow"])
+        XCTAssertEqual(scope(c, [idea, spotify]), ["com.spotify.client"])
         c.freezeList = ["com.jetbrains.intellij"]
-        XCTAssertEqual(scope(c, [idea, wispr]), ["com.jetbrains.intellij", "com.electron.wispr-flow"], "an explicit entry overrides the prefix")
+        XCTAssertEqual(scope(c, [idea, spotify]), ["com.jetbrains.intellij", "com.spotify.client"], "an explicit entry overrides the prefix")
+    }
+
+    /// Meeting, recording and dictation apps and their helper apps are
+    /// never automatic candidates, whatever their policy. The ids are
+    /// pinned: each is read from an installed app or cited in Freezer.swift.
+    func testMeetingAppsAndTheirHelpersAreProtected() {
+        XCTAssertEqual(FreezePlanner.meetingApps, [
+            "us.zoom.xos", "com.microsoft.teams2", "com.microsoft.teams", "Cisco-Systems.Spark", "com.cisco.washost",
+            "com.cisco.webexmeetingsapp", "com.webex.meetingmanager", "com.webex.pluginagent", "com.electron.wispr-flow",
+            "com.granola.app", "com.otterai.desktop", "com.obsproject.obs-studio", "com.loom.desktop",
+        ])
+        XCTAssertTrue(FreezePlanner.meetingApps.isSubset(of: FreezePlanner.builtInProtected))
+        let helpers = ["us.zoom.CptHost", "us.zoom.ZoomCefHelper", "us.zoom.caphost", "us.zoom.aomhost",
+                       "com.electron.wispr-flow.helper", "com.electron.wispr-flow.accessibility-mac-app",
+                       "com.obsproject.obs-studio.helper.gpu", "com.cisco.webex.CaptureHost", "com.microsoft.teams2.helper",
+                       "Cisco-Systems.Spark.helper", "com.granola.app.helper", "com.loom.desktop.helper", "com.otterai.desktop.helper"]
+        for id in FreezePlanner.meetingApps.sorted() + helpers {
+            XCTAssertTrue(FreezePlanner.isBuiltInProtected(id), id)
+        }
+        // The prefixes end at a label boundary: look-alikes stay freezable.
+        for id in ["us.zoomer.app", "com.electron.wispr-flowchart", "com.loom.desktopapp", "com.granola.application", "com.webex.other"] {
+            XCTAssertFalse(FreezePlanner.isBuiltInProtected(id), id)
+        }
+
+        var c = Config()
+        c.freezeAllApps = true
+        c.freezeList = []
+        c.agentList = []
+        var pid: Int32 = 2000
+        let running = (FreezePlanner.meetingApps.sorted() + helpers + ["com.apple.FaceTime"]).map { id -> RunningApp in
+            pid += 1
+            return RunningApp(pid: pid, bundleId: id, name: id)
+        }
+        XCTAssertEqual(scope(c, running + [spotify]), ["com.spotify.client"], "only the ordinary Dock app is a candidate")
+        // FaceTime is an Apple app: the hard denylist covers it, even as an
+        // explicit entry. Other meeting apps follow the protected set: an
+        // explicit entry overrides it.
+        XCTAssertTrue(FreezePlanner.isDenied("com.apple.FaceTime", config: c))
+        c.freezeList = ["us.zoom.xos"]
+        XCTAssertEqual(scope(c, running + [spotify]), ["us.zoom.xos", "com.spotify.client"])
     }
 
     /// A fresh config does not opt in to the automatic scope: with Dock
@@ -269,8 +309,8 @@ final class FreezerTests: XCTestCase {
     func testLidCloseScopeIsTheFreezeListOnlyByDefault() {
         let c = Config()
         XCTAssertFalse(c.freezeAllApps)
-        XCTAssertEqual(scope(c, apps + [wispr, figma]), Config.defaultFreezeList)
-        XCTAssertEqual(FreezePlanner.automaticCandidates(config: c, apps: apps + [wispr, figma]), [])
+        XCTAssertEqual(scope(c, apps + [spotify, figma]), Config.defaultFreezeList)
+        XCTAssertEqual(FreezePlanner.automaticCandidates(config: c, apps: apps + [spotify, figma]), [])
     }
 
     func testLidCloseScopeIsExplicitFirstThenAlphabeticalByName() {
@@ -278,10 +318,10 @@ final class FreezerTests: XCTestCase {
         c.freezeAllApps = true
         c.freezeList = ["net.whatsapp.WhatsApp", "com.tinyspeck.slackmacgap"]
         let arq = RunningApp(pid: 1000, bundleId: "com.haystack.arq", name: "arq")
-        let zoom = RunningApp(pid: 1001, bundleId: "us.zoom.xos", name: "zoom.us")
+        let todoist = RunningApp(pid: 1001, bundleId: "com.todoist.mac.Todoist", name: "todoist")
         XCTAssertEqual(
-            scope(c, [zoom, wispr, apps[0], figma, arq]),
-            ["net.whatsapp.WhatsApp", "com.tinyspeck.slackmacgap", "com.haystack.arq", "com.figma.Desktop", "com.electron.wispr-flow", "us.zoom.xos"]
+            scope(c, [todoist, spotify, apps[0], figma, arq]),
+            ["net.whatsapp.WhatsApp", "com.tinyspeck.slackmacgap", "com.haystack.arq", "com.figma.Desktop", "com.spotify.client", "com.todoist.mac.Todoist"]
         )
     }
 
@@ -289,16 +329,16 @@ final class FreezerTests: XCTestCase {
         var c = Config()
         c.freezeAllApps = true
         c.freezeList = ["com.figma.Desktop", "com.figma.Desktop", "com.tinyspeck.slackmacgap"]
-        let second = RunningApp(pid: 601, bundleId: "com.electron.wispr-flow", name: "Wispr Flow")
+        let second = RunningApp(pid: 601, bundleId: "com.spotify.client", name: "Spotify")
         let figmaAgain = RunningApp(pid: 701, bundleId: "com.figma.Desktop", name: "Figma")
-        XCTAssertEqual(scope(c, [figma, wispr, second, figmaAgain]), ["com.figma.Desktop", "com.tinyspeck.slackmacgap", "com.electron.wispr-flow"])
+        XCTAssertEqual(scope(c, [figma, spotify, second, figmaAgain]), ["com.figma.Desktop", "com.tinyspeck.slackmacgap", "com.spotify.client"])
     }
 
     func testLidCloseScopeWithToggleOffIsTheFreezeListOnly() {
         var c = Config()
         c.freezeAllApps = false
         c.freezeList = ["com.tinyspeck.slackmacgap", "com.hnc.Discord"]
-        XCTAssertEqual(scope(c, apps + [wispr, figma]), ["com.tinyspeck.slackmacgap", "com.hnc.Discord"])
+        XCTAssertEqual(scope(c, apps + [spotify, figma]), ["com.tinyspeck.slackmacgap", "com.hnc.Discord"])
     }
 
     /// `plan(config:)` is the lid-close scope turned into process groups.
@@ -307,8 +347,8 @@ final class FreezerTests: XCTestCase {
         c.freezeAllApps = true
         c.freezeList = ["com.tinyspeck.slackmacgap"]
         let procs = processes + [ProcessEntry(pid: 600, ppid: 1, startedAt: 6000), ProcessEntry(pid: 900, ppid: 1, startedAt: 9000)]
-        let f = FakeFreezer(apps: apps + [wispr, bartender], processes: procs, control: FakeProcessControl())
-        XCTAssertEqual(f.plan(config: c).map(\.bundleId), ["com.tinyspeck.slackmacgap", "com.electron.wispr-flow"])
+        let f = FakeFreezer(apps: apps + [spotify, bartender], processes: procs, control: FakeProcessControl())
+        XCTAssertEqual(f.plan(config: c).map(\.bundleId), ["com.tinyspeck.slackmacgap", "com.spotify.client"])
         c.freezeAllApps = false
         XCTAssertEqual(f.plan(config: c).map(\.bundleId), ["com.tinyspeck.slackmacgap"])
     }
