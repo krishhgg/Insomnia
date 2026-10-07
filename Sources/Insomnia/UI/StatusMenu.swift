@@ -18,9 +18,10 @@ enum StatusMenu {
             /// bundle id and name, so the item still names the same browser
             /// after a scan replaces the list.
             case relaunchBrowser(ThrottledBrowser)
-            /// Drop the saved volume of this output device (its UID): it is
-            /// not connected, and Insomnia stops waiting for it.
-            case stopWaitingForOutput(String)
+            /// Drop the saved volume of this output device: it is not
+            /// connected, and Insomnia stops waiting for it. Carries the
+            /// save the item was built for, so a later one is not dropped.
+            case stopWaitingForOutput(SessionManager.WaitingOutput)
         }
 
         let title: String
@@ -54,7 +55,7 @@ enum StatusMenu {
         hotspotWarning: String? = nil,
         error: String?,
         foreignSleep: String? = nil,
-        outputsWaiting: [SavedAudioOutput] = [],
+        outputsWaiting: [SessionManager.WaitingOutput] = [],
         lidSimulationBuild: Bool = false
     ) -> [Item] {
         var out: [Item] = []
@@ -93,9 +94,9 @@ enum StatusMenu {
         if let foreignSleep = present(foreignSleep) {
             out.append(Item(title: "\u{26A0} \(foreignSleep)", kind: .warning))
         }
-        for output in outputsWaiting {
-            out.append(Item(title: "\u{26A0} \(SessionManager.stillMutedLine(output))", kind: .warning))
-            out.append(Item(title: "Stop waiting for \(output.label)", kind: .stopWaitingForOutput(output.deviceUID)))
+        for waiting in outputsWaiting {
+            out.append(Item(title: "\u{26A0} \(SessionManager.stillMutedLine(waiting.entry))", kind: .warning))
+            out.append(Item(title: "Stop waiting for \(waiting.entry.label)", kind: .stopWaitingForOutput(waiting)))
         }
         if !out.isEmpty {
             out.append(Item(title: "", kind: .separator))
@@ -148,9 +149,9 @@ enum StatusMenu {
                 let entry = action(title: item.title, selector: relaunchBrowser, key: "", target: target)
                 entry.representedObject = browser
                 menu.addItem(entry)
-            case let .stopWaitingForOutput(deviceUID):
+            case let .stopWaitingForOutput(waiting):
                 let entry = action(title: item.title, selector: stopWaitingForOutput, key: "", target: target)
-                entry.representedObject = deviceUID
+                entry.representedObject = waiting
                 menu.addItem(entry)
             }
         }

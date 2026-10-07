@@ -125,16 +125,29 @@ Quit, or reconcile.
 | Countdown redraw | stop timer | restart timer |
 
 An output device that is not connected when its entry is restored keeps the
-entry, and the restore of everything else goes on. It does not hold up the
+entry, and the restore of everything else goes on. Each restore decides
+again whether a device is connected: only a device CoreAudio reports as not
+connected on that try counts as away. An away device does not hold up the
 end of a session: End and Quit restore sleep and the rest, the end
 notification names each device that is still muted, and the menu shows a
 line for each with a "Stop waiting for <device>" item, which drops that
-entry and leaves the device as it is. While Insomnia runs, a device that
+entry and leaves the device as it is. The item drops nothing if, when it
+runs, the device reads as connected or the entry is a later lid close's
+save rather than the one the menu showed. While Insomnia runs, a device that
 connects again gets its volume back at once (a CoreAudio device-list
 listener), or at the next lid open if a session is running with the lid
-closed. A later launch restores every connected device at reconcile. A
-restore that fails for another reason, or a cleared entry that cannot be
-written, is reported and the entry stays for a retry.
+closed. Before the launch reconcile has taken a session over, a session.json
+that has not expired, or cannot be read, counts as a running session for
+this. A later launch restores every connected device at reconcile.
+
+A restore that fails on a connected device, or a cleared entry that cannot
+be written, is reported and the entry stays. It makes the end incomplete,
+as any failed restore does. The recovery agent keeps these entries but
+cannot restore CoreAudio settings, so the incomplete-restore notification
+says Insomnia tries again itself. That retry, and the retry of a device
+change the recovery lock refused, runs in process after 30 s, reads the
+journal again and checks the lid again. It stops after 10 tries in a row;
+the next device change, lid open, end or launch tries again.
 
 A session that starts, or that reconcile resumes at launch, while the lid
 reads closed starts with the countdown redraw stopped: the lid observer

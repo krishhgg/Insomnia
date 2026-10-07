@@ -165,7 +165,9 @@ The defaults are worth knowing:
   An output that is not connected stays muted until it reconnects: Insomnia
   restores it then if it is running, or at the next launch. Ending or
   quitting a session does not wait for it. The end notification and the menu
-  name it, and the menu's "Stop waiting for <device>" leaves it as it is.
+  name it, and the menu's "Stop waiting for <device>" leaves it as it is. A
+  restore that fails on a connected output is retried by Insomnia while it
+  runs, and at the next launch.
 - **Microphone:** on Mac laptops with Apple silicon or a T2 chip, closing the
   lid disconnects the built-in microphone in hardware. Recording a meeting
   with the lid closed needs AirPods or an external mic; Settings says the same

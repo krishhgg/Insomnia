@@ -35,9 +35,11 @@ final class LidActionsTests: XCTestCase {
         dockerRule: Bool? = true,
         mute: Bool = true,
         sampler: BrightnessSampler? = nil,
-        reassertDelay: Duration = .seconds(3600)
+        reassertDelay: Duration = .seconds(3600),
+        lockTimeout: TimeInterval = 0.3,
+        retryDelay: TimeInterval = 60
     ) async -> (SessionManager, LidActions) {
-        let m = h.makeManager(reassertDelay: reassertDelay)
+        let m = h.makeManager(lockTimeout: lockTimeout, retryDelay: retryDelay, reassertDelay: reassertDelay)
         m.config.muteOnLidClose = mute
         m.config.freezeList = ["com.tinyspeck.slackmacgap"]
         if let dockerRule { m.config.dockerRule = dockerRule }
@@ -979,8 +981,8 @@ final class LidActionsTests: XCTestCase {
     /// A session whose lid closed on the USB headset, which was then
     /// unplugged: the speakers are the default output, the headset is
     /// muted and owed its volume.
-    private func closeOnTheHeadsetAndUnplugIt() async -> (SessionManager, LidActions) {
-        let (m, actions) = await make()
+    private func closeOnTheHeadsetAndUnplugIt(lockTimeout: TimeInterval = 0.3, retryDelay: TimeInterval = 60) async -> (SessionManager, LidActions) {
+        let (m, actions) = await make(lockTimeout: lockTimeout, retryDelay: retryDelay)
         h.audio.connect("usb-headset", name: "USB Headset", volume: 0.3)
         await m.start(duration: 3600)
         await actions.onClose()
@@ -1023,7 +1025,7 @@ final class LidActionsTests: XCTestCase {
         XCTAssertEqual(h.audio.volume, 0.6, "the speakers are left alone")
         XCTAssertFalse(h.audio.muted, "the speakers are left alone")
         XCTAssertEqual(try h.store.loadState()?.savedAudioOutputs, [Self.headsetSaved])
-        XCTAssertEqual(m.outputsWaitingForRestore, [Self.headsetSaved])
+        XCTAssertEqual(m.outputsWaitingForRestore.map(\.entry), [Self.headsetSaved])
         XCTAssertNil(m.lastError)
 
         await actions.onClose()
@@ -1046,7 +1048,7 @@ final class LidActionsTests: XCTestCase {
         XCTAssertEqual(h.audio.device("usb-headset")?.volume, 0.3)
         XCTAssertEqual(h.audio.device("usb-headset")?.muted, false)
         XCTAssertEqual(try h.store.loadState()?.savedAudioOutputs, [])
-        XCTAssertEqual(m.outputsWaitingForRestore, [])
+        XCTAssertEqual(m.outputsWaitingForRestore.map(\.entry), [])
         XCTAssertTrue(m.isActive)
     }
 
@@ -1095,7 +1097,7 @@ final class LidActionsTests: XCTestCase {
         XCTAssertEqual(post.title, "Session ended")
         XCTAssertEqual(post.body, "Insomnia quit. Sleep is back to normal. USB Headset was not connected, so it is still muted. Insomnia restores its volume when it reconnects while Insomnia is running, or at the next launch.")
         XCTAssertFalse(h.notifier.posts.contains { $0.title == SessionManager.incompleteTitle })
-        XCTAssertEqual(m.outputsWaitingForRestore, [Self.headsetSaved])
+        XCTAssertEqual(m.outputsWaitingForRestore.map(\.entry), [Self.headsetSaved])
 
         h.audio.connect("usb-headset", name: "USB Headset", volume: 0.3, muted: true)
         h.audio.fireDevicesChanged()
@@ -1108,7 +1110,7 @@ final class LidActionsTests: XCTestCase {
             try await Task.sleep(for: .milliseconds(10))
         }
         XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
-        XCTAssertEqual(m.outputsWaitingForRestore, [])
+        XCTAssertEqual(m.outputsWaitingForRestore.map(\.entry), [])
     }
 
     /// The headset was plugged back in while Insomnia was not running: the
@@ -1123,7 +1125,7 @@ final class LidActionsTests: XCTestCase {
         let away = h.makeManager()
         await away.reconcile()
         XCTAssertEqual(try h.store.loadState()?.savedAudioOutputs, [Self.headsetSaved])
-        XCTAssertEqual(away.outputsWaitingForRestore, [Self.headsetSaved])
+        XCTAssertEqual(away.outputsWaitingForRestore.map(\.entry), [Self.headsetSaved])
         XCTAssertEqual(h.notifier.posts.count, posted)
         XCTAssertNil(away.lastError)
 
@@ -1133,7 +1135,7 @@ final class LidActionsTests: XCTestCase {
         XCTAssertEqual(h.audio.applied.map { $0.deviceUID }, ["usb-headset"])
         XCTAssertEqual(h.audio.device("usb-headset")?.muted, false)
         XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
-        XCTAssertEqual(back.outputsWaitingForRestore, [])
+        XCTAssertEqual(back.outputsWaitingForRestore.map(\.entry), [])
         XCTAssertEqual(h.notifier.posts.count, posted)
     }
 
@@ -1160,10 +1162,10 @@ final class LidActionsTests: XCTestCase {
         await actions.onClose()
         XCTAssertEqual(try h.store.loadState()?.savedAudioOutputs, [Self.headsetSaved, Self.speakersSaved])
 
-        await m.stopWaitingForOutput("usb-headset")
+        await m.stopWaitingForOutput(try XCTUnwrap(m.outputsWaitingForRestore.first))
 
         XCTAssertEqual(try h.store.loadState()?.savedAudioOutputs, [Self.speakersSaved])
-        XCTAssertEqual(m.outputsWaitingForRestore, [])
+        XCTAssertEqual(m.outputsWaitingForRestore.map(\.entry), [])
         h.audio.connect("usb-headset", name: "USB Headset", volume: 0.3, muted: true)
         await actions.onOpen()
         XCTAssertEqual(h.audio.applied.map { $0.deviceUID }, [FakeAudioControl.speakers])
@@ -1194,6 +1196,218 @@ final class LidActionsTests: XCTestCase {
         h.audio.onApply = nil
         await actions.onOpen()
         XCTAssertEqual(h.audio.applied.count, 1)
+        XCTAssertEqual(try h.store.loadState()?.savedAudioOutputs, [])
+    }
+
+    /// The headset was away at a lid open, then came back, and its restore
+    /// fails at Quit. That try finds it connected, so it is owed, not
+    /// waiting: the end is incomplete, the recovery agent is asked for, and
+    /// with no agent the end stays pending, so Quit is refused. Nothing
+    /// says the headset is not connected.
+    func testADeviceThatCameBackAndThenFailsToRestoreHoldsUpTheEnd() async throws {
+        let (m, actions) = await closeOnTheHeadsetAndUnplugIt()
+        await actions.onOpen()
+        XCTAssertEqual(m.outputsWaitingForRestore.map(\.entry), [Self.headsetSaved])
+        h.audio.connect("usb-headset", name: "USB Headset", volume: 0.3, muted: true)
+        h.audio.throwOnApply = true
+        h.backstop.failArm = true
+
+        let outcome = await m.end(reason: .quit)
+
+        XCTAssertEqual(outcome, .incomplete(agentArmed: false))
+        XCTAssertEqual(m.pendingEnd, .quit, "the end is retried in process")
+        XCTAssertEqual(m.outputsWaitingForRestore.map(\.entry), [], "connected, so not waiting")
+        XCTAssertEqual(try h.store.loadState()?.savedAudioOutputs, [Self.headsetSaved])
+        XCTAssertEqual(h.audio.device("usb-headset")?.muted, true)
+        let post = try XCTUnwrap(h.notifier.posts.last)
+        XCTAssertEqual(post.title, SessionManager.incompleteTitle)
+        XCTAssertFalse(post.body.contains("not connected"), post.body)
+        XCTAssertTrue(logText().contains("could not restore audio on USB Headset: apply failed"), logText())
+    }
+
+    /// A restore that fails on a connected device is retried by Insomnia
+    /// itself. The recovery agent keeps the entry but cannot restore output
+    /// volume, and the notification says that instead of promising the
+    /// agent's retry. Once the device takes the write, the retry restores
+    /// it.
+    func testAFailedRestoreOnAConnectedDeviceIsRetriedInProcess() async throws {
+        let (m, actions) = await make(retryDelay: 1)
+        await m.start(duration: 3600)
+        await actions.onClose()
+        h.audio.throwOnApply = true
+
+        let outcome = await m.end(reason: .user)
+
+        XCTAssertEqual(outcome, .incomplete(agentArmed: true))
+        XCTAssertNil(m.pendingEnd)
+        let post = try XCTUnwrap(h.notifier.posts.last)
+        XCTAssertEqual(post.title, SessionManager.incompleteTitle)
+        XCTAssertEqual(post.body, "could not restore audio on MacBook Pro Speakers: apply failed (OSStatus -1); kept in the journal to retry. The recovery agent cannot restore output volume. Insomnia tries again in 1 s while it runs, and at its next launch.")
+        XCTAssertTrue(h.audio.muted)
+
+        h.audio.throwOnApply = false
+        for _ in 0..<500 where h.audio.applied.isEmpty {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(h.audio.applied.map { $0.deviceUID }, [FakeAudioControl.speakers])
+        XCTAssertEqual(h.audio.volume, 0.6)
+        XCTAssertFalse(h.audio.muted)
+        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
+    }
+
+    /// The headset reconnects while the backstop holds the recovery lock
+    /// past the app's wait. CoreAudio sends that event once, so the refused
+    /// restore is retried in process, and refused again while the lock is
+    /// still held. Once the lock is free, the headset gets its volume back.
+    func testAReconnectRefusedByABusyLockIsRetriedOnceTheLockIsFree() async throws {
+        let (m, _) = await closeOnTheHeadsetAndUnplugIt(lockTimeout: 0.05, retryDelay: 0.2)
+        await m.end(reason: .user)
+        XCTAssertEqual(m.outputsWaitingForRestore.map(\.entry), [Self.headsetSaved])
+        h.audio.connect("usb-headset", name: "USB Headset", volume: 0.3, muted: true)
+        let held = try XCTUnwrap(try RecoveryLock(url: h.home.paths.recoveryLock).tryAcquire())
+
+        await m.outputDevicesChanged()
+        XCTAssertEqual(h.audio.applied.count, 0)
+        XCTAssertTrue(m.lastError?.hasPrefix("output device change skipped, nothing changed") == true, m.lastError ?? "nil")
+        for _ in 0..<500 where !logText().contains("audio retry skipped") {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertTrue(logText().contains("audio retry skipped"), "the retry ran while the lock was held")
+        XCTAssertEqual(h.audio.applied.count, 0)
+        XCTAssertEqual(h.audio.device("usb-headset")?.muted, true)
+        XCTAssertEqual(try h.store.loadState()?.savedAudioOutputs, [Self.headsetSaved])
+
+        held.release()
+        for _ in 0..<500 where h.audio.applied.isEmpty {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(h.audio.applied.map { $0.deviceUID }, ["usb-headset"])
+        XCTAssertEqual(h.audio.device("usb-headset")?.volume, 0.3)
+        XCTAssertEqual(h.audio.device("usb-headset")?.muted, false)
+        for _ in 0..<500 where !m.outputsWaitingForRestore.isEmpty {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
+    }
+
+    /// The in-process retry stops after `audioRetryLimit` tries in a row,
+    /// so a lock that stays busy does not keep it going. The entry stays,
+    /// and the next device change starts over and restores the headset.
+    func testTheAudioRetryStopsAfterItsLimitAndADeviceChangeStartsOver() async throws {
+        let (m, _) = await closeOnTheHeadsetAndUnplugIt(lockTimeout: 0.02, retryDelay: 0.02)
+        await m.end(reason: .user)
+        h.audio.connect("usb-headset", name: "USB Headset", volume: 0.3, muted: true)
+        let held = try XCTUnwrap(try RecoveryLock(url: h.home.paths.recoveryLock).tryAcquire())
+
+        await m.outputDevicesChanged()
+        let gaveUp = "still not restored after \(SessionManager.audioRetryLimit) retries"
+        for _ in 0..<1000 where !logText().contains(gaveUp) {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertTrue(logText().contains(gaveUp), logText())
+        XCTAssertEqual(logText().components(separatedBy: "audio retry skipped").count - 1, SessionManager.audioRetryLimit)
+        held.release()
+        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertEqual(h.audio.applied.count, 0, "nothing retries once the limit is reached")
+        XCTAssertEqual(try h.store.loadState()?.savedAudioOutputs, [Self.headsetSaved])
+
+        await m.outputDevicesChanged()
+        XCTAssertEqual(h.audio.applied.map { $0.deviceUID }, ["usb-headset"])
+        XCTAssertEqual(h.audio.device("usb-headset")?.muted, false)
+        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
+    }
+
+    /// A device change that arrives before the launch reconcile has taken
+    /// the session on disk over, first before it ran and then after the
+    /// recovery lock refused it, does not unmute a saved output while that
+    /// session's lid is closed. The reconcile resumes the session with the
+    /// output still muted, and the lid open restores it.
+    func testADeviceChangeBeforeTheLaunchReconcileWaitsForTheLidOfTheSessionOnDisk() async throws {
+        var s = RuntimeState()
+        s.sleepDisabledByUs = true
+        s.savedAudioOutputs = [Self.headsetSaved]
+        try h.store.saveState(s)
+        try h.store.saveSession(SessionMath.newSession(now: h.clock.now, duration: 3600, maxDuration: 86400))
+        h.clamshell.closed = true
+        h.audio.connect("usb-headset", name: "USB Headset", volume: 0.3, muted: true)
+        let m = h.makeManager(lockTimeout: 0.05)
+
+        await m.outputDevicesChanged()
+        XCTAssertEqual(h.audio.applied.count, 0)
+        XCTAssertEqual(h.audio.device("usb-headset")?.muted, true)
+
+        let held = try XCTUnwrap(try RecoveryLock(url: h.home.paths.recoveryLock).tryAcquire())
+        await m.reconcile()
+        held.release()
+        XCTAssertFalse(m.isActive, "the launch reconcile was refused")
+        await m.outputDevicesChanged()
+        XCTAssertEqual(h.audio.applied.count, 0)
+        XCTAssertEqual(h.audio.device("usb-headset")?.muted, true)
+        XCTAssertEqual(try h.store.loadState()?.savedAudioOutputs, [Self.headsetSaved])
+
+        await m.reconcile()
+        XCTAssertTrue(m.isActive)
+        XCTAssertEqual(h.audio.device("usb-headset")?.muted, true)
+
+        h.clamshell.closed = false
+        await m.undoLidActions()
+        XCTAssertEqual(h.audio.applied.map { $0.deviceUID }, ["usb-headset"])
+        XCTAssertEqual(h.audio.device("usb-headset")?.muted, false)
+        XCTAssertEqual(try h.store.loadState()?.savedAudioOutputs, [])
+    }
+
+    /// A "Stop waiting" click queued behind the headset's reconnection
+    /// restore and a new lid close: by the time it runs, the save it was
+    /// for is gone and a later one is in its place. That save stays, with
+    /// the headset connected and again once it is away and waiting, with
+    /// the same values. The lid open restores it.
+    func testAStaleStopWaitingItemDoesNotDropALaterSave() async throws {
+        let (m, actions) = await closeOnTheHeadsetAndUnplugIt(lockTimeout: 5)
+        await actions.onOpen()
+        let stale = try XCTUnwrap(m.outputsWaitingForRestore.first)
+        h.audio.connect("usb-headset", name: "USB Headset", volume: 0.3, muted: true)
+
+        let held = try XCTUnwrap(try RecoveryLock(url: h.home.paths.recoveryLock).tryAcquire())
+        let restore = await runUntilSuspended { await m.outputDevicesChanged() }
+        let close = await runUntilSuspended { await actions.onClose() }
+        let discard = await runUntilSuspended { await m.stopWaitingForOutput(stale) }
+        held.release()
+        await restore.value
+        await close.value
+        await discard.value
+
+        XCTAssertEqual(h.audio.applied.map { $0.deviceUID }, ["usb-headset"], "the reconnection restored it")
+        XCTAssertEqual(h.audio.device("usb-headset")?.muted, true, "the new close muted it")
+        XCTAssertEqual(try h.store.loadState()?.savedAudioOutputs, [Self.headsetSaved])
+
+        h.audio.disconnect("usb-headset")
+        await actions.onOpen()
+        XCTAssertEqual(m.outputsWaitingForRestore.map(\.entry), [Self.headsetSaved])
+        await m.stopWaitingForOutput(stale)
+        XCTAssertEqual(try h.store.loadState()?.savedAudioOutputs, [Self.headsetSaved])
+
+        h.audio.connect("usb-headset", name: "USB Headset", volume: 0.3, muted: true)
+        await actions.onOpen()
+        XCTAssertEqual(h.audio.applied.map { $0.deviceUID }, ["usb-headset", "usb-headset"])
+        XCTAssertEqual(h.audio.device("usb-headset")?.muted, false)
+        XCTAssertEqual(try h.store.loadState()?.savedAudioOutputs, [])
+    }
+
+    /// The headset came back after the menu was built, and the click runs
+    /// before its device change does. A device that is connected is not
+    /// waiting, so nothing is dropped, and the device change restores it.
+    func testStopWaitingForADeviceThatIsBackDropsNothing() async throws {
+        let (m, actions) = await closeOnTheHeadsetAndUnplugIt()
+        await actions.onOpen()
+        let item = try XCTUnwrap(m.outputsWaitingForRestore.first)
+        h.audio.connect("usb-headset", name: "USB Headset", volume: 0.3, muted: true)
+
+        await m.stopWaitingForOutput(item)
+        XCTAssertEqual(try h.store.loadState()?.savedAudioOutputs, [Self.headsetSaved])
+        XCTAssertEqual(m.outputsWaitingForRestore.map(\.entry), [])
+
+        await m.outputDevicesChanged()
+        XCTAssertEqual(h.audio.device("usb-headset")?.muted, false)
         XCTAssertEqual(try h.store.loadState()?.savedAudioOutputs, [])
     }
 

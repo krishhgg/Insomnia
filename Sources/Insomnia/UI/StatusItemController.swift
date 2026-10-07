@@ -692,8 +692,8 @@ final class StatusItemController: NSObject {
     }
 
     @objc private func menuStopWaitingForOutput(_ sender: NSMenuItem) {
-        guard let deviceUID = sender.representedObject as? String else { return }
-        Task { await manager.stopWaitingForOutput(deviceUID) }
+        guard let waiting = sender.representedObject as? SessionManager.WaitingOutput else { return }
+        Task { await manager.stopWaitingForOutput(waiting) }
     }
 
     @objc private func menuRelaunchBrowser(_ sender: NSMenuItem) {

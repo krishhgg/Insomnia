@@ -168,6 +168,16 @@ struct RuntimeState: Codable, Equatable, Sendable {
         return rest.isDirty
     }
 
+    /// `isDirty` with every saved output volume left out, which the recovery
+    /// agent keeps but only the app can restore.
+    var isDirtyApartFromAudio: Bool {
+        var rest = self
+        rest.savedAudioOutputs = []
+        rest.savedOutputVolume = nil
+        rest.savedMuted = nil
+        return rest.isDirty
+    }
+
     private enum CodingKeys: String, CodingKey {
         case sleepDisabledByUs, lowPowerSetByUs, frozenProcesses, frozenPids, dockerFrozen
         case savedAudioOutputs, savedOutputVolume, savedMuted

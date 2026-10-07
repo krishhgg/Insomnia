@@ -91,17 +91,18 @@ final class StatusMenuWarningTests: XCTestCase {
     }
 
     /// Each output device still muted from a lid close gets a warning line
-    /// and a live item that carries its UID, so the click drops the entry
-    /// of the device the menu named. Builds the NSMenu only.
+    /// and a live item that carries the device and which of its saves the
+    /// menu showed, so the click drops that save and no later one. Builds
+    /// the NSMenu only.
     func testEachWaitingOutputHasALineAndAStopWaitingItem() {
-        let headset = SavedAudioOutput(deviceUID: "usb-headset", name: "USB Headset", volume: 0.3, muted: false)
-        let unnamed = SavedAudioOutput(deviceUID: "70-8C-F2:output", name: nil, volume: 0.5, muted: false)
+        let headset = SessionManager.WaitingOutput(entry: SavedAudioOutput(deviceUID: "usb-headset", name: "USB Headset", volume: 0.3, muted: false), save: 2)
+        let unnamed = SessionManager.WaitingOutput(entry: SavedAudioOutput(deviceUID: "70-8C-F2:output", name: nil, volume: 0.5, muted: false), save: 0)
         let items = StatusMenu.items(sessionActive: false, sleepHeld: false, machine: nil, actions: nil, throttledBrowsers: [], error: nil, outputsWaiting: [headset, unnamed])
         XCTAssertEqual(Array(items.prefix(4)), [
             StatusMenu.Item(title: "\u{26A0} USB Headset is still muted from a lid close; Insomnia restores it when it reconnects", kind: .warning),
-            StatusMenu.Item(title: "Stop waiting for USB Headset", kind: .stopWaitingForOutput("usb-headset")),
+            StatusMenu.Item(title: "Stop waiting for USB Headset", kind: .stopWaitingForOutput(headset)),
             StatusMenu.Item(title: "\u{26A0} 70-8C-F2:output is still muted from a lid close; Insomnia restores it when it reconnects", kind: .warning),
-            StatusMenu.Item(title: "Stop waiting for 70-8C-F2:output", kind: .stopWaitingForOutput("70-8C-F2:output")),
+            StatusMenu.Item(title: "Stop waiting for 70-8C-F2:output", kind: .stopWaitingForOutput(unnamed)),
         ])
         let menu = StatusMenu.menu(
             items,
@@ -112,7 +113,7 @@ final class StatusMenuWarningTests: XCTestCase {
             stopWaitingForOutput: #selector(NSObject.description)
         )
         let entry = menu.items.first { $0.title == "Stop waiting for USB Headset" }
-        XCTAssertEqual(entry?.representedObject as? String, "usb-headset")
+        XCTAssertEqual(entry?.representedObject as? SessionManager.WaitingOutput, headset)
         XCTAssertEqual(entry?.isEnabled, true)
     }
 
