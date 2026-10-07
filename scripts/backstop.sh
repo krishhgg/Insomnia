@@ -259,8 +259,9 @@ tighten() { # path...
 }
 tighten "$APP_SUPPORT" "$LOG_DIR" "$LOG" "$LOCK" "$STATE" "$SESSION"
 inode() { stat -f %i "$1" 2>/dev/null; }
+lock_shared=0
 if [[ -e /dev/fd/9 && -e "$LOCK" && -n "$(inode "$LOCK")" && "$(inode /dev/fd/9)" == "$(inode "$LOCK")" ]]; then
-  : # fd 9 is the caller's handle on the lock file; share its lock.
+  lock_shared=1 # fd 9 is the caller's handle on the lock file; share its lock.
 else
   exec 9<>"$LOCK"
 fi
@@ -293,75 +294,150 @@ is_positive_int() {
   [[ "$1" =~ ^[0-9]+$ ]] && (( 10#$1 > 0 ))
 }
 
-# True once the supervisor has written the command's exit status.
-wait_for_status() { # rcfile seconds
-  local i
-  for (( i = 0; i < $2 * 10; i++ )); do
-    [[ -s "$1" ]] && return 0
+# True once file $1 is non-empty; waits at least $2 seconds for it unless it
+# appears first. The limit is read from bash's SECONDS clock, which counts
+# whole seconds of wall-clock time, so the wait ends at the first check after
+# the clock has gone past the limit: more than $2 seconds after the call, up
+# to one second later than that, plus the poll in progress at that moment. A
+# slow poll on a loaded machine (each sleep is a fork) adds its own length
+# once, where counting polls stretched the limit by every one of them. The
+# file is checked once more after the limit, so a status written during the
+# last poll still counts. A wall-clock change during the wait (the clock set
+# back or forward) lengthens or shortens it by that much.
+wait_for_status() { # file seconds
+  local deadline=$(( SECONDS + $2 ))
+  while [[ ! -s "$1" ]] && (( SECONDS <= deadline )); do
     sleep 0.1
   done
   [[ -s "$1" ]]
 }
 
-# Run one undo command (sudo -n pmset ...) inside the locked transaction with
-# a time limit. A supervising subshell that keeps fd 9 (the lock) starts the
-# command, waits for it and writes its exit status to a file. sudo drops
-# extra descriptors before running pmset, so pmset itself never holds the
-# lock: the supervisor does, until sudo reports that the command finished.
-# On timeout the command gets SIGTERM (sudo relays it to pmset and waits for
-# it), then KILL_GRACE_SECONDS. A command that is still running after that is
-# never SIGKILLed: killing sudo would orphan a root pmset that could change
-# power state later, outside any transaction. Instead the supervisor keeps
-# waiting and so keeps the lock, this run returns 125 with command_alive=1,
-# and the pid is logged for manual intervention. The caller must then end the
+# Run one undo command (sudo -n pmset ..., defaults ...) inside the locked
+# transaction with a time limit. supervise_command (below) starts it in the
+# background, enforces the limit and writes one status line; this run waits
+# for that line and never signals the command itself. Returns the command's
+# exit status; 124 when it did not finish within COMMAND_TIMEOUT_SECONDS and
+# ended within KILL_GRACE_SECONDS of the SIGTERM it then got; 125, with
+# command_alive=1, when it was still running after that, or when no status
+# came in time.
+# A command still running after SIGTERM is never SIGKILLed: killing sudo
+# would orphan a root pmset that could change power state later, outside any
+# transaction. Its supervisor keeps waiting and so keeps the lock, and the
+# pid is logged for manual intervention. The caller must then end the
 # transaction (stop_transaction): no later undo command may run beside a live
-# one, and the journal stays as it was. Every later app start and backstop run
-# is refused as "lock held" until that command ends.
-# Each call gets its own status files, so a status can never be read as
-# another command's. The supervisor's stdio is detached so a caller capturing
-# this script's output gets EOF when the script exits, not when the command
-# does.
+# one, and the journal stays as it was. Every later app start and backstop
+# run is refused as "lock held" until that command ends. A missing status
+# ends the transaction the same way: nothing here can tell whether the
+# command still runs, and stopping is the safe side.
+# Each call gets its own status files (.backstop.<this run's pid>.<call>.pid
+# and .rc), so a status can never be read as another command's. The .pid file
+# is for the log only. Nothing signals the pid read from it: by the time it
+# is read the supervisor may have reaped the command, and the number may
+# belong to another process. A call that ended removes its files; a call that
+# returned 125 leaves them to its live supervisor. The first call of a run
+# that took the lock on its own handle removes what earlier runs left: their
+# supervisors kept the lock while they lived, so all of them have ended. A
+# run that shares its caller's lock (fd 9) skips that: an earlier run under
+# the same lock may still have a supervisor waiting for its command.
+# The supervisor's stdio is detached so a caller capturing this script's
+# output gets EOF when the script exits, not when the command does.
 bounded_calls=0
 command_alive=0
 bounded_output=""   # file for the next bounded command's output; empty: discarded
 run_bounded() { # command args...
-  local cpid rc pidfile rcfile supervisor
+  local base status="" rc cpid="" supervisor answer_within
   bounded_calls=$((bounded_calls + 1))
-  pidfile="$APP_SUPPORT/.backstop.$$.$bounded_calls.pid"
-  rcfile="$APP_SUPPORT/.backstop.$$.$bounded_calls.rc"
-  if (( bounded_calls == 1 )); then
-    # Status files left by an earlier run that had to fail closed. Their
-    # supervisor held the lock while it lived, so they are stale by now.
+  base="$APP_SUPPORT/.backstop.$$.$bounded_calls"
+  if (( bounded_calls == 1 && ! lock_shared )); then
     "$RM" -f "$APP_SUPPORT"/.backstop.*.pid "$APP_SUPPORT"/.backstop.*.rc
   fi
-  (
-    "$@" </dev/null >"${bounded_output:-/dev/null}" 2>&1 &
-    cpid=$!
-    echo "$cpid" > "$pidfile"
-    rc=0
-    wait "$cpid" || rc=$?
-    echo "$rc" > "$rcfile"
-  ) </dev/null >/dev/null 2>&1 &
+  supervise_command "$base" "$@" </dev/null >/dev/null 2>&1 &
   supervisor=$!
-  if ! wait_for_status "$rcfile" "$COMMAND_TIMEOUT_SECONDS"; then
-    cpid="$(cat "$pidfile" 2>/dev/null || true)"
-    if [[ -n "$cpid" ]]; then
-      "$KILL" -TERM "$cpid" 2>/dev/null || true
-    fi
-    if ! wait_for_status "$rcfile" "$KILL_GRACE_SECONDS"; then
-      log error "'$*' (pid ${cpid:-?}) did not finish within ${COMMAND_TIMEOUT_SECONDS}s and did not stop on SIGTERM. It is not killed, because that could leave a root pmset running outside the transaction. It keeps the recovery lock until it ends, so Insomnia cannot start and recovery cannot run until then; stop it by hand (sudo kill ${cpid:-<pid>}) and the next run will retry"
-      command_alive=1
-      return 125
-    fi
-    log error "'$*' did not finish within ${COMMAND_TIMEOUT_SECONDS}s; terminated with SIGTERM (pid ${cpid:-?})"
-    wait "$supervisor" 2>/dev/null || true
-    "$RM" -f "$pidfile" "$rcfile"
-    return 124
+  # Each of the supervisor's two waits can end up to a second after its
+  # limit, plus the poll in progress then (see wait_for_status), and the
+  # supervisor takes a moment to start and to write its status. Four seconds
+  # cover that at the usual 0.1 s poll. A supervisor slower than that gets
+  # the 125 below, the safe side.
+  answer_within=$(( COMMAND_TIMEOUT_SECONDS + KILL_GRACE_SECONDS + 4 ))
+  if wait_for_status "$base.rc" "$answer_within"; then
+    read -r status < "$base.rc" || true
   fi
-  rc="$(cat "$rcfile")"
+  # A regular file only: a FIFO there could block this run under the lock.
+  if [[ -f "$base.pid" ]]; then
+    read -r cpid < "$base.pid" || true
+    [[ "$cpid" =~ ^[0-9]+$ ]] || cpid=""
+  fi
+  case "$status" in
+    "exit "*) rc="${status#exit }" ;;
+    term)
+      log error "'$*' did not finish within ${COMMAND_TIMEOUT_SECONDS}s; terminated with SIGTERM (pid ${cpid:-?})"
+      rc=124 ;;
+    alive)
+      log error "'$*' (pid ${cpid:-?}) did not finish within ${COMMAND_TIMEOUT_SECONDS}s and did not stop on SIGTERM. It is not killed, because that could leave a root pmset running outside the transaction. It keeps the recovery lock until it ends, so Insomnia cannot start and recovery cannot run until then; stop it by hand (sudo kill ${cpid:-<pid>}, after 'ps -p ${cpid:-<pid>}' shows that pid is still this command) and the next run will retry"
+      command_alive=1
+      return 125 ;;
+    *)
+      log error "'$*' (pid ${cpid:-?}): its supervisor reported no result within ${answer_within}s, so the command may still be running. Nothing is signaled from here; while the supervisor waits for the command it keeps the recovery lock. The journal is kept and the next run will retry"
+      command_alive=1
+      return 125 ;;
+  esac
   wait "$supervisor" 2>/dev/null || true
-  "$RM" -f "$pidfile" "$rcfile"
+  "$RM" -f "$base.pid" "$base.rc"
+  [[ "$rc" =~ ^[0-9]+$ ]] || rc=1
   return "$rc"
+}
+
+# The supervisor of one run_bounded call; it runs in the background and is
+# the only process that signals the command. It keeps fd 9 (the recovery
+# lock) until its command has exited and been reaped. sudo drops extra
+# descriptors before running pmset, so pmset itself never holds the lock:
+# the supervisor does, until sudo reports that the command finished. Both
+# limits are measured here (see wait_for_job), so they hold even if this run
+# is killed while it waits.
+# The supervisor ignores SIGTERM and SIGHUP, so neither the end of this run,
+# killed or not, nor either signal sent to its whole process group frees the
+# lock while the command runs. launchd signals what is left of a job's
+# process group once the job's main process has exited, unless the job sets
+# AbandonProcessGroup, which this agent does not. SIGINT and SIGQUIT are
+# ignored already, as in every background job of a script. SIGKILL cannot be
+# ignored: a supervisor killed with it frees the lock even if its command is
+# still running. The command gets back the SIGTERM and SIGHUP actions this
+# script started with (the defaults, under launchd), so it still stops on
+# SIGTERM.
+# The command is the supervisor's only job, so it stays in the supervisor's
+# job list until the supervisor has reaped it, and signal_job (see
+# run_app_bounded) sends SIGTERM by jobspec: to the command or, once bash has
+# reaped it, to nothing, never to a process that reused its pid. At the limit
+# the command gets SIGTERM (sudo relays it to pmset and waits for it), then
+# KILL_GRACE_SECONDS; it never gets SIGKILL. <base>.rc gets one line:
+# "exit <status>" when the command ended within the limit, "term" when it
+# ended within the grace, "alive" when it was still running then. After
+# "alive" the supervisor goes on waiting and logs the command's exit.
+# errexit is off here: a failed write must not end the supervisor while its
+# command still runs.
+supervise_command() { # base command args...
+  local base="$1" cpid rc
+  shift
+  set +e
+  trap '' TERM HUP
+  ( trap - TERM HUP; exec "$@" ) </dev/null >"${bounded_output:-/dev/null}" 2>&1 &
+  cpid=$!
+  echo "$cpid" > "$base.pid"
+  if wait_for_job "$cpid" "$COMMAND_TIMEOUT_SECONDS"; then
+    wait "$cpid"
+    echo "exit $?" > "$base.rc"
+    return
+  fi
+  signal_job TERM "$cpid"
+  if wait_for_job "$cpid" "$KILL_GRACE_SECONDS"; then
+    wait "$cpid"
+    echo term > "$base.rc"
+    return
+  fi
+  echo alive > "$base.rc"
+  wait "$cpid"
+  rc=$?
+  log info "'$*' (pid $cpid), left running after SIGTERM, has exited (wait status $rc); its supervisor now lets go of the recovery lock, and the next run will retry"
 }
 
 # Run one read (pmset -g batt, notifyutil -g) with the undo commands' time
@@ -444,11 +520,13 @@ job_running() { # pid
   done
   return 1
 }
-# True once job pid $1 has left bash's running list; polls for $2 seconds.
+# True once job pid $1 has left bash's running list; waits at least $2
+# seconds for that unless it happens first, on the SECONDS clock like
+# wait_for_status (and within the same bounds), and checks once more after
+# the limit.
 wait_for_job() { # pid seconds
-  local i
-  for (( i = 0; i < $2 * 10; i++ )); do
-    job_running "$1" || return 0
+  local deadline=$(( SECONDS + $2 ))
+  while job_running "$1" && (( SECONDS <= deadline )); do
     sleep 0.1
   done
   ! job_running "$1"

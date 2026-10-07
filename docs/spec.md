@@ -776,7 +776,16 @@ Backstop, independent of the app:
   In the app the command holds the lock itself, with a descriptor on the
   lock file as its stdin, so a crash or force quit of the app does not
   free the lock while the command runs; the agent's supervising subshell
-  keeps it the same way. The app runs no `sudo pmset` outside a
+  keeps it the same way. That subshell, not the script that started it,
+  enforces the limit and is the only process that signals the command. It
+  measures the limit and the grace on bash's `SECONDS` clock, so slow polls
+  on a loaded machine do not stretch them, and it sends SIGTERM by jobspec,
+  which reaches the command or, once the command has been reaped, nothing:
+  never a process that reused its pid. The pid the script logs is never
+  signaled. The subshell ignores SIGTERM and SIGHUP, so neither the end of
+  the agent's run nor launchd's signal to what is left of the job's process
+  group frees the lock while the command runs; a SIGKILL to the subshell
+  would. The app runs no `sudo pmset` outside a
   transaction. Every one goes through `PmsetSleepGuard.sudoPmset`,
   including a check that runs a sudoers command only to see whether it
   passes. It reports the pid with the `sudo kill` command, in a menu line
