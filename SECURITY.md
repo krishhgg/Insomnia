@@ -1,8 +1,7 @@
 # Security
 
-Insomnia is experimental software. There is no security-response SLA. Binary
-releases are experimental prereleases until they are signed with a Developer ID
-and notarized. Report suspected vulnerabilities against the current main branch
+Insomnia is experimental software. There is no security-response SLA. Report
+suspected vulnerabilities against the current main branch
 or a release tag, including the affected revision and a minimal,
 non-destructive reproduction.
 
@@ -48,12 +47,11 @@ krishhgg/Insomnia/.github/workflows/release.yml --source-ref
 refs/tags/v<version>`); `install.sh --app` then checks the signature,
 identifier and version of a private copy of the bundle before asking for a
 password, installs that copy, and refuses
-a bundle whose origin it cannot verify (a Developer ID signature from the
-team pinned in the script) unless `--allow-unverified-origin` is given. The
-attestation shows which workflow run produced the bytes, not
-that the code is free of defects. Until Developer ID signing and notarization
-are set up (see [docs/releasing.md](docs/releasing.md)), releases are ad-hoc
-signed and macOS blocks their first launch.
+it unless `--allow-unverified-origin` is given, because it cannot verify where
+an ad-hoc bundle came from. The attestation shows which workflow run produced
+the bytes, not that the code is free of defects. Releases are ad-hoc signed and
+not notarized ([docs/releasing.md](docs/releasing.md)), so macOS blocks their
+first launch.
 
 Passing automated checks or a secret scan does not establish the absence of
 vulnerabilities. Do not probe recovery by disrupting someone else's processes,

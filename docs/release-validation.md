@@ -152,7 +152,6 @@ is performed. Do not replace "not run" with "passed" based on source review.
 | `install.sh` and `uninstall.sh` from a release zip unpacked in `/tmp`, with a `build-app.sh` and a `backstop.sh` added to the unpacked folder, run neither (install without `--app` stops, uninstall runs the sealed copy), on a working Mac | Not run |
 | `install.sh --app` from a release zip stops with the Apple Silicon message on an Intel Mac, and installs on an Apple Silicon Mac from a Terminal running under Rosetta | Not run |
 | Release workflow end to end: tag push, tests, package, attestation, GitHub Release, `gh attestation verify` of the download | Not run |
-| Developer ID signing, notarization and stapling in the Release workflow | Not run |
 | Launch at login survives a reinstall by install.sh, including a second install.sh run on the same unchanged build (switch on, reinstall, relaunch: the log shows the launch-time check, System Settings > General > Login Items lists Insomnia as enabled, and the Settings switch reads on; a pending approval shows the note and the Open Login Items button) | Not run |
 | Launch at login heals on the first upgrade from a build without the install record (switch on in the previous build, upgrade with install.sh, relaunch: the log shows "registering once and recording the install", Login Items lists Insomnia, and config.json has `launchAtLoginInstall`) | Not run |
 | Launch at login removed in System Settings stays removed (switch on, relaunch once so the install is on file, remove Insomnia under System Settings > General > Login Items, relaunch: the log says the removal was respected, the Settings switch is off, and Login Items does not list Insomnia again) | Not run |
@@ -185,9 +184,8 @@ Release workflow tests, packages, checksums, attests and publishes it for a
 --app` against prebuilt fixtures, one of them ad-hoc signed by the real
 codesign, and ReleaseWorkflowTests check that every action in the workflows
 is pinned to a commit and that no job has more than read access except the
-one that publishes. No release has been produced with it yet. Developer ID
-signing and notarization run only once the maintainer adds the secrets;
-until then releases are ad-hoc signed prereleases. A
-consumer installation and recovery walkthrough from a downloaded zip has not
+one that publishes. No release has been produced with it yet. Releases are
+ad-hoc signed and not notarized, published as prereleases. A consumer
+installation and recovery walkthrough from a downloaded zip has not
 been done. Open-source availability and a passing PR are not equivalent to
-readiness for a signed public binary release.
+readiness for a public binary release.

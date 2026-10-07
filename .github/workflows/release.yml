@@ -4,32 +4,16 @@ name: Release
 # it as a GitHub Release. docs/releasing.md walks through a release.
 #
 # Triggers
-#   push of a tag v<version>  test, build, sign, package, attest, publish a
-#                             GitHub Release. <version> must equal
+#   push of a tag v<version>  test, build, package, attest, publish a GitHub
+#                             Release. <version> must equal
 #                             CFBundleShortVersionString in Resources/Info.plist.
-#   workflow_dispatch         test, build, sign and package only; the zip and
+#   workflow_dispatch         test, build and package only; the zip and
 #                             SHA256SUMS are uploaded as a workflow artifact.
 #                             Nothing is attested or published.
 #
-# Secrets (repository secrets; every one optional)
-#   INSOMNIA_SIGN_P12_BASE64    Developer ID Application certificate with its
-#                               private key, exported as .p12, base64-encoded
-#   INSOMNIA_SIGN_P12_PASSWORD  password of that .p12
-#   INSOMNIA_SIGN_IDENTITY      the identity's name, as `security
-#                               find-identity -v -p codesigning` prints it,
-#                               e.g. "Developer ID Application: Name (TEAMID)"
-#   INSOMNIA_NOTARY_KEY_BASE64  App Store Connect API key (.p8), base64-encoded
-#   INSOMNIA_NOTARY_KEY_ID      that key's ID
-#   INSOMNIA_NOTARY_ISSUER_ID   that key's issuer ID
-# Without them the bundle is ad-hoc signed and the release is a prerelease
-# described as experimental. The six are set together or not at all: the
-# first step fails the run when the signing secrets exist without the
-# notary secrets or the reverse, or when a set is incomplete, because a
-# Developer ID build that is not notarized is blocked by Gatekeeper and
-# refused by install.sh --app, so it must never be published.
-#
-# The certificate goes into a keychain created for the run and deleted at
-# the end, never into the login keychain. Every action is pinned to a commit.
+# The bundle is ad-hoc signed and not notarized (build-app.sh), so the run
+# uses no secrets and no keychain. The release is a prerelease. Every action
+# is pinned to a commit.
 
 on:
   push:
@@ -46,40 +30,15 @@ concurrency:
 
 jobs:
   build:
-    name: Test, build, sign and package (macOS 26)
+    name: Test, build and package (macOS 26)
     runs-on: macos-26
     timeout-minutes: 60
-    # Read-only: this job holds the signing key, so it gets no write scope.
+    # Read-only: only the release job below may write.
     permissions:
       contents: read
-    env:
-      HAVE_SIGNING: ${{ secrets.INSOMNIA_SIGN_P12_BASE64 != '' && secrets.INSOMNIA_SIGN_P12_PASSWORD != '' && secrets.INSOMNIA_SIGN_IDENTITY != '' }}
-      HAVE_NOTARY: ${{ secrets.INSOMNIA_NOTARY_KEY_BASE64 != '' && secrets.INSOMNIA_NOTARY_KEY_ID != '' && secrets.INSOMNIA_NOTARY_ISSUER_ID != '' }}
-      ANY_SIGNING: ${{ secrets.INSOMNIA_SIGN_P12_BASE64 != '' || secrets.INSOMNIA_SIGN_P12_PASSWORD != '' || secrets.INSOMNIA_SIGN_IDENTITY != '' }}
-      ANY_NOTARY: ${{ secrets.INSOMNIA_NOTARY_KEY_BASE64 != '' || secrets.INSOMNIA_NOTARY_KEY_ID != '' || secrets.INSOMNIA_NOTARY_ISSUER_ID != '' }}
     outputs:
       version: ${{ steps.version.outputs.version }}
-      signed: ${{ steps.build.outputs.signed }}
-      notarized: ${{ steps.notarize.outputs.notarized }}
-      team: ${{ steps.build.outputs.team }}
-      origin_verified: ${{ steps.build.outputs.origin_verified }}
     steps:
-      - name: Check that the signing and notary secrets are all set or all absent
-        run: |
-          if [[ "$ANY_SIGNING" == true && "$HAVE_SIGNING" != true ]]; then
-            echo "::error::Some of INSOMNIA_SIGN_P12_BASE64, INSOMNIA_SIGN_P12_PASSWORD and INSOMNIA_SIGN_IDENTITY are set, but not all three."
-            exit 1
-          fi
-          if [[ "$ANY_NOTARY" == true && "$HAVE_NOTARY" != true ]]; then
-            echo "::error::Some of INSOMNIA_NOTARY_KEY_BASE64, INSOMNIA_NOTARY_KEY_ID and INSOMNIA_NOTARY_ISSUER_ID are set, but not all three."
-            exit 1
-          fi
-          if [[ "$HAVE_SIGNING" != "$HAVE_NOTARY" ]]; then
-            echo "::error::The signing secrets and the notary secrets must be set together (signing: $HAVE_SIGNING, notarization: $HAVE_NOTARY). A Developer ID build that is not notarized is blocked by Gatekeeper and refused by install.sh --app, so it is never published. Set all six secrets or none."
-            exit 1
-          fi
-          echo "signing: $HAVE_SIGNING, notarization: $HAVE_NOTARY"
-
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -130,86 +89,12 @@ jobs:
       - name: Run tests
         run: swift test
 
-      - name: Import the Developer ID certificate into a temporary keychain
-        if: env.HAVE_SIGNING == 'true'
+      - name: Build
         env:
-          P12_BASE64: ${{ secrets.INSOMNIA_SIGN_P12_BASE64 }}
-          P12_PASSWORD: ${{ secrets.INSOMNIA_SIGN_P12_PASSWORD }}
-        run: |
-          keychain="$RUNNER_TEMP/insomnia-release.keychain-db"
-          keychain_password="$(uuidgen)"
-          security create-keychain -p "$keychain_password" "$keychain"
-          # Exported before anything is imported, so the removal step below
-          # runs even if a command after this one fails.
-          echo "SIGNING_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
-          security set-keychain-settings -lut 3600 "$keychain"
-          security unlock-keychain -p "$keychain_password" "$keychain"
-          p12="$RUNNER_TEMP/insomnia-release.p12"
-          trap 'rm -f "$p12"' EXIT
-          printf '%s' "$P12_BASE64" | base64 --decode > "$p12"
-          security import "$p12" -k "$keychain" -P "$P12_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
-          rm -f "$p12"
-          # Let codesign use the key without a UI prompt.
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain" >/dev/null
-          # Search this keychain too; the login keychain stays as it is.
-          existing=()
-          while IFS= read -r line; do existing+=("$line"); done < <(security list-keychains -d user | sed -e 's/^ *"//' -e 's/"$//')
-          security list-keychains -d user -s "$keychain" "${existing[@]}"
-          security find-identity -v -p codesigning "$keychain"
-
-      - name: Build and sign
-        id: build
-        env:
-          INSOMNIA_SIGN_IDENTITY: ${{ env.HAVE_SIGNING == 'true' && secrets.INSOMNIA_SIGN_IDENTITY || '' }}
           # build-app.sh compiles the simulate-lid.sh watcher in for "1"; a
           # release never carries it.
           INSOMNIA_LID_SIMULATION: ""
-        run: |
-          scripts/build-app.sh --output dist
-          team="$(codesign -dvv dist/Insomnia.app 2>&1 | sed -n 's/^TeamIdentifier=//p' | head -n 1)"
-          # The team install.sh --app expects. While it is empty install.sh
-          # cannot verify where a download came from and needs
-          # --allow-unverified-origin; the release notes then say so.
-          expected_team="$(sed -n 's/^EXPECTED_TEAM_ID="\(.*\)"$/\1/p' scripts/install.sh)"
-          origin_verified=false
-          if [[ -n "$INSOMNIA_SIGN_IDENTITY" ]]; then
-            echo "signed=true" >> "$GITHUB_OUTPUT"
-            echo "team=$team" >> "$GITHUB_OUTPUT"
-            if [[ -n "$expected_team" && "$expected_team" != "$team" ]]; then
-              echo "::error::scripts/install.sh expects team $expected_team, but the bundle is signed by team $team; the install.sh in the zip would refuse this release."
-              exit 1
-            fi
-            if [[ -n "$expected_team" ]]; then
-              origin_verified=true
-            else
-              echo "::warning::EXPECTED_TEAM_ID is empty in scripts/install.sh, so install.sh --app cannot verify this release's origin and needs --allow-unverified-origin. Set it to $team (docs/releasing.md)."
-            fi
-          else
-            echo "signed=false" >> "$GITHUB_OUTPUT"
-            echo "team=" >> "$GITHUB_OUTPUT"
-            echo "::notice::No Developer ID secrets: Insomnia.app is ad-hoc signed. This build is an experimental prerelease."
-          fi
-          echo "origin_verified=$origin_verified" >> "$GITHUB_OUTPUT"
-
-      - name: Notarize and staple
-        id: notarize
-        if: env.HAVE_SIGNING == 'true' && env.HAVE_NOTARY == 'true'
-        env:
-          NOTARY_KEY_BASE64: ${{ secrets.INSOMNIA_NOTARY_KEY_BASE64 }}
-          NOTARY_KEY_ID: ${{ secrets.INSOMNIA_NOTARY_KEY_ID }}
-          NOTARY_ISSUER_ID: ${{ secrets.INSOMNIA_NOTARY_ISSUER_ID }}
-        run: |
-          key="$RUNNER_TEMP/notary.p8"
-          trap 'rm -f "$key"' EXIT
-          printf '%s' "$NOTARY_KEY_BASE64" | base64 --decode > "$key"
-          submission="$RUNNER_TEMP/Insomnia-notary.zip"
-          /usr/bin/ditto -c -k --sequesterRsrc --keepParent dist/Insomnia.app "$submission"
-          xcrun notarytool submit "$submission" --key "$key" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID" --wait --timeout 30m
-          rm -f "$key"
-          xcrun stapler staple dist/Insomnia.app
-          xcrun stapler validate dist/Insomnia.app
-          spctl --assess --type execute --verbose=2 dist/Insomnia.app
-          echo "notarized=true" >> "$GITHUB_OUTPUT"
+        run: scripts/build-app.sh --output dist
 
       - name: Package
         env:
@@ -224,10 +109,6 @@ jobs:
           rm -rf "release/$pkg"
           cat release/SHA256SUMS
           codesign -dvv dist/Insomnia.app 2>&1 | grep -E '^(Identifier|Signature|Authority|TeamIdentifier|CDHash)=' || true
-
-      - name: Remove the temporary keychain
-        if: always() && env.SIGNING_KEYCHAIN != ''
-        run: security delete-keychain "$SIGNING_KEYCHAIN"
 
       - name: Upload the package as a workflow artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -252,10 +133,6 @@ jobs:
       attestations: write  # store the attestation on the repository
     env:
       VERSION: ${{ needs.build.outputs.version }}
-      SIGNED: ${{ needs.build.outputs.signed }}
-      NOTARIZED: ${{ needs.build.outputs.notarized }}
-      TEAM: ${{ needs.build.outputs.team }}
-      ORIGIN_VERIFIED: ${{ needs.build.outputs.origin_verified }}
     steps:
       - name: Download the package
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -272,20 +149,8 @@ jobs:
         run: |
           zip="$(basename release/*.zip)"
           sum="$(cut -d' ' -f1 release/SHA256SUMS)"
-          if [[ "$SIGNED" == true && "$NOTARIZED" == true ]]; then
-            signing="Signed with a Developer ID (team $TEAM) and notarized by Apple."
-          elif [[ "$SIGNED" == true ]]; then
-            signing="Prerelease: signed with a Developer ID (team $TEAM) but not notarized, so Gatekeeper blocks it after download. Treat it as experimental."
-          else
-            signing="Prerelease: ad-hoc signed, experimental. No Developer ID and no notarization; macOS blocks the first launch until you allow it in System Settings > Privacy & Security. The checksum and attestation below still show this zip is what the Release workflow built from the tagged commit."
-          fi
-          if [[ "$ORIGIN_VERIFIED" == true ]]; then
-            install_flags=""
-            install_note="The installer checks the bundle's signature, identifier and version, and that it is Developer ID signed by team $TEAM, the team its install.sh expects, before asking for your password. It then installs the app, the recovery agent and the sudoers rule described in the README."
-          else
-            install_flags="--allow-unverified-origin "
-            install_note="The installer checks the bundle's signature, identifier and version before asking for your password, but it cannot verify where this bundle came from: that is what the checksum and the attestation above are for, and \`--allow-unverified-origin\` says you checked them. It then installs the app, the recovery agent and the sudoers rule described in the README."
-          fi
+          signing="Prerelease: ad-hoc signed and not notarized, so macOS blocks the first launch until you allow it in System Settings > Privacy & Security. The checksum and attestation below show this zip is what the Release workflow built from the tagged commit."
+          install_note="The installer checks the bundle's signature, identifier and version before asking for your password, but it cannot verify where this bundle came from: that is what the checksum and the attestation above are for, and \`--allow-unverified-origin\` says you checked them. It then installs the app, the recovery agent and the sudoers rule described in the README."
           {
             echo "Insomnia $VERSION for Apple Silicon Macs with macOS 26 or later. The app is built for arm64 only, so the installer stops on an Intel Mac."
             echo
@@ -307,7 +172,7 @@ jobs:
             echo '```bash'
             echo "ditto -x -k $zip ."
             echo "cd ${zip%.zip}"
-            echo "./install.sh ${install_flags}--app ./Insomnia.app"
+            echo "./install.sh --allow-unverified-origin --app ./Insomnia.app"
             echo "open \"\$HOME/Applications/Insomnia.app\""
             echo '```'
             echo
@@ -321,12 +186,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          flags=(--verify-tag)
-          if [[ "$SIGNED" != true || "$NOTARIZED" != true ]]; then
-            flags+=(--prerelease)
-          fi
           gh release create "$GITHUB_REF_NAME" release/*.zip release/SHA256SUMS \
             --repo "$GITHUB_REPOSITORY" \
             --title "Insomnia $VERSION" \
             --notes-file notes.md \
-            "${flags[@]}"
+            --verify-tag \
+            --prerelease

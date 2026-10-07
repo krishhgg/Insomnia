@@ -12,8 +12,7 @@
 # Where the bundle comes from:
 #   ./scripts/install.sh                      builds it from this checkout
 #                                             (scripts/build-app.sh, ad-hoc
-#                                             signed unless INSOMNIA_SIGN_IDENTITY
-#                                             is set); only from a checkout's
+#                                             signed); only from a checkout's
 #                                             scripts/ folder (in_checkout)
 #   ./install.sh --app /path/to/Insomnia.app  installs a prebuilt bundle, such
 #                                             as the one in a release zip
@@ -72,10 +71,9 @@ CALL_TIMEOUT_SECONDS=30
 
 # What a prebuilt bundle (--app) must be.
 BUNDLE_ID=com.kgarg.insomnia
-# Apple Team ID of the Developer ID that signs releases. Empty until the
-# maintainer sets up release signing (docs/releasing.md). A Developer ID
-# bundle from this team, accepted by Gatekeeper, is the only bundle whose
-# origin --app treats as verified; while this is empty, every bundle needs
+# Apple Team ID of a Developer ID whose bundles --app treats as verified in
+# origin, when Gatekeeper accepts them. Empty: releases are ad-hoc signed and
+# not notarized (docs/releasing.md), so every bundle needs
 # --allow-unverified-origin.
 EXPECTED_TEAM_ID=""
 

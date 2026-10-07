@@ -41,11 +41,9 @@
 Requires **macOS 26 or later on an Apple Silicon Mac**. Release zips are built
 for arm64 only, and their `install.sh --app` stops on an Intel Mac. On Intel,
 building from source (below) is the only option, and it is untested there.
-Until Developer ID signing is set up, releases are ad-hoc signed experimental
+Releases are ad-hoc signed and not notarized, and are published as
 prereleases: macOS blocks the first launch until you allow it in System
-Settings > Privacy & Security. The checksum and the build attestation below
-still show that the zip is what the Release workflow built from the tagged
-commit.
+Settings > Privacy & Security.
 
 1. Download `Insomnia-<version>-macos.zip` and `SHA256SUMS` from the
    [latest release](https://github.com/krishhgg/Insomnia/releases).
@@ -70,16 +68,13 @@ commit.
    open "$HOME/Applications/Insomnia.app"
    ```
 
-   `--allow-unverified-origin` says you ran the two commands in step 2. Until
-   releases are Developer ID signed by the team pinned in `install.sh`, the
-   installer can check that the bundle is intact but not who made it, so it
-   refuses to install without the flag. The release notes give the exact
-   command for each release.
+   `--allow-unverified-origin` says you ran the two commands in step 2. The
+   installer can check that an ad-hoc bundle is intact but not who made it,
+   so it refuses to install without the flag.
 
-The installer checks the bundle's signature, identifier and version (and, for
-a Developer ID build, Gatekeeper's verdict and the team) before it asks for
-anything. It then installs the app and a background recovery agent, and asks
-for administrator access to install a narrowly scoped sudoers rule. It grants
+The installer checks the bundle's signature, identifier and version before it
+asks for anything. It then installs the app and a background recovery agent,
+and asks for administrator access to install a narrowly scoped sudoers rule. It grants
 **your user account**, not just Insomnia, passwordless access to four
 power-setting commands. Review that permission before installing.
 

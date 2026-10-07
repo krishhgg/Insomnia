@@ -35,8 +35,8 @@ closed bag. Its design goals are to:
   No Xcode project.
 - `build-app.sh` assembles a minimal `Insomnia.app` bundle (`LSUIElement =
   true`, no Dock icon) with `backstop.sh` sealed under `Contents/Resources`
-  and signs it (ad-hoc, or with a Developer ID when `INSOMNIA_SIGN_IDENTITY`
-  is set). `install.sh` installs that build, or a prebuilt bundle passed with
+  and signs it ad-hoc.
+  `install.sh` installs that build, or a prebuilt bundle passed with
   `--app` after verifying it (one whose origin it cannot verify needs
   `--allow-unverified-origin`), to `~/Applications`. The Release workflow
   packages the same bundle (`docs/releasing.md`), built for arm64 only;

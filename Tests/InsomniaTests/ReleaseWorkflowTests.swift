@@ -71,36 +71,36 @@ final class ReleaseWorkflowTests: XCTestCase {
         XCTAssertTrue(text.contains("workflow_dispatch:"), "can be run by hand")
         XCTAssertFalse(text.contains("pull_request"), "never runs for pull requests")
         XCTAssertTrue(text.contains("if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')"), "publishing is gated on a pushed tag, not on a manual run that happens to use a tag ref")
-        XCTAssertTrue(text.contains(#"if [[ "$HAVE_SIGNING" != "$HAVE_NOTARY" ]]"#), "signing secrets without notary secrets (or the reverse) fail the run")
         XCTAssertTrue(text.contains("--signer-workflow $GITHUB_REPOSITORY/.github/workflows/release.yml --source-ref $GITHUB_REF"), "the notes pin the verify command to this workflow and the tag")
-        XCTAssertTrue(text.contains("--allow-unverified-origin"), "the notes say when install.sh needs the origin opt-in")
+        XCTAssertTrue(text.contains(#"echo "./install.sh --allow-unverified-origin --app ./Insomnia.app""#), "the notes' install command carries the origin opt-in install.sh needs for an ad-hoc bundle")
         XCTAssertTrue(text.contains("permissions: {}"), "nothing at the top level")
-        XCTAssertTrue(text.contains("--prerelease"), "unsigned builds are marked prerelease")
+        XCTAssertTrue(text.contains("--prerelease"), "ad-hoc releases are marked prerelease")
         XCTAssertTrue(text.contains("attest-build-provenance"), "build provenance is attested")
         XCTAssertTrue(text.contains("shasum -a 256"), "a checksum file is produced")
-        XCTAssertTrue(text.contains("ditto -c -k --sequesterRsrc --keepParent"), "zipped the way notarization and Finder expect")
+        XCTAssertTrue(text.contains("ditto -c -k --sequesterRsrc --keepParent"), "zipped the way Finder expects")
         XCTAssertTrue(text.contains("CFBundleShortVersionString"), "the tag is checked against the bundle version")
         XCTAssertTrue(text.contains("scripts/build-app.sh --output"), "built with the same script as install.sh")
-        XCTAssertTrue(text.contains("security delete-keychain"), "the temporary keychain is removed")
         XCTAssertFalse(text.contains("--allow-unsigned"), "no Gatekeeper workarounds")
     }
 
-    /// Key material leaves the runner even when a signing step fails: each
-    /// decoded key file is removed by an EXIT trap set before it is written,
-    /// and the keychain path is exported before anything is imported, so
-    /// the always() removal step finds it.
-    func testKeyFilesAndTheKeychainAreRemovedWhenASigningStepFails() throws {
+    /// Releases are ad-hoc signed and not notarized: the workflow reads no
+    /// secret, imports no certificate, notarizes nothing, and build-app.sh
+    /// has no Developer ID path (no signing identity from the environment,
+    /// no hardened runtime, no timestamp).
+    func testTheReleaseIsAdHocSignedWithNoSigningOrNotarizationStep() throws {
         let text = try XCTUnwrap(try workflows().first { $0.name == "release.yml" }).text
-        func offset(_ needle: String) throws -> String.Index {
-            try XCTUnwrap(text.range(of: needle), "release.yml has no \(needle)").lowerBound
+        for absent in ["secrets.", "security ", "create-keychain", "notarytool", "stapler", "INSOMNIA_SIGN", "INSOMNIA_NOTARY"] {
+            XCTAssertFalse(text.contains(absent), "release.yml contains \(absent)")
         }
-        XCTAssertLessThan(try offset(#"trap 'rm -f "$p12"' EXIT"#), try offset(#"base64 --decode > "$p12""#))
-        XCTAssertLessThan(try offset(#"trap 'rm -f "$key"' EXIT"#), try offset(#"base64 --decode > "$key""#))
-        XCTAssertLessThan(try offset(#"echo "SIGNING_KEYCHAIN=$keychain" >> "$GITHUB_ENV""#), try offset(#"security import "$p12""#))
-        XCTAssertTrue(text.contains("if: always() && env.SIGNING_KEYCHAIN != ''"), "the keychain removal runs after a failure")
+        let repo = workflowsDir.deletingLastPathComponent().deletingLastPathComponent()
+        let build = try String(contentsOf: repo.appendingPathComponent("scripts/build-app.sh"), encoding: .utf8)
+        for absent in ["INSOMNIA_SIGN_IDENTITY", "--options", "--timestamp"] {
+            XCTAssertFalse(build.contains(absent), "build-app.sh contains \(absent)")
+        }
+        XCTAssertTrue(build.contains(#""$CODESIGN" --force --sign - "$APP""#), "build-app.sh signs ad-hoc")
     }
 
-    /// The job that holds the signing key has read-only access; only the job
+    /// The build job has read-only access; only the job
     /// that publishes may write, and only what publishing needs.
     func testOnlyTheReleaseJobMayWrite() throws {
         let text = try XCTUnwrap(try workflows().first { $0.name == "release.yml" }).text

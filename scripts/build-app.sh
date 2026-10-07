@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build Insomnia and assemble a signed Insomnia.app. install.sh runs this for
+# Build Insomnia and assemble an ad-hoc signed Insomnia.app. install.sh runs this for
 # source installs, and .github/workflows/release.yml runs it for the
 # downloadable package, so both produce the same bundle.
 #
@@ -7,17 +7,11 @@
 #   Writes DIR/Insomnia.app, replacing a bundle already at that path. DIR is
 #   created if needed. Prints the bundle path last.
 #
-# Signing is chosen by the environment:
-#   INSOMNIA_SIGN_IDENTITY  set to the name of a "Developer ID Application"
-#                           identity in an unlocked keychain: the bundle is
-#                           signed with it, with the hardened runtime and a
-#                           secure timestamp, which is what notarization
-#                           needs. Unset or empty: ad-hoc signature
-#                           (`codesign --sign -`), which only identifies this
-#                           build (its cdhash) and which Gatekeeper blocks
-#                           when the bundle was downloaded.
-# The bundle has no nested code, so there is no --deep; backstop.sh under
-# Contents/Resources is sealed as a resource either way.
+# The signature is always ad-hoc (`codesign --sign -`): releases are ad-hoc
+# signed and not notarized (docs/releasing.md). It identifies only this build
+# (its cdhash), and macOS blocks the first launch of a downloaded copy until
+# the user allows it. The bundle has no nested code, so there is no --deep;
+# backstop.sh under Contents/Resources is sealed as a resource.
 set -euo pipefail
 
 # Fixed tool paths: never taken from PATH. Tests patch these lines in a
@@ -25,6 +19,10 @@ set -euo pipefail
 SWIFT=/usr/bin/swift
 CODESIGN=/usr/bin/codesign
 PLUTIL=/usr/bin/plutil
+RM=/bin/rm
+MKDIR=/bin/mkdir
+CP=/bin/cp
+CHMOD=/bin/chmod
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -40,7 +38,7 @@ done
 [[ -n "$OUTPUT" ]] || { usage; exit 2; }
 # Resolved now, before the build changes into the checkout: a relative
 # --output means relative to the caller's directory, not to the checkout.
-mkdir -p "$OUTPUT"
+"$MKDIR" -p "$OUTPUT"
 OUTPUT="$(cd "$OUTPUT" && pwd)"
 
 step() { printf '\n==> %s\n' "$*"; }
@@ -68,27 +66,21 @@ BIN="$("$SWIFT" build -c release ${BUILD_FLAGS[@]+"${BUILD_FLAGS[@]}"} --show-bi
 # 2. Bundle ------------------------------------------------------------------
 APP="$OUTPUT/Insomnia.app"
 step "Assembling $APP"
-rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp "$BIN" "$APP/Contents/MacOS/Insomnia"
-cp "$ROOT/Resources/Info.plist" "$APP/Contents/Info.plist"
-cp "$ROOT/Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
+"$RM" -rf "$APP"
+"$MKDIR" -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+"$CP" "$BIN" "$APP/Contents/MacOS/Insomnia"
+"$CP" "$ROOT/Resources/Info.plist" "$APP/Contents/Info.plist"
+"$CP" "$ROOT/Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 # backstop.sh goes into the bundle before it is signed, so the signature's
 # resource seal covers it. The LaunchAgent install.sh writes verifies the
 # bundle and only then runs this copy; an edited script fails that check.
-cp "$ROOT/scripts/backstop.sh" "$APP/Contents/Resources/backstop.sh"
-chmod 755 "$APP/Contents/Resources/backstop.sh"
+"$CP" "$ROOT/scripts/backstop.sh" "$APP/Contents/Resources/backstop.sh"
+"$CHMOD" 755 "$APP/Contents/Resources/backstop.sh"
 "$PLUTIL" -lint "$APP/Contents/Info.plist" >/dev/null
 
 # 3. Sign --------------------------------------------------------------------
-IDENTITY="${INSOMNIA_SIGN_IDENTITY:-}"
-if [[ -n "$IDENTITY" ]]; then
-  step "Signing with \"$IDENTITY\" (hardened runtime, timestamped)"
-  "$CODESIGN" --force --sign "$IDENTITY" --options runtime --timestamp "$APP"
-else
-  step "Signing ad-hoc (no INSOMNIA_SIGN_IDENTITY; this build is identified only by its cdhash)"
-  "$CODESIGN" --force --sign - "$APP"
-fi
+step "Signing ad-hoc (this build is identified only by its cdhash)"
+"$CODESIGN" --force --sign - "$APP"
 "$CODESIGN" --verify --strict "$APP"
 "$CODESIGN" -dvv "$APP" 2>&1 | grep -E '^(Identifier|Signature|Authority|TeamIdentifier|CDHash)=' || true
 echo "$APP"
