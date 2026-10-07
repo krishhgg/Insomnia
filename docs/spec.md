@@ -119,6 +119,12 @@ recovery; newly written journals use `frozenProcesses`.
 - 2-second debounce to ignore flapping.
 - Lid close and open each run a fixed, reversible action list (below).
 - Lid events do nothing when no session is active.
+- Each lid event is numbered as it arrives, before its actions queue behind
+  earlier ones. An open makes every earlier close stale. A close still
+  queued does nothing when its turn comes. A close waiting on a Docker probe
+  stops waiting at once, leaves Docker running, takes Docker's entries out
+  of the journal and signals nothing more, so the open's undo runs without
+  waiting for `docker ps`. The probe's late answer is logged and not used.
 
 ### 4. Lid-close actions (battery)
 
@@ -130,10 +136,15 @@ Quit, or reconcile.
 | Display (optional, default on) | save brightness, set it to 0, request display sleep (best effort) | wake the display, restore the saved brightness |
 | Keyboard backlight (optional, same toggle) | save brightness, set it to 0 | restore the saved brightness |
 | Freeze scope | `SIGSTOP` every process whose responsible app is in the freeze scope (rules below) | `SIGCONT` the recorded pids only |
-| Docker rule | if Docker Desktop is running and `docker ps -q` is empty, freeze it | resume |
+| Docker rule (default off) | if Docker Desktop is running and `docker ps -q` is empty, journal its tree, ask `docker ps -q` once more right before the SIGSTOP and freeze it only on a second clean empty answer; busy, a failed probe, a timeout, a lid open or a session end at either point leaves it running | resume |
 | Mute (optional) | save volume and mute state, then mute | restore both exactly |
 | Low Power Mode | on (optional, default on) | off unless a battery or thermal floor still wants it |
 | Countdown redraw | stop timer | restart timer |
+
+A session that starts, or that reconcile resumes at launch, while the lid
+reads closed starts with the countdown redraw stopped: the lid observer
+reports changes only, so no close event arrives for it. The next lid open
+restarts the redraw.
 
 Freeze scope rules:
 
@@ -296,7 +307,10 @@ last held while it was on was the battery or thermal floor, not the lid.
   uninstall makes under the recovery lock (`pgrep`, `launchctl`,
   `codesign`); a read that does not answer ends the check with the command
   to run by hand, and uninstall goes on. A call past its limit gets SIGTERM,
-  then SIGKILL, and never holds the lock.
+  then SIGKILL a second later. Each call keeps the lock until it has exited
+  or been stopped, and a supervising process enforces the limit even if
+  uninstall is killed while it waits, so its `launchctl bootout` is not
+  still running when the app takes the lock and loads its agent.
 - Browser throttling: Chromium browsers throttle windows macOS reports as
   occluded, which is every window once the lid is closed with no external
   display. Timers drop to 1 Hz, animation frames stop, pages report hidden.
@@ -401,6 +415,87 @@ provided by the standalone backstop. Performance effects depend on workload.
   SSID) and is never placed in process arguments. Retry with backoff (5 s,
   10 s, 20 s, 30 s, then every 30 s) until the path is satisfied or the
   session ends.
+- The Keychain item is created with an access list naming only the saving
+  build (`SecAccessCreate` with the running code as the sole trusted
+  application; under ad-hoc signing that is the build's cdhash). Reads run
+  with the process-wide Keychain prompt switch off
+  (`SecKeychainSetUserInteractionAllowed`, put back after each call), since
+  the per-query no-UI keys only govern the data protection keychain. An item
+  the build may not read fails with `errSecAuthFailed` (another build's item,
+  or a locked keychain; the file-based keychain cannot tell them apart), and
+  a missing item with `errSecItemNotFound`. Either skips the join and sets
+  a `HotspotPasswordReport`, the `HotspotPasswordProblem` and the SSID it
+  was read for: a warning line in the right-click menu and a notice under
+  the password field in Settings, both only while that SSID is the one
+  configured, and one notification per outage and hotspot (re-armed on
+  recovery, on stop and when the password is saved). Settings checks the
+  notice again whenever the configured SSID changes. A save in
+  Settings writes to the keychain that holds the item reads find, which
+  need not be the default keychain (a new item goes to the default
+  keychain). A locked keychain
+  hides this build's items as well as another build's, so a save that
+  finds the item unreadable first checks the keychain's lock state
+  (`SecKeychainGetStatus`) and, if it is locked, unlocks it (the prompt)
+  and starts over. An item the build can read already names it, so only
+  the value changes, in place (`SecItemUpdate`). An item it still cannot
+  read is another build's and needs a new access list, and the file-based
+  keychain changes that only by replacing the item (an in-place update of
+  `kSecAttrAccess` did not return when tried on a throwaway keychain): the
+  new password is put beside the old item, in the same keychain, under
+  service `insomnia-hotspot.replacing`; the old item is deleted; the new
+  one is renamed to `insomnia-hotspot`. Reads use only `insomnia-hotspot`
+  and never fall back to a `.replacing` item: which save left it, and
+  whether that save finished, is not known, and one in another keychain
+  on the search list can hold an older password. Until the delete, the
+  password reads as unreadable, as before the save; after the rename, as
+  the new one. A save that stops in between (a failed rename, a crash)
+  leaves it reading as missing, and the user enters it again. A
+  `.replacing` item the build can read, left by such a save, has its value
+  changed in place by the next save; one it cannot read with the keychain
+  unlocked is another build's and is deleted, then added again. A refused
+  delete of the old item removes the `.replacing` item and keeps the old
+  one. Clearing the password deletes both. Deleting another build's item, and unlocking the keychain
+  for a save, need the prompt, which is allowed only there.
+  `kSecAttrAccessible` is not set: the file-based keychain drops it, and
+  the data protection keychain needs an access-group entitlement.
+- Every keychain call the app makes, the failover's reads and the saves
+  and clears in Settings, runs on one serial dispatch queue
+  (`KeychainQueue`), never on the main actor. A save can wait on a
+  keychain prompt for as long as the user leaves it open, and the battery
+  floor, the deadline timer and End keep running meanwhile; one queue also
+  keeps two calls from setting the process-wide prompt switch at once. The
+  Save button reads "Saving…" until the keychain answers, then "Saved"
+  only while the SSID and password fields hold what the save stored: the
+  save uses the SSID that was in the field when it began, so an SSID typed
+  during the wait has no password yet. A failed save's notice stays under
+  the field even when the failover's report changed during the wait; the
+  recheck that change started reads the keychain behind the save, and its
+  answer is dropped. So is the answer of a load still running when a save
+  or clear begins, so it cannot refill a field the user just cleared. A
+  load fills the field only if the field was empty when it began and
+  nobody has edited it since, not even by typing and deleting it again. A
+  recheck that begins meanwhile (the report changed, or the SSID was
+  edited) sets the notice instead of the load, but does not stop the fill.
+- Work that waits on `KeychainQueue` checks again, once the wait is over,
+  everything it acts on, and drops its answer if any of it changed. A
+  load or recheck in Settings whose SSID was edited meanwhile is dropped,
+  since its answer is about the old SSID's item, and the SSID configured
+  now is read instead, so the field is not left empty with no notice.
+  That read is a peek: the SSID a later save moves the password from
+  stays the one the window loaded, as after any SSID edit. A save writes
+  the item for the SSID configured when it began and removes the item of
+  the SSID the window loaded, if that SSID was edited since, and returns
+  both. It clears the failover's report and re-arms its notification
+  unless the report is about the SSID configured when it answers and the
+  save touched neither of that SSID's items. A save that stored for an
+  SSID edited away meanwhile then checks the notice for the SSID
+  configured now. A failover join whose read waited behind a
+  save does nothing if the session has ended, Wi-Fi has come back, or the
+  configured SSID has changed: no join and no warning, so the
+  notification stays armed. After a recovery or stop it schedules no
+  retry either; after an SSID change the retry stays, and the next tick
+  reads the SSID configured then. Inside a save, the unlock prompt is
+  followed by a fresh read of the item and its keychain.
 - macOS 26 requires Location Services permission before CoreWLAN exposes SSIDs
   or returns results for an SSID-filtered scan. Insomnia requests when-in-use
   access when the hotspot is saved or a configured session starts, never at
@@ -414,6 +509,10 @@ provided by the standalone backstop. Performance effects depend on workload.
   the body; `insomnia.log` keeps the text.
 - Each outage is logged with start, end, and gap length to
   `~/Library/Logs/Insomnia/handoffs.log`. The menu shows the last gap.
+  Like `insomnia.log`, the file is owner-only (0600) and is renamed to
+  `handoffs.log.1` once it passes 1 MiB (`OwnerOnly.swift`). A log the user
+  replaced with a symlink is never rotated, so the cap does not hold for it:
+  the file it points to is the user's to manage.
 - Path satisfied again after a gap longer than `nudgeThreshold` (default 90 s):
   - For every configured tmux target (`session:window.pane`), resolve the
     concrete pane, read its state and then its mark, the pane-scoped user
@@ -530,10 +629,14 @@ Backstop, independent of the app:
   the lock first removes the rule and leaves no journal, so the recovery
   alone would pass. Under the lock every `sudo -n -l`, `pgrep`, `launchctl`
   and `codesign --verify` call has a 30 s limit (the sudoers check before
-  the lock has it too) and runs with fd 9 closed; a call past it gets
-  SIGTERM, then SIGKILL. A sudoers check or `pgrep` that does not answer
-  stops the run, which releases the lock so the app and the agent can
-  recover. A `launchctl print` that does not answer counts as unknown, never
+  the lock has it too). A supervising process enforces it, even if the
+  installer is killed while it waits, and the call keeps fd 9, so the lock
+  is held until the call has exited or been stopped: no `launchctl bootout`
+  or `bootstrap` it started is still running once the lock is released. A call past the
+  limit gets SIGTERM, then SIGKILL a second later; `sudo` only ever gets
+  SIGTERM, and one that ignores it keeps the lock until it ends, reported
+  with its pid. A sudoers check or `pgrep` that does not answer stops the
+  run, which releases the lock so the app and the agent can recover. A `launchctl print` that does not answer counts as unknown, never
   as unloaded. A `codesign --verify` that does not answer leaves it unknown
   which bundle the plist on disk pins, so the run stops and moves neither
   bundle. uninstall.sh runs the
@@ -551,10 +654,44 @@ Backstop, independent of the app:
   to acquire it must not permit an unprotected journal write or side effect.
 - Successful restores may clear their entries; failures must stay journaled.
   Process recovery must verify identity and avoid resuming a process that
-  Insomnia did not stop. Old PID-only entries need conservative handling.
+  Insomnia did not stop. The entries that record `startedAtMicros` go to
+  the installed app binary in one call (`Insomnia --resume-frozen
+  <seconds>`, with one line `<pid> <startedAt> <startedAtMicros>
+  <bootSession>` per entry on standard input, which has no size limit,
+  answered before AppKit starts),
+  so the comparison is to the microsecond and each entry's signal follows
+  its own lookup in one process. The binary prints one line per entry in
+  input order, `<pid> <word>`, and exits 0 when every word is `resumed` or
+  `gone`, 1 otherwise. A missing or malformed `<seconds>` (1 to 300), any
+  further argument, empty input or a malformed line is a usage error (exit
+  64) that checks nothing. The script runs the binary only when the bundle's
+  `Info.plist` declares `InsomniaResumeFrozenVersion` equal to the version
+  the script speaks, because an older build would start the menu bar app
+  instead; otherwise it keeps those entries. It runs it with the same
+  30-second limit as a power command, then SIGTERM, then SIGKILL, and with
+  the lock descriptor: the binary keeps the recovery lock while it can
+  still send a signal, even if the script dies first, and ends itself with
+  SIGALRM after `<seconds>` (the script's limit plus the SIGTERM grace), so
+  the lock is freed without anyone waiting for it. The script starts the
+  binary as its own background job and is the only process that signals
+  it, by jobspec, so a signal never reaches a pid bash has already reaped. It checks the whole answer:
+  one line per entry with that entry's pid and a known word and nothing
+  else, and an exit status that agrees with the words. `resumed` and `gone`
+  clear an entry, the other words keep it, and a missing binary, a timeout
+  or any other answer keeps every entry of the call. Entries without
+  microseconds keep the shell's one-second `ps` comparison. Old PID-only
+  entries need conservative handling.
 - The shell does not restore CoreAudio settings. Saved audio must remain in
   the journal for the app to restore. Uninstall must preserve recovery tools
-  and state when restoration is incomplete, including saved audio.
+  and state when restoration is incomplete, including saved audio. It runs
+  the checkout's backstop only when the installed app declares the
+  `InsomniaResumeFrozenVersion` that backstop speaks; otherwise it runs the
+  backstop installed with that app, when there is one: the copy sealed in
+  its bundle, once `codesign --verify --strict` passes, else the writable
+  copy older installs left in Application Support. With no installed copy
+  it runs the checkout's backstop anyway, which keeps the entries that
+  need the binary without running it, so uninstall stops before removing
+  anything.
 - The shell puts `appNapOverrides` back with `defaults write <id>
   NSAppSleepDisabled -bool <previous>` or `defaults delete` when the key was
   absent. A delete that fails counts as done only when `defaults read` then
@@ -575,7 +712,9 @@ restored by backstop, sleep disabled by something other than Insomnia
 ### 10. Settings
 
 JSON at `~/Library/Application Support/Insomnia/config.json`, edited through a
-small settings window:
+small settings window. Like `session.json`, `state.json` and the recovery
+lock it is created mode 0600 in a 0700 directory, and a looser file from an
+older build is tightened when the app reads it:
 
 - presets, default preset
 - freeze list (bundle ids), freeze every other app on/off (default off),
@@ -804,7 +943,7 @@ Insomnia/
 ## Install
 
 ```
-git clone https://github.com/kgarg2468/Insomnia.git && cd Insomnia
+git clone https://github.com/krishhgg/Insomnia.git && cd Insomnia
 ./scripts/install.sh      # asks for sudo once, for the sudoers file
 ```
 
@@ -830,7 +969,12 @@ that any case passed; record results in the release validation record.
    every session at login. Saved audio requires the app to reopen.
 5. **Freeze.** Slack and WhatsApp on list, close lid, `ps -o stat` shows `T`
    for their whole trees. Open lid → running, reconnected, no relaunch.
-6. **Docker rule.** No containers → paused on close. One container → untouched.
+6. **Docker rule.** Rule on. No containers → paused on close; insomnia.log
+   has "first check found no running container" and "second check found no
+   running container". One container → untouched, log has "first check found
+   containers running". A container started between the two checks →
+   untouched, log has the first check finding none and "second check found
+   containers running".
 7. **Mute.** Volume 60%, close lid → muted. Open → 60%, unmuted.
 8. **Chrome occlusion.** Lid closed, Playwright attached to headed Chrome:
    read `document.visibilityState` and measure `setInterval` drift. Repeat with

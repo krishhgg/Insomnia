@@ -48,6 +48,7 @@ final class ReconcileLidGatingTests: XCTestCase {
         XCTAssertEqual(after.savedKeyboardBrightness, 0.3)
         XCTAssertEqual(m.state, after)
         XCTAssertEqual(h.guardFake.calls, ["disablesleep 1"])
+        XCTAssertFalse(m.countdownTimerArmed, "the session resumed under a closed lid redraws every second")
     }
 
     /// A journal holding only saved brightness (no freeze, no audio) is
@@ -98,6 +99,7 @@ final class ReconcileLidGatingTests: XCTestCase {
         XCTAssertNil(after.savedKeyboardBrightness)
         XCTAssertTrue(after.sleepDisabledByUs)
         XCTAssertEqual(m.state, after)
+        XCTAssertTrue(m.countdownTimerArmed, "the session resumed with the lid open has no countdown")
     }
 
     func testUnknownLidStateKeepsActions() async throws {
@@ -107,6 +109,8 @@ final class ReconcileLidGatingTests: XCTestCase {
         await m.reconcile()
         XCTAssertEqual(h.procs.resumed, [])
         XCTAssertEqual(try h.store.loadState()?.frozenPids, [111, 222])
+        // No reading (a desktop has no lid): the countdown runs.
+        XCTAssertTrue(m.countdownTimerArmed)
     }
 
     func testExpiredSessionRestoresRegardlessOfLid() async throws {

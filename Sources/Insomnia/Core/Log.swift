@@ -29,18 +29,13 @@ enum Log {
         lock.lock()
         defer { lock.unlock() }
         do {
-            try FileManager.default.createDirectory(at: paths.logs, withIntermediateDirectories: true)
-            let url = paths.logFile
-            if !FileManager.default.fileExists(atPath: url.path) {
-                FileManager.default.createFile(atPath: url.path, contents: nil)
-            }
-            let handle = try FileHandle(forWritingTo: url)
-            defer { try? handle.close() }
-            try handle.seekToEnd()
-            try handle.write(contentsOf: Data(line.utf8))
+            // Owner-only, and rotated to insomnia.log.1 past OwnerOnly.maxLogBytes.
+            // A chmod or rotation that fails is thrown after the line is
+            // written, so it reaches the unified log below.
+            try OwnerOnly.appendToLog(line, at: paths.logFile)
         } catch {
             // The description carries a path under the home directory.
-            logger.error("log append failed: \(error.localizedDescription, privacy: .private)")
+            logger.error("insomnia.log: \(error.localizedDescription, privacy: .private)")
         }
     }
 }

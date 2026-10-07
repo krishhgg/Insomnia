@@ -202,6 +202,7 @@ final class UIStatusTests: XCTestCase {
         XCTAssertEqual(s.frozenCount, 0)
         XCTAssertFalse(s.dockerPaused)
         XCTAssertTrue(s.throttledBrowsers.isEmpty)
+        XCTAssertNil(s.hotspotPasswordReport)
         XCTAssertNil(s.instantWatts())
         s.refreshInstant()
         s.refreshOnDemand()
@@ -285,6 +286,49 @@ final class UIStatusTests: XCTestCase {
         )
         XCTAssertEqual(items.first, StatusMenu.Item(title: "\u{26A0} sudo: a password is required", kind: .warning))
         XCTAssertEqual(items.map(\.kind), [.warning, .separator, .settings, .quit])
+    }
+
+    /// A hotspot join skipped for want of a password is a warning line in
+    /// the menu, between the browser items and the session error, so the
+    /// failure is never silent.
+    func testMenuShowsTheHotspotPasswordProblemAsAWarning() {
+        let items = StatusMenu.items(
+            sessionActive: true,
+            sleepHeld: true,
+            machine: nil,
+            actions: nil,
+            throttledBrowsers: [Self.chrome],
+            hotspotWarning: HotspotPasswordProblem.unreadable.menuLine,
+            error: "sudo: a password is required"
+        )
+        XCTAssertEqual(
+            items.map(\.kind),
+            [.info, .warning, .relaunchBrowser(Self.chrome), .warning, .warning, .separator, .settings, .quit]
+        )
+        XCTAssertEqual(items[3], StatusMenu.Item(
+            title: "\u{26A0} Hotspot password unreadable by this build: enter it again in Settings",
+            kind: .warning
+        ))
+        XCTAssertEqual(
+            StatusMenu.items(sessionActive: false, sleepHeld: false, machine: nil, actions: nil, throttledBrowsers: [], hotspotWarning: nil, error: nil).map(\.kind),
+            [.settings, .quit]
+        )
+    }
+
+    /// Each problem has a menu line, a sentence for the notification, and a
+    /// Settings notice except for a missing item, where the empty field is
+    /// the notice.
+    func testHotspotPasswordProblemCopy() {
+        XCTAssertEqual(HotspotPasswordProblem.missing.menuLine, "\u{26A0} Hotspot password not saved: enter it in Settings")
+        XCTAssertNil(HotspotPasswordProblem.missing.settingsNotice)
+        XCTAssertTrue(HotspotPasswordProblem.unreadable.settingsNotice?.contains("Enter it again and save") ?? false)
+        XCTAssertTrue(HotspotPasswordProblem.unreadable.explanation.hasSuffix("Enter it again in Settings."))
+        XCTAssertEqual(HotspotPasswordProblem.error("keychain: boom").menuLine, "\u{26A0} Hotspot password unreadable: keychain: boom")
+        XCTAssertEqual(HotspotPasswordProblem.error("keychain: boom").settingsNotice, "The saved password can't be read: keychain: boom")
+        XCTAssertEqual(KeychainError(status: errSecAuthFailed).problem, .unreadable)
+        XCTAssertEqual(KeychainError(status: errSecInteractionNotAllowed).problem, .unreadable)
+        XCTAssertEqual(KeychainError(status: errSecInvalidOwnerEdit).problem, .unreadable)
+        XCTAssertEqual(KeychainError(status: errSecParam).problem, .error("keychain: One or more parameters passed to a function were not valid."))
     }
 
     /// The relaunch item asks first, since the browser is quit and its
@@ -1143,6 +1187,7 @@ final class RecordingStatusSource: StatusSource {
     var dockerPaused = false
     var throttledBrowsers: [ThrottledBrowser] = []
     var relaunchProblems: [String] = []
+    var hotspotPasswordReport: HotspotPasswordReport? = nil
     private(set) var relaunched: [ThrottledBrowser] = []
 
     func refreshOnDemand() {}

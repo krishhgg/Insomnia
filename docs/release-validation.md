@@ -117,6 +117,7 @@ is performed. Do not replace "not run" with "passed" based on source review.
 | Unreadable session.json moved aside by the app at launch and by the agent, then uninstall with and without --purge | Not run |
 | session.json without read permission during a session: the agent restores sleep within a minute and renames the file to session.json.unreadable-<time>, or the app does both at launch and notifies; after fixing the copy's permissions, a relaunch does not resume the session | Not run |
 | Reboot/login with active or dirty journals | Not run |
+| Backstop resuming a frozen test process through the installed `Insomnia --resume-frozen`, and keeping the entry when the bundle is removed or its Info.plist lacks `InsomniaResumeFrozenVersion` | Not run |
 | Lid-close/open and safe recovery of explicitly selected test processes | Not run |
 | Lid-close display/keyboard darkening and restore | Not run |
 | Freeze-all scope with agents running (Cursor/T3 Code/Claude untouched) | Not run |
@@ -128,7 +129,10 @@ is performed. Do not replace "not run" with "passed" based on source review.
 | Existing Low Power Mode preference and saved audio restoration | Not run |
 | App Nap opt-in: previous `NSAppSleepDisabled` put back at session end, by the backstop after a force-quit, and by uninstall | Not run |
 | Docker Desktop idle/busy behavior with another Docker context selected | Not run |
+| Docker rule off on a fresh config.json (no `docker ps`, Docker untouched) and on with a container started between the two idle checks (Docker untouched, both checks logged with their answers) | Not run |
+| Docker rule on, lid opened while an idle check is still running (Docker never paused, the display and frozen apps restored without waiting for `docker ps`, insomnia.log says the lid opened during that check), and a session started with the lid already closed (no countdown redraw until the lid opens) | Not run |
 | Hotspot permission, association, cancellation, and reconnect | Not run |
+| Hotspot password after a reinstall: menu and Settings report it unreadable, no prompt during an outage, re-save replaces the item (prompt on Save allowed) | Not run |
 | Settings location note matches what System Settings shows after the grant | Not run |
 | tmux cancellation with a dedicated disposable pane | Not run |
 | tmux nudge on the user's own tmux server: marked pane gets `continue` only, Enter toggle submits it, unmarked pane untouched | Not run |
@@ -152,6 +156,8 @@ is performed. Do not replace "not run" with "passed" based on source review.
 | `install.sh` and `uninstall.sh` from a release zip unpacked in `/tmp`, with a `build-app.sh` and a `backstop.sh` added to the unpacked folder, run neither (install without `--app` stops, uninstall runs the sealed copy), on a working Mac | Not run |
 | `install.sh --app` from a release zip stops with the Apple Silicon message on an Intel Mac, and installs on an Apple Silicon Mac from a Terminal running under Rosetta | Not run |
 | Release workflow end to end: tag push, tests, package, attestation, GitHub Release, `gh attestation verify` of the download | Not run |
+| Install or uninstall whose own process is killed (`kill -9 <pid>`) during a `launchctl bootout` keeps the recovery lock until that bootout has ended or been stopped, about 31 s at most, and the app started afterwards keeps its agent loaded, on a working Mac | Not run |
+| First launch over an existing install tightens Application Support/Insomnia and Logs/Insomnia to 0700 and their files to 0600 | Not run |
 | Launch at login survives a reinstall by install.sh, including a second install.sh run on the same unchanged build (switch on, reinstall, relaunch: the log shows the launch-time check, System Settings > General > Login Items lists Insomnia as enabled, and the Settings switch reads on; a pending approval shows the note and the Open Login Items button) | Not run |
 | Launch at login heals on the first upgrade from a build without the install record (switch on in the previous build, upgrade with install.sh, relaunch: the log shows "registering once and recording the install", Login Items lists Insomnia, and config.json has `launchAtLoginInstall`) | Not run |
 | Launch at login removed in System Settings stays removed (switch on, relaunch once so the install is on file, remove Insomnia under System Settings > General > Login Items, relaunch: the log says the removal was respected, the Settings switch is off, and Login Items does not list Insomnia again) | Not run |

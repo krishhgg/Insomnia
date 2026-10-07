@@ -38,15 +38,20 @@
 
 ## Install
 
-Requires **macOS 26 or later on an Apple Silicon Mac**. Release zips are built
-for arm64 only, and their `install.sh --app` stops on an Intel Mac. On Intel,
-building from source (below) is the only option, and it is untested there.
-Releases are ad-hoc signed and not notarized, and are published as
-prereleases: macOS blocks the first launch until you allow it in System
-Settings > Privacy & Security.
+Requires **macOS 26 or later on an Apple Silicon Mac**.
 
-1. Download `Insomnia-<version>-macos.zip` and `SHA256SUMS` from the
-   [latest release](https://github.com/krishhgg/Insomnia/releases).
+Paste this into your coding agent:
+
+```text
+Install Insomnia from https://github.com/krishhgg/Insomnia by following its README. If a step needs my password, give me the command to run in Terminal.
+```
+
+Or run it yourself:
+
+1. Download `Insomnia-<version>-macos.zip` and `SHA256SUMS` from the newest
+   release on the [releases page](https://github.com/krishhgg/Insomnia/releases)
+   (releases are marked Pre-release). If the page has no release yet, build
+   from source (below).
 2. Verify the download (`gh` is the [GitHub CLI](https://cli.github.com)):
 
    ```bash
@@ -68,9 +73,11 @@ Settings > Privacy & Security.
    open "$HOME/Applications/Insomnia.app"
    ```
 
-   `--allow-unverified-origin` says you ran the two commands in step 2. The
-   installer can check that an ad-hoc bundle is intact but not who made it,
-   so it refuses to install without the flag.
+   Releases are ad-hoc signed and not notarized. The installer can check that
+   the bundle is intact but not who made it, so it refuses to install without
+   `--allow-unverified-origin`, which says you ran the two commands in step 2.
+   macOS blocks the first launch of a downloaded copy until you allow it in
+   System Settings > Privacy & Security.
 
 The installer checks the bundle's signature, identifier and version before it
 asks for anything. It then installs the app and a background recovery agent,
@@ -78,9 +85,15 @@ and asks for administrator access to install a narrowly scoped sudoers rule. It 
 **your user account**, not just Insomnia, passwordless access to four
 power-setting commands. Review that permission before installing.
 
+Release zips are built for arm64 only, and their `install.sh --app` stops on
+an Intel Mac. On Intel, building from source (below) is the only option, and
+it is untested there.
+
 ### Build from source (experimental)
 
-Requires **Xcode with Swift 6.2 or later**. Clone a release tag, not `main`:
+Requires **Xcode with Swift 6.2 or later**. Clone the newest release tag
+rather than `main`. While no release exists, leave out `--branch v<version>`
+to build `main`:
 
 ```bash
 git clone --branch v<version> --depth 1 https://github.com/krishhgg/Insomnia.git
@@ -105,7 +118,7 @@ a `build-app.sh` was added to its folder after unpacking.
 | `~/Applications/Insomnia.app` | The menu bar app, with `backstop.sh` sealed inside it at `Contents/Resources` |
 | `~/Library/Application Support/Insomnia/` | Configuration and the session/recovery journals |
 | `~/Library/LaunchAgents/com.insomnia.backstop.plist` | Per-user recovery agent: verifies the app's code signature, then runs the sealed `backstop.sh` |
-| `~/Library/Logs/Insomnia/` | `insomnia.log` and `handoffs.log` |
+| `~/Library/Logs/Insomnia/` | `insomnia.log` and `handoffs.log`, each capped at 1 MiB with one older copy kept as `.1`, unless you replace it with a symlink |
 | `/etc/sudoers.d/insomnia` | Permission for the four commands below |
 
 ```text
@@ -170,10 +183,14 @@ replacing either; follow the reported instructions before retrying. The
 installer checks the sudoers rule again once it holds the recovery lock, and
 stops if the rule is gone, as after an `uninstall.sh` that took the lock first.
 Each call it makes to `sudo`, `pgrep`, `launchctl` or `codesign` while it
-holds the lock has a 30 s limit and runs without the lock's file descriptor.
-A call that does not answer in time is stopped and the install stops with
-it, so the lock is released and the app and the agent's backstop can take it
-again to undo a session.
+holds the lock has a 30 s limit, which a supervising process enforces even
+if the installer is killed meanwhile. The call keeps the lock until it has
+exited or been stopped, so no `launchctl bootout` it started is still
+running once the lock is released. A call that does not answer in time gets SIGTERM, then SIGKILL
+a second later, and the install stops, so the lock is released and the app
+and the agent's backstop can take it again to undo a session. `sudo` only
+ever gets SIGTERM: one that ignores it keeps the lock until it ends, and the
+installer prints its pid.
 
 </details>
 
@@ -199,15 +216,18 @@ and check the status menu and `~/Library/Logs/Insomnia/insomnia.log` afterward.
 ## What happens when the lid closes
 
 <p align="center">
-  <img src="docs/assets/lid-actions.svg" alt="Illustrated Settings defaults: Slack, WhatsApp, and Discord on the freeze list, Docker's idle rule on, mute off. During a session, lid close applies configured actions; reopening attempts to resume verified owned freezes and restore saved audio. The session continues. Without an active session, lid changes do nothing." width="880">
+  <img src="docs/assets/lid-actions.svg" alt="Illustrated Settings defaults: Slack, WhatsApp, and Discord on the freeze list, Docker's idle rule off, mute off. During a session, lid close applies configured actions; reopening attempts to resume verified owned freezes and restore saved audio. The session continues. Without an active session, lid changes do nothing." width="880">
 </p>
 
 During a session, Insomnia turns the display and keyboard backlight off
 (saving their brightness first), pauses the apps on the freeze list (and, if
 you opt in, every other Dock app that is not an agent app), checks whether
 Docker Desktop is idle before pausing it, and can save then mute audio.
-Reopening the lid attempts to undo those lid actions. **The timer keeps
-counting down while the lid is closed**; only its on-screen redraw pauses.
+Reopening the lid attempts to undo those lid actions. If the lid opens
+while Insomnia is still checking Docker, Docker is left running and the undo
+starts right away. **The timer keeps counting down while the lid is
+closed**; only its on-screen redraw pauses, also for a session started with
+the lid already closed.
 
 The display step exists because the sleep guard stops macOS from doing it:
 with sleep disabled, closing the lid no longer turns the panel or the keys off
@@ -232,9 +252,13 @@ The defaults are worth knowing:
   apps are never picked up automatically; add them to the freeze list if you
   want them paused. Settings shows a "Would freeze now" line listing what the
   automatic scope would pause at that moment.
-- **Docker rule:** enabled, with a separate local Docker Desktop idle check.
-  Container startup can race that check; disable the rule for important Docker
-  workloads where an unexpected pause would be disruptive.
+- **Docker rule:** off. Turn it on to pause Docker Desktop on lid close when
+  no container is running. The local Desktop socket is asked once to pick
+  Docker up and once more right before the pause; a busy answer, a failed
+  `docker ps` or a timeout at either point leaves Docker running. A container
+  that starts between the second check and the pause is still paused with
+  Desktop, so leave the rule off for Docker workloads an unexpected pause
+  would hurt.
 - **Mute on close:** off.
 - **Display and keyboard backlight:** on ("Turn off the display and keyboard
   backlight" in Settings). Both values are saved to the journal before they
@@ -316,8 +340,24 @@ installation scenarios still need [release validation](docs/release-validation.m
   stopped. Verify the live process and whether it should be resumed; never
   blindly signal a PID from an old log.
 - **Identity is not an atomic guarantee:** the app checks start time to the
-  microsecond; the shell checks to the second. A lookup and a signal are still
-  separate operations.
+  microsecond, and the backstop asks the installed app binary
+  (`Insomnia --resume-frozen`) to do the same check and send the signal for
+  every entry that records microseconds, all such entries in one call with a
+  30-second limit. The entries go to the binary on standard input, so a long
+  journal cannot exceed the argument size limit. The backstop never signals those entries itself. It keeps
+  them when the binary is missing, does not finish in time, or answers
+  anything but one expected line per entry. It runs the binary only when the
+  installed bundle declares `InsomniaResumeFrozenVersion` in its
+  `Info.plist`, so it never starts an older build. The binary holds the
+  recovery lock while it can still send a signal and ends itself after the
+  same limit, so a backstop run that is killed mid-call leaves no helper
+  that could act later without the lock. `uninstall.sh` uses the backstop
+  installed with an app that does not declare that version. With no such
+  copy, the checkout's backstop keeps those entries and uninstall stops
+  before removing anything. Entries written by builds before
+  microseconds were recorded keep the one-second `ps` comparison in the
+  shell. A lookup and a signal are still separate operations, one pid at a
+  time.
 - **Stuck power commands:** a command that survives its timeout keeps the
   recovery lock until it exits. Other recovery attempts or new sessions wait
   or fail with a warning instead of running alongside it.
@@ -350,6 +390,30 @@ enter the hotspot SSID and password in Insomnia Settings. The password is
 stored in the login Keychain under service `insomnia-hotspot`. Insomnia uses
 CoreWLAN to find and join that network without putting the password in process
 arguments.
+
+The Keychain item's access list names only the build of Insomnia that saved
+it, and Insomnia reads it with Keychain prompts switched off, so a join during
+an outage never raises a dialog. The installer signs each build ad hoc, which
+gives every install a new identity: after a reinstall the saved password is
+unreadable by the new build. Insomnia then skips the join, shows "Hotspot
+password unreadable by this build" in the right-click menu and in Settings,
+and sends one notification per outage. The warning belongs to the SSID it was
+read for. Change the SSID and it goes, and Settings checks the new SSID's
+saved password instead. Enter the password again in Settings and save; the
+save writes the new password before it removes the old item,
+and macOS may ask you to allow Insomnia to delete the old one, or to unlock
+the login keychain. If that save is cut off after the old item is gone,
+the password reads as missing and you enter it once more: Insomnia never
+reads a half-finished save's copy. The Save button reads "Saving…" until
+macOS answers, and "Saved" only while the SSID and password fields still
+hold what was saved. A join that was waiting while you changed the SSID is
+dropped, and the next retry uses the new SSID. A Settings read that was
+waiting is dropped too, and Settings reads the new SSID's password instead.
+Anything you type in the password field while Settings is still loading the
+saved one stays, even if you delete it again. The rest of Insomnia,
+including the battery floor and End, keeps running while the dialog is open.
+A build signed with a stable identity would keep the item readable across
+upgrades.
 
 macOS requires Location Services permission to reveal network names. Insomnia
 requests it on the first hotspot save, or when starting a session with a
@@ -415,6 +479,21 @@ Lines the app writes to `insomnia.log` also go to the unified log with their
 bodies marked private, so `log show` and other local programs see `<private>`
 in place of the text unless private data logging is enabled on the Mac. The
 backstop's lines go only to `insomnia.log`, which keeps the full text of both.
+The files in Application Support/Insomnia and Logs/Insomnia (config, session,
+journal, recovery lock, the two logs) are owner-only, mode 0600 with those two
+directories 0700, and one left looser by an older build is tightened the next
+time the app or the backstop opens it. Insomnia sets only these modes and
+leaves any access control list (ACL) on these files and folders as it is, so
+an ACL someone added, or one inherited from a parent folder, can still give
+another account access (`ls -le` shows it). The LaunchAgent plist and the installed
+scripts hold no private data and keep the modes the installer gives them.
+`insomnia.log` and `handoffs.log` are capped at 1 MiB: a
+log past the cap is renamed to `insomnia.log.1` or `handoffs.log.1`,
+replacing the previous copy, and a new file starts. The cap does not apply
+to a log you replace with a symlink. Insomnia writes through the link and
+never rotates it, since the rename would move the link and not the file it
+points to, and it logs that once. You set up the link, so trimming the file
+it points to is up to you.
 
 `INSOMNIA_HOME` relocates app support files, logs, and LaunchAgents for testing.
 It is **not an installation sandbox**: installation/removal also involves the

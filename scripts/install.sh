@@ -119,56 +119,82 @@ command_line() { local line; line="$(printf '%q ' "$@")"; printf '%s' "${line% }
 
 # Run one external call with a time limit, so a call that stalls (a sudo
 # policy or directory-service lookup, a launchd that does not answer) cannot
-# keep this run, and the recovery lock it holds, waiting forever. Its
-# combined output is left in BOUNDED_OUTPUT (trailing newline removed) and
-# its exit status returned, or 124 when it did not finish within
-# CALL_TIMEOUT_SECONDS: it is then sent SIGTERM, and SIGKILL a second later
-# if it is still there. A supervising subshell waits for the call and writes
-# its status to a file; both run with fd 9 (the recovery lock) closed, so
-# nothing left behind by a stuck call holds the lock once this script exits.
+# keep this run waiting forever. Its combined output is left in
+# BOUNDED_OUTPUT (trailing newline removed) and its exit status returned, or
+# 124 when it did not finish within CALL_TIMEOUT_SECONDS and was stopped, or
+# 125 when it is sudo and still running (pid in BOUNDED_PID).
+#
+# supervise() starts the call in the background and enforces the limit
+# itself, so the limit holds even if this run is killed while it waits. At
+# the limit the call gets SIGTERM, and SIGKILL a second later if it is still
+# there. sudo only ever gets SIGTERM: killing sudo would orphan what it runs
+# as root. The supervisor and the call keep fd 9 (the recovery lock, once
+# this run holds it) until the call has exited, so no call made under the
+# lock outlives it: if this run is killed during a launchctl bootout, the
+# bootout is stopped and reaped before the lock goes, and cannot unload an
+# agent the app confirms after taking the lock. Every call but sudo is gone
+# by the limit plus about a second. A sudo that ignores SIGTERM keeps the
+# lock until it ends, as backstop.sh does with sudo pmset.
 # Each call's files get a name from mktemp, so a call made inside $(...)
 # cannot reuse another's.
 BOUNDED_OUTPUT=""
+BOUNDED_PID=""
 bounded() { # command args...
-  local base supervisor cpid rc i
+  local base supervisor rc i
   base="$("$MKTEMP" "$WORK/call.XXXXXX")"
   BOUNDED_OUTPUT=""
-  (
-    "$@" </dev/null >"$base.out" 2>&1 &
-    echo "$!" > "$base.pid"
-    rc=0
-    wait "$!" || rc=$?
-    echo "$rc" > "$base.rc"
-  ) </dev/null >/dev/null 2>&1 9>&- &
+  BOUNDED_PID=""
+  supervise "$base" "$@" </dev/null >/dev/null 2>&1 &
   supervisor=$!
-  for (( i = 0; i < CALL_TIMEOUT_SECONDS * 100; i++ )); do
-    if [[ -s "$base.rc" ]]; then break; fi
-    sleep 0.01
-  done
-  if [[ ! -s "$base.rc" ]]; then
-    cpid="$(cat "$base.pid" 2>/dev/null || true)"
-    if [[ -n "$cpid" ]]; then kill -TERM "$cpid" 2>/dev/null || true; fi
-    for (( i = 0; i < 10; i++ )); do
+  if [[ "$1" == "$SUDO" ]]; then
+    # The limit, then up to two seconds for sudo to stop on SIGTERM.
+    for (( i = 0; i < (CALL_TIMEOUT_SECONDS + 2) * 100; i++ )); do
       if [[ -s "$base.rc" ]]; then break; fi
-      sleep 0.1
+      sleep 0.01
     done
-    if [[ ! -s "$base.rc" && -n "$cpid" ]]; then
-      kill -KILL "$cpid" 2>/dev/null || true
-      for (( i = 0; i < 10; i++ )); do
-        if [[ -s "$base.rc" ]]; then break; fi
-        sleep 0.1
-      done
+    if [[ ! -s "$base.rc" ]]; then
+      BOUNDED_PID="$(cat "$base.pid" 2>/dev/null || true)"
+      return 125
     fi
-    # Reap the supervisor once it has written the status; one that is
-    # still waiting on an unkillable call is left behind without the lock.
-    if [[ -s "$base.rc" ]]; then wait "$supervisor" 2>/dev/null || true; fi
-    return 124
   fi
-  read -r rc < "$base.rc"
+  # Any other call is killed a second after the limit, so this wait ends.
   wait "$supervisor" 2>/dev/null || true
+  rc=124
+  if [[ -s "$base.rc" ]]; then read -r rc < "$base.rc"; fi
   IFS= read -r -d '' BOUNDED_OUTPUT < "$base.out" || true
   BOUNDED_OUTPUT="${BOUNDED_OUTPUT%$'\n'}"
   return "$rc"
+}
+# The supervising process of one bounded() call; it runs in the background.
+# The call is its only job, so `kill %1` signals the call, and the shell
+# skips a job it has already reaped: a reused pid is never signalled. The
+# status file is written once the call has been reaped.
+supervise() { # base command args...
+  local base="$1" cpid rc=0 i
+  shift
+  "$@" </dev/null >"$base.out" 2>&1 &
+  cpid=$!
+  echo "$cpid" > "$base.pid"
+  for (( i = 0; i < CALL_TIMEOUT_SECONDS * 100; i++ )); do
+    kill -0 "$cpid" 2>/dev/null || break
+    sleep 0.01
+  done
+  # At the limit, and the shell has not reaped the call: it is still there.
+  if (( i == CALL_TIMEOUT_SECONDS * 100 )) && [[ -n "$(jobs -rp)" ]]; then
+    kill -TERM %1 2>/dev/null || true
+    if [[ "$1" != "$SUDO" ]]; then
+      for (( i = 0; i < 100; i++ )); do
+        if [[ -z "$(jobs -rp)" ]]; then break; fi
+        sleep 0.01
+      done
+      if [[ -n "$(jobs -rp)" ]]; then kill -KILL %1 2>/dev/null || true; fi
+    fi
+    wait "$cpid" 2>/dev/null || true
+    echo 124 > "$base.rc"
+    return
+  fi
+  wait "$cpid" || rc=$?
+  echo "$rc" > "$base.rc"
 }
 # How a bounded call's exit status reads in a message.
 call_result() { # status
@@ -232,13 +258,18 @@ move_bundle() { # from to
 
 # Whether sudo grants the four pmset commands of the rule without a
 # password: 0 when it does, 124 when a check did not answer within
-# CALL_TIMEOUT_SECONDS, 1 otherwise. `sudo -n -l <command>` checks the rule
-# without running pmset (nothing on the machine changes).
+# CALL_TIMEOUT_SECONDS and stopped on SIGTERM, 125 when it did not stop and
+# is still running (BOUNDED_PID), 1 otherwise. `sudo -n -l <command>` checks
+# the rule without running pmset (nothing on the machine changes).
 pmset_rule_check() { # pmset arguments
   local rc=0
   bounded "$SUDO" -n -l /usr/bin/pmset "$@" || rc=$?
-  if (( rc == 0 || rc == 124 )); then return "$rc"; fi
+  if (( rc == 0 || rc == 124 || rc == 125 )); then return "$rc"; fi
   return 1
+}
+# The part of a message about a sudo check that is still running.
+sudo_alive_note() {
+  printf "It was sent SIGTERM and is still running as pid %s. It is not killed, because killing sudo could leave what it runs as root behind" "${BOUNDED_PID:-?}"
 }
 pmset_rule_effective() {
   pmset_rule_check -a disablesleep 1 \
@@ -403,6 +434,9 @@ if (( rule_rc == 0 )); then
 elif (( rule_rc == 124 )); then
   echo "'sudo -n -l', which checks the rule, did not answer within ${CALL_TIMEOUT_SECONDS}s, so the rule in $SUDOERS is not verified. The app (with backstop.sh) and the LaunchAgent were not touched; rerun once sudo answers." >&2
   exit 1
+elif (( rule_rc == 125 )); then
+  echo "'sudo -n -l', which checks the rule, did not answer within ${CALL_TIMEOUT_SECONDS}s, so the rule in $SUDOERS is not verified. $(sudo_alive_note). The app (with backstop.sh) and the LaunchAgent were not touched; rerun once it has ended (or stop it with 'sudo kill ${BOUNDED_PID:-<pid>}')." >&2
+  exit 1
 else
   echo "'sudo -n pmset' is still not permitted; check $SUDOERS. The app (with backstop.sh) and the LaunchAgent were not touched." >&2
   exit 1
@@ -433,6 +467,10 @@ fi
 mkdir -p "$APP_DIR"
 STAGE="$("$MKTEMP" -d "$APP_DIR/.Insomnia.app.staging.$$.XXXXXX")"
 NEW_APP="$STAGE/Insomnia.app"
+# The bundle is copied here whole and reaches $APP in one rename under the
+# recovery lock (step 5), so backstop.sh never sees this binary beside an
+# older Info.plist or the reverse (it runs the binary's --resume-frozen mode
+# only once Info.plist declares InsomniaResumeFrozenVersion).
 # ditto keeps the signature's resource seal and every attribute intact (a
 # downloaded bundle keeps its quarantine flag; Gatekeeper decides at launch).
 "$DITTO" "$SOURCE_APP" "$NEW_APP"
@@ -496,8 +534,9 @@ if (( lock_rc != 0 )); then
   exit 75
 fi
 # From here on every sudo, pgrep, launchctl and codesign call goes through
-# bounded(): one that stalls ends this run, which lets go of the lock, so
-# the app and the agent's backstop can take it again and undo a session.
+# bounded(): one that stalls is stopped and ends this run, which lets go of
+# the lock, so the app and the agent's backstop can take it again and undo a
+# session. A sudo that does not stop on SIGTERM keeps the lock until it ends.
 # A pgrep that cannot answer does not say the app is gone, so the run stops.
 pgrep_rc=0
 bounded "$PGREP" -x Insomnia || pgrep_rc=$?
@@ -520,11 +559,24 @@ if (( rule_rc == 124 )); then
   cat >&2 <<FAIL
 
 Install stopped: 'sudo -n -l', which checks the rule in $SUDOERS again now that
-this run holds the recovery lock, did not answer within ${CALL_TIMEOUT_SECONDS}s. The check was
-stopped and this run exits, which lets go of the lock, so the app and the
-LaunchAgent's backstop can take it again and undo a session left over. The app
-at $APP and the LaunchAgent were not touched; the new build was discarded.
+this run holds the recovery lock, did not answer within ${CALL_TIMEOUT_SECONDS}s. The check
+stopped on SIGTERM and this run exits, which lets go of the lock, so the app and
+the LaunchAgent's backstop can take it again and undo a session left over. The
+app at $APP and the LaunchAgent were not touched; the new build was discarded.
 Rerun this script once sudo answers.
+FAIL
+  exit 1
+elif (( rule_rc == 125 )); then
+  cat >&2 <<FAIL
+
+Install stopped: 'sudo -n -l', which checks the rule in $SUDOERS again now that
+this run holds the recovery lock, did not answer within ${CALL_TIMEOUT_SECONDS}s. $(sudo_alive_note).
+It keeps the recovery lock until it ends, so until then the app cannot start a
+session and the LaunchAgent's backstop cannot undo one. If it does not end by
+itself, stop it:
+  sudo kill ${BOUNDED_PID:-<pid>}
+The app at $APP and the LaunchAgent were not touched; the new build was
+discarded. Rerun this script once it has ended.
 FAIL
   exit 1
 elif (( rule_rc != 0 )); then
