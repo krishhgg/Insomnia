@@ -67,16 +67,21 @@ final class BackstopVersionTests: XCTestCase {
         }
     }
 
-    /// The launchd scheduler checks the script its agent runs.
+    /// The launchd scheduler checks the script its agent runs: the copy
+    /// sealed in the bundle it pins.
     func testLaunchdBackstopChecksTheScriptItsAgentRuns() throws {
         let home = TempHome()
         defer { home.destroy() }
-        let backstop = LaunchdBackstop(paths: home.paths, run: { _, _ in ShellResult(status: 0, stdout: "", stderr: "") })
+        let bundle = home.paths.appBundle
+        let script = Paths.backstopScript(inBundle: bundle)
+        let backstop = LaunchdBackstop(paths: home.paths, bundle: bundle, run: { _, _ in ShellResult(status: 0, stdout: "", stderr: "") })
+        XCTAssertEqual(backstop.scriptPath, script.path)
         XCTAssertThrowsError(try backstop.checkVoidsPrompts())
-        try "#!/bin/bash\n# insomnia-backstop-version: 1\n".write(to: home.paths.backstopScript, atomically: true, encoding: .utf8)
+        try FileManager.default.createDirectory(at: script.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try "#!/bin/bash\n# insomnia-backstop-version: 1\n".write(to: script, atomically: true, encoding: .utf8)
         XCTAssertThrowsError(try backstop.checkVoidsPrompts())
-        try FileManager.default.removeItem(at: home.paths.backstopScript)
-        try FileManager.default.copyItem(at: repoBackstop, to: home.paths.backstopScript)
+        try FileManager.default.removeItem(at: script)
+        try FileManager.default.copyItem(at: repoBackstop, to: script)
         XCTAssertNoThrow(try backstop.checkVoidsPrompts())
     }
 }
