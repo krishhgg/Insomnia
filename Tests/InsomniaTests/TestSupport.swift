@@ -1059,7 +1059,7 @@ enum RootSudoPolicy: String {
 /// it reads `start` until the restore check's `pmset -a disablesleep 0`
 /// has run, and `afterRestore` from then on, as if the check took that
 /// long. No wall clock is involved.
-struct FakeClock {
+struct RootCommandClock {
     let start: Int
     let afterRestore: Int
 }
@@ -1111,7 +1111,7 @@ func appleScriptQuotedForm(_ s: String) -> String {
 /// exists), so a test can act while the command holds the marker's lock.
 /// `command` is `AdministratorPrompt.rootCommand` unless given (a test
 /// passes the copy embedded in the AppleScript). With `clock`, `/bin/date`
-/// is replaced by a fake that reads it (FakeClock).
+/// is replaced by a fake that reads it (RootCommandClock).
 final class RootCommandProcess {
     private let process = Process()
     private let childExit: ProcessExit
@@ -1123,7 +1123,7 @@ final class RootCommandProcess {
     private let fakePmset: URL
     private let fakeSudo: URL
 
-    init(marker: URL, nonce: String, deadline: String? = nil, uid: String? = nil, policy: RootSudoPolicy = .rule, command: String = AdministratorPrompt.rootCommand, clock: FakeClock? = nil, in dir: URL, holdPmset: Bool = false, holdAt: String = "-a disablesleep 1") throws {
+    init(marker: URL, nonce: String, deadline: String? = nil, uid: String? = nil, policy: RootSudoPolicy = .rule, command: String = AdministratorPrompt.rootCommand, clock: RootCommandClock? = nil, in dir: URL, holdPmset: Bool = false, holdAt: String = "-a disablesleep 1") throws {
         let fake = dir.appendingPathComponent("fake-pmset")
         let fakeDate = dir.appendingPathComponent("fake-date")
         let clockFile = dir.appendingPathComponent("fake-clock")
@@ -1195,7 +1195,9 @@ final class RootCommandProcess {
             cat "$FAKE_CLOCK_FILE"
             """.write(to: fakeDate, atomically: true, encoding: .utf8)
         }
-        for url in clock == nil ? [fake, sudo] : [fake, sudo, fakeDate] {
+        var executables = [fake, sudo]
+        if clock != nil { executables.append(fakeDate) }
+        for url in executables {
             try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
         }
 
@@ -1322,7 +1324,7 @@ func waitUntilLockfWaits(under pid: pid_t) -> Bool {
 }
 
 /// Runs the root command to the end (see RootCommandProcess).
-func runRootCommand(marker: URL, nonce: String, deadline: String? = nil, uid: String? = nil, policy: RootSudoPolicy = .rule, command: String = AdministratorPrompt.rootCommand, clock: FakeClock? = nil, in dir: URL) throws -> RootCommandRun {
+func runRootCommand(marker: URL, nonce: String, deadline: String? = nil, uid: String? = nil, policy: RootSudoPolicy = .rule, command: String = AdministratorPrompt.rootCommand, clock: RootCommandClock? = nil, in dir: URL) throws -> RootCommandRun {
     try RootCommandProcess(marker: marker, nonce: nonce, deadline: deadline, uid: uid, policy: policy, command: command, clock: clock, in: dir).wait()
 }
 

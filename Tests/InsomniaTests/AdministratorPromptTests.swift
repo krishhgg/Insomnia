@@ -513,7 +513,7 @@ final class RootCommandTests: XCTestCase {
         return try runRootCommand(
             marker: marker, nonce: "nonce-1", deadline: String(fakeDeadline), policy: policy,
             command: appleScriptEmbeddedRootCommand(),
-            clock: FakeClock(start: fakeDeadline - 100, afterRestore: afterRestore), in: dir)
+            clock: RootCommandClock(start: fakeDeadline - 100, afterRestore: afterRestore), in: dir)
     }
 
     /// Control: a restore check that ends a second before the deadline
