@@ -1055,6 +1055,42 @@ enum RootSudoPolicy: String {
     case noRootEntry
 }
 
+/// A clock for the root command's `/bin/date +%s` (RootCommandProcess):
+/// it reads `start` until the restore check's `pmset -a disablesleep 0`
+/// has run, and `afterRestore` from then on, as if the check took that
+/// long. No wall clock is involved.
+struct FakeClock {
+    let start: Int
+    let afterRestore: Int
+}
+
+/// The root command as `AdministratorPrompt.disableSleepScript` embeds it:
+/// the AppleScript string after `/bin/sh -c " & quoted form of `, with
+/// AppleScript's `\"` and `\\` read back. This is the text osascript passes
+/// to `/bin/sh -c`.
+func appleScriptEmbeddedRootCommand() throws -> String {
+    let script = AdministratorPrompt.disableSleepScript
+    let opening = "\" /bin/sh -c \" & quoted form of \""
+    guard let start = script.range(of: opening)?.upperBound else {
+        throw NSError(domain: "appleScriptEmbeddedRootCommand", code: 1, userInfo: [NSLocalizedDescriptionKey: "no quoted root command in the script"])
+    }
+    var command = ""
+    var escaped = false
+    for ch in script[start...] {
+        if escaped {
+            command.append(ch)
+            escaped = false
+        } else if ch == "\\" {
+            escaped = true
+        } else if ch == "\"" {
+            return command
+        } else {
+            command.append(ch)
+        }
+    }
+    throw NSError(domain: "appleScriptEmbeddedRootCommand", code: 2, userInfo: [NSLocalizedDescriptionKey: "the quoted root command never ends"])
+}
+
 /// AppleScript's `quoted form of`: single quotes, each `'` as `'\''`.
 func appleScriptQuotedForm(_ s: String) -> String {
     "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
@@ -1073,6 +1109,9 @@ func appleScriptQuotedForm(_ s: String) -> String {
 /// on the machine. With `holdPmset` the fake pmset, once called with
 /// `holdAt`, waits until `release()` (60 s at most, and only while `dir`
 /// exists), so a test can act while the command holds the marker's lock.
+/// `command` is `AdministratorPrompt.rootCommand` unless given (a test
+/// passes the copy embedded in the AppleScript). With `clock`, `/bin/date`
+/// is replaced by a fake that reads it (FakeClock).
 final class RootCommandProcess {
     private let process = Process()
     private let childExit: ProcessExit
@@ -1084,8 +1123,10 @@ final class RootCommandProcess {
     private let fakePmset: URL
     private let fakeSudo: URL
 
-    init(marker: URL, nonce: String, deadline: String? = nil, uid: String? = nil, policy: RootSudoPolicy = .rule, in dir: URL, holdPmset: Bool = false, holdAt: String = "-a disablesleep 1") throws {
+    init(marker: URL, nonce: String, deadline: String? = nil, uid: String? = nil, policy: RootSudoPolicy = .rule, command: String = AdministratorPrompt.rootCommand, clock: FakeClock? = nil, in dir: URL, holdPmset: Bool = false, holdAt: String = "-a disablesleep 1") throws {
         let fake = dir.appendingPathComponent("fake-pmset")
+        let fakeDate = dir.appendingPathComponent("fake-date")
+        let clockFile = dir.appendingPathComponent("fake-clock")
         let sudo = dir.appendingPathComponent("root-sudo")
         fakePmset = fake
         fakeSudo = sudo
@@ -1097,6 +1138,9 @@ final class RootCommandProcess {
         try """
         #!/bin/bash
         printf '%s\\n' "$*" >> "$FAKE_PMSET_CALLS"
+        if [[ -n "${FAKE_CLOCK_AFTER_RESTORE:-}" && "$*" == "-a disablesleep 0" ]]; then
+          printf '%s\\n' "$FAKE_CLOCK_AFTER_RESTORE" > "$FAKE_CLOCK_FILE"
+        fi
         if [[ "$*" == "$FAKE_PMSET_WATCH" ]]; then
           : > "$FAKE_PMSET_STARTED"
           if [[ -n "${FAKE_PMSET_HOLD:-}" ]]; then
@@ -1143,13 +1187,27 @@ final class RootCommandProcess {
         echo "sudo: a password is required" >&2
         exit 1
         """.write(to: sudo, atomically: true, encoding: .utf8)
-        for url in [fake, sudo] {
+        if let clock {
+            try "\(clock.start)\n".write(to: clockFile, atomically: true, encoding: .utf8)
+            try """
+            #!/bin/bash
+            [[ "$*" == +%s ]] || { echo "fake date: unexpected arguments $*" >&2; exit 2; }
+            cat "$FAKE_CLOCK_FILE"
+            """.write(to: fakeDate, atomically: true, encoding: .utf8)
+        }
+        for url in clock == nil ? [fake, sudo] : [fake, sudo, fakeDate] {
             try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
         }
 
         let realPmset = "/usr/bin/pmset"
         let realSudo = "/usr/bin/sudo"
-        let command = AdministratorPrompt.rootCommand
+        let realDate = "/bin/date"
+        var command = command
+        if clock != nil {
+            XCTAssertTrue(command.contains(realDate), "the command reads the clock through /bin/date")
+            XCTAssertFalse(fakeDate.path.contains(" "), "the fake replaces an unquoted word")
+            command = command.replacingOccurrences(of: realDate, with: fakeDate.path)
+        }
         XCTAssertEqual(command.components(separatedBy: realPmset).count - 1, 2, "the command calls pmset twice, the restore check and the change, by absolute path")
         XCTAssertEqual(command.components(separatedBy: realSudo).count - 1, 2, "root's sudo to the user, and the user's sudo, by absolute path")
         XCTAssertFalse(fake.path.contains(" ") || sudo.path.contains(" "), "the fakes replace unquoted words")
@@ -1166,6 +1224,8 @@ final class RootCommandProcess {
         env["FAKE_PMSET_STARTED"] = started.path
         env["FAKE_PMSET_WATCH"] = holdAt
         env["FAKE_PMSET_HOLD"] = holdPmset ? releaseFile.path : ""
+        env["FAKE_CLOCK_FILE"] = clockFile.path
+        env["FAKE_CLOCK_AFTER_RESTORE"] = clock.map { String($0.afterRestore) } ?? ""
         env.removeValue(forKey: "FAKE_SUDO_AS")
         process.environment = env
         process.standardInput = FileHandle.nullDevice
@@ -1262,8 +1322,8 @@ func waitUntilLockfWaits(under pid: pid_t) -> Bool {
 }
 
 /// Runs the root command to the end (see RootCommandProcess).
-func runRootCommand(marker: URL, nonce: String, deadline: String? = nil, uid: String? = nil, policy: RootSudoPolicy = .rule, in dir: URL) throws -> RootCommandRun {
-    try RootCommandProcess(marker: marker, nonce: nonce, deadline: deadline, uid: uid, policy: policy, in: dir).wait()
+func runRootCommand(marker: URL, nonce: String, deadline: String? = nil, uid: String? = nil, policy: RootSudoPolicy = .rule, command: String = AdministratorPrompt.rootCommand, clock: FakeClock? = nil, in dir: URL) throws -> RootCommandRun {
+    try RootCommandProcess(marker: marker, nonce: nonce, deadline: deadline, uid: uid, policy: policy, command: command, clock: clock, in: dir).wait()
 }
 
 /// Holds an flock(2) lock on `url` from this process, the way the root

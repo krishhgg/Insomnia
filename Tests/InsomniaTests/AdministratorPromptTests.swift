@@ -495,22 +495,57 @@ final class RootCommandTests: XCTestCase {
         }
     }
 
-    /// The restore check can be slow (sudo may wait on a directory
-    /// service). A session that ends while it runs gets nothing turned
-    /// off: the clock is compared again before `disablesleep 1`, and the
-    /// only pmset that ran is the restore the undo runs anyway.
-    func testDoesNothingWhenTheSessionEndsDuringTheRestoreCheck() throws {
+    /// The command the AppleScript literal hands to `/bin/sh -c`, read back
+    /// from it, is `rootCommand` exactly. The clock tests below run that
+    /// embedded copy.
+    func testTheAppleScriptEmbedsTheRootCommandUnchanged() throws {
+        XCTAssertEqual(try appleScriptEmbeddedRootCommand(), AdministratorPrompt.rootCommand)
+    }
+
+    /// A deadline far from the real clock, so a read that missed the fake
+    /// clock would show.
+    private let fakeDeadline = 2_000_000_100
+
+    /// The embedded command, started 100 s before `fakeDeadline` on a fake
+    /// clock that reads `afterRestore` once the restore check has run.
+    private func runOnFakeClock(afterRestore: Int, policy: RootSudoPolicy = .rule) throws -> RootCommandRun {
         try Data("nonce-1".utf8).write(to: marker)
-        let deadline = Int(Date().timeIntervalSince1970) + 5
-        let command = try RootCommandProcess(marker: marker, nonce: "nonce-1", deadline: String(deadline), in: dir, holdPmset: true, holdAt: "-a disablesleep 0")
-        XCTAssertTrue(command.waitUntilPmsetRuns(), "the restore check never ran")
-        while Int(Date().timeIntervalSince1970) < deadline { usleep(50_000) }
-        command.release()
-        let r = command.wait()
-        XCTAssertEqual(r.status, 4, r.stderr)
+        return try runRootCommand(
+            marker: marker, nonce: "nonce-1", deadline: String(fakeDeadline), policy: policy,
+            command: appleScriptEmbeddedRootCommand(),
+            clock: FakeClock(start: fakeDeadline - 100, afterRestore: afterRestore), in: dir)
+    }
+
+    /// Control: a restore check that ends a second before the deadline
+    /// turns sleep off after it.
+    func testTurnsSleepOffWhenTheRestoreCheckEndsBeforeTheDeadline() throws {
+        let r = try runOnFakeClock(afterRestore: fakeDeadline - 1)
+        XCTAssertEqual(r.status, 0, r.stderr)
         XCTAssertEqual(r.sudoCalls, restoreCheck)
-        XCTAssertEqual(r.pmsetCalls, ["-a disablesleep 0"], "the restore ran, disablesleep 1 did not")
-        XCTAssertTrue(r.stderr.contains("the session this password was for ended while the restore was checked; sleep was not turned off"), r.stderr)
+        XCTAssertEqual(r.pmsetCalls, ["-a disablesleep 0", "-a disablesleep 1"])
+    }
+
+    /// The restore check can be slow (sudo may wait on a directory
+    /// service). When the session's end comes while it runs, at the very
+    /// second of the deadline or after it, nothing is turned off: the only
+    /// pmset that ran is the restore, which the start's undo runs anyway.
+    func testDoesNothingWhenTheRestoreCheckEndsAtOrAfterTheDeadline() throws {
+        for afterRestore in [fakeDeadline, fakeDeadline + 1, fakeDeadline + 86_400] {
+            let r = try runOnFakeClock(afterRestore: afterRestore)
+            XCTAssertEqual(r.status, 4, "\(afterRestore): \(r.stderr)")
+            XCTAssertEqual(r.sudoCalls, restoreCheck, "\(afterRestore)")
+            XCTAssertEqual(r.pmsetCalls, ["-a disablesleep 0"], "the restore ran, disablesleep 1 did not: \(afterRestore)")
+            XCTAssertTrue(r.stderr.contains("the session this password was for ended while the restore was checked; sleep was not turned off"), r.stderr)
+        }
+    }
+
+    /// A restore check that fails is still exit 5, on the same clock.
+    func testAFailedRestoreCheckStillExitsFiveOnTheFakeClock() throws {
+        let r = try runOnFakeClock(afterRestore: fakeDeadline - 1, policy: .noRule)
+        XCTAssertEqual(r.status, 5, r.stderr)
+        XCTAssertEqual(r.sudoCalls, restoreCheck)
+        XCTAssertEqual(r.pmsetCalls, [])
+        XCTAssertTrue(r.stderr.contains("turning sleep back on needs a password, so sleep was not turned off"), r.stderr)
     }
 
     /// A deadline that is not a plain number fails the comparison, which
