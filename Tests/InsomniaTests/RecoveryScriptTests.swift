@@ -2741,6 +2741,31 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(try onlyFrozenEntry()?["pid"] as? Int, 5309, "the killed run published nothing")
     }
 
+    /// A binary that does not answer, with every poll the script makes a
+    /// quarter second slower (see slowPollingPath). Its 4 s limit is read
+    /// from bash's SECONDS clock, so it gets SIGTERM up to a second and a
+    /// slow poll after the limit, and the run is over long before polls
+    /// counted ten a second (about 16 s here) would have sent it.
+    func testAppBinaryThatDoesNotAnswerIsStoppedOnTimeWhenEveryPollIsSlow() throws {
+        try writeMicrosecondEntry(pid: 5311, started: 1_789_388_423, micros: 11)
+        fx.setMode("insomnia", "hang")
+
+        let started = Date()
+        let r = try fx.run(try backstop(commandTimeout: 4), extraEnvironment: ["PATH": try fx.slowPollingPath()])
+        let elapsed = Date().timeIntervalSince(started)
+
+        XCTAssertNotEqual(r.status, 0)
+        XCTAssertGreaterThan(fx.slowPolls(), 0, "the script polled through the slow sleep")
+        XCTAssertGreaterThan(elapsed, 4, "the binary had its whole limit")
+        XCTAssertLessThan(elapsed, 9, "4 s, up to a second and a slow poll late, and the slow poll that sees it end")
+        XCTAssertEqual(fx.calls(), ["Insomnia --resume-frozen 5 < 5311 1789388423 11 \(fx.bootUUID)"])
+        XCTAssertEqual(try onlyFrozenEntry()?["pid"] as? Int, 5311)
+        XCTAssertTrue(try fx.lockIsFree())
+        let log = fx.log()
+        XCTAssertTrue(log.contains("did not answer within 4s; sent SIGTERM, and it ended (wait status 143)"), log)
+        XCTAssertFalse(log.contains("SIGKILL"), log)
+    }
+
     /// The binary of an older build has no --resume-frozen mode and would
     /// start the menu bar app. The backstop runs the binary only when the
     /// bundle's Info.plist declares the interface version it speaks;
@@ -2893,7 +2918,7 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(fx.exists(fx.session))
         XCTAssertTrue(try fx.lockIsFree(), "a timed-out child must not keep the recovery lock")
         let log = fx.log()
-        XCTAssertTrue(log.contains("did not finish within 1s"), log)
+        XCTAssertTrue(log.contains("did not finish within 1s; terminated with SIGTERM"), log)
         XCTAssertTrue(log.contains("journal kept dirty"), log)
     }
 
@@ -3092,6 +3117,226 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(after.status, 0, after.stderr + fx.log())
         XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, false)
         XCTAssertEqual(fx.calls(), ["sudo -n \(fx.fakePmset) -a disablesleep 0"], "the retry runs in its own transaction")
+    }
+
+    /// A command's supervisor writes its status only after it has reaped
+    /// the command, so until the status is there the call's .pid file can
+    /// name a pid the kernel has already given to another process. The fake
+    /// sudo exits at once, after writing the pid of a sentinel this test
+    /// started into its call's .pid file and putting a FIFO where the status
+    /// goes, so the supervisor's status write waits until the test opens
+    /// it. The run must not signal the sentinel, whatever the .pid file
+    /// says, and with no status in time it stops the transaction: journal
+    /// and session kept, no second undo. The supervisor holds the lock until
+    /// it has written its status. The sentinel is a /bin/sleep this test
+    /// posix_spawned and reaps only at the end, so its pid stays its own.
+    func testALateStatusNeverLeadsToSignalingThePidInTheStatusFiles() throws {
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":true,"frozenProcesses":[],"dockerFrozen":false}"#)
+        let sentinelScript = fx.root.appendingPathComponent("sentinel.sh")
+        try "exec /bin/sleep 120\n".write(to: sentinelScript, atomically: true, encoding: .utf8)
+        let sentinel = try fx.spawn(sentinelScript)
+        defer {
+            _ = sentinel.signal(SIGTERM)
+            sentinel.wait()
+        }
+        try String(sentinel.pid).write(to: fx.root.appendingPathComponent("sentinel.pid"), atomically: true, encoding: .utf8)
+        fx.setMode("sudo", "status-delayed")
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 1, r.stderr + fx.log())
+        XCTAssertFalse(sentinel.hasExited, "the pid read from the .pid file was signaled")
+        XCTAssertEqual(fx.calls(), ["sudo -n \(fx.fakePmset) -a disablesleep 0", "sudo STATUS-DELAYED"], "no second undo")
+        let s = try fx.stateJSON()
+        XCTAssertEqual(s["sleepDisabledByUs"] as? Bool, true)
+        XCTAssertEqual(s["lowPowerSetByUs"] as? Bool, true)
+        XCTAssertTrue(fx.exists(fx.session))
+        let log = fx.log()
+        XCTAssertTrue(log.contains("(pid \(sentinel.pid)): its supervisor reported no result within 6s"), "the pid is only logged: \(log)")
+        XCTAssertTrue(log.contains("recovery stopped"), log)
+        XCTAssertFalse(try fx.lockIsFree(), "the supervisor has not written its status yet, so it still holds the lock")
+
+        XCTAssertEqual(Array(fx.drainStatusFIFOs(within: 5).values), ["exit 0\n"], "the supervisor writes the status it got from wait")
+        XCTAssertTrue(try fx.waitUntilLockIsFree(5), "the supervisor lets go of the lock once its status is written")
+        XCTAssertFalse(sentinel.hasExited)
+
+        fx.setMode("sudo", "ok")
+        fx.clearCalls()
+        let after = try fx.run(fx.backstop)
+        XCTAssertEqual(after.status, 0, after.stderr + fx.log())
+        XCTAssertEqual(fx.calls(), ["sudo -n \(fx.fakePmset) -a disablesleep 0", "sudo -n \(fx.fakePmset) -b lowpowermode 0"])
+        XCTAssertEqual(try fx.backstopFiles(), [], "the next run that took the lock itself removed the stopped call's files")
+    }
+
+    /// A power command that ignores SIGTERM, with every poll the script and
+    /// its supervisor make a quarter second slower (see slowPollingPath).
+    /// The supervisor reads its 4 s limit and its 1 s grace from bash's
+    /// SECONDS clock: the command gets one SIGTERM, after its whole limit,
+    /// and the run reports it still running after the grace. Each wait can
+    /// end up to a second and a slow poll late. Counted in polls (ten a
+    /// second) the two took about 20 s here.
+    func testALiveCommandIsReportedOnTimeWhenEveryPollIsSlow() throws {
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":true,"frozenProcesses":[],"dockerFrozen":false}"#)
+        fx.setMode("sudo", "logs-term")
+
+        let started = Date()
+        let r = try fx.run(try backstop(commandTimeout: 4), extraEnvironment: ["PATH": try fx.slowPollingPath()])
+        let elapsed = Date().timeIntervalSince(started)
+
+        XCTAssertEqual(r.status, 1, r.stderr + fx.log())
+        XCTAssertGreaterThan(fx.slowPolls(), 0, "the script polled through the slow sleep")
+        XCTAssertGreaterThan(elapsed, 5, "the command had its whole 4 s limit and the 1 s grace")
+        XCTAssertLessThan(elapsed, 12, "4 s and 1 s, up to a second and a slow poll late each, and the run's own slow poll")
+        XCTAssertEqual(fx.calls().filter { $0 == "sudo SIGTERM" }.count, 1, "\(fx.calls())")
+        XCTAssertEqual(fx.calls().filter { $0.hasPrefix("sudo -n") }, ["sudo -n \(fx.fakePmset) -a disablesleep 0"], "no second undo")
+        XCTAssertNil(fx.commandEnded(), "never SIGKILLed")
+        XCTAssertFalse(try fx.lockIsFree())
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, true)
+        let log = fx.log()
+        XCTAssertTrue(log.contains("did not finish within 4s and did not stop on SIGTERM"), log)
+        XCTAssertTrue(log.contains("recovery stopped"), log)
+
+        fx.releaseCommand()
+        XCTAssertTrue(try fx.waitUntilLockIsFree(10))
+        XCTAssertEqual(fx.commandEnded(), "released")
+        XCTAssertTrue(fx.log().contains("left running after SIGTERM, has exited (wait status 0)"), fx.log())
+    }
+
+    /// The supervisor works alone once its run is gone. The fake sudo closes
+    /// its fd 9, as sudo does, logs every SIGTERM and SIGHUP it gets and
+    /// keeps running. The test kills the backstop shell with SIGKILL while
+    /// it waits for the command, then sends SIGTERM, SIGHUP and SIGINT to
+    /// the shell's whole process group, the way launchd signals what is
+    /// left of a job's process group once the job has exited. The supervisor
+    /// survives that, sends the command its own SIGTERM at the 3 s limit
+    /// (never SIGKILL), and keeps the recovery lock until the command has
+    /// exited and been reaped. What this test signals is the shell it
+    /// posix_spawned as the leader of a new process group, and that group,
+    /// before reaping the shell: until then neither the pid nor the group
+    /// id can name another process.
+    func testTheSupervisorOutlivesItsRunAndGroupSignalsAndHoldsTheLockUntilItReapsTheCommand() throws {
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":true,"frozenProcesses":[],"dockerFrozen":false}"#)
+        fx.setMode("sudo", "drops-fd9-logs-signals")
+
+        let shell = try fx.spawn(try backstop(commandTimeout: 3), ownProcessGroup: true)
+        defer {
+            fx.releaseCommand()
+            shell.wait()
+        }
+        guard let command = fx.hungPid("sudo", within: 10) else {
+            _ = shell.signal(SIGKILL)
+            return XCTFail("the command never started: \(fx.calls()) \(fx.log())")
+        }
+        guard !shell.hasExited else {
+            return XCTFail("the backstop ended before the test could kill it (wait status \(shell.wait())): \(fx.log())")
+        }
+        XCTAssertEqual(shell.signal(SIGKILL), 0)
+        for sig in [SIGTERM, SIGHUP, SIGINT] {
+            XCTAssertEqual(shell.signalGroup(sig), 0, "signal \(sig)")
+        }
+        let status = shell.wait()
+        XCTAssertEqual(status & 0x7f, SIGKILL, "the backstop did not end by SIGKILL (wait status \(status))")
+
+        XCTAssertTrue(waitUntil(15) { self.fx.calls().filter { $0 == "sudo SIGTERM" }.count == 2 },
+                      "one SIGTERM from the group, one from the supervisor at the limit: \(fx.calls())")
+        XCTAssertTrue(waitUntil(10) { self.statusLines() == ["alive"] }, "the supervisor reached the end of the grace: \(self.statusLines())")
+        XCTAssertEqual(fx.calls().filter { $0 == "sudo SIGTERM" }.count, 2, "\(fx.calls())")
+        XCTAssertEqual(fx.calls().filter { $0 == "sudo SIGHUP" }.count, 1, "\(fx.calls())")
+        XCTAssertEqual(fx.calls().filter { !$0.hasPrefix("sudo SIG") }, ["sudo -n \(fx.fakePmset) -a disablesleep 0"],
+                       "the command had closed fd 9, and nothing else ran")
+        XCTAssertNil(fx.commandEnded(), "never SIGKILLed")
+        XCTAssertFalse(try fx.lockIsFree(), "the supervisor still holds the lock for its live command")
+
+        fx.releaseCommand()
+        try assertLockHeldUntilGone(command, within: 10)
+        XCTAssertEqual(fx.commandEnded(), "released")
+        XCTAssertTrue(fx.log().contains("left running after SIGTERM, has exited"), fx.log())
+        let s = try fx.stateJSON()
+        XCTAssertEqual(s["sleepDisabledByUs"] as? Bool, true, "the killed run published nothing")
+        XCTAssertEqual(s["lowPowerSetByUs"] as? Bool, true)
+    }
+
+    /// The supervisor ignores SIGTERM and SIGHUP, and a child inherits
+    /// ignored signals, but the command must not: SIGTERM at its limit has
+    /// to be able to stop it. The fake checks both from a shell that
+    /// inherits its signal actions (see "signals-self"). As a check on the
+    /// check, a backstop started with SIGTERM already ignored, which no
+    /// launchd job is, cannot give the command the default back (bash keeps
+    /// a signal ignored at its start ignored), and the fake sees that.
+    func testTheUndoCommandStopsOnSigtermAndSighupThoughItsSupervisorIgnoresThem() throws {
+        fx.setMode("sudo", "signals-self")
+        for ignoringTerm in [false, true] {
+            try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+            try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+            fx.clearCalls()
+
+            let r = try fx.run(fx.backstop, ignoringTerm: ignoringTerm)
+
+            XCTAssertEqual(r.status, 0, r.stderr + fx.log())
+            let survived = ignoringTerm ? ["sudo SURVIVED TERM"] : []
+            XCTAssertEqual(fx.calls(), ["sudo -n \(fx.fakePmset) -a disablesleep 0"] + survived + ["sudo SIGNALS-CHECKED"], "ignoringTerm \(ignoringTerm)")
+        }
+    }
+
+    /// Each call's status files go when the call ends, whatever the command
+    /// did. A run that took the lock itself also removes the files earlier
+    /// runs left: their supervisors held the lock while they lived. A run
+    /// that shares its caller's lock leaves them, since an earlier run
+    /// under that same lock may still have a supervisor waiting for its
+    /// command.
+    func testStatusFilesGoWithTheirCallAndLeftoversOnlyUnderTheRunsOwnLock() throws {
+        let leftovers = [".backstop.4242.1.pid", ".backstop.4242.1.rc"]
+        for name in leftovers {
+            try "4242\n".write(to: fx.home.appendingPathComponent(name), atomically: true, encoding: .utf8)
+        }
+        try Data().write(to: fx.lock)
+        let sharing = fx.root.appendingPathComponent("holder-then-backstop.sh")
+        try """
+        #!/bin/bash
+        set -eu
+        exec 9<>"\(fx.lock.path)"
+        /usr/bin/lockf -t 0 9
+        /bin/bash "\(fx.backstop.path)"
+        """.write(to: sharing, atomically: true, encoding: .utf8)
+
+        for (mode, expected) in [("ok", Int32(0)), ("fail", 1), ("hang", 1)] {
+            try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+            try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+            fx.setMode("sudo", mode)
+
+            let r = try fx.run(sharing)
+
+            XCTAssertEqual(r.status, expected, "\(mode): \(r.stderr) \(fx.log())")
+            XCTAssertEqual(try fx.backstopFiles(), leftovers, mode)
+            XCTAssertTrue(try fx.lockIsFree(), mode)
+        }
+        XCTAssertTrue(fx.log().contains("terminated with SIGTERM"), fx.log())
+
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        fx.setMode("sudo", "ok")
+        let r = try fx.run(fx.backstop)
+        XCTAssertEqual(r.status, 0, r.stderr + fx.log())
+        XCTAssertEqual(try fx.backstopFiles(), [])
+    }
+
+    /// A copy of the fixture's backstop with COMMAND_TIMEOUT_SECONDS set to
+    /// `seconds`.
+    private func backstop(commandTimeout seconds: Int) throws -> URL {
+        let url = fx.root.appendingPathComponent("backstop-\(seconds)s.sh")
+        try ScriptFixture.patch(try String(contentsOf: fx.backstop, encoding: .utf8), ["COMMAND_TIMEOUT_SECONDS": String(seconds)])
+            .write(to: url, atomically: true, encoding: .utf8)
+        return url
+    }
+
+    /// The lines in the bounded calls' .rc status files, in file name order.
+    private func statusLines() -> [String] {
+        let names = ((try? fx.backstopFiles()) ?? []).filter { $0.hasSuffix(".rc") }
+        return names.compactMap { try? String(contentsOf: fx.home.appendingPathComponent($0), encoding: .utf8) }
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
     }
 
     func testUninstallAbortsWhenBootoutAndPrintBothFailAmbiguously() throws {
@@ -5200,7 +5445,49 @@ private final class ScriptFixture {
 
     func destroy() {
         releaseCommand()
+        // A supervisor still waiting to write its status into a FIFO would
+        // wait forever once the FIFO is gone.
+        drainStatusFIFOs(within: 1)
         try? fm.removeItem(at: root)
+    }
+
+    /// The backstop's files in INSOMNIA_HOME: each bounded call's .pid and
+    /// .rc status files, and the app binary's input and answer directory.
+    func backstopFiles() throws -> [String] {
+        try contents(of: home).filter { $0.hasPrefix(".backstop") }
+    }
+
+    /// Opens each FIFO among the backstop's files for reading, without
+    /// waiting for a writer, so a supervisor blocked on writing its status
+    /// there (see the fake sudo's "status-delayed") can go on. Returns what
+    /// was written to each, by file name, once its writer has closed it or
+    /// after `seconds`.
+    @discardableResult
+    func drainStatusFIFOs(within seconds: Double) -> [String: String] {
+        var written: [String: String] = [:]
+        for name in (try? backstopFiles()) ?? [] {
+            let path = home.appendingPathComponent(name).path
+            var info = stat()
+            guard lstat(path, &info) == 0, info.st_mode & S_IFMT == S_IFIFO else { continue }
+            let fd = open(path, O_RDONLY | O_NONBLOCK)
+            guard fd >= 0 else { continue }
+            defer { close(fd) }
+            var data = Data()
+            var buffer = [UInt8](repeating: 0, count: 64)
+            let deadline = Date().addingTimeInterval(seconds)
+            while Date() < deadline {
+                let n = read(fd, &buffer, buffer.count)
+                if n > 0 {
+                    data.append(contentsOf: buffer[0..<n])
+                } else if n == 0 && !data.isEmpty {
+                    break   // the writer has closed it
+                } else {
+                    Thread.sleep(forTimeInterval: 0.05)
+                }
+            }
+            written[name] = String(decoding: data, as: UTF8.self)
+        }
+        return written
     }
 
     /// Lets a fake command in mode "ignore-term" / "closes-fd9" finish.
@@ -5515,6 +5802,39 @@ private final class ScriptFixture {
                   while [[ ! -e "\(r)/release" && -d "\(r)" && $(date +%s) -lt $deadline ]]; do /bin/sleep 0.1; done
                   if [[ -e "\(r)/release" ]]; then echo released > "\(r)/command.ended"
                   elif [[ -d "\(r)" ]]; then echo watchdog > "\(r)/command.ended"; fi
+                  exit 0 ;;
+                # "logs-term": like "ignore-term", and every SIGTERM it gets
+                # is logged as "sudo SIGTERM" (see sudoHangHere).
+                logs-term) hang_on_term ignore ;;
+                # "drops-fd9-logs-signals": like "logs-term", after closing
+                # its fd 9 the way sudo does, and every SIGHUP it gets is
+                # logged as "sudo SIGHUP".
+                drops-fd9-logs-signals) exec 9<&-; trap 'echo "sudo SIGHUP" >> "\(calls)"' HUP; hang_on_term ignore ;;
+                # "signals-self": for SIGTERM and then SIGHUP, a shell that
+                # inherits this command's signal actions sends itself the
+                # signal and, if it is still there afterwards, logs "sudo
+                # SURVIVED <signal>". Then it exits 0.
+                signals-self) for s in TERM HUP; do /bin/bash -c "kill -$s \\$\\$; echo 'sudo SURVIVED $s' >> '\(calls)'"; done
+                  printf 'sudo SIGNALS-CHECKED\\n' >> "\(calls)"; exit 0 ;;
+                # "status-delayed": finds the status files of the backstop
+                # call that runs it (the .pid file holding its own pid),
+                # changes two of them and exits 0. The .pid file then names
+                # the process in sentinel.pid, the way a pid the kernel gave
+                # to another process after this one was reaped would, and a
+                # FIFO stands where the call's status goes, so the
+                # supervisor's status write waits until the test opens the
+                # FIFO to read it (see drainStatusFIFOs).
+                status-delayed) base=""
+                  for (( i = 0; i < 50; i++ )); do
+                    for f in "\(home.path)"/.backstop.*.pid; do
+                      if [[ "$(cat "$f" 2>/dev/null)" == "$$" ]]; then base="${f%.pid}"; break 2; fi
+                    done
+                    /bin/sleep 0.1
+                  done
+                  [[ -n "$base" ]] || exit 0
+                  cat "\(r)/sentinel.pid" > "$base.pid"
+                  /usr/bin/mkfifo "$base.rc"
+                  printf 'sudo STATUS-DELAYED\\n' >> "\(calls)"
                   exit 0 ;;
                 *) exit 1 ;;
               esac ;;
@@ -5996,18 +6316,19 @@ private final class ScriptFixture {
     /// SIGTERM, the way sudo ends a policy check. `hang_on_term ignore` logs
     /// it and keeps running until the test calls releaseCommand (or the
     /// fixture goes, or a 60 s watchdog), then writes command.ended. Both
-    /// note an inherited fd 9 and record the pid in `sudo.hung.pid`.
+    /// note an inherited fd 9 and record the pid in `sudo.hung.pid`, once
+    /// the SIGTERM trap is in place.
     func sudoHangHere() -> String {
         """
         hang_on_term() {
           calls_log="\(callsLog.path)"
           if { : >&9; } 2>/dev/null; then echo 'sudo FD9-OPEN' >> "$calls_log"; fi
-          echo $$ > "\(root.path)/sudo.hung.pid"
           if [[ "$1" == stop ]]; then
             trap 'echo "sudo SIGTERM" >> "$calls_log"; exit 143' TERM
           else
             trap 'echo "sudo SIGTERM" >> "$calls_log"' TERM
           fi
+          echo $$ > "\(root.path)/sudo.hung.pid"
           deadline=$(( $(date +%s) + 60 ))
           while [[ ! -e "\(root.path)/release" && -d "\(root.path)" && $(date +%s) -lt $deadline ]]; do /bin/sleep 0.1; done
           if [[ -e "\(root.path)/release" ]]; then echo released > "\(root.path)/command.ended"
@@ -6269,9 +6590,14 @@ private final class ScriptFixture {
     /// this child or nothing, never a process that reused the pid.
     final class Spawned {
         let pid: pid_t
+        /// Started as the leader of a process group of its own (see spawn).
+        let leadsGroup: Bool
         private(set) var status: Int32?
 
-        init(pid: pid_t) { self.pid = pid }
+        init(pid: pid_t, leadsGroup: Bool) {
+            self.pid = pid
+            self.leadsGroup = leadsGroup
+        }
 
         /// Whether the child has exited, checked without reaping it.
         var hasExited: Bool {
@@ -6285,6 +6611,18 @@ private final class ScriptFixture {
         func signal(_ sig: Int32) -> Int32 {
             guard status == nil else { return -1 }
             return kill(pid, sig)
+        }
+
+        /// Sends `sig` to every process in the group the child leads, the
+        /// way launchd signals what is left of a job's process group once
+        /// its main process has exited. Only for a child spawned with
+        /// `ownProcessGroup`, so the group holds nothing but the child and
+        /// what it started. Refuses with -1 once `wait` has reaped the
+        /// child: until then its pid, the group's id, cannot name another
+        /// process or group.
+        func signalGroup(_ sig: Int32) -> Int32 {
+            guard leadsGroup, status == nil else { return -1 }
+            return killpg(pid, sig)
         }
 
         /// Waits for the child to exit, reaps it, and returns its wait
@@ -6305,8 +6643,9 @@ private final class ScriptFixture {
     /// `extraEnvironment`) and working directory as `run`, standard input and output on /dev/null,
     /// and returns without waiting for it. Like a Process, the child gets
     /// no other descriptor of the test process, an empty signal mask and
-    /// default signal actions.
-    func spawn(_ script: URL, extraEnvironment: [String: String] = [:]) throws -> Spawned {
+    /// default signal actions. With `ownProcessGroup` it leads a new process
+    /// group, as launchd starts a job, instead of joining the test's.
+    func spawn(_ script: URL, extraEnvironment: [String: String] = [:], ownProcessGroup: Bool = false) throws -> Spawned {
         var actions: posix_spawn_file_actions_t?
         posix_spawn_file_actions_init(&actions)
         defer { posix_spawn_file_actions_destroy(&actions) }
@@ -6326,7 +6665,12 @@ private final class ScriptFixture {
         sigdelset(&defaults, SIGSTOP)
         posix_spawnattr_setsigmask(&attr, &mask)
         posix_spawnattr_setsigdefault(&attr, &defaults)
-        posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF))
+        var flags = POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF
+        if ownProcessGroup {
+            posix_spawnattr_setpgroup(&attr, 0)
+            flags |= POSIX_SPAWN_SETPGROUP
+        }
+        posix_spawnattr_setflags(&attr, Int16(flags))
 
         let arguments = ["/bin/bash", script.path]
         let argv: [UnsafeMutablePointer<CChar>?] = arguments.map { strdup($0) } + [nil]
@@ -6337,7 +6681,7 @@ private final class ScriptFixture {
         var pid: pid_t = 0
         let spawned = posix_spawn(&pid, "/bin/bash", &actions, &attr, argv, envp)
         guard spawned == 0, pid > 0 else { throw FixtureError("posix_spawn /bin/bash \(script.path) failed: \(spawned)") }
-        return Spawned(pid: pid)
+        return Spawned(pid: pid, leadsGroup: ownProcessGroup)
     }
 
     /// A lockf process that holds the recovery lock.
