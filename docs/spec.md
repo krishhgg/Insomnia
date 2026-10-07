@@ -144,10 +144,12 @@ A restore that fails on a connected device, or a cleared entry that cannot
 be written, is reported and the entry stays. It makes the end incomplete,
 as any failed restore does. The recovery agent keeps these entries but
 cannot restore CoreAudio settings, so the incomplete-restore notification
-says Insomnia tries again itself. That retry, and the retry of a device
-change the recovery lock refused, runs in process after 30 s, reads the
-journal again and checks the lid again. It stops after 10 tries in a row;
-the next device change, lid open, end or launch tries again.
+says Insomnia tries again itself. That retry runs in process after 30 s,
+reads the journal again and checks the lid again. A device change that
+could not run at all (the recovery lock was busy, a `sudo pmset` left
+running still held it, or state.json did not decode) is retried the same
+way. The retry stops after 10 tries in a row; the next device change, lid
+open, end or launch tries again.
 
 A session that starts, or that reconcile resumes at launch, while the lid
 reads closed starts with the countdown redraw stopped: the lid observer
