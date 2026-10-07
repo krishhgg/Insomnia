@@ -698,6 +698,7 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, false)
         XCTAssertTrue(fx.exists(fx.session))
         XCTAssertEqual(try Data(contentsOf: fx.endedSession), try Data(contentsOf: fx.session), "the record is the file's exact bytes")
+        XCTAssertNil(try fx.stateJSON()["endedSession"], "ended-session.json holds the record; the journal needs none")
         XCTAssertTrue(fx.log().contains("its end is recorded in"), fx.log())
 
         let app = try fx.holdAliveLock()
@@ -718,11 +719,73 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(fx.exists(fx.endedSession), "the record goes with the file it copies")
     }
 
-    /// Neither session.json nor the record can be written: nothing on disk
-    /// says the session is over. Sleep is restored anyway, but its journal
-    /// entry stays as evidence and the run exits 1.
-    func testEndThatCanNeitherRemoveNorRecordKeepsTheSleepEntry() throws {
+    /// session.json cannot be removed and ended-session.json holds an
+    /// unrelated record that cannot be replaced. The end goes in the journal
+    /// instead (endedSession, the file's bytes in base64), and every other
+    /// key stays. Sleep is restored and its entry cleared: the record says
+    /// the session is over. Later runs end it again without reading the
+    /// battery or the heat, even with the app alive. The record stays once
+    /// the file is gone; only the app removes it, and it matches nothing.
+    func testEndThatCannotWriteTheEndRecordRecordsItInTheJournal() throws {
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: 3600))
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"futureKey":{"kept":1}}"#)
+        try setImmutable(fx.session, true)
+        try "{}".write(to: fx.endedSession, atomically: true, encoding: .utf8)
+        try setImmutable(fx.endedSession, true)
+        let marker = try Data(contentsOf: fx.session).base64EncodedString()
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 1, r.stderr + fx.log())
+        XCTAssertEqual(calls(), [sleepRestored])
+        let journal = try fx.stateJSON()
+        XCTAssertEqual(journal["endedSession"] as? String, marker)
+        XCTAssertEqual(journal["sleepDisabledByUs"] as? Bool, false)
+        XCTAssertEqual((journal["futureKey"] as? [String: Any])?["kept"] as? Int, 1, "keys the agent does not own survive")
+        XCTAssertNoThrow(try Store(paths: Paths(root: fx.home)).loadState(), "the app still reads the journal")
+        XCTAssertTrue(fx.exists(fx.session))
+        XCTAssertEqual(try String(contentsOf: fx.endedSession, encoding: .utf8), "{}")
+        XCTAssertTrue(fx.log().contains("its end is recorded in \(fx.state.path) (endedSession) instead"), fx.log())
+
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+        fx.clearCalls()
+        let again = try fx.run(fx.backstop)
+
+        XCTAssertEqual(again.status, 1, again.stderr + fx.log())
+        XCTAssertEqual(calls(), [], "a session recorded as ended is not checked again")
+        XCTAssertTrue(fx.log().contains("already ended (recorded in \(fx.state.path) (endedSession))"), fx.log())
+
+        try setImmutable(fx.session, false)
+        let last = try fx.run(fx.backstop)
+
+        XCTAssertEqual(last.status, 0, last.stderr + fx.log())
+        XCTAssertFalse(fx.exists(fx.session))
+        XCTAssertEqual(try fx.stateJSON()["endedSession"] as? String, marker)
+    }
+
+    /// The same with sleep that cannot be restored: the record is in the
+    /// journal before the undo is tried, so it is there although the undo
+    /// failed and sleepDisabledByUs stays for the retry.
+    func testEndRecordGoesInTheJournalBeforeTheUndo() throws {
         try writeLiveSession()
+        try setImmutable(fx.session, true)
+        try "{}".write(to: fx.endedSession, atomically: true, encoding: .utf8)
+        try setImmutable(fx.endedSession, true)
+        fx.setMode("sudo", "fail")
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 1, r.stderr + fx.log())
+        let journal = try fx.stateJSON()
+        XCTAssertEqual(journal["endedSession"] as? String, try Data(contentsOf: fx.session).base64EncodedString())
+        XCTAssertEqual(journal["sleepDisabledByUs"] as? Bool, true)
+    }
+
+    /// No journal on disk: the record is a journal of its own, which the app
+    /// reads as clean.
+    func testEndRecordWithNoJournalWritesOne() throws {
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: 3600))
         try setImmutable(fx.session, true)
         try "{}".write(to: fx.endedSession, atomically: true, encoding: .utf8)
         try setImmutable(fx.endedSession, true)
@@ -730,13 +793,69 @@ final class RecoveryScriptTests: XCTestCase {
         let r = try fx.run(fx.backstop)
 
         XCTAssertEqual(r.status, 1, r.stderr + fx.log())
+        XCTAssertEqual(calls(), [], "nothing journaled means nothing to undo")
+        let journal = try XCTUnwrap(try Store(paths: Paths(root: fx.home)).loadState())
+        XCTAssertEqual(journal.endedSession, try Data(contentsOf: fx.session).base64EncodedString())
+        XCTAssertFalse(journal.isDirty)
+    }
+
+    /// Neither session.json, nor ended-session.json, nor the journal can be
+    /// written: nothing on disk says the session is over. Sleep is restored
+    /// anyway, but its journal entry stays as evidence and the run exits 1.
+    /// (The app then resumes nothing either: it writes the journal before
+    /// it resumes a session; JournaledSessionEndTests.)
+    func testEndThatCanNeitherRemoveNorRecordKeepsTheSleepEntry() throws {
+        try writeLiveSession()
+        try setImmutable(fx.session, true)
+        try "{}".write(to: fx.endedSession, atomically: true, encoding: .utf8)
+        try setImmutable(fx.endedSession, true)
+        try setImmutable(fx.state, true)
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 1, r.stderr + fx.log())
         XCTAssertEqual(calls(), [sleepRestored])
         XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, true, "evidence kept while the session still reads as valid")
+        XCTAssertNil(try fx.stateJSON()["endedSession"])
         XCTAssertTrue(fx.exists(fx.session))
         XCTAssertEqual(try String(contentsOf: fx.endedSession, encoding: .utf8), "{}")
         let log = fx.log()
-        XCTAssertTrue(log.contains("could not remove \(fx.session.path) or record its end"), log)
+        XCTAssertTrue(log.contains("could not remove \(fx.session.path) or record its end in \(fx.endedSession.path) or \(fx.state.path)"), log)
         XCTAssertTrue(log.contains("still journaled: sleepDisabledByUs is kept although sleep is restored"), log)
+    }
+
+    /// A journaled end of another session.json (other bytes) ends nothing:
+    /// the live session is checked as usual and kept, and the record stays.
+    func testJournalRecordOfAnotherSessionDoesNotEndTheSession() throws {
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: 3600))
+        let other = Data(#"{"endsAt":"2001-01-01T00:00:00Z","startedAt":"2001-01-01T00:00:00Z"}"#.utf8).base64EncodedString()
+        let journal = #"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"endedSession":"\#(other)"}"#
+        try fx.writeState(journal)
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 0, r.stderr + fx.log())
+        XCTAssertEqual(calls(), [batteryRead, thermalRead])
+        XCTAssertTrue(fx.exists(fx.session), "the session must stand")
+        XCTAssertEqual(try String(contentsOf: fx.state, encoding: .utf8), journal, "journal must not be rewritten")
+    }
+
+    /// endedSession is a string or absent, as the app decodes it. Any other
+    /// type makes the journal malformed for the agent and the app alike.
+    func testJournalWithAnEndRecordThatIsNotAStringIsMalformed() throws {
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        let broken = #"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"endedSession":42}"#
+        try fx.writeState(broken)
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertNotEqual(r.status, 0)
+        XCTAssertEqual(fx.calls(), [])
+        XCTAssertEqual(try String(contentsOf: fx.state, encoding: .utf8), broken)
+        XCTAssertTrue(fx.log().contains("endedSession is a integer, not a string"), fx.log())
+        XCTAssertThrowsError(try Store(paths: Paths(root: fx.home)).loadState())
     }
 
     /// A record left from an earlier session.json matches nothing: it goes,
@@ -6337,7 +6456,7 @@ private final class ScriptFixture {
         drainStatusFIFOs(within: 1)
         // A test that failed before clearing the flag must not leave its
         // temp home behind.
-        for file in [session, endedSession] { try? setImmutable(file, false) }
+        for file in [session, endedSession, state] { try? setImmutable(file, false) }
         try? fm.removeItem(at: root)
     }
 

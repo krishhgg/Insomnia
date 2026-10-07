@@ -14,16 +14,14 @@ import XCTest
 final class CutoffAgreementTests: XCTestCase {
     var h: Harness!
     var alive: AppAliveLock!
-    var agent: URL!
-    var agentDir: URL!
+    var agent: PatchedBackstop!
 
     override func setUp() async throws {
         h = Harness()
         try h.home.paths.createDirectories()
         alive = AppAliveLock(url: h.home.paths.appAliveFile)
         XCTAssertTrue(try alive.tryAcquire())
-        agentDir = h.home.root.appendingPathComponent("agent", isDirectory: true)
-        agent = try makeAgent()
+        agent = try PatchedBackstop(home: h.home.root, dir: h.home.root.appendingPathComponent("agent", isDirectory: true))
     }
 
     override func tearDown() async throws {
@@ -35,80 +33,17 @@ final class CutoffAgreementTests: XCTestCase {
 
     // MARK: The agent
 
-    /// A copy of backstop.sh whose tools are fakes in `agentDir`: pmset
-    /// reports an internal battery at 25% on battery power, notifyutil the
-    /// level in agentDir/thermal, sudo succeeds. Each call is recorded in
-    /// agentDir/calls.
-    private func makeAgent() throws -> URL {
-        let fm = FileManager.default
-        try fm.createDirectory(at: agentDir, withIntermediateDirectories: true)
-        let calls = agentDir.appendingPathComponent("calls").path
-        let thermal = agentDir.appendingPathComponent("thermal").path
-        try "0".write(toFile: thermal, atomically: true, encoding: .utf8)
-        let fakes: [String: String] = [
-            "PMSET": #"""
-            printf 'pmset %s\n' "$*" >> '\#(calls)'
-            [[ "$*" == "-g batt" ]] || exit 99
-            printf "Now drawing from 'Battery Power'\n -InternalBattery-0 (id=4567)\t25%%; discharging; 1:00 remaining present: true\n"
-            """#,
-            "NOTIFYUTIL": #"""
-            printf 'notifyutil %s\n' "$*" >> '\#(calls)'
-            printf 'com.apple.system.thermalpressurelevel %s\n' "$(cat '\#(thermal)')"
-            """#,
-            "SUDO": #"printf 'sudo %s\n' "$*" >> '\#(calls)'"#,
-            "IOREG": "exit 0",
-            "PS": "exit 1",
-            "SYSCTL": "echo fake-boot",
-            "KILL": #"printf 'kill %s\n' "$*" >> '\#(calls)'; exit 1"#,
-            "DEFAULTS": #"printf 'defaults %s\n' "$*" >> '\#(calls)'; exit 1"#,
-            "INSOMNIA_BIN": "exit 1",
-        ]
-        let source = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-            .appendingPathComponent("scripts/backstop.sh")
-        var lines = try String(contentsOf: source, encoding: .utf8).components(separatedBy: "\n")
-        var constants = [String: String]()
-        for (name, body) in fakes {
-            let fake = agentDir.appendingPathComponent(name.lowercased())
-            try "#!/bin/bash\n\(body)\n".write(to: fake, atomically: true, encoding: .utf8)
-            try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: fake.path)
-            constants[name] = fake.path
-        }
-        constants["INSOMNIA_INFO"] = agentDir.appendingPathComponent("no-Info.plist").path
-        for (name, value) in constants {
-            let hits = lines.indices.filter { lines[$0].hasPrefix("\(name)=") }
-            XCTAssertEqual(hits.count, 1, name)
-            lines[hits[0]] = "\(name)='\(value)'"
-        }
-        let url = agentDir.appendingPathComponent("backstop.sh")
-        try lines.joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)
-        return url
-    }
-
     /// One agent run with the app alive at thermal pressure `level`.
     /// Returns whether it ended the session: session.json removed, sleep
     /// restored and the journal says so.
     private func agentEnds(level: Int) async throws -> Bool {
-        try "\(level)".write(to: agentDir.appendingPathComponent("thermal"), atomically: true, encoding: .utf8)
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/bin/bash")
-        p.arguments = [agent.path]
-        p.environment = ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "INSOMNIA_HOME": h.home.root.path, "HOME": h.home.root.path]
-        p.standardOutput = FileHandle.nullDevice
-        p.standardError = FileHandle.nullDevice
-        let exit = ProcessExit(p)
-        try p.run()
-        await exit.exited()
-        XCTAssertEqual(p.terminationStatus, 0, logText())
+        try agent.setThermal(level)
+        let exit = try await agent.run()
+        XCTAssertEqual(exit, 0, logText())
         let ended = try h.store.loadSession() == nil
-        XCTAssertEqual(agentCalls().contains("sudo -n \(agentDir.appendingPathComponent("pmset").path) -a disablesleep 0"), ended, agentCalls().joined(separator: "\n"))
+        XCTAssertEqual(agent.calls.contains(agent.restoreCall), ended, agent.calls.joined(separator: "\n"))
         XCTAssertEqual(try h.store.loadState()?.sleepDisabledByUs, !ended)
         return ended
-    }
-
-    private func agentCalls() -> [String] {
-        ((try? String(contentsOf: agentDir.appendingPathComponent("calls"), encoding: .utf8)) ?? "")
-            .split(separator: "\n").map(String.init)
     }
 
     private func logText() -> String {

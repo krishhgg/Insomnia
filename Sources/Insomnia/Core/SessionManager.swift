@@ -11,10 +11,12 @@ enum EndReason: String, Sendable {
     case batteryUnreadable
     case thermalCritical
     case backstop
-    /// session.json was gone while this process still held the session: the
-    /// recovery agent ended it (its log line says why: app not running,
-    /// battery below the end floor, critical heat) while the app was stopped,
-    /// hung, or not holding the alive lock, and restored from the journal.
+    /// session.json was gone, or recorded as ended (in ended-session.json or
+    /// the journal's endedSession), while this process still held the
+    /// session: the recovery agent ended it (its log line says why: app not
+    /// running, battery below the end floor, critical heat) while the app
+    /// was stopped, hung, or not holding the alive lock, and restored from
+    /// the journal.
     /// The app ends on its side from whatever the journal still holds.
     case agentCutoff
     /// Reconcile found a session on disk but could not arm the recovery
@@ -656,7 +658,8 @@ final class SessionManager {
     /// process still holds a session means backstop.sh ended it (its log
     /// line says why) while this process could not act: stopped, hung, or
     /// without the alive lock. So does a session.json the agent recorded as
-    /// ended because it could not remove the file. The agent has restored
+    /// ended because it could not remove the file, in ended-session.json or
+    /// in the journal's endedSession. The agent has restored
     /// what it could; the end here runs from the journal just read under the
     /// lock, so anything it left is retried, and observers, timers and the
     /// countdown stop. An unreadable session.json is not a vanished one and
@@ -673,6 +676,8 @@ final class SessionManager {
             Log.error("session.json is gone while the session until \(iso(s.endsAt)) was active: the recovery agent ended it (its log line says why); ending here from the journal")
         } else if store.sessionEndIsRecorded() {
             Log.error("the session until \(iso(s.endsAt)) is recorded as ended in ended-session.json: the recovery agent ended it but could not remove session.json (its log line says why); ending here from the journal")
+        } else if store.sessionEndIsJournaled(in: state) {
+            Log.error("the session until \(iso(s.endsAt)) is recorded as ended in state.json (endedSession): the recovery agent ended it but could not remove session.json or write ended-session.json (its log line says why); ending here from the journal")
         } else {
             return
         }
@@ -827,11 +832,13 @@ final class SessionManager {
 
     /// The 1 Hz tick's look for a session the agent ended while the lid was
     /// open and nothing else transacted: a cheap look first (session.json
-    /// gone, or recorded as ended), then the decision and the end under the
-    /// lock (`adoptAgentEnd`). Internal so tests can run one tick at a time.
+    /// gone, or recorded as ended in ended-session.json or the journal on
+    /// disk), then the decision and the end under the lock
+    /// (`adoptAgentEnd`). Internal so tests can run one tick at a time.
     func noticeAgentEnd() async {
         guard session != nil, !checkingAgentEnd, now >= agentEndRetryAt,
               !FileManager.default.fileExists(atPath: paths.sessionFile.path) || store.sessionEndIsRecorded()
+                || ((try? store.loadState()).map { store.sessionEndIsJournaled(in: $0) } ?? false)
         else { return }
         checkingAgentEnd = true
         defer { checkingAgentEnd = false }
@@ -1239,6 +1246,11 @@ final class SessionManager {
         }
 
         do {
+            // A recorded end of an earlier session.json goes first: written
+            // after it, a file with the same bytes would read as ended.
+            if state.endedSession != nil {
+                try journal { $0.endedSession = nil }
+            }
             try store.saveSession(new)
             keptSessionFile = nil
             try journal { $0.sleepDisabledByUs = true }
@@ -1405,15 +1417,18 @@ final class SessionManager {
         } else {
             do {
                 try store.deleteSession()
+                dropJournaledSessionEnd()
             } catch {
                 // The end is decided: a file that stays must not read as a
-                // live session to the next launch or to backstop.sh.
-                let endRecorded = store.recordSessionEnd()
-                let relaunch = endRecorded
+                // live session to the next launch or to backstop.sh. The
+                // record is written before restoreAll undoes anything.
+                let recordedIn: String? = store.recordSessionEnd() ? "ended-session.json"
+                    : journalSessionEnd() ? "state.json" : nil
+                let relaunch = recordedIn != nil
                     ? "its end is recorded, so a relaunch will not resume it"
-                    : "a relaunch would hold sleep again for it"
+                    : "a relaunch that can write state.json again could hold sleep again for it"
                 retainedBecause = "session.json could not be removed (\(error.localizedDescription)); \(relaunch)."
-                fail("could not remove session.json: \(error.localizedDescription)" + (endRecorded ? "; its end is recorded in ended-session.json" : "; its end could not be recorded either"))
+                fail("could not remove session.json: \(error.localizedDescription)" + (recordedIn.map { "; its end is recorded in \($0)" } ?? "; its end could not be recorded either"))
             }
         }
         let stuck = await restoreAll()
@@ -2326,8 +2341,12 @@ final class SessionManager {
         }
 
         // A session ended earlier whose session.json could not be removed
-        // (ended-session.json holds its bytes) is over, deadline or not.
-        let endedEarlier = onDisk != nil && store.sessionEndIsRecorded()
+        // (ended-session.json, or the journal's endedSession, holds its
+        // bytes) is over, deadline or not.
+        let endRecordedIn: String? = onDisk == nil ? nil
+            : store.sessionEndIsRecorded() ? "ended-session.json"
+            : store.sessionEndIsJournaled(in: state) ? "state.json" : nil
+        let endedEarlier = endRecordedIn != nil
 
         // A valid session is not resumed while config.json is rejected in
         // place: the agent would enforce the file's cutoffs, not the app's.
@@ -2345,14 +2364,18 @@ final class SessionManager {
                 _ = await performEnd(reason: .recoveryUnavailable)
                 return
             }
-            if !state.sleepDisabledByUs {
-                do {
-                    try journal { $0.sleepDisabledByUs = true }
-                } catch {
-                    fail("could not journal sleep guard: \(error.localizedDescription); ending session")
-                    _ = await performEnd(reason: .recoveryUnavailable)
-                    return
-                }
+            // Written even when sleepDisabledByUs is already set: a session
+            // resumes only from a journal this process can write. An agent
+            // run that ended the session but could neither remove
+            // session.json nor record the end anywhere leaves just that
+            // flag behind, and the write that fails here keeps the session
+            // it ended from resuming.
+            do {
+                try journal { $0.sleepDisabledByUs = true }
+            } catch {
+                fail("could not journal sleep guard: \(error.localizedDescription); ending session")
+                _ = await performEnd(reason: .recoveryUnavailable)
+                return
             }
             do {
                 try await sleepGuard.setSleepDisabled(true)
@@ -2399,7 +2422,7 @@ final class SessionManager {
         let savedOutputs = Set(state.savedAudioOutputs.map(\.deviceUID))
         let owesEnd = keptSessionFile != nil ? state.isDirty : state.isDirty(leavingOutAudioOf: savedOutputs)
         if endedEarlier {
-            Log.info("reconcile: session.json holds a session already ended (recorded in ended-session.json); restoring, not resuming")
+            Log.info("reconcile: session.json holds a session already ended (recorded in \(endRecordedIn ?? "ended-session.json")); restoring, not resuming")
             if case .privilegedCommandRunning = await performEnd(reason: .backstop) { return }
         } else if let s = onDisk, resumable, let why = rejectedConfigFile {
             Log.error("reconcile: session valid until \(iso(s.endsAt)) not resumed: \(why)")
@@ -2678,6 +2701,36 @@ final class SessionManager {
         deadlineTimer = nil
         countdownTimer?.invalidate()
         countdownTimer = nil
+    }
+
+    /// Records the end of the session in session.json in the journal
+    /// (`RuntimeState.endedSession`), for an end that could neither remove
+    /// that file nor write ended-session.json, such as an unrelated record
+    /// there that cannot be replaced. True when the journal on disk now
+    /// records it.
+    private func journalSessionEnd() -> Bool {
+        guard let marker = store.sessionEndMarker() else { return false }
+        if state.endedSession == marker { return true }
+        do {
+            try journal { $0.endedSession = marker }
+            return true
+        } catch {
+            Log.error("could not record the end of session.json in state.json either: \(error.localizedDescription)")
+            return false
+        }
+    }
+
+    /// Removes a journaled end once its session.json is gone. It would end
+    /// nothing, since it matches only that file's bytes, but a later file
+    /// with the same bytes would read as ended. A write that fails leaves it
+    /// for the next one; a start removes it before it writes session.json.
+    private func dropJournaledSessionEnd() {
+        guard state.endedSession != nil else { return }
+        do {
+            try journal { $0.endedSession = nil }
+        } catch {
+            Log.error("could not remove the recorded session end from state.json: \(error.localizedDescription)")
+        }
     }
 
     private func persistState(_ s: RuntimeState) throws {

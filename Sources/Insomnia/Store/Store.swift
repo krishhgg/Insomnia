@@ -188,6 +188,22 @@ struct Store: Sendable {
         return sessionEndIsRecorded()
     }
 
+    /// session.json's bytes in base64, the form `RuntimeState.endedSession`
+    /// records them in (backstop.sh's session_base64 prints the same), or
+    /// nil when the file is missing, unreadable or not a regular file.
+    func sessionEndMarker() -> String? {
+        (try? readData(from: paths.sessionFile))?.base64EncodedString()
+    }
+
+    /// Whether `journal` records the end of the session in session.json:
+    /// its endedSession holds that file's bytes. The record written when
+    /// ended-session.json could not be (SessionManager's
+    /// `journalSessionEnd`, or backstop.sh's record_end_in_journal).
+    func sessionEndIsJournaled(in journal: RuntimeState) -> Bool {
+        guard let recorded = journal.endedSession, let current = sessionEndMarker() else { return false }
+        return recorded == current
+    }
+
     /// Whether anything is at session.json, a dangling symlink included.
     /// lstat(2) only: the entry is never opened.
     func sessionEntryExists() -> Bool {

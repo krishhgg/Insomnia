@@ -145,6 +145,16 @@ struct RuntimeState: Codable, Equatable, Sendable {
     /// each with the value to put back. Not a lid action: restored at
     /// session end, at reconcile, or by the backstop with `defaults`.
     var appNapOverrides: [AppNapOverride] = []
+    /// The end of the session in session.json, recorded for an end that
+    /// could neither remove that file nor write ended-session.json (an
+    /// unrelated record there that cannot be replaced): the file's exact
+    /// bytes in base64. While it matches the file, that session is over,
+    /// as with ended-session.json (`Store.sessionEndIsJournaled`). Written
+    /// by this app or by backstop.sh, before anything is undone. A record,
+    /// not something to undo: it counts neither as dirty nor as an undo
+    /// entry, and only this app removes it, before it writes a new
+    /// session.json and after it removes one.
+    var endedSession: String? = nil
 
     /// Bare pids of every journaled freeze, for display and de-duplication.
     var frozenPids: [Int32] { frozenProcesses.map(\.pid) }
@@ -154,11 +164,12 @@ struct RuntimeState: Codable, Equatable, Sendable {
 
     /// The undo entries alone: the state without
     /// `displayRestoredUnderLowPower`, a write owed after the mode rather
-    /// than something to undo. Two states with equal entries owe the same
-    /// undos.
+    /// than something to undo, and without `endedSession`, a record. Two
+    /// states with equal entries owe the same undos.
     var undoEntries: RuntimeState {
         var entries = self
         entries.displayRestoredUnderLowPower = nil
+        entries.endedSession = nil
         return entries
     }
 
@@ -201,7 +212,7 @@ struct RuntimeState: Codable, Equatable, Sendable {
         case sleepDisabledByUs, lowPowerSetByUs, frozenProcesses, frozenPids, dockerFrozen
         case savedAudioOutputs, savedOutputVolume, savedMuted
         case savedDisplayBrightness, savedKeyboardBrightness, displayRestoredUnderLowPower
-        case appNapOverrides
+        case appNapOverrides, endedSession
     }
 
     // Tolerate missing keys so a state.json written by an older build, or by
@@ -227,6 +238,7 @@ struct RuntimeState: Codable, Equatable, Sendable {
         savedKeyboardBrightness = try c.decodeIfPresent(Float.self, forKey: .savedKeyboardBrightness)
         displayRestoredUnderLowPower = try c.decodeIfPresent(Float.self, forKey: .displayRestoredUnderLowPower)
         appNapOverrides = try c.decodeIfPresent([AppNapOverride].self, forKey: .appNapOverrides) ?? []
+        endedSession = try c.decodeIfPresent(String.self, forKey: .endedSession)
     }
 
     /// `frozenPids` is read for migration only and never written again, so
@@ -244,5 +256,8 @@ struct RuntimeState: Codable, Equatable, Sendable {
         try c.encodeIfPresent(savedKeyboardBrightness, forKey: .savedKeyboardBrightness)
         try c.encodeIfPresent(displayRestoredUnderLowPower, forKey: .displayRestoredUnderLowPower)
         try c.encode(appNapOverrides, forKey: .appNapOverrides)
+        // Only when set, so a journal without a record keeps the bytes
+        // earlier builds wrote.
+        try c.encodeIfPresent(endedSession, forKey: .endedSession)
     }
 }

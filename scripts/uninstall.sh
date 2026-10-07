@@ -102,7 +102,9 @@ SESSION="$APP_SUPPORT/session.json"
 # (record_end there). The backstop run below removes it with session.json, or
 # as stale. One still there when files are removed could not be removed: it
 # ends nothing by then, but it is a copy of that session's times, so it is
-# removed with session.json, and remove_owned names it if that fails.
+# removed with session.json, and remove_owned names it if that fails. When
+# that record cannot be written either, the end is recorded in state.json
+# (endedSession); that key is not something to undo and goes with the file.
 ENDED="$APP_SUPPORT/ended-session.json"
 STATE="$APP_SUPPORT/state.json"
 CONFIG="$APP_SUPPORT/config.json"
@@ -245,6 +247,8 @@ journal_shape_problems() { # file
     t="$(type_of "$f" "$key")"
     [[ -z "$t" || "$t" == float || "$t" == integer || "$t" == "(any)" ]] || echo "$key is a $t, not a number"
   done
+  t="$(type_of "$f" endedSession)"
+  [[ -z "$t" || "$t" == string || "$t" == "(any)" ]] || echo "endedSession is a $t, not a string"
   t="$(type_of "$f" frozenProcesses)"
   if [[ -n "$t" && "$t" != "(any)" ]]; then
     if [[ "$t" != array ]]; then

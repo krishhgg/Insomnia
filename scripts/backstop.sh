@@ -55,11 +55,16 @@
 #     a failing or hung pmset) never leaves a session a relaunched app would
 #     resume. What is left stays in state.json for the next run and the app.
 #     A session.json that cannot be removed (an immutable file) is recorded
-#     as ended in ended-session.json, a copy of its bytes. While the two
-#     match, the app restores that session instead of resuming it, and every
-#     run ends it again without the checks and retries the removal. If the
-#     record cannot be written either, sleep is still restored but its
-#     journal entry stays, and the run exits 1.
+#     as ended in ended-session.json, a copy of its bytes. When that file
+#     cannot be written either (an unrelated record there that cannot be
+#     replaced), the record goes in state.json instead: endedSession, the
+#     same bytes in base64. Either record is written before anything is
+#     undone. While one matches the file, the app restores that session
+#     instead of resuming it, and every run ends it again without the
+#     checks and retries the removal. If neither record can be written,
+#     sleep is still restored but its journal entry stays, and the run exits
+#     1. The app writes the journal before it resumes a session, so it
+#     resumes none while state.json cannot be written.
 #   - state.json missing or clean: nothing is undone and nothing privileged
 #     runs; an expired session.json is removed. Exit 0. Entries in
 #     savedAudioOutputs alone count as clean (see below).
@@ -126,6 +131,8 @@
 #                              fails any other way proves nothing and the
 #                              entry stays.
 #     A flag is cleared only after its undo succeeded. Unknown keys survive.
+#     endedSession (see above) is a record, not something to undo: it never
+#     makes the journal dirty, and only the app removes it.
 #     Exit 0 only when the journal is clean afterwards; otherwise exit 1 so
 #     the failure is visible and the next periodic run retries.
 #   - state.json unreadable, not a JSON object, or with a known key of the
@@ -182,6 +189,7 @@ RM=/bin/rm
 MV=/bin/mv
 CP=/bin/cp
 MKTEMP=/usr/bin/mktemp
+BASE64=/usr/bin/base64
 # The installed app binary, for the microsecond identity check of
 # frozenProcesses entries (see above), and the bundle's Info.plist, which
 # must declare InsomniaResumeFrozenVersion RESUME_FROZEN_VERSION before the
@@ -594,6 +602,8 @@ journal_shape_problems() { # file
     t="$(type_of "$f" "$key")"
     [[ -z "$t" || "$t" == float || "$t" == integer || "$t" == "(any)" ]] || echo "$key is a $t, not a number"
   done
+  t="$(type_of "$f" endedSession)"
+  [[ -z "$t" || "$t" == string || "$t" == "(any)" ]] || echo "endedSession is a $t, not a string"
   t="$(type_of "$f" frozenProcesses)"
   if [[ -n "$t" && "$t" != "(any)" ]]; then
     if [[ "$t" != array ]]; then
@@ -797,21 +807,48 @@ remove_end_record() {
   return 0
 }
 
+# session.json's bytes in base64 on one line, as Swift's
+# Data.base64EncodedString() writes them, or nothing. Only a regular file
+# is opened, as in end_recorded.
+session_base64() {
+  [[ -f "$SESSION" ]] || return 1
+  "$BASE64" 2>/dev/null < "$SESSION"
+}
+
+# Whether the journal records the end of the session in $SESSION instead:
+# its endedSession key holds that file's bytes in base64. The record the
+# app and record_end_in_journal write when $ENDED cannot be written.
+journal_records_end() {
+  local recorded current
+  [[ -f "$SESSION" && -f "$STATE" ]] || return 1
+  [[ "$(type_of "$STATE" endedSession)" == string ]] || return 1
+  recorded="$(extract "$STATE" endedSession)" || return 1
+  current="$(session_base64)" || return 1
+  [[ -n "$current" && "$recorded" == "$current" ]]
+}
+
 # --- Was this session already ended? -----------------------------------------
 # A run or the app that ends a valid session but cannot remove session.json
-# records the end in $ENDED, a copy of the file's exact bytes (record_end).
-# While the two match, that session is over whatever its endsAt says: this
-# run ends it again without the checks below and retries the removal. A
-# record that matches nothing (its session.json was removed or replaced) is
-# stale and goes; it could only ever match the file it copied. rm unlinks
-# a FIFO there without opening it.
+# records the end in $ENDED, a copy of the file's exact bytes (record_end),
+# or, when that cannot be written either, in the journal's endedSession
+# (record_end_in_journal). While a record matches, that session is over
+# whatever its endsAt says: this run ends it again without the checks below
+# and retries the removal. A record at $ENDED that matches nothing (its
+# session.json was removed or replaced) is stale and goes; it could only
+# ever match the file it copied. rm unlinks a FIFO there without opening
+# it. An endedSession that matches nothing ends nothing; it stays until the
+# app removes it, which the app does before it writes a new session.json.
 ended_before=0
-if [[ -e "$ENDED" ]]; then
-  if end_recorded; then
-    ended_before=1
-  else
-    remove_end_record
-  fi
+ended_where=""
+if [[ -e "$ENDED" ]] && ! end_recorded; then
+  remove_end_record
+fi
+if end_recorded; then
+  ended_before=1
+  ended_where="$ENDED"
+elif journal_records_end; then
+  ended_before=1
+  ended_where="$STATE (endedSession)"
 fi
 
 # --- Is a valid session still live? ------------------------------------------
@@ -977,7 +1014,7 @@ thermal_cutoff() {
 cutoff=""
 if [[ "$session_state" == valid ]] && (( force == 0 )); then
   if (( ended_before == 1 )); then
-    cutoff="already ended (recorded in $ENDED) but session.json could not be removed"
+    cutoff="already ended (recorded in $ended_where) but session.json could not be removed"
   elif ! app_alive; then
     cutoff="Insomnia is not running"
   elif battery_cutoff; then
@@ -999,12 +1036,16 @@ fi
 # session.json is gone). What the undo cannot finish stays in state.json,
 # which the next run and the app's reconcile complete without a session.
 #
-# A session.json that cannot be removed is recorded as ended instead, and
-# the app and every later run honour the record until the file is gone. If
-# the record cannot be written either, nothing on disk says the session is
+# A session.json that cannot be removed is recorded as ended instead, in
+# $ENDED or else in the journal, and the app and every later run honour the
+# record until the file is gone. The record is written here, before the
+# undo below, so no relaunch finds sleep restored and the session still
+# live. If neither can be written, nothing on disk says the session is
 # over: sleep is still restored below, since leaving it disabled is worse,
 # but its journal entry stays, so the journal reads dirty, uninstall.sh
-# stops, and every run exits 1 until a person makes the file removable.
+# stops, and every run exits 1 until a person makes the file removable. The
+# app resumes a session only once it has written the journal itself, so a
+# journal this run could not write keeps that session from resuming too.
 
 # Remove session.json, then the record of its end, which means something
 # only while the file it copies is there. False when session.json stays.
@@ -1027,15 +1068,53 @@ record_end() {
   end_recorded
 }
 
+# Record the same end in the journal: endedSession set to session.json's
+# bytes in base64, every other key kept. For a session.json whose end
+# cannot be written to $ENDED (an unrelated record there that cannot be
+# replaced). Published like the journal at the end of this run: a private
+# copy edited, checked and renamed over state.json. A journal that is not a
+# regular file, or not the shape the app writes, is left alone; the run
+# stops at it below. A missing one, or one with no keys, which plutil reads
+# as an old-style plist and will not edit, is written whole. True only when
+# the journal then records the end.
+record_end_in_journal() {
+  local tmp="$APP_SUPPORT/.state.json.backstop.$$" encoded json=""
+  if journal_records_end; then return 0; fi
+  encoded="$(session_base64)" || return 1
+  [[ -n "$encoded" ]] || return 1
+  if [[ -e "$STATE" ]]; then
+    [[ -f "$STATE" ]] || return 1
+    json="$("$PLUTIL" -convert json -o - "$STATE" 2>/dev/null)" || return 1
+    [[ -z "$(journal_shape_problems "$STATE")" ]] || return 1
+  fi
+  # As in record_end: a leftover at this PID's name goes unopened first.
+  "$RM" -f "$tmp" 2>/dev/null || true
+  if [[ -z "$json" || "$json" == "{}" ]]; then
+    printf '{"endedSession":"%s"}' "$encoded" 2>/dev/null > "$tmp" || { "$RM" -f "$tmp" 2>/dev/null; return 1; }
+  elif ! { "$CP" "$STATE" "$tmp" 2>/dev/null \
+        && "$PLUTIL" -replace endedSession -string "$encoded" "$tmp" >/dev/null 2>&1; }; then
+    "$RM" -f "$tmp" 2>/dev/null || true
+    return 1
+  fi
+  if [[ "$("$PLUTIL" -convert json -o - "$tmp" 2>/dev/null | head -c 1)" != "{" || "$(head -c 1 "$tmp")" != "{" ]] \
+      || ! "$MV" -f "$tmp" "$STATE" 2>/dev/null; then
+    "$RM" -f "$tmp" 2>/dev/null || true
+    return 1
+  fi
+  journal_records_end
+}
+
 session_left=0      # 1 when the valid session this run ends is still on disk
 keep_sleep_entry=0  # 1 when nothing on disk records that end
 if [[ "$session_state" == valid ]] && ! remove_session; then
   session_left=1
   if record_end; then
     log error "could not remove $SESSION; its end is recorded in $ENDED, so Insomnia restores the session instead of resuming it. Every run retries the removal"
+  elif record_end_in_journal; then
+    log error "could not remove $SESSION or record its end in $ENDED; its end is recorded in $STATE (endedSession) instead, so Insomnia restores the session instead of resuming it. Every run retries the removal"
   else
     keep_sleep_entry=1
-    log error "could not remove $SESSION or record its end in $ENDED; a relaunched Insomnia could resume the session. Sleep is restored anyway, but sleepDisabledByUs stays journaled and every run exits 1 until the file can be removed (ls -lO shows its flags)"
+    log error "could not remove $SESSION or record its end in $ENDED or $STATE. Sleep is restored anyway, but sleepDisabledByUs stays journaled and every run exits 1 until the file can be removed (ls -lO shows its flags); Insomnia resumes no session until it can write $STATE"
   fi
 fi
 
