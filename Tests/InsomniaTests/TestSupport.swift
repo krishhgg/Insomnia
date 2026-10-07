@@ -98,6 +98,7 @@ final class FakeAdministratorPrompt: AdministratorPromptRunning, @unchecked Send
     private var _markerAtShow: [String?] = []
     private var _onShow: (@Sendable (PendingStart) -> Void)?
     private var _now: @Sendable () -> Date = { Date() }
+    private var _restoreNeedsPassword = false
     /// Opened by the test to end a `.hang`.
     let gate = AsyncGate()
 
@@ -123,6 +124,13 @@ final class FakeAdministratorPrompt: AdministratorPromptRunning, @unchecked Send
         get { lock.withLock { _now } }
         set { lock.withLock { _now = newValue } }
     }
+    /// /etc/sudoers.d/insomnia is missing or not in effect: a `.succeed`
+    /// answer whose marker and deadline pass then fails the root command's
+    /// restore check, which exits 5 before `disablesleep 1`.
+    var restoreNeedsPassword: Bool {
+        get { lock.withLock { _restoreNeedsPassword } }
+        set { lock.withLock { _restoreNeedsPassword = newValue } }
+    }
 
     func disableSleep(_ start: PendingStart) async throws {
         let marker = try? String(contentsOf: start.marker, encoding: .utf8)
@@ -139,6 +147,9 @@ final class FakeAdministratorPrompt: AdministratorPromptRunning, @unchecked Send
             }
             guard now() < start.deadline else {
                 throw AdministratorPromptError.failed(status: 1, stderr: "execution error: the session this password was for has already ended; sleep was not turned off (4)")
+            }
+            guard !restoreNeedsPassword else {
+                throw AdministratorPromptError.restoreNeedsPassword(stderr: "execution error: sudo: a password is required\rturning sleep back on needs a password, so sleep was not turned off (5)")
             }
             return
         case .cancel:
@@ -172,9 +183,8 @@ final class FakeSleepGuard: SleepGuarding, @unchecked Sendable {
     private var _restoreGate: AsyncGate?
     private var _restoreCalledAt: Date?
     private var _readGate: AsyncGate?
-    private var _restoreChecks = 0
-    private var _restoreRuleMissing = false
-    private var _onRestoreCheck: (@Sendable () -> Void)?
+    private var _sleepSettingChecks = 0
+    private var _onSleepSettingCheck: (@Sendable () -> Void)?
     private var _lastSleepOffIsOurs: Bool?
     var throwOn: Set<String> = []
     /// Commands that take effect and *then* fail (a timeout after pmset
@@ -220,37 +230,28 @@ final class FakeSleepGuard: SleepGuarding, @unchecked Sendable {
         set { lock.withLock { _readGate = newValue } }
     }
 
-    /// `checkPasswordlessRestore()` calls. Kept out of `calls`, which
+    /// `checkSleepSettingForStart()` calls. Kept out of `calls`, which
     /// tests compare as sequences of pmset commands.
-    var restoreChecks: Int { lock.withLock { _restoreChecks } }
-    /// /etc/sudoers.d/insomnia is missing: the check fails the way
-    /// `sudo -k -n` does when it would need a password.
-    var restoreRuleMissing: Bool {
-        get { lock.withLock { _restoreRuleMissing } }
-        set { lock.withLock { _restoreRuleMissing = newValue } }
-    }
+    var sleepSettingChecks: Int { lock.withLock { _sleepSettingChecks } }
     /// What the latest check was told about the journal.
     var lastSleepOffIsOurs: Bool? { lock.withLock { _lastSleepOffIsOurs } }
     /// Runs inside every check, so a test can look at what had happened
     /// by then.
-    var onRestoreCheck: (@Sendable () -> Void)? {
-        get { lock.withLock { _onRestoreCheck } }
-        set { lock.withLock { _onRestoreCheck = newValue } }
+    var onSleepSettingCheck: (@Sendable () -> Void)? {
+        get { lock.withLock { _onSleepSettingCheck } }
+        set { lock.withLock { _onSleepSettingCheck = newValue } }
     }
 
-    /// Fails as PmsetSleepGuard's does: refused while sleep is off and
-    /// the journal does not own that, and otherwise refused without the
-    /// rule. It never changes `sleepDisabled`, so a test still sees what
-    /// an end did; the run's effect is tested with the real guard.
-    func checkPasswordlessRestore(sleepOffIsOurs: Bool) async throws {
-        let (missing, off, hook) = lock.withLock {
-            _restoreChecks += 1
+    /// Refuses as PmsetSleepGuard's does: while sleep is off and the
+    /// journal does not own that. Its read is tested with the real guard.
+    func checkSleepSettingForStart(sleepOffIsOurs: Bool) async throws {
+        let (off, hook) = lock.withLock {
+            _sleepSettingChecks += 1
             _lastSleepOffIsOurs = sleepOffIsOurs
-            return (_restoreRuleMissing, _sleepDisabled, _onRestoreCheck)
+            return (_sleepDisabled, _onSleepSettingCheck)
         }
         hook?()
-        if off, !sleepOffIsOurs { throw PasswordlessRestoreError.sleepAlreadyOff }
-        if missing { throw PasswordlessRestoreError.notConfirmed("exit 1: sudo: a password is required") }
+        if off, !sleepOffIsOurs { throw SleepSettingRefusal.sleepAlreadyOff }
     }
 
     /// Commands reported as still running after SIGTERM
@@ -956,6 +957,33 @@ struct RootCommandRun {
     let stderr: String
     /// Arguments of each pmset call, in order.
     let pmsetCalls: [String]
+    /// Arguments of each sudo call, in order, with the fakes' paths shown
+    /// as /usr/bin/sudo and /usr/bin/pmset.
+    let sudoCalls: [String]
+}
+
+/// What the fake sudo behind the root command lets through
+/// (RootCommandProcess). Root runs anything as any user without a
+/// password, as the default /etc/sudoers allows, except under
+/// `noRootEntry`. The user who pressed Start (the uid the command is
+/// given) gets:
+enum RootSudoPolicy: String {
+    /// /etc/sudoers.d/insomnia in effect: the exact restore line,
+    /// `/usr/bin/pmset` followed by `PmsetSleepGuard.restoreArguments`,
+    /// runs without a password, for this user only.
+    case rule
+    /// No rule, but another passwordless entry: `sudo -l` lists without a
+    /// password, and running pmset needs the password (the admin group's
+    /// rule).
+    case listOnly
+    /// No rule, and a credential cached by a recent sudo in a terminal:
+    /// everything runs unless `-k` makes sudo ignore that credential.
+    case cached
+    /// No rule at all: everything needs the password.
+    case noRule
+    /// The rule is in effect, but root's own entry was removed from
+    /// /etc/sudoers, so root cannot run anything as the user.
+    case noRootEntry
 }
 
 /// AppleScript's `quoted form of`: single quotes, each `'` as `'\''`.
@@ -966,46 +994,100 @@ func appleScriptQuotedForm(_ s: String) -> String {
 /// The command the dialog runs as root, started the way the dialog starts
 /// it: `/bin/sh -c` on the line `do shell script` builds, `<markerLock>
 /// '<marker>' /bin/sh -c '<rootCommand>' insomnia '<marker>' '<nonce>'
-/// '<deadline>'`, quoted as `quoted form of` quotes it. The deadline is an
-/// hour from now unless given. The real /usr/bin/lockf takes the marker's
-/// lock and the real /bin/date tells the time. It runs as the current user with `dir` as its working
-/// directory, and `/usr/bin/pmset` is replaced by a fake in `dir` that
-/// records its arguments. With `holdPmset` the fake pmset, once called,
-/// waits until `release()` (60 s at most, and only while `dir` exists), so
-/// a test can act while the command holds the marker's lock.
+/// '<deadline>' '<uid>'`, quoted as `quoted form of` quotes it. The
+/// deadline is an hour from now and the uid this process's unless given.
+/// The real /usr/bin/lockf takes the marker's lock and the real /bin/date
+/// tells the time. It runs as the current user with `dir` as its working
+/// directory. `/usr/bin/pmset` is replaced by a fake in `dir` that records
+/// its arguments, and `/usr/bin/sudo` by a fake that records its arguments
+/// and answers as `policy` says (RootSudoPolicy); neither changes anything
+/// on the machine. With `holdPmset` the fake pmset, once called with
+/// `holdAt`, waits until `release()` (60 s at most, and only while `dir`
+/// exists), so a test can act while the command holds the marker's lock.
 final class RootCommandProcess {
     private let process = Process()
     private let childExit: ProcessExit
     private let err = Pipe()
     private let calls: URL
+    private let sudoCalls: URL
     private let started: URL
     private let releaseFile: URL
+    private let fakePmset: URL
+    private let fakeSudo: URL
 
-    init(marker: URL, nonce: String, deadline: String? = nil, in dir: URL, holdPmset: Bool = false) throws {
+    init(marker: URL, nonce: String, deadline: String? = nil, uid: String? = nil, policy: RootSudoPolicy = .rule, in dir: URL, holdPmset: Bool = false, holdAt: String = "-a disablesleep 1") throws {
         let fake = dir.appendingPathComponent("fake-pmset")
+        let sudo = dir.appendingPathComponent("root-sudo")
+        fakePmset = fake
+        fakeSudo = sudo
         calls = dir.appendingPathComponent("pmset-calls")
+        sudoCalls = dir.appendingPathComponent("root-sudo-calls")
         started = dir.appendingPathComponent("pmset-started")
         releaseFile = dir.appendingPathComponent("pmset-release")
-        for file in [calls, started, releaseFile] { try? FileManager.default.removeItem(at: file) }
+        for file in [calls, sudoCalls, started, releaseFile] { try? FileManager.default.removeItem(at: file) }
         try """
         #!/bin/bash
         printf '%s\\n' "$*" >> "$FAKE_PMSET_CALLS"
-        : > "$FAKE_PMSET_STARTED"
-        if [[ -n "${FAKE_PMSET_HOLD:-}" ]]; then
-          i=0; while [[ ! -e "$FAKE_PMSET_HOLD" && -d "${FAKE_PMSET_HOLD%/*}" && $i -lt 1200 ]]; do sleep 0.05; i=$((i + 1)); done
+        if [[ "$*" == "$FAKE_PMSET_WATCH" ]]; then
+          : > "$FAKE_PMSET_STARTED"
+          if [[ -n "${FAKE_PMSET_HOLD:-}" ]]; then
+            i=0; while [[ ! -e "$FAKE_PMSET_HOLD" && -d "${FAKE_PMSET_HOLD%/*}" && $i -lt 1200 ]]; do sleep 0.05; i=$((i + 1)); done
+          fi
         fi
         exit 0
         """.write(to: fake, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fake.path)
+        // The fake sudo. FAKE_SUDO_AS unset or 0: root invoked it, and
+        // root runs the command (as the -u user, if given) without a
+        // password. Any other uid: that user invoked it, and the policy
+        // decides.
+        let restore = ([fake.path] + PmsetSleepGuard.restoreArguments).joined(separator: " ")
+        try """
+        #!/bin/bash
+        printf '%s\\n' "$*" >> '\(sudoCalls.path)'
+        k=0; l=0; n=0; u=""
+        while [[ "${1:-}" == -* ]]; do
+          case "$1" in
+            -k) k=1 ;; -l) l=1 ;; -n) n=1 ;;
+            -u) shift; u="${1:-}" ;;
+            *) echo "fake sudo: unexpected option $1" >&2; exit 2 ;;
+          esac
+          shift
+        done
+        if (( !n )); then echo "fake sudo: would have prompted" >&2; exit 2; fi
+        policy='\(policy.rawValue)'
+        if [[ "${FAKE_SUDO_AS:-0}" == 0 ]]; then
+          if [[ "$policy" == noRootEntry ]]; then echo "sudo: root is not in the sudoers file" >&2; exit 1; fi
+          if [[ -n "$u" ]]; then
+            [[ "$u" =~ ^#[0-9]+$ ]] || { echo "sudo: unknown user $u" >&2; exit 1; }
+            export FAKE_SUDO_AS="${u#\\#}"
+          fi
+          exec "$@"
+        fi
+        if (( l )); then
+          case "$policy" in rule|listOnly|cached|noRootEntry) echo "$*"; exit 0 ;; esac
+        else
+          case "$policy" in
+            rule|noRootEntry) [[ "$FAKE_SUDO_AS" == '\(getuid())' && "$*" == '\(restore)' ]] && exec "$@" ;;
+            cached) (( k )) || exec "$@" ;;
+          esac
+        fi
+        echo "sudo: a password is required" >&2
+        exit 1
+        """.write(to: sudo, atomically: true, encoding: .utf8)
+        for url in [fake, sudo] {
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+        }
 
-        let real = "/usr/bin/pmset"
+        let realPmset = "/usr/bin/pmset"
+        let realSudo = "/usr/bin/sudo"
         let command = AdministratorPrompt.rootCommand
-        XCTAssertEqual(command.components(separatedBy: real).count - 1, 1, "the command calls pmset once, by absolute path")
-        XCTAssertFalse(fake.path.contains(" "), "the fake replaces an unquoted word")
+        XCTAssertEqual(command.components(separatedBy: realPmset).count - 1, 2, "the command calls pmset twice, the restore check and the change, by absolute path")
+        XCTAssertEqual(command.components(separatedBy: realSudo).count - 1, 2, "root's sudo to the user, and the user's sudo, by absolute path")
+        XCTAssertFalse(fake.path.contains(" ") || sudo.path.contains(" "), "the fakes replace unquoted words")
         let line = AdministratorPrompt.markerLock + " " + appleScriptQuotedForm(marker.path)
-            + " /bin/sh -c " + appleScriptQuotedForm(command.replacingOccurrences(of: real, with: fake.path))
+            + " /bin/sh -c " + appleScriptQuotedForm(command.replacingOccurrences(of: realPmset, with: fake.path).replacingOccurrences(of: realSudo, with: sudo.path))
             + " insomnia " + appleScriptQuotedForm(marker.path) + " " + appleScriptQuotedForm(nonce)
-            + " " + appleScriptQuotedForm(deadline ?? Self.inAnHour)
+            + " " + appleScriptQuotedForm(deadline ?? Self.inAnHour) + " " + appleScriptQuotedForm(uid ?? String(getuid()))
 
         process.executableURL = URL(fileURLWithPath: "/bin/sh")
         process.arguments = ["-c", line]
@@ -1013,7 +1095,9 @@ final class RootCommandProcess {
         var env = ProcessInfo.processInfo.environment
         env["FAKE_PMSET_CALLS"] = calls.path
         env["FAKE_PMSET_STARTED"] = started.path
+        env["FAKE_PMSET_WATCH"] = holdAt
         env["FAKE_PMSET_HOLD"] = holdPmset ? releaseFile.path : ""
+        env.removeValue(forKey: "FAKE_SUDO_AS")
         process.environment = env
         process.standardInput = FileHandle.nullDevice
         process.standardError = err
@@ -1027,7 +1111,8 @@ final class RootCommandProcess {
         PendingStart(marker: URL(fileURLWithPath: "/"), nonce: "", deadline: Date().addingTimeInterval(3600)).deadlineArgument
     }
 
-    /// Waits (10 s at most) until the fake pmset has been called.
+    /// Waits (10 s at most) until the fake pmset has been called with
+    /// `holdAt`.
     func waitUntilPmsetRuns() -> Bool {
         let limit = Date().addingTimeInterval(10)
         while !FileManager.default.fileExists(atPath: started.path) {
@@ -1045,10 +1130,14 @@ final class RootCommandProcess {
         let errData = err.fileHandleForReading.readDataToEndOfFile()
         childExit.wait()
         let recorded = (try? String(contentsOf: calls, encoding: .utf8)) ?? ""
+        let sudoRecorded = (try? String(contentsOf: sudoCalls, encoding: .utf8)) ?? ""
         return RootCommandRun(
             status: process.terminationStatus,
             stderr: String(decoding: errData, as: UTF8.self),
-            pmsetCalls: recorded.split(separator: "\n").map(String.init)
+            pmsetCalls: recorded.split(separator: "\n").map(String.init),
+            sudoCalls: sudoRecorded.split(separator: "\n").map {
+                $0.replacingOccurrences(of: fakeSudo.path, with: "/usr/bin/sudo").replacingOccurrences(of: fakePmset.path, with: "/usr/bin/pmset")
+            }
         )
     }
 }
@@ -1104,8 +1193,8 @@ func waitUntilLockfWaits(under pid: pid_t) -> Bool {
 }
 
 /// Runs the root command to the end (see RootCommandProcess).
-func runRootCommand(marker: URL, nonce: String, deadline: String? = nil, in dir: URL) throws -> RootCommandRun {
-    try RootCommandProcess(marker: marker, nonce: nonce, deadline: deadline, in: dir).wait()
+func runRootCommand(marker: URL, nonce: String, deadline: String? = nil, uid: String? = nil, policy: RootSudoPolicy = .rule, in dir: URL) throws -> RootCommandRun {
+    try RootCommandProcess(marker: marker, nonce: nonce, deadline: deadline, uid: uid, policy: policy, in: dir).wait()
 }
 
 /// Holds an flock(2) lock on `url` from this process, the way the root

@@ -1164,7 +1164,7 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(fx.log().contains("journal kept dirty"), fx.log())
 
         command.release()
-        XCTAssertEqual(command.wait().pmsetCalls, ["-a disablesleep 1"])
+        XCTAssertEqual(command.wait().pmsetCalls, ["-a disablesleep 0", "-a disablesleep 1"])
         fx.clearCalls()
         let again = try fx.run(fx.backstop)
 

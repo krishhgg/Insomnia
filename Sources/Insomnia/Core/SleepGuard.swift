@@ -5,16 +5,16 @@ import Foundation
 /// everything else goes through the three passwordless pmset lines
 /// install.sh writes to sudoers, none of which can keep the Mac awake.
 protocol SleepGuarding: Sendable {
-    /// Proves, without prompting, that `enableSleep` needs no password,
-    /// by running it. Start calls it before anything is written or shown:
-    /// sleep may be turned off only while it can be turned back on with
-    /// nobody at the keyboard. `sleepOffIsOurs` is the journal's
-    /// `sleepDisabledByUs`: when it is set, the restore is owed anyway
-    /// and runs whatever the setting is. Otherwise it runs only while
-    /// `pmset -g` reports SleepDisabled 0, where it changes nothing, and a
-    /// 1 fails the check with nothing run. Throws
-    /// `PasswordlessRestoreError` when the restore is not confirmed.
-    func checkPasswordlessRestore(sleepOffIsOurs: Bool) async throws
+    /// Start calls it before anything is written or the dialog is shown.
+    /// It only reads `pmset -g` and runs nothing as root. `sleepOffIsOurs`
+    /// is the journal's `sleepDisabledByUs`: when it is set, a SleepDisabled
+    /// 1 is Insomnia's own and nothing is read. Otherwise a 1 means someone
+    /// else turned sleep off, and a session's end would turn it back on for
+    /// them, so Start is refused; so it is when the setting cannot be read.
+    /// Throws `SleepSettingRefusal`. Whether sleep can be turned back on
+    /// without a password is checked later, as root, right before sleep is
+    /// turned off (see `AdministratorPrompt.rootCommand`).
+    func checkSleepSettingForStart(sleepOffIsOurs: Bool) async throws
     /// Shows the administrator password dialog and waits for it; only an
     /// explicit Start by the user may call it, after writing `start`'s
     /// marker. Sleep is turned off only while that marker holds its nonce.
@@ -49,28 +49,21 @@ struct SleepGuardError: Error, LocalizedError, Sendable {
     }
 }
 
-/// Why `checkPasswordlessRestore` could not prove that sleep can be
-/// turned back on without a password.
-enum PasswordlessRestoreError: Error, LocalizedError, Sendable {
+/// Why `checkSleepSettingForStart` refused Start.
+enum SleepSettingRefusal: Error, LocalizedError, Sendable {
     /// `pmset -g` already reports SleepDisabled 1 and the journal does not
-    /// say Insomnia set it. Proving the restore would turn sleep back on
-    /// for whoever turned it off, so nothing is run.
+    /// say Insomnia set it.
     case sleepAlreadyOff
-    /// `pmset -g` could not be read, so it is not known whether the
-    /// restore would change anything. Nothing is run.
+    /// `pmset -g` could not be read, so a setting someone else made could
+    /// not be ruled out.
     case sleepSettingUnreadable(String)
-    /// The restore command did not exit 0: what sudo answered, or why it
-    /// could not be run.
-    case notConfirmed(String)
 
     var errorDescription: String? {
         switch self {
         case .sleepAlreadyOff:
-            "sleep is already off (pmset reports SleepDisabled 1) and Insomnia did not turn it off, so Start leaves it alone: checking that sleep can be turned back on without a password would turn it on. To re-enable sleep: sudo pmset -a disablesleep 0, then start again"
+            "sleep is already off (pmset reports SleepDisabled 1) and Insomnia did not turn it off, so Start leaves it alone: the session's end would turn it back on. To re-enable sleep: sudo pmset -a disablesleep 0, then start again"
         case let .sleepSettingUnreadable(detail):
-            "`pmset -g` could not be read (\(detail)), so it was not checked that sleep can be turned back on without a password"
-        case let .notConfirmed(detail):
-            "sleep can only be turned off while it can be turned back on without a password, and `\(PmsetSleepGuard.restoreCheckCommand)` did not confirm that (\(detail)); /etc/sudoers.d/insomnia is missing or not in effect, run scripts/install.sh again"
+            "`pmset -g` could not be read (\(detail)), so it is not known whether someone else turned sleep off"
         }
     }
 }
@@ -82,17 +75,9 @@ enum PasswordlessRestoreError: Error, LocalizedError, Sendable {
 struct PmsetSleepGuard: SleepGuarding {
     static let sudo = "/usr/bin/sudo"
     static let pmset = "/usr/bin/pmset"
-    /// What `enableSleep` passes to pmset, and what
-    /// `checkPasswordlessRestore` runs.
+    /// What `enableSleep` passes to pmset. The root command checks the
+    /// same line before it turns sleep off (`AdministratorPrompt.rootCommand`).
     static let restoreArguments = ["-a", "disablesleep", "0"]
-    /// The sudo options `checkPasswordlessRestore` adds. `-k` ignores a
-    /// cached credential (a recent sudo in a terminal), and `-n` fails
-    /// instead of prompting, so exit 0 means the sudoers policy itself
-    /// lets the exact restore command run as root without a password.
-    static let restoreCheckOptions = ["-k", "-n"]
-    static var restoreCheckCommand: String {
-        ([sudo] + restoreCheckOptions + [pmset] + restoreArguments).joined(separator: " ")
-    }
     /// pmset normally returns in well under a second; a hung powerd must not
     /// hang a quit or a lid action forever.
     static let timeout: TimeInterval = 20
@@ -132,39 +117,20 @@ struct PmsetSleepGuard: SleepGuarding {
         self.runner = runner
     }
 
-    /// Runs the restore itself, `sudo -k -n /usr/bin/pmset -a disablesleep
-    /// 0`, because only running a command shows whether sudo would ask for
-    /// a password: `sudo -l` lists a command the admin group may run with
-    /// its password, and lists without one whenever any passwordless entry
-    /// exists. A restore the journal owes (`sleepOffIsOurs`) is what any
-    /// end or backstop.sh run does next, so it runs as it is. Otherwise
-    /// it runs only while `pmset -g` reports SleepDisabled 0, where it
-    /// changes nothing. A 1 is left as it is and the check fails, the same
-    /// as a cancelled dialog leaves it: proving the restore then would
-    /// turn sleep back on for whoever turned it off. Something that sets
-    /// the bit between the read and the run is the one case the run can
-    /// change.
-    func checkPasswordlessRestore(sleepOffIsOurs: Bool) async throws {
-        if !sleepOffIsOurs {
-            let sleepOff: Bool
-            do {
-                sleepOff = try await isSleepDisabled()
-            } catch {
-                throw PasswordlessRestoreError.sleepSettingUnreadable(error.localizedDescription)
-            }
-            guard !sleepOff else { throw PasswordlessRestoreError.sleepAlreadyOff }
-        }
-        let args = Self.restoreCheckOptions + [Self.pmset] + Self.restoreArguments
-        let r: ShellResult
+    /// Reads `pmset -g` unless the journal already owns a SleepDisabled 1.
+    /// Nothing runs as root here: running the restore to prove it needs no
+    /// password would turn sleep back on for whoever set it between this
+    /// read and that run, so the root command does it instead, under the
+    /// marker's lock, where the start has journaled the setting as its own.
+    func checkSleepSettingForStart(sleepOffIsOurs: Bool) async throws {
+        guard !sleepOffIsOurs else { return }
+        let sleepOff: Bool
         do {
-            r = try await CancellableCommand().run(sudoPath, args, timeout: Self.timeout)
+            sleepOff = try await isSleepDisabled()
         } catch {
-            throw PasswordlessRestoreError.notConfirmed("could not be run: \(error.localizedDescription)")
+            throw SleepSettingRefusal.sleepSettingUnreadable(error.localizedDescription)
         }
-        guard r.succeeded else {
-            let said = r.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
-            throw PasswordlessRestoreError.notConfirmed("exit \(r.status)" + (said.isEmpty ? "" : ": \(said)"))
-        }
+        guard !sleepOff else { throw SleepSettingRefusal.sleepAlreadyOff }
     }
 
     func disableSleep(_ start: PendingStart) async throws {

@@ -34,25 +34,45 @@ not write the file: a process running as you that puts a copy in its place
 while the command runs could get it deleted early. Such a process could
 already clear the journal entry in `state.json` directly. A dialog answered after its start was abandoned (the app died, recovery
 ran, the start rolled back, a newer start began) runs nothing. The app shows
-the dialog only when the installed `backstop.sh` declares, in its
-`# insomnia-backstop-version:` line, a version that deletes `pending-start`,
-and the installer installs that script before the app, so recovery after a
-crash under the dialog never depends on an older script. It also shows the
-dialog only after running the restore itself, `sudo -k -n /usr/bin/pmset -a
-disablesleep 0`, with exit 0: `-k` ignores a credential cached by a recent
-sudo and `-n` fails instead of prompting, so only a sudoers rule that lets
-that exact command run as root without a password passes. `sudo -l` is not
-used: it lists commands the admin group may run with its password, and lists
-without one whenever the account has any passwordless entry. Without the
-rule (an uninstall that stopped part way, a hand-deleted file) Start is
-refused with nothing changed and the user is told to rerun the installer.
-The run happens only while `pmset -g` reports SleepDisabled 0, where it
-changes nothing, or while the journal already owes that restore after one
-failed. A SleepDisabled 1 the journal does not claim is left alone: Start
-runs nothing as root, is refused, and gives the command that turns sleep
-back on. A tool that sets SleepDisabled between that read and the run is
-the one case the run changes. The installer checks the rule the same way
-right after writing it, only while SleepDisabled reads 0. A file that
+the dialog only when the `backstop.sh` sealed in its bundle, the copy the
+recovery agent runs, declares in its `# insomnia-backstop-version:` line a
+version that deletes `pending-start`, so recovery after a crash under the
+dialog never depends on an older script.
+
+Before the dialog the app runs nothing through sudo. It reads `pmset -g`,
+and a SleepDisabled 1 the journal does not claim is left alone: Start is
+refused with nothing run and gives the command that turns sleep back on. An
+unreadable `pmset -g` refuses too. After the password, under the marker's
+lock and after the nonce and deadline checks, the root command proves that
+the session's end can turn sleep back on without a password by running that
+restore: `sudo -n -u "#<uid>" /usr/bin/sudo -k -n /usr/bin/pmset -a
+disablesleep 0`. Root drops to the user who pressed Start (sudo never asks
+root for a password, and macOS's default `root ALL = (ALL) ALL` permits
+it), and the user's sudo runs
+the exact restore with `-k`, which ignores a credential cached by a recent
+sudo, and `-n`, which fails instead of prompting. So only a sudoers rule
+that lets that user run that exact command without a password passes.
+`sudo -l` is not used: it lists commands the admin group may run with its
+password, and lists without one whenever the account has any passwordless
+entry. Only when the restore exits 0 does the root command run `pmset -a
+disablesleep 1`. Otherwise it exits 5 having run no pmset, and the start is
+rolled back with nothing to undo: no session, the journal and session.json
+as they were, and a message to rerun the installer. That happens without
+the rule (an uninstall that stopped part way, a hand-deleted file) and on a
+Mac whose sudoers lacks root's default entry. The user has typed the
+password by the time a missing rule is reported.
+
+pmset has no compare-and-set, so the read before the dialog is not atomic
+with anything after it. A SleepDisabled 1 another tool sets after that read
+is not seen: the session's end sets it to 0, and if the tool sets it while
+the dialog is up, the root command's
+check sets it to 0 for a moment before it sets 1. The check never makes a
+change the end or a rollback would not make. The installer runs no pmset:
+right after writing the rule it confirms that `sudo -k -n -l` lists the
+three commands without a password, which catches a rule sudo does not read
+but is not proof that the restore runs, because the listing passes once any
+of the user's rules is passwordless. The root command's check covers the
+rest at every Start. A file that
 cannot be deleted (its command is still running, an immutable flag, an ACL)
 does not stop sleep from being turned back on, but the journal keeps the sleep
 entry, the app and the agent report it and retry, and new sessions are refused
@@ -61,9 +81,8 @@ was installed). The installer never writes a passwordless `disablesleep 1`
 line, on any path, including failed upgrades. It asks for the password before
 it quits a running Insomnia, so a cancelled password changes nothing, and it
 quits the app before it writes the rule, stopping with nothing changed if the
-app will not quit. It writes the rule only after every run of the previous
-`backstop.sh` has exited, so a stop while one is still running leaves the
-previous rule beside the previous app. If it stops after the rule is written but before the app is replaced, an
+app will not quit. It writes the rule under the recovery lock, after the
+app has quit. If it stops after the rule is written but before the app is replaced, an
 older build left installed cannot start a session until the installer is
 rerun; it fails closed and the installer prints the rerun command. The
 uninstaller removes the file.

@@ -75,40 +75,53 @@ recovery; newly written journals use `frozenProcesses`.
   timer runs at 1 Hz and stops while the lid is closed.
 - Click the cup/countdown to enter an extension; hold the end control to end.
   Right-click opens the status, browser actions, Settings, and Quit menu.
-- Session start: check that the installed `backstop.sh` declares
-  `# insomnia-backstop-version: 2` or later (`BackstopVersion.swift`; 2 is
-  the first that deletes `pending-start`) and refuse with nothing written,
-  asking for `scripts/install.sh` again, if not. Then prove, without
-  prompting, that sleep can be turned back on with no password by running
-  the restore: `sudo -k -n /usr/bin/pmset -a disablesleep 0` must exit 0
-  (`SleepGuarding.checkPasswordlessRestore`). `-k` ignores a cached
-  credential and `-n` fails instead of prompting. `sudo -l` is not used: it
-  lists commands the admin group may run with its password, and lists
-  without one whenever any passwordless entry exists. Otherwise refuse the
-  same way, since the end, the backstop and uninstall all restore with
-  `sudo -n` and would leave sleep off. The run happens only while
-  `pmset -g` reports `SleepDisabled 0`, where it changes nothing, or when
-  the journal already has `sleepDisabledByUs` (a failed restore is owed
-  anyway). A `SleepDisabled 1` the journal does not claim is left alone,
-  as after a cancelled dialog: run nothing and refuse, giving
-  `sudo pmset -a disablesleep 0`. An unreadable `pmset -g` refuses too.
-  Then write session + state
+- Session start: check that the `backstop.sh` sealed in the bundle the
+  agent runs declares `# insomnia-backstop-version: 2` or later
+  (`BackstopVersion.swift`; 2 is the first that deletes `pending-start`)
+  and refuse with nothing written, asking for `scripts/install.sh` again,
+  if not. Then read `pmset -g`
+  (`SleepGuarding.checkSleepSettingForStart`, which runs nothing through
+  sudo). A `SleepDisabled 1` the journal does not claim is left alone, as
+  after a cancelled dialog: run nothing and refuse, giving
+  `sudo pmset -a disablesleep 0`, since the session's end would turn it
+  back on. An unreadable `pmset -g` refuses too. When the journal already
+  has `sleepDisabledByUs` (a failed restore is owed anyway) there is
+  nothing to read. Then write session + state
   to disk, arm the launchd backstop,
   write a fresh random nonce to `pending-start`, and only then run `pmset -a
   disablesleep 1` through the macOS administrator password dialog
   (`osascript` running a fixed `do shell script ... with administrator
   privileges` literal; 120 s limit, SIGTERM only at the deadline). The
-  marker path, the nonce and the session's `endsAt` (whole seconds since
-  1970, rounded down) are the script's only inputs, passed as positional
-  parameters; the root command runs under `lockf` on the marker and runs
-  pmset only while the marker holds the nonce and `/bin/date +%s` is below
-  `endsAt` (section 8). A
+  marker path, the nonce, the session's `endsAt` (whole seconds since
+  1970, rounded down) and the user's uid are the script's only inputs,
+  passed as positional parameters; the root command runs under `lockf` on
+  the marker and runs pmset only while the marker holds the nonce and
+  `/bin/date +%s` is below `endsAt` (section 8). After those checks it
+  proves that the end can turn sleep back on with no password by running
+  that restore as the user: `/usr/bin/sudo -n -u "#<uid>" /usr/bin/sudo -k
+  -n /usr/bin/pmset -a disablesleep 0`. sudo never asks root for a
+  password, and macOS's default `root ALL = (ALL) ALL` lets root run it as
+  the user. The user's `-k` ignores a cached credential and `-n` fails
+  instead of prompting, so only a rule that lets that user run that exact
+  command without a password passes. `sudo -l` is not used: it lists
+  commands the admin group may run with its password, and lists without
+  one whenever any passwordless entry exists. A uid that is not a positive
+  number fails without running sudo. Only on exit 0 does the root command
+  run `/usr/bin/pmset -a disablesleep 1`. Otherwise it exits 5 having run
+  no pmset (`AdministratorPromptError.restoreNeedsPassword`, which tells
+  the user to run `scripts/install.sh` again), since the end, the backstop
+  and uninstall all restore with `sudo -n` and would leave sleep off. The
+  user has typed the password by then. pmset has no compare-and-set, so
+  the read before the dialog proves nothing later: a `SleepDisabled 1`
+  another tool sets after it is set to 0 by the end, and, when it is set
+  while the dialog is up, by the check for a moment before the 1. The
+  check never makes a change the end or a rollback would not make. A
   session never starts unless the backstop is armed, and a start is refused
   while a `pending-start` from an earlier start cannot be removed. If the
-  dialog is cancelled or osascript cannot be launched, nothing ran as root:
-  put session.json and the journal back exactly as they were read, run no
-  pmset (a `SleepDisabled` set by another tool stays), and surface the
-  error. If the password is wrong, it times out, or pmset fails, pmset may
+  dialog is cancelled, osascript cannot be launched, or the restore check
+  fails, no pmset ran: put session.json and the journal back exactly as
+  they were read, run no pmset (a `SleepDisabled` set by another tool
+  stays), and surface the error. If the password is wrong, it times out, or pmset fails, pmset may
   have run, so undo from the journal like an end, delete the session file
   and surface the error. The start deletes `pending-start` on every outcome
   before it lets go of the recovery lock. The wait is bounded: if the
@@ -155,17 +168,16 @@ recovery; newly written journals use `frozenProcesses`.
   changes nothing and a running session keeps going. Then it asks a running
   app to quit and stops with nothing changed, the sudoers file included, if
   the app is still running after 15 s, and asks for the password once more
-  if sudo's cached credential expired during the quit. Then it takes the
-  recovery lock, checks that the app was not opened again meanwhile, and
-  replaces `backstop.sh` (atomically, so a run of the old script keeps its
-  own copy). It waits up to 30 s until no process runs the old script, and
-  stops before the rule if one still does or the check fails, so the
-  installed app keeps the rule it was installed with. A run is a process
-  whose arguments are exactly `/bin/bash`, the installed path and at most
-  `--force`; a process that only names the path (an editor, a `tail`) is
-  not one. Only then does it write the three-line rule, look once more for
-  a reopened app, and replace the bundle, so a new app never runs beside a
-  backstop that cannot void its dialog. A build older than this rule
+  if sudo's cached credential expired during the quit. It assembles the
+  new bundle with `backstop.sh` sealed inside, then takes the recovery
+  lock, checks that the app was not opened again meanwhile, and writes the
+  three-line rule with `sudo -n` (`visudo -cf`, then `install`). It then
+  checks that `sudo -k -n -l` lists the three commands without a password
+  and stops if not. That catches a rule sudo does not read, but a listing
+  is not proof that the restore runs: it passes once any of the user's
+  rules is passwordless. The root command's check at every Start (section
+  1) is that proof. The installer runs no pmset. Only after the listing
+  does it replace the bundle. A build older than this rule
   starts sessions with `sudo -n pmset -a disablesleep 1`, so any stop between
   the rule and the new bundle leaves that build unable to start a session;
   the installer says so and prints the rerun command. A successful install
@@ -611,7 +623,8 @@ Invariants:
   covers it, so a dialog answered after its start was abandoned (crash or
   force-quit under the dialog, rollback, a newer start) cannot leave sleep
   off once the journal entry is gone. No dialog is shown unless the
-  installed `backstop.sh` declares a version that deletes the marker.
+  `backstop.sh` sealed in the bundle declares a version that deletes the
+  marker.
 - A transaction holds the recovery lock while a command it started may
   still change something. A stuck dialog whose marker this transaction
   deleted under the marker's lock can no longer change anything, so it does
@@ -745,19 +758,17 @@ Backstop, independent of the app:
   and no step after a failed bootstrap counts on a loaded job. Before
   recovery the run only puts a set-aside bundle back when nothing is at the
   app's path, and removes staging directories whose owning install is gone
-  (matched by the exact name install.sh gives them). Right after taking the
-  lock it checks the sudoers rule again with `sudo -n -l` for each of the
-  four commands and stops if it no longer holds: an uninstall.sh that took
-  the lock first removes the rule and leaves no journal, so the recovery
-  alone would pass. Under the lock every `sudo -n -l`, `pgrep`, `launchctl`
-  and `codesign --verify` call has a 30 s limit (the sudoers check before
-  the lock has it too). A supervising process enforces it, even if the
+  (matched by the exact name install.sh gives them). The sudoers rule is
+  written and listed under the lock before any of this (section 2), so an
+  uninstall.sh that took the lock first and removed the rule cannot leave
+  the new app without it. Under the lock every `sudo`, `pgrep`, `launchctl`
+  and `codesign --verify` call has a 30 s limit. A supervising process enforces it, even if the
   installer is killed while it waits, and the call keeps fd 9, so the lock
   is held until the call has exited or been stopped: no `launchctl bootout`
   or `bootstrap` it started is still running once the lock is released. A call past the
   limit gets SIGTERM, then SIGKILL one to two seconds later; `sudo` only ever gets
   SIGTERM, and one that ignores it keeps the lock until it ends, reported
-  with its pid. A sudoers check or `pgrep` that does not answer stops the
+  with its pid. A `sudo` call or `pgrep` that does not answer stops the
   run, which releases the lock so the app and the agent can recover. A `launchctl print` that does not answer counts as unknown, never
   as unloaded. A `codesign --verify` that does not answer leaves it unknown
   which bundle the plist on disk pins, so the run stops and moves neither

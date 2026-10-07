@@ -1,16 +1,16 @@
 import Foundation
 
-/// The recovery contract the installed backstop.sh implements, read from
+/// The recovery contract the agent's backstop.sh implements, read from
 /// its `# insomnia-backstop-version: N` line.
 ///
 /// Start reads it before the password dialog, under the recovery lock.
 /// Version 2 is the first backstop.sh that deletes the pending-start marker
-/// under its lock before it restores sleep. An older one, left installed by
-/// an upgrade that stopped early, restores sleep after a crash but leaves
-/// the marker, so a dialog still open could turn sleep off again with
-/// nothing journaled: with it installed no dialog is shown at all.
-/// install.sh replaces backstop.sh before the bundle, so only an install
-/// that never reached the new script leaves one behind.
+/// under its lock before it restores sleep. An older one restores sleep
+/// after a crash but leaves the marker, so a dialog still open could turn
+/// sleep off again with nothing journaled: with it in place no dialog is
+/// shown at all. The script read is the copy sealed in the bundle the agent
+/// runs (LaunchdBackstop.scriptPath), so this refuses a bundle whose copy
+/// is missing, unreadable or older than this build expects.
 enum BackstopVersion {
     static let required = 2
     static let linePrefix = "# insomnia-backstop-version: "

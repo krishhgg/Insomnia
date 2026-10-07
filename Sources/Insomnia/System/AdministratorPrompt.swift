@@ -20,14 +20,22 @@ enum AdministratorPromptError: Error, LocalizedError, Sendable {
     /// held another nonce, or the session had already ended), or pmset
     /// itself failed.
     case failed(status: Int32, stderr: String)
+    /// The password was accepted, but the root command found that sleep
+    /// could not be turned back on without a password: `sudo -k -n
+    /// /usr/bin/pmset -a disablesleep 0`, run as the user who pressed
+    /// Start, failed (exit 5), so `disablesleep 1` was never run.
+    case restoreNeedsPassword(stderr: String)
     case launchFailed(String)
 
-    /// Nothing can have run as root: the dialog was cancelled, or osascript
-    /// never started. Every other failure may have run pmset before it
-    /// failed or was stopped, so the caller undoes it like an end.
-    var nothingRan: Bool {
+    /// Nothing the caller would undo can have run as root: the dialog was
+    /// cancelled, osascript never started, or the root command stopped at
+    /// its restore check (exit 5). That check runs only the restore
+    /// itself, so at most it turned sleep back on, which is what the undo
+    /// would do. Every other failure may have run `disablesleep 1` before
+    /// it failed or was stopped, so the caller undoes it like an end.
+    var nothingToUndo: Bool {
         switch self {
-        case .cancelled, .launchFailed: true
+        case .cancelled, .launchFailed, .restoreNeedsPassword: true
         case .timedOut, .stillRunning, .failed: false
         }
     }
@@ -46,6 +54,9 @@ enum AdministratorPromptError: Error, LocalizedError, Sendable {
         case let .failed(status, stderr):
             let detail = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
             return "the administrator password prompt failed (osascript exited \(status))" + (detail.isEmpty ? "" : ": \(detail)")
+        case let .restoreNeedsPassword(stderr):
+            let detail = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+            return "sleep was not turned off: turning it back on needs a password (`sudo -k -n /usr/bin/pmset -a disablesleep 0` failed" + (detail.isEmpty ? "" : ": \(detail)") + "), so a session could not end without you. /etc/sudoers.d/insomnia is missing or not in effect; run scripts/install.sh again"
         case let .launchFailed(detail):
             return "could not launch osascript for the administrator password prompt: \(detail)"
         }
@@ -168,12 +179,13 @@ struct PendingStart: Sendable, Equatable {
 /// user may reach this; relaunch and reconcile read `pmset -g` instead.
 protocol AdministratorPromptRunning: Sendable {
     /// Returns once `pmset -a disablesleep 1` has run as root, which it does
-    /// only while `start.marker` holds `start.nonce` and before
-    /// `start.deadline`. Throws an `AdministratorPromptError` when the
+    /// only while `start.marker` holds `start.nonce`, before
+    /// `start.deadline`, and once sudo has run the restore for this user
+    /// without a password. Throws an `AdministratorPromptError` when the
     /// dialog was cancelled, the password was wrong, the marker was gone or
-    /// no longer matched, the deadline had passed, pmset failed, nothing
-    /// came back in time, or the prompt's process would not stop
-    /// (`.stillRunning`).
+    /// no longer matched, the deadline had passed, the restore needed a
+    /// password (`.restoreNeedsPassword`), pmset failed, nothing came back
+    /// in time, or the prompt's process would not stop (`.stillRunning`).
     func disableSleep(_ start: PendingStart) async throws
 }
 
@@ -189,25 +201,40 @@ enum AdministratorPrompt {
     /// effect the journal entry the start wrote first still covers.
     static let markerLock = "/usr/bin/lockf -k -n -t 10"
     /// What runs as root under that lock, as `/bin/sh -c <this> insomnia
-    /// <marker> <nonce> <deadline>`. Fixed text: the marker path, nonce and
-    /// deadline arrive only as `$1`, `$2` and `$3`, and the marker's content
-    /// is only compared, never run. pmset runs only while the marker holds
-    /// the nonce and the clock is before the deadline (seconds since 1970).
-    /// Exit 3: the start was over before the password was accepted. Exit 4:
-    /// the session had ended by then, or `$3` is not a number `[` can
-    /// compare, which fails the test and so refuses too. Either way nothing
-    /// ran.
-    static let rootCommand = #"m=$(/usr/bin/head -c 64 "$1" 2>/dev/null); if [ -z "$2" ] || [ "$m" != "$2" ]; then echo "the start that asked for this password is over; sleep was not turned off" >&2; exit 3; fi; if ! [ "$(/bin/date +%s)" -lt "$3" ] 2>/dev/null; then echo "the session this password was for has already ended; sleep was not turned off" >&2; exit 4; fi; exec /usr/bin/pmset -a disablesleep 1"#
+    /// <marker> <nonce> <deadline> <uid>`. Fixed text: the marker path,
+    /// nonce, deadline and the uid of the user who pressed Start arrive only
+    /// as `$1` to `$4`, and the marker's content is only compared, never
+    /// run. pmset runs only while the marker holds the nonce and the clock
+    /// is before the deadline (seconds since 1970). Exit 3: the start was
+    /// over before the password was accepted. Exit 4: the session had ended
+    /// by then, or `$3` is not a number `[` can compare, which fails the
+    /// test and so refuses too. Either way nothing ran.
+    ///
+    /// Then, still under the marker's lock and right before sleep is turned
+    /// off, the restore every end and backstop.sh run depends on is run the
+    /// way they run it: as that user, through sudo, with no password. Root
+    /// drops to the user with `sudo -n -u "#$4"`, and the user's sudo runs
+    /// the restore with `-k`, which ignores a credential cached by a recent
+    /// sudo in a terminal, and `-n`, which fails instead of prompting. So it
+    /// passes only when the sudoers policy itself lets that user run the
+    /// exact restore without a password. When it does not, or `$4` is not a
+    /// positive whole number, the command exits 5 without turning sleep
+    /// off. The restore runs at a point the start has already journaled,
+    /// and only right before `disablesleep 1`, so it never leaves a change
+    /// the session's end would not make: either sleep is turned off next,
+    /// or the start fails and its undo runs the same restore. pmset is not
+    /// `exec`ed, so its own exit status can never read as 5.
+    static let rootCommand = ##"m=$(/usr/bin/head -c 64 "$1" 2>/dev/null); if [ -z "$2" ] || [ "$m" != "$2" ]; then echo "the start that asked for this password is over; sleep was not turned off" >&2; exit 3; fi; if ! [ "$(/bin/date +%s)" -lt "$3" ] 2>/dev/null; then echo "the session this password was for has already ended; sleep was not turned off" >&2; exit 4; fi; if ! [ "$4" -gt 0 ] 2>/dev/null || ! /usr/bin/sudo -n -u "#$4" /usr/bin/sudo -k -n /usr/bin/pmset -a disablesleep 0; then echo "turning sleep back on needs a password, so sleep was not turned off" >&2; exit 5; fi; /usr/bin/pmset -a disablesleep 1 || exit 1"##
     /// The whole AppleScript, as one literal: `markerLock`, `rootCommand`
     /// (each `"` escaped for AppleScript), the privilege flag and the
     /// dialog text are fixed at compile time. Its only inputs are the
-    /// marker path, the nonce and the deadline, `item 1` to `item 3 of
-    /// argv`, and each reaches the root shell through `quoted form of`, as
-    /// lockf's file and as positional parameters. No configuration value or environment
-    /// variable reaches the command that runs as root.
+    /// marker path, the nonce, the deadline and the uid, `item 1` to `item
+    /// 4 of argv`, and each reaches the root shell through `quoted form
+    /// of`, as lockf's file and as positional parameters. No configuration
+    /// value or environment variable reaches the command that runs as root.
     static let disableSleepScript = #"""
     on run argv
-    do shell script "/usr/bin/lockf -k -n -t 10 " & quoted form of (item 1 of argv) & " /bin/sh -c " & quoted form of "m=$(/usr/bin/head -c 64 \"$1\" 2>/dev/null); if [ -z \"$2\" ] || [ \"$m\" != \"$2\" ]; then echo \"the start that asked for this password is over; sleep was not turned off\" >&2; exit 3; fi; if ! [ \"$(/bin/date +%s)\" -lt \"$3\" ] 2>/dev/null; then echo \"the session this password was for has already ended; sleep was not turned off\" >&2; exit 4; fi; exec /usr/bin/pmset -a disablesleep 1" & " insomnia " & quoted form of (item 1 of argv) & " " & quoted form of (item 2 of argv) & " " & quoted form of (item 3 of argv) with administrator privileges with prompt "Insomnia needs your password to turn off system sleep for this session."
+    do shell script "/usr/bin/lockf -k -n -t 10 " & quoted form of (item 1 of argv) & " /bin/sh -c " & quoted form of "m=$(/usr/bin/head -c 64 \"$1\" 2>/dev/null); if [ -z \"$2\" ] || [ \"$m\" != \"$2\" ]; then echo \"the start that asked for this password is over; sleep was not turned off\" >&2; exit 3; fi; if ! [ \"$(/bin/date +%s)\" -lt \"$3\" ] 2>/dev/null; then echo \"the session this password was for has already ended; sleep was not turned off\" >&2; exit 4; fi; if ! [ \"$4\" -gt 0 ] 2>/dev/null || ! /usr/bin/sudo -n -u \"#$4\" /usr/bin/sudo -k -n /usr/bin/pmset -a disablesleep 0; then echo \"turning sleep back on needs a password, so sleep was not turned off\" >&2; exit 5; fi; /usr/bin/pmset -a disablesleep 1 || exit 1" & " insomnia " & quoted form of (item 1 of argv) & " " & quoted form of (item 2 of argv) & " " & quoted form of (item 3 of argv) & " " & quoted form of (item 4 of argv) with administrator privileges with prompt "Insomnia needs your password to turn off system sleep for this session."
     end run
     """#
     /// The user is typing a password, so the limit is generous. At the
@@ -227,8 +254,8 @@ enum AdministratorPrompt {
 /// deadline.
 ///
 /// Only SIGTERM is ever sent. The command osascript runs after the dialog
-/// is a root pmset; a SIGKILL could not reach it and would only orphan
-/// it. The wait is bounded all the same: `grace` seconds after the
+/// is a root sudo and pmset; a SIGKILL could not reach them and would only
+/// orphan them. The wait is bounded all the same: `grace` seconds after the
 /// deadline the caller is answered with `.stillRunning`, carrying the pid
 /// and a handle that resolves when the child and its pipes are gone, so
 /// the caller can say what is running, keep its lock, and roll back after
@@ -259,10 +286,13 @@ struct OsascriptAdministratorPrompt: AdministratorPromptRunning {
         self.beforeDeadline = beforeDeadline
     }
 
+    /// The uid passed is this process's, the user who pressed Start: the
+    /// one whose sudoers rule every end and backstop.sh run depend on.
     func disableSleep(_ start: PendingStart) async throws {
-        let r = try await run(["-e", AdministratorPrompt.disableSleepScript, start.marker.path, start.nonce, start.deadlineArgument])
+        let r = try await run(["-e", AdministratorPrompt.disableSleepScript, start.marker.path, start.nonce, start.deadlineArgument, String(getuid())])
         guard r.status == 0 else {
             if Self.isCancel(r.stderr) { throw AdministratorPromptError.cancelled }
+            if Self.isRestoreRefusal(r.stderr) { throw AdministratorPromptError.restoreNeedsPassword(stderr: r.stderr) }
             throw AdministratorPromptError.failed(status: r.status, stderr: r.stderr)
         }
     }
@@ -274,6 +304,13 @@ struct OsascriptAdministratorPrompt: AdministratorPromptRunning {
     /// for a cancel, whatever text it contains.
     static func isCancel(_ stderr: String) -> Bool {
         stderr.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix("(-128)")
+    }
+
+    /// The root command exited 5: it stopped at its restore check, before
+    /// `disablesleep 1`. osascript ends its error line with the shell's
+    /// exit status, the same way it ends a cancel with -128.
+    static func isRestoreRefusal(_ stderr: String) -> Bool {
+        stderr.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix("(5)")
     }
 
     /// The one place that knows whether the child exists, whether this

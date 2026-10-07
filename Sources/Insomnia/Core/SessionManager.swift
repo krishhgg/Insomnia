@@ -874,15 +874,14 @@ final class SessionManager {
             return
         }
         do {
-            // Once the dialog has turned sleep off, only the passwordless
-            // rule can turn it back on: this app's end and backstop.sh
-            // both run `sudo -n`. Without the rule they would fail at the
-            // deadline and leave sleep off, so no dialog is shown. The
-            // check runs that restore while sleep is on, or when the
-            // journal already owes it, and otherwise refuses while sleep
-            // is off: a setting someone else made stays, as it does after
-            // a cancelled dialog.
-            try await sleepGuard.checkPasswordlessRestore(sleepOffIsOurs: state.sleepDisabledByUs)
+            // A SleepDisabled 1 the journal does not own is someone else's
+            // setting, and this session's end would turn it back on, so
+            // Start leaves it alone, as a cancelled dialog does. Whether
+            // the end can turn sleep back on without a password is checked
+            // later, as root, right before sleep is turned off: this app's
+            // end and backstop.sh both run `sudo -n`, and without the rule
+            // they would fail at the deadline and leave sleep off.
+            try await sleepGuard.checkSleepSettingForStart(sleepOffIsOurs: state.sleepDisabledByUs)
         } catch {
             fail("start refused, nothing changed: \(error.localizedDescription)")
             notifier.post(title: Self.endTitle(.startFailed, had: false), body: "Nothing was changed: \(error.localizedDescription).")
@@ -954,7 +953,8 @@ final class SessionManager {
         // The administrator password dialog. This is the only call that can
         // prompt, and Start is the only path that reaches it: the user just
         // pressed Enter, so someone is at the keyboard. A cancel, a wrong
-        // password, a timeout or a pmset failure all land here.
+        // password, a restore that needs a password, a timeout or a pmset
+        // failure all land here.
         // The marker goes on every outcome below before anything is
         // restored, and a marker that cannot go keeps the sleep entry
         // journaled (see restoreAll).
@@ -1002,11 +1002,13 @@ final class SessionManager {
             fail("could not disable sleep: \(prompt) did not finish in time and has now exited; rolling the start back")
             _ = await performEnd(reason: .startFailed)
             return
-        } catch let error as AdministratorPromptError where error.nothingRan {
-            // Cancelled, or osascript never started: nothing ran as root.
-            // The journal and session.json go back exactly as they were and
-            // no pmset runs, so a sleep setting another tool owns is left
-            // alone. Nothing can use this attempt's marker any more, so one
+        } catch let error as AdministratorPromptError where error.nothingToUndo {
+            // Cancelled, osascript never started, or the root command found
+            // that the restore needs a password and stopped before
+            // `disablesleep 1`: nothing ran as root that an undo would
+            // reverse. The journal and session.json go back exactly as they
+            // were and no pmset runs, so a sleep setting another tool owns
+            // is left alone. Nothing can use this attempt's marker any more, so one
             // that cannot be deleted does not hold the rollback back; it is
             // reported, and the next transaction tries it again.
             await clearPendingStart()
@@ -1989,7 +1991,7 @@ final class SessionManager {
     /// owner should re-enable it. Shown on its own menu line on every
     /// reconcile that finds it, and posted as a notification once per
     /// launch. Start is refused while the bit reads 1 (see
-    /// `checkPasswordlessRestore`), so the line is cleared by a recheck
+    /// `checkSleepSettingForStart`), so the line is cleared by a recheck
     /// that reads it as 0, or by a session start that found it 0.
     private func reportForeignSleepDisable() {
         foreignSleepWarning = Self.foreignSleepLine

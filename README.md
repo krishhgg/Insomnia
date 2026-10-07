@@ -90,13 +90,10 @@ The installer never writes that line, on any path. It asks for your password
 before it quits a running Insomnia, so cancelling the password prompt changes
 nothing and a running session keeps going. When a session is running it says
 the upgrade will end it before asking, and in a terminal it asks whether to
-continue. It stops with nothing changed if the app will not quit. Next it
-replaces `backstop.sh` and waits up to 30 s for any run of the old script to
-finish; if one is still running it stops before it writes the rule, so the
-installed app keeps working, and says to rerun. Only then does it write the
-rule and replace the app. If it stops between the two, an older build left
-installed cannot start a session until you rerun `./scripts/install.sh`, and
-the installer says so.
+continue. It stops with nothing changed if the app will not quit. Then,
+under the recovery lock, it writes the rule and replaces the app. If it stops
+between the two, an older build left installed cannot start a session until
+you rerun `./scripts/install.sh`, and the installer says so.
 Insomnia is not sandboxed. The app, scripts, and journals are local; hotspot
 passwords use the login Keychain, not the configuration file.
 
@@ -177,9 +174,12 @@ installer prints its pid.
    dialog left on screen after Insomnia crashed or was force-quit does
    nothing when you answer it, once Insomnia has relaunched or the recovery
    agent has run (within a minute). Insomnia shows no dialog at all while
-   the installed `backstop.sh` is older than the app, because an older one
-   cannot void such a dialog: Start then says to run `./scripts/install.sh`
-   again. If the `pending-start` file that guards such a dialog cannot be deleted,
+   the `backstop.sh` sealed in its bundle is missing or older than the app
+   expects, because an older one cannot void such a dialog: Start then says
+   to run `./scripts/install.sh` again. A password typed while the sudoers
+   rule is missing turns nothing off either: the start is undone and
+   Insomnia says to run the installer again (see How recovery works). If
+   the `pending-start` file that guards such a dialog cannot be deleted,
    Insomnia still turns sleep back on, but says so in the menu and a
    notification, keeps the journal entry, refuses new sessions, and retries
    until the file is gone.
@@ -288,13 +288,17 @@ has passed. It leaves a valid, unexpired session alone.
 Undoing never needs a password: the sudoers rule covers turning sleep back on,
 so the app, the agent, and the uninstaller can all restore sleep unattended.
 Turning sleep off is the only step that asks, and only when you press Enter.
-Before it asks, the app proves that turning sleep back on still needs no
-password by doing it: it runs `sudo -k -n /usr/bin/pmset -a disablesleep 0`
-while sleep is on, where the command changes nothing. `-k` makes sudo ignore
-a password you typed into it recently, so only the sudoers rule can let the
-command through. If `/etc/sudoers.d/insomnia` is gone or not in effect, no
-dialog appears, nothing is changed, and Insomnia tells you to run
-`scripts/install.sh` again.
+After you type the password, and before it turns sleep off, the command
+behind the dialog checks that turning sleep back on still needs no password
+by doing it: as root it switches to your account and runs
+`sudo -k -n /usr/bin/pmset -a disablesleep 0`, the command the session's end
+runs. `-k` makes sudo ignore a password you typed into it recently and `-n`
+makes it fail instead of asking, so only the sudoers rule lets the command
+through. If `/etc/sudoers.d/insomnia` is gone or not in effect, sleep is not
+turned off, the start is undone, and Insomnia tells you to run
+`scripts/install.sh` again. You find this out only after typing the
+password: the check needs root, and before the dialog the app runs nothing
+through sudo, it only reads `pmset -g`.
 When Insomnia starts up (login, or a relaunch after a crash) and finds a valid
 session on disk, it checks whether sleep is still off. If it is, the session
 continues; if something turned sleep back on in the meantime, the session ends
@@ -402,8 +406,13 @@ installation scenarios still need [release validation](docs/release-validation.m
   journal entry, a `SleepDisabled 1` in `pmset -g` is left alone: Insomnia
   did not set it and only its owner should undo it. The menu shows a warning
   and a notification gives the command, `sudo pmset -a disablesleep 0`.
-  Start is refused until it reads 0 again, since proving the passwordless
-  restore would turn sleep back on.
+  Start is refused until it reads 0 again, since the session's end would
+  turn sleep back on. That check is a read at Start: pmset cannot change
+  the setting only if it still holds a given value, so a `SleepDisabled 1`
+  another tool sets after Start has read `pmset -g` is not seen. Ending the
+  session sets it to 0 whoever set it, and if the tool sets it while the
+  password dialog is up, the check behind the dialog sets it to 0 for a
+  moment before Insomnia sets 1.
 - **Low Power Mode:** Insomnia checks the existing setting so it does not
   claim ownership of an already-enabled preference.
 - **App Nap:** off by default. When the setting is on, Insomnia journals each

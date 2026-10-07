@@ -198,29 +198,32 @@ Flag a change that breaks one of these; do not flag the behavior itself.
   and makes `uninstall.sh` refuse to remove anything. A cancelled dialog or
   an osascript that never launched ran nothing as root: the start restores
   the journal and session.json exactly and runs no pmset.
-- `BackstopVersion.swift`, `backstop.sh`, `install.sh`. Start reads the
-  installed `backstop.sh`'s `# insomnia-backstop-version:` line and shows no
-  dialog below version 2, the first that deletes `pending-start`; the user
-  is told to run `install.sh` again. It also shows no dialog unless
-  `SleepGuarding.checkPasswordlessRestore` passes first, with nothing
-  written before it: without the passwordless restore every undo would
-  fail and leave sleep off. The check runs the restore itself, `sudo -k -n
-  /usr/bin/pmset -a disablesleep 0`, because only a run shows whether sudo
-  wants a password (`-k` ignores a cached credential; `sudo -l` lists
-  commands the admin group may run with its password). It runs only while
-  `pmset -g` reports `SleepDisabled 0` or the journal already owes that
-  restore; a `SleepDisabled 1` the journal does not claim refuses Start
-  with nothing run, deliberately, so a setting another tool made stays.
-  `install.sh` checks the rule the same way after writing it, and leaves
-  the check to the app while `SleepDisabled` does not read 0. `install.sh` installs `backstop.sh`
-  under the recovery lock before the bundle (`install -S`, so a running old
-  script keeps its inode) and waits up to `RETIRE_WAIT_SECONDS` for runs of
-  the old script to exit, stopping before the sudoers rule if one stays. A
-  run is a process whose arguments are exactly `/bin/bash`, the installed
-  path and at most `--force`. The wait cannot use the recovery lock: the
-  installer holds it, and an old run is waiting on it. Bump the
-  version line and `BackstopVersion.required` together whenever the app
-  starts relying on new backstop behavior.
+- `BackstopVersion.swift`, `backstop.sh`. Start reads the
+  `# insomnia-backstop-version:` line of the `backstop.sh` sealed in the
+  bundle the agent runs and shows no dialog below version 2, the first
+  that deletes `pending-start`; the user is told to run `install.sh` again.
+  Bump the version line and `BackstopVersion.required` together whenever
+  the app starts relying on new backstop behavior.
+- `AdministratorPrompt.swift`, `SleepGuard.swift`, `install.sh`. Before the
+  dialog the app runs nothing through sudo:
+  `SleepGuarding.checkSleepSettingForStart` only reads `pmset -g`, and a
+  `SleepDisabled 1` the journal does not claim refuses Start with nothing
+  run, deliberately, so a setting another tool made stays. The proof that
+  the end can restore without a password is in the root command, after
+  the nonce and deadline checks and under the marker's lock:
+  `sudo -n -u "#$4" /usr/bin/sudo -k -n /usr/bin/pmset -a disablesleep 0`,
+  then `pmset -a disablesleep 1` only if that exited 0, else exit 5
+  (`restoreNeedsPassword`, rolled back with nothing to undo). Root's sudo
+  needs no password; the user's `-k` ignores a cached credential and `-n`
+  never prompts, so only a rule that lets the user run that exact command
+  passes. `sudo -l` is not proof (it lists commands the admin group may run
+  with its password, and lists without one once any rule is NOPASSWD).
+  Known and disclosed: pmset has no compare-and-set, so a `SleepDisabled 1`
+  another tool sets after Start's read is set to 0 by the end, and for a
+  moment by the check when set while the dialog is up; the user types the
+  password before a missing rule is reported; a sudoers without root's
+  default entry fails closed. `install.sh` runs no pmset: after writing
+  the rule it checks a `sudo -k -n -l` listing, which is not proof either.
 - `DisplayPower.swift`, `LidActions.swift`. On lid close, brightness 0 is
   the primary mechanism; the display sleep request (`IORequestIdle`) is
   best effort and is ignored while any process holds a display assertion,
@@ -244,7 +247,6 @@ Flag a change that breaks one of these; do not flag the behavior itself.
   running app is asked to quit, so a cancelled password changes nothing and
   a running session keeps going; when a session is running it says so first
   and, in a terminal, asks to continue. It then quits the app and, under the
-  recovery lock, installs `backstop.sh`, waits for older runs of it, writes
-  the sudoers file on the cached credential, and looks for a reopened app
-  right before it replaces the bundle. Every stop says what was installed so
+  recovery lock, looks for a reopened app and writes the sudoers file on
+  the cached credential before the recovery and the bundle swap. Every stop says what was installed so
   far; one after the rule is written gives the rerun command.
