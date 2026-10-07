@@ -567,7 +567,11 @@ running, and without the retry a session still live on disk would hold
 sleep with no battery floor until its deadline. If `unfinished-command.json`
 was on disk, that command has exited by the time the reconcile holds the
 lock, so a session it resumes is checked against Low Power Mode as after a
-command the app itself left running (below).
+command the app itself left running (below). The check stays owed when a
+later attempt is refused for an unreadable journal, although that refusal
+removes the record. A start that makes a session active before the retry
+runs the check for that session instead. An end restores the mode from the
+journal and owes no check.
 
 Backstop, independent of the app:
 

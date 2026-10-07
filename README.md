@@ -269,12 +269,13 @@ installation scenarios still need [release validation](docs/release-validation.m
   menu. It gives the pid and `sudo kill`, in one notification as well,
   only while that pid still has the recorded start time and boot session;
   otherwise it says the command has exited, since the pid may now belong
-  to another process. The relaunch tries again every 30 s. Once the
-  command has exited, it resumes a session that has not expired, with its
-  battery floors, and checks Low Power Mode the way it does after its own
-  command exits, described below. Until the command exits, Insomnia
-  refuses to quit or start a session, and records any end or lid event it
-  refuses. A
+  to another process. The relaunch tries again 30 s after each refusal.
+  Once the command has exited, it resumes a session that has not expired,
+  with its battery floors, and checks Low Power Mode the way it does after
+  its own command exits, described below. A session the user starts
+  before that next try gets the same check. Until the command exits,
+  Insomnia refuses to quit or start a session, and records any end or lid
+  event it refuses. A
   `disablesleep 0` or `lowpowermode 0` that exits 0 counts as done: its
   journal entry is cleared before the lock is released, and the command
   is not run again. If that journal write fails, the menu says so and the

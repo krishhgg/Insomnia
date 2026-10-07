@@ -242,6 +242,15 @@ final class SessionManager {
     @ObservationIgnored private var settleRetry: Task<Void, Never>?
     /// The launch reconcile waiting to run again after a refusal.
     @ObservationIgnored private var reconcileRetry: Task<Void, Never>?
+    /// A reconcile found the record of a `sudo pmset` an earlier run left
+    /// running, so the session it resumes is owed a Low Power Mode check
+    /// (`settleEarlierCommand`). Kept here, not read from disk on each
+    /// attempt: `exclusive` removes the record even when it then refuses
+    /// the transaction for an unreadable journal. Owed until a reconcile or
+    /// start makes a session active and hands it to `settleAfterCommand`;
+    /// cleared by a reconcile that leaves no session, and by an end, which
+    /// restores the mode from the journal.
+    @ObservationIgnored private var earlierCommandCheckOwed = false
     /// Whether this launch has posted the notification for a SleepDisabled
     /// bit Insomnia did not set (reconcile step 3), so a bit that stays set
     /// is announced once, not on every reconcile.
@@ -797,6 +806,9 @@ final class SessionManager {
         }
         let ticket = endTicket
         _ = await exclusive("start") { await self.performStart(duration: duration, ticket: ticket) }
+        // A start that goes through before a refused launch reconcile runs
+        // again drops that reconcile, and takes over its check.
+        await settleEarlierCommand()
     }
 
     private func performStart(duration: TimeInterval, ticket: Int) async {
@@ -976,11 +988,12 @@ final class SessionManager {
         session = nil
         // Every lid action is undone from the journal below, or by the
         // retry of this end, and Low Power Mode restored from it: a lid
-        // event refused earlier and a settle pass waiting to run again
-        // owe nothing.
+        // event refused earlier, a settle pass waiting to run again and
+        // the check owed for an earlier run's command owe nothing.
         lidEventDeferred = false
         settleRetry?.cancel()
         settleRetry = nil
+        earlierCommandCheckOwed = false
         scheduledDeadline = nil
         remainingText = ""
         countdownText = ""
@@ -1542,6 +1555,8 @@ final class SessionManager {
     /// the lock, and may have changed Low Power Mode after the journal was
     /// written. A session resumed after it is checked against the mode, as
     /// after a command this process left running (`settleAfterCommand`).
+    /// The check stays owed across refusals, and goes to a session a start
+    /// makes active first (`earlierCommandCheckOwed`).
     func reconcile() async {
         reconcileRetry?.cancel()
         reconcileRetry = nil
@@ -1551,7 +1566,7 @@ final class SessionManager {
     private func reconcile(ticket: Int, isRetry: Bool) async {
         // This process removes the record of its own command when that
         // command exits, so a record on disk now was left by an earlier run.
-        let leftRunning = store.loadUnfinishedCommand() != nil
+        if store.loadUnfinishedCommand() != nil { earlierCommandCheckOwed = true }
         let result = await exclusive("reconcile") { () -> Bool in
             if isRetry, !self.reconcileIsOwed(since: ticket) { return false }
             await self.performReconcile()
@@ -1559,12 +1574,22 @@ final class SessionManager {
         }
         switch result {
         case .success(true):
-            if leftRunning { await settleAfterCommand() }
+            // No session: the journal held no claim, or an end restores it.
+            if session == nil { earlierCommandCheckOwed = false }
+            await settleEarlierCommand()
         case .success(false):
             break
         case .failure:
             scheduleReconcileRetry(ticket: ticket)
         }
+    }
+
+    /// Hand the check owed for an earlier run's command to the session a
+    /// reconcile or start has just made active. Without one it stays owed.
+    private func settleEarlierCommand() async {
+        guard earlierCommandCheckOwed, session != nil else { return }
+        earlierCommandCheckOwed = false
+        await settleAfterCommand()
     }
 
     private func scheduleReconcileRetry(ticket: Int) {
@@ -1582,7 +1607,8 @@ final class SessionManager {
 
     /// A refused reconcile is moot once a start has made a session active
     /// or an end has been requested: the start replaced the session on
-    /// disk, and restoring the journal is the end's job from then on.
+    /// disk and took over the Low Power check, and restoring the journal is
+    /// the end's job from then on.
     /// Checked before the retry queues and again once it holds the lock.
     private func reconcileIsOwed(since ticket: Int) -> Bool {
         guard session == nil, endTicket == ticket else {

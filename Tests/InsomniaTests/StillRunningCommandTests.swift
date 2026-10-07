@@ -350,6 +350,80 @@ final class StillRunningCommandTests: XCTestCase {
         XCTAssertFalse(h.guardFake.sleepDisabled)
     }
 
+    /// The record an earlier run left of a `lowpowermode 1` that did not
+    /// stop on SIGTERM. The command has since exited and failed: Low Power
+    /// Mode is off (`FakeSleepGuard` starts with it off).
+    private func recordFailedLowPowerEnable() throws {
+        try h.store.saveUnfinishedCommand(UnfinishedCommandRecord(
+            pid: 4321,
+            command: "/usr/bin/sudo -n /usr/bin/pmset -a lowpowermode 1",
+            since: h.clock.now,
+            identity: FakeSleepGuard.identity(of: 4321)
+        ))
+    }
+
+    /// The relaunch finds the record of the command and a free lock, but
+    /// state.json does not decode. The refusal removes the record; once
+    /// the file is fixed, the retry still checks the mode for the session
+    /// it resumes, and the Low Power Mode floor acts on it again.
+    func testLaunchReconcileRefusedForAnUnreadableJournalStillChecksTheMode() async throws {
+        let session = try liveSessionOnDisk()
+        try recordFailedLowPowerEnable()
+        let stateFile = h.home.paths.stateFile
+        let journal = try Data(contentsOf: stateFile)
+        try Data("{".utf8).write(to: stateFile)
+        let m = h.makeManager(retryDelay: 0.1)
+        let resyncs = Locked<[Bool]>([])
+        m.resyncAfterCommand = { resyncs.value.append($0) }
+        let floors = FloorRuleDriver(manager: m, notifier: h.notifier)
+
+        await m.reconcile()
+
+        XCTAssertNil(m.session)
+        XCTAssertNil(h.store.loadUnfinishedCommand(), "precondition: the refusal removes the record")
+        XCTAssertEqual(h.guardFake.calls, [])
+        try journal.write(to: stateFile)
+        await waitUntil("the resumed session was never checked against the mode") { resyncs.value == [false] }
+
+        XCTAssertEqual(m.session, session)
+        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1", "pmset -g custom", "lowpowermode 0"])
+        XCTAssertEqual(try h.store.loadState()?.lowPowerSetByUs, false, "ownership of a mode that is off was kept")
+        await floors.run(battery: .percent(30), isCharging: false, thermal: .nominal, lidClosed: false)
+        XCTAssertTrue(h.guardFake.lowPowerOn, "the Low Power Mode floor did not act on the resumed session")
+    }
+
+    /// The command exits while the refused launch reconcile waits to run
+    /// again, and the user starts a session first. The start drops the
+    /// reconcile and runs the check it owed: the journal it keeps still
+    /// claims the mode the failed command never switched on.
+    func testStartBeforeTheReconcileRetryTakesOverTheModeCheck() async throws {
+        let old = try liveSessionOnDisk()
+        try recordFailedLowPowerEnable()
+        h.processes.run(4321, as: FakeSleepGuard.identity(of: 4321))
+        // Stands in for the command, which holds the lock through its stdin.
+        let command = try XCTUnwrap(try RecoveryLock(url: h.home.paths.recoveryLock).tryAcquire())
+        let m = h.makeManager()
+        let resyncs = Locked<[Bool]>([])
+        m.resyncAfterCommand = { resyncs.value.append($0) }
+        let floors = FloorRuleDriver(manager: m, notifier: h.notifier)
+
+        await m.reconcile()
+        XCTAssertNil(m.session)
+        command.release()
+        h.processes.entries = [:]
+        await m.start(duration: 3600)
+
+        let session = try XCTUnwrap(m.session)
+        XCTAssertNotEqual(session, old)
+        XCTAssertEqual(try h.store.loadSession(), session)
+        XCTAssertNil(h.store.loadUnfinishedCommand())
+        XCTAssertEqual(resyncs.value, [false], "the started session was never checked against the mode")
+        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1", "pmset -g custom", "lowpowermode 0"])
+        XCTAssertEqual(try h.store.loadState()?.lowPowerSetByUs, false, "ownership of a mode that is off was kept")
+        await floors.run(battery: .percent(30), isCharging: false, thermal: .nominal, lidClosed: false)
+        XCTAssertTrue(h.guardFake.lowPowerOn, "the Low Power Mode floor did not act on the started session")
+    }
+
     /// A start whose `disablesleep 1` is left running is not surfaced, and
     /// nothing is rolled back: session.json and the journal entry stay so
     /// the backstop can honour the deadline if Insomnia dies first. The undo
