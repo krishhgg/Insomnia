@@ -83,8 +83,9 @@ final class TempHome {
 /// running after SIGTERM and hands out `unfinished`, which the test ends
 /// with `markExited()`. `.succeed` keeps the root command's rules, in its
 /// order: exit 3 unless the marker holds the nonce, 4 at or after the
-/// deadline, 6 while `sleepOffNow` reads a 1 the start does not own, and 5
-/// with `restoreNeedsPassword`. `onShow` runs when the dialog is shown,
+/// deadline, 5 with `restoreNeedsPassword` (sudo's answers are read before
+/// pmset), and 6 while `sleepOffNow` reads a 1 the start does not own.
+/// None of them writes anything. `onShow` runs when the dialog is shown,
 /// before the mode's answer. Never shows anything and never runs pmset.
 final class FakeAdministratorPrompt: AdministratorPromptRunning, @unchecked Sendable {
     enum Mode { case succeed, cancel, fail, launchFail, hang, stuck }
@@ -127,8 +128,9 @@ final class FakeAdministratorPrompt: AdministratorPromptRunning, @unchecked Send
         set { lock.withLock { _now = newValue } }
     }
     /// /etc/sudoers.d/insomnia is missing or not in effect: a `.succeed`
-    /// answer whose marker and deadline pass then fails the root command's
-    /// restore check, which turns sleep back on and exits 5.
+    /// answer whose marker and deadline pass then exits 5, as the root
+    /// command does when sudo does not confirm the restore, before it reads
+    /// or writes pmset.
     var restoreNeedsPassword: Bool {
         get { lock.withLock { _restoreNeedsPassword } }
         set { lock.withLock { _restoreNeedsPassword = newValue } }
@@ -156,11 +158,11 @@ final class FakeAdministratorPrompt: AdministratorPromptRunning, @unchecked Send
             guard now() < start.deadline else {
                 throw AdministratorPromptError.refused(rootStatus: 4, stderr: "execution error: the session this password was for has already ended; sleep was not turned off (4)")
             }
+            guard !restoreNeedsPassword else {
+                throw AdministratorPromptError.restoreNeedsPassword(stderr: "execution error: sudo: a password is required\rsudo -k -n -l did not list this user's sudoers rules without a password, or listed Runas or command-specific Defaults, which apply to the restore but not to this check; sleep was not turned off (5)")
+            }
             guard start.sleepOffIsOurs || !sleepOffNow() else {
                 throw AdministratorPromptError.refused(rootStatus: 6, stderr: "execution error: pmset -g shows a SleepDisabled 1 this start did not set, or could not be read; it was left alone and sleep was not turned off (6)")
-            }
-            guard !restoreNeedsPassword else {
-                throw AdministratorPromptError.restoreNeedsPassword(stderr: "execution error: sudo: a password is required\rturning sleep back on needs a password, so it was turned back on at once and not left off (5)")
             }
             return
         case .cancel:
@@ -1043,54 +1045,339 @@ struct RootCommandRun {
     /// Arguments of each pmset call, in order.
     let pmsetCalls: [String]
     /// Who ran each pmset call, in the same order: `root`, or the uid the
-    /// fake sudo switched to (the restore check, run as that user).
+    /// fake sudo switched to.
     let pmsetAs: [String]
-    /// Arguments of each sudo call, in order, with the fakes' paths shown
-    /// as /usr/bin/sudo and /usr/bin/pmset.
+    /// Arguments of each sudo call, in order: root's, and each sudo of the
+    /// user's it started. The fakes' paths are shown as /usr/bin/sudo,
+    /// /usr/bin/env and /usr/bin/pmset.
     let sudoCalls: [String]
+    /// Arguments of each /usr/bin/env call, shown the same way.
+    let envCalls: [String]
     /// The fake machine's SleepDisabled once the command has exited: what
     /// the fake pmset last wrote, or what the test or a simulated other
     /// tool set (`0`, `1`, or `fail`).
     let sleepDisabled: String
 }
 
-/// What the fake sudo behind the root command lets through
-/// (RootCommandProcess). Root runs anything as any user without a
-/// password, as the default /etc/sudoers allows, except under
-/// `noRootEntry`. The user who pressed Start (the uid the command is
-/// given) gets:
-enum RootSudoPolicy: String {
-    /// /etc/sudoers.d/insomnia in effect: the exact restore line,
-    /// `/usr/bin/pmset` followed by `PmsetSleepGuard.restoreArguments`,
-    /// runs without a password, for this user only.
+/// What sudo prints, built the way sudo 1.9.17p2 builds it (Apple's
+/// sudo-114.100.11 carries the same code), for the fake sudo behind the
+/// root command and for the tests that feed the root command's awk
+/// programs. None of it was captured from a running sudo: each shape
+/// follows format strings in the source kept with the round 18 evidence.
+/// `sudo -V` comes from src/sudo.c (`Sudo version %s`) and each plugin's
+/// version function: plugins/sudoers/policy.c (the policy plugin and
+/// grammar lines; more only for root), iolog.c and audit.c. `sudo -l`
+/// comes from display_privs in plugins/sudoers/display.c, with Defaults
+/// as sudoers_format_default in fmtsudoers.c writes them, and `sudo -ll
+/// command` from display_cmnd and display_cmndspec_long. Neither wraps
+/// on a pipe: display_privs sets the width to 0 for a FIFO, and
+/// display_cmnd always does.
+enum SudoFormat {
+    static let version = "1.9.17p2"
+
+    /// `sudo -V` as a user other than root: sudo's line, the sudoers
+    /// policy plugin's two lines, then one line per other plugin loaded,
+    /// by default sudoers' own I/O and audit plugins.
+    static func versionOutput(_ v: String = version, io: Bool = true, audit: Bool = true, more: [String] = []) -> String {
+        var lines = ["Sudo version \(v)", "Sudoers policy plugin version \(v)", "Sudoers file grammar version 50"]
+        if io { lines.append("Sudoers I/O plugin version \(v)") }
+        if audit { lines.append("Sudoers audit plugin version \(v)") }
+        return (lines + more).map { $0 + "\n" }.joined()
+    }
+
+    /// The Defaults in macOS's own /etc/sudoers, as `sudo -l` prints them:
+    /// `+=` with no blanks around it, and a value with a blank in double
+    /// quotes.
+    static let macDefaults = [
+        "env_reset", "env_keep+=BLOCKSIZE", "env_keep+=\"COLORFGBG COLORTERM\"", "env_keep+=__CF_USER_TEXT_ENCODING",
+        "env_keep+=\"CHARSET LANG LANGUAGE LC_ALL LC_COLLATE LC_CTYPE\"", "env_keep+=\"LC_MESSAGES LC_MONETARY LC_NUMERIC LC_TIME\"",
+        "env_keep+=\"LINES COLUMNS\"", "env_keep+=LSCOLORS", "env_keep+=SSH_AUTH_SOCK", "env_keep+=TZ",
+        "env_keep+=\"DISPLAY XAUTHORIZATION XAUTHORITY\"", "env_keep+=\"EDITOR VISUAL\"", "env_keep+=\"HOME MAIL\"",
+        "lecture_file=/etc/sudo_lecture", "!log_allowed",
+    ]
+
+    /// `sudo -l`: the Defaults that apply to the user, then any Defaults
+    /// bound to a Runas user or a command, each group under its header and
+    /// followed by a blank line, then one line per matching sudoers line,
+    /// `(runas) TAGS: command`.
+    static func listing(user: String = "user", host: String = "mac", defaults: [String] = macDefaults, bound: [String] = [], rules: [String]) -> String {
+        var text = ""
+        if !defaults.isEmpty {
+            text += "Matching Defaults entries for \(user) on \(host):\n    " + defaults.joined(separator: ", ") + "\n\n"
+        }
+        if !bound.isEmpty {
+            text += "Runas and Command-specific defaults for \(user):\n" + bound.map { "    " + $0 }.joined(separator: "\n") + "\n\n"
+        }
+        return text + "User \(user) may run the following commands on \(host):\n" + rules.map { "    \($0)\n" }.joined()
+    }
+
+    /// One rule in `sudo -ll`'s long form: where it came from, its run-as
+    /// user, its options (an `Options:` line only when it has any), any
+    /// limits, then its commands, each after a tab.
+    static func longEntry(source: String = "Sudoers entry: /private/etc/sudoers.d/insomnia", runAsUsers: String = "root", options: [String] = ["!authenticate"], limits: [String] = [], commands: [String]) -> String {
+        var text = source + "\n    RunAsUsers: \(runAsUsers)\n"
+        if !options.isEmpty { text += "    Options: " + options.joined(separator: ", ") + "\n" }
+        text += limits.map { "    \($0)\n" }.joined()
+        return text + "    Commands:\n" + commands.map { "\t\($0)\n" }.joined()
+    }
+
+    /// `sudo -ll command` when the last rule that matches allows it: that
+    /// rule's long form, then `Matched:` and the command as asked. When
+    /// that rule denies it, or no rule matches, sudo prints nothing to
+    /// stdout and exits 1.
+    static func check(_ entry: String, matched: String) -> String {
+        entry + "    Matched: \(matched)\n"
+    }
+}
+
+/// One answer of the fake sudo: what it prints, and its exit status.
+struct SudoAnswer {
+    var stdout = ""
+    var stderr = ""
+    var status: Int32 = 0
+
+    /// sudo -n when it would have to ask for a password.
+    static let passwordRequired = SudoAnswer(stderr: "sudo: a password is required\n", status: 1)
+}
+
+/// What the fake sudo answers under one RootSudoPolicy.
+struct SudoAnswers {
+    /// `sudo -V`, as the user.
+    var version = SudoAnswer(stdout: SudoFormat.versionOutput())
+    /// `sudo -k -n -l`.
+    var listing: SudoAnswer
+    /// `sudo -k -n -ll <the restore line>`.
+    var check: SudoAnswer
+    /// Root's `sudo -n -u #<uid> ...` when root may not switch to the
+    /// user; nil when it may.
+    var root: SudoAnswer?
+    /// The commands the user may run without a password, as given to sudo.
+    var runs: [String]
+}
+
+/// A sudoers policy for the fake sudo behind the root command
+/// (RootCommandProcess, FakeDialogMachine). Root runs anything as any user
+/// without a password, as macOS's `root ALL = (ALL) ALL` allows, except
+/// under `noRootEntry`. The user who pressed Start (the uid the command is
+/// given) is an administrator, whose `%admin ALL = (ALL) ALL` needs a
+/// password, and has:
+enum RootSudoPolicy: String, CaseIterable {
+    /// /etc/sudoers.d/insomnia as install.sh writes it: the restore line
+    /// and the two Low Power Mode lines, NOPASSWD, as root, for this user.
     case rule
-    /// No rule, but another passwordless entry: `sudo -l` lists without a
-    /// password, and running pmset needs the password (the admin group's
-    /// rule).
+    /// The same, with sudo naming the file /etc/sudoers.d/insomnia (an
+    /// `#includedir /etc/sudoers.d`).
+    case etcPath
+    /// No rule, but another NOPASSWD entry (`/usr/bin/true`), so sudo
+    /// lists without a password; the restore matches only the admin
+    /// group's `(ALL) ALL`, which needs one.
     case listOnly
-    /// No rule, and a credential cached by a recent sudo in a terminal:
-    /// everything runs unless `-k` makes sudo ignore that credential.
-    case cached
-    /// No rule at all: everything needs the password.
+    /// No NOPASSWD entry at all (no rule, or the rule without NOPASSWD and
+    /// nothing else): a listing needs the password.
     case noRule
-    /// A rule for the exact restore line, but without NOPASSWD: running it
-    /// (and `sudo -l`) needs the password.
-    case passwd
-    /// A rule that denies the restore (`!/usr/bin/pmset`): sudo refuses
-    /// without asking for a password.
+    /// The rule without NOPASSWD, beside another NOPASSWD entry: sudo
+    /// lists, and the rule has no `Options:` line.
+    case noTag
+    /// The rule, then `!/usr/bin/pmset`: sudo denies the restore and
+    /// prints nothing for it.
     case deny
-    /// The rule is in effect, but root's own entry was removed from
-    /// /etc/sudoers, so root cannot run anything as the user.
+    /// The rule, and in a later file the restore line without NOPASSWD,
+    /// which wins: the restore needs a password.
+    case laterRule
+    /// The rule, and `Defaults!/usr/bin/pmset log_output`, which applies
+    /// when the restore runs but not to a listing.
+    case boundDefaults
+    /// The rule as `(ALL) NOPASSWD:`.
+    case runAsAll
+    /// The rule as `NOPASSWD: LOG_OUTPUT:`.
+    case extraOption
+    /// The rule with `NOTAFTER=20261231000000Z`.
+    case timeLimited
+    /// The rule from LDAP.
+    case ldap
+    /// The rule, and a sudo that answers `-ll command` with the bare
+    /// command, as `sudo -l command` does.
+    case pathOnly
+    /// The rule, and an answer cut off inside its command line.
+    case truncated
+    /// The rule, and sudo 1.9.14p3.
+    case oldSudo
+    /// The rule, and an approval plugin loaded beside sudoers.
+    case approvalPlugin
+    /// The rule, but root's own entry is gone from /etc/sudoers, so root
+    /// cannot switch to the user.
     case noRootEntry
+
+    /// The answers, for sudoers lines that name pmset as `pmset`: the
+    /// real /usr/bin/pmset, or the fake standing in for it.
+    func answers(pmset: String = "/usr/bin/pmset") -> SudoAnswers {
+        let restore = ([pmset] + PmsetSleepGuard.restoreArguments).joined(separator: " ")
+        let lines = [restore, "\(pmset) -b lowpowermode 1", "\(pmset) -b lowpowermode 0"]
+        let admin = "(ALL) ALL"
+        let other = "(root) NOPASSWD: /usr/bin/true"
+        let ruleCheck = SudoFormat.check(SudoFormat.longEntry(commands: [restore]), matched: restore)
+        func check(_ entry: String) -> SudoAnswer { SudoAnswer(stdout: SudoFormat.check(entry, matched: restore)) }
+        var a = SudoAnswers(
+            listing: SudoAnswer(stdout: SudoFormat.listing(rules: [admin] + lines.map { "(root) NOPASSWD: \($0)" })),
+            check: SudoAnswer(stdout: ruleCheck), runs: lines)
+        switch self {
+        case .rule:
+            break
+        case .etcPath:
+            a.check = check(SudoFormat.longEntry(source: "Sudoers entry: /etc/sudoers.d/insomnia", commands: [restore]))
+        case .listOnly:
+            a.listing.stdout = SudoFormat.listing(rules: [admin, other])
+            a.check = check(SudoFormat.longEntry(source: "Sudoers entry: /private/etc/sudoers", runAsUsers: "ALL", options: [], commands: ["ALL"]))
+            a.runs = []
+        case .noRule:
+            a.listing = .passwordRequired
+            a.check = .passwordRequired
+            a.runs = []
+        case .noTag:
+            a.listing.stdout = SudoFormat.listing(rules: [admin] + lines.map { "(root) \($0)" } + [other])
+            a.check = check(SudoFormat.longEntry(options: [], commands: [restore]))
+            a.runs = []
+        case .deny:
+            a.listing.stdout = SudoFormat.listing(rules: [admin] + lines.map { "(root) NOPASSWD: \($0)" } + ["(root) !\(pmset)"])
+            a.check = SudoAnswer(status: 1)
+            a.runs = []
+        case .laterRule:
+            a.listing.stdout = SudoFormat.listing(rules: [admin] + lines.map { "(root) NOPASSWD: \($0)" } + ["(root) \(restore)"])
+            a.check = check(SudoFormat.longEntry(source: "Sudoers entry: /private/etc/sudoers.d/zz-local", options: [], commands: [restore]))
+            a.runs = Array(lines.dropFirst())
+        case .boundDefaults:
+            a.listing.stdout = SudoFormat.listing(bound: ["Defaults!\(pmset) log_output"], rules: [admin] + lines.map { "(root) NOPASSWD: \($0)" })
+        case .runAsAll:
+            a.listing.stdout = SudoFormat.listing(rules: [admin] + lines.map { "(ALL) NOPASSWD: \($0)" })
+            a.check = check(SudoFormat.longEntry(runAsUsers: "ALL", commands: [restore]))
+        case .extraOption:
+            a.listing.stdout = SudoFormat.listing(rules: [admin] + lines.map { "(root) NOPASSWD: LOG_OUTPUT: \($0)" })
+            a.check = check(SudoFormat.longEntry(options: ["!authenticate", "log_output"], commands: [restore]))
+        case .timeLimited:
+            a.listing.stdout = SudoFormat.listing(rules: [admin] + lines.map { "(root) NOTAFTER=20261231000000Z NOPASSWD: \($0)" })
+            a.check = check(SudoFormat.longEntry(limits: ["NotAfter: 20261231000000Z"], commands: [restore]))
+        case .ldap:
+            a.check = check(SudoFormat.longEntry(source: "LDAP Role: insomnia", commands: [restore]))
+        case .pathOnly:
+            a.check.stdout = restore + "\n"
+        case .truncated:
+            a.check.stdout = String(ruleCheck[..<ruleCheck.range(of: "disablesleep")!.lowerBound])
+        case .oldSudo:
+            a.version.stdout = SudoFormat.versionOutput("1.9.14p3")
+        case .approvalPlugin:
+            a.version.stdout = SudoFormat.versionOutput(more: ["Sample approval plugin version \(SudoFormat.version)"])
+        case .noRootEntry:
+            a.root = SudoAnswer(stderr: "root is not in the sudoers file.\n", status: 1)
+        }
+        return a
+    }
+}
+
+/// Writes `answers` where fakeSudoScript reads them: `<name>.out`,
+/// `.err` and `.status` for `version`, `list`, `check`, `other` (a user
+/// with no sudoers lines) and, when root may not switch, `root`; and
+/// `runs`, one command per line.
+func writeSudoAnswers(_ answers: SudoAnswers, to dir: URL) throws {
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    let named: [(String, SudoAnswer?)] = [("version", answers.version), ("list", answers.listing), ("check", answers.check), ("other", .passwordRequired), ("root", answers.root)]
+    for (name, answer) in named {
+        for ext in ["out", "err", "status"] { try? FileManager.default.removeItem(at: dir.appendingPathComponent("\(name).\(ext)")) }
+        guard let answer else { continue }
+        try Data(answer.stdout.utf8).write(to: dir.appendingPathComponent("\(name).out"))
+        try Data(answer.stderr.utf8).write(to: dir.appendingPathComponent("\(name).err"))
+        try Data(String(answer.status).utf8).write(to: dir.appendingPathComponent("\(name).status"))
+    }
+    try Data(answers.runs.map { $0 + "\n" }.joined().utf8).write(to: dir.appendingPathComponent("runs"))
+}
+
+/// A fake /usr/bin/sudo that answers from the files writeSudoAnswers put
+/// in `answers` and logs each call's arguments to `log`. `FAKE_SUDO_AS`
+/// says who invoked it: `0` for root, a uid once root switched with `-u`,
+/// unset for the user running the tests (as the app runs sudo). Root runs
+/// any command as any user without a password, unless `root.status`
+/// exists. Anyone gets the `version` answer for `-V`. The tests' user gets
+/// `list` for `-k -n -l` and `check` for `-k -n -ll <restore>`, and any
+/// other user the `other` answer. A command runs only for the tests' user,
+/// and only when it is one of `runs`; /usr/bin/pmset, the path the app
+/// runs, stands for the fake pmset that starts `restore`. Anything the
+/// root command never asks (a listing without `-k -n`, a prompt) exits 2
+/// with `fake sudo:`.
+/// `before` and `after` are shell lines that see `$sig`, `sudo
+/// <arguments>`: `before` runs before the call does anything, `after` once
+/// an answer is printed.
+func fakeSudoScript(log: URL, answers: URL, restore: String, before: String = "", after: String = "") -> String {
+    """
+    #!/bin/bash
+    printf '%s\\n' "$*" >> '\(log.path)'
+    sig="sudo $*"
+    \(before)
+    who="${FAKE_SUDO_AS:-\(getuid())}"
+    k=0; l=0; n=0; v=0; u=""
+    while [[ "${1:-}" == -* ]]; do
+      case "$1" in
+        -k) k=1 ;; -n) n=1 ;; -V) v=1 ;; -l) l=$((l + 1)) ;; -ll) l=$((l + 2)) ;;
+        -u) shift; u="${1:-}" ;;
+        *) echo "fake sudo: unexpected option $1" >&2; exit 2 ;;
+      esac
+      shift
+    done
+    a='\(answers.path)'
+    reply() {
+      /bin/cat "$a/$1.out"; /bin/cat "$a/$1.err" >&2
+      rc="$(/bin/cat "$a/$1.status")"
+      \(after)
+      exit "$rc"
+    }
+    if [[ "$who" == 0 ]]; then
+      (( n && !k && !l && !v )) || { echo "fake sudo: root asked for $sig" >&2; exit 2; }
+      [[ -e "$a/root.status" ]] && reply root
+      [[ "$u" =~ ^#[0-9]+$ ]] || { echo "sudo: unknown user $u" >&2; exit 1; }
+      export FAKE_SUDO_AS="${u#\\#}"
+      exec "$@"
+    fi
+    (( v )) && reply version
+    if (( l )); then
+      (( k && n )) || { echo "fake sudo: a listing without -k and -n: $sig" >&2; exit 2; }
+      [[ "$who" == '\(getuid())' ]] || reply other
+      (( l == 1 && $# == 0 )) && reply list
+      (( l == 2 )) && [[ "$*" == '\(restore)' ]] && reply check
+      echo "fake sudo: a listing the root command never asks for: $sig" >&2; exit 2
+    fi
+    (( n )) || { echo "fake sudo: would have prompted" >&2; exit 2; }
+    cmd=("$@")
+    [[ "${1:-}" == /usr/bin/pmset ]] && cmd[0]='\(restore.prefix { $0 != " " })'
+    if [[ "$who" == '\(getuid())' ]] && /usr/bin/grep -qxF -- "${cmd[*]}" "$a/runs"; then exec "${cmd[@]}"; fi
+    echo "sudo: a password is required" >&2
+    exit 1
+    """
+}
+
+/// A fake /usr/bin/env for the root command's `env -i LC_ALL=C sudo ...`.
+/// It logs its arguments to `log`, exits 2 unless they start with `-i
+/// LC_ALL=C`, and runs the rest with only `LC_ALL=C` and the `FAKE_`
+/// variables in its environment. Those stand for the fake machine (whom
+/// the fake sudo switched to, RootCommandProcess's hooks); on a real Mac
+/// the uid is the kernel's, which `env -i` cannot clear.
+func fakeEnvScript(log: URL) -> String {
+    """
+    #!/bin/bash
+    printf '%s\\n' "$*" >> '\(log.path)'
+    [[ "${1:-}" == -i && "${2:-}" == LC_ALL=C ]] || { echo "fake env: not -i LC_ALL=C: $*" >&2; exit 2; }
+    shift 2
+    keep=()
+    for name in $(compgen -e FAKE_); do keep+=("$name=${!name}"); done
+    exec /usr/bin/env -i LC_ALL=C "${keep[@]}" "$@"
+    """
 }
 
 /// A clock for the root command's `/bin/date +%s` (RootCommandProcess):
-/// it reads `start` until the restore check's `pmset -a disablesleep 0`
-/// has run, and `afterRestore` from then on, as if the check took that
-/// long. No wall clock is involved.
+/// it reads `start` until the call `at` (a signature, such as
+/// `RootCommandProcess.ruleQuery`) has answered, and `later` from then on,
+/// as if that call took that long. No wall clock is involved.
 struct RootCommandClock {
     let start: Int
-    let afterRestore: Int
+    let later: Int
+    let at: String
 }
 
 /// The root command as `AdministratorPrompt.disableSleepScript` embeds it:
@@ -1128,150 +1415,135 @@ func appleScriptQuotedForm(_ s: String) -> String {
 /// The command the dialog runs as root, started the way the dialog starts
 /// it: `/bin/sh -c` on the line `do shell script` builds, `<markerLock>
 /// '<marker>' /bin/sh -c '<rootCommand>' insomnia '<marker>' '<nonce>'
-/// '<deadline>' '<uid>'`, quoted as `quoted form of` quotes it. The
-/// deadline is an hour from now and the uid this process's unless given.
-/// The real /usr/bin/lockf takes the marker's lock and the real /bin/date
-/// tells the time. It runs as the current user with `dir` as its working
-/// directory. `/usr/bin/pmset` is replaced by a fake in `dir` that records
-/// its arguments, and `/usr/bin/sudo` by a fake that records its arguments
-/// and answers as `policy` says (RootSudoPolicy); neither changes anything
-/// on the machine. With `holdPmset` the fake pmset, once called with
-/// `holdAt`, waits until `release()` (60 s at most, and only while `dir`
-/// exists), so a test can act while the command holds the marker's lock.
+/// '<deadline>' '<uid>' '<owned>'`, quoted as `quoted form of` quotes it.
+/// The deadline is an hour from now, the uid this process's and `owned`
+/// `0` unless given. The real /usr/bin/lockf takes the marker's lock and
+/// the real /bin/date tells the time. It runs as the current user with
+/// `dir` as its working directory, and nothing it runs changes the
+/// machine: `/usr/bin/pmset`, `/usr/bin/sudo` and `/usr/bin/env` are
+/// replaced by fakes in `dir`. The fake sudo answers as `policy` says
+/// (RootSudoPolicy, fakeSudoScript), the fake env checks for `-i
+/// LC_ALL=C` (fakeEnvScript), and the fake pmset records its arguments.
 /// `command` is `AdministratorPrompt.rootCommand` unless given (a test
 /// passes the copy embedded in the AppleScript). With `clock`, `/bin/date`
 /// is replaced by a fake that reads it (RootCommandClock).
 ///
-/// The fake pmset keeps one SleepDisabled value in a file, starting at
-/// `sleepDisabled` (`0`, `1`, or `fail`, which makes `pmset -g` fail):
-/// `-g` prints it in `pmset -g`'s shape (or `pmsetOutput` verbatim), and
-/// `-a disablesleep N` writes N. `foreignAfter` is another tool: right
-/// after the first pmset call with those arguments, it sets SleepDisabled
-/// to 1, once. `-g` is the read before anything is written, `-a
-/// disablesleep 1` the change made before the restore check, and `-a
-/// disablesleep 0` the check's own write (or root's restore when the check
-/// fails). `owned` is the command's `$5`, `0` unless given. With
-/// `holdPmset` and the default `holdAt`, the hold comes at the first `-a
-/// disablesleep 1`, before it writes, with sleep still on. `foreignSets` is
-/// the value that other tool writes, `1` unless given (`fail` makes the
-/// next `pmset -g` fail). With `rootRestoreFails`, a `-a disablesleep 0`
-/// that root runs itself (not the check, run as the user) fails and writes
-/// nothing. With `outputClosed`, the command's stderr is a pipe whose
-/// reading end is already closed, as when osascript has exited: a write
-/// to it raises SIGPIPE, and `stderr` comes back empty.
+/// Calls are named by signature: `sudo <arguments>` for a sudo of the
+/// user's (`versionQuery`, `listQuery`, `ruleQuery`) and `pmset
+/// <arguments>` for pmset (`read`, `write`), naming pmset as
+/// /usr/bin/pmset. The fake pmset keeps one SleepDisabled value in a
+/// file, starting at `sleepDisabled` (`0`, `1`, or `fail`, which makes
+/// `pmset -g` fail): `-g` prints it in `pmset -g`'s shape (or
+/// `pmsetOutput` verbatim), and `-a disablesleep N` writes N, unless
+/// `writeFails`, which makes `-a disablesleep 1` fail without writing.
+/// `foreignAfter` is another tool: once the call with that signature has
+/// answered, it sets SleepDisabled to `foreignSets` (`1` unless given;
+/// `fail` makes the next `pmset -g` fail), once. With `holdAt`, the call
+/// with that signature waits before it does anything until `release()`
+/// (60 s at most, and only while `dir` exists), so a test can act while
+/// the command holds the marker's lock. With `outputClosed`, the
+/// command's stderr is a pipe whose reading end is already closed, as when
+/// osascript has exited: a write to it raises SIGPIPE, and `stderr` comes
+/// back empty.
 final class RootCommandProcess {
+    /// The user's `sudo -V`.
+    static let versionQuery = "sudo -V"
+    /// The user's `sudo -k -n -l`.
+    static let listQuery = "sudo -k -n -l"
+    /// The user's `sudo -k -n -ll` for the restore line.
+    static let ruleQuery = "sudo -k -n -ll /usr/bin/pmset -a disablesleep 0"
+    /// Root's `pmset -g`.
+    static let read = "pmset -g"
+    /// Root's only write, `pmset -a disablesleep 1`.
+    static let write = "pmset -a disablesleep 1"
+
     private let process = Process()
     private let childExit: ProcessExit
     private let err = Pipe()
     private let calls: URL
     private let callers: URL
     private let sudoCalls: URL
+    private let envCalls: URL
     private let started: URL
     private let releaseFile: URL
     private let fakePmset: URL
     private let fakeSudo: URL
+    private let fakeEnv: URL
     private let sleepState: URL
 
-    init(marker: URL, nonce: String, deadline: String? = nil, uid: String? = nil, policy: RootSudoPolicy = .rule, command: String = AdministratorPrompt.rootCommand, clock: RootCommandClock? = nil, sleepDisabled: String = "0", owned: String = "0", pmsetOutput: String? = nil, foreignAfter: String? = nil, foreignSets: String = "1", rootRestoreFails: Bool = false, outputClosed: Bool = false, in dir: URL, holdPmset: Bool = false, holdAt: String = "-a disablesleep 1") throws {
+    init(marker: URL, nonce: String, deadline: String? = nil, uid: String? = nil, policy: RootSudoPolicy = .rule, command: String = AdministratorPrompt.rootCommand, clock: RootCommandClock? = nil, sleepDisabled: String = "0", owned: String = "0", pmsetOutput: String? = nil, foreignAfter: String? = nil, foreignSets: String = "1", writeFails: Bool = false, outputClosed: Bool = false, in dir: URL, holdAt: String? = nil) throws {
         let fake = dir.appendingPathComponent("fake-pmset")
+        let sudo = dir.appendingPathComponent("root-sudo")
+        let env = dir.appendingPathComponent("fake-env")
         let fakeDate = dir.appendingPathComponent("fake-date")
         let clockFile = dir.appendingPathComponent("fake-clock")
-        let sudo = dir.appendingPathComponent("root-sudo")
+        let answers = dir.appendingPathComponent("root-sudo-answers", isDirectory: true)
         let outputFile = dir.appendingPathComponent("fake-pmset-output")
         let foreignDone = dir.appendingPathComponent("fake-foreign-done")
         fakePmset = fake
         fakeSudo = sudo
+        fakeEnv = env
         sleepState = dir.appendingPathComponent("fake-sleep-disabled")
         calls = dir.appendingPathComponent("pmset-calls")
         callers = dir.appendingPathComponent("pmset-as")
         sudoCalls = dir.appendingPathComponent("root-sudo-calls")
+        envCalls = dir.appendingPathComponent("root-env-calls")
         started = dir.appendingPathComponent("pmset-started")
         releaseFile = dir.appendingPathComponent("pmset-release")
-        for file in [calls, callers, sudoCalls, started, releaseFile, outputFile, foreignDone] { try? FileManager.default.removeItem(at: file) }
+        for file in [calls, callers, sudoCalls, envCalls, started, releaseFile, outputFile, foreignDone] { try? FileManager.default.removeItem(at: file) }
         try Data(sleepDisabled.utf8).write(to: sleepState)
         if let pmsetOutput { try Data(pmsetOutput.utf8).write(to: outputFile) }
+        try writeSudoAnswers(policy.answers(pmset: fake.path), to: answers)
+        // Shell lines both fakes run, with $sig set to the call's signature.
+        let before = """
+        if [[ "$sig" == "$FAKE_HOLD_AT" ]]; then
+          : > "$FAKE_HOLD_STARTED"
+          if [[ -n "$FAKE_HOLD_RELEASE" ]]; then
+            i=0; while [[ ! -e "$FAKE_HOLD_RELEASE" && -d "${FAKE_HOLD_RELEASE%/*}" && $i -lt 1200 ]]; do /bin/sleep 0.05; i=$((i + 1)); done
+          fi
+        fi
+        """
+        let after = """
+        if [[ "$sig" == "$FAKE_CLOCK_AT" ]]; then printf '%s\\n' "$FAKE_CLOCK_LATER" > "$FAKE_CLOCK_FILE"; fi
+        if [[ "$sig" == "$FAKE_FOREIGN_AFTER" && ! -e "$FAKE_FOREIGN_DONE" ]]; then : > "$FAKE_FOREIGN_DONE"; printf '%s' "$FAKE_FOREIGN_SETS" > "$FAKE_SLEEP_STATE"; fi
+        """
         try """
         #!/bin/bash
         printf '%s\\n' "$*" >> "$FAKE_PMSET_CALLS"
-        printf '%s\\n' "${FAKE_SUDO_AS:-root}" >> "$FAKE_PMSET_AS"
-        if [[ -n "${FAKE_CLOCK_AFTER_RESTORE:-}" && "$*" == "-a disablesleep 0" ]]; then
-          printf '%s\\n' "$FAKE_CLOCK_AFTER_RESTORE" > "$FAKE_CLOCK_FILE"
-        fi
-        if [[ "$*" == "$FAKE_PMSET_WATCH" ]]; then
-          : > "$FAKE_PMSET_STARTED"
-          if [[ -n "${FAKE_PMSET_HOLD:-}" ]]; then
-            i=0; while [[ ! -e "$FAKE_PMSET_HOLD" && -d "${FAKE_PMSET_HOLD%/*}" && $i -lt 1200 ]]; do sleep 0.05; i=$((i + 1)); done
-          fi
-        fi
+        who="${FAKE_SUDO_AS:-0}"; [[ "$who" == 0 ]] && who=root
+        printf '%s\\n' "$who" >> "$FAKE_PMSET_AS"
+        sig="pmset $*"
+        \(before)
         rc=0
         case "$*" in
           -g)
-            state="$(cat "$FAKE_SLEEP_STATE")"
+            state="$(/bin/cat "$FAKE_SLEEP_STATE")"
             if [[ "$state" == fail ]]; then echo "pmset: could not read the settings" >&2; rc=1
-            elif [[ -e "$FAKE_PMSET_OUTPUT" ]]; then cat "$FAKE_PMSET_OUTPUT"
+            elif [[ -e "$FAKE_PMSET_OUTPUT" ]]; then /bin/cat "$FAKE_PMSET_OUTPUT"
             else printf 'System-wide power settings:\\nCurrently in use:\\n standby              1\\n SleepDisabled        %s\\n sleep                1\\n' "$state"
             fi ;;
-          "-a disablesleep 0")
-            if [[ -n "$FAKE_ROOT_RESTORE_FAILS" && -z "${FAKE_SUDO_AS:-}" ]]; then echo "pmset: could not write the settings" >&2; rc=1
-            else printf 0 > "$FAKE_SLEEP_STATE"
+          "-a disablesleep 0") printf 0 > "$FAKE_SLEEP_STATE" ;;
+          "-a disablesleep 1")
+            if [[ -n "$FAKE_WRITE_FAILS" ]]; then echo "pmset: could not write the settings" >&2; rc=1
+            else printf 1 > "$FAKE_SLEEP_STATE"
             fi ;;
-          "-a disablesleep 1") printf 1 > "$FAKE_SLEEP_STATE" ;;
           *) echo "fake pmset: unexpected arguments $*" >&2; rc=2 ;;
         esac
-        if [[ -n "$FAKE_FOREIGN_AFTER" && "$*" == "$FAKE_FOREIGN_AFTER" && ! -e "$FAKE_FOREIGN_DONE" ]]; then
-          : > "$FAKE_FOREIGN_DONE"
-          printf '%s' "$FAKE_FOREIGN_SETS" > "$FAKE_SLEEP_STATE"
-        fi
+        \(after)
         exit $rc
         """.write(to: fake, atomically: true, encoding: .utf8)
-        // The fake sudo. FAKE_SUDO_AS unset or 0: root invoked it, and
-        // root runs the command (as the -u user, if given) without a
-        // password. Any other uid: that user invoked it, and the policy
-        // decides.
         let restore = ([fake.path] + PmsetSleepGuard.restoreArguments).joined(separator: " ")
-        try """
-        #!/bin/bash
-        printf '%s\\n' "$*" >> '\(sudoCalls.path)'
-        k=0; l=0; n=0; u=""
-        while [[ "${1:-}" == -* ]]; do
-          case "$1" in
-            -k) k=1 ;; -l) l=1 ;; -n) n=1 ;;
-            -u) shift; u="${1:-}" ;;
-            *) echo "fake sudo: unexpected option $1" >&2; exit 2 ;;
-          esac
-          shift
-        done
-        if (( !n )); then echo "fake sudo: would have prompted" >&2; exit 2; fi
-        policy='\(policy.rawValue)'
-        if [[ "${FAKE_SUDO_AS:-0}" == 0 ]]; then
-          if [[ "$policy" == noRootEntry ]]; then echo "sudo: root is not in the sudoers file" >&2; exit 1; fi
-          if [[ -n "$u" ]]; then
-            [[ "$u" =~ ^#[0-9]+$ ]] || { echo "sudo: unknown user $u" >&2; exit 1; }
-            export FAKE_SUDO_AS="${u#\\#}"
-          fi
-          exec "$@"
-        fi
-        if (( l )); then
-          case "$policy" in rule|listOnly|cached|noRootEntry) echo "$*"; exit 0 ;; esac
-        else
-          case "$policy" in
-            rule|noRootEntry) [[ "$FAKE_SUDO_AS" == '\(getuid())' && "$*" == '\(restore)' ]] && exec "$@" ;;
-            cached) (( k )) || exec "$@" ;;
-            deny) echo "Sorry, user is not allowed to execute '$*' as root." >&2; exit 1 ;;
-          esac
-        fi
-        echo "sudo: a password is required" >&2
-        exit 1
-        """.write(to: sudo, atomically: true, encoding: .utf8)
+        try fakeSudoScript(log: sudoCalls, answers: answers, restore: restore, before: before, after: after).write(to: sudo, atomically: true, encoding: .utf8)
+        try fakeEnvScript(log: envCalls).write(to: env, atomically: true, encoding: .utf8)
         if let clock {
             try "\(clock.start)\n".write(to: clockFile, atomically: true, encoding: .utf8)
             try """
             #!/bin/bash
             [[ "$*" == +%s ]] || { echo "fake date: unexpected arguments $*" >&2; exit 2; }
-            cat "$FAKE_CLOCK_FILE"
+            /bin/cat "$FAKE_CLOCK_FILE"
             """.write(to: fakeDate, atomically: true, encoding: .utf8)
         }
-        var executables = [fake, sudo]
+        var executables = [fake, sudo, env]
         if clock != nil { executables.append(fakeDate) }
         for url in executables {
             try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
@@ -1279,41 +1551,47 @@ final class RootCommandProcess {
 
         let realPmset = "/usr/bin/pmset"
         let realSudo = "/usr/bin/sudo"
+        let realEnv = "/usr/bin/env"
         let realDate = "/bin/date"
         var command = command
         if clock != nil {
-            XCTAssertTrue(command.contains(realDate), "the command reads the clock through /bin/date")
+            XCTAssertEqual(command.components(separatedBy: realDate).count - 1, 1, "the command reads the clock through /bin/date, in one place")
             XCTAssertFalse(fakeDate.path.contains(" "), "the fake replaces an unquoted word")
             command = command.replacingOccurrences(of: realDate, with: fakeDate.path)
         }
-        XCTAssertEqual(command.components(separatedBy: realPmset).count - 1, 5, "the command names pmset five times, by absolute path: the read, the change the check undoes, the restore check, root's own restore when the check fails, and the session's change")
+        XCTAssertEqual(command.components(separatedBy: realPmset).count - 1, 4, "the command names pmset four times, by absolute path: in the rule query, in the line it expects back, in its read and in its write")
         XCTAssertEqual(command.components(separatedBy: realSudo).count - 1, 2, "root's sudo to the user, and the user's sudo, by absolute path")
-        XCTAssertFalse(fake.path.contains(" ") || sudo.path.contains(" "), "the fakes replace unquoted words")
+        XCTAssertEqual(command.components(separatedBy: realEnv).count - 1, 1, "the env that empties the user's sudo's environment, by absolute path")
+        XCTAssertFalse(fake.path.contains(" ") || sudo.path.contains(" ") || env.path.contains(" "), "the fakes replace unquoted words")
+        let faked = command.replacingOccurrences(of: realPmset, with: fake.path).replacingOccurrences(of: realSudo, with: sudo.path).replacingOccurrences(of: realEnv, with: env.path)
         let line = AdministratorPrompt.markerLock + " " + appleScriptQuotedForm(marker.path)
-            + " /bin/sh -c " + appleScriptQuotedForm(command.replacingOccurrences(of: realPmset, with: fake.path).replacingOccurrences(of: realSudo, with: sudo.path))
+            + " /bin/sh -c " + appleScriptQuotedForm(faked)
             + " insomnia " + appleScriptQuotedForm(marker.path) + " " + appleScriptQuotedForm(nonce)
             + " " + appleScriptQuotedForm(deadline ?? Self.inAnHour) + " " + appleScriptQuotedForm(uid ?? String(getuid()))
             + " " + appleScriptQuotedForm(owned)
 
+        /// Signatures name pmset as /usr/bin/pmset; the fakes see the fake.
+        func signature(_ s: String?) -> String { (s ?? "").replacingOccurrences(of: realPmset, with: fake.path) }
         process.executableURL = URL(fileURLWithPath: "/bin/sh")
         process.arguments = ["-c", line]
         process.currentDirectoryURL = dir
-        var env = ProcessInfo.processInfo.environment
-        env["FAKE_PMSET_CALLS"] = calls.path
-        env["FAKE_PMSET_AS"] = callers.path
-        env["FAKE_PMSET_STARTED"] = started.path
-        env["FAKE_PMSET_WATCH"] = holdAt
-        env["FAKE_PMSET_HOLD"] = holdPmset ? releaseFile.path : ""
-        env["FAKE_CLOCK_FILE"] = clockFile.path
-        env["FAKE_CLOCK_AFTER_RESTORE"] = clock.map { String($0.afterRestore) } ?? ""
-        env["FAKE_SLEEP_STATE"] = sleepState.path
-        env["FAKE_PMSET_OUTPUT"] = outputFile.path
-        env["FAKE_FOREIGN_AFTER"] = foreignAfter ?? ""
-        env["FAKE_FOREIGN_SETS"] = foreignSets
-        env["FAKE_ROOT_RESTORE_FAILS"] = rootRestoreFails ? "1" : ""
-        env["FAKE_FOREIGN_DONE"] = foreignDone.path
-        env.removeValue(forKey: "FAKE_SUDO_AS")
-        process.environment = env
+        var environment = ProcessInfo.processInfo.environment.filter { !$0.key.hasPrefix("FAKE_") }
+        environment["FAKE_SUDO_AS"] = "0"
+        environment["FAKE_PMSET_CALLS"] = calls.path
+        environment["FAKE_PMSET_AS"] = callers.path
+        environment["FAKE_HOLD_AT"] = signature(holdAt)
+        environment["FAKE_HOLD_STARTED"] = started.path
+        environment["FAKE_HOLD_RELEASE"] = holdAt == nil ? "" : releaseFile.path
+        environment["FAKE_CLOCK_AT"] = signature(clock?.at)
+        environment["FAKE_CLOCK_LATER"] = clock.map { String($0.later) } ?? ""
+        environment["FAKE_CLOCK_FILE"] = clockFile.path
+        environment["FAKE_SLEEP_STATE"] = sleepState.path
+        environment["FAKE_PMSET_OUTPUT"] = outputFile.path
+        environment["FAKE_FOREIGN_AFTER"] = signature(foreignAfter)
+        environment["FAKE_FOREIGN_SETS"] = foreignSets
+        environment["FAKE_FOREIGN_DONE"] = foreignDone.path
+        environment["FAKE_WRITE_FAILS"] = writeFails ? "1" : ""
+        process.environment = environment
         process.standardInput = FileHandle.nullDevice
         process.standardError = err
         self.outputClosed = outputClosed
@@ -1330,8 +1608,7 @@ final class RootCommandProcess {
         PendingStart(marker: URL(fileURLWithPath: "/"), nonce: "", deadline: Date().addingTimeInterval(3600)).deadlineArgument
     }
 
-    /// Waits (10 s at most) until the fake pmset has been called with
-    /// `holdAt`.
+    /// Waits (10 s at most) until the call `holdAt` has started.
     func waitUntilPmsetRuns() -> Bool {
         let limit = Date().addingTimeInterval(10)
         while !FileManager.default.fileExists(atPath: started.path) {
@@ -1348,17 +1625,21 @@ final class RootCommandProcess {
     func wait() -> RootCommandRun {
         let errData = outputClosed ? Data() : err.fileHandleForReading.readDataToEndOfFile()
         childExit.wait()
-        let recorded = (try? String(contentsOf: calls, encoding: .utf8)) ?? ""
-        let callersRecorded = (try? String(contentsOf: callers, encoding: .utf8)) ?? ""
-        let sudoRecorded = (try? String(contentsOf: sudoCalls, encoding: .utf8)) ?? ""
+        func lines(_ url: URL) -> [String] {
+            ((try? String(contentsOf: url, encoding: .utf8)) ?? "").split(separator: "\n").map(String.init)
+        }
+        func shown(_ line: String) -> String {
+            line.replacingOccurrences(of: fakeSudo.path, with: "/usr/bin/sudo")
+                .replacingOccurrences(of: fakeEnv.path, with: "/usr/bin/env")
+                .replacingOccurrences(of: fakePmset.path, with: "/usr/bin/pmset")
+        }
         return RootCommandRun(
             status: process.terminationStatus,
             stderr: String(decoding: errData, as: UTF8.self),
-            pmsetCalls: recorded.split(separator: "\n").map(String.init),
-            pmsetAs: callersRecorded.split(separator: "\n").map(String.init),
-            sudoCalls: sudoRecorded.split(separator: "\n").map {
-                $0.replacingOccurrences(of: fakeSudo.path, with: "/usr/bin/sudo").replacingOccurrences(of: fakePmset.path, with: "/usr/bin/pmset")
-            },
+            pmsetCalls: lines(calls),
+            pmsetAs: lines(callers),
+            sudoCalls: lines(sudoCalls).map(shown),
+            envCalls: lines(envCalls).map(shown),
             sleepDisabled: (try? String(contentsOf: sleepState, encoding: .utf8)) ?? ""
         )
     }
@@ -1422,112 +1703,96 @@ func runRootCommand(marker: URL, nonce: String, deadline: String? = nil, uid: St
 /// One fake Mac behind a Start driven end to end through the real
 /// PmsetSleepGuard and OsascriptAdministratorPrompt, with no dialog and
 /// nothing privileged. SleepDisabled lives in a file. The fake pmset prints
-/// it for `-g` and writes it for `-a disablesleep N`. The fake sudo answers
-/// as macOS's default `root ALL = (ALL) ALL` and the user's
-/// /etc/sudoers.d/insomnia would: root runs anything as anyone, and the
-/// user runs only the rule's three pmset lines, all without a password.
-/// The fake osascript records the script it was given and runs the root
-/// command embedded in it (`appleScriptEmbeddedRootCommand`, with pmset,
-/// sudo and date pointed at the fakes) under the real lockf, as `do shell
+/// it for `-g` and writes it for `-a disablesleep N`. The fake sudo
+/// (fakeSudoScript) answers as `policy` says, `.rule` unless set
+/// (RootSudoPolicy): root runs anything as anyone, and the user runs only
+/// the rule's three pmset lines, all without a password. The fake env
+/// checks the root command's `env -i LC_ALL=C` (fakeEnvScript). The fake
+/// osascript records the script it was given and runs the root command
+/// embedded in it (`appleScriptEmbeddedRootCommand`, with pmset, sudo, env
+/// and date pointed at the fakes) under the real lockf, as `do shell
 /// script` would, with the marker, nonce, deadline, uid and ownership flag
 /// it was given. It reports a non-zero exit the way osascript does:
-/// `execution error: <stderr> (<status>)`, exit 1. The clock starts at
-/// `clockStart` and reads `clockAfterRestore` from the moment the restore
-/// check's `disablesleep 0` has run. `foreignDuringDialog`,
-/// `foreignAfterRootRead` and `foreignAfterRestore` are another tool
-/// setting SleepDisabled to 1 once: while the dialog is up, right after the
-/// root command's first `pmset -g`, or right after the restore check's
-/// write. `ruleMissing` takes the user's three pmset lines out of the fake
-/// sudoers, so the check (and any restore the app runs) needs a password.
+/// `execution error: <stderr> (<status>)`, exit 1. The clock reads
+/// `clockStart` until the root command's call `clockAt` (a
+/// RootCommandProcess signature) has answered, and `clockLater` from then
+/// on. `foreignDuringDialog` and `foreignAfter` are another tool setting
+/// SleepDisabled to 1 once: while the dialog is up, or right after the
+/// root command's call with that signature.
 final class FakeDialogMachine {
     let dir: URL
     let osascript: URL
     let sudo: URL
     let pmset: URL
+    private let env: URL
     private let date: URL
     private let state: URL
+    private let answers: URL
     private let pmsetLog: URL
     private let sudoLog: URL
+    private let envLog: URL
     private let scriptLog: URL
-    private let clock: URL
-    private let clockAfter: URL
     private let foreignDialog: URL
-    private let foreignRead: URL
-    private let foreignRestore: URL
-    private let noRule: URL
+    private let foreignAt: URL
 
-    init(in dir: URL, clockStart: Int, clockAfterRestore: Int) throws {
+    init(in dir: URL, clockStart: Int, clockLater: Int, clockAt: String = RootCommandProcess.ruleQuery) throws {
         self.dir = dir
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         XCTAssertFalse(dir.path.contains(" "), "the fakes replace unquoted words in the root command")
         osascript = dir.appendingPathComponent("osascript")
         sudo = dir.appendingPathComponent("sudo")
         pmset = dir.appendingPathComponent("pmset")
+        env = dir.appendingPathComponent("env")
         date = dir.appendingPathComponent("date")
         state = dir.appendingPathComponent("sleep-disabled")
+        answers = dir.appendingPathComponent("sudo-answers", isDirectory: true)
         pmsetLog = dir.appendingPathComponent("pmset-calls")
         sudoLog = dir.appendingPathComponent("sudo-calls")
+        envLog = dir.appendingPathComponent("env-calls")
         scriptLog = dir.appendingPathComponent("osascript-script")
-        clock = dir.appendingPathComponent("clock")
-        clockAfter = dir.appendingPathComponent("clock-after-restore")
         foreignDialog = dir.appendingPathComponent("foreign-during-dialog")
-        foreignRead = dir.appendingPathComponent("foreign-after-root-read")
-        foreignRestore = dir.appendingPathComponent("foreign-after-restore")
-        noRule = dir.appendingPathComponent("rule-missing")
+        foreignAt = dir.appendingPathComponent("foreign-at")
+        let clock = dir.appendingPathComponent("clock")
+        let clockLaterFile = dir.appendingPathComponent("clock-later")
+        let clockAtFile = dir.appendingPathComponent("clock-at")
         let rootCommand = dir.appendingPathComponent("root-command")
         try Data("0".utf8).write(to: state)
         try Data("\(clockStart)\n".utf8).write(to: clock)
-        try Data("\(clockAfterRestore)\n".utf8).write(to: clockAfter)
+        try Data("\(clockLater)\n".utf8).write(to: clockLaterFile)
+        try Data(clockAt.replacingOccurrences(of: "/usr/bin/pmset", with: pmset.path).utf8).write(to: clockAtFile)
+        try writeSudoAnswers(policy.answers(pmset: pmset.path), to: answers)
 
+        // Run by both fakes once a call has answered, with $sig set to its
+        // signature; only calls made by the root command (FAKE_SUDO_AS set,
+        // to 0 or to the uid root switched to) move the clock or set the
+        // other tool's 1.
+        let after = """
+        if [[ -n "${FAKE_SUDO_AS:-}" ]]; then
+          if [[ -e '\(clockLaterFile.path)' && "$sig" == "$(/bin/cat '\(clockAtFile.path)')" ]]; then /bin/mv '\(clockLaterFile.path)' '\(clock.path)'; fi
+          if [[ -e '\(foreignAt.path)' && "$sig" == "$(/bin/cat '\(foreignAt.path)')" ]]; then /bin/rm -f '\(foreignAt.path)'; printf 1 > '\(state.path)'; fi
+        fi
+        """
         try """
         #!/bin/bash
         printf '%s\\n' "$*" >> '\(pmsetLog.path)'
+        sig="pmset $*"
         case "$*" in
-          -g)
-            printf 'System-wide power settings:\\nCurrently in use:\\n SleepDisabled        %s\\n sleep                1\\n' "$(cat '\(state.path)')"
-            if [[ "${FAKE_SUDO_AS:-}" == 0 && -e '\(foreignRead.path)' ]]; then rm -f '\(foreignRead.path)'; printf 1 > '\(state.path)'; fi ;;
+          -g) printf 'System-wide power settings:\\nCurrently in use:\\n SleepDisabled        %s\\n sleep                1\\n' "$(/bin/cat '\(state.path)')" ;;
           "-g custom") printf 'AC Power:\\n lowpowermode         0\\n' ;;
-          "-a disablesleep 0")
-            printf 0 > '\(state.path)'
-            if [[ -e '\(clockAfter.path)' ]]; then mv '\(clockAfter.path)' '\(clock.path)'; fi
-            if [[ -e '\(foreignRestore.path)' ]]; then rm -f '\(foreignRestore.path)'; printf 1 > '\(state.path)'; fi ;;
+          "-a disablesleep 0") printf 0 > '\(state.path)' ;;
           "-a disablesleep 1") printf 1 > '\(state.path)' ;;
           "-b lowpowermode 0"|"-b lowpowermode 1") ;;
           *) echo "fake pmset: unexpected arguments $*" >&2; exit 2 ;;
         esac
+        \(after)
         """.write(to: pmset, atomically: true, encoding: .utf8)
-        try """
-        #!/bin/bash
-        printf '%s\\n' "$*" >> '\(sudoLog.path)'
-        n=0; u=""
-        while [[ "${1:-}" == -* ]]; do
-          case "$1" in
-            -k) ;; -n) n=1 ;;
-            -u) shift; u="${1:-}" ;;
-            *) echo "fake sudo: unexpected option $1" >&2; exit 2 ;;
-          esac
-          shift
-        done
-        if (( !n )); then echo "fake sudo: would have prompted" >&2; exit 2; fi
-        if [[ "${FAKE_SUDO_AS:-}" == 0 ]]; then
-          if [[ -n "$u" ]]; then
-            [[ "$u" =~ ^#[0-9]+$ ]] || { echo "sudo: unknown user $u" >&2; exit 1; }
-            export FAKE_SUDO_AS="${u#\\#}"
-          fi
-          exec "$@"
-        fi
-        if [[ ! -e '\(noRule.path)' && "${FAKE_SUDO_AS:-\(getuid())}" == '\(getuid())' && ( "$1" == /usr/bin/pmset || "$1" == '\(pmset.path)' ) ]]; then
-          case "${*:2}" in
-            "-a disablesleep 0"|"-b lowpowermode 1"|"-b lowpowermode 0") exec '\(pmset.path)' "${@:2}" ;;
-          esac
-        fi
-        echo "sudo: a password is required" >&2
-        exit 1
-        """.write(to: sudo, atomically: true, encoding: .utf8)
+        let restore = ([pmset.path] + PmsetSleepGuard.restoreArguments).joined(separator: " ")
+        try fakeSudoScript(log: sudoLog, answers: answers, restore: restore, after: after).write(to: sudo, atomically: true, encoding: .utf8)
+        try fakeEnvScript(log: envLog).write(to: env, atomically: true, encoding: .utf8)
         try """
         #!/bin/bash
         [[ "$*" == +%s ]] || { echo "fake date: unexpected arguments $*" >&2; exit 2; }
-        cat '\(clock.path)'
+        /bin/cat '\(clock.path)'
         """.write(to: date, atomically: true, encoding: .utf8)
         try """
         #!/bin/bash
@@ -1541,12 +1806,13 @@ final class FakeDialogMachine {
         printf '0:1: execution error: %s (%d)\\n' "$(printf '%s' "$err" | tr '\\n' '\\r')" "$rc" >&2
         exit 1
         """.write(to: osascript, atomically: true, encoding: .utf8)
-        for url in [osascript, sudo, pmset, date] {
+        for url in [osascript, sudo, pmset, env, date] {
             try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
         }
         let embedded = try appleScriptEmbeddedRootCommand()
             .replacingOccurrences(of: "/usr/bin/pmset", with: pmset.path)
             .replacingOccurrences(of: "/usr/bin/sudo", with: sudo.path)
+            .replacingOccurrences(of: "/usr/bin/env", with: env.path)
             .replacingOccurrences(of: "/bin/date", with: date.path)
         try Data(embedded.utf8).write(to: rootCommand)
     }
@@ -1554,6 +1820,11 @@ final class FakeDialogMachine {
     /// The real guard the app builds, pointed at these fakes.
     func sleepGuard() -> PmsetSleepGuard {
         PmsetSleepGuard(prompt: OsascriptAdministratorPrompt(executable: osascript.path, timeout: 30), sudo: sudo.path, pmset: pmset.path)
+    }
+
+    /// What the fake sudo answers from now on.
+    var policy: RootSudoPolicy = .rule {
+        didSet { try! writeSudoAnswers(policy.answers(pmset: pmset.path), to: answers) }
     }
 
     /// SleepDisabled on the fake machine: `0` or `1`.
@@ -1567,19 +1838,17 @@ final class FakeDialogMachine {
         set { if newValue { FileManager.default.createFile(atPath: foreignDialog.path, contents: nil) } else { try? FileManager.default.removeItem(at: foreignDialog) } }
     }
 
-    var foreignAfterRootRead: Bool {
-        get { FileManager.default.fileExists(atPath: foreignRead.path) }
-        set { if newValue { FileManager.default.createFile(atPath: foreignRead.path, contents: nil) } else { try? FileManager.default.removeItem(at: foreignRead) } }
-    }
-
-    var foreignAfterRestore: Bool {
-        get { FileManager.default.fileExists(atPath: foreignRestore.path) }
-        set { if newValue { FileManager.default.createFile(atPath: foreignRestore.path, contents: nil) } else { try? FileManager.default.removeItem(at: foreignRestore) } }
-    }
-
-    var ruleMissing: Bool {
-        get { FileManager.default.fileExists(atPath: noRule.path) }
-        set { if newValue { FileManager.default.createFile(atPath: noRule.path, contents: nil) } else { try? FileManager.default.removeItem(at: noRule) } }
+    /// The signature after which the other tool sets its 1, until it has;
+    /// nil once it has (or when none was set).
+    var foreignAfter: String? {
+        get { (try? String(contentsOf: foreignAt, encoding: .utf8))?.replacingOccurrences(of: pmset.path, with: "/usr/bin/pmset") }
+        set {
+            if let newValue {
+                try! Data(newValue.replacingOccurrences(of: "/usr/bin/pmset", with: pmset.path).utf8).write(to: foreignAt)
+            } else {
+                try? FileManager.default.removeItem(at: foreignAt)
+            }
+        }
     }
 
     /// The script the fake osascript was last given.
@@ -1589,11 +1858,18 @@ final class FakeDialogMachine {
     func pmsetCalls() -> [String] { Self.lines(pmsetLog) }
 
     /// Arguments of each sudo call, with the fakes' paths shown as
-    /// /usr/bin/pmset and /usr/bin/sudo.
+    /// /usr/bin/pmset, /usr/bin/sudo and /usr/bin/env.
     func sudoCalls() -> [String] {
         Self.lines(sudoLog).map {
-            $0.replacingOccurrences(of: sudo.path, with: "/usr/bin/sudo").replacingOccurrences(of: pmset.path, with: "/usr/bin/pmset")
+            $0.replacingOccurrences(of: sudo.path, with: "/usr/bin/sudo")
+                .replacingOccurrences(of: env.path, with: "/usr/bin/env")
+                .replacingOccurrences(of: pmset.path, with: "/usr/bin/pmset")
         }
+    }
+
+    /// Arguments of each env call, shown the same way.
+    func envCalls() -> [String] {
+        Self.lines(envLog).map { $0.replacingOccurrences(of: sudo.path, with: "/usr/bin/sudo").replacingOccurrences(of: pmset.path, with: "/usr/bin/pmset") }
     }
 
     private static func lines(_ url: URL) -> [String] {

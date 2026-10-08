@@ -135,11 +135,11 @@ final class OsascriptAdministratorPromptTests: XCTestCase {
         }
     }
 
-    /// The root command exits 5 when the restore check fails, after root
-    /// has turned sleep back on; osascript ends its error with that status.
-    /// The error says what to do about it.
+    /// The root command exits 5 when sudo does not confirm the restore,
+    /// before anything is written; osascript ends its error with that
+    /// status. The error says what to do about it.
     func testARefusedRestoreCheckIsReportedWithTheFix() async throws {
-        let exe = try fakeOsascript("printf '0:812: execution error: sudo: a password is required\\rturning sleep back on needs a password, so it was turned back on at once and not left off (5)\\n' >&2; exit 1")
+        let exe = try fakeOsascript("printf '0:812: execution error: sudo: a password is required\\rsudo -k -n -l did not list this user'\\''s sudoers rules without a password, or listed Runas or command-specific Defaults, which apply to the restore but not to this check; sleep was not turned off (5)\\n' >&2; exit 1")
         let prompt = OsascriptAdministratorPrompt(executable: exe, timeout: 5)
         do {
             try await prompt.disableSleep(start)
@@ -147,9 +147,10 @@ final class OsascriptAdministratorPromptTests: XCTestCase {
         } catch let error as AdministratorPromptError {
             guard case .restoreNeedsPassword = error else { return XCTFail("\(error)") }
             let text = try XCTUnwrap(error.errorDescription)
-            XCTAssertTrue(text.hasPrefix("sleep was not left off: turning it back on needs a password (`sudo -k -n /usr/bin/pmset -a disablesleep 0` failed: "), text)
+            XCTAssertTrue(text.hasPrefix("sleep was not turned off: sudo did not confirm that `sudo -n /usr/bin/pmset -a disablesleep 0` runs for you without a password ("), text)
             XCTAssertTrue(text.contains("sudo: a password is required"), text)
-            XCTAssertTrue(text.hasSuffix("/etc/sudoers.d/insomnia is missing or not in effect; run scripts/install.sh again"), text)
+            XCTAssertTrue(text.contains("Run scripts/install.sh again if /etc/sudoers.d/insomnia is missing or not in effect"), text)
+            XCTAssertTrue(text.hasSuffix("and on Defaults bound to a Runas user or a command"), text)
         }
     }
 
@@ -203,8 +204,8 @@ final class OsascriptAdministratorPromptTests: XCTestCase {
         }
     }
 
-    /// Each exit that means the root command stopped without leaving
-    /// sleep off (its own 3, 4 and 6, lockf's 69 and 75) is a refusal:
+    /// Each exit that means the root command stopped before it wrote
+    /// anything (its own 3, 4 and 6, lockf's 69 and 75) is a refusal:
     /// nothing to undo, and the error names the status.
     func testRootRefusalsLeaveNothingToUndo() async throws {
         for status: Int32 in [3, 4, 6, 69, 75] {
@@ -218,7 +219,7 @@ final class OsascriptAdministratorPromptTests: XCTestCase {
                 XCTAssertEqual(code, status)
                 XCTAssertTrue(error.nothingToUndo, "\(status)")
                 let text = try XCTUnwrap(error.errorDescription)
-                XCTAssertTrue(text.hasPrefix("Insomnia did not leave sleep off (the command behind the password dialog stopped with status \(status) and undid anything it had changed)"), text)
+                XCTAssertTrue(text.hasPrefix("Insomnia did not turn sleep off (the command behind the password dialog stopped with status \(status) before it changed anything)"), text)
             }
         }
     }
@@ -408,141 +409,110 @@ final class RootCommandTests: XCTestCase {
 
     private var marker: URL { dir.appendingPathComponent("pending-start") }
     private var store: Store { Store(paths: Paths(root: dir)) }
-
-    private var restoreCheck: [String] {
-        ["-n -u #\(getuid()) /usr/bin/sudo -k -n /usr/bin/pmset -a disablesleep 0", "-k -n /usr/bin/pmset -a disablesleep 0"]
-    }
-
     private var uid: String { String(getuid()) }
 
-    /// Every pmset call a command that turns sleep off makes: the read, the
-    /// change the check undoes, the restore check, the read after it, and
-    /// the session's change.
-    private let allCalls = ["-g", "-a disablesleep 1", "-a disablesleep 0", "-g", "-a disablesleep 1"]
-    /// Who runs them: root, except the restore check, run as the user.
-    private var allAs: [String] { ["root", "root", uid, "root", "root"] }
-    /// A restore check that fails: the read, root's change, and root's own
-    /// restore of it. The user's sudo starts no pmset.
-    private let refusedCalls = ["-g", "-a disablesleep 1", "-a disablesleep 0"]
-    private let refusedAs = ["root", "root", "root"]
+    /// The three questions, in order, each as root's sudo to the user and
+    /// as the user's own sudo it starts.
+    private var queries: [String] {
+        let asUser = "-n -u #\(uid) /usr/bin/env -i LC_ALL=C /usr/bin/sudo "
+        return ["-V", "-k -n -l", "-k -n -ll /usr/bin/pmset -a disablesleep 0"].flatMap { [asUser + $0, $0] }
+    }
 
-    /// With the rule in effect, root reads sleep on and turns it off. The
-    /// restore check then runs as the user who pressed Start, through that
-    /// user's sudo with -k and -n, and turns sleep back on, undoing root's
-    /// own change. Root reads sleep on again and turns it off for the
-    /// session.
-    func testTurnsSleepOffWhileTheMarkerHoldsTheNonce() throws {
+    /// Every pmset call of a command that turns sleep off: its read, then
+    /// its only write.
+    private let allCalls = ["-g", "-a disablesleep 1"]
+
+    /// With the rule in effect, root asks the user's sudo three questions
+    /// (through `sudo -u`, then `env -i LC_ALL=C`), reads sleep on, and
+    /// turns it off. Nothing else runs pmset.
+    func testTurnsSleepOffOnceSudoConfirmsThePasswordlessRestore() throws {
         try Data("nonce-1".utf8).write(to: marker)
         let r = try runRootCommand(marker: marker, nonce: "nonce-1", in: dir)
         XCTAssertEqual(r.status, 0, r.stderr)
-        XCTAssertEqual(r.sudoCalls, restoreCheck)
+        XCTAssertEqual(r.sudoCalls, queries)
+        XCTAssertEqual(r.envCalls, ["-V", "-k -n -l", "-k -n -ll /usr/bin/pmset -a disablesleep 0"].map { "-i LC_ALL=C /usr/bin/sudo " + $0 })
         XCTAssertEqual(r.pmsetCalls, allCalls)
-        XCTAssertEqual(r.pmsetAs, allAs)
+        XCTAssertEqual(r.pmsetAs, ["root", "root"])
         XCTAssertEqual(r.sleepDisabled, "1")
         XCTAssertEqual(try String(contentsOf: marker, encoding: .utf8), "nonce-1", "lockf -k leaves the file")
     }
 
-    /// The check runs the line the app's end runs (`sudo -n /usr/bin/pmset`
-    /// with `PmsetSleepGuard.restoreArguments`), so a pass means that end
-    /// can run. It runs right after root's own `disablesleep 1`, so the
-    /// 0 it writes is the undo of that change.
-    func testTheCheckRunsTheRestoreTheEndRuns() throws {
+    /// Round 17 R1: the check used to run the restore, after root had
+    /// turned sleep off for it to undo. Now the user's sudo only lists and
+    /// prints its version, and the line it lists is the one every end runs
+    /// (`sudo -n /usr/bin/pmset` with `PmsetSleepGuard.restoreArguments`).
+    func testTheQueriesNameTheRestoreTheEndRunsAndRunNothing() throws {
+        let endLine = ([PmsetSleepGuard.pmset] + PmsetSleepGuard.restoreArguments).joined(separator: " ")
+        XCTAssertEqual(RootCommandProcess.ruleQuery, "sudo -k -n -ll " + endLine)
+        XCTAssertTrue(AdministratorPrompt.rootCommand.contains("r=$(q -k -n -ll \(endLine))"))
+        XCTAssertTrue(AdministratorPrompt.rootCommand.contains("BEGIN { c = \"\(endLine)\" }"))
         try Data("nonce-1".utf8).write(to: marker)
         let r = try runRootCommand(marker: marker, nonce: "nonce-1", in: dir)
-        let endLine = ([PmsetSleepGuard.pmset] + PmsetSleepGuard.restoreArguments).joined(separator: " ")
-        XCTAssertEqual(r.sudoCalls.last, "-k -n " + endLine)
-        XCTAssertEqual(r.pmsetCalls[2], PmsetSleepGuard.restoreArguments.joined(separator: " "))
-        XCTAssertEqual(r.pmsetAs[2], uid)
-        XCTAssertEqual(Array(r.pmsetCalls[1...2]), ["-a disablesleep 1", "-a disablesleep 0"], "the check undoes the change root made just before it")
-        XCTAssertEqual(r.pmsetAs[1], "root")
+        XCTAssertEqual(r.status, 0, r.stderr)
+        XCTAssertEqual(r.sudoCalls.filter { !$0.hasPrefix("-n -u ") }, ["-V", "-k -n -l", "-k -n -ll " + endLine], "each of the user's sudo calls lists or prints a version; none runs a command")
+        XCTAssertEqual(r.pmsetAs, ["root", "root"], "no pmset runs as the user")
     }
 
-    /// No rule, and a credential a recent sudo in a terminal cached: sudo
-    /// would run the restore without asking, but -k makes it ignore that
-    /// credential, so the check fails, and root turns sleep back on itself.
-    func testRefusesWhenOnlyACachedCredentialWouldRunTheRestore() throws {
-        try Data("nonce-1".utf8).write(to: marker)
-        let r = try runRootCommand(marker: marker, nonce: "nonce-1", policy: .cached, in: dir)
-        XCTAssertEqual(r.status, 5, r.stderr)
-        XCTAssertEqual(r.sudoCalls, restoreCheck)
-        XCTAssertEqual(r.pmsetCalls, refusedCalls)
-        XCTAssertEqual(r.pmsetAs, refusedAs, "the user's sudo ran nothing; root restored its own change")
-        XCTAssertEqual(r.sleepDisabled, "0")
-        XCTAssertTrue(r.stderr.contains("sudo: a password is required"), r.stderr)
-        XCTAssertTrue(r.stderr.contains("turning sleep back on needs a password, so it was turned back on at once and not left off"), r.stderr)
-    }
-
-    /// No rule, but another passwordless entry lets `sudo -l` list the
-    /// restore without a password. Listing is not running: the check
-    /// fails.
-    func testRefusesWhenTheRestoreIsListedButNeedsAPasswordToRun() throws {
-        try Data("nonce-1".utf8).write(to: marker)
-        let r = try runRootCommand(marker: marker, nonce: "nonce-1", policy: .listOnly, in: dir)
-        XCTAssertEqual(r.status, 5, r.stderr)
-        XCTAssertEqual(r.sudoCalls, restoreCheck, "the check runs the restore; it never lists")
-        XCTAssertEqual(r.pmsetCalls, refusedCalls)
-        XCTAssertEqual(r.pmsetAs, refusedAs)
-        XCTAssertEqual(r.sleepDisabled, "0")
-    }
-
-    func testRefusesWithoutTheRule() throws {
-        try Data("nonce-1".utf8).write(to: marker)
-        let r = try runRootCommand(marker: marker, nonce: "nonce-1", policy: .noRule, in: dir)
-        XCTAssertEqual(r.status, 5, r.stderr)
-        XCTAssertEqual(r.pmsetCalls, refusedCalls)
-        XCTAssertEqual(r.sleepDisabled, "0")
-    }
-
-    /// Root's own sudoers entry is gone, so root cannot run the check as
-    /// the user: that fails closed too.
-    func testRefusesWhenRootCannotRunTheCheckAsTheUser() throws {
-        try Data("nonce-1".utf8).write(to: marker)
-        let r = try runRootCommand(marker: marker, nonce: "nonce-1", policy: .noRootEntry, in: dir)
-        XCTAssertEqual(r.status, 5, r.stderr)
-        XCTAssertEqual(r.sudoCalls, [restoreCheck[0]])
-        XCTAssertEqual(r.pmsetCalls, refusedCalls)
-        XCTAssertEqual(r.pmsetAs, refusedAs)
-        XCTAssertEqual(r.sleepDisabled, "0")
-    }
-
-    /// Every policy but the NOPASSWD rule, in both copies of the command:
-    /// a cached credential, a listing-only entry, no rule, the rule without
-    /// NOPASSWD, a rule that denies the restore, and no root entry. Each
-    /// fails the check, which never prompts, and each leaves sleep on with
-    /// nothing the user's sudo started.
-    func testEveryPolicyButTheRuleLeavesSleepOn() throws {
-        for policy: RootSudoPolicy in [.cached, .listOnly, .noRule, .passwd, .deny, .noRootEntry] {
+    /// Every policy but the rule makes the command exit 5 before it reads
+    /// or writes pmset, in both copies of the command, and none prompts.
+    /// Each stops at the first answer that does not fit: root's switch to
+    /// the user, `-V`, `-l` or `-ll`.
+    func testEveryOtherPolicyRefusesBeforeAnyPmset() throws {
+        let version = "sudo -V, run as this user, failed or does not show sudo 1.9.15 or later"
+        let listing = "sudo -k -n -l did not list this user's sudoers rules without a password"
+        let rule = "sudo -k -n -ll does not show the rule in /etc/sudoers.d/insomnia"
+        // How many of `queries` each policy lets run, and what it says.
+        let stops: [RootSudoPolicy: (calls: Int, says: String)] = [
+            .noRootEntry: (1, version), .oldSudo: (2, version), .approvalPlugin: (2, version),
+            .noRule: (4, listing), .boundDefaults: (4, listing),
+            .listOnly: (6, rule), .noTag: (6, rule), .deny: (6, rule), .laterRule: (6, rule), .runAsAll: (6, rule),
+            .extraOption: (6, rule), .timeLimited: (6, rule), .ldap: (6, rule), .pathOnly: (6, rule), .truncated: (6, rule),
+        ]
+        XCTAssertEqual(Set(stops.keys).union([.rule, .etcPath]), Set(RootSudoPolicy.allCases), "every policy is covered")
+        for (policy, stop) in stops.sorted(by: { $0.key.rawValue < $1.key.rawValue }) {
             for (name, command) in try bothCommands() {
                 try Data("nonce-1".utf8).write(to: marker)
                 let r = try runRootCommand(marker: marker, nonce: "nonce-1", policy: policy, command: command, in: dir)
                 let label = "\(policy) \(name)"
                 XCTAssertEqual(r.status, 5, "\(label): \(r.stderr)")
-                XCTAssertEqual(r.pmsetCalls, refusedCalls, label)
-                XCTAssertEqual(r.pmsetAs, refusedAs, label)
+                XCTAssertEqual(r.sudoCalls, Array(queries.prefix(stop.calls)), label)
+                XCTAssertEqual(r.pmsetCalls, [], "\(label): nothing read, nothing written")
                 XCTAssertEqual(r.sleepDisabled, "0", label)
-                XCTAssertFalse(r.stderr.contains("would have prompted"), label)
+                XCTAssertTrue(r.stderr.contains(stop.says), "\(label): \(r.stderr)")
+                XCTAssertTrue(r.stderr.hasSuffix("sleep was not turned off\n"), "\(label): \(r.stderr)")
+                XCTAssertFalse(r.stderr.contains("fake "), "\(label): a fake was used as the command never uses it: \(r.stderr)")
             }
         }
-        let control = try runRootCommand(marker: marker, nonce: "nonce-1", policy: .rule, in: dir)
-        XCTAssertEqual(control.status, 0, control.stderr)
-        XCTAssertEqual(control.pmsetAs, allAs)
     }
 
-    /// The rule belongs to the user who pressed Start. Checked as another
-    /// user, it does not pass.
-    func testTheCheckIsForTheUserItIsGiven() throws {
+    /// sudo names the rule's file as the includedir names it:
+    /// /private/etc/sudoers.d on macOS, /etc/sudoers.d under an
+    /// `#includedir /etc/sudoers.d`. Either is the rule.
+    func testTakesTheRuleUnderEitherNameOfItsFile() throws {
+        for policy: RootSudoPolicy in [.rule, .etcPath] {
+            try Data("nonce-1".utf8).write(to: marker)
+            let r = try runRootCommand(marker: marker, nonce: "nonce-1", policy: policy, in: dir)
+            XCTAssertEqual(r.status, 0, "\(policy): \(r.stderr)")
+            XCTAssertEqual(r.pmsetCalls, allCalls, "\(policy)")
+        }
+    }
+
+    /// The questions are about the user who pressed Start. Asked of
+    /// another user, who has no sudoers lines, they fail.
+    func testTheQueriesAreForTheUserTheyAreGiven() throws {
         try Data("nonce-1".utf8).write(to: marker)
         let other = String(getuid() + 1)
         let r = try runRootCommand(marker: marker, nonce: "nonce-1", uid: other, in: dir)
         XCTAssertEqual(r.status, 5, r.stderr)
-        XCTAssertEqual(r.sudoCalls.first, "-n -u #\(other) /usr/bin/sudo -k -n /usr/bin/pmset -a disablesleep 0")
-        XCTAssertEqual(r.pmsetCalls, refusedCalls)
+        XCTAssertEqual(r.sudoCalls.first, "-n -u #\(other) /usr/bin/env -i LC_ALL=C /usr/bin/sudo -V")
+        XCTAssertEqual(r.sudoCalls.count, 4, "anyone may see the version; that user's listing needs a password")
+        XCTAssertEqual(r.pmsetCalls, [])
         XCTAssertEqual(r.sleepDisabled, "0")
     }
 
     /// A uid that is not a positive whole number is refused before sudo
-    /// or pmset runs: root (0) never needs a password, so a check as root
-    /// would prove nothing.
+    /// or pmset runs: root (0) never needs a password, so asking about
+    /// root would prove nothing.
     func testAnUnusableUidRefusesWithoutRunningSudo() throws {
         try Data("nonce-1".utf8).write(to: marker)
         for uid in ["", "0", "-1", "abc", "501x", "1e3", "99999999999999999999", "$(touch canary)"] {
@@ -550,7 +520,7 @@ final class RootCommandTests: XCTestCase {
             XCTAssertEqual(r.status, 5, "uid \(uid.debugDescription): \(r.stderr)")
             XCTAssertEqual(r.sudoCalls, [], "uid \(uid.debugDescription)")
             XCTAssertEqual(r.pmsetCalls, [], "uid \(uid.debugDescription)")
-            XCTAssertTrue(r.stderr.contains("turning sleep back on needs a password, so sleep was not turned off"), r.stderr)
+            XCTAssertTrue(r.stderr.contains("no user id came with the password, so sudo could not be asked whether sleep can be turned back on without one; sleep was not turned off"), r.stderr)
         }
         XCTAssertFalse(FileManager.default.fileExists(atPath: dir.appendingPathComponent("canary").path))
     }
@@ -561,7 +531,7 @@ final class RootCommandTests: XCTestCase {
         let r = try runRootCommand(marker: marker, nonce: "nonce-1", in: dir)
         XCTAssertEqual(r.status, 69, r.stderr)
         XCTAssertEqual(r.pmsetCalls, [])
-        XCTAssertEqual(r.sudoCalls, [], "no restore check either")
+        XCTAssertEqual(r.sudoCalls, [], "no question either")
         XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path), "lockf -n never creates the marker")
     }
 
@@ -583,8 +553,8 @@ final class RootCommandTests: XCTestCase {
         XCTAssertEqual(r.pmsetCalls, [])
     }
 
-    /// A password accepted at or after the session's end turns nothing
-    /// off, even though the marker still holds the nonce.
+    /// A password accepted at or after the session's end asks nothing and
+    /// turns nothing off, even though the marker still holds the nonce.
     func testDoesNothingOnceTheSessionHasEnded() throws {
         try Data("nonce-1".utf8).write(to: marker)
         let now = Int(Date().timeIntervalSince1970)
@@ -608,50 +578,78 @@ final class RootCommandTests: XCTestCase {
     /// clock would show.
     private let fakeDeadline = 2_000_000_100
 
-    /// The embedded command, started 100 s before `fakeDeadline` on a fake
-    /// clock that reads `afterRestore` once the restore check has run.
-    private func runOnFakeClock(afterRestore: Int, policy: RootSudoPolicy = .rule, sleepDisabled: String = "0", owned: String = "0", foreignAfter: String? = nil, foreignSets: String = "1") throws -> RootCommandRun {
+    /// Each call before the write that can take a while: the three
+    /// questions and root's read.
+    private let slowCalls = [RootCommandProcess.versionQuery, RootCommandProcess.listQuery, RootCommandProcess.ruleQuery, RootCommandProcess.read]
+
+    /// The command (the embedded copy unless given), started 100 s before
+    /// `fakeDeadline` on a fake clock that reads `later` once the call `at`
+    /// has answered.
+    private func runOnFakeClock(at: String, later: Int, command: String? = nil, policy: RootSudoPolicy = .rule, sleepDisabled: String = "0", owned: String = "0", foreignAfter: String? = nil) throws -> RootCommandRun {
         try Data("nonce-1".utf8).write(to: marker)
         return try runRootCommand(
             marker: marker, nonce: "nonce-1", deadline: String(fakeDeadline), policy: policy,
-            command: appleScriptEmbeddedRootCommand(),
-            clock: RootCommandClock(start: fakeDeadline - 100, afterRestore: afterRestore),
-            sleepDisabled: sleepDisabled, owned: owned, foreignAfter: foreignAfter, foreignSets: foreignSets, in: dir)
+            command: command ?? appleScriptEmbeddedRootCommand(),
+            clock: RootCommandClock(start: fakeDeadline - 100, later: later, at: at),
+            sleepDisabled: sleepDisabled, owned: owned, foreignAfter: foreignAfter, in: dir)
     }
 
-    /// Control: a restore check that ends a second before the deadline
-    /// turns sleep off after it.
-    func testTurnsSleepOffWhenTheRestoreCheckEndsBeforeTheDeadline() throws {
-        let r = try runOnFakeClock(afterRestore: fakeDeadline - 1)
-        XCTAssertEqual(r.status, 0, r.stderr)
-        XCTAssertEqual(r.sudoCalls, restoreCheck)
-        XCTAssertEqual(r.pmsetCalls, allCalls)
-    }
-
-    /// The restore check can be slow (sudo may wait on a directory
-    /// service). When the session's end comes while it runs, at the very
-    /// second of the deadline or after it, sleep is left as the check left
-    /// it: on, root's own change undone, and nothing read or written after.
-    func testLeavesSleepOnWhenTheRestoreCheckEndsAtOrAfterTheDeadline() throws {
-        for afterRestore in [fakeDeadline, fakeDeadline + 1, fakeDeadline + 86_400] {
-            let r = try runOnFakeClock(afterRestore: afterRestore)
-            XCTAssertEqual(r.status, 4, "\(afterRestore): \(r.stderr)")
-            XCTAssertEqual(r.sudoCalls, restoreCheck, "\(afterRestore)")
-            XCTAssertEqual(r.pmsetCalls, ["-g", "-a disablesleep 1", "-a disablesleep 0"], "the check undid root's change; nothing ran after it: \(afterRestore)")
-            XCTAssertEqual(r.pmsetAs, ["root", "root", uid], "\(afterRestore)")
-            XCTAssertEqual(r.sleepDisabled, "0", "\(afterRestore)")
-            XCTAssertTrue(r.stderr.contains("the session this password was for ended while the restore was checked; the check turned sleep back on and it was not left off"), r.stderr)
+    /// Control: whichever call takes the time, when it ends a second
+    /// before the deadline, sleep is turned off after it.
+    func testTurnsSleepOffWhenEveryAnswerComesBeforeTheDeadline() throws {
+        for at in slowCalls {
+            let r = try runOnFakeClock(at: at, later: fakeDeadline - 1)
+            XCTAssertEqual(r.status, 0, "\(at): \(r.stderr)")
+            XCTAssertEqual(r.sudoCalls, queries, at)
+            XCTAssertEqual(r.pmsetCalls, allCalls, at)
+            XCTAssertEqual(r.sleepDisabled, "1", at)
         }
     }
 
-    /// A restore check that fails is still exit 5, on the same clock.
-    func testAFailedRestoreCheckStillExitsFiveOnTheFakeClock() throws {
-        let r = try runOnFakeClock(afterRestore: fakeDeadline - 1, policy: .noRule)
+    /// Round 17 R3. Any call before the write can use up the rest of the
+    /// session: sudo may wait on a directory service, pmset on powerd.
+    /// Before, the clock was read before the last `pmset -g`, so a read
+    /// that ended at the deadline or later was still followed by the
+    /// write. The clock is now read after the questions and again after
+    /// the read, right before the write. When the deadline comes during
+    /// any of them, at its very second or after, the command writes
+    /// nothing, and reads nothing after it.
+    func testWritesNothingWhenTheDeadlineComesDuringAnyCallBeforeTheWrite() throws {
+        for at in slowCalls {
+            for later in [fakeDeadline, fakeDeadline + 1, fakeDeadline + 86_400] {
+                for (name, command) in try bothCommands() {
+                    let label = "\(at), \(later - fakeDeadline) s after the deadline, \(name)"
+                    let r = try runOnFakeClock(at: at, later: later, command: command)
+                    XCTAssertEqual(r.status, 4, "\(label): \(r.stderr)")
+                    XCTAssertEqual(r.sudoCalls, queries, label)
+                    XCTAssertEqual(r.pmsetCalls, at == RootCommandProcess.read ? ["-g"] : [], label)
+                    XCTAssertEqual(r.sleepDisabled, "0", label)
+                    let says = at == RootCommandProcess.read
+                        ? "the session this password was for ended while pmset -g was read; sleep was not turned off"
+                        : "the session this password was for ended while sudo was asked about the restore; sleep was not turned off"
+                    XCTAssertTrue(r.stderr.contains(says), "\(label): \(r.stderr)")
+                }
+            }
+        }
+    }
+
+    /// The journal-owned path skips the read, so the comparison after the
+    /// questions is the one right before the write, and it still stops it.
+    func testAJournalOwnedSettingWritesNothingWhenTheDeadlineComesDuringTheQuestions() throws {
+        for (name, command) in try bothCommands() {
+            let r = try runOnFakeClock(at: RootCommandProcess.ruleQuery, later: fakeDeadline, command: command, sleepDisabled: "1", owned: "1")
+            XCTAssertEqual(r.status, 4, "\(name): \(r.stderr)")
+            XCTAssertEqual(r.pmsetCalls, [], name)
+            XCTAssertEqual(r.sleepDisabled, "1", name)
+        }
+    }
+
+    /// A refusal on the fake clock is still exit 5.
+    func testARefusalStillExitsFiveOnTheFakeClock() throws {
+        let r = try runOnFakeClock(at: RootCommandProcess.versionQuery, later: fakeDeadline - 1, policy: .noRule)
         XCTAssertEqual(r.status, 5, r.stderr)
-        XCTAssertEqual(r.sudoCalls, restoreCheck)
-        XCTAssertEqual(r.pmsetCalls, refusedCalls)
-        XCTAssertEqual(r.sleepDisabled, "0")
-        XCTAssertTrue(r.stderr.contains("turning sleep back on needs a password, so it was turned back on at once and not left off"), r.stderr)
+        XCTAssertEqual(r.sudoCalls, Array(queries.prefix(4)))
+        XCTAssertEqual(r.pmsetCalls, [])
     }
 
     /// A deadline that is not a plain number fails the comparison, which
@@ -665,41 +663,67 @@ final class RootCommandTests: XCTestCase {
         }
     }
 
-    /// When root's own restore after a failed check fails too, the command
-    /// exits 1, never 5: the start then undoes it like an end.
-    func testARootRestoreThatFailsIsNotARefusal() throws {
-        for (name, command) in try bothCommands() {
-            try Data("nonce-1".utf8).write(to: marker)
-            let r = try RootCommandProcess(marker: marker, nonce: "nonce-1", policy: .noRule, command: command, rootRestoreFails: true, in: dir).wait()
-            XCTAssertEqual(r.status, 1, "\(name): \(r.stderr)")
-            XCTAssertEqual(r.pmsetCalls, refusedCalls, name)
-            XCTAssertEqual(r.sleepDisabled, "1", "\(name): root's change is still in place, for the start's undo")
-            XCTAssertFalse(r.stderr.contains("turning sleep back on needs a password"), "\(name): nothing claims sleep went back on")
-        }
+    /// When pmset's own write fails, the command exits 1, never a refusal:
+    /// pmset may have changed the setting before it failed, so the start
+    /// undoes it like an end.
+    func testAFailedWriteIsNotARefusal() throws {
+        try Data("nonce-1".utf8).write(to: marker)
+        let r = try RootCommandProcess(marker: marker, nonce: "nonce-1", writeFails: true, in: dir).wait()
+        XCTAssertEqual(r.status, 1, r.stderr)
+        XCTAssertEqual(r.pmsetCalls, allCalls)
+        XCTAssertFalse(OsascriptAdministratorPrompt.refusalStatuses.contains(r.status))
     }
 
-    /// osascript may already have exited (SIGTERM at the deadline) when the
-    /// check fails, and then the first write to the command's stderr kills
-    /// it with SIGPIPE. Root turns sleep back on before it prints, so even
-    /// then sleep is not left off. sudo's own message hits the closed pipe
-    /// first; whatever kills it, the check has failed.
-    func testAClosedDialogCannotStopRootsRestore() throws {
-        for (name, command) in try bothCommands() {
-            try Data("nonce-1".utf8).write(to: marker)
-            let r = try RootCommandProcess(marker: marker, nonce: "nonce-1", policy: .noRule, command: command, outputClosed: true, in: dir).wait()
-            XCTAssertNotEqual(r.status, 0, name)
-            XCTAssertEqual(r.pmsetCalls, refusedCalls, name)
-            XCTAssertEqual(r.sleepDisabled, "0", "\(name): sleep must not be left off")
+    /// Round 17 R2. osascript may already have exited (SIGTERM at the
+    /// app's deadline) when the command refuses, so its stderr is a pipe
+    /// nobody reads. Before, the first write to it killed the shell with
+    /// SIGPIPE: lockf reported 70, the start took that for a failure and
+    /// undid, and the command's own fallback had already written 0 over
+    /// another tool's 1. The command now ignores SIGPIPE, so each refusal
+    /// still exits with its own status, and none writes anything.
+    func testARefusalKeepsItsStatusWhenTheDialogsOutputIsGone() throws {
+        struct Case {
+            let name: String
+            let policy: RootSudoPolicy
+            let initial: String
+            let foreignAfter: String?
+            let status: Int32
+            let pmset: [String]
+            let left: String
         }
+        let cases = [
+            Case(name: "no rule", policy: .noRule, initial: "0", foreignAfter: nil, status: 5, pmset: [], left: "0"),
+            Case(name: "no rule, another tool's 1 while sudo is asked", policy: .noRule, initial: "0", foreignAfter: RootCommandProcess.versionQuery, status: 5, pmset: [], left: "1"),
+            Case(name: "an old sudo", policy: .oldSudo, initial: "0", foreignAfter: nil, status: 5, pmset: [], left: "0"),
+            Case(name: "a later rule", policy: .laterRule, initial: "0", foreignAfter: nil, status: 5, pmset: [], left: "0"),
+            Case(name: "another tool's 1 from while the dialog was up", policy: .rule, initial: "1", foreignAfter: nil, status: 6, pmset: ["-g"], left: "1"),
+            Case(name: "another tool's 1 while sudo is asked", policy: .rule, initial: "0", foreignAfter: RootCommandProcess.ruleQuery, status: 6, pmset: ["-g"], left: "1"),
+        ]
+        for c in cases {
+            for (name, command) in try bothCommands() {
+                try Data("nonce-1".utf8).write(to: marker)
+                let r = try RootCommandProcess(marker: marker, nonce: "nonce-1", policy: c.policy, command: command, sleepDisabled: c.initial, foreignAfter: c.foreignAfter, outputClosed: true, in: dir).wait()
+                let label = "\(c.name), \(name)"
+                XCTAssertEqual(r.status, c.status, label)
+                XCTAssertEqual(r.pmsetCalls, c.pmset, label)
+                XCTAssertEqual(r.sleepDisabled, c.left, label)
+            }
+        }
+        try Data("nonce-2".utf8).write(to: marker)
+        XCTAssertEqual(try RootCommandProcess(marker: marker, nonce: "nonce-1", outputClosed: true, in: dir).wait().status, 3)
+        try Data("nonce-1".utf8).write(to: marker)
+        let ended = try RootCommandProcess(marker: marker, nonce: "nonce-1", deadline: String(Int(Date().timeIntervalSince1970) - 1), outputClosed: true, in: dir).wait()
+        XCTAssertEqual(ended.status, 4)
+        XCTAssertEqual(ended.pmsetCalls, [])
     }
 
-    /// The command holds the marker's lock from before its check until
+    /// The command holds the marker's lock from before its checks until
     /// pmset exits, so the app cannot delete the marker in between: the
     /// removal times out and the marker stays, and once pmset is done it
     /// goes.
     func testTheMarkerCannotBeRemovedWhilePmsetRuns() async throws {
         try Data("nonce-1".utf8).write(to: marker)
-        let command = try RootCommandProcess(marker: marker, nonce: "nonce-1", in: dir, holdPmset: true)
+        let command = try RootCommandProcess(marker: marker, nonce: "nonce-1", in: dir, holdAt: RootCommandProcess.write)
         XCTAssertTrue(command.waitUntilPmsetRuns())
 
         do {
@@ -726,7 +750,7 @@ final class RootCommandTests: XCTestCase {
     /// deletes nothing else.
     func testAReplacedMarkerIsNotDeletedWhilePmsetRuns() async throws {
         let written = try store.savePendingStart("nonce-1")
-        let command = try RootCommandProcess(marker: marker, nonce: "nonce-1", in: dir, holdPmset: true)
+        let command = try RootCommandProcess(marker: marker, nonce: "nonce-1", in: dir, holdAt: RootCommandProcess.write)
         XCTAssertTrue(command.waitUntilPmsetRuns())
         let copy = dir.appendingPathComponent("copy")
         try Data("nonce-1".utf8).write(to: copy)
@@ -746,16 +770,17 @@ final class RootCommandTests: XCTestCase {
         XCTAssertEqual(r.pmsetCalls, allCalls)
     }
 
-    /// The restore check runs under the same lock: while it runs, the
-    /// marker cannot go, so recovery never undoes beside it.
-    func testTheMarkerCannotBeRemovedWhileTheRestoreCheckRuns() async throws {
+    /// sudo is asked under the same lock: while it answers, the marker
+    /// cannot go, so recovery never undoes beside a command that may still
+    /// write.
+    func testTheMarkerCannotBeRemovedWhileSudoIsAsked() async throws {
         try Data("nonce-1".utf8).write(to: marker)
-        let command = try RootCommandProcess(marker: marker, nonce: "nonce-1", in: dir, holdPmset: true, holdAt: "-a disablesleep 0")
+        let command = try RootCommandProcess(marker: marker, nonce: "nonce-1", in: dir, holdAt: RootCommandProcess.ruleQuery)
         XCTAssertTrue(command.waitUntilPmsetRuns())
 
         do {
             try await store.removePendingStart(timeout: 0.3)
-            XCTFail("the marker must not go while the check runs")
+            XCTFail("the marker must not go while sudo is asked")
         } catch StoreError.markerBusy {
             // expected
         }
@@ -811,110 +836,92 @@ final class RootCommandTests: XCTestCase {
 
     /// Round 14 P1: another tool sets SleepDisabled 1 while the password is
     /// typed. Start's own read found 0, but the command reads `pmset -g`
-    /// again as root, before it writes anything, and leaves the 1 alone:
-    /// no sudo, no pmset write.
+    /// again as root, right before its write, and leaves the 1 alone. The
+    /// questions before that read change nothing.
     func testLeavesASleepSettingMadeWhileTheDialogWasUp() throws {
         for (name, command) in try bothCommands() {
             try Data("nonce-1".utf8).write(to: marker)
             let r = try runRootCommand(marker: marker, nonce: "nonce-1", command: command, sleepDisabled: "1", in: dir)
             XCTAssertEqual(r.status, 6, "\(name): \(r.stderr)")
             XCTAssertEqual(r.pmsetCalls, ["-g"], name)
-            XCTAssertEqual(r.sudoCalls, [], "\(name): the restore check would have cleared it")
+            XCTAssertEqual(r.sudoCalls, queries, name)
             XCTAssertEqual(r.sleepDisabled, "1", name)
             XCTAssertTrue(r.stderr.contains("pmset -g shows a SleepDisabled 1 this start did not set, or could not be read; it was left alone and sleep was not turned off"), r.stderr)
         }
     }
 
-    /// The reviewer's case on the fake clock: a 1 set while the dialog was
-    /// up, and a deadline that passes during the restore check. Before,
-    /// the check cleared the 1 and the deadline then stopped the command,
-    /// leaving 0. Now the read stops it first, so the 1 stays, whatever
-    /// the clock does after.
-    func testASettingMadeWhileTheDialogWasUpSurvivesADeadlineDuringTheCheck() throws {
-        for afterRestore in [fakeDeadline - 1, fakeDeadline, fakeDeadline + 1] {
-            let r = try runOnFakeClock(afterRestore: afterRestore, sleepDisabled: "1")
-            XCTAssertEqual(r.status, 6, "\(afterRestore): \(r.stderr)")
-            XCTAssertEqual(r.pmsetCalls, ["-g"], "\(afterRestore)")
-            XCTAssertEqual(r.sudoCalls, [], "\(afterRestore)")
-            XCTAssertEqual(r.sleepDisabled, "1", "\(afterRestore)")
+    /// Round 17 R1: a 1 set while sudo is asked. Before, root had already
+    /// turned sleep off for its check, and the check's write of 0 (or
+    /// root's own restore when the check failed) cleared that 1. Now
+    /// nothing has been written by then, and the read finds it.
+    func testLeavesASleepSettingMadeWhileSudoIsAsked() throws {
+        for at in [RootCommandProcess.versionQuery, RootCommandProcess.listQuery, RootCommandProcess.ruleQuery] {
+            for (name, command) in try bothCommands() {
+                try Data("nonce-1".utf8).write(to: marker)
+                let r = try runRootCommand(marker: marker, nonce: "nonce-1", command: command, foreignAfter: at, in: dir)
+                XCTAssertEqual(r.status, 6, "\(at) \(name): \(r.stderr)")
+                XCTAssertEqual(r.pmsetCalls, ["-g"], "\(at) \(name)")
+                XCTAssertEqual(r.sleepDisabled, "1", "\(at) \(name)")
+            }
         }
     }
 
-    /// A 1 set right after the restore check's write of 0: before the
-    /// deadline, the read after the check finds it and leaves it; after
-    /// the deadline, the command stops before that read and leaves it too.
-    func testLeavesASleepSettingMadeAfterTheRestoreCheck() throws {
-        let inTime = try runOnFakeClock(afterRestore: fakeDeadline - 1, foreignAfter: "-a disablesleep 0")
-        XCTAssertEqual(inTime.status, 6, inTime.stderr)
-        XCTAssertEqual(inTime.sudoCalls, restoreCheck)
-        XCTAssertEqual(inTime.pmsetCalls, ["-g", "-a disablesleep 1", "-a disablesleep 0", "-g"])
-        XCTAssertEqual(inTime.sleepDisabled, "1")
-        XCTAssertTrue(inTime.stderr.contains("pmset -g shows a SleepDisabled 1 set after the restore check turned sleep back on, or could not be read; it was left alone and this start did not turn sleep off again"), inTime.stderr)
-
-        let late = try runOnFakeClock(afterRestore: fakeDeadline + 1, foreignAfter: "-a disablesleep 0")
-        XCTAssertEqual(late.status, 4, late.stderr)
-        XCTAssertEqual(late.pmsetCalls, ["-g", "-a disablesleep 1", "-a disablesleep 0"])
-        XCTAssertEqual(late.sleepDisabled, "1")
-
-        let plain = try runRootCommand(marker: marker, nonce: "nonce-1", foreignAfter: "-a disablesleep 0", in: dir)
-        XCTAssertEqual(plain.status, 6, plain.stderr)
-        XCTAssertEqual(plain.sleepDisabled, "1")
+    /// The same 1 when sudo does not confirm the restore: the command
+    /// stops before it reads, and nothing is written over the 1.
+    func testASudoRefusalLeavesASettingMadeWhileSudoIsAsked() throws {
+        for (policy, at) in [(RootSudoPolicy.noRule, RootCommandProcess.versionQuery), (.listOnly, RootCommandProcess.listQuery), (.laterRule, RootCommandProcess.ruleQuery)] {
+            try Data("nonce-1".utf8).write(to: marker)
+            let r = try runRootCommand(marker: marker, nonce: "nonce-1", policy: policy, foreignAfter: at, in: dir)
+            XCTAssertEqual(r.status, 5, "\(policy): \(r.stderr)")
+            XCTAssertEqual(r.pmsetCalls, [], "\(policy)")
+            XCTAssertEqual(r.sleepDisabled, "1", "\(policy)")
+        }
     }
 
     /// `pmset -g` that fails is not taken for 0: the command stops before
     /// it writes anything, as Start does.
-    func testAnUnreadableSettingStopsBeforeTheRestoreCheck() throws {
+    func testAnUnreadableSettingStopsBeforeTheWrite() throws {
         for (name, command) in try bothCommands() {
             try Data("nonce-1".utf8).write(to: marker)
             let r = try runRootCommand(marker: marker, nonce: "nonce-1", command: command, sleepDisabled: "fail", in: dir)
             XCTAssertEqual(r.status, 6, "\(name): \(r.stderr)")
             XCTAssertEqual(r.pmsetCalls, ["-g"], name)
-            XCTAssertEqual(r.sudoCalls, [], name)
+            XCTAssertEqual(r.sudoCalls, queries, name)
             XCTAssertEqual(r.sleepDisabled, "fail", name)
         }
     }
 
-    /// The read after the check fails the same way: the command stops
-    /// before the session's change, and its own change is already undone.
-    func testAnUnreadableSettingAfterTheCheckStopsBeforeTheChange() throws {
-        let r = try runOnFakeClock(afterRestore: fakeDeadline - 1, foreignAfter: "-a disablesleep 0", foreignSets: "fail")
-        XCTAssertEqual(r.status, 6, r.stderr)
-        XCTAssertEqual(r.pmsetCalls, ["-g", "-a disablesleep 1", "-a disablesleep 0", "-g"])
-        XCTAssertEqual(r.sleepDisabled, "fail")
-    }
-
     /// `$5` is `1` only when the journal already owned the SleepDisabled 1
     /// (an earlier restore failed). Start skipped its read for that 1, and
-    /// so does the command: it turns sleep off, runs the restore that was
-    /// owed as its check, and turns sleep off again.
-    func testAJournalOwnedSettingSkipsTheReads() throws {
+    /// so does the command, but it still asks sudo first, and then writes
+    /// once.
+    func testAJournalOwnedSettingSkipsTheReadButNotTheQuestions() throws {
         for (name, command) in try bothCommands() {
             try Data("nonce-1".utf8).write(to: marker)
             let r = try runRootCommand(marker: marker, nonce: "nonce-1", command: command, sleepDisabled: "1", owned: "1", in: dir)
             XCTAssertEqual(r.status, 0, "\(name): \(r.stderr)")
-            XCTAssertEqual(r.pmsetCalls, ["-a disablesleep 1", "-a disablesleep 0", "-a disablesleep 1"], name)
-            XCTAssertEqual(r.pmsetAs, ["root", uid, "root"], name)
-            XCTAssertEqual(r.sudoCalls, restoreCheck, name)
+            XCTAssertEqual(r.pmsetCalls, ["-a disablesleep 1"], name)
+            XCTAssertEqual(r.pmsetAs, ["root"], name)
+            XCTAssertEqual(r.sudoCalls, queries, name)
             XCTAssertEqual(r.sleepDisabled, "1", name)
         }
     }
 
-    /// The same journal-owned 1 when the check fails: root runs the owed
-    /// restore itself, so the Mac is left with sleep on. The journal entry
-    /// the start rolls back to still says the restore is owed, and running
-    /// it again sets 0 over 0.
-    func testAJournalOwnedSettingIsRestoredWhenTheCheckFails() throws {
+    /// The same journal-owned 1 when sudo does not confirm the restore.
+    /// Before, root ran the owed restore itself while the journal entry
+    /// the start rolls back to still said it was owed. Now nothing is
+    /// written: the 1 stays, and that entry keeps owing its restore.
+    func testAJournalOwnedSettingIsLeftToTheJournalWhenSudoRefuses() throws {
         try Data("nonce-1".utf8).write(to: marker)
         let r = try runRootCommand(marker: marker, nonce: "nonce-1", policy: .noRule, sleepDisabled: "1", owned: "1", in: dir)
         XCTAssertEqual(r.status, 5, r.stderr)
-        XCTAssertEqual(r.pmsetCalls, ["-a disablesleep 1", "-a disablesleep 0"])
-        XCTAssertEqual(r.pmsetAs, ["root", "root"])
-        XCTAssertEqual(r.sleepDisabled, "0")
+        XCTAssertEqual(r.pmsetCalls, [])
+        XCTAssertEqual(r.sleepDisabled, "1")
     }
 
-    /// Only exactly `1` skips the reads; anything else, empty or odd,
+    /// Only exactly `1` skips the read; anything else, empty or odd,
     /// reads, and is never run.
-    func testOnlyExactlyOneSkipsTheReads() throws {
+    func testOnlyExactlyOneSkipsTheRead() throws {
         try Data("nonce-1".utf8).write(to: marker)
         for owned in ["", "0", "true", "yes", "01", " 1", "1 ", "1\n", "$(touch canary)", "1;touch canary"] {
             let r = try runRootCommand(marker: marker, nonce: "nonce-1", sleepDisabled: "1", owned: owned, in: dir)
@@ -957,57 +964,187 @@ final class RootCommandTests: XCTestCase {
 
     /// Where another tool's SleepDisabled 1 lands decides whether it
     /// survives. Each row injects one 1 at one point, on the fake clock,
-    /// through a check that passes, a check that fails (exit 5) and a
-    /// deadline that passes during the check (exit 4).
+    /// through a confirmed restore, a refused one (exit 5) and a deadline
+    /// that passes (exit 4).
     ///
-    /// Before any write (set while the dialog was up) or after the check's
-    /// write, the 1 survives every path. In between it does not: pmset has
-    /// no compare-and-set, so a 1 set in the moment between the read and
-    /// root's `disablesleep 1` cannot be told from that change, and neither
-    /// can a 1 set while root's change is in effect. The check's write (or
-    /// root's own restore when the check fails) clears it, and on the
-    /// passing path the session's end would. These rows record that limit;
-    /// they do not make it go away.
+    /// Before root's read (set while the dialog was up, or while sudo is
+    /// asked) the 1 survives every path, because nothing has been written:
+    /// the read stops the command (6), or a refusal or the deadline stops
+    /// it before the read. After the read it does not survive a confirmed
+    /// restore: pmset has no compare-and-set, so a 1 set in the moment
+    /// between root's read of 0 and its write cannot be told from that
+    /// write, and the session's end clears it as Insomnia's own. A
+    /// deadline that comes during that read still stops the write, and
+    /// the 1 stays. These rows record that limit; they do not make it go
+    /// away.
     func testWhereAnotherToolsOneLandsDecidesWhetherItSurvives() throws {
         struct Row {
             let at: String?
             let initial: String
             let policy: RootSudoPolicy
-            let afterRestore: Int
+            let clockAt: String
+            let late: Bool
             let status: Int32
             let left: String
             let survives: Bool
         }
-        let pass = fakeDeadline - 1
-        let late = fakeDeadline + 1
+        let V = RootCommandProcess.versionQuery, l = RootCommandProcess.listQuery, ll = RootCommandProcess.ruleQuery, g = RootCommandProcess.read
         let rows = [
-            // Set while the dialog was up: the first read stops everything.
-            Row(at: nil, initial: "1", policy: .rule, afterRestore: pass, status: 6, left: "1", survives: true),
-            Row(at: nil, initial: "1", policy: .noRule, afterRestore: pass, status: 6, left: "1", survives: true),
-            Row(at: nil, initial: "1", policy: .rule, afterRestore: late, status: 6, left: "1", survives: true),
-            // Between the read and root's change: taken for Insomnia's own.
-            Row(at: "-g", initial: "0", policy: .rule, afterRestore: pass, status: 0, left: "1", survives: false),
-            Row(at: "-g", initial: "0", policy: .noRule, afterRestore: pass, status: 5, left: "0", survives: false),
-            Row(at: "-g", initial: "0", policy: .rule, afterRestore: late, status: 4, left: "0", survives: false),
-            // While root's change is in effect, before the check's write.
-            Row(at: "-a disablesleep 1", initial: "0", policy: .rule, afterRestore: pass, status: 0, left: "1", survives: false),
-            Row(at: "-a disablesleep 1", initial: "0", policy: .noRule, afterRestore: pass, status: 5, left: "0", survives: false),
-            Row(at: "-a disablesleep 1", initial: "0", policy: .rule, afterRestore: late, status: 4, left: "0", survives: false),
-            // After the check's write: the deadline or the second read
-            // stops the command and the 1 stays.
-            Row(at: "-a disablesleep 0", initial: "0", policy: .rule, afterRestore: pass, status: 6, left: "1", survives: true),
-            Row(at: "-a disablesleep 0", initial: "0", policy: .rule, afterRestore: late, status: 4, left: "1", survives: true),
+            // Set while the dialog was up.
+            Row(at: nil, initial: "1", policy: .rule, clockAt: ll, late: false, status: 6, left: "1", survives: true),
+            Row(at: nil, initial: "1", policy: .noRule, clockAt: ll, late: false, status: 5, left: "1", survives: true),
+            Row(at: nil, initial: "1", policy: .rule, clockAt: ll, late: true, status: 4, left: "1", survives: true),
+            // Set while sudo is asked.
+            Row(at: V, initial: "0", policy: .rule, clockAt: ll, late: false, status: 6, left: "1", survives: true),
+            Row(at: l, initial: "0", policy: .rule, clockAt: ll, late: false, status: 6, left: "1", survives: true),
+            Row(at: ll, initial: "0", policy: .rule, clockAt: ll, late: false, status: 6, left: "1", survives: true),
+            Row(at: V, initial: "0", policy: .noRule, clockAt: ll, late: false, status: 5, left: "1", survives: true),
+            Row(at: ll, initial: "0", policy: .listOnly, clockAt: ll, late: false, status: 5, left: "1", survives: true),
+            Row(at: ll, initial: "0", policy: .rule, clockAt: ll, late: true, status: 4, left: "1", survives: true),
+            // Set right after root's read of 0: taken for Insomnia's own.
+            Row(at: g, initial: "0", policy: .rule, clockAt: ll, late: false, status: 0, left: "1", survives: false),
+            // The same, with the deadline coming during that read.
+            Row(at: g, initial: "0", policy: .rule, clockAt: g, late: true, status: 4, left: "1", survives: true),
         ]
         for row in rows {
-            let label = "\(row.at ?? "dialog") \(row.policy) \(row.afterRestore == pass ? "in time" : "late")"
-            let r = try runOnFakeClock(afterRestore: row.afterRestore, policy: row.policy, sleepDisabled: row.initial, foreignAfter: row.at)
+            let label = "\(row.at ?? "dialog") \(row.policy) \(row.late ? "late at \(row.clockAt)" : "in time")"
+            let r = try runOnFakeClock(at: row.clockAt, later: row.late ? fakeDeadline : fakeDeadline - 1, policy: row.policy, sleepDisabled: row.initial, foreignAfter: row.at)
             XCTAssertEqual(r.status, row.status, "\(label): \(r.stderr)")
             XCTAssertEqual(r.sleepDisabled, row.left, label)
+            XCTAssertEqual(r.pmsetCalls.contains("-a disablesleep 1"), row.status == 0, "\(label): only a confirmed start writes")
             // A 1 that survives is still there and the command stopped;
-            // one that does not was cleared by a write of 0, or (status
-            // 0) is now Insomnia's journaled 1, which the end clears.
+            // one that does not is now Insomnia's journaled 1 (status 0),
+            // which the end clears.
             XCTAssertEqual(row.survives, r.status != 0 && r.sleepDisabled == "1", label)
         }
+    }
+}
+
+/// The root command's readers of sudo's answers: the awk programs exactly
+/// as `AdministratorPrompt.rootCommand` holds them, fed text in the shapes
+/// sudo 1.9.17p2's source prints (SudoFormat). That text was built from the
+/// source, not captured from a running sudo, so these show that the
+/// readers take the shapes the source prints and refuse the near misses
+/// around them, not that a given Mac prints those shapes.
+final class RootCommandSudoAnswerTests: XCTestCase {
+    private var dir: URL!
+
+    override func setUpWithError() throws {
+        dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("insomnia-sudo-answer-tests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    }
+
+    override func tearDownWithError() throws {
+        try? FileManager.default.removeItem(at: dir)
+    }
+
+    /// The command's awk programs, in order: the `-V` reader, the `-l`
+    /// reader, the `-ll` reader and the `pmset -g` reader.
+    private func programs() throws -> [String] {
+        let programs = AdministratorPrompt.rootCommand.components(separatedBy: "/usr/bin/awk '").dropFirst().compactMap { $0.components(separatedBy: "'").first }
+        XCTAssertEqual(programs.count, 4)
+        guard programs.count == 4 else { throw XCTSkip("the command's awk programs moved") }
+        return programs
+    }
+
+    /// The program's exit status for `text` as the command hands it over,
+    /// `printf %s "$(...)"`: without its trailing newlines.
+    private func status(_ program: String, _ text: String) throws -> Int32 {
+        var input = text
+        while input.hasSuffix("\n") { input.removeLast() }
+        let file = dir.appendingPathComponent("input")
+        try Data(input.utf8).write(to: file)
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/awk")
+        p.arguments = [program]
+        p.environment = ["LC_ALL": "C"]
+        p.standardInput = try FileHandle(forReadingFrom: file)
+        p.standardOutput = FileHandle.nullDevice
+        let exit = ProcessExit(p)
+        try p.run()
+        exit.wait()
+        return p.terminationStatus
+    }
+
+    func testTheVersionReaderTakesOnlySudoersOnSudo1_9_15AndLater() throws {
+        let reader = try programs()[0]
+        let v = SudoFormat.version
+        let accepted = [
+            "1.9.17p2 with sudoers' I/O and audit plugins": SudoFormat.versionOutput(),
+            "1.9.15": SudoFormat.versionOutput("1.9.15"),
+            "1.9.15p5": SudoFormat.versionOutput("1.9.15p5"),
+            "1.9.16p2 without the audit plugin": SudoFormat.versionOutput("1.9.16p2", audit: false),
+            "1.9.17p2 with the policy plugin alone": SudoFormat.versionOutput(io: false, audit: false),
+        ]
+        let refused = [
+            "1.9.14p3": SudoFormat.versionOutput("1.9.14p3"),
+            "1.9.9": SudoFormat.versionOutput("1.9.9"),
+            "1.10.0": SudoFormat.versionOutput("1.10.0"),
+            "2.0.0": SudoFormat.versionOutput("2.0.0"),
+            "1.9.17x": SudoFormat.versionOutput("1.9.17x"),
+            "an approval plugin": SudoFormat.versionOutput(more: ["Sample approval plugin version \(v)"]),
+            "another I/O plugin": SudoFormat.versionOutput(more: ["Sample I/O plugin version \(v)"]),
+            "the policy plugin of another version": "Sudo version \(v)\nSudoers policy plugin version 1.9.16\nSudoers file grammar version 50\n",
+            "another policy plugin": "Sudo version \(v)\nSample policy plugin version \(v)\n",
+            "root's long answer": "Sudo version \(v)\nConfigure options: --with-pam\nSudoers policy plugin version \(v)\nSudoers file grammar version 50\n\nSudoers path: /etc/sudoers\n",
+            "the audit plugin twice": SudoFormat.versionOutput(more: ["Sudoers audit plugin version \(v)"]),
+            "the I/O plugin after the audit plugin": SudoFormat.versionOutput(io: false, more: ["Sudoers I/O plugin version \(v)"]),
+            "no grammar line": "Sudo version \(v)\nSudoers policy plugin version \(v)\n",
+            "a blank after the version": SudoFormat.versionOutput().replacingOccurrences(of: "Sudo version \(v)\n", with: "Sudo version \(v) \n"),
+            "CRLF": SudoFormat.versionOutput().replacingOccurrences(of: "\n", with: "\r\n"),
+            "nothing": "",
+        ]
+        for (name, text) in accepted { XCTAssertEqual(try status(reader, text), 0, name) }
+        for (name, text) in refused { XCTAssertNotEqual(try status(reader, text), 0, name) }
+    }
+
+    /// The `-l` reader refuses any Defaults bound to a Runas user or a
+    /// command: those apply when the restore runs, not to the `-ll`
+    /// listing. Whether the listing ran without a password is its exit
+    /// status, which the command checks before this reader.
+    func testTheListingReaderRefusesDefaultsBoundToARunasUserOrACommand() throws {
+        let reader = try programs()[1]
+        let rule = ["(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0"]
+        XCTAssertEqual(try status(reader, RootSudoPolicy.rule.answers().listing.stdout), 0)
+        XCTAssertEqual(try status(reader, SudoFormat.listing(defaults: [], rules: rule)), 0)
+        XCTAssertEqual(try status(reader, SudoFormat.listing(defaults: ["env_keep+=\"Runas and Command-specific defaults for user:\""], rules: rule)), 0, "the header's words inside a value are not the header")
+        XCTAssertNotEqual(try status(reader, RootSudoPolicy.boundDefaults.answers().listing.stdout), 0)
+        XCTAssertNotEqual(try status(reader, SudoFormat.listing(bound: ["Defaults>root log_output"], rules: rule)), 0)
+        XCTAssertNotEqual(try status(reader, SudoFormat.listing(defaults: [], bound: ["Defaults>root !authenticate", "Defaults!/usr/bin/pmset log_output"], rules: rule)), 0)
+    }
+
+    /// The `-ll` reader takes the rule install.sh writes, as sudo names its
+    /// file either way, and nothing else: every policy that differs in the
+    /// answer to `-ll`, and near misses of the rule's own answer.
+    func testTheRuleReaderTakesOnlyTheInsomniaRuleWithoutAPassword() throws {
+        let reader = try programs()[2]
+        let restore = "/usr/bin/pmset -a disablesleep 0"
+        for policy: RootSudoPolicy in [.rule, .etcPath] {
+            XCTAssertEqual(try status(reader, policy.answers().check.stdout), 0, "\(policy)")
+        }
+        for policy: RootSudoPolicy in [.listOnly, .noTag, .deny, .laterRule, .runAsAll, .extraOption, .timeLimited, .ldap, .pathOnly, .truncated] {
+            XCTAssertNotEqual(try status(reader, policy.answers().check.stdout), 0, "\(policy)")
+        }
+        let rule = RootSudoPolicy.rule.answers().check.stdout
+        let refused = [
+            "the rule's PASSWD tag": SudoFormat.check(SudoFormat.longEntry(options: ["authenticate"], commands: [restore]), matched: restore),
+            "a rule-level option before the tag": SudoFormat.check(SudoFormat.longEntry(options: ["log_output", "!authenticate"], commands: [restore]), matched: restore),
+            "run-as root and wheel": SudoFormat.check(SudoFormat.longEntry(runAsUsers: "root, wheel", commands: [restore]), matched: restore),
+            "a RunAsGroups line": rule.replacingOccurrences(of: "    RunAsUsers: root\n", with: "    RunAsUsers: root\n    RunAsGroups: wheel\n"),
+            "pmset with any arguments": SudoFormat.check(SudoFormat.longEntry(commands: ["/usr/bin/pmset"]), matched: restore),
+            "two commands": SudoFormat.check(SudoFormat.longEntry(commands: [restore, "/usr/bin/pmset -b lowpowermode 1"]), matched: restore),
+            "another command matched": SudoFormat.check(SudoFormat.longEntry(commands: [restore]), matched: "/usr/bin/pmset -a disablesleep 1"),
+            "another file of the same name": SudoFormat.check(SudoFormat.longEntry(source: "Sudoers entry: /private/etc/sudoers.d/insomnia~", commands: [restore]), matched: restore),
+            "a Timeout line": SudoFormat.check(SudoFormat.longEntry(limits: ["Timeout: 30"], commands: [restore]), matched: restore),
+            "spaces for the tab": rule.replacingOccurrences(of: "\t", with: "    "),
+            "CRLF": rule.replacingOccurrences(of: "\n", with: "\r\n"),
+            "a second entry": rule + "\n" + rule,
+            "a line after Matched": rule + "    Matched: \(restore)\n",
+            "no Matched line": SudoFormat.longEntry(commands: [restore]),
+            "nothing": "",
+        ]
+        for (name, text) in refused { XCTAssertNotEqual(try status(reader, text), 0, name) }
     }
 }
 
@@ -1436,10 +1573,11 @@ final class SleepPromptLifecycleTests: XCTestCase {
         XCTAssertEqual(h.prompt.shown, 1)
     }
 
-    /// The password is accepted, but the root command finds that turning
-    /// sleep back on needs a password, turns it back on itself and exits 5.
-    /// Nothing is left that an undo would reverse: the start rolls back
-    /// with no pmset, and the user is told to run install.sh again.
+    /// The password is accepted, but sudo does not confirm that turning
+    /// sleep back on runs without a password, so the root command exits 5
+    /// before it reads or writes pmset. Nothing is left that an undo would
+    /// reverse: the start rolls back with no pmset, and the user is told
+    /// to run install.sh again.
     func testStartWhoseRestoreCheckFailsRollsBackWithNothingToUndo() async throws {
         h.prompt.restoreNeedsPassword = true
         let m = h.makeManager()
@@ -1450,12 +1588,12 @@ final class SleepPromptLifecycleTests: XCTestCase {
         XCTAssertEqual(h.guardFake.calls, ["disablesleep 1"], "no restore runs after the check refused")
         XCTAssertEqual(h.guardFake.unlockedPrivilegedCalls, [])
         let err = try XCTUnwrap(m.lastError)
-        XCTAssertTrue(err.hasPrefix("could not disable sleep: sleep was not left off: turning it back on needs a password"), err)
-        XCTAssertTrue(err.hasSuffix("run scripts/install.sh again"), err)
+        XCTAssertTrue(err.hasPrefix("could not disable sleep: sleep was not turned off: sudo did not confirm"), err)
+        XCTAssertTrue(err.contains("Run scripts/install.sh again"), err)
         let post = try XCTUnwrap(h.notifier.posts.last)
         XCTAssertEqual(post.title, "Session not started")
-        XCTAssertTrue(post.body.hasPrefix("No session was started, and Insomnia undid anything it changed: sleep was not left off"), post.body)
-        XCTAssertTrue(post.body.contains("run scripts/install.sh again"), post.body)
+        XCTAssertTrue(post.body.hasPrefix("No session was started, and Insomnia undid anything it changed: sleep was not turned off"), post.body)
+        XCTAssertTrue(post.body.contains("Run scripts/install.sh again"), post.body)
 
         h.prompt.restoreNeedsPassword = false
         await m.start(duration: 1800)
@@ -1464,7 +1602,8 @@ final class SleepPromptLifecycleTests: XCTestCase {
     }
 
     /// A restore the journal already owed (an earlier one failed) stays
-    /// owed when the check refuses: the rollback puts that entry back.
+    /// owed when sudo does not confirm the restore: the root command
+    /// writes nothing, and the rollback puts that entry back.
     func testARefusedRestoreCheckKeepsAnEntryAnEarlierRestoreLeft() async throws {
         var earlier = RuntimeState()
         earlier.sleepDisabledByUs = true
@@ -1761,10 +1900,10 @@ final class SleepPromptLifecycleTests: XCTestCase {
         XCTAssertNil(try h.store.loadSession())
         XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
         let err = try XCTUnwrap(m.lastError)
-        XCTAssertTrue(err.hasPrefix("could not disable sleep: Insomnia did not leave sleep off (the command behind the password dialog stopped with status 6 and undid anything it had changed)"), err)
+        XCTAssertTrue(err.hasPrefix("could not disable sleep: Insomnia did not turn sleep off (the command behind the password dialog stopped with status 6 before it changed anything)"), err)
         let post = try XCTUnwrap(h.notifier.posts.last)
         XCTAssertEqual(post.title, "Session not started")
-        XCTAssertTrue(post.body.hasPrefix("No session was started, and Insomnia undid anything it changed: Insomnia did not leave sleep off"), post.body)
+        XCTAssertTrue(post.body.hasPrefix("No session was started, and Insomnia undid anything it changed: Insomnia did not turn sleep off"), post.body)
     }
 
     /// The reviewer's case through Start: a 1 set while the dialog is up
@@ -1977,7 +2116,7 @@ final class SleepPromptLifecycleTests: XCTestCase {
         _ = try seedValidSession()
         let orphan = PendingStart(marker: h.home.paths.pendingStartFile, nonce: UUID().uuidString, deadline: Date().addingTimeInterval(3600))
         try h.store.savePendingStart(orphan.nonce)
-        let command = try RootCommandProcess(marker: orphan.marker, nonce: orphan.nonce, deadline: orphan.deadlineArgument, in: h.home.root, holdPmset: true)
+        let command = try RootCommandProcess(marker: orphan.marker, nonce: orphan.nonce, deadline: orphan.deadlineArgument, in: h.home.root, holdAt: RootCommandProcess.write)
         defer { command.release() }
         XCTAssertTrue(command.waitUntilPmsetRuns())
         h.guardFake.sleepDisabled = false
@@ -2005,7 +2144,7 @@ final class SleepPromptLifecycleTests: XCTestCase {
 
         command.release()
         let r = command.wait()
-        XCTAssertEqual(r.pmsetCalls, ["-g", "-a disablesleep 1", "-a disablesleep 0", "-g", "-a disablesleep 1"])
+        XCTAssertEqual(r.pmsetCalls, ["-g", "-a disablesleep 1"])
         h.guardFake.sleepDisabled = true
         await m.reconcile()
 
@@ -2297,7 +2436,7 @@ final class SleepPromptLifecycleTests: XCTestCase {
 /// Start end to end through the real PmsetSleepGuard and
 /// OsascriptAdministratorPrompt, on a fake machine (FakeDialogMachine)
 /// whose osascript runs the root command embedded in the AppleScript under
-/// the real lockf, with fake sudo, pmset and clock. No dialog, sudo or
+/// the real lockf, with fake sudo, env, pmset and clock. No dialog, sudo or
 /// pmset of the machine's own runs.
 @MainActor
 final class StartOwnershipEndToEndTests: XCTestCase {
@@ -2314,14 +2453,20 @@ final class StartOwnershipEndToEndTests: XCTestCase {
     /// The harness clock: every session starts at this second.
     private let now = 1_800_000_000
 
-    private func machine(clockStart: Int? = nil, clockAfterRestore: Int? = nil) throws -> FakeDialogMachine {
+    /// A fake machine in its own directory. Its clock reads `clockStart`
+    /// until the root command's call `clockAt` has answered, then
+    /// `clockLater`.
+    private func machine(_ name: String = "machine", clockStart: Int? = nil, clockLater: Int? = nil, clockAt: String = RootCommandProcess.ruleQuery) throws -> FakeDialogMachine {
         try FakeDialogMachine(
-            in: h.home.root.appendingPathComponent("machine", isDirectory: true),
-            clockStart: clockStart ?? now, clockAfterRestore: clockAfterRestore ?? now + 5)
+            in: h.home.root.appendingPathComponent(name, isDirectory: true),
+            clockStart: clockStart ?? now, clockLater: clockLater ?? now + 5, clockAt: clockAt)
     }
 
-    private var restoreCheck: [String] {
-        ["-n -u #\(getuid()) /usr/bin/sudo -k -n /usr/bin/pmset -a disablesleep 0", "-k -n /usr/bin/pmset -a disablesleep 0"]
+    /// The root command's three questions, each as root's sudo to the user
+    /// and as the user's own sudo it starts.
+    private var queries: [String] {
+        let asUser = "-n -u #\(getuid()) /usr/bin/env -i LC_ALL=C /usr/bin/sudo "
+        return ["-V", "-k -n -l", "-k -n -ll /usr/bin/pmset -a disablesleep 0"].flatMap { [asUser + $0, $0] }
     }
 
     private func assertRolledBackWithNothingUndone(_ m: SessionManager, _ fake: FakeDialogMachine, status: Int32, file: StaticString = #filePath, line: UInt = #line) throws {
@@ -2331,13 +2476,12 @@ final class StartOwnershipEndToEndTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: h.home.paths.pendingStartFile.path), "pending-start left behind", file: file, line: line)
         XCTAssertFalse(fake.sudoCalls().contains("-n /usr/bin/pmset -a disablesleep 0"), "the app ran an undo", file: file, line: line)
         let err = try XCTUnwrap(m.lastError, file: file, line: line)
-        XCTAssertTrue(err.hasPrefix("could not disable sleep: Insomnia did not leave sleep off (the command behind the password dialog stopped with status \(status) and undid anything it had changed)"), err, file: file, line: line)
+        XCTAssertTrue(err.hasPrefix("could not disable sleep: Insomnia did not turn sleep off (the command behind the password dialog stopped with status \(status) before it changed anything)"), err, file: file, line: line)
         XCTAssertEqual(h.notifier.posts.last?.title, "Session not started", file: file, line: line)
     }
 
-    /// Control: the command reads sleep on, turns it off, runs the restore
-    /// check (which turns it back on), reads sleep on again and turns it
-    /// off for the session; the end turns it back on.
+    /// Control: the command asks sudo its three questions, reads sleep on
+    /// and turns it off once; the end turns it back on.
     func testStartTurnsSleepOffAndTheEndTurnsItBackOn() async throws {
         let fake = try machine()
         let m = h.makeManager(sleepGuard: fake.sleepGuard())
@@ -2345,8 +2489,8 @@ final class StartOwnershipEndToEndTests: XCTestCase {
 
         XCTAssertTrue(m.isActive, m.lastError ?? "")
         XCTAssertEqual(fake.script, AdministratorPrompt.disableSleepScript)
-        XCTAssertEqual(fake.pmsetCalls(), ["-g", "-g", "-a disablesleep 1", "-a disablesleep 0", "-g", "-a disablesleep 1"], "Start's read, then the command's")
-        XCTAssertEqual(fake.sudoCalls(), restoreCheck)
+        XCTAssertEqual(fake.pmsetCalls(), ["-g", "-g", "-a disablesleep 1"], "Start's read, then the command's read and its write")
+        XCTAssertEqual(fake.sudoCalls(), queries)
         XCTAssertEqual(fake.sleepDisabled, "1")
         XCTAssertEqual(try h.store.loadState()?.sleepDisabledByUs, true)
 
@@ -2355,24 +2499,23 @@ final class StartOwnershipEndToEndTests: XCTestCase {
         XCTAssertEqual(fake.sleepDisabled, "0")
     }
 
-    /// Round 14 P1, reproduced end to end: a SleepDisabled 1 set while the
-    /// dialog is up, and a session whose end passes during the restore
-    /// check. Before, the check cleared the 1, the command stopped at the
-    /// deadline, and the Mac was left at 0. Now the 1 stays, and nothing
-    /// runs through sudo at all.
+    /// Round 14 P1, end to end: a SleepDisabled 1 set while the dialog is
+    /// up, and a session whose end passes while sudo is asked. The command
+    /// stops after the questions without reading or writing pmset, and the
+    /// rollback runs none, so the 1 stays.
     func testASettingMadeWhileTheDialogIsUpSurvivesALateEnd() async throws {
-        let fake = try machine(clockAfterRestore: now + 90)
+        let fake = try machine(clockLater: now + 90)
         fake.foreignDuringDialog = true
         let m = h.makeManager(sleepGuard: fake.sleepGuard())
         await m.start(duration: 60)
 
         XCTAssertEqual(fake.sleepDisabled, "1", "the other tool's setting must survive")
-        XCTAssertEqual(fake.pmsetCalls(), ["-g", "-g"])
-        XCTAssertEqual(fake.sudoCalls(), [])
-        try assertRolledBackWithNothingUndone(m, fake, status: 6)
+        XCTAssertEqual(fake.pmsetCalls(), ["-g"], "Start's read only")
+        XCTAssertEqual(fake.sudoCalls(), queries)
+        try assertRolledBackWithNothingUndone(m, fake, status: 4)
     }
 
-    /// The same 1 with time to spare: still left alone.
+    /// The same 1 with time to spare: the command's read finds it.
     func testASettingMadeWhileTheDialogIsUpIsLeftAlone() async throws {
         let fake = try machine()
         fake.foreignDuringDialog = true
@@ -2380,26 +2523,31 @@ final class StartOwnershipEndToEndTests: XCTestCase {
         await m.start(duration: 1800)
 
         XCTAssertEqual(fake.sleepDisabled, "1")
-        XCTAssertEqual(fake.sudoCalls(), [])
+        XCTAssertEqual(fake.pmsetCalls(), ["-g", "-g"])
+        XCTAssertEqual(fake.sudoCalls(), queries)
         try assertRolledBackWithNothingUndone(m, fake, status: 6)
     }
 
-    /// A 1 set right after the restore check's write: the read after the
-    /// check finds it, and the start is rolled back with no pmset.
-    func testASettingMadeAfterTheRestoreCheckIsLeftAlone() async throws {
-        let fake = try machine()
-        fake.foreignAfterRestore = true
-        let m = h.makeManager(sleepGuard: fake.sleepGuard())
-        await m.start(duration: 1800)
+    /// Round 17 R1, end to end: a 1 set while sudo is asked. Before, root
+    /// had turned sleep off for its check by then, and the check's 0
+    /// cleared the 1. Now nothing has been written, and the read finds it.
+    func testASettingMadeWhileSudoIsAskedIsLeftAlone() async throws {
+        for at in [RootCommandProcess.versionQuery, RootCommandProcess.listQuery, RootCommandProcess.ruleQuery] {
+            let fake = try machine("machine \(at)".replacingOccurrences(of: " ", with: "-").replacingOccurrences(of: "/", with: "_"))
+            fake.foreignAfter = at
+            let m = h.makeManager(sleepGuard: fake.sleepGuard())
+            await m.start(duration: 1800)
 
-        XCTAssertEqual(fake.sleepDisabled, "1")
-        XCTAssertEqual(fake.pmsetCalls(), ["-g", "-g", "-a disablesleep 1", "-a disablesleep 0", "-g"])
-        XCTAssertEqual(fake.sudoCalls(), restoreCheck)
-        try assertRolledBackWithNothingUndone(m, fake, status: 6)
+            XCTAssertNil(fake.foreignAfter, "\(at): the other tool's 1 was set")
+            XCTAssertEqual(fake.sleepDisabled, "1", at)
+            XCTAssertEqual(fake.pmsetCalls(), ["-g", "-g"], at)
+            XCTAssertEqual(fake.sudoCalls(), queries, at)
+            try assertRolledBackWithNothingUndone(m, fake, status: 6)
+        }
     }
 
     /// A password typed after the session's end: the command stops before
-    /// any read or write (status 4) and nothing is undone.
+    /// it asks or reads anything (status 4) and nothing is undone.
     func testALatePasswordRunsNothing() async throws {
         let fake = try machine(clockStart: now + 90)
         let m = h.makeManager(sleepGuard: fake.sleepGuard())
@@ -2411,23 +2559,42 @@ final class StartOwnershipEndToEndTests: XCTestCase {
         try assertRolledBackWithNothingUndone(m, fake, status: 4)
     }
 
-    /// The session's end passes during the restore check, with no other
-    /// tool involved: the check's 0 undid root's own change, the command
-    /// stops there, and the start is rolled back with no further pmset.
-    func testAnEndDuringTheRestoreCheckIsRolledBackWithoutAnUndo() async throws {
-        let fake = try machine(clockAfterRestore: now + 90)
+    /// The session's end passes while sudo is asked, with no other tool
+    /// involved. Before, root had already turned sleep off and the check
+    /// turned it back on. Now nothing was written, and the start is rolled
+    /// back with no pmset at all after Start's read.
+    func testAnEndWhileSudoIsAskedIsRolledBackWithoutAnUndo() async throws {
+        let fake = try machine(clockLater: now + 90)
         let m = h.makeManager(sleepGuard: fake.sleepGuard())
         await m.start(duration: 60)
 
-        XCTAssertEqual(fake.pmsetCalls(), ["-g", "-g", "-a disablesleep 1", "-a disablesleep 0"])
-        XCTAssertEqual(fake.sudoCalls(), restoreCheck)
+        XCTAssertEqual(fake.pmsetCalls(), ["-g"])
+        XCTAssertEqual(fake.sudoCalls(), queries)
         XCTAssertEqual(fake.sleepDisabled, "0")
         try assertRolledBackWithNothingUndone(m, fake, status: 4)
     }
 
+    /// Round 17 R3, end to end: the session's end comes while root reads
+    /// `pmset -g`, at its very second or later. Before, the clock was read
+    /// before that read, and the write followed it. Now the clock is read
+    /// again right before the write, which does not happen.
+    func testAnEndDuringRootsReadWritesNothing() async throws {
+        for later in [now + 60, now + 90] {
+            let fake = try machine("machine-\(later - now)", clockLater: later, clockAt: RootCommandProcess.read)
+            let m = h.makeManager(sleepGuard: fake.sleepGuard())
+            await m.start(duration: 60)
+
+            XCTAssertEqual(fake.pmsetCalls(), ["-g", "-g"], "\(later - now) s")
+            XCTAssertEqual(fake.sudoCalls(), queries, "\(later - now) s")
+            XCTAssertEqual(fake.sleepDisabled, "0", "\(later - now) s")
+            try assertRolledBackWithNothingUndone(m, fake, status: 4)
+        }
+    }
+
     /// A 1 the journal already owned (an earlier restore failed): neither
-    /// Start nor the command reads it as someone else's. The command runs
-    /// the owed restore as its check and turns sleep off again.
+    /// Start nor the command reads it as someone else's. The command still
+    /// asks sudo first, then turns sleep off; it no longer runs the owed
+    /// restore itself.
     func testASettingTheJournalOwnsIsNotReadAsSomeoneElses() async throws {
         var earlier = RuntimeState()
         earlier.sleepDisabledByUs = true
@@ -2438,74 +2605,78 @@ final class StartOwnershipEndToEndTests: XCTestCase {
         await m.start(duration: 1800)
 
         XCTAssertTrue(m.isActive, m.lastError ?? "")
-        XCTAssertEqual(fake.pmsetCalls(), ["-a disablesleep 1", "-a disablesleep 0", "-a disablesleep 1"])
-        XCTAssertEqual(fake.sudoCalls(), restoreCheck)
+        XCTAssertEqual(fake.pmsetCalls(), ["-a disablesleep 1"])
+        XCTAssertEqual(fake.sudoCalls(), queries)
         XCTAssertEqual(fake.sleepDisabled, "1")
     }
 
-    /// /etc/sudoers.d/insomnia is not in effect: the check fails, root
-    /// turns its own change back on, and the start rolls back with no
-    /// undo. Sleep is on, the journal is clean, and the app ran no pmset
-    /// of its own after the dialog.
-    func testAFailedRestoreCheckLeavesSleepOnWithNoUndo() async throws {
+    /// /etc/sudoers.d/insomnia is not in effect, or sudo's answers do not
+    /// show it alone: the command stops before any pmset and the start
+    /// rolls back with no undo. Sleep stays on, the journal is clean, and
+    /// pmset ran only for Start's read.
+    func testARefusedRestoreQueryLeavesSleepOnWithNoUndo() async throws {
+        for (policy, calls): (RootSudoPolicy, Int) in [(.noRule, 4), (.laterRule, 6), (.oldSudo, 2)] {
+            let fake = try machine("machine-\(policy)")
+            fake.policy = policy
+            let m = h.makeManager(sleepGuard: fake.sleepGuard())
+            await m.start(duration: 1800)
+
+            XCTAssertEqual(fake.pmsetCalls(), ["-g"], "\(policy): Start's read only")
+            XCTAssertEqual(fake.sudoCalls(), Array(queries.prefix(calls)), "\(policy)")
+            XCTAssertEqual(fake.sleepDisabled, "0", "\(policy)")
+            XCTAssertNil(m.session, "\(policy)")
+            XCTAssertNil(try h.store.loadSession(), "\(policy)")
+            XCTAssertEqual(try h.store.loadState(), RuntimeState.clean, "\(policy)")
+            XCTAssertFalse(FileManager.default.fileExists(atPath: h.home.paths.pendingStartFile.path), "\(policy)")
+            let err = try XCTUnwrap(m.lastError)
+            XCTAssertTrue(err.hasPrefix("could not disable sleep: sleep was not turned off: sudo did not confirm"), "\(policy): \(err)")
+        }
+    }
+
+    /// Round 17 R2, end to end: another tool's 1 set while sudo is asked,
+    /// and sudo does not confirm the restore. Before, root's own restore
+    /// wrote 0 over it. Now nothing is written, and the 1 stays.
+    func testASettingMadeWhileSudoIsAskedSurvivesARefusal() async throws {
         let fake = try machine()
-        fake.ruleMissing = true
+        fake.policy = .noRule
+        fake.foreignAfter = RootCommandProcess.versionQuery
         let m = h.makeManager(sleepGuard: fake.sleepGuard())
         await m.start(duration: 1800)
 
-        XCTAssertEqual(fake.pmsetCalls(), ["-g", "-g", "-a disablesleep 1", "-a disablesleep 0"], "Start's read, then root's read, change and own restore")
-        XCTAssertEqual(fake.sudoCalls(), restoreCheck)
-        XCTAssertEqual(fake.sleepDisabled, "0")
-        XCTAssertNil(m.session)
-        XCTAssertNil(try h.store.loadSession())
-        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: h.home.paths.pendingStartFile.path))
-        let err = try XCTUnwrap(m.lastError)
-        XCTAssertTrue(err.hasPrefix("could not disable sleep: sleep was not left off: turning it back on needs a password"), err)
-    }
-
-    /// The deadline path with another tool's 1 after the check's write: the
-    /// session's end passed during the check, the command stops before
-    /// reading again, and the rollback runs no pmset, so the 1 stays.
-    func testASettingMadeAfterTheCheckSurvivesALateEnd() async throws {
-        let fake = try machine(clockAfterRestore: now + 90)
-        fake.foreignAfterRestore = true
-        let m = h.makeManager(sleepGuard: fake.sleepGuard())
-        await m.start(duration: 60)
-
+        XCTAssertNil(fake.foreignAfter, "the other tool's 1 was set")
         XCTAssertEqual(fake.sleepDisabled, "1")
-        XCTAssertEqual(fake.pmsetCalls(), ["-g", "-g", "-a disablesleep 1", "-a disablesleep 0"])
-        try assertRolledBackWithNothingUndone(m, fake, status: 4)
+        XCTAssertEqual(fake.pmsetCalls(), ["-g"])
+        XCTAssertNil(m.session)
+        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
+        XCTAssertFalse(fake.sudoCalls().contains("-n /usr/bin/pmset -a disablesleep 0"), "the app ran an undo")
     }
 
-    /// The limit, end to end. Another tool sets 1 right after the command's
-    /// own read found 0. pmset has no compare-and-set, so root's change
-    /// writes 1 over it and the check's write clears it. With the rule in
-    /// effect the start goes on, that 1 is now journaled as Insomnia's, and
-    /// the end clears it; with the rule missing, root's restore clears it
-    /// and the rollback leaves 0. The other tool's 1 is lost either way.
-    func testASettingMadeRightAfterTheCommandsReadIsStillCleared() async throws {
+    /// The limit, end to end. Another tool sets 1 right after the
+    /// command's own read found 0. pmset has no compare-and-set, so the
+    /// write that follows cannot be told from it: the start goes on, that
+    /// 1 is journaled as Insomnia's, and the end clears it. When the
+    /// session's end comes during that read, the write does not follow,
+    /// and the 1 stays.
+    func testASettingMadeRightAfterTheCommandsReadIsClearedOnlyWhenTheWriteFollows() async throws {
         let fake = try machine()
-        fake.foreignAfterRootRead = true
+        fake.foreignAfter = RootCommandProcess.read
         let m = h.makeManager(sleepGuard: fake.sleepGuard())
         await m.start(duration: 1800)
 
         XCTAssertTrue(m.isActive, m.lastError ?? "")
-        XCTAssertFalse(fake.foreignAfterRootRead, "the other tool's 1 was set")
-        XCTAssertEqual(fake.pmsetCalls(), ["-g", "-g", "-a disablesleep 1", "-a disablesleep 0", "-g", "-a disablesleep 1"])
+        XCTAssertNil(fake.foreignAfter, "the other tool's 1 was set")
+        XCTAssertEqual(fake.pmsetCalls(), ["-g", "-g", "-a disablesleep 1"])
         await m.end(reason: .user)
         XCTAssertEqual(fake.sleepDisabled, "0", "the end cleared it")
 
-        let refused = try FakeDialogMachine(in: h.home.root.appendingPathComponent("machine-no-rule", isDirectory: true), clockStart: now, clockAfterRestore: now + 5)
-        refused.foreignAfterRootRead = true
-        refused.ruleMissing = true
-        let m2 = h.makeManager(sleepGuard: refused.sleepGuard())
-        await m2.start(duration: 1800)
+        let late = try machine("machine-late", clockLater: now + 90, clockAt: RootCommandProcess.read)
+        late.foreignAfter = RootCommandProcess.read
+        let m2 = h.makeManager(sleepGuard: late.sleepGuard())
+        await m2.start(duration: 60)
 
-        XCTAssertNil(m2.session)
-        XCTAssertFalse(refused.foreignAfterRootRead, "the other tool's 1 was set")
-        XCTAssertEqual(refused.pmsetCalls(), ["-g", "-g", "-a disablesleep 1", "-a disablesleep 0"])
-        XCTAssertEqual(refused.sleepDisabled, "0", "root's restore cleared it")
-        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
+        XCTAssertNil(late.foreignAfter, "the other tool's 1 was set")
+        XCTAssertEqual(late.pmsetCalls(), ["-g", "-g"])
+        XCTAssertEqual(late.sleepDisabled, "1", "no write followed the read")
+        try assertRolledBackWithNothingUndone(m2, late, status: 4)
     }
 }

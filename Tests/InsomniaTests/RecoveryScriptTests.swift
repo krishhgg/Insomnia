@@ -1197,7 +1197,7 @@ final class RecoveryScriptTests: XCTestCase {
         try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
         let nonce = UUID().uuidString
         try Data(nonce.utf8).write(to: fx.pendingStart)
-        let command = try RootCommandProcess(marker: fx.pendingStart, nonce: nonce, in: fx.root, holdPmset: true)
+        let command = try RootCommandProcess(marker: fx.pendingStart, nonce: nonce, in: fx.root, holdAt: RootCommandProcess.write)
         defer { command.release() }
         XCTAssertTrue(command.waitUntilPmsetRuns())
 
@@ -1211,7 +1211,7 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(fx.log().contains("journal kept dirty"), fx.log())
 
         command.release()
-        XCTAssertEqual(command.wait().pmsetCalls, ["-g", "-a disablesleep 1", "-a disablesleep 0", "-g", "-a disablesleep 1"])
+        XCTAssertEqual(command.wait().pmsetCalls, ["-g", "-a disablesleep 1"])
         fx.clearCalls()
         let again = try fx.run(fx.backstop)
 

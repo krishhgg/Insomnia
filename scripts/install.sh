@@ -276,9 +276,10 @@ move_bundle() { # from to
 # that the restore runs without a password: by default sudo lists without a
 # password once any of the user's rules is NOPASSWD, and the listing does not
 # say which rule matched (an admin rule that needs the password would pass
-# too). The command behind the app's password dialog checks again at every
-# Start, right before it turns sleep off, by running the restore as this
-# user with `sudo -k -n`.
+# too). The command behind the app's password dialog asks again at every
+# Start, before it writes anything, with `sudo -k -n -ll`, which shows the
+# rule that matched, and turns sleep off only when that is this file's
+# NOPASSWD restore line.
 pmset_rule_check() { # pmset arguments
   local rc=0
   bounded "$SUDO" -k -n -l /usr/bin/pmset "$@" || rc=$?
@@ -677,7 +678,7 @@ RULE_AHEAD_OF_BUNDLE=1
 rule_rc=0
 pmset_rule_effective || rule_rc=$?
 if (( rule_rc == 0 )); then
-  echo "sudoers rule written; 'sudo -k -n -l' lists its three commands (at every Start, before sleep is turned off, Insomnia checks that the restore runs without a password)"
+  echo "sudoers rule written; 'sudo -k -n -l' lists its three commands (at every Start, before sleep is turned off, Insomnia checks with 'sudo -k -n -ll' that the restore matches this rule without a password)"
 elif (( rule_rc == 124 || rule_rc == 125 )); then
   echo >&2
   sudo_stalled_note "$rule_rc" "Install stopped: 'sudo -k -n -l', which checks the rule just written to $SUDOERS,"

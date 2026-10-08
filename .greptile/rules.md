@@ -213,46 +213,51 @@ Flag a change that breaks one of these; do not flag the behavior itself.
   dialog the app runs nothing through sudo:
   `SleepGuarding.checkSleepSettingForStart` only reads `pmset -g`, and a
   `SleepDisabled 1` the journal does not claim refuses Start with nothing
-  run, deliberately, so a setting another tool made stays. The proof that
+  run, deliberately, so a setting another tool made stays. The check that
   the end can restore without a password is in the root command, under
-  the marker's lock, in this order: the nonce check (3), the deadline
-  (4), a uid that is a positive number (5), a root read of `pmset -g`
-  (6 on a `SleepDisabled 1` or a failed read; skipped only when `$5` is
-  exactly `1`, the journal claimed the 1 before this start), root's own
-  `pmset -a disablesleep 1`, then the proof
-  `sudo -n -u "#$4" /usr/bin/sudo -k -n /usr/bin/pmset -a disablesleep 0`,
-  which undoes root's change rather than a value it found. A failed proof
-  runs root's own `pmset -a disablesleep 0` before any output, then exits
-  5 (`restoreNeedsPassword`); a root pmset that fails there exits 1. After
-  a proof that passes: the deadline again (4), `pmset -g` again (6), and
-  only then `pmset -a disablesleep 1` for the session. Exits 3, 4 and 6,
-  and lockf's 69 and 75, are `.refused`. All refusals leave no change of
-  the command's own and roll back with no pmset, so another tool's setting
-  found by a read stays; any other status may have left `disablesleep 1`
-  in place and is undone like an end. Flag a change that writes before the
-  first read, runs the proof before root's own `disablesleep 1`, prints
-  before root's restore on the exit-5 path, or treats exit 1 as a refusal.
-  Root's sudo needs no password; the user's `-k` ignores a cached
-  credential and `-n` never prompts, so only a rule that lets the user run
-  that exact command passes. `sudo -l` is not proof (it lists commands the
-  admin group may run with its password, and lists without one once any
-  rule is NOPASSWD). Known and disclosed (round 14 P1 narrowed and moved
-  onto Insomnia's own change, not closed): pmset has no compare-and-set and
-  one `SleepDisabled` with no owner, so a 1 another tool sets between the
-  root command's first read and its own `disablesleep 1`, or while that 1
-  is in effect during the proof, is cleared by the proof's write (or by
-  root's restore after a failed proof) and, if the start goes on, by the
-  end; one set after the last read, or during the session, is set to 0 by
-  the end; one set during a dialog that then fails ambiguously (wrong
-  password, timeout, stuck prompt, pmset failure, any other status) is set
+  the marker's lock, before any write, in this order: the nonce check
+  (3), the deadline (4), a uid that is a positive number (5), then three
+  queries as that user through `q()` = `sudo -n -u "#$w" /usr/bin/env -i
+  LC_ALL=C /usr/bin/sudo "$@" </dev/null`: `-V` (5 unless sudo 1.9.15 to
+  1.9.x with only the sudoers plugins), `-k -n -l` (5 unless it lists
+  without a password and shows no Runas or command-specific Defaults),
+  and `-k -n -ll /usr/bin/pmset -a disablesleep 0` (5 unless it prints
+  exactly the six-line /etc/sudoers.d/insomnia entry: `RunAsUsers: root`,
+  `Options: !authenticate`, the restore as the only command and
+  `Matched:` the restore). Then the deadline (4), a root read of `pmset
+  -g` (6 on a `SleepDisabled 1` or a failed read; skipped only when `$5`
+  is exactly `1`, the journal claimed the 1 before this start), the
+  deadline again (4), and only then `pmset -a disablesleep 1`, the
+  command's only write (1 if it fails). `trap '' PIPE` keeps each
+  refusal's status when the dialog's stderr is gone. Exits 3, 4 and 6,
+  and lockf's 69 and 75, are `.refused`; 5 is `restoreNeedsPassword`.
+  All refusals leave no change of the command's own and roll back with no
+  pmset, so another tool's setting found by a read stays; any other
+  status may have left `disablesleep 1` in place and is undone like an
+  end. Flag a change that writes anything (pmset or a restore run as the
+  user) before the queries pass, runs a query that executes a command,
+  accepts `sudo -l` or `sudo -v` alone, a bare exit status or a NOPASSWD
+  grep as the check, drops a clock check after a query or the read, reads
+  sudo's output in another locale or without fixed paths, or treats exit
+  1 as a refusal. Known and disclosed (round 14 P1 narrowed to one
+  moment, not closed): pmset has no compare-and-set and one
+  `SleepDisabled` with no owner, so a 1 another tool sets between root's
+  read and its `disablesleep 1` is taken for Insomnia's and set to 0 by
+  the end; one set during the session is set to 0 by the end; one set
+  during a dialog that then fails ambiguously (wrong password, timeout,
+  stuck prompt, pmset failure, a status lost to a signal or crash) is set
   to 0 by the undo; one set during a dialog whose app quits or crashes
   first is set to 0 by the end or the backstop; and while the journal
-  claims a 1 another tool's 1 is taken for it. Sleep is off while the
-  proof runs, even when it fails; a root shell that dies then leaves it
-  off with the start's journal entry. The user types the password before
-  a missing rule is reported; a sudoers without root's default entry fails
-  closed. `install.sh` runs no pmset: after writing
-  the rule it checks a `sudo -k -n -l` listing, which is not proof either.
+  claims a 1 another tool's 1 is taken for it, and a refusal leaves it
+  owed. The listing is about the rule when it is read: a rule removed
+  later, an I/O log failure at the restore, or other groups at restore
+  time can still make a restore fail, and the backstop retries. The check
+  refuses every Start under a sudo outside 1.9.15 to 1.9.x, other
+  plugins, bound Defaults, `listpw=always` or a later rule for the
+  restore. The user types the password before a refusal is reported; a
+  sudoers without root's default entry fails closed. `install.sh` runs no
+  pmset: after writing the rule it checks a `sudo -k -n -l` listing, which
+  is not the check.
 - `DisplayPower.swift`, `LidActions.swift`. On lid close, brightness 0 is
   the primary mechanism; the display sleep request (`IORequestIdle`) is
   best effort and is ignored while any process holds a display assertion,

@@ -11,9 +11,9 @@ protocol SleepGuarding: Sendable {
     /// 1 is Insomnia's own and nothing is read. Otherwise a 1 means someone
     /// else turned sleep off, and a session's end would turn it back on for
     /// them, so Start is refused; so it is when the setting cannot be read.
-    /// Throws `SleepSettingRefusal`. The root command reads the setting
-    /// again behind the dialog, and checks whether sleep can be turned back
-    /// on without a password before it leaves sleep off (see
+    /// Throws `SleepSettingRefusal`. Behind the dialog, before it writes
+    /// anything, the root command asks sudo whether sleep can be turned
+    /// back on without a password and reads the setting again (see
     /// `AdministratorPrompt.rootCommand`).
     func checkSleepSettingForStart(sleepOffIsOurs: Bool) async throws
     /// Shows the administrator password dialog and waits for it; only an
@@ -76,8 +76,9 @@ enum SleepSettingRefusal: Error, LocalizedError, Sendable {
 struct PmsetSleepGuard: SleepGuarding {
     static let sudo = "/usr/bin/sudo"
     static let pmset = "/usr/bin/pmset"
-    /// What `enableSleep` passes to pmset. The root command checks the
-    /// same line before it turns sleep off (`AdministratorPrompt.rootCommand`).
+    /// What `enableSleep` passes to pmset. The root command asks sudo
+    /// about the same line before it turns sleep off
+    /// (`AdministratorPrompt.rootCommand`).
     static let restoreArguments = ["-a", "disablesleep", "0"]
     /// pmset normally returns in well under a second; a hung powerd must not
     /// hang a quit or a lid action forever.
@@ -119,11 +120,10 @@ struct PmsetSleepGuard: SleepGuarding {
     }
 
     /// Reads `pmset -g` unless the journal already owns a SleepDisabled 1.
-    /// Nothing runs as root here: running the restore to prove it needs no
-    /// password would turn sleep back on for whoever set it between this
-    /// read and that run, so the root command does it instead, under the
-    /// marker's lock, after its own read of `pmset -g` found sleep on and
-    /// it turned sleep off, so the restore undoes its own change.
+    /// Nothing runs as root here, and the restore is never run to test it:
+    /// it would turn sleep back on for whoever set it. Whether it needs a
+    /// password is asked of sudo by the root command, under the marker's
+    /// lock, with listings that change nothing.
     func checkSleepSettingForStart(sleepOffIsOurs: Bool) async throws {
         guard !sleepOffIsOurs else { return }
         let sleepOff: Bool

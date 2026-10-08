@@ -935,10 +935,11 @@ final class SessionManager {
             // A SleepDisabled 1 the journal does not own is someone else's
             // setting, and this session's end would turn it back on, so
             // Start leaves it alone, as a cancelled dialog does. Whether
-            // the end can turn sleep back on without a password is checked
-            // later, as root, right before sleep is turned off: this app's
-            // end and backstop.sh both run `sudo -n`, and without the rule
-            // they would fail at the deadline and leave sleep off.
+            // the end can turn sleep back on without a password is asked of
+            // sudo later, by the root command before it writes anything:
+            // this app's end and backstop.sh both run `sudo -n`, and
+            // without the rule they would fail at the deadline and leave
+            // sleep off.
             try await sleepGuard.checkSleepSettingForStart(sleepOffIsOurs: state.sleepDisabledByUs)
         } catch {
             fail("start refused, nothing changed: \(error.localizedDescription)")
@@ -1065,18 +1066,15 @@ final class SessionManager {
             return
         } catch let error as AdministratorPromptError where error.nothingToUndo {
             // Cancelled, osascript never started, or the root command
-            // refused: the start was over, the session had ended, the
-            // restore needs a password, or `pmset -g` showed a 1 this start
-            // did not set. A refusal comes before root writes anything, or
-            // after the restore check (or root, when the check fails) has
-            // turned the command's own temporary 1 back to 0, so nothing is
-            // left for an undo to reverse (`AdministratorPrompt.rootCommand`
-            // names the moments in which another tool's 1 is still
-            // cleared). The journal and session.json go back exactly as they
-            // were and no pmset runs, so a sleep setting another tool made,
-            // even while the dialog was up, is left alone. Nothing can use
-            // this attempt's marker any more, so one that cannot be deleted
-            // does not hold the rollback back; it is reported, and the next
+            // refused: the start was over, the session had ended, sudo did
+            // not confirm a passwordless restore, or `pmset -g` showed a 1
+            // this start did not set. Every refusal comes before root's
+            // only write, so nothing is left for an undo to reverse. The
+            // journal and session.json go back exactly as they were and no
+            // pmset runs, so a sleep setting another tool made, even while
+            // the dialog was up, is left alone. Nothing can use this
+            // attempt's marker any more, so one that cannot be deleted does
+            // not hold the rollback back; it is reported, and the next
             // transaction tries it again.
             await clearPendingStart()
             rollBackStart(journal: journalBefore, session: sessionBefore)
