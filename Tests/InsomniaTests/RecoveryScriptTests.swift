@@ -881,17 +881,26 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(log.contains("still journaled: sleepDisabledByUs is kept although sleep is restored"), log)
     }
 
+    private var logs: URL { fx.home.appendingPathComponent("Logs", isDirectory: true) }
+
+    /// The records aside in the log folder.
+    private func recordsInTheLogFolder() throws -> [String] {
+        try fx.contents(of: logs).filter { Paths.isEndedSessionAsideName($0) }
+    }
+
     /// A folder that takes no new file (mode 0555; the lock file and the
     /// log folder already exist): session.json cannot be removed and no
-    /// record can be written anywhere. The restore still runs, but its
+    /// record can be written beside it. The record goes in the log folder,
+    /// the file's exact bytes, mode 0600. The restore still runs, but its
     /// supervisor cannot write the status files either, so the run cannot
     /// tell whether the command finished: it reports no result, keeps the
-    /// journal as it was and exits 1. This is the case the record aside
-    /// does not cover.
-    func testEndInAFolderThatTakesNoNewFileRecordsNothingAndKeepsTheJournal() throws {
+    /// journal as it was and exits 1. Once the folder takes files again, a
+    /// run with the app alive ends the session without the checks, and
+    /// session.json and the record go.
+    func testEndInAFolderThatTakesNoNewFileRecordsItInTheLogFolder() throws {
         try writeLiveSession()
-        FileManager.default.createFile(atPath: fx.home.appendingPathComponent(".recovery.lock").path, contents: nil)
-        try FileManager.default.createDirectory(at: fx.home.appendingPathComponent("Logs"), withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: fx.lock.path, contents: nil)
+        try FileManager.default.createDirectory(at: logs, withIntermediateDirectories: true)
         let journal = try Data(contentsOf: fx.state)
         fx.clearCalls()
         try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: fx.home.path)
@@ -904,10 +913,134 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(fx.exists(fx.session))
         XCTAssertFalse(fx.exists(fx.endedSession))
         XCTAssertEqual(try recordsAside(), [])
+        let names = try recordsInTheLogFolder()
+        XCTAssertEqual(names.count, 1, "\(names)")
+        let record = logs.appendingPathComponent(try XCTUnwrap(names.first))
+        XCTAssertEqual(try Data(contentsOf: record), try Data(contentsOf: fx.session), "the record is the file's exact bytes")
+        XCTAssertEqual(try FileManager.default.attributesOfItem(atPath: record.path)[.posixPermissions] as? Int, 0o600)
         XCTAssertEqual(try Data(contentsOf: fx.state), journal, "the journal is kept as it was")
         let log = fx.log()
-        XCTAssertTrue(log.contains("or a new file in \(fx.home.path)"), log)
+        XCTAssertTrue(log.contains("its end is recorded in \(record.path) instead"), log)
         XCTAssertTrue(log.contains("its supervisor reported no result within"), log)
+
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fx.home.path)
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+        fx.clearCalls()
+        let again = try fx.run(fx.backstop)
+
+        XCTAssertEqual(again.status, 0, again.stderr + fx.log())
+        XCTAssertEqual(calls(), [sleepRestored], "no checks; the journal still asks for the restore")
+        XCTAssertTrue(fx.log().contains("already ended (recorded in \(record.path))"), fx.log())
+        XCTAssertFalse(fx.exists(fx.session))
+        XCTAssertEqual(try recordsInTheLogFolder(), [], "the record goes with the file it copies")
+    }
+
+    /// The same with the log folder refusing new files too (both mode
+    /// 0555): no record can be written anywhere. The restore still runs,
+    /// the run reports no result, keeps the journal as it was and exits 1.
+    /// This is the case no record covers (the app then resumes nothing
+    /// while session.json cannot be replaced; JournaledSessionEndTests).
+    func testEndWhereNeitherFolderTakesANewFileRecordsNothingAndKeepsTheJournal() throws {
+        try writeLiveSession()
+        FileManager.default.createFile(atPath: fx.lock.path, contents: nil)
+        try FileManager.default.createDirectory(at: logs, withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: fx.logFile.path, contents: nil)
+        let journal = try Data(contentsOf: fx.state)
+        fx.clearCalls()
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: logs.path)
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: fx.home.path)
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fx.home.path)
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: logs.path)
+        }
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 1, r.stderr + fx.log())
+        XCTAssertEqual(calls(), [sleepRestored], "the restore runs")
+        XCTAssertTrue(fx.exists(fx.session))
+        XCTAssertFalse(fx.exists(fx.endedSession))
+        XCTAssertEqual(try recordsAside(), [])
+        XCTAssertEqual(try recordsInTheLogFolder(), [])
+        XCTAssertEqual(try Data(contentsOf: fx.state), journal, "the journal is kept as it was")
+        let log = fx.log()
+        XCTAssertTrue(log.contains("or a new file in \(fx.home.path) or \(logs.path)"), log)
+        XCTAssertTrue(log.contains("its supervisor reported no result within"), log)
+    }
+
+    /// In the log folder as beside session.json: a record that matches no
+    /// session.json goes, and the live session is checked as usual. One
+    /// that cmp cannot read stays and ends nothing. A symlink, a FIFO and
+    /// other names are never opened or removed.
+    func testStaleRecordInTheLogFolderIsRemovedAndOthersAreLeft() throws {
+        try writeLiveSession()
+        try FileManager.default.createDirectory(at: logs, withIntermediateDirectories: true)
+        let stale = logs.appendingPathComponent("ended-session.json.Stale001")
+        try #"{"endsAt":"2001-01-01T00:00:00Z","startedAt":"2001-01-01T00:00:00Z"}"#.write(to: stale, atomically: true, encoding: .utf8)
+        let unreadable = logs.appendingPathComponent("ended-session.json.NoRead00")
+        try FileManager.default.copyItem(at: fx.session, to: unreadable)
+        try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: unreadable.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: unreadable.path) }
+        let copy = fx.root.appendingPathComponent("copy-of-session")
+        try FileManager.default.copyItem(at: fx.session, to: copy)
+        let link = logs.appendingPathComponent("ended-session.json.Link0000")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: copy)
+        let other = logs.appendingPathComponent("ended-session.json.Other0000")
+        try FileManager.default.copyItem(at: fx.session, to: other)
+        let fifo = try FIFOWatch(at: logs.appendingPathComponent("ended-session.json.Fifo0000"))
+        defer { fifo.stop() }
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+
+        try assertSessionKept(try fx.run(fx.backstop))
+
+        XCTAssertEqual(calls(), [batteryRead, thermalRead])
+        XCTAssertFalse(fifo.readerSeen, "a FIFO named like a record was opened")
+        XCTAssertFalse(fx.exists(stale))
+        for kept in [unreadable, link, other, fifo.url] {
+            XCTAssertNotNil(try? FileManager.default.attributesOfItem(atPath: kept.path), kept.lastPathComponent)
+        }
+    }
+
+    /// A log folder that is a symlink is not searched: a matching record
+    /// in the folder it points to ends nothing and stays. Nor is a record
+    /// written through it when the folder beside session.json takes no new
+    /// file: nothing is recorded, as when both folders refuse.
+    func testALogFolderThatIsASymlinkIsNeitherSearchedNorWrittenThrough() throws {
+        try writeLiveSession()
+        let elsewhere = fx.root.appendingPathComponent("elsewhere", isDirectory: true)
+        try FileManager.default.createDirectory(at: elsewhere, withIntermediateDirectories: true)
+        if fx.exists(logs) {
+            for name in try fx.contents(of: logs) {
+                try FileManager.default.moveItem(at: logs.appendingPathComponent(name), to: elsewhere.appendingPathComponent(name))
+            }
+            try FileManager.default.removeItem(at: logs)
+        }
+        try FileManager.default.createSymbolicLink(at: logs, withDestinationURL: elsewhere)
+        let matching = elsewhere.appendingPathComponent("ended-session.json.Elsewher")
+        try FileManager.default.copyItem(at: fx.session, to: matching)
+        do {
+            let app = try fx.holdAliveLock()
+            defer { app.release() }
+            try assertSessionKept(try fx.run(fx.backstop))
+            XCTAssertEqual(calls(), [batteryRead, thermalRead], "checked as usual")
+            XCTAssertTrue(fx.exists(matching))
+        }
+
+        try FileManager.default.removeItem(at: matching)
+        FileManager.default.createFile(atPath: fx.lock.path, contents: nil)
+        fx.clearCalls()
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: fx.home.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fx.home.path) }
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 1, r.stderr + fx.log())
+        XCTAssertEqual(calls(), [sleepRestored])
+        XCTAssertTrue(fx.exists(fx.session))
+        XCTAssertEqual(try fx.contents(of: elsewhere).filter { Paths.isEndedSessionAsideName($0) }, [], "no record through the symlink")
+        XCTAssertTrue(fx.log().contains("or a new file in \(fx.home.path) or \(logs.path)"), fx.log())
     }
 
     /// A record aside that matches no session.json goes, as a stale
@@ -1079,6 +1212,22 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(fifo.readerSeen, "config.json was opened although it is a FIFO")
         XCTAssertTrue(fifo.isStillFIFO)
         XCTAssertEqual(calls(), [batteryRead, thermalRead])
+    }
+
+    /// A config.json this user cannot read gives the app no settings
+    /// either (it moves the file aside), so the defaults apply, 10% and
+    /// thermal rules on, whatever the file holds.
+    func testConfigThatCannotBeReadGivesTheDefaults() throws {
+        try writeLiveSession()
+        try fx.writeConfig(#"{"endFloor": 0, "thermalRules": false}"#)
+        try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: fx.config.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fx.config.path) }
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+        fx.setBattery(fx.battery(source: "Battery Power", percent: 9))
+
+        try assertSessionEnded(try fx.run(fx.backstop), reason: "battery at 9% on battery power, below the 10% end floor")
+        XCTAssertFalse(fx.log().contains("enforcing the strictest"), fx.log())
     }
 
     /// The log is appended to only as a regular file. Most lines are written
@@ -2135,6 +2284,45 @@ final class RecoveryScriptTests: XCTestCase {
             try FileManager.default.removeItem(at: dir)
             try FileManager.default.removeItem(at: notOurs)
         }
+    }
+
+    /// Records in the log folder go with or without --purge, as those
+    /// beside session.json do: one uninstall cannot remove (immutable) is
+    /// named by uninstall itself, and other names stay. With only a record
+    /// in it, --purge then removes the log folder.
+    func testUninstallRemovesRecordsInTheLogFolderInBothModes() throws {
+        for purge in [false, true] {
+            try fx.installMachinery()
+            try FileManager.default.createDirectory(at: logs, withIntermediateDirectories: true)
+            let removable = logs.appendingPathComponent("ended-session.json.Abcd1234")
+            let pinned = logs.appendingPathComponent("ended-session.json.Pinned00")
+            let notOurs = logs.appendingPathComponent("ended-session.json.notes")
+            for file in [removable, pinned, notOurs] {
+                try "{}".write(to: file, atomically: true, encoding: .utf8)
+            }
+            try setImmutable(pinned, true)
+            defer { try? setImmutable(pinned, false) }
+
+            let r = try fx.run(fx.uninstall, purge ? ["--purge"] : [])
+
+            XCTAssertEqual(r.status, 1, "purge \(purge): " + r.stderr + r.stdout)
+            XCTAssertFalse(fx.exists(removable), "purge \(purge)")
+            XCTAssertTrue(fx.exists(pinned))
+            XCTAssertTrue(r.stderr.contains("Could not remove \(pinned.path); left in place."), r.stderr)
+            XCTAssertTrue(fx.exists(notOurs))
+            try setImmutable(pinned, false)
+            try FileManager.default.removeItem(at: pinned)
+            try FileManager.default.removeItem(at: notOurs)
+        }
+
+        try fx.installMachinery()
+        try FileManager.default.createDirectory(at: logs, withIntermediateDirectories: true)
+        let only = logs.appendingPathComponent("ended-session.json.Only0000")
+        try "{}".write(to: only, atomically: true, encoding: .utf8)
+        let r = try fx.run(fx.uninstall, ["--purge"])
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertFalse(fx.exists(only))
+        XCTAssertFalse(fx.exists(logs), "--purge removes the log folder once the record is gone")
     }
 
     /// --purge removes the moved-aside copies, but only names of exactly the
@@ -6903,15 +7091,11 @@ private final class ScriptFixture {
     // MARK: Fakes
 
     /// An app bundle's Info.plist, with InsomniaResumeFrozenVersion set to
-    /// `resumeFrozenVersion` as an integer, or without the key when nil.
-    static func infoPlist(resumeFrozenVersion: String?) -> String {
-        let key = resumeFrozenVersion.map { "<key>InsomniaResumeFrozenVersion</key><integer>\($0)</integer>" } ?? ""
-        return """
-        <?xml version="1.0" encoding="UTF-8"?>
-        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-        <plist version="1.0"><dict><key>CFBundleExecutable</key><string>Insomnia</string>\(key)</dict></plist>
-
-        """
+    /// `resumeFrozenVersion` as an integer, or without the key when nil,
+    /// and InsomniaAgentCutoffsVersion set to `agentCutoffsVersion` the
+    /// same way.
+    static func infoPlist(resumeFrozenVersion: String?, agentCutoffsVersion: String? = "\(AgentCutoffsCommand.version)") -> String {
+        BuiltApp.infoPlist(resumeFrozenVersion: resumeFrozenVersion, agentCutoffsVersion: agentCutoffsVersion)
     }
 
     private func writeFake(_ name: String, _ body: String) throws {
@@ -7235,6 +7419,8 @@ private final class ScriptFixture {
         fi
         exec /bin/chmod "$@"
         """)
+        // Insomnia --agent-cutoffs: this build's own binary, unrecorded, so
+        // config.json is read by the app's decoder as in production.
         // Insomnia --resume-frozen: reads its entries from standard input,
         // one "<pid> <startedAt> <micros> <boot>" line each, and records the
         // call as "Insomnia <arguments> < <line>; <line>; ...". Answers one
@@ -7253,6 +7439,7 @@ private final class ScriptFixture {
         try fm.createDirectory(at: appInfo.deletingLastPathComponent(), withIntermediateDirectories: true)
         try Self.infoPlist(resumeFrozenVersion: "1").write(to: appInfo, atomically: true, encoding: .utf8)
         try writeFake("Insomnia", """
+        [[ "${1:-}" == --agent-cutoffs ]] && exec '\(BuiltApp.binary.path)' "$@"
         input=()
         while IFS= read -r line || [[ -n "$line" ]]; do input+=("$line"); done
         joined=""

@@ -1054,3 +1054,29 @@ enum TestACL {
         return count
     }
 }
+
+/// The Insomnia executable this build made, beside the test bundle. Tests
+/// that run backstop.sh hand it config.json through `--agent-cutoffs`, as
+/// the installed app binary is in production, so the agent's reading of the
+/// file is the app's decoder and not a test double.
+enum BuiltApp {
+    private final class Marker {}
+
+    static var binary: URL {
+        Bundle(for: Marker.self).bundleURL.deletingLastPathComponent().appendingPathComponent("Insomnia")
+    }
+
+    /// An app bundle's Info.plist declaring `InsomniaAgentCutoffsVersion`
+    /// as `agentCutoffsVersion`, or without that key when nil, and
+    /// `InsomniaResumeFrozenVersion` likewise.
+    static func infoPlist(resumeFrozenVersion: String? = nil, agentCutoffsVersion: String?) -> String {
+        let frozen = resumeFrozenVersion.map { "<key>InsomniaResumeFrozenVersion</key><integer>\($0)</integer>" } ?? ""
+        let cutoffs = agentCutoffsVersion.map { "<key>InsomniaAgentCutoffsVersion</key><integer>\($0)</integer>" } ?? ""
+        return """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0"><dict><key>CFBundleExecutable</key><string>Insomnia</string>\(frozen)\(cutoffs)</dict></plist>
+
+        """
+    }
+}

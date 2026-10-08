@@ -18,12 +18,19 @@ the backstop probes (`.app.alive` in Application Support) is an flock(2) any
 process running as that user can hold; a process holding it stops the backstop
 from noticing that Insomnia has quit. Only that check is lost: the backstop
 still ends the session at its deadline, below the battery end floor, or at
-critical thermal pressure. The app is not
+critical thermal pressure. While the lock is held, the backstop reads the end
+floor and the thermal rule by passing `config.json` to the installed app's
+binary (`Insomnia --agent-cutoffs`), the one in the bundle whose signature the
+agent checks before each run. When that binary is gone or replaced by
+another version during the run, or gives no usable answer in time, the
+backstop enforces the strictest values, a 95% end floor with thermal rules
+on. The app is not
 sandboxed; local logs can contain SSIDs, process metadata, and tmux target names.
 The lines the app writes to `insomnia.log` also reach the unified log with the
 body marked private, so programs reading `log show` see `<private>` instead of
 those names unless private data logging is enabled on the Mac. The files
-Insomnia creates (logs, journal, session, config, recovery lock) are mode 0600
+Insomnia creates (logs, journal, session, config, recovery lock, session end
+records) are mode 0600
 and its directories 0700; the backstop runs with `umask 077`. Insomnia sets
 only these modes and leaves any access control list (ACL) on these files as it
 is, so an ACL someone added can still give another account access. Logs are capped at

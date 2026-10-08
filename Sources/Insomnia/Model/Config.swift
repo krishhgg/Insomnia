@@ -306,8 +306,9 @@ extension Config {
 
 // MARK: Cutoffs the recovery agent enforces
 
-/// The two settings backstop.sh reads from config.json and enforces on its
-/// own while a session runs: the end floor and the thermal rule.
+/// The two settings backstop.sh enforces on its own while a session runs,
+/// the end floor and the thermal rule, as `AgentCutoffsCommand` prints them
+/// from config.json.
 struct AgentCutoffs: Equatable, Sendable {
     /// 0...`Config.maxEndFloor`; 0 is off.
     let endFloor: Int
@@ -319,15 +320,15 @@ struct AgentCutoffs: Equatable, Sendable {
 }
 
 extension Config {
-    /// The cutoffs as the agent reads them from this config: the end floor
-    /// clamped as the script clamps it (above `maxEndFloor` is
-    /// `maxEndFloor`, 0 or below is off), as `normalizeFloors` clamps it.
+    /// The cutoffs the agent enforces for this config: the end floor
+    /// clamped as `normalizeFloors` clamps it (above `maxEndFloor` is
+    /// `maxEndFloor`, 0 or below is off).
     var agentCutoffs: AgentCutoffs {
         AgentCutoffs(endFloor: min(max(endFloor, 0), Config.maxEndFloor), thermalRules: thermalRules)
     }
 
-    /// What the agent enforces while config.json is missing:
-    /// `config_int endFloor 10 0 95` and `config_bool thermalRules true`, the
-    /// app's defaults.
+    /// What the agent enforces while config.json is missing, or holds bytes
+    /// the app's decoder rejects: the app's defaults (read_cutoffs in
+    /// backstop.sh).
     static let agentDefaultCutoffs = AgentCutoffs(endFloor: 10, thermalRules: true)
 }

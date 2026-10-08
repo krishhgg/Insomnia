@@ -626,16 +626,17 @@ final class ConfigLoadTests: XCTestCase {
 
     // MARK: config.json rejected in place
 
-    /// The app's decoder refuses this file (freezeList is not a list), but
-    /// its endFloor and thermalRules are valid scalars that backstop.sh
-    /// reads by itself: a 0% floor and no thermal rule.
+    /// The app's decoder refuses this file (freezeList is not a list),
+    /// though its endFloor and thermalRules alone would read as a 0% floor
+    /// and no thermal rule. backstop.sh reads it through the app's decoder,
+    /// so the agent enforces the app's defaults for it.
     private let rejectedConfig = #"{"endFloor": 0, "thermalRules": false, "freezeList": 42}"#
 
     /// While a file the app rejects cannot be moved aside, the agent would
-    /// enforce its cutoffs, not the app's defaults, so Start changes nothing
-    /// and says which file to fix and how. Once the file can be renamed,
-    /// the next Start moves it aside, writes the settings in use back, and
-    /// starts.
+    /// enforce the app's defaults, which need not be the settings in use, so
+    /// Start changes nothing and says which file to fix and how. Once the
+    /// file can be renamed, the next Start moves it aside, writes the
+    /// settings in use back, and starts.
     func testStartIsRefusedWhileARejectedConfigCannotBeMovedAside() async throws {
         let written = try writeConfig(rejectedConfig)
         let file = h.home.paths.configFile

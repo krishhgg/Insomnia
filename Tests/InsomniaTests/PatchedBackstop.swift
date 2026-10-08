@@ -8,7 +8,11 @@ import Foundation
 /// `setThermal`, sudo succeeds. Each call is recorded in dir/calls, and
 /// each sudo call also copies state.json as it was at that moment to
 /// dir/state-at-sudo (removed when there is none) and lists the names in
-/// INSOMNIA_HOME to dir/names-at-sudo.
+/// INSOMNIA_HOME to dir/names-at-sudo and in its Logs folder to
+/// dir/logs-at-sudo. The app binary is the one this build made, for
+/// `--agent-cutoffs` only (`BuiltApp`), unrecorded, so config.json is read
+/// by the app's own decoder as in production; its Info.plist declares that
+/// mode and not `--resume-frozen`.
 struct PatchedBackstop {
     let dir: URL
     let script: URL
@@ -30,6 +34,7 @@ struct PatchedBackstop {
         let battery = dir.appendingPathComponent("battery").path
         let stateAtSudo = dir.appendingPathComponent("state-at-sudo").path
         let namesAtSudo = dir.appendingPathComponent("names-at-sudo").path
+        let logsAtSudo = dir.appendingPathComponent("logs-at-sudo").path
         let state = home.appendingPathComponent("state.json").path
         try "0".write(toFile: thermal, atomically: true, encoding: .utf8)
         try "25".write(toFile: battery, atomically: true, encoding: .utf8)
@@ -47,13 +52,17 @@ struct PatchedBackstop {
             printf 'sudo %s\n' "$*" >> '\#(calls)'
             /bin/cp '\#(state)' '\#(stateAtSudo)' 2>/dev/null || /bin/rm -f '\#(stateAtSudo)'
             /bin/ls -a '\#(home.path)' > '\#(namesAtSudo)'
+            /bin/ls -a '\#(home.path)/Logs' > '\#(logsAtSudo)' 2>/dev/null || : > '\#(logsAtSudo)'
             """#,
             "IOREG": "exit 0",
             "PS": "exit 1",
             "SYSCTL": "echo fake-boot",
             "KILL": #"printf 'kill %s\n' "$*" >> '\#(calls)'; exit 1"#,
             "DEFAULTS": #"printf 'defaults %s\n' "$*" >> '\#(calls)'; exit 1"#,
-            "INSOMNIA_BIN": "exit 1",
+            "INSOMNIA_BIN": #"""
+            [[ "${1:-}" == --agent-cutoffs ]] && exec '\#(BuiltApp.binary.path)' "$@"
+            exit 1
+            """#,
         ]
         let source = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
@@ -66,7 +75,9 @@ struct PatchedBackstop {
             try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: fake.path)
             constants[name] = fake.path
         }
-        constants["INSOMNIA_INFO"] = dir.appendingPathComponent("no-Info.plist").path
+        let info = dir.appendingPathComponent("Info.plist")
+        try BuiltApp.infoPlist(agentCutoffsVersion: "\(AgentCutoffsCommand.version)").write(to: info, atomically: true, encoding: .utf8)
+        constants["INSOMNIA_INFO"] = info.path
         for (name, value) in constants {
             let hits = lines.indices.filter { lines[$0].hasPrefix("\(name)=") }
             guard hits.count == 1 else { throw PatchError(constant: name, hits: hits.count) }
@@ -96,6 +107,10 @@ struct PatchedBackstop {
         try p.run()
         await exit.exited()
         return p.terminationStatus
+    }
+
+    func clearCalls() {
+        try? FileManager.default.removeItem(at: dir.appendingPathComponent("calls"))
     }
 
     var calls: [String] {
@@ -132,5 +147,34 @@ struct PatchedBackstop {
     var namesAtSudo: [String] {
         ((try? String(contentsOf: dir.appendingPathComponent("names-at-sudo"), encoding: .utf8)) ?? "")
             .split(separator: "\n").map(String.init)
+    }
+
+    /// The names in INSOMNIA_HOME/Logs as the last sudo call found them.
+    var logsAtSudo: [String] {
+        ((try? String(contentsOf: dir.appendingPathComponent("logs-at-sudo"), encoding: .utf8)) ?? "")
+            .split(separator: "\n").map(String.init)
+    }
+
+    /// Makes the app binary unusable for the agent: its Info.plist then
+    /// declares no `--agent-cutoffs` version, so the binary is not run.
+    func withdrawAgentCutoffs() throws {
+        try BuiltApp.infoPlist(agentCutoffsVersion: nil).write(to: dir.appendingPathComponent("Info.plist"), atomically: true, encoding: .utf8)
+    }
+
+    /// The app binary the agent runs (INSOMNIA_BIN).
+    var appBinary: URL { dir.appendingPathComponent("insomnia_bin") }
+
+    /// Replaces the app binary with a script running `body`.
+    func replaceAppBinary(with body: String) throws {
+        try "#!/bin/bash\n\(body)\n".write(to: appBinary, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: appBinary.path)
+    }
+
+    /// Sets COMMAND_TIMEOUT_SECONDS, the limit on each read, in this copy.
+    func setCommandTimeout(_ seconds: Int) throws {
+        let text = try String(contentsOf: script, encoding: .utf8)
+        let line = "COMMAND_TIMEOUT_SECONDS=30"
+        guard text.components(separatedBy: "\n").filter({ $0 == line }).count == 1 else { throw PatchError(constant: "COMMAND_TIMEOUT_SECONDS", hits: 0) }
+        try text.replacingOccurrences(of: "\n\(line)\n", with: "\nCOMMAND_TIMEOUT_SECONDS=\(seconds)\n").write(to: script, atomically: true, encoding: .utf8)
     }
 }

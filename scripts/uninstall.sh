@@ -106,8 +106,9 @@ SESSION="$APP_SUPPORT/session.json"
 # that record cannot be written either, the end is recorded in state.json
 # (endedSession); that key is not something to undo and goes with the file.
 # When neither can be written, the same record goes to a new file,
-# ended-session.json. and eight letters or digits (collect_end_records_aside
-# below), removed the same way.
+# ended-session.json. and eight letters or digits, beside them or in
+# $LOG_DIR (collect_end_records_aside below), removed the same way by both
+# modes, before --purge removes $LOG_DIR.
 ENDED="$APP_SUPPORT/ended-session.json"
 STATE="$APP_SUPPORT/state.json"
 CONFIG="$APP_SUPPORT/config.json"
@@ -549,16 +550,21 @@ collect_moved_aside() { # session.json | config.json
 }
 
 # The records of a session's end that backstop.sh (record_end_aside) or the
-# app wrote under a fresh name, into END_RECORDS_ASIDE: every path named
-# ended-session.json. and exactly eight letters or digits, whatever it is.
+# app wrote under a fresh name, in $APP_SUPPORT or $LOG_DIR, into
+# END_RECORDS_ASIDE: every path there named ended-session.json. and exactly
+# eight letters or digits, whatever it is. $LOG_DIR is searched only when it
+# is a directory, not a symlink, as backstop.sh and the app search it.
 # remove_owned removes the regular files among them and names the rest.
 collect_end_records_aside() {
-  local f
+  local d f
   END_RECORDS_ASIDE=()
-  for f in "$APP_SUPPORT"/ended-session.json.????????; do
-    [[ -e "$f" || -L "$f" ]] || continue
-    [[ "${f##*/}" =~ ^ended-session\.json\.[A-Za-z0-9]{8}$ ]] || continue
-    END_RECORDS_ASIDE+=("$f")
+  for d in "$APP_SUPPORT" "$LOG_DIR"; do
+    [[ "$d" == "$APP_SUPPORT" || ( -d "$d" && ! -L "$d" ) ]] || continue
+    for f in "$d"/ended-session.json.????????; do
+      [[ -e "$f" || -L "$f" ]] || continue
+      [[ "${f##*/}" =~ ^ended-session\.json\.[A-Za-z0-9]{8}$ ]] || continue
+      END_RECORDS_ASIDE+=("$f")
+    done
   done
   return 0
 }

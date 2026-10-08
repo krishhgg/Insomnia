@@ -190,16 +190,32 @@ struct Store: Sendable {
         return sessionEndIsRecorded()
     }
 
-    /// The records written aside (Paths.endedSessionAsidePrefix): regular
-    /// files, not symlinks, with exactly that name shape, in name order.
-    /// Nothing else is ever opened or removed as one.
+    /// The records written aside (Paths.endedSessionAsidePrefix) in
+    /// `Paths.endedSessionAsideFolders`: regular files, not symlinks, owned
+    /// by this user, with exactly that name shape, folder by folder in
+    /// name order. The log folder is searched only while it is a directory,
+    /// not a symlink, owned by this user. Nothing else is ever opened or
+    /// removed as one.
     func sessionEndRecordsAside() -> [URL] {
-        guard let names = try? FileManager.default.contentsOfDirectory(atPath: paths.appSupport.path) else { return [] }
-        return names.filter(Paths.isEndedSessionAsideName).sorted().compactMap { name in
-            let url = paths.appSupport.appendingPathComponent(name)
+        recordAsideFolders().flatMap { folder -> [URL] in
+            guard let names = try? FileManager.default.contentsOfDirectory(atPath: folder.path) else { return [] }
+            return names.filter(Paths.isEndedSessionAsideName).sorted().compactMap { name in
+                let url = folder.appendingPathComponent(name)
+                var st = stat()
+                guard lstat(url.path, &st) == 0, st.st_mode & S_IFMT == S_IFREG, st.st_uid == getuid() else { return nil }
+                return url
+            }
+        }
+    }
+
+    /// `Paths.endedSessionAsideFolders` as they may be used now: the log
+    /// folder only while it is a directory (lstat, so not a symlink) this
+    /// user owns.
+    private func recordAsideFolders() -> [URL] {
+        paths.endedSessionAsideFolders.filter { folder in
+            guard folder != paths.appSupport else { return true }
             var st = stat()
-            guard lstat(url.path, &st) == 0, st.st_mode & S_IFMT == S_IFREG else { return nil }
-            return url
+            return lstat(folder.path, &st) == 0 && st.st_mode & S_IFMT == S_IFDIR && st.st_uid == getuid()
         }
     }
 
@@ -212,19 +228,30 @@ struct Store: Sendable {
     }
 
     /// For an end that could not remove session.json or write
-    /// ended-session.json or the journal: copies its bytes to a new file
-    /// beside them, created exclusively under a random name. A record
-    /// aside that already matches is used again. Returns the record, only
-    /// once it reads back identical to the file.
+    /// ended-session.json or the journal: copies its bytes to a new file,
+    /// created exclusively under a random name, beside them, or in the log
+    /// folder when their folder takes no new file. A record aside that
+    /// already matches, in either folder, is used again. Returns the
+    /// record, only once it reads back identical to the file.
     func recordSessionEndAside() -> URL? {
         if let existing = sessionEndRecordAside() { return existing }
         guard let current = try? readData(from: paths.sessionFile) else { return nil }
+        _ = try? OwnerOnly.createDirectory(paths.logs)
+        for folder in recordAsideFolders() {
+            if let record = createRecordAside(in: folder, contents: current) { return record }
+        }
+        return nil
+    }
+
+    /// One record aside in `folder`, or nil when none could be created
+    /// there and read back identical to `contents`.
+    private func createRecordAside(in folder: URL, contents: Data) -> URL? {
         let letters = Array("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
         for _ in 0..<8 {
             let suffix = String((0..<8).map { _ in letters.randomElement()! })
-            let url = paths.appSupport.appendingPathComponent(Paths.endedSessionAsidePrefix + suffix)
+            let url = folder.appendingPathComponent(Paths.endedSessionAsidePrefix + suffix)
             do {
-                try OwnerOnly.createFile(at: url, contents: current)
+                try OwnerOnly.createFile(at: url, contents: contents)
             } catch OwnerOnlyError.open(_, EEXIST) {
                 continue
             } catch OwnerOnlyError.write {
@@ -234,11 +261,27 @@ struct Store: Sendable {
             } catch {
                 return nil
             }
-            if (try? readData(from: url)) == current { return url }
+            if (try? readData(from: url)) == contents { return url }
             try? FileManager.default.removeItem(at: url)
             return nil
         }
         return nil
+    }
+
+    /// Writes session.json's bytes back over it, unchanged: a new file
+    /// renamed into its place, as every write here. True only when that
+    /// worked and the file then reads back as the same bytes. Reconcile
+    /// runs it before it resumes a session: a session.json that cannot be
+    /// replaced is one an end could not remove either, so an end of it may
+    /// have gone unrecorded.
+    func rewriteSessionFile() -> Bool {
+        guard let current = try? readData(from: paths.sessionFile) else { return false }
+        do {
+            try write(data: current, to: paths.sessionFile)
+        } catch {
+            return false
+        }
+        return (try? readData(from: paths.sessionFile)) == current
     }
 
     /// session.json's bytes in base64, the form `RuntimeState.endedSession`
@@ -317,11 +360,19 @@ struct Store: Sendable {
     /// Throws StoreError.unreadable, with a one-line reason, when the file
     /// does not decode.
     func loadConfig() throws -> Config? {
+        guard let data = try readData(from: paths.configFile) else { return nil }
         do {
-            return try read(Config.self, from: paths.configFile)
+            return try Self.decodeConfig(data)
         } catch let error as DecodingError {
             throw StoreError.unreadable(file: paths.configFile.path, detail: Self.brief(error))
         }
+    }
+
+    /// config.json's bytes as the app reads them: the one decoder behind
+    /// `loadConfig` and `Insomnia --agent-cutoffs` (AgentCutoffsCommand),
+    /// which backstop.sh runs on the same bytes. Pure: it opens no file.
+    static func decodeConfig(_ data: Data) throws -> Config {
+        try makeDecoder().decode(Config.self, from: data)
     }
     func saveConfig(_ c: Config) throws { try write(c, to: paths.configFile) }
 

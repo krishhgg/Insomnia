@@ -72,9 +72,16 @@ struct Paths: Sendable, Equatable {
     /// The same record under a fresh name, for when neither
     /// ended-session.json nor state.json can be written: this prefix and
     /// eight letters or digits, created exclusively (Store, and mktemp in
-    /// backstop.sh). Only a regular file with exactly that name counts;
-    /// backstop.sh and uninstall.sh use the same shape.
+    /// backstop.sh), in one of `endedSessionAsideFolders`. Only a regular
+    /// file this user owns with exactly that name counts; backstop.sh and
+    /// uninstall.sh use the same shape.
     static let endedSessionAsidePrefix = "ended-session.json."
+    /// Where records aside go and are looked for, in this order: beside
+    /// ended-session.json, then the log folder, which is outside
+    /// Application Support and so can take a new file when that folder
+    /// does not. The log folder counts only while it is a directory, not a
+    /// symlink, owned by this user. No other folder is searched.
+    var endedSessionAsideFolders: [URL] { [appSupport, logs] }
     static func isEndedSessionAsideName(_ name: String) -> Bool {
         guard name.hasPrefix(endedSessionAsidePrefix) else { return false }
         let suffix = name.utf8.dropFirst(endedSessionAsidePrefix.utf8.count)

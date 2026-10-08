@@ -10,12 +10,13 @@ import XCTest
 /// recovery agent (the real backstop.sh, tools patched to fakes) or by the
 /// app. A record of one session.json never ends another. When the journal
 /// cannot be written either, the record goes to a new file beside them
-/// (ended-session.json.<8 letters or digits>), and no launch resumes the
-/// session, whatever SleepDisabled reads and whichever file is repaired.
-/// When no record can be written at all (here MKTEMP fails), the agent
-/// still restores sleep, and no launch holds sleep again for that session:
-/// not while the journal cannot be written, and not once it can, since the
-/// journal then says sleep is held and pmset says it is not.
+/// (ended-session.json.<8 letters or digits>), or in the log folder when
+/// their folder takes no new file, and no launch resumes the session,
+/// whatever SleepDisabled reads and whichever file is repaired. When no
+/// record can be written at all (here MKTEMP fails, or both folders refuse
+/// new files), the agent still restores sleep, and no launch holds sleep
+/// again for that session while session.json cannot be replaced or the
+/// journal cannot be written, or once pmset says sleep is not held.
 @MainActor
 final class JournaledSessionEndTests: XCTestCase {
     var h: Harness!
@@ -594,6 +595,326 @@ final class JournaledSessionEndTests: XCTestCase {
         await m.noticeAgentEnd()
         XCTAssertTrue(m.isActive)
         XCTAssertFalse(fifo.readerSeen)
+    }
+
+    // MARK: The record in the log folder
+
+    private var logs: URL { h.home.paths.logs }
+
+    /// The round-22 review's files: session.json, an unrelated
+    /// ended-session.json and state.json all immutable, and the folder
+    /// holding them takes no new file. The agent (the app dead) cannot
+    /// remove session.json or write any record there, so it writes the
+    /// record in the log folder, reads it back, and only then restores
+    /// sleep. Its status files fail in that folder too, so the run exits 1
+    /// once its supervisor reports no result.
+    private func endRecordedInTheLogFolder(restoreFails: Bool) async throws -> URL {
+        _ = try await startThenPin()
+        try setImmutable(h.home.paths.stateFile, true)
+        if restoreFails { try agent.failSudo() }
+        try TestACL.denyNewFiles(in: h.home.paths.appSupport)
+        defer { try? TestACL.removeAll(h.home.paths.appSupport) }
+
+        try await runAgent(expecting: 1)
+
+        let record = try recordAside()
+        XCTAssertEqual(record.deletingLastPathComponent().resolvingSymlinksInPath(), logs.resolvingSymlinksInPath())
+        XCTAssertTrue(agent.calls.contains(agent.restoreCall), agent.calls.joined(separator: "\n"))
+        XCTAssertTrue(agent.logsAtSudo.contains(record.lastPathComponent), "recorded before sleep was restored: \(agent.logsAtSudo)")
+        XCTAssertFalse(agent.namesAtSudo.contains { Paths.isEndedSessionAsideName($0) }, "\(agent.namesAtSudo)")
+        XCTAssertEqual(try Data(contentsOf: h.home.paths.endedSessionFile), unrelatedRecord)
+        XCTAssertNil(try h.store.loadState()?.endedSession)
+        XCTAssertFalse(h.store.sessionEndIsRecorded())
+        XCTAssertTrue(logText().contains("its end is recorded in \(record.path) instead"), logText())
+        var info = stat()
+        XCTAssertEqual(lstat(record.path, &info), 0)
+        XCTAssertEqual(info.st_mode & 0o777, 0o600)
+        return record
+    }
+
+    /// Then the folder and state.json are repaired, SleepDisabled reads 1
+    /// (the restore failed, or something else set it again) and the app
+    /// launches first, holding the alive lock. The record in the log folder
+    /// ends the session: no disablesleep 1. A later agent run ends it again
+    /// without the checks, and once session.json can be removed, it and the
+    /// record go.
+    private func relaunchAfterTheFolderAndJournalAreRepaired(_ record: URL) async throws {
+        try TestACL.removeAll(h.home.paths.appSupport)
+        try setImmutable(h.home.paths.stateFile, false)
+        h.guardFake.sleepDisabled = true
+        let alive = AppAliveLock(url: h.home.paths.appAliveFile)
+        XCTAssertTrue(try alive.tryAcquire())
+        defer { alive.release() }
+        let before = h.guardFake.calls.count
+        let next = h.makeManager()
+        await next.reconcile()
+
+        XCTAssertFalse(next.isActive, "the agent's end survives the folder and journal repair")
+        XCTAssertFalse(sleepHeldAgain(since: before), "\(h.guardFake.calls)")
+        XCTAssertTrue(logText().contains("reconcile: session.json holds a session already ended (recorded in \(record.lastPathComponent)); restoring, not resuming"), logText())
+        XCTAssertEqual(h.store.sessionEndRecordsAside(), [record], "the app's end reuses the record")
+        XCTAssertEqual(try h.store.loadState()?.endedSession, try marker(), "now the journal records it too")
+
+        let callsBefore = agent.calls.count
+        try await runAgent(expecting: 1)
+        XCTAssertFalse(agent.calls.dropFirst(callsBefore).contains("pmset -g batt"), "no checks for a session recorded as ended")
+
+        try unpinAll()
+        try await runAgent(expecting: 0)
+        XCTAssertNil(try h.store.loadSession())
+        XCTAssertEqual(h.store.sessionEndRecordsAside(), [], "the record goes with the file it copies")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: record.path))
+    }
+
+    func testAFailedRestoreRecordedInTheLogFolderIsNotResumedOnceTheFolderAndJournalAreRepaired() async throws {
+        let record = try await endRecordedInTheLogFolder(restoreFails: true)
+        try await relaunchAfterTheFolderAndJournalAreRepaired(record)
+    }
+
+    func testAnotherHoldDoesNotResumeASessionRecordedInTheLogFolder() async throws {
+        let record = try await endRecordedInTheLogFolder(restoreFails: false)
+        try await relaunchAfterTheFolderAndJournalAreRepaired(record)
+    }
+
+    /// The app ends its own session in the same files: it writes the
+    /// record in the log folder before it restores anything, and a
+    /// relaunch and the agent both treat the session as over.
+    func testAnAppEndThatCanWriteOnlyInTheLogFolderIsHonouredByARelaunchAndTheAgent() async throws {
+        let m = try await startThenPin()
+        try setImmutable(h.home.paths.stateFile, true)
+        try TestACL.denyNewFiles(in: h.home.paths.appSupport)
+        defer { try? TestACL.removeAll(h.home.paths.appSupport) }
+        let gate = AsyncGate()
+        h.guardFake.restoreGate = gate
+
+        let end = Task { @MainActor in _ = await m.end(reason: .user) }
+        await gate.waitUntilStarted()
+        let record = try recordAside()
+        XCTAssertEqual(record.deletingLastPathComponent().resolvingSymlinksInPath(), logs.resolvingSymlinksInPath())
+        await gate.open()
+        await end.value
+        h.guardFake.restoreGate = nil
+
+        XCTAssertFalse(m.isActive)
+        XCTAssertTrue(h.notifier.posts.contains { $0.body.contains("its end is recorded, so a relaunch will not resume it") }, "\(h.notifier.posts)")
+        try TestACL.removeAll(h.home.paths.appSupport)
+
+        h.guardFake.sleepDisabled = true
+        let before = h.guardFake.calls.count
+        let next = h.makeManager()
+        await next.reconcile()
+        XCTAssertFalse(next.isActive)
+        XCTAssertFalse(sleepHeldAgain(since: before), "\(h.guardFake.calls)")
+
+        try await runAgent(expecting: 1)
+        XCTAssertTrue(logText().contains("already ended (recorded in \(record.path))"), logText())
+        XCTAssertFalse(agent.calls.contains("pmset -g batt"), agent.calls.joined(separator: "\n"))
+        XCTAssertEqual(h.store.sessionEndRecordsAside(), [record])
+    }
+
+    /// A running app's tick sees a record in the log folder and ends its
+    /// side; one of an earlier session.json ends nothing, and the agent
+    /// removes it.
+    func testTheRunningAppAndTheAgentReadTheLogFolder() async throws {
+        let m = h.makeManager()
+        await m.reconcile()
+        await m.start(duration: 3600)
+        XCTAssertTrue(m.isActive)
+        let bytes = try Data(contentsOf: h.home.paths.sessionFile)
+        let stale = logs.appendingPathComponent("ended-session.json.Stale001")
+        try Data("an earlier session.json".utf8).write(to: stale)
+        let alive = AppAliveLock(url: h.home.paths.appAliveFile)
+        XCTAssertTrue(try alive.tryAcquire())
+        defer { alive.release() }
+
+        await m.noticeAgentEnd()
+        XCTAssertTrue(m.isActive, "a record of another session.json ends nothing")
+        try await runAgent(expecting: 0)
+        XCTAssertNotNil(try h.store.loadSession())
+        XCTAssertFalse(agent.calls.contains(agent.restoreCall), agent.calls.joined(separator: "\n"))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: stale.path), "a record that matches nothing goes")
+
+        let record = logs.appendingPathComponent("ended-session.json.Match001")
+        try bytes.write(to: record)
+        let before = h.guardFake.calls.count
+        await m.noticeAgentEnd()
+        XCTAssertFalse(m.isActive)
+        XCTAssertFalse(sleepHeldAgain(since: before), "\(h.guardFake.calls)")
+        XCTAssertNil(try h.store.loadSession())
+        XCTAssertFalse(FileManager.default.fileExists(atPath: record.path), "the end removes the record with session.json")
+    }
+
+    /// In the log folder as beside session.json: a symlink to a copy of
+    /// session.json, a FIFO and other names never end the session, the
+    /// FIFO is never opened, and neither side removes any of them. A record
+    /// nobody can read is not removed as stale and ends nothing. A log
+    /// folder that is a symlink is not searched at all, by either side, and
+    /// the app does not write a record through it.
+    func testOnlyARegularFileInTheRealLogFolderIsARecord() async throws {
+        let m = h.makeManager()
+        await m.reconcile()
+        await m.start(duration: 3600)
+        XCTAssertTrue(m.isActive)
+        let bytes = try Data(contentsOf: h.home.paths.sessionFile)
+        let copy = h.home.root.appendingPathComponent("copy-of-session")
+        try bytes.write(to: copy)
+        let link = logs.appendingPathComponent("ended-session.json.Link0000")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: copy)
+        let other = logs.appendingPathComponent("ended-session.json.Other0000")
+        try bytes.write(to: other)
+        let unreadable = logs.appendingPathComponent("ended-session.json.NoRead00")
+        try bytes.write(to: unreadable)
+        try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: unreadable.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: unreadable.path) }
+        let fifo = try FIFOWatch(at: logs.appendingPathComponent("ended-session.json.Fifo0000"))
+        defer { fifo.stop() }
+
+        XCTAssertEqual(h.store.sessionEndRecordsAside(), [unreadable])
+        XCTAssertNil(h.store.sessionEndRecordAside())
+        let alive = AppAliveLock(url: h.home.paths.appAliveFile)
+        XCTAssertTrue(try alive.tryAcquire())
+        defer { alive.release() }
+        try await runAgent(expecting: 0)
+        XCTAssertFalse(fifo.readerSeen, "a FIFO named like a record was opened")
+        XCTAssertNotNil(try h.store.loadSession())
+        XCTAssertFalse(agent.calls.contains(agent.restoreCall), agent.calls.joined(separator: "\n"))
+        for kept in [link, other, unreadable] {
+            XCTAssertNotNil(try? FileManager.default.attributesOfItem(atPath: kept.path), kept.lastPathComponent)
+        }
+        await m.noticeAgentEnd()
+        XCTAssertTrue(m.isActive)
+        XCTAssertFalse(fifo.readerSeen)
+
+        // The log folder replaced by a symlink to a folder holding a
+        // matching record.
+        let elsewhere = h.home.root.appendingPathComponent("elsewhere", isDirectory: true)
+        try FileManager.default.createDirectory(at: elsewhere, withIntermediateDirectories: true)
+        try bytes.write(to: elsewhere.appendingPathComponent("ended-session.json.Elsewher"))
+        let realLogs = h.home.root.appendingPathComponent("real-logs", isDirectory: true)
+        try FileManager.default.moveItem(at: logs, to: realLogs)
+        try FileManager.default.createSymbolicLink(at: logs, withDestinationURL: elsewhere)
+        defer {
+            try? FileManager.default.removeItem(at: logs)
+            try? FileManager.default.moveItem(at: realLogs, to: logs)
+        }
+        XCTAssertEqual(h.store.sessionEndRecordsAside(), [])
+        await m.noticeAgentEnd()
+        XCTAssertTrue(m.isActive, "a record through a symlinked log folder ends nothing")
+        try await runAgent(expecting: 0)
+        XCTAssertNotNil(try h.store.loadSession(), "the agent ends nothing on a record through a symlinked log folder")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: elsewhere.appendingPathComponent("ended-session.json.Elsewher").path))
+
+        try setImmutable(h.home.paths.sessionFile, true)
+        try setImmutable(h.home.paths.stateFile, true)
+        try unrelatedRecord.write(to: h.home.paths.endedSessionFile)
+        try setImmutable(h.home.paths.endedSessionFile, true)
+        try TestACL.denyNewFiles(in: h.home.paths.appSupport)
+        defer { try? TestACL.removeAll(h.home.paths.appSupport) }
+        XCTAssertNil(h.store.recordSessionEndAside(), "no record is written through the symlink")
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: elsewhere.path), ["ended-session.json.Elsewher"])
+    }
+
+    /// Every place refuses the record: session.json, ended-session.json and
+    /// state.json immutable, and neither the folder holding them nor the
+    /// log folder takes a new file. The agent still restores sleep (here it
+    /// fails, so SleepDisabled stays 1) and keeps sleepDisabledByUs. Then
+    /// both folders and state.json are repaired and the app launches first.
+    /// session.json still cannot be replaced, so the app does not hold
+    /// sleep again for it: it ends it and records the end in the journal.
+    func testAnEndRecordedNowhereIsNotResumedWhileSessionJSONCannotBeReplaced() async throws {
+        _ = try await startThenPin()
+        try setImmutable(h.home.paths.stateFile, true)
+        try agent.failSudo()
+        try TestACL.denyNewFiles(in: h.home.paths.appSupport)
+        try TestACL.denyNewFiles(in: logs)
+        defer {
+            try? TestACL.removeAll(h.home.paths.appSupport)
+            try? TestACL.removeAll(logs)
+        }
+
+        try await runAgent(expecting: 1)
+        XCTAssertTrue(agent.calls.contains(agent.restoreCall), agent.calls.joined(separator: "\n"))
+        XCTAssertEqual(h.store.sessionEndRecordsAside(), [])
+        XCTAssertFalse(h.store.sessionEndIsRecorded())
+        XCTAssertNil(try h.store.loadState()?.endedSession)
+        XCTAssertEqual(try h.store.loadState()?.sleepDisabledByUs, true)
+        XCTAssertTrue(logText().contains("could not remove \(h.home.paths.sessionFile.path) or record its end in \(h.home.paths.endedSessionFile.path), \(h.home.paths.stateFile.path) or a new file in \(h.home.paths.appSupport.path) or \(logs.path)"), logText())
+
+        try TestACL.removeAll(h.home.paths.appSupport)
+        try TestACL.removeAll(logs)
+        try setImmutable(h.home.paths.stateFile, false)
+        h.guardFake.sleepDisabled = true
+        let alive = AppAliveLock(url: h.home.paths.appAliveFile)
+        XCTAssertTrue(try alive.tryAcquire())
+        defer { alive.release() }
+        let marker = try marker()
+        let before = h.guardFake.calls.count
+        let next = h.makeManager()
+        await next.reconcile()
+
+        XCTAssertFalse(next.isActive, "a session whose end may have gone unrecorded must not come back")
+        XCTAssertFalse(sleepHeldAgain(since: before), "\(h.guardFake.calls)")
+        XCTAssertFalse(h.guardFake.sleepDisabled, "the relaunch restores the hold the agent could not")
+        XCTAssertTrue(logText().contains("but it cannot be replaced, so an end of it may have gone unrecorded"), logText())
+        XCTAssertEqual(try h.store.loadState()?.endedSession, marker)
+    }
+
+    /// The cost of that rule: a session the app was running when it died,
+    /// with nothing ended, is not resumed either while session.json cannot
+    /// be replaced. The same crash with a writable session.json resumes.
+    func testACrashedSessionWhoseFileCannotBeReplacedIsEndedNotResumed() async throws {
+        let m = h.makeManager()
+        await m.reconcile()
+        await m.start(duration: 3600)
+        XCTAssertTrue(m.isActive)
+        let session = try Data(contentsOf: h.home.paths.sessionFile)
+        let journal = try Data(contentsOf: h.home.paths.stateFile)
+        try setImmutable(h.home.paths.sessionFile, true)
+
+        var before = h.guardFake.calls.count
+        let pinned = h.makeManager()
+        await pinned.reconcile()
+        XCTAssertFalse(pinned.isActive)
+        XCTAssertFalse(sleepHeldAgain(since: before), "\(h.guardFake.calls)")
+        XCTAssertTrue(logText().contains("but it cannot be replaced"), logText())
+
+        // Undo that end: the same crash, but session.json can be replaced.
+        try setImmutable(h.home.paths.sessionFile, false)
+        try? FileManager.default.removeItem(at: h.home.paths.endedSessionFile)
+        try session.write(to: h.home.paths.sessionFile)
+        try journal.write(to: h.home.paths.stateFile)
+        h.guardFake.sleepDisabled = true
+        before = h.guardFake.calls.count
+        let control = h.makeManager()
+        await control.reconcile()
+        XCTAssertTrue(control.isActive, logText())
+        XCTAssertTrue(sleepHeldAgain(since: before), "\(h.guardFake.calls)")
+        XCTAssertEqual(try Data(contentsOf: h.home.paths.sessionFile), session, "the rewrite keeps the same bytes")
+    }
+
+    /// The Store's side: a record goes in the log folder only when the
+    /// folder beside session.json takes no new file, is found there, and
+    /// is removed with session.json.
+    func testTheStoreWritesARecordInTheLogFolderOnlyWhenItsOwnFolderRefuses() throws {
+        try h.store.saveSession(Session(startedAt: h.clock.now, endsAt: h.clock.now.addingTimeInterval(600)))
+        try TestACL.denyNewFiles(in: h.home.paths.appSupport)
+        defer { try? TestACL.removeAll(h.home.paths.appSupport) }
+        let record = try XCTUnwrap(h.store.recordSessionEndAside())
+        XCTAssertEqual(record.deletingLastPathComponent().resolvingSymlinksInPath(), logs.resolvingSymlinksInPath())
+        XCTAssertEqual(try Data(contentsOf: record), try Data(contentsOf: h.home.paths.sessionFile))
+        var info = stat()
+        XCTAssertEqual(lstat(record.path, &info), 0)
+        XCTAssertEqual(info.st_mode & 0o777, 0o600)
+        XCTAssertEqual(h.store.recordSessionEndAside(), record, "used again while it matches")
+        try TestACL.removeAll(h.home.paths.appSupport)
+        XCTAssertEqual(h.store.recordSessionEndAside(), record, "found in the log folder once the other takes files again")
+        try h.store.deleteSession()
+        XCTAssertEqual(h.store.sessionEndRecordsAside(), [])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: record.path))
+
+        try h.store.saveSession(Session(startedAt: h.clock.now, endsAt: h.clock.now.addingTimeInterval(600)))
+        let beside = try XCTUnwrap(h.store.recordSessionEndAside())
+        XCTAssertEqual(beside.deletingLastPathComponent().resolvingSymlinksInPath(), h.home.paths.appSupport.resolvingSymlinksInPath(), "beside session.json first")
     }
 
     /// The app's record aside: created 0600 under a fresh name, used again

@@ -1432,7 +1432,7 @@ final class SessionManager {
                     : store.recordSessionEndAside()?.lastPathComponent
                 let relaunch = recordedIn != nil
                     ? "its end is recorded, so a relaunch will not resume it"
-                    : "a relaunch that can write state.json while sleep is still disabled could hold sleep again for it"
+                    : "a relaunch does not resume it while the file cannot be replaced, but once it and state.json take writes again, one while sleep is still disabled could hold sleep again for it"
                 retainedBecause = "session.json could not be removed (\(error.localizedDescription)); \(relaunch)."
                 fail("could not remove session.json: \(error.localizedDescription)" + (recordedIn.map { "; its end is recorded in \($0)" } ?? "; its end could not be recorded either"))
             }
@@ -2369,9 +2369,8 @@ final class SessionManager {
             // end undoes it, and nothing outside this transaction can run one
             // now (the recovery lock), so a bit that reads 0 was set back
             // while no Insomnia ran: by an agent end that could neither
-            // remove session.json nor record the end anywhere, not even in
-            // a new file beside it (it restores sleep and keeps the entry),
-            // by hand, or never set by a start
+            // remove session.json nor record the end anywhere (it restores
+            // sleep and keeps the entry), by hand, or never set by a start
             // that died before its pmset. Holding sleep again would revive a
             // session that was ended, so it ends here, and the end is
             // recorded wherever it can be now. A read that fails cannot
@@ -2401,17 +2400,33 @@ final class SessionManager {
             // Written even when sleepDisabledByUs is already set: a session
             // resumes only from a journal this process can write. An agent
             // run that ended the session but could neither remove
-            // session.json nor record the end anywhere (the folder took no
-            // new file) leaves just that flag behind; when its restore
-            // failed as well, the bit still
-            // reads 1 above, and the write that fails here keeps the
-            // session it ended from resuming while state.json stays
-            // unwritable.
+            // session.json nor record the end anywhere leaves just that flag
+            // behind; when its restore failed as well, the bit still reads 1
+            // above, and the write that fails here keeps the session it
+            // ended from resuming while state.json stays unwritable.
             do {
                 try journal { $0.sleepDisabledByUs = true }
             } catch {
                 fail("could not journal sleep guard: \(error.localizedDescription); ending session")
                 _ = await performEnd(reason: .recoveryUnavailable)
+                return
+            }
+            // An end, by the agent or by an earlier app, removes
+            // session.json, and records the end when it cannot: in
+            // ended-session.json, the journal, or a new file beside them or
+            // in the log folder. When none of those took a write, nothing
+            // on disk says the session is over, and the bit pmset reports
+            // cannot say it either: it is global, and another process or a
+            // failed restore can leave it at 1. Such an end left a
+            // session.json it could not remove, so sleep is held again only
+            // for a session.json that can be replaced now (the same bytes,
+            // written and read back). One that cannot ends here instead,
+            // and the end is recorded wherever it can be now. Nothing tells
+            // such an end from a crash once session.json and the journal
+            // take writes again.
+            guard store.rewriteSessionFile() else {
+                Log.error("reconcile: session.json holds a session valid until \(iso(s.endsAt)), but it cannot be replaced, so an end of it may have gone unrecorded (a recovery agent end that could neither remove it nor record its end anywhere); ending it, not resuming")
+                _ = await performEnd(reason: .backstop)
                 return
             }
             do {

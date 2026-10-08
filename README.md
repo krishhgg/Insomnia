@@ -118,7 +118,7 @@ a `build-app.sh` was added to its folder after unpacking.
 | `~/Applications/Insomnia.app` | The menu bar app, with `backstop.sh` sealed inside it at `Contents/Resources` |
 | `~/Library/Application Support/Insomnia/` | Configuration, the session/recovery journals, and lock files |
 | `~/Library/LaunchAgents/com.insomnia.backstop.plist` | Per-user recovery agent: verifies the app's code signature, then runs the sealed `backstop.sh` |
-| `~/Library/Logs/Insomnia/` | `insomnia.log` and `handoffs.log`, each capped at 1 MiB with one older copy kept as `.1`, unless you replace it with a symlink |
+| `~/Library/Logs/Insomnia/` | `insomnia.log` and `handoffs.log`, each capped at 1 MiB with one older copy kept as `.1`, unless you replace it with a symlink. A session end record lands here only when the Application Support folder takes no new file (see "How recovery works") |
 | `/etc/sudoers.d/insomnia` | Permission for the four commands below |
 
 ```text
@@ -338,24 +338,43 @@ launch, and the kernel releases it when the process dies, however it dies. A
 second copy that cannot take it quits at launch without changing anything. The
 Mac is on battery power with the charge below the end floor from `config.json`
 (default 10%); a battery that is present but cannot be read counts as below
-it. Or the thermal pressure level reported by `notifyutil` is critical. Each
+it. Or the thermal pressure level reported by `notifyutil` is critical while
+the thermal rule is on. The agent does not parse `config.json` itself. It
+passes the file to the app's binary in `~/Applications/Insomnia.app` with
+`--agent-cutoffs`, which decodes it with the app's own code, prints the end
+floor and the thermal setting, and exits without starting the app. This runs
+once a minute while a session is valid, the app is running and the file
+exists. Without the file, or with one the app rejects or cannot read, the
+agent uses the app's defaults (10%, on). When the binary cannot answer (it
+was removed or replaced by an older or newer build after the agent checked
+the bundle's signature, it gives no usable answer within 30 seconds, or
+`config.json` is over 8 MiB), the agent uses the strictest values instead, a
+95% end floor with the thermal rule on, and logs why. Each
 early end is logged with its reason, and the saved session is deleted before
 the restore starts. A restore that cannot finish leaves entries in the journal
 for the next run and the app. If the saved session cannot be deleted, its end
-is recorded beside it before anything is restored: in `ended-session.json`;
-when that file cannot be written, in the journal (`endedSession` in
-`state.json`); and when neither can be written, in a new file named
-`ended-session.json.` followed by eight letters or digits. While a record
-matches the saved session, the app restores that session instead of resuming
-it, whatever `pmset` reports, and every agent run ends it again. Only when the
-folder takes no new file either is nothing recorded. The agent still runs the
-restore, but it cannot confirm the result, so it keeps the journal and exits 1.
-The app resumes no session while it cannot write `state.json`, and none whose
-journal says sleep is held while `pmset` reports it is not. Once the folder and
-`state.json` can be written again, an app launched before the next agent run
-resumes that session if sleep still reads as disabled (the restore failed, or
-something else disabled sleep). Otherwise the session stands until its
-deadline, and sessions are capped at 24 hours by default (`maxDuration`).
+is recorded before anything is restored: in `ended-session.json`; when that
+file cannot be written, in the journal (`endedSession` in `state.json`); when
+neither can be written, in a new file beside them named `ended-session.json.`
+followed by eight letters or digits; and when that folder takes no new file,
+in a file with such a name in `~/Library/Logs/Insomnia`. The agent reads each
+record back before it restores anything. The app and the agent count a record
+only if it is a regular file you own, not a link, and the log folder only if
+it is a real folder you own, not a link. While a record matches the saved
+session byte for byte, the app restores that session instead of resuming it,
+whatever `pmset` reports, and every agent run ends it again. Only when neither
+folder takes a new file is nothing recorded. The agent still runs the restore,
+but it cannot confirm the result, so it keeps the journal and exits 1. The app
+resumes no session while it cannot write `state.json`, none whose journal says
+sleep is held while `pmset` reports it is not, and none whose `session.json`
+it cannot replace with the same bytes. That last rule has a cost: a session
+the app was running when it crashed is ended at the next launch, not resumed,
+while its `session.json` cannot be replaced. Once `session.json` can be
+replaced and `state.json` written again, an app launched before the next agent
+run resumes a session ended with nothing recorded if sleep still reads as
+disabled (the restore failed, or something else disabled sleep), because
+nothing on disk tells that end from a crash. Otherwise the session stands until
+its deadline, and sessions are capped at 24 hours by default (`maxDuration`).
 
 The app and backstop use the same lock so they do not restore and rewrite the
 journal over one another. Failed restoration keeps the relevant entries;
