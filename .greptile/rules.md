@@ -214,23 +214,44 @@ Flag a change that breaks one of these; do not flag the behavior itself.
   `SleepGuarding.checkSleepSettingForStart` only reads `pmset -g`, and a
   `SleepDisabled 1` the journal does not claim refuses Start with nothing
   run, deliberately, so a setting another tool made stays. The proof that
-  the end can restore without a password is in the root command, after
-  the nonce and deadline checks and under the marker's lock:
+  the end can restore without a password is in the root command, under
+  the marker's lock, in this order: the nonce check (3), the deadline
+  (4), a uid that is a positive number (5), a root read of `pmset -g`
+  (6 on a `SleepDisabled 1` or a failed read; skipped only when `$5` is
+  exactly `1`, the journal claimed the 1 before this start), root's own
+  `pmset -a disablesleep 1`, then the proof
   `sudo -n -u "#$4" /usr/bin/sudo -k -n /usr/bin/pmset -a disablesleep 0`,
-  then the deadline compared again, since the check can be slow, and
-  `pmset -a disablesleep 1` only if the restore exited 0 and the deadline
-  has still not passed. A failed restore exits 5 (`restoreNeedsPassword`,
-  rolled back with nothing to undo); a deadline passed during it exits 4
-  (undone like an end). Root's sudo
-  needs no password; the user's `-k` ignores a cached credential and `-n`
-  never prompts, so only a rule that lets the user run that exact command
-  passes. `sudo -l` is not proof (it lists commands the admin group may run
-  with its password, and lists without one once any rule is NOPASSWD).
-  Known and disclosed: pmset has no compare-and-set, so a `SleepDisabled 1`
-  another tool sets after Start's read is set to 0 by the end, and for a
-  moment by the check when set while the dialog is up; the user types the
-  password before a missing rule is reported; a sudoers without root's
-  default entry fails closed. `install.sh` runs no pmset: after writing
+  which undoes root's change rather than a value it found. A failed proof
+  runs root's own `pmset -a disablesleep 0` before any output, then exits
+  5 (`restoreNeedsPassword`); a root pmset that fails there exits 1. After
+  a proof that passes: the deadline again (4), `pmset -g` again (6), and
+  only then `pmset -a disablesleep 1` for the session. Exits 3, 4 and 6,
+  and lockf's 69 and 75, are `.refused`. All refusals leave no change of
+  the command's own and roll back with no pmset, so another tool's setting
+  found by a read stays; any other status may have left `disablesleep 1`
+  in place and is undone like an end. Flag a change that writes before the
+  first read, runs the proof before root's own `disablesleep 1`, prints
+  before root's restore on the exit-5 path, or treats exit 1 as a refusal.
+  Root's sudo needs no password; the user's `-k` ignores a cached
+  credential and `-n` never prompts, so only a rule that lets the user run
+  that exact command passes. `sudo -l` is not proof (it lists commands the
+  admin group may run with its password, and lists without one once any
+  rule is NOPASSWD). Known and disclosed (round 14 P1 narrowed and moved
+  onto Insomnia's own change, not closed): pmset has no compare-and-set and
+  one `SleepDisabled` with no owner, so a 1 another tool sets between the
+  root command's first read and its own `disablesleep 1`, or while that 1
+  is in effect during the proof, is cleared by the proof's write (or by
+  root's restore after a failed proof) and, if the start goes on, by the
+  end; one set after the last read, or during the session, is set to 0 by
+  the end; one set during a dialog that then fails ambiguously (wrong
+  password, timeout, stuck prompt, pmset failure, any other status) is set
+  to 0 by the undo; one set during a dialog whose app quits or crashes
+  first is set to 0 by the end or the backstop; and while the journal
+  claims a 1 another tool's 1 is taken for it. Sleep is off while the
+  proof runs, even when it fails; a root shell that dies then leaves it
+  off with the start's journal entry. The user types the password before
+  a missing rule is reported; a sudoers without root's default entry fails
+  closed. `install.sh` runs no pmset: after writing
   the rule it checks a `sudo -k -n -l` listing, which is not proof either.
 - `DisplayPower.swift`, `LidActions.swift`. On lid close, brightness 0 is
   the primary mechanism; the display sleep request (`IORequestIdle`) is

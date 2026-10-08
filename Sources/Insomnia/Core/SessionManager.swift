@@ -995,8 +995,11 @@ final class SessionManager {
         // by whoever takes the lock next if this process dies first, so a
         // dialog answered after its start was abandoned changes nothing.
         // The command is also given the session's end and refuses after
-        // it, so a password typed too late changes nothing either.
-        let pending = PendingStart(marker: store.paths.pendingStartFile, nonce: UUID().uuidString, deadline: new.endsAt)
+        // it, so a password typed too late changes nothing either. It reads
+        // `pmset -g` again as root, since another tool may turn sleep off
+        // while the password is typed, unless the journal owned a 1 before
+        // this start, for which Start's own read was skipped too.
+        let pending = PendingStart(marker: store.paths.pendingStartFile, nonce: UUID().uuidString, deadline: new.endsAt, sleepOffIsOurs: journalBefore.sleepDisabledByUs)
         let markerFile: FileIdentity
         do {
             markerFile = try store.savePendingStart(pending.nonce)
@@ -1011,7 +1014,7 @@ final class SessionManager {
         // The administrator password dialog. This is the only call that can
         // prompt, and Start is the only path that reaches it: the user just
         // pressed Enter, so someone is at the keyboard. A cancel, a wrong
-        // password, a restore that needs a password, a timeout or a pmset
+        // password, a root command that refused, a timeout or a pmset
         // failure all land here.
         // The marker goes on every outcome below before anything is
         // restored, and a marker that cannot go keeps the sleep entry
@@ -1061,18 +1064,24 @@ final class SessionManager {
             _ = await performEnd(reason: .startFailed)
             return
         } catch let error as AdministratorPromptError where error.nothingToUndo {
-            // Cancelled, osascript never started, or the root command found
-            // that the restore needs a password and stopped before
-            // `disablesleep 1`: nothing ran as root that an undo would
-            // reverse. The journal and session.json go back exactly as they
-            // were and no pmset runs, so a sleep setting another tool owns
-            // is left alone. Nothing can use this attempt's marker any more, so one
-            // that cannot be deleted does not hold the rollback back; it is
-            // reported, and the next transaction tries it again.
+            // Cancelled, osascript never started, or the root command
+            // refused: the start was over, the session had ended, the
+            // restore needs a password, or `pmset -g` showed a 1 this start
+            // did not set. A refusal comes before root writes anything, or
+            // after the restore check (or root, when the check fails) has
+            // turned the command's own temporary 1 back to 0, so nothing is
+            // left for an undo to reverse (`AdministratorPrompt.rootCommand`
+            // names the moments in which another tool's 1 is still
+            // cleared). The journal and session.json go back exactly as they
+            // were and no pmset runs, so a sleep setting another tool made,
+            // even while the dialog was up, is left alone. Nothing can use
+            // this attempt's marker any more, so one that cannot be deleted
+            // does not hold the rollback back; it is reported, and the next
+            // transaction tries it again.
             await clearPendingStart()
             rollBackStart(journal: journalBefore, session: sessionBefore)
             fail("could not disable sleep: \(error.localizedDescription)")
-            notifier.post(title: Self.endTitle(.startFailed, had: false), body: "No session was started, and nothing was changed: \(error.localizedDescription).")
+            notifier.post(title: Self.endTitle(.startFailed, had: false), body: "No session was started, and Insomnia undid anything it changed: \(error.localizedDescription).")
             return
         } catch {
             await clearPendingStart()

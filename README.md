@@ -214,7 +214,11 @@ installer prints its pid.
    press Enter. macOS asks for your administrator password to turn system
    sleep off. It asks only while sleep is on: if another tool has already
    turned sleep off, Start changes nothing and shows the command that turns
-   it back on, so that tool's setting stays. Cancelling the dialog starts
+   it back on, so that tool's setting stays. The command behind the dialog
+   reads the setting again once you have typed the password, before it
+   changes anything, so a tool that turns sleep off while the dialog is up
+   keeps its setting too: no session starts and nothing is changed.
+   Cancelling the dialog starts
    no session and changes nothing. A wrong password, no answer within 120
    seconds, or a pmset failure also starts no session, but Insomnia cannot
    tell whether pmset ran first, so it runs `pmset -a disablesleep 0`,
@@ -368,17 +372,19 @@ has passed. It leaves a valid, unexpired session alone.
 Undoing never needs a password: the sudoers rule covers turning sleep back on,
 so the app, the agent, and the uninstaller can all restore sleep unattended.
 Turning sleep off is the only step that asks, and only when you press Enter.
-After you type the password, and before it turns sleep off, the command
-behind the dialog checks that turning sleep back on still needs no password
-by doing it: as root it switches to your account and runs
+After you type the password, the command behind the dialog checks that
+turning sleep back on still needs no password by doing it. As root it turns
+sleep off, switches to your account, and runs
 `sudo -k -n /usr/bin/pmset -a disablesleep 0`, the command the session's end
-runs. `-k` makes sudo ignore a password you typed into it recently and `-n`
-makes it fail instead of asking, so only the sudoers rule lets the command
-through. If `/etc/sudoers.d/insomnia` is gone or not in effect, sleep is not
-turned off, the start is undone, and Insomnia tells you to run
-`scripts/install.sh` again. You find this out only after typing the
-password: the check needs root, and before the dialog the app runs nothing
-through sudo, it only reads `pmset -g`.
+runs, which turns sleep back on. `-k` makes sudo ignore a password you typed
+into it recently and `-n` makes it fail instead of asking, so only the
+sudoers rule lets the command through. Only then does it turn sleep off for
+the session. If `/etc/sudoers.d/insomnia` is gone or not in effect, root
+turns sleep back on itself, the start is undone, and Insomnia tells you to
+run `scripts/install.sh` again. Sleep is off for the moment the check takes
+even then. You find this out only after typing the password: the check needs
+root, and before the dialog the app runs nothing through sudo, it only reads
+`pmset -g`.
 When Insomnia starts up (login, or a relaunch after a crash) and finds a valid
 session on disk, it checks whether sleep is still off. If it is, the session
 continues; if something turned sleep back on in the meantime, the session ends
@@ -493,12 +499,23 @@ installation scenarios still need [release validation](docs/release-validation.m
   did not set it and only its owner should undo it. The menu shows a warning
   and a notification gives the command, `sudo pmset -a disablesleep 0`.
   Start is refused until it reads 0 again, since the session's end would
-  turn sleep back on. That check is a read at Start: pmset cannot change
-  the setting only if it still holds a given value, so a `SleepDisabled 1`
-  another tool sets after Start has read `pmset -g` is not seen. Ending the
-  session sets it to 0 whoever set it, and if the tool sets it while the
-  password dialog is up, the check behind the dialog sets it to 0 for a
-  moment before Insomnia sets 1.
+  turn sleep back on. Start reads it before the dialog, and the command
+  behind the dialog reads it again as root before it changes anything and
+  after the restore check; a 1 at either read stops that command, and the
+  1 stays. The restore check's write of 0 only undoes the 1 that command
+  set just before it. pmset cannot change the setting only if it still
+  holds a given value, though, so some moments remain uncovered, and this
+  is not fixed. A `SleepDisabled 1` another tool sets in the instant
+  between the command's first read and its own `disablesleep 1`, or while
+  that 1 is in effect during the check, looks like Insomnia's own: the
+  check sets it to 0, and if the start goes on, the session's end does.
+  One set after the last read, or during the session, is set to 0 when the
+  session ends. One set while the dialog is up is also set to 0 when the
+  dialog then fails in a way that may have left sleep off (a wrong
+  password, no answer, a pmset failure), or when Insomnia quits or crashes
+  before the answer and the session's end or the recovery agent restores
+  sleep. And while Insomnia still owes a restore from an earlier session,
+  another tool's 1 looks like Insomnia's own.
 - **Low Power Mode:** Insomnia checks the existing setting so it does not
   claim ownership of an already-enabled preference.
 - **App Nap:** off by default. When the setting is on, Insomnia journals each

@@ -1211,7 +1211,7 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(fx.log().contains("journal kept dirty"), fx.log())
 
         command.release()
-        XCTAssertEqual(command.wait().pmsetCalls, ["-a disablesleep 0", "-a disablesleep 1"])
+        XCTAssertEqual(command.wait().pmsetCalls, ["-g", "-a disablesleep 1", "-a disablesleep 0", "-g", "-a disablesleep 1"])
         fx.clearCalls()
         let again = try fx.run(fx.backstop)
 
@@ -3320,6 +3320,56 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(r.status, 0, r.stderr + fx.log())
         XCTAssertEqual(fx.calls(), ["sudo -n \(fx.fakePmset) -a disablesleep 0"])
         XCTAssertFalse(fx.log().contains("still held"), fx.log())
+    }
+
+    /// The inodes that decide whether fd 9 is the caller's lock come from
+    /// STAT=/usr/bin/stat, never a stat found first on PATH. One that
+    /// prints the same number for every file would let an unrelated fd 9
+    /// pass for the lock while someone else holds it, and one that prints a
+    /// new number each time would make the caller's own lock look foreign.
+    /// Neither changes what the backstop does.
+    func testLockSharingIgnoresAStatOnPATH() throws {
+        let shadow = fx.root.appendingPathComponent("shadow", isDirectory: true)
+        try FileManager.default.createDirectory(at: shadow, withIntermediateDirectories: true)
+        let shadowStat = shadow.appendingPathComponent("stat")
+        let counter = fx.root.appendingPathComponent("shadow-stat-count")
+        try """
+        #!/bin/bash
+        printf x >> '\(counter.path)'
+        if [[ "${FAKE_STAT_SAME:-}" == 1 ]]; then echo 1; else wc -c < '\(counter.path)' | tr -d ' '; fi
+        """.write(to: shadowStat, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: shadowStat.path)
+        let path = "\(shadow.path):/usr/bin:/bin:/usr/sbin:/sbin"
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+
+        // An unrelated fd 9 while someone else holds the lock.
+        let holder = try fx.holdLock()
+        let other = fx.root.appendingPathComponent("other.file")
+        try Data().write(to: other)
+        var r = try fx.run(fx.backstop, [], fd9: other, extraEnvironment: ["PATH": path, "FAKE_STAT_SAME": "1"])
+        holder.stop()
+        XCTAssertEqual(r.status, 75, r.stderr + fx.log())
+        XCTAssertEqual(fx.calls(), [])
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, true)
+        XCTAssertTrue(try fx.lockIsFree(), "the holder let go")
+
+        // The caller's own lock, handed down on fd 9.
+        try Data().write(to: fx.lock)
+        let wrapper = fx.root.appendingPathComponent("holder-then-backstop.sh")
+        try """
+        #!/bin/bash
+        set -eu
+        exec 9<>"\(fx.lock.path)"
+        /usr/bin/lockf -t 0 9
+        /bin/bash "\(fx.backstop.path)"
+        """.write(to: wrapper, atomically: true, encoding: .utf8)
+        let logged = fx.log().count
+        r = try fx.run(wrapper, extraEnvironment: ["PATH": path])
+        XCTAssertEqual(r.status, 0, r.stderr + fx.log())
+        XCTAssertEqual(fx.calls(), ["sudo -n \(fx.fakePmset) -a disablesleep 0"])
+        let second = String(fx.log().dropFirst(logged))
+        XCTAssertFalse(second.contains("still held"), second)
     }
 
     // MARK: - Final integration checks

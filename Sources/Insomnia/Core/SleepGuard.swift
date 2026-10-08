@@ -11,9 +11,10 @@ protocol SleepGuarding: Sendable {
     /// 1 is Insomnia's own and nothing is read. Otherwise a 1 means someone
     /// else turned sleep off, and a session's end would turn it back on for
     /// them, so Start is refused; so it is when the setting cannot be read.
-    /// Throws `SleepSettingRefusal`. Whether sleep can be turned back on
-    /// without a password is checked later, as root, right before sleep is
-    /// turned off (see `AdministratorPrompt.rootCommand`).
+    /// Throws `SleepSettingRefusal`. The root command reads the setting
+    /// again behind the dialog, and checks whether sleep can be turned back
+    /// on without a password before it leaves sleep off (see
+    /// `AdministratorPrompt.rootCommand`).
     func checkSleepSettingForStart(sleepOffIsOurs: Bool) async throws
     /// Shows the administrator password dialog and waits for it; only an
     /// explicit Start by the user may call it, after writing `start`'s
@@ -121,7 +122,8 @@ struct PmsetSleepGuard: SleepGuarding {
     /// Nothing runs as root here: running the restore to prove it needs no
     /// password would turn sleep back on for whoever set it between this
     /// read and that run, so the root command does it instead, under the
-    /// marker's lock, where the start has journaled the setting as its own.
+    /// marker's lock, after its own read of `pmset -g` found sleep on and
+    /// it turned sleep off, so the restore undoes its own change.
     func checkSleepSettingForStart(sleepOffIsOurs: Bool) async throws {
         guard !sleepOffIsOurs else { return }
         let sleepOff: Bool
