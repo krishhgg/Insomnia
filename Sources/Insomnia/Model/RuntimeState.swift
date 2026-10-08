@@ -145,6 +145,11 @@ struct RuntimeState: Codable, Equatable, Sendable {
     /// each with the value to put back. Not a lid action: restored at
     /// session end, at reconcile, or by the backstop with `defaults`.
     var appNapOverrides: [AppNapOverride] = []
+    /// A start that may still turn sleep off, journaled with
+    /// `sleepDisabledByUs` before its password dialog (SleepOffAttempt).
+    /// Never set without `sleepDisabledByUs`, so it adds nothing to undo on
+    /// its own; it records whether that entry may be cleared without one.
+    var sleepOffAttempt: SleepOffAttempt? = nil
 
     /// Bare pids of every journaled freeze, for display and de-duplication.
     var frozenPids: [Int32] { frozenProcesses.map(\.pid) }
@@ -201,7 +206,7 @@ struct RuntimeState: Codable, Equatable, Sendable {
         case sleepDisabledByUs, lowPowerSetByUs, frozenProcesses, frozenPids, dockerFrozen
         case savedAudioOutputs, savedOutputVolume, savedMuted
         case savedDisplayBrightness, savedKeyboardBrightness, displayRestoredUnderLowPower
-        case appNapOverrides
+        case appNapOverrides, sleepOffAttempt
     }
 
     // Tolerate missing keys so a state.json written by an older build, or by
@@ -227,6 +232,7 @@ struct RuntimeState: Codable, Equatable, Sendable {
         savedKeyboardBrightness = try c.decodeIfPresent(Float.self, forKey: .savedKeyboardBrightness)
         displayRestoredUnderLowPower = try c.decodeIfPresent(Float.self, forKey: .displayRestoredUnderLowPower)
         appNapOverrides = try c.decodeIfPresent([AppNapOverride].self, forKey: .appNapOverrides) ?? []
+        sleepOffAttempt = try c.decodeIfPresent(SleepOffAttempt.self, forKey: .sleepOffAttempt)
     }
 
     /// `frozenPids` is read for migration only and never written again, so
@@ -244,5 +250,6 @@ struct RuntimeState: Codable, Equatable, Sendable {
         try c.encodeIfPresent(savedKeyboardBrightness, forKey: .savedKeyboardBrightness)
         try c.encodeIfPresent(displayRestoredUnderLowPower, forKey: .displayRestoredUnderLowPower)
         try c.encode(appNapOverrides, forKey: .appNapOverrides)
+        try c.encodeIfPresent(sleepOffAttempt, forKey: .sleepOffAttempt)
     }
 }

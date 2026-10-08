@@ -404,6 +404,7 @@ final class ReconcileTests: XCTestCase {
             sleepGuard: real.guardFake,
             processControl: real.procs,
             backstop: real.backstop,
+            receipts: real.receipts,
             notifier: real.notifier,
             clamshell: { false },
             clock: { Date() }

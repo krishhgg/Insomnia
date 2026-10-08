@@ -176,6 +176,9 @@ final class SessionManager {
     private let sleepGuard: any SleepGuarding
     private let processControl: any ProcessSignaling
     private let backstop: any BackstopScheduling
+    /// The root-owned record of what the command behind a start's password
+    /// dialog did, read to settle a start the journal still records.
+    private let receipts: SleepOffReceipts
     private let audio: any AudioControlling
     private let display: any DisplayDimming
     private let keyboard: any KeyboardBacklighting
@@ -312,6 +315,11 @@ final class SessionManager {
     /// is refused and the end is retried. Cleared by the next reconcile, and
     /// by a start, whose own session.json replaces it.
     @ObservationIgnored private var keptSessionFile: KeptSessionFile?
+    /// Set when a session.json beside a pending-start marker that no
+    /// journaled start accounts for could not be removed
+    /// (dropSessionOfUnrecordedMarker): reconcile ends that session rather
+    /// than resume it.
+    @ObservationIgnored private var unrecordedMarkerSession = false
     /// What the one-time lid-close update changed at init, posted by the
     /// launch reconcile (`announceLidCloseUpdate`). Settings shows the same
     /// change (`Config.lidCloseDefaultsNotice`) for a user who has
@@ -330,6 +338,7 @@ final class SessionManager {
         sleepGuard: any SleepGuarding,
         processControl: any ProcessSignaling,
         backstop: any BackstopScheduling,
+        receipts: SleepOffReceipts,
         audio: any AudioControlling = NoopAudioControl(),
         display: any DisplayDimming = NoopDisplayDimmer(),
         keyboard: any KeyboardBacklighting = NoopKeyboardBacklight(),
@@ -348,6 +357,7 @@ final class SessionManager {
         self.sleepGuard = sleepGuard
         self.processControl = processControl
         self.backstop = backstop
+        self.receipts = receipts
         self.audio = audio
         self.display = display
         self.keyboard = keyboard
@@ -426,6 +436,7 @@ final class SessionManager {
             sleepGuard: PmsetSleepGuard(),
             processControl: processControl,
             backstop: LaunchdBackstop(paths: paths),
+            receipts: .live,
             audio: audio,
             display: display,
             keyboard: keyboard,
@@ -523,11 +534,18 @@ final class SessionManager {
             // One that cannot be removed does not stop the transaction:
             // restores still run, and `markerProblem` holds back only the
             // clearing of the sleep entry and any new start.
-            await self.clearPendingStart()
+            let clearing = await self.clearPendingStart()
             do {
                 try self.loadJournal()
             } catch {
                 return .failure(.journalUnreadable(self.refuseForUnreadableJournal(what, error)))
+            }
+            if case let .cleared(file) = clearing {
+                if self.state.sleepOffAttempt != nil {
+                    self.settleSleepOffAttempt(removed: file)
+                } else if file != nil {
+                    self.dropSessionOfUnrecordedMarker()
+                }
             }
             self.writeOwedEdits()
             let before = self.unfinishedCommand
@@ -622,7 +640,7 @@ final class SessionManager {
     private func confirmUndo(_ undo: PendingUndo, by command: UnfinishedCommand) {
         let clear: (inout RuntimeState) -> Void
         switch undo {
-        case .sleepRestored: clear = { $0.sleepDisabledByUs = false }
+        case .sleepRestored: clear = { $0.sleepDisabledByUs = false; $0.sleepOffAttempt = nil }
         case .lowPowerOff: clear = { $0.lowPowerSetByUs = false }
         }
         do {
@@ -922,6 +940,15 @@ final class SessionManager {
             notifier.post(title: Self.endTitle(.startFailed, had: false), body: "Nothing was changed: \(text)")
             return
         }
+        if state.sleepOffAttempt != nil {
+            // An earlier start the journal still records could not be
+            // settled: the journal could not be updated with what its
+            // receipt shows. A new start would replace that record.
+            let text = "an earlier start is still recorded in the journal, which could not be updated with what its receipt shows. Every run tries again"
+            fail("start refused, nothing changed: \(text)")
+            notifier.post(title: Self.endTitle(.startFailed, had: false), body: "Nothing was changed: \(text).")
+            return
+        }
         do {
             // Only a backstop.sh that deletes the marker can void the
             // dialog below if this process dies under it.
@@ -929,6 +956,18 @@ final class SessionManager {
         } catch {
             fail("start refused, nothing changed: \(error.localizedDescription)")
             notifier.post(title: Self.endTitle(.startFailed, had: false), body: "Nothing was changed: \(error.localizedDescription).")
+            return
+        }
+        let receipt: String
+        do {
+            // The record the root command keeps of what it did. Without a
+            // safe one, nothing could show later that a failed or abandoned
+            // start never turned sleep off.
+            receipt = try receipts.identity()
+        } catch {
+            let text = "the receipt \(receipts.file) that shows whether a start turned sleep off is missing or unsafe (\(error.localizedDescription)). Run scripts/install.sh again"
+            fail("start refused, nothing changed: \(text)")
+            notifier.post(title: Self.endTitle(.startFailed, had: false), body: "Nothing was changed: \(text).")
             return
         }
         do {
@@ -964,10 +1003,25 @@ final class SessionManager {
             return
         }
 
+        // The command the dialog runs as root turns sleep off only while the
+        // pending-start marker holds this attempt's nonce (see below), and
+        // is given the session's end, after which it refuses. It reads
+        // `pmset -g` again as root, since another tool may turn sleep off
+        // while the password is typed, unless the journal owned a 1 before
+        // this start, for which Start's own read was skipped too.
+        let pending = PendingStart(marker: store.paths.pendingStartFile, nonce: UUID().uuidString, deadline: new.endsAt, sleepOffIsOurs: journalBefore.sleepDisabledByUs)
+        var attempt = SleepOffAttempt(nonce: pending.nonce, owedBefore: journalBefore.sleepDisabledByUs, receipt: receipt, deadline: pending.deadlineSeconds, marker: nil)
         do {
+            // The journal first, with the attempt: a crash before
+            // session.json is written leaves a record whose settlement
+            // finds no dialog and puts the entry back, and a crash after it
+            // leaves one that also removes this session.json.
+            try journal {
+                $0.sleepDisabledByUs = true
+                $0.sleepOffAttempt = attempt
+            }
             try store.saveSession(new)
             keptSessionFile = nil
-            try journal { $0.sleepDisabledByUs = true }
         } catch {
             fail("could not write session: \(error.localizedDescription)")
             rollBackStart(journal: journalBefore, session: sessionBefore)
@@ -995,12 +1049,10 @@ final class SessionManager {
         // every outcome, before this transaction lets go of the lock, and
         // by whoever takes the lock next if this process dies first, so a
         // dialog answered after its start was abandoned changes nothing.
-        // The command is also given the session's end and refuses after
-        // it, so a password typed too late changes nothing either. It reads
-        // `pmset -g` again as root, since another tool may turn sleep off
-        // while the password is typed, unless the journal owned a 1 before
-        // this start, for which Start's own read was skipped too.
-        let pending = PendingStart(marker: store.paths.pendingStartFile, nonce: UUID().uuidString, deadline: new.endsAt, sleepOffIsOurs: journalBefore.sleepDisabledByUs)
+        // Its identity goes in the journal before the dialog: a marker
+        // that is not this file when it goes may have been replaced while
+        // a command for this start held it, and then the receipt is not
+        // trusted.
         let markerFile: FileIdentity
         do {
             markerFile = try store.savePendingStart(pending.nonce)
@@ -1009,6 +1061,16 @@ final class SessionManager {
             await clearPendingStart()
             rollBackStart(journal: journalBefore, session: sessionBefore)
             fail("could not write the pending-start marker: \(error.localizedDescription)")
+            return
+        }
+        attempt.marker = markerFile.text
+        do {
+            try journal { $0.sleepOffAttempt = attempt }
+        } catch {
+            // No dialog was shown.
+            await clearPendingStart()
+            rollBackStart(journal: journalBefore, session: sessionBefore)
+            fail("could not journal the pending-start marker: \(error.localizedDescription)")
             return
         }
 
@@ -1028,24 +1090,20 @@ final class SessionManager {
             // that still comes cannot turn sleep off. Only the file this
             // start wrote counts: one put in its place may have been
             // swapped in after the command locked the original.
-            let cleared = await clearPendingStart(expecting: markerFile, start: (pending.nonce, markerFile))
+            let cleared = await clearPendingStart(expecting: markerFile)
             let alive = prompt.osascriptAlive
             if cleared != .kept {
                 // The command behind the dialog now finds no marker and
                 // changes nothing, whenever it runs, so nothing here waits
                 // for it: the start is rolled back now and the recovery
                 // lock goes with this transaction. The leftover process is
-                // reported, and watched on its own until it exits. A marker
-                // that still held only the nonce means no command for this
-                // start reached the sleep setting, so there is nothing to
-                // undo; otherwise the start is undone like an end.
+                // reported, and watched on its own until it exits. A receipt
+                // that shows no command for this start turned sleep off
+                // leaves nothing to undo; otherwise the start is undone like
+                // an end.
                 reportStuckPrompt(prompt, grace: grace, osascriptAlive: alive, voided: true)
                 watchVoidedPrompt(prompt, grace: grace)
-                if cleared == .untouched {
-                    rollBackUntouchedStart(journal: journalBefore, session: sessionBefore, error: AdministratorPromptError.stillRunning(prompt, grace: grace).localizedDescription)
-                } else {
-                    _ = await performEnd(reason: .startFailed)
-                }
+                await endFailedStart(attempt, clearing: cleared, journal: journalBefore, session: sessionBefore, error: AdministratorPromptError.stillRunning(prompt, grace: grace).localizedDescription)
                 return
             }
             // A root command already past its check holds the marker's
@@ -1066,15 +1124,11 @@ final class SessionManager {
             }
             await prompt.waitUntilExit()
             // The command that held the marker's lock has exited with the
-            // prompt, so the marker can go before the undo reads the result.
+            // prompt, so the marker can go before the receipt is read.
             let text = "\(prompt) did not finish in time and has now exited; rolling the start back"
-            if await clearPendingStart(start: (pending.nonce, markerFile)) == .untouched {
-                fail("could not disable sleep: \(text)")
-                rollBackUntouchedStart(journal: journalBefore, session: sessionBefore, error: text)
-                return
-            }
+            let clearing = await clearPendingStart()
             fail("could not disable sleep: \(text)")
-            _ = await performEnd(reason: .startFailed)
+            await endFailedStart(attempt, clearing: clearing, journal: journalBefore, session: sessionBefore, error: text)
             return
         } catch let error as AdministratorPromptError where error.nothingToUndo {
             // Cancelled, osascript never started, or the root command
@@ -1096,17 +1150,23 @@ final class SessionManager {
         } catch {
             // A wrong password, a signal, a timeout, a pmset failure: the
             // status cannot say whether root's write came first, but the
-            // marker can. The prompt has exited, so no command holds it.
-            let untouched = await clearPendingStart(start: (pending.nonce, markerFile)) == .untouched
+            // receipt can. The prompt has exited, so no command holds the
+            // marker.
+            let clearing = await clearPendingStart()
             fail("could not disable sleep: \(error.localizedDescription)")
-            if untouched {
-                rollBackUntouchedStart(journal: journalBefore, session: sessionBefore, error: error.localizedDescription)
-            } else {
-                _ = await performEnd(reason: .startFailed)
-            }
+            await endFailedStart(attempt, clearing: clearing, journal: journalBefore, session: sessionBefore, error: error.localizedDescription)
             return
         }
         await clearPendingStart()
+        do {
+            // Sleep is off and journaled as ours; the record of the attempt
+            // has nothing left to show. Left in place, the next transaction
+            // finds the marker gone and keeps the sleep entry, which is
+            // already set.
+            try journal { $0.sleepOffAttempt = nil }
+        } catch {
+            Log.error("could not clear the start's record from the journal: \(error.localizedDescription); the next run settles it and keeps the sleep entry")
+        }
         guard endTicket == ticket else {
             // Sleep is disabled and journaled as ours. The end that was
             // requested runs next and restores from that journal; the session
@@ -1501,7 +1561,10 @@ final class SessionManager {
                     Log.error("sleep restored, but its journal entry is kept")
                     fail(Self.markerProblemText(problem))
                 } else {
-                    clearUndone("sleep restored") { $0.sleepDisabledByUs = false }
+                    // The marker went before this restore, so no command
+                    // for a start the journal still records can turn sleep
+                    // off after it: the record goes with the entry.
+                    clearUndone("sleep restored") { $0.sleepDisabledByUs = false; $0.sleepOffAttempt = nil }
                 }
             } catch let still as CommandStillRunningError {
                 stopTransaction(for: still, thenEnd: nil, undoes: .sleepRestored)
@@ -2147,6 +2210,21 @@ final class SessionManager {
             onDisk = nil
         }
 
+        if let s = onDisk, !s.isExpired(at: now), state.sleepOffAttempt != nil || unrecordedMarkerSession {
+            // A start the journal still records could not be settled: its
+            // marker is still there (a command behind its dialog may still
+            // be running) or the journal could not be updated. Or the
+            // session.json beside a marker no journaled start accounts for
+            // could not be removed. Whether that start turned sleep off is
+            // unknown, so a SleepDisabled 1 now may be someone else's, and
+            // the session it wrote is never resumed on it. It ends like any
+            // session: sleep is restored, and the entry and the record go
+            // with that restore only once the marker is gone (restoreAll).
+            unrecordedMarkerSession = false
+            Log.info("reconcile: session.json until \(iso(s.endsAt)) belongs to a start that is not settled; ending it instead of resuming it")
+            _ = await performEnd(reason: .startFailed)
+            return
+        }
         if let s = onDisk, !s.isExpired(at: now) {
             // Step 2: valid session. Arm first, then check that sleep is
             // still off, then journal. Any failure ends the session rather
@@ -2562,14 +2640,9 @@ final class SessionManager {
     enum MarkerClearing: Equatable {
         /// The marker is still there (see clearPendingStart).
         case kept
-        /// The marker is gone.
-        case cleared
-        /// The marker is gone, and what was deleted is the file the start
-        /// wrote, still holding only its nonce: the command behind its
-        /// dialog never wrote its record, so it never read or wrote the
-        /// sleep setting, and with the marker gone it never will
-        /// (`RemovedMarker.isUntouched`).
-        case untouched
+        /// The marker is gone. `file` is the file that was locked and
+        /// deleted; nil when there was nothing, or a link to nothing.
+        case cleared(file: FileIdentity?)
     }
 
     /// Locks, then deletes the pending-start marker (see PendingStart and
@@ -2580,9 +2653,8 @@ final class SessionManager {
     /// its place), or, with `expecting`, the file at the path is not the
     /// one this start wrote. The failure is logged and shown in the menu,
     /// and every later transaction, backstop run and uninstall tries again.
-    /// `.untouched` only for `start`, the nonce and file a start wrote.
     @discardableResult
-    private func clearPendingStart(expecting written: FileIdentity? = nil, start: (nonce: String, file: FileIdentity)? = nil) async -> MarkerClearing {
+    private func clearPendingStart(expecting written: FileIdentity? = nil) async -> MarkerClearing {
         let removed: RemovedMarker?
         do {
             removed = try await store.removePendingStart(timeout: markerLockTimeout, expecting: written)
@@ -2598,20 +2670,114 @@ final class SessionManager {
             fail(Self.markerProblemText(error.localizedDescription))
             return .kept
         }
-        if let start, let removed, removed.isUntouched(written: start.file, nonce: start.nonce) {
-            Log.info("the pending-start marker still held only its nonce: the command behind the dialog never reached the sleep setting")
-            return .untouched
-        }
-        return .cleared
+        return .cleared(file: removed?.file)
     }
 
-    /// Ends a start whose dialog failed in a way that could have come after
-    /// root's write, but whose marker was `.untouched`: like a refusal, the
-    /// journal and session.json go back as they were and no pmset runs, so
-    /// a SleepDisabled 1 another tool set while the dialog was up stays.
-    private func rollBackUntouchedStart(journal before: RuntimeState, session previous: Session?, error: String) {
-        rollBackStart(journal: before, session: previous)
-        notifier.post(title: Self.endTitle(.startFailed, had: false), body: "No session was started, and Insomnia undid anything it changed: \(error). The command behind the password dialog never reached the sleep setting.")
+    /// What the receipt shows about `attempt`, once the marker is gone under
+    /// its lock and `removed` is the file that went. A start that never
+    /// journaled its marker never showed its dialog. A marker that is not
+    /// the file the start wrote may have been deleted or replaced without
+    /// the lock while a command for that start held the original, and that
+    /// command may still write, so the receipt is not read.
+    private func attemptVerdict(_ attempt: SleepOffAttempt, removed: FileIdentity?) -> SleepOffVerdict {
+        guard let marker = attempt.marker else { return .neverWrote }
+        guard removed?.text == marker else {
+            return .mayHaveWritten("the pending-start marker that went is not the file that start wrote")
+        }
+        return receipts.verdict(for: attempt)
+    }
+
+    /// Settles the start the journal still records (`sleepOffAttempt`) once
+    /// its marker is gone under the marker's lock: this process crashed or
+    /// was force-quit while the start ran, and neither backstop.sh nor
+    /// uninstall.sh has settled it since. That start never finished, so its
+    /// session never began: with no session in memory, session.json goes
+    /// if it is that start's (its end is the start's deadline), whatever the
+    /// receipt shows, and so is never resumed because a SleepDisabled 1
+    /// someone else set reads as still off. A receipt that shows no command
+    /// for it turned sleep off puts back the sleep entry from before the
+    /// start, which keeps any restore an earlier session still owes.
+    /// Anything else keeps the sleep entry, and the restore runs like any
+    /// other. A removal or write that fails leaves the record: reconcile
+    /// ends an unexpired session rather than resume it, starts are refused,
+    /// and the next transaction tries again, then with the marker already
+    /// gone, which reads as "may have turned sleep off".
+    private func settleSleepOffAttempt(removed: FileIdentity?) {
+        guard let attempt = state.sleepOffAttempt else { return }
+        let verdict = attemptVerdict(attempt, removed: removed)
+        if session == nil, let s = try? store.loadSession(), Int(s.endsAt.timeIntervalSince1970.rounded(.down)) == attempt.deadline {
+            do {
+                try store.deleteSession()
+                Log.info("removed session.json of a start that never finished")
+            } catch {
+                fail("could not remove session.json of an earlier start that never finished: \(error.localizedDescription). Its session is ended rather than resumed, starts are refused, and every run tries again")
+                return
+            }
+        }
+        var settled = state
+        settled.sleepOffAttempt = nil
+        switch verdict {
+        case .neverWrote:
+            settled.sleepDisabledByUs = attempt.owedBefore
+            Log.info("settled an earlier start: its receipt shows the command behind its dialog never turned sleep off; the sleep entry is back to \(attempt.owedBefore ? "owed by an earlier session" : "clear")")
+        case let .mayHaveWritten(reason):
+            settled.sleepDisabledByUs = true
+            Log.info("settled an earlier start as one that may have turned sleep off (\(reason)); the sleep entry stays")
+        }
+        do {
+            try persistState(settled)
+        } catch {
+            fail("could not settle an earlier start in the journal: \(error.localizedDescription). Its session is ended rather than resumed, starts are refused, and every run tries again")
+        }
+    }
+
+    /// A pending-start marker went that no journaled start accounts for:
+    /// one left by a build from before `sleepOffAttempt`, or by a start
+    /// that finished or rolled back but could not delete it. Whether a
+    /// command behind its dialog turned sleep off is unknown, so with no
+    /// session in memory, session.json beside it is never resumed: it goes.
+    /// A sleep entry still journaled is restored like any other, and a
+    /// SleepDisabled 1 the journal does not own is left alone. A session
+    /// that had started and lost its marker only to a failed delete ends
+    /// early here, which is the safe side. A removal that fails makes
+    /// reconcile end that session rather than resume it.
+    private func dropSessionOfUnrecordedMarker() {
+        guard session == nil, let s = try? store.loadSession() else { return }
+        do {
+            try store.deleteSession()
+            Log.info("removed session.json until \(iso(s.endsAt)): it was beside a pending-start marker that no journaled start accounts for, so it is never resumed")
+        } catch {
+            unrecordedMarkerSession = true
+            fail("could not remove session.json beside a pending-start marker that no journaled start accounts for: \(error.localizedDescription). Its session is ended rather than resumed")
+        }
+    }
+
+    /// Ends a start whose dialog failed in a way its status cannot vouch
+    /// for (a lost answer, a signal, a timeout, a prompt that would not
+    /// stop), after `clearing` the marker. A receipt that shows no command
+    /// for it turned sleep off rolls it back like a refusal: the journal and
+    /// session.json go back as they were and no pmset runs, so a
+    /// SleepDisabled 1 another tool set while the dialog was up stays.
+    /// Anything else, a marker that is still there included, is undone
+    /// like an end; with the marker still there, the record stays for the
+    /// next transaction to settle.
+    private func endFailedStart(_ attempt: SleepOffAttempt, clearing: MarkerClearing, journal before: RuntimeState, session previous: Session?, error: String) async {
+        if case let .cleared(file) = clearing {
+            switch attemptVerdict(attempt, removed: file) {
+            case .neverWrote:
+                rollBackStart(journal: before, session: previous)
+                notifier.post(title: Self.endTitle(.startFailed, had: false), body: "No session was started, and Insomnia undid anything it changed: \(error). The receipt shows that the command behind the password dialog never turned sleep off.")
+                return
+            case let .mayHaveWritten(reason):
+                Log.info("the failed start is undone like an end: \(reason)")
+                do {
+                    try journal { $0.sleepOffAttempt = nil }
+                } catch {
+                    Log.error("could not clear the start's record from the journal: \(error.localizedDescription); the end below clears it with the sleep entry")
+                }
+            }
+        }
+        _ = await performEnd(reason: .startFailed)
     }
 
     /// The menu's error line goes away after a success, except for a

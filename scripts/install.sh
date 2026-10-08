@@ -1,10 +1,12 @@
 #!/bin/bash
 # Install Insomnia: put Insomnia.app (with backstop.sh sealed inside it) in
 # ~/Applications, install the LaunchAgent that verifies the bundle and runs
-# that script, and write the three-line sudoers rule. Idempotent; asks for
-# sudo once (for /etc/sudoers.d/insomnia), before a running Insomnia is asked
+# that script, write the three-line sudoers rule, and create the root-owned
+# receipt folder and this user's receipt in /private/var/db/com.kgarg.insomnia
+# (kept if already there and safe). Idempotent; asks for sudo once (for
+# /etc/sudoers.d/insomnia and the receipt), before a running Insomnia is asked
 # to quit and before anything of a previous install is touched. The rule, the
-# bundle and the LaunchAgent are replaced under the recovery lock; the bundle
+# receipt, the bundle and the LaunchAgent are set up under the recovery lock; the bundle
 # and the LaunchAgent together, in one step (the agent pins one build, so the
 # two must match at every moment), and a run that stops after that step began
 # puts the previous bundle back. Not atomic beyond that: a failure after the
@@ -67,6 +69,8 @@ MKDIR=/bin/mkdir
 CHMOD=/bin/chmod
 CAT=/bin/cat
 INSTALL=/usr/bin/install
+STAT=/usr/bin/stat
+LS=/bin/ls
 # sudo is given visudo and install by full path. Given a bare name, it would
 # search the caller's PATH and run whatever it finds there as root.
 VISUDO=/usr/sbin/visudo
@@ -97,6 +101,13 @@ LABEL="com.insomnia.backstop"
 PLIST="$LAUNCH_AGENTS/$LABEL.plist"
 SUDOERS=/etc/sudoers.d/insomnia
 UID_NUM="$(id -u)"
+# The folder of the root-owned receipts (SleepOffReceipts.swift) and the one
+# owner besides root it may have: none, as uid 0 is root. Tests patch both
+# lines in a private copy, for a folder in their temporary directory.
+RECEIPTS=/private/var/db/com.kgarg.insomnia
+RECEIPT_OWNER=0
+RECEIPT="$RECEIPTS/$UID_NUM"
+TMP_RECEIPT=""
 # Where the new bundle is assembled and signed (step 3) and where the previous
 # one waits during the swap (step 6). Both inside $APP_DIR, so the swap is two
 # renames on one filesystem. The staging directory's name carries the PID of
@@ -320,6 +331,7 @@ cleanup() {
   local rc=$?
   if (( rc != 0 && RULE_AHEAD_OF_BUNDLE )); then rule_ahead_note; fi
   if [[ -n "$TMP_SUDOERS" ]]; then "$RM" -f "$TMP_SUDOERS"; fi
+  if [[ -n "$TMP_RECEIPT" ]]; then "$RM" -f "$TMP_RECEIPT"; fi
   if [[ -n "$CANDIDATE" ]]; then "$RM" -f "$CANDIDATE"; fi
   if [[ -n "$CANDIDATE_DIR" ]]; then "$RMDIR" "$CANDIDATE_DIR" 2>/dev/null || true; fi
   if [[ -n "$STAGE" ]]; then "$RM" -rf "$STAGE"; fi
@@ -695,6 +707,107 @@ touched; the new build was discarded.
 FAIL
   exit 1
 fi
+
+# The receipt: /private/var/db/com.kgarg.insomnia/<uid>, root's, 0644, one
+# link, 45 bytes (SleepOffReceipts.swift). The command behind a Start's
+# password dialog writes it as root before it turns sleep off, and the app,
+# backstop.sh and uninstall.sh read it to tell whether a start that never
+# finished did. Root writes only under folders nobody but root can change,
+# so every folder from the receipt's up to / is checked first, by lstat (a
+# link fails), and again at the end. Nothing here changes the owner or mode
+# of something already there: a folder or file that is not as this script
+# makes it stops the install, to be removed by hand. A receipt that is
+# already as this script makes it stays as it is, since it may record a
+# start the recovery below still has to settle.
+# Prints why the folders from $1 up to / are not safe for root to write
+# under, or nothing.
+folders_problem() { # folder
+  local p="$1" listing
+  local paths=()
+  while [[ -n "$p" ]]; do paths+=("$p"); p="${p%/*}"; done
+  paths+=(/)
+  listing="$("$STAT" -f '%u %Lp %l %z %HT' "${paths[@]}" 2>/dev/null)" || listing=""
+  if ! printf '%s\n' "$listing" | /usr/bin/awk -v o="$RECEIPT_OWNER" -v n="${#paths[@]}" '{ k = (NR == 1 || k) && NF == 5 && $5 == "Directory" && ($1 == 0 || $1 == o) && $2 !~ /[2367].?$/ }; END { exit !(k && NR == n) }'; then
+    echo "$1 or a folder above it is missing, is not a folder, or is not root's alone (owner or group or other write permission)"
+    return 0
+  fi
+  listing="$("$LS" -lde "${paths[@]}" 2>/dev/null)" || listing=""
+  if [[ -z "$listing" ]] || ! printf '%s\n' "$listing" | /usr/bin/awk '$1 ~ /^[0-9]+:$/ && / allow / { f = 1 }; END { exit f }'; then
+    echo "$1 or a folder above it has an access control entry that allows changes, or could not be listed"
+  fi
+}
+# Prints why $RECEIPT is not as this script makes it, or nothing.
+receipt_problem() {
+  local listing
+  listing="$("$STAT" -f '%u %Lp %l %z %HT' "$RECEIPT" 2>/dev/null)" || listing=""
+  if ! printf '%s\n' "$listing" | /usr/bin/awk -v o="$RECEIPT_OWNER" '{ k = NR == 1 && NF == 6 && $5 == "Regular" && $6 == "File" && $3 == 1 && $4 == 45 && ($1 == 0 || $1 == o) && $2 !~ /[2367].?$/ }; END { exit !(k && NR == 1) }'; then
+    echo "$RECEIPT is not a regular file of root's with one link and 45 bytes that only root can change"
+    return 0
+  fi
+  listing="$("$LS" -le "$RECEIPT" 2>/dev/null)" || listing=""
+  if [[ -z "$listing" ]] || ! printf '%s\n' "$listing" | /usr/bin/awk '$1 ~ /^[0-9]+:$/ && / allow / { f = 1 }; END { exit f }'; then
+    echo "$RECEIPT has an access control entry that allows changes, or could not be listed"
+  fi
+}
+receipt_stop() { # problem
+  cat >&2 <<FAIL
+
+Install stopped: $1. Insomnia does not change
+the owner or mode of anything it did not make. Remove it by hand
+(sudo rm -f $RECEIPT, or sudo rmdir $RECEIPTS once empty) and rerun this script.
+Installed so far: $SUDOERS. The app at $APP and the LaunchAgent were not touched;
+the new build was discarded.
+FAIL
+  exit 1
+}
+receipt_sudo_failed() { # what rc
+  cat >&2 <<FAIL
+
+Install stopped: '$1' exited $2, perhaps because sudo wanted a password again
+(the credential step 2 cached may have expired). Rerun this script.
+Installed so far: $SUDOERS. The app at $APP and the LaunchAgent were not touched;
+the new build was discarded.
+FAIL
+  exit 1
+}
+step "Creating the receipt $RECEIPT"
+problem="$(folders_problem "${RECEIPTS%/*}")"
+[[ -z "$problem" ]] || receipt_stop "$problem"
+if [[ ! -e "$RECEIPTS" && ! -L "$RECEIPTS" ]]; then
+  mkdir_rc=0
+  bounded "$SUDO" -n "$MKDIR" -m 0755 "$RECEIPTS" || mkdir_rc=$?
+  if (( mkdir_rc == 124 || mkdir_rc == 125 )); then
+    echo >&2
+    sudo_stalled_note "$mkdir_rc" "Install stopped: 'sudo mkdir $RECEIPTS'"
+    echo "Installed so far: $SUDOERS. The app at $APP and the LaunchAgent were not touched; the new build was discarded." >&2
+    exit 1
+  elif (( mkdir_rc != 0 )); then
+    if [[ -n "$BOUNDED_OUTPUT" ]]; then printf '%s\n' "$BOUNDED_OUTPUT" >&2; fi
+    receipt_sudo_failed "sudo mkdir $RECEIPTS" "$mkdir_rc"
+  fi
+fi
+problem="$(folders_problem "$RECEIPTS")"
+[[ -z "$problem" ]] || receipt_stop "$problem"
+if [[ ! -e "$RECEIPT" && ! -L "$RECEIPT" ]]; then
+  TMP_RECEIPT="$("$MKTEMP")"
+  printf '00000000-0000-0000-0000-000000000000 refused\n' > "$TMP_RECEIPT"
+  receipt_rc=0
+  bounded "$SUDO" -n "$INSTALL" -m 0644 -o root -g wheel "$TMP_RECEIPT" "$RECEIPT" || receipt_rc=$?
+  if (( receipt_rc == 124 || receipt_rc == 125 )); then
+    echo >&2
+    sudo_stalled_note "$receipt_rc" "Install stopped: 'sudo install', which writes $RECEIPT,"
+    echo "Installed so far: $SUDOERS. The app at $APP and the LaunchAgent were not touched; the new build was discarded." >&2
+    exit 1
+  elif (( receipt_rc != 0 )); then
+    if [[ -n "$BOUNDED_OUTPUT" ]]; then printf '%s\n' "$BOUNDED_OUTPUT" >&2; fi
+    receipt_sudo_failed "sudo install $RECEIPT" "$receipt_rc"
+  fi
+fi
+problem="$(receipt_problem)"
+[[ -z "$problem" ]] || receipt_stop "$problem"
+problem="$(folders_problem "$RECEIPTS")"
+[[ -z "$problem" ]] || receipt_stop "$problem"
+echo "receipt $RECEIPT is root's and only root can change it or the folders above it"
 
 # Leftovers of earlier runs are handled only here, under the lock. Step 6
 # runs under it too, so no other install is between setting the previous

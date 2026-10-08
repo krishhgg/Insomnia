@@ -75,6 +75,44 @@ final class TempHome {
     }
 }
 
+/// Receipts for tests (SleepOffReceipts): a `receipts` folder in the real
+/// path of `parent`, so lstat meets no link on the way up (the temporary
+/// directory is under /var, a link to /private/var), 0755, holding this
+/// user's receipt with install.sh's initial content, 0644. The test user
+/// owns both, so the receipts trust that uid besides root;
+/// `SleepOffReceipts.live` trusts root alone. `parent` is set to 0755 too,
+/// whatever the umask: it is the test's own directory.
+enum TestReceipts {
+    static func make(in parent: URL) throws -> SleepOffReceipts {
+        guard let resolved = realpath(parent.path, nil) else { throw POSIXError(.ENOENT) }
+        let real = String(cString: resolved)
+        free(resolved)
+        XCTAssertEqual(chmod(real, 0o755), 0)
+        let folder = real + "/receipts"
+        if mkdir(folder, 0o755) != 0 { XCTAssertEqual(errno, EEXIST) }
+        XCTAssertEqual(chmod(folder, 0o755), 0)
+        let receipts = SleepOffReceipts(folder: folder, owners: [0, getuid()], user: getuid())
+        if !FileManager.default.fileExists(atPath: receipts.file) {
+            try Data(SleepOffReceipts.initialContent.utf8).write(to: URL(fileURLWithPath: receipts.file))
+        }
+        XCTAssertEqual(chmod(receipts.file, 0o644), 0)
+        return receipts
+    }
+
+    /// The receipt's bytes as text; nil when it cannot be read.
+    static func text(_ receipts: SleepOffReceipts) -> String? {
+        try? String(contentsOf: URL(fileURLWithPath: receipts.file), encoding: .utf8)
+    }
+
+    /// Writes `<nonce> <word>` and a newline over the receipt in place, as
+    /// the root command's `dd conv=notrunc` does: the file keeps its inode.
+    static func write(_ file: String, nonce: String, word: String) {
+        guard let handle = FileHandle(forWritingAtPath: file) else { return }
+        defer { try? handle.close() }
+        try? handle.write(contentsOf: Data("\(nonce) \(word)\n".utf8))
+    }
+}
+
 /// The administrator password dialog as a fake. Answers at once in
 /// `.succeed`, `.cancel`, `.fail` and `.launchFail` (osascript could not
 /// be started); in `.hang` it waits on `gate` like a
@@ -84,12 +122,13 @@ final class TempHome {
 /// with `markExited()`. `.succeed` keeps the root command's rules, in its
 /// order: exit 3 unless the marker holds the nonce, 4 at or after the
 /// deadline, 5 with `restoreNeedsPassword` (sudo's answers are read before
-/// pmset), then the record (`PendingStart.receipt`) over the nonce, and 6
-/// while `sleepOffNow` reads a 1 the start does not own, which puts the
-/// bare nonce back. `.fail`, `.hang` and `.stuck` leave the marker alone
-/// unless `wroteRecord` says the command got that far. `onShow` runs when
-/// the dialog is shown, before the mode's answer. Never shows anything and
-/// never runs pmset.
+/// pmset), 7 when there is no `receiptFile`, 6 while `sleepOffNow` reads a
+/// 1 the start does not own, all with nothing written, and then
+/// `<nonce> writing` over the receipt. `.fail`, `.hang` and `.stuck` leave
+/// the receipt alone unless `wroteRecord` says the command got that far.
+/// None of them ever writes the marker, as the root command never does.
+/// `onShow` runs when the dialog is shown, before the mode's answer. Never
+/// shows anything and never runs pmset.
 final class FakeAdministratorPrompt: AdministratorPromptRunning, @unchecked Sendable {
     enum Mode { case succeed, cancel, fail, launchFail, hang, stuck }
 
@@ -106,6 +145,7 @@ final class FakeAdministratorPrompt: AdministratorPromptRunning, @unchecked Send
     private var _restoreNeedsPassword = false
     private var _sleepOffNow: @Sendable () -> Bool = { false }
     private var _wroteRecord = false
+    private var _receiptFile: String?
     /// Opened by the test to end a `.hang`.
     let gate = AsyncGate()
 
@@ -147,20 +187,33 @@ final class FakeAdministratorPrompt: AdministratorPromptRunning, @unchecked Send
     }
 
     /// The command behind a `.fail`, `.hang` or `.stuck` dialog got past
-    /// its checks and wrote its record before that answer, as one that
-    /// failed in pmset or was killed after the record would.
+    /// its checks and wrote `<nonce> writing` to the receipt before that
+    /// answer, as one that failed in pmset or was killed after the receipt
+    /// would.
     var wroteRecord: Bool {
         get { lock.withLock { _wroteRecord } }
         set { lock.withLock { _wroteRecord = newValue } }
     }
 
-    /// Writes over the marker in place, as the root command's `printf >`
-    /// does, so the file stays the one the start wrote.
+    /// The receipt the root command writes (Harness.receipts); nil for a
+    /// Mac where install.sh never made one.
+    var receiptFile: String? {
+        get { lock.withLock { _receiptFile } }
+        set { lock.withLock { _receiptFile = newValue } }
+    }
+
+    /// Writes over the marker in place, as a process running as the user
+    /// can, so the file stays the one the start wrote.
     static func overwrite(_ marker: URL, with text: String) {
         guard let handle = try? FileHandle(forWritingTo: marker) else { return }
         defer { try? handle.close() }
         try? handle.truncate(atOffset: 0)
         try? handle.write(contentsOf: Data(text.utf8))
+    }
+
+    /// The root command's write before pmset: `<nonce> writing`.
+    func writeRecord(_ start: PendingStart) {
+        if let file = receiptFile { TestReceipts.write(file, nonce: start.nonce, word: "writing") }
     }
 
     func disableSleep(_ start: PendingStart) async throws {
@@ -182,28 +235,30 @@ final class FakeAdministratorPrompt: AdministratorPromptRunning, @unchecked Send
             guard !restoreNeedsPassword else {
                 throw AdministratorPromptError.restoreNeedsPassword(stderr: "execution error: sudo: a password is required\rsudo -k -n -l did not list this user's sudoers rules without a password; sleep was not turned off (5)")
             }
-            Self.overwrite(start.marker, with: start.receipt)
+            guard let file = receiptFile, FileManager.default.fileExists(atPath: file) else {
+                throw AdministratorPromptError.refused(rootStatus: 7, stderr: "execution error: the receipt is missing, or not the file install.sh made; sleep was not turned off (7)")
+            }
             guard start.sleepOffIsOurs || !sleepOffNow() else {
-                Self.overwrite(start.marker, with: start.nonce)
                 throw AdministratorPromptError.refused(rootStatus: 6, stderr: "execution error: pmset -g shows a SleepDisabled 1 this start did not set, or could not be read; it was left alone and sleep was not turned off (6)")
             }
+            writeRecord(start)
             return
         case .cancel:
             throw AdministratorPromptError.cancelled
         case .fail:
             if wroteRecord {
-                Self.overwrite(start.marker, with: start.receipt)
+                writeRecord(start)
                 throw AdministratorPromptError.failed(status: 1, stderr: "execution error: pmset: could not set the value (1)")
             }
             throw AdministratorPromptError.failed(status: 1, stderr: "execution error: The administrator user name or password was incorrect.")
         case .launchFail:
             throw AdministratorPromptError.launchFailed("The file osascript does not exist.")
         case .hang:
-            if wroteRecord { Self.overwrite(start.marker, with: start.receipt) }
+            if wroteRecord { writeRecord(start) }
             await gate.wait()
             throw AdministratorPromptError.timedOut(seconds: AdministratorPrompt.timeout)
         case .stuck:
-            if wroteRecord { Self.overwrite(start.marker, with: start.receipt) }
+            if wroteRecord { writeRecord(start) }
             let handle = UnfinishedPrompt(pid: Self.stuckPid, osascriptAlive: true)
             lock.withLock { _unfinished = handle }
             throw AdministratorPromptError.stillRunning(handle, grace: AdministratorPrompt.stopGrace)
@@ -393,8 +448,8 @@ final class FakeSleepGuard: SleepGuarding, @unchecked Sendable {
     func disableSleep(_ start: PendingStart) async throws {
         if throwOn.contains("disablesleep 1") {
             // pmset itself failed, so the root command had got past its
-            // checks and written its record.
-            FakeAdministratorPrompt.overwrite(start.marker, with: start.receipt)
+            // checks and written the receipt.
+            prompt.writeRecord(start)
         }
         try record("disablesleep 1")
         try await prompt.disableSleep(start)
@@ -980,9 +1035,12 @@ struct Harness {
     let notifier: RecordingNotifier
     let clamshell: FakeClamshell
     let processes: FakeProcessTable
+    /// This user's receipt, in the temporary home (TestReceipts).
+    let receipts: SleepOffReceipts
 
     init(now: Date = Date(timeIntervalSince1970: 1_800_000_000)) {
         home = TempHome()
+        receipts = try! TestReceipts.make(in: home.root)
         guardFake = FakeSleepGuard()
         procs = FakeProcessControl()
         backstop = FakeBackstop()
@@ -997,6 +1055,7 @@ struct Harness {
         processes = FakeProcessTable()
         let c = clock
         guardFake.prompt.now = { c.now }
+        guardFake.prompt.receiptFile = receipts.file
     }
 
     /// `lockTimeout` is short so contention tests fail closed quickly;
@@ -1010,7 +1069,8 @@ struct Harness {
         retryDelay: TimeInterval = 60,
         markerLockTimeout: TimeInterval = 0.3,
         reassertDelay: Duration = .seconds(3600),
-        sleepGuard: (any SleepGuarding)? = nil
+        sleepGuard: (any SleepGuarding)? = nil,
+        receipts: SleepOffReceipts? = nil
     ) -> SessionManager {
         let c = clock
         let lid = clamshell
@@ -1020,6 +1080,7 @@ struct Harness {
             sleepGuard: sleepGuard ?? guardFake,
             processControl: procs,
             backstop: backstop,
+            receipts: receipts ?? self.receipts,
             audio: audio,
             display: display,
             keyboard: keyboard,
@@ -1506,6 +1567,12 @@ func appleScriptQuotedForm(_ s: String) -> String {
 /// /private/etc/sudo.conf and /private/etc/pam.d/sudo are files in `dir`
 /// instead: `sudoConf` (none unless given) and `pamSudo` (macOS's own
 /// unless given; nil for none). The fake sudo reads the same sudo.conf.
+/// The receipt is `receipts`' (TestReceipts in the real path of `dir`
+/// unless given): the command names that folder in place of
+/// /private/var/db/com.kgarg.insomnia and trusts this user's uid besides
+/// root (`-v o=` in its awk check), unless `trustTestUser` is false: then
+/// it keeps production's check, root alone. With `receiptWriteFails`,
+/// /bin/dd is a fake that writes nothing and fails.
 ///
 /// Calls are named by signature: `sudo <arguments>` for a sudo of the
 /// user's (`versionQuery`, `listQuery`, `ruleQuery`) and `pmset
@@ -1549,8 +1616,13 @@ final class RootCommandProcess {
     private let fakeSudo: URL
     private let fakeEnv: URL
     private let sleepState: URL
+    /// The receipt the command writes.
+    let receipts: SleepOffReceipts
 
-    init(marker: URL, nonce: String, deadline: String? = nil, uid: String? = nil, policy: RootSudoPolicy = .rule, command: String = AdministratorPrompt.rootCommand, clock: RootCommandClock? = nil, sleepDisabled: String = "0", owned: String = "0", pmsetOutput: String? = nil, foreignAfter: String? = nil, foreignSets: String = "1", writeFails: Bool = false, outputClosed: Bool = false, sudoConf: String? = nil, pamSudo: String? = SudoFormat.macPamSudo, in dir: URL, holdAt: String? = nil) throws {
+    init(marker: URL, nonce: String, deadline: String? = nil, uid: String? = nil, policy: RootSudoPolicy = .rule, command: String = AdministratorPrompt.rootCommand, clock: RootCommandClock? = nil, sleepDisabled: String = "0", owned: String = "0", pmsetOutput: String? = nil, foreignAfter: String? = nil, foreignSets: String = "1", writeFails: Bool = false, outputClosed: Bool = false, sudoConf: String? = nil, pamSudo: String? = SudoFormat.macPamSudo, receipts: SleepOffReceipts? = nil, receiptWriteFails: Bool = false, trustTestUser: Bool = true, in dir: URL, holdAt: String? = nil) throws {
+        let receipts = try receipts ?? TestReceipts.make(in: dir)
+        self.receipts = receipts
+        let fakeDd = dir.appendingPathComponent("fake-dd")
         let fake = dir.appendingPathComponent("fake-pmset")
         let conf = dir.appendingPathComponent("fake-sudo.conf")
         let pam = dir.appendingPathComponent("fake-pam.d-sudo")
@@ -1626,7 +1698,8 @@ final class RootCommandProcess {
             /bin/cat "$FAKE_CLOCK_FILE"
             """.write(to: fakeDate, atomically: true, encoding: .utf8)
         }
-        var executables = [fake, sudo, env]
+        try "#!/bin/bash\n/bin/cat >/dev/null\nexit 1\n".write(to: fakeDd, atomically: true, encoding: .utf8)
+        var executables = [fake, sudo, env, fakeDd]
         if clock != nil { executables.append(fakeDate) }
         for url in executables {
             try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
@@ -1646,8 +1719,13 @@ final class RootCommandProcess {
         XCTAssertEqual(command.components(separatedBy: realSudo).count - 1, 2, "root's sudo to the user, and the user's sudo, by absolute path")
         XCTAssertEqual(command.components(separatedBy: realEnv).count - 1, 1, "the env that empties the user's sudo's environment, by absolute path")
         XCTAssertFalse(fake.path.contains(" ") || sudo.path.contains(" ") || env.path.contains(" "), "the fakes replace unquoted words")
-        let faked = Self.withPrivateConfiguration(command, sudoConf: conf, pamSudo: pam)
+        var faked = Self.withPrivateConfiguration(command, sudoConf: conf, pamSudo: pam)
             .replacingOccurrences(of: realPmset, with: fake.path).replacingOccurrences(of: realSudo, with: sudo.path).replacingOccurrences(of: realEnv, with: env.path)
+        faked = Self.withTestReceipts(faked, receipts, trustTestUser: trustTestUser)
+        if receiptWriteFails {
+            XCTAssertFalse(fakeDd.path.contains(" "), "the fake replaces an unquoted word")
+            faked = faked.replacingOccurrences(of: Self.realDd, with: fakeDd.path)
+        }
         let line = AdministratorPrompt.markerLock + " " + appleScriptQuotedForm(marker.path)
             + " /bin/sh -c " + appleScriptQuotedForm(faked)
             + " insomnia " + appleScriptQuotedForm(marker.path) + " " + appleScriptQuotedForm(nonce)
@@ -1689,6 +1767,21 @@ final class RootCommandProcess {
     /// The configuration files the command reads, by the paths it names.
     static let sudoConfPath = "/private/etc/sudo.conf"
     static let pamSudoPath = "/private/etc/pam.d/sudo"
+    /// The one tool the command writes the receipt with.
+    static let realDd = "/bin/dd "
+
+    /// `command` writing and checking the receipt in `receipts.folder`, and
+    /// with `trustTestUser`, trusting the test user's uid besides root's
+    /// there. Each of the three appears once in the command, and the folder
+    /// has no space in it.
+    static func withTestReceipts(_ command: String, _ receipts: SleepOffReceipts, trustTestUser: Bool = true) -> String {
+        XCTAssertEqual(command.components(separatedBy: SleepOffReceipts.folder).count - 1, 1, "the command names the receipt folder once")
+        XCTAssertEqual(command.components(separatedBy: "-v o=0 ").count - 1, 1, "the command's awk check trusts one owner besides root, uid 0, given once")
+        XCTAssertEqual(command.components(separatedBy: realDd).count - 1, 1, "the command writes the receipt with /bin/dd, once")
+        XCTAssertFalse(receipts.folder.contains(" "), "the fixture replaces an unquoted word")
+        return command.replacingOccurrences(of: SleepOffReceipts.folder, with: receipts.folder)
+            .replacingOccurrences(of: "-v o=0 ", with: trustTestUser ? "-v o=\(getuid()) " : "-v o=0 ")
+    }
 
     /// `command` reading `sudoConf` and `pamSudo` in place of the
     /// system's files, each of which it names once.
@@ -1793,8 +1886,8 @@ func waitUntilLockfWaits(under pid: pid_t) -> Bool {
 }
 
 /// Runs the root command to the end (see RootCommandProcess).
-func runRootCommand(marker: URL, nonce: String, deadline: String? = nil, uid: String? = nil, policy: RootSudoPolicy = .rule, command: String = AdministratorPrompt.rootCommand, clock: RootCommandClock? = nil, sleepDisabled: String = "0", owned: String = "0", pmsetOutput: String? = nil, foreignAfter: String? = nil, foreignSets: String = "1", sudoConf: String? = nil, pamSudo: String? = SudoFormat.macPamSudo, in dir: URL) throws -> RootCommandRun {
-    try RootCommandProcess(marker: marker, nonce: nonce, deadline: deadline, uid: uid, policy: policy, command: command, clock: clock, sleepDisabled: sleepDisabled, owned: owned, pmsetOutput: pmsetOutput, foreignAfter: foreignAfter, foreignSets: foreignSets, sudoConf: sudoConf, pamSudo: pamSudo, in: dir).wait()
+func runRootCommand(marker: URL, nonce: String, deadline: String? = nil, uid: String? = nil, policy: RootSudoPolicy = .rule, command: String = AdministratorPrompt.rootCommand, clock: RootCommandClock? = nil, sleepDisabled: String = "0", owned: String = "0", pmsetOutput: String? = nil, foreignAfter: String? = nil, foreignSets: String = "1", sudoConf: String? = nil, pamSudo: String? = SudoFormat.macPamSudo, receipts: SleepOffReceipts? = nil, receiptWriteFails: Bool = false, trustTestUser: Bool = true, in dir: URL) throws -> RootCommandRun {
+    try RootCommandProcess(marker: marker, nonce: nonce, deadline: deadline, uid: uid, policy: policy, command: command, clock: clock, sleepDisabled: sleepDisabled, owned: owned, pmsetOutput: pmsetOutput, foreignAfter: foreignAfter, foreignSets: foreignSets, sudoConf: sudoConf, pamSudo: pamSudo, receipts: receipts, receiptWriteFails: receiptWriteFails, trustTestUser: trustTestUser, in: dir).wait()
 }
 
 /// One fake Mac behind a Start driven end to end through the real
@@ -1821,8 +1914,11 @@ func runRootCommand(marker: URL, nonce: String, deadline: String? = nil, uid: St
 /// The root command reads `sudoConf` (none unless set) and `pamSudo`
 /// (macOS's own unless set) in place of /private/etc/sudo.conf and
 /// /private/etc/pam.d/sudo, and the fake sudo reads the same sudo.conf.
+/// It writes `receipts` (TestReceipts in the real path of `dir` unless
+/// given; RootCommandProcess.withTestReceipts).
 final class FakeDialogMachine {
     let dir: URL
+    let receipts: SleepOffReceipts
     let osascript: URL
     let sudo: URL
     let pmset: URL
@@ -1834,15 +1930,17 @@ final class FakeDialogMachine {
     private let sudoLog: URL
     private let envLog: URL
     private let scriptLog: URL
+    private let nonceLog: URL
     private let foreignDialog: URL
     private let foreignAt: URL
     private let interruptFile: URL
     private let confFile: URL
     private let pamFile: URL
 
-    init(in dir: URL, clockStart: Int, clockLater: Int, clockAt: String = RootCommandProcess.ruleQuery) throws {
+    init(in dir: URL, clockStart: Int, clockLater: Int, clockAt: String = RootCommandProcess.ruleQuery, receipts: SleepOffReceipts? = nil) throws {
         self.dir = dir
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        self.receipts = try receipts ?? TestReceipts.make(in: dir)
         XCTAssertFalse(dir.path.contains(" "), "the fakes replace unquoted words in the root command")
         osascript = dir.appendingPathComponent("osascript")
         sudo = dir.appendingPathComponent("sudo")
@@ -1855,6 +1953,7 @@ final class FakeDialogMachine {
         sudoLog = dir.appendingPathComponent("sudo-calls")
         envLog = dir.appendingPathComponent("env-calls")
         scriptLog = dir.appendingPathComponent("osascript-script")
+        nonceLog = dir.appendingPathComponent("osascript-nonce")
         foreignDialog = dir.appendingPathComponent("foreign-during-dialog")
         foreignAt = dir.appendingPathComponent("foreign-at")
         interruptFile = dir.appendingPathComponent("interrupt-at")
@@ -1919,6 +2018,7 @@ final class FakeDialogMachine {
         #!/bin/bash
         [[ "$1" == -e && $# -eq 7 ]] || { echo "fake osascript: unexpected arguments" >&2; exit 2; }
         printf '%s' "$2" > '\(scriptLog.path)'
+        printf '%s' "$4" > '\(nonceLog.path)'
         shift 2
         if [[ -e '\(foreignDialog.path)' ]]; then rm -f '\(foreignDialog.path)'; printf 1 > '\(state.path)'; fi
         err="$(FAKE_SUDO_AS=0 \(AdministratorPrompt.markerLock) "$1" /bin/sh -c "$(cat '\(rootCommand.path)')" insomnia "$@" 2>&1 >/dev/null & printf '%s' $! > '\(lockfPid.path)'; wait $!)"
@@ -1930,7 +2030,7 @@ final class FakeDialogMachine {
         for url in [osascript, sudo, pmset, env, date] {
             try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
         }
-        let embedded = RootCommandProcess.withPrivateConfiguration(try appleScriptEmbeddedRootCommand(), sudoConf: confFile, pamSudo: pamFile)
+        let embedded = RootCommandProcess.withTestReceipts(RootCommandProcess.withPrivateConfiguration(try appleScriptEmbeddedRootCommand(), sudoConf: confFile, pamSudo: pamFile), self.receipts)
             .replacingOccurrences(of: "/usr/bin/pmset", with: pmset.path)
             .replacingOccurrences(of: "/usr/bin/sudo", with: sudo.path)
             .replacingOccurrences(of: "/usr/bin/env", with: env.path)
@@ -1999,6 +2099,9 @@ final class FakeDialogMachine {
 
     /// The script the fake osascript was last given.
     var script: String? { try? String(contentsOf: scriptLog, encoding: .utf8) }
+
+    /// The nonce the fake osascript was last given.
+    var nonce: String? { try? String(contentsOf: nonceLog, encoding: .utf8) }
 
     /// Arguments of each pmset call, by the app and by the root command.
     func pmsetCalls() -> [String] { Self.lines(pmsetLog) }

@@ -6,7 +6,8 @@
 # copy older installs left in Application Support; from anywhere else, such
 # as a release zip: the sealed copy only), verifies for itself that the
 # journal is clean, and only then removes the LaunchAgent, the sudoers rule,
-# the app bundle (backstop.sh included), and the journal. Keeps config.json
+# this user's receipt in /private/var/db/com.kgarg.insomnia (and the folder,
+# once empty), the app bundle (backstop.sh included), and the journal. Keeps config.json
 # and the logs unless --purge. Everything after the quit happens while this
 # process holds APP_SUPPORT/.recovery.lock, so neither a queued periodic
 # backstop nor a relaunched app can republish the journal while it is being
@@ -71,7 +72,7 @@ LOCKF=/usr/bin/lockf
 RM=/bin/rm
 DEFAULTS=/usr/bin/defaults
 KILL=/bin/kill
-# sudo is given test and rm by full path. Given a bare name, it would search
+# sudo is given test, rm and rmdir by full path. Given a bare name, it would search
 # the caller's PATH and run whatever it finds there as root.
 TEST=/bin/test
 STAT=/usr/bin/stat
@@ -79,6 +80,14 @@ DATE=/bin/date
 MKDIR=/bin/mkdir
 RMDIR=/bin/rmdir
 MKTEMP=/usr/bin/mktemp
+CP=/bin/cp
+MV=/bin/mv
+LS=/bin/ls
+# The folder of the root-owned receipts install.sh made
+# (SleepOffReceipts.swift), and the one owner besides root it may have:
+# none, as uid 0 is root. Tests patch both lines in a private copy.
+RECEIPTS=/private/var/db/com.kgarg.insomnia
+RECEIPT_OWNER=0
 LOCK_TIMEOUT_SECONDS=10
 # How long to wait for the root command behind a password dialog to let go
 # of the pending-start marker.
@@ -89,7 +98,7 @@ QUIT_WAIT_SECONDS=10
 # launchctl, codesign) may run before it is stopped with SIGTERM, then
 # SIGKILL. A call made under the recovery lock keeps the lock until it has
 # exited or been stopped, even if this run is killed first (see bounded()).
-# backstop.sh bounds its own commands; the two sudo calls
+# backstop.sh bounds its own commands; the sudo calls of step 5
 # prompt for a password and are left to sudo's own prompt timeout.
 CALL_TIMEOUT_SECONDS=30
 APP="$HOME/Applications/Insomnia.app"
@@ -329,6 +338,19 @@ journal_shape_problems() { # file
       done
     fi
   fi
+  t="$(type_of "$f" sleepOffAttempt)"
+  if [[ -n "$t" && "$t" != "(any)" ]]; then
+    if [[ "$t" != dictionary ]]; then
+      echo "sleepOffAttempt is a $t, not an object"
+    else
+      [[ "$(type_of "$f" sleepOffAttempt.nonce)" == string ]] || echo "sleepOffAttempt.nonce is not a string"
+      [[ "$(type_of "$f" sleepOffAttempt.owedBefore)" == bool ]] || echo "sleepOffAttempt.owedBefore is not a bool"
+      [[ "$(type_of "$f" sleepOffAttempt.receipt)" == string ]] || echo "sleepOffAttempt.receipt is not a string"
+      [[ "$(type_of "$f" sleepOffAttempt.deadline)" == integer ]] || echo "sleepOffAttempt.deadline is not an integer"
+      t="$(type_of "$f" sleepOffAttempt.marker)"
+      [[ -z "$t" || "$t" == string || "$t" == "(any)" ]] || echo "sleepOffAttempt.marker is a $t, not a string"
+    fi
+  fi
 }
 
 # Same rules as backstop.sh: a date in the form Store.parseDate reads, and
@@ -428,6 +450,9 @@ journal_problems() {
     echo "state.json is malformed (unexpected shape):"
     echo "$shape"
     return 0
+  fi
+  if [[ "$(type_of "$STATE" sleepOffAttempt)" == dictionary ]]; then
+    echo "a start that never finished is still journaled (sleepOffAttempt), so whether it turned sleep off is not settled"
   fi
   for key in sleepDisabledByUs lowPowerSetByUs dockerFrozen; do
     if [[ "$(extract "$STATE" "$key" || true)" == "true" ]]; then
@@ -672,7 +697,9 @@ fi
 # link to nothing is removed: the root command cannot open it either.
 # Sets marker_rc: 0 deleted or gone, 75 still locked after
 # PENDING_LOCK_TIMEOUT_SECONDS, 3 replaced after the open, 4 not a regular
-# file, anything else from the open or rm.
+# file, anything else from the open or rm. Sets removed_marker to the
+# device:inode of the file it locked and deleted, for settle_attempt.
+removed_marker=""
 delete_pending_marker() {
   local locked
   marker_rc=0
@@ -690,7 +717,7 @@ delete_pending_marker() {
   if (( marker_rc == 0 )); then
     locked="$("$STAT" -f '%d:%i' <&8 2>/dev/null)" || locked=""
     if [[ -n "$locked" && "$locked" == "$("$STAT" -L -f '%d:%i' "$PENDING" 2>/dev/null)" ]]; then
-      "$RM" -f "$PENDING" 2>/dev/null || marker_rc=$?
+      if "$RM" -f "$PENDING" 2>/dev/null; then removed_marker="$locked"; else marker_rc=$?; fi
     else
       marker_rc=3
     fi
@@ -704,6 +731,144 @@ delete_pending_marker() {
 if [[ -e "$PENDING" || -L "$PENDING" ]]; then
   delete_pending_marker
 fi
+
+# A start journals sleepOffAttempt (RuntimeState.swift) together with
+# sleepDisabledByUs before its password dialog can run anything, and
+# removes it once it has finished or rolled back. One still here belongs to
+# a start that never finished: the app died under it. With its marker gone
+# under the marker's lock (above), no command for that start can write any
+# more, and the receipt shows whether one did (SleepOffReceipts.swift):
+#   - the attempt has no marker: no dialog was shown;
+#   - the marker deleted above is the one the attempt journaled, and the
+#     receipt is the file it was when the start began, still safe, and
+#     holds another start's nonce or this one's with "refused": no command
+#     for this start turned sleep off;
+#   - anything else may have, a marker this run did not delete included
+#     (deleted without the lock, the command could still have been running).
+# Either way session.json goes when its end is the attempt's deadline: its
+# start never finished, so that session is never resumed (a SleepDisabled 1
+# someone else set would read as still off). "Never" puts sleepDisabledByUs
+# back as it was before the start (owedBefore), which keeps a restore an
+# earlier session still owes; anything else sets it, and the undo below
+# runs. The journal is published as backstop.sh publishes it (copy, edit,
+# verify, rename). This script deletes the marker itself, before the
+# backstop runs, so it settles here, with the same rules as backstop.sh's
+# settle_attempt; the backstop then finds the start settled. A failure
+# stops the uninstall with nothing removed. Skipped while the marker is
+# still present, and for a journal that is missing, not a regular file or
+# malformed, which step 4 reports.
+
+# Prints "never" when the receipt shows that the command for the start with
+# nonce $1, begun when the receipt's device:inode was $2, never turned sleep
+# off, or else why it may have. Every check matches
+# SleepOffReceipts.swift and the root command (AdministratorPrompt.swift):
+# the receipt, its folder and each folder above up to /, by lstat, must be
+# root's (or RECEIPT_OWNER's), with no write permission for group or others
+# and no access control entry that allows anything; the receipt a regular
+# file with one link and 45 bytes, the rest folders.
+receipt_verdict() { # nonce identity
+  local f="$RECEIPTS/$UID_NUM" p="$RECEIPTS" listing content line
+  local paths=("$f")
+  while [[ -n "$p" ]]; do paths+=("$p"); p="${p%/*}"; done
+  paths+=(/)
+  listing="$("$STAT" -f '%u %Lp %l %z %HT' "${paths[@]}" 2>/dev/null)" || listing=""
+  if ! printf '%s\n' "$listing" | /usr/bin/awk -v o="$RECEIPT_OWNER" -v n="${#paths[@]}" 'NR == 1 { k = NF == 6 && $5 == "Regular" && $6 == "File" && $3 == 1 && $4 == 45 }; NR > 1 { k = k && NF == 5 && $5 == "Directory" }; { k = k && ($1 == 0 || $1 == o) && $2 !~ /[2367].?$/ }; END { exit !(k && NR == n) }'; then
+    echo "$f is missing, is not the 45-byte file install.sh made, or someone other than root can change it or a folder above it"
+    return 0
+  fi
+  listing="$("$LS" -lde "${paths[@]}" 2>/dev/null)" || listing=""
+  if [[ -z "$listing" ]] || ! printf '%s\n' "$listing" | /usr/bin/awk '$1 ~ /^[0-9]+:$/ && / allow / { f = 1 }; END { exit f }'; then
+    echo "$f or a folder above it has an access control entry that allows changes, or could not be listed"
+    return 0
+  fi
+  if [[ "$("$STAT" -f '%d:%i' "$f" 2>/dev/null)" != "$2" ]]; then
+    echo "$f is not the file it was when the start began"
+    return 0
+  fi
+  content="$(/usr/bin/head -c 46 "$f" 2>/dev/null; echo .)"
+  content="${content%.}"
+  line="${content%$'\n'}"
+  if (( ${#content} != 45 )) || [[ "$line" == "$content" ]] || ! [[ "$line" =~ ^([0-9A-F-]{36})\ (writing|refused)$ ]]; then
+    echo "$f does not hold a nonce and writing or refused"
+    return 0
+  fi
+  if [[ "${BASH_REMATCH[1]}" != "$1" || "${BASH_REMATCH[2]}" == refused ]]; then
+    echo never
+  else
+    echo "$f shows that the command went on to turn sleep off"
+  fi
+}
+
+# Prints why the folders from $1 up to / are not root's alone (the checks
+# above, for folders only), or nothing. Step 5 removes the receipt as root
+# only when this prints nothing for its folder.
+folders_problem() { # folder
+  local p="$1" listing
+  local paths=()
+  while [[ -n "$p" ]]; do paths+=("$p"); p="${p%/*}"; done
+  paths+=(/)
+  listing="$("$STAT" -f '%u %Lp %l %z %HT' "${paths[@]}" 2>/dev/null)" || listing=""
+  if ! printf '%s\n' "$listing" | /usr/bin/awk -v o="$RECEIPT_OWNER" -v n="${#paths[@]}" '{ k = (NR == 1 || k) && NF == 5 && $5 == "Directory" && ($1 == 0 || $1 == o) && $2 !~ /[2367].?$/ }; END { exit !(k && NR == n) }'; then
+    echo "$1 or a folder above it is not a folder, or is not root's alone"
+    return 0
+  fi
+  listing="$("$LS" -lde "${paths[@]}" 2>/dev/null)" || listing=""
+  if [[ -z "$listing" ]] || ! printf '%s\n' "$listing" | /usr/bin/awk '$1 ~ /^[0-9]+:$/ && / allow / { f = 1 }; END { exit f }'; then
+    echo "$1 or a folder above it has an access control entry that allows changes, or could not be listed"
+  fi
+}
+
+settle_attempt() {
+  local nonce owed receipt deadline verdict owes tmp
+  [[ ! -e "$PENDING" && ! -L "$PENDING" ]] || return 0
+  [[ -f "$STATE" ]] || return 0
+  [[ "$(type_of "$STATE" sleepOffAttempt)" == dictionary ]] || return 0
+  "$PLUTIL" -convert json -o /dev/null "$STATE" >/dev/null 2>&1 || return 0
+  [[ -z "$(journal_shape_problems "$STATE")" ]] || return 0
+  nonce="$(extract "$STATE" sleepOffAttempt.nonce || true)"
+  owed="$(extract "$STATE" sleepOffAttempt.owedBefore || true)"
+  receipt="$(extract "$STATE" sleepOffAttempt.receipt || true)"
+  deadline="$(extract "$STATE" sleepOffAttempt.deadline || true)"
+  if [[ "$(type_of "$STATE" sleepOffAttempt.marker)" != string ]]; then
+    verdict=never
+  elif [[ -z "$removed_marker" || "$removed_marker" != "$(extract "$STATE" sleepOffAttempt.marker || true)" ]]; then
+    verdict="the pending-start marker this run deleted is not the file that start wrote"
+  else
+    verdict="$(receipt_verdict "$nonce" "$receipt")"
+  fi
+  if [[ "$verdict" == never ]]; then
+    owes="$owed"
+    echo "settling an unfinished start: its receipt shows the command behind its dialog never turned sleep off; sleepDisabledByUs goes back to $owed"
+  else
+    owes=true
+    echo "settling an unfinished start as one that may have turned sleep off ($verdict); sleepDisabledByUs stays set"
+  fi
+  # Only a session.json this run can read as a session is matched; one it
+  # cannot read is treated as expired by the backstop, and the app never
+  # resumes it.
+  if [[ -f "$SESSION" ]] && cat "$SESSION" >/dev/null 2>&1 && [[ -z "$(session_shape_problems "$SESSION")" ]] \
+     && [[ "$(epoch_at "$SESSION" endsAt)" == "$deadline" ]]; then
+    if ! "$RM" -f "$SESSION"; then
+      echo "Could not remove $SESSION of the unfinished start. Nothing was removed; rerun." >&2
+      exit 1
+    fi
+    echo "removed $SESSION: its start never finished"
+  fi
+  tmp="$APP_SUPPORT/.state.json.uninstall.$$"
+  if "$CP" "$STATE" "$tmp" \
+     && "$PLUTIL" -remove sleepOffAttempt "$tmp" >/dev/null 2>&1 \
+     && "$PLUTIL" -replace sleepDisabledByUs -bool "$owes" "$tmp" >/dev/null 2>&1 \
+     && [[ "$("$PLUTIL" -convert json -o - "$tmp" 2>/dev/null | head -c 1)" == "{" ]] \
+     && [[ "$(head -c 1 "$tmp")" == "{" ]] \
+     && "$MV" -f "$tmp" "$STATE"; then
+    return 0
+  fi
+  "$RM" -f "$tmp"
+  echo "Could not publish the settled start to $STATE; the journal was kept. Nothing was removed; rerun." >&2
+  exit 1
+}
+
+settle_attempt
 
 # 3. Undo everything via a backstop that matches the installed app ----------
 # The backstop inherits fd 9 and shares this lock instead of waiting on it.
@@ -830,6 +995,41 @@ if [[ -d "$CANDIDATE_DIR" && ! -L "$CANDIDATE_DIR" ]]; then "$RMDIR" "$CANDIDATE
 step "Removing $SUDOERS (requires your password)"
 if [[ -e "$SUDOERS" ]] || "$SUDO" "$TEST" -e "$SUDOERS"; then
   "$SUDO" "$RM" -f "$SUDOERS"
+fi
+
+# The receipt install.sh made, and its folder once empty: other accounts on
+# this Mac keep theirs. Root removes them only while the folder and every
+# folder above it are root's alone, so no folder on the path given to rm can
+# be changed by anyone else. Step 4 found no unsettled start, and the marker
+# is gone, so nothing still needs the receipt. A receipt that is not a
+# regular file was not made by install.sh and is left.
+RECEIPT="$RECEIPTS/$UID_NUM"
+step "Removing the receipt $RECEIPT"
+if [[ ! -e "$RECEIPTS" && ! -L "$RECEIPTS" ]]; then
+  echo "no $RECEIPTS"
+else
+  receipt_folders="$(folders_problem "$RECEIPTS")"
+  if [[ -n "$receipt_folders" ]]; then
+    echo "Left $RECEIPTS and what is in it: $receipt_folders, so nothing in it is removed as root. Remove it by hand." >&2
+    remove_failures=$((remove_failures + 1))
+  elif [[ -L "$RECEIPT" ]] || { [[ -e "$RECEIPT" ]] && [[ ! -f "$RECEIPT" ]]; }; then
+    echo "Left $RECEIPT: it is not a regular file, so install.sh did not make it. Remove it by hand." >&2
+    remove_failures=$((remove_failures + 1))
+  else
+    if [[ -f "$RECEIPT" ]]; then
+      if "$SUDO" "$RM" -f "$RECEIPT"; then
+        echo "removed $RECEIPT"
+      else
+        echo "Could not remove $RECEIPT." >&2
+        remove_failures=$((remove_failures + 1))
+      fi
+    fi
+    if "$SUDO" "$RMDIR" "$RECEIPTS" 2>/dev/null; then
+      echo "removed $RECEIPTS"
+    else
+      echo "kept $RECEIPTS: it still holds another account's receipt, or could not be removed"
+    fi
+  fi
 fi
 
 step "Removing app bundle"

@@ -397,10 +397,15 @@ final class OsascriptAdministratorPromptTests: XCTestCase {
 final class RootCommandTests: XCTestCase {
     private var dir: URL!
 
+    /// The receipt the command writes: TestReceipts in `dir`, which every
+    /// run here uses unless it is given another.
+    private var receipts: SleepOffReceipts!
+
     override func setUpWithError() throws {
         dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("insomnia-root-command-tests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        receipts = try TestReceipts.make(in: dir)
     }
 
     override func tearDownWithError() throws {
@@ -410,6 +415,20 @@ final class RootCommandTests: XCTestCase {
     private var marker: URL { dir.appendingPathComponent("pending-start") }
     private var store: Store { Store(paths: Paths(root: dir)) }
     private var uid: String { String(getuid()) }
+
+    /// Nonces as the app makes them (`UUID().uuidString`). The command
+    /// takes only an uppercase UUID, since the receipt holds it.
+    private let nonce1 = "6F1C2B4A-0000-4000-8000-000000000001"
+    private let nonce2 = "6F1C2B4A-0000-4000-8000-000000000002"
+
+    /// The receipt's content: its 45 bytes as text.
+    private var receipt: String? { TestReceipts.text(receipts) }
+    private func line(_ nonce: String, _ word: String) -> String { "\(nonce) \(word)\n" }
+
+    /// Puts install.sh's content back in the receipt, in place.
+    private func resetReceipt() {
+        TestReceipts.write(receipts.file, nonce: "00000000-0000-0000-0000-000000000000", word: "refused")
+    }
 
     /// The three questions, in order, each as root's sudo to the user and
     /// as the user's own sudo it starts.
@@ -422,37 +441,24 @@ final class RootCommandTests: XCTestCase {
     /// its only write.
     private let allCalls = ["-g", "-a disablesleep 1"]
 
-    /// Root's sudo to the user that writes `content` over the marker, as
-    /// the fake sudo logs it.
-    private func markerWrite(_ content: String, marker: URL? = nil) -> String {
-        "-n -u #\(uid) /usr/bin/env " + markerWriteCommand(content, marker: marker)
-    }
-
-    /// The same, as the fake env logs it.
-    private func markerWriteCommand(_ content: String, marker: URL? = nil) -> String {
-        "-i LC_ALL=C /bin/sh -c printf %s \"$2\" > \"$1\" put \((marker ?? self.marker).path) \(content)"
-    }
-
-    /// Every sudo call of a command that gets past the questions: those,
-    /// then the record over the nonce.
-    private var throughTheRecord: [String] { queries + [markerWrite("nonce-1 writing")] }
-
-    /// The same, then the bare nonce put back by a refusal after the record.
-    private var refusedAfterTheRecord: [String] { throughTheRecord + [markerWrite("nonce-1")] }
+    /// Every sudo call of a command that gets past the questions: only
+    /// those. Root writes the receipt itself, and nothing writes the marker.
+    private var throughTheRecord: [String] { queries }
 
     /// With the rule in effect, root asks the user's sudo three questions
     /// (through `sudo -u`, then `env -i LC_ALL=C`), reads sleep on, and
     /// turns it off. Nothing else runs pmset.
     func testTurnsSleepOffOnceSudoConfirmsThePasswordlessRestore() throws {
-        try Data("nonce-1".utf8).write(to: marker)
-        let r = try runRootCommand(marker: marker, nonce: "nonce-1", in: dir)
+        try Data(nonce1.utf8).write(to: marker)
+        let r = try runRootCommand(marker: marker, nonce: nonce1, receipts: receipts, in: dir)
         XCTAssertEqual(r.status, 0, r.stderr)
         XCTAssertEqual(r.sudoCalls, throughTheRecord)
-        XCTAssertEqual(r.envCalls, ["-V", "-k -n -l", "-k -n -ll /usr/bin/pmset -a disablesleep 0"].map { "-i LC_ALL=C /usr/bin/sudo " + $0 } + [markerWriteCommand("nonce-1 writing")])
+        XCTAssertEqual(r.envCalls, ["-V", "-k -n -l", "-k -n -ll /usr/bin/pmset -a disablesleep 0"].map { "-i LC_ALL=C /usr/bin/sudo " + $0 })
         XCTAssertEqual(r.pmsetCalls, allCalls)
         XCTAssertEqual(r.pmsetAs, ["root", "root"])
         XCTAssertEqual(r.sleepDisabled, "1")
-        XCTAssertEqual(try String(contentsOf: marker, encoding: .utf8), "nonce-1 writing", "lockf -k leaves the file, holding the record")
+        XCTAssertEqual(try String(contentsOf: marker, encoding: .utf8), nonce1, "lockf -k leaves the file, and nothing writes it")
+        XCTAssertEqual(receipt, line(nonce1, "writing"), "the receipt records the start before its write")
     }
 
     /// Round 17 R1: the check used to run the restore, after root had
@@ -464,8 +470,8 @@ final class RootCommandTests: XCTestCase {
         XCTAssertEqual(RootCommandProcess.ruleQuery, "sudo -k -n -ll " + endLine)
         XCTAssertTrue(AdministratorPrompt.rootCommand.contains("r=$(q -k -n -ll \(endLine))"))
         XCTAssertTrue(AdministratorPrompt.rootCommand.contains("BEGIN { c = \"\(endLine)\" }"))
-        try Data("nonce-1".utf8).write(to: marker)
-        let r = try runRootCommand(marker: marker, nonce: "nonce-1", in: dir)
+        try Data(nonce1.utf8).write(to: marker)
+        let r = try runRootCommand(marker: marker, nonce: nonce1, receipts: receipts, in: dir)
         XCTAssertEqual(r.status, 0, r.stderr)
         XCTAssertEqual(r.sudoCalls.filter { !$0.hasPrefix("-n -u ") }, ["-V", "-k -n -l", "-k -n -ll " + endLine], "each of the user's sudo calls lists or prints a version; none runs a command")
         XCTAssertEqual(r.pmsetAs, ["root", "root"], "no pmset runs as the user")
@@ -492,8 +498,8 @@ final class RootCommandTests: XCTestCase {
         XCTAssertEqual(Set(stops.keys).union([.rule, .etcPath]), Set(RootSudoPolicy.allCases), "every policy is covered")
         for (policy, stop) in stops.sorted(by: { $0.key.rawValue < $1.key.rawValue }) {
             for (name, command) in try bothCommands() {
-                try Data("nonce-1".utf8).write(to: marker)
-                let r = try runRootCommand(marker: marker, nonce: "nonce-1", policy: policy, command: command, in: dir)
+                try Data(nonce1.utf8).write(to: marker)
+                let r = try runRootCommand(marker: marker, nonce: nonce1, policy: policy, command: command, receipts: receipts, in: dir)
                 let label = "\(policy) \(name)"
                 XCTAssertEqual(r.status, 5, "\(label): \(r.stderr)")
                 XCTAssertEqual(r.sudoCalls, Array(queries.prefix(stop.calls)), label)
@@ -522,8 +528,8 @@ final class RootCommandTests: XCTestCase {
         ]
         for (what, conf) in confs {
             for (name, command) in try bothCommands() {
-                try Data("nonce-1".utf8).write(to: marker)
-                let r = try runRootCommand(marker: marker, nonce: "nonce-1", command: command, sudoConf: conf, in: dir)
+                try Data(nonce1.utf8).write(to: marker)
+                let r = try runRootCommand(marker: marker, nonce: nonce1, command: command, sudoConf: conf, receipts: receipts, in: dir)
                 let label = "\(what), \(name)"
                 XCTAssertEqual(r.status, 5, "\(label): \(r.stderr)")
                 XCTAssertEqual(r.sudoCalls, [], label)
@@ -588,13 +594,13 @@ final class RootCommandTests: XCTestCase {
             "no session line": stock.replacingOccurrences(of: "session    required       pam_permit.so\n", with: ""),
         ]
         for (what, pam) in accepted {
-            try Data("nonce-1".utf8).write(to: marker)
-            let r = try runRootCommand(marker: marker, nonce: "nonce-1", pamSudo: pam, in: dir)
+            try Data(nonce1.utf8).write(to: marker)
+            let r = try runRootCommand(marker: marker, nonce: nonce1, pamSudo: pam, receipts: receipts, in: dir)
             XCTAssertEqual(r.status, 0, "\(what): \(r.stderr)")
         }
         for (what, pam) in refused {
-            try Data("nonce-1".utf8).write(to: marker)
-            let r = try runRootCommand(marker: marker, nonce: "nonce-1", pamSudo: pam, in: dir)
+            try Data(nonce1.utf8).write(to: marker)
+            let r = try runRootCommand(marker: marker, nonce: nonce1, pamSudo: pam, receipts: receipts, in: dir)
             XCTAssertEqual(r.status, 5, "\(what): \(r.stderr)")
             XCTAssertEqual(r.sudoCalls, [], what)
             XCTAssertEqual(r.pmsetCalls, [], what)
@@ -607,8 +613,8 @@ final class RootCommandTests: XCTestCase {
     /// `#includedir /etc/sudoers.d`. Either is the rule.
     func testTakesTheRuleUnderEitherNameOfItsFile() throws {
         for policy: RootSudoPolicy in [.rule, .etcPath] {
-            try Data("nonce-1".utf8).write(to: marker)
-            let r = try runRootCommand(marker: marker, nonce: "nonce-1", policy: policy, in: dir)
+            try Data(nonce1.utf8).write(to: marker)
+            let r = try runRootCommand(marker: marker, nonce: nonce1, policy: policy, receipts: receipts, in: dir)
             XCTAssertEqual(r.status, 0, "\(policy): \(r.stderr)")
             XCTAssertEqual(r.pmsetCalls, allCalls, "\(policy)")
         }
@@ -617,9 +623,9 @@ final class RootCommandTests: XCTestCase {
     /// The questions are about the user who pressed Start. Asked of
     /// another user, who has no sudoers lines, they fail.
     func testTheQueriesAreForTheUserTheyAreGiven() throws {
-        try Data("nonce-1".utf8).write(to: marker)
+        try Data(nonce1.utf8).write(to: marker)
         let other = String(getuid() + 1)
-        let r = try runRootCommand(marker: marker, nonce: "nonce-1", uid: other, in: dir)
+        let r = try runRootCommand(marker: marker, nonce: nonce1, uid: other, receipts: receipts, in: dir)
         XCTAssertEqual(r.status, 5, r.stderr)
         XCTAssertEqual(r.sudoCalls.first, "-n -u #\(other) /usr/bin/env -i LC_ALL=C /usr/bin/sudo -V")
         XCTAssertEqual(r.sudoCalls.count, 4, "anyone may see the version; that user's listing needs a password")
@@ -631,9 +637,9 @@ final class RootCommandTests: XCTestCase {
     /// or pmset runs: root (0) never needs a password, so asking about
     /// root would prove nothing.
     func testAnUnusableUidRefusesWithoutRunningSudo() throws {
-        try Data("nonce-1".utf8).write(to: marker)
+        try Data(nonce1.utf8).write(to: marker)
         for uid in ["", "0", "-1", "abc", "501x", "1e3", "99999999999999999999", "$(touch canary)"] {
-            let r = try runRootCommand(marker: marker, nonce: "nonce-1", uid: uid, in: dir)
+            let r = try runRootCommand(marker: marker, nonce: nonce1, uid: uid, receipts: receipts, in: dir)
             XCTAssertEqual(r.status, 5, "uid \(uid.debugDescription): \(r.stderr)")
             XCTAssertEqual(r.sudoCalls, [], "uid \(uid.debugDescription)")
             XCTAssertEqual(r.pmsetCalls, [], "uid \(uid.debugDescription)")
@@ -645,7 +651,7 @@ final class RootCommandTests: XCTestCase {
     /// Recovery (or the start itself) deleted the marker: lockf -n has
     /// nothing to open, and a late answer runs nothing.
     func testDoesNothingOnceTheMarkerIsGone() throws {
-        let r = try runRootCommand(marker: marker, nonce: "nonce-1", in: dir)
+        let r = try runRootCommand(marker: marker, nonce: nonce1, receipts: receipts, in: dir)
         XCTAssertEqual(r.status, 69, r.stderr)
         XCTAssertEqual(r.pmsetCalls, [])
         XCTAssertEqual(r.sudoCalls, [], "no question either")
@@ -654,18 +660,18 @@ final class RootCommandTests: XCTestCase {
 
     /// A dialog left from an older start cannot act for a newer one.
     func testDoesNothingWhenANewerStartOwnsTheMarker() throws {
-        try Data("nonce-2".utf8).write(to: marker)
-        let r = try runRootCommand(marker: marker, nonce: "nonce-1", in: dir)
+        try Data(nonce2.utf8).write(to: marker)
+        let r = try runRootCommand(marker: marker, nonce: nonce1, receipts: receipts, in: dir)
         XCTAssertEqual(r.status, 3)
         XCTAssertEqual(r.pmsetCalls, [])
         XCTAssertEqual(r.sudoCalls, [])
         XCTAssertTrue(r.stderr.contains("sleep was not turned off"), r.stderr)
-        XCTAssertEqual(try String(contentsOf: marker, encoding: .utf8), "nonce-2", "the newer start's marker is left alone")
+        XCTAssertEqual(try String(contentsOf: marker, encoding: .utf8), nonce2, "the newer start's marker is left alone")
     }
 
     func testAnEmptyNonceNeverMatches() throws {
         try Data().write(to: marker)
-        let r = try runRootCommand(marker: marker, nonce: "", in: dir)
+        let r = try runRootCommand(marker: marker, nonce: "", receipts: receipts, in: dir)
         XCTAssertEqual(r.status, 3)
         XCTAssertEqual(r.pmsetCalls, [])
     }
@@ -673,10 +679,10 @@ final class RootCommandTests: XCTestCase {
     /// A password accepted at or after the session's end asks nothing and
     /// turns nothing off, even though the marker still holds the nonce.
     func testDoesNothingOnceTheSessionHasEnded() throws {
-        try Data("nonce-1".utf8).write(to: marker)
+        try Data(nonce1.utf8).write(to: marker)
         let now = Int(Date().timeIntervalSince1970)
         for deadline in [now - 1, now, now - 86_400] {
-            let r = try runRootCommand(marker: marker, nonce: "nonce-1", deadline: String(deadline), in: dir)
+            let r = try runRootCommand(marker: marker, nonce: nonce1, deadline: String(deadline), receipts: receipts, in: dir)
             XCTAssertEqual(r.status, 4, "deadline \(deadline): \(r.stderr)")
             XCTAssertEqual(r.pmsetCalls, [], "deadline \(deadline)")
             XCTAssertEqual(r.sudoCalls, [], "deadline \(deadline)")
@@ -703,12 +709,13 @@ final class RootCommandTests: XCTestCase {
     /// `fakeDeadline` on a fake clock that reads `later` once the call `at`
     /// has answered.
     private func runOnFakeClock(at: String, later: Int, command: String? = nil, policy: RootSudoPolicy = .rule, sleepDisabled: String = "0", owned: String = "0", foreignAfter: String? = nil) throws -> RootCommandRun {
-        try Data("nonce-1".utf8).write(to: marker)
+        try Data(nonce1.utf8).write(to: marker)
+        resetReceipt()
         return try runRootCommand(
-            marker: marker, nonce: "nonce-1", deadline: String(fakeDeadline), policy: policy,
+            marker: marker, nonce: nonce1, deadline: String(fakeDeadline), policy: policy,
             command: command ?? appleScriptEmbeddedRootCommand(),
             clock: RootCommandClock(start: fakeDeadline - 100, later: later, at: at),
-            sleepDisabled: sleepDisabled, owned: owned, foreignAfter: foreignAfter, in: dir)
+            sleepDisabled: sleepDisabled, owned: owned, foreignAfter: foreignAfter, receipts: receipts, in: dir)
     }
 
     /// Control: whichever call takes the time, when it ends a second
@@ -738,8 +745,9 @@ final class RootCommandTests: XCTestCase {
                     let label = "\(at), \(later - fakeDeadline) s after the deadline, \(name)"
                     let r = try runOnFakeClock(at: at, later: later, command: command)
                     XCTAssertEqual(r.status, 4, "\(label): \(r.stderr)")
-                    XCTAssertEqual(r.sudoCalls, at == RootCommandProcess.read ? refusedAfterTheRecord : queries, label)
-                    XCTAssertEqual(try String(contentsOf: marker, encoding: .utf8), "nonce-1", "\(label): the marker holds the bare nonce again")
+                    XCTAssertEqual(r.sudoCalls, queries, label)
+                    XCTAssertEqual(try String(contentsOf: marker, encoding: .utf8), nonce1, "\(label): nothing writes the marker")
+                    XCTAssertEqual(receipt, at == RootCommandProcess.read ? line(nonce1, "refused") : SleepOffReceipts.initialContent, "\(label): a deadline after the receipt's write leaves this nonce refused")
                     XCTAssertEqual(r.pmsetCalls, at == RootCommandProcess.read ? ["-g"] : [], label)
                     XCTAssertEqual(r.sleepDisabled, "0", label)
                     let says = at == RootCommandProcess.read
@@ -773,9 +781,9 @@ final class RootCommandTests: XCTestCase {
     /// A deadline that is not a plain number fails the comparison, which
     /// refuses: a malformed one can never mean "no deadline".
     func testAnUnreadableDeadlineNeverPasses() throws {
-        try Data("nonce-1".utf8).write(to: marker)
+        try Data(nonce1.utf8).write(to: marker)
         for deadline in ["", "soon", "1e12", "0x2540BE3FF", "9999999999s", "99999999999999999999", "$(echo 9999999999)"] {
-            let r = try runRootCommand(marker: marker, nonce: "nonce-1", deadline: deadline, in: dir)
+            let r = try runRootCommand(marker: marker, nonce: nonce1, deadline: deadline, receipts: receipts, in: dir)
             XCTAssertEqual(r.status, 4, "deadline \(deadline.debugDescription): \(r.stderr)")
             XCTAssertEqual(r.pmsetCalls, [], "deadline \(deadline.debugDescription)")
         }
@@ -785,64 +793,191 @@ final class RootCommandTests: XCTestCase {
     /// pmset may have changed the setting before it failed, so the start
     /// undoes it like an end.
     func testAFailedWriteIsNotARefusal() throws {
-        try Data("nonce-1".utf8).write(to: marker)
-        let r = try RootCommandProcess(marker: marker, nonce: "nonce-1", writeFails: true, in: dir).wait()
+        try Data(nonce1.utf8).write(to: marker)
+        let r = try RootCommandProcess(marker: marker, nonce: nonce1, writeFails: true, receipts: receipts, in: dir).wait()
         XCTAssertEqual(r.status, 1, r.stderr)
         XCTAssertEqual(r.pmsetCalls, allCalls)
         XCTAssertFalse(OsascriptAdministratorPrompt.refusalStatuses.contains(r.status))
-        XCTAssertEqual(try String(contentsOf: marker, encoding: .utf8), "nonce-1 writing", "the record tells the start that the write may have run")
+        XCTAssertEqual(receipt, line(nonce1, "writing"), "the receipt tells the start that the write may have run")
+        XCTAssertEqual(try String(contentsOf: marker, encoding: .utf8), nonce1)
     }
 
-    // MARK: The record
+    // MARK: The receipt
 
-    /// Round 19 P1 (ownership). The command replaces the nonce with its
-    /// record only after every check, right before it reads and writes the
-    /// sleep setting, so the marker shows which side of that line a
-    /// failure came from. While sudo is asked it still holds the bare
-    /// nonce; from root's read on it holds the record.
-    func testTheMarkerTakesTheRecordOnlyAfterEveryCheck() throws {
-        for at in [RootCommandProcess.versionQuery, RootCommandProcess.listQuery, RootCommandProcess.ruleQuery] {
-            try Data("nonce-1".utf8).write(to: marker)
-            let command = try RootCommandProcess(marker: marker, nonce: "nonce-1", in: dir, holdAt: at)
+    /// Round 19 P1 (ownership), now in the receipt. The command writes its
+    /// record only after every check and root's read, right before the
+    /// last deadline check and the write, so the receipt shows which side
+    /// of that line a failure came from. While sudo is asked and while
+    /// root reads it still holds install.sh's content; from the write on it
+    /// holds this nonce with `writing`. The marker never changes.
+    func testTheReceiptTakesTheRecordOnlyAfterEveryCheckAndTheRead() throws {
+        for at in [RootCommandProcess.versionQuery, RootCommandProcess.listQuery, RootCommandProcess.ruleQuery, RootCommandProcess.read] {
+            try Data(nonce1.utf8).write(to: marker)
+            resetReceipt()
+            let command = try RootCommandProcess(marker: marker, nonce: nonce1, receipts: receipts, in: dir, holdAt: at)
             XCTAssertTrue(command.waitUntilPmsetRuns(), at)
-            XCTAssertEqual(try String(contentsOf: marker, encoding: .utf8), "nonce-1", "\(at): no record while sudo is asked")
+            XCTAssertEqual(receipt, SleepOffReceipts.initialContent, "\(at): no record before the read has answered")
             command.release()
             XCTAssertEqual(command.wait().status, 0, at)
+            XCTAssertEqual(receipt, line(nonce1, "writing"), at)
         }
-        for at in [RootCommandProcess.read, RootCommandProcess.write] {
-            try Data("nonce-1".utf8).write(to: marker)
-            let command = try RootCommandProcess(marker: marker, nonce: "nonce-1", in: dir, holdAt: at)
-            XCTAssertTrue(command.waitUntilPmsetRuns(), at)
-            XCTAssertEqual(try String(contentsOf: marker, encoding: .utf8), "nonce-1 writing", at)
-            command.release()
-            XCTAssertEqual(command.wait().status, 0, at)
-        }
+        try Data(nonce1.utf8).write(to: marker)
+        resetReceipt()
+        let command = try RootCommandProcess(marker: marker, nonce: nonce1, receipts: receipts, in: dir, holdAt: RootCommandProcess.write)
+        XCTAssertTrue(command.waitUntilPmsetRuns())
+        XCTAssertEqual(receipt, line(nonce1, "writing"), "published, synced and read back before pmset starts")
+        XCTAssertEqual(try String(contentsOf: marker, encoding: .utf8), nonce1)
+        command.release()
+        XCTAssertEqual(command.wait().status, 0)
     }
 
-    /// The record goes over the nonce in the file the start wrote, as the
-    /// user, not as root: the same file, so the app can tell it from a copy.
-    func testTheRecordIsWrittenInPlaceAsTheUser() throws {
-        let written = try store.savePendingStart("nonce-1")
-        let r = try runRootCommand(marker: marker, nonce: "nonce-1", in: dir)
+    /// The receipt is written in place by root itself, not through a sudo
+    /// to the user, with `dd conv=notrunc,fsync` and read back: the file
+    /// keeps its inode and its 45 bytes, so a reader can tell it from a
+    /// file put in its place. The marker the start wrote is the same file
+    /// with the same content afterwards.
+    func testTheReceiptIsWrittenInPlaceAndTheMarkerNeverIs() throws {
+        XCTAssertTrue(AdministratorPrompt.rootCommand.contains(#"put() { printf '%s %s\n' "$2" "$1" | /bin/dd of="$f" conv=notrunc,fsync 2>/dev/null && [ "$(/usr/bin/head -c 45 "$f" 2>/dev/null)" = "$2 $1" ]; }"#))
+        let written = try store.savePendingStart(nonce1)
+        let before = FileIdentity(atPath: receipts.file)
+        let r = try runRootCommand(marker: marker, nonce: nonce1, receipts: receipts, in: dir)
         XCTAssertEqual(r.status, 0, r.stderr)
+        XCTAssertEqual(FileIdentity(atPath: receipts.file), before)
+        XCTAssertEqual(try FileManager.default.attributesOfItem(atPath: receipts.file)[.size] as? Int, SleepOffReceipts.size)
+        XCTAssertEqual(receipt, line(nonce1, "writing"))
         XCTAssertEqual(FileIdentity(atPath: marker.path), written)
-        XCTAssertTrue(r.sudoCalls.contains(markerWrite("nonce-1 writing")), "\(r.sudoCalls)")
-        XCTAssertEqual(r.sudoCalls.filter { $0.contains(" put ") }.allSatisfy { $0.hasPrefix("-n -u #\(uid) /usr/bin/env -i LC_ALL=C /bin/sh -c ") }, true, "only ever written through root's sudo to the user")
+        XCTAssertEqual(try String(contentsOf: marker, encoding: .utf8), nonce1)
+        XCTAssertEqual(r.sudoCalls, queries, "no sudo call writes anything")
     }
 
-    /// A marker the user cannot write stops the command before it reads
-    /// or writes the sleep setting, with its own refusal (7).
-    func testAMarkerThatCannotTakeTheRecordStopsBeforeTheRead() throws {
-        try Data("nonce-1".utf8).write(to: marker)
-        XCTAssertEqual(chmod(marker.path, 0o444), 0)
-        defer { chmod(marker.path, 0o644) }
+    /// A receipt the command cannot write and read back stops it before
+    /// pmset writes, with its own refusal (7), after root's read: a dd
+    /// that fails, and a receipt this run cannot write. Nothing of this
+    /// start is left in it.
+    func testAReceiptThatCannotBeWrittenStopsBeforeTheWrite() throws {
         for (name, command) in try bothCommands() {
-            let r = try runRootCommand(marker: marker, nonce: "nonce-1", command: command, in: dir)
+            for unwritable in [false, true] {
+                try Data(nonce1.utf8).write(to: marker)
+                resetReceipt()
+                if unwritable { XCTAssertEqual(chmod(receipts.file, 0o444), 0) }
+                defer { chmod(receipts.file, 0o644) }
+                let r = try runRootCommand(marker: marker, nonce: nonce1, command: command, receipts: receipts, receiptWriteFails: !unwritable, in: dir)
+                let label = "\(name), \(unwritable ? "read-only receipt" : "dd fails")"
+                XCTAssertEqual(r.status, 7, "\(label): \(r.stderr)")
+                XCTAssertEqual(r.pmsetCalls, ["-g"], label)
+                XCTAssertEqual(r.sleepDisabled, "0", label)
+                XCTAssertEqual(receipt, SleepOffReceipts.initialContent, label)
+                XCTAssertTrue(r.stderr.contains("could not be written, synced and read back with this start's nonce; sleep was not turned off"), "\(label): \(r.stderr)")
+                XCTAssertTrue(OsascriptAdministratorPrompt.refusalStatuses.contains(r.status), label)
+            }
+        }
+    }
+
+    /// Every receipt that is not the file install.sh made, or that someone
+    /// other than root (here, the test user standing in for root) could
+    /// change, or whose folders above could, stops the command before
+    /// root's read, with nothing written anywhere.
+    func testAMissingOrUnsafeReceiptStopsBeforeTheRead() throws {
+        let file = URL(fileURLWithPath: receipts.file)
+        let folder = URL(fileURLWithPath: receipts.folder)
+        let above = folder.deletingLastPathComponent().path
+        let user = String(cString: getpwuid(getuid()).pointee.pw_name)
+        func acl(_ path: String, _ spec: String?) {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/bin/chmod")
+            p.arguments = spec.map { ["+a", $0, path] } ?? ["-N", path]
+            let exit = ProcessExit(p)
+            XCTAssertNoThrow(try p.run())
+            exit.wait()
+            XCTAssertEqual(p.terminationStatus, 0, path)
+        }
+        func put(_ text: String) throws { try Data(text.utf8).write(to: file) }
+        let initial = SleepOffReceipts.initialContent
+        let cases: [(what: String, change: () throws -> Void, undo: () throws -> Void)] = [
+            ("missing", { try FileManager.default.removeItem(at: file) }, { try put(initial) }),
+            ("44 bytes", { try put(String(initial.dropLast())) }, { try put(initial) }),
+            ("46 bytes", { try put(initial + "\n") }, { try put(initial) }),
+            ("group-writable", { XCTAssertEqual(chmod(file.path, 0o664), 0) }, { XCTAssertEqual(chmod(file.path, 0o644), 0) }),
+            ("writable by others", { XCTAssertEqual(chmod(file.path, 0o646), 0) }, { XCTAssertEqual(chmod(file.path, 0o644), 0) }),
+            ("a second link", { XCTAssertEqual(link(file.path, folder.path + "/other"), 0) }, { XCTAssertEqual(unlink(folder.path + "/other"), 0) }),
+            ("a symbolic link to a 45-byte file", {
+                try Data(initial.utf8).write(to: folder.appendingPathComponent("target"))
+                try FileManager.default.removeItem(at: file)
+                try FileManager.default.createSymbolicLink(atPath: file.path, withDestinationPath: folder.appendingPathComponent("target").path)
+            }, {
+                try FileManager.default.removeItem(at: file)
+                try FileManager.default.removeItem(at: folder.appendingPathComponent("target"))
+                try put(initial)
+            }),
+            ("a folder in its place", {
+                try FileManager.default.removeItem(at: file)
+                try FileManager.default.createDirectory(at: file, withIntermediateDirectories: false)
+            }, {
+                try FileManager.default.removeItem(at: file)
+                try put(initial)
+            }),
+            ("an allow entry on the receipt", { acl(file.path, "user:\(user) allow write") }, { acl(file.path, nil) }),
+            ("a group-writable folder", { XCTAssertEqual(chmod(folder.path, 0o775), 0) }, { XCTAssertEqual(chmod(folder.path, 0o755), 0) }),
+            ("an allow entry on the folder", { acl(folder.path, "user:\(user) allow add_file") }, { acl(folder.path, nil) }),
+            ("an allow entry on the folder above", { acl(above, "user:\(user) allow add_subdirectory") }, { acl(above, nil) }),
+            ("a folder above writable by others", { XCTAssertEqual(chmod(above, 0o757), 0) }, { XCTAssertEqual(chmod(above, 0o755), 0) }),
+        ]
+        for c in cases {
+            for (name, command) in try bothCommands() {
+                try Data(nonce1.utf8).write(to: marker)
+                resetReceipt()
+                try c.change()
+                let before = try? Data(contentsOf: file)
+                let r = try runRootCommand(marker: marker, nonce: nonce1, command: command, receipts: receipts, in: dir)
+                let after = try? Data(contentsOf: file)
+                try c.undo()
+                let label = "\(c.what), \(name)"
+                XCTAssertEqual(r.status, 7, "\(label): \(r.stderr)")
+                XCTAssertEqual(r.pmsetCalls, [], "\(label): nothing read, nothing written")
+                XCTAssertEqual(r.sudoCalls, queries, label)
+                XCTAssertEqual(r.sleepDisabled, "0", label)
+                XCTAssertEqual(after, before, "\(label): the receipt, or what stands in its place, is untouched")
+                XCTAssertTrue(r.stderr.contains("is missing, is not the 45-byte file install.sh made, or someone other than root can change it or a folder above it. Run install.sh again; sleep was not turned off"), "\(label): \(r.stderr)")
+            }
+        }
+        // The control: the same receipt, unchanged, is taken.
+        try Data(nonce1.utf8).write(to: marker)
+        resetReceipt()
+        let r = try runRootCommand(marker: marker, nonce: nonce1, receipts: receipts, in: dir)
+        XCTAssertEqual(r.status, 0, r.stderr)
+        XCTAssertEqual(receipt, line(nonce1, "writing"))
+    }
+
+    /// No test bypass reaches production: the command as it ships trusts
+    /// root alone, so the same receipt, owned by the user running the
+    /// tests and otherwise as install.sh makes it, is refused.
+    func testTheShippedCommandTrustsOnlyRootsReceipt() throws {
+        XCTAssertEqual(AdministratorPrompt.rootCommand.components(separatedBy: "/usr/bin/awk -v o=0 -v n=$n ").count - 1, 1)
+        XCTAssertEqual(SleepOffReceipts.live.owners, [0])
+        XCTAssertEqual(SleepOffReceipts.live.folder, "/private/var/db/com.kgarg.insomnia")
+        XCTAssertEqual(SleepOffReceipts.live.user, getuid())
+        for (name, command) in try bothCommands() {
+            try Data(nonce1.utf8).write(to: marker)
+            resetReceipt()
+            let r = try runRootCommand(marker: marker, nonce: nonce1, command: command, receipts: receipts, trustTestUser: false, in: dir)
             XCTAssertEqual(r.status, 7, "\(name): \(r.stderr)")
             XCTAssertEqual(r.pmsetCalls, [], name)
-            XCTAssertEqual(r.sudoCalls, throughTheRecord, name)
-            XCTAssertTrue(r.stderr.contains("the marker could not be changed, as this user, to record that this start went on to read and write the sleep setting; sleep was not turned off"), r.stderr)
-            XCTAssertTrue(OsascriptAdministratorPrompt.refusalStatuses.contains(r.status), name)
+            XCTAssertEqual(receipt, SleepOffReceipts.initialContent, name)
+        }
+    }
+
+    /// The nonce goes in the receipt, so only an uppercase UUID is taken,
+    /// and anything else stops the command before root's read. Each is
+    /// also the marker's content, so only this check stops it.
+    func testOnlyAnUppercaseUUIDNonceReachesTheReceipt() throws {
+        for nonce in [nonce1.lowercased(), String(nonce1.dropLast()), nonce1 + "0", "6F1C2B4A-0000-4000-8000-00000000000G", "6F1C2B4A 0000-4000-8000-000000000001"] {
+            try Data(nonce.utf8).write(to: marker)
+            resetReceipt()
+            let r = try runRootCommand(marker: marker, nonce: nonce, receipts: receipts, in: dir)
+            XCTAssertEqual(r.status, 7, "\(nonce): \(r.stderr)")
+            XCTAssertEqual(r.pmsetCalls, [], nonce)
+            XCTAssertEqual(receipt, SleepOffReceipts.initialContent, nonce)
+            XCTAssertTrue(r.stderr.contains("the nonce is not an uppercase UUID, so it cannot go in the receipt; sleep was not turned off"), "\(nonce): \(r.stderr)")
         }
     }
 
@@ -873,18 +1008,18 @@ final class RootCommandTests: XCTestCase {
         ]
         for c in cases {
             for (name, command) in try bothCommands() {
-                try Data("nonce-1".utf8).write(to: marker)
-                let r = try RootCommandProcess(marker: marker, nonce: "nonce-1", policy: c.policy, command: command, sleepDisabled: c.initial, foreignAfter: c.foreignAfter, outputClosed: true, in: dir).wait()
+                try Data(nonce1.utf8).write(to: marker)
+                let r = try RootCommandProcess(marker: marker, nonce: nonce1, policy: c.policy, command: command, sleepDisabled: c.initial, foreignAfter: c.foreignAfter, outputClosed: true, receipts: receipts, in: dir).wait()
                 let label = "\(c.name), \(name)"
                 XCTAssertEqual(r.status, c.status, label)
                 XCTAssertEqual(r.pmsetCalls, c.pmset, label)
                 XCTAssertEqual(r.sleepDisabled, c.left, label)
             }
         }
-        try Data("nonce-2".utf8).write(to: marker)
-        XCTAssertEqual(try RootCommandProcess(marker: marker, nonce: "nonce-1", outputClosed: true, in: dir).wait().status, 3)
-        try Data("nonce-1".utf8).write(to: marker)
-        let ended = try RootCommandProcess(marker: marker, nonce: "nonce-1", deadline: String(Int(Date().timeIntervalSince1970) - 1), outputClosed: true, in: dir).wait()
+        try Data(nonce2.utf8).write(to: marker)
+        XCTAssertEqual(try RootCommandProcess(marker: marker, nonce: nonce1, outputClosed: true, receipts: receipts, in: dir).wait().status, 3)
+        try Data(nonce1.utf8).write(to: marker)
+        let ended = try RootCommandProcess(marker: marker, nonce: nonce1, deadline: String(Int(Date().timeIntervalSince1970) - 1), outputClosed: true, receipts: receipts, in: dir).wait()
         XCTAssertEqual(ended.status, 4)
         XCTAssertEqual(ended.pmsetCalls, [])
     }
@@ -894,8 +1029,8 @@ final class RootCommandTests: XCTestCase {
     /// removal times out and the marker stays, and once pmset is done it
     /// goes.
     func testTheMarkerCannotBeRemovedWhilePmsetRuns() async throws {
-        try Data("nonce-1".utf8).write(to: marker)
-        let command = try RootCommandProcess(marker: marker, nonce: "nonce-1", in: dir, holdAt: RootCommandProcess.write)
+        try Data(nonce1.utf8).write(to: marker)
+        let command = try RootCommandProcess(marker: marker, nonce: nonce1, receipts: receipts, in: dir, holdAt: RootCommandProcess.write)
         XCTAssertTrue(command.waitUntilPmsetRuns())
 
         do {
@@ -904,14 +1039,15 @@ final class RootCommandTests: XCTestCase {
         } catch StoreError.markerBusy {
             // expected
         }
-        XCTAssertEqual(try String(contentsOf: marker, encoding: .utf8), "nonce-1 writing")
+        XCTAssertEqual(try String(contentsOf: marker, encoding: .utf8), nonce1)
+        XCTAssertEqual(receipt, line(nonce1, "writing"))
 
         command.release()
         let r = command.wait()
         XCTAssertEqual(r.status, 0, r.stderr)
         XCTAssertEqual(r.pmsetCalls, allCalls)
         let removed = try await store.removePendingStart(timeout: 5)
-        XCTAssertEqual(removed?.content, Data("nonce-1 writing".utf8))
+        XCTAssertNotNil(removed?.file)
         XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
     }
 
@@ -921,11 +1057,11 @@ final class RootCommandTests: XCTestCase {
     /// delete it while pmset runs. The start knows which file it wrote and
     /// deletes nothing else.
     func testAReplacedMarkerIsNotDeletedWhilePmsetRuns() async throws {
-        let written = try store.savePendingStart("nonce-1")
-        let command = try RootCommandProcess(marker: marker, nonce: "nonce-1", in: dir, holdAt: RootCommandProcess.write)
+        let written = try store.savePendingStart(nonce1)
+        let command = try RootCommandProcess(marker: marker, nonce: nonce1, receipts: receipts, in: dir, holdAt: RootCommandProcess.write)
         XCTAssertTrue(command.waitUntilPmsetRuns())
         let copy = dir.appendingPathComponent("copy")
-        try Data("nonce-1".utf8).write(to: copy)
+        try Data(nonce1.utf8).write(to: copy)
         XCTAssertEqual(rename(copy.path, marker.path), 0)
 
         do {
@@ -934,7 +1070,7 @@ final class RootCommandTests: XCTestCase {
         } catch StoreError.markerReplaced {
             // expected
         }
-        XCTAssertEqual(try String(contentsOf: marker, encoding: .utf8), "nonce-1")
+        XCTAssertEqual(try String(contentsOf: marker, encoding: .utf8), nonce1)
 
         command.release()
         let r = command.wait()
@@ -946,8 +1082,8 @@ final class RootCommandTests: XCTestCase {
     /// cannot go, so recovery never undoes beside a command that may still
     /// write.
     func testTheMarkerCannotBeRemovedWhileSudoIsAsked() async throws {
-        try Data("nonce-1".utf8).write(to: marker)
-        let command = try RootCommandProcess(marker: marker, nonce: "nonce-1", in: dir, holdAt: RootCommandProcess.ruleQuery)
+        try Data(nonce1.utf8).write(to: marker)
+        let command = try RootCommandProcess(marker: marker, nonce: nonce1, receipts: receipts, in: dir, holdAt: RootCommandProcess.ruleQuery)
         XCTAssertTrue(command.waitUntilPmsetRuns())
 
         do {
@@ -972,9 +1108,9 @@ final class RootCommandTests: XCTestCase {
     /// `waitUntilLockfWaits`); a command that had not reached it yet would
     /// exit 69, not 3.
     func testAnAnswerThatWaitsOnARemovalRunsNothing() throws {
-        try Data("nonce-1".utf8).write(to: marker)
+        try Data(nonce1.utf8).write(to: marker)
         let holder = try FileLockHolder(marker)
-        let command = try RootCommandProcess(marker: marker, nonce: "nonce-1", in: dir)
+        let command = try RootCommandProcess(marker: marker, nonce: nonce1, receipts: receipts, in: dir)
         XCTAssertTrue(waitUntilLockfWaits(under: command.pid), "lockf never blocked on the marker")
         try FileManager.default.removeItem(at: marker)
         holder.release()
@@ -985,17 +1121,26 @@ final class RootCommandTests: XCTestCase {
     }
 
     /// The marker path and the nonce are data: quotes, spaces and `$(...)`
-    /// in either arrive intact and are never run.
+    /// in either arrive intact and are never run. An odd path with a UUID
+    /// nonce turns sleep off; an odd nonce is refused (7) before root's
+    /// read, since it cannot go in the receipt, and is not run either.
     func testPathAndNonceAreNeverRun() throws {
         let odd = dir.appendingPathComponent("it's a \"dir\" $(touch canary)", isDirectory: true)
         try FileManager.default.createDirectory(at: odd, withIntermediateDirectories: true)
         let oddMarker = odd.appendingPathComponent("pending-start")
-        let nonce = "$(touch canary)'\";touch canary;`touch canary`"
-        try Data(nonce.utf8).write(to: oddMarker)
-        let r = try runRootCommand(marker: oddMarker, nonce: nonce, in: dir)
+        try Data(nonce1.utf8).write(to: oddMarker)
+        let r = try runRootCommand(marker: oddMarker, nonce: nonce1, receipts: receipts, in: dir)
         XCTAssertEqual(r.status, 0, r.stderr)
         XCTAssertEqual(r.pmsetCalls, allCalls)
+        let nonce = "$(touch canary)'\";touch canary;`touch canary`"
+        try Data(nonce.utf8).write(to: oddMarker)
+        resetReceipt()
+        let refused = try runRootCommand(marker: oddMarker, nonce: nonce, receipts: receipts, in: dir)
+        XCTAssertEqual(refused.status, 7, refused.stderr)
+        XCTAssertEqual(refused.pmsetCalls, [])
+        XCTAssertEqual(receipt, SleepOffReceipts.initialContent)
         XCTAssertFalse(FileManager.default.fileExists(atPath: dir.appendingPathComponent("canary").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: odd.appendingPathComponent("canary").path))
     }
 
     // MARK: Someone else's SleepDisabled 1
@@ -1012,12 +1157,13 @@ final class RootCommandTests: XCTestCase {
     /// questions before that read change nothing.
     func testLeavesASleepSettingMadeWhileTheDialogWasUp() throws {
         for (name, command) in try bothCommands() {
-            try Data("nonce-1".utf8).write(to: marker)
-            let r = try runRootCommand(marker: marker, nonce: "nonce-1", command: command, sleepDisabled: "1", in: dir)
+            try Data(nonce1.utf8).write(to: marker)
+            let r = try runRootCommand(marker: marker, nonce: nonce1, command: command, sleepDisabled: "1", receipts: receipts, in: dir)
             XCTAssertEqual(r.status, 6, "\(name): \(r.stderr)")
             XCTAssertEqual(r.pmsetCalls, ["-g"], name)
-            XCTAssertEqual(r.sudoCalls, refusedAfterTheRecord, name)
-            XCTAssertEqual(try String(contentsOf: marker, encoding: .utf8), "nonce-1", name)
+            XCTAssertEqual(r.sudoCalls, queries, name)
+            XCTAssertEqual(try String(contentsOf: marker, encoding: .utf8), nonce1, name)
+            XCTAssertEqual(receipt, SleepOffReceipts.initialContent, "\(name): a refusal at the read writes nothing")
             XCTAssertEqual(r.sleepDisabled, "1", name)
             XCTAssertTrue(r.stderr.contains("pmset -g shows a SleepDisabled 1 this start did not set, or could not be read; it was left alone and sleep was not turned off"), r.stderr)
         }
@@ -1030,8 +1176,8 @@ final class RootCommandTests: XCTestCase {
     func testLeavesASleepSettingMadeWhileSudoIsAsked() throws {
         for at in [RootCommandProcess.versionQuery, RootCommandProcess.listQuery, RootCommandProcess.ruleQuery] {
             for (name, command) in try bothCommands() {
-                try Data("nonce-1".utf8).write(to: marker)
-                let r = try runRootCommand(marker: marker, nonce: "nonce-1", command: command, foreignAfter: at, in: dir)
+                try Data(nonce1.utf8).write(to: marker)
+                let r = try runRootCommand(marker: marker, nonce: nonce1, command: command, foreignAfter: at, receipts: receipts, in: dir)
                 XCTAssertEqual(r.status, 6, "\(at) \(name): \(r.stderr)")
                 XCTAssertEqual(r.pmsetCalls, ["-g"], "\(at) \(name)")
                 XCTAssertEqual(r.sleepDisabled, "1", "\(at) \(name)")
@@ -1043,8 +1189,8 @@ final class RootCommandTests: XCTestCase {
     /// stops before it reads, and nothing is written over the 1.
     func testASudoRefusalLeavesASettingMadeWhileSudoIsAsked() throws {
         for (policy, at) in [(RootSudoPolicy.noRule, RootCommandProcess.versionQuery), (.listOnly, RootCommandProcess.listQuery), (.laterRule, RootCommandProcess.ruleQuery)] {
-            try Data("nonce-1".utf8).write(to: marker)
-            let r = try runRootCommand(marker: marker, nonce: "nonce-1", policy: policy, foreignAfter: at, in: dir)
+            try Data(nonce1.utf8).write(to: marker)
+            let r = try runRootCommand(marker: marker, nonce: nonce1, policy: policy, foreignAfter: at, receipts: receipts, in: dir)
             XCTAssertEqual(r.status, 5, "\(policy): \(r.stderr)")
             XCTAssertEqual(r.pmsetCalls, [], "\(policy)")
             XCTAssertEqual(r.sleepDisabled, "1", "\(policy)")
@@ -1055,11 +1201,11 @@ final class RootCommandTests: XCTestCase {
     /// it writes anything, as Start does.
     func testAnUnreadableSettingStopsBeforeTheWrite() throws {
         for (name, command) in try bothCommands() {
-            try Data("nonce-1".utf8).write(to: marker)
-            let r = try runRootCommand(marker: marker, nonce: "nonce-1", command: command, sleepDisabled: "fail", in: dir)
+            try Data(nonce1.utf8).write(to: marker)
+            let r = try runRootCommand(marker: marker, nonce: nonce1, command: command, sleepDisabled: "fail", receipts: receipts, in: dir)
             XCTAssertEqual(r.status, 6, "\(name): \(r.stderr)")
             XCTAssertEqual(r.pmsetCalls, ["-g"], name)
-            XCTAssertEqual(r.sudoCalls, refusedAfterTheRecord, name)
+            XCTAssertEqual(r.sudoCalls, queries, name)
             XCTAssertEqual(r.sleepDisabled, "fail", name)
         }
     }
@@ -1070,8 +1216,8 @@ final class RootCommandTests: XCTestCase {
     /// once.
     func testAJournalOwnedSettingSkipsTheReadButNotTheQuestions() throws {
         for (name, command) in try bothCommands() {
-            try Data("nonce-1".utf8).write(to: marker)
-            let r = try runRootCommand(marker: marker, nonce: "nonce-1", command: command, sleepDisabled: "1", owned: "1", in: dir)
+            try Data(nonce1.utf8).write(to: marker)
+            let r = try runRootCommand(marker: marker, nonce: nonce1, command: command, sleepDisabled: "1", owned: "1", receipts: receipts, in: dir)
             XCTAssertEqual(r.status, 0, "\(name): \(r.stderr)")
             XCTAssertEqual(r.pmsetCalls, ["-a disablesleep 1"], name)
             XCTAssertEqual(r.pmsetAs, ["root"], name)
@@ -1085,8 +1231,8 @@ final class RootCommandTests: XCTestCase {
     /// the start rolls back to still said it was owed. Now nothing is
     /// written: the 1 stays, and that entry keeps owing its restore.
     func testAJournalOwnedSettingIsLeftToTheJournalWhenSudoRefuses() throws {
-        try Data("nonce-1".utf8).write(to: marker)
-        let r = try runRootCommand(marker: marker, nonce: "nonce-1", policy: .noRule, sleepDisabled: "1", owned: "1", in: dir)
+        try Data(nonce1.utf8).write(to: marker)
+        let r = try runRootCommand(marker: marker, nonce: nonce1, policy: .noRule, sleepDisabled: "1", owned: "1", receipts: receipts, in: dir)
         XCTAssertEqual(r.status, 5, r.stderr)
         XCTAssertEqual(r.pmsetCalls, [])
         XCTAssertEqual(r.sleepDisabled, "1")
@@ -1095,9 +1241,9 @@ final class RootCommandTests: XCTestCase {
     /// Only exactly `1` skips the read; anything else, empty or odd,
     /// reads, and is never run.
     func testOnlyExactlyOneSkipsTheRead() throws {
-        try Data("nonce-1".utf8).write(to: marker)
+        try Data(nonce1.utf8).write(to: marker)
         for owned in ["", "0", "true", "yes", "01", " 1", "1 ", "1\n", "$(touch canary)", "1;touch canary"] {
-            let r = try runRootCommand(marker: marker, nonce: "nonce-1", sleepDisabled: "1", owned: owned, in: dir)
+            let r = try runRootCommand(marker: marker, nonce: nonce1, sleepDisabled: "1", owned: owned, receipts: receipts, in: dir)
             XCTAssertEqual(r.status, 6, "owned \(owned.debugDescription): \(r.stderr)")
             XCTAssertEqual(r.pmsetCalls, ["-g"], "owned \(owned.debugDescription)")
             XCTAssertEqual(r.sleepDisabled, "1", "owned \(owned.debugDescription)")
@@ -1127,9 +1273,9 @@ final class RootCommandTests: XCTestCase {
             "standby 1\nsleep 1\n",
         ]
         for output in outputs {
-            try Data("nonce-1".utf8).write(to: marker)
+            try Data(nonce1.utf8).write(to: marker)
             let startReads = PmsetSleepGuard.parseSleepDisabled(output)
-            let r = try runRootCommand(marker: marker, nonce: "nonce-1", pmsetOutput: output, in: dir)
+            let r = try runRootCommand(marker: marker, nonce: nonce1, pmsetOutput: output, receipts: receipts, in: dir)
             XCTAssertEqual(r.status, startReads ? 6 : 0, "\(output.debugDescription): \(r.stderr)")
             XCTAssertEqual(r.pmsetCalls, startReads ? ["-g"] : allCalls, output.debugDescription)
         }
@@ -1212,13 +1358,16 @@ final class RootCommandSudoAnswerTests: XCTestCase {
         try? FileManager.default.removeItem(at: dir)
     }
 
-    /// The command's awk programs, in order: the /etc/pam.d/sudo reader,
-    /// the `-V` reader, the `-l` reader, the `-ll` reader and the `pmset
-    /// -g` reader.
+    /// The command's awk programs that take no variables, in order: the
+    /// /etc/pam.d/sudo reader, the `-V` reader, the `-l` reader, the `-ll`
+    /// reader, the receipt's access control reader and the `pmset -g`
+    /// reader. The receipt's lstat reader is given `-v` variables and is
+    /// not among them.
     private func programs() throws -> [String] {
         let programs = AdministratorPrompt.rootCommand.components(separatedBy: "/usr/bin/awk '").dropFirst().compactMap { $0.components(separatedBy: "'").first }
-        XCTAssertEqual(programs.count, 5)
-        guard programs.count == 5 else { throw XCTSkip("the command's awk programs moved") }
+        XCTAssertEqual(programs.count, 6)
+        XCTAssertEqual(AdministratorPrompt.rootCommand.components(separatedBy: "/usr/bin/awk ").count - 1, 7)
+        guard programs.count == 6 else { throw XCTSkip("the command's awk programs moved") }
         return programs
     }
 
@@ -1394,9 +1543,11 @@ final class PendingStartRemovalTests: XCTestCase {
 
     func testRemovesAMarkerAndReportsAMissingOne() async throws {
         try Data("n".utf8).write(to: marker)
+        let written = FileIdentity(atPath: marker.path)
         let first = try await store.removePendingStart(timeout: 1)
         let second = try await store.removePendingStart(timeout: 1)
-        XCTAssertEqual(first?.content, Data("n".utf8))
+        XCTAssertNotNil(written)
+        XCTAssertEqual(first, RemovedMarker(file: written))
         XCTAssertNil(second)
         XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
     }
@@ -1464,49 +1615,37 @@ final class PendingStartRemovalTests: XCTestCase {
         let written = try store.savePendingStart("n")
         XCTAssertEqual(written, FileIdentity(atPath: marker.path))
         let removed = try await store.removePendingStart(timeout: 1, expecting: written)
-        XCTAssertEqual(removed, RemovedMarker(file: written, content: Data("n".utf8)))
+        XCTAssertEqual(removed, RemovedMarker(file: written))
         XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
     }
 
-    /// What the root command left in the marker decides whether the start
-    /// it belonged to can be rolled back without an undo: only the file the
-    /// start wrote, holding exactly its nonce, shows that no command for it
-    /// reached the sleep setting.
-    func testOnlyTheFileTheStartWroteStillHoldingItsNonceIsUntouched() async throws {
+    /// What goes is reported by identity alone. A rewrite in place keeps
+    /// the file the start wrote, whatever it holds now: anything running
+    /// as the user can do that, so what the marker holds shows nothing
+    /// about the command behind the dialog, and only the receipt does
+    /// (SleepOffReceiptsTests). A copy in its place is another file, and
+    /// so is a later start's own marker.
+    func testTheFileThatGoesIsReportedByIdentityAlone() async throws {
         let nonce = "6F1C2B4A-0000-4000-8000-00000000000A"
-        let start = PendingStart(marker: marker, nonce: nonce, deadline: Date().addingTimeInterval(3600))
-        func removed(after change: (FileIdentity) throws -> Void) async throws -> (RemovedMarker?, FileIdentity) {
+        for text in [nonce, "", nonce + " writing", nonce + " refused\n", "6F1C2B4A-0000-4000-8000-00000000000B"] {
             let written = try store.savePendingStart(nonce)
-            try change(written)
-            return (try await store.removePendingStart(timeout: 1), written)
-        }
-        func overwrite(_ text: String) -> (FileIdentity) throws -> Void {
-            { _ in FakeAdministratorPrompt.overwrite(self.marker, with: text) }
-        }
-        let (kept, keptFile) = try await removed { _ in }
-        XCTAssertEqual(kept?.isUntouched(written: keptFile, nonce: nonce), true)
-
-        for (what, change) in [
-            ("its record", overwrite(start.receipt)),
-            ("an emptied file", overwrite("")),
-            ("half a record", overwrite(nonce + " wri")),
-            ("another nonce", overwrite("6F1C2B4A-0000-4000-8000-00000000000B")),
-            ("the nonce and a newline", overwrite(nonce + "\n")),
-        ] {
-            let (r, written) = try await removed(after: change)
-            XCTAssertEqual(r?.file, written, what)
-            XCTAssertEqual(r?.isUntouched(written: written, nonce: nonce), false, what)
+            FakeAdministratorPrompt.overwrite(marker, with: text)
+            XCTAssertEqual(FileIdentity(atPath: marker.path), written, "\(text): rewritten in place")
+            let removed = try await store.removePendingStart(timeout: 1)
+            XCTAssertEqual(removed, RemovedMarker(file: written), text)
         }
 
-        // A copy holding the nonce in the marker's place is not the file
-        // the start wrote, and neither is a later start's own marker.
-        let (copied, copiedFrom) = try await removed { _ in try self.replaceMarker(with: nonce) }
-        XCTAssertEqual(copied?.content, Data(nonce.utf8))
-        XCTAssertEqual(copied?.isUntouched(written: copiedFrom, nonce: nonce), false)
+        let copiedFrom = try store.savePendingStart(nonce)
+        try replaceMarker(with: nonce)
+        let copied = try await store.removePendingStart(timeout: 1)
+        XCTAssertNotNil(copied?.file)
+        XCTAssertNotEqual(copied?.file, copiedFrom)
         let earlier = try store.savePendingStart(nonce)
         try FileManager.default.removeItem(at: marker)
-        let (later, _) = try await removed { _ in }
-        XCTAssertEqual(later?.isUntouched(written: earlier, nonce: nonce), false)
+        let later = try store.savePendingStart(nonce)
+        XCTAssertNotEqual(later, earlier)
+        let removed = try await store.removePendingStart(timeout: 1)
+        XCTAssertEqual(removed, RemovedMarker(file: later))
     }
 
     /// A copy in the marker's place is not the file the start wrote. The
@@ -1542,12 +1681,19 @@ final class PendingStartRemovalTests: XCTestCase {
     /// lock: it is looked up again, and goes once its own lock is held.
     func testAFileSwappedInAfterTheOpenIsLockedBeforeItGoes() async throws {
         try Data("n".utf8).write(to: marker)
+        let first = FileIdentity(atPath: marker.path)
         let locks = Locked(0)
+        let swapped = Locked<FileIdentity?>(nil)
         let removed = try await store.removePendingStart(timeout: 5, pollEvery: .milliseconds(10), onLocked: {
             locks.value += 1
-            if locks.value == 1 { try? self.replaceMarker(with: "m") }
+            if locks.value == 1 {
+                try? self.replaceMarker(with: "m")
+                swapped.value = FileIdentity(atPath: self.marker.path)
+            }
         })
-        XCTAssertEqual(removed?.content, Data("m".utf8), "what goes is the file locked last")
+        XCTAssertNotNil(swapped.value)
+        XCTAssertNotEqual(swapped.value, first)
+        XCTAssertEqual(removed, RemovedMarker(file: swapped.value), "what goes is the file locked last")
         XCTAssertEqual(locks.value, 2, "the swapped-in file was locked before it went")
         XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
     }
@@ -1572,7 +1718,7 @@ final class PendingStartRemovalTests: XCTestCase {
     func testADanglingLinkIsRemoved() async throws {
         try FileManager.default.createSymbolicLink(atPath: marker.path, withDestinationPath: dir.appendingPathComponent("nowhere").path)
         let removed = try await store.removePendingStart(timeout: 1)
-        XCTAssertEqual(removed, RemovedMarker(file: nil, content: nil))
+        XCTAssertEqual(removed, RemovedMarker(file: nil))
         XCTAssertNil(try? FileManager.default.destinationOfSymbolicLink(atPath: marker.path))
     }
 }
@@ -1708,11 +1854,14 @@ final class PmsetSleepGuardPromptTests: XCTestCase {
 
     func testDisableSleepGoesThroughThePromptWithItsStart() async throws {
         let prompt = FakeAdministratorPrompt()
+        let receipts = try TestReceipts.make(in: dir)
+        prompt.receiptFile = receipts.file
         let sleepGuard = PmsetSleepGuard(prompt: prompt)
         let start = try pendingStart()
         try await sleepGuard.disableSleep(start)
         XCTAssertEqual(prompt.shown, 1)
         XCTAssertEqual(prompt.starts, [start])
+        XCTAssertEqual(TestReceipts.text(receipts), "\(start.nonce) writing\n")
     }
 
     func testCancelledPromptSurfacesAsCancelled() async throws {
@@ -2120,8 +2269,8 @@ final class SleepPromptLifecycleTests: XCTestCase {
         XCTAssertNil(try h.store.loadSession())
     }
 
-    /// A wrong password: no root command ran, so the marker still holds
-    /// the bare nonce, and the start is rolled back with no undo.
+    /// A wrong password: no root command ran, so the receipt still holds
+    /// another start's nonce, and the start is rolled back with no undo.
     func testFailedPromptRollsBack() async throws {
         h.prompt.mode = .fail
         let m = h.makeManager()
@@ -2134,7 +2283,8 @@ final class SleepPromptLifecycleTests: XCTestCase {
         XCTAssertTrue(err.contains("incorrect"), err)
         let post = try XCTUnwrap(h.notifier.posts.last)
         XCTAssertEqual(post.title, "Session not started")
-        XCTAssertTrue(post.body.hasSuffix("The command behind the password dialog never reached the sleep setting."), post.body)
+        XCTAssertTrue(post.body.hasSuffix("The receipt shows that the command behind the password dialog never turned sleep off."), post.body)
+        XCTAssertEqual(TestReceipts.text(h.receipts), SleepOffReceipts.initialContent)
     }
 
     /// A failure after the command wrote its record is undone like an end.
@@ -2434,7 +2584,7 @@ final class SleepPromptLifecycleTests: XCTestCase {
 
         try assertRolledBackClean(m)
         XCTAssertEqual(h.prompt.shown, 0)
-        let late = try runRootCommand(marker: orphan.marker, nonce: orphan.nonce, deadline: orphan.deadlineArgument, in: h.home.root)
+        let late = try runRootCommand(marker: orphan.marker, nonce: orphan.nonce, deadline: orphan.deadlineArgument, receipts: h.receipts, in: h.home.root)
         XCTAssertEqual(late.status, 69, late.stderr)
         XCTAssertEqual(late.pmsetCalls, [], "the late answer must not turn sleep off")
     }
@@ -2449,7 +2599,7 @@ final class SleepPromptLifecycleTests: XCTestCase {
         _ = try seedValidSession()
         let orphan = PendingStart(marker: h.home.paths.pendingStartFile, nonce: UUID().uuidString, deadline: Date().addingTimeInterval(3600))
         try h.store.savePendingStart(orphan.nonce)
-        let command = try RootCommandProcess(marker: orphan.marker, nonce: orphan.nonce, deadline: orphan.deadlineArgument, in: h.home.root, holdAt: RootCommandProcess.write)
+        let command = try RootCommandProcess(marker: orphan.marker, nonce: orphan.nonce, deadline: orphan.deadlineArgument, receipts: h.receipts, in: h.home.root, holdAt: RootCommandProcess.write)
         defer { command.release() }
         XCTAssertTrue(command.waitUntilPmsetRuns())
         h.guardFake.sleepDisabled = false
@@ -2715,7 +2865,7 @@ final class SleepPromptLifecycleTests: XCTestCase {
         await h.prompt.gate.waitUntilStarted()
         let newer = try XCTUnwrap(h.prompt.starts.first)
         XCTAssertNotEqual(newer.nonce, orphan.nonce)
-        let late = try runRootCommand(marker: orphan.marker, nonce: orphan.nonce, deadline: orphan.deadlineArgument, in: h.home.root)
+        let late = try runRootCommand(marker: orphan.marker, nonce: orphan.nonce, deadline: orphan.deadlineArgument, receipts: h.receipts, in: h.home.root)
         XCTAssertEqual(late.status, 3, late.stderr)
         XCTAssertEqual(late.pmsetCalls, [])
         XCTAssertEqual(try String(contentsOf: newer.marker, encoding: .utf8), newer.nonce, "the newer start's marker is untouched")
@@ -2837,10 +2987,14 @@ final class StartOwnershipEndToEndTests: XCTestCase {
     /// A fake machine in its own directory. Its clock reads `clockStart`
     /// until the root command's call `clockAt` has answered, then
     /// `clockLater`.
+    /// It writes the harness's receipt, which the manager reads; each
+    /// machine starts it over with install.sh's content.
     private func machine(_ name: String = "machine", clockStart: Int? = nil, clockLater: Int? = nil, clockAt: String = RootCommandProcess.ruleQuery) throws -> FakeDialogMachine {
-        try FakeDialogMachine(
+        TestReceipts.write(h.receipts.file, nonce: "00000000-0000-0000-0000-000000000000", word: "refused")
+        XCTAssertEqual(TestReceipts.text(h.receipts), SleepOffReceipts.initialContent)
+        return try FakeDialogMachine(
             in: h.home.root.appendingPathComponent(name, isDirectory: true),
-            clockStart: clockStart ?? now, clockLater: clockLater ?? now + 5, clockAt: clockAt)
+            clockStart: clockStart ?? now, clockLater: clockLater ?? now + 5, clockAt: clockAt, receipts: h.receipts)
     }
 
     /// The root command's three questions, each as root's sudo to the user
@@ -2850,20 +3004,13 @@ final class StartOwnershipEndToEndTests: XCTestCase {
         return ["-V", "-k -n -l", "-k -n -ll /usr/bin/pmset -a disablesleep 0"].flatMap { [asUser + $0, $0] }
     }
 
-    /// Every sudo call but root's writes over the marker.
-    private func questions(_ fake: FakeDialogMachine) -> [String] {
-        fake.sudoCalls().filter { !$0.contains(" put ") }
-    }
-
-    /// What root wrote over the marker, in order, through its sudo to the
-    /// user, with the nonce shown as `N`: `N writing` for the record, `N`
-    /// for a refusal that put the bare nonce back.
-    private func markerWrites(_ fake: FakeDialogMachine) -> [String] {
-        let prefix = "-n -u #\(getuid()) /usr/bin/env -i LC_ALL=C /bin/sh -c printf %s \"$2\" > \"$1\" put \(h.home.paths.pendingStartFile.path) "
-        let written = fake.sudoCalls().filter { $0.hasPrefix(prefix) }.map { String($0.dropFirst(prefix.count)) }
-        XCTAssertEqual(written.count, fake.sudoCalls().filter { $0.contains(" put ") }.count, "every write goes through root's sudo to the user")
-        guard let nonce = written.first.map({ $0.replacingOccurrences(of: " writing", with: "") }), !nonce.isEmpty else { return written }
-        return written.map { $0.replacingOccurrences(of: nonce, with: "N") }
+    /// The receipt after the start, with the nonce the dialog was given
+    /// shown as `N`. Root writes nothing else: none of its sudo calls
+    /// writes the marker (each test compares them all).
+    private func receipt(_ fake: FakeDialogMachine) -> String {
+        let text = TestReceipts.text(h.receipts) ?? "unreadable"
+        guard let nonce = fake.nonce, !nonce.isEmpty else { return text }
+        return text.replacingOccurrences(of: nonce, with: "N")
     }
 
     private func assertRolledBackWithNothingUndone(_ m: SessionManager, _ fake: FakeDialogMachine, status: Int32, file: StaticString = #filePath, line: UInt = #line) throws {
@@ -2887,10 +3034,11 @@ final class StartOwnershipEndToEndTests: XCTestCase {
         XCTAssertTrue(m.isActive, m.lastError ?? "")
         XCTAssertEqual(fake.script, AdministratorPrompt.disableSleepScript)
         XCTAssertEqual(fake.pmsetCalls(), ["-g", "-g", "-a disablesleep 1"], "Start's read, then the command's read and its write")
-        XCTAssertEqual(questions(fake), queries)
-        XCTAssertEqual(markerWrites(fake), ["N writing"])
+        XCTAssertEqual(fake.sudoCalls(), queries)
+        XCTAssertEqual(receipt(fake), "N writing\n")
         XCTAssertEqual(fake.sleepDisabled, "1")
         XCTAssertEqual(try h.store.loadState()?.sleepDisabledByUs, true)
+        XCTAssertNil(try h.store.loadState()?.sleepOffAttempt, "a start that finished settles its own record")
 
         await m.end(reason: .user)
         XCTAssertEqual(fake.sudoCalls().last, "-n /usr/bin/pmset -a disablesleep 0")
@@ -2922,8 +3070,8 @@ final class StartOwnershipEndToEndTests: XCTestCase {
 
         XCTAssertEqual(fake.sleepDisabled, "1")
         XCTAssertEqual(fake.pmsetCalls(), ["-g", "-g"])
-        XCTAssertEqual(questions(fake), queries)
-        XCTAssertEqual(markerWrites(fake), ["N writing", "N"])
+        XCTAssertEqual(fake.sudoCalls(), queries)
+        XCTAssertEqual(receipt(fake), SleepOffReceipts.initialContent, "the read comes before the record")
         try assertRolledBackWithNothingUndone(m, fake, status: 6)
     }
 
@@ -2940,8 +3088,8 @@ final class StartOwnershipEndToEndTests: XCTestCase {
             XCTAssertNil(fake.foreignAfter, "\(at): the other tool's 1 was set")
             XCTAssertEqual(fake.sleepDisabled, "1", at)
             XCTAssertEqual(fake.pmsetCalls(), ["-g", "-g"], at)
-            XCTAssertEqual(questions(fake), queries, at)
-            XCTAssertEqual(markerWrites(fake), ["N writing", "N"], at)
+            XCTAssertEqual(fake.sudoCalls(), queries, at)
+            XCTAssertEqual(receipt(fake), SleepOffReceipts.initialContent, at)
             try assertRolledBackWithNothingUndone(m, fake, status: 6)
         }
     }
@@ -2985,8 +3133,8 @@ final class StartOwnershipEndToEndTests: XCTestCase {
             await m.start(duration: 60)
 
             XCTAssertEqual(fake.pmsetCalls(), ["-g", "-g"], "\(later - now) s")
-            XCTAssertEqual(questions(fake), queries, "\(later - now) s")
-            XCTAssertEqual(markerWrites(fake), ["N writing", "N"], "\(later - now) s")
+            XCTAssertEqual(fake.sudoCalls(), queries, "\(later - now) s")
+            XCTAssertEqual(receipt(fake), "N refused\n", "\(later - now) s: the record, then the refusal over it")
             XCTAssertEqual(fake.sleepDisabled, "0", "\(later - now) s")
             try assertRolledBackWithNothingUndone(m, fake, status: 4)
         }
@@ -3007,8 +3155,8 @@ final class StartOwnershipEndToEndTests: XCTestCase {
 
         XCTAssertTrue(m.isActive, m.lastError ?? "")
         XCTAssertEqual(fake.pmsetCalls(), ["-a disablesleep 1"])
-        XCTAssertEqual(questions(fake), queries)
-        XCTAssertEqual(markerWrites(fake), ["N writing"])
+        XCTAssertEqual(fake.sudoCalls(), queries)
+        XCTAssertEqual(receipt(fake), "N writing\n")
         XCTAssertEqual(fake.sleepDisabled, "1")
     }
 
@@ -3085,12 +3233,14 @@ final class StartOwnershipEndToEndTests: XCTestCase {
     // MARK: Round 19
 
     /// Round 19 P1 (ownership), end to end. Another tool sets 1 while the
-    /// dialog is up, and the command is stopped while sudo is asked, before
-    /// its record: lockf reports the signal as 70, which could have come
-    /// from anywhere. The marker still holds the bare nonce, so the start
-    /// is rolled back with no undo, and the 1 stays.
+    /// dialog is up, and the command is stopped before its record: while
+    /// sudo is asked, or as root's read starts. lockf reports the signal as
+    /// 70, which could have come from anywhere. The receipt still holds
+    /// another start's nonce, so the start is rolled back with no undo, and
+    /// the 1 stays. Round 22: the read is before the record now, so a stop
+    /// there leaves the 1 too.
     func testACommandStoppedBeforeItsRecordLeavesASettingMadeWhileTheDialogWasUp() async throws {
-        for at in [RootCommandProcess.versionQuery, RootCommandProcess.listQuery, RootCommandProcess.ruleQuery] {
+        for at in [RootCommandProcess.versionQuery, RootCommandProcess.listQuery, RootCommandProcess.ruleQuery, RootCommandProcess.read] {
             let fake = try machine("machine \(at)".replacingOccurrences(of: " ", with: "-").replacingOccurrences(of: "/", with: "_"))
             fake.foreignDuringDialog = true
             fake.interruptAt = at
@@ -3099,8 +3249,8 @@ final class StartOwnershipEndToEndTests: XCTestCase {
 
             XCTAssertNil(fake.interruptAt, "\(at): the command was stopped")
             XCTAssertEqual(fake.sleepDisabled, "1", "\(at): the other tool's setting must survive")
-            XCTAssertEqual(fake.pmsetCalls(), ["-g"], "\(at): Start's read only")
-            XCTAssertEqual(markerWrites(fake), [], at)
+            XCTAssertEqual(fake.pmsetCalls(), at == RootCommandProcess.read ? ["-g", "-g"] : ["-g"], "\(at): Start's read, and root's when it was stopped there")
+            XCTAssertEqual(receipt(fake), SleepOffReceipts.initialContent, at)
             XCTAssertFalse(fake.sudoCalls().contains("-n /usr/bin/pmset -a disablesleep 0"), "\(at): the app ran an undo")
             XCTAssertNil(m.session, at)
             XCTAssertNil(try h.store.loadSession(), at)
@@ -3111,26 +3261,30 @@ final class StartOwnershipEndToEndTests: XCTestCase {
             XCTAssertTrue(err.hasSuffix("(70)"), "\(at): lockf's status for a command ended by a signal: \(err)")
             let post = try XCTUnwrap(h.notifier.posts.last)
             XCTAssertEqual(post.title, "Session not started", at)
-            XCTAssertTrue(post.body.hasSuffix("The command behind the password dialog never reached the sleep setting."), post.body)
+            XCTAssertTrue(post.body.hasSuffix("The receipt shows that the command behind the password dialog never turned sleep off."), post.body)
         }
     }
 
-    /// The limit that stays: stopped after its record, at root's read, the
-    /// command never wrote, but the marker cannot show that, so the start
-    /// is undone like an end and the other tool's 1 is cleared with it.
+    /// The limit that stays: another tool sets 1 right after root's read,
+    /// and the command is stopped after its record, as its write starts.
+    /// The receipt holds this start's `writing`, which cannot show whether
+    /// the write ran, so the start is undone like an end and the other
+    /// tool's 1 is cleared with it.
     func testACommandStoppedAfterItsRecordIsUndoneEvenBeforeItsWrite() async throws {
         let fake = try machine()
-        fake.foreignDuringDialog = true
-        fake.interruptAt = RootCommandProcess.read
+        fake.foreignAfter = RootCommandProcess.read
+        fake.interruptAt = RootCommandProcess.write
         let m = h.makeManager(sleepGuard: fake.sleepGuard())
         await m.start(duration: 1800)
 
+        XCTAssertNil(fake.foreignAfter, "the other tool's 1 was set")
         XCTAssertNil(fake.interruptAt, "the command was stopped")
-        XCTAssertEqual(markerWrites(fake), ["N writing"])
-        XCTAssertFalse(fake.pmsetCalls().contains("-a disablesleep 1"), "the write never came")
-        XCTAssertEqual(fake.sudoCalls().last, "-n /usr/bin/pmset -a disablesleep 0", "the app undid")
+        XCTAssertEqual(receipt(fake), "N writing\n")
+        XCTAssertEqual(fake.pmsetCalls(), ["-g", "-g", "-a disablesleep 1", "-a disablesleep 0"], "the write was stopped as it started; then the app's undo")
+        XCTAssertEqual(fake.sudoCalls(), queries + ["-n /usr/bin/pmset -a disablesleep 0"], "the app undid")
         XCTAssertEqual(fake.sleepDisabled, "0", "and cleared the other tool's 1")
         XCTAssertNil(m.session)
+        XCTAssertNil(try h.store.loadSession())
         XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
     }
 

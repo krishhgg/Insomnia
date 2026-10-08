@@ -41,6 +41,14 @@
 # but sleepDisabledByUs stays journaled and the run exits 1, so the next run
 # retries.
 #
+# Then, with the marker gone, the run settles a start the journal still
+# records (sleepOffAttempt, see settle_attempt): the root-owned receipt
+# install.sh made in RECEIPTS shows whether the command behind that start's
+# dialog turned sleep off. This happens before the session is read, so a
+# session whose start never finished is never left to be resumed. A marker
+# that no journaled start accounts for takes session.json with it
+# (drop_unrecorded_session), for the same reason.
+#
 # Decision, driven only by what the journal says was changed:
 #   - session.json valid (endsAt in the future) and no --force: exit 0
 #     (1 while pending-start is still present).
@@ -161,8 +169,10 @@
 # reads it from the installed script before every password dialog and
 # refuses Start when it is missing or lower than it needs
 # (BackstopVersion.swift). 2: pending-start is deleted under its lock, as
-# described above. Raise it when the app comes to rely on something new here.
-# insomnia-backstop-version: 2
+# described above. 3: a start the journal still records is settled from its
+# receipt once its marker is gone (settle_attempt). Raise it when the app
+# comes to rely on something new here.
+# insomnia-backstop-version: 3
 set -euo pipefail
 export LC_ALL=C TZ=UTC
 # Everything this run creates (log lines, the lock file, the published
@@ -187,6 +197,12 @@ MV=/bin/mv
 CP=/bin/cp
 STAT=/usr/bin/stat
 MKTEMP=/usr/bin/mktemp
+LS=/bin/ls
+# The folder of the root-owned receipts (SleepOffReceipts.swift), and the
+# one owner besides root it may have: none, as uid 0 is root. Tests patch
+# both lines in a private copy, for a folder in their temporary directory.
+RECEIPTS=/private/var/db/com.kgarg.insomnia
+RECEIPT_OWNER=0
 # The installed app binary, for the microsecond identity check of
 # frozenProcesses entries (see above), and the bundle's Info.plist, which
 # must declare InsomniaResumeFrozenVersion RESUME_FROZEN_VERSION before the
@@ -293,7 +309,9 @@ fi
 # link to nothing is removed: the root command cannot open it either.
 # Sets marker_rc: 0 deleted or gone, 75 still locked after
 # PENDING_LOCK_TIMEOUT_SECONDS, 3 replaced after the open, 4 not a regular
-# file, anything else from the open or rm.
+# file, anything else from the open or rm. Sets removed_marker to the
+# device:inode of the file it locked and deleted, for settle_attempt.
+removed_marker=""
 delete_pending_marker() {
   local locked
   marker_rc=0
@@ -311,7 +329,7 @@ delete_pending_marker() {
   if (( marker_rc == 0 )); then
     locked="$("$STAT" -f '%d:%i' <&8 2>/dev/null)" || locked=""
     if [[ -n "$locked" && "$locked" == "$("$STAT" -L -f '%d:%i' "$PENDING" 2>/dev/null)" ]]; then
-      "$RM" -f "$PENDING" 2>/dev/null || marker_rc=$?
+      if "$RM" -f "$PENDING" 2>/dev/null; then removed_marker="$locked"; else marker_rc=$?; fi
     else
       marker_rc=3
     fi
@@ -344,6 +362,10 @@ fi
 exit_unless_marker_stuck() { # what the run found
   if (( marker_stuck )); then
     log error "$1, but $PENDING is still present; will retry on the next run"
+    exit 1
+  fi
+  if [[ -n "${settle_failed:-}" ]]; then
+    log error "$1, but $settle_failed; will retry on the next run"
     exit 1
   fi
   exit 0
@@ -686,6 +708,19 @@ journal_shape_problems() { # file
       done
     fi
   fi
+  t="$(type_of "$f" sleepOffAttempt)"
+  if [[ -n "$t" && "$t" != "(any)" ]]; then
+    if [[ "$t" != dictionary ]]; then
+      echo "sleepOffAttempt is a $t, not an object"
+    else
+      [[ "$(type_of "$f" sleepOffAttempt.nonce)" == string ]] || echo "sleepOffAttempt.nonce is not a string"
+      [[ "$(type_of "$f" sleepOffAttempt.owedBefore)" == bool ]] || echo "sleepOffAttempt.owedBefore is not a bool"
+      [[ "$(type_of "$f" sleepOffAttempt.receipt)" == string ]] || echo "sleepOffAttempt.receipt is not a string"
+      [[ "$(type_of "$f" sleepOffAttempt.deadline)" == integer ]] || echo "sleepOffAttempt.deadline is not an integer"
+      t="$(type_of "$f" sleepOffAttempt.marker)"
+      [[ -z "$t" || "$t" == string || "$t" == "(any)" ]] || echo "sleepOffAttempt.marker is a $t, not a string"
+    fi
+  fi
 }
 
 # Seconds since the epoch for a date in the one form session.json may hold,
@@ -763,6 +798,149 @@ session_shape_problems() { # file
     done
   fi
 }
+
+# --- Settle an unfinished start ----------------------------------------------
+# A start journals sleepOffAttempt (RuntimeState.swift) together with
+# sleepDisabledByUs before its password dialog can run anything, and
+# removes it once it has finished or rolled back. One still here belongs to
+# a start that never finished: the app died under it. With its marker gone
+# under the marker's lock (above), no command for that start can write any
+# more, and the receipt shows whether one did (SleepOffReceipts.swift):
+#   - the attempt has no marker: no dialog was shown;
+#   - the marker deleted above is the one the attempt journaled, and the
+#     receipt is the file it was when the start began, still safe, and
+#     holds another start's nonce or this one's with "refused": no command
+#     for this start turned sleep off;
+#   - anything else may have, a marker this run did not delete included
+#     (deleted without the lock, the command could still have been running).
+# Either way session.json goes when its end is the attempt's deadline: its
+# start never finished, so that session is never resumed (a SleepDisabled 1
+# someone else set would read as still off). "Never" puts sleepDisabledByUs
+# back as it was before the start (owedBefore), which keeps a restore an
+# earlier session still owes; anything else sets it, and the undo below
+# runs. The journal is published as below (copy, edit, verify, rename). If
+# session.json or the journal cannot be written, the start stays journaled
+# and the run undoes the journal as --force would, then exits 1; the next
+# run settles again, with no marker of its own to match, as "may have".
+# Skipped while the marker is still present, and for a journal that is
+# missing, not a regular file or malformed, which the rest of the run
+# handles.
+
+# Prints "never" when the receipt shows that the command for the start with
+# nonce $1, begun when the receipt's device:inode was $2, never turned sleep
+# off, or else why it may have. Every check matches
+# SleepOffReceipts.swift and the root command (AdministratorPrompt.swift):
+# the receipt, its folder and each folder above up to /, by lstat, must be
+# root's (or RECEIPT_OWNER's), with no write permission for group or others
+# and no access control entry that allows anything; the receipt a regular
+# file with one link and 45 bytes, the rest folders.
+receipt_verdict() { # nonce identity
+  local f="$RECEIPTS/$UID" p="$RECEIPTS" listing content line
+  local paths=("$f")
+  while [[ -n "$p" ]]; do paths+=("$p"); p="${p%/*}"; done
+  paths+=(/)
+  listing="$("$STAT" -f '%u %Lp %l %z %HT' "${paths[@]}" 2>/dev/null)" || listing=""
+  if ! printf '%s\n' "$listing" | /usr/bin/awk -v o="$RECEIPT_OWNER" -v n="${#paths[@]}" 'NR == 1 { k = NF == 6 && $5 == "Regular" && $6 == "File" && $3 == 1 && $4 == 45 }; NR > 1 { k = k && NF == 5 && $5 == "Directory" }; { k = k && ($1 == 0 || $1 == o) && $2 !~ /[2367].?$/ }; END { exit !(k && NR == n) }'; then
+    echo "$f is missing, is not the 45-byte file install.sh made, or someone other than root can change it or a folder above it"
+    return 0
+  fi
+  listing="$("$LS" -lde "${paths[@]}" 2>/dev/null)" || listing=""
+  if [[ -z "$listing" ]] || ! printf '%s\n' "$listing" | /usr/bin/awk '$1 ~ /^[0-9]+:$/ && / allow / { f = 1 }; END { exit f }'; then
+    echo "$f or a folder above it has an access control entry that allows changes, or could not be listed"
+    return 0
+  fi
+  if [[ "$("$STAT" -f '%d:%i' "$f" 2>/dev/null)" != "$2" ]]; then
+    echo "$f is not the file it was when the start began"
+    return 0
+  fi
+  content="$(/usr/bin/head -c 46 "$f" 2>/dev/null; echo .)"
+  content="${content%.}"
+  line="${content%$'\n'}"
+  if (( ${#content} != 45 )) || [[ "$line" == "$content" ]] || ! [[ "$line" =~ ^([0-9A-F-]{36})\ (writing|refused)$ ]]; then
+    echo "$f does not hold a nonce and writing or refused"
+    return 0
+  fi
+  if [[ "${BASH_REMATCH[1]}" != "$1" || "${BASH_REMATCH[2]}" == refused ]]; then
+    echo never
+  else
+    echo "$f shows that the command went on to turn sleep off"
+  fi
+}
+
+# A marker this run deleted that no journaled start accounts for was left
+# by a build from before sleepOffAttempt, or by a start that finished or
+# rolled back but could not delete it. Whether a command behind its dialog
+# turned sleep off is unknown, so session.json beside it is never resumed:
+# it goes, and a sleep entry still journaled is undone below like any other.
+# A session that had started and lost its marker only to a failed delete
+# ends early, which is the safe side. If session.json cannot be removed,
+# this run undoes the journal as --force would and exits 1.
+drop_unrecorded_session() {
+  [[ -n "$removed_marker" && -f "$SESSION" ]] || return 0
+  if "$RM" -f "$SESSION"; then
+    log info "removed $SESSION: it was beside a pending-start marker that no journaled start accounts for, so it is never resumed"
+  else
+    settle_failed="$SESSION, beside a pending-start marker that no journaled start accounts for, could not be removed"
+    log error "could not remove $SESSION beside a pending-start marker that no journaled start accounts for; undoing the journal as --force would"
+    force=1
+  fi
+}
+
+settle_attempt() {
+  local nonce owed receipt deadline verdict owes tmp
+  (( marker_stuck == 0 )) || return 0
+  if [[ ! -f "$STATE" ]] || [[ "$(type_of "$STATE" sleepOffAttempt)" != dictionary ]]; then
+    drop_unrecorded_session
+    return 0
+  fi
+  "$PLUTIL" -convert json -o /dev/null "$STATE" >/dev/null 2>&1 || return 0
+  [[ -z "$(journal_shape_problems "$STATE")" ]] || return 0
+  nonce="$(extract "$STATE" sleepOffAttempt.nonce || true)"
+  owed="$(extract "$STATE" sleepOffAttempt.owedBefore || true)"
+  receipt="$(extract "$STATE" sleepOffAttempt.receipt || true)"
+  deadline="$(extract "$STATE" sleepOffAttempt.deadline || true)"
+  if [[ "$(type_of "$STATE" sleepOffAttempt.marker)" != string ]]; then
+    verdict=never
+  elif [[ -z "$removed_marker" || "$removed_marker" != "$(extract "$STATE" sleepOffAttempt.marker || true)" ]]; then
+    verdict="the pending-start marker this run deleted is not the file that start wrote"
+  else
+    verdict="$(receipt_verdict "$nonce" "$receipt")"
+  fi
+  if [[ "$verdict" == never ]]; then
+    owes="$owed"
+    log info "settling an unfinished start: its receipt shows the command behind its dialog never turned sleep off; sleepDisabledByUs goes back to $owed"
+  else
+    owes=true
+    log info "settling an unfinished start as one that may have turned sleep off ($verdict); sleepDisabledByUs stays set"
+  fi
+  # Only a session.json this run can read as a session is matched; one it
+  # cannot read is treated as expired below, and the app never resumes it.
+  if [[ -f "$SESSION" ]] && cat "$SESSION" >/dev/null 2>&1 && [[ -z "$(session_shape_problems "$SESSION")" ]] \
+     && [[ "$(epoch_at "$SESSION" endsAt)" == "$deadline" ]]; then
+    if ! "$RM" -f "$SESSION"; then
+      settle_failed="the unfinished start is still journaled: $SESSION could not be removed"
+      log error "could not remove $SESSION of the unfinished start; undoing the journal as --force would"
+      force=1
+      return 0
+    fi
+    log info "removed $SESSION: its start never finished, so it is never resumed"
+  fi
+  tmp="$APP_SUPPORT/.state.json.settle.$$"
+  if "$CP" "$STATE" "$tmp" \
+     && "$PLUTIL" -remove sleepOffAttempt "$tmp" >/dev/null 2>&1 \
+     && "$PLUTIL" -replace sleepDisabledByUs -bool "$owes" "$tmp" >/dev/null 2>&1 \
+     && [[ "$("$PLUTIL" -convert json -o - "$tmp" 2>/dev/null | head -c 1)" == "{" ]] \
+     && [[ "$(head -c 1 "$tmp")" == "{" ]] \
+     && "$MV" -f "$tmp" "$STATE"; then
+    return 0
+  fi
+  "$RM" -f "$tmp"
+  settle_failed="the unfinished start is still journaled: the settled journal could not be published to $STATE"
+  log error "could not publish the settled start to $STATE; undoing the journal as --force would"
+  force=1
+}
+settle_failed=""
+settle_attempt
 
 # --- Read the session --------------------------------------------------------
 # session_state: none | valid | expired | malformed | unreadable
@@ -1301,6 +1479,9 @@ fi
 # --- Report ------------------------------------------------------------------
 if (( marker_stuck )); then
   failures+=("$PENDING is still present, so a password dialog left from an abandoned start could still turn sleep off")
+fi
+if [[ -n "$settle_failed" ]]; then
+  failures+=("$settle_failed")
 fi
 if (( ${#failures[@]} > 0 )); then
   for f in "${failures[@]}"; do log error "still journaled: $f"; done
