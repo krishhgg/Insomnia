@@ -349,9 +349,12 @@ final class LockEndRecordTests: XCTestCase {
     /// undo and keeps the inode. After every flag and both ACLs are
     /// repaired, the app launches first with SleepDisabled still 1: it ends
     /// the session instead of holding sleep again, removes session.json
-    /// and empties the lock file.
+    /// and empties the lock file. Neither folder takes the run's status
+    /// files either, so it waits for a status that never comes; the fake
+    /// commands get a 2 s limit instead of 30 s to shorten that wait.
     func testAnAgentEndRecordedOnlyInTheLockFileIsNotRevivedAfterAFullRepair() async throws {
         _ = try await startThenPinAll()
+        try agent.setCommandTimeout(2)
         let lockInode = try inode(lockFile)
         let bytes = try Data(contentsOf: h.home.paths.sessionFile)
         try agent.failSudo()

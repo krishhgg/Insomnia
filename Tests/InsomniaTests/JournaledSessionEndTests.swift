@@ -682,10 +682,13 @@ final class JournaledSessionEndTests: XCTestCase {
     /// remove session.json or write any record there, so it writes the
     /// record in the log folder, reads it back, and only then restores
     /// sleep. Its status files fail in that folder too, so the run exits 1
-    /// once its supervisor reports no result.
+    /// once its supervisor reports no result. The fake commands get a 2 s
+    /// limit instead of 30 s: the run waits for that missing status for the
+    /// limit plus the grace either way, and the fakes finish at once.
     private func endRecordedInTheLogFolder(restoreFails: Bool) async throws -> URL {
         _ = try await startThenPin()
         lockInodeAtStart = try lockFileInode()
+        try agent.setCommandTimeout(2)
         try setImmutable(h.home.paths.stateFile, true)
         if restoreFails { try agent.failSudo() }
         try TestACL.denyNewFiles(in: h.home.paths.appSupport)
@@ -911,8 +914,10 @@ final class JournaledSessionEndTests: XCTestCase {
     /// folders and state.json are repaired and the app launches first.
     /// session.json still cannot be replaced, so the app does not hold
     /// sleep again for it: it ends it and records the end in the journal.
+    /// The 2 s limit on the fakes is as in endRecordedInTheLogFolder.
     func testAnEndRecordedNowhereIsNotResumedWhileSessionJSONCannotBeReplaced() async throws {
         _ = try await startThenPin()
+        try agent.setCommandTimeout(2)
         try setImmutable(h.home.paths.stateFile, true)
         try agent.failSudo()
         try agent.refuseLockRecord()

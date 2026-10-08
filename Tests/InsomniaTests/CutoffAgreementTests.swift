@@ -800,20 +800,27 @@ final class CutoffAgreementTests: XCTestCase {
     /// For each text, the floor the agent enforces on that config.json is
     /// the one the app takes from it, or the agent's default 10% where the
     /// app rejects the file: the agent ends a session one point below it
-    /// and keeps it at it (at 0%, for a floor of 0, which is off).
+    /// and keeps it at it (at 0%, for a floor of 0, which is off). Each of
+    /// those agent runs gets its own home (`SeparateRun`), so they run
+    /// several at a time.
     private func assertTheAgentFollowsTheApp(_ table: [(text: String, app: Int?)],
                                              file: StaticString = #filePath, line: UInt = #line) async throws {
-        for (text, expected) in table {
-            try Data(#"{"endFloor": \#(text), "thermalRules": false}"#.utf8).write(to: h.home.paths.configFile)
+        var runs: [(run: SeparateRun, ends: Bool)] = []
+        for (row, (text, expected)) in table.enumerated() {
+            let config = Data(#"{"endFloor": \#(text), "thermalRules": false}"#.utf8)
+            try config.write(to: h.home.paths.configFile)
             let app = try? h.store.loadConfig()?.agentCutoffs.endFloor
             XCTAssertEqual(app, expected, "the app on endFloor \(text)", file: file, line: line)
             let floor = app ?? Config.agentDefaultCutoffs.endFloor
             if floor > 0 {
-                let below = try await agentEnds(atBattery: floor - 1, file: file, line: line)
-                XCTAssertTrue(below, "endFloor \(text): the agent keeps a session at \(floor - 1)%: \(logText())", file: file, line: line)
+                runs.append((try SeparateRun(in: h, name: "\(row)-below", config: config, battery: floor - 1), true))
             }
-            let at = try await agentEnds(atBattery: floor, file: file, line: line)
-            XCTAssertFalse(at, "endFloor \(text): the agent ends a session at \(floor)%: \(logText())", file: file, line: line)
+            runs.append((try SeparateRun(in: h, name: "\(row)-at", config: config, battery: floor), false))
+        }
+        let ended = try await SeparateRun.runAll(runs.map(\.run))
+        for ((run, ends), (status, ended)) in zip(runs, ended) {
+            XCTAssertEqual(status, 0, run.log, file: file, line: line)
+            XCTAssertEqual(ended, ends, "\(String(decoding: run.config, as: UTF8.self)): the agent \(ended ? "ends" : "keeps") a session at \(run.battery)%: \(run.log)", file: file, line: line)
         }
     }
 
@@ -903,5 +910,66 @@ final class CutoffAgreementTests: XCTestCase {
         XCTAssertEqual(try h.store.loadConfig()?.endFloor, m.config.agentCutoffs.endFloor, file: file, line: line)
         let control = try await agentEnds(atBattery: battery, file: file, line: line)
         XCTAssertEqual(control, expected, "the agent on the app's settings: \(logText())", file: file, line: line)
+    }
+}
+
+/// One agent run on its own INSOMNIA_HOME inside a test's home, so that
+/// runs which share nothing can go several at a time: config.json holding
+/// `config`, a session on disk whose journal holds sleep, as the app leaves
+/// one, the app's alive lock held, and the battery at `battery` percent on
+/// battery power at nominal heat. The same as `agentEnds(atBattery:)`, one
+/// home per run.
+struct SeparateRun {
+    let paths: Paths
+    let config: Data
+    let battery: Int
+    let agent: PatchedBackstop
+    let alive: AppAliveLock
+
+    @MainActor init(in h: Harness, name: String, config: Data, battery: Int) throws {
+        let root = h.home.root.appendingPathComponent("runs/\(name)", isDirectory: true)
+        paths = Paths(root: root)
+        try paths.createDirectories()
+        self.config = config
+        self.battery = battery
+        try config.write(to: paths.configFile)
+        let store = Store(paths: paths)
+        let now = h.clock.now
+        try store.saveSession(Session(startedAt: now, endsAt: now.addingTimeInterval(3600)))
+        var journal = RuntimeState()
+        journal.sleepDisabledByUs = true
+        try store.saveState(journal)
+        agent = try PatchedBackstop(home: root, dir: root.appendingPathComponent("agent", isDirectory: true))
+        try agent.setThermal(0)
+        try agent.setBattery(battery)
+        alive = AppAliveLock(url: paths.appAliveFile)
+        guard try alive.tryAcquire() else { throw CocoaError(.fileLocking) }
+    }
+
+    var log: String { (try? String(contentsOf: paths.logFile, encoding: .utf8)) ?? "" }
+
+    /// Runs each agent once, at most `width` at a time, then lets go of
+    /// each alive lock. Returns, in order, each exit status and whether the
+    /// run removed session.json.
+    static func runAll(_ runs: [SeparateRun], width: Int = 8) async throws -> [(status: Int32, ended: Bool)] {
+        var statuses = [Int32](repeating: -1, count: runs.count)
+        try await withThrowingTaskGroup(of: (Int, Int32).self) { group in
+            var next = 0
+            func add() {
+                guard next < runs.count else { return }
+                let (i, agent) = (next, runs[next].agent)
+                group.addTask { (i, try await agent.run()) }
+                next += 1
+            }
+            for _ in 0..<width { add() }
+            while let (i, status) = try await group.next() {
+                statuses[i] = status
+                add()
+            }
+        }
+        return try zip(runs, statuses).map { run, status in
+            run.alive.release()
+            return (status, try Store(paths: run.paths).loadSession() == nil)
+        }
     }
 }
