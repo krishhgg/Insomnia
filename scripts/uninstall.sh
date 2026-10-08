@@ -68,6 +68,7 @@ MKDIR=/bin/mkdir
 RM=/bin/rm
 RMDIR=/bin/rmdir
 MKTEMP=/usr/bin/mktemp
+STAT=/usr/bin/stat
 LOCK_TIMEOUT_SECONDS=10
 # How long to wait for the app to exit after asking it to quit.
 QUIT_WAIT_SECONDS=10
@@ -108,7 +109,9 @@ SESSION="$APP_SUPPORT/session.json"
 # When neither can be written, the same record goes to a new file,
 # ended-session.json. and eight letters or digits, beside them or in
 # $LOG_DIR (collect_end_records_aside below), removed the same way by both
-# modes, before --purge removes $LOG_DIR.
+# modes, before --purge removes $LOG_DIR. When no new file can be created
+# either, it goes in the recovery lock file, which both modes empty in
+# place and keep (clear_lock_record).
 ENDED="$APP_SUPPORT/ended-session.json"
 STATE="$APP_SUPPORT/state.json"
 CONFIG="$APP_SUPPORT/config.json"
@@ -253,6 +256,8 @@ journal_shape_problems() { # file
   done
   t="$(type_of "$f" endedSession)"
   [[ -z "$t" || "$t" == string || "$t" == "(any)" ]] || echo "endedSession is a $t, not a string"
+  # sessionCutoffs is not checked, as in backstop.sh: the app reads a value
+  # it does not write as none, and nothing here uses it.
   t="$(type_of "$f" frozenProcesses)"
   if [[ -n "$t" && "$t" != "(any)" ]]; then
     if [[ "$t" != array ]]; then
@@ -569,6 +574,40 @@ collect_end_records_aside() {
   return 0
 }
 
+# The recovery lock file may hold the record of a session's end that
+# backstop.sh or the app wrote there when nothing else took it (a tag and
+# session.json's bytes in base64; record_end_in_lock in backstop.sh).
+# session.json is gone by the time this runs (step 4 stops while it is
+# there), so such a record ends nothing; it is still a copy of that
+# session's times. The file is emptied in place, never unlinked, and only
+# while it is a regular file, not a symlink, owned by this user, and the
+# file this run holds the lock on (fd 9). Anything else is left and named,
+# and a failure counts like a file that could not be removed. A
+# session.json still there (one remove_owned could not remove) keeps the
+# record, which may be its end.
+clear_lock_record() {
+  local held named
+  [[ -e "$LOCK" || -L "$LOCK" ]] || return 0
+  if [[ -e "$SESSION" || -L "$SESSION" ]]; then
+    echo "Left the contents of $LOCK: $SESSION is still there, and they may record its end."
+    return 0
+  fi
+  if [[ ! -f "$LOCK" || -L "$LOCK" || ! -O "$LOCK" ]]; then
+    echo "Left the contents of $LOCK: it is not a regular file this user owns."
+    return 0
+  fi
+  [[ -s "$LOCK" ]] || return 0
+  held="$("$STAT" -f %i /dev/fd/9 2>/dev/null || true)"
+  named="$("$STAT" -f %i "$LOCK" 2>/dev/null || true)"
+  if [[ -n "$held" && "$held" == "$named" ]] && { : > "$LOCK"; } 2>/dev/null && [[ ! -s "$LOCK" ]]; then
+    echo "Emptied $LOCK of the record of a session's end; the file itself is kept."
+    return 0
+  fi
+  echo "Could not empty $LOCK of the record of a session's end; left in place." >&2
+  remove_failures=$((remove_failures + 1))
+  return 0
+}
+
 # Removes files Insomnia wrote, one path per argument. Only a regular file
 # is removed. Anything else at one of these paths is not something Insomnia
 # wrote; it is left and named, so a stray directory never stops the run
@@ -849,6 +888,7 @@ if (( PURGE == 1 )); then
   if (( ${#END_RECORDS_ASIDE[@]} > 0 )); then
     remove_owned "${END_RECORDS_ASIDE[@]}"
   fi
+  clear_lock_record
   for name in session.json config.json; do
     collect_moved_aside "$name"
     if (( ${#MOVED_ASIDE[@]} > 0 )); then
@@ -864,7 +904,8 @@ if (( PURGE == 1 )); then
   # it, and anything that opened it a moment ago (a queued agent run, an app
   # launched after the check above) waits on this inode. Unlinking it would
   # let the next opener create a second lock nobody else sees. A leftover
-  # empty lock file and its directory are the accepted cost.
+  # empty lock file (emptied of any end record above) and its directory are
+  # the accepted cost.
   "$RMDIR" "$LOG_DIR" 2>/dev/null || true
   (( OWN_LAUNCH_AGENTS_DIR == 1 )) && { "$RMDIR" "$LAUNCH_AGENTS" 2>/dev/null || true; }
   echo "Kept $LOCK (the recovery lock is never unlinked; delete $APP_SUPPORT by hand if you want it gone)."
@@ -877,6 +918,7 @@ else
   if (( ${#END_RECORDS_ASIDE[@]} > 0 )); then
     remove_owned "${END_RECORDS_ASIDE[@]}"
   fi
+  clear_lock_record
   echo "Kept $APP_SUPPORT/config.json and $LOG_DIR (use --purge to remove)."
   for name in session.json config.json; do
     collect_moved_aside "$name"

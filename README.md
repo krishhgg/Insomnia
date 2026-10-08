@@ -345,10 +345,16 @@ passes the file to the app's binary in `~/Applications/Insomnia.app` with
 floor and the thermal setting, and exits without starting the app. This runs
 once a minute while a session is valid, the app is running and the file
 exists. Without the file, or with one the app rejects or cannot read, the
-agent uses the app's defaults (10%, on). When the binary cannot answer (it
+agent uses the end floor and thermal setting the app recorded for the session
+in `state.json`, read the same way with `--agent-session-cutoffs`. The app
+records them before a session starts or resumes and before a change to
+either takes effect; when it cannot, it refuses the change or ends the
+session. A journal without them (a session an older build started) gives the
+app's defaults (10%, on). When the binary cannot answer (it
 was removed or replaced by an older or newer build after the agent checked
 the bundle's signature, it gives no usable answer within 30 seconds, or
-`config.json` is over 8 MiB), the agent uses the strictest values instead, a
+`config.json` is over 8 MiB), or the journal holds a value the app does not
+write, the agent uses the strictest values instead, a
 95% end floor with the thermal rule on, and logs why. Each
 early end is logged with its reason, and the saved session is deleted before
 the restore starts. A restore that cannot finish leaves entries in the journal
@@ -356,14 +362,19 @@ for the next run and the app. If the saved session cannot be deleted, its end
 is recorded before anything is restored: in `ended-session.json`; when that
 file cannot be written, in the journal (`endedSession` in `state.json`); when
 neither can be written, in a new file beside them named `ended-session.json.`
-followed by eight letters or digits; and when that folder takes no new file,
-in a file with such a name in `~/Library/Logs/Insomnia`. The agent reads each
+followed by eight letters or digits; when that folder takes no new file,
+in a file with such a name in `~/Library/Logs/Insomnia`; and when neither
+folder takes one, in the recovery lock file `.recovery.lock`, which exists
+already. That record is written in place, so the file keeps its inode and
+stays the lock both sides take, and content there that is not a whole record
+counts as the end of whatever session is saved. The agent reads each
 record back before it restores anything. The app and the agent count a record
 only if it is a regular file you own, not a link, and the log folder only if
 it is a real folder you own, not a link. While a record matches the saved
 session byte for byte, the app restores that session instead of resuming it,
 whatever `pmset` reports, and every agent run ends it again. Only when neither
-folder takes a new file is nothing recorded. The agent still runs the restore,
+folder takes a new file and the lock file takes no write either (a full disk,
+say) is nothing recorded. The agent still runs the restore,
 but it cannot confirm the result, so it keeps the journal and exits 1. The app
 resumes no session while it cannot write `state.json`, none whose journal says
 sleep is held while `pmset` reports it is not, and none whose `session.json`
@@ -599,7 +610,7 @@ starts no session and ends a running one. Make the file writable or delete
 it. After a rename or a delete, the app writes the settings it runs on in the
 file's place. When that write fails (a full disk, for example), no session
 runs unless the app's end floor and thermal setting are the defaults the
-backstop uses without the file (10%, on). Local logs can contain SSIDs,
+backstop falls back to without the file (10%, on). Local logs can contain SSIDs,
 process metadata, and tmux targets. Check them before sharing publicly.
 Lines the app writes to `insomnia.log` also go to the unified log with their
 bodies marked private, so `log show` and other local programs see `<private>`

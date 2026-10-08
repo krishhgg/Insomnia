@@ -42,7 +42,9 @@ wrong type is left untouched and the run exits 1.
 
 The app and the script serialize on one `flock(2)` lock,
 `.recovery.lock`, which is never unlinked so both lock the same inode
-(`RecoveryLock.swift`; `lockf` on fd 9 in the scripts). `uninstall.sh`
+(`RecoveryLock.swift`; `lockf` on fd 9 in the scripts). It may also hold a
+record of a session's end (`ended-session-v1 <base64>`), written in place
+through the held descriptor and never by replacing the file. `uninstall.sh`
 takes the lock, runs the backstop with `--force` under it, and refuses to
 remove the recovery machinery while anything is still journaled. Battery
 and thermal floors run only while the app is alive; the backstop does not

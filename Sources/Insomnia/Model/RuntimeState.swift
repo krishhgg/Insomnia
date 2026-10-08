@@ -155,6 +155,20 @@ struct RuntimeState: Codable, Equatable, Sendable {
     /// entry, and only this app removes it, before it writes a new
     /// session.json and after it removes one.
     var endedSession: String? = nil
+    /// The end floor and thermal rule the app enforces for the session in
+    /// session.json, recorded before the session starts or resumes and
+    /// before a change to them takes effect (`SessionManager`'s start,
+    /// reconcile, `publishSessionCutoffs` and `updateConfig`). backstop.sh
+    /// enforces config.json's cutoffs, and these while config.json is
+    /// missing, cannot be read, or holds bytes the app rejects, so a hung
+    /// app's session keeps the floor it had. Written as
+    /// `AgentCutoffs.journalValue` ("30 false"). A record, not something to
+    /// undo: it counts neither as dirty nor as an undo entry, backstop.sh
+    /// keeps it as it is, and the app clears it when it removes
+    /// session.json. A value the app does not write decodes as nil here
+    /// (`decodeSessionCutoffs`), so the app records its own over it; the
+    /// agent's reader rejects it and enforces the strictest cutoffs.
+    var sessionCutoffs: AgentCutoffs? = nil
 
     /// Bare pids of every journaled freeze, for display and de-duplication.
     var frozenPids: [Int32] { frozenProcesses.map(\.pid) }
@@ -164,12 +178,14 @@ struct RuntimeState: Codable, Equatable, Sendable {
 
     /// The undo entries alone: the state without
     /// `displayRestoredUnderLowPower`, a write owed after the mode rather
-    /// than something to undo, and without `endedSession`, a record. Two
-    /// states with equal entries owe the same undos.
+    /// than something to undo, and without `endedSession` and
+    /// `sessionCutoffs`, records. Two states with equal entries owe the same
+    /// undos.
     var undoEntries: RuntimeState {
         var entries = self
         entries.displayRestoredUnderLowPower = nil
         entries.endedSession = nil
+        entries.sessionCutoffs = nil
         return entries
     }
 
@@ -212,7 +228,7 @@ struct RuntimeState: Codable, Equatable, Sendable {
         case sleepDisabledByUs, lowPowerSetByUs, frozenProcesses, frozenPids, dockerFrozen
         case savedAudioOutputs, savedOutputVolume, savedMuted
         case savedDisplayBrightness, savedKeyboardBrightness, displayRestoredUnderLowPower
-        case appNapOverrides, endedSession
+        case appNapOverrides, endedSession, sessionCutoffs
     }
 
     // Tolerate missing keys so a state.json written by an older build, or by
@@ -239,6 +255,26 @@ struct RuntimeState: Codable, Equatable, Sendable {
         displayRestoredUnderLowPower = try c.decodeIfPresent(Float.self, forKey: .displayRestoredUnderLowPower)
         appNapOverrides = try c.decodeIfPresent([AppNapOverride].self, forKey: .appNapOverrides) ?? []
         endedSession = try c.decodeIfPresent(String.self, forKey: .endedSession)
+        sessionCutoffs = try? Self.decodeSessionCutoffs(from: decoder)
+    }
+
+    private enum SessionCutoffsKey: String, CodingKey {
+        case sessionCutoffs
+    }
+
+    /// The journal's `sessionCutoffs` as the agent's reader takes it
+    /// (`AgentCutoffsCommand`'s `--agent-session-cutoffs`): nil when the key
+    /// is absent or null; throws when the journal is not a JSON object or
+    /// the value is not a string `AgentCutoffs(journalValue:)` reads.
+    /// Duplicate and escaped keys come out as this decoder reads them.
+    /// `init(from:)` takes a throw as nil.
+    static func decodeSessionCutoffs(from decoder: Decoder) throws -> AgentCutoffs? {
+        let c = try decoder.container(keyedBy: SessionCutoffsKey.self)
+        guard let text = try c.decodeIfPresent(String.self, forKey: .sessionCutoffs) else { return nil }
+        guard let cutoffs = AgentCutoffs(journalValue: text) else {
+            throw DecodingError.dataCorruptedError(forKey: .sessionCutoffs, in: c, debugDescription: "\(text.debugDescription) is not an end floor from 0 to \(Config.maxEndFloor) and true or false, such as \"30 false\"")
+        }
+        return cutoffs
     }
 
     /// `frozenPids` is read for migration only and never written again, so
@@ -259,5 +295,16 @@ struct RuntimeState: Codable, Equatable, Sendable {
         // Only when set, so a journal without a record keeps the bytes
         // earlier builds wrote.
         try c.encodeIfPresent(endedSession, forKey: .endedSession)
+        try c.encodeIfPresent(sessionCutoffs?.journalValue, forKey: .sessionCutoffs)
+    }
+}
+
+/// state.json's `sessionCutoffs` alone, read strictly
+/// (`RuntimeState.decodeSessionCutoffs`), for `AgentCutoffsCommand`.
+struct JournaledSessionCutoffs: Decodable {
+    let cutoffs: AgentCutoffs?
+
+    init(from decoder: Decoder) throws {
+        cutoffs = try RuntimeState.decodeSessionCutoffs(from: decoder)
     }
 }

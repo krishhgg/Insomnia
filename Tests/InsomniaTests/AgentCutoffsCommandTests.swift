@@ -3,10 +3,12 @@ import Foundation
 import XCTest
 @testable import Insomnia
 
-/// `Insomnia --agent-cutoffs`: the one-shot mode backstop.sh runs to read
-/// config.json with the app's decoder. The mapping is tested in process
-/// with injected input; the built binary is run with its input in a file or
-/// an open pipe, in a temp INSOMNIA_HOME and HOME that it must leave empty.
+/// `Insomnia --agent-cutoffs` and `--agent-session-cutoffs`: the one-shot
+/// modes backstop.sh runs to read config.json, and the cutoffs the journal
+/// records for the session, with the app's decoder. The mapping is tested
+/// in process with injected input; the built binary is run with its input
+/// in a file or an open pipe, in a temp INSOMNIA_HOME and HOME that it must
+/// leave empty.
 final class AgentCutoffsCommandTests: XCTestCase {
     /// Runs the mode in process with `input`. The lifetime is recorded,
     /// never armed: an alarm would end the test runner.
@@ -32,7 +34,8 @@ final class AgentCutoffsCommandTests: XCTestCase {
     /// "usage" with EX_USAGE before standard input is read.
     func testBadArgumentsAreAUsageErrorBeforeAnythingIsRead() {
         for arguments in [["--agent-cutoffs"], ["--agent-cutoffs", "0"], ["--agent-cutoffs", "301"], ["--agent-cutoffs", "x"],
-                          ["--agent-cutoffs", "-5"], ["--agent-cutoffs", "0030"], ["--agent-cutoffs", "30", "30"]] {
+                          ["--agent-cutoffs", "-5"], ["--agent-cutoffs", "0030"], ["--agent-cutoffs", "30", "30"],
+                          ["--agent-session-cutoffs"], ["--agent-session-cutoffs", "0"], ["--agent-session-cutoffs", "30", "30"]] {
             let read = Locked(0)
             let armed = Locked<[UInt32]>([])
             let out = AgentCutoffsCommand.run(arguments, input: { read.value += 1; return Data("{}".utf8) }, endAfter: { armed.value.append($0) })
@@ -55,6 +58,20 @@ final class AgentCutoffsCommandTests: XCTestCase {
 
     func testInputThatCannotBeReadIsUnreadable() {
         XCTAssertEqual(run(["--agent-cutoffs", "5"], input: nil), .init(lines: ["unreadable"], status: AgentCutoffsCommand.unreadableStatus))
+        XCTAssertEqual(run(["--agent-session-cutoffs", "5"], input: nil), .init(lines: ["unreadable"], status: AgentCutoffsCommand.unreadableStatus))
+    }
+
+    /// Each mode reads its own file: config.json's bytes are no journal
+    /// record, and the journal's are no config.json.
+    func testEachModeAnswersForItsOwnFile() {
+        let armed = Locked<[UInt32]>([])
+        XCTAssertEqual(run(["--agent-session-cutoffs", "33"], input: Data(#"{"sessionCutoffs":"30 false"}"#.utf8), armed: armed),
+                       .init(lines: ["cutoffs 30 false"], status: 0))
+        XCTAssertEqual(armed.value, [33])
+        XCTAssertEqual(run(["--agent-session-cutoffs", "33"], input: Data(#"{"endFloor":30,"thermalRules":false}"#.utf8)),
+                       .init(lines: ["none"], status: 0))
+        XCTAssertEqual(run(["--agent-cutoffs", "33"], input: Data(#"{"sessionCutoffs":"30 false"}"#.utf8)),
+                       .init(lines: ["cutoffs 10 true"], status: 0))
     }
 
     /// The answer is `Store.decodeConfig` on the same bytes, as
@@ -103,6 +120,89 @@ final class AgentCutoffsCommandTests: XCTestCase {
             try data.write(to: home.paths.configFile)
             let app = try? store.loadConfig()?.agentCutoffs
             XCTAssertEqual(app.map { "cutoffs \($0.endFloor) \($0.thermalRules)" } ?? "rejected", answer, "Store.loadConfig on \(text)")
+        }
+    }
+
+    /// The journal's sessionCutoffs as the agent's mode reads it, and as
+    /// the app reads it (`Store.loadState`): the same cutoffs where the
+    /// value is one the app writes, through the same decoder, so duplicate
+    /// and escaped keys pick the same value. Absent or null is none, a
+    /// session an older build started. Any other value is rejected by the
+    /// agent, which then enforces the strictest cutoffs, and read as none
+    /// by the app, which records its own over it at its next transaction;
+    /// a journal that is not a JSON object is rejected by both.
+    func testTheSessionAnswerIsTheAppsReadingOfTheJournal() throws {
+        let journal = #""sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false"#
+        let cases: [(value: String?, answer: String)] = [
+            (#""sessionCutoffs":"30 false""#, "cutoffs 30 false"),
+            (#""sessionCutoffs":"0 false""#, "cutoffs 0 false"),
+            (#""sessionCutoffs":"95 true""#, "cutoffs 95 true"),
+            (#""sessionCutoffs":"5 true""#, "cutoffs 5 true"),
+            (#""sessionCutoffs":"30 false","sessionCutoffs":"0 true""#, "cutoffs 30 false"),
+            (#""sessionCutoffs":"0 true","sessionCutoffs":"30 false""#, "cutoffs 0 true"),
+            (#""session\u0043utoffs":"30 false","sessionCutoffs":"0 true""#, "cutoffs 30 false"),
+            (#""sessionCutoffs":"30 false","session\u0043utoffs":"0 true""#, "cutoffs 30 false"),
+            (#""sessionCutoffs":"\u0033\u0030 false""#, "cutoffs 30 false"),
+            (nil, "none"),
+            (#""sessionCutoffs":null"#, "none"),
+            (#""sessioncutoffs":"30 false""#, "none"),
+            (#""sessionCutoffs":"96 false""#, "rejected"),
+            (#""sessionCutoffs":"100 true""#, "rejected"),
+            (#""sessionCutoffs":"-1 true""#, "rejected"),
+            (#""sessionCutoffs":"+5 true""#, "rejected"),
+            (#""sessionCutoffs":"030 false""#, "rejected"),
+            (#""sessionCutoffs":"05 false""#, "rejected"),
+            (#""sessionCutoffs":"30  false""#, "rejected"),
+            (#""sessionCutoffs":" 30 false""#, "rejected"),
+            (#""sessionCutoffs":"30 false ""#, "rejected"),
+            (#""sessionCutoffs":"30\tfalse""#, "rejected"),
+            (#""sessionCutoffs":"30 FALSE""#, "rejected"),
+            (#""sessionCutoffs":"30 off""#, "rejected"),
+            (#""sessionCutoffs":"30""#, "rejected"),
+            (#""sessionCutoffs":"""#, "rejected"),
+            (#""sessionCutoffs":"\u0663\u0660 false""#, "rejected"),
+            (#""sessionCutoffs":30"#, "rejected"),
+            (#""sessionCutoffs":true"#, "rejected"),
+            (#""sessionCutoffs":["30 false"]"#, "rejected"),
+            (#""sessionCutoffs":{"endFloor":30}"#, "rejected"),
+            (#""sessionCutoffs":"30 false","sessionCutoffs":30"#, "cutoffs 30 false"),
+            (#""sessionCutoffs":30,"sessionCutoffs":"30 false""#, "rejected"),
+        ]
+        let home = TempHome()
+        defer { home.destroy() }
+        try home.paths.createDirectories()
+        let store = Store(paths: home.paths)
+        for (value, answer) in cases {
+            let text = "{" + journal + (value.map { "," + $0 } ?? "") + "}"
+            let data = Data(text.utf8)
+            let out = AgentCutoffsCommand.sessionAnswer(for: data)
+            XCTAssertEqual(out.lines, [answer], text)
+            XCTAssertEqual(out.status, answer == "rejected" ? AgentCutoffsCommand.rejectedStatus : 0, text)
+            try data.write(to: home.paths.stateFile)
+            let app = try store.loadState()
+            XCTAssertEqual(app?.sleepDisabledByUs, true, "the rest of the journal reads as written: \(text)")
+            let expected = answer.hasPrefix("cutoffs ") ? AgentCutoffs(journalValue: String(answer.dropFirst("cutoffs ".count))) : nil
+            XCTAssertEqual(app?.sessionCutoffs, expected, "Store.loadState on \(text)")
+        }
+        for text in ["", "not json", #"["sessionCutoffs","30 false"]"#, #""30 false""#, #"{"sessionCutoffs":"30 false"} trailing"#] {
+            XCTAssertEqual(AgentCutoffsCommand.sessionAnswer(for: Data(text.utf8)), .init(lines: ["rejected"], status: AgentCutoffsCommand.rejectedStatus), text)
+            try Data(text.utf8).write(to: home.paths.stateFile)
+            XCTAssertThrowsError(try store.loadState(), text)
+        }
+    }
+
+    /// `AgentCutoffs.journalValue` round-trips every floor the app can
+    /// enforce, and its reader takes nothing else.
+    func testTheJournalFormRoundTripsEveryCutoffAndNothingElse() {
+        for floor in 0...Config.maxEndFloor {
+            for rule in [true, false] {
+                let cutoffs = AgentCutoffs(endFloor: floor, thermalRules: rule)
+                XCTAssertEqual(AgentCutoffs(journalValue: cutoffs.journalValue), cutoffs, cutoffs.journalValue)
+            }
+        }
+        XCTAssertEqual(AgentCutoffs(endFloor: 30, thermalRules: false).journalValue, "30 false")
+        for text in ["96 true", "99 false", "00 true", "1 yes", "true 30", "30 true true", "30", "", " ", "1e1 true", "0x1 true", "٣ true"] {
+            XCTAssertNil(AgentCutoffs(journalValue: text), text)
         }
     }
 
@@ -170,6 +270,29 @@ final class AgentCutoffsCommandTests: XCTestCase {
         XCTAssertEqual(usage.status, AgentCutoffsCommand.usageStatus)
         XCTAssertEqual(usage.stdout, "usage\n")
         XCTAssertTrue(usage.stderr.hasPrefix("usage: Insomnia --agent-cutoffs"), usage.stderr)
+        XCTAssertEqual(usage.left, [])
+    }
+
+    /// The same for the journal's cutoffs: one line, no file written.
+    func testBuiltBinaryAnswersForTheJournalWithoutStartingTheAppOrWritingAFile() throws {
+        let cases: [(input: String, line: String, status: Int32)] = [
+            (#"{"sleepDisabledByUs":true,"sessionCutoffs":"30 false","sessionCutoffs":"0 true"}"#, "cutoffs 30 false", 0),
+            (#"{"sleepDisabledByUs":true}"#, "none", 0),
+            (#"{"sleepDisabledByUs":true,"sessionCutoffs":"96 false"}"#, "rejected", AgentCutoffsCommand.rejectedStatus),
+            (#"{"sleepDisabledByUs":true,"sessionCutoffs":30}"#, "rejected", AgentCutoffsCommand.rejectedStatus),
+        ]
+        for c in cases {
+            let r = try runBinary(["--agent-session-cutoffs", "30"], input: Data(c.input.utf8))
+            XCTAssertEqual(r.status, c.status, c.input)
+            XCTAssertEqual(r.stdout, c.line + "\n", c.input)
+            XCTAssertEqual(r.stderr, "", c.input)
+            XCTAssertEqual(r.left, [], c.input)
+        }
+        let usage = try runBinary(["--agent-session-cutoffs", "x"], input: Data("{}".utf8))
+        XCTAssertEqual(usage.status, AgentCutoffsCommand.usageStatus)
+        XCTAssertEqual(usage.stdout, "usage\n")
+        XCTAssertTrue(usage.stderr.hasPrefix("usage: Insomnia --agent-session-cutoffs"), usage.stderr)
+        XCTAssertTrue(usage.stderr.hasSuffix("< state.json\n"), usage.stderr)
         XCTAssertEqual(usage.left, [])
     }
 

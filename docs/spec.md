@@ -487,25 +487,46 @@ any other field therefore read the same on both sides. The backstop runs it
 as one of its bounded reads (section 8): without the recovery lock's
 descriptor, stopped with SIGTERM after `COMMAND_TIMEOUT_SECONDS` (30) and
 with SIGKILL 3 seconds later. It runs the binary only when the bundle's
-Info.plist declares `InsomniaAgentCutoffsVersion` 1, the version the script
+Info.plist declares `InsomniaAgentCutoffsVersion` 2, the version the script
 speaks, since an older build has no such mode and would open the menu bar
-app instead. A missing file, one that is not a regular file (never opened),
-one this user cannot read, and the answer `rejected` (the decoder refused
-the bytes) give the app's defaults, 10% and on. Any other outcome gives the
-strictest values, a 95% end floor with thermal rules on, and a log line
-naming the cause: the binary missing or not executable, or another
-declared version (the agent runs only the script sealed in
-`~/Applications/Insomnia.app`, after checking that bundle's signature, so
-these need the bundle removed or replaced during the run), no answer in
-time, more than 8 MiB of input, or output in another form. Until the
-installed binary answers again, that fallback ends a session on battery
-power below 95% and ends one at critical heat even with the thermal rule
-off. A config.json removed between the check and the open also gives the
-strictest values for that run. The app takes those two values only from a
-file that decodes, runs no session while a config.json it rejected stays in
-place, and writes its settings where the file is missing (section 10),
-since the agent enforces the defaults for both and they need not be the
-settings in use.
+app instead.
+
+A missing file, one that is not a regular file (never opened), one this
+user cannot read, and the answer `rejected` (the decoder refused the bytes)
+give the cutoffs the app recorded for the session in `state.json`:
+`sessionCutoffs`, the end floor and the rule as `"30 false"`. The backstop
+reads them the same way, through the app's decoder: it opens a readable
+regular `state.json` once and passes its bytes to
+`Insomnia --agent-session-cutoffs 33`, which prints
+`cutoffs <endFloor> <thermalRules>`, or `none` for a journal without them (a
+session an older build started). `none`, and no `state.json` at all, give
+the app's defaults, 10% and on. The app records them before a session
+starts (with `sleepDisabledByUs`) or resumes, before a Settings change to
+either takes effect (under the recovery lock taken without waiting, before
+`config.json` is written; a busy lock or a failed write refuses the change
+and a failed `config.json` write puts the record back), and in the next
+transaction after it adopts a hand edit or finds another record there. A
+transaction that cannot record them ends the session (`cutoffsNotRecorded`).
+So a session whose app has stopped answering keeps the floor and rule the
+app enforced, also after its `config.json` is deleted or rejected. The
+record is not an undo entry: it never makes the journal dirty, the backstop
+never changes it, and the app clears it when it removes `session.json`. The
+app reads a value it does not write as none and records its own over it.
+
+Any other outcome gives the strictest values, a 95% end floor with thermal
+rules on, and a log line naming the cause: the binary missing or not
+executable, or another declared version (the agent runs only the script
+sealed in `~/Applications/Insomnia.app`, after checking that bundle's
+signature, so these need the bundle removed or replaced during the run), no
+answer in time, more than 8 MiB of input, output in another form, a
+`state.json` that is not a regular file this user can read, or a
+`sessionCutoffs` the app does not write (`rejected` from the journal).
+Until the installed binary answers again, that fallback ends a session on
+battery power below 95% and ends one at critical heat even with the thermal
+rule off. A config.json removed between the check and the open also gives
+the strictest values for that run. The app takes those two values only from
+a file that decodes, runs no session while a config.json it rejected stays
+in place, and writes its settings where the file is missing (section 10).
 Performance effects depend on workload.
 
 ### 7. Network failover
@@ -795,7 +816,8 @@ Backstop, independent of the app:
   app restores) leaves journal entries, not a session to resume. The app ends
   its side when it sees `session.json` gone. A file that cannot be removed is
   recorded as ended instead (below); the one gap is when neither its folder
-  nor the log folder takes a new file.
+  nor the log folder takes a new file and the recovery lock file takes no
+  write either.
 - A `session.json` that cannot be removed (an immutable file) is recorded as
   ended in `ended-session.json`, a copy of its bytes. The app writes the same
   record when its own end cannot remove the file. When `ended-session.json`
@@ -805,8 +827,30 @@ Backstop, independent of the app:
   written either (all three files immutable), the record goes to a new file
   named `ended-session.json.` and eight letters or digits, in the same folder
   or, when that folder takes no new file (a deny ACL, say), in the log
-  folder `~/Library/Logs/Insomnia`. It is created exclusively (`mktemp` in
-  the agent, `O_EXCL` with a random name in the app), mode 0600, and kept
+  folder `~/Library/Logs/Insomnia`. When neither folder takes one, the
+  record goes into the recovery lock file `.recovery.lock`, which exists
+  already: `ended-session-v1 `, the bytes in base64 and a newline, at most 1
+  MiB. Both sides write it in place while they hold the lock (the app
+  through the lock's own descriptor, with `pwrite`, `ftruncate` and `fsync`,
+  only while the path still names that file, a regular file this user owns;
+  the agent with `>`, only while the path names the file its fd 9 holds, a
+  regular file this user owns, so a write cut short there can also leave an
+  empty file, which is no record and fails the read-back), so the file keeps
+  its inode and stays the lock every party takes. Both read it back before
+  they undo anything. The lock file is read only while it is a regular file
+  this user owns (`lstat`, `O_NOFOLLOW` in the app; `-L`, `-f`, `-O` in the
+  agent); anything else holds no record and is never written. Empty content
+  is no record. Content that is no whole record of that form (a write cut
+  short, more than 1 MiB, or a file that cannot be read) counts as the end
+  of whatever `session.json` holds, until that file is gone or replaced. The
+  app empties the record when it removes `session.json` and when a start
+  replaces it (a start that fails puts it back with the old file, byte for
+  byte), and each agent run empties a record of other bytes, or any content
+  once `session.json` is gone, as it does a stale record aside.
+  `uninstall.sh` empties it in both modes, never removing the file. A start
+  refuses while the lock file cannot be read whole, since it could not put a
+  record back. A record aside is created exclusively (`mktemp` in the agent,
+  `O_EXCL` with a random name in the app), mode 0600, and kept
   only when it reads back identical. Only a regular file of exactly that
   name owned by this user counts; a symlink, a FIFO, another owner's file or
   another name is never opened or removed. The log folder is searched and
@@ -824,11 +868,18 @@ Backstop, independent of the app:
   ends another. A record aside is removed with `session.json` by the app and
   the agent, and by each agent run once it differs from `session.json` byte
   for byte or the file is gone; one `cmp` cannot read stays and ends
-  nothing. `uninstall.sh` removes the rest from both folders, with or
-  without `--purge`. If no record can be written at all, which needs both
-  folders to take no new file, the agent still runs the restore but cannot
-  write the status files that confirm it, so the run reports no result,
-  keeps the journal as it was and exits 1, and uninstall stops. The app
+  nothing. `ended-session.json` follows the same rule: the app and each
+  agent run remove it only once it differs from `session.json` or the file
+  is gone, and keep it while `session.json` cannot be read; both follow a
+  symlink there to a regular file and check no owner, and an unreadable
+  record ends nothing while it stays unreadable. `uninstall.sh` removes the
+  rest from both folders, with or without `--purge`. When neither folder
+  takes a new file, the agent still runs the restore but cannot write the
+  status files that confirm it, so the run reports no result, keeps the
+  journal as it was and exits 1, and uninstall stops; a record in the lock
+  file still ends the session for the app and every later run. No record can
+  be written at all only when the lock file takes no write either (not a
+  regular file this user owns, or a full disk). The app
   writes the journal before it resumes any session, so it resumes none
   while `state.json` cannot be written. A relaunch that finds
   `sleepDisabledByUs` while `pmset` reports `SleepDisabled 0` ends the
@@ -1062,14 +1113,17 @@ checks the file again:
   Power Mode floor above the end floor if needed, and logs the change. No
   other setting changes, and the file is not rewritten.
 - A missing file (deleted, or never written) gets the settings the app runs
-  on written in its place. While it is missing, the backstop enforces its
-  own defaults (10%, thermal rules on). When the write fails, as on a full
-  disk, and the app's end floor and thermal rule are those defaults, both
-  sides agree: the session goes on, the failure is logged once, and every
-  transaction writes again. When they differ, no session runs (below).
+  on written in its place. While it is missing, the backstop enforces the
+  cutoffs the journal records for the session (section 6), or its own
+  defaults (10%, thermal rules on) where it records none. When the write
+  fails, as on a full disk, and the app's end floor and thermal rule are
+  those defaults, the session goes on, the failure is logged once, and
+  every transaction writes again. When they differ, no session runs
+  (below), as before the journal recorded them: a Start would then rest on
+  the journal record alone.
 - A file that does not decode is renamed aside as at launch, and the
   settings the app runs on are written in its place. Until then the
-  backstop enforces the defaults for it, as for a missing file. A rejected
+  backstop enforces the journal's record for it, as for a missing file. A rejected
   file that cannot be renamed and that a person then deletes gets the same
   write.
 

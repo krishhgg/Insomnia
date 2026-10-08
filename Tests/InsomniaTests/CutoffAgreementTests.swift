@@ -424,6 +424,277 @@ final class CutoffAgreementTests: XCTestCase {
         try await assertBoth(m, critical: false, battery: 4, end: true)
     }
 
+    // MARK: The cutoffs recorded for the session
+
+    /// A config.json the app's decoder rejects for a field other than the
+    /// cutoffs (freezeList 42).
+    private let rejectedConfig = Data(#"{"endFloor":30,"thermalRules":false,"configVersion":2,"lidCloseDefaultsApplied":true,"freezeList":42}"#.utf8)
+
+    private func recorded() throws -> AgentCutoffs? { try h.store.loadState()?.sessionCutoffs }
+
+    /// The round-24 review's case: a session on a 30% floor with the thermal
+    /// rules off, and an app that has stopped answering (no transaction
+    /// runs; the alive lock stays held). config.json is then rejected as a
+    /// whole, or deleted. The agent enforces the cutoffs the app recorded
+    /// for the session in state.json, so at 20% both end it, and at 40%,
+    /// at critical heat too, both keep it: neither the agent's defaults
+    /// (10%, rule on) nor the strictest (95%, rule on) apply. The agent's
+    /// end leaves the record; the app's end of the session clears it.
+    func testAHungSessionKeepsItsRecordedCutoffsWhileConfigIsRejectedOrMissing() async throws {
+        let m = try await startWith(endFloor: 30, thermalRules: false)
+        let cutoffs = AgentCutoffs(endFloor: 30, thermalRules: false)
+        XCTAssertEqual(try recorded(), cutoffs, "Start records them")
+        let session = try Data(contentsOf: h.home.paths.sessionFile)
+        let journal = try Data(contentsOf: h.home.paths.stateFile)
+        let breaks: [(name: String, breakIt: () throws -> Void)] = [
+            ("rejected", { try self.rejectedConfig.write(to: self.h.home.paths.configFile) }),
+            ("missing", { try? FileManager.default.removeItem(at: self.h.home.paths.configFile) }),
+        ]
+        for (name, breakIt) in breaks {
+            for (battery, critical, end) in [(40, true, false), (40, false, false), (31, false, false), (29, false, true), (20, false, true)] {
+                try session.write(to: h.home.paths.sessionFile)
+                try journal.write(to: h.home.paths.stateFile)
+                try breakIt()
+                agent.clearCalls()
+                XCTAssertEqual(appEnds(m, critical: critical, battery: battery), end, "the app at \(battery)%")
+                try agent.setBattery(battery)
+                let ended = try await agentEnds(level: critical ? 3 : 0)
+                XCTAssertEqual(ended, end, "\(name) config.json at \(battery)%, critical \(critical): \(logText())")
+                XCTAssertEqual(try recorded(), cutoffs, "the agent keeps the record")
+            }
+        }
+        XCTAssertTrue(logText().contains("below the 30% end floor"), logText())
+        XCTAssertFalse(logText().contains("enforcing the strictest"), logText())
+
+        await m.noticeAgentEnd()
+        XCTAssertFalse(m.isActive)
+        XCTAssertNil(try recorded(), "the app clears it once session.json is gone")
+    }
+
+    /// The journal's record as the agent reads it through the app's binary,
+    /// with config.json rejected: duplicate and escaped keys as the app's
+    /// decoder takes them; none (a session an older build started) and no
+    /// state.json at all are the defaults; a value the app does not write
+    /// is the strictest, with the reason logged. The app reads that value
+    /// as none and records its own over it.
+    func testTheAgentReadsTheRecordAsTheAppDoes() async throws {
+        _ = try await startWith(endFloor: 30, thermalRules: false)
+        let session = try Data(contentsOf: h.home.paths.sessionFile)
+        let base = #"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false"#
+        let cases: [(value: String, battery: Int, end: Bool, log: String)] = [
+            (#","sessionCutoffs":"30 false""#, 20, true, "below the 30% end floor"),
+            (#","sessionCutoffs":"30 false""#, 40, false, ""),
+            (#","sessionCutoffs":"30 false","sessionCutoffs":"0 false""#, 20, true, "below the 30% end floor"),
+            (#","sessionCutoffs":"0 false","sessionCutoffs":"30 false""#, 5, false, ""),
+            (#","session\u0043utoffs":"30 false","sessionCutoffs":"0 false""#, 20, true, "below the 30% end floor"),
+            ("", 20, false, ""),
+            ("", 9, true, "below the 10% end floor"),
+            (#","sessionCutoffs":null"#, 9, true, "below the 10% end floor"),
+            (#","sessionCutoffs":"96 false""#, 40, true, "enforcing the strictest, a 95% end floor and thermal rules on"),
+            (#","sessionCutoffs":30"#, 40, true, "enforcing the strictest, a 95% end floor and thermal rules on"),
+            (#","sessionCutoffs":"30 off""#, 94, true, "below the 95% end floor"),
+        ]
+        for c in cases {
+            try session.write(to: h.home.paths.sessionFile)
+            let text = base + c.value + "}"
+            try Data(text.utf8).write(to: h.home.paths.stateFile)
+            try rejectedConfig.write(to: h.home.paths.configFile)
+            try? FileManager.default.removeItem(at: h.home.paths.logFile)
+            agent.clearCalls()
+            try agent.setBattery(c.battery)
+            let ended = try await agentEnds(level: 0)
+            XCTAssertEqual(ended, c.end, "\(text) at \(c.battery)%: \(logText())")
+            if !c.log.isEmpty {
+                XCTAssertTrue(logText().contains(c.log), "\(text): \(logText())")
+            }
+            if c.log.hasPrefix("enforcing") {
+                XCTAssertTrue(logText().contains("is rejected by the app, and the cutoffs recorded for the session in \(h.home.paths.stateFile.path) could not be read"), logText())
+            }
+        }
+
+        try session.write(to: h.home.paths.sessionFile)
+        try? FileManager.default.removeItem(at: h.home.paths.stateFile)
+        try rejectedConfig.write(to: h.home.paths.configFile)
+        try agent.setBattery(20)
+        let exit = try await agent.run()
+        XCTAssertEqual(exit, 0, logText())
+        XCTAssertNotNil(try h.store.loadSession(), "no state.json: the defaults keep the session at 20%: \(logText())")
+        try agent.setBattery(9)
+        _ = try await agent.run()
+        XCTAssertNil(try h.store.loadSession(), "and end it at 9%: \(logText())")
+    }
+
+    /// A Settings change during a session is recorded for it in the journal
+    /// before it takes effect, so a hung app's session keeps it. A change
+    /// between sessions records nothing; the next Start records its own.
+    func testACutoffChangeIsRecordedForTheSessionBeforeItTakesEffect() async throws {
+        let m = try await startWith(endFloor: 10)
+        XCTAssertEqual(try recorded(), AgentCutoffs(endFloor: 10, thermalRules: true))
+
+        XCTAssertTrue(m.updateConfig {
+            $0.setEndFloor(30)
+            $0.thermalRules = false
+        })
+
+        XCTAssertEqual(try recorded(), AgentCutoffs(endFloor: 30, thermalRules: false))
+        XCTAssertEqual(try h.store.loadConfig()?.agentCutoffs, AgentCutoffs(endFloor: 30, thermalRules: false))
+        XCTAssertTrue(m.updateConfig { $0.muteOnLidClose.toggle() }, "another setting records nothing")
+        XCTAssertEqual(try recorded(), AgentCutoffs(endFloor: 30, thermalRules: false))
+        XCTAssertTrue(m.updateConfig { $0.setEndFloor(200) }, "Settings clamps the floor")
+        XCTAssertEqual(try recorded(), AgentCutoffs(endFloor: 95, thermalRules: false), "the clamped floor in use is recorded")
+        XCTAssertTrue(m.updateConfig { $0.setEndFloor(30) })
+        let session = try Data(contentsOf: h.home.paths.sessionFile)
+        let journal = try Data(contentsOf: h.home.paths.stateFile)
+        try rejectedConfig.write(to: h.home.paths.configFile)
+        XCTAssertFalse(appEnds(m, critical: true, battery: 40))
+        try agent.setBattery(40)
+        let keptHot = try await agentEnds(level: 3)
+        XCTAssertFalse(keptHot, "the rule turned off is the one recorded: \(logText())")
+        try session.write(to: h.home.paths.sessionFile)
+        try journal.write(to: h.home.paths.stateFile)
+        try rejectedConfig.write(to: h.home.paths.configFile)
+        XCTAssertTrue(appEnds(m, critical: false, battery: 20))
+        try agent.setBattery(20)
+        let ended = try await agentEnds(level: 0)
+        XCTAssertTrue(ended, logText())
+        await m.noticeAgentEnd()
+        XCTAssertFalse(m.isActive)
+        XCTAssertNil(try recorded())
+
+        try h.store.saveConfig(m.config)
+        XCTAssertTrue(m.updateConfig { $0.setEndFloor(50) })
+        XCTAssertNil(try recorded(), "no session, nothing recorded")
+        await m.start(duration: 3600)
+        XCTAssertTrue(m.isActive)
+        XCTAssertEqual(try recorded(), AgentCutoffs(endFloor: 50, thermalRules: false), "the next Start records its own")
+        await m.end(reason: .user)
+        XCTAssertNil(try recorded(), "an ordinary end clears it")
+    }
+
+    /// A cutoff change whose record cannot be written (state.json
+    /// immutable, or the recovery lock busy with an agent run) changes
+    /// neither side and says why; a retry once it can be written applies
+    /// it. A change whose config.json write fails after the record was
+    /// written puts the record back, so the agent keeps the old cutoffs
+    /// too, also once config.json is rejected.
+    func testACutoffChangeThatCannotBeRecordedChangesNeitherSide() async throws {
+        let m = try await startWith(endFloor: 10)
+        let before = AgentCutoffs(endFloor: 10, thermalRules: true)
+        let state = h.home.paths.stateFile
+        try setImmutable(state, true)
+
+        XCTAssertFalse(m.updateConfig { $0.setEndFloor(30) })
+
+        try setImmutable(state, false)
+        XCTAssertEqual(m.config.agentCutoffs, before)
+        XCTAssertEqual(try h.store.loadConfig()?.agentCutoffs, before, "config.json is not written")
+        XCTAssertEqual(try recorded(), before)
+        let error = try XCTUnwrap(m.configSaveError)
+        XCTAssertTrue(error.hasPrefix("Could not record the change for the session in state.json ("), error)
+        XCTAssertTrue(error.hasSuffix("so both stay at end floor 10%, thermal rules on."), error)
+
+        let lock = try XCTUnwrap(try RecoveryLock(url: h.home.paths.recoveryLock).tryAcquire())
+        XCTAssertFalse(m.updateConfig { $0.setEndFloor(30) })
+        lock.release()
+        XCTAssertEqual(m.config.agentCutoffs, before)
+        XCTAssertEqual(try recorded(), before)
+        XCTAssertTrue(try XCTUnwrap(m.configSaveError).contains("the recovery lock is busy"))
+
+        XCTAssertTrue(m.updateConfig { $0.setEndFloor(30) }, "the retry")
+        XCTAssertNil(m.configSaveError)
+        XCTAssertEqual(try recorded(), AgentCutoffs(endFloor: 30, thermalRules: true))
+        XCTAssertEqual(try h.store.loadConfig()?.endFloor, 30)
+
+        try setImmutable(h.home.paths.configFile, true)
+        XCTAssertFalse(m.updateConfig { $0.setEndFloor(50) })
+        try setImmutable(h.home.paths.configFile, false)
+        XCTAssertEqual(m.config.endFloor, 30)
+        XCTAssertEqual(try recorded(), AgentCutoffs(endFloor: 30, thermalRules: true), "put back")
+        XCTAssertTrue(try XCTUnwrap(m.configSaveError).hasPrefix("Could not save the change to config.json ("))
+
+        try rejectedConfig.write(to: h.home.paths.configFile)
+        XCTAssertFalse(appEnds(m, critical: false, battery: 40))
+        try agent.setBattery(40)
+        let kept = try await agentEnds(level: 0)
+        XCTAssertFalse(kept, "the agent is on 30%, not the 50% that was refused: \(logText())")
+    }
+
+    /// The tick records the cutoffs in use where the journal holds none
+    /// (a session an older build started, or one written before this
+    /// build), other cutoffs (a hand edit), or a value the app does not
+    /// write; and after the app adopts a hand edit of config.json, here a
+    /// floor of 200 that the decoder clamps to 95.
+    func testTheTickRecordsTheCutoffsInUse() async throws {
+        let m = try await startWith(endFloor: 30, thermalRules: false)
+        let cutoffs = AgentCutoffs(endFloor: 30, thermalRules: false)
+        let base = #"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false"#
+        for value in ["", #","sessionCutoffs":"0 true""#, #","sessionCutoffs":"96 false""#, #","sessionCutoffs":30"#] {
+            try Data((base + value + "}").utf8).write(to: h.home.paths.stateFile)
+            await m.noticeConfigFileChange()
+            XCTAssertTrue(m.isActive)
+            XCTAssertEqual(try recorded(), cutoffs, value)
+        }
+        let journal = try Data(contentsOf: h.home.paths.stateFile)
+        await m.noticeConfigFileChange()
+        XCTAssertEqual(try Data(contentsOf: h.home.paths.stateFile), journal, "a record that matches is not written again")
+
+        try Data(#"{"endFloor":200,"thermalRules":false,"configVersion":2,"lidCloseDefaultsApplied":true}"#.utf8).write(to: h.home.paths.configFile)
+        await m.noticeConfigFileChange()
+        XCTAssertEqual(m.config.agentCutoffs, AgentCutoffs(endFloor: 95, thermalRules: false))
+        XCTAssertEqual(try recorded(), AgentCutoffs(endFloor: 95, thermalRules: false))
+
+        try rejectedConfig.write(to: h.home.paths.configFile)
+        try await assertBoth(m, critical: false, battery: 94, end: true)
+    }
+
+    /// A transaction that cannot record the cutoffs in use for the running
+    /// session (state.json immutable after a hand edit of config.json to a
+    /// 30% floor) ends it, as a rejected config.json does, and says why.
+    /// The journal cannot be cleared either, so the end's notice is the
+    /// incomplete restore. The next Start, once state.json takes writes,
+    /// records them.
+    func testASessionWhoseCutoffsCannotBeRecordedEnds() async throws {
+        let m = try await startWith(endFloor: 10)
+        var edited = m.config
+        edited.setEndFloor(30)
+        try h.store.saveConfig(edited)
+        try setImmutable(h.home.paths.stateFile, true)
+
+        await m.noticeConfigFileChange()
+
+        try setImmutable(h.home.paths.stateFile, false)
+        XCTAssertFalse(m.isActive)
+        XCTAssertNil(try h.store.loadSession())
+        XCTAssertTrue(h.guardFake.calls.contains("disablesleep 0"), "\(h.guardFake.calls)")
+        XCTAssertTrue(logText().contains("ending the session: could not record its end floor 30%, thermal rules on in state.json"), logText())
+        XCTAssertTrue(logText().contains("session end (cutoffsNotRecorded)"), logText())
+
+        await m.start(duration: 3600)
+        XCTAssertTrue(m.isActive)
+        XCTAssertEqual(try recorded(), AgentCutoffs(endFloor: 30, thermalRules: true))
+    }
+
+    /// A session resumed after a crash or at login records its cutoffs
+    /// again, also over a journal an older build wrote without them, before
+    /// sleep is held for it.
+    func testAResumedSessionRecordsItsCutoffs() async throws {
+        let first = try await startWith(endFloor: 30, thermalRules: false)
+        XCTAssertTrue(first.isActive)
+        var journal = try XCTUnwrap(try h.store.loadState())
+        journal.sessionCutoffs = nil
+        try h.store.saveState(journal)
+
+        let m = h.makeManager()
+        await m.reconcile()
+
+        XCTAssertTrue(m.isActive, "resumed")
+        XCTAssertEqual(try recorded(), AgentCutoffs(endFloor: 30, thermalRules: false))
+        try rejectedConfig.write(to: h.home.paths.configFile)
+        try agent.setBattery(20)
+        let ended = try await agentEnds(level: 0)
+        XCTAssertTrue(ended, logText())
+    }
+
     // MARK: When the app's binary cannot answer
 
     /// The agent cannot read config.json without the app's binary. When the
@@ -442,7 +713,7 @@ final class CutoffAgreementTests: XCTestCase {
         XCTAssertFalse(control, "the binary answers: \(logText())")
 
         let cases: [(why: String, breakIt: () throws -> Void)] = [
-            ("declares InsomniaAgentCutoffsVersion '', not 1", { try self.agent.withdrawAgentCutoffs() }),
+            ("declares InsomniaAgentCutoffsVersion '', not 2", { try self.agent.withdrawAgentCutoffs() }),
             ("is missing or not executable", { try FileManager.default.removeItem(at: self.agent.appBinary) }),
             ("unexpected answer from '\(agent.appBinary.path) --agent-cutoffs' (exit 0, output 'cutoffs 96 false')", { try self.agent.replaceAppBinary(with: "echo 'cutoffs 96 false'") }),
             ("(exit 0, output 'rejected')", { try self.agent.replaceAppBinary(with: "echo rejected") }),

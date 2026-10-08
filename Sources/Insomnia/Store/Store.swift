@@ -150,10 +150,19 @@ struct Store: Sendable {
         }
     }
     func saveSession(_ s: Session) throws { try write(s, to: paths.sessionFile) }
+    /// Puts back session.json's exact bytes, as read before a write that is
+    /// being undone: every record of a session's end matches exact bytes,
+    /// which encoding the decoded session again need not give.
+    func restoreSessionFile(_ data: Data) throws { try write(data: data, to: paths.sessionFile) }
     /// Removes session.json, then the records of its end, which mean
     /// something only while the file they copy is there. A record that
     /// cannot be removed is left and logged: it matches no later
-    /// session.json, but it is still a copy of the session's times.
+    /// session.json, but it is still a copy of the session's times. The
+    /// record in the recovery lock file is emptied in place, through the
+    /// lock this transaction holds; one that cannot be is left and logged
+    /// too. It ends nothing while no session.json is there, and the next
+    /// start (once it has written its session.json) or recovery agent run
+    /// empties it.
     func deleteSession() throws {
         try remove(at: paths.sessionFile)
         for record in [paths.endedSessionFile] + sessionEndRecordsAside() {
@@ -162,6 +171,9 @@ struct Store: Sendable {
             } catch {
                 Log.error("could not remove \(record.path) (\(error.localizedDescription)); it matches no session.json, so it ends nothing, but it stays until removed by hand")
             }
+        }
+        if !clearLockEndRecord() {
+            Log.error("could not empty \(paths.recoveryLock.path) of the record of a session's end; it matches no session.json, so it ends nothing, and the next start or recovery agent run empties it")
         }
     }
 
@@ -300,6 +312,174 @@ struct Store: Sendable {
         return recorded == current
     }
 
+    // MARK: The end record in the recovery lock file
+
+    /// The last place the end of a session is recorded, for when
+    /// ended-session.json, the journal and both folders of records aside
+    /// refuse it: the recovery lock file, which exists already, so the
+    /// record needs no new file. It then holds this tag, a space,
+    /// session.json's bytes in base64 (`sessionEndMarker`), a newline, and
+    /// nothing else. It is written in place (`RecoveryLockHandle
+    /// .replaceContents`), so it keeps its inode and stays the lock, and it
+    /// is never unlinked. backstop.sh reads and writes the same record
+    /// (read_lock_record, record_end_in_lock) and uninstall.sh empties it.
+    static let lockEndRecordTag = "ended-session-v1"
+    /// A larger lock file holds no whole record.
+    static let lockEndRecordMaxBytes = 1 << 20
+
+    /// What the recovery lock file says about the end of a session.
+    enum LockEndRecord: Equatable {
+        /// Nothing: the file is empty or missing, or not a regular file
+        /// (lstat, so not a symlink) this user owns, which is never read or
+        /// written as a record.
+        case none
+        /// A whole record: the end of the session.json whose bytes this
+        /// base64 holds.
+        case record(String)
+        /// Anything else: a write cut short, other bytes, a file that cannot
+        /// be read whole (the text says which). It cannot say which session
+        /// it ended, so it counts as the end of whatever session.json holds
+        /// until session.json is gone, the safe side.
+        case unknown(String)
+    }
+
+    func lockEndRecord() -> LockEndRecord {
+        switch readLockFile() {
+        case .notUsable: return .none
+        case let .unreadable(why): return .unknown(why)
+        case let .bytes(data): return Self.parseLockEndRecord(data)
+        }
+    }
+
+    private enum LockFile {
+        /// Missing, or not a regular file (lstat) this user owns.
+        case notUsable
+        case bytes(Data)
+        case unreadable(String)
+    }
+
+    /// The recovery lock file's bytes, read only while it is a regular file
+    /// (lstat, so not a symlink) this user owns and at most
+    /// `lockEndRecordMaxBytes` long.
+    private func readLockFile() -> LockFile {
+        let path = paths.recoveryLock.path
+        var st = stat()
+        guard lstat(path, &st) == 0, st.st_mode & S_IFMT == S_IFREG, st.st_uid == getuid() else { return .notUsable }
+        if st.st_size == 0 { return .bytes(Data()) }
+        guard st.st_size <= Self.lockEndRecordMaxBytes else {
+            return .unreadable("it holds \(st.st_size) bytes, more than an end record")
+        }
+        // O_NONBLOCK and O_NOFOLLOW: what took the place of the file checked
+        // above is never waited on or followed.
+        let fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+        guard fd >= 0 else { return .unreadable("it could not be read (\(String(cString: strerror(errno))))") }
+        defer { close(fd) }
+        var opened = stat()
+        guard fstat(fd, &opened) == 0, opened.st_dev == st.st_dev, opened.st_ino == st.st_ino else {
+            return .unreadable("it changed while it was read")
+        }
+        // One byte more than the size: a file that grew meanwhile is not
+        // read as the shorter content it held.
+        var bytes = [UInt8](repeating: 0, count: Int(st.st_size) + 1)
+        var count = 0
+        while count < bytes.count {
+            let n = bytes.withUnsafeMutableBytes { Darwin.read(fd, $0.baseAddress! + count, $0.count - count) }
+            if n < 0 {
+                if errno == EINTR { continue }
+                return .unreadable("it could not be read (\(String(cString: strerror(errno))))")
+            }
+            if n == 0 { break }
+            count += n
+        }
+        guard count == Int(st.st_size) else { return .unreadable("it changed while it was read") }
+        return .bytes(Data(bytes[..<count]))
+    }
+
+    /// Content backstop.sh's read_lock_record reads the same way: the tag,
+    /// one space, base64 (letters, digits, + and /, then at most two =,
+    /// a multiple of four in all) and one newline is a record; nothing is
+    /// none; anything else is unknown.
+    static func parseLockEndRecord(_ data: Data) -> LockEndRecord {
+        guard !data.isEmpty else { return .none }
+        let other = LockEndRecord.unknown("it holds bytes other than one whole end record")
+        let prefix = Array((lockEndRecordTag + " ").utf8)
+        let bytes = Array(data)
+        guard bytes.last == 0x0A, bytes.count > prefix.count + 1, Array(bytes.prefix(prefix.count)) == prefix else { return other }
+        let encoded = bytes[prefix.count..<(bytes.count - 1)]
+        let padding = encoded.reversed().prefix { $0 == 0x3D }.count
+        let digits = encoded.dropLast(padding)
+        func isDigit(_ b: UInt8) -> Bool {
+            (0x41...0x5A).contains(b) || (0x61...0x7A).contains(b) || (0x30...0x39).contains(b) || b == 0x2B || b == 0x2F
+        }
+        guard padding <= 2, !digits.isEmpty, digits.allSatisfy(isDigit), encoded.count % 4 == 0 else { return other }
+        return .record(String(decoding: encoded, as: UTF8.self))
+    }
+
+    /// Where the recovery lock file records the end of the session in
+    /// session.json, for the log, or nil when it does not: a record of
+    /// exactly that file's bytes, or content that is not a whole record,
+    /// which counts as the end of any session (`LockEndRecord.unknown`).
+    /// Nothing is recorded for a session.json that is not a regular file.
+    func sessionEndRecordedInLock() -> String? {
+        var st = stat()
+        guard stat(paths.sessionFile.path, &st) == 0, st.st_mode & S_IFMT == S_IFREG else { return nil }
+        switch lockEndRecord() {
+        case .none:
+            return nil
+        case let .unknown(why):
+            return "\(paths.recoveryLock.lastPathComponent), which \(why), so it counts as the end of any session"
+        case let .record(encoded):
+            return encoded == sessionEndMarker() ? paths.recoveryLock.lastPathComponent : nil
+        }
+    }
+
+    /// For an end that could not remove session.json and could write
+    /// neither ended-session.json, the journal nor a record aside: the record of its
+    /// bytes in the recovery lock file, written through `lock`, the handle
+    /// this transaction holds. A record already there for these bytes, or
+    /// content that already counts as the end of any session, is kept. True
+    /// only when the file then reads back as such.
+    func recordSessionEndInLock(lock: RecoveryLockHandle? = RecoveryLock.held) -> Bool {
+        if sessionEndRecordedInLock() != nil { return true }
+        guard let lock, let encoded = sessionEndMarker() else { return false }
+        let record = Data("\(Self.lockEndRecordTag) \(encoded)\n".utf8)
+        guard record.count <= Self.lockEndRecordMaxBytes else { return false }
+        _ = lock.replaceContents(with: record, at: paths.recoveryLock.path)
+        return lockEndRecord() == .record(encoded) && sessionEndRecordedInLock() != nil
+    }
+
+    /// Empties the recovery lock file of any record, through `lock`, once
+    /// the session it may end is gone or replaced. True when nothing is
+    /// left to empty: the file holds none, or is not a regular file this
+    /// user owns, which is never written.
+    func clearLockEndRecord(lock: RecoveryLockHandle? = RecoveryLock.held) -> Bool {
+        if lockEndRecord() == .none { return true }
+        guard let lock else { return false }
+        _ = lock.replaceContents(with: Data(), at: paths.recoveryLock.path)
+        return lockEndRecord() == .none
+    }
+
+    /// The recovery lock file's bytes, to put back with
+    /// `restoreLockContents` when what replaced them is undone: empty for a
+    /// file that is missing or not a regular file this user owns, which is
+    /// never written; nil when it cannot be read whole.
+    func lockContents() -> Data? {
+        switch readLockFile() {
+        case .notUsable: return Data()
+        case .unreadable: return nil
+        case let .bytes(data): return data
+        }
+    }
+
+    /// Puts `data` back in the recovery lock file through `lock`. True when
+    /// it then holds exactly those bytes.
+    func restoreLockContents(_ data: Data, lock: RecoveryLockHandle? = RecoveryLock.held) -> Bool {
+        if lockContents() == data { return true }
+        guard let lock else { return false }
+        _ = lock.replaceContents(with: data, at: paths.recoveryLock.path)
+        return lockContents() == data
+    }
+
     /// Whether anything is at session.json, a dangling symlink included.
     /// lstat(2) only: the entry is never opened.
     func sessionEntryExists() -> Bool {
@@ -410,6 +590,7 @@ enum StoreError: Error, LocalizedError {
     case corrupt(file: String, detail: String)
     case unreadable(file: String, detail: String)
     case notRegularFile(file: String)
+    case lockRecordNotCleared(file: String)
 
     var errorDescription: String? {
         switch self {
@@ -421,6 +602,8 @@ enum StoreError: Error, LocalizedError {
             return "\(file) could not be decoded (\(detail))"
         case let .notRegularFile(file):
             return "\(file) is not a regular file; it was not opened"
+        case let .lockRecordNotCleared(file):
+            return "\(file) holds the record of an earlier session's end and could not be emptied"
         }
     }
 }

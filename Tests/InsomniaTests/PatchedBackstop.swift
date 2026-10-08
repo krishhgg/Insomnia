@@ -10,9 +10,10 @@ import Foundation
 /// dir/state-at-sudo (removed when there is none) and lists the names in
 /// INSOMNIA_HOME to dir/names-at-sudo and in its Logs folder to
 /// dir/logs-at-sudo. The app binary is the one this build made, for
-/// `--agent-cutoffs` only (`BuiltApp`), unrecorded, so config.json is read
-/// by the app's own decoder as in production; its Info.plist declares that
-/// mode and not `--resume-frozen`.
+/// `--agent-cutoffs` and `--agent-session-cutoffs` only (`BuiltApp`),
+/// unrecorded, so config.json and the journal's cutoffs are read by the
+/// app's own decoder as in production; its Info.plist declares those modes
+/// and not `--resume-frozen`.
 struct PatchedBackstop {
     let dir: URL
     let script: URL
@@ -60,7 +61,7 @@ struct PatchedBackstop {
             "KILL": #"printf 'kill %s\n' "$*" >> '\#(calls)'; exit 1"#,
             "DEFAULTS": #"printf 'defaults %s\n' "$*" >> '\#(calls)'; exit 1"#,
             "INSOMNIA_BIN": #"""
-            [[ "${1:-}" == --agent-cutoffs ]] && exec '\#(BuiltApp.binary.path)' "$@"
+            [[ "${1:-}" == --agent-cutoffs || "${1:-}" == --agent-session-cutoffs ]] && exec '\#(BuiltApp.binary.path)' "$@"
             exit 1
             """#,
         ]
@@ -131,10 +132,28 @@ struct PatchedBackstop {
     /// that really takes no new file the agent's status files fail too;
     /// RecoveryScriptTests runs that case.
     func refuseRecordsAside() throws {
+        try patch("MKTEMP=/usr/bin/mktemp", "MKTEMP=/usr/bin/false")
+    }
+
+    /// Sets LOCK_RECORD_MAX_BYTES to 0, so no record fits in the recovery
+    /// lock file and the agent writes none there: a stand-in for a lock
+    /// file that refuses the write (a full disk). Content already in the
+    /// file then reads as not a whole record.
+    func refuseLockRecord() throws {
+        try patch("LOCK_RECORD_MAX_BYTES=1048576", "LOCK_RECORD_MAX_BYTES=0")
+    }
+
+    /// Points CAT at /usr/bin/false, so the agent cannot read the recovery
+    /// lock file back after it writes a record there.
+    func failLockReadBack() throws {
+        try patch("CAT=/bin/cat", "CAT=/usr/bin/false")
+    }
+
+    private func patch(_ line: String, _ replacement: String) throws {
         let text = try String(contentsOf: script, encoding: .utf8)
-        let line = "MKTEMP=/usr/bin/mktemp"
-        guard text.components(separatedBy: line).count == 2 else { throw PatchError(constant: "MKTEMP", hits: text.components(separatedBy: line).count - 1) }
-        try text.replacingOccurrences(of: line, with: "MKTEMP=/usr/bin/false").write(to: script, atomically: true, encoding: .utf8)
+        let hits = text.components(separatedBy: "\n").filter { $0 == line }.count
+        guard hits == 1 else { throw PatchError(constant: String(line.prefix { $0 != "=" }), hits: hits) }
+        try text.replacingOccurrences(of: "\n\(line)\n", with: "\n\(replacement)\n").write(to: script, atomically: true, encoding: .utf8)
     }
 
     /// The call that restores sleep.

@@ -41,10 +41,14 @@
 #                     the end floor (strict, so 0 disables it). The floor
 #                     and the thermal rule are what the app takes from
 #                     config.json: the installed app binary decodes the file
-#                     with the app's own decoder (read_cutoffs). The defaults,
-#                     10% and on, apply when the file is missing or the app
-#                     rejects it, and the strictest, 95% and on, when the
-#                     binary cannot answer. A battery present but unreadable,
+#                     with the app's own decoder (read_cutoffs). When the
+#                     file is missing, cannot be read, or the app rejects
+#                     it, the cutoffs the app recorded for the session in
+#                     state.json (sessionCutoffs) apply, read by the same
+#                     binary; the defaults, 10% and on, only for a session
+#                     recorded without them (an older build); and the
+#                     strictest, 95% and on, when the binary cannot answer.
+#                     A battery present but unreadable,
 #                     or a failing pmset, ends too (fail closed). No battery
 #                     in pmset: ioreg shows whether an AppleSmartBattery
 #                     service exists, as the app checks. None is a desktop,
@@ -67,18 +71,24 @@
 #     same bytes in base64. When state.json cannot be written either, the
 #     copy goes in a new file, ended-session.json.<8 letters or digits>
 #     (mktemp), beside them, or in the log folder when their folder takes
-#     no new file. Each record is written and read back before anything is
-#     undone. While one matches the file, the app restores that session
-#     instead of resuming it, and every run ends it again without the
-#     checks and retries the removal. If no record can be written (neither
-#     folder takes a new file), sleep is still restored but its journal
-#     entry stays, and the run exits 1. Before it resumes a session the app
-#     writes session.json's bytes back over it and writes the journal, so
-#     it resumes none while session.json cannot be replaced or state.json
-#     cannot be written. Once both take writes again (session.json made
-#     removable as well), an app launched before the next run, with pmset
-#     reporting SleepDisabled 1, resumes it: nothing left on disk then
-#     tells that session from one a crash left.
+#     no new file. When neither folder takes a new file, the record goes in
+#     the recovery lock file, which exists already: a tag and the same
+#     base64, written in place, so the file keeps its inode and stays the
+#     lock (record_end_in_lock). Each record is written and read back before
+#     anything is undone. While one matches the file, the app restores that
+#     session instead of resuming it, and every run ends it again without
+#     the checks and retries the removal. Lock file content that is not a
+#     whole record (a write cut short) counts as the end of whatever
+#     session.json holds. If no record can be written (neither folder takes
+#     a new file, and the lock file is not a regular file this user owns,
+#     or refuses the write too, as on a full disk), sleep is still restored
+#     but its journal entry stays, and the run exits 1. Before it resumes a
+#     session the app writes session.json's bytes back over it and writes
+#     the journal, so it resumes none while session.json cannot be replaced
+#     or state.json cannot be written. Once both take writes again
+#     (session.json made removable as well), an app launched before the
+#     next run, with pmset reporting SleepDisabled 1, resumes it: nothing
+#     left on disk then tells that session from one a crash left.
 #   - state.json missing or clean: nothing is undone and nothing privileged
 #     runs; an expired session.json is removed. Exit 0. Entries in
 #     savedAudioOutputs alone count as clean (see below).
@@ -146,7 +156,8 @@
 #                              entry stays.
 #     A flag is cleared only after its undo succeeded. Unknown keys survive.
 #     endedSession (see above) is a record, not something to undo: it never
-#     makes the journal dirty, and only the app removes it.
+#     makes the journal dirty, and only the app removes it. So is
+#     sessionCutoffs (see read_cutoffs), which this script never changes.
 #     Exit 0 only when the journal is clean afterwards; otherwise exit 1 so
 #     the failure is visible and the next periodic run retries.
 #   - state.json unreadable, not a JSON object, or with a known key of the
@@ -204,6 +215,8 @@ MV=/bin/mv
 CP=/bin/cp
 MKTEMP=/usr/bin/mktemp
 BASE64=/usr/bin/base64
+STAT=/usr/bin/stat
+CAT=/bin/cat
 # The installed app binary, for the microsecond identity check of
 # frozenProcesses entries (see above) and for reading config.json's cutoffs
 # (read_cutoffs), and the bundle's Info.plist, which must declare
@@ -215,8 +228,13 @@ BASE64=/usr/bin/base64
 INSOMNIA_BIN="${HOME:-}/Applications/Insomnia.app/Contents/MacOS/Insomnia"
 INSOMNIA_INFO="${HOME:-}/Applications/Insomnia.app/Contents/Info.plist"
 RESUME_FROZEN_VERSION=1
-AGENT_CUTOFFS_VERSION=1
+AGENT_CUTOFFS_VERSION=2
 LOCK_TIMEOUT_SECONDS=10
+# The end record kept in the recovery lock file (read_lock_record): this
+# tag, a space, session.json's bytes in base64, and a newline. A file larger
+# than LOCK_RECORD_MAX_BYTES holds no whole record.
+LOCK_RECORD_TAG=ended-session-v1
+LOCK_RECORD_MAX_BYTES=1048576
 # com.apple.system.thermalpressurelevel at or above this ends a session. On
 # macOS the levels are 0 nominal, 1 moderate, 2 heavy, 3 trapping, 4 sleeping
 # (libkern/OSThermalNotification.h); ProcessInfo reports .critical from
@@ -283,7 +301,7 @@ tighten() { # path...
   done
 }
 tighten "$APP_SUPPORT" "$LOG_DIR" "$LOG" "$LOCK" "$STATE" "$SESSION"
-inode() { stat -f %i "$1" 2>/dev/null; }
+inode() { "$STAT" -f %i "$1" 2>/dev/null; }
 lock_shared=0
 if [[ -e /dev/fd/9 && -e "$LOCK" && -n "$(inode "$LOCK")" && "$(inode /dev/fd/9)" == "$(inode "$LOCK")" ]]; then
   lock_shared=1 # fd 9 is the caller's handle on the lock file; share its lock.
@@ -625,6 +643,10 @@ journal_shape_problems() { # file
   done
   t="$(type_of "$f" endedSession)"
   [[ -z "$t" || "$t" == string || "$t" == "(any)" ]] || echo "endedSession is a $t, not a string"
+  # sessionCutoffs is a record and not checked here: the app reads a value
+  # it does not write as none and records its own over it, so it never
+  # makes the journal unusable. read_cutoffs has the app's binary read it
+  # strictly where it is used.
   t="$(type_of "$f" frozenProcesses)"
   if [[ -n "$t" && "$t" != "(any)" ]]; then
     if [[ "$t" != array ]]; then
@@ -828,6 +850,26 @@ remove_end_record() {
   return 0
 }
 
+# Remove $ENDED when it is shown to match no session.json: session.json is
+# gone, or cmp finds other bytes (exit 1). Anything at $ENDED that is not a
+# regular file is not a record and goes too; rm unlinks a FIFO without
+# opening it. A record that cmp cannot compare (exit 2: either file
+# unreadable), or one beside a session.json that is not a regular file,
+# stays, as remove_stale_end_records_aside keeps such a record aside: it is
+# not shown to be stale, and once the file can be read again it ends the
+# session it copies. While cmp cannot compare it, it matches nothing
+# (end_recorded). Never fails.
+remove_stale_end_record() {
+  local rc=0
+  [[ -e "$ENDED" || -L "$ENDED" ]] || return 0
+  if [[ -f "$ENDED" && ( -e "$SESSION" || -L "$SESSION" ) ]]; then
+    [[ -f "$SESSION" ]] || return 0
+    "$CMP" -s "$SESSION" "$ENDED" || rc=$?
+    (( rc == 1 )) || return 0
+  fi
+  remove_end_record
+}
+
 # session.json's bytes in base64 on one line, as Swift's
 # Data.base64EncodedString() writes them, or nothing. Only a regular file
 # is opened, as in end_recorded.
@@ -910,25 +952,142 @@ remove_stale_end_records_aside() {
   return 0
 }
 
+# The last place an end is recorded (record_end_in_lock), for when $ENDED,
+# the journal and both folders refuse the record: the recovery lock file,
+# which exists already, so the record needs no new file. Its contents are
+# then the record and nothing else: LOCK_RECORD_TAG, a space, session.json's
+# bytes in base64 on one line (as session_base64 prints them), and a
+# newline. It is written in place, so the file keeps its inode and every
+# party still locks the same file, and it is never unlinked. Only a regular
+# file, not a symlink, owned by this user is read or written as one; the
+# app reads it the same way (Store.lockEndRecord). read_lock_record sets
+# lock_record_state:
+#   none     the file is empty, or not such a file: no record.
+#   record   a whole record; lock_record holds its base64.
+#   unknown  anything else: a write cut short, other bytes, a file that
+#            cannot be read whole (lock_record_why says which). It cannot
+#            say which session it ended, so it counts as the end of
+#            whatever session.json holds, the safe side, until session.json
+#            is gone (end_recorded_in_lock, remove_stale_lock_record).
+lock_record_state=none
+lock_record=""
+lock_record_why=""
+read_lock_record() {
+  local size content body re="^${LOCK_RECORD_TAG} ([A-Za-z0-9+/]+={0,2})\$"
+  lock_record_state=none
+  lock_record=""
+  lock_record_why=""
+  [[ -f "$LOCK" && ! -L "$LOCK" && -O "$LOCK" ]] || return 0
+  lock_record_state=unknown
+  size="$("$STAT" -f %z "$LOCK" 2>/dev/null)" || size=""
+  if [[ ! "$size" =~ ^[0-9]+$ ]]; then
+    lock_record_why="its size could not be read"
+    return 0
+  fi
+  if (( size == 0 )); then
+    lock_record_state=none
+    return 0
+  fi
+  if (( size > LOCK_RECORD_MAX_BYTES )); then
+    lock_record_why="it holds $size bytes, more than an end record"
+    return 0
+  fi
+  # The sentinel keeps a trailing newline that command substitution strips.
+  if ! content="$("$CAT" "$LOCK" 2>/dev/null && printf x)"; then
+    lock_record_why="it could not be read"
+    return 0
+  fi
+  content="${content%x}"
+  # LC_ALL=C: the length counts bytes. bash drops NUL bytes, so a length
+  # other than the size means bytes no record has.
+  if (( ${#content} != size )) || [[ "$content" != *$'\n' ]]; then
+    lock_record_why="it holds bytes other than one whole end record"
+    return 0
+  fi
+  body="${content%$'\n'}"
+  if [[ "$body" =~ $re ]] && (( ${#BASH_REMATCH[1]} % 4 == 0 )); then
+    lock_record_state=record
+    lock_record="${BASH_REMATCH[1]}"
+    return 0
+  fi
+  lock_record_why="it holds bytes other than one whole end record"
+  return 0
+}
+
+# Whether the recovery lock file records the end of the session in
+# $SESSION: a record of exactly its bytes, or content that is not a whole
+# record (see read_lock_record). Sets lock_match_why for the log.
+lock_match_why=""
+end_recorded_in_lock() {
+  local current
+  lock_match_why=""
+  [[ -f "$SESSION" ]] || return 1
+  read_lock_record
+  case "$lock_record_state" in
+    unknown)
+      lock_match_why="$LOCK, which $lock_record_why, so it counts as the end of any session"
+      return 0 ;;
+    record)
+      current="$(session_base64)" || return 1
+      [[ -n "$current" && "$lock_record" == "$current" ]] || return 1
+      lock_match_why="$LOCK"
+      return 0 ;;
+  esac
+  return 1
+}
+
+# Whether the lock file at $LOCK is a regular file, not a symlink, owned by
+# this user, and the file this run holds the lock on (fd 9): the only file
+# an end record is written to or emptied from.
+lock_is_held_file() {
+  local held named
+  [[ -f "$LOCK" && ! -L "$LOCK" && -O "$LOCK" ]] || return 1
+  held="$(inode /dev/fd/9)"
+  named="$(inode "$LOCK")"
+  [[ -n "$held" && "$held" == "$named" ]]
+}
+
+# Empty the recovery lock file of a record that ends nothing: anything in it
+# once session.json is gone, and a whole record of other bytes than a
+# session.json that can be read. Content that is not a whole record stays
+# while session.json is there, and so does everything while session.json is
+# not a regular file or cannot be read: none of it is shown to be stale.
+# Emptied in place (the inode stays), only while $LOCK is the file this run
+# holds; never unlinked. Never fails.
+remove_stale_lock_record() {
+  local current
+  read_lock_record
+  [[ "$lock_record_state" != none ]] || return 0
+  if [[ -e "$SESSION" || -L "$SESSION" ]]; then
+    [[ "$lock_record_state" == record && -f "$SESSION" ]] || return 0
+    current="$(session_base64)" || return 0
+    [[ -n "$current" && "$lock_record" != "$current" ]] || return 0
+  fi
+  if lock_is_held_file && { : > "$LOCK"; } 2>/dev/null; then return 0; fi
+  log warn "could not empty $LOCK of an end record that matches no session.json; it ends nothing, and the next run tries again" || true
+  return 0
+}
+
 # --- Was this session already ended? -----------------------------------------
 # A run or the app that ends a valid session but cannot remove session.json
 # records the end in $ENDED, a copy of the file's exact bytes (record_end),
 # or, when that cannot be written either, in the journal's endedSession
 # (record_end_in_journal), or else in a new file beside them or in $LOG_DIR
-# (record_end_aside). While a record matches, that session is over
+# (record_end_aside), or else in the recovery lock file
+# (record_end_in_lock). While a record matches, that session is over
 # whatever its endsAt says: this run ends it again without the checks below
-# and retries the removal. A record at $ENDED or aside that matches nothing
-# (its session.json was removed or replaced) is stale and goes; it could
-# only ever match the file it copied. rm unlinks a FIFO at $ENDED without
-# opening it. An endedSession that matches nothing ends nothing; it stays
-# until the app removes it, which the app does before it writes a new
+# and retries the removal. A record at $ENDED, aside or in the lock file
+# that is shown to match nothing (its session.json was removed, or holds
+# other bytes) is stale and goes; it could only ever match the file it
+# copied. One that cannot be compared (session.json or the record cannot
+# be read) stays. An endedSession that matches nothing ends nothing; it
+# stays until the app removes it, which the app does before it writes a new
 # session.json.
 ended_before=0
 ended_where=""
-if [[ -e "$ENDED" ]] && ! end_recorded; then
-  remove_end_record
-fi
+remove_stale_end_record
 remove_stale_end_records_aside
+remove_stale_lock_record
 if end_recorded; then
   ended_before=1
   ended_where="$ENDED"
@@ -938,6 +1097,9 @@ elif journal_records_end; then
 elif end_recorded_aside; then
   ended_before=1
   ended_where="$aside_match"
+elif end_recorded_in_lock; then
+  ended_before=1
+  ended_where="$lock_match_why"
 fi
 
 # --- Is a valid session still live? ------------------------------------------
@@ -964,32 +1126,41 @@ app_alive() {
   return 1
 }
 
-# The end floor and thermal rule the app enforces, from config.json. The app
-# decides what the file means (Store.decodeConfig, through the whole Config
-# decoder: duplicate and escaped keys, numbers it rounds, an error in any
-# other field), so this script does not parse the JSON itself. It hands the
-# file's bytes on standard input to the installed app binary's one-shot
-# mode, `Insomnia --agent-cutoffs <seconds>` (AgentCutoffsCommand.swift),
-# which decodes them with the app's decoder and prints the cutoffs the app
-# takes from a file that decodes (Config.agentCutoffs). The file is opened
-# once, by the shell, for that call. Run as a read (run_read): bounded, with
-# the recovery lock's fd closed, and stopped when it does not answer. The
-# binary opens no file, writes nothing and takes no lock, so it answers
-# while the app itself is hung. Called once per run, only for a valid
-# session while the app is alive. Sets cutoff_floor (0 is off, else 1 to 95)
-# and cutoff_thermal (true or false):
+# The end floor and thermal rule the app enforces. The app decides what its
+# files mean, so this script parses neither config.json nor the journal's
+# sessionCutoffs itself. It hands a file's bytes on standard input to one of
+# the installed app binary's one-shot modes (AgentCutoffsCommand.swift),
+# which decodes them with the app's own decoder and prints the cutoffs. The
+# file is opened once, by the shell, for that call. Run as a read
+# (run_read): bounded, with the recovery lock's fd closed, and stopped when
+# it does not answer. The binary opens no file, writes nothing and takes no
+# lock, so it answers while the app itself is hung. Called once per run,
+# only for a valid session while the app is alive. Sets cutoff_floor (0 is
+# off, else 1 to 95) and cutoff_thermal (true or false):
+#   - config.json a regular file this user can read: `Insomnia
+#     --agent-cutoffs <seconds>` decodes it through the whole Config decoder
+#     (Store.decodeConfig: duplicate and escaped keys, numbers it rounds, an
+#     error in any other field). "cutoffs <floor> <true|false>" with exit 0
+#     is that floor and rule, the ones the app takes from a file that
+#     decodes (Config.agentCutoffs). "rejected" with exit 65 is a file the
+#     app does not use; the cutoffs below apply.
 #   - config.json missing, a dangling symlink, not a regular file (never
-#     opened: open(2) on a FIFO blocks), or not readable by this user: the
-#     app's defaults (Config.agentDefaultCutoffs), 10% and on. The app has
-#     no settings from such a file either: it moves a file it cannot read
-#     aside and writes the settings in use in its place.
-#   - "cutoffs <floor> <true|false>" with exit 0: that floor and rule.
-#   - "rejected" with exit 65, a file the app's decoder rejects: the
-#     defaults again, as for a missing file.
+#     opened: open(2) on a FIFO blocks), not readable by this user, or
+#     rejected: the cutoffs the app enforces for this session, which it
+#     records in state.json (sessionCutoffs) before the session starts or
+#     resumes and before a change to them takes effect. `Insomnia
+#     --agent-session-cutoffs <seconds>` reads them from the journal's bytes
+#     with the app's own decoder. "cutoffs <floor> <true|false>" with exit 0
+#     is that floor and rule. "none" with exit 0, a journal without them (a
+#     session an older build started), and no state.json at all are the
+#     app's defaults (Config.agentDefaultCutoffs), 10% and on, which such a
+#     build enforced there.
 #   - anything else: the binary missing or not executable, a bundle whose
 #     Info.plist does not declare InsomniaAgentCutoffsVersion
 #     AGENT_CUTOFFS_VERSION (an older build has no such mode and would open
-#     the menu bar app instead), a timeout, another exit status or answer:
+#     the menu bar app instead), a timeout, another exit status or answer
+#     ("rejected" from the journal: a sessionCutoffs the app does not
+#     write), or a state.json that is not a regular file this user can read:
 #     the strictest cutoffs, a 95% end floor and thermal rules on, with an
 #     error logged. On battery power that ends the session below 95%; the
 #     run cannot tell which cutoffs the app enforces, and keeping sleep
@@ -997,39 +1168,85 @@ app_alive() {
 cutoff_floor=10
 cutoff_thermal=true
 read_cutoffs() {
-  local out="" rc=0 declared="" why=""
   local answer_re='^cutoffs ([0-9]|[1-8][0-9]|9[0-5]) (true|false)$'
+  local why="" fallback
   cutoff_floor=10
   cutoff_thermal=true
-  [[ -f "$CONFIG" && -r "$CONFIG" ]] || return 0
+  if [[ -f "$CONFIG" && -r "$CONFIG" ]]; then
+    ask_app_cutoffs --agent-cutoffs "$CONFIG"
+    if [[ -n "$cutoffs_why" ]]; then
+      why="could not read the end floor and thermal rule in $CONFIG: $cutoffs_why"
+    elif (( cutoffs_rc == 0 )) && [[ "$cutoffs_answer" =~ $answer_re ]]; then
+      cutoff_floor="${BASH_REMATCH[1]}"
+      cutoff_thermal="${BASH_REMATCH[2]}"
+      return 0
+    elif (( cutoffs_rc != 65 )) || [[ "$cutoffs_answer" != rejected ]]; then
+      why="could not read the end floor and thermal rule in $CONFIG: $(cutoffs_failure --agent-cutoffs)"
+    fi
+    fallback="$CONFIG is rejected by the app"
+  else
+    fallback="$CONFIG is missing or cannot be read"
+  fi
+  if [[ -z "$why" ]]; then
+    if [[ ! -e "$STATE" && ! -L "$STATE" ]]; then
+      return 0
+    elif [[ ! -f "$STATE" || ! -r "$STATE" ]]; then
+      why="$fallback, and $STATE, which holds the cutoffs recorded for the session, is not a regular file this user can read, so it was not opened"
+    else
+      ask_app_cutoffs --agent-session-cutoffs "$STATE"
+      if [[ -n "$cutoffs_why" ]]; then
+        why="$fallback, and the cutoffs recorded for the session in $STATE could not be read: $cutoffs_why"
+      elif (( cutoffs_rc == 0 )) && [[ "$cutoffs_answer" =~ $answer_re ]]; then
+        cutoff_floor="${BASH_REMATCH[1]}"
+        cutoff_thermal="${BASH_REMATCH[2]}"
+        return 0
+      elif (( cutoffs_rc == 0 )) && [[ "$cutoffs_answer" == none ]]; then
+        return 0
+      else
+        why="$fallback, and the cutoffs recorded for the session in $STATE could not be read: $(cutoffs_failure --agent-session-cutoffs)"
+      fi
+    fi
+  fi
+  cutoff_floor=95
+  cutoff_thermal=true
+  log error "$why; enforcing the strictest, a 95% end floor and thermal rules on"
+  return 0
+}
+
+# Run the app binary's mode $1 (--agent-cutoffs or --agent-session-cutoffs)
+# on the bytes of file $2, as a read. Sets cutoffs_answer and cutoffs_rc, or
+# cutoffs_why when the binary was not run.
+cutoffs_answer=""
+cutoffs_rc=0
+cutoffs_why=""
+ask_app_cutoffs() { # flag file
+  local declared=""
+  cutoffs_answer=""
+  cutoffs_rc=0
+  cutoffs_why=""
   # A regular file only: a FIFO there could block this run under the lock.
   if [[ -f "$INSOMNIA_INFO" ]]; then
     declared="$(extract "$INSOMNIA_INFO" InsomniaAgentCutoffsVersion || true)"
   fi
   if [[ ! -x "$INSOMNIA_BIN" ]]; then
-    why="$INSOMNIA_BIN is missing or not executable"
+    cutoffs_why="$INSOMNIA_BIN is missing or not executable"
   elif [[ "$declared" != "$AGENT_CUTOFFS_VERSION" ]]; then
-    why="$INSOMNIA_INFO declares InsomniaAgentCutoffsVersion '${declared}', not $AGENT_CUTOFFS_VERSION (an older or newer build); the binary was not run"
+    cutoffs_why="$INSOMNIA_INFO declares InsomniaAgentCutoffsVersion '${declared}', not $AGENT_CUTOFFS_VERSION (an older or newer build); the binary was not run"
   else
-    read_input="$CONFIG"
-    run_read out "$INSOMNIA_BIN" --agent-cutoffs "$((COMMAND_TIMEOUT_SECONDS + KILL_GRACE_SECONDS))" || rc=$?
+    read_input="$2"
+    run_read cutoffs_answer "$INSOMNIA_BIN" "$1" "$((COMMAND_TIMEOUT_SECONDS + KILL_GRACE_SECONDS))" || cutoffs_rc=$?
     read_input=""
-    if (( rc == 0 )) && [[ "$out" =~ $answer_re ]]; then
-      cutoff_floor="${BASH_REMATCH[1]}"
-      cutoff_thermal="${BASH_REMATCH[2]}"
-      return 0
-    elif (( rc == 65 )) && [[ "$out" == rejected ]]; then
-      return 0
-    elif (( rc == 124 )); then
-      why="'$INSOMNIA_BIN --agent-cutoffs' did not answer within ${COMMAND_TIMEOUT_SECONDS}s"
-    else
-      why="unexpected answer from '$INSOMNIA_BIN --agent-cutoffs' (exit $rc, output '$(printf '%s' "$out" | head -c 200 | tr -c '[:print:]' ' ')')"
-    fi
   fi
-  cutoff_floor=95
-  cutoff_thermal=true
-  log error "could not read the end floor and thermal rule in $CONFIG: $why; enforcing the strictest, a 95% end floor and thermal rules on"
   return 0
+}
+
+# Why the answer ask_app_cutoffs got for mode $1 is not one to use.
+cutoffs_failure() { # flag
+  if (( cutoffs_rc == 124 )); then
+    echo "'$INSOMNIA_BIN $1' did not answer within ${COMMAND_TIMEOUT_SECONDS}s"
+  else
+    echo "unexpected answer from '$INSOMNIA_BIN $1' (exit $cutoffs_rc, output '$(printf '%s' "$cutoffs_answer" | head -c 200 | tr -c '[:print:]' ' ')')"
+  fi
 }
 
 # pmset -g batt prints the source ("Now drawing from 'Battery Power'" or 'AC
@@ -1156,10 +1373,12 @@ fi
 #
 # A session.json that cannot be removed is recorded as ended instead, in
 # $ENDED, else in the journal, else in a new file beside them or in
-# $LOG_DIR, and the app and every later run honour the record until the
-# file is gone. The record is written here, before the undo below, so no
-# relaunch finds sleep restored and the session still live. If none can be
-# written (neither folder takes a new file), nothing on disk says the
+# $LOG_DIR, else in the recovery lock file, and the app and every later run
+# honour the record until the file is gone. The record is written and read
+# back here, before the undo below, so no relaunch finds sleep restored and
+# the session still live. If none can be written (neither folder takes a
+# new file, and the lock file is not a regular file this user owns or
+# refuses the write too, as a full disk does), nothing on disk says the
 # session is over: sleep is still restored below, since leaving it disabled
 # is worse, but its journal entry stays, so the journal reads dirty,
 # uninstall.sh stops, and every run exits 1 until a person makes the file
@@ -1174,6 +1393,7 @@ remove_session() {
   "$RM" -f "$SESSION" 2>/dev/null || return 1
   remove_end_record
   remove_stale_end_records_aside
+  remove_stale_lock_record
 }
 
 # Record that the session in session.json is over: a copy of its exact bytes
@@ -1249,6 +1469,28 @@ record_end_aside() {
   return 1
 }
 
+# Record the same end in the recovery lock file (see read_lock_record), for
+# when $ENDED, the journal and both folders refuse it: the file exists
+# already and takes the record in place, keeping its inode. Written only
+# while $LOCK is the regular file this run holds the lock on. A record
+# already there for these bytes is used again, and so is content that is
+# not a whole record, which already counts as the end of any session and is
+# not overwritten. True only when the file then reads back as exactly that
+# record. A write cut short leaves content that is not a whole record,
+# which every reader counts as the end of whatever session.json holds.
+record_end_in_lock() {
+  local encoded
+  encoded="$(session_base64)" || return 1
+  [[ -n "$encoded" ]] || return 1
+  if end_recorded_in_lock; then return 0; fi
+  (( ${#LOCK_RECORD_TAG} + ${#encoded} + 2 <= LOCK_RECORD_MAX_BYTES )) || return 1
+  lock_is_held_file || return 1
+  { printf '%s %s\n' "$LOCK_RECORD_TAG" "$encoded" > "$LOCK"; } 2>/dev/null || true
+  lock_is_held_file || return 1
+  read_lock_record
+  [[ "$lock_record_state" == record && "$lock_record" == "$encoded" ]]
+}
+
 session_left=0      # 1 when the valid session this run ends is still on disk
 keep_sleep_entry=0  # 1 when nothing on disk records that end
 if [[ "$session_state" == valid ]] && ! remove_session; then
@@ -1259,9 +1501,11 @@ if [[ "$session_state" == valid ]] && ! remove_session; then
     log error "could not remove $SESSION or record its end in $ENDED; its end is recorded in $STATE (endedSession) instead, so Insomnia restores the session instead of resuming it. Every run retries the removal"
   elif record_end_aside; then
     log error "could not remove $SESSION or record its end in $ENDED or $STATE; its end is recorded in $aside_match instead, so Insomnia restores the session instead of resuming it. Every run retries the removal"
+  elif record_end_in_lock; then
+    log error "could not remove $SESSION or record its end in $ENDED, $STATE or a new file in $APP_SUPPORT or $LOG_DIR; its end is recorded in the recovery lock file $LOCK instead, so Insomnia restores the session instead of resuming it. Every run retries the removal"
   else
     keep_sleep_entry=1
-    log error "could not remove $SESSION or record its end in $ENDED, $STATE or a new file in $APP_SUPPORT or $LOG_DIR. Sleep is restored anyway, but sleepDisabledByUs stays journaled and every run exits 1 until the file can be removed (ls -lO shows its flags); Insomnia resumes no session while it cannot replace $SESSION or write $STATE, and none whose journaled sleep hold pmset no longer reports"
+    log error "could not remove $SESSION or record its end in $ENDED, $STATE, a new file in $APP_SUPPORT or $LOG_DIR, or the recovery lock file $LOCK. Sleep is restored anyway, but sleepDisabledByUs stays journaled and every run exits 1 until the file can be removed (ls -lO shows its flags); Insomnia resumes no session while it cannot replace $SESSION or write $STATE, and none whose journaled sleep hold pmset no longer reports"
   fi
 fi
 

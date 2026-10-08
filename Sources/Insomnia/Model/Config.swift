@@ -308,11 +308,42 @@ extension Config {
 
 /// The two settings backstop.sh enforces on its own while a session runs,
 /// the end floor and the thermal rule, as `AgentCutoffsCommand` prints them
-/// from config.json.
+/// from config.json, or from the journal's record of them
+/// (`RuntimeState.sessionCutoffs`) when config.json cannot be used.
 struct AgentCutoffs: Equatable, Sendable {
     /// 0...`Config.maxEndFloor`; 0 is off.
     let endFloor: Int
     let thermalRules: Bool
+
+    init(endFloor: Int, thermalRules: Bool) {
+        self.endFloor = endFloor
+        self.thermalRules = thermalRules
+    }
+
+    /// The form the journal records them in, and the one
+    /// `AgentCutoffsCommand` prints after "cutoffs ": the end floor in
+    /// decimal, a space, and true or false. `"30 false"`.
+    var journalValue: String { "\(endFloor) \(thermalRules)" }
+
+    /// Reads `journalValue` back: nil for anything else, such as a floor
+    /// outside 0...`Config.maxEndFloor`, a leading zero, a sign, other
+    /// spacing, or another word for the rule. No other text means the
+    /// same cutoffs.
+    init?(journalValue text: String) {
+        let parts = text.split(separator: " ", omittingEmptySubsequences: false)
+        guard parts.count == 2, let floorText = parts.first, let rule = parts.last,
+              !floorText.isEmpty, floorText.count <= 2,
+              floorText.utf8.allSatisfy({ (0x30...0x39).contains($0) }),
+              floorText == "0" || !floorText.hasPrefix("0"),
+              let floor = Int(floorText), floor <= Config.maxEndFloor
+        else { return nil }
+        switch rule {
+        case "true": thermalRules = true
+        case "false": thermalRules = false
+        default: return nil
+        }
+        endFloor = floor
+    }
 
     var description: String {
         "end floor \(endFloor == 0 ? "off" : "\(endFloor)%"), thermal rules \(thermalRules ? "on" : "off")"

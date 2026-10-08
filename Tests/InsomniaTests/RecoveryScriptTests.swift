@@ -400,7 +400,9 @@ final class RecoveryScriptTests: XCTestCase {
         let seen = try String(contentsOf: fx.root.appendingPathComponent("read.files"), encoding: .utf8)
             .split(separator: "\n").map(String.init)
         XCTAssertEqual(seen.count, 1, "\(seen)")
-        XCTAssertTrue(seen.allSatisfy { $0.hasSuffix(".1.out") }, "a read has its output file and no .pid or .rc status files: \(seen)")
+        // The battery read is the run's second: with no config.json, the
+        // cutoffs the journal records for the session are read first.
+        XCTAssertTrue(seen.allSatisfy { $0.hasSuffix(".2.out") }, "a read has its output file and no .pid or .rc status files: \(seen)")
 
         try writeLiveSession()
         fx.clearCalls()
@@ -851,14 +853,50 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(try recordsAside(), [], "the record goes with the file it copies")
     }
 
-    /// The same files, and the record aside cannot be created either (the
-    /// MKTEMP constant is /usr/bin/false here): nothing on disk says the
-    /// session is over. Sleep is restored anyway, but its journal entry
-    /// stays as evidence and the run exits 1. (The app then resumes nothing
-    /// either: it writes the journal before it resumes a session;
-    /// JournaledSessionEndTests.)
+    /// The same files, the record aside cannot be created either (the
+    /// MKTEMP constant is /usr/bin/false here), and the recovery lock file
+    /// takes no record (LOCK_RECORD_MAX_BYTES is 0 here, a stand-in for a
+    /// write it refuses): nothing on disk says the session is over. Sleep
+    /// is restored anyway, but its journal entry stays as evidence and the
+    /// run exits 1. (The app then resumes nothing either: it writes the
+    /// journal before it resumes a session; JournaledSessionEndTests.)
     func testEndThatCanNeitherRemoveNorRecordKeepsTheSleepEntry() throws {
         try writeLiveSession()
+        try setImmutable(fx.session, true)
+        try "{}".write(to: fx.endedSession, atomically: true, encoding: .utf8)
+        try setImmutable(fx.endedSession, true)
+        try setImmutable(fx.state, true)
+        var text = try String(contentsOf: fx.backstop, encoding: .utf8)
+        text = try ScriptFixture.replaceOnce(text, "MKTEMP=/usr/bin/mktemp", with: "MKTEMP=/usr/bin/false")
+        try ScriptFixture.replaceOnce(text, "\nLOCK_RECORD_MAX_BYTES=1048576\n", with: "\nLOCK_RECORD_MAX_BYTES=0\n")
+            .write(to: fx.backstop, atomically: true, encoding: .utf8)
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 1, r.stderr + fx.log())
+        XCTAssertEqual(calls(), [sleepRestored])
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, true, "evidence kept while the session still reads as valid")
+        XCTAssertNil(try fx.stateJSON()["endedSession"])
+        XCTAssertTrue(fx.exists(fx.session))
+        XCTAssertEqual(try String(contentsOf: fx.endedSession, encoding: .utf8), "{}")
+        XCTAssertEqual(try recordsAside(), [])
+        XCTAssertEqual(try Data(contentsOf: fx.lock), Data())
+        let log = fx.log()
+        XCTAssertTrue(log.contains("could not remove \(fx.session.path) or record its end in \(fx.endedSession.path), \(fx.state.path), a new file in \(fx.home.path) or \(logs.path), or the recovery lock file \(fx.lock.path)"), log)
+        XCTAssertTrue(log.contains("still journaled: sleepDisabledByUs is kept although sleep is restored"), log)
+    }
+
+    /// The same files and no record aside, with a recovery lock file that
+    /// takes the record: it then holds the tag and the file's bytes in
+    /// base64, written in place, so its inode stays. Sleep is restored and
+    /// the run exits 1 while session.json stays. Later runs end the session
+    /// again without the checks, even with the app alive. Once the files
+    /// can be changed, session.json goes and the lock file is emptied, the
+    /// same inode still.
+    func testEndThatCanWriteOnlyTheLockFileRecordsItThere() throws {
+        try writeLiveSession()
+        FileManager.default.createFile(atPath: fx.lock.path, contents: nil)
+        let lockInode = try fx.inode(fx.lock)
         try setImmutable(fx.session, true)
         try "{}".write(to: fx.endedSession, atomically: true, encoding: .utf8)
         try setImmutable(fx.endedSession, true)
@@ -871,14 +909,29 @@ final class RecoveryScriptTests: XCTestCase {
 
         XCTAssertEqual(r.status, 1, r.stderr + fx.log())
         XCTAssertEqual(calls(), [sleepRestored])
-        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, true, "evidence kept while the session still reads as valid")
-        XCTAssertNil(try fx.stateJSON()["endedSession"])
-        XCTAssertTrue(fx.exists(fx.session))
-        XCTAssertEqual(try String(contentsOf: fx.endedSession, encoding: .utf8), "{}")
+        let record = "ended-session-v1 \(try Data(contentsOf: fx.session).base64EncodedString())\n"
+        XCTAssertEqual(try String(contentsOf: fx.lock, encoding: .utf8), record)
+        XCTAssertEqual(try fx.inode(fx.lock), lockInode)
         XCTAssertEqual(try recordsAside(), [])
-        let log = fx.log()
-        XCTAssertTrue(log.contains("could not remove \(fx.session.path) or record its end in \(fx.endedSession.path), \(fx.state.path) or a new file in \(fx.home.path)"), log)
-        XCTAssertTrue(log.contains("still journaled: sleepDisabledByUs is kept although sleep is restored"), log)
+        XCTAssertTrue(fx.log().contains("its end is recorded in the recovery lock file \(fx.lock.path) instead"), fx.log())
+
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+        fx.clearCalls()
+        let again = try fx.run(fx.backstop)
+
+        XCTAssertEqual(again.status, 1, again.stderr + fx.log())
+        XCTAssertEqual(calls(), [sleepRestored], "no checks; the journal still asks for the restore")
+        XCTAssertTrue(fx.log().contains("already ended (recorded in \(fx.lock.path))"), fx.log())
+        XCTAssertEqual(try String(contentsOf: fx.lock, encoding: .utf8), record, "a record that matches is kept and used again")
+
+        for file in [fx.session, fx.endedSession, fx.state] { try setImmutable(file, false) }
+        let last = try fx.run(fx.backstop)
+
+        XCTAssertEqual(last.status, 0, last.stderr + fx.log())
+        XCTAssertFalse(fx.exists(fx.session))
+        XCTAssertEqual(try Data(contentsOf: fx.lock), Data(), "the record goes with the file it copies")
+        XCTAssertEqual(try fx.inode(fx.lock), lockInode)
     }
 
     private var logs: URL { fx.home.appendingPathComponent("Logs", isDirectory: true) }
@@ -919,6 +972,7 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: record), try Data(contentsOf: fx.session), "the record is the file's exact bytes")
         XCTAssertEqual(try FileManager.default.attributesOfItem(atPath: record.path)[.posixPermissions] as? Int, 0o600)
         XCTAssertEqual(try Data(contentsOf: fx.state), journal, "the journal is kept as it was")
+        XCTAssertEqual(try Data(contentsOf: fx.lock), Data(), "the lock file is only the last place")
         let log = fx.log()
         XCTAssertTrue(log.contains("its end is recorded in \(record.path) instead"), log)
         XCTAssertTrue(log.contains("its supervisor reported no result within"), log)
@@ -937,13 +991,17 @@ final class RecoveryScriptTests: XCTestCase {
     }
 
     /// The same with the log folder refusing new files too (both mode
-    /// 0555): no record can be written anywhere. The restore still runs,
-    /// the run reports no result, keeps the journal as it was and exits 1.
-    /// This is the case no record covers (the app then resumes nothing
-    /// while session.json cannot be replaced; JournaledSessionEndTests).
-    func testEndWhereNeitherFolderTakesANewFileRecordsNothingAndKeepsTheJournal() throws {
+    /// 0555): no new file can be written anywhere. The record goes in the
+    /// recovery lock file, which exists already, in place, before the
+    /// restore. The restore still runs, the run reports no result, keeps
+    /// the journal as it was and exits 1. Once both folders take files
+    /// again, a run with the app alive ends the session without the
+    /// checks, and session.json goes and the lock file is emptied, its
+    /// inode the same throughout.
+    func testEndWhereNeitherFolderTakesANewFileRecordsItInTheLockFile() throws {
         try writeLiveSession()
         FileManager.default.createFile(atPath: fx.lock.path, contents: nil)
+        let lockInode = try fx.inode(fx.lock)
         try FileManager.default.createDirectory(at: logs, withIntermediateDirectories: true)
         FileManager.default.createFile(atPath: fx.logFile.path, contents: nil)
         let journal = try Data(contentsOf: fx.state)
@@ -963,9 +1021,64 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(fx.exists(fx.endedSession))
         XCTAssertEqual(try recordsAside(), [])
         XCTAssertEqual(try recordsInTheLogFolder(), [])
+        XCTAssertEqual(try String(contentsOf: fx.lock, encoding: .utf8), "ended-session-v1 \(try Data(contentsOf: fx.session).base64EncodedString())\n")
+        XCTAssertEqual(try fx.inode(fx.lock), lockInode)
         XCTAssertEqual(try Data(contentsOf: fx.state), journal, "the journal is kept as it was")
         let log = fx.log()
-        XCTAssertTrue(log.contains("or a new file in \(fx.home.path) or \(logs.path)"), log)
+        XCTAssertTrue(log.contains("or a new file in \(fx.home.path) or \(logs.path); its end is recorded in the recovery lock file \(fx.lock.path) instead"), log)
+        XCTAssertTrue(log.contains("its supervisor reported no result within"), log)
+
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fx.home.path)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: logs.path)
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+        fx.clearCalls()
+        let again = try fx.run(fx.backstop)
+
+        XCTAssertEqual(again.status, 0, again.stderr + fx.log())
+        XCTAssertEqual(calls(), [sleepRestored], "no checks; the journal still asks for the restore")
+        XCTAssertTrue(fx.log().contains("already ended (recorded in \(fx.lock.path))"), fx.log())
+        XCTAssertFalse(fx.exists(fx.session))
+        XCTAssertEqual(try Data(contentsOf: fx.lock), Data())
+        XCTAssertEqual(try fx.inode(fx.lock), lockInode)
+    }
+
+    /// The same, and the lock file takes no record either
+    /// (LOCK_RECORD_MAX_BYTES is 0 here, a stand-in for a write it
+    /// refuses): no record can be written anywhere. The restore still
+    /// runs, the run reports no result, keeps the journal as it was and
+    /// exits 1. This is the case no record covers (the app then resumes
+    /// nothing while session.json cannot be replaced;
+    /// JournaledSessionEndTests).
+    func testEndWhereNeitherFolderNorTheLockFileTakesTheRecordRecordsNothing() throws {
+        try writeLiveSession()
+        FileManager.default.createFile(atPath: fx.lock.path, contents: nil)
+        try FileManager.default.createDirectory(at: logs, withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: fx.logFile.path, contents: nil)
+        let text = try String(contentsOf: fx.backstop, encoding: .utf8)
+        try ScriptFixture.replaceOnce(text, "\nLOCK_RECORD_MAX_BYTES=1048576\n", with: "\nLOCK_RECORD_MAX_BYTES=0\n")
+            .write(to: fx.backstop, atomically: true, encoding: .utf8)
+        let journal = try Data(contentsOf: fx.state)
+        fx.clearCalls()
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: logs.path)
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: fx.home.path)
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fx.home.path)
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: logs.path)
+        }
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 1, r.stderr + fx.log())
+        XCTAssertEqual(calls(), [sleepRestored], "the restore runs")
+        XCTAssertTrue(fx.exists(fx.session))
+        XCTAssertFalse(fx.exists(fx.endedSession))
+        XCTAssertEqual(try recordsAside(), [])
+        XCTAssertEqual(try recordsInTheLogFolder(), [])
+        XCTAssertEqual(try Data(contentsOf: fx.lock), Data())
+        XCTAssertEqual(try Data(contentsOf: fx.state), journal, "the journal is kept as it was")
+        let log = fx.log()
+        XCTAssertTrue(log.contains("a new file in \(fx.home.path) or \(logs.path), or the recovery lock file \(fx.lock.path). Sleep is restored anyway"), log)
         XCTAssertTrue(log.contains("its supervisor reported no result within"), log)
     }
 
@@ -1006,7 +1119,8 @@ final class RecoveryScriptTests: XCTestCase {
     /// A log folder that is a symlink is not searched: a matching record
     /// in the folder it points to ends nothing and stays. Nor is a record
     /// written through it when the folder beside session.json takes no new
-    /// file: nothing is recorded, as when both folders refuse.
+    /// file: the record goes in the recovery lock file, as when both
+    /// folders refuse.
     func testALogFolderThatIsASymlinkIsNeitherSearchedNorWrittenThrough() throws {
         try writeLiveSession()
         let elsewhere = fx.root.appendingPathComponent("elsewhere", isDirectory: true)
@@ -1040,7 +1154,8 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(calls(), [sleepRestored])
         XCTAssertTrue(fx.exists(fx.session))
         XCTAssertEqual(try fx.contents(of: elsewhere).filter { Paths.isEndedSessionAsideName($0) }, [], "no record through the symlink")
-        XCTAssertTrue(fx.log().contains("or a new file in \(fx.home.path) or \(logs.path)"), fx.log())
+        XCTAssertTrue(fx.log().contains("or a new file in \(fx.home.path) or \(logs.path); its end is recorded in the recovery lock file \(fx.lock.path) instead"), fx.log())
+        XCTAssertEqual(try String(contentsOf: fx.lock, encoding: .utf8), "ended-session-v1 \(try Data(contentsOf: fx.session).base64EncodedString())\n")
     }
 
     /// A record aside that matches no session.json goes, as a stale
@@ -1111,6 +1226,39 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertThrowsError(try Store(paths: Paths(root: fx.home)).loadState())
     }
 
+    /// sessionCutoffs is a record the app writes as "30 false". A value it
+    /// does not write, of any type, leaves the journal usable for the agent
+    /// and both uninstall modes, as for the app, which reads it as none:
+    /// the undo runs, and the value stays as it is.
+    func testJournalWithSessionCutoffsTheAppDoesNotWriteIsStillUsable() throws {
+        for value in [#""96 false""#, "30", "true", #"["30 false"]"#, #"{"endFloor":30}"#, "null", #""30 false""#] {
+            for purge in [nil, false, true] {
+                if purge != nil {
+                    try FileManager.default.createDirectory(at: fx.state.deletingLastPathComponent(), withIntermediateDirectories: true)
+                    try fx.installMachinery()
+                }
+                try? FileManager.default.removeItem(at: fx.session)
+                try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+                let journal = #"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"sessionCutoffs":\#(value)}"#
+                try fx.writeState(journal)
+                XCTAssertEqual(try Store(paths: Paths(root: fx.home)).loadState()?.sleepDisabledByUs, true, value)
+                fx.clearCalls()
+
+                let r = try purge.map { try fx.run(fx.uninstall, $0 ? ["--purge"] : []) } ?? fx.run(fx.backstop)
+
+                let label = "\(value), \(purge.map { $0 ? "uninstall --purge" : "uninstall" } ?? "agent")"
+                XCTAssertEqual(r.status, 0, "\(label): \(r.stderr) \(r.stdout) \(fx.log())")
+                XCTAssertTrue(fx.calls().contains("sudo -n \(fx.fakePmset) -a disablesleep 0"), "\(label): \(fx.calls())")
+                XCTAssertFalse(fx.log().contains("sessionCutoffs is a"), "\(label): \(fx.log())")
+                if purge == nil {
+                    let after = try String(contentsOf: fx.state, encoding: .utf8)
+                    XCTAssertTrue(after.contains(#""sessionCutoffs":\#(value)"#) || after.contains(#""sessionCutoffs" : \#(value)"#), "\(label): kept as it is: \(after)")
+                    XCTAssertFalse(fx.exists(fx.session), label)
+                }
+            }
+        }
+    }
+
     /// A record left from an earlier session.json matches nothing: it goes,
     /// and the live session is checked as usual.
     func testStaleEndRecordIsRemovedAndDoesNotEndTheSession() throws {
@@ -1123,6 +1271,55 @@ final class RecoveryScriptTests: XCTestCase {
 
         XCTAssertEqual(calls(), [batteryRead, thermalRead])
         XCTAssertFalse(fx.exists(fx.endedSession))
+    }
+
+    /// An exact record beside a session.json that cannot be read (mode 0,
+    /// immutable, so it cannot be moved aside either) is not shown to be
+    /// stale: cmp cannot compare them (exit 2), so it stays, on every
+    /// retry. Once session.json can be read again it ends that session:
+    /// the next run, with the app alive, ends it without the checks and
+    /// removes both. A record beside a session.json that is not a regular
+    /// file stays too; one beside no session.json goes.
+    func testAnExactEndRecordStaysWhileSessionJSONCannotBeCompared() throws {
+        try writeLiveSession()
+        try FileManager.default.copyItem(at: fx.session, to: fx.endedSession)
+        let bytes = try Data(contentsOf: fx.session)
+        try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: fx.session.path)
+        try setImmutable(fx.session, true)
+        defer {
+            try? setImmutable(fx.session, false)
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fx.session.path)
+        }
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+
+        let r = try fx.run(fx.backstop)
+        XCTAssertEqual(r.status, 1, r.stderr + fx.log())
+        XCTAssertEqual(try Data(contentsOf: fx.endedSession), bytes, "kept while it cannot be compared")
+        let retry = try fx.run(fx.backstop)
+        XCTAssertEqual(retry.status, 1, retry.stderr + fx.log())
+        XCTAssertEqual(try Data(contentsOf: fx.endedSession), bytes, "kept on the retry too")
+
+        try setImmutable(fx.session, false)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fx.session.path)
+        try fx.writeState(liveJournal)
+        fx.clearCalls()
+        let repaired = try fx.run(fx.backstop)
+        XCTAssertEqual(repaired.status, 0, repaired.stderr + fx.log())
+        XCTAssertTrue(fx.log().contains("already ended (recorded in \(fx.endedSession.path))"), fx.log())
+        XCTAssertEqual(calls(), [sleepRestored], "no checks for a session recorded as ended")
+        XCTAssertFalse(fx.exists(fx.session))
+        XCTAssertFalse(fx.exists(fx.endedSession))
+
+        try FileManager.default.createDirectory(at: fx.session, withIntermediateDirectories: false)
+        try bytes.write(to: fx.endedSession)
+        _ = try fx.run(fx.backstop)
+        XCTAssertEqual(try Data(contentsOf: fx.endedSession), bytes, "not shown to be stale beside a session.json that is not a file")
+        // That run moved the directory aside, as any session.json it cannot
+        // read; nothing is at session.json now.
+        try? FileManager.default.removeItem(at: fx.session)
+        _ = try fx.run(fx.backstop)
+        XCTAssertFalse(fx.exists(fx.endedSession), "stale once session.json is gone")
     }
 
     /// A stale record that cannot be removed ends nothing, but it is a copy
@@ -2284,6 +2481,61 @@ final class RecoveryScriptTests: XCTestCase {
             try FileManager.default.removeItem(at: dir)
             try FileManager.default.removeItem(at: notOurs)
         }
+    }
+
+    /// The record of a session's end in the recovery lock file goes with or
+    /// without --purge, emptied in place: the file and its inode stay. The
+    /// fixture's backstop is changed here to leave it, so what empties it
+    /// is uninstall's own copy of the rule. A symlink at the lock path
+    /// before uninstall starts stops it before it removes anything, as on
+    /// main: the backstop cannot show that the link is the lock uninstall
+    /// holds, so it waits on that lock and gives up (exit 75). One put there
+    /// during the run is named and left. Neither writes the file a symlink
+    /// points to.
+    func testUninstallEmptiesTheLockFileRecordInPlaceInBothModes() throws {
+        let text = try String(contentsOf: fx.backstop, encoding: .utf8)
+        let clear = #"  if lock_is_held_file && { : > "$LOCK"; } 2>/dev/null; then return 0; fi"#
+        try ScriptFixture.replaceOnce(text, clear, with: "  return 0")
+            .write(to: fx.backstop, atomically: true, encoding: .utf8)
+        let record = Data("ended-session-v1 QUJD\n".utf8)
+        for purge in [false, true] {
+            try fx.installMachinery()
+            FileManager.default.createFile(atPath: fx.lock.path, contents: record)
+            let lockInode = try fx.inode(fx.lock)
+
+            let r = try fx.run(fx.uninstall, purge ? ["--purge"] : [])
+
+            XCTAssertEqual(r.status, 0, "purge \(purge): " + r.stderr + r.stdout)
+            XCTAssertEqual(try Data(contentsOf: fx.lock), Data(), "purge \(purge)")
+            XCTAssertEqual(try fx.inode(fx.lock), lockInode, "purge \(purge)")
+            XCTAssertTrue(r.stdout.contains("Emptied \(fx.lock.path) of the record of a session's end; the file itself is kept."), r.stdout)
+        }
+
+        try fx.installMachinery()
+        let target = fx.root.appendingPathComponent("elsewhere.lock")
+        try record.write(to: target)
+        try FileManager.default.removeItem(at: fx.lock)
+        try FileManager.default.createSymbolicLink(at: fx.lock, withDestinationURL: target)
+        var r = try fx.run(fx.uninstall)
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertTrue(r.stderr.contains("Uninstall stopped BEFORE removing anything"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("backstop exited 75"), r.stderr)
+        XCTAssertTrue((try? String(contentsOf: fx.logFile, encoding: .utf8))?.contains("recovery lock \(fx.lock.path) still held") == true)
+        XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: fx.lock.path), target.path)
+        XCTAssertEqual(try Data(contentsOf: target), record)
+
+        // That uninstall removed nothing, so the machinery is still there.
+        try FileManager.default.removeItem(at: fx.lock)
+        FileManager.default.createFile(atPath: fx.lock.path, contents: record)
+        let moved = fx.root.appendingPathComponent("moved.lock")
+        try ScriptFixture.replaceOnce(text, clear, with: "  /bin/mv \"$LOCK\" '\(moved.path)' && /bin/ln -s '\(target.path)' \"$LOCK\"; return 0")
+            .write(to: fx.backstop, atomically: true, encoding: .utf8)
+        r = try fx.run(fx.uninstall)
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertTrue(r.stdout.contains("Left the contents of \(fx.lock.path): it is not a regular file this user owns."), r.stdout)
+        XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: fx.lock.path), target.path)
+        XCTAssertEqual(try Data(contentsOf: target), record)
+        XCTAssertEqual(try Data(contentsOf: moved), record)
     }
 
     /// Records in the log folder go with or without --purge, as those
@@ -7419,8 +7671,9 @@ private final class ScriptFixture {
         fi
         exec /bin/chmod "$@"
         """)
-        // Insomnia --agent-cutoffs: this build's own binary, unrecorded, so
-        // config.json is read by the app's decoder as in production.
+        // Insomnia --agent-cutoffs and --agent-session-cutoffs: this build's
+        // own binary, unrecorded, so config.json and the journal's cutoffs
+        // are read by the app's decoder as in production.
         // Insomnia --resume-frozen: reads its entries from standard input,
         // one "<pid> <startedAt> <micros> <boot>" line each, and records the
         // call as "Insomnia <arguments> < <line>; <line>; ...". Answers one
@@ -7439,7 +7692,7 @@ private final class ScriptFixture {
         try fm.createDirectory(at: appInfo.deletingLastPathComponent(), withIntermediateDirectories: true)
         try Self.infoPlist(resumeFrozenVersion: "1").write(to: appInfo, atomically: true, encoding: .utf8)
         try writeFake("Insomnia", """
-        [[ "${1:-}" == --agent-cutoffs ]] && exec '\(BuiltApp.binary.path)' "$@"
+        [[ "${1:-}" == --agent-cutoffs || "${1:-}" == --agent-session-cutoffs ]] && exec '\(BuiltApp.binary.path)' "$@"
         input=()
         while IFS= read -r line || [[ -n "$line" ]]; do input+=("$line"); done
         joined=""

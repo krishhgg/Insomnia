@@ -63,6 +63,39 @@ final class RecoveryLockHandle: @unchecked Sendable {
         }
     }
 
+    /// Makes the locked file hold exactly `data`, written in place through
+    /// this handle's descriptor, so the file keeps its inode and stays the
+    /// lock every party takes (`Store.recordSessionEndInLock`). Only while
+    /// `path` still names that same file, a regular file (lstat, so not a
+    /// symlink) this user owns. The new bytes go over the old ones before
+    /// the file is cut to their length, so a write cut short leaves bytes
+    /// that are no whole record, never an empty file in place of a record.
+    /// True once written and synced; the caller reads the file back. False
+    /// once released or when a step fails, which can leave part of `data`.
+    func replaceContents(with data: Data, at path: String) -> Bool {
+        mutex.withLock {
+            guard fd >= 0 else { return false }
+            var held = stat()
+            var named = stat()
+            guard fstat(fd, &held) == 0, lstat(path, &named) == 0,
+                  named.st_mode & S_IFMT == S_IFREG, named.st_uid == getuid(),
+                  held.st_dev == named.st_dev, held.st_ino == named.st_ino else { return false }
+            let written = data.withUnsafeBytes { raw -> Bool in
+                var offset = 0
+                while offset < raw.count {
+                    let n = pwrite(fd, raw.baseAddress! + offset, raw.count - offset, off_t(offset))
+                    if n < 0 {
+                        if errno == EINTR { continue }
+                        return false
+                    }
+                    offset += n
+                }
+                return true
+            }
+            return written && ftruncate(fd, off_t(data.count)) == 0 && fsync(fd) == 0
+        }
+    }
+
     deinit { release() }
 }
 

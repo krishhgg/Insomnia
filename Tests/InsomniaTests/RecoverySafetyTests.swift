@@ -403,7 +403,9 @@ final class RecoverySafetyTests: XCTestCase {
         XCTAssertEqual(outcome, .sessionRetained)
         XCTAssertNotNil(try h.store.loadSession(), "fixture did not keep session.json")
         XCTAssertFalse(h.guardFake.sleepDisabled, "the machine must still be restored")
-        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
+        var kept = RuntimeState.clean
+        kept.sessionCutoffs = m.config.agentCutoffs
+        XCTAssertEqual(try h.store.loadState(), kept, "the session's cutoffs stay while its session.json does")
         XCTAssertEqual(m.pendingEnd, .quit)
         XCTAssertFalse(m.quitRequested)
         let last = try XCTUnwrap(h.notifier.posts.last)
@@ -418,6 +420,7 @@ final class RecoverySafetyTests: XCTestCase {
         let second = await m.end(reason: .user)
         XCTAssertEqual(second, .restored)
         XCTAssertNil(try h.store.loadSession())
+        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
         XCTAssertNil(m.pendingEnd)
 
         // A fresh launch finds nothing to hold.
