@@ -123,10 +123,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         terminating = true
         Task {
             let outcome = await manager.end(reason: .quit)
-            switch outcome {
-            case .restored, .incomplete(agentArmed: true):
+            if outcome.letsQuitGo {
                 sender.reply(toApplicationShouldTerminate: true)
-            case .locked, .incomplete(agentArmed: false), .sessionRetained, .journalUnreadable, .privilegedCommandRunning:
+            } else {
                 Log.error("quit deferred: recovery still pending (\(outcome)); staying to retry")
                 terminating = false
                 sender.reply(toApplicationShouldTerminate: false)

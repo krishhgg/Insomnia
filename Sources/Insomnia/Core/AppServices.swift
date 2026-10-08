@@ -71,7 +71,7 @@ final class AppServices {
     /// Last trusted display/keyboard brightness for the lid close (spec
     /// section 4): read every 30 s while the lid is open, at start, and 3 s
     /// after each lid open (the backlight stays suppressed briefly after the
-    /// wake).
+    /// wake), and given each level the manager restores (see `follow`).
     private let sampler: BrightnessSampler
     private static let sampleInterval: TimeInterval = 30
     private static let sampleLeeway: DispatchTimeInterval = .seconds(5)
@@ -153,7 +153,7 @@ final class AppServices {
         // A power command left running refuses lid and floor transactions
         // until it exits; the manager calls back then.
         manager.resyncAfterCommand = { [weak self] replayLid in self?.resyncAfterCommand(replayLid: replayLid) }
-        sampler.displayHeld = { [weak manager] in manager?.state.lowPowerSetByUs ?? false }
+        sampler.follow(manager)
 
         lid.onChange = { [weak self] closed in self?.lidChanged(closed) }
         lid.start()
@@ -463,5 +463,30 @@ final class AppServices {
         if let network { return await network.currentSSID() }
         let probe = NetworkFailover(paths: paths, keychain: keychain, notifier: notifier) { Config() }
         return await probe.currentSSID()
+    }
+}
+
+extension BrightnessSampler {
+    /// Ties the sampler to `manager`'s journal (spec section 4). A device
+    /// whose brightness is journaled is not read: it is at the 0 a lid
+    /// close left, or at a level not yet decided, until its restore. An
+    /// entry the manager settled but the journal has not taken yet does not
+    /// count (`effectiveState`): the device is the user's again. The
+    /// display is also not read while the journal on disk says Insomnia's
+    /// own Low Power Mode is on, even once the mode is known off with that
+    /// clear owed: the panel may still be on its way back from the mode,
+    /// and the level written after it stays the sample until the clear
+    /// lands. Each level the manager writes from the journal, or finds set
+    /// since in place of a kept value, becomes the sample, so a lid close
+    /// soon after journals that level and not a reading from before it.
+    func follow(_ manager: SessionManager) {
+        displayHeld = { [weak manager] in
+            guard let manager else { return false }
+            return manager.state.lowPowerSetByUs || manager.effectiveState.savedDisplayBrightness != nil
+        }
+        keyboardHeld = { [weak manager] in manager?.effectiveState.savedKeyboardBrightness != nil }
+        manager.didSettleBrightness = { [weak self] display, keyboard in
+            self?.record(display: display, keyboard: keyboard)
+        }
     }
 }

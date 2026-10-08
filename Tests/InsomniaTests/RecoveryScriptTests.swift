@@ -3,6 +3,10 @@ import Foundation
 import XCTest
 @testable import Insomnia
 
+/// One backslash, for the JSON escapes in the texts below, which then read
+/// as they are in the file: "\#(backslash)u0041" is a \u escape in it.
+private let backslash = "\\"
+
 /// Behavioural tests for scripts/backstop.sh and scripts/uninstall.sh.
 ///
 /// Each test runs a private COPY of the production script against a
@@ -1727,6 +1731,71 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(fx.log().contains("journal cleared"), fx.log())
     }
 
+    /// A brightness the app kept because its private-call guard refused
+    /// the restore on this macOS is kept here too, with its flag, but does
+    /// not keep the journal dirty: the rest is undone, the run succeeds,
+    /// and the log says why the value stays instead of asking to open the
+    /// app, which could not restore it either.
+    func testRefusedBrightnessIsKeptWithoutKeepingTheJournalDirty() throws {
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"savedDisplayBrightness":0.75,"displayRestoreRefused":true,"savedKeyboardBrightness":0.25,"keyboardRestoreRefused":true}"#)
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 0, r.stderr + fx.log())
+        XCTAssertEqual(fx.calls().count, 1, fx.calls().description)
+        XCTAssertTrue(fx.calls().first?.hasSuffix("pmset -a disablesleep 0") ?? false, fx.calls().description)
+        let s = try fx.stateJSON()
+        XCTAssertEqual(s["sleepDisabledByUs"] as? Bool, false)
+        XCTAssertEqual(s["savedDisplayBrightness"] as? Double, 0.75)
+        XCTAssertEqual(s["displayRestoreRefused"] as? Bool, true)
+        XCTAssertEqual(s["savedKeyboardBrightness"] as? Double, 0.25)
+        XCTAssertEqual(s["keyboardRestoreRefused"] as? Bool, true)
+        XCTAssertTrue(fx.log().contains("saved display brightness,saved keyboard backlight kept: the app's private-call guard refused that restore on this macOS"), fx.log())
+        XCTAssertFalse(fx.log().contains("Open Insomnia"), fx.log())
+        XCTAssertFalse(fx.log().contains("[error]"), fx.log())
+    }
+
+    /// Only refused brightness left: the journal counts as clean, an
+    /// expired session is removed, nothing privileged runs, and with no
+    /// session the periodic run exits 0 without a word, instead of failing
+    /// every minute for something it can never restore.
+    func testRefusedBrightnessAloneIsNotDirty() throws {
+        let json = #"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"savedDisplayBrightness":0.6,"displayRestoreRefused":true}"#
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        try fx.writeState(json)
+
+        let expired = try fx.run(fx.backstop)
+
+        XCTAssertEqual(expired.status, 0, expired.stderr + fx.log())
+        XCTAssertEqual(fx.calls(), [])
+        XCTAssertFalse(fx.exists(fx.session))
+        XCTAssertEqual(try String(contentsOf: fx.state, encoding: .utf8), json, "the journal is not rewritten")
+        XCTAssertTrue(fx.log().contains("journal already clean"), fx.log())
+        XCTAssertTrue(fx.log().contains("saved display brightness kept: the app's private-call guard refused that restore"), fx.log())
+
+        let before = fx.log()
+        let periodic = try fx.run(fx.backstop)
+
+        XCTAssertEqual(periodic.status, 0, periodic.stderr + fx.log())
+        XCTAssertEqual(fx.calls(), [])
+        XCTAssertEqual(fx.log(), before, "nothing to report on a run with nothing to do")
+    }
+
+    /// The flag covers only its own device: an unflagged keyboard entry
+    /// next to a refused display still needs the app.
+    func testAnUnflaggedEntryNextToARefusedOneStillNeedsTheApp() throws {
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"savedDisplayBrightness":0.6,"displayRestoreRefused":true,"savedKeyboardBrightness":0.4}"#)
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertNotEqual(r.status, 0, r.stderr + fx.log())
+        XCTAssertTrue(fx.log().contains("saved keyboard backlight can only be restored by the app; kept. Open Insomnia"), fx.log())
+        XCTAssertTrue(fx.log().contains("saved display brightness kept: the app's private-call guard refused"), fx.log())
+        XCTAssertEqual(try fx.stateJSON()["savedKeyboardBrightness"] as? Double, 0.4)
+    }
+
     // MARK: App Nap
 
     /// `NSAppSleepDisabled` the app set for agent apps is put back with the
@@ -1944,6 +2013,24 @@ final class RecoveryScriptTests: XCTestCase {
         let again = try fx.run(fx.backstop)
         XCTAssertEqual(again.status, 0, again.stderr)
         XCTAssertEqual(try movedAsideSessions(), [name], "a second run moved something else")
+    }
+
+    /// A brightness kept after a refused restore is not dirty, so it does
+    /// not hold back the move; it stays in the journal, and the log says
+    /// why, as it does when an expired session is removed.
+    func testMalformedSessionNextToARefusedBrightnessIsMovedAsideAndTheValueKept() throws {
+        let json = #"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"savedDisplayBrightness":0.6,"displayRestoreRefused":true}"#
+        try "not json".write(to: fx.session, atomically: true, encoding: .utf8)
+        try fx.writeState(json)
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 0, r.stderr + fx.log())
+        XCTAssertEqual(fx.calls(), [])
+        XCTAssertFalse(fx.exists(fx.session), "session.json left in place")
+        XCTAssertEqual(try movedAsideSessions().count, 1)
+        XCTAssertEqual(try String(contentsOf: fx.state, encoding: .utf8), json, "the journal is not rewritten")
+        XCTAssertTrue(fx.log().contains("saved display brightness kept: the app's private-call guard refused that restore"), fx.log())
     }
 
     /// While the journal stays dirty the file stays too: the next run must
@@ -2777,6 +2864,32 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(r.stderr.contains("open Insomnia.app"), r.stderr)
     }
 
+    /// A brightness the app kept after a refused restore does not stop the
+    /// uninstall, since nothing can restore it on this macOS, but
+    /// state.json stays, even with --purge, so a later Insomnia that can
+    /// make the call restores it. The output names the level to set.
+    func testUninstallCompletesPastARefusedBrightnessAndKeepsTheJournal() throws {
+        for purge in [false, true] {
+            let f = try ScriptFixture()
+            defer { f.destroy() }
+            try f.installMachinery()
+            try f.writeConfig(#"{"agentList":[]}"#)
+            try f.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"savedDisplayBrightness":0.6,"displayRestoreRefused":true}"#)
+
+            let r = try f.run(f.uninstall, purge ? ["--purge"] : [])
+
+            XCTAssertEqual(r.status, 0, "purge \(purge): " + r.stderr + r.stdout)
+            XCTAssertFalse(f.exists(f.plist), "purge \(purge)")
+            XCTAssertFalse(f.exists(f.app), "purge \(purge)")
+            XCTAssertTrue(f.exists(f.state), "purge \(purge)")
+            XCTAssertEqual(try f.stateJSON()["savedDisplayBrightness"] as? Double, 0.6)
+            XCTAssertEqual(try f.stateJSON()["displayRestoreRefused"] as? Bool, true)
+            XCTAssertEqual(f.exists(f.config), !purge, "purge \(purge)")
+            XCTAssertTrue(r.stdout.contains("  - display brightness 0.6"), r.stdout)
+            XCTAssertTrue(r.stdout.contains("Set the level with the brightness keys or Control Center"), r.stdout)
+            XCTAssertTrue(r.stdout.contains("Kept \(f.state.path): it holds the brightness listed above."), r.stdout)
+        }
+    }
     /// The backstop leaves an output device entry alone and exits 0, but
     /// removing Insomnia would leave that device muted for good: uninstall
     /// names the device and says how to get it back or let it go.
@@ -2797,7 +2910,6 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(r.stderr.contains("70-8C-F2:output is still muted from a lid close"), r.stderr)
         XCTAssertTrue(r.stderr.contains("Stop waiting for <device>"), r.stderr)
     }
-
     func testUninstallAbortsOnSavedDisplayBrightnessAndExplainsReopeningTheApp() throws {
         try fx.installMachinery()
         try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"savedDisplayBrightness":0.6}"#)
@@ -3825,6 +3937,8 @@ final class RecoveryScriptTests: XCTestCase {
             #"{"sleepDisabledByUs":false,"savedMuted":1}"#,
             #"{"sleepDisabledByUs":false,"savedDisplayBrightness":"bright"}"#,
             #"{"sleepDisabledByUs":false,"savedKeyboardBrightness":true}"#,
+            #"{"sleepDisabledByUs":false,"savedDisplayBrightness":0.5,"displayRestoreRefused":"yes"}"#,
+            #"{"sleepDisabledByUs":false,"savedKeyboardBrightness":0.5,"keyboardRestoreRefused":1}"#,
             #"{"sleepDisabledByUs":false,"appNapOverrides":"com.google.Chrome"}"#,
             #"{"sleepDisabledByUs":false,"appNapOverrides":["com.google.Chrome"]}"#,
             #"{"sleepDisabledByUs":false,"appNapOverrides":[{"previous":true}]}"#,
@@ -3864,7 +3978,7 @@ final class RecoveryScriptTests: XCTestCase {
     func testNullOptionalFieldsCountAsAbsent() throws {
         // Swift's decodeIfPresent treats null as nil; the shell must agree.
         try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
-        let json = #"{"sleepDisabledByUs":false,"lowPowerSetByUs":null,"frozenProcesses":[],"dockerFrozen":false,"savedOutputVolume":null,"savedMuted":null,"savedDisplayBrightness":null,"savedKeyboardBrightness":null,"frozenPids":null,"appNapOverrides":null,"savedAudioOutputs":null}"#
+        let json = #"{"sleepDisabledByUs":false,"lowPowerSetByUs":null,"frozenProcesses":[],"dockerFrozen":false,"savedOutputVolume":null,"savedMuted":null,"savedDisplayBrightness":null,"savedKeyboardBrightness":null,"frozenPids":null,"appNapOverrides":null,"savedAudioOutputs":null,"displayRestoreRefused":null,"keyboardRestoreRefused":null,"displayRestoredUnderLowPower":null,"keptDisplayUnderLowPower":null,"keptDisplayUnderLowPowerBoot":null,"keptDisplayReadLit":null}"#
         try fx.writeState(json)
 
         let r = try fx.run(fx.backstop)
@@ -3899,6 +4013,7 @@ final class RecoveryScriptTests: XCTestCase {
             #"{"sleepDisabledByUs":"true"}"#,
             #"{"sleepDisabledByUs":false,"frozenProcesses":"garbage"}"#,
             #"{"sleepDisabledByUs":false,"savedDisplayBrightness":"bright"}"#,
+            #"{"sleepDisabledByUs":false,"savedDisplayBrightness":0.5,"displayRestoreRefused":"yes"}"#,
             #"{"sleepDisabledByUs":false,"appNapOverrides":[{"previous":true}]}"#,
         ] + Self.corruptOutputJournals {
             let f = try ScriptFixture()
@@ -3915,6 +4030,671 @@ final class RecoveryScriptTests: XCTestCase {
             XCTAssertTrue(f.exists(f.app), json)
             XCTAssertEqual(try String(contentsOf: f.state, encoding: .utf8), json)
             XCTAssertTrue(r.stderr.contains("malformed") || r.stderr.contains("not a JSON object"), r.stderr)
+        }
+    }
+
+    // MARK: Kept display records
+
+    /// A journal with a kept display entry and the app's records about it,
+    /// sleep and Low Power Mode still ours: a run that took it for clean
+    /// would call pmset twice and republish it.
+    static func keptDisplayJournal(_ records: String, ours: Bool = true) -> String {
+        #"{"sleepDisabledByUs":\#(ours),"lowPowerSetByUs":\#(ours),"frozenProcesses":[],"dockerFrozen":false,"savedDisplayBrightness":0.8,"displayRestoreRefused":true"#
+            + (records.isEmpty ? "" : "," + records) + "}"
+    }
+
+    /// Records the app's decoder refuses, each with the start of the line
+    /// the log gives the problem: wrong types, numbers a Float cannot hold,
+    /// and numbers plutil reads otherwise than the app. plutil turns
+    /// 1e-400 into 0, reads 1., .5 and +1, which are not JSON numbers, and
+    /// keeps the last of two copies of a key, where the app keeps the
+    /// first. A key spelled with a \u escape is that key to both. plutil
+    /// also reads keys written as JSON5 or with a \x escape, and comments;
+    /// the app reads none of them.
+    static let malformedKeptDisplayRecords: [(problem: String, json: String)] = [
+        ("keptDisplayUnderLowPower is ", #""keptDisplayUnderLowPower":"0.8""#),
+        ("keptDisplayUnderLowPower is ", #""keptDisplayUnderLowPower":true"#),
+        ("keptDisplayUnderLowPower is ", #""keptDisplayUnderLowPower":[0.8]"#),
+        ("keptDisplayUnderLowPower is ", #""keptDisplayUnderLowPower":1e39"#),
+        ("keptDisplayUnderLowPower is ", #""keptDisplayUnderLowPower":-1e39"#),
+        ("keptDisplayUnderLowPower is ", #""keptDisplayUnderLowPower":1e-50"#),
+        ("keptDisplayUnderLowPower is ", #""keptDisplayUnderLowPower":1e-400"#),
+        ("keptDisplayUnderLowPower is ", #""keptDisplayUnderLowPower":-1e-400"#),
+        ("keptDisplayUnderLowPower is ", #""keptDisplayUnderLowPower":1."#),
+        ("keptDisplayUnderLowPower is ", #""keptDisplayUnderLowPower":1e-400,"keptDisplayUnderLowPower":0.8"#),
+        ("keptDisplayReadLit is ", #""keptDisplayReadLit":"0.8""#),
+        ("keptDisplayReadLit is ", #""keptDisplayReadLit":false"#),
+        ("keptDisplayReadLit is ", #""keptDisplayReadLit":{"value":0.8}"#),
+        ("keptDisplayReadLit is ", #""keptDisplayReadLit":3.5e38"#),
+        ("keptDisplayReadLit is ", #""keptDisplayReadLit":5e-46"#),
+        ("keptDisplayReadLit is ", #""keptDisplayReadLit":1e-400"#),
+        ("keptDisplayReadLit is ", #""keptDisplayReadLit":-1e-400"#),
+        ("keptDisplayReadLit is ", #""keptDisplayReadLit":.5"#),
+        ("keptDisplayReadLit is ", #""keptDisplayReadLit":+1"#),
+        ("keptDisplayReadLit is ", #""keptDisplayReadLit":1e-400,"keptDisplayReadLit":0.8"#),
+        ("keptDisplayReadLit is ", #""kept\u0044isplayReadLit":1e-400"#),
+        ("keptDisplayUnderLowPower is ", #""keptDisplayUnderLowPowe\#(backslash)u0072":"0.8""#),
+        ("a key in state.json has an escape JSON does not have", #""kept\#(backslash)x44isplayReadLit":0.8"#),
+        ("the top level of state.json cannot be followed here", #"keptDisplayReadLit:1e-400"#),
+        ("the top level of state.json cannot be followed here", #"'keptDisplayReadLit':0.8"#),
+        ("the top level of state.json cannot be followed here", #"/* note */"keptDisplayReadLit":0.8"#),
+        ("keptDisplayUnderLowPowerBoot is ", #""keptDisplayUnderLowPowerBoot":7"#),
+        ("keptDisplayUnderLowPowerBoot is ", #""keptDisplayUnderLowPowerBoot":true"#),
+        ("keptDisplayUnderLowPowerBoot is ", #""keptDisplayUnderLowPowerBoot":["boot-a"]"#),
+        ("displayRestoredUnderLowPower is ", #""displayRestoredUnderLowPower":"0.75""#),
+        ("displayRestoredUnderLowPower is ", #""displayRestoredUnderLowPower":false"#),
+    ]
+
+    /// Forms the app's decoder reads: null and absent are none, a number
+    /// may be written as an integer, 0 in any form is 0, the ends of a
+    /// Float's range hold, and so does a Float as a script republishes it,
+    /// with 17 significant digits.
+    static let validKeptDisplayRecords = [
+        "",
+        #""keptDisplayUnderLowPower":0.8,"keptDisplayUnderLowPowerBoot":"8F2C1A3E-0B6D-4C11-9E3F-2A7B5C4D1E00","keptDisplayReadLit":0.8"#,
+        #""keptDisplayUnderLowPower":1,"keptDisplayReadLit":0"#,
+        #""keptDisplayUnderLowPower":null,"keptDisplayUnderLowPowerBoot":null,"keptDisplayReadLit":null,"displayRestoredUnderLowPower":null"#,
+        #""keptDisplayUnderLowPowerBoot":"","displayRestoredUnderLowPower":0.75"#,
+        #""keptDisplayUnderLowPower":1e-45,"keptDisplayReadLit":3.4028235e38"#,
+        #""keptDisplayUnderLowPower":-3.4028235e38,"keptDisplayReadLit":-1e-45"#,
+        #""keptDisplayUnderLowPower":-0,"keptDisplayReadLit":0e-400"#,
+        #""keptDisplayUnderLowPower":0.0,"keptDisplayReadLit":0.80000001192092896"#,
+        #""keptDisplayReadL\#(backslash)u0069t":0.8,"kept\#(backslash)u0044isplayUnderLowPower":0.8"#,
+        #""keptDisplayReadLit":0.8,"note":{"keptDisplayReadLit":1e-400,"keptDisplayUnderLowPower":"0.8"},"list":[{"keptDisplayReadLit":0.7},"]}{["]"#,
+        #""note":"\#(backslash)"keptDisplayReadLit\#(backslash)":1e-400 \#(backslash)\#(backslash)u0041 \#(backslash)\#(backslash)","keptDisplayReadLit" : 0.8"#,
+    ]
+
+    /// Journals the app reads, taking the first copy of a key, that both
+    /// scripts refuse: plutil checks the last copy, and a republished
+    /// journal would keep only that one.
+    static let duplicatedKeptDisplayRecords: [(problem: String, json: String)] = [
+        ("keptDisplayReadLit is in the top level of state.json 2 times; the app reads the first and plutil the last", #""keptDisplayReadLit":0.8,"keptDisplayReadLit":0.7"#),
+        ("keptDisplayReadLit is in the top level of state.json 2 times", #""keptDisplayReadLit":0.8,"keptDisplayReadL\#(backslash)u0069t":0.7"#),
+        ("keptDisplayUnderLowPower is in the top level of state.json 3 times", #""keptDisplayUnderLowPower":0.8,"keptDisplayUnderLowPower":0.8,"keptDisplayUnderLowPower":0.8"#),
+        ("keptDisplayUnderLowPowerBoot is in the top level of state.json 2 times", #""keptDisplayUnderLowPowerBoot":"boot A","keptDisplayUnderLowPowerBoot":"boot B""#),
+    ]
+
+    static let keptDisplayRecordKeys = [
+        "keptDisplayUnderLowPower", "keptDisplayUnderLowPowerBoot", "keptDisplayReadLit", "displayRestoredUnderLowPower",
+    ]
+
+    /// A record the app could not decode makes the journal malformed, as
+    /// any other key of the wrong shape does: no pmset, the bytes and the
+    /// session kept, and the log names the key. The app's decoder refuses
+    /// each of these journals too.
+    func testMalformedKeptDisplayRecordsAreRejectedByBackstopWithoutCommands() throws {
+        for (problem, record) in Self.malformedKeptDisplayRecords {
+            let json = Self.keptDisplayJournal(record)
+            XCTAssertThrowsError(try Store.makeDecoder().decode(RuntimeState.self, from: Data(json.utf8)), "the app refuses \(json)")
+            let f = try ScriptFixture()
+            defer { f.destroy() }
+            try f.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+            try f.writeState(json)
+
+            let r = try f.run(f.backstop)
+
+            XCTAssertNotEqual(r.status, 0, json)
+            XCTAssertEqual(f.calls(), [], "no privileged command for \(json)")
+            XCTAssertEqual(try String(contentsOf: f.state, encoding: .utf8), json, "evidence kept for \(json)")
+            XCTAssertTrue(f.exists(f.session), json)
+            XCTAssertTrue(f.log().contains("\(f.state.path): \(problem)"), "\(json): \(f.log())")
+            XCTAssertTrue(f.log().contains("is unreadable or malformed; nothing undone, evidence kept"), f.log())
+        }
+    }
+
+    /// Every form the app reads passes: sleep and the mode are undone, the
+    /// records stay as they were for the app, but for the boot of a record
+    /// of the kept entry, which becomes this boot as the mode goes off. The
+    /// published journal still decodes in the app and passes the check on
+    /// the next run.
+    func testValidKeptDisplayRecordsAreKeptForTheApp() throws {
+        for records in Self.validKeptDisplayRecords {
+            let json = Self.keptDisplayJournal(records)
+            let before = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
+            let decodedBefore = try Store.makeDecoder().decode(RuntimeState.self, from: Data(json.utf8))
+            let f = try ScriptFixture()
+            defer { f.destroy() }
+            try f.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+            try f.writeState(json)
+
+            let r = try f.run(f.backstop)
+
+            XCTAssertEqual(r.status, 0, json + r.stderr + f.log())
+            XCTAssertEqual(f.calls(), [
+                "sudo -n \(f.fakePmset) -a disablesleep 0",
+                "sudo -n \(f.fakePmset) -b lowpowermode 0",
+            ], json)
+            let after = try f.stateJSON()
+            XCTAssertEqual(after["lowPowerSetByUs"] as? Bool, false, json)
+            let stamped = decodedBefore.keptDisplayUnderLowPower != nil
+            for key in Self.keptDisplayRecordKeys + ["savedDisplayBrightness", "displayRestoreRefused"] {
+                if stamped, key == "keptDisplayUnderLowPowerBoot" {
+                    XCTAssertEqual(after[key] as? String, f.bootUUID, "\(key) in \(json)")
+                } else {
+                    XCTAssertEqual(after[key] as? NSObject, before[key] as? NSObject, "\(key) in \(json)")
+                }
+            }
+            let published = try Data(contentsOf: f.state)
+            let decoded = try Store.makeDecoder().decode(RuntimeState.self, from: published)
+            XCTAssertEqual(decoded.keptDisplayUnderLowPower, decodedBefore.keptDisplayUnderLowPower, json)
+            XCTAssertEqual(decoded.keptDisplayUnderLowPowerBoot, stamped ? f.bootUUID : decodedBefore.keptDisplayUnderLowPowerBoot, json)
+            XCTAssertEqual(decoded.keptDisplayReadLit, decodedBefore.keptDisplayReadLit, json)
+            XCTAssertEqual(decoded.displayRestoredUnderLowPower, decodedBefore.displayRestoredUnderLowPower, json)
+
+            let again = try f.run(f.backstop)
+            XCTAssertEqual(again.status, 0, json + again.stderr + f.log())
+            XCTAssertEqual(f.calls().count, 2, json)
+            XCTAssertFalse(f.log().contains("malformed"), f.log())
+            XCTAssertEqual(try Data(contentsOf: f.state), published, "a clean journal is not rewritten: \(json)")
+        }
+    }
+
+    /// uninstall.sh checks the same records itself: one the app could not
+    /// decode stops it with everything in place, even when the backstop
+    /// exits 0.
+    func testUninstallRejectsMalformedKeptDisplayRecordsEvenWhenBackstopExitsZero() throws {
+        for (problem, record) in Self.malformedKeptDisplayRecords {
+            let json = Self.keptDisplayJournal(record, ours: false)
+            let f = try ScriptFixture()
+            defer { f.destroy() }
+            try f.installMachinery()
+            try "#!/bin/bash\nexit 0\n".write(to: f.backstop, atomically: true, encoding: .utf8)
+            try f.writeState(json)
+
+            let r = try f.run(f.uninstall, ["--purge"])
+
+            XCTAssertNotEqual(r.status, 0, json)
+            XCTAssertTrue(f.exists(f.plist), json)
+            XCTAssertTrue(f.exists(f.sudoers), json)
+            XCTAssertTrue(f.exists(f.app), json)
+            XCTAssertEqual(try String(contentsOf: f.state, encoding: .utf8), json)
+            XCTAssertTrue(r.stderr.contains("state.json is malformed (unexpected shape)"), "\(json): \(r.stderr)")
+            XCTAssertTrue(r.stderr.contains(problem), "\(json): \(r.stderr)")
+            XCTAssertThrowsError(try Store.makeDecoder().decode(RuntimeState.self, from: Data(json.utf8)), "the app refuses \(json)")
+        }
+    }
+
+    /// A key the app reads more than once, as in `duplicatedKeptDisplayRecords`:
+    /// the app decodes the journal, and both scripts refuse it before any
+    /// command, with the bytes kept.
+    func testDuplicatedKeptDisplayRecordsAreRefusedByBothScripts() throws {
+        for (problem, record) in Self.duplicatedKeptDisplayRecords {
+            let json = Self.keptDisplayJournal(record)
+            XCTAssertNoThrow(try Store.makeDecoder().decode(RuntimeState.self, from: Data(json.utf8)), "the app reads \(json)")
+            let f = try ScriptFixture()
+            defer { f.destroy() }
+            try f.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+            try f.writeState(json)
+
+            let r = try f.run(f.backstop)
+
+            XCTAssertNotEqual(r.status, 0, json)
+            XCTAssertEqual(f.calls(), [], "no privileged command for \(json)")
+            XCTAssertEqual(try String(contentsOf: f.state, encoding: .utf8), json)
+            XCTAssertTrue(f.log().contains("\(f.state.path): \(problem)"), "\(json): \(f.log())")
+
+            let u = try ScriptFixture()
+            defer { u.destroy() }
+            try u.installMachinery()
+            try "#!/bin/bash\nexit 0\n".write(to: u.backstop, atomically: true, encoding: .utf8)
+            try u.writeState(Self.keptDisplayJournal(record, ours: false))
+
+            let ur = try u.run(u.uninstall, ["--purge"])
+
+            XCTAssertNotEqual(ur.status, 0, json)
+            XCTAssertTrue(u.exists(u.app), json)
+            XCTAssertTrue(ur.stderr.contains(problem), "\(json): \(ur.stderr)")
+        }
+    }
+
+    /// record_text_problems as it is in each script, run on its own over
+    /// exact bytes: what it prints, or nothing.
+    private func recordTextProblems(_ inputs: [(label: String, bytes: Data)], script: String = "backstop.sh") throws -> [String: String] {
+        let f = try ScriptFixture()
+        defer { f.destroy() }
+        let runner = f.root.appendingPathComponent("record-text-problems.sh")
+        try ("set -euo pipefail\n" + Self.recordTextProblemsSource(script) + "\nrecord_text_problems \"$1\"\n")
+            .write(to: runner, atomically: true, encoding: .utf8)
+        var printed: [String: String] = [:]
+        for (i, input) in inputs.enumerated() {
+            let file = f.root.appendingPathComponent("input.\(i)")
+            try input.bytes.write(to: file)
+            let r = try f.run(runner, [file.path])
+            XCTAssertEqual(r.status, 0, "\(input.label): \(r.stderr)")
+            XCTAssertEqual(r.stderr, "", input.label)
+            printed[input.label] = r.stdout
+        }
+        return printed
+    }
+
+    private static func recordTextProblemsSource(_ script: String) throws -> String {
+        let text = try String(contentsOf: ScriptFixture.productionScripts.appendingPathComponent(script), encoding: .utf8)
+        let lines = text.components(separatedBy: "\n")
+        let start = try XCTUnwrap(lines.firstIndex(of: "record_text_problems() { # file"), script)
+        let end = try XCTUnwrap(lines[start...].firstIndex(of: "}"), script)
+        return lines[start...end].joined(separator: "\n")
+    }
+
+    /// The two scripts carry the same reader, comment and all.
+    func testBothScriptsReadTheRecordsTheSameWay() throws {
+        func withComment(_ script: String) throws -> String {
+            let text = try String(contentsOf: ScriptFixture.productionScripts.appendingPathComponent(script), encoding: .utf8)
+            let start = try XCTUnwrap(text.range(of: "# Prints one line per way the app's records about a kept display entry would"), script)
+            let end = try XCTUnwrap(text.range(of: "\n}\n", range: start.upperBound..<text.endIndex), script)
+            return String(text[start.lowerBound..<end.upperBound])
+        }
+        XCTAssertEqual(try withComment("backstop.sh"), try withComment("uninstall.sh"))
+        XCTAssertEqual(try Self.recordTextProblemsSource("backstop.sh"), try Self.recordTextProblemsSource("uninstall.sh"))
+    }
+
+    /// The reader over texts no fixture writes whole: what it reads as the
+    /// app does prints nothing, and what it refuses names the problem.
+    /// Each text is also given to the app's decoder, which reads every one
+    /// printing nothing. It also reads some the reader refuses: UTF-16 and
+    /// a NUL byte in a string, which the reader cannot follow, and the keys
+    /// read twice, where plutil would check the other copy. The BOM-less
+    /// UTF-16 file hiding a key is one the reader passed before it refused
+    /// NUL bytes: the shell drops them, and what is left reads as a key
+    /// inside an array, while the app reads 1e-400 at the top level.
+    func testTheRecordReaderFollowsTheTopLevelAsTheAppReadsIt() throws {
+        let b = backslash
+        let bom = Data([0xEF, 0xBB, 0xBF])
+        func utf8(_ s: String) -> Data { Data(s.utf8) }
+        let cases: [(label: String, bytes: Data, prints: String, appReads: Bool)] = [
+            ("no records", utf8(#"{"sleepDisabledByUs":true}"#), "", true),
+            ("empty object", utf8("{ }"), "", true),
+            ("UTF-8 byte order mark", bom + utf8(#"{"keptDisplayReadLit":0.8}"#), "", true),
+            ("UTF-8 byte order mark, too small", bom + utf8(#"{"keptDisplayReadLit":1e-400}"#),
+             "keptDisplayReadLit is 1e-400, too small a number for the app to read\n", false),
+            ("UTF-16 with a byte order mark", Data([0xFF, 0xFE]) + #"{"keptDisplayReadLit":0.8}"#.data(using: .utf16LittleEndian)!,
+             "the top level of state.json cannot be followed here, so its records about a kept display entry cannot be checked\n", true),
+            ("UTF-16 without a byte order mark", #"{"keptDisplayReadLit":0.8}"#.data(using: .utf16LittleEndian)!,
+             "the top level of state.json cannot be followed here, so its records about a kept display entry cannot be checked\n", true),
+            ("UTF-16 without a byte order mark, hiding a key",
+             "{\"a\":\"\u{2278}\u{222C}\u{2271}\u{203A}\u{205B}\",\"keptDisplayReadLit\":1e-400,\"b\":\"\u{2C5D}\u{2220}\u{2263}\u{203A}\u{7822}\"}"
+                .data(using: .utf16LittleEndian)!,
+             "the top level of state.json cannot be followed here, so its records about a kept display entry cannot be checked\n", false),
+            ("UTF-16 without records", #"{"sleepDisabledByUs":true}"#.data(using: .utf16LittleEndian)!, "", true),
+            ("NUL byte in a string", utf8("{\"keptDisplayReadLit\":0.8,\"a\":\"x\u{0}y\"}"),
+             "the top level of state.json cannot be followed here, so its records about a kept display entry cannot be checked\n", true),
+            ("comma before the end", utf8(#"{"keptDisplayReadLit":0.8,}"#), "", true),
+            ("whitespace everywhere", utf8("\n{ \"a\" :\t[ 1 ,2 ] ,\r\n \"keptDisplayReadLit\"\n:\n0.8\n}\n"), "", true),
+            ("escaped letter, upper hex", utf8(#"{"kept\#(b)u0044isplayReadLit":1e-400}"#),
+             "keptDisplayReadLit is 1e-400, too small a number for the app to read\n", false),
+            ("escaped letter, lower hex", utf8(#"{"keptDisplayRead\#(b)u004cit":1e39}"#),
+             "keptDisplayReadLit is 1e39, too large a number for the app to read\n", false),
+            ("escaped letter, valid value", utf8(#"{"keptDisplayReadL\#(b)u0069t":0.8}"#), "", true),
+            ("other escapes in keys", utf8(#"{"a\#(b)"\#(b)\#(b)\#(b)/\#(b)b\#(b)f\#(b)n\#(b)r\#(b)t\#(b)u00e9\#(b)ud83d\#(b)ude00":1}"#), "", true),
+            ("a key with a \\x escape", utf8(#"{"kept\#(b)x44isplayReadLit":0.8}"#),
+             "a key in state.json has an escape JSON does not have, so its records about a kept display entry cannot be checked\n", false),
+            ("unquoted key", utf8(#"{keptDisplayReadLit:0.8}"#),
+             "the top level of state.json cannot be followed here, so its records about a kept display entry cannot be checked\n", false),
+            ("block comment", utf8(#"{"a":1,/* c */"keptDisplayReadLit":0.8}"#),
+             "the top level of state.json cannot be followed here, so its records about a kept display entry cannot be checked\n", false),
+            ("line comment", utf8("{\"a\":1, // c\n\"keptDisplayReadLit\":0.8}"),
+             "the top level of state.json cannot be followed here, so its records about a kept display entry cannot be checked\n", false),
+            ("escaped backslash in a value", utf8(#"{"name":"Headset \#(b)\#(b)u0041","uid":"\#(b)\#(b)"}"#), "", true),
+            ("escape in a value", utf8(#"{"name":"Headset \#(b)u0041 \#(b)"keptDisplayReadLit\#(b)":1e-400"}"#), "", true),
+            ("nested copies", utf8(#"{"keptDisplayReadLit":0.8,"a":{"keptDisplayReadLit":1e-400,"b":[["keptDisplayReadLit",{"keptDisplayReadLit":0.7}]]}}"#), "", true),
+            ("brackets in nested strings", utf8(#"{"a":{"b":"}]","c":["{[",{"d":"\#(b)"}"}]},"keptDisplayReadLit":1e-400}"#),
+             "keptDisplayReadLit is 1e-400, too small a number for the app to read\n", false),
+            ("read twice", utf8(#"{"keptDisplayReadLit":0.8,"keptDisplayReadL\#(b)u0069t":0.8}"#),
+             "keptDisplayReadLit is in the top level of state.json 2 times; the app reads the first and plutil the last\n", true),
+            ("boot read twice", utf8(#"{"keptDisplayUnderLowPowerBoot":"a","keptDisplayUnderLowPowerBoot":null}"#),
+             "keptDisplayUnderLowPowerBoot is in the top level of state.json 2 times; the app reads the first and plutil the last\n", true),
+            ("zero forms", utf8(#"{"keptDisplayReadLit":-0,"keptDisplayUnderLowPower":0e-400}"#), "", true),
+            ("leading zero", utf8(#"{"keptDisplayReadLit":01}"#),
+             "keptDisplayReadLit is written as 01, which the app does not read as a number\n", false),
+        ]
+        let printed = try recordTextProblems(cases.map { ($0.label, $0.bytes) })
+        let printedByUninstall = try recordTextProblems(cases.map { ($0.label, $0.bytes) }, script: "uninstall.sh")
+        for c in cases {
+            XCTAssertEqual(printed[c.label], c.prints, c.label)
+            XCTAssertEqual(printedByUninstall[c.label], c.prints, c.label)
+            let reads = (try? Store.makeDecoder().decode(RuntimeState.self, from: c.bytes)) != nil
+            XCTAssertEqual(reads, c.appReads, "the app's decoder on \(c.label)")
+        }
+    }
+
+    /// The same records in a form the app reads do not stop the uninstall:
+    /// it completes past the kept entry, and state.json stays byte for byte
+    /// with them, even with --purge.
+    func testUninstallCompletesPastValidKeptDisplayRecordsAndKeepsThem() throws {
+        for records in Self.validKeptDisplayRecords {
+            let json = Self.keptDisplayJournal(records, ours: false)
+            let f = try ScriptFixture()
+            defer { f.destroy() }
+            try f.installMachinery()
+            try f.writeConfig(#"{"agentList":[]}"#)
+            try f.writeState(json)
+
+            let r = try f.run(f.uninstall, ["--purge"])
+
+            XCTAssertEqual(r.status, 0, json + r.stderr + r.stdout)
+            XCTAssertFalse(f.exists(f.plist), json)
+            XCTAssertFalse(f.exists(f.app), json)
+            XCTAssertEqual(try String(contentsOf: f.state, encoding: .utf8), json)
+            XCTAssertTrue(r.stdout.contains("  - display brightness 0.8"), r.stdout)
+        }
+    }
+
+    /// uninstall.sh with the backstop it installed, not a stub, on numbers
+    /// plutil reads as 0 or as other numbers than the app: the backstop
+    /// refuses before any command, and so does uninstall.sh, with the app,
+    /// the agent, the sudoers rule, the session and state.json all kept.
+    func testUninstallWithItsBackstopRejectsNumbersPlutilMisreads() throws {
+        let records = [
+            #""keptDisplayUnderLowPower":1e-400"#,
+            #""keptDisplayReadLit":1e-400"#,
+            #""keptDisplayReadLit":-1e-400,"keptDisplayReadLit":0.8"#,
+            #""keptDisplayUnderLowPower":+1"#,
+        ]
+        for record in records {
+            let json = Self.keptDisplayJournal(record)
+            XCTAssertThrowsError(try Store.makeDecoder().decode(RuntimeState.self, from: Data(json.utf8)), "the app refuses \(json)")
+            let f = try ScriptFixture()
+            defer { f.destroy() }
+            try f.installMachinery()
+            try f.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+            let sessionBytes = try Data(contentsOf: f.session)
+            try f.writeState(json)
+
+            let r = try f.run(f.uninstall, ["--purge"])
+
+            XCTAssertNotEqual(r.status, 0, json)
+            XCTAssertFalse(f.calls().contains { $0.hasPrefix("sudo") || $0.contains("pmset") }, "\(json): \(f.calls())")
+            XCTAssertTrue(f.exists(f.app), json)
+            XCTAssertTrue(f.exists(f.plist), json)
+            XCTAssertTrue(f.exists(f.sudoers), json)
+            XCTAssertTrue(f.exists(f.installedBackstop), json)
+            XCTAssertEqual(try String(contentsOf: f.state, encoding: .utf8), json, "evidence kept")
+            XCTAssertEqual(try Data(contentsOf: f.session), sessionBytes, "session kept")
+            XCTAssertTrue(f.log().contains("is unreadable or malformed; nothing undone, evidence kept"), "\(json): \(f.log())")
+        }
+    }
+
+    /// Low Power Mode on over a kept display entry the app recorded in an
+    /// earlier boot. The backstop switches the mode off before the app
+    /// launches in this boot, and gives the record this boot, so the app
+    /// takes no reading of the entry in this boot as the user's level
+    /// while the panel comes back from the mode. The value, the reading
+    /// above 0 and the entry stay as they were.
+    func testBackstopGivesTheKeptDisplayRecordThisBootWhenItSwitchesTheModeOff() throws {
+        let json = Self.keptDisplayJournal(#""keptDisplayUnderLowPower":0.8,"keptDisplayUnderLowPowerBoot":"boot A","keptDisplayReadLit":0.8"#)
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        try fx.writeState(json)
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 0, r.stderr + fx.log())
+        XCTAssertTrue(fx.calls().contains("sudo -n \(fx.fakePmset) -b lowpowermode 0"), "\(fx.calls())")
+        let after = try fx.stateJSON()
+        XCTAssertEqual(after["lowPowerSetByUs"] as? Bool, false)
+        XCTAssertEqual(after["keptDisplayUnderLowPowerBoot"] as? String, fx.bootUUID)
+        XCTAssertEqual(after["keptDisplayUnderLowPower"] as? Double, 0.8)
+        XCTAssertEqual(after["keptDisplayReadLit"] as? Double, 0.8)
+        XCTAssertEqual(after["savedDisplayBrightness"] as? Double, 0.8)
+        XCTAssertEqual(after["displayRestoreRefused"] as? Bool, true)
+        let decoded = try Store.makeDecoder().decode(RuntimeState.self, from: Data(contentsOf: fx.state))
+        XCTAssertTrue(decoded.keptDisplayReadUnderLowPower(inBoot: fx.bootUUID), "the app's doubt in this boot")
+        XCTAssertFalse(decoded.lowPowerClaimFromEarlierBoot(boot: fx.bootUUID))
+    }
+
+    /// The same with a boot the backstop cannot read: the record gets an
+    /// empty boot, which the app reads as this boot's too.
+    func testBackstopGivesTheKeptDisplayRecordAnEmptyBootWhenItCannotReadThisOne() throws {
+        let json = Self.keptDisplayJournal(#""keptDisplayUnderLowPower":0.8,"keptDisplayUnderLowPowerBoot":"boot A""#)
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        try fx.writeState(json)
+        try FileManager.default.removeItem(at: fx.root.appendingPathComponent("boot.uuid"))
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 0, r.stderr + fx.log())
+        XCTAssertTrue(fx.calls().contains("sudo -n \(fx.fakePmset) -b lowpowermode 0"), "\(fx.calls())")
+        let after = try fx.stateJSON()
+        XCTAssertEqual(after["lowPowerSetByUs"] as? Bool, false)
+        XCTAssertEqual(after["keptDisplayUnderLowPowerBoot"] as? String, "")
+        let decoded = try Store.makeDecoder().decode(RuntimeState.self, from: Data(contentsOf: fx.state))
+        XCTAssertTrue(decoded.keptDisplayReadUnderLowPower(inBoot: "a boot the app reads"))
+    }
+
+    /// Nothing to give a boot to: no record, or a null one. The mode goes
+    /// off, nothing is published before it, and the journal keeps its
+    /// records as they were.
+    func testBackstopGivesNoBootWithoutARecord() throws {
+        for records in ["", #""keptDisplayUnderLowPower":null,"keptDisplayReadLit":0.8"#] {
+            let json = Self.keptDisplayJournal(records)
+            let f = try ScriptFixture()
+            defer { f.destroy() }
+            try f.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+            try f.writeState(json)
+
+            let r = try f.run(f.backstop)
+
+            XCTAssertEqual(r.status, 0, json + r.stderr + f.log())
+            XCTAssertTrue(f.calls().contains("sudo -n \(f.fakePmset) -b lowpowermode 0"), "\(json): \(f.calls())")
+            XCTAssertFalse(f.log().contains("given this boot"), f.log())
+            let before = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
+            let after = try f.stateJSON()
+            XCTAssertEqual(after["lowPowerSetByUs"] as? Bool, false, json)
+            XCTAssertEqual(after["keptDisplayUnderLowPowerBoot"] as? NSObject, before["keptDisplayUnderLowPowerBoot"] as? NSObject, json)
+            XCTAssertEqual(after["keptDisplayUnderLowPower"] as? NSObject, before["keptDisplayUnderLowPower"] as? NSObject, json)
+            XCTAssertEqual(after["keptDisplayReadLit"] as? NSObject, before["keptDisplayReadLit"] as? NSObject, json)
+        }
+    }
+
+    /// A record of the kept entry from an earlier boot, or one with no boot
+    /// as builds before the boot wrote it: the record gets this boot in a
+    /// journal published before `lowpowermode 0` runs, and the log says so
+    /// first. When that command then fails, the record keeps this boot next
+    /// to the claim, which the app reads as its own mode on in this boot:
+    /// the mode is still on. The retry in the same boot switches the mode
+    /// off without publishing the boot again.
+    func testBackstopPublishesThisBootBeforeTheModeGoesOffEvenWhenTheCommandFails() throws {
+        for records in [#""keptDisplayUnderLowPower":0.8,"keptDisplayUnderLowPowerBoot":"boot A","keptDisplayReadLit":0.8"#, #""keptDisplayUnderLowPower":0.8"#] {
+            let json = Self.keptDisplayJournal(records)
+            let f = try ScriptFixture()
+            defer { f.destroy() }
+            try f.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+            let sessionBytes = try Data(contentsOf: f.session)
+            try f.writeState(json)
+            f.setMode("sudo", "fail")
+
+            let r = try f.run(f.backstop)
+
+            XCTAssertNotEqual(r.status, 0, json)
+            XCTAssertTrue(f.calls().contains("sudo -n \(f.fakePmset) -b lowpowermode 0"), "\(json): \(f.calls())")
+            let after = try f.stateJSON()
+            XCTAssertEqual(after["lowPowerSetByUs"] as? Bool, true, json)
+            XCTAssertEqual(after["sleepDisabledByUs"] as? Bool, true, json)
+            XCTAssertEqual(after["keptDisplayUnderLowPowerBoot"] as? String, f.bootUUID, json)
+            XCTAssertEqual(after["keptDisplayUnderLowPower"] as? Double, 0.8, json)
+            XCTAssertEqual(after["savedDisplayBrightness"] as? Double, 0.8, json)
+            XCTAssertEqual(after["displayRestoreRefused"] as? Bool, true, json)
+            XCTAssertEqual(try Data(contentsOf: f.session), sessionBytes, "session kept: \(json)")
+            let decoded = try Store.makeDecoder().decode(RuntimeState.self, from: Data(contentsOf: f.state))
+            XCTAssertFalse(decoded.lowPowerClaimFromEarlierBoot(boot: f.bootUUID), "the claim is this boot's: \(json)")
+            XCTAssertTrue(decoded.keptDisplayReadUnderLowPower(inBoot: f.bootUUID), json)
+            let log = f.log()
+            let stamped = try XCTUnwrap(log.range(of: "kept display entry's record given this boot (\(f.bootUUID)) before Low Power Mode is switched off"), log)
+            let failed = try XCTUnwrap(log.range(of: "pmset -b lowpowermode 0 failed; keeping journal entry for retry"), log)
+            XCTAssertLessThan(stamped.lowerBound, failed.lowerBound, "published before the command")
+            XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: f.home.path).filter { $0.hasPrefix(".state.json.backstop") }, [])
+
+            f.setMode("sudo", "ok")
+            let again = try f.run(f.backstop)
+
+            XCTAssertEqual(again.status, 0, json + again.stderr + f.log())
+            let retried = try f.stateJSON()
+            XCTAssertEqual(retried["lowPowerSetByUs"] as? Bool, false, json)
+            XCTAssertEqual(retried["keptDisplayUnderLowPowerBoot"] as? String, f.bootUUID, json)
+            XCTAssertEqual(f.log().components(separatedBy: "given this boot").count - 1, 1, "not published again in the same boot: \(f.log())")
+            XCTAssertFalse(f.exists(f.session), json)
+        }
+    }
+
+    /// A record that already has this boot needs nothing before the mode
+    /// goes off: one journal is published, after the undo.
+    func testBackstopPublishesNothingBeforeTheModeGoesOffForARecordOfThisBoot() throws {
+        let json = Self.keptDisplayJournal(#""keptDisplayUnderLowPower":0.8,"keptDisplayUnderLowPowerBoot":"\#(fx.bootUUID)""#)
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        try fx.writeState(json)
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 0, r.stderr + fx.log())
+        XCTAssertTrue(fx.calls().contains("sudo -n \(fx.fakePmset) -b lowpowermode 0"), "\(fx.calls())")
+        XCTAssertFalse(fx.log().contains("given this boot"), fx.log())
+        let after = try fx.stateJSON()
+        XCTAssertEqual(after["lowPowerSetByUs"] as? Bool, false)
+        XCTAssertEqual(after["keptDisplayUnderLowPowerBoot"] as? String, fx.bootUUID)
+    }
+
+    /// The Mac restarts after a run that gave the record its boot but could
+    /// not switch the mode off: the next run gives the record the new boot
+    /// before it does.
+    func testBackstopGivesTheRecordTheNewBootAfterARestart() throws {
+        let json = Self.keptDisplayJournal(#""keptDisplayUnderLowPower":0.8,"keptDisplayUnderLowPowerBoot":"boot A""#)
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        try fx.writeState(json)
+        fx.setMode("sudo", "fail")
+        _ = try fx.run(fx.backstop)
+        XCTAssertEqual(try fx.stateJSON()["keptDisplayUnderLowPowerBoot"] as? String, fx.bootUUID)
+
+        let newBoot = "5A5A5A5A-6666-7777-8888-999999999999"
+        try newBoot.write(to: fx.root.appendingPathComponent("boot.uuid"), atomically: true, encoding: .utf8)
+        fx.setMode("sudo", "ok")
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 0, r.stderr + fx.log())
+        let after = try fx.stateJSON()
+        XCTAssertEqual(after["lowPowerSetByUs"] as? Bool, false)
+        XCTAssertEqual(after["keptDisplayUnderLowPowerBoot"] as? String, newBoot)
+        XCTAssertTrue(fx.log().contains("kept display entry's record given this boot (\(newBoot)) before Low Power Mode is switched off"), fx.log())
+    }
+
+    /// The mode goes off, and then the journal of the undo cannot be
+    /// published (its rename fails). state.json still says the mode and
+    /// sleep are ours, but its record already has this boot, published
+    /// before the mode went off, so the app reads the claim as its own
+    /// mode on in this boot. A retry once the rename works clears the
+    /// claim.
+    func testAFailedFinalPublishLeavesTheRecordWithThisBoot() throws {
+        let json = Self.keptDisplayJournal(#""keptDisplayUnderLowPower":0.8,"keptDisplayUnderLowPowerBoot":"boot A","keptDisplayReadLit":0.8"#)
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        let sessionBytes = try Data(contentsOf: fx.session)
+        try fx.writeState(json)
+        try fx.failMoves([("*/.state.json.backstop.*", "*")])
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertNotEqual(r.status, 0)
+        XCTAssertTrue(fx.calls().contains("sudo -n \(fx.fakePmset) -a disablesleep 0"), "\(fx.calls())")
+        XCTAssertTrue(fx.calls().contains("sudo -n \(fx.fakePmset) -b lowpowermode 0"), "\(fx.calls())")
+        XCTAssertTrue(fx.calls().contains { $0.hasPrefix("mv FAILED \(fx.home.path)/.state.json.backstop.") }, "\(fx.calls())")
+        XCTAssertTrue(fx.log().contains("could not publish the updated journal to \(fx.state.path); previous journal kept, will retry"), fx.log())
+        let after = try fx.stateJSON()
+        XCTAssertEqual(after["lowPowerSetByUs"] as? Bool, true)
+        XCTAssertEqual(after["sleepDisabledByUs"] as? Bool, true)
+        XCTAssertEqual(after["keptDisplayUnderLowPowerBoot"] as? String, fx.bootUUID)
+        XCTAssertEqual(after["keptDisplayReadLit"] as? Double, 0.8)
+        XCTAssertEqual(try Data(contentsOf: fx.session), sessionBytes)
+        let decoded = try Store.makeDecoder().decode(RuntimeState.self, from: Data(contentsOf: fx.state))
+        XCTAssertFalse(decoded.lowPowerClaimFromEarlierBoot(boot: fx.bootUUID))
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: fx.home.path).filter { $0.hasPrefix(".state.json.backstop") }, [])
+
+        try FileManager.default.removeItem(at: fx.root.appendingPathComponent("mv.fail"))
+        let again = try fx.run(fx.backstop)
+
+        XCTAssertEqual(again.status, 0, again.stderr + fx.log())
+        let retried = try fx.stateJSON()
+        XCTAssertEqual(retried["lowPowerSetByUs"] as? Bool, false)
+        XCTAssertEqual(retried["sleepDisabledByUs"] as? Bool, false)
+        XCTAssertEqual(retried["keptDisplayUnderLowPowerBoot"] as? String, fx.bootUUID)
+        XCTAssertFalse(fx.exists(fx.session))
+    }
+
+    /// The journal with this boot cannot be published before the mode
+    /// goes off, by a failed rename or a state.json that refuses every
+    /// change: the mode is left on and its entry kept for the retry,
+    /// since switched off with the earlier boot on disk, the app could
+    /// take the panel coming back from it for the user's level. The rest
+    /// of the undo still runs: sleep and the frozen process.
+    func testBackstopLeavesTheModeOnWhenItCannotPublishThisBootFirst() throws {
+        let frozen = #""frozenProcesses":[{"pid":4242,"startedAt":1789388423,"startedAtMicros":17,"bootSession":"\#(fx.bootUUID)"}]"#
+        let json = Self.keptDisplayJournal(#""keptDisplayUnderLowPower":0.8,"keptDisplayUnderLowPowerBoot":"boot A""#)
+            .replacingOccurrences(of: #""frozenProcesses":[]"#, with: frozen)
+        for immutable in [false, true] {
+            let f = try ScriptFixture()
+            defer {
+                try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: f.state.path)
+                f.destroy()
+            }
+            try f.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+            let sessionBytes = try Data(contentsOf: f.session)
+            try f.writeState(json)
+            if immutable {
+                try FileManager.default.setAttributes([.immutable: true], ofItemAtPath: f.state.path)
+            } else {
+                try f.failMoves([("*/.state.json.backstop-boot.*", "*")])
+            }
+
+            let r = try f.run(f.backstop)
+            try FileManager.default.setAttributes([.immutable: false], ofItemAtPath: f.state.path)
+
+            let label = immutable ? "immutable" : "rename fails"
+            XCTAssertNotEqual(r.status, 0, label)
+            XCTAssertTrue(f.calls().contains("sudo -n \(f.fakePmset) -a disablesleep 0"), "\(label): \(f.calls())")
+            XCTAssertTrue(f.calls().contains { $0.hasPrefix("Insomnia --resume-frozen") && $0.contains("4242 1789388423 17") }, "\(label): \(f.calls())")
+            XCTAssertFalse(f.calls().contains { $0.contains("lowpowermode") }, "\(label): \(f.calls())")
+            let log = f.log()
+            XCTAssertTrue(log.contains("could not publish this boot for the kept display entry's record to \(f.state.path); Low Power Mode left on, keeping journal entry for retry"), log)
+            if immutable {
+                XCTAssertTrue(log.contains("could not publish the updated journal to \(f.state.path); previous journal kept, will retry"), log)
+            } else {
+                XCTAssertTrue(log.contains("still journaled: Low Power Mode is still set: state.json could not take this boot for the kept display entry's record, so the mode was not switched off"), log)
+            }
+            XCTAssertFalse(log.contains("given this boot"), log)
+            XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: f.home.path).filter { $0.hasPrefix(".state.json.backstop") }, [], label)
+            XCTAssertEqual(try Data(contentsOf: f.session), sessionBytes, label)
+            if immutable {
+                XCTAssertEqual(try String(contentsOf: f.state, encoding: .utf8), json, "nothing could be written")
+            } else {
+                let after = try f.stateJSON()
+                XCTAssertEqual(after["lowPowerSetByUs"] as? Bool, true, label)
+                XCTAssertEqual(after["sleepDisabledByUs"] as? Bool, false, "the rest of the undo is published: \(label)")
+                XCTAssertEqual((after["frozenProcesses"] as? [Any])?.count, 0, label)
+                XCTAssertEqual(after["keptDisplayUnderLowPowerBoot"] as? String, "boot A", label)
+            }
+        }
+    }
+
+    /// uninstall.sh runs the backstop it installed, which publishes this
+    /// boot before the mode goes off. When its final journal then cannot be
+    /// published, the uninstall stops with everything in place, and the
+    /// record keeps this boot.
+    func testUninstallStopsAfterAFailedFinalPublishWithTheRecordGivenThisBoot() throws {
+        for purge in [false, true] {
+            let json = Self.keptDisplayJournal(#""keptDisplayUnderLowPower":0.8,"keptDisplayUnderLowPowerBoot":"boot A""#)
+            let f = try ScriptFixture()
+            defer { f.destroy() }
+            try f.installMachinery()
+            try f.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+            try f.writeState(json)
+            try f.failMoves([("*/.state.json.backstop.*", "*")])
+
+            let r = try f.run(f.uninstall, purge ? ["--purge"] : [])
+
+            XCTAssertNotEqual(r.status, 0, "purge \(purge)")
+            XCTAssertTrue(f.calls().contains("sudo -n \(f.fakePmset) -b lowpowermode 0"), "\(f.calls())")
+            XCTAssertTrue(f.exists(f.app))
+            XCTAssertTrue(f.exists(f.plist))
+            XCTAssertTrue(f.exists(f.sudoers))
+            XCTAssertTrue(f.exists(f.session))
+            let after = try f.stateJSON()
+            XCTAssertEqual(after["lowPowerSetByUs"] as? Bool, true)
+            XCTAssertEqual(after["keptDisplayUnderLowPowerBoot"] as? String, f.bootUUID)
         }
     }
 
@@ -7208,6 +7988,7 @@ private final class ScriptFixture {
             "INSOMNIA_INFO": appInfo.path,
             "DEFAULTS": bin.appendingPathComponent("defaults").path,
             "DATE": bin.appendingPathComponent("date").path,
+            "MV": bin.appendingPathComponent("mv").path,
             "LOCK_TIMEOUT_SECONDS": "1",
             "COMMAND_TIMEOUT_SECONDS": "1",
             "KILL_GRACE_SECONDS": "1",
@@ -7553,10 +8334,10 @@ private final class ScriptFixture {
         for a in "$@"; do [[ "$a" == --show-bin-path ]] && { echo "\(r)/binroot"; exit 0; }; done
         exit 0
         """)
-        // mv: install.sh's MV. Runs /bin/mv unless a line of mv.fail,
-        // "<from pattern>|<to pattern>" (bash globs), matches the move; then
-        // it logs "mv FAILED <from> <to>" and exits 1 like a refused rename,
-        // and both paths stay as they were.
+        // mv: install.sh's and backstop.sh's MV. Runs /bin/mv unless a line
+        // of mv.fail, "<from pattern>|<to pattern>" (bash globs), matches the
+        // move; then it logs "mv FAILED <from> <to>" and exits 1 like a
+        // refused rename, and both paths stay as they were.
         try writeFake("mv", """
         args=(); for a in "$@"; do [[ "$a" == -* ]] || args+=("$a"); done
         from="${args[0]:-}"; to="${args[1]:-}"
@@ -8471,5 +9252,504 @@ private final class ScriptFixture {
         p.terminate()
         let text = (try? String(contentsOf: diagURL, encoding: .utf8)) ?? ""
         throw FixtureError("could not take the recovery lock for the contention test; holder running=\(p.isRunning) probes=\(probes) output=\(text)")
+    }
+}
+
+/// The app and the production copy of backstop.sh across restarts, with
+/// fake devices and a temporary home: what the agent publishes is what the
+/// next launch reads.
+@MainActor
+final class AgentModeExitInANewBootTests: XCTestCase {
+    private var h: Harness!
+
+    override func setUp() async throws { h = Harness() }
+    override func tearDown() async throws { h.home.destroy(); h = nil }
+
+    private func lidActions(_ m: SessionManager, sampler: BrightnessSampler) -> LidActions {
+        m.config.muteOnLidClose = false
+        m.config.freezeList = []
+        m.config.freezeAllApps = false
+        m.config.darkenDisplayOnLidClose = true
+        let freezer = FakeFreezer(apps: [], processes: [], control: h.procs)
+        return LidActions(manager: m, freezer: freezer, docker: DockerRule(freezer: freezer, probe: { true }), audio: h.audio, display: h.display, keyboard: h.keyboard, sampler: sampler)
+    }
+
+    private func follow(_ m: SessionManager) -> BrightnessSampler {
+        let sampler = BrightnessSampler(display: h.display, keyboard: h.keyboard, idleSeconds: { 1 })
+        sampler.follow(m)
+        return sampler
+    }
+
+    private func logText() -> String {
+        (try? String(contentsOf: h.home.paths.logFile, encoding: .utf8)) ?? ""
+    }
+
+    /// In boot A the app switches Low Power Mode on over a kept 0.8, and
+    /// an open reads it at 0.4: the journal records that reading and the
+    /// mode over the entry, in boot A. The Mac restarts, and in boot B the
+    /// agent switches the mode off before the app launches. The app's
+    /// first reading in boot B, 0.4 again while the panel comes back from
+    /// the mode, is not taken as the user's level: the entry waits and
+    /// nothing is sampled. The user's 0.6 then reads the same way, so a
+    /// close and an open leave the panel at 0.6 and never write 0.4. A
+    /// launch in boot C reads 0.6 and leaves it as set.
+    func testAReadingAfterTheAgentSwitchedTheModeOffInANewBootWaitsForTheNextBoot() async throws {
+        var seeded = RuntimeState()
+        seeded.savedDisplayBrightness = 0.8
+        seeded.displayRestoreRefused = true
+        try h.store.saveState(seeded)
+        h.clamshell.closed = false
+        h.display.brightness = 0.4
+        let first = h.makeManager(bootSession: "boot A")
+        await first.start(duration: 3600)
+        let on = await first.setLowPower(true)
+        XCTAssertTrue(on)
+        await lidActions(first, sampler: follow(first)).onOpen()
+        let bootA = try XCTUnwrap(try h.store.loadState())
+        XCTAssertTrue(bootA.lowPowerSetByUs)
+        XCTAssertEqual(bootA.keptDisplayReadLit, 0.8)
+        XCTAssertEqual(bootA.keptDisplayUnderLowPowerBoot, "boot A")
+
+        let f = try ScriptFixture()
+        defer { f.destroy() }
+        try f.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        try f.writeState(try String(contentsOf: h.home.paths.stateFile, encoding: .utf8))
+        let r = try f.run(f.backstop)
+        XCTAssertEqual(r.status, 0, r.stderr + f.log())
+        XCTAssertTrue(f.calls().contains("sudo -n \(f.fakePmset) -b lowpowermode 0"), "\(f.calls())")
+        try Data(contentsOf: f.state).write(to: h.home.paths.stateFile)
+        try FileManager.default.removeItem(at: h.home.paths.sessionFile)
+        h.guardFake.lowPowerOn = false
+        let published = try XCTUnwrap(try h.store.loadState())
+        XCTAssertFalse(published.lowPowerSetByUs)
+        XCTAssertEqual(published.keptDisplayUnderLowPowerBoot, f.bootUUID)
+
+        let m = h.makeManager(bootSession: f.bootUUID)
+        let sampler = follow(m)
+        let actions = lidActions(m, sampler: sampler)
+        await m.reconcile()
+
+        let waiting = try XCTUnwrap(try h.store.loadState())
+        XCTAssertEqual(waiting.savedDisplayBrightness, 0.8, "0.4 is not taken as the user's level")
+        XCTAssertTrue(waiting.displayRestoreRefused)
+        XCTAssertNil(sampler.last?.display, "nothing sampled")
+        XCTAssertTrue(logText().contains("display brightness 0.8, kept after a refused restore, reads 0.4 after our low power mode was or may have been on over it since the Mac last started, which rescales it until some time after it goes off; that is not taken as a level set since"), logText())
+
+        await m.start(duration: 3600)
+        h.display.brightness = 0.6
+        h.clamshell.closed = true
+        await actions.onClose()
+        h.clamshell.closed = false
+        await actions.onOpen()
+
+        XCTAssertFalse(h.display.sets.contains(0.4), "\(h.display.sets)")
+        XCTAssertEqual(h.display.brightness, 0.6)
+        XCTAssertEqual(try h.store.loadState()?.savedDisplayBrightness, 0.8)
+        XCTAssertNil(sampler.last?.display)
+        _ = await m.end(reason: .user)
+
+        let later = h.makeManager(bootSession: "boot C")
+        let laterSampler = follow(later)
+        await later.reconcile()
+
+        XCTAssertNil(try h.store.loadState()?.savedDisplayBrightness)
+        XCTAssertEqual(laterSampler.last?.display, 0.6)
+        XCTAssertFalse(h.display.sets.contains(0.4), "\(h.display.sets)")
+        XCTAssertEqual(h.display.brightness, 0.6)
+    }
+    /// The same journal from boot A, and in boot B the agent switches the
+    /// mode off, but the journal of its undo cannot be published: the
+    /// file still claims the mode and the session. The record was given
+    /// boot B before the mode went off, so the app reads the claim as its
+    /// own mode on in this boot: the first reading, 0.4 while the panel
+    /// comes back, is not taken as the user's level, and a close and an
+    /// open never write it. A launch in boot C decides on the user's 0.6.
+    func testAReadingAfterTheAgentSwitchedTheModeOffWaitsWhenItsJournalIsNotPublished() async throws {
+        var seeded = RuntimeState()
+        seeded.savedDisplayBrightness = 0.8
+        seeded.displayRestoreRefused = true
+        seeded.lowPowerSetByUs = true
+        seeded.keptDisplayUnderLowPower = 0.8
+        seeded.keptDisplayUnderLowPowerBoot = "boot A"
+        seeded.keptDisplayReadLit = 0.8
+        let f = try ScriptFixture()
+        defer { f.destroy() }
+        try Store.makeEncoder().encode(seeded).write(to: f.state)
+        try f.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        try f.failMoves([("*/.state.json.backstop.*", "*")])
+
+        let r = try f.run(f.backstop)
+
+        XCTAssertNotEqual(r.status, 0)
+        XCTAssertTrue(f.calls().contains("sudo -n \(f.fakePmset) -b lowpowermode 0"), "\(f.calls())")
+        XCTAssertTrue(f.exists(f.session))
+        let onDisk = try Store.makeDecoder().decode(RuntimeState.self, from: Data(contentsOf: f.state))
+        XCTAssertTrue(onDisk.lowPowerSetByUs, "the undo's journal was not published")
+        XCTAssertEqual(onDisk.keptDisplayUnderLowPowerBoot, f.bootUUID)
+        try Data(contentsOf: f.state).write(to: h.home.paths.stateFile)
+        // The session the agent kept, expired by the app's clock too.
+        try h.store.saveSession(Session(startedAt: h.clock.now.addingTimeInterval(-7200), endsAt: h.clock.now.addingTimeInterval(-60)))
+        h.guardFake.lowPowerOn = false
+        h.clamshell.closed = false
+        h.display.brightness = 0.4
+
+        let m = h.makeManager(bootSession: f.bootUUID)
+        let sampler = follow(m)
+        let actions = lidActions(m, sampler: sampler)
+        await m.reconcile()
+
+        let waiting = try XCTUnwrap(try h.store.loadState())
+        XCTAssertEqual(waiting.savedDisplayBrightness, 0.8, "0.4 is not taken as the user's level")
+        XCTAssertTrue(waiting.displayRestoreRefused)
+        XCTAssertFalse(waiting.lowPowerSetByUs)
+        XCTAssertEqual(m.effectiveState.savedDisplayBrightness, 0.8)
+        XCTAssertNil(sampler.last?.display, "nothing sampled")
+        XCTAssertEqual(h.display.sets, [])
+
+        await m.start(duration: 3600)
+        h.display.brightness = 0.6
+        h.clamshell.closed = true
+        await actions.onClose()
+        h.clamshell.closed = false
+        await actions.onOpen()
+
+        XCTAssertFalse(h.display.sets.contains(0.4), "\(h.display.sets)")
+        XCTAssertEqual(h.display.brightness, 0.6)
+        XCTAssertNil(sampler.last?.display)
+        _ = await m.end(reason: .user)
+
+        let later = h.makeManager(bootSession: "boot C")
+        let laterSampler = follow(later)
+        await later.reconcile()
+
+        XCTAssertNil(try h.store.loadState()?.savedDisplayBrightness)
+        XCTAssertEqual(laterSampler.last?.display, 0.6)
+        XCTAssertFalse(h.display.sets.contains(0.4), "\(h.display.sets)")
+        XCTAssertEqual(h.display.brightness, 0.6)
+    }
+
+    /// The same journal from boot A, and in boot B state.json refuses
+    /// every change, so the agent cannot publish boot B before the mode
+    /// goes off and leaves the mode on. The app launches with the claim
+    /// from boot A and reads the mode on, so the switch-off is the mode's
+    /// end in this boot: 0.4 is not taken as the user's level, and a close
+    /// and an open never write it.
+    func testAReadingWaitsWhenTheAgentLeftTheModeOnForWantOfAJournal() async throws {
+        var seeded = RuntimeState()
+        seeded.savedDisplayBrightness = 0.8
+        seeded.displayRestoreRefused = true
+        seeded.lowPowerSetByUs = true
+        seeded.keptDisplayUnderLowPower = 0.8
+        seeded.keptDisplayUnderLowPowerBoot = "boot A"
+        seeded.keptDisplayReadLit = 0.8
+        let original = try Store.makeEncoder().encode(seeded)
+        let f = try ScriptFixture()
+        defer {
+            try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: f.state.path)
+            f.destroy()
+        }
+        try original.write(to: f.state)
+        try f.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        try FileManager.default.setAttributes([.immutable: true], ofItemAtPath: f.state.path)
+
+        let r = try f.run(f.backstop)
+        try FileManager.default.setAttributes([.immutable: false], ofItemAtPath: f.state.path)
+
+        XCTAssertNotEqual(r.status, 0)
+        XCTAssertFalse(f.calls().contains { $0.contains("lowpowermode") }, "\(f.calls())")
+        XCTAssertEqual(try Data(contentsOf: f.state), original)
+        try original.write(to: h.home.paths.stateFile)
+        try h.store.saveSession(Session(startedAt: h.clock.now.addingTimeInterval(-7200), endsAt: h.clock.now.addingTimeInterval(-60)))
+        h.guardFake.lowPowerOn = true
+        h.clamshell.closed = false
+        h.display.brightness = 0.4
+
+        let m = h.makeManager(bootSession: f.bootUUID)
+        let sampler = follow(m)
+        let actions = lidActions(m, sampler: sampler)
+        await m.reconcile()
+
+        XCTAssertFalse(h.guardFake.lowPowerOn, "the app switches its mode off itself")
+        let waiting = try XCTUnwrap(try h.store.loadState())
+        XCTAssertEqual(waiting.savedDisplayBrightness, 0.8, "0.4 is not taken as the user's level")
+        XCTAssertEqual(waiting.keptDisplayUnderLowPowerBoot, f.bootUUID)
+        XCTAssertNil(sampler.last?.display, "nothing sampled")
+        XCTAssertTrue(logText().contains("low power mode, journaled as ours before the Mac last started, reads on; it is switched off as ours in this boot"), logText())
+
+        await m.start(duration: 3600)
+        h.display.brightness = 0.6
+        h.clamshell.closed = true
+        await actions.onClose()
+        h.clamshell.closed = false
+        await actions.onOpen()
+
+        XCTAssertFalse(h.display.sets.contains(0.4), "\(h.display.sets)")
+        XCTAssertEqual(h.display.brightness, 0.6)
+        XCTAssertNil(sampler.last?.display)
+        _ = await m.end(reason: .user)
+    }
+
+    /// The same journal from boot A. In boot B the user or another tool
+    /// switches Low Power Mode off a moment before the app launches: with
+    /// no agent run before it, or after the agent could not publish this
+    /// boot and so left the mode on. The app reads the mode off, which
+    /// does not show the panel is back: 0.4 is not taken as the user's
+    /// level, nothing is sampled, and a close and an open leave the
+    /// user's 0.6 as set and never write 0.4. A launch in boot C decides
+    /// on 0.6.
+    private func checkARecentSwitchOffByHandIsNotTakenAsTheUsersLevel(failedPreparation: Bool) async throws {
+        var seeded = RuntimeState()
+        seeded.savedDisplayBrightness = 0.8
+        seeded.displayRestoreRefused = true
+        seeded.lowPowerSetByUs = true
+        seeded.keptDisplayUnderLowPower = 0.8
+        seeded.keptDisplayUnderLowPowerBoot = "boot A"
+        seeded.keptDisplayReadLit = 0.8
+        let original = try Store.makeEncoder().encode(seeded)
+        let f = try ScriptFixture()
+        defer {
+            try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: f.state.path)
+            f.destroy()
+        }
+        if failedPreparation {
+            try original.write(to: f.state)
+            try f.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+            try FileManager.default.setAttributes([.immutable: true], ofItemAtPath: f.state.path)
+            let r = try f.run(f.backstop)
+            try FileManager.default.setAttributes([.immutable: false], ofItemAtPath: f.state.path)
+            XCTAssertNotEqual(r.status, 0)
+            XCTAssertFalse(f.calls().contains { $0.contains("lowpowermode") }, "\(f.calls())")
+            XCTAssertEqual(try Data(contentsOf: f.state), original)
+        }
+        try original.write(to: h.home.paths.stateFile)
+        try h.store.saveSession(Session(startedAt: h.clock.now.addingTimeInterval(-7200), endsAt: h.clock.now.addingTimeInterval(-60)))
+        // Switched off by hand a moment ago: the panel is on its way back
+        // to the user's 0.6.
+        h.guardFake.lowPowerOn = false
+        h.clamshell.closed = false
+        h.display.brightness = 0.4
+
+        let m = h.makeManager(bootSession: f.bootUUID)
+        let sampler = follow(m)
+        let actions = lidActions(m, sampler: sampler)
+        await m.reconcile()
+
+        let after = try XCTUnwrap(try h.store.loadState())
+        XCTAssertEqual(after.savedDisplayBrightness, 0.8, "a mode off a moment ago does not show the panel is back")
+        XCTAssertFalse(after.lowPowerSetByUs)
+        XCTAssertEqual(after.keptDisplayUnderLowPowerBoot, f.bootUUID)
+        XCTAssertNil(sampler.last?.display, "0.4 is not the user's sample")
+        XCTAssertEqual(h.display.sets, [])
+        XCTAssertTrue(logText().contains("low power mode, journaled as ours before the Mac last started, reads off; it may have gone off only a moment ago, with the panel still on its way back, so it is switched off as ours in this boot"), logText())
+
+        await m.start(duration: 3600)
+        h.display.brightness = 0.6
+        h.clamshell.closed = true
+        await actions.onClose()
+        h.clamshell.closed = false
+        await actions.onOpen()
+
+        XCTAssertFalse(h.display.sets.contains(0.4), "the next close and open do not write over the user's 0.6: \(h.display.sets)")
+        XCTAssertEqual(h.display.brightness, 0.6)
+        XCTAssertNil(sampler.last?.display)
+        _ = await m.end(reason: .user)
+
+        let later = h.makeManager(bootSession: "boot C")
+        let laterSampler = follow(later)
+        await later.reconcile()
+
+        XCTAssertNil(try h.store.loadState()?.savedDisplayBrightness)
+        XCTAssertEqual(laterSampler.last?.display, 0.6)
+        XCTAssertFalse(h.display.sets.contains(0.4), "\(h.display.sets)")
+        XCTAssertEqual(h.display.brightness, 0.6)
+    }
+
+    func testARecentSwitchOffByHandWithNoAgentIsNotTakenAsTheUsersLevel() async throws {
+        try await checkARecentSwitchOffByHandIsNotTakenAsTheUsersLevel(failedPreparation: false)
+    }
+
+    func testARecentSwitchOffByHandAfterAFailedAgentPreparationIsNotTakenAsTheUsersLevel() async throws {
+        try await checkARecentSwitchOffByHandIsNotTakenAsTheUsersLevel(failedPreparation: true)
+    }
+}
+
+/// Journals the app writes itself, through LidActions and the Store, over
+/// an output device whose name or UID holds a backslash with "u0041" after
+/// it. The app's encoder writes that backslash as \\, so the text holds
+/// "\\u0041": a string with a backslash in it, not a \u escape. The
+/// scripts read it as the app does and undo the rest of the journal, and
+/// the app then restores the device.
+@MainActor
+final class AppEncodedJournalScriptTests: XCTestCase {
+    private static let escapedName = "Headset \(backslash)u0041"
+    private static let escapedUID = "Device-\(backslash)u0041"
+
+    /// The journal the app writes as the lid closes with muting on, with
+    /// sleep, Low Power Mode and a frozen process journaled beside it,
+    /// and, with `record`, a kept display entry and its records from boot
+    /// A. `legacy` drops the save ID, as builds before it wrote the entry.
+    private func appJournal(uid: String, name: String, record: Bool, legacy: Bool, boot: String) async throws -> Data {
+        let h = Harness()
+        defer { h.home.destroy() }
+        h.audio.connect(uid, name: name, volume: 0.6)
+        let m = h.makeManager(bootSession: boot)
+        m.config.muteOnLidClose = true
+        m.config.darkenDisplayOnLidClose = false
+        m.config.freezeList = []
+        m.config.freezeAllApps = false
+        await m.start(duration: 3600)
+        let freezer = FakeFreezer(apps: [], processes: [], control: h.procs)
+        let actions = LidActions(manager: m, freezer: freezer, docker: DockerRule(freezer: freezer, probe: { true }), audio: h.audio, display: h.display, keyboard: h.keyboard)
+        await actions.onClose()
+        XCTAssertEqual(h.audio.mutes, 1)
+        var s = try XCTUnwrap(try h.store.loadState())
+        XCTAssertEqual(s.savedAudioOutputs.map(\.deviceUID), [uid])
+        XCTAssertEqual(s.savedAudioOutputs.map(\.name), [name])
+        if legacy {
+            s.savedAudioOutputs = s.savedAudioOutputs.map { SavedAudioOutput(deviceUID: $0.deviceUID, name: $0.name, volume: $0.volume, muted: $0.muted, saveID: nil) }
+        }
+        s.sleepDisabledByUs = true
+        s.lowPowerSetByUs = true
+        s.frozenProcesses = [FrozenProcess(pid: 4242, identity: ProcessIdentity(startedAt: 1_789_388_423, startedAtMicros: 17, bootSession: boot))]
+        if record {
+            s.savedDisplayBrightness = 0.8
+            s.displayRestoreRefused = true
+            s.keptDisplayUnderLowPower = 0.8
+            s.keptDisplayUnderLowPowerBoot = "boot A"
+            s.keptDisplayReadLit = 0.8
+        }
+        try h.store.saveState(s)
+        let data = try Data(contentsOf: h.home.paths.stateFile)
+        XCTAssertEqual(try Store.makeDecoder().decode(RuntimeState.self, from: data), s)
+        return data
+    }
+
+    private static func variants() -> [(label: String, uid: String, name: String)] {
+        [("name", "Device-A", escapedName), ("uid", escapedUID, "Headset A"), ("plain", "Device-A", "Headset A")]
+    }
+
+    /// Sleep, Low Power Mode and the frozen process are undone, the session
+    /// goes, and the saved output stays in the journal as the app wrote it.
+    private func checkUndone(_ f: ScriptFixture, before: Data, _ label: String) throws {
+        XCTAssertTrue(f.calls().contains("sudo -n \(f.fakePmset) -a disablesleep 0"), "\(label): \(f.calls())")
+        XCTAssertTrue(f.calls().contains("sudo -n \(f.fakePmset) -b lowpowermode 0"), "\(label): \(f.calls())")
+        XCTAssertTrue(f.calls().contains { $0.hasPrefix("Insomnia --resume-frozen") && $0.contains("4242 1789388423 17") }, "\(label): \(f.calls())")
+        XCTAssertFalse(f.log().contains("malformed"), "\(label): \(f.log())")
+        let wrote = try Store.makeDecoder().decode(RuntimeState.self, from: before)
+        let after = try Store.makeDecoder().decode(RuntimeState.self, from: Data(contentsOf: f.state))
+        XCTAssertFalse(after.sleepDisabledByUs, label)
+        XCTAssertFalse(after.lowPowerSetByUs, label)
+        XCTAssertEqual(after.frozenProcesses, [], label)
+        XCTAssertEqual(after.savedAudioOutputs, wrote.savedAudioOutputs, label)
+        XCTAssertEqual(after.keptDisplayUnderLowPowerBoot, wrote.keptDisplayUnderLowPower == nil ? nil : f.bootUUID, label)
+    }
+
+    /// The agent on an expired session: the same outcome for each name or
+    /// UID as for a plain one, with or without a kept display record, in
+    /// the current entry form and the legacy one. The app then restores
+    /// the device from the journal the agent published.
+    func testAnEscapedNameOrUIDDoesNotStopTheAgentAndTheAppRestoresIt() async throws {
+        for v in Self.variants() {
+            for record in [false, true] {
+                for legacy in [false, true] {
+                    let label = "\(v.label) record \(record) legacy \(legacy)"
+                    let f = try ScriptFixture()
+                    defer { f.destroy() }
+                    let before = try await appJournal(uid: v.uid, name: v.name, record: record, legacy: legacy, boot: f.bootUUID)
+                    if v.label != "plain" {
+                        XCTAssertTrue(String(decoding: before, as: UTF8.self).contains("\(backslash)\(backslash)u0041"), label)
+                    }
+                    try before.write(to: f.state)
+                    try f.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+
+                    let r = try f.run(f.backstop)
+
+                    XCTAssertEqual(r.status, 0, "\(label): \(r.stderr) \(f.log())")
+                    XCTAssertFalse(f.exists(f.session), label)
+                    try checkUndone(f, before: before, label)
+
+                    let h = Harness()
+                    defer { h.home.destroy() }
+                    h.audio.connect(v.uid, name: v.name, volume: 0.6, muted: true)
+                    h.clamshell.closed = false
+                    try Data(contentsOf: f.state).write(to: h.home.paths.stateFile)
+                    let m = h.makeManager(bootSession: f.bootUUID)
+                    await m.reconcile()
+
+                    XCTAssertEqual(h.audio.device(v.uid)?.muted, false, label)
+                    XCTAssertEqual(h.audio.device(v.uid)?.volume, 0.6, label)
+                    XCTAssertEqual(try h.store.loadState()?.savedAudioOutputs, [], label)
+                }
+            }
+        }
+    }
+
+    /// uninstall.sh, with and without --purge, runs the backstop it
+    /// installed over the same journals: the undo goes as far as for a
+    /// plain name, and the saved output, which only the app restores,
+    /// stops the removal with the app, the agent and the sudoers rule in
+    /// place.
+    func testAnEscapedNameOrUIDDoesNotStopTheUndoOfAnUninstall() async throws {
+        for v in Self.variants() {
+            for record in [false, true] {
+                for legacy in [false, true] {
+                    for purge in [false, true] {
+                        let label = "\(v.label) record \(record) legacy \(legacy) purge \(purge)"
+                        let f = try ScriptFixture()
+                        defer { f.destroy() }
+                        let before = try await appJournal(uid: v.uid, name: v.name, record: record, legacy: legacy, boot: f.bootUUID)
+                        try f.installMachinery()
+                        try before.write(to: f.state)
+                        try f.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+
+                        let r = try f.run(f.uninstall, purge ? ["--purge"] : [])
+
+                        XCTAssertNotEqual(r.status, 0, label)
+                        XCTAssertTrue(f.exists(f.app), label)
+                        XCTAssertTrue(f.exists(f.plist), label)
+                        XCTAssertTrue(f.exists(f.sudoers), label)
+                        XCTAssertFalse(r.stderr.contains("malformed"), "\(label): \(r.stderr)")
+                        XCTAssertTrue(r.stderr.contains("audio") || r.stdout.contains("audio"), "\(label): \(r.stdout) \(r.stderr)")
+                        try checkUndone(f, before: before, label)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Journals the app reads, each with sleep journaled, through the
+    /// agent: what is around the records, in strings and nested values,
+    /// holds none, and the forms of a record the app reads pass. Sleep is
+    /// undone each time.
+    func testWhatTheAppReadsAroundTheRecordsDoesNotStopTheAgent() throws {
+        let b = backslash
+        let base = #"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false"#
+        let tails: [(label: String, tail: String)] = [
+            ("an escaped backslash in a value", #","unrelated":"Device \#(b)\#(b)u0041"}"#),
+            ("an escape in a value", #","unrelated":"Device \#(b)u0041"}"#),
+            ("a nested number too small", #","unrelated":{"keptDisplayReadLit":1e-400}}"#),
+            ("a nested copy", #","keptDisplayReadLit":0.8,"unrelated":{"keptDisplayReadLit":0.7}}"#),
+            ("an escaped key", #","keptDisplayReadL\#(b)u0069t":0.8}"#),
+            ("a float", #","keptDisplayReadLit":0.80000001192092896}"#),
+            ("zero with an exponent", #","keptDisplayReadLit":0e-400}"#),
+            ("negative zero", #","keptDisplayReadLit":-0}"#),
+            ("an integer", #","keptDisplayReadLit":1}"#),
+            ("null", #","keptDisplayReadLit":null}"#),
+        ]
+        for (label, tail) in tails {
+            let json = base + tail
+            XCTAssertNoThrow(try Store.makeDecoder().decode(RuntimeState.self, from: Data(json.utf8)), label)
+            let f = try ScriptFixture()
+            defer { f.destroy() }
+            try f.writeState(json)
+            try f.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+
+            let r = try f.run(f.backstop)
+
+            XCTAssertEqual(r.status, 0, "\(label): \(r.stderr) \(f.log())")
+            XCTAssertTrue(f.calls().contains("sudo -n \(f.fakePmset) -a disablesleep 0"), label)
+            XCTAssertEqual(try f.stateJSON()["sleepDisabledByUs"] as? Bool, false, label)
+            XCTAssertFalse(f.exists(f.session), label)
+        }
     }
 }
