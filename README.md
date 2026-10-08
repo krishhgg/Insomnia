@@ -227,16 +227,20 @@ installer prints its pid.
    off: `/private/var/db/com.kgarg.insomnia/<your user id>`, a file
    `scripts/install.sh` makes and only root can change. Every Insomnia
    folder of your account shares it. A start claims the receipt before its
-   dialog, in `<your user id>.released` beside it, and keeps the claim
-   until the start is settled. Until then, Start in any other Insomnia
+   dialog, in `<your user id>.released` beside it, and Insomnia gives the
+   claim back only after the start's settlement is written to its journal.
+   Until then, Start in any other Insomnia
    folder of yours is refused. The command locks the receipt before its
    first check and keeps it locked until it and its pmset have exited.
    Insomnia, the recovery agent and the scripts read the receipt only under
    that lock. Right before the command turns sleep off, it uses
    `/usr/bin/perl` to write the start's random code, the code the receipt
    held before, and `writing` into the receipt. It then asks the drive to
-   flush its cache (`F_FULLFSYNC`). If the start's answer window has ended
-   by then, it writes `refused` and stops. That window ends when the
+   flush its cache (`F_FULLFSYNC`) and reads the sleep setting again: if
+   something turned sleep off meanwhile, or the read fails, it writes
+   `refused` and stops, and that setting stays. If the start's answer
+   window has ended by then, it writes `refused` and stops. That window
+   ends when the
    session would, or 130 seconds after Start if that is sooner: the
    dialog's 120 seconds, the 3 seconds Insomnia waits after stopping it,
    and 7 seconds for it to launch.
@@ -256,13 +260,27 @@ installer prints its pid.
    unreadable receipt waits for the answer window to end, since a command
    for the start could still write until then. Until then, and for as long
    as the receipt stays locked, nothing is decided: the start stays
-   recorded with its claim, Start is refused, and nothing is undone. The
-   next run after the window ends settles it.
+   recorded with its claim, Start is refused, and sleep is left as it is,
+   even when an earlier session still owes a restore. Insomnia's other
+   changes (Low Power Mode, stopped processes, audio) are undone as usual.
+   The window's end only shows that no new command for the start can
+   begin, and only while the clock is not set back. A command already
+   running keeps the receipt locked until its pmset exits, so Insomnia
+   waits for the lock however long that takes: a command that never exits
+   means Insomnia never turns sleep back on for that start. The next run
+   after the window ends that can lock the receipt settles it. It writes
+   the result into the journal first, then gives the claim back, then
+   drops the start's record. If it stops after the first step (a crash, or
+   a `.released` file or journal it cannot write), the next run finishes
+   those steps from the journaled result without reading the receipt
+   again, and Start stays refused until then.
 
    Start refuses with nothing changed while the receipt is missing or
    unsafe (it says to run `./scripts/install.sh` again), while a start
    from another Insomnia folder of yours is not settled, and while
-   something holds the receipt's lock for more than 10 seconds. A Mac
+   something holds the receipt's lock for more than 10 seconds. Any
+   account on the Mac can hold that lock, since the receipt is readable to
+   all. A Mac
    without `/usr/bin/perl` cannot start a session: the command refuses
    after you type the password. SECURITY.md lists what the receipt cannot
    show.
@@ -303,14 +321,17 @@ installer prints its pid.
      be deleted, because a command behind the dialog still holds it or for
      any other reason, is retried on every later run. The unfinished
      session is never resumed. Until the start's answer window has ended,
-     the old dialog can still be answered, so the start stays recorded and
-     Start is refused. After that the receipt decides: a start that never
+     the old dialog can still be answered, so the start stays recorded,
+     Start is refused, and sleep is left as it is. After that the receipt
+     decides, once it can be locked: a start that never
      turned sleep off changes nothing and keeps any restore an earlier
      session still owes, and anything else turns sleep back on. If the
      journal cannot be updated with that result, the start stays recorded,
-     Start is refused, and every run tries again. Meanwhile sleep is turned
-     back on only when the receipt showed nothing or an earlier restore is
-     owed.
+     Start is refused, and every run tries again. Meanwhile sleep is
+     turned back on only when the receipt showed nothing or an earlier
+     restore is owed. Once the result is journaled, a claim that cannot be
+     given back or a record that cannot be removed keeps Start refused
+     until a later run finishes them; the result is not read again.
 
    Insomnia shows no dialog at all while the `backstop.sh` sealed in its
    bundle is missing or older than the app expects, because an older one
@@ -617,22 +638,28 @@ installation scenarios still need [release validation](docs/release-validation.m
   and a notification gives the command, `sudo pmset -a disablesleep 0`.
   Start is refused until it reads 0 again, since the session's end would
   turn sleep back on. Start reads it before the dialog, and the command
-  behind the dialog reads it again as root after it has asked sudo and
-  right before its only write; a 1 at that read stops the command, and the
+  behind the dialog reads it as root after it has asked sudo, and once
+  more after it has written its receipt line, right before its last clock
+  check and its only write; a 1 at either read stops the command, and the
   1 stays. Nothing writes 0 before that write. pmset cannot change the
   setting only if it still holds a given value, though, so one moment
   remains uncovered, and this is not fixed. A `SleepDisabled 1` another
-  tool sets in the instant between the command's read and its own
+  tool sets in the instant between the command's second read and its own
   `disablesleep 1` looks like Insomnia's own, and the session's end sets
   it to 0. One set during the session is set to 0 when the session
   ends. One set while the dialog is up stays when the start then fails or
   is abandoned (a crash included) and the receipt shows that the command
   never turned sleep off, also while the journal cannot take that result.
-  It is set to 0 when the receipt shows nothing: at once when the command
+  One set while the command writes its receipt line stops it at the second
+  read and stays too, unless the command's `refused` line cannot be
+  written and its exit status is lost: the receipt then still shows
+  `writing`, and the 1 is set to 0. It is set to 0 when the receipt shows
+  nothing: at once when the command
   wrote `writing` and then failed or was stopped, or a later start's line
   names another earlier code, and once the start's answer window has
-  ended when the receipt is missing, replaced or unreadable. So it is when
-  the receipt stays locked past that window. On a drive that ignores the flush request, a
+  ended when the receipt is missing, replaced or unreadable. While the
+  receipt stays locked, nothing is set to 0. On a drive that ignores the
+  flush request, a
   power loss can bring back an older receipt while pmset's 1 persists;
   that 1 then reads as set by something else. And while Insomnia still
   owes a restore from an earlier session, another tool's 1 looks like

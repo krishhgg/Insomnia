@@ -261,11 +261,13 @@ Flag a change that breaks one of these; do not flag the behavior itself.
   the journal and session.json exactly and runs no pmset.
 - `BackstopVersion.swift`, `backstop.sh`. Start reads the
   `# insomnia-backstop-version:` line of the `backstop.sh` sealed in the
-  bundle the agent runs and shows no dialog below version 4 (2 is the
-  first that deletes `pending-start`, 3 the first that settles a
-  journaled `sleepOffAttempt` from its receipt, 4 the first that reads
-  the receipt under its lock as the 82-byte line with the predecessor and
-  the start's `expires`, and gives the start's claim back); the user is
+  bundle the agent runs and shows no dialog below version 5 (2 is the
+  first that deletes `pending-start`, 3 the first that settles a journaled
+  `sleepOffAttempt` from its receipt, 4 the first that reads the receipt
+  under its lock as the 82-byte line with the predecessor and the start's
+  `expires`, and gives the start's claim back, 5 the first that journals a
+  settlement's decision before it gives the claim back and finishes a
+  settled record); the user is
   told to run `install.sh` again.
   Bump the version line and `BackstopVersion.required` together whenever
   the app starts relying on new backstop behavior.
@@ -312,7 +314,9 @@ Flag a change that breaks one of these; do not flag the behavior itself.
   `O_WRONLY|O_NOFOLLOW` with no create or truncate, the same device:inode
   as fd 8, one full syswrite, `fcntl` `F_FULLFSYNC` (51), close, reopen
   and read back; `<nonce> <predecessor> refused` and 7 if any of that
-  fails or perl is missing), `expires` again (`refused` and 4), and only
+  fails or perl is missing), a second root read of `pmset -g` under the
+  same rule (`refused` and 6; it narrows the window and is not an owner
+  token), `expires` again (`refused` and 4), and only
   then `pmset -a disablesleep 1`, the command's only power write (1 if it
   fails). Its shell and pmset keep fd 8, so the receipt stays locked
   until pmset exits. Root never writes the marker or anything in the
@@ -335,20 +339,30 @@ Flag a change that breaks one of these; do not flag the behavior itself.
   unsafe or malformed receipt is too once `expires` has passed. Before
   then those, and at any time a receipt lock that stays busy or fails,
   are `.undecided`: the start keeps the attempt, its claim and
-  `sleepDisabledByUs` and runs no pmset before `expires` unless the
-  journal owed a restore before it (`owedBefore`). A dialog that did not end by itself
+  `sleepDisabledByUs` and runs no pmset for sleep at any time, whatever
+  `owedBefore` says (`expires` proves only that no command for the start
+  enters later while the wall clock does not go back, not that one already
+  entered has exited); the rest of the end still runs. A dialog that did
+  not end by itself
   (timeout, stuck prompt, interruption) and has at most 15 s left of
   `expires` waits for it before the read. The next recovery-lock holder (the app after a relaunch,
   backstop.sh, uninstall.sh) settles an attempt still journaled the same
   way once the marker is gone and before it reads the session:
-  `.undecided` keeps everything; otherwise the session.json whose end is
-  the attempt's deadline goes, the claim goes back, `.neverWrote` puts
-  `sleepDisabledByUs` back to `owedBefore`, anything else keeps it, and a
-  settlement that cannot be written keeps the attempt and the claim (with
-  `.neverWrote` and no `owedBefore` no pmset runs and Starts stay
-  refused; otherwise the app ends an unexpired session of it and refuses
-  Start, backstop.sh undoes as `--force` and exits 1, uninstall.sh stops
-  with no pmset). The release file `<uid>.released` (the user's, 0600,
+  `.undecided` keeps everything and holds the sleep undo; otherwise the
+  session.json whose end is the attempt's deadline goes, then, with the
+  claim still held, the decision is journaled (`sleepOffAttempt.settled`,
+  `.neverWrote` putting `sleepDisabledByUs` back to `owedBefore`, anything
+  else keeping it), then the claim goes back, then the attempt goes
+  (`finishSettlement`, `finish_settlement`). A settlement that cannot
+  journal its decision keeps the attempt unsettled and the claim (with
+  `.neverWrote` and no `owedBefore` no pmset runs and Starts stay refused;
+  otherwise the app ends an unexpired session of it and refuses Start,
+  backstop.sh undoes as `--force` and exits 1, uninstall.sh stops with no
+  pmset). One that fails after that keeps the settled record, which holds
+  nothing back: the undo follows its decision, Starts stay refused,
+  backstop.sh exits 1, uninstall.sh stops, and later runs finish it
+  without reading the receipt again. The release file `<uid>.released`
+  (the user's, 0600,
   42 bytes, `<nonce> free|held`) holds the claim: a start claims only
   while it shows the receipt's nonce `free`, and another
   `INSOMNIA_HOME`'s unsettled claim refuses Start. A marker removed with no
@@ -364,7 +378,12 @@ Flag a change that breaks one of these; do not flag the behavior itself.
   whose attempt is still journaled, reads or claims the receipt without
   its lock or takes a busy or failed lock as clean, lets `.undecided` or
   a predecessor read before `expires` (dialog not over) settle as
-  `.neverWrote`, writes the receipt without `F_FULLFSYNC` or with more
+  `.neverWrote`, lets `.undecided` or a busy receipt run the sleep undo
+  (owed or not, before or after `expires`), gives a claim back before the
+  decision is journaled, reads a settled record against the receipt again,
+  drops the second `pmset -g` read, has install.sh read the receipt or the
+  release file before it holds the receipt's lock or replace a `held`
+  claim, writes the receipt without `F_FULLFSYNC` or with more
   than one write, claims while the release file shows another nonce or
   `held`, drops the sudo.conf or PAM check,
   accepts another sudo version or adds a Defaults name to the list
@@ -378,15 +397,22 @@ Flag a change that breaks one of these; do not flag the behavior itself.
   1 as a refusal. Known and disclosed (round 14 P1 narrowed to one
   moment, not closed): pmset has no compare-and-set and one
   `SleepDisabled` with no owner, so a 1 another tool sets between root's
-  read and its `disablesleep 1` is taken for Insomnia's and set to 0 by
-  the end; one set during the session is set to 0 by the end; one set
-  after root's read during a dialog that then fails ambiguously (timeout,
+  second read and its `disablesleep 1` is taken for Insomnia's and set to
+  0 by the end; one set during the session is set to 0 by the end; one set
+  while the `writing` line is written is caught by the second read, unless
+  its `refused` line cannot be written and the status is lost, and is then
+  set to 0; one set after root's second read during a dialog that then
+  fails ambiguously (timeout,
   stuck prompt, pmset failure, a status lost to a signal) is set to 0 by
   the undo once the command wrote `writing`, even when it stopped before
   its write; once `expires` has passed a receipt that shows nothing, and
   at any time a replaced marker or a settlement that cannot be written,
   also undo; an attempt that stays `.undecided` keeps Start refused and
-  the session recorded until a later holder settles it; the receipt is
+  the session recorded until a later holder settles it, and holds the
+  sleep undo for as long as the receipt stays locked, with no limit, so a
+  root command that never exits means no restore and any local account can
+  delay one (the receipt is readable and the lock advisory); the receipt
+  is
   `F_FULLFSYNC`ed, but what that and pmset's own write guarantee across
   a power loss is not measured, so older receipt content beside pmset's 1
   stays possible and that 1 is then reported as someone else's; a

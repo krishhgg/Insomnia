@@ -187,7 +187,10 @@ opens it again and reads the line back. Any failure, a missing perl
 included, tries to write `refused` the same way and exits 7, so a Mac
 without `/usr/bin/perl` cannot start a session. Apple's fcntl(2) manual
 describes F_FULLFSYNC as an fsync(2) followed by a request to the drive to
-flush its own cache, and says that some drives ignore that request. The
+flush its own cache, and says that some drives ignore that request. Once
+the line is read back, the command reads `pmset -g` again, under the same
+rule: a SleepDisabled 1 set while the line was written, or a
+read that fails, writes `refused` and exits 6, and that 1 stays. The
 clock is compared once more: at or after `expires` the command writes
 `refused` and exits 4. Only then does it run `pmset -a disablesleep 1`, its
 only power write, which the start journaled before the dialog. If pmset
@@ -265,11 +268,12 @@ anything: `sleepOffAttempt` in state.json, written with
 `sleepDisabledByUs`, holds the nonce, the predecessor, the receipt's
 device and inode, the session's end, the `sleepDisabledByUs` from before
 the start (`owedBefore`) and, once the marker exists, `expires` and the
-marker's device and inode. A start that finishes or rolls back gives its
-claim back and removes the attempt. One left in the journal belongs to a
-start that never finished (the app crashed or was force-quit) or to a
-settlement that could not finish. The next holder of the recovery lock
-(the app at the start of every transaction, backstop.sh or uninstall.sh)
+marker's device and inode. A start that finishes or rolls back marks the
+attempt `settled` in the journal, then gives its claim back, then removes
+the attempt. One left in the journal belongs to a start that never
+finished (the app crashed or was force-quit) or to a settlement that
+could not finish. The next holder of the recovery lock (the app at the
+start of every transaction, backstop.sh or uninstall.sh)
 settles it once it has deleted the marker under the marker's lock, before
 it reads the session or restores anything. Which marker file went decides
 nothing: the receipt does, read under its lock.
@@ -277,36 +281,52 @@ nothing: the receipt does, read under its lock.
 A settlement knows of no dialog that is over, so a start whose `expires`
 has not passed and whose receipt still holds the predecessor stays
 journaled: its dialog can still be answered. So do the other receipts that
-decide nothing before `expires`, and a receipt that stays locked or cannot
-be locked. While a start stays journaled, new Starts in that Insomnia
+decide nothing before `expires`, and, at any time, a receipt that stays
+locked or cannot be locked: a command for that start may hold it and still
+be in pmset. While a start stays journaled, new Starts in that Insomnia
 folder are refused, its claim keeps Starts in every other folder of the
 user refused, an unexpired session of that start is ended rather than
-resumed, and no pmset runs for it until `expires` has passed, unless an
-earlier restore is owed. A start with a receipt that stays locked is
-retried for as long as the lock is held, with no limit. Otherwise
-session.json goes first if its end is that start's deadline (that session
-never began, and is never resumed on a SleepDisabled 1 someone else may
-have set), then the claim goes back, then the journal drops the attempt. A
-receipt that shows no command turned sleep off (an attempt with no marker
-never showed a dialog) puts `sleepDisabledByUs` back to `owedBefore`, so a
-restore an earlier session still owes stays owed and no pmset runs.
-Anything else keeps `sleepDisabledByUs`, and the restore runs.
+resumed, and no pmset runs for sleep, whatever an earlier session owes.
+`expires` only stops commands that have not yet reached their last clock
+check; one already past it may still turn sleep off after an undo, which
+would then not hold. The rest of the undo (Low Power Mode, frozen
+processes, audio) still runs. A start whose receipt stays locked keeps
+that hold for as long as the lock is held, with no limit, so a command
+that never exits leaves sleep as it is with no restore from Insomnia.
+Otherwise session.json goes first if its end is that start's deadline
+(that session never began, and is never resumed on a SleepDisabled 1
+someone else may have set). Then, while the
+claim is still held, the journal records the decision: the attempt marked
+`settled`, with `sleepDisabledByUs` put back to `owedBefore` when the
+receipt shows no command turned sleep off (an attempt with no marker never
+showed a dialog), so a restore an earlier session still owes stays owed
+and no pmset runs, and kept otherwise, so the restore runs. Then the claim
+goes back, then the journal drops the attempt. A record already marked
+`settled` is finished the same way from its decision, and never read
+against the receipt again: once its claim went back, a later start's line
+may show something else.
 
-A settlement step that fails keeps the attempt journaled with what the
-receipt showed, and keeps the claim, or takes it again, so the next run
-reads the same line: a session.json that cannot be removed (then nothing
-is removed), a claim that cannot be given back, or a journal that cannot
-be written. The menu, the log and uninstall.sh's message say whether
-session.json of that start was removed. When the receipt showed that no
-command turned sleep off and no earlier restore is owed, no pmset runs
-while the attempt waits: the app refuses Start and retries at every
+A settlement step that fails before the decision is in the journal keeps
+the attempt unsettled, with the claim, so the next run reads the same
+line: a session.json that cannot be removed (then nothing is removed) or a
+journal that cannot be written. One that fails after it (a claim that
+cannot be given back, a settled record that cannot be removed, a receipt
+that cannot be locked to finish it) keeps the settled record. That record
+holds nothing back, since its decision is made: the undo follows it,
+Starts stay refused until it is finished, and every run tries again. A
+crash at any point leaves one of those two journals. The menu, the log and
+uninstall.sh's message say whether session.json of that start was removed
+and whether the decision was journaled. While the receipt cannot decide
+yet, or shows that no command turned sleep off with no earlier restore
+owed, no pmset runs for sleep: the app refuses Start and retries at every
 transaction, backstop.sh logs that sleep is left as it is, keeps the
 journal dirty and exits 1, and uninstall.sh stops with nothing else
 removed. Otherwise the app and backstop.sh run the restore and keep the
-attempt. uninstall.sh runs no pmset while any attempt stays: it says what
-it removed and stops. A marker the lock holder deletes that no journaled
-start accounts for (left by an older build, or by a start that finished
-but could not delete it) takes session.json with it, for the same reason.
+attempt. uninstall.sh runs no pmset while an attempt stays unsettled or a
+settled one cannot be finished: it says what it removed or journaled and
+stops. A marker the lock holder deletes that no journaled start accounts
+for (left by an older build, or by a start that finished but could not
+delete it) takes session.json with it, for the same reason.
 
 Only install.sh (which creates the receipt), uninstall.sh (which removes
 this user's receipt and release file and then the folder once it is empty,
@@ -327,20 +347,25 @@ after it, and a 1 another tool writes over a 1 already in effect leaves no
 trace.
 
 - A SleepDisabled 1 another tool sets in the instant between the root
-  command's read and its `disablesleep 1` (the time pmset takes to start)
-  cannot be told from Insomnia's, and the session's end sets it to 0. One
-  set during the session is set to 0 by the session's end.
-- One set while a dialog is up, before the root command's read, stops the
-  command and stays, after a crash too. One set after that read is set to
-  0 when the start then fails once the command has written `writing` (a
-  pmset failure, or a signal or the dialog's time limit between that write
-  and pmset).
+  command's second read and its `disablesleep 1` (the clock check and the
+  time pmset takes to start) cannot be told from Insomnia's, and the
+  session's end sets it to 0. One set during the session is set to 0 by
+  the session's end.
+- One set while a dialog is up, before the root command's first read, or
+  while its `writing` line is written, before the second read, stops the
+  command and stays, after a crash too, when the command reports exit 6 or
+  writes its `refused` line. When that line cannot be written and the
+  status is lost (a signal, the dialog's time limit, a crash before the
+  app acts on it), the receipt still shows `writing`, and the settlement
+  sets that 1 to 0. One set after the
+  second read is set to 0 when the start then fails (a pmset failure, or a
+  signal or the dialog's time limit before pmset). The second read narrows
+  the window; it is not an owner token and does not close it.
 - When the receipt shows nothing once `expires` has passed (missing,
   replaced, unreadable, under a changed folder, or a later start's line
   that names another predecessor), the start is undone like an end, and a
-  1 another tool set is set to 0. So it is once `expires` has passed for a
-  receipt that stays locked: the restore runs while the start stays
-  journaled.
+  1 another tool set is set to 0. A receipt that stays locked decides
+  nothing at any time, and the sleep undo waits for it (below).
 - The receipt's line reaches the drive before pmset runs only on a drive
   that honours F_FULLFSYNC. On one that does not, a power loss can bring
   the receipt back with older content while pmset's 1 persists. That 1 is
@@ -352,18 +377,29 @@ trace.
   without an fsync. A crash cannot put back a session.json from before the
   start that the start overwrote. Nothing makes the receipt, the release
   file, the journal and pmset's setting change together.
-- A crash that keeps a settled journal but loses the release file's
-  give-back, an Insomnia folder deleted or abandoned while one of its
-  starts is unsettled, or a release file someone damaged, leaves a claim
-  nothing gives back. Every Start of the user is then refused, with the
-  claim's nonce in the message, until `sudo rm -f
+- A settlement journals its decision before it gives the claim back, so a
+  crash between the two leaves a settled record that the next run
+  finishes. An Insomnia folder deleted or abandoned while one of its
+  starts is still journaled (settled or not), or a release file someone
+  damaged, leaves a claim nothing gives back. Every Start of the user is
+  then refused, with the claim's nonce in the message, until `sudo rm -f
   /private/var/db/com.kgarg.insomnia/<uid>
   /private/var/db/com.kgarg.insomnia/<uid>.released` and
-  `./scripts/install.sh` again. install.sh alone keeps a `held` claim.
-- Any local account can hold the receipt's lock for as long as it likes.
-  Starts are then refused, and a journaled start is retried, unsettled,
-  for as long as the lock is held (after its `expires` with the restore
-  run). A crash or timeout under a dialog keeps Starts in that folder
+  `./scripts/install.sh` again. install.sh alone keeps a `held` claim,
+  read under the receipt's lock, even right after it made the receipt, and
+  stops at a claim in a file that is not the user's 0600 file with one
+  link. It replaces a release file with no claim by rename, after checking
+  that the file still holds the bytes it read; a write between that check
+  and the rename is lost.
+- Any local account can hold the receipt's lock for as long as it likes:
+  the receipt is readable (0644) and the lock is advisory. Starts are then
+  refused, and a journaled start is retried, unsettled, with its sleep undo
+  held, for as long as the lock is held, after its `expires` too. A root
+  command that never exits (a hung pmset or sudo query) holds the lock the
+  same way, and Insomnia then never restores sleep for that start.
+  Deleting the marker does not stop a command already past its nonce
+  check, and the lock that command holds can outlast the dialog's answer
+  window. A crash or timeout under a dialog keeps Starts in that folder
   refused for up to about 130 s, and a start in one Insomnia folder keeps
   Starts in every other folder of the user refused until it is settled.
   uninstall.sh holds the receipt's lock while it runs `sudo rm`, which may
@@ -371,9 +407,12 @@ trace.
   other Insomnia folder of the user needs `./scripts/install.sh` again
   before its next start. A Mac without `/usr/bin/perl` refuses every Start
   with exit 7.
-- The clock is the wall clock, as session.json's end is. A clock set back
-  after a settlement lets a dialog left on screen pass the comparison with
-  `expires` again, though only while a marker holds its nonce.
+- The clock is the wall clock, as session.json's end is, and `expires`
+  proves that no command for a start will begin only while that clock does
+  not go back. A clock set back after a settlement lets a dialog left on
+  screen pass the comparison with `expires` again, though only while a
+  marker holds its nonce. A settled record that says a command never wrote
+  is a record of what the receipt showed; it revokes nothing.
 - The recovery agent is scheduled every 60 s, but launchd does not promise
   when it runs, and it does not run while the Mac sleeps, so no recovery
   has a fixed time bound.
@@ -391,10 +430,13 @@ trace.
   forged release file only lets a later start's line in, which names this
   start's nonce as its predecessor and shows nothing. The marker's and the
   receipt's locks are advisory.
-- A start that turned sleep off but could not then clear its attempt from
-  the journal keeps it; a later settlement finds its `writing`, removes the
-  session.json whose end is that deadline and so ends that session early,
-  with sleep restored. A session whose marker could not be deleted when it
+- A start that turned sleep off but could not then mark its attempt
+  settled keeps it unsettled; a later settlement finds its `writing`,
+  removes the session.json whose end is that deadline and so ends that
+  session early, with sleep restored. One that marked it settled but could
+  not give the claim back or remove the record keeps the session while the
+  app runs; an app relaunched over that record ends the session rather
+  than resume it. A session whose marker could not be deleted when it
   started ends early too, when a later run deletes that marker with no
   attempt journaled.
 - While the journal claims a 1 from an earlier session, another tool's 1
@@ -416,6 +458,14 @@ trace.
   refuses install and Start. Neither the receipt, its lock, perl's
   F_FULLFSYNC nor any of this was run on a Mac as root in testing: every
   check above ran against fakes and files in a temporary folder.
+- These rules cost availability, and none of that cost is waived: Start
+  is refused under any sudo, sudo.conf, PAM or Defaults setting the checks
+  do not accept, without `/usr/bin/perl`, while any account holds the
+  readable receipt's lock, while a claim nothing gives back is out, and
+  over the 45-byte receipt of earlier builds of this change, which
+  install.sh refuses rather than convert. A start can stay unsettled, with
+  Starts refused and its sleep undo held, for as long as its receipt stays
+  locked.
 
 Closing the ownership gaps needs a sleep assertion owned by a process, or
 a pmset that compares before it sets, which this design does not have.

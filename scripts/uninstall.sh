@@ -538,6 +538,8 @@ journal_shape_problems() { # file
       [[ "$(type_of "$f" sleepOffAttempt.expires)" == integer ]] || echo "sleepOffAttempt.expires is not an integer"
       t="$(type_of "$f" sleepOffAttempt.marker)"
       [[ -z "$t" || "$t" == string || "$t" == "(any)" ]] || echo "sleepOffAttempt.marker is a $t, not a string"
+      t="$(type_of "$f" sleepOffAttempt.settled)"
+      [[ -z "$t" || "$t" == bool || "$t" == "(any)" ]] || echo "sleepOffAttempt.settled is a $t, not a bool"
     fi
   fi
 }
@@ -949,8 +951,8 @@ fi
 #   - "never": the attempt has no marker (no dialog was shown); or the
 #     receipt holds this start's nonce with "refused"; or another start's
 #     line that names the same predecessor; or, once the start's expires
-#     has passed (its command refuses from then on), the predecessor
-#     itself.
+#     has passed (its command refuses from then on, while the wall clock
+#     does not go back), the predecessor itself.
 #   - "may": the receipt holds this start's "writing", a later start's
 #     line, or, once expires has passed, anything else: a receipt that is
 #     missing, replaced, unsafe or damaged.
@@ -959,19 +961,23 @@ fi
 #     still be answered.
 # Decided, session.json goes when its end is the attempt's deadline: its
 # start never finished, so that session is never resumed (a SleepDisabled 1
-# someone else set would read as still off). Then the start's claim on the
-# receipt goes back (the release file) and the journal drops the attempt
-# as backstop.sh publishes it (copy, edit, verify, rename): with
+# someone else set would read as still off). Then the journal records the
+# decision while the claim is still held, as backstop.sh publishes it
+# (copy, edit, verify, rename): sleepOffAttempt.settled, with
 # sleepDisabledByUs as it was before the start (owedBefore) after "never",
 # which keeps a restore an earlier session still owes, and set after "may",
-# so the backstop below undoes it. The backstop that runs may be an older
-# copy that does not know sleepOffAttempt, so the start is settled here
-# first. Undecided, or a lock, removal, claim or journal write that fails,
-# stops the uninstall before the backstop runs: no pmset runs, the record,
-# the sleep entry and the claim stay, so the receipt's line still shows the
-# same thing next time, and the message says what was removed. Skipped for
-# a journal that is missing, not a regular file or malformed, which step 4
-# reports.
+# so the backstop below undoes it. Only then does the start's claim on the
+# receipt go back (the release file) and the journal drop the attempt. A
+# record already settled is only finished that way: the receipt is not read
+# against it again, since once the claim went back a later start's lines
+# may show something else. The backstop that runs may be an older copy that
+# does not know sleepOffAttempt, so the start is settled here first.
+# Undecided, or a lock, removal or journal write that fails before the
+# decision is published, stops the uninstall before the backstop runs: no
+# pmset runs, and the record, the sleep entry and the claim stay. A claim or
+# removal that fails after it stops it too, with the decision journaled.
+# The message says what was removed or written. Skipped for a journal that
+# is missing, not a regular file or malformed, which step 4 reports.
 
 # Prints why the receipt or a folder above it fails the checks, or nothing.
 # Every check matches SleepOffReceipts.swift and the root command
@@ -1167,24 +1173,66 @@ folders_problem() { # folder
 }
 
 # Stops the uninstall with the start still journaled. No pmset has run.
-settle_stop() { # why removed
+settle_stop() { # why what-was-done
   unlock_receipt
   echo "The unfinished start is still journaled: $1." >&2
   if [[ -n "${2:-}" ]]; then
-    echo "$2 was removed; nothing else was, and no pmset ran. Then rerun." >&2
+    echo "$2; nothing else was, and no pmset ran. Then rerun." >&2
   else
     echo "Nothing was removed and no pmset ran. Then rerun." >&2
   fi
   exit 1
 }
 
+# Publishes $STATE with the edits given (remove:KEYPATH or
+# true:KEYPATH / false:KEYPATH), as one copy, edit, verify and rename.
+# Returns non-zero, with nothing published and no copy left, when any step
+# fails.
+edit_state() { # edit...
+  local tmp="$APP_SUPPORT/.state.json.uninstall.$$" e ok=1
+  "$CP" "$STATE" "$tmp" || ok=0
+  for e in "$@"; do
+    (( ok == 1 )) || break
+    case "$e" in
+      remove:*) "$PLUTIL" -remove "${e#remove:}" "$tmp" >/dev/null 2>&1 || ok=0 ;;
+      true:*|false:*) "$PLUTIL" -replace "${e#*:}" -bool "${e%%:*}" "$tmp" >/dev/null 2>&1 || ok=0 ;;
+      *) ok=0 ;;
+    esac
+  done
+  if (( ok == 1 )); then
+    [[ "$("$PLUTIL" -convert json -o - "$tmp" 2>/dev/null | "$HEAD" -c 1)" == "{" ]] || ok=0
+    [[ "$("$HEAD" -c 1 "$tmp")" == "{" ]] || ok=0
+  fi
+  if (( ok == 1 )) && "$MV" -f "$tmp" "$STATE"; then
+    return 0
+  fi
+  "$RM" -f "$tmp"
+  return 1
+}
+
+# Under the receipt's lock: gives a settled start's claim back and drops
+# its record, or stops the uninstall saying what was done.
+finish_settlement() { # nonce what-was-done
+  give_back_claim "$1" || settle_stop "it is settled, but its claim on the receipt could not be given back ($claim_why)" "$2"
+  edit_state remove:sleepOffAttempt || settle_stop "it is settled, but its settled record could not be removed from $STATE" "$2"
+  unlock_receipt
+  echo "the settlement is finished: $( (( gave_back )) && echo "the start's claim on the receipt was given back" || echo "the start held no claim on the receipt") and its record removed"
+}
+
 settle_attempt() {
-  local nonce owed receipt pred deadline expires now has_marker=0 owes tmp removed="" why
+  local nonce owed receipt pred deadline expires now has_marker=0 owes removed=""
   [[ -f "$STATE" ]] || return 0
   [[ "$(type_of "$STATE" sleepOffAttempt)" == dictionary ]] || return 0
   "$PLUTIL" -convert json -o /dev/null "$STATE" >/dev/null 2>&1 || return 0
   [[ -z "$(journal_shape_problems "$STATE")" ]] || return 0
   nonce="$(extract "$STATE" sleepOffAttempt.nonce || true)"
+  if [[ "$(extract "$STATE" sleepOffAttempt.settled || true)" == true ]]; then
+    lock_receipt
+    [[ -n "$receipt_locked" ]] || settle_stop "it is settled, but the receipt could not be locked to give its claim back ($receipt_lock_why)"
+    echo "finishing the settlement of an earlier start, which the journal records as settled"
+    finish_settlement "$nonce" ""
+    return 0
+  fi
   owed="$(extract "$STATE" sleepOffAttempt.owedBefore || true)"
   receipt="$(extract "$STATE" sleepOffAttempt.receipt || true)"
   pred="$(extract "$STATE" sleepOffAttempt.predecessor || true)"
@@ -1196,7 +1244,7 @@ settle_attempt() {
   [[ "$now" =~ ^[0-9]+$ ]] || now=0
   attempt_verdict "$nonce" "$pred" "$receipt" "$expires" "$now" "$has_marker"
   if [[ "$verdict" == undecided ]]; then
-    settle_stop "it is not settled yet ($verdict_why). Wait for that to pass: a start's password dialog can be answered for about two minutes after it was shown"
+    settle_stop "it is not settled yet ($verdict_why). Wait for that to pass: a start's password dialog can be answered for about two minutes after it was shown, and a command it started holds the receipt until pmset exits"
   fi
   if [[ -z "$receipt_locked" ]]; then
     settle_stop "the receipt could not be locked to give its claim back ($receipt_lock_why)"
@@ -1214,26 +1262,13 @@ settle_attempt() {
   if [[ -f "$SESSION" ]] && "$CAT" "$SESSION" >/dev/null 2>&1 && [[ -z "$(session_shape_problems "$SESSION")" ]] \
      && [[ "$(epoch_at "$SESSION" endsAt)" == "$deadline" ]]; then
     "$RM" -f "$SESSION" || settle_stop "$SESSION of that start could not be removed"
-    removed="$SESSION"
+    removed="$SESSION was removed"
     echo "removed $SESSION: its start never finished"
   fi
-  give_back_claim "$nonce" || settle_stop "its claim on the receipt could not be given back ($claim_why)" "$removed"
-  tmp="$APP_SUPPORT/.state.json.uninstall.$$"
-  if "$CP" "$STATE" "$tmp" \
-     && "$PLUTIL" -remove sleepOffAttempt "$tmp" >/dev/null 2>&1 \
-     && "$PLUTIL" -replace sleepDisabledByUs -bool "$owes" "$tmp" >/dev/null 2>&1 \
-     && [[ "$("$PLUTIL" -convert json -o - "$tmp" 2>/dev/null | "$HEAD" -c 1)" == "{" ]] \
-     && [[ "$("$HEAD" -c 1 "$tmp")" == "{" ]] \
-     && "$MV" -f "$tmp" "$STATE"; then
-    unlock_receipt
-    return 0
-  fi
-  "$RM" -f "$tmp"
-  why="the settled journal could not be published to $STATE"
-  if (( gave_back )) && ! write_release "$nonce" held; then
-    why="$why; the receipt's claim, given back first, could not be taken again, so a start from another Insomnia folder may replace the line this settlement read, which then shows nothing"
-  fi
-  settle_stop "$why" "$removed"
+  # The decision, published while the claim is still held.
+  edit_state true:sleepOffAttempt.settled "$owes:sleepDisabledByUs" || settle_stop "the settled journal could not be published to $STATE" "$removed"
+  if [[ -n "$removed" ]]; then removed="$removed, and the decision"; else removed="The decision"; fi
+  finish_settlement "$nonce" "$removed was journaled in $STATE as settled"
 }
 
 settle_attempt

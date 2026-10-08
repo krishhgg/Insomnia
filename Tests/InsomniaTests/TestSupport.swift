@@ -1606,16 +1606,21 @@ enum ReceiptWriteFault: String, CaseIterable {
 
 /// The fake /usr/bin/perl for the root command's receipt write: records
 /// the line it was given in `$FAKE_PERL_CALLS`, changes the program as
-/// `$FAKE_PERL_FAULT` says (ReceiptWriteFault) for the `writing` line, or
-/// for every line with `$FAKE_PERL_FAULT_ALL`, and runs the real
-/// /usr/bin/perl with it. A fault that finds nothing to change fails the
-/// run with exit 2.
+/// `$FAKE_PERL_FAULT` says (ReceiptWriteFault) for the `writing` line, for
+/// the `refused` line only with `$FAKE_PERL_FAULT_REFUSED`, or for every
+/// line with `$FAKE_PERL_FAULT_ALL`, and runs the real /usr/bin/perl with
+/// it. A fault that finds nothing to change fails the run with exit 2.
+/// Once perl has answered, its call (signature `perl writing` or `perl
+/// refused`) moves RootCommandProcess's fake clock when it is that call's
+/// `at`, and runs its other-tool hook (`foreignHook`).
 let fakePerlScript = """
 #!/bin/bash
 [[ "${1:-}" == -e && $# -eq 4 ]] || { echo "fake perl: unexpected arguments" >&2; exit 2; }
 prog="$2"
 printf '%s\\n' "$4" >> "$FAKE_PERL_CALLS"
-if [[ -n "${FAKE_PERL_FAULT:-}" && ( -n "${FAKE_PERL_FAULT_ALL:-}" || "$4" == *' writing' ) ]]; then
+sig="perl ${4##* }"
+if [[ -n "${FAKE_PERL_FAULT_REFUSED:-}" ]]; then faulted=' refused'; else faulted=' writing'; fi
+if [[ -n "${FAKE_PERL_FAULT:-}" && ( -n "${FAKE_PERL_FAULT_ALL:-}" || "$4" == *"$faulted" ) ]]; then
   case "$FAKE_PERL_FAULT" in
     open) from='sysopen(my $h, $f, 257)'; to='sysopen(my $h, $f . q(.none), 257)' ;;
     short) from='my $n = syswrite $h, $l;'; to='my $n = syswrite $h, $l, 40;' ;;
@@ -1628,7 +1633,23 @@ if [[ -n "${FAKE_PERL_FAULT:-}" && ( -n "${FAKE_PERL_FAULT_ALL:-}" || "$4" == *'
   [[ "$changed" != "$prog" ]] || { echo "fake perl: $FAKE_PERL_FAULT found nothing to change" >&2; exit 2; }
   prog=$changed
 fi
-exec /usr/bin/perl -e "$prog" "$3" "$4"
+/usr/bin/perl -e "$prog" "$3" "$4"
+rc=$?
+if [[ -n "${FAKE_CLOCK_AT:-}" && "$sig" == "$FAKE_CLOCK_AT" ]]; then printf '%s\\n' "$FAKE_CLOCK_LATER" > "$FAKE_CLOCK_FILE"; fi
+\(foreignHook)
+exit $rc
+"""
+
+/// Another tool setting SleepDisabled, for RootCommandProcess: once the
+/// `$FAKE_FOREIGN_NTH`th call (the first unless set) with the signature
+/// `$FAKE_FOREIGN_AFTER` has answered, SleepDisabled becomes
+/// `$FAKE_FOREIGN_SETS`, once. Run with `$sig` set.
+let foreignHook = """
+if [[ -n "${FAKE_FOREIGN_AFTER:-}" && "$sig" == "$FAKE_FOREIGN_AFTER" && ! -e "$FAKE_FOREIGN_DONE" ]]; then
+  printf x >> "$FAKE_FOREIGN_DONE.seen"
+  seen=$(< "$FAKE_FOREIGN_DONE.seen")
+  if (( ${#seen} >= ${FAKE_FOREIGN_NTH:-1} )); then : > "$FAKE_FOREIGN_DONE"; printf '%s' "$FAKE_FOREIGN_SETS" > "$FAKE_SLEEP_STATE"; fi
+fi
 """
 
 /// A clock for the root command's `/bin/date +%s` (RootCommandProcess):
@@ -1713,8 +1734,11 @@ func appleScriptQuotedForm(_ s: String) -> String {
 /// `pmsetOutput` verbatim), and `-a disablesleep N` writes N, unless
 /// `writeFails`, which makes `-a disablesleep 1` fail without writing.
 /// `foreignAfter` is another tool: once the call with that signature has
-/// answered, it sets SleepDisabled to `foreignSets` (`1` unless given;
-/// `fail` makes the next `pmset -g` fail), once. With `holdAt`, the call
+/// answered (the `foreignAfterCall`th one, the first unless given; `perl
+/// writing` and `perl refused` name the receipt writes), it sets
+/// SleepDisabled to `foreignSets` (`1` unless given; `fail` makes the next
+/// `pmset -g` fail), once. `refusedReceiptWriteFails` puts
+/// `receiptWriteFault` on the `refused` line only. With `holdAt`, the call
 /// with that signature waits before it does anything until `release()`
 /// (60 s at most, and only while `dir` exists), so a test can act while
 /// the command holds the marker's lock. With `outputClosed`, the
@@ -1750,7 +1774,7 @@ final class RootCommandProcess {
     /// The receipt the command writes.
     let receipts: SleepOffReceipts
 
-    init(marker: URL, nonce: String, expires: String? = nil, uid: String? = nil, policy: RootSudoPolicy = .rule, command: String = AdministratorPrompt.rootCommand, clock: RootCommandClock? = nil, sleepDisabled: String = "0", owned: String = "0", pmsetOutput: String? = nil, foreignAfter: String? = nil, foreignSets: String = "1", writeFails: Bool = false, outputClosed: Bool = false, sudoConf: String? = nil, pamSudo: String? = SudoFormat.macPamSudo, receipts: SleepOffReceipts? = nil, predecessor: String? = nil, receiptIdentity: String? = nil, receiptWriteFault: ReceiptWriteFault? = nil, everyReceiptWriteFails: Bool = false, receiptLockSeconds: Int? = nil, trustTestUser: Bool = true, in dir: URL, holdAt: String? = nil) throws {
+    init(marker: URL, nonce: String, expires: String? = nil, uid: String? = nil, policy: RootSudoPolicy = .rule, command: String = AdministratorPrompt.rootCommand, clock: RootCommandClock? = nil, sleepDisabled: String = "0", owned: String = "0", pmsetOutput: String? = nil, foreignAfter: String? = nil, foreignAfterCall: Int = 1, foreignSets: String = "1", writeFails: Bool = false, outputClosed: Bool = false, sudoConf: String? = nil, pamSudo: String? = SudoFormat.macPamSudo, receipts: SleepOffReceipts? = nil, predecessor: String? = nil, receiptIdentity: String? = nil, receiptWriteFault: ReceiptWriteFault? = nil, everyReceiptWriteFails: Bool = false, refusedReceiptWriteFails: Bool = false, receiptLockSeconds: Int? = nil, trustTestUser: Bool = true, in dir: URL, holdAt: String? = nil) throws {
         let receipts = try receipts ?? TestReceipts.make(in: dir)
         self.receipts = receipts
         let fakePerl = dir.appendingPathComponent("fake-perl", isDirectory: true).appendingPathComponent("perl")
@@ -1765,6 +1789,7 @@ final class RootCommandProcess {
         let answers = dir.appendingPathComponent("root-sudo-answers", isDirectory: true)
         let outputFile = dir.appendingPathComponent("fake-pmset-output")
         let foreignDone = dir.appendingPathComponent("fake-foreign-done")
+        let foreignSeen = dir.appendingPathComponent("fake-foreign-done.seen")
         fakePmset = fake
         fakeSudo = sudo
         fakeEnv = env
@@ -1776,7 +1801,7 @@ final class RootCommandProcess {
         perlCalls = dir.appendingPathComponent("root-perl-calls")
         started = dir.appendingPathComponent("pmset-started")
         releaseFile = dir.appendingPathComponent("pmset-release")
-        for file in [calls, callers, sudoCalls, envCalls, perlCalls, started, releaseFile, outputFile, foreignDone, conf, pam] { try? FileManager.default.removeItem(at: file) }
+        for file in [calls, callers, sudoCalls, envCalls, perlCalls, started, releaseFile, outputFile, foreignDone, foreignSeen, conf, pam] { try? FileManager.default.removeItem(at: file) }
         if let sudoConf { try Data(sudoConf.utf8).write(to: conf) }
         if let pamSudo { try Data(pamSudo.utf8).write(to: pam) }
         try Data(sleepDisabled.utf8).write(to: sleepState)
@@ -1793,7 +1818,7 @@ final class RootCommandProcess {
         """
         let after = """
         if [[ "$sig" == "$FAKE_CLOCK_AT" ]]; then printf '%s\\n' "$FAKE_CLOCK_LATER" > "$FAKE_CLOCK_FILE"; fi
-        if [[ "$sig" == "$FAKE_FOREIGN_AFTER" && ! -e "$FAKE_FOREIGN_DONE" ]]; then : > "$FAKE_FOREIGN_DONE"; printf '%s' "$FAKE_FOREIGN_SETS" > "$FAKE_SLEEP_STATE"; fi
+        \(foreignHook)
         """
         try """
         #!/bin/bash
@@ -1889,10 +1914,12 @@ final class RootCommandProcess {
         environment["FAKE_FOREIGN_AFTER"] = signature(foreignAfter)
         environment["FAKE_FOREIGN_SETS"] = foreignSets
         environment["FAKE_FOREIGN_DONE"] = foreignDone.path
+        environment["FAKE_FOREIGN_NTH"] = String(foreignAfterCall)
         environment["FAKE_WRITE_FAILS"] = writeFails ? "1" : ""
         environment["FAKE_PERL_CALLS"] = perlCalls.path
         environment["FAKE_PERL_FAULT"] = receiptWriteFault.map { $0 == .perlMissing ? "" : $0.rawValue } ?? ""
         environment["FAKE_PERL_FAULT_ALL"] = everyReceiptWriteFails ? "1" : ""
+        environment["FAKE_PERL_FAULT_REFUSED"] = refusedReceiptWriteFails ? "1" : ""
         process.environment = environment
         process.standardInput = FileHandle.nullDevice
         process.standardError = err
@@ -2030,8 +2057,8 @@ func waitUntilLockfWaits(under pid: pid_t) -> Bool {
 }
 
 /// Runs the root command to the end (see RootCommandProcess).
-func runRootCommand(marker: URL, nonce: String, expires: String? = nil, uid: String? = nil, policy: RootSudoPolicy = .rule, command: String = AdministratorPrompt.rootCommand, clock: RootCommandClock? = nil, sleepDisabled: String = "0", owned: String = "0", pmsetOutput: String? = nil, foreignAfter: String? = nil, foreignSets: String = "1", sudoConf: String? = nil, pamSudo: String? = SudoFormat.macPamSudo, receipts: SleepOffReceipts? = nil, predecessor: String? = nil, receiptIdentity: String? = nil, receiptWriteFault: ReceiptWriteFault? = nil, everyReceiptWriteFails: Bool = false, receiptLockSeconds: Int? = nil, trustTestUser: Bool = true, in dir: URL) throws -> RootCommandRun {
-    try RootCommandProcess(marker: marker, nonce: nonce, expires: expires, uid: uid, policy: policy, command: command, clock: clock, sleepDisabled: sleepDisabled, owned: owned, pmsetOutput: pmsetOutput, foreignAfter: foreignAfter, foreignSets: foreignSets, sudoConf: sudoConf, pamSudo: pamSudo, receipts: receipts, predecessor: predecessor, receiptIdentity: receiptIdentity, receiptWriteFault: receiptWriteFault, everyReceiptWriteFails: everyReceiptWriteFails, receiptLockSeconds: receiptLockSeconds, trustTestUser: trustTestUser, in: dir).wait()
+func runRootCommand(marker: URL, nonce: String, expires: String? = nil, uid: String? = nil, policy: RootSudoPolicy = .rule, command: String = AdministratorPrompt.rootCommand, clock: RootCommandClock? = nil, sleepDisabled: String = "0", owned: String = "0", pmsetOutput: String? = nil, foreignAfter: String? = nil, foreignAfterCall: Int = 1, foreignSets: String = "1", sudoConf: String? = nil, pamSudo: String? = SudoFormat.macPamSudo, receipts: SleepOffReceipts? = nil, predecessor: String? = nil, receiptIdentity: String? = nil, receiptWriteFault: ReceiptWriteFault? = nil, everyReceiptWriteFails: Bool = false, refusedReceiptWriteFails: Bool = false, receiptLockSeconds: Int? = nil, trustTestUser: Bool = true, in dir: URL) throws -> RootCommandRun {
+    try RootCommandProcess(marker: marker, nonce: nonce, expires: expires, uid: uid, policy: policy, command: command, clock: clock, sleepDisabled: sleepDisabled, owned: owned, pmsetOutput: pmsetOutput, foreignAfter: foreignAfter, foreignAfterCall: foreignAfterCall, foreignSets: foreignSets, sudoConf: sudoConf, pamSudo: pamSudo, receipts: receipts, predecessor: predecessor, receiptIdentity: receiptIdentity, receiptWriteFault: receiptWriteFault, everyReceiptWriteFails: everyReceiptWriteFails, refusedReceiptWriteFails: refusedReceiptWriteFails, receiptLockSeconds: receiptLockSeconds, trustTestUser: trustTestUser, in: dir).wait()
 }
 
 /// One fake Mac behind a Start driven end to end through the real
@@ -2052,7 +2079,8 @@ func runRootCommand(marker: URL, nonce: String, expires: String? = nil, uid: Str
 /// RootCommandProcess signature) has answered, and `clockLater` from then
 /// on. `foreignDuringDialog` and `foreignAfter` are another tool setting
 /// SleepDisabled to 1 once: while the dialog is up, or right after the
-/// root command's call with that signature. `interruptAt` stops the root
+/// root command's call with that signature (its `foreignAfterCall`th one,
+/// the first unless set). `interruptAt` stops the root
 /// command with SIGTERM as its call with that signature starts, before
 /// that call answers, as a timeout or a crash between two steps would.
 /// The root command reads `sudoConf` (none unless set) and `pamSudo`
@@ -2077,6 +2105,8 @@ final class FakeDialogMachine {
     private let nonceLog: URL
     private let foreignDialog: URL
     private let foreignAt: URL
+    private let foreignCall: URL
+    private let foreignSeen: URL
     private let interruptFile: URL
     private let confFile: URL
     private let pamFile: URL
@@ -2100,6 +2130,8 @@ final class FakeDialogMachine {
         nonceLog = dir.appendingPathComponent("osascript-nonce")
         foreignDialog = dir.appendingPathComponent("foreign-during-dialog")
         foreignAt = dir.appendingPathComponent("foreign-at")
+        foreignCall = dir.appendingPathComponent("foreign-call")
+        foreignSeen = dir.appendingPathComponent("foreign-seen")
         interruptFile = dir.appendingPathComponent("interrupt-at")
         confFile = dir.appendingPathComponent("sudo.conf")
         pamFile = dir.appendingPathComponent("pam.d-sudo")
@@ -2122,7 +2154,11 @@ final class FakeDialogMachine {
         let after = """
         if [[ -n "${FAKE_SUDO_AS:-}" ]]; then
           if [[ -e '\(clockLaterFile.path)' && "$sig" == "$(/bin/cat '\(clockAtFile.path)')" ]]; then /bin/mv '\(clockLaterFile.path)' '\(clock.path)'; fi
-          if [[ -e '\(foreignAt.path)' && "$sig" == "$(/bin/cat '\(foreignAt.path)')" ]]; then /bin/rm -f '\(foreignAt.path)'; printf 1 > '\(state.path)'; fi
+          if [[ -e '\(foreignAt.path)' && "$sig" == "$(/bin/cat '\(foreignAt.path)')" ]]; then
+            printf x >> '\(foreignSeen.path)'
+            seen=$(< '\(foreignSeen.path)')
+            if (( ${#seen} >= $(/bin/cat '\(foreignCall.path)' 2>/dev/null || echo 1) )); then /bin/rm -f '\(foreignAt.path)' '\(foreignSeen.path)'; printf 1 > '\(state.path)'; fi
+          fi
         fi
         """
         // Run by both fakes before a call of the root command's does
@@ -2226,6 +2262,13 @@ final class FakeDialogMachine {
     var foreignDuringDialog: Bool {
         get { FileManager.default.fileExists(atPath: foreignDialog.path) }
         set { if newValue { FileManager.default.createFile(atPath: foreignDialog.path, contents: nil) } else { try? FileManager.default.removeItem(at: foreignDialog) } }
+    }
+
+    /// Which call with the signature `foreignAfter` the other tool waits
+    /// for: 1, the first, unless set.
+    var foreignAfterCall: Int {
+        get { Int((try? String(contentsOf: foreignCall, encoding: .utf8)) ?? "") ?? 1 }
+        set { try! Data(String(newValue).utf8).write(to: foreignCall) }
     }
 
     /// The signature after which the other tool sets its 1, until it has;

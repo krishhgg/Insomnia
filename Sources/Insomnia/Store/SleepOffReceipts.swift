@@ -37,12 +37,23 @@ struct SleepOffAttempt: Codable, Equatable, Sendable {
     /// marker and before the dialog. nil: no dialog was shown, so nothing
     /// ran as root for this start.
     var marker: String?
+    /// true once a settlement decided this start and journaled what it
+    /// owes (`sleepDisabledByUs`), before it gives the start's claim back.
+    /// A settled record changes nothing to undo; it waits only for the
+    /// claim to be given back, under the receipt's lock, and is then
+    /// removed. So a crash or a failure after the decision is published
+    /// leaves the decision itself, never a record a later start's receipt
+    /// line could be read against again. Left out of the JSON when nil.
+    var settled: Bool? = nil
+
+    var isSettled: Bool { settled == true }
 }
 
 /// What a receipt shows about one start.
 enum SleepOffVerdict: Equatable, Sendable {
     /// The root command for that start never ran `pmset -a disablesleep 1`,
-    /// and never will.
+    /// and never will (when that rests on `expires` having passed, only
+    /// while the wall clock does not go back).
     case neverWrote
     /// It may have, or nothing shows otherwise; the reason, for the log.
     case mayHaveWritten(String)

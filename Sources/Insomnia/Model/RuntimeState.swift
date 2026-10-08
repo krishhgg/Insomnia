@@ -204,9 +204,17 @@ struct RuntimeState: Codable, Equatable, Sendable {
     var appNapOverrides: [AppNapOverride] = []
     /// A start that may still turn sleep off, journaled with
     /// `sleepDisabledByUs` before its password dialog (SleepOffAttempt).
-    /// Never set without `sleepDisabledByUs`, so it adds nothing to undo on
-    /// its own; it records whether that entry may be cleared without one.
+    /// Until it is settled it is never set without `sleepDisabledByUs`, so
+    /// it adds nothing to undo on its own; it records whether that entry
+    /// may be cleared without one. A settled one sits beside whatever
+    /// `sleepDisabledByUs` the settlement decided and only waits for its
+    /// claim on the receipt to be given back.
     var sleepOffAttempt: SleepOffAttempt? = nil
+
+    /// The journaled start, unless a settlement has already decided it.
+    var unsettledSleepOffAttempt: SleepOffAttempt? {
+        sleepOffAttempt.flatMap { $0.isSettled ? nil : $0 }
+    }
 
     /// Bare pids of every journaled freeze, for display and de-duplication.
     var frozenPids: [Int32] { frozenProcesses.map(\.pid) }

@@ -798,11 +798,9 @@ if [[ ! -e "$RECEIPTS" && ! -L "$RECEIPTS" ]]; then
 fi
 problem="$(folders_problem "$RECEIPTS")"
 [[ -z "$problem" ]] || receipt_stop "$problem"
-receipt_made=0
 if [[ ! -e "$RECEIPT" && ! -L "$RECEIPT" ]]; then
   TMP_RECEIPT="$("$MKTEMP")"
   printf '00000000-0000-0000-0000-000000000000 00000000-0000-0000-0000-000000000000 refused\n' > "$TMP_RECEIPT"
-  receipt_made=1
   receipt_rc=0
   bounded "$SUDO" -n "$INSTALL" -m 0644 -o root -g wheel "$TMP_RECEIPT" "$RECEIPT" || receipt_rc=$?
   if (( receipt_rc == 124 || receipt_rc == 125 )); then
@@ -823,35 +821,59 @@ echo "receipt $RECEIPT is root's and only root can change it or the folders abov
 
 # The release file beside it: <uid>.released, this user's, 0600, 42 bytes
 # (SleepOffReceipts.releaseFile): a nonce and "free" or "held". A start
-# claims the receipt there before its dialog, and gives the claim back once
-# it is settled; meanwhile no start from another Insomnia folder of this
-# user can replace the receipt's line, which that settlement reads. Under
-# the receipt's lock (fd 7, as the root command and every reader lock it),
-# it is written new as the receipt's nonce, free, when the receipt was made
-# just now, or when the file is missing, not in that shape, or shows another
-# nonce free. A claim ("held") is kept: it may be a start of another
+# claims the receipt there before its dialog, and gives the claim back only
+# once its settlement is journaled; meanwhile, while this file is intact, no
+# start from another Insomnia folder of this user can replace the receipt's
+# line, which that settlement reads. Every
+# decision here is made under the receipt's lock (fd 7, as the root command
+# and every reader lock it), from the receipt's line and the release file
+# as they are while it is held, since a start claims the receipt under the
+# same lock. A claim ("held") in this user's file with one link is kept,
+# even right after the receipt was made: it may be a start of another
 # Insomnia folder of this user that is not settled yet, and one of this
-# folder's own is settled by the recovery below. A claim whose folder is
-# gone keeps every start refused: remove both files by hand (sudo rm -f
-# $RECEIPT $RELEASED) once no Insomnia password dialog is open, and run this
-# script again. A release file that is not a regular file stops the
-# install, like the receipt.
+# folder's own is settled by the recovery below. A claim in any other file
+# stops the install rather than be replaced, since the app reads it as a
+# claim. The receipt's own nonce, free, is kept too. Anything else (no
+# file, another nonce free, or bytes not in that shape) is written new as
+# the receipt's nonce, free, by sudo install(1), which replaces the file by
+# rename; just before that, the receipt, the folders above it and the
+# release file are checked again, and the release file must still hold the
+# bytes read above. A claim whose folder is gone keeps every start refused:
+# remove both files by hand (sudo rm -f $RECEIPT $RELEASED) once no
+# Insomnia password dialog is open, and run this script again. A release
+# file that is not a regular file stops the install, like the receipt.
+# Prints the release file's owner, mode, links, size and type, by lstat.
+release_meta() {
+  "$STAT" -f '%u %Lp %l %z %HT' "$RELEASED" 2>/dev/null || true
+}
+# Prints the release file's first 43 bytes, then a dot.
+release_bytes() {
+  "$HEAD" -c 43 "$RELEASED" 2>/dev/null
+  echo .
+}
+# Stops the install unless the receipt is the file fd 7 locked, still as
+# this script makes it, under folders as this script makes them, and holds
+# the line read under the lock.
+receipt_unchanged() {
+  local problem now
+  if [[ "$("$STAT" -f '%d:%i' <&7 2>/dev/null)" != "$("$STAT" -f '%d:%i' "$RECEIPT" 2>/dev/null)" ]]; then
+    receipt_stop "$RECEIPT was replaced while it was locked"
+  fi
+  problem="$(receipt_problem)"
+  [[ -z "$problem" ]] || receipt_stop "$problem"
+  problem="$(folders_problem "$RECEIPTS")"
+  [[ -z "$problem" ]] || receipt_stop "$problem"
+  now="$("$HEAD" -c 83 "$RECEIPT" 2>/dev/null; echo .)"
+  [[ "$now" == "$receipt_line." ]] || receipt_stop "$RECEIPT changed while it was locked"
+}
 if [[ -L "$RELEASED" ]] || { [[ -e "$RELEASED" ]] && [[ ! -f "$RELEASED" ]]; }; then
   receipt_stop "$RELEASED is not a regular file"
 fi
-release_line=""
-if [[ -f "$RELEASED" ]] && [[ "$("$STAT" -f '%u %l %z' "$RELEASED" 2>/dev/null)" == "$UID_NUM 1 42" ]]; then
-  release_line="$("$HEAD" -c 43 "$RELEASED" 2>/dev/null; echo .)"
-  release_line="${release_line%.}"
-fi
-if (( receipt_made == 0 )) && [[ "$release_line" =~ ^[0-9A-F-]{36}\ held$'\n'$ ]]; then
-  echo "kept $RELEASED: a start of this user (${release_line:0:36}) claims the receipt and is not settled yet"
-else
-  { exec 7<"$RECEIPT"; } 2>/dev/null || receipt_stop "$RECEIPT could not be opened"
-  receipt_lock_rc=0
-  "$LOCKF" -s -t "$RECEIPT_LOCK_TIMEOUT_SECONDS" 7 2>/dev/null || receipt_lock_rc=$?
-  if (( receipt_lock_rc != 0 )); then
-    "$CAT" >&2 <<FAIL
+{ exec 7<"$RECEIPT"; } 2>/dev/null || receipt_stop "$RECEIPT could not be opened"
+receipt_lock_rc=0
+"$LOCKF" -s -t "$RECEIPT_LOCK_TIMEOUT_SECONDS" 7 2>/dev/null || receipt_lock_rc=$?
+if (( receipt_lock_rc != 0 )); then
+  "$CAT" >&2 <<FAIL
 
 Install stopped: $RECEIPT stayed locked for ${RECEIPT_LOCK_TIMEOUT_SECONDS} s (lockf exit
 $receipt_lock_rc): the command behind an Insomnia password dialog may be running, or
@@ -859,41 +881,65 @@ another Insomnia folder of this user is settling a start. Rerun this script.
 Installed so far: $SUDOERS. The app at $APP and the LaunchAgent were not touched;
 the new build was discarded.
 FAIL
-    exit 1
-  fi
-  if [[ "$("$STAT" -f '%d:%i' <&7 2>/dev/null)" != "$("$STAT" -f '%d:%i' "$RECEIPT" 2>/dev/null)" ]]; then
-    receipt_stop "$RECEIPT was replaced while it was locked"
-  fi
-  receipt_line="$("$HEAD" -c 83 <&7 2>/dev/null; echo .)"
-  receipt_line="${receipt_line%.}"
-  if ! [[ "$receipt_line" =~ ^([0-9A-F-]{36})\ [0-9A-F-]{36}\ (writing|refused)$'\n'$ ]]; then
-    receipt_stop "$RECEIPT does not hold two nonces and writing or refused"
-  fi
-  receipt_nonce="${BASH_REMATCH[1]}"
-  if (( receipt_made == 0 )) && [[ "$release_line" == "$receipt_nonce free"$'\n' ]]; then
-    echo "kept $RELEASED"
-  else
-    TMP_RELEASE="$("$MKTEMP")"
-    printf '%s free\n' "$receipt_nonce" > "$TMP_RELEASE"
-    release_rc=0
-    bounded "$SUDO" -n "$INSTALL" -m 0600 -o "$UID_NUM" "$TMP_RELEASE" "$RELEASED" || release_rc=$?
-    if (( release_rc == 124 || release_rc == 125 )); then
-      echo >&2
-      sudo_stalled_note "$release_rc" "Install stopped: 'sudo install', which writes $RELEASED,"
-      echo "Installed so far: $SUDOERS. The app at $APP and the LaunchAgent were not touched; the new build was discarded." >&2
-      exit 1
-    elif (( release_rc != 0 )); then
-      if [[ -n "$BOUNDED_OUTPUT" ]]; then printf '%s\n' "$BOUNDED_OUTPUT" >&2; fi
-      receipt_sudo_failed "sudo install $RELEASED" "$release_rc"
-    fi
-    if [[ "$("$STAT" -f '%u %l %z' "$RELEASED" 2>/dev/null)" != "$UID_NUM 1 42" ]] \
-       || [[ "$("$HEAD" -c 43 "$RELEASED" 2>/dev/null; echo .)" != "$receipt_nonce free"$'\n'. ]]; then
-      receipt_stop "$RELEASED is not the file this script just wrote"
-    fi
-    echo "release file $RELEASED written: no start claims the receipt"
-  fi
-  exec 7<&-
+  exit 1
 fi
+receipt_line="$("$HEAD" -c 83 <&7 2>/dev/null; echo .)"
+receipt_line="${receipt_line%.}"
+if ! [[ "$receipt_line" =~ ^([0-9A-F-]{36})\ [0-9A-F-]{36}\ (writing|refused)$'\n'$ ]]; then
+  receipt_stop "$RECEIPT does not hold two nonces and writing or refused"
+fi
+receipt_nonce="${BASH_REMATCH[1]}"
+receipt_unchanged
+if [[ -L "$RELEASED" ]] || { [[ -e "$RELEASED" ]] && [[ ! -f "$RELEASED" ]]; }; then
+  receipt_stop "$RELEASED is not a regular file"
+fi
+release_was=""
+release_line=""
+if [[ -f "$RELEASED" ]]; then
+  release_was="$(release_meta)"
+  release_line="$(release_bytes)"
+  release_line="${release_line%.}"
+fi
+if [[ "$release_line" =~ ^([0-9A-F-]{36})\ held$'\n'$ ]]; then
+  if [[ "$release_was" != "$UID_NUM 600 1 42 Regular File" ]]; then
+    receipt_stop "$RELEASED claims the receipt for a start (${BASH_REMATCH[1]}), but is not this user's 0600 file with one link, so it is not replaced"
+  fi
+  echo "kept $RELEASED: a start of this user (${BASH_REMATCH[1]}) claims the receipt and is not settled yet"
+elif [[ "$release_line" == "$receipt_nonce free"$'\n' && "$release_was" == "$UID_NUM 600 1 42 Regular File" ]]; then
+  echo "kept $RELEASED"
+else
+  TMP_RELEASE="$("$MKTEMP")"
+  printf '%s free\n' "$receipt_nonce" > "$TMP_RELEASE"
+  # Checked again just before the write: the receipt, the folders and the
+  # release file, which must still be what was read above.
+  receipt_unchanged
+  if [[ -L "$RELEASED" ]] || { [[ -e "$RELEASED" ]] && [[ ! -f "$RELEASED" ]]; }; then
+    receipt_stop "$RELEASED is not a regular file"
+  fi
+  if [[ -n "$release_was" ]]; then
+    [[ "$(release_meta)" == "$release_was" && "$(release_bytes)" == "$release_line." ]] \
+      || receipt_stop "$RELEASED changed while the receipt was locked"
+  elif [[ -e "$RELEASED" || -L "$RELEASED" ]]; then
+    receipt_stop "$RELEASED appeared while the receipt was locked"
+  fi
+  release_rc=0
+  bounded "$SUDO" -n "$INSTALL" -m 0600 -o "$UID_NUM" "$TMP_RELEASE" "$RELEASED" || release_rc=$?
+  if (( release_rc == 124 || release_rc == 125 )); then
+    echo >&2
+    sudo_stalled_note "$release_rc" "Install stopped: 'sudo install', which writes $RELEASED,"
+    echo "Installed so far: $SUDOERS. The app at $APP and the LaunchAgent were not touched; the new build was discarded." >&2
+    exit 1
+  elif (( release_rc != 0 )); then
+    if [[ -n "$BOUNDED_OUTPUT" ]]; then printf '%s\n' "$BOUNDED_OUTPUT" >&2; fi
+    receipt_sudo_failed "sudo install $RELEASED" "$release_rc"
+  fi
+  if [[ "$(release_meta)" != "$UID_NUM 600 1 42 Regular File" ]] \
+     || [[ "$(release_bytes)" != "$receipt_nonce free"$'\n'. ]]; then
+    receipt_stop "$RELEASED is not the file this script just wrote"
+  fi
+  echo "release file $RELEASED written: no start claims the receipt"
+fi
+exec 7<&-
 
 # Leftovers of earlier runs are handled only here, under the lock. Step 6
 # runs under it too, so no other install is between setting the previous

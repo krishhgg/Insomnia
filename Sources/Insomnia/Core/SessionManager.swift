@@ -144,11 +144,13 @@ final class SessionManager {
     /// settled, or nil when no start is recorded. Set by every settlement;
     /// a new start is refused with it.
     @ObservationIgnored private var attemptProblem: String?
-    /// Why the undo of that start is held back, or nil when it runs. Set
-    /// by every settlement: the receipt shows its command never turned
-    /// sleep off and no earlier restore is owed, but the journal could not
-    /// record that, or its dialog can still be answered. `restoreAll` then
-    /// runs no pmset for it, so a SleepDisabled 1 another tool set stays.
+    /// Why the sleep undo of that start is held back, or nil when it runs.
+    /// Set by every settlement: a command for that start may still act
+    /// (undecided), or the receipt shows its command never turned sleep
+    /// off and no earlier restore is owed, but the journal could not record
+    /// that. `restoreAll` then runs no pmset for sleep, so a SleepDisabled
+    /// 1 another tool set stays and a pmset still running for that start is
+    /// not raced. Never set for a settled record.
     @ObservationIgnored private var attemptHold: String?
     /// The sudo pmset left running (`unfinishedCommand`), what it holds up
     /// and the pid to stop it by hand. Kept apart from `lastError` so the
@@ -933,7 +935,7 @@ final class SessionManager {
                 fail(Self.markerProblemText(problem))
                 return
             }
-            if state.sleepOffAttempt != nil {
+            if state.unsettledSleepOffAttempt != nil {
                 // As in `restoreAll`: only a settlement removes a start the
                 // journal still records, and the entry stays with it.
                 Log.error("sleep restored (\(command.description) exited 0), but its journal entry stays with the start the journal still records")
@@ -1279,13 +1281,17 @@ final class SessionManager {
             notifier.post(title: Self.endTitle(.startFailed, had: false), body: "Nothing was changed: \(text)")
             return
         }
-        if state.sleepOffAttempt != nil {
+        if let recorded = state.sleepOffAttempt {
             // An earlier start the journal still records is not settled:
             // its dialog can still be answered, its receipt could not be
             // read, or the journal could not be updated with what the
-            // receipt shows. A new start would replace that record.
+            // receipt shows. Or it is settled, but its claim on the
+            // receipt was not given back yet. A new start would replace
+            // that record.
             let why = attemptProblem ?? "it could not be settled"
-            let text = "an earlier start is still recorded in the journal and is not settled (\(why)). Starts are refused until a later run settles it"
+            let text = recorded.isSettled
+                ? "an earlier start is still recorded in the journal (\(why)). Starts are refused until a later run gives its claim on the receipt back"
+                : "an earlier start is still recorded in the journal and is not settled (\(why)). Starts are refused until a later run settles it"
             fail("start refused, nothing changed: \(text)")
             notifier.post(title: Self.endTitle(.startFailed, had: false), body: "Nothing was changed: \(text).")
             return
@@ -1393,11 +1399,14 @@ final class SessionManager {
         do {
             try receipts.writeRelease(.held(attempt.nonce))
         } catch {
-            // The claim may be half written: put back what it showed.
+            // The claim may be half written: put back what it showed. A
+            // claim that landed all the same is given back by the
+            // settlement, and the record stays until then, so it is never
+            // left with no record to account for it. No dialog was shown.
             try? receipts.writeRelease(.free(predecessor))
             held.release()
             fail("could not claim the receipt: \(error.localizedDescription)")
-            rollBackStart(journal: journalBefore, session: sessionBefore)
+            await abandonStart(attempt, journal: journalBefore, session: sessionBefore)
             return
         }
         held.release()
@@ -1557,11 +1566,11 @@ final class SessionManager {
         }
         await clearPendingStart()
         // Sleep is off and journaled as ours; the record of the attempt has
-        // nothing left to show. The claim goes back first, under the
-        // receipt's lock, and is taken again if the journal cannot be
-        // written. Left in place, the record is settled by the next
+        // nothing left to show. Under the receipt's lock the record is
+        // marked settled first, then the claim goes back and the record
+        // goes. Left unsettled, the record is settled by the next
         // transaction, which keeps the sleep entry: the receipt shows this
-        // start's `writing`.
+        // start's `writing`. Left settled, the next transaction finishes it.
         await finishAttempt(attempt)
         guard endTicket == ticket else {
             // Sleep is disabled and journaled as ours. The end that was
@@ -2027,12 +2036,13 @@ final class SessionManager {
     /// command may still be running: sleep is restored all the same, but
     /// the entry stays as the record that the bit may be Insomnia's, so the
     /// end reports itself incomplete and every later run retries. Nor is
-    /// it cleared while the journal still records a start
-    /// (`sleepOffAttempt`): only that start's settlement removes it, and the
-    /// entry goes with the restore after that. For such a start no pmset
-    /// runs at all while `attemptHold` says why: its receipt shows its
-    /// command never turned sleep off and no earlier restore is owed, or
-    /// its dialog can still be answered.
+    /// it cleared while the journal still records a start that is not
+    /// settled (`sleepOffAttempt`): only that start's settlement decides
+    /// it, and the entry goes with the restore after that. For such a
+    /// start no sleep pmset runs at all while `attemptHold` says why: a
+    /// command for it may still act, or its receipt shows its command
+    /// never turned sleep off and no earlier restore is owed. A settled
+    /// record already decided the entry, and changes nothing here.
     ///
     /// A `sudo pmset` that does not stop on SIGTERM ends the restore right
     /// there, as stop_transaction does in backstop.sh: no later undo runs
@@ -2040,7 +2050,7 @@ final class SessionManager {
     /// command is returned; the caller (`performEnd`) reports the end as
     /// stopped and it is retried once the command has exited.
     func restoreAll() async -> UnfinishedCommand? {
-        if state.sleepDisabledByUs, state.sleepOffAttempt != nil, let hold = attemptHold {
+        if state.sleepDisabledByUs, state.unsettledSleepOffAttempt != nil, let hold = attemptHold {
             Log.info("sleep entry kept, and sleep left as it is: \(hold)")
         } else if state.sleepDisabledByUs {
             do {
@@ -2049,9 +2059,10 @@ final class SessionManager {
                 if let problem = markerProblem {
                     Log.error("sleep restored, but its journal entry is kept")
                     fail(Self.markerProblemText(problem))
-                } else if state.sleepOffAttempt != nil {
-                    // A command for that start may still turn sleep off,
-                    // or the journal could not record its settlement.
+                } else if state.unsettledSleepOffAttempt != nil {
+                    // A command for that start may have turned sleep off,
+                    // or the journal could not record its settlement. A
+                    // settled record decided the entry already.
                     Log.error("sleep restored, but its journal entry stays with the start the journal still records")
                 } else {
                     clearUndone("sleep restored") { $0.sleepDisabledByUs = false }
@@ -2953,6 +2964,9 @@ final class SessionManager {
             // A start the journal still records could not be settled: its
             // dialog can still be answered, its receipt stayed locked or
             // could not be read, or a removal or the journal write failed.
+            // Or its settlement is published but could not give the claim
+            // back or remove the record, which ends the session too: the
+            // safe side, and only after a crash with that left over.
             // Or the session.json beside a marker no journaled start
             // accounts for could not be removed. Whether that start turned
             // sleep off is not settled, so a SleepDisabled 1 now may be
@@ -3270,13 +3284,17 @@ final class SessionManager {
     /// file.
     private func restoreSessionFile(_ previous: Session?) {
         do {
-            if let previous {
-                try store.saveSession(previous)
-            } else {
-                try store.deleteSession()
-            }
+            try putBackSessionFile(previous)
         } catch {
             fail("could not restore session.json after a failed start: \(error.localizedDescription)")
+        }
+    }
+
+    private func putBackSessionFile(_ previous: Session?) throws {
+        if let previous {
+            try store.saveSession(previous)
+        } else {
+            try store.deleteSession()
         }
     }
 
@@ -3452,54 +3470,100 @@ final class SessionManager {
 
     /// Records why the start the journal still records stays there:
     /// `attemptProblem`, which a new start is refused with, and
-    /// `attemptHold` when no undo may run for it. That is when no earlier
-    /// restore is owed and the receipt shows its command never turned sleep
-    /// off, or its dialog can still be answered (`over` false): a
-    /// SleepDisabled 1 now may be another tool's. Anything else runs the
-    /// undo and keeps the entry with the record (`restoreAll`); a restore
-    /// an earlier session owes always runs.
-    private func keepAttempt(_ attempt: SleepOffAttempt, _ verdict: SleepOffVerdict, over: Bool, because why: String) {
+    /// `attemptHold` when no sleep undo may run for it. Undecided holds the
+    /// undo whatever the time and whatever an earlier session owes: the
+    /// receipt stays locked or cannot be locked, or the dialog can still
+    /// be answered, so a command for that start may still act, and a pmset
+    /// it already started can turn sleep off after the undo. The start's
+    /// `expires` only stops commands that have not begun. The undo is held
+    /// too when the receipt shows its command never turned sleep off and no
+    /// earlier restore is owed: a SleepDisabled 1 now may be another
+    /// tool's. A start that may have written, or one that never wrote
+    /// behind a restore an earlier session owes, runs the undo and keeps
+    /// the entry with the record (`restoreAll`). The restore an earlier
+    /// session owes stays journaled while it is held, and runs once the
+    /// start is settled.
+    private func keepAttempt(_ attempt: SleepOffAttempt, _ verdict: SleepOffVerdict, because why: String) {
         attemptProblem = why
-        guard !attempt.owedBefore else {
-            attemptHold = nil
-            return
-        }
         switch verdict {
         case .neverWrote:
-            attemptHold = "the receipt shows that the command behind that start's dialog never turned sleep off and no earlier restore is owed, but \(why)"
+            attemptHold = attempt.owedBefore ? nil : "the receipt shows that the command behind that start's dialog never turned sleep off and no earlier restore is owed, but \(why)"
         case .mayHaveWritten:
             attemptHold = nil
         case .undecided:
-            attemptHold = over ? nil : why
+            attemptHold = why
         }
     }
 
-    /// Under `held`: gives `attempt`'s claim back, then runs `write`, which
-    /// drops the record from the journal. A `write` that fails takes the
-    /// claim back, so the receipt's line still shows the same thing at the
-    /// next settlement. Returns nil once written, or why not, saying what
-    /// was done.
-    private func publishSettlement(of attempt: SleepOffAttempt, under held: SleepOffReceipts.Guard, _ write: () throws -> Void) -> String? {
-        let gaveBack: Bool
+    /// A settlement published its decision but could not give the claim
+    /// back or remove the record (`SettlementPublication.pending`). The
+    /// settled record adds nothing to undo and holds nothing back; it only
+    /// refuses new starts until a later run finishes it.
+    private func settlementPending(_ why: String) {
+        attemptProblem = "it is settled, but \(why)"
+        attemptHold = nil
+    }
+
+    /// How far `publishSettlement` got.
+    private enum SettlementPublication {
+        /// Published, the claim given back and the record removed.
+        case done
+        /// Nothing was written: the record stays unsettled, the claim
+        /// held, and the receipt's line still shows the same thing next
+        /// time. The reason.
+        case notPublished(String)
+        /// The decision is in the journal (`SleepOffAttempt.settled`), but
+        /// the claim could not be given back or the settled record could
+        /// not be removed. The next transaction, backstop.sh or
+        /// uninstall.sh finishes it without reading the receipt again. The
+        /// reason.
+        case pending(String)
+    }
+
+    /// Under `held`: runs `write`, which journals the decision with
+    /// `attempt` marked settled, then gives the claim back and removes the
+    /// record (`finishSettlement`). The claim stays held until the
+    /// decision is on disk, so no start from another Insomnia folder can
+    /// add receipt lines that would make the receipt show something else
+    /// before the decision is kept: a crash or a failure at any point
+    /// leaves either the record unsettled with its claim, or the decision.
+    private func publishSettlement(of attempt: SleepOffAttempt, under held: SleepOffReceipts.Guard, _ write: (SleepOffAttempt) throws -> Void) -> SettlementPublication {
+        var settled = attempt
+        settled.settled = true
         do {
-            gaveBack = try receipts.release(attempt.nonce, under: held)
+            try write(settled)
         } catch {
-            return "the receipt's claim could not be given back (\(error.localizedDescription))"
+            return .notPublished("the journal could not be updated (\(error.localizedDescription))")
+        }
+        return finishSettlement(of: settled, under: held)
+    }
+
+    /// Under `held`: gives a settled record's claim back, when the release
+    /// file still shows it held, then removes the record.
+    private func finishSettlement(of attempt: SleepOffAttempt, under held: SleepOffReceipts.Guard) -> SettlementPublication {
+        do {
+            try receipts.release(attempt.nonce, under: held)
+        } catch {
+            return .pending("its claim on the receipt could not be given back (\(error.localizedDescription))")
         }
         do {
-            try write()
-            return nil
+            try journal { $0.sleepOffAttempt = nil }
         } catch {
-            var why = "the journal could not be updated (\(error.localizedDescription))"
-            if gaveBack {
-                do {
-                    try receipts.writeRelease(.held(attempt.nonce))
-                } catch {
-                    why += "; the receipt's claim, given back first, could not be taken again (\(error.localizedDescription)), so a start from another Insomnia folder may replace the line the settlement read, which then shows nothing"
-                }
-            }
-            return why
+            return .pending("its settled record could not be removed from the journal (\(error.localizedDescription))")
         }
+        return .done
+    }
+
+    /// With no session in memory, deletes session.json when it is the one
+    /// `attempt` wrote (its end is the start's deadline): that session
+    /// never began, and it must go before the settlement is published so
+    /// it is never resumed because a SleepDisabled 1 someone else set reads
+    /// as still off. Returns whether it deleted it.
+    private func removeSessionOfUnfinishedStart(_ attempt: SleepOffAttempt) throws -> Bool {
+        guard session == nil, let s = try? store.loadSession(), Self.seconds(s.endsAt) == attempt.deadline else { return false }
+        try store.deleteSession()
+        Log.info("removed session.json of a start that never finished")
+        return true
     }
 
     /// Settles the start the journal still records (`sleepOffAttempt`)
@@ -3509,63 +3573,68 @@ final class SessionManager {
     /// since. Runs at the top of every transaction, whatever happened to
     /// the marker.
     ///
+    /// A record already settled is only finished (`finishSettledAttempt`).
     /// Undecided (`SleepOffVerdict.undecided`: its dialog can still be
     /// answered, or the receipt stays locked or cannot be locked) keeps
-    /// everything, the record, the entry, session.json and the claim, and
-    /// the next transaction reads the receipt again. Otherwise that start
-    /// never finished, so its session never began: with no session in
-    /// memory, its session.json (its end is the start's deadline) goes
-    /// first, so it is never resumed because a SleepDisabled 1 someone
-    /// else set reads as still off. Then the claim goes back and the
-    /// journal drops the record: with the sleep entry from before the start
-    /// when no command for it turned sleep off, which keeps a restore an
-    /// earlier session still owes, and with the entry kept otherwise, so
-    /// the restore runs like any other. A removal or write that fails
-    /// keeps the record (`publishSettlement` takes the claim back), so the
-    /// receipt's line still shows the same thing next time: reconcile ends
-    /// an unexpired session rather than resume it, starts are refused, the
-    /// menu says what was removed, and the next transaction tries again.
+    /// everything, the record, the entry, session.json and the claim, holds
+    /// the sleep undo (`keepAttempt`), and the next transaction reads the
+    /// receipt again. Otherwise that start never finished, so its session
+    /// never began: its session.json goes first
+    /// (`removeSessionOfUnfinishedStart`). Then the journal records the
+    /// decision with the record marked settled: the sleep entry from before
+    /// the start when no command for it turned sleep off, which keeps a
+    /// restore an earlier session still owes, and the entry kept
+    /// otherwise, so the restore runs like any other. Only then does the
+    /// claim go back and the record go. A removal or write that fails
+    /// before the decision is published keeps the record unsettled with its
+    /// claim, so the receipt's line still shows the same thing next time:
+    /// reconcile ends an unexpired session rather than resume it, starts
+    /// are refused, the menu says what was removed, and the next
+    /// transaction tries again.
     private func settleSleepOffAttempt() async {
         attemptProblem = nil
         attemptHold = nil
         guard let attempt = state.sleepOffAttempt else { return }
+        if attempt.isSettled {
+            await finishSettledAttempt(attempt)
+            return
+        }
         let outcome = await lockReceipt()
         defer { if case let .success(held) = outcome { held.release() } }
         let now = Self.seconds(clock())
         let verdict = receipts.verdict(for: attempt, lock: outcome, now: now)
-        let over = now >= attempt.expires
         let held: SleepOffReceipts.Guard
         switch (verdict, outcome) {
         case let (.undecided(why), _):
-            keepAttempt(attempt, verdict, over: over, because: why)
+            keepAttempt(attempt, verdict, because: why)
             Log.info("an earlier start is not settled yet: \(why)")
             return
         case let (_, .failure(error)):
             let why = "the receipt could not be locked to give that start's claim back (\(error.localizedDescription))"
-            keepAttempt(attempt, verdict, over: over, because: why)
+            keepAttempt(attempt, verdict, because: why)
             fail("could not settle an earlier start: \(why). Nothing was removed; starts are refused, and every run tries again")
             return
         case let (_, .success(g)):
             held = g
         }
         var removed = ""
-        if session == nil, let s = try? store.loadSession(), Self.seconds(s.endsAt) == attempt.deadline {
-            do {
-                try store.deleteSession()
-                removed = "; session.json of that start was removed"
-                Log.info("removed session.json of a start that never finished")
-            } catch {
-                let why = "session.json of that start could not be removed (\(error.localizedDescription))"
-                keepAttempt(attempt, verdict, over: over, because: why)
-                fail("could not settle an earlier start: \(why). Nothing was removed; its session is ended rather than resumed, starts are refused, and every run tries again")
-                return
-            }
+        do {
+            if try removeSessionOfUnfinishedStart(attempt) { removed = "; session.json of that start was removed" }
+        } catch {
+            let why = "session.json of that start could not be removed (\(error.localizedDescription))"
+            keepAttempt(attempt, verdict, because: why)
+            fail("could not settle an earlier start: \(why). Nothing was removed; its session is ended rather than resumed, starts are refused, and every run tries again")
+            return
         }
-        var settled = state
-        settled.sleepOffAttempt = nil
-        settled.sleepDisabledByUs = verdict == .neverWrote ? attempt.owedBefore : true
-        if let why = publishSettlement(of: attempt, under: held, { try persistState(settled) }) {
-            keepAttempt(attempt, verdict, over: over, because: why + removed)
+        let owes = verdict == .neverWrote ? attempt.owedBefore : true
+        let published = publishSettlement(of: attempt, under: held) { settled in
+            var s = state
+            s.sleepOffAttempt = settled
+            s.sleepDisabledByUs = owes
+            try persistState(s)
+        }
+        if case let .notPublished(why) = published {
+            keepAttempt(attempt, verdict, because: why + removed)
             fail("could not settle an earlier start: \(why)\(removed). The start stays recorded, starts are refused, and every run tries again")
             return
         }
@@ -3575,13 +3644,48 @@ final class SessionManager {
         case let .mayHaveWritten(reason), let .undecided(reason):
             Log.info("settled an earlier start as one that may have turned sleep off (\(reason)); the sleep entry stays")
         }
+        if case let .pending(why) = published {
+            settlementPending(why)
+            fail("settled an earlier start, but \(why)\(removed). Its record stays in the journal, marked settled, starts are refused, and every run tries again")
+        }
     }
 
-    /// After sleep was turned off for `attempt`: gives the claim back
-    /// under the receipt's lock and drops the record, keeping the sleep
-    /// entry. Whatever fails leaves the record (and the claim) for the
-    /// next transaction, whose settlement finds this start's `writing` and
-    /// keeps the entry.
+    /// Finishes a settlement whose decision is already in the journal:
+    /// under the receipt's lock, the claim goes back and the record goes.
+    /// The receipt is not read again. Once the claim went back, later
+    /// starts' lines may make it show something else, so only the
+    /// published decision counts.
+    private func finishSettledAttempt(_ attempt: SleepOffAttempt) async {
+        let held: SleepOffReceipts.Guard
+        switch await lockReceipt() {
+        case let .success(g):
+            held = g
+        case let .failure(error):
+            let why = "the receipt could not be locked to give its claim back (\(error.localizedDescription))"
+            settlementPending(why)
+            if error is SleepOffReceipts.Busy {
+                Log.info("an earlier start is settled, but \(why)")
+            } else {
+                fail("an earlier start is settled, but \(why). Its record stays in the journal, starts are refused, and every run tries again")
+            }
+            return
+        }
+        defer { held.release() }
+        if case let .pending(why) = finishSettlement(of: attempt, under: held) {
+            settlementPending(why)
+            fail("an earlier start is settled, but \(why). Its record stays in the journal, starts are refused, and every run tries again")
+            return
+        }
+        Log.info("finished an earlier start's settlement: its claim on the receipt was given back and its record removed")
+    }
+
+    /// After sleep was turned off for `attempt`: under the receipt's lock,
+    /// marks the record settled, gives the claim back and drops the
+    /// record, keeping the sleep entry. A lock or write that fails before
+    /// the record is marked leaves it unsettled with its claim for the next
+    /// transaction, whose settlement finds this start's `writing` and keeps
+    /// the entry. One that fails after leaves the settled record for the
+    /// next transaction to finish.
     private func finishAttempt(_ attempt: SleepOffAttempt) async {
         let held: SleepOffReceipts.Guard
         switch await lockReceipt() {
@@ -3592,38 +3696,64 @@ final class SessionManager {
             return
         }
         defer { held.release() }
-        if let why = publishSettlement(of: attempt, under: held, { try journal { $0.sleepOffAttempt = nil } }) {
+        switch publishSettlement(of: attempt, under: held, { settled in try journal { $0.sleepOffAttempt = settled } }) {
+        case .done:
+            break
+        case let .notPublished(why):
             Log.error("could not clear the start's record: \(why); the next run settles it and keeps the sleep entry")
+        case let .pending(why):
+            settlementPending(why)
+            Log.error("the start's record is settled, but \(why); the next run finishes it")
         }
     }
 
     /// Rolls back a start whose command cannot have turned sleep off: no
     /// dialog was shown, or it ended with nothing to undo
-    /// (`AdministratorPromptError.nothingToUndo`). Under the receipt's lock
-    /// the claim goes back first, then the journal and session.json go back
-    /// exactly as they were. Returns whether they did. A lock, claim or
-    /// journal write that fails keeps the record and the claim, and only
-    /// session.json goes back: the next settlement finishes the rest. No
-    /// pmset runs for that record unless an earlier restore is owed
-    /// (`attemptHold`), and starts are refused until it is settled.
+    /// (`AdministratorPromptError.nothingToUndo`). session.json goes back
+    /// first, then under the receipt's lock the journal goes back exactly
+    /// as it was, with the record marked settled, and only then does the
+    /// claim go back and the record go. Returns whether the journal and
+    /// session.json went back. A session.json, lock or journal write that
+    /// fails keeps the record unsettled with its claim, so the next
+    /// settlement finishes the rest; no pmset runs for it unless an
+    /// earlier restore is owed (`attemptHold`), and starts are refused
+    /// until then. A claim or record removal that fails after that leaves
+    /// the settled record for the next run to finish.
     @discardableResult
     private func abandonStart(_ attempt: SleepOffAttempt, journal before: RuntimeState, session previous: Session?) async -> Bool {
         attemptProblem = nil
         attemptHold = nil
         let why: String
+        do {
+            try putBackSessionFile(previous)
+        } catch {
+            why = "session.json could not be put back as it was (\(error.localizedDescription))"
+            keepAttempt(attempt, .neverWrote, because: why)
+            fail("the failed start stays recorded in the journal: \(why). No pmset runs for it\(attempt.owedBefore ? " beyond the restore an earlier session owes" : ""), its session is ended rather than resumed, starts are refused, and every run tries again")
+            return false
+        }
         switch await lockReceipt() {
         case let .success(held):
             defer { held.release() }
-            guard let failed = publishSettlement(of: attempt, under: held, { try persistState(before) }) else {
-                restoreSessionFile(previous)
-                return true
+            let published = publishSettlement(of: attempt, under: held) { settled in
+                var s = before
+                s.sleepOffAttempt = settled
+                try persistState(s)
             }
-            why = failed
+            switch published {
+            case .done:
+                return true
+            case let .pending(failed):
+                settlementPending(failed)
+                fail("the failed start was rolled back, but \(failed). Its record stays in the journal, marked settled, starts are refused, and every run tries again")
+                return true
+            case let .notPublished(failed):
+                why = failed
+            }
         case let .failure(error):
             why = "the receipt could not be locked to give this start's claim back (\(error.localizedDescription))"
         }
-        keepAttempt(attempt, .neverWrote, over: true, because: why)
-        restoreSessionFile(previous)
+        keepAttempt(attempt, .neverWrote, because: why)
         fail("the failed start stays recorded in the journal: \(why). session.json was put back as it was. No pmset runs for it\(attempt.owedBefore ? " beyond the restore an earlier session owes" : ""), starts are refused, and every run tries again")
         return false
     }
@@ -3660,12 +3790,14 @@ final class SessionManager {
     /// A receipt that shows no command for the start turned sleep off rolls
     /// it back like a refusal (`abandonStart`), and no pmset runs, so a
     /// SleepDisabled 1 another tool set while the dialog was up stays. One
-    /// that may have gives the claim back, drops the record and undoes the
+    /// that may have removes the start's session.json, publishes the
+    /// settlement, gives the claim back, drops the record and undoes the
     /// start like an end. Undecided keeps the record and the claim and
-    /// ends the start without an undo (`attemptHold`) while the dialog can
-    /// still be answered, with one after that: the session never begins,
-    /// starts are refused, and the next transaction, or backstop.sh, which
-    /// the end arms, settles it.
+    /// ends the start with the sleep undo held (`attemptHold`), however
+    /// long the receipt stays locked: a command for that start may still
+    /// be running pmset. The session never begins, starts are refused,
+    /// and the next transaction, or backstop.sh, which the end arms,
+    /// settles it and restores sleep then.
     private func endFailedStart(_ attempt: SleepOffAttempt, dialogOver: Bool, journal before: RuntimeState, session previous: Session?, error: String) async {
         attemptProblem = nil
         attemptHold = nil
@@ -3680,7 +3812,6 @@ final class SessionManager {
             now = Self.seconds(clock())
             verdict = receipts.verdict(for: attempt, lock: outcome, now: now, dialogOver: dialogOver)
         }
-        let over = dialogOver || now >= attempt.expires
         switch verdict {
         case .neverWrote:
             if case let .success(held) = outcome { held.release() }
@@ -3692,18 +3823,32 @@ final class SessionManager {
             Log.info("the failed start is undone like an end: \(reason)")
             switch outcome {
             case let .success(held):
-                if let why = publishSettlement(of: attempt, under: held, { try journal { $0.sleepOffAttempt = nil } }) {
-                    keepAttempt(attempt, verdict, over: over, because: why)
+                defer { held.release() }
+                do {
+                    _ = try removeSessionOfUnfinishedStart(attempt)
+                } catch {
+                    let why = "session.json of that start could not be removed (\(error.localizedDescription))"
+                    keepAttempt(attempt, verdict, because: why)
                     Log.error("the failed start stays recorded: \(why); the end below restores sleep and keeps the entry")
+                    break
                 }
-                held.release()
+                switch publishSettlement(of: attempt, under: held, { settled in try journal { $0.sleepOffAttempt = settled } }) {
+                case .done:
+                    break
+                case let .notPublished(why):
+                    keepAttempt(attempt, verdict, because: why)
+                    Log.error("the failed start stays recorded: \(why); the end below restores sleep and keeps the entry")
+                case let .pending(why):
+                    settlementPending(why)
+                    Log.error("the failed start is settled, but \(why); the end below restores sleep, and the next run finishes the settlement")
+                }
             case let .failure(error):
-                keepAttempt(attempt, verdict, over: over, because: "the receipt could not be locked to give the start's claim back (\(error.localizedDescription))")
+                keepAttempt(attempt, verdict, because: "the receipt could not be locked to give the start's claim back (\(error.localizedDescription))")
             }
         case let .undecided(why):
             if case let .success(held) = outcome { held.release() }
-            keepAttempt(attempt, verdict, over: over, because: why)
-            fail("could not disable sleep: \(error). The start is not settled yet: \(why). It stays recorded, starts are refused until it is settled, and \(over ? "sleep is restored now and again once it is" : "nothing is undone before then")")
+            keepAttempt(attempt, verdict, because: why)
+            fail("could not disable sleep: \(error). The start is not settled yet: \(why). It stays recorded, starts are refused until it is settled, and sleep is left as it is until then, since a command for that start may still be running")
         }
         _ = await performEnd(reason: .startFailed)
     }

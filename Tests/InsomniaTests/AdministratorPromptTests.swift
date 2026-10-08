@@ -482,9 +482,10 @@ final class RootCommandTests: XCTestCase {
         return ["-V", "-k -n -l", "-k -n -ll /usr/bin/pmset -a disablesleep 0"].flatMap { [asUser + $0, $0] }
     }
 
-    /// Every pmset call of a command that turns sleep off: its read, then
-    /// its only write.
-    private let allCalls = ["-g", "-a disablesleep 1"]
+    /// Every pmset call of a command that turns sleep off: its read, its
+    /// read again once its record is written (round 25 F7), then its only
+    /// write.
+    private let allCalls = ["-g", "-g", "-a disablesleep 1"]
 
     /// Every sudo call of a command that gets past the questions: only
     /// those. Root writes the receipt itself, and nothing writes the marker.
@@ -500,7 +501,7 @@ final class RootCommandTests: XCTestCase {
         XCTAssertEqual(r.sudoCalls, throughTheRecord)
         XCTAssertEqual(r.envCalls, ["-V", "-k -n -l", "-k -n -ll /usr/bin/pmset -a disablesleep 0"].map { "-i LC_ALL=C /usr/bin/sudo " + $0 })
         XCTAssertEqual(r.pmsetCalls, allCalls)
-        XCTAssertEqual(r.pmsetAs, ["root", "root"])
+        XCTAssertEqual(r.pmsetAs, ["root", "root", "root"])
         XCTAssertEqual(r.sleepDisabled, "1")
         XCTAssertEqual(try String(contentsOf: marker, encoding: .utf8), nonce1, "lockf -k leaves the file, and nothing writes it")
         XCTAssertEqual(receipt, line(nonce1, "writing"), "the receipt records the start before its write")
@@ -519,7 +520,7 @@ final class RootCommandTests: XCTestCase {
         let r = try runRootCommand(marker: marker, nonce: nonce1, receipts: receipts, in: dir)
         XCTAssertEqual(r.status, 0, r.stderr)
         XCTAssertEqual(r.sudoCalls.filter { !$0.hasPrefix("-n -u ") }, ["-V", "-k -n -l", "-k -n -ll " + endLine], "each of the user's sudo calls lists or prints a version; none runs a command")
-        XCTAssertEqual(r.pmsetAs, ["root", "root"], "no pmset runs as the user")
+        XCTAssertEqual(r.pmsetAs, ["root", "root", "root"], "no pmset runs as the user")
     }
 
     /// Every policy but the rule makes the command exit 5 before it reads
@@ -761,14 +762,14 @@ final class RootCommandTests: XCTestCase {
     /// The command (the embedded copy unless given), started 100 s before
     /// `fakeDeadline` on a fake clock that reads `later` once the call `at`
     /// has answered.
-    private func runOnFakeClock(at: String, later: Int, command: String? = nil, policy: RootSudoPolicy = .rule, sleepDisabled: String = "0", owned: String = "0", foreignAfter: String? = nil) throws -> RootCommandRun {
+    private func runOnFakeClock(at: String, later: Int, command: String? = nil, policy: RootSudoPolicy = .rule, sleepDisabled: String = "0", owned: String = "0", foreignAfter: String? = nil, foreignAfterCall: Int = 1) throws -> RootCommandRun {
         try Data(nonce1.utf8).write(to: marker)
         resetReceipt()
         return try runRootCommand(
             marker: marker, nonce: nonce1, expires: String(fakeDeadline), policy: policy,
             command: command ?? appleScriptEmbeddedRootCommand(),
             clock: RootCommandClock(start: fakeDeadline - 100, later: later, at: at),
-            sleepDisabled: sleepDisabled, owned: owned, foreignAfter: foreignAfter, receipts: receipts, in: dir)
+            sleepDisabled: sleepDisabled, owned: owned, foreignAfter: foreignAfter, foreignAfterCall: foreignAfterCall, receipts: receipts, in: dir)
     }
 
     /// Control: whichever call takes the time, when it ends a second
@@ -787,10 +788,12 @@ final class RootCommandTests: XCTestCase {
     /// session: sudo may wait on a directory service, pmset on powerd.
     /// Before, the clock was read before the last `pmset -g`, so a read
     /// that ended at the deadline or later was still followed by the
-    /// write. The clock is now read after the questions and again after
-    /// the read, right before the write. When the deadline comes during
-    /// any of them, at its very second or after, the command writes
-    /// nothing, and reads nothing after it.
+    /// write. The clock is now read after the questions and again right
+    /// before the write, after the record and the second read. When the
+    /// deadline comes during any of them, at its very second or after, the
+    /// command writes nothing; after the questions it reads nothing more,
+    /// and after the first read it reads once more (its second read, which
+    /// finds nothing here) and then stops.
     func testWritesNothingWhenTheDeadlineComesDuringAnyCallBeforeTheWrite() throws {
         for at in slowCalls {
             for later in [fakeDeadline, fakeDeadline + 1, fakeDeadline + 86_400] {
@@ -801,7 +804,7 @@ final class RootCommandTests: XCTestCase {
                     XCTAssertEqual(r.sudoCalls, queries, label)
                     XCTAssertEqual(try String(contentsOf: marker, encoding: .utf8), nonce1, "\(label): nothing writes the marker")
                     XCTAssertEqual(receipt, at == RootCommandProcess.read ? line(nonce1, "refused") : SleepOffReceipts.initialContent, "\(label): a deadline after the receipt's write leaves this nonce refused")
-                    XCTAssertEqual(r.pmsetCalls, at == RootCommandProcess.read ? ["-g"] : [], label)
+                    XCTAssertEqual(r.pmsetCalls, at == RootCommandProcess.read ? ["-g", "-g"] : [], label)
                     XCTAssertEqual(r.sleepDisabled, "0", label)
                     let says = at == RootCommandProcess.read
                         ? "the start this password was for timed out, or its session ended, while pmset -g was read; sleep was not turned off"
@@ -1490,23 +1493,28 @@ final class RootCommandTests: XCTestCase {
     }
 
     /// Where another tool's SleepDisabled 1 lands decides whether it
-    /// survives. Each row injects one 1 at one point, on the fake clock,
-    /// through a confirmed restore, a refused one (exit 5) and a deadline
-    /// that passes (exit 4).
+    /// survives. Each row injects one 1 at one point (after the `call`th
+    /// call with that signature), on the fake clock, through a confirmed
+    /// restore, a refused one (exit 5) and a deadline that passes (exit 4).
     ///
-    /// Before root's read (set while the dialog was up, or while sudo is
-    /// asked) the 1 survives every path, because nothing has been written:
-    /// the read stops the command (6), or a refusal or the deadline stops
-    /// it before the read. After the read it does not survive a confirmed
-    /// restore: pmset has no compare-and-set, so a 1 set in the moment
-    /// between root's read of 0 and its write cannot be told from that
-    /// write, and the session's end clears it as Insomnia's own. A
-    /// deadline that comes during that read still stops the write, and
+    /// Before root's first read (set while the dialog was up, or while sudo
+    /// is asked) the 1 survives every path, because nothing has been
+    /// written: the read stops the command (6), or a refusal or the
+    /// deadline stops it before the read. Round 25 F7: set after that read,
+    /// or while the record is written and flushed, it is found by the
+    /// second read, which comes after the record and before the deadline's
+    /// last check: the command writes `refused` over its record and stops
+    /// (6), and the 1 survives. After the second read it does not survive a
+    /// confirmed restore: pmset has no compare-and-set, so a 1 set in the
+    /// moment between root's last read of 0 and its write cannot be told
+    /// from that write, and the session's end clears it as Insomnia's own.
+    /// A deadline that comes during that read still stops the write, and
     /// the 1 stays. These rows record that limit; they do not make it go
     /// away.
     func testWhereAnotherToolsOneLandsDecidesWhetherItSurvives() throws {
         struct Row {
             let at: String?
+            var call = 1
             let initial: String
             let policy: RootSudoPolicy
             let clockAt: String
@@ -1515,7 +1523,7 @@ final class RootCommandTests: XCTestCase {
             let left: String
             let survives: Bool
         }
-        let V = RootCommandProcess.versionQuery, l = RootCommandProcess.listQuery, ll = RootCommandProcess.ruleQuery, g = RootCommandProcess.read
+        let V = RootCommandProcess.versionQuery, l = RootCommandProcess.listQuery, ll = RootCommandProcess.ruleQuery, g = RootCommandProcess.read, w = "perl writing"
         let rows = [
             // Set while the dialog was up.
             Row(at: nil, initial: "1", policy: .rule, clockAt: ll, late: false, status: 6, left: "1", survives: true),
@@ -1528,14 +1536,22 @@ final class RootCommandTests: XCTestCase {
             Row(at: V, initial: "0", policy: .noRule, clockAt: ll, late: false, status: 5, left: "1", survives: true),
             Row(at: ll, initial: "0", policy: .listOnly, clockAt: ll, late: false, status: 5, left: "1", survives: true),
             Row(at: ll, initial: "0", policy: .rule, clockAt: ll, late: true, status: 4, left: "1", survives: true),
-            // Set right after root's read of 0: taken for Insomnia's own.
-            Row(at: g, initial: "0", policy: .rule, clockAt: ll, late: false, status: 0, left: "1", survives: false),
+            // Set right after root's first read of 0, or while its record
+            // is written and flushed: the second read finds it.
+            Row(at: g, initial: "0", policy: .rule, clockAt: ll, late: false, status: 6, left: "1", survives: true),
+            Row(at: w, initial: "0", policy: .rule, clockAt: ll, late: false, status: 6, left: "1", survives: true),
+            // The same, with the deadline coming during the first read: the
+            // second read comes before the deadline's last check.
+            Row(at: g, initial: "0", policy: .rule, clockAt: g, late: true, status: 6, left: "1", survives: true),
+            // Set right after root's second read of 0: taken for
+            // Insomnia's own.
+            Row(at: g, call: 2, initial: "0", policy: .rule, clockAt: ll, late: false, status: 0, left: "1", survives: false),
             // The same, with the deadline coming during that read.
-            Row(at: g, initial: "0", policy: .rule, clockAt: g, late: true, status: 4, left: "1", survives: true),
+            Row(at: g, call: 2, initial: "0", policy: .rule, clockAt: g, late: true, status: 4, left: "1", survives: true),
         ]
         for row in rows {
-            let label = "\(row.at ?? "dialog") \(row.policy) \(row.late ? "late at \(row.clockAt)" : "in time")"
-            let r = try runOnFakeClock(at: row.clockAt, later: row.late ? fakeDeadline : fakeDeadline - 1, policy: row.policy, sleepDisabled: row.initial, foreignAfter: row.at)
+            let label = "\(row.at ?? "dialog") #\(row.call) \(row.policy) \(row.late ? "late at \(row.clockAt)" : "in time")"
+            let r = try runOnFakeClock(at: row.clockAt, later: row.late ? fakeDeadline : fakeDeadline - 1, policy: row.policy, sleepDisabled: row.initial, foreignAfter: row.at, foreignAfterCall: row.call)
             XCTAssertEqual(r.status, row.status, "\(label): \(r.stderr)")
             XCTAssertEqual(r.sleepDisabled, row.left, label)
             XCTAssertEqual(r.pmsetCalls.contains("-a disablesleep 1"), row.status == 0, "\(label): only a confirmed start writes")
@@ -1544,6 +1560,82 @@ final class RootCommandTests: XCTestCase {
             // which the end clears.
             XCTAssertEqual(row.survives, r.status != 0 && r.sleepDisabled == "1", label)
         }
+    }
+
+    // MARK: Round 25 F7: the second read
+
+    /// Another tool's 1 set while the command writes and flushes its
+    /// record, through both copies of the command. The second read, after
+    /// the record and before the write, finds it: the command writes
+    /// `refused` over its record and stops with 6, a refusal, and the 1
+    /// stays. That read failing stops it the same way.
+    func testASettingMadeWhileTheRecordIsWrittenIsLeftAlone() throws {
+        for (name, command) in try bothCommands() {
+            for sets in ["1", "fail"] {
+                let label = "\(name), \(sets)"
+                try Data(nonce1.utf8).write(to: marker)
+                resetReceipt()
+                let r = try runRootCommand(marker: marker, nonce: nonce1, command: command, foreignAfter: "perl writing", foreignSets: sets, receipts: receipts, in: dir)
+                XCTAssertEqual(r.status, 6, "\(label): \(r.stderr)")
+                XCTAssertTrue(OsascriptAdministratorPrompt.refusalStatuses.contains(r.status), label)
+                XCTAssertEqual(r.pmsetCalls, ["-g", "-g"], label)
+                XCTAssertEqual(r.sleepDisabled, sets, "\(label): left alone")
+                XCTAssertEqual(r.perlCalls, ["\(nonce1) \(SleepOffReceipts.zero) writing", "\(nonce1) \(SleepOffReceipts.zero) refused"], label)
+                XCTAssertEqual(receipt, line(nonce1, "refused"), "\(label): a settlement finds the command never turned sleep off")
+                XCTAssertTrue(r.stderr.contains("pmset -g, read again once this start's record was written, shows a SleepDisabled 1 this start did not set, or could not be read; it was left alone and sleep was not turned off"), "\(label): \(r.stderr)")
+            }
+        }
+    }
+
+    /// The limit this leaves: when the `refused` over the record cannot be
+    /// written either, the receipt keeps the record's `writing`. The
+    /// status (6) still says nothing was written, and the app that reads
+    /// it rolls the start back with no undo; a settlement that never sees
+    /// that status (the app died) reads `writing` and undoes the start,
+    /// clearing that 1.
+    func testASecondReadRefusalWhoseRefusedLineCannotBeWrittenLeavesTheRecord() throws {
+        for (name, command) in try bothCommands() {
+            try Data(nonce1.utf8).write(to: marker)
+            resetReceipt()
+            let r = try runRootCommand(marker: marker, nonce: nonce1, command: command, foreignAfter: "perl writing", receipts: receipts, receiptWriteFault: .openFails, refusedReceiptWriteFails: true, in: dir)
+            XCTAssertEqual(r.status, 6, "\(name): \(r.stderr)")
+            XCTAssertEqual(r.pmsetCalls, ["-g", "-g"], name)
+            XCTAssertEqual(r.sleepDisabled, "1", name)
+            XCTAssertEqual(r.perlCalls, ["\(nonce1) \(SleepOffReceipts.zero) writing", "\(nonce1) \(SleepOffReceipts.zero) refused"], name)
+            XCTAssertEqual(receipt, line(nonce1, "writing"), name)
+        }
+    }
+
+    /// The deadline is read again after the second read, right before the
+    /// write: a record whose write and flush end at the deadline's very
+    /// second or later is followed by the second read and then a stop with
+    /// `refused` over the record (4); a second before, the write follows.
+    func testTheDeadlineIsReadAgainAfterTheSecondRead() throws {
+        for later in [fakeDeadline - 1, fakeDeadline, fakeDeadline + 1] {
+            let r = try runOnFakeClock(at: "perl writing", later: later)
+            let label = "\(later - fakeDeadline) s from the deadline"
+            if later < fakeDeadline {
+                XCTAssertEqual(r.status, 0, "\(label): \(r.stderr)")
+                XCTAssertEqual(r.pmsetCalls, allCalls, label)
+                XCTAssertEqual(receipt, line(nonce1, "writing"), label)
+            } else {
+                XCTAssertEqual(r.status, 4, "\(label): \(r.stderr)")
+                XCTAssertEqual(r.pmsetCalls, ["-g", "-g"], label)
+                XCTAssertEqual(r.sleepDisabled, "0", label)
+                XCTAssertEqual(receipt, line(nonce1, "refused"), label)
+                XCTAssertTrue(r.stderr.contains("the start this password was for timed out, or its session ended, while pmset -g was read; sleep was not turned off"), "\(label): \(r.stderr)")
+            }
+        }
+    }
+
+    /// A 1 the journal owns skips both reads: the command reads nothing and
+    /// writes, whatever another tool does meanwhile.
+    func testAJournalOwnedSettingSkipsBothReads() throws {
+        try Data(nonce1.utf8).write(to: marker)
+        let r = try runRootCommand(marker: marker, nonce: nonce1, sleepDisabled: "1", owned: "1", foreignAfter: "perl writing", foreignSets: "fail", receipts: receipts, in: dir)
+        XCTAssertEqual(r.status, 0, r.stderr)
+        XCTAssertEqual(r.pmsetCalls, ["-a disablesleep 1"])
+        XCTAssertEqual(receipt, line(nonce1, "writing"))
     }
 }
 
@@ -2737,7 +2829,7 @@ final class SleepPromptLifecycleTests: XCTestCase {
         XCTAssertEqual(TestReceipts.release(h.receipts), "\(pending.nonce) held\n")
         let err = try XCTUnwrap(m.lastError)
         XCTAssertTrue(err.contains("The start is not settled yet"), err)
-        XCTAssertTrue(err.contains("nothing is undone before then"), err)
+        XCTAssertTrue(err.contains("sleep is left as it is until then, since a command for that start may still be running"), err)
 
         h.prompt.mode = .succeed
         await m.start(duration: 1800)
@@ -2934,7 +3026,7 @@ final class SleepPromptLifecycleTests: XCTestCase {
 
         command.release()
         let r = command.wait()
-        XCTAssertEqual(r.pmsetCalls, ["-g", "-a disablesleep 1"])
+        XCTAssertEqual(r.pmsetCalls, ["-g", "-g", "-a disablesleep 1"])
         h.guardFake.sleepDisabled = true
         await m.reconcile()
 
@@ -3342,8 +3434,9 @@ final class StartOwnershipEndToEndTests: XCTestCase {
         XCTAssertEqual(h.notifier.posts.last?.title, "Session not started", file: file, line: line)
     }
 
-    /// Control: the command asks sudo its three questions, reads sleep on
-    /// and turns it off once; the end turns it back on.
+    /// Control: the command asks sudo its three questions, reads sleep on,
+    /// reads it again once its record is written, and turns it off once;
+    /// the end turns it back on.
     func testStartTurnsSleepOffAndTheEndTurnsItBackOn() async throws {
         let fake = try machine()
         let m = h.makeManager(sleepGuard: fake.sleepGuard())
@@ -3351,7 +3444,7 @@ final class StartOwnershipEndToEndTests: XCTestCase {
 
         XCTAssertTrue(m.isActive, m.lastError ?? "")
         XCTAssertEqual(fake.script, AdministratorPrompt.disableSleepScript)
-        XCTAssertEqual(fake.pmsetCalls(), ["-g", "-g", "-a disablesleep 1"], "Start's read, then the command's read and its write")
+        XCTAssertEqual(fake.pmsetCalls(), ["-g", "-g", "-g", "-a disablesleep 1"], "Start's read, then the command's two reads and its write")
         XCTAssertEqual(fake.sudoCalls(), queries)
         XCTAssertEqual(receipt(fake), "N Z writing\n")
         XCTAssertEqual(fake.sleepDisabled, "1")
@@ -3443,14 +3536,15 @@ final class StartOwnershipEndToEndTests: XCTestCase {
     /// Round 17 R3, end to end: the session's end comes while root reads
     /// `pmset -g`, at its very second or later. Before, the clock was read
     /// before that read, and the write followed it. Now the clock is read
-    /// again right before the write, which does not happen.
+    /// again right before the write, after the record and the second read,
+    /// and the write does not happen.
     func testAnEndDuringRootsReadWritesNothing() async throws {
         for later in [now + 60, now + 90] {
             let fake = try machine("machine-\(later - now)", clockLater: later, clockAt: RootCommandProcess.read)
             let m = h.makeManager(sleepGuard: fake.sleepGuard())
             await m.start(duration: 60)
 
-            XCTAssertEqual(fake.pmsetCalls(), ["-g", "-g"], "\(later - now) s")
+            XCTAssertEqual(fake.pmsetCalls(), ["-g", "-g", "-g"], "\(later - now) s")
             XCTAssertEqual(fake.sudoCalls(), queries, "\(later - now) s")
             XCTAssertEqual(receipt(fake), "N Z refused\n", "\(later - now) s: the record, then the refusal over it")
             XCTAssertEqual(fake.sleepDisabled, "0", "\(later - now) s")
@@ -3519,31 +3613,51 @@ final class StartOwnershipEndToEndTests: XCTestCase {
         XCTAssertFalse(fake.sudoCalls().contains("-n /usr/bin/pmset -a disablesleep 0"), "the app ran an undo")
     }
 
+    /// Round 25 F7, end to end. Another tool sets 1 right after the
+    /// command's first read found 0: its second read, once its record is
+    /// written, finds it, the command writes `refused` over its record and
+    /// stops with 6, and the start is rolled back with nothing undone, so
+    /// the 1 stays.
+    ///
     /// The limit, end to end. Another tool sets 1 right after the
-    /// command's own read found 0. pmset has no compare-and-set, so the
+    /// command's second read found 0. pmset has no compare-and-set, so the
     /// write that follows cannot be told from it: the start goes on, that
     /// 1 is journaled as Insomnia's, and the end clears it. When the
     /// session's end comes during that read, the write does not follow,
     /// and the 1 stays.
     func testASettingMadeRightAfterTheCommandsReadIsClearedOnlyWhenTheWriteFollows() async throws {
+        let first = try machine("machine-first")
+        first.foreignAfter = RootCommandProcess.read
+        let m0 = h.makeManager(sleepGuard: first.sleepGuard())
+        await m0.start(duration: 1800)
+
+        XCTAssertNil(first.foreignAfter, "the other tool's 1 was set")
+        XCTAssertEqual(first.pmsetCalls(), ["-g", "-g", "-g"])
+        XCTAssertEqual(receipt(first), "N Z refused\n")
+        XCTAssertEqual(first.sleepDisabled, "1", "the second read found it")
+        try assertRolledBackWithNothingUndone(m0, first, status: 6)
+
         let fake = try machine()
         fake.foreignAfter = RootCommandProcess.read
+        fake.foreignAfterCall = 2
         let m = h.makeManager(sleepGuard: fake.sleepGuard())
         await m.start(duration: 1800)
 
         XCTAssertTrue(m.isActive, m.lastError ?? "")
         XCTAssertNil(fake.foreignAfter, "the other tool's 1 was set")
-        XCTAssertEqual(fake.pmsetCalls(), ["-g", "-g", "-a disablesleep 1"])
+        XCTAssertEqual(fake.pmsetCalls(), ["-g", "-g", "-g", "-a disablesleep 1"])
         await m.end(reason: .user)
         XCTAssertEqual(fake.sleepDisabled, "0", "the end cleared it")
 
         let late = try machine("machine-late", clockLater: now + 90, clockAt: RootCommandProcess.read)
         late.foreignAfter = RootCommandProcess.read
+        late.foreignAfterCall = 2
         let m2 = h.makeManager(sleepGuard: late.sleepGuard())
         await m2.start(duration: 60)
 
         XCTAssertNil(late.foreignAfter, "the other tool's 1 was set")
-        XCTAssertEqual(late.pmsetCalls(), ["-g", "-g"])
+        XCTAssertEqual(late.pmsetCalls(), ["-g", "-g", "-g"])
+        XCTAssertEqual(receipt(late), "N Z refused\n")
         XCTAssertEqual(late.sleepDisabled, "1", "no write followed the read")
         try assertRolledBackWithNothingUndone(m2, late, status: 4)
     }
@@ -3583,14 +3697,15 @@ final class StartOwnershipEndToEndTests: XCTestCase {
         }
     }
 
-    /// The limit that stays: another tool sets 1 right after root's read,
-    /// and the command is stopped after its record, as its write starts.
-    /// The receipt holds this start's `writing`, which cannot show whether
-    /// the write ran, so the start is undone like an end and the other
-    /// tool's 1 is cleared with it.
+    /// The limit that stays: another tool sets 1 right after root's
+    /// second read, and the command is stopped after its record, as its
+    /// write starts. The receipt holds this start's `writing`, which cannot
+    /// show whether the write ran, so the start is undone like an end and
+    /// the other tool's 1 is cleared with it.
     func testACommandStoppedAfterItsRecordIsUndoneEvenBeforeItsWrite() async throws {
         let fake = try machine()
         fake.foreignAfter = RootCommandProcess.read
+        fake.foreignAfterCall = 2
         fake.interruptAt = RootCommandProcess.write
         let m = h.makeManager(sleepGuard: fake.sleepGuard())
         await m.start(duration: 1800)
@@ -3598,7 +3713,7 @@ final class StartOwnershipEndToEndTests: XCTestCase {
         XCTAssertNil(fake.foreignAfter, "the other tool's 1 was set")
         XCTAssertNil(fake.interruptAt, "the command was stopped")
         XCTAssertEqual(receipt(fake), "N Z writing\n")
-        XCTAssertEqual(fake.pmsetCalls(), ["-g", "-g", "-a disablesleep 1", "-a disablesleep 0"], "the write was stopped as it started; then the app's undo")
+        XCTAssertEqual(fake.pmsetCalls(), ["-g", "-g", "-g", "-a disablesleep 1", "-a disablesleep 0"], "the write was stopped as it started; then the app's undo")
         XCTAssertEqual(fake.sudoCalls(), queries + ["-n /usr/bin/pmset -a disablesleep 0"], "the app undid")
         XCTAssertEqual(fake.sleepDisabled, "0", "and cleared the other tool's 1")
         XCTAssertNil(m.session)
