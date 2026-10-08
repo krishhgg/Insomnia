@@ -199,10 +199,20 @@ bounded() { # command args...
 # The call is its only job, so `kill %1` signals the call, and the shell
 # skips a job it has already reaped: a reused pid is never signalled. The
 # status file is written once the call has been reaped.
+# Like backstop.sh's supervisor, it ignores SIGTERM and SIGHUP, so a signal
+# sent to this run's whole process group (a closed terminal, or launchd once
+# a job's main process has gone) does not end it while its call runs. sudo
+# closes its copy of fd 9, so the supervisor may be the only holder of the
+# recovery lock until the call has exited. The call gets back the SIGTERM
+# and SIGHUP actions this script started with, so it still stops on the
+# SIGTERM at its limit or from the group. errexit is off here: a failed
+# write must not end the supervisor while its call runs.
 supervise() { # base command args...
   local base="$1" cpid rc=0 deadline
   shift
-  "$@" </dev/null >"$base.out" 2>&1 &
+  set +e
+  trap '' TERM HUP
+  ( trap - TERM HUP; exec "$@" ) </dev/null >"$base.out" 2>&1 &
   cpid=$!
   echo "$cpid" > "$base.pid"
   deadline=$(( SECONDS + CALL_TIMEOUT_SECONDS ))

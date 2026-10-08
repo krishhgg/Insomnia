@@ -2169,6 +2169,124 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(try helper("install.sh"), try helper("uninstall.sh"))
     }
 
+    /// The shared supervisor gives its call the SIGTERM and SIGHUP actions
+    /// the script started with, though it ignores both itself: the fake
+    /// sudo sends itself each signal from a shell that inherits its actions
+    /// (see "signals-self") and logs "sudo SURVIVED <signal>" only if it
+    /// lives on. A harness started with SIGTERM already ignored cannot give
+    /// the default back, since bash keeps a signal ignored at its start
+    /// ignored, and the fake sees that: a check on the check.
+    func testTheSharedSupervisorGivesItsCallTheDefaultSignalActions() throws {
+        let harness = try boundedHarness()
+        fx.setMode("sudo", "signals-self")
+        for ignoringTerm in [false, true] {
+            fx.clearCalls()
+
+            let r = try fx.run(harness, ignoringTerm: ignoringTerm)
+
+            XCTAssertEqual(r.status, 0, r.stderr)
+            let survived = ignoringTerm ? ["sudo SURVIVED TERM"] : []
+            XCTAssertEqual(fx.calls(), ["sudo -n \(fx.fakePmset) -a disablesleep 0"] + survived + ["sudo SIGNALS-CHECKED", "bounded 0"],
+                           "ignoringTerm \(ignoringTerm)")
+            XCTAssertTrue(try fx.lockIsFree(), "ignoringTerm \(ignoringTerm)")
+        }
+    }
+
+    /// The shared supervisor works alone once its run is gone, as
+    /// backstop.sh's does. The harness holds the recovery lock on fd 9 and
+    /// makes one bounded sudo call; the fake sudo closes its fd 9, as sudo
+    /// does, and logs each SIGTERM and SIGHUP with its sender. The test
+    /// kills the harness with SIGKILL while it waits, then sends SIGTERM,
+    /// SIGHUP and SIGINT to its whole process group. The supervisor
+    /// survives, sends its call SIGTERM at the 3 s limit and never SIGKILL,
+    /// and keeps the lock until the call has exited and it has reaped it:
+    /// only then does it write the call's status. The test signals only the
+    /// harness it posix_spawned as a group leader, and that group, before
+    /// reaping the harness.
+    func testTheSharedSupervisorOutlivesItsRunAndGroupSignalsAndHoldsTheLockUntilItReapsTheCall() throws {
+        let harness = try boundedHarness()
+        fx.setMode("sudo", "drops-fd9-logs-signals")
+
+        let shell = try fx.spawn(harness, ownProcessGroup: true)
+        defer {
+            fx.releaseCommand()
+            shell.wait()
+        }
+        guard let command = fx.hungPid("sudo", within: 10) else {
+            _ = shell.signal(SIGKILL)
+            return XCTFail("the call never started: \(fx.calls())")
+        }
+        guard !shell.hasExited else {
+            return XCTFail("the harness ended before the test could kill it (wait status \(shell.wait())): \(fx.calls())")
+        }
+        XCTAssertEqual(shell.signal(SIGKILL), 0)
+        signalGroupInTurn(shell, receiver: command)
+        let status = shell.wait()
+        XCTAssertEqual(status & 0x7f, SIGKILL, "the harness did not end by SIGKILL (wait status \(status))")
+        XCTAssertFalse(try fx.lockIsFree(), "the supervisor survived the group's signals and holds the lock")
+
+        XCTAssertTrue(waitUntil(15) { self.fx.calls().filter { $0 == "sudo SIGTERM" }.count == 2 },
+                      "one SIGTERM from the group, one from the supervisor at the limit: \(fx.calls())")
+        let senders = try fx.signalSenders(of: command)
+        XCTAssertNotEqual(senders.parent, shell.pid, "the call's parent is the supervisor, not the killed harness")
+        XCTAssertEqual(senders.term.sorted(), [getpid(), senders.parent].sorted(),
+                       "one SIGTERM from this test's signal to the group, one from the supervisor (pid \(senders.parent))")
+        XCTAssertEqual(senders.hup, [getpid()], "the only SIGHUP is this test's signal to the group")
+        XCTAssertEqual(fx.calls().filter { !$0.hasPrefix("sudo SIG") }, ["sudo -n \(fx.fakePmset) -a disablesleep 0"],
+                       "the call had closed fd 9, and the killed harness wrote nothing more")
+        XCTAssertNil(fx.commandEnded(), "never SIGKILLed")
+        XCTAssertEqual(try harnessStatuses(), [], "no status before the call is reaped")
+        XCTAssertFalse(try fx.lockIsFree(), "the supervisor still holds the lock for its live call")
+
+        fx.releaseCommand()
+        try assertLockHeldUntilGone(command, within: 10)
+        XCTAssertEqual(fx.commandEnded(), "released")
+        XCTAssertTrue(waitUntil(5) { (try? self.harnessStatuses()) == ["124"] }, "status after the reap: \(String(describing: try? harnessStatuses()))")
+    }
+
+    /// A script that runs install.sh's bounded() and supervise() on their
+    /// own (testInstallAndUninstallShareTheBoundedCallHelper keeps
+    /// uninstall.sh's the same): it takes the recovery lock on fd 9, makes
+    /// one bounded `sudo -n pmset -a disablesleep 0` through the fake sudo
+    /// with a 3 s limit, and logs "bounded <status>". Its bounded calls
+    /// keep their files in the fixture's harness.* folder.
+    private func boundedHarness() throws -> URL {
+        let text = try String(contentsOf: ScriptFixture.productionScripts.appendingPathComponent("install.sh"), encoding: .utf8)
+        let start = try XCTUnwrap(text.range(of: "\nbounded() {"))
+        let supervise = try XCTUnwrap(text.range(of: "\nsupervise() {", range: start.upperBound..<text.endIndex))
+        let end = try XCTUnwrap(text.range(of: "\n}\n", range: supervise.upperBound..<text.endIndex))
+        let url = fx.root.appendingPathComponent("bounded-harness.sh")
+        try ("""
+        set -euo pipefail
+        SUDO="\(fx.bin.appendingPathComponent("sudo").path)"
+        MKTEMP=/usr/bin/mktemp
+        CALL_TIMEOUT_SECONDS=3
+        WORK="$("$MKTEMP" -d "\(fx.root.path)/harness.XXXXXX")"
+        """ + String(text[start.lowerBound..<end.upperBound]) + """
+        exec 9<>"\(fx.lock.path)"
+        /usr/bin/lockf -t 0 9
+        rc=0
+        bounded "$SUDO" -n "\(fx.fakePmset)" -a disablesleep 0 || rc=$?
+        echo "bounded $rc" >> "\(fx.callsLog.path)"
+
+        """).write(to: url, atomically: true, encoding: .utf8)
+        return url
+    }
+
+    /// The status files boundedHarness's calls have written so far.
+    private func harnessStatuses() throws -> [String] {
+        let fm = FileManager.default
+        var statuses: [String] = []
+        for dir in try fm.contentsOfDirectory(atPath: fx.root.path).filter({ $0.hasPrefix("harness.") }).sorted() {
+            let folder = fx.root.appendingPathComponent(dir)
+            for name in try fm.contentsOfDirectory(atPath: folder.path).filter({ $0.hasSuffix(".rc") }).sorted() {
+                let text = try String(contentsOf: folder.appendingPathComponent(name), encoding: .utf8)
+                statuses.append(text.trimmingCharacters(in: .whitespacesAndNewlines))
+            }
+        }
+        return statuses
+    }
+
     /// An uninstall killed while its `launchctl bootout` does not answer:
     /// the bootout keeps the recovery lock until its supervisor has stopped
     /// it at the limit, so it cannot unload an agent the app loads and
@@ -4003,8 +4121,9 @@ final class RecoveryScriptTests: XCTestCase {
     }
 
     /// The supervisor works alone once its run is gone. The fake sudo closes
-    /// its fd 9, as sudo does, logs every SIGTERM and SIGHUP it gets and
-    /// keeps running. The test kills the backstop shell with SIGKILL while
+    /// its fd 9, as sudo does, logs every SIGTERM and SIGHUP it gets with
+    /// its sender (one perl process, see signalReceiverHere) and keeps
+    /// running. The test kills the backstop shell with SIGKILL while
     /// it waits for the command, then sends SIGTERM, SIGHUP and SIGINT to
     /// the shell's whole process group, the way launchd signals what is
     /// left of a job's process group once the job has exited. The supervisor
@@ -4032,9 +4151,7 @@ final class RecoveryScriptTests: XCTestCase {
             return XCTFail("the backstop ended before the test could kill it (wait status \(shell.wait())): \(fx.log())")
         }
         XCTAssertEqual(shell.signal(SIGKILL), 0)
-        for sig in [SIGTERM, SIGHUP, SIGINT] {
-            XCTAssertEqual(shell.signalGroup(sig), 0, "signal \(sig)")
-        }
+        signalGroupInTurn(shell, receiver: command)
         let status = shell.wait()
         XCTAssertEqual(status & 0x7f, SIGKILL, "the backstop did not end by SIGKILL (wait status \(status))")
 
@@ -4043,6 +4160,11 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(waitUntil(10) { self.statusLines() == ["alive"] }, "the supervisor reached the end of the grace: \(self.statusLines())")
         XCTAssertEqual(fx.calls().filter { $0 == "sudo SIGTERM" }.count, 2, "\(fx.calls())")
         XCTAssertEqual(fx.calls().filter { $0 == "sudo SIGHUP" }.count, 1, "\(fx.calls())")
+        let senders = try fx.signalSenders(of: command)
+        XCTAssertNotEqual(senders.parent, shell.pid, "the command's parent is the supervisor, not the killed shell")
+        XCTAssertEqual(senders.term.sorted(), [getpid(), senders.parent].sorted(),
+                       "one SIGTERM from this test's signal to the group, one from the supervisor (pid \(senders.parent))")
+        XCTAssertEqual(senders.hup, [getpid()], "the only SIGHUP is this test's signal to the group")
         XCTAssertEqual(fx.calls().filter { !$0.hasPrefix("sudo SIG") }, ["sudo -n \(fx.fakePmset) -a disablesleep 0"],
                        "the command had closed fd 9, and nothing else ran")
         XCTAssertNil(fx.commandEnded(), "never SIGKILLed")
@@ -4119,6 +4241,20 @@ final class RecoveryScriptTests: XCTestCase {
         let r = try fx.run(fx.backstop)
         XCTAssertEqual(r.status, 0, r.stderr + fx.log())
         XCTAssertEqual(try fx.backstopFiles(), [])
+    }
+
+    /// Sends SIGTERM, SIGHUP and SIGINT to the process group `shell` leads,
+    /// the way launchd signals what is left of a job's group, one at a
+    /// time: SIGHUP once the fake sudo's receiver `command` has logged the
+    /// SIGTERM, SIGINT once it has logged the SIGHUP. The kernel keeps one
+    /// sender per process: of two signals pending at once, the second is
+    /// delivered with sender 0, so the receiver could not say who sent it.
+    private func signalGroupInTurn(_ shell: ScriptFixture.Spawned, receiver command: pid_t) {
+        XCTAssertEqual(shell.signalGroup(SIGTERM), 0, "SIGTERM")
+        XCTAssertTrue(waitUntil(10) { ((try? self.fx.signalSenders(of: command))?.term.count ?? 0) >= 1 }, "the group's SIGTERM arrived")
+        XCTAssertEqual(shell.signalGroup(SIGHUP), 0, "SIGHUP")
+        XCTAssertTrue(waitUntil(10) { ((try? self.fx.signalSenders(of: command))?.hup.count ?? 0) >= 1 }, "the group's SIGHUP arrived")
+        XCTAssertEqual(shell.signalGroup(SIGINT), 0, "SIGINT")
     }
 
     /// A copy of the fixture's backstop with COMMAND_TIMEOUT_SECONDS set to
@@ -7744,6 +7880,60 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(fx.commandEnded(), "released")
     }
 
+    /// uninstall.sh's root transaction runs through the shared supervisor
+    /// under the recovery lock. Here the fake sudo closes its fd 9, as sudo
+    /// does, removes the rule and then ignores SIGTERM, logging each SIGTERM
+    /// and SIGHUP with its sender. The test kills the uninstall with SIGKILL
+    /// while it waits, then sends SIGTERM, SIGHUP and SIGINT to its whole
+    /// process group. The supervisor survives that, sends sudo its own
+    /// SIGTERM at the 5 s limit and never SIGKILL, and is the one holder of
+    /// the lock until sudo has exited and been reaped. Nothing after the
+    /// transaction ran: the app and the journal stay. The test signals only
+    /// the uninstall it posix_spawned as a group leader, and that group,
+    /// before reaping it.
+    func testUninstallsRootTransactionKeepsTheLockThroughGroupSignalsUntilSudoEnds() throws {
+        try fx.installMachinery()
+        try fx.writeConfig(#"{"agentList":[]}"#)
+        try fx.writeState(Self.cleanJournal)
+        fx.setMode("sudo", "txn-drops-fd9-receives-after")
+
+        let shell = try fx.spawn(fx.uninstall, ownProcessGroup: true)
+        defer {
+            fx.releaseCommand()
+            shell.wait()
+        }
+        guard let command = fx.hungPid("sudo", within: 30) else {
+            _ = shell.signal(SIGKILL)
+            return XCTFail("the transaction never started: \(fx.calls())")
+        }
+        guard !shell.hasExited else {
+            return XCTFail("the uninstall ended before the test could kill it (wait status \(shell.wait())): \(fx.calls())")
+        }
+        XCTAssertEqual(shell.signal(SIGKILL), 0)
+        signalGroupInTurn(shell, receiver: command)
+        let status = shell.wait()
+        XCTAssertEqual(status & 0x7f, SIGKILL, "the uninstall did not end by SIGKILL (wait status \(status))")
+        XCTAssertFalse(try fx.lockIsFree(), "the supervisor survived the group's signals and holds the lock")
+
+        XCTAssertTrue(waitUntil(15) { self.fx.calls().filter { $0 == "sudo SIGTERM" }.count == 2 },
+                      "one SIGTERM from the group, one from the supervisor at the limit: \(fx.calls())")
+        let senders = try fx.signalSenders(of: command)
+        XCTAssertNotEqual(senders.parent, shell.pid, "sudo's parent is the supervisor, not the killed uninstall")
+        XCTAssertEqual(senders.term.sorted(), [getpid(), senders.parent].sorted(),
+                       "one SIGTERM from this test's signal to the group, one from the supervisor (pid \(senders.parent))")
+        XCTAssertEqual(senders.hup, [getpid()], "the only SIGHUP is this test's signal to the group")
+        XCTAssertTrue(fx.calls().contains("sudo TXN-EXITED 0"), "\(fx.calls())")
+        XCTAssertFalse(fx.calls().contains("sudo FD9-OPEN"), "sudo had closed fd 9: \(fx.calls())")
+        XCTAssertNil(fx.commandEnded(), "never SIGKILLed")
+        XCTAssertFalse(try fx.lockIsFree(), "the supervisor still holds the lock for the live sudo")
+
+        fx.releaseCommand()
+        try assertLockHeldUntilGone(command, within: 10)
+        XCTAssertEqual(fx.commandEnded(), "released")
+        XCTAssertTrue(fx.exists(fx.app))
+        XCTAssertTrue(fx.exists(fx.state))
+    }
+
     /// From a checkout, uninstall.sh reads the installed app's
     /// InsomniaResumeFrozenVersion before the recovery lock, with bounded
     /// calls. A read that does not answer, fails, or finds a plist that does
@@ -8316,6 +8506,26 @@ private final class ScriptFixture {
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    /// What the fake sudo's signal receiver `pid` logged (see
+    /// signalReceiverHere): its parent, the supervisor that started it, and
+    /// the sender of each SIGTERM and each SIGHUP it got, in order. A
+    /// sender the kernel did not name is left out, so it shows as a missing
+    /// entry.
+    func signalSenders(of pid: pid_t) throws -> (parent: pid_t, term: [pid_t], hup: [pid_t]) {
+        let text = (try? String(contentsOf: root.appendingPathComponent("signals.log"), encoding: .utf8)) ?? ""
+        let lines = text.split(separator: "\n").map(String.init)
+        let prefix = "ready pid=\(pid) ppid="
+        guard let ready = lines.lastIndex(where: { $0.hasPrefix(prefix) }),
+              let parent = pid_t(lines[ready].dropFirst(prefix.count)) else {
+            throw FixtureError("no readiness line for pid \(pid) in signals.log: \(lines)")
+        }
+        let after = lines[(ready + 1)...]
+        func senders(_ name: String) -> [pid_t] {
+            after.filter { $0.hasPrefix("\(name) from ") }.compactMap { pid_t($0.dropFirst(name.count + 6)) }
+        }
+        return (parent, senders("TERM"), senders("HUP"))
+    }
+
     /// Polls until the recovery lock is free; false after `seconds`.
     func waitUntilLockIsFree(_ seconds: Double = 15) throws -> Bool {
         let deadline = Date(timeIntervalSinceNow: seconds)
@@ -8642,7 +8852,9 @@ private final class ScriptFixture {
         // then exits 143, as a sudo killed by SIGTERM; "txn-hangs-after"
         // runs it and then does not answer until SIGTERM;
         // "txn-ignores-term-after" runs it and then ignores SIGTERM until
-        // the test releases it.
+        // the test releases it; "txn-drops-fd9-receives-after" closes its
+        // fd 9 the way sudo does, runs it and then waits in
+        // signalReceiverHere's receiver until the test releases it.
         // Mode "rule-not-effective": authentication passes and the rule is
         // installed, but `sudo -n -l <pmset ...>` still says no. Mode
         // "rule-gone-under-lock": `sudo -n -l` says yes while nobody holds
@@ -8667,6 +8879,7 @@ private final class ScriptFixture {
         if [[ -n "$nflag" && "$mode" == auth-fail ]]; then echo "sudo: a password is required" >&2; exit 1; fi
         \(sudoHangHere())
         \(lockHeldHere())
+        \(signalReceiverHere())
         # "ignore-term" and "closes-fd9" behave like a pmset that ignores
         # SIGTERM: they live until the test creates the release file (or the
         # fixture is destroyed, or a 60 s wall-clock watchdog), so a test decides when
@@ -8703,10 +8916,10 @@ private final class ScriptFixture {
                 # "logs-term": like "ignore-term", and every SIGTERM it gets
                 # is logged as "sudo SIGTERM" (see sudoHangHere).
                 logs-term) hang_on_term ignore ;;
-                # "drops-fd9-logs-signals": like "logs-term", after closing
-                # its fd 9 the way sudo does, and every SIGHUP it gets is
-                # logged as "sudo SIGHUP".
-                drops-fd9-logs-signals) exec 9<&-; trap 'echo "sudo SIGHUP" >> "\(calls)"' HUP; hang_on_term ignore ;;
+                # "drops-fd9-logs-signals": closes its fd 9 the way sudo
+                # does, then waits like "logs-term", logging every SIGTERM
+                # and SIGHUP with its sender (see signalReceiverHere).
+                drops-fd9-logs-signals) exec 9<&-; receive_signals ;;
                 # "signals-self": for SIGTERM and then SIGHUP, a shell that
                 # inherits this command's signal actions sends itself the
                 # signal and, if it is still there afterwards, logs "sudo
@@ -8768,6 +8981,7 @@ private final class ScriptFixture {
               txn-fails-after) "$@"; printf 'sudo TXN-EXITED %s\\n' "$?" >> "\(calls)"; exit 143 ;;
               txn-hangs-after) "$@"; printf 'sudo TXN-EXITED %s\\n' "$?" >> "\(calls)"; hang_on_term stop ;;
               txn-ignores-term-after) "$@"; printf 'sudo TXN-EXITED %s\\n' "$?" >> "\(calls)"; hang_on_term ignore ;;
+              txn-drops-fd9-receives-after) exec 9<&-; "$@"; printf 'sudo TXN-EXITED %s\\n' "$?" >> "\(calls)"; receive_signals ;;
             esac
             exec "$@" ;;
           *) exit 1 ;;
@@ -9432,8 +9646,12 @@ private final class ScriptFixture {
     /// SIGTERM, the way sudo ends a policy check. `hang_on_term ignore` logs
     /// it and keeps running until the test calls releaseCommand (or the
     /// fixture goes, or a 60 s watchdog), then writes command.ended. Both
-    /// note an inherited fd 9 and record the pid in `sudo.hung.pid`, once
-    /// the SIGTERM trap is in place.
+    /// note an inherited fd 9 and record the pid in `sudo.hung.pid` once the
+    /// SIGTERM trap and the watchdog's deadline are in place. The wait loop
+    /// reads bash's SECONDS clock and runs no command substitution: a
+    /// `$(...)` child is a copy of this shell with the logging trap, so a
+    /// signal sent to the whole process group, or one pending when it
+    /// forks, can log one SIGTERM twice.
     func sudoHangHere() -> String {
         """
         hang_on_term() {
@@ -9444,12 +9662,60 @@ private final class ScriptFixture {
           else
             trap 'echo "sudo SIGTERM" >> "$calls_log"' TERM
           fi
+          deadline=$(( SECONDS + 60 ))
           echo $$ > "\(root.path)/sudo.hung.pid"
-          deadline=$(( $(date +%s) + 60 ))
-          while [[ ! -e "\(root.path)/release" && -d "\(root.path)" && $(date +%s) -lt $deadline ]]; do /bin/sleep 0.1; done
+          while [[ ! -e "\(root.path)/release" && -d "\(root.path)" ]] && (( SECONDS < deadline )); do /bin/sleep 0.1; done
           if [[ -e "\(root.path)/release" ]]; then echo released > "\(root.path)/command.ended"
           elif [[ -d "\(root.path)" ]]; then echo watchdog > "\(root.path)/command.ended"; fi
           exit 0
+        }
+        """
+    }
+
+    /// Shell function for the fake sudo: `receive_signals` replaces the fake
+    /// with one perl process that waits like `hang_on_term ignore` and
+    /// records who sent each signal. It ignores SIGTERM and SIGHUP after
+    /// logging each as "sudo SIGTERM" / "sudo SIGHUP", and adds "TERM from
+    /// <pid>" / "HUP from <pid>" to signals.log, the sender's pid from the
+    /// kernel's siginfo. One process, which starts no other, is the only
+    /// receiver, so each delivery is logged once. signals.log starts with
+    /// "ready pid=<pid> ppid=<parent>" (the parent is the supervisor that
+    /// started the fake), written with `sudo.hung.pid` once both handlers
+    /// and the watchdog's deadline are in place. It notes an inherited fd 9
+    /// as "sudo FD9-OPEN". SIGINT keeps the action the fake inherited
+    /// (ignored, in a background job). The handlers run at once (perl's
+    /// "unsafe" signals, the only way perl passes siginfo), each with both
+    /// signals blocked, while the loop sleeps in select(). The kernel keeps
+    /// one sender per process, so a signal that was pending beside another
+    /// is logged as sent by 0 (see signalGroupInTurn).
+    func signalReceiverHere() -> String {
+        """
+        receive_signals() {
+          exec /usr/bin/perl -MPOSIX -e '
+            my ($calls, $evidence, $root) = @ARGV;
+            sub note { my ($file, $line) = @_; if (open(my $fh, ">>", $file)) { print $fh "$line\\n"; close $fh } }
+            my $mask = POSIX::SigSet->new(POSIX::SIGTERM, POSIX::SIGHUP);
+            for my $name ("TERM", "HUP") {
+              my $act = POSIX::SigAction->new(sub {
+                my ($sig, $info) = @_;
+                note($calls, "sudo SIG$name");
+                note($evidence, "$name from " . (ref $info ? $info->{pid} : "unknown"));
+              }, $mask, POSIX::SA_SIGINFO);
+              $act->safe(0);
+              POSIX::sigaction($name eq "TERM" ? POSIX::SIGTERM : POSIX::SIGHUP, $act) or die "sigaction $name: $!";
+            }
+            my $dup = POSIX::dup(9);
+            if (defined $dup) { POSIX::close($dup); note($calls, "sudo FD9-OPEN") }
+            my $deadline = time + 60;
+            note($evidence, "ready pid=$$ ppid=" . getppid());
+            open(my $ready, ">", "$root/sudo.hung.pid") or die "sudo.hung.pid: $!";
+            print $ready "$$\\n";
+            close $ready;
+            select(undef, undef, undef, 0.1) while !-e "$root/release" && -d $root && time < $deadline;
+            if (-e "$root/release") { note("$root/command.ended", "released") }
+            elsif (-d $root) { note("$root/command.ended", "watchdog") }
+            exit 0;
+          ' "\(callsLog.path)" "\(root.path)/signals.log" "\(root.path)"
         }
         """
     }
