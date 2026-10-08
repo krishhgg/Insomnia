@@ -1263,6 +1263,43 @@ final class RecoveryScriptTests: XCTestCase {
         }
     }
 
+    /// Greptile 4219151895, uninstall.sh's side (PathSubstitutionTests has
+    /// the agent's): an uninstall that undoes a journaled sleep hold through
+    /// the checkout's backstop.sh, run on twin fixtures with the usual PATH
+    /// (the control) and with PathSubstitutes first in PATH, prints the
+    /// same, makes the same calls and removes the same files, and neither
+    /// script calls a stand-in. Its readers (the pid of each bounded call,
+    /// session.json and the journal's shape, the App Nap list, its uid and
+    /// folder names) would read otherwise from a stand-in.
+    func testUninstallAndItsBackstopTakeNoToolFromPath() throws {
+        let twin = try ScriptFixture()
+        defer { twin.destroy() }
+        for f in [fx!, twin] {
+            try f.installMachinery()
+            try f.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+            try f.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        }
+        let log = twin.root.appendingPathComponent("substitutes.log")
+        let path = try PathSubstitutes.path(in: twin.root.appendingPathComponent("substitutes", isDirectory: true), log: log,
+                                            scripts: [twin.repoScripts.path + "/", twin.app.path + "/"])
+
+        let control = try fx.run(fx.uninstall)
+        let r = try twin.run(twin.uninstall, extraEnvironment: ["PATH": path])
+
+        XCTAssertEqual(PathSubstitutes.calls(in: log), [], "uninstall.sh or its backstop.sh called a tool from PATH")
+        XCTAssertEqual(control.status, 0, control.stderr + control.stdout)
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        let same = { (text: String, f: ScriptFixture) in text.replacingOccurrences(of: f.root.path, with: "<root>") }
+        XCTAssertEqual(same(r.stdout, twin), same(control.stdout, fx))
+        XCTAssertEqual(same(r.stderr, twin), same(control.stderr, fx))
+        XCTAssertEqual(twin.calls().map { same($0, twin) }, fx.calls().map { same($0, fx) })
+        XCTAssertTrue(fx.calls().contains("sudo -n \(fx.fakePmset) -a disablesleep 0"), fx.calls().joined(separator: "\n"))
+        for f in [fx!, twin] {
+            XCTAssertFalse(f.exists(f.session))
+            XCTAssertFalse(f.exists(f.app))
+        }
+    }
+
     /// A record left from an earlier session.json matches nothing: it goes,
     /// and the live session is checked as usual.
     func testStaleEndRecordIsRemovedAndDoesNotEndTheSession() throws {

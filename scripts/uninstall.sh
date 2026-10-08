@@ -63,7 +63,11 @@ done
 # /tmp beforehand. Never the folder above either: a zip unpacked at
 # /tmp/Insomnia-<version> would make that /tmp, where any account can create
 # scripts/backstop.sh.
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Its parent without dirname, since the fixed tool paths come below.
+script_parent="${BASH_SOURCE[0]}"
+case "$script_parent" in */*) script_parent="${script_parent%/*}" ;; *) script_parent=. ;; esac
+[[ -n "$script_parent" ]] || script_parent=/
+SCRIPT_DIR="$(CDPATH="" cd -- "$script_parent" && pwd)"
 in_checkout() { [[ "${SCRIPT_DIR##*/}" == scripts && -f "${SCRIPT_DIR%/*}/Package.swift" ]]; }
 
 # Fixed tool paths: never taken from PATH or the environment. Tests patch
@@ -83,6 +87,14 @@ RM=/bin/rm
 RMDIR=/bin/rmdir
 MKTEMP=/usr/bin/mktemp
 STAT=/usr/bin/stat
+CAT=/bin/cat
+HEAD=/usr/bin/head
+TR=/usr/bin/tr
+AWK=/usr/bin/awk
+ID=/usr/bin/id
+# sleep is the one tool taken by name: it only paces the polls in bounded()
+# and the quit wait and reads nothing, and the tests that make every poll
+# slow put their own sleep first in PATH.
 LOCK_TIMEOUT_SECONDS=10
 # How long to wait for the app to exit after asking it to quit.
 QUIT_WAIT_SECONDS=10
@@ -157,7 +169,7 @@ DEFAULT_AGENTS=(
   com.electron.ollama             # Ollama
 )
 LOCK="$APP_SUPPORT/.recovery.lock"
-UID_NUM="$(id -u)"
+UID_NUM="$("$ID" -u)"
 
 step() { printf '\n==> %s\n' "$*"; }
 
@@ -193,7 +205,7 @@ bounded() { # command args...
       sleep 0.01
     done
     if [[ ! -s "$base.rc" ]]; then
-      BOUNDED_PID="$(cat "$base.pid" 2>/dev/null || true)"
+      BOUNDED_PID="$("$CAT" "$base.pid" 2>/dev/null || true)"
       return 125
     fi
   fi
@@ -240,7 +252,7 @@ supervise() { # base command args...
 
 # Fail closed on paths that are not the exact things install.sh created.
 case "$APP_SUPPORT" in /*) ;; *) echo "refusing: app support path is not absolute: $APP_SUPPORT" >&2; exit 1 ;; esac
-[[ "$(basename "$APP")" == "Insomnia.app" ]] || { echo "refusing: $APP is not an Insomnia.app bundle path" >&2; exit 1; }
+[[ "${APP##*/}" == "Insomnia.app" ]] || { echo "refusing: $APP is not an Insomnia.app bundle path" >&2; exit 1; }
 
 extract() { # file keypath (raw scalar; non-zero if missing)
   "$PLUTIL" -extract "$2" raw -o - "$1" 2>/dev/null
@@ -413,7 +425,7 @@ record_text_problems() { # file
 # the types RuntimeState.swift writes; null counts as absent.
 journal_shape_problems() { # file
   local f="$1" key t i n
-  if [[ "$("$PLUTIL" -convert json -o - "$f" 2>/dev/null | head -c 1)" != "{" ]]; then
+  if [[ "$("$PLUTIL" -convert json -o - "$f" 2>/dev/null | "$HEAD" -c 1)" != "{" ]]; then
     echo "state.json is not a JSON object"
     return 0
   fi
@@ -566,8 +578,8 @@ session_shape_problems() { # file
   local f="$1" key t i
   # plutil also reads XML and binary property lists, which the app's
   # JSONDecoder refuses, so the file itself must start with "{" too.
-  if [[ "$(LC_ALL=C tr -d ' \t\r\n' < "$f" 2>/dev/null | head -c 1)" != "{" ]] \
-     || [[ "$("$PLUTIL" -convert json -o - "$f" 2>/dev/null | head -c 1)" != "{" ]]; then
+  if [[ "$(LC_ALL=C "$TR" -d ' \t\r\n' < "$f" 2>/dev/null | "$HEAD" -c 1)" != "{" ]] \
+     || [[ "$("$PLUTIL" -convert json -o - "$f" 2>/dev/null | "$HEAD" -c 1)" != "{" ]]; then
     echo "session.json is not a JSON object"
     return 0
   fi
@@ -606,7 +618,7 @@ journal_problems() {
     # blocks, and this check runs while the recovery lock is held.
     if [[ ! -f "$SESSION" ]]; then
       echo "session.json is still present and cannot be read: it is not a regular file, so it was not opened"
-    elif ! cat "$SESSION" >/dev/null 2>&1; then
+    elif ! "$CAT" "$SESSION" >/dev/null 2>&1; then
       echo "session.json is still present and cannot be read (permissions or I/O)"
     elif shape="$(session_shape_problems "$SESSION")" && [[ -n "$shape" ]]; then
       echo "session.json is still present and is not a session: ${shape%%$'\n'*}"
@@ -706,14 +718,14 @@ list_unrecorded_app_nap() {
     [[ "$value" == 1 ]] || continue
     if (( found == 0 )); then
       found=1
-      cat <<MSG
+      "$CAT" <<MSG
 NSAppSleepDisabled is YES for these agent apps and Insomnia has no record of
 what it was before (an older build set it without recording). They are left
 as they are. To turn App Nap back on for one, run:
 MSG
     fi
     printf '  defaults delete %q NSAppSleepDisabled\n' "$id"
-  done < <(printf '%s' "$ids" | awk '!seen[$0]++')
+  done < <(printf '%s' "$ids" | "$AWK" '!seen[$0]++')
   if (( found == 0 )); then
     echo "none of the $checked agent apps checked has NSAppSleepDisabled set"
   fi
@@ -829,14 +841,14 @@ remove_owned() { # path...
 
 abort_incomplete() { # backstop exit status, problem lines...
   local rc="$1"; shift
-  cat >&2 <<MSG
+  "$CAT" >&2 <<MSG
 
 Uninstall stopped BEFORE removing anything: Insomnia's changes are not fully
 undone (backstop exit status $rc). Still journaled in $STATE:
 MSG
   local p
   for p in "$@"; do printf '  - %s\n' "$p" >&2; done
-  cat >&2 <<MSG
+  "$CAT" >&2 <<MSG
 
 Nothing was removed on purpose: the LaunchAgent keeps retrying every minute,
 the sudoers rule keeps pmset undoable, and the journal keeps the evidence.
@@ -1067,7 +1079,8 @@ step "Removing app bundle"
 # A staging directory whose run is still alive belongs to an install that
 # has not reached the lock yet, and stays. kill -0 only asks whether the
 # process exists; it sends no signal. Symlinks and any other name are left.
-APP_DIR="$(dirname "$APP")"
+APP_DIR="${APP%/*}"
+[[ -n "$APP_DIR" ]] || APP_DIR=/
 PREVIOUS_APP="$APP_DIR/.Insomnia.app.previous"
 if [[ -d "$PREVIOUS_APP" && ! -L "$PREVIOUS_APP" ]]; then
   "$RM" -rf "$PREVIOUS_APP"

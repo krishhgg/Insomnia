@@ -247,6 +247,13 @@ MKTEMP=/usr/bin/mktemp
 BASE64=/usr/bin/base64
 STAT=/usr/bin/stat
 CAT=/bin/cat
+GREP=/usr/bin/grep
+HEAD=/usr/bin/head
+TR=/usr/bin/tr
+ID=/usr/bin/id
+# sleep is the one tool taken by name: it only paces the polls in
+# wait_for_status and wait_for_job and reads nothing, and the tests that
+# make every poll slow put their own sleep first in PATH.
 # The installed app binary, for the microsecond identity check of
 # frozenProcesses entries (see above) and for reading config.json's cutoffs
 # (read_cutoffs), and the bundle's Info.plist, which must declare
@@ -569,7 +576,7 @@ run_read() { # varname command args...
       fi
     fi
   fi
-  if (( rc != 124 )) && [[ -f "$outfile" ]]; then read_output="$(cat "$outfile")"; fi
+  if (( rc != 124 )) && [[ -f "$outfile" ]]; then read_output="$("$CAT" "$outfile")"; fi
   printf -v "$name" '%s' "$read_output"
   "$RM" -f "$outfile"
   return "$rc"
@@ -816,7 +823,7 @@ record_text_problems() { # file
 # the same as an absent optional (Swift decodeIfPresent).
 journal_shape_problems() { # file
   local f="$1" key t i n
-  if [[ "$("$PLUTIL" -convert json -o - "$f" 2>/dev/null | head -c 1)" != "{" ]]; then
+  if [[ "$("$PLUTIL" -convert json -o - "$f" 2>/dev/null | "$HEAD" -c 1)" != "{" ]]; then
     echo "state.json is not a JSON object"
     return 0
   fi
@@ -967,8 +974,8 @@ session_shape_problems() { # file
   local f="$1" key t i
   # plutil also reads XML and binary property lists, which the app's
   # JSONDecoder refuses, so the file itself must start with "{" too.
-  if [[ "$(LC_ALL=C tr -d ' \t\r\n' < "$f" 2>/dev/null | head -c 1)" != "{" ]] \
-     || [[ "$("$PLUTIL" -convert json -o - "$f" 2>/dev/null | head -c 1)" != "{" ]]; then
+  if [[ "$(LC_ALL=C "$TR" -d ' \t\r\n' < "$f" 2>/dev/null | "$HEAD" -c 1)" != "{" ]] \
+     || [[ "$("$PLUTIL" -convert json -o - "$f" 2>/dev/null | "$HEAD" -c 1)" != "{" ]]; then
     echo "session.json is not a JSON object"
     return 0
   fi
@@ -1009,7 +1016,7 @@ if [[ -e "$SESSION" ]]; then
   if [[ ! -f "$SESSION" ]]; then
     session_state=unreadable
     unreadable_why="it is not a regular file, so it is not opened"
-  elif ! cat "$SESSION" >/dev/null 2>&1; then
+  elif ! "$CAT" "$SESSION" >/dev/null 2>&1; then
     session_state=unreadable
     unreadable_why="permissions or I/O"
   else
@@ -1442,7 +1449,7 @@ cutoffs_failure() { # flag
   if (( cutoffs_rc == 124 )); then
     echo "'$INSOMNIA_BIN $1' did not answer within ${COMMAND_TIMEOUT_SECONDS}s"
   else
-    echo "unexpected answer from '$INSOMNIA_BIN $1' (exit $cutoffs_rc, output '$(printf '%s' "$cutoffs_answer" | head -c 200 | tr -c '[:print:]' ' ')')"
+    echo "unexpected answer from '$INSOMNIA_BIN $1' (exit $cutoffs_rc, output '$(printf '%s' "$cutoffs_answer" | "$HEAD" -c 200 | "$TR" -c '[:print:]' ' ')')"
   fi
 }
 
@@ -1473,7 +1480,7 @@ battery_cutoff() {
     battery_reason="battery state unreadable (pmset -g batt exit $rc)"
     return 0
   fi
-  line="$(grep -m 1 InternalBattery <<< "$out" || true)"
+  line="$("$GREP" -m 1 InternalBattery <<< "$out" || true)"
   if [[ -z "$line" ]]; then
     battery_without_row
     return
@@ -1511,8 +1518,8 @@ battery_without_row() {
     battery_reason="no battery in pmset -g batt, and ioreg exit $rc could not show there is none"
     return 0
   fi
-  grep -q '^+-o ' <<< "$reg" || return 1
-  grep -q '"ExternalConnected" = Yes' <<< "$reg" && return 1
+  "$GREP" -q '^+-o ' <<< "$reg" || return 1
+  "$GREP" -q '"ExternalConnected" = Yes' <<< "$reg" && return 1
   battery_reason="battery present (AppleSmartBattery) but missing from pmset -g batt, and no charger reported"
   return 0
 }
@@ -1602,7 +1609,7 @@ record_end() {
   # The name carries this run's PID, so anything already there was left by
   # an earlier process. It goes unopened: writing through a FIFO blocks.
   "$RM" -f "$tmp" 2>/dev/null || true
-  if [[ -f "$SESSION" ]] && cat "$SESSION" > "$tmp" 2>/dev/null; then "$MV" -f "$tmp" "$ENDED" 2>/dev/null || true; fi
+  if [[ -f "$SESSION" ]] && "$CAT" "$SESSION" > "$tmp" 2>/dev/null; then "$MV" -f "$tmp" "$ENDED" 2>/dev/null || true; fi
   "$RM" -f "$tmp" 2>/dev/null || true
   end_recorded
 }
@@ -1635,7 +1642,7 @@ record_end_in_journal() {
     "$RM" -f "$tmp" 2>/dev/null || true
     return 1
   fi
-  if [[ "$("$PLUTIL" -convert json -o - "$tmp" 2>/dev/null | head -c 1)" != "{" || "$(head -c 1 "$tmp")" != "{" ]] \
+  if [[ "$("$PLUTIL" -convert json -o - "$tmp" 2>/dev/null | "$HEAD" -c 1)" != "{" || "$("$HEAD" -c 1 "$tmp")" != "{" ]] \
       || ! "$MV" -f "$tmp" "$STATE" 2>/dev/null; then
     "$RM" -f "$tmp" 2>/dev/null || true
     return 1
@@ -1657,7 +1664,7 @@ record_end_aside() {
   set_aside_dirs
   for d in "${aside_dirs[@]}"; do
     f="$("$MKTEMP" "$d/ended-session.json.XXXXXXXX" 2>/dev/null)" || continue
-    if is_end_record_aside "$f" && cat "$SESSION" > "$f" 2>/dev/null && "$CMP" -s "$SESSION" "$f"; then
+    if is_end_record_aside "$f" && "$CAT" "$SESSION" > "$f" 2>/dev/null && "$CMP" -s "$SESSION" "$f"; then
       aside_match="$f"
       return 0
     fi
@@ -1899,8 +1906,8 @@ prepare_low_power_off() {
     "$PLUTIL" -replace keptDisplayUnderLowPowerBoot -string "$boot" "$tmp" >/dev/null 2>&1 || ok=0
   fi
   if (( ok == 1 )); then
-    [[ "$("$PLUTIL" -convert json -o - "$tmp" 2>/dev/null | head -c 1)" == "{" ]] || ok=0
-    [[ "$(head -c 1 "$tmp")" == "{" ]] || ok=0
+    [[ "$("$PLUTIL" -convert json -o - "$tmp" 2>/dev/null | "$HEAD" -c 1)" == "{" ]] || ok=0
+    [[ "$("$HEAD" -c 1 "$tmp")" == "{" ]] || ok=0
   fi
   if (( ok == 1 )); then
     "$MV" -f "$tmp" "$STATE" || ok=0
@@ -2015,8 +2022,8 @@ resume_via_app() {
     valid=0
   else
     answer="$app_answer_dir/out"
-    size="$(stat -f %z "$answer" 2>/dev/null || echo 0)"
-    excerpt="$(head -c 200 "$answer" | tr -c '[:print:]' ' ')"
+    size="$("$STAT" -f %z "$answer" 2>/dev/null || echo 0)"
+    excerpt="$("$HEAD" -c 200 "$answer" | "$TR" -c '[:print:]' ' ')"
     # A valid line is at most 24 bytes ("<10-digit pid> unverifiable\n").
     if (( size > n * 32 )); then
       valid=0
@@ -2069,7 +2076,7 @@ resume_via_app() {
 }
 if (( frozen_count > 0 )); then
   boot_now="$("$SYSCTL" -n kern.bootsessionuuid 2>/dev/null || true)"
-  uid_now="$(id -u)"
+  uid_now="$("$ID" -u)"
   i=0
   while (( i < frozen_count )); do
     pid="$(extract "$STATE" "frozenProcesses.$i.pid" || true)"
@@ -2215,7 +2222,7 @@ if (( app_nap_count > 0 )); then
           log error "defaults delete $bundle NSAppSleepDisabled failed and the key is still set; keeping journal entry for retry"
           failures+=("App Nap is still off for $bundle: defaults delete failed")
           keep_app_nap_entry "$i"
-        elif grep -q "does not exist" "$probe" 2>/dev/null; then
+        elif "$GREP" -q "does not exist" "$probe" 2>/dev/null; then
           log info "defaults delete $bundle NSAppSleepDisabled: the key is already absent"
           changed=1
         else
@@ -2268,8 +2275,8 @@ if (( changed == 1 )); then
   fi
   if (( publish_ok == 1 )); then
     # plutil keeps JSON files as JSON; make sure the result is still one.
-    [[ "$("$PLUTIL" -convert json -o - "$tmp" 2>/dev/null | head -c 1)" == "{" ]] || publish_ok=0
-    [[ "$(head -c 1 "$tmp")" == "{" ]] || publish_ok=0
+    [[ "$("$PLUTIL" -convert json -o - "$tmp" 2>/dev/null | "$HEAD" -c 1)" == "{" ]] || publish_ok=0
+    [[ "$("$HEAD" -c 1 "$tmp")" == "{" ]] || publish_ok=0
   fi
   if (( publish_ok == 1 )); then
     "$MV" -f "$tmp" "$STATE" || publish_ok=0

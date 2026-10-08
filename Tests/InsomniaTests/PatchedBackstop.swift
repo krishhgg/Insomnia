@@ -43,11 +43,11 @@ struct PatchedBackstop {
             "PMSET": #"""
             printf 'pmset %s\n' "$*" >> '\#(calls)'
             [[ "$*" == "-g batt" ]] || exit 99
-            printf "Now drawing from 'Battery Power'\n -InternalBattery-0 (id=4567)\t%s%%; discharging; 1:00 remaining present: true\n" "$(cat '\#(battery)')"
+            printf "Now drawing from 'Battery Power'\n -InternalBattery-0 (id=4567)\t%s%%; discharging; 1:00 remaining present: true\n" "$(/bin/cat '\#(battery)')"
             """#,
             "NOTIFYUTIL": #"""
             printf 'notifyutil %s\n' "$*" >> '\#(calls)'
-            printf 'com.apple.system.thermalpressurelevel %s\n' "$(cat '\#(thermal)')"
+            printf 'com.apple.system.thermalpressurelevel %s\n' "$(/bin/cat '\#(thermal)')"
             """#,
             "SUDO": #"""
             printf 'sudo %s\n' "$*" >> '\#(calls)'
@@ -96,12 +96,13 @@ struct PatchedBackstop {
         try "\(percent)".write(to: dir.appendingPathComponent("battery"), atomically: true, encoding: .utf8)
     }
 
-    /// One run, as launchd starts it. Returns its exit status.
-    func run() async throws -> Int32 {
+    /// One run, as launchd starts it, or with another PATH. Returns its
+    /// exit status. The fakes call every tool by its full path.
+    func run(path: String = "/usr/bin:/bin:/usr/sbin:/sbin") async throws -> Int32 {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/bash")
         p.arguments = [script.path]
-        p.environment = ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "INSOMNIA_HOME": home.path, "HOME": home.path]
+        p.environment = ["PATH": path, "INSOMNIA_HOME": home.path, "HOME": home.path]
         p.standardOutput = FileHandle.nullDevice
         p.standardError = FileHandle.nullDevice
         let exit = ProcessExit(p)
@@ -143,10 +144,20 @@ struct PatchedBackstop {
         try patch("LOCK_RECORD_MAX_BYTES=1048576", "LOCK_RECORD_MAX_BYTES=0")
     }
 
-    /// Points CAT at /usr/bin/false, so the agent cannot read the recovery
-    /// lock file back after it writes a record there.
+    /// Points CAT at a fake that fails on the recovery lock file and runs
+    /// /bin/cat on anything else, so the agent cannot read the lock file
+    /// back after it writes a record there, and reads session.json and its
+    /// other files as usual.
     func failLockReadBack() throws {
-        try patch("CAT=/bin/cat", "CAT=/usr/bin/false")
+        let cat = dir.appendingPathComponent("cat")
+        try #"""
+        #!/bin/bash
+        [[ "${1:-}" == */.recovery.lock ]] && exit 1
+        exec /bin/cat "$@"
+
+        """#.write(to: cat, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: cat.path)
+        try patch("CAT=/bin/cat", "CAT='\(cat.path)'")
     }
 
     private func patch(_ line: String, _ replacement: String) throws {
