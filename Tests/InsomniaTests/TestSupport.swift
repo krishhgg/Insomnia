@@ -774,6 +774,7 @@ final class FakeDisplayDimmer: DisplayDimming, @unchecked Sendable {
     private let lock = NSLock()
     private var _brightness: Float
     private var _sets: [Float] = []
+    private var _reads = 0
     private var _sleepRequests = 0
     private var _wakes = 0
     private var _asleep = false
@@ -799,6 +800,8 @@ final class FakeDisplayDimmer: DisplayDimming, @unchecked Sendable {
     }
     /// Every value written, in order.
     var sets: [Float] { lock.withLock { _sets } }
+    /// How many reads answered, failed ones left out.
+    var reads: Int { lock.withLock { _reads } }
     var sleepRequests: Int { lock.withLock { _sleepRequests } }
     var wakes: Int { lock.withLock { _wakes } }
 
@@ -806,7 +809,10 @@ final class FakeDisplayDimmer: DisplayDimming, @unchecked Sendable {
 
     func readBrightness() throws -> Float {
         if throwOnRead { throw DisplayPowerError(what: "read brightness") }
-        return brightness
+        return lock.withLock {
+            _reads += 1
+            return _brightness
+        }
     }
 
     func setBrightness(_ value: Float) throws {
@@ -1107,17 +1113,29 @@ struct Harness {
     /// short so contention tests fail closed quickly;
     /// `retryDelay` is long so the in-process retry never fires by accident;
     /// `reassertDelay` likewise, so the second display/keyboard write after
-    /// a restore never lands in a test that did not ask for it.
-    /// `sleepGuard` replaces `guardFake` for a test that drives the real
-    /// PmsetSleepGuard against a fake sudo and pmset.
+    /// a restore never lands in a test that did not ask for it, and
+    /// `keptRecheckDelay` and `keptRecheckSlowDelay` for the re-read of a
+    /// kept brightness.
+    /// `display` and `keyboard` replace the harness fakes, for a device
+    /// the private-call guard refuses. `sleepGuard` replaces `guardFake`:
+    /// a wrapper around it, or the real PmsetSleepGuard against a fake
+    /// sudo and pmset. `receipts` replaces the harness's receipt folder.
+    /// `bootSession` stands in for `kern.bootsessionuuid`, for a launch
+    /// after a restart.
     func makeManager(
         lockTimeout: TimeInterval = 0.3,
         retryDelay: TimeInterval = 60,
         markerLockTimeout: TimeInterval = 0.3,
         receiptLockTimeout: TimeInterval = 0.3,
         reassertDelay: Duration = .seconds(3600),
+        keptRecheckDelay: Duration = .seconds(3600),
+        keptRecheckAttempts: Int = 20,
+        keptRecheckSlowDelay: Duration = .seconds(3600),
+        display: (any DisplayDimming)? = nil,
+        keyboard: (any KeyboardBacklighting)? = nil,
         sleepGuard: (any SleepGuarding)? = nil,
-        receipts: SleepOffReceipts? = nil
+        receipts: SleepOffReceipts? = nil,
+        bootSession: String = SignalProcessControl.bootSession
     ) -> SessionManager {
         let c = clock
         let lid = clamshell
@@ -1129,8 +1147,8 @@ struct Harness {
             backstop: backstop,
             receipts: receipts ?? self.receipts,
             audio: audio,
-            display: display,
-            keyboard: keyboard,
+            display: display ?? self.display,
+            keyboard: keyboard ?? self.keyboard,
             appNap: appNap,
             notifier: notifier,
             clamshell: { lid.closed },
@@ -1140,7 +1158,11 @@ struct Harness {
             recoveryRetryDelay: retryDelay,
             markerLockTimeout: markerLockTimeout,
             receiptLockTimeout: receiptLockTimeout,
-            reassertDelay: reassertDelay
+            reassertDelay: reassertDelay,
+            keptRecheckDelay: keptRecheckDelay,
+            keptRecheckAttempts: keptRecheckAttempts,
+            keptRecheckSlowDelay: keptRecheckSlowDelay,
+            bootSession: bootSession
         )
     }
 }

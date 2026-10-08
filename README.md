@@ -318,6 +318,27 @@ the lid already closed.
 The display step exists because the sleep guard stops macOS from doing it:
 with sleep disabled, closing the lid no longer turns the panel or the keys off
 by itself. Insomnia sets both to zero and restores them when the lid opens.
+Both go through private macOS frameworks. The display calls run only on a
+macOS major version they were measured on (26). The keyboard calls run only
+while the private keyboard class has the method signatures measured on 26,
+on whatever version. If either check refuses a device, Insomnia leaves it
+alone and Settings says why under the toggle. A level saved before an update
+that the check now refuses stays saved for a version that can restore it, and
+the menu says to set it with the brightness keys meanwhile. That version leaves
+a level you set by hand alone, and decides only on a reading taken with the
+display awake and the keys not dimmed. Once Insomnia's own Low Power Mode has
+been on over the saved display level, it leaves that level undecided until the
+Mac restarts, through relaunches of the app, and until then a lid close leaves
+that display lit and only asks it to sleep. The same goes when the recovery
+agent switches that mode off before Insomnia starts again, and when Insomnia
+switches off a mode still claimed from before a restart. That mode may read
+off then, yet it may have gone off only a moment before, so the level waits
+for the next restart even when the mode has been off for days. Once it has seen
+that display lit above zero, it never writes the saved level over a zero you
+set by hand, also after a relaunch or a restart. It cannot tell that zero
+from one auto-brightness left under a closing lid, so the saved level stays
+undecided, with nothing written, until you raise the display above zero. If Insomnia cannot record that it saw the display lit, or that the
+saved level is settled, Quit waits until it can.
 The display comes back to the brightness sampled while the lid was open, not
 the reading at the moment of closing (auto-brightness has already dimmed the
 panel under the closing lid by then, and Low Power Mode rescales it), and if

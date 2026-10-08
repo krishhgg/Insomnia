@@ -74,7 +74,12 @@ RuntimeState {                // everything Insomnia changed and must undo
   savedMuted:         Bool?   // legacy, the same
   savedDisplayBrightness:  Float?  // nil when darkening is off or lid is open
   savedKeyboardBrightness: Float?  // nil when there is no backlight, too
+  displayRestoreRefused:   Bool    // written only when true: the guard refused this restore; see section 4
+  keyboardRestoreRefused:  Bool    // the same for the keyboard backlight
   displayRestoredUnderLowPower: Float?  // restored on open under our Low Power Mode; written again when it ends
+  keptDisplayUnderLowPower:     Float?   // the kept (refused) display entry our Low Power Mode was on over; see section 4
+  keptDisplayUnderLowPowerBoot: String?  // kern.bootsessionuuid of the boot that record was written in, or that backstop.sh switches the mode off in (published before it does)
+  keptDisplayReadLit:           Float?   // the kept display entry, read above 0 with the lid open and the panel awake; see section 4
   appNapOverrides:    [{bundleId, previous?}]  // previous absent when the app had no NSAppSleepDisabled key
 }
 ```
@@ -356,6 +361,180 @@ Quit, or reconcile.
 | Low Power Mode | on (optional, default on) | off unless a battery or thermal floor still wants it |
 | Countdown redraw | stop timer | restart timer |
 
+The display and keyboard rows go through private frameworks with no ABI
+contract: the DisplayServices C functions and CoreBrightness's
+`KeyboardBrightnessClient`. Two guards run once per launch, before the
+first call. The DisplayServices functions are called only on a macOS major
+version they were measured on (26, `DisplayPower.measuredDisplayServicesMajors`);
+a C symbol carries no type information, so on any other major the display
+is left alone until someone measures again. The `KeyboardBrightnessClient`
+methods are read through the Objective-C runtime and compared with the type
+encodings measured on macOS 26 (`DisplayPower.measuredKeyboardClientEncodings`,
+stack offsets removed); a missing required method or a changed encoding
+refuses the keyboard backlight before anything is instantiated. A refused
+device is skipped at lid close with a log line, nothing is journaled for
+it, and Settings shows the reason under the darken toggle. With nothing
+journaled for either device the close does not request display sleep,
+since lid open and reconcile wake the display only for a journaled
+brightness, as section 4 describes.
+
+A brightness journaled before an update that the guard now refuses is not
+written on open or reconcile, and it is not dropped either: an entry is
+cleared only after its undo. It stays in the journal with
+`displayRestoreRefused` or `keyboardRestoreRefused` set. One error names
+each such device with its saved level, says it could not be restored on
+this macOS build, and says to set the level with the brightness keys or
+Control Center; Settings also shows each saved level under the darken
+toggle. That error goes into one report with every other failure of the
+same undo, such as a failed resume, audio restore or write on the other
+device, since it comes up at every lid open. A flagged entry is not dirty
+for backstop.sh or uninstall.sh, nor for the app while the guard refuses
+its device. Nothing on that build can restore it, and counting it would
+post "Restore incomplete" at every end and launch, fail the backstop every
+minute, and stop uninstall for good. It also does not hold back a new
+session or Quit. The app tries again at every lid open during a session,
+at every end, and at every launch, with or without a session. On a build
+or macOS where the guard allows the call, it reads the device first. Only
+a reading taken with the lid known to be open, and that macOS is not
+holding down, counts. A closed lid leaves the device at 0 or turned off,
+and a write would light what the close keeps dark, so an end or a launch
+under a closed lid reads nothing and leaves the entry waiting. A display
+asleep reads its idle-dim value, and a keyboard backlight suppressed after
+the wake, or idle-dimmed, reads 0 at any level. Such a reading decides
+nothing, and neither does a read that fails or a keyboard that reads as
+absent. The entry then stays as it is. The app reads it again every 3 s,
+20 times, and then every minute for as long as it waits and the app runs,
+since outside a session nothing else acts on a lid open. While the lid is
+not known to be open it reads nothing, and the 3 s reads start again once
+it is. A busy recovery lock skips one read, not the rest. An end does not
+count a waiting entry as not restored, since nothing failed. The close
+left the device at 0, so a reading above 0 is a level set since, as the
+error asked: the darkening is already undone, and the entry is cleared
+without a write rather than overwrite that level. A display reading above
+0 taken while Insomnia's own Low Power Mode is on is the mode's rescaled
+value and not that level, and once the mode is off the panel comes back
+over a time nobody has measured. So no display reading above 0 taken
+under the mode, or after it in the same boot of the Mac, decides the
+entry: it would become the sample a later close journals. A relaunch is
+no sign that the panel is back, so the journal records the entry as one
+the mode was on over (`keptDisplayUnderLowPower`, with the boot session),
+and a relaunch reads it with the same doubt. The entry waits for a launch
+after a restart; until then it stays flagged, the panel is read again
+every minute, and a lid close leaves it lit and only asks it to sleep
+(below). That a restart ends the mode's rescale is assumed, not measured.
+The record is about that entry alone: settled, replaced or unflagged, it
+is dropped, one with no boot session holds until the next restart, and a
+journal written before the record existed carries no doubt. While the
+journal still claims the mode (`lowPowerSetByUs`), the record keeps the
+boot it was written in, so a launch after a restart can tell that the
+claim is from before it. Such a claim says nothing about the mode in this
+boot, and neither does a read of the mode. Before its `lowpowermode 0` the
+app reads the mode (`pmset -g custom`, the battery setting the claim is
+about) for the log only. On, the switch-off ends the mode in this boot.
+Off, the user or another tool may have switched it off a moment before,
+with the panel still on its way back. Either way, and when the mode cannot
+be read, the switch-off counts as the mode's end in this boot: the record
+is written for this boot and the entry waits for the next restart, as
+above. That holds for every route that switches such a claim off: an end,
+a launch, the menu or a floor, and the check after a power command. It
+also holds when state.json refuses the clear, in this process and in a
+relaunch in the same boot. The cost falls on a mode that went off long
+before the launch, which no reading tells apart: until a launch after the
+next restart the entry stays in state.json, the display is not sampled,
+and a close leaves it lit and only asks it to sleep. The level the user
+set is never written over. A claim with no record, a
+record with no boot or an empty one, or a launch that cannot read its own
+boot is taken as this boot's, so the entry waits, at the cost of one more
+restart. backstop.sh, before its own `lowpowermode 0`, gives a record of
+another boot, or with none, its own boot (empty if it cannot read it),
+after a restart or not, and publishes that journal on its own first: the
+mode may have been on in that boot until then, before Insomnia launched in
+it. A launch in that boot then reads the entry with the same doubt and
+waits for the next restart, even when the mode was already off before the
+agent's switch-off. The record has that boot before the mode goes off, so
+a command that fails, or a journal of the undo that cannot be published
+after it, leaves the claim next to a record of this boot, which a launch
+reads as its own mode on in this boot, with the same doubt. If the journal
+with the boot cannot be published, the agent leaves the mode on and keeps
+its entry for the retry: switched off next to a record of an earlier boot,
+the panel on its way back could be taken for the user's level. A journal
+with no record has nothing to give a boot, so one written before the
+record existed still carries no doubt. A display still at 0 under or after the
+mode gets the saved value, written once more after the mode as for any
+restore under it, unless a reading of that entry above 0, with the lid
+known open and the panel awake, showed the darkening undone. That reading
+is journaled (`keptDisplayReadLit`), so it holds through relaunches and
+restarts, which do not darken the panel again. A 0 read after it may be a
+level the user set, or one macOS still holds the panel at: auto-brightness
+can pull the panel down to 0 under a closing lid, and the panel can still
+read that 0 once the lid is open again, for a time nobody has measured. No
+reading of 0 tells the two apart, however late it comes, so the saved
+value is not written and the entry is not cleared. It stays flagged, the
+display sample stays held, and the app reads the panel again every 3 s,
+20 times, then every minute, through relaunches and restarts, until it
+reads above 0. A 0 the user set stays as set until then. A reading above
+0 with no doubt above left is the level set since, and the entry is
+cleared without a write. A lid close with a sample of 0, or 0 as the value
+owed after the mode, journals that 0 in place of the kept value. A current
+read of 0 at the close is no such level, since it may be the closing
+lid's. The close leaves the entry flagged and the panel as it is, and only
+asks it to sleep. A reading at a lid close, under the closing lid or of a panel
+asleep, shows no such thing, and neither does a reading of an earlier
+entry: the record goes with its entry, as the record of the mode does. If
+state.json refuses the record, this process holds it and the next write
+records it. An end does not let Quit go before then: "Restore incomplete"
+says Insomnia retries in 30 s and not to quit until state.json can be
+written, and Quit waits, as for a failed restore whose flag is owed. A
+crash, a forced quit or a lost disk before the record lands loses it, and
+the next launch writes the saved value over a 0, as before any reading.
+If state.json cannot
+take that clear, the entry still counts as done in this process. The clear
+is owed: it goes into the journal ahead of any later write, and at the
+start of every lid close, lid open, end and launch, so none of them works
+from the old entry. A lid close then journals the level the device reads,
+not the old saved one. The app also retries the clear at the same pace,
+and reads and writes nothing for it, so a level the user lowers to 0
+meanwhile stays at 0. Quit waits for that clear: a launch after the quit
+would read the entry again, and would write the saved value over a 0 the
+user set since. "Restore incomplete" says Insomnia retries in 30 s and not
+to quit until state.json can be written, and Start is refused until the
+end goes through. A crash, a forced quit or a lost disk before the clear
+lands leaves the entry to the next launch, which reads the device again.
+A device still at 0 there gets the saved value and both keys are cleared. A failed write there clears the
+flag, and the entry is retried like any failed restore. If the flag cannot
+be cleared either, the disk still shows a flagged entry, which backstop.sh
+and uninstall.sh pass over, so the app keeps the end itself. "Restore
+incomplete" says Insomnia retries in 30 s, the app retries the write and
+the owed flag together, and Quit waits until one of them lands. A write
+that lands while state.json still refuses the clear settles the entry in
+this process, with only the clear owed, and Quit waits for that clear as
+above. A launch or
+re-read with no session whose write fails is ended as for a dirty journal,
+so the agent is armed for it, or the app keeps it while the flag is still
+owed. A write whose clear is owed is done all the same: the second write
+2 s later still goes out, and a display written under Insomnia's Low Power
+Mode still owes its write after the mode, as the clear would have
+journaled. A lid close that can read the device clears the flag too: it
+keeps the earlier saved value while the device reads 0, and saves the new
+level when it reads above 0. For the display that level must be trusted:
+the last sample, the value owed after the mode, or a current read taken
+with the panel awake and Insomnia's Low Power Mode not on at any point in
+the run, nor over the entry since the Mac last started. Without one, the close leaves the entry flagged and the panel as
+it is. A rescaled, dimmed or asleep read is not the user's level, and the
+saved value may not be either, since the user may have set one by hand.
+A panel darkened to 0 would read at the open as the darkening never
+undone and get the saved value, so the close only asks the display to
+sleep, which macOS ignores while any process holds a display assertion;
+the panel then stays lit under the closed lid until the open, which reads
+the entry again as above. A close whose journal write fails
+darkens nothing and asks the display to sleep only for an entry this
+process has not settled. Uninstall goes ahead past a flagged entry, prints
+the saved level, and keeps state.json, even with `--purge`, so a later
+install that can make the call restores it.
+
+The guards narrow the risk of calling a private function whose shape
+changed; they do not replace the hardware rows in
+docs/release-validation.md.
 An output device that is not connected when its entry is restored keeps the
 entry, and the restore of everything else goes on. Each restore decides
 again whether a device is connected: only a device CoreAudio reports as not
@@ -396,7 +575,6 @@ A session that starts, or that reconcile resumes at launch, while the lid
 reads closed starts with the countdown redraw stopped: the lid observer
 reports changes only, so no close event arrives for it. The next lid open
 restarts the redraw.
-
 Freeze scope rules:
 
 - Two scopes. The explicit freeze list: apps the user picks by bundle id from
@@ -466,8 +644,10 @@ the panel and keys stayed lit for the whole closed period. A display sleep
 request (`IORequestIdle` on `IODisplayWrangler`, what `pmset displaysleepnow`
 does) is ignored while any process holds a display assertion, and agents
 routinely do, so brightness 0 is the primary mechanism and the sleep request
-is best effort. Display brightness 0 does not switch the keyboard backlight
-off; it is set separately. Both values are journaled before they are changed
+is best effort. It is made only when a display or keyboard brightness is
+journaled, because the wake that undoes it on open, or on reconcile after
+a relaunch, runs only for such an entry. Display brightness 0 does not
+switch the keyboard backlight off; it is set separately. Both values are journaled before they are changed
 and restored on open, session end, Quit, or reconcile with the lid open; the
 backstop keeps the entries and only the app restores them (private
 frameworks). An end that could not restore one says so in its
@@ -494,7 +674,17 @@ dim or not, since a dim panel on open beats a black one.
 While Low Power Mode is on because Insomnia switched it on (the journal's
 `lowPowerSetByUs`), the display sample is held: the panel reads the mode's
 value, and the sample taken just before the mode went on is the one to
-restore. The keyboard journals the current
+restore. The hold follows the journal on disk: after a `lowpowermode 0`
+that exited 0 with the ownership clear refused, the panel may still be on
+its way back from the mode, so the display sample, by then the level
+written after the mode, stays held until the clear lands, while the
+keyboard is still sampled. Each device's sample is also held while the journal has a saved
+brightness for it, since the device then reads the 0 a close left or a
+level not yet decided. Each level the app writes from the journal, or
+finds set since in place of a kept value, becomes that device's sample,
+so a close soon after a restore that came late, from the re-read of a
+kept value or after the mode, journals the restored level and not a 0
+sampled before it. The keyboard journals the current
 read if trusted now, else its last sample; when nothing trustworthy is
 known for it, it is left to macOS entirely (no journal entry, no write),
 because restoring a suppressed 0 would leave the backlight off. On open the
@@ -516,7 +706,12 @@ and if the mode turns out to have been cleared by someone else (the
 backstop after a kill: it keeps the entry but never writes brightness);
 taking the mode over discards any entry left from an earlier interval in
 the same journal write. A Low Power Mode interval with no lid restore under
-it writes nothing. The
+it writes nothing. If state.json refuses to clear the mode's ownership
+after `lowpowermode 0` exits 0, the mode is off all the same: the clear is
+owed, as for a kept brightness, the write after the mode goes at once, and
+a later switch-off from the ownership still on disk compares nothing. If
+state.json refuses to clear the owed write itself, written or dropped,
+that clear is owed too, so no later journal write brings the value back. The
 sample the display journals dates from the last 30 s window in which the
 user was active with the lid open and the panel awake, and is held from
 before Insomnia's own Low Power Mode: a brightness change made within 30 s
@@ -1062,12 +1257,21 @@ Backstop, independent of the app:
   entry is cleared under the lock before the lock is released, and a
   display write owed for the end of the mode is done then. If the journal
   cannot be read or written then, the entry stays, the undo runs again,
-  and the menu says so. Any other exit confirms nothing. When the command
+  and the menu says so. For `lowpowermode 0` with a journal that cannot be
+  written, the clear is also owed, so the app takes the mode as off and
+  does the display write at once. With a journal that cannot be read and
+  a display write owed after the mode, by the journal last read, the clear
+  is owed the same way and the write waits for the first transaction that
+  reads the journal again; it is made only if that journal, with the owed
+  edits, still owes the same value with the mode not Insomnia's. The
+  unreadable file is not written. Any other exit confirms nothing. When the command
   exits the app retries a pending end.
   Otherwise it reads Low Power Mode under the lock. A mode that reads on
   stays journaled as Insomnia's. A mode that reads off is switched off
   once more with the app's own `lowpowermode 0`, and the ownership is
-  cleared only when that exits 0. A display write owed for the end of the
+  cleared only when that exits 0. A claim from before the Mac last started
+  that it clears this way counts as the mode's end in this boot, as for
+  any switch-off (section 4). A display write owed for the end of the
   mode is kept through the check and done then: with the mode already off,
   powerd's rescale of the panel cannot be told apart from a user's change,
   so the panel is compared with the owed value only before a switch-off,
@@ -1076,7 +1280,10 @@ Backstop, independent of the app:
   change still in the 2 s lid debounce has settled, and runs the floor
   rules again. A check that cannot take the lock, read the journal or the
   mode, switch the mode off, or write the journal runs again after the
-  retry delay while the session lasts.
+  retry delay while the session lasts. After a `lowpowermode 0` that
+  exited 0, the ownership clear the journal refused is owed: the retried
+  check's transaction writes it first, and the check then has nothing to
+  switch off.
 - Successful restores may clear their entries; failures must stay journaled.
   A journal write that fails to clear the entry of a successful restore is
   shown in the menu as well as logged, and the restore is retried. The
@@ -1131,6 +1338,11 @@ Backstop, independent of the app:
   it runs the checkout's backstop anyway, which keeps the entries that
   need the binary without running it, so uninstall stops before removing
   anything.
+- The shell does not restore display or keyboard brightness either; both stay
+  in the journal for the app. One flagged `displayRestoreRefused` or
+  `keyboardRestoreRefused` is kept but does not make the journal dirty, so
+  it neither fails the run nor stops uninstall, which keeps state.json for
+  it (section 4).
 - The shell puts `appNapOverrides` back with `defaults write <id>
   NSAppSleepDisabled -bool <previous>` or `defaults delete` when the key was
   absent. A delete that fails counts as done only when `defaults read` then

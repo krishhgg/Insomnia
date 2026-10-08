@@ -185,38 +185,94 @@ final class LidActions {
     /// either the current read, dim or
     /// not, since a dim panel on open beats a black one. The sample can be
     /// up to 30 s old: a brightness change made right before closing the
-    /// lid is not seen. The keyboard reads 0
-    /// when suppressed by display sleep, so it takes the current read if
-    /// trusted now, else the last trusted sample, else nothing, since
-    /// restoring 0 would leave the backlight off for good.
+    /// lid is not seen. A value kept after a refused restore gives way only
+    /// to a sample, the value owed after the mode, or a current read that
+    /// is trusted and taken with our Low Power Mode never on in this run,
+    /// nor over the entry in this boot (`SessionManager.keptDisplayReadDoubt`).
+    /// Without one, the level may
+    /// be one the user set by hand, and the reading is no level to restore
+    /// either: the entry is left as it is, undecided, and the panel is not
+    /// darkened, since the open would read the 0 left here as the darkening
+    /// never undone and write the kept value. The display sleep request
+    /// still goes, and is then the only thing that turns that panel off.
+    /// A sample of 0, or the value owed after the mode at 0, replaces the
+    /// kept one only once a reading above 0 showed that entry's darkening
+    /// undone (`RuntimeState.keptDisplayReadLit`): before that, the 0 may
+    /// still be the darkening, and the kept value stays for the open to
+    /// write. A current read of 0 after such a reading is no level either:
+    /// auto-brightness may have pulled the panel down to it under the
+    /// closing lid. The entry is left undecided, as above, and the open
+    /// does not take a 0 it reads as a level set since: only a reading
+    /// above 0 decides that entry (`SessionManager.restoreDisplay`).
+    /// The keyboard reads 0 when suppressed by display sleep, so it takes
+    /// the current read if trusted now, else the last trusted sample, else
+    /// nothing, since restoring 0 would leave the backlight off for good.
     private func darkenSavingCurrent(_ manager: SessionManager) {
         do {
             let current = try display.readBrightness()
+            // With the owed edits applied: a restore under the mode whose
+            // clear the journal has not taken still owes its write.
+            let journaled = manager.effectiveState
             let value: Float
+            // Why `value` is not the user's level, if it may not be.
+            var doubt: String?
+            let kept = journaled.displayRestoreRefused ? journaled.savedDisplayBrightness : nil
             if let sampled = sampler?.last?.display {
                 value = sampled
                 if sampled != current {
                     Log.info("display brightness reads \(current) at the close; journaling the last open-lid sample \(sampled)")
                 }
-            } else if manager.state.lowPowerSetByUs, let owed = manager.state.displayRestoredUnderLowPower {
+            } else if journaled.lowPowerSetByUs, let owed = journaled.displayRestoredUnderLowPower {
                 value = owed
                 Log.info("display brightness reads \(current) at the close under our low power mode with no sample; journaling the value restored under it, \(owed)")
+            } else if journaled.lowPowerSetByUs {
+                value = current
+                doubt = "under our low power mode, which rescales it"
             } else if sampler?.displayReadIsTrusted ?? !display.isAsleep() {
                 value = current
+                doubt = manager.keptDisplayReadDoubt
+                if doubt == nil, current == 0, journaled.keptDisplayReadLitHolds {
+                    doubt = "with no sample, where auto-brightness under the closing lid may have pulled it down"
+                }
             } else {
                 value = current
-                Log.info("display brightness read while dimmed or asleep and no trusted sample; restoring that value on open")
+                doubt = "while dimmed or asleep"
+                if kept == nil {
+                    Log.info("display brightness read while dimmed or asleep and no trusted sample; restoring that value on open")
+                }
             }
-            try manager.journal { s in
-                // Keep an earlier save if a previous close was never undone.
-                if s.savedDisplayBrightness == nil { s.savedDisplayBrightness = value }
-            }
-            do {
-                try display.setBrightness(0)
-                Log.info("display darkened (was brightness \(value))")
-            } catch {
-                // The journal entry stays: the open restores whatever is there.
-                Log.error("display darken failed: \(error.localizedDescription)")
+            if let kept, let doubt {
+                // The user was told to set the level by hand, and may have:
+                // neither that reading nor the kept value is the level to
+                // come back to. Taken under the closing lid, maybe of a
+                // panel asleep, it shows no undone darkening either, so a
+                // 0 the open reads still gets the kept value. After a
+                // reading above 0 that did show it, the open takes no 0
+                // as set since: that 0 may still be the closing lid's.
+                Log.info("display brightness reads \(current) at the close \(doubt); the value kept after a refused restore, \(kept), stays journaled and undecided, and the display is not darkened, so the open reads it again")
+            } else {
+                try manager.journal { s in
+                    // Keep an earlier save if a previous close was never
+                    // undone. One kept after a refused restore gives way to
+                    // the user's level above 0: the user was told to set it
+                    // by hand, so that is the level to come back to. A 0
+                    // is that level too once a reading above 0 showed the
+                    // darkening undone, if it is a sample or the value owed
+                    // after the mode: a current read of 0 then was left
+                    // undecided above. The device answered, so the entry
+                    // is an ordinary one again.
+                    if s.savedDisplayBrightness == nil || (s.displayRestoreRefused && (value > 0 || s.keptDisplayReadLitHolds)) {
+                        s.savedDisplayBrightness = value
+                    }
+                    s.displayRestoreRefused = false
+                }
+                do {
+                    try display.setBrightness(0)
+                    Log.info("display darkened (was brightness \(value))")
+                } catch {
+                    // The journal entry stays: the open restores whatever is there.
+                    Log.error("display darken failed: \(error.localizedDescription)")
+                }
             }
         } catch {
             Log.error("display darken on lid close skipped: \(error.localizedDescription)")
@@ -235,7 +291,11 @@ final class LidActions {
                 }
                 if let value {
                     try manager.journal { s in
-                        if s.savedKeyboardBrightness == nil { s.savedKeyboardBrightness = value }
+                        // As for the display above.
+                        if s.savedKeyboardBrightness == nil || (s.keyboardRestoreRefused && value > 0) {
+                            s.savedKeyboardBrightness = value
+                        }
+                        s.keyboardRestoreRefused = false
                     }
                     do {
                         try keyboard.setBrightness(0)
@@ -253,6 +313,16 @@ final class LidActions {
             Log.error("keyboard backlight on lid close skipped: \(error.localizedDescription)")
         }
 
+        // The wake that undoes this request runs on open, and on reconcile
+        // after a relaunch, only for a journaled brightness. With nothing
+        // journaled (both devices refused or unreadable) nothing would wake
+        // a panel this put to sleep, so it is not asked to sleep.
+        // With the owed edits applied: an entry this process already
+        // settled is not restored, so the open would not wake for it.
+        guard manager.effectiveState.brightnessJournaled else {
+            Log.info("display sleep not requested: no display or keyboard brightness is journaled, so nothing would wake the display on open")
+            return
+        }
         do {
             try display.requestSleep()
             Log.info("display sleep requested")

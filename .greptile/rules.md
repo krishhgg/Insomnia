@@ -38,12 +38,56 @@ so the pre-swap recovery never runs the older installed build. It keeps, and
 never restores, `savedOutputVolume`, `savedMuted`, `savedAudioOutputs`,
 `savedDisplayBrightness`, `savedKeyboardBrightness` and
 `displayRestoredUnderLowPower`: CoreAudio and the private brightness
-frameworks need the app. `savedAudioOutputs` entries alone leave the
+frameworks need the app. The app's records `keptDisplayUnderLowPower`,
+`keptDisplayUnderLowPowerBoot` and `keptDisplayReadLit` are kept too.
+Before the backstop's `lowpowermode 0`, when the journal has
+`keptDisplayUnderLowPower` with another boot or none, it writes its own
+`kern.bootsessionuuid` (empty if unreadable) to
+`keptDisplayUnderLowPowerBoot` and publishes that journal on its own, so
+the app doubts that entry's readings in that boot even if the journal of
+the undo never lands. If that publish fails, the mode is left on and its
+entry kept for retry. Both scripts check the records' types and read the
+three keys from the file's text too (`record_text_problems`, the same in
+both), as the app's decoder reads it: keys of the top-level object only,
+with their `\u` escapes decoded, every value stepped over whole, so a
+string or nested value holds no record. Each number must be null or a
+JSON number that a Swift Float holds and that does not round to 0 from a
+nonzero value (plutil turns 1e-400 into 0.0). One of the keys found twice
+at the top level, a key with an escape JSON does not have, and a top
+level the reader cannot follow (JSON5 keys, comments, NUL bytes as in
+UTF-16) are refused. Any of
+these makes the journal malformed, so nothing is undone and uninstall
+removes nothing. `savedAudioOutputs` entries alone leave the
 journal clean for the backstop (an entry can wait days for its device), but
-uninstall stops on them. Legacy `frozenPids` entries
-are never signaled or cleared by the shell. A flag is cleared only after
-its undo succeeded; a journal that is unreadable or has a known key of the
-wrong type is left untouched and the run exits 1.
+uninstall stops on them. A saved brightness flagged
+`displayRestoreRefused` or `keyboardRestoreRefused` (the app's private-call
+guard refused that restore on this macOS) stays journaled but is not dirty
+for the backstop or uninstall, which keeps state.json for it, nor for the
+app while the guard refuses that device. A build whose guard allows the call
+writes the flagged value only while the device still reads 0, the level the
+lid close left: a higher reading means the user already undid the darkening
+by hand, so the entry is cleared without a write. Only a reading taken while
+macOS is not holding the device down counts: the display awake, the keyboard
+backlight neither suppressed nor dimmed. A reading taken while macOS holds it
+down, or a read that fails, leaves the entry as it is for a later read. A
+display reading above 0 taken under the app's own Low Power Mode, or after it
+in the same boot, relaunches included, leaves the entry for a launch after a
+restart. A claim on the mode written before the Mac last started (its record
+of the kept entry names another boot) is read before the switch-off for the
+log only: on, off or unreadable, the switch-off is the mode's end in this
+boot, since a mode read off may have gone off a moment before, so the
+entry waits for a launch after the next restart. A reading above 0 of the
+kept entry is journaled (`keptDisplayReadLit`), and a later 0 is then not
+overwritten with the saved value, in that run or any later one. No 0 read
+after it is taken as a level set since either, however late, since macOS may
+still hold the panel at a closing lid's 0: the entry stays flagged, with the
+display sample held, until the panel reads above 0. A close with no sample
+leaves the entry flagged. If state.json refuses `keptDisplayReadLit`, an
+end returns
+`.incomplete(agentArmed: false)` and Quit waits until it lands. Legacy
+`frozenPids` entries are never signaled or cleared by the shell. A flag is
+cleared only after its undo succeeded; a journal that is unreadable or has a
+known key of the wrong type is left untouched and the run exits 1.
 
 The app and the script serialize on one `flock(2)` lock,
 `.recovery.lock`, which is never unlinked so both lock the same inode
@@ -134,9 +178,15 @@ Flag a change that breaks one of these; do not flag the behavior itself.
   With no installed copy it runs the checkout's backstop anyway, which
   keeps those entries, so uninstall stops before removing anything.
 - `backstop.sh`, kept entries. Saved audio, saved display and keyboard
-  brightness, and `displayRestoredUnderLowPower` are kept for the app, not
-  restored by the shell. Legacy `frozenPids` are never signaled or cleared
-  there, even when the pid is gone (spec section 8).
+  brightness, `displayRestoredUnderLowPower` and the records
+  `keptDisplayUnderLowPower`, `keptDisplayUnderLowPowerBoot` and
+  `keptDisplayReadLit` are kept for the app, not restored by the shell,
+  except that a backstop run gives `keptDisplayUnderLowPowerBoot` its own
+  boot, in a journal it publishes before its `lowpowermode 0`, and leaves
+  the mode on if it cannot. The records are read from the file's text as
+  well as through plutil (`record_text_problems`), at the top level only.
+  Legacy `frozenPids` are never signaled or cleared there, even when the
+  pid is gone (spec section 8).
 - `ProcessControl.swift`, `LidActions.swift`, `backstop.sh`. Only pids
   Insomnia stopped are resumed, and only when the journaled identity still
   matches. Provisional entries written before the kernel confirmed the stop

@@ -113,6 +113,36 @@
 #                              and keyboard backlight the app set to 0 on lid
 #                              close; only the app can restore these (private
 #                              frameworks). Kept for the app's reconcile.
+#                              With displayRestoreRefused / keyboardRestore-
+#                              Refused true, the app's private-call guard
+#                              refused that restore on this macOS: kept, and
+#                              not dirty, since no run here or of that app
+#                              build can restore it.
+#       displayRestoredUnderLowPower, keptDisplayUnderLowPower,
+#       keptDisplayUnderLowPowerBoot, keptDisplayReadLit -> the app's own
+#                              records about a display restore under its Low
+#                              Power Mode and about a kept display entry.
+#                              Nothing to undo and not dirty: never read for
+#                              an undo here, and kept as they are for the
+#                              app, with one change. Before this run
+#                              switches Low Power Mode off, a record of the
+#                              kept entry gets this boot's
+#                              kern.bootsessionuuid (empty if it cannot be
+#                              read) as keptDisplayUnderLowPowerBoot, in a
+#                              journal published first, so the app takes no
+#                              reading of that entry in this boot as the
+#                              user's level while the panel comes back from
+#                              the mode, even if the journal written after
+#                              the undo is lost. If that journal cannot be
+#                              published, the mode is left on and kept for
+#                              retry. Their types are checked, and the three
+#                              keys about the kept entry are also read from
+#                              the file's text as the app reads it
+#                              (record_text_problems): at the top level, with
+#                              escapes in keys decoded. A number the app
+#                              cannot decode, one of these keys found twice
+#                              there, or text the check cannot follow makes
+#                              the journal malformed.
 #       appNapOverrides     -> NSAppSleepDisabled the app set to YES in an
 #                              agent app's preferences, with the value it had
 #                              before: defaults write <bundleId>
@@ -628,6 +658,163 @@ stop_transaction() { # what
   exit 1
 }
 
+# Prints one line per way the app's records about a kept display entry would
+# not decode, or nothing. Read from the text of state.json $1 itself, not
+# through plutil, which turns a number too small for a Double, such as
+# 1e-400, into 0.0, reads 1., .5, +1 and other JSON5 forms the app refuses,
+# and keeps the last of two copies of a key where the app's JSONDecoder keeps
+# the first. The text is read the way the app reads it. Only keys of the
+# top-level object count, with their \u escapes decoded, so
+# "keptDisplayReadL\u0069t" is that key. Every value is stepped over whole: a
+# string to its closing quote, an object or array to its closing bracket. So
+# a saved audio name or UID, or a nested object, that holds such a key, a \u
+# escape or a bad number holds no record. Each of the two numbers must be
+# null or a JSON number a Swift Float holds: not above about 3.4028236e38, and
+# either 0 in every digit or not so small that it rounds to 0 (below about
+# 7.0065e-46). The range is read from the decimal exponent and the first 9
+# significant digits, a little stricter than the app (from 3.40282356e38 and
+# up to 7.01e-46), where no brightness lies. A string, object or array there
+# is left to the type check. Also refused: one of the three keys found more
+# than once at the top level, since plutil checks and republishes the last
+# copy; a key with an escape JSON does not have, such as \x41, which plutil
+# reads as A; and a top level this reader cannot follow, such as a key
+# without quotes, a comment, a byte order mark other than UTF-8's, or a NUL
+# byte. UTF-16 and UTF-32, which the app also reads, have NUL bytes, and the
+# shell drops them from the text, which would turn such a file into other
+# characters. Text outside ASCII cannot spell the keys, even under the
+# decoder's Unicode equivalence, so a file with neither "keptDisplay" nor a
+# backslash in it has none of them and is not read further. Any of these
+# makes the journal malformed, as for a wrong type, and nothing is undone.
+record_text_problems() { # file
+  local LC_ALL=C
+  local text rest raw key c token depth str plain scalar number esc hex lost
+  local n_low=0 n_lit=0 n_boot=0 digits sig exp e10 lead
+  str='^"([^"\\]|\\.)*"'
+  plain='^[^]["{}]+'
+  scalar='^[^],}[:space:]]+'
+  number='^-?(0|[1-9][0-9]*)(\.([0-9]+))?([eE]([-+]?)([0-9]+))?$'
+  esc='^u00(4[1-9A-Fa-f]|5[0-9Aa]|6[1-9A-Fa-f]|7[0-9Aa])'
+  hex='^u[0-9A-Fa-f]{4}'
+  lost="the top level of state.json cannot be followed here, so its records about a kept display entry cannot be checked"
+  text="$(<"$1")"
+  [[ "$text" == *keptDisplay* || "$text" == *\\* ]] || return 0
+  if IFS= read -r -d '' c < "$1"; then
+    echo "$lost"
+    return 0
+  fi
+  rest="${text#$'\xef\xbb\xbf'}"
+  rest="${rest#"${rest%%[![:space:]]*}"}"
+  [[ "${rest:0:1}" == "{" ]] || { echo "$lost"; return 0; }
+  rest="${rest:1}"
+  while :; do
+    rest="${rest#"${rest%%[![:space:]]*}"}"
+    # An empty object, or a comma before the end, which the app accepts.
+    [[ "${rest:0:1}" == "}" ]] && break
+    [[ "$rest" =~ $str ]] || { echo "$lost"; return 0; }
+    raw="${BASH_REMATCH[0]}"
+    rest="${rest:${#raw}}"
+    raw="${raw:1:${#raw}-2}"
+    # The key as the app reads it. Of the escapes JSON has, only a \u of a
+    # letter can be part of one of the three keys; the others stand for no
+    # letter.
+    key=""
+    while [[ "$raw" == *\\* ]]; do
+      key+="${raw%%\\*}"
+      raw="${raw#*\\}"
+      if [[ "$raw" =~ $esc ]]; then
+        printf -v c '%b' "\\x${BASH_REMATCH[1]}"
+        key+="$c"
+        raw="${raw:5}"
+      elif [[ "$raw" =~ $hex ]]; then
+        key+="?"
+        raw="${raw:5}"
+      else
+        case "${raw:0:1}" in
+          '"'|\\|/|b|f|n|r|t) key+="?"; raw="${raw:1}" ;;
+          *) echo "a key in state.json has an escape JSON does not have, so its records about a kept display entry cannot be checked"; return 0 ;;
+        esac
+      fi
+    done
+    key+="$raw"
+    rest="${rest#"${rest%%[![:space:]]*}"}"
+    [[ "${rest:0:1}" == : ]] || { echo "$lost"; return 0; }
+    rest="${rest:1}"
+    rest="${rest#"${rest%%[![:space:]]*}"}"
+    token=""
+    case "${rest:0:1}" in
+      '"')
+        [[ "$rest" =~ $str ]] || { echo "$lost"; return 0; }
+        rest="${rest:${#BASH_REMATCH[0]}}"
+        ;;
+      '{'|'[')
+        depth=0
+        while :; do
+          case "${rest:0:1}" in
+            '{'|'[') depth=$((depth + 1)); rest="${rest:1}" ;;
+            '}'|']') depth=$((depth - 1)); rest="${rest:1}"; (( depth > 0 )) || break ;;
+            '"')
+              [[ "$rest" =~ $str ]] || { echo "$lost"; return 0; }
+              rest="${rest:${#BASH_REMATCH[0]}}"
+              ;;
+            '') echo "$lost"; return 0 ;;
+            *)
+              [[ "$rest" =~ $plain ]] || { echo "$lost"; return 0; }
+              rest="${rest:${#BASH_REMATCH[0]}}"
+              ;;
+          esac
+        done
+        ;;
+      *)
+        [[ "$rest" =~ $scalar ]] || { echo "$lost"; return 0; }
+        token="${BASH_REMATCH[0]}"
+        rest="${rest:${#token}}"
+        ;;
+    esac
+    case "$key" in
+      keptDisplayUnderLowPower) n_low=$((n_low + 1)) ;;
+      keptDisplayReadLit) n_lit=$((n_lit + 1)) ;;
+      # The boot is a string, whose type plutil checks.
+      keptDisplayUnderLowPowerBoot) n_boot=$((n_boot + 1)); token="" ;;
+      *) token="" ;;
+    esac
+    if [[ -n "$token" && "$token" != null ]]; then
+      if [[ "$token" =~ $number ]]; then
+        digits="${BASH_REMATCH[1]}${BASH_REMATCH[3]}"
+        sig="${digits#"${digits%%[1-9]*}"}"
+        if [[ -n "$sig" ]]; then
+          exp="${BASH_REMATCH[6]#"${BASH_REMATCH[6]%%[1-9]*}"}"
+          if (( ${#exp} > 18 )); then
+            e10=1000000000000000000
+          else
+            e10=$((10#0$exp))
+          fi
+          [[ "${BASH_REMATCH[5]}" == - ]] && e10=$((-e10))
+          e10=$((e10 + ${#BASH_REMATCH[1]} - 1 - (${#digits} - ${#sig})))
+          lead="${sig}00000000"
+          lead=$((10#${lead:0:9}))
+          if (( e10 < -46 || (e10 == -46 && lead < 701000000) )); then
+            echo "$key is ${token:0:40}, too small a number for the app to read"
+          elif (( e10 > 38 || (e10 == 38 && lead > 340282355) )); then
+            echo "$key is ${token:0:40}, too large a number for the app to read"
+          fi
+        fi
+      else
+        echo "$key is written as ${token:0:40}, which the app does not read as a number"
+      fi
+    fi
+    rest="${rest#"${rest%%[![:space:]]*}"}"
+    case "${rest:0:1}" in
+      ,) rest="${rest:1}" ;;
+      '}') break ;;
+      *) echo "$lost"; return 0 ;;
+    esac
+  done
+  (( n_low > 1 )) && echo "keptDisplayUnderLowPower is in the top level of state.json $n_low times; the app reads the first and plutil the last"
+  (( n_lit > 1 )) && echo "keptDisplayReadLit is in the top level of state.json $n_lit times; the app reads the first and plutil the last"
+  (( n_boot > 1 )) && echo "keptDisplayUnderLowPowerBoot is in the top level of state.json $n_boot times; the app reads the first and plutil the last"
+  return 0
+}
+
 # Prints one line per way the journal does not have the shape the app writes
 # (RuntimeState.swift). Present keys must have the right type; a JSON null is
 # the same as an absent optional (Swift decodeIfPresent).
@@ -637,14 +824,24 @@ journal_shape_problems() { # file
     echo "state.json is not a JSON object"
     return 0
   fi
-  for key in sleepDisabledByUs lowPowerSetByUs dockerFrozen savedMuted; do
+  for key in sleepDisabledByUs lowPowerSetByUs dockerFrozen savedMuted displayRestoreRefused keyboardRestoreRefused; do
     t="$(type_of "$f" "$key")"
     [[ -z "$t" || "$t" == bool || "$t" == "(any)" ]] || echo "$key is a $t, not a bool"
   done
-  for key in savedOutputVolume savedDisplayBrightness savedKeyboardBrightness; do
+  for key in savedOutputVolume savedDisplayBrightness savedKeyboardBrightness displayRestoredUnderLowPower; do
     t="$(type_of "$f" "$key")"
     [[ -z "$t" || "$t" == float || "$t" == integer || "$t" == "(any)" ]] || echo "$key is a $t, not a number"
   done
+  # The app's records about a kept display entry: kept for the app, never
+  # read for an undo here. Each must still decode, or the app cannot read
+  # the journal at all.
+  for key in keptDisplayUnderLowPower keptDisplayReadLit; do
+    t="$(type_of "$f" "$key")"
+    [[ -z "$t" || "$t" == float || "$t" == integer || "$t" == "(any)" ]] || echo "$key is a $t, not a number"
+  done
+  t="$(type_of "$f" keptDisplayUnderLowPowerBoot)"
+  [[ -z "$t" || "$t" == string || "$t" == "(any)" ]] || echo "keptDisplayUnderLowPowerBoot is a $t, not a string"
+  record_text_problems "$f"
   t="$(type_of "$f" frozenProcesses)"
   if [[ -n "$t" && "$t" != "(any)" ]]; then
     if [[ "$t" != array ]]; then
@@ -1220,7 +1417,7 @@ if [[ "$journal_state" == malformed ]]; then
 fi
 
 sleep_held=false; low_power=false; docker_frozen=false; has_audio=0
-has_display=0; has_keyboard=0
+has_display=0; has_keyboard=0; refused_display=0; refused_keyboard=0
 frozen_count=0; legacy_count=0; app_nap_count=0; output_count=0
 if [[ "$journal_state" == clean ]]; then
   is_true "$STATE" sleepDisabledByUs && sleep_held=true
@@ -1228,8 +1425,12 @@ if [[ "$journal_state" == clean ]]; then
   is_true "$STATE" dockerFrozen && docker_frozen=true
   extract "$STATE" savedOutputVolume >/dev/null && has_audio=1
   extract "$STATE" savedMuted >/dev/null && has_audio=1
-  extract "$STATE" savedDisplayBrightness >/dev/null && has_display=1
-  extract "$STATE" savedKeyboardBrightness >/dev/null && has_keyboard=1
+  if extract "$STATE" savedDisplayBrightness >/dev/null; then
+    if is_true "$STATE" displayRestoreRefused; then refused_display=1; else has_display=1; fi
+  fi
+  if extract "$STATE" savedKeyboardBrightness >/dev/null; then
+    if is_true "$STATE" keyboardRestoreRefused; then refused_keyboard=1; else has_keyboard=1; fi
+  fi
   while extract_json "$STATE" "frozenProcesses.$frozen_count" >/dev/null; do
     frozen_count=$((frozen_count + 1))
   done
@@ -1247,6 +1448,17 @@ if [[ "$journal_state" == clean ]]; then
      || (( has_audio == 1 || has_display == 1 || has_keyboard == 1 || frozen_count > 0 || legacy_count > 0 || app_nap_count > 0 )); then
     journal_state=dirty
   fi
+fi
+
+# Brightness the app kept after its private-call guard refused the
+# restore: it stays in the journal for a build that can make the call, and
+# is not dirty, since neither this script nor that app build can restore it.
+refused_note=""
+if (( refused_display == 1 || refused_keyboard == 1 )); then
+  refused=()
+  (( refused_display == 1 )) && refused+=("saved display brightness")
+  (( refused_keyboard == 1 )) && refused+=("saved keyboard backlight")
+  refused_note="$(IFS=,; echo "${refused[*]}") kept: the app's private-call guard refused that restore on this macOS, so nothing here or in that app build can restore it; set the level with the brightness keys"
 fi
 
 # session.json that is not a session, or cannot be read. Its bytes are
@@ -1298,6 +1510,7 @@ if [[ "$journal_state" != dirty ]]; then
     log info "$session_note; nothing journaled to undo"
   fi
   if [[ "$session_state" == malformed || "$session_state" == unreadable ]]; then
+    [[ -n "$refused_note" ]] && log info "$refused_note"
     quarantine_session || exit 1
   elif [[ "$session_state" != none ]]; then
     if [[ "$journal_state" == missing ]]; then
@@ -1305,6 +1518,7 @@ if [[ "$journal_state" != dirty ]]; then
     else
       log info "$session_note; journal already clean"
     fi
+    [[ -n "$refused_note" ]] && log info "$refused_note"
     "$RM" -f "$SESSION"
   fi
   exit_unless_marker_stuck "journal is clean"
@@ -1338,9 +1552,53 @@ elif [[ "$sleep_held" == true ]]; then
   fi
 fi
 
+# The app's record of a kept display entry the mode was over
+# (keptDisplayUnderLowPower). The mode may have been on in this boot until
+# now, and the panel comes back from it over a time nobody has measured, so
+# the record is given this boot before the mode goes off, in a journal
+# published on its own. The app then takes no reading of that entry in this
+# boot as the user's level, as when it switches the mode off itself. That
+# holds also when the journal written after the undo below never lands: the
+# file then still says lowPowerSetByUs, next to a record from this boot,
+# which the app reads as its own mode on in this boot. A boot that cannot be
+# read is written empty, which the app reads as this boot's too, and a
+# record that already has this boot is left as it is. Returns non-zero when
+# the record could not be published; the caller then leaves the mode on,
+# since switched off with the old boot on disk, the app could take the panel
+# on its way back for the level the user set. A journal with no record, or a
+# null one, gets none.
+prepare_low_power_off() {
+  local t boot recorded tmp ok=1
+  t="$(type_of "$STATE" keptDisplayUnderLowPower)"
+  [[ "$t" == float || "$t" == integer ]] || return 0
+  boot="$("$SYSCTL" -n kern.bootsessionuuid 2>/dev/null || true)"
+  recorded="$(extract "$STATE" keptDisplayUnderLowPowerBoot || true)"
+  [[ "$recorded" == "$boot" ]] && return 0
+  tmp="$APP_SUPPORT/.state.json.backstop-boot.$$"
+  "$CP" "$STATE" "$tmp" || ok=0
+  if (( ok == 1 )); then
+    "$PLUTIL" -replace keptDisplayUnderLowPowerBoot -string "$boot" "$tmp" >/dev/null 2>&1 || ok=0
+  fi
+  if (( ok == 1 )); then
+    [[ "$("$PLUTIL" -convert json -o - "$tmp" 2>/dev/null | head -c 1)" == "{" ]] || ok=0
+    [[ "$(head -c 1 "$tmp")" == "{" ]] || ok=0
+  fi
+  if (( ok == 1 )); then
+    "$MV" -f "$tmp" "$STATE" || ok=0
+  fi
+  if (( ok == 0 )); then
+    "$RM" -f "$tmp"
+    return 1
+  fi
+  log info "kept display entry's record given this boot (${boot:-unreadable, written empty}) before Low Power Mode is switched off"
+}
+
 new_low="$low_power"
 if [[ "$low_power" == true ]]; then
-  if run_bounded "$SUDO" -n "$PMSET" -b lowpowermode 0; then
+  if ! prepare_low_power_off; then
+    log error "could not publish this boot for the kept display entry's record to $STATE; Low Power Mode left on, keeping journal entry for retry"
+    failures+=("Low Power Mode is still set: state.json could not take this boot for the kept display entry's record, so the mode was not switched off")
+  elif run_bounded "$SUDO" -n "$PMSET" -b lowpowermode 0; then
     log info "pmset -b lowpowermode 0 ok"
     new_low=false; changed=1
   else
@@ -1663,6 +1921,7 @@ if (( has_audio == 1 || has_display == 1 || has_keyboard == 1 )); then
   log error "$(IFS=,; echo "${pending[*]}") can only be restored by the app; kept. Open Insomnia"
   failures+=("saved audio, display brightness or keyboard backlight settings need the app: open Insomnia to restore them")
 fi
+[[ -n "$refused_note" ]] && log info "$refused_note"
 
 # --- Publish -----------------------------------------------------------------
 # Edit a private copy, verify it, then rename it over state.json so readers
