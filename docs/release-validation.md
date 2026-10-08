@@ -104,6 +104,79 @@ close journals the trusted value or the sample, leaves the keyboard alone when
 neither exists, and the open re-asserts the restore 2 s after the wake. Unit
 tests with fakes only; the hardware rows below are unchanged.
 
+Measured on October 1, 2026 on the same machine (macOS 26.2, 25C56, arm64),
+read-only through the Objective-C runtime, the `KeyboardBrightnessClient`
+instance method type encodings: `copyKeyboardBacklightIDs` `@16@0:8`,
+`isKeyboardBuiltIn:` `B24@0:8Q16`, `brightnessForKeyboard:` `f24@0:8Q16`,
+`setBrightness:forKeyboard:` `B28@0:8f16Q20`,
+`isBacklightSuppressedOnKeyboard:` `B24@0:8Q16`,
+`isBacklightDimmedOnKeyboard:` `B24@0:8Q16`. `DisplayPower.swift` now
+refuses the DisplayServices calls on any macOS major other than 26, and the
+keyboard class when a required method is missing or an encoding (offsets
+removed) differs from these; on an Intel Mac `BOOL` encodes as `c`, so the
+keyboard backlight is refused there until measured. A refused device is
+skipped at lid close, journals nothing, and is named in Settings; with
+both devices refused the close does not request display sleep, since the
+open wakes the display only for a journaled brightness. A value
+journaled before an update that the guard now refuses stays journaled,
+flagged as refused so it no longer counts as dirty, with an error that
+names each saved level and says to set it by hand; backstop.sh and
+uninstall.sh read the flag. A later build that can make the call writes
+the kept value only while the device still reads 0, the level the close
+left, so a level set by hand since is not overwritten. It decides only
+on a reading taken with the lid known to be open, the display awake and
+the keyboard backlight neither suppressed nor dimmed, keeps the entry
+when the read fails, and reads again every 3 s for a minute, then every
+minute while the entry waits, reading nothing while the lid is not known
+to be open. An entry found set since, or written, that state.json cannot
+clear is not read or written again, and only its clear is retried; the
+clear goes into the journal ahead of any later write, so a lid close
+journals the level the device reads. When the write fails and state.json
+cannot take the cleared flag either, backstop.sh would pass over the
+entry, so Insomnia retries it in process and holds Quit until the write
+lands or the flag is on disk. The sampler takes no reading of a device
+whose brightness is journaled, and each level written from the journal
+or found set since becomes its sample, so a close right after a late
+restore journals that level. A display reading above 0 under Insomnia's
+own Low Power Mode, or after it in the same boot, relaunches included,
+decides nothing, and a launch after a restart reads the entry again. A
+backstop run whose `lowpowermode 0` exits 0 gives that record its own boot,
+so a launch in that boot doubts the reading too. A later reading of 0, in
+that run, a relaunch or after a restart, does not bring the kept value back
+either (the reading above 0 is journaled), unless the reading above 0 was
+taken under a closing lid, of a panel asleep, or of another entry. That 0
+is not taken as a level set since either, however late it is read, since
+macOS may still hold the panel at a closing lid's 0: the entry stays
+flagged until the panel reads above 0. If state.json refuses that record,
+Quit waits until it lands. A Low Power Mode claim journaled before a
+restart is read before the switch-off, and the read only goes to the
+log. Whether the mode reads on, off or not at all, the switch-off counts
+as Insomnia's in this boot, since a mode that reads off may have gone off
+only a moment ago. The kept display entry is recorded for this boot, so
+it stays flagged, and the display is not sampled, through this boot,
+relaunches included. A mode off since long before the launch reads the
+same, and its entry waits the same way, at the same cost. Only a launch
+after a restart that came after state.json took the ownership clear can
+decide the entry, and only by a trusted reading with the lid known open
+and the panel awake. After a reading above 0, a 0 still waits for a
+reading above 0. A boot session that cannot be read, a lid not known to
+be open, a panel asleep or unreadable, or a state.json that refuses the
+writes can keep the entry waiting longer. That a restart ends the mode's
+rescale is assumed, not measured, and a restart clears no entry by
+itself. A close with no trusted level leaves the
+entry flagged and the panel lit, and only asks the display to sleep. After
+a reading above 0, a close whose only level is a 0 read under the closing
+lid leaves the entry flagged too. A write whose clear state.json refuses is still written again 2 s
+later and, under the mode, after it. A `lowpowermode 0` that exits 0 while
+state.json refuses the ownership clear still does the write owed after
+the mode, and the display sample stays the level written after it until
+the clear lands; one that exits 0 while state.json cannot be read does
+that write once state.json reads again and still owes it. A write after
+the mode dropped while state.json refuses that clear stays dropped. Unit
+tests with an injected version and
+fake classes only; the rows below stay "Not run", and the guards do not
+stand in for them.
+
 ## Hardware validation still required
 
 None of the cases below is certified by the automated regression suite. Record
@@ -120,6 +193,22 @@ is performed. Do not replace "not run" with "passed" based on source review.
 | Backstop resuming a frozen test process through the installed `Insomnia --resume-frozen`, and keeping the entry when the bundle is removed or its Info.plist lacks `InsomniaResumeFrozenVersion` | Not run |
 | Lid-close/open and safe recovery of explicitly selected test processes | Not run |
 | Lid-close display/keyboard darkening and restore | Not run |
+| Darkening still runs under the private-call guards on macOS 26 (close the lid during a session: the log shows "display darkened" and "keyboard backlight off" and no "refused" line; Settings shows no note under the darken toggle) | Not run |
+| Darkening refused on an unmeasured macOS version (a macOS major other than 26, or a `KeyboardBrightnessClient` whose methods changed: the log shows the "refused" line once and "skipped" at lid close, nothing is journaled for that device, and Settings names the reason under the darken toggle; with both refused the log shows "display sleep not requested" and the panel is lit when the lid opens; a level saved by the earlier build stays in state.json with `displayRestoreRefused` or `keyboardRestoreRefused` after the first open or launch, the menu says it could not be restored on this macOS build and names each saved level, Settings shows the saved level under the darken toggle, no "Restore incomplete" follows, and the backstop log does not fail for it) | Not run |
+| A kept brightness on a build that can make the call (after a refused restore, set the keyboard backlight by hand, put the display to sleep, then launch that build and wake the display): the log shows "not read: macOS has the backlight suppressed or dimmed" and then "set since its restore", and the backlight stays at the level set | Not run |
+| A kept keyboard backlight when a session ends with the lid closed, on a build that can make the call: the log shows "the lid is not known to be open, so the kept value is not read", and about a minute or less after the lid opens, with no session, "set since its restore" or "keyboard backlight restored" | Not run |
+| A kept brightness at a launch with no session and the lid closed (an external display in clamshell mode, after a refused restore), on a build that can make the call: the log shows "not read: the lid is not known to be open" for each kept device and nothing is written, and once the lid opens "set since its restore" or "restored" | Not run |
+| A kept display brightness restored late during a session (launch with the display asleep after a refused restore, wake it, start a session at once, wait for "display restored", then close and open the lid within 30 s): the close logs "display darkened (was brightness" with the restored level, and the open brings the panel back at that level, not black | Not run |
+| A kept display brightness under Insomnia's own Low Power Mode, on a build that can make the call (after a refused restore, set the display by hand, start a session on battery below the floor so Insomnia switches the mode on, then open the lid): the log shows "under our low power mode, which rescales it" and nothing is written; once the mode is off, "after our low power mode was or may have been on in this run" and nothing is written, and a close logs "stays journaled and undecided, and the display is not darkened" and the panel goes dark only if the display sleep request is honored; after a relaunch with the lid open, "since the Mac last started" and nothing is written; after a restart, "set since its restore" with the level set by hand, and a close and open after that bring back that level | Not run |
+| A kept display brightness over a restart with Insomnia's Low Power Mode claimed (as in the row above, quit the app with `kill -9` while the mode is on, restart the Mac, set the display by hand, then launch on battery): the log shows "journaled as ours before the Mac last started, reads on" or "reads off; it may have gone off only a moment ago"; either way nothing is written and the display is not darkened at a close until the next restart, and after it "set since its restore" with the level set by hand. After an open under the mode read the panel above 0, set the display to 0 by hand, relaunch and then restart: the kept value never comes back over that 0, after the restart the log shows "only a reading above 0 tells them apart" and the entry stays in state.json, and once the display is raised above 0 by hand, "set since its restore" with that level | Not run |
+| A kept display brightness when the recovery agent switches Insomnia's Low Power Mode off after a restart (as in the row above, quit with `kill -9` while the mode is on, restart the Mac, and wait for "pmset -b lowpowermode 0 ok" in the backstop log before launching on battery): the backstop log shows "kept display entry's record given this boot" before "pmset -b lowpowermode 0 ok", state.json's `keptDisplayUnderLowPowerBoot` is this boot's `kern.bootsessionuuid`, the launch logs "since the Mac last started" and writes nothing, and after the next restart "set since its restore" | Not run |
+| Quit while a reading above 0 of the kept display entry is not yet in state.json (as in the restart row above, `chflags uchg` state.json before the launch after the restart that reads the panel above 0, then Quit): the menu says "do not quit until state.json can be written" and Insomnia keeps running; after `chflags nouchg`, Quit within the next retry quits, and state.json has `keptDisplayReadLit` | Not run |
+| The recovery agent when state.json refuses writes over a kept display entry (as in the agent row above, `chflags uchg` state.json in the new boot before the agent runs): the backstop log shows "Low Power Mode left on, keeping journal entry for retry", `pmset -g` still shows lowpowermode 1, and sleep is restored; after `chflags nouchg`, the next run logs "record given this boot" and then "pmset -b lowpowermode 0 ok" | Not run |
+| Quit while the clear of a settled kept display brightness is not yet in state.json (after a refused restore, set the display by hand above 0, `chflags uchg` state.json, launch with no session so the log shows "set since its restore", set the display to 0 by hand, then Quit): the notification says "do not quit until state.json can be written", Insomnia keeps running and Start is refused; after `chflags nouchg`, the next retry clears the entry from state.json, Quit quits, and a relaunch leaves the display at 0 | Not run |
+| Backstop and uninstall over saved audio of an output device renamed to `Headset \u0041` (a Bluetooth headset renamed in Bluetooth settings, the lid closed on it with muting on, then the app quit with `kill -9` and the session left to expire): the backstop log has no "malformed" and shows "pmset -a disablesleep 0 ok", state.json keeps the headset's entry, and the next launch with the headset connected restores its volume and mute | Not run |
+| A kept display brightness read above 0 that a close under the closing lid reads at 0 (as in the row above, after the launch that leaves the entry waiting, keep the display asleep until the session starts, wake it with auto-brightness on, then close the lid in a dark room before the next re-read): the close logs "where auto-brightness under the closing lid may have pulled it down" and "stays journaled and undecided", nothing is written at the close or the open, and while the panel reads 0 the open and every re-read log "only a reading above 0 tells them apart" and the entry stays in state.json; once the panel reads above 0, "set since its restore" with that level, and the kept value is never written | Not run |
+| The same entry across a relaunch (as in the row above, quit Insomnia after the close with the lid still closed, open the lid, and relaunch Insomnia while the panel still reads 0): the launch logs "only a reading above 0 tells them apart" while the panel reads 0, nothing is written, and once the panel reads above 0, "set since its restore" with that level | Not run |
+| Backstop and uninstall with a hand-edited state.json whose `keptDisplayReadLit` is `1e-400` (a copy of a journal from the restart row above, in a test home): the backstop logs "is unreadable or malformed; nothing undone, evidence kept", uninstall prints "state.json is unreadable or malformed" and removes nothing, and state.json is unchanged | Not run |
 | Freeze-all scope with agents running (Cursor/T3 Code/Claude untouched) | Not run |
 | Freeze-all off on a fresh config.json (list only) and on with a terminal, a non-Chrome browser and a JetBrains IDE open (all untouched) | Not run |
 | Real lid close with freeze-all on during a Zoom or Teams call on AirPods, with Wispr Flow or Granola taking notes: none of their processes stopped (`ps -o stat` shows no `T`), the call and the notes continue, other Dock apps frozen, sound muted | Not run |
