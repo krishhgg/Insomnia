@@ -604,6 +604,10 @@ final class SessionManager {
     /// missing, unreadable or carrying other cutoffs (a write that failed,
     /// a busy lock): `recoveryRetryDelay` later, not every second.
     @ObservationIgnored private var configCheckRetryAt = Date.distantPast
+    /// Run by `updateConfig` after config.json refused a cutoff change and
+    /// before the journal's record of the old cutoffs is put back.
+    /// Injection point for tests that make that write fail.
+    @ObservationIgnored var beforeRecordedCutoffsPutBack: (() -> Void)?
 
     init(
         paths: Paths,
@@ -1041,7 +1045,10 @@ final class SessionManager {
     /// held until config.json is written. A busy lock, an unreadable
     /// journal or a write that fails leaves both on the old cutoffs (a
     /// journal record already written is put back), says so in
-    /// `configSaveError`, and returns false. Any other change takes effect
+    /// `configSaveError`, and returns false. When the record cannot be put
+    /// back either, the journal holds cutoffs config.json does not, so the
+    /// session ends: on disk before the lock is released
+    /// (`endSessionOnDisk`), then in process. Any other change takes effect
     /// at once and is written behind it; a write that fails is logged, and
     /// the next save writes it.
     @discardableResult
@@ -1072,12 +1079,26 @@ final class SessionManager {
                 return false
             }
             if let recorded {
+                beforeRecordedCutoffsPutBack?()
                 do {
                     try journal { $0.sessionCutoffs = recorded.before }
                 } catch {
-                    // The next transaction or tick records the cutoffs in
-                    // use again (`publishSessionCutoffs`).
-                    Log.error("could not put the session's recorded cutoffs back in state.json: \(error.localizedDescription)")
+                    // The journal records cutoffs config.json does not
+                    // carry, and the agent enforces that record whenever it
+                    // cannot use config.json. The session ends on disk here,
+                    // under the lock the record was written under, so no
+                    // agent run or relaunch reads it as live; the undo
+                    // follows in its own transaction.
+                    let putBack = error.localizedDescription
+                    Log.error("settings: could not put the session's recorded \(recorded.before?.description ?? "absence of cutoffs") back in state.json (\(putBack)); ending the session")
+                    let retained = RecoveryLock.$held.withValue(recorded.lock) { endSessionOnDisk() }
+                    endTicket += 1
+                    pendingEnd = .cutoffsNotRecorded
+                    Task { @MainActor [weak self] in _ = await self?.end(reason: .cutoffsNotRecorded) }
+                    let line = "Could not save the change to config.json (\(detail)), or put back the end floor and thermal rules recorded for the session in state.json (\(putBack)). The recovery agent reads them from those files, so Insomnia ended the session" + (retained.map { ": \($0)" } ?? ".") + " The settings stay at \(config.agentCutoffs.description)."
+                    Log.error("settings: \(c.agentCutoffs.description) not applied: \(line)")
+                    configSaveError = line
+                    return false
                 }
             }
             let line = "Could not save the change to config.json (\(detail)). The recovery agent reads the end floor and thermal rules from that file, so both stay at \(config.agentCutoffs.description)."
@@ -1856,28 +1877,7 @@ final class SessionManager {
         countdownText = ""
         // Why session.json is still in place when a relaunch could act on
         // it; the end is then retried and quit refused.
-        var retainedBecause: String?
-        if let kept = keptSessionFile {
-            retainedBecause = retryMovingAsideKeptSessionFile(kept)
-        } else {
-            do {
-                try store.deleteSession()
-                dropJournaledSessionEnd()
-            } catch {
-                // The end is decided: a file that stays must not read as a
-                // live session to the next launch or to backstop.sh. The
-                // record is written before restoreAll undoes anything.
-                let recordedIn: String? = store.recordSessionEnd() ? "ended-session.json"
-                    : journalSessionEnd() ? "state.json"
-                    : store.recordSessionEndAside()?.lastPathComponent
-                        ?? (store.recordSessionEndInLock() ? "the recovery lock file \(paths.recoveryLock.lastPathComponent)" : nil)
-                let relaunch = recordedIn != nil
-                    ? "its end is recorded, so a relaunch will not resume it"
-                    : "a relaunch does not resume it while the file cannot be replaced, but once it and state.json take writes again, one while sleep is still disabled could hold sleep again for it"
-                retainedBecause = "session.json could not be removed (\(error.localizedDescription)); \(relaunch)."
-                fail("could not remove session.json: \(error.localizedDescription)" + (recordedIn.map { "; its end is recorded in \($0)" } ?? "; its end could not be recorded either"))
-            }
-        }
+        let retainedBecause = endSessionOnDisk()
         let stuck = await restoreAll()
         services?.stop()
 
@@ -1983,6 +1983,34 @@ final class SessionManager {
         notifier.post(title: Self.endTitle(reason, had: had), body: endBody(reason, waiting: waiting))
         settlePendingEnd()
         return .restored
+    }
+
+    /// The end decided on disk, under the lock the caller holds, before
+    /// anything is undone: session.json removed (moved aside when it was
+    /// kept unread), or, when it cannot be removed, recorded as ended in
+    /// ended-session.json, else the journal, else a record aside, else the
+    /// recovery lock file, so it does not read as a live session to the
+    /// next launch or to backstop.sh. Returns why session.json is still in
+    /// place when a relaunch could act on it, or nil.
+    private func endSessionOnDisk() -> String? {
+        if let kept = keptSessionFile {
+            return retryMovingAsideKeptSessionFile(kept)
+        }
+        do {
+            try store.deleteSession()
+            dropJournaledSessionEnd()
+            return nil
+        } catch {
+            let recordedIn: String? = store.recordSessionEnd() ? "ended-session.json"
+                : journalSessionEnd() ? "state.json"
+                : store.recordSessionEndAside()?.lastPathComponent
+                    ?? (store.recordSessionEndInLock() ? "the recovery lock file \(paths.recoveryLock.lastPathComponent)" : nil)
+            let relaunch = recordedIn != nil
+                ? "its end is recorded, so a relaunch will not resume it"
+                : "a relaunch does not resume it while the file cannot be replaced, but once it and state.json take writes again, one while sleep is still disabled could hold sleep again for it"
+            fail("could not remove session.json: \(error.localizedDescription)" + (recordedIn.map { "; its end is recorded in \($0)" } ?? "; its end could not be recorded either"))
+            return "session.json could not be removed (\(error.localizedDescription)); \(relaunch)."
+        }
     }
 
     /// An end that finished, or left the rest to an armed agent, resolves

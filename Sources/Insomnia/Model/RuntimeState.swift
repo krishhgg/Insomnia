@@ -224,7 +224,8 @@ struct RuntimeState: Codable, Equatable, Sendable {
     /// keeps it as it is, and the app clears it when it removes
     /// session.json. A value the app does not write decodes as nil here
     /// (`decodeSessionCutoffs`), so the app records its own over it; the
-    /// agent's reader rejects it and enforces the strictest cutoffs.
+    /// agent's reader answers `foreign` for it and enforces the strictest
+    /// cutoffs.
     var sessionCutoffs: AgentCutoffs? = nil
 
     /// Bare pids of every journaled freeze, for display and de-duplication.

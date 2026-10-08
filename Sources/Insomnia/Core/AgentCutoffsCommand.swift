@@ -17,10 +17,14 @@ import Foundation
 /// no file opened, no setting written, no lock taken, no private API.
 ///
 /// `--agent-session-cutoffs` is for when config.json is missing, cannot be
-/// read or is rejected: it decodes the journal's bytes the way the app
-/// reads its `sessionCutoffs` (`RuntimeState.decodeSessionCutoffs`) and
-/// prints the cutoffs the app recorded for the session, so a hung app's
-/// session keeps the floor and rule it had.
+/// read or is rejected. It first decodes the whole journal with the app's
+/// own decoder (`Store.decodeState`, which `Store.loadState` runs). The app
+/// does not start, extend or end a session on a journal that fails there,
+/// and backstop.sh then keeps the session and the journal as they are.
+/// Then it reads the journal's `sessionCutoffs` strictly
+/// (`RuntimeState.decodeSessionCutoffs`) and prints the cutoffs the app
+/// recorded for the session, so a hung app's session keeps the floor and
+/// rule it had.
 ///
 /// `<seconds>` is how long this process may live, a whole number from 1 to
 /// `ResumeFrozenCommand.maxLifetimeSeconds`. As in `--resume-frozen`, it
@@ -34,18 +38,23 @@ import Foundation
 ///                                       journal, record cutoffs); exit 0
 ///     none                              the journal records none (one an
 ///                                       older build wrote); exit 0
-///     rejected                          the app's decoder rejects them, or
-///                                       the journal is not a JSON object
-///                                       or records a value the app does
-///                                       not write; exit 65
+///     rejected                          the app's decoder rejects them
+///                                       (the journal: all of it, as the
+///                                       app loads it); exit 65
+///     foreign                           the journal decodes, but its
+///                                       sessionCutoffs is a value the app
+///                                       does not write, which the app
+///                                       reads as none; exit 65
 ///     unreadable                        standard input failed, or held more
 ///                                       than `maxInputBytes`; exit 74
 ///     usage                             bad arguments, nothing read; exit 64
 ///
 /// backstop.sh enforces the printed cutoffs. On `rejected` from
 /// config.json it asks for the journal's; on `none` it enforces the app's
-/// defaults (`Config.agentDefaultCutoffs`); for any other outcome, the
-/// strictest cutoffs (see read_cutoffs there).
+/// defaults (`Config.agentDefaultCutoffs`); on `rejected` from the journal
+/// it stops without ending the session; on `foreign`, the strictest
+/// cutoffs; when the binary gives no answer, it reads the journal's
+/// cutoffs itself (see read_cutoffs there).
 ///
 /// The bundle declares this interface as `InsomniaAgentCutoffsVersion`
 /// (`version`) in its Info.plist. backstop.sh runs the binary only when the
@@ -55,8 +64,9 @@ enum AgentCutoffsCommand {
     static let flag = "--agent-cutoffs"
     static let sessionFlag = "--agent-session-cutoffs"
     /// `InsomniaAgentCutoffsVersion` in Resources/Info.plist, and
-    /// AGENT_CUTOFFS_VERSION in backstop.sh. 2 added `sessionFlag`.
-    static let version = 2
+    /// AGENT_CUTOFFS_VERSION in backstop.sh. 2 added `sessionFlag`; 3 made
+    /// it decode the whole journal first and added `foreign`.
+    static let version = 3
     /// EX_USAGE, EX_DATAERR and EX_IOERR from sysexits(3).
     static let usageStatus: Int32 = 64
     static let rejectedStatus: Int32 = 65
@@ -95,12 +105,16 @@ enum AgentCutoffsCommand {
         return cutoffsOutput(config.agentCutoffs)
     }
 
-    /// The answer for state.json's bytes: the cutoffs the app recorded for
-    /// the session, through the reader the app uses for them, which picks
-    /// duplicate and escaped keys as the app's decoder does.
+    /// The answer for state.json's bytes: `rejected` for a journal the app
+    /// cannot load, else the cutoffs the app recorded for the session,
+    /// through the reader the app uses for them, which picks duplicate and
+    /// escaped keys as the app's decoder does.
     static func sessionAnswer(for data: Data) -> ResumeFrozenCommand.Output {
-        guard let journal = try? Store.makeDecoder().decode(JournaledSessionCutoffs.self, from: data) else {
+        guard (try? Store.decodeState(data)) != nil else {
             return .init(lines: ["rejected"], status: rejectedStatus)
+        }
+        guard let journal = try? Store.makeDecoder().decode(JournaledSessionCutoffs.self, from: data) else {
+            return .init(lines: ["foreign"], status: rejectedStatus)
         }
         guard let cutoffs = journal.cutoffs else { return .init(lines: ["none"], status: 0) }
         return cutoffsOutput(cutoffs)

@@ -374,9 +374,14 @@ session. A journal without them (a session an older build started) gives the
 app's defaults (10%, on). When the binary cannot answer (it
 was removed or replaced by an older or newer build after the agent checked
 the bundle's signature, it gives no usable answer within 30 seconds, or
-`config.json` is over 8 MiB), or the journal holds a value the app does not
-write, the agent uses the strictest values instead, a
-95% end floor with the thermal rule on, and logs why. Each
+`config.json` is over 8 MiB), the agent reads the recorded values from
+`state.json` itself and logs that it did. When the journal holds a value the
+app does not write, or no record while only the binary failed, the agent
+uses the strictest values instead, a 95% end floor with the thermal rule
+on, and logs why. Before it reads them, or ends a session, the agent checks
+that `state.json` loads as the app loads it; when it does not, the agent
+keeps the session, changes nothing and logs why, until the app or a person
+fixes the file. Each
 early end is logged with its reason, and the saved session is deleted before
 the restore starts. A restore that cannot finish leaves entries in the journal
 for the next run and the app. If the saved session cannot be deleted, its end
@@ -390,8 +395,10 @@ already. That record is written in place, so the file keeps its inode and
 stays the lock both sides take, and content there that is not a whole record
 counts as the end of whatever session is saved. The agent reads each
 record back before it restores anything. The app and the agent count a record
-only if it is a regular file you own, not a link, and the log folder only if
-it is a real folder you own, not a link. While a record matches the saved
+aside or in the lock file only if it is a regular file you own, not a link,
+and the log folder only if it is a real folder you own, not a link.
+`ended-session.json` counts as `session.json` does: a link there is
+followed to a regular file, and its owner is not checked. While a record matches the saved
 session byte for byte, the app restores that session instead of resuming it,
 whatever `pmset` reports, and every agent run ends it again. Only when neither
 folder takes a new file and the lock file takes no write either (a full disk,

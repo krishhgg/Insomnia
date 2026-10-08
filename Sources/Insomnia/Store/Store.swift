@@ -530,10 +530,19 @@ struct Store: Sendable {
     /// names the file so a person can fix or move it.
     func loadState() throws -> RuntimeState? {
         do {
-            return try read(RuntimeState.self, from: paths.stateFile)
+            guard let data = try readData(from: paths.stateFile) else { return nil }
+            return try Self.decodeState(data)
         } catch let error as DecodingError {
             throw StoreError.corrupt(file: paths.stateFile.path, detail: Self.brief(error))
         }
+    }
+
+    /// state.json's bytes as the app reads them: the one decoder behind
+    /// `loadState` and `Insomnia --agent-session-cutoffs`
+    /// (AgentCutoffsCommand), which backstop.sh runs on the same bytes
+    /// before it uses the journal's cutoffs. Pure: it opens no file.
+    static func decodeState(_ data: Data) throws -> RuntimeState {
+        try makeDecoder().decode(RuntimeState.self, from: data)
     }
     func saveState(_ s: RuntimeState) throws { try write(s, to: paths.stateFile) }
 

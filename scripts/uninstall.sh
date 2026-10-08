@@ -24,11 +24,10 @@
 # are never undone here and stay or go with state.json; backstop.sh of this
 # version gives the record of the kept entry this boot, in a journal it
 # publishes before it switches Low Power Mode off. One of the wrong type, a
-# number the app cannot decode, one of the three keys about the kept entry
-# found twice at the top level of the file, or text the check cannot follow
-# makes the journal malformed: the same text check as backstop.sh
-# (record_text_problems), which reads keys at the top level only, with
-# their escapes decoded, as the app does.
+# number the app cannot decode, a key found twice in one object anywhere in
+# the file, or text the check cannot follow makes the journal malformed:
+# the same text check as backstop.sh (record_text_problems), which reads
+# every object and array, with the escapes in keys decoded, as the app does.
 #
 # Deletion is by exact owned file, never by directory tree: --purge removes
 # the files Insomnia writes (see Paths.swift), the session.json copies the
@@ -264,46 +263,64 @@ type_of() { # file keypath -> bool|integer|float|string|array|dictionary|(any); 
   "$PLUTIL" -type "$2" -o - "$1" 2>/dev/null || true
 }
 
-# Prints one line per way the app's records about a kept display entry would
-# not decode, or nothing. Read from the text of state.json $1 itself, not
-# through plutil, which turns a number too small for a Double, such as
-# 1e-400, into 0.0, reads 1., .5, +1 and other JSON5 forms the app refuses,
-# and keeps the last of two copies of a key where the app's JSONDecoder keeps
-# the first. The text is read the way the app reads it. Only keys of the
-# top-level object count, with their \u escapes decoded, so
-# "keptDisplayReadL\u0069t" is that key. Every value is stepped over whole: a
-# string to its closing quote, an object or array to its closing bracket. So
-# a saved audio name or UID, or a nested object, that holds such a key, a \u
-# escape or a bad number holds no record. Each of the two numbers must be
-# null or a JSON number a Swift Float holds: not above about 3.4028236e38, and
-# either 0 in every digit or not so small that it rounds to 0 (below about
-# 7.0065e-46). The range is read from the decimal exponent and the first 9
-# significant digits, a little stricter than the app (from 3.40282356e38 and
-# up to 7.01e-46), where no brightness lies. A string, object or array there
-# is left to the type check. Also refused: one of the three keys found more
-# than once at the top level, since plutil checks and republishes the last
-# copy; a key with an escape JSON does not have, such as \x41, which plutil
-# reads as A; and a top level this reader cannot follow, such as a key
-# without quotes, a comment, a byte order mark other than UTF-8's, or a NUL
-# byte. UTF-16 and UTF-32, which the app also reads, have NUL bytes, and the
-# shell drops them from the text, which would turn such a file into other
-# characters. Text outside ASCII cannot spell the keys, even under the
-# decoder's Unicode equivalence, so a file with neither "keptDisplay" nor a
-# backslash in it has none of them and is not read further. Any of these
-# makes the journal malformed, as for a wrong type, and nothing is undone.
+# Prints one line per way the text of state.json $1 would not decode in the
+# app, or would read otherwise than plutil reads it, or nothing. Read from
+# the text itself, not through plutil, which keeps the last of two copies
+# of a key where the app's JSONDecoder keeps the first, turns a number too
+# small for a Double, such as 1e-400, into 0.0, and reads 1., .5, +1,
+# single quotes, keys without quotes, comments and other JSON5 forms the
+# app refuses. The text is read the way the app reads it: every object and
+# array, at any depth, key by key and value by value. A key's \u escapes
+# are decoded, so "keptDisplayReadL\u0069t" is that key, and a Kelvin sign
+# (U+212A), written as such or as \u212A, is read as K, since the app's
+# keys match it as K. A string is stepped over to its closing quote, so a
+# saved audio name or UID that holds a key, a bracket or a bad number holds
+# none of them. Refused:
+#   - a key found more than once in one object, since plutil checks and
+#     republishes the last copy. Only keys of letters alone are compared;
+#     every key the app reads is one.
+#   - a string with an escape JSON does not have, such as \x41, which plutil
+#     reads as A. In a key, nothing after it is read.
+#   - a value that is not a string, object, array, JSON number, true, false
+#     or null.
+#   - a number where the app reads a Float (the saved and kept display,
+#     keyboard and output levels, and each saved output's volume) that a
+#     Swift Float cannot hold: above about 3.4028236e38, or not 0 in every
+#     digit and so small that it rounds to 0 (below about 7.0065e-46). The
+#     range is read from the decimal exponent and the first 9 significant
+#     digits, a little stricter than the app (from 3.40282356e38 and up to
+#     7.01e-46), where no level lies.
+#   - a whole number where the app reads an Int32 (a frozen process's pid
+#     and startedAtMicros, a legacy frozen pid) or an Int64 (its startedAt)
+#     that the type cannot hold.
+#   - text this reader cannot follow: a key without quotes, a comment, a
+#     byte order mark other than UTF-8's, or a NUL byte. UTF-16 and UTF-32,
+#     which the app reads but never writes, have NUL bytes, and the shell
+#     drops them from the text, which would turn such a file into other
+#     characters.
+# A string, object or array where a number belongs is left to the type
+# check, and so is a number such as 1.0 where a whole number belongs, which
+# plutil reads as a float. The app reads some of what is refused here: a
+# key twice (it takes the first), a bad escape or number under a key it
+# does not read, a whole number written as 1.0. The app never writes them,
+# so they are refused anyway. Any of these makes the journal malformed, as
+# for a wrong type, and nothing is undone.
 record_text_problems() { # file
   local LC_ALL=C
-  local text rest raw key c token depth str plain scalar number esc hex lost
-  local n_low=0 n_lit=0 n_boot=0 digits sig exp e10 lead
+  local text rest raw name c token want d vpath vshown kind limit list seen nm n
+  local str strict scalar number int esc kelvin hex lost
+  local digits sig exp e10 lead
+  local -a kinds paths shown keys names counts
   str='^"([^"\\]|\\.)*"'
-  plain='^[^]["{}]+'
+  strict='^"([^"\\]|\\["\\/bfnrt]|\\u[0-9A-Fa-f]{4})*"$'
   scalar='^[^],}[:space:]]+'
   number='^-?(0|[1-9][0-9]*)(\.([0-9]+))?([eE]([-+]?)([0-9]+))?$'
+  int='^-?(0|[1-9][0-9]*)$'
   esc='^u00(4[1-9A-Fa-f]|5[0-9Aa]|6[1-9A-Fa-f]|7[0-9Aa])'
+  kelvin='^u212[Aa]'
   hex='^u[0-9A-Fa-f]{4}'
-  lost="the top level of state.json cannot be followed here, so its records about a kept display entry cannot be checked"
+  lost="the text of state.json cannot be followed here, so the keys the app reads in it cannot be checked"
   text="$(<"$1")"
-  [[ "$text" == *keptDisplay* || "$text" == *\\* ]] || return 0
   if IFS= read -r -d '' c < "$1"; then
     echo "$lost"
     return 0
@@ -311,113 +328,184 @@ record_text_problems() { # file
   rest="${text#$'\xef\xbb\xbf'}"
   rest="${rest#"${rest%%[![:space:]]*}"}"
   [[ "${rest:0:1}" == "{" ]] || { echo "$lost"; return 0; }
-  rest="${rest:1}"
+  # d is the depth of the object or array being read (1 is the top level);
+  # for each, kinds holds { or [, paths where it is in the app's terms
+  # (frozenProcesses[]), shown the same as a log names it
+  # (frozenProcesses[0]), keys its last key, names its keys of letters
+  # alone, and counts the values an array has had. want is what comes
+  # next: a key, a colon, a value, or a comma or the end (next).
+  d=0
+  want=value
   while :; do
     rest="${rest#"${rest%%[![:space:]]*}"}"
-    # An empty object, or a comma before the end, which the app accepts.
-    [[ "${rest:0:1}" == "}" ]] && break
-    [[ "$rest" =~ $str ]] || { echo "$lost"; return 0; }
-    raw="${BASH_REMATCH[0]}"
-    rest="${rest:${#raw}}"
-    raw="${raw:1:${#raw}-2}"
-    # The key as the app reads it. Of the escapes JSON has, only a \u of a
-    # letter can be part of one of the three keys; the others stand for no
-    # letter.
-    key=""
-    while [[ "$raw" == *\\* ]]; do
-      key+="${raw%%\\*}"
-      raw="${raw#*\\}"
-      if [[ "$raw" =~ $esc ]]; then
-        printf -v c '%b' "\\x${BASH_REMATCH[1]}"
-        key+="$c"
-        raw="${raw:5}"
-      elif [[ "$raw" =~ $hex ]]; then
-        key+="?"
-        raw="${raw:5}"
+    c="${rest:0:1}"
+    vpath=""
+    vshown=""
+    if [[ "$want" == value ]] && (( d > 0 )); then
+      if [[ "${kinds[d]}" == "{" ]]; then
+        vpath="${paths[d]:+${paths[d]}.}${keys[d]}"
+        vshown="${shown[d]:+${shown[d]}.}${keys[d]}"
       else
-        case "${raw:0:1}" in
-          '"'|\\|/|b|f|n|r|t) key+="?"; raw="${raw:1}" ;;
-          *) echo "a key in state.json has an escape JSON does not have, so its records about a kept display entry cannot be checked"; return 0 ;;
-        esac
-      fi
-    done
-    key+="$raw"
-    rest="${rest#"${rest%%[![:space:]]*}"}"
-    [[ "${rest:0:1}" == : ]] || { echo "$lost"; return 0; }
-    rest="${rest:1}"
-    rest="${rest#"${rest%%[![:space:]]*}"}"
-    token=""
-    case "${rest:0:1}" in
-      '"')
-        [[ "$rest" =~ $str ]] || { echo "$lost"; return 0; }
-        rest="${rest:${#BASH_REMATCH[0]}}"
-        ;;
-      '{'|'[')
-        depth=0
-        while :; do
-          case "${rest:0:1}" in
-            '{'|'[') depth=$((depth + 1)); rest="${rest:1}" ;;
-            '}'|']') depth=$((depth - 1)); rest="${rest:1}"; (( depth > 0 )) || break ;;
-            '"')
-              [[ "$rest" =~ $str ]] || { echo "$lost"; return 0; }
-              rest="${rest:${#BASH_REMATCH[0]}}"
-              ;;
-            '') echo "$lost"; return 0 ;;
-            *)
-              [[ "$rest" =~ $plain ]] || { echo "$lost"; return 0; }
-              rest="${rest:${#BASH_REMATCH[0]}}"
-              ;;
-          esac
-        done
-        ;;
-      *)
-        [[ "$rest" =~ $scalar ]] || { echo "$lost"; return 0; }
-        token="${BASH_REMATCH[0]}"
-        rest="${rest:${#token}}"
-        ;;
-    esac
-    case "$key" in
-      keptDisplayUnderLowPower) n_low=$((n_low + 1)) ;;
-      keptDisplayReadLit) n_lit=$((n_lit + 1)) ;;
-      # The boot is a string, whose type plutil checks.
-      keptDisplayUnderLowPowerBoot) n_boot=$((n_boot + 1)); token="" ;;
-      *) token="" ;;
-    esac
-    if [[ -n "$token" && "$token" != null ]]; then
-      if [[ "$token" =~ $number ]]; then
-        digits="${BASH_REMATCH[1]}${BASH_REMATCH[3]}"
-        sig="${digits#"${digits%%[1-9]*}"}"
-        if [[ -n "$sig" ]]; then
-          exp="${BASH_REMATCH[6]#"${BASH_REMATCH[6]%%[1-9]*}"}"
-          if (( ${#exp} > 18 )); then
-            e10=1000000000000000000
-          else
-            e10=$((10#0$exp))
-          fi
-          [[ "${BASH_REMATCH[5]}" == - ]] && e10=$((-e10))
-          e10=$((e10 + ${#BASH_REMATCH[1]} - 1 - (${#digits} - ${#sig})))
-          lead="${sig}00000000"
-          lead=$((10#${lead:0:9}))
-          if (( e10 < -46 || (e10 == -46 && lead < 701000000) )); then
-            echo "$key is ${token:0:40}, too small a number for the app to read"
-          elif (( e10 > 38 || (e10 == 38 && lead > 340282355) )); then
-            echo "$key is ${token:0:40}, too large a number for the app to read"
-          fi
-        fi
-      else
-        echo "$key is written as ${token:0:40}, which the app does not read as a number"
+        vpath="${paths[d]}[]"
+        vshown="${shown[d]}[${counts[d]}]"
       fi
     fi
-    rest="${rest#"${rest%%[![:space:]]*}"}"
-    case "${rest:0:1}" in
-      ,) rest="${rest:1}" ;;
-      '}') break ;;
-      *) echo "$lost"; return 0 ;;
+    case "$c" in
+      '{'|'[')
+        [[ "$want" == value ]] || { echo "$lost"; return 0; }
+        d=$((d + 1))
+        kinds[d]="$c"
+        paths[d]="$vpath"
+        shown[d]="$vshown"
+        keys[d]=""
+        names[d]="|"
+        counts[d]=0
+        if [[ "$c" == "{" ]]; then want=key; else want=value; fi
+        rest="${rest:1}"
+        ;;
+      '}'|']')
+        # An empty object or array, or a comma before the end, which the
+        # app accepts.
+        if [[ "$c" == "}" ]]; then
+          [[ "${kinds[d]}" == "{" && ( "$want" == key || "$want" == next ) ]] || { echo "$lost"; return 0; }
+          list="${names[d]}"
+          seen="|"
+          raw="${list#|}"
+          while [[ -n "$raw" ]]; do
+            nm="${raw%%|*}"
+            raw="${raw#*|}"
+            [[ "$seen" != *"|$nm|"* ]] || continue
+            seen+="$nm|"
+            n=0
+            token="$list"
+            while [[ "$token" == *"|$nm|"* ]]; do
+              n=$((n + 1))
+              token="|${token#*"|$nm|"}"
+            done
+            if (( n > 1 && d == 1 )); then
+              echo "$nm is in the top level of state.json $n times; the app reads the first and plutil the last"
+            elif (( n > 1 )); then
+              echo "${shown[d]} has $nm $n times; the app reads the first and plutil the last"
+            fi
+          done
+        else
+          [[ "${kinds[d]}" == "[" && ( "$want" == value || "$want" == next ) ]] || { echo "$lost"; return 0; }
+        fi
+        rest="${rest:1}"
+        d=$((d - 1))
+        (( d > 0 )) || break
+        want=next
+        if [[ "${kinds[d]}" == "[" ]]; then counts[d]=$((counts[d] + 1)); fi
+        ;;
+      ,)
+        [[ "$want" == next ]] || { echo "$lost"; return 0; }
+        if [[ "${kinds[d]}" == "{" ]]; then want=key; else want=value; fi
+        rest="${rest:1}"
+        ;;
+      :)
+        [[ "$want" == colon ]] || { echo "$lost"; return 0; }
+        want=value
+        rest="${rest:1}"
+        ;;
+      '"')
+        [[ "$rest" =~ $str ]] || { echo "$lost"; return 0; }
+        raw="${BASH_REMATCH[0]}"
+        rest="${rest:${#raw}}"
+        if [[ "$want" == key ]]; then
+          # The key as the app reads it. Of the escapes JSON has, only a \u
+          # of a letter or of the Kelvin sign can be part of a key of
+          # letters alone; the others stand for no letter.
+          raw="${raw:1:${#raw}-2}"
+          raw="${raw//$'\xe2\x84\xaa'/K}"
+          name=""
+          while [[ "$raw" == *\\* ]]; do
+            name+="${raw%%\\*}"
+            raw="${raw#*\\}"
+            if [[ "$raw" =~ $esc ]]; then
+              printf -v c '%b' "\\x${BASH_REMATCH[1]}"
+              name+="$c"
+              raw="${raw:5}"
+            elif [[ "$raw" =~ $kelvin ]]; then
+              name+=K
+              raw="${raw:5}"
+            elif [[ "$raw" =~ $hex ]]; then
+              name+="?"
+              raw="${raw:5}"
+            else
+              case "${raw:0:1}" in
+                '"'|\\|/|b|f|n|r|t) name+="?"; raw="${raw:1}" ;;
+                *) echo "a key in state.json has an escape JSON does not have, so the keys the app reads in it cannot be checked"; return 0 ;;
+              esac
+            fi
+          done
+          name+="$raw"
+          keys[d]="$name"
+          if [[ "$name" =~ ^[A-Za-z]+$ ]]; then names[d]+="$name|"; fi
+          want=colon
+        elif [[ "$want" == value ]]; then
+          [[ "$raw" =~ $strict ]] || echo "$vshown is a string with an escape JSON does not have, which the app does not read"
+          want=next
+          if [[ "${kinds[d]}" == "[" ]]; then counts[d]=$((counts[d] + 1)); fi
+        else
+          echo "$lost"
+          return 0
+        fi
+        ;;
+      '')
+        echo "$lost"
+        return 0
+        ;;
+      *)
+        [[ "$want" == value && "$rest" =~ $scalar ]] || { echo "$lost"; return 0; }
+        token="${BASH_REMATCH[0]}"
+        rest="${rest:${#token}}"
+        case "$vpath" in
+          keptDisplayUnderLowPower|keptDisplayReadLit|displayRestoredUnderLowPower|savedOutputVolume|savedDisplayBrightness|savedKeyboardBrightness|'savedAudioOutputs[].volume') kind=float ;;
+          'frozenProcesses[].pid'|'frozenProcesses[].startedAtMicros'|'frozenPids[]') kind=int32 ;;
+          'frozenProcesses[].startedAt') kind=int64 ;;
+          *) kind=any ;;
+        esac
+        if [[ "$token" == null || "$token" == true || "$token" == false ]]; then
+          :
+        elif [[ "$token" =~ $number && "$kind" == float ]]; then
+          digits="${BASH_REMATCH[1]}${BASH_REMATCH[3]}"
+          sig="${digits#"${digits%%[1-9]*}"}"
+          if [[ -n "$sig" ]]; then
+            exp="${BASH_REMATCH[6]#"${BASH_REMATCH[6]%%[1-9]*}"}"
+            if (( ${#exp} > 18 )); then
+              e10=1000000000000000000
+            else
+              e10=$((10#0$exp))
+            fi
+            if [[ "${BASH_REMATCH[5]}" == - ]]; then e10=$((-e10)); fi
+            e10=$((e10 + ${#BASH_REMATCH[1]} - 1 - (${#digits} - ${#sig})))
+            lead="${sig}00000000"
+            lead=$((10#${lead:0:9}))
+            if (( e10 < -46 || (e10 == -46 && lead < 701000000) )); then
+              echo "$vshown is ${token:0:40}, too small a number for the app to read"
+            elif (( e10 > 38 || (e10 == 38 && lead > 340282355) )); then
+              echo "$vshown is ${token:0:40}, too large a number for the app to read"
+            fi
+          fi
+        elif [[ "$token" =~ $int && "$kind" == int* ]]; then
+          digits="${token#-}"
+          if [[ "$kind" == int32 ]]; then limit=2147483647; else limit=9223372036854775807; fi
+          if [[ "$token" == -* ]]; then limit="${limit%7}8"; fi
+          if (( ${#digits} > ${#limit} )) || { (( ${#digits} == ${#limit} )) && [[ "$digits" > "$limit" ]]; }; then
+            echo "$vshown is ${token:0:40}, a whole number the app cannot read there"
+          fi
+        elif [[ "$token" =~ $number ]]; then
+          :
+        elif [[ "$kind" == float ]]; then
+          echo "$vshown is written as ${token:0:40}, which the app does not read as a number"
+        else
+          echo "$vshown is written as ${token:0:40}, which is not a JSON value the app reads"
+        fi
+        want=next
+        if [[ "${kinds[d]}" == "[" ]]; then counts[d]=$((counts[d] + 1)); fi
+        ;;
     esac
   done
-  (( n_low > 1 )) && echo "keptDisplayUnderLowPower is in the top level of state.json $n_low times; the app reads the first and plutil the last"
-  (( n_lit > 1 )) && echo "keptDisplayReadLit is in the top level of state.json $n_lit times; the app reads the first and plutil the last"
-  (( n_boot > 1 )) && echo "keptDisplayUnderLowPowerBoot is in the top level of state.json $n_boot times; the app reads the first and plutil the last"
   return 0
 }
 

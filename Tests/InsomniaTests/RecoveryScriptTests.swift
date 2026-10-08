@@ -191,6 +191,113 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(fx.log().contains("journal already clean"), fx.log())
     }
 
+    /// Greptile 4219151866: a journal the app does not load stops the run
+    /// before a valid session is ended, whatever ends it (the battery with
+    /// the app alive, config.json missing or read, the app not running,
+    /// --force): session.json and the journal stay byte for byte, no end is
+    /// recorded anywhere, nothing runs, and the log says why. The app does
+    /// not load these journals, or reads one copy of a key where plutil
+    /// would read and republish the other. The review's trace is the first
+    /// journal with config.json missing, at 20%. Once the journal is
+    /// repaired the next run ends the session.
+    func testAJournalTheAppDoesNotLoadKeepsAValidSessionTheRunWouldEnd() throws {
+        let b = backslash
+        let journals = [
+            #"{"sleepDisabledByUs":true,"frozenProcesses":"bad","sessionCutoffs":"30 false"}"#,
+            #"{"sleepDisabledByUs":true,"sleepDisabledByUs":false,"frozenProcesses":[],"sessionCutoffs":"30 false"}"#,
+            #"{"sleepDisabledByUs":true,"frozenProcesses":[{"pid":5,"pid":6}],"sessionCutoffs":"30 false"}"#,
+            #"{"sleepDisabledByUs":true,"sleepDisabledBy\#(b)u0055s":true,"sessionCutoffs":"30 false"}"#,
+            #"{"sleepDisabledByUs":true,"frozenProcesses":[{"pid":2147483648}],"sessionCutoffs":"30 false"}"#,
+            #"{"sleepDisabledByUs":true,"sessionCutoffs":"30 false","sessionCutoffs":"0 false"}"#,
+            #"{"sleepDisabledByUs":true,"sessionCutoffs":"30 false","#,
+        ]
+        let modes: [(name: String, alive: Bool, config: String?, args: [String], kept: String)] = [
+            ("app alive, config.json missing", true, nil, [], "its cutoffs are not read and it is not ended"),
+            ("app alive, config.json read", true, #"{"endFloor":30,"thermalRules":false}"#, [], "it is not ended"),
+            ("app not running", false, nil, [], "it is not ended"),
+            ("--force", true, nil, ["--force"], "it is not ended"),
+        ]
+        for journal in journals {
+            for mode in modes {
+                let label = "\(mode.name), \(journal)"
+                try? FileManager.default.removeItem(at: fx.config)
+                if let config = mode.config { try fx.writeConfig(config) }
+                try fx.writeSession(endsAt: Date(timeIntervalSinceNow: 3600))
+                let session = try Data(contentsOf: fx.session)
+                try fx.writeState(journal)
+                try? FileManager.default.removeItem(at: fx.logFile)
+                fx.setBattery(fx.battery(source: "Battery Power", percent: 20))
+                fx.clearCalls()
+                let app = mode.alive ? try fx.holdAliveLock() : nil
+
+                let r = try fx.run(fx.backstop, mode.args)
+                app?.release()
+
+                XCTAssertEqual(r.status, 1, "\(label): \(fx.log())")
+                XCTAssertEqual(try Data(contentsOf: fx.session), session, label)
+                XCTAssertEqual(try String(contentsOf: fx.state, encoding: .utf8), journal, label)
+                XCTAssertEqual(try fx.contents(of: fx.home).filter { $0.hasPrefix("ended-session") }, [], label)
+                XCTAssertEqual(((try? fx.contents(of: fx.logFile.deletingLastPathComponent())) ?? []).filter { $0.hasPrefix("ended-session") }, [], label)
+                XCTAssertFalse(String(decoding: (try? Data(contentsOf: fx.lock)) ?? Data(), as: UTF8.self).contains("ended-session-v1"), label)
+                XCTAssertFalse(calls().contains { $0.hasPrefix("sudo") || $0.hasPrefix("kill") }, "\(label): \(calls())")
+                XCTAssertTrue(fx.log().contains("is unreadable or malformed; nothing undone, evidence kept"), "\(label): \(fx.log())")
+                XCTAssertTrue(fx.log().contains("\(fx.session.path) is kept as it is: \(mode.kept) while"), "\(label): \(fx.log())")
+            }
+        }
+
+        try? FileManager.default.removeItem(at: fx.config)
+        try fx.writeState(#"{"sleepDisabledByUs":true,"frozenProcesses":[],"sessionCutoffs":"30 false"}"#)
+        fx.clearCalls()
+        let r = try fx.run(fx.backstop)
+        try assertSessionEnded(r, reason: "Insomnia is not running")
+    }
+
+    /// The controls: the same session with a journal the app loads, as this
+    /// build writes it or as an older one did (frozenPids, no record of the
+    /// cutoffs), ends in each mode. With the app alive and config.json
+    /// missing, the record's 30% floor ends it at 20%, and the defaults'
+    /// 10% one at 9% only.
+    func testAJournalTheAppLoadsLetsTheRunEndAValidSession() throws {
+        let current = #"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"savedAudioOutputs":[],"appNapOverrides":[],"sessionCutoffs":"30 false"}"#
+        let legacy = #"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenPids":[],"dockerFrozen":false}"#
+        let cases: [(journal: String, alive: Bool, args: [String], battery: Int, reason: String?)] = [
+            (current, true, [], 20, "below the 30% end floor"),
+            (current, true, [], 31, nil),
+            (legacy, true, [], 9, "below the 10% end floor"),
+            (legacy, true, [], 20, nil),
+            (current, false, [], 20, "Insomnia is not running"),
+            (legacy, false, [], 20, "Insomnia is not running"),
+            (current, true, ["--force"], 20, "forced end of session"),
+            (legacy, true, ["--force"], 20, "forced end of session"),
+        ]
+        for c in cases {
+            let label = "\(c.args) alive \(c.alive) at \(c.battery)%: \(c.journal)"
+            XCTAssertNoThrow(try Store.makeDecoder().decode(RuntimeState.self, from: Data(c.journal.utf8)), label)
+            try fx.writeSession(endsAt: Date(timeIntervalSinceNow: 3600))
+            try fx.writeState(c.journal)
+            try? FileManager.default.removeItem(at: fx.logFile)
+            fx.setBattery(fx.battery(source: "Battery Power", percent: c.battery))
+            fx.clearCalls()
+            let app = c.alive ? try fx.holdAliveLock() : nil
+
+            let r = try fx.run(fx.backstop, c.args)
+            app?.release()
+
+            if let reason = c.reason {
+                XCTAssertEqual(r.status, 0, "\(label): \(fx.log())")
+                XCTAssertTrue(calls().contains(sleepRestored), "\(label): \(calls()) \(fx.log())")
+                XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, false, label)
+                XCTAssertFalse(fx.exists(fx.session), label)
+                XCTAssertTrue(fx.log().contains(reason), "\(label): \(fx.log())")
+                XCTAssertFalse(fx.log().contains("unreadable or malformed"), "\(label): \(fx.log())")
+            } else {
+                XCTAssertEqual(r.status, 0, "\(label): \(fx.log())")
+                XCTAssertTrue(fx.exists(fx.session), label)
+                XCTAssertEqual(try String(contentsOf: fx.state, encoding: .utf8), c.journal, label)
+            }
+        }
+    }
+
     func testBatteryBelowTheEndFloorOnBatteryPowerEndsTheSession() throws {
         try writeLiveSession()
         let app = try fx.holdAliveLock()
@@ -4112,9 +4219,9 @@ final class RecoveryScriptTests: XCTestCase {
         ("keptDisplayReadLit is ", #""kept\u0044isplayReadLit":1e-400"#),
         ("keptDisplayUnderLowPower is ", #""keptDisplayUnderLowPowe\#(backslash)u0072":"0.8""#),
         ("a key in state.json has an escape JSON does not have", #""kept\#(backslash)x44isplayReadLit":0.8"#),
-        ("the top level of state.json cannot be followed here", #"keptDisplayReadLit:1e-400"#),
-        ("the top level of state.json cannot be followed here", #"'keptDisplayReadLit':0.8"#),
-        ("the top level of state.json cannot be followed here", #"/* note */"keptDisplayReadLit":0.8"#),
+        ("the text of state.json cannot be followed here", #"keptDisplayReadLit:1e-400"#),
+        ("the text of state.json cannot be followed here", #"'keptDisplayReadLit':0.8"#),
+        ("the text of state.json cannot be followed here", #"/* note */"keptDisplayReadLit":0.8"#),
         ("keptDisplayUnderLowPowerBoot is ", #""keptDisplayUnderLowPowerBoot":7"#),
         ("keptDisplayUnderLowPowerBoot is ", #""keptDisplayUnderLowPowerBoot":true"#),
         ("keptDisplayUnderLowPowerBoot is ", #""keptDisplayUnderLowPowerBoot":["boot-a"]"#),
@@ -4312,11 +4419,140 @@ final class RecoveryScriptTests: XCTestCase {
         return lines[start...end].joined(separator: "\n")
     }
 
+    /// The functions `names` as they are in `script`, each from its first
+    /// line to the first line that is a closing brace alone.
+    private static func scriptFunctions(_ names: [String], script: String) throws -> String {
+        let text = try String(contentsOf: ScriptFixture.productionScripts.appendingPathComponent(script), encoding: .utf8)
+        let lines = text.components(separatedBy: "\n")
+        return try names.map { name in
+            let start = try XCTUnwrap(lines.firstIndex { $0.hasPrefix("\(name)() {") }, "\(name) in \(script)")
+            let end = try XCTUnwrap(lines[start...].firstIndex(of: "}"), "\(name) in \(script)")
+            return lines[start...end].joined(separator: "\n")
+        }.joined(separator: "\n")
+    }
+
+    /// Greptile 4219151866: one table of journals, each read by the app
+    /// (`Store.decodeState`, what `Store.loadState` runs), by the agent's
+    /// mode of the app's binary (`AgentCutoffsCommand.sessionAnswer`), and
+    /// by each script's check (`plutil -convert`, then
+    /// journal_shape_problems, as check_journal and uninstall.sh's
+    /// journal_problems run them), and for the agent, the record as its own
+    /// reader takes it (journal_cutoffs). The scripts accept the same
+    /// journals, and only ones the app loads. They refuse some the app
+    /// loads and never writes: a key twice in one object, at any depth and
+    /// however it is spelled, where plutil would read and republish the
+    /// other copy; an integer written as 1.0; a bad escape or number under
+    /// a key the app does not read. On every journal both accept, the
+    /// agent's reader and the binary give the same record. The journals the
+    /// app writes now and wrote before (frozenPids, no record) pass.
+    func testTheAppTheBinaryAndBothScriptsAcceptTheSameJournals() throws {
+        let b = backslash
+        var full = RuntimeState()
+        full.sleepDisabledByUs = true
+        full.lowPowerSetByUs = true
+        full.dockerFrozen = true
+        full.frozenProcesses = [FrozenProcess(pid: 5105, identity: ProcessIdentity(startedAt: 1_700_000_000, startedAtMicros: 250_000, bootSession: "0F0F0F0F-1111-2222-3333-444444444444"))]
+        full.savedAudioOutputs = [SavedAudioOutput(deviceUID: "BuiltInSpeakerDevice", name: "MacBook Pro Speakers", volume: 0.5, muted: false, saveID: "a")]
+        full.savedOutputVolume = 0.25
+        full.savedMuted = false
+        full.savedDisplayBrightness = 0.8
+        full.savedKeyboardBrightness = 0.3
+        full.appNapOverrides = [AppNapOverride(bundleId: "com.example.agent", previous: nil)]
+        full.endedSession = "e30="
+        full.sessionCutoffs = AgentCutoffs(endFloor: 30, thermalRules: false)
+        let written = String(decoding: try Store.makeEncoder().encode(full), as: UTF8.self)
+        // (label, text, the scripts accept, the app loads)
+        let rows: [(label: String, text: String, scripts: Bool, app: Bool)] = [
+            ("the app's journal now", written, true, true),
+            ("an older build's journal", #"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenPids":[5105,5106],"dockerFrozen":false}"#, true, true),
+            ("a frozen process without identity", #"{"frozenProcesses":[{"pid":5105}]}"#, true, true),
+            ("no keys", "{}", true, true),
+            ("commas before the ends", #"{"frozenProcesses":[],"sleepDisabledByUs":true,}"#, true, true),
+            ("keys spelled with escapes", #"{"sleep\#(b)u0044isabledByUs":true,"session\#(b)u0043utoffs":"30 false"}"#, true, true),
+            ("an escaped record", #"{"sessionCutoffs":"\#(b)u0033\#(b)u0030 false"}"#, true, true),
+            ("other keys and values", #"{"note":{"a":[1,{"b":null}],"c":"\#(b)u00e9"},"sessionCutoffs":"0 true"}"#, true, true),
+            ("a record the app does not write", #"{"sessionCutoffs":"96 false"}"#, true, true),
+            ("a record of another type", #"{"sessionCutoffs":30}"#, true, true),
+            ("a record with a newline", #"{"sessionCutoffs":"30 false\#(b)n"}"#, true, true),
+            ("a null record", #"{"sessionCutoffs":null}"#, true, true),
+            ("a bool of the wrong type", #"{"sleepDisabledByUs":"yes","sessionCutoffs":"30 false"}"#, false, false),
+            ("frozenProcesses of the wrong type", #"{"sleepDisabledByUs":true,"frozenProcesses":"bad","sessionCutoffs":"30 false"}"#, false, false),
+            ("a pid of the wrong type", #"{"frozenProcesses":[{"pid":"5105"}]}"#, false, false),
+            ("a pid written as 1.0", #"{"frozenProcesses":[{"pid":5105.0}]}"#, false, true),
+            ("a pid too large", #"{"frozenProcesses":[{"pid":2147483648}]}"#, false, false),
+            ("a saved output without muted", #"{"savedAudioOutputs":[{"deviceUID":"a","volume":0.5}]}"#, false, false),
+            ("an App Nap entry without its bundle", #"{"appNapOverrides":[{"previous":true}]}"#, false, false),
+            ("an endedSession of the wrong type", #"{"endedSession":5}"#, false, false),
+            ("a level too large", #"{"savedKeyboardBrightness":1e39}"#, false, false),
+            ("a key twice", #"{"sleepDisabledByUs":true,"sleepDisabledByUs":false}"#, false, true),
+            ("a bad first copy", #"{"frozenProcesses":"bad","frozenProcesses":[]}"#, false, false),
+            ("a bad last copy", #"{"frozenProcesses":[],"frozenProcesses":"bad"}"#, false, true),
+            ("a nested key twice", #"{"frozenProcesses":[{"pid":5,"pid":"x"}]}"#, false, true),
+            ("a key twice, once escaped", #"{"sleepDisabledByUs":true,"sleepDisabledBy\#(b)u0055s":"x"}"#, false, true),
+            ("a key twice, once with a Kelvin sign", "{\"saved\u{212A}eyboardBrightness\":\"bad\",\"savedKeyboardBrightness\":0.5}", false, false),
+            ("a record twice", #"{"sessionCutoffs":"30 false","sessionCutoffs":"0 true"}"#, false, true),
+            ("a bad escape under another key", #"{"note":"\#(b)x41"}"#, false, true),
+            ("a leading zero under another key", #"{"note":01}"#, false, true),
+            ("not an object", #"["sleepDisabledByUs",true]"#, false, false),
+            ("not JSON", #"{"sleepDisabledByUs":true,"#, false, false),
+        ]
+        let f = try ScriptFixture()
+        defer { f.destroy() }
+        var files: [String] = []
+        for (i, row) in rows.enumerated() {
+            let file = f.root.appendingPathComponent("journal.\(i)")
+            try Data(row.text.utf8).write(to: file)
+            files.append(file.path)
+        }
+        func check(_ script: String, reader: Bool) throws -> [String] {
+            let names = ["extract", "type_of", "record_text_problems", "journal_shape_problems"] + (reader ? ["journal_cutoffs"] : [])
+            let runner = f.root.appendingPathComponent("accept.\(script)")
+            try ("""
+            set -euo pipefail
+            export LC_ALL=C
+            PLUTIL=/usr/bin/plutil
+            HEAD=/usr/bin/head
+
+            """ + Self.scriptFunctions(names, script: script) + """
+
+            for STATE in "$@"; do
+              if "$PLUTIL" -convert json -o /dev/null "$STATE" >/dev/null 2>&1 && [[ -z "$(journal_shape_problems "$STATE")" ]]; then
+                printf 'accepted %s\\n' "\(reader ? "$(journal_cutoffs)" : "-")"
+              else
+                echo refused
+              fi
+            done
+
+            """).write(to: runner, atomically: true, encoding: .utf8)
+            let r = try f.run(runner, files)
+            XCTAssertEqual(r.status, 0, "\(script): \(r.stderr)")
+            XCTAssertEqual(r.stderr, "", script)
+            return r.stdout.split(separator: "\n").map(String.init)
+        }
+        let agent = try check("backstop.sh", reader: true)
+        let uninstall = try check("uninstall.sh", reader: false)
+        XCTAssertEqual(agent.count, rows.count)
+        XCTAssertEqual(uninstall.count, rows.count)
+        for (i, row) in rows.enumerated() where i < agent.count && i < uninstall.count {
+            let data = Data(row.text.utf8)
+            let app = (try? Store.decodeState(data)) != nil
+            let binary = AgentCutoffsCommand.sessionAnswer(for: data).lines.joined()
+            XCTAssertEqual(app, row.app, "the app on \(row.label)")
+            XCTAssertEqual(binary == "rejected", !row.app, "the binary on \(row.label): \(binary)")
+            XCTAssertEqual(agent[i] != "refused", row.scripts, "backstop.sh on \(row.label): \(agent[i])")
+            XCTAssertEqual(uninstall[i] != "refused", row.scripts, "uninstall.sh on \(row.label): \(uninstall[i])")
+            XCTAssertTrue(!row.scripts || row.app, "the scripts accept only what the app loads: \(row.label)")
+            if row.scripts {
+                XCTAssertEqual(agent[i], "accepted \(binary)", "the agent's reader and the binary on \(row.label)")
+            }
+        }
+    }
+
     /// The two scripts carry the same reader, comment and all.
     func testBothScriptsReadTheRecordsTheSameWay() throws {
         func withComment(_ script: String) throws -> String {
             let text = try String(contentsOf: ScriptFixture.productionScripts.appendingPathComponent(script), encoding: .utf8)
-            let start = try XCTUnwrap(text.range(of: "# Prints one line per way the app's records about a kept display entry would"), script)
+            let start = try XCTUnwrap(text.range(of: "# Prints one line per way the text of state.json $1 would not decode in the"), script)
             let end = try XCTUnwrap(text.range(of: "\n}\n", range: start.upperBound..<text.endIndex), script)
             return String(text[start.lowerBound..<end.upperBound])
         }
@@ -4327,9 +4563,11 @@ final class RecoveryScriptTests: XCTestCase {
     /// The reader over texts no fixture writes whole: what it reads as the
     /// app does prints nothing, and what it refuses names the problem.
     /// Each text is also given to the app's decoder, which reads every one
-    /// printing nothing. It also reads some the reader refuses: UTF-16 and
-    /// a NUL byte in a string, which the reader cannot follow, and the keys
-    /// read twice, where plutil would check the other copy. The BOM-less
+    /// printing nothing. It also reads some the reader refuses, none of
+    /// which the app writes: UTF-16 and a NUL byte in a string, which the
+    /// reader cannot follow, a key twice in one object at any depth, where
+    /// plutil would check the other copy, and a bad escape in a value the
+    /// app does not read. The BOM-less
     /// UTF-16 file hiding a key is one the reader passed before it refused
     /// NUL bytes: the shell drops them, and what is left reads as a key
     /// inside an array, while the app reads 1e-400 at the top level.
@@ -4344,16 +4582,17 @@ final class RecoveryScriptTests: XCTestCase {
             ("UTF-8 byte order mark, too small", bom + utf8(#"{"keptDisplayReadLit":1e-400}"#),
              "keptDisplayReadLit is 1e-400, too small a number for the app to read\n", false),
             ("UTF-16 with a byte order mark", Data([0xFF, 0xFE]) + #"{"keptDisplayReadLit":0.8}"#.data(using: .utf16LittleEndian)!,
-             "the top level of state.json cannot be followed here, so its records about a kept display entry cannot be checked\n", true),
+             "the text of state.json cannot be followed here, so the keys the app reads in it cannot be checked\n", true),
             ("UTF-16 without a byte order mark", #"{"keptDisplayReadLit":0.8}"#.data(using: .utf16LittleEndian)!,
-             "the top level of state.json cannot be followed here, so its records about a kept display entry cannot be checked\n", true),
+             "the text of state.json cannot be followed here, so the keys the app reads in it cannot be checked\n", true),
             ("UTF-16 without a byte order mark, hiding a key",
              "{\"a\":\"\u{2278}\u{222C}\u{2271}\u{203A}\u{205B}\",\"keptDisplayReadLit\":1e-400,\"b\":\"\u{2C5D}\u{2220}\u{2263}\u{203A}\u{7822}\"}"
                 .data(using: .utf16LittleEndian)!,
-             "the top level of state.json cannot be followed here, so its records about a kept display entry cannot be checked\n", false),
-            ("UTF-16 without records", #"{"sleepDisabledByUs":true}"#.data(using: .utf16LittleEndian)!, "", true),
+             "the text of state.json cannot be followed here, so the keys the app reads in it cannot be checked\n", false),
+            ("UTF-16 without records", #"{"sleepDisabledByUs":true}"#.data(using: .utf16LittleEndian)!,
+             "the text of state.json cannot be followed here, so the keys the app reads in it cannot be checked\n", true),
             ("NUL byte in a string", utf8("{\"keptDisplayReadLit\":0.8,\"a\":\"x\u{0}y\"}"),
-             "the top level of state.json cannot be followed here, so its records about a kept display entry cannot be checked\n", true),
+             "the text of state.json cannot be followed here, so the keys the app reads in it cannot be checked\n", true),
             ("comma before the end", utf8(#"{"keptDisplayReadLit":0.8,}"#), "", true),
             ("whitespace everywhere", utf8("\n{ \"a\" :\t[ 1 ,2 ] ,\r\n \"keptDisplayReadLit\"\n:\n0.8\n}\n"), "", true),
             ("escaped letter, upper hex", utf8(#"{"kept\#(b)u0044isplayReadLit":1e-400}"#),
@@ -4363,13 +4602,13 @@ final class RecoveryScriptTests: XCTestCase {
             ("escaped letter, valid value", utf8(#"{"keptDisplayReadL\#(b)u0069t":0.8}"#), "", true),
             ("other escapes in keys", utf8(#"{"a\#(b)"\#(b)\#(b)\#(b)/\#(b)b\#(b)f\#(b)n\#(b)r\#(b)t\#(b)u00e9\#(b)ud83d\#(b)ude00":1}"#), "", true),
             ("a key with a \\x escape", utf8(#"{"kept\#(b)x44isplayReadLit":0.8}"#),
-             "a key in state.json has an escape JSON does not have, so its records about a kept display entry cannot be checked\n", false),
+             "a key in state.json has an escape JSON does not have, so the keys the app reads in it cannot be checked\n", false),
             ("unquoted key", utf8(#"{keptDisplayReadLit:0.8}"#),
-             "the top level of state.json cannot be followed here, so its records about a kept display entry cannot be checked\n", false),
+             "the text of state.json cannot be followed here, so the keys the app reads in it cannot be checked\n", false),
             ("block comment", utf8(#"{"a":1,/* c */"keptDisplayReadLit":0.8}"#),
-             "the top level of state.json cannot be followed here, so its records about a kept display entry cannot be checked\n", false),
+             "the text of state.json cannot be followed here, so the keys the app reads in it cannot be checked\n", false),
             ("line comment", utf8("{\"a\":1, // c\n\"keptDisplayReadLit\":0.8}"),
-             "the top level of state.json cannot be followed here, so its records about a kept display entry cannot be checked\n", false),
+             "the text of state.json cannot be followed here, so the keys the app reads in it cannot be checked\n", false),
             ("escaped backslash in a value", utf8(#"{"name":"Headset \#(b)\#(b)u0041","uid":"\#(b)\#(b)"}"#), "", true),
             ("escape in a value", utf8(#"{"name":"Headset \#(b)u0041 \#(b)"keptDisplayReadLit\#(b)":1e-400"}"#), "", true),
             ("nested copies", utf8(#"{"keptDisplayReadLit":0.8,"a":{"keptDisplayReadLit":1e-400,"b":[["keptDisplayReadLit",{"keptDisplayReadLit":0.7}]]}}"#), "", true),
@@ -4382,6 +4621,37 @@ final class RecoveryScriptTests: XCTestCase {
             ("zero forms", utf8(#"{"keptDisplayReadLit":-0,"keptDisplayUnderLowPower":0e-400}"#), "", true),
             ("leading zero", utf8(#"{"keptDisplayReadLit":01}"#),
              "keptDisplayReadLit is written as 01, which the app does not read as a number\n", false),
+            ("any key read twice", utf8(#"{"sleepDisabledByUs":true,"sleepDisabledByUs":false}"#),
+             "sleepDisabledByUs is in the top level of state.json 2 times; the app reads the first and plutil the last\n", true),
+            ("a nested key read twice", utf8(#"{"frozenProcesses":[{"pid":5,"p\#(b)u0069d":6}]}"#),
+             "frozenProcesses[0] has pid 2 times; the app reads the first and plutil the last\n", true),
+            ("a key twice in an object the app does not read", utf8(#"{"a":{"x":1,"x":2}}"#),
+             "a has x 2 times; the app reads the first and plutil the last\n", true),
+            ("one key in two objects", utf8(#"{"a":{"x":1},"b":{"x":2}}"#), "", true),
+            ("a Kelvin sign spelling a key twice", utf8("{\"saved\u{212A}eyboardBrightness\":\"bad\",\"savedKeyboardBrightness\":0.5}"),
+             "savedKeyboardBrightness is in the top level of state.json 2 times; the app reads the first and plutil the last\n", false),
+            ("an escaped Kelvin sign spelling a key twice", utf8(#"{"savedKeyboardBrightness":0.5,"saved\#(b)u212AeyboardBrightness":0.4}"#),
+             "savedKeyboardBrightness is in the top level of state.json 2 times; the app reads the first and plutil the last\n", true),
+            ("commas before the ends inside", utf8(#"{"a":[1,2,],"b":{"c":1,}}"#), "", true),
+            ("an Int32 too large", utf8(#"{"frozenProcesses":[{"pid":2147483648}]}"#),
+             "frozenProcesses[0].pid is 2147483648, a whole number the app cannot read there\n", false),
+            ("the ends of Int32 and Int64", utf8(#"{"frozenProcesses":[{"pid":-2147483648,"startedAt":9223372036854775807,"startedAtMicros":2147483647}]}"#), "", true),
+            ("an Int64 too large", utf8(#"{"frozenProcesses":[{"pid":1,"startedAt":9223372036854775808}]}"#),
+             "frozenProcesses[0].startedAt is 9223372036854775808, a whole number the app cannot read there\n", false),
+            ("a legacy pid too small", utf8(#"{"frozenPids":[1,2,-2147483649]}"#),
+             "frozenPids[2] is -2147483649, a whole number the app cannot read there\n", false),
+            ("an output volume too large", utf8(#"{"savedAudioOutputs":[{"deviceUID":"a","volume":1e39,"muted":false}]}"#),
+             "savedAudioOutputs[0].volume is 1e39, too large a number for the app to read\n", false),
+            ("a saved level written as 1.", utf8(#"{"savedOutputVolume":1.}"#),
+             "savedOutputVolume is written as 1., which the app does not read as a number\n", false),
+            ("not a JSON number in an object the app does not read", utf8(#"{"note":{"a":+1}}"#),
+             "note.a is written as +1, which is not a JSON value the app reads\n", false),
+            ("single quotes in an array", utf8(#"{"note":['s']}"#),
+             "note[0] is written as 's', which is not a JSON value the app reads\n", false),
+            ("a \\x escape in a value the app reads", utf8(#"{"endedSession":"abc\#(b)x41"}"#),
+             "endedSession is a string with an escape JSON does not have, which the app does not read\n", false),
+            ("a \\x escape in a value the app does not read", utf8(#"{"note":"abc\#(b)x41"}"#),
+             "note is a string with an escape JSON does not have, which the app does not read\n", true),
         ]
         let printed = try recordTextProblems(cases.map { ($0.label, $0.bytes) })
         let printedByUninstall = try recordTextProblems(cases.map { ($0.label, $0.bytes) }, script: "uninstall.sh")

@@ -682,9 +682,10 @@ any other field therefore read the same on both sides. The backstop runs it
 as one of its bounded reads (section 8): without the recovery lock's
 descriptor, stopped with SIGTERM after `COMMAND_TIMEOUT_SECONDS` (30) and
 with SIGKILL 3 seconds later. It runs the binary only when the bundle's
-Info.plist declares `InsomniaAgentCutoffsVersion` 2, the version the script
+Info.plist declares `InsomniaAgentCutoffsVersion` 3, the version the script
 speaks, since an older build has no such mode and would open the menu bar
-app instead.
+app instead. Version 3 decodes the whole journal before it reads the
+cutoffs from it.
 
 A missing file, one that is not a regular file (never opened), one this
 user cannot read, and the answer `rejected` (the decoder refused the bytes)
@@ -692,34 +693,76 @@ give the cutoffs the app recorded for the session in `state.json`:
 `sessionCutoffs`, the end floor and the rule as `"30 false"`. The backstop
 reads them the same way, through the app's decoder: it opens a readable
 regular `state.json` once and passes its bytes to
-`Insomnia --agent-session-cutoffs 33`, which prints
-`cutoffs <endFloor> <thermalRules>`, or `none` for a journal without them (a
-session an older build started). `none`, and no `state.json` at all, give
-the app's defaults, 10% and on. The app records them before a session
+`Insomnia --agent-session-cutoffs 33`. That mode decodes the whole journal
+as `Store.loadState` does (`Store.decodeState`), then `sessionCutoffs`, and
+prints `cutoffs <endFloor> <thermalRules>`, or `none` for a journal without
+them (a session an older build started). It answers `rejected` (exit 65)
+for a journal the app does not load, and `foreign` (exit 65) for a
+`sessionCutoffs` the app does not write, which the app reads as none.
+`none`, and no `state.json` at all, give the app's defaults, 10% and on. The app records them before a session
 starts (with `sleepDisabledByUs`) or resumes, before a Settings change to
 either takes effect (under the recovery lock taken without waiting, before
 `config.json` is written; a busy lock or a failed write refuses the change
 and a failed `config.json` write puts the record back), and in the next
 transaction after it adopts a hand edit or finds another record there. A
 transaction that cannot record them ends the session (`cutoffsNotRecorded`).
+So does a Settings change whose `config.json` write fails after the record
+was written, when the record then cannot be put back either: the journal
+would hold cutoffs the app does not enforce, looser or stricter. Still under
+the lock the record was written under, the app ends the session on disk as
+an end does (section 8): it removes `session.json`, or records its end in
+`ended-session.json`, the journal, a record aside or the lock file. Settings
+says the session ended, the undo runs in the next transaction, and no
+relaunch or agent run from then on reads the session as live. When none of
+those can be written either, the end is not recorded, as for any end
+(section 8).
 So a session whose app has stopped answering keeps the floor and rule the
 app enforced, also after its `config.json` is deleted or rejected. The
 record is not an undo entry: it never makes the journal dirty, the backstop
 never changes it, and the app clears it when it removes `session.json`. The
 app reads a value it does not write as none and records its own over it.
 
+Before it reads the cutoffs for a valid session, or ends one, the backstop
+checks that `state.json` loads as the app loads it: JSON whose top level
+is an object, the keys the app reads of the types and ranges it decodes,
+and no key of letters twice in one object (`journal_shape_problems`,
+`record_text_problems`, section 8). A journal that fails, a `state.json`
+that is not a regular file or cannot be read, and a journal the binary
+answers `rejected` for stop the run (exit 1), logged, with `session.json`,
+the journal and every undo entry as they were: the app neither ends nor
+resumes a session on a journal it cannot load, and nothing says which
+cutoffs it holds. The check refuses some text the app's decoder reads (a
+key twice, of which the decoder takes the first; a whole number written
+`1.0`; an escape or number under a key the app does not read; a NUL in a
+value; UTF-16), none of which the app writes. While such a journal stays,
+a valid session keeps sleep held unless the app ends it, and nothing is
+undone, until the file is fixed.
+
+When the binary cannot answer (missing or not executable, or another
+declared version: the agent runs only the script sealed in
+`~/Applications/Insomnia.app`, after checking that bundle's signature, so
+these need the bundle removed or replaced during the run; no answer in
+time, more than 8 MiB of input, output in another form), the backstop reads
+`sessionCutoffs` from the journal it checked itself (`journal_cutoffs`): a
+string of exactly the form the app writes, a floor of 0 to 95 with no
+leading zero and `true` or `false`, which `plutil` reads from the one copy
+of the key the check allows. It enforces that record and logs that it read
+it. A journal with no record gives the app's defaults when `config.json`
+was missing or rejected, and the strictest values when `config.json` is
+there and only the binary failed on it, since the app may enforce what that
+file holds. A binary that failed on `config.json` is not run again on the
+journal, and a hand edit of `config.json` the app has not adopted yet is
+not seen on that path; the app records an edit it adopts within a second
+while it answers.
+
 Any other outcome gives the strictest values, a 95% end floor with thermal
-rules on, and a log line naming the cause: the binary missing or not
-executable, or another declared version (the agent runs only the script
-sealed in `~/Applications/Insomnia.app`, after checking that bundle's
-signature, so these need the bundle removed or replaced during the run), no
-answer in time, more than 8 MiB of input, output in another form, a
-`state.json` that is not a regular file this user can read, or a
-`sessionCutoffs` the app does not write (`rejected` from the journal).
-Until the installed binary answers again, that fallback ends a session on
-battery power below 95% and ends one at critical heat even with the thermal
-rule off. A config.json removed between the check and the open also gives
-the strictest values for that run. The app takes those two values only from
+rules on, and a log line naming the cause: a `sessionCutoffs` the app does
+not write (`foreign`), a `state.json` that is a symlink to nothing, or no
+record, or no `state.json`, while only the binary failed on `config.json`.
+Until the installed binary answers again or the app records its cutoffs,
+that fallback ends a session on battery power below 95% and ends one at
+critical heat even with the thermal rule off. A config.json removed between
+the check and the open counts as a binary that failed on it for that run. The app takes those two values only from
 a file that decodes, runs no session while a config.json it rejected stays
 in place, and writes its settings where the file is missing (section 10).
 Performance effects depend on workload.
@@ -1005,6 +1048,11 @@ Backstop, independent of the app:
   agent ends the session otherwise, exactly as `--force` does, and logs the
   reason. A present battery that cannot be read fails closed; an unreadable
   thermal level only warns. `--force` runs none of these checks.
+- Before the agent decides an end for a valid session, `--force` included,
+  it checks that `state.json` loads as the app loads it (section 6). A
+  journal that does not stops the run with `session.json` and the journal
+  kept, since the undo could not run on it and a removed `session.json`
+  would leave sleep held with no session to end.
 - An end the agent decides is final from that decision. It removes
   `session.json` under the lock before it undoes anything, so an undo it
   cannot finish (a failing or hung `pmset`, saved audio or brightness only the
@@ -1352,8 +1400,11 @@ the backstop's defaults, no session runs:
 
 Settings changes the end floor and the thermal rule only through
 config.json: the change is written first and takes effect once the write
-succeeds. A write that fails changes neither side; Settings shows the error
-under the power settings, and both keep the old values. Any other setting
+succeeds. A write that fails changes neither side once the session's
+record of them in state.json is put back; Settings shows the error under
+the power settings, and both keep the old values. When the record cannot be
+put back either, the session ends instead and Settings says so (section 6).
+Any other setting
 takes effect at once and is written behind it; a write that fails is
 logged, and the next save writes it.
 

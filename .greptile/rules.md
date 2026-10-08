@@ -42,17 +42,20 @@ Before the backstop's `lowpowermode 0`, when the journal has
 the app doubts that entry's readings in that boot even if the journal of
 the undo never lands. If that publish fails, the mode is left on and its
 entry kept for retry. Both scripts check the records' types and read the
-three keys from the file's text too (`record_text_problems`, the same in
-both), as the app's decoder reads it: keys of the top-level object only,
-with their `\u` escapes decoded, every value stepped over whole, so a
-string or nested value holds no record. Each number must be null or a
-JSON number that a Swift Float holds and that does not round to 0 from a
-nonzero value (plutil turns 1e-400 into 0.0). One of the keys found twice
-at the top level, a key with an escape JSON does not have, and a top
-level the reader cannot follow (JSON5 keys, comments, NUL bytes as in
-UTF-16) are refused. Any of
-these makes the journal malformed, so nothing is undone and uninstall
-removes nothing. `savedAudioOutputs` entries alone leave the
+whole file's text too (`record_text_problems`, the same in both), as the
+app's decoder reads it: every object and array at any depth, keys with
+their `\u` escapes decoded (a Kelvin sign read as K), strings stepped over
+whole, so a saved name holds no key. A number where the app reads a Float
+must be one a Swift Float holds that does not round to 0 from a nonzero
+value (plutil turns 1e-400 into 0.0), and one where it reads an Int32 or
+Int64 must fit. A key of letters found twice in one object, an escape
+JSON does not have, a value that is no JSON value, and text the reader
+cannot follow (JSON5 keys, comments, NUL bytes as in UTF-16) are refused.
+Any of these makes the journal malformed, so nothing is undone and
+uninstall removes nothing. backstop.sh checks the journal so before it
+reads the cutoffs for a valid session or ends one: a journal that fails,
+or that `--agent-session-cutoffs` answers `rejected` for, stops the run
+with `session.json`, the journal and every undo entry kept. `savedAudioOutputs` entries alone leave the
 journal clean for the backstop (an entry can wait days for its device), but
 uninstall stops on them. A saved brightness flagged
 `displayRestoreRefused` or `keyboardRestoreRefused` (the app's private-call
@@ -181,7 +184,7 @@ Flag a change that breaks one of these; do not flag the behavior itself.
   except that a backstop run gives `keptDisplayUnderLowPowerBoot` its own
   boot, in a journal it publishes before its `lowpowermode 0`, and leaves
   the mode on if it cannot. The records are read from the file's text as
-  well as through plutil (`record_text_problems`), at the top level only.
+  well as through plutil (`record_text_problems`), which reads every object.
   Legacy `frozenPids` are never signaled or cleared there, even when the
   pid is gone (spec section 8).
 - `ProcessControl.swift`, `LidActions.swift`, `backstop.sh`. Only pids

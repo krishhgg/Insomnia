@@ -127,10 +127,12 @@ final class AgentCutoffsCommandTests: XCTestCase {
     /// the app reads it (`Store.loadState`): the same cutoffs where the
     /// value is one the app writes, through the same decoder, so duplicate
     /// and escaped keys pick the same value. Absent or null is none, a
-    /// session an older build started. Any other value is rejected by the
+    /// session an older build started. Any other value is `foreign` to the
     /// agent, which then enforces the strictest cutoffs, and read as none
-    /// by the app, which records its own over it at its next transaction;
-    /// a journal that is not a JSON object is rejected by both.
+    /// by the app, which records its own over it at its next transaction.
+    /// A journal the app does not load is `rejected`, whatever its
+    /// sessionCutoffs: one that is not a JSON object, or has another key
+    /// the app's decoder refuses, including the first of two copies.
     func testTheSessionAnswerIsTheAppsReadingOfTheJournal() throws {
         let journal = #""sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false"#
         let cases: [(value: String?, answer: String)] = [
@@ -146,27 +148,27 @@ final class AgentCutoffsCommandTests: XCTestCase {
             (nil, "none"),
             (#""sessionCutoffs":null"#, "none"),
             (#""sessioncutoffs":"30 false""#, "none"),
-            (#""sessionCutoffs":"96 false""#, "rejected"),
-            (#""sessionCutoffs":"100 true""#, "rejected"),
-            (#""sessionCutoffs":"-1 true""#, "rejected"),
-            (#""sessionCutoffs":"+5 true""#, "rejected"),
-            (#""sessionCutoffs":"030 false""#, "rejected"),
-            (#""sessionCutoffs":"05 false""#, "rejected"),
-            (#""sessionCutoffs":"30  false""#, "rejected"),
-            (#""sessionCutoffs":" 30 false""#, "rejected"),
-            (#""sessionCutoffs":"30 false ""#, "rejected"),
-            (#""sessionCutoffs":"30\tfalse""#, "rejected"),
-            (#""sessionCutoffs":"30 FALSE""#, "rejected"),
-            (#""sessionCutoffs":"30 off""#, "rejected"),
-            (#""sessionCutoffs":"30""#, "rejected"),
-            (#""sessionCutoffs":"""#, "rejected"),
-            (#""sessionCutoffs":"\u0663\u0660 false""#, "rejected"),
-            (#""sessionCutoffs":30"#, "rejected"),
-            (#""sessionCutoffs":true"#, "rejected"),
-            (#""sessionCutoffs":["30 false"]"#, "rejected"),
-            (#""sessionCutoffs":{"endFloor":30}"#, "rejected"),
+            (#""sessionCutoffs":"96 false""#, "foreign"),
+            (#""sessionCutoffs":"100 true""#, "foreign"),
+            (#""sessionCutoffs":"-1 true""#, "foreign"),
+            (#""sessionCutoffs":"+5 true""#, "foreign"),
+            (#""sessionCutoffs":"030 false""#, "foreign"),
+            (#""sessionCutoffs":"05 false""#, "foreign"),
+            (#""sessionCutoffs":"30  false""#, "foreign"),
+            (#""sessionCutoffs":" 30 false""#, "foreign"),
+            (#""sessionCutoffs":"30 false ""#, "foreign"),
+            (#""sessionCutoffs":"30\tfalse""#, "foreign"),
+            (#""sessionCutoffs":"30 FALSE""#, "foreign"),
+            (#""sessionCutoffs":"30 off""#, "foreign"),
+            (#""sessionCutoffs":"30""#, "foreign"),
+            (#""sessionCutoffs":"""#, "foreign"),
+            (#""sessionCutoffs":"\u0663\u0660 false""#, "foreign"),
+            (#""sessionCutoffs":30"#, "foreign"),
+            (#""sessionCutoffs":true"#, "foreign"),
+            (#""sessionCutoffs":["30 false"]"#, "foreign"),
+            (#""sessionCutoffs":{"endFloor":30}"#, "foreign"),
             (#""sessionCutoffs":"30 false","sessionCutoffs":30"#, "cutoffs 30 false"),
-            (#""sessionCutoffs":30,"sessionCutoffs":"30 false""#, "rejected"),
+            (#""sessionCutoffs":30,"sessionCutoffs":"30 false""#, "foreign"),
         ]
         let home = TempHome()
         defer { home.destroy() }
@@ -177,14 +179,26 @@ final class AgentCutoffsCommandTests: XCTestCase {
             let data = Data(text.utf8)
             let out = AgentCutoffsCommand.sessionAnswer(for: data)
             XCTAssertEqual(out.lines, [answer], text)
-            XCTAssertEqual(out.status, answer == "rejected" ? AgentCutoffsCommand.rejectedStatus : 0, text)
+            XCTAssertEqual(out.status, answer == "foreign" ? AgentCutoffsCommand.rejectedStatus : 0, text)
             try data.write(to: home.paths.stateFile)
             let app = try store.loadState()
             XCTAssertEqual(app?.sleepDisabledByUs, true, "the rest of the journal reads as written: \(text)")
             let expected = answer.hasPrefix("cutoffs ") ? AgentCutoffs(journalValue: String(answer.dropFirst("cutoffs ".count))) : nil
             XCTAssertEqual(app?.sessionCutoffs, expected, "Store.loadState on \(text)")
         }
-        for text in ["", "not json", #"["sessionCutoffs","30 false"]"#, #""30 false""#, #"{"sessionCutoffs":"30 false"} trailing"#] {
+        let rejected = [
+            "", "not json", #"["sessionCutoffs","30 false"]"#, #""30 false""#, #"{"sessionCutoffs":"30 false"} trailing"#,
+            #"{"sleepDisabledByUs":true,"frozenProcesses":"bad","sessionCutoffs":"30 false"}"#,
+            #"{"sleepDisabledByUs":"yes","sessionCutoffs":"30 false"}"#,
+            #"{"sessionCutoffs":"30 false","savedKeyboardBrightness":1e39}"#,
+            #"{"sessionCutoffs":"30 false","frozenProcesses":[{"pid":2147483648}]}"#,
+            #"{"sessionCutoffs":"30 false","frozenPids":[1.5]}"#,
+            #"{"sessionCutoffs":"30 false","endedSession":5}"#,
+            #"{"sessionCutoffs":"30 false","appNapOverrides":[{"previous":true}]}"#,
+            #"{"sessionCutoffs":"30 false","savedAudioOutputs":[{"deviceUID":"a","volume":0.5}]}"#,
+            #"{"frozenProcesses":"bad","sessionCutoffs":"30 false","frozenProcesses":[]}"#,
+        ]
+        for text in rejected {
             XCTAssertEqual(AgentCutoffsCommand.sessionAnswer(for: Data(text.utf8)), .init(lines: ["rejected"], status: AgentCutoffsCommand.rejectedStatus), text)
             try Data(text.utf8).write(to: home.paths.stateFile)
             XCTAssertThrowsError(try store.loadState(), text)
@@ -278,8 +292,9 @@ final class AgentCutoffsCommandTests: XCTestCase {
         let cases: [(input: String, line: String, status: Int32)] = [
             (#"{"sleepDisabledByUs":true,"sessionCutoffs":"30 false","sessionCutoffs":"0 true"}"#, "cutoffs 30 false", 0),
             (#"{"sleepDisabledByUs":true}"#, "none", 0),
-            (#"{"sleepDisabledByUs":true,"sessionCutoffs":"96 false"}"#, "rejected", AgentCutoffsCommand.rejectedStatus),
-            (#"{"sleepDisabledByUs":true,"sessionCutoffs":30}"#, "rejected", AgentCutoffsCommand.rejectedStatus),
+            (#"{"sleepDisabledByUs":true,"sessionCutoffs":"96 false"}"#, "foreign", AgentCutoffsCommand.rejectedStatus),
+            (#"{"sleepDisabledByUs":true,"sessionCutoffs":30}"#, "foreign", AgentCutoffsCommand.rejectedStatus),
+            (#"{"sleepDisabledByUs":true,"frozenProcesses":"bad","sessionCutoffs":"30 false"}"#, "rejected", AgentCutoffsCommand.rejectedStatus),
         ]
         for c in cases {
             let r = try runBinary(["--agent-session-cutoffs", "30"], input: Data(c.input.utf8))
