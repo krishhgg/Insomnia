@@ -123,7 +123,8 @@ a `build-app.sh` was added to its folder after unpacking.
 | `~/Library/LaunchAgents/com.insomnia.backstop.plist` | Per-user recovery agent: verifies the app's code signature, then runs the sealed `backstop.sh` |
 | `~/Library/Logs/Insomnia/` | `insomnia.log` and `handoffs.log`, each capped at 1 MiB with one older copy kept as `.1`, unless you replace it with a symlink |
 | `/etc/sudoers.d/insomnia` | Permission for the three commands below |
-| `/private/var/db/com.kgarg.insomnia/<uid>` | The receipt that shows whether the command behind a Start's password dialog turned sleep off (see Using it). The file and its folder are root's and only root can change them; the installer stops, changing nothing about them, if either is already there in another form |
+| `/private/var/db/com.kgarg.insomnia/<uid>` | The receipt that shows whether the command behind a Start's password dialog turned sleep off, and the lock that command holds until it exits (see Using it). Every Insomnia folder of the account shares it. The file and its folder are root's and only root can change them; the installer stops, changing nothing about them, if either is already there in another form |
+| `/private/var/db/com.kgarg.insomnia/<uid>.released` | Your own file beside the receipt: which start, if any, claims the receipt until that start is settled |
 
 ```text
 /usr/bin/pmset -a disablesleep 0
@@ -224,27 +225,60 @@ installer prints its pid.
 
    Insomnia keeps a receipt that says whether that command turned sleep
    off: `/private/var/db/com.kgarg.insomnia/<your user id>`, a file
-   `scripts/install.sh` makes and only root can change. Right before the
-   command turns sleep off it writes the start's random code and `writing`
-   into the receipt, and changes `writing` to `refused` if the session's
-   end passed meanwhile. When a start fails in a way the dialog's answer does
-   not explain, Insomnia first makes sure no command for that start can
-   still run, then reads the receipt. Only a receipt that holds another
-   start's code, or this start's with `refused`, shows that sleep was never
-   turned off, and then nothing is changed. Anything else, a missing or
-   replaced receipt included, shows nothing, and Insomnia runs
+   `scripts/install.sh` makes and only root can change. Every Insomnia
+   folder of your account shares it. A start claims the receipt before its
+   dialog, in `<your user id>.released` beside it, and keeps the claim
+   until the start is settled. Until then, Start in any other Insomnia
+   folder of yours is refused. The command locks the receipt before its
+   first check and keeps it locked until it and its pmset have exited.
+   Insomnia, the recovery agent and the scripts read the receipt only under
+   that lock. Right before the command turns sleep off, it uses
+   `/usr/bin/perl` to write the start's random code, the code the receipt
+   held before, and `writing` into the receipt. It then asks the drive to
+   flush its cache (`F_FULLFSYNC`). If the start's answer window has ended
+   by then, it writes `refused` and stops. That window ends when the
+   session would, or 130 seconds after Start if that is sooner: the
+   dialog's 120 seconds, the 3 seconds Insomnia waits after stopping it,
+   and 7 seconds for it to launch.
+
+   When a start fails in a way the dialog's answer does not explain,
+   Insomnia first deletes the start's `pending-start` file, so no command
+   for that start can pass its check any more. Then it reads the receipt
+   under its lock. Three receipts show that sleep was never turned off:
+   this start's code with `refused`; another start's line that names the
+   same earlier code; and the earlier code itself, once the dialog has
+   ended on its own or its answer window has ended. Then nothing is
+   changed, and a restore an earlier session still owes stays owed.
+   Anything else shows nothing, and Insomnia runs
    `pmset -a disablesleep 0`, which turns sleep back on even if another
-   tool turned it off in the meantime. Start refuses with nothing changed
-   while the receipt is missing or unsafe and says to run
-   `./scripts/install.sh` again. SECURITY.md lists what the receipt cannot
+   tool turned it off in the meantime. It does so at once for this
+   start's `writing` or a later start's line. A missing, replaced or
+   unreadable receipt waits for the answer window to end, since a command
+   for the start could still write until then. Until then, and for as long
+   as the receipt stays locked, nothing is decided: the start stays
+   recorded with its claim, Start is refused, and nothing is undone. The
+   next run after the window ends settles it.
+
+   Start refuses with nothing changed while the receipt is missing or
+   unsafe (it says to run `./scripts/install.sh` again), while a start
+   from another Insomnia folder of yours is not settled, and while
+   something holds the receipt's lock for more than 10 seconds. A Mac
+   without `/usr/bin/perl` cannot start a session: the command refuses
+   after you type the password. SECURITY.md lists what the receipt cannot
    show.
 
    How a start that does not turn sleep off ends:
 
    - **Cancel** starts no session and changes nothing.
-   - **A wrong password, or no answer within 120 seconds,** starts no
-     session. The command never ran, the receipt shows it, and nothing is
-     changed.
+   - **A wrong password** starts no session. The command never ran, the
+     dialog ended on its own, and the receipt still holds the earlier code,
+     so nothing is changed.
+   - **No answer within 120 seconds** starts no session. Insomnia sends
+     the dialog SIGTERM, but a dialog can still be answered until its
+     answer window ends, a few seconds later. Insomnia waits up to 15
+     seconds for the window to end, then reads the receipt: the command
+     never ran, so nothing is changed. If the window ends later than that,
+     the start stays recorded until then, and Start is refused meanwhile.
    - **The command takes too long.** The 120 seconds count from when the
      dialog appears, so they include the command that runs after you type
      the password. When they run out, Insomnia sends the dialog SIGTERM,
@@ -257,27 +291,30 @@ installer prints its pid.
      written `writing`, sleep is turned back on. A pmset failure, or an
      answer lost to a signal, is settled the same way.
    - **The dialog will not close** but no command behind it has started:
-     Insomnia voids the start so the dialog can no longer turn sleep off,
-     rolls the start back at once, and names the process with its pid in
-     the menu until it exits.
+     Insomnia deletes the start's `pending-start` file, so the dialog can
+     no longer turn sleep off, and settles the start from the receipt once
+     its answer window has ended, without waiting for the process. The
+     menu names the process with its pid until it exits.
    - **Insomnia crashed or was force-quit with the dialog up.** The next
      run that holds the recovery lock (Insomnia after a relaunch, the
      recovery agent or `uninstall.sh`) deletes the start's `pending-start`
-     file, and from then on answering the old dialog changes nothing.
-     launchd schedules the agent every minute but does not promise when it
-     runs; it does not run while the Mac sleeps. A file that cannot be
-     deleted, because a command behind the dialog still holds it or for any
-     other reason, is retried on every later run. The unfinished session is
-     never resumed. With the file
-     gone, the receipt decides: a start that never turned sleep off changes
-     nothing and keeps any restore an earlier session still owes, and
-     anything else turns sleep back on. If the journal cannot be updated
-     with that result, sleep is turned back on, Start is refused, and every
-     run tries again.
+     file. launchd schedules the agent every minute but does not promise
+     when it runs; it does not run while the Mac sleeps. A file that cannot
+     be deleted, because a command behind the dialog still holds it or for
+     any other reason, is retried on every later run. The unfinished
+     session is never resumed. Until the start's answer window has ended,
+     the old dialog can still be answered, so the start stays recorded and
+     Start is refused. After that the receipt decides: a start that never
+     turned sleep off changes nothing and keeps any restore an earlier
+     session still owes, and anything else turns sleep back on. If the
+     journal cannot be updated with that result, the start stays recorded,
+     Start is refused, and every run tries again. Meanwhile sleep is turned
+     back on only when the receipt showed nothing or an earlier restore is
+     owed.
 
    Insomnia shows no dialog at all while the `backstop.sh` sealed in its
    bundle is missing or older than the app expects, because an older one
-   cannot void such a dialog: Start then says to run `./scripts/install.sh`
+   cannot settle such a start from the receipt: Start then says to run `./scripts/install.sh`
    again. A password typed while the sudoers rule is missing turns nothing
    off either: the start is undone and Insomnia says to run the installer
    again (see How recovery works). If the `pending-start` file that guards
@@ -565,9 +602,10 @@ installation scenarios still need [release validation](docs/release-validation.m
   debounce, and runs the floor rules again. If the mode cannot be read or
   switched off, or the journal cannot be written, it tries again every
   30 s while the session lasts. The password dialog is different: it is
-  never killed either, but a dialog whose start was voided can no longer
-  change anything, so that start rolls back at once and the menu names the
-  dialog until it exits.
+  never killed either, but a dialog whose `pending-start` file is gone can
+  no longer change anything once its answer window has ended, so that
+  start is settled from the receipt then, a few seconds later, and the menu
+  names the dialog until it exits.
 - **Audio:** the backstop preserves volume/mute entries but cannot restore
   CoreAudio. Reopen the app for recovery. An output device that is not
   connected keeps its entry until it reconnects, and uninstall stops while
@@ -589,14 +627,18 @@ installation scenarios still need [release validation](docs/release-validation.m
   it to 0. One set during the session is set to 0 when the session
   ends. One set while the dialog is up stays when the start then fails or
   is abandoned (a crash included) and the receipt shows that the command
-  never turned sleep off. It is set to 0 when the receipt shows nothing:
-  the command wrote `writing` and then failed or was stopped, or the
-  receipt is missing, replaced or unreadable, or the `pending-start` file
-  was not the one the start wrote. It is also set to 0 when the journal
-  cannot be updated with what the receipt shows. And while Insomnia still
+  never turned sleep off, also while the journal cannot take that result.
+  It is set to 0 when the receipt shows nothing: at once when the command
+  wrote `writing` and then failed or was stopped, or a later start's line
+  names another earlier code, and once the start's answer window has
+  ended when the receipt is missing, replaced or unreadable. So it is when
+  the receipt stays locked past that window. On a drive that ignores the flush request, a
+  power loss can bring back an older receipt while pmset's 1 persists;
+  that 1 then reads as set by something else. And while Insomnia still
   owes a restore from an earlier session, another tool's 1 looks like
-  Insomnia's own. A program running as you can change `pending-start` and
-  the journal, and with them which of these happens; SECURITY.md says how.
+  Insomnia's own. A program running as you can change `pending-start`, the
+  `.released` file and the journal, and with them which of these happens;
+  SECURITY.md says how.
 - **Low Power Mode:** Insomnia checks the existing setting so it does not
   claim ownership of an already-enabled preference.
 - **App Nap:** off by default. When the setting is on, Insomnia journals each
@@ -752,9 +794,15 @@ The zip has no `backstop.sh`, so one added beside its uninstaller is not run.
 Neither looks in the folder above its own.
 
 The uninstaller requests cleanup before removing the app, agent, sudoers
-rule and your receipt. It removes the receipts folder too once no other
-account's receipt is in it, and leaves the folder and everything in it
-alone when someone other than root could change it. If recovery is incomplete or the app refuses to quit, it stops; resolve
+rule, your receipt and its `.released` file. It removes those two only
+under the receipt's lock and only while no start claims the receipt. A
+start from another Insomnia folder of yours that is not settled, a lock
+that stays held, or a `.released` file it cannot read keeps both, with a
+message. Once they are gone, any other Insomnia folder of yours needs
+`./scripts/install.sh` again before its next start. It removes the
+receipts folder too once no other account's receipt is in it, and leaves
+the folder and everything in it alone when someone other than root could
+change it. If recovery is incomplete or the app refuses to quit, it stops; resolve
 the reported problem and retry. With the app it removes what an interrupted
 install left beside it: `~/Applications/.Insomnia.app.previous`, and
 `.Insomnia.app.staging.*` directories of installs that are no longer running.

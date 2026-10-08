@@ -225,8 +225,9 @@ Flag a change that breaks one of these; do not flag the behavior itself.
   gets SIGTERM at 120 s and is never sent SIGKILL. One still running 3 s
   later is reported with its pid and its marker is deleted under the
   marker's lock. Once that succeeds its root command can no longer run
-  pmset, so the start rolls back at once (settled from the receipt) and
-  releases the recovery lock; the prompt is watched outside the
+  pmset, so the start waits for its answer window (`expires`, at most 15
+  s by then) to end, is settled from the receipt and releases the
+  recovery lock; the prompt is watched outside the
   transaction, and the menu line offers `kill <pid>` until osascript exits
   and goes once the prompt has. Only while the root command holds the
   marker's lock (anywhere from its nonce check to its exit, a sudo query
@@ -237,10 +238,12 @@ Flag a change that breaks one of these; do not flag the behavior itself.
   root command; docs must not call a hung query bounded by it.
 - `AdministratorPrompt.swift`, `SessionManager.swift`, `backstop.sh`,
   `uninstall.sh`. A prompt can outlive its start (the app crashes or is
-  force-quit under the dialog, the start rolls back after a stuck prompt).
+  force-quit under the dialog, the start is settled after a stuck prompt).
   Its root command therefore runs under `lockf -k -n` on `pending-start`
   and runs `pmset -a disablesleep 1` only while the file holds that start's
-  nonce and `/bin/date +%s` is below the session's end, passed as `$3`; a
+  nonce and `/bin/date +%s` is below `expires` (the session's end or 130
+  s after the marker, `AdministratorPrompt.answerWindow`, whichever is
+  first), passed as `$3`; a
   `$3` that `[` cannot compare refuses too. The start deletes the file before it releases the recovery lock;
   every other lock holder deletes it before it touches the journal, and
   every deleter (Store.removePendingStart, backstop.sh, uninstall.sh)
@@ -258,10 +261,12 @@ Flag a change that breaks one of these; do not flag the behavior itself.
   the journal and session.json exactly and runs no pmset.
 - `BackstopVersion.swift`, `backstop.sh`. Start reads the
   `# insomnia-backstop-version:` line of the `backstop.sh` sealed in the
-  bundle the agent runs and shows no dialog below version 3 (2 is the
+  bundle the agent runs and shows no dialog below version 4 (2 is the
   first that deletes `pending-start`, 3 the first that settles a
-  journaled `sleepOffAttempt` from its receipt); the user is told to run
-  `install.sh` again.
+  journaled `sleepOffAttempt` from its receipt, 4 the first that reads
+  the receipt under its lock as the 82-byte line with the predecessor and
+  the start's `expires`, and gives the start's claim back); the user is
+  told to run `install.sh` again.
   Bump the version line and `BackstopVersion.required` together whenever
   the app starts relying on new backstop behavior.
 - `AdministratorPrompt.swift`, `SleepGuard.swift`, `install.sh`. Before the
@@ -270,8 +275,15 @@ Flag a change that breaks one of these; do not flag the behavior itself.
   `SleepDisabled 1` the journal does not claim refuses Start with nothing
   run, deliberately, so a setting another tool made stays. The check that
   the end can restore without a password is in the root command, under
-  the marker's lock, before any write, in this order: the nonce check
-  (3), the deadline (4), a uid that is a positive number (5), no
+  the marker's lock and the receipt's, before any write, in this order: a
+  uid that is a positive number (5) of plain digits (7), the receipt
+  opened read-only on fd 8 and locked with `/usr/bin/lockf -s -t 10 8`
+  (75 if it stays locked), checked by fixed path (7: `stat`/`ls -le` of
+  `/private/var/db/com.kgarg.insomnia/<uid>` and every folder up to /
+  showing a one-link 82-byte regular file under folders, all root's, no
+  group or other write, no allowing ACL, and fd 8 and the path the
+  device:inode the start claimed, `$7`), the nonce check (3), `expires`
+  (4), no
   `/private/etc/sudo.conf` in any form (5: `sudo -V` does not list an
   approval plugin with no show_version, and sudo consults one only when
   it runs a command), `/private/etc/pam.d/sudo` with exactly one
@@ -290,36 +302,56 @@ Flag a change that breaks one of these; do not flag the behavior itself.
   password), and `-k -n -ll /usr/bin/pmset -a disablesleep 0` (5 unless
   it prints exactly the six-line /etc/sudoers.d/insomnia entry:
   `RunAsUsers: root`, `Options: !authenticate`, the restore as the only
-  command and `Matched:` the restore). Then the deadline (4), the receipt
-  check by fixed path (7: a uid of plain digits, an uppercase UUID nonce,
-  and `stat`/`ls -le` of `/private/var/db/com.kgarg.insomnia/<uid>` and
-  every folder up to / showing a one-link 45-byte regular file under
-  folders, all root's, no group or other write, no allowing ACL), a root
-  read of `pmset -g` (6 on a `SleepDisabled 1` or a failed read; skipped
-  only when `$5` is exactly `1`, the journal claimed the 1 before this
-  start), `<nonce> writing` written into the receipt in place with `dd
-  conv=notrunc,fsync` and read back (`<nonce> refused` and 7 if that
-  fails), the deadline again (`<nonce> refused` and 4), and only then
-  `pmset -a disablesleep 1`, the command's only power write (1 if it
-  fails). Root never writes the marker or anything in the user's
-  folders. `trap '' PIPE` keeps each refusal's status when the dialog's
-  stderr is gone. Exits 3, 4, 6 and 7, and lockf's 69 and 75, are
-  `.refused`; 5 is `restoreNeedsPassword`. All refusals leave the sleep
+  command and `Matched:` the restore). Then `expires` (4), the nonce and
+  predecessor uppercase UUIDs that differ, the nonce not all zeros (7),
+  the receipt's first 36 bytes through fd 8 equal to the predecessor `$6`
+  (8), a root read of `pmset -g` (6 on a `SleepDisabled 1` or a failed
+  read; skipped only when `$5` is exactly `1`, the journal claimed the 1
+  before this start), `<nonce> <predecessor> writing` written into the
+  receipt in place by `/usr/bin/env -i /usr/bin/perl` (sysopen
+  `O_WRONLY|O_NOFOLLOW` with no create or truncate, the same device:inode
+  as fd 8, one full syswrite, `fcntl` `F_FULLFSYNC` (51), close, reopen
+  and read back; `<nonce> <predecessor> refused` and 7 if any of that
+  fails or perl is missing), `expires` again (`refused` and 4), and only
+  then `pmset -a disablesleep 1`, the command's only power write (1 if it
+  fails). Its shell and pmset keep fd 8, so the receipt stays locked
+  until pmset exits. Root never writes the marker or anything in the
+  user's folders. `trap '' PIPE` keeps each refusal's status when the
+  dialog's stderr is gone. Exits 3, 4, 6, 7 and 8, and lockf's 69 and 75,
+  are `.refused`; 5 is `restoreNeedsPassword`. All refusals leave the sleep
   setting as the command found it and roll back with no pmset, so another
   tool's setting found by a read stays. Any other status is ambiguous:
-  the start deletes the marker under its lock and rolls back with no
-  pmset only when the deleted file is the marker journaled in
-  `sleepOffAttempt` and `SleepOffReceipts.verdict` is `.neverWrote` (the
-  receipt passes every check, is the journaled device:inode, and holds
-  another nonce or this one with `refused`); anything else is undone like
-  an end. The next recovery-lock holder (the app after a relaunch,
+  the start deletes the marker under its lock, reads
+  `SleepOffReceipts.verdict` under the receipt's lock and rolls back with
+  no pmset only when the deleted file is the marker journaled in
+  `sleepOffAttempt` and the verdict is `.neverWrote`: the receipt passes
+  every check, is the journaled device:inode, and holds this nonce with
+  `refused`, another start's line naming the same predecessor, or the
+  predecessor itself once the dialog ended by itself
+  (`AdministratorPromptError.dialogOver`: cancelled, launch failure,
+  refusal, wrong password) or `expires` has passed. This nonce's
+  `writing`, or a later line naming another predecessor, is
+  `.mayHaveWritten` and undone like an end at once; a missing, replaced,
+  unsafe or malformed receipt is too once `expires` has passed. Before
+  then those, and at any time a receipt lock that stays busy or fails,
+  are `.undecided`: the start keeps the attempt, its claim and
+  `sleepDisabledByUs` and runs no pmset before `expires` unless the
+  journal owed a restore before it (`owedBefore`). A dialog that did not end by itself
+  (timeout, stuck prompt, interruption) and has at most 15 s left of
+  `expires` waits for it before the read. The next recovery-lock holder (the app after a relaunch,
   backstop.sh, uninstall.sh) settles an attempt still journaled the same
-  way once the marker is gone and before it reads the session: the
-  session.json whose end is the attempt's deadline goes, `.neverWrote`
-  puts `sleepDisabledByUs` back to `owedBefore`, anything else keeps it,
-  and a settlement that cannot be written keeps the attempt (the app ends
-  an unexpired session of it and refuses Start, backstop.sh undoes as
-  `--force` and exits 1, uninstall.sh stops). A marker removed with no
+  way once the marker is gone and before it reads the session:
+  `.undecided` keeps everything; otherwise the session.json whose end is
+  the attempt's deadline goes, the claim goes back, `.neverWrote` puts
+  `sleepDisabledByUs` back to `owedBefore`, anything else keeps it, and a
+  settlement that cannot be written keeps the attempt and the claim (with
+  `.neverWrote` and no `owedBefore` no pmset runs and Starts stay
+  refused; otherwise the app ends an unexpired session of it and refuses
+  Start, backstop.sh undoes as `--force` and exits 1, uninstall.sh stops
+  with no pmset). The release file `<uid>.released` (the user's, 0600,
+  42 bytes, `<nonce> free|held`) holds the claim: a start claims only
+  while it shows the receipt's nonce `free`, and another
+  `INSOMNIA_HOME`'s unsettled claim refuses Start. A marker removed with no
   attempt journaled takes session.json with it when no session is in
   memory. Flag a change that writes anything (pmset, the receipt or a
   restore run as the user) before the checks pass, has root write the
@@ -329,7 +361,12 @@ Flag a change that breaks one of these; do not flag the behavior itself.
   widens `owners` or `RECEIPT_OWNER` included), reads the receipt before
   the marker is gone under its lock, lets `.neverWrote` clear an owed
   `sleepDisabledByUs` rather than restore `owedBefore`, resumes a session
-  whose attempt is still journaled, drops the sudo.conf or PAM check,
+  whose attempt is still journaled, reads or claims the receipt without
+  its lock or takes a busy or failed lock as clean, lets `.undecided` or
+  a predecessor read before `expires` (dialog not over) settle as
+  `.neverWrote`, writes the receipt without `F_FULLFSYNC` or with more
+  than one write, claims while the release file shows another nonce or
+  `held`, drops the sudo.conf or PAM check,
   accepts another sudo version or adds a Defaults name to the list
   without reading what that setting does when sudo runs a command,
   treats a missing, replaced or unreadable receipt, or a marker other
@@ -346,10 +383,13 @@ Flag a change that breaks one of these; do not flag the behavior itself.
   after root's read during a dialog that then fails ambiguously (timeout,
   stuck prompt, pmset failure, a status lost to a signal) is set to 0 by
   the undo once the command wrote `writing`, even when it stopped before
-  its write; a receipt that shows nothing, a replaced marker or a
-  settlement that cannot be written also undo; the receipt is fsynced,
-  not `F_FULLFSYNC`ed, so a power loss can bring back older content while
-  pmset's 1 survives, and that 1 is then reported as someone else's; a
+  its write; once `expires` has passed a receipt that shows nothing, and
+  at any time a replaced marker or a settlement that cannot be written,
+  also undo; an attempt that stays `.undecided` keeps Start refused and
+  the session recorded until a later holder settles it; the receipt is
+  `F_FULLFSYNC`ed, but what that and pmset's own write guarantee across
+  a power loss is not measured, so older receipt content beside pmset's 1
+  stays possible and that 1 is then reported as someone else's; a
   process running as the user can rewrite state.json and the attempt,
   swap the marker while a command holds it, or write a settled start's
   nonce into a new marker before a password goes into that start's old

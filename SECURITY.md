@@ -248,12 +248,14 @@ of three lines:
   leave the start unsettled.
 
 The start then rolls back with no pmset, and a SleepDisabled 1 another
-tool set while the dialog was up stays. This start's `writing`, a later
-start's line that names another predecessor, and a receipt that is
-missing, replaced, unreadable, of another size or shape or under a folder
-someone other than root could change are undone like an end once
-`expires` has passed. Before then they decide nothing (below), and so does
-a receipt that stays locked or whose lock fails, at any time. A wrong
+tool set while the dialog was up stays. This start's `writing` and a
+later start's line that names another predecessor are undone like an end
+at once. A receipt that is missing, replaced, unreadable, of another size
+or shape or under a folder someone other than root could change is undone
+like an end once `expires` has passed. Before then it decides nothing
+(below), and neither does the predecessor after a dialog that may still
+be answered, nor, at any time, a receipt that stays locked or whose lock
+fails. A wrong
 password never starts the command, so the receipt still holds the
 predecessor. A cancelled dialog never starts it either, and rolls back on
 its status alone.
