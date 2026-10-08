@@ -134,13 +134,32 @@ login Keychain, not the configuration file.
 
 The rule is one file for the whole Mac and grants one account. The installer
 reads it through sudo first and stops, changing nothing, when it grants
-another account. It then writes the rule in one `sudo` call that takes a lock
-only root can create (`/var/run/insomnia-sudoers.lock`), checks the rule is
-still what it read, has `visudo` check a copy beside it, and renames that
-copy over it. The uninstaller removes the rule the same way, under the same
-lock. So when two accounts install or uninstall at once, neither overwrites
-or removes a rule the other wrote after its read: the run that finds the rule
-changed stops, and asks you to rerun it.
+another account. It then writes the rule in one `sudo /bin/bash -c` call.
+That root shell takes a lock file in the rule's own folder,
+`/etc/sudoers.d/.insomnia-sudoers.lock` (sudo skips a name with a dot).
+Before opening it, root checks that every folder above it is root's and
+writable only by root, and that the file, if it is there, is a regular file
+of root's with mode 0600 and one link; after locking it, that the descriptor
+and the path are still that same file. The lock file is created only where
+nothing is, and is never repaired, replaced or removed: one that fails a
+check stops the run and is left for you to look at. Root then opens the rule,
+checks that its exact text is the text the run read and judged (passed to
+root as an argument, not read again from a file), has `visudo` check a new
+copy beside it, and renames that copy over the rule only while the rule's
+path still names the file it opened. The uninstaller removes the rule the
+same way, under the same lock. So when two accounts run these scripts at
+once, neither overwrites or removes a rule the other wrote after its read:
+the run that finds the rule changed stops, and asks you to rerun it.
+
+The lock keeps out only the runs that take it. Installers and uninstallers
+of earlier releases take no lock, or an older one, and neither does an
+administrator's own `sudo`; against those the checks leave the moments
+between root's last check and its rename or removal open. A root call that
+is killed or does not answer in time leaves it unknown whether the rule
+changed, and the script says so instead of claiming nothing changed. The
+root shell needs sudo to allow `/bin/bash`, as it does for an administrator
+by default; an account whose sudo policy allows only listed commands cannot
+install this way.
 
 The recovery agent runs at login and every 60 seconds. Its command line pins
 the installed bundle's code requirement (for an ad-hoc build, the cdhash of
@@ -173,13 +192,17 @@ not by its name, so the Insomnia API client (`com.insomnia.app`), whose
 executable is also named Insomnia, is reported and left alone. A process named
 Insomnia with any other bundle id, or one that cannot be read, counts as this
 app and blocks the upgrade until it exits; it is never asked to quit. Once
-the installer holds the recovery lock it reads no Info.plist: a process it
-first sees then counts as unverified and blocks. A copy running in another
-account, or a process there that cannot be told apart from one, stops the
-install before the sudoers rule is replaced, since that copy may need the
-rule; it is named and never asked to quit. A `pgrep` that fails or does not
-answer stops it there too. A refusal names the pid and
-executable path it found. The new
+the installer holds the recovery lock, its process check reads no
+Info.plist: a process it first sees then counts as unverified and blocks. A
+copy running in another account, or a process there that cannot be told
+apart from one, stops the install before the sudoers rule is replaced, since
+that copy may need the rule; it is named and never asked to quit. So does a
+process whose owner `ps -o uid=` cannot tell (it fails, does not answer, or
+prints no user ID): the installer looks once more and, if the owner is still
+unknown, stops before its first `sudo` call, the password prompt included.
+Only a process positively identified as the API client is ignored. A
+`pgrep` that fails or does not answer stops it there too. A refusal names
+the pid and executable path it found. The new
 bundle is built in a staging directory next to the app and moved into place in
 the same step that replaces the recovery agent. That step starts only after
 `launchctl print` confirms the previous agent is unloaded; otherwise nothing is
@@ -204,15 +227,19 @@ print` does not confirm the unload or the reload. Unresolved recovery prevents
 replacing either; follow the reported instructions before retrying. The
 installer checks the sudoers rule again once it holds the recovery lock, and
 stops if the rule is gone, as after an `uninstall.sh` that took the lock first.
-Each call it makes to `sudo`, `pgrep`, `ps`, `launchctl` or `codesign` while it
-holds the lock has a 30 s limit, which a supervising process enforces even
-if the installer is killed meanwhile. The call keeps the lock until it has
-exited or been stopped, so no `launchctl bootout` it started is still
-running once the lock is released. A call that does not answer in time gets SIGTERM, then SIGKILL
-one to two seconds later, and the install stops, so the lock is released and the app
-and the agent's backstop can take it again to undo a session. `sudo` only
-ever gets SIGTERM: one that ignores it keeps the lock until it ends, and the
-installer prints its pid.
+Each call it makes to `sudo`, `pgrep`, `ps`, `plutil`, `launchctl` or
+`codesign` while it holds the lock has a 30 s limit, which a supervising
+process enforces even if the installer is killed meanwhile. The call keeps
+the lock until it has exited or been stopped, so no `launchctl bootout` it
+started is still running once the lock is released. A call that does not
+answer in time gets SIGTERM, then SIGKILL one to two seconds later, and the
+install stops, so the lock is released and the app and the agent's backstop
+can take it again to undo a session. A read that fails or does not answer is
+never taken as a clean answer. `sudo` only ever gets SIGTERM: one that
+ignores it keeps the lock until it ends, and the installer prints its pid.
+The `backstop.sh` the installer runs under the lock to end a stale session
+is not one of these calls: as before, it has no such limit, and it reads the
+installed app's Info.plist and the journal itself.
 
 </details>
 
@@ -633,17 +660,39 @@ problem and retry. The Insomnia API client (`com.insomnia.app`) is reported and
 left alone. A process named Insomnia with any other bundle id, or whose bundle
 id cannot be read, or whose Info.plist does not answer within the
 uninstaller's time limit for a call, blocks the uninstall until it exits.
-Once the uninstaller holds the recovery lock it reads no Info.plist: a
-process it first sees then counts as unverified and blocks. A `pgrep` that
-fails or does not answer stops the uninstall before anything is removed, and
-so does a copy running in another account, which is never asked to quit. The
-sudoers rule is one file for the whole Mac and names the account whose install
-wrote it. The uninstaller reads it through sudo and removes it only when it is
-exactly the rule the installer writes for your account; otherwise it keeps the
-file and says why. It removes the rule only if the rule still holds what it
-read, checked under the lock the installer takes for its write. If the rule
-changed meanwhile, or another run holds that lock for 10 s, the uninstaller
-keeps the rule and the app, and asks you to rerun it. With the app it removes what an interrupted
+A `pgrep` that fails or does not answer stops the uninstall before anything
+is removed, and so does a copy running in another account, which is never
+asked to quit. So does a process whose owner `ps -o uid=` cannot tell, or
+whose identity cannot be read, once a second look still finds it: the
+uninstaller then stops before its first `sudo` call. Only a process
+positively identified as the API client is ignored.
+
+From a checkout, the uninstaller reads the installed app's
+`InsomniaResumeFrozenVersion` before it takes the recovery lock, with the
+same time limit, and under the lock checks with `stat` (which reads no
+contents) that the Info.plist is still that file, unchanged. A read that
+fails or does not answer, or a file that changed, stops it before any
+`backstop.sh` runs or anything is removed. It asks for your password
+(`sudo -v`) before the lock as well, so every `sudo` call under the lock is
+`sudo -n` with the 30 s limit. Once it holds the lock, its own process check
+and journal checks read no Info.plist: a process it first sees then counts as
+unverified and blocks. The `backstop.sh` it runs there has no such limit and
+reads the installed app's Info.plist itself, as before. A journal check
+whose read fails or does not answer counts as a problem, never as a clean
+journal, and stops the uninstall before anything is removed. If the later
+read for a brightness Insomnia kept fails, the journal is kept.
+
+The sudoers rule is one file for the whole Mac and names the account whose
+install wrote it. The uninstaller reads it through sudo and removes it only
+when it is exactly the rule the installer writes for your account; otherwise
+it keeps the file and says why. It removes the rule only if the rule still
+holds what it read, checked under the lock the installer takes for its write.
+If the rule changed meanwhile, or another run holds that lock for 10 s, the
+uninstaller keeps the rule and the app, and asks you to rerun it. If the
+root call that removes it fails in an unknown way or does not answer, the
+uninstaller keeps the app and the recovery journal too, since whether the
+rule is gone is not known; a `sudo` that ignores SIGTERM keeps the recovery
+lock until it ends, and the uninstaller prints its pid. With the app it removes what an interrupted
 install left beside it: `~/Applications/.Insomnia.app.previous`, and
 `.Insomnia.app.staging.*` directories of installs that are no longer running.
 Nothing else in `~/Applications` is touched. Purge removes owned files, not arbitrary

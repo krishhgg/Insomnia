@@ -84,27 +84,31 @@ RMDIR=/bin/rmdir
 MKTEMP=/usr/bin/mktemp
 TEST=/bin/test
 CAT=/bin/cat
-CMP=/usr/bin/cmp
+CP=/bin/cp
+STAT=/usr/bin/stat
 # The shell sudoers_remove runs as root.
 ROOT_BASH=/bin/bash
 LOCK_TIMEOUT_SECONDS=10
 # How long to wait for the app to exit after asking it to quit.
 QUIT_WAIT_SECONDS=10
 # Longest one external call made by this script itself (pgrep, ps, plutil,
-# defaults, launchctl, codesign) may run before it is stopped with SIGTERM,
-# then SIGKILL. A call made under the recovery lock keeps the lock until it
-# has exited or been stopped, even if this run is killed first (see bounded()).
-# backstop.sh bounds its own commands; the sudo calls (the test, read and
-# removal of the sudoers rule) prompt for a password and are left to sudo's
-# own prompt timeout.
+# cp, stat, defaults, launchctl, codesign, and the sudo calls made under the
+# recovery lock) may run before it is stopped with SIGTERM, then SIGKILL,
+# except sudo, which only ever gets SIGTERM. A call made under the recovery
+# lock keeps the lock until it has exited or been stopped, even if this run
+# is killed first (see bounded()). backstop.sh bounds its own commands. The
+# password is asked once, with `sudo -v` before the lock is taken, so no
+# call made under the lock waits for a prompt.
 CALL_TIMEOUT_SECONDS=30
 APP="$HOME/Applications/Insomnia.app"
 SUDOERS=/etc/sudoers.d/insomnia
 # Held, as root, by install.sh and uninstall.sh around each compare and
-# write of $SUDOERS (see install.sh). /var/run is writable only by root and
-# the daemon group, and the file is root's with mode 0600, so no account can
-# create, swap or hold it.
-SUDOERS_LOCK=/var/run/insomnia-sudoers.lock
+# write of $SUDOERS (see install.sh, which says why only root can make,
+# swap or hold it). Never removed, not even by --purge.
+SUDOERS_LOCK=/private/etc/sudoers.d/.insomnia-sudoers.lock
+# The owner the guard, the rule and the folders above them must have: root.
+# Tests patch this line to the test account.
+ROOT_UID=0
 BUNDLE_ID=com.kgarg.insomnia
 # The Insomnia API client, whose executable is also named Insomnia. Its
 # bundle id is the only one that proves a process is not this app.
@@ -162,26 +166,30 @@ ACCOUNT="$("$ID" -un)"
 
 step() { printf '\n==> %s\n' "$*"; }
 
-# Scratch space for bounded(): this run's own directory, emptied on exit.
+# Scratch space for bounded() and for the private copies of the journal the
+# checks in step 4 read: this run's own directory, emptied on exit.
 WORK="$("$MKTEMP" -d "${TMPDIR:-/tmp}/insomnia-uninstall.XXXXXX")"
-trap '"$RM" -f "$WORK"/call.* "$WORK/sudoers.seen" 2>/dev/null; "$RMDIR" "$WORK" 2>/dev/null || true' EXIT
+trap '"$RM" -f "$WORK"/call.* "$WORK"/*.json "$WORK"/*.lines 2>/dev/null; "$RMDIR" "$WORK" 2>/dev/null || true' EXIT
 
 # Run one external call with a time limit. Its combined output is left in
-# BOUNDED_OUTPUT (trailing newline removed) and its exit status returned, or
-# 124 when it did not finish within CALL_TIMEOUT_SECONDS and was stopped, or
-# 125 when it is sudo and still running (pid in BOUNDED_PID; this script
-# bounds no sudo call). The same helper as install.sh's, which says more.
-# supervise() enforces the limit itself, even if this run is killed while it
-# waits: SIGTERM once the limit has passed on bash's SECONDS clock, SIGKILL
-# one to two seconds later, never SIGKILL for sudo. The supervisor and the call keep fd 9 (the recovery lock) until the
+# BOUNDED_OUTPUT (trailing newline removed) and in the file
+# $BOUNDED_BASE.out byte for byte, and its exit status returned, or 124 when
+# it did not finish within CALL_TIMEOUT_SECONDS and was stopped, or 125 when
+# it is sudo and still running (pid in BOUNDED_PID). The same helper as
+# install.sh's, which says more. supervise() enforces the limit itself, even
+# if this run is killed while it waits: SIGTERM once the limit has passed on
+# bash's SECONDS clock, SIGKILL one to two seconds later, never SIGKILL for
+# sudo. The supervisor and the call keep fd 9 (the recovery lock) until the
 # call has exited, so a launchctl bootout made under the lock cannot unload
-# an agent the app confirms after this run is gone.
+# an agent the app confirms after this run is gone, and a sudo that ignores
+# SIGTERM keeps the lock until it ends.
 BOUNDED_OUTPUT=""
 BOUNDED_PID=""
-# shellcheck disable=SC2034  # BOUNDED_PID is for sudo, and this script bounds none
+BOUNDED_BASE=""
 bounded() { # command args...
   local base supervisor rc deadline
   base="$("$MKTEMP" "$WORK/call.XXXXXX")"
+  BOUNDED_BASE="$base"
   BOUNDED_OUTPUT=""
   BOUNDED_PID=""
   supervise "$base" "$@" </dev/null >/dev/null 2>&1 &
@@ -243,14 +251,51 @@ supervise() { # base command args...
 case "$APP_SUPPORT" in /*) ;; *) echo "refusing: app support path is not absolute: $APP_SUPPORT" >&2; exit 1 ;; esac
 [[ "$(basename "$APP")" == "Insomnia.app" ]] || { echo "refusing: $APP is not an Insomnia.app bundle path" >&2; exit 1; }
 
-extract() { # file keypath (raw scalar; non-zero if missing)
-  "$PLUTIL" -extract "$2" raw -o - "$1" 2>/dev/null
+# Reads made under the recovery lock (the journal, config.json) are bounded
+# calls, so none can keep the lock waiting. One that fails in a way other
+# than plutil's own "no such value" or "does not parse" (exit 1), or does
+# not answer in time, is noted in READ_FAILURES. Its caller sees no value,
+# so the caller of the whole check must treat a note there as a check that
+# did not complete (it is never a clean journal). Once a read has failed,
+# the rest return at once: they would most likely wait the same way. These
+# notes go to a file because most reads run inside $(...).
+READ_FAILURES="$WORK/read-failures.lines"
+plutil_read() { # plutil arguments... file -> its output; 0 read, 1 plutil said no, 2 failed (noted)
+  local rc=0 file="${!#}"
+  [[ ! -s "$READ_FAILURES" ]] || return 2
+  bounded "$PLUTIL" "$@" || rc=$?
+  case "$rc" in
+    0) "$CAT" "$BOUNDED_BASE.out"; return 0 ;;
+    1) return 1 ;;
+  esac
+  echo "'plutil $1 $2' on ${file##*/} $(call_result "$rc")" >> "$READ_FAILURES"
+  return 2
+}
+extract() { # file keypath (raw scalar; non-zero if missing or failed)
+  plutil_read -extract "$2" raw -o - "$1"
 }
 extract_json() { # file keypath
-  "$PLUTIL" -extract "$2" json -o - "$1" 2>/dev/null
+  plutil_read -extract "$2" json -o - "$1"
 }
-type_of() { # file keypath -> bool|integer|float|string|array|dictionary|(any); empty if absent
-  "$PLUTIL" -type "$2" -o - "$1" 2>/dev/null || true
+type_of() { # file keypath -> bool|integer|float|string|array|dictionary|(any); empty if absent or failed
+  plutil_read -type "$2" -o - "$1" || true
+}
+# Copies the regular file $1 to $2, in WORK, with one bounded cp, so the
+# checks read a private copy that cannot block or change under them. Returns
+# cp's status, or 124 when it did not answer in time.
+snapshot() { # file copy
+  local rc=0
+  "$RM" -f "$2"
+  bounded "$CP" "$1" "$2" || rc=$?
+  return "$rc"
+}
+# How a bounded call's exit status reads in a message.
+call_result() { # status
+  if (( $1 == 124 )); then
+    printf 'did not answer within %ss' "$CALL_TIMEOUT_SECONDS"
+  else
+    printf 'exited %s' "$1"
+  fi
 }
 
 # Prints one line per way the app's records about a kept display entry would
@@ -413,8 +458,10 @@ record_text_problems() { # file
 # Shape check, same rules as backstop.sh: a JSON object whose known keys have
 # the types RuntimeState.swift writes; null counts as absent.
 journal_shape_problems() { # file
-  local f="$1" key t i n
-  if [[ "$("$PLUTIL" -convert json -o - "$f" 2>/dev/null | head -c 1)" != "{" ]]; then
+  local f="$1" key t i n json
+  json="$(plutil_read -convert json -o - "$f")" || true
+  [[ ! -s "$READ_FAILURES" ]] || return 0
+  if [[ "${json:0:1}" != "{" ]]; then
     echo "state.json is not a JSON object"
     return 0
   fi
@@ -513,22 +560,25 @@ journal_shape_problems() { # file
   fi
 }
 
-is_refused() { # key
-  [[ "$(extract "$STATE" "$1" || true)" == "true" ]]
+is_refused() { # file key
+  [[ "$(extract "$1" "$2" || true)" == "true" ]]
 }
 
 # Brightness the app kept after its private-call guard refused the restore
 # on this macOS, one line per device with the saved level. Not a problem
-# for uninstall: no step here can restore it.
+# for uninstall: no step here can restore it. Read from the private copy of
+# state.json that journal_problems checked; a read that fails is noted in
+# READ_FAILURES, and the caller then keeps state.json.
 refused_brightness() {
   local value
-  [[ -f "$STATE" ]] || return 0
-  if is_refused displayRestoreRefused && value="$(extract "$STATE" savedDisplayBrightness)"; then
+  [[ -f "$STATE_COPY" ]] || return 0
+  if is_refused "$STATE_COPY" displayRestoreRefused && value="$(extract "$STATE_COPY" savedDisplayBrightness)"; then
     echo "display brightness $value"
   fi
-  if is_refused keyboardRestoreRefused && value="$(extract "$STATE" savedKeyboardBrightness)"; then
+  if is_refused "$STATE_COPY" keyboardRestoreRefused && value="$(extract "$STATE_COPY" savedKeyboardBrightness)"; then
     echo "keyboard backlight $value"
   fi
+  return 0
 }
 
 # Same rules as backstop.sh: a date in the form Store.parseDate reads, and
@@ -560,11 +610,13 @@ epoch_at() { # file keypath
   epoch_of "${v%$'\n'}"
 }
 session_shape_problems() { # file
-  local f="$1" key t i
+  local f="$1" key t i json
   # plutil also reads XML and binary property lists, which the app's
   # JSONDecoder refuses, so the file itself must start with "{" too.
+  json="$(plutil_read -convert json -o - "$f")" || true
+  [[ ! -s "$READ_FAILURES" ]] || return 0
   if [[ "$(LC_ALL=C tr -d ' \t\r\n' < "$f" 2>/dev/null | head -c 1)" != "{" ]] \
-     || [[ "$("$PLUTIL" -convert json -o - "$f" 2>/dev/null | head -c 1)" != "{" ]]; then
+     || [[ "${json:0:1}" != "{" ]]; then
     echo "session.json is not a JSON object"
     return 0
   fi
@@ -595,20 +647,33 @@ session_shape_problems() { # file
 
 # Independent check of the journal: prints one line per unresolved item.
 # Trusts nothing about the backstop that just ran (it may be an older copy).
+# It runs under the recovery lock, so each file is read once, by a bounded
+# cp into WORK, and every check reads that copy: a FIFO, a stalled disk or
+# a file swapped meanwhile cannot keep the lock waiting or show one check
+# another file. A read that fails or does not answer is noted in
+# READ_FAILURES, which the caller counts as a problem.
+SESSION_COPY="$WORK/session.json"
+STATE_COPY="$WORK/state.json"
 journal_problems() {
-  local key value shape i
+  local key value shape i rc
   if [[ -e "$SESSION" ]]; then
     shape=""
-    # Only a regular file is opened: open(2) on a FIFO with no writer
-    # blocks, and this check runs while the recovery lock is held.
+    rc=0
+    # Only a regular file is copied: open(2) on a FIFO with no writer
+    # blocks.
     if [[ ! -f "$SESSION" ]]; then
       echo "session.json is still present and cannot be read: it is not a regular file, so it was not opened"
-    elif ! cat "$SESSION" >/dev/null 2>&1; then
-      echo "session.json is still present and cannot be read (permissions or I/O)"
-    elif shape="$(session_shape_problems "$SESSION")" && [[ -n "$shape" ]]; then
-      echo "session.json is still present and is not a session: ${shape%%$'\n'*}"
     else
-      echo "session.json is still present"
+      snapshot "$SESSION" "$SESSION_COPY" || rc=$?
+      if (( rc == 124 )); then
+        echo "session.json is still present and could not be read within ${CALL_TIMEOUT_SECONDS}s"
+      elif (( rc != 0 )); then
+        echo "session.json is still present and cannot be read (permissions or I/O)"
+      elif shape="$(session_shape_problems "$SESSION_COPY")" && [[ -n "$shape" ]]; then
+        echo "session.json is still present and is not a session: ${shape%%$'\n'*}"
+      else
+        echo "session.json is still present"
+      fi
     fi
   fi
   [[ -e "$STATE" ]] || return 0
@@ -616,48 +681,62 @@ journal_problems() {
     echo "state.json is not a regular file, so it was not opened"
     return 0
   fi
-  if ! "$PLUTIL" -convert json -o /dev/null "$STATE" >/dev/null 2>&1; then
+  rc=0
+  snapshot "$STATE" "$STATE_COPY" || rc=$?
+  if (( rc == 124 )); then
+    echo "state.json could not be read within ${CALL_TIMEOUT_SECONDS}s"
+    return 0
+  elif (( rc != 0 )); then
     echo "state.json is unreadable or malformed"
     return 0
   fi
-  shape="$(journal_shape_problems "$STATE")"
+  rc=0
+  plutil_read -convert json -o /dev/null "$STATE_COPY" >/dev/null || rc=$?
+  if (( rc == 1 )); then
+    echo "state.json is unreadable or malformed"
+    return 0
+  elif (( rc != 0 )); then
+    return 0
+  fi
+  shape="$(journal_shape_problems "$STATE_COPY")"
   if [[ -n "$shape" ]]; then
     echo "state.json is malformed (unexpected shape):"
     echo "$shape"
     return 0
   fi
   for key in sleepDisabledByUs lowPowerSetByUs dockerFrozen; do
-    if [[ "$(extract "$STATE" "$key" || true)" == "true" ]]; then
+    if [[ "$(extract "$STATE_COPY" "$key" || true)" == "true" ]]; then
       echo "$key is still true"
     fi
   done
-  value="$(extract_json "$STATE" frozenProcesses || true)"
+  value="$(extract_json "$STATE_COPY" frozenProcesses || true)"
   if [[ -n "$value" && "$value" != "[]" ]]; then
     echo "frozen processes are still journaled: $value"
   fi
-  value="$(extract_json "$STATE" frozenPids || true)"
+  value="$(extract_json "$STATE_COPY" frozenPids || true)"
   if [[ -n "$value" && "$value" != "[]" ]]; then
     echo "legacy frozen pids (no identity; the backstop never signals or clears these, only the app does): $value"
   fi
-  if extract "$STATE" savedOutputVolume >/dev/null || extract "$STATE" savedMuted >/dev/null; then
+  if extract "$STATE_COPY" savedOutputVolume >/dev/null || extract "$STATE_COPY" savedMuted >/dev/null; then
     echo "saved audio settings (volume/mute) are not restored; only the app can do that"
   fi
   i=0
-  while extract_json "$STATE" "savedAudioOutputs.$i" >/dev/null; do
-    value="$(extract "$STATE" "savedAudioOutputs.$i.name" || extract "$STATE" "savedAudioOutputs.$i.deviceUID" || true)"
+  while extract_json "$STATE_COPY" "savedAudioOutputs.$i" >/dev/null; do
+    value="$(extract "$STATE_COPY" "savedAudioOutputs.$i.name" || extract "$STATE_COPY" "savedAudioOutputs.$i.deviceUID" || true)"
     echo "$value is still muted from a lid close; only the app can restore its volume, once the device is connected"
     i=$((i + 1))
   done
-  if extract "$STATE" savedDisplayBrightness >/dev/null && ! is_refused displayRestoreRefused; then
+  if extract "$STATE_COPY" savedDisplayBrightness >/dev/null && ! is_refused "$STATE_COPY" displayRestoreRefused; then
     echo "saved display brightness is not restored; only the app can do that"
   fi
-  if extract "$STATE" savedKeyboardBrightness >/dev/null && ! is_refused keyboardRestoreRefused; then
+  if extract "$STATE_COPY" savedKeyboardBrightness >/dev/null && ! is_refused "$STATE_COPY" keyboardRestoreRefused; then
     echo "saved keyboard backlight is not restored; only the app can do that"
   fi
-  value="$(extract_json "$STATE" appNapOverrides || true)"
+  value="$(extract_json "$STATE_COPY" appNapOverrides || true)"
   if [[ -n "$value" && "$value" != "[]" ]]; then
     echo "App Nap settings (NSAppSleepDisabled) are not put back: $value"
   fi
+  return 0
 }
 
 # Agent apps whose NSAppSleepDisabled is YES with no journal entry: set by a
@@ -668,16 +747,23 @@ journal_problems() {
 # read that says "does not exist" counts as clear; a read that fails any
 # other way is reported, not counted. Each read is bounded; one that does
 # not answer in time (cfprefsd stuck) ends the check, since the rest would
-# wait the same way, and uninstall goes on.
+# wait the same way, and uninstall goes on. So does a read of config.json's
+# list that fails or does not answer; the apps listed only there are then
+# named as not checked.
 list_unrecorded_app_nap() {
   local ids="" i=0 id value rc found=0 checked=0 unreadable=0 stuck="" skipped=0
   for id in "${DEFAULT_AGENTS[@]}"; do ids="$ids$id"$'\n'; done
   if [[ -f "$CONFIG" ]]; then
+    "$RM" -f "$READ_FAILURES"
     while id="$(extract "$CONFIG" "agentList.$i")"; do
       i=$((i + 1))
       ids="$ids$id"$'\n'
     done
+    if [[ -s "$READ_FAILURES" ]]; then
+      echo "could not read all of the agent list in $CONFIG ($(head -n 1 "$READ_FAILURES")), so agent apps listed only there may not have been checked"
+    fi
   fi
+  ids="$(printf '%s' "$ids" | awk '!seen[$0]++')"
   while IFS= read -r id; do
     [[ -n "$id" && "$id" != -* ]] || continue
     if [[ -n "$stuck" ]]; then skipped=$((skipped + 1)); continue; fi
@@ -710,7 +796,7 @@ as they are. To turn App Nap back on for one, run:
 MSG
     fi
     printf '  defaults delete %q NSAppSleepDisabled\n' "$id"
-  done < <(printf '%s' "$ids" | awk '!seen[$0]++')
+  done <<< "$ids"
   if (( found == 0 )); then
     echo "none of the $checked agent apps checked has NSAppSleepDisabled set"
   fi
@@ -831,15 +917,21 @@ MSG
 # process there that cannot be told apart from one, blocks as well: the
 # rule at $SUDOERS is one file for the whole Mac, and that copy may need it
 # to undo its own session. It is reported, and never asked to quit or
-# signalled; only its own account can quit it. pgrep, ps and plutil go
+# signalled; only its own account can quit it. A process whose owner `ps -o
+# uid=` does not give (it failed, did not answer, or printed no user ID) may
+# be in either account, so it is neither: it is never asked to quit, and it
+# stops the run before anything is asked to quit unless a fresh look finds
+# it gone (UNKNOWN_OWNER, await_known_owners). Only a process proven to be
+# the API client is ignored whatever its owner. pgrep, ps and plutil go
 # through bounded(), so none of them can keep this run, or the recovery
 # lock, waiting. A pgrep that fails or does not answer says nothing about
 # what runs, so it blocks (PGREP_PROBLEM).
 APP_FOUND=()      # "pid N (path)" per running copy of this app in this account
 UNVERIFIED=()     # "pid N (path; why)" per process of this account that could not be told apart from it
 OTHER_ACCOUNT=()  # "pid N (uid U, path)" per copy, or process that could not be told apart from one, in another account
+UNKNOWN_OWNER=()  # "pid N (owner unknown: why; path)" per process not proven to be the API client whose owner is unknown
 OTHER_FOUND=()    # "pid N (path, bundle id X)" per process proven to be the API client
-BLOCKING=()       # the first three: what must be gone before files are touched
+BLOCKING=()       # the first four: what must be gone before files are touched
 PGREP_PROBLEM=""  # "pgrep exited N" or "pgrep did not answer within Ns", when it did not list
 # Bundle ids read before the recovery lock, as "pid|bundle|id", reused for
 # the same process only: one that took a bundle's place since has another
@@ -861,8 +953,8 @@ known_id() { # pid bundle
   return 0
 }
 find_insomnia() {
-  local pid pids rc owner exe bundle id desc this
-  APP_FOUND=(); UNVERIFIED=(); OTHER_ACCOUNT=(); OTHER_FOUND=(); BLOCKING=(); PGREP_PROBLEM=""
+  local pid pids rc owner owner_why exe bundle id desc this
+  APP_FOUND=(); UNVERIFIED=(); OTHER_ACCOUNT=(); UNKNOWN_OWNER=(); OTHER_FOUND=(); BLOCKING=(); PGREP_PROBLEM=""
   # pgrep exits 1 when no process has the name. Any other failure, or no
   # answer in time, counts as "running": fail closed.
   rc=0
@@ -884,8 +976,15 @@ find_insomnia() {
     [[ "$pid" =~ ^[0-9]+$ ]] || continue
     rc=0
     bounded "$PS" -o uid= -p "$pid" || rc=$?
-    owner=""
-    (( rc == 0 )) && owner="${BOUNDED_OUTPUT//[[:space:]]/}"
+    owner="${BOUNDED_OUTPUT//[[:space:]]/}"
+    owner_why=""
+    if (( rc != 0 )); then
+      owner_why="ps -o uid= $(call_result "$rc")"
+    elif [[ -z "$owner" ]]; then
+      owner_why="ps -o uid= printed nothing"
+    elif [[ ! "$owner" =~ ^[0-9]+$ ]]; then
+      owner_why="ps -o uid= printed '$owner', not a user ID"
+    fi
     rc=0
     bounded "$PS" -o comm= -p "$pid" || rc=$?
     exe=""
@@ -922,9 +1021,13 @@ find_insomnia() {
       this=0
       if [[ -n "$id" ]]; then desc="$exe; bundle id $id is neither this app's nor the Insomnia API client's"; fi
     fi
-    # No uid (the process just exited, or ps failed) is not proof of
-    # another account; such a pid is judged as one of this account's.
-    if [[ -n "$owner" && "$owner" != "$UID_NUM" ]]; then
+    # No user ID (ps failed, did not answer, or the process just exited)
+    # proves neither account, so such a process is neither this account's
+    # app nor another's: it is never asked to quit and it blocks.
+    if [[ -n "$owner_why" ]]; then
+      UNKNOWN_OWNER+=("pid $pid (owner unknown: $owner_why; $desc)")
+      BLOCKING+=("pid $pid (owner unknown: $owner_why; $desc)")
+    elif [[ "$owner" != "$UID_NUM" ]]; then
       OTHER_ACCOUNT+=("pid $pid (uid $owner, $desc)")
       BLOCKING+=("pid $pid (uid $owner, $desc)")
     elif (( this == 1 )); then
@@ -985,40 +1088,179 @@ sudoers_not_ours() { # file content
   return 0
 }
 
-# Removes the rule at $SUDOERS only if it is still the bytes this run read
-# into $SUDOERS_SEEN and judged to be its own: another account's install.sh
-# may replace it between the read and the removal. The compare and the
-# removal are one call to sudo, run as root while it holds $SUDOERS_LOCK,
-# the lock install.sh takes for its compare and write. Exit status: 0
-# removed, 3 the lock was not free within LOCK_TIMEOUT_SECONDS, 4 the file
-# changed since it was read, 5 the removal failed (1 is sudo's own, as for
-# a wrong password). Only 0 changes the file.
-sudoers_remove_as_root() { # rule seen
-  umask 077
-  [[ ! -L "$SUDOERS_LOCK" ]] || exit 3
-  exec 8>>"$SUDOERS_LOCK" || exit 3
-  "$LOCKF" -t "$LOCK_TIMEOUT_SECONDS" 8 2>/dev/null || exit 3
-  { [[ -f "$1" && ! -L "$1" ]] && "$CMP" -s "$2" "$1"; } || exit 4
-  "$RM" -f "$1" || exit 5
-  exit 0
+# Why the file named $1 cannot take part in the rule's transaction, or
+# nothing when it can: a regular file of root's (ROOT_UID) with one link, no
+# setuid, setgid or sticky bit and no write permission for group or others;
+# with $3, exactly that mode. $2 is its `stat -f '%Hp %Mp %Lp %u %l'`, which
+# reads the name itself, not what a link points to. This and the two
+# functions below are the same in install.sh and uninstall.sh (a test keeps
+# them in step) and run only as root.
+sudoers_file_problem() { # name stat [mode]
+  local type special perm uid links
+  read -r type special perm uid links <<< "$2"
+  if [[ "${type:-}" != 10 ]]; then
+    echo "$1 is not a regular file (stat: ${2:-no answer})"
+  elif [[ "${uid:-}" != "$ROOT_UID" ]]; then
+    echo "$1 belongs to uid ${uid:-?}, not root"
+  elif [[ "${links:-}" != 1 ]]; then
+    echo "$1 has ${links:-?} links, not 1"
+  elif [[ "${special:-}" != 0 || ! "${perm:-}" =~ ^[0-7]+$ ]] || (( (8#$perm & 8#022) != 0 )); then
+    echo "$1 has mode ${special:-?}${perm:-?}, so someone other than root may change it"
+  elif [[ -n "${3:-}" && "$perm" != "$3" ]]; then
+    echo "$1 has mode $perm, not $3"
+  fi
+  return 0
 }
-# Runs sudoers_remove_as_root as root, in one sudo call. The shell's script
-# is the function's text after this script's fixed tool paths, and sudo
-# resets the environment, so nothing root runs comes from PATH.
-sudoers_remove() {
-  "$SUDO" "$ROOT_BASH" -c "set -u
-$(printf '%s=%q\n' SUDOERS_LOCK "$SUDOERS_LOCK" LOCK_TIMEOUT_SECONDS "$LOCK_TIMEOUT_SECONDS" \
-    LOCKF "$LOCKF" CMP "$CMP" RM "$RM")
-$(declare -f sudoers_remove_as_root)
-sudoers_remove_as_root \"\$@\"" insomnia-sudoers-remove "$SUDOERS" "$SUDOERS_SEEN"
+# Takes $SUDOERS_LOCK on fd 8 for the rest of the root shell, once it is
+# shown that only root can have made or changed it. An existing file must be
+# a regular file of root's with mode 0600 and one link, and every folder from
+# its own up to / a folder of root's that group and others cannot write.
+# Both are checked before the file is opened, so a FIFO (whose open would
+# wait) or a link is never opened. The file is created, mode 0600, only where
+# nothing is (noclobber: no link is followed and nothing is truncated).
+# Nothing is ever repaired, replaced or removed. Once the lock is taken, the
+# descriptor and the path must still be the same file, unchanged, and the
+# rule $1 must be in the same folder. Exits 7 with the reason when a check
+# fails, 3 when the lock is not free within LOCK_TIMEOUT_SECONDS.
+sudoers_guard_take() { # rule
+  local dir s type perm uid why took seen
+  if [[ -e "$SUDOERS_LOCK" || -L "$SUDOERS_LOCK" ]]; then
+    why="$(sudoers_file_problem "$SUDOERS_LOCK" "$("$STAT" -f '%Hp %Mp %Lp %u %l' "$SUDOERS_LOCK" 2>/dev/null)" 600)"
+    if [[ -n "$why" ]]; then echo "$why" >&2; exit 7; fi
+  fi
+  dir="$SUDOERS_LOCK"
+  while [[ "$dir" == /?* ]]; do
+    dir="${dir%/*}"
+    s="$("$STAT" -f '%Hp %Lp %u' "${dir:-/}" 2>/dev/null)"
+    read -r type perm uid <<< "$s"
+    if [[ "${type:-}" != 4 || ! "${perm:-}" =~ ^[0-7]+$ ]] \
+       || [[ "${uid:-}" != 0 && "${uid:-}" != "$ROOT_UID" ]] || (( (8#$perm & 8#022) != 0 )); then
+      echo "${dir:-/}, a folder above $SUDOERS_LOCK, is not a folder of root's that only root can write (stat: ${s:-no answer})" >&2
+      exit 7
+    fi
+  done
+  ( set -C; : > "$SUDOERS_LOCK" ) 2>/dev/null || true
+  why="$(sudoers_file_problem "$SUDOERS_LOCK" "$("$STAT" -f '%Hp %Mp %Lp %u %l' "$SUDOERS_LOCK" 2>/dev/null)" 600)"
+  if [[ -n "$why" ]]; then echo "$why" >&2; exit 7; fi
+  exec 8<"$SUDOERS_LOCK" || exit 7
+  "$LOCKF" -t "$LOCK_TIMEOUT_SECONDS" 8 2>/dev/null || exit 3
+  took="$("$STAT" -f '%d:%i %Hp %Mp %Lp %u %l' <&8 2>/dev/null)"
+  seen="$("$STAT" -f '%d:%i %Hp %Mp %Lp %u %l' "$SUDOERS_LOCK" 2>/dev/null)"
+  if [[ -z "$took" || "$took" != "$seen" ]]; then
+    echo "$SUDOERS_LOCK is no longer the file this run opened and locked" >&2
+    exit 7
+  fi
+  why="$(sudoers_file_problem "$SUDOERS_LOCK" "${took#* }" 600)"
+  if [[ -n "$why" ]]; then echo "$why" >&2; exit 7; fi
+  if [[ "$("$STAT" -L -f '%d:%i' "${1%/*}" 2>/dev/null)" != "$("$STAT" -f '%d:%i' "${SUDOERS_LOCK%/*}" 2>/dev/null)" ]]; then
+    echo "$1 is not in the folder that holds $SUDOERS_LOCK" >&2
+    exit 7
+  fi
+}
+# Opens the rule $1 on fd 7, once sudoers_file_problem finds nothing wrong
+# with it (any mode without group or other write), and reads it through that
+# descriptor. Exits 4 unless the path still names the opened file and the
+# text read, trailing newlines aside, is exactly $2, the text the caller read
+# and judged before sudo ran; 8 when the shell cannot hold the bytes exactly
+# (a NUL byte, or a change while they were read). Leaves the file's identity
+# in PINNED_ID and its text in PINNED_TEXT.
+sudoers_pin_rule() { # rule text
+  local LC_ALL=C why size
+  why="$(sudoers_file_problem "$1" "$("$STAT" -f '%Hp %Mp %Lp %u %l' "$1" 2>/dev/null)")"
+  if [[ -n "$why" ]]; then echo "$why" >&2; exit 4; fi
+  exec 7<"$1" || exit 4
+  PINNED_ID="$("$STAT" -f '%d:%i' <&7 2>/dev/null)"
+  if [[ -z "$PINNED_ID" || "$PINNED_ID" != "$("$STAT" -f '%d:%i' "$1" 2>/dev/null)" ]]; then
+    echo "$1 was replaced while it was opened" >&2
+    exit 4
+  fi
+  size="$("$STAT" -f '%z' <&7 2>/dev/null)"
+  PINNED_TEXT="$("$CAT" <&7 && echo .)"
+  PINNED_TEXT="${PINNED_TEXT%.}"
+  if [[ -z "$size" || "${#PINNED_TEXT}" != "$size" ]]; then
+    echo "$1 holds a NUL byte, or changed while it was read" >&2
+    exit 8
+  fi
+  PINNED_TEXT="${PINNED_TEXT%"${PINNED_TEXT##*[!$'\n']}"}"
+  if [[ "$PINNED_TEXT" != "$2" ]]; then
+    echo "$1 is not the text this run read" >&2
+    exit 4
+  fi
 }
 
-# Stops the run when Insomnia runs in another account, or when pgrep could
-# not say whether it does. Nothing has been changed by then, and nothing is
-# sent to any process.
+# Removes the rule at $SUDOERS only if it is still exactly the text this run
+# read and judged to be its own (passed to root as an argument): another
+# account's install.sh may replace it between the read and the removal. The
+# compare and the removal are one call to sudo, run as root while it holds
+# $SUDOERS_LOCK (sudoers_guard_take), the lock install.sh takes for its
+# compare and write. Root reads the rule through a descriptor it opened and
+# checked (sudoers_pin_rule), judges that text again with sudoers_not_ours,
+# and removes the path only while it still names the file it opened. The
+# lock keeps out only the runs that take it, as install.sh says. Exit
+# status: 0 removed; 3 the lock was not free within LOCK_TIMEOUT_SECONDS; 4
+# the rule changed since it was read, or is not a regular file of root's
+# with one link that only root can change; 5 rm reported that the removal
+# failed; 7 the lock file, or a folder above it, is not one only root can
+# change; 8 the rule as root read it holds a NUL byte, changed while it was
+# read, or is not this account's. 1 is sudo's own (no valid timestamp, say)
+# or a shell error before the removal. In all of these the rule was not
+# removed, though the lock file may have been created. Any other status (the
+# root shell, or its rm, was killed by a signal), or a call that did not
+# finish in time, leaves it unknown whether the removal happened.
+sudoers_remove_as_root() { # rule text
+  umask 077
+  sudoers_guard_take "$1"
+  sudoers_pin_rule "$1" "$2"
+  [[ -z "$(sudoers_not_ours "$PINNED_TEXT")" ]] || exit 8
+  if [[ "$("$STAT" -f '%d:%i' "$1" 2>/dev/null)" != "$PINNED_ID" ]]; then
+    echo "$1 was replaced while it was checked" >&2
+    exit 4
+  fi
+  # An rm killed by a signal may have removed the rule already, so its
+  # status goes on as it is, an unknown result, not as a failed removal.
+  "$RM" -f "$1" || { rc=$?; (( rc > 128 )) && exit "$rc"; exit 5; }
+  exit 0
+}
+# Runs sudoers_remove_as_root as root, in one sudo call, bounded like every
+# other call made under the recovery lock: `sudo -n` never prompts (the
+# password was asked before the lock, with `sudo -v`), and a sudo still
+# running past the limit returns 125 and keeps the lock until it ends. The
+# shell's script is this script's fixed tool paths, the account's name, and
+# the text of the functions root runs; sudo resets the environment, so
+# nothing root runs comes from PATH.
+sudoers_remove() { # text
+  bounded "$SUDO" -n "$ROOT_BASH" -c "set -u
+$(printf '%s=%q\n' SUDOERS_LOCK "$SUDOERS_LOCK" ROOT_UID "$ROOT_UID" ACCOUNT "$ACCOUNT" \
+    LOCK_TIMEOUT_SECONDS "$LOCK_TIMEOUT_SECONDS" LOCKF "$LOCKF" STAT "$STAT" CAT "$CAT" RM "$RM")
+$(declare -f sudoers_file_problem sudoers_guard_take sudoers_pin_rule sudoers_not_ours sudoers_remove_as_root)
+sudoers_remove_as_root \"\$@\"" insomnia-sudoers-remove "$SUDOERS" "$1"
+}
+# The part of a message about a sudo call that is still running.
+sudo_alive_note() {
+  printf "It was sent SIGTERM and is still running as pid %s. It is not killed, because killing sudo could leave what it runs as root behind" "${BOUNDED_PID:-?}"
+}
+# Stops the run when the outcome of a sudo call made for the rule is not
+# known. The app and the journal stay, so a recovery that still needs the
+# rule (if it is there) has its app and agent's files; the LaunchAgent is
+# already gone by then.
+sudoers_uncertain() { # what is not known
+  echo "$1" >&2
+  echo "The LaunchAgent is already removed; the app at $APP and the recovery journal were kept. Check the rule with 'sudo cat $SUDOERS', then rerun this script." >&2
+  exit 1
+}
+
+# Stops the run when Insomnia runs in another account, when a process named
+# Insomnia has an owner ps could not give, or when pgrep could not say
+# whether it runs. Nothing has been changed by then, and nothing is sent to
+# any process.
 stop_for_other_accounts() {
   if [[ -n "$PGREP_PROBLEM" ]]; then
     echo "$PGREP_PROBLEM, so whether Insomnia runs in this or another account is unknown. Rerun once it answers. Nothing was removed." >&2
+    exit 1
+  fi
+  if (( ${#UNKNOWN_OWNER[@]} > 0 )); then
+    echo "Whose process these are could not be read, so whether Insomnia runs in this or another account is unknown: $(list "${UNKNOWN_OWNER[@]}")." >&2
+    echo "$SUDOERS is shared by every account on this Mac, so nothing was asked to quit. Rerun once 'ps -o uid= -p <pid>' answers for them, or once they have exited. Nothing was removed." >&2
     exit 1
   fi
   (( ${#OTHER_ACCOUNT[@]} > 0 )) || return 0
@@ -1027,15 +1269,33 @@ stop_for_other_accounts() {
   echo "Quit Insomnia in that account, then rerun. Nothing was removed." >&2
   exit 1
 }
+# A process whose owner could not be read may only have raced its own exit,
+# so the processes are listed again, once a second for up to
+# QUIT_WAIT_SECONDS, while one is listed; stop_for_other_accounts then stops
+# the run if one still is. A pgrep problem stops it at once.
+await_known_owners() {
+  local i
+  for (( i = 0; i < QUIT_WAIT_SECONDS; i++ )); do
+    [[ -z "$PGREP_PROBLEM" ]] || return 0
+    (( ${#UNKNOWN_OWNER[@]} > 0 )) || return 0
+    sleep 1
+    find_insomnia
+  done
+  return 0
+}
 
 # 1. Quit the app --------------------------------------------------------------
 # Ask politely and wait. The app refuses to quit while it has unresolved
 # recovery work, and that refusal must stand: no pkill, no force. This app
 # counts, and so does a process named Insomnia that cannot be told apart
 # from it (find_insomnia); one proven to be another app is reported and
-# left alone. A copy in another account stops the run at once.
+# left alone. A copy in another account stops the run at once, and so does
+# a process whose owner ps cannot give once QUIT_WAIT_SECONDS have passed
+# (await_known_owners): before anything is asked to quit, and before the
+# first sudo below.
 step "Quitting Insomnia"
 if app_running; then
+  await_known_owners
   report_others
   stop_for_other_accounts
   report_unverified
@@ -1057,6 +1317,68 @@ if app_running; then
   fi
 else
   report_others
+fi
+
+# Which backstop.sh speaks the installed app's --resume-frozen interface
+# depends on the InsomniaResumeFrozenVersion its Info.plist declares (step
+# 3). No Info.plist is read under the recovery lock, so it is read here,
+# before the lock, with bounded calls, together with the file's identity
+# (device, inode, change time with nanoseconds, size) before and after the
+# read. Step 3 uses the value only when a bounded stat under the lock, which
+# reads no contents, shows the same file unchanged. A read that fails, does
+# not answer or sees the file change stops the run here, before anything is
+# removed and before any backstop runs. Only from a source checkout does
+# the value choose anything, so only there is it read.
+CHECKOUT_BACKSTOP=""
+if in_checkout && [[ -f "$SCRIPT_DIR/backstop.sh" ]]; then
+  CHECKOUT_BACKSTOP="$SCRIPT_DIR/backstop.sh"
+fi
+INFO_PLIST="$APP/Contents/Info.plist"
+installed_version=""
+VERSION_EVIDENCE=none   # no regular file at $INFO_PLIST, which declares nothing
+VERSION_PROBLEM=""
+read_installed_version() {
+  local rc=0 before
+  [[ -f "$INFO_PLIST" ]] || return 0
+  bounded "$STAT" -L -f '%d:%i:%Fc:%z' "$INFO_PLIST" || rc=$?
+  if (( rc != 0 )); then VERSION_PROBLEM="'stat' $(call_result "$rc")"; return 1; fi
+  before="$BOUNDED_OUTPUT"
+  bounded "$PLUTIL" -extract InsomniaResumeFrozenVersion raw -o - "$INFO_PLIST" || rc=$?
+  if (( rc == 0 )); then
+    installed_version="$("$CAT" "$BOUNDED_BASE.out")"
+  elif (( rc == 1 )); then
+    # No such key, or no plist at all: only a plist that parses declares
+    # no version.
+    rc=0
+    bounded "$PLUTIL" -lint "$INFO_PLIST" || rc=$?
+    if (( rc != 0 )); then VERSION_PROBLEM="it does not parse ('plutil -lint' $(call_result "$rc"))"; return 1; fi
+  else
+    VERSION_PROBLEM="'plutil -extract InsomniaResumeFrozenVersion' $(call_result "$rc")"
+    return 1
+  fi
+  rc=0
+  bounded "$STAT" -L -f '%d:%i:%Fc:%z' "$INFO_PLIST" || rc=$?
+  if (( rc != 0 )); then VERSION_PROBLEM="'stat' $(call_result "$rc")"; return 1; fi
+  if [[ "$BOUNDED_OUTPUT" != "$before" ]]; then VERSION_PROBLEM="it changed while it was read"; return 1; fi
+  VERSION_EVIDENCE="$before"
+}
+if [[ -n "$CHECKOUT_BACKSTOP" ]] && ! read_installed_version; then
+  echo "Could not read InsomniaResumeFrozenVersion from $INFO_PLIST: $VERSION_PROBLEM. Which backstop.sh speaks the installed app's interface is unknown, so none was run. Nothing was removed; rerun once it reads." >&2
+  exit 1
+fi
+
+# The password is asked here, once, before the recovery lock: each sudo call
+# made under the lock (step 5) is `sudo -n` and bounded, so none waits at a
+# prompt while the lock is held. It is asked only when the rule is there,
+# or when its folder cannot be searched without sudo. The last process check
+# above ran just before this, with nothing in between but the bounded reads
+# above. sudo's timestamp lasts a few minutes (five by default); if it runs
+# out before step 5, that step keeps the rule and the app.
+if [[ -e "$SUDOERS" || ! -x "${SUDOERS%/*}" ]]; then
+  if ! "$SUDO" -v; then
+    echo "sudo did not authenticate, so $SUDOERS could not be removed later. Nothing was removed." >&2
+    exit 1
+  fi
 fi
 
 # 2. Take the recovery lock and keep it to the end ---------------------------
@@ -1102,13 +1424,22 @@ step "Restoring the machine via backstop --force"
 if [[ -e "$SCRIPT_DIR/backstop.sh" ]] && ! in_checkout; then
   echo "not running $SCRIPT_DIR/backstop.sh: $SCRIPT_DIR is not the scripts folder of a source checkout, and a release zip has no backstop.sh, so it was added after the zip was unpacked." >&2
 fi
-CHECKOUT_BACKSTOP=""
-if in_checkout && [[ -f "$SCRIPT_DIR/backstop.sh" ]]; then
-  CHECKOUT_BACKSTOP="$SCRIPT_DIR/backstop.sh"
-fi
-installed_version=""
-if [[ -f "$APP/Contents/Info.plist" ]]; then
-  installed_version="$(extract "$APP/Contents/Info.plist" InsomniaResumeFrozenVersion || true)"
+# The version read before the lock still applies only to the same file,
+# unchanged (see read_installed_version).
+if [[ -n "$CHECKOUT_BACKSTOP" ]]; then
+  version_rc=0
+  version_now=none
+  if [[ -f "$INFO_PLIST" ]]; then
+    bounded "$STAT" -L -f '%d:%i:%Fc:%z' "$INFO_PLIST" || version_rc=$?
+    version_now="$BOUNDED_OUTPUT"
+  fi
+  if (( version_rc != 0 )); then
+    echo "'stat $INFO_PLIST' $(call_result "$version_rc") under the recovery lock, so whether the InsomniaResumeFrozenVersion read before the lock still applies is unknown, and no backstop.sh was run. Nothing was removed; rerun." >&2
+    exit 1
+  elif [[ "$version_now" != "$VERSION_EVIDENCE" ]]; then
+    echo "$INFO_PLIST changed after this run read its InsomniaResumeFrozenVersion (an install may have replaced the app meanwhile). No Info.plist is read under the recovery lock, so which backstop.sh speaks the installed app's interface is unknown, and none was run. Nothing was removed; rerun." >&2
+    exit 1
+  fi
 fi
 if [[ -n "$CHECKOUT_BACKSTOP" ]] && { [[ "$installed_version" == "$RESUME_FROZEN_VERSION" ]] || { [[ ! -f "$APP/Contents/Resources/backstop.sh" ]] && [[ ! -f "$APP_SUPPORT/backstop.sh" ]]; }; }; then
   BACKSTOP="$CHECKOUT_BACKSTOP"
@@ -1144,11 +1475,26 @@ recovery_rc=0
 /bin/bash "$BACKSTOP" --force || recovery_rc=$?
 
 # 4. Verify independently ------------------------------------------------------
+# The checks run in a subshell this shell waits for, writing to a file in
+# WORK, not in a process substitution: so nothing the check starts outlives
+# it with the lock, and a check that stops early (its status) or a read that
+# failed (READ_FAILURES) counts as a problem, never as a clean journal.
 step "Verifying the recovery journal"
 problems=()
+"$RM" -f "$READ_FAILURES"
+check_rc=0
+( journal_problems ) > "$WORK/journal.lines" || check_rc=$?
 while IFS= read -r line; do
   [[ -n "$line" ]] && problems+=("$line")
-done < <(journal_problems)
+done < "$WORK/journal.lines"
+if [[ -s "$READ_FAILURES" ]]; then
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && problems+=("the journal could not be fully checked: $line")
+  done < "$READ_FAILURES"
+fi
+if (( check_rc != 0 )); then
+  problems+=("the journal check stopped with status $check_rc, so the journal was not fully checked")
+fi
 if (( recovery_rc != 0 )) && (( ${#problems[@]} == 0 )); then
   problems+=("backstop exited $recovery_rc; see $LOG_DIR/insomnia.log")
 fi
@@ -1156,16 +1502,31 @@ if (( ${#problems[@]} > 0 )); then
   abort_incomplete "$recovery_rc" "${problems[@]}"
 fi
 echo "journal clean"
+# state.json is kept when a brightness it records cannot be restored here,
+# and also when reading it again for that fails: a kept file is never the
+# wrong way round.
 kept_brightness=()
+"$RM" -f "$READ_FAILURES"
+kept_rc=0
+( refused_brightness ) > "$WORK/kept.lines" || kept_rc=$?
 while IFS= read -r line; do
   [[ -n "$line" ]] && kept_brightness+=("$line")
-done < <(refused_brightness)
+done < "$WORK/kept.lines"
+kept_unknown=""
+if [[ -s "$READ_FAILURES" ]]; then
+  kept_unknown="$(head -n 1 "$READ_FAILURES")"
+elif (( kept_rc != 0 )); then
+  kept_unknown="the check stopped with status $kept_rc"
+fi
 if (( ${#kept_brightness[@]} > 0 )); then
   echo "Not restored, and kept in $STATE:"
   for line in "${kept_brightness[@]}"; do echo "  - $line"; done
   echo "Insomnia's private-call guard refused that restore on this macOS, so nothing here can"
   echo "make it. Set the level with the brightness keys or Control Center. The file stays so a"
   echo "later Insomnia that can make the call restores it at launch."
+fi
+if [[ -n "$kept_unknown" ]]; then
+  echo "Reading $STATE again for a brightness Insomnia kept failed ($kept_unknown), so whether it holds one is unknown; it is kept."
 fi
 if app_running; then
   echo "Insomnia started again ($(list "${BLOCKING[@]}")); quit it and rerun. Nothing was removed." >&2
@@ -1211,29 +1572,58 @@ for candidate in "$CANDIDATE_DIR/$LABEL.candidate-"* "$LAUNCH_AGENTS/$LABEL.cand
 done
 if [[ -d "$CANDIDATE_DIR" && ! -L "$CANDIDATE_DIR" ]]; then "$RMDIR" "$CANDIDATE_DIR" 2>/dev/null || true; fi
 
-step "Removing $SUDOERS (requires your password)"
-SUDOERS_SEEN="$WORK/sudoers.seen"
-if [[ -e "$SUDOERS" ]] || "$SUDO" "$TEST" -e "$SUDOERS"; then
-  # Root-only, so it is read through sudo. A read that fails (a wrong
-  # password, say) stops here, as the removal itself would have.
-  if ! "$SUDO" "$CAT" "$SUDOERS" > "$SUDOERS_SEEN"; then
-    echo "Could not read $SUDOERS through sudo, so it was kept. The LaunchAgent is already removed; the app at $APP is not." >&2
+# Every sudo call here runs under the recovery lock, so each is `sudo -n`
+# (the password was asked before the lock) and bounded: one that does not
+# answer is sent SIGTERM, never SIGKILL, and one still running past the
+# limit keeps the lock until it ends (see bounded()). Whenever whether the
+# rule was removed is not known, the run stops with the app and the journal
+# kept (sudoers_uncertain).
+step "Removing $SUDOERS"
+sudoers_present=0
+if [[ -e "$SUDOERS" ]]; then
+  sudoers_present=1
+elif [[ ! -x "${SUDOERS%/*}" ]]; then
+  # The folder cannot be searched without root, so only sudo can tell.
+  test_rc=0
+  bounded "$SUDO" -n "$TEST" -e "$SUDOERS" || test_rc=$?
+  if (( test_rc == 0 )); then
+    sudoers_present=1
+  elif (( test_rc == 125 )); then
+    sudoers_uncertain "'sudo -n test -e $SUDOERS' did not answer within ${CALL_TIMEOUT_SECONDS}s, so whether the rule is there is not known. $(sudo_alive_note). It keeps the recovery lock until it ends."
+  elif (( test_rc != 1 )) || [[ -n "$BOUNDED_OUTPUT" ]]; then
+    sudoers_uncertain "'sudo -n test -e $SUDOERS' $(call_result "$test_rc")${BOUNDED_OUTPUT:+ ($BOUNDED_OUTPUT)}, so whether the rule is there is not known."
+  fi
+fi
+if (( sudoers_present )); then
+  # Root-only, so it is read through sudo.
+  read_rc=0
+  bounded "$SUDO" -n "$CAT" "$SUDOERS" || read_rc=$?
+  if (( read_rc == 125 )); then
+    sudoers_uncertain "'sudo -n cat $SUDOERS' did not answer within ${CALL_TIMEOUT_SECONDS}s, so the rule was not removed. $(sudo_alive_note). It keeps the recovery lock until it ends."
+  elif (( read_rc != 0 )); then
+    echo "Could not read $SUDOERS through sudo ('sudo -n cat' $(call_result "$read_rc")${BOUNDED_OUTPUT:+: $BOUNDED_OUTPUT}), so it was kept. The LaunchAgent is already removed; the app at $APP is not." >&2
     echo "Rerun this script, or check the file and remove it yourself with 'sudo rm $SUDOERS'." >&2
     exit 1
   fi
-  sudoers_text="$(< "$SUDOERS_SEEN")"
+  # As the shell's $(...) would read it: trailing newlines cut.
+  sudoers_text="${BOUNDED_OUTPUT%"${BOUNDED_OUTPUT##*[!$'\n']}"}"
   sudoers_why="$(sudoers_not_ours "$sudoers_text")"
   if [[ -z "$sudoers_why" ]]; then
     remove_rc=0
-    sudoers_remove || remove_rc=$?
+    sudoers_remove "$sudoers_text" || remove_rc=$?
+    case "$remove_rc" in
+      0) ;;
+      3) echo "Kept $SUDOERS: $SUDOERS_LOCK stayed taken for ${LOCK_TIMEOUT_SECONDS}s, so another install.sh or uninstall.sh, perhaps in another account, is changing it." >&2 ;;
+      4) echo "Kept $SUDOERS: it changed after this uninstall read it, or is not a regular file of root's with one link that only root can change (${BOUNDED_OUTPUT:-no detail}). Another install.sh or uninstall.sh, perhaps in another account, may have written or removed it meanwhile, and a rule written then may be another account's." >&2 ;;
+      5) echo "Kept $SUDOERS: removing it failed (${BOUNDED_OUTPUT:-no detail})." >&2 ;;
+      7) echo "Kept $SUDOERS: the lock file $SUDOERS_LOCK, or a folder above it, is not one only root can change (${BOUNDED_OUTPUT:-no detail}), so the lock that keeps two runs from changing the rule at once cannot be trusted. Nothing there was repaired: check it yourself (the lock file must be a regular file of root's with mode 0600 and one link)." >&2 ;;
+      8) echo "Kept $SUDOERS: read again as root, it holds a NUL byte, changed while it was read, or is not the rule install.sh writes for $ACCOUNT${BOUNDED_OUTPUT:+ ($BOUNDED_OUTPUT)}." >&2 ;;
+      1 | 2) echo "Kept $SUDOERS: the sudo call that removes it exited $remove_rc before removing it${BOUNDED_OUTPUT:+ ($BOUNDED_OUTPUT)}." >&2 ;;
+      124) sudoers_uncertain "The sudo call that removes $SUDOERS did not answer within ${CALL_TIMEOUT_SECONDS}s and stopped on SIGTERM, so whether the rule was removed is not known." ;;
+      125) sudoers_uncertain "The sudo call that removes $SUDOERS did not answer within ${CALL_TIMEOUT_SECONDS}s, so whether the rule was removed is not known. $(sudo_alive_note). It keeps the recovery lock until it ends, so until then the app cannot start a session; if it does not end by itself, stop it with 'sudo kill ${BOUNDED_PID:-<pid>}'." ;;
+      *) sudoers_uncertain "The sudo call that removes $SUDOERS exited $remove_rc (a signal), so whether the rule was removed is not known." ;;
+    esac
     if (( remove_rc != 0 )); then
-      if (( remove_rc == 3 )); then
-        echo "Kept $SUDOERS: $SUDOERS_LOCK stayed taken for ${LOCK_TIMEOUT_SECONDS}s, so another install.sh or uninstall.sh, perhaps in another account, is changing it." >&2
-      elif (( remove_rc == 4 )); then
-        echo "Kept $SUDOERS: it changed after this uninstall read it. Another install.sh or uninstall.sh, perhaps in another account, wrote or removed it meanwhile, and a rule written then may be another account's." >&2
-      else
-        echo "Kept $SUDOERS: the sudo call that removes it exited $remove_rc." >&2
-      fi
       echo "The LaunchAgent is already removed; the app at $APP is not. Rerun this script to check the rule again." >&2
       exit 1
     fi
@@ -1281,7 +1671,7 @@ if (( PURGE == 1 )); then
         "$APP_SUPPORT/unfinished-command.json" \
         "$LOG_DIR/insomnia.log" "$LOG_DIR/insomnia.log.1" \
         "$LOG_DIR/handoffs.log" "$LOG_DIR/handoffs.log.1"
-  (( ${#kept_brightness[@]} > 0 )) || remove_owned "$STATE"
+  (( ${#kept_brightness[@]} > 0 )) || [[ -n "$kept_unknown" ]] || remove_owned "$STATE"
   collect_moved_aside_sessions
   if (( ${#MOVED_ASIDE[@]} > 0 )); then
     remove_owned "${MOVED_ASIDE[@]}"
@@ -1304,7 +1694,7 @@ else
   # unfinished-command.json names a sudo pmset that held the recovery lock;
   # this run holds it now, so that command has exited.
   remove_owned "$APP_SUPPORT/backstop.sh" "$SESSION" "$APP_SUPPORT/unfinished-command.json"
-  (( ${#kept_brightness[@]} > 0 )) || remove_owned "$STATE"
+  (( ${#kept_brightness[@]} > 0 )) || [[ -n "$kept_unknown" ]] || remove_owned "$STATE"
   echo "Kept $APP_SUPPORT/config.json and $LOG_DIR (use --purge to remove)."
   collect_moved_aside_sessions
   if (( ${#MOVED_ASIDE[@]} > 0 )); then
@@ -1317,6 +1707,7 @@ else
   fi
 fi
 (( ${#kept_brightness[@]} == 0 )) || echo "Kept $STATE: it holds the brightness listed above."
+[[ -z "$kept_unknown" ]] || echo "Kept $STATE: reading it again failed (see above)."
 
 if (( remove_failures > 0 )); then
   echo "Done, except $remove_failures file(s) that could not be removed (named above)." >&2

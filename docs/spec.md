@@ -126,22 +126,54 @@ recovery; newly written journals use `frozenProcesses`.
   process there named Insomnia cannot be told apart from it, `install.sh`
   stops before the sudoers step and `uninstall.sh` before removing anything.
   That process is named and never asked to quit or signalled. So does a
-  `pgrep` that fails or does not answer. Under the recovery lock neither
-  script reads an Info.plist, not even with a time limit: a process first
-  seen there counts as unverified and stops the run.
-- Both scripts change the file in one `sudo /bin/bash -c` call. It takes
-  `/var/run/insomnia-sudoers.lock` with `lockf` (created by root with mode
-  0600; a symlink there is refused) for at most 10 s, then compares the file
-  with what the run read: absent, or the same bytes by `cmp`. Only then does
-  `install.sh` write a copy beside the rule (`mktemp`, `root:wheel`, 0440),
-  check that copy with `visudo -cf` and rename it over the rule, or
-  `uninstall.sh` remove the rule. A failure removes the copy and leaves the
-  rule. A file that changed since the read, or a lock still taken after
-  10 s, stops the run: `install.sh` changes nothing, and `uninstall.sh`
-  keeps the rule and the app. Both ask for a rerun. Before that call the
-  scripts read the rule with `sudo /bin/test -e` and `sudo /bin/cat`, and
-  `install.sh` checks the new rule with `sudo /usr/sbin/visudo -cf`. Every
-  tool run through sudo has a fixed path.
+  `pgrep` that fails or does not answer. A process whose owner `ps -o uid=`
+  cannot tell (it fails, does not answer, or prints no user ID), or whose
+  identity is unverified, is looked for once more and then stops either
+  script before its first `sudo` call; only a process identified as the API
+  client (`com.insomnia.app`) is ignored. Under the recovery lock the
+  scripts' process checks read no Info.plist, not even with a time limit: a
+  process first seen there counts as unverified and stops the run. The
+  `backstop.sh` each script runs under the lock is main's: it has no time
+  limit and reads the installed app's Info.plist itself. `uninstall.sh`
+  reads `InsomniaResumeFrozenVersion` before the lock (bounded, with the
+  file's identity before and after) and under it only checks with `stat`
+  that the file is unchanged; anything else stops it before a backstop runs.
+- Both scripts change the file in one `sudo /bin/bash -c` call, which
+  restricted administrators whose policy does not allow `/bin/bash` cannot
+  make. As root it takes `/etc/sudoers.d/.insomnia-sudoers.lock` with
+  `lockf` for at most 10 s (sudo skips a name with a dot). Before the open,
+  every folder above the file must be root's and not writable by group or
+  others, and an existing file a regular file of root's with mode 0600 and
+  one link, so a FIFO or a link is never opened; after locking, the
+  descriptor and the path must still be that same file. The file is created
+  (umask 077, noclobber) only where nothing is, and is never repaired,
+  replaced or removed; a check that fails stops the run (exit 7). Scripts of
+  earlier releases took no lock, unmerged branches used
+  `/var/run/insomnia-sudoers.lock`, and an administrator's own `sudo` takes
+  none: the lock does not serialize against those.
+- Root then opens the rule on a descriptor, after checking it is a regular
+  file of root's with one link that only root can change, reads it through
+  that descriptor, and compares it with the exact text the run read and
+  judged, which is passed to root as an argument. It judges that text again
+  (another account's grant stops it) and refuses a NUL byte or a size that
+  does not match what was read. Only then does `install.sh` write a copy
+  beside the rule (`mktemp`, `root:wheel`, 0440), check that copy with
+  `visudo -cf` and rename it over the rule while the path still names the
+  opened file, or `uninstall.sh` remove the rule under the same check. A
+  checked failure removes the copy and leaves the rule. A file that changed
+  since the read, or a lock still taken after 10 s, stops the run:
+  `install.sh` leaves the rule, the app and the agent, and `uninstall.sh`
+  keeps the rule and the app. Both ask for a rerun. The lock file may have
+  been created by then. A root shell killed by a signal, or an `mv` or `rm`
+  killed by one, leaves it unknown whether the rule changed; the scripts
+  report that, and `uninstall.sh` then keeps the app and the journal. A
+  root shell killed outright can leave its copy under a dotted name sudo
+  never reads. Before that call the scripts read the rule with `sudo
+  /bin/test -e` and `sudo /bin/cat`, and `install.sh` checks the new rule
+  with `sudo /usr/sbin/visudo -cf`. `uninstall.sh` asks for the password
+  with `sudo -v` before the recovery lock, and every sudo call under it is
+  `sudo -n`, with the time limit every call there has. Every tool run
+  through sudo has a fixed path.
 - Nothing else runs as root.
 
 ### 3. Lid observer

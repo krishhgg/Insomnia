@@ -67,7 +67,7 @@ MKTEMP=/usr/bin/mktemp
 MKDIR=/bin/mkdir
 TEST=/bin/test
 CAT=/bin/cat
-CMP=/usr/bin/cmp
+STAT=/usr/bin/stat
 CHOWN=/usr/sbin/chown
 VISUDO=/usr/sbin/visudo
 # The shell sudoers_replace runs as root.
@@ -104,10 +104,18 @@ LABEL="com.insomnia.backstop"
 PLIST="$LAUNCH_AGENTS/$LABEL.plist"
 SUDOERS=/etc/sudoers.d/insomnia
 # Held, as root, by install.sh and uninstall.sh around each compare and
-# write of $SUDOERS (sudoers_replace). /var/run is writable only by root and
-# the daemon group, and the file is root's with mode 0600, so no account can
-# create, swap or hold it.
-SUDOERS_LOCK=/var/run/insomnia-sudoers.lock
+# write of $SUDOERS (sudoers_replace). It sits beside the rule, in the folder
+# sudo reads rules from: that folder and every folder above it belong to
+# root and only root can write them, which sudoers_guard_take checks before
+# it opens the file. sudo skips a name there that contains a dot
+# (sudoers(5), @includedir), so this file is never read as a rule. It is
+# created once, root's with mode 0600, and never removed, so every run locks
+# the same inode. A path with no symbolic link in it (/etc is one).
+SUDOERS_LOCK=/private/etc/sudoers.d/.insomnia-sudoers.lock
+# The owner the guard, the rule and the folders above them must have: root.
+# Tests patch this line to the test account, the only way to run the root
+# transaction without root.
+ROOT_UID=0
 UID_NUM="$(id -u)"
 # Where the new bundle is assembled and signed (step 3) and where the previous
 # one waits during the swap (step 6). Both inside $APP_DIR, so the swap is two
@@ -120,8 +128,6 @@ NEW_APP=""
 # Where build-app.sh writes a source build before it is staged.
 BUILD_DIR=""
 TMP_SUDOERS=""
-# The rule as this run read it, for sudoers_replace to compare; in $WORK.
-SUDOERS_SEEN=""
 CANDIDATE=""
 CANDIDATE_DIR=""
 WORK=""
@@ -135,9 +141,10 @@ command_line() { local line; line="$(printf '%q ' "$@")"; printf '%s' "${line% }
 # Run one external call with a time limit, so a call that stalls (a sudo
 # policy or directory-service lookup, a launchd that does not answer) cannot
 # keep this run waiting forever. Its combined output is left in
-# BOUNDED_OUTPUT (trailing newline removed) and its exit status returned, or
-# 124 when it did not finish within CALL_TIMEOUT_SECONDS and was stopped, or
-# 125 when it is sudo and still running (pid in BOUNDED_PID).
+# BOUNDED_OUTPUT (trailing newline removed) and in the file $BOUNDED_BASE.out
+# byte for byte, and its exit status returned, or 124 when it did not finish
+# within CALL_TIMEOUT_SECONDS and was stopped, or 125 when it is sudo and
+# still running (pid in BOUNDED_PID).
 #
 # supervise() starts the call in the background and enforces the limit
 # itself, so the limit holds even if this run is killed while it waits. Once
@@ -157,9 +164,12 @@ command_line() { local line; line="$(printf '%q ' "$@")"; printf '%s' "${line% }
 # cannot reuse another's.
 BOUNDED_OUTPUT=""
 BOUNDED_PID=""
+BOUNDED_BASE=""
+# shellcheck disable=SC2034  # BOUNDED_BASE is read in uninstall.sh, whose bounded() is this one
 bounded() { # command args...
   local base supervisor rc deadline
   base="$("$MKTEMP" "$WORK/call.XXXXXX")"
+  BOUNDED_BASE="$base"
   BOUNDED_OUTPUT=""
   BOUNDED_PID=""
   supervise "$base" "$@" </dev/null >/dev/null 2>&1 &
@@ -315,15 +325,21 @@ pmset_rule_effective() {
 # rule at $SUDOERS is one file for the whole Mac, this install replaces it
 # with a rule for this account, and that copy may need it to undo its own
 # session. It is reported, and never asked to quit or signalled; only its
-# own account can quit it. pgrep, ps and plutil go through bounded(), so
-# none of them can keep this run, or the recovery lock, waiting. A pgrep
-# that fails or does not answer says nothing about what runs, so it blocks
-# (PGREP_PROBLEM).
+# own account can quit it. A process whose owner `ps -o uid=` does not give
+# (it failed, did not answer, or printed no user ID) may be in either
+# account, so it is neither: it is never asked to quit, and it stops the run
+# before the first sudo (UNKNOWN_OWNER, stop_for_other_accounts) unless a
+# fresh look finds it gone (await_identified). Only a process proven to be
+# the API client is ignored whatever its owner. pgrep, ps and plutil go
+# through bounded(), so none of them can keep this run, or the recovery
+# lock, waiting. A pgrep that fails or does not answer says nothing about
+# what runs, so it blocks (PGREP_PROBLEM).
 APP_FOUND=()      # "pid N (path)" per running copy of this app in this account
 UNVERIFIED=()     # "pid N (path; why)" per process of this account that could not be told apart from it
 OTHER_ACCOUNT=()  # "pid N (uid U, path)" per copy, or process that could not be told apart from one, in another account
+UNKNOWN_OWNER=()  # "pid N (owner unknown: why; path)" per process not proven to be the API client whose owner is unknown
 OTHER_FOUND=()    # "pid N (path, bundle id X)" per process proven to be the API client
-BLOCKING=()       # the first three: what must be gone before files are touched
+BLOCKING=()       # the first four: what must be gone before files are touched
 PGREP_PROBLEM=""  # "pgrep exited N" or "pgrep did not answer within Ns", when it did not list
 # Bundle ids read before the recovery lock, as "pid|bundle|id", reused for
 # the same process only: one that took a bundle's place since has another
@@ -344,8 +360,8 @@ known_id() { # pid bundle
   return 0
 }
 find_insomnia() {
-  local pid pids rc owner exe bundle id desc this
-  APP_FOUND=(); UNVERIFIED=(); OTHER_ACCOUNT=(); OTHER_FOUND=(); BLOCKING=(); PGREP_PROBLEM=""
+  local pid pids rc owner owner_why exe bundle id desc this
+  APP_FOUND=(); UNVERIFIED=(); OTHER_ACCOUNT=(); UNKNOWN_OWNER=(); OTHER_FOUND=(); BLOCKING=(); PGREP_PROBLEM=""
   # pgrep exits 1 when no process has the name.
   rc=0
   bounded "$PGREP" -x Insomnia || rc=$?
@@ -361,8 +377,15 @@ find_insomnia() {
     [[ "$pid" =~ ^[0-9]+$ ]] || continue
     rc=0
     bounded "$PS" -o uid= -p "$pid" || rc=$?
-    owner=""
-    if (( rc == 0 )); then owner="${BOUNDED_OUTPUT//[[:space:]]/}"; fi
+    owner="${BOUNDED_OUTPUT//[[:space:]]/}"
+    owner_why=""
+    if (( rc != 0 )); then
+      owner_why="ps -o uid= $(call_result "$rc")"
+    elif [[ -z "$owner" ]]; then
+      owner_why="ps -o uid= printed nothing"
+    elif [[ ! "$owner" =~ ^[0-9]+$ ]]; then
+      owner_why="ps -o uid= printed '$owner', not a user ID"
+    fi
     rc=0
     bounded "$PS" -o comm= -p "$pid" || rc=$?
     exe=""
@@ -399,9 +422,13 @@ find_insomnia() {
       this=0
       if [[ -n "$id" ]]; then desc="$exe; bundle id $id is neither this app's nor the Insomnia API client's"; fi
     fi
-    # No uid (the process just exited, or ps failed) is not proof of
-    # another account; such a pid is judged as one of this account's.
-    if [[ -n "$owner" && "$owner" != "$UID_NUM" ]]; then
+    # No user ID (ps failed, did not answer, or the process just exited)
+    # proves neither account, so such a process is neither this account's
+    # app nor another's: it is never asked to quit and it blocks.
+    if [[ -n "$owner_why" ]]; then
+      UNKNOWN_OWNER+=("pid $pid (owner unknown: $owner_why; $desc)")
+      BLOCKING+=("pid $pid (owner unknown: $owner_why; $desc)")
+    elif [[ "$owner" != "$UID_NUM" ]]; then
       OTHER_ACCOUNT+=("pid $pid (uid $owner, $desc)")
       BLOCKING+=("pid $pid (uid $owner, $desc)")
     elif (( this == 1 )); then
@@ -466,12 +493,18 @@ sudoers_for_others() { # file content
   done <<< "$1"
   return 0
 }
-# Stops the run when Insomnia runs in another account, or when pgrep could
-# not say whether it does; nothing is sent to any process. The argument
-# says what this run has changed so far.
+# Stops the run when Insomnia runs in another account, when a process named
+# Insomnia has an owner ps could not give, or when pgrep could not say
+# whether it runs; nothing is sent to any process. The argument says what
+# this run has changed so far.
 stop_for_other_accounts() { # what was changed
   if [[ -n "$PGREP_PROBLEM" ]]; then
     echo "$PGREP_PROBLEM, so whether Insomnia runs in this or another account is unknown. Rerun once it answers. $1" >&2
+    exit 1
+  fi
+  if (( ${#UNKNOWN_OWNER[@]} > 0 )); then
+    echo "Whose process these are could not be read, so whether Insomnia runs in this or another account is unknown: $(list "${UNKNOWN_OWNER[@]}")." >&2
+    echo "$SUDOERS is shared by every account on this Mac, so nothing was asked to quit. Rerun once 'ps -o uid= -p <pid>' answers for them, or once they have exited. $1" >&2
     exit 1
   fi
   (( ${#OTHER_ACCOUNT[@]} > 0 )) || return 0
@@ -480,51 +513,217 @@ stop_for_other_accounts() { # what was changed
   echo "Quit Insomnia in that account, then rerun. $1" >&2
   exit 1
 }
+# Before the first sudo, which asks for the password: a process whose owner
+# or identity could not be read may be another account's copy of this app,
+# whose grant the rule written next would take away. The lookup may only
+# have raced the process's exit, so the processes are listed again, once a
+# second for up to QUIT_WAIT_SECONDS, while any such process is listed. One
+# that is still listed then stops the run (stop_for_other_accounts,
+# stop_for_unverified). A pgrep problem stops it at once.
+await_identified() {
+  local i
+  for (( i = 0; i < QUIT_WAIT_SECONDS; i++ )); do
+    [[ -z "$PGREP_PROBLEM" ]] || return 0
+    (( ${#UNKNOWN_OWNER[@]} + ${#UNVERIFIED[@]} > 0 )) || return 0
+    sleep 1
+    find_insomnia
+  done
+  return 0
+}
+stop_for_unverified() { # what was changed
+  (( ${#UNVERIFIED[@]} > 0 )) || return 0
+  echo "Cannot tell whether ${#UNVERIFIED[@]} process(es) named Insomnia are this app, and they were still running after ${QUIT_WAIT_SECONDS}s: $(list "${UNVERIFIED[@]}")." >&2
+  echo "Nothing was asked to quit. Quit them, or wait for them to exit, then rerun. $1" >&2
+  exit 1
+}
+
+# Why the file named $1 cannot take part in the rule's transaction, or
+# nothing when it can: a regular file of root's (ROOT_UID) with one link, no
+# setuid, setgid or sticky bit and no write permission for group or others;
+# with $3, exactly that mode. $2 is its `stat -f '%Hp %Mp %Lp %u %l'`, which
+# reads the name itself, not what a link points to. This and the two
+# functions below are the same in install.sh and uninstall.sh (a test keeps
+# them in step) and run only as root.
+sudoers_file_problem() { # name stat [mode]
+  local type special perm uid links
+  read -r type special perm uid links <<< "$2"
+  if [[ "${type:-}" != 10 ]]; then
+    echo "$1 is not a regular file (stat: ${2:-no answer})"
+  elif [[ "${uid:-}" != "$ROOT_UID" ]]; then
+    echo "$1 belongs to uid ${uid:-?}, not root"
+  elif [[ "${links:-}" != 1 ]]; then
+    echo "$1 has ${links:-?} links, not 1"
+  elif [[ "${special:-}" != 0 || ! "${perm:-}" =~ ^[0-7]+$ ]] || (( (8#$perm & 8#022) != 0 )); then
+    echo "$1 has mode ${special:-?}${perm:-?}, so someone other than root may change it"
+  elif [[ -n "${3:-}" && "$perm" != "$3" ]]; then
+    echo "$1 has mode $perm, not $3"
+  fi
+  return 0
+}
+# Takes $SUDOERS_LOCK on fd 8 for the rest of the root shell, once it is
+# shown that only root can have made or changed it. An existing file must be
+# a regular file of root's with mode 0600 and one link, and every folder from
+# its own up to / a folder of root's that group and others cannot write.
+# Both are checked before the file is opened, so a FIFO (whose open would
+# wait) or a link is never opened. The file is created, mode 0600, only where
+# nothing is (noclobber: no link is followed and nothing is truncated).
+# Nothing is ever repaired, replaced or removed. Once the lock is taken, the
+# descriptor and the path must still be the same file, unchanged, and the
+# rule $1 must be in the same folder. Exits 7 with the reason when a check
+# fails, 3 when the lock is not free within LOCK_TIMEOUT_SECONDS.
+sudoers_guard_take() { # rule
+  local dir s type perm uid why took seen
+  if [[ -e "$SUDOERS_LOCK" || -L "$SUDOERS_LOCK" ]]; then
+    why="$(sudoers_file_problem "$SUDOERS_LOCK" "$("$STAT" -f '%Hp %Mp %Lp %u %l' "$SUDOERS_LOCK" 2>/dev/null)" 600)"
+    if [[ -n "$why" ]]; then echo "$why" >&2; exit 7; fi
+  fi
+  dir="$SUDOERS_LOCK"
+  while [[ "$dir" == /?* ]]; do
+    dir="${dir%/*}"
+    s="$("$STAT" -f '%Hp %Lp %u' "${dir:-/}" 2>/dev/null)"
+    read -r type perm uid <<< "$s"
+    if [[ "${type:-}" != 4 || ! "${perm:-}" =~ ^[0-7]+$ ]] \
+       || [[ "${uid:-}" != 0 && "${uid:-}" != "$ROOT_UID" ]] || (( (8#$perm & 8#022) != 0 )); then
+      echo "${dir:-/}, a folder above $SUDOERS_LOCK, is not a folder of root's that only root can write (stat: ${s:-no answer})" >&2
+      exit 7
+    fi
+  done
+  ( set -C; : > "$SUDOERS_LOCK" ) 2>/dev/null || true
+  why="$(sudoers_file_problem "$SUDOERS_LOCK" "$("$STAT" -f '%Hp %Mp %Lp %u %l' "$SUDOERS_LOCK" 2>/dev/null)" 600)"
+  if [[ -n "$why" ]]; then echo "$why" >&2; exit 7; fi
+  exec 8<"$SUDOERS_LOCK" || exit 7
+  "$LOCKF" -t "$LOCK_TIMEOUT_SECONDS" 8 2>/dev/null || exit 3
+  took="$("$STAT" -f '%d:%i %Hp %Mp %Lp %u %l' <&8 2>/dev/null)"
+  seen="$("$STAT" -f '%d:%i %Hp %Mp %Lp %u %l' "$SUDOERS_LOCK" 2>/dev/null)"
+  if [[ -z "$took" || "$took" != "$seen" ]]; then
+    echo "$SUDOERS_LOCK is no longer the file this run opened and locked" >&2
+    exit 7
+  fi
+  why="$(sudoers_file_problem "$SUDOERS_LOCK" "${took#* }" 600)"
+  if [[ -n "$why" ]]; then echo "$why" >&2; exit 7; fi
+  if [[ "$("$STAT" -L -f '%d:%i' "${1%/*}" 2>/dev/null)" != "$("$STAT" -f '%d:%i' "${SUDOERS_LOCK%/*}" 2>/dev/null)" ]]; then
+    echo "$1 is not in the folder that holds $SUDOERS_LOCK" >&2
+    exit 7
+  fi
+}
+# Opens the rule $1 on fd 7, once sudoers_file_problem finds nothing wrong
+# with it (any mode without group or other write), and reads it through that
+# descriptor. Exits 4 unless the path still names the opened file and the
+# text read, trailing newlines aside, is exactly $2, the text the caller read
+# and judged before sudo ran; 8 when the shell cannot hold the bytes exactly
+# (a NUL byte, or a change while they were read). Leaves the file's identity
+# in PINNED_ID and its text in PINNED_TEXT.
+sudoers_pin_rule() { # rule text
+  local LC_ALL=C why size
+  why="$(sudoers_file_problem "$1" "$("$STAT" -f '%Hp %Mp %Lp %u %l' "$1" 2>/dev/null)")"
+  if [[ -n "$why" ]]; then echo "$why" >&2; exit 4; fi
+  exec 7<"$1" || exit 4
+  PINNED_ID="$("$STAT" -f '%d:%i' <&7 2>/dev/null)"
+  if [[ -z "$PINNED_ID" || "$PINNED_ID" != "$("$STAT" -f '%d:%i' "$1" 2>/dev/null)" ]]; then
+    echo "$1 was replaced while it was opened" >&2
+    exit 4
+  fi
+  size="$("$STAT" -f '%z' <&7 2>/dev/null)"
+  PINNED_TEXT="$("$CAT" <&7 && echo .)"
+  PINNED_TEXT="${PINNED_TEXT%.}"
+  if [[ -z "$size" || "${#PINNED_TEXT}" != "$size" ]]; then
+    echo "$1 holds a NUL byte, or changed while it was read" >&2
+    exit 8
+  fi
+  PINNED_TEXT="${PINNED_TEXT%"${PINNED_TEXT##*[!$'\n']}"}"
+  if [[ "$PINNED_TEXT" != "$2" ]]; then
+    echo "$1 is not the text this run read" >&2
+    exit 4
+  fi
+}
+
+# The rule this script writes for $USER: a header and the four pmset
+# commands, nothing else. Root writes it from this function too.
+sudoers_rule_text() {
+  printf '%s\n' "# Installed by Insomnia install.sh. Exactly four commands, nothing else." \
+    "$USER ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 1" \
+    "$USER ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0" \
+    "$USER ALL=(root) NOPASSWD: /usr/bin/pmset -b lowpowermode 1" \
+    "$USER ALL=(root) NOPASSWD: /usr/bin/pmset -b lowpowermode 0"
+}
 
 # $SUDOERS is one file for the whole Mac, and another account's install.sh
 # or uninstall.sh may write or remove it between this run's read (step 2)
 # and its write. So the write happens only if the file is still what this
-# run read and judged: absent, or the bytes it read into $SUDOERS_SEEN. The
-# compare and the write are one call to sudo, run as root while it holds
-# $SUDOERS_LOCK, the lock uninstall.sh takes for its compare and removal.
-# The new rule is copied beside the old one (sudo skips a name with a dot),
-# owned by root with mode 0440, checked there with visudo, so no process of
-# this account can change it between the check and the use, and renamed
-# over the old one: the rule is the old one or the new one, never a mix,
-# and a copy that is not renamed is removed. Exit status: 0 replaced, 3 the
-# lock was not free within LOCK_TIMEOUT_SECONDS, 4 the file changed since it
-# was read, 5 a tool failed, 6 the new rule failed visudo's check, 2 a bad
-# call (1 is sudo's own, as for a wrong password). Only 0 changes the file.
-sudoers_replace_as_root() { # absent|same rule seen new
+# run read and judged: absent, or exactly the text it read. That text is
+# handed to root as an argument, so what root compares is what was judged
+# here, not a file anyone could change meanwhile. The compare and the write
+# are one call to sudo, run as root while it holds $SUDOERS_LOCK
+# (sudoers_guard_take), the lock uninstall.sh takes for its compare and
+# removal. Root reads the rule through a descriptor it opened and checked
+# (sudoers_pin_rule), judges that text again with sudoers_for_others, and
+# renames only while the path still names the file it opened. The new rule
+# is written from sudoers_rule_text beside the old one (sudo skips a name
+# with a dot), owned by root with mode 0440, checked there with visudo, and
+# renamed over the old one: the rule is the old one or the new one, never a
+# mix. The copy is removed when the root shell exits without renaming it;
+# a root shell killed outright (SIGKILL) leaves it, under a dotted name sudo
+# never reads.
+#
+# The lock keeps out only the runs that take it: install.sh and uninstall.sh
+# of this version. Scripts of earlier releases take no lock, and neither does
+# an administrator's own sudo. Against those, the checks above leave only the
+# moments between root's last check and its rename open; they do not close
+# them.
+#
+# Exit status: 0 replaced; 3 the lock was not free within
+# LOCK_TIMEOUT_SECONDS; 4 the rule changed since it was read, or is not a
+# regular file of root's with one link that only root can change; 5 staging
+# the new rule failed, or mv reported that the rename failed; 6 the new rule
+# failed visudo's check; 7 the lock file, or a folder above it, is not one
+# only root can change; 8 the rule as root read it holds a NUL byte, changed
+# while it was read, or has a line for someone else; 2 a bad call. 1 is
+# sudo's own (a wrong password) or a shell error before the rename. In all
+# of these the rule was not replaced, though the lock file may have been
+# created. Any other status (the root shell, or its mv, was killed by a
+# signal), or a call that never returns, leaves it unknown whether the
+# rename happened.
+sudoers_replace_as_root() { # absent|same rule [text]
   STAGED_RULE=""
   trap '[[ -z "$STAGED_RULE" ]] || "$RM" -f "$STAGED_RULE"' EXIT
   umask 077
-  [[ ! -L "$SUDOERS_LOCK" ]] || exit 3
-  exec 8>>"$SUDOERS_LOCK" || exit 3
-  "$LOCKF" -t "$LOCK_TIMEOUT_SECONDS" 8 2>/dev/null || exit 3
-  case "$1" in
-    absent) [[ ! -e "$2" && ! -L "$2" ]] || exit 4 ;;
-    same) { [[ -f "$2" && ! -L "$2" ]] && "$CMP" -s "$3" "$2"; } || exit 4 ;;
-    *) exit 2 ;;
-  esac
+  case "$1" in absent | same) ;; *) exit 2 ;; esac
+  sudoers_guard_take "$2"
+  if [[ "$1" == absent ]]; then
+    if [[ -e "$2" || -L "$2" ]]; then echo "$2 is there now" >&2; exit 4; fi
+  else
+    sudoers_pin_rule "$2" "${3-}"
+    [[ -z "$(sudoers_for_others "$PINNED_TEXT")" ]] || exit 8
+  fi
   STAGED_RULE="$("$MKTEMP" "$2.XXXXXX")" || exit 5
-  "$CAT" "$4" > "$STAGED_RULE" || exit 5
+  sudoers_rule_text > "$STAGED_RULE" || exit 5
   { "$CHOWN" root:wheel "$STAGED_RULE" && "$CHMOD" 0440 "$STAGED_RULE"; } || exit 5
   "$VISUDO" -cf "$STAGED_RULE" >/dev/null || exit 6
-  "$MV" -f "$STAGED_RULE" "$2" || exit 5
+  if [[ "$1" == absent ]]; then
+    if [[ -e "$2" || -L "$2" ]]; then echo "$2 is there now" >&2; exit 4; fi
+  elif [[ "$("$STAT" -f '%d:%i' "$2" 2>/dev/null)" != "$PINNED_ID" ]]; then
+    echo "$2 was replaced while the new rule was staged" >&2
+    exit 4
+  fi
+  # An mv killed by a signal may have renamed already, so its status goes
+  # on as it is, an unknown result, not as a failed rename.
+  "$MV" -f "$STAGED_RULE" "$2" || { rc=$?; (( rc > 128 )) && exit "$rc"; exit 5; }
   STAGED_RULE=""
   exit 0
 }
 # Runs sudoers_replace_as_root as root, in one sudo call. The shell's script
-# is the function's text after this script's fixed tool paths, and sudo
-# resets the environment, so nothing root runs comes from PATH.
-sudoers_replace() { # absent|same
+# is this script's fixed tool paths, the account's name and user ID, and the
+# text of the functions root runs; sudo resets the environment, so nothing
+# root runs comes from PATH. $2 is the rule's text as step 2 read and judged
+# it ("same" only).
+sudoers_replace() { # absent|same [text]
   "$SUDO" "$ROOT_BASH" -c "set -u
-$(printf '%s=%q\n' SUDOERS_LOCK "$SUDOERS_LOCK" LOCK_TIMEOUT_SECONDS "$LOCK_TIMEOUT_SECONDS" \
-    LOCKF "$LOCKF" CMP "$CMP" CAT "$CAT" MKTEMP "$MKTEMP" CHOWN "$CHOWN" CHMOD "$CHMOD" \
-    VISUDO "$VISUDO" MV "$MV" RM "$RM")
-$(declare -f sudoers_replace_as_root)
-sudoers_replace_as_root \"\$@\"" insomnia-sudoers-replace "$1" "$SUDOERS" "$SUDOERS_SEEN" "$TMP_SUDOERS"
+$(printf '%s=%q\n' SUDOERS_LOCK "$SUDOERS_LOCK" ROOT_UID "$ROOT_UID" USER "$USER" UID_NUM "$UID_NUM" \
+    LOCK_TIMEOUT_SECONDS "$LOCK_TIMEOUT_SECONDS" LOCKF "$LOCKF" STAT "$STAT" CAT "$CAT" \
+    MKTEMP "$MKTEMP" CHOWN "$CHOWN" CHMOD "$CHMOD" VISUDO "$VISUDO" MV "$MV" RM "$RM")
+$(declare -f sudoers_file_problem sudoers_guard_take sudoers_pin_rule sudoers_for_others \
+    sudoers_rule_text sudoers_replace_as_root)
+sudoers_replace_as_root \"\$@\"" insomnia-sudoers-replace "$1" "$SUDOERS" "${2-}"
 }
 
 cleanup() {
@@ -534,7 +733,7 @@ cleanup() {
   if [[ -n "$STAGE" ]]; then "$RM" -rf "$STAGE"; fi
   if [[ -n "$BUILD_DIR" ]]; then "$RM" -rf "$BUILD_DIR"; fi
   if [[ -n "$WORK" ]]; then
-    "$RM" -f "$WORK"/call.* "$WORK/sudoers.seen" 2>/dev/null || true
+    "$RM" -f "$WORK"/call.* 2>/dev/null || true
     "$RMDIR" "$WORK" 2>/dev/null || true
   fi
 }
@@ -635,24 +834,28 @@ fi
 #    The password prompt comes first: until the rule is installed and proven
 #    effective, the running app is not asked to quit and neither the bundle
 #    (backstop.sh included) nor the LaunchAgent are touched. A copy running
-#    in another account stops the install before the rule is replaced
-#    (find_insomnia), and so does a rule that grants another account: that
-#    account's agent needs it to undo a session even after its app crashed,
-#    when no process of it is left to find. The rule is written only if it
-#    is still what was read here (sudoers_replace).
+#    in another account stops the install before the first sudo
+#    (find_insomnia), and so does a process named Insomnia whose owner or
+#    identity cannot be read and that is still listed after
+#    QUIT_WAIT_SECONDS (await_identified). So does a rule that grants
+#    another account: that account's agent needs it to undo a session even
+#    after its app crashed, when no process of it is left to find. The rule
+#    is written only if it is still what was read here (sudoers_replace).
 find_insomnia
+await_identified
 stop_for_other_accounts "Nothing was changed."
+stop_for_unverified "Nothing was changed."
 step "Writing $SUDOERS (requires your password once)"
-SUDOERS_SEEN="$WORK/sudoers.seen"
 sudoers_expect=absent
+sudoers_text=""
 if [[ -e "$SUDOERS" ]] || "$SUDO" "$TEST" -e "$SUDOERS"; then
   # Root-only, so it is read through sudo, the same way uninstall.sh reads it.
-  if ! "$SUDO" "$CAT" "$SUDOERS" > "$SUDOERS_SEEN"; then
+  # The text stays in this shell, never in a file, and goes to root as it is.
+  if ! sudoers_text="$("$SUDO" "$CAT" "$SUDOERS")"; then
     echo "Could not read $SUDOERS through sudo, so it was not replaced. Nothing was changed." >&2
     exit 1
   fi
   sudoers_expect=same
-  sudoers_text="$(< "$SUDOERS_SEEN")"
   sudoers_why="$(sudoers_for_others "$sudoers_text")"
   if [[ "$sudoers_why" == grants\ * ]]; then
     echo "$SUDOERS $sudoers_why, not $USER. Another account installed Insomnia, and its recovery agent needs that rule to undo a session, even one whose app crashed. This Mac has room for one rule, so this install would take it away." >&2
@@ -665,32 +868,38 @@ if [[ -e "$SUDOERS" ]] || "$SUDO" "$TEST" -e "$SUDOERS"; then
   fi
 fi
 TMP_SUDOERS="$("$MKTEMP")"
-cat > "$TMP_SUDOERS" <<SUDO
-# Installed by Insomnia install.sh. Exactly four commands, nothing else.
-$USER ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 1
-$USER ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0
-$USER ALL=(root) NOPASSWD: /usr/bin/pmset -b lowpowermode 1
-$USER ALL=(root) NOPASSWD: /usr/bin/pmset -b lowpowermode 0
-SUDO
+sudoers_rule_text > "$TMP_SUDOERS"
 if ! "$SUDO" "$VISUDO" -cf "$TMP_SUDOERS" >/dev/null; then
   echo "sudoers file failed validation (or sudo did not authenticate); not installed. Nothing was changed." >&2
   exit 1
 fi
 replace_rc=0
-sudoers_replace "$sudoers_expect" || replace_rc=$?
+sudoers_replace "$sudoers_expect" "$sudoers_text" || replace_rc=$?
 case "$replace_rc" in
   0) ;;
   3)
-    echo "$SUDOERS was not replaced: $SUDOERS_LOCK stayed taken for ${LOCK_TIMEOUT_SECONDS}s, so another install.sh or uninstall.sh, perhaps in another account, is changing it. Rerun in a moment. Nothing was changed." >&2
+    echo "$SUDOERS was not replaced: $SUDOERS_LOCK stayed taken for ${LOCK_TIMEOUT_SECONDS}s, so another install.sh or uninstall.sh, perhaps in another account, is changing it. Rerun in a moment. The app and the LaunchAgent were not touched." >&2
     exit 1 ;;
   4)
-    echo "$SUDOERS changed after this install read it: another install.sh or uninstall.sh, perhaps in another account, wrote or removed it meanwhile. It was not replaced, so no rule written meanwhile was overwritten. Rerun to check it again. Nothing was changed." >&2
+    echo "$SUDOERS changed after this install read it, or is not a regular file of root's with one link that only root can change (see any line above). Another install.sh or uninstall.sh, perhaps in another account, may have written or removed it meanwhile. It was not replaced, so no rule written meanwhile was overwritten. Rerun to check it again. The app and the LaunchAgent were not touched." >&2
+    exit 1 ;;
+  5)
+    echo "$SUDOERS was not replaced: copying the new rule beside it, or renaming the copy into place, failed (see the error above). The app and the LaunchAgent were not touched." >&2
     exit 1 ;;
   6)
-    echo "The new rule failed visudo's check once copied beside $SUDOERS, so $SUDOERS was not replaced. Nothing was changed." >&2
+    echo "The new rule failed visudo's check once copied beside $SUDOERS, so $SUDOERS was not replaced. The app and the LaunchAgent were not touched." >&2
+    exit 1 ;;
+  7)
+    echo "$SUDOERS was not replaced: the lock file $SUDOERS_LOCK, or a folder above it, is not one only root can change (see the line above), so the lock that keeps two runs from writing the rule at once cannot be trusted. The app and the LaunchAgent were not touched, and nothing there was repaired: check it yourself (the lock file must be a regular file of root's with mode 0600 and one link), then rerun." >&2
+    exit 1 ;;
+  8)
+    echo "$SUDOERS was not replaced: read again as root, it holds a NUL byte, changed while it was read, or has a line that is not for $USER. Rerun to check it again. The app and the LaunchAgent were not touched." >&2
+    exit 1 ;;
+  1 | 2)
+    echo "$SUDOERS was not replaced: the sudo call that replaces it exited $replace_rc before replacing it. The app and the LaunchAgent were not touched." >&2
     exit 1 ;;
   *)
-    echo "$SUDOERS was not replaced: the sudo call that replaces it exited $replace_rc. Nothing was changed." >&2
+    echo "The sudo call that replaces $SUDOERS exited $replace_rc (a signal), so whether $SUDOERS was replaced is not known. The app (with backstop.sh) and the LaunchAgent were not touched. Check it with 'sudo cat $SUDOERS', then rerun." >&2
     exit 1 ;;
 esac
 # The backstop cannot undo anything without the rule, so stop here. Checked
@@ -815,10 +1024,10 @@ if (( lock_rc != 0 )); then
   echo "Wait a minute and rerun. $SUDOERS is installed; the app at $APP and the LaunchAgent were not touched." >&2
   exit 75
 fi
-# From here on every sudo, pgrep, ps, launchctl and codesign call goes
-# through bounded(): one that stalls is stopped and ends this run, which lets
-# go of the lock, so the app and the agent's backstop can take it again and
-# undo a session. A sudo that does not stop on SIGTERM keeps the lock until
+# From here on every sudo, pgrep, ps, plutil, launchctl and codesign call
+# goes through bounded(): one that stalls is stopped and ends this run,
+# which lets go of the lock, so the app and the agent's backstop can take it
+# again and undo a session. A sudo that does not stop on SIGTERM keeps the lock until
 # it ends. A pgrep that cannot answer does not say the app is gone, so the
 # run stops. No Info.plist is read from here on (PLIST_READS=0): a process
 # not identified before the lock counts as unverified.
@@ -919,23 +1128,50 @@ done
 
 # Whether the plist on disk, the one launchd loads at the next login, pins
 # the bundle at $PREVIOUS_APP and not the one at $APP: 0 when it does, 1
-# when it does not, 124 when a codesign check did not answer in time, so
-# it is not known which of the two it pins.
+# when it does not (no plist, or one that parses and pins no requirement),
+# 124 when that is not known, with the reason in PINS_UNKNOWN: a read or a
+# codesign check failed or did not answer in time, or the plist is not a
+# regular file or does not parse. Every read here runs under the recovery
+# lock, so each is a bounded call.
+PINS_UNKNOWN=""
 plist_pins_previous() {
-  local pinned rc
-  pinned="$("$PLUTIL" -extract ProgramArguments.4 raw -o - "$PLIST" 2>/dev/null || true)"
+  local pinned rc=0
+  PINS_UNKNOWN=""
+  [[ -e "$PLIST" || -L "$PLIST" ]] || return 1
+  if [[ ! -f "$PLIST" ]]; then
+    PINS_UNKNOWN="$PLIST is not a regular file, so which of the two bundles it pins is unknown."
+    return 124
+  fi
+  bounded "$PLUTIL" -extract ProgramArguments.4 raw -o - "$PLIST" || rc=$?
+  if (( rc == 1 )); then
+    # No such entry, or no plist at all: only a plist that parses pins
+    # nothing.
+    rc=0
+    bounded "$PLUTIL" -lint "$PLIST" || rc=$?
+    if (( rc == 0 )); then return 1; fi
+    PINS_UNKNOWN="'plutil -lint $PLIST' $(call_result "$rc"), so which of the two bundles it pins is unknown."
+    return 124
+  elif (( rc != 0 )); then
+    PINS_UNKNOWN="'plutil -extract ProgramArguments.4', which reads the requirement $PLIST pins, $(call_result "$rc")."
+    return 124
+  fi
+  pinned="$BOUNDED_OUTPUT"
   [[ -n "$pinned" ]] || return 1
   rc=0
   bounded "$CODESIGN" --verify --strict "-R=$pinned" "$APP" || rc=$?
   if (( rc == 0 )); then return 1; fi
-  if (( rc == 124 )); then return 124; fi
+  if (( rc == 124 )); then
+    PINS_UNKNOWN="'codesign --verify', which tells which of the two bundles $PLIST pins, did not answer within ${CALL_TIMEOUT_SECONDS}s."
+    return 124
+  fi
   rc=0
   bounded "$CODESIGN" --verify --strict "-R=$pinned" "$PREVIOUS_APP" || rc=$?
+  if (( rc == 124 )); then
+    PINS_UNKNOWN="'codesign --verify', which tells which of the two bundles $PLIST pins, did not answer within ${CALL_TIMEOUT_SECONDS}s."
+  fi
   if (( rc == 0 || rc == 124 )); then return "$rc"; fi
   return 1
 }
-pins_unknown_note="'codesign --verify', which tells which of the two bundles $PLIST pins,
-did not answer within ${CALL_TIMEOUT_SECONDS}s."
 
 step "Ending any stale session and checking the recovery journal"
 recovery_rc=0
@@ -962,7 +1198,7 @@ build at $APP. Before you log out, resolve the recovery and rerun this script,
 which puts the previous app back."
     elif (( pins_rc == 124 )); then
       pair_note="$pair_note
-$pins_unknown_note"
+$PINS_UNKNOWN"
     fi
   else
     pair_note="The app at $APP and the LaunchAgent were not replaced or unloaded,
@@ -1007,10 +1243,10 @@ if [[ -d "$PREVIOUS_APP" ]]; then
     cat >&2 <<FAIL
 
 Install stopped: an interrupted run left a build at $APP and set the previous app
-aside at $PREVIOUS_APP, and $pins_unknown_note
+aside at $PREVIOUS_APP. $PINS_UNKNOWN
 Neither bundle was moved and no LaunchAgent job was unloaded; the new build was
 discarded. Installed so far: $SUDOERS. The recovery journal was clean when
-checked above. Rerun this script once codesign answers.
+checked above. Rerun this script once that is resolved.
 FAIL
     exit 1
   fi
@@ -1183,7 +1419,19 @@ cat > "$CANDIDATE" <<PLIST
 </dict>
 </plist>
 PLIST
-"$PLUTIL" -lint "$CANDIDATE" >/dev/null
+# Under the recovery lock, so bounded like every other call here.
+lint_rc=0
+bounded "$PLUTIL" -lint "$CANDIDATE" || lint_rc=$?
+if (( lint_rc != 0 )); then
+  cat >&2 <<FAIL
+
+Install stopped: 'plutil -lint' on the new LaunchAgent plist $(call_result "$lint_rc")${BOUNDED_OUTPUT:+ ($BOUNDED_OUTPUT)}.
+The plist at $PLIST and the app at $APP were not replaced and no job was
+unloaded in this step; the new build was discarded. Installed so far: $SUDOERS.
+Rerun this script.
+FAIL
+  exit 1
+fi
 
 # bootout by service target (ignored if nothing is loaded; a path launchctl
 # cannot read fails with EIO instead of unloading anything), swap the new
