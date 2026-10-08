@@ -346,8 +346,12 @@ resume. If the saved session cannot be deleted, its end is recorded beside it
 in `ended-session.json`, or, when that file cannot be written either, in the
 journal (`endedSession` in `state.json`). The record is written before
 anything is restored, and the app restores that session instead of resuming
-it. If no record can be written, the app still resumes nothing while it
-cannot write the journal itself. Otherwise the session stands until its
+it. If no record can be written, the agent still restores sleep and leaves
+`sleepDisabledByUs` in the journal. The app does not resume a session whose
+journal says sleep is held while `pmset` reports it is not: it ends that
+session and records the end where it can, so making `state.json` or every
+file writable again does not bring the session back. Nor does it resume one
+while it cannot write the journal. Otherwise the session stands until its
 deadline, and sessions are capped at 24 hours by default (`maxDuration`).
 
 The app and backstop use the same lock so they do not restore and rewrite the

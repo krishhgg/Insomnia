@@ -1379,6 +1379,7 @@ final class LidActionsTests: XCTestCase {
         s.savedAudioOutputs = [Self.headsetSaved]
         try h.store.saveState(s)
         try h.store.saveSession(SessionMath.newSession(now: h.clock.now, duration: 3600, maxDuration: 86400))
+        h.guardFake.sleepDisabled = true // the crashed session's hold
         h.clamshell.closed = true
         h.audio.connect("usb-headset", name: "USB Headset", volume: 0.3, muted: true)
         let m = h.makeManager(lockTimeout: 0.05)

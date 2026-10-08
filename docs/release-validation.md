@@ -127,6 +127,7 @@ is performed. Do not replace "not run" with "passed" based on source review.
 | A hand edit to the end floor or thermal setting in config.json while a session runs with the lid open: the app takes it within a second, and the backstop's next run uses the same value | Not run |
 | A Settings change to the end floor or thermal setting while config.json cannot be written (`chflags uchg`): Settings says why, and the app and the backstop keep the old value | Not run |
 | Backstop end while session.json and an unrelated ended-session.json are both locked (`chflags uchg`): state.json gets endedSession before sleep is restored, a relaunch restores instead of resuming, and after `chflags nouchg` on session.json the next run removes it | Not run |
+| Backstop end while session.json, an unrelated ended-session.json and state.json are all locked: sleep is restored and the agent exits 1; after `chflags nouchg` on state.json alone, or on all three, a relaunch ends the session instead of disabling sleep again | Not run |
 | Reboot/login with active or dirty journals | Not run |
 | Backstop resuming a frozen test process through the installed `Insomnia --resume-frozen`, and keeping the entry when the bundle is removed or its Info.plist lacks `InsomniaResumeFrozenVersion` | Not run |
 | Lid-close/open and safe recovery of explicitly selected test processes | Not run |

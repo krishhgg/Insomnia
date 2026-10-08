@@ -8,8 +8,11 @@ import XCTest
 /// there that cannot be replaced. The end then goes in the journal
 /// (state.json's endedSession), before anything is undone, written by the
 /// recovery agent (the real backstop.sh, tools patched to fakes) or by the
-/// app. A record of one session.json never ends another, and a journal
-/// that cannot be written holds no session either.
+/// app. A record of one session.json never ends another. When no record
+/// can be written at all, the agent still restores sleep, and no launch
+/// holds sleep again for that session: not while the journal cannot be
+/// written, and not once it can, since the journal then says sleep is held
+/// and pmset says it is not.
 @MainActor
 final class JournaledSessionEndTests: XCTestCase {
     var h: Harness!
@@ -181,6 +184,7 @@ final class JournaledSessionEndTests: XCTestCase {
         journal.sleepDisabledByUs = true
         journal.endedSession = earlier
         try h.store.saveState(journal)
+        h.guardFake.sleepDisabled = true // the newer session's hold
         let alive = AppAliveLock(url: h.home.paths.appAliveFile)
         XCTAssertTrue(try alive.tryAcquire())
         defer { alive.release() }
@@ -201,7 +205,9 @@ final class JournaledSessionEndTests: XCTestCase {
     /// Nothing can record the end: session.json, ended-session.json and
     /// state.json are all immutable. The agent restores sleep but keeps
     /// sleepDisabledByUs; the relaunched app cannot write the journal, so
-    /// it does not resume the session either.
+    /// it does not resume the session either. The app's pmset still reads
+    /// SleepDisabled 1 here (the fake sudo above changes nothing it reads):
+    /// the journal write alone keeps the session from resuming.
     func testACutoffThatCanRecordNothingIsNotResumedWhileTheJournalCannotBeWritten() async throws {
         _ = try await startThenPin()
         try setImmutable(h.home.paths.stateFile, true)
@@ -218,5 +224,85 @@ final class JournaledSessionEndTests: XCTestCase {
         XCTAssertFalse(next.isActive)
         XCTAssertFalse(sleepHeldAgain(since: before), "\(h.guardFake.calls)")
         XCTAssertTrue(logText().contains("could not journal sleep guard"), logText())
+    }
+
+    /// An agent end that could record nothing, with all three files
+    /// immutable: the agent restores sleep, which the app's pmset then
+    /// reads too, and keeps sleepDisabledByUs.
+    private func endWithNothingRecorded() async throws {
+        _ = try await startThenPin()
+        try setImmutable(h.home.paths.stateFile, true)
+        try await runAgent(expecting: 1)
+        XCTAssertTrue(agent.calls.contains(agent.restoreCall), agent.calls.joined(separator: "\n"))
+        XCTAssertEqual(try h.store.loadState()?.sleepDisabledByUs, true)
+        XCTAssertNil(try h.store.loadState()?.endedSession)
+        XCTAssertFalse(h.store.sessionEndIsRecorded())
+        XCTAssertTrue(logText().contains("could not remove \(h.home.paths.sessionFile.path) or record its end in"), logText())
+        h.guardFake.sleepDisabled = false
+    }
+
+    private let undoneHoldLine = "reconcile: session.json holds a session whose sleep hold was undone while Insomnia was not running"
+
+    /// The reviewer's case: after that end, state.json alone is made
+    /// writable again and the app relaunches (holding the alive lock). The
+    /// journal says sleep is held and pmset says it is not, so the session
+    /// is ended, not held again, and its end is recorded in the journal
+    /// this time. The agent then treats it as ended, and once session.json
+    /// can be removed it goes.
+    func testACutoffThatCanRecordNothingIsNotResumedOnceOnlyTheJournalCanBeWritten() async throws {
+        try await endWithNothingRecorded()
+        let marker = try marker()
+        try setImmutable(h.home.paths.stateFile, false)
+        let alive = AppAliveLock(url: h.home.paths.appAliveFile)
+        XCTAssertTrue(try alive.tryAcquire())
+        defer { alive.release() }
+
+        let before = h.guardFake.calls.count
+        let next = h.makeManager()
+        await next.reconcile()
+
+        XCTAssertFalse(next.isActive, "a session the agent ended must not come back")
+        XCTAssertFalse(sleepHeldAgain(since: before), "\(h.guardFake.calls)")
+        XCTAssertFalse(h.guardFake.sleepDisabled)
+        XCTAssertTrue(logText().contains(undoneHoldLine), logText())
+        XCTAssertNotNil(try h.store.loadSession(), "session.json is still immutable")
+        let journal = try XCTUnwrap(try h.store.loadState())
+        XCTAssertEqual(journal.endedSession, marker)
+        XCTAssertFalse(journal.sleepDisabledByUs)
+
+        let callsBefore = agent.calls.count
+        try await runAgent(expecting: 1)
+        XCTAssertTrue(logText().contains("already ended (recorded in \(h.home.paths.stateFile.path) (endedSession))"), logText())
+        XCTAssertFalse(agent.calls.dropFirst(callsBefore).contains("pmset -g batt"), "no checks for a session recorded as ended")
+
+        try setImmutable(h.home.paths.sessionFile, false)
+        try await runAgent(expecting: 0)
+        XCTAssertNil(try h.store.loadSession())
+        let third = h.makeManager()
+        await third.reconcile()
+        XCTAssertFalse(third.isActive)
+        XCTAssertFalse(sleepHeldAgain(since: before), "\(h.guardFake.calls)")
+    }
+
+    /// The same end, then every file made writable again before the
+    /// relaunch: the session is ended and its file removed, and sleep is
+    /// not held again.
+    func testACutoffThatCanRecordNothingIsNotResumedOnceEveryFileCanBeWritten() async throws {
+        try await endWithNothingRecorded()
+        for file in [h.home.paths.sessionFile, h.home.paths.endedSessionFile, h.home.paths.stateFile] {
+            try setImmutable(file, false)
+        }
+
+        let before = h.guardFake.calls.count
+        let next = h.makeManager()
+        await next.reconcile()
+
+        XCTAssertFalse(next.isActive, "a session the agent ended must not come back")
+        XCTAssertFalse(sleepHeldAgain(since: before), "\(h.guardFake.calls)")
+        XCTAssertTrue(logText().contains(undoneHoldLine), logText())
+        XCTAssertNil(try h.store.loadSession())
+        let journal = try XCTUnwrap(try h.store.loadState())
+        XCTAssertFalse(journal.isDirty)
+        XCTAssertNil(journal.endedSession)
     }
 }

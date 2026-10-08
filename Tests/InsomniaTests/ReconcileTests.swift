@@ -59,7 +59,7 @@ final class ReconcileTests: XCTestCase {
 
         XCTAssertEqual(m.session, s)
         XCTAssertTrue(m.isActive)
-        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1"])
+        XCTAssertEqual(h.guardFake.calls, ["pmset -g", "disablesleep 1"], "the journaled hold is confirmed first")
         XCTAssertEqual(m.scheduledDeadline, s.endsAt)
         XCTAssertEqual(h.backstop.arms, 1)
         XCTAssertEqual(m.remainingText, "2h 14m")
@@ -75,6 +75,50 @@ final class ReconcileTests: XCTestCase {
         await m.reconcile()
         XCTAssertEqual(try h.store.loadState()?.sleepDisabledByUs, true)
         XCTAssertEqual(h.guardFake.calls, ["disablesleep 1"])
+    }
+
+    // (b'') valid session whose journaled hold no longer holds: pmset reads
+    // SleepDisabled 0, so the disable was undone while Insomnia was not
+    // running (here by hand; in JournaledSessionEndTests by an agent end
+    // that could record nothing). Ended from the journal, not held again.
+    func testAValidSessionWhoseJournaledHoldWasUndoneIsEndedNotResumed() async throws {
+        let now = h.clock.now
+        try h.store.saveSession(Session(startedAt: now.addingTimeInterval(-600), endsAt: now.addingTimeInterval(3600)))
+        var st = RuntimeState()
+        st.sleepDisabledByUs = true
+        try h.store.saveState(st)
+        h.guardFake.sleepDisabled = false
+
+        let m = h.makeManager()
+        await m.reconcile()
+
+        XCTAssertFalse(m.isActive)
+        XCTAssertFalse(h.guardFake.calls.contains("disablesleep 1"), "\(h.guardFake.calls)")
+        XCTAssertFalse(h.guardFake.sleepDisabled)
+        XCTAssertNil(try h.store.loadSession())
+        XCTAssertEqual(try h.store.loadState()?.isDirty, false)
+        XCTAssertEqual(h.notifier.posts.last?.title, "Sleep restored")
+    }
+
+    // (b''') the same session when pmset -g cannot be read: the hold
+    // cannot be confirmed, so the session ends instead of being held again.
+    func testAValidSessionWhoseJournaledHoldCannotBeConfirmedIsEndedNotResumed() async throws {
+        let now = h.clock.now
+        try h.store.saveSession(Session(startedAt: now.addingTimeInterval(-600), endsAt: now.addingTimeInterval(3600)))
+        var st = RuntimeState()
+        st.sleepDisabledByUs = true
+        try h.store.saveState(st)
+        h.guardFake.sleepDisabled = true
+        h.guardFake.throwOn = ["pmset -g"]
+
+        let m = h.makeManager()
+        await m.reconcile()
+
+        XCTAssertFalse(m.isActive)
+        XCTAssertFalse(h.guardFake.calls.contains("disablesleep 1"), "\(h.guardFake.calls)")
+        XCTAssertTrue(h.guardFake.calls.contains("disablesleep 0"), "\(h.guardFake.calls)")
+        XCTAssertNil(try h.store.loadSession())
+        XCTAssertEqual(try h.store.loadState()?.isDirty, false)
     }
 
     // (c) no session, no journal entry, but pmset reports SleepDisabled:
@@ -598,12 +642,13 @@ final class ReconcileTests: XCTestCase {
         var st = RuntimeState()
         st.sleepDisabledByUs = true
         try h.store.saveState(st)
+        h.guardFake.sleepDisabled = true // the crashed session's hold
 
         let m = h.makeManager()
         await m.reconcile()
 
         XCTAssertEqual(m.session, s)
-        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1"])
+        XCTAssertEqual(h.guardFake.calls, ["pmset -g", "disablesleep 1"])
     }
 
     func testDeadlineTimerFiresEnd() async throws {

@@ -1426,7 +1426,7 @@ final class SessionManager {
                     : journalSessionEnd() ? "state.json" : nil
                 let relaunch = recordedIn != nil
                     ? "its end is recorded, so a relaunch will not resume it"
-                    : "a relaunch that can write state.json again could hold sleep again for it"
+                    : "a relaunch that can write state.json while sleep is still disabled could hold sleep again for it"
                 retainedBecause = "session.json could not be removed (\(error.localizedDescription)); \(relaunch)."
                 fail("could not remove session.json: \(error.localizedDescription)" + (recordedIn.map { "; its end is recorded in \($0)" } ?? "; its end could not be recorded either"))
             }
@@ -2357,6 +2357,31 @@ final class SessionManager {
             // sleep. Any failure ends the session rather than holding sleep
             // with nothing guaranteed to release it.
             session = s
+            // A disable the journal records must still be in effect. Only an
+            // end undoes it, and nothing outside this transaction can run one
+            // now (the recovery lock), so a bit that reads 0 was set back
+            // while no Insomnia ran: by an agent end that could neither
+            // remove session.json nor record the end anywhere (it restores
+            // sleep and keeps the entry), by hand, or never set by a start
+            // that died before its pmset. Holding sleep again would revive a
+            // session that was ended, so it ends here, and the end is
+            // recorded wherever it can be now. A read that fails cannot
+            // confirm the hold, so it ends the session too.
+            if state.sleepDisabledByUs {
+                let held: Bool
+                do {
+                    held = try await sleepGuard.isSleepDisabled()
+                } catch {
+                    fail("could not read SleepDisabled for the session on disk: \(error.localizedDescription); ending it")
+                    _ = await performEnd(reason: .recoveryUnavailable)
+                    return
+                }
+                guard held else {
+                    Log.error("reconcile: session.json holds a session whose sleep hold was undone while Insomnia was not running: sleepDisabledByUs is journaled but SleepDisabled reads 0 (a recovery agent end that could record nothing, a hand-run pmset, or a start that died before disabling sleep); ending it, not resuming")
+                    _ = await performEnd(reason: .backstop)
+                    return
+                }
+            }
             do {
                 try await backstop.arm()
             } catch {
@@ -2368,8 +2393,10 @@ final class SessionManager {
             // resumes only from a journal this process can write. An agent
             // run that ended the session but could neither remove
             // session.json nor record the end anywhere leaves just that
-            // flag behind, and the write that fails here keeps the session
-            // it ended from resuming.
+            // flag behind; when its restore failed as well, the bit still
+            // reads 1 above, and the write that fails here keeps the
+            // session it ended from resuming while state.json stays
+            // unwritable.
             do {
                 try journal { $0.sleepDisabledByUs = true }
             } catch {

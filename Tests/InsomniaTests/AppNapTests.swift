@@ -212,6 +212,7 @@ final class AppNapTests: XCTestCase {
         var st = RuntimeState()
         st.sleepDisabledByUs = true
         try h.store.saveState(st)
+        h.guardFake.sleepDisabled = true // the crashed session's hold
         let m = makeManager(optIn: true, agents: [chrome, terminal])
         let file = h.home.paths.stateFile.path
         let gate = AsyncGate()
@@ -244,6 +245,7 @@ final class AppNapTests: XCTestCase {
         var st = RuntimeState()
         st.sleepDisabledByUs = true
         try h.store.saveState(st)
+        h.guardFake.sleepDisabled = true // the crashed session's hold
         let m = makeManager(optIn: true, agents: [chrome, terminal])
         let file = h.home.paths.stateFile.path
         try FileManager.default.setAttributes([.immutable: true], ofItemAtPath: file)
@@ -332,6 +334,7 @@ final class AppNapTests: XCTestCase {
         try h.store.saveState(st)
         // Chrome: journaled, then the crash came before or after the write.
         h.appNap.values = [chrome: true, terminal: false]
+        h.guardFake.sleepDisabled = true // the crashed session's hold
 
         let m = makeManager(optIn: true, agents: [chrome, terminal])
         await m.reconcile()

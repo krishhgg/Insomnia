@@ -3,10 +3,11 @@ import Foundation
 
 /// A copy of backstop.sh whose tools are fakes in `dir`, for tests that run
 /// the real agent beside a SessionManager on the same INSOMNIA_HOME: pmset
-/// reports an internal battery at 25% on battery power, notifyutil the
-/// thermal pressure level set with `setThermal`, sudo succeeds. Each call
-/// is recorded in dir/calls, and each sudo call also copies state.json as it
-/// was at that moment to dir/state-at-sudo (removed when there is none).
+/// reports an internal battery on battery power at 25% or the level set
+/// with `setBattery`, notifyutil the thermal pressure level set with
+/// `setThermal`, sudo succeeds. Each call is recorded in dir/calls, and
+/// each sudo call also copies state.json as it was at that moment to
+/// dir/state-at-sudo (removed when there is none).
 struct PatchedBackstop {
     let dir: URL
     let script: URL
@@ -25,14 +26,16 @@ struct PatchedBackstop {
         try fm.createDirectory(at: dir, withIntermediateDirectories: true)
         let calls = dir.appendingPathComponent("calls").path
         let thermal = dir.appendingPathComponent("thermal").path
+        let battery = dir.appendingPathComponent("battery").path
         let stateAtSudo = dir.appendingPathComponent("state-at-sudo").path
         let state = home.appendingPathComponent("state.json").path
         try "0".write(toFile: thermal, atomically: true, encoding: .utf8)
+        try "25".write(toFile: battery, atomically: true, encoding: .utf8)
         let fakes: [String: String] = [
             "PMSET": #"""
             printf 'pmset %s\n' "$*" >> '\#(calls)'
             [[ "$*" == "-g batt" ]] || exit 99
-            printf "Now drawing from 'Battery Power'\n -InternalBattery-0 (id=4567)\t25%%; discharging; 1:00 remaining present: true\n"
+            printf "Now drawing from 'Battery Power'\n -InternalBattery-0 (id=4567)\t%s%%; discharging; 1:00 remaining present: true\n" "$(cat '\#(battery)')"
             """#,
             "NOTIFYUTIL": #"""
             printf 'notifyutil %s\n' "$*" >> '\#(calls)'
@@ -72,6 +75,10 @@ struct PatchedBackstop {
 
     func setThermal(_ level: Int) throws {
         try "\(level)".write(to: dir.appendingPathComponent("thermal"), atomically: true, encoding: .utf8)
+    }
+
+    func setBattery(_ percent: Int) throws {
+        try "\(percent)".write(to: dir.appendingPathComponent("battery"), atomically: true, encoding: .utf8)
     }
 
     /// One run, as launchd starts it. Returns its exit status.

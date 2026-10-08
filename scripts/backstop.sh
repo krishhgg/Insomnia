@@ -881,28 +881,67 @@ app_alive() {
 # plutil -extract raw prints a string and a number alike; the type comes from
 # plutil -type. JSONDecoder reads any number that is exactly an integer as an
 # Int (30.0, 3e1), so a float counts when it is whole. Its raw form is
-# rounded to six places, so the test reads the XML form, which prints the
-# shortest exact value ("30", "0.0", "30.000000100000001"). More than 18
-# digits is past what the shell can compare; the default stands for it.
+# rounded to six places, so the test reads the XML form, which prints 17
+# significant digits less trailing zeros: plain below 1e17 ("30", "0.0",
+# "30.000000100000001"), in exponent form from there ("9.2e+18"), where
+# every double is whole.
+#
+# config_int clamps the value to min...max as the app does (Config's
+# agentCutoffs), and the app takes any Int, -9223372036854775808 through
+# 9223372036854775807; past that it rejects the file, and the default
+# stands. Shell arithmetic wraps at that range, so it never sees such a
+# value: 19 digits are compared in two halves, and a float in exponent
+# form by its exponent, then its 17 digits against 2^63, which prints as
+# 9.2233720368547758e+18 (the app takes a double that an Int holds, so
+# -2^63 counts and 2^63 does not). The few texts plutil rounds to -2^63
+# that the app still rejects (-9223372036854775809) are clamped too; the
+# app runs no session while a file it rejects is in place. Only a number
+# of up to 18 digits is computed with.
 #
 # config.json is opened only when it is a regular file, as session.json and
 # state.json are: open(2) on a FIFO with no writer blocks while this run
 # holds the recovery lock. Anything else reads as a missing file, as the app
 # treats it (Store.readData; the app then moves it aside).
 config_is_file() { [[ -f "$CONFIG" ]]; }
-config_int() { # key default
-  local t="" v=""
+config_int() { # key default min max, with 0 <= min <= max
+  local t="" v="" m="" limit
   config_is_file && t="$(type_of "$CONFIG" "$1")"
   if [[ "$t" == integer ]]; then
     v="$(extract "$CONFIG" "$1" || true)"
+    if [[ "$v" =~ ^-?([0-9]{19,})$ ]]; then
+      m="${BASH_REMATCH[1]}"
+      limit=6854775807
+      [[ "$v" == -* ]] && limit=6854775808
+      (( ${#m} == 19 && (10#${m:0:9} < 922337203 || (10#${m:0:9} == 922337203 && 10#${m:9} <= limit)) )) || v=""
+    fi
   elif [[ "$t" == float ]]; then
     v="$("$PLUTIL" -extract "$1" xml1 -o - "$CONFIG" 2>/dev/null | sed -n 's:.*<real>\(.*\)</real>.*:\1:p' || true)"
-    [[ "$v" == 0.0 || "$v" == -0.0 ]] && v=0
+    if [[ "$v" =~ ^(-?[0-9]+)\.0+$ ]]; then
+      v="${BASH_REMATCH[1]}"
+    elif [[ "$v" =~ ^(-?)([1-9])(\.([0-9]{1,16}))?e\+([0-9]{2})$ ]]; then
+      # The 17 digits stand in for the value: an Int this size is clamped
+      # by its sign alone.
+      m="${BASH_REMATCH[2]}${BASH_REMATCH[4]}0000000000000000"
+      m="${m:0:17}"
+      limit=92233720368547758
+      [[ -n "${BASH_REMATCH[1]}" ]] && limit=$((limit + 1))
+      if (( 10#${BASH_REMATCH[5]} < 18 || (10#${BASH_REMATCH[5]} == 18 && 10#$m < limit) )); then
+        v="${BASH_REMATCH[1]}$m"
+      else
+        v=""
+      fi
+    fi
   fi
-  if [[ "$v" =~ ^(-?)([0-9]{1,18})$ ]]; then
-    echo "${BASH_REMATCH[1]}$((10#${BASH_REMATCH[2]}))"
-  else
+  if [[ ! "$v" =~ ^(-?)0*([0-9]+)$ ]]; then
     echo "$2"
+  elif [[ -n "${BASH_REMATCH[1]}" && "${BASH_REMATCH[2]}" != 0 ]]; then
+    echo "$3"
+  elif (( ${#BASH_REMATCH[2]} > 18 || 10#${BASH_REMATCH[2]} > $4 )); then
+    echo "$4"
+  elif (( 10#${BASH_REMATCH[2]} < $3 )); then
+    echo "$3"
+  else
+    echo "$((10#${BASH_REMATCH[2]}))"
   fi
 }
 config_bool() { # key default
@@ -931,10 +970,9 @@ battery_cutoff() {
   local out="" rc=0 floor percent source line
   local source_re="Now drawing from '([^']*)'" percent_re='[[:space:]]([0-9]+)%;'
   battery_reason=""
-  floor="$(config_int endFloor 10)"
   # The app clamps the end floor to 0...95 (Config.normalizeFloors), so a
   # negative one is off, as 0 is.
-  (( floor > 95 )) && floor=95
+  floor="$(config_int endFloor 10 0 95)"
   (( floor > 0 )) || return 1
   run_read out "$PMSET" -g batt || rc=$?
   if (( rc == 124 )); then
@@ -1114,7 +1152,7 @@ if [[ "$session_state" == valid ]] && ! remove_session; then
     log error "could not remove $SESSION or record its end in $ENDED; its end is recorded in $STATE (endedSession) instead, so Insomnia restores the session instead of resuming it. Every run retries the removal"
   else
     keep_sleep_entry=1
-    log error "could not remove $SESSION or record its end in $ENDED or $STATE. Sleep is restored anyway, but sleepDisabledByUs stays journaled and every run exits 1 until the file can be removed (ls -lO shows its flags); Insomnia resumes no session until it can write $STATE"
+    log error "could not remove $SESSION or record its end in $ENDED or $STATE. Sleep is restored anyway, but sleepDisabledByUs stays journaled and every run exits 1 until the file can be removed (ls -lO shows its flags); Insomnia does not resume a session whose journaled sleep hold pmset no longer reports, and resumes none while it cannot write $STATE"
   fi
 fi
 

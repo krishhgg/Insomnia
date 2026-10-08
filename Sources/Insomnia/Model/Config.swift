@@ -327,7 +327,7 @@ extension Config {
     }
 
     /// What the agent enforces while config.json is missing:
-    /// `config_int endFloor 10` and `config_bool thermalRules true`, the
+    /// `config_int endFloor 10 0 95` and `config_bool thermalRules true`, the
     /// app's defaults.
     static let agentDefaultCutoffs = AgentCutoffs(endFloor: 10, thermalRules: true)
 }

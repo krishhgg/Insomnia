@@ -6,8 +6,9 @@ import XCTest
 /// cutoffs: FloorRules on `manager.config`, and backstop.sh on the endFloor
 /// and thermalRules keys of config.json. These tests take the two through
 /// each way they could part (a deleted file, a Settings change that could
-/// not be saved, a file repaired or edited by hand) and then ask both, with
-/// the battery at 25% on battery power and the thermal pressure level at 3
+/// not be saved, a file repaired or edited by hand, an end floor far
+/// outside 0...95) and then ask both, with the battery at 25% on battery
+/// power (or the level a test names) and the thermal pressure level at 3
 /// (critical) or 0. The agent is the real backstop.sh with its tools
 /// patched to fakes, run with the app's alive lock held.
 @MainActor
@@ -52,10 +53,10 @@ final class CutoffAgreementTests: XCTestCase {
 
     // MARK: Both sides
 
-    /// Whether FloorRules ends the session on the app's settings at 25% on
-    /// battery power, at critical or nominal heat.
-    private func appEnds(_ m: SessionManager, critical: Bool) -> Bool {
-        FloorRules.evaluate(battery: .percent(25), isCharging: false, thermal: critical ? .critical : .nominal,
+    /// Whether FloorRules ends the session on the app's settings at
+    /// `battery` percent on battery power, at critical or nominal heat.
+    private func appEnds(_ m: SessionManager, critical: Bool, battery: Int = 25) -> Bool {
+        FloorRules.evaluate(battery: .percent(battery), isCharging: false, thermal: critical ? .critical : .nominal,
                             lidClosed: false, lowPowerSetByUs: false, config: m.config)
             .contains { if case .endSession = $0 { true } else { false } }
     }
@@ -279,5 +280,120 @@ final class CutoffAgreementTests: XCTestCase {
         XCTAssertEqual(m.config.endFloor, 50)
         XCTAssertEqual(m.config.lowPowerFloor, 55, "raised above the new end floor")
         try await assertBoth(m, critical: false, end: true)
+    }
+
+    // MARK: End floors outside 0...95
+
+    /// endFloor as written in config.json, and the floor the app takes from
+    /// it, clamped to 0...95, or nil where the app rejects the file. Swift
+    /// decodes an Int from -2^63 through 2^63 - 1, and a number written as
+    /// a float when its Double is whole and an Int holds it; anything else
+    /// (a fraction, a string, a bool) fails the whole file. The texts
+    /// around 2^63 are the last that decode on each side and the first
+    /// that do not.
+    private static let endFloorsWrittenAsIntegers: [(text: String, app: Int?)] = [
+        ("0", 0), ("-1", 0), ("5", 5), ("94", 94), ("95", 95), ("96", 95), ("200", 95),
+        ("999999999999999999", 95), ("1000000000000000000", 95),
+        ("9223372036854775806", 95), ("9223372036854775807", 95),
+        ("-999999999999999999", 0), ("-1000000000000000000", 0),
+        ("-9223372036854775807", 0), ("-9223372036854775808", 0),
+        ("9223372036854775808", nil), ("18446744073709551615", nil), ("99999999999999999999", nil),
+    ]
+
+    private static let endFloorsWrittenAsFloats: [(text: String, app: Int?)] = [
+        ("30.0", 30), ("3e1", 30), ("29.999999999999999999", 30), ("0.0", 0), ("-0.0", 0),
+        ("1e2", 95), ("1e16", 95), ("1e17", 95), ("123456789012345678.5", 95),
+        ("9.2e18", 95), ("-9.2e18", 0), ("9223372036854775295.0", 95), ("-9223372036854775807.0", 0),
+        ("9223372036854775296.0", nil), ("1e19", nil), ("-1e19", nil),
+        ("30.5", nil), ("-0.5", nil), ("1e-1", nil), (#""30""#, nil), ("true", nil),
+    ]
+
+    /// A session on disk whose journal holds sleep, as the app leaves one,
+    /// and one agent run at `percent` on battery power and nominal heat.
+    /// Returns whether it ended the session.
+    private func agentEnds(atBattery percent: Int, file: StaticString = #filePath, line: UInt = #line) async throws -> Bool {
+        let now = h.clock.now
+        try h.store.saveSession(Session(startedAt: now, endsAt: now.addingTimeInterval(3600)))
+        var journal = RuntimeState()
+        journal.sleepDisabledByUs = true
+        try h.store.saveState(journal)
+        try agent.setThermal(0)
+        try agent.setBattery(percent)
+        let exit = try await agent.run()
+        XCTAssertEqual(exit, 0, logText(), file: file, line: line)
+        return try h.store.loadSession() == nil
+    }
+
+    /// For each text, the floor the agent enforces on that config.json is
+    /// the one the app takes from it, or the agent's default 10% where the
+    /// app rejects the file: the agent ends a session one point below it
+    /// and keeps it at it (at 0%, for a floor of 0, which is off).
+    private func assertTheAgentFollowsTheApp(_ table: [(text: String, app: Int?)],
+                                             file: StaticString = #filePath, line: UInt = #line) async throws {
+        for (text, expected) in table {
+            try Data(#"{"endFloor": \#(text), "thermalRules": false}"#.utf8).write(to: h.home.paths.configFile)
+            let app = try? h.store.loadConfig()?.agentCutoffs.endFloor
+            XCTAssertEqual(app, expected, "the app on endFloor \(text)", file: file, line: line)
+            let floor = app ?? Config.agentDefaultCutoffs.endFloor
+            if floor > 0 {
+                let below = try await agentEnds(atBattery: floor - 1, file: file, line: line)
+                XCTAssertTrue(below, "endFloor \(text): the agent keeps a session at \(floor - 1)%: \(logText())", file: file, line: line)
+            }
+            let at = try await agentEnds(atBattery: floor, file: file, line: line)
+            XCTAssertFalse(at, "endFloor \(text): the agent ends a session at \(floor)%: \(logText())", file: file, line: line)
+        }
+    }
+
+    func testTheAgentEnforcesTheEndFloorTheAppTakesFromAnyInteger() async throws {
+        try await assertTheAgentFollowsTheApp(Self.endFloorsWrittenAsIntegers)
+    }
+
+    func testTheAgentEnforcesTheEndFloorTheAppTakesFromAnyFloat() async throws {
+        try await assertTheAgentFollowsTheApp(Self.endFloorsWrittenAsFloats)
+    }
+
+    /// The reviewer's case: config.json holds endFloor Int.max and cannot
+    /// be written, so the app cannot put the 95 it clamps that to in its
+    /// place. Start accepts the file, since both sides read it, and at 25%
+    /// both end the session. The same agent run on a file holding the
+    /// app's settings is the control.
+    func testAnEndFloorOfIntMaxThatCannotBeRewrittenIsNinetyFiveOnBothSides() async throws {
+        try await assertAnUnwritableEndFloor(Int.max, battery: 25, ends: true)
+    }
+
+    /// Int.min, which the app clamps to 0 (off): at 5% both keep the
+    /// session, where the agent's default 10% would end it.
+    func testAnEndFloorOfIntMinThatCannotBeRewrittenIsOffOnBothSides() async throws {
+        try await assertAnUnwritableEndFloor(Int.min, battery: 5, ends: false)
+    }
+
+    private func assertAnUnwritableEndFloor(_ value: Int, battery: Int, ends expected: Bool,
+                                            file: StaticString = #filePath, line: UInt = #line) async throws {
+        var c = Config()
+        c.endFloor = value
+        c.thermalRules = false
+        try h.store.saveConfig(c)
+        let written = try Data(contentsOf: h.home.paths.configFile)
+        try setImmutable(h.home.paths.configFile, true)
+        let m = h.makeManager()
+        await m.reconcile()
+        await m.start(duration: 3600)
+        XCTAssertTrue(m.isActive, file: file, line: line)
+        XCTAssertNil(m.rejectedConfigFile, file: file, line: line)
+        XCTAssertEqual(try Data(contentsOf: h.home.paths.configFile), written, "the file still holds \(value)", file: file, line: line)
+        XCTAssertEqual(appEnds(m, critical: false, battery: battery), expected, "the app on \(m.config.agentCutoffs.description)", file: file, line: line)
+
+        try agent.setBattery(battery)
+        let exit = try await agent.run()
+        XCTAssertEqual(exit, 0, logText(), file: file, line: line)
+        let ended = try h.store.loadSession() == nil
+        XCTAssertEqual(ended, expected, "the agent on endFloor \(value) at \(battery)%: \(logText())", file: file, line: line)
+        XCTAssertEqual(agent.calls.contains(agent.restoreCall), expected, agent.calls.joined(separator: "\n"), file: file, line: line)
+
+        try setImmutable(h.home.paths.configFile, false)
+        try h.store.saveConfig(m.config)
+        XCTAssertEqual(try h.store.loadConfig()?.endFloor, m.config.agentCutoffs.endFloor, file: file, line: line)
+        let control = try await agentEnds(atBattery: battery, file: file, line: line)
+        XCTAssertEqual(control, expected, "the agent on the app's settings: \(logText())", file: file, line: line)
     }
 }

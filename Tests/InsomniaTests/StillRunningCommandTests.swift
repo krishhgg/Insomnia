@@ -313,7 +313,7 @@ final class StillRunningCommandTests: XCTestCase {
 
         XCTAssertEqual(m.session, session)
         XCTAssertNil(h.store.loadUnfinishedCommand())
-        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1", "pmset -g custom", "lowpowermode 0"])
+        XCTAssertEqual(h.guardFake.calls, ["pmset -g", "disablesleep 1", "pmset -g custom", "lowpowermode 0"])
         XCTAssertEqual(try h.store.loadState()?.lowPowerSetByUs, false, "ownership of a mode that is off was kept")
 
         await floors.run(battery: .percent(30), isCharging: false, thermal: .nominal, lidClosed: false)
@@ -386,7 +386,7 @@ final class StillRunningCommandTests: XCTestCase {
         await waitUntil("the resumed session was never checked against the mode") { resyncs.value == [false] }
 
         XCTAssertEqual(m.session, session)
-        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1", "pmset -g custom", "lowpowermode 0"])
+        XCTAssertEqual(h.guardFake.calls, ["pmset -g", "disablesleep 1", "pmset -g custom", "lowpowermode 0"])
         XCTAssertEqual(try h.store.loadState()?.lowPowerSetByUs, false, "ownership of a mode that is off was kept")
         await floors.run(battery: .percent(30), isCharging: false, thermal: .nominal, lidClosed: false)
         XCTAssertTrue(h.guardFake.lowPowerOn, "the Low Power Mode floor did not act on the resumed session")
@@ -663,7 +663,7 @@ final class StillRunningCommandTests: XCTestCase {
         await m.reconcile()
 
         XCTAssertNil(m.session)
-        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1", "disablesleep 1"])
+        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1", "pmset -g", "disablesleep 1"])
         XCTAssertEqual(m.pendingEnd, .recoveryUnavailable)
         XCTAssertNotNil(try h.store.loadSession())
         XCTAssertEqual(try h.store.loadState()?.sleepDisabledByUs, true)
@@ -672,7 +672,7 @@ final class StillRunningCommandTests: XCTestCase {
         h.guardFake.stillRunning = []
         h.guardFake.exitStuckCommands()
         await waitUntil("pending end never retried") { m.pendingEnd == nil }
-        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1", "disablesleep 1", "disablesleep 0"])
+        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1", "pmset -g", "disablesleep 1", "disablesleep 0"])
         XCTAssertNil(try h.store.loadSession())
         XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
         XCTAssertFalse(try lockIsHeld())

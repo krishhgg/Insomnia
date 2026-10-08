@@ -470,12 +470,14 @@ When `pmset` lists no internal battery, the backstop asks `ioreg` for the
 is a desktop, and with one but no charger reported (`ExternalConnected`) the
 battery counts as unreadable and the session ends. It reads `endFloor` as the
 app decodes it, so a whole float such as `30.0` is 30, and clamps it to 0
-through 95 as `Config.normalizeFloors` does. The backstop reads the scalar
-keys `endFloor` and `thermalRules` from config.json directly, not through the
-app's decoder, so it cannot tell whether the app accepted the file. The app
-therefore takes those two values from a file that decodes, runs no session
-while a config.json it rejected stays in place, and writes its settings
-where the file is missing (section 10).
+through 95 as `Config.normalizeFloors` does, over the whole range of a Swift
+`Int`: 9223372036854775807 is 95 and -9223372036854775808 is 0 on both
+sides. The backstop reads the scalar keys `endFloor` and `thermalRules` from
+config.json directly, not through the app's decoder, so it cannot tell
+whether the app accepted the file. The app therefore takes those two values
+from a file that decodes, runs no session while a config.json it rejected
+stays in place, and writes its settings where the file is missing (section
+10).
 Performance effects depend on workload.
 
 ### 7. Network failover
@@ -644,7 +646,12 @@ Reconcile runs at every Insomnia launch:
    files in place.
 2. Session valid → establish the independent recovery agent before reapplying
    the sleep guard, then resume observers. If the lid is open, restore recorded
-   lid-close actions. Arming or restoration errors must remain visible.
+   lid-close actions. Arming or restoration errors must remain visible. A
+   journal that says Insomnia disabled sleep must find `SleepDisabled 1`
+   first: a 0 means the hold was undone while no Insomnia ran (an agent end
+   that could record nothing, a hand-run `pmset`, a start that died before
+   its `pmset`), and a read that fails cannot confirm it. Either way the
+   session is ended as in step 1, not resumed.
 3. `pmset -g` reports `SleepDisabled 1` with no session and no journal
    entry → leave it. Step 1 has already undone a disable Insomnia journaled,
    so this one was set by something else (a hand-run `pmset`, another tool)
@@ -769,8 +776,13 @@ Backstop, independent of the app:
   `session.json` and after it removes one, so a record of one session never
   ends another. If no record can be written, the agent still restores sleep
   but keeps the `sleepDisabledByUs` entry and exits 1, so the journal stays
-  dirty and uninstall stops. The app writes the journal before it resumes
-  any session, so it resumes none while `state.json` cannot be written.
+  dirty and uninstall stops. A relaunch then finds that entry while `pmset`
+  reports `SleepDisabled 0`, and ends the session instead of resuming it
+  (step 2 in Reconcile), recording the end where it can; this holds once
+  `state.json`, or every file, can be written again. The app also writes the
+  journal before it resumes any session, so it resumes none while
+  `state.json` cannot be written, which covers an agent whose restore failed
+  as well.
 - The battery and thermal reads have the undo commands' time limit but never
   hold the lock: they run with its descriptor closed, and one that ignores
   SIGTERM gets SIGKILL. A hung read fails only its own check, never the next

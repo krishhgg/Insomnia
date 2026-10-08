@@ -24,6 +24,7 @@ final class ReconcileLidGatingTests: XCTestCase {
         st.savedKeyboardBrightness = 0.3
         try h.store.saveState(st)
         h.procs.stoppedNow = [111, 222]
+        h.guardFake.sleepDisabled = true // the crashed session's hold
         return s
     }
 
@@ -47,7 +48,7 @@ final class ReconcileLidGatingTests: XCTestCase {
         XCTAssertEqual(after.savedDisplayBrightness, 0.8)
         XCTAssertEqual(after.savedKeyboardBrightness, 0.3)
         XCTAssertEqual(m.state, after)
-        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1"])
+        XCTAssertEqual(h.guardFake.calls, ["pmset -g", "disablesleep 1"])
         XCTAssertFalse(m.countdownTimerArmed, "the session resumed under a closed lid redraws every second")
     }
 
@@ -62,6 +63,7 @@ final class ReconcileLidGatingTests: XCTestCase {
         st.savedDisplayBrightness = 0.8
         st.savedKeyboardBrightness = 0.3
         try h.store.saveState(st)
+        h.guardFake.sleepDisabled = true // the crashed session's hold
         h.clamshell.closed = true
         let m = h.makeManager()
         await m.reconcile()
