@@ -354,9 +354,9 @@ struct Store: Sendable {
         case record(String)
         /// Read, and not one whole record (the text says why): a write cut
         /// short, other bytes, or more bytes than any record. It ends no
-        /// session. No writer counts a record before it reads it back
-        /// whole, so a write cut short was never taken for an end, and the
-        /// end it was for is in the log or still to be recorded. It is
+        /// session, unless it is the record of the session in session.json
+        /// cut short as a writer leaves it (`lockHoldsRecordCutShort`),
+        /// which counts as that session's end. Content that ends nothing is
         /// emptied like a stale record (backstop.sh's
         /// remove_stale_lock_record, `deleteSession`, a start), and a
         /// record written here replaces it.
@@ -443,16 +443,20 @@ struct Store: Sendable {
 
     /// Where the recovery lock file records the end of the session in
     /// session.json, for the log, or nil when it does not: a record of
-    /// exactly that file's bytes, or a file that cannot be read whole,
-    /// which may hold one (`LockEndRecord.unreadable`). Content read whole
-    /// that is not a record ends nothing (`LockEndRecord.foreign`). Nothing
-    /// is recorded for a session.json that is not a regular file.
+    /// exactly that file's bytes, that record cut short as a writer leaves
+    /// it (`lockHoldsRecordCutShort`), or a file that cannot be read whole,
+    /// which may hold one (`LockEndRecord.unreadable`). Other content read
+    /// whole that is not a record ends nothing (`LockEndRecord.foreign`).
+    /// Nothing is recorded for a session.json that is not a regular file.
     func sessionEndRecordedInLock() -> String? {
         var st = stat()
         guard stat(paths.sessionFile.path, &st) == 0, st.st_mode & S_IFMT == S_IFREG else { return nil }
         switch lockEndRecord() {
-        case .none, .foreign:
+        case .none:
             return nil
+        case .foreign:
+            guard let encoded = sessionEndMarker(), lockHoldsRecordCutShort(of: encoded) else { return nil }
+            return "\(paths.recoveryLock.lastPathComponent), which holds this session's end record cut short, so it counts as one"
         case let .unreadable(why):
             return "\(paths.recoveryLock.lastPathComponent), which \(why), so it may hold this session's end and counts as one"
         case let .record(encoded):
@@ -460,11 +464,30 @@ struct Store: Sendable {
         }
     }
 
+    /// Whether the recovery lock file holds the record of the session.json
+    /// whose bytes `encoded` holds in base64, cut short as a writer leaves
+    /// it when it stops partway: the record's first bytes and nothing else
+    /// (backstop.sh empties the file, then writes; a write that fails
+    /// partway), or the whole record followed by bytes the file held before
+    /// (`RecoveryLockHandle.replaceContents` writes over the old bytes
+    /// before it cuts the file to length). A writer was recording that end,
+    /// so it counts as one, the safe side. Other content that is no record
+    /// ends nothing. backstop.sh's lock_holds_record_cut_short reads the
+    /// same way.
+    private func lockHoldsRecordCutShort(of encoded: String) -> Bool {
+        guard case let .bytes(data) = readLockFile(), !data.isEmpty else { return false }
+        let whole = Data("\(Self.lockEndRecordTag) \(encoded)\n".utf8)
+        return data.count < whole.count ? whole.starts(with: data) : data.count > whole.count && data.starts(with: whole)
+    }
+
     /// For an end that could not remove session.json and could write
     /// neither ended-session.json, the journal nor a record aside: the record of its
     /// bytes in the recovery lock file, written through `lock`, the handle
     /// this transaction holds, over anything else there. A record already
-    /// there for these bytes is kept. A file that cannot be read whole
+    /// there for these bytes is kept. Over that record cut short
+    /// (`lockHoldsRecordCutShort`) the write never leaves less of it: the
+    /// first bytes grow into the record, and the record with bytes after it
+    /// is cut to the record. A file that cannot be read whole
     /// counts as an end for readers, but not here: it is written over too,
     /// as no read shows what it holds. True only when the file then reads
     /// back as a whole record of these bytes.

@@ -81,9 +81,10 @@
 #     lock (record_end_in_lock). Each record is written and read back before
 #     anything is undone. While one matches the file, the app restores that
 #     session instead of resuming it, and every run ends it again without
-#     the checks and retries the removal. Lock file content that is not a
-#     whole record (a write cut short) counts as the end of whatever
-#     session.json holds. If no record can be written (neither folder takes
+#     the checks and retries the removal. A lock file that cannot be read,
+#     or that holds session.json's record cut short as a writer leaves it,
+#     counts as the end of that session; other content that is not a whole
+#     record ends nothing. If no record can be written (neither folder takes
 #     a new file, and the lock file is not a regular file this user owns,
 #     or refuses the write too, as on a full disk), sleep is still restored
 #     but its journal entry stays, and the run exits 1. Before it resumes a
@@ -1444,10 +1445,12 @@ remove_stale_end_records_aside() {
 #   record      a whole record; lock_record holds its base64.
 #   foreign     read, and not one whole record: a write cut short, other
 #               bytes, or more bytes than any record (lock_record_why says
-#               which). It ends no session. No writer counts a record
-#               before it reads it back whole, so a write cut short was
-#               never taken for an end. remove_stale_lock_record empties
-#               it, and a record written here replaces it.
+#               which). It ends no session, unless it is the record of the
+#               session in session.json cut short as a writer leaves it
+#               (lock_holds_record_cut_short), which counts as that
+#               session's end. remove_stale_lock_record empties content
+#               that ends nothing, and a record written here replaces it.
+#               lock_content holds content read whole, up to the bound.
 #   unreadable  its size or bytes could not be read (lock_record_why). It
 #               may hold a whole record of the session in session.json, so
 #               it counts as that session's end, the safe side, until it
@@ -1459,11 +1462,13 @@ remove_stale_end_records_aside() {
 lock_record_state=none
 lock_record=""
 lock_record_why=""
+lock_content=""
 read_lock_record() {
   local size content body re="^${LOCK_RECORD_TAG} ([A-Za-z0-9+/]+={0,2})\$"
   lock_record_state=none
   lock_record=""
   lock_record_why=""
+  lock_content=""
   [[ -f "$LOCK" && ! -L "$LOCK" && -O "$LOCK" ]] || return 0
   lock_record_state=unreadable
   size="$("$STAT" -f %z "$LOCK" 2>/dev/null)" || size=""
@@ -1488,7 +1493,12 @@ read_lock_record() {
   content="${content%x}"
   # LC_ALL=C: the length counts bytes. bash drops NUL bytes, so a length
   # other than the size means bytes no record has.
-  if (( ${#content} != size )) || [[ "$content" != *$'\n' ]]; then
+  if (( ${#content} != size )); then
+    lock_record_why="it holds bytes other than one whole end record"
+    return 0
+  fi
+  lock_content="$content"
+  if [[ "$content" != *$'\n' ]]; then
     lock_record_why="it holds bytes other than one whole end record"
     return 0
   fi
@@ -1502,10 +1512,30 @@ read_lock_record() {
   return 0
 }
 
+# Whether the lock file holds the record of session.json's bytes ($1, in
+# base64) cut short as a writer leaves it when it stops partway (content
+# read whole that is no record, see read_lock_record): the record's first
+# bytes and nothing else (record_end_in_lock empties the file, then
+# writes; a write that fails partway), or the whole record followed by
+# bytes the file held before (the app writes over the old bytes before it
+# cuts the file to length). A writer was recording that end, so it counts
+# as one, the safe side. Other content that is no record ends nothing. The
+# app reads the same way (Store.lockHoldsRecordCutShort).
+lock_holds_record_cut_short() {
+  local whole="$LOCK_RECORD_TAG $1"$'\n'
+  [[ "$lock_record_state" == foreign && -n "$lock_content" && -n "$1" ]] || return 1
+  if (( ${#lock_content} < ${#whole} )); then
+    [[ "${whole:0:${#lock_content}}" == "$lock_content" ]]
+  else
+    (( ${#lock_content} > ${#whole} )) && [[ "${lock_content:0:${#whole}}" == "$whole" ]]
+  fi
+}
+
 # Whether the recovery lock file records the end of the session in
-# $SESSION: a record of exactly its bytes, or a file that cannot be read,
-# which may hold one (see read_lock_record). Content read whole that is not
-# a record ends nothing. Sets lock_match_why for the log.
+# $SESSION: a record of exactly its bytes, that record cut short
+# (lock_holds_record_cut_short), or a file that cannot be read, which may
+# hold one (see read_lock_record). Other content read whole that is not a
+# record ends nothing. Sets lock_match_why for the log.
 lock_match_why=""
 end_recorded_in_lock() {
   local current
@@ -1520,6 +1550,11 @@ end_recorded_in_lock() {
       current="$(session_base64)" || return 1
       [[ -n "$current" && "$lock_record" == "$current" ]] || return 1
       lock_match_why="$LOCK"
+      return 0 ;;
+    foreign)
+      current="$(session_base64)" || return 1
+      lock_holds_record_cut_short "$current" || return 1
+      lock_match_why="$LOCK, which holds this session's end record cut short, so it counts as one"
       return 0 ;;
   esac
   return 1
@@ -1537,21 +1572,27 @@ lock_is_held_file() {
 }
 
 # Empty the recovery lock file of what ends nothing: anything in it once
-# session.json is gone, content read whole that is not a record (foreign,
-# see read_lock_record), and a whole record of other bytes than a
-# session.json that can be read. A file that cannot be read stays while
-# session.json is there, and so does a record while session.json is not a
-# regular file or cannot be read: neither is shown to be stale. Emptied in
-# place (the inode stays), only while $LOCK is the file this run holds;
-# never unlinked. Never fails.
+# session.json is gone, and, while session.json is a regular file that can
+# be read, a whole record of other bytes and content read whole that is no
+# record and not its record cut short (foreign, see read_lock_record and
+# lock_holds_record_cut_short). A file that cannot be read stays while
+# session.json is there, and so do a record and other content while
+# session.json is not a regular file or cannot be read: none is shown to
+# be stale. Emptied in place (the inode stays), only while $LOCK is the
+# file this run holds; never unlinked. Never fails.
 remove_stale_lock_record() {
   local current
   read_lock_record
   [[ "$lock_record_state" != none ]] || return 0
-  if [[ "$lock_record_state" != foreign ]] && [[ -e "$SESSION" || -L "$SESSION" ]]; then
-    [[ "$lock_record_state" == record && -f "$SESSION" ]] || return 0
+  if [[ -e "$SESSION" || -L "$SESSION" ]]; then
+    [[ "$lock_record_state" != unreadable && -f "$SESSION" ]] || return 0
     current="$(session_base64)" || return 0
-    [[ -n "$current" && "$lock_record" != "$current" ]] || return 0
+    [[ -n "$current" ]] || return 0
+    if [[ "$lock_record_state" == record ]]; then
+      [[ "$lock_record" != "$current" ]] || return 0
+    elif lock_holds_record_cut_short "$current"; then
+      return 0
+    fi
   fi
   if [[ "$lock_record_state" == foreign ]]; then
     log info "emptying $LOCK: $lock_record_why, which ends no session" || true
@@ -2088,21 +2129,34 @@ record_end_aside() {
 # Record the same end in the recovery lock file (see read_lock_record), for
 # when $ENDED, the journal and both folders refuse it: the file exists
 # already and takes the record in place, keeping its inode. Written only
-# while $LOCK is the regular file this run holds the lock on, over anything
-# else there. A record already there for these bytes is used again. A file
-# that cannot be read counts as an end for readers, but not here: it is
-# written over too, as no read shows what it holds. True only when the
-# file then reads back as exactly that record. A write cut short is never
-# counted, and leaves content that ends no session.
+# while $LOCK is the regular file this run holds the lock on. Content that
+# already counts as this end is never emptied: a record already there for
+# these bytes is used again, and that record's first bytes
+# (lock_holds_record_cut_short) are completed by appending the rest, so a
+# run stopped partway leaves more of it, never less. The whole record with
+# bytes after it, which only `>` could cut, and a file that cannot be read
+# are left as they are; both count as the end for every reader, and the
+# run goes on to the log. Anything else ends nothing for this session and
+# is written over with `>`, which empties the file before it writes: a run
+# stopped in between leaves an empty file or the record's first bytes,
+# where the file held nothing that ended this session either. True only
+# when the file then reads back as exactly that record.
 record_end_in_lock() {
-  local encoded
+  local encoded whole
   encoded="$(session_base64)" || return 1
   [[ -n "$encoded" ]] || return 1
+  whole="$LOCK_RECORD_TAG $encoded"$'\n'
   read_lock_record
   if [[ "$lock_record_state" == record && "$lock_record" == "$encoded" ]]; then return 0; fi
-  (( ${#LOCK_RECORD_TAG} + ${#encoded} + 2 <= LOCK_RECORD_MAX_BYTES )) || return 1
+  [[ "$lock_record_state" != unreadable ]] || return 1
+  (( ${#whole} <= LOCK_RECORD_MAX_BYTES )) || return 1
   lock_is_held_file || return 1
-  { printf '%s %s\n' "$LOCK_RECORD_TAG" "$encoded" > "$LOCK"; } 2>/dev/null || true
+  if lock_holds_record_cut_short "$encoded"; then
+    (( ${#lock_content} < ${#whole} )) || return 1
+    { printf '%s' "${whole:${#lock_content}}" >> "$LOCK"; } 2>/dev/null || true
+  else
+    { printf '%s' "$whole" > "$LOCK"; } 2>/dev/null || true
+  fi
   lock_is_held_file || return 1
   read_lock_record
   [[ "$lock_record_state" == record && "$lock_record" == "$encoded" ]]

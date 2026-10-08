@@ -1096,27 +1096,43 @@ Backstop, independent of the app:
   MiB. Both sides write it in place while they hold the lock (the app
   through the lock's own descriptor, with `pwrite`, `ftruncate` and `fsync`,
   only while the path still names that file, a regular file this user owns;
-  the agent with `>`, only while the path names the file its fd 9 holds, a
-  regular file this user owns, so a write cut short there can also leave an
-  empty file, which is no record and fails the read-back), so the file keeps
+  the agent with `>`, or with `>>` to complete the record's first bytes,
+  only while the path names the file its fd 9 holds, a regular file this
+  user owns; `>` empties the file before it writes, so a run stopped in
+  between leaves an empty file, which is no record, and the agent uses `>`
+  only over content that ends nothing for that session), so the file keeps
   its inode and stays the lock every party takes. Both read it back before
   they undo anything. The lock file is read only while it is a regular file
   this user owns (`lstat`, `O_NOFOLLOW` in the app; `-L`, `-f`, `-O` in the
   agent); anything else holds no record and is never written. Empty content
-  is no record. Content read whole that is no whole record of that form (a
-  write cut short, other bytes, more than 1 MiB) ends no session: no writer
-  counts a record before it reads it back whole, so such content was never
-  taken for an end, and a writer writes its record over it. A lock file
+  is no record. Content read whole that is the record of the bytes in
+  `session.json` cut short as a writer leaves it when it stops partway (the
+  record's first bytes and nothing else, or the whole record followed by
+  bytes the file held before) counts as that session's end, the safe side,
+  since a writer was recording it. No writer empties it: the app writes the
+  record over it, which only adds to it before the cut to length, the agent
+  appends the rest of the first bytes, and the agent leaves the whole record
+  with bytes after it as it is. Other content read whole that is no whole
+  record of that form (other bytes, a record of other bytes cut short, more
+  than 1 MiB) ends no session, and a writer writes its record over it. A
+  record cut short matches only the bytes it has: a stale one is the start
+  of a later session's record too while it stops before the first byte
+  where the two `session.json` files differ, and then ends that session. A
+  start empties the lock file once it has written its new `session.json`,
+  so that takes a start stopped in between, or a person. A lock file
   whose size or bytes cannot be read counts as the end of whatever
   `session.json` holds, since it may hold that record, until it can be read
-  or that file is gone or replaced; no writer takes it for its own record.
+  or that file is gone or replaced; no writer takes it for its own record,
+  and the agent does not write over it.
   The app empties the record when it removes `session.json` and when a
   start replaces it (a start that fails puts it back with the old file,
-  byte for byte), and each agent run empties a record of other bytes,
-  content that is no record, or any content once `session.json` is gone,
-  as it does a stale record aside. `uninstall.sh` empties it in both modes,
-  never removing the file. A start over a `session.json` refuses while the
-  lock file cannot be read, since it could not put a record back; a lock
+  byte for byte). Each agent run empties any content once `session.json`
+  is gone and, while `session.json` is a regular file it can read, a record
+  of other bytes and content that is no record and not that record cut
+  short, as it does a stale record aside. `uninstall.sh` empties it in
+  both modes, never removing the file. A start over a `session.json`
+  refuses while the lock file cannot be read, since it could not put a
+  record back; a lock
   file over 1 MiB holds no record and does not refuse it. A record aside is created exclusively (`mktemp` in the agent,
   `O_EXCL` with a random name in the app), mode 0600, and kept
   only when it reads back identical. Only a regular file of exactly that

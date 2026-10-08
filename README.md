@@ -404,11 +404,15 @@ in a file with such a name in `~/Library/Logs/Insomnia`; and when neither
 folder takes one, in the recovery lock file `.recovery.lock`, which exists
 already. That record is written in place, so the file keeps its inode and
 stays the lock both sides take. A writer counts the record only once it
-reads it back whole, so other content there (a write cut short, other bytes,
-more than 1 MiB) ends no session, and the agent empties it. A lock file that
-cannot be read counts as the end of the saved session, since it may hold
-one. When the lock file takes no write either, the end goes into
-`insomnia.log` as one line holding the saved session's bytes. It counts
+reads it back whole. The saved session's record cut short as a writer leaves
+it when it stops partway (its first bytes, or the whole record followed by
+bytes the file held before) still counts as that session's end, and a writer
+completes it instead of emptying it. Other content there (other bytes, a
+record of other bytes cut short, more than 1 MiB) ends no session, and the
+agent empties it. A lock file that cannot be read counts as the end of the
+saved session, since it may hold one. When the lock file takes no write
+either, the end goes into `insomnia.log` as one line holding the saved
+session's bytes. It counts
 only once it reads back as a whole line, a saved session over 64 KiB is
 never recorded there, and a log that cannot be read or is over 64 MiB holds
 no record for the app or the agent. The app rotates that log only while it

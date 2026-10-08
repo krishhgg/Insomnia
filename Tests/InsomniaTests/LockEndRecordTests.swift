@@ -8,10 +8,13 @@ import XCTest
 /// journal and both folders of records aside refuse the record. The file
 /// exists already, so the record needs no new file; it is written in place,
 /// so the file keeps its inode and stays the lock the app and the agent
-/// take. Content read whole that is not a whole record ends no session; a
-/// file that cannot be read counts as the end of whatever session.json
-/// holds until that file is gone. The agent is the real backstop.sh with
-/// its tools patched to fakes (PatchedBackstop).
+/// take. Content read whole that is not a whole record ends no session,
+/// unless it is the record of the session in session.json cut short as a
+/// writer leaves it (its first bytes, or the whole record with old bytes
+/// after it), which counts as that session's end; a file that cannot be
+/// read counts as the end of whatever session.json holds until that file
+/// is gone. The agent is the real backstop.sh with its tools patched to
+/// fakes (PatchedBackstop).
 @MainActor
 final class LockEndRecordTests: XCTestCase {
     var h: Harness!
@@ -57,6 +60,25 @@ final class LockEndRecordTests: XCTestCase {
         (try? String(contentsOf: h.home.paths.logFile, encoding: .utf8)) ?? ""
     }
 
+    private func logText(since mark: Int) -> String { String(logText().dropFirst(mark)) }
+
+    /// Runs `body` with this process's file size limit at `bytes` and
+    /// SIGXFSZ ignored, so a write past that offset stops there, as one cut
+    /// short by a full disk does: the kernel writes the bytes below the
+    /// limit and fails the rest with EFBIG. The limit holds for the whole
+    /// process, so it is set around one write only.
+    private func withFileSizeLimit<T>(_ bytes: Int, _ body: () -> T) throws -> T {
+        var old = rlimit()
+        guard getrlimit(RLIMIT_FSIZE, &old) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EINVAL) }
+        var limited = old
+        limited.rlim_cur = rlim_t(bytes)
+        let handler = signal(SIGXFSZ, SIG_IGN)
+        defer { signal(SIGXFSZ, handler) }
+        guard setrlimit(RLIMIT_FSIZE, &limited) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EINVAL) }
+        defer { setrlimit(RLIMIT_FSIZE, &old) }
+        return body()
+    }
+
     private func sleepHeldAgain(since count: Int) -> Bool {
         h.guardFake.calls.dropFirst(count).contains("disablesleep 1")
     }
@@ -92,7 +114,10 @@ final class LockEndRecordTests: XCTestCase {
     /// (read_lock_record) on the same bytes, one fresh home per case:
     /// whether they count the session in session.json as ended, and that
     /// the agent empties a whole record of other bytes and content that is
-    /// no record while the session stays. The app is alive and the machine
+    /// no record while the session stays. This session's record cut short
+    /// (its first bytes, or the whole record and more) counts as its end
+    /// for both; another session's record cut short past the first byte
+    /// where the two differ does not. The app is alive and the machine
     /// within every floor, so the agent ends only a session it finds
     /// recorded as ended. The homes are set up one at a time (each Harness
     /// points INSOMNIA_HOME at its own), and the agent runs go several at a
@@ -105,18 +130,22 @@ final class LockEndRecordTests: XCTestCase {
             ("empty", .none, false, { _ in Data() }),
             ("this session", .record, true, { Data("\(tag) \($0)\n".utf8) }),
             ("another session", .record, false, { _ in Data("\(tag) \(other)\n".utf8) }),
-            ("no newline", .foreign, false, { Data("\(tag) \($0)".utf8) }),
-            ("two newlines", .foreign, false, { Data("\(tag) \($0)\n\n".utf8) }),
+            ("no newline", .foreign, true, { Data("\(tag) \($0)".utf8) }),
+            ("two newlines", .foreign, true, { Data("\(tag) \($0)\n\n".utf8) }),
             ("carriage return", .foreign, false, { Data("\(tag) \($0)\r\n".utf8) }),
             ("other tag", .foreign, false, { Data("ended-session-v2 \($0)\n".utf8) }),
             ("two spaces", .foreign, false, { Data("\(tag)  \($0)\n".utf8) }),
             ("cut base64", .foreign, false, { Data("\(tag) \($0.dropLast())\n".utf8) }),
-            ("cut short", .foreign, false, { Data("\(tag) \($0)\n".utf8.prefix(10)) }),
+            ("cut short", .foreign, true, { Data("\(tag) \($0)\n".utf8.prefix(10)) }),
+            ("first byte", .foreign, true, { Data("\(tag) \($0)\n".utf8.prefix(1)) }),
+            ("cut inside the base64", .foreign, true, { Data("\(tag) \($0)\n".utf8.prefix(tag.utf8.count + 1 + $0.utf8.count / 2)) }),
+            ("record and old bytes", .foreign, true, { Data("\(tag) \($0)\n".utf8) + Data(repeating: 0x41, count: 4096) }),
+            ("another session cut short", .foreign, false, { _ in Data("\(tag) \(other)\n".utf8.prefix(tag.utf8.count + 1 + 8)) }),
             ("three pads", .foreign, false, { _ in Data("\(tag) Q===\n".utf8) }),
             ("pads only", .foreign, false, { _ in Data("\(tag) ====\n".utf8) }),
             ("pad inside", .foreign, false, { _ in Data("\(tag) QQ==QQ==\n".utf8) }),
             ("NUL byte", .foreign, false, { Data("\(tag) \($0)".utf8) + Data([0]) + Data("\n".utf8) }),
-            ("trailing byte", .foreign, false, { Data("\(tag) \($0)\nx".utf8) }),
+            ("trailing byte", .foreign, true, { Data("\(tag) \($0)\nx".utf8) }),
             ("newline only", .foreign, false, { _ in Data("\n".utf8) }),
             ("other text", .foreign, false, { _ in Data("pid 4242\n".utf8) }),
             ("over the bound", .foreign, false, { _ in Data(repeating: 0x41, count: Store.lockEndRecordMaxBytes + 1) }),
@@ -164,9 +193,11 @@ final class LockEndRecordTests: XCTestCase {
             XCTAssertEqual(status, 0, "\(c.name): \(log)")
             XCTAssertEqual(try home.store.loadSession() == nil, c.ends, "\(c.name): \(log)")
             XCTAssertEqual(log.contains("already ended (recorded in \(lock.path)"), c.ends, "\(c.name): \(log)")
+            XCTAssertEqual(log.contains("already ended (recorded in \(lock.path), which holds this session's end record cut short, so it counts as one)"), c.ends && c.kind == .foreign, "\(c.name): \(log)")
             XCTAssertEqual(caseAgent.calls.contains("pmset -g batt"), !c.ends, "\(c.name): checked only when not ended")
             // Emptied once its session.json is gone, and a whole record of
-            // other bytes or content that is no record at once.
+            // other bytes or content that is no record and not this
+            // session's record cut short at once.
             XCTAssertEqual(try Data(contentsOf: lock), Data(), c.name)
             XCTAssertEqual(log.contains("emptying \(lock.path): "), c.kind == .foreign, "\(c.name): \(log)")
             XCTAssertEqual(try inode(lock), lockInode, c.name)
@@ -278,6 +309,79 @@ final class LockEndRecordTests: XCTestCase {
         XCTAssertEqual(try inode(lockFile), lockInode)
     }
 
+    /// Every state a writer leaves when it stops partway through this
+    /// session's record, from each kind of content it can find there. The
+    /// app writes the record over the old bytes, then cuts the file to the
+    /// record's length (`RecoveryLockHandle.replaceContents`). A file size
+    /// limit stops its real write after the record's first k bytes, for k
+    /// from 0 to all but one; a limit cannot stop it between its write and
+    /// its cut, so the test writes that state itself, as it does the
+    /// agent's. The agent
+    /// leaves content that already counts as the end as it is, or appends
+    /// the rest to the record's first bytes, and empties anything else with
+    /// `>` before it writes (record_end_in_lock). From content that counted
+    /// as the end every state counts too. From content that did not, the
+    /// app's file counts once its write is done and before the cut, and the
+    /// agent's from its first byte on; the agent's empty file between its
+    /// `>` and its write ends nothing, as the content it emptied did not.
+    /// The app's writer then completes the record from each start in place.
+    func testAWriterStoppedPartwayNeverLeavesLessOfThisEndThanItFound() throws {
+        let held = try XCTUnwrap(try RecoveryLock(url: lockFile).tryAcquire())
+        defer { held.release() }
+        let lockInode = try inode(lockFile)
+        try h.store.saveSession(Session(startedAt: h.clock.now, endsAt: h.clock.now.addingTimeInterval(600)))
+        let whole = record(of: try Data(contentsOf: h.home.paths.sessionFile))
+        let starts: [(name: String, content: Data)] = [
+            ("empty", Data()),
+            ("other text", Data("pid 4242\n".utf8)),
+            ("more bytes than the record", Data(repeating: 0x41, count: whole.count * 3)),
+            ("another session's record", record(of: Data("an earlier session.json".utf8))),
+            ("this record's first bytes", whole.prefix(whole.count / 2)),
+            ("this record and old bytes", whole + Data(repeating: 0x41, count: 64)),
+        ]
+        func counts(_ content: Data) throws -> Bool {
+            try writeInPlace(content, to: lockFile)
+            return h.store.sessionEndRecordedInLock() != nil
+        }
+        for (name, start) in starts {
+            let counted = try counts(start)
+            XCTAssertEqual(counted, name.hasPrefix("this record"), name)
+            let cuts = Set([1, 2, whole.count / 3, whole.count / 2, whole.count - 1, start.count, start.count + 1])
+                .filter { (1..<whole.count).contains($0) }.sorted()
+            // The app: the first k bytes of the record over the old ones,
+            // then the whole record over them, before the cut.
+            let written = whole + start.dropFirst(whole.count)
+            let app = cuts.map { whole.prefix($0) + start.dropFirst($0) } + [written]
+            // The agent: content that counts is left, or its first bytes
+            // grow; anything else is emptied, then written.
+            let agent: [Data] = counted
+                ? (start.count < whole.count ? ([start.count] + cuts.filter { $0 > start.count }).map { whole.prefix($0) } : [start])
+                : cuts.map { whole.prefix($0) }
+            // The app's own writer, stopped after the record's first k bytes.
+            for k in [0] + cuts {
+                try writeInPlace(start, to: lockFile)
+                XCTAssertFalse(try withFileSizeLimit(k) { held.replaceContents(with: whole, at: lockFile.path) }, "\(name): \(k)")
+                XCTAssertEqual(lockBytes(), whole.prefix(k) + start.dropFirst(k), "\(name): stopped after \(k) bytes")
+                XCTAssertTrue(!counted || h.store.sessionEndRecordedInLock() != nil, "\(name): stopped after \(k) bytes")
+            }
+            if counted {
+                for state in app + agent {
+                    XCTAssertTrue(try counts(state), "\(name): \(String(decoding: state, as: UTF8.self))")
+                }
+            } else {
+                XCTAssertTrue(try counts(written), "\(name): the app's write before its cut")
+                for state in agent {
+                    XCTAssertTrue(try counts(state), "\(name): the agent's first \(state.count) bytes")
+                }
+                XCTAssertFalse(try counts(Data()), "\(name): the agent's file between its > and its write")
+            }
+            try writeInPlace(start, to: lockFile)
+            XCTAssertTrue(h.store.recordSessionEndInLock(lock: held), name)
+            XCTAssertEqual(lockBytes(), whole, name)
+            XCTAssertEqual(try inode(lockFile), lockInode, name)
+        }
+    }
+
     /// A symlink at the lock path is never read or written as a record,
     /// even when the file it points to holds a matching one and the lock
     /// was taken through it. A file the handle does not hold is not
@@ -380,6 +484,50 @@ final class LockEndRecordTests: XCTestCase {
         XCTAssertTrue(logText().contains("its end is recorded in state.json"), logText())
         XCTAssertEqual(lockBytes(), Data())
         XCTAssertEqual(try inode(lockFile), lockInode)
+    }
+
+    /// The app's end stopped partway through its write to the lock file,
+    /// with session.json still in place and SleepDisabled still 1: the
+    /// record's first bytes, or the whole record with the file's old bytes
+    /// after it. A relaunch ends the session instead of holding sleep
+    /// again, removes session.json and empties the lock file in place. A
+    /// new session then starts, and a crash during it resumes as usual.
+    func testARelaunchEndsTheSessionWhoseRecordInTheLockFileWasCutShort() async throws {
+        await h.makeManager().reconcile()
+        let lockInode = try inode(lockFile)
+        for form in ["first bytes", "record and old bytes"] {
+            h.clock.advance(60)
+            let m = h.makeManager()
+            await m.reconcile()
+            await m.start(duration: 3600)
+            XCTAssertTrue(m.isActive, form)
+            let whole = record(of: try Data(contentsOf: h.home.paths.sessionFile))
+            try writeInPlace(form == "first bytes" ? whole.prefix(whole.count / 2) : whole + Data(repeating: 0x41, count: 64), to: lockFile)
+            XCTAssertTrue(h.guardFake.sleepDisabled, form)
+
+            var before = h.guardFake.calls.count
+            let mark = logText().count
+            let next = h.makeManager()
+            await next.reconcile()
+            XCTAssertFalse(next.isActive, "\(form): \(logText(since: mark))")
+            XCTAssertFalse(sleepHeldAgain(since: before), "\(form): \(h.guardFake.calls)")
+            XCTAssertFalse(h.guardFake.sleepDisabled, form)
+            XCTAssertTrue(logText(since: mark).contains("reconcile: session.json holds a session already ended (recorded in .recovery.lock, which holds this session's end record cut short, so it counts as one); restoring, not resuming"), logText(since: mark))
+            XCTAssertNil(try h.store.loadSession(), form)
+            XCTAssertEqual(lockBytes(), Data(), form)
+            XCTAssertEqual(try inode(lockFile), lockInode, form)
+
+            await next.start(duration: 3600)
+            XCTAssertTrue(next.isActive, form)
+            before = h.guardFake.calls.count
+            let resumed = h.makeManager()
+            await resumed.reconcile()
+            XCTAssertTrue(resumed.isActive, "\(form): \(logText(since: mark))")
+            XCTAssertTrue(sleepHeldAgain(since: before), form)
+            XCTAssertEqual(lockBytes(), Data(), form)
+            _ = await resumed.end(reason: .user)
+            XCTAssertNil(try h.store.loadSession(), form)
+        }
     }
 
     // MARK: The agent's end
@@ -502,13 +650,89 @@ final class LockEndRecordTests: XCTestCase {
         XCTAssertTrue(logText().contains(endedInLockLine), logText())
     }
 
+    /// The agent finds this session's record cut short in the lock file, as
+    /// a run or the app leaves it when stopped partway, while session.json,
+    /// an unrelated ended-session.json and state.json are immutable, no
+    /// record aside can be made and the restore fails. It counts as the
+    /// end, and the agent never empties it:
+    /// - its first bytes: the agent appends the rest. The fake rm sets the
+    ///   append-only flag on the lock file (chflags uappnd) when the run
+    ///   tries to remove session.json, after the run opened its fd 9 there,
+    ///   so from then on a write with `>`, which empties the file first,
+    ///   fails and only an append goes through.
+    /// - the whole record with old bytes after it: the agent leaves it as
+    ///   it is and records the end in insomnia.log.
+    /// A lock file the agent cannot read (CAT fails on it) counts as the
+    /// end too, and the agent leaves it as it is as well. After the repair
+    /// the app relaunches with SleepDisabled still 1, ends the session
+    /// instead of resuming it, removes session.json and empties the lock
+    /// file, which keeps its inode throughout.
+    func testTheAgentNeverEmptiesThisSessionsRecordCutShort() async throws {
+        await h.makeManager().reconcile()
+        let lockInode = try inode(lockFile)
+        defer { try? FileManager.default.setAttributes([.appendOnly: false], ofItemAtPath: lockFile.path) }
+        for (index, form) in ["first bytes", "record and old bytes", "unreadable"].enumerated() {
+            h.clock.advance(60)
+            _ = try await startThenPinAll()
+            let whole = record(of: try Data(contentsOf: h.home.paths.sessionFile))
+            let found = form == "first bytes" ? whole.prefix(whole.count / 2)
+                : form == "record and old bytes" ? whole + Data(repeating: 0x41, count: 64)
+                : Data("pid 4242\n".utf8)
+            try writeInPlace(found, to: lockFile)
+            let caseAgent = try PatchedBackstop(home: h.home.root, dir: h.home.root.appendingPathComponent("agent-\(index)", isDirectory: true))
+            try caseAgent.refuseRecordsAside()
+            try caseAgent.failSudo()
+            if form == "first bytes" {
+                try caseAgent.makeLockAppendOnly(whenRemoving: h.home.paths.sessionFile, lock: lockFile)
+            } else if form == "unreadable" {
+                try caseAgent.failLockReadBack()
+            }
+
+            var mark = logText().count
+            let exit = try await caseAgent.run()
+            let log = logText(since: mark)
+            XCTAssertEqual(exit, 1, "\(form): \(log)")
+            XCTAssertFalse(caseAgent.calls.contains("pmset -g batt"), form)
+            if form == "first bytes" {
+                XCTAssertTrue(log.contains("already ended (recorded in \(lockFile.path), which holds this session's end record cut short, so it counts as one)"), log)
+                XCTAssertTrue(log.contains("its end is recorded in the recovery lock file \(lockFile.path) instead"), log)
+                XCTAssertEqual(try FileManager.default.attributesOfItem(atPath: lockFile.path)[.appendOnly] as? Bool, true, "the fake rm ran")
+                XCTAssertEqual(lockBytes(), whole)
+                try FileManager.default.setAttributes([.appendOnly: false], ofItemAtPath: lockFile.path)
+            } else {
+                let why = form == "unreadable" ? "which it could not be read, so it may hold this session's end and counts as one"
+                    : "which holds this session's end record cut short, so it counts as one"
+                XCTAssertTrue(log.contains("already ended (recorded in \(lockFile.path), \(why))"), log)
+                XCTAssertTrue(log.contains("its end is recorded in the log file \(h.home.paths.logFile.path) instead"), log)
+                XCTAssertEqual(lockBytes(), found, form)
+            }
+            XCTAssertEqual(try inode(lockFile), lockInode, form)
+
+            unpinAll()
+            XCTAssertTrue(h.guardFake.sleepDisabled, "\(form): the failed restore left it at 1")
+            let before = h.guardFake.calls.count
+            mark = logText().count
+            let next = h.makeManager()
+            await next.reconcile()
+            let recordedIn = form == "first bytes" ? ".recovery.lock"
+                : form == "record and old bytes" ? ".recovery.lock, which holds this session's end record cut short, so it counts as one"
+                : "insomnia.log"
+            XCTAssertFalse(next.isActive, "\(form): \(logText(since: mark))")
+            XCTAssertFalse(sleepHeldAgain(since: before), "\(form): \(h.guardFake.calls)")
+            XCTAssertTrue(logText(since: mark).contains("reconcile: session.json holds a session already ended (recorded in \(recordedIn)); restoring, not resuming"), logText(since: mark))
+            XCTAssertNil(try h.store.loadSession(), form)
+            XCTAssertEqual(lockBytes(), Data(), form)
+            XCTAssertEqual(try inode(lockFile), lockInode, form)
+        }
+    }
+
     // MARK: Other sessions and cleanup
 
     /// A crash with the lock file empty, with a whole record of an earlier
-    /// session's bytes, and with content that is no whole record (a write
-    /// cut short) resumes: none of them ends this session. The agent then
-    /// empties the stale record or the content and checks the session as
-    /// usual.
+    /// session's bytes, and with content that is no whole record (another
+    /// session's record cut short) resumes: none of them ends this session.
+    /// The agent then empties the stale record or the content and checks
+    /// the session as usual.
     func testAStaleRecordOrContentThatIsNoRecordEndsNoNewerSession() async throws {
         let first = h.makeManager()
         await first.reconcile()
@@ -605,9 +829,10 @@ final class LockEndRecordTests: XCTestCase {
         XCTAssertEqual(try inode(lockFile), lockInode)
     }
 
-    /// session.json removed outside the lock cannot empty the record: it
-    /// is logged and stays, ending nothing, and the agent's next run
-    /// empties it in place.
+    /// session.json removed outside the lock cannot empty the record, whole
+    /// or cut short: it is logged and stays, ending nothing, and the
+    /// agent's next run empties it in place. Content that is no record
+    /// stays while session.json cannot be read.
     func testARecordLeftByACleanupWithoutTheLockIsEmptiedByTheNextRun() async throws {
         let m = h.makeManager()
         await m.reconcile()
@@ -621,6 +846,40 @@ final class LockEndRecordTests: XCTestCase {
         XCTAssertEqual(lockBytes(), ended)
         XCTAssertTrue(logText().contains("could not empty \(lockFile.path) of the record of a session's end"), logText())
         try await runAgent(expecting: 0)
+        XCTAssertEqual(lockBytes(), Data())
+        XCTAssertEqual(try inode(lockFile), lockInode)
+
+        try h.store.saveSession(Session(startedAt: h.clock.now, endsAt: h.clock.now.addingTimeInterval(600)))
+        let cut = ended.prefix(ended.count / 2)
+        try writeInPlace(cut, to: lockFile)
+        XCTAssertNotNil(h.store.sessionEndRecordedInLock())
+        try h.store.deleteSession()
+        XCTAssertEqual(lockBytes(), cut)
+        XCTAssertNil(h.store.sessionEndRecordedInLock(), "nothing to end without session.json")
+        agent.clearCalls()
+        try await runAgent(expecting: 0)
+        XCTAssertTrue(logText().contains("emptying \(lockFile.path): it holds bytes other than one whole end record, which ends no session"), logText())
+        XCTAssertEqual(lockBytes(), Data())
+        XCTAssertEqual(try inode(lockFile), lockInode)
+
+        // While session.json cannot be read, nothing shows that such content
+        // ends nothing, so the run keeps it. That run removes session.json,
+        // whose end time is unknown, and the next run empties the content.
+        h.clock.advance(60)
+        try h.store.saveSession(Session(startedAt: h.clock.now, endsAt: h.clock.now.addingTimeInterval(600)))
+        let unread = record(of: try Data(contentsOf: h.home.paths.sessionFile)).prefix(40)
+        try writeInPlace(unread, to: lockFile)
+        try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: h.home.paths.sessionFile.path)
+        var mark = logText().count
+        agent.clearCalls()
+        try await runAgent(expecting: 0)
+        XCTAssertTrue(logText(since: mark).contains("session.json cannot be read"), logText(since: mark))
+        XCTAssertFalse(logText(since: mark).contains("emptying \(lockFile.path)"), logText(since: mark))
+        XCTAssertEqual(lockBytes(), unread)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: h.home.paths.sessionFile.path), logText(since: mark))
+        mark = logText().count
+        try await runAgent(expecting: 0)
+        XCTAssertTrue(logText(since: mark).contains("emptying \(lockFile.path): it holds bytes other than one whole end record, which ends no session"), logText(since: mark))
         XCTAssertEqual(lockBytes(), Data())
         XCTAssertEqual(try inode(lockFile), lockInode)
     }

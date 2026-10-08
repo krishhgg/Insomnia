@@ -83,8 +83,11 @@ final class RecoveryLockHandle: @unchecked Sendable {
     /// lock every party takes (`Store.recordSessionEndInLock`). Only while
     /// `path` still names that same file, a regular file (lstat, so not a
     /// symlink) this user owns. The new bytes go over the old ones before
-    /// the file is cut to their length, so a write cut short leaves bytes
-    /// that are no whole record, never an empty file in place of a record.
+    /// the file is cut to their length, so a write cut short never leaves an
+    /// empty file in place of a record. It leaves the record's first bytes
+    /// over the old ones, which count as the end when no old bytes but the
+    /// record's own follow them, or the whole record with old bytes after
+    /// it, which counts too (`Store.lockHoldsRecordCutShort`).
     /// True once written and synced; the caller reads the file back. False
     /// once released or when a step fails, which can leave part of `data`.
     func replaceContents(with data: Data, at path: String) -> Bool {

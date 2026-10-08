@@ -91,9 +91,13 @@ The app and the script serialize on one `flock(2)` lock,
 `.recovery.lock`, which is never unlinked so both lock the same inode
 (`RecoveryLock.swift`; `lockf` on fd 9 in the scripts). It may also hold a
 record of a session's end (`ended-session-v1 <base64>`), written in place
-through the held descriptor and never by replacing the file. When that
-write fails too, the end is appended to `insomnia.log` as one line
-(`insomnia-ended-session-v1 <size> <base64>`, `LogEndRecord.swift`), and
+through the held descriptor and never by replacing the file. That record
+cut short as a writer leaves it (its first bytes, or the whole record with
+the file's old bytes after it) counts as the end of the session whose bytes
+it starts with, and no writer empties it; other content that is no record
+ends nothing. When that write fails too, the end is appended to
+`insomnia.log` as one line (`insomnia-ended-session-v1 <size> <base64>`,
+`LogEndRecord.swift`), and
 insomnia.log is rotated only under this lock, with a record still in force
 copied forward. `uninstall.sh`
 takes the lock, runs the backstop with `--force` under it, and refuses to

@@ -183,6 +183,23 @@ struct PatchedBackstop {
         try patch("CAT=/bin/cat", "CAT='\(cat.path)'")
     }
 
+    /// Points RM at a fake that sets the user append-only flag (chflags
+    /// uappnd) on `lock` when the agent removes `session`, then runs
+    /// /bin/rm. The run opened its fd 9 on the lock file before, so from
+    /// then on the file takes appends (`>>`) and no write that empties it
+    /// (`>`). The test clears the flag.
+    func makeLockAppendOnly(whenRemoving session: URL, lock: URL) throws {
+        let rm = dir.appendingPathComponent("rm")
+        try #"""
+        #!/bin/bash
+        [[ "${1:-}" == -f && "${2:-}" == '\#(session.path)' ]] && /usr/bin/chflags uappnd '\#(lock.path)'
+        exec /bin/rm "$@"
+
+        """#.write(to: rm, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: rm.path)
+        try patch("RM=/bin/rm", "RM='\(rm.path)'")
+    }
+
     /// Sets LOG_RECORD_MAX_BYTES to 0, so no session.json fits in an end
     /// record in insomnia.log: the agent writes none there and reads none
     /// back, a stand-in for a log that refuses the line (a full disk).
