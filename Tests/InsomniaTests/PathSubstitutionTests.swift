@@ -2,10 +2,11 @@ import Foundation
 import XCTest
 @testable import Insomnia
 
-/// A PATH whose cat, grep, head, tr, id, stat, awk, basename and dirname
-/// are stand-ins, for the tests that show the recovery scripts take every
-/// tool that reads state from its fixed path (CAT, GREP, HEAD, TR, ID,
-/// STAT, AWK), never from PATH. A stand-in called by a process whose
+/// A PATH whose cat, grep, head, tr, id, stat, awk and basename are
+/// stand-ins, for the tests that show the recovery scripts take every tool
+/// that reads state from its fixed path (CAT, GREP, HEAD, TR, ID, STAT,
+/// AWK), never from PATH. dirname is not one: uninstall.sh finds its own
+/// folder with it, as install.sh does, and that reads no state. A stand-in called by a process whose
 /// command line holds one of `scripts` (a recovery script, or a subshell of
 /// one) logs the call and answers with something that would change the
 /// run: a 0% end floor from the app's binary, a full battery, a file that
@@ -21,7 +22,6 @@ enum PathSubstitutes {
         ("stat", "/usr/bin/stat", "echo 0"),
         ("awk", "/usr/bin/awk", ":"),
         ("basename", "/usr/bin/basename", "echo Insomnia.app"),
-        ("dirname", "/usr/bin/dirname", "echo /"),
     ]
 
     /// Writes the stand-ins in `dir` and returns the PATH that puts them

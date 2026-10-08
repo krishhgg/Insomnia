@@ -1375,9 +1375,9 @@ final class RecoveryScriptTests: XCTestCase {
     /// the checkout's backstop.sh, run on twin fixtures with the usual PATH
     /// (the control) and with PathSubstitutes first in PATH, prints the
     /// same, makes the same calls and removes the same files, and neither
-    /// script calls a stand-in. Its readers (the pid of each bounded call,
-    /// session.json and the journal's shape, the App Nap list, its uid and
-    /// folder names) would read otherwise from a stand-in.
+    /// script calls a stand-in. Its readers (session.json and the journal's
+    /// shape, the App Nap list, its uid and the app's folder names) would
+    /// read otherwise from a stand-in.
     func testUninstallAndItsBackstopTakeNoToolFromPath() throws {
         let twin = try ScriptFixture()
         defer { twin.destroy() }

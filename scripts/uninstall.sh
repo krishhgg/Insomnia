@@ -62,11 +62,7 @@ done
 # /tmp beforehand. Never the folder above either: a zip unpacked at
 # /tmp/Insomnia-<version> would make that /tmp, where any account can create
 # scripts/backstop.sh.
-# Its parent without dirname, since the fixed tool paths come below.
-script_parent="${BASH_SOURCE[0]}"
-case "$script_parent" in */*) script_parent="${script_parent%/*}" ;; *) script_parent=. ;; esac
-[[ -n "$script_parent" ]] || script_parent=/
-SCRIPT_DIR="$(CDPATH="" cd -- "$script_parent" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 in_checkout() { [[ "${SCRIPT_DIR##*/}" == scripts && -f "${SCRIPT_DIR%/*}/Package.swift" ]]; }
 
 # Fixed tool paths: never taken from PATH or the environment. Tests patch
@@ -91,9 +87,12 @@ HEAD=/usr/bin/head
 TR=/usr/bin/tr
 AWK=/usr/bin/awk
 ID=/usr/bin/id
-# sleep is the one tool taken by name: it only paces the polls in bounded()
-# and the quit wait and reads nothing, and the tests that make every poll
-# slow put their own sleep first in PATH.
+# Three tools are taken by name, and none reads state. sleep only paces the
+# polls in bounded() and the quit wait, and the tests that make every poll
+# slow put their own sleep first in PATH. dirname finds this script's folder
+# (SCRIPT_DIR above), and cat reads a sudo call's pid in bounded(), which
+# this script never runs for sudo. Those two lines are install.sh's word for
+# word, as ReleaseWorkflowTests and RecoveryScriptTests require.
 LOCK_TIMEOUT_SECONDS=10
 # How long to wait for the app to exit after asking it to quit.
 QUIT_WAIT_SECONDS=10
@@ -204,7 +203,7 @@ bounded() { # command args...
       sleep 0.01
     done
     if [[ ! -s "$base.rc" ]]; then
-      BOUNDED_PID="$("$CAT" "$base.pid" 2>/dev/null || true)"
+      BOUNDED_PID="$(cat "$base.pid" 2>/dev/null || true)"
       return 125
     fi
   fi
