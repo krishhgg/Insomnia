@@ -78,7 +78,7 @@ RuntimeState {                // everything Insomnia changed and must undo
   keyboardRestoreRefused:  Bool    // the same for the keyboard backlight
   displayRestoredUnderLowPower: Float?  // restored on open under our Low Power Mode; written again when it ends
   keptDisplayUnderLowPower:     Float?   // the kept (refused) display entry our Low Power Mode was on over; see section 4
-  keptDisplayUnderLowPowerBoot: String?  // kern.bootsessionuuid of the boot that record was written in
+  keptDisplayUnderLowPowerBoot: String?  // kern.bootsessionuuid of the boot that record was written in, or that backstop.sh switched the mode off in
   keptDisplayReadLit:           Float?   // the kept display entry, read above 0 with the lid open and the panel awake; see section 4
   appNapOverrides:    [{bundleId, previous?}]  // previous absent when the app had no NSAppSleepDisabled key
 }
@@ -223,35 +223,42 @@ Off, the switch-off changes nothing, the record of the earlier boot goes,
 and a reading of the panel decides the entry. A claim with no record, a
 record with no boot or an empty one, or a launch that cannot read its own
 boot is taken as this boot's, so the entry waits, at the cost of one more
-restart. The agent's own `lowpowermode 0` after a restart records nothing:
-a mode still on then is not known to the app's next launch, and a reading
-the panel takes on its way back may decide the entry. A display still at
-0 under or after the mode gets the saved value, written once more after
-the mode as for any restore under it, unless a reading of that entry above
-0, with the lid known open and the panel awake, showed the darkening
-undone: that 0 may be one the user set, and the saved value is not written
-over it. That reading is journaled (`keptDisplayReadLit`), so it holds
-through relaunches and restarts, which do not darken the panel again.
-While a doubt above remains the entry waits; once none is left, the 0 is
-the level set since, and the entry is cleared without a write. A lid
-close with a sample of 0, or 0 as the value owed after the mode, then
-journals that 0 in place of the kept value. A current read of 0 at the
-close is no such level: auto-brightness may have pulled the panel down to
-it under the closing lid. The close leaves the entry flagged and the
-panel as it is, and only asks it to sleep. A 0 read after the lid was
-closed over the entry, by such a close or while a reading or re-read
-waited for the lid, may still be the closing lid's: the first one waits,
-and only a 0 read 3 s or more after it (`keptRecheckDelay`, the delay of
-the sampler's read after an open) is the level set since. That wait is
-held by the process alone, not journaled. A launch cannot know whether
-the lid closed over the entry before it, after a crash or while
-Insomnia was not running, so the first 0 it reads waits the same way,
-timed from that reading and not from any earlier process's. A reading at a lid close, under the closing lid or of a panel
+restart. backstop.sh, when its own `lowpowermode 0` exits 0 and the journal
+has the record, gives the record its own boot (empty if it cannot read
+it), after a restart or not: the mode may have been on in that boot until
+then, before Insomnia launched in it. A launch in that boot then reads the
+entry with the same doubt and waits for the next restart, even when the
+mode was already off before the agent's switch-off. A journal with no
+record has nothing to give a boot, so one written before the record
+existed still carries no doubt. A display still at 0 under or after the
+mode gets the saved value, written once more after the mode as for any
+restore under it, unless a reading of that entry above 0, with the lid
+known open and the panel awake, showed the darkening undone. That reading
+is journaled (`keptDisplayReadLit`), so it holds through relaunches and
+restarts, which do not darken the panel again. A 0 read after it may be a
+level the user set, or one macOS still holds the panel at: auto-brightness
+can pull the panel down to 0 under a closing lid, and the panel can still
+read that 0 once the lid is open again, for a time nobody has measured. No
+reading of 0 tells the two apart, however late it comes, so the saved
+value is not written and the entry is not cleared. It stays flagged, the
+display sample stays held, and the app reads the panel again every 3 s,
+20 times, then every minute, through relaunches and restarts, until it
+reads above 0. A 0 the user set stays as set until then. A reading above
+0 with no doubt above left is the level set since, and the entry is
+cleared without a write. A lid close with a sample of 0, or 0 as the value
+owed after the mode, journals that 0 in place of the kept value. A current
+read of 0 at the close is no such level, since it may be the closing
+lid's. The close leaves the entry flagged and the panel as it is, and only
+asks it to sleep. A reading at a lid close, under the closing lid or of a panel
 asleep, shows no such thing, and neither does a reading of an earlier
 entry: the record goes with its entry, as the record of the mode does. If
 state.json refuses the record, this process holds it and the next write
-records it; a quit before then loses it, and the next launch writes the
-saved value over a 0, as before any reading. If state.json cannot
+records it. An end does not let Quit go before then: "Restore incomplete"
+says Insomnia retries in 30 s and not to quit until state.json can be
+written, and Quit waits, as for a failed restore whose flag is owed. A
+crash, a forced quit or a lost disk before the record lands loses it, and
+the next launch writes the saved value over a 0, as before any reading.
+If state.json cannot
 take that clear, the entry still counts as done in this process. The clear
 is owed: it goes into the journal ahead of any later write, and at the
 start of every lid close, lid open, end and launch, so none of them works

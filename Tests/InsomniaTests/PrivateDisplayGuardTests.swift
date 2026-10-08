@@ -1660,6 +1660,10 @@ final class RefusedDarkeningTests: XCTestCase {
         XCTAssertFalse(logText().contains("after a reading above 0 showed its darkening undone"), logText())
     }
 
+    /// What a reading of 0 of the kept 0.8 logs once a reading above 0
+    /// showed its darkening undone, with no doubt left.
+    private let zeroWaits = "display brightness 0.8, kept after a refused restore, reads 0 after a reading above 0 showed its darkening undone; that 0 may be a level set since or one macOS still holds the panel at after a lid close, and only a reading above 0 tells them apart, so the kept value is not written"
+
     /// A sampler that follows `m`, for the levels a launch or reading
     /// decides.
     private func follow(_ m: SessionManager) -> BrightnessSampler {
@@ -1672,11 +1676,11 @@ final class RefusedDarkeningTests: XCTestCase {
     /// its darkening is undone, and the journal says so. The session ends
     /// and the user sets the display to 0 by hand. A relaunch in the same
     /// boot still doubts its reading, and does not write 0.8 over that 0.
-    /// A launch after a restart has no doubt left. Its first 0 waits, since
-    /// it does not know whether the lid closed over the entry before it;
-    /// the re-read still reads 0, which is the level set since: the entry
-    /// goes without a write and 0 is the sample. 0.8 never comes back, at
-    /// a close and open either.
+    /// A launch after a restart has no doubt left, but no reading of 0
+    /// tells that 0 from one macOS holds the panel at: its first reading
+    /// and every re-read leave the entry waiting, with nothing written or
+    /// sampled, and so do a close and an open. 0.8 never comes back. Once
+    /// the user sets 0.3, the next reading takes it as the level set since.
     func testAReadingAboveZeroIsKeptAcrossARelaunchAndARestart() async throws {
         try seedKeptDisplay()
         h.clamshell.closed = false
@@ -1705,24 +1709,22 @@ final class RefusedDarkeningTests: XCTestCase {
         XCTAssertNil(relaunchedSampler.last?.display)
         XCTAssertTrue(logText().contains("display brightness 0.8, kept after a refused restore, reads 0 after our low power mode was on over it since the Mac last started, which rescales it until some time after it goes off, after a reading above 0 showed its darkening undone; that 0 may be a level set since, so the kept value is not written"), logText())
 
-        let restarted = h.makeManager(keptRecheckDelay: .milliseconds(100), bootSession: "a later boot")
+        let restarted = h.makeManager(keptRecheckDelay: .milliseconds(20), keptRecheckAttempts: 3, keptRecheckSlowDelay: .milliseconds(20), bootSession: "a later boot")
         let sampler = follow(restarted)
         let laterActions = makeDarkening(restarted, sampler: sampler)
+        let readsBefore = h.display.reads
         await restarted.reconcile()
+        try await waitFor { self.logText().contains("\(self.zeroWaits); still so after 3 readings") }
 
-        XCTAssertEqual(try h.store.loadState()?.savedDisplayBrightness, 0.8, "the first 0 since the launch decides nothing")
-        XCTAssertNil(sampler.last?.display)
-        XCTAssertTrue(logText().contains("display brightness 0.8, kept after a refused restore, reads 0 at the first reading since Insomnia launched, which does not know whether the lid closed over it before, after a reading above 0 showed its darkening undone"), logText())
-        try await waitFor { try self.h.store.loadState()?.savedDisplayBrightness == nil }
-
-        XCTAssertEqual(h.display.sets, [])
-        let decided = try XCTUnwrap(try h.store.loadState())
-        XCTAssertNil(decided.savedDisplayBrightness)
-        XCTAssertFalse(decided.displayRestoreRefused)
-        XCTAssertNil(decided.keptDisplayReadLit, "the record goes with its entry")
-        XCTAssertNil(decided.keptDisplayUnderLowPower)
-        XCTAssertEqual(sampler.last?.display, 0)
-        XCTAssertTrue(logText().contains("display brightness 0.8, kept after a refused restore, reads 0 after a reading above 0 showed its darkening undone; that 0 is a level set since"), logText())
+        XCTAssertTrue(logText().contains("\(zeroWaits); still so after 3 readings"), logText())
+        XCTAssertGreaterThanOrEqual(h.display.reads - readsBefore, 4, "the launch's reading and three re-reads")
+        XCTAssertEqual(h.display.sets, [], "the user's 0 is not written over")
+        let afterRestart = try XCTUnwrap(try h.store.loadState())
+        XCTAssertEqual(afterRestart.savedDisplayBrightness, 0.8, "no reading of 0 decides")
+        XCTAssertTrue(afterRestart.displayRestoreRefused)
+        XCTAssertEqual(afterRestart.keptDisplayReadLit, 0.8)
+        XCTAssertNil(sampler.last?.display, "nothing sampled")
+        XCTAssertFalse(logText().contains("that 0 is a level set since"), logText())
 
         await restarted.start(duration: 3600)
         h.clamshell.closed = true
@@ -1730,15 +1732,29 @@ final class RefusedDarkeningTests: XCTestCase {
         h.clamshell.closed = false
         await laterActions.onOpen()
 
-        XCTAssertFalse(h.display.sets.contains(0.8), "\(h.display.sets)")
+        XCTAssertEqual(h.display.sets, [], "0.8 never comes back")
         XCTAssertEqual(h.display.brightness, 0)
+        XCTAssertEqual(try h.store.loadState()?.savedDisplayBrightness, 0.8)
+        XCTAssertNil(sampler.last?.display)
+
+        h.display.brightness = 0.3
+        try await waitFor { try self.h.store.loadState()?.savedDisplayBrightness == nil }
+
+        let decided = try XCTUnwrap(try h.store.loadState())
+        XCTAssertNil(decided.savedDisplayBrightness)
+        XCTAssertFalse(decided.displayRestoreRefused)
+        XCTAssertNil(decided.keptDisplayReadLit, "the record goes with its entry")
+        XCTAssertNil(decided.keptDisplayUnderLowPower)
+        XCTAssertEqual(h.display.sets, [])
+        XCTAssertEqual(sampler.last?.display, 0.3)
     }
 
     /// The same reading while state.json refuses every write: the record
     /// is owed, and this process holds it, so a 0 read under the mode is
     /// not written over. Once the journal takes writes, the next write
-    /// records it, and a launch after a restart finds it and, at the
-    /// reading after its first, leaves the user's 0 as set.
+    /// records it, and a launch after a restart finds it and leaves the
+    /// user's 0 as set, with the entry waiting, until the panel reads
+    /// above 0.
     func testAReadingAboveZeroTheJournalRefusedIsHeldAndRecordedLater() async throws {
         try seedKeptDisplay()
         h.clamshell.closed = false
@@ -1773,15 +1789,113 @@ final class RefusedDarkeningTests: XCTestCase {
         _ = await m.end(reason: .user)
         XCTAssertEqual(h.display.sets, [])
 
-        let restarted = h.makeManager(keptRecheckDelay: .milliseconds(100), bootSession: "a later boot")
+        let restarted = h.makeManager(keptRecheckDelay: .milliseconds(20), keptRecheckAttempts: 3, keptRecheckSlowDelay: .milliseconds(20), bootSession: "a later boot")
         let sampler = follow(restarted)
         await restarted.reconcile()
+        try await waitFor { self.logText().contains("\(self.zeroWaits); still so after 3 readings") }
 
-        XCTAssertEqual(try h.store.loadState()?.savedDisplayBrightness, 0.8, "the first 0 since the launch decides nothing")
+        XCTAssertTrue(logText().contains("\(zeroWaits); still so after 3 readings"), logText())
+        XCTAssertEqual(try h.store.loadState()?.savedDisplayBrightness, 0.8, "no reading of 0 decides")
+        XCTAssertEqual(h.display.sets, [])
+        XCTAssertNil(sampler.last?.display)
+
+        h.display.brightness = 0.6
         try await waitFor { try self.h.store.loadState()?.savedDisplayBrightness == nil }
 
+        XCTAssertNil(try h.store.loadState()?.savedDisplayBrightness)
         XCTAssertEqual(h.display.sets, [])
-        XCTAssertEqual(sampler.last?.display, 0)
+        XCTAssertEqual(sampler.last?.display, 0.6)
+    }
+
+    /// The same reading refused by state.json, and the user sets 0 by hand
+    /// and quits while the record is still owed. The agent never needs
+    /// that reading, but a relaunch without it would write 0.8 over the 0.
+    /// So the end does not let quit go: "Restore incomplete" says Insomnia
+    /// retries and not to quit until state.json can be written, and the
+    /// end stays pending. Once state.json takes writes, the next end
+    /// records the reading and lets quit go, and a relaunch leaves the 0
+    /// as it is.
+    func testQuitWaitsWhileAReadingAboveZeroIsOwed() async throws {
+        try seedKeptDisplay()
+        h.clamshell.closed = false
+        h.display.brightness = 0.4
+        let m = h.makeManager(retryDelay: 3600)
+        let actions = makeDarkening(m, sampler: nil)
+        await m.start(duration: 3600)
+        let on = await m.setLowPower(true)
+        XCTAssertTrue(on)
+        let file = h.home.paths.stateFile.path
+        try FileManager.default.setAttributes([.immutable: true], ofItemAtPath: file)
+        defer { try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: file) }
+        await actions.onOpen()
+        XCTAssertNil(try h.store.loadState()?.keptDisplayReadLit)
+        XCTAssertEqual(m.effectiveState.keptDisplayReadLit, 0.8)
+        h.display.brightness = 0
+
+        let held = await m.end(reason: .quit)
+
+        XCTAssertEqual(held, .incomplete(agentArmed: false), "quit waits while only this process holds the reading")
+        XCTAssertEqual(m.pendingEnd, .quit)
+        XCTAssertEqual(m.effectiveState.keptDisplayReadLit, 0.8, "still held")
+        let body = try XCTUnwrap(h.notifier.posts.last { $0.title == SessionManager.incompleteTitle }?.body)
+        XCTAssertTrue(body.contains("do not quit until state.json can be written"), body)
+        XCTAssertEqual(h.display.sets, [])
+
+        try FileManager.default.setAttributes([.immutable: false], ofItemAtPath: file)
+        let done = await m.end(reason: .quit)
+
+        XCTAssertEqual(done, .restored)
+        XCTAssertNil(m.pendingEnd)
+        XCTAssertEqual(try h.store.loadState()?.keptDisplayReadLit, 0.8)
+
+        let relaunched = h.makeManager()
+        await relaunched.reconcile()
+
+        XCTAssertEqual(h.display.sets, [], "the user's 0 is not written over")
+        XCTAssertEqual(h.display.brightness, 0)
+        XCTAssertEqual(try h.store.loadState()?.savedDisplayBrightness, 0.8)
+    }
+
+    /// With no session and nothing else to undo, a launch reads the kept
+    /// 0.8 at 0.4 after Insomnia's Low Power Mode was on over it in this
+    /// boot, and state.json refuses the record of that reading. The end of
+    /// a quit has nothing for the agent, and would report a full restore,
+    /// but it does not let quit go while the record is owed. Once
+    /// state.json takes writes, the next end records it and lets quit go.
+    func testQuitWaitsWhenOnlyAReadingAboveZeroIsOwed() async throws {
+        var st = RuntimeState()
+        st.savedDisplayBrightness = 0.8
+        st.displayRestoreRefused = true
+        st.keptDisplayUnderLowPower = 0.8
+        st.keptDisplayUnderLowPowerBoot = "this boot"
+        try h.store.saveState(st)
+        h.clamshell.closed = false
+        h.display.brightness = 0.4
+        let m = h.makeManager(retryDelay: 3600, bootSession: "this boot")
+        let file = h.home.paths.stateFile.path
+        try FileManager.default.setAttributes([.immutable: true], ofItemAtPath: file)
+        defer { try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: file) }
+        await m.reconcile()
+        XCTAssertNil(m.pendingEnd)
+        XCTAssertNil(try h.store.loadState()?.keptDisplayReadLit)
+        XCTAssertEqual(m.effectiveState.keptDisplayReadLit, 0.8)
+
+        let held = await m.end(reason: .quit)
+
+        XCTAssertEqual(held, .incomplete(agentArmed: false))
+        XCTAssertEqual(m.pendingEnd, .quit)
+        XCTAssertEqual(h.backstop.arms, 0, "nothing for the agent")
+        let body = try XCTUnwrap(h.notifier.posts.last { $0.title == SessionManager.incompleteTitle }?.body)
+        XCTAssertTrue(body.contains("state.json could not record a reading of the display brightness kept after a refused restore"), body)
+        XCTAssertTrue(body.contains("do not quit until state.json can be written"), body)
+
+        try FileManager.default.setAttributes([.immutable: false], ofItemAtPath: file)
+        let done = await m.end(reason: .quit)
+
+        XCTAssertEqual(done, .restored)
+        XCTAssertNil(m.pendingEnd)
+        XCTAssertEqual(try h.store.loadState()?.keptDisplayReadLit, 0.8)
+        XCTAssertEqual(h.display.sets, [])
     }
 
     /// An open reads the kept 0.8 at 0.4 under Insomnia's Low Power Mode,
@@ -1843,7 +1957,7 @@ final class RefusedDarkeningTests: XCTestCase {
         let opened = try XCTUnwrap(try h.store.loadState())
         XCTAssertEqual(opened.savedDisplayBrightness, 0.8)
         XCTAssertTrue(opened.displayRestoreRefused)
-        XCTAssertTrue(logText().contains("display brightness 0.8, kept after a refused restore, reads 0 at the first reading since the lid closed over it, after a reading above 0 showed its darkening undone; that 0 may still be the one auto-brightness pulled the panel down to under the closing lid, so it is not yet taken as a level set since, and the kept value is not written"), logText())
+        XCTAssertTrue(logText().contains(zeroWaits), logText())
 
         h.display.brightness = 0.5
         try await waitFor { try self.h.store.loadState()?.savedDisplayBrightness == nil }
@@ -1855,15 +1969,16 @@ final class RefusedDarkeningTests: XCTestCase {
         XCTAssertFalse(logText().contains("that 0 is a level set since"), logText())
     }
 
-    /// The same, after the user set the panel to 0 by hand. The open reads
-    /// 0 and waits; the re-read a moment later, the lid open and the panel
-    /// awake, still reads 0 and takes it as the level set since: the entry
-    /// goes without a write, and 0 is the sample. The next close journals
-    /// that sample, and the open after it never writes 0.8.
-    func testAZeroSetByHandBeforeTheCloseIsTakenAtALaterReadingAfterTheOpen() async throws {
+    /// The same, after the user set the panel to 0 by hand. The close
+    /// leaves the entry undecided, and the open and every re-read after it
+    /// read 0 and wait: that 0 may be the user's or one macOS holds the
+    /// panel at. Nothing is written or sampled, at the next close and open
+    /// too, so the user's 0 stays and 0.8 never comes back. The panel read
+    /// at 0.4 later decides the entry.
+    func testAZeroSetByHandBeforeTheCloseWaitsForAReadingAboveZero() async throws {
         try await journalAReadingAboveZeroInAnEarlierBoot()
         h.display.brightness = 0
-        let m = h.makeManager(keptRecheckDelay: .milliseconds(100), bootSession: "a later boot")
+        let m = h.makeManager(keptRecheckDelay: .milliseconds(20), keptRecheckAttempts: 3, keptRecheckSlowDelay: .milliseconds(20), bootSession: "a later boot")
         let sampler = follow(m)
         let actions = makeDarkening(m, sampler: sampler)
         await m.start(duration: 3600)
@@ -1876,34 +1991,45 @@ final class RefusedDarkeningTests: XCTestCase {
         XCTAssertTrue(closed.displayRestoreRefused)
 
         h.clamshell.closed = false
+        let readsBefore = h.display.reads
         await actions.onOpen()
+        try await waitFor { self.logText().contains("\(self.zeroWaits); still so after 3 readings") }
 
-        XCTAssertEqual(try h.store.loadState()?.savedDisplayBrightness, 0.8, "the first 0 after the lid closed decides nothing")
-        try await waitFor { try self.h.store.loadState()?.savedDisplayBrightness == nil }
-
-        let decided = try XCTUnwrap(try h.store.loadState())
-        XCTAssertFalse(decided.displayRestoreRefused)
-        XCTAssertNil(decided.keptDisplayReadLit)
+        XCTAssertTrue(logText().contains("\(zeroWaits); still so after 3 readings"), logText())
+        XCTAssertGreaterThanOrEqual(h.display.reads - readsBefore, 4, "the open's reading and three re-reads")
+        let waiting = try XCTUnwrap(try h.store.loadState())
+        XCTAssertEqual(waiting.savedDisplayBrightness, 0.8, "no reading of 0 decides")
+        XCTAssertTrue(waiting.displayRestoreRefused)
+        XCTAssertEqual(waiting.keptDisplayReadLit, 0.8)
         XCTAssertEqual(h.display.sets, [])
-        XCTAssertEqual(sampler.last?.display, 0)
-        XCTAssertTrue(logText().contains("display brightness 0.8, kept after a refused restore, reads 0 after a reading above 0 showed its darkening undone; that 0 is a level set since"), logText())
+        XCTAssertNil(sampler.last?.display, "nothing sampled")
 
         h.clamshell.closed = true
         await actions.onClose()
-        XCTAssertEqual(try h.store.loadState()?.savedDisplayBrightness, 0, "the sample")
         h.clamshell.closed = false
         await actions.onOpen()
 
-        XCTAssertFalse(h.display.sets.contains(0.8), "\(h.display.sets)")
+        XCTAssertEqual(h.display.sets, [], "the user's 0 is not written over")
         XCTAssertEqual(h.display.brightness, 0)
+        XCTAssertEqual(try h.store.loadState()?.savedDisplayBrightness, 0.8)
+        XCTAssertNil(sampler.last?.display)
+
+        h.display.brightness = 0.4
+        try await waitFor { try self.h.store.loadState()?.savedDisplayBrightness == nil }
+
+        XCTAssertNil(try h.store.loadState()?.savedDisplayBrightness)
+        XCTAssertNil(try h.store.loadState()?.keptDisplayReadLit)
+        XCTAssertEqual(h.display.sets, [])
+        XCTAssertEqual(sampler.last?.display, 0.4)
     }
 
     /// A reading above 0 left by an earlier boot, and a close over the
     /// panel asleep, which leaves the kept 0.8 undecided. The open finds
     /// the panel awake at 0, and an end follows at once. Neither reading
     /// takes that 0 as a level set since: the panel may still be at the 0
-    /// auto-brightness pulled it down to under the closing lid. Nothing is
-    /// written, and the entry stays for the re-read.
+    /// auto-brightness pulled it down to under the closing lid, and no
+    /// reading of 0 tells that from a 0 the user set. Nothing is written,
+    /// and the entry stays for the re-read.
     func testAZeroReadRightAfterTheOpenIsNotYetALevelSetSince() async throws {
         try await journalAReadingAboveZeroInAnEarlierBoot()
         h.display.brightness = 0.2
@@ -1927,8 +2053,7 @@ final class RefusedDarkeningTests: XCTestCase {
         XCTAssertEqual(waiting.savedDisplayBrightness, 0.8)
         XCTAssertTrue(waiting.displayRestoreRefused)
         XCTAssertEqual(waiting.keptDisplayReadLit, 0.8)
-        XCTAssertTrue(logText().contains("display brightness 0.8, kept after a refused restore, reads 0 at the first reading since the lid closed over it, after a reading above 0 showed its darkening undone"), logText())
-        XCTAssertTrue(logText().contains("display brightness 0.8, kept after a refused restore, reads 0 less than 3600.0 seconds after the first reading of 0 since the lid closed over it, after a reading above 0 showed its darkening undone"), logText())
+        XCTAssertGreaterThanOrEqual(logText().components(separatedBy: zeroWaits).count - 1, 2, "the open and the end: \(logText())")
         XCTAssertFalse(logText().contains("that 0 is a level set since"), logText())
     }
 
@@ -1966,25 +2091,38 @@ final class RefusedDarkeningTests: XCTestCase {
     /// A reading above 0 left by an earlier boot, and a launch of a later
     /// boot under a closed lid, with no session: the re-read waits for the
     /// lid. Once it opens the panel reads 0, which may still be the closing
-    /// lid's: that first reading waits, and a reading a re-read delay or
-    /// more after it takes the 0 as set since. Nothing is written. One
-    /// quick re-read only, so the re-read logs what it waits for.
-    func testAReReadAfterTheLidWasClosedTakesAZeroOnlyAtTheReadingAfter() async throws {
+    /// lid's, and no re-read takes it as set since, however many come.
+    /// Nothing is written or sampled. One quick re-read only, so the
+    /// re-read logs what it waits for, then the slow ones; the panel read
+    /// at 0.5 decides the entry.
+    func testAReReadAfterTheLidWasClosedLeavesAZeroUndecided() async throws {
         try await journalAReadingAboveZeroInAnEarlierBoot()
         h.clamshell.closed = true
         h.display.brightness = 0
         let m = h.makeManager(keptRecheckDelay: .milliseconds(50), keptRecheckAttempts: 1, keptRecheckSlowDelay: .milliseconds(20), bootSession: "a later boot")
+        let sampler = follow(m)
         await m.reconcile()
         try await waitFor { self.logText().contains("brightness re-check: the lid is not known to be open") }
 
+        let readsBefore = h.display.reads
         h.clamshell.closed = false
+        try await waitFor { self.h.display.reads - readsBefore >= 5 }
+
+        XCTAssertGreaterThanOrEqual(h.display.reads - readsBefore, 5)
+        XCTAssertTrue(logText().contains("\(zeroWaits); still so after 1 readings"), logText())
+        let waiting = try XCTUnwrap(try h.store.loadState())
+        XCTAssertEqual(waiting.savedDisplayBrightness, 0.8, "no reading of 0 decides")
+        XCTAssertTrue(waiting.displayRestoreRefused)
+        XCTAssertEqual(waiting.keptDisplayReadLit, 0.8)
+        XCTAssertEqual(h.display.sets, [])
+        XCTAssertNil(sampler.last?.display)
+
+        h.display.brightness = 0.5
         try await waitFor { try self.h.store.loadState()?.savedDisplayBrightness == nil }
 
+        XCTAssertNil(try h.store.loadState()?.savedDisplayBrightness)
         XCTAssertEqual(h.display.sets, [])
-        let log = logText()
-        let waited = try XCTUnwrap(log.range(of: "reads 0 at the first reading since the lid closed over it, after a reading above 0 showed its darkening undone; that 0 may still be the one auto-brightness pulled the panel down to under the closing lid, so it is not yet taken as a level set since, and the kept value is not written; still so after 1 readings"), log)
-        let decided = try XCTUnwrap(log.range(of: "reads 0 after a reading above 0 showed its darkening undone; that 0 is a level set since"), log)
-        XCTAssertLessThan(waited.lowerBound, decided.lowerBound)
+        XCTAssertEqual(sampler.last?.display, 0.5)
     }
 
     /// Greptile's relaunch trace, with Insomnia gone before the open. A
@@ -2024,7 +2162,7 @@ final class RefusedDarkeningTests: XCTestCase {
         XCTAssertTrue(waiting.displayRestoreRefused, "and is undecided")
         XCTAssertEqual(waiting.keptDisplayReadLit, 0.8)
         XCTAssertNil(sampler.last?.display, "nothing sampled")
-        XCTAssertTrue(logText().contains("display brightness 0.8, kept after a refused restore, reads 0 at the first reading since Insomnia launched, which does not know whether the lid closed over it before, after a reading above 0 showed its darkening undone; that 0 may still be the one auto-brightness pulled the panel down to under the closing lid, so it is not yet taken as a level set since, and the kept value is not written"), logText())
+        XCTAssertTrue(logText().contains(zeroWaits), logText())
         XCTAssertFalse(logText().contains("that 0 is a level set since"), logText())
 
         h.display.brightness = 0.5
@@ -2037,14 +2175,12 @@ final class RefusedDarkeningTests: XCTestCase {
         XCTAssertFalse(logText().contains("that 0 is a level set since"), logText())
     }
 
-    /// The same, with Insomnia gone after the open read its first 0 and
-    /// before the reading after it. The new process starts its own wait
-    /// and takes nothing from the earlier one's timing: its first 0 waits
-    /// although the earlier first 0 is more than a re-read delay old.
-    /// The panel stays at 0, and only the new process's re-read, a re-read
-    /// delay after its own first 0, takes that 0 as set since, without a
-    /// write.
-    func testARelaunchAfterTheOpensFirstZeroWaitsAgain() async throws {
+    /// The same, with Insomnia gone after the open read its first 0. The
+    /// new process reads the panel still at 0, and neither its first
+    /// reading nor any re-read after it takes that 0 as set since, however
+    /// late: nothing is written, cleared or sampled. The panel read at 0.5
+    /// decides the entry.
+    func testARelaunchAfterTheOpensFirstZeroStillWaits() async throws {
         try await journalAReadingAboveZeroInAnEarlierBoot()
         h.display.brightness = 0.5
         let gone = h.makeManager(bootSession: "a later boot")
@@ -2056,28 +2192,29 @@ final class RefusedDarkeningTests: XCTestCase {
         h.clamshell.closed = false
         await goneActions.onOpen()
         XCTAssertEqual(try h.store.loadState()?.savedDisplayBrightness, 0.8)
-        XCTAssertTrue(logText().contains("display brightness 0.8, kept after a refused restore, reads 0 at the first reading since the lid closed over it"), logText())
-        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertTrue(logText().contains(zeroWaits), logText())
 
-        let relaunched = h.makeManager(keptRecheckDelay: .milliseconds(200), bootSession: "a later boot")
+        let relaunched = h.makeManager(keptRecheckDelay: .milliseconds(20), keptRecheckAttempts: 3, keptRecheckSlowDelay: .milliseconds(20), bootSession: "a later boot")
         let sampler = follow(relaunched)
+        let readsBefore = h.display.reads
         await relaunched.reconcile()
+        try await waitFor { self.h.display.reads - readsBefore >= 6 }
 
+        XCTAssertGreaterThanOrEqual(h.display.reads - readsBefore, 6)
         XCTAssertEqual(h.display.sets, [], "no restore")
         let waiting = try XCTUnwrap(try h.store.loadState())
         XCTAssertEqual(waiting.savedDisplayBrightness, 0.8, "the kept value stays")
         XCTAssertTrue(waiting.displayRestoreRefused, "and is undecided")
         XCTAssertEqual(waiting.keptDisplayReadLit, 0.8)
         XCTAssertNil(sampler.last?.display, "nothing sampled")
-        XCTAssertTrue(logText().contains("reads 0 at the first reading since Insomnia launched, which does not know whether the lid closed over it before"), logText())
         XCTAssertFalse(logText().contains("that 0 is a level set since"), logText())
 
+        h.display.brightness = 0.5
         try await waitFor { try self.h.store.loadState()?.savedDisplayBrightness == nil }
 
         XCTAssertEqual(h.display.sets, [])
-        XCTAssertEqual(sampler.last?.display, 0)
+        XCTAssertEqual(sampler.last?.display, 0.5)
         XCTAssertNil(try XCTUnwrap(try h.store.loadState()).keptDisplayReadLit)
-        XCTAssertTrue(logText().contains("display brightness 0.8, kept after a refused restore, reads 0 after a reading above 0 showed its darkening undone; that 0 is a level set since"), logText())
     }
 
     /// A reading above 0 is journaled for the kept 0.8 it read. A launch

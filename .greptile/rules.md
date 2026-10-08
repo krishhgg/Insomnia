@@ -34,10 +34,17 @@ restores, `savedOutputVolume`, `savedMuted`, `savedAudioOutputs`,
 `savedDisplayBrightness`, `savedKeyboardBrightness` and
 `displayRestoredUnderLowPower`: CoreAudio and the private brightness
 frameworks need the app. The app's records `keptDisplayUnderLowPower`,
-`keptDisplayUnderLowPowerBoot` and `keptDisplayReadLit` are kept as they
-are too, also when `lowPowerSetByUs` is cleared; both scripts check their
-types, and the two numbers must fit a Swift Float, or the journal is
-malformed. `savedAudioOutputs` entries alone leave the
+`keptDisplayUnderLowPowerBoot` and `keptDisplayReadLit` are kept too. When
+the backstop's `lowpowermode 0` exits 0 and the journal has
+`keptDisplayUnderLowPower`, it writes its own `kern.bootsessionuuid` (empty
+if unreadable) to `keptDisplayUnderLowPowerBoot`, so the app doubts that
+entry's readings in that boot. Both scripts check the records' types and
+read the three keys from the file's text too (`record_text_problems`, the
+same in both): each number must be null or a JSON number that a Swift
+Float holds and that does not round to 0 from a nonzero value (plutil turns
+1e-400 into 0.0), and a key found twice or a `\u` escape of a letter
+anywhere in the file is refused. Any of these makes the journal malformed,
+so nothing is undone and uninstall removes nothing. `savedAudioOutputs` entries alone leave the
 journal clean for the backstop (an entry can wait days for its device), but
 uninstall stops on them. A saved brightness flagged
 `displayRestoreRefused` or `keyboardRestoreRefused` (the app's private-call
@@ -56,10 +63,12 @@ restart. A claim on the mode written before the Mac last started (its record
 of the kept entry names another boot) is read before the switch-off: read
 off, it puts no doubt on the reading. A reading above 0 of the kept entry is
 journaled (`keptDisplayReadLit`), and a later 0 is then not overwritten with
-the saved value, in that run or any later one. A 0 read under the closing lid
-is no level set since: a close with no sample leaves the entry flagged, and the
-first 0 read after the lid was closed over the entry, or the first since a
-launch, waits 3 s for another reading. Legacy
+the saved value, in that run or any later one. No 0 read after it is taken
+as a level set since either, however late, since macOS may still hold the
+panel at a closing lid's 0: the entry stays flagged, with the display sample
+held, until the panel reads above 0. A close with no sample leaves the entry
+flagged. If state.json refuses `keptDisplayReadLit`, an end returns
+`.incomplete(agentArmed: false)` and Quit waits until it lands. Legacy
 `frozenPids` entries are never signaled or cleared by the shell. A flag is
 cleared only after its undo succeeded; a journal that is unreadable or has a
 known key of the wrong type is left untouched and the run exits 1.
@@ -155,7 +164,10 @@ Flag a change that breaks one of these; do not flag the behavior itself.
 - `backstop.sh`, kept entries. Saved audio, saved display and keyboard
   brightness, `displayRestoredUnderLowPower` and the records
   `keptDisplayUnderLowPower`, `keptDisplayUnderLowPowerBoot` and
-  `keptDisplayReadLit` are kept for the app, not restored by the shell.
+  `keptDisplayReadLit` are kept for the app, not restored by the shell,
+  except that a backstop run whose `lowpowermode 0` exits 0 gives
+  `keptDisplayUnderLowPowerBoot` its own boot. The records are read from
+  the file's text as well as through plutil (`record_text_problems`).
   Legacy `frozenPids` are never signaled or cleared there, even when the
   pid is gone (spec section 8).
 - `ProcessControl.swift`, `LidActions.swift`, `backstop.sh`. Only pids

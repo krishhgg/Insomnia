@@ -493,6 +493,7 @@ final class FakeDisplayDimmer: DisplayDimming, @unchecked Sendable {
     private let lock = NSLock()
     private var _brightness: Float
     private var _sets: [Float] = []
+    private var _reads = 0
     private var _sleepRequests = 0
     private var _wakes = 0
     private var _asleep = false
@@ -518,6 +519,8 @@ final class FakeDisplayDimmer: DisplayDimming, @unchecked Sendable {
     }
     /// Every value written, in order.
     var sets: [Float] { lock.withLock { _sets } }
+    /// How many reads answered, failed ones left out.
+    var reads: Int { lock.withLock { _reads } }
     var sleepRequests: Int { lock.withLock { _sleepRequests } }
     var wakes: Int { lock.withLock { _wakes } }
 
@@ -525,7 +528,10 @@ final class FakeDisplayDimmer: DisplayDimming, @unchecked Sendable {
 
     func readBrightness() throws -> Float {
         if throwOnRead { throw DisplayPowerError(what: "read brightness") }
-        return brightness
+        return lock.withLock {
+            _reads += 1
+            return _brightness
+        }
     }
 
     func setBrightness(_ value: Float) throws {

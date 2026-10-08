@@ -139,19 +139,21 @@ whose brightness is journaled, and each level written from the journal
 or found set since becomes its sample, so a close right after a late
 restore journals that level. A display reading above 0 under Insomnia's
 own Low Power Mode, or after it in the same boot, relaunches included,
-decides nothing, and a launch after a restart reads the entry again; a
-later reading of 0, in that run, a relaunch or after a restart, does not
-bring the kept value back either (the reading above 0 is journaled), and
-once no doubt is left that 0 is the level set since, unless the reading
-above 0 was taken under a closing lid, of a panel asleep, or of another
-entry. A Low Power Mode claim journaled before a restart is read before the
-switch-off, and a mode read off then puts no doubt on the panel's reading.
-A close with no trusted level leaves the entry flagged and the panel lit,
-and only asks the display to sleep. After a reading above 0, a close whose
-only level is a 0 read under the closing lid leaves the entry flagged too,
-and the first 0 read after the lid was closed over the entry, or the first
-since a launch, waits 3 s for another reading before it counts as a level
-set since. A write whose clear state.json refuses is still written again 2 s
+decides nothing, and a launch after a restart reads the entry again. A
+backstop run whose `lowpowermode 0` exits 0 gives that record its own boot,
+so a launch in that boot doubts the reading too. A later reading of 0, in
+that run, a relaunch or after a restart, does not bring the kept value back
+either (the reading above 0 is journaled), unless the reading above 0 was
+taken under a closing lid, of a panel asleep, or of another entry. That 0
+is not taken as a level set since either, however late it is read, since
+macOS may still hold the panel at a closing lid's 0: the entry stays
+flagged until the panel reads above 0. If state.json refuses that record,
+Quit waits until it lands. A Low Power Mode claim journaled before a
+restart is read before the switch-off, and a mode read off then puts no
+doubt on the panel's reading. A close with no trusted level leaves the
+entry flagged and the panel lit, and only asks the display to sleep. After
+a reading above 0, a close whose only level is a 0 read under the closing
+lid leaves the entry flagged too. A write whose clear state.json refuses is still written again 2 s
 later and, under the mode, after it. A `lowpowermode 0` that exits 0 while
 state.json refuses the ownership clear still does the write owed after
 the mode, and the display sample stays the level written after it until
@@ -185,9 +187,12 @@ is performed. Do not replace "not run" with "passed" based on source review.
 | A kept brightness at a launch with no session and the lid closed (an external display in clamshell mode, after a refused restore), on a build that can make the call: the log shows "not read: the lid is not known to be open" for each kept device and nothing is written, and once the lid opens "set since its restore" or "restored" | Not run |
 | A kept display brightness restored late during a session (launch with the display asleep after a refused restore, wake it, start a session at once, wait for "display restored", then close and open the lid within 30 s): the close logs "display darkened (was brightness" with the restored level, and the open brings the panel back at that level, not black | Not run |
 | A kept display brightness under Insomnia's own Low Power Mode, on a build that can make the call (after a refused restore, set the display by hand, start a session on battery below the floor so Insomnia switches the mode on, then open the lid): the log shows "under our low power mode, which rescales it" and nothing is written; once the mode is off, "after our low power mode was on in this run" and nothing is written, and a close logs "stays journaled and undecided, and the display is not darkened" and the panel goes dark only if the display sleep request is honored; after a relaunch with the lid open, "since the Mac last started" and nothing is written; after a restart, "set since its restore" with the level set by hand, and a close and open after that bring back that level | Not run |
-| A kept display brightness over a restart with Insomnia's Low Power Mode claimed (as in the row above, quit the app with `kill -9` while the mode is on, restart the Mac, set the display by hand, then launch on battery): the log shows "journaled as ours before the Mac last started, reads on" or "reads off"; with "reads off", "set since its restore" at that launch; with "reads on", nothing is written until the next restart. After an open under the mode read the panel above 0, set the display to 0 by hand, relaunch and then restart: the kept value never comes back over that 0, and after the restart the log shows "that 0 is a level set since" | Not run |
-| A kept display brightness read above 0 that a close under the closing lid reads at 0 (as in the row above, after the launch that leaves the entry waiting, keep the display asleep until the session starts, wake it with auto-brightness on, then close the lid in a dark room before the next re-read): the close logs "where auto-brightness under the closing lid may have pulled it down" and "stays journaled and undecided", nothing is written at the close or the open, and the open logs "at the first reading since the lid closed over it" if the panel still reads 0; a few seconds later the level the panel reads is left as set, and 0 is never written | Not run |
-| The same entry across a relaunch (as in the row above, quit Insomnia after the close with the lid still closed, open the lid, and relaunch Insomnia while the panel still reads 0): the launch logs "at the first reading since Insomnia launched", nothing is written, and a few seconds later the level the panel reads is left as set, and 0 is never written | Not run |
+| A kept display brightness over a restart with Insomnia's Low Power Mode claimed (as in the row above, quit the app with `kill -9` while the mode is on, restart the Mac, set the display by hand, then launch on battery): the log shows "journaled as ours before the Mac last started, reads on" or "reads off"; with "reads off", "set since its restore" at that launch; with "reads on", nothing is written until the next restart. After an open under the mode read the panel above 0, set the display to 0 by hand, relaunch and then restart: the kept value never comes back over that 0, after the restart the log shows "only a reading above 0 tells them apart" and the entry stays in state.json, and once the display is raised above 0 by hand, "set since its restore" with that level | Not run |
+| A kept display brightness when the recovery agent switches Insomnia's Low Power Mode off after a restart (as in the row above, quit with `kill -9` while the mode is on, restart the Mac, and wait for "pmset -b lowpowermode 0 ok" in the backstop log before launching on battery): state.json's `keptDisplayUnderLowPowerBoot` is this boot's `kern.bootsessionuuid`, the launch logs "since the Mac last started" and writes nothing, and after the next restart "set since its restore" | Not run |
+| Quit while a reading above 0 of the kept display entry is not yet in state.json (as in the restart row above, `chflags uchg` state.json before the launch after the restart that reads the panel above 0, then Quit): the menu says "do not quit until state.json can be written" and Insomnia keeps running; after `chflags nouchg`, Quit within the next retry quits, and state.json has `keptDisplayReadLit` | Not run |
+| A kept display brightness read above 0 that a close under the closing lid reads at 0 (as in the row above, after the launch that leaves the entry waiting, keep the display asleep until the session starts, wake it with auto-brightness on, then close the lid in a dark room before the next re-read): the close logs "where auto-brightness under the closing lid may have pulled it down" and "stays journaled and undecided", nothing is written at the close or the open, and while the panel reads 0 the open and every re-read log "only a reading above 0 tells them apart" and the entry stays in state.json; once the panel reads above 0, "set since its restore" with that level, and the kept value is never written | Not run |
+| The same entry across a relaunch (as in the row above, quit Insomnia after the close with the lid still closed, open the lid, and relaunch Insomnia while the panel still reads 0): the launch logs "only a reading above 0 tells them apart" while the panel reads 0, nothing is written, and once the panel reads above 0, "set since its restore" with that level | Not run |
+| Backstop and uninstall with a hand-edited state.json whose `keptDisplayReadLit` is `1e-400` (a copy of a journal from the restart row above, in a test home): the backstop logs "is unreadable or malformed; nothing undone, evidence kept", uninstall prints "state.json is unreadable or malformed" and removes nothing, and state.json is unchanged | Not run |
 | Freeze-all scope with agents running (Cursor/T3 Code/Claude untouched) | Not run |
 | Freeze-all off on a fresh config.json (list only) and on with a terminal, a non-Chrome browser and a JetBrains IDE open (all untouched) | Not run |
 | Real lid close with freeze-all on during a Zoom or Teams call on AirPods, with Wispr Flow or Granola taking notes: none of their processes stopped (`ps -o stat` shows no `T`), the call and the notes continue, other Dock apps frozen, sound muted | Not run |

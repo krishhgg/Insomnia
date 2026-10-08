@@ -93,10 +93,20 @@
 #                              records about a display restore under its Low
 #                              Power Mode and about a kept display entry.
 #                              Nothing to undo and not dirty: never read for
-#                              an undo here, and kept exactly as they are for
-#                              the app, also when lowPowerSetByUs is cleared.
-#                              Their types are checked, and the two numbers
-#                              about the kept entry must fit a Float.
+#                              an undo here, and kept as they are for the
+#                              app, with one change. When this run switches
+#                              Low Power Mode off, a record of the kept entry
+#                              gets this boot's kern.bootsessionuuid (empty
+#                              if it cannot be read) as
+#                              keptDisplayUnderLowPowerBoot, so the app takes
+#                              no reading of that entry in this boot as the
+#                              user's level while the panel comes back from
+#                              the mode. Their types are checked, and the
+#                              three keys about the kept entry are also read
+#                              from the file's text (record_text_problems): a
+#                              number the app cannot decode, a key found twice
+#                              or a \u escape of a letter makes the journal
+#                              malformed.
 #       appNapOverrides     -> NSAppSleepDisabled the app set to YES in an
 #                              agent app's preferences, with the value it had
 #                              before: defaults write <bundleId>
@@ -485,27 +495,62 @@ stop_transaction() { # what
   exit 1
 }
 
-# Prints why the number at keypath $2 would not decode as a Swift Float, or
-# nothing. The app's JSONDecoder refuses a number a Float cannot hold: above
-# about 3.4028236e38, or so small it would round to 0 (below about 7.0065e-46).
-# plutil's XML form prints the value with 17 significant digits, in the
-# d.ddde+NN form at both ends, so the exponent and the first 9 digits are read
-# from that. A little stricter than the app (from 3.40282356e38 and up to
-# 7.01e-46), where no brightness lies: the journal then counts as malformed,
-# as for a wrong type, and nothing is undone.
-float_range_problem() { # file keypath
-  local x exp mag lead form='<real>-?([0-9])(\.([0-9]+))?e([-+][0-9]+)</real>'
-  x="$("$PLUTIL" -extract "$2" xml1 -o - "$1" 2>/dev/null)" || return 0
-  [[ "$x" =~ $form ]] || return 0
-  exp="${BASH_REMATCH[4]}"
-  mag=$((10#${exp#[-+]}))
-  lead="${BASH_REMATCH[3]}00000000"
-  lead=$((10#${BASH_REMATCH[1]}${lead:0:8}))
-  if [[ "$exp" == -* ]]; then
-    if (( mag > 46 || (mag == 46 && lead < 701000000) )); then echo "$2 is too small a number for the app to read"; fi
-  elif (( mag > 38 || (mag == 38 && lead > 340282355) )); then
-    echo "$2 is too large a number for the app to read"
+# Prints one line per way the app's records about a kept display entry would
+# not decode, or nothing. Read from the text of state.json $1 itself, not
+# through plutil, which turns a number too small for a Double, such as
+# 1e-400, into 0.0, reads 1., .5 and +1 as numbers, and keeps the last of two
+# copies of a key where the app's JSONDecoder keeps the first. Each of the
+# two numbers must be null or a JSON number a Swift Float holds: not above
+# about 3.4028236e38, and either 0 in every digit or not so small that it
+# rounds to 0 (below about 7.0065e-46). The range is read from the decimal
+# exponent and the first 9 significant digits, a little stricter than the
+# app (from 3.40282356e38 and up to 7.01e-46), where no brightness lies. A key
+# found more than once, or a \u escape of a letter anywhere in the file
+# (which could spell one of these keys, and which the app never writes), is
+# refused too. A copy in a nested object counts, though the app reads only
+# the top level, and the app never writes one. Any of these makes the journal
+# malformed, as for a wrong type, and nothing is undone.
+record_text_problems() { # file
+  local text rest key token n esc number pattern digits sig exp e10 lead
+  esc='\\u00(4[1-9A-Fa-f]|5[0-9Aa]|6[1-9A-Fa-f]|7[0-9Aa])'
+  number='^-?(0|[1-9][0-9]*)(\.([0-9]+))?([eE]([-+]?)([0-9]+))?$'
+  text="$(<"$1")"
+  if [[ "$text" =~ $esc ]]; then
+    echo "state.json spells a letter with a \\u escape, which the app never writes, so its records about a kept display entry cannot be checked"
+    return 0
   fi
+  for key in keptDisplayUnderLowPower keptDisplayReadLit keptDisplayUnderLowPowerBoot; do
+    pattern="\"$key\"[[:space:]]*:[[:space:]]*([^],}[:space:]]*)"
+    rest="$text"
+    n=0
+    while [[ "$rest" =~ $pattern ]]; do
+      n=$((n + 1))
+      token="${BASH_REMATCH[1]}"
+      rest="${rest#*"${BASH_REMATCH[0]}"}"
+      # The boot is a string, whose type plutil checks.
+      [[ "$key" == keptDisplayUnderLowPowerBoot || "$token" == null ]] && continue
+      [[ "$token" =~ $number ]] || { echo "$key is written as ${token:0:40}, which the app does not read as a number"; continue; }
+      digits="${BASH_REMATCH[1]}${BASH_REMATCH[3]}"
+      sig="${digits#"${digits%%[1-9]*}"}"
+      [[ -n "$sig" ]] || continue
+      exp="${BASH_REMATCH[6]#"${BASH_REMATCH[6]%%[1-9]*}"}"
+      if (( ${#exp} > 18 )); then
+        e10=1000000000000000000
+      else
+        e10=$((10#0$exp))
+      fi
+      [[ "${BASH_REMATCH[5]}" == - ]] && e10=$((-e10))
+      e10=$((e10 + ${#BASH_REMATCH[1]} - 1 - (${#digits} - ${#sig})))
+      lead="${sig}00000000"
+      lead=$((10#${lead:0:9}))
+      if (( e10 < -46 || (e10 == -46 && lead < 701000000) )); then
+        echo "$key is ${token:0:40}, too small a number for the app to read"
+      elif (( e10 > 38 || (e10 == 38 && lead > 340282355) )); then
+        echo "$key is ${token:0:40}, too large a number for the app to read"
+      fi
+    done
+    if (( n > 1 )); then echo "$key is in state.json $n times; the app reads the first and plutil the last"; fi
+  done
   return 0
 }
 
@@ -531,14 +576,11 @@ journal_shape_problems() { # file
   # the journal at all.
   for key in keptDisplayUnderLowPower keptDisplayReadLit; do
     t="$(type_of "$f" "$key")"
-    if [[ "$t" == float ]]; then
-      float_range_problem "$f" "$key"
-    elif [[ -n "$t" && "$t" != integer && "$t" != "(any)" ]]; then
-      echo "$key is a $t, not a number"
-    fi
+    [[ -z "$t" || "$t" == float || "$t" == integer || "$t" == "(any)" ]] || echo "$key is a $t, not a number"
   done
   t="$(type_of "$f" keptDisplayUnderLowPowerBoot)"
   [[ -z "$t" || "$t" == string || "$t" == "(any)" ]] || echo "keptDisplayUnderLowPowerBoot is a $t, not a string"
+  record_text_problems "$f"
   t="$(type_of "$f" frozenProcesses)"
   if [[ -n "$t" && "$t" != "(any)" ]]; then
     if [[ "$t" != array ]]; then
@@ -879,10 +921,23 @@ if [[ "$sleep_held" == true ]]; then
 fi
 
 new_low="$low_power"
+stamp_record=0; record_boot=""
 if [[ "$low_power" == true ]]; then
   if run_bounded "$SUDO" -n "$PMSET" -b lowpowermode 0; then
     log info "pmset -b lowpowermode 0 ok"
     new_low=false; changed=1
+    # The app's record of a kept display entry the mode was over
+    # (keptDisplayUnderLowPower): the mode may have been on in this boot
+    # until now, and the panel comes back from it over a time nobody has
+    # measured, so the record is given this boot. The app then takes no
+    # reading of that entry in this boot as the user's level, as when it
+    # switches the mode off itself. A boot that cannot be read is written
+    # empty, which the app reads as this boot's too.
+    t="$(type_of "$STATE" keptDisplayUnderLowPower)"
+    if [[ "$t" == float || "$t" == integer ]]; then
+      stamp_record=1
+      record_boot="$("$SYSCTL" -n kern.bootsessionuuid 2>/dev/null || true)"
+    fi
   else
     if (( command_alive )); then stop_transaction "pmset -b lowpowermode 0"; fi
     log error "pmset -b lowpowermode 0 failed; keeping journal entry for retry"
@@ -1217,6 +1272,9 @@ if (( changed == 1 )); then
   fi
   if (( publish_ok == 1 )) && [[ "$new_low" != "$low_power" ]]; then
     "$PLUTIL" -replace lowPowerSetByUs -bool "$new_low" "$tmp" >/dev/null 2>&1 || publish_ok=0
+  fi
+  if (( publish_ok == 1 && stamp_record == 1 )); then
+    "$PLUTIL" -replace keptDisplayUnderLowPowerBoot -string "$record_boot" "$tmp" >/dev/null 2>&1 || publish_ok=0
   fi
   if (( publish_ok == 1 )) && [[ "$new_docker" != "$docker_frozen" ]]; then
     "$PLUTIL" -replace dockerFrozen -bool "$new_docker" "$tmp" >/dev/null 2>&1 || publish_ok=0

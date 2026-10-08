@@ -220,7 +220,8 @@ final class SessionManager {
         var lowPowerOff = false
         /// The kept display entry with this value read above 0
         /// (`noteKeptDisplayReadLit`). Applied only while the entry still
-        /// holds that value and its flag.
+        /// holds that value and its flag. An end does not let quit go
+        /// while it is owed (`performEnd`).
         var displayReadLit: Float?
 
         var isEmpty: Bool {
@@ -371,18 +372,6 @@ final class SessionManager {
     /// The re-read has logged that the lid is not known to be open, so the
     /// reads at the slow pace while it stays so log nothing.
     @ObservationIgnored private var keptRecheckSawLidClosed = false
-    /// The lid closed over the display entry kept after a refused restore
-    /// since a reading last decided or timed it, and when the first 0
-    /// after that was read (see `zeroSinceLidClosedWait`). In this process
-    /// only: a launch does not know whether the lid closed over the entry
-    /// before it, maybe while Insomnia was not running, so it starts as if
-    /// it had.
-    private enum LidOverKeptDisplay {
-        case launched
-        case closed
-        case readZero(at: ContinuousClock.Instant, since: String)
-    }
-    @ObservationIgnored private var lidOverKeptDisplay: LidOverKeptDisplay? = .launched
     /// The pending in-process retry of the saved output volumes
     /// (`scheduleAudioRetry`). One at a time.
     @ObservationIgnored private var audioRetryTask: Task<Void, Never>?
@@ -1380,7 +1369,13 @@ final class SessionManager {
         let waiting = outputsWaitingForRestore
         let waitingUIDs = Set(waiting.map(\.deviceUID))
         let dirty = journalNeedsRestore(leavingOutAudioOf: waitingUIDs)
-        if dirty || retainedBecause != nil {
+        // A reading above 0 of the kept display entry that the journal has
+        // not taken is in this process only. The agent never needs it,
+        // but the next launch does: without it, a 0 the user sets reads as
+        // the darkening never undone and gets the kept value. So quit
+        // waits until it reaches the disk, as for a hidden failed restore.
+        let owedReadLit = owedEdits.displayReadLit
+        if dirty || retainedBecause != nil || owedReadLit != nil {
             // The journal is the retry list. Make sure something will read it.
             var armed = true
             if dirty {
@@ -1409,8 +1404,12 @@ final class SessionManager {
             if armed, owedEdits.hidesARestore {
                 Log.info("end: the recovery agent cannot see a failed brightness restore whose flag the journal has not taken; Insomnia retries it itself")
             }
-            let agentCanFinish = armed && !owedEdits.hidesARestore
-            let detail = lastError ?? "some changes could not be undone"
+            if let owedReadLit {
+                Log.info("end: the journal has not taken that display brightness \(owedReadLit), kept after a refused restore, read above 0; a relaunch without it would write that value over a 0 set since, so Insomnia keeps it and retries")
+            }
+            let agentCanFinish = armed && !owedEdits.hidesARestore && owedReadLit == nil
+            let detail = dirty ? (lastError ?? "some changes could not be undone")
+                : "state.json could not record a reading of the display brightness kept after a refused restore"
             let retry: String
             if agentCanFinish {
                 // The agent keeps saved output volumes, display brightness
@@ -1428,6 +1427,8 @@ final class SessionManager {
                 if owesAudio { sentences.append(Self.audioRetrySentence(recoveryRetryDelay)) }
                 if owesBrightness { sentences.append(Self.brightnessRetrySentence) }
                 retry = sentences.joined(separator: " ")
+            } else if owedReadLit != nil {
+                retry = "Insomnia retries in \(Int(recoveryRetryDelay)) s; do not quit until state.json can be written."
             } else {
                 retry = "Insomnia retries in \(Int(recoveryRetryDelay)) s; do not quit until it is restored."
             }
@@ -2113,21 +2114,21 @@ final class SessionManager {
     /// boot. A reading of 0 still writes the kept value, owed once more
     /// after the mode as for any restore under it, unless that entry read
     /// above 0 since, in this run or an earlier one
-    /// (`RuntimeState.keptDisplayReadLit`): that 0 may be the user's. It is
-    /// then left as set, with the entry cleared, once no doubt is left,
-    /// and waits until then. A 0 read soon after the lid closed over the
-    /// entry, or soon after a launch, waits too (`zeroSinceLidClosedWait`).
+    /// (`RuntimeState.keptDisplayReadLit`): that 0 may be the user's, or
+    /// one macOS still holds the panel at, as auto-brightness can after a
+    /// lid close, for a time nobody has measured. No reading of 0 tells
+    /// the two apart, however late, so the entry waits with nothing
+    /// written, and the sampler stays held, until the panel reads above 0.
+    /// A 0 the user set stays as set, and so do the entry and its refusal
+    /// message, until then.
     private func restoreDisplay(saved: Float, waiting: inout [String], errors: inout [String]) -> Float? {
         if effectiveState.displayRestoreRefused {
-            if clamshell() != false { noteLidClosedOverKeptDisplay() }
             switch keptLevel(read: { try display.readBrightness() },
                              untrusted: { display.isAsleep() ? "the display is asleep" : nil }) {
             case .undecided(let why):
                 waiting.append("display brightness \(saved), kept after a refused restore, not read: \(why)")
                 return nil
             case .setSince(let now):
-                // A panel lit again is no longer at a closing lid's 0.
-                lidOverKeptDisplay = nil
                 if let doubt = keptDisplayReadDoubt {
                     noteKeptDisplayReadLit(saved)
                     waiting.append("display brightness \(saved), kept after a refused restore, reads \(now) \(doubt); that is not taken as a level set since")
@@ -2142,21 +2143,12 @@ final class SessionManager {
             case .dark where effectiveState.keptDisplayReadLitHolds:
                 if let doubt = keptDisplayReadDoubt {
                     waiting.append("display brightness \(saved), kept after a refused restore, reads 0 \(doubt), after a reading above 0 showed its darkening undone; that 0 may be a level set since, so the kept value is not written")
-                    return nil
+                } else {
+                    waiting.append("display brightness \(saved), kept after a refused restore, reads 0 after a reading above 0 showed its darkening undone; that 0 may be a level set since or one macOS still holds the panel at after a lid close, and only a reading above 0 tells them apart, so the kept value is not written")
                 }
-                if let wait = zeroSinceLidClosedWait() {
-                    waiting.append("display brightness \(saved), kept after a refused restore, reads 0 \(wait), after a reading above 0 showed its darkening undone; that 0 may still be the one auto-brightness pulled the panel down to under the closing lid, so it is not yet taken as a level set since, and the kept value is not written")
-                    return nil
-                }
-                Log.info("display brightness \(saved), kept after a refused restore, reads 0 after a reading above 0 showed its darkening undone; that 0 is a level set since")
-                clearSetSince("display brightness", saved: saved, now: 0, owed: \.display, errors: &errors) { s in
-                    s.savedDisplayBrightness = nil
-                    s.displayRestoreRefused = false
-                }
-                didSettleBrightness?(0, nil)
                 return nil
             case .dark:
-                lidOverKeptDisplay = nil
+                break
             }
         }
         do {
@@ -2268,7 +2260,6 @@ final class SessionManager {
         let rereadKeyboard = kept.savedKeyboardBrightness != nil && kept.keyboardRestoreRefused && keyboard.refusal() == nil
         guard rereadDisplay || rereadKeyboard || !owedEdits.clearsWaiting.isEmpty else { return }
         guard clamshell() == false || !(rereadDisplay || rereadKeyboard) else {
-            if rereadDisplay { noteLidClosedOverKeptDisplay() }
             if !keptRecheckSawLidClosed {
                 keptRecheckSawLidClosed = true
                 Log.info("brightness re-check: the lid is not known to be open, so the kept value is not read; checked again every \(keptRecheckSlowDelay) until it is")
@@ -3019,8 +3010,10 @@ final class SessionManager {
     /// (`keptDisplayReadDoubt`): its darkening is undone. Journaled for
     /// later runs, a restart included (`RuntimeState.keptDisplayReadLit`).
     /// If the journal cannot be written the record is owed, so this
-    /// process still holds it (see `owedEdits`), and a quit before it
-    /// lands leaves the next launch without it, as before any reading.
+    /// process still holds it (see `owedEdits`), and an end does not let
+    /// Quit go until it lands (`performEnd`). A crash, a forced quit or a
+    /// lost disk before then leaves the next launch without it, as before
+    /// any reading.
     private func noteKeptDisplayReadLit(_ saved: Float) {
         guard effectiveState.keptDisplayReadLit != saved else { return }
         do {
@@ -3028,48 +3021,6 @@ final class SessionManager {
         } catch {
             owedEdits.displayReadLit = saved
             Log.error("display brightness \(saved), kept after a refused restore, read above 0, but the journal could not record it: \(error.localizedDescription); this process holds it, and the next journal write or transaction tries again")
-        }
-    }
-
-    /// The lid is closed, or not known to be open, over a display entry
-    /// kept after a refused restore: by a lid close that left it undecided
-    /// (`LidActions`), or seen by a reading or re-read that waits for the
-    /// lid. Auto-brightness may pull the panel down to 0 under the closing
-    /// lid, and the panel can still read that 0 when the lid is open again.
-    func noteLidClosedOverKeptDisplay() {
-        let s = effectiveState
-        guard s.savedDisplayBrightness != nil, s.displayRestoreRefused else { return }
-        lidOverKeptDisplay = .closed
-    }
-
-    /// Why a 0 read of the kept display entry, with the lid known open and
-    /// the panel awake, is not yet taken as a level set since, or nil when
-    /// it may be: after the lid closed over the entry
-    /// (`noteLidClosedOverKeptDisplay`), the first such 0 may still be the
-    /// closing lid's. So may the first since a launch, which does not know
-    /// whether the lid closed over the entry before it, as after a quit or
-    /// a crash with the lid closed. It is timed, and only a 0 read
-    /// `keptRecheckDelay` or more after it decides, as the sampler waits
-    /// 3 s after each open before it reads the panel as the user's. Each
-    /// reading that waits sets the re-read going, so that later reading
-    /// comes.
-    private func zeroSinceLidClosedWait() -> String? {
-        let now = ContinuousClock.now
-        switch lidOverKeptDisplay {
-        case nil:
-            return nil
-        case .launched:
-            lidOverKeptDisplay = .readZero(at: now, since: "since Insomnia launched")
-            return "at the first reading since Insomnia launched, which does not know whether the lid closed over it before"
-        case .closed:
-            lidOverKeptDisplay = .readZero(at: now, since: "since the lid closed over it")
-            return "at the first reading since the lid closed over it"
-        case .readZero(let at, let since):
-            guard at.duration(to: now) < keptRecheckDelay else {
-                lidOverKeptDisplay = nil
-                return nil
-            }
-            return "less than \(keptRecheckDelay) after the first reading of 0 \(since)"
         }
     }
 

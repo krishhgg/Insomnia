@@ -173,8 +173,11 @@ struct RuntimeState: Codable, Equatable, Sendable {
     /// from before the Mac last started (`lowPowerClaimFromEarlierBoot`).
     /// A record with no boot session to compare holds, and the next write
     /// that knows the boot gives it that one. Not something to undo; the
-    /// scripts check its type and keep it for the app. Left out of the
-    /// JSON when nil.
+    /// scripts check it and keep it for the app. backstop.sh, when it
+    /// switches the mode off and clears `lowPowerSetByUs`, gives the record
+    /// its own boot (empty if it cannot read it): the mode may have been on
+    /// in that boot until then, before Insomnia launched in it. Left out of
+    /// the JSON when nil.
     var keptDisplayUnderLowPower: Float? = nil
     var keptDisplayUnderLowPowerBoot: String? = nil
     /// A display brightness kept after a refused restore that read above 0
@@ -183,10 +186,12 @@ struct RuntimeState: Codable, Equatable, Sendable {
     /// saved value. That reading shows the close's darkening undone, so a
     /// later 0 may be a level the user set, and the kept value is not
     /// written over it, in this run or a later one, after a restart too:
-    /// a restart does not darken the panel again. Only for the entry with
-    /// that value and its flag: the journal write that settles, replaces
-    /// or unflags it drops it (`dropKeptDisplayReadLitUnlessKept`). Not
-    /// something to undo; the scripts check its type and keep it for the
+    /// a restart does not darken the panel again. That 0 is not taken as
+    /// the user's level either, since macOS may still hold the panel at
+    /// it: the entry waits until the panel reads above 0. Only for the
+    /// entry with that value and its flag: the journal write that settles,
+    /// replaces or unflags it drops it (`dropKeptDisplayReadLitUnlessKept`).
+    /// Not something to undo; the scripts check it and keep it for the
     /// app. Left out of the JSON when nil.
     var keptDisplayReadLit: Float? = nil
     /// Agent apps whose App Nap preference Insomnia set for the session,
