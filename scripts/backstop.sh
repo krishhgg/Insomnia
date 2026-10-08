@@ -52,19 +52,24 @@
 #   - A valid session this run ends (a check above, or --force) is over
 #     from that decision: session.json is removed before anything is undone,
 #     so an undo that cannot finish (saved brightness only the app restores,
-#     a failing or hung pmset) never leaves a session a relaunched app would
-#     resume. What is left stays in state.json for the next run and the app.
+#     a failing or hung pmset) does not leave a session a relaunched app
+#     would resume (the one gap is below). What is left stays in state.json
+#     for the next run and the app.
 #     A session.json that cannot be removed (an immutable file) is recorded
 #     as ended in ended-session.json, a copy of its bytes. When that file
 #     cannot be written either (an unrelated record there that cannot be
 #     replaced), the record goes in state.json instead: endedSession, the
-#     same bytes in base64. Either record is written before anything is
-#     undone. While one matches the file, the app restores that session
-#     instead of resuming it, and every run ends it again without the
-#     checks and retries the removal. If neither record can be written,
-#     sleep is still restored but its journal entry stays, and the run exits
-#     1. The app writes the journal before it resumes a session, so it
-#     resumes none while state.json cannot be written.
+#     same bytes in base64. When state.json cannot be written either, the
+#     copy goes in a new file beside them, ended-session.json.<8 letters or
+#     digits> (mktemp). Each record is written before anything is undone.
+#     While one matches the file, the app restores that session instead of
+#     resuming it, and every run ends it again without the checks and
+#     retries the removal. If no record can be written (the folder takes no
+#     new file), sleep is still restored but its journal entry stays, and
+#     the run exits 1. The app writes the journal before it resumes a
+#     session, so it resumes none while state.json cannot be written. Once
+#     the folder and state.json take writes again, an app launched before
+#     the next run, with pmset reporting SleepDisabled 1, resumes it.
 #   - state.json missing or clean: nothing is undone and nothing privileged
 #     runs; an expired session.json is removed. Exit 0. Entries in
 #     savedAudioOutputs alone count as clean (see below).
@@ -827,28 +832,82 @@ journal_records_end() {
   [[ -n "$current" && "$recorded" == "$current" ]]
 }
 
+# Records written beside $ENDED under a fresh name when neither $ENDED nor
+# the journal can hold the record (record_end_aside): the same copy of
+# session.json's bytes. Only a regular file (not a symlink) whose name is
+# ended-session.json. and eight letters or digits counts, the names mktemp
+# here and the app (Store.recordSessionEndAside) create; anything else with
+# such a name is never opened or removed.
+is_end_record_aside() { # path
+  [[ "${1##*/}" =~ ^ended-session\.json\.[A-Za-z0-9]{8}$ && -f "$1" && ! -L "$1" ]]
+}
+
+# Whether a record aside matches session.json; sets aside_match to it.
+aside_match=""
+end_recorded_aside() {
+  local f
+  aside_match=""
+  [[ -f "$SESSION" ]] || return 1
+  for f in "$APP_SUPPORT"/ended-session.json.????????; do
+    is_end_record_aside "$f" || continue
+    if "$CMP" -s "$SESSION" "$f"; then
+      aside_match="$f"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Remove each record aside that matches no session.json: all of them once
+# the file is gone, and one that differs from it byte for byte. One that
+# cmp cannot compare (either file unreadable, session.json not a regular
+# file) stays: it is not shown to be stale, and it ends nothing while cmp
+# cannot match it. Never fails.
+remove_stale_end_records_aside() {
+  local f rc
+  for f in "$APP_SUPPORT"/ended-session.json.????????; do
+    is_end_record_aside "$f" || continue
+    rc=1
+    if [[ -e "$SESSION" || -L "$SESSION" ]]; then
+      [[ -f "$SESSION" ]] || continue
+      rc=0
+      "$CMP" -s "$SESSION" "$f" || rc=$?
+    fi
+    (( rc == 1 )) || continue
+    "$RM" -f "$f" 2>/dev/null \
+      || log warn "could not remove $f; it matches no session.json, so it ends nothing, but it stays until removed by hand (ls -lO shows its flags)"
+  done
+  return 0
+}
+
 # --- Was this session already ended? -----------------------------------------
 # A run or the app that ends a valid session but cannot remove session.json
 # records the end in $ENDED, a copy of the file's exact bytes (record_end),
 # or, when that cannot be written either, in the journal's endedSession
-# (record_end_in_journal). While a record matches, that session is over
+# (record_end_in_journal), or else in a new file beside them
+# (record_end_aside). While a record matches, that session is over
 # whatever its endsAt says: this run ends it again without the checks below
-# and retries the removal. A record at $ENDED that matches nothing (its
-# session.json was removed or replaced) is stale and goes; it could only
-# ever match the file it copied. rm unlinks a FIFO there without opening
-# it. An endedSession that matches nothing ends nothing; it stays until the
-# app removes it, which the app does before it writes a new session.json.
+# and retries the removal. A record at $ENDED or aside that matches nothing
+# (its session.json was removed or replaced) is stale and goes; it could
+# only ever match the file it copied. rm unlinks a FIFO at $ENDED without
+# opening it. An endedSession that matches nothing ends nothing; it stays
+# until the app removes it, which the app does before it writes a new
+# session.json.
 ended_before=0
 ended_where=""
 if [[ -e "$ENDED" ]] && ! end_recorded; then
   remove_end_record
 fi
+remove_stale_end_records_aside
 if end_recorded; then
   ended_before=1
   ended_where="$ENDED"
 elif journal_records_end; then
   ended_before=1
   ended_where="$STATE (endedSession)"
+elif end_recorded_aside; then
+  ended_before=1
+  ended_where="$aside_match"
 fi
 
 # --- Is a valid session still live? ------------------------------------------
@@ -879,33 +938,165 @@ app_alive() {
 # or the value is not one the app decodes (Int, Bool): a string "false" or
 # "30" is rejected here as the app rejects it, so both enforce the same rule.
 # plutil -extract raw prints a string and a number alike; the type comes from
-# plutil -type. JSONDecoder reads any number that is exactly an integer as an
-# Int (30.0, 3e1), so a float counts when it is whole. Its raw form is
-# rounded to six places, so the test reads the XML form, which prints 17
-# significant digits less trailing zeros: plain below 1e17 ("30", "0.0",
-# "30.000000100000001"), in exponent form from there ("9.2e+18"), where
-# every double is whole.
+# plutil -type. plutil reads config.json as JSON5, though, and rounds every
+# number with a fraction or exponent to a double, so its value alone cannot
+# say what the app's decoder (strict JSON) makes of the text. config_int
+# therefore reads the number's own text (config_number_text) and takes it
+# only when app_int_value proves the app reads that text as an Int. Anything
+# else (a form the app rejects, one it rounds, a file this reading cannot
+# follow) gets the larger of plutil's reading and the default: for endFloor,
+# its only caller, a higher floor ends a session sooner, so the agent never
+# keeps a session on a lower floor than the default because of a text the
+# app may reject.
 #
-# config_int clamps the value to min...max as the app does (Config's
-# agentCutoffs), and the app takes any Int, -9223372036854775808 through
-# 9223372036854775807; past that it rejects the file, and the default
-# stands. Shell arithmetic wraps at that range, so it never sees such a
-# value: 19 digits are compared in two halves, and a float in exponent
+# plutil's reading: an integer as printed; a float counts when it is whole.
+# Its raw form is rounded to six places, so the test reads the XML form,
+# which prints 17 significant digits less trailing zeros: plain below 1e17
+# ("30", "0.0", "30.000000100000001"), in exponent form from there
+# ("9.2e+18"), where every double is whole. It is clamped to min...max as
+# the app clamps (Config's agentCutoffs); shell arithmetic wraps at the Int
+# range, so 19 digits are compared in two halves, and a float in exponent
 # form by its exponent, then its 17 digits against 2^63, which prints as
-# 9.2233720368547758e+18 (the app takes a double that an Int holds, so
-# -2^63 counts and 2^63 does not). The few texts plutil rounds to -2^63
-# that the app still rejects (-9223372036854775809) are clamped too; the
-# app runs no session while a file it rejects is in place. Only a number
-# of up to 18 digits is computed with.
+# 9.2233720368547758e+18. Only a number of up to 18 digits is computed with.
 #
 # config.json is opened only when it is a regular file, as session.json and
 # state.json are: open(2) on a FIFO with no writer blocks while this run
-# holds the recovery lock. Anything else reads as a missing file, as the app
-# treats it (Store.readData; the app then moves it aside).
+# holds the lock. Anything else reads as a missing file, as the app treats
+# it (Store.readData; the app then moves it aside).
 config_is_file() { [[ -f "$CONFIG" ]]; }
+
+# Prints the text of the number config.json gives for key at the top level,
+# or returns 1 when this reading cannot vouch for the text the app's decoder
+# sees: the file is not a regular file of at most 16 KiB, holds a NUL byte,
+# or is not one strict JSON object (plutil also takes JSON5: comments, a
+# trailing comma, single quotes, +5, 0x5, other escapes); or a top-level key
+# is written with an escape, or the key appears twice at the top level, or
+# its value is not a number. Strings are checked for JSON's escapes and for
+# raw control characters (DEL too), not for UTF-8. At most 4096 tokens and
+# 64 levels of nesting are read (the decoder stops at 512 levels).
+config_number_text() { # key
+  local size text rest tok n=0 stack="" expect=value key="" found="" seen=0
+  # [:cntrl:] also refuses DEL, which JSON allows; bash 3.2 cannot hold
+  # bytes 1 and 127 in a regex, so no range is written out.
+  local ws=$' \t\n\r'
+  local str='"([^[:cntrl:]"\\]|\\["\\/bfnrt]|\\u[0-9A-Fa-f]{4})*"'
+  local tok_re="^[${ws}]*(${str}|[]{},:[]|[^]{},:\"${ws}[]+)"
+  local end_re="^[${ws}]*\$"
+  local num_re='^-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][-+]?[0-9]+)?$'
+  config_is_file || return 1
+  size="$(stat -f %z "$CONFIG" 2>/dev/null)" || return 1
+  [[ "$size" =~ ^[0-9]+$ ]] && (( size <= 16384 )) || return 1
+  # The trailing "." keeps trailing newlines; bash drops NUL bytes, which the
+  # length check then catches, as it does a file that changed size.
+  text="$(cat "$CONFIG" 2>/dev/null && echo .)" || return 1
+  text="${text%.}"
+  (( ${#text} == size )) || return 1
+  rest="$text"
+  while [[ "$rest" =~ $tok_re ]]; do
+    tok="${BASH_REMATCH[1]}"
+    rest="${rest:${#BASH_REMATCH[0]}}"
+    (( ++n <= 4096 )) || return 1
+    case "$expect:$tok" in
+      'key_or_close:}'|'next:}'|'value_or_close:]'|'next:]')
+        [[ "${stack: -1}$tok" == '{}' || "${stack: -1}$tok" == '[]' ]] || return 1
+        stack="${stack%?}"
+        expect=next
+        [[ -n "$stack" ]] || expect=end ;;
+      key:\"*|key_or_close:\"*)
+        if (( ${#stack} == 1 )); then
+          [[ "$tok" != *\\* ]] || return 1
+          key="$tok"
+        fi
+        expect=after_key ;;
+      'after_key::') expect=value ;;
+      'next:,')
+        expect=value
+        [[ "${stack: -1}" == '{' ]] && expect=key ;;
+      value:*|value_or_close:*)
+        # The top level is one object.
+        [[ -n "$stack" || "$tok" == '{' ]] || return 1
+        if (( ${#stack} == 1 )) && [[ "$key" == "\"$1\"" ]]; then
+          (( seen++ == 0 )) && [[ "$tok" =~ $num_re ]] || return 1
+          found="$tok"
+        fi
+        expect=next
+        case "$tok" in
+          '{') stack="${stack}{"; expect=key_or_close ;;
+          '[') stack="${stack}["; expect=value_or_close ;;
+          \"*|true|false|null) ;;
+          *) [[ "$tok" =~ $num_re ]] || return 1 ;;
+        esac
+        (( ${#stack} <= 64 )) || return 1 ;;
+      *) return 1 ;;
+    esac
+  done
+  [[ "$expect" == end && "$rest" =~ $end_re && -n "$found" ]] || return 1
+  echo "$found"
+}
+
+# Prints the Int the app's decoder makes of a JSON number text, clamped to
+# min...max, or returns 1 unless the text is one it was measured to take
+# as exactly that Int (JSONDecoder on this macOS, against private files):
+#   - an integer without fraction or exponent: any Int, -9223372036854775808
+#     through 9223372036854775807;
+#   - with a fraction or exponent: a value that is exactly a whole number,
+#     -9223372036854775807 through 9223372036854775295 (the decoder goes
+#     through a double, and from 9223372036854775296 that rounds to 2^63; it
+#     rejects -9223372036854775808 written this way), within 64 characters
+#     and an exponent of at most two digits once leading zeros go (five for
+#     zero).
+# A value that is not whole (4.9999999999999999, 1e-400) is left out: the
+# decoder takes some by rounding and rejects others (0.5).
+app_int_value() { # text min max, with 0 <= min <= max
+  local re='^(-?)(0|[1-9][0-9]*)(\.([0-9]+))?([eE]([-+]?)([0-9]+))?$'
+  local sign digits frac exp esign zeros scale limit=9223372036854775807
+  [[ "$1" =~ $re ]] || return 1
+  sign="${BASH_REMATCH[1]}"; digits="${BASH_REMATCH[2]}"; frac="${BASH_REMATCH[4]}"
+  esign="${BASH_REMATCH[6]}"; exp="${BASH_REMATCH[7]}"
+  if [[ -z "${BASH_REMATCH[3]}${BASH_REMATCH[5]}" ]]; then
+    [[ -n "$sign" ]] && limit=9223372036854775808
+  else
+    exp="${exp#"${exp%%[!0]*}"}"
+    digits="$digits$frac"
+    digits="${digits#"${digits%%[!0]*}"}"
+    (( ${#1} <= 64 )) || return 1
+    if [[ -z "$digits" ]]; then
+      # Zero, whatever the exponent.
+      (( ${#exp} <= 5 )) || return 1
+      digits=0
+    else
+      (( ${#exp} <= 2 )) || return 1
+      zeros="${digits##*[!0]}"
+      digits="${digits%"$zeros"}"
+      scale=$(( ${esign}1 * 10#${exp:-0} - ${#frac} + ${#zeros} ))
+      (( scale >= 0 && ${#digits} + scale <= 19 )) || return 1
+      while (( scale-- > 0 )); do digits="${digits}0"; done
+    fi
+    [[ -z "$sign" ]] && limit=9223372036854775295
+  fi
+  (( ${#digits} <= 19 )) || return 1
+  if (( ${#digits} == 19 )); then
+    (( 10#${digits:0:9} < 10#${limit:0:9} ||
+       (10#${digits:0:9} == 10#${limit:0:9} && 10#${digits:9} <= 10#${limit:9}) )) || return 1
+  fi
+  if [[ -n "$sign" && "$digits" != 0 ]]; then
+    echo "$2"
+  elif (( ${#digits} > 18 || 10#$digits > $3 )); then
+    echo "$3"
+  elif (( 10#$digits < $2 )); then
+    echo "$2"
+  else
+    echo "$((10#$digits))"
+  fi
+}
+
 config_int() { # key default min max, with 0 <= min <= max
-  local t="" v="" m="" limit
+  local t="" v="" m="" limit text r
   config_is_file && t="$(type_of "$CONFIG" "$1")"
+  if [[ "$t" == integer || "$t" == float ]] && text="$(config_number_text "$1")" &&
+      app_int_value "$text" "$3" "$4"; then
+    return 0
+  fi
   if [[ "$t" == integer ]]; then
     v="$(extract "$CONFIG" "$1" || true)"
     if [[ "$v" =~ ^-?([0-9]{19,})$ ]]; then
@@ -933,16 +1124,19 @@ config_int() { # key default min max, with 0 <= min <= max
     fi
   fi
   if [[ ! "$v" =~ ^(-?)0*([0-9]+)$ ]]; then
-    echo "$2"
+    r="$2"
   elif [[ -n "${BASH_REMATCH[1]}" && "${BASH_REMATCH[2]}" != 0 ]]; then
-    echo "$3"
+    r="$3"
   elif (( ${#BASH_REMATCH[2]} > 18 || 10#${BASH_REMATCH[2]} > $4 )); then
-    echo "$4"
+    r="$4"
   elif (( 10#${BASH_REMATCH[2]} < $3 )); then
-    echo "$3"
+    r="$3"
   else
-    echo "$((10#${BASH_REMATCH[2]}))"
+    r="$((10#${BASH_REMATCH[2]}))"
   fi
+  # Not proven: never below the default.
+  (( r >= $2 )) || r="$2"
+  echo "$r"
 }
 config_bool() { # key default
   local v=""
@@ -1075,21 +1269,23 @@ fi
 # which the next run and the app's reconcile complete without a session.
 #
 # A session.json that cannot be removed is recorded as ended instead, in
-# $ENDED or else in the journal, and the app and every later run honour the
-# record until the file is gone. The record is written here, before the
-# undo below, so no relaunch finds sleep restored and the session still
-# live. If neither can be written, nothing on disk says the session is
-# over: sleep is still restored below, since leaving it disabled is worse,
-# but its journal entry stays, so the journal reads dirty, uninstall.sh
-# stops, and every run exits 1 until a person makes the file removable. The
-# app resumes a session only once it has written the journal itself, so a
-# journal this run could not write keeps that session from resuming too.
+# $ENDED, else in the journal, else in a new file beside them, and the app
+# and every later run honour the record until the file is gone. The record
+# is written here, before the undo below, so no relaunch finds sleep
+# restored and the session still live. If none can be written (the folder
+# takes no new file), nothing on disk says the session is over: sleep is
+# still restored below, since leaving it disabled is worse, but its journal
+# entry stays, so the journal reads dirty, uninstall.sh stops, and every
+# run exits 1 until a person makes the file removable. The app resumes a
+# session only once it has written the journal itself, so a journal this
+# run could not write keeps that session from resuming too.
 
-# Remove session.json, then the record of its end, which means something
-# only while the file it copies is there. False when session.json stays.
+# Remove session.json, then the records of its end, which mean something
+# only while the file they copy is there. False when session.json stays.
 remove_session() {
   "$RM" -f "$SESSION" 2>/dev/null || return 1
   remove_end_record
+  remove_stale_end_records_aside
 }
 
 # Record that the session in session.json is over: a copy of its exact bytes
@@ -1142,6 +1338,25 @@ record_end_in_journal() {
   journal_records_end
 }
 
+# Record the same end in a new file beside $ENDED, for when neither $ENDED
+# nor the journal can be written (all three files immutable, say, while the
+# folder still takes new files). mktemp creates it 0600 under a name no
+# file had; it is filled from session.json and kept only when it reads back
+# identical. A record aside that already matches is used again, so a
+# session has at most one.
+record_end_aside() {
+  local f=""
+  if end_recorded_aside; then return 0; fi
+  [[ -f "$SESSION" ]] || return 1
+  f="$("$MKTEMP" "$APP_SUPPORT/ended-session.json.XXXXXXXX" 2>/dev/null)" || return 1
+  if is_end_record_aside "$f" && cat "$SESSION" > "$f" 2>/dev/null && "$CMP" -s "$SESSION" "$f"; then
+    aside_match="$f"
+    return 0
+  fi
+  [[ -z "$f" ]] || "$RM" -f "$f" 2>/dev/null || true
+  return 1
+}
+
 session_left=0      # 1 when the valid session this run ends is still on disk
 keep_sleep_entry=0  # 1 when nothing on disk records that end
 if [[ "$session_state" == valid ]] && ! remove_session; then
@@ -1150,9 +1365,11 @@ if [[ "$session_state" == valid ]] && ! remove_session; then
     log error "could not remove $SESSION; its end is recorded in $ENDED, so Insomnia restores the session instead of resuming it. Every run retries the removal"
   elif record_end_in_journal; then
     log error "could not remove $SESSION or record its end in $ENDED; its end is recorded in $STATE (endedSession) instead, so Insomnia restores the session instead of resuming it. Every run retries the removal"
+  elif record_end_aside; then
+    log error "could not remove $SESSION or record its end in $ENDED or $STATE; its end is recorded in $aside_match instead, so Insomnia restores the session instead of resuming it. Every run retries the removal"
   else
     keep_sleep_entry=1
-    log error "could not remove $SESSION or record its end in $ENDED or $STATE. Sleep is restored anyway, but sleepDisabledByUs stays journaled and every run exits 1 until the file can be removed (ls -lO shows its flags); Insomnia does not resume a session whose journaled sleep hold pmset no longer reports, and resumes none while it cannot write $STATE"
+    log error "could not remove $SESSION or record its end in $ENDED, $STATE or a new file in $APP_SUPPORT. Sleep is restored anyway, but sleepDisabledByUs stays journaled and every run exits 1 until the file can be removed (ls -lO shows its flags); Insomnia does not resume a session whose journaled sleep hold pmset no longer reports, and resumes none while it cannot write $STATE"
   fi
 fi
 

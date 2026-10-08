@@ -150,16 +150,18 @@ struct Store: Sendable {
         }
     }
     func saveSession(_ s: Session) throws { try write(s, to: paths.sessionFile) }
-    /// Removes session.json, then the record of its end, which means
-    /// something only while the file it copies is there. A record that
+    /// Removes session.json, then the records of its end, which mean
+    /// something only while the file they copy is there. A record that
     /// cannot be removed is left and logged: it matches no later
     /// session.json, but it is still a copy of the session's times.
     func deleteSession() throws {
         try remove(at: paths.sessionFile)
-        do {
-            try remove(at: paths.endedSessionFile)
-        } catch {
-            Log.error("could not remove \(paths.endedSessionFile.path) (\(error.localizedDescription)); it matches no session.json, so it ends nothing, but it stays until removed by hand")
+        for record in [paths.endedSessionFile] + sessionEndRecordsAside() {
+            do {
+                try remove(at: record)
+            } catch {
+                Log.error("could not remove \(record.path) (\(error.localizedDescription)); it matches no session.json, so it ends nothing, but it stays until removed by hand")
+            }
         }
     }
 
@@ -186,6 +188,57 @@ struct Store: Sendable {
             return false
         }
         return sessionEndIsRecorded()
+    }
+
+    /// The records written aside (Paths.endedSessionAsidePrefix): regular
+    /// files, not symlinks, with exactly that name shape, in name order.
+    /// Nothing else is ever opened or removed as one.
+    func sessionEndRecordsAside() -> [URL] {
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: paths.appSupport.path) else { return [] }
+        return names.filter(Paths.isEndedSessionAsideName).sorted().compactMap { name in
+            let url = paths.appSupport.appendingPathComponent(name)
+            var st = stat()
+            guard lstat(url.path, &st) == 0, st.st_mode & S_IFMT == S_IFREG else { return nil }
+            return url
+        }
+    }
+
+    /// The record aside that holds session.json's exact bytes, if one does:
+    /// that session is over, as with ended-session.json.
+    func sessionEndRecordAside() -> URL? {
+        let records = sessionEndRecordsAside()
+        guard !records.isEmpty, let current = try? readData(from: paths.sessionFile) else { return nil }
+        return records.first { (try? readData(from: $0)) == current }
+    }
+
+    /// For an end that could not remove session.json or write
+    /// ended-session.json or the journal: copies its bytes to a new file
+    /// beside them, created exclusively under a random name. A record
+    /// aside that already matches is used again. Returns the record, only
+    /// once it reads back identical to the file.
+    func recordSessionEndAside() -> URL? {
+        if let existing = sessionEndRecordAside() { return existing }
+        guard let current = try? readData(from: paths.sessionFile) else { return nil }
+        let letters = Array("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+        for _ in 0..<8 {
+            let suffix = String((0..<8).map { _ in letters.randomElement()! })
+            let url = paths.appSupport.appendingPathComponent(Paths.endedSessionAsidePrefix + suffix)
+            do {
+                try OwnerOnly.createFile(at: url, contents: current)
+            } catch OwnerOnlyError.open(_, EEXIST) {
+                continue
+            } catch OwnerOnlyError.write {
+                // Created here, then a write failed: the partial copy goes.
+                try? FileManager.default.removeItem(at: url)
+                return nil
+            } catch {
+                return nil
+            }
+            if (try? readData(from: url)) == current { return url }
+            try? FileManager.default.removeItem(at: url)
+            return nil
+        }
+        return nil
     }
 
     /// session.json's bytes in base64, the form `RuntimeState.endedSession`

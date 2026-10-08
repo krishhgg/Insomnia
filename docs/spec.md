@@ -469,10 +469,21 @@ When `pmset` lists no internal battery, the backstop asks `ioreg` for the
 `AppleSmartBattery` service, as `PowerMonitor` does: with no service the Mac
 is a desktop, and with one but no charger reported (`ExternalConnected`) the
 battery counts as unreadable and the session ends. It reads `endFloor` as the
-app decodes it, so a whole float such as `30.0` is 30, and clamps it to 0
-through 95 as `Config.normalizeFloors` does, over the whole range of a Swift
-`Int`: 9223372036854775807 is 95 and -9223372036854775808 is 0 on both
-sides. The backstop reads the scalar keys `endFloor` and `thermalRules` from
+app decodes it when it can check the number's text: config.json is one
+strict JSON object of at most 16 KiB, 4096 tokens and 64 levels, and the key
+appears once at the top level without escapes. Then an integer is read over
+the whole range of a Swift `Int`, a whole number written with a fraction or
+an exponent (`30.0`, `3e1`) from -9223372036854775807 through
+9223372036854775295, and the value is clamped to 0 through 95 as
+`Config.normalizeFloors` does: 9223372036854775807 is 95 and
+-9223372036854775808 is 0 on both sides. Any other text is read through
+`plutil`, which also takes JSON5 forms the app rejects (`+5`, a comment) and
+rounds numbers (-9223372036854775809 becomes -9.2233720368547758e+18), and
+the result is never below the default 10%. A number the app rejects
+therefore never lowers the backstop's floor below the default. A value the
+app rounds (`4.9999999999999999`), a file past those limits, a duplicate or
+escaped key and a trailing comma can give the backstop a higher floor than
+the app. The backstop reads the scalar keys `endFloor` and `thermalRules` from
 config.json directly, not through the app's decoder, so it cannot tell
 whether the app accepted the file. The app therefore takes those two values
 from a file that decodes, runs no session while a config.json it rejected
@@ -761,28 +772,45 @@ Backstop, independent of the app:
 - An end the agent decides is final from that decision. It removes
   `session.json` under the lock before it undoes anything, so an undo it
   cannot finish (a failing or hung `pmset`, saved audio or brightness only the
-  app restores) leaves journal entries, never a session a relaunched app would
-  resume. The app ends its side when it sees `session.json` gone.
+  app restores) leaves journal entries, not a session to resume. The app ends
+  its side when it sees `session.json` gone. A file that cannot be removed is
+  recorded as ended instead (below); the one gap is a folder that takes no
+  new file.
 - A `session.json` that cannot be removed (an immutable file) is recorded as
   ended in `ended-session.json`, a copy of its bytes. The app writes the same
   record when its own end cannot remove the file. When `ended-session.json`
   cannot be written either (an unrelated record there that cannot be
   replaced), the end is recorded in the journal instead: `endedSession` in
-  `state.json`, the same bytes in base64. The agent and the app write the
-  record before they undo anything. While a record matches the file, the app
-  restores that session instead of resuming it, and each agent run ends it
-  again and retries the removal. `endedSession` is not an undo entry and
-  never makes the journal dirty; the app removes it before it writes a new
+  `state.json`, the same bytes in base64. When the journal cannot be
+  written either (all three files immutable), the record goes to a new file
+  in the same folder, `ended-session.json.` and eight letters or digits,
+  created exclusively (`mktemp` in the agent, `O_EXCL` with a random name in
+  the app), mode 0600, and kept only when it reads back identical. Only a
+  regular file of exactly that name counts; a symlink, a FIFO or another
+  name is never opened or removed. A record aside that already matches is
+  used again. The agent and the app write the record before they undo
+  anything. While a record matches the file, the app restores that session
+  instead of resuming it, whatever `SleepDisabled` reads, the 1 Hz tick ends
+  a session the app still holds, and each agent run ends it again and
+  retries the removal. `endedSession` is not an undo entry and never makes
+  the journal dirty; the app removes it before it writes a new
   `session.json` and after it removes one, so a record of one session never
-  ends another. If no record can be written, the agent still restores sleep
-  but keeps the `sleepDisabledByUs` entry and exits 1, so the journal stays
-  dirty and uninstall stops. A relaunch then finds that entry while `pmset`
-  reports `SleepDisabled 0`, and ends the session instead of resuming it
-  (step 2 in Reconcile), recording the end where it can; this holds once
-  `state.json`, or every file, can be written again. The app also writes the
-  journal before it resumes any session, so it resumes none while
-  `state.json` cannot be written, which covers an agent whose restore failed
-  as well.
+  ends another. A record aside is removed with `session.json` by the app and
+  the agent, and by each agent run once it differs from `session.json` byte
+  for byte or the file is gone; one `cmp` cannot read stays and ends
+  nothing. `uninstall.sh` removes the rest, with or without `--purge`. If no
+  record can be written at all, which needs a folder that takes no new
+  file, the agent still runs the restore but cannot write the status files
+  that confirm it, so the run reports no result, keeps the journal as it
+  was and exits 1, and uninstall stops. The app writes the journal before
+  it resumes any session, so it resumes none while `state.json` cannot be
+  written. A relaunch that finds `sleepDisabledByUs` while `pmset` reports
+  `SleepDisabled 0` ends the session instead of resuming it (step 2 in
+  Reconcile), recording the end where it can. Once the folder and
+  `state.json` can be written again, an app launched before the next agent
+  run with `SleepDisabled 1` (the restore failed, or something else set
+  it) resumes that session; the next agent run treats it as any live
+  session.
 - The battery and thermal reads have the undo commands' time limit but never
   hold the lock: they run with its descriptor closed, and one that ignores
   SIGTERM gets SIGKILL. A hung read fails only its own check, never the next
@@ -899,9 +927,12 @@ Backstop, independent of the app:
   Power Mode or notifications. A reboot alone does not end a session whose
   deadline is still ahead. If no Insomnia holds the alive lock when the agent
   first runs after login, the agent ends it. With launch at login on, the app can
-  start first; its reconcile then resumes the session as on any launch (step
-  2), and a healthy agent run keeps it until its deadline or a cutoff. These
-  scenarios require the separate hardware validation record.
+  start first; its reconcile then follows step 2. A session with an end
+  record is restored, not resumed. A journaled hold must still read
+  `SleepDisabled 1`, so the session resumes only if that setting survived
+  the reboot, which has not been measured, and is ended otherwise. A resumed
+  session lasts until its deadline or a cutoff. These scenarios require the
+  separate hardware validation record.
 
 ### 9. Notifications
 

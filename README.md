@@ -341,17 +341,20 @@ Mac is on battery power with the charge below the end floor from `config.json`
 it. Or the thermal pressure level reported by `notifyutil` is critical. Each
 early end is logged with its reason, and the saved session is deleted before
 the restore starts. A restore that cannot finish leaves entries in the journal
-for the next run and the app, never a session that a relaunched app would
-resume. If the saved session cannot be deleted, its end is recorded beside it
-in `ended-session.json`, or, when that file cannot be written either, in the
-journal (`endedSession` in `state.json`). The record is written before
-anything is restored, and the app restores that session instead of resuming
-it. If no record can be written, the agent still restores sleep and leaves
-`sleepDisabledByUs` in the journal. The app does not resume a session whose
-journal says sleep is held while `pmset` reports it is not: it ends that
-session and records the end where it can, so making `state.json` or every
-file writable again does not bring the session back. Nor does it resume one
-while it cannot write the journal. Otherwise the session stands until its
+for the next run and the app. If the saved session cannot be deleted, its end
+is recorded beside it before anything is restored: in `ended-session.json`;
+when that file cannot be written, in the journal (`endedSession` in
+`state.json`); and when neither can be written, in a new file named
+`ended-session.json.` followed by eight letters or digits. While a record
+matches the saved session, the app restores that session instead of resuming
+it, whatever `pmset` reports, and every agent run ends it again. Only when the
+folder takes no new file either is nothing recorded. The agent still runs the
+restore, but it cannot confirm the result, so it keeps the journal and exits 1.
+The app resumes no session while it cannot write `state.json`, and none whose
+journal says sleep is held while `pmset` reports it is not. Once the folder and
+`state.json` can be written again, an app launched before the next agent run
+resumes that session if sleep still reads as disabled (the restore failed, or
+something else disabled sleep). Otherwise the session stands until its
 deadline, and sessions are capped at 24 hours by default (`maxDuration`).
 
 The app and backstop use the same lock so they do not restore and rewrite the

@@ -7,7 +7,8 @@ import Foundation
 /// with `setBattery`, notifyutil the thermal pressure level set with
 /// `setThermal`, sudo succeeds. Each call is recorded in dir/calls, and
 /// each sudo call also copies state.json as it was at that moment to
-/// dir/state-at-sudo (removed when there is none).
+/// dir/state-at-sudo (removed when there is none) and lists the names in
+/// INSOMNIA_HOME to dir/names-at-sudo.
 struct PatchedBackstop {
     let dir: URL
     let script: URL
@@ -28,6 +29,7 @@ struct PatchedBackstop {
         let thermal = dir.appendingPathComponent("thermal").path
         let battery = dir.appendingPathComponent("battery").path
         let stateAtSudo = dir.appendingPathComponent("state-at-sudo").path
+        let namesAtSudo = dir.appendingPathComponent("names-at-sudo").path
         let state = home.appendingPathComponent("state.json").path
         try "0".write(toFile: thermal, atomically: true, encoding: .utf8)
         try "25".write(toFile: battery, atomically: true, encoding: .utf8)
@@ -44,6 +46,7 @@ struct PatchedBackstop {
             "SUDO": #"""
             printf 'sudo %s\n' "$*" >> '\#(calls)'
             /bin/cp '\#(state)' '\#(stateAtSudo)' 2>/dev/null || /bin/rm -f '\#(stateAtSudo)'
+            /bin/ls -a '\#(home.path)' > '\#(namesAtSudo)'
             """#,
             "IOREG": "exit 0",
             "PS": "exit 1",
@@ -100,9 +103,34 @@ struct PatchedBackstop {
             .split(separator: "\n").map(String.init)
     }
 
+    /// Makes every sudo call fail (exit 1) after it is recorded: the
+    /// restore does not happen.
+    func failSudo() throws {
+        let sudo = dir.appendingPathComponent("sudo")
+        try (String(contentsOf: sudo, encoding: .utf8) + "exit 1\n").write(to: sudo, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: sudo.path)
+    }
+
+    /// Points MKTEMP at /usr/bin/false, so the agent cannot create the
+    /// record aside (ended-session.json.<8 letters or digits>). In a folder
+    /// that really takes no new file the agent's status files fail too;
+    /// RecoveryScriptTests runs that case.
+    func refuseRecordsAside() throws {
+        let text = try String(contentsOf: script, encoding: .utf8)
+        let line = "MKTEMP=/usr/bin/mktemp"
+        guard text.components(separatedBy: line).count == 2 else { throw PatchError(constant: "MKTEMP", hits: text.components(separatedBy: line).count - 1) }
+        try text.replacingOccurrences(of: line, with: "MKTEMP=/usr/bin/false").write(to: script, atomically: true, encoding: .utf8)
+    }
+
     /// The call that restores sleep.
     var restoreCall: String { "sudo -n \(dir.appendingPathComponent("pmset").path) -a disablesleep 0" }
 
     /// state.json as the last sudo call found it, or nil when there was none.
     var stateAtSudo: Data? { try? Data(contentsOf: dir.appendingPathComponent("state-at-sudo")) }
+
+    /// The names in INSOMNIA_HOME as the last sudo call found them.
+    var namesAtSudo: [String] {
+        ((try? String(contentsOf: dir.appendingPathComponent("names-at-sudo"), encoding: .utf8)) ?? "")
+            .split(separator: "\n").map(String.init)
+    }
 }

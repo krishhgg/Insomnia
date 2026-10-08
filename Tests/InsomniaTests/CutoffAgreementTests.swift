@@ -284,28 +284,49 @@ final class CutoffAgreementTests: XCTestCase {
 
     // MARK: End floors outside 0...95
 
-    /// endFloor as written in config.json, and the floor the app takes from
-    /// it, clamped to 0...95, or nil where the app rejects the file. Swift
-    /// decodes an Int from -2^63 through 2^63 - 1, and a number written as
-    /// a float when its Double is whole and an Int holds it; anything else
-    /// (a fraction, a string, a bool) fails the whole file. The texts
-    /// around 2^63 are the last that decode on each side and the first
-    /// that do not.
-    private static let endFloorsWrittenAsIntegers: [(text: String, app: Int?)] = [
-        ("0", 0), ("-1", 0), ("5", 5), ("94", 94), ("95", 95), ("96", 95), ("200", 95),
-        ("999999999999999999", 95), ("1000000000000000000", 95),
-        ("9223372036854775806", 95), ("9223372036854775807", 95),
-        ("-999999999999999999", 0), ("-1000000000000000000", 0),
-        ("-9223372036854775807", 0), ("-9223372036854775808", 0),
-        ("9223372036854775808", nil), ("18446744073709551615", nil), ("99999999999999999999", nil),
+    /// endFloor as written in config.json, the floor the app takes from it,
+    /// clamped to 0...95, or nil where the app rejects the file, and the
+    /// floor the agent enforces when it is not the app's (or 10% for a file
+    /// the app rejects). The decoder (measured on this macOS) takes an
+    /// integer from -2^63 through 2^63 - 1. A number with a fraction or
+    /// exponent goes through a double: a whole value from -2^63 + 1 through
+    /// 2^63 - 513 decodes, -2^63 written that way does not, and some values
+    /// that are not whole decode by rounding (4.9999999999999999 is 5)
+    /// while others fail the file (30.5). plutil reads the file as JSON5,
+    /// so +5, 5. and 0x5 are numbers to it. The texts around 2^63 are the
+    /// last that decode on each side and the first that do not.
+    private static let endFloorsWrittenAsIntegers: [(text: String, app: Int?, agent: Int?)] = [
+        ("0", 0, nil), ("-1", 0, nil), ("5", 5, nil), ("94", 94, nil), ("95", 95, nil), ("96", 95, nil), ("200", 95, nil),
+        ("999999999999999999", 95, nil), ("1000000000000000000", 95, nil),
+        ("9223372036854775806", 95, nil), ("9223372036854775807", 95, nil),
+        ("-999999999999999999", 0, nil), ("-1000000000000000000", 0, nil),
+        ("-9223372036854775807", 0, nil), ("-9223372036854775808", 0, nil),
+        ("9223372036854775808", nil, nil), ("18446744073709551615", nil, nil), ("99999999999999999999", nil, nil),
+        // The review's case: plutil rounds it to -2^63, which the app's
+        // decoder rejects; the agent keeps its default.
+        ("-9223372036854775809", nil, nil), ("-99999999999999999999", nil, nil),
+        // JSON5 forms plutil reads and the app rejects. Never below the
+        // default; +30 is read as 30, above it.
+        ("+5", nil, nil), ("0x5", nil, nil), ("05", nil, nil), ("+30", nil, 30),
     ]
 
-    private static let endFloorsWrittenAsFloats: [(text: String, app: Int?)] = [
-        ("30.0", 30), ("3e1", 30), ("29.999999999999999999", 30), ("0.0", 0), ("-0.0", 0),
-        ("1e2", 95), ("1e16", 95), ("1e17", 95), ("123456789012345678.5", 95),
-        ("9.2e18", 95), ("-9.2e18", 0), ("9223372036854775295.0", 95), ("-9223372036854775807.0", 0),
-        ("9223372036854775296.0", nil), ("1e19", nil), ("-1e19", nil),
-        ("30.5", nil), ("-0.5", nil), ("1e-1", nil), (#""30""#, nil), ("true", nil),
+    private static let endFloorsWrittenAsFloats: [(text: String, app: Int?, agent: Int?)] = [
+        ("30.0", 30, nil), ("3e1", 30, nil), ("29.999999999999999999", 30, nil), ("0.0", 0, nil), ("-0.0", 0, nil),
+        ("-5.0", 0, nil), ("-5e0", 0, nil), ("0.0e400", 0, nil),
+        ("1e2", 95, nil), ("1e16", 95, nil), ("1e17", 95, nil), ("123456789012345678.5", 95, nil),
+        ("9.2e18", 95, nil), ("-9.2e18", 0, nil), ("9223372036854775295.0", 95, nil), ("-9223372036854775807.0", 0, nil),
+        ("9223372036854775000.0", 95, nil), ("9.223372036854775295e18", 95, nil),
+        ("-9.2233720368547758e18", 0, nil), ("-0.9223372036854775807e19", 0, nil),
+        ("9223372036854775296.0", nil, nil), ("1e19", nil, nil), ("-1e19", nil, nil),
+        // plutil reads each of these as -2^63, which clamps to 0, and the
+        // app rejects every one.
+        ("-9223372036854775808.0", nil, nil), ("-9223372036854775807.5", nil, nil),
+        ("-9223372036854775000.5", nil, nil), ("-9.223372036854775808e18", nil, nil),
+        ("30.5", nil, nil), ("-0.5", nil, nil), ("1e-1", nil, nil), (#""30""#, nil, nil), ("true", nil, nil),
+        ("5.", nil, nil), ("-5.", nil, nil), (".5e1", nil, nil), ("+5.0", nil, nil),
+        // Not whole, but rounded to a whole value by the decoder: the agent
+        // proves only whole values and does not go below its default.
+        ("4.9999999999999999", 5, 10), ("1e-400", 0, 10), ("-100000000000000000.5", 0, 10),
     ]
 
     /// A session on disk whose journal holds sleep, as the app leaves one,
@@ -326,15 +347,17 @@ final class CutoffAgreementTests: XCTestCase {
 
     /// For each text, the floor the agent enforces on that config.json is
     /// the one the app takes from it, or the agent's default 10% where the
-    /// app rejects the file: the agent ends a session one point below it
-    /// and keeps it at it (at 0%, for a floor of 0, which is off).
-    private func assertTheAgentFollowsTheApp(_ table: [(text: String, app: Int?)],
+    /// app rejects the file, unless the row names another: the agent ends a
+    /// session one point below it and keeps it at it (at 0%, for a floor of
+    /// 0, which is off).
+    private func assertTheAgentFollowsTheApp(_ table: [(text: String, app: Int?, agent: Int?)],
                                              file: StaticString = #filePath, line: UInt = #line) async throws {
-        for (text, expected) in table {
+        for (text, expected, agentFloor) in table {
             try Data(#"{"endFloor": \#(text), "thermalRules": false}"#.utf8).write(to: h.home.paths.configFile)
             let app = try? h.store.loadConfig()?.agentCutoffs.endFloor
             XCTAssertEqual(app, expected, "the app on endFloor \(text)", file: file, line: line)
-            let floor = app ?? Config.agentDefaultCutoffs.endFloor
+            let floor = agentFloor ?? app ?? Config.agentDefaultCutoffs.endFloor
+            XCTAssertGreaterThanOrEqual(floor, app ?? Config.agentDefaultCutoffs.endFloor, "endFloor \(text): never weaker", file: file, line: line)
             if floor > 0 {
                 let below = try await agentEnds(atBattery: floor - 1, file: file, line: line)
                 XCTAssertTrue(below, "endFloor \(text): the agent keeps a session at \(floor - 1)%: \(logText())", file: file, line: line)
@@ -365,6 +388,41 @@ final class CutoffAgreementTests: XCTestCase {
     /// session, where the agent's default 10% would end it.
     func testAnEndFloorOfIntMinThatCannotBeRewrittenIsOffOnBothSides() async throws {
         try await assertAnUnwritableEndFloor(Int.min, battery: 5, ends: false)
+    }
+
+    /// The review's case: during a session on the default 10%, config.json
+    /// is replaced by one holding endFloor -9223372036854775809, which the
+    /// app's decoder rejects and plutil rounds to -2^63. An app that has
+    /// stopped answering keeps 10%, so at 5% the agent must end the session
+    /// on its default instead of reading the floor as off. The same run on
+    /// the app's settings is the control.
+    func testARejectedEndFloorBelowIntMinDoesNotTurnTheAgentsCutoffOff() async throws {
+        var c = Config()
+        c.thermalRules = false
+        try h.store.saveConfig(c)
+        let m = h.makeManager()
+        await m.reconcile()
+        await m.start(duration: 3600)
+        XCTAssertTrue(m.isActive)
+        let session = try Data(contentsOf: h.home.paths.sessionFile)
+        let journal = try Data(contentsOf: h.home.paths.stateFile)
+        try Data(#"{"configVersion":2,"lidCloseDefaultsApplied":true,"endFloor":-9223372036854775809,"thermalRules":false}"#.utf8)
+            .write(to: h.home.paths.configFile)
+        XCTAssertThrowsError(try h.store.loadConfig())
+        XCTAssertTrue(appEnds(m, critical: false, battery: 5), "the app on \(m.config.agentCutoffs.description)")
+
+        try agent.setBattery(5)
+        let exit = try await agent.run()
+        XCTAssertEqual(exit, 0, logText())
+        XCTAssertNil(try h.store.loadSession(), "the agent keeps a session at 5% on a file the app rejects: \(logText())")
+        XCTAssertTrue(agent.calls.contains(agent.restoreCall), agent.calls.joined(separator: "\n"))
+        XCTAssertTrue(logText().contains("below the 10% end floor"), logText())
+
+        try session.write(to: h.home.paths.sessionFile)
+        try journal.write(to: h.home.paths.stateFile)
+        try h.store.saveConfig(c)
+        let control = try await agentEnds(atBattery: 5)
+        XCTAssertTrue(control, "the agent on the app's settings: \(logText())")
     }
 
     private func assertAnUnwritableEndFloor(_ value: Int, battery: Int, ends expected: Bool,

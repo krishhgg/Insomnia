@@ -69,6 +69,17 @@ struct Paths: Sendable, Equatable {
     /// match, the session is over whatever its endsAt says. backstop.sh
     /// writes and honours the same file.
     var endedSessionFile: URL { appSupport.appendingPathComponent("ended-session.json") }
+    /// The same record under a fresh name, for when neither
+    /// ended-session.json nor state.json can be written: this prefix and
+    /// eight letters or digits, created exclusively (Store, and mktemp in
+    /// backstop.sh). Only a regular file with exactly that name counts;
+    /// backstop.sh and uninstall.sh use the same shape.
+    static let endedSessionAsidePrefix = "ended-session.json."
+    static func isEndedSessionAsideName(_ name: String) -> Bool {
+        guard name.hasPrefix(endedSessionAsidePrefix) else { return false }
+        let suffix = name.utf8.dropFirst(endedSessionAsidePrefix.utf8.count)
+        return suffix.count == 8 && suffix.allSatisfy { (0x30...0x39).contains($0) || (0x41...0x5A).contains($0) || (0x61...0x7A).contains($0) }
+    }
     /// Where an unreadable session.json goes: this prefix, a UTC stamp
     /// (yyyyMMddTHHmmssZ) and, if that name is taken, -1, -2, ... The same
     /// shape is produced by backstop.sh and removed by `uninstall.sh --purge`.

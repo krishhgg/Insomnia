@@ -658,8 +658,9 @@ final class SessionManager {
     /// process still holds a session means backstop.sh ended it (its log
     /// line says why) while this process could not act: stopped, hung, or
     /// without the alive lock. So does a session.json the agent recorded as
-    /// ended because it could not remove the file, in ended-session.json or
-    /// in the journal's endedSession. The agent has restored
+    /// ended because it could not remove the file, in ended-session.json,
+    /// in the journal's endedSession, or in a record aside
+    /// (ended-session.json.<8 letters or digits>). The agent has restored
     /// what it could; the end here runs from the journal just read under the
     /// lock, so anything it left is retried, and observers, timers and the
     /// countdown stop. An unreadable session.json is not a vanished one and
@@ -678,6 +679,8 @@ final class SessionManager {
             Log.error("the session until \(iso(s.endsAt)) is recorded as ended in ended-session.json: the recovery agent ended it but could not remove session.json (its log line says why); ending here from the journal")
         } else if store.sessionEndIsJournaled(in: state) {
             Log.error("the session until \(iso(s.endsAt)) is recorded as ended in state.json (endedSession): the recovery agent ended it but could not remove session.json or write ended-session.json (its log line says why); ending here from the journal")
+        } else if let record = store.sessionEndRecordAside() {
+            Log.error("the session until \(iso(s.endsAt)) is recorded as ended in \(record.lastPathComponent): the recovery agent ended it but could not remove session.json or write ended-session.json or state.json (its log line says why); ending here from the journal")
         } else {
             return
         }
@@ -832,13 +835,15 @@ final class SessionManager {
 
     /// The 1 Hz tick's look for a session the agent ended while the lid was
     /// open and nothing else transacted: a cheap look first (session.json
-    /// gone, or recorded as ended in ended-session.json or the journal on
-    /// disk), then the decision and the end under the lock
-    /// (`adoptAgentEnd`). Internal so tests can run one tick at a time.
+    /// gone, or recorded as ended in ended-session.json, the journal or a
+    /// record aside on disk; the last lists the folder), then the decision
+    /// and the end under the lock (`adoptAgentEnd`). Internal so tests can
+    /// run one tick at a time.
     func noticeAgentEnd() async {
         guard session != nil, !checkingAgentEnd, now >= agentEndRetryAt,
               !FileManager.default.fileExists(atPath: paths.sessionFile.path) || store.sessionEndIsRecorded()
                 || ((try? store.loadState()).map { store.sessionEndIsJournaled(in: $0) } ?? false)
+                || store.sessionEndRecordAside() != nil
         else { return }
         checkingAgentEnd = true
         defer { checkingAgentEnd = false }
@@ -1423,7 +1428,8 @@ final class SessionManager {
                 // live session to the next launch or to backstop.sh. The
                 // record is written before restoreAll undoes anything.
                 let recordedIn: String? = store.recordSessionEnd() ? "ended-session.json"
-                    : journalSessionEnd() ? "state.json" : nil
+                    : journalSessionEnd() ? "state.json"
+                    : store.recordSessionEndAside()?.lastPathComponent
                 let relaunch = recordedIn != nil
                     ? "its end is recorded, so a relaunch will not resume it"
                     : "a relaunch that can write state.json while sleep is still disabled could hold sleep again for it"
@@ -2341,11 +2347,13 @@ final class SessionManager {
         }
 
         // A session ended earlier whose session.json could not be removed
-        // (ended-session.json, or the journal's endedSession, holds its
-        // bytes) is over, deadline or not.
+        // (ended-session.json, the journal's endedSession, or a record
+        // aside holds its bytes) is over, deadline or not, whatever pmset
+        // reads now.
         let endRecordedIn: String? = onDisk == nil ? nil
             : store.sessionEndIsRecorded() ? "ended-session.json"
-            : store.sessionEndIsJournaled(in: state) ? "state.json" : nil
+            : store.sessionEndIsJournaled(in: state) ? "state.json"
+            : store.sessionEndRecordAside()?.lastPathComponent
         let endedEarlier = endRecordedIn != nil
 
         // A valid session is not resumed while config.json is rejected in
@@ -2361,8 +2369,9 @@ final class SessionManager {
             // end undoes it, and nothing outside this transaction can run one
             // now (the recovery lock), so a bit that reads 0 was set back
             // while no Insomnia ran: by an agent end that could neither
-            // remove session.json nor record the end anywhere (it restores
-            // sleep and keeps the entry), by hand, or never set by a start
+            // remove session.json nor record the end anywhere, not even in
+            // a new file beside it (it restores sleep and keeps the entry),
+            // by hand, or never set by a start
             // that died before its pmset. Holding sleep again would revive a
             // session that was ended, so it ends here, and the end is
             // recorded wherever it can be now. A read that fails cannot
@@ -2392,8 +2401,9 @@ final class SessionManager {
             // Written even when sleepDisabledByUs is already set: a session
             // resumes only from a journal this process can write. An agent
             // run that ended the session but could neither remove
-            // session.json nor record the end anywhere leaves just that
-            // flag behind; when its restore failed as well, the bit still
+            // session.json nor record the end anywhere (the folder took no
+            // new file) leaves just that flag behind; when its restore
+            // failed as well, the bit still
             // reads 1 above, and the write that fails here keeps the
             // session it ended from resuming while state.json stays
             // unwritable.

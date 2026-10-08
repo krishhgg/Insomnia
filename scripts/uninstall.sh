@@ -105,6 +105,9 @@ SESSION="$APP_SUPPORT/session.json"
 # removed with session.json, and remove_owned names it if that fails. When
 # that record cannot be written either, the end is recorded in state.json
 # (endedSession); that key is not something to undo and goes with the file.
+# When neither can be written, the same record goes to a new file,
+# ended-session.json. and eight letters or digits (collect_end_records_aside
+# below), removed the same way.
 ENDED="$APP_SUPPORT/ended-session.json"
 STATE="$APP_SUPPORT/state.json"
 CONFIG="$APP_SUPPORT/config.json"
@@ -545,6 +548,21 @@ collect_moved_aside() { # session.json | config.json
   return 0
 }
 
+# The records of a session's end that backstop.sh (record_end_aside) or the
+# app wrote under a fresh name, into END_RECORDS_ASIDE: every path named
+# ended-session.json. and exactly eight letters or digits, whatever it is.
+# remove_owned removes the regular files among them and names the rest.
+collect_end_records_aside() {
+  local f
+  END_RECORDS_ASIDE=()
+  for f in "$APP_SUPPORT"/ended-session.json.????????; do
+    [[ -e "$f" || -L "$f" ]] || continue
+    [[ "${f##*/}" =~ ^ended-session\.json\.[A-Za-z0-9]{8}$ ]] || continue
+    END_RECORDS_ASIDE+=("$f")
+  done
+  return 0
+}
+
 # Removes files Insomnia wrote, one path per argument. Only a regular file
 # is removed. Anything else at one of these paths is not something Insomnia
 # wrote; it is left and named, so a stray directory never stops the run
@@ -821,6 +839,10 @@ if (( PURGE == 1 )); then
         "$APP_SUPPORT/unfinished-command.json" \
         "$LOG_DIR/insomnia.log" "$LOG_DIR/insomnia.log.1" \
         "$LOG_DIR/handoffs.log" "$LOG_DIR/handoffs.log.1"
+  collect_end_records_aside
+  if (( ${#END_RECORDS_ASIDE[@]} > 0 )); then
+    remove_owned "${END_RECORDS_ASIDE[@]}"
+  fi
   for name in session.json config.json; do
     collect_moved_aside "$name"
     if (( ${#MOVED_ASIDE[@]} > 0 )); then
@@ -845,6 +867,10 @@ else
   # unfinished-command.json names a sudo pmset that held the recovery lock;
   # this run holds it now, so that command has exited.
   remove_owned "$APP_SUPPORT/backstop.sh" "$SESSION" "$ENDED" "$STATE" "$APP_SUPPORT/unfinished-command.json"
+  collect_end_records_aside
+  if (( ${#END_RECORDS_ASIDE[@]} > 0 )); then
+    remove_owned "${END_RECORDS_ASIDE[@]}"
+  fi
   echo "Kept $APP_SUPPORT/config.json and $LOG_DIR (use --purge to remove)."
   for name in session.json config.json; do
     collect_moved_aside "$name"

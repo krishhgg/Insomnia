@@ -799,12 +799,20 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(journal.isDirty)
     }
 
+    /// The records aside in the fixture's home: names of the record's shape.
+    private func recordsAside() throws -> [String] {
+        try fx.contents(of: fx.home).filter { Paths.isEndedSessionAsideName($0) }
+    }
+
     /// Neither session.json, nor ended-session.json, nor the journal can be
-    /// written: nothing on disk says the session is over. Sleep is restored
-    /// anyway, but its journal entry stays as evidence and the run exits 1.
-    /// (The app then resumes nothing either: it writes the journal before
-    /// it resumes a session; JournaledSessionEndTests.)
-    func testEndThatCanNeitherRemoveNorRecordKeepsTheSleepEntry() throws {
+    /// written, but the folder takes new files: the end is recorded in a
+    /// new file beside them, ended-session.json.<8 letters or digits>, the
+    /// file's exact bytes, mode 0600. Sleep is restored; the journal keeps
+    /// sleepDisabledByUs because it cannot be written. Later runs end the
+    /// session again without the checks, even with the app alive, and keep
+    /// the record. Once the files can be changed, session.json and the
+    /// record go.
+    func testEndThatCanWriteOnlyANewFileRecordsItAside() throws {
         try writeLiveSession()
         try setImmutable(fx.session, true)
         try "{}".write(to: fx.endedSession, atomically: true, encoding: .utf8)
@@ -815,13 +823,125 @@ final class RecoveryScriptTests: XCTestCase {
 
         XCTAssertEqual(r.status, 1, r.stderr + fx.log())
         XCTAssertEqual(calls(), [sleepRestored])
+        let names = try recordsAside()
+        XCTAssertEqual(names.count, 1, "\(names)")
+        let record = fx.home.appendingPathComponent(try XCTUnwrap(names.first))
+        XCTAssertEqual(try Data(contentsOf: record), try Data(contentsOf: fx.session), "the record is the file's exact bytes")
+        XCTAssertEqual(try FileManager.default.attributesOfItem(atPath: record.path)[.posixPermissions] as? Int, 0o600)
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, true, "state.json cannot be written")
+        XCTAssertNil(try fx.stateJSON()["endedSession"])
+        XCTAssertEqual(try String(contentsOf: fx.endedSession, encoding: .utf8), "{}")
+        XCTAssertTrue(fx.log().contains("could not remove \(fx.session.path) or record its end in \(fx.endedSession.path) or \(fx.state.path); its end is recorded in \(record.path) instead"), fx.log())
+
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+        fx.clearCalls()
+        let again = try fx.run(fx.backstop)
+
+        XCTAssertEqual(again.status, 1, again.stderr + fx.log())
+        XCTAssertEqual(calls(), [sleepRestored], "no checks; the journal still asks for the restore")
+        XCTAssertTrue(fx.log().contains("already ended (recorded in \(record.path))"), fx.log())
+        XCTAssertEqual(try recordsAside(), names, "a record that matches is kept and used again")
+
+        for file in [fx.session, fx.endedSession, fx.state] { try setImmutable(file, false) }
+        let last = try fx.run(fx.backstop)
+
+        XCTAssertEqual(last.status, 0, last.stderr + fx.log())
+        XCTAssertFalse(fx.exists(fx.session))
+        XCTAssertEqual(try recordsAside(), [], "the record goes with the file it copies")
+    }
+
+    /// The same files, and the record aside cannot be created either (the
+    /// MKTEMP constant is /usr/bin/false here): nothing on disk says the
+    /// session is over. Sleep is restored anyway, but its journal entry
+    /// stays as evidence and the run exits 1. (The app then resumes nothing
+    /// either: it writes the journal before it resumes a session;
+    /// JournaledSessionEndTests.)
+    func testEndThatCanNeitherRemoveNorRecordKeepsTheSleepEntry() throws {
+        try writeLiveSession()
+        try setImmutable(fx.session, true)
+        try "{}".write(to: fx.endedSession, atomically: true, encoding: .utf8)
+        try setImmutable(fx.endedSession, true)
+        try setImmutable(fx.state, true)
+        let text = try String(contentsOf: fx.backstop, encoding: .utf8)
+        try ScriptFixture.replaceOnce(text, "MKTEMP=/usr/bin/mktemp", with: "MKTEMP=/usr/bin/false")
+            .write(to: fx.backstop, atomically: true, encoding: .utf8)
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 1, r.stderr + fx.log())
+        XCTAssertEqual(calls(), [sleepRestored])
         XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, true, "evidence kept while the session still reads as valid")
         XCTAssertNil(try fx.stateJSON()["endedSession"])
         XCTAssertTrue(fx.exists(fx.session))
         XCTAssertEqual(try String(contentsOf: fx.endedSession, encoding: .utf8), "{}")
+        XCTAssertEqual(try recordsAside(), [])
         let log = fx.log()
-        XCTAssertTrue(log.contains("could not remove \(fx.session.path) or record its end in \(fx.endedSession.path) or \(fx.state.path)"), log)
+        XCTAssertTrue(log.contains("could not remove \(fx.session.path) or record its end in \(fx.endedSession.path), \(fx.state.path) or a new file in \(fx.home.path)"), log)
         XCTAssertTrue(log.contains("still journaled: sleepDisabledByUs is kept although sleep is restored"), log)
+    }
+
+    /// A folder that takes no new file (mode 0555; the lock file and the
+    /// log folder already exist): session.json cannot be removed and no
+    /// record can be written anywhere. The restore still runs, but its
+    /// supervisor cannot write the status files either, so the run cannot
+    /// tell whether the command finished: it reports no result, keeps the
+    /// journal as it was and exits 1. This is the case the record aside
+    /// does not cover.
+    func testEndInAFolderThatTakesNoNewFileRecordsNothingAndKeepsTheJournal() throws {
+        try writeLiveSession()
+        FileManager.default.createFile(atPath: fx.home.appendingPathComponent(".recovery.lock").path, contents: nil)
+        try FileManager.default.createDirectory(at: fx.home.appendingPathComponent("Logs"), withIntermediateDirectories: true)
+        let journal = try Data(contentsOf: fx.state)
+        fx.clearCalls()
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: fx.home.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fx.home.path) }
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 1, r.stderr + fx.log())
+        XCTAssertEqual(calls(), [sleepRestored], "the restore runs")
+        XCTAssertTrue(fx.exists(fx.session))
+        XCTAssertFalse(fx.exists(fx.endedSession))
+        XCTAssertEqual(try recordsAside(), [])
+        XCTAssertEqual(try Data(contentsOf: fx.state), journal, "the journal is kept as it was")
+        let log = fx.log()
+        XCTAssertTrue(log.contains("or a new file in \(fx.home.path)"), log)
+        XCTAssertTrue(log.contains("its supervisor reported no result within"), log)
+    }
+
+    /// A record aside that matches no session.json goes, as a stale
+    /// ended-session.json does, and the live session is checked as usual.
+    /// One that cmp cannot read is not shown to be stale and stays; it ends
+    /// nothing. A symlink, a FIFO and other names are never opened or
+    /// removed.
+    func testStaleRecordAsideIsRemovedAndOthersAreLeft() throws {
+        try writeLiveSession()
+        let stale = fx.home.appendingPathComponent("ended-session.json.Stale001")
+        try #"{"endsAt":"2001-01-01T00:00:00Z","startedAt":"2001-01-01T00:00:00Z"}"#.write(to: stale, atomically: true, encoding: .utf8)
+        let unreadable = fx.home.appendingPathComponent("ended-session.json.NoRead00")
+        try FileManager.default.copyItem(at: fx.session, to: unreadable)
+        try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: unreadable.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: unreadable.path) }
+        let copy = fx.root.appendingPathComponent("copy-of-session")
+        try FileManager.default.copyItem(at: fx.session, to: copy)
+        let link = fx.home.appendingPathComponent("ended-session.json.Link0000")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: copy)
+        let other = fx.home.appendingPathComponent("ended-session.json.Other0000")
+        try FileManager.default.copyItem(at: fx.session, to: other)
+        let fifo = try FIFOWatch(at: fx.home.appendingPathComponent("ended-session.json.Fifo0000"))
+        defer { fifo.stop() }
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+
+        try assertSessionKept(try fx.run(fx.backstop))
+
+        XCTAssertEqual(calls(), [batteryRead, thermalRead])
+        XCTAssertFalse(fifo.readerSeen, "a FIFO named like a record was opened")
+        XCTAssertFalse(fx.exists(stale))
+        for kept in [unreadable, link, other, fifo.url] {
+            XCTAssertNotNil(try? FileManager.default.attributesOfItem(atPath: kept.path), kept.lastPathComponent)
+        }
     }
 
     /// A journaled end of another session.json (other bytes) ends nothing:
@@ -1980,6 +2100,40 @@ final class RecoveryScriptTests: XCTestCase {
 
             XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
             XCTAssertFalse(fx.exists(record), "purge \(purge)")
+        }
+    }
+
+    /// Records aside (ended-session.json.<8 letters or digits>) go with or
+    /// without --purge. The backstop run removes a stale one first; one it
+    /// cannot remove (immutable here) is named and counted by uninstall,
+    /// a directory of that name is left and named, other names stay.
+    func testUninstallRemovesRecordsAsideAndNamesWhatItCannot() throws {
+        for purge in [false, true] {
+            try fx.installMachinery()
+            let removable = fx.home.appendingPathComponent("ended-session.json.Abcd1234")
+            let pinned = fx.home.appendingPathComponent("ended-session.json.Pinned00")
+            let dir = fx.home.appendingPathComponent("ended-session.json.Dir00000")
+            let notOurs = fx.home.appendingPathComponent("ended-session.json.notes")
+            for file in [removable, pinned, notOurs] {
+                try "{}".write(to: file, atomically: true, encoding: .utf8)
+            }
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            try setImmutable(pinned, true)
+            defer { try? setImmutable(pinned, false) }
+
+            let r = try fx.run(fx.uninstall, purge ? ["--purge"] : [])
+
+            XCTAssertEqual(r.status, 1, "purge \(purge): " + r.stderr + r.stdout)
+            XCTAssertFalse(fx.exists(removable), "purge \(purge)")
+            XCTAssertTrue(fx.exists(pinned))
+            XCTAssertTrue(r.stderr.contains("Could not remove \(pinned.path); left in place."), r.stderr)
+            XCTAssertTrue(r.stdout.contains("Left \(dir.path): it is not a regular file, so Insomnia did not write it."), r.stdout)
+            XCTAssertTrue(fx.exists(dir))
+            XCTAssertTrue(fx.exists(notOurs))
+            try setImmutable(pinned, false)
+            try FileManager.default.removeItem(at: pinned)
+            try FileManager.default.removeItem(at: dir)
+            try FileManager.default.removeItem(at: notOurs)
         }
     }
 
