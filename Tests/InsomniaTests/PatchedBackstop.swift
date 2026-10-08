@@ -111,6 +111,29 @@ struct PatchedBackstop {
         return p.terminationStatus
     }
 
+    /// Runs each agent once, at most `width` at a time, and returns their
+    /// exit statuses in order. The agents must act on separate homes. Every
+    /// run that started is waited for, also when another fails to start:
+    /// the group waits for its tasks before it throws.
+    static func runAll(_ agents: [PatchedBackstop], width: Int = 8) async throws -> [Int32] {
+        var statuses = [Int32](repeating: -1, count: agents.count)
+        try await withThrowingTaskGroup(of: (Int, Int32).self) { group in
+            var next = 0
+            func add() {
+                guard next < agents.count else { return }
+                let (i, agent) = (next, agents[next])
+                group.addTask { (i, try await agent.run()) }
+                next += 1
+            }
+            for _ in 0..<width { add() }
+            while let (i, status) = try await group.next() {
+                statuses[i] = status
+                add()
+            }
+        }
+        return statuses
+    }
+
     func clearCalls() {
         try? FileManager.default.removeItem(at: dir.appendingPathComponent("calls"))
     }
@@ -139,7 +162,7 @@ struct PatchedBackstop {
     /// Sets LOCK_RECORD_MAX_BYTES to 0, so no record fits in the recovery
     /// lock file and the agent writes none there: a stand-in for a lock
     /// file that refuses the write (a full disk). Content already in the
-    /// file then reads as not a whole record.
+    /// file then reads as more than any record, which ends no session.
     func refuseLockRecord() throws {
         try patch("LOCK_RECORD_MAX_BYTES=1048576", "LOCK_RECORD_MAX_BYTES=0")
     }
@@ -158,6 +181,29 @@ struct PatchedBackstop {
         """#.write(to: cat, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: cat.path)
         try patch("CAT=/bin/cat", "CAT='\(cat.path)'")
+    }
+
+    /// Sets LOG_RECORD_MAX_BYTES to 0, so no session.json fits in an end
+    /// record in insomnia.log: the agent writes none there and reads none
+    /// back, a stand-in for a log that refuses the line (a full disk).
+    func refuseLogRecord() throws {
+        try patch("LOG_RECORD_MAX_BYTES=65536", "LOG_RECORD_MAX_BYTES=0")
+    }
+
+    /// Points GREP at a fake that finds no end record line in a log (exit
+    /// 1 for `-Fxq -e insomnia-ended-session-v1 ...`) and runs /usr/bin/grep
+    /// on anything else: the agent's line goes into insomnia.log, but
+    /// neither the read-back nor a later run finds it.
+    func failLogReadBack() throws {
+        let grep = dir.appendingPathComponent("grep")
+        try #"""
+        #!/bin/bash
+        [[ "${1:-}" == -Fxq && "${2:-}" == -e && "${3:-}" == "insomnia-ended-session-v1 "* ]] && exit 1
+        exec /usr/bin/grep "$@"
+
+        """#.write(to: grep, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: grep.path)
+        try patch("GREP=/usr/bin/grep", "GREP='\(grep.path)'")
     }
 
     private func patch(_ line: String, _ replacement: String) throws {

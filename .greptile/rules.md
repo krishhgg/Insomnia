@@ -91,7 +91,11 @@ The app and the script serialize on one `flock(2)` lock,
 `.recovery.lock`, which is never unlinked so both lock the same inode
 (`RecoveryLock.swift`; `lockf` on fd 9 in the scripts). It may also hold a
 record of a session's end (`ended-session-v1 <base64>`), written in place
-through the held descriptor and never by replacing the file. `uninstall.sh`
+through the held descriptor and never by replacing the file. When that
+write fails too, the end is appended to `insomnia.log` as one line
+(`insomnia-ended-session-v1 <size> <base64>`, `LogEndRecord.swift`), and
+insomnia.log is rotated only under this lock, with a record still in force
+copied forward. `uninstall.sh`
 takes the lock, runs the backstop with `--force` under it, and refuses to
 remove the recovery machinery while anything is still journaled. Battery
 and thermal floors run only while the app is alive; the backstop does not
@@ -225,6 +229,9 @@ Flag a change that breaks one of these; do not flag the behavior itself.
   `insomnia.log`, a local file shared with `backstop.sh` so one file tells
   the whole story. That file may contain SSIDs, process metadata and tmux
   target names (SECURITY.md). The privacy rule applies to the unified log.
+  A line written without the recovery lock is never followed by a rotation
+  (`OwnerOnly.LogRotation.deferred`), so the file can pass 1 MiB until a
+  line is written under the lock: it may hold an end record.
 - `LidActions.swift`. Lid events do nothing when no session is active
   (spec section 3).
 - `simulate-lid.sh`, `LidSimulation.swift`. The trigger file is the same

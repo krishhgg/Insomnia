@@ -15,8 +15,9 @@ import XCTest
 /// whatever SleepDisabled reads and whichever file is repaired. When no
 /// new file can be created either (here MKTEMP fails, or both folders
 /// refuse new files), the record goes in the recovery lock file
-/// (LockEndRecordTests). When that takes no record either (here
-/// `refuseLockRecord`), the agent still restores sleep, and no launch holds
+/// (LockEndRecordTests), and when that takes none, in insomnia.log
+/// (LogEndRecordTests). When neither takes a record (here
+/// `refuseLockRecord` and `refuseLogRecord`), the agent still restores sleep, and no launch holds
 /// sleep again for that session while session.json cannot be replaced or
 /// the journal cannot be written, or once pmset says sleep is not held.
 @MainActor
@@ -231,7 +232,8 @@ final class JournaledSessionEndTests: XCTestCase {
 
     /// Nothing can record the end: session.json, ended-session.json and
     /// state.json are all immutable, the agent cannot create a record
-    /// aside, and the recovery lock file takes no record. The agent
+    /// aside, and neither the recovery lock file nor insomnia.log takes
+    /// a record. The agent
     /// restores sleep but keeps sleepDisabledByUs; the
     /// relaunched app cannot write the journal, so it does not resume the
     /// session either. The app's pmset still reads SleepDisabled 1 here
@@ -242,6 +244,7 @@ final class JournaledSessionEndTests: XCTestCase {
         try setImmutable(h.home.paths.stateFile, true)
         try agent.refuseRecordsAside()
         try agent.refuseLockRecord()
+        try agent.refuseLogRecord()
 
         try await runAgent(expecting: 1)
         XCTAssertTrue(agent.calls.contains(agent.restoreCall))
@@ -259,7 +262,7 @@ final class JournaledSessionEndTests: XCTestCase {
     }
 
     /// An agent end that could record nothing, with all three files
-    /// immutable, no record aside and none in the lock file: the agent
+    /// immutable, no record aside and none in the lock file or the log: the agent
     /// restores sleep, which the app's pmset then reads too, and keeps
     /// sleepDisabledByUs.
     private func endWithNothingRecorded() async throws {
@@ -267,6 +270,7 @@ final class JournaledSessionEndTests: XCTestCase {
         try setImmutable(h.home.paths.stateFile, true)
         try agent.refuseRecordsAside()
         try agent.refuseLockRecord()
+        try agent.refuseLogRecord()
         try await runAgent(expecting: 1)
         XCTAssertTrue(agent.calls.contains(agent.restoreCall), agent.calls.joined(separator: "\n"))
         XCTAssertEqual(try h.store.loadState()?.sleepDisabledByUs, true)
@@ -907,9 +911,10 @@ final class JournaledSessionEndTests: XCTestCase {
 
     /// Every place refuses the record: session.json, ended-session.json and
     /// state.json immutable, neither the folder holding them nor the log
-    /// folder takes a new file, and the recovery lock file takes no record
-    /// (LockEndRecordTests covers the same case with a lock file that
-    /// takes it). The agent still restores sleep (here it fails, so
+    /// folder takes a new file, and neither the recovery lock file nor
+    /// insomnia.log takes a record (LockEndRecordTests and
+    /// LogEndRecordTests cover the same case with a file that takes it).
+    /// The agent still restores sleep (here it fails, so
     /// SleepDisabled stays 1) and keeps sleepDisabledByUs. Then both
     /// folders and state.json are repaired and the app launches first.
     /// session.json still cannot be replaced, so the app does not hold
@@ -921,6 +926,7 @@ final class JournaledSessionEndTests: XCTestCase {
         try setImmutable(h.home.paths.stateFile, true)
         try agent.failSudo()
         try agent.refuseLockRecord()
+        try agent.refuseLogRecord()
         try TestACL.denyNewFiles(in: h.home.paths.appSupport)
         try TestACL.denyNewFiles(in: logs)
         defer {
@@ -934,7 +940,7 @@ final class JournaledSessionEndTests: XCTestCase {
         XCTAssertFalse(h.store.sessionEndIsRecorded())
         XCTAssertNil(try h.store.loadState()?.endedSession)
         XCTAssertEqual(try h.store.loadState()?.sleepDisabledByUs, true)
-        XCTAssertTrue(logText().contains("could not remove \(h.home.paths.sessionFile.path) or record its end in \(h.home.paths.endedSessionFile.path), \(h.home.paths.stateFile.path), a new file in \(h.home.paths.appSupport.path) or \(logs.path), or the recovery lock file \(h.home.paths.recoveryLock.path)"), logText())
+        XCTAssertTrue(logText().contains("could not remove \(h.home.paths.sessionFile.path) or record its end in \(h.home.paths.endedSessionFile.path), \(h.home.paths.stateFile.path), a new file in \(h.home.paths.appSupport.path) or \(logs.path), the recovery lock file \(h.home.paths.recoveryLock.path), or the log file \(h.home.paths.logFile.path)"), logText())
         XCTAssertEqual(h.store.lockEndRecord(), .none)
 
         try TestACL.removeAll(h.home.paths.appSupport)

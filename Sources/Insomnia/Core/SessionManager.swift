@@ -470,6 +470,9 @@ final class SessionManager {
     @ObservationIgnored private var countdownTimer: Timer?
     @ObservationIgnored private var retryTimer: Timer?
     @ObservationIgnored private var checkingAgentEnd = false
+    /// The tick's last read of the logs for an end record, with what it
+    /// read them at (`logRecordsSessionEnd`).
+    @ObservationIgnored private var lastLogEndRecordRead: (fingerprint: String, found: Bool)?
     /// The tick's next look for the agent's end after a transaction for it
     /// was refused: the recovery lock was held, state.json did not decode,
     /// or an unfinished command held the lock. backstop.sh removes
@@ -904,8 +907,9 @@ final class SessionManager {
     /// without the alive lock. So does a session.json the agent recorded as
     /// ended because it could not remove the file, in ended-session.json,
     /// in the journal's endedSession, in a record aside
-    /// (ended-session.json.<8 letters or digits>), or in the recovery lock
-    /// file (`Store.sessionEndRecordedInLock`). The agent has restored
+    /// (ended-session.json.<8 letters or digits>), in the recovery lock
+    /// file (`Store.sessionEndRecordedInLock`), or in insomnia.log or
+    /// insomnia.log.1 (`Store.sessionEndRecordedInLog`). The agent has restored
     /// what it could; the end here runs from the journal just read under the
     /// lock, so anything it left is retried, and observers, timers and the
     /// countdown stop. An unreadable session.json is not a vanished one and
@@ -928,6 +932,8 @@ final class SessionManager {
             Log.error("the session until \(iso(s.endsAt)) is recorded as ended in \(record.lastPathComponent): the recovery agent ended it but could not remove session.json or write ended-session.json or state.json (its log line says why); ending here from the journal")
         } else if let lock = store.sessionEndRecordedInLock() {
             Log.error("the session until \(iso(s.endsAt)) is recorded as ended in \(lock): the recovery agent ended it but could not remove session.json or write ended-session.json, state.json or a new file (its log line says why); ending here from the journal")
+        } else if let log = store.sessionEndRecordedInLog() {
+            Log.error("the session until \(iso(s.endsAt)) is recorded as ended in \(log): the recovery agent ended it but could not remove session.json or write ended-session.json, state.json, a new file or the recovery lock file (its log line says why); ending here from the journal")
         } else {
             return
         }
@@ -1173,8 +1179,9 @@ final class SessionManager {
     /// The 1 Hz tick's look for a session the agent ended while the lid was
     /// open and nothing else transacted: a cheap look first (session.json
     /// gone, or recorded as ended in ended-session.json, the journal, a
-    /// record aside on disk or the recovery lock file; a record aside lists
-    /// the folder), then the decision
+    /// record aside on disk, the recovery lock file or the log; a record
+    /// aside lists the folder, and the logs are read again only once they
+    /// or session.json changed), then the decision
     /// and the end under the lock (`adoptAgentEnd`). Internal so tests can
     /// run one tick at a time.
     func noticeAgentEnd() async {
@@ -1182,6 +1189,7 @@ final class SessionManager {
               !FileManager.default.fileExists(atPath: paths.sessionFile.path) || store.sessionEndIsRecorded()
                 || ((try? store.loadState()).map { store.sessionEndIsJournaled(in: $0) } ?? false)
                 || store.sessionEndRecordAside() != nil || store.sessionEndRecordedInLock() != nil
+                || logRecordsSessionEnd()
         else { return }
         checkingAgentEnd = true
         defer { checkingAgentEnd = false }
@@ -1189,6 +1197,17 @@ final class SessionManager {
         if case .failure = result {
             agentEndRetryAt = now.addingTimeInterval(recoveryRetryDelay)
         }
+    }
+
+    /// The tick's look at the logs for the end of the session: read again
+    /// only when session.json or a log changed since the last read
+    /// (`Store.logEndRecordFingerprint`).
+    private func logRecordsSessionEnd() -> Bool {
+        let fingerprint = store.logEndRecordFingerprint()
+        if let last = lastLogEndRecordRead, last.fingerprint == fingerprint { return last.found }
+        let found = store.sessionEndRecordedInLog() != nil
+        lastLogEndRecordRead = (fingerprint, found)
+        return found
     }
 
     /// The 1 Hz tick's look at config.json while a session runs: a file that
@@ -1708,8 +1727,9 @@ final class SessionManager {
             try store.saveSession(new)
             keptSessionFile = nil
             // The record in the recovery lock file goes only once the file
-            // it may end is replaced. Content there that is not a whole
-            // record counts as the end of any session, this new one too.
+            // it may end is replaced. A file that cannot be read whole
+            // counts as the end of any session, this new one too, and
+            // other content is emptied with it.
             guard store.clearLockEndRecord() else {
                 throw StoreError.lockRecordNotCleared(file: paths.recoveryLock.path)
             }
@@ -1989,9 +2009,10 @@ final class SessionManager {
     /// anything is undone: session.json removed (moved aside when it was
     /// kept unread), or, when it cannot be removed, recorded as ended in
     /// ended-session.json, else the journal, else a record aside, else the
-    /// recovery lock file, so it does not read as a live session to the
-    /// next launch or to backstop.sh. Returns why session.json is still in
-    /// place when a relaunch could act on it, or nil.
+    /// recovery lock file, else a line in insomnia.log, so it does not read
+    /// as a live session to the next launch or to backstop.sh. Returns why
+    /// session.json is still in place when a relaunch could act on it, or
+    /// nil.
     private func endSessionOnDisk() -> String? {
         if let kept = keptSessionFile {
             return retryMovingAsideKeptSessionFile(kept)
@@ -2004,7 +2025,8 @@ final class SessionManager {
             let recordedIn: String? = store.recordSessionEnd() ? "ended-session.json"
                 : journalSessionEnd() ? "state.json"
                 : store.recordSessionEndAside()?.lastPathComponent
-                    ?? (store.recordSessionEndInLock() ? "the recovery lock file \(paths.recoveryLock.lastPathComponent)" : nil)
+                    ?? (store.recordSessionEndInLock() ? "the recovery lock file \(paths.recoveryLock.lastPathComponent)"
+                        : store.recordSessionEndInLog() ? "the log file \(paths.logFile.lastPathComponent)" : nil)
             let relaunch = recordedIn != nil
                 ? "its end is recorded, so a relaunch will not resume it"
                 : "a relaunch does not resume it while the file cannot be replaced, but once it and state.json take writes again, one while sleep is still disabled could hold sleep again for it"
@@ -3150,14 +3172,17 @@ final class SessionManager {
         }
 
         // A session ended earlier whose session.json could not be removed
-        // (ended-session.json, the journal's endedSession, a record aside
-        // or the recovery lock file holds its bytes, or the lock file holds
-        // content that is not a whole record) is over, deadline or not,
-        // whatever pmset reads now.
+        // (ended-session.json, the journal's endedSession, a record aside,
+        // the recovery lock file or a line in insomnia.log or
+        // insomnia.log.1 holds its bytes, or the lock file cannot be read
+        // whole) is over, deadline or not, whatever pmset reads now. Other
+        // content in the lock file ends nothing (`Store.LockEndRecord
+        // .foreign`).
         let endRecordedIn: String? = onDisk == nil ? nil
             : store.sessionEndIsRecorded() ? "ended-session.json"
             : store.sessionEndIsJournaled(in: state) ? "state.json"
             : store.sessionEndRecordAside()?.lastPathComponent ?? store.sessionEndRecordedInLock()
+                ?? store.sessionEndRecordedInLog()
         let endedEarlier = endRecordedIn != nil
 
         // A valid session is not resumed while config.json is rejected in

@@ -52,17 +52,30 @@ final class OwnerOnlyTests: XCTestCase {
         XCTAssertTrue(text.hasSuffix("insomnia: new line\n"), text)
     }
 
+    /// insomnia.log rotates only under the recovery lock, as a rotation
+    /// must not run while the lock's holder writes and reads back an end
+    /// record (`LogEndRecord`). Without it, a line past the cap is appended
+    /// and the rotation waits for a line written under the lock.
     func testLogPastTheCapRotatesToDotOneAndStartsAFreshFile() throws {
         let log = home.paths.logFile
         let rotated = OwnerOnly.rotated(log)
         XCTAssertEqual(rotated.lastPathComponent, "insomnia.log.1")
-        try FileManager.default.createDirectory(at: home.paths.logs, withIntermediateDirectories: true)
+        try home.paths.createDirectories()
         let first = Data(repeating: UInt8(ascii: "a"), count: Int(OwnerOnly.maxLogBytes) + 1)
         try first.write(to: log)
 
-        Log.append(level: "info", "after first rotation", paths: home.paths)
+        Log.append(level: "info", "without the lock", paths: home.paths)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: rotated.path), "rotated without the recovery lock")
+        XCTAssertTrue(try String(contentsOf: log, encoding: .utf8).hasSuffix("insomnia: without the lock\n"))
 
-        XCTAssertEqual(try Data(contentsOf: rotated), first, "the full log was not moved aside intact")
+        let handle = try XCTUnwrap(try RecoveryLock(url: home.paths.recoveryLock).tryAcquire())
+        defer { handle.release() }
+        let full = try Data(contentsOf: log)
+        RecoveryLock.$held.withValue(handle) {
+            Log.append(level: "info", "after first rotation", paths: home.paths)
+        }
+
+        XCTAssertEqual(try Data(contentsOf: rotated), full, "the full log was not moved aside intact")
         let fresh = try String(contentsOf: log, encoding: .utf8)
         XCTAssertTrue(fresh.hasSuffix("insomnia: after first rotation\n"), fresh)
         XCTAssertLessThan(fresh.utf8.count, 200, "the new file must hold only the new line")
@@ -71,9 +84,19 @@ final class OwnerOnlyTests: XCTestCase {
         // The next rotation replaces .1; nothing becomes .2.
         let second = Data(repeating: UInt8(ascii: "b"), count: Int(OwnerOnly.maxLogBytes) + 1)
         try second.write(to: log)
-        Log.append(level: "info", "after second rotation", paths: home.paths)
+        RecoveryLock.$held.withValue(handle) {
+            Log.append(level: "info", "after second rotation", paths: home.paths)
+        }
         XCTAssertEqual(try Data(contentsOf: rotated), second)
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: home.paths.logs.path).sorted(), ["insomnia.log", "insomnia.log.1"])
+
+        // A handle released, or on another file, no longer counts.
+        try second.write(to: log)
+        handle.release()
+        RecoveryLock.$held.withValue(handle) {
+            Log.append(level: "info", "after the release", paths: home.paths)
+        }
+        XCTAssertEqual(try Data(contentsOf: rotated), second, "rotated with a released handle")
     }
 
     /// Exactly at the cap nothing moves; one byte over, the next append rotates.

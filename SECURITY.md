@@ -39,7 +39,10 @@ records) are mode 0600
 and its directories 0700; the backstop runs with `umask 077`. Insomnia sets
 only these modes and leaves any access control list (ACL) on these files as it
 is, so an ACL someone added can still give another account access. Logs are capped at
-1 MiB with one older copy kept. A log the user replaced with a symlink is not
+1 MiB with one older copy kept. `insomnia.log` is rotated only while the app
+holds the recovery lock, because it can hold the record of a session's end (a
+line with session.json's bytes in base64), so it can grow past 1 MiB until
+then. A log the user replaced with a symlink is not
 rotated: the file it points to is the user's to manage. Location
 Services access is requested only when a hotspot is saved or a session starts
 with one configured; it is used to read Wi-Fi network names and the app never

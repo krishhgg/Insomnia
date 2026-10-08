@@ -118,7 +118,7 @@ a `build-app.sh` was added to its folder after unpacking.
 | `~/Applications/Insomnia.app` | The menu bar app, with `backstop.sh` sealed inside it at `Contents/Resources` |
 | `~/Library/Application Support/Insomnia/` | Configuration, the session/recovery journals, and lock files |
 | `~/Library/LaunchAgents/com.insomnia.backstop.plist` | Per-user recovery agent: verifies the app's code signature, then runs the sealed `backstop.sh` |
-| `~/Library/Logs/Insomnia/` | `insomnia.log` and `handoffs.log`, each capped at 1 MiB with one older copy kept as `.1`, unless you replace it with a symlink. A session end record lands here only when the Application Support folder takes no new file (see "How recovery works") |
+| `~/Library/Logs/Insomnia/` | `insomnia.log` and `handoffs.log`, each capped at 1 MiB with one older copy kept as `.1`, unless you replace it with a symlink; `insomnia.log` can pass the cap for a while (see "Configuration and privacy"). A session end record lands here only when the Application Support folder takes no new file, or, as a line in `insomnia.log`, when the recovery lock file takes no write either (see "How recovery works") |
 | `/etc/sudoers.d/insomnia` | Permission for the four commands below |
 
 ```text
@@ -376,12 +376,23 @@ was removed or replaced by an older or newer build after the agent checked
 the bundle's signature, it gives no usable answer within 30 seconds, or
 `config.json` is over 8 MiB), the agent reads the recorded values from
 `state.json` itself and logs that it did. When the journal holds a value the
-app does not write, or no record while only the binary failed, the agent
-uses the strictest values instead, a 95% end floor with the thermal rule
-on, and logs why. Before it reads them, or ends a session, the agent checks
-that `state.json` loads as the app loads it; when it does not, the agent
-keeps the session, changes nothing and logs why, until the app or a person
-fixes the file. Each
+app does not write, `state.json` is a symlink to nothing, or the journal
+holds no record while only the binary failed, the agent uses the strictest
+values instead, a 95% end floor with the thermal rule on, and logs why.
+These need not match the app: it reads such a value or link as no record
+and keeps enforcing its own settings, so the agent can end a session on
+battery below 95%, or at critical heat with the thermal rule off, that the
+app would keep. A running app that answers writes its record over such a
+value within a second. Before it reads them, or ends a session, the agent checks
+the parts of `state.json` the app decodes. When they do not load as the app
+loads them, the agent keeps the session, changes nothing and logs why, until
+the app or a person fixes the file; the first run after the fix ends the
+session if it is over. The check also refuses some text the app loads but
+never writes (a key it reads written twice, a number a `Double` rounds,
+UTF-32; spec section 6 lists them). A running app rewrites the journal in its
+own form the next time it writes it, but with the app crashed or hung, such a
+journal keeps the session and its sleep hold, past the deadline too, until
+someone fixes the file. Each
 early end is logged with its reason, and the saved session is deleted before
 the restore starts. A restore that cannot finish leaves entries in the journal
 for the next run and the app. If the saved session cannot be deleted, its end
@@ -392,17 +403,31 @@ followed by eight letters or digits; when that folder takes no new file,
 in a file with such a name in `~/Library/Logs/Insomnia`; and when neither
 folder takes one, in the recovery lock file `.recovery.lock`, which exists
 already. That record is written in place, so the file keeps its inode and
-stays the lock both sides take, and content there that is not a whole record
-counts as the end of whatever session is saved. The agent reads each
+stays the lock both sides take. A writer counts the record only once it
+reads it back whole, so other content there (a write cut short, other bytes,
+more than 1 MiB) ends no session, and the agent empties it. A lock file that
+cannot be read counts as the end of the saved session, since it may hold
+one. When the lock file takes no write either, the end goes into
+`insomnia.log` as one line holding the saved session's bytes. It counts
+only once it reads back as a whole line, a saved session over 64 KiB is
+never recorded there, and a log that cannot be read or is over 64 MiB holds
+no record for the app or the agent. The app rotates that log only while it
+holds the recovery lock and copies such a line forward when it does, so the
+record lasts while the saved session stays. The agent reads each
 record back before it restores anything. The app and the agent count a record
 aside or in the lock file only if it is a regular file you own, not a link,
 and the log folder only if it is a real folder you own, not a link.
 `ended-session.json` counts as `session.json` does: a link there is
 followed to a regular file, and its owner is not checked. While a record matches the saved
 session byte for byte, the app restores that session instead of resuming it,
-whatever `pmset` reports, and every agent run ends it again. Only when neither
-folder takes a new file and the lock file takes no write either (a full disk,
-say) is nothing recorded. The agent still runs the restore,
+whatever `pmset` reports, and every agent run ends it again. A record matches
+bytes, not a session: a saved session written later with the same bytes,
+which takes the same start and end times to the second, would read as ended
+too. A session the app was running when it crashed, with no record of its
+bytes in any of these places, resumes at the next launch under the rules
+below. Only when neither folder takes a new file, the lock file takes no
+write and `insomnia.log` takes no new line either (a full disk, say) is
+nothing recorded. The agent still runs the restore,
 but it cannot confirm the result, so it keeps the journal and exits 1. The app
 resumes no session while it cannot write `state.json`, none whose journal says
 sleep is held while `pmset` reports it is not, and none whose `session.json`
@@ -655,7 +680,11 @@ another account access (`ls -le` shows it). The LaunchAgent plist and the instal
 scripts hold no private data and keep the modes the installer gives them.
 `insomnia.log` and `handoffs.log` are capped at 1 MiB: a
 log past the cap is renamed to `insomnia.log.1` or `handoffs.log.1`,
-replacing the previous copy, and a new file starts. The cap does not apply
+replacing the previous copy, and a new file starts. `insomnia.log` can hold
+the record of a session's end, so the app renames it only while it holds
+the recovery lock, and waits while `insomnia.log.1` or the saved session
+cannot be read and could hold such a record; until then the file grows past
+the cap. The backstop appends to it and never renames it. The cap does not apply
 to a log you replace with a symlink. Insomnia writes through the link and
 never rotates it, since the rename would move the link and not the file it
 points to, and it logs that once. You set up the link, so trimming the file

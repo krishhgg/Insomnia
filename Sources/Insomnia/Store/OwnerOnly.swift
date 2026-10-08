@@ -28,7 +28,10 @@ import Foundation
 /// rename would move the link itself; that is reported once, and the cap
 /// does not hold for it. The user set up the link, so the file it points to
 /// is theirs to trim. The backstop appends with `>>` and never rotates, so
-/// it simply creates the fresh file.
+/// it simply creates the fresh file. insomnia.log can hold the record of a
+/// session's end (`LogEndRecord`), so the app rotates it only under the
+/// recovery lock, and copies such a record forward before the rename
+/// discards the old `.1` (`LogRotation`).
 enum OwnerOnly {
     static let fileMode: mode_t = 0o600
     static let directoryMode: mode_t = 0o700
@@ -86,6 +89,7 @@ enum OwnerOnly {
 
     private static let reported = PathSet()
     private static let symlinkedLogs = PathSet()
+    private static let recordsNotKept = PathSet()
 
     private final class PathSet: @unchecked Sendable {
         private let lock = NSLock()
@@ -104,6 +108,7 @@ enum OwnerOnly {
     /// past `maxBytes` is rotated first so the line lands in a new file.
     /// The line is written even when a chmod or the rotation fails; the
     /// first such failure is then thrown so the caller can report it.
+    /// `rotation` says whether the file may be rotated now (`LogRotation`).
     /// `beforeRotating` runs once the file held is found past the cap and
     /// before its lock is taken; a throw from it ends the append there, with
     /// nothing rotated or written. Tests use it to rotate from outside first.
@@ -111,6 +116,7 @@ enum OwnerOnly {
         _ text: String,
         at url: URL,
         maxBytes: UInt64 = maxLogBytes,
+        rotation: LogRotation = .free,
         beforeRotating: () throws -> Void = {}
     ) throws {
         var problems: [OwnerOnlyError] = []
@@ -120,9 +126,9 @@ enum OwnerOnly {
         // Before any rotation, so a legacy 0644 log is 0600 by the time it
         // becomes `.1`.
         if let problem = tighten(fd: fd, path: url.path) { problems.append(problem) }
-        if size(of: fd) > maxBytes {
+        if size(of: fd) > maxBytes, !rotation.isDeferred {
             try beforeRotating()
-            switch rotateHeld(fd, at: url, maxBytes: maxBytes) {
+            switch rotateHeld(fd, at: url, maxBytes: maxBytes, keep: rotation.keep) {
             case let .keep(problem):
                 // The held file is still the log: keep writing to it.
                 if let problem { problems.append(problem) }
@@ -153,6 +159,33 @@ enum OwnerOnly {
     /// `<name>.1` next to the log: insomnia.log.1, handoffs.log.1.
     static func rotated(_ url: URL) -> URL { url.appendingPathExtension("1") }
 
+    /// When a log past the cap is rotated.
+    enum LogRotation {
+        /// At once: handoffs.log.
+        case free
+        /// Not now: the line goes to the file as it is, past the cap, and
+        /// the next append that may rotate does. insomnia.log while this
+        /// process does not hold the recovery lock, since backstop.sh writes
+        /// and reads back an end record there under that lock alone.
+        case deferred
+        /// Once `keep`, given the descriptor on the file about to be
+        /// renamed, has copied into it what the rename would discard
+        /// (`LogEndRecord.keepRecords`). False keeps the file as it is, past
+        /// the cap, and the next append tries again. insomnia.log under the
+        /// recovery lock.
+        case keeping((Int32) -> Bool)
+
+        var isDeferred: Bool {
+            if case .deferred = self { return true }
+            return false
+        }
+
+        var keep: ((Int32) -> Bool)? {
+            if case let .keeping(keep) = self { return keep }
+            return nil
+        }
+    }
+
     /// What `rotateHeld` leaves the appender to do.
     private enum Rotation {
         /// The path names a fresh file, whoever rotated: open it.
@@ -169,8 +202,10 @@ enum OwnerOnly {
     /// with lstat(2): a symlinked log is not renamed, because rename moves
     /// the link, not its target, and the next open would start a plain file
     /// in its place. A rename keeps the inode and its mode; the backstop may
-    /// still have a line in flight to it, which then lands in `.1`.
-    private static func rotateHeld(_ fd: Int32, at url: URL, maxBytes: UInt64) -> Rotation {
+    /// still have a line in flight to it, which then lands in `.1`. `keep`,
+    /// when given, runs under the same flock once the file held is found to
+    /// be the log and past the cap; false keeps it, reported once.
+    private static func rotateHeld(_ fd: Int32, at url: URL, maxBytes: UInt64, keep: ((Int32) -> Bool)?) -> Rotation {
         guard flock(fd, LOCK_EX) == 0 else { return .keep(.rotate(path: url.path, errno: errno)) }
         defer { flock(fd, LOCK_UN) }
         var held = stat()
@@ -186,6 +221,9 @@ enum OwnerOnly {
         }
         guard held.st_ino == named.st_ino, held.st_dev == named.st_dev else { return .reopen }
         guard UInt64(max(0, held.st_size)) > maxBytes else { return .keep(nil) }
+        if let keep, !keep(fd) {
+            return .keep(recordsNotKept.insert(url.path) ? .endRecordNotKept(path: url.path) : nil)
+        }
         guard rename(url.path, rotated(url).path) == 0 else { return .keep(.rotate(path: url.path, errno: errno)) }
         return .reopen
     }
@@ -221,12 +259,13 @@ enum OwnerOnlyError: Error, LocalizedError {
     case chmod(path: String, errno: Int32)
     case rotate(path: String, errno: Int32)
     case symlinkNotRotated(path: String)
+    case endRecordNotKept(path: String)
 
     var path: String {
         switch self {
         case let .open(path, _), let .write(path, _), let .chmod(path, _), let .rotate(path, _):
             return path
-        case let .symlinkNotRotated(path):
+        case let .symlinkNotRotated(path), let .endRecordNotKept(path):
             return path
         }
     }
@@ -238,6 +277,7 @@ enum OwnerOnlyError: Error, LocalizedError {
         case let .chmod(path, errno): return "could not make \(path) owner-only: \(String(cString: strerror(errno)))"
         case let .rotate(path, errno): return "could not rotate \(path) to \(path).1: \(String(cString: strerror(errno)))"
         case let .symlinkNotRotated(path): return "not rotating \(path): it is a symlink, so its target can grow past the cap"
+        case let .endRecordNotKept(path): return "not rotating \(path) yet: \(path).1 may hold the record of the end of the session in session.json, and it could not be read or copied forward; the next line tries again"
         }
     }
 }

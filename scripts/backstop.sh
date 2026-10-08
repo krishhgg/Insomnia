@@ -257,6 +257,7 @@ CAT=/bin/cat
 GREP=/usr/bin/grep
 HEAD=/usr/bin/head
 TR=/usr/bin/tr
+ICONV=/usr/bin/iconv
 ID=/usr/bin/id
 # sleep is the one tool taken by name: it only paces the polls in
 # wait_for_status and wait_for_job and reads nothing, and the tests that
@@ -279,6 +280,14 @@ LOCK_TIMEOUT_SECONDS=10
 # than LOCK_RECORD_MAX_BYTES holds no whole record.
 LOCK_RECORD_TAG=ended-session-v1
 LOCK_RECORD_MAX_BYTES=1048576
+# The end record appended to insomnia.log (log_record_line): this tag, a
+# space, the number of bytes in session.json, a space, those bytes in base64,
+# and a newline. A session.json longer than LOG_RECORD_MAX_BYTES is never
+# recorded there, and a log larger than LOG_SCAN_MAX_BYTES is not searched
+# for a record (LogEndRecord.swift has the same three values).
+LOG_RECORD_TAG=insomnia-ended-session-v1
+LOG_RECORD_MAX_BYTES=65536
+LOG_SCAN_MAX_BYTES=67108864
 # com.apple.system.thermalpressurelevel at or above this ends a session. On
 # macOS the levels are 0 nominal, 1 moderate, 2 heavy, 3 trapping, 4 sleeping
 # (libkern/OSThermalNotification.h); ProcessInfo reports .critical from
@@ -368,6 +377,19 @@ extract() { # file keypath
 }
 extract_json() { # file keypath
   "$PLUTIL" -extract "$2" json -o - "$1" 2>/dev/null
+}
+# A whole number at keypath $2, as digits with an optional minus sign.
+# plutil prints one written with a fraction or an exponent, such as 5105.0,
+# with six zeros after a point (5105.000000); record_text_problems has
+# found it whole and within 2^53, so the zeros are dropped, and -0 is 0.
+extract_whole() { # file keypath
+  local v
+  v="$(extract "$1" "$2")" || return 1
+  if [[ "$v" =~ ^(-?)([0-9]+)\.0+$ ]]; then
+    v="${BASH_REMATCH[1]}${BASH_REMATCH[2]}"
+    [[ "$v" != -0 ]] || v=0
+  fi
+  printf '%s\n' "$v"
 }
 # Type name of a keypath (bool, integer, float, string, array, dictionary,
 # "(any)" for null); empty if the key is absent.
@@ -674,20 +696,34 @@ stop_transaction() { # what
 # of a key where the app's JSONDecoder keeps the first, turns a number too
 # small for a Double, such as 1e-400, into 0.0, and reads 1., .5, +1,
 # single quotes, keys without quotes, comments and other JSON5 forms the
-# app refuses. The text is read the way the app reads it: every object and
-# array, at any depth, key by key and value by value. A key's \u escapes
-# are decoded, so "keptDisplayReadL\u0069t" is that key, and a Kelvin sign
-# (U+212A), written as such or as \u212A, is read as K, since the app's
-# keys match it as K. A string is stepped over to its closing quote, so a
-# saved audio name or UID that holds a key, a bracket or a bad number holds
-# none of them. Refused:
-#   - a key found more than once in one object, since plutil checks and
-#     republishes the last copy. Only keys of letters alone are compared;
-#     every key the app reads is one.
-#   - a string with an escape JSON does not have, such as \x41, which plutil
-#     reads as A. In a key, nothing after it is read.
-#   - a value that is not a string, object, array, JSON number, true, false
-#     or null.
+# app refuses. The text is followed the way the app reads it: every object
+# and array, at any depth, key by key and value by value. What the app
+# decodes (RuntimeState.swift) is checked: the top level, the arrays under
+# frozenProcesses, frozenPids, savedAudioOutputs and appNapOverrides, the
+# objects in them, and the value under each key the app reads in those
+# objects. The rest is followed but not checked, as the app skips it: a
+# key it does not read and what is under that key, and what is inside an
+# object or array where the app reads no object or array, such as one
+# under sessionCutoffs. In what is checked, a key's \u escapes are decoded,
+# so "keptDisplayReadL\u0069t" is that key, and a Kelvin sign (U+212A),
+# written as such or as \u212A, is read as K, since the app's keys match
+# it as K. A string is stepped over to its closing quote, so a saved audio
+# name or UID that holds a key, a bracket or a bad number holds none of
+# them. A file in UTF-16, which the app reads but never writes, is read
+# through iconv(1) as UTF-8, its byte order taken from its byte order mark
+# or from where its first NUL byte is, as the app's decoder takes it.
+# Refused:
+#   - a key the app reads, found more than once in one object it reads,
+#     since plutil checks and republishes the last copy.
+#   - in what is checked, a string or key with an escape JSON does not
+#     have, such as \x41, which plutil reads as A. In a key, nothing after
+#     it is read.
+#   - in what is checked, a value that is not a string, object, array, JSON
+#     number, true, false or null. In the rest, a value the app does not
+#     skip either: one that is not a string, object, array, true, false,
+#     null or a run of digits, points, exponents and signs that starts with
+#     a digit or a minus sign. So +1, .5, 0x10 and single quotes are
+#     refused there, and 1. and -.5 are not.
 #   - a number where the app reads a Float (the saved and kept display,
 #     keyboard and output levels, and each saved output's volume) that a
 #     Swift Float cannot hold: above about 3.4028236e38, or not 0 in every
@@ -695,40 +731,58 @@ stop_transaction() { # what
 #     range is read from the decimal exponent and the first 9 significant
 #     digits, a little stricter than the app (from 3.40282356e38 and up to
 #     7.01e-46), where no level lies.
-#   - a whole number where the app reads an Int32 (a frozen process's pid
-#     and startedAtMicros, a legacy frozen pid) or an Int64 (its startedAt)
-#     that the type cannot hold.
+#   - a number where the app reads an Int32 (a frozen process's pid and
+#     startedAtMicros, a legacy frozen pid) or an Int64 (its startedAt)
+#     that is not a whole number the type holds. One written with a
+#     fraction or an exponent, such as 5105.0 or 1e2, passes when its exact
+#     decimal value is whole and at most 9007199254740992 (2^53) from 0, so
+#     plutil's double holds it exactly; plutil prints it with a fraction of
+#     zeros, which backstop.sh drops where it reads one (extract_whole).
+#     The app also reads larger ones, and ones a Double rounds to a whole
+#     number, such as 1.0000000000000001; they are refused here.
 #   - text this reader cannot follow: a key without quotes, a comment, a
-#     byte order mark other than UTF-8's, or a NUL byte. UTF-16 and UTF-32,
-#     which the app reads but never writes, have NUL bytes, and the shell
-#     drops them from the text, which would turn such a file into other
-#     characters.
+#     byte order mark other than UTF-8's or UTF-16's, a NUL byte in UTF-8
+#     or in the UTF-8 read from UTF-16, or UTF-16 iconv cannot read.
+#     UTF-32, which the app reads without a byte order mark, is refused
+#     that way.
 # A string, object or array where a number belongs is left to the type
-# check, and so is a number such as 1.0 where a whole number belongs, which
-# plutil reads as a float. The app reads some of what is refused here: a
-# key twice (it takes the first), a bad escape or number under a key it
-# does not read, a whole number written as 1.0. The app never writes them,
-# so they are refused anyway. Any of these makes the journal malformed, as
-# for a wrong type, and nothing is undone.
+# check. plutil -convert, which runs first, refuses what it cannot parse
+# anywhere in the file, even where the app skips it: a leading zero such
+# as 01, a number too large for a Double such as 1e400, an escape such as
+# \a or \u0000, a lone surrogate. The app reads some of what is refused
+# here or by plutil, and never writes any of it. Any of these makes the
+# journal malformed, as for a wrong type, and nothing is undone.
 record_text_problems() { # file
   local LC_ALL=C
-  local text rest raw name c token want d vpath vshown kind limit list seen nm n
-  local str strict scalar number int esc kelvin hex lost
-  local digits sig exp e10 lead
-  local -a kinds paths shown keys names counts
+  local text rest raw name c token want d vpath vshown kind limit list seen nm n rel from
+  local str strict scalar number int lax esc kelvin hex lost
+  local digits sig exp e10 lead frac whole scale pad
+  local -a kinds paths shown keys names counts rels knowns
   str='^"([^"\\]|\\.)*"'
   strict='^"([^"\\]|\\["\\/bfnrt]|\\u[0-9A-Fa-f]{4})*"$'
   scalar='^[^],}[:space:]]+'
   number='^-?(0|[1-9][0-9]*)(\.([0-9]+))?([eE]([-+]?)([0-9]+))?$'
   int='^-?(0|[1-9][0-9]*)$'
+  lax='^[-0-9][-0-9.eE+]*$'
   esc='^u00(4[1-9A-Fa-f]|5[0-9Aa]|6[1-9A-Fa-f]|7[0-9Aa])'
   kelvin='^u212[Aa]'
   hex='^u[0-9A-Fa-f]{4}'
   lost="the text of state.json cannot be followed here, so the keys the app reads in it cannot be checked"
-  text="$(<"$1")"
+  # c is what comes before the first NUL byte, if there is one. The shell
+  # drops NUL bytes from text, so UTF-8 with one is never read here.
   if IFS= read -r -d '' c < "$1"; then
-    echo "$lost"
-    return 0
+    case "$c" in
+      ''|$'\xfe\xff') from=UTF-16BE ;;
+      ?|$'\xff\xfe'?) from=UTF-16LE ;;
+      *) echo "$lost"; return 0 ;;
+    esac
+    if ! text="$("$ICONV" -f "$from" -t UTF-8 < "$1" 2> /dev/null)" ||
+      IFS= read -r -d '' c < <("$ICONV" -f "$from" -t UTF-8 < "$1" 2> /dev/null); then
+      echo "$lost"
+      return 0
+    fi
+  else
+    text="$(<"$1")"
   fi
   rest="${text#$'\xef\xbb\xbf'}"
   rest="${rest#"${rest%%[![:space:]]*}"}"
@@ -736,9 +790,11 @@ record_text_problems() { # file
   # d is the depth of the object or array being read (1 is the top level);
   # for each, kinds holds { or [, paths where it is in the app's terms
   # (frozenProcesses[]), shown the same as a log names it
-  # (frozenProcesses[0]), keys its last key, names its keys of letters
-  # alone, and counts the values an array has had. want is what comes
-  # next: a key, a colon, a value, or a comma or the end (next).
+  # (frozenProcesses[0]), keys its last key, rels 1 when it is checked,
+  # knowns the keys the app reads in it, names those of its keys, and
+  # counts the values an array has had. want is what comes next: a key, a
+  # colon, a value, or a comma or the end (next). rel is 1 when the value
+  # about to be read is checked.
   d=0
   want=value
   while :; do
@@ -746,26 +802,50 @@ record_text_problems() { # file
     c="${rest:0:1}"
     vpath=""
     vshown=""
+    rel=0
     if [[ "$want" == value ]] && (( d > 0 )); then
       if [[ "${kinds[d]}" == "{" ]]; then
         vpath="${paths[d]:+${paths[d]}.}${keys[d]}"
         vshown="${shown[d]:+${shown[d]}.}${keys[d]}"
+        if [[ "${keys[d]}" =~ ^[A-Za-z]+$ && "${knowns[d]}" == *"|${keys[d]}|"* ]]; then rel=1; fi
       else
         vpath="${paths[d]}[]"
         vshown="${shown[d]}[${counts[d]}]"
+        rel="${rels[d]}"
       fi
     fi
     case "$c" in
       '{'|'[')
         [[ "$want" == value ]] || { echo "$lost"; return 0; }
         d=$((d + 1))
+        (( d > 1 )) || rel=1
         kinds[d]="$c"
         paths[d]="$vpath"
         shown[d]="$vshown"
         keys[d]=""
         names[d]="|"
         counts[d]=0
-        if [[ "$c" == "{" ]]; then want=key; else want=value; fi
+        knowns[d]=""
+        rels[d]=0
+        if [[ "$c" == "{" ]]; then
+          want=key
+          if (( rel == 1 )); then
+            case "$vpath" in
+              '') knowns[d]='|sleepDisabledByUs|lowPowerSetByUs|frozenProcesses|frozenPids|dockerFrozen|savedAudioOutputs|savedOutputVolume|savedMuted|savedDisplayBrightness|savedKeyboardBrightness|displayRestoredUnderLowPower|displayRestoreRefused|keyboardRestoreRefused|keptDisplayUnderLowPower|keptDisplayUnderLowPowerBoot|keptDisplayReadLit|appNapOverrides|endedSession|sessionCutoffs|' ;;
+              'frozenProcesses[]') knowns[d]='|pid|startedAt|startedAtMicros|bootSession|' ;;
+              'savedAudioOutputs[]') knowns[d]='|deviceUID|name|volume|muted|saveID|' ;;
+              'appNapOverrides[]') knowns[d]='|bundleId|previous|' ;;
+            esac
+            [[ -z "${knowns[d]}" ]] || rels[d]=1
+          fi
+        else
+          want=value
+          if (( rel == 1 )); then
+            case "$vpath" in
+              frozenProcesses|frozenPids|savedAudioOutputs|appNapOverrides) rels[d]=1 ;;
+            esac
+          fi
+        fi
         rest="${rest:1}"
         ;;
       '}'|']')
@@ -817,38 +897,47 @@ record_text_problems() { # file
         raw="${BASH_REMATCH[0]}"
         rest="${rest:${#raw}}"
         if [[ "$want" == key ]]; then
-          # The key as the app reads it. Of the escapes JSON has, only a \u
-          # of a letter or of the Kelvin sign can be part of a key of
-          # letters alone; the others stand for no letter.
           raw="${raw:1:${#raw}-2}"
-          raw="${raw//$'\xe2\x84\xaa'/K}"
-          name=""
-          while [[ "$raw" == *\\* ]]; do
-            name+="${raw%%\\*}"
-            raw="${raw#*\\}"
-            if [[ "$raw" =~ $esc ]]; then
-              printf -v c '%b' "\\x${BASH_REMATCH[1]}"
-              name+="$c"
-              raw="${raw:5}"
-            elif [[ "$raw" =~ $kelvin ]]; then
-              name+=K
-              raw="${raw:5}"
-            elif [[ "$raw" =~ $hex ]]; then
-              name+="?"
-              raw="${raw:5}"
-            else
-              case "${raw:0:1}" in
-                '"'|\\|/|b|f|n|r|t) name+="?"; raw="${raw:1}" ;;
-                *) echo "a key in state.json has an escape JSON does not have, so the keys the app reads in it cannot be checked"; return 0 ;;
-              esac
+          if [[ "${rels[d]}" == 1 ]]; then
+            # The key as the app reads it. Of the escapes JSON has, only a
+            # \u of a letter or of the Kelvin sign can be part of a key of
+            # letters alone, as every key the app reads is; the others
+            # stand for no letter.
+            raw="${raw//$'\xe2\x84\xaa'/K}"
+            name=""
+            while [[ "$raw" == *\\* ]]; do
+              name+="${raw%%\\*}"
+              raw="${raw#*\\}"
+              if [[ "$raw" =~ $esc ]]; then
+                printf -v c '%b' "\\x${BASH_REMATCH[1]}"
+                name+="$c"
+                raw="${raw:5}"
+              elif [[ "$raw" =~ $kelvin ]]; then
+                name+=K
+                raw="${raw:5}"
+              elif [[ "$raw" =~ $hex ]]; then
+                name+="?"
+                raw="${raw:5}"
+              else
+                case "${raw:0:1}" in
+                  '"'|\\|/|b|f|n|r|t) name+="?"; raw="${raw:1}" ;;
+                  *) echo "a key in state.json has an escape JSON does not have, so the keys the app reads in it cannot be checked"; return 0 ;;
+                esac
+              fi
+            done
+            name+="$raw"
+            keys[d]="$name"
+            if [[ "$name" =~ ^[A-Za-z]+$ && "${knowns[d]}" == *"|$name|"* ]]; then
+              names[d]+="$name|"
             fi
-          done
-          name+="$raw"
-          keys[d]="$name"
-          if [[ "$name" =~ ^[A-Za-z]+$ ]]; then names[d]+="$name|"; fi
+          else
+            keys[d]="$raw"
+          fi
           want="colon"
         elif [[ "$want" == value ]]; then
-          [[ "$raw" =~ $strict ]] || echo "$vshown is a string with an escape JSON does not have, which the app does not read"
+          if (( rel == 1 )) && ! [[ "$raw" =~ $strict ]]; then
+            echo "$vshown is a string with an escape JSON does not have, which the app does not read"
+          fi
           want=next
           if [[ "${kinds[d]}" == "[" ]]; then counts[d]=$((counts[d] + 1)); fi
         else
@@ -864,14 +953,18 @@ record_text_problems() { # file
         [[ "$want" == value && "$rest" =~ $scalar ]] || { echo "$lost"; return 0; }
         token="${BASH_REMATCH[0]}"
         rest="${rest:${#token}}"
-        case "$vpath" in
-          keptDisplayUnderLowPower|keptDisplayReadLit|displayRestoredUnderLowPower|savedOutputVolume|savedDisplayBrightness|savedKeyboardBrightness|'savedAudioOutputs[].volume') kind=float ;;
-          'frozenProcesses[].pid'|'frozenProcesses[].startedAtMicros'|'frozenPids[]') kind=int32 ;;
-          'frozenProcesses[].startedAt') kind=int64 ;;
-          *) kind=any ;;
-        esac
+        kind=any
+        if (( rel == 1 )); then
+          case "$vpath" in
+            keptDisplayUnderLowPower|keptDisplayReadLit|displayRestoredUnderLowPower|savedOutputVolume|savedDisplayBrightness|savedKeyboardBrightness|'savedAudioOutputs[].volume') kind=float ;;
+            'frozenProcesses[].pid'|'frozenProcesses[].startedAtMicros'|'frozenPids[]') kind=int32 ;;
+            'frozenProcesses[].startedAt') kind=int64 ;;
+          esac
+        fi
         if [[ "$token" == null || "$token" == true || "$token" == false ]]; then
           :
+        elif (( rel == 0 )); then
+          [[ "$token" =~ $lax ]] || echo "$vshown is written as ${token:0:40}, which is not a JSON value the app reads"
         elif [[ "$token" =~ $number && "$kind" == float ]]; then
           digits="${BASH_REMATCH[1]}${BASH_REMATCH[3]}"
           sig="${digits#"${digits%%[1-9]*}"}"
@@ -892,13 +985,48 @@ record_text_problems() { # file
               echo "$vshown is ${token:0:40}, too large a number for the app to read"
             fi
           fi
-        elif [[ "$token" =~ $int && "$kind" == int* ]]; then
-          digits="${token#-}"
-          if [[ "$kind" == int32 ]]; then limit=2147483647; else limit=9223372036854775807; fi
-          if [[ "$token" == -* ]]; then limit="${limit%7}8"; fi
-          # shellcheck disable=SC2071  # digit strings of one length, compared as text: the limits overflow $(( ))
-          if (( ${#digits} > ${#limit} )) || { (( ${#digits} == ${#limit} )) && [[ "$digits" > "$limit" ]]; }; then
-            echo "$vshown is ${token:0:40}, a whole number the app cannot read there"
+        elif [[ "$token" =~ $number && "$kind" == int* ]]; then
+          # whole is the number without its sign, as digits; empty when it
+          # is not whole or is too long to be read here.
+          whole=""
+          frac="${BASH_REMATCH[3]}"
+          digits="${BASH_REMATCH[1]}$frac"
+          sig="${digits#"${digits%%[1-9]*}"}"
+          if [[ -z "$sig" ]]; then
+            whole=0
+          else
+            exp="${BASH_REMATCH[6]#"${BASH_REMATCH[6]%%[1-9]*}"}"
+            if (( ${#exp} > 4 )); then
+              e10=100000
+            else
+              e10=$((10#0$exp))
+            fi
+            if [[ "${BASH_REMATCH[5]}" == - ]]; then e10=$((-e10)); fi
+            # The value is sig without its trailing zeros, times ten to
+            # the power scale.
+            whole="${sig%"${sig##*[1-9]}"}"
+            scale=$((e10 - ${#frac} + ${#sig} - ${#whole}))
+            if (( scale < 0 )); then
+              echo "$vshown is ${token:0:40}, which is not a whole number, where the app reads one"
+              whole=""
+            elif (( ${#whole} + scale > 19 )); then
+              whole=9999999999999999999
+            elif (( scale > 0 )); then
+              printf -v pad '%0*d' "$scale" 0
+              whole+="$pad"
+            fi
+          fi
+          if [[ -n "$whole" ]]; then
+            if [[ "$kind" == int32 ]]; then limit=2147483647; elif [[ "$token" =~ $int ]]; then limit=9223372036854775807; else limit=9007199254740992; fi
+            if [[ "$token" == -* && "$limit" != 9007199254740992 ]]; then limit="${limit%7}8"; fi
+            # shellcheck disable=SC2071  # digit strings of one length, compared as text: the limits overflow $(( ))
+            if (( ${#whole} > ${#limit} )) || { (( ${#whole} == ${#limit} )) && [[ "$whole" > "$limit" ]]; }; then
+              if [[ "$limit" == 9007199254740992 ]]; then
+                echo "$vshown is ${token:0:40}, a whole number past 9007199254740992 written with a fraction or an exponent, which is not read here"
+              else
+                echo "$vshown is ${token:0:40}, a whole number the app cannot read there"
+              fi
+            fi
           fi
         elif [[ "$token" =~ $number ]]; then
           :
@@ -958,10 +1086,13 @@ journal_shape_problems() { # file
         if [[ "$(type_of "$f" "frozenProcesses.$i")" != dictionary ]]; then
           echo "frozenProcesses[$i] is not an object"
         else
-          [[ "$(type_of "$f" "frozenProcesses.$i.pid")" == integer ]] || echo "frozenProcesses[$i].pid is not an integer"
+          # A float here is a whole number written as one, such as
+          # 5105.0; record_text_problems refuses any other.
+          t="$(type_of "$f" "frozenProcesses.$i.pid")"
+          [[ "$t" == integer || "$t" == float ]] || echo "frozenProcesses[$i].pid is not an integer"
           for n in startedAt startedAtMicros; do
             t="$(type_of "$f" "frozenProcesses.$i.$n")"
-            [[ -z "$t" || "$t" == integer || "$t" == "(any)" ]] || echo "frozenProcesses[$i].$n is a $t, not an integer"
+            [[ -z "$t" || "$t" == integer || "$t" == float || "$t" == "(any)" ]] || echo "frozenProcesses[$i].$n is a $t, not an integer"
           done
           t="$(type_of "$f" "frozenProcesses.$i.bootSession")"
           [[ -z "$t" || "$t" == string || "$t" == "(any)" ]] || echo "frozenProcesses[$i].bootSession is a $t, not a string"
@@ -977,7 +1108,8 @@ journal_shape_problems() { # file
     else
       i=0
       while [[ -n "$(type_of "$f" "frozenPids.$i")" ]]; do
-        [[ "$(type_of "$f" "frozenPids.$i")" == integer ]] || echo "frozenPids[$i] is not an integer"
+        t="$(type_of "$f" "frozenPids.$i")"
+        [[ "$t" == integer || "$t" == float ]] || echo "frozenPids[$i] is not an integer"
         i=$((i + 1))
       done
     fi
@@ -1308,13 +1440,22 @@ remove_stale_end_records_aside() {
 # file, not a symlink, owned by this user is read or written as one; the
 # app reads it the same way (Store.lockEndRecord). read_lock_record sets
 # lock_record_state:
-#   none     the file is empty, or not such a file: no record.
-#   record   a whole record; lock_record holds its base64.
-#   unknown  anything else: a write cut short, other bytes, a file that
-#            cannot be read whole (lock_record_why says which). It cannot
-#            say which session it ended, so it counts as the end of
-#            whatever session.json holds, the safe side, until session.json
-#            is gone (end_recorded_in_lock, remove_stale_lock_record).
+#   none        the file is empty, or not such a file: no record.
+#   record      a whole record; lock_record holds its base64.
+#   foreign     read, and not one whole record: a write cut short, other
+#               bytes, or more bytes than any record (lock_record_why says
+#               which). It ends no session. No writer counts a record
+#               before it reads it back whole, so a write cut short was
+#               never taken for an end. remove_stale_lock_record empties
+#               it, and a record written here replaces it.
+#   unreadable  its size or bytes could not be read (lock_record_why). It
+#               may hold a whole record of the session in session.json, so
+#               it counts as that session's end, the safe side, until it
+#               can be read or session.json is gone (end_recorded_in_lock,
+#               remove_stale_lock_record).
+# Every writer holds the lock, and this run reads it under the lock, so a
+# length other than the size is a NUL byte (bash drops them) and not a
+# write in progress.
 lock_record_state=none
 lock_record=""
 lock_record_why=""
@@ -1324,7 +1465,7 @@ read_lock_record() {
   lock_record=""
   lock_record_why=""
   [[ -f "$LOCK" && ! -L "$LOCK" && -O "$LOCK" ]] || return 0
-  lock_record_state=unknown
+  lock_record_state=unreadable
   size="$("$STAT" -f %z "$LOCK" 2>/dev/null)" || size=""
   if [[ ! "$size" =~ ^[0-9]+$ ]]; then
     lock_record_why="its size could not be read"
@@ -1334,13 +1475,14 @@ read_lock_record() {
     lock_record_state=none
     return 0
   fi
-  if (( size > LOCK_RECORD_MAX_BYTES )); then
-    lock_record_why="it holds $size bytes, more than an end record"
+  # The sentinel keeps a trailing newline that command substitution strips.
+  if (( size <= LOCK_RECORD_MAX_BYTES )) && ! content="$("$CAT" "$LOCK" 2>/dev/null && printf x)"; then
+    lock_record_why="it could not be read"
     return 0
   fi
-  # The sentinel keeps a trailing newline that command substitution strips.
-  if ! content="$("$CAT" "$LOCK" 2>/dev/null && printf x)"; then
-    lock_record_why="it could not be read"
+  lock_record_state=foreign
+  if (( size > LOCK_RECORD_MAX_BYTES )); then
+    lock_record_why="it holds $size bytes, more than an end record"
     return 0
   fi
   content="${content%x}"
@@ -1361,8 +1503,9 @@ read_lock_record() {
 }
 
 # Whether the recovery lock file records the end of the session in
-# $SESSION: a record of exactly its bytes, or content that is not a whole
-# record (see read_lock_record). Sets lock_match_why for the log.
+# $SESSION: a record of exactly its bytes, or a file that cannot be read,
+# which may hold one (see read_lock_record). Content read whole that is not
+# a record ends nothing. Sets lock_match_why for the log.
 lock_match_why=""
 end_recorded_in_lock() {
   local current
@@ -1370,8 +1513,8 @@ end_recorded_in_lock() {
   [[ -f "$SESSION" ]] || return 1
   read_lock_record
   case "$lock_record_state" in
-    unknown)
-      lock_match_why="$LOCK, which $lock_record_why, so it counts as the end of any session"
+    unreadable)
+      lock_match_why="$LOCK, which $lock_record_why, so it may hold this session's end and counts as one"
       return 0 ;;
     record)
       current="$(session_base64)" || return 1
@@ -1393,25 +1536,74 @@ lock_is_held_file() {
   [[ -n "$held" && "$held" == "$named" ]]
 }
 
-# Empty the recovery lock file of a record that ends nothing: anything in it
-# once session.json is gone, and a whole record of other bytes than a
-# session.json that can be read. Content that is not a whole record stays
-# while session.json is there, and so does everything while session.json is
-# not a regular file or cannot be read: none of it is shown to be stale.
-# Emptied in place (the inode stays), only while $LOCK is the file this run
-# holds; never unlinked. Never fails.
+# Empty the recovery lock file of what ends nothing: anything in it once
+# session.json is gone, content read whole that is not a record (foreign,
+# see read_lock_record), and a whole record of other bytes than a
+# session.json that can be read. A file that cannot be read stays while
+# session.json is there, and so does a record while session.json is not a
+# regular file or cannot be read: neither is shown to be stale. Emptied in
+# place (the inode stays), only while $LOCK is the file this run holds;
+# never unlinked. Never fails.
 remove_stale_lock_record() {
   local current
   read_lock_record
   [[ "$lock_record_state" != none ]] || return 0
-  if [[ -e "$SESSION" || -L "$SESSION" ]]; then
+  if [[ "$lock_record_state" != foreign ]] && [[ -e "$SESSION" || -L "$SESSION" ]]; then
     [[ "$lock_record_state" == record && -f "$SESSION" ]] || return 0
     current="$(session_base64)" || return 0
     [[ -n "$current" && "$lock_record" != "$current" ]] || return 0
   fi
+  if [[ "$lock_record_state" == foreign ]]; then
+    log info "emptying $LOCK: $lock_record_why, which ends no session" || true
+  fi
   if lock_is_held_file && { : > "$LOCK"; } 2>/dev/null; then return 0; fi
-  log warn "could not empty $LOCK of an end record that matches no session.json; it ends nothing, and the next run tries again" || true
+  log warn "could not empty $LOCK of content that ends no session; it ends nothing, and the next run tries again" || true
   return 0
+}
+
+# The place after the lock file (record_end_in_log): one line appended to
+# insomnia.log, which exists already, so the record needs no new file and no
+# write in place. The line is LOG_RECORD_TAG, the number of bytes in
+# session.json and those bytes in base64, separated by single spaces
+# (LogEndRecord.swift in the app writes and reads the same line).
+# log_record_line prints it for session.json as it is now, without the
+# newline, or fails for a file that is not a regular file, is empty, is
+# longer than LOG_RECORD_MAX_BYTES or does not read back at its size.
+log_record_line() {
+  local size encoded
+  [[ -f "$SESSION" ]] || return 1
+  size="$("$STAT" -f %z "$SESSION" 2>/dev/null)" || return 1
+  [[ "$size" =~ ^[0-9]+$ ]] || return 1
+  (( size > 0 && size <= LOG_RECORD_MAX_BYTES )) || return 1
+  encoded="$(session_base64)" || return 1
+  # Base64 of exactly $size bytes, no more and no fewer.
+  (( ${#encoded} == 4 * ((size + 2) / 3) )) || return 1
+  printf '%s %s %s' "$LOG_RECORD_TAG" "$size" "$encoded"
+}
+
+# Whether insomnia.log or insomnia.log.1 holds a whole line equal to
+# log_record_line: the end of exactly the session in $SESSION. A line is
+# ended by a newline or the end of the file, as grep reads it, so a write
+# cut short, a line another write broke into, or a record of other bytes
+# matches nothing. Only a regular file, not a symlink, owned by this user,
+# of at most LOG_SCAN_MAX_BYTES, is read. A log that cannot be read records
+# nothing here; the app's rotation keeps it (LogEndRecord.keepRecords). Sets
+# log_match to the file.
+log_match=""
+end_recorded_in_log() {
+  local line f size
+  log_match=""
+  line="$(log_record_line)" || return 1
+  for f in "$LOG" "$LOG.1"; do
+    [[ -f "$f" && ! -L "$f" && -O "$f" ]] || continue
+    size="$("$STAT" -f %z "$f" 2>/dev/null)" || continue
+    if ! [[ "$size" =~ ^[0-9]+$ ]] || (( size > LOG_SCAN_MAX_BYTES )); then continue; fi
+    if "$GREP" -Fxq -e "$line" < "$f" 2>/dev/null; then
+      log_match="$f"
+      return 0
+    fi
+  done
+  return 1
 }
 
 # --- Was this session already ended? -----------------------------------------
@@ -1446,6 +1638,9 @@ elif end_recorded_aside; then
 elif end_recorded_in_lock; then
   ended_before=1
   ended_where="$lock_match_why"
+elif end_recorded_in_log; then
+  ended_before=1
+  ended_where="$log_match"
 fi
 
 # --- Is a valid session still live? ------------------------------------------
@@ -1525,7 +1720,10 @@ app_alive() {
 #     the strictest cutoffs, a 95% end floor and thermal rules on, with an
 #     error logged. On battery power that ends the session below 95%; the
 #     run cannot tell which cutoffs the app enforces, and keeping sleep
-#     disabled on a lower floor than the app's is the worse error.
+#     disabled on a lower floor than the app's is the worse error. These
+#     need not match the app, which reads such a value or link as no record
+#     and keeps its own settings, and rewrites them within a second while
+#     it answers.
 cutoff_floor=10
 cutoff_thermal=true
 read_cutoffs() {
@@ -1607,12 +1805,12 @@ read_cutoffs() {
 # The journal's sessionCutoffs read here, for when the app's binary cannot
 # read it: "cutoffs <floor> <true|false>", "none" for no record (the key
 # absent or null) or "foreign" for a value the app does not write. Only
-# for a journal check_journal found loads: each key of letters is then in
-# its object once (record_text_problems), so the copy plutil reads is the
-# copy the app reads, and every escape is one JSON has. plutil -extract
-# raw prints the string and a newline; the dot keeps any other trailing
-# newline, which the app does not accept either. The test is the one
-# AgentCutoffs(journalValue:) makes.
+# for a journal check_journal found loads: each key the app reads at the
+# top level is then there once (record_text_problems), so the copy plutil
+# reads is the copy the app reads, and every escape in the record is one
+# JSON has. plutil -extract raw prints the string and a newline; the dot
+# keeps any other trailing newline, which the app does not accept either.
+# The test is the one AgentCutoffs(journalValue:) makes.
 journal_cutoffs() {
   local t v re='^([0-9]|[1-8][0-9]|9[0-5]) (true|false)$'
   t="$(type_of "$STATE" sessionCutoffs)"
@@ -1890,23 +2088,61 @@ record_end_aside() {
 # Record the same end in the recovery lock file (see read_lock_record), for
 # when $ENDED, the journal and both folders refuse it: the file exists
 # already and takes the record in place, keeping its inode. Written only
-# while $LOCK is the regular file this run holds the lock on. A record
-# already there for these bytes is used again, and so is content that is
-# not a whole record, which already counts as the end of any session and is
-# not overwritten. True only when the file then reads back as exactly that
-# record. A write cut short leaves content that is not a whole record,
-# which every reader counts as the end of whatever session.json holds.
+# while $LOCK is the regular file this run holds the lock on, over anything
+# else there. A record already there for these bytes is used again. A file
+# that cannot be read counts as an end for readers, but not here: it is
+# written over too, as no read shows what it holds. True only when the
+# file then reads back as exactly that record. A write cut short is never
+# counted, and leaves content that ends no session.
 record_end_in_lock() {
   local encoded
   encoded="$(session_base64)" || return 1
   [[ -n "$encoded" ]] || return 1
-  if end_recorded_in_lock; then return 0; fi
+  read_lock_record
+  if [[ "$lock_record_state" == record && "$lock_record" == "$encoded" ]]; then return 0; fi
   (( ${#LOCK_RECORD_TAG} + ${#encoded} + 2 <= LOCK_RECORD_MAX_BYTES )) || return 1
   lock_is_held_file || return 1
   { printf '%s %s\n' "$LOCK_RECORD_TAG" "$encoded" > "$LOCK"; } 2>/dev/null || true
   lock_is_held_file || return 1
   read_lock_record
   [[ "$lock_record_state" == record && "$lock_record" == "$encoded" ]]
+}
+
+# Device and inode of a path (lstat), and of an open descriptor: stat
+# with no operand reads its standard input with fstat(2). /dev/fd/N is no
+# substitute, as stat reports devfs's device for it.
+devino() { "$STAT" -f %d:%i "$1" 2>/dev/null; }
+fd_devino() { "$STAT" -f %d:%i <&"$1" 2>/dev/null; }
+
+# Record the same end as one line appended to insomnia.log (see
+# end_recorded_in_log), for when $ENDED, the journal, both folders and the
+# lock file refuse it. This run holds the recovery lock (fd 9), and the app
+# rotates the log only under that lock, so the file cannot be renamed
+# between the write and the read-back. Written only while $LOG is a regular
+# file, not a symlink, owned by this user, through a descriptor opened for
+# appending, read back through another opened for reading, both checked to
+# be on the file $LOG names (device and inode) before the write and after
+# the read. A record already in either log for these bytes is used again.
+# True only when the read-back finds the whole line, and end_recorded_in_log
+# then finds it too.
+record_end_in_log() {
+  local line rc=1
+  if end_recorded_in_log; then return 0; fi
+  line="$(log_record_line)" || return 1
+  [[ -f "$LOG" && ! -L "$LOG" && -O "$LOG" ]] || return 1
+  # shellcheck disable=SC2094  # the log is appended to on 8 and read back on 7, on purpose
+  {
+    if [[ -n "$(fd_devino 8)" && "$(fd_devino 8)" == "$(fd_devino 7)" \
+          && "$(fd_devino 8)" == "$(devino "$LOG")" && -f "$LOG" && ! -L "$LOG" && -O "$LOG" ]] \
+        && { printf '%s\n' "$line" >&8; } 2>/dev/null \
+        && "$GREP" -Fxq -e "$line" <&7 2>/dev/null \
+        && [[ "$(fd_devino 7)" == "$(devino "$LOG")" ]]; then
+      rc=0
+    fi
+  } 2>/dev/null 8>>"$LOG" 7<"$LOG" || return 1
+  # And as every reader finds it, by path (a log past LOG_SCAN_MAX_BYTES is
+  # not searched).
+  (( rc == 0 )) && end_recorded_in_log
 }
 
 # The journal is checked first: a valid session is not ended, its file not
@@ -1928,9 +2164,11 @@ if [[ "$session_state" == valid ]] && ! remove_session; then
     log error "could not remove $SESSION or record its end in $ENDED or $STATE; its end is recorded in $aside_match instead, so Insomnia restores the session instead of resuming it. Every run retries the removal"
   elif record_end_in_lock; then
     log error "could not remove $SESSION or record its end in $ENDED, $STATE or a new file in $APP_SUPPORT or $LOG_DIR; its end is recorded in the recovery lock file $LOCK instead, so Insomnia restores the session instead of resuming it. Every run retries the removal"
+  elif record_end_in_log; then
+    log error "could not remove $SESSION or record its end in $ENDED, $STATE, a new file in $APP_SUPPORT or $LOG_DIR, or the recovery lock file $LOCK; its end is recorded in the log file $LOG instead, so Insomnia restores the session instead of resuming it. Every run retries the removal"
   else
     keep_sleep_entry=1
-    log error "could not remove $SESSION or record its end in $ENDED, $STATE, a new file in $APP_SUPPORT or $LOG_DIR, or the recovery lock file $LOCK. Sleep is restored anyway, but sleepDisabledByUs stays journaled and every run exits 1 until the file can be removed (ls -lO shows its flags); Insomnia resumes no session while it cannot replace $SESSION or write $STATE, and none whose journaled sleep hold pmset no longer reports"
+    log error "could not remove $SESSION or record its end in $ENDED, $STATE, a new file in $APP_SUPPORT or $LOG_DIR, the recovery lock file $LOCK, or the log file $LOG. Sleep is restored anyway, but sleepDisabledByUs stays journaled and every run exits 1 until the file can be removed (ls -lO shows its flags); Insomnia resumes no session while it cannot replace $SESSION or write $STATE, and none whose journaled sleep hold pmset no longer reports"
   fi
 fi
 
@@ -2281,9 +2519,9 @@ if (( frozen_count > 0 )); then
   uid_now="$("$ID" -u)"
   i=0
   while (( i < frozen_count )); do
-    pid="$(extract "$STATE" "frozenProcesses.$i.pid" || true)"
-    started="$(extract "$STATE" "frozenProcesses.$i.startedAt" || true)"
-    micros="$(extract "$STATE" "frozenProcesses.$i.startedAtMicros" || true)"
+    pid="$(extract_whole "$STATE" "frozenProcesses.$i.pid" || true)"
+    started="$(extract_whole "$STATE" "frozenProcesses.$i.startedAt" || true)"
+    micros="$(extract_whole "$STATE" "frozenProcesses.$i.startedAtMicros" || true)"
     boot="$(extract "$STATE" "frozenProcesses.$i.bootSession" || true)"
     if ! is_positive_int "$pid"; then
       log error "frozen entry $i has no valid pid (${pid:-?}); kept, not signaled"

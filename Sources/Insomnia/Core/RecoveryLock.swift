@@ -51,6 +51,21 @@ final class RecoveryLockHandle: @unchecked Sendable {
         }
     }
 
+    /// Whether this handle still holds the lock on the file at `path`: not
+    /// released, and `path` names the file its descriptor is open on. The
+    /// log's rotation and its end record (`LogEndRecord`) run only then, so
+    /// a handle inherited by a task that outlived its transaction, or one
+    /// on another home's lock, never counts.
+    func locks(path: String) -> Bool {
+        mutex.withLock {
+            guard fd >= 0 else { return false }
+            var held = stat()
+            var named = stat()
+            return fstat(fd, &held) == 0 && stat(path, &named) == 0
+                && held.st_dev == named.st_dev && held.st_ino == named.st_ino
+        }
+    }
+
     /// A new close-on-exec descriptor on the locked file, for a child that
     /// must keep the lock while it runs: the spawn installs it without the
     /// flag. The caller closes its copy once the child has been started.

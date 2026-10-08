@@ -327,6 +327,22 @@ struct Store: Sendable {
     /// A larger lock file holds no whole record.
     static let lockEndRecordMaxBytes = 1 << 20
 
+    #if DEBUG
+    /// Tests set a lower limit on the record this app writes in the lock
+    /// file, 0 for a lock file that refuses it (a stand-in for a full disk),
+    /// as `PatchedBackstop.refuseLockRecord` does for the agent. Debug
+    /// builds only; nothing reads it otherwise.
+    nonisolated(unsafe) static var lockRecordWriteLimitForTesting: Int?
+    #endif
+
+    private static var lockRecordWriteLimit: Int {
+        #if DEBUG
+        return lockRecordWriteLimitForTesting ?? lockEndRecordMaxBytes
+        #else
+        return lockEndRecordMaxBytes
+        #endif
+    }
+
     /// What the recovery lock file says about the end of a session.
     enum LockEndRecord: Equatable {
         /// Nothing: the file is empty or missing, or not a regular file
@@ -336,17 +352,27 @@ struct Store: Sendable {
         /// A whole record: the end of the session.json whose bytes this
         /// base64 holds.
         case record(String)
-        /// Anything else: a write cut short, other bytes, a file that cannot
-        /// be read whole (the text says which). It cannot say which session
-        /// it ended, so it counts as the end of whatever session.json holds
-        /// until session.json is gone, the safe side.
-        case unknown(String)
+        /// Read, and not one whole record (the text says why): a write cut
+        /// short, other bytes, or more bytes than any record. It ends no
+        /// session. No writer counts a record before it reads it back
+        /// whole, so a write cut short was never taken for an end, and the
+        /// end it was for is in the log or still to be recorded. It is
+        /// emptied like a stale record (backstop.sh's
+        /// remove_stale_lock_record, `deleteSession`, a start), and a
+        /// record written here replaces it.
+        case foreign(String)
+        /// The file could not be read whole (the text says why). It may
+        /// hold a whole record of the session in session.json, so it counts
+        /// as that session's end, the safe side, until it can be read or
+        /// session.json is gone. No writer takes it for a record it wrote.
+        case unreadable(String)
     }
 
     func lockEndRecord() -> LockEndRecord {
         switch readLockFile() {
         case .notUsable: return .none
-        case let .unreadable(why): return .unknown(why)
+        case let .tooLarge(size): return .foreign("it holds \(size) bytes, more than an end record")
+        case let .unreadable(why): return .unreadable(why)
         case let .bytes(data): return Self.parseLockEndRecord(data)
         }
     }
@@ -355,6 +381,8 @@ struct Store: Sendable {
         /// Missing, or not a regular file (lstat) this user owns.
         case notUsable
         case bytes(Data)
+        /// Larger than `lockEndRecordMaxBytes`, so not read.
+        case tooLarge(Int64)
         case unreadable(String)
     }
 
@@ -366,9 +394,7 @@ struct Store: Sendable {
         var st = stat()
         guard lstat(path, &st) == 0, st.st_mode & S_IFMT == S_IFREG, st.st_uid == getuid() else { return .notUsable }
         if st.st_size == 0 { return .bytes(Data()) }
-        guard st.st_size <= Self.lockEndRecordMaxBytes else {
-            return .unreadable("it holds \(st.st_size) bytes, more than an end record")
-        }
+        guard st.st_size <= Self.lockEndRecordMaxBytes else { return .tooLarge(Int64(st.st_size)) }
         // O_NONBLOCK and O_NOFOLLOW: what took the place of the file checked
         // above is never waited on or followed.
         let fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
@@ -398,10 +424,10 @@ struct Store: Sendable {
     /// Content backstop.sh's read_lock_record reads the same way: the tag,
     /// one space, base64 (letters, digits, + and /, then at most two =,
     /// a multiple of four in all) and one newline is a record; nothing is
-    /// none; anything else is unknown.
+    /// none; anything else is foreign.
     static func parseLockEndRecord(_ data: Data) -> LockEndRecord {
         guard !data.isEmpty else { return .none }
-        let other = LockEndRecord.unknown("it holds bytes other than one whole end record")
+        let other = LockEndRecord.foreign("it holds bytes other than one whole end record")
         let prefix = Array((lockEndRecordTag + " ").utf8)
         let bytes = Array(data)
         guard bytes.last == 0x0A, bytes.count > prefix.count + 1, Array(bytes.prefix(prefix.count)) == prefix else { return other }
@@ -417,17 +443,18 @@ struct Store: Sendable {
 
     /// Where the recovery lock file records the end of the session in
     /// session.json, for the log, or nil when it does not: a record of
-    /// exactly that file's bytes, or content that is not a whole record,
-    /// which counts as the end of any session (`LockEndRecord.unknown`).
-    /// Nothing is recorded for a session.json that is not a regular file.
+    /// exactly that file's bytes, or a file that cannot be read whole,
+    /// which may hold one (`LockEndRecord.unreadable`). Content read whole
+    /// that is not a record ends nothing (`LockEndRecord.foreign`). Nothing
+    /// is recorded for a session.json that is not a regular file.
     func sessionEndRecordedInLock() -> String? {
         var st = stat()
         guard stat(paths.sessionFile.path, &st) == 0, st.st_mode & S_IFMT == S_IFREG else { return nil }
         switch lockEndRecord() {
-        case .none:
+        case .none, .foreign:
             return nil
-        case let .unknown(why):
-            return "\(paths.recoveryLock.lastPathComponent), which \(why), so it counts as the end of any session"
+        case let .unreadable(why):
+            return "\(paths.recoveryLock.lastPathComponent), which \(why), so it may hold this session's end and counts as one"
         case let .record(encoded):
             return encoded == sessionEndMarker() ? paths.recoveryLock.lastPathComponent : nil
         }
@@ -436,14 +463,17 @@ struct Store: Sendable {
     /// For an end that could not remove session.json and could write
     /// neither ended-session.json, the journal nor a record aside: the record of its
     /// bytes in the recovery lock file, written through `lock`, the handle
-    /// this transaction holds. A record already there for these bytes, or
-    /// content that already counts as the end of any session, is kept. True
-    /// only when the file then reads back as such.
+    /// this transaction holds, over anything else there. A record already
+    /// there for these bytes is kept. A file that cannot be read whole
+    /// counts as an end for readers, but not here: it is written over too,
+    /// as no read shows what it holds. True only when the file then reads
+    /// back as a whole record of these bytes.
     func recordSessionEndInLock(lock: RecoveryLockHandle? = RecoveryLock.held) -> Bool {
-        if sessionEndRecordedInLock() != nil { return true }
-        guard let lock, let encoded = sessionEndMarker() else { return false }
+        guard let encoded = sessionEndMarker() else { return false }
+        if lockEndRecord() == .record(encoded) { return true }
+        guard let lock else { return false }
         let record = Data("\(Self.lockEndRecordTag) \(encoded)\n".utf8)
-        guard record.count <= Self.lockEndRecordMaxBytes else { return false }
+        guard record.count <= Self.lockRecordWriteLimit else { return false }
         _ = lock.replaceContents(with: record, at: paths.recoveryLock.path)
         return lockEndRecord() == .record(encoded) && sessionEndRecordedInLock() != nil
     }
@@ -462,10 +492,11 @@ struct Store: Sendable {
     /// The recovery lock file's bytes, to put back with
     /// `restoreLockContents` when what replaced them is undone: empty for a
     /// file that is missing or not a regular file this user owns, which is
-    /// never written; nil when it cannot be read whole.
+    /// never written, and for one larger than any record, which ends
+    /// nothing and is not kept; nil when it cannot be read whole.
     func lockContents() -> Data? {
         switch readLockFile() {
-        case .notUsable: return Data()
+        case .notUsable, .tooLarge: return Data()
         case .unreadable: return nil
         case let .bytes(data): return data
         }
@@ -478,6 +509,53 @@ struct Store: Sendable {
         guard let lock else { return false }
         _ = lock.replaceContents(with: data, at: paths.recoveryLock.path)
         return lockContents() == data
+    }
+
+    // MARK: The end record in the log
+
+    /// Where the log records the end of the session in session.json
+    /// (`LogEndRecord`): "insomnia.log" or "insomnia.log.1", the file that
+    /// holds a whole record of exactly that file's bytes, or nil. A log that
+    /// cannot be read records nothing here; a rotation keeps it
+    /// (`LogEndRecord.keepRecords`). Nothing is recorded for a session.json
+    /// that is missing, unreadable or not a regular file.
+    func sessionEndRecordedInLog() -> String? {
+        guard let current = try? readData(from: paths.sessionFile),
+              let line = LogEndRecord.line(for: current) else { return nil }
+        for url in [paths.logFile, OwnerOnly.rotated(paths.logFile)] {
+            if case .read(found: true, _) = LogEndRecord.scan(url, for: line) { return url.lastPathComponent }
+        }
+        return nil
+    }
+
+    /// For an end that could not remove session.json and could write
+    /// neither ended-session.json, the journal, a record aside nor the
+    /// recovery lock file: the record of its bytes appended to insomnia.log,
+    /// only while `lock` is the recovery lock this transaction holds, and
+    /// under `Log.withFileLock`, so no line or rotation from this process
+    /// runs between the write and the read-back. A record already in either
+    /// log for these bytes is used again. True only when a whole record of
+    /// session.json's bytes then reads back.
+    func recordSessionEndInLog(lock: RecoveryLockHandle? = RecoveryLock.held) -> Bool {
+        if sessionEndRecordedInLog() != nil { return true }
+        guard let lock, lock.locks(path: paths.recoveryLock.path),
+              let current = try? readData(from: paths.sessionFile),
+              let line = LogEndRecord.line(for: current) else { return false }
+        let logFile = paths.logFile
+        guard Log.withFileLock({ LogEndRecord.append(line, to: logFile) }) else { return false }
+        return sessionEndRecordedInLog() != nil
+    }
+
+    /// What `sessionEndRecordedInLog` reads, as device, inode, size and
+    /// modification time of session.json (followed, as it is read) and both
+    /// logs (not followed), so the 1 Hz tick reads the logs again only after
+    /// one of them changed.
+    func logEndRecordFingerprint() -> String {
+        [(paths.sessionFile, true), (paths.logFile, false), (OwnerOnly.rotated(paths.logFile), false)].map { url, follow in
+            var st = stat()
+            guard (follow ? stat(url.path, &st) : lstat(url.path, &st)) == 0 else { return "-" }
+            return "\(st.st_dev):\(st.st_ino):\(st.st_size):\(st.st_mtimespec.tv_sec).\(st.st_mtimespec.tv_nsec)"
+        }.joined(separator: " ")
     }
 
     /// Whether anything is at session.json, a dangling symlink included.

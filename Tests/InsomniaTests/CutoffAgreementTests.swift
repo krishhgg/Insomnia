@@ -904,42 +904,51 @@ final class CutoffAgreementTests: XCTestCase {
     /// enforces the strictest cutoffs, a 95% end floor and thermal rules
     /// on, and logs why: on a file with both off, it ends a session at 94%
     /// and keeps one at 95%. Each answer the binary gives here is one the
-    /// script does not take.
+    /// script does not take. Each run after the control has a home of its
+    /// own (`SeparateRun`), so they go several at a time.
     func testTheAgentEnforcesTheStrictestCutoffsWhenTheAppBinaryCannotAnswer() async throws {
         var c = Config()
         c.setEndFloor(0)
         c.thermalRules = false
         try h.store.saveConfig(c)
+        let config = try Data(contentsOf: h.home.paths.configFile)
         let control = try await agentEnds(atBattery: 94)
         XCTAssertFalse(control, "the binary answers: \(logText())")
 
-        let cases: [(why: String, breakIt: () throws -> Void)] = [
-            ("declares InsomniaAgentCutoffsVersion '', not \(AgentCutoffsCommand.version)", { try self.agent.withdrawAgentCutoffs() }),
-            ("is missing or not executable", { try FileManager.default.removeItem(at: self.agent.appBinary) }),
-            ("unexpected answer from '\(agent.appBinary.path) --agent-cutoffs' (exit 0, output 'cutoffs 96 false')", { try self.agent.replaceAppBinary(with: "echo 'cutoffs 96 false'") }),
-            ("(exit 0, output 'rejected')", { try self.agent.replaceAppBinary(with: "echo rejected") }),
-            ("(exit 65, output 'cutoffs 0 false')", { try self.agent.replaceAppBinary(with: "echo 'cutoffs 0 false'; exit 65") }),
-            ("(exit 1, output '')", { try self.agent.replaceAppBinary(with: "exit 1") }),
-            ("did not answer within 1s", {
-                try self.agent.replaceAppBinary(with: "exec /bin/sleep 300")
-                try self.agent.setCommandTimeout(1)
+        // Each run's copy has its own app binary, which one message names.
+        // A binary that does not answer is cut off after 5 s, not 1 s: the
+        // undo commands share that limit, and with eight runs at once a fake
+        // that answers at once was seen to start too late for 1 s.
+        let cases: [(why: (PatchedBackstop) -> String, breakIt: (PatchedBackstop) throws -> Void)] = [
+            ({ _ in "declares InsomniaAgentCutoffsVersion '', not \(AgentCutoffsCommand.version)" }, { try $0.withdrawAgentCutoffs() }),
+            ({ _ in "is missing or not executable" }, { try FileManager.default.removeItem(at: $0.appBinary) }),
+            ({ "unexpected answer from '\($0.appBinary.path) --agent-cutoffs' (exit 0, output 'cutoffs 96 false')" }, { try $0.replaceAppBinary(with: "echo 'cutoffs 96 false'") }),
+            ({ _ in "(exit 0, output 'rejected')" }, { try $0.replaceAppBinary(with: "echo rejected") }),
+            ({ _ in "(exit 65, output 'cutoffs 0 false')" }, { try $0.replaceAppBinary(with: "echo 'cutoffs 0 false'; exit 65") }),
+            ({ _ in "(exit 1, output '')" }, { try $0.replaceAppBinary(with: "exit 1") }),
+            ({ _ in "did not answer within 5s" }, {
+                try $0.replaceAppBinary(with: "exec /bin/sleep 300")
+                try $0.setCommandTimeout(5)
             }),
         ]
-        for (why, breakIt) in cases {
-            agent = try PatchedBackstop(home: h.home.root, dir: h.home.root.appendingPathComponent("agent", isDirectory: true))
-            try breakIt()
-            try? FileManager.default.removeItem(at: h.home.paths.logFile)
-            let ends = try await agentEnds(atBattery: 94)
-            XCTAssertTrue(ends, "\(why): \(logText())")
-            XCTAssertTrue(logText().contains("below the 95% end floor"), logText())
-            XCTAssertTrue(logText().contains(why), "\(why): \(logText())")
-            XCTAssertTrue(logText().contains("enforcing the strictest, a 95% end floor and thermal rules on"), logText())
-            let kept = try await agentEnds(atBattery: 95)
-            XCTAssertFalse(kept, "\(why): \(logText())")
-            try agent.setThermal(3)
-            let exit = try await agent.run()
-            XCTAssertEqual(exit, 0, logText())
-            XCTAssertNil(try h.store.loadSession(), "\(why): the thermal rule is on: \(logText())")
+        var runs: [(run: SeparateRun, why: String, ends: Bool, what: String)] = []
+        for (i, (why, breakIt)) in cases.enumerated() {
+            for (battery, level, ends, what) in [(94, 0, true, "at 94%"), (95, 0, false, "at 95%"), (95, 3, true, "at 95%, critical: the thermal rule is on")] {
+                let run = try SeparateRun(in: h, name: "\(i)-\(battery)-\(level)", config: config, battery: battery, level: level, prepare: breakIt)
+                runs.append((run, why(run.agent), ends, what))
+            }
+        }
+
+        let results = try await SeparateRun.runAll(runs.map(\.run))
+
+        for (r, result) in zip(runs, results) {
+            let log = try r.run.check(result, "\(r.why) \(r.what)")
+            XCTAssertEqual(result.ended, r.ends, "\(r.why) \(r.what): \(log)")
+            if r.run.battery == 94 {
+                XCTAssertTrue(log.contains("below the 95% end floor"), log)
+                XCTAssertTrue(log.contains(r.why), "\(r.why): \(log)")
+                XCTAssertTrue(log.contains("enforcing the strictest, a 95% end floor and thermal rules on"), log)
+            }
         }
     }
 
@@ -952,67 +961,77 @@ final class CutoffAgreementTests: XCTestCase {
     /// a record gives the defaults where config.json was missing (a session
     /// an older build started: kept at 20%, ended at 9%), and the strictest
     /// cutoffs where config.json is there and the binary could not read it,
-    /// rejected or not.
+    /// rejected or not. Each run has a home of its own holding copies of
+    /// the session's files (`SeparateRun`), so they go several at a time.
     func testTheAgentReadsTheRecordItselfWhenTheAppBinaryCannotAnswer() async throws {
         _ = try await startWith(endFloor: 30, thermalRules: false)
         XCTAssertEqual(try recorded(), AgentCutoffs(endFloor: 30, thermalRules: false))
         let session = try Data(contentsOf: h.home.paths.sessionFile)
         let journal = try Data(contentsOf: h.home.paths.stateFile)
         let config = try Data(contentsOf: h.home.paths.configFile)
-        let breaks: [(why: String, breakIt: () throws -> Void)] = [
-            ("declares InsomniaAgentCutoffsVersion '', not \(AgentCutoffsCommand.version)", { try self.agent.withdrawAgentCutoffs() }),
-            ("is missing or not executable", { try FileManager.default.removeItem(at: self.agent.appBinary) }),
-            ("(exit 0, output 'cutoffs 96 false')", { try self.agent.replaceAppBinary(with: "echo 'cutoffs 96 false'") }),
-            ("did not answer within 1s", {
-                try self.agent.replaceAppBinary(with: "exec /bin/sleep 300")
-                try self.agent.setCommandTimeout(1)
+        let breaks: [(why: String, breakIt: (PatchedBackstop) throws -> Void)] = [
+            ("declares InsomniaAgentCutoffsVersion '', not \(AgentCutoffsCommand.version)", { try $0.withdrawAgentCutoffs() }),
+            ("is missing or not executable", { try FileManager.default.removeItem(at: $0.appBinary) }),
+            ("(exit 0, output 'cutoffs 96 false')", { try $0.replaceAppBinary(with: "echo 'cutoffs 96 false'") }),
+            // 5 s, not 1 s, as in the strictest-cutoffs test above.
+            ("did not answer within 5s", {
+                try $0.replaceAppBinary(with: "exec /bin/sleep 300")
+                try $0.setCommandTimeout(5)
             }),
         ]
-        let configs: [(name: String, write: () throws -> Void)] = [
-            ("read", { try config.write(to: self.h.home.paths.configFile) }),
-            ("rejected", { try self.rejectedConfig.write(to: self.h.home.paths.configFile) }),
-            ("missing", { try? FileManager.default.removeItem(at: self.h.home.paths.configFile) }),
-        ]
-        for (why, breakIt) in breaks {
-            agent = try PatchedBackstop(home: h.home.root, dir: h.home.root.appendingPathComponent("agent", isDirectory: true))
-            try breakIt()
-            for (name, write) in configs {
-                for (battery, critical, end) in [(31, true, false), (29, false, true)] {
-                    let label = "\(why), config.json \(name), \(battery)%, critical \(critical)"
-                    try session.write(to: h.home.paths.sessionFile)
-                    try journal.write(to: h.home.paths.stateFile)
-                    try write()
-                    try? FileManager.default.removeItem(at: h.home.paths.logFile)
-                    agent.clearCalls()
-                    try agent.setBattery(battery)
-                    let ended = try await agentEnds(level: critical ? 3 : 0)
-                    XCTAssertEqual(ended, end, "\(label): \(logText())")
-                    XCTAssertTrue(logText().contains(why), "\(label): \(logText())")
-                    XCTAssertTrue(logText().contains("enforcing the cutoffs recorded for the session in \(h.home.paths.stateFile.path), read here: a 30% end floor and thermal rules off"), "\(label): \(logText())")
-                    XCTAssertFalse(logText().contains("enforcing the strictest"), "\(label): \(logText())")
-                }
-            }
-        }
-
-        try FileManager.default.removeItem(at: agent.appBinary)
+        let configs: [(name: String, bytes: Data?)] = [("read", config), ("rejected", rejectedConfig), ("missing", nil)]
         var older = try Store.decodeState(journal)
         older.sessionCutoffs = nil
         let olderJournal = try Store.makeEncoder().encode(older)
-        for (name, write, battery, end, log) in [
-            ("missing", configs[2].write, 20, false, "records no cutoffs for the session (an older build started it), so the app's defaults apply"),
-            ("missing", configs[2].write, 9, true, "below the 10% end floor"),
-            ("rejected", configs[1].write, 94, true, "records no cutoffs for the session; enforcing the strictest, a 95% end floor and thermal rules on"),
-            ("read", configs[0].write, 94, true, "records no cutoffs for the session; enforcing the strictest, a 95% end floor and thermal rules on"),
-        ] as [(String, () throws -> Void, Int, Bool, String)] {
-            try session.write(to: h.home.paths.sessionFile)
-            try olderJournal.write(to: h.home.paths.stateFile)
-            try write()
-            try? FileManager.default.removeItem(at: h.home.paths.logFile)
-            agent.clearCalls()
-            try agent.setBattery(battery)
-            let ended = try await agentEnds(level: 0)
-            XCTAssertEqual(ended, end, "no record, config.json \(name), \(battery)%: \(logText())")
-            XCTAssertTrue(logText().contains(log), "no record, config.json \(name), \(battery)%: \(logText())")
+
+        // A run on copies of the session, `journal` and config.json as
+        // `configs` names it.
+        func run(_ name: String, journal: Data, config: Int, battery: Int, level: Int,
+                 prepare: (PatchedBackstop) throws -> Void) throws -> SeparateRun {
+            let bytes = configs[config].bytes
+            return try SeparateRun(in: h, name: name, config: bytes ?? Data(), battery: battery, level: level, prepare: prepare) { paths in
+                try session.write(to: paths.sessionFile)
+                try journal.write(to: paths.stateFile)
+                try bytes?.write(to: paths.configFile)
+            }
+        }
+
+        var runs: [(run: SeparateRun, label: String, end: Bool, logs: [String], strictest: Bool)] = []
+        for (b, (why, breakIt)) in breaks.enumerated() {
+            for (c, (name, _)) in configs.enumerated() {
+                for (battery, critical, end) in [(31, true, false), (29, false, true)] {
+                    let r = try run("\(b)-\(name)-\(battery)", journal: journal, config: c, battery: battery, level: critical ? 3 : 0, prepare: breakIt)
+                    let read = "enforcing the cutoffs recorded for the session in \(r.paths.stateFile.path), read here: a 30% end floor and thermal rules off"
+                    runs.append((r, "\(why), config.json \(name), \(battery)%, critical \(critical)", end, [why, read], false))
+                }
+            }
+        }
+        // The last break's copy, whose binary then goes too.
+        let gone: (PatchedBackstop) throws -> Void = {
+            try breaks[3].breakIt($0)
+            try FileManager.default.removeItem(at: $0.appBinary)
+        }
+        for (c, battery, end, log) in [
+            (2, 20, false, "records no cutoffs for the session (an older build started it), so the app's defaults apply"),
+            (2, 9, true, "below the 10% end floor"),
+            (1, 94, true, "records no cutoffs for the session; enforcing the strictest, a 95% end floor and thermal rules on"),
+            (0, 94, true, "records no cutoffs for the session; enforcing the strictest, a 95% end floor and thermal rules on"),
+        ] {
+            let r = try run("older-\(configs[c].name)-\(battery)", journal: olderJournal, config: c, battery: battery, level: 0, prepare: gone)
+            runs.append((r, "no record, config.json \(configs[c].name), \(battery)%", end, [log], true))
+        }
+
+        let results = try await SeparateRun.runAll(runs.map(\.run))
+
+        for (r, result) in zip(runs, results) {
+            let log = try r.run.check(result, r.label)
+            XCTAssertEqual(result.ended, r.end, "\(r.label): \(log)")
+            for line in r.logs {
+                XCTAssertTrue(log.contains(line), "\(r.label): \(log)")
+            }
+            if !r.strictest {
+                XCTAssertFalse(log.contains("enforcing the strictest"), "\(r.label): \(log)")
+            }
         }
     }
 
@@ -1214,8 +1233,9 @@ final class CutoffAgreementTests: XCTestCase {
 /// runs which share nothing can go several at a time: config.json holding
 /// `config`, a session on disk whose journal holds sleep, as the app leaves
 /// one, the app's alive lock held, and the battery at `battery` percent on
-/// battery power at nominal heat. The same as `agentEnds(atBattery:)`, one
-/// home per run.
+/// battery power at thermal pressure `level` (nominal by default). The same
+/// as `agentEnds(atBattery:)`, one home per run. `prepare` changes the
+/// run's copy of the agent first (an app binary that cannot answer).
 struct SeparateRun {
     let paths: Paths
     let config: Data
@@ -1223,24 +1243,49 @@ struct SeparateRun {
     let agent: PatchedBackstop
     let alive: AppAliveLock
 
-    @MainActor init(in h: Harness, name: String, config: Data, battery: Int) throws {
+    @MainActor init(in h: Harness, name: String, config: Data, battery: Int, level: Int = 0,
+                    prepare: (PatchedBackstop) throws -> Void = { _ in }) throws {
+        let now = h.clock.now
+        try self.init(in: h, name: name, config: config, battery: battery, level: level, prepare: prepare) { paths in
+            try config.write(to: paths.configFile)
+            let store = Store(paths: paths)
+            try store.saveSession(Session(startedAt: now, endsAt: now.addingTimeInterval(3600)))
+            var journal = RuntimeState()
+            journal.sleepDisabledByUs = true
+            try store.saveState(journal)
+        }
+    }
+
+    /// A run on the files `write` puts in the run's folder (session.json,
+    /// state.json, config.json as a test copied them); `config` is only
+    /// what messages show.
+    @MainActor init(in h: Harness, name: String, config: Data, battery: Int, level: Int,
+                    prepare: (PatchedBackstop) throws -> Void, write: (Paths) throws -> Void) throws {
         let root = h.home.root.appendingPathComponent("runs/\(name)", isDirectory: true)
         paths = Paths(root: root)
         try paths.createDirectories()
         self.config = config
         self.battery = battery
-        try config.write(to: paths.configFile)
-        let store = Store(paths: paths)
-        let now = h.clock.now
-        try store.saveSession(Session(startedAt: now, endsAt: now.addingTimeInterval(3600)))
-        var journal = RuntimeState()
-        journal.sleepDisabledByUs = true
-        try store.saveState(journal)
+        try write(paths)
         agent = try PatchedBackstop(home: root, dir: root.appendingPathComponent("agent", isDirectory: true))
-        try agent.setThermal(0)
+        try agent.setThermal(level)
         try agent.setBattery(battery)
+        try prepare(agent)
         alive = AppAliveLock(url: paths.appAliveFile)
         guard try alive.tryAcquire() else { throw CocoaError(.fileLocking) }
+    }
+
+    /// What `agentEnds(level:)` checks after a run: exit 0, and sleep
+    /// restored and the journal cleared exactly when session.json is gone.
+    /// Returns the run's log.
+    @discardableResult
+    func check(_ result: (status: Int32, ended: Bool), _ label: String,
+               file: StaticString = #filePath, line: UInt = #line) throws -> String {
+        let log = self.log
+        XCTAssertEqual(result.status, 0, "\(label): \(log)", file: file, line: line)
+        XCTAssertEqual(agent.calls.contains(agent.restoreCall), result.ended, "\(label): \(agent.calls.joined(separator: "\n"))", file: file, line: line)
+        XCTAssertEqual(try Store(paths: paths).loadState()?.sleepDisabledByUs, !result.ended, "\(label): \(log)", file: file, line: line)
+        return log
     }
 
     var log: String { (try? String(contentsOf: paths.logFile, encoding: .utf8)) ?? "" }
@@ -1249,21 +1294,7 @@ struct SeparateRun {
     /// each alive lock. Returns, in order, each exit status and whether the
     /// run removed session.json.
     static func runAll(_ runs: [SeparateRun], width: Int = 8) async throws -> [(status: Int32, ended: Bool)] {
-        var statuses = [Int32](repeating: -1, count: runs.count)
-        try await withThrowingTaskGroup(of: (Int, Int32).self) { group in
-            var next = 0
-            func add() {
-                guard next < runs.count else { return }
-                let (i, agent) = (next, runs[next].agent)
-                group.addTask { (i, try await agent.run()) }
-                next += 1
-            }
-            for _ in 0..<width { add() }
-            while let (i, status) = try await group.next() {
-                statuses[i] = status
-                add()
-            }
-        }
+        let statuses = try await PatchedBackstop.runAll(runs.map(\.agent), width: width)
         return try zip(runs, statuses).map { run, status in
             run.alive.release()
             return (status, try Store(paths: run.paths).loadSession() == nil)
