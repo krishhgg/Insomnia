@@ -9,14 +9,17 @@ import Foundation
 /// after a crash but leaves the marker, so a dialog still open could turn
 /// sleep off again with nothing journaled. Version 3 is the first that
 /// settles a start the journal still records (`sleepOffAttempt`) from its
-/// receipt once the marker is gone. An older one leaves that entry, so the
-/// session of a start that never finished would stay on disk and no later
-/// Start could run until the app settled it. With either in place no dialog
-/// is shown at all. The script read is the copy sealed in the bundle the
+/// receipt. Version 4 is the first that reads the receipt under its lock,
+/// as the 82-byte line with the predecessor nonce, and the start's
+/// `expires`, and gives the start's claim back (SleepOffReceipts). An older
+/// one would misread that receipt, or leave the entry, so the session of a
+/// start that never finished would stay on disk and no later Start could
+/// run until the app settled it. With any of them in place no dialog is
+/// shown at all. The script read is the copy sealed in the bundle the
 /// agent runs (LaunchdBackstop.scriptPath), so this refuses a bundle whose
 /// copy is missing, unreadable or older than this build expects.
 enum BackstopVersion {
-    static let required = 3
+    static let required = 4
     static let linePrefix = "# insomnia-backstop-version: "
 
     /// The number on the script's first version line; nil when there is

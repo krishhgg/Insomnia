@@ -43,16 +43,17 @@ final class BackstopVersionTests: XCTestCase {
     }
 
     func testAcceptsTheRequiredVersionAndNewer() throws {
-        XCTAssertNoThrow(try BackstopVersion.check(scriptAt: script("#!/bin/bash\n# insomnia-backstop-version: 3\n")))
+        XCTAssertNoThrow(try BackstopVersion.check(scriptAt: script("#!/bin/bash\n# insomnia-backstop-version: 4\n")))
         XCTAssertNoThrow(try BackstopVersion.check(scriptAt: script("#!/bin/bash\n# insomnia-backstop-version: 7\n")))
     }
 
     /// An older script (version 2 deletes the marker but does not settle
-    /// a journaled start from its receipt), one with no version line (every
-    /// backstop.sh before the marker) and a missing one all say to run
-    /// install.sh again.
+    /// a journaled start from its receipt; version 3 reads the 45-byte
+    /// receipt without its lock or the start's claim), one with no version
+    /// line (every backstop.sh before the marker) and a missing one all say
+    /// to run install.sh again.
     func testRefusesOlderMissingAndUnreadableScripts() throws {
-        for text in ["#!/bin/bash\n# insomnia-backstop-version: 1\n", "#!/bin/bash\n# insomnia-backstop-version: 2\n", "#!/bin/bash\nPMSET=/usr/bin/pmset\n"] {
+        for text in ["#!/bin/bash\n# insomnia-backstop-version: 1\n", "#!/bin/bash\n# insomnia-backstop-version: 2\n", "#!/bin/bash\n# insomnia-backstop-version: 3\n", "#!/bin/bash\nPMSET=/usr/bin/pmset\n"] {
             let url = try script(text)
             XCTAssertThrowsError(try BackstopVersion.check(scriptAt: url)) { error in
                 let message = error.localizedDescription

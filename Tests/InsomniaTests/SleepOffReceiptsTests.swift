@@ -2,10 +2,10 @@ import Darwin
 import XCTest
 @testable import Insomnia
 
-/// SleepOffReceipts on its own: what a receipt shows about one start, and
-/// every receipt or folder it refuses to trust. Each test has its own
-/// receipt folder in a temporary home (TestReceipts), trusted for the test
-/// user besides root.
+/// SleepOffReceipts on its own: what a receipt shows about one start under
+/// its lock, the claim kept in the release file, and every receipt or
+/// folder it refuses to trust. Each test has its own receipt folder in a
+/// temporary home (TestReceipts), trusted for the test user besides root.
 final class SleepOffReceiptsTests: XCTestCase {
     private var home: TempHome!
     private var receipts: SleepOffReceipts!
@@ -19,13 +19,21 @@ final class SleepOffReceiptsTests: XCTestCase {
         _ = try? runChmod(["-N", receipts.file])
         _ = try? runChmod(["-N", receipts.folder])
         chmod(receipts.folder, 0o755)
+        chmod(receipts.file, 0o644)
         home.destroy()
     }
 
+    /// This start's nonce, the one it claimed the receipt from, and two
+    /// others.
     private let nonce = "6F9619FF-8B86-D011-B42D-00C04FC964FF"
+    private let predecessor = "6F9619FF-8B86-D011-B42D-00C04FC96400"
+    private let later = "6F9619FF-8B86-D011-B42D-00C04FC96401"
+    private let other = "6F9619FF-8B86-D011-B42D-00C04FC96402"
+    /// When this start's answer window ends.
+    private let expires = 1_800_000_100
 
-    private func attempt(_ identity: String) -> SleepOffAttempt {
-        SleepOffAttempt(nonce: nonce, owedBefore: false, receipt: identity, deadline: 1_800_000_000, marker: "1:2")
+    private func attempt(_ identity: String, marker: String? = "1:2") -> SleepOffAttempt {
+        SleepOffAttempt(nonce: nonce, owedBefore: false, receipt: identity, predecessor: predecessor, deadline: 1_800_000_000, expires: expires, marker: marker)
     }
 
     private func runChmod(_ args: [String]) throws -> Int32 {
@@ -45,49 +53,151 @@ final class SleepOffReceiptsTests: XCTestCase {
         return nil
     }
 
-    /// Install.sh's nonce, another start's, and this start's `refused` all
-    /// show that this start's command never turned sleep off; only this
-    /// start's `writing` shows that it may have.
-    func testTheVerdictFollowsTheNonceAndTheWord() throws {
+    private func undecided(_ verdict: SleepOffVerdict) -> String? {
+        if case let .undecided(reason) = verdict { return reason }
+        return nil
+    }
+
+    /// The verdict for `attempt`, read under the receipt's lock at `now`.
+    private func verdict(_ attempt: SleepOffAttempt, now: Int, dialogOver: Bool = false) async -> SleepOffVerdict {
+        let outcome: Result<SleepOffReceipts.Guard, Error>
+        do { outcome = .success(try await receipts.lock(timeout: 0.2)) } catch { outcome = .failure(error) }
+        defer { if case let .success(held) = outcome { held.release() } }
+        return receipts.verdict(for: attempt, lock: outcome, now: now, dialogOver: dialogOver)
+    }
+
+    /// Round 24 F1. Under the lock, at any time: this start's `refused`,
+    /// or another start's line that names the same predecessor (that start
+    /// claimed the receipt from the same line and wrote first, so this
+    /// start's command, which writes only while the receipt holds the
+    /// predecessor, never can) shows that this start's command never
+    /// turned sleep off. This start's `writing`, and a line naming another
+    /// predecessor (a later start's, which shows nothing about this one),
+    /// show that it may have. The predecessor itself shows nothing until
+    /// the start has expired or its dialog is over, and then that it never
+    /// did.
+    func testTheVerdictFollowsTheLineThePredecessorAndTheTime() async throws {
         let identity = try receipts.identity()
-        XCTAssertEqual(receipts.verdict(for: attempt(identity)), .neverWrote, "install.sh's content")
-        TestReceipts.write(receipts.file, nonce: "00000000-1111-2222-3333-444444444444", word: "writing")
-        XCTAssertEqual(receipts.verdict(for: attempt(identity)), .neverWrote, "another start's record")
-        TestReceipts.write(receipts.file, nonce: nonce, word: "refused")
-        XCTAssertEqual(receipts.verdict(for: attempt(identity)), .neverWrote, "this start's command stopped at its last deadline check")
-        TestReceipts.write(receipts.file, nonce: nonce, word: "writing")
-        let reason = try XCTUnwrap(mayHaveWritten(receipts.verdict(for: attempt(identity))))
-        XCTAssertEqual(reason, "\(receipts.file) shows that the command went on to turn sleep off")
+        let a = attempt(identity)
+        for now in [expires - 1, expires, expires + 3600] {
+            let over = now >= expires
+            let at = "\(now - expires) s from expires"
+            TestReceipts.write(receipts.file, nonce: predecessor, predecessor: other, word: "refused")
+            if over {
+                let v = await verdict(a, now: now)
+                XCTAssertEqual(v, .neverWrote, "\(at): the predecessor, once no command can still write")
+            } else {
+                let early = await verdict(a, now: now)
+                let why = try XCTUnwrap(undecided(early), at)
+                XCTAssertTrue(why.hasPrefix("the password dialog of that start can still be answered until 2027-01-15T08:01:40Z"), "\(at): \(why)")
+                let v = await verdict(a, now: now, dialogOver: true)
+                XCTAssertEqual(v, .neverWrote, "\(at): the dialog ended on its own")
+            }
+            TestReceipts.write(receipts.file, nonce: predecessor, predecessor: other, word: "writing")
+            if over {
+                let v = await verdict(a, now: now)
+                XCTAssertEqual(v, .neverWrote, "\(at): the predecessor's own word is not this start's")
+            }
+            TestReceipts.write(receipts.file, nonce: nonce, predecessor: predecessor, word: "refused")
+            var v = await verdict(a, now: now)
+            XCTAssertEqual(v, .neverWrote, "\(at): this start's command stopped before pmset")
+            TestReceipts.write(receipts.file, nonce: nonce, predecessor: predecessor, word: "writing")
+            v = await verdict(a, now: now)
+            let wrote = try XCTUnwrap(mayHaveWritten(v), at)
+            XCTAssertEqual(wrote, "\(receipts.file) shows that the command went on to turn sleep off")
+            for word in ["writing", "refused"] {
+                TestReceipts.write(receipts.file, nonce: later, predecessor: predecessor, word: word)
+                v = await verdict(a, now: now)
+                XCTAssertEqual(v, .neverWrote, "\(at): another start claimed the same line and wrote first (\(word))")
+                TestReceipts.write(receipts.file, nonce: later, predecessor: other, word: word)
+                v = await verdict(a, now: now)
+                let reason = try XCTUnwrap(mayHaveWritten(v), "\(at), \(word)")
+                XCTAssertEqual(reason, "\(receipts.file) holds a later start's line, which no longer shows what the command for this start did")
+            }
+        }
         XCTAssertEqual(try receipts.identity(), identity, "written in place, the receipt stays the same file")
     }
 
+    /// A start that never showed its dialog never ran anything as root,
+    /// whatever the receipt holds, and its verdict needs no lock.
+    func testAStartWithNoDialogNeverWrote() async throws {
+        TestReceipts.write(receipts.file, nonce: nonce, predecessor: predecessor, word: "writing")
+        let a = attempt(try receipts.identity(), marker: nil)
+        XCTAssertEqual(receipts.verdict(for: a, lock: .failure(SleepOffReceipts.Busy(file: receipts.file, seconds: 1)), now: expires - 1), .neverWrote)
+        let v = await verdict(a, now: expires - 1)
+        XCTAssertEqual(v, .neverWrote)
+    }
+
+    /// Round 24 F2. A receipt that stays locked (a root command for some
+    /// start holds it until its pmset exits, or another Insomnia folder of
+    /// this user, or anything running as the user), a lock that fails, or
+    /// a wait that was cancelled decide nothing, at any time: the start
+    /// stays recorded and is read again later.
+    func testALockedReceiptDecidesNothing() async throws {
+        TestReceipts.write(receipts.file, nonce: nonce, predecessor: predecessor, word: "refused")
+        let a = attempt(try receipts.identity())
+        let held = try await receipts.lock(timeout: 0.2)
+        defer { held.release() }
+        let started = Date()
+        do {
+            _ = try await receipts.lock(timeout: 0.3)
+            XCTFail("a second lock was granted")
+        } catch let busy as SleepOffReceipts.Busy {
+            XCTAssertGreaterThanOrEqual(Date().timeIntervalSince(started), 0.3)
+            XCTAssertEqual(busy.localizedDescription, "\(receipts.file) stayed locked for 0 s: the command behind a password dialog may be running, or another Insomnia folder of this user, or something else running as this user, is holding it")
+        }
+        for now in [expires - 1, expires + 3600] {
+            for dialogOver in [false, true] {
+                for error: Error in [SleepOffReceipts.Busy(file: receipts.file, seconds: 10), SleepOffReceipts.LockFailed(file: receipts.file, errno: EIO), CancellationError()] {
+                    let why = undecided(receipts.verdict(for: a, lock: .failure(error), now: now, dialogOver: dialogOver))
+                    XCTAssertEqual(why, error.localizedDescription, "\(error), \(now - expires) s from expires, dialogOver \(dialogOver)")
+                }
+            }
+        }
+        held.release()
+        let v = await verdict(a, now: expires - 1)
+        XCTAssertEqual(v, .neverWrote, "once let go, the same receipt decides")
+    }
+
     /// The same bytes in another file (renamed over the receipt) show
-    /// nothing about a start that began with the first one.
-    func testAReceiptThatIsAnotherFileNowShowsNothing() throws {
+    /// nothing about a start that began with the first one: undecided
+    /// while a command for it could still write, and undone like an end
+    /// after that.
+    func testAReceiptThatIsAnotherFileNowShowsNothing() async throws {
         let identity = try receipts.identity()
         let copy = receipts.folder + "/copy"
-        try Data(SleepOffReceipts.initialContent.utf8).write(to: URL(fileURLWithPath: copy))
+        try Data(line(nonce, "refused").utf8).write(to: URL(fileURLWithPath: copy))
         XCTAssertEqual(chmod(copy, 0o644), 0)
         XCTAssertEqual(rename(copy, receipts.file), 0)
 
         XCTAssertNotEqual(try receipts.identity(), identity)
-        let reason = try XCTUnwrap(mayHaveWritten(receipts.verdict(for: attempt(identity))))
+        let early = await verdict(attempt(identity), now: expires - 1)
+        let why = try XCTUnwrap(undecided(early))
+        XCTAssertTrue(why.hasPrefix("\(receipts.file) is not the file it was when the start began; a command for that start could still write until "), why)
+        let late = await verdict(attempt(identity), now: expires)
+        let reason = try XCTUnwrap(mayHaveWritten(late))
         XCTAssertEqual(reason, "\(receipts.file) is not the file it was when the start began")
+    }
+
+    private func line(_ nonce: String, _ word: String, after: String? = nil) -> String {
+        "\(nonce) \(after ?? predecessor) \(word)\n"
     }
 
     /// Each way a receipt or a folder above it can be something the checks
     /// do not trust. A receipt that would otherwise show "never" shows
-    /// nothing, and a start could not begin with it (identity throws), apart
-    /// from content that is wrong in a 45-byte file, which only the read
-    /// finds.
-    func testAReceiptOrFolderTheChecksDoNotTrustShowsNothing() throws {
+    /// nothing (undecided before expires, may have written after), and a
+    /// start could not begin with it (identity throws), apart from content
+    /// that is wrong in an 82-byte file, which only the read under the lock
+    /// finds, and a receipt nobody can read, which only the open finds.
+    func testAReceiptOrFolderTheChecksDoNotTrustShowsNothing() async throws {
         let user = String(cString: getpwuid(getuid()).pointee.pw_name)
         let file = receipts.file
         let folder = receipts.folder
         let cases: [(name: String, startable: Bool, says: String, damage: () throws -> Void, repair: () throws -> Void)] = [
             ("missing", false, "No such file or directory", { XCTAssertEqual(unlink(file), 0) }, {}),
-            ("44 bytes", false, "is 44 bytes, not 45", { XCTAssertEqual(truncate(file, 44), 0) }, {}),
-            ("46 bytes", false, "is 46 bytes, not 45", { XCTAssertEqual(truncate(file, 46), 0) }, {}),
+            ("81 bytes", false, "is 81 bytes, not 82", { XCTAssertEqual(truncate(file, 81), 0) }, {}),
+            ("83 bytes", false, "is 83 bytes, not 82", { XCTAssertEqual(truncate(file, 83), 0) }, {}),
+            ("an earlier build's 45 bytes", false, "is 45 bytes, not 82", { try Data("\(self.nonce) refused\n".utf8).write(to: URL(fileURLWithPath: file)) }, {}),
             ("group-writable", false, "can be changed by its group or by others", { XCTAssertEqual(chmod(file, 0o664), 0) }, {}),
             ("writable by others", false, "can be changed by its group or by others", { XCTAssertEqual(chmod(file, 0o646), 0) }, {}),
             ("a hard link", false, "has 2 links", { XCTAssertEqual(link(file, folder + "/link"), 0) }, { unlink(folder + "/link") }),
@@ -102,16 +212,18 @@ final class SleepOffReceiptsTests: XCTestCase {
             ("a group-writable folder", false, "can be changed by its group or by others", { XCTAssertEqual(chmod(folder, 0o775), 0) }, { chmod(folder, 0o755) }),
             ("an allow entry on the folder", false, "has an access control entry that allows changes", { XCTAssertEqual(try self.runChmod(["+a", "user:\(user) allow add_file", folder]), 0) },
              { _ = try self.runChmod(["-N", folder]) }),
-            ("unreadable", true, "Permission denied", { XCTAssertEqual(chmod(file, 0o000), 0) }, {}),
-            ("a lower-case nonce", true, "does not hold a nonce and writing or refused", { TestReceipts.write(file, nonce: self.nonce.lowercased(), word: "refused") }, {}),
-            ("another word", true, "does not hold a nonce and writing or refused", { TestReceipts.write(file, nonce: self.nonce, word: "written") }, {}),
-            ("no newline", true, "does not hold a nonce and writing or refused", { TestReceipts.write(file, nonce: self.nonce, word: "refused\u{20}"); XCTAssertEqual(truncate(file, 45), 0) }, {}),
+            ("unreadable", true, "Permission denied", { XCTAssertEqual(chmod(file, 0o000), 0) }, { chmod(file, 0o644) }),
+            ("a lower-case nonce", true, "does not hold two nonces and writing or refused", { TestReceipts.write(file, nonce: self.nonce.lowercased(), predecessor: self.predecessor, word: "refused") }, {}),
+            ("a lower-case predecessor", true, "does not hold two nonces and writing or refused", { TestReceipts.write(file, nonce: self.nonce, predecessor: self.predecessor.lowercased(), word: "refused") }, {}),
+            ("another word", true, "does not hold two nonces and writing or refused", { TestReceipts.write(file, nonce: self.nonce, predecessor: self.predecessor, word: "written") }, {}),
+            ("no newline", true, "does not hold two nonces and writing or refused", { TestReceipts.write(file, nonce: self.nonce, predecessor: self.predecessor, word: "refused\u{20}"); XCTAssertEqual(truncate(file, 82), 0) }, {}),
         ]
         for c in cases {
             receipts = try TestReceipts.make(in: home.root)
-            TestReceipts.write(file, nonce: "00000000-0000-0000-0000-000000000000", word: "refused")
+            TestReceipts.write(file, nonce: nonce, predecessor: predecessor, word: "refused")
             let identity = try receipts.identity()
-            XCTAssertEqual(receipts.verdict(for: attempt(identity)), .neverWrote, "\(c.name): the control")
+            let control = await verdict(attempt(identity), now: expires - 1)
+            XCTAssertEqual(control, .neverWrote, "\(c.name): the control")
             try c.damage()
 
             if c.startable {
@@ -121,7 +233,12 @@ final class SleepOffReceiptsTests: XCTestCase {
                     XCTAssertTrue(error.localizedDescription.contains(c.says), "\(c.name): \(error.localizedDescription)")
                 }
             }
-            let reason = try XCTUnwrap(mayHaveWritten(receipts.verdict(for: attempt(identity))), c.name)
+            let early = await verdict(attempt(identity), now: expires - 1)
+            let why = try XCTUnwrap(undecided(early), c.name)
+            XCTAssertTrue(why.contains(c.says), "\(c.name): \(why)")
+            XCTAssertTrue(why.contains("a command for that start could still write until"), "\(c.name): \(why)")
+            let late = await verdict(attempt(identity), now: expires)
+            let reason = try XCTUnwrap(mayHaveWritten(late), c.name)
             XCTAssertTrue(reason.contains(c.says), "\(c.name): \(reason)")
 
             try c.repair()
@@ -133,12 +250,13 @@ final class SleepOffReceiptsTests: XCTestCase {
     /// A receipt the user owns, in a folder the user owns, which is all a
     /// process running as the user could make, shows nothing under that
     /// trust and cannot begin a start, whatever it holds.
-    func testOnlyRootIsTrustedAndAReceiptTheUserOwnsIsNot() throws {
+    func testOnlyRootIsTrustedAndAReceiptTheUserOwnsIsNot() async throws {
         let live = SleepOffReceipts.live
         XCTAssertEqual(live.folder, "/private/var/db/com.kgarg.insomnia")
         XCTAssertEqual(live.owners, [0])
         XCTAssertEqual(live.user, getuid())
         XCTAssertEqual(live.file, "/private/var/db/com.kgarg.insomnia/\(getuid())")
+        XCTAssertEqual(live.releaseFile, "/private/var/db/com.kgarg.insomnia/\(getuid()).released")
 
         let identity = try receipts.identity()
         let shipped = SleepOffReceipts(folder: receipts.folder, owners: [0], user: getuid())
@@ -146,8 +264,11 @@ final class SleepOffReceiptsTests: XCTestCase {
             XCTAssertTrue(error.localizedDescription.contains("belongs to uid \(getuid()), not root"), error.localizedDescription)
         }
         for word in ["refused", "writing"] {
-            TestReceipts.write(receipts.file, nonce: nonce, word: word)
-            let reason = try XCTUnwrap(mayHaveWritten(shipped.verdict(for: attempt(identity))), word)
+            TestReceipts.write(receipts.file, nonce: nonce, predecessor: predecessor, word: word)
+            let outcome: Result<SleepOffReceipts.Guard, Error>
+            do { outcome = .success(try await shipped.lock(timeout: 0.2)) } catch { outcome = .failure(error) }
+            XCTAssertThrowsError(try outcome.get(), word)
+            let reason = try XCTUnwrap(mayHaveWritten(shipped.verdict(for: attempt(identity), lock: outcome, now: expires)), word)
             XCTAssertTrue(reason.contains("not root"), reason)
         }
     }
@@ -187,42 +308,145 @@ final class SleepOffReceiptsTests: XCTestCase {
         XCTAssertEqual(try receipts.identity() + "\n", printed)
         XCTAssertEqual(FileIdentity(atPath: receipts.file)?.text, try receipts.identity())
     }
+
+    // MARK: The claim
+
+    /// Round 24 F1. A start claims the receipt under its lock while the
+    /// release file shows the receipt's nonce free, and the receipt's
+    /// nonce becomes its predecessor. A claim another start holds, from
+    /// this Insomnia folder or another of this user's, refuses the claim,
+    /// so no root command can replace the line that start's settlement
+    /// reads; so does a release file that names another nonce, or is
+    /// missing or not in its shape.
+    func testAStartClaimsTheReceiptOnlyWhileItIsFree() async throws {
+        TestReceipts.write(receipts.file, nonce: predecessor, predecessor: other, word: "refused")
+        TestReceipts.setRelease(receipts, "\(predecessor) free\n")
+        let held = try await receipts.lock(timeout: 0.2)
+        defer { held.release() }
+        XCTAssertEqual(try receipts.claimable(under: held), predecessor)
+
+        TestReceipts.setRelease(receipts, "\(later) held\n")
+        XCTAssertThrowsError(try receipts.claimable(under: held)) { error in
+            XCTAssertTrue(error is SleepOffReceipts.Claimed, "\(error)")
+            XCTAssertEqual(error.localizedDescription, "another Insomnia start (\(later)) has claimed the receipt and is not settled yet. Its own Insomnia folder settles it: open Insomnia from that folder, or wait for its recovery agent, which tries every minute")
+        }
+        TestReceipts.setRelease(receipts, "\(other) free\n")
+        XCTAssertThrowsError(try receipts.claimable(under: held)) { error in
+            XCTAssertTrue(error.localizedDescription.hasSuffix("names a start other than the one \(receipts.file) holds. Run install.sh again"), error.localizedDescription)
+        }
+        for (what, text) in [("lower case", "\(predecessor.lowercased()) free\n"), ("another word", "\(predecessor) gone\n"), ("41 bytes", "\(predecessor) free"), ("43 bytes", "\(predecessor) free\n\n")] {
+            try Data(text.utf8).write(to: URL(fileURLWithPath: receipts.releaseFile))
+            XCTAssertThrowsError(try receipts.claimable(under: held), what) { error in
+                XCTAssertTrue(error.localizedDescription.hasSuffix("Run install.sh again"), "\(what): \(error.localizedDescription)")
+            }
+        }
+        XCTAssertEqual(unlink(receipts.releaseFile), 0)
+        XCTAssertThrowsError(try receipts.claimable(under: held)) { error in
+            XCTAssertTrue(error.localizedDescription.contains("No such file or directory. Run install.sh again"), error.localizedDescription)
+        }
+        XCTAssertEqual(symlink(receipts.file, receipts.releaseFile), 0)
+        XCTAssertThrowsError(try receipts.claimable(under: held), "never through a link")
+        XCTAssertThrowsError(try receipts.writeRelease(.free(predecessor)), "never through a link")
+        XCTAssertEqual(TestReceipts.text(receipts), "\(predecessor) \(other) refused\n", "the receipt behind the link is untouched")
+    }
+
+    /// Giving a claim back writes the receipt's nonce free, and only when
+    /// the release file shows that claim: a claim given back already, or
+    /// another start's, is left as it is.
+    func testAClaimIsGivenBackOnlyByItsOwnStart() async throws {
+        TestReceipts.write(receipts.file, nonce: nonce, predecessor: predecessor, word: "refused")
+        let held = try await receipts.lock(timeout: 0.2)
+        defer { held.release() }
+        TestReceipts.setRelease(receipts, "\(nonce) held\n")
+        XCTAssertTrue(try receipts.release(nonce, under: held))
+        XCTAssertEqual(TestReceipts.release(receipts), "\(nonce) free\n", "free, under the nonce the receipt holds now")
+        XCTAssertFalse(try receipts.release(nonce, under: held), "given back already")
+        TestReceipts.setRelease(receipts, "\(later) held\n")
+        XCTAssertFalse(try receipts.release(nonce, under: held))
+        XCTAssertEqual(TestReceipts.release(receipts), "\(later) held\n", "another start's claim stays")
+
+        // The command for the start never ran: the receipt still holds
+        // its predecessor, which is free again.
+        TestReceipts.write(receipts.file, nonce: predecessor, predecessor: other, word: "writing")
+        TestReceipts.setRelease(receipts, "\(nonce) held\n")
+        XCTAssertTrue(try receipts.release(nonce, under: held))
+        XCTAssertEqual(TestReceipts.release(receipts), "\(predecessor) free\n")
+        XCTAssertEqual(try receipts.claimable(under: held), predecessor)
+    }
+
+    /// The release file is written in place, never created or truncated
+    /// to another size, and read back.
+    func testTheReleaseFileIsWrittenInPlace() throws {
+        let before = FileIdentity(atPath: receipts.releaseFile)
+        try receipts.writeRelease(.held(nonce))
+        XCTAssertEqual(TestReceipts.release(receipts), "\(nonce) held\n")
+        XCTAssertEqual(try receipts.readRelease(), .held(nonce))
+        XCTAssertEqual(FileIdentity(atPath: receipts.releaseFile), before)
+        XCTAssertEqual(try FileManager.default.attributesOfItem(atPath: receipts.releaseFile)[.size] as? Int, SleepOffReceipts.releaseSize)
+        XCTAssertEqual(truncate(receipts.releaseFile, 41), 0)
+        XCTAssertThrowsError(try receipts.writeRelease(.free(nonce)))
+        XCTAssertEqual(unlink(receipts.releaseFile), 0)
+        XCTAssertThrowsError(try receipts.writeRelease(.free(nonce)))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: receipts.releaseFile), "never created")
+    }
 }
 
 /// A start the app journaled (sleepOffAttempt) and never finished, settled
 /// by the next transaction of a relaunched app, and the rules around it:
-/// round 21's two receipt controls and its two relaunch findings, as
-/// safety assertions.
+/// round 21's two receipt controls and its two relaunch findings, and
+/// round 24's shared receipt (F1), receipt lock (F2), answer window (F3)
+/// and settlements that cannot be written (F4), as safety assertions.
 @MainActor
 final class SleepOffSettlementTests: XCTestCase {
     private var h: Harness!
+    /// Harnesses for other Insomnia folders that share `h`'s receipt.
+    private var others: [Harness] = []
 
     override func setUp() async throws {
         h = Harness()
     }
 
     override func tearDown() async throws {
+        for harness in others + [h!] {
+            chmod(harness.home.root.path, 0o755)
+            harness.home.destroy()
+        }
+        others = []
+    }
+
+    /// A new harness in place of `h`, for the next case of a loop.
+    private func fresh() {
         chmod(h.home.root.path, 0o755)
         h.home.destroy()
+        h = Harness()
     }
 
     private let now = 1_800_000_000
 
-    /// What a start journals before its dialog, as performStart writes it:
-    /// sleepDisabledByUs with the attempt, its session.json (ending
-    /// `endsIn` seconds after the harness clock), and the marker, whose
-    /// identity is journaled when `marker` is set. The app then dies.
+    /// What a start journals before its dialog, as performStart writes it,
+    /// in `harness` (`h` unless given), and the app then dies:
+    /// sleepDisabledByUs with the attempt, whose predecessor is the nonce
+    /// the receipt holds; the claim (the release file shows the attempt's
+    /// nonce held); its session.json, ending `endsIn` seconds after the
+    /// harness clock; and with `marker`, the marker, whose identity is
+    /// journaled with `expires`: AdministratorPrompt.answerWindow after the
+    /// clock, or the session's end if sooner.
     @discardableResult
-    private func journalUnfinishedStart(owedBefore: Bool = false, endsIn: TimeInterval = 1800, marker: Bool = true) throws -> SleepOffAttempt {
+    private func journalUnfinishedStart(owedBefore: Bool = false, endsIn: TimeInterval = 1800, marker: Bool = true, in harness: Harness? = nil) throws -> SleepOffAttempt {
+        let h = harness ?? self.h!
         let session = SessionMath.newSession(now: h.clock.now.addingTimeInterval(endsIn - 3600), duration: 3600, maxDuration: 86400)
         let nonce = UUID().uuidString
-        var attempt = SleepOffAttempt(nonce: nonce, owedBefore: owedBefore, receipt: try h.receipts.identity(), deadline: Int(session.endsAt.timeIntervalSince1970.rounded(.down)), marker: nil)
+        let deadline = Int(session.endsAt.timeIntervalSince1970.rounded(.down))
+        let predecessor = try XCTUnwrap(TestReceipts.nonce(h.receipts.file))
+        var attempt = SleepOffAttempt(nonce: nonce, owedBefore: owedBefore, receipt: try h.receipts.identity(), predecessor: predecessor, deadline: deadline, expires: deadline, marker: nil)
         var journal = RuntimeState.clean
         journal.sleepDisabledByUs = true
         journal.sleepOffAttempt = attempt
         try h.store.saveState(journal)
+        TestReceipts.setRelease(h.receipts, "\(nonce) held\n")
         try h.store.saveSession(session)
         if marker {
+            attempt.expires = min(deadline, Int(h.clock.now.addingTimeInterval(AdministratorPrompt.answerWindow).timeIntervalSince1970.rounded(.down)))
             attempt.marker = try h.store.savePendingStart(nonce).text
             journal.sleepOffAttempt = attempt
             try h.store.saveState(journal)
@@ -230,7 +454,15 @@ final class SleepOffSettlementTests: XCTestCase {
         return attempt
     }
 
+    /// Moves `harness`'s clock (`h`'s unless given) past the answer window
+    /// of a start journaled at its current time.
+    private func pastExpiry(_ harness: Harness? = nil) {
+        (harness ?? h).clock.advance(AdministratorPrompt.answerWindow + 1)
+    }
+
     private var markerExists: Bool { FileManager.default.fileExists(atPath: h.home.paths.pendingStartFile.path) }
+
+    private var restores: Int { h.guardFake.calls.filter { $0 == "disablesleep 0" }.count }
 
     /// Settled and nothing resumed: no session in memory or on disk, no
     /// marker, a clean journal.
@@ -241,24 +473,58 @@ final class SleepOffSettlementTests: XCTestCase {
         XCTAssertEqual(try h.store.loadState(), RuntimeState.clean, file: file, line: line)
     }
 
-    // MARK: Round 21's relaunch findings
+    /// Not settled: the start stays recorded with the sleep entry and its
+    /// claim, its session is ended rather than resumed, and a start is
+    /// refused before its dialog with a reason that contains each of
+    /// `saying`.
+    private func assertStillRecorded(_ m: SessionManager, _ attempt: SleepOffAttempt, saying: [String], file: StaticString = #filePath, line: UInt = #line) async throws {
+        XCTAssertFalse(m.isActive, file: file, line: line)
+        XCTAssertNil(try h.store.loadSession(), "ended rather than resumed", file: file, line: line)
+        let journal = try XCTUnwrap(h.store.loadState(), file: file, line: line)
+        XCTAssertEqual(journal.sleepOffAttempt, attempt, file: file, line: line)
+        XCTAssertTrue(journal.sleepDisabledByUs, file: file, line: line)
+        XCTAssertEqual(TestReceipts.release(h.receipts), "\(attempt.nonce) held\n", "the claim stays", file: file, line: line)
+        let shown = h.prompt.shown
+        await m.start(duration: 1800)
+        XCTAssertFalse(m.isActive, file: file, line: line)
+        XCTAssertEqual(h.prompt.shown, shown, "no dialog", file: file, line: line)
+        let error = m.lastError ?? ""
+        XCTAssertTrue(error.hasPrefix("start refused, nothing changed: an earlier start is still recorded in the journal and is not settled ("), error, file: file, line: line)
+        for part in saying {
+            XCTAssertTrue(error.contains(part), "\(error) does not say \(part)", file: file, line: line)
+        }
+    }
+
+    // MARK: Round 21's relaunch findings, and the answer window
 
     /// Round 21 P1: the app died under the dialog of a start whose session
     /// is still valid, and another tool set SleepDisabled 1 meanwhile.
     /// Before, the relaunch read that 1 as the session's and resumed it,
-    /// and its end cleared the other tool's setting. Now the receipt shows
-    /// the command never turned sleep off: the session is removed, not
-    /// resumed, and the 1 is left alone.
+    /// and its end cleared the other tool's setting. Round 24 F3: while
+    /// the dialog can still be answered, a receipt that still holds the
+    /// predecessor shows nothing yet, so the session is ended rather than
+    /// resumed, nothing is undone, the start stays recorded and starts are
+    /// refused. Once the answer window is over, the same receipt shows
+    /// the command never turned sleep off: the record and the claim go, and
+    /// the 1 is left alone throughout.
     func testARelaunchDoesNotResumeAnUnexpiredStartOnAnotherToolsSetting() async throws {
-        try journalUnfinishedStart()
+        let attempt = try journalUnfinishedStart()
         h.guardFake.sleepDisabled = true
         let m = h.makeManager()
 
         await m.reconcile()
 
+        try await assertStillRecorded(m, attempt, saying: ["the password dialog of that start can still be answered until "])
+        XCTAssertTrue(h.guardFake.sleepDisabled)
+        XCTAssertEqual(restores, 0, "\(h.guardFake.calls)")
+
+        pastExpiry()
+        await m.reconcile()
+
         try assertSettledAndNotResumed(m)
+        XCTAssertEqual(TestReceipts.release(h.receipts), "\(SleepOffReceipts.zero) free\n", "the claim is given back")
         XCTAssertTrue(h.guardFake.sleepDisabled, "the other tool's setting is left alone")
-        XCTAssertFalse(h.guardFake.calls.contains("disablesleep 0"), "\(h.guardFake.calls)")
+        XCTAssertEqual(restores, 0, "\(h.guardFake.calls)")
     }
 
     /// Round 21 P1, the expired case: before, the relaunch restored from
@@ -272,64 +538,182 @@ final class SleepOffSettlementTests: XCTestCase {
         await m.reconcile()
 
         try assertSettledAndNotResumed(m)
+        XCTAssertEqual(TestReceipts.release(h.receipts), "\(SleepOffReceipts.zero) free\n")
         XCTAssertTrue(h.guardFake.sleepDisabled)
-        XCTAssertFalse(h.guardFake.calls.contains("disablesleep 0"), "\(h.guardFake.calls)")
+        XCTAssertEqual(restores, 0, "\(h.guardFake.calls)")
     }
 
     /// A start that never turned sleep off does not erase a restore an
-    /// earlier session still owes: the entry goes back to true and is
-    /// restored.
+    /// earlier session still owes, and that restore runs even while the
+    /// start's dialog can still be answered: nothing holds back a restore
+    /// that was owed before it. The start stays recorded with the entry
+    /// until its window is over; then the entry goes back to true and is
+    /// restored again.
     func testARelaunchKeepsTheRestoreAnEarlierSessionOwes() async throws {
-        try journalUnfinishedStart(owedBefore: true)
+        let attempt = try journalUnfinishedStart(owedBefore: true)
         h.guardFake.sleepDisabled = true
         let m = h.makeManager()
 
         await m.reconcile()
 
-        try assertSettledAndNotResumed(m)
-        XCTAssertEqual(h.guardFake.calls.filter { $0 == "disablesleep 0" }.count, 1, "\(h.guardFake.calls)")
+        XCTAssertEqual(restores, 1, "\(h.guardFake.calls)")
         XCTAssertFalse(h.guardFake.sleepDisabled)
+        try await assertStillRecorded(m, attempt, saying: ["the password dialog of that start can still be answered until "])
+
+        pastExpiry()
+        await m.reconcile()
+
+        try assertSettledAndNotResumed(m)
+        XCTAssertEqual(restores, 2, "\(h.guardFake.calls)")
     }
 
     /// The receipt shows this start's `writing`: its command may have
-    /// turned sleep off. The session is still not resumed; the start is
-    /// undone like an end.
+    /// turned sleep off, whenever this is read. The session is still not
+    /// resumed; the start is undone like an end, and the claim goes back
+    /// under the start's own nonce, which the receipt now holds.
     func testARelaunchUndoesAStartWhoseReceiptShowsItsCommandWrote() async throws {
         let attempt = try journalUnfinishedStart()
-        TestReceipts.write(h.receipts.file, nonce: attempt.nonce, word: "writing")
+        TestReceipts.write(h.receipts.file, nonce: attempt.nonce, predecessor: attempt.predecessor, word: "writing")
         h.guardFake.sleepDisabled = true
         let m = h.makeManager()
 
         await m.reconcile()
 
         try assertSettledAndNotResumed(m)
-        XCTAssertTrue(h.guardFake.calls.contains("disablesleep 0"), "\(h.guardFake.calls)")
+        XCTAssertEqual(restores, 1, "\(h.guardFake.calls)")
+        XCTAssertFalse(h.guardFake.sleepDisabled)
+        XCTAssertEqual(TestReceipts.release(h.receipts), "\(attempt.nonce) free\n")
+    }
+
+    /// Round 24 F1: a line another start wrote shows nothing about this
+    /// one unless it names this start's predecessor. Another nonce after
+    /// another predecessor (a later start's, or a line written some other
+    /// way) is undone like an end at once, `refused` or `writing`; it is
+    /// never read as "this start never wrote".
+    func testARelaunchUndoesAStartWhoseReceiptHoldsALaterStartsLine() async throws {
+        for word in ["refused", "writing"] {
+            fresh()
+            try journalUnfinishedStart()
+            TestReceipts.write(h.receipts.file, nonce: UUID().uuidString, predecessor: UUID().uuidString, word: word)
+            h.guardFake.sleepDisabled = true
+            let m = h.makeManager()
+
+            await m.reconcile()
+
+            try assertSettledAndNotResumed(m)
+            XCTAssertEqual(restores, 1, "\(word): \(h.guardFake.calls)")
+            XCTAssertFalse(h.guardFake.sleepDisabled, word)
+        }
+    }
+
+    /// A receipt that is another file now shows nothing about this start:
+    /// while a command for it could still write, the start stays recorded
+    /// and nothing is undone; after that it is undone like an end.
+    func testARelaunchUndoesAStartWhoseReceiptIsAnotherFileOnceItsWindowIsOver() async throws {
+        let attempt = try journalUnfinishedStart()
+        let copy = h.receipts.folder + "/copy"
+        try Data(SleepOffReceipts.initialContent.utf8).write(to: URL(fileURLWithPath: copy))
+        XCTAssertEqual(chmod(copy, 0o644), 0)
+        XCTAssertEqual(rename(copy, h.receipts.file), 0)
+        h.guardFake.sleepDisabled = true
+        let m = h.makeManager()
+
+        await m.reconcile()
+
+        try await assertStillRecorded(m, attempt, saying: ["is not the file it was when the start began; a command for that start could still write until "])
+        XCTAssertEqual(restores, 0, "\(h.guardFake.calls)")
+        XCTAssertTrue(h.guardFake.sleepDisabled)
+
+        pastExpiry()
+        await m.reconcile()
+
+        try assertSettledAndNotResumed(m)
+        XCTAssertEqual(restores, 1, "\(h.guardFake.calls)")
         XCTAssertFalse(h.guardFake.sleepDisabled)
     }
 
-    /// Evidence that does not match the start shows nothing, and each is
-    /// undone like an end: a receipt that is another file now, a marker
-    /// replaced by another file with the same nonce, and a marker that was
-    /// already gone (deleted without its lock).
-    func testARelaunchUndoesAStartWhoseEvidenceDoesNotMatch() async throws {
+    /// Round 24 F2: a missing receipt keeps the start recorded. Nothing is
+    /// undone while a command for it could still write. After that sleep
+    /// is restored, but the claim cannot be given back without the
+    /// receipt's lock, so the record stays and starts are refused at every
+    /// run, each trying again, until install.sh makes the receipt again.
+    func testAMissingReceiptKeepsTheStartRecorded() async throws {
+        let attempt = try journalUnfinishedStart()
+        XCTAssertEqual(unlink(h.receipts.file), 0)
+        h.guardFake.sleepDisabled = true
+        let m = h.makeManager()
+
+        await m.reconcile()
+
+        try await assertStillRecorded(m, attempt, saying: ["No such file or directory", "a command for that start could still write until "])
+        XCTAssertEqual(restores, 0, "\(h.guardFake.calls)")
+        XCTAssertTrue(h.guardFake.sleepDisabled)
+
+        pastExpiry()
+        for run in 1...2 {
+            await m.reconcile()
+
+            XCTAssertGreaterThanOrEqual(restores, 1, "run \(run): \(h.guardFake.calls)")
+            XCTAssertFalse(h.guardFake.sleepDisabled, "run \(run)")
+            try await assertStillRecorded(m, attempt, saying: ["the receipt could not be locked to give that start's claim back (", "No such file or directory"])
+        }
+
+        // install.sh again: a new receipt, free.
+        _ = try TestReceipts.make(in: h.home.root)
+        await m.reconcile()
+
+        try assertSettledAndNotResumed(m)
+    }
+
+    /// Round 24 F2: a receipt whose lock stays held (by a root command
+    /// still in pmset, by another Insomnia folder of this user, or by
+    /// anything running as the user) decides nothing. Before the start's
+    /// window is over nothing is undone; after it sleep is restored. The
+    /// start stays recorded either way, refusing starts, until a run gets
+    /// the lock, and that run settles it.
+    func testALockedReceiptKeepsTheStartRecordedUntilItIsLetGo() async throws {
+        let attempt = try journalUnfinishedStart()
+        h.guardFake.sleepDisabled = true
+        let held = try await h.receipts.lock(timeout: 0.2)
+        defer { held.release() }
+        let m = h.makeManager()
+
+        await m.reconcile()
+
+        try await assertStillRecorded(m, attempt, saying: ["\(h.receipts.file) stayed locked for 0 s"])
+        XCTAssertEqual(restores, 0, "\(h.guardFake.calls)")
+        XCTAssertTrue(h.guardFake.sleepDisabled)
+
+        pastExpiry()
+        await m.reconcile()
+
+        try await assertStillRecorded(m, attempt, saying: ["\(h.receipts.file) stayed locked for 0 s"])
+        XCTAssertEqual(restores, 1, "a command for it could no longer begin, and one may have turned sleep off: \(h.guardFake.calls)")
+        XCTAssertFalse(h.guardFake.sleepDisabled)
+
+        held.release()
+        await m.reconcile()
+
+        try assertSettledAndNotResumed(m)
+        XCTAssertEqual(TestReceipts.release(h.receipts), "\(SleepOffReceipts.zero) free\n")
+    }
+
+    /// The marker decides nothing any more: replaced by another file with
+    /// the same nonce, or already gone (deleted without its lock), a start
+    /// whose receipt still holds its predecessor stays recorded while its
+    /// dialog can still be answered, and is settled as never having turned
+    /// sleep off after that, with no pmset.
+    func testTheMarkerDecidesNothing() async throws {
         let cases: [(String, (SleepOffAttempt) throws -> Void)] = [
-            ("receipt replaced", { _ in
-                let copy = self.h.receipts.folder + "/copy"
-                try Data(SleepOffReceipts.initialContent.utf8).write(to: URL(fileURLWithPath: copy))
-                XCTAssertEqual(chmod(copy, 0o644), 0)
-                XCTAssertEqual(rename(copy, self.h.receipts.file), 0)
-            }),
             ("marker replaced", { attempt in
                 let copy = self.h.home.root.appendingPathComponent("marker-copy")
                 try Data(attempt.nonce.utf8).write(to: copy)
                 XCTAssertEqual(rename(copy.path, self.h.home.paths.pendingStartFile.path), 0)
             }),
             ("marker gone", { _ in try FileManager.default.removeItem(at: self.h.home.paths.pendingStartFile) }),
-            ("receipt missing", { _ in XCTAssertEqual(unlink(self.h.receipts.file), 0) }),
         ]
         for (name, damage) in cases {
-            h.home.destroy()
-            h = Harness()
+            fresh()
             let attempt = try journalUnfinishedStart()
             try damage(attempt)
             h.guardFake.sleepDisabled = true
@@ -339,17 +723,24 @@ final class SleepOffSettlementTests: XCTestCase {
 
             XCTAssertFalse(m.isActive, name)
             XCTAssertNil(try h.store.loadSession(), name)
-            XCTAssertEqual(try h.store.loadState(), RuntimeState.clean, name)
-            XCTAssertTrue(h.guardFake.calls.contains("disablesleep 0"), "\(name): \(h.guardFake.calls)")
-            XCTAssertFalse(h.guardFake.sleepDisabled, name)
+            XCTAssertEqual(try h.store.loadState()?.sleepOffAttempt, attempt, name)
+            XCTAssertEqual(restores, 0, "\(name): \(h.guardFake.calls)")
+
+            pastExpiry()
+            await m.reconcile()
+
+            try assertSettledAndNotResumed(m)
+            XCTAssertTrue(h.guardFake.sleepDisabled, name)
+            XCTAssertEqual(restores, 0, "\(name): \(h.guardFake.calls)")
         }
     }
 
     /// No marker journaled: the start never showed its dialog, so nothing
-    /// ran as root for it, whatever the receipt holds.
+    /// ran as root for it, whatever the receipt holds, and it is settled at
+    /// once.
     func testARelaunchSettlesAStartThatShowedNoDialogAsNeverTurningSleepOff() async throws {
         let attempt = try journalUnfinishedStart(marker: false)
-        TestReceipts.write(h.receipts.file, nonce: attempt.nonce, word: "writing")
+        TestReceipts.write(h.receipts.file, nonce: attempt.nonce, predecessor: attempt.predecessor, word: "writing")
         h.guardFake.sleepDisabled = true
         let m = h.makeManager()
 
@@ -357,7 +748,7 @@ final class SleepOffSettlementTests: XCTestCase {
 
         try assertSettledAndNotResumed(m)
         XCTAssertTrue(h.guardFake.sleepDisabled)
-        XCTAssertFalse(h.guardFake.calls.contains("disablesleep 0"), "\(h.guardFake.calls)")
+        XCTAssertEqual(restores, 0, "\(h.guardFake.calls)")
     }
 
     /// A marker no journaled start accounts for, as a build from before
@@ -366,8 +757,7 @@ final class SleepOffSettlementTests: XCTestCase {
     /// entry is restored. The control, with no marker, resumes.
     func testARelaunchDoesNotResumeASessionBesideAMarkerNoJournaledStartAccountsFor() async throws {
         for marker in [true, false] {
-            h.home.destroy()
-            h = Harness()
+            fresh()
             let session = SessionMath.newSession(now: h.clock.now, duration: 1800, maxDuration: 86400)
             try h.store.saveSession(session)
             var journal = RuntimeState.clean
@@ -381,24 +771,25 @@ final class SleepOffSettlementTests: XCTestCase {
 
             if marker {
                 try assertSettledAndNotResumed(m)
-                XCTAssertTrue(h.guardFake.calls.contains("disablesleep 0"), "\(h.guardFake.calls)")
+                XCTAssertEqual(restores, 1, "\(h.guardFake.calls)")
             } else {
                 XCTAssertTrue(m.isActive, "control: \(m.lastError ?? "")")
-                XCTAssertFalse(h.guardFake.calls.contains("disablesleep 0"), "control: \(h.guardFake.calls)")
+                XCTAssertEqual(restores, 0, "control: \(h.guardFake.calls)")
                 await m.end(reason: .user)
             }
         }
     }
 
-    /// The settlement cannot be written. With the app's folder read-only,
-    /// neither session.json nor the journal can change: the record stays,
-    /// the session is ended rather than resumed and sleep is restored, and
-    /// a new start is refused before its dialog (first because that end is
-    /// still pending). With only state.json immutable, session.json goes
-    /// but the journal keeps the record, and a new start is refused because
-    /// of it. Either way the next transaction that can write settles it.
-    func testASettlementThatCannotBeWrittenEndsTheSessionAndRefusesStartsUntilItIs() async throws {
-        try journalUnfinishedStart()
+    // MARK: Settlements that cannot be written (round 24 F4)
+
+    /// The receipt shows this start's `writing`, so it is undone like an
+    /// end, but with the app's folder read-only nothing can be removed:
+    /// the record and the claim stay, the session is ended rather than
+    /// resumed and sleep is restored, a new start is refused before its
+    /// dialog, and the next run that can write settles it.
+    func testAStartThatMayHaveWrittenIsUndoneWhileItsSettlementCannotBeWritten() async throws {
+        let attempt = try journalUnfinishedStart()
+        TestReceipts.write(h.receipts.file, nonce: attempt.nonce, predecessor: attempt.predecessor, word: "writing")
         try FileManager.default.removeItem(at: h.home.paths.pendingStartFile)
         FileManager.default.createFile(atPath: h.home.paths.recoveryLock.path, contents: nil)
         try FileManager.default.createDirectory(at: h.home.paths.logs, withIntermediateDirectories: true)
@@ -409,59 +800,204 @@ final class SleepOffSettlementTests: XCTestCase {
         await m.reconcile()
 
         XCTAssertFalse(m.isActive)
-        XCTAssertTrue(h.guardFake.calls.contains("disablesleep 0"), "\(h.guardFake.calls)")
+        XCTAssertEqual(restores, 1, "\(h.guardFake.calls)")
         XCTAssertFalse(h.guardFake.sleepDisabled)
-        XCTAssertNotNil(try h.store.loadState()?.sleepOffAttempt, "the record stays")
+        XCTAssertEqual(try h.store.loadState()?.sleepOffAttempt, attempt, "the record stays")
+        XCTAssertEqual(TestReceipts.release(h.receipts), "\(attempt.nonce) held\n", "and so does the claim")
 
         await m.start(duration: 1800)
 
         XCTAssertFalse(m.isActive)
         XCTAssertEqual(h.prompt.shown, 0, "no dialog")
+        // With the folder read-only the end of that session is pending
+        // too, and that refusal comes first.
         XCTAssertTrue(m.lastError?.hasPrefix("start refused") == true, m.lastError ?? "")
 
         XCTAssertEqual(chmod(h.home.root.path, 0o755), 0)
         await m.reconcile()
 
         try assertSettledAndNotResumed(m)
+        XCTAssertEqual(TestReceipts.release(h.receipts), "\(attempt.nonce) free\n")
+    }
 
-        h.home.destroy()
-        h = Harness()
-        try journalUnfinishedStart()
-        try FileManager.default.removeItem(at: h.home.paths.pendingStartFile)
+    /// Round 24 F4: the receipt shows the start's command never turned
+    /// sleep off and no earlier restore is owed, so no pmset may run for
+    /// it: a SleepDisabled 1 now is someone else's. When the settlement
+    /// cannot be written the record stays, starts are refused, and still
+    /// no pmset runs, at every run, until one can write. With state.json
+    /// immutable, session.json goes but the journal keeps the record, and
+    /// the claim, given back first, is taken again; the error says the
+    /// session.json was removed only at the run that removed it. With the
+    /// folder read-only, neither the marker, session.json nor the journal
+    /// can change (and the end of that session is pending too, which
+    /// refuses a start first).
+    func testAStartThatNeverWroteRunsNoPmsetWhileItsSettlementCannotBeWritten() async throws {
+        let attempt = try journalUnfinishedStart()
         h.guardFake.sleepDisabled = true
-        let n = h.makeManager()
+        pastExpiry()
+        let m = h.makeManager()
         let file = h.home.paths.stateFile.path
-        // Rename over an immutable state.json is refused.
         try FileManager.default.setAttributes([.immutable: true], ofItemAtPath: file)
         defer { try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: file) }
 
-        await n.reconcile()
+        for run in 1...2 {
+            await m.reconcile()
 
-        XCTAssertFalse(n.isActive)
-        XCTAssertNil(try h.store.loadSession(), "the unfinished start's session.json goes")
-        XCTAssertTrue(h.guardFake.calls.contains("disablesleep 0"), "\(h.guardFake.calls)")
-        XCTAssertFalse(h.guardFake.sleepDisabled)
-        XCTAssertNotNil(try h.store.loadState()?.sleepOffAttempt, "the record stays")
+            XCTAssertFalse(m.isActive, "run \(run)")
+            XCTAssertNil(try h.store.loadSession(), "run \(run): the start's session.json goes")
+            XCTAssertEqual(try h.store.loadState()?.sleepOffAttempt, attempt, "run \(run): the record stays")
+            XCTAssertEqual(TestReceipts.release(h.receipts), "\(attempt.nonce) held\n", "run \(run): the claim is taken again")
+            XCTAssertTrue(h.guardFake.sleepDisabled, "run \(run)")
+            XCTAssertEqual(restores, 0, "run \(run): \(h.guardFake.calls)")
+            let error = m.lastError ?? ""
+            XCTAssertTrue(error.hasPrefix("could not settle an earlier start: the journal could not be updated ("), "run \(run): \(error)")
+            XCTAssertEqual(error.contains("; session.json of that start was removed. "), run == 1, "run \(run): \(error)")
 
-        await n.start(duration: 1800)
+            await m.start(duration: 1800)
 
-        XCTAssertFalse(n.isActive)
-        XCTAssertEqual(h.prompt.shown, 0, "no dialog")
-        XCTAssertTrue(n.lastError?.contains("an earlier start is still recorded in the journal") == true, n.lastError ?? "")
+            XCTAssertFalse(m.isActive, "run \(run)")
+            XCTAssertEqual(h.prompt.shown, 0, "run \(run): no dialog")
+            XCTAssertTrue(m.lastError?.hasPrefix("start refused, nothing changed: an earlier start is still recorded in the journal and is not settled (the journal could not be updated (") == true, "run \(run): \(m.lastError ?? "")")
+        }
 
         try FileManager.default.setAttributes([.immutable: false], ofItemAtPath: file)
+        await m.reconcile()
+
+        try assertSettledAndNotResumed(m)
+        XCTAssertTrue(h.guardFake.sleepDisabled)
+        XCTAssertEqual(restores, 0, "\(h.guardFake.calls)")
+        XCTAssertEqual(TestReceipts.release(h.receipts), "\(SleepOffReceipts.zero) free\n")
+
+        fresh()
+        let second = try journalUnfinishedStart()
+        FileManager.default.createFile(atPath: h.home.paths.recoveryLock.path, contents: nil)
+        try FileManager.default.createDirectory(at: h.home.paths.logs, withIntermediateDirectories: true)
+        h.guardFake.sleepDisabled = true
+        pastExpiry()
+        let n = h.makeManager()
+        XCTAssertEqual(chmod(h.home.root.path, 0o500), 0)
+
+        for run in 1...2 {
+            await n.reconcile()
+
+            XCTAssertFalse(n.isActive, "run \(run)")
+            XCTAssertTrue(markerExists, "run \(run): the marker could not be removed")
+            XCTAssertNotNil(try h.store.loadSession(), "run \(run): nor session.json")
+            XCTAssertEqual(try h.store.loadState()?.sleepOffAttempt, second, "run \(run): nor the journal")
+            XCTAssertEqual(TestReceipts.release(h.receipts), "\(second.nonce) held\n", "run \(run)")
+            XCTAssertTrue(h.guardFake.sleepDisabled, "run \(run)")
+            XCTAssertEqual(restores, 0, "run \(run): \(h.guardFake.calls)")
+
+            await n.start(duration: 1800)
+
+            XCTAssertFalse(n.isActive, "run \(run)")
+            XCTAssertEqual(h.prompt.shown, 0, "run \(run): no dialog")
+            XCTAssertTrue(n.lastError?.hasPrefix("start refused") == true, "run \(run): \(n.lastError ?? "")")
+        }
+
+        XCTAssertEqual(chmod(h.home.root.path, 0o755), 0)
         await n.reconcile()
 
         try assertSettledAndNotResumed(n)
+        XCTAssertTrue(h.guardFake.sleepDisabled)
+        XCTAssertEqual(restores, 0, "\(h.guardFake.calls)")
+    }
+
+    // MARK: Two Insomnia folders of one user (round 24 F1)
+
+    /// Two Insomnia folders of one user (INSOMNIA_HOME) share the user's
+    /// receipt. While a start from one of them is not settled, its claim
+    /// refuses a start from the other before anything is written or shown,
+    /// so no command for the second start can replace the line the first
+    /// one's settlement reads. Once the first folder settles its start, the
+    /// second starts.
+    func testAStartFromAnotherFolderWaitsForTheClaimToBeSettled() async throws {
+        let attempt = try journalUnfinishedStart()
+        let b = Harness(sharing: h.receipts)
+        others.append(b)
+        let mB = b.makeManager()
+
+        await mB.start(duration: 1800)
+
+        XCTAssertFalse(mB.isActive)
+        XCTAssertEqual(b.prompt.shown, 0)
+        XCTAssertTrue(b.guardFake.calls.isEmpty, "\(b.guardFake.calls)")
+        XCTAssertNil(try b.store.loadSession())
+        XCTAssertNil(try b.store.loadState()?.sleepOffAttempt)
+        XCTAssertEqual(mB.lastError, "start refused, nothing changed: the receipt \(h.receipts.file) cannot be claimed: another Insomnia start (\(attempt.nonce)) has claimed the receipt and is not settled yet. Its own Insomnia folder settles it: open Insomnia from that folder, or wait for its recovery agent, which tries every minute")
+        XCTAssertEqual(TestReceipts.text(h.receipts), SleepOffReceipts.initialContent)
+        XCTAssertEqual(TestReceipts.release(h.receipts), "\(attempt.nonce) held\n")
+
+        pastExpiry()
+        pastExpiry(b)
+        let m = h.makeManager()
+        await m.reconcile()
+        try assertSettledAndNotResumed(m)
+
+        await mB.start(duration: 1800)
+
+        XCTAssertTrue(mB.isActive, mB.lastError ?? "")
+        let second = try XCTUnwrap(b.prompt.starts.last)
+        XCTAssertEqual(second.predecessor, SleepOffReceipts.zero)
+        XCTAssertEqual(TestReceipts.text(h.receipts), "\(second.nonce) \(SleepOffReceipts.zero) writing\n")
+        XCTAssertEqual(TestReceipts.release(h.receipts), "\(second.nonce) free\n")
+        await mB.end(reason: .user)
+        XCTAssertEqual(try b.store.loadState(), RuntimeState.clean)
+    }
+
+    /// Round 24 F1, overlapping: something running as the user writes the
+    /// release file (0600, the user's) free while a start from one folder
+    /// is still under its dialog, and a start from another folder claims
+    /// the same line and turns sleep off. The first start's command, which
+    /// writes only while the receipt holds the predecessor both claimed,
+    /// stops before pmset (exit 8) and leaves the second start's line in
+    /// place. The first start's settlement reads that line, which names
+    /// the same predecessor, as "never wrote", at once: it is rolled back
+    /// with no pmset, and the second start's session and claim are left
+    /// alone.
+    func testTwoStartsThatClaimTheSameLineCannotBothWrite() async throws {
+        let attempt = try journalUnfinishedStart()
+        let b = Harness(sharing: h.receipts)
+        others.append(b)
+        TestReceipts.setRelease(h.receipts, "\(attempt.predecessor) free\n")
+        let mB = b.makeManager()
+
+        await mB.start(duration: 1800)
+
+        XCTAssertTrue(mB.isActive, mB.lastError ?? "")
+        let second = try XCTUnwrap(b.prompt.starts.last)
+        XCTAssertEqual(second.predecessor, attempt.predecessor)
+        let line = "\(second.nonce) \(attempt.predecessor) writing\n"
+        XCTAssertEqual(TestReceipts.text(h.receipts), line)
+
+        let dir = h.home.root.appendingPathComponent("late-answer")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let late = try runRootCommand(marker: h.home.paths.pendingStartFile, nonce: attempt.nonce, receipts: h.receipts, predecessor: attempt.predecessor, receiptIdentity: attempt.receipt, in: dir)
+        XCTAssertEqual(late.status, 8, late.stderr)
+        XCTAssertEqual(late.pmsetCalls, [])
+        XCTAssertEqual(TestReceipts.text(h.receipts), line, "the second start's line stays")
+
+        h.guardFake.sleepDisabled = true
+        let m = h.makeManager()
+        await m.reconcile()
+
+        try assertSettledAndNotResumed(m)
+        XCTAssertEqual(restores, 0, "\(h.guardFake.calls)")
+        XCTAssertTrue(h.guardFake.sleepDisabled)
+        XCTAssertTrue(mB.isActive)
+        XCTAssertEqual(TestReceipts.release(h.receipts), "\(second.nonce) free\n", "a settlement gives back no claim but its own")
+        await mB.end(reason: .user)
     }
 
     // MARK: A new attempt and a replay
 
     /// A `writing` left by an earlier start is not this start's: a start
     /// whose dialog fails before its command's record is rolled back with
-    /// nothing undone.
+    /// nothing undone, and the claim goes back.
     func testAnEarlierStartsWritingDoesNotCountForANewStart() async throws {
-        TestReceipts.write(h.receipts.file, nonce: UUID().uuidString, word: "writing")
+        let earlier = UUID().uuidString
+        TestReceipts.write(h.receipts.file, nonce: earlier, word: "writing")
+        TestReceipts.setRelease(h.receipts, "\(earlier) free\n")
         h.prompt.mode = .fail
         let m = h.makeManager()
 
@@ -469,7 +1005,8 @@ final class SleepOffSettlementTests: XCTestCase {
 
         XCTAssertFalse(m.isActive)
         XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
-        XCTAssertFalse(h.guardFake.calls.contains("disablesleep 0"), "\(h.guardFake.calls)")
+        XCTAssertEqual(restores, 0, "\(h.guardFake.calls)")
+        XCTAssertEqual(TestReceipts.release(h.receipts), "\(earlier) free\n")
         XCTAssertTrue(h.notifier.posts.last?.body.hasSuffix("The receipt shows that the command behind the password dialog never turned sleep off.") == true, h.notifier.posts.last?.body ?? "")
     }
 
@@ -479,6 +1016,7 @@ final class SleepOffSettlementTests: XCTestCase {
     /// pmset or the receipt.
     func testAReplayedDialogWritesNothing() async throws {
         let attempt = try journalUnfinishedStart()
+        pastExpiry()
         let m = h.makeManager()
         await m.reconcile()
         try assertSettledAndNotResumed(m)
@@ -517,25 +1055,36 @@ final class SleepOffSettlementTests: XCTestCase {
         XCTAssertNil(try h.store.loadState()?.sleepOffAttempt)
         XCTAssertTrue(m.lastError?.contains("is missing or unsafe") == true, m.lastError ?? "")
         XCTAssertTrue(m.lastError?.contains("not root") == true, m.lastError ?? "")
+        XCTAssertEqual(TestReceipts.release(h.receipts), SleepOffReceipts.initialRelease, "nothing claimed")
     }
 
-    /// Control: a normal start journals its attempt only while the dialog
-    /// runs, and a normal end restores.
+    /// Control: a normal start journals its attempt and claims the receipt
+    /// only while the dialog runs, and a normal end restores.
     func testANormalStartAndEndLeaveNoRecord() async throws {
         let m = h.makeManager()
         let atShow = JournalAtShow()
+        let releaseAtShow = JournalAtShow()
         let stateFile = h.home.paths.stateFile
-        h.prompt.onShow = { _ in atShow.data = try? Data(contentsOf: stateFile) }
+        let releaseFile = URL(fileURLWithPath: h.receipts.releaseFile)
+        h.prompt.onShow = { _ in
+            atShow.data = try? Data(contentsOf: stateFile)
+            releaseAtShow.data = try? Data(contentsOf: releaseFile)
+        }
 
         await m.start(duration: 1800)
 
         XCTAssertTrue(m.isActive, m.lastError ?? "")
+        let nonce = try XCTUnwrap(h.prompt.starts.last?.nonce)
         let journal = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(atShow.data)) as? [String: Any])
         let attempt = try XCTUnwrap(journal["sleepOffAttempt"] as? [String: Any], "journaled before the dialog")
         XCTAssertNotNil(attempt["marker"] as? String, "with its marker")
+        XCTAssertEqual(attempt["predecessor"] as? String, SleepOffReceipts.zero)
+        XCTAssertEqual(attempt["expires"] as? Int, now + Int(AdministratorPrompt.answerWindow))
         XCTAssertEqual(journal["sleepDisabledByUs"] as? Bool, true)
+        XCTAssertEqual(releaseAtShow.data.map { String(decoding: $0, as: UTF8.self) }, "\(nonce) held\n", "claimed before the dialog")
         XCTAssertNil(try h.store.loadState()?.sleepOffAttempt)
         XCTAssertEqual(try h.store.loadState()?.sleepDisabledByUs, true)
+        XCTAssertEqual(TestReceipts.release(h.receipts), "\(nonce) free\n", "given back once sleep is off")
         await m.end(reason: .user)
         XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
         XCTAssertFalse(h.guardFake.sleepDisabled)
@@ -585,7 +1134,8 @@ final class SleepOffSettlementTests: XCTestCase {
 
         XCTAssertEqual(fake.sleepDisabled, "0")
         XCTAssertEqual(fake.pmsetCalls(), ["-g", "-g", "-a disablesleep 1", "-a disablesleep 0"])
-        XCTAssertEqual(TestReceipts.text(h.receipts), "\(fake.nonce ?? "?") writing\n")
+        XCTAssertEqual(TestReceipts.text(h.receipts), "\(fake.nonce ?? "?") \(SleepOffReceipts.zero) writing\n")
+        XCTAssertEqual(TestReceipts.release(h.receipts), "\(fake.nonce ?? "?") free\n")
         XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
         XCTAssertNil(try h.store.loadSession())
         XCTAssertNil(m.session)
@@ -607,7 +1157,7 @@ final class SleepOffSettlementTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: fake.dir.appendingPathComponent("marker-before")), try Data(contentsOf: fake.dir.appendingPathComponent("marker-after")), "the same inode was rewritten, not replaced")
         XCTAssertEqual(fake.sleepDisabled, "0", "sleep is back on")
         XCTAssertEqual(fake.pmsetCalls(), ["-g", "-g", "-a disablesleep 1", "-a disablesleep 0"], "the app undid the write")
-        XCTAssertEqual(TestReceipts.text(h.receipts), "\(fake.nonce ?? "?") writing\n")
+        XCTAssertEqual(TestReceipts.text(h.receipts), "\(fake.nonce ?? "?") \(SleepOffReceipts.zero) writing\n")
         XCTAssertEqual(try h.store.loadState(), RuntimeState.clean, "the restore was made, then cleared")
         XCTAssertNil(try h.store.loadSession())
         XCTAssertNil(m.session)

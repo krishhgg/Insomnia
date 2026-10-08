@@ -68,6 +68,7 @@ MKTEMP=/usr/bin/mktemp
 MKDIR=/bin/mkdir
 CHMOD=/bin/chmod
 CAT=/bin/cat
+HEAD=/usr/bin/head
 INSTALL=/usr/bin/install
 STAT=/usr/bin/stat
 LS=/bin/ls
@@ -75,6 +76,9 @@ LS=/bin/ls
 # search the caller's PATH and run whatever it finds there as root.
 VISUDO=/usr/sbin/visudo
 LOCK_TIMEOUT_SECONDS=10
+# How long to wait for the receipt's lock before the release file is
+# written: the root command holds it from its checks until pmset exits.
+RECEIPT_LOCK_TIMEOUT_SECONDS=10
 # The limit for one call to sudo, pgrep, launchctl or codesign made while this
 # run holds the recovery lock; see bounded() below.
 CALL_TIMEOUT_SECONDS=30
@@ -107,7 +111,9 @@ UID_NUM="$(id -u)"
 RECEIPTS=/private/var/db/com.kgarg.insomnia
 RECEIPT_OWNER=0
 RECEIPT="$RECEIPTS/$UID_NUM"
+RELEASED="$RECEIPT.released"
 TMP_RECEIPT=""
+TMP_RELEASE=""
 # Where the new bundle is assembled and signed (step 3) and where the previous
 # one waits during the swap (step 6). Both inside $APP_DIR, so the swap is two
 # renames on one filesystem. The staging directory's name carries the PID of
@@ -332,6 +338,7 @@ cleanup() {
   if (( rc != 0 && RULE_AHEAD_OF_BUNDLE )); then rule_ahead_note; fi
   if [[ -n "$TMP_SUDOERS" ]]; then "$RM" -f "$TMP_SUDOERS"; fi
   if [[ -n "$TMP_RECEIPT" ]]; then "$RM" -f "$TMP_RECEIPT"; fi
+  if [[ -n "$TMP_RELEASE" ]]; then "$RM" -f "$TMP_RELEASE"; fi
   if [[ -n "$CANDIDATE" ]]; then "$RM" -f "$CANDIDATE"; fi
   if [[ -n "$CANDIDATE_DIR" ]]; then "$RMDIR" "$CANDIDATE_DIR" 2>/dev/null || true; fi
   if [[ -n "$STAGE" ]]; then "$RM" -rf "$STAGE"; fi
@@ -709,16 +716,18 @@ FAIL
 fi
 
 # The receipt: /private/var/db/com.kgarg.insomnia/<uid>, root's, 0644, one
-# link, 45 bytes (SleepOffReceipts.swift). The command behind a Start's
-# password dialog writes it as root before it turns sleep off, and the app,
-# backstop.sh and uninstall.sh read it to tell whether a start that never
-# finished did. Root writes only under folders nobody but root can change,
-# so every folder from the receipt's up to / is checked first, by lstat (a
-# link fails), and again at the end. Nothing here changes the owner or mode
-# of something already there: a folder or file that is not as this script
-# makes it stops the install, to be removed by hand. A receipt that is
-# already as this script makes it stays as it is, since it may record a
-# start the recovery below still has to settle.
+# link, 82 bytes (SleepOffReceipts.swift). The command behind a Start's
+# password dialog locks it and writes it as root before it turns sleep off,
+# and the app, backstop.sh and uninstall.sh read it under the same lock to
+# tell whether a start that never finished did. Root writes only under
+# folders nobody but root can change, so every folder from the receipt's up
+# to / is checked first, by lstat (a link fails), and again at the end.
+# Nothing here changes the owner or mode of something already there: a
+# folder or file that is not as this script makes it stops the install, to
+# be removed by hand. A receipt that is already as this script makes it
+# stays as it is, since it may record a start the recovery below, or an
+# Insomnia folder of this user other than this one (INSOMNIA_HOME), still
+# has to settle.
 # Prints why the folders from $1 up to / are not safe for root to write
 # under, or nothing.
 folders_problem() { # folder
@@ -740,8 +749,8 @@ folders_problem() { # folder
 receipt_problem() {
   local listing
   listing="$("$STAT" -f '%u %Lp %l %z %HT' "$RECEIPT" 2>/dev/null)" || listing=""
-  if ! printf '%s\n' "$listing" | /usr/bin/awk -v o="$RECEIPT_OWNER" '{ k = NR == 1 && NF == 6 && $5 == "Regular" && $6 == "File" && $3 == 1 && $4 == 45 && ($1 == 0 || $1 == o) && $2 !~ /[2367].?$/ }; END { exit !(k && NR == 1) }'; then
-    echo "$RECEIPT is not a regular file of root's with one link and 45 bytes that only root can change"
+  if ! printf '%s\n' "$listing" | /usr/bin/awk -v o="$RECEIPT_OWNER" '{ k = NR == 1 && NF == 6 && $5 == "Regular" && $6 == "File" && $3 == 1 && $4 == 82 && ($1 == 0 || $1 == o) && $2 !~ /[2367].?$/ }; END { exit !(k && NR == 1) }'; then
+    echo "$RECEIPT is not a regular file of root's with one link and 82 bytes that only root can change"
     return 0
   fi
   listing="$("$LS" -le "$RECEIPT" 2>/dev/null)" || listing=""
@@ -754,7 +763,8 @@ receipt_stop() { # problem
 
 Install stopped: $1. Insomnia does not change
 the owner or mode of anything it did not make. Remove it by hand
-(sudo rm -f $RECEIPT, or sudo rmdir $RECEIPTS once empty) and rerun this script.
+(sudo rm -f $RECEIPT $RELEASED, or sudo rmdir $RECEIPTS once empty) and rerun
+this script.
 Installed so far: $SUDOERS. The app at $APP and the LaunchAgent were not touched;
 the new build was discarded.
 FAIL
@@ -788,9 +798,11 @@ if [[ ! -e "$RECEIPTS" && ! -L "$RECEIPTS" ]]; then
 fi
 problem="$(folders_problem "$RECEIPTS")"
 [[ -z "$problem" ]] || receipt_stop "$problem"
+receipt_made=0
 if [[ ! -e "$RECEIPT" && ! -L "$RECEIPT" ]]; then
   TMP_RECEIPT="$("$MKTEMP")"
-  printf '00000000-0000-0000-0000-000000000000 refused\n' > "$TMP_RECEIPT"
+  printf '00000000-0000-0000-0000-000000000000 00000000-0000-0000-0000-000000000000 refused\n' > "$TMP_RECEIPT"
+  receipt_made=1
   receipt_rc=0
   bounded "$SUDO" -n "$INSTALL" -m 0644 -o root -g wheel "$TMP_RECEIPT" "$RECEIPT" || receipt_rc=$?
   if (( receipt_rc == 124 || receipt_rc == 125 )); then
@@ -808,6 +820,80 @@ problem="$(receipt_problem)"
 problem="$(folders_problem "$RECEIPTS")"
 [[ -z "$problem" ]] || receipt_stop "$problem"
 echo "receipt $RECEIPT is root's and only root can change it or the folders above it"
+
+# The release file beside it: <uid>.released, this user's, 0600, 42 bytes
+# (SleepOffReceipts.releaseFile): a nonce and "free" or "held". A start
+# claims the receipt there before its dialog, and gives the claim back once
+# it is settled; meanwhile no start from another Insomnia folder of this
+# user can replace the receipt's line, which that settlement reads. Under
+# the receipt's lock (fd 7, as the root command and every reader lock it),
+# it is written new as the receipt's nonce, free, when the receipt was made
+# just now, or when the file is missing, not in that shape, or shows another
+# nonce free. A claim ("held") is kept: it may be a start of another
+# Insomnia folder of this user that is not settled yet, and one of this
+# folder's own is settled by the recovery below. A claim whose folder is
+# gone keeps every start refused: remove both files by hand (sudo rm -f
+# $RECEIPT $RELEASED) once no Insomnia password dialog is open, and run this
+# script again. A release file that is not a regular file stops the
+# install, like the receipt.
+if [[ -L "$RELEASED" ]] || { [[ -e "$RELEASED" ]] && [[ ! -f "$RELEASED" ]]; }; then
+  receipt_stop "$RELEASED is not a regular file"
+fi
+release_line=""
+if [[ -f "$RELEASED" ]] && [[ "$("$STAT" -f '%u %l %z' "$RELEASED" 2>/dev/null)" == "$UID_NUM 1 42" ]]; then
+  release_line="$("$HEAD" -c 43 "$RELEASED" 2>/dev/null; echo .)"
+  release_line="${release_line%.}"
+fi
+if (( receipt_made == 0 )) && [[ "$release_line" =~ ^[0-9A-F-]{36}\ held$'\n'$ ]]; then
+  echo "kept $RELEASED: a start of this user (${release_line:0:36}) claims the receipt and is not settled yet"
+else
+  { exec 7<"$RECEIPT"; } 2>/dev/null || receipt_stop "$RECEIPT could not be opened"
+  receipt_lock_rc=0
+  "$LOCKF" -s -t "$RECEIPT_LOCK_TIMEOUT_SECONDS" 7 2>/dev/null || receipt_lock_rc=$?
+  if (( receipt_lock_rc != 0 )); then
+    "$CAT" >&2 <<FAIL
+
+Install stopped: $RECEIPT stayed locked for ${RECEIPT_LOCK_TIMEOUT_SECONDS} s (lockf exit
+$receipt_lock_rc): the command behind an Insomnia password dialog may be running, or
+another Insomnia folder of this user is settling a start. Rerun this script.
+Installed so far: $SUDOERS. The app at $APP and the LaunchAgent were not touched;
+the new build was discarded.
+FAIL
+    exit 1
+  fi
+  if [[ "$("$STAT" -f '%d:%i' <&7 2>/dev/null)" != "$("$STAT" -f '%d:%i' "$RECEIPT" 2>/dev/null)" ]]; then
+    receipt_stop "$RECEIPT was replaced while it was locked"
+  fi
+  receipt_line="$("$HEAD" -c 83 <&7 2>/dev/null; echo .)"
+  receipt_line="${receipt_line%.}"
+  if ! [[ "$receipt_line" =~ ^([0-9A-F-]{36})\ [0-9A-F-]{36}\ (writing|refused)$'\n'$ ]]; then
+    receipt_stop "$RECEIPT does not hold two nonces and writing or refused"
+  fi
+  receipt_nonce="${BASH_REMATCH[1]}"
+  if (( receipt_made == 0 )) && [[ "$release_line" == "$receipt_nonce free"$'\n' ]]; then
+    echo "kept $RELEASED"
+  else
+    TMP_RELEASE="$("$MKTEMP")"
+    printf '%s free\n' "$receipt_nonce" > "$TMP_RELEASE"
+    release_rc=0
+    bounded "$SUDO" -n "$INSTALL" -m 0600 -o "$UID_NUM" "$TMP_RELEASE" "$RELEASED" || release_rc=$?
+    if (( release_rc == 124 || release_rc == 125 )); then
+      echo >&2
+      sudo_stalled_note "$release_rc" "Install stopped: 'sudo install', which writes $RELEASED,"
+      echo "Installed so far: $SUDOERS. The app at $APP and the LaunchAgent were not touched; the new build was discarded." >&2
+      exit 1
+    elif (( release_rc != 0 )); then
+      if [[ -n "$BOUNDED_OUTPUT" ]]; then printf '%s\n' "$BOUNDED_OUTPUT" >&2; fi
+      receipt_sudo_failed "sudo install $RELEASED" "$release_rc"
+    fi
+    if [[ "$("$STAT" -f '%u %l %z' "$RELEASED" 2>/dev/null)" != "$UID_NUM 1 42" ]] \
+       || [[ "$("$HEAD" -c 43 "$RELEASED" 2>/dev/null; echo .)" != "$receipt_nonce free"$'\n'. ]]; then
+      receipt_stop "$RELEASED is not the file this script just wrote"
+    fi
+    echo "release file $RELEASED written: no start claims the receipt"
+  fi
+  exec 7<&-
+fi
 
 # Leftovers of earlier runs are handled only here, under the lock. Step 6
 # runs under it too, so no other install is between setting the previous
