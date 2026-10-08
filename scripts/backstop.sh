@@ -846,7 +846,7 @@ record_text_problems() { # file
           name+="$raw"
           keys[d]="$name"
           if [[ "$name" =~ ^[A-Za-z]+$ ]]; then names[d]+="$name|"; fi
-          want=colon
+          want="colon"
         elif [[ "$want" == value ]]; then
           [[ "$raw" =~ $strict ]] || echo "$vshown is a string with an escape JSON does not have, which the app does not read"
           want=next
@@ -896,6 +896,7 @@ record_text_problems() { # file
           digits="${token#-}"
           if [[ "$kind" == int32 ]]; then limit=2147483647; else limit=9223372036854775807; fi
           if [[ "$token" == -* ]]; then limit="${limit%7}8"; fi
+          # shellcheck disable=SC2071  # digit strings of one length, compared as text: the limits overflow $(( ))
           if (( ${#digits} > ${#limit} )) || { (( ${#digits} == ${#limit} )) && [[ "$digits" > "$limit" ]]; }; then
             echo "$vshown is ${token:0:40}, a whole number the app cannot read there"
           fi
