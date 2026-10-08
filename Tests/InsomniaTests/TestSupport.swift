@@ -807,6 +807,8 @@ struct Harness {
     /// kept brightness.
     /// `display` and `keyboard` replace the harness fakes, for a device
     /// the private-call guard refuses; `sleepGuard` wraps `guardFake`.
+    /// `bootSession` stands in for `kern.bootsessionuuid`, for a launch
+    /// after a restart.
     func makeManager(
         lockTimeout: TimeInterval = 0.3,
         retryDelay: TimeInterval = 60,
@@ -816,7 +818,8 @@ struct Harness {
         keptRecheckSlowDelay: Duration = .seconds(3600),
         display: (any DisplayDimming)? = nil,
         keyboard: (any KeyboardBacklighting)? = nil,
-        sleepGuard: (any SleepGuarding)? = nil
+        sleepGuard: (any SleepGuarding)? = nil,
+        bootSession: String = SignalProcessControl.bootSession
     ) -> SessionManager {
         let c = clock
         let lid = clamshell
@@ -839,7 +842,8 @@ struct Harness {
             reassertDelay: reassertDelay,
             keptRecheckDelay: keptRecheckDelay,
             keptRecheckAttempts: keptRecheckAttempts,
-            keptRecheckSlowDelay: keptRecheckSlowDelay
+            keptRecheckSlowDelay: keptRecheckSlowDelay,
+            bootSession: bootSession
         )
     }
 }

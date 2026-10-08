@@ -37,12 +37,13 @@ final class BrightnessSampler {
     private let clock: @Sendable () -> Date
     private let maxIdle: Double
 
-    /// While true, display readings are not taken. Either Insomnia's own
-    /// Low Power Mode is on and the panel reads the mode's rescaled value,
-    /// not the user's, so the sample taken just before the mode went on is
-    /// kept; or the journal holds a saved display brightness, so the panel
-    /// reads the 0 a lid close left or a level not yet decided. Wired to
-    /// the session journal by `follow`.
+    /// While true, display readings are not taken. Either the journal on
+    /// disk says Insomnia's own Low Power Mode is on and the panel reads
+    /// the mode's rescaled value, or one on its way back, not the user's,
+    /// so the sample taken just before the mode went on, or the level
+    /// written after it, is kept; or the journal holds a saved display
+    /// brightness, so the panel reads the 0 a lid close left or a level
+    /// not yet decided. Wired to the session journal by `follow`.
     var displayHeld: () -> Bool = { false }
     /// The same for the keyboard backlight: true while the journal holds a
     /// saved keyboard brightness.

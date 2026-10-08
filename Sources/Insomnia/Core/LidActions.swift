@@ -187,8 +187,9 @@ final class LidActions {
     /// up to 30 s old: a brightness change made right before closing the
     /// lid is not seen. A value kept after a refused restore gives way only
     /// to a sample, the value owed after the mode, or a current read that
-    /// is trusted and taken with our Low Power Mode never on in this run
-    /// (`SessionManager.keptDisplayReadDoubt`). Without one, the level may
+    /// is trusted and taken with our Low Power Mode never on in this run,
+    /// nor over the entry in this boot (`SessionManager.keptDisplayReadDoubt`).
+    /// Without one, the level may
     /// be one the user set by hand, and the reading is no level to restore
     /// either: the entry is left as it is, undecided, and the panel is not
     /// darkened, since the open would read the 0 left here as the darkening
@@ -231,9 +232,9 @@ final class LidActions {
             if let kept, let doubt {
                 // The user was told to set the level by hand, and may have:
                 // neither that reading nor the kept value is the level to
-                // come back to. A reading above 0 also means a later 0 may
-                // be the user's (`keptDisplayLeftLit`).
-                if current > 0 { manager.keptDisplayLeftLit() }
+                // come back to. Taken under the closing lid, maybe of a
+                // panel asleep, it shows no undone darkening either, so a
+                // 0 the open reads still gets the kept value.
                 Log.info("display brightness reads \(current) at the close \(doubt); the value kept after a refused restore, \(kept), stays journaled and undecided, and the display is not darkened, so the open reads it again")
             } else {
                 try manager.journal { s in

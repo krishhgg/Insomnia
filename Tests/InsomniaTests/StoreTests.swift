@@ -175,6 +175,87 @@ final class StoreTests: XCTestCase {
         XCTAssertNil(try Store.makeDecoder().decode(RuntimeState.self, from: legacy).displayRestoredUnderLowPower)
     }
 
+    /// The record of our Low Power Mode over a kept display entry stays in
+    /// the file, flat, with its boot session, and is neither dirty nor an
+    /// undo entry. Written only while set; a journal without it decodes
+    /// with none.
+    func testKeptDisplayUnderLowPowerRoundTripsAndIsNotDirty() throws {
+        var st = RuntimeState()
+        st.savedDisplayBrightness = 0.8
+        st.displayRestoreRefused = true
+        st.keptDisplayUnderLowPower = 0.8
+        st.keptDisplayUnderLowPowerBoot = "boot-a"
+        try store.saveState(st)
+        XCTAssertEqual(try store.loadState(), st)
+        let text = try String(contentsOf: home.paths.stateFile, encoding: .utf8)
+        XCTAssertTrue(text.contains("\"keptDisplayUnderLowPower\" : 0.8"), text)
+        XCTAssertTrue(text.contains("\"keptDisplayUnderLowPowerBoot\" : \"boot-a\""), text)
+        XCTAssertFalse(st.isDirty)
+        XCTAssertNil(st.undoEntries.keptDisplayUnderLowPower)
+        XCTAssertNil(st.undoEntries.keptDisplayUnderLowPowerBoot)
+
+        try store.saveState(RuntimeState())
+        let bare = try String(contentsOf: home.paths.stateFile, encoding: .utf8)
+        XCTAssertFalse(bare.contains("keptDisplayUnderLowPower"), bare)
+        let legacy = Data(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"savedDisplayBrightness":0.8,"displayRestoreRefused":true}"#.utf8)
+        let decoded = try Store.makeDecoder().decode(RuntimeState.self, from: legacy)
+        XCTAssertNil(decoded.keptDisplayUnderLowPower)
+        XCTAssertFalse(decoded.keptDisplayReadUnderLowPower(inBoot: "boot-a"), "a journal from before the record is no doubt")
+    }
+
+    /// The record holds only for the kept entry it names, with that value
+    /// and its flag, in the boot it was written in; a journal write drops
+    /// it otherwise. One with no boot session holds, and takes the boot of
+    /// the next write that knows it.
+    func testKeptDisplayUnderLowPowerHoldsForItsEntryInItsBoot() {
+        var st = RuntimeState()
+        st.savedDisplayBrightness = 0.8
+        st.displayRestoreRefused = true
+        st.noteLowPowerOverKeptDisplay(ours: false, boot: "boot-a")
+        XCTAssertNil(st.keptDisplayUnderLowPower, "recorded with the mode never ours")
+
+        st.noteLowPowerOverKeptDisplay(ours: true, boot: "boot-a")
+        XCTAssertEqual(st.keptDisplayUnderLowPower, 0.8)
+        XCTAssertEqual(st.keptDisplayUnderLowPowerBoot, "boot-a")
+        XCTAssertTrue(st.keptDisplayReadUnderLowPower(inBoot: "boot-a"))
+        XCTAssertFalse(st.keptDisplayReadUnderLowPower(inBoot: "boot-b"))
+        XCTAssertTrue(st.keptDisplayReadUnderLowPower(inBoot: ""), "a boot not read is no restart")
+        var sameBoot = st
+        sameBoot.noteLowPowerOverKeptDisplay(ours: false, boot: "boot-a")
+        XCTAssertEqual(sameBoot, st, "kept with the mode no longer ours")
+
+        var later = st
+        later.noteLowPowerOverKeptDisplay(ours: false, boot: "boot-b")
+        XCTAssertNil(later.keptDisplayUnderLowPower)
+        XCTAssertNil(later.keptDisplayUnderLowPowerBoot)
+
+        var replaced = st
+        replaced.savedDisplayBrightness = 0.7
+        XCTAssertFalse(replaced.keptDisplayReadUnderLowPower(inBoot: "boot-a"))
+        replaced.noteLowPowerOverKeptDisplay(ours: false, boot: "boot-a")
+        XCTAssertNil(replaced.keptDisplayUnderLowPower)
+
+        var unflagged = st
+        unflagged.displayRestoreRefused = false
+        XCTAssertFalse(unflagged.keptDisplayReadUnderLowPower(inBoot: "boot-a"))
+        unflagged.noteLowPowerOverKeptDisplay(ours: true, boot: "boot-a")
+        XCTAssertNil(unflagged.keptDisplayUnderLowPower, "an ordinary entry is not recorded")
+
+        var settled = st
+        settled.savedDisplayBrightness = nil
+        settled.displayRestoreRefused = false
+        settled.noteLowPowerOverKeptDisplay(ours: true, boot: "boot-a")
+        XCTAssertNil(settled.keptDisplayUnderLowPower)
+
+        var unknown = st
+        unknown.keptDisplayUnderLowPowerBoot = nil
+        XCTAssertTrue(unknown.keptDisplayReadUnderLowPower(inBoot: "boot-b"))
+        unknown.noteLowPowerOverKeptDisplay(ours: false, boot: "boot-b")
+        XCTAssertEqual(unknown.keptDisplayUnderLowPower, 0.8)
+        XCTAssertEqual(unknown.keptDisplayUnderLowPowerBoot, "boot-b")
+        XCTAssertFalse(unknown.keptDisplayReadUnderLowPower(inBoot: "boot-c"), "held until the next restart only")
+    }
+
     func testSavedBrightnessCountsAsDirty() throws {
         var st = RuntimeState()
         XCTAssertFalse(st.isDirty)

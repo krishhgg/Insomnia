@@ -1113,6 +1113,81 @@ final class StillRunningCommandTests: XCTestCase {
         XCTAssertNil(try h.store.loadState()?.displayRestoredUnderLowPower)
     }
 
+    /// The same, but state.json does not decode when the switch-off exits
+    /// 0: nothing is written or cleared, and the mode is known off. The
+    /// end once the file reads again writes the owed value over powerd's
+    /// rescale and does not switch the mode off again, which would read
+    /// the rescale as a change by the user and drop the write.
+    func testSwitchOffThatExits0OnAnUnreadableJournalStillWritesTheOwedDisplay() async throws {
+        let m = h.makeManager(retryDelay: 3600)
+        m.resyncAfterCommand = { _ in }
+        await m.start(duration: 3600)
+        let on = await m.setLowPower(true)
+        XCTAssertTrue(on)
+        var st = try XCTUnwrap(try h.store.loadState())
+        st.displayRestoredUnderLowPower = 0.6
+        try h.store.saveState(st)
+        h.display.brightness = 0.6
+        h.guardFake.stillRunning = ["lowpowermode 0"]
+        let off = await m.setLowPower(false)
+        XCTAssertFalse(off)
+        let stateFile = h.home.paths.stateFile
+        let journal = try Data(contentsOf: stateFile)
+        let broken = Data("{ not json".utf8)
+        try broken.write(to: stateFile)
+
+        h.display.brightness = 0.45
+        h.guardFake.stillRunning = []
+        h.guardFake.exitStuckCommands()
+
+        await waitUntil("the lock never went with the exit") { m.unfinishedCommand == nil }
+        XCTAssertEqual(h.display.sets, [], "written on a journal not read")
+        XCTAssertEqual(try Data(contentsOf: stateFile), broken, "an unreadable journal was overwritten")
+        let log = (try? String(contentsOf: h.home.paths.logFile, encoding: .utf8)) ?? ""
+        XCTAssertTrue(log.contains("low power mode is off, and the clear and the display write owed after it (0.6) wait for the journal to read again"), log)
+        XCTAssertFalse(try lockIsHeld())
+
+        try journal.write(to: stateFile)
+        let before = h.guardFake.calls
+        let ended = await m.end(reason: .user)
+
+        XCTAssertEqual(ended, .restored)
+        XCTAssertEqual(h.display.sets, [0.6])
+        XCTAssertEqual(h.display.brightness, 0.6)
+        XCTAssertFalse(h.guardFake.calls.dropFirst(before.count).contains("lowpowermode 0"), "the mode known off was switched off again")
+        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
+        XCTAssertFalse((m.lastError ?? "").contains("wait for the journal to read again"), m.lastError ?? "")
+    }
+
+    /// The same, and the file that reads again no longer owes the write:
+    /// the panel is left as it is.
+    func testSwitchOffThatExits0OnAnUnreadableJournalWritesNothingTheFixedJournalDoesNotOwe() async throws {
+        let m = h.makeManager(retryDelay: 3600)
+        m.resyncAfterCommand = { _ in }
+        await m.start(duration: 3600)
+        let on = await m.setLowPower(true)
+        XCTAssertTrue(on)
+        var st = try XCTUnwrap(try h.store.loadState())
+        st.displayRestoredUnderLowPower = 0.6
+        try h.store.saveState(st)
+        h.display.brightness = 0.6
+        h.guardFake.stillRunning = ["lowpowermode 0"]
+        _ = await m.setLowPower(false)
+        try Data("{ not json".utf8).write(to: h.home.paths.stateFile)
+        h.display.brightness = 0.45
+        h.guardFake.stillRunning = []
+        h.guardFake.exitStuckCommands()
+        await waitUntil("the lock never went with the exit") { m.unfinishedCommand == nil }
+
+        st.displayRestoredUnderLowPower = nil
+        try h.store.saveState(st)
+        _ = await m.end(reason: .user)
+
+        XCTAssertEqual(h.display.sets, [])
+        XCTAssertEqual(h.display.brightness, 0.45)
+        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
+    }
+
     /// The same, but the switch-off exits 1 after switching the mode off,
     /// and powerd rescales the panel. The check reads the mode off and runs
     /// its own `lowpowermode 0`. It does not compare the panel with the

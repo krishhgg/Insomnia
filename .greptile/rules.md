@@ -47,7 +47,8 @@ macOS is not holding the device down counts: the display awake, the keyboard
 backlight neither suppressed nor dimmed. A reading taken while macOS holds it
 down, or a read that fails, leaves the entry as it is for a later read. A
 display reading above 0 taken under the app's own Low Power Mode, or after it
-in the same run, leaves the entry for the next launch. Legacy
+in the same boot, relaunches included, leaves the entry for a launch after a
+restart. Legacy
 `frozenPids` entries are never signaled or cleared by the shell. A flag is
 cleared only after its undo succeeded; a journal that is unreadable or has a
 known key of the wrong type is left untouched and the run exits 1.

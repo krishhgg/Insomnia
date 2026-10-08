@@ -138,15 +138,20 @@ lands or the flag is on disk. The sampler takes no reading of a device
 whose brightness is journaled, and each level written from the journal
 or found set since becomes its sample, so a close right after a late
 restore journals that level. A display reading above 0 under Insomnia's
-own Low Power Mode, or after it in the same run, decides nothing, and the
-next launch reads the entry again; a later reading of 0 in that run does
-not bring the kept value back either. A close with no trusted level
+own Low Power Mode, or after it in the same boot, relaunches included,
+decides nothing, and a launch after a restart reads the entry again; a
+later reading of 0 in that run does not bring the kept value back either,
+unless the reading above 0 was taken under a closing lid, of a panel
+asleep, or of another entry. A close with no trusted level
 leaves the entry flagged and the panel lit, and only asks the display to
 sleep. A write whose clear state.json refuses is still written again 2 s
 later and, under the mode, after it. A `lowpowermode 0` that exits 0 while
 state.json refuses the ownership clear still does the write owed after
-the mode, and a write after the mode dropped while state.json refuses
-that clear stays dropped. Unit tests with an injected version and
+the mode, and the display sample stays the level written after it until
+the clear lands; one that exits 0 while state.json cannot be read does
+that write once state.json reads again and still owes it. A write after
+the mode dropped while state.json refuses that clear stays dropped. Unit
+tests with an injected version and
 fake classes only; the rows below stay "Not run", and the guards do not
 stand in for them.
 
@@ -172,7 +177,7 @@ is performed. Do not replace "not run" with "passed" based on source review.
 | A kept keyboard backlight when a session ends with the lid closed, on a build that can make the call: the log shows "the lid is not known to be open, so the kept value is not read", and about a minute or less after the lid opens, with no session, "set since its restore" or "keyboard backlight restored" | Not run |
 | A kept brightness at a launch with no session and the lid closed (an external display in clamshell mode, after a refused restore), on a build that can make the call: the log shows "not read: the lid is not known to be open" for each kept device and nothing is written, and once the lid opens "set since its restore" or "restored" | Not run |
 | A kept display brightness restored late during a session (launch with the display asleep after a refused restore, wake it, start a session at once, wait for "display restored", then close and open the lid within 30 s): the close logs "display darkened (was brightness" with the restored level, and the open brings the panel back at that level, not black | Not run |
-| A kept display brightness under Insomnia's own Low Power Mode, on a build that can make the call (after a refused restore, set the display by hand, start a session on battery below the floor so Insomnia switches the mode on, then open the lid): the log shows "under our low power mode, which rescales it" and nothing is written; once the mode is off, "after our low power mode was on in this run" and nothing is written, and a close logs "stays journaled and undecided, and the display is not darkened" and the panel goes dark only if the display sleep request is honored; after a relaunch with the lid open, "set since its restore" with the level set by hand, and a close and open after that bring back that level | Not run |
+| A kept display brightness under Insomnia's own Low Power Mode, on a build that can make the call (after a refused restore, set the display by hand, start a session on battery below the floor so Insomnia switches the mode on, then open the lid): the log shows "under our low power mode, which rescales it" and nothing is written; once the mode is off, "after our low power mode was on in this run" and nothing is written, and a close logs "stays journaled and undecided, and the display is not darkened" and the panel goes dark only if the display sleep request is honored; after a relaunch with the lid open, "since the Mac last started" and nothing is written; after a restart, "set since its restore" with the level set by hand, and a close and open after that bring back that level | Not run |
 | Freeze-all scope with agents running (Cursor/T3 Code/Claude untouched) | Not run |
 | Freeze-all off on a fresh config.json (list only) and on with a terminal, a non-Chrome browser and a JetBrains IDE open (all untouched) | Not run |
 | Real lid close with freeze-all on during a Zoom or Teams call on AirPods, with Wispr Flow or Granola taking notes: none of their processes stopped (`ps -o stat` shows no `T`), the call and the notes continue, other Dock apps frozen, sound muted | Not run |

@@ -285,30 +285,48 @@ final class SessionManager {
     /// Low Power Mode is on. The mode rescales the panel, and once it is
     /// off macOS brings the panel back over a time nobody has measured, so
     /// from then on no display reading in this run is taken as the level
-    /// the user set (`keptDisplayReadDoubt`).
+    /// the user set (`keptDisplayReadDoubt`). A display entry kept after a
+    /// refused restore is journaled as such for later runs in the same
+    /// boot (`RuntimeState.keptDisplayUnderLowPower`).
     @ObservationIgnored private var lowPowerWasOurs = false
 
-    /// A display brightness kept after a refused restore read above 0 in
-    /// this run, by a reading that did not decide it. The darkening is
-    /// undone, so a later reading of 0 may be a level set since and does
-    /// not bring the kept value back (see restoreDisplay).
-    @ObservationIgnored private var keptDisplayReadLit = false
+    /// `kern.bootsessionuuid` of this run, for `keptDisplayUnderLowPower`.
+    private let bootSession: String
+
+    /// The display brightness kept after a refused restore that read above
+    /// 0 in this run, with the lid known open and the panel awake, by a
+    /// reading that did not decide it (`keptDisplayReadDoubt`): the saved
+    /// value. That entry's darkening is undone, so a later reading of 0
+    /// may be a level set since and does not bring the kept value back
+    /// (see restoreDisplay). A reading under a closed or closing lid, or
+    /// of a panel asleep, shows nothing of the kind. Forgotten once this
+    /// process finds that entry settled, replaced or unflagged
+    /// (`forgetKeptDisplayLitUnlessKept`).
+    @ObservationIgnored private var keptDisplayReadLit: Float?
 
     /// Why a reading of the display does not show the level set since a
     /// value kept after a refused restore, or nil when it may: under
     /// Insomnia's Low Power Mode it reads the mode's rescaled value, and
     /// after it, a value on its way back. Such a value is never adopted:
-    /// the entry stays, and the next launch reads it again.
+    /// the entry stays. A relaunch is no sign the panel is back, so the
+    /// entry is journaled as one the mode was on over, and later runs read
+    /// it with the same doubt until the Mac restarts.
     var keptDisplayReadDoubt: String? {
-        if effectiveState.lowPowerSetByUs { return "under our low power mode, which rescales it" }
+        let s = effectiveState
+        if s.lowPowerSetByUs { return "under our low power mode, which rescales it" }
         if lowPowerWasOurs { return "after our low power mode was on in this run, which rescales it until some time after it goes off" }
+        if s.keptDisplayReadUnderLowPower(inBoot: bootSession) {
+            return "after our low power mode was on over it since the Mac last started, which rescales it until some time after it goes off"
+        }
         return nil
     }
 
-    /// For a lid close that read the display above 0 and left a kept
-    /// value undecided (`keptDisplayReadLit`).
-    func keptDisplayLeftLit() {
-        keptDisplayReadLit = true
+    /// `keptDisplayReadLit` is about the display entry still kept, with the
+    /// owed edits applied, and is dropped otherwise.
+    private func forgetKeptDisplayLitUnlessKept() {
+        guard let lit = keptDisplayReadLit else { return }
+        let s = effectiveState
+        if !(s.displayRestoreRefused && s.savedDisplayBrightness == lit) { keptDisplayReadLit = nil }
     }
 
     /// Fire date of the single deadline timer, exposed for tests and the menu.
@@ -499,7 +517,8 @@ final class SessionManager {
         reassertDelay: Duration = .seconds(2),
         keptRecheckDelay: Duration = .seconds(3),
         keptRecheckAttempts: Int = 20,
-        keptRecheckSlowDelay: Duration = .seconds(60)
+        keptRecheckSlowDelay: Duration = .seconds(60),
+        bootSession: String = SignalProcessControl.bootSession
     ) {
         self.paths = paths
         self.store = Store(paths: paths)
@@ -521,6 +540,7 @@ final class SessionManager {
         self.keptRecheckDelay = keptRecheckDelay
         self.keptRecheckAttempts = keptRecheckAttempts
         self.keptRecheckSlowDelay = keptRecheckSlowDelay
+        self.bootSession = bootSession
 
         try? paths.createDirectories()
         var loadedState: RuntimeState?
@@ -685,6 +705,7 @@ final class SessionManager {
                 return .failure(.journalUnreadable(self.refuseForUnreadableJournal(what, error)))
             }
             self.writeOwedEdits()
+            self.settleDisplayAfterUnreadOff()
             let before = self.unfinishedCommand
             // Every `sudo pmset` `op` runs is handed this lock
             // (`PmsetSleepGuard`) and holds it until it exits.
@@ -712,6 +733,7 @@ final class SessionManager {
     private func loadJournal() throws {
         state = try store.loadState() ?? .clean
         if state.lowPowerSetByUs { lowPowerWasOurs = true }
+        forgetKeptDisplayLitUnlessKept()
     }
 
     /// Returns the line put in the menu.
@@ -775,6 +797,15 @@ final class SessionManager {
     /// If it cannot be read or written, the entry stays, the retry runs the
     /// undo again, and the menu says so (`clearUndone`) in place of the
     /// command's line, which goes with the exit.
+    ///
+    /// A `lowpowermode 0` with a display write owed after the mode, by
+    /// what this process last read, is known done even when the journal
+    /// cannot be read: its clear is owed as for a journal that refuses it,
+    /// and the write waits for the first transaction that reads the journal
+    /// again (`displayWriteAfterUnreadOff`). The unreadable file is not
+    /// written. Left to the retry, that write would meet a panel the
+    /// mode's end rescaled and be dropped as moved by the user
+    /// (`dropDisplayWriteIfMoved`).
     private func confirmUndo(_ undo: PendingUndo, by command: UnfinishedCommand) {
         let clear: (inout RuntimeState) -> Void
         switch undo {
@@ -784,6 +815,13 @@ final class SessionManager {
         do {
             try loadJournal()
         } catch {
+            if case .lowPowerOff = undo, let owed = effectiveState.displayRestoredUnderLowPower {
+                lowPowerWasOurs = true
+                owedEdits.lowPowerOff = true
+                displayWriteAfterUnreadOff = owed
+                failUncleared("\(command.description) exited 0, but the journal could not be read to clear its entry: \(error.localizedDescription); low power mode is off, and the clear and the display write owed after it (\(owed)) wait for the journal to read again", clear)
+                return
+            }
             failUncleared("\(command.description) exited 0, but the journal could not be read to clear its entry: \(error.localizedDescription); it will be retried", clear)
             return
         }
@@ -820,6 +858,29 @@ final class SessionManager {
     private func failUncleared(_ message: String, _ clear: @escaping (inout RuntimeState) -> Void) {
         fail(message)
         uncleared = (message, clear)
+    }
+
+    /// A `lowpowermode 0` exited 0 while the journal could not be read
+    /// (`confirmUndo`): the display write owed after the mode then, by
+    /// what this process had last read. nil when none was owed.
+    @ObservationIgnored private var displayWriteAfterUnreadOff: Float?
+
+    /// The first transaction that reads the journal again after
+    /// `displayWriteAfterUnreadOff` makes that write, as `confirmUndo`
+    /// would have at the exit, if the journal read back, with the owed
+    /// edits, still owes that value with the mode not ours. Any other
+    /// journal (replaced, edited, or one whose entry went meanwhile) gets
+    /// no write: what it owes is decided as for any journal.
+    private func settleDisplayAfterUnreadOff() {
+        guard let carried = displayWriteAfterUnreadOff else { return }
+        displayWriteAfterUnreadOff = nil
+        let journaled = effectiveState
+        guard journaled.displayRestoredUnderLowPower == carried, !journaled.lowPowerSetByUs else {
+            Log.info("display write owed after low power mode (\(carried)) not made: the journal read back after the switch-off does not owe it")
+            return
+        }
+        Log.info("journal readable again after low power mode went off; writing the display owed after it")
+        settleDisplayAfterLowPower()
     }
 
     /// Insomnia's Low Power Mode is off: a `lowpowermode 0` exited 0. Its
@@ -1394,9 +1455,11 @@ final class SessionManager {
         var s = state
         owedEdits.apply(to: &s)
         mutate(&s)
+        s.noteLowPowerOverKeptDisplay(ours: lowPowerWasOurs || s.lowPowerSetByUs, boot: bootSession)
         try persistState(s)
         for line in owedEdits.keptLines + owedEdits.lowPowerLines { Log.info(line) }
         owedEdits = OwedEdits()
+        forgetKeptDisplayLitUnlessKept()
     }
 
     /// Take the entries of an undone freeze off the journal now, or with
@@ -1992,13 +2055,14 @@ final class SessionManager {
     /// the re-assert. A value kept after a refused restore is read first,
     /// and may be cleared without a write or left waiting: see keptLevel.
     /// A level above 0 read under Insomnia's Low Power Mode, or after it
-    /// in this run (`keptDisplayReadDoubt`), may be the mode's rescaled
-    /// value or one on its way back, not the user's: it would become the
-    /// sampler's sample and so the level the next close journals. The
-    /// entry waits, and is decided at the next launch. A reading of 0
-    /// still writes the kept value, owed once more after the mode as for
-    /// any restore under it, unless the display read above 0 since
-    /// (`keptDisplayReadLit`): that 0 may be the user's.
+    /// in this run or boot (`keptDisplayReadDoubt`), may be the mode's
+    /// rescaled value or one on its way back, not the user's: it would
+    /// become the sampler's sample and so the level the next close
+    /// journals. The entry waits, and is decided by a reading in a later
+    /// boot. A reading of 0 still writes the kept value, owed once more
+    /// after the mode as for any restore under it, unless that entry read
+    /// above 0 since in this run (`keptDisplayReadLit`): that 0 may be the
+    /// user's.
     private func restoreDisplay(saved: Float, waiting: inout [String], errors: inout [String]) -> Float? {
         if effectiveState.displayRestoreRefused {
             switch keptLevel(read: { try display.readBrightness() },
@@ -2008,7 +2072,7 @@ final class SessionManager {
                 return nil
             case .setSince(let now):
                 if let doubt = keptDisplayReadDoubt {
-                    keptDisplayReadLit = true
+                    keptDisplayReadLit = saved
                     waiting.append("display brightness \(saved), kept after a refused restore, reads \(now) \(doubt); that is not taken as a level set since")
                     return nil
                 }
@@ -2016,9 +2080,10 @@ final class SessionManager {
                     s.savedDisplayBrightness = nil
                     s.displayRestoreRefused = false
                 }
+                forgetKeptDisplayLitUnlessKept()
                 didSettleBrightness?(now, nil)
                 return nil
-            case .dark where keptDisplayReadLit:
+            case .dark where keptDisplayReadLit == saved:
                 waiting.append("display brightness \(saved), kept after a refused restore, reads 0 after it read above 0 in this run; that 0 may be a level set since, so the kept value is not written")
                 return nil
             case .dark:
@@ -2030,6 +2095,7 @@ final class SessionManager {
         } catch {
             errors.append("could not restore display brightness: \(error.localizedDescription)")
             makeRetryable("display brightness", saved: saved, flag: \.displayRestoreRefused, owed: \.display, errors: &errors)
+            forgetKeptDisplayLitUnlessKept()
             return nil
         }
         Log.info("display restored (brightness \(saved))")
@@ -2048,6 +2114,7 @@ final class SessionManager {
         } catch {
             errors.append(unclearedLine("display brightness restored but the journal entry could not be cleared: \(error.localizedDescription); it will be retried", clear))
             settleRestored(saved, underLowPower: underLowPower, flag: \.displayRestoreRefused, owed: \.display)
+            forgetKeptDisplayLitUnlessKept()
         }
         return saved
     }

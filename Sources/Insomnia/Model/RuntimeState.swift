@@ -158,6 +158,21 @@ struct RuntimeState: Codable, Equatable, Sendable {
     /// backstop ignores it and keeps it, and the app drops it if it finds
     /// the mode cleared by someone else.
     var displayRestoredUnderLowPower: Float? = nil
+    /// A display brightness kept after a refused restore that Insomnia's
+    /// own Low Power Mode was on over, or that a run of the app with the
+    /// mode on at some point journaled: the saved value, and the boot
+    /// session (`kern.bootsessionuuid`) of that run. Once the mode is off
+    /// the panel comes back over a time nobody has measured, and the app
+    /// can be relaunched meanwhile, so no reading above 0 decides that
+    /// entry in that boot, in any run (`SessionManager.keptDisplayReadDoubt`).
+    /// Only for the entry with that value and its flag: the journal write
+    /// that settles, replaces or unflags it, or finds the record from an
+    /// earlier boot, drops it (`noteLowPowerOverKeptDisplay`). A record
+    /// with no boot session to compare holds, and the next write that
+    /// knows the boot gives it that one. Not something to undo; the
+    /// scripts never read it. Left out of the JSON when nil.
+    var keptDisplayUnderLowPower: Float? = nil
+    var keptDisplayUnderLowPowerBoot: String? = nil
     /// Agent apps whose App Nap preference Insomnia set for the session,
     /// each with the value to put back. Not a lid action: restored at
     /// session end, at reconcile, or by the backstop with `defaults`.
@@ -169,13 +184,41 @@ struct RuntimeState: Codable, Equatable, Sendable {
     /// A state with nothing left to undo.
     static let clean = RuntimeState()
 
+    /// `keptDisplayUnderLowPower` is about the entry as it reads now, in
+    /// boot session `boot`.
+    func keptDisplayReadUnderLowPower(inBoot boot: String) -> Bool {
+        guard let doubted = keptDisplayUnderLowPower, displayRestoreRefused, savedDisplayBrightness == doubted else { return false }
+        let recorded = keptDisplayUnderLowPowerBoot ?? ""
+        return recorded == boot || recorded.isEmpty || boot.isEmpty
+    }
+
+    /// Before each journal write: a display entry kept after a refused
+    /// restore is recorded as one our Low Power Mode was on over while
+    /// `ours` (the mode is ours, or was in this run), and a record that is
+    /// not about the entry as it reads now, in boot `boot`, is dropped. A
+    /// record with no boot session, which may be from this boot, is taken
+    /// as this boot's, so it holds until the next restart and no longer.
+    mutating func noteLowPowerOverKeptDisplay(ours: Bool, boot: String) {
+        if ours, displayRestoreRefused, let kept = savedDisplayBrightness {
+            keptDisplayUnderLowPower = kept
+            keptDisplayUnderLowPowerBoot = boot
+        } else if !keptDisplayReadUnderLowPower(inBoot: boot) {
+            keptDisplayUnderLowPower = nil
+            keptDisplayUnderLowPowerBoot = nil
+        } else if (keptDisplayUnderLowPowerBoot ?? "").isEmpty {
+            keptDisplayUnderLowPowerBoot = boot
+        }
+    }
+
     /// The undo entries alone: the state without
     /// `displayRestoredUnderLowPower`, a write owed after the mode rather
-    /// than something to undo. Two states with equal entries owe the same
-    /// undos.
+    /// than something to undo, or `keptDisplayUnderLowPower`. Two states
+    /// with equal entries owe the same undos.
     var undoEntries: RuntimeState {
         var entries = self
         entries.displayRestoredUnderLowPower = nil
+        entries.keptDisplayUnderLowPower = nil
+        entries.keptDisplayUnderLowPowerBoot = nil
         return entries
     }
 
@@ -221,6 +264,7 @@ struct RuntimeState: Codable, Equatable, Sendable {
         case savedAudioOutputs, savedOutputVolume, savedMuted
         case savedDisplayBrightness, savedKeyboardBrightness, displayRestoredUnderLowPower
         case displayRestoreRefused, keyboardRestoreRefused
+        case keptDisplayUnderLowPower, keptDisplayUnderLowPowerBoot
         case appNapOverrides
     }
 
@@ -248,6 +292,8 @@ struct RuntimeState: Codable, Equatable, Sendable {
         displayRestoredUnderLowPower = try c.decodeIfPresent(Float.self, forKey: .displayRestoredUnderLowPower)
         displayRestoreRefused = try c.decodeIfPresent(Bool.self, forKey: .displayRestoreRefused) ?? false
         keyboardRestoreRefused = try c.decodeIfPresent(Bool.self, forKey: .keyboardRestoreRefused) ?? false
+        keptDisplayUnderLowPower = try c.decodeIfPresent(Float.self, forKey: .keptDisplayUnderLowPower)
+        keptDisplayUnderLowPowerBoot = try c.decodeIfPresent(String.self, forKey: .keptDisplayUnderLowPowerBoot)
         appNapOverrides = try c.decodeIfPresent([AppNapOverride].self, forKey: .appNapOverrides) ?? []
     }
 
@@ -269,6 +315,8 @@ struct RuntimeState: Codable, Equatable, Sendable {
         // same to backstop.sh and uninstall.sh as before the flags existed.
         if displayRestoreRefused { try c.encode(true, forKey: .displayRestoreRefused) }
         if keyboardRestoreRefused { try c.encode(true, forKey: .keyboardRestoreRefused) }
+        try c.encodeIfPresent(keptDisplayUnderLowPower, forKey: .keptDisplayUnderLowPower)
+        try c.encodeIfPresent(keptDisplayUnderLowPowerBoot, forKey: .keptDisplayUnderLowPowerBoot)
         try c.encode(appNapOverrides, forKey: .appNapOverrides)
     }
 }
