@@ -243,8 +243,10 @@ closed over the entry, by such a close or while a reading or re-read
 waited for the lid, may still be the closing lid's: the first one waits,
 and only a 0 read 3 s or more after it (`keptRecheckDelay`, the delay of
 the sampler's read after an open) is the level set since. That wait is
-held by the process alone, so a relaunch with the lid already open reads
-the panel without it. A reading at a lid close, under the closing lid or of a panel
+held by the process alone, not journaled. A launch cannot know whether
+the lid closed over the entry before it, after a crash or while
+Insomnia was not running, so the first 0 it reads waits the same way,
+timed from that reading and not from any earlier process's. A reading at a lid close, under the closing lid or of a panel
 asleep, shows no such thing, and neither does a reading of an earlier
 entry: the record goes with its entry, as the record of the mode does. If
 state.json refuses the record, this process holds it and the next write

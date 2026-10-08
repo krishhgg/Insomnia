@@ -58,8 +58,8 @@ off, it puts no doubt on the reading. A reading above 0 of the kept entry is
 journaled (`keptDisplayReadLit`), and a later 0 is then not overwritten with
 the saved value, in that run or any later one. A 0 read under the closing lid
 is no level set since: a close with no sample leaves the entry flagged, and the
-first 0 read after the lid was closed over the entry waits 3 s for another
-reading. Legacy
+first 0 read after the lid was closed over the entry, or the first since a
+launch, waits 3 s for another reading. Legacy
 `frozenPids` entries are never signaled or cleared by the shell. A flag is
 cleared only after its undo succeeded; a journal that is unreadable or has a
 known key of the wrong type is left untouched and the run exits 1.

@@ -374,12 +374,15 @@ final class SessionManager {
     /// The lid closed over the display entry kept after a refused restore
     /// since a reading last decided or timed it, and when the first 0
     /// after that was read (see `zeroSinceLidClosedWait`). In this process
-    /// only.
+    /// only: a launch does not know whether the lid closed over the entry
+    /// before it, maybe while Insomnia was not running, so it starts as if
+    /// it had.
     private enum LidOverKeptDisplay {
+        case launched
         case closed
-        case readZero(at: ContinuousClock.Instant)
+        case readZero(at: ContinuousClock.Instant, since: String)
     }
-    @ObservationIgnored private var lidOverKeptDisplay: LidOverKeptDisplay?
+    @ObservationIgnored private var lidOverKeptDisplay: LidOverKeptDisplay? = .launched
     /// The pending in-process retry of the saved output volumes
     /// (`scheduleAudioRetry`). One at a time.
     @ObservationIgnored private var audioRetryTask: Task<Void, Never>?
@@ -2113,7 +2116,7 @@ final class SessionManager {
     /// (`RuntimeState.keptDisplayReadLit`): that 0 may be the user's. It is
     /// then left as set, with the entry cleared, once no doubt is left,
     /// and waits until then. A 0 read soon after the lid closed over the
-    /// entry waits too (`zeroSinceLidClosedWait`).
+    /// entry, or soon after a launch, waits too (`zeroSinceLidClosedWait`).
     private func restoreDisplay(saved: Float, waiting: inout [String], errors: inout [String]) -> Float? {
         if effectiveState.displayRestoreRefused {
             if clamshell() != false { noteLidClosedOverKeptDisplay() }
@@ -3043,24 +3046,30 @@ final class SessionManager {
     /// the panel awake, is not yet taken as a level set since, or nil when
     /// it may be: after the lid closed over the entry
     /// (`noteLidClosedOverKeptDisplay`), the first such 0 may still be the
-    /// closing lid's. It is timed, and only a 0 read `keptRecheckDelay` or
-    /// more after it decides, as the sampler waits 3 s after each open
-    /// before it reads the panel as the user's. Each reading that waits
-    /// sets the re-read going, so that later reading comes.
+    /// closing lid's. So may the first since a launch, which does not know
+    /// whether the lid closed over the entry before it, as after a quit or
+    /// a crash with the lid closed. It is timed, and only a 0 read
+    /// `keptRecheckDelay` or more after it decides, as the sampler waits
+    /// 3 s after each open before it reads the panel as the user's. Each
+    /// reading that waits sets the re-read going, so that later reading
+    /// comes.
     private func zeroSinceLidClosedWait() -> String? {
         let now = ContinuousClock.now
         switch lidOverKeptDisplay {
         case nil:
             return nil
+        case .launched:
+            lidOverKeptDisplay = .readZero(at: now, since: "since Insomnia launched")
+            return "at the first reading since Insomnia launched, which does not know whether the lid closed over it before"
         case .closed:
-            lidOverKeptDisplay = .readZero(at: now)
+            lidOverKeptDisplay = .readZero(at: now, since: "since the lid closed over it")
             return "at the first reading since the lid closed over it"
-        case .readZero(let at):
+        case .readZero(let at, let since):
             guard at.duration(to: now) < keptRecheckDelay else {
                 lidOverKeptDisplay = nil
                 return nil
             }
-            return "less than \(keptRecheckDelay) after the first reading of 0 since the lid closed over it"
+            return "less than \(keptRecheckDelay) after the first reading of 0 \(since)"
         }
     }
 
