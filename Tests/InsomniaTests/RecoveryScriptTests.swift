@@ -7446,7 +7446,10 @@ private final class ScriptFixture {
     /// it and keeps running until the test calls releaseCommand (or the
     /// fixture goes, or a 60 s watchdog), then writes command.ended. Both
     /// note an inherited fd 9 and record the pid in `sudo.hung.pid`, once
-    /// the SIGTERM trap is in place.
+    /// the SIGTERM trap and the watchdog's deadline are in place. A test
+    /// may signal the fake's process group as soon as the pid appears, and
+    /// a signal that killed the `date` setting the deadline would leave it
+    /// at 60, so the watchdog would end the fake at once.
     func sudoHangHere() -> String {
         """
         hang_on_term() {
@@ -7457,8 +7460,8 @@ private final class ScriptFixture {
           else
             trap 'echo "sudo SIGTERM" >> "$calls_log"' TERM
           fi
-          echo $$ > "\(root.path)/sudo.hung.pid"
           deadline=$(( $(date +%s) + 60 ))
+          echo $$ > "\(root.path)/sudo.hung.pid"
           while [[ ! -e "\(root.path)/release" && -d "\(root.path)" && $(date +%s) -lt $deadline ]]; do /bin/sleep 0.1; done
           if [[ -e "\(root.path)/release" ]]; then echo released > "\(root.path)/command.ended"
           elif [[ -d "\(root.path)" ]]; then echo watchdog > "\(root.path)/command.ended"; fi
