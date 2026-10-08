@@ -203,8 +203,42 @@ final class AppNapTests: XCTestCase {
 
     /// A journal that cannot be written means no preference write: the
     /// session still runs, the app's preferences are untouched, and the
-    /// failure is reported.
+    /// failure is reported. The journal becomes unwritable once the resume
+    /// has journaled its sleep guard and is holding sleep, because a resume
+    /// that cannot write the journal at all is refused (the next test).
     func testJournalWriteFailureMeansNoPreferenceWrite() async throws {
+        let now = h.clock.now
+        try h.store.saveSession(Session(startedAt: now, endsAt: now.addingTimeInterval(3600)))
+        var st = RuntimeState()
+        st.sleepDisabledByUs = true
+        try h.store.saveState(st)
+        let m = makeManager(optIn: true, agents: [chrome, terminal])
+        let file = h.home.paths.stateFile.path
+        let gate = AsyncGate()
+        h.guardFake.sleepGate = gate
+        defer { try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: file) }
+
+        let reconcile = Task { await m.reconcile() }
+        await gate.waitUntilStarted()
+        try FileManager.default.setAttributes([.immutable: true], ofItemAtPath: file)
+        await gate.open()
+        await reconcile.value
+        try FileManager.default.setAttributes([.immutable: false], ofItemAtPath: file)
+
+        XCTAssertTrue(m.isActive, "the session itself is unaffected")
+        XCTAssertEqual(h.appNap.writes.count, 0)
+        XCTAssertEqual(h.appNap.values, [:])
+        XCTAssertEqual(try h.store.loadState()?.appNapOverrides, [])
+        let err = try XCTUnwrap(m.lastError)
+        XCTAssertTrue(err.contains("could not journal the App Nap setting"), err)
+        XCTAssertTrue(err.contains("left unchanged"), err)
+    }
+
+    /// A journal that cannot be written when reconcile finds a valid
+    /// session means no resume at all, even with `sleepDisabledByUs`
+    /// already set. The write that fails is the one a resume needs, so
+    /// sleep is not held again and no preference is written.
+    func testUnwritableJournalAtReconcileResumesNothingAndWritesNoPreference() async throws {
         let now = h.clock.now
         try h.store.saveSession(Session(startedAt: now, endsAt: now.addingTimeInterval(3600)))
         var st = RuntimeState()
@@ -218,13 +252,13 @@ final class AppNapTests: XCTestCase {
         await m.reconcile()
         try FileManager.default.setAttributes([.immutable: false], ofItemAtPath: file)
 
-        XCTAssertTrue(m.isActive, "the session itself is unaffected")
+        XCTAssertFalse(m.isActive, "a session resumes only from a journal it can write")
+        XCTAssertFalse(h.guardFake.calls.contains("disablesleep 1"), "\(h.guardFake.calls)")
         XCTAssertEqual(h.appNap.writes.count, 0)
         XCTAssertEqual(h.appNap.values, [:])
         XCTAssertEqual(try h.store.loadState()?.appNapOverrides, [])
-        let err = try XCTUnwrap(m.lastError)
-        XCTAssertTrue(err.contains("could not journal the App Nap setting"), err)
-        XCTAssertTrue(err.contains("left unchanged"), err)
+        let log = (try? String(contentsOf: h.home.paths.logFile, encoding: .utf8)) ?? ""
+        XCTAssertTrue(log.contains("could not journal sleep guard"), log)
     }
 
     /// A preference write that fails after its entry was journaled keeps
