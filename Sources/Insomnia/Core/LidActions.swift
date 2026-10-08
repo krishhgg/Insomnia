@@ -195,10 +195,15 @@ final class LidActions {
     /// darkened, since the open would read the 0 left here as the darkening
     /// never undone and write the kept value. The display sleep request
     /// still goes, and is then the only thing that turns that panel off.
-    /// Such a value of 0 replaces the kept one only once a reading above 0
-    /// showed that entry's darkening undone
-    /// (`RuntimeState.keptDisplayReadLit`): before that, the 0 may still be
-    /// the darkening, and the kept value stays for the open to write.
+    /// A sample of 0, or the value owed after the mode at 0, replaces the
+    /// kept one only once a reading above 0 showed that entry's darkening
+    /// undone (`RuntimeState.keptDisplayReadLit`): before that, the 0 may
+    /// still be the darkening, and the kept value stays for the open to
+    /// write. A current read of 0 after such a reading is no level either:
+    /// auto-brightness may have pulled the panel down to it under the
+    /// closing lid. The entry is left undecided, as above, and the open
+    /// does not take a 0 it reads soon after as a level set since
+    /// (`SessionManager.noteLidClosedOverKeptDisplay`).
     /// The keyboard reads 0 when suppressed by display sleep, so it takes
     /// the current read if trusted now, else the last trusted sample, else
     /// nothing, since restoring 0 would leave the backlight off for good.
@@ -226,6 +231,9 @@ final class LidActions {
             } else if sampler?.displayReadIsTrusted ?? !display.isAsleep() {
                 value = current
                 doubt = manager.keptDisplayReadDoubt
+                if doubt == nil, current == 0, journaled.keptDisplayReadLitHolds {
+                    doubt = "with no sample, where auto-brightness under the closing lid may have pulled it down"
+                }
             } else {
                 value = current
                 doubt = "while dimmed or asleep"
@@ -238,8 +246,12 @@ final class LidActions {
                 // neither that reading nor the kept value is the level to
                 // come back to. Taken under the closing lid, maybe of a
                 // panel asleep, it shows no undone darkening either, so a
-                // 0 the open reads still gets the kept value.
+                // 0 the open reads still gets the kept value. After a
+                // reading above 0 that did show it, the open waits before
+                // it takes a 0 as set since: that 0 may still be the
+                // closing lid's.
                 Log.info("display brightness reads \(current) at the close \(doubt); the value kept after a refused restore, \(kept), stays journaled and undecided, and the display is not darkened, so the open reads it again")
+                manager.noteLidClosedOverKeptDisplay()
             } else {
                 try manager.journal { s in
                     // Keep an earlier save if a previous close was never
@@ -247,7 +259,9 @@ final class LidActions {
                     // the user's level above 0: the user was told to set it
                     // by hand, so that is the level to come back to. A 0
                     // is that level too once a reading above 0 showed the
-                    // darkening undone. The device answered, so the entry
+                    // darkening undone, if it is a sample or the value owed
+                    // after the mode: a current read of 0 then was left
+                    // undecided above. The device answered, so the entry
                     // is an ordinary one again.
                     if s.savedDisplayBrightness == nil || (s.displayRestoreRefused && (value > 0 || s.keptDisplayReadLitHolds)) {
                         s.savedDisplayBrightness = value

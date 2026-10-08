@@ -234,8 +234,17 @@ over it. That reading is journaled (`keptDisplayReadLit`), so it holds
 through relaunches and restarts, which do not darken the panel again.
 While a doubt above remains the entry waits; once none is left, the 0 is
 the level set since, and the entry is cleared without a write. A lid
-close that takes a trusted 0 then journals that 0 in place of the kept
-value. A reading at a lid close, under the closing lid or of a panel
+close with a sample of 0, or 0 as the value owed after the mode, then
+journals that 0 in place of the kept value. A current read of 0 at the
+close is no such level: auto-brightness may have pulled the panel down to
+it under the closing lid. The close leaves the entry flagged and the
+panel as it is, and only asks it to sleep. A 0 read after the lid was
+closed over the entry, by such a close or while a reading or re-read
+waited for the lid, may still be the closing lid's: the first one waits,
+and only a 0 read 3 s or more after it (`keptRecheckDelay`, the delay of
+the sampler's read after an open) is the level set since. That wait is
+held by the process alone, so a relaunch with the lid already open reads
+the panel without it. A reading at a lid close, under the closing lid or of a panel
 asleep, shows no such thing, and neither does a reading of an earlier
 entry: the record goes with its entry, as the record of the mode does. If
 state.json refuses the record, this process holds it and the next write

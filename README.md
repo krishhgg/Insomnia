@@ -245,7 +245,9 @@ been on over the saved display level, it leaves that level undecided until the
 Mac restarts, through relaunches of the app, and until then a lid close leaves
 that display lit and only asks it to sleep. Once it has seen that display lit
 above zero, it never writes the saved level over a zero you set by hand,
-also after a relaunch or a restart.
+also after a relaunch or a restart. A zero read as the lid closes, or right
+as it opens, may be auto-brightness rather than yours, so Insomnia reads the
+display again a few seconds later before it takes that zero as your level.
 The display comes back to the brightness sampled while the lid was open, not
 the reading at the moment of closing (auto-brightness has already dimmed the
 panel under the closing lid by then, and Low Power Mode rescales it), and if
