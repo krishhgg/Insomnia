@@ -18,25 +18,28 @@ enum AdministratorPromptError: Error, LocalizedError, Sendable {
     /// osascript exited non-zero for another reason: the password was wrong
     /// too many times, pmset itself failed (the root command's 1), or the
     /// command ended some other way (a signal, a status it never uses).
-    /// Any of these may have come after `disablesleep 1`.
+    /// The status alone cannot show whether any of these came after
+    /// `disablesleep 1`; the marker can (see `AdministratorPrompt.rootCommand`).
     case failed(status: Int32, stderr: String)
-    /// The password was accepted, but sudo did not confirm that the user
-    /// who pressed Start can turn sleep back on without a password (exit
-    /// 5): no usable uid came with it, root could not switch to that user,
-    /// or that user's sudo did not show a supported version, did not list
-    /// without a password, listed Defaults bound to a Runas user or a
-    /// command, or did not show /etc/sudoers.d/insomnia's restore line as
-    /// the matching rule. Every one of these comes before the command
-    /// writes anything.
+    /// The password was accepted, but the root command could not confirm
+    /// that the user who pressed Start can turn sleep back on without a
+    /// password (exit 5): no usable uid came with it, /etc/sudo.conf
+    /// exists, /etc/pam.d/sudo has session lines other than macOS's own,
+    /// root could not switch to that user, or that user's sudo is not
+    /// 1.9.17p2 with only the sudoers plugins, did not list without a
+    /// password, listed a Defaults entry the check does not accept, or did
+    /// not show /etc/sudoers.d/insomnia's restore line as the matching
+    /// rule. Every one of these comes before the command writes anything.
     case restoreNeedsPassword(stderr: String)
     /// The root command stopped before it wrote anything, and its exit
     /// status says why: the start was over (3); the session had ended,
     /// before the sudo checks, during them or while `pmset -g` was read
-    /// (4); or `pmset -g` showed a SleepDisabled 1 the start did not own,
-    /// or could not be read (6). Or lockf never started it: the marker was
-    /// gone (69) or stayed locked for 10 s (75). `rootStatus` is that
-    /// status, which osascript ends its error line with; osascript itself
-    /// exits 1.
+    /// (4); `pmset -g` showed a SleepDisabled 1 the start did not own, or
+    /// could not be read (6); or the record that the start went on to the
+    /// sleep setting could not be written to the marker (7). Or lockf
+    /// never started it: the marker was gone (69) or stayed locked for
+    /// 10 s (75). `rootStatus` is that status, which osascript ends its
+    /// error line with; osascript itself exits 1.
     case refused(rootStatus: Int32, stderr: String)
     case launchFailed(String)
 
@@ -46,8 +49,9 @@ enum AdministratorPromptError: Error, LocalizedError, Sendable {
     /// of which come before its only write. An undo would add nothing but a
     /// chance to clear a SleepDisabled 1 another tool set. Every other
     /// failure may have left `disablesleep 1` in place, so the caller
-    /// undoes it like an end. `AdministratorPrompt.rootCommand` says why a
-    /// refusal keeps its status even when the dialog's output is gone.
+    /// undoes it like an end, unless the marker shows that no command for
+    /// the start reached its write. `AdministratorPrompt.rootCommand` says
+    /// why a refusal keeps its status even when the dialog's output is gone.
     var nothingToUndo: Bool {
         switch self {
         case .cancelled, .launchFailed, .restoreNeedsPassword, .refused: true
@@ -71,7 +75,7 @@ enum AdministratorPromptError: Error, LocalizedError, Sendable {
             return "the administrator password prompt failed (osascript exited \(status))" + (detail.isEmpty ? "" : ": \(detail)")
         case let .restoreNeedsPassword(stderr):
             let detail = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
-            return "sleep was not turned off: sudo did not confirm that `sudo -n /usr/bin/pmset -a disablesleep 0` runs for you without a password" + (detail.isEmpty ? "" : " (\(detail))") + ", so a session could not end without you. Run scripts/install.sh again if /etc/sudoers.d/insomnia is missing or not in effect. The check also stops on a sudo older than 1.9.15 or one with other plugins, and on Defaults bound to a Runas user or a command"
+            return "sleep was not turned off: sudo did not confirm that `sudo -n /usr/bin/pmset -a disablesleep 0` runs for you without a password" + (detail.isEmpty ? "" : " (\(detail))") + ", so a session could not end without you. If /etc/sudoers.d/insomnia is missing or not in effect, run scripts/install.sh again. The check also stops on any sudo but 1.9.17p2, on an /etc/sudo.conf, on session lines in /etc/pam.d/sudo other than macOS's own, and on sudoers Defaults it does not accept. install.sh changes none of those, and the message above names the one found"
         case let .refused(status, stderr):
             let detail = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
             return "Insomnia did not turn sleep off (the command behind the password dialog stopped with status \(status) before it changed anything)" + (detail.isEmpty ? "" : ": \(detail)")
@@ -179,7 +183,10 @@ final class UnfinishedPrompt: @unchecked Sendable, CustomStringConvertible {
 /// sleep entry. Nor can an answer that comes after the session's end,
 /// `deadline`, leave sleep off: the root command compares it with the
 /// clock once it holds the lock, again after the sudo checks, and again
-/// right before its only write.
+/// right before its only write. Once past its checks, and before it reads
+/// or writes the sleep setting, the command replaces the nonce with
+/// `receipt`, so a marker still holding only the nonce shows that the
+/// command never got that far.
 struct PendingStart: Sendable, Equatable {
     let marker: URL
     let nonce: String
@@ -197,6 +204,10 @@ struct PendingStart: Sendable, Equatable {
     /// `sleepOffIsOurs` as the root command's `$5`: `1` skips its reads,
     /// anything else keeps them.
     var ownershipArgument: String { sleepOffIsOurs ? "1" : "0" }
+
+    /// What the root command writes over the nonce before it reads or
+    /// writes the sleep setting: `"$2 writing"` in its text.
+    var receipt: String { nonce + " writing" }
 }
 
 /// The one privileged command Insomnia cannot run without a password:
@@ -209,12 +220,14 @@ protocol AdministratorPromptRunning: Sendable {
     /// Returns once `pmset -a disablesleep 1` has run as root, which happens
     /// only while `start.marker` holds `start.nonce`, before
     /// `start.deadline`, once sudo has confirmed without running anything
-    /// that this user can run the restore without a password, and while
+    /// that this user can run the restore without a password, after
+    /// `<nonce> writing` has replaced the nonce in `start.marker`, and while
     /// `pmset -g` reads sleep on (unless `start.sleepOffIsOurs`). Throws an
     /// `AdministratorPromptError` when the dialog was cancelled, the
     /// password was wrong, the root command stopped before writing
     /// (`.refused`: the marker was gone or no longer matched, the deadline
-    /// had passed, or someone else's SleepDisabled 1 was found), sudo did
+    /// had passed, someone else's SleepDisabled 1 was found, or the marker
+    /// could not take the record), sudo did
     /// not confirm the restore (`.restoreNeedsPassword`), pmset failed,
     /// nothing came back in time, or the prompt's process would not stop
     /// (`.stillRunning`).
@@ -237,38 +250,63 @@ enum AdministratorPrompt {
     /// path, nonce, deadline, the uid of the user who pressed Start and
     /// whether the journal already owned a SleepDisabled 1 arrive only as
     /// `$1` to `$5`, and the marker's content is only compared, never run.
-    /// It writes once, as its last step: `pmset -a disablesleep 1`. Every
+    /// Root writes once, as its last step: `pmset -a disablesleep 1`. Every
     /// refusal comes before that write, so none leaves a change of the
     /// command's own, and the start rolls back without running pmset.
     ///
     /// It first ignores SIGPIPE: a refusal printed to a dialog whose output
     /// is gone then still exits with its own status instead of dying by the
-    /// signal, which lockf would report as 70 and the start would undo like
-    /// a failure. It sets `LC_ALL=C` for every tool it runs, all by
-    /// absolute path. Exit 3: the marker no longer holds the nonce (the
-    /// start was over before the password was accepted). Exit 4: the clock
-    /// (seconds since 1970) is not before the deadline, or `$3` is not a
-    /// number `[` can compare, which fails the test and so refuses too.
-    /// Exit 5: `$4` is not a positive whole number.
+    /// signal, which lockf would report as 70. It sets `LC_ALL=C` for every
+    /// tool it runs, all by absolute path. Exit 3: the marker no longer
+    /// holds the nonce (the start was over before the password was
+    /// accepted). Exit 4: the clock (seconds since 1970) is not before the
+    /// deadline, or `$3` is not a number `[` can compare, which fails the
+    /// test and so refuses too. Exit 5: `$4` is not a positive whole number.
     ///
-    /// Then sudo is asked, without running anything, whether the restore
-    /// every end and backstop.sh run, `sudo -n /usr/bin/pmset -a
-    /// disablesleep 0`, runs for that user without a password. Root drops
-    /// to the user with `sudo -n -u "#$4"` and starts the user's sudo with
-    /// an empty environment but `LC_ALL=C` and stdin from /dev/null. Exit 5,
-    /// with nothing written, unless all three answers are the ones
-    /// sudo 1.9.15 to 1.9.x prints for the rule install.sh writes:
+    /// Then it checks, without running anything, that the restore every end
+    /// and backstop.sh run, `sudo -n /usr/bin/pmset -a disablesleep 0`, runs
+    /// for that user without a password. A check that fails exits 5, with
+    /// nothing written. Root reads two files first:
     ///
-    /// - `sudo -V` shows `Sudo version 1.9.N` (N at least 15, an optional
-    ///   `pN`), `Sudoers policy plugin version` with the same version, a
-    ///   `Sudoers file grammar version` line, and at most the sudoers I/O
-    ///   and audit plugins' own lines after them. Anything else (another
-    ///   policy plugin, an approval plugin, which sudo consults only when a
-    ///   command runs, a version whose listing has not been checked) fails.
-    /// - `sudo -k -n -l` lists the user's rules without a password and
-    ///   shows no "Runas and Command-specific defaults" header: Defaults
-    ///   bound to a command (`Defaults!/usr/bin/pmset ...`) apply when the
-    ///   restore runs but not to a listing, so any such Defaults fail.
+    /// - /private/etc/sudo.conf must not exist in any form, a dangling link
+    ///   included. Apple's sudo reads plugins from that one path, compiled
+    ///   in, with no environment or command-line override, and without the
+    ///   file it uses its built-in sudoers policy, I/O and audit plugins.
+    ///   With the file it can load an approval plugin that prints no
+    ///   version line, so `sudo -V` and both listings look the same, and
+    ///   that plugin is consulted only when a command runs. macOS installs
+    ///   no sudo.conf.
+    /// - /private/etc/pam.d/sudo must have exactly one line that mentions a
+    ///   session, `session required pam_permit.so`, as macOS installs it.
+    ///   sudo opens a PAM session only to run a command, never for a
+    ///   listing, and a session module that failed would fail the restore.
+    ///
+    /// The rest ask sudo. Root drops to the user with `sudo -n -u "#$4"` and
+    /// starts the user's sudo with an empty environment but `LC_ALL=C` and
+    /// stdin from /dev/null. The answers must be the ones sudo 1.9.17p2
+    /// (Apple's sudo-114.100.11) prints for the rule install.sh writes. Only
+    /// that source was read for what a listing shares with running a
+    /// command, so any other version fails:
+    ///
+    /// - `sudo -V` shows `Sudo version 1.9.17p2`, `Sudoers policy plugin
+    ///   version 1.9.17p2`, `Sudoers file grammar version 50`, and at most
+    ///   the sudoers I/O and audit plugins' own lines after them.
+    /// - `sudo -k -n -l` lists the user's rules without a password, and each
+    ///   Defaults entry it shows for the user is one that cannot stop a
+    ///   NOPASSWD rule from running: env_reset, env_keep, env_check and
+    ///   env_delete, which only choose the environment pmset gets;
+    ///   log_allowed and log_denied, which only decide what goes to syslog;
+    ///   and lecture, lecture_file, passprompt, badpass_message,
+    ///   passwd_timeout, passwd_tries, timestamp_timeout, timestamp_type,
+    ///   tty_tickets, pwfeedback and insults, which sudo reads only when it
+    ///   asks for a password. Any other entry fails, and the message names
+    ///   it. So do Defaults bound to a Runas user or a command (the "Runas
+    ///   and Command-specific defaults" header), which apply when the
+    ///   restore runs but not to a listing, and a Defaults line with a
+    ///   backslash or a tab in it: sudo does not escape a backslash inside
+    ///   a quoted value, so such a line cannot be split back into entries
+    ///   with certainty. The listing goes to a pipe, so sudo prints all the
+    ///   user's Defaults on one line, unwrapped.
     /// - `sudo -k -n -ll /usr/bin/pmset -a disablesleep 0` exits 0 and
     ///   prints exactly the six lines of the matching rule: `Sudoers entry:`
     ///   /private/etc/sudoers.d/insomnia (or /etc/sudoers.d/insomnia),
@@ -288,30 +326,47 @@ enum AdministratorPrompt {
     ///
     /// The checks can take a while (sudo may look the user up in a
     /// directory service), so the clock is compared with the deadline again
-    /// after them (exit 4). Then root reads `pmset -g` itself, under the
-    /// marker's lock: another tool may have turned sleep off while the
-    /// password was typed. A SleepDisabled 1 (the first `SleepDisabled`
-    /// line with a value, as `PmsetSleepGuard.parseSleepDisabled` reads it),
-    /// or a `pmset -g` that fails, exits 6, and that tool's setting stays.
-    /// `$5` is `1` only when the journal already owned a 1 before this start
-    /// (an earlier restore failed); that 1 is Insomnia's own, so nothing is
-    /// read, as at Start. The clock is compared once more, right before the
-    /// write (exit 4). A session that ends in the moment between that last
-    /// comparison and the write ends at once, because the deadline timer
-    /// the start arms next fires immediately for a date in the past.
+    /// after them (exit 4). Then the command writes `<nonce> writing` over
+    /// the marker, as the user, through the same `sudo -n -u "#$4"`, so root
+    /// never writes into the user's folder itself. That is the record that
+    /// this start passed every check and may go on to read and write the
+    /// sleep setting; if it cannot be written, the command exits 7. Then
+    /// root reads `pmset -g` itself, under the marker's lock: another tool
+    /// may have turned sleep off while the password was typed. A
+    /// SleepDisabled 1 (the first `SleepDisabled` line with a value, as
+    /// `PmsetSleepGuard.parseSleepDisabled` reads it), or a `pmset -g` that
+    /// fails, exits 6, and that tool's setting stays. `$5` is `1` only when
+    /// the journal already owned a 1 before this start (an earlier restore
+    /// failed); that 1 is Insomnia's own, so nothing is read, as at Start.
+    /// The clock is compared once more, right before the write (exit 4). A
+    /// 6 or a 4 at this point first writes the bare nonce back, as the user.
+    /// A session that ends in the moment between the last comparison and
+    /// the write ends at once, because the deadline timer the start arms
+    /// next fires immediately for a date in the past.
+    ///
+    /// So when the app deletes the marker under its lock and finds the file
+    /// it wrote still holding only the nonce, no command for this start
+    /// reached its write, and none can any more. The app reads that after a
+    /// failure whose status it cannot trust (a lost answer, a signal, a
+    /// timeout) and then rolls back without an undo, which would clear a
+    /// SleepDisabled 1 another tool set meanwhile (SessionManager). Anything
+    /// else, the record included, is undone like an end.
     ///
     /// What this cannot do: pmset has one SleepDisabled setting and no
     /// compare-and-set, so a 1 another tool sets in the moment between
     /// root's read of 0 and its write cannot be told from Insomnia's own,
     /// and the session's end sets it to 0, as it does for a 1 another tool
-    /// sets during a session. A listing is not the restore: a rule removed
-    /// after the check, a log sudo cannot write when the command runs, or
-    /// other groups for the user when the app or backstop.sh runs sudo than
-    /// when root switched to that user, can still make a later restore
-    /// fail, and backstop.sh then keeps the journal entry and retries.
-    /// pmset is not `exec`ed, so its own exit status can never read as 3 to
-    /// 6.
-    static let rootCommand = ##"trap '' PIPE; LC_ALL=C; export LC_ALL; m=$(/usr/bin/head -c 64 "$1" 2>/dev/null); if [ -z "$2" ] || [ "$m" != "$2" ]; then echo "the start that asked for this password is over; sleep was not turned off" >&2; exit 3; fi; late() { ! [ "$(/bin/date +%s)" -lt "$1" ] 2>/dev/null; }; if late "$3"; then echo "the session this password was for has already ended; sleep was not turned off" >&2; exit 4; fi; if ! [ "$4" -gt 0 ] 2>/dev/null; then echo "no user id came with the password, so sudo could not be asked whether sleep can be turned back on without one; sleep was not turned off" >&2; exit 5; fi; w=$4; q() { /usr/bin/sudo -n -u "#$w" /usr/bin/env -i LC_ALL=C /usr/bin/sudo "$@" </dev/null; }; v=$(q -V) && printf %s "$v" | /usr/bin/awk 'NR == 1 { k = $0 ~ /^Sudo version 1[.]9[.][0-9]+(p[0-9]+)?$/ && substr($0, 18) + 0 >= 15; v = substr($0, 14); next }; NR == 2 { k = k && $0 == "Sudoers policy plugin version " v; next }; NR == 3 { k = k && $0 ~ /^Sudoers file grammar version [0-9]+$/; next }; $0 == "Sudoers I/O plugin version " v && !i && !a { i = 1; next }; $0 == "Sudoers audit plugin version " v && !a { a = 1; next }; { k = 0 }; END { exit !(k && NR >= 3) }' || { echo "sudo -V, run as this user, failed or does not show sudo 1.9.15 or later with only the sudoers plugins, the only sudo whose answers this check can read; sleep was not turned off" >&2; exit 5; }; l=$(q -k -n -l) && printf %s "$l" | /usr/bin/awk 'index($0, "Runas and Command-specific defaults for ") == 1 { exit 1 }' || { echo "sudo -k -n -l did not list this user's sudoers rules without a password, or listed Runas or command-specific Defaults, which apply to the restore but not to this check; sleep was not turned off" >&2; exit 5; }; r=$(q -k -n -ll /usr/bin/pmset -a disablesleep 0) && printf %s "$r" | /usr/bin/awk 'BEGIN { c = "/usr/bin/pmset -a disablesleep 0" }; NR == 1 { k = $0 == "Sudoers entry: /private/etc/sudoers.d/insomnia" || $0 == "Sudoers entry: /etc/sudoers.d/insomnia" }; NR == 2 { k = k && $0 == "    RunAsUsers: root" }; NR == 3 { k = k && $0 == "    Options: !authenticate" }; NR == 4 { k = k && $0 == "    Commands:" }; NR == 5 { k = k && $0 == sprintf("%c", 9) c }; NR == 6 { k = k && $0 == "    Matched: " c }; END { exit !(k && NR == 6) }' || { echo "sudo -k -n -ll does not show the rule in /etc/sudoers.d/insomnia that lets this user turn sleep back on as root without a password; sleep was not turned off" >&2; exit 5; }; if late "$3"; then echo "the session this password was for ended while sudo was asked about the restore; sleep was not turned off" >&2; exit 4; fi; foreign() { [ "$1" != 1 ] && { s=$(/usr/bin/pmset -g) || return 0; [ "$(printf %s "$s" | /usr/bin/awk '$1 == "SleepDisabled" && NF > 1 { print $2; exit }')" = 1 ]; }; }; if foreign "$5"; then echo "pmset -g shows a SleepDisabled 1 this start did not set, or could not be read; it was left alone and sleep was not turned off" >&2; exit 6; fi; if late "$3"; then echo "the session this password was for ended while pmset -g was read; sleep was not turned off" >&2; exit 4; fi; /usr/bin/pmset -a disablesleep 1 || exit 1"##
+    /// sets during a session. A failure after the record is undone even
+    /// when it came before the write, and recovery after a crash or a
+    /// relaunch does not read the record at all, so either can still clear
+    /// such a 1. A process running as the user can write the marker too,
+    /// and could forge or erase the record. A listing is not the restore: a
+    /// rule removed, a sudo.conf or PAM change, or a host name or group
+    /// membership that changes which Defaults apply, after the check, can
+    /// still make a later restore fail, and backstop.sh then keeps the
+    /// journal entry and retries. pmset is not `exec`ed, so its own exit
+    /// status can never read as 3 to 7.
+    static let rootCommand = ##"trap '' PIPE; LC_ALL=C; export LC_ALL; m=$(/usr/bin/head -c 64 "$1" 2>/dev/null); if [ -z "$2" ] || [ "$m" != "$2" ]; then echo "the start that asked for this password is over; sleep was not turned off" >&2; exit 3; fi; late() { ! [ "$(/bin/date +%s)" -lt "$1" ] 2>/dev/null; }; if late "$3"; then echo "the session this password was for has already ended; sleep was not turned off" >&2; exit 4; fi; if ! [ "$4" -gt 0 ] 2>/dev/null; then echo "no user id came with the password, so sudo could not be asked whether sleep can be turned back on without one; sleep was not turned off" >&2; exit 5; fi; c=/private/etc/sudo.conf; if [ -e "$c" ] || [ -L "$c" ]; then echo "/etc/sudo.conf exists. sudo -V does not list every plugin that file can load, and an approval plugin can show nothing there and still refuse the restore, so this check works only with sudo's built-in plugins and no /etc/sudo.conf; sleep was not turned off" >&2; exit 5; fi; /usr/bin/awk '$1 !~ /^#/ && tolower($0) ~ /session/ { n++; k = $1 == "session" && $2 == "required" && $3 == "pam_permit.so" && NF == 3 }; END { exit !(n == 1 && k) }' /private/etc/pam.d/sudo 2>/dev/null || { echo "/etc/pam.d/sudo could not be read, or its session lines are not macOS's own single session required pam_permit.so. sudo runs them for the restore but not for a listing, so this check cannot tell whether the restore runs; sleep was not turned off" >&2; exit 5; }; w=$4; u() { /usr/bin/sudo -n -u "#$w" /usr/bin/env -i LC_ALL=C "$@" </dev/null; }; q() { u /usr/bin/sudo "$@"; }; v=$(q -V) && printf %s "$v" | /usr/bin/awk 'BEGIN { v = "1.9.17p2" }; NR == 1 { k = $0 == "Sudo version " v; next }; NR == 2 { k = k && $0 == "Sudoers policy plugin version " v; next }; NR == 3 { k = k && $0 == "Sudoers file grammar version 50"; next }; $0 == "Sudoers I/O plugin version " v && !i && !a { i = 1; next }; $0 == "Sudoers audit plugin version " v && !a { a = 1; next }; { k = 0 }; END { exit !(k && NR >= 3) }' || { echo "sudo -V, run as this user, failed or does not show sudo 1.9.17p2 with only the sudoers plugins. This check follows how sudo 1.9.17p2 lists and runs commands, and another version needs an Insomnia release checked against it; sleep was not turned off" >&2; exit 5; }; l=$(q -k -n -l) || { echo "sudo -k -n -l did not list this user's sudoers rules without a password; sleep was not turned off" >&2; exit 5; }; d=$(printf %s "$l" | /usr/bin/awk 'function ok(e, n, o) { o = ""; n = e; if (match(n, /[-+]?=/)) { o = substr(n, RSTART, RLENGTH); n = substr(n, 1, RSTART - 1) }; if (n ~ /^!/) return (o == "" && index(" env_reset env_keep env_check env_delete lecture lecture_file log_allowed log_denied passprompt badpass_message passwd_timeout passwd_tries timestamp_timeout timestamp_type tty_tickets pwfeedback insults ", " " substr(n, 2) " ") > 0); if (o == "") return (index(" env_reset lecture log_allowed log_denied tty_tickets pwfeedback insults ", " " n " ") > 0); if (o != "=") return (index(" env_keep env_check env_delete ", " " n " ") > 0); return (index(" env_keep env_check env_delete lecture lecture_file passprompt badpass_message passwd_timeout passwd_tries timestamp_timeout timestamp_type ", " " n " ") > 0) }; NR == 1 && index($0, "Matching Defaults entries for ") == 1 { s = 1; next }; s == 1 { s = 2; t = $0; if (substr(t, 1, 4) != "    " || index(t, sprintf("%c", 92)) || index(t, sprintf("%c", 9))) { print "a backslash, a tab or a layout it cannot read"; f = 1; exit }; t = substr(t, 5); while (1) { if (!match(t, /^!?[a-z_]+([-+]?=("[^"]*"|[^ ",:=#]*))?/)) { print substr(t, 1, 80); f = 1; exit }; e = substr(t, 1, RLENGTH); t = substr(t, RLENGTH + 1); if (!ok(e)) { print substr(e, 1, 80); f = 1; exit }; if (t == "") break; if (substr(t, 1, 2) != ", ") { print substr(t, 1, 80); f = 1; exit }; t = substr(t, 3) }; next }; s == 2 { if ($0 != "") { print "a layout it cannot read"; f = 1; exit }; s = 3; next }; index($0, "Runas and Command-specific defaults for ") == 1 { print "Defaults bound to a Runas user or a command, which apply to the restore but not to a listing"; f = 1; exit }; index($0, "Matching Defaults entries for ") == 1 { print "a layout it cannot read"; f = 1; exit }; END { exit f || s == 1 || s == 2 }') || { echo "sudo -k -n -l shows a Defaults entry this check does not accept: ${d:-output it cannot read}. Settings like that can make the restore fail where a listing does not; sleep was not turned off" >&2; exit 5; }; r=$(q -k -n -ll /usr/bin/pmset -a disablesleep 0) && printf %s "$r" | /usr/bin/awk 'BEGIN { c = "/usr/bin/pmset -a disablesleep 0" }; NR == 1 { k = $0 == "Sudoers entry: /private/etc/sudoers.d/insomnia" || $0 == "Sudoers entry: /etc/sudoers.d/insomnia" }; NR == 2 { k = k && $0 == "    RunAsUsers: root" }; NR == 3 { k = k && $0 == "    Options: !authenticate" }; NR == 4 { k = k && $0 == "    Commands:" }; NR == 5 { k = k && $0 == sprintf("%c", 9) c }; NR == 6 { k = k && $0 == "    Matched: " c }; END { exit !(k && NR == 6) }' || { echo "sudo -k -n -ll does not show the rule in /etc/sudoers.d/insomnia that lets this user turn sleep back on as root without a password; sleep was not turned off" >&2; exit 5; }; if late "$3"; then echo "the session this password was for ended while sudo was asked about the restore; sleep was not turned off" >&2; exit 4; fi; put() { u /bin/sh -c 'printf %s "$2" > "$1"' put "$1" "$2"; }; put "$1" "$2 writing" || { echo "the marker could not be changed, as this user, to record that this start went on to read and write the sleep setting; sleep was not turned off" >&2; exit 7; }; foreign() { [ "$1" != 1 ] && { s=$(/usr/bin/pmset -g) || return 0; [ "$(printf %s "$s" | /usr/bin/awk '$1 == "SleepDisabled" && NF > 1 { print $2; exit }')" = 1 ]; }; }; if foreign "$5"; then put "$1" "$2"; echo "pmset -g shows a SleepDisabled 1 this start did not set, or could not be read; it was left alone and sleep was not turned off" >&2; exit 6; fi; if late "$3"; then put "$1" "$2"; echo "the session this password was for ended while pmset -g was read; sleep was not turned off" >&2; exit 4; fi; /usr/bin/pmset -a disablesleep 1 || exit 1"##
     /// The whole AppleScript, as one literal: `markerLock`, `rootCommand`
     /// (each `"` escaped for AppleScript), the privilege flag and the
     /// dialog text are fixed at compile time. Its only inputs are the
@@ -322,7 +377,7 @@ enum AdministratorPrompt {
     /// the command that runs as root.
     static let disableSleepScript = #"""
     on run argv
-    do shell script "/usr/bin/lockf -k -n -t 10 " & quoted form of (item 1 of argv) & " /bin/sh -c " & quoted form of "trap '' PIPE; LC_ALL=C; export LC_ALL; m=$(/usr/bin/head -c 64 \"$1\" 2>/dev/null); if [ -z \"$2\" ] || [ \"$m\" != \"$2\" ]; then echo \"the start that asked for this password is over; sleep was not turned off\" >&2; exit 3; fi; late() { ! [ \"$(/bin/date +%s)\" -lt \"$1\" ] 2>/dev/null; }; if late \"$3\"; then echo \"the session this password was for has already ended; sleep was not turned off\" >&2; exit 4; fi; if ! [ \"$4\" -gt 0 ] 2>/dev/null; then echo \"no user id came with the password, so sudo could not be asked whether sleep can be turned back on without one; sleep was not turned off\" >&2; exit 5; fi; w=$4; q() { /usr/bin/sudo -n -u \"#$w\" /usr/bin/env -i LC_ALL=C /usr/bin/sudo \"$@\" </dev/null; }; v=$(q -V) && printf %s \"$v\" | /usr/bin/awk 'NR == 1 { k = $0 ~ /^Sudo version 1[.]9[.][0-9]+(p[0-9]+)?$/ && substr($0, 18) + 0 >= 15; v = substr($0, 14); next }; NR == 2 { k = k && $0 == \"Sudoers policy plugin version \" v; next }; NR == 3 { k = k && $0 ~ /^Sudoers file grammar version [0-9]+$/; next }; $0 == \"Sudoers I/O plugin version \" v && !i && !a { i = 1; next }; $0 == \"Sudoers audit plugin version \" v && !a { a = 1; next }; { k = 0 }; END { exit !(k && NR >= 3) }' || { echo \"sudo -V, run as this user, failed or does not show sudo 1.9.15 or later with only the sudoers plugins, the only sudo whose answers this check can read; sleep was not turned off\" >&2; exit 5; }; l=$(q -k -n -l) && printf %s \"$l\" | /usr/bin/awk 'index($0, \"Runas and Command-specific defaults for \") == 1 { exit 1 }' || { echo \"sudo -k -n -l did not list this user's sudoers rules without a password, or listed Runas or command-specific Defaults, which apply to the restore but not to this check; sleep was not turned off\" >&2; exit 5; }; r=$(q -k -n -ll /usr/bin/pmset -a disablesleep 0) && printf %s \"$r\" | /usr/bin/awk 'BEGIN { c = \"/usr/bin/pmset -a disablesleep 0\" }; NR == 1 { k = $0 == \"Sudoers entry: /private/etc/sudoers.d/insomnia\" || $0 == \"Sudoers entry: /etc/sudoers.d/insomnia\" }; NR == 2 { k = k && $0 == \"    RunAsUsers: root\" }; NR == 3 { k = k && $0 == \"    Options: !authenticate\" }; NR == 4 { k = k && $0 == \"    Commands:\" }; NR == 5 { k = k && $0 == sprintf(\"%c\", 9) c }; NR == 6 { k = k && $0 == \"    Matched: \" c }; END { exit !(k && NR == 6) }' || { echo \"sudo -k -n -ll does not show the rule in /etc/sudoers.d/insomnia that lets this user turn sleep back on as root without a password; sleep was not turned off\" >&2; exit 5; }; if late \"$3\"; then echo \"the session this password was for ended while sudo was asked about the restore; sleep was not turned off\" >&2; exit 4; fi; foreign() { [ \"$1\" != 1 ] && { s=$(/usr/bin/pmset -g) || return 0; [ \"$(printf %s \"$s\" | /usr/bin/awk '$1 == \"SleepDisabled\" && NF > 1 { print $2; exit }')\" = 1 ]; }; }; if foreign \"$5\"; then echo \"pmset -g shows a SleepDisabled 1 this start did not set, or could not be read; it was left alone and sleep was not turned off\" >&2; exit 6; fi; if late \"$3\"; then echo \"the session this password was for ended while pmset -g was read; sleep was not turned off\" >&2; exit 4; fi; /usr/bin/pmset -a disablesleep 1 || exit 1" & " insomnia " & quoted form of (item 1 of argv) & " " & quoted form of (item 2 of argv) & " " & quoted form of (item 3 of argv) & " " & quoted form of (item 4 of argv) & " " & quoted form of (item 5 of argv) with administrator privileges with prompt "Insomnia needs your password to turn off system sleep for this session."
+    do shell script "/usr/bin/lockf -k -n -t 10 " & quoted form of (item 1 of argv) & " /bin/sh -c " & quoted form of "trap '' PIPE; LC_ALL=C; export LC_ALL; m=$(/usr/bin/head -c 64 \"$1\" 2>/dev/null); if [ -z \"$2\" ] || [ \"$m\" != \"$2\" ]; then echo \"the start that asked for this password is over; sleep was not turned off\" >&2; exit 3; fi; late() { ! [ \"$(/bin/date +%s)\" -lt \"$1\" ] 2>/dev/null; }; if late \"$3\"; then echo \"the session this password was for has already ended; sleep was not turned off\" >&2; exit 4; fi; if ! [ \"$4\" -gt 0 ] 2>/dev/null; then echo \"no user id came with the password, so sudo could not be asked whether sleep can be turned back on without one; sleep was not turned off\" >&2; exit 5; fi; c=/private/etc/sudo.conf; if [ -e \"$c\" ] || [ -L \"$c\" ]; then echo \"/etc/sudo.conf exists. sudo -V does not list every plugin that file can load, and an approval plugin can show nothing there and still refuse the restore, so this check works only with sudo's built-in plugins and no /etc/sudo.conf; sleep was not turned off\" >&2; exit 5; fi; /usr/bin/awk '$1 !~ /^#/ && tolower($0) ~ /session/ { n++; k = $1 == \"session\" && $2 == \"required\" && $3 == \"pam_permit.so\" && NF == 3 }; END { exit !(n == 1 && k) }' /private/etc/pam.d/sudo 2>/dev/null || { echo \"/etc/pam.d/sudo could not be read, or its session lines are not macOS's own single session required pam_permit.so. sudo runs them for the restore but not for a listing, so this check cannot tell whether the restore runs; sleep was not turned off\" >&2; exit 5; }; w=$4; u() { /usr/bin/sudo -n -u \"#$w\" /usr/bin/env -i LC_ALL=C \"$@\" </dev/null; }; q() { u /usr/bin/sudo \"$@\"; }; v=$(q -V) && printf %s \"$v\" | /usr/bin/awk 'BEGIN { v = \"1.9.17p2\" }; NR == 1 { k = $0 == \"Sudo version \" v; next }; NR == 2 { k = k && $0 == \"Sudoers policy plugin version \" v; next }; NR == 3 { k = k && $0 == \"Sudoers file grammar version 50\"; next }; $0 == \"Sudoers I/O plugin version \" v && !i && !a { i = 1; next }; $0 == \"Sudoers audit plugin version \" v && !a { a = 1; next }; { k = 0 }; END { exit !(k && NR >= 3) }' || { echo \"sudo -V, run as this user, failed or does not show sudo 1.9.17p2 with only the sudoers plugins. This check follows how sudo 1.9.17p2 lists and runs commands, and another version needs an Insomnia release checked against it; sleep was not turned off\" >&2; exit 5; }; l=$(q -k -n -l) || { echo \"sudo -k -n -l did not list this user's sudoers rules without a password; sleep was not turned off\" >&2; exit 5; }; d=$(printf %s \"$l\" | /usr/bin/awk 'function ok(e, n, o) { o = \"\"; n = e; if (match(n, /[-+]?=/)) { o = substr(n, RSTART, RLENGTH); n = substr(n, 1, RSTART - 1) }; if (n ~ /^!/) return (o == \"\" && index(\" env_reset env_keep env_check env_delete lecture lecture_file log_allowed log_denied passprompt badpass_message passwd_timeout passwd_tries timestamp_timeout timestamp_type tty_tickets pwfeedback insults \", \" \" substr(n, 2) \" \") > 0); if (o == \"\") return (index(\" env_reset lecture log_allowed log_denied tty_tickets pwfeedback insults \", \" \" n \" \") > 0); if (o != \"=\") return (index(\" env_keep env_check env_delete \", \" \" n \" \") > 0); return (index(\" env_keep env_check env_delete lecture lecture_file passprompt badpass_message passwd_timeout passwd_tries timestamp_timeout timestamp_type \", \" \" n \" \") > 0) }; NR == 1 && index($0, \"Matching Defaults entries for \") == 1 { s = 1; next }; s == 1 { s = 2; t = $0; if (substr(t, 1, 4) != \"    \" || index(t, sprintf(\"%c\", 92)) || index(t, sprintf(\"%c\", 9))) { print \"a backslash, a tab or a layout it cannot read\"; f = 1; exit }; t = substr(t, 5); while (1) { if (!match(t, /^!?[a-z_]+([-+]?=(\"[^\"]*\"|[^ \",:=#]*))?/)) { print substr(t, 1, 80); f = 1; exit }; e = substr(t, 1, RLENGTH); t = substr(t, RLENGTH + 1); if (!ok(e)) { print substr(e, 1, 80); f = 1; exit }; if (t == \"\") break; if (substr(t, 1, 2) != \", \") { print substr(t, 1, 80); f = 1; exit }; t = substr(t, 3) }; next }; s == 2 { if ($0 != \"\") { print \"a layout it cannot read\"; f = 1; exit }; s = 3; next }; index($0, \"Runas and Command-specific defaults for \") == 1 { print \"Defaults bound to a Runas user or a command, which apply to the restore but not to a listing\"; f = 1; exit }; index($0, \"Matching Defaults entries for \") == 1 { print \"a layout it cannot read\"; f = 1; exit }; END { exit f || s == 1 || s == 2 }') || { echo \"sudo -k -n -l shows a Defaults entry this check does not accept: ${d:-output it cannot read}. Settings like that can make the restore fail where a listing does not; sleep was not turned off\" >&2; exit 5; }; r=$(q -k -n -ll /usr/bin/pmset -a disablesleep 0) && printf %s \"$r\" | /usr/bin/awk 'BEGIN { c = \"/usr/bin/pmset -a disablesleep 0\" }; NR == 1 { k = $0 == \"Sudoers entry: /private/etc/sudoers.d/insomnia\" || $0 == \"Sudoers entry: /etc/sudoers.d/insomnia\" }; NR == 2 { k = k && $0 == \"    RunAsUsers: root\" }; NR == 3 { k = k && $0 == \"    Options: !authenticate\" }; NR == 4 { k = k && $0 == \"    Commands:\" }; NR == 5 { k = k && $0 == sprintf(\"%c\", 9) c }; NR == 6 { k = k && $0 == \"    Matched: \" c }; END { exit !(k && NR == 6) }' || { echo \"sudo -k -n -ll does not show the rule in /etc/sudoers.d/insomnia that lets this user turn sleep back on as root without a password; sleep was not turned off\" >&2; exit 5; }; if late \"$3\"; then echo \"the session this password was for ended while sudo was asked about the restore; sleep was not turned off\" >&2; exit 4; fi; put() { u /bin/sh -c 'printf %s \"$2\" > \"$1\"' put \"$1\" \"$2\"; }; put \"$1\" \"$2 writing\" || { echo \"the marker could not be changed, as this user, to record that this start went on to read and write the sleep setting; sleep was not turned off\" >&2; exit 7; }; foreign() { [ \"$1\" != 1 ] && { s=$(/usr/bin/pmset -g) || return 0; [ \"$(printf %s \"$s\" | /usr/bin/awk '$1 == \"SleepDisabled\" && NF > 1 { print $2; exit }')\" = 1 ]; }; }; if foreign \"$5\"; then put \"$1\" \"$2\"; echo \"pmset -g shows a SleepDisabled 1 this start did not set, or could not be read; it was left alone and sleep was not turned off\" >&2; exit 6; fi; if late \"$3\"; then put \"$1\" \"$2\"; echo \"the session this password was for ended while pmset -g was read; sleep was not turned off\" >&2; exit 4; fi; /usr/bin/pmset -a disablesleep 1 || exit 1" & " insomnia " & quoted form of (item 1 of argv) & " " & quoted form of (item 2 of argv) & " " & quoted form of (item 3 of argv) & " " & quoted form of (item 4 of argv) & " " & quoted form of (item 5 of argv) with administrator privileges with prompt "Insomnia needs your password to turn off system sleep for this session."
     end run
     """#
     /// The user is typing a password, so the limit is generous. At the
@@ -389,12 +444,12 @@ struct OsascriptAdministratorPrompt: AdministratorPromptRunning {
     }
 
     /// The exits that mean the root command stopped before its only write
-    /// (`AdministratorPromptError.refused`): its own 3, 4 and 6, and
+    /// (`AdministratorPromptError.refused`): its own 3, 4, 6 and 7, and
     /// lockf's 69 (no marker) and 75 (the marker stayed locked), for which
     /// it never started. None of them can come from pmset, whose failure
     /// the command turns into 1, or from a signal, which lockf reports as
     /// 70. 5 is `isRestoreRefusal`.
-    static let refusalStatuses: Set<Int32> = [3, 4, 6, 69, 75]
+    static let refusalStatuses: Set<Int32> = [3, 4, 6, 7, 69, 75]
 
     /// The status osascript ends its error line with, `(<status>)`, when it
     /// is a positive whole number: the exit status of the command `do shell

@@ -1206,7 +1206,7 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(r.status, 1, r.stderr)
         XCTAssertEqual(fx.calls(), ["sudo -n \(fx.fakePmset) -a disablesleep 0"], "sleep itself is still restored")
         XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, true, "the entry stays while the command may still turn sleep off")
-        XCTAssertEqual(try String(contentsOf: fx.pendingStart, encoding: .utf8), nonce)
+        XCTAssertEqual(try String(contentsOf: fx.pendingStart, encoding: .utf8), nonce + " writing", "the marker, holding the command's record, stays")
         XCTAssertTrue(fx.log().contains("still locked after 1s by the command a password dialog started as root"), fx.log())
         XCTAssertTrue(fx.log().contains("journal kept dirty"), fx.log())
 

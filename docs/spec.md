@@ -115,18 +115,37 @@ recovery; newly written journals use `frozenProcesses`.
   1970, rounded down), the user's uid and whether the journal already
   claimed a `SleepDisabled 1` before this start (`1` or `0`) are the
   script's only inputs, passed as positional parameters; the root command
-  runs under `lockf` on the marker and runs pmset only while the marker
-  holds the nonce and `/bin/date +%s` is below `endsAt` (section 8). A
+  runs under `lockf` on the marker, keeps its lock from the nonce check
+  until pmset exits, and runs pmset only if the marker held the nonce at
+  that check and `/bin/date +%s` is below `endsAt` (section 8). A
   uid that is not a positive number exits 5 before anything runs. Before
-  it writes anything, the command asks sudo whether the end can turn
-  sleep back on with no password. Root runs `/usr/bin/sudo -n -u
-  "#<uid>" /usr/bin/env -i LC_ALL=C /usr/bin/sudo ...` three times, with
-  stdin from /dev/null; sudo never asks root for a password, and macOS's
-  default `root ALL = (ALL) ALL` lets root run it as the user. `sudo -V`
-  must show sudo 1.9.15 or later with the sudoers policy plugin and only
-  sudoers' own I/O and audit plugins besides it. `sudo -k -n -l` must
-  list without a password and show no Runas or command-specific Defaults,
-  which apply when the restore runs but not to a listing. `sudo -k -n -ll
+  it writes anything, the command checks whether the end can turn sleep
+  back on with no password. As root it first exits 5 when
+  `/private/etc/sudo.conf` exists in any form: Apple's sudo loads plugins
+  only from that compiled-in path, and an approval plugin there can print
+  nothing in `sudo -V` and refuse only a command that runs. It also exits
+  5 when `/private/etc/pam.d/sudo` cannot be read or has any uncommented
+  session line but macOS's single `session required pam_permit.so`,
+  since sudo opens a PAM session only to run a command. Root then runs
+  `/usr/bin/sudo -n -u "#<uid>" /usr/bin/env -i LC_ALL=C /usr/bin/sudo
+  ...` three times, with stdin from /dev/null; sudo never asks root for a
+  password, and macOS's default `root ALL = (ALL) ALL` lets root run it
+  as the user. The answers are read as sudo 1.9.17p2 prints them, the
+  sudo in macOS 26.2 (Apple's sudo-114.100.11), the only source read for
+  what a listing shares with running a command. `sudo -V` must show
+  exactly `Sudo version 1.9.17p2`, the sudoers policy plugin 1.9.17p2,
+  grammar version 50, and after them nothing but the sudoers I/O and
+  audit plugins' own lines. `sudo -k -n -l` must list without a
+  password, show no Runas or command-specific Defaults (they apply when
+  the restore runs but not to a listing), and show only Defaults entries
+  from a list of settings that cannot stop a NOPASSWD rule from running:
+  env_reset, env_keep, env_check, env_delete, log_allowed, log_denied,
+  and settings sudo reads only when it asks for a password (lecture,
+  lecture_file, passprompt, badpass_message, passwd_timeout,
+  passwd_tries, timestamp_timeout, timestamp_type, tty_tickets,
+  pwfeedback, insults). Any other entry, such as `log_output`, exits 5
+  and the message names it; so does a Defaults line with a backslash or
+  a tab. `sudo -k -n -ll
   /usr/bin/pmset -a disablesleep 0` must print exactly six lines: the
   entry from /etc/sudoers.d/insomnia (`/private/etc/...` or `/etc/...`),
   `RunAsUsers: root`, `Options: !authenticate`, `Commands:`, the restore
@@ -136,20 +155,26 @@ recovery; newly written journals use `frozenProcesses`.
   refuses. `-k` ignores a cached credential and `-n` fails instead of
   prompting. None of the three runs a command; a generic `sudo -l`,
   `sudo -v`, a listing's exit status alone, or a search for NOPASSWD is
-  never taken as proof. Any failed query, any other version, plugin or
-  output, output cut short, and a `listpw` that wants a password exit 5
-  with nothing changed (`AdministratorPromptError.restoreNeedsPassword`,
-  which tells the user to run `scripts/install.sh` again). Then
-  `/bin/date +%s` is compared with `endsAt` (exit 4 once it has passed),
-  and the command reads `pmset -g` itself, as root and under the marker's
-  lock, because another tool may have turned sleep off while the password
-  was typed: a `SleepDisabled 1` (read the way
+  never taken as proof. Any failed file check or query, any other
+  version, plugin, Defaults entry or output, output cut short, and a
+  `listpw` that wants a password exit 5 with nothing changed
+  (`AdministratorPromptError.restoreNeedsPassword`, whose message names
+  the check and says `scripts/install.sh` fixes only a missing rule).
+  Then `/bin/date +%s` is compared with `endsAt` (exit 4 once it has
+  passed). Next the command writes `<nonce> writing` over the marker, as
+  the user, through the same `sudo -n -u "#<uid>"` and `env -i`, so root
+  never writes into the user's folder. That record says this start passed
+  every check and may read and write the sleep setting; a write that
+  fails exits 7. The command then reads `pmset -g` itself, as root and
+  under the marker's lock, because another tool may have turned sleep off
+  while the password was typed: a `SleepDisabled 1` (read the way
   `PmsetSleepGuard.parseSleepDisabled` reads it) or a read that fails
   exits 6 with nothing changed. Only when the journal claimed the 1
   before this start is nothing read, as at Start. The clock is compared
   once more right before the write (exit 4), so a deadline reached during
-  any query or the read, at its very second or later, stops it. Only
-  then does root run `/usr/bin/pmset -a disablesleep 1` (the change the
+  any query or the read, at its very second or later, stops it. A 6 or a
+  4 after the record first writes the bare nonce back. Only then does
+  root run `/usr/bin/pmset -a disablesleep 1` (the change the
   start journaled before the dialog), the command's only write; if it
   fails, the command exits 1. The command ignores SIGPIPE, so a refusal
   keeps its status when the dialog's output is gone, and no query has a
@@ -163,37 +188,46 @@ recovery; newly written journals use `frozenProcesses`.
   1 leaves no trace. A `SleepDisabled 1` another tool sets between the
   root command's read and its `disablesleep 1` (the time pmset takes to
   start) is taken for Insomnia's own and set to 0 by the end; one set
-  while a dialog is up that then fails in a way that may have left
-  `disablesleep 1` in place (including an exit status lost to a signal or
-  a crash) is set to 0 by that start's undo; one set while a dialog is up
-  when Insomnia quits or crashes before the answer is taken for
-  Insomnia's own (the journal already holds the start's entry) and set
-  to 0 by the end or the backstop; and while the journal claims a 1,
-  another tool's 1 cannot be told from it, and a refused start leaves it
-  with its restore still owed. sudo answers for the moment it is asked:
-  a rule removed later, an I/O log sudo cannot write when the restore
-  runs, or other groups for the user when the app or the backstop runs
+  while a dialog is up that then fails with a status the app cannot
+  trust is set to 0 by that start's undo once the command wrote its
+  record, even when it stopped after the record and before its write;
+  one set while a dialog is up when Insomnia quits or crashes before the
+  answer is taken for Insomnia's own (the journal already holds the
+  start's entry, and recovery does not read the record) and set to 0 by
+  the end or the backstop; and while the journal claims a 1, another
+  tool's 1 cannot be told from it, and a refused start leaves it with its
+  restore still owed. A process running as the user can erase the record
+  or write the bare nonce back (SECURITY.md). sudo answers for the moment
+  it is asked: a rule removed later, a sudo.conf or PAM file changed
+  later, or other groups for the user when the app or the backstop runs
   sudo can still make a restore fail, and the backstop keeps the entry
-  and retries. A sudo outside 1.9.15 to 1.9.x or with other plugins,
-  bound Defaults, `listpw=always` and a later rule for the restore, even
-  a passwordless one, refuse every Start. A session never starts unless the
+  and retries. Any sudo but 1.9.17p2, a sudo.conf, PAM session lines
+  other than macOS's own, bound Defaults, Defaults outside the list,
+  `listpw=always` and a later rule for the restore, even a passwordless
+  one, refuse every Start, and rerunning install.sh changes none of them.
+  A session never starts unless the
   backstop is armed, and a start is refused while a `pending-start` from
   an earlier start cannot be removed. If the dialog is cancelled,
-  osascript cannot be launched, or the root command refuses (its exit 3,
-  4, 5 or 6, or lockf's 69 or 75, which osascript ends its error line
+  osascript cannot be launched, or the root command refuses (its exit 3
+  to 7, or lockf's 69 or 75, which osascript ends its error line
   with: `AdministratorPromptError.restoreNeedsPassword` and `.refused`),
   the command left no change of its own for an undo to reverse: put
   session.json and the journal back exactly as they were read, run no
   pmset (a `SleepDisabled` set by another tool, even while the dialog was
-  up, stays), and surface the error. If the password is wrong, it times out, pmset fails, or the
-  command ends with any other status, pmset may have run, so undo from
-  the journal like an end, delete the session file
-  and surface the error. The start deletes `pending-start` on every outcome
+  up, stays), and surface the error. If the password is wrong, it times
+  out, pmset fails, or the command ends with any other status, the start
+  deletes `pending-start` under its lock and reads what it held. When the
+  file it locked is the one it wrote and holds only the nonce, no command
+  reached the sleep setting, so it rolls back as for a refusal, with no
+  pmset. Otherwise pmset may have run, so it undoes from the journal like
+  an end, deletes the session file and surfaces the error. The app after
+  a relaunch and the backstop do not read the record. The start deletes `pending-start` on every outcome
   before it lets go of the recovery lock. The wait is bounded: if the
   dialog's process has not finished 3 s after the SIGTERM, Insomnia kills
   nothing and deletes the marker under its lock. Once that succeeds the
   dialog's command can no longer change anything, so the start is rolled
-  back at once and the recovery lock released; the process is watched on
+  back at once (with no undo when the marker held only the nonce) and the
+  recovery lock released; the process is watched on
   its own, and the menu line names its pid until osascript exits and goes
   when the whole prompt has. While the dialog's root command holds the
   marker's lock (it is past its checks and may be in pmset), or the marker
@@ -735,6 +769,15 @@ Invariants:
   off once the journal entry is gone. No dialog is shown unless the
   `backstop.sh` sealed in the bundle declares a version that deletes the
   marker.
+- Past its checks, the root command writes `<nonce> writing` over the
+  marker, as the user, before it reads `pmset -g`, and writes the bare
+  nonce back when it then refuses. Only the start that wrote the marker
+  reads that record, after a failure whose status it cannot trust: the
+  file it wrote, holding only the nonce, means no command for this start
+  reached the sleep setting, and the start rolls back with no undo
+  (section 1). When the marker is missing, replaced or changed, the start
+  is undone like an end. Every other deleter ignores the content and acts as before, so a
+  crash under the dialog still ends in a full undo.
 - A transaction holds the recovery lock while a command it started may
   still change something. A stuck dialog whose marker this transaction
   deleted under the marker's lock can no longer change anything, so it does

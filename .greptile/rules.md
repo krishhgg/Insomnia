@@ -216,26 +216,48 @@ Flag a change that breaks one of these; do not flag the behavior itself.
   run, deliberately, so a setting another tool made stays. The check that
   the end can restore without a password is in the root command, under
   the marker's lock, before any write, in this order: the nonce check
-  (3), the deadline (4), a uid that is a positive number (5), then three
-  queries as that user through `q()` = `sudo -n -u "#$w" /usr/bin/env -i
-  LC_ALL=C /usr/bin/sudo "$@" </dev/null`: `-V` (5 unless sudo 1.9.15 to
-  1.9.x with only the sudoers plugins), `-k -n -l` (5 unless it lists
-  without a password and shows no Runas or command-specific Defaults),
-  and `-k -n -ll /usr/bin/pmset -a disablesleep 0` (5 unless it prints
-  exactly the six-line /etc/sudoers.d/insomnia entry: `RunAsUsers: root`,
-  `Options: !authenticate`, the restore as the only command and
-  `Matched:` the restore). Then the deadline (4), a root read of `pmset
-  -g` (6 on a `SleepDisabled 1` or a failed read; skipped only when `$5`
-  is exactly `1`, the journal claimed the 1 before this start), the
-  deadline again (4), and only then `pmset -a disablesleep 1`, the
-  command's only write (1 if it fails). `trap '' PIPE` keeps each
-  refusal's status when the dialog's stderr is gone. Exits 3, 4 and 6,
-  and lockf's 69 and 75, are `.refused`; 5 is `restoreNeedsPassword`.
-  All refusals leave no change of the command's own and roll back with no
-  pmset, so another tool's setting found by a read stays; any other
-  status may have left `disablesleep 1` in place and is undone like an
-  end. Flag a change that writes anything (pmset or a restore run as the
-  user) before the queries pass, runs a query that executes a command,
+  (3), the deadline (4), a uid that is a positive number (5), no
+  `/private/etc/sudo.conf` in any form (5: `sudo -V` does not list an
+  approval plugin with no show_version, and sudo consults one only when
+  it runs a command), `/private/etc/pam.d/sudo` with exactly one
+  uncommented session line, `session required pam_permit.so` (5: sudo
+  opens a PAM session only to run a command), then three queries as that
+  user through `q()` = `u /usr/bin/sudo "$@"`, `u()` being `sudo -n -u
+  "#$w" /usr/bin/env -i LC_ALL=C "$@" </dev/null`: `-V` (5 unless
+  exactly sudo 1.9.17p2, its sudoers policy plugin, grammar 50 and only
+  the sudoers I/O and audit plugins after them), `-k -n -l` (5 unless it
+  lists without a password, shows no Runas or command-specific Defaults,
+  and shows only Defaults entries on the list in the root command:
+  env_reset, env_keep, env_check, env_delete, log_allowed, log_denied,
+  and lecture, lecture_file, passprompt, badpass_message, passwd_timeout,
+  passwd_tries, timestamp_timeout, timestamp_type, tty_tickets,
+  pwfeedback and insults, which sudo reads only when it asks for a
+  password), and `-k -n -ll /usr/bin/pmset -a disablesleep 0` (5 unless
+  it prints exactly the six-line /etc/sudoers.d/insomnia entry:
+  `RunAsUsers: root`, `Options: !authenticate`, the restore as the only
+  command and `Matched:` the restore). Then the deadline (4), the record
+  `<nonce> writing` written over the marker as the user through `u()`
+  (7 if it fails), a root read of `pmset -g` (6 on a `SleepDisabled 1`
+  or a failed read; skipped only when `$5` is exactly `1`, the journal
+  claimed the 1 before this start), the deadline again (4), the bare
+  nonce written back before a 6 or a 4 at this point, and only then
+  `pmset -a disablesleep 1`, the command's only root write (1 if it
+  fails). `trap '' PIPE` keeps each refusal's status when the dialog's
+  stderr is gone. Exits 3, 4, 6 and 7, and lockf's 69 and 75, are
+  `.refused`; 5 is `restoreNeedsPassword`. All refusals leave the sleep
+  setting as the command found it and roll back with no pmset, so another
+  tool's setting found by a read stays. Any other status is ambiguous:
+  the start deletes the marker under its lock and rolls back with no
+  pmset only when the locked file is the one savePendingStart wrote and
+  holds exactly the nonce (`RemovedMarker.isUntouched`); the record,
+  other content, or a missing or replaced file is undone like an end.
+  The app after a relaunch, backstop.sh and uninstall.sh never read the
+  record. Flag a change that writes anything (pmset, the record or a
+  restore run as the user) before the checks pass, writes the record as
+  root, drops the sudo.conf or PAM check, accepts another sudo version or
+  adds a Defaults name to the list without reading what that setting does
+  when sudo runs a command, treats a missing, replaced or changed marker
+  as untouched, runs a query that executes a command,
   accepts `sudo -l` or `sudo -v` alone, a bare exit status or a NOPASSWD
   grep as the check, drops a clock check after a query or the read, reads
   sudo's output in another locale or without fixed paths, or treats exit
@@ -244,17 +266,20 @@ Flag a change that breaks one of these; do not flag the behavior itself.
   `SleepDisabled` with no owner, so a 1 another tool sets between root's
   read and its `disablesleep 1` is taken for Insomnia's and set to 0 by
   the end; one set during the session is set to 0 by the end; one set
-  during a dialog that then fails ambiguously (wrong password, timeout,
-  stuck prompt, pmset failure, a status lost to a signal or crash) is set
-  to 0 by the undo; one set during a dialog whose app quits or crashes
-  first is set to 0 by the end or the backstop; and while the journal
-  claims a 1 another tool's 1 is taken for it, and a refusal leaves it
-  owed. The listing is about the rule when it is read: a rule removed
-  later, an I/O log failure at the restore, or other groups at restore
-  time can still make a restore fail, and the backstop retries. The check
-  refuses every Start under a sudo outside 1.9.15 to 1.9.x, other
-  plugins, bound Defaults, `listpw=always` or a later rule for the
-  restore. The user types the password before a refusal is reported; a
+  during a dialog that then fails ambiguously (timeout, stuck prompt,
+  pmset failure, a status lost to a signal) is set to 0 by the undo once
+  the command wrote its record, even when it stopped before its write;
+  one set during a dialog whose app quits or crashes first is set to 0
+  by the end or the backstop, which do not read the record; a process
+  running as the user can erase the record or write the bare nonce back;
+  and while the journal claims a 1 another tool's 1 is taken for it, and
+  a refusal leaves it owed. The listing is about the rule when it is
+  read: a rule removed later, a sudo.conf or PAM file changed later, or
+  other groups at restore time can still make a restore fail, and the
+  backstop retries. The check refuses every Start under any sudo but
+  1.9.17p2, a sudo.conf, other PAM session lines, Defaults outside the
+  list, bound Defaults, `listpw=always` or a later rule for the restore,
+  and install.sh changes none of these. The user types the password before a refusal is reported; a
   sudoers without root's default entry fails closed. `install.sh` runs no
   pmset: after writing the rule it checks a `sudo -k -n -l` listing, which
   is not the check.

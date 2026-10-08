@@ -139,7 +139,7 @@ final class OsascriptAdministratorPromptTests: XCTestCase {
     /// before anything is written; osascript ends its error with that
     /// status. The error says what to do about it.
     func testARefusedRestoreCheckIsReportedWithTheFix() async throws {
-        let exe = try fakeOsascript("printf '0:812: execution error: sudo: a password is required\\rsudo -k -n -l did not list this user'\\''s sudoers rules without a password, or listed Runas or command-specific Defaults, which apply to the restore but not to this check; sleep was not turned off (5)\\n' >&2; exit 1")
+        let exe = try fakeOsascript("printf '0:812: execution error: sudo: a password is required\\rsudo -k -n -l did not list this user'\\''s sudoers rules without a password; sleep was not turned off (5)\\n' >&2; exit 1")
         let prompt = OsascriptAdministratorPrompt(executable: exe, timeout: 5)
         do {
             try await prompt.disableSleep(start)
@@ -149,8 +149,8 @@ final class OsascriptAdministratorPromptTests: XCTestCase {
             let text = try XCTUnwrap(error.errorDescription)
             XCTAssertTrue(text.hasPrefix("sleep was not turned off: sudo did not confirm that `sudo -n /usr/bin/pmset -a disablesleep 0` runs for you without a password ("), text)
             XCTAssertTrue(text.contains("sudo: a password is required"), text)
-            XCTAssertTrue(text.contains("Run scripts/install.sh again if /etc/sudoers.d/insomnia is missing or not in effect"), text)
-            XCTAssertTrue(text.hasSuffix("and on Defaults bound to a Runas user or a command"), text)
+            XCTAssertTrue(text.contains("If /etc/sudoers.d/insomnia is missing or not in effect, run scripts/install.sh again."), text)
+            XCTAssertTrue(text.hasSuffix("install.sh changes none of those, and the message above names the one found"), text)
         }
     }
 
@@ -205,10 +205,10 @@ final class OsascriptAdministratorPromptTests: XCTestCase {
     }
 
     /// Each exit that means the root command stopped before it wrote
-    /// anything (its own 3, 4 and 6, lockf's 69 and 75) is a refusal:
+    /// anything (its own 3, 4, 6 and 7, lockf's 69 and 75) is a refusal:
     /// nothing to undo, and the error names the status.
     func testRootRefusalsLeaveNothingToUndo() async throws {
-        for status: Int32 in [3, 4, 6, 69, 75] {
+        for status: Int32 in [3, 4, 6, 7, 69, 75] {
             try? FileManager.default.removeItem(at: argsFile)
             let exe = try fakeOsascript("printf '0:1: execution error: stopped\\rsleep was not turned off (\(status))\\n' >&2; exit 1")
             do {
@@ -229,7 +229,7 @@ final class OsascriptAdministratorPromptTests: XCTestCase {
     /// signal 128 and up), so it stays an ambiguous failure the start
     /// undoes like an end.
     func testOtherRootStatusesAreFailuresToUndo() async throws {
-        let lines = ["(1)", "(2)", "(7)", "(70)", "(71)", "(73)", "(126)", "(127)", "(143)", "(255)", "(-6)", "( 6)", "(6) pmset failed (1)", "(6).", "6"]
+        let lines = ["(1)", "(2)", "(8)", "(70)", "(71)", "(73)", "(126)", "(127)", "(143)", "(255)", "(-6)", "( 6)", "(6) pmset failed (1)", "(6).", "6"]
         for line in lines {
             try? FileManager.default.removeItem(at: argsFile)
             let exe = try fakeOsascript("printf '%s\\n' 'execution error: pmset failed \(line)' >&2; exit 1")
@@ -422,6 +422,24 @@ final class RootCommandTests: XCTestCase {
     /// its only write.
     private let allCalls = ["-g", "-a disablesleep 1"]
 
+    /// Root's sudo to the user that writes `content` over the marker, as
+    /// the fake sudo logs it.
+    private func markerWrite(_ content: String, marker: URL? = nil) -> String {
+        "-n -u #\(uid) /usr/bin/env " + markerWriteCommand(content, marker: marker)
+    }
+
+    /// The same, as the fake env logs it.
+    private func markerWriteCommand(_ content: String, marker: URL? = nil) -> String {
+        "-i LC_ALL=C /bin/sh -c printf %s \"$2\" > \"$1\" put \((marker ?? self.marker).path) \(content)"
+    }
+
+    /// Every sudo call of a command that gets past the questions: those,
+    /// then the record over the nonce.
+    private var throughTheRecord: [String] { queries + [markerWrite("nonce-1 writing")] }
+
+    /// The same, then the bare nonce put back by a refusal after the record.
+    private var refusedAfterTheRecord: [String] { throughTheRecord + [markerWrite("nonce-1")] }
+
     /// With the rule in effect, root asks the user's sudo three questions
     /// (through `sudo -u`, then `env -i LC_ALL=C`), reads sleep on, and
     /// turns it off. Nothing else runs pmset.
@@ -429,12 +447,12 @@ final class RootCommandTests: XCTestCase {
         try Data("nonce-1".utf8).write(to: marker)
         let r = try runRootCommand(marker: marker, nonce: "nonce-1", in: dir)
         XCTAssertEqual(r.status, 0, r.stderr)
-        XCTAssertEqual(r.sudoCalls, queries)
-        XCTAssertEqual(r.envCalls, ["-V", "-k -n -l", "-k -n -ll /usr/bin/pmset -a disablesleep 0"].map { "-i LC_ALL=C /usr/bin/sudo " + $0 })
+        XCTAssertEqual(r.sudoCalls, throughTheRecord)
+        XCTAssertEqual(r.envCalls, ["-V", "-k -n -l", "-k -n -ll /usr/bin/pmset -a disablesleep 0"].map { "-i LC_ALL=C /usr/bin/sudo " + $0 } + [markerWriteCommand("nonce-1 writing")])
         XCTAssertEqual(r.pmsetCalls, allCalls)
         XCTAssertEqual(r.pmsetAs, ["root", "root"])
         XCTAssertEqual(r.sleepDisabled, "1")
-        XCTAssertEqual(try String(contentsOf: marker, encoding: .utf8), "nonce-1", "lockf -k leaves the file")
+        XCTAssertEqual(try String(contentsOf: marker, encoding: .utf8), "nonce-1 writing", "lockf -k leaves the file, holding the record")
     }
 
     /// Round 17 R1: the check used to run the restore, after root had
@@ -458,13 +476,16 @@ final class RootCommandTests: XCTestCase {
     /// Each stops at the first answer that does not fit: root's switch to
     /// the user, `-V`, `-l` or `-ll`.
     func testEveryOtherPolicyRefusesBeforeAnyPmset() throws {
-        let version = "sudo -V, run as this user, failed or does not show sudo 1.9.15 or later"
+        let version = "sudo -V, run as this user, failed or does not show sudo 1.9.17p2 with only the sudoers plugins."
         let listing = "sudo -k -n -l did not list this user's sudoers rules without a password"
+        let defaults = "sudo -k -n -l shows a Defaults entry this check does not accept: "
         let rule = "sudo -k -n -ll does not show the rule in /etc/sudoers.d/insomnia"
         // How many of `queries` each policy lets run, and what it says.
         let stops: [RootSudoPolicy: (calls: Int, says: String)] = [
-            .noRootEntry: (1, version), .oldSudo: (2, version), .approvalPlugin: (2, version),
-            .noRule: (4, listing), .boundDefaults: (4, listing),
+            .noRootEntry: (1, version), .oldSudo: (2, version), .newSudo: (2, version),
+            .noRule: (4, listing),
+            .boundDefaults: (4, defaults + "Defaults bound to a Runas user or a command, which apply to the restore but not to a listing."),
+            .userDefaults: (4, defaults + "log_output. Settings like that can make the restore fail where a listing does not"),
             .listOnly: (6, rule), .noTag: (6, rule), .deny: (6, rule), .laterRule: (6, rule), .runAsAll: (6, rule),
             .extraOption: (6, rule), .timeLimited: (6, rule), .ldap: (6, rule), .pathOnly: (6, rule), .truncated: (6, rule),
         ]
@@ -482,6 +503,102 @@ final class RootCommandTests: XCTestCase {
                 XCTAssertTrue(r.stderr.hasSuffix("sleep was not turned off\n"), "\(label): \(r.stderr)")
                 XCTAssertFalse(r.stderr.contains("fake "), "\(label): a fake was used as the command never uses it: \(r.stderr)")
             }
+        }
+    }
+
+    /// Round 19 P1 (silent approval plugin). `sudo -V` lists no approval
+    /// plugin whose show_version is NULL, and sudo consults approval
+    /// plugins only when it runs a command, so no answer the user's sudo
+    /// gives can show one. The fixture loads such a plugin from a private
+    /// sudo.conf: the fake sudo's answers stay those of the rule, and the
+    /// restore is rejected. Any /etc/sudo.conf now stops the command
+    /// before it runs sudo at all, whatever the file holds.
+    func testAnySudoConfStopsTheCommandBeforeSudoRuns() throws {
+        let confs = [
+            "a silent approval plugin": SudoFormat.silentApprovalConf,
+            "an empty file": "",
+            "comments only": "# Plugin sudoers_policy sudoers.so\n",
+            "a setting, no plugin": "Set disable_coredump false\n",
+        ]
+        for (what, conf) in confs {
+            for (name, command) in try bothCommands() {
+                try Data("nonce-1".utf8).write(to: marker)
+                let r = try runRootCommand(marker: marker, nonce: "nonce-1", command: command, sudoConf: conf, in: dir)
+                let label = "\(what), \(name)"
+                XCTAssertEqual(r.status, 5, "\(label): \(r.stderr)")
+                XCTAssertEqual(r.sudoCalls, [], label)
+                XCTAssertEqual(r.pmsetCalls, [], label)
+                XCTAssertTrue(r.stderr.contains("/etc/sudo.conf exists. sudo -V does not list every plugin that file can load"), "\(label): \(r.stderr)")
+                XCTAssertTrue(r.stderr.hasSuffix("sleep was not turned off\n"), "\(label): \(r.stderr)")
+            }
+        }
+    }
+
+    /// The fixture's plugin behaves as the source says such a plugin does:
+    /// the version, the listing and the rule check answer as without it,
+    /// and only running the restore fails. Before this round, the command
+    /// took those answers and turned sleep off (the round 19 review's
+    /// probe); the restore at the session's end would then fail.
+    func testTheSilentApprovalFixtureChangesNothingButTheRestore() throws {
+        let tools = dir.appendingPathComponent("tools", isDirectory: true)
+        try FileManager.default.createDirectory(at: tools, withIntermediateDirectories: true)
+        let fake = try FakeDialogMachine(in: tools, clockStart: 1_800_000_000, clockLater: 1_800_000_005)
+        func run(_ args: [String]) throws -> (status: Int32, out: String) {
+            let p = Process()
+            let out = Pipe()
+            p.executableURL = fake.sudo
+            p.arguments = args
+            p.environment = ProcessInfo.processInfo.environment.filter { !$0.key.hasPrefix("FAKE_") }
+            p.standardOutput = out
+            p.standardError = FileHandle.nullDevice
+            let exit = ProcessExit(p)
+            try p.run()
+            let text = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+            exit.wait()
+            return (p.terminationStatus, text)
+        }
+        let questions = [["-V"], ["-k", "-n", "-l"], ["-k", "-n", "-ll", "/usr/bin/pmset", "-a", "disablesleep", "0"]]
+        let restore = ["-n", "/usr/bin/pmset", "-a", "disablesleep", "0"]
+        let without = try questions.map(run)
+        XCTAssertEqual(try run(restore).status, 0, "the restore runs without the plugin")
+        fake.sudoConf = SudoFormat.silentApprovalConf
+        let with = try questions.map(run)
+        XCTAssertEqual(with.map(\.status), without.map(\.status))
+        XCTAssertEqual(with.map(\.out), without.map(\.out))
+        XCTAssertEqual(try run(restore).status, 1, "the plugin rejects the restore")
+    }
+
+    /// sudo opens a PAM session for a command it runs, never for a listing
+    /// (pam.c in sudoers), so only macOS's own single `session required
+    /// pam_permit.so` line, which cannot fail, lets the listing stand for
+    /// the restore. Comments and lines of the other stacks do not matter.
+    func testOnlyMacOSsOwnPamSessionLinePasses() throws {
+        let stock = SudoFormat.macPamSudo
+        let accepted = [
+            "macOS's own": stock,
+            "a comment that names a session": stock + "# session optional pam_foo.so\n",
+            "another auth line": stock.replacingOccurrences(of: "auth       include        sudo_local\n", with: "auth       include        sudo_local\nauth       sufficient     pam_tid.so\n"),
+        ]
+        let refused: [String: String?] = [
+            "no file": nil,
+            "a second session line": stock + "session    optional       pam_launchd.so\n",
+            "an option on the line": stock.replacingOccurrences(of: "session    required       pam_permit.so", with: "session    required       pam_permit.so debug"),
+            "another module": stock.replacingOccurrences(of: "session    required       pam_permit.so", with: "session    required       pam_deny.so"),
+            "an include": stock.replacingOccurrences(of: "session    required       pam_permit.so", with: "session    include        sudo_local"),
+            "no session line": stock.replacingOccurrences(of: "session    required       pam_permit.so\n", with: ""),
+        ]
+        for (what, pam) in accepted {
+            try Data("nonce-1".utf8).write(to: marker)
+            let r = try runRootCommand(marker: marker, nonce: "nonce-1", pamSudo: pam, in: dir)
+            XCTAssertEqual(r.status, 0, "\(what): \(r.stderr)")
+        }
+        for (what, pam) in refused {
+            try Data("nonce-1".utf8).write(to: marker)
+            let r = try runRootCommand(marker: marker, nonce: "nonce-1", pamSudo: pam, in: dir)
+            XCTAssertEqual(r.status, 5, "\(what): \(r.stderr)")
+            XCTAssertEqual(r.sudoCalls, [], what)
+            XCTAssertEqual(r.pmsetCalls, [], what)
+            XCTAssertTrue(r.stderr.contains("/etc/pam.d/sudo could not be read, or its session lines are not macOS's own single session required pam_permit.so"), "\(what): \(r.stderr)")
         }
     }
 
@@ -600,7 +717,7 @@ final class RootCommandTests: XCTestCase {
         for at in slowCalls {
             let r = try runOnFakeClock(at: at, later: fakeDeadline - 1)
             XCTAssertEqual(r.status, 0, "\(at): \(r.stderr)")
-            XCTAssertEqual(r.sudoCalls, queries, at)
+            XCTAssertEqual(r.sudoCalls, throughTheRecord, at)
             XCTAssertEqual(r.pmsetCalls, allCalls, at)
             XCTAssertEqual(r.sleepDisabled, "1", at)
         }
@@ -621,7 +738,8 @@ final class RootCommandTests: XCTestCase {
                     let label = "\(at), \(later - fakeDeadline) s after the deadline, \(name)"
                     let r = try runOnFakeClock(at: at, later: later, command: command)
                     XCTAssertEqual(r.status, 4, "\(label): \(r.stderr)")
-                    XCTAssertEqual(r.sudoCalls, queries, label)
+                    XCTAssertEqual(r.sudoCalls, at == RootCommandProcess.read ? refusedAfterTheRecord : queries, label)
+                    XCTAssertEqual(try String(contentsOf: marker, encoding: .utf8), "nonce-1", "\(label): the marker holds the bare nonce again")
                     XCTAssertEqual(r.pmsetCalls, at == RootCommandProcess.read ? ["-g"] : [], label)
                     XCTAssertEqual(r.sleepDisabled, "0", label)
                     let says = at == RootCommandProcess.read
@@ -672,6 +790,60 @@ final class RootCommandTests: XCTestCase {
         XCTAssertEqual(r.status, 1, r.stderr)
         XCTAssertEqual(r.pmsetCalls, allCalls)
         XCTAssertFalse(OsascriptAdministratorPrompt.refusalStatuses.contains(r.status))
+        XCTAssertEqual(try String(contentsOf: marker, encoding: .utf8), "nonce-1 writing", "the record tells the start that the write may have run")
+    }
+
+    // MARK: The record
+
+    /// Round 19 P1 (ownership). The command replaces the nonce with its
+    /// record only after every check, right before it reads and writes the
+    /// sleep setting, so the marker shows which side of that line a
+    /// failure came from. While sudo is asked it still holds the bare
+    /// nonce; from root's read on it holds the record.
+    func testTheMarkerTakesTheRecordOnlyAfterEveryCheck() throws {
+        for at in [RootCommandProcess.versionQuery, RootCommandProcess.listQuery, RootCommandProcess.ruleQuery] {
+            try Data("nonce-1".utf8).write(to: marker)
+            let command = try RootCommandProcess(marker: marker, nonce: "nonce-1", in: dir, holdAt: at)
+            XCTAssertTrue(command.waitUntilPmsetRuns(), at)
+            XCTAssertEqual(try String(contentsOf: marker, encoding: .utf8), "nonce-1", "\(at): no record while sudo is asked")
+            command.release()
+            XCTAssertEqual(command.wait().status, 0, at)
+        }
+        for at in [RootCommandProcess.read, RootCommandProcess.write] {
+            try Data("nonce-1".utf8).write(to: marker)
+            let command = try RootCommandProcess(marker: marker, nonce: "nonce-1", in: dir, holdAt: at)
+            XCTAssertTrue(command.waitUntilPmsetRuns(), at)
+            XCTAssertEqual(try String(contentsOf: marker, encoding: .utf8), "nonce-1 writing", at)
+            command.release()
+            XCTAssertEqual(command.wait().status, 0, at)
+        }
+    }
+
+    /// The record goes over the nonce in the file the start wrote, as the
+    /// user, not as root: the same file, so the app can tell it from a copy.
+    func testTheRecordIsWrittenInPlaceAsTheUser() throws {
+        let written = try store.savePendingStart("nonce-1")
+        let r = try runRootCommand(marker: marker, nonce: "nonce-1", in: dir)
+        XCTAssertEqual(r.status, 0, r.stderr)
+        XCTAssertEqual(FileIdentity(atPath: marker.path), written)
+        XCTAssertTrue(r.sudoCalls.contains(markerWrite("nonce-1 writing")), "\(r.sudoCalls)")
+        XCTAssertEqual(r.sudoCalls.filter { $0.contains(" put ") }.allSatisfy { $0.hasPrefix("-n -u #\(uid) /usr/bin/env -i LC_ALL=C /bin/sh -c ") }, true, "only ever written through root's sudo to the user")
+    }
+
+    /// A marker the user cannot write stops the command before it reads
+    /// or writes the sleep setting, with its own refusal (7).
+    func testAMarkerThatCannotTakeTheRecordStopsBeforeTheRead() throws {
+        try Data("nonce-1".utf8).write(to: marker)
+        XCTAssertEqual(chmod(marker.path, 0o444), 0)
+        defer { chmod(marker.path, 0o644) }
+        for (name, command) in try bothCommands() {
+            let r = try runRootCommand(marker: marker, nonce: "nonce-1", command: command, in: dir)
+            XCTAssertEqual(r.status, 7, "\(name): \(r.stderr)")
+            XCTAssertEqual(r.pmsetCalls, [], name)
+            XCTAssertEqual(r.sudoCalls, throughTheRecord, name)
+            XCTAssertTrue(r.stderr.contains("the marker could not be changed, as this user, to record that this start went on to read and write the sleep setting; sleep was not turned off"), r.stderr)
+            XCTAssertTrue(OsascriptAdministratorPrompt.refusalStatuses.contains(r.status), name)
+        }
     }
 
     /// Round 17 R2. osascript may already have exited (SIGTERM at the
@@ -732,14 +904,14 @@ final class RootCommandTests: XCTestCase {
         } catch StoreError.markerBusy {
             // expected
         }
-        XCTAssertEqual(try String(contentsOf: marker, encoding: .utf8), "nonce-1")
+        XCTAssertEqual(try String(contentsOf: marker, encoding: .utf8), "nonce-1 writing")
 
         command.release()
         let r = command.wait()
         XCTAssertEqual(r.status, 0, r.stderr)
         XCTAssertEqual(r.pmsetCalls, allCalls)
         let removed = try await store.removePendingStart(timeout: 5)
-        XCTAssertTrue(removed)
+        XCTAssertEqual(removed?.content, Data("nonce-1 writing".utf8))
         XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
     }
 
@@ -790,7 +962,7 @@ final class RootCommandTests: XCTestCase {
         XCTAssertEqual(r.status, 0, r.stderr)
         XCTAssertEqual(r.pmsetCalls, allCalls)
         let removed = try await store.removePendingStart(timeout: 5)
-        XCTAssertTrue(removed)
+        XCTAssertNotNil(removed)
     }
 
     /// The other order: a remover holds the lock when the answer comes.
@@ -844,7 +1016,8 @@ final class RootCommandTests: XCTestCase {
             let r = try runRootCommand(marker: marker, nonce: "nonce-1", command: command, sleepDisabled: "1", in: dir)
             XCTAssertEqual(r.status, 6, "\(name): \(r.stderr)")
             XCTAssertEqual(r.pmsetCalls, ["-g"], name)
-            XCTAssertEqual(r.sudoCalls, queries, name)
+            XCTAssertEqual(r.sudoCalls, refusedAfterTheRecord, name)
+            XCTAssertEqual(try String(contentsOf: marker, encoding: .utf8), "nonce-1", name)
             XCTAssertEqual(r.sleepDisabled, "1", name)
             XCTAssertTrue(r.stderr.contains("pmset -g shows a SleepDisabled 1 this start did not set, or could not be read; it was left alone and sleep was not turned off"), r.stderr)
         }
@@ -886,7 +1059,7 @@ final class RootCommandTests: XCTestCase {
             let r = try runRootCommand(marker: marker, nonce: "nonce-1", command: command, sleepDisabled: "fail", in: dir)
             XCTAssertEqual(r.status, 6, "\(name): \(r.stderr)")
             XCTAssertEqual(r.pmsetCalls, ["-g"], name)
-            XCTAssertEqual(r.sudoCalls, queries, name)
+            XCTAssertEqual(r.sudoCalls, refusedAfterTheRecord, name)
             XCTAssertEqual(r.sleepDisabled, "fail", name)
         }
     }
@@ -902,7 +1075,7 @@ final class RootCommandTests: XCTestCase {
             XCTAssertEqual(r.status, 0, "\(name): \(r.stderr)")
             XCTAssertEqual(r.pmsetCalls, ["-a disablesleep 1"], name)
             XCTAssertEqual(r.pmsetAs, ["root"], name)
-            XCTAssertEqual(r.sudoCalls, queries, name)
+            XCTAssertEqual(r.sudoCalls, throughTheRecord, name)
             XCTAssertEqual(r.sleepDisabled, "1", name)
         }
     }
@@ -953,8 +1126,8 @@ final class RootCommandTests: XCTestCase {
             "",
             "standby 1\nsleep 1\n",
         ]
-        try Data("nonce-1".utf8).write(to: marker)
         for output in outputs {
+            try Data("nonce-1".utf8).write(to: marker)
             let startReads = PmsetSleepGuard.parseSleepDisabled(output)
             let r = try runRootCommand(marker: marker, nonce: "nonce-1", pmsetOutput: output, in: dir)
             XCTAssertEqual(r.status, startReads ? 6 : 0, "\(output.debugDescription): \(r.stderr)")
@@ -1039,12 +1212,13 @@ final class RootCommandSudoAnswerTests: XCTestCase {
         try? FileManager.default.removeItem(at: dir)
     }
 
-    /// The command's awk programs, in order: the `-V` reader, the `-l`
-    /// reader, the `-ll` reader and the `pmset -g` reader.
+    /// The command's awk programs, in order: the /etc/pam.d/sudo reader,
+    /// the `-V` reader, the `-l` reader, the `-ll` reader and the `pmset
+    /// -g` reader.
     private func programs() throws -> [String] {
         let programs = AdministratorPrompt.rootCommand.components(separatedBy: "/usr/bin/awk '").dropFirst().compactMap { $0.components(separatedBy: "'").first }
-        XCTAssertEqual(programs.count, 4)
-        guard programs.count == 4 else { throw XCTSkip("the command's awk programs moved") }
+        XCTAssertEqual(programs.count, 5)
+        guard programs.count == 5 else { throw XCTSkip("the command's awk programs moved") }
         return programs
     }
 
@@ -1067,17 +1241,25 @@ final class RootCommandSudoAnswerTests: XCTestCase {
         return p.terminationStatus
     }
 
-    func testTheVersionReaderTakesOnlySudoersOnSudo1_9_15AndLater() throws {
-        let reader = try programs()[0]
+    /// Round 19 P1 (Defaults). The command follows how sudo 1.9.17p2,
+    /// macOS's, lists and runs a command, so it takes that version alone,
+    /// with the grammar that version reads.
+    func testTheVersionReaderTakesOnlySudo1_9_17p2WithTheSudoersPlugins() throws {
+        let reader = try programs()[1]
         let v = SudoFormat.version
         let accepted = [
             "1.9.17p2 with sudoers' I/O and audit plugins": SudoFormat.versionOutput(),
-            "1.9.15": SudoFormat.versionOutput("1.9.15"),
-            "1.9.15p5": SudoFormat.versionOutput("1.9.15p5"),
-            "1.9.16p2 without the audit plugin": SudoFormat.versionOutput("1.9.16p2", audit: false),
+            "1.9.17p2 without the audit plugin": SudoFormat.versionOutput(audit: false),
+            "1.9.17p2 without the I/O plugin": SudoFormat.versionOutput(io: false),
             "1.9.17p2 with the policy plugin alone": SudoFormat.versionOutput(io: false, audit: false),
         ]
         let refused = [
+            "1.9.15": SudoFormat.versionOutput("1.9.15"),
+            "1.9.16p2": SudoFormat.versionOutput("1.9.16p2"),
+            "1.9.17p1": SudoFormat.versionOutput("1.9.17p1"),
+            "1.9.17p3": SudoFormat.versionOutput("1.9.17p3"),
+            "1.9.18": SudoFormat.versionOutput("1.9.18"),
+            "grammar 51": SudoFormat.versionOutput().replacingOccurrences(of: "grammar version 50", with: "grammar version 51"),
             "1.9.14p3": SudoFormat.versionOutput("1.9.14p3"),
             "1.9.9": SudoFormat.versionOutput("1.9.9"),
             "1.10.0": SudoFormat.versionOutput("1.10.0"),
@@ -1099,26 +1281,70 @@ final class RootCommandSudoAnswerTests: XCTestCase {
         for (name, text) in refused { XCTAssertNotEqual(try status(reader, text), 0, name) }
     }
 
-    /// The `-l` reader refuses any Defaults bound to a Runas user or a
-    /// command: those apply when the restore runs, not to the `-ll`
-    /// listing. Whether the listing ran without a password is its exit
-    /// status, which the command checks before this reader.
-    func testTheListingReaderRefusesDefaultsBoundToARunasUserOrACommand() throws {
-        let reader = try programs()[1]
+    /// Round 19 P1 (Defaults). The `-l` reader takes only Defaults that
+    /// cannot make the restore fail where a listing passes: environment
+    /// lists, the lecture, the password prompt's text and limits, and
+    /// syslog of allowed and denied commands. Anything else that applies
+    /// to the user (I/O logs, a log file, Runas and group settings, other
+    /// authentication), any Defaults bound to a Runas user or a command,
+    /// and text it cannot read for certain stop the command. Whether the
+    /// listing ran without a password is its exit status, which the
+    /// command checks before this reader.
+    func testTheListingReaderTakesOnlyTheDefaultsItAccepts() throws {
+        let reader = try programs()[2]
         let rule = ["(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0"]
-        XCTAssertEqual(try status(reader, RootSudoPolicy.rule.answers().listing.stdout), 0)
-        XCTAssertEqual(try status(reader, SudoFormat.listing(defaults: [], rules: rule)), 0)
-        XCTAssertEqual(try status(reader, SudoFormat.listing(defaults: ["env_keep+=\"Runas and Command-specific defaults for user:\""], rules: rule)), 0, "the header's words inside a value are not the header")
-        XCTAssertNotEqual(try status(reader, RootSudoPolicy.boundDefaults.answers().listing.stdout), 0)
-        XCTAssertNotEqual(try status(reader, SudoFormat.listing(bound: ["Defaults>root log_output"], rules: rule)), 0)
-        XCTAssertNotEqual(try status(reader, SudoFormat.listing(defaults: [], bound: ["Defaults>root !authenticate", "Defaults!/usr/bin/pmset log_output"], rules: rule)), 0)
+        func listing(_ defaults: [String]) -> String { SudoFormat.listing(defaults: defaults, rules: rule) }
+        let accepted = [
+            "macOS's own": RootSudoPolicy.rule.answers().listing.stdout,
+            "none": listing([]),
+            "the header's words inside a value": listing(["env_keep+=\"Runas and Command-specific defaults for user:\""]),
+            "each one taken": listing([
+                "!env_reset", "env_keep-=TZ", "env_check+=TERM", "env_delete=\"PERL5LIB PYTHONPATH\"", "lecture", "!lecture",
+                "lecture=always", "lecture_file=/etc/sudo_lecture", "log_allowed", "log_denied", "!log_denied",
+                "passprompt=\"Password for %p:\"", "badpass_message=\"Try again\"", "passwd_timeout=5", "passwd_tries=3",
+                "timestamp_timeout=15", "!timestamp_timeout", "timestamp_type=tty", "tty_tickets", "pwfeedback", "insults",
+            ]),
+        ]
+        let refused = [
+            "the round 19 review's user Defaults": RootSudoPolicy.userDefaults.answers().listing.stdout,
+            "log_output": listing(["log_output"]),
+            "!ignore_iolog_errors": listing(["!ignore_iolog_errors"]),
+            "an I/O log directory": listing(["iolog_dir=/var/log/sudo-io"]),
+            "a log file": listing(["logfile=/var/log/sudo.log"]),
+            "use_pty": listing(["use_pty"]),
+            "requiretty": listing(["requiretty"]),
+            "rootpw": listing(["rootpw"]),
+            "!authenticate": listing(["!authenticate"]),
+            "group_source": listing(["group_source=static"]),
+            "preserve_groups": listing(["preserve_groups"]),
+            "runas_default": listing(["runas_default=nobody"]),
+            "a Runas or command Defaults": RootSudoPolicy.boundDefaults.answers().listing.stdout,
+            "a Runas Defaults after the user's": SudoFormat.listing(bound: ["Defaults>root log_output"], rules: rule),
+            "only bound Defaults": SudoFormat.listing(defaults: [], bound: ["Defaults>root !authenticate", "Defaults!/usr/bin/pmset log_output"], rules: rule),
+            "env_reset as a list": listing(["env_reset+=FOO"]),
+            "lecture_file added to": listing(["lecture_file+=/etc/x"]),
+            "a backslash in a value": listing(["env_keep+=\"A\\\" log_output B\""]),
+            "an escaped comma": listing(["passprompt=a\\,b"]),
+            "a tab": listing(["env_reset,\tlog_output"]),
+            "no space after the comma": listing(["env_reset,log_output"]),
+            "a doubled comma": listing(["env_reset", ", log_output"]),
+            "a quote left open": listing(["passprompt=\"Password"]),
+            "an unknown name": listing(["env_resetx"]),
+            "upper case": listing(["ENV_RESET"]),
+            "a second Matching header": listing(["env_reset"]).replacingOccurrences(of: "User user may run", with: "Matching Defaults entries for user on mac:\n    log_output\n\nUser user may run"),
+            "no blank line after the entries": listing(["env_reset"]).replacingOccurrences(of: "env_reset\n\n", with: "env_reset\n"),
+            "unindented entries": listing(["env_reset"]).replacingOccurrences(of: "    env_reset", with: "env_reset"),
+            "the header alone": "Matching Defaults entries for user on mac:\n",
+        ]
+        for (name, text) in accepted { XCTAssertEqual(try status(reader, text), 0, name) }
+        for (name, text) in refused { XCTAssertNotEqual(try status(reader, text), 0, name) }
     }
 
     /// The `-ll` reader takes the rule install.sh writes, as sudo names its
     /// file either way, and nothing else: every policy that differs in the
     /// answer to `-ll`, and near misses of the rule's own answer.
     func testTheRuleReaderTakesOnlyTheInsomniaRuleWithoutAPassword() throws {
-        let reader = try programs()[2]
+        let reader = try programs()[3]
         let restore = "/usr/bin/pmset -a disablesleep 0"
         for policy: RootSudoPolicy in [.rule, .etcPath] {
             XCTAssertEqual(try status(reader, policy.answers().check.stdout), 0, "\(policy)")
@@ -1170,8 +1396,8 @@ final class PendingStartRemovalTests: XCTestCase {
         try Data("n".utf8).write(to: marker)
         let first = try await store.removePendingStart(timeout: 1)
         let second = try await store.removePendingStart(timeout: 1)
-        XCTAssertTrue(first)
-        XCTAssertFalse(second)
+        XCTAssertEqual(first?.content, Data("n".utf8))
+        XCTAssertNil(second)
         XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
     }
 
@@ -1181,7 +1407,7 @@ final class PendingStartRemovalTests: XCTestCase {
         let holder = try FileLockHolder(marker)
         DispatchQueue.global().asyncAfter(deadline: .now() + 0.2) { holder.release() }
         let removed = try await store.removePendingStart(timeout: 5)
-        XCTAssertTrue(removed)
+        XCTAssertNotNil(removed)
         XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
     }
 
@@ -1238,8 +1464,49 @@ final class PendingStartRemovalTests: XCTestCase {
         let written = try store.savePendingStart("n")
         XCTAssertEqual(written, FileIdentity(atPath: marker.path))
         let removed = try await store.removePendingStart(timeout: 1, expecting: written)
-        XCTAssertTrue(removed)
+        XCTAssertEqual(removed, RemovedMarker(file: written, content: Data("n".utf8)))
         XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+    }
+
+    /// What the root command left in the marker decides whether the start
+    /// it belonged to can be rolled back without an undo: only the file the
+    /// start wrote, holding exactly its nonce, shows that no command for it
+    /// reached the sleep setting.
+    func testOnlyTheFileTheStartWroteStillHoldingItsNonceIsUntouched() async throws {
+        let nonce = "6F1C2B4A-0000-4000-8000-00000000000A"
+        let start = PendingStart(marker: marker, nonce: nonce, deadline: Date().addingTimeInterval(3600))
+        func removed(after change: (FileIdentity) throws -> Void) async throws -> (RemovedMarker?, FileIdentity) {
+            let written = try store.savePendingStart(nonce)
+            try change(written)
+            return (try await store.removePendingStart(timeout: 1), written)
+        }
+        func overwrite(_ text: String) -> (FileIdentity) throws -> Void {
+            { _ in FakeAdministratorPrompt.overwrite(self.marker, with: text) }
+        }
+        let (kept, keptFile) = try await removed { _ in }
+        XCTAssertEqual(kept?.isUntouched(written: keptFile, nonce: nonce), true)
+
+        for (what, change) in [
+            ("its record", overwrite(start.receipt)),
+            ("an emptied file", overwrite("")),
+            ("half a record", overwrite(nonce + " wri")),
+            ("another nonce", overwrite("6F1C2B4A-0000-4000-8000-00000000000B")),
+            ("the nonce and a newline", overwrite(nonce + "\n")),
+        ] {
+            let (r, written) = try await removed(after: change)
+            XCTAssertEqual(r?.file, written, what)
+            XCTAssertEqual(r?.isUntouched(written: written, nonce: nonce), false, what)
+        }
+
+        // A copy holding the nonce in the marker's place is not the file
+        // the start wrote, and neither is a later start's own marker.
+        let (copied, copiedFrom) = try await removed { _ in try self.replaceMarker(with: nonce) }
+        XCTAssertEqual(copied?.content, Data(nonce.utf8))
+        XCTAssertEqual(copied?.isUntouched(written: copiedFrom, nonce: nonce), false)
+        let earlier = try store.savePendingStart(nonce)
+        try FileManager.default.removeItem(at: marker)
+        let (later, _) = try await removed { _ in }
+        XCTAssertEqual(later?.isUntouched(written: earlier, nonce: nonce), false)
     }
 
     /// A copy in the marker's place is not the file the start wrote. The
@@ -1280,7 +1547,7 @@ final class PendingStartRemovalTests: XCTestCase {
             locks.value += 1
             if locks.value == 1 { try? self.replaceMarker(with: "m") }
         })
-        XCTAssertTrue(removed)
+        XCTAssertEqual(removed?.content, Data("m".utf8), "what goes is the file locked last")
         XCTAssertEqual(locks.value, 2, "the swapped-in file was locked before it went")
         XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
     }
@@ -1305,7 +1572,7 @@ final class PendingStartRemovalTests: XCTestCase {
     func testADanglingLinkIsRemoved() async throws {
         try FileManager.default.createSymbolicLink(atPath: marker.path, withDestinationPath: dir.appendingPathComponent("nowhere").path)
         let removed = try await store.removePendingStart(timeout: 1)
-        XCTAssertTrue(removed)
+        XCTAssertEqual(removed, RemovedMarker(file: nil, content: nil))
         XCTAssertNil(try? FileManager.default.destinationOfSymbolicLink(atPath: marker.path))
     }
 }
@@ -1589,11 +1856,11 @@ final class SleepPromptLifecycleTests: XCTestCase {
         XCTAssertEqual(h.guardFake.unlockedPrivilegedCalls, [])
         let err = try XCTUnwrap(m.lastError)
         XCTAssertTrue(err.hasPrefix("could not disable sleep: sleep was not turned off: sudo did not confirm"), err)
-        XCTAssertTrue(err.contains("Run scripts/install.sh again"), err)
+        XCTAssertTrue(err.contains("run scripts/install.sh again"), err)
         let post = try XCTUnwrap(h.notifier.posts.last)
         XCTAssertEqual(post.title, "Session not started")
         XCTAssertTrue(post.body.hasPrefix("No session was started, and Insomnia undid anything it changed: sleep was not turned off"), post.body)
-        XCTAssertTrue(post.body.contains("Run scripts/install.sh again"), post.body)
+        XCTAssertTrue(post.body.contains("run scripts/install.sh again"), post.body)
 
         h.prompt.restoreNeedsPassword = false
         await m.start(duration: 1800)
@@ -1853,6 +2120,8 @@ final class SleepPromptLifecycleTests: XCTestCase {
         XCTAssertNil(try h.store.loadSession())
     }
 
+    /// A wrong password: no root command ran, so the marker still holds
+    /// the bare nonce, and the start is rolled back with no undo.
     func testFailedPromptRollsBack() async throws {
         h.prompt.mode = .fail
         let m = h.makeManager()
@@ -1860,9 +2129,23 @@ final class SleepPromptLifecycleTests: XCTestCase {
 
         try assertRolledBackClean(m)
         XCTAssertEqual(h.prompt.shown, 1)
-        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1", "disablesleep 0"])
+        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1"], "nothing reached the sleep setting, so nothing is undone")
         let err = try XCTUnwrap(m.lastError)
         XCTAssertTrue(err.contains("incorrect"), err)
+        let post = try XCTUnwrap(h.notifier.posts.last)
+        XCTAssertEqual(post.title, "Session not started")
+        XCTAssertTrue(post.body.hasSuffix("The command behind the password dialog never reached the sleep setting."), post.body)
+    }
+
+    /// A failure after the command wrote its record is undone like an end.
+    func testAFailureAfterTheRecordIsUndone() async throws {
+        h.prompt.mode = .fail
+        h.prompt.wroteRecord = true
+        let m = h.makeManager()
+        await m.start(duration: 1800)
+
+        try assertRolledBackClean(m)
+        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1", "disablesleep 0"])
         XCTAssertEqual(h.notifier.posts.last?.title, "Session not started")
     }
 
@@ -1947,15 +2230,65 @@ final class SleepPromptLifecycleTests: XCTestCase {
         XCTAssertEqual(h.prompt.starts.map(\.sleepOffIsOurs), [true, false])
     }
 
-    /// The limit on the other side: a failure that may have come after
-    /// `disablesleep 1` (here osascript's own error) is still undone like
-    /// an end, so a 1 another tool set while that dialog was up is cleared
-    /// too. Leaving it would risk leaving Insomnia's own 1 with no
-    /// journal entry.
-    func testAnAmbiguousFailureStillUndoesASettingMadeMeanwhile() async throws {
+    /// Round 19 P1 (ownership). A failure whose status cannot say where
+    /// it came from, while the marker still holds the bare nonce: no
+    /// command for this start reached the sleep setting, so a 1 another
+    /// tool set while the dialog was up is left alone.
+    func testAFailureBeforeTheRecordLeavesASettingMadeMeanwhile() async throws {
         let guardFake = h.guardFake
         h.prompt.onShow = { _ in guardFake.sleepDisabled = true }
         h.prompt.mode = .fail
+        let m = h.makeManager()
+        await m.start(duration: 1800)
+
+        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1"])
+        XCTAssertTrue(h.guardFake.sleepDisabled, "the other tool's setting must survive")
+        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
+        XCTAssertNil(try h.store.loadSession())
+    }
+
+    /// Only the file the start wrote can show that no command reached the
+    /// sleep setting. A copy put in its place while the dialog was up
+    /// proves nothing, even holding the start's nonce, so the failure is
+    /// undone like an end.
+    func testAFailureWithAReplacedMarkerIsUndoneEvenWhenItHoldsTheNonce() async throws {
+        h.prompt.onShow = { start in
+            let copy = start.marker.deletingLastPathComponent().appendingPathComponent("copy-\(UUID().uuidString)")
+            try? Data(start.nonce.utf8).write(to: copy)
+            _ = rename(copy.path, start.marker.path)
+        }
+        h.prompt.mode = .fail
+        let m = h.makeManager()
+        await m.start(duration: 1800)
+
+        try assertRolledBackClean(m)
+        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1", "disablesleep 0"])
+        XCTAssertEqual(h.notifier.posts.last?.title, "Session not started")
+    }
+
+    /// The same for a marker that is gone: nothing shows the command
+    /// stopped short, so the failure is undone like an end.
+    func testAFailureWithNoMarkerLeftIsUndone() async throws {
+        h.prompt.onShow = { start in try? FileManager.default.removeItem(at: start.marker) }
+        h.prompt.mode = .fail
+        let m = h.makeManager()
+        await m.start(duration: 1800)
+
+        try assertRolledBackClean(m)
+        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1", "disablesleep 0"])
+        XCTAssertEqual(h.notifier.posts.last?.title, "Session not started")
+    }
+
+    /// The limit on the other side: once the record is in the marker, a
+    /// failure that may have come after `disablesleep 1` is still undone
+    /// like an end, so a 1 another tool set while that dialog was up is
+    /// cleared too, even if the failure came before the write. Leaving it
+    /// would risk leaving Insomnia's own 1 with no journal entry.
+    func testAnAmbiguousFailureAfterTheRecordStillUndoesASettingMadeMeanwhile() async throws {
+        let guardFake = h.guardFake
+        h.prompt.onShow = { _ in guardFake.sleepDisabled = true }
+        h.prompt.mode = .fail
+        h.prompt.wroteRecord = true
         let m = h.makeManager()
         await m.start(duration: 1800)
 
@@ -2034,7 +2367,7 @@ final class SleepPromptLifecycleTests: XCTestCase {
 
         XCTAssertTrue(handle.osascriptAlive, "osascript has not exited")
         try assertRolledBackClean(m)
-        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1", "disablesleep 0"])
+        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1"], "the marker still held the bare nonce, so nothing is undone")
         let free = try XCTUnwrap(try RecoveryLock(url: h.home.paths.recoveryLock).tryAcquire(), "the recovery lock is let go")
         free.release()
         let stuck = h.notifier.posts.filter { $0.title == "Password prompt still running" }
@@ -2235,6 +2568,7 @@ final class SleepPromptLifecycleTests: XCTestCase {
         let box = LockHolderBox()
         h.prompt.onShow = { start in box.hold(start.marker) }
         h.prompt.mode = .stuck
+        h.prompt.wroteRecord = true
         let m = h.makeManager()
 
         let start = Task { await m.start(duration: 1800) }
@@ -2281,6 +2615,53 @@ final class SleepPromptLifecycleTests: XCTestCase {
         XCTAssertEqual(h.guardFake.calls, ["disablesleep 1", "disablesleep 0"])
         XCTAssertTrue(h.notifier.posts.contains { $0.title == "Session not started" })
         XCTAssertEqual(h.prompt.shown, 1)
+    }
+
+    /// The same wait, for a command that held the marker's lock but had
+    /// not written its record when it exited: once the marker goes it
+    /// still holds the bare nonce, so the rollback runs no undo and a 1
+    /// another tool set while the dialog was up stays.
+    func testStuckPromptWhoseCommandExitsBeforeItsRecordIsRolledBackWithoutAnUndo() async throws {
+        let box = LockHolderBox()
+        let guardFake = h.guardFake
+        h.prompt.onShow = { start in
+            box.hold(start.marker)
+            guardFake.sleepDisabled = true
+        }
+        h.prompt.mode = .stuck
+        let m = h.makeManager()
+
+        let start = Task { await m.start(duration: 1800) }
+        try await waitUntil("the stuck prompt is reported") {
+            h.notifier.posts.contains { $0.title == "Password prompt still running" }
+        }
+        let handle = try XCTUnwrap(h.prompt.unfinished)
+        XCTAssertEqual(try h.store.loadState()?.sleepDisabledByUs, true, "the journal entry stays while the command may run")
+        box.release()
+        handle.markExited()
+        await start.value
+
+        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1"])
+        XCTAssertTrue(h.guardFake.sleepDisabled, "the other tool's setting must survive")
+        XCTAssertNil(m.session)
+        XCTAssertNil(try h.store.loadSession())
+        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
+        XCTAssertFalse(markerExists)
+        XCTAssertNil(m.markerProblem)
+        XCTAssertEqual(h.notifier.posts.last?.title, "Session not started")
+    }
+
+    /// A stuck prompt whose marker goes at once, holding the record: the
+    /// command got past its checks before it was voided, so the start is
+    /// undone like an end.
+    func testStuckPromptWhoseMarkerHeldTheRecordIsUndone() async throws {
+        h.prompt.wroteRecord = true
+        let m = h.makeManager()
+        guard let handle = try await startWithAVoidedStuckPrompt(m) else { return }
+
+        try assertRolledBackClean(m)
+        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1", "disablesleep 0"])
+        handle.markExited()
     }
 
     /// The stuck prompt's command holds the lock on the marker this start
@@ -2469,6 +2850,22 @@ final class StartOwnershipEndToEndTests: XCTestCase {
         return ["-V", "-k -n -l", "-k -n -ll /usr/bin/pmset -a disablesleep 0"].flatMap { [asUser + $0, $0] }
     }
 
+    /// Every sudo call but root's writes over the marker.
+    private func questions(_ fake: FakeDialogMachine) -> [String] {
+        fake.sudoCalls().filter { !$0.contains(" put ") }
+    }
+
+    /// What root wrote over the marker, in order, through its sudo to the
+    /// user, with the nonce shown as `N`: `N writing` for the record, `N`
+    /// for a refusal that put the bare nonce back.
+    private func markerWrites(_ fake: FakeDialogMachine) -> [String] {
+        let prefix = "-n -u #\(getuid()) /usr/bin/env -i LC_ALL=C /bin/sh -c printf %s \"$2\" > \"$1\" put \(h.home.paths.pendingStartFile.path) "
+        let written = fake.sudoCalls().filter { $0.hasPrefix(prefix) }.map { String($0.dropFirst(prefix.count)) }
+        XCTAssertEqual(written.count, fake.sudoCalls().filter { $0.contains(" put ") }.count, "every write goes through root's sudo to the user")
+        guard let nonce = written.first.map({ $0.replacingOccurrences(of: " writing", with: "") }), !nonce.isEmpty else { return written }
+        return written.map { $0.replacingOccurrences(of: nonce, with: "N") }
+    }
+
     private func assertRolledBackWithNothingUndone(_ m: SessionManager, _ fake: FakeDialogMachine, status: Int32, file: StaticString = #filePath, line: UInt = #line) throws {
         XCTAssertNil(m.session, file: file, line: line)
         XCTAssertNil(try h.store.loadSession(), "session.json left behind", file: file, line: line)
@@ -2490,7 +2887,8 @@ final class StartOwnershipEndToEndTests: XCTestCase {
         XCTAssertTrue(m.isActive, m.lastError ?? "")
         XCTAssertEqual(fake.script, AdministratorPrompt.disableSleepScript)
         XCTAssertEqual(fake.pmsetCalls(), ["-g", "-g", "-a disablesleep 1"], "Start's read, then the command's read and its write")
-        XCTAssertEqual(fake.sudoCalls(), queries)
+        XCTAssertEqual(questions(fake), queries)
+        XCTAssertEqual(markerWrites(fake), ["N writing"])
         XCTAssertEqual(fake.sleepDisabled, "1")
         XCTAssertEqual(try h.store.loadState()?.sleepDisabledByUs, true)
 
@@ -2524,7 +2922,8 @@ final class StartOwnershipEndToEndTests: XCTestCase {
 
         XCTAssertEqual(fake.sleepDisabled, "1")
         XCTAssertEqual(fake.pmsetCalls(), ["-g", "-g"])
-        XCTAssertEqual(fake.sudoCalls(), queries)
+        XCTAssertEqual(questions(fake), queries)
+        XCTAssertEqual(markerWrites(fake), ["N writing", "N"])
         try assertRolledBackWithNothingUndone(m, fake, status: 6)
     }
 
@@ -2541,7 +2940,8 @@ final class StartOwnershipEndToEndTests: XCTestCase {
             XCTAssertNil(fake.foreignAfter, "\(at): the other tool's 1 was set")
             XCTAssertEqual(fake.sleepDisabled, "1", at)
             XCTAssertEqual(fake.pmsetCalls(), ["-g", "-g"], at)
-            XCTAssertEqual(fake.sudoCalls(), queries, at)
+            XCTAssertEqual(questions(fake), queries, at)
+            XCTAssertEqual(markerWrites(fake), ["N writing", "N"], at)
             try assertRolledBackWithNothingUndone(m, fake, status: 6)
         }
     }
@@ -2585,7 +2985,8 @@ final class StartOwnershipEndToEndTests: XCTestCase {
             await m.start(duration: 60)
 
             XCTAssertEqual(fake.pmsetCalls(), ["-g", "-g"], "\(later - now) s")
-            XCTAssertEqual(fake.sudoCalls(), queries, "\(later - now) s")
+            XCTAssertEqual(questions(fake), queries, "\(later - now) s")
+            XCTAssertEqual(markerWrites(fake), ["N writing", "N"], "\(later - now) s")
             XCTAssertEqual(fake.sleepDisabled, "0", "\(later - now) s")
             try assertRolledBackWithNothingUndone(m, fake, status: 4)
         }
@@ -2606,7 +3007,8 @@ final class StartOwnershipEndToEndTests: XCTestCase {
 
         XCTAssertTrue(m.isActive, m.lastError ?? "")
         XCTAssertEqual(fake.pmsetCalls(), ["-a disablesleep 1"])
-        XCTAssertEqual(fake.sudoCalls(), queries)
+        XCTAssertEqual(questions(fake), queries)
+        XCTAssertEqual(markerWrites(fake), ["N writing"])
         XCTAssertEqual(fake.sleepDisabled, "1")
     }
 
@@ -2678,5 +3080,97 @@ final class StartOwnershipEndToEndTests: XCTestCase {
         XCTAssertEqual(late.pmsetCalls(), ["-g", "-g"])
         XCTAssertEqual(late.sleepDisabled, "1", "no write followed the read")
         try assertRolledBackWithNothingUndone(m2, late, status: 4)
+    }
+
+    // MARK: Round 19
+
+    /// Round 19 P1 (ownership), end to end. Another tool sets 1 while the
+    /// dialog is up, and the command is stopped while sudo is asked, before
+    /// its record: lockf reports the signal as 70, which could have come
+    /// from anywhere. The marker still holds the bare nonce, so the start
+    /// is rolled back with no undo, and the 1 stays.
+    func testACommandStoppedBeforeItsRecordLeavesASettingMadeWhileTheDialogWasUp() async throws {
+        for at in [RootCommandProcess.versionQuery, RootCommandProcess.listQuery, RootCommandProcess.ruleQuery] {
+            let fake = try machine("machine \(at)".replacingOccurrences(of: " ", with: "-").replacingOccurrences(of: "/", with: "_"))
+            fake.foreignDuringDialog = true
+            fake.interruptAt = at
+            let m = h.makeManager(sleepGuard: fake.sleepGuard())
+            await m.start(duration: 1800)
+
+            XCTAssertNil(fake.interruptAt, "\(at): the command was stopped")
+            XCTAssertEqual(fake.sleepDisabled, "1", "\(at): the other tool's setting must survive")
+            XCTAssertEqual(fake.pmsetCalls(), ["-g"], "\(at): Start's read only")
+            XCTAssertEqual(markerWrites(fake), [], at)
+            XCTAssertFalse(fake.sudoCalls().contains("-n /usr/bin/pmset -a disablesleep 0"), "\(at): the app ran an undo")
+            XCTAssertNil(m.session, at)
+            XCTAssertNil(try h.store.loadSession(), at)
+            XCTAssertEqual(try h.store.loadState(), RuntimeState.clean, at)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: h.home.paths.pendingStartFile.path), at)
+            let err = try XCTUnwrap(m.lastError)
+            XCTAssertTrue(err.hasPrefix("could not disable sleep: the administrator password prompt failed (osascript exited 1)"), "\(at): \(err)")
+            XCTAssertTrue(err.hasSuffix("(70)"), "\(at): lockf's status for a command ended by a signal: \(err)")
+            let post = try XCTUnwrap(h.notifier.posts.last)
+            XCTAssertEqual(post.title, "Session not started", at)
+            XCTAssertTrue(post.body.hasSuffix("The command behind the password dialog never reached the sleep setting."), post.body)
+        }
+    }
+
+    /// The limit that stays: stopped after its record, at root's read, the
+    /// command never wrote, but the marker cannot show that, so the start
+    /// is undone like an end and the other tool's 1 is cleared with it.
+    func testACommandStoppedAfterItsRecordIsUndoneEvenBeforeItsWrite() async throws {
+        let fake = try machine()
+        fake.foreignDuringDialog = true
+        fake.interruptAt = RootCommandProcess.read
+        let m = h.makeManager(sleepGuard: fake.sleepGuard())
+        await m.start(duration: 1800)
+
+        XCTAssertNil(fake.interruptAt, "the command was stopped")
+        XCTAssertEqual(markerWrites(fake), ["N writing"])
+        XCTAssertFalse(fake.pmsetCalls().contains("-a disablesleep 1"), "the write never came")
+        XCTAssertEqual(fake.sudoCalls().last, "-n /usr/bin/pmset -a disablesleep 0", "the app undid")
+        XCTAssertEqual(fake.sleepDisabled, "0", "and cleared the other tool's 1")
+        XCTAssertNil(m.session)
+        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
+    }
+
+    /// Round 19 P1 (silent approval plugin), end to end. Before, sudo's
+    /// answers passed, the start turned sleep off, and the end's restore
+    /// was rejected, leaving sleep off. Now the sudo.conf that loads the
+    /// plugin stops the command before it asks sudo anything.
+    func testASudoConfStopsTheStartBeforeSudoIsAsked() async throws {
+        let fake = try machine()
+        fake.sudoConf = SudoFormat.silentApprovalConf
+        let m = h.makeManager(sleepGuard: fake.sleepGuard())
+        await m.start(duration: 1800)
+
+        XCTAssertEqual(fake.sudoCalls(), [])
+        XCTAssertEqual(fake.pmsetCalls(), ["-g"], "Start's read only")
+        XCTAssertEqual(fake.sleepDisabled, "0")
+        XCTAssertNil(m.session)
+        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
+        let err = try XCTUnwrap(m.lastError)
+        XCTAssertTrue(err.hasPrefix("could not disable sleep: sleep was not turned off: sudo did not confirm"), err)
+        XCTAssertTrue(err.contains("/etc/sudo.conf exists"), err)
+    }
+
+    /// Round 19 P1 (Defaults), end to end: the review's user Defaults
+    /// (`log_output`, `!ignore_iolog_errors` and an I/O log directory under
+    /// a regular file) make the restore fail, but not a listing. The
+    /// command names the first one it does not accept and stops before any
+    /// pmset; macOS's own Defaults pass (every other test here).
+    func testUserDefaultsTheCheckDoesNotAcceptStopTheStart() async throws {
+        let fake = try machine()
+        fake.policy = .userDefaults
+        let m = h.makeManager(sleepGuard: fake.sleepGuard())
+        await m.start(duration: 1800)
+
+        XCTAssertEqual(fake.sudoCalls(), Array(queries.prefix(4)))
+        XCTAssertEqual(fake.pmsetCalls(), ["-g"])
+        XCTAssertEqual(fake.sleepDisabled, "0")
+        XCTAssertNil(m.session)
+        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
+        let err = try XCTUnwrap(m.lastError)
+        XCTAssertTrue(err.contains("sudo -k -n -l shows a Defaults entry this check does not accept: log_output."), err)
     }
 }

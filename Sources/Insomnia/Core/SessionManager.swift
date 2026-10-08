@@ -1028,17 +1028,24 @@ final class SessionManager {
             // that still comes cannot turn sleep off. Only the file this
             // start wrote counts: one put in its place may have been
             // swapped in after the command locked the original.
-            let voided = await clearPendingStart(expecting: markerFile)
+            let cleared = await clearPendingStart(expecting: markerFile, start: (pending.nonce, markerFile))
             let alive = prompt.osascriptAlive
-            if voided {
+            if cleared != .kept {
                 // The command behind the dialog now finds no marker and
                 // changes nothing, whenever it runs, so nothing here waits
                 // for it: the start is rolled back now and the recovery
                 // lock goes with this transaction. The leftover process is
-                // reported, and watched on its own until it exits.
+                // reported, and watched on its own until it exits. A marker
+                // that still held only the nonce means no command for this
+                // start reached the sleep setting, so there is nothing to
+                // undo; otherwise the start is undone like an end.
                 reportStuckPrompt(prompt, grace: grace, osascriptAlive: alive, voided: true)
                 watchVoidedPrompt(prompt, grace: grace)
-                _ = await performEnd(reason: .startFailed)
+                if cleared == .untouched {
+                    rollBackUntouchedStart(journal: journalBefore, session: sessionBefore, error: AdministratorPromptError.stillRunning(prompt, grace: grace).localizedDescription)
+                } else {
+                    _ = await performEnd(reason: .startFailed)
+                }
                 return
             }
             // A root command already past its check holds the marker's
@@ -1060,8 +1067,13 @@ final class SessionManager {
             await prompt.waitUntilExit()
             // The command that held the marker's lock has exited with the
             // prompt, so the marker can go before the undo reads the result.
-            await clearPendingStart()
-            fail("could not disable sleep: \(prompt) did not finish in time and has now exited; rolling the start back")
+            let text = "\(prompt) did not finish in time and has now exited; rolling the start back"
+            if await clearPendingStart(start: (pending.nonce, markerFile)) == .untouched {
+                fail("could not disable sleep: \(text)")
+                rollBackUntouchedStart(journal: journalBefore, session: sessionBefore, error: text)
+                return
+            }
+            fail("could not disable sleep: \(text)")
             _ = await performEnd(reason: .startFailed)
             return
         } catch let error as AdministratorPromptError where error.nothingToUndo {
@@ -1082,9 +1094,16 @@ final class SessionManager {
             notifier.post(title: Self.endTitle(.startFailed, had: false), body: "No session was started, and Insomnia undid anything it changed: \(error.localizedDescription).")
             return
         } catch {
-            await clearPendingStart()
+            // A wrong password, a signal, a timeout, a pmset failure: the
+            // status cannot say whether root's write came first, but the
+            // marker can. The prompt has exited, so no command holds it.
+            let untouched = await clearPendingStart(start: (pending.nonce, markerFile)) == .untouched
             fail("could not disable sleep: \(error.localizedDescription)")
-            _ = await performEnd(reason: .startFailed)
+            if untouched {
+                rollBackUntouchedStart(journal: journalBefore, session: sessionBefore, error: error.localizedDescription)
+            } else {
+                _ = await performEnd(reason: .startFailed)
+            }
             return
         }
         await clearPendingStart()
@@ -2539,30 +2558,60 @@ final class SessionManager {
         }
     }
 
+    /// What clearing the pending-start marker found.
+    enum MarkerClearing: Equatable {
+        /// The marker is still there (see clearPendingStart).
+        case kept
+        /// The marker is gone.
+        case cleared
+        /// The marker is gone, and what was deleted is the file the start
+        /// wrote, still holding only its nonce: the command behind its
+        /// dialog never wrote its record, so it never read or wrote the
+        /// sleep setting, and with the marker gone it never will
+        /// (`RemovedMarker.isUntouched`).
+        case untouched
+    }
+
     /// Locks, then deletes the pending-start marker (see PendingStart and
     /// `Store.removePendingStart`), and records the outcome in
-    /// `markerProblem`. False when the root command behind a dialog still
+    /// `markerProblem`. `.kept` when the root command behind a dialog still
     /// held the marker's lock after `markerLockTimeout`, or the file could
     /// not be deleted (an immutable flag, a deny-delete ACL, a directory in
     /// its place), or, with `expecting`, the file at the path is not the
     /// one this start wrote. The failure is logged and shown in the menu,
     /// and every later transaction, backstop run and uninstall tries again.
+    /// `.untouched` only for `start`, the nonce and file a start wrote.
     @discardableResult
-    private func clearPendingStart(expecting written: FileIdentity? = nil) async -> Bool {
+    private func clearPendingStart(expecting written: FileIdentity? = nil, start: (nonce: String, file: FileIdentity)? = nil) async -> MarkerClearing {
+        let removed: RemovedMarker?
         do {
-            if try await store.removePendingStart(timeout: markerLockTimeout, expecting: written) {
+            removed = try await store.removePendingStart(timeout: markerLockTimeout, expecting: written)
+            if removed != nil {
                 Log.info("deleted the pending-start marker; a password dialog left from that start can no longer turn sleep off")
             }
             if let old = markerProblem {
                 markerProblem = nil
                 if lastError == Self.markerProblemText(old) { lastError = nil }
             }
-            return true
         } catch {
             markerProblem = error.localizedDescription
             fail(Self.markerProblemText(error.localizedDescription))
-            return false
+            return .kept
         }
+        if let start, let removed, removed.isUntouched(written: start.file, nonce: start.nonce) {
+            Log.info("the pending-start marker still held only its nonce: the command behind the dialog never reached the sleep setting")
+            return .untouched
+        }
+        return .cleared
+    }
+
+    /// Ends a start whose dialog failed in a way that could have come after
+    /// root's write, but whose marker was `.untouched`: like a refusal, the
+    /// journal and session.json go back as they were and no pmset runs, so
+    /// a SleepDisabled 1 another tool set while the dialog was up stays.
+    private func rollBackUntouchedStart(journal before: RuntimeState, session previous: Session?, error: String) {
+        rollBackStart(journal: before, session: previous)
+        notifier.post(title: Self.endTitle(.startFailed, had: false), body: "No session was started, and Insomnia undid anything it changed: \(error). The command behind the password dialog never reached the sleep setting.")
     }
 
     /// The menu's error line goes away after a success, except for a

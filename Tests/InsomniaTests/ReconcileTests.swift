@@ -275,8 +275,9 @@ final class ReconcileTests: XCTestCase {
     }
 
     // Start ordering: journal first, then pmset. A pmset failure is
-    // ambiguous (the setting may have been applied), so the start is undone
-    // from the journal; once the undo is confirmed nothing remains.
+    // ambiguous (the setting may have been applied), and the root command
+    // wrote its record before it ran pmset, so the start is undone from
+    // the journal; once the undo is confirmed nothing remains.
     func testStartUndoesFromJournalWhenPmsetFails() async throws {
         h.guardFake.throwOn = ["disablesleep 1"]
         let m = h.makeManager()

@@ -218,7 +218,9 @@ struct Store: Sendable {
     /// marker goes either before the check, which then fails, or after
     /// pmset has exited, never in between. The link is followed to the
     /// file, as lockf follows it, and the wait is polled so the caller is
-    /// never blocked. Returns whether a marker was there.
+    /// never blocked. Returns what it deleted: the file, with what it held
+    /// when the lock was taken, or a link to nothing, which has neither.
+    /// nil when nothing was there.
     ///
     /// The lock belongs to the file, but everything else here goes by path.
     /// Once the lock is held, the path must still name the locked file, or
@@ -245,7 +247,7 @@ struct Store: Sendable {
         expecting written: FileIdentity? = nil,
         pollEvery: Duration = .milliseconds(50),
         onLocked: (() -> Void)? = nil
-    ) async throws -> Bool {
+    ) async throws -> RemovedMarker? {
         let path = paths.pendingStartFile.path
         let deadline = ContinuousClock.now + .seconds(timeout)
         while true {
@@ -258,7 +260,7 @@ struct Store: Sendable {
                 if written != nil { throw StoreError.markerReplaced(path: path) }
                 // Missing, or a link to nothing, which lockf cannot open
                 // either; the link itself still goes.
-                return try Self.unlinkMarker(path)
+                return try Self.unlinkMarker(path) ? RemovedMarker(file: nil, content: nil) : nil
             }
             let busy: Bool
             if flock(fd, LOCK_EX | LOCK_NB) == 0 {
@@ -268,7 +270,11 @@ struct Store: Sendable {
                 if let written, locked != written { throw StoreError.markerReplaced(path: path) }
                 // stat(2) follows a link, as open(2) and lockf do.
                 if let locked, locked == FileIdentity(atPath: path) {
-                    return try Self.unlinkMarker(path)
+                    // Read under the lock, so no root command is writing.
+                    var bytes = [UInt8](repeating: 0, count: RemovedMarker.readLimit)
+                    let n = pread(fd, &bytes, bytes.count, 0)
+                    let content = n >= 0 ? Data(bytes.prefix(n)) : nil
+                    return try Self.unlinkMarker(path) ? RemovedMarker(file: locked, content: content) : nil
                 }
                 busy = false
             } else {
@@ -316,6 +322,27 @@ struct Store: Sendable {
         case let .valueNotFound(t, c): return path(c) + "missing \(t)"
         @unknown default: return String(describing: error)
         }
+    }
+}
+
+/// A pending-start marker `Store.removePendingStart` deleted.
+struct RemovedMarker: Equatable, Sendable {
+    /// More than the marker ever holds: a nonce (36 bytes), or a nonce and
+    /// " writing".
+    static let readLimit = 128
+
+    /// The file that was locked and deleted; nil for a link to nothing.
+    let file: FileIdentity?
+    /// Its first `readLimit` bytes, read under the lock just before the
+    /// unlink; nil when the read failed.
+    let content: Data?
+
+    /// Whether this is the file `written` names and it still holds
+    /// exactly `nonce`: the root command behind that start's dialog never
+    /// replaced the nonce with its record (PendingStart.receipt), so it
+    /// never reached `pmset -g` or `pmset -a disablesleep 1`.
+    func isUntouched(written: FileIdentity, nonce: String) -> Bool {
+        file == written && content == Data(nonce.utf8)
     }
 }
 

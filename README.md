@@ -218,13 +218,17 @@ installer prints its pid.
    reads the setting again once you have typed the password, before it
    changes anything, so a tool that turns sleep off while the dialog is up
    keeps its setting too: no session starts and nothing is changed.
-   Cancelling the dialog starts
-   no session and changes nothing. A wrong password, no answer within 120
-   seconds, or a pmset failure also starts no session, but Insomnia cannot
-   tell whether pmset ran first, so it runs `pmset -a disablesleep 0`,
-   which puts sleep back on as it was when the dialog appeared. A
-   password typed after the session would already have ended turns nothing
-   off. If the dialog's process will not close, Insomnia voids its start so
+   Cancelling the dialog, a wrong password, or no answer within 120
+   seconds starts no session and changes nothing. Before the command reads
+   and changes the sleep setting, it writes a record into Insomnia's
+   `pending-start` file. If the dialog then fails in a way Insomnia cannot
+   read, such as a pmset failure or a command stopped by a signal,
+   Insomnia looks at that file. Without the record, the command never
+   reached the setting, and nothing is undone. With it, Insomnia cannot
+   tell whether pmset ran, so it runs `pmset -a disablesleep 0`, which puts
+   sleep back on as it was when the dialog appeared, even if another tool
+   turned it off in the meantime. A password typed after the session would already have ended
+   turns nothing off. If the dialog's process will not close, Insomnia voids its start so
    it can no longer turn sleep off, rolls the start back at once, and names
    the process with its pid in the menu until it exits; only a command that
    is already turning sleep off when the time runs out is waited for. A
@@ -373,22 +377,29 @@ Undoing never needs a password: the sudoers rule covers turning sleep back on,
 so the app, the agent, and the uninstaller can all restore sleep unattended.
 Turning sleep off is the only step that asks, and only when you press Enter.
 After you type the password, and before it changes anything, the command
-behind the dialog asks sudo whether the session's end will be able to turn
-sleep back on without a password. As root it switches to your account and
-runs your sudo three times: `sudo -V`, `sudo -k -n -l`, and
-`sudo -k -n -ll /usr/bin/pmset -a disablesleep 0`, which prints the sudoers
-rule that decides `sudo -n /usr/bin/pmset -a disablesleep 0`, the command
-the session's end runs. `-k` makes sudo ignore a password you typed into it
-recently and `-n` makes it fail instead of asking. None of the three runs a
-command. Sleep is turned off only when that rule is the one in
-`/etc/sudoers.d/insomnia`, as root, with NOPASSWD and nothing else. If the
-file is gone or not in effect, or sudo's answers do not show it plainly
-(a sudo older than 1.9.15 or with other plugins, Defaults bound to a user
-or a command, a later rule for the same command), nothing is changed, the
-start is undone, and Insomnia tells you to run `scripts/install.sh` again.
-You find this out only after typing the password: the check needs root, and
-before the dialog the app runs nothing through sudo, it only reads `pmset
--g`.
+behind the dialog checks whether the session's end will be able to turn
+sleep back on without a password. As root it first checks that there is no
+`/etc/sudo.conf`, which can load sudo plugins that a listing does not show,
+and that `/etc/pam.d/sudo` has macOS's own single session line. Then it
+switches to your account and runs your sudo three times: `sudo -V`,
+`sudo -k -n -l`, and `sudo -k -n -ll /usr/bin/pmset -a disablesleep 0`,
+which prints the sudoers rule that decides
+`sudo -n /usr/bin/pmset -a disablesleep 0`, the command the session's end
+runs. `-k` makes sudo ignore a password you typed into it recently and `-n`
+makes it fail instead of asking. None of the three runs a command. Sleep is
+turned off only when sudo is 1.9.17p2 (the sudo in macOS 26.2) with only
+its built-in plugins, every Defaults entry sudo lists for you is one the
+check accepts, and the rule is the one in `/etc/sudoers.d/insomnia`, as
+root, with NOPASSWD and nothing else. Otherwise nothing is changed, the
+start is undone, and the message names what stopped it. If the rule file
+is gone or not in effect, run `scripts/install.sh` again. The installer
+does not change the other checks: another sudo version (a newer macOS
+included) needs an Insomnia release checked against it, and a sudo.conf, a
+changed PAM file, Defaults bound to a user or a command, other Defaults
+the check does not accept, or a later rule for the same command stop every
+Start until you remove them. You find this out only after typing the
+password: the check needs root, and before the dialog the app runs nothing
+through sudo, it only reads `pmset -g`.
 When Insomnia starts up (login, or a relaunch after a crash) and finds a valid
 session on disk, it checks whether sleep is still off. If it is, the session
 continues; if something turned sleep back on in the meantime, the session ends
