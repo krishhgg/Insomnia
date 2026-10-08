@@ -123,7 +123,10 @@ recovery; newly written journals use `frozenProcesses`.
   message. While Insomnia runs in another account (`ps -o uid=`), or a
   process there named Insomnia cannot be told apart from it, `install.sh`
   stops before the sudoers step and `uninstall.sh` before removing anything.
-  That process is named and never asked to quit or signalled.
+  That process is named and never asked to quit or signalled. So does a
+  `pgrep` that fails or does not answer. Under the recovery lock neither
+  script reads an Info.plist, not even with a time limit: a process first
+  seen there counts as unverified and stops the run.
 - Nothing else runs as root.
 
 ### 3. Lid observer

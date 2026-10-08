@@ -821,23 +821,52 @@ MSG
 # process there that cannot be told apart from one, blocks as well: the
 # rule at $SUDOERS is one file for the whole Mac, and that copy may need it
 # to undo its own session. It is reported, and never asked to quit or
-# signalled; only its own account can quit it.
+# signalled; only its own account can quit it. pgrep, ps and plutil go
+# through bounded(), so none of them can keep this run, or the recovery
+# lock, waiting. A pgrep that fails or does not answer says nothing about
+# what runs, so it blocks (PGREP_PROBLEM).
 APP_FOUND=()      # "pid N (path)" per running copy of this app in this account
 UNVERIFIED=()     # "pid N (path; why)" per process of this account that could not be told apart from it
 OTHER_ACCOUNT=()  # "pid N (uid U, path)" per copy, or process that could not be told apart from one, in another account
 OTHER_FOUND=()    # "pid N (path, bundle id X)" per process proven to be the API client
 BLOCKING=()       # the first three: what must be gone before files are touched
+PGREP_PROBLEM=""  # "pgrep exited N" or "pgrep did not answer within Ns", when it did not list
+# Bundle ids read before the recovery lock, as "pid|bundle|id", reused for
+# the same process only: one that took a bundle's place since has another
+# pid and is not taken for what ran there before. Once the lock is held
+# (PLIST_READS=0) no Info.plist is read at all, not even a bounded read: a
+# call made under the lock keeps the lock until it exits (see bounded()),
+# so a process first seen then counts as unverified and blocks.
+KNOWN_IDS=()
+PLIST_READS=1
+known_id() { # pid bundle
+  local entry
+  (( ${#KNOWN_IDS[@]} > 0 )) || return 0
+  for entry in "${KNOWN_IDS[@]}"; do
+    if [[ "${entry%|*}" == "$1|$2" ]]; then
+      printf '%s\n' "${entry##*|}"
+      return 0
+    fi
+  done
+  return 0
+}
 find_insomnia() {
   local pid pids rc owner exe bundle id desc this
-  APP_FOUND=(); UNVERIFIED=(); OTHER_ACCOUNT=(); OTHER_FOUND=(); BLOCKING=()
-  # A pgrep that does not answer in time counts as "running": fail closed.
+  APP_FOUND=(); UNVERIFIED=(); OTHER_ACCOUNT=(); OTHER_FOUND=(); BLOCKING=(); PGREP_PROBLEM=""
+  # pgrep exits 1 when no process has the name. Any other failure, or no
+  # answer in time, counts as "running": fail closed.
   rc=0
   bounded "$PGREP" -x Insomnia || rc=$?
   pids="$BOUNDED_OUTPUT"
-  if (( rc == 124 )); then
-    echo "pgrep did not answer within ${CALL_TIMEOUT_SECONDS}s; treating Insomnia as running." >&2
-    UNVERIFIED+=("pgrep did not answer within ${CALL_TIMEOUT_SECONDS}s")
-    BLOCKING+=("pgrep did not answer within ${CALL_TIMEOUT_SECONDS}s")
+  if (( rc != 0 && rc != 1 )); then
+    if (( rc == 124 )); then
+      PGREP_PROBLEM="pgrep did not answer within ${CALL_TIMEOUT_SECONDS}s"
+    else
+      PGREP_PROBLEM="pgrep exited $rc"
+    fi
+    echo "$PGREP_PROBLEM; treating Insomnia as running." >&2
+    UNVERIFIED+=("$PGREP_PROBLEM")
+    BLOCKING+=("$PGREP_PROBLEM")
     return 0
   fi
   (( rc == 0 )) || pids=""
@@ -855,15 +884,21 @@ find_insomnia() {
     desc="${exe:-executable path unknown}"   # what the messages say; gains the reason when unverified
     if [[ "$exe" == /*/Contents/MacOS/* ]]; then
       bundle="${exe%/Contents/MacOS/*}"
-      # Bounded like every other call here: this check also runs under the
-      # recovery lock, and an Info.plist on a stalled volume must not hold it.
+      id="$(known_id "$pid" "$bundle")"
       rc=0
-      bounded "$PLUTIL" -extract CFBundleIdentifier raw -o - "$bundle/Contents/Info.plist" || rc=$?
-      (( rc == 0 )) && id="${BOUNDED_OUTPUT%%$'\n'*}"
-      if (( rc == 124 )); then
-        desc="$exe; $bundle/Contents/Info.plist did not answer within ${CALL_TIMEOUT_SECONDS}s"
-      elif [[ -z "$id" ]]; then
-        desc="$exe; no bundle id readable from $bundle/Contents/Info.plist"
+      if [[ -z "$id" ]] && (( PLIST_READS == 1 )); then
+        bounded "$PLUTIL" -extract CFBundleIdentifier raw -o - "$bundle/Contents/Info.plist" || rc=$?
+        if (( rc == 0 )); then id="${BOUNDED_OUTPUT%%$'\n'*}"; fi
+        if [[ -n "$id" ]]; then KNOWN_IDS+=("$pid|$bundle|$id"); fi
+      fi
+      if [[ -z "$id" ]]; then
+        if (( PLIST_READS == 0 )); then
+          desc="$exe; first seen under the recovery lock, where no Info.plist is read"
+        elif (( rc == 124 )); then
+          desc="$exe; $bundle/Contents/Info.plist did not answer within ${CALL_TIMEOUT_SECONDS}s"
+        else
+          desc="$exe; no bundle id readable from $bundle/Contents/Info.plist"
+        fi
       fi
     elif [[ -n "$exe" ]]; then
       desc="$exe; not inside an app bundle, so no bundle id to read"
@@ -940,9 +975,14 @@ sudoers_not_ours() { # file content
   return 0
 }
 
-# Stops the run when Insomnia runs in another account. Nothing has been
-# changed by then, and nothing is sent to that process.
+# Stops the run when Insomnia runs in another account, or when pgrep could
+# not say whether it does. Nothing has been changed by then, and nothing is
+# sent to any process.
 stop_for_other_accounts() {
+  if [[ -n "$PGREP_PROBLEM" ]]; then
+    echo "$PGREP_PROBLEM, so whether Insomnia runs in this or another account is unknown. Rerun once it answers. Nothing was removed." >&2
+    exit 1
+  fi
   (( ${#OTHER_ACCOUNT[@]} > 0 )) || return 0
   echo "Insomnia is running in another account, or a process named Insomnia there could not be told apart from it: $(list "${OTHER_ACCOUNT[@]}")." >&2
   echo "$SUDOERS is shared by every account on this Mac and that copy may need it, so it is left alone and not asked to quit." >&2
@@ -992,6 +1032,9 @@ if (( lock_rc != 0 )); then
   echo "Wait a minute and rerun. Nothing was removed." >&2
   exit 75
 fi
+# From here on no Info.plist is read (PLIST_READS=0): a process first seen
+# under the lock counts as unverified and stops the run.
+PLIST_READS=0
 if app_running; then
   echo "Insomnia started again ($(list "${BLOCKING[@]}")); quit it and rerun. Nothing was removed." >&2
   exit 1

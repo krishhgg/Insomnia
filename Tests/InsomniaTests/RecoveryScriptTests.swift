@@ -6352,10 +6352,6 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(try fx.lockIsFree())
     }
 
-    /// uninstall.sh bounds its Info.plist read like every other call. A
-    /// read that never answers under the recovery lock (a bundle on a
-    /// stalled volume) is stopped after CALL_TIMEOUT_SECONDS without the
-    /// lock, the process counts as unverified, and nothing is removed.
     /// Ids kept from before the lock belong to the processes they were read
     /// for. A process that took the API client's place (another pid at the
     /// same path, such as a copy of this app) is not taken for the client
@@ -6383,7 +6379,12 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "trusted")
     }
 
-    func testUninstallTreatsAnInfoPlistThatDoesNotAnswerUnderTheLockAsUnverified() throws {
+    /// Under the recovery lock uninstall.sh reads no Info.plist either: a
+    /// call made there keeps the lock until it exits (see bounded()), so a
+    /// read on a stalled volume would hold the lock for CALL_TIMEOUT_SECONDS.
+    /// A process first seen there counts as unverified, even a copy whose
+    /// Info.plist would have shown this app, and nothing is removed.
+    func testUninstallReadsNoInfoPlistUnderTheRecoveryLock() throws {
         try fx.installMachinery()
         try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
         let stalled = try fx.otherBundle(in: "Volumes/Stalled", bundleId: "com.kgarg.insomnia")
@@ -6393,15 +6394,11 @@ final class RecoveryScriptTests: XCTestCase {
         try fx.pgrepPids([5151])
         try fx.psComm([(5151, stalled.path)])
 
-        let started = Date()
         let r = try fx.run(fx.uninstall)
-        let elapsed = Date().timeIntervalSince(started)
 
         XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
-        XCTAssertLessThan(elapsed, 20)
-        XCTAssertTrue(r.stderr.contains("Insomnia started again (pid 5151 (\(stalled.path); \(plist.path) did not answer within 1s))"), r.stderr)
-        XCTAssertEqual(fx.plistReads(), [plist.path])
-        XCTAssertTrue(fx.hungProcessGone("plutil"))
+        XCTAssertTrue(r.stderr.contains("Insomnia started again (pid 5151 (\(stalled.path); first seen under the recovery lock, where no Info.plist is read))"), r.stderr)
+        XCTAssertEqual(fx.plistReads(), [])
         let calls = fx.calls()
         XCTAssertFalse(calls.contains("plutil FD9-OPEN"), "\(calls)")
         XCTAssertFalse(calls.contains { $0.hasPrefix("osascript") || $0.hasPrefix("kill") || $0.hasPrefix("pkill") }, "\(calls)")
@@ -6410,6 +6407,36 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(fx.exists(fx.plist))
         XCTAssertTrue(fx.exists(fx.app))
         XCTAssertTrue(try fx.lockIsFree())
+    }
+
+    /// Before the lock the read is bounded like every other call: an
+    /// Info.plist that never answers (a bundle on a stalled volume) is
+    /// stopped after CALL_TIMEOUT_SECONDS, and the process counts as
+    /// unverified until it exits. It is not asked to quit.
+    func testUninstallStopsAnInfoPlistReadThatDoesNotAnswerBeforeTheLock() throws {
+        try fx.installMachinery()
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        let stalled = try fx.otherBundle(in: "Volumes/Stalled", bundleId: "com.kgarg.insomnia")
+        let plist = stalled.deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("Info.plist")
+        try fx.hangPlutil(on: plist)
+        fx.setMode("pgrep", "0\n1\n")   // running at the quit step, then gone
+        try fx.pgrepPids([5151])
+        try fx.psComm([(5151, stalled.path)])
+
+        let started = Date()
+        let r = try fx.run(fx.uninstall)
+        let elapsed = Date().timeIntervalSince(started)
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertLessThan(elapsed, 30)
+        XCTAssertTrue(r.stdout.contains("Cannot tell whether 1 process(es) named Insomnia are this app, so they count as it until they exit: pid 5151 (\(stalled.path); \(plist.path) did not answer within 5s)."), r.stdout)
+        XCTAssertEqual(fx.plistReads().filter { $0 == plist.path }, [plist.path], "read once, at the quit step: \(fx.plistReads())")
+        XCTAssertTrue(fx.hungProcessGone("plutil"))
+        let calls = fx.calls()
+        XCTAssertFalse(calls.contains("plutil FD9-OPEN"), "\(calls)")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("osascript") || $0.hasPrefix("kill") || $0.hasPrefix("pkill") }, "\(calls)")
+        XCTAssertFalse(fx.exists(fx.app))
+        XCTAssertTrue(fx.exists(stalled), "the other bundle is not touched")
     }
 
     /// The same for uninstall: an unknown bundle id blocks, in this account
@@ -6698,6 +6725,44 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), fx.sudoersRule)
         XCTAssertEqual(try String(contentsOf: fx.installedExecutable, encoding: .utf8), "binary", "old bundle replaced")
         XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "plist", "LaunchAgent replaced")
+    }
+
+    /// A pgrep that fails (exit 3, a fatal error) lists nothing, which does
+    /// not show that no copy runs in another account: the install stops
+    /// before its first sudo call, with nothing changed.
+    func testInstallStopsBeforeTheSudoersStepWhenPgrepFails() throws {
+        try fx.prepareInstall()
+        try fx.installMachinery()
+        fx.setMode("pgrep", "3\n")
+
+        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": ScriptFixture.account])
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertTrue(r.stderr.contains("pgrep exited 3, so whether Insomnia runs in this or another account is unknown. Rerun once it answers. Nothing was changed."), r.stderr)
+        let calls = fx.calls()
+        XCTAssertFalse(calls.contains { $0.hasPrefix("sudo") || $0.hasPrefix("osascript") || $0.hasPrefix("launchctl") }, "\(calls)")
+        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), fx.sudoersRule)
+        XCTAssertEqual(try String(contentsOf: fx.installedExecutable, encoding: .utf8), "binary", "old bundle replaced")
+        XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "plist", "LaunchAgent replaced")
+    }
+
+    /// The same at uninstall's quit step: nothing is asked to quit or
+    /// removed.
+    func testUninstallStopsWhenPgrepFails() throws {
+        try fx.installMachinery()
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        fx.setMode("pgrep", "3\n")
+
+        let r = try fx.run(fx.uninstall)
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertTrue(r.stderr.contains("pgrep exited 3, so whether Insomnia runs in this or another account is unknown. Rerun once it answers. Nothing was removed."), r.stderr)
+        let calls = fx.calls()
+        XCTAssertFalse(calls.contains { $0.hasPrefix("sudo") || $0.hasPrefix("osascript") || $0.hasPrefix("launchctl") }, "\(calls)")
+        XCTAssertTrue(fx.exists(fx.app))
+        XCTAssertTrue(fx.exists(fx.plist))
+        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), fx.sudoersRule)
+        XCTAssertTrue(try fx.lockIsFree())
     }
 
     /// The API client in another account is still another app: it is

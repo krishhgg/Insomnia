@@ -167,7 +167,8 @@ the installer holds the recovery lock it reads no Info.plist: a process it
 first sees then counts as unverified and blocks. A copy running in another
 account, or a process there that cannot be told apart from one, stops the
 install before the sudoers rule is replaced, since that copy may need the
-rule; it is named and never asked to quit. A refusal names the pid and
+rule; it is named and never asked to quit. A `pgrep` that fails or does not
+answer stops it there too. A refusal names the pid and
 executable path it found. The new
 bundle is built in a staging directory next to the app and moved into place in
 the same step that replaces the recovery agent. That step starts only after
@@ -621,8 +622,11 @@ the pid and executable path of the copy still running; resolve the reported
 problem and retry. The Insomnia API client (`com.insomnia.app`) is reported and
 left alone. A process named Insomnia with any other bundle id, or whose bundle
 id cannot be read, or whose Info.plist does not answer within the
-uninstaller's time limit for a call, blocks the uninstall until it exits. A copy running in another account stops
-the uninstall before anything is removed, and is never asked to quit. The
+uninstaller's time limit for a call, blocks the uninstall until it exits.
+Once the uninstaller holds the recovery lock it reads no Info.plist: a
+process it first sees then counts as unverified and blocks. A `pgrep` that
+fails or does not answer stops the uninstall before anything is removed, and
+so does a copy running in another account, which is never asked to quit. The
 sudoers rule is one file for the whole Mac and names the account that installed
 last. The uninstaller reads it through sudo and removes it only when it is
 exactly the rule the installer writes for your account; otherwise it keeps the
