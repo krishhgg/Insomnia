@@ -256,6 +256,117 @@ final class StoreTests: XCTestCase {
         XCTAssertFalse(unknown.keptDisplayReadUnderLowPower(inBoot: "boot-c"), "held until the next restart only")
     }
 
+    /// Our Low Power Mode claim next to a record from another boot is a
+    /// claim from before the Mac last started: the record keeps that boot
+    /// while the claim stays, is stamped again only when the mode is ours
+    /// in this boot, and goes once the claim is cleared. A record with no
+    /// boot, a boot not read, no record or another entry is not taken for
+    /// one.
+    func testLowPowerClaimFromAnEarlierBootKeepsItsRecord() {
+        var st = RuntimeState()
+        st.savedDisplayBrightness = 0.8
+        st.displayRestoreRefused = true
+        st.lowPowerSetByUs = true
+        st.noteLowPowerOverKeptDisplay(ours: true, boot: "boot-a")
+        XCTAssertFalse(st.lowPowerClaimFromEarlierBoot(boot: "boot-a"))
+        XCTAssertTrue(st.lowPowerClaimFromEarlierBoot(boot: "boot-b"))
+        XCTAssertFalse(st.lowPowerClaimFromEarlierBoot(boot: ""), "a boot not read is no restart")
+
+        var later = st
+        later.noteLowPowerOverKeptDisplay(ours: false, boot: "boot-b")
+        XCTAssertEqual(later, st, "kept, earlier boot and all, while the claim stays")
+        XCTAssertFalse(later.keptDisplayReadUnderLowPower(inBoot: "boot-b"))
+
+        var restamped = st
+        restamped.noteLowPowerOverKeptDisplay(ours: true, boot: "boot-b")
+        XCTAssertEqual(restamped.keptDisplayUnderLowPowerBoot, "boot-b", "the mode ours in this boot")
+        XCTAssertFalse(restamped.lowPowerClaimFromEarlierBoot(boot: "boot-b"))
+
+        var cleared = st
+        cleared.lowPowerSetByUs = false
+        XCTAssertFalse(cleared.lowPowerClaimFromEarlierBoot(boot: "boot-b"))
+        cleared.noteLowPowerOverKeptDisplay(ours: false, boot: "boot-b")
+        XCTAssertNil(cleared.keptDisplayUnderLowPower)
+        XCTAssertNil(cleared.keptDisplayUnderLowPowerBoot)
+
+        var noBoot = st
+        noBoot.keptDisplayUnderLowPowerBoot = nil
+        XCTAssertFalse(noBoot.lowPowerClaimFromEarlierBoot(boot: "boot-b"))
+        XCTAssertTrue(noBoot.keptDisplayReadUnderLowPower(inBoot: "boot-b"), "still doubt")
+
+        var noRecord = st
+        noRecord.keptDisplayUnderLowPower = nil
+        noRecord.keptDisplayUnderLowPowerBoot = nil
+        XCTAssertFalse(noRecord.lowPowerClaimFromEarlierBoot(boot: "boot-b"))
+
+        var replaced = st
+        replaced.savedDisplayBrightness = 0.7
+        XCTAssertFalse(replaced.lowPowerClaimFromEarlierBoot(boot: "boot-b"))
+    }
+
+    /// The record that a kept display entry read above 0 with the lid open
+    /// and the panel awake stays in the file, flat, and is neither dirty
+    /// nor an undo entry. Written only while set; a journal without it
+    /// decodes with none.
+    func testKeptDisplayReadLitRoundTripsAndIsNotDirty() throws {
+        var st = RuntimeState()
+        st.savedDisplayBrightness = 0.8
+        st.displayRestoreRefused = true
+        st.keptDisplayReadLit = 0.8
+        try store.saveState(st)
+        XCTAssertEqual(try store.loadState(), st)
+        let text = try String(contentsOf: home.paths.stateFile, encoding: .utf8)
+        XCTAssertTrue(text.contains("\"keptDisplayReadLit\" : 0.8"), text)
+        XCTAssertTrue(st.keptDisplayReadLitHolds)
+        XCTAssertFalse(st.isDirty)
+        XCTAssertNil(st.undoEntries.keptDisplayReadLit)
+
+        try store.saveState(RuntimeState())
+        let bare = try String(contentsOf: home.paths.stateFile, encoding: .utf8)
+        XCTAssertFalse(bare.contains("keptDisplayReadLit"), bare)
+        let legacy = Data(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"savedDisplayBrightness":0.8,"displayRestoreRefused":true}"#.utf8)
+        let decoded = try Store.makeDecoder().decode(RuntimeState.self, from: legacy)
+        XCTAssertNil(decoded.keptDisplayReadLit)
+        XCTAssertFalse(decoded.keptDisplayReadLitHolds, "a journal from before the record has no reading above 0")
+    }
+
+    /// It holds only for the kept entry it names, with that value and its
+    /// flag; the normalization every journal write runs drops it once the
+    /// entry is settled, unflagged or replaced.
+    func testKeptDisplayReadLitHoldsOnlyForItsEntry() {
+        var st = RuntimeState()
+        st.savedDisplayBrightness = 0.8
+        st.displayRestoreRefused = true
+        st.keptDisplayReadLit = 0.8
+        var kept = st
+        kept.dropKeptDisplayReadLitUnlessKept()
+        XCTAssertEqual(kept, st)
+
+        var settled = st
+        settled.savedDisplayBrightness = nil
+        settled.displayRestoreRefused = false
+        XCTAssertFalse(settled.keptDisplayReadLitHolds)
+        settled.dropKeptDisplayReadLitUnlessKept()
+        XCTAssertNil(settled.keptDisplayReadLit)
+
+        var unflagged = st
+        unflagged.displayRestoreRefused = false
+        XCTAssertFalse(unflagged.keptDisplayReadLitHolds, "an ordinary entry is restored, not judged")
+        unflagged.dropKeptDisplayReadLitUnlessKept()
+        XCTAssertNil(unflagged.keptDisplayReadLit)
+
+        var replaced = st
+        replaced.savedDisplayBrightness = 0.7
+        XCTAssertFalse(replaced.keptDisplayReadLitHolds)
+        replaced.dropKeptDisplayReadLitUnlessKept()
+        XCTAssertNil(replaced.keptDisplayReadLit)
+
+        var stray = RuntimeState()
+        stray.keptDisplayReadLit = 0.8
+        stray.dropKeptDisplayReadLitUnlessKept()
+        XCTAssertNil(stray.keptDisplayReadLit)
+    }
+
     func testSavedBrightnessCountsAsDirty() throws {
         var st = RuntimeState()
         XCTAssertFalse(st.isDirty)

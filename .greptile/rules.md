@@ -33,7 +33,11 @@ binary keeps the recovery lock on fd 9 until it ends itself after
 restores, `savedOutputVolume`, `savedMuted`, `savedAudioOutputs`,
 `savedDisplayBrightness`, `savedKeyboardBrightness` and
 `displayRestoredUnderLowPower`: CoreAudio and the private brightness
-frameworks need the app. `savedAudioOutputs` entries alone leave the
+frameworks need the app. The app's records `keptDisplayUnderLowPower`,
+`keptDisplayUnderLowPowerBoot` and `keptDisplayReadLit` are kept as they
+are too, also when `lowPowerSetByUs` is cleared; both scripts check their
+types, and the two numbers must fit a Swift Float, or the journal is
+malformed. `savedAudioOutputs` entries alone leave the
 journal clean for the backstop (an entry can wait days for its device), but
 uninstall stops on them. A saved brightness flagged
 `displayRestoreRefused` or `keyboardRestoreRefused` (the app's private-call
@@ -48,7 +52,11 @@ backlight neither suppressed nor dimmed. A reading taken while macOS holds it
 down, or a read that fails, leaves the entry as it is for a later read. A
 display reading above 0 taken under the app's own Low Power Mode, or after it
 in the same boot, relaunches included, leaves the entry for a launch after a
-restart. Legacy
+restart. A claim on the mode written before the Mac last started (its record
+of the kept entry names another boot) is read before the switch-off: read
+off, it puts no doubt on the reading. A reading above 0 of the kept entry is
+journaled (`keptDisplayReadLit`), and a later 0 is then not overwritten with
+the saved value, in that run or any later one. Legacy
 `frozenPids` entries are never signaled or cleared by the shell. A flag is
 cleared only after its undo succeeded; a journal that is unreadable or has a
 known key of the wrong type is left untouched and the run exits 1.
@@ -142,9 +150,11 @@ Flag a change that breaks one of these; do not flag the behavior itself.
   With no installed copy it runs the checkout's backstop anyway, which
   keeps those entries, so uninstall stops before removing anything.
 - `backstop.sh`, kept entries. Saved audio, saved display and keyboard
-  brightness, and `displayRestoredUnderLowPower` are kept for the app, not
-  restored by the shell. Legacy `frozenPids` are never signaled or cleared
-  there, even when the pid is gone (spec section 8).
+  brightness, `displayRestoredUnderLowPower` and the records
+  `keptDisplayUnderLowPower`, `keptDisplayUnderLowPowerBoot` and
+  `keptDisplayReadLit` are kept for the app, not restored by the shell.
+  Legacy `frozenPids` are never signaled or cleared there, even when the
+  pid is gone (spec section 8).
 - `ProcessControl.swift`, `LidActions.swift`, `backstop.sh`. Only pids
   Insomnia stopped are resumed, and only when the journaled identity still
   matches. Provisional entries written before the kernel confirmed the stop

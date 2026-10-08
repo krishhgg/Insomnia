@@ -77,6 +77,9 @@ RuntimeState {                // everything Insomnia changed and must undo
   displayRestoreRefused:   Bool    // written only when true: the guard refused this restore; see section 4
   keyboardRestoreRefused:  Bool    // the same for the keyboard backlight
   displayRestoredUnderLowPower: Float?  // restored on open under our Low Power Mode; written again when it ends
+  keptDisplayUnderLowPower:     Float?   // the kept (refused) display entry our Low Power Mode was on over; see section 4
+  keptDisplayUnderLowPowerBoot: String?  // kern.bootsessionuuid of the boot that record was written in
+  keptDisplayReadLit:           Float?   // the kept display entry, read above 0 with the lid open and the panel awake; see section 4
   appNapOverrides:    [{bundleId, previous?}]  // previous absent when the app had no NSAppSleepDisabled key
 }
 ```
@@ -208,14 +211,36 @@ every minute, and a lid close leaves it lit and only asks it to sleep
 (below). That a restart ends the mode's rescale is assumed, not measured.
 The record is about that entry alone: settled, replaced or unflagged, it
 is dropped, one with no boot session holds until the next restart, and a
-journal written before the record existed carries no doubt. A display
-still at 0 under or after the mode gets the saved value, written once
-more after the mode as for any restore under it, unless a reading of that
-entry above 0 in the same run, with the lid known open and the panel
-awake, showed the darkening undone: that 0 may be one the user set, and
-the saved value is not written over it. A reading at a lid close, under
-the closing lid or of a panel asleep, shows no such thing, and neither
-does a reading of an earlier entry. If state.json cannot
+journal written before the record existed carries no doubt. While the
+journal still claims the mode (`lowPowerSetByUs`), the record keeps the
+boot it was written in, so a launch after a restart can tell that the
+claim is from before it. Such a claim says nothing about the mode in this
+boot, so before its `lowpowermode 0` the app reads the mode
+(`pmset -g custom`, the battery setting the claim is about). On, or not
+readable, the switch-off is the mode's end in this boot: the record is
+written for this boot and the entry waits for the next restart, as above.
+Off, the switch-off changes nothing, the record of the earlier boot goes,
+and a reading of the panel decides the entry. A claim with no record, a
+record with no boot or an empty one, or a launch that cannot read its own
+boot is taken as this boot's, so the entry waits, at the cost of one more
+restart. The agent's own `lowpowermode 0` after a restart records nothing:
+a mode still on then is not known to the app's next launch, and a reading
+the panel takes on its way back may decide the entry. A display still at
+0 under or after the mode gets the saved value, written once more after
+the mode as for any restore under it, unless a reading of that entry above
+0, with the lid known open and the panel awake, showed the darkening
+undone: that 0 may be one the user set, and the saved value is not written
+over it. That reading is journaled (`keptDisplayReadLit`), so it holds
+through relaunches and restarts, which do not darken the panel again.
+While a doubt above remains the entry waits; once none is left, the 0 is
+the level set since, and the entry is cleared without a write. A lid
+close that takes a trusted 0 then journals that 0 in place of the kept
+value. A reading at a lid close, under the closing lid or of a panel
+asleep, shows no such thing, and neither does a reading of an earlier
+entry: the record goes with its entry, as the record of the mode does. If
+state.json refuses the record, this process holds it and the next write
+records it; a quit before then loses it, and the next launch writes the
+saved value over a 0, as before any reading. If state.json cannot
 take that clear, the entry still counts as done in this process. The clear
 is owed: it goes into the journal ahead of any later write, and at the
 start of every lid close, lid open, end and launch, so none of them works

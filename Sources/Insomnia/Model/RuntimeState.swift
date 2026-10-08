@@ -167,12 +167,28 @@ struct RuntimeState: Codable, Equatable, Sendable {
     /// entry in that boot, in any run (`SessionManager.keptDisplayReadDoubt`).
     /// Only for the entry with that value and its flag: the journal write
     /// that settles, replaces or unflags it, or finds the record from an
-    /// earlier boot, drops it (`noteLowPowerOverKeptDisplay`). A record
-    /// with no boot session to compare holds, and the next write that
-    /// knows the boot gives it that one. Not something to undo; the
-    /// scripts never read it. Left out of the JSON when nil.
+    /// earlier boot with `lowPowerSetByUs` cleared, drops it
+    /// (`noteLowPowerOverKeptDisplay`). While `lowPowerSetByUs` is still
+    /// set the record keeps its boot, so a later run can tell that claim is
+    /// from before the Mac last started (`lowPowerClaimFromEarlierBoot`).
+    /// A record with no boot session to compare holds, and the next write
+    /// that knows the boot gives it that one. Not something to undo; the
+    /// scripts check its type and keep it for the app. Left out of the
+    /// JSON when nil.
     var keptDisplayUnderLowPower: Float? = nil
     var keptDisplayUnderLowPowerBoot: String? = nil
+    /// A display brightness kept after a refused restore that read above 0
+    /// with the lid known open and the panel awake, by a reading taken
+    /// under `SessionManager.keptDisplayReadDoubt` and so not adopted: the
+    /// saved value. That reading shows the close's darkening undone, so a
+    /// later 0 may be a level the user set, and the kept value is not
+    /// written over it, in this run or a later one, after a restart too:
+    /// a restart does not darken the panel again. Only for the entry with
+    /// that value and its flag: the journal write that settles, replaces
+    /// or unflags it drops it (`dropKeptDisplayReadLitUnlessKept`). Not
+    /// something to undo; the scripts check its type and keep it for the
+    /// app. Left out of the JSON when nil.
+    var keptDisplayReadLit: Float? = nil
     /// Agent apps whose App Nap preference Insomnia set for the session,
     /// each with the value to put back. Not a lid action: restored at
     /// session end, at reconcile, or by the backstop with `defaults`.
@@ -184,24 +200,59 @@ struct RuntimeState: Codable, Equatable, Sendable {
     /// A state with nothing left to undo.
     static let clean = RuntimeState()
 
+    /// `keptDisplayUnderLowPower` names the display entry as it reads now:
+    /// that value, with its flag.
+    private var keptDisplayRecordMatches: Bool {
+        keptDisplayUnderLowPower != nil && displayRestoreRefused && savedDisplayBrightness == keptDisplayUnderLowPower
+    }
+
     /// `keptDisplayUnderLowPower` is about the entry as it reads now, in
     /// boot session `boot`.
     func keptDisplayReadUnderLowPower(inBoot boot: String) -> Bool {
-        guard let doubted = keptDisplayUnderLowPower, displayRestoreRefused, savedDisplayBrightness == doubted else { return false }
+        guard keptDisplayRecordMatches else { return false }
         let recorded = keptDisplayUnderLowPowerBoot ?? ""
         return recorded == boot || recorded.isEmpty || boot.isEmpty
     }
 
+    /// `lowPowerSetByUs` next to a record of the kept display entry from
+    /// another boot than `boot`: the claim was written before the Mac last
+    /// started and says nothing about the mode in this boot. The mode may
+    /// still be on (a `pmset -b` setting, not known to end with a restart)
+    /// or long off. A record or boot session that is unknown
+    /// (empty) gives no such sign, and the claim counts as this boot's.
+    func lowPowerClaimFromEarlierBoot(boot: String) -> Bool {
+        guard lowPowerSetByUs, keptDisplayRecordMatches else { return false }
+        let recorded = keptDisplayUnderLowPowerBoot ?? ""
+        return !recorded.isEmpty && !boot.isEmpty && recorded != boot
+    }
+
+    /// `keptDisplayReadLit` names the display entry as it reads now.
+    var keptDisplayReadLitHolds: Bool {
+        keptDisplayReadLit != nil && displayRestoreRefused && savedDisplayBrightness == keptDisplayReadLit
+    }
+
+    /// Before each journal write: `keptDisplayReadLit` goes with the entry
+    /// it was read for.
+    mutating func dropKeptDisplayReadLitUnlessKept() {
+        if !keptDisplayReadLitHolds { keptDisplayReadLit = nil }
+    }
+
     /// Before each journal write: a display entry kept after a refused
     /// restore is recorded as one our Low Power Mode was on over while
-    /// `ours` (the mode is ours, or was in this run), and a record that is
-    /// not about the entry as it reads now, in boot `boot`, is dropped. A
-    /// record with no boot session, which may be from this boot, is taken
-    /// as this boot's, so it holds until the next restart and no longer.
+    /// `ours` (the mode is ours in this boot, or was in this run), and a
+    /// record that is not about the entry as it reads now, in boot `boot`,
+    /// is dropped, unless `lowPowerSetByUs` is still set: then the record
+    /// keeps its earlier boot, the sign that the claim is from before the
+    /// restart (`lowPowerClaimFromEarlierBoot`), and goes with the claim.
+    /// A record with no boot session, which may be from this boot, is
+    /// taken as this boot's, so it holds until the next restart and no
+    /// longer.
     mutating func noteLowPowerOverKeptDisplay(ours: Bool, boot: String) {
         if ours, displayRestoreRefused, let kept = savedDisplayBrightness {
             keptDisplayUnderLowPower = kept
             keptDisplayUnderLowPowerBoot = boot
+        } else if lowPowerClaimFromEarlierBoot(boot: boot) {
+            // Kept as it is, earlier boot and all, while the claim stays.
         } else if !keptDisplayReadUnderLowPower(inBoot: boot) {
             keptDisplayUnderLowPower = nil
             keptDisplayUnderLowPowerBoot = nil
@@ -212,13 +263,15 @@ struct RuntimeState: Codable, Equatable, Sendable {
 
     /// The undo entries alone: the state without
     /// `displayRestoredUnderLowPower`, a write owed after the mode rather
-    /// than something to undo, or `keptDisplayUnderLowPower`. Two states
-    /// with equal entries owe the same undos.
+    /// than something to undo, `keptDisplayUnderLowPower` or
+    /// `keptDisplayReadLit`. Two states with equal entries owe the same
+    /// undos.
     var undoEntries: RuntimeState {
         var entries = self
         entries.displayRestoredUnderLowPower = nil
         entries.keptDisplayUnderLowPower = nil
         entries.keptDisplayUnderLowPowerBoot = nil
+        entries.keptDisplayReadLit = nil
         return entries
     }
 
@@ -264,7 +317,7 @@ struct RuntimeState: Codable, Equatable, Sendable {
         case savedAudioOutputs, savedOutputVolume, savedMuted
         case savedDisplayBrightness, savedKeyboardBrightness, displayRestoredUnderLowPower
         case displayRestoreRefused, keyboardRestoreRefused
-        case keptDisplayUnderLowPower, keptDisplayUnderLowPowerBoot
+        case keptDisplayUnderLowPower, keptDisplayUnderLowPowerBoot, keptDisplayReadLit
         case appNapOverrides
     }
 
@@ -294,6 +347,7 @@ struct RuntimeState: Codable, Equatable, Sendable {
         keyboardRestoreRefused = try c.decodeIfPresent(Bool.self, forKey: .keyboardRestoreRefused) ?? false
         keptDisplayUnderLowPower = try c.decodeIfPresent(Float.self, forKey: .keptDisplayUnderLowPower)
         keptDisplayUnderLowPowerBoot = try c.decodeIfPresent(String.self, forKey: .keptDisplayUnderLowPowerBoot)
+        keptDisplayReadLit = try c.decodeIfPresent(Float.self, forKey: .keptDisplayReadLit)
         appNapOverrides = try c.decodeIfPresent([AppNapOverride].self, forKey: .appNapOverrides) ?? []
     }
 
@@ -317,6 +371,7 @@ struct RuntimeState: Codable, Equatable, Sendable {
         if keyboardRestoreRefused { try c.encode(true, forKey: .keyboardRestoreRefused) }
         try c.encodeIfPresent(keptDisplayUnderLowPower, forKey: .keptDisplayUnderLowPower)
         try c.encodeIfPresent(keptDisplayUnderLowPowerBoot, forKey: .keptDisplayUnderLowPowerBoot)
+        try c.encodeIfPresent(keptDisplayReadLit, forKey: .keptDisplayReadLit)
         try c.encode(appNapOverrides, forKey: .appNapOverrides)
     }
 }

@@ -1456,12 +1456,13 @@ final class RefusedDarkeningTests: XCTestCase {
         XCTAssertTrue(off)
 
         h.display.brightness = 0
-        try await waitFor { self.logText().contains("reads 0 after it read above 0 in this run") }
+        try await waitFor { self.logText().contains("after a reading above 0 showed its darkening undone") }
 
         XCTAssertEqual(h.display.sets, [])
         XCTAssertEqual(h.display.brightness, 0)
         XCTAssertEqual(try h.store.loadState()?.savedDisplayBrightness, 0.8)
-        XCTAssertTrue(logText().contains("display brightness 0.8, kept after a refused restore, reads 0 after it read above 0 in this run; that 0 may be a level set since, so the kept value is not written"), logText())
+        XCTAssertEqual(try h.store.loadState()?.keptDisplayReadLit, 0.8, "journaled for later runs")
+        XCTAssertTrue(logText().contains("display brightness 0.8, kept after a refused restore, reads 0 after our low power mode was on in this run, which rescales it until some time after it goes off, after a reading above 0 showed its darkening undone; that 0 may be a level set since, so the kept value is not written"), logText())
     }
 
     /// A lid open writes a kept display value while state.json refuses
@@ -1571,6 +1572,7 @@ final class RefusedDarkeningTests: XCTestCase {
         h.clamshell.closed = true
         await actions.onClose()
         XCTAssertEqual(h.display.sets, [])
+        XCTAssertNil(try h.store.loadState()?.keptDisplayReadLit, "a reading of a panel asleep under a closing lid is no evidence")
 
         h.clamshell.closed = false
         h.display.asleep = false
@@ -1580,7 +1582,7 @@ final class RefusedDarkeningTests: XCTestCase {
         XCTAssertEqual(h.display.sets, [0.8])
         XCTAssertEqual(h.display.brightness, 0.8)
         XCTAssertNil(try h.store.loadState()?.savedDisplayBrightness)
-        XCTAssertFalse(logText().contains("reads 0 after it read above 0 in this run"), logText())
+        XCTAssertFalse(logText().contains("after a reading above 0 showed its darkening undone"), logText())
     }
 
     /// A close under Insomnia's Low Power Mode reads the awake panel at 0.4
@@ -1598,6 +1600,7 @@ final class RefusedDarkeningTests: XCTestCase {
         await actions.onClose()
         XCTAssertEqual(h.display.sets, [])
         XCTAssertEqual(try h.store.loadState()?.savedDisplayBrightness, 0.8)
+        XCTAssertNil(try h.store.loadState()?.keptDisplayReadLit, "a reading under the closing lid is no evidence")
 
         h.clamshell.closed = false
         h.display.brightness = 0
@@ -1643,6 +1646,7 @@ final class RefusedDarkeningTests: XCTestCase {
 
         XCTAssertEqual(h.display.sets, [0.7])
         XCTAssertNil(try h.store.loadState()?.savedDisplayBrightness)
+        XCTAssertNil(try h.store.loadState()?.keptDisplayReadLit, "the record goes with the entry it was about")
 
         var again = try XCTUnwrap(try h.store.loadState())
         again.savedDisplayBrightness = 0.8
@@ -1653,7 +1657,511 @@ final class RefusedDarkeningTests: XCTestCase {
 
         XCTAssertEqual(h.display.sets, [0.7, 0.8])
         XCTAssertNil(try h.store.loadState()?.savedDisplayBrightness)
-        XCTAssertFalse(logText().contains("reads 0 after it read above 0 in this run"), logText())
+        XCTAssertFalse(logText().contains("after a reading above 0 showed its darkening undone"), logText())
+    }
+
+    /// A sampler that follows `m`, for the levels a launch or reading
+    /// decides.
+    private func follow(_ m: SessionManager) -> BrightnessSampler {
+        let sampler = BrightnessSampler(display: h.display, keyboard: h.keyboard, idleSeconds: { 1 })
+        sampler.follow(m)
+        return sampler
+    }
+
+    /// An open reads the kept 0.8 at 0.4 under Insomnia's Low Power Mode:
+    /// its darkening is undone, and the journal says so. The session ends
+    /// and the user sets the display to 0 by hand. A relaunch in the same
+    /// boot still doubts its reading, and does not write 0.8 over that 0.
+    /// A launch after a restart has no doubt left: the 0 is the level set
+    /// since, the entry goes without a write and 0 is the sample. 0.8 never
+    /// comes back, at a close and open either.
+    func testAReadingAboveZeroIsKeptAcrossARelaunchAndARestart() async throws {
+        try seedKeptDisplay()
+        h.clamshell.closed = false
+        h.display.brightness = 0.4
+        let first = h.makeManager()
+        let actions = makeDarkening(first, sampler: nil)
+        await first.start(duration: 3600)
+        let on = await first.setLowPower(true)
+        XCTAssertTrue(on)
+        await actions.onOpen()
+        XCTAssertEqual(h.display.sets, [])
+        XCTAssertEqual(try h.store.loadState()?.keptDisplayReadLit, 0.8)
+        let outcome = await first.end(reason: .user)
+        XCTAssertEqual(outcome, .restored)
+        h.display.brightness = 0
+
+        let relaunched = h.makeManager()
+        let relaunchedSampler = follow(relaunched)
+        await relaunched.reconcile()
+
+        XCTAssertEqual(h.display.sets, [], "the user's 0 is not written over")
+        let waiting = try XCTUnwrap(try h.store.loadState())
+        XCTAssertEqual(waiting.savedDisplayBrightness, 0.8)
+        XCTAssertTrue(waiting.displayRestoreRefused)
+        XCTAssertEqual(waiting.keptDisplayReadLit, 0.8)
+        XCTAssertNil(relaunchedSampler.last?.display)
+        XCTAssertTrue(logText().contains("display brightness 0.8, kept after a refused restore, reads 0 after our low power mode was on over it since the Mac last started, which rescales it until some time after it goes off, after a reading above 0 showed its darkening undone; that 0 may be a level set since, so the kept value is not written"), logText())
+
+        let restarted = h.makeManager(bootSession: "a later boot")
+        let sampler = follow(restarted)
+        let laterActions = makeDarkening(restarted, sampler: sampler)
+        await restarted.reconcile()
+
+        XCTAssertEqual(h.display.sets, [])
+        let decided = try XCTUnwrap(try h.store.loadState())
+        XCTAssertNil(decided.savedDisplayBrightness)
+        XCTAssertFalse(decided.displayRestoreRefused)
+        XCTAssertNil(decided.keptDisplayReadLit, "the record goes with its entry")
+        XCTAssertNil(decided.keptDisplayUnderLowPower)
+        XCTAssertEqual(sampler.last?.display, 0)
+        XCTAssertTrue(logText().contains("display brightness 0.8, kept after a refused restore, reads 0 after a reading above 0 showed its darkening undone; that 0 is a level set since"), logText())
+
+        await restarted.start(duration: 3600)
+        h.clamshell.closed = true
+        await laterActions.onClose()
+        h.clamshell.closed = false
+        await laterActions.onOpen()
+
+        XCTAssertFalse(h.display.sets.contains(0.8), "\(h.display.sets)")
+        XCTAssertEqual(h.display.brightness, 0)
+    }
+
+    /// The same reading while state.json refuses every write: the record
+    /// is owed, and this process holds it, so a 0 read under the mode is
+    /// not written over. Once the journal takes writes, the next write
+    /// records it, and a launch after a restart finds it and leaves the
+    /// user's 0 as set.
+    func testAReadingAboveZeroTheJournalRefusedIsHeldAndRecordedLater() async throws {
+        try seedKeptDisplay()
+        h.clamshell.closed = false
+        h.display.brightness = 0.4
+        let m = h.makeManager()
+        let actions = makeDarkening(m, sampler: nil)
+        await m.start(duration: 3600)
+        let on = await m.setLowPower(true)
+        XCTAssertTrue(on)
+        let file = h.home.paths.stateFile.path
+        try FileManager.default.setAttributes([.immutable: true], ofItemAtPath: file)
+        defer { try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: file) }
+
+        await actions.onOpen()
+
+        XCTAssertNil(try h.store.loadState()?.keptDisplayReadLit)
+        XCTAssertEqual(m.effectiveState.keptDisplayReadLit, 0.8, "this process holds it")
+        XCTAssertTrue(logText().contains("display brightness 0.8, kept after a refused restore, read above 0, but the journal could not record it"), logText())
+
+        h.display.brightness = 0
+        await m.undoLidActions()
+
+        XCTAssertEqual(h.display.sets, [])
+        XCTAssertTrue(logText().contains("display brightness 0.8, kept after a refused restore, reads 0 under our low power mode, which rescales it, after a reading above 0 showed its darkening undone; that 0 may be a level set since, so the kept value is not written"), logText())
+
+        try FileManager.default.setAttributes([.immutable: false], ofItemAtPath: file)
+        let off = await m.setLowPower(false)
+        XCTAssertTrue(off)
+
+        XCTAssertEqual(try h.store.loadState()?.keptDisplayReadLit, 0.8)
+        XCTAssertTrue(logText().contains("display brightness 0.8, kept after a refused restore, journaled as read above 0"), logText())
+        _ = await m.end(reason: .user)
+        XCTAssertEqual(h.display.sets, [])
+
+        let restarted = h.makeManager(bootSession: "a later boot")
+        let sampler = follow(restarted)
+        await restarted.reconcile()
+
+        XCTAssertEqual(h.display.sets, [])
+        XCTAssertNil(try h.store.loadState()?.savedDisplayBrightness)
+        XCTAssertEqual(sampler.last?.display, 0)
+    }
+
+    /// A reading above 0 left by an earlier boot, and a launch whose open
+    /// finds the panel asleep, which decides nothing. The user then sets 0
+    /// on the awake panel, and the lid closes: that 0 is the level to come
+    /// back to, so it replaces the kept value, and the open writes 0, not
+    /// 0.8.
+    func testACloseAfterAReadingAboveZeroJournalsALaterZero() async throws {
+        try h.store.saveState(RuntimeState())
+        try Data(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"savedDisplayBrightness":0.8,"displayRestoreRefused":true,"keptDisplayReadLit":0.8}"#.utf8).write(to: h.home.paths.stateFile)
+        h.clamshell.closed = false
+        h.display.asleep = true
+        h.display.brightness = 0
+        let m = h.makeManager()
+        let actions = makeDarkening(m, sampler: nil)
+        await m.reconcile()
+        XCTAssertEqual(try h.store.loadState()?.savedDisplayBrightness, 0.8, "a panel asleep decides nothing")
+        await m.start(duration: 3600)
+
+        h.display.asleep = false
+        h.clamshell.closed = true
+        await actions.onClose()
+
+        let closed = try XCTUnwrap(try h.store.loadState())
+        XCTAssertEqual(closed.savedDisplayBrightness, 0)
+        XCTAssertFalse(closed.displayRestoreRefused)
+        XCTAssertNil(closed.keptDisplayReadLit)
+
+        h.clamshell.closed = false
+        await actions.onOpen()
+
+        XCTAssertFalse(h.display.sets.contains(0.8), "\(h.display.sets)")
+        XCTAssertEqual(h.display.brightness, 0)
+        XCTAssertNil(try h.store.loadState()?.savedDisplayBrightness)
+    }
+
+    /// A reading above 0 is journaled for the kept 0.8 it read. A launch
+    /// after a restart finds 0.8 set by hand and clears the entry, and the
+    /// record goes with it. The next close journals 0.8 again, an entry of
+    /// the same value, and a launch of a build whose guard refuses the call
+    /// keeps it as refused. Nothing has read that entry above 0, so the 0
+    /// a build that can make the call reads at its launch is the
+    /// darkening: 0.8 is written.
+    func testAReadingAboveZeroGoesWithItsEntryAcrossLaunches() async throws {
+        try seedKeptDisplay()
+        h.clamshell.closed = false
+        h.display.brightness = 0.4
+        let first = h.makeManager()
+        let actions = makeDarkening(first, sampler: nil)
+        await first.start(duration: 3600)
+        let on = await first.setLowPower(true)
+        XCTAssertTrue(on)
+        await actions.onOpen()
+        XCTAssertEqual(try h.store.loadState()?.keptDisplayReadLit, 0.8)
+        _ = await first.end(reason: .user)
+
+        h.display.brightness = 0.8
+        let restarted = h.makeManager(bootSession: "a later boot")
+        let sampler = follow(restarted)
+        let laterActions = makeDarkening(restarted, sampler: sampler)
+        await restarted.reconcile()
+
+        let settled = try XCTUnwrap(try h.store.loadState())
+        XCTAssertNil(settled.savedDisplayBrightness)
+        XCTAssertNil(settled.keptDisplayReadLit, "the record goes with its entry")
+        XCTAssertEqual(sampler.last?.display, 0.8)
+
+        await restarted.start(duration: 3600)
+        h.clamshell.closed = true
+        await laterActions.onClose()
+
+        let closed = try XCTUnwrap(try h.store.loadState())
+        XCTAssertEqual(closed.savedDisplayBrightness, 0.8)
+        XCTAssertFalse(closed.displayRestoreRefused)
+        XCTAssertNil(closed.keptDisplayReadLit)
+        XCTAssertEqual(h.display.brightness, 0)
+
+        h.clamshell.closed = false
+        let refusing = h.makeManager(display: refusedDisplay, bootSession: "a later boot")
+        await refusing.reconcile()
+
+        let kept = try XCTUnwrap(try h.store.loadState())
+        XCTAssertEqual(kept.savedDisplayBrightness, 0.8)
+        XCTAssertTrue(kept.displayRestoreRefused)
+        XCTAssertNil(kept.keptDisplayReadLit)
+        let setsBefore = h.display.sets
+
+        let measured = h.makeManager(bootSession: "a later boot")
+        await measured.reconcile()
+
+        XCTAssertEqual(h.display.sets, setsBefore + [0.8], "the darkening is undone")
+        XCTAssertEqual(h.display.brightness, 0.8)
+        XCTAssertNil(try h.store.loadState()?.savedDisplayBrightness)
+    }
+
+    /// The journal a session of boot A leaves when the app is gone before
+    /// its end: sleep and Low Power Mode ours over the kept 0.8, the mode
+    /// recorded over it in `boot` (none: a journal from before the record),
+    /// and the session over by now.
+    private func seedClaimFromBootA(record: Bool = true, boot: String? = "boot A") throws {
+        var st = RuntimeState()
+        st.sleepDisabledByUs = true
+        st.lowPowerSetByUs = true
+        st.savedDisplayBrightness = 0.8
+        st.displayRestoreRefused = true
+        if record {
+            st.keptDisplayUnderLowPower = 0.8
+            st.keptDisplayUnderLowPowerBoot = boot
+        }
+        try h.store.saveState(st)
+        let now = h.clock.now
+        try h.store.saveSession(Session(startedAt: now.addingTimeInterval(-7200), endsAt: now.addingTimeInterval(-3600)))
+    }
+
+    /// Boot A: a session switches Insomnia's Low Power Mode on over the
+    /// kept 0.8, the open reads the rescaled 0.4, and the app is gone
+    /// before the session ends. The Mac restarts. In boot B the mode reads
+    /// off and the panel 0.6. The launch ends the session and reads the
+    /// mode before its `lowpowermode 0`: the claim from boot A says nothing
+    /// about boot B, and with the mode off the switch-off changes nothing.
+    /// So 0.6 is the level set since: the entry and the record of boot A
+    /// go without a write, and 0.6 is the sample.
+    func testAClaimFromBeforeARestartWithTheModeOffDoesNotHoldTheKeptValue() async throws {
+        try seedKeptDisplay()
+        h.clamshell.closed = false
+        h.display.brightness = 0.4
+        let first = h.makeManager(bootSession: "boot A")
+        let actions = makeDarkening(first, sampler: nil)
+        await first.start(duration: 3600)
+        let on = await first.setLowPower(true)
+        XCTAssertTrue(on)
+        await actions.onOpen()
+        let left = try XCTUnwrap(try h.store.loadState())
+        XCTAssertTrue(left.lowPowerSetByUs)
+        XCTAssertEqual(left.keptDisplayUnderLowPower, 0.8)
+        XCTAssertEqual(left.keptDisplayUnderLowPowerBoot, "boot A")
+
+        h.clock.now = h.clock.now.addingTimeInterval(7200)
+        h.guardFake.lowPowerOn = false
+        h.display.brightness = 0.6
+        let callsBefore = h.guardFake.calls.count
+        let restarted = h.makeManager(bootSession: "boot B")
+        let sampler = follow(restarted)
+        await restarted.reconcile()
+
+        let after = try XCTUnwrap(try h.store.loadState())
+        XCTAssertFalse(after.lowPowerSetByUs)
+        XCTAssertNil(after.savedDisplayBrightness)
+        XCTAssertNil(after.keptDisplayUnderLowPower)
+        XCTAssertNil(after.keptDisplayUnderLowPowerBoot)
+        XCTAssertEqual(h.display.sets, [])
+        XCTAssertEqual(sampler.last?.display, 0.6)
+        XCTAssertTrue(logText().contains("low power mode, journaled as ours before the Mac last started, reads off; the switch-off changes nothing in this boot"), logText())
+        let calls = Array(h.guardFake.calls.dropFirst(callsBefore))
+        let read = try XCTUnwrap(calls.firstIndex(of: "pmset -g custom"), "\(calls)")
+        let off = try XCTUnwrap(calls.firstIndex(of: "lowpowermode 0"), "\(calls)")
+        XCTAssertLessThan(read, off, "\(calls)")
+    }
+
+    /// The same claim with the mode still on in boot B, as Low Power Mode
+    /// may outlast a restart: the switch-off ends it in this boot, so the
+    /// panel's 0.6 may be on its way back. The entry waits, the record is
+    /// for boot B now, and a relaunch in boot B waits too. A launch in
+    /// boot C decides it.
+    func testAClaimFromBeforeARestartWithTheModeOnWaitsForTheNextRestart() async throws {
+        try seedClaimFromBootA()
+        h.clamshell.closed = false
+        h.display.brightness = 0.6
+        h.guardFake.lowPowerOn = true
+        let m = h.makeManager(bootSession: "boot B")
+        let sampler = follow(m)
+
+        await m.reconcile()
+
+        XCTAssertFalse(h.guardFake.lowPowerOn)
+        let after = try XCTUnwrap(try h.store.loadState())
+        XCTAssertFalse(after.lowPowerSetByUs)
+        XCTAssertEqual(after.savedDisplayBrightness, 0.8)
+        XCTAssertEqual(after.keptDisplayUnderLowPower, 0.8)
+        XCTAssertEqual(after.keptDisplayUnderLowPowerBoot, "boot B")
+        XCTAssertEqual(h.display.sets, [])
+        XCTAssertNil(sampler.last?.display)
+        XCTAssertTrue(logText().contains("low power mode, journaled as ours before the Mac last started, reads on; it is switched off as ours in this boot"), logText())
+        XCTAssertTrue(logText().contains("display brightness 0.8, kept after a refused restore, reads 0.6 after our low power mode was on in this run"), logText())
+
+        let relaunched = h.makeManager(bootSession: "boot B")
+        let relaunchedSampler = follow(relaunched)
+        await relaunched.reconcile()
+
+        XCTAssertEqual(try h.store.loadState()?.savedDisplayBrightness, 0.8)
+        XCTAssertNil(relaunchedSampler.last?.display)
+
+        let callsBefore = h.guardFake.calls.count
+        let restarted = h.makeManager(bootSession: "boot C")
+        let newSampler = follow(restarted)
+        await restarted.reconcile()
+
+        XCTAssertNil(try h.store.loadState()?.savedDisplayBrightness)
+        XCTAssertEqual(h.display.sets, [])
+        XCTAssertEqual(newSampler.last?.display, 0.6)
+        let later = Array(h.guardFake.calls.dropFirst(callsBefore))
+        XCTAssertFalse(later.contains("pmset -g custom") || later.contains("lowpowermode 0"), "no claim left to read or switch off: \(later)")
+    }
+
+    /// A read of the mode that fails counts as on: the entry waits, with
+    /// the record for boot B.
+    func testAClaimFromBeforeARestartWhoseModeCannotBeReadWaits() async throws {
+        try seedClaimFromBootA()
+        h.clamshell.closed = false
+        h.display.brightness = 0.6
+        h.guardFake.throwOn = ["pmset -g custom"]
+        let m = h.makeManager(bootSession: "boot B")
+        let sampler = follow(m)
+
+        await m.reconcile()
+
+        XCTAssertTrue(h.guardFake.calls.contains("lowpowermode 0"), "\(h.guardFake.calls)")
+        let after = try XCTUnwrap(try h.store.loadState())
+        XCTAssertFalse(after.lowPowerSetByUs)
+        XCTAssertEqual(after.savedDisplayBrightness, 0.8)
+        XCTAssertEqual(after.keptDisplayUnderLowPowerBoot, "boot B")
+        XCTAssertNil(sampler.last?.display)
+        XCTAssertTrue(logText().contains("could not read low power mode, journaled as ours before the Mac last started; it is switched off as ours in this boot"), logText())
+    }
+
+    /// A claim that cannot be placed in an earlier boot keeps the doubt it
+    /// had: a journal from before the record, a record with no boot or an
+    /// empty one, and a launch that could not read its own boot. The mode
+    /// is not read for it, and the entry waits through the switch-off.
+    func testAClaimWithoutAKnownEarlierBootStillWaits() async throws {
+        let cases: [(record: Bool, recorded: String?, boot: String)] = [
+            (false, nil, "boot B"),
+            (true, nil, "boot B"),
+            (true, "", "boot B"),
+            (true, "boot A", ""),
+        ]
+        for c in cases {
+            h.home.destroy()
+            h = Harness()
+            try seedClaimFromBootA(record: c.record, boot: c.recorded)
+            h.clamshell.closed = false
+            h.display.brightness = 0.6
+            let m = h.makeManager(bootSession: c.boot)
+            let sampler = follow(m)
+
+            await m.reconcile()
+
+            XCTAssertFalse(h.guardFake.calls.contains("pmset -g custom"), "\(c): \(h.guardFake.calls)")
+            XCTAssertTrue(h.guardFake.calls.contains("lowpowermode 0"), "\(c)")
+            let after = try XCTUnwrap(try h.store.loadState())
+            XCTAssertFalse(after.lowPowerSetByUs, "\(c)")
+            XCTAssertEqual(after.savedDisplayBrightness, 0.8, "\(c)")
+            XCTAssertEqual(after.keptDisplayUnderLowPower, 0.8, "\(c)")
+            XCTAssertEqual(after.keptDisplayUnderLowPowerBoot, c.boot, "\(c)")
+            XCTAssertEqual(h.display.sets, [], "\(c)")
+            XCTAssertNil(sampler.last?.display, "\(c)")
+        }
+    }
+
+    /// The claim from boot A, with the mode off in boot B and the lid
+    /// closed at launch: the end clears the claim and the record of boot A,
+    /// and the entry waits for the lid. A session of boot B then switches
+    /// the mode on itself: the record is for boot B, the open under the
+    /// mode and the re-reads after it decide nothing, and neither does a
+    /// relaunch in boot B.
+    func testOurLowPowerModeOfTheNewBootStillHoldsTheKeptValue() async throws {
+        try seedClaimFromBootA()
+        h.clamshell.closed = true
+        h.display.brightness = 0.6
+        let m = h.makeManager(bootSession: "boot B")
+        let actions = makeDarkening(m, sampler: nil)
+        await m.reconcile()
+
+        let cleared = try XCTUnwrap(try h.store.loadState())
+        XCTAssertFalse(cleared.lowPowerSetByUs)
+        XCTAssertEqual(cleared.savedDisplayBrightness, 0.8, "not read under a closed lid")
+        XCTAssertNil(cleared.keptDisplayUnderLowPower)
+
+        await m.start(duration: 3600)
+        let on = await m.setLowPower(true)
+        XCTAssertTrue(on)
+        XCTAssertEqual(try h.store.loadState()?.keptDisplayUnderLowPowerBoot, "boot B")
+        h.clamshell.closed = false
+        h.display.brightness = 0.4
+        await actions.onOpen()
+        let off = await m.setLowPower(false)
+        XCTAssertTrue(off)
+        h.display.brightness = 0.6
+        await m.undoLidActions()
+
+        XCTAssertEqual(try h.store.loadState()?.savedDisplayBrightness, 0.8)
+        XCTAssertTrue(logText().contains("display brightness 0.8, kept after a refused restore, reads 0.6 after our low power mode was on in this run"), logText())
+
+        let relaunched = h.makeManager(bootSession: "boot B")
+        let sampler = follow(relaunched)
+        await relaunched.reconcile()
+
+        XCTAssertEqual(try h.store.loadState()?.savedDisplayBrightness, 0.8)
+        XCTAssertEqual(h.display.sets, [])
+        XCTAssertNil(sampler.last?.display)
+    }
+
+    /// The claim from boot A with the mode on in boot B, while state.json
+    /// refuses writes: the switch-off goes through and its clear is owed.
+    /// The disk keeps the claim and the record of boot A, and this process
+    /// counts the mode as its own, so the entry waits. The clear lands with
+    /// the next transaction, and the record with it is for boot B.
+    func testAClaimFromBeforeARestartWhoseClearIsOwedStillWaits() async throws {
+        try seedClaimFromBootA()
+        h.clamshell.closed = false
+        h.display.brightness = 0.6
+        h.guardFake.lowPowerOn = true
+        let file = h.home.paths.stateFile.path
+        try FileManager.default.setAttributes([.immutable: true], ofItemAtPath: file)
+        defer { try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: file) }
+        let m = h.makeManager(retryDelay: 3600, bootSession: "boot B")
+        let sampler = follow(m)
+
+        await m.reconcile()
+
+        XCTAssertFalse(h.guardFake.lowPowerOn)
+        let disk = try XCTUnwrap(try h.store.loadState())
+        XCTAssertTrue(disk.lowPowerSetByUs)
+        XCTAssertEqual(disk.keptDisplayUnderLowPowerBoot, "boot A")
+        XCTAssertFalse(m.effectiveState.lowPowerSetByUs)
+        XCTAssertEqual(h.display.sets, [])
+        XCTAssertNil(sampler.last?.display)
+        XCTAssertEqual(m.effectiveState.savedDisplayBrightness, 0.8)
+
+        try FileManager.default.setAttributes([.immutable: false], ofItemAtPath: file)
+        await m.undoLidActions()
+
+        let after = try XCTUnwrap(try h.store.loadState())
+        XCTAssertFalse(after.lowPowerSetByUs)
+        XCTAssertEqual(after.savedDisplayBrightness, 0.8)
+        XCTAssertEqual(after.keptDisplayUnderLowPowerBoot, "boot B")
+        XCTAssertNil(sampler.last?.display)
+    }
+
+    /// state.json cannot be read when the app starts in boot B, and is
+    /// repaired before the next try: the claim from boot A read then is
+    /// placed in boot A all the same, the mode is read, and with it off
+    /// the entry is decided.
+    func testAClaimFromBeforeARestartReadFromARepairedJournalIsReadLikeAnyOther() async throws {
+        try seedClaimFromBootA()
+        let file = h.home.paths.stateFile
+        let readable = try Data(contentsOf: file)
+        try Data("{ unreadable journal".utf8).write(to: file)
+        h.clamshell.closed = false
+        h.display.brightness = 0.6
+        h.guardFake.lowPowerOn = false
+        let m = h.makeManager(retryDelay: 3600, bootSession: "boot B")
+        let sampler = follow(m)
+        await m.reconcile()
+        XCTAssertFalse(h.guardFake.calls.contains("lowpowermode 0"))
+
+        try readable.write(to: file)
+        await m.reconcile()
+
+        XCTAssertTrue(h.guardFake.calls.contains("pmset -g custom"), "\(h.guardFake.calls)")
+        XCTAssertNil(try h.store.loadState()?.savedDisplayBrightness)
+        XCTAssertEqual(h.display.sets, [])
+        XCTAssertEqual(sampler.last?.display, 0.6)
+    }
+
+    /// The claim was already given back, by the app before the restart or
+    /// by the agent: the record of boot A is about another boot, nothing
+    /// reads or switches the mode, and the launch in boot B decides the
+    /// entry.
+    func testARecordFromBeforeARestartWithTheClaimGivenBackDecidesTheEntry() async throws {
+        try seedClaimFromBootA()
+        var given = try XCTUnwrap(try h.store.loadState())
+        given.sleepDisabledByUs = false
+        given.lowPowerSetByUs = false
+        try h.store.saveState(given)
+        try h.store.deleteSession()
+        h.clamshell.closed = false
+        h.display.brightness = 0.6
+        let m = h.makeManager(bootSession: "boot B")
+        let sampler = follow(m)
+
+        await m.reconcile()
+
+        XCTAssertFalse(h.guardFake.calls.contains("pmset -g custom") || h.guardFake.calls.contains("lowpowermode 0"), "\(h.guardFake.calls)")
+        let after = try XCTUnwrap(try h.store.loadState())
+        XCTAssertNil(after.savedDisplayBrightness)
+        XCTAssertNil(after.keptDisplayUnderLowPower)
+        XCTAssertEqual(h.display.sets, [])
+        XCTAssertEqual(sampler.last?.display, 0.6)
     }
 
     /// A session switches Insomnia's Low Power Mode off over the kept 0.8,

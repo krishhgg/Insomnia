@@ -18,7 +18,11 @@
 # A brightness the app kept because its private-call guard refused the
 # restore on this macOS does not stop the uninstall, since nothing here can
 # restore it; state.json is kept, even with --purge, so a later Insomnia
-# that can make the call restores it at launch.
+# that can make the call restores it at launch. The app's records about that
+# entry and about a restore under its Low Power Mode (displayRestoredUnderLowPower,
+# keptDisplayUnderLowPower, keptDisplayUnderLowPowerBoot, keptDisplayReadLit)
+# are never undone here and stay or go with state.json; one of the wrong type,
+# or a number a Float cannot hold, makes the journal malformed.
 #
 # Deletion is by exact owned file, never by directory tree: --purge removes
 # the files Insomnia writes (see Paths.swift), the session.json copies the
@@ -225,6 +229,30 @@ type_of() { # file keypath -> bool|integer|float|string|array|dictionary|(any); 
   "$PLUTIL" -type "$2" -o - "$1" 2>/dev/null || true
 }
 
+# Prints why the number at keypath $2 would not decode as a Swift Float, or
+# nothing. The app's JSONDecoder refuses a number a Float cannot hold: above
+# about 3.4028236e38, or so small it would round to 0 (below about 7.0065e-46).
+# plutil's XML form prints the value with 17 significant digits, in the
+# d.ddde+NN form at both ends, so the exponent and the first 9 digits are read
+# from that. A little stricter than the app (from 3.40282356e38 and up to
+# 7.01e-46), where no brightness lies: the journal then counts as malformed,
+# as for a wrong type, and nothing is undone.
+float_range_problem() { # file keypath
+  local x exp mag lead form='<real>-?([0-9])(\.([0-9]+))?e([-+][0-9]+)</real>'
+  x="$("$PLUTIL" -extract "$2" xml1 -o - "$1" 2>/dev/null)" || return 0
+  [[ "$x" =~ $form ]] || return 0
+  exp="${BASH_REMATCH[4]}"
+  mag=$((10#${exp#[-+]}))
+  lead="${BASH_REMATCH[3]}00000000"
+  lead=$((10#${BASH_REMATCH[1]}${lead:0:8}))
+  if [[ "$exp" == -* ]]; then
+    if (( mag > 46 || (mag == 46 && lead < 701000000) )); then echo "$2 is too small a number for the app to read"; fi
+  elif (( mag > 38 || (mag == 38 && lead > 340282355) )); then
+    echo "$2 is too large a number for the app to read"
+  fi
+  return 0
+}
+
 # Shape check, same rules as backstop.sh: a JSON object whose known keys have
 # the types RuntimeState.swift writes; null counts as absent.
 journal_shape_problems() { # file
@@ -237,10 +265,23 @@ journal_shape_problems() { # file
     t="$(type_of "$f" "$key")"
     [[ -z "$t" || "$t" == bool || "$t" == "(any)" ]] || echo "$key is a $t, not a bool"
   done
-  for key in savedOutputVolume savedDisplayBrightness savedKeyboardBrightness; do
+  for key in savedOutputVolume savedDisplayBrightness savedKeyboardBrightness displayRestoredUnderLowPower; do
     t="$(type_of "$f" "$key")"
     [[ -z "$t" || "$t" == float || "$t" == integer || "$t" == "(any)" ]] || echo "$key is a $t, not a number"
   done
+  # The app's records about a kept display entry: never read for an undo
+  # here, and they stay or go with state.json. Each must still decode, or
+  # the app cannot read the journal at all.
+  for key in keptDisplayUnderLowPower keptDisplayReadLit; do
+    t="$(type_of "$f" "$key")"
+    if [[ "$t" == float ]]; then
+      float_range_problem "$f" "$key"
+    elif [[ -n "$t" && "$t" != integer && "$t" != "(any)" ]]; then
+      echo "$key is a $t, not a number"
+    fi
+  done
+  t="$(type_of "$f" keptDisplayUnderLowPowerBoot)"
+  [[ -z "$t" || "$t" == string || "$t" == "(any)" ]] || echo "keptDisplayUnderLowPowerBoot is a $t, not a string"
   t="$(type_of "$f" frozenProcesses)"
   if [[ -n "$t" && "$t" != "(any)" ]]; then
     if [[ "$t" != array ]]; then

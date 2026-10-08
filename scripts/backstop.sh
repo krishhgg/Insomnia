@@ -88,6 +88,15 @@
 #                              refused that restore on this macOS: kept, and
 #                              not dirty, since no run here or of that app
 #                              build can restore it.
+#       displayRestoredUnderLowPower, keptDisplayUnderLowPower,
+#       keptDisplayUnderLowPowerBoot, keptDisplayReadLit -> the app's own
+#                              records about a display restore under its Low
+#                              Power Mode and about a kept display entry.
+#                              Nothing to undo and not dirty: never read for
+#                              an undo here, and kept exactly as they are for
+#                              the app, also when lowPowerSetByUs is cleared.
+#                              Their types are checked, and the two numbers
+#                              about the kept entry must fit a Float.
 #       appNapOverrides     -> NSAppSleepDisabled the app set to YES in an
 #                              agent app's preferences, with the value it had
 #                              before: defaults write <bundleId>
@@ -476,6 +485,30 @@ stop_transaction() { # what
   exit 1
 }
 
+# Prints why the number at keypath $2 would not decode as a Swift Float, or
+# nothing. The app's JSONDecoder refuses a number a Float cannot hold: above
+# about 3.4028236e38, or so small it would round to 0 (below about 7.0065e-46).
+# plutil's XML form prints the value with 17 significant digits, in the
+# d.ddde+NN form at both ends, so the exponent and the first 9 digits are read
+# from that. A little stricter than the app (from 3.40282356e38 and up to
+# 7.01e-46), where no brightness lies: the journal then counts as malformed,
+# as for a wrong type, and nothing is undone.
+float_range_problem() { # file keypath
+  local x exp mag lead form='<real>-?([0-9])(\.([0-9]+))?e([-+][0-9]+)</real>'
+  x="$("$PLUTIL" -extract "$2" xml1 -o - "$1" 2>/dev/null)" || return 0
+  [[ "$x" =~ $form ]] || return 0
+  exp="${BASH_REMATCH[4]}"
+  mag=$((10#${exp#[-+]}))
+  lead="${BASH_REMATCH[3]}00000000"
+  lead=$((10#${BASH_REMATCH[1]}${lead:0:8}))
+  if [[ "$exp" == -* ]]; then
+    if (( mag > 46 || (mag == 46 && lead < 701000000) )); then echo "$2 is too small a number for the app to read"; fi
+  elif (( mag > 38 || (mag == 38 && lead > 340282355) )); then
+    echo "$2 is too large a number for the app to read"
+  fi
+  return 0
+}
+
 # Prints one line per way the journal does not have the shape the app writes
 # (RuntimeState.swift). Present keys must have the right type; a JSON null is
 # the same as an absent optional (Swift decodeIfPresent).
@@ -489,10 +522,23 @@ journal_shape_problems() { # file
     t="$(type_of "$f" "$key")"
     [[ -z "$t" || "$t" == bool || "$t" == "(any)" ]] || echo "$key is a $t, not a bool"
   done
-  for key in savedOutputVolume savedDisplayBrightness savedKeyboardBrightness; do
+  for key in savedOutputVolume savedDisplayBrightness savedKeyboardBrightness displayRestoredUnderLowPower; do
     t="$(type_of "$f" "$key")"
     [[ -z "$t" || "$t" == float || "$t" == integer || "$t" == "(any)" ]] || echo "$key is a $t, not a number"
   done
+  # The app's records about a kept display entry: kept for the app, never
+  # read for an undo here. Each must still decode, or the app cannot read
+  # the journal at all.
+  for key in keptDisplayUnderLowPower keptDisplayReadLit; do
+    t="$(type_of "$f" "$key")"
+    if [[ "$t" == float ]]; then
+      float_range_problem "$f" "$key"
+    elif [[ -n "$t" && "$t" != integer && "$t" != "(any)" ]]; then
+      echo "$key is a $t, not a number"
+    fi
+  done
+  t="$(type_of "$f" keptDisplayUnderLowPowerBoot)"
+  [[ -z "$t" || "$t" == string || "$t" == "(any)" ]] || echo "keptDisplayUnderLowPowerBoot is a $t, not a string"
   t="$(type_of "$f" frozenProcesses)"
   if [[ -n "$t" && "$t" != "(any)" ]]; then
     if [[ "$t" != array ]]; then

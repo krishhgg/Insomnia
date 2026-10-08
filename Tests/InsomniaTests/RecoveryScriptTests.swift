@@ -2376,7 +2376,7 @@ final class RecoveryScriptTests: XCTestCase {
     func testNullOptionalFieldsCountAsAbsent() throws {
         // Swift's decodeIfPresent treats null as nil; the shell must agree.
         try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
-        let json = #"{"sleepDisabledByUs":false,"lowPowerSetByUs":null,"frozenProcesses":[],"dockerFrozen":false,"savedOutputVolume":null,"savedMuted":null,"savedDisplayBrightness":null,"savedKeyboardBrightness":null,"frozenPids":null,"appNapOverrides":null,"savedAudioOutputs":null}"#
+        let json = #"{"sleepDisabledByUs":false,"lowPowerSetByUs":null,"frozenProcesses":[],"dockerFrozen":false,"savedOutputVolume":null,"savedMuted":null,"savedDisplayBrightness":null,"savedKeyboardBrightness":null,"frozenPids":null,"appNapOverrides":null,"savedAudioOutputs":null,"displayRestoreRefused":null,"keyboardRestoreRefused":null,"displayRestoredUnderLowPower":null,"keptDisplayUnderLowPower":null,"keptDisplayUnderLowPowerBoot":null,"keptDisplayReadLit":null}"#
         try fx.writeState(json)
 
         let r = try fx.run(fx.backstop)
@@ -2428,6 +2428,163 @@ final class RecoveryScriptTests: XCTestCase {
             XCTAssertTrue(f.exists(f.app), json)
             XCTAssertEqual(try String(contentsOf: f.state, encoding: .utf8), json)
             XCTAssertTrue(r.stderr.contains("malformed") || r.stderr.contains("not a JSON object"), r.stderr)
+        }
+    }
+
+    // MARK: Kept display records
+
+    /// A journal with a kept display entry and the app's records about it,
+    /// sleep and Low Power Mode still ours: a run that took it for clean
+    /// would call pmset twice and republish it.
+    static func keptDisplayJournal(_ records: String, ours: Bool = true) -> String {
+        #"{"sleepDisabledByUs":\#(ours),"lowPowerSetByUs":\#(ours),"frozenProcesses":[],"dockerFrozen":false,"savedDisplayBrightness":0.8,"displayRestoreRefused":true"#
+            + (records.isEmpty ? "" : "," + records) + "}"
+    }
+
+    /// Records the app's decoder refuses, each with the key the log names:
+    /// wrong types, and numbers a Float cannot hold.
+    static let malformedKeptDisplayRecords: [(key: String, json: String)] = [
+        ("keptDisplayUnderLowPower", #""keptDisplayUnderLowPower":"0.8""#),
+        ("keptDisplayUnderLowPower", #""keptDisplayUnderLowPower":true"#),
+        ("keptDisplayUnderLowPower", #""keptDisplayUnderLowPower":[0.8]"#),
+        ("keptDisplayUnderLowPower", #""keptDisplayUnderLowPower":1e39"#),
+        ("keptDisplayUnderLowPower", #""keptDisplayUnderLowPower":-1e39"#),
+        ("keptDisplayUnderLowPower", #""keptDisplayUnderLowPower":1e-50"#),
+        ("keptDisplayReadLit", #""keptDisplayReadLit":"0.8""#),
+        ("keptDisplayReadLit", #""keptDisplayReadLit":false"#),
+        ("keptDisplayReadLit", #""keptDisplayReadLit":{"value":0.8}"#),
+        ("keptDisplayReadLit", #""keptDisplayReadLit":3.5e38"#),
+        ("keptDisplayReadLit", #""keptDisplayReadLit":5e-46"#),
+        ("keptDisplayUnderLowPowerBoot", #""keptDisplayUnderLowPowerBoot":7"#),
+        ("keptDisplayUnderLowPowerBoot", #""keptDisplayUnderLowPowerBoot":true"#),
+        ("keptDisplayUnderLowPowerBoot", #""keptDisplayUnderLowPowerBoot":["boot-a"]"#),
+        ("displayRestoredUnderLowPower", #""displayRestoredUnderLowPower":"0.75""#),
+        ("displayRestoredUnderLowPower", #""displayRestoredUnderLowPower":false"#),
+    ]
+
+    /// Forms the app's decoder reads: null and absent are none, a number
+    /// may be written as an integer, and the ends of a Float's range hold.
+    static let validKeptDisplayRecords = [
+        "",
+        #""keptDisplayUnderLowPower":0.8,"keptDisplayUnderLowPowerBoot":"8F2C1A3E-0B6D-4C11-9E3F-2A7B5C4D1E00","keptDisplayReadLit":0.8"#,
+        #""keptDisplayUnderLowPower":1,"keptDisplayReadLit":0"#,
+        #""keptDisplayUnderLowPower":null,"keptDisplayUnderLowPowerBoot":null,"keptDisplayReadLit":null,"displayRestoredUnderLowPower":null"#,
+        #""keptDisplayUnderLowPowerBoot":"","displayRestoredUnderLowPower":0.75"#,
+        #""keptDisplayUnderLowPower":1e-45,"keptDisplayReadLit":3.4028235e38"#,
+        #""keptDisplayUnderLowPower":-3.4028235e38,"keptDisplayReadLit":-1e-45"#,
+    ]
+
+    static let keptDisplayRecordKeys = [
+        "keptDisplayUnderLowPower", "keptDisplayUnderLowPowerBoot", "keptDisplayReadLit", "displayRestoredUnderLowPower",
+    ]
+
+    /// A record the app could not decode makes the journal malformed, as
+    /// any other key of the wrong shape does: no pmset, the bytes and the
+    /// session kept, and the log names the key. The app's decoder refuses
+    /// each of these journals too.
+    func testMalformedKeptDisplayRecordsAreRejectedByBackstopWithoutCommands() throws {
+        for (key, record) in Self.malformedKeptDisplayRecords {
+            let json = Self.keptDisplayJournal(record)
+            XCTAssertThrowsError(try Store.makeDecoder().decode(RuntimeState.self, from: Data(json.utf8)), "the app refuses \(json)")
+            let f = try ScriptFixture()
+            defer { f.destroy() }
+            try f.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+            try f.writeState(json)
+
+            let r = try f.run(f.backstop)
+
+            XCTAssertNotEqual(r.status, 0, json)
+            XCTAssertEqual(f.calls(), [], "no privileged command for \(json)")
+            XCTAssertEqual(try String(contentsOf: f.state, encoding: .utf8), json, "evidence kept for \(json)")
+            XCTAssertTrue(f.exists(f.session), json)
+            XCTAssertTrue(f.log().contains("\(f.state.path): \(key) is "), "\(json): \(f.log())")
+            XCTAssertTrue(f.log().contains("is unreadable or malformed; nothing undone, evidence kept"), f.log())
+        }
+    }
+
+    /// Every form the app reads passes: sleep and the mode are undone, the
+    /// records stay as they were for the app, the published journal still
+    /// decodes in the app and passes the check on the next run.
+    func testValidKeptDisplayRecordsAreKeptForTheApp() throws {
+        for records in Self.validKeptDisplayRecords {
+            let json = Self.keptDisplayJournal(records)
+            let before = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
+            let decodedBefore = try Store.makeDecoder().decode(RuntimeState.self, from: Data(json.utf8))
+            let f = try ScriptFixture()
+            defer { f.destroy() }
+            try f.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+            try f.writeState(json)
+
+            let r = try f.run(f.backstop)
+
+            XCTAssertEqual(r.status, 0, json + r.stderr + f.log())
+            XCTAssertEqual(f.calls(), [
+                "sudo -n \(f.fakePmset) -a disablesleep 0",
+                "sudo -n \(f.fakePmset) -b lowpowermode 0",
+            ], json)
+            let after = try f.stateJSON()
+            XCTAssertEqual(after["lowPowerSetByUs"] as? Bool, false, json)
+            for key in Self.keptDisplayRecordKeys + ["savedDisplayBrightness", "displayRestoreRefused"] {
+                XCTAssertEqual(after[key] as? NSObject, before[key] as? NSObject, "\(key) in \(json)")
+            }
+            let published = try Data(contentsOf: f.state)
+            let decoded = try Store.makeDecoder().decode(RuntimeState.self, from: published)
+            XCTAssertEqual(decoded.keptDisplayUnderLowPower, decodedBefore.keptDisplayUnderLowPower, json)
+            XCTAssertEqual(decoded.keptDisplayUnderLowPowerBoot, decodedBefore.keptDisplayUnderLowPowerBoot, json)
+            XCTAssertEqual(decoded.keptDisplayReadLit, decodedBefore.keptDisplayReadLit, json)
+            XCTAssertEqual(decoded.displayRestoredUnderLowPower, decodedBefore.displayRestoredUnderLowPower, json)
+
+            let again = try f.run(f.backstop)
+            XCTAssertEqual(again.status, 0, json + again.stderr + f.log())
+            XCTAssertEqual(f.calls().count, 2, json)
+            XCTAssertFalse(f.log().contains("malformed"), f.log())
+            XCTAssertEqual(try Data(contentsOf: f.state), published, "a clean journal is not rewritten: \(json)")
+        }
+    }
+
+    /// uninstall.sh checks the same records itself: one the app could not
+    /// decode stops it with everything in place, even when the backstop
+    /// exits 0.
+    func testUninstallRejectsMalformedKeptDisplayRecordsEvenWhenBackstopExitsZero() throws {
+        for (key, record) in Self.malformedKeptDisplayRecords {
+            let json = Self.keptDisplayJournal(record, ours: false)
+            let f = try ScriptFixture()
+            defer { f.destroy() }
+            try f.installMachinery()
+            try "#!/bin/bash\nexit 0\n".write(to: f.backstop, atomically: true, encoding: .utf8)
+            try f.writeState(json)
+
+            let r = try f.run(f.uninstall, ["--purge"])
+
+            XCTAssertNotEqual(r.status, 0, json)
+            XCTAssertTrue(f.exists(f.plist), json)
+            XCTAssertTrue(f.exists(f.sudoers), json)
+            XCTAssertTrue(f.exists(f.app), json)
+            XCTAssertEqual(try String(contentsOf: f.state, encoding: .utf8), json)
+            XCTAssertTrue(r.stderr.contains("state.json is malformed (unexpected shape)"), "\(json): \(r.stderr)")
+            XCTAssertTrue(r.stderr.contains("\(key) is "), "\(json): \(r.stderr)")
+        }
+    }
+
+    /// The same records in a form the app reads do not stop the uninstall:
+    /// it completes past the kept entry, and state.json stays byte for byte
+    /// with them, even with --purge.
+    func testUninstallCompletesPastValidKeptDisplayRecordsAndKeepsThem() throws {
+        for records in Self.validKeptDisplayRecords {
+            let json = Self.keptDisplayJournal(records, ours: false)
+            let f = try ScriptFixture()
+            defer { f.destroy() }
+            try f.installMachinery()
+            try f.writeConfig(#"{"agentList":[]}"#)
+            try f.writeState(json)
+
+            let r = try f.run(f.uninstall, ["--purge"])
+
+            XCTAssertEqual(r.status, 0, json + r.stderr + r.stdout)
+            XCTAssertFalse(f.exists(f.plist), json)
+            XCTAssertFalse(f.exists(f.app), json)
+            XCTAssertEqual(try String(contentsOf: f.state, encoding: .utf8), json)
+            XCTAssertTrue(r.stdout.contains("  - display brightness 0.8"), r.stdout)
         }
     }
 

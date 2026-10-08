@@ -140,11 +140,14 @@ or found set since becomes its sample, so a close right after a late
 restore journals that level. A display reading above 0 under Insomnia's
 own Low Power Mode, or after it in the same boot, relaunches included,
 decides nothing, and a launch after a restart reads the entry again; a
-later reading of 0 in that run does not bring the kept value back either,
-unless the reading above 0 was taken under a closing lid, of a panel
-asleep, or of another entry. A close with no trusted level
-leaves the entry flagged and the panel lit, and only asks the display to
-sleep. A write whose clear state.json refuses is still written again 2 s
+later reading of 0, in that run, a relaunch or after a restart, does not
+bring the kept value back either (the reading above 0 is journaled), and
+once no doubt is left that 0 is the level set since, unless the reading
+above 0 was taken under a closing lid, of a panel asleep, or of another
+entry. A Low Power Mode claim journaled before a restart is read before the
+switch-off, and a mode read off then puts no doubt on the panel's reading.
+A close with no trusted level leaves the entry flagged and the panel lit,
+and only asks the display to sleep. A write whose clear state.json refuses is still written again 2 s
 later and, under the mode, after it. A `lowpowermode 0` that exits 0 while
 state.json refuses the ownership clear still does the write owed after
 the mode, and the display sample stays the level written after it until
@@ -178,6 +181,7 @@ is performed. Do not replace "not run" with "passed" based on source review.
 | A kept brightness at a launch with no session and the lid closed (an external display in clamshell mode, after a refused restore), on a build that can make the call: the log shows "not read: the lid is not known to be open" for each kept device and nothing is written, and once the lid opens "set since its restore" or "restored" | Not run |
 | A kept display brightness restored late during a session (launch with the display asleep after a refused restore, wake it, start a session at once, wait for "display restored", then close and open the lid within 30 s): the close logs "display darkened (was brightness" with the restored level, and the open brings the panel back at that level, not black | Not run |
 | A kept display brightness under Insomnia's own Low Power Mode, on a build that can make the call (after a refused restore, set the display by hand, start a session on battery below the floor so Insomnia switches the mode on, then open the lid): the log shows "under our low power mode, which rescales it" and nothing is written; once the mode is off, "after our low power mode was on in this run" and nothing is written, and a close logs "stays journaled and undecided, and the display is not darkened" and the panel goes dark only if the display sleep request is honored; after a relaunch with the lid open, "since the Mac last started" and nothing is written; after a restart, "set since its restore" with the level set by hand, and a close and open after that bring back that level | Not run |
+| A kept display brightness over a restart with Insomnia's Low Power Mode claimed (as in the row above, quit the app with `kill -9` while the mode is on, restart the Mac, set the display by hand, then launch on battery): the log shows "journaled as ours before the Mac last started, reads on" or "reads off"; with "reads off", "set since its restore" at that launch; with "reads on", nothing is written until the next restart. After an open under the mode read the panel above 0, set the display to 0 by hand, relaunch and then restart: the kept value never comes back over that 0, and after the restart the log shows "that 0 is a level set since" | Not run |
 | Freeze-all scope with agents running (Cursor/T3 Code/Claude untouched) | Not run |
 | Freeze-all off on a fresh config.json (list only) and on with a terminal, a non-Chrome browser and a JetBrains IDE open (all untouched) | Not run |
 | Real lid close with freeze-all on during a Zoom or Teams call on AirPods, with Wispr Flow or Granola taking notes: none of their processes stopped (`ps -o stat` shows no `T`), the call and the notes continue, other Dock apps frozen, sound muted | Not run |

@@ -195,6 +195,10 @@ final class LidActions {
     /// darkened, since the open would read the 0 left here as the darkening
     /// never undone and write the kept value. The display sleep request
     /// still goes, and is then the only thing that turns that panel off.
+    /// Such a value of 0 replaces the kept one only once a reading above 0
+    /// showed that entry's darkening undone
+    /// (`RuntimeState.keptDisplayReadLit`): before that, the 0 may still be
+    /// the darkening, and the kept value stays for the open to write.
     /// The keyboard reads 0 when suppressed by display sleep, so it takes
     /// the current read if trusted now, else the last trusted sample, else
     /// nothing, since restoring 0 would leave the backlight off for good.
@@ -241,9 +245,11 @@ final class LidActions {
                     // Keep an earlier save if a previous close was never
                     // undone. One kept after a refused restore gives way to
                     // the user's level above 0: the user was told to set it
-                    // by hand, so that is the level to come back to. The
-                    // device answered, so the entry is an ordinary one again.
-                    if s.savedDisplayBrightness == nil || (s.displayRestoreRefused && value > 0) {
+                    // by hand, so that is the level to come back to. A 0
+                    // is that level too once a reading above 0 showed the
+                    // darkening undone. The device answered, so the entry
+                    // is an ordinary one again.
+                    if s.savedDisplayBrightness == nil || (s.displayRestoreRefused && (value > 0 || s.keptDisplayReadLitHolds)) {
                         s.savedDisplayBrightness = value
                     }
                     s.displayRestoreRefused = false
