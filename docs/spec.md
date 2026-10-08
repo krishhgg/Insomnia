@@ -195,12 +195,16 @@ count a waiting entry as not restored, since nothing failed. The close
 left the device at 0, so a reading above 0 is a level set since, as the
 error asked: the darkening is already undone, and the entry is cleared
 without a write rather than overwrite that level. A display reading above
-0 taken while Insomnia's own Low Power Mode is on, or just after an end
-switched the mode off, is the mode's rescaled value and not that level,
-so it would become the sample a later close journals. The entry waits,
-and the re-read decides once the mode is off. A display still at 0 under
-the mode gets the saved value, written once more after the mode as for
-any restore under it. If state.json cannot
+0 taken while Insomnia's own Low Power Mode is on is the mode's rescaled
+value and not that level, and once the mode is off the panel comes back
+over a time nobody has measured. So no display reading above 0 taken
+under the mode, or after it in the same run of the app, decides the
+entry: it would become the sample a later close journals. The entry
+waits, and the next launch reads it again. A display still at 0 under or
+after the mode gets the saved value, written once more after the mode as
+for any restore under it, unless a reading above 0 in the same run showed
+the darkening undone: that 0 may be one the user set, and the saved value
+is not written over it. If state.json cannot
 take that clear, the entry still counts as done in this process. The clear
 is owed: it goes into the journal ahead of any later write, and at the
 start of every lid close, lid open, end and launch, so none of them works
@@ -226,8 +230,15 @@ journaled. A lid close that can read the device clears the flag too: it
 keeps the earlier saved value while the device reads 0, and saves the new
 level when it reads above 0. For the display that level must be trusted:
 the last sample, the value owed after the mode, or a current read taken
-outside Insomnia's Low Power Mode with the panel awake. A rescaled, dimmed
-or asleep read leaves the earlier value. A close whose journal write fails
+with the panel awake and Insomnia's Low Power Mode not on at any point in
+the run. Without one, the close leaves the entry flagged and the panel as
+it is. A rescaled, dimmed or asleep read is not the user's level, and the
+saved value may not be either, since the user may have set one by hand.
+A panel darkened to 0 would read at the open as the darkening never
+undone and get the saved value, so the close only asks the display to
+sleep, which macOS ignores while any process holds a display assertion;
+the panel then stays lit under the closed lid until the open, which reads
+the entry again as above. A close whose journal write fails
 darkens nothing and asks the display to sleep only for an entry this
 process has not settled. Uninstall goes ahead past a flagged entry, prints
 the saved level, and keeps state.json, even with `--purge`, so a later
@@ -403,7 +414,12 @@ and if the mode turns out to have been cleared by someone else (the
 backstop after a kill: it keeps the entry but never writes brightness);
 taking the mode over discards any entry left from an earlier interval in
 the same journal write. A Low Power Mode interval with no lid restore under
-it writes nothing. The
+it writes nothing. If state.json refuses to clear the mode's ownership
+after `lowpowermode 0` exits 0, the mode is off all the same: the clear is
+owed, as for a kept brightness, the write after the mode goes at once, and
+a later switch-off from the ownership still on disk compares nothing. If
+state.json refuses to clear the owed write itself, written or dropped,
+that clear is owed too, so no later journal write brings the value back. The
 sample the display journals dates from the last 30 s window in which the
 user was active with the lid open and the panel awake, and is held from
 before Insomnia's own Low Power Mode: a brightness change made within 30 s
@@ -852,7 +868,9 @@ Backstop, independent of the app:
   entry is cleared under the lock before the lock is released, and a
   display write owed for the end of the mode is done then. If the journal
   cannot be read or written then, the entry stays, the undo runs again,
-  and the menu says so. Any other exit confirms nothing. When the command
+  and the menu says so. For `lowpowermode 0` with a journal that cannot be
+  written, the clear is also owed, so the app takes the mode as off and
+  does the display write at once. Any other exit confirms nothing. When the command
   exits the app retries a pending end.
   Otherwise it reads Low Power Mode under the lock. A mode that reads on
   stays journaled as Insomnia's. A mode that reads off is switched off
@@ -866,7 +884,10 @@ Backstop, independent of the app:
   change still in the 2 s lid debounce has settled, and runs the floor
   rules again. A check that cannot take the lock, read the journal or the
   mode, switch the mode off, or write the journal runs again after the
-  retry delay while the session lasts.
+  retry delay while the session lasts. After a `lowpowermode 0` that
+  exited 0, the ownership clear the journal refused is owed: the retried
+  check's transaction writes it first, and the check then has nothing to
+  switch off.
 - Successful restores may clear their entries; failures must stay journaled.
   A journal write that fails to clear the entry of a successful restore is
   shown in the menu as well as logged, and the restore is retried. The

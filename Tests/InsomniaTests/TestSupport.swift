@@ -806,7 +806,7 @@ struct Harness {
     /// `keptRecheckDelay` and `keptRecheckSlowDelay` for the re-read of a
     /// kept brightness.
     /// `display` and `keyboard` replace the harness fakes, for a device
-    /// the private-call guard refuses.
+    /// the private-call guard refuses; `sleepGuard` wraps `guardFake`.
     func makeManager(
         lockTimeout: TimeInterval = 0.3,
         retryDelay: TimeInterval = 60,
@@ -815,14 +815,15 @@ struct Harness {
         keptRecheckAttempts: Int = 20,
         keptRecheckSlowDelay: Duration = .seconds(3600),
         display: (any DisplayDimming)? = nil,
-        keyboard: (any KeyboardBacklighting)? = nil
+        keyboard: (any KeyboardBacklighting)? = nil,
+        sleepGuard: (any SleepGuarding)? = nil
     ) -> SessionManager {
         let c = clock
         let lid = clamshell
         let table = processes
         return SessionManager(
             paths: home.paths,
-            sleepGuard: guardFake,
+            sleepGuard: sleepGuard ?? guardFake,
             processControl: procs,
             backstop: backstop,
             audio: audio,

@@ -187,10 +187,16 @@ final class LidActions {
     /// up to 30 s old: a brightness change made right before closing the
     /// lid is not seen. A value kept after a refused restore gives way only
     /// to a sample, the value owed after the mode, or a current read that
-    /// is trusted and taken outside our Low Power Mode. The keyboard reads 0
-    /// when suppressed by display sleep, so it takes the current read if
-    /// trusted now, else the last trusted sample, else nothing, since
-    /// restoring 0 would leave the backlight off for good.
+    /// is trusted and taken with our Low Power Mode never on in this run
+    /// (`SessionManager.keptDisplayReadDoubt`). Without one, the level may
+    /// be one the user set by hand, and the reading is no level to restore
+    /// either: the entry is left as it is, undecided, and the panel is not
+    /// darkened, since the open would read the 0 left here as the darkening
+    /// never undone and write the kept value. The display sleep request
+    /// still goes, and is then the only thing that turns that panel off.
+    /// The keyboard reads 0 when suppressed by display sleep, so it takes
+    /// the current read if trusted now, else the last trusted sample, else
+    /// nothing, since restoring 0 would leave the backlight off for good.
     private func darkenSavingCurrent(_ manager: SessionManager) {
         do {
             let current = try display.readBrightness()
@@ -198,8 +204,9 @@ final class LidActions {
             // clear the journal has not taken still owes its write.
             let journaled = manager.effectiveState
             let value: Float
-            // Whether `value` may replace a value kept after a refused restore.
-            var trusted = true
+            // Why `value` is not the user's level, if it may not be.
+            var doubt: String?
+            let kept = journaled.displayRestoreRefused ? journaled.savedDisplayBrightness : nil
             if let sampled = sampler?.last?.display {
                 value = sampled
                 if sampled != current {
@@ -210,39 +217,43 @@ final class LidActions {
                 Log.info("display brightness reads \(current) at the close under our low power mode with no sample; journaling the value restored under it, \(owed)")
             } else if journaled.lowPowerSetByUs {
                 value = current
-                trusted = false
+                doubt = "under our low power mode, which rescales it"
             } else if sampler?.displayReadIsTrusted ?? !display.isAsleep() {
                 value = current
+                doubt = manager.keptDisplayReadDoubt
             } else {
                 value = current
-                trusted = false
-                Log.info("display brightness read while dimmed or asleep and no trusted sample; restoring that value on open")
-            }
-            var keptOverRead: Float?
-            try manager.journal { s in
-                // Keep an earlier save if a previous close was never undone.
-                // One kept after a refused restore gives way to a trusted
-                // level above 0: the user was told to set it by hand, so
-                // that is the level to come back to. A read rescaled by our
-                // Low Power Mode, dimmed or asleep is not that level. The
-                // device answered, so the entry is an ordinary one again.
-                if s.savedDisplayBrightness == nil || (s.displayRestoreRefused && value > 0 && trusted) {
-                    s.savedDisplayBrightness = value
-                } else if s.displayRestoreRefused && value > 0 {
-                    keptOverRead = s.savedDisplayBrightness
+                doubt = "while dimmed or asleep"
+                if kept == nil {
+                    Log.info("display brightness read while dimmed or asleep and no trusted sample; restoring that value on open")
                 }
-                s.displayRestoreRefused = false
             }
-            if let kept = keptOverRead {
-                let why = journaled.lowPowerSetByUs ? "under our low power mode, which rescales it" : "while dimmed or asleep"
-                Log.info("display brightness reads \(current) at the close \(why); the value kept after a refused restore, \(kept), stays journaled")
-            }
-            do {
-                try display.setBrightness(0)
-                Log.info("display darkened (was brightness \(value))")
-            } catch {
-                // The journal entry stays: the open restores whatever is there.
-                Log.error("display darken failed: \(error.localizedDescription)")
+            if let kept, let doubt {
+                // The user was told to set the level by hand, and may have:
+                // neither that reading nor the kept value is the level to
+                // come back to. A reading above 0 also means a later 0 may
+                // be the user's (`keptDisplayLeftLit`).
+                if current > 0 { manager.keptDisplayLeftLit() }
+                Log.info("display brightness reads \(current) at the close \(doubt); the value kept after a refused restore, \(kept), stays journaled and undecided, and the display is not darkened, so the open reads it again")
+            } else {
+                try manager.journal { s in
+                    // Keep an earlier save if a previous close was never
+                    // undone. One kept after a refused restore gives way to
+                    // the user's level above 0: the user was told to set it
+                    // by hand, so that is the level to come back to. The
+                    // device answered, so the entry is an ordinary one again.
+                    if s.savedDisplayBrightness == nil || (s.displayRestoreRefused && value > 0) {
+                        s.savedDisplayBrightness = value
+                    }
+                    s.displayRestoreRefused = false
+                }
+                do {
+                    try display.setBrightness(0)
+                    Log.info("display darkened (was brightness \(value))")
+                } catch {
+                    // The journal entry stays: the open restores whatever is there.
+                    Log.error("display darken failed: \(error.localizedDescription)")
+                }
             }
         } catch {
             Log.error("display darken on lid close skipped: \(error.localizedDescription)")

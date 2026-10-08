@@ -933,9 +933,11 @@ final class StillRunningCommandTests: XCTestCase {
     /// The rollback exits 0, but the journal cannot be written, so its
     /// undo cannot be journaled as done. The check after it reads the mode
     /// off and switches it off, and cannot write the journal either. The
-    /// flag stays on disk, and the check runs again after the retry delay;
-    /// once the journal takes the write the floors switch the mode on
-    /// again.
+    /// flag stays on disk, the clear is owed, and the check runs again
+    /// after the retry delay. By then the journal takes writes: the owed
+    /// clear lands as the transaction starts, so the check finds no
+    /// ownership and runs no second `lowpowermode 0`, and the floors switch
+    /// the mode on again.
     func testCheckThatCouldNotWriteTheJournalRunsAgain() async throws {
         let m = h.makeManager(retryDelay: 0.2)
         let dir = h.home.paths.appSupport.path
@@ -955,8 +957,8 @@ final class StillRunningCommandTests: XCTestCase {
         await waitUntil("the check never ran again after the failed journal write") { floorRuns.value == 2 }
         XCTAssertEqual(
             Array(h.guardFake.calls.dropFirst(before.count)),
-            ["pmset -g custom", "lowpowermode 0", "pmset -g custom", "lowpowermode 0", "pmset -g custom", "lowpowermode 1"],
-            "the check whose write failed, the retried check, then the floors' enable"
+            ["pmset -g custom", "lowpowermode 0", "pmset -g custom", "lowpowermode 1"],
+            "the check whose write failed, then the floors' enable after the retried check landed the owed clear"
         )
         XCTAssertTrue(h.guardFake.lowPowerOn)
         XCTAssertEqual(try h.store.loadState()?.lowPowerSetByUs, true)
@@ -1156,9 +1158,10 @@ final class StillRunningCommandTests: XCTestCase {
     /// clear its entry fails. The command's line goes with the exit; the
     /// menu says instead that the entry stays and is retried. The check
     /// that follows cannot read the mode here, which it only logs, so that
-    /// line stays in the menu. Once the journal takes writes and the mode
-    /// reads again, the retried check switches the mode off and clears the
-    /// entry, and the line goes with it while the session still runs.
+    /// line stays in the menu. The clear is owed: once the journal takes
+    /// writes, the retried check's transaction lands it first, and the
+    /// check runs no second `lowpowermode 0` after the one that exited 0.
+    /// The line goes with the entry while the session still runs.
     func testLateSwitchOffWhoseClearFailsIsShownInTheMenu() async throws {
         let m = h.makeManager(retryDelay: 0.2)
         m.resyncAfterCommand = { _ in }
@@ -1183,8 +1186,8 @@ final class StillRunningCommandTests: XCTestCase {
         h.guardFake.throwOn = []
         await waitUntil("the retried check never cleared the entry") { (try? self.h.store.loadState()?.lowPowerSetByUs) == false }
         let after = Array(h.guardFake.calls.dropFirst(before.count))
-        XCTAssertEqual(after.filter { $0 != "pmset -g custom" }, ["lowpowermode 0"], "the switch-off the retried check confirms with")
-        XCTAssertEqual(after.suffix(2), ["pmset -g custom", "lowpowermode 0"])
+        XCTAssertFalse(after.isEmpty, "the check never read the mode")
+        XCTAssertEqual(after.filter { $0 != "pmset -g custom" }, [], "the mode switched off again after a lowpowermode 0 that exited 0")
         XCTAssertNil(m.lastError, "the line still says a clear that went through will be retried")
         XCTAssertEqual(try h.store.loadState()?.sleepDisabledByUs, true)
         XCTAssertFalse(try lockIsHeld())

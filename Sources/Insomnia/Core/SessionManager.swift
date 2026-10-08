@@ -213,8 +213,15 @@ final class SessionManager {
         var freeze = UndoneFreeze()
         var display: KeptEdit?
         var keyboard: KeptEdit?
+        /// The display write owed after Low Power Mode was dropped or done
+        /// (`clearDisplayWriteAfterLowPower`).
+        var displayWriteAfterLowPowerCleared = false
+        /// Insomnia's Low Power Mode went off (`clearLowPowerOwnership`).
+        var lowPowerOff = false
 
-        var isEmpty: Bool { freeze.isEmpty && display == nil && keyboard == nil }
+        var isEmpty: Bool {
+            freeze.isEmpty && display == nil && keyboard == nil && !displayWriteAfterLowPowerCleared && !lowPowerOff
+        }
 
         /// An unflag still owed leaves a failed restore on disk looking
         /// like one no build can make, which backstop.sh and uninstall.sh
@@ -223,6 +230,11 @@ final class SessionManager {
 
         var keptLines: [String] {
             [display?.written("display brightness"), keyboard?.written("keyboard backlight")].compactMap { $0 }
+        }
+
+        var lowPowerLines: [String] {
+            [displayWriteAfterLowPowerCleared ? "display write owed after low power mode cleared from the journal" : nil,
+             lowPowerOff ? "low power mode, switched off, cleared from the journal" : nil].compactMap { $0 }
         }
 
         /// Kept entries settled, as set since or restored, whose clear the
@@ -240,8 +252,12 @@ final class SessionManager {
 
         func apply(to s: inout RuntimeState) {
             freeze.apply(to: &s)
+            // Before the display's edit, so a restore owed after the
+            // clear keeps its own write after the mode.
+            if displayWriteAfterLowPowerCleared { s.displayRestoredUnderLowPower = nil }
             display?.apply(to: &s, saved: \.savedDisplayBrightness, flag: \.displayRestoreRefused, restoredUnderLowPower: \.displayRestoredUnderLowPower)
             keyboard?.apply(to: &s, saved: \.savedKeyboardBrightness, flag: \.keyboardRestoreRefused)
+            if lowPowerOff { s.lowPowerSetByUs = false }
         }
     }
 
@@ -250,17 +266,49 @@ final class SessionManager {
     /// on their own at the start of every transaction, so a lid close or
     /// any other write never works from an entry this process already
     /// settled. In memory only: after a relaunch, reconcile finds the pids
-    /// of an undone freeze running and clears their entries itself, and
-    /// reads a kept brightness again.
+    /// of an undone freeze running and clears their entries itself, reads
+    /// a kept brightness again, and switches off once more a Low Power
+    /// Mode still journaled as ours, which changes nothing.
     private var owedEdits = OwedEdits()
 
     /// The journal as it reads once the owed edits are written: what is
-    /// frozen right now, and which brightness is still Insomnia's to
-    /// restore. The status menu and the sampler read this, not `state`.
+    /// frozen right now, which brightness is still Insomnia's to restore,
+    /// and whether Insomnia's Low Power Mode is on. The status menu and the
+    /// sampler read this, not `state`.
     var effectiveState: RuntimeState {
         var s = state
         owedEdits.apply(to: &s)
         return s
+    }
+
+    /// The journal has said, at some point in this run, that Insomnia's own
+    /// Low Power Mode is on. The mode rescales the panel, and once it is
+    /// off macOS brings the panel back over a time nobody has measured, so
+    /// from then on no display reading in this run is taken as the level
+    /// the user set (`keptDisplayReadDoubt`).
+    @ObservationIgnored private var lowPowerWasOurs = false
+
+    /// A display brightness kept after a refused restore read above 0 in
+    /// this run, by a reading that did not decide it. The darkening is
+    /// undone, so a later reading of 0 may be a level set since and does
+    /// not bring the kept value back (see restoreDisplay).
+    @ObservationIgnored private var keptDisplayReadLit = false
+
+    /// Why a reading of the display does not show the level set since a
+    /// value kept after a refused restore, or nil when it may: under
+    /// Insomnia's Low Power Mode it reads the mode's rescaled value, and
+    /// after it, a value on its way back. Such a value is never adopted:
+    /// the entry stays, and the next launch reads it again.
+    var keptDisplayReadDoubt: String? {
+        if effectiveState.lowPowerSetByUs { return "under our low power mode, which rescales it" }
+        if lowPowerWasOurs { return "after our low power mode was on in this run, which rescales it until some time after it goes off" }
+        return nil
+    }
+
+    /// For a lid close that read the display above 0 and left a kept
+    /// value undecided (`keptDisplayReadLit`).
+    func keptDisplayLeftLit() {
+        keptDisplayReadLit = true
     }
 
     /// Fire date of the single deadline timer, exposed for tests and the menu.
@@ -486,6 +534,7 @@ final class SessionManager {
             Log.error(loadError!)
         }
         self.state = loadedState ?? .clean
+        self.lowPowerWasOurs = loadedState?.lowPowerSetByUs ?? false
         self.lastError = loadError
         if var c = (try? store.loadConfig()) ?? nil {
             // Settings keeps the end floor below the Low Power Mode floor; a
@@ -662,6 +711,7 @@ final class SessionManager {
     /// not decode throws and is left exactly as it is.
     private func loadJournal() throws {
         state = try store.loadState() ?? .clean
+        if state.lowPowerSetByUs { lowPowerWasOurs = true }
     }
 
     /// Returns the line put in the menu.
@@ -742,7 +792,7 @@ final class SessionManager {
             guard clearUndone("sleep restored (\(command.description) exited 0)", clear) else { return }
             Log.info("sleep restored: \(command.description) exited 0")
         case .lowPowerOff:
-            guard clearUndone("low power mode switched off (\(command.description) exited 0)", clear) else { return }
+            clearLowPowerOwnership("low power mode switched off (\(command.description) exited 0)")
             Log.info("low power mode off: \(command.description) exited 0")
             settleDisplayAfterLowPower()
         }
@@ -770,6 +820,24 @@ final class SessionManager {
     private func failUncleared(_ message: String, _ clear: @escaping (inout RuntimeState) -> Void) {
         fail(message)
         uncleared = (message, clear)
+    }
+
+    /// Insomnia's Low Power Mode is off: a `lowpowermode 0` exited 0. Its
+    /// ownership is cleared like any confirmed undo (`clearUndone`). If the
+    /// journal refuses, the entry stays on disk and in the menu, and the
+    /// clear is owed as well (see `owedEdits`): the mode is off all the
+    /// same, so the display write owed after it goes now, as when the clear
+    /// lands. Left for a retry, it would meet a panel the mode's end has
+    /// rescaled, which reads like a level the user set, and be dropped.
+    /// Until a write lands the disk still claims the mode, so an end, the
+    /// floors or the agent may switch it off once more, as after any
+    /// failed clear. Returns whether the journal took the clear.
+    @discardableResult
+    private func clearLowPowerOwnership(_ what: String) -> Bool {
+        lowPowerWasOurs = true
+        guard !clearUndone(what, { $0.lowPowerSetByUs = false }) else { return true }
+        owedEdits.lowPowerOff = true
+        return false
     }
 
     /// `failUncleared` for an undo that reports its errors in one message:
@@ -926,10 +994,12 @@ final class SessionManager {
             Log.error("low power mode reads off after the power command, but lowpowermode 0 failed; ownership kept in the journal and checked again in \(Int(recoveryRetryDelay)) s: \(error.localizedDescription)")
             return false
         }
-        guard clearUndone("low power mode confirmed off after the power command", { $0.lowPowerSetByUs = false }) else { return false }
-        Log.info("low power mode confirmed off after the power command; ownership cleared from the journal")
+        let cleared = clearLowPowerOwnership("low power mode confirmed off after the power command")
+        if cleared {
+            Log.info("low power mode confirmed off after the power command; ownership cleared from the journal")
+        }
         settleDisplayAfterLowPower()
-        return true
+        return cleared
     }
 
     /// A `sudo pmset` did not stop on SIGTERM (`CommandStillRunningError`).
@@ -1325,7 +1395,7 @@ final class SessionManager {
         owedEdits.apply(to: &s)
         mutate(&s)
         try persistState(s)
-        for line in owedEdits.keptLines { Log.info(line) }
+        for line in owedEdits.keptLines + owedEdits.lowPowerLines { Log.info(line) }
         owedEdits = OwedEdits()
     }
 
@@ -1348,6 +1418,9 @@ final class SessionManager {
             }
             if !owedEdits.keptLines.isEmpty {
                 Log.error("could not write the brightness edits owed to the journal: \(error.localizedDescription); the next journal write or transaction tries again")
+            }
+            if !owedEdits.lowPowerLines.isEmpty {
+                Log.error("could not write the low power mode edits owed to the journal: \(error.localizedDescription); the next journal write or transaction tries again")
             }
         }
     }
@@ -1411,7 +1484,7 @@ final class SessionManager {
                 fail("could not enable low power mode: \(error.localizedDescription)")
                 do {
                     try await sleepGuard.setLowPowerMode(false)
-                    clearUndone("low power mode switched off after the failed enable") { $0.lowPowerSetByUs = false }
+                    clearLowPowerOwnership("low power mode switched off after the failed enable")
                 } catch let still as CommandStillRunningError {
                     // The rollback itself is left running, and the lock
                     // stays with it. Ownership stays journaled until it has
@@ -1437,7 +1510,7 @@ final class SessionManager {
             dropDisplayWriteIfMoved()
             do {
                 try await sleepGuard.setLowPowerMode(false)
-                clearUndone("low power mode switched off") { $0.lowPowerSetByUs = false }
+                clearLowPowerOwnership("low power mode switched off")
                 Log.info("low power mode off")
                 settleDisplayAfterLowPower()
                 return true
@@ -1497,7 +1570,7 @@ final class SessionManager {
             dropDisplayWriteIfMoved()
             do {
                 try await sleepGuard.setLowPowerMode(false)
-                clearUndone("low power mode cleared") { $0.lowPowerSetByUs = false }
+                clearLowPowerOwnership("low power mode cleared")
                 Log.info("low power mode cleared")
                 lowPowerJustCleared = true
             } catch let still as CommandStillRunningError {
@@ -1510,7 +1583,7 @@ final class SessionManager {
             dropDisplayWrite(reason: "the mode was cleared by someone else")
         }
 
-        undoLidActionsInJournal(lowPowerJustEnded: lowPowerJustCleared)
+        undoLidActionsInJournal()
         restoreAppNapInJournal()
         // After the undo: a restore just written with the mode off owes
         // nothing more (its journal write clears the entry), and a lid
@@ -1820,10 +1893,8 @@ final class SessionManager {
     }
 
     /// Shared body of lid open, reconcile (lid open) and `restoreAll()`;
-    /// each entry is journaled as soon as it is undone. `lowPowerJustEnded`:
-    /// `restoreAll()` switched Insomnia's Low Power Mode off a moment ago
-    /// (see restoreDisplay).
-    private func undoLidActionsInJournal(lowPowerJustEnded: Bool = false) {
+    /// each entry is journaled as soon as it is undone.
+    private func undoLidActionsInJournal() {
         // Every error of this undo goes into one report at the end, so a
         // refused brightness restore, which recurs at every lid open and
         // launch, does not hide a failed resume, audio or write beside it.
@@ -1887,7 +1958,7 @@ final class SessionManager {
         if let saved = kept.savedDisplayBrightness, let why = display.refusal() {
             refused.append(keepRefusedRestore("Display brightness", saved: saved, why: why, flag: \.displayRestoreRefused))
         } else if let saved = kept.savedDisplayBrightness {
-            restoredDisplay = restoreDisplay(saved: saved, lowPowerJustEnded: lowPowerJustEnded, waiting: &waiting, errors: &errors)
+            restoredDisplay = restoreDisplay(saved: saved, waiting: &waiting, errors: &errors)
         }
         if let saved = kept.savedKeyboardBrightness, let why = keyboard.refusal() {
             refused.append(keepRefusedRestore("Keyboard backlight", saved: saved, why: why, flag: \.keyboardRestoreRefused))
@@ -1920,29 +1991,35 @@ final class SessionManager {
     /// call: written, and the entry cleared. Returns the value written, for
     /// the re-assert. A value kept after a refused restore is read first,
     /// and may be cleared without a write or left waiting: see keptLevel.
-    /// A level above 0 read while Insomnia's Low Power Mode is on, or just
-    /// after `restoreAll()` switched it off, is the mode's rescaled value,
-    /// not the user's: it would become the sampler's sample and so the
-    /// level the next close journals. The entry waits, and the re-read
-    /// decides once the mode is off. A reading of 0 still writes the kept
-    /// value, owed once more after the mode as for any restore under it.
-    private func restoreDisplay(saved: Float, lowPowerJustEnded: Bool = false, waiting: inout [String], errors: inout [String]) -> Float? {
+    /// A level above 0 read under Insomnia's Low Power Mode, or after it
+    /// in this run (`keptDisplayReadDoubt`), may be the mode's rescaled
+    /// value or one on its way back, not the user's: it would become the
+    /// sampler's sample and so the level the next close journals. The
+    /// entry waits, and is decided at the next launch. A reading of 0
+    /// still writes the kept value, owed once more after the mode as for
+    /// any restore under it, unless the display read above 0 since
+    /// (`keptDisplayReadLit`): that 0 may be the user's.
+    private func restoreDisplay(saved: Float, waiting: inout [String], errors: inout [String]) -> Float? {
         if effectiveState.displayRestoreRefused {
             switch keptLevel(read: { try display.readBrightness() },
                              untrusted: { display.isAsleep() ? "the display is asleep" : nil }) {
             case .undecided(let why):
                 waiting.append("display brightness \(saved), kept after a refused restore, not read: \(why)")
                 return nil
-            case .setSince(let now) where effectiveState.lowPowerSetByUs || lowPowerJustEnded:
-                let when = lowPowerJustEnded ? "just after Insomnia's Low Power Mode went off" : "while Insomnia's Low Power Mode is on"
-                waiting.append("display brightness \(saved), kept after a refused restore, reads \(now) \(when); the mode rescales the panel, so that is not taken as a level set since")
-                return nil
             case .setSince(let now):
+                if let doubt = keptDisplayReadDoubt {
+                    keptDisplayReadLit = true
+                    waiting.append("display brightness \(saved), kept after a refused restore, reads \(now) \(doubt); that is not taken as a level set since")
+                    return nil
+                }
                 clearSetSince("display brightness", saved: saved, now: now, owed: \.display, errors: &errors) { s in
                     s.savedDisplayBrightness = nil
                     s.displayRestoreRefused = false
                 }
                 didSettleBrightness?(now, nil)
+                return nil
+            case .dark where keptDisplayReadLit:
+                waiting.append("display brightness \(saved), kept after a refused restore, reads 0 after it read above 0 in this run; that 0 may be a level set since, so the kept value is not written")
                 return nil
             case .dark:
                 break
@@ -1958,8 +2035,9 @@ final class SessionManager {
         Log.info("display restored (brightness \(saved))")
         didSettleBrightness?(saved, nil)
         // Written under our Low Power Mode: written again once the
-        // mode is off, since the mode's end rescales the panel.
-        let underLowPower = state.lowPowerSetByUs
+        // mode is off, since the mode's end rescales the panel. A mode
+        // switched off whose clear is owed is off.
+        let underLowPower = effectiveState.lowPowerSetByUs
         let clear: (inout RuntimeState) -> Void = { s in
             s.savedDisplayBrightness = nil
             s.displayRestoreRefused = false
@@ -2123,11 +2201,11 @@ final class SessionManager {
             try display.setBrightness(value)
             Log.info("display restored again after low power mode (brightness \(value))")
             didSettleBrightness?(value, nil)
-            try? journal { $0.displayRestoredUnderLowPower = nil }
+            clearDisplayWriteAfterLowPower()
             scheduleReassert(display: value, keyboard: nil)
         } catch {
             Log.error("display restore after low power mode failed: \(error.localizedDescription)")
-            try? journal { $0.displayRestoredUnderLowPower = nil }
+            clearDisplayWriteAfterLowPower()
         }
     }
 
@@ -2147,10 +2225,28 @@ final class SessionManager {
     private func dropDisplayWrite(reason: String) {
         guard effectiveState.displayRestoredUnderLowPower != nil else { return }
         Log.info("display restore after low power mode dropped: \(reason)")
-        try? journal { $0.displayRestoredUnderLowPower = nil }
+        clearDisplayWriteAfterLowPower()
         // The open's own second write of that value, if still pending,
         // would land it all the same.
         pendingReassert.display = nil
+    }
+
+    /// The display write owed after Low Power Mode, done or dropped, off
+    /// the journal. If the journal refuses, the clear is owed (see
+    /// `owedEdits`), so no later write puts the value back: neither one
+    /// that succeeds with the entry still on disk, nor a restore owed
+    /// under the mode, whose own write after the mode is taken out too. A
+    /// restore owed after this one keeps its write.
+    private func clearDisplayWriteAfterLowPower() {
+        do {
+            try journal { $0.displayRestoredUnderLowPower = nil }
+        } catch {
+            owedEdits.displayWriteAfterLowPowerCleared = true
+            if case let .restored(value, true)? = owedEdits.display {
+                owedEdits.display = .restored(value, underLowPower: false)
+            }
+            Log.error("could not clear the display write owed after low power mode from the journal: \(error.localizedDescription); it is not made, and the next journal write or transaction clears it")
+        }
     }
 
     /// The second write of a restore, `reassertDelay` later. Best effort:
@@ -2696,6 +2792,7 @@ final class SessionManager {
     private func persistState(_ s: RuntimeState) throws {
         try store.saveState(s)
         state = s
+        if s.lowPowerSetByUs { lowPowerWasOurs = true }
         // The entry a failed clear left is gone once its clear changes no
         // undo entry of what was written, or nothing is left to undo,
         // whichever write did it. The display write owed after Low Power
