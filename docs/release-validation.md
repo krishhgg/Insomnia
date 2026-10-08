@@ -149,8 +149,21 @@ is not taken as a level set since either, however late it is read, since
 macOS may still hold the panel at a closing lid's 0: the entry stays
 flagged until the panel reads above 0. If state.json refuses that record,
 Quit waits until it lands. A Low Power Mode claim journaled before a
-restart is read before the switch-off, and a mode read off then puts no
-doubt on the panel's reading. A close with no trusted level leaves the
+restart is read before the switch-off, and the read only goes to the
+log. Whether the mode reads on, off or not at all, the switch-off counts
+as Insomnia's in this boot, since a mode that reads off may have gone off
+only a moment ago. The kept display entry is recorded for this boot, so
+it stays flagged, and the display is not sampled, through this boot,
+relaunches included. A mode off since long before the launch reads the
+same, and its entry waits the same way, at the same cost. Only a launch
+after a restart that came after state.json took the ownership clear can
+decide the entry, and only by a trusted reading with the lid known open
+and the panel awake. After a reading above 0, a 0 still waits for a
+reading above 0. A boot session that cannot be read, a lid not known to
+be open, a panel asleep or unreadable, or a state.json that refuses the
+writes can keep the entry waiting longer. That a restart ends the mode's
+rescale is assumed, not measured, and a restart clears no entry by
+itself. A close with no trusted level leaves the
 entry flagged and the panel lit, and only asks the display to sleep. After
 a reading above 0, a close whose only level is a 0 read under the closing
 lid leaves the entry flagged too. A write whose clear state.json refuses is still written again 2 s

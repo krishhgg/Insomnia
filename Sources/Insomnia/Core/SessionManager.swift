@@ -3089,10 +3089,17 @@ final class SessionManager {
     /// still flags the entry, and backstop.sh and uninstall.sh pass over
     /// it. That is now right, since the device holds the value. The clear
     /// is owed instead, replacing any unflag owed for an earlier failed
-    /// write, so an end no longer waits on this process for the entry, and
-    /// a lid close or a later end does not work from it. `underLowPower`
-    /// keeps the display's write owed for when Insomnia's Low Power Mode
-    /// goes off, which the clear would have journaled.
+    /// write, so a lid close or an undo works from the entry as settled
+    /// (`effectiveState`), not from the disk. `underLowPower` keeps the
+    /// display's write owed for when Insomnia's Low Power Mode goes off,
+    /// which the clear would have journaled. While the disk still holds the
+    /// entry with this value and its flag, an end, Quit included, returns
+    /// `.incomplete(agentArmed: false)` and stays pending, so Start is
+    /// refused, and it is retried until the clear lands
+    /// (`OwedEdits.settlesAKeptEntry`), since a relaunch would read the
+    /// entry again and could write the saved value over a 0 set since. An
+    /// entry the disk holds with another value, or without its flag, is
+    /// left as it is by the owed clear, which then holds up no end.
     private func settleRestored(_ saved: Float, underLowPower: Bool = false, flag: KeyPath<RuntimeState, Bool>, owed: WritableKeyPath<OwedEdits, KeptEdit?>) {
         guard state[keyPath: flag] else { return }
         owedEdits[keyPath: owed] = .restored(saved, underLowPower: underLowPower)
