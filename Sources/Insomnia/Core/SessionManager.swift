@@ -52,6 +52,16 @@ enum EndOutcome: Sendable, Equatable {
     /// end is retried when the command exits, and quit is refused meanwhile
     /// so the app is still there to retry it.
     case privilegedCommandRunning(pid: Int32)
+
+    /// Whether a quit may go ahead after an end with this outcome
+    /// (`AppDelegate.applicationShouldTerminate`): only once nothing is
+    /// left that this process alone can finish.
+    var letsQuitGo: Bool {
+        switch self {
+        case .restored, .incomplete(agentArmed: true): true
+        case .locked, .incomplete(agentArmed: false), .sessionRetained, .journalUnreadable, .privilegedCommandRunning: false
+        }
+    }
 }
 
 /// Why a lifecycle transaction did not run at all. A busy lock and an
@@ -190,6 +200,13 @@ final class SessionManager {
             return false
         }
 
+        /// A clear, of a level set since or restored, while the journal
+        /// `s` still holds the entry with that value and its flag. Lost, it
+        /// leaves that entry for the next launch to read again.
+        func clearsEntry(in s: RuntimeState, saved: KeyPath<RuntimeState, Float?>, flag: KeyPath<RuntimeState, Bool>) -> Bool {
+            !isUnflag && s[keyPath: flag] && s[keyPath: saved] == self.saved
+        }
+
         func apply(to s: inout RuntimeState, saved: WritableKeyPath<RuntimeState, Float?>, flag: WritableKeyPath<RuntimeState, Bool>, restoredUnderLowPower: WritableKeyPath<RuntimeState, Float?>? = nil) {
             guard s[keyPath: flag], s[keyPath: saved] == self.saved else { return }
             if !isUnflag { s[keyPath: saved] = nil }
@@ -232,6 +249,16 @@ final class SessionManager {
         /// like one no build can make, which backstop.sh and uninstall.sh
         /// pass over: only this process can finish it.
         var hidesARestore: Bool { display?.isUnflag == true || keyboard?.isUnflag == true }
+
+        /// A kept entry settled, as set since or restored, whose clear the
+        /// journal `s` has not taken. On disk the entry still reads as
+        /// kept, so a launch after a quit reads it again, and writes the
+        /// saved value over a 0 the user set since. An end does not let
+        /// quit go while one is owed (`performEnd`).
+        func settlesAKeptEntry(in s: RuntimeState) -> Bool {
+            display?.clearsEntry(in: s, saved: \.savedDisplayBrightness, flag: \.displayRestoreRefused) == true
+                || keyboard?.clearsEntry(in: s, saved: \.savedKeyboardBrightness, flag: \.keyboardRestoreRefused) == true
+        }
 
         var keptLines: [String] {
             [display?.written("display brightness"), keyboard?.written("keyboard backlight"),
@@ -279,7 +306,11 @@ final class SessionManager {
     /// settled. In memory only: after a relaunch, reconcile finds the pids
     /// of an undone freeze running and clears their entries itself, reads
     /// a kept brightness again, and switches off once more a Low Power
-    /// Mode still journaled as ours, which changes nothing.
+    /// Mode still journaled as ours, which changes nothing. A kept
+    /// brightness read again could get its saved value written over a 0
+    /// set since, so an end does not let quit go while the clear of one
+    /// is owed (`OwedEdits.settlesAKeptEntry`), nor while a failed
+    /// restore's flag or a reading above 0 is.
     private var owedEdits = OwedEdits()
 
     /// The journal as it reads once the owed edits are written: what is
@@ -1375,7 +1406,13 @@ final class SessionManager {
         // the darkening never undone and gets the kept value. So quit
         // waits until it reaches the disk, as for a hidden failed restore.
         let owedReadLit = owedEdits.displayReadLit
-        if dirty || retainedBecause != nil || owedReadLit != nil {
+        // So is a kept entry this process settled, as set since or
+        // restored, whose clear the journal has not taken. On disk the
+        // entry still reads as kept: the next launch would read it again
+        // and write the saved value over a 0 the user sets meanwhile. Quit
+        // waits for that clear too.
+        let owedSettlement = owedEdits.settlesAKeptEntry(in: state)
+        if dirty || retainedBecause != nil || owedReadLit != nil || owedSettlement {
             // The journal is the retry list. Make sure something will read it.
             var armed = true
             if dirty {
@@ -1407,9 +1444,14 @@ final class SessionManager {
             if let owedReadLit {
                 Log.info("end: the journal has not taken that display brightness \(owedReadLit), kept after a refused restore, read above 0; a relaunch without it would write that value over a 0 set since, so Insomnia keeps it and retries")
             }
-            let agentCanFinish = armed && !owedEdits.hidesARestore && owedReadLit == nil
+            if owedSettlement {
+                Log.info("end: the journal has not taken the clear of a brightness kept after a refused restore and settled in this process; a relaunch would read that entry again and could write its saved value over a 0 set since, so Insomnia keeps it and retries")
+            }
+            let agentCanFinish = armed && !owedEdits.hidesARestore && owedReadLit == nil && !owedSettlement
+            let unrecorded = [owedSettlement ? "that a brightness kept after a refused restore is settled" : nil,
+                              owedReadLit != nil ? "a reading of the display brightness kept after a refused restore" : nil]
             let detail = dirty ? (lastError ?? "some changes could not be undone")
-                : "state.json could not record a reading of the display brightness kept after a refused restore"
+                : "state.json could not record \(unrecorded.compactMap { $0 }.joined(separator: ", nor "))"
             let retry: String
             if agentCanFinish {
                 // The agent keeps saved output volumes, display brightness
@@ -1427,7 +1469,7 @@ final class SessionManager {
                 if owesAudio { sentences.append(Self.audioRetrySentence(recoveryRetryDelay)) }
                 if owesBrightness { sentences.append(Self.brightnessRetrySentence) }
                 retry = sentences.joined(separator: " ")
-            } else if owedReadLit != nil {
+            } else if owedReadLit != nil || owedSettlement {
                 retry = "Insomnia retries in \(Int(recoveryRetryDelay)) s; do not quit until state.json can be written."
             } else {
                 retry = "Insomnia retries in \(Int(recoveryRetryDelay)) s; do not quit until it is restored."

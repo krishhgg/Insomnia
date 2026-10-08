@@ -248,8 +248,8 @@ agent switches that mode off before Insomnia starts again. Once it has seen
 that display lit above zero, it never writes the saved level over a zero you
 set by hand, also after a relaunch or a restart. It cannot tell that zero
 from one auto-brightness left under a closing lid, so the saved level stays
-undecided, with nothing written, until you raise the display above zero. If Insomnia cannot record that it saw the display lit, Quit waits
-until it can.
+undecided, with nothing written, until you raise the display above zero. If Insomnia cannot record that it saw the display lit, or that the
+saved level is settled, Quit waits until it can.
 The display comes back to the brightness sampled while the lid was open, not
 the reading at the moment of closing (auto-brightness has already dimmed the
 panel under the closing lid by then, and Low Power Mode rescales it), and if

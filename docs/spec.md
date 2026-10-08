@@ -78,7 +78,7 @@ RuntimeState {                // everything Insomnia changed and must undo
   keyboardRestoreRefused:  Bool    // the same for the keyboard backlight
   displayRestoredUnderLowPower: Float?  // restored on open under our Low Power Mode; written again when it ends
   keptDisplayUnderLowPower:     Float?   // the kept (refused) display entry our Low Power Mode was on over; see section 4
-  keptDisplayUnderLowPowerBoot: String?  // kern.bootsessionuuid of the boot that record was written in, or that backstop.sh switched the mode off in
+  keptDisplayUnderLowPowerBoot: String?  // kern.bootsessionuuid of the boot that record was written in, or that backstop.sh switches the mode off in (published before it does)
   keptDisplayReadLit:           Float?   // the kept display entry, read above 0 with the lid open and the panel awake; see section 4
   appNapOverrides:    [{bundleId, previous?}]  // previous absent when the app had no NSAppSleepDisabled key
 }
@@ -223,14 +223,21 @@ Off, the switch-off changes nothing, the record of the earlier boot goes,
 and a reading of the panel decides the entry. A claim with no record, a
 record with no boot or an empty one, or a launch that cannot read its own
 boot is taken as this boot's, so the entry waits, at the cost of one more
-restart. backstop.sh, when its own `lowpowermode 0` exits 0 and the journal
-has the record, gives the record its own boot (empty if it cannot read
-it), after a restart or not: the mode may have been on in that boot until
-then, before Insomnia launched in it. A launch in that boot then reads the
-entry with the same doubt and waits for the next restart, even when the
-mode was already off before the agent's switch-off. A journal with no
-record has nothing to give a boot, so one written before the record
-existed still carries no doubt. A display still at 0 under or after the
+restart. backstop.sh, before its own `lowpowermode 0`, gives a record of
+another boot, or with none, its own boot (empty if it cannot read it),
+after a restart or not, and publishes that journal on its own first: the
+mode may have been on in that boot until then, before Insomnia launched in
+it. A launch in that boot then reads the entry with the same doubt and
+waits for the next restart, even when the mode was already off before the
+agent's switch-off. The record has that boot before the mode goes off, so
+a command that fails, or a journal of the undo that cannot be published
+after it, leaves the claim next to a record of this boot, which a launch
+reads as its own mode on in this boot, with the same doubt. If the journal
+with the boot cannot be published, the agent leaves the mode on and keeps
+its entry for the retry: switched off next to a record of an earlier boot,
+the panel on its way back could be taken for the user's level. A journal
+with no record has nothing to give a boot, so one written before the
+record existed still carries no doubt. A display still at 0 under or after the
 mode gets the saved value, written once more after the mode as for any
 restore under it, unless a reading of that entry above 0, with the lid
 known open and the panel awake, showed the darkening undone. That reading
@@ -265,16 +272,21 @@ start of every lid close, lid open, end and launch, so none of them works
 from the old entry. A lid close then journals the level the device reads,
 not the old saved one. The app also retries the clear at the same pace,
 and reads and writes nothing for it, so a level the user lowers to 0
-meanwhile stays at 0. A quit before the clear lands leaves the entry to
-the next launch, which reads the device again. A device still at 0 gets
-the saved value and both keys are cleared. A failed write there clears the
+meanwhile stays at 0. Quit waits for that clear: a launch after the quit
+would read the entry again, and would write the saved value over a 0 the
+user set since. "Restore incomplete" says Insomnia retries in 30 s and not
+to quit until state.json can be written, and Start is refused until the
+end goes through. A crash, a forced quit or a lost disk before the clear
+lands leaves the entry to the next launch, which reads the device again.
+A device still at 0 there gets the saved value and both keys are cleared. A failed write there clears the
 flag, and the entry is retried like any failed restore. If the flag cannot
 be cleared either, the disk still shows a flagged entry, which backstop.sh
 and uninstall.sh pass over, so the app keeps the end itself. "Restore
 incomplete" says Insomnia retries in 30 s, the app retries the write and
 the owed flag together, and Quit waits until one of them lands. A write
 that lands while state.json still refuses the clear settles the entry in
-this process, with only the clear owed, so Quit goes ahead. A launch or
+this process, with only the clear owed, and Quit waits for that clear as
+above. A launch or
 re-read with no session whose write fails is ended as for a dirty journal,
 so the agent is armed for it, or the app keeps it while the flag is still
 owed. A write whose clear is owed is done all the same: the second write

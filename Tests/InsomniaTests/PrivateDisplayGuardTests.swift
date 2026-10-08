@@ -913,10 +913,11 @@ final class RefusedDarkeningTests: XCTestCase {
     /// The same double failure, and then the write lands while state.json
     /// still refuses every change. The panel is asleep, which would leave a
     /// refused entry waiting, but this one is an ordinary failed restore
-    /// now and is written. The device holds the value, so quit goes ahead
-    /// even though the disk still flags the entry, and its clear lands at
-    /// the next transaction once the journal takes writes.
-    func testAKeptValueWrittenWhileTheJournalRefusesItsClearLetsQuitGo() async throws {
+    /// now and is written. The device holds the value, but the disk still
+    /// flags the entry, and a launch after a quit would read it again and
+    /// could write 0.8 over a 0 set since: quit waits until the clear lands
+    /// at the next transaction, once the journal takes writes.
+    func testAKeptValueWrittenWhileTheJournalRefusesItsClearHoldsQuitUntilTheClearLands() async throws {
         let now = h.clock.now
         try h.store.saveSession(Session(startedAt: now.addingTimeInterval(-7200), endsAt: now.addingTimeInterval(-60)))
         var st = RuntimeState()
@@ -938,8 +939,9 @@ final class RefusedDarkeningTests: XCTestCase {
         let outcome = await m.end(reason: .quit)
 
         XCTAssertEqual(h.display.sets.last, 0.8)
-        XCTAssertEqual(outcome, .restored, "the device holds the value, and the disk shows nothing dirty")
-        XCTAssertNil(m.pendingEnd)
+        XCTAssertEqual(outcome, .incomplete(agentArmed: false), "the device holds the value, but the disk still reads the entry as kept")
+        XCTAssertFalse(outcome.letsQuitGo)
+        XCTAssertEqual(m.pendingEnd, .quit)
         XCTAssertTrue(try XCTUnwrap(try h.store.loadState()).displayRestoreRefused, "the disk still refuses the clear")
         XCTAssertFalse(m.effectiveState.brightnessJournaled)
 
@@ -947,6 +949,7 @@ final class RefusedDarkeningTests: XCTestCase {
         let later = await m.end(reason: .user)
 
         XCTAssertEqual(later, .restored)
+        XCTAssertNil(m.pendingEnd)
         XCTAssertEqual(h.display.sets, [0.8], "written once")
         let after = try XCTUnwrap(try h.store.loadState())
         XCTAssertNil(after.savedDisplayBrightness)
@@ -1467,9 +1470,11 @@ final class RefusedDarkeningTests: XCTestCase {
 
     /// A lid open writes a kept display value while state.json refuses
     /// the clear, and the end that follows cannot clear the sleep entry
-    /// either. "Restore incomplete" says the agent retries the sleep entry
-    /// and does not say the brightness still waits for the app: it is
-    /// restored, with only its clear owed.
+    /// either. The agent is armed for the sleep entry but cannot clear the
+    /// kept one, so this process keeps the end and quit waits.
+    /// "Restore incomplete" says to wait for state.json and does not say
+    /// the brightness still waits for the app: it is restored, with only
+    /// its clear owed.
     func testAnEndAfterAnOwedClearDoesNotSayTheBrightnessIsStillOwed() async throws {
         try seedKeptDisplay()
         h.clamshell.closed = false
@@ -1484,9 +1489,10 @@ final class RefusedDarkeningTests: XCTestCase {
 
         let outcome = await m.end(reason: .user)
 
-        XCTAssertEqual(outcome, .incomplete(agentArmed: true))
+        XCTAssertEqual(outcome, .incomplete(agentArmed: false))
+        XCTAssertEqual(h.backstop.arms, 2, "armed at the start and again for the sleep entry")
         let body = try XCTUnwrap(h.notifier.posts.last { $0.title == SessionManager.incompleteTitle }?.body)
-        XCTAssertTrue(body.contains("The recovery agent retries every minute."), body)
+        XCTAssertTrue(body.contains("do not quit until state.json can be written."), body)
         XCTAssertFalse(body.contains(SessionManager.brightnessRetrySentence), body)
     }
 
@@ -2995,5 +3001,279 @@ private final class AfterSwitchOffSleepGuard: SleepGuarding, @unchecked Sendable
     func setLowPowerMode(_ on: Bool) async throws {
         try await inner.setLowPowerMode(on)
         if !on { afterSwitchOff?() }
+    }
+}
+
+/// A brightness kept after a refused restore that this process settles,
+/// as set since or by writing the kept value, while state.json refuses the
+/// clear. On disk the entry still reads as kept, so a launch after a quit
+/// would read it again and write the saved value over a 0 the user set
+/// since. An end holds quit, and Start, until the clear reaches the disk.
+@MainActor
+final class OwedKeptClearQuitTests: XCTestCase {
+    var h: Harness!
+
+    override func setUp() async throws {
+        h = Harness()
+    }
+
+    override func tearDown() async throws {
+        try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: h.home.paths.stateFile.path)
+        h.home.destroy()
+    }
+
+    private func logText() -> String {
+        (try? String(contentsOf: h.home.paths.logFile, encoding: .utf8)) ?? ""
+    }
+
+    private func setJournalImmutable(_ on: Bool) throws {
+        try FileManager.default.setAttributes([.immutable: on], ofItemAtPath: h.home.paths.stateFile.path)
+    }
+
+    /// Polls for up to 3 s.
+    private func waitFor(_ condition: () throws -> Bool) async throws {
+        for _ in 0..<300 {
+            if try condition() { return }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+    }
+
+    private func seedKept(keyboard: Bool = false) throws {
+        var st = RuntimeState()
+        if keyboard {
+            st.savedKeyboardBrightness = 0.3
+            st.keyboardRestoreRefused = true
+        } else {
+            st.savedDisplayBrightness = 0.8
+            st.displayRestoreRefused = true
+        }
+        try h.store.saveState(st)
+    }
+
+    private func makeDarkening(_ m: SessionManager) -> LidActions {
+        m.config.muteOnLidClose = false
+        m.config.freezeList = []
+        m.config.freezeAllApps = false
+        let freezer = FakeFreezer(apps: [], processes: [], control: h.procs)
+        return LidActions(
+            manager: m,
+            freezer: freezer,
+            docker: DockerRule(freezer: freezer, probe: { true }),
+            audio: h.audio,
+            display: h.display,
+            keyboard: h.keyboard,
+            sampler: nil
+        )
+    }
+
+    private func incompleteBody() -> String {
+        h.notifier.posts.last { $0.title == SessionManager.incompleteTitle }?.body ?? ""
+    }
+
+    /// The mapping `AppDelegate.applicationShouldTerminate` quits by.
+    func testOnlyARestoreOrAnEndTheArmedAgentCanFinishLetsQuitGo() {
+        XCTAssertTrue(EndOutcome.restored.letsQuitGo)
+        XCTAssertTrue(EndOutcome.incomplete(agentArmed: true).letsQuitGo)
+        XCTAssertFalse(EndOutcome.incomplete(agentArmed: false).letsQuitGo)
+        XCTAssertFalse(EndOutcome.locked.letsQuitGo)
+        XCTAssertFalse(EndOutcome.sessionRetained.letsQuitGo)
+        XCTAssertFalse(EndOutcome.journalUnreadable.letsQuitGo)
+        XCTAssertFalse(EndOutcome.privilegedCommandRunning(pid: 1).letsQuitGo)
+    }
+
+    /// With no session, a launch reads the kept display entry while
+    /// state.json refuses every change: the panel reads `reads`, 0.6 set
+    /// since or 0 that gets the kept 0.8. The user then sets the panel to
+    /// 0. Quit waits, and Start is refused, while the clear is owed. Once
+    /// the journal takes writes the retry lands the clear, Start works
+    /// again, and a relaunch writes nothing over the 0.
+    private func checkNoSessionSettlementHoldsQuit(reads: Float, writes: [Float]) async throws {
+        try seedKept()
+        h.clamshell.closed = false
+        h.display.brightness = reads
+        let m = h.makeManager(retryDelay: 3600)
+        try setJournalImmutable(true)
+
+        await m.reconcile()
+
+        XCTAssertEqual(h.display.sets, writes)
+        XCTAssertNil(m.effectiveState.savedDisplayBrightness, "settled in this process")
+        let onDisk = try XCTUnwrap(try h.store.loadState())
+        XCTAssertEqual(onDisk.savedDisplayBrightness, 0.8, "the journal refused the clear")
+        XCTAssertTrue(onDisk.displayRestoreRefused)
+
+        h.display.brightness = 0
+        let quit = await m.end(reason: .quit)
+
+        XCTAssertEqual(quit, .incomplete(agentArmed: false))
+        XCTAssertFalse(quit.letsQuitGo, "quit waits for the clear")
+        XCTAssertEqual(m.pendingEnd, .quit)
+        XCTAssertEqual(h.backstop.arms, 0, "nothing for the agent: it cannot clear a kept entry")
+        let body = incompleteBody()
+        XCTAssertTrue(body.hasPrefix("state.json could not record that a brightness kept after a refused restore is settled. "), body)
+        XCTAssertTrue(body.hasSuffix("do not quit until state.json can be written."), body)
+        XCTAssertFalse(body.contains(SessionManager.brightnessRetrySentence), body)
+        XCTAssertTrue(logText().contains("end: the journal has not taken the clear of a brightness kept after a refused restore and settled in this process; a relaunch would read that entry again and could write its saved value over a 0 set since, so Insomnia keeps it and retries"), logText())
+
+        await m.start(duration: 3600)
+
+        XCTAssertNil(m.session, "Start is refused while the end is pending")
+        XCTAssertNil(try h.store.loadSession())
+        XCTAssertTrue(try XCTUnwrap(m.lastError).contains("start refused: the previous session is still being ended"), m.lastError ?? "")
+
+        let stillRefused = await m.end(reason: .user)
+
+        XCTAssertEqual(stillRefused, .incomplete(agentArmed: false), "the retry while the journal still refuses it")
+        XCTAssertNotNil(m.pendingEnd)
+
+        try setJournalImmutable(false)
+        let retried = await m.end(reason: .user)
+
+        XCTAssertEqual(retried, .restored)
+        XCTAssertTrue(retried.letsQuitGo)
+        XCTAssertNil(m.pendingEnd)
+        let cleared = try XCTUnwrap(try h.store.loadState())
+        XCTAssertNil(cleared.savedDisplayBrightness)
+        XCTAssertFalse(cleared.displayRestoreRefused)
+        XCTAssertEqual(h.display.sets, writes, "nothing written over the 0")
+
+        await m.start(duration: 3600)
+        XCTAssertNotNil(m.session, "Start works once the clear has landed")
+        let ended = await m.end(reason: .user)
+        XCTAssertEqual(ended, .restored)
+
+        let relaunched = h.makeManager()
+        await relaunched.reconcile()
+
+        XCTAssertEqual(h.display.sets, writes, "the relaunch has no kept entry to read")
+        XCTAssertEqual(h.display.brightness, 0)
+    }
+
+    func testANoSessionClearOfALevelSetSinceHoldsQuitUntilItLands() async throws {
+        try await checkNoSessionSettlementHoldsQuit(reads: 0.6, writes: [])
+    }
+
+    func testANoSessionRestoreWhoseClearIsOwedHoldsQuitUntilItLands() async throws {
+        try await checkNoSessionSettlementHoldsQuit(reads: 0, writes: [0.8])
+    }
+
+    /// The keyboard entry, with the same owed clear: quit waits as for
+    /// the display.
+    func testAKeyboardRestoreWhoseClearIsOwedHoldsQuitUntilItLands() async throws {
+        try seedKept(keyboard: true)
+        h.clamshell.closed = false
+        h.keyboard.brightness = 0
+        let m = h.makeManager(retryDelay: 3600)
+        try setJournalImmutable(true)
+        await m.reconcile()
+        XCTAssertEqual(h.keyboard.sets, [0.3])
+        XCTAssertTrue(try XCTUnwrap(try h.store.loadState()).keyboardRestoreRefused)
+
+        h.keyboard.brightness = 0
+        let quit = await m.end(reason: .quit)
+
+        XCTAssertEqual(quit, .incomplete(agentArmed: false))
+        XCTAssertEqual(m.pendingEnd, .quit)
+
+        try setJournalImmutable(false)
+        let retried = await m.end(reason: .user)
+
+        XCTAssertEqual(retried, .restored)
+        XCTAssertNil(try h.store.loadState()?.savedKeyboardBrightness)
+        let relaunched = h.makeManager()
+        await relaunched.reconcile()
+        XCTAssertEqual(h.keyboard.sets, [0.3], "nothing written over the 0")
+        XCTAssertEqual(h.keyboard.brightness, 0)
+    }
+
+    /// In a session, a lid open writes the kept 0.8 while state.json
+    /// refuses every change, so neither its clear nor the end's own
+    /// entries land. The agent armed for those entries cannot clear the
+    /// kept one, so quit waits; with the agent armed and without.
+    private func checkSessionSettlementHoldsQuit(agentArms: Bool) async throws {
+        try seedKept()
+        h.clamshell.closed = false
+        h.display.brightness = 0
+        let m = h.makeManager(retryDelay: 3600)
+        let actions = makeDarkening(m)
+        await m.start(duration: 3600)
+        XCTAssertNotNil(m.session)
+        let armsAtStart = h.backstop.arms
+        h.backstop.failArm = !agentArms
+        try setJournalImmutable(true)
+        await actions.onOpen()
+        XCTAssertEqual(h.display.sets, [0.8])
+
+        h.display.brightness = 0
+        let quit = await m.end(reason: .quit)
+
+        XCTAssertEqual(quit, .incomplete(agentArmed: false))
+        XCTAssertFalse(quit.letsQuitGo)
+        XCTAssertEqual(m.pendingEnd, .quit)
+        XCTAssertEqual(h.backstop.arms, agentArms ? armsAtStart + 1 : armsAtStart, "armed for the session's own entries, or not")
+        let body = incompleteBody()
+        XCTAssertTrue(body.hasSuffix("do not quit until state.json can be written."), body)
+        XCTAssertFalse(body.contains(SessionManager.brightnessRetrySentence), body)
+
+        try setJournalImmutable(false)
+        let retried = await m.end(reason: .user)
+
+        XCTAssertEqual(retried, .restored)
+        XCTAssertNil(m.pendingEnd)
+        let after = try XCTUnwrap(try h.store.loadState())
+        XCTAssertNil(after.savedDisplayBrightness)
+        XCTAssertFalse(after.isDirty)
+        let relaunched = h.makeManager()
+        await relaunched.reconcile()
+        XCTAssertEqual(h.display.sets, [0.8], "nothing written over the 0")
+        XCTAssertEqual(h.display.brightness, 0)
+    }
+
+    func testAnArmedAgentDoesNotLetQuitGoWhileAKeptClearIsOwed() async throws {
+        try await checkSessionSettlementHoldsQuit(agentArms: true)
+    }
+
+    func testAnUnarmedAgentDoesNotLetQuitGoWhileAKeptClearIsOwed() async throws {
+        try await checkSessionSettlementHoldsQuit(agentArms: false)
+    }
+
+    /// The in-process retry the held quit schedules lands the clear on
+    /// its own once the journal takes writes.
+    func testTheEndRetryLandsAnOwedKeptClear() async throws {
+        try seedKept()
+        h.clamshell.closed = false
+        h.display.brightness = 0
+        let m = h.makeManager(retryDelay: 0.1)
+        try setJournalImmutable(true)
+        await m.reconcile()
+        h.display.brightness = 0
+        let quit = await m.end(reason: .quit)
+        XCTAssertEqual(quit, .incomplete(agentArmed: false))
+
+        try setJournalImmutable(false)
+        try await waitFor { m.pendingEnd == nil }
+
+        XCTAssertNil(m.pendingEnd)
+        XCTAssertNil(try h.store.loadState()?.savedDisplayBrightness)
+        XCTAssertTrue(logText().contains("retrying pending end (quit)"), logText())
+        XCTAssertEqual(h.display.sets, [0.8])
+    }
+
+    /// The control: a journal that takes the clear lets quit go at once.
+    func testAKeptEntrySettledOnDiskLetsQuitGo() async throws {
+        try seedKept()
+        h.clamshell.closed = false
+        h.display.brightness = 0
+        let m = h.makeManager(retryDelay: 3600)
+        await m.reconcile()
+        XCTAssertNil(try h.store.loadState()?.savedDisplayBrightness)
+
+        h.display.brightness = 0
+        let quit = await m.end(reason: .quit)
+
+        XCTAssertEqual(quit, .restored)
+        XCTAssertTrue(quit.letsQuitGo)
+        XCTAssertNil(m.pendingEnd)
+        XCTAssertEqual(h.display.sets, [0.8])
     }
 }

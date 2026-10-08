@@ -173,11 +173,14 @@ struct RuntimeState: Codable, Equatable, Sendable {
     /// from before the Mac last started (`lowPowerClaimFromEarlierBoot`).
     /// A record with no boot session to compare holds, and the next write
     /// that knows the boot gives it that one. Not something to undo; the
-    /// scripts check it and keep it for the app. backstop.sh, when it
-    /// switches the mode off and clears `lowPowerSetByUs`, gives the record
-    /// its own boot (empty if it cannot read it): the mode may have been on
-    /// in that boot until then, before Insomnia launched in it. Left out of
-    /// the JSON when nil.
+    /// scripts check it and keep it for the app. backstop.sh gives the
+    /// record its own boot (empty if it cannot read it) before it switches
+    /// the mode off and clears `lowPowerSetByUs`: the mode may have been on
+    /// in that boot until then, before Insomnia launched in it. It
+    /// publishes that boot on its own first, so a journal it fails to
+    /// write after the switch-off still shows the claim with a record from
+    /// this boot, and it leaves the mode on if that publish fails. Left
+    /// out of the JSON when nil.
     var keptDisplayUnderLowPower: Float? = nil
     var keptDisplayUnderLowPowerBoot: String? = nil
     /// A display brightness kept after a refused restore that read above 0

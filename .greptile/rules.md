@@ -34,17 +34,25 @@ restores, `savedOutputVolume`, `savedMuted`, `savedAudioOutputs`,
 `savedDisplayBrightness`, `savedKeyboardBrightness` and
 `displayRestoredUnderLowPower`: CoreAudio and the private brightness
 frameworks need the app. The app's records `keptDisplayUnderLowPower`,
-`keptDisplayUnderLowPowerBoot` and `keptDisplayReadLit` are kept too. When
-the backstop's `lowpowermode 0` exits 0 and the journal has
-`keptDisplayUnderLowPower`, it writes its own `kern.bootsessionuuid` (empty
-if unreadable) to `keptDisplayUnderLowPowerBoot`, so the app doubts that
-entry's readings in that boot. Both scripts check the records' types and
-read the three keys from the file's text too (`record_text_problems`, the
-same in both): each number must be null or a JSON number that a Swift
-Float holds and that does not round to 0 from a nonzero value (plutil turns
-1e-400 into 0.0), and a key found twice or a `\u` escape of a letter
-anywhere in the file is refused. Any of these makes the journal malformed,
-so nothing is undone and uninstall removes nothing. `savedAudioOutputs` entries alone leave the
+`keptDisplayUnderLowPowerBoot` and `keptDisplayReadLit` are kept too.
+Before the backstop's `lowpowermode 0`, when the journal has
+`keptDisplayUnderLowPower` with another boot or none, it writes its own
+`kern.bootsessionuuid` (empty if unreadable) to
+`keptDisplayUnderLowPowerBoot` and publishes that journal on its own, so
+the app doubts that entry's readings in that boot even if the journal of
+the undo never lands. If that publish fails, the mode is left on and its
+entry kept for retry. Both scripts check the records' types and read the
+three keys from the file's text too (`record_text_problems`, the same in
+both), as the app's decoder reads it: keys of the top-level object only,
+with their `\u` escapes decoded, every value stepped over whole, so a
+string or nested value holds no record. Each number must be null or a
+JSON number that a Swift Float holds and that does not round to 0 from a
+nonzero value (plutil turns 1e-400 into 0.0). One of the keys found twice
+at the top level, a key with an escape JSON does not have, and a top
+level the reader cannot follow (JSON5 keys, comments, NUL bytes as in
+UTF-16) are refused. Any of
+these makes the journal malformed, so nothing is undone and uninstall
+removes nothing. `savedAudioOutputs` entries alone leave the
 journal clean for the backstop (an entry can wait days for its device), but
 uninstall stops on them. A saved brightness flagged
 `displayRestoreRefused` or `keyboardRestoreRefused` (the app's private-call
@@ -165,9 +173,10 @@ Flag a change that breaks one of these; do not flag the behavior itself.
   brightness, `displayRestoredUnderLowPower` and the records
   `keptDisplayUnderLowPower`, `keptDisplayUnderLowPowerBoot` and
   `keptDisplayReadLit` are kept for the app, not restored by the shell,
-  except that a backstop run whose `lowpowermode 0` exits 0 gives
-  `keptDisplayUnderLowPowerBoot` its own boot. The records are read from
-  the file's text as well as through plutil (`record_text_problems`).
+  except that a backstop run gives `keptDisplayUnderLowPowerBoot` its own
+  boot, in a journal it publishes before its `lowpowermode 0`, and leaves
+  the mode on if it cannot. The records are read from the file's text as
+  well as through plutil (`record_text_problems`), at the top level only.
   Legacy `frozenPids` are never signaled or cleared there, even when the
   pid is gone (spec section 8).
 - `ProcessControl.swift`, `LidActions.swift`, `backstop.sh`. Only pids
