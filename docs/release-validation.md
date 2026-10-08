@@ -243,6 +243,8 @@ is performed. Do not replace "not run" with "passed" based on source review.
 | Install/upgrade/uninstall with recoverable failure conditions | Not run |
 | Install and uninstall while the Insomnia API client (same executable name, other bundle id) is running | Not run |
 | Install and uninstall while Insomnia runs in a second account (both stop, naming that pid and uid, without quitting it), and uninstall in the first account after the second installed (the rule is kept and the message names the second account) | Not run |
+| Two accounts installing at once from their own homes with real sudo (the second write stops with "changed after this install read it" and the first account's rule stays), and an install in one account while the other uninstalls (neither replaces nor removes the other's rule) | Not run |
+| The sudoers write and removal as root: `/var/run/insomnia-sudoers.lock` is root's with mode 0600, the rule is `root:wheel` 0440 after the rename, and no `insomnia.*` copy is left in `/etc/sudoers.d` after a refused `visudo` check | Not run |
 | Recovery agent refuses to run after the installed bundle or its sealed backstop.sh is modified, and logs why | Not run |
 | Running app refuses to arm (session start refused, reason shown) after its installed bundle is edited or re-signed under it | Not run |
 | Upgrade whose new agent fails to load puts the previous bundle back and reloads the previous agent, on a working Mac | Not run |

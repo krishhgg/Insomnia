@@ -116,7 +116,9 @@ recovery; newly written journals use `frozenProcesses`.
   - `/usr/bin/pmset -a disablesleep 0`
   - `/usr/bin/pmset -b lowpowermode 1`
   - `/usr/bin/pmset -b lowpowermode 0`
-- The file is one per Mac and names one account, the last to install.
+- The file is one per Mac and names one account, the one whose install
+  wrote it. `install.sh` reads it through sudo before writing and refuses a
+  rule with any line for another account.
   `uninstall.sh` reads it through sudo and removes it only when every line
   is blank, the header comment, or one of those four grants to the calling
   account (`id -un`); a grant to another account, or any other line, keeps it with a
@@ -127,6 +129,19 @@ recovery; newly written journals use `frozenProcesses`.
   `pgrep` that fails or does not answer. Under the recovery lock neither
   script reads an Info.plist, not even with a time limit: a process first
   seen there counts as unverified and stops the run.
+- Both scripts change the file in one `sudo /bin/bash -c` call. It takes
+  `/var/run/insomnia-sudoers.lock` with `lockf` (created by root with mode
+  0600; a symlink there is refused) for at most 10 s, then compares the file
+  with what the run read: absent, or the same bytes by `cmp`. Only then does
+  `install.sh` write a copy beside the rule (`mktemp`, `root:wheel`, 0440),
+  check that copy with `visudo -cf` and rename it over the rule, or
+  `uninstall.sh` remove the rule. A failure removes the copy and leaves the
+  rule. A file that changed since the read, or a lock still taken after
+  10 s, stops the run: `install.sh` changes nothing, and `uninstall.sh`
+  keeps the rule and the app. Both ask for a rerun. Before that call the
+  scripts read the rule with `sudo /bin/test -e` and `sudo /bin/cat`, and
+  `install.sh` checks the new rule with `sudo /usr/sbin/visudo -cf`. Every
+  tool run through sudo has a fixed path.
 - Nothing else runs as root.
 
 ### 3. Lid observer

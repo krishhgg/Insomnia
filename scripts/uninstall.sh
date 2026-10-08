@@ -82,6 +82,11 @@ MKDIR=/bin/mkdir
 RM=/bin/rm
 RMDIR=/bin/rmdir
 MKTEMP=/usr/bin/mktemp
+TEST=/bin/test
+CAT=/bin/cat
+CMP=/usr/bin/cmp
+# The shell sudoers_remove runs as root.
+ROOT_BASH=/bin/bash
 LOCK_TIMEOUT_SECONDS=10
 # How long to wait for the app to exit after asking it to quit.
 QUIT_WAIT_SECONDS=10
@@ -89,12 +94,17 @@ QUIT_WAIT_SECONDS=10
 # defaults, launchctl, codesign) may run before it is stopped with SIGTERM,
 # then SIGKILL. A call made under the recovery lock keeps the lock until it
 # has exited or been stopped, even if this run is killed first (see bounded()).
-# backstop.sh bounds its own commands; the sudo calls (test, cat and rm of
-# the sudoers rule) prompt for a password and are left to sudo's own prompt
-# timeout.
+# backstop.sh bounds its own commands; the sudo calls (the test, read and
+# removal of the sudoers rule) prompt for a password and are left to sudo's
+# own prompt timeout.
 CALL_TIMEOUT_SECONDS=30
 APP="$HOME/Applications/Insomnia.app"
 SUDOERS=/etc/sudoers.d/insomnia
+# Held, as root, by install.sh and uninstall.sh around each compare and
+# write of $SUDOERS (see install.sh). /var/run is writable only by root and
+# the daemon group, and the file is root's with mode 0600, so no account can
+# create, swap or hold it.
+SUDOERS_LOCK=/var/run/insomnia-sudoers.lock
 BUNDLE_ID=com.kgarg.insomnia
 # The Insomnia API client, whose executable is also named Insomnia. Its
 # bundle id is the only one that proves a process is not this app.
@@ -154,7 +164,7 @@ step() { printf '\n==> %s\n' "$*"; }
 
 # Scratch space for bounded(): this run's own directory, emptied on exit.
 WORK="$("$MKTEMP" -d "${TMPDIR:-/tmp}/insomnia-uninstall.XXXXXX")"
-trap '"$RM" -f "$WORK"/call.* 2>/dev/null; "$RMDIR" "$WORK" 2>/dev/null || true' EXIT
+trap '"$RM" -f "$WORK"/call.* "$WORK/sudoers.seen" 2>/dev/null; "$RMDIR" "$WORK" 2>/dev/null || true' EXIT
 
 # Run one external call with a time limit. Its combined output is left in
 # BOUNDED_OUTPUT (trailing newline removed) and its exit status returned, or
@@ -975,6 +985,34 @@ sudoers_not_ours() { # file content
   return 0
 }
 
+# Removes the rule at $SUDOERS only if it is still the bytes this run read
+# into $SUDOERS_SEEN and judged to be its own: another account's install.sh
+# may replace it between the read and the removal. The compare and the
+# removal are one call to sudo, run as root while it holds $SUDOERS_LOCK,
+# the lock install.sh takes for its compare and write. Exit status: 0
+# removed, 3 the lock was not free within LOCK_TIMEOUT_SECONDS, 4 the file
+# changed since it was read, 5 the removal failed (1 is sudo's own, as for
+# a wrong password). Only 0 changes the file.
+sudoers_remove_as_root() { # rule seen
+  umask 077
+  [[ ! -L "$SUDOERS_LOCK" ]] || exit 3
+  exec 8>>"$SUDOERS_LOCK" || exit 3
+  "$LOCKF" -t "$LOCK_TIMEOUT_SECONDS" 8 2>/dev/null || exit 3
+  { [[ -f "$1" && ! -L "$1" ]] && "$CMP" -s "$2" "$1"; } || exit 4
+  "$RM" -f "$1" || exit 5
+  exit 0
+}
+# Runs sudoers_remove_as_root as root, in one sudo call. The shell's script
+# is the function's text after this script's fixed tool paths, and sudo
+# resets the environment, so nothing root runs comes from PATH.
+sudoers_remove() {
+  "$SUDO" "$ROOT_BASH" -c "set -u
+$(printf '%s=%q\n' SUDOERS_LOCK "$SUDOERS_LOCK" LOCK_TIMEOUT_SECONDS "$LOCK_TIMEOUT_SECONDS" \
+    LOCKF "$LOCKF" CMP "$CMP" RM "$RM")
+$(declare -f sudoers_remove_as_root)
+sudoers_remove_as_root \"\$@\"" insomnia-sudoers-remove "$SUDOERS" "$SUDOERS_SEEN"
+}
+
 # Stops the run when Insomnia runs in another account, or when pgrep could
 # not say whether it does. Nothing has been changed by then, and nothing is
 # sent to any process.
@@ -1174,17 +1212,31 @@ done
 if [[ -d "$CANDIDATE_DIR" && ! -L "$CANDIDATE_DIR" ]]; then "$RMDIR" "$CANDIDATE_DIR" 2>/dev/null || true; fi
 
 step "Removing $SUDOERS (requires your password)"
-if [[ -e "$SUDOERS" ]] || "$SUDO" test -e "$SUDOERS"; then
+SUDOERS_SEEN="$WORK/sudoers.seen"
+if [[ -e "$SUDOERS" ]] || "$SUDO" "$TEST" -e "$SUDOERS"; then
   # Root-only, so it is read through sudo. A read that fails (a wrong
   # password, say) stops here, as the removal itself would have.
-  if ! sudoers_text="$("$SUDO" cat "$SUDOERS")"; then
+  if ! "$SUDO" "$CAT" "$SUDOERS" > "$SUDOERS_SEEN"; then
     echo "Could not read $SUDOERS through sudo, so it was kept. The LaunchAgent is already removed; the app at $APP is not." >&2
     echo "Rerun this script, or check the file and remove it yourself with 'sudo rm $SUDOERS'." >&2
     exit 1
   fi
+  sudoers_text="$(< "$SUDOERS_SEEN")"
   sudoers_why="$(sudoers_not_ours "$sudoers_text")"
   if [[ -z "$sudoers_why" ]]; then
-    "$SUDO" rm -f "$SUDOERS"
+    remove_rc=0
+    sudoers_remove || remove_rc=$?
+    if (( remove_rc != 0 )); then
+      if (( remove_rc == 3 )); then
+        echo "Kept $SUDOERS: $SUDOERS_LOCK stayed taken for ${LOCK_TIMEOUT_SECONDS}s, so another install.sh or uninstall.sh, perhaps in another account, is changing it." >&2
+      elif (( remove_rc == 4 )); then
+        echo "Kept $SUDOERS: it changed after this uninstall read it. Another install.sh or uninstall.sh, perhaps in another account, wrote or removed it meanwhile, and a rule written then may be another account's." >&2
+      else
+        echo "Kept $SUDOERS: the sudo call that removes it exited $remove_rc." >&2
+      fi
+      echo "The LaunchAgent is already removed; the app at $APP is not. Rerun this script to check the rule again." >&2
+      exit 1
+    fi
   elif [[ "$sudoers_why" == grants\ * ]]; then
     echo "Kept $SUDOERS: it $sudoers_why, not $ACCOUNT. Another account installed Insomnia after this one, and its app and agent need that rule to undo a session. Uninstall Insomnia in that account to remove it."
   else

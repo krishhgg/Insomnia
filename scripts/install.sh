@@ -65,6 +65,13 @@ RM=/bin/rm
 RMDIR=/bin/rmdir
 MKTEMP=/usr/bin/mktemp
 MKDIR=/bin/mkdir
+TEST=/bin/test
+CAT=/bin/cat
+CMP=/usr/bin/cmp
+CHOWN=/usr/sbin/chown
+VISUDO=/usr/sbin/visudo
+# The shell sudoers_replace runs as root.
+ROOT_BASH=/bin/bash
 LOCK_TIMEOUT_SECONDS=10
 # The limit for one call to sudo, pgrep, ps, plutil, launchctl or codesign
 # made while this run holds the recovery lock (and for the sudoers check and
@@ -96,6 +103,11 @@ LAUNCH_AGENTS="$HOME/Library/LaunchAgents"
 LABEL="com.insomnia.backstop"
 PLIST="$LAUNCH_AGENTS/$LABEL.plist"
 SUDOERS=/etc/sudoers.d/insomnia
+# Held, as root, by install.sh and uninstall.sh around each compare and
+# write of $SUDOERS (sudoers_replace). /var/run is writable only by root and
+# the daemon group, and the file is root's with mode 0600, so no account can
+# create, swap or hold it.
+SUDOERS_LOCK=/var/run/insomnia-sudoers.lock
 UID_NUM="$(id -u)"
 # Where the new bundle is assembled and signed (step 3) and where the previous
 # one waits during the swap (step 6). Both inside $APP_DIR, so the swap is two
@@ -108,6 +120,8 @@ NEW_APP=""
 # Where build-app.sh writes a source build before it is staged.
 BUILD_DIR=""
 TMP_SUDOERS=""
+# The rule as this run read it, for sudoers_replace to compare; in $WORK.
+SUDOERS_SEEN=""
 CANDIDATE=""
 CANDIDATE_DIR=""
 WORK=""
@@ -467,6 +481,52 @@ stop_for_other_accounts() { # what was changed
   exit 1
 }
 
+# $SUDOERS is one file for the whole Mac, and another account's install.sh
+# or uninstall.sh may write or remove it between this run's read (step 2)
+# and its write. So the write happens only if the file is still what this
+# run read and judged: absent, or the bytes it read into $SUDOERS_SEEN. The
+# compare and the write are one call to sudo, run as root while it holds
+# $SUDOERS_LOCK, the lock uninstall.sh takes for its compare and removal.
+# The new rule is copied beside the old one (sudo skips a name with a dot),
+# owned by root with mode 0440, checked there with visudo, so no process of
+# this account can change it between the check and the use, and renamed
+# over the old one: the rule is the old one or the new one, never a mix,
+# and a copy that is not renamed is removed. Exit status: 0 replaced, 3 the
+# lock was not free within LOCK_TIMEOUT_SECONDS, 4 the file changed since it
+# was read, 5 a tool failed, 6 the new rule failed visudo's check, 2 a bad
+# call (1 is sudo's own, as for a wrong password). Only 0 changes the file.
+sudoers_replace_as_root() { # absent|same rule seen new
+  STAGED_RULE=""
+  trap '[[ -z "$STAGED_RULE" ]] || "$RM" -f "$STAGED_RULE"' EXIT
+  umask 077
+  [[ ! -L "$SUDOERS_LOCK" ]] || exit 3
+  exec 8>>"$SUDOERS_LOCK" || exit 3
+  "$LOCKF" -t "$LOCK_TIMEOUT_SECONDS" 8 2>/dev/null || exit 3
+  case "$1" in
+    absent) [[ ! -e "$2" && ! -L "$2" ]] || exit 4 ;;
+    same) { [[ -f "$2" && ! -L "$2" ]] && "$CMP" -s "$3" "$2"; } || exit 4 ;;
+    *) exit 2 ;;
+  esac
+  STAGED_RULE="$("$MKTEMP" "$2.XXXXXX")" || exit 5
+  "$CAT" "$4" > "$STAGED_RULE" || exit 5
+  { "$CHOWN" root:wheel "$STAGED_RULE" && "$CHMOD" 0440 "$STAGED_RULE"; } || exit 5
+  "$VISUDO" -cf "$STAGED_RULE" >/dev/null || exit 6
+  "$MV" -f "$STAGED_RULE" "$2" || exit 5
+  STAGED_RULE=""
+  exit 0
+}
+# Runs sudoers_replace_as_root as root, in one sudo call. The shell's script
+# is the function's text after this script's fixed tool paths, and sudo
+# resets the environment, so nothing root runs comes from PATH.
+sudoers_replace() { # absent|same
+  "$SUDO" "$ROOT_BASH" -c "set -u
+$(printf '%s=%q\n' SUDOERS_LOCK "$SUDOERS_LOCK" LOCK_TIMEOUT_SECONDS "$LOCK_TIMEOUT_SECONDS" \
+    LOCKF "$LOCKF" CMP "$CMP" CAT "$CAT" MKTEMP "$MKTEMP" CHOWN "$CHOWN" CHMOD "$CHMOD" \
+    VISUDO "$VISUDO" MV "$MV" RM "$RM")
+$(declare -f sudoers_replace_as_root)
+sudoers_replace_as_root \"\$@\"" insomnia-sudoers-replace "$1" "$SUDOERS" "$SUDOERS_SEEN" "$TMP_SUDOERS"
+}
+
 cleanup() {
   if [[ -n "$TMP_SUDOERS" ]]; then "$RM" -f "$TMP_SUDOERS"; fi
   if [[ -n "$CANDIDATE" ]]; then "$RM" -f "$CANDIDATE"; fi
@@ -474,7 +534,7 @@ cleanup() {
   if [[ -n "$STAGE" ]]; then "$RM" -rf "$STAGE"; fi
   if [[ -n "$BUILD_DIR" ]]; then "$RM" -rf "$BUILD_DIR"; fi
   if [[ -n "$WORK" ]]; then
-    "$RM" -f "$WORK"/call.* 2>/dev/null || true
+    "$RM" -f "$WORK"/call.* "$WORK/sudoers.seen" 2>/dev/null || true
     "$RMDIR" "$WORK" 2>/dev/null || true
   fi
 }
@@ -578,16 +638,21 @@ fi
 #    in another account stops the install before the rule is replaced
 #    (find_insomnia), and so does a rule that grants another account: that
 #    account's agent needs it to undo a session even after its app crashed,
-#    when no process of it is left to find.
+#    when no process of it is left to find. The rule is written only if it
+#    is still what was read here (sudoers_replace).
 find_insomnia
 stop_for_other_accounts "Nothing was changed."
 step "Writing $SUDOERS (requires your password once)"
-if [[ -e "$SUDOERS" ]] || "$SUDO" test -e "$SUDOERS"; then
+SUDOERS_SEEN="$WORK/sudoers.seen"
+sudoers_expect=absent
+if [[ -e "$SUDOERS" ]] || "$SUDO" "$TEST" -e "$SUDOERS"; then
   # Root-only, so it is read through sudo, the same way uninstall.sh reads it.
-  if ! sudoers_text="$("$SUDO" cat "$SUDOERS")"; then
+  if ! "$SUDO" "$CAT" "$SUDOERS" > "$SUDOERS_SEEN"; then
     echo "Could not read $SUDOERS through sudo, so it was not replaced. Nothing was changed." >&2
     exit 1
   fi
+  sudoers_expect=same
+  sudoers_text="$(< "$SUDOERS_SEEN")"
   sudoers_why="$(sudoers_for_others "$sudoers_text")"
   if [[ "$sudoers_why" == grants\ * ]]; then
     echo "$SUDOERS $sudoers_why, not $USER. Another account installed Insomnia, and its recovery agent needs that rule to undo a session, even one whose app crashed. This Mac has room for one rule, so this install would take it away." >&2
@@ -607,12 +672,27 @@ $USER ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0
 $USER ALL=(root) NOPASSWD: /usr/bin/pmset -b lowpowermode 1
 $USER ALL=(root) NOPASSWD: /usr/bin/pmset -b lowpowermode 0
 SUDO
-if "$SUDO" visudo -cf "$TMP_SUDOERS" >/dev/null; then
-  "$SUDO" install -m 0440 -o root -g wheel "$TMP_SUDOERS" "$SUDOERS"
-else
+if ! "$SUDO" "$VISUDO" -cf "$TMP_SUDOERS" >/dev/null; then
   echo "sudoers file failed validation (or sudo did not authenticate); not installed. Nothing was changed." >&2
   exit 1
 fi
+replace_rc=0
+sudoers_replace "$sudoers_expect" || replace_rc=$?
+case "$replace_rc" in
+  0) ;;
+  3)
+    echo "$SUDOERS was not replaced: $SUDOERS_LOCK stayed taken for ${LOCK_TIMEOUT_SECONDS}s, so another install.sh or uninstall.sh, perhaps in another account, is changing it. Rerun in a moment. Nothing was changed." >&2
+    exit 1 ;;
+  4)
+    echo "$SUDOERS changed after this install read it: another install.sh or uninstall.sh, perhaps in another account, wrote or removed it meanwhile. It was not replaced, so no rule written meanwhile was overwritten. Rerun to check it again. Nothing was changed." >&2
+    exit 1 ;;
+  6)
+    echo "The new rule failed visudo's check once copied beside $SUDOERS, so $SUDOERS was not replaced. Nothing was changed." >&2
+    exit 1 ;;
+  *)
+    echo "$SUDOERS was not replaced: the sudo call that replaces it exited $replace_rc. Nothing was changed." >&2
+    exit 1 ;;
+esac
 # The backstop cannot undo anything without the rule, so stop here. Checked
 # again once this run holds the recovery lock (step 5).
 rule_rc=0

@@ -132,6 +132,16 @@ The grant is available to other processes running as your user. Insomnia is not
 sandboxed. The app, scripts, and journals are local; hotspot passwords use the
 login Keychain, not the configuration file.
 
+The rule is one file for the whole Mac and grants one account. The installer
+reads it through sudo first and stops, changing nothing, when it grants
+another account. It then writes the rule in one `sudo` call that takes a lock
+only root can create (`/var/run/insomnia-sudoers.lock`), checks the rule is
+still what it read, has `visudo` check a copy beside it, and renames that
+copy over it. The uninstaller removes the rule the same way, under the same
+lock. So when two accounts install or uninstall at once, neither overwrites
+or removes a rule the other wrote after its read: the run that finds the rule
+changed stops, and asks you to rerun it.
+
 The recovery agent runs at login and every 60 seconds. Its command line pins
 the installed bundle's code requirement (for an ad-hoc build, the cdhash of
 that build) and runs `codesign --verify --strict` against it before executing
@@ -627,10 +637,13 @@ Once the uninstaller holds the recovery lock it reads no Info.plist: a
 process it first sees then counts as unverified and blocks. A `pgrep` that
 fails or does not answer stops the uninstall before anything is removed, and
 so does a copy running in another account, which is never asked to quit. The
-sudoers rule is one file for the whole Mac and names the account that installed
-last. The uninstaller reads it through sudo and removes it only when it is
+sudoers rule is one file for the whole Mac and names the account whose install
+wrote it. The uninstaller reads it through sudo and removes it only when it is
 exactly the rule the installer writes for your account; otherwise it keeps the
-file and says why. With the app it removes what an interrupted
+file and says why. It removes the rule only if the rule still holds what it
+read, checked under the lock the installer takes for its write. If the rule
+changed meanwhile, or another run holds that lock for 10 s, the uninstaller
+keeps the rule and the app, and asks you to rerun it. With the app it removes what an interrupted
 install left beside it: `~/Applications/.Insomnia.app.previous`, and
 `.Insomnia.app.staging.*` directories of installs that are no longer running.
 Nothing else in `~/Applications` is touched. Purge removes owned files, not arbitrary
