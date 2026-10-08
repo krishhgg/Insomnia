@@ -1,15 +1,34 @@
 #!/bin/bash
 # Reverse install.sh. Quits the app, takes the recovery lock, runs the current
-# backstop with --force under that same lock, verifies for itself that the
+# backstop with --force under that same lock (from a source checkout: the
+# checkout's copy when the installed app declares the interface version it
+# speaks, else the app's own: the one sealed in the bundle, else the writable
+# copy older installs left in Application Support; from anywhere else, such
+# as a release zip: the sealed copy only), verifies for itself that the
 # journal is clean, and only then removes the LaunchAgent, the sudoers rule,
-# the app bundle, and the journal. Keeps config.json and the logs unless
-# --purge. Everything after the quit happens while this process holds
-# APP_SUPPORT/.recovery.lock, so neither a queued periodic backstop nor a
-# relaunched app can republish the journal while it is being removed.
+# the app bundle (backstop.sh included), and the journal. Keeps config.json
+# and the logs unless --purge. Everything after the quit happens while this
+# process holds APP_SUPPORT/.recovery.lock, so neither a queued periodic
+# backstop nor a relaunched app can republish the journal while it is being
+# removed.
 #
 # If anything Insomnia changed is still journaled, nothing is removed: the
 # LaunchAgent keeps retrying every minute, the sudoers rule keeps pmset
 # undoable, and state.json keeps the evidence. The message says what to do.
+# A brightness the app kept because its private-call guard refused the
+# restore on this macOS does not stop the uninstall, since nothing here can
+# restore it; state.json is kept, even with --purge, so a later Insomnia
+# that can make the call restores it at launch. The app's records about that
+# entry and about a restore under its Low Power Mode (displayRestoredUnderLowPower,
+# keptDisplayUnderLowPower, keptDisplayUnderLowPowerBoot, keptDisplayReadLit)
+# are never undone here and stay or go with state.json; backstop.sh of this
+# version gives the record of the kept entry this boot, in a journal it
+# publishes before it switches Low Power Mode off. One of the wrong type, a
+# number the app cannot decode, one of the three keys about the kept entry
+# found twice at the top level of the file, or text the check cannot follow
+# makes the journal malformed: the same text check as backstop.sh
+# (record_text_problems), which reads keys at the top level only, with
+# their escapes decoded, as the app does.
 #
 # Deletion is by exact owned file, never by directory tree: --purge removes
 # the files Insomnia writes (see Paths.swift), the session.json copies the
@@ -17,7 +36,10 @@
 # exact shape), and then rmdir's its own directories only if they are empty.
 # Only regular files are removed; anything else at one of those paths is
 # left with a message. The lock file is never unlinked, so --purge leaves
-# APP_SUPPORT/.recovery.lock (and therefore APP_SUPPORT).
+# APP_SUPPORT/.recovery.lock (and therefore APP_SUPPORT). The bundle trees
+# removed are the installed app and install.sh's own leftovers beside it,
+# matched by the exact names install.sh gives them, and the agent plist goes
+# with the candidate plists install.sh and the app stage it from.
 #
 # Honours INSOMNIA_HOME with the same layout as the app (see Paths.swift).
 set -euo pipefail
@@ -31,7 +53,16 @@ for arg in "$@"; do
   esac
 done
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# The folder this script is in. backstop.sh is taken from there only when it
+# is the scripts/ folder of a source checkout, with Package.swift one level
+# up (in_checkout). A release zip's folder is not, and the zip has no
+# backstop.sh, so one found beside its uninstall.sh was added after the zip
+# was unpacked, for example by another account that created the folder in
+# /tmp beforehand. Never the folder above either: a zip unpacked at
+# /tmp/Insomnia-<version> would make that /tmp, where any account can create
+# scripts/backstop.sh.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+in_checkout() { [[ "${SCRIPT_DIR##*/}" == scripts && -f "${SCRIPT_DIR%/*}/Package.swift" ]]; }
 
 # Fixed tool paths: never taken from PATH or the environment. Tests patch
 # these lines in a private copy of the script.
@@ -41,9 +72,11 @@ OSASCRIPT=/usr/bin/osascript
 LAUNCHCTL=/bin/launchctl
 SUDO=/usr/bin/sudo
 PLUTIL=/usr/bin/plutil
+CODESIGN=/usr/bin/codesign
 LOCKF=/usr/bin/lockf
 DEFAULTS=/usr/bin/defaults
 ID=/usr/bin/id
+KILL=/bin/kill
 DATE=/bin/date
 MKDIR=/bin/mkdir
 RM=/bin/rm
@@ -52,12 +85,13 @@ MKTEMP=/usr/bin/mktemp
 LOCK_TIMEOUT_SECONDS=10
 # How long to wait for the app to exit after asking it to quit.
 QUIT_WAIT_SECONDS=10
-# Longest one external call made by this script itself (pgrep, ps,
-# defaults, launchctl) may run before it is stopped with SIGTERM, then SIGKILL. These
-# are unprivileged and never touch the journal, and they run with the lock
-# descriptor closed, so a call that hangs is reported and can never keep the
-# recovery lock. backstop.sh bounds its own commands; the two sudo calls
-# prompt for a password and are left to sudo's own prompt timeout.
+# Longest one external call made by this script itself (pgrep, ps, plutil,
+# defaults, launchctl, codesign) may run before it is stopped with SIGTERM,
+# then SIGKILL. A call made under the recovery lock keeps the lock until it
+# has exited or been stopped, even if this run is killed first (see bounded()).
+# backstop.sh bounds its own commands; the sudo calls (test, cat and rm of
+# the sudoers rule) prompt for a password and are left to sudo's own prompt
+# timeout.
 CALL_TIMEOUT_SECONDS=30
 APP="$HOME/Applications/Insomnia.app"
 SUDOERS=/etc/sudoers.d/insomnia
@@ -124,57 +158,75 @@ trap '"$RM" -f "$WORK"/call.* 2>/dev/null; "$RMDIR" "$WORK" 2>/dev/null || true'
 
 # Run one external call with a time limit. Its combined output is left in
 # BOUNDED_OUTPUT (trailing newline removed) and its exit status returned, or
-# 124 when it did not finish within CALL_TIMEOUT_SECONDS: it is then sent
-# SIGTERM, and SIGKILL a second later if it is still there. A supervising
-# subshell waits for the call and writes its status to a file; both run with
-# fd 9 (the recovery lock) closed, so nothing left behind by a stuck call
-# holds the lock once this script exits. Called directly, not in $(...), so
-# the counter that names each call's files stays unique.
-bounded_calls=0
+# 124 when it did not finish within CALL_TIMEOUT_SECONDS and was stopped, or
+# 125 when it is sudo and still running (pid in BOUNDED_PID; this script
+# bounds no sudo call). The same helper as install.sh's, which says more.
+# supervise() enforces the limit itself, even if this run is killed while it
+# waits: SIGTERM once the limit has passed on bash's SECONDS clock, SIGKILL
+# one to two seconds later, never SIGKILL for sudo. The supervisor and the call keep fd 9 (the recovery lock) until the
+# call has exited, so a launchctl bootout made under the lock cannot unload
+# an agent the app confirms after this run is gone.
 BOUNDED_OUTPUT=""
+BOUNDED_PID=""
+# shellcheck disable=SC2034  # BOUNDED_PID is for sudo, and this script bounds none
 bounded() { # command args...
-  local base supervisor cpid rc i
-  bounded_calls=$((bounded_calls + 1))
-  base="$WORK/call.$bounded_calls"
+  local base supervisor rc deadline
+  base="$("$MKTEMP" "$WORK/call.XXXXXX")"
   BOUNDED_OUTPUT=""
-  (
-    "$@" </dev/null >"$base.out" 2>&1 &
-    echo "$!" > "$base.pid"
-    rc=0
-    wait "$!" || rc=$?
-    echo "$rc" > "$base.rc"
-  ) </dev/null >/dev/null 2>&1 9>&- &
+  BOUNDED_PID=""
+  supervise "$base" "$@" </dev/null >/dev/null 2>&1 &
   supervisor=$!
-  # Polled every 10 ms: a check makes some 30 calls, so a coarser poll
-  # would add seconds to an uninstall that is otherwise instant.
-  for (( i = 0; i < CALL_TIMEOUT_SECONDS * 100; i++ )); do
-    if [[ -s "$base.rc" ]]; then break; fi
-    sleep 0.01
-  done
-  if [[ ! -s "$base.rc" ]]; then
-    cpid="$(cat "$base.pid" 2>/dev/null || true)"
-    if [[ -n "$cpid" ]]; then kill -TERM "$cpid" 2>/dev/null || true; fi
-    for (( i = 0; i < 10; i++ )); do
-      if [[ -s "$base.rc" ]]; then break; fi
-      sleep 0.1
+  if [[ "$1" == "$SUDO" ]]; then
+    # The supervisor's limit (at most a second over), then at least two
+    # seconds for sudo to stop on SIGTERM.
+    deadline=$(( SECONDS + CALL_TIMEOUT_SECONDS + 3 ))
+    while [[ ! -s "$base.rc" ]] && (( SECONDS <= deadline )); do
+      sleep 0.01
     done
-    if [[ ! -s "$base.rc" && -n "$cpid" ]]; then
-      kill -KILL "$cpid" 2>/dev/null || true
-      for (( i = 0; i < 10; i++ )); do
-        if [[ -s "$base.rc" ]]; then break; fi
-        sleep 0.1
-      done
+    if [[ ! -s "$base.rc" ]]; then
+      BOUNDED_PID="$(cat "$base.pid" 2>/dev/null || true)"
+      return 125
     fi
-    # Reap the supervisor once it has written the status; one that is
-    # still waiting on an unkillable call is left behind without the lock.
-    if [[ -s "$base.rc" ]]; then wait "$supervisor" 2>/dev/null || true; fi
-    return 124
   fi
-  read -r rc < "$base.rc"
+  # Any other call gets SIGKILL at most two seconds after its SIGTERM, so
+  # this wait ends.
   wait "$supervisor" 2>/dev/null || true
+  rc=124
+  if [[ -s "$base.rc" ]]; then read -r rc < "$base.rc"; fi
   IFS= read -r -d '' BOUNDED_OUTPUT < "$base.out" || true
   BOUNDED_OUTPUT="${BOUNDED_OUTPUT%$'\n'}"
   return "$rc"
+}
+# The supervising process of one bounded() call; it runs in the background.
+# The call is its only job, so `kill %1` signals the call, and the shell
+# skips a job it has already reaped: a reused pid is never signalled. The
+# status file is written once the call has been reaped.
+supervise() { # base command args...
+  local base="$1" cpid rc=0 deadline
+  shift
+  "$@" </dev/null >"$base.out" 2>&1 &
+  cpid=$!
+  echo "$cpid" > "$base.pid"
+  deadline=$(( SECONDS + CALL_TIMEOUT_SECONDS ))
+  while kill -0 "$cpid" 2>/dev/null && (( SECONDS <= deadline )); do
+    sleep 0.01
+  done
+  # Past the limit, and the shell has not reaped the call: it is still there.
+  if (( SECONDS > deadline )) && [[ -n "$(jobs -rp)" ]]; then
+    kill -TERM %1 2>/dev/null || true
+    if [[ "$1" != "$SUDO" ]]; then
+      deadline=$(( SECONDS + 1 ))
+      while [[ -n "$(jobs -rp)" ]] && (( SECONDS <= deadline )); do
+        sleep 0.01
+      done
+      if [[ -n "$(jobs -rp)" ]]; then kill -KILL %1 2>/dev/null || true; fi
+    fi
+    wait "$cpid" 2>/dev/null || true
+    echo 124 > "$base.rc"
+    return
+  fi
+  wait "$cpid" || rc=$?
+  echo "$rc" > "$base.rc"
 }
 
 # Fail closed on paths that are not the exact things install.sh created.
@@ -191,6 +243,163 @@ type_of() { # file keypath -> bool|integer|float|string|array|dictionary|(any); 
   "$PLUTIL" -type "$2" -o - "$1" 2>/dev/null || true
 }
 
+# Prints one line per way the app's records about a kept display entry would
+# not decode, or nothing. Read from the text of state.json $1 itself, not
+# through plutil, which turns a number too small for a Double, such as
+# 1e-400, into 0.0, reads 1., .5, +1 and other JSON5 forms the app refuses,
+# and keeps the last of two copies of a key where the app's JSONDecoder keeps
+# the first. The text is read the way the app reads it. Only keys of the
+# top-level object count, with their \u escapes decoded, so
+# "keptDisplayReadL\u0069t" is that key. Every value is stepped over whole: a
+# string to its closing quote, an object or array to its closing bracket. So
+# a saved audio name or UID, or a nested object, that holds such a key, a \u
+# escape or a bad number holds no record. Each of the two numbers must be
+# null or a JSON number a Swift Float holds: not above about 3.4028236e38, and
+# either 0 in every digit or not so small that it rounds to 0 (below about
+# 7.0065e-46). The range is read from the decimal exponent and the first 9
+# significant digits, a little stricter than the app (from 3.40282356e38 and
+# up to 7.01e-46), where no brightness lies. A string, object or array there
+# is left to the type check. Also refused: one of the three keys found more
+# than once at the top level, since plutil checks and republishes the last
+# copy; a key with an escape JSON does not have, such as \x41, which plutil
+# reads as A; and a top level this reader cannot follow, such as a key
+# without quotes, a comment, a byte order mark other than UTF-8's, or a NUL
+# byte. UTF-16 and UTF-32, which the app also reads, have NUL bytes, and the
+# shell drops them from the text, which would turn such a file into other
+# characters. Text outside ASCII cannot spell the keys, even under the
+# decoder's Unicode equivalence, so a file with neither "keptDisplay" nor a
+# backslash in it has none of them and is not read further. Any of these
+# makes the journal malformed, as for a wrong type, and nothing is undone.
+record_text_problems() { # file
+  local LC_ALL=C
+  local text rest raw key c token depth str plain scalar number esc hex lost
+  local n_low=0 n_lit=0 n_boot=0 digits sig exp e10 lead
+  str='^"([^"\\]|\\.)*"'
+  plain='^[^]["{}]+'
+  scalar='^[^],}[:space:]]+'
+  number='^-?(0|[1-9][0-9]*)(\.([0-9]+))?([eE]([-+]?)([0-9]+))?$'
+  esc='^u00(4[1-9A-Fa-f]|5[0-9Aa]|6[1-9A-Fa-f]|7[0-9Aa])'
+  hex='^u[0-9A-Fa-f]{4}'
+  lost="the top level of state.json cannot be followed here, so its records about a kept display entry cannot be checked"
+  text="$(<"$1")"
+  [[ "$text" == *keptDisplay* || "$text" == *\\* ]] || return 0
+  if IFS= read -r -d '' c < "$1"; then
+    echo "$lost"
+    return 0
+  fi
+  rest="${text#$'\xef\xbb\xbf'}"
+  rest="${rest#"${rest%%[![:space:]]*}"}"
+  [[ "${rest:0:1}" == "{" ]] || { echo "$lost"; return 0; }
+  rest="${rest:1}"
+  while :; do
+    rest="${rest#"${rest%%[![:space:]]*}"}"
+    # An empty object, or a comma before the end, which the app accepts.
+    [[ "${rest:0:1}" == "}" ]] && break
+    [[ "$rest" =~ $str ]] || { echo "$lost"; return 0; }
+    raw="${BASH_REMATCH[0]}"
+    rest="${rest:${#raw}}"
+    raw="${raw:1:${#raw}-2}"
+    # The key as the app reads it. Of the escapes JSON has, only a \u of a
+    # letter can be part of one of the three keys; the others stand for no
+    # letter.
+    key=""
+    while [[ "$raw" == *\\* ]]; do
+      key+="${raw%%\\*}"
+      raw="${raw#*\\}"
+      if [[ "$raw" =~ $esc ]]; then
+        printf -v c '%b' "\\x${BASH_REMATCH[1]}"
+        key+="$c"
+        raw="${raw:5}"
+      elif [[ "$raw" =~ $hex ]]; then
+        key+="?"
+        raw="${raw:5}"
+      else
+        case "${raw:0:1}" in
+          '"'|\\|/|b|f|n|r|t) key+="?"; raw="${raw:1}" ;;
+          *) echo "a key in state.json has an escape JSON does not have, so its records about a kept display entry cannot be checked"; return 0 ;;
+        esac
+      fi
+    done
+    key+="$raw"
+    rest="${rest#"${rest%%[![:space:]]*}"}"
+    [[ "${rest:0:1}" == : ]] || { echo "$lost"; return 0; }
+    rest="${rest:1}"
+    rest="${rest#"${rest%%[![:space:]]*}"}"
+    token=""
+    case "${rest:0:1}" in
+      '"')
+        [[ "$rest" =~ $str ]] || { echo "$lost"; return 0; }
+        rest="${rest:${#BASH_REMATCH[0]}}"
+        ;;
+      '{'|'[')
+        depth=0
+        while :; do
+          case "${rest:0:1}" in
+            '{'|'[') depth=$((depth + 1)); rest="${rest:1}" ;;
+            '}'|']') depth=$((depth - 1)); rest="${rest:1}"; (( depth > 0 )) || break ;;
+            '"')
+              [[ "$rest" =~ $str ]] || { echo "$lost"; return 0; }
+              rest="${rest:${#BASH_REMATCH[0]}}"
+              ;;
+            '') echo "$lost"; return 0 ;;
+            *)
+              [[ "$rest" =~ $plain ]] || { echo "$lost"; return 0; }
+              rest="${rest:${#BASH_REMATCH[0]}}"
+              ;;
+          esac
+        done
+        ;;
+      *)
+        [[ "$rest" =~ $scalar ]] || { echo "$lost"; return 0; }
+        token="${BASH_REMATCH[0]}"
+        rest="${rest:${#token}}"
+        ;;
+    esac
+    case "$key" in
+      keptDisplayUnderLowPower) n_low=$((n_low + 1)) ;;
+      keptDisplayReadLit) n_lit=$((n_lit + 1)) ;;
+      # The boot is a string, whose type plutil checks.
+      keptDisplayUnderLowPowerBoot) n_boot=$((n_boot + 1)); token="" ;;
+      *) token="" ;;
+    esac
+    if [[ -n "$token" && "$token" != null ]]; then
+      if [[ "$token" =~ $number ]]; then
+        digits="${BASH_REMATCH[1]}${BASH_REMATCH[3]}"
+        sig="${digits#"${digits%%[1-9]*}"}"
+        if [[ -n "$sig" ]]; then
+          exp="${BASH_REMATCH[6]#"${BASH_REMATCH[6]%%[1-9]*}"}"
+          if (( ${#exp} > 18 )); then
+            e10=1000000000000000000
+          else
+            e10=$((10#0$exp))
+          fi
+          [[ "${BASH_REMATCH[5]}" == - ]] && e10=$((-e10))
+          e10=$((e10 + ${#BASH_REMATCH[1]} - 1 - (${#digits} - ${#sig})))
+          lead="${sig}00000000"
+          lead=$((10#${lead:0:9}))
+          if (( e10 < -46 || (e10 == -46 && lead < 701000000) )); then
+            echo "$key is ${token:0:40}, too small a number for the app to read"
+          elif (( e10 > 38 || (e10 == 38 && lead > 340282355) )); then
+            echo "$key is ${token:0:40}, too large a number for the app to read"
+          fi
+        fi
+      else
+        echo "$key is written as ${token:0:40}, which the app does not read as a number"
+      fi
+    fi
+    rest="${rest#"${rest%%[![:space:]]*}"}"
+    case "${rest:0:1}" in
+      ,) rest="${rest:1}" ;;
+      '}') break ;;
+      *) echo "$lost"; return 0 ;;
+    esac
+  done
+  (( n_low > 1 )) && echo "keptDisplayUnderLowPower is in the top level of state.json $n_low times; the app reads the first and plutil the last"
+  (( n_lit > 1 )) && echo "keptDisplayReadLit is in the top level of state.json $n_lit times; the app reads the first and plutil the last"
+  (( n_boot > 1 )) && echo "keptDisplayUnderLowPowerBoot is in the top level of state.json $n_boot times; the app reads the first and plutil the last"
+  return 0
+}
+
 # Shape check, same rules as backstop.sh: a JSON object whose known keys have
 # the types RuntimeState.swift writes; null counts as absent.
 journal_shape_problems() { # file
@@ -199,14 +408,24 @@ journal_shape_problems() { # file
     echo "state.json is not a JSON object"
     return 0
   fi
-  for key in sleepDisabledByUs lowPowerSetByUs dockerFrozen savedMuted; do
+  for key in sleepDisabledByUs lowPowerSetByUs dockerFrozen savedMuted displayRestoreRefused keyboardRestoreRefused; do
     t="$(type_of "$f" "$key")"
     [[ -z "$t" || "$t" == bool || "$t" == "(any)" ]] || echo "$key is a $t, not a bool"
   done
-  for key in savedOutputVolume savedDisplayBrightness savedKeyboardBrightness; do
+  for key in savedOutputVolume savedDisplayBrightness savedKeyboardBrightness displayRestoredUnderLowPower; do
     t="$(type_of "$f" "$key")"
     [[ -z "$t" || "$t" == float || "$t" == integer || "$t" == "(any)" ]] || echo "$key is a $t, not a number"
   done
+  # The app's records about a kept display entry: never read for an undo
+  # here, and they stay or go with state.json. Each must still decode, or
+  # the app cannot read the journal at all.
+  for key in keptDisplayUnderLowPower keptDisplayReadLit; do
+    t="$(type_of "$f" "$key")"
+    [[ -z "$t" || "$t" == float || "$t" == integer || "$t" == "(any)" ]] || echo "$key is a $t, not a number"
+  done
+  t="$(type_of "$f" keptDisplayUnderLowPowerBoot)"
+  [[ -z "$t" || "$t" == string || "$t" == "(any)" ]] || echo "keptDisplayUnderLowPowerBoot is a $t, not a string"
+  record_text_problems "$f"
   t="$(type_of "$f" frozenProcesses)"
   if [[ -n "$t" && "$t" != "(any)" ]]; then
     if [[ "$t" != array ]]; then
@@ -241,6 +460,29 @@ journal_shape_problems() { # file
       done
     fi
   fi
+  t="$(type_of "$f" savedAudioOutputs)"
+  if [[ -n "$t" && "$t" != "(any)" ]]; then
+    if [[ "$t" != array ]]; then
+      echo "savedAudioOutputs is a $t, not an array"
+    else
+      i=0
+      while [[ -n "$(type_of "$f" "savedAudioOutputs.$i")" ]]; do
+        if [[ "$(type_of "$f" "savedAudioOutputs.$i")" != dictionary ]]; then
+          echo "savedAudioOutputs[$i] is not an object"
+        else
+          [[ "$(type_of "$f" "savedAudioOutputs.$i.deviceUID")" == string ]] || echo "savedAudioOutputs[$i].deviceUID is not a string"
+          t="$(type_of "$f" "savedAudioOutputs.$i.volume")"
+          [[ "$t" == float || "$t" == integer ]] || echo "savedAudioOutputs[$i].volume is not a number"
+          [[ "$(type_of "$f" "savedAudioOutputs.$i.muted")" == bool ]] || echo "savedAudioOutputs[$i].muted is not a bool"
+          t="$(type_of "$f" "savedAudioOutputs.$i.name")"
+          [[ -z "$t" || "$t" == string || "$t" == "(any)" ]] || echo "savedAudioOutputs[$i].name is a $t, not a string"
+          t="$(type_of "$f" "savedAudioOutputs.$i.saveID")"
+          [[ -z "$t" || "$t" == string || "$t" == "(any)" ]] || echo "savedAudioOutputs[$i].saveID is a $t, not a string"
+        fi
+        i=$((i + 1))
+      done
+    fi
+  fi
   t="$(type_of "$f" appNapOverrides)"
   if [[ -n "$t" && "$t" != "(any)" ]]; then
     if [[ "$t" != array ]]; then
@@ -258,6 +500,24 @@ journal_shape_problems() { # file
         i=$((i + 1))
       done
     fi
+  fi
+}
+
+is_refused() { # key
+  [[ "$(extract "$STATE" "$1" || true)" == "true" ]]
+}
+
+# Brightness the app kept after its private-call guard refused the restore
+# on this macOS, one line per device with the saved level. Not a problem
+# for uninstall: no step here can restore it.
+refused_brightness() {
+  local value
+  [[ -f "$STATE" ]] || return 0
+  if is_refused displayRestoreRefused && value="$(extract "$STATE" savedDisplayBrightness)"; then
+    echo "display brightness $value"
+  fi
+  if is_refused keyboardRestoreRefused && value="$(extract "$STATE" savedKeyboardBrightness)"; then
+    echo "keyboard backlight $value"
   fi
 }
 
@@ -326,7 +586,7 @@ session_shape_problems() { # file
 # Independent check of the journal: prints one line per unresolved item.
 # Trusts nothing about the backstop that just ran (it may be an older copy).
 journal_problems() {
-  local key value shape
+  local key value shape i
   if [[ -e "$SESSION" ]]; then
     shape=""
     # Only a regular file is opened: open(2) on a FIFO with no writer
@@ -372,10 +632,16 @@ journal_problems() {
   if extract "$STATE" savedOutputVolume >/dev/null || extract "$STATE" savedMuted >/dev/null; then
     echo "saved audio settings (volume/mute) are not restored; only the app can do that"
   fi
-  if extract "$STATE" savedDisplayBrightness >/dev/null; then
+  i=0
+  while extract_json "$STATE" "savedAudioOutputs.$i" >/dev/null; do
+    value="$(extract "$STATE" "savedAudioOutputs.$i.name" || extract "$STATE" "savedAudioOutputs.$i.deviceUID" || true)"
+    echo "$value is still muted from a lid close; only the app can restore its volume, once the device is connected"
+    i=$((i + 1))
+  done
+  if extract "$STATE" savedDisplayBrightness >/dev/null && ! is_refused displayRestoreRefused; then
     echo "saved display brightness is not restored; only the app can do that"
   fi
-  if extract "$STATE" savedKeyboardBrightness >/dev/null; then
+  if extract "$STATE" savedKeyboardBrightness >/dev/null && ! is_refused keyboardRestoreRefused; then
     echo "saved keyboard backlight is not restored; only the app can do that"
   fi
   value="$(extract_json "$STATE" appNapOverrides || true)"
@@ -509,6 +775,10 @@ What to do, then rerun this script:
   - Saved audio (volume/mute), display brightness or keyboard backlight:
     open Insomnia.app; it restores them from the journal at launch. If the
     display is dark, press the brightness-up key first.
+  - An output device still muted from a lid close: connect it and open
+    Insomnia.app, which restores its volume. If the device is gone for
+    good, open Insomnia.app and choose "Stop waiting for <device>" in its
+    menu; the device then stays as it is.
   - pmset failures (sleep / Low Power Mode): check $SUDOERS
     (rerun scripts/install.sh to reinstall it), or run
     'sudo pmset -a disablesleep 0' / 'sudo pmset -b lowpowermode 0' yourself.
@@ -729,31 +999,66 @@ fi
 
 # 3. Undo everything via a backstop that matches the installed app ----------
 # The backstop inherits fd 9 and shares this lock instead of waiting on it.
-# This checkout's backstop.sh hands frozen entries that record microseconds
-# to the installed app binary, and runs that binary only when the bundle's
-# Info.plist declares InsomniaResumeFrozenVersion RESUME_FROZEN_VERSION (the
-# same value as in backstop.sh; a test keeps the two in step). An app that
-# does not declare it was installed together with its own backstop.sh in
-# APP_SUPPORT, the copy the LaunchAgent runs, so that copy is used instead
-# when it exists. Without it this checkout's backstop runs anyway: it keeps
-# the entries that need the binary, and step 4 stops before removing
-# anything.
+# From a source checkout, the checkout's backstop.sh hands frozen entries
+# that record microseconds to the installed app binary, and runs that binary
+# only when the bundle's Info.plist declares InsomniaResumeFrozenVersion
+# RESUME_FROZEN_VERSION (the same value as in backstop.sh; a test keeps the
+# two in step). So the checkout's copy runs when the app declares that
+# version. An app that does not was installed together with its own
+# backstop.sh, which speaks its version: the copy install.sh sealed into the
+# bundle, or for installs before that layout the writable copy in
+# $APP_SUPPORT that the LaunchAgent runs. That copy is used instead when it
+# exists. With neither copy the checkout's backstop runs anyway: it keeps the
+# entries that need the binary, and step 4 stops before removing anything.
+# From anywhere else, such as a release zip's folder, the sealed copy or
+# nothing: a backstop.sh beside this script there is not from the zip (see
+# SCRIPT_DIR), and the writable copy is older than release zips. The sealed
+# copy runs only while the bundle's signature still verifies: its resource
+# seal covers the script, so this is the check the LaunchAgent runs (without
+# the pinned requirement, which this script does not have), and an edited
+# copy is refused the same way.
 step "Restoring the machine via backstop --force"
+if [[ -e "$SCRIPT_DIR/backstop.sh" ]] && ! in_checkout; then
+  echo "not running $SCRIPT_DIR/backstop.sh: $SCRIPT_DIR is not the scripts folder of a source checkout, and a release zip has no backstop.sh, so it was added after the zip was unpacked." >&2
+fi
+CHECKOUT_BACKSTOP=""
+if in_checkout && [[ -f "$SCRIPT_DIR/backstop.sh" ]]; then
+  CHECKOUT_BACKSTOP="$SCRIPT_DIR/backstop.sh"
+fi
 installed_version=""
 if [[ -f "$APP/Contents/Info.plist" ]]; then
   installed_version="$(extract "$APP/Contents/Info.plist" InsomniaResumeFrozenVersion || true)"
 fi
-if [[ -f "$ROOT/scripts/backstop.sh" ]] && { [[ "$installed_version" == "$RESUME_FROZEN_VERSION" ]] || [[ ! -f "$APP_SUPPORT/backstop.sh" ]]; }; then
-  BACKSTOP="$ROOT/scripts/backstop.sh"
-elif [[ -f "$APP_SUPPORT/backstop.sh" ]]; then
-  BACKSTOP="$APP_SUPPORT/backstop.sh"
-  if [[ -f "$ROOT/scripts/backstop.sh" ]]; then
-    echo "$APP does not declare InsomniaResumeFrozenVersion $RESUME_FROZEN_VERSION; using the backstop installed with it, $BACKSTOP"
+if [[ -n "$CHECKOUT_BACKSTOP" ]] && { [[ "$installed_version" == "$RESUME_FROZEN_VERSION" ]] || { [[ ! -f "$APP/Contents/Resources/backstop.sh" ]] && [[ ! -f "$APP_SUPPORT/backstop.sh" ]]; }; }; then
+  BACKSTOP="$CHECKOUT_BACKSTOP"
+elif [[ -f "$APP/Contents/Resources/backstop.sh" ]]; then
+  verify_rc=0
+  bounded "$CODESIGN" --verify --strict "$APP" || verify_rc=$?
+  if (( verify_rc == 124 )); then
+    echo "'codesign --verify --strict $APP' did not answer within ${CALL_TIMEOUT_SECONDS}s, so the backstop.sh sealed in it was not run." >&2
+    echo "Nothing was removed. Rerun once codesign answers, or run scripts/uninstall.sh from a checkout of the source: it runs its own backstop.sh when this app declares InsomniaResumeFrozenVersion $RESUME_FROZEN_VERSION." >&2
+    exit 1
+  elif (( verify_rc != 0 )); then
+    echo "$APP does not pass 'codesign --verify --strict' (exit $verify_rc: ${BOUNDED_OUTPUT:-no detail}), so the backstop.sh sealed in it was not run." >&2
+    echo "Nothing was removed. Reinstall and rerun, or run scripts/uninstall.sh from a checkout of the source: it runs its own backstop.sh when this app declares InsomniaResumeFrozenVersion $RESUME_FROZEN_VERSION." >&2
+    exit 1
   fi
+  echo "$APP verifies"
+  BACKSTOP="$APP/Contents/Resources/backstop.sh"
+elif in_checkout && [[ -f "$APP_SUPPORT/backstop.sh" ]]; then
+  BACKSTOP="$APP_SUPPORT/backstop.sh"
+elif in_checkout; then
+  echo "no backstop.sh found in $SCRIPT_DIR, $APP/Contents/Resources or $APP_SUPPORT; nothing was removed" >&2
+  exit 1
 else
-  echo "no backstop.sh found in $ROOT/scripts or $APP_SUPPORT; nothing was removed" >&2
+  echo "no backstop.sh sealed in $APP/Contents/Resources, and outside a source checkout this script runs no other copy; nothing was removed." >&2
+  echo "Run scripts/uninstall.sh from a checkout of the source." >&2
   exit 1
 fi
+if [[ -n "$CHECKOUT_BACKSTOP" && "$BACKSTOP" != "$CHECKOUT_BACKSTOP" ]]; then
+  echo "$APP does not declare InsomniaResumeFrozenVersion $RESUME_FROZEN_VERSION; using the backstop installed with it, $BACKSTOP"
+fi
+echo "using $BACKSTOP"
 recovery_rc=0
 /bin/bash "$BACKSTOP" --force || recovery_rc=$?
 
@@ -770,6 +1075,17 @@ if (( ${#problems[@]} > 0 )); then
   abort_incomplete "$recovery_rc" "${problems[@]}"
 fi
 echo "journal clean"
+kept_brightness=()
+while IFS= read -r line; do
+  [[ -n "$line" ]] && kept_brightness+=("$line")
+done < <(refused_brightness)
+if (( ${#kept_brightness[@]} > 0 )); then
+  echo "Not restored, and kept in $STATE:"
+  for line in "${kept_brightness[@]}"; do echo "  - $line"; done
+  echo "Insomnia's private-call guard refused that restore on this macOS, so nothing here can"
+  echo "make it. Set the level with the brightness keys or Control Center. The file stays so a"
+  echo "later Insomnia that can make the call restores it at launch."
+fi
 if app_running; then
   echo "Insomnia started again ($(list "${BLOCKING[@]}")); quit it and rerun. Nothing was removed." >&2
   exit 1
@@ -803,6 +1119,16 @@ if (( print_rc != 113 )); then
   exit 1
 fi
 "$RM" -f "$PLIST"
+# Candidate plists install.sh and the app write before a load and rename
+# into place after it: in the staging directory beside the plist, and in
+# $LAUNCH_AGENTS itself for older builds. Only files with the label's
+# candidate prefix, the same ones both of them sweep; the staging directory
+# goes only once empty.
+CANDIDATE_DIR="$LAUNCH_AGENTS/.$LABEL.staging"
+for candidate in "$CANDIDATE_DIR/$LABEL.candidate-"* "$LAUNCH_AGENTS/$LABEL.candidate-"*; do
+  if [[ -f "$candidate" && ! -L "$candidate" ]]; then "$RM" -f "$candidate"; fi
+done
+if [[ -d "$CANDIDATE_DIR" && ! -L "$CANDIDATE_DIR" ]]; then "$RMDIR" "$CANDIDATE_DIR" 2>/dev/null || true; fi
 
 step "Removing $SUDOERS (requires your password)"
 if [[ -e "$SUDOERS" ]] || "$SUDO" test -e "$SUDOERS"; then
@@ -825,12 +1151,42 @@ fi
 
 step "Removing app bundle"
 "$RM" -rf "$APP"
+# install.sh's leftovers beside the bundle, by the exact names it gives them.
+# An upgrade sets the previous bundle aside at .Insomnia.app.previous during
+# its swap and assembles the new one in .Insomnia.app.staging.<pid>.<six
+# letters and digits> (mktemp). The swap runs under the recovery lock, which
+# this script holds, so a set-aside bundle belongs to a run that was stopped.
+# A staging directory whose run is still alive belongs to an install that
+# has not reached the lock yet, and stays. kill -0 only asks whether the
+# process exists; it sends no signal. Symlinks and any other name are left.
+APP_DIR="$(dirname "$APP")"
+PREVIOUS_APP="$APP_DIR/.Insomnia.app.previous"
+if [[ -d "$PREVIOUS_APP" && ! -L "$PREVIOUS_APP" ]]; then
+  "$RM" -rf "$PREVIOUS_APP"
+  echo "removed $PREVIOUS_APP, the previous bundle an interrupted install set aside"
+fi
+staging_re='^\.Insomnia\.app\.staging\.([0-9]+)\.[A-Za-z0-9]{6}$'
+for dir in "$APP_DIR"/.Insomnia.app.staging.*; do
+  [[ -d "$dir" && ! -L "$dir" ]] || continue
+  [[ "${dir##*/}" =~ $staging_re ]] || continue
+  owner="${BASH_REMATCH[1]}"
+  if "$KILL" -0 "$owner" 2>/dev/null; then
+    echo "kept $dir: the install.sh run that made it (pid $owner) is still running"
+    continue
+  fi
+  "$RM" -rf "$dir"
+  echo "removed $dir, left by an install.sh run that is gone"
+done
 
+# $APP_SUPPORT/backstop.sh below is the writable copy of older installs; the
+# current one went with the bundle.
 if (( PURGE == 1 )); then
   step "Purging Insomnia's files in $APP_SUPPORT and $LOG_DIR"
-  remove_owned "$SESSION" "$STATE" "$APP_SUPPORT/config.json" "$APP_SUPPORT/backstop.sh" \
+  remove_owned "$SESSION" "$APP_SUPPORT/config.json" "$APP_SUPPORT/backstop.sh" \
+        "$APP_SUPPORT/unfinished-command.json" \
         "$LOG_DIR/insomnia.log" "$LOG_DIR/insomnia.log.1" \
         "$LOG_DIR/handoffs.log" "$LOG_DIR/handoffs.log.1"
+  (( ${#kept_brightness[@]} > 0 )) || remove_owned "$STATE"
   collect_moved_aside_sessions
   if (( ${#MOVED_ASIDE[@]} > 0 )); then
     remove_owned "${MOVED_ASIDE[@]}"
@@ -850,7 +1206,10 @@ if (( PURGE == 1 )); then
   echo "Kept $LOCK (the recovery lock is never unlinked; delete $APP_SUPPORT by hand if you want it gone)."
   [[ -d "$LOG_DIR" ]] && echo "Kept $LOG_DIR: it still holds files Insomnia did not create."
 else
-  remove_owned "$APP_SUPPORT/backstop.sh" "$SESSION" "$STATE"
+  # unfinished-command.json names a sudo pmset that held the recovery lock;
+  # this run holds it now, so that command has exited.
+  remove_owned "$APP_SUPPORT/backstop.sh" "$SESSION" "$APP_SUPPORT/unfinished-command.json"
+  (( ${#kept_brightness[@]} > 0 )) || remove_owned "$STATE"
   echo "Kept $APP_SUPPORT/config.json and $LOG_DIR (use --purge to remove)."
   collect_moved_aside_sessions
   if (( ${#MOVED_ASIDE[@]} > 0 )); then
@@ -862,6 +1221,7 @@ else
     done
   fi
 fi
+(( ${#kept_brightness[@]} == 0 )) || echo "Kept $STATE: it holds the brightness listed above."
 
 if (( remove_failures > 0 )); then
   echo "Done, except $remove_failures file(s) that could not be removed (named above)." >&2

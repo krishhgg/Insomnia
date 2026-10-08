@@ -131,6 +131,42 @@ final class BrightnessSamplerTests: XCTestCase {
         XCTAssertEqual(s.last?.display, 0.5)
     }
 
+    /// While the keyboard is held (its brightness is journaled, so it reads
+    /// the 0 a close left) the keyboard sample is kept and the display
+    /// still merges.
+    func testAHeldKeyboardKeepsItsSampleWhileTheDisplayStillMerges() {
+        let s = make()
+        s.sample()
+        let held = Locked(true)
+        s.keyboardHeld = { held.value }
+        display.brightness = 0.6
+        keyboard.brightness = 0
+        XCTAssertEqual(s.sample(), BrightnessSample(display: 0.6, keyboard: nil, takenAt: t0))
+        XCTAssertEqual(s.last, BrightnessSample(display: 0.6, keyboard: 0.5, takenAt: t0))
+
+        held.value = false
+        keyboard.brightness = 0.4
+        XCTAssertEqual(s.sample(), BrightnessSample(display: 0.6, keyboard: 0.4, takenAt: t0))
+    }
+
+    /// A level written from the journal is the sample from then on, even
+    /// while the device is held and with no input for minutes; it merges
+    /// per field like a reading.
+    func testARecordedLevelIsTheSampleEvenWhileHeld() {
+        let s = make()
+        s.sample()
+        s.displayHeld = { true }
+        s.keyboardHeld = { true }
+        idle.value = 600
+
+        s.record(display: 0.8, keyboard: nil)
+        XCTAssertEqual(s.last, BrightnessSample(display: 0.8, keyboard: 0.5, takenAt: t0))
+        s.record(display: nil, keyboard: 0.3)
+        XCTAssertEqual(s.last, BrightnessSample(display: 0.8, keyboard: 0.3, takenAt: t0))
+        s.record(display: nil, keyboard: nil)
+        XCTAssertEqual(s.last, BrightnessSample(display: 0.8, keyboard: 0.3, takenAt: t0))
+    }
+
     func testNoopControlsReadAsAwakeAndUnsuppressed() {
         XCTAssertFalse(NoopDisplayDimmer().isAsleep())
         XCTAssertFalse(NoopKeyboardBacklight().isSuppressedOrDimmed())

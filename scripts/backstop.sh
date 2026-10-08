@@ -3,6 +3,16 @@
 # Runs from launchd (RunAtLoad + StartInterval 60, installed by install.sh)
 # and from install.sh / uninstall.sh. Needs no Insomnia process and no Swift.
 #
+# Where it lives: install.sh copies this file into the app bundle at
+# Insomnia.app/Contents/Resources/backstop.sh before signing the bundle, so
+# the signature's resource seal covers it. The LaunchAgent's command line
+# runs `codesign --verify --strict` on the bundle against the requirement
+# pinned in the plist (for an ad-hoc build, the cdhash of that build) and
+# execs this file only when that passes; an edited copy makes the check fail
+# and the agent logs one line and runs nothing. Nothing executable is kept in
+# Application Support (installs before this layout ran a writable copy from
+# there; install.sh removes it once the new agent is loaded).
+#
 # Every run is one transaction under APP_SUPPORT/.recovery.lock, an flock(2)
 # exclusive lock on the same file the app locks: read session.json and
 # state.json, decide, undo, publish the new journal atomically, release. If
@@ -19,7 +29,8 @@
 # Decision, driven only by what the journal says was changed:
 #   - session.json valid (endsAt in the future) and no --force: exit 0.
 #   - state.json missing or clean: nothing is undone and nothing privileged
-#     runs; an expired session.json is removed. Exit 0.
+#     runs; an expired session.json is removed. Exit 0. Entries in
+#     savedAudioOutputs alone count as clean (see below).
 #   - state.json dirty: undo each journaled entry from the journal alone:
 #       sleepDisabledByUs   -> sudo -n pmset -a disablesleep 0
 #       lowPowerSetByUs     -> sudo -n pmset -b lowpowermode 0
@@ -58,10 +69,50 @@
 #                              process is ours. Only the app resolves them.
 #       savedOutputVolume / savedMuted -> CoreAudio; only the app can restore
 #                              these. Kept for the app's reconcile.
+#       savedAudioOutputs   -> CoreAudio volume and mute of each output
+#                              device a lid close muted, by device UID; only
+#                              the app can restore these, and only while the
+#                              device is connected. Kept for the app, and on
+#                              their own they leave the journal clean: an
+#                              entry can wait days for its device, the app's
+#                              menu shows it, and an error every minute here
+#                              would only fill the log. They are logged once
+#                              when this run removes a session or undoes
+#                              something else.
 #       savedDisplayBrightness / savedKeyboardBrightness -> display brightness
 #                              and keyboard backlight the app set to 0 on lid
 #                              close; only the app can restore these (private
 #                              frameworks). Kept for the app's reconcile.
+#                              With displayRestoreRefused / keyboardRestore-
+#                              Refused true, the app's private-call guard
+#                              refused that restore on this macOS: kept, and
+#                              not dirty, since no run here or of that app
+#                              build can restore it.
+#       displayRestoredUnderLowPower, keptDisplayUnderLowPower,
+#       keptDisplayUnderLowPowerBoot, keptDisplayReadLit -> the app's own
+#                              records about a display restore under its Low
+#                              Power Mode and about a kept display entry.
+#                              Nothing to undo and not dirty: never read for
+#                              an undo here, and kept as they are for the
+#                              app, with one change. Before this run
+#                              switches Low Power Mode off, a record of the
+#                              kept entry gets this boot's
+#                              kern.bootsessionuuid (empty if it cannot be
+#                              read) as keptDisplayUnderLowPowerBoot, in a
+#                              journal published first, so the app takes no
+#                              reading of that entry in this boot as the
+#                              user's level while the panel comes back from
+#                              the mode, even if the journal written after
+#                              the undo is lost. If that journal cannot be
+#                              published, the mode is left on and kept for
+#                              retry. Their types are checked, and the three
+#                              keys about the kept entry are also read from
+#                              the file's text as the app reads it
+#                              (record_text_problems): at the top level, with
+#                              escapes in keys decoded. A number the app
+#                              cannot decode, one of these keys found twice
+#                              there, or text the check cannot follow makes
+#                              the journal malformed.
 #       appNapOverrides     -> NSAppSleepDisabled the app set to YES in an
 #                              agent app's preferences, with the value it had
 #                              before: defaults write <bundleId>
@@ -191,8 +242,9 @@ tighten() { # path...
 }
 tighten "$APP_SUPPORT" "$LOG_DIR" "$LOG" "$LOCK" "$STATE" "$SESSION"
 inode() { stat -f %i "$1" 2>/dev/null; }
+lock_shared=0
 if [[ -e /dev/fd/9 && -e "$LOCK" && -n "$(inode "$LOCK")" && "$(inode /dev/fd/9)" == "$(inode "$LOCK")" ]]; then
-  : # fd 9 is the caller's handle on the lock file; share its lock.
+  lock_shared=1 # fd 9 is the caller's handle on the lock file; share its lock.
 else
   exec 9<>"$LOCK"
 fi
@@ -225,75 +277,150 @@ is_positive_int() {
   [[ "$1" =~ ^[0-9]+$ ]] && (( 10#$1 > 0 ))
 }
 
-# True once the supervisor has written the command's exit status.
-wait_for_status() { # rcfile seconds
-  local i
-  for (( i = 0; i < $2 * 10; i++ )); do
-    [[ -s "$1" ]] && return 0
+# True once file $1 is non-empty; waits at least $2 seconds for it unless it
+# appears first. The limit is read from bash's SECONDS clock, which counts
+# whole seconds of wall-clock time, so the wait ends at the first check after
+# the clock has gone past the limit: more than $2 seconds after the call, up
+# to one second later than that, plus the poll in progress at that moment. A
+# slow poll on a loaded machine (each sleep is a fork) adds its own length
+# once, where counting polls stretched the limit by every one of them. The
+# file is checked once more after the limit, so a status written during the
+# last poll still counts. A wall-clock change during the wait (the clock set
+# back or forward) lengthens or shortens it by that much.
+wait_for_status() { # file seconds
+  local deadline=$(( SECONDS + $2 ))
+  while [[ ! -s "$1" ]] && (( SECONDS <= deadline )); do
     sleep 0.1
   done
   [[ -s "$1" ]]
 }
 
-# Run one undo command (sudo -n pmset ...) inside the locked transaction with
-# a time limit. A supervising subshell that keeps fd 9 (the lock) starts the
-# command, waits for it and writes its exit status to a file. sudo drops
-# extra descriptors before running pmset, so pmset itself never holds the
-# lock: the supervisor does, until sudo reports that the command finished.
-# On timeout the command gets SIGTERM (sudo relays it to pmset and waits for
-# it), then KILL_GRACE_SECONDS. A command that is still running after that is
-# never SIGKILLed: killing sudo would orphan a root pmset that could change
-# power state later, outside any transaction. Instead the supervisor keeps
-# waiting and so keeps the lock, this run returns 125 with command_alive=1,
-# and the pid is logged for manual intervention. The caller must then end the
+# Run one undo command (sudo -n pmset ..., defaults ...) inside the locked
+# transaction with a time limit. supervise_command (below) starts it in the
+# background, enforces the limit and writes one status line; this run waits
+# for that line and never signals the command itself. Returns the command's
+# exit status; 124 when it did not finish within COMMAND_TIMEOUT_SECONDS and
+# ended within KILL_GRACE_SECONDS of the SIGTERM it then got; 125, with
+# command_alive=1, when it was still running after that, or when no status
+# came in time.
+# A command still running after SIGTERM is never SIGKILLed: killing sudo
+# would orphan a root pmset that could change power state later, outside any
+# transaction. Its supervisor keeps waiting and so keeps the lock, and the
+# pid is logged for manual intervention. The caller must then end the
 # transaction (stop_transaction): no later undo command may run beside a live
-# one, and the journal stays as it was. Every later app start and backstop run
-# is refused as "lock held" until that command ends.
-# Each call gets its own status files, so a status can never be read as
-# another command's. The supervisor's stdio is detached so a caller capturing
-# this script's output gets EOF when the script exits, not when the command
-# does.
+# one, and the journal stays as it was. Every later app start and backstop
+# run is refused as "lock held" until that command ends. A missing status
+# ends the transaction the same way: nothing here can tell whether the
+# command still runs, and stopping is the safe side.
+# Each call gets its own status files (.backstop.<this run's pid>.<call>.pid
+# and .rc), so a status can never be read as another command's. The .pid file
+# is for the log only. Nothing signals the pid read from it: by the time it
+# is read the supervisor may have reaped the command, and the number may
+# belong to another process. A call that ended removes its files; a call that
+# returned 125 leaves them to its live supervisor. The first call of a run
+# that took the lock on its own handle removes what earlier runs left: their
+# supervisors kept the lock while they lived, so all of them have ended. A
+# run that shares its caller's lock (fd 9) skips that: an earlier run under
+# the same lock may still have a supervisor waiting for its command.
+# The supervisor's stdio is detached so a caller capturing this script's
+# output gets EOF when the script exits, not when the command does.
 bounded_calls=0
 command_alive=0
 bounded_output=""   # file for the next bounded command's output; empty: discarded
 run_bounded() { # command args...
-  local cpid rc pidfile rcfile supervisor
+  local base status="" rc cpid="" supervisor answer_within
   bounded_calls=$((bounded_calls + 1))
-  pidfile="$APP_SUPPORT/.backstop.$$.$bounded_calls.pid"
-  rcfile="$APP_SUPPORT/.backstop.$$.$bounded_calls.rc"
-  if (( bounded_calls == 1 )); then
-    # Status files left by an earlier run that had to fail closed. Their
-    # supervisor held the lock while it lived, so they are stale by now.
+  base="$APP_SUPPORT/.backstop.$$.$bounded_calls"
+  if (( bounded_calls == 1 && ! lock_shared )); then
     "$RM" -f "$APP_SUPPORT"/.backstop.*.pid "$APP_SUPPORT"/.backstop.*.rc
   fi
-  (
-    "$@" </dev/null >"${bounded_output:-/dev/null}" 2>&1 &
-    cpid=$!
-    echo "$cpid" > "$pidfile"
-    rc=0
-    wait "$cpid" || rc=$?
-    echo "$rc" > "$rcfile"
-  ) </dev/null >/dev/null 2>&1 &
+  supervise_command "$base" "$@" </dev/null >/dev/null 2>&1 &
   supervisor=$!
-  if ! wait_for_status "$rcfile" "$COMMAND_TIMEOUT_SECONDS"; then
-    cpid="$(cat "$pidfile" 2>/dev/null || true)"
-    if [[ -n "$cpid" ]]; then
-      kill -TERM "$cpid" 2>/dev/null || true
-    fi
-    if ! wait_for_status "$rcfile" "$KILL_GRACE_SECONDS"; then
-      log error "'$*' (pid ${cpid:-?}) did not finish within ${COMMAND_TIMEOUT_SECONDS}s and did not stop on SIGTERM. It is not killed, because that could leave a root pmset running outside the transaction. It keeps the recovery lock until it ends, so Insomnia cannot start and recovery cannot run until then; stop it by hand (sudo kill ${cpid:-<pid>}) and the next run will retry"
-      command_alive=1
-      return 125
-    fi
-    log error "'$*' did not finish within ${COMMAND_TIMEOUT_SECONDS}s; terminated with SIGTERM (pid ${cpid:-?})"
-    wait "$supervisor" 2>/dev/null || true
-    "$RM" -f "$pidfile" "$rcfile"
-    return 124
+  # Each of the supervisor's two waits can end up to a second after its
+  # limit, plus the poll in progress then (see wait_for_status), and the
+  # supervisor takes a moment to start and to write its status. Four seconds
+  # cover that at the usual 0.1 s poll. A supervisor slower than that gets
+  # the 125 below, the safe side.
+  answer_within=$(( COMMAND_TIMEOUT_SECONDS + KILL_GRACE_SECONDS + 4 ))
+  if wait_for_status "$base.rc" "$answer_within"; then
+    read -r status < "$base.rc" || true
   fi
-  rc="$(cat "$rcfile")"
+  # A regular file only: a FIFO there could block this run under the lock.
+  if [[ -f "$base.pid" ]]; then
+    read -r cpid < "$base.pid" || true
+    [[ "$cpid" =~ ^[0-9]+$ ]] || cpid=""
+  fi
+  case "$status" in
+    "exit "*) rc="${status#exit }" ;;
+    term)
+      log error "'$*' did not finish within ${COMMAND_TIMEOUT_SECONDS}s; terminated with SIGTERM (pid ${cpid:-?})"
+      rc=124 ;;
+    alive)
+      log error "'$*' (pid ${cpid:-?}) did not finish within ${COMMAND_TIMEOUT_SECONDS}s and did not stop on SIGTERM. It is not killed, because that could leave a root pmset running outside the transaction. It keeps the recovery lock until it ends, so Insomnia cannot start and recovery cannot run until then; stop it by hand (sudo kill ${cpid:-<pid>}, after 'ps -p ${cpid:-<pid>}' shows that pid is still this command) and the next run will retry"
+      command_alive=1
+      return 125 ;;
+    *)
+      log error "'$*' (pid ${cpid:-?}): its supervisor reported no result within ${answer_within}s, so the command may still be running. Nothing is signaled from here; while the supervisor waits for the command it keeps the recovery lock. The journal is kept and the next run will retry"
+      command_alive=1
+      return 125 ;;
+  esac
   wait "$supervisor" 2>/dev/null || true
-  "$RM" -f "$pidfile" "$rcfile"
+  "$RM" -f "$base.pid" "$base.rc"
+  [[ "$rc" =~ ^[0-9]+$ ]] || rc=1
   return "$rc"
+}
+
+# The supervisor of one run_bounded call; it runs in the background and is
+# the only process that signals the command. It keeps fd 9 (the recovery
+# lock) until its command has exited and been reaped. sudo drops extra
+# descriptors before running pmset, so pmset itself never holds the lock:
+# the supervisor does, until sudo reports that the command finished. Both
+# limits are measured here (see wait_for_job), so they hold even if this run
+# is killed while it waits.
+# The supervisor ignores SIGTERM and SIGHUP, so neither the end of this run,
+# killed or not, nor either signal sent to its whole process group frees the
+# lock while the command runs. launchd signals what is left of a job's
+# process group once the job's main process has exited, unless the job sets
+# AbandonProcessGroup, which this agent does not. SIGINT and SIGQUIT are
+# ignored already, as in every background job of a script. SIGKILL cannot be
+# ignored: a supervisor killed with it frees the lock even if its command is
+# still running. The command gets back the SIGTERM and SIGHUP actions this
+# script started with (the defaults, under launchd), so it still stops on
+# SIGTERM.
+# The command is the supervisor's only job, so it stays in the supervisor's
+# job list until the supervisor has reaped it, and signal_job (see
+# run_app_bounded) sends SIGTERM by jobspec: to the command or, once bash has
+# reaped it, to nothing, never to a process that reused its pid. At the limit
+# the command gets SIGTERM (sudo relays it to pmset and waits for it), then
+# KILL_GRACE_SECONDS; it never gets SIGKILL. <base>.rc gets one line:
+# "exit <status>" when the command ended within the limit, "term" when it
+# ended within the grace, "alive" when it was still running then. After
+# "alive" the supervisor goes on waiting and logs the command's exit.
+# errexit is off here: a failed write must not end the supervisor while its
+# command still runs.
+supervise_command() { # base command args...
+  local base="$1" cpid rc
+  shift
+  set +e
+  trap '' TERM HUP
+  ( trap - TERM HUP; exec "$@" ) </dev/null >"${bounded_output:-/dev/null}" 2>&1 &
+  cpid=$!
+  echo "$cpid" > "$base.pid"
+  if wait_for_job "$cpid" "$COMMAND_TIMEOUT_SECONDS"; then
+    wait "$cpid"
+    echo "exit $?" > "$base.rc"
+    return
+  fi
+  signal_job TERM "$cpid"
+  if wait_for_job "$cpid" "$KILL_GRACE_SECONDS"; then
+    wait "$cpid"
+    echo term > "$base.rc"
+    return
+  fi
+  echo alive > "$base.rc"
+  wait "$cpid"
+  rc=$?
+  log info "'$*' (pid $cpid), left running after SIGTERM, has exited (wait status $rc); its supervisor now lets go of the recovery lock, and the next run will retry"
 }
 
 # Run the app binary's --resume-frozen check (see resume_via_app) with the
@@ -327,11 +454,13 @@ job_running() { # pid
   done
   return 1
 }
-# True once job pid $1 has left bash's running list; polls for $2 seconds.
+# True once job pid $1 has left bash's running list; waits at least $2
+# seconds for that unless it happens first, on the SECONDS clock like
+# wait_for_status (and within the same bounds), and checks once more after
+# the limit.
 wait_for_job() { # pid seconds
-  local i
-  for (( i = 0; i < $2 * 10; i++ )); do
-    job_running "$1" || return 0
+  local deadline=$(( SECONDS + $2 ))
+  while job_running "$1" && (( SECONDS <= deadline )); do
     sleep 0.1
   done
   ! job_running "$1"
@@ -372,6 +501,163 @@ stop_transaction() { # what
   exit 1
 }
 
+# Prints one line per way the app's records about a kept display entry would
+# not decode, or nothing. Read from the text of state.json $1 itself, not
+# through plutil, which turns a number too small for a Double, such as
+# 1e-400, into 0.0, reads 1., .5, +1 and other JSON5 forms the app refuses,
+# and keeps the last of two copies of a key where the app's JSONDecoder keeps
+# the first. The text is read the way the app reads it. Only keys of the
+# top-level object count, with their \u escapes decoded, so
+# "keptDisplayReadL\u0069t" is that key. Every value is stepped over whole: a
+# string to its closing quote, an object or array to its closing bracket. So
+# a saved audio name or UID, or a nested object, that holds such a key, a \u
+# escape or a bad number holds no record. Each of the two numbers must be
+# null or a JSON number a Swift Float holds: not above about 3.4028236e38, and
+# either 0 in every digit or not so small that it rounds to 0 (below about
+# 7.0065e-46). The range is read from the decimal exponent and the first 9
+# significant digits, a little stricter than the app (from 3.40282356e38 and
+# up to 7.01e-46), where no brightness lies. A string, object or array there
+# is left to the type check. Also refused: one of the three keys found more
+# than once at the top level, since plutil checks and republishes the last
+# copy; a key with an escape JSON does not have, such as \x41, which plutil
+# reads as A; and a top level this reader cannot follow, such as a key
+# without quotes, a comment, a byte order mark other than UTF-8's, or a NUL
+# byte. UTF-16 and UTF-32, which the app also reads, have NUL bytes, and the
+# shell drops them from the text, which would turn such a file into other
+# characters. Text outside ASCII cannot spell the keys, even under the
+# decoder's Unicode equivalence, so a file with neither "keptDisplay" nor a
+# backslash in it has none of them and is not read further. Any of these
+# makes the journal malformed, as for a wrong type, and nothing is undone.
+record_text_problems() { # file
+  local LC_ALL=C
+  local text rest raw key c token depth str plain scalar number esc hex lost
+  local n_low=0 n_lit=0 n_boot=0 digits sig exp e10 lead
+  str='^"([^"\\]|\\.)*"'
+  plain='^[^]["{}]+'
+  scalar='^[^],}[:space:]]+'
+  number='^-?(0|[1-9][0-9]*)(\.([0-9]+))?([eE]([-+]?)([0-9]+))?$'
+  esc='^u00(4[1-9A-Fa-f]|5[0-9Aa]|6[1-9A-Fa-f]|7[0-9Aa])'
+  hex='^u[0-9A-Fa-f]{4}'
+  lost="the top level of state.json cannot be followed here, so its records about a kept display entry cannot be checked"
+  text="$(<"$1")"
+  [[ "$text" == *keptDisplay* || "$text" == *\\* ]] || return 0
+  if IFS= read -r -d '' c < "$1"; then
+    echo "$lost"
+    return 0
+  fi
+  rest="${text#$'\xef\xbb\xbf'}"
+  rest="${rest#"${rest%%[![:space:]]*}"}"
+  [[ "${rest:0:1}" == "{" ]] || { echo "$lost"; return 0; }
+  rest="${rest:1}"
+  while :; do
+    rest="${rest#"${rest%%[![:space:]]*}"}"
+    # An empty object, or a comma before the end, which the app accepts.
+    [[ "${rest:0:1}" == "}" ]] && break
+    [[ "$rest" =~ $str ]] || { echo "$lost"; return 0; }
+    raw="${BASH_REMATCH[0]}"
+    rest="${rest:${#raw}}"
+    raw="${raw:1:${#raw}-2}"
+    # The key as the app reads it. Of the escapes JSON has, only a \u of a
+    # letter can be part of one of the three keys; the others stand for no
+    # letter.
+    key=""
+    while [[ "$raw" == *\\* ]]; do
+      key+="${raw%%\\*}"
+      raw="${raw#*\\}"
+      if [[ "$raw" =~ $esc ]]; then
+        printf -v c '%b' "\\x${BASH_REMATCH[1]}"
+        key+="$c"
+        raw="${raw:5}"
+      elif [[ "$raw" =~ $hex ]]; then
+        key+="?"
+        raw="${raw:5}"
+      else
+        case "${raw:0:1}" in
+          '"'|\\|/|b|f|n|r|t) key+="?"; raw="${raw:1}" ;;
+          *) echo "a key in state.json has an escape JSON does not have, so its records about a kept display entry cannot be checked"; return 0 ;;
+        esac
+      fi
+    done
+    key+="$raw"
+    rest="${rest#"${rest%%[![:space:]]*}"}"
+    [[ "${rest:0:1}" == : ]] || { echo "$lost"; return 0; }
+    rest="${rest:1}"
+    rest="${rest#"${rest%%[![:space:]]*}"}"
+    token=""
+    case "${rest:0:1}" in
+      '"')
+        [[ "$rest" =~ $str ]] || { echo "$lost"; return 0; }
+        rest="${rest:${#BASH_REMATCH[0]}}"
+        ;;
+      '{'|'[')
+        depth=0
+        while :; do
+          case "${rest:0:1}" in
+            '{'|'[') depth=$((depth + 1)); rest="${rest:1}" ;;
+            '}'|']') depth=$((depth - 1)); rest="${rest:1}"; (( depth > 0 )) || break ;;
+            '"')
+              [[ "$rest" =~ $str ]] || { echo "$lost"; return 0; }
+              rest="${rest:${#BASH_REMATCH[0]}}"
+              ;;
+            '') echo "$lost"; return 0 ;;
+            *)
+              [[ "$rest" =~ $plain ]] || { echo "$lost"; return 0; }
+              rest="${rest:${#BASH_REMATCH[0]}}"
+              ;;
+          esac
+        done
+        ;;
+      *)
+        [[ "$rest" =~ $scalar ]] || { echo "$lost"; return 0; }
+        token="${BASH_REMATCH[0]}"
+        rest="${rest:${#token}}"
+        ;;
+    esac
+    case "$key" in
+      keptDisplayUnderLowPower) n_low=$((n_low + 1)) ;;
+      keptDisplayReadLit) n_lit=$((n_lit + 1)) ;;
+      # The boot is a string, whose type plutil checks.
+      keptDisplayUnderLowPowerBoot) n_boot=$((n_boot + 1)); token="" ;;
+      *) token="" ;;
+    esac
+    if [[ -n "$token" && "$token" != null ]]; then
+      if [[ "$token" =~ $number ]]; then
+        digits="${BASH_REMATCH[1]}${BASH_REMATCH[3]}"
+        sig="${digits#"${digits%%[1-9]*}"}"
+        if [[ -n "$sig" ]]; then
+          exp="${BASH_REMATCH[6]#"${BASH_REMATCH[6]%%[1-9]*}"}"
+          if (( ${#exp} > 18 )); then
+            e10=1000000000000000000
+          else
+            e10=$((10#0$exp))
+          fi
+          [[ "${BASH_REMATCH[5]}" == - ]] && e10=$((-e10))
+          e10=$((e10 + ${#BASH_REMATCH[1]} - 1 - (${#digits} - ${#sig})))
+          lead="${sig}00000000"
+          lead=$((10#${lead:0:9}))
+          if (( e10 < -46 || (e10 == -46 && lead < 701000000) )); then
+            echo "$key is ${token:0:40}, too small a number for the app to read"
+          elif (( e10 > 38 || (e10 == 38 && lead > 340282355) )); then
+            echo "$key is ${token:0:40}, too large a number for the app to read"
+          fi
+        fi
+      else
+        echo "$key is written as ${token:0:40}, which the app does not read as a number"
+      fi
+    fi
+    rest="${rest#"${rest%%[![:space:]]*}"}"
+    case "${rest:0:1}" in
+      ,) rest="${rest:1}" ;;
+      '}') break ;;
+      *) echo "$lost"; return 0 ;;
+    esac
+  done
+  (( n_low > 1 )) && echo "keptDisplayUnderLowPower is in the top level of state.json $n_low times; the app reads the first and plutil the last"
+  (( n_lit > 1 )) && echo "keptDisplayReadLit is in the top level of state.json $n_lit times; the app reads the first and plutil the last"
+  (( n_boot > 1 )) && echo "keptDisplayUnderLowPowerBoot is in the top level of state.json $n_boot times; the app reads the first and plutil the last"
+  return 0
+}
+
 # Prints one line per way the journal does not have the shape the app writes
 # (RuntimeState.swift). Present keys must have the right type; a JSON null is
 # the same as an absent optional (Swift decodeIfPresent).
@@ -381,14 +667,24 @@ journal_shape_problems() { # file
     echo "state.json is not a JSON object"
     return 0
   fi
-  for key in sleepDisabledByUs lowPowerSetByUs dockerFrozen savedMuted; do
+  for key in sleepDisabledByUs lowPowerSetByUs dockerFrozen savedMuted displayRestoreRefused keyboardRestoreRefused; do
     t="$(type_of "$f" "$key")"
     [[ -z "$t" || "$t" == bool || "$t" == "(any)" ]] || echo "$key is a $t, not a bool"
   done
-  for key in savedOutputVolume savedDisplayBrightness savedKeyboardBrightness; do
+  for key in savedOutputVolume savedDisplayBrightness savedKeyboardBrightness displayRestoredUnderLowPower; do
     t="$(type_of "$f" "$key")"
     [[ -z "$t" || "$t" == float || "$t" == integer || "$t" == "(any)" ]] || echo "$key is a $t, not a number"
   done
+  # The app's records about a kept display entry: kept for the app, never
+  # read for an undo here. Each must still decode, or the app cannot read
+  # the journal at all.
+  for key in keptDisplayUnderLowPower keptDisplayReadLit; do
+    t="$(type_of "$f" "$key")"
+    [[ -z "$t" || "$t" == float || "$t" == integer || "$t" == "(any)" ]] || echo "$key is a $t, not a number"
+  done
+  t="$(type_of "$f" keptDisplayUnderLowPowerBoot)"
+  [[ -z "$t" || "$t" == string || "$t" == "(any)" ]] || echo "keptDisplayUnderLowPowerBoot is a $t, not a string"
+  record_text_problems "$f"
   t="$(type_of "$f" frozenProcesses)"
   if [[ -n "$t" && "$t" != "(any)" ]]; then
     if [[ "$t" != array ]]; then
@@ -419,6 +715,29 @@ journal_shape_problems() { # file
       i=0
       while [[ -n "$(type_of "$f" "frozenPids.$i")" ]]; do
         [[ "$(type_of "$f" "frozenPids.$i")" == integer ]] || echo "frozenPids[$i] is not an integer"
+        i=$((i + 1))
+      done
+    fi
+  fi
+  t="$(type_of "$f" savedAudioOutputs)"
+  if [[ -n "$t" && "$t" != "(any)" ]]; then
+    if [[ "$t" != array ]]; then
+      echo "savedAudioOutputs is a $t, not an array"
+    else
+      i=0
+      while [[ -n "$(type_of "$f" "savedAudioOutputs.$i")" ]]; do
+        if [[ "$(type_of "$f" "savedAudioOutputs.$i")" != dictionary ]]; then
+          echo "savedAudioOutputs[$i] is not an object"
+        else
+          [[ "$(type_of "$f" "savedAudioOutputs.$i.deviceUID")" == string ]] || echo "savedAudioOutputs[$i].deviceUID is not a string"
+          t="$(type_of "$f" "savedAudioOutputs.$i.volume")"
+          [[ "$t" == float || "$t" == integer ]] || echo "savedAudioOutputs[$i].volume is not a number"
+          [[ "$(type_of "$f" "savedAudioOutputs.$i.muted")" == bool ]] || echo "savedAudioOutputs[$i].muted is not a bool"
+          t="$(type_of "$f" "savedAudioOutputs.$i.name")"
+          [[ -z "$t" || "$t" == string || "$t" == "(any)" ]] || echo "savedAudioOutputs[$i].name is a $t, not a string"
+          t="$(type_of "$f" "savedAudioOutputs.$i.saveID")"
+          [[ -z "$t" || "$t" == string || "$t" == "(any)" ]] || echo "savedAudioOutputs[$i].saveID is a $t, not a string"
+        fi
         i=$((i + 1))
       done
     fi
@@ -578,16 +897,20 @@ if [[ "$journal_state" == malformed ]]; then
 fi
 
 sleep_held=false; low_power=false; docker_frozen=false; has_audio=0
-has_display=0; has_keyboard=0
-frozen_count=0; legacy_count=0; app_nap_count=0
+has_display=0; has_keyboard=0; refused_display=0; refused_keyboard=0
+frozen_count=0; legacy_count=0; app_nap_count=0; output_count=0
 if [[ "$journal_state" == clean ]]; then
   is_true "$STATE" sleepDisabledByUs && sleep_held=true
   is_true "$STATE" lowPowerSetByUs && low_power=true
   is_true "$STATE" dockerFrozen && docker_frozen=true
   extract "$STATE" savedOutputVolume >/dev/null && has_audio=1
   extract "$STATE" savedMuted >/dev/null && has_audio=1
-  extract "$STATE" savedDisplayBrightness >/dev/null && has_display=1
-  extract "$STATE" savedKeyboardBrightness >/dev/null && has_keyboard=1
+  if extract "$STATE" savedDisplayBrightness >/dev/null; then
+    if is_true "$STATE" displayRestoreRefused; then refused_display=1; else has_display=1; fi
+  fi
+  if extract "$STATE" savedKeyboardBrightness >/dev/null; then
+    if is_true "$STATE" keyboardRestoreRefused; then refused_keyboard=1; else has_keyboard=1; fi
+  fi
   while extract_json "$STATE" "frozenProcesses.$frozen_count" >/dev/null; do
     frozen_count=$((frozen_count + 1))
   done
@@ -597,10 +920,25 @@ if [[ "$journal_state" == clean ]]; then
   while extract_json "$STATE" "appNapOverrides.$app_nap_count" >/dev/null; do
     app_nap_count=$((app_nap_count + 1))
   done
+  # Kept for the app and not counted as dirty; see the header.
+  while extract_json "$STATE" "savedAudioOutputs.$output_count" >/dev/null; do
+    output_count=$((output_count + 1))
+  done
   if [[ "$sleep_held" == true || "$low_power" == true || "$docker_frozen" == true ]] \
      || (( has_audio == 1 || has_display == 1 || has_keyboard == 1 || frozen_count > 0 || legacy_count > 0 || app_nap_count > 0 )); then
     journal_state=dirty
   fi
+fi
+
+# Brightness the app kept after its private-call guard refused the
+# restore: it stays in the journal for a build that can make the call, and
+# is not dirty, since neither this script nor that app build can restore it.
+refused_note=""
+if (( refused_display == 1 || refused_keyboard == 1 )); then
+  refused=()
+  (( refused_display == 1 )) && refused+=("saved display brightness")
+  (( refused_keyboard == 1 )) && refused+=("saved keyboard backlight")
+  refused_note="$(IFS=,; echo "${refused[*]}") kept: the app's private-call guard refused that restore on this macOS, so nothing here or in that app build can restore it; set the level with the brightness keys"
 fi
 
 # session.json that is not a session, or cannot be read. Its bytes are
@@ -641,12 +979,18 @@ case "$session_state" in
   unreadable) session_note="session.json cannot be read ($unreadable_why), so its end time is unknown; treated as expired" ;;
 esac
 
+outputs_note="saved audio for $output_count output device(s), kept for the app, which restores each once it is connected"
+
 if [[ "$journal_state" != dirty ]]; then
   # Nothing journaled: nothing to undo, and nothing privileged runs.
+  if [[ "$session_state" != none ]] && (( output_count > 0 )); then
+    log info "journal clean apart from $outputs_note"
+  fi
   if [[ "$session_state" == unreadable ]]; then
     log info "$session_note; nothing journaled to undo"
   fi
   if [[ "$session_state" == malformed || "$session_state" == unreadable ]]; then
+    [[ -n "$refused_note" ]] && log info "$refused_note"
     quarantine_session || exit 1
     exit 0
   fi
@@ -656,6 +1000,7 @@ if [[ "$journal_state" != dirty ]]; then
     else
       log info "$session_note; journal already clean"
     fi
+    [[ -n "$refused_note" ]] && log info "$refused_note"
     "$RM" -f "$SESSION"
   fi
   exit 0
@@ -679,9 +1024,53 @@ if [[ "$sleep_held" == true ]]; then
   fi
 fi
 
+# The app's record of a kept display entry the mode was over
+# (keptDisplayUnderLowPower). The mode may have been on in this boot until
+# now, and the panel comes back from it over a time nobody has measured, so
+# the record is given this boot before the mode goes off, in a journal
+# published on its own. The app then takes no reading of that entry in this
+# boot as the user's level, as when it switches the mode off itself. That
+# holds also when the journal written after the undo below never lands: the
+# file then still says lowPowerSetByUs, next to a record from this boot,
+# which the app reads as its own mode on in this boot. A boot that cannot be
+# read is written empty, which the app reads as this boot's too, and a
+# record that already has this boot is left as it is. Returns non-zero when
+# the record could not be published; the caller then leaves the mode on,
+# since switched off with the old boot on disk, the app could take the panel
+# on its way back for the level the user set. A journal with no record, or a
+# null one, gets none.
+prepare_low_power_off() {
+  local t boot recorded tmp ok=1
+  t="$(type_of "$STATE" keptDisplayUnderLowPower)"
+  [[ "$t" == float || "$t" == integer ]] || return 0
+  boot="$("$SYSCTL" -n kern.bootsessionuuid 2>/dev/null || true)"
+  recorded="$(extract "$STATE" keptDisplayUnderLowPowerBoot || true)"
+  [[ "$recorded" == "$boot" ]] && return 0
+  tmp="$APP_SUPPORT/.state.json.backstop-boot.$$"
+  "$CP" "$STATE" "$tmp" || ok=0
+  if (( ok == 1 )); then
+    "$PLUTIL" -replace keptDisplayUnderLowPowerBoot -string "$boot" "$tmp" >/dev/null 2>&1 || ok=0
+  fi
+  if (( ok == 1 )); then
+    [[ "$("$PLUTIL" -convert json -o - "$tmp" 2>/dev/null | head -c 1)" == "{" ]] || ok=0
+    [[ "$(head -c 1 "$tmp")" == "{" ]] || ok=0
+  fi
+  if (( ok == 1 )); then
+    "$MV" -f "$tmp" "$STATE" || ok=0
+  fi
+  if (( ok == 0 )); then
+    "$RM" -f "$tmp"
+    return 1
+  fi
+  log info "kept display entry's record given this boot (${boot:-unreadable, written empty}) before Low Power Mode is switched off"
+}
+
 new_low="$low_power"
 if [[ "$low_power" == true ]]; then
-  if run_bounded "$SUDO" -n "$PMSET" -b lowpowermode 0; then
+  if ! prepare_low_power_off; then
+    log error "could not publish this boot for the kept display entry's record to $STATE; Low Power Mode left on, keeping journal entry for retry"
+    failures+=("Low Power Mode is still set: state.json could not take this boot for the kept display entry's record, so the mode was not switched off")
+  elif run_bounded "$SUDO" -n "$PMSET" -b lowpowermode 0; then
     log info "pmset -b lowpowermode 0 ok"
     new_low=false; changed=1
   else
@@ -1004,6 +1393,7 @@ if (( has_audio == 1 || has_display == 1 || has_keyboard == 1 )); then
   log error "$(IFS=,; echo "${pending[*]}") can only be restored by the app; kept. Open Insomnia"
   failures+=("saved audio, display brightness or keyboard backlight settings need the app: open Insomnia to restore them")
 fi
+[[ -n "$refused_note" ]] && log info "$refused_note"
 
 # --- Publish -----------------------------------------------------------------
 # Edit a private copy, verify it, then rename it over state.json so readers
@@ -1049,7 +1439,11 @@ if (( ${#failures[@]} > 0 )); then
   exit 1
 fi
 
-log info "journal cleared"
+if (( output_count > 0 )); then
+  log info "journal cleared apart from $outputs_note"
+else
+  log info "journal cleared"
+fi
 case "$session_state" in
   malformed|unreadable) quarantine_session || exit 1 ;;
   *)                    "$RM" -f "$SESSION" ;;

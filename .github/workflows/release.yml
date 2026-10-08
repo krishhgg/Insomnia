@@ -1,0 +1,194 @@
+name: Release
+
+# Builds the downloadable Insomnia package and, for a version tag, publishes
+# it as a GitHub Release. docs/releasing.md walks through a release.
+#
+# Triggers
+#   push of a tag v<version>  test, build, package, attest, publish a GitHub
+#                             Release. <version> must equal
+#                             CFBundleShortVersionString in Resources/Info.plist.
+#   workflow_dispatch         test, build and package only; the zip and
+#                             SHA256SUMS are uploaded as a workflow artifact.
+#                             Nothing is attested or published.
+#
+# The bundle is ad-hoc signed and not notarized (build-app.sh), so the run
+# uses no secrets and no keychain. The release is a prerelease. Every action
+# is pinned to a commit.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+# Nothing at the top level; each job declares exactly what it needs.
+permissions: {}
+
+# One run per tag; a rerun waits instead of cancelling a publish in progress.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Test, build and package (macOS 26)
+    runs-on: macos-26
+    timeout-minutes: 60
+    # Read-only: only the release job below may write.
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Read the version and check the tag against it
+        id: version
+        run: |
+          version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Resources/Info.plist)"
+          case "$GITHUB_REF" in
+            refs/tags/v*)
+              tag="${GITHUB_REF#refs/tags/v}"
+              if [[ "$tag" != "$version" ]]; then
+                echo "tag v$tag does not match CFBundleShortVersionString $version in Resources/Info.plist" >&2
+                exit 1
+              fi
+              ;;
+          esac
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Insomnia $version"
+
+      - name: Print toolchain versions
+        run: |
+          xcodebuild -version
+          swift --version
+
+      - name: Install tmux
+        # Same as ci.yml: without tmux the pane tests skip instead of running.
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+          HOMEBREW_NO_ENV_HINTS: "1"
+        run: |
+          if ! brew list --versions tmux >/dev/null 2>&1; then
+            brew install tmux
+          fi
+          tmux_bin="$(brew --prefix)/bin/tmux"
+          case "$tmux_bin" in
+            /opt/homebrew/bin/tmux|/usr/local/bin/tmux) ;;
+            *)
+              echo "tmux linked at unexpected path: $tmux_bin" >&2
+              exit 1
+              ;;
+          esac
+          test -x "$tmux_bin"
+          "$tmux_bin" -V
+
+      - name: Run tests
+        run: swift test
+
+      - name: Build
+        env:
+          # build-app.sh compiles the simulate-lid.sh watcher in for "1"; a
+          # release never carries it.
+          INSOMNIA_LID_SIMULATION: ""
+        run: scripts/build-app.sh --output dist
+
+      - name: Package
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          pkg="Insomnia-$VERSION-macos"
+          mkdir -p "release/$pkg"
+          /usr/bin/ditto dist/Insomnia.app "release/$pkg/Insomnia.app"
+          cp scripts/install.sh scripts/uninstall.sh "release/$pkg/"
+          (cd release && /usr/bin/ditto -c -k --sequesterRsrc --keepParent "$pkg" "$pkg.zip")
+          (cd release && shasum -a 256 "$pkg.zip" > SHA256SUMS)
+          rm -rf "release/$pkg"
+          cat release/SHA256SUMS
+          codesign -dvv dist/Insomnia.app 2>&1 | grep -E '^(Identifier|Signature|Authority|TeamIdentifier|CDHash)=' || true
+
+      - name: Upload the package as a workflow artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: Insomnia-${{ steps.version.outputs.version }}-macos
+          path: |
+            release/*.zip
+            release/SHA256SUMS
+          if-no-files-found: error
+
+  release:
+    name: Attest and publish the GitHub Release
+    needs: build
+    # Pushed tags only. A manual run stops at the artifact, even one started
+    # on a tag ref, which a check of the ref alone would let through.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write      # create the release and upload its assets
+      id-token: write      # sign the provenance statement (Sigstore)
+      attestations: write  # store the attestation on the repository
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - name: Download the package
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: Insomnia-${{ needs.build.outputs.version }}-macos
+          path: release
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: release/*.zip
+
+      - name: Write the release notes
+        run: |
+          zip="$(basename release/*.zip)"
+          sum="$(cut -d' ' -f1 release/SHA256SUMS)"
+          signing="Prerelease: ad-hoc signed and not notarized, so macOS blocks the first launch until you allow it in System Settings > Privacy & Security. The checksum and attestation below show this zip is what the Release workflow built from the tagged commit."
+          install_note="The installer checks the bundle's signature, identifier and version before asking for your password, but it cannot verify where this bundle came from: that is what the checksum and the attestation above are for, and \`--allow-unverified-origin\` says you checked them. It then installs the app, the recovery agent and the sudoers rule described in the README."
+          {
+            echo "Insomnia $VERSION for Apple Silicon Macs with macOS 26 or later. The app is built for arm64 only, so the installer stops on an Intel Mac."
+            echo
+            echo "$signing"
+            echo
+            echo "## Verify the download"
+            echo
+            echo '```bash'
+            echo "shasum -a 256 -c SHA256SUMS"
+            echo "gh attestation verify $zip -R $GITHUB_REPOSITORY --signer-workflow $GITHUB_REPOSITORY/.github/workflows/release.yml --source-ref $GITHUB_REF"
+            echo '```'
+            echo
+            echo "The second command checks that this zip is the subject of an attestation signed by this repository's Release workflow for the tag \`$GITHUB_REF_NAME\`, not by just any workflow of this repository."
+            echo
+            echo "SHA-256 of \`$zip\`: \`$sum\`"
+            echo
+            echo "## Install"
+            echo
+            echo '```bash'
+            echo "ditto -x -k $zip ."
+            echo "cd ${zip%.zip}"
+            echo "./install.sh --allow-unverified-origin --app ./Insomnia.app"
+            echo "open \"\$HOME/Applications/Insomnia.app\""
+            echo '```'
+            echo
+            echo "$install_note"
+            echo
+            echo "Built from \`$GITHUB_SHA\` by run $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID."
+          } > notes.md
+          cat notes.md
+
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" release/*.zip release/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Insomnia $VERSION" \
+            --notes-file notes.md \
+            --verify-tag \
+            --prerelease

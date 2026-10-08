@@ -56,6 +56,56 @@ final class StoreTests: XCTestCase {
         XCTAssertFalse(clean.contains("savedKeyboardBrightness"), clean)
     }
 
+    /// Output device entries are flat objects that backstop.sh and
+    /// uninstall.sh check with plutil: a string UID, an optional string
+    /// name, a number, a bool and an optional string save ID.
+    func testSavedAudioOutputsAreWrittenFlatForTheScripts() throws {
+        var st = RuntimeState()
+        st.savedAudioOutputs = [
+            SavedAudioOutput(deviceUID: "usb-headset", name: "USB Headset", volume: 0.25, muted: false, saveID: "8C1F0E2A-55B1-4F0D-9D7B-3E1A2B4C5D6E"),
+            SavedAudioOutput(deviceUID: "70-8C-F2:output", name: nil, volume: 1, muted: true, saveID: nil),
+        ]
+        try store.saveState(st)
+        XCTAssertEqual(try store.loadState()?.savedAudioOutputs, st.savedAudioOutputs)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: home.paths.stateFile)) as? [String: Any])
+        let outputs = try XCTUnwrap(json["savedAudioOutputs"] as? [[String: Any]])
+        XCTAssertEqual(outputs.first?["deviceUID"] as? String, "usb-headset")
+        XCTAssertEqual(outputs.first?["name"] as? String, "USB Headset")
+        XCTAssertEqual(outputs.first?["volume"] as? Double, 0.25)
+        XCTAssertEqual(outputs.first?["muted"] as? Bool, false)
+        XCTAssertEqual(outputs.first?["saveID"] as? String, "8C1F0E2A-55B1-4F0D-9D7B-3E1A2B4C5D6E")
+        XCTAssertNil(outputs.last?["name"])
+        XCTAssertNil(outputs.last?["saveID"])
+        XCTAssertTrue(st.isDirty)
+        XCTAssertFalse(st.isDirty(leavingOutAudioOf: ["usb-headset", "70-8C-F2:output"]))
+    }
+
+    /// A journal from before output device entries has no key, and a null
+    /// counts as absent, as the scripts read it. An entry from before save
+    /// IDs, or with a null one, has none. Every entry the scripts call
+    /// malformed, the app's decoder refuses too, so neither side undoes a
+    /// journal the other cannot read.
+    func testSavedAudioOutputsDecodeLikeTheScriptsCheckThem() throws {
+        for legacy in [
+            #"{"sleepDisabledByUs":false,"savedOutputVolume":0.5,"savedMuted":false}"#,
+            #"{"sleepDisabledByUs":false,"savedOutputVolume":0.5,"savedMuted":false,"savedAudioOutputs":null}"#,
+        ] {
+            let st = try Store.makeDecoder().decode(RuntimeState.self, from: Data(legacy.utf8))
+            XCTAssertEqual(st.savedAudioOutputs, [], legacy)
+            XCTAssertEqual(st.savedOutputVolume, 0.5, legacy)
+        }
+        for earlier in [
+            #"{"savedAudioOutputs":[{"deviceUID":"usb-headset","name":"USB Headset","volume":0.3,"muted":false}]}"#,
+            #"{"savedAudioOutputs":[{"deviceUID":"usb-headset","name":"USB Headset","volume":0.3,"muted":false,"saveID":null}]}"#,
+        ] {
+            let st = try Store.makeDecoder().decode(RuntimeState.self, from: Data(earlier.utf8))
+            XCTAssertEqual(st.savedAudioOutputs, [SavedAudioOutput(deviceUID: "usb-headset", name: "USB Headset", volume: 0.3, muted: false, saveID: nil)], earlier)
+        }
+        for json in RecoveryScriptTests.corruptOutputJournals {
+            XCTAssertThrowsError(try Store.makeDecoder().decode(RuntimeState.self, from: Data(json.utf8)), json)
+        }
+    }
+
     /// App Nap entries are flat objects with a string bundle id and an
     /// optional bool, which is what backstop.sh reads with plutil; an
     /// absent previous value stays absent in the JSON. They keep the
@@ -125,6 +175,198 @@ final class StoreTests: XCTestCase {
         XCTAssertNil(try Store.makeDecoder().decode(RuntimeState.self, from: legacy).displayRestoredUnderLowPower)
     }
 
+    /// The record of our Low Power Mode over a kept display entry stays in
+    /// the file, flat, with its boot session, and is neither dirty nor an
+    /// undo entry. Written only while set; a journal without it decodes
+    /// with none.
+    func testKeptDisplayUnderLowPowerRoundTripsAndIsNotDirty() throws {
+        var st = RuntimeState()
+        st.savedDisplayBrightness = 0.8
+        st.displayRestoreRefused = true
+        st.keptDisplayUnderLowPower = 0.8
+        st.keptDisplayUnderLowPowerBoot = "boot-a"
+        try store.saveState(st)
+        XCTAssertEqual(try store.loadState(), st)
+        let text = try String(contentsOf: home.paths.stateFile, encoding: .utf8)
+        XCTAssertTrue(text.contains("\"keptDisplayUnderLowPower\" : 0.8"), text)
+        XCTAssertTrue(text.contains("\"keptDisplayUnderLowPowerBoot\" : \"boot-a\""), text)
+        XCTAssertFalse(st.isDirty)
+        XCTAssertNil(st.undoEntries.keptDisplayUnderLowPower)
+        XCTAssertNil(st.undoEntries.keptDisplayUnderLowPowerBoot)
+
+        try store.saveState(RuntimeState())
+        let bare = try String(contentsOf: home.paths.stateFile, encoding: .utf8)
+        XCTAssertFalse(bare.contains("keptDisplayUnderLowPower"), bare)
+        let legacy = Data(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"savedDisplayBrightness":0.8,"displayRestoreRefused":true}"#.utf8)
+        let decoded = try Store.makeDecoder().decode(RuntimeState.self, from: legacy)
+        XCTAssertNil(decoded.keptDisplayUnderLowPower)
+        XCTAssertFalse(decoded.keptDisplayReadUnderLowPower(inBoot: "boot-a"), "a journal from before the record is no doubt")
+    }
+
+    /// The record holds only for the kept entry it names, with that value
+    /// and its flag, in the boot it was written in; a journal write drops
+    /// it otherwise. One with no boot session holds, and takes the boot of
+    /// the next write that knows it.
+    func testKeptDisplayUnderLowPowerHoldsForItsEntryInItsBoot() {
+        var st = RuntimeState()
+        st.savedDisplayBrightness = 0.8
+        st.displayRestoreRefused = true
+        st.noteLowPowerOverKeptDisplay(ours: false, boot: "boot-a")
+        XCTAssertNil(st.keptDisplayUnderLowPower, "recorded with the mode never ours")
+
+        st.noteLowPowerOverKeptDisplay(ours: true, boot: "boot-a")
+        XCTAssertEqual(st.keptDisplayUnderLowPower, 0.8)
+        XCTAssertEqual(st.keptDisplayUnderLowPowerBoot, "boot-a")
+        XCTAssertTrue(st.keptDisplayReadUnderLowPower(inBoot: "boot-a"))
+        XCTAssertFalse(st.keptDisplayReadUnderLowPower(inBoot: "boot-b"))
+        XCTAssertTrue(st.keptDisplayReadUnderLowPower(inBoot: ""), "a boot not read is no restart")
+        var sameBoot = st
+        sameBoot.noteLowPowerOverKeptDisplay(ours: false, boot: "boot-a")
+        XCTAssertEqual(sameBoot, st, "kept with the mode no longer ours")
+
+        var later = st
+        later.noteLowPowerOverKeptDisplay(ours: false, boot: "boot-b")
+        XCTAssertNil(later.keptDisplayUnderLowPower)
+        XCTAssertNil(later.keptDisplayUnderLowPowerBoot)
+
+        var replaced = st
+        replaced.savedDisplayBrightness = 0.7
+        XCTAssertFalse(replaced.keptDisplayReadUnderLowPower(inBoot: "boot-a"))
+        replaced.noteLowPowerOverKeptDisplay(ours: false, boot: "boot-a")
+        XCTAssertNil(replaced.keptDisplayUnderLowPower)
+
+        var unflagged = st
+        unflagged.displayRestoreRefused = false
+        XCTAssertFalse(unflagged.keptDisplayReadUnderLowPower(inBoot: "boot-a"))
+        unflagged.noteLowPowerOverKeptDisplay(ours: true, boot: "boot-a")
+        XCTAssertNil(unflagged.keptDisplayUnderLowPower, "an ordinary entry is not recorded")
+
+        var settled = st
+        settled.savedDisplayBrightness = nil
+        settled.displayRestoreRefused = false
+        settled.noteLowPowerOverKeptDisplay(ours: true, boot: "boot-a")
+        XCTAssertNil(settled.keptDisplayUnderLowPower)
+
+        var unknown = st
+        unknown.keptDisplayUnderLowPowerBoot = nil
+        XCTAssertTrue(unknown.keptDisplayReadUnderLowPower(inBoot: "boot-b"))
+        unknown.noteLowPowerOverKeptDisplay(ours: false, boot: "boot-b")
+        XCTAssertEqual(unknown.keptDisplayUnderLowPower, 0.8)
+        XCTAssertEqual(unknown.keptDisplayUnderLowPowerBoot, "boot-b")
+        XCTAssertFalse(unknown.keptDisplayReadUnderLowPower(inBoot: "boot-c"), "held until the next restart only")
+    }
+
+    /// Our Low Power Mode claim next to a record from another boot is a
+    /// claim from before the Mac last started: the record keeps that boot
+    /// while the claim stays, is stamped again only when the mode is ours
+    /// in this boot, and goes once the claim is cleared. A record with no
+    /// boot, a boot not read, no record or another entry is not taken for
+    /// one.
+    func testLowPowerClaimFromAnEarlierBootKeepsItsRecord() {
+        var st = RuntimeState()
+        st.savedDisplayBrightness = 0.8
+        st.displayRestoreRefused = true
+        st.lowPowerSetByUs = true
+        st.noteLowPowerOverKeptDisplay(ours: true, boot: "boot-a")
+        XCTAssertFalse(st.lowPowerClaimFromEarlierBoot(boot: "boot-a"))
+        XCTAssertTrue(st.lowPowerClaimFromEarlierBoot(boot: "boot-b"))
+        XCTAssertFalse(st.lowPowerClaimFromEarlierBoot(boot: ""), "a boot not read is no restart")
+
+        var later = st
+        later.noteLowPowerOverKeptDisplay(ours: false, boot: "boot-b")
+        XCTAssertEqual(later, st, "kept, earlier boot and all, while the claim stays")
+        XCTAssertFalse(later.keptDisplayReadUnderLowPower(inBoot: "boot-b"))
+
+        var restamped = st
+        restamped.noteLowPowerOverKeptDisplay(ours: true, boot: "boot-b")
+        XCTAssertEqual(restamped.keptDisplayUnderLowPowerBoot, "boot-b", "the mode ours in this boot")
+        XCTAssertFalse(restamped.lowPowerClaimFromEarlierBoot(boot: "boot-b"))
+
+        var cleared = st
+        cleared.lowPowerSetByUs = false
+        XCTAssertFalse(cleared.lowPowerClaimFromEarlierBoot(boot: "boot-b"))
+        cleared.noteLowPowerOverKeptDisplay(ours: false, boot: "boot-b")
+        XCTAssertNil(cleared.keptDisplayUnderLowPower)
+        XCTAssertNil(cleared.keptDisplayUnderLowPowerBoot)
+
+        var noBoot = st
+        noBoot.keptDisplayUnderLowPowerBoot = nil
+        XCTAssertFalse(noBoot.lowPowerClaimFromEarlierBoot(boot: "boot-b"))
+        XCTAssertTrue(noBoot.keptDisplayReadUnderLowPower(inBoot: "boot-b"), "still doubt")
+
+        var noRecord = st
+        noRecord.keptDisplayUnderLowPower = nil
+        noRecord.keptDisplayUnderLowPowerBoot = nil
+        XCTAssertFalse(noRecord.lowPowerClaimFromEarlierBoot(boot: "boot-b"))
+
+        var replaced = st
+        replaced.savedDisplayBrightness = 0.7
+        XCTAssertFalse(replaced.lowPowerClaimFromEarlierBoot(boot: "boot-b"))
+    }
+
+    /// The record that a kept display entry read above 0 with the lid open
+    /// and the panel awake stays in the file, flat, and is neither dirty
+    /// nor an undo entry. Written only while set; a journal without it
+    /// decodes with none.
+    func testKeptDisplayReadLitRoundTripsAndIsNotDirty() throws {
+        var st = RuntimeState()
+        st.savedDisplayBrightness = 0.8
+        st.displayRestoreRefused = true
+        st.keptDisplayReadLit = 0.8
+        try store.saveState(st)
+        XCTAssertEqual(try store.loadState(), st)
+        let text = try String(contentsOf: home.paths.stateFile, encoding: .utf8)
+        XCTAssertTrue(text.contains("\"keptDisplayReadLit\" : 0.8"), text)
+        XCTAssertTrue(st.keptDisplayReadLitHolds)
+        XCTAssertFalse(st.isDirty)
+        XCTAssertNil(st.undoEntries.keptDisplayReadLit)
+
+        try store.saveState(RuntimeState())
+        let bare = try String(contentsOf: home.paths.stateFile, encoding: .utf8)
+        XCTAssertFalse(bare.contains("keptDisplayReadLit"), bare)
+        let legacy = Data(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"savedDisplayBrightness":0.8,"displayRestoreRefused":true}"#.utf8)
+        let decoded = try Store.makeDecoder().decode(RuntimeState.self, from: legacy)
+        XCTAssertNil(decoded.keptDisplayReadLit)
+        XCTAssertFalse(decoded.keptDisplayReadLitHolds, "a journal from before the record has no reading above 0")
+    }
+
+    /// It holds only for the kept entry it names, with that value and its
+    /// flag; the normalization every journal write runs drops it once the
+    /// entry is settled, unflagged or replaced.
+    func testKeptDisplayReadLitHoldsOnlyForItsEntry() {
+        var st = RuntimeState()
+        st.savedDisplayBrightness = 0.8
+        st.displayRestoreRefused = true
+        st.keptDisplayReadLit = 0.8
+        var kept = st
+        kept.dropKeptDisplayReadLitUnlessKept()
+        XCTAssertEqual(kept, st)
+
+        var settled = st
+        settled.savedDisplayBrightness = nil
+        settled.displayRestoreRefused = false
+        XCTAssertFalse(settled.keptDisplayReadLitHolds)
+        settled.dropKeptDisplayReadLitUnlessKept()
+        XCTAssertNil(settled.keptDisplayReadLit)
+
+        var unflagged = st
+        unflagged.displayRestoreRefused = false
+        XCTAssertFalse(unflagged.keptDisplayReadLitHolds, "an ordinary entry is restored, not judged")
+        unflagged.dropKeptDisplayReadLitUnlessKept()
+        XCTAssertNil(unflagged.keptDisplayReadLit)
+
+        var replaced = st
+        replaced.savedDisplayBrightness = 0.7
+        XCTAssertFalse(replaced.keptDisplayReadLitHolds)
+        replaced.dropKeptDisplayReadLitUnlessKept()
+        XCTAssertNil(replaced.keptDisplayReadLit)
+
+        var stray = RuntimeState()
+        stray.keptDisplayReadLit = 0.8
+        stray.dropKeptDisplayReadLitUnlessKept()
+        XCTAssertNil(stray.keptDisplayReadLit)
+    }
+
     func testSavedBrightnessCountsAsDirty() throws {
         var st = RuntimeState()
         XCTAssertFalse(st.isDirty)
@@ -133,6 +375,42 @@ final class StoreTests: XCTestCase {
         st = RuntimeState()
         st.savedKeyboardBrightness = 0
         XCTAssertTrue(st.isDirty)
+    }
+
+    /// A saved brightness kept after a refused restore stays in the file
+    /// with its flag, flat for the scripts, and is not dirty. The flags are
+    /// written only while set, and a journal without them decodes as not
+    /// refused.
+    func testRefusedBrightnessRoundTripsAndIsNotDirty() throws {
+        var st = RuntimeState()
+        st.savedDisplayBrightness = 0.8
+        st.displayRestoreRefused = true
+        st.savedKeyboardBrightness = 0.3
+        st.keyboardRestoreRefused = true
+        try store.saveState(st)
+        XCTAssertEqual(try store.loadState(), st)
+        let text = try String(contentsOf: home.paths.stateFile, encoding: .utf8)
+        XCTAssertTrue(text.contains("\"displayRestoreRefused\" : true"), text)
+        XCTAssertTrue(text.contains("\"keyboardRestoreRefused\" : true"), text)
+        XCTAssertTrue(st.brightnessJournaled, "the open still wakes a display a close may have put to sleep")
+        XCTAssertTrue(st.hasRefusedBrightness)
+        XCTAssertFalse(st.hasLidActions)
+        XCTAssertFalse(st.isDirty)
+
+        st.keyboardRestoreRefused = false
+        XCTAssertTrue(st.isDirty, "an unflagged entry is still one to restore")
+
+        var plain = RuntimeState()
+        plain.savedDisplayBrightness = 0.5
+        try store.saveState(plain)
+        let plainText = try String(contentsOf: home.paths.stateFile, encoding: .utf8)
+        XCTAssertFalse(plainText.contains("RestoreRefused"), plainText)
+        XCTAssertFalse(try XCTUnwrap(try store.loadState()).displayRestoreRefused)
+
+        var flagOnly = RuntimeState()
+        flagOnly.displayRestoreRefused = true
+        XCTAssertFalse(flagOnly.hasRefusedBrightness, "a flag without a value keeps nothing")
+        XCTAssertFalse(flagOnly.isDirty)
     }
 
     /// Reconcile keeps lid-close actions while the lid is closed; every

@@ -33,8 +33,27 @@ closed bag. Its design goals are to:
 - macOS 26 on Apple Silicon (built and tested on MacBook Pro M5).
 - Swift 6, SwiftUI content hosted in a custom `NSStatusItem`, Swift Package.
   No Xcode project.
-- `install.sh` assembles a minimal `Insomnia.app` bundle (`LSUIElement = true`,
-  no Dock icon), ad-hoc codesigns it, and installs it to `~/Applications`.
+- `build-app.sh` assembles a minimal `Insomnia.app` bundle (`LSUIElement =
+  true`, no Dock icon) with `backstop.sh` sealed under `Contents/Resources`
+  and signs it ad-hoc.
+  `install.sh` installs that build, or a prebuilt bundle passed with
+  `--app` after verifying its integrity (only with
+  `--allow-unverified-origin`, since it cannot verify where a bundle came
+  from), to `~/Applications`. The Release workflow
+  packages the same bundle (`docs/releasing.md`), built for arm64 only;
+  `install.sh --app` stops unless `sysctl -n hw.optional.arm64` reads 1
+  (true on Apple Silicon, also under Rosetta). `install.sh` and
+  `uninstall.sh` take sibling scripts (`build-app.sh`, `backstop.sh`) only
+  from a source checkout's `scripts/` folder, with `Package.swift` one level
+  up, and never from the folder above their own: the release zip carries
+  both scripts at its top level, unpacked wherever the user chose, such as
+  `/tmp`, where another account may have created that folder first and
+  added files to it. Anywhere else, `install.sh` without `--app` stops and
+  runs no `build-app.sh` it finds, and `uninstall.sh` runs only the verified
+  bundle's sealed `backstop.sh`, or stops when the bundle has none. The
+  staged copy of the bundle loses group and other write permission and
+  every ACL before it is verified and installed (neither is part of the
+  signature); extended attributes, the quarantine flag among them, stay.
 
 ## Core model
 
@@ -50,11 +69,17 @@ RuntimeState {                // everything Insomnia changed and must undo
   lowPowerSetByUs:    Bool
   frozenProcesses:    [{pid, startedAt, startedAtMicros, bootSession}]
   dockerFrozen:       Bool
-  savedOutputVolume:  Float?  // nil when mute is off or lid is open
-  savedMuted:         Bool?
+  savedAudioOutputs:  [{deviceUID, name?, volume, muted, saveID?}]  // each output device a lid close muted, with what it had; saveID is a UUID drawn for each save; empty when mute is off or every device is restored
+  savedOutputVolume:  Float?  // legacy: an earlier build's entry, restored on the default output; never written now
+  savedMuted:         Bool?   // legacy, the same
   savedDisplayBrightness:  Float?  // nil when darkening is off or lid is open
   savedKeyboardBrightness: Float?  // nil when there is no backlight, too
+  displayRestoreRefused:   Bool    // written only when true: the guard refused this restore; see section 4
+  keyboardRestoreRefused:  Bool    // the same for the keyboard backlight
   displayRestoredUnderLowPower: Float?  // restored on open under our Low Power Mode; written again when it ends
+  keptDisplayUnderLowPower:     Float?   // the kept (refused) display entry our Low Power Mode was on over; see section 4
+  keptDisplayUnderLowPowerBoot: String?  // kern.bootsessionuuid of the boot that record was written in, or that backstop.sh switches the mode off in (published before it does)
+  keptDisplayReadLit:           Float?   // the kept display entry, read above 0 with the lid open and the panel awake; see section 4
   appNapOverrides:    [{bundleId, previous?}]  // previous absent when the app had no NSAppSleepDisabled key
 }
 ```
@@ -109,6 +134,12 @@ recovery; newly written journals use `frozenProcesses`.
 - 2-second debounce to ignore flapping.
 - Lid close and open each run a fixed, reversible action list (below).
 - Lid events do nothing when no session is active.
+- Each lid event is numbered as it arrives, before its actions queue behind
+  earlier ones. An open makes every earlier close stale. A close still
+  queued does nothing when its turn comes. A close waiting on a Docker probe
+  stops waiting at once, leaves Docker running, takes Docker's entries out
+  of the journal and signals nothing more, so the open's undo runs without
+  waiting for `docker ps`. The probe's late answer is logged and not used.
 
 ### 4. Lid-close actions (battery)
 
@@ -120,11 +151,225 @@ Quit, or reconcile.
 | Display (optional, default on) | save brightness, set it to 0, request display sleep (best effort) | wake the display, restore the saved brightness |
 | Keyboard backlight (optional, same toggle) | save brightness, set it to 0 | restore the saved brightness |
 | Freeze scope | `SIGSTOP` every process whose responsible app is in the freeze scope (rules below) | `SIGCONT` the recorded pids only |
-| Docker rule | if Docker Desktop is running and `docker ps -q` is empty, freeze it | resume |
-| Mute (optional) | save volume and mute state, then mute | restore both exactly |
+| Docker rule (default off) | if Docker Desktop is running and `docker ps -q` is empty, journal its tree, ask `docker ps -q` once more right before the SIGSTOP and freeze it only on a second clean empty answer; busy, a failed probe, a timeout, a lid open or a session end at either point leaves it running | resume |
+| Mute (optional, default on) | journal the default output's UID, name, volume and mute state as its own entry, unless that device already has one, then mute that device; another device's entry never stops it | restore each entry on its own device, never on another output, and clear only that entry; a device the user unmuted meanwhile is left as it is; a device that is not connected keeps its entry (see below) |
 | Low Power Mode | on (optional, default on) | off unless a battery or thermal floor still wants it |
 | Countdown redraw | stop timer | restart timer |
 
+The display and keyboard rows go through private frameworks with no ABI
+contract: the DisplayServices C functions and CoreBrightness's
+`KeyboardBrightnessClient`. Two guards run once per launch, before the
+first call. The DisplayServices functions are called only on a macOS major
+version they were measured on (26, `DisplayPower.measuredDisplayServicesMajors`);
+a C symbol carries no type information, so on any other major the display
+is left alone until someone measures again. The `KeyboardBrightnessClient`
+methods are read through the Objective-C runtime and compared with the type
+encodings measured on macOS 26 (`DisplayPower.measuredKeyboardClientEncodings`,
+stack offsets removed); a missing required method or a changed encoding
+refuses the keyboard backlight before anything is instantiated. A refused
+device is skipped at lid close with a log line, nothing is journaled for
+it, and Settings shows the reason under the darken toggle. With nothing
+journaled for either device the close does not request display sleep,
+since lid open and reconcile wake the display only for a journaled
+brightness, as section 4 describes.
+
+A brightness journaled before an update that the guard now refuses is not
+written on open or reconcile, and it is not dropped either: an entry is
+cleared only after its undo. It stays in the journal with
+`displayRestoreRefused` or `keyboardRestoreRefused` set. One error names
+each such device with its saved level, says it could not be restored on
+this macOS build, and says to set the level with the brightness keys or
+Control Center; Settings also shows each saved level under the darken
+toggle. That error goes into one report with every other failure of the
+same undo, such as a failed resume, audio restore or write on the other
+device, since it comes up at every lid open. A flagged entry is not dirty
+for backstop.sh or uninstall.sh, nor for the app while the guard refuses
+its device. Nothing on that build can restore it, and counting it would
+post "Restore incomplete" at every end and launch, fail the backstop every
+minute, and stop uninstall for good. It also does not hold back a new
+session or Quit. The app tries again at every lid open during a session,
+at every end, and at every launch, with or without a session. On a build
+or macOS where the guard allows the call, it reads the device first. Only
+a reading taken with the lid known to be open, and that macOS is not
+holding down, counts. A closed lid leaves the device at 0 or turned off,
+and a write would light what the close keeps dark, so an end or a launch
+under a closed lid reads nothing and leaves the entry waiting. A display
+asleep reads its idle-dim value, and a keyboard backlight suppressed after
+the wake, or idle-dimmed, reads 0 at any level. Such a reading decides
+nothing, and neither does a read that fails or a keyboard that reads as
+absent. The entry then stays as it is. The app reads it again every 3 s,
+20 times, and then every minute for as long as it waits and the app runs,
+since outside a session nothing else acts on a lid open. While the lid is
+not known to be open it reads nothing, and the 3 s reads start again once
+it is. A busy recovery lock skips one read, not the rest. An end does not
+count a waiting entry as not restored, since nothing failed. The close
+left the device at 0, so a reading above 0 is a level set since, as the
+error asked: the darkening is already undone, and the entry is cleared
+without a write rather than overwrite that level. A display reading above
+0 taken while Insomnia's own Low Power Mode is on is the mode's rescaled
+value and not that level, and once the mode is off the panel comes back
+over a time nobody has measured. So no display reading above 0 taken
+under the mode, or after it in the same boot of the Mac, decides the
+entry: it would become the sample a later close journals. A relaunch is
+no sign that the panel is back, so the journal records the entry as one
+the mode was on over (`keptDisplayUnderLowPower`, with the boot session),
+and a relaunch reads it with the same doubt. The entry waits for a launch
+after a restart; until then it stays flagged, the panel is read again
+every minute, and a lid close leaves it lit and only asks it to sleep
+(below). That a restart ends the mode's rescale is assumed, not measured.
+The record is about that entry alone: settled, replaced or unflagged, it
+is dropped, one with no boot session holds until the next restart, and a
+journal written before the record existed carries no doubt. While the
+journal still claims the mode (`lowPowerSetByUs`), the record keeps the
+boot it was written in, so a launch after a restart can tell that the
+claim is from before it. Such a claim says nothing about the mode in this
+boot, and neither does a read of the mode. Before its `lowpowermode 0` the
+app reads the mode (`pmset -g custom`, the battery setting the claim is
+about) for the log only. On, the switch-off ends the mode in this boot.
+Off, the user or another tool may have switched it off a moment before,
+with the panel still on its way back. Either way, and when the mode cannot
+be read, the switch-off counts as the mode's end in this boot: the record
+is written for this boot and the entry waits for the next restart, as
+above. That holds for every route that switches such a claim off: an end,
+a launch, the menu or a floor, and the check after a power command. It
+also holds when state.json refuses the clear, in this process and in a
+relaunch in the same boot. The cost falls on a mode that went off long
+before the launch, which no reading tells apart: until a launch after the
+next restart the entry stays in state.json, the display is not sampled,
+and a close leaves it lit and only asks it to sleep. The level the user
+set is never written over. A claim with no record, a
+record with no boot or an empty one, or a launch that cannot read its own
+boot is taken as this boot's, so the entry waits, at the cost of one more
+restart. backstop.sh, before its own `lowpowermode 0`, gives a record of
+another boot, or with none, its own boot (empty if it cannot read it),
+after a restart or not, and publishes that journal on its own first: the
+mode may have been on in that boot until then, before Insomnia launched in
+it. A launch in that boot then reads the entry with the same doubt and
+waits for the next restart, even when the mode was already off before the
+agent's switch-off. The record has that boot before the mode goes off, so
+a command that fails, or a journal of the undo that cannot be published
+after it, leaves the claim next to a record of this boot, which a launch
+reads as its own mode on in this boot, with the same doubt. If the journal
+with the boot cannot be published, the agent leaves the mode on and keeps
+its entry for the retry: switched off next to a record of an earlier boot,
+the panel on its way back could be taken for the user's level. A journal
+with no record has nothing to give a boot, so one written before the
+record existed still carries no doubt. A display still at 0 under or after the
+mode gets the saved value, written once more after the mode as for any
+restore under it, unless a reading of that entry above 0, with the lid
+known open and the panel awake, showed the darkening undone. That reading
+is journaled (`keptDisplayReadLit`), so it holds through relaunches and
+restarts, which do not darken the panel again. A 0 read after it may be a
+level the user set, or one macOS still holds the panel at: auto-brightness
+can pull the panel down to 0 under a closing lid, and the panel can still
+read that 0 once the lid is open again, for a time nobody has measured. No
+reading of 0 tells the two apart, however late it comes, so the saved
+value is not written and the entry is not cleared. It stays flagged, the
+display sample stays held, and the app reads the panel again every 3 s,
+20 times, then every minute, through relaunches and restarts, until it
+reads above 0. A 0 the user set stays as set until then. A reading above
+0 with no doubt above left is the level set since, and the entry is
+cleared without a write. A lid close with a sample of 0, or 0 as the value
+owed after the mode, journals that 0 in place of the kept value. A current
+read of 0 at the close is no such level, since it may be the closing
+lid's. The close leaves the entry flagged and the panel as it is, and only
+asks it to sleep. A reading at a lid close, under the closing lid or of a panel
+asleep, shows no such thing, and neither does a reading of an earlier
+entry: the record goes with its entry, as the record of the mode does. If
+state.json refuses the record, this process holds it and the next write
+records it. An end does not let Quit go before then: "Restore incomplete"
+says Insomnia retries in 30 s and not to quit until state.json can be
+written, and Quit waits, as for a failed restore whose flag is owed. A
+crash, a forced quit or a lost disk before the record lands loses it, and
+the next launch writes the saved value over a 0, as before any reading.
+If state.json cannot
+take that clear, the entry still counts as done in this process. The clear
+is owed: it goes into the journal ahead of any later write, and at the
+start of every lid close, lid open, end and launch, so none of them works
+from the old entry. A lid close then journals the level the device reads,
+not the old saved one. The app also retries the clear at the same pace,
+and reads and writes nothing for it, so a level the user lowers to 0
+meanwhile stays at 0. Quit waits for that clear: a launch after the quit
+would read the entry again, and would write the saved value over a 0 the
+user set since. "Restore incomplete" says Insomnia retries in 30 s and not
+to quit until state.json can be written, and Start is refused until the
+end goes through. A crash, a forced quit or a lost disk before the clear
+lands leaves the entry to the next launch, which reads the device again.
+A device still at 0 there gets the saved value and both keys are cleared. A failed write there clears the
+flag, and the entry is retried like any failed restore. If the flag cannot
+be cleared either, the disk still shows a flagged entry, which backstop.sh
+and uninstall.sh pass over, so the app keeps the end itself. "Restore
+incomplete" says Insomnia retries in 30 s, the app retries the write and
+the owed flag together, and Quit waits until one of them lands. A write
+that lands while state.json still refuses the clear settles the entry in
+this process, with only the clear owed, and Quit waits for that clear as
+above. A launch or
+re-read with no session whose write fails is ended as for a dirty journal,
+so the agent is armed for it, or the app keeps it while the flag is still
+owed. A write whose clear is owed is done all the same: the second write
+2 s later still goes out, and a display written under Insomnia's Low Power
+Mode still owes its write after the mode, as the clear would have
+journaled. A lid close that can read the device clears the flag too: it
+keeps the earlier saved value while the device reads 0, and saves the new
+level when it reads above 0. For the display that level must be trusted:
+the last sample, the value owed after the mode, or a current read taken
+with the panel awake and Insomnia's Low Power Mode not on at any point in
+the run, nor over the entry since the Mac last started. Without one, the close leaves the entry flagged and the panel as
+it is. A rescaled, dimmed or asleep read is not the user's level, and the
+saved value may not be either, since the user may have set one by hand.
+A panel darkened to 0 would read at the open as the darkening never
+undone and get the saved value, so the close only asks the display to
+sleep, which macOS ignores while any process holds a display assertion;
+the panel then stays lit under the closed lid until the open, which reads
+the entry again as above. A close whose journal write fails
+darkens nothing and asks the display to sleep only for an entry this
+process has not settled. Uninstall goes ahead past a flagged entry, prints
+the saved level, and keeps state.json, even with `--purge`, so a later
+install that can make the call restores it.
+
+The guards narrow the risk of calling a private function whose shape
+changed; they do not replace the hardware rows in
+docs/release-validation.md.
+An output device that is not connected when its entry is restored keeps the
+entry, and the restore of everything else goes on. Each restore decides
+again whether a device is connected: only a device CoreAudio reports as not
+connected on that try counts as away. An away device does not hold up the
+end of a session: End and Quit restore sleep and the rest, the end
+notification names each device that is still muted, and the menu shows a
+line for each with a "Stop waiting for <device>" item, which drops that
+entry and leaves the device as it is. The item drops nothing if, when it
+runs, the device reads as connected or the entry is a later lid close's
+save rather than the one the menu showed. Each save has an ID of its own
+(`saveID`, drawn by the lid close that writes the entry), and the item
+compares it with the journal on disk under the lock, so a later save with
+the same values, written by this or another copy of the app, is not
+dropped. An entry written before entries had an ID has none and is
+compared by its values. While Insomnia runs, a device that
+connects again gets its volume back at once (a CoreAudio device-list
+listener), or at the next lid open if a session is running with the lid
+closed. Each device change reads the journal on disk under the lock, so a
+copy of the app with nothing saved in memory also restores a save another
+copy wrote. Before the launch reconcile has taken a session over, a session.json
+that has not expired, or cannot be read, counts as a running session for
+this. A later launch restores every connected device at reconcile.
+
+A restore that fails on a connected device, or a cleared entry that cannot
+be written, is reported and the entry stays. It makes the end incomplete,
+as any failed restore does. The recovery agent keeps these entries but
+cannot restore CoreAudio settings, so the incomplete-restore notification
+says Insomnia tries again itself. That retry runs in process after 30 s,
+reads the journal again and checks the lid again. A device change that
+could not run at all (the recovery lock was busy, a `sudo pmset` left
+running still held it, or state.json did not decode) is retried the same
+way. The retry stops after 10 tries in a row; the next device change, lid
+open, end or launch tries again. The menu line that a refused device change
+or a failed restore put up goes once a later restore leaves nothing to
+retry, unless a newer failure has taken its place.
+
+A session that starts, or that reconcile resumes at launch, while the lid
+reads closed starts with the countdown redraw stopped: the lid observer
+reports changes only, so no close event arrives for it. The next lid open
+restarts the redraw.
 Freeze scope rules:
 
 - Two scopes. The explicit freeze list: apps the user picks by bundle id from
@@ -147,9 +392,16 @@ Freeze scope rules:
   kitty, WezTerm, Tabby, Hyper), browsers (Arc, Chrome, Chromium, Edge, Brave,
   Vivaldi, Opera, Firefox with its Developer and Nightly editions, Zen),
   Tailscale, LM Studio, Ollama, Docker Desktop's Electron front end,
-  1Password, Bitwarden, Postgres.app and OrbStack. Every id is verified
-  against an installed copy or the Homebrew cask metadata named in the
-  comment next to it. The automatic scope leaves them alone even when they
+  1Password, Bitwarden, Postgres.app and OrbStack, and meeting, recording
+  and dictation apps (`meetingApps`): Zoom, Microsoft Teams (new and
+  classic), Webex, the older Webex Meetings app with its meeting window and
+  plugin agent, Wispr Flow, Granola, Otter, OBS and Loom. Their helper apps
+  are matched by prefix: each of those ids followed by a dot, plus `us.zoom.`
+  and `com.cisco.webex.` (`meetingAppPrefixes`). Helpers an app starts are
+  its child processes and are left out with it. FaceTime is
+  `com.apple.FaceTime`, already on the hard denylist. Every id is verified
+  against an installed copy, the Homebrew cask metadata or the page named in
+  the comment next to it. The automatic scope leaves them alone even when they
   are not on the agent list. Code level and not persisted: an existing
   config.json already carries its own agent list, so new agent-list defaults
   never reach it. An explicit freeze-list entry overrides this set; the hard
@@ -187,11 +439,15 @@ the panel and keys stayed lit for the whole closed period. A display sleep
 request (`IORequestIdle` on `IODisplayWrangler`, what `pmset displaysleepnow`
 does) is ignored while any process holds a display assertion, and agents
 routinely do, so brightness 0 is the primary mechanism and the sleep request
-is best effort. Display brightness 0 does not switch the keyboard backlight
-off; it is set separately. Both values are journaled before they are changed
+is best effort. It is made only when a display or keyboard brightness is
+journaled, because the wake that undoes it on open, or on reconcile after
+a relaunch, runs only for such an entry. Display brightness 0 does not
+switch the keyboard backlight off; it is set separately. Both values are journaled before they are changed
 and restored on open, session end, Quit, or reconcile with the lid open; the
 backstop keeps the entries and only the app restores them (private
-frameworks). What is journaled is the user's value, not whatever the device
+frameworks). An end that could not restore one says so in its
+incomplete-restore notification, without promising the recovery agent's
+retry: a later session's end or the next launch tries again. What is journaled is the user's value, not whatever the device
 reads at that instant. A reading is trusted only when the last keyboard,
 mouse or trackpad input was under 30 s ago (`CGEventSource`; the idle dim
 never starts sooner) and the panel is awake (`CGDisplayIsAsleep`, else it
@@ -213,7 +469,17 @@ dim or not, since a dim panel on open beats a black one.
 While Low Power Mode is on because Insomnia switched it on (the journal's
 `lowPowerSetByUs`), the display sample is held: the panel reads the mode's
 value, and the sample taken just before the mode went on is the one to
-restore. The keyboard journals the current
+restore. The hold follows the journal on disk: after a `lowpowermode 0`
+that exited 0 with the ownership clear refused, the panel may still be on
+its way back from the mode, so the display sample, by then the level
+written after the mode, stays held until the clear lands, while the
+keyboard is still sampled. Each device's sample is also held while the journal has a saved
+brightness for it, since the device then reads the 0 a close left or a
+level not yet decided. Each level the app writes from the journal, or
+finds set since in place of a kept value, becomes that device's sample,
+so a close soon after a restore that came late, from the re-read of a
+kept value or after the mode, journals the restored level and not a 0
+sampled before it. The keyboard journals the current
 read if trusted now, else its last sample; when nothing trustworthy is
 known for it, it is left to macOS entirely (no journal entry, no write),
 because restoring a suppressed 0 would leave the backlight off. On open the
@@ -235,7 +501,12 @@ and if the mode turns out to have been cleared by someone else (the
 backstop after a kill: it keeps the entry but never writes brightness);
 taking the mode over discards any entry left from an earlier interval in
 the same journal write. A Low Power Mode interval with no lid restore under
-it writes nothing. The
+it writes nothing. If state.json refuses to clear the mode's ownership
+after `lowpowermode 0` exits 0, the mode is off all the same: the clear is
+owed, as for a kept brightness, the write after the mode goes at once, and
+a later switch-off from the ownership still on disk compares nothing. If
+state.json refuses to clear the owed write itself, written or dropped,
+that clear is owed too, so no later journal write brings the value back. The
 sample the display journals dates from the last 30 s window in which the
 user was active with the lid open and the panel awake, and is held from
 before Insomnia's own Low Power Mode: a brightness change made within 30 s
@@ -283,10 +554,13 @@ last held while it was on was the battery or thermal floor, not the lid.
   shell-quoted `defaults delete` command for it, and continues. The summary
   says how many apps were checked; an app whose key cannot be read is
   reported, not counted. Each read has a 30 s limit, like every other call
-  uninstall makes under the recovery lock (`pgrep`, `launchctl`); a read
-  that does not answer ends the check with the command to run by hand, and
-  uninstall goes on. A call past its limit gets SIGTERM, then SIGKILL, and
-  never holds the lock.
+  uninstall makes under the recovery lock (`pgrep`, `launchctl`,
+  `codesign`); a read that does not answer ends the check with the command
+  to run by hand, and uninstall goes on. A call past its limit gets SIGTERM,
+  then SIGKILL one to two seconds later. Each call keeps the lock until it has exited
+  or been stopped, and a supervising process enforces the limit even if
+  uninstall is killed while it waits, so its `launchctl bootout` is not
+  still running when the app takes the lock and loads its agent.
 - Browser throttling: Chromium browsers throttle windows macOS reports as
   occluded, which is every window once the lid is closed with no external
   display. Timers drop to 1 Hz, animation frames stop, pages report hidden.
@@ -538,7 +812,9 @@ Reconcile runs at every Insomnia launch:
    new path. If either rename fails the file stays and a start is refused
    while it is there. Every end then restores the journal and tries the
    rename again; while it fails the end is not finished, so quit is refused
-   and the end is retried. A file that could not be read would be resumed
+   and the end is retried. The launch that kept the file runs that end
+   itself when the journal holds any entry, saved output volumes alone
+   included. A file that could not be read would be resumed
    if it became readable in place, and every later launch and the agent
    read either kind again. The messages say to remove it or move it out of
    the folder. `backstop.sh` tries the rename again on every run.
@@ -556,13 +832,161 @@ Reconcile runs at every Insomnia launch:
    journal, not from this check. Nothing clears `SleepDisabled` without a
    journal entry, in the app or in the agent.
 
+A reconcile refused for a busy lock or an unreadable journal changes
+nothing and runs again after the retry delay until it goes through, unless
+a start has made a session active or an end has been requested since. The
+lock can stay busy for as long as a `sudo pmset` an earlier run left
+running, and without the retry a session still live on disk would hold
+sleep with no battery floor until its deadline. If `unfinished-command.json`
+was on disk, that command has exited by the time the reconcile holds the
+lock, so a session it resumes is checked against Low Power Mode as after a
+command the app itself left running (below). The check stays owed when a
+later attempt is refused for an unreadable journal, although that refusal
+removes the record. A start that makes a session active before the retry
+runs the check for that session instead. An end restores the mode from the
+journal and owes no check.
+
 Backstop, independent of the app:
 
 - The agent reads the saved deadline; recurring recovery checks avoid replacing
   the loaded job for every extension and allow retries after a failure.
+- The agent runs only the `backstop.sh` sealed in the signed bundle. Its
+  command line verifies the bundle against the code requirement pinned in the
+  plist (`codesign --verify --strict -R=...`; for an ad-hoc build, that
+  build's cdhash) and execs the script when that passes; otherwise it logs
+  one line and exits without running anything. No executable lives in a
+  writable directory. The plist is a per-user file like any LaunchAgent; at
+  the next arm the app rewrites a plist that does not match, and reloads a
+  loaded job whose command line or run interval (the `arguments` and `run
+  interval` that `launchctl print` lists) differs from the plist's.
+- What the app pins is the requirement of the code it is running
+  (SecCodeCopySelf), read after SecCodeCheckValidity confirmed the bundle on
+  disk is that code, and the bundle must pass the agent's own check against
+  it at every arm. Otherwise arm() fails with the reason: a loaded agent
+  whose bundle no longer verifies is never reported as armed, and a bundle
+  re-signed under the running app is never re-pinned. A `swift run` build
+  outside any bundle pins the installed bundle from disk.
+- install.sh replaces the bundle and the agent in one locked step: the new
+  bundle is staged next to the app and swapped in only after `launchctl
+  print` confirms the previous job is unloaded, then the new job is loaded.
+  So any job loaded after the swap is this run's and pins the new bundle.
+  When the new job cannot be loaded or its plist cannot be published,
+  install.sh unloads any job that may be loaded, confirms that with print,
+  and puts the previous bundle back; if the unload is not confirmed, the
+  new bundle stays, because that job pins it. Every bundle rename is checked
+  (`mv`, refused when the destination exists): when one of the swap or its
+  undo fails, the previous bundle goes back and its job is loaded again as
+  after a failed load, and when the previous bundle cannot go back, no
+  bundle is deleted, no job is loaded against an empty app path, and the
+  message prints the `mv` and `launchctl bootstrap` that restore the pair.
+  The same holds for the renames of the repair below. A rerun after an interrupted
+  or failed swap keeps the bundle the plist on disk pins. It runs its
+  forced recovery first, with the loaded job and the bundles as the earlier
+  run left them, and stops there if recovery fails. Only then does it
+  unload and confirm any loaded job, move a bundle and load the plist on
+  disk again; it stops when print does not confirm the unload or that
+  reload. A loaded job is never left pinning a bundle that was moved away,
+  and no step after a failed bootstrap counts on a loaded job. Before
+  recovery the run only puts a set-aside bundle back when nothing is at the
+  app's path, and removes staging directories whose owning install is gone
+  (matched by the exact name install.sh gives them). Right after taking the
+  lock it checks the sudoers rule again with `sudo -n -l` for each of the
+  four commands and stops if it no longer holds: an uninstall.sh that took
+  the lock first removes the rule and leaves no journal, so the recovery
+  alone would pass. Under the lock every `sudo -n -l`, `pgrep`, `launchctl`
+  and `codesign --verify` call has a 30 s limit (the sudoers check before
+  the lock has it too). A supervising process enforces it, even if the
+  installer is killed while it waits, and the call keeps fd 9, so the lock
+  is held until the call has exited or been stopped: no `launchctl bootout`
+  or `bootstrap` it started is still running once the lock is released. A call past the
+  limit gets SIGTERM, then SIGKILL one to two seconds later; `sudo` only ever gets
+  SIGTERM, and one that ignores it keeps the lock until it ends, reported
+  with its pid. A sudoers check or `pgrep` that does not answer stops the
+  run, which releases the lock so the app and the agent can recover. A `launchctl print` that does not answer counts as unknown, never
+  as unloaded. A `codesign --verify` that does not answer leaves it unknown
+  which bundle the plist on disk pins, so the run stops and moves neither
+  bundle. uninstall.sh runs the
+  bundle's sealed backstop.sh only after `codesign --verify --strict`
+  passes on the bundle (a bounded call, like its other calls under the
+  lock). Once recovery is confirmed and print confirms the agent unloaded,
+  it removes the bundle and install.sh's leftovers beside it, by their exact
+  names: `.Insomnia.app.previous`, and `.Insomnia.app.staging.<pid>.<six
+  letters and digits>` directories whose run `kill -0` reports gone (a live
+  run's stays). Symlinks and other names are left. With the agent plist go
+  the candidate plists install.sh and the app stage it from
+  (`com.insomnia.backstop.candidate-*` in `.com.insomnia.backstop.staging`
+  and, from older builds, in the LaunchAgents directory).
 - App and script transactions must coordinate through a shared lock. Failure
   to acquire it must not permit an unprotected journal write or side effect.
+- A `sudo pmset` is sent SIGTERM at its timeout (20 s in the app, 30 s in the
+  agent), never SIGKILL: a killed sudo can orphan a root pmset that still
+  changes power state later, outside any transaction. One still running 3 s
+  after SIGTERM stops the transaction where it is, in the app as in the
+  agent's `run_bounded`: nothing else is undone, the journal keeps every
+  entry it had, and the recovery lock stays held until the command exits.
+  In the app the command holds the lock itself, with a descriptor on the
+  lock file as its stdin, so a crash or force quit of the app does not
+  free the lock while the command runs; the agent's supervising subshell
+  keeps it the same way. That subshell, not the script that started it,
+  enforces the limit and is the only process that signals the command. It
+  measures the limit and the grace on bash's `SECONDS` clock, so slow polls
+  on a loaded machine do not stretch them, and it sends SIGTERM by jobspec,
+  which reaches the command or, once the command has been reaped, nothing:
+  never a process that reused its pid. The pid the script logs is never
+  signaled. The subshell ignores SIGTERM and SIGHUP, so neither the end of
+  the agent's run nor launchd's signal to what is left of the job's process
+  group frees the lock while the command runs; a SIGKILL to the subshell
+  would. The app runs no `sudo pmset` outside a
+  transaction. Every one goes through `PmsetSleepGuard.sudoPmset`,
+  including a check that runs a sudoers command only to see whether it
+  passes. It reports the pid with the `sudo kill` command, in a menu line
+  of its own that the exit removes, and refuses to quit or start a
+  session until then. It also records the command in
+  `unfinished-command.json`, with the start time and boot session read
+  from the process table when the command was left running. The exit
+  removes the record, and so does the next transaction that takes the
+  lock. A transaction refused for a busy lock names the recorded command.
+  It gives the pid and `sudo kill` only while the live pid still has that
+  start time and boot session, and the first such refusal for a pid also
+  notifies; otherwise it says the command has exited, or that the pid
+  cannot be confirmed, and names no process to stop. An end, lid close or
+  lid open refused meanwhile is recorded at the refusal. An undo
+  (`disablesleep 0`, `lowpowermode 0`) that exits 0 is confirmed: its
+  entry is cleared under the lock before the lock is released, and a
+  display write owed for the end of the mode is done then. If the journal
+  cannot be read or written then, the entry stays, the undo runs again,
+  and the menu says so. For `lowpowermode 0` with a journal that cannot be
+  written, the clear is also owed, so the app takes the mode as off and
+  does the display write at once. With a journal that cannot be read and
+  a display write owed after the mode, by the journal last read, the clear
+  is owed the same way and the write waits for the first transaction that
+  reads the journal again; it is made only if that journal, with the owed
+  edits, still owes the same value with the mode not Insomnia's. The
+  unreadable file is not written. Any other exit confirms nothing. When the command
+  exits the app retries a pending end.
+  Otherwise it reads Low Power Mode under the lock. A mode that reads on
+  stays journaled as Insomnia's. A mode that reads off is switched off
+  once more with the app's own `lowpowermode 0`, and the ownership is
+  cleared only when that exits 0. A claim from before the Mac last started
+  that it clears this way counts as the mode's end in this boot, as for
+  any switch-off (section 4). A display write owed for the end of the
+  mode is kept through the check and done then: with the mode already off,
+  powerd's rescale of the panel cannot be told apart from a user's change,
+  so the panel is compared with the owed value only before a switch-off,
+  while the mode is still on. Then the app replays
+  a refused lid event for the state of the latest lid event, after any
+  change still in the 2 s lid debounce has settled, and runs the floor
+  rules again. A check that cannot take the lock, read the journal or the
+  mode, switch the mode off, or write the journal runs again after the
+  retry delay while the session lasts. After a `lowpowermode 0` that
+  exited 0, the ownership clear the journal refused is owed: the retried
+  check's transaction writes it first, and the check then has nothing to
+  switch off.
 - Successful restores may clear their entries; failures must stay journaled.
+  A journal write that fails to clear the entry of a successful restore is
+  shown in the menu as well as logged, and the restore is retried. The
+  line goes once a later write clears that entry, unless a newer error
+  has replaced it.
   Process recovery must verify identity and avoid resuming a process that
   Insomnia did not stop. The entries that record `startedAtMicros` go to
   the installed app binary in one call (`Insomnia --resume-frozen
@@ -592,14 +1016,27 @@ Backstop, independent of the app:
   microseconds keep the shell's one-second `ps` comparison. Old PID-only
   entries need conservative handling.
 - The shell does not restore CoreAudio settings. Saved audio must remain in
-  the journal for the app to restore. Uninstall must preserve recovery tools
+  the journal for the app to restore. Legacy `savedOutputVolume` /
+  `savedMuted` count as unresolved, so the run exits 1 and says to open
+  Insomnia. `savedAudioOutputs` entries are checked for shape and kept, but
+  on their own they leave the journal clean: an entry can wait days for its
+  device, the app's menu shows it, and an error every minute would only
+  fill the log. The backstop logs them once, when it removes a session or
+  undoes something else. Uninstall must preserve recovery tools
   and state when restoration is incomplete, including saved audio. It runs
   the checkout's backstop only when the installed app declares the
   `InsomniaResumeFrozenVersion` that backstop speaks; otherwise it runs the
-  backstop installed with that app, when there is one. With no installed
-  copy it runs the checkout's backstop anyway, which keeps the entries that
+  backstop installed with that app, when there is one: the copy sealed in
+  its bundle, once `codesign --verify --strict` passes, else the writable
+  copy older installs left in Application Support. With no installed copy
+  it runs the checkout's backstop anyway, which keeps the entries that
   need the binary without running it, so uninstall stops before removing
   anything.
+- The shell does not restore display or keyboard brightness either; both stay
+  in the journal for the app. One flagged `displayRestoreRefused` or
+  `keyboardRestoreRefused` is kept but does not make the journal dirty, so
+  it neither fails the run nor stops uninstall, which keeps state.json for
+  it (section 4).
 - The shell puts `appNapOverrides` back with `defaults write <id>
   NSAppSleepDisabled -bool <previous>` or `defaults delete` when the key was
   absent. A delete that fails counts as done only when `defaults read` then
@@ -615,7 +1052,8 @@ Backstop, independent of the app:
 minutes before end, battery floor reached, battery unreadable twice in a row,
 thermal action taken, network gap recovered (with nudge summary), sleep
 restored by backstop, sleep disabled by something other than Insomnia
-(reconcile step 3, once per launch).
+(reconcile step 3, once per launch), lid-close settings changed by the
+one-time update (section 10, once).
 
 ### 10. Settings
 
@@ -626,7 +1064,23 @@ older build is tightened when the app reads it:
 
 - presets, default preset
 - freeze list (bundle ids), freeze every other app on/off (default off),
-  Docker rule on/off, mute on lid close on/off
+  Docker rule on/off, mute on lid close on/off (default on). Under the mute
+  toggle: on Mac laptops with Apple silicon or a T2 chip, closing the lid
+  disconnects the built-in microphone in hardware, so recording with the lid
+  closed needs AirPods or an external mic.
+- one-time lid-close update. A config.json without `lidCloseDefaultsApplied`
+  was saved by an earlier build. At launch it gets `freezeAllApps` off and
+  `muteOnLidClose` on, the mark set, and is written back. When either value
+  changed, the launch reconcile posts one "Lid-close settings changed"
+  notification naming each change and where to change it back (Settings,
+  Lid-close actions). It posts before taking the recovery lock, so a busy
+  lock or an unreadable journal does not hold it back, and after the app
+  installs its notification delegate. The app keeps the change in `lidCloseDefaultsNotice` so Settings
+  shows the same line at the top of Lid-close actions until dismissed. The
+  mark stays set, so a setting the user turns back is never changed again. A
+  missing `muteOnLidClose` in a config without the mark reads as off, as the
+  earlier builds read it. A fresh install writes a config.json with the mark
+  and the new defaults and shows no notice.
 - agent list (bundle ids), turn App Nap off for them on/off (default off)
 - `lowPowerFloor`, `endFloor`, thermal rules on/off
 - hotspot SSID (password entered once, stored in Keychain), `nudgeThreshold`
@@ -838,7 +1292,8 @@ Insomnia/
     TestSupport.swift
     UIStatusTests.swift
   scripts/
-    install.sh             build, bundle, codesign, sudoers, launchd, login item
+    build-app.sh           build, bundle (backstop.sh sealed inside), codesign
+    install.sh             build-app.sh or a verified --app bundle, sudoers, launchd
     uninstall.sh           reverse all of the above, restore sleep
     backstop.sh            standalone restore from JSON
     simulate-lid.sh        file trigger for the lid-close action path (debug and
@@ -876,8 +1331,18 @@ that any case passed; record results in the release validation record.
    every session at login. Saved audio requires the app to reopen.
 5. **Freeze.** Slack and WhatsApp on list, close lid, `ps -o stat` shows `T`
    for their whole trees. Open lid → running, reconnected, no relaunch.
-6. **Docker rule.** No containers → paused on close. One container → untouched.
-7. **Mute.** Volume 60%, close lid → muted. Open → 60%, unmuted.
+6. **Docker rule.** Rule on. No containers → paused on close; insomnia.log
+   has "first check found no running container" and "second check found no
+   running container". One container → untouched, log has "first check found
+   containers running". A container started between the two checks →
+   untouched, log has the first check finding none and "second check found
+   containers running".
+7. **Mute.** Volume 60%, close lid → muted. Open → 60%, unmuted. With a
+   headset as the output, close the lid, unplug the headset, open the lid
+   and choose End: the notification and the menu name the headset as still
+   muted. Plug it back in → its volume comes back and the menu line goes.
+   Repeat, but Quit with the headset unplugged, plug it in, then launch
+   Insomnia → restored at launch.
 8. **Chrome occlusion.** Lid closed, Playwright attached to headed Chrome:
    read `document.visibilityState` and measure `setInterval` drift. Repeat with
    both flags. Decide whether feature 5's browser section stays.
@@ -901,7 +1366,8 @@ that any case passed; record results in the release validation record.
     with the lid open using `scripts/simulate-lid.sh closed` then `open`
     during a session; the log shows `lid SIMULATED closed (file trigger)`.
     That needs a build with the watcher compiled in (installed with
-    `INSOMNIA_LID_SIMULATION=1 ./scripts/install.sh`; it logs "Lid
+    `INSOMNIA_LID_SIMULATION=1 ./scripts/install.sh`, which `build-app.sh`
+    reads; install.sh refuses it with `--app`; it logs "Lid
     simulation build" at launch). A normal install ignores the trigger:
     the watcher is compiled out so a file written by any other program
     running as the user cannot replay the lid actions. CI proves that on
@@ -918,6 +1384,17 @@ that any case passed; record results in the release validation record.
     0 → put back to 0. Force-quit during a session → `backstop.sh` alone puts
     it back. Set the key to 1 by hand, empty `appNapOverrides`, run
     `uninstall.sh` → it prints the `defaults delete` command and continues.
+15. **Meeting apps.** Freeze-all on, a Zoom or Teams call running on AirPods
+    and Wispr Flow or Granola taking notes. Close the lid → none of their
+    processes shows `T` in `ps -o stat`, the call and the notes continue,
+    other Dock apps are frozen, sound is muted.
+16. **Upgrade notice.** Install over a build whose config.json has
+    `freezeAllApps: true` and `muteOnLidClose: false`. First launch → one
+    "Lid-close settings changed" notification, the same line at the top of
+    Lid-close actions in Settings, both toggles changed, config.json has
+    `lidCloseDefaultsApplied: true`. Turn freeze-all back on, relaunch → no
+    notice, still on. Dismiss removes the Settings line. A fresh install
+    shows no notice.
 
 ## Open decisions (defaults chosen, change if you disagree)
 
