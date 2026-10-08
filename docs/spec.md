@@ -215,12 +215,21 @@ journal written before the record existed carries no doubt. While the
 journal still claims the mode (`lowPowerSetByUs`), the record keeps the
 boot it was written in, so a launch after a restart can tell that the
 claim is from before it. Such a claim says nothing about the mode in this
-boot, so before its `lowpowermode 0` the app reads the mode
-(`pmset -g custom`, the battery setting the claim is about). On, or not
-readable, the switch-off is the mode's end in this boot: the record is
-written for this boot and the entry waits for the next restart, as above.
-Off, the switch-off changes nothing, the record of the earlier boot goes,
-and a reading of the panel decides the entry. A claim with no record, a
+boot, and neither does a read of the mode. Before its `lowpowermode 0` the
+app reads the mode (`pmset -g custom`, the battery setting the claim is
+about) for the log only. On, the switch-off ends the mode in this boot.
+Off, the user or another tool may have switched it off a moment before,
+with the panel still on its way back. Either way, and when the mode cannot
+be read, the switch-off counts as the mode's end in this boot: the record
+is written for this boot and the entry waits for the next restart, as
+above. That holds for every route that switches such a claim off: an end,
+a launch, the menu or a floor, and the check after a power command. It
+also holds when state.json refuses the clear, in this process and in a
+relaunch in the same boot. The cost falls on a mode that went off long
+before the launch, which no reading tells apart: until a launch after the
+next restart the entry stays in state.json, the display is not sampled,
+and a close leaves it lit and only asks it to sleep. The level the user
+set is never written over. A claim with no record, a
 record with no boot or an empty one, or a launch that cannot read its own
 boot is taken as this boot's, so the entry waits, at the cost of one more
 restart. backstop.sh, before its own `lowpowermode 0`, gives a record of
@@ -950,7 +959,9 @@ Backstop, independent of the app:
   Otherwise it reads Low Power Mode under the lock. A mode that reads on
   stays journaled as Insomnia's. A mode that reads off is switched off
   once more with the app's own `lowpowermode 0`, and the ownership is
-  cleared only when that exits 0. A display write owed for the end of the
+  cleared only when that exits 0. A claim from before the Mac last started
+  that it clears this way counts as the mode's end in this boot, as for
+  any switch-off (section 4). A display write owed for the end of the
   mode is kept through the check and done then: with the mode already off,
   powerd's rescale of the panel cannot be told apart from a user's change,
   so the panel is compared with the owed value only before a switch-off,

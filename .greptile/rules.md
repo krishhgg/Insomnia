@@ -68,14 +68,17 @@ down, or a read that fails, leaves the entry as it is for a later read. A
 display reading above 0 taken under the app's own Low Power Mode, or after it
 in the same boot, relaunches included, leaves the entry for a launch after a
 restart. A claim on the mode written before the Mac last started (its record
-of the kept entry names another boot) is read before the switch-off: read
-off, it puts no doubt on the reading. A reading above 0 of the kept entry is
-journaled (`keptDisplayReadLit`), and a later 0 is then not overwritten with
-the saved value, in that run or any later one. No 0 read after it is taken
-as a level set since either, however late, since macOS may still hold the
-panel at a closing lid's 0: the entry stays flagged, with the display sample
-held, until the panel reads above 0. A close with no sample leaves the entry
-flagged. If state.json refuses `keptDisplayReadLit`, an end returns
+of the kept entry names another boot) is read before the switch-off for the
+log only: on, off or unreadable, the switch-off is the mode's end in this
+boot, since a mode read off may have gone off a moment before, so the
+entry waits for a launch after the next restart. A reading above 0 of the
+kept entry is journaled (`keptDisplayReadLit`), and a later 0 is then not
+overwritten with the saved value, in that run or any later one. No 0 read
+after it is taken as a level set since either, however late, since macOS may
+still hold the panel at a closing lid's 0: the entry stays flagged, with the
+display sample held, until the panel reads above 0. A close with no sample
+leaves the entry flagged. If state.json refuses `keptDisplayReadLit`, an
+end returns
 `.incomplete(agentArmed: false)` and Quit waits until it lands. Legacy
 `frozenPids` entries are never signaled or cleared by the shell. A flag is
 cleared only after its undo succeeded; a journal that is unreadable or has a

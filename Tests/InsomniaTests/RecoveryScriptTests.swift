@@ -7592,7 +7592,7 @@ final class AgentModeExitInANewBootTests: XCTestCase {
         XCTAssertEqual(waiting.savedDisplayBrightness, 0.8, "0.4 is not taken as the user's level")
         XCTAssertTrue(waiting.displayRestoreRefused)
         XCTAssertNil(sampler.last?.display, "nothing sampled")
-        XCTAssertTrue(logText().contains("display brightness 0.8, kept after a refused restore, reads 0.4 after our low power mode was on over it since the Mac last started, which rescales it until some time after it goes off; that is not taken as a level set since"), logText())
+        XCTAssertTrue(logText().contains("display brightness 0.8, kept after a refused restore, reads 0.4 after our low power mode was or may have been on over it since the Mac last started, which rescales it until some time after it goes off; that is not taken as a level set since"), logText())
 
         await m.start(duration: 3600)
         h.display.brightness = 0.6
@@ -7746,6 +7746,89 @@ final class AgentModeExitInANewBootTests: XCTestCase {
         XCTAssertEqual(h.display.brightness, 0.6)
         XCTAssertNil(sampler.last?.display)
         _ = await m.end(reason: .user)
+    }
+
+    /// The same journal from boot A. In boot B the user or another tool
+    /// switches Low Power Mode off a moment before the app launches: with
+    /// no agent run before it, or after the agent could not publish this
+    /// boot and so left the mode on. The app reads the mode off, which
+    /// does not show the panel is back: 0.4 is not taken as the user's
+    /// level, nothing is sampled, and a close and an open leave the
+    /// user's 0.6 as set and never write 0.4. A launch in boot C decides
+    /// on 0.6.
+    private func checkARecentSwitchOffByHandIsNotTakenAsTheUsersLevel(failedPreparation: Bool) async throws {
+        var seeded = RuntimeState()
+        seeded.savedDisplayBrightness = 0.8
+        seeded.displayRestoreRefused = true
+        seeded.lowPowerSetByUs = true
+        seeded.keptDisplayUnderLowPower = 0.8
+        seeded.keptDisplayUnderLowPowerBoot = "boot A"
+        seeded.keptDisplayReadLit = 0.8
+        let original = try Store.makeEncoder().encode(seeded)
+        let f = try ScriptFixture()
+        defer {
+            try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: f.state.path)
+            f.destroy()
+        }
+        if failedPreparation {
+            try original.write(to: f.state)
+            try f.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+            try FileManager.default.setAttributes([.immutable: true], ofItemAtPath: f.state.path)
+            let r = try f.run(f.backstop)
+            try FileManager.default.setAttributes([.immutable: false], ofItemAtPath: f.state.path)
+            XCTAssertNotEqual(r.status, 0)
+            XCTAssertFalse(f.calls().contains { $0.contains("lowpowermode") }, "\(f.calls())")
+            XCTAssertEqual(try Data(contentsOf: f.state), original)
+        }
+        try original.write(to: h.home.paths.stateFile)
+        try h.store.saveSession(Session(startedAt: h.clock.now.addingTimeInterval(-7200), endsAt: h.clock.now.addingTimeInterval(-60)))
+        // Switched off by hand a moment ago: the panel is on its way back
+        // to the user's 0.6.
+        h.guardFake.lowPowerOn = false
+        h.clamshell.closed = false
+        h.display.brightness = 0.4
+
+        let m = h.makeManager(bootSession: f.bootUUID)
+        let sampler = follow(m)
+        let actions = lidActions(m, sampler: sampler)
+        await m.reconcile()
+
+        let after = try XCTUnwrap(try h.store.loadState())
+        XCTAssertEqual(after.savedDisplayBrightness, 0.8, "a mode off a moment ago does not show the panel is back")
+        XCTAssertFalse(after.lowPowerSetByUs)
+        XCTAssertEqual(after.keptDisplayUnderLowPowerBoot, f.bootUUID)
+        XCTAssertNil(sampler.last?.display, "0.4 is not the user's sample")
+        XCTAssertEqual(h.display.sets, [])
+        XCTAssertTrue(logText().contains("low power mode, journaled as ours before the Mac last started, reads off; it may have gone off only a moment ago, with the panel still on its way back, so it is switched off as ours in this boot"), logText())
+
+        await m.start(duration: 3600)
+        h.display.brightness = 0.6
+        h.clamshell.closed = true
+        await actions.onClose()
+        h.clamshell.closed = false
+        await actions.onOpen()
+
+        XCTAssertFalse(h.display.sets.contains(0.4), "the next close and open do not write over the user's 0.6: \(h.display.sets)")
+        XCTAssertEqual(h.display.brightness, 0.6)
+        XCTAssertNil(sampler.last?.display)
+        _ = await m.end(reason: .user)
+
+        let later = h.makeManager(bootSession: "boot C")
+        let laterSampler = follow(later)
+        await later.reconcile()
+
+        XCTAssertNil(try h.store.loadState()?.savedDisplayBrightness)
+        XCTAssertEqual(laterSampler.last?.display, 0.6)
+        XCTAssertFalse(h.display.sets.contains(0.4), "\(h.display.sets)")
+        XCTAssertEqual(h.display.brightness, 0.6)
+    }
+
+    func testARecentSwitchOffByHandWithNoAgentIsNotTakenAsTheUsersLevel() async throws {
+        try await checkARecentSwitchOffByHandIsNotTakenAsTheUsersLevel(failedPreparation: false)
+    }
+
+    func testARecentSwitchOffByHandAfterAFailedAgentPreparationIsNotTakenAsTheUsersLevel() async throws {
+        try await checkARecentSwitchOffByHandIsNotTakenAsTheUsersLevel(failedPreparation: true)
     }
 }
 

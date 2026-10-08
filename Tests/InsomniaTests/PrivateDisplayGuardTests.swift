@@ -1373,16 +1373,16 @@ final class RefusedDarkeningTests: XCTestCase {
 
         let off = await m.setLowPower(false)
         XCTAssertTrue(off)
-        try await waitFor { self.logText().contains("reads 0.4 after our low power mode was on in this run") }
+        try await waitFor { self.logText().contains("reads 0.4 after our low power mode was or may have been on in this run") }
         h.display.brightness = 0.6
-        try await waitFor { self.logText().contains("reads 0.6 after our low power mode was on in this run") }
+        try await waitFor { self.logText().contains("reads 0.6 after our low power mode was or may have been on in this run") }
 
         let after = try XCTUnwrap(try h.store.loadState())
         XCTAssertFalse(after.lowPowerSetByUs)
         XCTAssertEqual(after.savedDisplayBrightness, 0.8, "not decided on a reading taken after the mode")
         XCTAssertTrue(after.displayRestoreRefused)
         XCTAssertNil(sampler.last?.display, "0.4 was on its way back, and nothing tells 0.6 apart from it")
-        XCTAssertTrue(logText().contains("display brightness 0.8, kept after a refused restore, reads 0.4 after our low power mode was on in this run, which rescales it until some time after it goes off; that is not taken as a level set since"), logText())
+        XCTAssertTrue(logText().contains("display brightness 0.8, kept after a refused restore, reads 0.4 after our low power mode was or may have been on in this run, which rescales it until some time after it goes off; that is not taken as a level set since"), logText())
 
         h.clamshell.closed = true
         await actions.onClose()
@@ -1392,7 +1392,7 @@ final class RefusedDarkeningTests: XCTestCase {
         XCTAssertTrue(closed.displayRestoreRefused, "still undecided")
         XCTAssertEqual(h.display.sets, [], "not darkened: the open would read that 0 as the darkening never undone")
         XCTAssertEqual(h.display.sleepRequests, 1)
-        XCTAssertTrue(logText().contains("display brightness reads 0.6 at the close after our low power mode was on in this run, which rescales it until some time after it goes off; the value kept after a refused restore, 0.8, stays journaled and undecided, and the display is not darkened"), logText())
+        XCTAssertTrue(logText().contains("display brightness reads 0.6 at the close after our low power mode was or may have been on in this run, which rescales it until some time after it goes off; the value kept after a refused restore, 0.8, stays journaled and undecided, and the display is not darkened"), logText())
 
         h.clamshell.closed = false
         await actions.onOpen()
@@ -1413,7 +1413,7 @@ final class RefusedDarkeningTests: XCTestCase {
         XCTAssertEqual(try h.store.loadState()?.savedDisplayBrightness, 0.8, "not decided by a relaunch in the same boot")
         XCTAssertEqual(h.display.sets, [])
         XCTAssertNil(relaunchedSampler.last?.display)
-        XCTAssertTrue(logText().contains("display brightness 0.8, kept after a refused restore, reads 0.6 after our low power mode was on over it since the Mac last started, which rescales it until some time after it goes off; that is not taken as a level set since"), logText())
+        XCTAssertTrue(logText().contains("display brightness 0.8, kept after a refused restore, reads 0.6 after our low power mode was or may have been on over it since the Mac last started, which rescales it until some time after it goes off; that is not taken as a level set since"), logText())
 
         let restarted = h.makeManager(bootSession: "a later boot")
         let newSampler = BrightnessSampler(display: h.display, keyboard: h.keyboard, idleSeconds: { 1 })
@@ -1465,7 +1465,7 @@ final class RefusedDarkeningTests: XCTestCase {
         XCTAssertEqual(h.display.brightness, 0)
         XCTAssertEqual(try h.store.loadState()?.savedDisplayBrightness, 0.8)
         XCTAssertEqual(try h.store.loadState()?.keptDisplayReadLit, 0.8, "journaled for later runs")
-        XCTAssertTrue(logText().contains("display brightness 0.8, kept after a refused restore, reads 0 after our low power mode was on in this run, which rescales it until some time after it goes off, after a reading above 0 showed its darkening undone; that 0 may be a level set since, so the kept value is not written"), logText())
+        XCTAssertTrue(logText().contains("display brightness 0.8, kept after a refused restore, reads 0 after our low power mode was or may have been on in this run, which rescales it until some time after it goes off, after a reading above 0 showed its darkening undone; that 0 may be a level set since, so the kept value is not written"), logText())
     }
 
     /// A lid open writes a kept display value while state.json refuses
@@ -1713,7 +1713,7 @@ final class RefusedDarkeningTests: XCTestCase {
         XCTAssertTrue(waiting.displayRestoreRefused)
         XCTAssertEqual(waiting.keptDisplayReadLit, 0.8)
         XCTAssertNil(relaunchedSampler.last?.display)
-        XCTAssertTrue(logText().contains("display brightness 0.8, kept after a refused restore, reads 0 after our low power mode was on over it since the Mac last started, which rescales it until some time after it goes off, after a reading above 0 showed its darkening undone; that 0 may be a level set since, so the kept value is not written"), logText())
+        XCTAssertTrue(logText().contains("display brightness 0.8, kept after a refused restore, reads 0 after our low power mode was or may have been on over it since the Mac last started, which rescales it until some time after it goes off, after a reading above 0 showed its darkening undone; that 0 may be a level set since, so the kept value is not written"), logText())
 
         let restarted = h.makeManager(keptRecheckDelay: .milliseconds(20), keptRecheckAttempts: 3, keptRecheckSlowDelay: .milliseconds(20), bootSession: "a later boot")
         let sampler = follow(restarted)
@@ -2305,11 +2305,12 @@ final class RefusedDarkeningTests: XCTestCase {
     /// kept 0.8, the open reads the rescaled 0.4, and the app is gone
     /// before the session ends. The Mac restarts. In boot B the mode reads
     /// off and the panel 0.6. The launch ends the session and reads the
-    /// mode before its `lowpowermode 0`: the claim from boot A says nothing
-    /// about boot B, and with the mode off the switch-off changes nothing.
-    /// So 0.6 is the level set since: the entry and the record of boot A
-    /// go without a write, and 0.6 is the sample.
-    func testAClaimFromBeforeARestartWithTheModeOffDoesNotHoldTheKeptValue() async throws {
+    /// mode before its `lowpowermode 0`, for the log: the mode may have
+    /// gone off a moment ago, with the panel on its way back, and nothing
+    /// tells that from a mode long off. So the switch-off counts as ours
+    /// in boot B: the entry waits with the record for boot B, nothing is
+    /// written, and nothing is sampled. A launch in boot C takes 0.6.
+    func testAClaimFromBeforeARestartWithTheModeOffStillHoldsTheKeptValue() async throws {
         try seedKeptDisplay()
         h.clamshell.closed = false
         h.display.brightness = 0.4
@@ -2334,16 +2335,25 @@ final class RefusedDarkeningTests: XCTestCase {
 
         let after = try XCTUnwrap(try h.store.loadState())
         XCTAssertFalse(after.lowPowerSetByUs)
-        XCTAssertNil(after.savedDisplayBrightness)
-        XCTAssertNil(after.keptDisplayUnderLowPower)
-        XCTAssertNil(after.keptDisplayUnderLowPowerBoot)
+        XCTAssertEqual(after.savedDisplayBrightness, 0.8)
+        XCTAssertEqual(after.keptDisplayUnderLowPower, 0.8)
+        XCTAssertEqual(after.keptDisplayUnderLowPowerBoot, "boot B")
         XCTAssertEqual(h.display.sets, [])
-        XCTAssertEqual(sampler.last?.display, 0.6)
-        XCTAssertTrue(logText().contains("low power mode, journaled as ours before the Mac last started, reads off; the switch-off changes nothing in this boot"), logText())
+        XCTAssertNil(sampler.last?.display)
+        XCTAssertTrue(logText().contains("low power mode, journaled as ours before the Mac last started, reads off; it may have gone off only a moment ago, with the panel still on its way back, so it is switched off as ours in this boot"), logText())
+        XCTAssertTrue(logText().contains("display brightness 0.8, kept after a refused restore, reads 0.6 after our low power mode was or may have been on in this run"), logText())
         let calls = Array(h.guardFake.calls.dropFirst(callsBefore))
         let read = try XCTUnwrap(calls.firstIndex(of: "pmset -g custom"), "\(calls)")
         let off = try XCTUnwrap(calls.firstIndex(of: "lowpowermode 0"), "\(calls)")
         XCTAssertLessThan(read, off, "\(calls)")
+
+        let later = h.makeManager(bootSession: "boot C")
+        let laterSampler = follow(later)
+        await later.reconcile()
+
+        XCTAssertNil(try h.store.loadState()?.savedDisplayBrightness)
+        XCTAssertEqual(h.display.sets, [])
+        XCTAssertEqual(laterSampler.last?.display, 0.6)
     }
 
     /// The same claim with the mode still on in boot B, as Low Power Mode
@@ -2370,7 +2380,7 @@ final class RefusedDarkeningTests: XCTestCase {
         XCTAssertEqual(h.display.sets, [])
         XCTAssertNil(sampler.last?.display)
         XCTAssertTrue(logText().contains("low power mode, journaled as ours before the Mac last started, reads on; it is switched off as ours in this boot"), logText())
-        XCTAssertTrue(logText().contains("display brightness 0.8, kept after a refused restore, reads 0.6 after our low power mode was on in this run"), logText())
+        XCTAssertTrue(logText().contains("display brightness 0.8, kept after a refused restore, reads 0.6 after our low power mode was or may have been on in this run"), logText())
 
         let relaunched = h.makeManager(bootSession: "boot B")
         let relaunchedSampler = follow(relaunched)
@@ -2447,11 +2457,11 @@ final class RefusedDarkeningTests: XCTestCase {
     }
 
     /// The claim from boot A, with the mode off in boot B and the lid
-    /// closed at launch: the end clears the claim and the record of boot A,
-    /// and the entry waits for the lid. A session of boot B then switches
-    /// the mode on itself: the record is for boot B, the open under the
-    /// mode and the re-reads after it decide nothing, and neither does a
-    /// relaunch in boot B.
+    /// closed at launch: the end clears the claim and gives the record
+    /// boot B, and the entry waits for the lid. A session of boot B then
+    /// switches the mode on itself: the record stays for boot B, the open
+    /// under the mode and the re-reads after it decide nothing, and
+    /// neither does a relaunch in boot B.
     func testOurLowPowerModeOfTheNewBootStillHoldsTheKeptValue() async throws {
         try seedClaimFromBootA()
         h.clamshell.closed = true
@@ -2463,7 +2473,8 @@ final class RefusedDarkeningTests: XCTestCase {
         let cleared = try XCTUnwrap(try h.store.loadState())
         XCTAssertFalse(cleared.lowPowerSetByUs)
         XCTAssertEqual(cleared.savedDisplayBrightness, 0.8, "not read under a closed lid")
-        XCTAssertNil(cleared.keptDisplayUnderLowPower)
+        XCTAssertEqual(cleared.keptDisplayUnderLowPower, 0.8)
+        XCTAssertEqual(cleared.keptDisplayUnderLowPowerBoot, "boot B")
 
         await m.start(duration: 3600)
         let on = await m.setLowPower(true)
@@ -2478,7 +2489,7 @@ final class RefusedDarkeningTests: XCTestCase {
         await m.undoLidActions()
 
         XCTAssertEqual(try h.store.loadState()?.savedDisplayBrightness, 0.8)
-        XCTAssertTrue(logText().contains("display brightness 0.8, kept after a refused restore, reads 0.6 after our low power mode was on in this run"), logText())
+        XCTAssertTrue(logText().contains("display brightness 0.8, kept after a refused restore, reads 0.6 after our low power mode was or may have been on in this run"), logText())
 
         let relaunched = h.makeManager(bootSession: "boot B")
         let sampler = follow(relaunched)
@@ -2529,7 +2540,7 @@ final class RefusedDarkeningTests: XCTestCase {
     /// state.json cannot be read when the app starts in boot B, and is
     /// repaired before the next try: the claim from boot A read then is
     /// placed in boot A all the same, the mode is read, and with it off
-    /// the entry is decided.
+    /// the entry waits for a later boot as for any such claim.
     func testAClaimFromBeforeARestartReadFromARepairedJournalIsReadLikeAnyOther() async throws {
         try seedClaimFromBootA()
         let file = h.home.paths.stateFile
@@ -2547,9 +2558,12 @@ final class RefusedDarkeningTests: XCTestCase {
         await m.reconcile()
 
         XCTAssertTrue(h.guardFake.calls.contains("pmset -g custom"), "\(h.guardFake.calls)")
-        XCTAssertNil(try h.store.loadState()?.savedDisplayBrightness)
+        let after = try XCTUnwrap(try h.store.loadState())
+        XCTAssertFalse(after.lowPowerSetByUs)
+        XCTAssertEqual(after.savedDisplayBrightness, 0.8)
+        XCTAssertEqual(after.keptDisplayUnderLowPowerBoot, "boot B")
         XCTAssertEqual(h.display.sets, [])
-        XCTAssertEqual(sampler.last?.display, 0.6)
+        XCTAssertNil(sampler.last?.display)
     }
 
     /// The claim was already given back, by the app before the restart or
@@ -2605,7 +2619,7 @@ final class RefusedDarkeningTests: XCTestCase {
         XCTAssertEqual(next.effectiveState.savedDisplayBrightness, 0.8)
         XCTAssertEqual(try h.store.loadState()?.keptDisplayUnderLowPower, 0.8)
         XCTAssertNil(sampler.last?.display)
-        XCTAssertTrue(logText().contains("display brightness 0.8, kept after a refused restore, reads 0.4 after our low power mode was on over it since the Mac last started"), logText())
+        XCTAssertTrue(logText().contains("display brightness 0.8, kept after a refused restore, reads 0.4 after our low power mode was or may have been on over it since the Mac last started"), logText())
 
         h.display.brightness = 0.6
         h.clamshell.closed = true
@@ -2660,12 +2674,12 @@ final class RefusedDarkeningTests: XCTestCase {
         XCTAssertFalse(h.guardFake.lowPowerOn)
         XCTAssertEqual(try h.store.loadState()?.savedDisplayBrightness, 0.8, "not decided on the reading taken as the mode went off")
         XCTAssertNil(sampler.last?.display)
-        XCTAssertTrue(logText().contains("display brightness 0.8, kept after a refused restore, reads 0.3 after our low power mode was on in this run"), logText())
+        XCTAssertTrue(logText().contains("display brightness 0.8, kept after a refused restore, reads 0.3 after our low power mode was or may have been on in this run"), logText())
 
         h.display.brightness = 0.5
-        try await waitFor { self.logText().contains("reads 0.5 after our low power mode was on in this run") }
+        try await waitFor { self.logText().contains("reads 0.5 after our low power mode was or may have been on in this run") }
 
-        XCTAssertTrue(logText().contains("reads 0.5 after our low power mode was on in this run"), logText())
+        XCTAssertTrue(logText().contains("reads 0.5 after our low power mode was or may have been on in this run"), logText())
         XCTAssertEqual(try h.store.loadState()?.savedDisplayBrightness, 0.8)
         XCTAssertEqual(h.display.sets, [])
         XCTAssertNil(sampler.last?.display)

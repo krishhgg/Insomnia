@@ -324,17 +324,17 @@ final class SessionManager {
     }
 
     /// The journal has said, at some point in this run, that Insomnia's own
-    /// Low Power Mode is on in this boot. The mode rescales the panel, and
-    /// once it is off macOS brings the panel back over a time nobody has
-    /// measured, so from then on no display reading in this run is taken
-    /// as the level the user set (`keptDisplayReadDoubt`). A display entry
-    /// kept after a refused restore is journaled as such for later runs in
-    /// the same boot (`RuntimeState.keptDisplayUnderLowPower`). A claim
-    /// read from before the Mac last started
-    /// (`RuntimeState.lowPowerClaimFromEarlierBoot`) does not set it: only
-    /// the mode read on, or not readable, before it is switched off in this
-    /// boot does (`readLowPowerClaimedBeforeRestart`), and so does enabling
-    /// it.
+    /// Low Power Mode is on in this boot, or this run switched off a claim
+    /// on the mode. The mode rescales the panel, and once it is off macOS
+    /// brings the panel back over a time nobody has measured, so from then
+    /// on no display reading in this run is taken as the level the user
+    /// set (`keptDisplayReadDoubt`). A display entry kept after a refused
+    /// restore is journaled as such for later runs in the same boot
+    /// (`RuntimeState.keptDisplayUnderLowPower`). A claim read from before
+    /// the Mac last started (`RuntimeState.lowPowerClaimFromEarlierBoot`)
+    /// does not set it by itself. Switching that claim off in this boot
+    /// does, whatever the mode reads (`readLowPowerClaimedBeforeRestart`,
+    /// `clearLowPowerOwnership`), and so does enabling the mode.
     @ObservationIgnored private var lowPowerWasOurs = false
 
     /// `kern.bootsessionuuid` of this run, for `keptDisplayUnderLowPower`.
@@ -353,9 +353,9 @@ final class SessionManager {
             return "while our low power mode, journaled on before the Mac last started, may still be on, which rescales it"
         }
         if s.lowPowerSetByUs { return "under our low power mode, which rescales it" }
-        if lowPowerWasOurs { return "after our low power mode was on in this run, which rescales it until some time after it goes off" }
+        if lowPowerWasOurs { return "after our low power mode was or may have been on in this run, which rescales it until some time after it goes off" }
         if s.keptDisplayReadUnderLowPower(inBoot: bootSession) {
-            return "after our low power mode was on over it since the Mac last started, which rescales it until some time after it goes off"
+            return "after our low power mode was or may have been on over it since the Mac last started, which rescales it until some time after it goes off"
         }
         return nil
     }
@@ -852,9 +852,9 @@ final class SessionManager {
             try loadJournal()
         } catch {
             if case .lowPowerOff = undo, let owed = effectiveState.displayRestoredUnderLowPower {
-                // A claim from before the restart was read before the
-                // command ran (`readLowPowerClaimedBeforeRestart`).
-                if claimsLowPowerInThisBoot(state) { lowPowerWasOurs = true }
+                // Switched off in this boot, a claim from before the
+                // restart included (`clearLowPowerOwnership`).
+                if state.lowPowerSetByUs { lowPowerWasOurs = true }
                 owedEdits.lowPowerOff = true
                 displayWriteAfterUnreadOff = owed
                 failUncleared("\(command.description) exited 0, but the journal could not be read to clear its entry: \(error.localizedDescription); low power mode is off, and the clear and the display write owed after it (\(owed)) wait for the journal to read again", clear)
@@ -931,12 +931,14 @@ final class SessionManager {
     /// Until a write lands the disk still claims the mode, so an end, the
     /// floors or the agent may switch it off once more, as after any
     /// failed clear. Returns whether the journal took the clear.
-    /// A claim from before the Mac last started is ours in this boot only
-    /// if the mode read on, or could not be read, before the switch-off
-    /// (`readLowPowerClaimedBeforeRestart`).
+    /// A claim from before the Mac last started is ours in this boot once
+    /// it is switched off in it, whatever the mode read before: it may
+    /// have been on until a moment before (`readLowPowerClaimedBeforeRestart`).
+    /// So the write that clears it records the kept display entry for this
+    /// boot, as does the next one that lands if this one is refused.
     @discardableResult
     private func clearLowPowerOwnership(_ what: String) -> Bool {
-        if claimsLowPowerInThisBoot(state) { lowPowerWasOurs = true }
+        if state.lowPowerSetByUs { lowPowerWasOurs = true }
         guard !clearUndone(what, { $0.lowPowerSetByUs = false }) else { return true }
         owedEdits.lowPowerOff = true
         return false
@@ -1662,23 +1664,25 @@ final class SessionManager {
 
     /// Before a `lowpowermode 0` for a claim on the mode from before the
     /// Mac last started (`RuntimeState.lowPowerClaimFromEarlierBoot`): the
-    /// claim says nothing about this boot, so the mode is read. On, the
-    /// switch-off changes it in this boot, and the panel comes back from
-    /// it over a time nobody has measured: the mode counts as ours in this
-    /// run (`lowPowerWasOurs`), and the kept display entry is recorded for
-    /// this boot. Off, the `lowpowermode 0` changes nothing, and no reading
-    /// of the panel is doubted for it. A read that fails counts as on.
+    /// claim says nothing about this boot, and neither does a read of the
+    /// mode. On, the switch-off ends it in this boot. Off, the user or
+    /// another tool may have switched it off a moment ago. Either way the
+    /// panel may be on its way back from it, over a time nobody has
+    /// measured, so the mode counts as ours in this run (`lowPowerWasOurs`)
+    /// and the kept display entry is recorded for this boot. A mode off
+    /// since long before this launch waits the same way, since no reading
+    /// tells the two apart: its entry stays until a launch after the next
+    /// restart. The read is logged and decides nothing.
     private func readLowPowerClaimedBeforeRestart() async {
         guard !lowPowerWasOurs, state.lowPowerClaimFromEarlierBoot(boot: bootSession) else { return }
+        lowPowerWasOurs = true
         do {
             if try await sleepGuard.isLowPowerModeOn() {
-                lowPowerWasOurs = true
                 Log.info("low power mode, journaled as ours before the Mac last started, reads on; it is switched off as ours in this boot")
             } else {
-                Log.info("low power mode, journaled as ours before the Mac last started, reads off; the switch-off changes nothing in this boot")
+                Log.info("low power mode, journaled as ours before the Mac last started, reads off; it may have gone off only a moment ago, with the panel still on its way back, so it is switched off as ours in this boot")
             }
         } catch {
-            lowPowerWasOurs = true
             Log.error("could not read low power mode, journaled as ours before the Mac last started; it is switched off as ours in this boot: \(error.localizedDescription)")
         }
     }

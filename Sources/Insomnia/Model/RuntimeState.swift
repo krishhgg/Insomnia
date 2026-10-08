@@ -159,9 +159,10 @@ struct RuntimeState: Codable, Equatable, Sendable {
     /// the mode cleared by someone else.
     var displayRestoredUnderLowPower: Float? = nil
     /// A display brightness kept after a refused restore that Insomnia's
-    /// own Low Power Mode was on over, or that a run of the app with the
-    /// mode on at some point journaled: the saved value, and the boot
-    /// session (`kern.bootsessionuuid`) of that run. Once the mode is off
+    /// own Low Power Mode was, or may have been, on over: one a run of the
+    /// app journaled with the mode on at some point, or after it switched
+    /// off a claim on the mode. The saved value, and the boot session
+    /// (`kern.bootsessionuuid`) of that run. Once the mode is off
     /// the panel comes back over a time nobody has measured, and the app
     /// can be relaunched meanwhile, so no reading above 0 decides that
     /// entry in that boot, in any run (`SessionManager.keptDisplayReadDoubt`).
@@ -225,8 +226,9 @@ struct RuntimeState: Codable, Equatable, Sendable {
     /// `lowPowerSetByUs` next to a record of the kept display entry from
     /// another boot than `boot`: the claim was written before the Mac last
     /// started and says nothing about the mode in this boot. The mode may
-    /// still be on (a `pmset -b` setting, not known to end with a restart)
-    /// or long off. A record or boot session that is unknown
+    /// still be on (a `pmset -b` setting, not known to end with a restart),
+    /// long off, or switched off a moment ago, which no read of the mode
+    /// tells apart from long off. A record or boot session that is unknown
     /// (empty) gives no such sign, and the claim counts as this boot's.
     func lowPowerClaimFromEarlierBoot(boot: String) -> Bool {
         guard lowPowerSetByUs, keptDisplayRecordMatches else { return false }
@@ -247,14 +249,14 @@ struct RuntimeState: Codable, Equatable, Sendable {
 
     /// Before each journal write: a display entry kept after a refused
     /// restore is recorded as one our Low Power Mode was on over while
-    /// `ours` (the mode is ours in this boot, or was in this run), and a
-    /// record that is not about the entry as it reads now, in boot `boot`,
-    /// is dropped, unless `lowPowerSetByUs` is still set: then the record
-    /// keeps its earlier boot, the sign that the claim is from before the
-    /// restart (`lowPowerClaimFromEarlierBoot`), and goes with the claim.
-    /// A record with no boot session, which may be from this boot, is
-    /// taken as this boot's, so it holds until the next restart and no
-    /// longer.
+    /// `ours` (the mode is ours in this boot, or was or may have been in
+    /// this run), and a record that is not about the entry as it reads
+    /// now, in boot `boot`, is dropped, unless `lowPowerSetByUs` is still
+    /// set: then the record keeps its earlier boot, the sign that the
+    /// claim is from before the restart (`lowPowerClaimFromEarlierBoot`),
+    /// and goes with the claim. A record with no boot session, which may
+    /// be from this boot, is taken as this boot's, so it holds until the
+    /// next restart and no longer.
     mutating func noteLowPowerOverKeptDisplay(ours: Bool, boot: String) {
         if ours, displayRestoreRefused, let kept = savedDisplayBrightness {
             keptDisplayUnderLowPower = kept

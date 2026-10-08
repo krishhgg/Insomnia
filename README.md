@@ -244,7 +244,10 @@ display awake and the keys not dimmed. Once Insomnia's own Low Power Mode has
 been on over the saved display level, it leaves that level undecided until the
 Mac restarts, through relaunches of the app, and until then a lid close leaves
 that display lit and only asks it to sleep. The same goes when the recovery
-agent switches that mode off before Insomnia starts again. Once it has seen
+agent switches that mode off before Insomnia starts again, and when Insomnia
+switches off a mode still claimed from before a restart. That mode may read
+off then, yet it may have gone off only a moment before, so the level waits
+for the next restart even when the mode has been off for days. Once it has seen
 that display lit above zero, it never writes the saved level over a zero you
 set by hand, also after a relaunch or a restart. It cannot tell that zero
 from one auto-brightness left under a closing lid, so the saved level stays
