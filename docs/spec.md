@@ -665,7 +665,8 @@ When `pmset` lists no internal battery, the backstop asks `ioreg` for the
 is a desktop, and with one but no charger reported (`ExternalConnected`) the
 battery counts as unreadable and the session ends. It reads `endFloor` and
 `thermalRules` through the app's own decoder, not by parsing config.json
-itself. While a session is valid and the app holds the liveness lock, it
+itself, while that binary answers (its own reader when it does not is
+below). While a session is valid and the app holds the liveness lock, it
 opens a readable regular `config.json` once and passes its bytes on standard
 input to `Insomnia --agent-cutoffs 33` in the installed bundle
 (`~/Applications/Insomnia.app/Contents/MacOS/Insomnia`). That mode
@@ -742,24 +743,40 @@ cutoffs it holds. The check follows every object and array but checks only
 what the app decodes: the top level, the four arrays and the objects in
 them. In a frozen process it checks `startedAtMicros` only after a
 `startedAt` that is there and not null, and `bootSession` only after both,
-as `FrozenProcess` decodes them. It accepts a whole number written
-with a fraction or an exponent (`5105.0`, `1e18`) when the field's type
-holds it and a `Double` holds it exactly, so `plutil` reads the same
-number; a key twice or an escape or number the app skips where the app
-reads nothing; UTF-16 with or without a byte order mark; and UTF-32
-without one, or big-endian with one. A `sessionCutoffs` written twice or
-with an escape JSON does not have leaves the journal loadable and counts as
-a record the app does not write. It refuses some text the app's decoder
-reads, none of which the app writes: a key the app reads twice in an object
-it reads (the decoder takes the first), a whole number written with a
-fraction or an exponent that a `Double` does not hold exactly
-(`9007199254740993.0`), a number a `Double` rounds (`1.0000000000000001`,
-`1e-99999`), a number or escape `plutil` cannot parse even where the app
-skips it (`01`, `1e400`, `\a`, `\u0000`, a lone surrogate), a NUL byte, and
-UTF-32LE with a byte order mark, which the app refuses too. While such a
-journal stays,
-a valid session keeps sleep held unless the app ends it, and nothing is
-undone, until the file is fixed.
+as `FrozenProcess` decodes them. The check reads the file's own text as
+the app's decoder reads it (`record_text_problems`), not through `plutil`,
+which keeps the last of two copies of a key where the app keeps the first
+and reads numbers through a `Double`. Where `plutil` would read the file
+otherwise than the app (a key the app reads written twice or with an
+escape, a whole number written with a fraction or an exponent, UTF-16 or
+UTF-32), the backstop reads and edits a copy of the journal as the app
+reads it (the view) and leaves the file as it is until it publishes a
+journal. The view holds the keys the app reads, the first copy of each,
+without escapes, with whole numbers as digits, and nothing the app skips.
+So a journal the backstop publishes from it drops what the app's own save
+drops: keys the app does not read, later copies of a key, a
+`sessionCutoffs` the app reads as no record, and an `endedSession` that
+holds `\u0000`, which is no session the app wrote. The check accepts a
+whole number written with a fraction or an exponent when the app reads it
+as a whole number the field's type holds (`5105.0`, `1e3`, and `1e-400` as
+0; not `0.5`, and not `2147483648` for an Int32), a number where the app
+reads a `Float` that does not round to infinity, or to 0 unless it is 0
+(compared as exact decimal digits), a key, escape or number the app
+skips, UTF-16 with or without a byte order mark, and UTF-32 without one or
+big-endian with one. A `sessionCutoffs` written twice counts by its first
+copy, and one the app reads as no record leaves the journal loadable and
+counts as a record the app does not write. It refuses some text the app's
+decoder reads, none of which the app writes: a NUL byte anywhere, a
+string the app reads that holds `\u0000`, which `plutil` cannot read, and
+text the check does not finish reading within 30 s (an object with very
+many keys or a very long array can take that long). It refuses an Int64
+on which Foundation stops the app (a precondition in its `Decimal` parse)
+and UTF-32LE with a byte order mark, which the app does not load either.
+`plutil` writes every number of a journal it edits through a `Double`; an
+edited copy whose text the check finds the app would read otherwise is
+not published, and the run keeps the old journal and exits 1. While a
+refused journal stays, a valid session keeps sleep held unless the app ends
+it, and nothing is undone, until the file is fixed.
 
 When the binary cannot answer for `config.json` (missing or not
 executable, or another declared version: the agent runs only the script
@@ -767,23 +784,27 @@ sealed in `~/Applications/Insomnia.app`, after checking that bundle's
 signature, so these need the bundle removed or replaced during the run; no
 answer in time, more than 8 MiB of input, output in another form), the
 backstop reads the file itself (`config_cutoffs`) and logs that it did. It
-copies the file once through a bounded read and uses the copy only where it
-can tell exactly what the app's `Config` decoder makes of it: at most
-64 KiB, parsed by `plutil`, and passed by the journal's text check in its
-`config.json` form (`record_text_problems`). That check follows the whole
-file and also checks each value the decoder reads for the type it takes
-there, null included where it reads the key with `decodeIfPresent`, and
-that a `lidCloseDefaultsNotice` object holds both its keys. A file that
-passes gives `endFloor` (10 when absent or null, clamped to 0 to 95 as
+copies the file once through a bounded read, at most 8 MiB as the binary
+reads, and reads the copy's text with the journal's reader in its
+`config.json` form (`record_text_problems`), without `plutil`. The reader
+follows the whole file as the app's `Config` decoder reads it: the first
+copy of a key, keys after their escapes, numbers as the field's type reads
+them (`1e-400` as an end floor of 0), and what the decoder skips skipped.
+It checks each value the decoder reads for the type it takes there, null
+included where it reads the key with `decodeIfPresent`, and that a
+`lidCloseDefaultsNotice` object holds both its keys. A file that passes
+gives `endFloor` (10 when absent or null, clamped to 0 to 95 as
 `Config.agentCutoffs` clamps it) and `thermalRules` (on when absent or
-null), the values the binary prints for it. A file whose only failures are
-values of a type the decoder does not take counts as rejected, as the
-binary answers for it. Any other failure (a key the app reads written
-twice, an escape JSON does not have, a number the decoder rounds or cannot
-hold, text the check cannot follow, a file `plutil` cannot parse or larger
-than 64 KiB) means the backstop cannot tell what the app makes of the file,
-and it is not used. A hand edit reaches the backstop on this path as it
-does through the binary. The binary is not run again on the journal then:
+null), the values the binary prints for it. A file the decoder rejects
+(text that is not JSON it reads, a value of a type it does not take there,
+a number the type does not hold, a string it does not read, a
+`lidCloseDefaultsNotice` without one of its keys) counts as rejected, as
+the binary answers for it. The backstop cannot tell what the app makes of
+a file over 8 MiB, one with an Int64 on which Foundation stops the app, or
+one the reader does not finish within 30 s (very many keys or a very long
+array), and it does not use one of those. So a hand edit reaches the
+backstop on this path only in a form this reader can read; one it cannot
+read leaves the cases below. The binary is not run again on the journal then:
 the backstop reads `sessionCutoffs` from the journal it checked itself
 (`journal_cutoffs`), a string of exactly the form the app writes, a floor
 of 0 to 95 with no leading zero and `true` or `false`, which `plutil` reads
@@ -1172,7 +1193,17 @@ Backstop, independent of the app:
   cannot be read counts as the end of whatever `session.json` holds, since
   it may hold that record, until it can be read or that file is gone or
   replaced; no writer takes it for its own record or writes its record
-  over it, and both go on to the log.
+  over it, and both go on to the log. Both read it three times, 0.1 s
+  apart (`Store.lockReadAttempts`, `LOCK_READ_ATTEMPTS`), before it counts
+  as unreadable, so a read error that passes ends nothing. When
+  `insomnia.log` holds a whole record of that session, both name the log
+  as where the end is recorded, since the lock file only may hold it.
+  Counting an unreadable lock file as the end keeps to the safe side; it
+  does not show that anyone ended the session. A lock file that holds no
+  record and whose reads keep failing (an I/O error, say) ends a session
+  nobody ended, and the agent then empties it once `session.json` is gone.
+  Whether such a file should end, keep or defer the session is an open
+  decision.
   The app empties the record when it removes `session.json`. A start that
   fails puts back the journal, the old `session.json` and the lock file
   byte for byte, the lock file before the old `session.json`; with no old
@@ -1228,9 +1259,25 @@ Backstop, independent of the app:
   newline or cannot be read, puts a newline before its own line: the app
   (`OwnerOnly.appendToLog`, `LogEndRecord`) and the agent (`log`,
   `record_end_in_log`) in the same write, the agent program's line when
-  the code check fails in a write before it. `uninstall.sh` writes the log
-  only through the agent. So a line written later never joins that record,
-  and a line a write cut short never joins the record written after it. A
+  the code check fails in a write before it. Each holds `flock(2)` on
+  `insomnia.log` itself from that read until its line is written (taken
+  last, after the recovery lock), checks once it holds it that its
+  descriptor is still on the file the path names, and opens the path again
+  when it is not (four opens at most in the app, three in the agent); a
+  rotation renames the file under the same lock. The app waits up to 2 s
+  for the lock: an ordinary line not locked in time waits in memory
+  (64 KiB, the oldest whole lines dropped first) and goes out before the
+  next line that gets the lock, and a record not locked in time is not
+  written and does not count. The agent
+  and the agent program wait up to 5 s (`lockf -s -t 5`); a line of the
+  agent's not locked in time goes to standard error, the agent program's is
+  not written, and neither is a record. `uninstall.sh` writes the log only
+  through the agent. So among these writers a line written later never
+  joins that record, and a line a write cut short never joins the record
+  written after it. A writer that takes no lock (an older build's agent
+  still installed, another program, a hand edit) can still append in
+  between; its line can join a record that already read back, and that
+  record then ends nothing. A
   `session.json` over 64 KiB is never recorded there. The app at launch,
   in reconcile, on its 1 Hz tick and in every transaction, each agent run
   and `uninstall.sh` look for a line equal to the one the current bytes of

@@ -25,9 +25,11 @@ agent checks before each run, and while that file is missing or rejected, the
 values the app recorded for the session in `state.json`
 (`Insomnia --agent-session-cutoffs`). When that binary is gone or replaced by
 another version during the run, or gives no usable answer in time, the
-backstop reads `config.json` itself where it can tell exactly what the app's
-decoder makes of it, and otherwise the values recorded in `state.json`, once
-the journal passes its check. A recorded value the app does not write counts
+backstop reads `config.json` itself where its own reader can tell what the
+app's decoder makes of it (not for a file over 8 MiB, one the reader does
+not finish within 30 s, or one on which Foundation stops the app), and
+otherwise the values recorded in `state.json`, once the journal passes its
+check. A recorded value the app does not write counts
 as none, as the app reads it. With no record, it enforces the app's defaults
 (a 10% end floor, thermal rules on) while `config.json` is missing or
 rejected, and the strictest values (95%, on) while the file is there but
@@ -46,7 +48,13 @@ is, so an ACL someone added can still give another account access. Logs are capp
 1 MiB with one older copy kept. `insomnia.log` is rotated only while the app
 holds the recovery lock, because it can hold the record of a session's end (a
 line with session.json's bytes in base64), so it can grow past 1 MiB until
-then. A log the user replaced with a symlink is not
+then. Insomnia's writers of `insomnia.log` (the app, the backstop and its
+LaunchAgent) hold flock(2) on the file while they write, so no line of
+theirs lands inside such a record. Any process running as that user can
+hold that lock too: the app's lines then wait in memory (64 KiB),
+the backstop's go to standard error, and no record of a session's end is
+written there. A process that appends without the lock can still break a
+record that was already read back. A log the user replaced with a symlink is not
 rotated: the file it points to is the user's to manage. Location
 Services access is requested only when a hotspot is saved or a session starts
 with one configured; it is used to read Wi-Fi network names and the app never

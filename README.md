@@ -423,11 +423,20 @@ Other content there (other bytes, a record of other bytes cut short, more than
 starts or resumes a session. A record's first bytes are also the first bytes of
 a later session's record, so a start empties everything but a record of the
 saved session it replaces before it writes its own. A lock file that cannot be
-read counts as the end of the saved session, since it may hold one, and no
-writer writes over it. When the lock file takes no write either, the end goes
-into `insomnia.log` as one line holding the saved session's bytes. A line that
-lacks only its newline at the end of the log counts too, so every writer of the
-log puts a newline first when the log does not end in one. It counts only once
+read on three tries 0.1 s apart counts as the end of the saved session, since
+it may hold one, and no writer writes over it. That rule keeps to the safe
+side and is no proof: a lock file that holds no record but keeps failing to
+read (an I/O error) ends a session nobody ended. When the log holds a record of
+that session, the app and the agent name the log instead. When the lock file
+takes no write either, the end goes into `insomnia.log` as one line holding the
+saved session's bytes. A line that lacks only its newline at the end of the log
+counts too, so Insomnia's writers of the log (the app, the agent and its
+LaunchAgent) put a newline first when the log does not end in one, and hold
+flock(2) on the log from that check until their line is written. An ordinary
+line they cannot lock in time waits in memory in the app and goes to standard
+error from the agent; a record they cannot lock in time is not written. A
+process that appends without that lock can still join a line to a record that
+already read back, and that record then ends nothing. A record counts only once
 it reads back as a whole line, a saved session over 64 KiB is never recorded
 there, and a log that cannot be read or is over 64 MiB holds no record for the
 app or the agent. The app rotates that log only while it holds the recovery
@@ -674,8 +683,13 @@ app will keep working while the lid is closed.
 Configuration lives in `~/Library/Application Support/Insomnia/config.json`.
 Use Settings for the app's controls; [Config.swift](Sources/Insomnia/Model/Config.swift)
 defines the full configuration and defaults. The backstop reads the end
-floor and thermal setting from the file directly, so the file decides those
-two for both. The app checks it whenever it starts, extends or ends a
+floor and thermal setting from the file too, through the installed app's
+decoder, or with its own reader when that binary cannot answer, so the file
+decides those two for both. Its own reader takes a hand edit only in a form it
+can read as the app does: it does not use a file over 8 MiB, one it cannot
+finish reading within 30 s, or one on which the app's decoder stops, and then
+uses the values the app recorded for the session, or a stopgap where there are
+none (spec section 6). The app checks it whenever it starts, extends or ends a
 session, and every second while one runs with the lid open: a hand edit to
 either value is taken into the app, and a change to either in Settings that
 cannot be saved does not take effect (Settings says why). If a hand edit
