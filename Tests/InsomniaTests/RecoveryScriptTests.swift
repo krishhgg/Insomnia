@@ -798,14 +798,22 @@ final class RecoveryScriptTests: XCTestCase {
         for script in [fx.backstop, fx.uninstall] {
             let text = try String(contentsOf: script, encoding: .utf8)
             var functions = ""
-            for name in ["extract", "epoch_of", "epoch_at"] {
+            // uninstall.sh's extract reads through plutil_read, which keeps
+            // plutil's stderr in $WORK and lists a failed read in
+            // READ_FAILURES; none of these reads may fail.
+            var names = ["extract", "epoch_of", "epoch_at"]
+            if text.contains("\nplutil_read() {") { names.insert("plutil_read", at: 0) }
+            for name in names {
                 let start = try XCTUnwrap(text.range(of: "\n\(name)() {"), "\(name) in \(script.lastPathComponent)")
                 let end = try XCTUnwrap(text.range(of: "\n}\n", range: start.upperBound..<text.endIndex))
                 functions += text[start.lowerBound..<end.upperBound]
             }
+            let work = fx.root.appendingPathComponent("work.\(script.lastPathComponent)", isDirectory: true)
+            try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
             let harness = fx.root.appendingPathComponent("epoch_at.\(script.lastPathComponent)")
-            try ("set -euo pipefail\nPLUTIL=/usr/bin/plutil\nDATE=/bin/date" + functions
-                + #"for f in "$@"; do printf '[%s]\n' "$(epoch_at "$f" endsAt)"; done"# + "\n")
+            try ("set -euo pipefail\nPLUTIL=/usr/bin/plutil\nDATE=/bin/date\nWORK='\(work.path)'\nREAD_FAILURES=\"$WORK/read.failures\"\n: > \"$READ_FAILURES\"" + functions
+                + #"for f in "$@"; do printf '[%s]\n' "$(epoch_at "$f" endsAt)"; done"# + "\n"
+                + #"if [[ -s "$READ_FAILURES" ]]; then /bin/cat "$READ_FAILURES" >&2; exit 3; fi"# + "\n")
                 .write(to: harness, atomically: true, encoding: .utf8)
 
             let r = try fx.run(harness, files)
@@ -1268,7 +1276,7 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(fx.calls(), ["sudo -n \(fx.fakePmset) -a disablesleep 0"])
         XCTAssertEqual(fx.markerAtSudo(), ["absent"], "the marker must be gone before pmset runs")
         XCTAssertFalse(fx.exists(fx.session))
-        XCTAssertTrue(fx.log().contains("pending-start; a password dialog left from an abandoned start can no longer turn sleep off"), fx.log())
+        XCTAssertTrue(fx.log().contains("pending-start; a command a password dialog left from an abandoned start runs stops at its marker check from now on, unless this user writes the marker again or the clock is set back"), fx.log())
 
         let late = try runRootCommand(marker: fx.pendingStart, nonce: nonce, in: fx.root)
         XCTAssertEqual(late.status, 69, late.stderr)
@@ -1285,7 +1293,7 @@ final class RecoveryScriptTests: XCTestCase {
         let nonce = UUID().uuidString
         try Data(nonce.utf8).write(to: fx.pendingStart)
         try fx.writeReceipt()
-        let command = try RootCommandProcess(marker: fx.pendingStart, nonce: nonce, receipts: SleepOffReceipts(folder: fx.receipts, owners: [0, getuid()], user: getuid()), in: fx.root, holdAt: RootCommandProcess.write)
+        let command = try RootCommandProcess(marker: fx.pendingStart, nonce: nonce, receipts: fx.swiftReceipts, in: fx.root, holdAt: RootCommandProcess.write)
         defer { command.release() }
         XCTAssertTrue(command.waitUntilPmsetRuns())
 
@@ -1660,7 +1668,7 @@ final class RecoveryScriptTests: XCTestCase {
 
         XCTAssertEqual(r.status, 0, r.stderr)
         try assertSettled(sleepRestored: true)
-        XCTAssertTrue(fx.log().contains("as one that may have turned sleep off (\(fx.receipt) shows that the command went on to turn sleep off)"), fx.log())
+        XCTAssertTrue(fx.log().contains("as one that may have turned sleep off (\(fx.receipt) holds that start's writing line: its command was about to turn sleep off and may have)"), fx.log())
         let tools = fx.toolCalls()
         XCTAssertTrue(tools.contains("head -c 83"), "\(tools)")
         XCTAssertTrue(tools.contains("head -c 43 \(fx.released)"), "\(tools)")
@@ -1707,7 +1715,7 @@ final class RecoveryScriptTests: XCTestCase {
         let nonce = try journalUnfinishedStart(expiresIn: 60)
         let copy = fx.receipts + "/copy"
         try Data(SleepOffReceipts.initialContent.utf8).write(to: URL(fileURLWithPath: copy))
-        XCTAssertEqual(chmod(copy, 0o644), 0)
+        XCTAssertEqual(chmod(copy, 0o600), 0)
         XCTAssertEqual(rename(copy, fx.receipt), 0)
 
         let r = try fx.run(fx.backstop)
@@ -1765,7 +1773,7 @@ final class RecoveryScriptTests: XCTestCase {
             }, { unlink(self.fx.receipt); unlink(self.fx.receipts + "/target") }, "is missing, is not the 82-byte file"),
             ("a writable folder", { XCTAssertEqual(chmod(self.fx.receipts, 0o775), 0) }, { chmod(self.fx.receipts, 0o755) }, "someone other than root can change it or a folder above it"),
             ("an allow entry on the receipt", { XCTAssertEqual(try self.fx.runTool("/bin/chmod", ["+a", "user:\(user) allow write", self.fx.receipt]).status, 0) },
-             { _ = try self.fx.runTool("/bin/chmod", ["-N", self.fx.receipt]) }, "has an access control entry that allows changes"),
+             { _ = try self.fx.runTool("/bin/chmod", ["-N", self.fx.receipt]) }, "does not have exactly one access control entry, the one that lets uid \(getuid()) read it and nothing else"),
             ("an allow entry on the folder", { XCTAssertEqual(try self.fx.runTool("/bin/chmod", ["+a", "user:\(user) allow add_file", self.fx.receipts]).status, 0) },
              { _ = try self.fx.runTool("/bin/chmod", ["-N", self.fx.receipts]) }, "has an access control entry that allows changes"),
         ]
@@ -1791,6 +1799,109 @@ final class RecoveryScriptTests: XCTestCase {
             try c.repair()
             if c.name == "missing" || c.name == "83 bytes" { unlink(fx.receipt) }
         }
+    }
+
+    /// F3 (round 28). A receipt with a mode other than 600, any list of
+    /// access control entries but the one install.sh adds, or a list ls
+    /// cannot read shows nothing: sleep is restored and the start stays
+    /// journaled with its claim, and the run changes neither the receipt
+    /// nor its list. The lists are stand-ins the scripts' ls shows
+    /// (ScriptFixture.receiptEntries); no real list changes.
+    func testBackstopTrustsOnlyAReceiptOfModeSixHundredWithTheEntryInstallShAdds() throws {
+        let mine = [AccessEntry.installed(for: getuid())]
+        let mode = "is missing, is not the 82-byte file install.sh made, mode 600, or someone other than root can change it or a folder above it"
+        let list = "\(fx.receipt) does not have exactly one access control entry, the one that lets uid \(fx.uid) read it and nothing else, or its list could not be read"
+        var cases: [(name: String, mode: mode_t, entries: [AccessEntry], listFails: Bool, says: String)] = [0o644, 0o640, 0o400].map { ("mode \(String($0, radix: 8))", $0, mine, false, mode) }
+        cases += TestReceipts.refusedLists.map { ($0.name, 0o600, $0.entries, false, list) }
+        cases.append(("a list ls cannot read", 0o600, mine, true, list))
+        let fails = fx.receiptEntries + ".fails"
+        for c in cases {
+            try? FileManager.default.removeItem(at: fx.logFile)
+            fx.clearCalls()
+            let nonce = try journalUnfinishedStart()
+            XCTAssertEqual(chmod(fx.receipt, c.mode), 0, c.name)
+            try fx.writeReceiptEntries(c.entries)
+            if c.listFails { XCTAssertTrue(FileManager.default.createFile(atPath: fails, contents: nil)) }
+            let before = [(try? fx.runTool("/bin/ls", ["-lde", fx.receipts, fx.receipt]).output) ?? "", fx.receiptText() ?? "", (try? String(contentsOfFile: fx.receiptEntries, encoding: .utf8)) ?? ""]
+
+            let r = try fx.run(fx.backstop)
+
+            try assertKept(r, nonce: nonce, restored: true, saying: [c.says, "an unfinished start could not be settled: "])
+            let after = [(try? fx.runTool("/bin/ls", ["-lde", fx.receipts, fx.receipt]).output) ?? "", fx.receiptText() ?? "", (try? String(contentsOfFile: fx.receiptEntries, encoding: .utf8)) ?? ""]
+            XCTAssertEqual(after, before, "\(c.name): the run changes nothing about the receipt, its list or its folder")
+            unlink(fails)
+            XCTAssertEqual(chmod(fx.receipt, 0o600), 0)
+            try fx.writeReceiptEntries(mine)
+        }
+        // The control: the same start with the receipt as install.sh makes it.
+        try? FileManager.default.removeItem(at: fx.logFile)
+        fx.clearCalls()
+        try journalUnfinishedStart()
+        let r = try fx.run(fx.backstop)
+        XCTAssertEqual(r.status, 0, r.stderr)
+        try assertSettled(sleepRestored: false)
+    }
+
+    /// F3 (round 28). backstop.sh, uninstall.sh, install.sh and the root
+    /// command (both copies) read the receipt's list with one awk program.
+    /// Fed listings in ls's shapes (file_cmds ls/print.c, TestReceipts.lsText)
+    /// through the real awk, it prints a name only for exactly ` 0:
+    /// user:<name> allow read`, alone, under a regular file's line. Each
+    /// caller then requires `id -u -- <name>` to be the uid, which the
+    /// real id(1) answers here for this user and for daemon.
+    func testEveryCopyReadsTheReceiptsListWithOneProgram() throws {
+        let reader = "NR == 1 { k = /^-/ }; NR == 2 && k && /^ 0: user:[^ :]+ allow read$/ { n = substr($2, 6) }; END { if (NR == 2) print n }"
+        var copies = try ["backstop.sh", "uninstall.sh", "install.sh"].map { try String(contentsOf: ScriptFixture.productionScripts.appendingPathComponent($0), encoding: .utf8) }
+        copies += [AdministratorPrompt.rootCommand, try appleScriptEmbeddedRootCommand()]
+        for (i, copy) in copies.enumerated() {
+            XCTAssertEqual(copy.components(separatedBy: "/usr/bin/awk '\(reader)'").count - 1, 1, "copy \(i)")
+        }
+        let me = String(cString: getpwuid(getuid()).pointee.pw_name)
+        let head = "-rw-------+ 1 root  wheel  82 Oct  8 12:00 /private/var/db/com.kgarg.insomnia/\(getuid())"
+        func entries(_ lines: [String]) -> String { ([head] + lines.enumerated().map { " \($0.offset): \($0.element)" }).joined(separator: "\n") }
+        var cases: [(String, String)] = [
+            (entries(["user:\(me) allow read"]), me),
+            (entries(["user:daemon allow read"]), "daemon"),
+            (entries([]), ""),
+            ("", ""),
+            ("d" + entries(["user:\(me) allow read"]).dropFirst(), ""),
+            ("l" + entries(["user:\(me) allow read"]).dropFirst(), ""),
+            (head + "\n 1: user:\(me) allow read", ""),
+            (head + "\n 0: user:\(me) allow read ", ""),
+            (head + "\n  0: user:\(me) allow read", ""),
+            (head + "\n 0: user:\(me)  allow read", ""),
+            (head + "\n 0: user:a:b allow read", ""),
+            (head + "\n 0: user: allow read", ""),
+            (head + "\n 0: user:\(me) allow readattr", ""),
+            (head + "\n 0: user:\(me) allow read\n", ""),
+            (entries(["user:\(me) allow read", "user:\(me) allow read"]), ""),
+        ]
+        for list in TestReceipts.refusedLists {
+            let lines = list.entries.map(TestReceipts.lsText)
+            cases.append((entries(lines), lines == ["user:daemon allow read"] ? "daemon" : ""))
+        }
+        let input = fx.root.appendingPathComponent("listing")
+        for (listing, name) in cases {
+            try Data((listing + "\n").utf8).write(to: input)
+            let p = Process()
+            let out = Pipe()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/awk")
+            p.arguments = [reader]
+            p.environment = ["LC_ALL": "C"]
+            p.standardInput = try FileHandle(forReadingFrom: input)
+            p.standardOutput = out
+            let exit = ProcessExit(p)
+            try p.run()
+            let printed = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+            exit.wait()
+            XCTAssertEqual(p.terminationStatus, 0, listing)
+            // Each caller reads it through $(...), which drops the
+            // newline, and then requires a name: a refused list prints an
+            // empty line or nothing.
+            XCTAssertTrue(printed == name + "\n" || (name.isEmpty && printed.isEmpty), "\(listing): \(printed.debugDescription)")
+        }
+        XCTAssertEqual(try fx.runTool("/usr/bin/id", ["-u", "--", me]).output.trimmingCharacters(in: .whitespacesAndNewlines), fx.uid)
+        XCTAssertEqual(try fx.runTool("/usr/bin/id", ["-u", "--", "daemon"]).output.trimmingCharacters(in: .whitespacesAndNewlines), "1")
     }
 
     /// The marker decides nothing: the receipt does. A marker that is
@@ -1839,7 +1950,7 @@ final class RecoveryScriptTests: XCTestCase {
     /// and a late answer to the dialog finds no marker and writes nothing.
     func testBackstopSettlesAStartOnlyOnceTheCommandBehindItsDialogIsDone() throws {
         let nonce = try journalUnfinishedStart(endsIn: -60)
-        let command = try RootCommandProcess(marker: fx.pendingStart, nonce: nonce, receipts: SleepOffReceipts(folder: fx.receipts, owners: [0, getuid()], user: getuid()), in: fx.root, holdAt: RootCommandProcess.write)
+        let command = try RootCommandProcess(marker: fx.pendingStart, nonce: nonce, receipts: fx.swiftReceipts, in: fx.root, holdAt: RootCommandProcess.write)
         defer { command.release() }
         XCTAssertTrue(command.waitUntilPmsetRuns())
 
@@ -1855,9 +1966,9 @@ final class RecoveryScriptTests: XCTestCase {
 
         XCTAssertEqual(again.status, 0, again.stderr)
         try assertSettled(sleepRestored: true)
-        XCTAssertTrue(fx.log().contains("shows that the command went on to turn sleep off"), fx.log())
+        XCTAssertTrue(fx.log().contains("holds that start's writing line: its command was about to turn sleep off and may have"), fx.log())
 
-        let late = try runRootCommand(marker: fx.pendingStart, nonce: nonce, receipts: SleepOffReceipts(folder: fx.receipts, owners: [0, getuid()], user: getuid()), in: fx.root)
+        let late = try runRootCommand(marker: fx.pendingStart, nonce: nonce, receipts: fx.swiftReceipts, in: fx.root)
         XCTAssertNotEqual(late.status, 0, late.stderr)
         XCTAssertEqual(late.pmsetCalls, [], "a late answer turns nothing off")
         XCTAssertEqual(fx.receiptText(), receiptLine(nonce, "writing"), "and records nothing")
@@ -1948,14 +2059,14 @@ final class RecoveryScriptTests: XCTestCase {
         }
     }
 
-    /// F6: a `head` and a `cat` first in PATH that would forge the
+    /// F6: a `head`, a `cat` and a `tr` first in PATH that would forge the
     /// receipt's line (this start's `refused`), a claim already given back,
-    /// and an unreadable session.json. The run reads the receipt, the
-    /// release file and session.json through its fixed HEAD and CAT only:
-    /// the start is undone as its real line says, its real claim is given
-    /// back and its session goes. The bare `head` the script inherited (the
-    /// journal's shape check) does reach the PATH one, which shows that
-    /// PATH was in effect.
+    /// an unreadable session.json and JSON files that do not start with
+    /// "{". The run reads the receipt, the release file, session.json and
+    /// the journal through its fixed HEAD, CAT and TR only (round 28,
+    /// finding 5: no bare one is left): the start is undone as its real
+    /// line says, its real claim is given back and its session goes. The
+    /// PATH the fixed tools were given shows that PATH was in effect.
     func testBackstopSettlesThroughItsOwnToolsWhateverPathHolds() throws {
         let nonce = try journalUnfinishedStart()
         try fx.writeReceipt(receiptLine(nonce, "writing"))
@@ -1965,12 +2076,12 @@ final class RecoveryScriptTests: XCTestCase {
 
         XCTAssertEqual(r.status, 0, r.stderr)
         try assertSettled(sleepRestored: true)
-        XCTAssertTrue(fx.log().contains("shows that the command went on to turn sleep off"), fx.log())
+        XCTAssertTrue(fx.log().contains("holds that start's writing line: its command was about to turn sleep off and may have"), fx.log())
         XCTAssertTrue(fx.log().contains("removed \(fx.session.path): its start never finished"), fx.log())
         XCTAssertEqual(try movedAsideSessions(), [])
-        let hostileCalls = fx.hostileCalls()
-        XCTAssertFalse(hostileCalls.contains { $0.hasPrefix("head -c 83") || $0.hasPrefix("head -c 43") || $0.hasPrefix("cat \(fx.session.path)") }, "\(hostileCalls)")
-        XCTAssertTrue(hostileCalls.contains("head -c 1"), "the PATH ones were found: \(hostileCalls)")
+        XCTAssertEqual(fx.hostileCalls(), [], "no head, cat or tr is taken from PATH")
+        XCTAssertFalse(fx.toolPaths().isEmpty)
+        XCTAssertTrue(fx.toolPaths().allSatisfy { $0.hasPrefix(hostile + ":") }, "PATH was in effect: \(fx.toolPaths())")
         let tools = fx.toolCalls()
         XCTAssertTrue(tools.contains("head -c 83") && tools.contains("head -c 43 \(fx.released)") && tools.contains("cat \(fx.session.path)"), "\(tools)")
     }
@@ -2206,7 +2317,7 @@ final class RecoveryScriptTests: XCTestCase {
         let r = try fx.run(fx.uninstall)
 
         XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
-        XCTAssertTrue(r.stdout.contains("settling an unfinished start as one that may have turned sleep off (\(fx.receipt) shows that the command went on to turn sleep off)"), r.stdout)
+        XCTAssertTrue(r.stdout.contains("settling an unfinished start as one that may have turned sleep off (\(fx.receipt) holds that start's writing line: its command was about to turn sleep off and may have)"), r.stdout)
         XCTAssertTrue(fx.calls().contains("sudo -n \(fx.fakePmset) -a disablesleep 0"), "\(fx.calls())")
         XCTAssertFalse(fx.exists(fx.session))
         XCTAssertFalse(FileManager.default.fileExists(atPath: fx.receipts))
@@ -2315,10 +2426,12 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: fx.receipts))
     }
 
-    /// F6 for uninstall.sh: the same hostile `head` and `cat` first in
-    /// PATH. The start is settled from the real receipt and release file,
-    /// its session goes, its backstop restores sleep, and the receipt and
-    /// release file are removed, as the real claim was given back.
+    /// F6 for uninstall.sh: the same hostile `head`, `cat` and `tr` first
+    /// in PATH. The start is settled from the real receipt and release
+    /// file, its session goes, its backstop restores sleep, and the receipt
+    /// and release file are removed, as the real claim was given back. No
+    /// file is read through a tool from PATH; a bare `cat` prints only this
+    /// script's own messages.
     func testUninstallSettlesThroughItsOwnToolsWhateverPathHolds() throws {
         try fx.installMachinery()
         let nonce = try journalUnfinishedStart()
@@ -2328,16 +2441,77 @@ final class RecoveryScriptTests: XCTestCase {
         let r = try fx.run(fx.uninstall, extraEnvironment: ["PATH": fx.path(first: hostile)])
 
         XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
-        XCTAssertTrue(r.stdout.contains("settling an unfinished start as one that may have turned sleep off (\(fx.receipt) shows that the command went on to turn sleep off)"), r.stdout)
+        XCTAssertTrue(r.stdout.contains("settling an unfinished start as one that may have turned sleep off (\(fx.receipt) holds that start's writing line: its command was about to turn sleep off and may have)"), r.stdout)
         XCTAssertTrue(r.stdout.contains("removed \(fx.session.path): its start never finished"), r.stdout)
         XCTAssertTrue(fx.calls().contains("sudo -n \(fx.fakePmset) -a disablesleep 0"), "\(fx.calls())")
         XCTAssertTrue(fx.calls().contains("sudo /bin/rm -f \(fx.released)"), "\(fx.calls())")
         XCTAssertFalse(FileManager.default.fileExists(atPath: fx.receipts))
-        let hostileCalls = fx.hostileCalls()
-        XCTAssertFalse(hostileCalls.contains { $0.hasPrefix("head -c 83") || $0.hasPrefix("head -c 43") || $0.hasPrefix("cat \(fx.session.path)") }, "\(hostileCalls)")
-        XCTAssertTrue(hostileCalls.contains("head -c 1"), "the PATH ones were found: \(hostileCalls)")
+        XCTAssertEqual(fx.hostileCalls(), [], "no file is read through a head, cat or tr from PATH")
+        XCTAssertFalse(fx.toolPaths().isEmpty)
+        XCTAssertTrue(fx.toolPaths().allSatisfy { $0.hasPrefix(hostile + ":") }, "PATH was in effect: \(fx.toolPaths())")
         let tools = fx.toolCalls()
         XCTAssertTrue(tools.contains("head -c 83") && tools.contains("head -c 43 \(fx.released)") && tools.contains("cat \(fx.session.path)"), "\(tools)")
+    }
+
+    /// Round 28, finding 5: the reads of session.json and the journal
+    /// outside the settlement go through the fixed CAT, HEAD and TR too.
+    /// With the hostile tools first in PATH, a session that is still valid
+    /// is kept and nothing is undone, where a bare `cat` that failed or a
+    /// bare `tr` or `head` that misread the file made it unreadable or
+    /// malformed, so treated as expired. An expired one is undone and the
+    /// journal published after the undo is checked through HEAD, where a
+    /// bare `head` that misread it kept the journal from being published.
+    func testBackstopReadsTheSessionAndPublishesTheJournalThroughItsOwnTools() throws {
+        for valid in [true, false] {
+            let label = valid ? "valid session" : "expired session"
+            let f = try ScriptFixture()
+            defer { f.destroy() }
+            try f.writeSession(endsAt: Date(timeIntervalSinceNow: valid ? 3600 : -60))
+            let session = try Data(contentsOf: f.session)
+            try f.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+            let hostile = try f.writeHostileTools(forging: UUID().uuidString)
+
+            let r = try f.run(f.backstop, extraEnvironment: ["PATH": f.path(first: hostile)])
+
+            XCTAssertEqual(r.status, 0, "\(label): \(r.stderr + f.log())")
+            XCTAssertEqual(f.hostileCalls(), [], label)
+            XCTAssertTrue(!f.toolPaths().isEmpty && f.toolPaths().allSatisfy { $0.hasPrefix(hostile + ":") }, "\(label): \(f.toolPaths())")
+            let tools = f.toolCalls()
+            XCTAssertTrue(tools.contains("cat \(f.session.path)") && tools.contains("tr -d") && tools.contains("head -c 1"), "\(label): \(tools)")
+            if valid {
+                XCTAssertEqual(f.calls(), [], label)
+                XCTAssertEqual(try Data(contentsOf: f.session), session, label)
+                XCTAssertEqual(try f.stateJSON()["sleepDisabledByUs"] as? Bool, true, label)
+                XCTAssertFalse(f.log().contains("cannot be read") || f.log().contains("unreadable") || f.log().contains("disablesleep"), "\(label): \(f.log())")
+            } else {
+                XCTAssertEqual(f.calls(), ["sudo -n \(f.fakePmset) -a disablesleep 0"], label)
+                XCTAssertFalse(f.exists(f.session), label)
+                XCTAssertEqual(try f.stateJSON()["sleepDisabledByUs"] as? Bool, false, label)
+                XCTAssertTrue(tools.contains { $0.hasPrefix("head -c 1 ") && $0.contains(".state.json.backstop.") }, "\(label): \(tools)")
+            }
+        }
+    }
+
+    /// Round 28, finding 5, for uninstall.sh: the session.json its own
+    /// journal check finds is read through CAT, HEAD and TR, so with the
+    /// hostile tools first in PATH it is named as a session still present,
+    /// not as one that cannot be read or is not a session.
+    func testUninstallReadsALeftoverSessionThroughItsOwnTools() throws {
+        try fx.installMachinery()
+        try "#!/bin/bash\nexit 0\n".write(to: fx.backstop, atomically: true, encoding: .utf8)
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: 3600))
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        let hostile = try fx.writeHostileTools(forging: UUID().uuidString)
+
+        let r = try fx.run(fx.uninstall, ["--purge"], extraEnvironment: ["PATH": fx.path(first: hostile)])
+
+        XCTAssertNotEqual(r.status, 0)
+        XCTAssertTrue(r.stderr.contains("  - session.json is still present\n"), r.stderr)
+        XCTAssertFalse(r.stderr.contains("session.json is still present and cannot be read") || r.stderr.contains("session.json is still present and is not a session"), r.stderr)
+        XCTAssertEqual(fx.hostileCalls(), [])
+        let tools = fx.toolCalls()
+        XCTAssertTrue(tools.contains("cat \(fx.session.path)") && tools.contains("tr -d") && tools.contains("head -c 1"), "\(tools)")
+        try assertNothingRemoved(fx, state: nil, "leftover session")
     }
 
     /// R25-1 for uninstall.sh: a record whose decision a settlement
@@ -2369,24 +2543,6 @@ final class RecoveryScriptTests: XCTestCase {
         }
     }
 
-    /// A receipt folder someone other than root could change is left with
-    /// everything in it, and nothing about it is changed.
-    func testUninstallLeavesAReceiptFolderSomeoneElseCouldChange() throws {
-        try fx.installMachinery()
-        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
-        try fx.writeReceipt()
-        XCTAssertEqual(chmod(fx.receipts, 0o775), 0)
-
-        let r = try fx.run(fx.uninstall)
-
-        XCTAssertTrue(r.stderr.contains("Left \(fx.receipts) and what is in it"), r.stderr)
-        XCTAssertTrue(FileManager.default.fileExists(atPath: fx.receipt))
-        XCTAssertFalse(fx.calls().contains { $0.contains(fx.receipts) }, "nothing in it is touched as root: \(fx.calls())")
-        var info = stat()
-        XCTAssertEqual(lstat(fx.receipts, &info), 0)
-        XCTAssertEqual(info.st_mode & 0o7777, 0o775)
-    }
-
     /// Another account's receipt keeps the folder; this account's receipt
     /// and release file go.
     func testUninstallKeepsTheReceiptFolderWhileAnotherAccountsReceiptIsInIt() throws {
@@ -2405,37 +2561,92 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(r.stdout.contains("kept \(fx.receipts): it still holds another account's receipt"), r.stdout)
     }
 
-    /// F1: every Insomnia folder of this user (INSOMNIA_HOME) shares the
-    /// receipt. A start of another folder that is not settled yet claims it
-    /// in the release file, and its settlement needs the receipt's line:
-    /// both files stay, with a message, and the uninstall exits 1 once the
-    /// rest is removed.
-    func testUninstallKeepsTheReceiptWhileAStartOfAnotherFolderClaimsIt() throws {
-        try fx.installMachinery()
-        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
-        let other = UUID().uuidString
-        try fx.writeReceipt(receiptLine(other, "writing"))
-        try fx.writeRelease("\(other) held\n")
+    // MARK: Round 28 (finding 2): what every Insomnia folder of this user shares
 
-        let r = try fx.run(fx.uninstall)
+    /// A journal of this folder with nothing to undo.
+    private let cleanJournal = #"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#
 
-        XCTAssertEqual(r.status, 1, r.stdout)
-        XCTAssertTrue(r.stderr.contains("Left \(fx.receipt) and \(fx.released): \(fx.released) shows that a start from another Insomnia folder of this user (\(other) held) is not settled yet, and the receipt is what settles it."), r.stderr)
-        XCTAssertEqual(fx.receiptText(), receiptLine(other, "writing"))
-        XCTAssertEqual(fx.release(), "\(other) held\n")
-        // The folder's rmdir is tried and fails, as it holds the receipt.
-        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("sudo /bin/rm -f ") && $0.contains(fx.receipts) }, "\(fx.calls())")
-        XCTAssertTrue(r.stdout.contains("kept \(fx.receipts)"), r.stdout)
-        XCTAssertFalse(fx.exists(fx.sudoers), "the rest of the install is removed")
+    /// Asserts the uninstall stopped before removing anything, saying
+    /// `saying`: exit 1, launchctl never asked to boot the agent out, sudo
+    /// asked to remove nothing, and the rule, the agent plist, the bundle
+    /// with its sealed backstop.sh, the journal, the receipt and the
+    /// release file all as they were.
+    private func assertUninstallRemovedNothing(_ r: (status: Int32, stdout: String, stderr: String), saying: String, journal: Data, receipt: String?, release: String?, file: StaticString = #filePath, line: UInt = #line) throws {
+        XCTAssertEqual(r.status, 1, r.stdout + r.stderr, file: file, line: line)
+        XCTAssertTrue(r.stderr.contains("Uninstall stopped BEFORE removing anything: \(saying)."), r.stderr, file: file, line: line)
+        XCTAssertTrue(r.stderr.contains("The LaunchAgent, \(fx.sudoers.path), \(fx.app.path), the receipt and the journal were kept."), r.stderr, file: file, line: line)
+        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("launchctl bootout") }, "\(fx.calls())", file: file, line: line)
+        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("sudo /bin/rm") || $0.hasPrefix("sudo /bin/rmdir") }, "\(fx.calls())", file: file, line: line)
+        XCTAssertTrue(fx.exists(fx.sudoers), "the rule that turns sleep back on stays", file: file, line: line)
+        XCTAssertTrue(fx.exists(fx.plist), "the agent stays", file: file, line: line)
+        XCTAssertTrue(fx.exists(fx.installedBackstop), "the bundle and its sealed backstop.sh stay", file: file, line: line)
+        XCTAssertEqual(try Data(contentsOf: fx.state), journal, file: file, line: line)
+        XCTAssertTrue(fx.exists(fx.config), file: file, line: line)
+        XCTAssertTrue(fx.exists(fx.logFile), file: file, line: line)
+        XCTAssertEqual(fx.receiptText(), receipt, file: file, line: line)
+        XCTAssertEqual(fx.release(), release, file: file, line: line)
     }
 
-    /// F2: a receipt that stays locked (here by this test, as the root
-    /// command behind a dialog or another folder's settlement would hold
-    /// it) is left with its release file, and the uninstall exits 1.
-    func testUninstallKeepsTheReceiptWhileItIsLocked() throws {
+    /// Finding 2, with two Insomnia folders of this user. This folder's
+    /// journal is clean, and a start of the other folder claims the
+    /// receipt: its app has exited, so no Insomnia process runs, and its
+    /// journal is in a folder this uninstall never sees. Whether the
+    /// receipt shows that start's `writing` or `refused`, the uninstall
+    /// stops before removing anything. The other folder's recovery agent
+    /// can then still settle that start and, where the receipt shows its
+    /// command may have turned sleep off, restore sleep through the rule
+    /// (the fake sudo runs the restore only while the rule is there). Once
+    /// that start is settled, the uninstall removes everything.
+    func testUninstallRemovesNothingWhileAStartOfAnotherFolderClaimsTheReceipt() throws {
+        for word in ["writing", "refused"] {
+            try? FileManager.default.removeItem(at: fx.installedBackstop)
+            try fx.installMachinery()
+            fx.clearCalls()
+            FileManager.default.createFile(atPath: fx.root.appendingPathComponent("sudo.needs-rule").path, contents: nil)
+            // The other folder's journal: what journalUnfinishedStart
+            // writes, moved to a folder of its own.
+            let other = fx.root.appendingPathComponent("other-\(word)", isDirectory: true)
+            try FileManager.default.createDirectory(at: other, withIntermediateDirectories: true)
+            let nonce = try journalUnfinishedStart(marker: .gone, session: false)
+            try FileManager.default.moveItem(at: fx.state, to: other.appendingPathComponent("state.json"))
+            try fx.writeState(cleanJournal)
+            try fx.writeReceipt(receiptLine(nonce, word))
+            let journal = try Data(contentsOf: fx.state)
+
+            let r = try fx.run(fx.uninstall)
+
+            try assertUninstallRemovedNothing(r, saying: "\(fx.released) shows that a start (\(nonce)) claims the receipt and is not settled yet", journal: journal, receipt: receiptLine(nonce, word), release: "\(nonce) held\n")
+            XCTAssertTrue(r.stderr.contains("Open Insomnia from that folder or let its recovery agent run, then rerun."), r.stderr)
+
+            fx.clearCalls()
+            let settle = try fx.run(fx.backstop, extraEnvironment: ["INSOMNIA_HOME": other.path])
+
+            XCTAssertEqual(settle.status, 0, "\(word): \(settle.stderr)")
+            XCTAssertEqual(fx.calls(), word == "writing" ? ["sudo -n \(fx.fakePmset) -a disablesleep 0"] : [], word)
+            let settled = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(contentsOf: other.appendingPathComponent("state.json"))) as? [String: Any])
+            XCTAssertNil(settled["sleepOffAttempt"], word)
+            XCTAssertEqual(settled["sleepDisabledByUs"] as? Bool, false, word)
+            XCTAssertEqual(fx.release(), "\(nonce) free\n", word)
+
+            fx.clearCalls()
+            let again = try fx.run(fx.uninstall)
+
+            XCTAssertEqual(again.status, 0, "\(word): \(again.stderr + again.stdout)")
+            XCTAssertFalse(fx.exists(fx.sudoers), word)
+            XCTAssertFalse(fx.exists(fx.app), word)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: fx.receipts), word)
+        }
+    }
+
+    /// The receipt stays locked (here by this test, as the root command
+    /// behind another folder's dialog or that folder's settlement would
+    /// hold it): what that command does is not known, so the uninstall
+    /// stops before removing anything.
+    func testUninstallRemovesNothingWhileTheReceiptIsLocked() throws {
         try fx.installMachinery()
-        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        try fx.writeState(cleanJournal)
         try fx.writeReceipt()
+        let journal = try Data(contentsOf: fx.state)
         let fd = open(fx.receipt, O_RDONLY)
         XCTAssertGreaterThanOrEqual(fd, 0)
         defer { close(fd) }
@@ -2443,19 +2654,239 @@ final class RecoveryScriptTests: XCTestCase {
 
         let r = try fx.run(fx.uninstall)
 
-        XCTAssertEqual(r.status, 1, r.stdout)
-        XCTAssertTrue(r.stderr.contains("Left \(fx.receipt) and \(fx.released): \(fx.receipt) stayed locked for 1 s"), r.stderr)
-        XCTAssertTrue(FileManager.default.fileExists(atPath: fx.receipt))
-        XCTAssertEqual(fx.release(), SleepOffReceipts.initialRelease)
+        try assertUninstallRemovedNothing(r, saying: "\(fx.receipt) stayed locked for 1 s: the command behind a password dialog may be running, or another Insomnia folder of this user, or something else running as this user, is holding it", journal: journal, receipt: SleepOffReceipts.initialContent, release: SleepOffReceipts.initialRelease)
+    }
+
+    /// Release files, receipts and folders that do not show whether a start
+    /// claims the receipt: each stops the uninstall before it removes
+    /// anything.
+    func testUninstallRemovesNothingWhileTheSharedFilesShowNothingItCanTrust() throws {
+        let other = UUID().uuidString
+        let cases: [(name: String, prepare: () throws -> Void, saying: String, receipt: String?, release: String?)] = [
+            ("damaged release file", { try self.fx.writeRelease("short\n") },
+             "\(fx.released) is not the 42-byte file install.sh made. Run install.sh again", SleepOffReceipts.initialContent, "short\n"),
+            ("release file of another nonce", { try self.fx.writeRelease("\(other) free\n") },
+             "\(fx.released) holds \(other) free, not the receipt's own nonce, so it does not show that no start claims the receipt", SleepOffReceipts.initialContent, "\(other) free\n"),
+            ("unreadable release file", { XCTAssertEqual(chmod(self.fx.released, 0), 0) },
+             "\(fx.released) does not hold a nonce and free or held. Run install.sh again", SleepOffReceipts.initialContent, nil),
+            ("damaged receipt", { try self.fx.writeReceipt(String(repeating: "x", count: 81) + "\n") },
+             "\(fx.receipt) does not hold two nonces and writing or refused", String(repeating: "x", count: 81) + "\n", SleepOffReceipts.initialRelease),
+            ("release file that is a folder", {
+                try FileManager.default.removeItem(atPath: self.fx.released)
+                try FileManager.default.createDirectory(atPath: self.fx.released, withIntermediateDirectories: false)
+             }, "\(fx.receipt) or \(fx.released) is not a regular file, so install.sh did not make it", SleepOffReceipts.initialContent, nil),
+            ("receipt folder someone else can change", { XCTAssertEqual(chmod(self.fx.receipts, 0o775), 0) },
+             "\(fx.receipts) or a folder above it is not a folder, or is not root's alone", SleepOffReceipts.initialContent, SleepOffReceipts.initialRelease),
+        ]
+        for c in cases {
+            try? FileManager.default.removeItem(at: fx.installedBackstop)
+            try fx.installMachinery()
+            fx.clearCalls()
+            try fx.writeState(cleanJournal)
+            if FileManager.default.fileExists(atPath: fx.receipts) {
+                chmod(fx.receipts, 0o755)
+                try? FileManager.default.removeItem(atPath: fx.receipts)
+            }
+            try fx.writeReceipt()
+            try c.prepare()
+            let journal = try Data(contentsOf: fx.state)
+
+            let r = try fx.run(fx.uninstall)
+
+            try assertUninstallRemovedNothing(r, saying: c.saying, journal: journal, receipt: c.receipt, release: c.release)
+            if c.name == "unreadable release file" { XCTAssertEqual(chmod(fx.released, 0o600), 0); XCTAssertEqual(fx.release(), SleepOffReceipts.initialRelease) }
+            if c.name == "receipt folder someone else can change" {
+                var info = stat()
+                XCTAssertEqual(lstat(fx.receipts, &info), 0)
+                XCTAssertEqual(info.st_mode & 0o7777, 0o775, "nothing about it is changed")
+                XCTAssertEqual(chmod(fx.receipts, 0o755), 0)
+            }
+        }
+    }
+
+    /// A start of another folder claims the receipt while the uninstall
+    /// waits for the receipt's lock, and lets the lock go: the claim is
+    /// read under the lock, and the uninstall stops before removing
+    /// anything.
+    func testUninstallRemovesNothingWhenAClaimAppearsWhileItWaitsForTheReceiptLock() throws {
+        try fx.installMachinery()
+        try fx.writeState(cleanJournal)
+        try fx.writeReceipt()
+        let journal = try Data(contentsOf: fx.state)
+        let other = UUID().uuidString
+        try fx.claimTheReceiptBeforeItsLock(in: fx.uninstall, nonce: other)
+
+        let r = try fx.run(fx.uninstall)
+
+        try assertUninstallRemovedNothing(r, saying: "\(fx.released) shows that a start (\(other)) claims the receipt and is not settled yet", journal: journal, receipt: SleepOffReceipts.initialContent, release: "\(other) held\n")
+    }
+
+    /// A receipt replaced right after its lock (by root: here a copy with
+    /// the same bytes and mode) is not the file the lock covers: the
+    /// uninstall stops before removing anything.
+    func testUninstallRemovesNothingWhenTheReceiptIsReplacedUnderItsLock() throws {
+        try fx.installMachinery()
+        try fx.writeState(cleanJournal)
+        try fx.writeReceipt()
+        let journal = try Data(contentsOf: fx.state)
+        try fx.swapReceiptAfterItsLock(in: fx.uninstall)
+
+        let r = try fx.run(fx.uninstall)
+
+        try assertUninstallRemovedNothing(r, saying: "\(fx.receipt) was replaced while it was locked", journal: journal, receipt: SleepOffReceipts.initialContent, release: SleepOffReceipts.initialRelease)
+    }
+
+    /// Something that ignores the receipt's lock writes a claim into the
+    /// release file after the check, while the agent is booted out. It is
+    /// seen before the rule goes: the uninstall stops there, with the rule,
+    /// the bundle, the receipt and the journal kept.
+    func testUninstallStopsBeforeTheRuleWhenTheReleaseFileChangesAfterTheCheck() throws {
+        try fx.installMachinery()
+        try fx.writeState(cleanJournal)
+        try fx.writeReceipt()
+        let journal = try Data(contentsOf: fx.state)
+        let other = UUID().uuidString
+        try other.write(to: fx.root.appendingPathComponent("claim.nonce"), atomically: true, encoding: .utf8)
+        fx.setMode("launchctl", "bootout-claims-receipt")
+
+        let r = try fx.run(fx.uninstall)
+
+        XCTAssertEqual(r.status, 1, r.stdout + r.stderr)
+        XCTAssertTrue(r.stderr.contains("Uninstall stopped after removing the LaunchAgent: \(fx.released) changed after it was checked."), r.stderr)
+        XCTAssertTrue(r.stderr.contains("\(fx.sudoers.path), \(fx.app.path), the receipt and the journal were kept."), r.stderr)
+        XCTAssertTrue(fx.exists(fx.sudoers))
+        XCTAssertTrue(fx.exists(fx.installedBackstop))
+        XCTAssertEqual(try Data(contentsOf: fx.state), journal)
+        XCTAssertEqual(fx.receiptText(), SleepOffReceipts.initialContent)
+        XCTAssertEqual(fx.release(), "\(other) held\n")
+        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("sudo /bin/rm") }, "\(fx.calls())")
+    }
+
+    /// The ordinary uninstall, with the receipt as install.sh made it, and
+    /// with the line of another folder's start that is settled (its claim
+    /// given back, "free" with its nonce): the receipt's lock is held from
+    /// the check through the agent's bootout, the rule's removal and the
+    /// receipt's own, and everything goes.
+    func testUninstallHoldsTheReceiptLockFromTheCheckUntilTheSharedFilesAreGone() throws {
+        let settled = UUID().uuidString
+        for (name, line, release) in [("as made", SleepOffReceipts.initialContent, SleepOffReceipts.initialRelease),
+                                      ("settled elsewhere", receiptLine(settled, "writing"), "\(settled) free\n")] {
+            try? FileManager.default.removeItem(at: fx.installedBackstop)
+            try? FileManager.default.removeItem(at: fx.root.appendingPathComponent("receipt-lock.log"))
+            try fx.installMachinery()
+            fx.clearCalls()
+            try fx.writeState(cleanJournal)
+            try fx.writeReceipt(line)
+            try fx.writeRelease(release)
+
+            let r = try fx.run(fx.uninstall)
+
+            XCTAssertEqual(r.status, 0, "\(name): \(r.stderr + r.stdout)")
+            XCTAssertTrue(r.stdout.contains("no start claims \(fx.receipt); it stays locked until the rule, the receipt and the bundle are gone"), "\(name): \(r.stdout)")
+            XCTAssertEqual(fx.receiptLockStates(), [
+                "launchctl bootout held",
+                "sudo rm \(fx.sudoers.path) held",
+                "sudo rm \(fx.receipt) held",
+                "sudo rm \(fx.released) absent",
+            ], name)
+            XCTAssertFalse(fx.exists(fx.sudoers), name)
+            XCTAssertFalse(fx.exists(fx.plist), name)
+            XCTAssertFalse(fx.exists(fx.app), name)
+            XCTAssertFalse(fx.exists(fx.state), name)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: fx.receipts), name)
+        }
+    }
+
+    /// A receipt that fails its own checks (here writable by others) can
+    /// be locked by nobody, and the app and the root command refuse it, so
+    /// no start can claim it: with its release file showing no claim, both
+    /// go, as root, through their fixed paths. With a claim there, the
+    /// uninstall stops before removing anything.
+    func testUninstallRemovesAReceiptNoStartCanClaimOnlyWhileItsReleaseFileShowsNoClaim() throws {
+        for held in [false, true] {
+            try? FileManager.default.removeItem(at: fx.installedBackstop)
+            try fx.installMachinery()
+            fx.clearCalls()
+            try fx.writeState(cleanJournal)
+            if FileManager.default.fileExists(atPath: fx.receipts) { try FileManager.default.removeItem(atPath: fx.receipts) }
+            try fx.writeReceipt()
+            let nonce = String(SleepOffReceipts.initialContent.prefix(36))
+            if held { try fx.writeRelease("\(nonce) held\n") }
+            XCTAssertEqual(chmod(fx.receipt, 0o666), 0)
+            let journal = try Data(contentsOf: fx.state)
+
+            let r = try fx.run(fx.uninstall)
+
+            if held {
+                try assertUninstallRemovedNothing(r, saying: "\(fx.released) shows that a start (\(nonce)) claims the receipt and is not settled yet", journal: journal, receipt: SleepOffReceipts.initialContent, release: "\(nonce) held\n")
+            } else {
+                XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+                XCTAssertTrue(r.stdout.contains("\(fx.receipt) cannot be locked (\(fx.receipt) is missing, is not the 82-byte file install.sh made, mode 600, or someone other than root can change it or a folder above it), so no start can claim it, and no start claims it now"), r.stdout)
+                XCTAssertTrue(fx.calls().contains("sudo /bin/rm -f \(fx.receipt)"), "\(fx.calls())")
+                XCTAssertTrue(fx.calls().contains("sudo /bin/rm -f \(fx.released)"), "\(fx.calls())")
+                XCTAssertFalse(FileManager.default.fileExists(atPath: fx.receipts))
+                XCTAssertFalse(fx.exists(fx.sudoers))
+            }
+        }
+    }
+
+    /// F3 (round 28). The same for a receipt with a mode other than 600,
+    /// another list of access control entries (stand-ins, as in the
+    /// backstop's test) or a list ls cannot read: the checks refuse it, so
+    /// it is removed only while its release file shows no claim.
+    func testUninstallTreatsAReceiptWithAnotherModeOrListAsOneNoStartCanClaim() throws {
+        let mine = [AccessEntry.installed(for: getuid())]
+        let lists = Dictionary(uniqueKeysWithValues: TestReceipts.refusedLists.map { ($0.name, $0.entries) })
+        let list = "\(fx.receipt) does not have exactly one access control entry, the one that lets uid \(fx.uid) read it and nothing else, or its list could not be read"
+        let cases: [(name: String, mode: mode_t, entries: [AccessEntry], listFails: Bool, why: String)] = [
+            ("mode 644", 0o644, mine, false, "\(fx.receipt) is missing, is not the 82-byte file install.sh made, mode 600, or someone other than root can change it or a folder above it"),
+            ("no entry", 0o600, [], false, list),
+            ("another account's entry", 0o600, try XCTUnwrap(lists["another account's entry"]), false, list),
+            ("an inherited entry", 0o600, try XCTUnwrap(lists["an inherited entry"]), false, list),
+            ("read and write", 0o600, try XCTUnwrap(lists["read and write"]), false, list),
+            ("a list ls cannot read", 0o600, mine, true, list),
+        ]
+        let fails = fx.receiptEntries + ".fails"
+        for c in cases {
+            for held in [false, true] {
+                let label = "\(c.name), \(held ? "a claim" : "no claim")"
+                try? FileManager.default.removeItem(at: fx.installedBackstop)
+                try fx.installMachinery()
+                fx.clearCalls()
+                try fx.writeState(cleanJournal)
+                if FileManager.default.fileExists(atPath: fx.receipts) { try FileManager.default.removeItem(atPath: fx.receipts) }
+                try fx.writeReceipt()
+                let nonce = String(SleepOffReceipts.initialContent.prefix(36))
+                if held { try fx.writeRelease("\(nonce) held\n") }
+                XCTAssertEqual(chmod(fx.receipt, c.mode), 0, label)
+                try fx.writeReceiptEntries(c.entries)
+                if c.listFails { XCTAssertTrue(FileManager.default.createFile(atPath: fails, contents: nil)) }
+                let journal = try Data(contentsOf: fx.state)
+
+                let r = try fx.run(fx.uninstall)
+                unlink(fails)
+
+                if held {
+                    try assertUninstallRemovedNothing(r, saying: "\(fx.released) shows that a start (\(nonce)) claims the receipt and is not settled yet", journal: journal, receipt: SleepOffReceipts.initialContent, release: "\(nonce) held\n")
+                } else {
+                    XCTAssertEqual(r.status, 0, "\(label): \(r.stderr + r.stdout)")
+                    XCTAssertTrue(r.stdout.contains("\(fx.receipt) cannot be locked (\(c.why)), so no start can claim it, and no start claims it now"), "\(label): \(r.stdout)")
+                    XCTAssertTrue(fx.calls().contains("sudo /bin/rm -f \(fx.receipt)"), "\(label): \(fx.calls())")
+                    XCTAssertFalse(FileManager.default.fileExists(atPath: fx.receipts), label)
+                }
+            }
+        }
     }
 
     // MARK: - install.sh and the receipt
 
     /// A new install makes the receipt folder and the receipt through sudo,
-    /// by their fixed paths, modes 0755 and 0644, owner root, and the
-    /// receipt holds a nonce no start has. Then, under the receipt's lock,
-    /// the release file beside it, the user's and 0600, with that nonce
-    /// free. The app trusts what it made.
+    /// by their fixed paths, modes 0755 and 0600, owner root, and the
+    /// receipt holds a nonce no start has. Then it gives the receipt one
+    /// access control entry, `user:<name> allow read`, through sudo chmod
+    /// (the fake records it as the stand-in the fixture's ls shows). Then,
+    /// under the receipt's lock, the release file beside it, the user's and
+    /// 0600, with that nonce free. The app trusts what it made.
     func testInstallCreatesTheReceiptThroughSudoByItsFixedPath() throws {
         try fx.prepareInstall()
         fx.setMode("launchctl", "loaded")
@@ -2465,19 +2896,25 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
         let calls = fx.calls()
         let mkdir = try XCTUnwrap(calls.firstIndex(of: "sudo -n \(fx.bin.path)/mkdir -m 0755 \(fx.receipts)"), "\(calls)")
-        let install = try XCTUnwrap(calls.firstIndex { $0.hasPrefix("sudo -n /usr/bin/install -m 0644 -o root -g wheel ") && $0.hasSuffix(" \(fx.receipt)") }, "\(calls)")
+        let install = try XCTUnwrap(calls.firstIndex { $0.hasPrefix("sudo -n /usr/bin/install -m 0600 -o root -g wheel ") && $0.hasSuffix(" \(fx.receipt)") }, "\(calls)")
+        let me = String(cString: getpwuid(getuid()).pointee.pw_name)
+        let entry = try XCTUnwrap(calls.firstIndex(of: "sudo -n \(fx.bin.path)/chmod +a user:\(me) allow read \(fx.receipt)"), "\(calls)")
         let release = try XCTUnwrap(calls.firstIndex { $0.hasPrefix("sudo -n /usr/bin/install -m 0600 -o \(getuid()) ") && $0.hasSuffix(" \(fx.released)") }, "\(calls)")
         XCTAssertLessThan(mkdir, install)
-        XCTAssertLessThan(install, release)
+        XCTAssertLessThan(install, entry)
+        XCTAssertLessThan(entry, release)
+        XCTAssertFalse(calls.contains { $0.hasPrefix("sudo -n \(fx.bin.path)/chmod 0600") }, "install(1) made it 0600: \(calls)")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("sudo REFUSED") }, "\(calls)")
         XCTAssertEqual(fx.receiptText(), SleepOffReceipts.initialContent)
         XCTAssertEqual(fx.release(), SleepOffReceipts.initialRelease)
         XCTAssertEqual(try fx.mode(URL(fileURLWithPath: fx.receipts)), 0o755)
-        XCTAssertEqual(try fx.mode(URL(fileURLWithPath: fx.receipt)), 0o644)
+        XCTAssertEqual(try fx.mode(URL(fileURLWithPath: fx.receipt)), 0o600)
+        XCTAssertEqual(try String(contentsOfFile: fx.receiptEntries, encoding: .utf8), "user:\(me) allow read\n")
         XCTAssertEqual(try fx.mode(URL(fileURLWithPath: fx.released)), 0o600)
-        XCTAssertTrue(r.stdout.contains("receipt \(fx.receipt) is root's and only root can change it or the folders above it"), r.stdout)
+        XCTAssertTrue(r.stdout.contains("receipt \(fx.receipt) is root's, only root can change it or the folders above it, and only root and \(me) can read it"), r.stdout)
         XCTAssertTrue(r.stdout.contains("release file \(fx.released) written: no start claims the receipt"), r.stdout)
         XCTAssertTrue(fx.toolCalls().contains("head -c 83"), "the receipt is read through HEAD: \(fx.toolCalls())")
-        let receipts = SleepOffReceipts(folder: fx.receipts, owners: [0, getuid()], user: getuid())
+        let receipts = fx.swiftReceipts
         XCTAssertNoThrow(try receipts.identity())
         XCTAssertEqual(try receipts.readRelease(), .free(SleepOffReceipts.zero))
     }
@@ -2515,6 +2952,117 @@ final class RecoveryScriptTests: XCTestCase {
             XCTAssertEqual(fx.release(), c.after, c.name)
             XCTAssertTrue(r.stdout.contains(c.says), "\(c.name): \(r.stdout)")
         }
+    }
+
+    /// F3 (round 28). A receipt an earlier build made (0644, no entry), or
+    /// one an install left between `install` and `chmod +a` (0600, no
+    /// entry), is repaired in place through sudo chmod: the mode first,
+    /// then the entry, and only the steps it needs. It stays the same file
+    /// with the same bytes, and a claim in its release file stays. The
+    /// entries are the fixture's stand-ins; no real list changes.
+    func testInstallRepairsTheModeAndEntryOfAReceiptItMadeBefore() throws {
+        try fx.prepareInstall()
+        fx.setMode("launchctl", "loaded")
+        let me = String(cString: getpwuid(getuid()).pointee.pw_name)
+        let mine = [AccessEntry.installed(for: getuid())]
+        let mode = "sudo -n \(fx.bin.path)/chmod 0600 \(fx.receipt)"
+        let entry = "sudo -n \(fx.bin.path)/chmod +a user:\(me) allow read \(fx.receipt)"
+        let cases: [(name: String, mode: mode_t, entries: [AccessEntry], calls: [String])] = [
+            ("an earlier build's: 0644, no entry", 0o644, [], [mode, entry]),
+            ("an install stopped before chmod +a: 0600, no entry", 0o600, [], [entry]),
+            ("0644 with the entry", 0o644, mine, [mode]),
+            ("0400, no entry", 0o400, [], [mode, entry]),
+        ]
+        for c in cases {
+            fx.clearCalls()
+            let nonce = UUID().uuidString
+            let text = receiptLine(nonce, "writing")
+            try fx.writeReceipt(text)
+            try fx.writeRelease("\(nonce) held\n")
+            XCTAssertEqual(chmod(fx.receipt, c.mode), 0, c.name)
+            try fx.writeReceiptEntries(c.entries)
+            let identity = fx.receiptIdentity()
+
+            let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+
+            XCTAssertEqual(r.status, 0, "\(c.name): \(r.stderr + r.stdout)")
+            XCTAssertEqual(fx.calls().filter { $0.hasPrefix("sudo -n \(fx.bin.path)/chmod ") }, c.calls, c.name)
+            XCTAssertFalse(fx.calls().contains { $0.hasPrefix("sudo REFUSED") }, "\(c.name): \(fx.calls())")
+            XCTAssertEqual(fx.receiptIdentity(), identity, "\(c.name): the same file")
+            XCTAssertEqual(fx.receiptText(), text, c.name)
+            XCTAssertEqual(try fx.mode(URL(fileURLWithPath: fx.receipt)), 0o600, c.name)
+            XCTAssertEqual(try String(contentsOfFile: fx.receiptEntries, encoding: .utf8), "user:\(me) allow read\n", c.name)
+            XCTAssertEqual(fx.release(), "\(nonce) held\n", "\(c.name): the claim stays")
+            XCTAssertTrue(r.stdout.contains("kept \(fx.released): a start of this user (\(nonce)) claims the receipt and is not settled yet"), "\(c.name): \(r.stdout)")
+            XCTAssertTrue(r.stdout.contains("only root and \(me) can read it"), "\(c.name): \(r.stdout)")
+            XCTAssertNoThrow(try fx.swiftReceipts.identity(), c.name)
+        }
+    }
+
+    /// F3 (round 28). A receipt with any other entry (stand-ins), a list
+    /// ls cannot read, or a mode that lets someone other than root change
+    /// it is not repaired: the install stops before its lock is taken,
+    /// with no sudo chmod, and the receipt, its mode, its list and its
+    /// release file stay as they were. So does a sudo chmod that fails,
+    /// and an account name chmod +a could not take.
+    func testInstallStopsAtAReceiptItCannotRepair() throws {
+        try fx.prepareInstall()
+        fx.setMode("launchctl", "loaded")
+        let me = String(cString: getpwuid(getuid()).pointee.pw_name)
+        let mine = [AccessEntry.installed(for: getuid())]
+        let lists = Dictionary(uniqueKeysWithValues: TestReceipts.refusedLists.map { ($0.name, $0.entries) })
+        let list = "Install stopped: \(fx.receipt) does not have exactly one access control entry, the one that lets \(me) (uid \(fx.uid)) read it and nothing else, or its list could not be read."
+        let fails = fx.receiptEntries + ".fails"
+        var cases: [(name: String, mode: mode_t, entries: [AccessEntry], listFails: Bool, chmodFails: Bool, says: String)] = [
+            "another account's entry", "a group's entry", "an inherited entry", "a deny entry", "read and write", "read and writesecurity", "read and chown", "the entry twice",
+        ].map { (String($0), 0o600, lists[String($0)] ?? [], false, false, list) }
+        cases += [
+            ("an earlier build's mode with another entry", 0o644, lists["read and write"] ?? [], false, false, "Install stopped: \(fx.receipt) has mode 644, not 600."),
+            ("a list ls cannot read", 0o600, [], true, false, list),
+            ("writable by others", 0o646, [], false, false, "Install stopped: \(fx.receipt) is not a regular file of root's with one link and 82 bytes that only root can change."),
+            ("sudo chmod fails", 0o644, [], false, true, "Install stopped: 'sudo chmod 0600 \(fx.receipt)' exited 1"),
+        ]
+        for c in cases {
+            fx.clearCalls()
+            let nonce = UUID().uuidString
+            let text = receiptLine(nonce, "writing")
+            try fx.writeReceipt(text)
+            try fx.writeRelease("\(nonce) held\n")
+            XCTAssertEqual(chmod(fx.receipt, c.mode), 0, c.name)
+            try fx.writeReceiptEntries(c.entries)
+            if c.listFails { XCTAssertTrue(FileManager.default.createFile(atPath: fails, contents: nil)) }
+            if c.chmodFails { XCTAssertTrue(FileManager.default.createFile(atPath: fx.root.appendingPathComponent("sudo-chmod.fail").path, contents: nil)) }
+            let identity = fx.receiptIdentity()
+            let entries = try String(contentsOfFile: fx.receiptEntries, encoding: .utf8)
+
+            let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+            unlink(fails)
+            unlink(fx.root.appendingPathComponent("sudo-chmod.fail").path)
+
+            XCTAssertEqual(r.status, 1, "\(c.name): \(r.stderr + r.stdout)")
+            XCTAssertTrue(r.stderr.contains(c.says), "\(c.name): \(r.stderr)")
+            XCTAssertEqual(fx.calls().filter { $0.hasPrefix("sudo -n \(fx.bin.path)/chmod ") }, c.chmodFails ? ["sudo -n \(fx.bin.path)/chmod 0600 \(fx.receipt)"] : [], c.name)
+            XCTAssertFalse(fx.calls().contains { $0.hasSuffix(" " + fx.released) && $0.hasPrefix("sudo ") }, "\(c.name): \(fx.calls())")
+            XCTAssertEqual(fx.receiptIdentity(), identity, c.name)
+            XCTAssertEqual(fx.receiptText(), text, c.name)
+            XCTAssertEqual(try fx.mode(URL(fileURLWithPath: fx.receipt)), Int(c.mode), c.name)
+            XCTAssertEqual(try String(contentsOfFile: fx.receiptEntries, encoding: .utf8), entries, c.name)
+            XCTAssertEqual(fx.release(), "\(nonce) held\n", c.name)
+            XCTAssertEqual(chmod(fx.receipt, 0o600), 0)
+            try fx.writeReceiptEntries(mine)
+        }
+
+        // An account name with a space, which chmod +a would split, stops
+        // the install before the receipt is touched (a fake id answers -un).
+        let id = fx.bin.appendingPathComponent("id-two-words")
+        try "#!/bin/bash\nif [[ \"$*\" == -un ]]; then echo 'two words'; exit 0; fi\nexec /usr/bin/id \"$@\"\n".write(to: id, atomically: true, encoding: .utf8)
+        XCTAssertEqual(chmod(id.path, 0o755), 0)
+        try fx.writeInstallCopies(extraConstants: ["ID": id.path])
+        fx.clearCalls()
+        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertTrue(r.stderr.contains("Install stopped: the account name of uid \(fx.uid) (two words) is empty, holds a space or a colon, or is not this uid's, so the receipt cannot be given an entry for it."), r.stderr)
+        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("sudo -n \(fx.bin.path)/chmod ") }, "\(fx.calls())")
     }
 
     /// F2 for install.sh: the release file is written only under the
@@ -3798,6 +4346,245 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(try helper("install.sh"), try helper("uninstall.sh"))
     }
 
+    // MARK: Round 28 (finding 7): the bounded-call supervisor
+
+    /// A private run of the exact bounded() and supervise() text of
+    /// install.sh or uninstall.sh (testInstallAndUninstallShareTheBoundedCallHelper
+    /// keeps the two the same). `main.sh` sets the scripts' shell options,
+    /// takes a lock of its own on fd 9 the way they take the recovery lock,
+    /// and makes one bounded sudo call, as install.sh makes its receipt
+    /// calls. It calls bounded() bare, so errexit is on in the supervisor
+    /// (the scripts' callers all add `|| rc=$?` or `|| true`, which turns it
+    /// off there). The fake sudo first checks, from shells that inherit its
+    /// signal actions, that SIGTERM and SIGHUP would still end it, and logs
+    /// "sudo SURVIVED <signal>" if not. With `logsSignals` it then logs every
+    /// SIGTERM and SIGHUP it gets and keeps running; a shell started with a
+    /// signal ignored cannot trap it, so a logged signal also shows that the
+    /// call got the default action back. It closes its fd 9, as sudo does,
+    /// and only then writes sudo.ready. It starts after the supervisor has
+    /// set its own signal actions, so those are in place once it is ready.
+    /// It runs until the test creates `release` and logs "sudo exiting" just
+    /// before it exits. With `pidWriteFails`, a directory stands where the
+    /// supervisor writes the call's pid.
+    private struct SupervisedCall {
+        let dir: URL
+        let main: URL
+
+        init(root: URL, script: String, callTimeout: Int, logsSignals: Bool, pidWriteFails: Bool) throws {
+            let text = try String(contentsOf: ScriptFixture.productionScripts.appendingPathComponent(script), encoding: .utf8)
+            guard let start = text.range(of: "\nbounded() {"),
+                  let supervise = text.range(of: "\nsupervise() {", range: start.upperBound..<text.endIndex),
+                  let end = text.range(of: "\n}\n", range: supervise.upperBound..<text.endIndex) else {
+                throw FixtureError("no bounded() and supervise() in \(script)")
+            }
+            let helper = String(text[start.lowerBound..<end.upperBound])
+            dir = root.appendingPathComponent("supervised-\(script)-\(UUID().uuidString.prefix(8))", isDirectory: true)
+            main = dir.appendingPathComponent("main.sh")
+            let fm = FileManager.default
+            try fm.createDirectory(at: dir.appendingPathComponent("work"), withIntermediateDirectories: true)
+            let h = dir.path
+            try #"""
+            #!/bin/bash
+            H="\#(h)"
+            for s in TERM HUP; do /bin/bash -c "kill -$s \$\$; echo 'sudo SURVIVED $s' >> '$H/events'"; done
+            if [[ \#(logsSignals ? "yes" : "no") == yes ]]; then
+              trap 'echo "sudo SIGTERM" >> "$H/events"' TERM
+              trap 'echo "sudo SIGHUP" >> "$H/events"' HUP
+            fi
+            exec 9<&-
+            : > "$H/sudo.ready"
+            while [[ ! -e "$H/release" && -d "$H" ]] && (( SECONDS < 60 )); do /bin/sleep 0.05; done
+            echo "sudo exiting" >> "$H/events"
+
+            """#.write(to: dir.appendingPathComponent("sudo"), atomically: true, encoding: .utf8)
+            try #"""
+            #!/bin/bash
+            b="$(/usr/bin/mktemp "$@")" || exit 1
+            if [[ \#(pidWriteFails ? "yes" : "no") == yes ]]; then /bin/mkdir "$b.pid" || exit 1; fi
+            echo "$b"
+
+            """#.write(to: dir.appendingPathComponent("mktemp"), atomically: true, encoding: .utf8)
+            try #"""
+            #!/bin/bash
+            set -euo pipefail
+            H="\#(h)"
+            MKTEMP="$H/mktemp"
+            SUDO="$H/sudo"
+            WORK="$H/work"
+            CALL_TIMEOUT_SECONDS=\#(callTimeout)
+            \#(helper)
+            exec 9<>"$H/lock"
+            /usr/bin/lockf -t 0 9
+            bounded "$SUDO" -n /usr/bin/true
+
+            """#.write(to: main, atomically: true, encoding: .utf8)
+            for name in ["sudo", "mktemp", "main.sh"] {
+                try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.appendingPathComponent(name).path)
+            }
+            fm.createFile(atPath: dir.appendingPathComponent("lock").path, contents: nil)
+        }
+
+        var isReady: Bool { FileManager.default.fileExists(atPath: dir.appendingPathComponent("sudo.ready").path) }
+
+        func events() -> [String] {
+            ((try? String(contentsOf: dir.appendingPathComponent("events"), encoding: .utf8)) ?? "")
+                .split(separator: "\n").map(String.init)
+        }
+
+        func release() {
+            FileManager.default.createFile(atPath: dir.appendingPathComponent("release").path, contents: nil)
+        }
+
+        /// The status the supervisor wrote once it had reaped the call; nil
+        /// before that.
+        func status() -> String? {
+            let work = dir.appendingPathComponent("work")
+            let names = (try? FileManager.default.contentsOfDirectory(atPath: work.path)) ?? []
+            guard let rc = names.first(where: { $0.hasSuffix(".rc") }) else { return nil }
+            return (try? String(contentsOf: work.appendingPathComponent(rc), encoding: .utf8))?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        /// Whether a directory stands where the supervisor writes the pid.
+        var pidIsDirectory: Bool {
+            let work = dir.appendingPathComponent("work")
+            let names = (try? FileManager.default.contentsOfDirectory(atPath: work.path)) ?? []
+            var isDirectory: ObjCBool = false
+            return names.contains { $0.hasSuffix(".pid") && FileManager.default.fileExists(atPath: work.appendingPathComponent($0).path, isDirectory: &isDirectory) && isDirectory.boolValue }
+        }
+
+        func lockIsFree() -> Bool {
+            let probe = Process()
+            probe.executableURL = URL(fileURLWithPath: "/usr/bin/lockf")
+            probe.arguments = ["-k", "-s", "-t", "0", dir.appendingPathComponent("lock").path, "/usr/bin/true"]
+            probe.standardOutput = FileHandle.nullDevice
+            probe.standardError = FileHandle.nullDevice
+            let exit = ProcessExit(probe)
+            guard (try? probe.run()) != nil else { return false }
+            exit.wait()
+            return probe.terminationStatus == 0
+        }
+    }
+
+    /// Releases the call and samples the lock until it is free: by then the
+    /// call must have logged its end and the supervisor must have written
+    /// the status it writes only after reaping the call.
+    private func assertLockFreeOnlyAfterTheCallIsReaped(_ call: SupervisedCall, status: String, _ label: String,
+                                                        file: StaticString = #filePath, line: UInt = #line) {
+        call.release()
+        let deadline = Date(timeIntervalSinceNow: 10)
+        while Date() < deadline {
+            if call.lockIsFree() {
+                XCTAssertEqual(call.events().last, "sudo exiting", "\(label): the lock was free before the call ended", file: file, line: line)
+                XCTAssertEqual(call.status(), status, "\(label): the lock was free before the supervisor reaped the call", file: file, line: line)
+                return
+            }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        XCTFail("\(label): the lock was not free within 10 s of the release: \(call.events())", file: file, line: line)
+    }
+
+    /// The call closes its fd 9 and keeps running through SIGTERM, the run
+    /// is killed, and SIGTERM and SIGHUP then reach the run's whole process
+    /// group, as launchd sends them to what is left of a job's group. The
+    /// supervisor survives both, sends the call its own SIGTERM at the 3 s
+    /// limit (never SIGKILL: the call is sudo), and keeps the lock until it
+    /// has reaped the call. Before round 28 the group SIGTERM ended the
+    /// supervisor, and the lock was free while the call still ran. The test
+    /// signals only the shell it spawned as the leader of a new group, and
+    /// that group, before it reaps the shell.
+    func testTheBoundedCallSupervisorSurvivesGroupSignalsAndKeepsTheLockUntilItReapsTheCall() throws {
+        for script in ["install.sh", "uninstall.sh"] {
+            let call = try SupervisedCall(root: fx.root, script: script, callTimeout: 3, logsSignals: true, pidWriteFails: false)
+            let started = Date()
+            let main = try fx.spawn(call.main, ownProcessGroup: true)
+            defer {
+                call.release()
+                main.wait()
+            }
+            guard waitUntil(10, { call.isReady }) else {
+                _ = main.signal(SIGKILL)
+                return XCTFail("\(script): the call never got ready: \(call.events())")
+            }
+            XCTAssertFalse(main.hasExited, script)
+            XCTAssertEqual(main.signal(SIGKILL), 0, script)
+            XCTAssertEqual(main.signalGroup(SIGTERM), 0, script)
+            XCTAssertEqual(main.signalGroup(SIGHUP), 0, script)
+            let status = main.wait()
+            XCTAssertEqual(status & 0x7f, SIGKILL, "\(script): wait status \(status)")
+
+            XCTAssertTrue(waitUntil(2) { Set(call.events()) == ["sudo SIGTERM", "sudo SIGHUP"] }, "\(script): \(call.events())")
+            XCTAssertLessThan(Date().timeIntervalSince(started), 3, "\(script): both came from the group, before the supervisor's limit")
+            XCTAssertFalse(call.lockIsFree(), "\(script): the run is dead and the call closed its fd 9, so only the supervisor can hold the lock")
+
+            XCTAssertTrue(waitUntil(10) { call.events().filter { $0 == "sudo SIGTERM" }.count == 2 },
+                          "\(script): the supervisor's own SIGTERM at the limit: \(call.events())")
+            XCTAssertGreaterThanOrEqual(Date().timeIntervalSince(started), 3, script)
+            Thread.sleep(forTimeInterval: 0.5)
+            XCTAssertEqual(call.events().filter { $0 == "sudo SIGTERM" }.count, 2, "\(script): one from the group, one from the supervisor: \(call.events())")
+            XCTAssertEqual(call.events().filter { $0 == "sudo SIGHUP" }.count, 1, "\(script): \(call.events())")
+            XCTAssertFalse(call.events().contains("sudo exiting"), "\(script): never SIGKILLed, and still running")
+            XCTAssertFalse(call.lockIsFree(), "\(script): the supervisor still holds the lock for its live call")
+            XCTAssertNil(call.status(), script)
+
+            assertLockFreeOnlyAfterTheCallIsReaped(call, status: "124", script)
+        }
+    }
+
+    /// The run alone is killed, with no signal to its group: the supervisor
+    /// keeps the lock until it has reaped the call, also when its write of
+    /// the call's pid fails. Before round 28 a failed write under errexit
+    /// ended the supervisor, and the lock was free while the call ran. The
+    /// call's limit (10 s) does not pass in this test.
+    func testTheBoundedCallSupervisorKeepsTheLockAfterItsRunIsKilledEvenWhenAStatusWriteFails() throws {
+        for (script, pidWriteFails) in [("install.sh", false), ("install.sh", true), ("uninstall.sh", true)] {
+            let label = "\(script) pidWriteFails \(pidWriteFails)"
+            let call = try SupervisedCall(root: fx.root, script: script, callTimeout: 10, logsSignals: true, pidWriteFails: pidWriteFails)
+            let main = try fx.spawn(call.main, ownProcessGroup: true)
+            defer {
+                call.release()
+                main.wait()
+            }
+            guard waitUntil(10, { call.isReady }) else {
+                _ = main.signal(SIGKILL)
+                return XCTFail("\(label): the call never got ready: \(call.events())")
+            }
+            XCTAssertEqual(main.signal(SIGKILL), 0, label)
+            let status = main.wait()
+            XCTAssertEqual(status & 0x7f, SIGKILL, "\(label): wait status \(status)")
+            XCTAssertEqual(call.pidIsDirectory, pidWriteFails, label)
+
+            XCTAssertFalse(waitUntil(1) { call.lockIsFree() }, "\(label): the lock was free while the call ran")
+            XCTAssertEqual(call.events(), [], "\(label): no signal reached the call")
+            XCTAssertNil(call.status(), label)
+
+            assertLockFreeOnlyAfterTheCallIsReaped(call, status: "0", label)
+        }
+    }
+
+    /// The call does not inherit the supervisor's ignored SIGTERM and
+    /// SIGHUP: shells it starts are ended by both, and a call that does not
+    /// catch SIGTERM is stopped by the supervisor's at its 1 s limit. The
+    /// run gets 124, and the lock is free once the call has been reaped.
+    func testTheBoundedCallGetsTheDefaultSignalActionsAndIsStoppedAtItsLimit() throws {
+        let call = try SupervisedCall(root: fx.root, script: "install.sh", callTimeout: 1, logsSignals: false, pidWriteFails: false)
+        let started = Date()
+        let main = try fx.spawn(call.main)
+        defer {
+            call.release()
+            main.wait()
+        }
+        XCTAssertTrue(waitUntil(10) { call.isReady }, "\(call.events())")
+        XCTAssertTrue(waitUntil(10) { main.hasExited }, "\(call.events())")
+        let status = main.wait()
+        XCTAssertEqual(status & 0x7f, 0, "exited, not signalled: wait status \(status)")
+        XCTAssertEqual((status >> 8) & 0xff, 124, "bounded() returned 124: wait status \(status)")
+        XCTAssertLessThan(Date().timeIntervalSince(started), 7, "the 1 s limit, at most a second more, and the run's wait")
+        XCTAssertEqual(call.events(), [], "no shell survived its signal, and SIGTERM ended the call before its own end")
+        XCTAssertEqual(call.status(), "124")
+        XCTAssertTrue(call.lockIsFree())
+    }
+
     /// An uninstall killed while its `launchctl bootout` does not answer:
     /// the bootout keeps the recovery lock until its supervisor has stopped
     /// it at the limit, so it cannot unload an agent the app loads and
@@ -3864,6 +4651,351 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(fx.exists(rotatedDir.appendingPathComponent("a.txt")))
         for gone in [fx.state, fx.config, fx.logFile, fx.home.appendingPathComponent("Logs/handoffs.log.1")] {
             XCTAssertFalse(fx.exists(gone), gone.path)
+        }
+    }
+
+    // MARK: Round 28 (finding 8): a journal read that fails is not a clean journal
+
+    /// Points `script`'s PLUTIL at a wrapper around the real plutil. The
+    /// `call`th call whose arguments, joined by spaces, match the bash
+    /// pattern `trigger` runs `action` instead of going straight on, with
+    /// $f set to the file plutil was given (its last argument). The action
+    /// can end the call (`exit 1`), or run the real plutil itself first.
+    /// Each time it runs, the call's arguments are added to plutil.fired.
+    private func wrapPlutil(in script: URL, of f: ScriptFixture, on trigger: String, call: Int = 1, _ action: String) throws {
+        let tag = UUID().uuidString.prefix(8)
+        let wrapper = f.bin.appendingPathComponent("plutil-\(tag)")
+        let counter = f.root.appendingPathComponent("plutil.count.\(tag)")
+        try """
+        #!/bin/bash
+        f="${!#}"
+        if [[ "$*" == \(trigger) ]]; then
+          n=0
+          if [[ -f '\(counter.path)' ]]; then read -r n < '\(counter.path)'; fi
+          n=$((n + 1))
+          echo "$n" > '\(counter.path)'
+          if (( n == \(call) )); then
+            echo "$*" >> '\(f.root.path)/plutil.fired'
+            \(action)
+          fi
+        fi
+        exec /usr/bin/plutil "$@"
+        """.write(to: wrapper, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: wrapper.path)
+        let text = try String(contentsOf: script, encoding: .utf8)
+        try ScriptFixture.patch(text, ["PLUTIL": wrapper.path]).write(to: script, atomically: true, encoding: .utf8)
+    }
+
+    /// The calls the wrapper acted on.
+    private func plutilFired(_ f: ScriptFixture) -> [String] {
+        ((try? String(contentsOf: f.root.appendingPathComponent("plutil.fired"), encoding: .utf8)) ?? "")
+            .split(separator: "\n").map(String.init)
+    }
+
+    /// Runs the real plutil, then takes every permission off the file it
+    /// read: this read works and the next read of that file does not.
+    private static let readThenLock = #"/usr/bin/plutil "$@"; rc=$?; /bin/chmod 000 "$f"; exit $rc"#
+
+    /// The file step 4 reads: the copy of state.json in the run's scratch
+    /// folder (read.state.json). The pattern also matches state.json itself,
+    /// so the same schedule applies to a script that reads the journal in
+    /// place, as the reviewed one did; this script reads no state.json in
+    /// place with these arguments before step 4.
+    private static let journalRead = "state.json"
+
+    /// Prints part of an answer, then fails the way an I/O error would.
+    private static func failAfterPrinting(_ partial: String) -> String {
+        #"printf '%s' '\#(partial)'; echo 'simulated read error' >&2; exit 1"#
+    }
+
+    /// What uninstall leaves when it stops before removing anything.
+    private func assertNothingRemoved(_ f: ScriptFixture, state json: String?, _ label: String, file: StaticString = #filePath, line: UInt = #line) throws {
+        for kept in [f.plist, f.sudoers, f.app, f.config, f.installedBackstop] {
+            XCTAssertTrue(f.exists(kept), "\(label): \(kept.path)", file: file, line: line)
+        }
+        if let json {
+            XCTAssertEqual(try String(contentsOf: f.state, encoding: .utf8), json, label, file: file, line: line)
+        }
+        XCTAssertFalse(f.calls().contains { $0.hasPrefix("launchctl bootout") || $0.hasPrefix("sudo") }, "\(label): \(f.calls())", file: file, line: line)
+    }
+
+    /// The schedule of the review's probe: the copy of the journal that
+    /// step 4 reads loses its permissions after the type reads of the shape
+    /// check and before its text is read for the kept display records. The
+    /// text read fails, so what the journal holds is unknown: uninstall
+    /// stops with the kept brightness and everything else in place, where
+    /// before it printed "journal clean", found no kept brightness and
+    /// removed state.json.
+    func testUninstallStopsWhenItsCopyOfTheJournalCannotBeReadForTheKeptRecords() throws {
+        for purge in [true, false] {
+            let label = "purge \(purge)"
+            let json = Self.keptDisplayJournal("", ours: false)
+            let f = try ScriptFixture()
+            defer { f.destroy() }
+            try f.installMachinery()
+            try f.writeState(json)
+            try wrapPlutil(in: f.uninstall, of: f, on: #""-type keptDisplayUnderLowPowerBoot -o - "*"# + Self.journalRead, Self.readThenLock)
+
+            let r = try f.run(f.uninstall, purge ? ["--purge"] : [])
+
+            XCTAssertNotEqual(r.status, 0, label)
+            XCTAssertEqual(plutilFired(f).count, 1, label)
+            XCTAssertTrue(r.stderr.contains("Uninstall stopped BEFORE removing anything: \(f.state.path) could not be read"), "\(label): \(r.stderr)")
+            XCTAssertTrue(r.stderr.contains("state.json could not be read whole"), "\(label): \(r.stderr)")
+            XCTAssertTrue(r.stderr.contains("its text could not be read for the kept display records"), "\(label): \(r.stderr)")
+            XCTAssertFalse(r.stdout.contains("journal clean"), "\(label): \(r.stdout)")
+            try assertNothingRemoved(f, state: json, label)
+        }
+    }
+
+    /// A read that fails after the shape check, in the journal check or in
+    /// the list of kept brightness, with part of an answer printed or none:
+    /// uninstall stops and names the failed read. Each of these reads, when
+    /// it works, is part of a clean run (the control below).
+    func testUninstallStopsWhenAnyLaterReadOfTheJournalFails() throws {
+        let cases: [(label: String, args: String, call: Int, action: String, names: String)] = [
+            ("the refusal flag, part printed", "-extract displayRestoreRefused raw -o -", 1, Self.failAfterPrinting("tr"),
+             "displayRestoreRefused: plutil -extract exited 1 (simulated read error)"),
+            ("the kept level, second read", "-extract savedDisplayBrightness raw -o -", 2, Self.failAfterPrinting("0."),
+             "savedDisplayBrightness: plutil -extract exited 1 (simulated read error)"),
+            ("an optional record's type", "-type keptDisplayReadLit -o -", 1, Self.failAfterPrinting(""),
+             "keptDisplayReadLit: plutil -type exited 1 (simulated read error)"),
+            ("the JSON for the shape check", "-convert json -o -", 1, Self.failAfterPrinting("{"),
+             "plutil -convert json failed"),
+            ("the copy made unreadable at the refusal flag", "-extract displayRestoreRefused raw -o -", 1, Self.readThenLock,
+             "savedKeyboardBrightness: plutil -extract exited 1"),
+        ]
+        for c in cases {
+            let json = Self.keptDisplayJournal("", ours: false)
+            let f = try ScriptFixture()
+            defer { f.destroy() }
+            try f.installMachinery()
+            try f.writeState(json)
+            try wrapPlutil(in: f.uninstall, of: f, on: "\"\(c.args) \"*" + Self.journalRead, call: c.call, c.action)
+
+            let r = try f.run(f.uninstall, ["--purge"])
+
+            XCTAssertNotEqual(r.status, 0, c.label)
+            XCTAssertEqual(plutilFired(f).count, 1, c.label)
+            XCTAssertTrue(r.stderr.contains("Uninstall stopped BEFORE removing anything: \(f.state.path) could not be read"), "\(c.label): \(r.stderr)")
+            XCTAssertTrue(r.stderr.contains(c.names), "\(c.label): \(r.stderr)")
+            XCTAssertFalse(r.stdout.contains("journal clean"), "\(c.label): \(r.stdout)")
+            XCTAssertFalse(r.stdout.contains("display brightness"), "\(c.label): \(r.stdout)")
+            try assertNothingRemoved(f, state: json, c.label)
+        }
+    }
+
+    /// Two kept levels, the first read and the second failing: one found
+    /// is not all found, and nothing is removed.
+    func testUninstallStopsWhenOnlyOneOfTwoKeptLevelsCanBeRead() throws {
+        let json = #"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"savedDisplayBrightness":0.6,"displayRestoreRefused":true,"savedKeyboardBrightness":0.4,"keyboardRestoreRefused":true}"#
+        try fx.installMachinery()
+        try fx.writeState(json)
+        try wrapPlutil(in: fx.uninstall, of: fx, on: #""-extract savedKeyboardBrightness raw -o - "*"# + Self.journalRead, call: 2, Self.failAfterPrinting("0.4"))
+
+        let r = try fx.run(fx.uninstall, ["--purge"])
+
+        XCTAssertNotEqual(r.status, 0)
+        XCTAssertEqual(plutilFired(fx).count, 1)
+        XCTAssertTrue(r.stderr.contains("savedKeyboardBrightness: plutil -extract exited 1 (simulated read error)"), r.stderr)
+        XCTAssertFalse(r.stdout.contains("journal clean"), r.stdout)
+        XCTAssertFalse(r.stdout.contains("display brightness 0.6"), r.stdout)
+        try assertNothingRemoved(fx, state: json, "keyboard")
+    }
+
+    /// Keys that hold null or are not there are absent, as for the app,
+    /// through the real plutil's own errors for them: the run completes,
+    /// removing state.json, or keeping it for a kept level.
+    func testUninstallReadsNullAndMissingKeysAsAbsentAndCompletes() throws {
+        let nulls = #""lowPowerSetByUs":null,"savedOutputVolume":null,"savedMuted":null,"savedKeyboardBrightness":null,"frozenPids":null,"appNapOverrides":null,"savedAudioOutputs":null,"keyboardRestoreRefused":null,"displayRestoredUnderLowPower":null,"keptDisplayUnderLowPower":null,"keptDisplayUnderLowPowerBoot":null,"keptDisplayReadLit":null"#
+        let cases: [(json: String, kept: String?)] = [
+            (#"{"sleepDisabledByUs":false,"frozenProcesses":[],"dockerFrozen":false,"savedDisplayBrightness":null,"displayRestoreRefused":null,"# + nulls + "}", nil),
+            (#"{"sleepDisabledByUs":false,"frozenProcesses":[],"dockerFrozen":false,"savedDisplayBrightness":0.8,"displayRestoreRefused":true,"# + nulls + "}", "  - display brightness 0.8"),
+            (#"{"sleepDisabledByUs":false}"#, nil),
+        ]
+        for c in cases {
+            let f = try ScriptFixture()
+            defer { f.destroy() }
+            try f.installMachinery()
+            try f.writeConfig(#"{"agentList":[]}"#)
+            try f.writeState(c.json)
+
+            let r = try f.run(f.uninstall, ["--purge"])
+
+            XCTAssertEqual(r.status, 0, c.json + r.stderr + r.stdout)
+            XCTAssertTrue(r.stdout.contains("journal clean"), r.stdout)
+            XCTAssertFalse(f.exists(f.app), c.json)
+            if let kept = c.kept {
+                XCTAssertTrue(r.stdout.contains(kept), r.stdout)
+                XCTAssertEqual(try String(contentsOf: f.state, encoding: .utf8), c.json)
+            } else {
+                XCTAssertFalse(f.exists(f.state), c.json)
+            }
+        }
+    }
+
+    /// state.json is a regular file at the check, then a FIFO with no
+    /// writer by the time it is copied: the copy has a time limit, so the
+    /// run does not hang with the recovery lock held. It stops, and the
+    /// FIFO stays.
+    func testUninstallStopsWhenTheJournalBecomesAFifoBeforeItIsCopied() throws {
+        let json = #"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#
+        try fx.installMachinery()
+        try fx.writeState(json)
+        let wrapper = fx.bin.appendingPathComponent("cp-swap-fifo")
+        try """
+        #!/bin/bash
+        if [[ "${!#}" == */insomnia-uninstall.*/read.state.json ]]; then
+          /bin/rm -f "$1" && /usr/bin/mkfifo "$1" && echo swapped >> '\(fx.root.path)/cp.fired'
+        fi
+        exec /bin/cp "$@"
+        """.write(to: wrapper, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: wrapper.path)
+        let text = try String(contentsOf: fx.uninstall, encoding: .utf8)
+        try ScriptFixture.patch(text, ["CP": wrapper.path]).write(to: fx.uninstall, atomically: true, encoding: .utf8)
+
+        // Awake time, not wall-clock time: the Mac can sleep during a run,
+        // and the script's time limit does not count while it does.
+        let started = ProcessInfo.processInfo.systemUptime
+        let r = try fx.run(fx.uninstall, ["--purge"])
+        let took = ProcessInfo.processInfo.systemUptime - started
+
+        XCTAssertNotEqual(r.status, 0)
+        XCTAssertEqual(try String(contentsOf: fx.root.appendingPathComponent("cp.fired"), encoding: .utf8), "swapped\n")
+        XCTAssertTrue(r.stderr.contains("state.json could not be copied to be read: cp did not answer within 5s"), r.stderr)
+        XCTAssertLessThan(took, 30, "the copy's limit is 5 s")
+        var info = stat()
+        XCTAssertEqual(lstat(fx.state.path, &info), 0)
+        XCTAssertEqual(info.st_mode & S_IFMT, S_IFIFO, "the FIFO is left where it is")
+        try assertNothingRemoved(fx, state: nil, "fifo")
+    }
+
+    /// state.json changes, or appears, after the journal check and before
+    /// it would be removed (here, as the LaunchAgent is booted out): the
+    /// file is left, named, and the run exits 1. The rest is removed, as
+    /// the journal that was checked allowed.
+    func testUninstallLeavesAJournalThatChangedOrAppearedAfterItsCheck() throws {
+        let checked = #"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#
+        let later = #"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#
+        for appears in [false, true] {
+            let label = appears ? "appeared" : "changed"
+            let f = try ScriptFixture()
+            defer { f.destroy() }
+            try f.installMachinery()
+            try f.writeConfig(#"{"agentList":[]}"#)
+            if !appears { try f.writeState(checked) }
+            let wrapper = f.bin.appendingPathComponent("launchctl-writes-state")
+            try """
+            #!/bin/bash
+            if [[ "$1" == bootout ]]; then printf '%s' '\(later)' > '\(f.state.path)'; fi
+            exec '\(f.bin.appendingPathComponent("launchctl").path)' "$@"
+            """.write(to: wrapper, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: wrapper.path)
+            let text = try String(contentsOf: f.uninstall, encoding: .utf8)
+            try ScriptFixture.patch(text, ["LAUNCHCTL": wrapper.path]).write(to: f.uninstall, atomically: true, encoding: .utf8)
+
+            let r = try f.run(f.uninstall, ["--purge"])
+
+            XCTAssertEqual(r.status, 1, "\(label): \(r.stderr)")
+            XCTAssertTrue(r.stdout.contains("journal clean"), "\(label): \(r.stdout)")
+            XCTAssertFalse(f.exists(f.app), label)
+            XCTAssertEqual(try String(contentsOf: f.state, encoding: .utf8), later, label)
+            let why = appears ? "it appeared after the journal check" : "it is not the file the journal check read (cmp exit 1)"
+            XCTAssertTrue(r.stderr.contains("Left \(f.state.path): \(why)"), "\(label): \(r.stderr)")
+            XCTAssertTrue(r.stderr.contains("Done, except 1 file(s) that could not be removed"), "\(label): \(r.stderr)")
+        }
+    }
+
+    /// The settlement's own reads: one that fails stops the uninstall
+    /// before the backstop, with the start, its claim, its marker and its
+    /// session in place, and no pmset.
+    func testUninstallStopsWhenAReadForTheSettlementFails() throws {
+        let nonce = try journalUnfinishedStart()
+        let json = try String(contentsOf: fx.state, encoding: .utf8)
+        try fx.installMachinery()
+        try wrapPlutil(in: fx.uninstall, of: fx, on: "\"-extract sleepOffAttempt.receipt raw -o - \(fx.state.path)\"", Self.failAfterPrinting(""))
+
+        let r = try fx.run(fx.uninstall, ["--purge"])
+
+        XCTAssertEqual(r.status, 1, r.stderr)
+        XCTAssertEqual(plutilFired(fx).count, 1)
+        XCTAssertTrue(r.stderr.contains("Uninstall stopped BEFORE removing anything: \(fx.state.path) could not be read whole (\(fx.state.path), sleepOffAttempt.receipt: plutil -extract exited 1 (simulated read error))"), r.stderr)
+        XCTAssertEqual(fx.release(), "\(nonce) held\n")
+        XCTAssertTrue(fx.exists(fx.session))
+        try assertNothingRemoved(fx, state: json, "settlement")
+    }
+
+    /// record_text_problems as it is in `script`, run on its own the way
+    /// its callers run it: its status and what it printed.
+    private func recordTextStatus(_ script: String, _ path: String) throws -> (status: Int32, stdout: String, stderr: String) {
+        let f = try ScriptFixture()
+        defer { f.destroy() }
+        let runner = f.root.appendingPathComponent("record-text-status.sh")
+        try ("set -euo pipefail\n" + Self.recordTextProblemsSource(script) + "\nrecord_text_problems \"$1\" || exit $?\n")
+            .write(to: runner, atomically: true, encoding: .utf8)
+        return try f.run(runner, [path])
+    }
+
+    /// A file the reader cannot open, and a folder, return 2 with nothing
+    /// printed in both scripts, where they returned 0 as a file with no
+    /// records.
+    func testTheRecordReaderReturnsTwoForWhatItCannotRead() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("record-text-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let locked = dir.appendingPathComponent("locked.json")
+        try Self.keptDisplayJournal(#""keptDisplayReadLit":1e-400"#).write(to: locked, atomically: true, encoding: .utf8)
+        XCTAssertEqual(chmod(locked.path, 0), 0)
+        defer { _ = chmod(locked.path, 0o600) }
+        let folder = dir.appendingPathComponent("folder.json", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        for script in ["backstop.sh", "uninstall.sh"] {
+            for path in [locked.path, folder.path] {
+                let r = try recordTextStatus(script, path)
+                XCTAssertEqual(r.status, 2, "\(script) \(path): \(r.stderr)")
+                XCTAssertEqual(r.stdout, "", "\(script) \(path)")
+                if path == locked.path { XCTAssertTrue(r.stderr.contains("Permission denied"), "\(script): \(r.stderr)") }
+            }
+        }
+    }
+
+    /// The backstop's journal read, with the text read failing after the
+    /// type reads passed (the same schedule as above): the journal is
+    /// unknown, not clean. Nothing is undone, the expired session stays,
+    /// and the run exits 1, where before it found the journal clean and
+    /// removed the session. The same in its settlement, before the start
+    /// it journals is settled.
+    func testTheBackstopTreatsAJournalItCannotReadWholeAsUnknown() throws {
+        for settling in [false, true] {
+            let label = settling ? "settlement" : "journal read"
+            let f = try ScriptFixture()
+            defer { f.destroy() }
+            let previous = fx
+            fx = f
+            defer { fx = previous }
+            if settling {
+                try journalUnfinishedStart()
+            } else {
+                try f.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+                try f.writeState(Self.keptDisplayJournal(""))
+            }
+            let json = try String(contentsOf: f.state, encoding: .utf8)
+            let session = try Data(contentsOf: f.session)
+            try wrapPlutil(in: f.backstop, of: f, on: "\"-type keptDisplayUnderLowPowerBoot -o - \(f.state.path)\"", Self.readThenLock)
+
+            let r = try f.run(f.backstop)
+
+            XCTAssertEqual(r.status, 1, "\(label): \(r.stderr)")
+            XCTAssertEqual(plutilFired(f).count, 1, label)
+            XCTAssertEqual(f.calls(), [], label)
+            XCTAssertEqual(chmod(f.state.path, 0o644), 0)
+            XCTAssertEqual(try String(contentsOf: f.state, encoding: .utf8), json, label)
+            XCTAssertEqual(try Data(contentsOf: f.session), session, label)
+            let logged = settling
+                ? "could not be read whole (its JSON, or its text for the kept display records), so the unfinished start it journals was not settled; nothing undone"
+                : "could not be read whole (its JSON, or its text for the kept display records); nothing undone, evidence kept"
+            XCTAssertTrue(f.log().contains(logged), "\(label): \(f.log())")
+            XCTAssertFalse(f.log().contains("journal already clean"), "\(label): \(f.log())")
         }
     }
 
@@ -4622,9 +5754,9 @@ final class RecoveryScriptTests: XCTestCase {
             XCTAssertTrue(decoded.keptDisplayReadUnderLowPower(inBoot: f.bootUUID), "\(hostilePath)")
             XCTAssertFalse(decoded.lowPowerClaimFromEarlierBoot(boot: f.bootUUID), "\(hostilePath)")
             XCTAssertTrue(f.toolCalls().contains { $0.hasPrefix("head -c 1 ") && $0.contains(".state.json.backstop-boot.") }, "\(hostilePath): \(f.toolCalls())")
-            XCTAssertFalse(f.hostileCalls().contains { $0.contains(".state.json.backstop-boot.") }, "\(hostilePath): \(f.hostileCalls())")
+            XCTAssertEqual(f.hostileCalls(), [], "\(hostilePath): no head is taken from PATH")
             if hostilePath {
-                XCTAssertTrue(f.hostileCalls().contains("head -c 1"), "the PATH one was found: \(f.hostileCalls())")
+                XCTAssertTrue(!f.toolPaths().isEmpty && f.toolPaths().allSatisfy { $0.hasPrefix(dir.path + ":") }, "PATH was in effect: \(f.toolPaths())")
             }
         }
     }
@@ -5854,6 +6986,11 @@ final class RecoveryScriptTests: XCTestCase {
         guard !shell.hasExited else {
             return XCTFail("the backstop ended before the test could kill it (wait status \(shell.wait())): \(fx.log())")
         }
+        // The fake wrote "ready" after its traps and before its pid, so
+        // what was sent from here reaches a command whose traps are set.
+        let ready = fx.sudoEvents()
+        XCTAssertEqual(ready.count, 1, "\(ready)")
+        XCTAssertTrue(ready.first?.hasPrefix("ready ") == true, "\(ready)")
         XCTAssertEqual(shell.signal(SIGKILL), 0)
         for sig in [SIGTERM, SIGHUP, SIGINT] {
             XCTAssertEqual(shell.signalGroup(sig), 0, "signal \(sig)")
@@ -5862,10 +6999,17 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(status & 0x7f, SIGKILL, "the backstop did not end by SIGKILL (wait status \(status))")
 
         XCTAssertTrue(waitUntil(15) { self.fx.calls().filter { $0 == "sudo SIGTERM" }.count == 2 },
-                      "one SIGTERM from the group, one from the supervisor at the limit: \(fx.calls())")
-        XCTAssertTrue(waitUntil(10) { self.statusLines() == ["alive"] }, "the supervisor reached the end of the grace: \(self.statusLines())")
-        XCTAssertEqual(fx.calls().filter { $0 == "sudo SIGTERM" }.count, 2, "\(fx.calls())")
-        XCTAssertEqual(fx.calls().filter { $0 == "sudo SIGHUP" }.count, 1, "\(fx.calls())")
+                      "one SIGTERM from the group, one from the supervisor at the limit: \(fx.calls()) \(fx.sudoEvents())")
+        XCTAssertTrue(waitUntil(10) { self.statusLines() == ["alive"] }, "the supervisor reached the end of the grace: \(self.statusLines()) \(fx.sudoEvents())")
+        XCTAssertEqual(fx.calls().filter { $0 == "sudo SIGTERM" }.count, 2, "\(fx.calls()) \(fx.sudoEvents())")
+        XCTAssertEqual(fx.calls().filter { $0 == "sudo SIGHUP" }.count, 1, "\(fx.calls()) \(fx.sudoEvents())")
+        // The fake's own clock: its last SIGTERM came at the 3 s limit or
+        // later (its SECONDS counts whole seconds, so at least 2), not
+        // from something sent before then.
+        let events = fx.sudoEvents()
+        XCTAssertEqual(events.filter { $0.hasPrefix("TERM ") }.count, 2, "\(events)")
+        XCTAssertEqual(events.filter { $0.hasPrefix("HUP ") }.count, 1, "\(events)")
+        XCTAssertGreaterThanOrEqual(events.last { $0.hasPrefix("TERM ") }.flatMap { Int($0.dropFirst(5)) } ?? -1, 2, "\(events)")
         XCTAssertEqual(fx.calls().filter { !$0.hasPrefix("sudo SIG") }, ["sudo -n \(fx.fakePmset) -a disablesleep 0"],
                        "the command had closed fd 9, and nothing else ran")
         XCTAssertNil(fx.commandEnded(), "never SIGKILLed")
@@ -8594,8 +9738,10 @@ private final class ScriptFixture {
     var receipt: String { receipts + "/" + uid }
     /// The release file beside it (SleepOffReceipts.releaseFile).
     var released: String { receipt + ".released" }
-    /// Every call to the scripts' CAT and HEAD (see writeFakes).
+    /// Every call to the scripts' CAT, HEAD and TR (see writeFakes).
     var toolsLog: URL { root.appendingPathComponent("tools.log") }
+    /// The PATH each of those calls was given.
+    var toolPathsLog: URL { root.appendingPathComponent("tools.path") }
 
     var backstop: URL { repoScripts.appendingPathComponent("backstop.sh") }
     var uninstall: URL { repoScripts.appendingPathComponent("uninstall.sh") }
@@ -8780,15 +9926,34 @@ private final class ScriptFixture {
     }
 
     /// The receipt as install.sh leaves it, with `text` in place of its
-    /// initial content: the folder 0755 and the file 0644. An existing
+    /// initial content: the folder 0755 and the file 0600. An existing
     /// receipt is written over in place, as the root command's perl does.
-    /// A release file is made beside it, as install.sh makes it, unless
-    /// there is one.
+    /// A new receipt, or one with no receiptEntries file, gets the access
+    /// control entry install.sh adds, as a stand-in in receiptEntries
+    /// (see writeFakes' ls). A release file is made beside it, as
+    /// install.sh makes it, unless there is one.
     func writeReceipt(_ text: String = SleepOffReceipts.initialContent) throws {
         if mkdir(receipts, 0o755) != 0 && errno != EEXIST { throw FixtureError("mkdir \(receipts): \(errno)") }
+        let made = !fm.fileExists(atPath: receipt)
         try Self.writeInPlace(receipt, text)
-        XCTAssertEqual(chmod(receipt, 0o644), 0)
+        XCTAssertEqual(chmod(receipt, 0o600), 0)
+        if made || !fm.fileExists(atPath: receiptEntries) { try writeReceiptEntries([.installed(for: getuid())]) }
         if !fm.fileExists(atPath: released) { try writeRelease(SleepOffReceipts.initialRelease) }
+    }
+
+    /// The stand-in access control entries of the receipt, which the
+    /// scripts' LS shows in front of its real ones (writeFakes).
+    var receiptEntries: String { root.path + "/receipt.acl" }
+
+    /// Puts `list` in receiptEntries.
+    func writeReceiptEntries(_ list: [AccessEntry]) throws {
+        try TestReceipts.writeEntries(list, to: receiptEntries)
+    }
+
+    /// The receipt's checks in Swift, with the entry install.sh adds as
+    /// their stand-in, as writeReceipt puts it in receiptEntries.
+    var swiftReceipts: SleepOffReceipts {
+        SleepOffReceipts(folder: receipts, owners: [0, getuid()], user: getuid(), standIn: [.installed(for: getuid())])
     }
 
     /// The release file with `text`, the test user's, 0600: written over in
@@ -8848,6 +10013,8 @@ private final class ScriptFixture {
             "DATE": bin.appendingPathComponent("date").path,
             "CAT": bin.appendingPathComponent("cat").path,
             "HEAD": bin.appendingPathComponent("head").path,
+            "TR": bin.appendingPathComponent("tr").path,
+            "LS": bin.appendingPathComponent("ls").path,
             "RECEIPTS": receipts,
             "RECEIPT_OWNER": uid,
             "MV": bin.appendingPathComponent("mv").path,
@@ -8871,6 +10038,8 @@ private final class ScriptFixture {
             "SUDOERS": sudoers.path,
             "CAT": bin.appendingPathComponent("cat").path,
             "HEAD": bin.appendingPathComponent("head").path,
+            "TR": bin.appendingPathComponent("tr").path,
+            "LS": bin.appendingPathComponent("ls").path,
             "RECEIPTS": receipts,
             "RECEIPT_OWNER": uid,
             "LOCK_TIMEOUT_SECONDS": "1",
@@ -8921,6 +10090,7 @@ private final class ScriptFixture {
             "CHMOD": bin.appendingPathComponent("chmod").path,
             "CAT": bin.appendingPathComponent("cat").path,
             "HEAD": bin.appendingPathComponent("head").path,
+            "LS": bin.appendingPathComponent("ls").path,
             "RECEIPTS": receipts,
             "RECEIPT_OWNER": uid,
             "LOCK_TIMEOUT_SECONDS": "1",
@@ -9019,17 +10189,28 @@ private final class ScriptFixture {
     private func writeFakes() throws {
         let calls = callsLog.path
         let r = root.path
-        // cat and head: the scripts' CAT and HEAD. Each call goes to
-        // tools.log, apart from calls.log, and then to the real tool. The
-        // child's PATH never holds this folder, so a bare `cat` or `head`
-        // in a script never reaches them.
+        // cat, head and tr: the scripts' CAT, HEAD and TR. Each call goes
+        // to tools.log, apart from calls.log, with the PATH it was given in
+        // tools.path, and then to the real tool. tr's arguments hold a tab
+        // and line breaks, so only its first goes to the log. The child's
+        // PATH never holds this folder, so a bare `cat`, `head` or `tr` in
+        // a script never reaches them. The fakes below call /bin/cat and
+        // /usr/bin/head by full path, so a hostile folder put first in PATH
+        // sees only the scripts' own calls.
         try writeFake("cat", """
         printf 'cat %s\\n' "$*" >> "\(toolsLog.path)"
+        printf '%s\\n' "$PATH" >> "\(toolPathsLog.path)"
         exec /bin/cat "$@"
         """)
         try writeFake("head", """
         printf 'head %s\\n' "$*" >> "\(toolsLog.path)"
+        printf '%s\\n' "$PATH" >> "\(toolPathsLog.path)"
         exec /usr/bin/head "$@"
+        """)
+        try writeFake("tr", """
+        printf 'tr %s\\n' "$1" >> "\(toolsLog.path)"
+        printf '%s\\n' "$PATH" >> "\(toolPathsLog.path)"
+        exec /usr/bin/tr "$@"
         """)
         // sudo: `-n <cmd>` is the pmset path and succeeds or fails by mode
         // without running anything. /bin/rm and /bin/test run unprivileged,
@@ -9068,9 +10249,12 @@ private final class ScriptFixture {
         try writeFake("sudo", """
         printf 'sudo %s\\n' "$*" >> "\(calls)"
         if [[ -e "\(pendingStart.path)" ]]; then echo present; else echo absent; fi >> "\(r)/marker-at-sudo"
-        mode="$(cat "\(r)/sudo.mode" 2>/dev/null || echo ok)"
+        # The shell's own read: an ordinary call, with no mode file, starts
+        # no process for it.
+        mode=ok; if [[ -e "\(r)/sudo.mode" ]]; then IFS= read -r mode < "\(r)/sudo.mode" || true; fi
         \(sudoHangHere())
         \(lockHeldHere())
+        \(receiptLockHere())
         # "ignore-term" and "closes-fd9" behave like a pmset that ignores
         # SIGTERM: they live until the test creates the release file (or the
         # fixture is destroyed, or a 60 s wall-clock watchdog), so a test decides when
@@ -9092,7 +10276,7 @@ private final class ScriptFixture {
         }
         # `-n visudo` and `-n install` (install.sh under the lock) are
         # handled below like the forms without -n.
-        if [[ "${1:-}" == -n && ( "${2:-}" == /usr/sbin/visudo || "${2:-}" == /usr/bin/install || "${2:-}" == "\(bin.path)/mkdir" ) ]]; then shift; fi
+        if [[ "${1:-}" == -n && ( "${2:-}" == /usr/sbin/visudo || "${2:-}" == /usr/bin/install || "${2:-}" == "\(bin.path)/mkdir" || "${2:-}" == "\(bin.path)/chmod" ) ]]; then shift; fi
         case "${1:-}" in
           -v) case "$mode" in
                 auth-fail) echo "sudo: 3 incorrect password attempts" >&2; exit 1 ;;
@@ -9100,7 +10284,7 @@ private final class ScriptFixture {
                 # (writePrebuiltApp's dist/Insomnia.app) while the password prompt waits.
                 swap-prebuilt) printf 'swapped' > "\(r)/dist/Insomnia.app/Contents/MacOS/Insomnia"; exit 0 ;;
                 reauth-fails)
-                  n=$(( $(cat "\(r)/sudo.auths" 2>/dev/null || echo 0) + 1 )); echo "$n" > "\(r)/sudo.auths"
+                  n=$(( $(/bin/cat "\(r)/sudo.auths" 2>/dev/null || echo 0) + 1 )); echo "$n" > "\(r)/sudo.auths"
                   if (( n > 1 )); then echo "sudo: 3 incorrect password attempts" >&2; exit 1; fi
                   exit 0 ;;
                 *) exit 0 ;;
@@ -9111,6 +10295,11 @@ private final class ScriptFixture {
                 case "$mode" in auth-fail|cache-expires|reauth-fails) exit 1 ;; *) exit 0 ;; esac
               fi
               if [[ "${2:-}" == -l ]]; then list_check; fi
+              # sudo.needs-rule: the restore runs only while the rule is
+              # there, as real sudo runs it without a password only then.
+              if [[ -e "\(r)/sudo.needs-rule" && ! -e "\(sudoers.path)" ]]; then
+                printf 'sudo NO-RULE %s\\n' "$*" >> "\(calls)"; echo "sudo: a password is required" >&2; exit 1
+              fi
               case "$mode" in
                 ok|no-rule-cached) exit 0 ;;
                 hang) exec /bin/sleep 60 ;;
@@ -9130,7 +10319,7 @@ private final class ScriptFixture {
                 # "drops-fd9-logs-signals": like "logs-term", after closing
                 # its fd 9 the way sudo does, and every SIGHUP it gets is
                 # logged as "sudo SIGHUP".
-                drops-fd9-logs-signals) exec 9<&-; trap 'echo "sudo SIGHUP" >> "\(calls)"' HUP; hang_on_term ignore ;;
+                drops-fd9-logs-signals) exec 9<&-; trap 'echo "sudo SIGHUP" >> "\(calls)"; echo "HUP $SECONDS" >> "\(r)/sudo.events"' HUP; hang_on_term ignore ;;
                 # "signals-self": for SIGTERM and then SIGHUP, a shell that
                 # inherits this command's signal actions sends itself the
                 # signal and, if it is still there afterwards, logs "sudo
@@ -9148,12 +10337,12 @@ private final class ScriptFixture {
                 status-delayed) base=""
                   for (( i = 0; i < 50; i++ )); do
                     for f in "\(home.path)"/.backstop.*.pid; do
-                      if [[ "$(cat "$f" 2>/dev/null)" == "$$" ]]; then base="${f%.pid}"; break 2; fi
+                      if [[ "$(/bin/cat "$f" 2>/dev/null)" == "$$" ]]; then base="${f%.pid}"; break 2; fi
                     done
                     /bin/sleep 0.1
                   done
                   [[ -n "$base" ]] || exit 0
-                  cat "\(r)/sentinel.pid" > "$base.pid"
+                  /bin/cat "\(r)/sentinel.pid" > "$base.pid"
                   /usr/bin/mkfifo "$base.rc"
                   printf 'sudo STATUS-DELAYED\\n' >> "\(calls)"
                   exit 0 ;;
@@ -9175,8 +10364,22 @@ private final class ScriptFixture {
             case "$dst" in "\(r)"/*|"\(receipts)"/*)
               /bin/mkdir -p "$(dirname "$dst")"; /bin/cp "$src" "$dst"
               if [[ -n "$perm" ]]; then /bin/chmod "$perm" "$dst"; fi
+              # A file install(1) makes has no access control entry.
+              if [[ "$dst" == "\(receipt)" ]]; then : > "\(receiptEntries)"; fi
               exit 0 ;;
             esac
+            printf 'sudo REFUSED %s\\n' "$*" >> "\(calls)"; exit 1 ;;
+          # install.sh's two calls of its CHMOD as root, on the receipt:
+          # `0600` sets the mode for real (the fixture's own file), and
+          # `+a <entry>` on a receipt with no entry writes the entry to
+          # receiptEntries, where the fixture's ls shows it, and changes no
+          # real access control list. While sudo-chmod.fail exists both
+          # fail. Anything else is refused.
+          "\(bin.path)/chmod")
+            if [[ "$mode" == auth-fail ]]; then echo "sudo: a password is required" >&2; exit 1; fi
+            if [[ -e "\(r)/sudo-chmod.fail" ]]; then echo "chmod: \(receipt): Operation not permitted" >&2; exit 1; fi
+            if [[ $# == 3 && "$2" == 0600 && "$3" == "\(receipt)" ]]; then exec /bin/chmod 0600 "$3"; fi
+            if [[ $# == 4 && "$2" == +a && "$4" == "\(receipt)" && ! -s "\(receiptEntries)" ]]; then printf '%s\\n' "$3" > "\(receiptEntries)"; exit 0; fi
             printf 'sudo REFUSED %s\\n' "$*" >> "\(calls)"; exit 1 ;;
           "\(bin.path)/mkdir")
             if [[ "$mode" == auth-fail ]]; then echo "sudo: a password is required" >&2; exit 1; fi
@@ -9186,9 +10389,10 @@ private final class ScriptFixture {
             case "${!#}" in "\(r)"/*|"\(receipts)") exec "$@" ;; esac
             printf 'sudo REFUSED %s\\n' "$*" >> "\(calls)"; exit 1 ;;
           /bin/rm|/bin/test)
+            if [[ "${1:-}" == /bin/rm ]]; then receipt_lock_state "sudo rm ${!#}"; fi
             for a in "$@"; do
               case "$a" in "\(r)"/*|"\(receipts)"/*)
-                if [[ "$(cat "\(r)/sudo-root.mode" 2>/dev/null)" == search ]]; then
+                if [[ "$(/bin/cat "\(r)/sudo-root.mode" 2>/dev/null)" == search ]]; then
                   d="$(dirname "$a")"; /bin/chmod u+x "$d"; "$@"; rc=$?; /bin/chmod u-x "$d"; exit $rc
                 fi
                 exec "$@" ;;
@@ -9205,7 +10409,7 @@ private final class ScriptFixture {
         try writeFake("pmset", """
         if [[ "$*" == -g ]]; then
           printf 'pmset -g\\n' >> "\(calls)"
-          case "$(cat "\(r)/pmset.mode" 2>/dev/null || echo 0)" in
+          case "$(/bin/cat "\(r)/pmset.mode" 2>/dev/null || echo 0)" in
             fail) echo "pmset: could not read the settings" >&2; exit 1 ;;
             none) printf 'System-wide power settings:\\n' ;;
             1) printf 'System-wide power settings:\\n SleepDisabled\\t\\t1\\n' ;;
@@ -9265,10 +10469,10 @@ private final class ScriptFixture {
         // lock.
         try writeFake("codesign", """
         printf 'codesign %s\\n' "$*" >> "\(calls)"
-        mode="$(cat "\(r)/codesign.mode" 2>/dev/null || echo ok)"
+        mode="$(/bin/cat "\(r)/codesign.mode" 2>/dev/null || echo ok)"
         \(hangHere("codesign"))
         \(lockHeldHere())
-        signing="$(cat "\(r)/codesign.signing" 2>/dev/null || echo adhoc)"
+        signing="$(/bin/cat "\(r)/codesign.signing" 2>/dev/null || echo adhoc)"
         last=""; deep=0; pinned=0; for a in "$@"; do last="$a"; [[ "$a" == --deep ]] && deep=1; [[ "$a" == -R=* ]] && pinned=1; done
         for a in "$@"; do
           case "$a" in
@@ -9296,7 +10500,7 @@ private final class ScriptFixture {
         // line, like a broken ps) and "garbage" (exit 0 with nonsense).
         try writeFake("ps", """
         printf 'ps %s\\n' "$*" >> "\(calls)"
-        mode="$(cat "\(r)/ps.mode" 2>/dev/null || echo ok)"
+        mode="$(/bin/cat "\(r)/ps.mode" 2>/dev/null || echo ok)"
         if [[ "$mode" == fail ]]; then echo "ps: cannot read process table" >&2; exit 2; fi
         if [[ "$mode" == garbage ]]; then echo "not a process line"; exit 0; fi
         pid=""; for a in "$@"; do pid="$a"; done
@@ -9308,7 +10512,7 @@ private final class ScriptFixture {
         """)
         try writeFake("kill", """
         printf 'kill %s\\n' "$*" >> "\(calls)"
-        fail="$(cat "\(r)/kill.fail.mode" 2>/dev/null || true)"
+        fail="$(/bin/cat "\(r)/kill.fail.mode" 2>/dev/null || true)"
         for f in $fail; do [[ "$f" == "${2:-}" ]] && exit 1; done
         exit 0
         """)
@@ -9321,14 +10525,14 @@ private final class ScriptFixture {
         try writeFake("sysctl", """
         if [[ "$*" == "-n hw.optional.arm64" ]]; then
           printf 'sysctl %s\\n' "$*" >> "\(calls)"
-          case "$(cat "\(r)/sysctl.mode" 2>/dev/null || echo ok)" in
+          case "$(/bin/cat "\(r)/sysctl.mode" 2>/dev/null || echo ok)" in
             intel-0) echo 0 ;;
             intel-missing) echo "sysctl: unknown oid 'hw.optional.arm64'" >&2; exit 1 ;;
             *) echo 1 ;;
           esac
           exit 0
         fi
-        cat "\(r)/boot.uuid"
+        /bin/cat "\(r)/boot.uuid"
         """)
         // chmod: recorded in chmod.calls, apart from calls.log, then run for
         // real so the modes still change. A path listed in chmod.fail fails
@@ -9341,6 +10545,12 @@ private final class ScriptFixture {
         fi
         exec /bin/chmod "$@"
         """)
+        // ls: the scripts' LS. `ls -le <receipt>` shows receiptEntries'
+        // lines as the receipt's first entries (TestReceipts.writeFakeLs),
+        // since a test cannot give its receipt the entry install.sh adds
+        // without changing a real access control list. Any other call is
+        // /bin/ls.
+        try TestReceipts.writeFakeLs(at: bin.appendingPathComponent("ls").path, receipt: receipt, entries: receiptEntries)
         // Insomnia --resume-frozen: reads its entries from standard input,
         // one "<pid> <startedAt> <micros> <boot>" line each, and records the
         // call as "Insomnia <arguments> < <line>; <line>; ...". Answers one
@@ -9366,7 +10576,7 @@ private final class ScriptFixture {
         printf 'Insomnia %s < %s\\n' "$*" "$joined" >> "\(calls)"
         echo "$PPID" > "\(r)/insomnia.ppid"
         if [[ -e /dev/fd/9 ]]; then stat -f %i /dev/fd/9 > "\(r)/insomnia.fd9"; else : > "\(r)/insomnia.fd9"; fi
-        mode="$(cat "\(r)/insomnia.mode" 2>/dev/null || echo ok)"
+        mode="$(/bin/cat "\(r)/insomnia.mode" 2>/dev/null || echo ok)"
         if [[ "$mode" == hold ]]; then
           for (( i = 0; i < 300; i++ )); do
             [[ -f "\(r)/insomnia.release" ]] && break
@@ -9375,8 +10585,8 @@ private final class ScriptFixture {
           printf 'Insomnia released\\n' >> "\(calls)"
         fi
         if [[ "$mode" == raw ]]; then
-          cat "\(r)/insomnia.output"
-          exit "$(cat "\(r)/insomnia.status")"
+          /bin/cat "\(r)/insomnia.output"
+          exit "$(/bin/cat "\(r)/insomnia.status")"
         fi
         status=0
         for line in "${input[@]}"; do
@@ -9397,7 +10607,7 @@ private final class ScriptFixture {
         // Not logged: it changes nothing.
         try writeFake("date", """
         if [[ "$*" == "-u +%Y%m%dT%H%M%SZ" && -f "\(r)/date.mode" ]]; then
-          cat "\(r)/date.mode"; echo; exit 0
+          /bin/cat "\(r)/date.mode"; echo; exit 0
         fi
         exec /bin/date "$@"
         """)
@@ -9413,7 +10623,7 @@ private final class ScriptFixture {
         // "hang:<domain>") never answers; see hangHere.
         try writeFake("defaults", """
         printf 'defaults %s\\n' "$*" >> "\(calls)"
-        mode="$(cat "\(r)/defaults.mode" 2>/dev/null || echo ok)"
+        mode="$(/bin/cat "\(r)/defaults.mode" 2>/dev/null || echo ok)"
         table="\(r)/defaults.table"
         cmd="${1:-}"; domain="${2:-}"; key="${3:-}"
         [[ "$key" == NSAppSleepDisabled ]] || { echo "fake defaults: unexpected key '$key'" >&2; exit 2; }
@@ -9457,7 +10667,7 @@ private final class ScriptFixture {
         printf 'pgrep %s\\n' "$*" >> "\(calls)"
         f="\(r)/pgrep.mode"
         [[ -f "$f" ]] || exit 1
-        first="$(head -n 1 "$f")"
+        first="$(/usr/bin/head -n 1 "$f")"
         if (( $(wc -l < "$f") > 1 )); then tail -n +2 "$f" > "$f.next" && mv "$f.next" "$f"; fi
         \(hangHere("pgrep"))
         if [[ "$first" == hang ]]; then hang_here; fi
@@ -9500,9 +10710,22 @@ private final class ScriptFixture {
         //   "print-hangs": print never answers (see hangHere); bootout succeeds.
         //   "bootout-hangs": bootout never answers (see hangHere); print
         //     lists the job.
+        //   "bootout-claims-receipt": bootout succeeds and, without the
+        //     receipt's lock, writes "<claim.nonce> held" over the release
+        //     file, as a writer that ignores the lock could; print says not
+        //     loaded.
+        // Every bootout also records in receipt-lock.log whether the
+        // receipt's lock is held (see receiptLockHere).
         try writeFake("launchctl", """
         printf 'launchctl %s\\n' "$*" >> "\(calls)"
-        mode="$(cat "\(r)/launchctl.mode" 2>/dev/null || echo ok)"
+        mode="$(/bin/cat "\(r)/launchctl.mode" 2>/dev/null || echo ok)"
+        \(receiptLockHere())
+        if [[ "${1:-}" == bootout ]]; then
+          receipt_lock_state "launchctl bootout"
+          if [[ "$mode" == bootout-claims-receipt ]]; then
+            printf '%s held\\n' "$(/bin/cat "\(r)/claim.nonce")" 1<> "\(released)"
+          fi
+        fi
         if [[ "${1:-}" == bootstrap ]]; then
           [[ "${3:-}" == *.plist && -f "${3:-}" ]] || { echo "Bootstrap failed: 5: Input/output error" >&2; exit 5; }
         elif [[ "${1:-}" == bootout && $# -ge 3 ]]; then
@@ -9517,7 +10740,7 @@ private final class ScriptFixture {
             echo 'launchctl LOCK-HELD during bootstrap' >> "\(calls)"
           fi
           if [[ -f "\(app.path)/Contents/MacOS/Insomnia" ]]; then
-            echo "launchctl APP-BINARY=$(head -n 1 "\(app.path)/Contents/MacOS/Insomnia") during bootstrap" >> "\(calls)"
+            echo "launchctl APP-BINARY=$(/usr/bin/head -n 1 "\(app.path)/Contents/MacOS/Insomnia") during bootstrap" >> "\(calls)"
           else
             echo 'launchctl APP-ABSENT during bootstrap' >> "\(calls)"
           fi
@@ -9527,7 +10750,7 @@ private final class ScriptFixture {
         if [[ "${1:-}:$mode" == bootout:bootout-hangs ]]; then hang_here; fi
         prints=0
         if [[ "${1:-}" == print ]]; then
-          prints=$(( $(cat "\(r)/print.count" 2>/dev/null || echo 0) + 1 )); echo "$prints" > "\(r)/print.count"
+          prints=$(( $(/bin/cat "\(r)/print.count" 2>/dev/null || echo 0) + 1 )); echo "$prints" > "\(r)/print.count"
         fi
         case "$mode" in
           loaded|loaded-bootstrap-fails-once|loaded-unload-fails-after-bootstrap|loaded-print-fails-once-after-bootstrap|loaded-print-fails-after-bootstrap|loaded-reload-fails-yet-listed)
@@ -9556,7 +10779,8 @@ private final class ScriptFixture {
             esac ;;
         esac
         case "${1:-}:$mode" in
-          bootout:print-hangs) exit 0 ;;
+          bootout:print-hangs|bootout:bootout-claims-receipt) exit 0 ;;
+          print:bootout-claims-receipt) exit 113 ;;
           bootout:ok|bootout:loaded-then-lost|bootout:no-then-error|bootout:bootstrap-fails) exit 0 ;;
           bootstrap:ok) exit 0 ;;
           bootstrap:loaded-then-lost|bootstrap:no-then-error|bootstrap:bootstrap-fails) echo "Bootstrap failed: 5: Input/output error" >&2; exit 5 ;;
@@ -9668,26 +10892,44 @@ private final class ScriptFixture {
     /// SIGTERM, the way sudo ends a policy check. `hang_on_term ignore` logs
     /// it and keeps running until the test calls releaseCommand (or the
     /// fixture goes, or a 60 s watchdog), then writes command.ended. Both
-    /// note an inherited fd 9 and record the pid in `sudo.hung.pid`, once
-    /// the SIGTERM trap is in place.
+    /// note an inherited fd 9. The watchdog's deadline is set first and the
+    /// SIGTERM trap next; only then does it write "ready" to sudo.events
+    /// and its pid to `sudo.hung.pid`, so a test that waits for the pid
+    /// signals a command that is ready. Each SIGTERM also goes to
+    /// sudo.events with the fake's SECONDS (sudoEvents).
+    /// Nothing after the trap runs a command substitution. Under Bash 3.2,
+    /// a signal sent to the process group while `$(...)` runs reaches the
+    /// substitution's child too: it can kill that child, so the
+    /// substitution comes back empty (a watchdog deadline of 60 from
+    /// `$(( $(date +%s) + 60 ))` ends the wait at once), or, while the
+    /// child is being forked, the child runs the trap as well and one
+    /// SIGTERM is logged twice.
     func sudoHangHere() -> String {
         """
         hang_on_term() {
           calls_log="\(callsLog.path)"
+          watchdog=$(( SECONDS + 60 ))
           if { : >&9; } 2>/dev/null; then echo 'sudo FD9-OPEN' >> "$calls_log"; fi
           if [[ "$1" == stop ]]; then
-            trap 'echo "sudo SIGTERM" >> "$calls_log"; exit 143' TERM
+            trap 'echo "sudo SIGTERM" >> "$calls_log"; echo "TERM $SECONDS" >> "\(root.path)/sudo.events"; exit 143' TERM
           else
-            trap 'echo "sudo SIGTERM" >> "$calls_log"' TERM
+            trap 'echo "sudo SIGTERM" >> "$calls_log"; echo "TERM $SECONDS" >> "\(root.path)/sudo.events"' TERM
           fi
+          echo "ready $SECONDS" >> "\(root.path)/sudo.events"
           echo $$ > "\(root.path)/sudo.hung.pid"
-          deadline=$(( $(date +%s) + 60 ))
-          while [[ ! -e "\(root.path)/release" && -d "\(root.path)" && $(date +%s) -lt $deadline ]]; do /bin/sleep 0.1; done
+          while [[ ! -e "\(root.path)/release" && -d "\(root.path)" ]] && (( SECONDS < watchdog )); do /bin/sleep 0.1; done
           if [[ -e "\(root.path)/release" ]]; then echo released > "\(root.path)/command.ended"
           elif [[ -d "\(root.path)" ]]; then echo watchdog > "\(root.path)/command.ended"; fi
           exit 0
         }
         """
+    }
+
+    /// What the fake sudo's hang_on_term wrote to sudo.events: "ready <s>",
+    /// then "TERM <s>" or "HUP <s>" for each signal it trapped, <s> being
+    /// its SECONDS (whole seconds since the fake started) at that point.
+    func sudoEvents() -> [String] {
+        ((try? String(contentsOf: root.appendingPathComponent("sudo.events"), encoding: .utf8)) ?? "").split(separator: "\n").map(String.init)
     }
 
     /// Shell function for a fake: `lock_held` succeeds while someone holds
@@ -9699,6 +10941,47 @@ private final class ScriptFixture {
           [[ -e "\(lock.path)" ]] && ! /usr/bin/lockf -k -s -t 0 "\(lock.path)" /usr/bin/true 2>/dev/null
         }
         """
+    }
+
+    /// Shell function for a fake: `receipt_lock_state <what>` appends
+    /// "<what> held", "<what> free" or "<what> absent" to receipt-lock.log:
+    /// whether someone holds the receipt's lock at that moment, asked
+    /// without waiting and without creating the file.
+    func receiptLockHere() -> String {
+        """
+        receipt_lock_state() {
+          local s
+          /usr/bin/lockf -k -n -s -t 0 "\(receipt)" /usr/bin/true 2>/dev/null
+          case $? in 0) s=free ;; 75) s=held ;; 69) s=absent ;; *) s=unknown ;; esac
+          echo "$1 $s" >> "\(root.path)/receipt-lock.log"
+        }
+        """
+    }
+
+    /// What receipt-lock.log holds, one line per record.
+    func receiptLockStates() -> [String] {
+        ((try? String(contentsOf: root.appendingPathComponent("receipt-lock.log"), encoding: .utf8)) ?? "").split(separator: "\n").map(String.init)
+    }
+
+    /// Points `script`'s LOCKF at a wrapper around the real lockf. The first
+    /// time the script locks fd 7 (the receipt), a start of another
+    /// Insomnia folder claims the receipt just before, the way one that
+    /// held the lock first and let it go would leave it: "<nonce> held" in
+    /// the release file.
+    func claimTheReceiptBeforeItsLock(in script: URL, nonce: String) throws {
+        let wrapper = bin.appendingPathComponent("lockf-claim")
+        let claimed = root.appendingPathComponent("claimed")
+        try """
+        #!/bin/bash
+        if [[ "${!#}" == 7 && ! -e '\(claimed.path)' ]]; then
+          : > '\(claimed.path)'
+          printf '%s held\\n' '\(nonce)' 1<> '\(released)'
+        fi
+        exec /usr/bin/lockf "$@"
+        """.write(to: wrapper, atomically: true, encoding: .utf8)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: wrapper.path)
+        let text = try String(contentsOf: script, encoding: .utf8)
+        try Self.patch(text, ["LOCKF": wrapper.path]).write(to: script, atomically: true, encoding: .utf8)
     }
 
     /// A TMPDIR inside the fixture for one run, so a test can check that
@@ -9800,7 +11083,7 @@ private final class ScriptFixture {
         #!/bin/bash
         /usr/bin/lockf "$@"; rc=$?
         if (( rc == 0 )) && [[ "${!#}" == 7 ]]; then
-          /bin/cp '\(receipt)' '\(copy)' && /bin/chmod 0644 '\(copy)' && /bin/mv -f '\(copy)' '\(receipt)'
+          /bin/cp '\(receipt)' '\(copy)' && /bin/chmod 0600 '\(copy)' && /bin/mv -f '\(copy)' '\(receipt)'
         fi
         exit $rc
         """.write(to: wrapper, atomically: true, encoding: .utf8)
@@ -9865,13 +11148,14 @@ private final class ScriptFixture {
 
     var hostileLog: URL { root.appendingPathComponent("hostile.log") }
 
-    /// A folder to put first in PATH, with a `head` and a `cat` that
-    /// would mislead a script that found them there. Every call is logged
-    /// to hostileLog. `head -c 83` prints `<nonce> <zero> refused`, the
-    /// line of a start whose command stopped before pmset; `head -c 43`
-    /// prints `<nonce> free`, a claim already given back; `cat` of
+    /// A folder to put first in PATH, with a `head`, a `cat` and a `tr`
+    /// that would mislead a script that found them there. Every call is
+    /// logged to hostileLog. `head -c 83` prints `<nonce> <zero> refused`,
+    /// the line of a start whose command stopped before pmset; `head -c 43`
+    /// prints `<nonce> free`, a claim already given back; `head -c 1` and
+    /// `tr` print `x`, so a JSON file looks like something else; `cat` of
     /// session.json fails as if it could not be read. Anything else runs
-    /// the real tool, so the bare calls a script inherited still work.
+    /// the real tool.
     func writeHostileTools(forging nonce: String) throws -> String {
         let dir = root.appendingPathComponent("hostile", isDirectory: true)
         try fm.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -9882,6 +11166,7 @@ private final class ScriptFixture {
             case "$*" in
               "-c 83") printf '%s %s refused\\n' '\(nonce)' '\(SleepOffReceipts.zero)'; exit 0 ;;
               "-c 43 "*) printf '%s free\\n' '\(nonce)'; exit 0 ;;
+              "-c 1"|"-c 1 "*) printf x; exit 0 ;;
             esac
             exec /usr/bin/head "$@"
             """),
@@ -9890,6 +11175,11 @@ private final class ScriptFixture {
             printf 'cat %s\\n' "$*" >> "\(hostileLog.path)"
             [[ "$*" == '\(session.path)' ]] && exit 1
             exec /bin/cat "$@"
+            """),
+            ("tr", """
+            #!/bin/bash
+            printf 'tr %s\\n' "$1" >> "\(hostileLog.path)"
+            printf x
             """),
         ]
         for (name, body) in tools {
@@ -9904,6 +11194,12 @@ private final class ScriptFixture {
         ((try? String(contentsOf: hostileLog, encoding: .utf8)) ?? "").split(separator: "\n").map(String.init)
     }
 
+    /// The PATH each call to the scripts' CAT, HEAD and TR was given: with
+    /// a folder put first, it shows that PATH was in effect for the run.
+    func toolPaths() -> [String] {
+        ((try? String(contentsOf: toolPathsLog, encoding: .utf8)) ?? "").split(separator: "\n").map(String.init)
+    }
+
     /// The child's PATH with `dir` first.
     func path(first dir: String) -> String {
         dir + ":" + (childEnvironment["PATH"] ?? "")
@@ -9916,6 +11212,8 @@ private final class ScriptFixture {
     /// Environment for the child: no inheritance, so neither the real HOME
     /// nor a TempHome's INSOMNIA_HOME can leak in. HOME is deliberately
     /// unset (see the class comment).
+    var scriptEnvironment: [String: String] { childEnvironment }
+
     private var childEnvironment: [String: String] {
         [
             "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
@@ -9940,6 +11238,8 @@ private final class ScriptFixture {
     /// first, the way uninstall.sh hands its lock handle to the backstop.
     /// `ignoringTerm` starts the script with SIGTERM ignored, which every
     /// process it starts inherits (not combined with `fd9`).
+    /// `environment`, when given, is the child's whole environment in place
+    /// of scriptEnvironment (see AppEncodedJournalScriptTests.ScriptRow).
     /// `extraEnvironment` is for install.sh's refusal test, the PATH tests
     /// and a private TMPDIR (see privateTmp). stdin is
     /// /dev/null, never the test process's own (a terminal when `swift test`
@@ -9950,7 +11250,7 @@ private final class ScriptFixture {
     /// the process started here.
     private(set) var lastPid: Int32 = 0
 
-    func run(_ script: URL, _ args: [String] = [], fd9: URL? = nil, ignoringTerm: Bool = false, extraEnvironment: [String: String] = [:], terminalInput: String? = nil) throws -> (status: Int32, stdout: String, stderr: String) {
+    func run(_ script: URL, _ args: [String] = [], fd9: URL? = nil, ignoringTerm: Bool = false, environment: [String: String]? = nil, extraEnvironment: [String: String] = [:], terminalInput: String? = nil) throws -> (status: Int32, stdout: String, stderr: String) {
         precondition(fd9 == nil || !ignoringTerm, "fd9 and ignoringTerm are not combined")
         let p = Process()
         var terminal: (master: FileHandle, slave: FileHandle)?
@@ -9975,7 +11275,7 @@ private final class ScriptFixture {
         } else {
             p.arguments = [script.path] + args
         }
-        p.environment = childEnvironment.merging(extraEnvironment) { $1 }
+        p.environment = (environment ?? childEnvironment).merging(extraEnvironment) { $1 }
         p.currentDirectoryURL = root
         // Capture to files rather than pipes: nothing to drain, nothing to deadlock.
         let outURL = root.appendingPathComponent("stdout.\(UUID().uuidString)")
@@ -10577,6 +11877,94 @@ final class AppEncodedJournalScriptTests: XCTestCase {
         [("name", "Device-A", escapedName), ("uid", escapedUID, "Headset A"), ("plain", "Device-A", "Headset A")]
     }
 
+    /// One script run of a fixture of its own. The child's whole
+    /// environment is taken from that fixture when the row is made, before
+    /// anything runs, and only that fixture's tree is written to, so two
+    /// rows can run at once. The result is set once the child has exited
+    /// and been reaped (ScriptFixture.run waits for it).
+    private final class ScriptRow: @unchecked Sendable {
+        let label: String
+        let fixture: ScriptFixture
+        let script: URL
+        let args: [String]
+        let environment: [String: String]
+        private(set) var result: Result<(status: Int32, stdout: String, stderr: String), Error>?
+
+        init(_ label: String, _ fixture: ScriptFixture, _ script: URL, _ args: [String] = []) {
+            self.label = label
+            self.fixture = fixture
+            self.script = script
+            self.args = args
+            environment = fixture.scriptEnvironment
+        }
+
+        func run() {
+            result = Result { try fixture.run(script, args, environment: environment) }
+        }
+
+        /// The run's result; fails the test for a row that did not run or
+        /// whose run threw.
+        func outcome(file: StaticString = #filePath, line: UInt = #line) throws -> (status: Int32, stdout: String, stderr: String) {
+            try XCTUnwrap(result, "\(label): the script did not run", file: file, line: line).get()
+        }
+    }
+
+    /// Hands out the rows one at a time and counts how many run at once.
+    private final class RowQueue: @unchecked Sendable {
+        private let lock = NSLock()
+        private let rows: [ScriptRow]
+        private var next = 0
+        private var running = 0
+        private(set) var mostAtOnce = 0
+
+        init(_ rows: [ScriptRow]) { self.rows = rows }
+
+        func take() -> ScriptRow? {
+            lock.lock()
+            defer { lock.unlock() }
+            guard next < rows.count else { return nil }
+            next += 1
+            running += 1
+            mostAtOnce = max(mostAtOnce, running)
+            return rows[next - 1]
+        }
+
+        func done() {
+            lock.lock()
+            running -= 1
+            lock.unlock()
+        }
+    }
+
+    /// Runs the rows' scripts at most two at a time, each from a thread of
+    /// its own, and returns once every row has run: each child has then
+    /// exited and been reaped. Only the scripts run here; everything that
+    /// builds a journal with the app or reads one back runs before or after,
+    /// on the test's own thread. Checks that every row ran, that no more
+    /// than two ran at once, and that each child's environment was its own
+    /// fixture's.
+    private static func runTwoAtATime(_ rows: [ScriptRow], file: StaticString = #filePath, line: UInt = #line) {
+        let queue = RowQueue(rows)
+        let group = DispatchGroup()
+        for _ in 0..<min(2, rows.count) {
+            group.enter()
+            Thread.detachNewThread {
+                while let row = queue.take() {
+                    row.run()
+                    queue.done()
+                }
+                group.leave()
+            }
+        }
+        group.wait()
+        XCTAssertLessThanOrEqual(queue.mostAtOnce, 2, file: file, line: line)
+        XCTAssertEqual(rows.filter { $0.result == nil }.map(\.label), [], "rows that did not run", file: file, line: line)
+        for row in rows {
+            XCTAssertEqual(row.environment, ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "INSOMNIA_HOME": row.fixture.home.path], row.label, file: file, line: line)
+        }
+        XCTAssertEqual(Set(rows.map { $0.environment["INSOMNIA_HOME"] ?? "" }).count, rows.count, "each row has a home of its own", file: file, line: line)
+    }
+
     /// Sleep, Low Power Mode and the frozen process are undone, the session
     /// goes, and the saved output stays in the journal as the app wrote it.
     private func checkUndone(_ f: ScriptFixture, before: Data, _ label: String) throws {
@@ -10597,39 +11985,53 @@ final class AppEncodedJournalScriptTests: XCTestCase {
     /// UID as for a plain one, with or without a kept display record, in
     /// the current entry form and the legacy one. The app then restores
     /// the device from the journal the agent published.
+    /// The journals are written one at a time with the app, the agent runs
+    /// on them two at a time (runTwoAtATime), and each is then checked and
+    /// read back by the app one at a time.
     func testAnEscapedNameOrUIDDoesNotStopTheAgentAndTheAppRestoresIt() async throws {
+        var fixtures: [ScriptFixture] = []
+        defer { fixtures.forEach { $0.destroy() } }
+        var rows: [(row: ScriptRow, v: (label: String, uid: String, name: String), before: Data)] = []
         for v in Self.variants() {
             for record in [false, true] {
                 for legacy in [false, true] {
                     let label = "\(v.label) record \(record) legacy \(legacy)"
                     let f = try ScriptFixture()
-                    defer { f.destroy() }
+                    fixtures.append(f)
                     let before = try await appJournal(uid: v.uid, name: v.name, record: record, legacy: legacy, boot: f.bootUUID)
                     if v.label != "plain" {
                         XCTAssertTrue(String(decoding: before, as: UTF8.self).contains("\(backslash)\(backslash)u0041"), label)
                     }
                     try before.write(to: f.state)
                     try f.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
-
-                    let r = try f.run(f.backstop)
-
-                    XCTAssertEqual(r.status, 0, "\(label): \(r.stderr) \(f.log())")
-                    XCTAssertFalse(f.exists(f.session), label)
-                    try checkUndone(f, before: before, label)
-
-                    let h = Harness()
-                    defer { h.home.destroy() }
-                    h.audio.connect(v.uid, name: v.name, volume: 0.6, muted: true)
-                    h.clamshell.closed = false
-                    try Data(contentsOf: f.state).write(to: h.home.paths.stateFile)
-                    let m = h.makeManager(bootSession: f.bootUUID)
-                    await m.reconcile()
-
-                    XCTAssertEqual(h.audio.device(v.uid)?.muted, false, label)
-                    XCTAssertEqual(h.audio.device(v.uid)?.volume, 0.6, label)
-                    XCTAssertEqual(try h.store.loadState()?.savedAudioOutputs, [], label)
+                    rows.append((ScriptRow(label, f, f.backstop), v, before))
                 }
             }
+        }
+        XCTAssertEqual(rows.count, 12)
+
+        Self.runTwoAtATime(rows.map(\.row))
+
+        for (row, v, before) in rows {
+            let label = row.label
+            let f = row.fixture
+            let r = try row.outcome()
+
+            XCTAssertEqual(r.status, 0, "\(label): \(r.stderr) \(f.log())")
+            XCTAssertFalse(f.exists(f.session), label)
+            try checkUndone(f, before: before, label)
+
+            let h = Harness()
+            defer { h.home.destroy() }
+            h.audio.connect(v.uid, name: v.name, volume: 0.6, muted: true)
+            h.clamshell.closed = false
+            try Data(contentsOf: f.state).write(to: h.home.paths.stateFile)
+            let m = h.makeManager(bootSession: f.bootUUID)
+            await m.reconcile()
+
+            XCTAssertEqual(h.audio.device(v.uid)?.muted, false, label)
+            XCTAssertEqual(h.audio.device(v.uid)?.volume, 0.6, label)
+            XCTAssertEqual(try h.store.loadState()?.savedAudioOutputs, [], label)
         }
     }
 
@@ -10638,31 +12040,44 @@ final class AppEncodedJournalScriptTests: XCTestCase {
     /// plain name, and the saved output, which only the app restores,
     /// stops the removal with the app, the agent and the sudoers rule in
     /// place.
+    /// The journals are written one at a time with the app, and the
+    /// uninstalls run two at a time (runTwoAtATime).
     func testAnEscapedNameOrUIDDoesNotStopTheUndoOfAnUninstall() async throws {
+        var fixtures: [ScriptFixture] = []
+        defer { fixtures.forEach { $0.destroy() } }
+        var rows: [(row: ScriptRow, before: Data)] = []
         for v in Self.variants() {
             for record in [false, true] {
                 for legacy in [false, true] {
                     for purge in [false, true] {
                         let label = "\(v.label) record \(record) legacy \(legacy) purge \(purge)"
                         let f = try ScriptFixture()
-                        defer { f.destroy() }
+                        fixtures.append(f)
                         let before = try await appJournal(uid: v.uid, name: v.name, record: record, legacy: legacy, boot: f.bootUUID)
                         try f.installMachinery()
                         try before.write(to: f.state)
                         try f.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
-
-                        let r = try f.run(f.uninstall, purge ? ["--purge"] : [])
-
-                        XCTAssertNotEqual(r.status, 0, label)
-                        XCTAssertTrue(f.exists(f.app), label)
-                        XCTAssertTrue(f.exists(f.plist), label)
-                        XCTAssertTrue(f.exists(f.sudoers), label)
-                        XCTAssertFalse(r.stderr.contains("malformed"), "\(label): \(r.stderr)")
-                        XCTAssertTrue(r.stderr.contains("audio") || r.stdout.contains("audio"), "\(label): \(r.stdout) \(r.stderr)")
-                        try checkUndone(f, before: before, label)
+                        rows.append((ScriptRow(label, f, f.uninstall, purge ? ["--purge"] : []), before))
                     }
                 }
             }
+        }
+        XCTAssertEqual(rows.count, 24)
+
+        Self.runTwoAtATime(rows.map(\.row))
+
+        for (row, before) in rows {
+            let label = row.label
+            let f = row.fixture
+            let r = try row.outcome()
+
+            XCTAssertNotEqual(r.status, 0, label)
+            XCTAssertTrue(f.exists(f.app), label)
+            XCTAssertTrue(f.exists(f.plist), label)
+            XCTAssertTrue(f.exists(f.sudoers), label)
+            XCTAssertFalse(r.stderr.contains("malformed"), "\(label): \(r.stderr)")
+            XCTAssertTrue(r.stderr.contains("audio") || r.stdout.contains("audio"), "\(label): \(r.stdout) \(r.stderr)")
+            try checkUndone(f, before: before, label)
         }
     }
 
@@ -10685,15 +12100,27 @@ final class AppEncodedJournalScriptTests: XCTestCase {
             ("an integer", #","keptDisplayReadLit":1}"#),
             ("null", #","keptDisplayReadLit":null}"#),
         ]
+        var fixtures: [ScriptFixture] = []
+        defer { fixtures.forEach { $0.destroy() } }
+        var rows: [ScriptRow] = []
         for (label, tail) in tails {
             let json = base + tail
             XCTAssertNoThrow(try Store.makeDecoder().decode(RuntimeState.self, from: Data(json.utf8)), label)
             let f = try ScriptFixture()
-            defer { f.destroy() }
+            fixtures.append(f)
             try f.writeState(json)
             try f.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+            rows.append(ScriptRow(label, f, f.backstop))
+        }
+        XCTAssertEqual(rows.count, 10)
 
-            let r = try f.run(f.backstop)
+        // The agent runs on them two at a time (runTwoAtATime).
+        Self.runTwoAtATime(rows)
+
+        for row in rows {
+            let label = row.label
+            let f = row.fixture
+            let r = try row.outcome()
 
             XCTAssertEqual(r.status, 0, "\(label): \(r.stderr) \(f.log())")
             XCTAssertTrue(f.calls().contains("sudo -n \(f.fakePmset) -a disablesleep 0"), label)

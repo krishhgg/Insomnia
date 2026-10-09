@@ -278,9 +278,9 @@ installer prints its pid.
    Start refuses with nothing changed while the receipt is missing or
    unsafe (it says to run `./scripts/install.sh` again), while a start
    from another Insomnia folder of yours is not settled, and while
-   something holds the receipt's lock for more than 10 seconds. Any
-   account on the Mac can hold that lock, since the receipt is readable to
-   all. A Mac
+   something holds the receipt's lock for more than 10 seconds. Only root
+   and your account can open the receipt, so another account cannot hold
+   that lock; anything running as you can. A Mac
    without `/usr/bin/perl` cannot start a session: the command refuses
    after you type the password. SECURITY.md lists what the receipt cannot
    show.
@@ -309,10 +309,11 @@ installer prints its pid.
      written `writing`, sleep is turned back on. A pmset failure, or an
      answer lost to a signal, is settled the same way.
    - **The dialog will not close** but no command behind it has started:
-     Insomnia deletes the start's `pending-start` file, so the dialog can
-     no longer turn sleep off, and settles the start from the receipt once
-     its answer window has ended, without waiting for the process. The
-     menu names the process with its pid until it exits.
+     Insomnia deletes the start's `pending-start` file, so a command the
+     dialog starts from now on stops at that check, and settles the start
+     from the receipt once its answer window has ended and no command for
+     it holds the receipt's lock. The menu names the process with its pid
+     until it exits.
    - **Insomnia crashed or was force-quit with the dialog up.** The next
      run that holds the recovery lock (Insomnia after a relaunch, the
      recovery agent or `uninstall.sh`) deletes the start's `pending-start`
@@ -652,7 +653,9 @@ installation scenarios still need [release validation](docs/release-validation.m
   never turned sleep off, also while the journal cannot take that result.
   One set while the command writes its receipt line stops it at the second
   read and stays too, unless the command's `refused` line cannot be
-  written and its exit status is lost: the receipt then still shows
+  written and its exit status is lost, or Insomnia gets the status but
+  cannot save the rollback before it quits or the recovery agent or
+  uninstall.sh settles the start: the receipt then still shows
   `writing`, and the 1 is set to 0. It is set to 0 when the receipt shows
   nothing: at once when the command
   wrote `writing` and then failed or was stopped, or a later start's line

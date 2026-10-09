@@ -670,13 +670,17 @@ final class RootCommandTests: XCTestCase {
 
     /// The questions are about the user who pressed Start. Asked of
     /// another user, who has no sudoers lines, they fail. That user's own
-    /// receipt is in the folder, so the command gets as far as sudo.
+    /// receipt is in the folder, so the command gets as far as sudo. The
+    /// other user is daemon (uid 1), an account every Mac has, so the
+    /// receipt's entry can name it.
     func testTheQueriesAreForTheUserTheyAreGiven() throws {
         try Data(nonce1.utf8).write(to: marker)
-        let other = String(getuid() + 1)
-        let theirs = SleepOffReceipts(folder: receipts.folder, owners: receipts.owners, user: getuid() + 1)
+        XCTAssertNotEqual(getuid(), 1)
+        XCTAssertNotNil(getpwuid(1), "daemon")
+        let other = "1"
+        let theirs = SleepOffReceipts(folder: receipts.folder, owners: receipts.owners, user: 1, standIn: [.installed(for: 1)])
         try Data(SleepOffReceipts.initialContent.utf8).write(to: URL(fileURLWithPath: theirs.file))
-        XCTAssertEqual(chmod(theirs.file, 0o644), 0)
+        XCTAssertEqual(chmod(theirs.file, 0o600), 0)
         let r = try runRootCommand(marker: marker, nonce: nonce1, uid: other, receipts: theirs, in: dir)
         XCTAssertEqual(r.status, 5, r.stderr)
         XCTAssertEqual(r.sudoCalls.first, "-n -u #\(other) /usr/bin/env -i LC_ALL=C /usr/bin/sudo -V")
@@ -956,10 +960,13 @@ final class RootCommandTests: XCTestCase {
                     }
                 }
             }
+            // The receipt's mode must be 600, so the test user's immutable
+            // flag (chflags uchg), which ls -le and stat's %Lp do not show,
+            // makes it a file this run cannot open for writing.
             try Data(nonce1.utf8).write(to: marker)
             resetReceipt()
-            XCTAssertEqual(chmod(receipts.file, 0o444), 0)
-            defer { chmod(receipts.file, 0o644) }
+            XCTAssertEqual(chflags(receipts.file, UInt32(UF_IMMUTABLE)), 0)
+            defer { chflags(receipts.file, 0) }
             let r = try runRootCommand(marker: marker, nonce: nonce1, command: command, receipts: receipts, in: dir)
             XCTAssertEqual(r.status, 7, "\(name), read-only: \(r.stderr)")
             XCTAssertEqual(r.pmsetCalls, ["-g"], name)
@@ -987,15 +994,20 @@ final class RootCommandTests: XCTestCase {
             exit.wait()
             XCTAssertEqual(p.terminationStatus, 0, path)
         }
-        func put(_ text: String) throws { try Data(text.utf8).write(to: file) }
+        // A receipt written again (after "missing", say) gets the mode
+        // install.sh gives it.
+        func put(_ text: String) throws {
+            try Data(text.utf8).write(to: file)
+            XCTAssertEqual(chmod(file.path, 0o600), 0)
+        }
         let initial = SleepOffReceipts.initialContent
         let cases: [(what: String, change: () throws -> Void, undo: () throws -> Void)] = [
             ("missing", { try FileManager.default.removeItem(at: file) }, { try put(initial) }),
             ("81 bytes", { try put(String(initial.dropLast())) }, { try put(initial) }),
             ("83 bytes", { try put(initial + "\n") }, { try put(initial) }),
             ("the 45 bytes of an earlier build", { try put("\(SleepOffReceipts.zero) refused\n") }, { try put(initial) }),
-            ("group-writable", { XCTAssertEqual(chmod(file.path, 0o664), 0) }, { XCTAssertEqual(chmod(file.path, 0o644), 0) }),
-            ("writable by others", { XCTAssertEqual(chmod(file.path, 0o646), 0) }, { XCTAssertEqual(chmod(file.path, 0o644), 0) }),
+            ("group-writable", { XCTAssertEqual(chmod(file.path, 0o664), 0) }, { XCTAssertEqual(chmod(file.path, 0o600), 0) }),
+            ("writable by others", { XCTAssertEqual(chmod(file.path, 0o646), 0) }, { XCTAssertEqual(chmod(file.path, 0o600), 0) }),
             ("a second link", { XCTAssertEqual(link(file.path, folder.path + "/other"), 0) }, { XCTAssertEqual(unlink(folder.path + "/other"), 0) }),
             ("a symbolic link to an 82-byte file", {
                 try Data(initial.utf8).write(to: folder.appendingPathComponent("target"))
@@ -1037,7 +1049,7 @@ final class RootCommandTests: XCTestCase {
                 XCTAssertEqual(after, before, "\(label): the receipt, or what stands in its place, is untouched")
                 let says = c.what == "missing"
                     ? "could not be opened. Run install.sh again; sleep was not turned off"
-                    : "is missing, is not the 82-byte file install.sh made, or someone other than root can change it or a folder above it. Run install.sh again; sleep was not turned off"
+                    : "is missing, is not the 82-byte file install.sh made, mode 600 with one access control entry that lets uid \(uid) read it and nothing else, or someone other than root can change it or a folder above it. Run install.sh again; sleep was not turned off"
                 XCTAssertTrue(r.stderr.contains(says), "\(label): \(r.stderr)")
             }
         }
@@ -1047,6 +1059,47 @@ final class RootCommandTests: XCTestCase {
         let r = try runRootCommand(marker: marker, nonce: nonce1, receipts: receipts, in: dir)
         XCTAssertEqual(r.status, 0, r.stderr)
         XCTAssertEqual(receipt, line(nonce1, "writing"))
+    }
+
+    /// F3 (round 28). A receipt with any mode but 600, or with any list of
+    /// access control entries but the one install.sh adds, or whose list
+    /// ls cannot read, stops the command the same way. The entries are
+    /// stand-ins the command's ls shows in front of the file's real ones,
+    /// which are none (RootCommandProcess.withTestReceipts): no real list
+    /// changes. `id -u` resolves the name for real. The control is the
+    /// entry install.sh adds.
+    func testAReceiptWithAnotherModeOrListStopsBeforeAnyQuestion() throws {
+        let says = "is missing, is not the 82-byte file install.sh made, mode 600 with one access control entry that lets uid \(uid) read it and nothing else, or someone other than root can change it or a folder above it. Run install.sh again; sleep was not turned off"
+        let base: SleepOffReceipts = receipts
+        let fails = base.folder + ".acl.fails"
+        var cases: [(what: String, receipts: SleepOffReceipts, mode: mode_t, listFails: Bool)] = [0o644, 0o640, 0o400, 0o700].map { ("mode \(String($0, radix: 8))", base, $0, false) }
+        cases += TestReceipts.refusedLists.map { ($0.name, TestReceipts.with(base, standIn: $0.entries), 0o600, false) }
+        cases.append(("a list ls cannot read", base, 0o600, true))
+        for c in cases {
+            for (name, command) in try bothCommands() {
+                try Data(nonce1.utf8).write(to: marker)
+                resetReceipt()
+                XCTAssertEqual(chmod(base.file, c.mode), 0)
+                if c.listFails { XCTAssertTrue(FileManager.default.createFile(atPath: fails, contents: nil)) }
+                let r = try runRootCommand(marker: marker, nonce: nonce1, command: command, receipts: c.receipts, in: dir)
+                unlink(fails)
+                XCTAssertEqual(chmod(base.file, 0o600), 0)
+                let label = "\(c.what), \(name)"
+                XCTAssertEqual(r.status, 7, "\(label): \(r.stderr)")
+                XCTAssertEqual(r.pmsetCalls, [], "\(label): nothing read, nothing written")
+                XCTAssertEqual(r.sudoCalls, [], "\(label): nothing asked")
+                XCTAssertEqual(r.perlCalls, [], "\(label): nothing written")
+                XCTAssertEqual(receipt, SleepOffReceipts.initialContent, label)
+                XCTAssertTrue(r.stderr.contains(says), "\(label): \(r.stderr)")
+            }
+        }
+        for (name, command) in try bothCommands() {
+            try Data(nonce1.utf8).write(to: marker)
+            resetReceipt()
+            let r = try runRootCommand(marker: marker, nonce: nonce1, command: command, receipts: base, in: dir)
+            XCTAssertEqual(r.status, 0, "the control, \(name): \(r.stderr)")
+            XCTAssertEqual(receipt, line(nonce1, "writing"), name)
+        }
     }
 
     /// No test bypass reaches production: the command as it ships trusts
@@ -1659,15 +1712,15 @@ final class RootCommandSudoAnswerTests: XCTestCase {
     }
 
     /// The command's awk programs that take no variables, in order: the
-    /// receipt's access control reader, the /etc/pam.d/sudo reader, the
-    /// `-V` reader, the `-l` reader, the `-ll` reader and the `pmset -g`
-    /// reader. The receipt's lstat reader, which comes first, is given `-v`
-    /// variables and is not among them.
+    /// folders' access control reader, the receipt's access control reader,
+    /// the /etc/pam.d/sudo reader, the `-V` reader, the `-l` reader, the
+    /// `-ll` reader and the `pmset -g` reader. The receipt's lstat reader,
+    /// which comes first, is given `-v` variables and is not among them.
     private func programs() throws -> [String] {
         let programs = AdministratorPrompt.rootCommand.components(separatedBy: "/usr/bin/awk '").dropFirst().compactMap { $0.components(separatedBy: "'").first }
-        XCTAssertEqual(programs.count, 6)
-        XCTAssertEqual(AdministratorPrompt.rootCommand.components(separatedBy: "/usr/bin/awk ").count - 1, 7)
-        guard programs.count == 6 else { throw XCTSkip("the command's awk programs moved") }
+        XCTAssertEqual(programs.count, 7)
+        XCTAssertEqual(AdministratorPrompt.rootCommand.components(separatedBy: "/usr/bin/awk ").count - 1, 8)
+        guard programs.count == 7 else { throw XCTSkip("the command's awk programs moved") }
         return programs
     }
 
@@ -1694,7 +1747,7 @@ final class RootCommandSudoAnswerTests: XCTestCase {
     /// macOS's, lists and runs a command, so it takes that version alone,
     /// with the grammar that version reads.
     func testTheVersionReaderTakesOnlySudo1_9_17p2WithTheSudoersPlugins() throws {
-        let reader = try programs()[2]
+        let reader = try programs()[3]
         let v = SudoFormat.version
         let accepted = [
             "1.9.17p2 with sudoers' I/O and audit plugins": SudoFormat.versionOutput(),
@@ -1740,7 +1793,7 @@ final class RootCommandSudoAnswerTests: XCTestCase {
     /// listing ran without a password is its exit status, which the
     /// command checks before this reader.
     func testTheListingReaderTakesOnlyTheDefaultsItAccepts() throws {
-        let reader = try programs()[3]
+        let reader = try programs()[4]
         let rule = ["(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0"]
         func listing(_ defaults: [String]) -> String { SudoFormat.listing(defaults: defaults, rules: rule) }
         let accepted = [
@@ -1793,7 +1846,7 @@ final class RootCommandSudoAnswerTests: XCTestCase {
     /// file either way, and nothing else: every policy that differs in the
     /// answer to `-ll`, and near misses of the rule's own answer.
     func testTheRuleReaderTakesOnlyTheInsomniaRuleWithoutAPassword() throws {
-        let reader = try programs()[4]
+        let reader = try programs()[5]
         let restore = "/usr/bin/pmset -a disablesleep 0"
         for policy: RootSudoPolicy in [.rule, .etcPath] {
             XCTAssertEqual(try status(reader, policy.answers().check.stdout), 0, "\(policy)")

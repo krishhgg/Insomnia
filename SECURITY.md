@@ -120,19 +120,37 @@ The receipt is `/private/var/db/com.kgarg.insomnia/<uid>`, exactly 82
 bytes on one line: a start's nonce (an uppercase UUID), a space, the nonce
 the receipt held before that start (its predecessor), a space, `writing` or
 `refused`, and a newline. install.sh makes the folder (mode 0755) and the
-file (mode 0644, holding the all-zero nonce twice and `refused`), both
+file (mode 0600, holding the all-zero nonce twice and `refused`), both
 root's, through `sudo -n` with those fixed paths, after checking by lstat
 that every folder from `/private/var/db` up to / is root's, is not a link,
 has no group or other write permission and no access control entry that
-allows anything. It checks the folder and the file again once they exist.
-A folder or file already there in any other form (another owner, a looser
-mode, a link, another type or size, a second hard link, an allowing ACL)
-stops the install: it never changes the owner or mode of something it did
-not make, and says to remove it by hand. That includes the 45-byte receipt
-of earlier builds of this change, which is not converted. A receipt already
-as it makes it is kept. Nothing running as the user can write the receipt
-or replace it or any folder above it. Every Insomnia folder of the user
-(`INSOMNIA_HOME`) shares the one receipt.
+allows anything. It then gives the file one access control entry, `sudo
+-n chmod +a "user:<name> allow read"`, for the account that ran it. Only
+root and that account can open the receipt, so no other account can take
+its lock. It checks the folder and the file again once they exist. A
+receipt an earlier build made (root's, one link, 82 bytes, no group or
+other write, with no entry or only that one) gets mode 0600 and the entry
+in place, with its bytes, its inode and any `held` claim kept. A folder or
+file already there in any other form (another owner, a looser mode, a
+link, another type or size, a second hard link, an allowing ACL on a
+folder, any other entry on the file) stops the install: it never changes
+the owner of something it did not make, and says to remove it by hand.
+That includes the 45-byte receipt of earlier builds of this change, which
+is not converted. A receipt already as it makes it is kept. Nothing
+running as the user can write the receipt or replace it or any folder
+above it. Every Insomnia folder of the user (`INSOMNIA_HOME`) shares the
+one receipt.
+
+The app, backstop.sh, uninstall.sh and the root command accept the
+receipt only at mode 0600 with exactly that one entry: allow, the read
+right alone, for the user's uid, not inherited and with no flags. Another
+account's or a group's entry, a deny entry, a second entry, or any other
+right or flag refuses. The app reads the list through acl(3) and sees
+every entry. The scripts and the root command read it through `ls -le`,
+which never prints the synchronize right, prints folder-only rights and
+the inherit flags only for folders, and skips an entry it cannot read; a
+receipt with one of those added can pass their check. They then ask
+`id -u` whether the entry's name is the user's uid.
 
 Beside it, install.sh makes `<uid>.released` through `sudo -n install`:
 the user's own file, mode 0600, 42 bytes, holding a nonce and `free` or
@@ -354,10 +372,15 @@ trace.
 - One set while a dialog is up, before the root command's first read, or
   while its `writing` line is written, before the second read, stops the
   command and stays, after a crash too, when the command reports exit 6 or
-  writes its `refused` line. When that line cannot be written and the
-  status is lost (a signal, the dialog's time limit, a crash before the
-  app acts on it), the receipt still shows `writing`, and the settlement
-  sets that 1 to 0. One set after the
+  writes its `refused` line. When that line cannot be written, the
+  receipt still shows `writing`. The app that gets the exit 6 rolls the
+  start back with no undo, and while it cannot journal that rollback its
+  own later settlements of the start keep the exit 6 as their verdict.
+  When the status is lost (a signal, the dialog's time limit, a crash
+  before the app acts on it), or the app quits or crashes before it can
+  journal the rollback, or backstop.sh or uninstall.sh settles the start
+  first, that settlement reads `writing` and sets that 1 to 0. One set
+  after the
   second read is set to 0 when the start then fails (a pmset failure, or a
   signal or the dialog's time limit before pmset). The second read narrows
   the window; it is not an owner token and does not close it.
@@ -391,16 +414,21 @@ trace.
   link. It replaces a release file with no claim by rename, after checking
   that the file still holds the bytes it read; a write between that check
   and the rename is lost.
-- Any local account can hold the receipt's lock for as long as it likes:
-  the receipt is readable (0644) and the lock is advisory. Starts are then
-  refused, and a journaled start is retried, unsettled, with its sleep undo
-  held, for as long as the lock is held, after its `expires` too. A root
+- Only root and the user can open the receipt (mode 0600 and one read
+  entry for the user), so another account cannot take its lock. Anything
+  running as the user can hold it for as long as it likes, since the lock
+  is advisory; the user's own processes can already rewrite the journal.
+  Starts are then refused, and a journaled start is retried, unsettled,
+  with its sleep undo held, for as long as the lock is held, after its
+  `expires` too. A root
   command that never exits (a hung pmset or sudo query) holds the lock the
   same way, and Insomnia then never restores sleep for that start.
   Deleting the marker does not stop a command already past its nonce
   check, and the lock that command holds can outlast the dialog's answer
   window. A crash or timeout under a dialog keeps Starts in that folder
-  refused for up to about 130 s, and a start in one Insomnia folder keeps
+  refused for at least about 130 s, and with no limit while a command
+  for that start runs or the receipt's lock, the claim or the journal
+  cannot be had. A start in one Insomnia folder keeps
   Starts in every other folder of the user refused until it is settled.
   uninstall.sh holds the receipt's lock while it runs `sudo rm`, which may
   ask for a password. After uninstall.sh removes the shared receipt, any
@@ -460,8 +488,8 @@ trace.
   check above ran against fakes and files in a temporary folder.
 - These rules cost availability, and none of that cost is waived: Start
   is refused under any sudo, sudo.conf, PAM or Defaults setting the checks
-  do not accept, without `/usr/bin/perl`, while any account holds the
-  readable receipt's lock, while a claim nothing gives back is out, and
+  do not accept, without `/usr/bin/perl`, while the user or root holds
+  the receipt's lock, while a claim nothing gives back is out, and
   over the 45-byte receipt of earlier builds of this change, which
   install.sh refuses rather than convert. A start can stay unsettled, with
   Starts refused and its sleep undo held, for as long as its receipt stays

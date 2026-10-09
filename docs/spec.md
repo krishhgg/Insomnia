@@ -230,14 +230,24 @@ recovery; newly written journals use `frozenProcesses`.
   has typed the password before any refusal.
 
   The receipt exists before any Start: install.sh makes the folder
-  (0755) and the file (0644, 82 bytes, the all-zero nonce twice and
+  (0755) and the file (0600, 82 bytes, the all-zero nonce twice and
   `refused`), root's, through `sudo -n` by those fixed paths, after
   checking by lstat that every folder from `/private/var/db` up is root's
-  with no group or other write bit and no allowing ACL. It checks again
-  once they exist. A folder or receipt already there in another form
-  stops the install with nothing about it changed (no chown or chmod of
-  something it did not make), the 45-byte receipt of earlier builds of
-  this change included; a receipt already as it makes it is kept. Beside
+  with no group or other write bit and no allowing ACL, then adds the
+  file's one access control entry, `user:<name> allow read`, with `sudo -n
+  chmod +a`. Only root and the user can open it, so no other account can
+  take its lock. It checks again once they exist. A receipt an earlier
+  build made (root's, one link, 82 bytes, no group or other write, no
+  entry or only that one) gets mode 0600 and the entry in place, bytes,
+  inode and `held` claim kept. A folder or receipt already there in
+  another form stops the install with nothing about it changed (no chown
+  of something it did not make), the 45-byte receipt of earlier builds of
+  this change included; a receipt already as it makes it is kept. Every
+  reader accepts only mode 0600 and that one entry (allow, read alone, the
+  user's uid, not inherited, no flags): the app through acl(3), the
+  scripts and the root command through `ls -le` and `id -u`, which cannot
+  see the rights and flags ls does not print for a file or an entry it
+  cannot read. Beside
   it, under the receipt's lock, install.sh writes `<uid>.released`
   through `sudo -n install`: the user's own file, 0600, 42 bytes, the
   receipt's nonce and `free`. A `held` claim on an existing receipt is
@@ -255,8 +265,12 @@ recovery; newly written journals use `frozenProcesses`.
   end. One set while the `writing` line is written stops the command at
   the second read and stays, except when its `refused` line cannot be
   written and the exit 6 never reaches the app (a signal, the time limit,
-  a crash): the receipt then still shows `writing`, and the settlement
-  sets that 1 to 0. One set after the second read is set to 0 by that
+  a crash), or reaches it but the app cannot journal its rollback before
+  it quits or crashes or backstop.sh or uninstall.sh settles the start:
+  the receipt then still shows `writing`, and that settlement sets that 1
+  to 0. While the app that got the exit 6 runs, its own settlements of
+  that start keep the exit 6 as their verdict. One set after the second
+  read is set to 0 by that
   start's undo when the start then fails, even when the command stopped
   before its write. One set while a dialog is up is also set to 0 once
   `expires` has passed when the receipt shows nothing (missing, replaced,
@@ -1177,8 +1191,9 @@ Invariants:
   one.
 - A transaction holds the recovery lock while a command it started may
   still change something. A stuck dialog whose marker this transaction
-  deleted under the marker's lock can no longer change anything, so it does
-  not hold the lock. That holds only for the file the start wrote:
+  deleted under the marker's lock can no longer change anything while the
+  marker is not written again under this user and the clock is not set
+  back, so it does not hold the lock. That holds only for the file the start wrote:
   `savePendingStart` returns its device and inode, and a marker found
   replaced (a copy could have been swapped in after the root command
   locked the original) or missing (it went without the lock) is not

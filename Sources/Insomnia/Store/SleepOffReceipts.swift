@@ -1,4 +1,5 @@
 import Darwin
+import Darwin.membership
 import Foundation
 
 /// A start's intent to turn sleep off. Journaled with `sleepDisabledByUs`
@@ -68,7 +69,10 @@ enum SleepOffVerdict: Equatable, Sendable {
 /// `/private/var/db/com.kgarg.insomnia/<uid>`, one file per user, exactly
 /// 82 bytes: a start's nonce, the nonce the receipt held before it, and
 /// `writing` or `refused`, on one line. install.sh creates the folder and
-/// the file, both root's, and only root can change either. Every Insomnia
+/// the file, both root's, and only root can change either. The file is
+/// 0600 with one access control entry, `user:<name> allow read`, for the
+/// user its name is the uid of (`AccessEntry.installed`): only root and
+/// that user can open it, so only they can hold its lock. Every Insomnia
 /// folder of the user (INSOMNIA_HOME) shares it.
 ///
 /// It is also the lock every party takes before it acts on a start (see
@@ -120,6 +124,13 @@ struct SleepOffReceipts: Sendable {
     /// This user's receipt, trusting root alone.
     static var live: SleepOffReceipts { SleepOffReceipts(folder: folder, owners: [0], user: getuid()) }
 
+    init(folder: String, owners: Set<uid_t>, user: uid_t, standIn: [AccessEntry]? = nil) {
+        self.folder = folder
+        self.owners = owners
+        self.user = user
+        self.standIn = standIn
+    }
+
     /// An absolute path with no `.`, `..`, empty or symbolic link
     /// component; anything else fails every check.
     let folder: String
@@ -128,6 +139,11 @@ struct SleepOffReceipts: Sendable {
     /// their temporary directory, since they cannot create root's files.
     let owners: Set<uid_t>
     let user: uid_t
+    /// nil in the app. Tests cannot make root's file, and cannot give a
+    /// file of their own the entry install.sh adds without changing a real
+    /// access control list, so they name entries here: the checks read
+    /// them first in the receipt's list, before the entries it really has.
+    let standIn: [AccessEntry]?
 
     var file: String { folder + "/" + String(user) }
     /// `<uid>.released`, beside the receipt: the user's own file, 42 bytes,
@@ -322,7 +338,7 @@ struct SleepOffReceipts: Sendable {
             return over ? .mayHaveWritten(error.localizedDescription) : .undecided("\(error.localizedDescription); a command for that start could still write \(until)")
         }
         if found.nonce == attempt.nonce {
-            return found.refused ? .neverWrote : .mayHaveWritten("\(file) shows that the command went on to turn sleep off")
+            return found.refused ? .neverWrote : .mayHaveWritten("\(file) holds that start's writing line: its command was about to turn sleep off and may have")
         }
         if found.nonce == attempt.predecessor {
             return over ? .neverWrote : .undecided("the password dialog of that start can still be answered \(until)")
@@ -417,9 +433,10 @@ struct SleepOffReceipts: Sendable {
 
     /// lstat(2) of the receipt and of each folder up to /: never through a
     /// link, each one root's (or an owner in `owners`), with no write
-    /// permission for group or others and no access control entry that
-    /// allows anything. The receipt itself must also be a regular file with
-    /// one link and `size` bytes.
+    /// permission for group or others. Each folder has no access control
+    /// entry that allows anything. The receipt itself must also be a
+    /// regular file with one link, `size` bytes and mode 0600, whose list
+    /// is exactly `AccessEntry.installed(for: user)`.
     private func check() throws -> stat {
         let parts = folder.split(separator: "/", omittingEmptySubsequences: false)
         guard folder.hasPrefix("/"), parts.count > 1, parts.dropFirst().allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." }) else {
@@ -453,30 +470,147 @@ struct SleepOffReceipts: Sendable {
         guard info.st_mode & 0o022 == 0 else {
             throw Problem(detail: "\(path) can be changed by its group or by others")
         }
-        switch Self.allowsAnything(path) {
-        case false?: break
-        case true?: throw Problem(detail: "\(path) has an access control entry that allows changes")
-        case nil: throw Problem(detail: "the access control list of \(path) could not be read")
+        guard directory || info.st_mode & 0o7777 == 0o600 else {
+            throw Problem(detail: "\(path) has mode \(String(info.st_mode & 0o7777, radix: 8)), not the 600 install.sh gives it")
+        }
+        guard let real = Self.accessEntries(path) else {
+            throw Problem(detail: "the access control list of \(path) could not be read")
+        }
+        if directory {
+            guard !real.contains(where: \.allows) else {
+                throw Problem(detail: "\(path) has an access control entry that allows changes")
+            }
+        } else if let why = Self.receiptAccessProblem((standIn ?? []) + real, user: user) {
+            throw Problem(detail: "\(path) \(why)")
         }
         return info
     }
 
-    /// Whether `path` itself (never a link's target) has an extended access
-    /// control entry of the allow kind. nil when the list cannot be read.
-    private static func allowsAnything(_ path: String) -> Bool? {
+    /// Why `entries` are not the receipt's list as install.sh makes it, or
+    /// nil. It must be exactly one entry, `AccessEntry.installed(for:
+    /// user)`: it allows, names `user`, grants `read` alone, and carries no
+    /// flag, so it was not inherited from the folder. Anything else lets
+    /// another account open the receipt and hold its lock, or lets someone
+    /// other than root change it, or is not what install.sh made.
+    static func receiptAccessProblem(_ entries: [AccessEntry], user: uid_t) -> String? {
+        let wanted = AccessEntry.installed(for: user)
+        guard entries.count == 1, let only = entries.first else {
+            return entries.isEmpty
+                ? "has no access control entry, so uid \(user) cannot read it"
+                : "has \(entries.count) access control entries, not the one that lets uid \(user) read it"
+        }
+        guard only == wanted else {
+            return "has an access control entry other than the one that lets uid \(user) read it: \(only.text)"
+        }
+        return nil
+    }
+
+    /// `path`'s own extended access control list (never a link's target),
+    /// in order; empty when it has none, nil when it cannot be read whole.
+    static func accessEntries(_ path: String) -> [AccessEntry]? {
         errno = 0
         guard let acl = acl_get_link_np(path, ACL_TYPE_EXTENDED) else {
-            return errno == ENOENT ? false : nil
+            return errno == ENOENT ? [] : nil
         }
         defer { acl_free(UnsafeMutableRawPointer(acl)) }
+        var entries: [AccessEntry] = []
         var entry: acl_entry_t?
         var which = ACL_FIRST_ENTRY.rawValue
         while acl_get_entry(acl, which, &entry) == 0 {
             which = ACL_NEXT_ENTRY.rawValue
             var tag = ACL_UNDEFINED_TAG
-            guard acl_get_tag_type(entry, &tag) == 0 else { return nil }
-            if tag == ACL_EXTENDED_ALLOW { return true }
+            var rights: acl_permset_mask_t = 0
+            var flags: acl_flagset_t?
+            guard acl_get_tag_type(entry, &tag) == 0, acl_get_permset_mask_np(entry, &rights) == 0,
+                  acl_get_flagset_np(UnsafeMutableRawPointer(entry), &flags) == 0,
+                  let qualifier = acl_get_qualifier(entry) else { return nil }
+            defer { acl_free(qualifier) }
+            var id: id_t = 0
+            var type: Int32 = -1
+            let principal: AccessEntry.Principal
+            if mbr_uuid_to_id(qualifier.assumingMemoryBound(to: UInt8.self), &id, &type) == 0, type == ID_TYPE_UID {
+                principal = .user(id)
+            } else if type == ID_TYPE_GID {
+                principal = .group(id)
+            } else {
+                principal = .unknown
+            }
+            entries.append(AccessEntry(
+                allows: tag == ACL_EXTENDED_ALLOW,
+                principal: principal,
+                rights: AccessEntry.words(rights),
+                flags: Set(AccessEntry.flagWords.filter { acl_get_flag_np(flags, $0.flag) == 1 }.map(\.word))
+            ))
         }
-        return false
+        return entries
     }
+}
+
+/// One entry of an extended access control list, as `SleepOffReceipts`
+/// reads it: the words are chmod(1)'s and ls(1)'s.
+struct AccessEntry: Equatable, Sendable {
+    enum Principal: Equatable, Sendable {
+        case user(uid_t)
+        case group(gid_t)
+        /// A UUID the directory does not map to a user or a group.
+        case unknown
+    }
+
+    /// ACL_EXTENDED_ALLOW. false for a deny entry, or a tag that is
+    /// neither.
+    var allows: Bool
+    var principal: Principal
+    /// The rights it names.
+    var rights: Set<String>
+    /// Its flags, `inherited` for an entry the file took from its folder.
+    var flags: Set<String>
+
+    /// The one entry install.sh adds to the receipt, with `chmod +a
+    /// "user:<name> allow read"`.
+    static func installed(for user: uid_t) -> AccessEntry {
+        AccessEntry(allows: true, principal: .user(user), rights: ["read"], flags: [])
+    }
+
+    /// For a message, about as `ls -le` prints it.
+    var text: String {
+        let who = switch principal {
+        case let .user(uid): "uid \(uid)"
+        case let .group(gid): "gid \(gid)"
+        case .unknown: "an unknown account"
+        }
+        let words = (rights.sorted() + flags.subtracting(["inherited"]).sorted()).joined(separator: ",")
+        return "\(who)\(flags.contains("inherited") ? " inherited" : "") \(allows ? "allow" : "deny") \(words)"
+    }
+
+    /// Every right acl(3) defines, by its word. A file's `read` is the bit
+    /// a folder calls `list`, `write` is `add_file`, `execute` is `search`
+    /// and `append` is `add_subdirectory`.
+    static let rightWords: [(right: acl_perm_t, word: String)] = [
+        (ACL_READ_DATA, "read"), (ACL_WRITE_DATA, "write"), (ACL_EXECUTE, "execute"),
+        (ACL_DELETE, "delete"), (ACL_APPEND_DATA, "append"), (ACL_DELETE_CHILD, "delete_child"),
+        (ACL_READ_ATTRIBUTES, "readattr"), (ACL_WRITE_ATTRIBUTES, "writeattr"),
+        (ACL_READ_EXTATTRIBUTES, "readextattr"), (ACL_WRITE_EXTATTRIBUTES, "writeextattr"),
+        (ACL_READ_SECURITY, "readsecurity"), (ACL_WRITE_SECURITY, "writesecurity"),
+        (ACL_CHANGE_OWNER, "chown"), (ACL_SYNCHRONIZE, "synchronize"),
+    ]
+
+    /// The words for the rights in `mask`, an entry's whole permission set,
+    /// and the bits of any right not in `rightWords` in hex, so that a
+    /// right this list does not name still makes the entry differ from
+    /// `installed`.
+    static func words(_ mask: acl_permset_mask_t) -> Set<String> {
+        var words = Set(rightWords.filter { mask & acl_permset_mask_t($0.right.rawValue) != 0 }.map(\.word))
+        let named = rightWords.reduce(acl_permset_mask_t(0)) { $0 | acl_permset_mask_t($1.right.rawValue) }
+        if mask & ~named != 0 {
+            words.insert("0x" + String(mask & ~named, radix: 16))
+        }
+        return words
+    }
+
+    /// Every entry flag acl(3) defines, by its word.
+    static let flagWords: [(flag: acl_flag_t, word: String)] = [
+        (ACL_ENTRY_INHERITED, "inherited"), (ACL_ENTRY_FILE_INHERIT, "file_inherit"),
+        (ACL_ENTRY_DIRECTORY_INHERIT, "directory_inherit"), (ACL_ENTRY_LIMIT_INHERIT, "limit_inherit"),
+        (ACL_ENTRY_ONLY_INHERIT, "only_inherit"),
+    ]
 }

@@ -93,7 +93,14 @@ The app and the script serialize on one `flock(2)` lock,
 `.recovery.lock`, which is never unlinked so both lock the same inode
 (`RecoveryLock.swift`; `lockf` on fd 9 in the scripts). `uninstall.sh`
 takes the lock, runs the backstop with `--force` under it, and refuses to
-remove the recovery machinery while anything is still journaled. Battery
+remove the recovery machinery while anything is still journaled or while
+any read of a private copy of the journal fails (a read it cannot finish
+is never counted as clean), and removes state.json only while it still
+equals that checked copy. Before it removes anything it also takes the
+receipt's lock and refuses while the release file shows a claim, names
+another nonce or cannot be read, or the lock stays busy; it keeps that
+lock until the shared rule, agent, bundle, receipt and release file are
+gone. Battery
 and thermal floors run only while the app is alive; the backstop does not
 provide them.
 
@@ -224,10 +231,13 @@ Flag a change that breaks one of these; do not flag the behavior itself.
 - `AdministratorPrompt.swift`, `SessionManager.swift`. The password prompt
   gets SIGTERM at 120 s and is never sent SIGKILL. One still running 3 s
   later is reported with its pid and its marker is deleted under the
-  marker's lock. Once that succeeds its root command can no longer run
-  pmset, so the start waits for its answer window (`expires`, at most 15
-  s by then) to end, is settled from the receipt and releases the
-  recovery lock; the prompt is watched outside the
+  marker's lock. Once that succeeds a command the dialog starts from then
+  on stops at its marker check, unless this user writes the marker again
+  or the clock is set back, so the start waits for its answer window
+  (`expires`, at most 15 s by then) to end, is settled from the receipt
+  under the receipt's lock (`.undecided`, with Starts refused and the
+  sleep undo held, while a command for the start holds that lock) and
+  releases the recovery lock; the prompt is watched outside the
   transaction, and the menu line offers `kill <pid>` until osascript exits
   and goes once the prompt has. Only while the root command holds the
   marker's lock (anywhere from its nonce check to its exit, a sudo query
@@ -282,9 +292,13 @@ Flag a change that breaks one of these; do not flag the behavior itself.
   opened read-only on fd 8 and locked with `/usr/bin/lockf -s -t 10 8`
   (75 if it stays locked), checked by fixed path (7: `stat`/`ls -le` of
   `/private/var/db/com.kgarg.insomnia/<uid>` and every folder up to /
-  showing a one-link 82-byte regular file under folders, all root's, no
-  group or other write, no allowing ACL, and fd 8 and the path the
-  device:inode the start claimed, `$7`), the nonce check (3), `expires`
+  showing a one-link 82-byte regular file of mode 600 whose only ACL
+  entry is `0: user:<name> allow read` with `id -u <name>` equal to `$4`,
+  under folders with no allowing ACL, all root's with no group or other
+  write, and fd 8 and the path the device:inode the start claimed, `$7`;
+  `ls -le` does not show `synchronize`, folder-only rights or entries it
+  cannot read on a file, so only the app's acl(3) check is exact), the
+  nonce check (3), `expires`
   (4), no
   `/private/etc/sudo.conf` in any form (5: `sudo -V` does not list an
   approval plugin with no show_version, and sudo consults one only when
@@ -370,7 +384,9 @@ Flag a change that breaks one of these; do not flag the behavior itself.
   memory. Flag a change that writes anything (pmset, the receipt or a
   restore run as the user) before the checks pass, has root write the
   marker or any path in the user's folders, chmods or chowns a receipt
-  or folder install.sh did not make, trusts a receipt owner other than
+  or folder install.sh did not make, gives the receipt any mode but 600
+  or any ACL entry but the installing user's read, accepts a receipt with
+  another mode or entry, trusts a receipt owner other than
   root in a shipped build (an environment variable, file or flag that
   widens `owners` or `RECEIPT_OWNER` included), reads the receipt before
   the marker is gone under its lock, lets `.neverWrote` clear an owed
@@ -410,8 +426,9 @@ Flag a change that breaks one of these; do not flag the behavior itself.
   also undo; an attempt that stays `.undecided` keeps Start refused and
   the session recorded until a later holder settles it, and holds the
   sleep undo for as long as the receipt stays locked, with no limit, so a
-  root command that never exits means no restore and any local account can
-  delay one (the receipt is readable and the lock advisory); the receipt
+  root command that never exits means no restore and a process running as
+  the user can delay one (only root and the user can open the receipt; its
+  lock is advisory); the receipt
   is
   `F_FULLFSYNC`ed, but what that and pmset's own write guarantee across
   a power loss is not measured, so older receipt content beside pmset's 1
@@ -419,8 +436,10 @@ Flag a change that breaks one of these; do not flag the behavior itself.
   process running as the user can rewrite state.json and the attempt,
   swap the marker while a command holds it, or write a settled start's
   nonce into a new marker before a password goes into that start's old
-  dialog; a start that cannot clear its attempt after success, and a
-  marker found with no attempt, end that session early; and while the
+  dialog; a start that cannot journal its settled success, and a marker
+  found with no attempt, end that session early, while a settled success
+  whose claim or record cleanup fails resumes its own session with Starts
+  refused until the cleanup finishes; and while the
   journal claims a 1 another tool's 1 is taken for it, and a refusal
   leaves it owed. The listing is about the rule when it is
   read: a rule removed later, a sudo.conf or PAM file changed later, or

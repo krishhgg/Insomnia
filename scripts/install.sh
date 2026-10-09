@@ -72,6 +72,7 @@ HEAD=/usr/bin/head
 INSTALL=/usr/bin/install
 STAT=/usr/bin/stat
 LS=/bin/ls
+ID=/usr/bin/id
 # sudo is given visudo and install by full path. Given a bare name, it would
 # search the caller's PATH and run whatever it finds there as root.
 VISUDO=/usr/sbin/visudo
@@ -146,7 +147,8 @@ command_line() { local line; line="$(printf '%q ' "$@")"; printf '%s' "${line% }
 # 125 when it is sudo and still running (pid in BOUNDED_PID).
 #
 # supervise() starts the call in the background and enforces the limit
-# itself, so the limit holds even if this run is killed while it waits. Once
+# itself, so the limit holds even if this run is killed while it waits, or
+# its whole process group gets SIGTERM or SIGHUP. Once
 # the limit has passed, the call gets SIGTERM, and SIGKILL one to two seconds
 # later if it is still there. sudo only ever gets SIGTERM: killing sudo would
 # orphan what it runs as root. Both waits are read from bash's SECONDS clock,
@@ -178,7 +180,7 @@ bounded() { # command args...
       sleep 0.01
     done
     if [[ ! -s "$base.rc" ]]; then
-      BOUNDED_PID="$(cat "$base.pid" 2>/dev/null || true)"
+      BOUNDED_PID="$("$CAT" "$base.pid" 2>/dev/null || true)"
       return 125
     fi
   fi
@@ -195,10 +197,19 @@ bounded() { # command args...
 # The call is its only job, so `kill %1` signals the call, and the shell
 # skips a job it has already reaped: a reused pid is never signalled. The
 # status file is written once the call has been reaped.
+# The supervisor keeps fd 9 until the call has exited and been reaped, and
+# the call may close its own copy (sudo does), so nothing else may end the
+# supervisor first. It ignores SIGTERM and SIGHUP, which reach this run's
+# whole process group when launchd stops what is left of a job or a
+# terminal closes, and with errexit off a failed status write or a failed
+# check does not end it either. The call gets the default actions back
+# before it starts, so the SIGTERM at its limit can still stop it.
 supervise() { # base command args...
   local base="$1" cpid rc=0 deadline
   shift
-  "$@" </dev/null >"$base.out" 2>&1 &
+  set +e
+  trap '' TERM HUP
+  ( trap - TERM HUP; exec "$@" ) </dev/null >"$base.out" 2>&1 &
   cpid=$!
   echo "$cpid" > "$base.pid"
   deadline=$(( SECONDS + CALL_TIMEOUT_SECONDS ))
@@ -715,19 +726,21 @@ FAIL
   exit 1
 fi
 
-# The receipt: /private/var/db/com.kgarg.insomnia/<uid>, root's, 0644, one
-# link, 82 bytes (SleepOffReceipts.swift). The command behind a Start's
+# The receipt: /private/var/db/com.kgarg.insomnia/<uid>, root's, 0600, one
+# link, 82 bytes (SleepOffReceipts.swift), with one access control entry,
+# `user:<name> allow read`, for this user. Only root and this user can open
+# it, so no other account can hold its lock. The command behind a Start's
 # password dialog locks it and writes it as root before it turns sleep off,
 # and the app, backstop.sh and uninstall.sh read it under the same lock to
 # tell whether a start that never finished did. Root writes only under
 # folders nobody but root can change, so every folder from the receipt's up
 # to / is checked first, by lstat (a link fails), and again at the end.
-# Nothing here changes the owner or mode of something already there: a
-# folder or file that is not as this script makes it stops the install, to
-# be removed by hand. A receipt that is already as this script makes it
-# stays as it is, since it may record a start the recovery below, or an
-# Insomnia folder of this user other than this one (INSOMNIA_HOME), still
-# has to settle.
+# Nothing here changes the owner or mode of something already there, apart
+# from the receipt's mode and entry below: a folder or file that is not as
+# this script makes it stops the install, to be removed by hand. A receipt
+# that is already as this script makes it stays as it is, since it may
+# record a start the recovery below, or an Insomnia folder of this user
+# other than this one (INSOMNIA_HOME), still has to settle.
 # Prints why the folders from $1 up to / are not safe for root to write
 # under, or nothing.
 folders_problem() { # folder
@@ -745,17 +758,59 @@ folders_problem() { # folder
     echo "$1 or a folder above it has an access control entry that allows changes, or could not be listed"
   fi
 }
-# Prints why $RECEIPT is not as this script makes it, or nothing.
-receipt_problem() {
+# Prints why $RECEIPT is not a regular file of root's with one link and 82
+# bytes that only root can change, or nothing.
+receipt_base_problem() {
   local listing
   listing="$("$STAT" -f '%u %Lp %l %z %HT' "$RECEIPT" 2>/dev/null)" || listing=""
   if ! printf '%s\n' "$listing" | /usr/bin/awk -v o="$RECEIPT_OWNER" '{ k = NR == 1 && NF == 6 && $5 == "Regular" && $6 == "File" && $3 == 1 && $4 == 82 && ($1 == 0 || $1 == o) && $2 !~ /[2367].?$/ }; END { exit !(k && NR == 1) }'; then
     echo "$RECEIPT is not a regular file of root's with one link and 82 bytes that only root can change"
+  fi
+}
+# Prints the receipt's access control entries as `ls -le` shows them: none
+# (it has no entry), ours (exactly the one this script adds), or other
+# (anything else, or a list that could not be read). Only `user:<name>
+# allow read`, as entry 0 and alone, with `id -u <name>` this user's uid,
+# is ours. ls(1) prints `inherited` after the name of an inherited entry,
+# every right after `allow` or `deny`, and a UUID in place of
+# `user:<name>` for an account the directory cannot name (file_cmds
+# ls/print.c), so each of those is other. It never prints synchronize,
+# prints the rights and flags only folders use only for a folder, and
+# skips an entry it cannot read, so those pass here; the app's check reads
+# every entry, right and flag. As receipt_access_problem in backstop.sh
+# and uninstall.sh, the root command and SleepOffReceipts.swift.
+receipt_entries() {
+  local listing name
+  if ! listing="$("$LS" -le "$RECEIPT" 2>/dev/null)" || [[ "$listing" != -* ]]; then
+    echo other
     return 0
   fi
-  listing="$("$LS" -le "$RECEIPT" 2>/dev/null)" || listing=""
-  if [[ -z "$listing" ]] || ! printf '%s\n' "$listing" | /usr/bin/awk '$1 ~ /^[0-9]+:$/ && / allow / { f = 1 }; END { exit f }'; then
-    echo "$RECEIPT has an access control entry that allows changes, or could not be listed"
+  if [[ "$listing" != *$'\n'* ]]; then
+    echo none
+    return 0
+  fi
+  name="$(printf '%s\n' "$listing" | /usr/bin/awk 'NR == 1 { k = /^-/ }; NR == 2 && k && /^ 0: user:[^ :]+ allow read$/ { n = substr($2, 6) }; END { if (NR == 2) print n }')"
+  if [[ -n "$name" ]] && [[ "$("$ID" -u -- "$name" 2>/dev/null)" == "$UID_NUM" ]]; then
+    echo ours
+  else
+    echo other
+  fi
+}
+# Prints why $RECEIPT is not as this script makes it, or nothing.
+receipt_problem() {
+  local problem mode
+  problem="$(receipt_base_problem)"
+  if [[ -n "$problem" ]]; then
+    echo "$problem"
+    return 0
+  fi
+  mode="$("$STAT" -f '%Lp' "$RECEIPT" 2>/dev/null)" || mode=""
+  if [[ "$mode" != 600 ]]; then
+    echo "$RECEIPT has mode ${mode:-that could not be read}, not 600"
+    return 0
+  fi
+  if [[ "$(receipt_entries)" != ours ]]; then
+    echo "$RECEIPT does not have exactly one access control entry, the one that lets $USER_NAME (uid $UID_NUM) read it and nothing else, or its list could not be read"
   fi
 }
 receipt_stop() { # problem
@@ -780,7 +835,31 @@ the new build was discarded.
 FAIL
   exit 1
 }
+# Runs `sudo -n` with the command after $1, which names it for a message,
+# within the call limit, and stops the install when it fails.
+receipt_sudo() { # what command...
+  local what="$1" rc=0
+  shift
+  bounded "$SUDO" -n "$@" || rc=$?
+  if (( rc == 124 || rc == 125 )); then
+    echo >&2
+    sudo_stalled_note "$rc" "Install stopped: '$what'"
+    echo "Installed so far: $SUDOERS. The app at $APP and the LaunchAgent were not touched; the new build was discarded." >&2
+    exit 1
+  elif (( rc != 0 )); then
+    if [[ -n "$BOUNDED_OUTPUT" ]]; then printf '%s\n' "$BOUNDED_OUTPUT" >&2; fi
+    receipt_sudo_failed "$what" "$rc"
+  fi
+}
 step "Creating the receipt $RECEIPT"
+# The account name the receipt's entry gives read access to. chmod +a
+# takes a name, which the directory maps to the account's UUID, and ls -le
+# prints it back. A name with a space or a colon, which chmod would split,
+# or one that is not this uid's, stops the install.
+USER_NAME="$("$ID" -un 2>/dev/null)" || USER_NAME=""
+if [[ -z "$USER_NAME" || "$USER_NAME" == *[\ :]* ]] || [[ "$("$ID" -u -- "$USER_NAME" 2>/dev/null)" != "$UID_NUM" ]]; then
+  receipt_stop "the account name of uid $UID_NUM (${USER_NAME:-none}) is empty, holds a space or a colon, or is not this uid's, so the receipt cannot be given an entry for it"
+fi
 problem="$(folders_problem "${RECEIPTS%/*}")"
 [[ -z "$problem" ]] || receipt_stop "$problem"
 if [[ ! -e "$RECEIPTS" && ! -L "$RECEIPTS" ]]; then
@@ -802,7 +881,7 @@ if [[ ! -e "$RECEIPT" && ! -L "$RECEIPT" ]]; then
   TMP_RECEIPT="$("$MKTEMP")"
   printf '00000000-0000-0000-0000-000000000000 00000000-0000-0000-0000-000000000000 refused\n' > "$TMP_RECEIPT"
   receipt_rc=0
-  bounded "$SUDO" -n "$INSTALL" -m 0644 -o root -g wheel "$TMP_RECEIPT" "$RECEIPT" || receipt_rc=$?
+  bounded "$SUDO" -n "$INSTALL" -m 0600 -o root -g wheel "$TMP_RECEIPT" "$RECEIPT" || receipt_rc=$?
   if (( receipt_rc == 124 || receipt_rc == 125 )); then
     echo >&2
     sudo_stalled_note "$receipt_rc" "Install stopped: 'sudo install', which writes $RECEIPT,"
@@ -813,11 +892,31 @@ if [[ ! -e "$RECEIPT" && ! -L "$RECEIPT" ]]; then
     receipt_sudo_failed "sudo install $RECEIPT" "$receipt_rc"
   fi
 fi
+# Then the mode and the entry. A receipt just made here is 0600 with no
+# entry. So is one an install stopped between `install` and `chmod +a`
+# left, and one an earlier build made is 0644 with no entry: either may
+# hold a line a start not settled yet still needs, so it is repaired in
+# place, keeping its line and its inode, by sudo chmod. The mode is set
+# first, so no account but root can open it until the entry is added. A
+# receipt that is not root's 82-byte file with one link that only root can
+# change, or that has any other entry, is left as it is and stops the
+# install below.
+if [[ -z "$(receipt_base_problem)" ]]; then
+  entries="$(receipt_entries)"
+  if [[ "$entries" == none || "$entries" == ours ]]; then
+    if [[ "$("$STAT" -f '%Lp' "$RECEIPT" 2>/dev/null)" != 600 ]]; then
+      receipt_sudo "sudo chmod 0600 $RECEIPT" "$CHMOD" 0600 "$RECEIPT"
+    fi
+    if [[ "$entries" == none ]]; then
+      receipt_sudo "sudo chmod +a \"user:$USER_NAME allow read\" $RECEIPT" "$CHMOD" +a "user:$USER_NAME allow read" "$RECEIPT"
+    fi
+  fi
+fi
 problem="$(receipt_problem)"
 [[ -z "$problem" ]] || receipt_stop "$problem"
 problem="$(folders_problem "$RECEIPTS")"
 [[ -z "$problem" ]] || receipt_stop "$problem"
-echo "receipt $RECEIPT is root's and only root can change it or the folders above it"
+echo "receipt $RECEIPT is root's, only root can change it or the folders above it, and only root and $USER_NAME can read it"
 
 # The release file beside it: <uid>.released, this user's, 0600, 42 bytes
 # (SleepOffReceipts.releaseFile): a nonce and "free" or "held". A start

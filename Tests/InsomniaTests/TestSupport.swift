@@ -78,13 +78,16 @@ final class TempHome {
 /// Receipts for tests (SleepOffReceipts): a `receipts` folder in the real
 /// path of `parent`, so lstat meets no link on the way up (the temporary
 /// directory is under /var, a link to /private/var), 0755, holding this
-/// user's receipt with install.sh's initial content, 0644, and its release
+/// user's receipt with install.sh's initial content, 0600, and its release
 /// file showing that content's nonce free, 0600, as install.sh makes
 /// them. The test user owns all three, so the receipts trust that uid
-/// besides root; `SleepOffReceipts.live` trusts root alone. `parent` is
-/// set to 0755 too, whatever the umask: it is the test's own directory.
-/// Files already there are kept, so two Insomnia folders of one test can
-/// share them.
+/// besides root; `SleepOffReceipts.live` trusts root alone. A test cannot
+/// give its receipt the access control entry install.sh adds without
+/// changing a real list, so the receipts read
+/// `AccessEntry.installed(for:)` as a stand-in in front of the file's real
+/// entries, which are none. `parent` is set to 0755 too, whatever the
+/// umask: it is the test's own directory. Files already there are kept, so
+/// two Insomnia folders of one test can share them.
 enum TestReceipts {
     static func make(in parent: URL) throws -> SleepOffReceipts {
         guard let resolved = realpath(parent.path, nil) else { throw POSIXError(.ENOENT) }
@@ -94,17 +97,115 @@ enum TestReceipts {
         let folder = real + "/receipts"
         if mkdir(folder, 0o755) != 0 { XCTAssertEqual(errno, EEXIST) }
         XCTAssertEqual(chmod(folder, 0o755), 0)
-        let receipts = SleepOffReceipts(folder: folder, owners: [0, getuid()], user: getuid())
+        let receipts = SleepOffReceipts(folder: folder, owners: [0, getuid()], user: getuid(), standIn: [.installed(for: getuid())])
         if !FileManager.default.fileExists(atPath: receipts.file) {
             try Data(SleepOffReceipts.initialContent.utf8).write(to: URL(fileURLWithPath: receipts.file))
             try? FileManager.default.removeItem(atPath: receipts.releaseFile)
         }
-        XCTAssertEqual(chmod(receipts.file, 0o644), 0)
+        XCTAssertEqual(chmod(receipts.file, 0o600), 0)
         if !FileManager.default.fileExists(atPath: receipts.releaseFile) {
             try Data(SleepOffReceipts.initialRelease.utf8).write(to: URL(fileURLWithPath: receipts.releaseFile))
         }
         XCTAssertEqual(chmod(receipts.releaseFile, 0o600), 0)
         return receipts
+    }
+
+    /// `receipts` with `standIn` read in front of the receipt's real
+    /// entries.
+    static func with(_ receipts: SleepOffReceipts, standIn: [AccessEntry]?) -> SleepOffReceipts {
+        SleepOffReceipts(folder: receipts.folder, owners: receipts.owners, user: receipts.user, standIn: standIn)
+    }
+
+    /// The rights ls(1) prints for a file's entry, in its order. It never
+    /// prints synchronize, and prints delete_child and every inheritance
+    /// flag but limit_inherit only for a folder (file_cmds ls/print.c,
+    /// acl_perms and acl_flags).
+    static let lsFileRights = ["read", "write", "execute", "delete", "append", "readattr", "writeattr", "readextattr", "writeextattr", "readsecurity", "writesecurity", "chown"]
+
+    /// A UUID no account has, printed as ls prints a UUID it cannot name.
+    static let unnamedUUID = "0F1E2D3C-4B5A-4978-8796-A5B4C3D2E1F0"
+
+    /// `entry` as `ls -le` prints it for a file, after its ` N: `:
+    /// `user:<name>` or `group:<name>`, or the upper-case UUID of an
+    /// account it cannot name, then ` inherited` for an inherited entry,
+    /// allow or deny, and the words, comma-separated, after a space even
+    /// when there are none (printacl).
+    static func lsText(_ entry: AccessEntry) -> String {
+        let who: String
+        switch entry.principal {
+        case let .user(uid): who = getpwuid(uid).map { "user:" + String(cString: $0.pointee.pw_name) } ?? unnamedUUID
+        case let .group(gid): who = getgrgid(gid).map { "group:" + String(cString: $0.pointee.gr_name) } ?? unnamedUUID
+        case .unknown: who = unnamedUUID
+        }
+        let words = lsFileRights.filter(entry.rights.contains) + (entry.flags.contains("limit_inherit") ? ["limit_inherit"] : [])
+        return "\(who)\(entry.flags.contains("inherited") ? " inherited" : "") \(entry.allows ? "allow" : "deny") \(words.joined(separator: ","))"
+    }
+
+    /// Writes an ls(1) at `tool` that stands in for the scripts' and the
+    /// root command's: `ls -le <receipt>` prints the real `/bin/ls -le` of
+    /// `receipt` with the lines of `entries` (lsText, one per line) as its
+    /// first entries, numbered as ls numbers them, and the file's real
+    /// entries after them, renumbered. While `entries` + ".fails" exists,
+    /// that call fails as an ls that cannot read the list would. Any other
+    /// call runs /bin/ls. It changes no access control list.
+    static func writeFakeLs(at tool: String, receipt: String, entries: String) throws {
+        func quoted(_ s: String) -> String { "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
+        let script = """
+        #!/bin/bash
+        if [[ $# == 2 && "$1" == -le && "$2" == \(quoted(receipt)) ]]; then
+          if [[ -e \(quoted(entries + ".fails")) ]]; then echo "ls: $2: Permission denied" >&2; exit 1; fi
+          out="$(/bin/ls -le "$2")" || exit 1
+          printf '%s\\n' "${out%%$'\\n'*}"
+          n=0
+          if [[ -f \(quoted(entries)) ]]; then
+            while IFS= read -r e; do printf ' %d: %s\\n' "$n" "$e"; n=$((n + 1)); done < \(quoted(entries))
+          fi
+          printf '%s\\n' "$out" | /usr/bin/awk -v n="$n" 'NR > 1 { sub(/^ [0-9]+: /, ""); printf " %d: %s\\n", n++, $0 }'
+          exit 0
+        fi
+        exec /bin/ls "$@"
+
+        """
+        try script.write(toFile: tool, atomically: true, encoding: .utf8)
+        XCTAssertEqual(chmod(tool, 0o755), 0)
+    }
+
+    /// Lists of access control entries every receipt check refuses, as
+    /// stand-ins with no real entry after them: no entry, and every way the
+    /// list or its one entry can differ from the one install.sh adds that
+    /// ls(1) shows for a file. Another account is daemon (uid 1), which
+    /// every Mac has; a group is staff (gid 20).
+    static var refusedLists: [(name: String, entries: [AccessEntry])] {
+        let mine = AccessEntry.installed(for: getuid())
+        func changed(_ change: (inout AccessEntry) -> Void) -> AccessEntry {
+            var entry = mine
+            change(&entry)
+            return entry
+        }
+        var lists: [(name: String, entries: [AccessEntry])] = [
+            ("no entry", []),
+            ("another account's entry", [.installed(for: 1)]),
+            ("a group's entry", [changed { $0.principal = .group(20) }]),
+            ("an entry for an account the directory cannot name", [changed { $0.principal = .unknown }]),
+            ("an inherited entry", [changed { $0.flags = ["inherited"] }]),
+            ("an entry with limit_inherit", [changed { $0.flags = ["limit_inherit"] }]),
+            ("a deny entry", [changed { $0.allows = false }]),
+            ("an entry with no rights", [changed { $0.rights = [] }]),
+            ("execute in place of read", [changed { $0.rights = ["execute"] }]),
+            ("the entry twice", [mine, mine]),
+            ("a deny entry for another account after it", [mine, AccessEntry(allows: false, principal: .user(1), rights: ["read"], flags: [])]),
+            ("an allow entry for a group in front of it", [changed { $0.principal = .group(20) }, mine]),
+        ]
+        for right in lsFileRights where right != "read" {
+            lists.append(("read and \(right)", [changed { $0.rights = ["read", right] }]))
+        }
+        return lists
+    }
+
+    /// Writes `list`, as lsText prints each entry, to `entries`, for a
+    /// writeFakeLs ls.
+    static func writeEntries(_ list: [AccessEntry], to entries: String) throws {
+        try list.map { lsText($0) + "\n" }.joined().write(toFile: entries, atomically: true, encoding: .utf8)
     }
 
     /// The receipt's bytes as text; nil when it cannot be read.
@@ -176,6 +277,8 @@ final class FakeAdministratorPrompt: AdministratorPromptRunning, @unchecked Send
     private var _restoreNeedsPassword = false
     private var _sleepOffNow: @Sendable () -> Bool = { false }
     private var _wroteRecord = false
+    private var _afterRecord: (@Sendable () -> Void)?
+    private var _refusedLineFails = false
     private var _receiptFile: String?
     /// Opened by the test to end a `.hang`.
     let gate = AsyncGate()
@@ -224,6 +327,23 @@ final class FakeAdministratorPrompt: AdministratorPromptRunning, @unchecked Send
     var wroteRecord: Bool {
         get { lock.withLock { _wroteRecord } }
         set { lock.withLock { _wroteRecord = newValue } }
+    }
+
+    /// Runs right after a `.succeed` answer's record, before the root
+    /// command's second read of `sleepOffNow`: another tool acting then.
+    /// A 1 it sets stops the command with 6, and the command writes
+    /// `refused` over its record.
+    var afterRecord: (@Sendable () -> Void)? {
+        get { lock.withLock { _afterRecord } }
+        set { lock.withLock { _afterRecord = newValue } }
+    }
+
+    /// The `refused` a second read writes over the record cannot be
+    /// written: the record's `writing` stays, and the command still stops
+    /// with 6.
+    var refusedLineFails: Bool {
+        get { lock.withLock { _refusedLineFails } }
+        set { lock.withLock { _refusedLineFails = newValue } }
     }
 
     /// The receipt the root command writes (Harness.receipts); nil for a
@@ -285,6 +405,11 @@ final class FakeAdministratorPrompt: AdministratorPromptRunning, @unchecked Send
                 throw AdministratorPromptError.refused(rootStatus: 6, stderr: "execution error: pmset -g shows a SleepDisabled 1 this start did not set, or could not be read; it was left alone and sleep was not turned off (6)")
             }
             writeRecord(start)
+            afterRecord?()
+            guard start.sleepOffIsOurs || !sleepOffNow() else {
+                if !refusedLineFails { TestReceipts.write(file, nonce: start.nonce, predecessor: start.predecessor, word: "refused") }
+                throw AdministratorPromptError.refused(rootStatus: 6, stderr: "execution error: pmset -g, read again once this start's record was written, shows a SleepDisabled 1 this start did not set, or could not be read; it was left alone and sleep was not turned off (6)")
+            }
             return
         case .cancel:
             throw AdministratorPromptError.cancelled
@@ -1943,15 +2068,27 @@ final class RootCommandProcess {
     /// `command` writing and checking the receipt in `receipts.folder`, and
     /// with `trustTestUser`, trusting the test user's uid besides root's
     /// there. The folder, the trusted owner and perl each appear once in the
-    /// command, and the folder has no space in it.
+    /// command, and the folder has no space in it. The command lists the
+    /// receipt's access control entries once, with `/bin/ls -le $f`; here
+    /// that is an ls (TestReceipts.writeFakeLs, at the folder's path plus
+    /// `.ls`) that shows `receipts.standIn` first, from the folder's path
+    /// plus `.acl`. A test makes that listing fail by creating the folder's
+    /// path plus `.acl.fails`.
     static func withTestReceipts(_ command: String, _ receipts: SleepOffReceipts, trustTestUser: Bool = true) -> String {
         XCTAssertEqual(command.components(separatedBy: SleepOffReceipts.folder).count - 1, 1, "the command names the receipt folder once")
         XCTAssertEqual(command.components(separatedBy: "-v o=0 ").count - 1, 1, "the command's awk check trusts one owner besides root, uid 0, given once")
         XCTAssertEqual(command.components(separatedBy: realPerl).count - 1, 1, "the command writes the receipt with /usr/bin/perl, named once")
+        XCTAssertEqual(command.components(separatedBy: receiptListing).count - 1, 1, "the command lists the receipt's entries once")
         XCTAssertFalse(receipts.folder.contains(" "), "the fixture replaces an unquoted word")
+        XCTAssertNoThrow(try TestReceipts.writeEntries(receipts.standIn ?? [], to: receipts.folder + ".acl"))
+        XCTAssertNoThrow(try TestReceipts.writeFakeLs(at: receipts.folder + ".ls", receipt: receipts.file, entries: receipts.folder + ".acl"))
         return command.replacingOccurrences(of: SleepOffReceipts.folder, with: receipts.folder)
             .replacingOccurrences(of: "-v o=0 ", with: trustTestUser ? "-v o=\(getuid()) " : "-v o=0 ")
+            .replacingOccurrences(of: receiptListing, with: receipts.folder + ".ls -le $f")
     }
+
+    /// How the command lists the receipt's access control entries.
+    static let receiptListing = "/bin/ls -le $f"
 
     /// `command` reading `sudoConf` and `pamSudo` in place of the
     /// system's files, each of which it names once.

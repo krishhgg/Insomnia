@@ -5,10 +5,13 @@
 # speaks, else the app's own: the one sealed in the bundle, else the writable
 # copy older installs left in Application Support; from anywhere else, such
 # as a release zip: the sealed copy only), verifies for itself that the
-# journal is clean, and only then removes the LaunchAgent, the sudoers rule,
-# this user's receipt and its release file in /private/var/db/com.kgarg.insomnia
-# (while no start of another Insomnia folder of this user claims them; the
-# folder too, once empty), the app bundle (backstop.sh included), and the journal. Keeps config.json
+# journal is clean, checks under the receipt's lock that no start of
+# another Insomnia folder of this user claims this user's receipt in
+# /private/var/db/com.kgarg.insomnia, and only then, keeping that lock,
+# removes the LaunchAgent, the sudoers rule, the receipt and its release
+# file (the folder too, once empty), the app bundle (backstop.sh included),
+# and the journal. A claim, a locked receipt or one it cannot read stops it
+# with nothing removed. Keeps config.json
 # and the logs unless --purge. Everything after the quit happens while this
 # process holds APP_SUPPORT/.recovery.lock, so neither a queued periodic
 # backstop nor a relaunched app can republish the journal while it is being
@@ -100,6 +103,9 @@ MV=/bin/mv
 LS=/bin/ls
 CAT=/bin/cat
 HEAD=/usr/bin/head
+TR=/usr/bin/tr
+ID=/usr/bin/id
+CMP=/usr/bin/cmp
 # The folder of the root-owned receipts install.sh made
 # (SleepOffReceipts.swift), and the one owner besides root it may have:
 # none, as uid 0 is root. Tests patch both lines in a private copy.
@@ -176,9 +182,10 @@ UID_NUM="$(id -u)"
 
 step() { printf '\n==> %s\n' "$*"; }
 
-# Scratch space for bounded(): this run's own directory, emptied on exit.
+# Scratch space for bounded() and the journal reads (read.*): this run's
+# own directory, emptied on exit.
 WORK="$("$MKTEMP" -d "${TMPDIR:-/tmp}/insomnia-uninstall.XXXXXX")"
-trap '"$RM" -f "$WORK"/call.* 2>/dev/null; "$RMDIR" "$WORK" 2>/dev/null || true' EXIT
+trap '"$RM" -f "$WORK"/call.* "$WORK"/read.* 2>/dev/null; "$RMDIR" "$WORK" 2>/dev/null || true' EXIT
 
 # Run one external call with a time limit. Its combined output is left in
 # BOUNDED_OUTPUT (trailing newline removed) and its exit status returned, or
@@ -186,7 +193,7 @@ trap '"$RM" -f "$WORK"/call.* 2>/dev/null; "$RMDIR" "$WORK" 2>/dev/null || true'
 # 125 when it is sudo and still running (pid in BOUNDED_PID; this script
 # bounds no sudo call). The same helper as install.sh's, which says more.
 # supervise() enforces the limit itself, even if this run is killed while it
-# waits: SIGTERM once the limit has passed on bash's SECONDS clock, SIGKILL
+# waits or its process group gets SIGTERM or SIGHUP: SIGTERM once the limit has passed on bash's SECONDS clock, SIGKILL
 # one to two seconds later, never SIGKILL for sudo. The supervisor and the call keep fd 9 (the recovery lock) until the
 # call has exited, so a launchctl bootout made under the lock cannot unload
 # an agent the app confirms after this run is gone.
@@ -208,7 +215,7 @@ bounded() { # command args...
       sleep 0.01
     done
     if [[ ! -s "$base.rc" ]]; then
-      BOUNDED_PID="$(cat "$base.pid" 2>/dev/null || true)"
+      BOUNDED_PID="$("$CAT" "$base.pid" 2>/dev/null || true)"
       return 125
     fi
   fi
@@ -225,10 +232,19 @@ bounded() { # command args...
 # The call is its only job, so `kill %1` signals the call, and the shell
 # skips a job it has already reaped: a reused pid is never signalled. The
 # status file is written once the call has been reaped.
+# The supervisor keeps fd 9 until the call has exited and been reaped, and
+# the call may close its own copy (sudo does), so nothing else may end the
+# supervisor first. It ignores SIGTERM and SIGHUP, which reach this run's
+# whole process group when launchd stops what is left of a job or a
+# terminal closes, and with errexit off a failed status write or a failed
+# check does not end it either. The call gets the default actions back
+# before it starts, so the SIGTERM at its limit can still stop it.
 supervise() { # base command args...
   local base="$1" cpid rc=0 deadline
   shift
-  "$@" </dev/null >"$base.out" 2>&1 &
+  set +e
+  trap '' TERM HUP
+  ( trap - TERM HUP; exec "$@" ) </dev/null >"$base.out" 2>&1 &
   cpid=$!
   echo "$cpid" > "$base.pid"
   deadline=$(( SECONDS + CALL_TIMEOUT_SECONDS ))
@@ -257,14 +273,41 @@ supervise() { # base command args...
 case "$APP_SUPPORT" in /*) ;; *) echo "refusing: app support path is not absolute: $APP_SUPPORT" >&2; exit 1 ;; esac
 [[ "$(basename "$APP")" == "Insomnia.app" ]] || { echo "refusing: $APP is not an Insomnia.app bundle path" >&2; exit 1; }
 
-extract() { # file keypath (raw scalar; non-zero if missing)
-  "$PLUTIL" -extract "$2" raw -o - "$1" 2>/dev/null
+# Reads through plutil. A key path that is not there, and a key that holds
+# null, count as absent, as for the app's decodeIfPresent: plutil reports
+# the first as "No value at that key path", and gives the second the type
+# "(any)". Any other failure (the file could not be opened or read, plutil
+# failed) is not absence. It is added to READ_FAILURES, which the
+# settlement and the journal check read before they trust what they found,
+# and the read returns 2. What plutil printed is passed on byte for byte.
+READ_FAILURES="$WORK/read.failures"
+plutil_read() { # file keypath plutil-option...
+  local f="$1" key="$2" out err="" rc=0 t
+  shift 2
+  out="$("$PLUTIL" "$@" -o - "$f" 2>"$WORK/read.err"; rc=$?; echo .; exit "$rc")" || rc=$?
+  if (( rc == 0 )); then
+    printf '%s' "${out%.}"
+    return 0
+  fi
+  IFS= read -r -d '' err < "$WORK/read.err" || true
+  err="${err%$'\n'}"
+  if (( rc == 1 )) && [[ "$err" == *"No value at that key path or invalid key path: $key" ]]; then
+    return 1
+  fi
+  if (( rc == 1 )) && [[ "$1" != -type ]] && t="$("$PLUTIL" -type "$key" -o - "$f" 2>/dev/null)" && [[ "$t" == "(any)" ]]; then
+    return 1
+  fi
+  printf '%s\n' "$f, $key: plutil $1 exited $rc (${err:-no message})" >> "$READ_FAILURES"
+  return 2
 }
-extract_json() { # file keypath
-  "$PLUTIL" -extract "$2" json -o - "$1" 2>/dev/null
+extract() { # file keypath (raw scalar; 1 if absent or null, 2 if the read failed)
+  plutil_read "$1" "$2" -extract "$2" raw
 }
-type_of() { # file keypath -> bool|integer|float|string|array|dictionary|(any); empty if absent
-  "$PLUTIL" -type "$2" -o - "$1" 2>/dev/null || true
+extract_json() { # file keypath (1 if absent or null, 2 if the read failed)
+  plutil_read "$1" "$2" -extract "$2" json
+}
+type_of() { # file keypath -> bool|integer|float|string|array|dictionary|(any); empty if absent or if the read failed
+  plutil_read "$1" "$2" -type "$2" || true
 }
 
 # Prints one line per way the app's records about a kept display entry would
@@ -294,9 +337,12 @@ type_of() { # file keypath -> bool|integer|float|string|array|dictionary|(any); 
 # decoder's Unicode equivalence, so a file with neither "keptDisplay" nor a
 # backslash in it has none of them and is not read further. Any of these
 # makes the journal malformed, as for a wrong type, and nothing is undone.
+# A file that cannot be opened, for either of the two reads here, returns 2
+# with nothing printed for it: its records are unknown, not absent, and the
+# caller must not count the journal as clean.
 record_text_problems() { # file
   local LC_ALL=C
-  local text rest raw key c token depth str plain scalar number esc hex lost
+  local text rest raw key c token depth str plain scalar number esc hex lost nul=""
   local n_low=0 n_lit=0 n_boot=0 digits sig exp e10 lead
   str='^"([^"\\]|\\.)*"'
   plain='^[^]["{}]+'
@@ -305,9 +351,13 @@ record_text_problems() { # file
   esc='^u00(4[1-9A-Fa-f]|5[0-9Aa]|6[1-9A-Fa-f]|7[0-9Aa])'
   hex='^u[0-9A-Fa-f]{4}'
   lost="the top level of state.json cannot be followed here, so its records about a kept display entry cannot be checked"
-  text="$(<"$1")"
+  text="$(<"$1")" || return 2
   [[ "$text" == *keptDisplay* || "$text" == *\\* ]] || return 0
-  if IFS= read -r -d '' c < "$1"; then
+  # A NUL byte ends this read with status 0, and the end of the file with
+  # status 1. The group itself always ends with 0, so a failed status means
+  # the file could not be opened a second time.
+  { IFS= read -r -d '' c && nul=1; true; } < "$1" || return 2
+  if [[ -n "$nul" ]]; then
     echo "$lost"
     return 0
   fi
@@ -425,10 +475,16 @@ record_text_problems() { # file
 }
 
 # Shape check, same rules as backstop.sh: a JSON object whose known keys have
-# the types RuntimeState.swift writes; null counts as absent.
+# the types RuntimeState.swift writes; null counts as absent. Returns 2 when
+# the file could not be converted or its text read; a failed key read is in
+# READ_FAILURES, and what this printed after it may come from that failure.
 journal_shape_problems() { # file
-  local f="$1" key t i n
-  if [[ "$("$PLUTIL" -convert json -o - "$f" 2>/dev/null | head -c 1)" != "{" ]]; then
+  local f="$1" key t i n json
+  if ! json="$("$PLUTIL" -convert json -o - "$f" 2>/dev/null)"; then
+    printf '%s\n' "$f: plutil -convert json failed" >> "$READ_FAILURES"
+    return 2
+  fi
+  if [[ "${json:0:1}" != "{" ]]; then
     echo "state.json is not a JSON object"
     return 0
   fi
@@ -449,7 +505,10 @@ journal_shape_problems() { # file
   done
   t="$(type_of "$f" keptDisplayUnderLowPowerBoot)"
   [[ -z "$t" || "$t" == string || "$t" == "(any)" ]] || echo "keptDisplayUnderLowPowerBoot is a $t, not a string"
-  record_text_problems "$f"
+  if ! record_text_problems "$f"; then
+    printf '%s\n' "$f: its text could not be read for the kept display records" >> "$READ_FAILURES"
+    return 2
+  fi
   t="$(type_of "$f" frozenProcesses)"
   if [[ -n "$t" && "$t" != "(any)" ]]; then
     if [[ "$t" != array ]]; then
@@ -545,21 +604,23 @@ journal_shape_problems() { # file
 }
 
 is_refused() { # key
-  [[ "$(extract "$STATE" "$1" || true)" == "true" ]]
+  [[ "$(extract "$SNAP" "$1" || true)" == "true" ]]
 }
 
 # Brightness the app kept after its private-call guard refused the restore
 # on this macOS, one line per device with the saved level. Not a problem
-# for uninstall: no step here can restore it.
+# for uninstall: no step here can restore it. Read from the copy
+# journal_problems checked; a failed read is in READ_FAILURES.
 refused_brightness() {
   local value
-  [[ -f "$STATE" ]] || return 0
-  if is_refused displayRestoreRefused && value="$(extract "$STATE" savedDisplayBrightness)"; then
+  [[ -n "$SNAP" ]] || return 0
+  if is_refused displayRestoreRefused && value="$(extract "$SNAP" savedDisplayBrightness)"; then
     echo "display brightness $value"
   fi
-  if is_refused keyboardRestoreRefused && value="$(extract "$STATE" savedKeyboardBrightness)"; then
+  if is_refused keyboardRestoreRefused && value="$(extract "$SNAP" savedKeyboardBrightness)"; then
     echo "keyboard backlight $value"
   fi
+  return 0
 }
 
 # Same rules as backstop.sh: a date in the form Store.parseDate reads, and
@@ -594,8 +655,8 @@ session_shape_problems() { # file
   local f="$1" key t i
   # plutil also reads XML and binary property lists, which the app's
   # JSONDecoder refuses, so the file itself must start with "{" too.
-  if [[ "$(LC_ALL=C tr -d ' \t\r\n' < "$f" 2>/dev/null | head -c 1)" != "{" ]] \
-     || [[ "$("$PLUTIL" -convert json -o - "$f" 2>/dev/null | head -c 1)" != "{" ]]; then
+  if [[ "$(LC_ALL=C "$TR" -d ' \t\r\n' < "$f" 2>/dev/null | "$HEAD" -c 1)" != "{" ]] \
+     || [[ "$("$PLUTIL" -convert json -o - "$f" 2>/dev/null | "$HEAD" -c 1)" != "{" ]]; then
     echo "session.json is not a JSON object"
     return 0
   fi
@@ -626,15 +687,23 @@ session_shape_problems() { # file
 
 # Independent check of the journal: prints one line per unresolved item.
 # Trusts nothing about the backstop that just ran (it may be an older copy).
+# state.json is read through one copy, SNAP, made with a time limit: a FIFO
+# put in its place after the regular-file check below would block a plain
+# read while this run holds the recovery lock. Every read sees the same
+# bytes, and step 5 removes state.json only while it still has them.
+# Returns 2, after the lines found so far, when a read failed: what it
+# printed is then not the whole answer. A failed key read is also in
+# READ_FAILURES, which the caller checks too.
+SNAP=""
 journal_problems() {
-  local key value shape i
+  local key value shape i rc=0
   if [[ -e "$SESSION" ]]; then
     shape=""
     # Only a regular file is opened: open(2) on a FIFO with no writer
     # blocks, and this check runs while the recovery lock is held.
     if [[ ! -f "$SESSION" ]]; then
       echo "session.json is still present and cannot be read: it is not a regular file, so it was not opened"
-    elif ! cat "$SESSION" >/dev/null 2>&1; then
+    elif ! "$CAT" "$SESSION" >/dev/null 2>&1; then
       echo "session.json is still present and cannot be read (permissions or I/O)"
     elif shape="$(session_shape_problems "$SESSION")" && [[ -n "$shape" ]]; then
       echo "session.json is still present and is not a session: ${shape%%$'\n'*}"
@@ -645,56 +714,70 @@ journal_problems() {
   if [[ -e "$PENDING" || -L "$PENDING" ]]; then
     echo "pending-start is still present, so a password dialog left from an abandoned start could still turn sleep off"
   fi
+  : > "$READ_FAILURES"
   [[ -e "$STATE" ]] || return 0
   if [[ ! -f "$STATE" ]]; then
     echo "state.json is not a regular file, so it was not opened"
     return 0
   fi
-  if ! "$PLUTIL" -convert json -o /dev/null "$STATE" >/dev/null 2>&1; then
+  bounded "$CP" "$STATE" "$WORK/read.state.json" || rc=$?
+  if (( rc == 124 )); then
+    echo "state.json could not be copied to be read: cp did not answer within ${CALL_TIMEOUT_SECONDS}s"
+    return 2
+  elif (( rc != 0 )) || [[ -L "$WORK/read.state.json" || ! -f "$WORK/read.state.json" ]]; then
+    echo "state.json could not be copied to be read: cp exited $rc${BOUNDED_OUTPUT:+ (${BOUNDED_OUTPUT%%$'\n'*})}"
+    return 2
+  fi
+  SNAP="$WORK/read.state.json"
+  if ! "$PLUTIL" -convert json -o /dev/null "$SNAP" >/dev/null 2>&1; then
     echo "state.json is unreadable or malformed"
     return 0
   fi
-  shape="$(journal_shape_problems "$STATE")"
+  if ! shape="$(journal_shape_problems "$SNAP")" || [[ -s "$READ_FAILURES" ]]; then
+    echo "state.json could not be read whole, so whether it has the shape the app writes is unknown"
+    return 2
+  fi
   if [[ -n "$shape" ]]; then
     echo "state.json is malformed (unexpected shape):"
     echo "$shape"
     return 0
   fi
-  if [[ "$(type_of "$STATE" sleepOffAttempt)" == dictionary ]]; then
+  if [[ "$(type_of "$SNAP" sleepOffAttempt)" == dictionary ]]; then
     echo "a start that never finished is still journaled (sleepOffAttempt), so whether it turned sleep off is not settled"
   fi
   for key in sleepDisabledByUs lowPowerSetByUs dockerFrozen; do
-    if [[ "$(extract "$STATE" "$key" || true)" == "true" ]]; then
+    if [[ "$(extract "$SNAP" "$key" || true)" == "true" ]]; then
       echo "$key is still true"
     fi
   done
-  value="$(extract_json "$STATE" frozenProcesses || true)"
+  value="$(extract_json "$SNAP" frozenProcesses || true)"
   if [[ -n "$value" && "$value" != "[]" ]]; then
     echo "frozen processes are still journaled: $value"
   fi
-  value="$(extract_json "$STATE" frozenPids || true)"
+  value="$(extract_json "$SNAP" frozenPids || true)"
   if [[ -n "$value" && "$value" != "[]" ]]; then
     echo "legacy frozen pids (no identity; the backstop never signals or clears these, only the app does): $value"
   fi
-  if extract "$STATE" savedOutputVolume >/dev/null || extract "$STATE" savedMuted >/dev/null; then
+  if extract "$SNAP" savedOutputVolume >/dev/null || extract "$SNAP" savedMuted >/dev/null; then
     echo "saved audio settings (volume/mute) are not restored; only the app can do that"
   fi
   i=0
-  while extract_json "$STATE" "savedAudioOutputs.$i" >/dev/null; do
-    value="$(extract "$STATE" "savedAudioOutputs.$i.name" || extract "$STATE" "savedAudioOutputs.$i.deviceUID" || true)"
+  while extract_json "$SNAP" "savedAudioOutputs.$i" >/dev/null; do
+    value="$(extract "$SNAP" "savedAudioOutputs.$i.name" || extract "$SNAP" "savedAudioOutputs.$i.deviceUID" || true)"
     echo "$value is still muted from a lid close; only the app can restore its volume, once the device is connected"
     i=$((i + 1))
   done
-  if extract "$STATE" savedDisplayBrightness >/dev/null && ! is_refused displayRestoreRefused; then
+  if extract "$SNAP" savedDisplayBrightness >/dev/null && ! is_refused displayRestoreRefused; then
     echo "saved display brightness is not restored; only the app can do that"
   fi
-  if extract "$STATE" savedKeyboardBrightness >/dev/null && ! is_refused keyboardRestoreRefused; then
+  if extract "$SNAP" savedKeyboardBrightness >/dev/null && ! is_refused keyboardRestoreRefused; then
     echo "saved keyboard backlight is not restored; only the app can do that"
   fi
-  value="$(extract_json "$STATE" appNapOverrides || true)"
+  value="$(extract_json "$SNAP" appNapOverrides || true)"
   if [[ -n "$value" && "$value" != "[]" ]]; then
     echo "App Nap settings (NSAppSleepDisabled) are not put back: $value"
   fi
+  return 0
 }
 
 # Agent apps whose NSAppSleepDisabled is YES with no journal entry: set by a
@@ -740,7 +823,7 @@ list_unrecorded_app_nap() {
     [[ "$value" == 1 ]] || continue
     if (( found == 0 )); then
       found=1
-      cat <<MSG
+      "$CAT" <<MSG
 NSAppSleepDisabled is YES for these agent apps and Insomnia has no record of
 what it was before (an older build set it without recording). They are left
 as they are. To turn App Nap back on for one, run:
@@ -784,6 +867,49 @@ collect_moved_aside_sessions() {
   return 0
 }
 
+# Stops the uninstall when state.json could not be read whole: what it
+# still journals is unknown, and nothing is removed for it.
+abort_unknown() { # backstop exit status, lines...
+  local rc="$1" p
+  shift
+  "$CAT" >&2 <<MSG
+
+Uninstall stopped BEFORE removing anything: $STATE could not be read
+whole, so what it still journals, including a brightness kept for a later
+Insomnia, is unknown (backstop exit status $rc):
+MSG
+  for p in "$@"; do printf '  - %s\n' "$p" >&2; done
+  "$CAT" >&2 <<MSG
+
+The LaunchAgent, $SUDOERS, $APP, the session and the journal were kept.
+Check that $STATE is a regular file you can read, then rerun.
+MSG
+  exit 1
+}
+
+# Removes $STATE, unless it holds a kept brightness, or it is not the file
+# step 4 read: a journal that appeared or changed since then is left and
+# counted.
+remove_state() {
+  local rc=0
+  (( ${#kept_brightness[@]} == 0 )) || return 0
+  [[ -e "$STATE" || -L "$STATE" ]] || return 0
+  if [[ -z "$SNAP" ]]; then
+    echo "Left $STATE: it appeared after the journal check, so it was not checked." >&2
+    remove_failures=$((remove_failures + 1))
+    return 0
+  fi
+  if [[ -f "$STATE" && ! -L "$STATE" ]]; then
+    bounded "$CMP" -s "$STATE" "$SNAP" || rc=$?
+    if (( rc != 0 )); then
+      echo "Left $STATE: it is not the file the journal check read (cmp exit $rc), so it was not checked." >&2
+      remove_failures=$((remove_failures + 1))
+      return 0
+    fi
+  fi
+  remove_owned "$STATE"
+}
+
 # Removes files Insomnia wrote, one path per argument. Only a regular file
 # is removed. Anything else at one of these paths is not something Insomnia
 # wrote; it is left and named, so a stray directory never stops the run
@@ -806,14 +932,14 @@ remove_owned() { # path...
 
 abort_incomplete() { # backstop exit status, problem lines...
   local rc="$1"; shift
-  cat >&2 <<MSG
+  "$CAT" >&2 <<MSG
 
 Uninstall stopped BEFORE removing anything: Insomnia's changes are not fully
 undone (backstop exit status $rc). Still journaled in $STATE:
 MSG
   local p
   for p in "$@"; do printf '  - %s\n' "$p" >&2; done
-  cat >&2 <<MSG
+  "$CAT" >&2 <<MSG
 
 Nothing was removed on purpose: the LaunchAgent keeps retrying every minute,
 the sudoers rule keeps pmset undoable, and the journal keeps the evidence.
@@ -983,35 +1109,60 @@ fi
 # Every check matches SleepOffReceipts.swift and the root command
 # (AdministratorPrompt.swift): the receipt, its folder and each folder above
 # up to /, by lstat, must be root's (or RECEIPT_OWNER's), with no write
-# permission for group or others and no access control entry that allows
-# anything; the receipt a regular file with one link and 82 bytes, the rest
-# folders.
+# permission for group or others; the receipt a regular file with one link,
+# 82 bytes and mode 600, the rest folders. No folder may have an access
+# control entry that allows anything, and the receipt must have exactly the
+# one install.sh adds (receipt_access_problem).
 receipt_unsafe() {
   local f="$RECEIPTS/$UID_NUM" p="$RECEIPTS" listing
-  local paths=("$f")
-  while [[ -n "$p" ]]; do paths+=("$p"); p="${p%/*}"; done
-  paths+=(/)
-  listing="$("$STAT" -f '%u %Lp %l %z %HT' "${paths[@]}" 2>/dev/null)" || listing=""
-  if ! printf '%s\n' "$listing" | /usr/bin/awk -v o="$RECEIPT_OWNER" -v n="${#paths[@]}" 'NR == 1 { k = NF == 6 && $5 == "Regular" && $6 == "File" && $3 == 1 && $4 == 82 }; NR > 1 { k = k && NF == 5 && $5 == "Directory" }; { k = k && ($1 == 0 || $1 == o) && $2 !~ /[2367].?$/ }; END { exit !(k && NR == n) }'; then
-    echo "$f is missing, is not the 82-byte file install.sh made, or someone other than root can change it or a folder above it"
+  local folders=()
+  while [[ -n "$p" ]]; do folders+=("$p"); p="${p%/*}"; done
+  folders+=(/)
+  listing="$("$STAT" -f '%u %Lp %l %z %HT' "$f" "${folders[@]}" 2>/dev/null)" || listing=""
+  if ! printf '%s\n' "$listing" | /usr/bin/awk -v o="$RECEIPT_OWNER" -v n="$(( ${#folders[@]} + 1 ))" 'NR == 1 { k = NF == 6 && $5 == "Regular" && $6 == "File" && $3 == 1 && $4 == 82 && $2 == 600 }; NR > 1 { k = k && NF == 5 && $5 == "Directory" }; { k = k && ($1 == 0 || $1 == o) && $2 !~ /[2367].?$/ }; END { exit !(k && NR == n) }'; then
+    echo "$f is missing, is not the 82-byte file install.sh made, mode 600, or someone other than root can change it or a folder above it"
     return 0
   fi
-  listing="$("$LS" -lde "${paths[@]}" 2>/dev/null)" || listing=""
+  listing="$("$LS" -lde "${folders[@]}" 2>/dev/null)" || listing=""
   if [[ -z "$listing" ]] || ! printf '%s\n' "$listing" | /usr/bin/awk '$1 ~ /^[0-9]+:$/ && / allow / { f = 1 }; END { exit f }'; then
-    echo "$f or a folder above it has an access control entry that allows changes, or could not be listed"
+    echo "a folder above $f has an access control entry that allows changes, or could not be listed"
+    return 0
+  fi
+  receipt_access_problem "$f" "$UID_NUM"
+}
+
+# Prints why the access control list of the receipt $1 is not the one
+# install.sh adds, or nothing. `ls -le` must show exactly one entry,
+# ` 0: user:<name> allow read`, and `id -u <name>` must be $2: so only
+# root and that user can open the receipt and hold its lock. ls(1) prints
+# `inherited` after the name of an inherited entry, every right after
+# `allow` or `deny`, and a UUID in place of `user:<name>` for an account the
+# directory cannot name (file_cmds ls/print.c), so each of those fails. It
+# never prints synchronize, prints the rights and flags only folders use
+# only for a folder, and skips an entry it cannot read, so those pass here;
+# the app's check reads every entry, right and flag. As
+# SleepOffReceipts.swift and the root command.
+receipt_access_problem() { # receipt uid
+  local listing name
+  listing="$("$LS" -le "$1" 2>/dev/null)" || listing=""
+  name="$(printf '%s\n' "$listing" | /usr/bin/awk 'NR == 1 { k = /^-/ }; NR == 2 && k && /^ 0: user:[^ :]+ allow read$/ { n = substr($2, 6) }; END { if (NR == 2) print n }')"
+  if [[ -z "$name" ]] || [[ "$("$ID" -u -- "$name" 2>/dev/null)" != "$2" ]]; then
+    echo "$1 does not have exactly one access control entry, the one that lets uid $2 read it and nothing else, or its list could not be read"
   fi
 }
 
 # Opens the receipt read-only on fd 7 and locks it as the root command does
 # (SleepOffReceipts.lock), exactly as backstop.sh's lock_receipt: sets
 # receipt_locked, or receipt_lock_why and, for a receipt that stayed locked
-# or a lockf that failed, receipt_lock_busy=1. unlock_receipt closes fd 7.
+# or a lockf that failed, receipt_lock_busy=1, or for one that failed the
+# checks before it was opened, receipt_lock_unsafe=1. unlock_receipt closes
+# fd 7.
 receipt_locked=""
 lock_receipt() {
   local f="$RECEIPTS/$UID_NUM" why rc=0 opened
-  receipt_locked=""; receipt_lock_why=""; receipt_lock_busy=0; receipt_read=0
+  receipt_locked=""; receipt_lock_why=""; receipt_lock_busy=0; receipt_lock_unsafe=0; receipt_read=0
   why="$(receipt_unsafe)"
-  if [[ -n "$why" ]]; then receipt_lock_why="$why"; return 0; fi
+  if [[ -n "$why" ]]; then receipt_lock_why="$why"; receipt_lock_unsafe=1; return 0; fi
   if ! { exec 7<"$f"; } 2>/dev/null; then
     receipt_lock_why="$f could not be opened"
     return 0
@@ -1135,7 +1286,7 @@ attempt_verdict() { # nonce predecessor identity expires now has-marker
     if [[ -n "$receipt_read_why" ]]; then
       verdict_why="$receipt_read_why"
     elif [[ "$receipt_nonce" == "$1" ]]; then
-      if [[ "$receipt_word" == refused ]]; then verdict=never; else verdict_why="$f shows that the command went on to turn sleep off"; fi
+      if [[ "$receipt_word" == refused ]]; then verdict=never; else verdict_why="$f holds that start's writing line: its command was about to turn sleep off and may have"; fi
       return 0
     elif [[ "$receipt_nonce" == "$2" ]]; then
       if (( over )); then verdict=never; else verdict=undecided; verdict_why="the password dialog of that start can still be answered $until"; fi
@@ -1219,14 +1370,38 @@ finish_settlement() { # nonce what-was-done
   echo "the settlement is finished: $( (( gave_back )) && echo "the start's claim on the receipt was given back" || echo "the start held no claim on the receipt") and its record removed"
 }
 
+# Stops the uninstall before anything runs when a read of the journal for
+# the settlement failed: whether a start is still journaled, or what it
+# records, is unknown.
+settle_unknown() {
+  local first=""
+  IFS= read -r first < "$READ_FAILURES" || true
+  unlock_receipt
+  echo "Uninstall stopped BEFORE removing anything: $STATE could not be read whole (${first:-a read failed}), so whether it journals a start that never finished, and what that start records, is unknown." >&2
+  echo "Nothing was removed and no pmset ran. Check that $STATE is a regular file you can read, then rerun." >&2
+  exit 1
+}
+
 settle_attempt() {
-  local nonce owed receipt pred deadline expires now has_marker=0 owes removed=""
+  local nonce owed receipt pred deadline expires now has_marker=0 owes removed="" shape settled
+  : > "$READ_FAILURES"
   [[ -f "$STATE" ]] || return 0
-  [[ "$(type_of "$STATE" sleepOffAttempt)" == dictionary ]] || return 0
+  # A journal plutil cannot convert whole is left to the journal check
+  # below, which stops the uninstall on it as unreadable or malformed
+  # before anything is removed. Every read after this one that fails stops
+  # it here.
   "$PLUTIL" -convert json -o /dev/null "$STATE" >/dev/null 2>&1 || return 0
-  [[ -z "$(journal_shape_problems "$STATE")" ]] || return 0
+  if [[ "$(type_of "$STATE" sleepOffAttempt)" != dictionary ]]; then
+    [[ ! -s "$READ_FAILURES" ]] || settle_unknown
+    return 0
+  fi
+  shape="$(journal_shape_problems "$STATE")" || settle_unknown
+  [[ ! -s "$READ_FAILURES" ]] || settle_unknown
+  [[ -z "$shape" ]] || return 0
   nonce="$(extract "$STATE" sleepOffAttempt.nonce || true)"
-  if [[ "$(extract "$STATE" sleepOffAttempt.settled || true)" == true ]]; then
+  settled="$(extract "$STATE" sleepOffAttempt.settled || true)"
+  [[ ! -s "$READ_FAILURES" ]] || settle_unknown
+  if [[ "$settled" == true ]]; then
     lock_receipt
     [[ -n "$receipt_locked" ]] || settle_stop "it is settled, but the receipt could not be locked to give its claim back ($receipt_lock_why)"
     echo "finishing the settlement of an earlier start, which the journal records as settled"
@@ -1239,6 +1414,7 @@ settle_attempt() {
   deadline="$(extract "$STATE" sleepOffAttempt.deadline || true)"
   expires="$(extract "$STATE" sleepOffAttempt.expires || true)"
   [[ "$(type_of "$STATE" sleepOffAttempt.marker)" == string ]] && has_marker=1
+  [[ ! -s "$READ_FAILURES" ]] || settle_unknown
   lock_receipt
   now="$("$DATE" -u +%s 2>/dev/null)" || now=0
   [[ "$now" =~ ^[0-9]+$ ]] || now=0
@@ -1340,21 +1516,40 @@ recovery_rc=0
 
 # 4. Verify independently ------------------------------------------------------
 step "Verifying the recovery journal"
+# The check's lines go through a file, so its status is kept. A read that
+# failed makes what the journal holds unknown: that stops the uninstall
+# whatever else was found, and nothing is removed.
 problems=()
-while IFS= read -r line; do
-  [[ -n "$line" ]] && problems+=("$line")
-done < <(journal_problems)
+journal_rc=0
+journal_problems > "$WORK/read.problems" || journal_rc=$?
+{ while IFS= read -r line; do
+  if [[ -n "$line" ]]; then problems+=("$line"); fi
+done; } < "$WORK/read.problems" || journal_rc=2
+if (( journal_rc != 0 )) || [[ -s "$READ_FAILURES" ]]; then
+  while IFS= read -r line; do
+    if [[ -n "$line" ]]; then problems+=("$line"); fi
+  done < "$READ_FAILURES" || true
+  abort_unknown "$recovery_rc" ${problems[@]+"${problems[@]}"}
+fi
 if (( recovery_rc != 0 )) && (( ${#problems[@]} == 0 )); then
   problems+=("backstop exited $recovery_rc; see $LOG_DIR/insomnia.log")
 fi
 if (( ${#problems[@]} > 0 )); then
   abort_incomplete "$recovery_rc" "${problems[@]}"
 fi
-echo "journal clean"
 kept_brightness=()
-while IFS= read -r line; do
-  [[ -n "$line" ]] && kept_brightness+=("$line")
-done < <(refused_brightness)
+refused_brightness > "$WORK/read.kept" || journal_rc=$?
+{ while IFS= read -r line; do
+  if [[ -n "$line" ]]; then kept_brightness+=("$line"); fi
+done; } < "$WORK/read.kept" || journal_rc=2
+if (( journal_rc != 0 )) || [[ -s "$READ_FAILURES" ]]; then
+  problems=()
+  while IFS= read -r line; do
+    if [[ -n "$line" ]]; then problems+=("$line"); fi
+  done < "$READ_FAILURES" || true
+  abort_unknown "$recovery_rc" ${problems[@]+"${problems[@]}"}
+fi
+echo "journal clean"
 if (( ${#kept_brightness[@]} > 0 )); then
   echo "Not restored, and kept in $STATE:"
   for line in "${kept_brightness[@]}"; do echo "  - $line"; done
@@ -1369,6 +1564,144 @@ fi
 
 step "Checking App Nap settings of agent apps"
 list_unrecorded_app_nap
+
+# The receipt, its release file, the sudoers rule and the app bundle are
+# shared by every Insomnia folder of this user (INSOMNIA_HOME). Every
+# folder's starts claim and settle through the receipt, every folder's
+# restore runs through the rule, and every folder's LaunchAgent runs the
+# backstop.sh sealed in the bundle. Step 4 found no unsettled start in this
+# folder, but a start of another folder may not be settled yet, whether or
+# not an app is running: its claim in the release file says so, and its
+# settlement needs the receipt's line, the rule and the bundle. So before
+# step 5 removes anything, the receipt is locked (lock_receipt, the lock a
+# start claims it under) and both files are read under that lock. Step 5
+# keeps the lock until the rule, the receipt and the bundle are gone, so no
+# start can claim the receipt after this check, and a root command waiting
+# for the lock then finds no receipt and refuses. The uninstall stops with
+# nothing removed:
+#   - while the receipt stays locked: the command behind a password dialog
+#     may be running, or another folder may be settling a start;
+#   - while the release file shows a claim, or a nonce other than the
+#     receipt's;
+#   - while either file or a folder above them cannot be read or fails the
+#     checks, or the receipt changes while it is locked, since what they
+#     show is then unknown.
+# A receipt that fails its own checks cannot be locked, but no start can
+# claim it either, since the app and the root command refuse it too. Only
+# its release file is read then, and both files go when it shows no claim.
+# The lock order is the one every reader keeps: the recovery lock (fd 9)
+# first, then the receipt's. Another folder's app or backstop holds its
+# own recovery lock, never this one, and waits for the receipt's for a
+# limited time, so the two cannot wait on each other.
+RECEIPT="$RECEIPTS/$UID_NUM"
+RELEASED="$RECEIPT.released"
+# Sets shared_why to why another Insomnia folder of this user may still
+# need what step 5 removes, or to nothing. With a receipt that passes the
+# checks, fd 7 stays locked (receipt_locked) when shared_why is empty.
+# Records what the check saw in shared_seen and release_seen, which
+# shared_unchanged compares against.
+check_shared() {
+  shared_why=""; shared_seen=none; release_seen=""; receipt_lock_why=""
+  if [[ ! -e "$RECEIPTS" && ! -L "$RECEIPTS" ]]; then return 0; fi
+  shared_why="$(folders_problem "$RECEIPTS")"
+  [[ -z "$shared_why" ]] || return 0
+  if [[ -L "$RECEIPT" || -L "$RELEASED" ]] || { [[ -e "$RECEIPT" ]] && [[ ! -f "$RECEIPT" ]]; } || { [[ -e "$RELEASED" ]] && [[ ! -f "$RELEASED" ]]; }; then
+    shared_why="$RECEIPT or $RELEASED is not a regular file, so install.sh did not make it"
+    return 0
+  fi
+  shared_seen=absent
+  if [[ -e "$RECEIPT" ]]; then
+    lock_receipt
+    if [[ -n "$receipt_locked" ]]; then
+      read_receipt
+      if [[ -n "$receipt_read_why" ]]; then
+        shared_why="$receipt_read_why"
+        unlock_receipt
+        return 0
+      fi
+      shared_seen="locked $receipt_locked $receipt_nonce $receipt_pred $receipt_word"
+    elif (( receipt_lock_unsafe )); then
+      shared_seen=unsafe
+    else
+      shared_why="$receipt_lock_why"
+      return 0
+    fi
+  fi
+  if [[ -e "$RELEASED" ]]; then
+    read_release
+    if [[ -n "$release_why" ]]; then
+      shared_why="$release_why"
+    elif [[ "$release_word" == held ]]; then
+      shared_why="$RELEASED shows that a start ($release_nonce) claims the receipt and is not settled yet"
+    elif [[ -n "$receipt_locked" && "$release_nonce" != "$receipt_nonce" ]]; then
+      shared_why="$RELEASED holds $release_nonce free, not the receipt's own nonce, so it does not show that no start claims the receipt"
+    fi
+    release_seen="$release_nonce $release_word"
+  fi
+  [[ -z "$shared_why" ]] || unlock_receipt
+}
+# Succeeds while the receipt, the release file and their folder are as
+# check_shared saw them; otherwise sets shared_why. A receipt locked there
+# must still be the locked file, pass the checks and hold the same line.
+shared_unchanged() {
+  local now=none line
+  shared_why=""
+  if [[ "$shared_seen" == locked* ]]; then
+    if [[ "$receipt_locked" != "$("$STAT" -f '%d:%i' "$RECEIPT" 2>/dev/null)" || -n "$(receipt_unsafe)" ]]; then
+      shared_why="$RECEIPT was replaced, or stopped passing the checks, while it was locked"
+      return 1
+    fi
+    # By path, which names the locked file: fd 7 was read to its end.
+    line="$("$HEAD" -c 83 "$RECEIPT" 2>/dev/null; echo .)"
+    now="locked $receipt_locked ${line%$'\n'.}"
+  elif [[ -e "$RECEIPT" || -L "$RECEIPT" ]]; then
+    if [[ -n "$(receipt_unsafe)" ]]; then now=unsafe; else now=lockable; fi
+  elif [[ -e "$RECEIPTS" || -L "$RECEIPTS" ]]; then
+    now=absent
+  fi
+  if [[ "$now" != "$shared_seen" ]]; then
+    shared_why="$RECEIPTS or $RECEIPT changed after it was checked"
+    return 1
+  fi
+  [[ "$shared_seen" != none ]] || return 0
+  if [[ -n "$(folders_problem "$RECEIPTS")" ]]; then
+    shared_why="$RECEIPTS or a folder above it stopped passing the checks after it was checked"
+    return 1
+  fi
+  if [[ -e "$RELEASED" || -L "$RELEASED" ]]; then
+    read_release
+    if [[ -n "$release_why" || "$release_nonce $release_word" != "$release_seen" ]]; then
+      shared_why="$RELEASED changed after it was checked"
+      return 1
+    fi
+  elif [[ -n "$release_seen" ]]; then
+    shared_why="$RELEASED went away after it was checked"
+    return 1
+  fi
+}
+step "Checking the receipt every Insomnia folder of this user shares"
+check_shared
+if [[ -n "$shared_why" ]]; then
+  "$CAT" >&2 <<MSG
+
+Uninstall stopped BEFORE removing anything: $shared_why.
+Another Insomnia folder of this user may have a start that is not settled
+yet, and its settlement needs the receipt, the sudoers rule that turns
+sleep back on, and the app bundle whose backstop.sh its recovery agent runs.
+The LaunchAgent, $SUDOERS, $APP, the receipt and the journal were kept.
+Open Insomnia from that folder or let its recovery agent run, then rerun.
+If no other Insomnia folder of yours has a start to settle, remove the
+receipt and its release file by hand (sudo rm -f $RECEIPT $RELEASED)
+once no Insomnia password dialog is open, then rerun.
+MSG
+  exit 1
+fi
+case "$shared_seen" in
+  none) echo "no $RECEIPTS" ;;
+  absent) echo "no receipt of this user in $RECEIPTS" ;;
+  unsafe) echo "$RECEIPT cannot be locked ($receipt_lock_why), so no start can claim it, and no start claims it now" ;;
+  *) echo "no start claims $RECEIPT; it stays locked until the rule, the receipt and the bundle are gone" ;;
+esac
 
 # 5. Remove, still under the lock -------------------------------------------
 # bootout first: it stops a running instance of the agent and drops queued
@@ -1406,79 +1739,50 @@ for candidate in "$CANDIDATE_DIR/$LABEL.candidate-"* "$LAUNCH_AGENTS/$LABEL.cand
 done
 if [[ -d "$CANDIDATE_DIR" && ! -L "$CANDIDATE_DIR" ]]; then "$RMDIR" "$CANDIDATE_DIR" 2>/dev/null || true; fi
 
+# The receipt, the release file and their folder must still be as the
+# check before step 5 saw them, under the receipt's lock it still holds.
 step "Removing $SUDOERS (requires your password)"
+if ! shared_unchanged; then
+  "$CAT" >&2 <<MSG
+
+Uninstall stopped after removing the LaunchAgent: $shared_why.
+$SUDOERS, $APP, the receipt and the journal were kept. Rerun this script.
+MSG
+  exit 1
+fi
 if [[ -e "$SUDOERS" ]] || "$SUDO" "$TEST" -e "$SUDOERS"; then
   "$SUDO" "$RM" -f "$SUDOERS"
 fi
 
-# The receipt install.sh made, its release file, and their folder once
-# empty: other accounts on this Mac keep theirs. Root removes them only
-# while the folder and every folder above it are root's alone, so no folder
-# on the path given to rm can be changed by anyone else. Step 4 found no
-# unsettled start in this Insomnia folder, but every Insomnia folder of
-# this user (INSOMNIA_HOME) shares the receipt, and a start in another one
-# may not be settled yet: its claim in the release file says so, and its
-# settlement needs the receipt's line. So both go only under the receipt's
-# lock (lock_receipt), held until they are gone, and only while the release
-# file shows the receipt's own nonce free: no start claims it, and no root
-# command is running or can start (one that has opened the receipt and
-# waits for the lock then finds it gone and refuses). A receipt that stays
-# locked, a claim, or a release file that cannot be read keeps both, with
-# a message. A receipt that fails the checks shows nothing to any reader,
-# so it goes without the lock. Another Insomnia folder of this user then
-# needs install.sh again before its next start. A receipt or release file
-# that is not a regular file was not made by install.sh and is left.
-RECEIPT="$RECEIPTS/$UID_NUM"
-RELEASED="$RECEIPT.released"
+# The receipt and its release file, which no start claims (see the check
+# before step 5), and their folder once empty: other accounts on this Mac
+# keep theirs. Root removes them only while the folder and every folder
+# above it are root's alone, so no folder on the path given to rm can be
+# changed by anyone else, and while the receipt is the file it locked.
+# Another Insomnia folder of this user then needs install.sh again before
+# its next start.
 step "Removing the receipt $RECEIPT"
-if [[ ! -e "$RECEIPTS" && ! -L "$RECEIPTS" ]]; then
+if [[ "$shared_seen" == none ]]; then
   echo "no $RECEIPTS"
 else
-  receipt_folders="$(folders_problem "$RECEIPTS")"
-  if [[ -n "$receipt_folders" ]]; then
-    echo "Left $RECEIPTS and what is in it: $receipt_folders, so nothing in it is removed as root. Remove it by hand." >&2
-    remove_failures=$((remove_failures + 1))
-  elif [[ -L "$RECEIPT" || -L "$RELEASED" ]] || { [[ -e "$RECEIPT" ]] && [[ ! -f "$RECEIPT" ]]; } || { [[ -e "$RELEASED" ]] && [[ ! -f "$RELEASED" ]]; }; then
-    echo "Left $RECEIPT and $RELEASED: one of them is not a regular file, so install.sh did not make it. Remove them by hand." >&2
+  if ! shared_unchanged; then
+    echo "Left $RECEIPT and $RELEASED: $shared_why. Remove them by hand (sudo rm -f $RECEIPT $RELEASED) once no Insomnia folder of yours has a start to settle, or leave them for a later install." >&2
     remove_failures=$((remove_failures + 1))
   else
-    keep_receipt=""
-    if [[ -f "$RECEIPT" ]]; then
-      lock_receipt
-      if (( receipt_lock_busy )); then
-        keep_receipt="$receipt_lock_why"
-      elif [[ -n "$receipt_locked" ]]; then
-        read_receipt
-        read_release
-        if [[ -n "$receipt_read_why" ]]; then
-          :
-        elif [[ -n "$release_why" ]]; then
-          keep_receipt="$release_why, so it cannot show whether a start from another Insomnia folder of this user still needs the receipt"
-        elif [[ "$release_word" != free || "$release_nonce" != "$receipt_nonce" ]]; then
-          keep_receipt="$RELEASED shows that a start from another Insomnia folder of this user ($release_nonce $release_word) is not settled yet, and the receipt is what settles it"
-        fi
+    for receipt_file in "$RECEIPT" "$RELEASED"; do
+      [[ -f "$receipt_file" ]] || continue
+      if "$SUDO" "$RM" -f "$receipt_file"; then
+        echo "removed $receipt_file"
+      else
+        echo "Could not remove $receipt_file." >&2
+        remove_failures=$((remove_failures + 1))
       fi
-    fi
-    if [[ -n "$keep_receipt" ]]; then
-      echo "Left $RECEIPT and $RELEASED: $keep_receipt. Open Insomnia from that folder or let its recovery agent run, then remove them by hand (sudo rm -f $RECEIPT $RELEASED), or leave them for a later install." >&2
-      remove_failures=$((remove_failures + 1))
-    else
-      for receipt_file in "$RECEIPT" "$RELEASED"; do
-        [[ -f "$receipt_file" ]] || continue
-        if "$SUDO" "$RM" -f "$receipt_file"; then
-          echo "removed $receipt_file"
-        else
-          echo "Could not remove $receipt_file." >&2
-          remove_failures=$((remove_failures + 1))
-        fi
-      done
-    fi
-    unlock_receipt
-    if "$SUDO" "$RMDIR" "$RECEIPTS" 2>/dev/null; then
-      echo "removed $RECEIPTS"
-    else
-      echo "kept $RECEIPTS: it still holds another account's receipt, or could not be removed"
-    fi
+    done
+  fi
+  if "$SUDO" "$RMDIR" "$RECEIPTS" 2>/dev/null; then
+    echo "removed $RECEIPTS"
+  else
+    echo "kept $RECEIPTS: it still holds another account's receipt, or could not be removed"
   fi
 fi
 
@@ -1510,6 +1814,9 @@ for dir in "$APP_DIR"/.Insomnia.app.staging.*; do
   "$RM" -rf "$dir"
   echo "removed $dir, left by an install.sh run that is gone"
 done
+# The bundle was the last thing another Insomnia folder of this user could
+# need; a start of one that waits for the receipt's lock finds it gone.
+unlock_receipt
 
 # $APP_SUPPORT/backstop.sh below is the writable copy of older installs; the
 # current one went with the bundle.
@@ -1519,7 +1826,7 @@ if (( PURGE == 1 )); then
         "$APP_SUPPORT/unfinished-command.json" \
         "$LOG_DIR/insomnia.log" "$LOG_DIR/insomnia.log.1" \
         "$LOG_DIR/handoffs.log" "$LOG_DIR/handoffs.log.1"
-  (( ${#kept_brightness[@]} > 0 )) || remove_owned "$STATE"
+  remove_state
   collect_moved_aside_sessions
   if (( ${#MOVED_ASIDE[@]} > 0 )); then
     remove_owned "${MOVED_ASIDE[@]}"
@@ -1542,7 +1849,7 @@ else
   # unfinished-command.json names a sudo pmset that held the recovery lock;
   # this run holds it now, so that command has exited.
   remove_owned "$APP_SUPPORT/backstop.sh" "$SESSION" "$APP_SUPPORT/unfinished-command.json"
-  (( ${#kept_brightness[@]} > 0 )) || remove_owned "$STATE"
+  remove_state
   echo "Kept $APP_SUPPORT/config.json and $LOG_DIR (use --purge to remove)."
   collect_moved_aside_sessions
   if (( ${#MOVED_ASIDE[@]} > 0 )); then

@@ -157,7 +157,8 @@
 #     Exit 0 only when the journal is clean afterwards; otherwise exit 1 so
 #     the failure is visible and the next periodic run retries.
 #   - state.json unreadable, not a JSON object, or with a known key of the
-#     wrong type: nothing is touched, exit 1.
+#     wrong type: nothing is touched, exit 1. So also when its JSON or text
+#     could not be read again after the first check passed.
 #   - session.json present but not a session: readable, but not the shape
 #     the app's Session decoder accepts (session_shape_problems). It is
 #     treated as expired. Once the journal is clean (already, or after the
@@ -239,6 +240,8 @@ MKTEMP=/usr/bin/mktemp
 LS=/bin/ls
 CAT=/bin/cat
 HEAD=/usr/bin/head
+TR=/usr/bin/tr
+ID=/usr/bin/id
 # The folder of the root-owned receipts (SleepOffReceipts.swift), and the
 # one owner besides root it may have: none, as uid 0 is root. Tests patch
 # both lines in a private copy, for a folder in their temporary directory.
@@ -397,7 +400,7 @@ if [[ -e "$PENDING" || -L "$PENDING" ]]; then
     esac
     log error "$PENDING $why; a password dialog left from an abandoned start could still turn sleep off, so sleepDisabledByUs stays journaled until a later run deletes it"
   else
-    log info "deleted $PENDING; a password dialog left from an abandoned start can no longer turn sleep off"
+    log info "deleted $PENDING; a command a password dialog left from an abandoned start runs stops at its marker check from now on, unless this user writes the marker again or the clock is set back"
   fi
 fi
 # Every exit 0 from here on goes through this: a marker still present is a
@@ -687,9 +690,12 @@ stop_transaction() { # what
 # decoder's Unicode equivalence, so a file with neither "keptDisplay" nor a
 # backslash in it has none of them and is not read further. Any of these
 # makes the journal malformed, as for a wrong type, and nothing is undone.
+# A file that cannot be opened, for either of the two reads here, returns 2
+# with nothing printed for it: its records are unknown, not absent, and the
+# caller must not count the journal as clean.
 record_text_problems() { # file
   local LC_ALL=C
-  local text rest raw key c token depth str plain scalar number esc hex lost
+  local text rest raw key c token depth str plain scalar number esc hex lost nul=""
   local n_low=0 n_lit=0 n_boot=0 digits sig exp e10 lead
   str='^"([^"\\]|\\.)*"'
   plain='^[^]["{}]+'
@@ -698,9 +704,13 @@ record_text_problems() { # file
   esc='^u00(4[1-9A-Fa-f]|5[0-9Aa]|6[1-9A-Fa-f]|7[0-9Aa])'
   hex='^u[0-9A-Fa-f]{4}'
   lost="the top level of state.json cannot be followed here, so its records about a kept display entry cannot be checked"
-  text="$(<"$1")"
+  text="$(<"$1")" || return 2
   [[ "$text" == *keptDisplay* || "$text" == *\\* ]] || return 0
-  if IFS= read -r -d '' c < "$1"; then
+  # A NUL byte ends this read with status 0, and the end of the file with
+  # status 1. The group itself always ends with 0, so a failed status means
+  # the file could not be opened a second time.
+  { IFS= read -r -d '' c && nul=1; true; } < "$1" || return 2
+  if [[ -n "$nul" ]]; then
     echo "$lost"
     return 0
   fi
@@ -819,10 +829,13 @@ record_text_problems() { # file
 
 # Prints one line per way the journal does not have the shape the app writes
 # (RuntimeState.swift). Present keys must have the right type; a JSON null is
-# the same as an absent optional (Swift decodeIfPresent).
+# the same as an absent optional (Swift decodeIfPresent). Returns 2 when the
+# file could not be converted or its text read for the kept display records:
+# its shape is then unknown, not malformed.
 journal_shape_problems() { # file
-  local f="$1" key t i n
-  if [[ "$("$PLUTIL" -convert json -o - "$f" 2>/dev/null | head -c 1)" != "{" ]]; then
+  local f="$1" key t i n json
+  json="$("$PLUTIL" -convert json -o - "$f" 2>/dev/null)" || return 2
+  if [[ "${json:0:1}" != "{" ]]; then
     echo "state.json is not a JSON object"
     return 0
   fi
@@ -843,7 +856,7 @@ journal_shape_problems() { # file
   done
   t="$(type_of "$f" keptDisplayUnderLowPowerBoot)"
   [[ -z "$t" || "$t" == string || "$t" == "(any)" ]] || echo "keptDisplayUnderLowPowerBoot is a $t, not a string"
-  record_text_problems "$f"
+  record_text_problems "$f" || return 2
   t="$(type_of "$f" frozenProcesses)"
   if [[ -n "$t" && "$t" != "(any)" ]]; then
     if [[ "$t" != array ]]; then
@@ -984,8 +997,8 @@ session_shape_problems() { # file
   local f="$1" key t i
   # plutil also reads XML and binary property lists, which the app's
   # JSONDecoder refuses, so the file itself must start with "{" too.
-  if [[ "$(LC_ALL=C tr -d ' \t\r\n' < "$f" 2>/dev/null | head -c 1)" != "{" ]] \
-     || [[ "$("$PLUTIL" -convert json -o - "$f" 2>/dev/null | head -c 1)" != "{" ]]; then
+  if [[ "$(LC_ALL=C "$TR" -d ' \t\r\n' < "$f" 2>/dev/null | "$HEAD" -c 1)" != "{" ]] \
+     || [[ "$("$PLUTIL" -convert json -o - "$f" 2>/dev/null | "$HEAD" -c 1)" != "{" ]]; then
     echo "session.json is not a JSON object"
     return 0
   fi
@@ -1070,22 +1083,45 @@ session_shape_problems() { # file
 # Every check matches SleepOffReceipts.swift and the root command
 # (AdministratorPrompt.swift): the receipt, its folder and each folder above
 # up to /, by lstat, must be root's (or RECEIPT_OWNER's), with no write
-# permission for group or others and no access control entry that allows
-# anything; the receipt a regular file with one link and 82 bytes, the rest
-# folders.
+# permission for group or others; the receipt a regular file with one link,
+# 82 bytes and mode 600, the rest folders. No folder may have an access
+# control entry that allows anything, and the receipt must have exactly the
+# one install.sh adds (receipt_access_problem).
 receipt_unsafe() {
   local f="$RECEIPTS/$UID" p="$RECEIPTS" listing
-  local paths=("$f")
-  while [[ -n "$p" ]]; do paths+=("$p"); p="${p%/*}"; done
-  paths+=(/)
-  listing="$("$STAT" -f '%u %Lp %l %z %HT' "${paths[@]}" 2>/dev/null)" || listing=""
-  if ! printf '%s\n' "$listing" | /usr/bin/awk -v o="$RECEIPT_OWNER" -v n="${#paths[@]}" 'NR == 1 { k = NF == 6 && $5 == "Regular" && $6 == "File" && $3 == 1 && $4 == 82 }; NR > 1 { k = k && NF == 5 && $5 == "Directory" }; { k = k && ($1 == 0 || $1 == o) && $2 !~ /[2367].?$/ }; END { exit !(k && NR == n) }'; then
-    echo "$f is missing, is not the 82-byte file install.sh made, or someone other than root can change it or a folder above it"
+  local folders=()
+  while [[ -n "$p" ]]; do folders+=("$p"); p="${p%/*}"; done
+  folders+=(/)
+  listing="$("$STAT" -f '%u %Lp %l %z %HT' "$f" "${folders[@]}" 2>/dev/null)" || listing=""
+  if ! printf '%s\n' "$listing" | /usr/bin/awk -v o="$RECEIPT_OWNER" -v n="$(( ${#folders[@]} + 1 ))" 'NR == 1 { k = NF == 6 && $5 == "Regular" && $6 == "File" && $3 == 1 && $4 == 82 && $2 == 600 }; NR > 1 { k = k && NF == 5 && $5 == "Directory" }; { k = k && ($1 == 0 || $1 == o) && $2 !~ /[2367].?$/ }; END { exit !(k && NR == n) }'; then
+    echo "$f is missing, is not the 82-byte file install.sh made, mode 600, or someone other than root can change it or a folder above it"
     return 0
   fi
-  listing="$("$LS" -lde "${paths[@]}" 2>/dev/null)" || listing=""
+  listing="$("$LS" -lde "${folders[@]}" 2>/dev/null)" || listing=""
   if [[ -z "$listing" ]] || ! printf '%s\n' "$listing" | /usr/bin/awk '$1 ~ /^[0-9]+:$/ && / allow / { f = 1 }; END { exit f }'; then
-    echo "$f or a folder above it has an access control entry that allows changes, or could not be listed"
+    echo "a folder above $f has an access control entry that allows changes, or could not be listed"
+    return 0
+  fi
+  receipt_access_problem "$f" "$UID"
+}
+
+# Prints why the access control list of the receipt $1 is not the one
+# install.sh adds, or nothing. `ls -le` must show exactly one entry,
+# ` 0: user:<name> allow read`, and `id -u <name>` must be $2: so only
+# root and that user can open the receipt and hold its lock. ls(1) prints
+# `inherited` after the name of an inherited entry, every right after
+# `allow` or `deny`, and a UUID in place of `user:<name>` for an account the
+# directory cannot name (file_cmds ls/print.c), so each of those fails. It
+# never prints synchronize, prints the rights and flags only folders use
+# only for a folder, and skips an entry it cannot read, so those pass here;
+# the app's check reads every entry, right and flag. As
+# SleepOffReceipts.swift and the root command.
+receipt_access_problem() { # receipt uid
+  local listing name
+  listing="$("$LS" -le "$1" 2>/dev/null)" || listing=""
+  name="$(printf '%s\n' "$listing" | /usr/bin/awk 'NR == 1 { k = /^-/ }; NR == 2 && k && /^ 0: user:[^ :]+ allow read$/ { n = substr($2, 6) }; END { if (NR == 2) print n }')"
+  if [[ -z "$name" ]] || [[ "$("$ID" -u -- "$name" 2>/dev/null)" != "$2" ]]; then
+    echo "$1 does not have exactly one access control entry, the one that lets uid $2 read it and nothing else, or its list could not be read"
   fi
 }
 
@@ -1237,7 +1273,7 @@ attempt_verdict() { # nonce predecessor identity expires now has-marker
     if [[ -n "$receipt_read_why" ]]; then
       verdict_why="$receipt_read_why"
     elif [[ "$receipt_nonce" == "$1" ]]; then
-      if [[ "$receipt_word" == refused ]]; then verdict=never; else verdict_why="$f shows that the command went on to turn sleep off"; fi
+      if [[ "$receipt_word" == refused ]]; then verdict=never; else verdict_why="$f holds that start's writing line: its command was about to turn sleep off and may have"; fi
       return 0
     elif [[ "$receipt_nonce" == "$2" ]]; then
       if (( over )); then verdict=never; else verdict=undecided; verdict_why="the password dialog of that start can still be answered $until"; fi
@@ -1342,13 +1378,19 @@ drop_unrecorded_session() {
 }
 
 settle_attempt() {
-  local nonce owed receipt pred deadline expires now has_marker=0 owes removed=""
+  local nonce owed receipt pred deadline expires now has_marker=0 owes removed="" shape
   if [[ ! -f "$STATE" ]] || [[ "$(type_of "$STATE" sleepOffAttempt)" != dictionary ]]; then
     drop_unrecorded_session
     return 0
   fi
   "$PLUTIL" -convert json -o /dev/null "$STATE" >/dev/null 2>&1 || return 0
-  [[ -z "$(journal_shape_problems "$STATE")" ]] || return 0
+  # A journal that could not be read whole is handled as below: nothing
+  # undone and exit 1, here before the start's record is read.
+  if ! shape="$(journal_shape_problems "$STATE")"; then
+    log error "$STATE could not be read whole (its JSON, or its text for the kept display records), so the unfinished start it journals was not settled; nothing undone, evidence kept. Check that it is a regular file this user can read"
+    exit 1
+  fi
+  [[ -z "$shape" ]] || return 0
   nonce="$(extract "$STATE" sleepOffAttempt.nonce || true)"
   if [[ "$(extract "$STATE" sleepOffAttempt.settled || true)" == true ]]; then
     # An earlier settlement published its decision but did not finish.
@@ -1430,7 +1472,7 @@ if [[ -e "$SESSION" ]]; then
   if [[ ! -f "$SESSION" ]]; then
     session_state=unreadable
     unreadable_why="it is not a regular file, so it is not opened"
-  elif ! cat "$SESSION" >/dev/null 2>&1; then
+  elif ! "$CAT" "$SESSION" >/dev/null 2>&1; then
     session_state=unreadable
     unreadable_why="permissions or I/O"
   else
@@ -1453,7 +1495,7 @@ if [[ "$session_state" == valid ]] && (( force == 0 )); then
 fi
 
 # --- Read the journal --------------------------------------------------------
-# journal_state: missing | malformed | clean | dirty
+# journal_state: missing | malformed | unreadable | clean | dirty
 if [[ ! -e "$STATE" ]]; then
   journal_state=missing
 elif [[ ! -f "$STATE" ]]; then
@@ -1463,9 +1505,17 @@ elif [[ ! -f "$STATE" ]]; then
 elif ! "$PLUTIL" -convert json -o /dev/null "$STATE" >/dev/null 2>&1; then
   journal_state=malformed
   shape_problems="not valid JSON"
+elif ! shape_problems="$(journal_shape_problems "$STATE")"; then
+  journal_state=unreadable
+elif [[ -n "$shape_problems" ]]; then
+  journal_state=malformed
 else
-  shape_problems="$(journal_shape_problems "$STATE")"
-  if [[ -n "$shape_problems" ]]; then journal_state=malformed; else journal_state=clean; fi
+  journal_state=clean
+fi
+
+if [[ "$journal_state" == unreadable ]]; then
+  log error "$STATE could not be read whole (its JSON, or its text for the kept display records); nothing undone, evidence kept. Check that it is a regular file this user can read, then rerun"
+  exit 1
 fi
 
 if [[ "$journal_state" == malformed ]]; then
@@ -1757,7 +1807,7 @@ resume_via_app() {
   else
     answer="$app_answer_dir/out"
     size="$(stat -f %z "$answer" 2>/dev/null || echo 0)"
-    excerpt="$(head -c 200 "$answer" | tr -c '[:print:]' ' ')"
+    excerpt="$("$HEAD" -c 200 "$answer" | "$TR" -c '[:print:]' ' ')"
     # A valid line is at most 24 bytes ("<10-digit pid> unverifiable\n").
     if (( size > n * 32 )); then
       valid=0
@@ -2007,8 +2057,8 @@ if (( changed == 1 )); then
   fi
   if (( publish_ok == 1 )); then
     # plutil keeps JSON files as JSON; make sure the result is still one.
-    [[ "$("$PLUTIL" -convert json -o - "$tmp" 2>/dev/null | head -c 1)" == "{" ]] || publish_ok=0
-    [[ "$(head -c 1 "$tmp")" == "{" ]] || publish_ok=0
+    [[ "$("$PLUTIL" -convert json -o - "$tmp" 2>/dev/null | "$HEAD" -c 1)" == "{" ]] || publish_ok=0
+    [[ "$("$HEAD" -c 1 "$tmp")" == "{" ]] || publish_ok=0
   fi
   if (( publish_ok == 1 )); then
     "$MV" -f "$tmp" "$STATE" || publish_ok=0
