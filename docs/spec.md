@@ -166,26 +166,46 @@ recovery; newly written journals use `frozenProcesses`.
   path when the backstop runs: the set-aside previous bundle when an
   interrupted install left only that.
 - Each script runs the backstop as one bounded call with a 300 s limit and
-  SIGTERM only. A backstop still running 3 s after its SIGTERM is reported
-  with its pid (status 125) and keeps the lock until it ends, and so does
-  each `sudo pmset` or app binary call it started, through that call's own
-  supervisor, which ignores SIGTERM and SIGHUP sent to the process group.
-  The backstop and the supervisor of that call run in a process group of
-  their own (`set -m` around the one `&`). Before it starts the backstop,
-  the supervisor turns job control on and off again, which clears bash's
-  record of that group, so `kill %1` at the limit signals the backstop
-  process alone and not the group. A signal sent to the calling script's
-  group (a closed terminal, or launchd once the script has gone) reaches
-  nothing the backstop started; the backstop runs to its end or its limit
-  with the lock held. A backstop from an earlier build whose supervisor for
-  `sudo pmset` does not ignore SIGTERM and SIGHUP therefore keeps the lock
-  in that supervisor until its sudo has ended and been reaped. Not covered:
-  the oldest copies in `$APP_SUPPORT`, which take no lock and run `sudo
-  pmset` in the foreground (a SIGTERM at the limit can leave that sudo
-  running after the lock is released), and an earlier build's backstop run
-  by launchd as the pinned agent after an install rollback, whose group
+  SIGTERM only. A backstop still running 3 s after its SIGTERM, or one that
+  has ended with a process it started still in its group, is reported with
+  its pid (status 125), and the lock stays held until they end. Each `sudo
+  pmset` or app binary call it started also keeps the lock until it ends,
+  through that call's own supervisor, which ignores SIGTERM and SIGHUP sent
+  to the process group.
+  The supervisor of the backstop runs in a process group of its own
+  (`set -m` around the one `&`), and the backstop leads another: it starts
+  through `/usr/bin/perl`, which calls `setpgrp(0, 0)` and then runs the
+  backstop with the same pid. Before it starts the backstop, the supervisor
+  turns job control on and off again, which clears bash's record of its
+  group, so `kill %1` at the limit signals the backstop process alone and
+  not a group. A signal sent to the calling script's group (a closed
+  terminal, or launchd once the script has gone) reaches nothing the
+  backstop started; the backstop runs to its end or its limit with the lock
+  held. A backstop from an earlier build whose supervisor for `sudo pmset`
+  does not ignore SIGTERM and SIGHUP therefore keeps the lock in that
+  supervisor until its sudo has ended and been reaped. Once the backstop
+  has been reaped, the supervisor checks the backstop's group with
+  `kill(0, -pgid)` from perl, which sends nothing and tells ESRCH (no
+  process left) apart from EPERM (one left that runs as root). When a
+  process is still there after about a second, the supervisor sends no
+  status (125), closes the pipe, keeps fd 9 until the group is empty,
+  checking every half second, and signals nothing. So the oldest copies in
+  `$APP_SUPPORT`, which take no lock and run `sudo pmset` in the
+  foreground, keep the lock through this supervisor after the SIGTERM at
+  the limit has ended them, until their sudo has ended (the sudo closes its
+  own fd 9). Costs: about 4 ms for the perl start and 8 ms for each check
+  on a test Mac; a process that stays in the group keeps the lock as long
+  as it runs; and once the group is empty, another process can take its id
+  as its pid and lead a group with it before the next check, and the
+  supervisor then waits for that group too. Not covered: a process that
+  leaves the group (`setsid`, `setpgid`), and an earlier build's backstop
+  run by launchd as the pinned agent after an install rollback, whose group
   launchd signals when the job's main process exits, since the agent does
-  not set AbandonProcessGroup.
+  not set AbandonProcessGroup. Without an executable `/usr/bin/perl`
+  neither script starts the backstop (126, with the reason): `install.sh`
+  stops, and `uninstall.sh` goes on to its own journal check. A perl that
+  runs but cannot answer leaves the group unknown, and the supervisor keeps
+  the lock.
   Every read the backstop makes under the lock (`cp`, `plutil`, `cat`,
   `stat`, `ps`) has 30 s, a checked status, and its output in a private
   directory. One that fails, is cut short, holds a NUL byte or does not
@@ -193,6 +213,28 @@ recovery; newly written journals use `frozenProcesses`.
   journaled. A backstop sealed in a bundle from an earlier release ignores
   these variables and reads the Info.plist and the journal itself, without
   a limit on each read; only the 300 s limit applies to it.
+- Each bounded call in the three scripts has a process of its own that
+  keeps the recovery lock (fd 9), once the run holds it, until it has
+  reaped the call. That process makes the call's
+  output file with `mktemp` in the run's private folder, opens it twice,
+  removes its name before the call starts, reads it back through its own
+  descriptor once the call has ended (at most 1 MiB; a NUL byte is found
+  and reported), and sends the status and the text down a pipe. The caller
+  waits for the status within the call's limit and for the text no longer
+  than 5 s; text that does not come in time counts as not read back. The
+  app binary is the exception: it has to be a child of the backstop's own
+  shell, which makes and pins its two files and writes its input, as on
+  main; only the read-back of its answer runs in a process of its own.
+  Limits, not waived: between `mktemp` and the removal of the name, another
+  process of this account can open the file, and a process the call left
+  behind that still holds it can write to it after the read, unseen. The
+  backstop's main shell makes its own `mktemp`, `rm` and note writes in the
+  private folder, writes the log and publishes the journal, all without a
+  limit; a note whose write fails is lost. Each read costs about 3 ms more
+  than a direct read, and its first 10000 `kill -0` checks up to 25 to
+  50 ms of CPU time. A process that sent no status, one killed with
+  SIGKILL included, reads as still running (125), and a SIGKILL to it
+  frees its hold on the lock.
 - `uninstall.sh`'s own journal check reads each file once, by a bounded `cp`
   into a private directory, and runs every check on that copy, each with an
   explicit status that does not depend on `set -e`. A read that fails, is
@@ -276,9 +318,11 @@ recovery; newly written journals use `frozenProcesses`.
 - Not closed: a writer that takes no lock (an earlier release's scripts, an
   administrator's own `sudo`) can still change the rule between root's last
   read and its `mv` or `rm`. No identity or byte check can see that change.
-  The root text is sent as one `bash -c` argument, about 7.9 KB for
-  `install.sh` and 6.7 KB for `uninstall.sh` with each function's leading
-  indentation removed.
+  The root text is sent as one `bash -c` argument, which sudo's log and
+  `ps` show: 8,686 bytes for `install.sh` and 7,511 for `uninstall.sh`,
+  with each function's leading indentation removed, measured from the
+  functions and constants alone (7,362 and 6,187 before the ACL reader;
+  7,857 and 6,697 at 2e67600).
 - Nothing else runs as root.
 
 ### 3. Lid observer

@@ -283,13 +283,16 @@ has a 300 s limit of its own. At the limit it gets SIGTERM only, never
 SIGKILL, since it may be running `sudo pmset`. Each `sudo pmset` or app
 binary call it started keeps the lock through its own supervisor until that
 call has exited, even if the backstop or the installer is killed first. The
-backstop and everything it starts run in a process group of their own, so
-closing the Terminal window does not reach them: the backstop runs to its
-end or its limit with the lock held, and the SIGTERM at the limit goes to
-the backstop process alone. A backstop still running three seconds after
-its SIGTERM keeps the lock until it ends, and the installer stops, prints
-its pid and replaces nothing. The
-backstop reads no Info.plist under the lock. The installer reads
+backstop leads a process group of its own, which everything it starts stays
+in unless it leaves it, so closing the Terminal window does not reach them:
+the backstop runs to its end or its limit with the lock held, and the
+SIGTERM at the limit goes to the backstop process alone. A backstop still
+running three seconds after its SIGTERM keeps the lock until it ends, and
+so does a process it started that is still in its group once it has ended.
+The installer then stops, prints the backstop's pid and replaces nothing.
+Without `/usr/bin/perl`, which starts that group and checks whether it is
+empty, the installer runs no backstop and stops, saying so.
+The backstop reads no Info.plist under the lock. The installer reads
 `InsomniaResumeFrozenVersion` and the file's identity before it takes the
 lock (from the bundle an interrupted install set aside, when that bundle is
 the one that goes back), and the backstop uses the version only while a
@@ -746,16 +749,23 @@ the version and the identity in its environment and uses the version only
 while a `stat` under the lock (which reads no contents) shows the same file
 unchanged. That backstop run has a 300 s limit and gets SIGTERM only
 at the limit: a backstop still running three seconds after its SIGTERM
-keeps the lock until it ends, and the uninstaller stops, names its pid and
-removes nothing. The backstop and everything it starts run in a process
-group of their own, so closing the Terminal window does not reach them: the
-backstop runs to its end or its limit with the lock held, and the SIGTERM
-at the limit goes to the backstop process alone. So a `sudo pmset` started
-by a backstop that takes the recovery lock, from this build or an earlier
-one, keeps the lock until that sudo has ended, even after the uninstaller
-or the backstop is gone. The oldest copies in Application Support take no
-lock and run `sudo pmset` in the foreground: a SIGTERM at the limit can
-leave that sudo running after the lock is released. A backstop sealed in a bundle from an earlier release does
+keeps the lock until it ends, and so does a process it started that is
+still in its process group once it has ended. The uninstaller then stops,
+names the backstop's pid and removes nothing. The backstop leads a process
+group of its own, which everything it starts stays in unless it leaves it,
+so closing the Terminal window does not reach them: the backstop runs to
+its end or its limit with the lock held, and the SIGTERM at the limit goes
+to the backstop process alone. So a `sudo pmset` started by a backstop from
+this build or an earlier one keeps the lock until that sudo has ended, even
+after the uninstaller or the backstop is gone. That includes the oldest
+copies in Application Support, which take no lock and run `sudo pmset` in
+the foreground: once the SIGTERM at the limit has ended such a copy, the
+uninstaller's supervisor keeps the lock until nothing is left in its group.
+A process that leaves the group (with `setsid`, say) is not waited for.
+Without `/usr/bin/perl`, which starts that group and checks whether it is
+empty, the uninstaller runs no backstop, says so, and goes on to its own
+journal check. A
+backstop sealed in a bundle from an earlier release does
 not know these variables. It reads the Info.plist and the journal itself,
 with no limit on each read, though the 300 s limit on its run still applies.
 A journal check whose read fails, is cut short, prints a NUL byte or does not

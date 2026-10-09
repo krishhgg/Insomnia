@@ -92,9 +92,12 @@ PERL=/usr/bin/perl
 # What root's shell asks whether an access control list entry is root's own
 # (r_root): read only, never a change.
 DSMEMBERUTIL=/usr/bin/dsmemberutil
-# The most bytes work_read takes from one file (a call's output, status or
-# pid, a note): a longer file reads as not read back.
+# The most bytes read_fd3 takes from one call's output (or the notes): a
+# longer one reads as not read back.
 READ_MAX_BYTES=1048576
+# How long bounded() waits for a call's output once its status has come: the
+# supervisor reads it back in that time, or it counts as not read back.
+READ_GRACE_SECONDS=5
 # The shell sudoers_remove runs as root.
 ROOT_BASH=/bin/bash
 LOCK_TIMEOUT_SECONDS=10
@@ -181,25 +184,29 @@ step() { printf '\n==> %s\n' "$*"; }
 # Scratch space for bounded() and for the private copies of the journal the
 # checks in step 4 read: this run's own directory, emptied on exit.
 WORK="$("$MKTEMP" -d "${TMPDIR:-/tmp}/insomnia-uninstall.XXXXXX")"
-trap '"$RM" -f "$WORK"/call.* "$WORK"/*.json "$WORK"/*.lines 2>/dev/null; "$RMDIR" "$WORK" 2>/dev/null || true' EXIT
+trap '"$RM" -f "$WORK"/call.* "$WORK"/notes.* "$WORK"/*.json 2>/dev/null; "$RMDIR" "$WORK" 2>/dev/null || true' EXIT
 
 # Run one external call with a time limit. Its exit status is returned, or
-# 124 when it did not finish within CALL_TIMEOUT_SECONDS and was stopped (or
-# its status could not be read back), or 125 when it is sudo and still
-# running (pid in BOUNDED_PID). Its output is read back once, with
-# work_read, into READ_TEXT and READ_HEAD, with work_read's status in
-# BOUNDED_READ, and into BOUNDED_OUTPUT (the text before any NUL byte,
-# trailing newline removed; empty when not read back). The same helper as
-# install.sh's, which says more. supervise() enforces the limit itself, even
-# if this run is killed while it waits: SIGTERM once the limit has passed on
-# bash's SECONDS clock, SIGKILL one to two seconds later, never SIGKILL for
-# sudo. The supervisor and the call keep fd 9 (the recovery lock) until the
-# call has exited, so a launchctl bootout made under the lock cannot unload
-# an agent the app confirms after this run is gone, and a sudo that ignores
-# SIGTERM keeps the lock until it ends. BOUNDED_LIMIT and BOUNDED_TERM_ONLY
-# give one call another limit, or SIGTERM only, and BOUNDED_OWN_GROUP a
-# process group of its own that no signal sent to this run's group reaches
-# (see run_backstop).
+# 124 when it did not finish within CALL_TIMEOUT_SECONDS and was stopped, or
+# 125 when no status came back in time (sudo still running after its
+# SIGTERM, any other call not ended two seconds after its SIGKILL, or a
+# process left in the own group of a BOUNDED_OWN_GROUP call; pid in
+# BOUNDED_PID), which no caller takes for a call that changed nothing, or
+# 126 when no file for its output could be made. Its output is read back
+# once, inside the supervisor after the call has been reaped, and comes down
+# a pipe with the pid and the status: into READ_TEXT and READ_HEAD, with
+# read_fd3's status in BOUNDED_READ, and into BOUNDED_OUTPUT (the text before
+# any NUL byte, trailing newline removed; empty when not read back). The same
+# helper as install.sh's, which says more. supervise() enforces the limit
+# itself, even if this run is killed while it waits: SIGTERM once the limit
+# has passed on bash's SECONDS clock, SIGKILL one to two seconds later, never
+# SIGKILL for sudo. The supervisor and the call keep fd 9 (the recovery lock)
+# until the call has exited, so a launchctl bootout made under the lock
+# cannot unload an agent the app confirms after this run is gone, and a sudo
+# that ignores SIGTERM keeps the lock until it ends. BOUNDED_LIMIT and
+# BOUNDED_TERM_ONLY give one call another limit, or SIGTERM only, and
+# BOUNDED_OWN_GROUP a process group of its own that no signal sent to this
+# run's group reaches (see run_backstop).
 BOUNDED_OUTPUT=""
 BOUNDED_READ=2
 BOUNDED_PID=""
@@ -207,80 +214,113 @@ BOUNDED_LIMIT=""
 BOUNDED_TERM_ONLY=""
 BOUNDED_OWN_GROUP=""
 bounded() { # command args...
-  local base supervisor rc deadline limit="${BOUNDED_LIMIT:-$CALL_TIMEOUT_SECONDS}" term_only=0 polls=0
-  local pid_form=$'^([0-9]+)\n?$' rc_form=$'^([0-9]{1,3})\n$'
+  local limit="${BOUNDED_LIMIT:-$CALL_TIMEOUT_SECONDS}" term_only=0 deadline pid="" rc=""
   if [[ "$1" == "$SUDO" || -n "${BOUNDED_TERM_ONLY:-}" ]]; then term_only=1; fi
   BOUNDED_OUTPUT=""
   BOUNDED_READ=2
   BOUNDED_PID=""
   READ_TEXT=""
   READ_HEAD=""
-  base="$("$MKTEMP" "$WORK/call.XXXXXX")" || return 126
-  if [[ -n "${BOUNDED_OWN_GROUP:-}" ]]; then set -m; fi
-  supervise "$base" "$limit" "$term_only" "$@" </dev/null >/dev/null 2>&1 &
-  supervisor=$!
-  set +m
-  if (( term_only )); then
-    # The supervisor's limit (at most a second over), then at least two
-    # seconds for the call to stop on SIGTERM.
-    deadline=$(( SECONDS + limit + 3 ))
-    while [[ ! -s "$base.rc" ]] && (( SECONDS <= deadline )); do
-      if (( polls < 50 )); then sleep 0.002; else sleep 0.05; fi
-      polls=$((polls + 1))
-    done
-    if [[ ! -s "$base.rc" ]]; then
-      # The pid is for messages only: nothing here signals it.
-      if work_read "$base.pid" && [[ "$READ_TEXT" =~ $pid_form ]]; then BOUNDED_PID="${BASH_REMATCH[1]}"; fi
-      READ_TEXT=""
-      READ_HEAD=""
-      return 125
-    fi
+  # The supervisor's limit (at most a second over), then at least two
+  # seconds for the call to stop on SIGTERM, and for any other call two more
+  # for its SIGKILL and its reap.
+  deadline=$(( SECONDS + limit + 3 + 2 * (1 - term_only) ))
+  exec 5< <(
+    exec 2>/dev/null
+    if [[ -n "${BOUNDED_OWN_GROUP:-}" ]]; then set -m; fi
+    supervise "$limit" "$term_only" "$@" </dev/null &
+    set +m
+  )
+  if pipe_field "$deadline" && [[ "$FIELD" =~ ^[0-9]*$ ]]; then
+    pid="$FIELD"
+    if pipe_field "$deadline" && [[ "$FIELD" =~ ^[0-9]{1,3}$ ]] && (( 10#$FIELD <= 255 )); then rc=$(( 10#$FIELD )); fi
   fi
-  # Any other call gets SIGKILL at most two seconds after its SIGTERM, so
-  # this wait ends.
-  wait "$supervisor" 2>/dev/null || true
-  rc=124
-  if work_read "$base.rc" && [[ "$READ_TEXT" =~ $rc_form ]] && (( 10#${BASH_REMATCH[1]} <= 255 )); then
-    rc=$(( 10#${BASH_REMATCH[1]} ))
+  if [[ -z "$rc" ]]; then
+    # The pid is for messages only: nothing here signals it.
+    exec 5<&-
+    BOUNDED_PID="$pid"
+    return 125
   fi
   BOUNDED_READ=0
-  work_read "$base.out" || BOUNDED_READ=$?
+  take_output "$(( SECONDS + READ_GRACE_SECONDS ))" || BOUNDED_READ=$?
+  exec 5<&-
   BOUNDED_OUTPUT="${READ_HEAD%$'\n'}"
   return "$rc"
 }
-# The supervising process of one bounded() call; it runs in the background.
+# Whether no process is left in process group $1, by kill with signal 0,
+# which sends nothing. A group that still has a process this account may not
+# signal (one running as root) is not gone. perl, at its fixed path, tells
+# "no such group" apart from "not permitted"; when it cannot run, the group
+# is not gone either.
+group_gone() { # process group id
+  # shellcheck disable=SC2016  # $ARGV and $! are perl's
+  "$PERL" -e 'kill(0, -$ARGV[0]) and exit 1; exit($!{ESRCH} ? 0 : 1)' -- "$1" 2>/dev/null
+}
+# The supervising process of one bounded() call; it runs in the background,
+# its standard output the pipe bounded() reads. Down that pipe it sends, as
+# fields that each end in a NUL byte, the call's pid once the call has
+# started (empty, then 126, when no file for its output could be made, and
+# the call is not made), the call's status once it has been reaped, and
+# then the call's output (send_output). No pid or status file is written,
+# and the output file has no name while the call runs (see pin_output), so
+# nothing put at a name can hold the supervisor, the lock it keeps, or
+# bounded(). bounded() stops reading at its deadline and closes the pipe; a
+# send after that fails (SIGPIPE is ignored here) and does not end the
+# supervisor, which goes on until it has reaped the call.
 # The call is its only job, so `kill %1` signals the call, and the shell
 # skips a job it has already reaped: a reused pid is never signalled. Bash
 # records that job under the process group the supervisor was started in,
 # and when that is a group of its own (BOUNDED_OWN_GROUP), `kill %1` would
 # signal the whole group, the call's own children too. Turning job control
 # on and off again before the call starts clears that record, so `kill %1`
-# always signals the call alone. The status file is written once the call
-# has been reaped.
-# The call's output, its pid and the status go to files opened read-write:
-# unlike a write-only open, that never waits for a reader when a FIFO stands
-# at the name, so no such file can hold the supervisor, the lock it keeps,
-# or bounded()'s wait for it. bounded() reads them back with work_read,
-# which takes nothing but a regular file.
+# always signals the call alone. The status is sent only once bash no longer
+# lists the call as running, so a wait that returned early is made again.
 # Like backstop.sh's supervisor, it ignores SIGTERM and SIGHUP, so a signal
 # sent to this run's whole process group (a closed terminal, or launchd once
 # a job's main process has gone) does not end it while its call runs. sudo
 # closes its copy of fd 9, so the supervisor may be the only holder of the
-# recovery lock until the call has exited. The call gets back the SIGTERM
-# and SIGHUP actions this script started with, so it still stops on the
-# SIGTERM at its limit, and on one sent to the group when it shares this
-# run's group. errexit is off here: a failed write must not end the
-# supervisor while its call runs.
-supervise() { # base limit term-only command args...
-  local base="$1" limit="$2" term_only="$3" cpid rc=0 deadline polls=0
-  shift 3
+# recovery lock until the call has exited. The call gets back the SIGTERM,
+# SIGHUP and SIGPIPE actions this script started with, so it still stops on
+# the SIGTERM at its limit, and on one sent to the group when it shares this
+# run's group. It gets none of the descriptors the supervisor reads from or
+# writes to but its output. errexit is off here: a failed write must not end
+# the supervisor while its call runs.
+# A call with BOUNDED_OWN_GROUP (the backstop) starts through perl, which
+# makes it the leader of a new process group, with its pid as the group's
+# id, before it runs the command. Bash's record of the job is unchanged, so
+# `kill %1` still signals the call alone. What the call starts stays in that
+# group unless it leaves it, and a process that sudo started may have closed
+# its copy of fd 9. So once the call has been reaped, the supervisor checks
+# the group, for up to about a second while what is left of it exits. When
+# a process is still in it after that, the supervisor sends no status, which
+# bounded() reports as 125, closes the pipe, and keeps fd 9 (and with it the
+# recovery lock) until the group is empty, checking every half second. It
+# never signals the group. The group's id cannot go to another process while
+# the group has a process in it; once it is empty, another process can take
+# that pid and lead a group with it before the next check, and the
+# supervisor then waits for that group too.
+supervise() { # limit term-only command args...
+  local limit="$1" term_only="$2" base cpid rc=0 status deadline polls=0
+  shift 2
   set +e
-  trap '' TERM HUP
+  trap '' TERM HUP PIPE
+  base="$("$MKTEMP" "$WORK/call.XXXXXX" 2>/dev/null)"
+  if [[ -z "$base" ]] || ! pin_output "$base"; then
+    printf '%s\0' "" 126 2 "" "" end
+    [[ -z "$base" ]] || "$RM" -f "$base" 2>/dev/null
+    return
+  fi
   set -m
   set +m
-  ( trap - TERM HUP; exec "$@" ) </dev/null 1<>"$base.out" 2>&1 &
+  if [[ -n "${BOUNDED_OWN_GROUP:-}" ]]; then
+    # shellcheck disable=SC2016  # $ARGV is perl's
+    ( trap - TERM HUP PIPE; exec "$PERL" -e 'setpgrp(0, 0) or exit 127; exec { $ARGV[0] } @ARGV; exit 127' -- "$@" ) </dev/null >&4 2>&4 3<&- 4>&- 6<&- 7<&- &
+  else
+    ( trap - TERM HUP PIPE; exec "$@" ) </dev/null >&4 2>&4 3<&- 4>&- 6<&- 7<&- &
+  fi
   cpid=$!
-  echo "$cpid" 1<>"$base.pid"
+  exec 4>&-
+  printf '%s\0' "$cpid"
   deadline=$(( SECONDS + limit ))
   while kill -0 "$cpid" 2>/dev/null && (( SECONDS <= deadline )); do
     if (( polls < 50 )); then sleep 0.002; else sleep 0.05; fi
@@ -296,12 +336,29 @@ supervise() { # base limit term-only command args...
       done
       if [[ -n "$(jobs -rp)" ]]; then kill -KILL %1 2>/dev/null || true; fi
     fi
-    wait "$cpid" 2>/dev/null || true
-    echo 124 1<>"$base.rc"
-    return
+    rc=124
   fi
-  wait "$cpid" || rc=$?
-  echo "$rc" 1<>"$base.rc"
+  status=0
+  wait "$cpid" 2>/dev/null || status=$?
+  while [[ -n "$(jobs -rp)" ]]; do
+    status=0
+    wait "$cpid" 2>/dev/null || status=$?
+  done
+  (( rc == 124 )) || rc=$status
+  if [[ -n "${BOUNDED_OWN_GROUP:-}" ]]; then
+    polls=0
+    until group_gone "$cpid"; do
+      if (( polls >= 10 )); then
+        exec 1>&-
+        until group_gone "$cpid"; do sleep 0.5; done
+        return
+      fi
+      sleep 0.1
+      polls=$((polls + 1))
+    done
+  fi
+  printf '%s\0' "$rc" || return
+  send_output
 }
 # backstop.sh, run as one bounded call with its own limit,
 # BACKSTOP_TIMEOUT_SECONDS, and SIGTERM only, never SIGKILL: on SIGTERM it
@@ -309,23 +366,38 @@ supervise() { # base limit term-only command args...
 # call it started keeps the recovery lock through its own supervisor until
 # that call has exited. It shares this run's lock through fd 9, which the
 # supervisor here keeps until the backstop has exited, even if this run is
-# killed first. The supervisor and the backstop run in a process group of
-# their own (BOUNDED_OWN_GROUP), so a signal sent to this run's group (a
-# closed terminal, or launchd once this run has gone) reaches nothing the
-# backstop started, and the SIGTERM at the limit goes to the backstop
-# process alone. So a backstop from an older build, whose supervisor for
-# sudo pmset does not ignore SIGTERM and SIGHUP, still keeps the lock in
-# that supervisor until its sudo has ended and been reaped. The
+# killed first. The supervisor runs in a process group of its own, and the
+# backstop in another, which it leads (BOUNDED_OWN_GROUP, see supervise), so
+# a signal sent to this run's group (a closed terminal, or launchd once this
+# run has gone) reaches nothing the backstop started, and the SIGTERM at the
+# limit goes to the backstop process alone. So a backstop from an older
+# build, whose supervisor for sudo pmset does not ignore SIGTERM and SIGHUP,
+# still keeps the lock in that supervisor until its sudo has ended and been
+# reaped. One from before the recovery lock ran sudo pmset in the
+# foreground with no supervisor: once the SIGTERM at the limit has ended
+# it, its sudo, which closed its fd 9, runs on in the backstop's group, and
+# the supervisor here keeps the lock until that group is empty. The
 # InsomniaResumeFrozenVersion read before the lock, and the identity of the
 # file it came from, go down in its environment (see read_info_version).
 # Returns the backstop's status, or 124 when it was stopped at its limit,
-# 125 when it was still running three seconds after its SIGTERM (pid in
-# BOUNDED_PID; it keeps the lock until it ends), 126 when it could not be
-# started. What it printed is printed once it ends.
+# 125 when it was still running three seconds after its SIGTERM or, once it
+# had ended, a process it started was still in its group (pid in
+# BOUNDED_PID; the lock stays held until they have ended), 126 when it was
+# not started, with the reason in BACKSTOP_NOT_STARTED. What it printed is
+# printed once it ends, unless it is 125. Without an executable $PERL the
+# backstop is not started: perl both starts it in its own group and tells
+# the supervisor when that group is empty, and a supervisor that can never
+# tell would keep the lock for good. A perl that runs but cannot answer
+# leaves the group unknown, and the supervisor keeps the lock.
 run_backstop() { # backstop.sh
   local rc=0 BOUNDED_LIMIT="$BACKSTOP_TIMEOUT_SECONDS" BOUNDED_TERM_ONLY=1 BOUNDED_OWN_GROUP=1
   local INSOMNIA_INFO_PATH="$INFO_PLIST" INSOMNIA_INFO_EVIDENCE="$INFO_EVIDENCE" INSOMNIA_INFO_VERSION="$INFO_VERSION"
   export INSOMNIA_INFO_PATH INSOMNIA_INFO_EVIDENCE INSOMNIA_INFO_VERSION
+  if [[ ! -x "$PERL" ]]; then
+    BACKSTOP_NOT_STARTED="$PERL, which starts it in a process group of its own and tells when that group is empty, is missing"
+    return 126
+  fi
+  BACKSTOP_NOT_STARTED="no file for its output could be made in $WORK"
   bounded /bin/bash "$1" --force || rc=$?
   if [[ -n "$BOUNDED_OUTPUT" ]]; then printf '%s\n' "$BOUNDED_OUTPUT"; fi
   return "$rc"
@@ -341,57 +413,81 @@ case "$APP_SUPPORT" in /*) ;; *) echo "refusing: app support path is not absolut
 # holds no value or only null (or, for -convert, that the file does not
 # parse, which every caller reports as a problem); 2 when it failed any
 # other way, did not answer in time, or its output could not be read back
-# whole. A 2 is noted in READ_FAILURES, and every caller passes it on, so
+# whole. A 2 is noted (see notes_reset), and every caller passes it on, so
 # the check that made the read returns 2 and its caller treats the 2, or a
-# note there, as a check that did not complete: never a clean journal, and
-# never an absent value. Once a read has failed, the rest return 2 at once:
-# they would most likely wait the same way. The notes go to a file because
-# most reads run inside $(...).
-READ_FAILURES="$WORK/read-failures.lines"
-# Reads a file this run made (a call's output, status or pid, a note, or
-# the app binary's answer) into READ_TEXT byte for byte, without $(...),
-# which drops NUL bytes and trailing newlines. Only bash itself opens and
-# reads it, through one descriptor, so no program that hangs can hold the
-# read. The open is read-write: a read-only open of a FIFO waits for a
-# writer, and this one does not. The open descriptor must be a regular file,
-# at most READ_MAX_BYTES are taken from it, so a file that keeps growing
-# cannot hold the read either, and after the read the name must still lead
-# to that file (the same inode), so a file swapped in meanwhile is not taken
-# for it. The name is checked first, so the open creates nothing unless the
-# file goes in between, which only this account could make happen: the
-# folder is this run's own (mktemp -d, mode 0700) or the app's.
+# note, as a check that did not complete: never a clean journal, and never
+# an absent value. Once a read has failed, the rest return 2 at once: they
+# would most likely wait the same way.
+# What a bounded call printed is read back inside its supervisor, never by
+# its caller. The supervisor (supervise in install.sh and uninstall.sh;
+# read_unit and supervise_command in backstop.sh) makes the file
+# for the call's output with mktemp, opens it twice, on fd 4 for the call to
+# write and on fd 3 to read back from its start, and removes its name before
+# the call starts (pin_output). From then on the file has no name, so no
+# other process can open it, write it, or put a FIFO or another file in its
+# place: only the call, what it starts and the supervisor reach it, through
+# those descriptors. (A process of this account that opens the name in the
+# few milliseconds between mktemp and the removal keeps what it opened; a
+# FIFO or a file it puts there instead fails the checks.) Once the call has
+# been reaped, the supervisor reads fd 3 to its end (read_fd3) and sends the
+# result down the pipe its caller reads (send_output), and the caller waits
+# for it no longer than its own deadline (take_output). The pid and the
+# status come down the same pipe. So the caller opens no file of the call's
+# and reads none, and a read that stalls holds the supervisor, which keeps
+# the recovery lock while it lives, while the caller counts the output as
+# not read back.
+# The app binary in backstop.sh has to be a child of the backstop shell
+# itself, which makes and pins its two files; only the read back runs in a
+# process of its own there (see run_app_bounded).
+
+# Opens the file mktemp has just made, $1, on fd 4 and on fd 3, each
+# read-write, so a FIFO put at the name cannot hold the open; checks that
+# both are one empty regular file; and removes the name. 1 when any of that
+# fails. (macOS gives /dev/fd/N the device of /dev, not of the file, so the
+# two descriptors can be compared with each other but not with the name.)
+pin_output() { # file
+  [[ -f "$1" && ! -L "$1" ]] || return 1
+  exec 4<>"$1" 3<>"$1" || return 1
+  [[ -f /dev/fd/4 && ! -s /dev/fd/4 && /dev/fd/3 -ef /dev/fd/4 ]] || return 1
+  "$RM" -f "$1" || return 1
+  [[ ! -e "$1" && ! -L "$1" ]]
+} 2>/dev/null
+# Reads fd 3 from where it stands to its end into READ_TEXT byte for byte,
+# without $(...), which drops NUL bytes and trailing newlines. fd 3 must be a
+# regular file, and at most READ_MAX_BYTES are taken from it, so a file that
+# keeps growing cannot hold the read. One more read after its end must find
+# nothing: a byte there was written while the file was read, by something the
+# call left running, and the text could stop anywhere.
 # Returns 0 when all of it was read; 1 when it has a NUL byte, which no shell
 # variable can hold (READ_TEXT is then the text without them and trailing
 # newlines, and READ_HEAD the text before the first); 2 when it is not a
-# regular file, is longer than READ_MAX_BYTES, could not be opened or read
-# (bash leaves the variable of a read that failed unset, and sets it at the
-# end of the file), or was swapped. READ_HEAD is READ_TEXT otherwise.
-work_read() { # file -> READ_TEXT, READ_HEAD
+# regular file, is longer than READ_MAX_BYTES, could not be read (bash leaves
+# the variable of a read that failed unset, and sets it at the end of the
+# file), or grew while it was read. READ_HEAD is READ_TEXT otherwise.
+read_fd3() { # -> READ_TEXT, READ_HEAD
   local LC_ALL=C part text="" head="" nul=0 left=$(( READ_MAX_BYTES + 1 ))
   READ_TEXT=""
   READ_HEAD=""
-  [[ -f "$1" && ! -L "$1" ]] || return 2
-  {
-    [[ -f /dev/fd/3 ]] || return 2
-    while :; do
-      unset -v part
-      if IFS= read -r -d '' -n "$left" -u 3 part; then
-        # A NUL byte ended this part, unless it took all that was left.
-        (( ${#part} < left )) || return 2
-        (( nul )) || head="$part"
-        nul=1
-        text="$text$part"
-        left=$(( left - ${#part} - 1 ))
-        (( left > 0 )) || return 2
-      else
-        [[ -n "${part+set}" ]] || return 2
-        text="$text$part"
-        break
-      fi
-    done
-    [[ -f "$1" && ! -L "$1" ]] || return 2
-    { [[ /dev/fd/3 -ef /dev/fd/4 ]]; } 4<>"$1" || return 2
-  } 2>/dev/null 3<>"$1" || return 2
+  [[ -f /dev/fd/3 ]] || return 2
+  while :; do
+    unset -v part
+    if IFS= read -r -d '' -n "$left" -u 3 part; then
+      # A NUL byte ended this part, unless it took all that was left.
+      (( ${#part} < left )) || return 2
+      (( nul )) || head="$part"
+      nul=1
+      text="$text$part"
+      left=$(( left - ${#part} - 1 ))
+      (( left > 0 )) || return 2
+    else
+      [[ -n "${part+set}" ]] || return 2
+      text="$text$part"
+      break
+    fi
+  done
+  unset -v part
+  if IFS= read -r -d '' -n 1 -u 3 part; then return 2; fi
+  [[ -n "${part+set}" && -z "$part" ]] || return 2
   if (( nul )); then
     READ_HEAD="$head"
     READ_TEXT="${text%"${text##*[!$'\n']}"}"
@@ -399,6 +495,94 @@ work_read() { # file -> READ_TEXT, READ_HEAD
   fi
   READ_TEXT="$text"
   READ_HEAD="$text"
+  return 0
+} 2>/dev/null
+# Sends what read_fd3 reads to standard output, the pipe to the caller, as
+# four fields that each end in a NUL byte: read_fd3's status, READ_TEXT,
+# READ_HEAD when it differs from READ_TEXT (a NUL byte; empty otherwise, so
+# no text goes twice), and "end".
+send_output() {
+  local status=0
+  read_fd3 || status=$?
+  (( status == 1 )) || READ_HEAD=""
+  printf '%s\0' "$status" "$READ_TEXT" "$READ_HEAD" end
+}
+# The next field from fd 5, the pipe from a supervisor, in FIELD: 1 when no
+# whole field came by the deadline, a time on bash's SECONDS clock (the wait
+# lasts until the clock has gone past it), or the pipe ended first.
+FIELD=""
+pipe_field() { # deadline
+  local seconds=$(( $1 - SECONDS + 1 ))
+  FIELD=""
+  (( seconds > 0 )) || return 1
+  IFS= read -r -d '' -t "$seconds" -u 5 FIELD
+} 2>/dev/null
+# The four fields send_output sends, from fd 5, in READ_TEXT and READ_HEAD,
+# waiting no later than the deadline: their status (see read_fd3), or 2 when
+# they did not all come, in that form, by then. It then waits, no later than
+# the deadline either, for the end of the pipe, which comes once the sender
+# has exited (or closed it), so a sender that has sent all it had is gone,
+# with the lock it kept, before the caller goes on.
+take_output() { # deadline
+  local status text head
+  READ_TEXT=""
+  READ_HEAD=""
+  pipe_field "$1" && [[ "$FIELD" =~ ^[012]$ ]] || return 2
+  status="$FIELD"
+  pipe_field "$1" || return 2
+  text="$FIELD"
+  pipe_field "$1" || return 2
+  head="$FIELD"
+  pipe_field "$1" && [[ "$FIELD" == end ]] || return 2
+  pipe_field "$1" || true
+  (( status == 1 )) || head="$text"
+  READ_TEXT="$text"
+  READ_HEAD="$head"
+  return "$status"
+}
+# Notes of reads that failed. A read made inside $(...) has to reach this
+# shell, so the notes go to a file: notes_reset makes one with
+# mktemp in WORK, opens it and removes its name as pin_output does, and keeps
+# it on fd 7, which note writes to, and on fd 6, which notes_read reads from.
+# Each $(...) writes through the same fd 7. noted is true once a note is
+# there, and also when no file for them could be made: every read then
+# counts as failed. notes_read reads them in a process of its own, as a
+# supervisor reads a call's output (send_output), and waits for them no
+# longer than READ_GRACE_SECONDS. It reads on from where the last one
+# stopped, so once after each notes_reset. A note whose write fails is lost.
+NOTES_BROKEN=1
+notes_reset() {
+  local file
+  NOTES_BROKEN=1
+  exec 6<&- 7<&-
+  file="$("$MKTEMP" "$WORK/notes.XXXXXX" 2>/dev/null)" || file=""
+  if [[ -n "$file" ]] && pin_output "$file"; then
+    exec 7>&4 6<&3
+    NOTES_BROKEN=0
+  elif [[ -n "$file" ]]; then
+    "$RM" -f "$file" 2>/dev/null || true
+  fi
+  exec 3<&- 4>&-
+  return 0
+}
+noted() {
+  (( NOTES_BROKEN )) || [[ -s /dev/fd/7 ]]
+}
+note() { # line
+  printf '%s\n' "$1" >&7 || true
+} 2>/dev/null
+notes_read() { # -> READ_TEXT
+  local rc=0
+  READ_TEXT=""
+  READ_HEAD=""
+  if (( NOTES_BROKEN )); then
+    READ_TEXT="no file for the notes of failed reads could be made in $WORK"
+    return 0
+  fi
+  exec 5< <(exec 3<&6 </dev/null 2>/dev/null; send_output)
+  take_output "$(( SECONDS + READ_GRACE_SECONDS ))" || rc=$?
+  exec 5<&-
+  (( rc != 2 )) || return 2
   return 0
 }
 # The non-empty lines of $1 in TEXT_LINES, split in the shell itself: no
@@ -416,7 +600,7 @@ text_lines() { # text
 }
 plutil_read() { # plutil arguments... file -> its output; 0, 1 or 2 (see above)
   local rc=0 file="${!#}" why
-  [[ ! -s "$READ_FAILURES" ]] || return 2
+  ! noted || return 2
   bounded "$PLUTIL" "$@" || rc=$?
   if (( rc == 0 )); then
     rc=$BOUNDED_READ
@@ -432,7 +616,7 @@ plutil_read() { # plutil arguments... file -> its output; 0, 1 or 2 (see above)
   else
     why="$(call_result "$rc")"
   fi
-  echo "'plutil $1 $2' on ${file##*/} $why" >> "$READ_FAILURES"
+  note "'plutil $1 $2' on ${file##*/} $why"
   return 2
 }
 # Whether the exit 1 of the plutil call just made with these arguments says
@@ -477,15 +661,15 @@ value_at() { # file keypath [raw|json]
   VALUE="$(plutil_read -extract "$2" "${3:-raw}" -o - "$1")" || rc=$?
   return "$rc"
 }
-# Reads file $1 whole into WHOLE_TEXT (and WHOLE_HEAD, see work_read) with
+# Reads file $1 whole into WHOLE_TEXT (and WHOLE_HEAD, see read_fd3) with
 # one bounded cat, so a FIFO or a stalled disk cannot keep the lock waiting:
 # 0, 1 when it has a NUL byte, or 2 when the read failed or did not answer
-# (noted in READ_FAILURES).
+# (noted; see notes_reset).
 read_whole() { # file -> WHOLE_TEXT, WHOLE_HEAD
   local rc=0 why
   WHOLE_TEXT=""
   WHOLE_HEAD=""
-  [[ ! -s "$READ_FAILURES" ]] || return 2
+  ! noted || return 2
   bounded "$CAT" "$1" || rc=$?
   if (( rc == 0 )); then
     rc=$BOUNDED_READ
@@ -496,7 +680,7 @@ read_whole() { # file -> WHOLE_TEXT, WHOLE_HEAD
   else
     why="$(call_result "$rc")"
   fi
-  echo "'cat' on ${1##*/} $why" >> "$READ_FAILURES"
+  note "'cat' on ${1##*/} $why"
   return 2
 }
 # Copies the regular file $1 to $2, in WORK, with one bounded cp, so the
@@ -505,25 +689,34 @@ read_whole() { # file -> WHOLE_TEXT, WHOLE_HEAD
 # its owner read it; cp writes into it and keeps that mode. cp -X copies no
 # extended attributes or ACL: a journal its owner can read only through an
 # ACL entry (mode 0200, say) would otherwise make cp fail or leave a copy
-# its mode keeps unreadable. Returns cp's status, 124 when it did not answer
-# in time, or 1 when the empty copy could not be made.
+# its mode keeps unreadable. The empty copy is opened read-write, which
+# does not wait as a write-only open of a FIFO would, should one be put at
+# the name once it has been removed, and must then be a regular file.
+# Returns cp's status as bounded() gives it: cp's own, or 124, 125 or 126
+# when cp did not answer in time, sent no status, or could not start (see
+# bounded; backstop.sh's gives no 125); or 1 when the empty copy could not
+# be made. Every caller takes any status but 0 as a file not read.
 snapshot() { # file copy
   local rc=0
   "$RM" -f "$2"
-  { : > "$2"; } 2>/dev/null || return 1
+  { : 1<>"$2"; } 2>/dev/null || return 1
+  [[ -f "$2" && ! -L "$2" ]] || return 1
   bounded "$CP" -X "$1" "$2" || rc=$?
   return "$rc"
 }
+notes_reset
 # How a bounded call's exit status reads in a message.
 call_result() { # status
   if (( $1 == 124 )); then
     printf 'did not answer within %ss' "$CALL_TIMEOUT_SECONDS"
+  elif (( $1 == 125 )); then
+    printf 'did not answer within %ss, and whether it has ended is not known' "$CALL_TIMEOUT_SECONDS"
   else
     printf 'exited %s' "$1"
   fi
 }
 # The same for a bounded call whose output was read: when it exited 0, what
-# was wrong with that output (BOUNDED_READ, from work_read).
+# was wrong with that output (BOUNDED_READ, from read_fd3).
 read_result() { # status
   if (( $1 != 0 )); then
     call_result "$1"
@@ -834,7 +1027,7 @@ is_refused() { # file key
 refused_brightness() {
   if [[ ! -f "$STATE_COPY" ]]; then
     [[ -e "$STATE" || -L "$STATE" ]] || return 0
-    echo "the copy of state.json that the journal check read is gone" >> "$READ_FAILURES"
+    note "the copy of state.json that the journal check read is gone"
     return 2
   fi
   refused_level savedDisplayBrightness displayRestoreRefused "display brightness" || return 2
@@ -941,8 +1134,8 @@ session_shape_problems() { # file
 # It runs under the recovery lock, so each file is read once, by a bounded
 # cp into WORK, and every check reads that copy: a FIFO, a stalled disk or
 # a file swapped meanwhile cannot keep the lock waiting or show one check
-# another file. Returns 2 when a read failed or did not answer (noted in
-# READ_FAILURES), after the lines it printed so far: the caller counts that
+# another file. Returns 2 when a read failed or did not answer (noted; see
+# notes_reset), after the lines it printed so far: the caller counts that
 # as a check that did not complete, never as a clean journal.
 SESSION_COPY="$WORK/session.json"
 STATE_COPY="$WORK/state.json"
@@ -958,7 +1151,7 @@ journal_problems() {
       echo "session.json is still present and cannot be read: it is not a regular file, so it was not opened"
     else
       snapshot "$SESSION" "$SESSION_COPY" || rc=$?
-      if (( rc == 124 )); then
+      if (( rc == 124 || rc == 125 )); then
         echo "session.json is still present and could not be read within ${CALL_TIMEOUT_SECONDS}s"
       elif (( rc != 0 )); then
         echo "session.json is still present and cannot be read (permissions or I/O)"
@@ -980,7 +1173,7 @@ journal_problems() {
   fi
   rc=0
   snapshot "$STATE" "$STATE_COPY" || rc=$?
-  if (( rc == 124 )); then
+  if (( rc == 124 || rc == 125 )); then
     echo "state.json could not be read within ${CALL_TIMEOUT_SECONDS}s"
     return 0
   elif (( rc != 0 )); then
@@ -1070,14 +1263,22 @@ list_unrecorded_app_nap() {
   local ids="" i=0 id value rc found=0 checked=0 unreadable=0 stuck="" skipped=0
   for id in "${DEFAULT_AGENTS[@]}"; do ids="$ids$id"$'\n'; done
   if [[ -f "$CONFIG" ]]; then
-    "$RM" -f "$READ_FAILURES"
-    while id="$(extract "$CONFIG" "agentList.$i")"; do
+    # The list ends where extract says there is no value (1); any other
+    # status, or a note, is a read that did not complete.
+    notes_reset
+    while :; do
+      rc=0
+      id="$(extract "$CONFIG" "agentList.$i")" || rc=$?
+      (( rc == 0 )) || break
       i=$((i + 1))
       ids="$ids$id"$'\n'
     done
-    if [[ -e "$READ_FAILURES" ]]; then
-      value="its note could not be read back"
-      if work_read "$READ_FAILURES"; then value="${READ_TEXT%%$'\n'*}"; fi
+    if (( rc != 1 )) || noted; then
+      value="the read stopped with status $rc"
+      if noted; then
+        value="its note could not be read back"
+        if notes_read && [[ -n "$READ_TEXT" ]]; then value="${READ_TEXT%%$'\n'*}"; fi
+      fi
       echo "could not read all of the agent list in $CONFIG ($value), so agent apps listed only there may not have been checked"
     fi
   fi
@@ -1088,7 +1289,7 @@ list_unrecorded_app_nap() {
     rc=0
     bounded "$DEFAULTS" read "$id" NSAppSleepDisabled || rc=$?
     value="$BOUNDED_OUTPUT"
-    if (( rc == 124 )); then
+    if (( rc == 124 || rc == 125 )); then
       stuck="$id"
       unreadable=$((unreadable + 1))
       printf 'defaults read did not answer within %ss for %s; check it yourself with: defaults read %q NSAppSleepDisabled\n' "$CALL_TIMEOUT_SECONDS" "$id" "$id"
@@ -1285,11 +1486,7 @@ find_insomnia() {
   bounded "$PGREP" -x Insomnia || rc=$?
   pids="$BOUNDED_OUTPUT"
   if (( rc != 0 && rc != 1 )); then
-    if (( rc == 124 )); then
-      PGREP_PROBLEM="pgrep did not answer within ${CALL_TIMEOUT_SECONDS}s"
-    else
-      PGREP_PROBLEM="pgrep exited $rc"
-    fi
+    PGREP_PROBLEM="pgrep $(call_result "$rc")"
   elif (( BOUNDED_READ != 0 )); then
     PGREP_PROBLEM="pgrep exited $rc, but its output could not be read back"
   elif (( rc == 0 )) && [[ ! "$pids" =~ $pid_lines ]]; then
@@ -1337,7 +1534,7 @@ find_insomnia() {
       if [[ -z "$id" ]]; then
         if (( PLIST_READS == 0 )); then
           desc="$exe; first seen under the recovery lock, where no Info.plist is read"
-        elif (( rc == 124 )); then
+        elif (( rc == 124 || rc == 125 )); then
           desc="$exe; $bundle/Contents/Info.plist did not answer within ${CALL_TIMEOUT_SECONDS}s"
         else
           desc="$exe; no bundle id readable from $bundle/Contents/Info.plist"
@@ -1498,6 +1695,7 @@ r_root() { # uuid
 # <UUID> <flags> <rights>" for r_acl to judge; deny, audit and alarm
 # entries grant nothing. Any problem prints why and exits non-zero. Last it
 # prints "checked <pairs>".
+# shellcheck disable=SC2016  # the $ names in this program are perl's, not this shell's
 r_acl_reader() {
   printf %s 'sub uuid{sprintf("%08X-%04X-%04X-%04X-%04X%08X",unpack("N n n n n N",$_[0]))}
 sub parse{my($b,$size,$rc,$want)=@_;
@@ -2162,8 +2360,8 @@ if [[ -n "$CHECKOUT_BACKSTOP" ]] && { [[ "$INFO_VERSION" == "$RESUME_FROZEN_VERS
 elif [[ -f "$APP/Contents/Resources/backstop.sh" ]]; then
   verify_rc=0
   bounded "$CODESIGN" --verify --strict "$APP" || verify_rc=$?
-  if (( verify_rc == 124 )); then
-    echo "'codesign --verify --strict $APP' did not answer within ${CALL_TIMEOUT_SECONDS}s, so the backstop.sh sealed in it was not run." >&2
+  if (( verify_rc == 124 || verify_rc == 125 )); then
+    echo "'codesign --verify --strict $APP' $(call_result "$verify_rc"), so the backstop.sh sealed in it was not run." >&2
     echo "Nothing was removed. Rerun once codesign answers, or run scripts/uninstall.sh from a checkout of the source: it runs its own backstop.sh when this app declares InsomniaResumeFrozenVersion $RESUME_FROZEN_VERSION." >&2
     exit 1
   elif (( verify_rc != 0 )); then
@@ -2191,10 +2389,10 @@ recovery_rc=0
 run_backstop "$BACKSTOP" || recovery_rc=$?
 case "$recovery_rc" in
   125)
-    echo "$BACKSTOP did not finish within ${BACKSTOP_TIMEOUT_SECONDS}s and is still running as pid ${BOUNDED_PID:-?} three seconds after its SIGTERM. It is not killed, because it may be running sudo pmset, and it keeps the recovery lock until it ends. Nothing was removed; rerun once it has ended." >&2
+    echo "$BACKSTOP (pid ${BOUNDED_PID:-?}) or a process it started is still running. Either the backstop did not finish within ${BACKSTOP_TIMEOUT_SECONDS}s and had not ended three seconds after its SIGTERM, or it ended and left that process running. Nothing is killed, because it may be running sudo pmset, and the recovery lock stays held until all of them have ended. Nothing was removed; rerun once they have ended." >&2
     exit 1 ;;
   124) echo "$BACKSTOP did not finish within ${BACKSTOP_TIMEOUT_SECONDS}s and was stopped with SIGTERM; what it undid before then stays undone, and the journal shows what is left." >&2 ;;
-  126) echo "$BACKSTOP could not be started: no file for its output could be made in $WORK." >&2 ;;
+  126) echo "$BACKSTOP could not be started: $BACKSTOP_NOT_STARTED." >&2 ;;
 esac
 
 # 4. Verify independently ------------------------------------------------------
@@ -2202,12 +2400,12 @@ esac
 # substitution: so nothing the check starts outlives it with the lock. Their
 # result does not rest on set -e, which bash turns off on the left of ||:
 # each read returns an explicit status, a read that failed or did not answer
-# makes the check return 2 with a note in READ_FAILURES, and the check
+# makes the check return 2 with a note (see notes_reset), and the check
 # prints "." last, so output cut short shows. Any of these counts as a
 # problem, never as a clean journal.
 step "Verifying the recovery journal"
 problems=()
-"$RM" -f "$READ_FAILURES"
+notes_reset
 check_rc=0
 check_text="$(journal_problems; rc=$?; echo .; exit "$rc")" || check_rc=$?
 if [[ "$check_text" != *. ]]; then
@@ -2216,8 +2414,8 @@ fi
 text_lines "${check_text%.}"
 problems+=(${TEXT_LINES[@]+"${TEXT_LINES[@]}"})
 check_noted=0
-if [[ -e "$READ_FAILURES" ]]; then
-  if work_read "$READ_FAILURES"; then
+if noted; then
+  if notes_read; then
     text_lines "$READ_TEXT"
     for line in ${TEXT_LINES[@]+"${TEXT_LINES[@]}"}; do
       problems+=("the journal could not be fully checked: $line")
@@ -2242,15 +2440,15 @@ echo "journal clean"
 # state.json is kept when a brightness it records cannot be restored here,
 # and also when reading it again for that fails: a kept file is never the
 # wrong way round.
-"$RM" -f "$READ_FAILURES"
+notes_reset
 kept_rc=0
 kept_text="$(refused_brightness; rc=$?; echo .; exit "$rc")" || kept_rc=$?
 text_lines "${kept_text%.}"
 kept_brightness=(${TEXT_LINES[@]+"${TEXT_LINES[@]}"})
 kept_unknown=""
-if [[ -e "$READ_FAILURES" ]]; then
+if noted; then
   kept_unknown="the note saying why could not be read back"
-  if work_read "$READ_FAILURES" && [[ -n "$READ_TEXT" ]]; then kept_unknown="${READ_TEXT%%$'\n'*}"; fi
+  if notes_read && [[ -n "$READ_TEXT" ]]; then kept_unknown="${READ_TEXT%%$'\n'*}"; fi
 elif (( kept_rc != 0 )); then
   kept_unknown="the check stopped with status $kept_rc"
 elif [[ "$kept_text" != *. ]]; then
@@ -2282,16 +2480,24 @@ list_unrecorded_app_nap
 step "Removing LaunchAgent"
 bootout_rc=0
 bounded "$LAUNCHCTL" bootout "gui/$UID_NUM" "$PLIST" || bootout_rc=$?
+# A bootout that has not ended (125) is work of this run whose outcome is
+# not known, and its supervisor keeps the recovery lock until it ends, so
+# nothing is removed beside it.
+if (( bootout_rc == 125 )); then
+  echo "'launchctl bootout' $(call_result 125) (pid ${BOUNDED_PID:-?}). It keeps the recovery lock until it ends. Nothing was removed; rerun once it has ended." >&2
+  exit 1
+fi
 # `launchctl print` exits 113 only when the service is not loaded; 0 means
 # still loaded and anything else means launchd could not be asked. 124 from
-# either call means it did not answer within CALL_TIMEOUT_SECONDS.
+# either call means it did not answer within CALL_TIMEOUT_SECONDS, and 125
+# from print that no status came back (see bounded).
 print_rc=0
 bounded "$LAUNCHCTL" print "gui/$UID_NUM/$LABEL" || print_rc=$?
 if (( print_rc != 113 )); then
   if (( print_rc == 0 )); then
     echo "launchctl bootout exited $bootout_rc and $LABEL is still loaded in gui/$UID_NUM." >&2
-  elif (( print_rc == 124 )); then
-    echo "launchctl bootout exited $bootout_rc and 'launchctl print' did not answer within ${CALL_TIMEOUT_SECONDS}s; cannot tell whether $LABEL is still loaded." >&2
+  elif (( print_rc == 124 || print_rc == 125 )); then
+    echo "launchctl bootout exited $bootout_rc and 'launchctl print' $(call_result "$print_rc"); cannot tell whether $LABEL is still loaded." >&2
   else
     echo "launchctl bootout exited $bootout_rc and 'launchctl print' exited $print_rc; cannot tell whether $LABEL is still loaded." >&2
   fi

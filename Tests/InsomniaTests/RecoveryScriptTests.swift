@@ -1,3 +1,4 @@
+import CryptoKit
 import Darwin
 import Foundation
 import XCTest
@@ -809,15 +810,16 @@ final class RecoveryScriptTests: XCTestCase {
                 functions += try Self.shellFunction(name, in: text, script.lastPathComponent)
             }
             let harness = fx.root.appendingPathComponent("epoch_at.\(script.lastPathComponent)")
+            // Exits 3 with the notes when a read failed.
             try ("set -euo pipefail\n" + functions
-                + #"for f in "$@"; do printf '[%s]\n' "$(epoch_at "$f" endsAt)"; done"# + "\n")
+                + #"for f in "$@"; do printf '[%s]\n' "$(epoch_at "$f" endsAt)"; done"# + "\n"
+                + #"if noted; then notes_read || true; printf 'noted: %s' "$READ_TEXT" >&2; exit 3; fi"# + "\n")
                 .write(to: harness, atomically: true, encoding: .utf8)
 
             let r = try fx.run(harness, files)
 
-            XCTAssertEqual(r.status, 0, r.stderr)
-            let failures = work.appendingPathComponent("read-failures.lines")
-            XCTAssertFalse(FileManager.default.fileExists(atPath: failures.path), "no read failed: \((try? String(contentsOf: failures, encoding: .utf8)) ?? "")")
+            XCTAssertEqual(r.status, 0, "no read failed: " + r.stderr)
+            XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: work.path), [], "no file of the reads or the notes is left with a name")
             let shell = r.stdout.split(separator: "\n", omittingEmptySubsequences: false).dropLast().map { String($0.dropFirst().dropLast()) }
             XCTAssertEqual(shell.count, cases.count, r.stdout)
             for (i, text) in cases.enumerated() where i < shell.count {
@@ -2146,25 +2148,170 @@ final class RecoveryScriptTests: XCTestCase {
     /// from bash's SECONDS clock, so the call is still stopped within three
     /// seconds of its 5 s limit: SIGTERM once the limit has passed, SIGKILL
     /// one to two seconds later. Limits counted in polls (100 a second) took
-    /// minutes here, and up to 36 s on a loaded CI runner.
+    /// minutes here, and up to 36 s on a loaded CI runner. The bound is on
+    /// the whole run; its failure message gives the time of each phase (see
+    /// slowPollTiming).
     func testUninstallStopsAHungCallOnTimeWhenEveryPollIsSlow() throws {
         try fx.installMachinery()
         try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
         try FileManager.default.removeItem(at: fx.backstop)
         try fx.writeMarkerBackstop(at: fx.installedBackstop, name: "sealed")
         fx.setMode("codesign", "verify-hangs")
+        var phases = PhaseTimes()
+        let path = try phases.time("slow sleep ready") { try fx.slowPollingPath() }
 
         let started = Date()
-        let r = try fx.run(fx.uninstall, ["--purge"], extraEnvironment: ["PATH": try fx.slowPollingPath()])
+        let r = try fx.run(fx.uninstall, ["--purge"], extraEnvironment: ["PATH": path])
         let elapsed = Date().timeIntervalSince(started)
+        let timing = slowPollTiming(phases, started: started, elapsed: elapsed, commandStartedFile: "codesign.hung.pid", command: "codesign --verify")
 
         XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
         XCTAssertGreaterThan(fx.slowPolls(), 0, "the script polled through the slow sleep")
         XCTAssertGreaterThan(elapsed, 5, "the call had its whole limit")
-        XCTAssertLessThan(elapsed, 15, "the 5 s limit, at most a second more, at most two of grace, and a few slow polls")
+        XCTAssertLessThan(elapsed, 15, "the 5 s limit, at most a second more, at most two of grace, and a few slow polls. \(timing)")
         XCTAssertTrue(r.stderr.contains("'codesign --verify --strict \(fx.app.path)' did not answer within 5s"), r.stderr)
         XCTAssertTrue(fx.hungProcessGone("codesign", within: 0))
         XCTAssertTrue(try fx.lockIsFree())
+    }
+
+    /// slowPollingPath's `sleep` is one file for every fixture: two
+    /// fixtures' stubs are one inode. Its ready run has happened and logged
+    /// nothing; a call still waits its quarter second before the sleep it
+    /// was asked for, and is logged in the fixture whose path ran it, never
+    /// in the other.
+    func testTheSlowSleepIsOneFileThatLogsOnlyToTheFixtureThatRanIt() throws {
+        let other = try ScriptFixture()
+        defer { other.destroy() }
+        func stub(_ path: String) -> String { path.components(separatedBy: ":")[0] + "/sleep" }
+        func inode(_ path: String) throws -> Int? {
+            try FileManager.default.attributesOfItem(atPath: path)[.systemFileNumber] as? Int
+        }
+        let mine = stub(try fx.slowPollingPath())
+        let theirs = stub(try other.slowPollingPath())
+        XCTAssertEqual(try inode(mine), try inode(theirs))
+        XCTAssertNotNil(try inode(mine))
+        XCTAssertEqual(fx.slowPollArguments(), [], "the ready run logs nothing")
+        XCTAssertEqual(other.slowPollArguments(), [])
+
+        let started = Date()
+        let r = try fx.runTool(mine, ["0.01"])
+        XCTAssertEqual(r.status, 0, r.output)
+        XCTAssertGreaterThanOrEqual(Date().timeIntervalSince(started), 0.26, "a quarter second, then the sleep asked for")
+        XCTAssertEqual(fx.slowPollArguments(), ["0.01"])
+        XCTAssertEqual(other.slowPollArguments(), [], "nothing in the other fixture's log")
+
+        XCTAssertEqual(try other.runTool(theirs, ["0"]).status, 0)
+        XCTAssertEqual(other.slowPollArguments(), ["0"])
+        XCTAssertEqual(fx.slowPollArguments(), ["0.01"])
+        XCTAssertEqual(fx.slowPollSummary(), "0.01 x1")
+
+        XCTAssertEqual(try fx.runTool(mine, [SharedFakes.readyArgument]).status, 0)
+        XCTAssertEqual(fx.slowPollArguments(), ["0.01"], "the ready argument logs nothing")
+    }
+
+    /// A shared fake whose ready run fails is neither linked nor kept: the
+    /// error names the status, and asking for the same text again runs it
+    /// again and fails the same way.
+    func testASharedFakeWhoseReadyRunFailsIsNotKept() throws {
+        let text = "#!/bin/bash\n# \(UUID().uuidString)\nexit 3\n"
+        let first = fx.root.appendingPathComponent("failing-fake")
+        XCTAssertThrowsError(try SharedFakes.link(text, to: first, ready: true)) {
+            XCTAssertTrue("\($0)".hasSuffix("exited 3 on its ready run"), "\($0)")
+        }
+        XCTAssertFalse(fx.exists(first))
+        XCTAssertThrowsError(try SharedFakes.link(text, to: first, ready: true)) {
+            XCTAssertTrue("\($0)".hasSuffix("exited 3 on its ready run"), "\($0)")
+        }
+        XCTAssertFalse(fx.exists(first))
+        let fine = "#!/bin/bash\n# \(UUID().uuidString)\n[[ \"${1-}\" != \(SharedFakes.readyArgument) ]] || exit 0\nexit 3\n"
+        XCTAssertGreaterThan(try SharedFakes.link(fine, to: first, ready: true), 0, "a new file's ready run")
+        XCTAssertEqual(try SharedFakes.link(fine, to: fx.root.appendingPathComponent("again"), ready: true), 0, "no second ready run")
+        XCTAssertEqual(try fx.runTool(first.path, []).status, 3, "the file runs as written")
+    }
+
+    /// The parse cache (ParsedScripts) keys on every byte. The same bytes
+    /// are parsed once and then answered from the cache with the same
+    /// parse; bytes that differ in one place (anywhere, at the same length
+    /// or not) are parsed anew, and their patch carries the change; bytes
+    /// that are not UTF-8 throw each time and are never kept. Every patch
+    /// from a parse equals the line-by-line rewrite the fixture used before
+    /// the cache, for each production script and each of its constants.
+    func testTheScriptParseCacheKeysOnEveryByte() throws {
+        let cache = ParsedScripts.shared
+        func reference(_ text: String, _ constants: [String: String]) throws -> String {
+            var lines = text.components(separatedBy: "\n")
+            for (name, value) in constants {
+                let hits = lines.indices.filter { lines[$0].hasPrefix("\(name)=") }
+                guard hits.count == 1 else { throw FixtureError("expected exactly one '\(name)=' line, found \(hits.count)") }
+                lines[hits[0]] = "\(name)='\(value)'"
+            }
+            return lines.joined(separator: "\n")
+        }
+        let real = try Data(contentsOf: ScriptFixture.productionScripts.appendingPathComponent("backstop.sh"))
+        let base = real + Data("\n# parse cache test \(UUID().uuidString)\n".utf8)
+        let constants = ["COMMAND_TIMEOUT_SECONDS": "7", "KILL_GRACE_SECONDS": "2"]
+
+        let before = cache.parsesAndHits
+        let made = try cache.parsed(base, "base")
+        XCTAssertFalse(made.cached, "new bytes are parsed")
+        XCTAssertEqual(cache.parsesAndHits.parses, before.parses + 1)
+        let again = try cache.parsed(base, "base")
+        XCTAssertTrue(again.cached, "the same bytes come from the cache")
+        XCTAssertEqual(again.parsed, made.parsed)
+        XCTAssertEqual(cache.parsesAndHits.parses, before.parses + 1)
+        XCTAssertEqual(cache.parsesAndHits.hits, before.hits + 1)
+        let baseText = try XCTUnwrap(String(data: base, encoding: .utf8))
+        XCTAssertEqual(try ScriptFixture.patch(again.parsed, constants), try reference(baseText, constants))
+
+        // One byte changed in place: the 3 in the line KILL_GRACE_SECONDS=3
+        // becomes a 9, at the same length.
+        let line = try XCTUnwrap(baseText.range(of: "\nKILL_GRACE_SECONDS=3\n"))
+        let offset = baseText.utf8.distance(from: baseText.utf8.startIndex, to: line.upperBound) - 2
+        var sameLength = base
+        XCTAssertEqual(sameLength[offset], UInt8(ascii: "3"))
+        sameLength[offset] = UInt8(ascii: "9")
+        // One byte more, at the very end.
+        let longer = base + Data("#".utf8)
+        // The last byte changed.
+        var lastByte = base
+        lastByte[lastByte.count - 1] = UInt8(ascii: " ")
+        for (label, mutant) in [("same length", sameLength), ("longer", longer), ("last byte", lastByte)] {
+            let parses = cache.parsesAndHits.parses
+            let result = try cache.parsed(mutant, label)
+            XCTAssertFalse(result.cached, label)
+            XCTAssertEqual(cache.parsesAndHits.parses, parses + 1, label)
+            XCTAssertNotEqual(result.parsed, made.parsed, label)
+            let mutantText = try XCTUnwrap(String(data: mutant, encoding: .utf8), label)
+            XCTAssertEqual(try ScriptFixture.patch(result.parsed, ["COMMAND_TIMEOUT_SECONDS": "7"]), try reference(mutantText, ["COMMAND_TIMEOUT_SECONDS": "7"]), label)
+        }
+        let changed = try cache.parsed(sameLength, "same length")
+        XCTAssertTrue(changed.cached)
+        XCTAssertTrue(changed.parsed.lines.contains("KILL_GRACE_SECONDS=9"))
+        XCTAssertFalse(changed.parsed.lines.contains("KILL_GRACE_SECONDS=3"))
+        XCTAssertTrue(try cache.parsed(base, "base").parsed.lines.contains("KILL_GRACE_SECONDS=3"), "the original is still its own")
+
+        var invalid = base
+        invalid.insert(0xFF, at: offset)
+        let parses = cache.parsesAndHits.parses
+        for _ in 0..<2 {
+            XCTAssertThrowsError(try cache.parsed(invalid, "invalid")) { XCTAssertEqual("\($0)", "invalid is not UTF-8") }
+        }
+        XCTAssertEqual(cache.parsesAndHits.parses, parses, "nothing parsed or kept for bytes that are not UTF-8")
+
+        for script in ["install.sh", "uninstall.sh", "backstop.sh"] {
+            let bytes = try Data(contentsOf: ScriptFixture.productionScripts.appendingPathComponent(script))
+            let text = try XCTUnwrap(String(data: bytes, encoding: .utf8), script)
+            let parsed = try cache.parsed(bytes, script).parsed
+            XCTAssertEqual(parsed, ParsedScripts.parse(text), script)
+            let names = parsed.assignments.filter { $0.value.count == 1 && $0.key.range(of: #"^[A-Z_][A-Z0-9_]*$"#, options: .regularExpression) != nil }.keys
+            XCTAssertGreaterThan(names.count, 10, script)
+            let all = Dictionary(uniqueKeysWithValues: names.map { ($0, "/fixture/\($0.lowercased())") })
+            XCTAssertEqual(try ScriptFixture.patch(parsed, all), try reference(text, all), script)
+            for name in ["NOT_A_CONSTANT", "SUDO_"] {
+                XCTAssertThrowsError(try ScriptFixture.patch(parsed, [name: "x"])) { XCTAssertEqual("\($0)", "expected exactly one '\(name)=' line, found 0", script) }
+                XCTAssertThrowsError(try reference(text, [name: "x"]), script)
+            }
+        }
     }
 
     /// install.sh and uninstall.sh make their calls through the same
@@ -2180,12 +2327,12 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(try helper("install.sh"), try helper("uninstall.sh"))
     }
 
-    /// The shared supervisor gives its call the SIGTERM and SIGHUP actions
-    /// the script started with, though it ignores both itself: the fake
-    /// sudo sends itself each signal from a shell that inherits its actions
-    /// (see "signals-self") and logs "sudo SURVIVED <signal>" only if it
-    /// lives on. A harness started with SIGTERM already ignored cannot give
-    /// the default back, since bash keeps a signal ignored at its start
+    /// The shared supervisor gives its call the SIGTERM, SIGHUP and SIGPIPE
+    /// actions the script started with, though it ignores all three itself:
+    /// the fake sudo sends itself each signal from a shell that inherits its
+    /// actions (see "signals-self") and logs "sudo SURVIVED <signal>" only
+    /// if it lives on. A harness started with SIGTERM already ignored cannot
+    /// give the default back, since bash keeps a signal ignored at its start
     /// ignored, and the fake sees that: a check on the check.
     func testTheSharedSupervisorGivesItsCallTheDefaultSignalActions() throws {
         let harness = try boundedHarness()
@@ -2210,10 +2357,11 @@ final class RecoveryScriptTests: XCTestCase {
     /// kills the harness with SIGKILL while it waits, then sends SIGTERM,
     /// SIGHUP and SIGINT to its whole process group. The supervisor
     /// survives, sends its call SIGTERM at the 3 s limit and never SIGKILL,
-    /// and keeps the lock until the call has exited and it has reaped it:
-    /// only then does it write the call's status. The test signals only the
-    /// harness it posix_spawned as a group leader, and that group, before
-    /// reaping the harness.
+    /// and keeps the lock until the call has exited and it has reaped it.
+    /// Its pid, status and output go down the pipe to the killed harness,
+    /// so no file of the call's is ever left with a name. The test signals
+    /// only the harness it posix_spawned as a group leader, and that group,
+    /// before reaping the harness.
     func testTheSharedSupervisorOutlivesItsRunAndGroupSignalsAndHoldsTheLockUntilItReapsTheCall() throws {
         let harness = try boundedHarness()
         fx.setMode("sudo", "drops-fd9-logs-signals")
@@ -2246,37 +2394,43 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(fx.calls().filter { !$0.hasPrefix("sudo SIG") }, ["sudo -n \(fx.fakePmset) -a disablesleep 0"],
                        "the call had closed fd 9, and the killed harness wrote nothing more")
         XCTAssertNil(fx.commandEnded(), "never SIGKILLed")
-        XCTAssertEqual(try harnessStatuses(), [], "no status before the call is reaped")
+        XCTAssertEqual(try harnessFiles(), [], "the call's output has no name")
         XCTAssertFalse(try fx.lockIsFree(), "the supervisor still holds the lock for its live call")
 
         fx.releaseCommand()
         try assertLockHeldUntilGone(command, within: 10)
         XCTAssertEqual(fx.commandEnded(), "released")
-        XCTAssertTrue(waitUntil(5) { (try? self.harnessStatuses()) == ["124"] }, "status after the reap: \(String(describing: try? harnessStatuses()))")
+        XCTAssertTrue(try fx.waitUntilLockIsFree(5), "the supervisor ends once it has reaped the call")
+        XCTAssertEqual(try harnessFiles(), [], "nothing is left with a name after the reap")
     }
 
     /// A script that runs install.sh's bounded() and supervise() on their
-    /// own, with the work_read they read back through
+    /// own, with the functions they read back through
     /// (testInstallAndUninstallShareTheBoundedCallHelper and
     /// testTheScriptsShareTheirReadersTextForText keep uninstall.sh's the
     /// same): it takes the recovery lock on fd 9 and runs `body`. The
     /// default body makes one bounded `sudo -n pmset -a disablesleep 0`
     /// through the fake sudo with a 3 s limit and logs "bounded <status>".
-    /// Its bounded calls keep their files in the fixture's harness.* folder.
+    /// Its bounded calls make their files in the fixture's harness.* folder.
     private func boundedHarness(_ body: String? = nil) throws -> URL {
         let text = try String(contentsOf: ScriptFixture.productionScripts.appendingPathComponent("install.sh"), encoding: .utf8)
         let start = try XCTUnwrap(text.range(of: "\nbounded() {"))
         let supervise = try XCTUnwrap(text.range(of: "\nsupervise() {", range: start.upperBound..<text.endIndex))
         let end = try XCTUnwrap(text.range(of: "\n}\n", range: supervise.upperBound..<text.endIndex))
         let url = fx.root.appendingPathComponent("bounded-harness.sh")
+        var layer = ""
+        for name in Self.readBackFunctions { layer += try Self.shellFunction(name, in: text, "install.sh") }
         try ("""
         set -euo pipefail
         SUDO="\(fx.bin.appendingPathComponent("sudo").path)"
         MKTEMP=/usr/bin/mktemp
+        RM=/bin/rm
         CALL_TIMEOUT_SECONDS=3
         READ_MAX_BYTES=1048576
+        READ_GRACE_SECONDS=5
+        FIELD=""
         WORK="$("$MKTEMP" -d "\(fx.root.path)/harness.XXXXXX")"
-        """ + String(text[start.lowerBound..<end.upperBound]) + (try Self.shellFunction("work_read", in: text, "install.sh")) + """
+        """ + String(text[start.lowerBound..<end.upperBound]) + layer + """
         exec 9<>"\(fx.lock.path)"
         /usr/bin/lockf -t 0 9
 
@@ -2289,18 +2443,20 @@ final class RecoveryScriptTests: XCTestCase {
         return url
     }
 
-    /// The status files boundedHarness's calls have written so far.
-    private func harnessStatuses() throws -> [String] {
+    /// The read-back functions of the layer the scripts share (see
+    /// pin_output), in the order they are defined.
+    static let readBackFunctions = ["pin_output", "read_fd3", "send_output", "pipe_field", "take_output"]
+
+    /// Every name in boundedHarness's folders, as "<folder>/<name>".
+    private func harnessFiles() throws -> [String] {
         let fm = FileManager.default
-        var statuses: [String] = []
+        var names: [String] = []
         for dir in try fm.contentsOfDirectory(atPath: fx.root.path).filter({ $0.hasPrefix("harness.") }).sorted() {
-            let folder = fx.root.appendingPathComponent(dir)
-            for name in try fm.contentsOfDirectory(atPath: folder.path).filter({ $0.hasSuffix(".rc") }).sorted() {
-                let text = try String(contentsOf: folder.appendingPathComponent(name), encoding: .utf8)
-                statuses.append(text.trimmingCharacters(in: .whitespacesAndNewlines))
+            for name in try fm.contentsOfDirectory(atPath: fx.root.appendingPathComponent(dir).path).sorted() {
+                names.append("\(dir)/\(name)")
             }
         }
-        return statuses
+        return names
     }
 
     /// Opens every FIFO in boundedHarness's folders read-write without
@@ -2331,91 +2487,83 @@ final class RecoveryScriptTests: XCTestCase {
         } while !run.process.hasExited && Date() < deadline
     }
 
-    /// A FIFO where one of a bounded call's files goes holds neither
-    /// bounded() nor its supervisor (and the recovery lock it keeps): each
-    /// file is read back with work_read, which takes nothing but a regular
-    /// file and opens it read-write, and the supervisor writes the status
-    /// and pid read-write as well. Four calls each find a FIFO there: over
-    /// the output once the call has written it; at the status before the
-    /// supervisor writes it, for a call that would get SIGKILL after its
-    /// SIGTERM; at the pid and the status before the supervisor starts
-    /// (made by a mktemp that puts them next to the name it makes), for a
-    /// call that runs until the SIGTERM at its 1 s limit (a supervisor
-    /// that waited to write the pid would not get to that limit until the
-    /// call ended on its own, 60 s later); at the output before the call
-    /// starts, for a sudo-like call; and
-    /// over the pid once written, for a call past its limit that ignores
-    /// SIGTERM, which bounded() leaves running (125). Each harness ends
-    /// within seconds: with the call's status and its output unread
-    /// (BOUNDED_READ 2), with 124 since the status is unknown (twice), and
-    /// with 125 and no pid. A reader or writer that waited at a FIFO (a
-    /// plain `<` or `>`, or cat) would hold its harness until this test
-    /// opened the FIFO itself, which it does only past a 20 s deadline. The
-    /// last call ends when the test releases it, and its supervisor keeps
-    /// the lock until then.
-    func testAFIFOWhereABoundedCallsFileGoesHoldsNeitherTheCallerNorTheSupervisor() throws {
+    /// Nothing put at a name can hold a bounded call's caller or its
+    /// supervisor (and the recovery lock that keeps): the file for the
+    /// call's output has no name from before the call starts (pin_output),
+    /// and the pid, the status and the output come down a pipe. Five
+    /// harnesses: a call that lists WORK while it runs finds nothing there;
+    /// a mktemp that leaves a FIFO, or a file with bytes in it, where it
+    /// made its file gets 126 at once, and the call is not made; a
+    /// supervisor whose read-back stalls (a DEBUG trap holds it for 8 s)
+    /// leaves its caller with the status and with the output not read back
+    /// (BOUNDED_READ 2) READ_GRACE_SECONDS later, and keeps the lock until
+    /// it has sent; and a call past its 1 s limit that ignores SIGTERM gives
+    /// 125 with its pid, and its supervisor keeps the lock until the test
+    /// releases the call. A harness that waited at a FIFO would hold until
+    /// this test opened it, which it does only past a 20 s deadline. No
+    /// name is left in WORK.
+    func testNothingPutAtANameHoldsABoundedCallsCallerOrItsSupervisor() throws {
         let calls = fx.callsLog.path
         let release = fx.root.appendingPathComponent("release").path
-        // A mktemp that also puts a FIFO at the name with each suffix.
-        func fifoMktemp(_ suffixes: String...) throws -> String {
-            let url = fx.root.appendingPathComponent("mktemp-fifos-" + suffixes.joined(separator: "-"))
+        // A mktemp that puts something else where it made its file.
+        func plantingMktemp(_ name: String, _ plant: String) throws -> String {
+            let url = fx.root.appendingPathComponent("mktemp-" + name)
             try """
             #!/bin/bash
             b="$(/usr/bin/mktemp "$@")" || exit
-            for s in \(suffixes.joined(separator: " ")); do /usr/bin/mkfifo "$b.$s" || exit; done
+            \(plant)
             printf '%s\\n' "$b"
 
             """.write(to: url, atomically: true, encoding: .utf8)
             try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
             return url.path
         }
-        let cases: [(name: String, body: String, logged: String)] = [
-            ("output", """
+        let logged = #"echo "bounded $rc read=$BOUNDED_READ output=[$BOUNDED_OUTPUT]" >> ""# + calls + "\"\n"
+        let cases: [(name: String, body: String, logged: [String], lockAfter: Bool)] = [
+            ("names while it runs", #"""
             rc=0
-            bounded /bin/bash -c 'echo text; for f in "$1"/call.*.out; do /bin/rm -f "$f"; /usr/bin/mkfifo "$f"; done' _ "$WORK" || rc=$?
-            echo "bounded $rc read=$BOUNDED_READ output=[$BOUNDED_OUTPUT]" >> "\(calls)"
+            bounded /bin/bash -c 'echo "text [$(/bin/ls -A "$1")]"' _ "$WORK" || rc=$?
 
-            """, "bounded 0 read=2 output=[]"),
-            ("status", """
+            """# + logged, ["bounded 0 read=0 output=[text []]"], true),
+            ("a FIFO from mktemp", """
             rc=0
-            bounded /bin/bash -c 'for f in "$1"/call.??????; do /usr/bin/mkfifo "$f.rc"; done; echo text' _ "$WORK" || rc=$?
-            echo "bounded $rc read=$BOUNDED_READ output=[$BOUNDED_OUTPUT]" >> "\(calls)"
+            MKTEMP="\(try plantingMktemp("fifo", #"/bin/rm -f "$b" && /usr/bin/mkfifo "$b" || exit"#))" bounded /bin/bash -c 'echo ran >> "\(calls)"' || rc=$?
 
-            """, "bounded 124 read=0 output=[text]"),
-            ("pid and status first", """
+            """ + logged, ["bounded 126 read=2 output=[]"], true),
+            ("bytes from mktemp", """
             rc=0
-            MKTEMP="\(try fifoMktemp("pid", "rc"))" BOUNDED_LIMIT=1 bounded /bin/bash -c 'echo text
-            deadline=$(( SECONDS + 60 ))
-            while (( SECONDS < deadline )); do /bin/sleep 0.1; done' || rc=$?
-            echo "bounded $rc read=$BOUNDED_READ output=[$BOUNDED_OUTPUT]" >> "\(calls)"
+            MKTEMP="\(try plantingMktemp("bytes", #"printf planted > "$b" || exit"#))" bounded /bin/bash -c 'echo ran >> "\(calls)"' || rc=$?
 
-            """, "bounded 124 read=0 output=[text]"),
-            ("output first", """
+            """ + logged, ["bounded 126 read=2 output=[]"], true),
+            ("stalled read-back", """
+            hook() {
+              if [[ "$BASH_COMMAND" == read_fd3 ]]; then trap - DEBUG; /bin/sleep 8; fi
+              return 0
+            }
+            set -T
+            trap hook DEBUG
+            started=$SECONDS
             rc=0
-            MKTEMP="\(try fifoMktemp("out"))" BOUNDED_TERM_ONLY=1 bounded /bin/bash -c 'trap "" TERM; echo text' || rc=$?
-            echo "bounded $rc read=$BOUNDED_READ output=[$BOUNDED_OUTPUT]" >> "\(calls)"
+            bounded /bin/echo text || rc=$?
+            trap - DEBUG
+            set +T
+            waited=$(( SECONDS - started ))
+            (( waited >= 5 && waited <= 7 )) && echo "waited 5 to 7 s" >> "\(calls)" || echo "waited $waited s" >> "\(calls)"
 
-            """, "bounded 0 read=2 output=[]"),
-            ("pid", """
+            """ + logged, ["waited 5 to 7 s", "bounded 0 read=2 output=[]"], false),
+            ("ignores SIGTERM past its limit", #"""
             rc=0
             BOUNDED_TERM_ONLY=1 BOUNDED_LIMIT=1 bounded /bin/bash -c 'trap "" TERM
-            for f in "$1"/call.??????; do
-              for (( i = 0; i < 500; i++ )); do [[ -s "$f.pid" ]] && break; /bin/sleep 0.01; done
-              /bin/rm -f "$f.pid"; /usr/bin/mkfifo "$f.pid"
-            done
             deadline=$(( SECONDS + 60 ))
-            while [[ ! -e "$2" ]] && (( SECONDS < deadline )); do /bin/sleep 0.1; done' _ "$WORK" "\(release)" || rc=$?
-            echo "bounded $rc pid=[$BOUNDED_PID]" >> "\(calls)"
+            while [[ ! -e "$1" ]] && (( SECONDS < deadline )); do /bin/sleep 0.1; done' _ "\#(release)" || rc=$?
+            pid=no
+            [[ "$BOUNDED_PID" =~ ^[0-9]+$ ]] && pid=yes
+            echo "bounded $rc pid=$pid" >> "\#(calls)"
 
-            """, "bounded 125 pid=[]"),
+            """#, ["bounded 125 pid=yes"], false),
         ]
         for c in cases {
             fx.clearCalls()
-            // Only this case's files from here on (harnessStatuses reads
-            // every status file, and a FIFO would hold that read).
-            for dir in try FileManager.default.contentsOfDirectory(atPath: fx.root.path) where dir.hasPrefix("harness.") {
-                try FileManager.default.removeItem(at: fx.root.appendingPathComponent(dir))
-            }
             let run = try fx.start(try boundedHarness(c.body))
             let ended = waitUntil(20) { run.process.hasExited }
             if !ended { releaseHarnessFIFOs(until: run, within: 10) }
@@ -2426,67 +2574,91 @@ final class RecoveryScriptTests: XCTestCase {
 
             XCTAssertTrue(ended, "\(c.name): the harness waited at a FIFO until the test opened it: \(fx.calls())")
             XCTAssertEqual(r.status, 0, c.name + r.stderr)
-            XCTAssertEqual(fx.calls(), [c.logged], c.name)
+            XCTAssertEqual(fx.calls(), c.logged, c.name)
+            if c.lockAfter {
+                XCTAssertTrue(try fx.waitUntilLockIsFree(5), "\(c.name): the supervisor has ended")
+            } else {
+                XCTAssertFalse(try fx.lockIsFree(), "\(c.name): the supervisor keeps the lock while it has work")
+            }
+            if c.name == "stalled read-back" {
+                XCTAssertTrue(try fx.waitUntilLockIsFree(10), "the supervisor ends once it has sent")
+            }
         }
-        XCTAssertFalse(try fx.lockIsFree(), "the supervisor keeps the lock while its call runs")
         fx.releaseCommand()
-        XCTAssertTrue(waitUntil(10) { (try? self.fx.lockIsFree()) == true }, "the supervisor ends once its call does")
-        XCTAssertEqual(try harnessStatuses(), ["124"], "the last call's status, written after its reap")
+        XCTAssertTrue(try fx.waitUntilLockIsFree(10), "the supervisor ends once its call does")
+        XCTAssertEqual(try harnessFiles(), [], "no name left in WORK")
     }
 
-    /// work_read, the one reader of the files a run makes, on its own with
-    /// READ_MAX_BYTES at 8. It returns 0 with the whole text, 1 for a NUL
-    /// byte (the text without them, and the text before the first), and 2
-    /// for anything it cannot show to be a whole regular file within the
-    /// limit: one byte over, a NUL past the limit, a FIFO (at once, without
-    /// waiting for a writer), a symbolic link, a folder, a missing file (not
-    /// created) and a file it cannot open read-write. Six runs change the
-    /// file during the read, from a DEBUG trap with functrace on, which
-    /// fires before each command inside the read and after its open: a
-    /// FIFO put at the name after the name check and before the open (with
-    /// extdebug, the trap skips that check, as one made before the swap
-    /// would pass), a FIFO put there once the descriptor is open, another
-    /// regular file put there and the file removed after the read (nothing
-    /// is created there), and the descriptor closed, or opened again
-    /// write-only on the same file, before the second read of a file with
-    /// a NUL (a read that fails keeps nothing of the part before it). Each
-    /// returns 2 without waiting, where the same file unchanged returns 0
-    /// or 1.
-    func testWorkReadTakesOnlyAWholeRegularFileWithinItsLimit() throws {
+    /// The read-back layer on its own, with READ_MAX_BYTES at 8, over
+    /// files made as a supervisor makes them. pin_output opens the file
+    /// read-write on fd 4 and fd 3, so a FIFO cannot hold it, and removes
+    /// its name; it refuses (1, at once) a FIFO, a symbolic link, a folder,
+    /// a missing file (none is created), a file with bytes in it, one it
+    /// cannot open read-write, a FIFO put at the name between its check and
+    /// its open, and a file put back at the name once it has removed it. A
+    /// file removed just before the open is made again by the open, empty,
+    /// and removed with the rest. read_fd3 then reads fd 3, not the name:
+    /// a FIFO put at the name afterwards changes nothing, while bytes
+    /// written through fd 4 before the read are read, as the call's own
+    /// are. It returns 0 with the whole text, 1 for a NUL byte (the text
+    /// without them, and the text before the first), and 2 for one byte
+    /// over the limit, a NUL past it, a byte written while it reads, a
+    /// descriptor that is closed or opened again write-only before its
+    /// second read, and one that is not a regular file. take_output takes
+    /// the four fields send_output sends, and returns 2 for a field
+    /// missing, a status that is not 0, 1 or 2, or a sender that stops
+    /// sending, within its deadline; a sender that sends all four and does
+    /// not end holds it until the deadline, no longer.
+    func testTheReadBackLayerTakesOnlyAWholePrivateFileAndWaitsNoLongerThanItsDeadline() throws {
         let text = try String(contentsOf: ScriptFixture.productionScripts.appendingPathComponent("install.sh"), encoding: .utf8)
         let dir = fx.root.appendingPathComponent("reads", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let script = fx.root.appendingPathComponent("work-read.sh")
+        let script = fx.root.appendingPathComponent("read-back.sh")
+        var layer = ""
+        for name in Self.readBackFunctions { layer += try Self.shellFunction(name, in: text, "install.sh") }
         try ("""
         set -uo pipefail
         READ_MAX_BYTES=8
+        RM=/bin/rm
+        FIELD=""
         d='\(dir.path)'
 
-        """ + (try Self.shellFunction("work_read", in: text, "install.sh")) + #"""
-        show() { # name file
+        """ + layer + #"""
+        # A file made as mktemp makes one, pinned, with $2 (a printf format)
+        # written through fd 4.
+        pinned() { # name format
           local rc=0
-          work_read "$2" || rc=$?
+          : > "$d/$1"
+          pin_output "$d/$1" || rc=$?
+          (( rc != 0 )) || printf "$2" >&4
+          return "$rc"
+        }
+        show() { # name
+          local rc=0
+          read_fd3 || rc=$?
           printf '%s %s %q %q\n' "$1" "$rc" "$READ_TEXT" "$READ_HEAD"
+          exec 3<&- 4>&-
+        }
+        refused() { # name file
+          local rc=0
+          pin_output "$2" || rc=$?
+          exec 3<&- 4>&-
+          printf 'pin %s %s\n' "$1" "$rc"
         }
         hook_case=""
         hook_count=0
         hook() {
           case "$hook_case" in
             fifo-before-open)
-              if [[ "$BASH_COMMAND" == '[[ -f "$1" && ! -L "$1" ]]' ]]; then
-                hook_case=""; /bin/rm -f "$d/swap"; /usr/bin/mkfifo "$d/swap"
-                return 1
-              fi ;;
-            fifo-after-open)
-              if [[ "$BASH_COMMAND" == "IFS= read "* ]]; then
+              if [[ "$BASH_COMMAND" == 'exec 4<> "$1" 3<> "$1"' ]]; then
                 hook_case=""; /bin/rm -f "$d/swap"; /usr/bin/mkfifo "$d/swap"
               fi ;;
-            other)
-              if [[ "$BASH_COMMAND" == break ]]; then
-                hook_case=""; printf 'other\n' > "$d/swap.new"; /bin/mv -f "$d/swap.new" "$d/swap"
-              fi ;;
-            gone)
-              if [[ "$BASH_COMMAND" == break ]]; then hook_case=""; /bin/rm -f "$d/swap"; fi ;;
+            gone-before-open)
+              if [[ "$BASH_COMMAND" == 'exec 4<> "$1" 3<> "$1"' ]]; then hook_case=""; /bin/rm -f "$d/swap"; fi ;;
+            back-after-removal)
+              if [[ "$BASH_COMMAND" == '[[ ! -e "$1" && ! -L "$1" ]]' ]]; then hook_case=""; : > "$d/swap"; fi ;;
+            grows)
+              if [[ "$BASH_COMMAND" == "IFS= read -r -d '' -n 1 -u 3 part" ]]; then hook_case=""; printf x >&4; fi ;;
             close)
               if [[ "$BASH_COMMAND" == "IFS= read "* ]]; then
                 hook_count=$(( hook_count + 1 ))
@@ -2495,60 +2667,86 @@ final class RecoveryScriptTests: XCTestCase {
             write-only)
               if [[ "$BASH_COMMAND" == "IFS= read "* ]]; then
                 hook_count=$(( hook_count + 1 ))
-                if (( hook_count == 2 )); then hook_case=""; exec 3>>"$d/swap"; fi
+                if (( hook_count == 2 )); then hook_case=""; exec 3>>"$d/other"; fi
               fi ;;
           esac
           return 0
         }
-        hooked() { # case name file
-          local rc=0
+        HOOKED=0
+        hooked() { # case command...
           hook_case="$1"
           hook_count=0
-          shopt -s extdebug
+          shift
+          HOOKED=0
           set -T
           trap hook DEBUG
-          work_read "$3" || rc=$?
+          "$@" || HOOKED=$?
           trap - DEBUG
           set +T
-          shopt -u extdebug
-          printf '%s %s %q %q hook=[%s]\n' "$2" "$rc" "$READ_TEXT" "$READ_HEAD" "$hook_case"
+          return 0
         }
-        printf 'abc\n' > "$d/plain"; show plain "$d/plain"
-        : > "$d/empty"; show empty "$d/empty"
-        printf '12345678' > "$d/eight"; show eight "$d/eight"
-        printf '123456789' > "$d/nine"; show nine "$d/nine"
-        printf 'ab\0cd\n\n' > "$d/nul"; show nul "$d/nul"
-        printf '\0abc' > "$d/nul-first"; show nul-first "$d/nul-first"
-        printf 'a\0b\0c' > "$d/nuls"; show nuls "$d/nuls"
-        printf '1234567\0' > "$d/nul-eighth"; show nul-eighth "$d/nul-eighth"
-        printf '12345678\0' > "$d/nul-ninth"; show nul-ninth "$d/nul-ninth"
-        printf 'a\0bcdefgh' > "$d/nul-then-over"; show nul-then-over "$d/nul-then-over"
-        /usr/bin/mkfifo "$d/fifo"; show fifo "$d/fifo"
-        /bin/ln -s "$d/plain" "$d/link"; show link "$d/link"
-        /bin/mkdir "$d/folder"; show folder "$d/folder"
-        show missing "$d/missing"
+        pinned plain 'abc\n' && show plain
+        pinned empty '' && show empty
+        pinned eight '12345678' && show eight
+        pinned nine '123456789' && show nine
+        pinned nul 'ab\0cd\n\n' && show nul
+        pinned nul-first '\0abc' && show nul-first
+        pinned nuls 'a\0b\0c' && show nuls
+        pinned nul-eighth '1234567\0' && show nul-eighth
+        pinned nul-ninth '12345678\0' && show nul-ninth
+        pinned nul-then-over 'a\0bcdefgh' && show nul-then-over
+        /usr/bin/mkfifo "$d/fifo"; refused fifo "$d/fifo"
+        printf 'abc\n' > "$d/target"; /bin/ln -s "$d/target" "$d/link"; refused link "$d/link"
+        /bin/mkdir "$d/folder"; refused folder "$d/folder"
+        refused missing "$d/missing"
         [[ -e "$d/missing" ]] && echo "missing created" || echo "missing not created"
-        printf 'abc\n' > "$d/read-only"; /bin/chmod 0400 "$d/read-only"; show read-only "$d/read-only"
-        printf 'abc\n' > "$d/swap"; show unswapped "$d/swap"
-        hooked fifo-before-open fifo-before-open "$d/swap"
-        /bin/rm -f "$d/swap"; printf 'abc\n' > "$d/swap"
-        hooked fifo-after-open fifo-after-open "$d/swap"
-        /bin/rm -f "$d/swap"; printf 'abc\n' > "$d/swap"
-        hooked other other-file-after-read "$d/swap"
-        /bin/rm -f "$d/swap"; printf 'abc\n' > "$d/swap"
-        hooked gone gone-after-read "$d/swap"
-        [[ -e "$d/swap" ]] && echo "gone created" || echo "gone not created"
-        /bin/rm -f "$d/swap"; printf 'ab\0cd' > "$d/swap"; show unswapped-nul "$d/swap"
-        hooked close closed-before-second-read "$d/swap"
-        hooked write-only write-only-before-second-read "$d/swap"
+        printf 'planted' > "$d/bytes"; refused bytes "$d/bytes"
+        : > "$d/read-only"; /bin/chmod 0400 "$d/read-only"; refused read-only "$d/read-only"
+        : > "$d/swap"; hooked fifo-before-open pin_output "$d/swap"; exec 3<&- 4>&-
+        printf 'pin fifo-before-open %s hook=[%s]\n' "$HOOKED" "$hook_case"; /bin/rm -f "$d/swap"
+        : > "$d/swap"; hooked back-after-removal pin_output "$d/swap"; exec 3<&- 4>&-
+        printf 'pin back-after-removal %s hook=[%s]\n' "$HOOKED" "$hook_case"; /bin/rm -f "$d/swap"
+        : > "$d/swap"; hooked gone-before-open pin_output "$d/swap"
+        printf 'pin gone-before-open %s hook=[%s]\n' "$HOOKED" "$hook_case"
+        [[ -e "$d/swap" ]] && echo "gone-before-open left" || echo "gone-before-open not left"
+        printf 'abc\n' >&4; show made-again
+        pinned swapped 'abc\n' && { /usr/bin/mkfifo "$d/swapped"; show fifo-at-the-name-after; }
+        pinned written 'abc\n' && { printf 'de' >&4; show written-through-fd-4; }
+        pinned grows 'abc' && { hooked grows read_fd3; printf 'grows %s %q hook=[%s]\n' "$HOOKED" "$READ_TEXT" "$hook_case"; exec 3<&- 4>&-; }
+        pinned close 'ab\0cd' && { hooked close read_fd3; printf 'closed-before-second-read %s %q hook=[%s]\n' "$HOOKED" "$READ_TEXT" "$hook_case"; exec 3<&- 4>&-; }
+        pinned write-only 'ab\0cd' && { hooked write-only read_fd3; printf 'write-only-before-second-read %s %q hook=[%s]\n' "$HOOKED" "$READ_TEXT" "$hook_case"; exec 3<&- 4>&-; }
+        exec 3< <(printf abc); show a-pipe
+        pinned sent 'a\0b\n' && {
+          exec 5< <(send_output)
+          rc=0; take_output "$(( SECONDS + 3 ))" || rc=$?
+          exec 5<&- 3<&- 4>&-
+          printf 'sent %s %q %q\n' "$rc" "$READ_TEXT" "$READ_HEAD"
+        }
+        took() { # name
+          local rc=0 started=$SECONDS waited when
+          take_output "$(( SECONDS + 2 ))" || rc=$?
+          waited=$(( SECONDS - started ))
+          exec 5<&-
+          when="after $waited s"
+          (( waited > 1 )) || when=at-once
+          (( waited < 2 || waited > 4 )) || when=at-the-deadline
+          printf 'take %s %s %q %q %s\n' "$1" "$rc" "$READ_TEXT" "$READ_HEAD" "$when"
+        }
+        exec 5< <(printf '%s\0' 0 abc '' end); took whole
+        exec 5< <(printf '%s\0' 1 abcd ab end); took nul
+        exec 5< <(printf '%s\0' 0 abc ''); took no-end
+        exec 5< <(printf '%s\0' 7 abc '' end); took status-7
+        exec 5< <(printf '%s\0' 0 abc '' other); took not-end
+        exec 5< <(printf '%s\0' 0; exec /bin/sleep 10 2>/dev/null); took stalls
+        exec 5< <(printf '%s\0' 0 abc '' end; exec /bin/sleep 10 2>/dev/null); took does-not-end
 
         """#).write(to: script, atomically: true, encoding: .utf8)
 
         let run = try fx.start(script)
-        let ended = waitUntil(20) { run.process.hasExited }
+        let ended = waitUntil(30) { run.process.hasExited }
         if !ended {
-            // A read that waited at a FIFO: give it a writer and an end.
-            for name in ["fifo", "swap"] {
+            // An open that waited at a FIFO: give it a writer and an end.
+            for name in ["fifo", "swap", "swapped"] {
                 let fd = open(dir.appendingPathComponent(name).path, O_RDWR | O_NONBLOCK)
                 if fd >= 0 { Thread.sleep(forTimeInterval: 0.2); close(fd) }
             }
@@ -2559,7 +2757,7 @@ final class RecoveryScriptTests: XCTestCase {
 
         XCTAssertTrue(ended, "a read waited: " + r.stdout)
         XCTAssertEqual(r.status, 0, r.stderr)
-        let readOnly = getuid() == 0 ? "read-only 0 $'abc\\n' $'abc\\n'" : "read-only 2 '' ''"
+        let readOnly = getuid() == 0 ? "pin read-only 0" : "pin read-only 1"
         XCTAssertEqual(r.stdout.components(separatedBy: "\n"), [
             "plain 0 $'abc\\n' $'abc\\n'",
             "empty 0 '' ''",
@@ -2571,21 +2769,32 @@ final class RecoveryScriptTests: XCTestCase {
             "nul-eighth 1 1234567 1234567",
             "nul-ninth 2 '' ''",
             "nul-then-over 2 '' ''",
-            "fifo 2 '' ''",
-            "link 2 '' ''",
-            "folder 2 '' ''",
-            "missing 2 '' ''",
+            "pin fifo 1",
+            "pin link 1",
+            "pin folder 1",
+            "pin missing 1",
             "missing not created",
+            "pin bytes 1",
             readOnly,
-            "unswapped 0 $'abc\\n' $'abc\\n'",
-            "fifo-before-open 2 '' '' hook=[]",
-            "fifo-after-open 2 '' '' hook=[]",
-            "other-file-after-read 2 '' '' hook=[]",
-            "gone-after-read 2 '' '' hook=[]",
-            "gone not created",
-            "unswapped-nul 1 abcd ab",
-            "closed-before-second-read 2 '' '' hook=[]",
-            "write-only-before-second-read 2 '' '' hook=[]",
+            "pin fifo-before-open 1 hook=[]",
+            "pin back-after-removal 1 hook=[]",
+            "pin gone-before-open 0 hook=[]",
+            "gone-before-open not left",
+            "made-again 0 $'abc\\n' $'abc\\n'",
+            "fifo-at-the-name-after 0 $'abc\\n' $'abc\\n'",
+            "written-through-fd-4 0 $'abc\\nde' $'abc\\nde'",
+            "grows 2 '' hook=[]",
+            "closed-before-second-read 2 '' hook=[]",
+            "write-only-before-second-read 2 '' hook=[]",
+            "a-pipe 2 '' ''",
+            "sent 1 ab a",
+            "take whole 0 abc abc at-once",
+            "take nul 1 abcd ab at-once",
+            "take no-end 2 '' '' at-once",
+            "take status-7 2 '' '' at-once",
+            "take not-end 2 '' '' at-once",
+            "take stalls 2 '' '' at-the-deadline",
+            "take does-not-end 0 abc abc at-the-deadline",
             "",
         ], r.stdout)
     }
@@ -3154,10 +3363,11 @@ final class RecoveryScriptTests: XCTestCase {
         return lines[start...end].joined(separator: "\n") + "\n"
     }
 
-    /// The text from work_read to snapshot, the read layer both scripts
-    /// share, as `text` has it.
+    /// The text from the comment on reading back a bounded call's output
+    /// to snapshot, the read layer uninstall.sh and backstop.sh share, as
+    /// `text` has it.
     static func sharedReadLayer(in text: String, _ script: String) throws -> String {
-        let start = try XCTUnwrap(text.range(of: "# Reads a file this run made (a call's output, status or pid, a note, or"), script)
+        let start = try XCTUnwrap(text.range(of: "# What a bounded call printed is read back inside its supervisor, never by"), script)
         let snapshot = try XCTUnwrap(text.range(of: "\nsnapshot() { # file copy\n", range: start.upperBound..<text.endIndex), script)
         let end = try XCTUnwrap(text.range(of: "\n}\n", range: snapshot.upperBound..<text.endIndex), script)
         return String(text[start.lowerBound..<end.upperBound])
@@ -3165,7 +3375,8 @@ final class RecoveryScriptTests: XCTestCase {
 
     /// A script's read layer, ready to source on its own: real tools, short
     /// limits, WORK at `work`, then the script's own bounded() with what it
-    /// calls, and the shared text from work_read to snapshot.
+    /// calls, the shared text to snapshot, and a notes_reset, as each
+    /// script makes once WORK is there.
     static func readLayerSource(_ text: String, script: String, work: URL) throws -> String {
         var source = """
         PLUTIL=/usr/bin/plutil
@@ -3180,22 +3391,23 @@ final class RecoveryScriptTests: XCTestCase {
         READ_TIMEOUT_SECONDS=5
         KILL_GRACE_SECONDS=1
         READ_MAX_BYTES=1048576
+        READ_GRACE_SECONDS=5
         WORK='\(work.path)'
-        READ_FAILURES="$WORK/read-failures.lines"
         BOUNDED_OUTPUT=""
         BOUNDED_READ=2
         BOUNDED_PID=""
         BOUNDED_LIMIT=""
         BOUNDED_TERM_ONLY=""
         BOUNDED_OWN_GROUP=""
-        bounded_reads=0
+        FIELD=""
+        NOTES_BROKEN=1
 
         """
         let own = script == "backstop.sh"
-            ? ["job_running", "wait_for_job", "signal_job", "bounded", "call_result"]
+            ? ["job_running", "wait_for_job", "signal_job", "bounded", "read_unit", "call_result"]
             : ["bounded", "supervise", "call_result"]
         for name in own { source += try shellFunction(name, in: text, script) }
-        return source + (try sharedReadLayer(in: text, script))
+        return source + (try sharedReadLayer(in: text, script)) + "notes_reset\n"
     }
 
     /// The two scripts carry the same reader, comment and all.
@@ -3706,7 +3918,8 @@ final class RecoveryScriptTests: XCTestCase {
     /// line on the binary's standard input, and never runs ps or kill for
     /// such an entry. "resumed" clears it. The binary's parent is the
     /// backstop shell itself: no supervisor process sits between them that
-    /// could reap it before the shell decides whether to signal it.
+    /// could reap it before the shell decides whether to signal it. Its
+    /// standard input and output are files with no name (see pin_output).
     func testMicrosecondEntryIsHandedToTheAppBinaryWithItsFullIdentity() throws {
         let started = 1_789_388_423
         try writeMicrosecondEntry(pid: 5100, started: started, micros: 654_321)
@@ -3721,6 +3934,10 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(fx.log().contains("SIGCONT sent to pid 5100 by the app binary"), fx.log())
         let parent = try String(contentsOf: fx.root.appendingPathComponent("insomnia.ppid"), encoding: .utf8)
         XCTAssertEqual(parent.trimmingCharacters(in: .whitespacesAndNewlines), String(fx.lastPid), "the binary is not a direct child of the backstop shell")
+        // Its input and its answer are files with no name, which nothing
+        // else can open, write or replace.
+        let io = try String(contentsOf: fx.root.appendingPathComponent("insomnia.io"), encoding: .utf8)
+        XCTAssertEqual(io, "0 Regular File\n0 Regular File\n")
     }
 
     /// Microseconds of 0 are an identity too (the key is present), not a
@@ -4049,19 +4266,25 @@ final class RecoveryScriptTests: XCTestCase {
     /// quarter second slower (see slowPollingPath). Its 4 s limit is read
     /// from bash's SECONDS clock, so it gets SIGTERM up to a second and a
     /// slow poll after the limit, and the run is over long before polls
-    /// counted ten a second (about 16 s here) would have sent it.
+    /// counted ten a second (about 16 s here) would have sent it. The bound
+    /// is on the whole run; its failure message gives the time of each
+    /// phase (see slowPollTiming).
     func testAppBinaryThatDoesNotAnswerIsStoppedOnTimeWhenEveryPollIsSlow() throws {
         try writeMicrosecondEntry(pid: 5311, started: 1_789_388_423, micros: 11)
         fx.setMode("insomnia", "hang")
+        var phases = PhaseTimes()
+        let script = try phases.time("patched copy") { try backstop(commandTimeout: 4) }
+        let path = try phases.time("slow sleep ready") { try fx.slowPollingPath() }
 
         let started = Date()
-        let r = try fx.run(try backstop(commandTimeout: 4), extraEnvironment: ["PATH": try fx.slowPollingPath()])
+        let r = try fx.run(script, extraEnvironment: ["PATH": path])
         let elapsed = Date().timeIntervalSince(started)
+        let timing = slowPollTiming(phases, started: started, elapsed: elapsed, commandStartedFile: "insomnia.ppid", command: "the binary")
 
         XCTAssertNotEqual(r.status, 0)
         XCTAssertGreaterThan(fx.slowPolls(), 0, "the script polled through the slow sleep")
         XCTAssertGreaterThan(elapsed, 4, "the binary had its whole limit")
-        XCTAssertLessThan(elapsed, 9, "4 s, up to a second and a slow poll late, and the slow poll that sees it end")
+        XCTAssertLessThan(elapsed, 9, "4 s, up to a second and a slow poll late, and the slow poll that sees it end. \(timing)")
         XCTAssertEqual(fx.calls(), ["Insomnia --resume-frozen 5 < 5311 1789388423 11 \(fx.bootUUID)"])
         XCTAssertEqual(try onlyFrozenEntry()?["pid"] as? Int, 5311)
         XCTAssertTrue(try fx.lockIsFree())
@@ -4423,54 +4646,47 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(fx.calls(), ["sudo -n \(fx.fakePmset) -a disablesleep 0"], "the retry runs in its own transaction")
     }
 
-    /// A command's supervisor writes its status only after it has reaped
-    /// the command, so until the status is there the call's .pid file can
-    /// name a pid the kernel has already given to another process. The fake
-    /// sudo exits at once, after writing the pid of a sentinel this test
-    /// started into its call's .pid file and putting a FIFO where the status
-    /// goes, so the supervisor's status write waits until the test opens
-    /// it. The run must not signal the sentinel, whatever the .pid file
-    /// says, and with no status in time it stops the transaction: journal
-    /// and session kept, no second undo. The supervisor holds the lock until
-    /// it has written its status. The sentinel is a /bin/sleep this test
-    /// posix_spawned and reaps only at the end, so its pid stays its own.
-    func testALateStatusNeverLeadsToSignalingThePidInTheStatusFiles() throws {
+    /// A supervisor killed with SIGKILL, which it cannot ignore, while its
+    /// command runs. The fake sudo closes its fd 9, as sudo does, kills its
+    /// parent (the supervisor) half a second in, and keeps running. The run
+    /// gets the pid and then the end of the pipe, with no status, so it
+    /// cannot tell whether the command still runs: it logs the pid, signals
+    /// nothing, and stops the transaction (journal and session kept, no
+    /// second undo). Once the run has exited nothing holds the recovery lock,
+    /// though the command still runs: that is what a SIGKILL to the
+    /// supervisor costs (see supervise_command). No pid or status goes to a
+    /// file, so the next run, after the command has ended, finds no file of
+    /// the call's.
+    func testASupervisorKilledWithSigkillLeavesTheTransactionStoppedAndSignalsNothing() throws {
         try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
         try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":true,"frozenProcesses":[],"dockerFrozen":false}"#)
-        let sentinelScript = fx.root.appendingPathComponent("sentinel.sh")
-        try "exec /bin/sleep 120\n".write(to: sentinelScript, atomically: true, encoding: .utf8)
-        let sentinel = try fx.spawn(sentinelScript)
-        defer {
-            _ = sentinel.signal(SIGTERM)
-            sentinel.wait()
-        }
-        try String(sentinel.pid).write(to: fx.root.appendingPathComponent("sentinel.pid"), atomically: true, encoding: .utf8)
-        fx.setMode("sudo", "status-delayed")
+        fx.setMode("sudo", "kills-supervisor")
 
         let r = try fx.run(fx.backstop)
 
         XCTAssertEqual(r.status, 1, r.stderr + fx.log())
-        XCTAssertFalse(sentinel.hasExited, "the pid read from the .pid file was signaled")
-        XCTAssertEqual(fx.calls(), ["sudo -n \(fx.fakePmset) -a disablesleep 0", "sudo STATUS-DELAYED"], "no second undo")
+        let command = try XCTUnwrap(fx.hungPid("sudo", within: 5), "the command runs on: \(fx.calls())")
+        XCTAssertEqual(fx.calls(), ["sudo -n \(fx.fakePmset) -a disablesleep 0", "sudo SUPERVISOR-KILLED"],
+                       "nothing signaled the command, and no second undo")
         let s = try fx.stateJSON()
         XCTAssertEqual(s["sleepDisabledByUs"] as? Bool, true)
         XCTAssertEqual(s["lowPowerSetByUs"] as? Bool, true)
         XCTAssertTrue(fx.exists(fx.session))
         let log = fx.log()
-        XCTAssertTrue(log.contains("(pid \(sentinel.pid)): its supervisor reported no result within 6s"), "the pid is only logged: \(log)")
+        XCTAssertTrue(log.contains("(pid \(command)): its supervisor reported no result within 6s"), "the pid is only logged: \(log)")
         XCTAssertTrue(log.contains("recovery stopped"), log)
-        XCTAssertFalse(try fx.lockIsFree(), "the supervisor has not written its status yet, so it still holds the lock")
+        XCTAssertNil(fx.commandEnded(), "the command still runs")
+        XCTAssertTrue(try fx.lockIsFree(), "with its supervisor killed, nothing holds the lock for the live command")
 
-        XCTAssertEqual(Array(fx.drainStatusFIFOs(within: 5).values), ["exit 0\n"], "the supervisor writes the status it got from wait")
-        XCTAssertTrue(try fx.waitUntilLockIsFree(5), "the supervisor lets go of the lock once its status is written")
-        XCTAssertFalse(sentinel.hasExited)
-
+        fx.releaseCommand()
+        XCTAssertTrue(waitUntil(10) { self.fx.commandEnded() != nil })
+        XCTAssertEqual(fx.commandEnded(), "released")
         fx.setMode("sudo", "ok")
         fx.clearCalls()
         let after = try fx.run(fx.backstop)
         XCTAssertEqual(after.status, 0, after.stderr + fx.log())
         XCTAssertEqual(fx.calls(), ["sudo -n \(fx.fakePmset) -a disablesleep 0", "sudo -n \(fx.fakePmset) -b lowpowermode 0"])
-        XCTAssertEqual(try fx.backstopFiles(), [], "the next run that took the lock itself removed the stopped call's files")
+        XCTAssertEqual(try fx.backstopFiles(), [], "no file of the killed call's")
     }
 
     /// A power command that ignores SIGTERM, with every poll the script and
@@ -4479,20 +4695,26 @@ final class RecoveryScriptTests: XCTestCase {
     /// SECONDS clock: the command gets one SIGTERM, after its whole limit,
     /// and the run reports it still running after the grace. Each wait can
     /// end up to a second and a slow poll late. Counted in polls (ten a
-    /// second) the two took about 20 s here.
+    /// second) the two took about 20 s here. The bound is on the whole run;
+    /// its failure message gives the time of each phase (see
+    /// slowPollTiming).
     func testALiveCommandIsReportedOnTimeWhenEveryPollIsSlow() throws {
         try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
         try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":true,"frozenProcesses":[],"dockerFrozen":false}"#)
         fx.setMode("sudo", "logs-term")
+        var phases = PhaseTimes()
+        let script = try phases.time("patched copy") { try backstop(commandTimeout: 4) }
+        let path = try phases.time("slow sleep ready") { try fx.slowPollingPath() }
 
         let started = Date()
-        let r = try fx.run(try backstop(commandTimeout: 4), extraEnvironment: ["PATH": try fx.slowPollingPath()])
+        let r = try fx.run(script, extraEnvironment: ["PATH": path])
         let elapsed = Date().timeIntervalSince(started)
+        let timing = slowPollTiming(phases, started: started, elapsed: elapsed, commandStartedFile: "sudo.hung.pid", command: "the sudo pmset")
 
         XCTAssertEqual(r.status, 1, r.stderr + fx.log())
         XCTAssertGreaterThan(fx.slowPolls(), 0, "the script polled through the slow sleep")
         XCTAssertGreaterThan(elapsed, 5, "the command had its whole 4 s limit and the 1 s grace")
-        XCTAssertLessThan(elapsed, 12, "4 s and 1 s, up to a second and a slow poll late each, and the run's own slow poll")
+        XCTAssertLessThan(elapsed, 12, "4 s and 1 s, up to a second and a slow poll late each, and the run's own slow poll. \(timing)")
         XCTAssertEqual(fx.calls().filter { $0 == "sudo SIGTERM" }.count, 1, "\(fx.calls())")
         XCTAssertEqual(fx.calls().filter { $0.hasPrefix("sudo -n") }, ["sudo -n \(fx.fakePmset) -a disablesleep 0"], "no second undo")
         XCTAssertNil(fx.commandEnded(), "never SIGKILLed")
@@ -4545,7 +4767,7 @@ final class RecoveryScriptTests: XCTestCase {
 
         XCTAssertTrue(waitUntil(15) { self.fx.calls().filter { $0 == "sudo SIGTERM" }.count == 2 },
                       "one SIGTERM from the group, one from the supervisor at the limit: \(fx.calls())")
-        XCTAssertTrue(waitUntil(10) { self.statusLines() == ["alive"] }, "the supervisor reached the end of the grace: \(self.statusLines())")
+        XCTAssertFalse(waitUntil(3) { self.fx.commandEnded() != nil }, "past the supervisor's 1 s grace, the command still runs")
         XCTAssertEqual(fx.calls().filter { $0 == "sudo SIGTERM" }.count, 2, "\(fx.calls())")
         XCTAssertEqual(fx.calls().filter { $0 == "sudo SIGHUP" }.count, 1, "\(fx.calls())")
         let senders = try fx.signalSenders(of: command)
@@ -4567,9 +4789,9 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(s["lowPowerSetByUs"] as? Bool, true)
     }
 
-    /// The supervisor ignores SIGTERM and SIGHUP, and a child inherits
-    /// ignored signals, but the command must not: SIGTERM at its limit has
-    /// to be able to stop it. The fake checks both from a shell that
+    /// The supervisor ignores SIGTERM, SIGHUP and SIGPIPE, and a child
+    /// inherits ignored signals, but the command must not: SIGTERM at its
+    /// limit has to be able to stop it. The fake checks both from a shell that
     /// inherits its signal actions (see "signals-self"). As a check on the
     /// check, a backstop started with SIGTERM already ignored, which no
     /// launchd job is, cannot give the command the default back (bash keeps
@@ -4589,13 +4811,14 @@ final class RecoveryScriptTests: XCTestCase {
         }
     }
 
-    /// Each call's status files go when the call ends, whatever the command
-    /// did. A run that took the lock itself also removes the files earlier
-    /// runs left: their supervisors held the lock while they lived. A run
-    /// that shares its caller's lock leaves them, since an earlier run
-    /// under that same lock may still have a supervisor waiting for its
-    /// command.
-    func testStatusFilesGoWithTheirCallAndLeftoversOnlyUnderTheRunsOwnLock() throws {
+    /// No bounded call leaves a file with a name, whatever the command did
+    /// (exit 0, fail, or run until its SIGTERM). Older builds wrote each
+    /// call's .pid and .rc status files in INSOMNIA_HOME. A run that took
+    /// the lock itself removes what they left: their supervisors held the
+    /// lock while they lived. A run that shares its caller's lock leaves
+    /// them, since an earlier run under that same lock may still have a
+    /// supervisor waiting for its command.
+    func testNoCallLeavesAFileAndOlderBuildsStatusFilesGoOnlyUnderTheRunsOwnLock() throws {
         let leftovers = [".backstop.4242.1.pid", ".backstop.4242.1.rc"]
         for name in leftovers {
             try "4242\n".write(to: fx.home.appendingPathComponent(name), atomically: true, encoding: .utf8)
@@ -4654,11 +4877,29 @@ final class RecoveryScriptTests: XCTestCase {
         return url
     }
 
-    /// The lines in the bounded calls' .rc status files, in file name order.
-    private func statusLines() -> [String] {
-        let names = ((try? fx.backstopFiles()) ?? []).filter { $0.hasSuffix(".rc") }
-        return names.compactMap { try? String(contentsOf: fx.home.appendingPathComponent($0), encoding: .utf8) }
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+    /// Where the time of a slow-poll test went, for its failure message: the
+    /// fixture (made before the test, the fakes' ready runs and the scripts'
+    /// parse included), the test's own steps before its run (`phases`), the
+    /// run split where the hung command started (the modification time of
+    /// `commandStartedFile`, which the fake writes once as it starts): the
+    /// script's own work before the command, then the command's limit, its
+    /// SIGTERM, any grace and the reap or report up to the run's end; and
+    /// the slow `sleep` calls by what each asked for. It is printed too, so
+    /// the test log has it for a run that passed.
+    private func slowPollTiming(_ phases: PhaseTimes, started: Date, elapsed: TimeInterval, commandStartedFile: String, command: String, test: String = #function) -> String {
+        var run = PhaseTimes()
+        run.add("run", elapsed)
+        let marker = fx.root.appendingPathComponent(commandStartedFile).path
+        if let commandStarted = (try? FileManager.default.attributesOfItem(atPath: marker))?[.modificationDate] as? Date {
+            let before = commandStarted.timeIntervalSince(started)
+            run.add("of which before \(command) started", before)
+            run.add("of which from then to the run's end", elapsed - before)
+        } else {
+            run.add("\(command) never started; no split", 0)
+        }
+        let text = "Fixture: \(fx.creation). Test: \(phases). Run: \(run). Slow sleeps: \(fx.slowPollSummary())."
+        print("Slow-poll timing of \(test): \(text)")
+        return text
     }
 
     func testUninstallAbortsWhenBootoutAndPrintBothFailAmbiguously() throws {
@@ -6182,15 +6423,18 @@ final class RecoveryScriptTests: XCTestCase {
     func testInstallGivesUpOnAHungSudoOnTimeWhenEveryPollIsSlow() throws {
         try writePreviousPair()
         fx.setMode("sudo", "rule-check-hangs")
+        var phases = PhaseTimes()
+        let path = try phases.time("slow sleep ready") { try fx.slowPollingPath() }
 
         let started = Date()
-        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": ScriptFixture.account, "PATH": try fx.slowPollingPath()])
+        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": ScriptFixture.account, "PATH": path])
         let elapsed = Date().timeIntervalSince(started)
+        let timing = slowPollTiming(phases, started: started, elapsed: elapsed, commandStartedFile: "sudo.hung.pid", command: "the sudo check")
 
         XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
         XCTAssertGreaterThan(fx.slowPolls(), 0, "the script polled through the slow sleep")
         XCTAssertGreaterThan(elapsed, 8, "the limit, then at least two seconds after SIGTERM")
-        XCTAssertLessThan(elapsed, 15, "the 5 s limit, at most four seconds more, and a few slow polls")
+        XCTAssertLessThan(elapsed, 15, "the 5 s limit, at most four seconds more, and a few slow polls. \(timing)")
         let pid = try XCTUnwrap(fx.hungPid("sudo", within: 0))
         XCTAssertTrue(r.stderr.contains("It was sent SIGTERM and is still running as pid \(pid). It is not killed"), r.stderr)
         XCTAssertTrue(fx.calls().contains("sudo SIGTERM"), "\(fx.calls())")
@@ -9446,6 +9690,270 @@ final class RecoveryScriptTests: XCTestCase {
         }
     }
 
+    /// A bounded call whose supervisor ends before it sends the call's
+    /// status gives 125: the call may still be running, and what it did is
+    /// not known. Here the call SIGKILLs its supervisor as it starts (see
+    /// killSupervisor) and then does what it would have done. For each
+    /// bounded call uninstall.sh makes whose answer a later step rests on,
+    /// in a fresh fixture each, the run takes 125 as no answer: it says
+    /// which call, stops where that call's caller stops for any call that
+    /// did not answer, and goes on only past the App Nap read, which
+    /// decides nothing. The stages: before anything (no lock, no backstop,
+    /// nothing asked to quit, nothing removed), before the backstop (the
+    /// lock taken, the journal as it was), before removal (the backstop ran,
+    /// every file kept), and after the LaunchAgent (the app and the journal
+    /// kept). Every row leaves the lock free once the orphaned call has
+    /// ended, and no scratch file. The words for this 125 are those for a
+    /// call past its limit ("did not answer within 5s"), which is not what
+    /// happened here; the rows check the decision and the call named.
+    func testUninstallTakesAMissingStatusFromEachBoundedCallAsNoAnswer() throws {
+        enum Stage { case beforeAnything, beforeBackstop, beforeRemoval, agentRemoved, finished }
+        struct Row {
+            let name: String
+            let pattern: String
+            var skip = 0
+            var setUp: (ScriptFixture) throws -> Void = { _ in }
+            var tearDown: (ScriptFixture) throws -> Void = { _ in }
+            var status: Int32 = 1
+            let says: (ScriptFixture) -> [String]
+            let stage: Stage
+            var ruleKept: Bool? = true
+        }
+        let late = "did not answer within 5s, and whether it has ended is not known"
+        let agentGone = { (f: ScriptFixture) in "The LaunchAgent is already removed; the app at \(f.app.path) and the recovery journal were kept." }
+        let searchable = { (f: ScriptFixture, mode: Int) in
+            try FileManager.default.setAttributes([.posixPermissions: mode], ofItemAtPath: f.sudoers.deletingLastPathComponent().path)
+        }
+        let rows: [Row] = [
+            Row(name: "pgrep, first look", pattern: "pgrep -x Insomnia",
+                says: { _ in ["pgrep \(late); treating Insomnia as running.",
+                              "pgrep \(late), so whether Insomnia runs in this or another account is unknown. Rerun once it answers. Nothing was removed."] },
+                stage: .beforeAnything),
+            Row(name: "pgrep under the lock, before the backstop", pattern: "pgrep -x Insomnia", skip: 1,
+                says: { _ in ["Insomnia started again (pgrep \(late)); quit it and rerun. Nothing was removed."] },
+                stage: .beforeBackstop),
+            Row(name: "pgrep after the journal check", pattern: "pgrep -x Insomnia", skip: 2,
+                says: { _ in ["Insomnia started again (pgrep \(late)); quit it and rerun. Nothing was removed."] },
+                stage: .beforeRemoval),
+            Row(name: "InsomniaResumeFrozenVersion read", pattern: "plutil -extract InsomniaResumeFrozenVersion *",
+                says: { f in ["Could not read InsomniaResumeFrozenVersion from \(f.app.path)/Contents/Info.plist: 'plutil -extract InsomniaResumeFrozenVersion' \(late). Which backstop.sh speaks the installed app's interface is unknown, so none was run. Nothing was removed; rerun once it reads."] },
+                stage: .beforeAnything),
+            Row(name: "rule only root can read, before the lock", pattern: "sudo -n /bin/cat *",
+                setUp: { f in
+                    try XCTSkipIf(getuid() == 0, "root reads a mode-000 file")
+                    try f.makeRuleRootOnly()
+                },
+                says: { f in ["'sudo -n cat \(f.sudoers.path)' did not answer within 5s, so whether it serves another account is not known.", "Nothing was removed."] },
+                stage: .beforeAnything),
+            Row(name: "rule in a folder only root can search, before the lock", pattern: "sudo -n /bin/test -e *",
+                setUp: { f in try searchable(f, 0o600) }, tearDown: { f in try searchable(f, 0o755) },
+                says: { f in ["'sudo -n test -e \(f.sudoers.path)' did not answer within 5s, so whether the rule is there is not known.", "Nothing was removed."] },
+                stage: .beforeAnything),
+            Row(name: "codesign check of the sealed copy", pattern: "codesign --verify --strict *",
+                setUp: { f in
+                    try FileManager.default.removeItem(at: f.backstop)
+                    try f.writeMarkerBackstop(at: f.installedBackstop, name: "sealed")
+                },
+                says: { f in ["'codesign --verify --strict \(f.app.path)' \(late), so the backstop.sh sealed in it was not run.", "Nothing was removed."] },
+                stage: .beforeBackstop),
+            Row(name: "copy of the journal", pattern: "cp -X *state.json *insomnia-uninstall.*",
+                says: { _ in ["Uninstall stopped BEFORE removing anything", "  - state.json could not be read within 5s"] },
+                stage: .beforeRemoval),
+            Row(name: "parse of the journal's copy", pattern: "plutil -convert json -o /dev/null *insomnia-uninstall.*",
+                says: { _ in ["Uninstall stopped BEFORE removing anything", "the journal could not be fully checked: 'plutil -convert json' on state.json \(late)"] },
+                stage: .beforeRemoval),
+            Row(name: "App Nap read", pattern: "defaults read * NSAppSleepDisabled", status: 0,
+                says: { f in
+                    guard let first = f.calls().first(where: { $0.hasPrefix("defaults read ") }) else { return ["a defaults read"] }
+                    let id = first.split(separator: " ")[2]
+                    return ["defaults read did not answer within 5s for \(id); check it yourself with: defaults read \(id) NSAppSleepDisabled",
+                            "stopped after \(id) did not answer;"]
+                },
+                stage: .finished, ruleKept: false),
+            Row(name: "bootout", pattern: "launchctl bootout *",
+                says: { _ in ["'launchctl bootout' \(late) (pid ", "It keeps the recovery lock until it ends. Nothing was removed; rerun once it has ended."] },
+                stage: .beforeRemoval),
+            Row(name: "print after the bootout", pattern: "launchctl print *",
+                says: { f in ["launchctl bootout exited 0 and 'launchctl print' \(late); cannot tell whether com.insomnia.backstop is still loaded.",
+                              "Nothing was removed. Run 'launchctl bootout gui/\(f.uid) \(f.plist.path)' yourself, then rerun."] },
+                stage: .beforeRemoval),
+            Row(name: "rule in a folder only root can search, under the lock", pattern: "sudo -n /bin/test -e *", skip: 1,
+                setUp: { f in try searchable(f, 0o600) }, tearDown: { f in try searchable(f, 0o755) },
+                says: { f in ["'sudo -n test -e \(f.sudoers.path)' did not answer within 5s, so whether the rule is there is not known.", agentGone(f)] },
+                stage: .agentRemoved),
+            Row(name: "rule read under the lock", pattern: "sudo -n /bin/cat *",
+                says: { f in ["'sudo -n cat \(f.sudoers.path)' did not answer within 5s, so the rule was not removed.", agentGone(f)] },
+                stage: .agentRemoved),
+            Row(name: "rule removal", pattern: "sudo -n /bin/bash -c *",
+                says: { f in ["The sudo call that removes \(f.sudoers.path) did not answer within 5s, so whether the rule was removed is not known.", agentGone(f)] },
+                stage: .agentRemoved, ruleKept: nil),
+        ]
+        for row in rows {
+            let f = try ScriptFixture()
+            defer { f.destroy() }
+            let label = "\(row.name): "
+            try f.installMachinery()
+            try f.writeState(Self.journalToUndo)
+            do {
+                try row.setUp(f)
+            } catch is XCTSkip {
+                continue
+            }
+            try f.killSupervisor(of: row.pattern, after: row.skip)
+            let tmp = try f.privateTmp()
+
+            let r = try f.run(f.uninstall, extraEnvironment: ["TMPDIR": tmp.path])
+            try row.tearDown(f)
+
+            let calls = f.calls()
+            let said = r.stderr + r.stdout
+            XCTAssertEqual(r.status, row.status, label + said)
+            XCTAssertEqual(calls.filter { $0.hasSuffix(" SUPERVISOR-KILLED") }.count, 1, label + "\(calls)")
+            XCTAssertFalse(f.exists(f.supervisorKill), label + "the call ran")
+            for text in row.says(f) {
+                XCTAssertTrue(said.contains(text), label + "no \"\(text)\" in: " + said)
+            }
+            let lockTaken = r.stdout.contains("==> Taking the recovery lock")
+            let backstopRan = calls.contains("sudo -n \(f.fakePmset) -a disablesleep 0")
+            let removal = calls.contains { $0.hasPrefix("sudo -n insomnia-sudoers-remove") }
+            switch row.stage {
+            case .beforeAnything, .beforeBackstop:
+                XCTAssertEqual(lockTaken, row.stage == .beforeBackstop, label + r.stdout)
+                XCTAssertFalse(backstopRan || calls.contains { $0.hasPrefix("backstop ") }, label + "\(calls)")
+                XCTAssertFalse(calls.contains { $0.hasPrefix("osascript") || $0.hasPrefix("launchctl") }, label + "\(calls)")
+                XCTAssertEqual(try f.stateJSON()["sleepDisabledByUs"] as? Bool, true, label + "the journal as it was")
+            case .beforeRemoval:
+                XCTAssertTrue(backstopRan, label + "\(calls)")
+            case .agentRemoved, .finished:
+                XCTAssertTrue(backstopRan, label + "\(calls)")
+                XCTAssertFalse(f.exists(f.plist), label)
+            }
+            switch row.stage {
+            case .beforeAnything, .beforeBackstop, .beforeRemoval:
+                XCTAssertTrue(f.exists(f.plist), label)
+                XCTAssertTrue(f.exists(f.app), label)
+                XCTAssertTrue(f.exists(f.state), label)
+                XCTAssertTrue(f.exists(f.sudoers), label)
+                XCTAssertFalse(removal, label + "\(calls)")
+            case .agentRemoved:
+                XCTAssertTrue(f.exists(f.app), label)
+                XCTAssertTrue(f.exists(f.state), label)
+                if row.ruleKept == true {
+                    XCTAssertTrue(f.exists(f.sudoers), label)
+                    XCTAssertFalse(removal, label + "\(calls)")
+                }
+            case .finished:
+                XCTAssertFalse(f.exists(f.app), label)
+                XCTAssertFalse(f.exists(f.sudoers), label)
+            }
+            XCTAssertTrue(try f.waitUntilLockIsFree(10), label + "the lock goes once the orphaned call has ended")
+            XCTAssertEqual(try f.contents(of: tmp), [], label + "no scratch file is left")
+        }
+    }
+
+    /// The same for install.sh, over a previous app and its loaded agent:
+    /// each bounded call whose answer a later step rests on, its supervisor
+    /// SIGKILLed as the call starts. The run stops before anything changes
+    /// (no lock, the previous pair as it was), or under the lock before the
+    /// swap (the previous pair as it was, nothing loaded), or, for the
+    /// bootstrap of the new job, with the new build kept at $APP beside the
+    /// job it may have loaded and the previous app set aside; the plist is
+    /// never replaced. The print before the unload decides nothing alone:
+    /// the unload asks print again, so that run goes on and installs. The
+    /// staging step's `chmod -R -N` is skipped (skipACLRemoval): no row
+    /// checks ACLs, and none changes one.
+    func testInstallTakesAMissingStatusFromEachBoundedCallAsNoAnswer() throws {
+        enum Stage { case beforeAnything, beforeSwap, newJobUnknown, finished }
+        struct Row {
+            let name: String
+            let pattern: String
+            var skip = 0
+            var status: Int32 = 1
+            let says: (ScriptFixture) -> [String]
+            let stage: Stage
+        }
+        let late = "did not answer within 5s, and whether it has ended is not known"
+        let rows: [Row] = [
+            Row(name: "pgrep, first look", pattern: "pgrep -x Insomnia",
+                says: { _ in ["pgrep \(late), so whether Insomnia runs in this or another account is unknown. Rerun once it answers. Nothing was changed."] },
+                stage: .beforeAnything),
+            Row(name: "whether a rule is there", pattern: "sudo -n /bin/test -e *",
+                says: { f in ["'sudo -n test -e \(f.sudoers.path)' did not answer within 5s, so whether a rule is there is not known.", "Nothing was changed."] },
+                stage: .beforeAnything),
+            Row(name: "rule check before the lock", pattern: "sudo -n -l *",
+                says: { f in ["'sudo -n -l', which checks the rule, did not answer within 5s, so the rule in \(f.sudoers.path) is not verified.",
+                              "The app (with backstop.sh) and the LaunchAgent were not touched;"] },
+                stage: .beforeAnything),
+            Row(name: "rule check under the lock", pattern: "sudo -n -l *", skip: 4,
+                says: { f in ["Install stopped: 'sudo -n -l', which checks the rule in \(f.sudoers.path) again now that",
+                              "The app at \(f.app.path) and the LaunchAgent were not touched; the new build was\ndiscarded."] },
+                stage: .beforeSwap),
+            Row(name: "lint of the new plist", pattern: "plutil -lint *.candidate-*",
+                says: { _ in ["Install stopped: 'plutil -lint' on the new LaunchAgent plist \(late)."] },
+                stage: .beforeSwap),
+            Row(name: "print before the unload", pattern: "launchctl print *", status: 0,
+                says: { f in ["'launchctl print gui/\(f.uid)/com.insomnia.backstop' \(late); whether the job is loaded is unknown (unknown:125)."] },
+                stage: .finished),
+            Row(name: "unload of the previous job", pattern: "launchctl bootout *",
+                says: { f in ["('launchctl bootout' \(late)), so the app at \(f.app.path) was not replaced"] },
+                stage: .beforeSwap),
+            Row(name: "load of the new job", pattern: "launchctl bootstrap *",
+                says: { _ in ["Install stopped: 'launchctl bootstrap' \(late) for the new LaunchAgent.",
+                              "The new job may still be loaded: unloading it was not confirmed ('launchctl bootstrap' \(late))."] },
+                stage: .newJobUnknown),
+        ]
+        for row in rows {
+            let f = try ScriptFixture()
+            defer { f.destroy() }
+            let label = "\(row.name): "
+            try f.prepareInstall()
+            try f.writePreviousApp()
+            try "trusted".write(to: f.plist, atomically: true, encoding: .utf8)
+            try f.writeState(Self.cleanJournal)
+            f.setMode("launchctl", "loaded")
+            try f.skipACLRemoval()
+            try f.killSupervisor(of: row.pattern, after: row.skip)
+            let tmp = try f.privateTmp()
+
+            let r = try f.run(f.installRedirected, extraEnvironment: ["USER": ScriptFixture.account, "TMPDIR": tmp.path])
+
+            let calls = f.calls()
+            let said = r.stderr + r.stdout
+            XCTAssertFalse(f.chmodCalls().contains { $0.contains(" -N") && !$0.hasPrefix("chmod SKIPPED-ACL ") }, label + "\(f.chmodCalls())")
+            XCTAssertEqual(f.chmodCalls().contains { $0.hasPrefix("chmod SKIPPED-ACL -R -N ") }, row.stage != .beforeAnything,
+                           label + "the staging step ran exactly when the run got past the first rule check: \(f.chmodCalls())")
+            XCTAssertEqual(r.status, row.status, label + said)
+            XCTAssertEqual(calls.filter { $0.hasSuffix(" SUPERVISOR-KILLED") }.count, 1, label + "\(calls)")
+            XCTAssertFalse(f.exists(f.supervisorKill), label + "the call ran")
+            for text in row.says(f) {
+                XCTAssertTrue(said.contains(text), label + "no \"\(text)\" in: " + said)
+            }
+            let lockTaken = r.stdout.contains("==> Taking the recovery lock")
+            let plist = try String(contentsOf: f.plist, encoding: .utf8)
+            let setAside = f.appsDir.appendingPathComponent(".Insomnia.app.previous", isDirectory: true)
+            switch row.stage {
+            case .beforeAnything, .beforeSwap:
+                XCTAssertEqual(lockTaken, row.stage == .beforeSwap, label + r.stdout)
+                XCTAssertEqual(try f.installedBinaryFirstLine(), "previous", label)
+                XCTAssertFalse(f.exists(setAside), label)
+                XCTAssertEqual(plist, "trusted", label)
+                XCTAssertFalse(calls.contains { $0.hasPrefix("launchctl bootstrap") }, label + "\(calls)")
+                if row.stage == .beforeAnything {
+                    XCTAssertFalse(calls.contains { $0.hasPrefix("launchctl bootout") }, label + "\(calls)")
+                }
+            case .newJobUnknown:
+                XCTAssertEqual(try f.installedBinaryFirstLine(), "#!/bin/bash", label + "the new build stays with the job that may pin it")
+                XCTAssertTrue(f.exists(setAside), label + "the previous app stays set aside")
+                XCTAssertEqual(plist, "trusted", label + "the plist is not replaced")
+            case .finished:
+                XCTAssertEqual(try f.installedBinaryFirstLine(), "#!/bin/bash", label)
+                XCTAssertNotEqual(plist, "trusted", label)
+            }
+            XCTAssertTrue(try f.waitUntilLockIsFree(10), label + "the lock goes once the orphaned call has ended")
+            XCTAssertEqual(try f.contents(of: tmp), [], label + "no scratch file is left")
+        }
+    }
+
     /// A sudo call that removed the rule and then ignores SIGTERM is never
     /// killed. The run stops and names its pid, and the call keeps the
     /// recovery lock until it ends, so the app cannot start a session while
@@ -10093,7 +10601,7 @@ final class RecoveryScriptTests: XCTestCase {
 
         XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
         let pid = try XCTUnwrap(fx.hungPid("backstop", within: 0), "\(fx.calls())")
-        XCTAssertTrue(r.stderr.contains("\(fx.backstop.path) did not finish within 2s and is still running as pid \(pid) three seconds after its SIGTERM. It is not killed, because it may be running sudo pmset, and it keeps the recovery lock until it ends. Nothing was removed; rerun once it has ended."), r.stderr)
+        XCTAssertTrue(r.stderr.contains("\(fx.backstop.path) (pid \(pid)) or a process it started is still running. Either the backstop did not finish within 2s and had not ended three seconds after its SIGTERM, or it ended and left that process running. Nothing is killed, because it may be running sudo pmset, and the recovery lock stays held until all of them have ended. Nothing was removed; rerun once they have ended."), r.stderr)
         let senders = try fx.signalSenders(of: pid)
         XCTAssertEqual(senders.term, [senders.parent], "one SIGTERM, from the supervisor")
         XCTAssertEqual(senders.hup, [])
@@ -10112,9 +10620,12 @@ final class RecoveryScriptTests: XCTestCase {
 
     /// The real backstop at its limit, while a sudo pmset it started runs
     /// on (the fake closes its fd 9, as sudo does, and ignores SIGTERM): the
-    /// backstop is sent SIGTERM and ends, and uninstall.sh reports that and
-    /// stops with nothing removed. The sudo gets no signal from either, and
-    /// the backstop's own supervisor keeps the lock until it ends.
+    /// backstop is sent SIGTERM and ends, but its supervisor for the sudo is
+    /// still in the backstop's process group. So uninstall.sh's supervisor
+    /// sends no status, and uninstall.sh stops at once with nothing removed,
+    /// before it reads the journal again. The sudo gets no signal from
+    /// either, and the backstop's own supervisor, and uninstall.sh's, keep
+    /// the lock until it ends.
     func testUninstallStopsABackstopAtItsLimitWhileItsSudoKeepsTheLock() throws {
         try fx.writeUninstallCopy(extraConstants: ["BACKSTOP_TIMEOUT_SECONDS": "2"])
         try ScriptFixture.patch(try String(contentsOf: fx.backstop, encoding: .utf8), ["COMMAND_TIMEOUT_SECONDS": "30"])
@@ -10128,9 +10639,10 @@ final class RecoveryScriptTests: XCTestCase {
         let r = try fx.run(fx.uninstall)
 
         XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
-        XCTAssertTrue(r.stderr.contains("\(fx.backstop.path) did not finish within 2s and was stopped with SIGTERM; what it undid before then stays undone, and the journal shows what is left."), r.stderr)
-        XCTAssertTrue(r.stderr.contains("Uninstall stopped BEFORE removing anything"), r.stderr)
-        XCTAssertTrue(r.stderr.contains("\n  - sleepDisabledByUs is still true\n"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("\(fx.backstop.path) (pid "), r.stderr)
+        XCTAssertTrue(r.stderr.contains(") or a process it started is still running. Either the backstop did not finish within 2s and had not ended three seconds after its SIGTERM, or it ended and left that process running."), r.stderr)
+        XCTAssertFalse(r.stderr.contains("was stopped with SIGTERM"), r.stderr)
+        XCTAssertFalse(r.stdout.contains("==> Verifying the recovery journal"), r.stdout)
         let command = try XCTUnwrap(fx.hungPid("sudo", within: 0), "\(fx.calls())")
         XCTAssertFalse(fx.calls().contains("sudo SIGTERM"), "\(fx.calls())")
         XCTAssertFalse(fx.calls().contains("sudo FD9-OPEN"), "\(fx.calls())")
@@ -10147,10 +10659,10 @@ final class RecoveryScriptTests: XCTestCase {
 
     /// The uninstall is killed with SIGKILL while its backstop runs, and
     /// its whole process group then gets SIGTERM, SIGHUP and SIGINT. None of
-    /// them reaches the backstop, which runs with its supervisor in a
-    /// process group of their own. The supervisor sends the backstop its
-    /// own SIGTERM at the limit (4 s here), never SIGKILL, and holds the
-    /// lock until the backstop has ended.
+    /// them reaches the backstop, which leads a process group of its own,
+    /// or its supervisor, which leads another. The supervisor sends the
+    /// backstop its own SIGTERM at the limit (4 s here), never SIGKILL, and
+    /// holds the lock until the backstop has ended.
     func testUninstallsBackstopCallKeepsTheLockThroughACrashAndGroupSignals() throws {
         try fx.writeUninstallCopy(extraConstants: ["BACKSTOP_TIMEOUT_SECONDS": "4"])
         try fx.installMachinery()
@@ -10171,7 +10683,8 @@ final class RecoveryScriptTests: XCTestCase {
             return XCTFail("the uninstall ended before the test could kill it (wait status \(shell.wait())): \(fx.calls())")
         }
         let supervisor = try fx.signalSenders(of: backstop).parent
-        XCTAssertEqual(getpgid(backstop), supervisor, "the backstop runs in the process group its supervisor leads")
+        XCTAssertEqual(getpgid(backstop), backstop, "the backstop leads a process group of its own")
+        XCTAssertEqual(getpgid(supervisor), supervisor, "its supervisor leads another")
         XCTAssertEqual(shell.signal(SIGKILL), 0)
         signalGoneRunsGroup(shell, [SIGTERM, SIGHUP, SIGINT])
         let status = shell.wait()
@@ -10399,8 +10912,9 @@ final class RecoveryScriptTests: XCTestCase {
 
     /// The older backstop above at uninstall.sh's limit for it (2 s here),
     /// while its sudo pmset runs on. The SIGTERM at the limit goes to the
-    /// backstop process alone, which ends at once, and the uninstall stops
-    /// with nothing removed. The sudo gets no signal, and the backstop's
+    /// backstop process alone, which ends at once. Its subshell is still in
+    /// its process group, so the uninstall stops at once with nothing
+    /// removed and says so. The sudo gets no signal, and the backstop's
     /// subshell keeps the lock until the sudo has ended, then reaps it and
     /// writes its status, 0.
     func testAnOlderBackstopsSudoKeepsTheLockPastTheBackstopsLimit() throws {
@@ -10415,8 +10929,8 @@ final class RecoveryScriptTests: XCTestCase {
         let r = try fx.run(fx.uninstall)
 
         XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
-        XCTAssertTrue(r.stderr.contains("\(fx.backstop.path) did not finish within 2s and was stopped with SIGTERM; what it undid before then stays undone, and the journal shows what is left."), r.stderr)
-        XCTAssertTrue(r.stderr.contains("Uninstall stopped BEFORE removing anything"), r.stderr)
+        XCTAssertTrue(r.stderr.contains(") or a process it started is still running. Either the backstop did not finish within 2s and had not ended three seconds after its SIGTERM, or it ended and left that process running."), r.stderr)
+        XCTAssertFalse(r.stdout.contains("==> Verifying the recovery journal"), r.stdout)
         for kept in [fx.plist, fx.app, fx.sudoers, fx.state] { XCTAssertTrue(fx.exists(kept), kept.path) }
         let sudo = try XCTUnwrap(fx.hungPid("sudo", within: 0), "\(fx.calls())")
         let senders = try fx.signalSenders(of: sudo)
@@ -10438,17 +10952,113 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(fx.log().contains("pmset -a disablesleep 0 ok"), fx.log())
     }
 
+    /// The undo of the first backstop (346c150), from before the recovery
+    /// lock, as the copy an install of that time left in Application
+    /// Support runs it: sudo pmset in the foreground, with no supervisor of
+    /// its own and no lock, and the same log line.
+    private func writeBackstopAt346c150(in f: ScriptFixture, at url: URL) throws {
+        try """
+        #!/bin/bash
+        set -euo pipefail
+        LOG_DIR="$INSOMNIA_HOME/Logs"
+        LOG="$LOG_DIR/insomnia.log"
+        PMSET='\(f.fakePmset)'
+        SUDO='\(f.bin.appendingPathComponent("sudo").path)'
+        log() {
+          mkdir -p "$LOG_DIR"
+          printf '%s [%s] backstop: %s\\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" >> "$LOG"
+        }
+        if "$SUDO" -n "$PMSET" -a disablesleep 0 2>/dev/null; then
+          log info "pmset -a disablesleep 0 ok"
+        else
+          log error "pmset -a disablesleep 0 failed (sudoers rule missing? run install.sh)"
+        fi
+
+        """.write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    /// That first backstop at uninstall.sh's limit for it (2 s here), while
+    /// its sudo pmset runs on. The fake sudo closes its fd 9, as sudo does,
+    /// so once the SIGTERM at the limit has ended the backstop, nothing it
+    /// started holds the lock. The sudo is still in the backstop's process
+    /// group, though, so uninstall.sh's supervisor sends no status and keeps
+    /// the lock until the sudo has ended; the uninstall stops at once with
+    /// nothing removed. The sudo gets no signal.
+    func testABackstopFromBeforeTheLockKeepsItPastItsLimitUntilItsSudoEnds() throws {
+        try fx.writeUninstallCopy(extraConstants: ["BACKSTOP_TIMEOUT_SECONDS": "2"])
+        try fx.installMachinery()
+        try fx.writeConfig(#"{"agentList":[]}"#)
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        try writeBackstopAt346c150(in: fx, at: fx.backstop)
+        fx.setMode("sudo", "drops-fd9-logs-signals")
+        defer { fx.releaseCommand() }
+
+        let r = try fx.run(fx.uninstall)
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertTrue(r.stderr.contains(") or a process it started is still running. Either the backstop did not finish within 2s and had not ended three seconds after its SIGTERM, or it ended and left that process running."), r.stderr)
+        XCTAssertFalse(r.stdout.contains("==> Verifying the recovery journal"), r.stdout)
+        for kept in [fx.plist, fx.app, fx.sudoers, fx.state] { XCTAssertTrue(fx.exists(kept), kept.path) }
+        let sudo = try XCTUnwrap(fx.hungPid("sudo", within: 0), "\(fx.calls())")
+        let senders = try fx.signalSenders(of: sudo)
+        XCTAssertEqual(senders.term, [], "no SIGTERM reached the sudo")
+        XCTAssertEqual(senders.hup, [])
+        XCTAssertFalse(fx.calls().contains("sudo FD9-OPEN"), "\(fx.calls())")
+        XCTAssertNil(fx.commandEnded())
+        XCTAssertFalse(try fx.lockIsFree(), "uninstall.sh's supervisor holds the lock for the sudo")
+
+        fx.releaseCommand()
+        try assertLockHeldUntilGone(sudo, within: 10)
+        XCTAssertEqual(fx.commandEnded(), "released")
+        XCTAssertFalse(fx.log().contains("pmset -a disablesleep 0 ok"), fx.log())
+    }
+
+    /// perl starts the backstop in a process group of its own and tells its
+    /// supervisor when that group is empty. With no perl at $PERL neither
+    /// can happen, and a supervisor that never gets an answer would keep
+    /// the lock for good, so the backstop is not run at all (126, with the
+    /// reason). run_backstop is the same text in install.sh and
+    /// uninstall.sh; here uninstall.sh says why, goes on to its own check,
+    /// which finds the journal still dirty, and removes nothing. No pmset
+    /// call was made and the lock is free once it exits.
+    func testTheBackstopIsNotRunWithoutPerl() throws {
+        func runBackstop(_ name: String) throws -> String {
+            let text = try String(contentsOf: ScriptFixture.productionScripts.appendingPathComponent(name), encoding: .utf8)
+            let start = try XCTUnwrap(text.range(of: "\nrun_backstop() {"), name)
+            let end = try XCTUnwrap(text.range(of: "\n}\n", range: start.upperBound..<text.endIndex), name)
+            return String(text[start.lowerBound..<end.upperBound])
+        }
+        XCTAssertEqual(try runBackstop("install.sh"), try runBackstop("uninstall.sh"))
+        let missing = fx.root.appendingPathComponent("no-perl/perl").path
+        try fx.writeUninstallCopy(extraConstants: ["PERL": missing])
+        try fx.installMachinery()
+        try fx.writeConfig(#"{"agentList":[]}"#)
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+
+        let r = try fx.run(fx.uninstall)
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertTrue(r.stderr.contains("\(fx.backstop.path) could not be started: \(missing), which starts it in a process group of its own and tells when that group is empty, is missing."), r.stderr)
+        XCTAssertTrue(r.stdout.contains("==> Verifying the recovery journal"), r.stdout)
+        XCTAssertTrue(r.stderr.contains("sleepDisabledByUs is still true"), r.stderr)
+        XCTAssertFalse(fx.calls().contains { $0.contains("disablesleep") }, "\(fx.calls())")
+        for kept in [fx.plist, fx.app, fx.sudoers, fx.state] { XCTAssertTrue(fx.exists(kept), kept.path) }
+        XCTAssertTrue(try fx.lockIsFree())
+    }
+
     /// install.sh runs the new build's backstop with the same limit. One
     /// that ends on the SIGTERM there (124) stops the install like any
     /// failed recovery, saying so; one that does not (125) stops it at once
     /// and keeps the lock until it ends. Nothing is replaced or unloaded,
-    /// and the version evidence, "none" with no app at $APP, went down.
+    /// and the version evidence, "none" with no app at $APP, went down. The
+    /// staging step's ACL removal is skipped (skipACLRemoval).
     func testInstallStopsWhenItsBackstopDoesNotFinishInTime() throws {
         for mode in ["stop", "receive"] {
             let f = try ScriptFixture()
             defer { f.releaseCommand(); f.destroy() }
             try f.writeInstallCopies(extraConstants: ["BACKSTOP_TIMEOUT_SECONDS": "2"])
             try f.prepareInstall()
+            try f.skipACLRemoval()
             try "trusted".write(to: f.plist, atomically: true, encoding: .utf8)
             try f.writeState(Self.cleanJournal)
             f.setMode("launchctl", "loaded")
@@ -10467,7 +11077,7 @@ final class RecoveryScriptTests: XCTestCase {
                 XCTAssertTrue(try f.lockIsFree(), mode)
             } else {
                 let pid = try XCTUnwrap(f.hungPid("backstop", within: 0), "\(f.calls())")
-                XCTAssertTrue(r.stderr.contains("Install stopped: the backstop did not finish within 2s and is still running as\npid \(pid) three seconds after its SIGTERM."), r.stderr)
+                XCTAssertTrue(r.stderr.contains("Install stopped: the backstop (pid \(pid)) or a process it started is still running.\nEither the backstop did not finish within 2s and had not ended three seconds\nafter its SIGTERM, or it ended and left that process running."), r.stderr)
                 let senders = try f.signalSenders(of: pid)
                 XCTAssertEqual(senders.term, [senders.parent], "one SIGTERM, from the supervisor")
                 XCTAssertFalse(try f.lockIsFree(), "the supervisor holds the lock for the live backstop")
@@ -10535,7 +11145,8 @@ final class RecoveryScriptTests: XCTestCase {
     /// cannot miss another: backstop.sh and uninstall.sh read through the
     /// same layer and check the journal and the session with the same
     /// functions, all three read an Info.plist's version the same way and
-    /// read back the files they make with the same work_read, and
+    /// read back what a bounded call printed through the same text (from
+    /// the comment on it to take_output), and
     /// install.sh and uninstall.sh run the backstop and every other bounded
     /// call, report a call whose output could not be read, and judge whose
     /// the rule is the same way.
@@ -10557,10 +11168,18 @@ final class RecoveryScriptTests: XCTestCase {
         let info = try infoBlock(backstop, "backstop.sh")
         XCTAssertEqual(try infoBlock(uninstall, "uninstall.sh"), info)
         XCTAssertEqual(try infoBlock(install, "install.sh"), info)
-        for name in ["run_backstop", "bounded", "supervise", "work_read", "read_result", "sudoers_for_others"] {
+        for name in ["run_backstop", "bounded", "supervise", "read_result", "sudoers_for_others"] {
             XCTAssertEqual(try Self.shellFunction(name, in: install, "install.sh"), try Self.shellFunction(name, in: uninstall, "uninstall.sh"), name)
         }
-        XCTAssertEqual(try Self.shellFunction("work_read", in: backstop, "backstop.sh"), try Self.shellFunction("work_read", in: install, "install.sh"))
+        func readBack(_ t: String, _ script: String) throws -> String {
+            let start = try XCTUnwrap(t.range(of: "# What a bounded call printed is read back inside its supervisor, never by"), script)
+            let take = try XCTUnwrap(t.range(of: "\ntake_output() { # deadline\n", range: start.upperBound..<t.endIndex), script)
+            let end = try XCTUnwrap(t.range(of: "\n}\n", range: take.upperBound..<t.endIndex), script)
+            return String(t[start.lowerBound..<end.upperBound])
+        }
+        let layer = try readBack(install, "install.sh")
+        XCTAssertEqual(try readBack(uninstall, "uninstall.sh"), layer)
+        XCTAssertEqual(try readBack(backstop, "backstop.sh"), layer)
     }
 
     // MARK: - A process named Insomnia whose owner cannot be read
@@ -10696,6 +11315,86 @@ private struct FixtureError: Error, CustomStringConvertible {
     init(_ d: String) { description = d }
 }
 
+/// Wall-clock seconds of the named phases of a fixture or a test, in the
+/// order they were added, for failure messages.
+private struct PhaseTimes: CustomStringConvertible {
+    private(set) var entries: [(name: String, seconds: TimeInterval)] = []
+
+    mutating func add(_ name: String, _ seconds: TimeInterval) {
+        entries.append((name, seconds))
+    }
+
+    mutating func time<T>(_ name: String, _ body: () throws -> T) rethrows -> T {
+        let started = Date()
+        defer { add(name, Date().timeIntervalSince(started)) }
+        return try body()
+    }
+
+    var description: String {
+        entries.map { String(format: "%@ %.3f s", $0.name, $0.seconds) }.joined(separator: "; ")
+    }
+}
+
+/// The production scripts split into lines, with each line that sets a
+/// constant indexed by the constant's name, kept for the test process so
+/// that each fixture does not parse the same text again. The key is the
+/// SHA-256 of every byte of the file, and a kept parse is used only when
+/// its bytes equal the bytes just read in full, so a script changed by a
+/// single byte (an edit, a mutation run) is parsed anew. Bytes that are not
+/// UTF-8 throw and are not kept. Each fixture still reads the files; only
+/// their parse is kept. A test's own copies (patched with fixture paths)
+/// are parsed without the cache: each is new text.
+private final class ParsedScripts: @unchecked Sendable {
+    struct Parsed: Equatable {
+        let lines: [String]
+        /// Each line's text before its first "=", for each line that has
+        /// one: the lines `NAME=...` that patch rewrites.
+        let assignments: [String: [Int]]
+    }
+
+    static let shared = ParsedScripts()
+    private let lock = NSLock()
+    private var kept: [Data: (bytes: Data, parsed: Parsed)] = [:]
+    private var counts = (parses: 0, hits: 0)
+
+    /// How many times `parsed` parsed bytes, and how many it answered from
+    /// what it kept.
+    var parsesAndHits: (parses: Int, hits: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        return counts
+    }
+
+    /// The parse of `bytes` (the file `name`), and whether it was kept.
+    func parsed(_ bytes: Data, _ name: String) throws -> (parsed: Parsed, cached: Bool) {
+        let digest = Data(SHA256.hash(data: bytes))
+        lock.lock()
+        defer { lock.unlock() }
+        if let known = kept[digest], known.bytes == bytes {
+            counts.hits += 1
+            return (known.parsed, true)
+        }
+        guard let text = String(data: bytes, encoding: .utf8) else {
+            throw FixtureError("\(name) is not UTF-8")
+        }
+        let parsed = Self.parse(text)
+        counts.parses += 1
+        kept[digest] = (bytes, parsed)
+        return (parsed, false)
+    }
+
+    static func parse(_ text: String) -> Parsed {
+        let lines = text.components(separatedBy: "\n")
+        var assignments: [String: [Int]] = [:]
+        for (index, line) in lines.enumerated() {
+            if let equals = line.firstIndex(of: "=") {
+                assignments[String(line[..<equals]), default: []].append(index)
+            }
+        }
+        return Parsed(lines: lines, assignments: assignments)
+    }
+}
+
 /// One file for each distinct fake text, in a directory of this test
 /// process, which every fixture's bin links to (see writeFake). Fixtures
 /// never write to a fake or change its mode, which would change it for
@@ -10724,26 +11423,64 @@ private final class SharedFakes: @unchecked Sendable {
         try? FileManager.default.removeItem(at: dir)
     }
 
+    /// The argument a fake's first line answers with exit 0 and nothing
+    /// else (see ScriptFixture.fakePreamble). No script passes it.
+    static let readyArgument = "--insomnia-fake-ready"
+
     /// Links `url` to the shared file holding `text`, written and made
-    /// executable the first time that text is asked for.
-    static func link(_ text: String, to url: URL) throws {
-        try shared.link(text, to: url)
+    /// executable the first time that text is asked for. When `ready` is
+    /// set, a new file also runs once, with readyArgument alone, before it
+    /// is linked: macOS checks an executable file the first time it runs
+    /// (85 to 400 ms per new file on a test Mac), so that check happens
+    /// here, while a fixture is made, and not inside a timed run. A file
+    /// whose ready run does not exit 0 is not kept, and the error says so.
+    /// Returns the seconds that ready run took, 0 when the file was there.
+    @discardableResult
+    static func link(_ text: String, to url: URL, ready: Bool = false) throws -> TimeInterval {
+        try shared.link(text, to: url, ready: ready)
     }
 
-    private func link(_ text: String, to url: URL) throws {
+    private func link(_ text: String, to url: URL, ready: Bool) throws -> TimeInterval {
         lock.lock()
         defer { lock.unlock() }
         if let failure { throw FixtureError(failure) }
         let source: URL
+        var readySeconds: TimeInterval = 0
         if let known = files[text] {
             source = known
         } else {
             source = dir.appendingPathComponent("fake.\(files.count)")
             try text.write(to: source, atomically: true, encoding: .utf8)
             try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: source.path)
+            if ready {
+                let started = Date()
+                let status = try Self.runOnce(source)
+                readySeconds = Date().timeIntervalSince(started)
+                guard status == 0 else {
+                    try? FileManager.default.removeItem(at: source)
+                    throw FixtureError("\(source.path) exited \(status) on its ready run")
+                }
+            }
             files[text] = source
         }
         try FileManager.default.linkItem(at: source, to: url)
+        return readySeconds
+    }
+
+    /// Runs `file` with readyArgument alone, an empty environment and
+    /// /dev/null for its input and output; returns its exit status.
+    private static func runOnce(_ file: URL) throws -> Int32 {
+        let p = Process()
+        p.executableURL = file
+        p.arguments = [readyArgument]
+        p.environment = [:]
+        p.standardInput = FileHandle.nullDevice
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        let exit = ProcessExit(p)
+        try p.run()
+        exit.wait()
+        return p.terminationStatus
     }
 }
 
@@ -10767,6 +11504,16 @@ private final class ScriptFixture {
     let callsLog: URL
     let bootUUID = "0F0F0F0F-1111-2222-3333-444444444444"
     let uid = String(getuid())
+    /// How long each part of making this fixture took (see init).
+    private(set) var creation = PhaseTimes()
+    /// Shared fakes this fixture was the first to ask for, and the seconds
+    /// their one ready run took in all (see writeFake).
+    private(set) var readyFiles = 0
+    private(set) var readySeconds: TimeInterval = 0
+    /// Seconds spent parsing the scripts for this fixture's copies, and how
+    /// many of the scripts came from the parse cache (see ParsedScripts).
+    private(set) var parseSeconds: TimeInterval = 0
+    private(set) var parsesCached = 0
 
     var backstop: URL { repoScripts.appendingPathComponent("backstop.sh") }
     var uninstall: URL { repoScripts.appendingPathComponent("uninstall.sh") }
@@ -10829,17 +11576,25 @@ private final class ScriptFixture {
         app = appsDir.appendingPathComponent("Insomnia.app", isDirectory: true)
         sudoers = root.appendingPathComponent("etc/sudoers.d/insomnia")
         callsLog = root.appendingPathComponent("calls.log")
-        for dir in [home, bin, repoScripts, appsDir, sudoers.deletingLastPathComponent(), root.appendingPathComponent("tmp", isDirectory: true)] {
-            try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        var phases = PhaseTimes()
+        try phases.time("folders") {
+            for dir in [home, bin, repoScripts, appsDir, sudoers.deletingLastPathComponent(), root.appendingPathComponent("tmp", isDirectory: true)] {
+                try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            }
+            // repo/ is a source checkout to install.sh and uninstall.sh: their
+            // folder is scripts/, with Package.swift one level up.
+            try "// swift-tools-version: 6.2\n".write(to: root.appendingPathComponent("repo/Package.swift"), atomically: true, encoding: .utf8)
         }
-        // repo/ is a source checkout to install.sh and uninstall.sh: their
-        // folder is scripts/, with Package.swift one level up.
-        try "// swift-tools-version: 6.2\n".write(to: root.appendingPathComponent("repo/Package.swift"), atomically: true, encoding: .utf8)
-        try writeFakes()
-        try writeScriptCopies()
-        try bootUUID.write(to: root.appendingPathComponent("boot.uuid"), atomically: true, encoding: .utf8)
-        // The process the fake pgrep reports by default is the installed app.
-        try psComm([(4242, installedExecutable.path)])
+        try phases.time("fakes") { try writeFakes() }
+        phases.add("of which \(readyFiles) new shared fakes' ready runs", readySeconds)
+        try phases.time("script copies") { try writeScriptCopies() }
+        phases.add("of which parsing (\(parsesCached) scripts from the cache)", parseSeconds)
+        try phases.time("rest") {
+            try bootUUID.write(to: root.appendingPathComponent("boot.uuid"), atomically: true, encoding: .utf8)
+            // The process the fake pgrep reports by default is the installed app.
+            try psComm([(4242, installedExecutable.path)])
+        }
+        creation = phases
     }
 
     /// Executable of the installed bundle, what `ps -o comm=` prints for a
@@ -10919,49 +11674,15 @@ private final class ScriptFixture {
 
     func destroy() {
         releaseCommand()
-        // A supervisor still waiting to write its status into a FIFO would
-        // wait forever once the FIFO is gone.
-        drainStatusFIFOs(within: 1)
         try? fm.removeItem(at: root)
     }
 
-    /// The backstop's files in INSOMNIA_HOME: each bounded call's .pid and
-    /// .rc status files, and the app binary's input and answer directory.
+    /// The names in INSOMNIA_HOME that start with ".backstop": none of this
+    /// build's (see run_bounded and run_app_bounded), and the .pid and .rc
+    /// status files and .backstop-resume.* folders older builds made, which
+    /// this build removes.
     func backstopFiles() throws -> [String] {
         try contents(of: home).filter { $0.hasPrefix(".backstop") }
-    }
-
-    /// Opens each FIFO among the backstop's files for reading, without
-    /// waiting for a writer, so a supervisor blocked on writing its status
-    /// there (see the fake sudo's "status-delayed") can go on. Returns what
-    /// was written to each, by file name, once its writer has closed it or
-    /// after `seconds`.
-    @discardableResult
-    func drainStatusFIFOs(within seconds: Double) -> [String: String] {
-        var written: [String: String] = [:]
-        for name in (try? backstopFiles()) ?? [] {
-            let path = home.appendingPathComponent(name).path
-            var info = stat()
-            guard lstat(path, &info) == 0, info.st_mode & S_IFMT == S_IFIFO else { continue }
-            let fd = open(path, O_RDONLY | O_NONBLOCK)
-            guard fd >= 0 else { continue }
-            defer { close(fd) }
-            var data = Data()
-            var buffer = [UInt8](repeating: 0, count: 64)
-            let deadline = Date().addingTimeInterval(seconds)
-            while Date() < deadline {
-                let n = read(fd, &buffer, buffer.count)
-                if n > 0 {
-                    data.append(contentsOf: buffer[0..<n])
-                } else if n == 0 && !data.isEmpty {
-                    break   // the writer has closed it
-                } else {
-                    Thread.sleep(forTimeInterval: 0.05)
-                }
-            }
-            written[name] = String(decoding: data, as: UTF8.self)
-        }
-        return written
     }
 
     /// Lets a fake command in mode "ignore-term" / "closes-fd9" finish.
@@ -11076,8 +11797,7 @@ private final class ScriptFixture {
 
     private func writeScriptCopies() throws {
         let src = Self.productionScripts
-        let backstopText = try String(contentsOf: src.appendingPathComponent("backstop.sh"), encoding: .utf8)
-        try Self.patch(backstopText, [
+        try Self.patch(try parsedScript("backstop.sh"), [
             "PMSET": fakePmset,
             "SUDO": bin.appendingPathComponent("sudo").path,
             "PS": bin.appendingPathComponent("ps").path,
@@ -11121,8 +11841,7 @@ private final class ScriptFixture {
     /// CALL_TIMEOUT_SECONDS, while a gate holds the fake sudo) rewrites the
     /// copy with it.
     func writeUninstallCopy(extraConstants: [String: String]) throws {
-        let uninstallText = try String(contentsOf: Self.productionScripts.appendingPathComponent("uninstall.sh"), encoding: .utf8)
-        try Self.patch(uninstallText, [
+        try Self.patch(try parsedScript("uninstall.sh"), [
             "PGREP": bin.appendingPathComponent("pgrep").path,
             "PS": bin.appendingPathComponent("ps").path,
             "OSASCRIPT": bin.appendingPathComponent("osascript").path,
@@ -11149,8 +11868,7 @@ private final class ScriptFixture {
     /// through the patched build-app.sh above). Tests that need another
     /// constant (the real CODESIGN) rewrite both copies with it.
     func writeInstallCopies(extraConstants: [String: String]) throws {
-        let installText = try String(contentsOf: Self.productionScripts.appendingPathComponent("install.sh"), encoding: .utf8)
-        let patchedInstall = try Self.patch(installText, installConstants(appsDir: appsDir, home: home).merging(extraConstants) { $1 })
+        let patchedInstall = try Self.patch(try parsedScript("install.sh"), installConstants(appsDir: appsDir, home: home).merging(extraConstants) { $1 })
         try patchedInstall.write(to: install, atomically: true, encoding: .utf8)
         // The redirected copy runs past the INSOMNIA_HOME refusal: that
         // variable is what makes the backstop copy it installs act on the
@@ -11207,8 +11925,7 @@ private final class ScriptFixture {
         let otherHome = base.appendingPathComponent("home", isDirectory: true)
         try fm.createDirectory(at: apps, withIntermediateDirectories: true)
         try fm.createDirectory(at: otherHome.appendingPathComponent("LaunchAgents"), withIntermediateDirectories: true)
-        let installText = try String(contentsOf: Self.productionScripts.appendingPathComponent("install.sh"), encoding: .utf8)
-        let patched = try Self.patch(installText, installConstants(appsDir: apps, home: otherHome))
+        let patched = try Self.patch(try parsedScript("install.sh"), installConstants(appsDir: apps, home: otherHome))
         let redirected = try Self.replaceOnce(patched, #"if [[ -n "${INSOMNIA_HOME:-}" ]]; then"#, with: "if false; then")
         // Beside the fixture's copies, so it builds from the same checkout.
         let script = repoScripts.appendingPathComponent("install.\(name).sh")
@@ -11257,9 +11974,17 @@ private final class ScriptFixture {
     /// line, so a renamed constant in the script fails loudly here instead of
     /// letting a test run the real tool.
     static func patch(_ text: String, _ constants: [String: String]) throws -> String {
-        var lines = text.components(separatedBy: "\n")
+        try patch(ParsedScripts.parse(text), constants)
+    }
+
+    /// The same, from a parse (see ParsedScripts). A line starts with
+    /// "NAME=" exactly when its text before its first "=" is NAME, for a
+    /// NAME without "=".
+    static func patch(_ parsed: ParsedScripts.Parsed, _ constants: [String: String]) throws -> String {
+        var lines = parsed.lines
         for (name, value) in constants {
-            let hits = lines.indices.filter { lines[$0].hasPrefix("\(name)=") }
+            guard !name.contains("=") else { throw FixtureError("constant name contains '=': \(name)") }
+            let hits = parsed.assignments[name] ?? []
             guard hits.count == 1 else {
                 throw FixtureError("expected exactly one '\(name)=' line, found \(hits.count)")
             }
@@ -11267,6 +11992,17 @@ private final class ScriptFixture {
             lines[hits[0]] = "\(name)='\(value)'"
         }
         return lines.joined(separator: "\n")
+    }
+
+    /// The production script `name`, read now and parsed through
+    /// ParsedScripts; the time it takes goes to parseSeconds.
+    private func parsedScript(_ name: String) throws -> ParsedScripts.Parsed {
+        let started = Date()
+        defer { parseSeconds += Date().timeIntervalSince(started) }
+        let bytes = try Data(contentsOf: Self.productionScripts.appendingPathComponent(name))
+        let result = try ParsedScripts.shared.parsed(bytes, name)
+        if result.cached { parsesCached += 1 }
+        return result.parsed
     }
 
     /// Replaces one exact line; fails loudly if the script no longer has it.
@@ -11291,14 +12027,33 @@ private final class ScriptFixture {
         """
     }
 
-    /// What every fake runs first: the fixture's root from the fake's own
-    /// path ($0 is <root>/bin/<name>, the absolute path the scripts and the
-    /// other fakes call), and that root with its symlinks resolved, as
-    /// realpath(3) gives it for a root under /var, /tmp or /etc (links to
-    /// /private/...).
+    /// What every fake runs first: an exit, and nothing else, for the one
+    /// run SharedFakes makes of a new file with its ready argument; then
+    /// the fixture's root from the fake's own path ($0 is <root>/bin/<name>,
+    /// the absolute path the scripts and the other fakes call), and that
+    /// root with its symlinks resolved, as realpath(3) gives it for a root
+    /// under /var, /tmp or /etc (links to /private/...). Then, while the
+    /// fixture has supervisor.kill (see killSupervisor), a fake whose
+    /// "<name> <arguments>" matches the bash glob on its second line, once
+    /// as many such calls as its first line says have gone by, removes the
+    /// file, logs "<name> SUPERVISOR-KILLED" and SIGKILLs its parent, the
+    /// supervisor of the bounded call that runs it, before it does what it
+    /// would have done.
     private static let fakePreamble = """
+    [[ "${1-}" != \(SharedFakes.readyArgument) ]] || exit 0
     FAKE_ROOT="${0%/bin/*}"
     case "$FAKE_ROOT" in /var/* | /tmp/* | /etc/*) FAKE_REAL_ROOT="/private$FAKE_ROOT" ;; *) FAKE_REAL_ROOT="$FAKE_ROOT" ;; esac
+    if [[ -f "$FAKE_ROOT/supervisor.kill" ]]; then
+      { IFS= read -r kill_skip; IFS= read -r kill_pattern; } < "$FAKE_ROOT/supervisor.kill"
+      if [[ "${0##*/} $*" == $kill_pattern ]]; then
+        if (( kill_skip > 0 )); then
+          printf '%s\\n%s\\n' "$(( kill_skip - 1 ))" "$kill_pattern" > "$FAKE_ROOT/supervisor.kill"
+        elif /bin/rm "$FAKE_ROOT/supervisor.kill" 2>/dev/null; then
+          printf '%s SUPERVISOR-KILLED\\n' "${0##*/}" >> "$FAKE_ROOT/calls.log"
+          kill -KILL "$PPID"
+        fi
+      fi
+    fi
 
     """
 
@@ -11306,7 +12061,9 @@ private final class ScriptFixture {
     /// fixture in this test process (see SharedFakes). macOS checks an
     /// executable file the first time it runs, which takes 85 to 400 ms per
     /// new file on a test Mac, and each fixture used to write its fakes
-    /// anew; a link to a file that has already run is not checked again.
+    /// anew; a link to a file that has already run is not checked again,
+    /// and a new file runs once before it is linked, so the check falls in
+    /// the making of the fixture (readyFiles and readySeconds).
     /// So that one file serves every fixture, the fixture's root in `body`
     /// becomes ${FAKE_ROOT} (${FAKE_REAL_ROOT} where it was resolved),
     /// which the preamble derives at run time. Every path in the fakes is
@@ -11326,7 +12083,11 @@ private final class ScriptFixture {
         guard !text.contains(root.lastPathComponent) else {
             throw FixtureError("fake \(name) names its fixture other than through FAKE_ROOT")
         }
-        try SharedFakes.link("#!/bin/bash\n" + Self.fakePreamble + text, to: bin.appendingPathComponent(name))
+        let seconds = try SharedFakes.link("#!/bin/bash\n" + Self.fakePreamble + text, to: bin.appendingPathComponent(name), ready: true)
+        if seconds > 0 {
+            readyFiles += 1
+            readySeconds += seconds
+        }
     }
 
     private func writeFakes() throws {
@@ -11444,32 +12205,20 @@ private final class ScriptFixture {
                 # does, then waits like "logs-term", logging every SIGTERM
                 # and SIGHUP with its sender (see signalReceiverHere).
                 drops-fd9-logs-signals) exec 9<&-; receive_signals ;;
-                # "signals-self": for SIGTERM and then SIGHUP, a shell that
+                # "signals-self": for SIGTERM, SIGHUP and SIGPIPE, a shell that
                 # inherits this command's signal actions sends itself the
                 # signal and, if it is still there afterwards, logs "sudo
                 # SURVIVED <signal>". Then it exits 0.
-                signals-self) for s in TERM HUP; do /bin/bash -c "kill -$s \\$\\$; echo 'sudo SURVIVED $s' >> '\(calls)'"; done
+                signals-self) for s in TERM HUP PIPE; do /bin/bash -c "kill -$s \\$\\$; echo 'sudo SURVIVED $s' >> '\(calls)'"; done
                   printf 'sudo SIGNALS-CHECKED\\n' >> "\(calls)"; exit 0 ;;
-                # "status-delayed": finds the status files of the backstop
-                # call that runs it (the .pid file holding its own pid),
-                # changes two of them and exits 0. The .pid file then names
-                # the process in sentinel.pid, the way a pid the kernel gave
-                # to another process after this one was reaped would, and a
-                # FIFO stands where the call's status goes, so the
-                # supervisor's status write waits until the test opens the
-                # FIFO to read it (see drainStatusFIFOs).
-                status-delayed) base=""
-                  for (( i = 0; i < 50; i++ )); do
-                    for f in "\(home.path)"/.backstop.*.pid; do
-                      if [[ "$(cat "$f" 2>/dev/null)" == "$$" ]]; then base="${f%.pid}"; break 2; fi
-                    done
-                    /bin/sleep 0.1
-                  done
-                  [[ -n "$base" ]] || exit 0
-                  cat "\(r)/sentinel.pid" > "$base.pid"
-                  /usr/bin/mkfifo "$base.rc"
-                  printf 'sudo STATUS-DELAYED\\n' >> "\(calls)"
-                  exit 0 ;;
+                # "kills-supervisor": closes its fd 9 the way sudo does,
+                # then, half a second on (time for its supervisor to have
+                # sent its pid), SIGKILLs its parent, the supervisor of the
+                # backstop call that runs it, logs "sudo SUPERVISOR-KILLED"
+                # and waits like "logs-term".
+                kills-supervisor) exec 9<&-; /bin/sleep 0.5; kill -KILL "$PPID"
+                  printf 'sudo SUPERVISOR-KILLED\\n' >> "\(calls)"
+                  hang_on_term ignore ;;
                 *) exit 1 ;;
               esac ;;
           "\(visudo)")
@@ -11733,8 +12482,16 @@ private final class ScriptFixture {
         // chmod: recorded in chmod.calls, apart from calls.log, then run for
         // real so the modes still change. A path that a line of chmod.fail
         // (a bash glob; a plain path matches only itself) matches fails the
-        // way an immutable file does.
+        // way an immutable file does. With chmod.no-acl, a call with -N
+        // (which removes ACL entries) is recorded as "chmod SKIPPED-ACL
+        // <arguments>" and succeeds without running, so a test that does
+        // not check ACLs changes none (see skipACLRemoval).
         try writeFake("chmod", """
+        if [[ -f "\(r)/chmod.no-acl" ]]; then
+          for a in "$@"; do
+            if [[ "$a" == -N ]]; then printf 'chmod SKIPPED-ACL %s\\n' "$*" >> "\(r)/chmod.calls"; exit 0; fi
+          done
+        fi
         printf 'chmod %s\\n' "$*" >> "\(r)/chmod.calls"
         if [[ -f "\(r)/chmod.fail" ]]; then
           while IFS= read -r p || [[ -n "$p" ]]; do
@@ -11921,8 +12678,10 @@ private final class ScriptFixture {
         // "<pid> <word>" line per entry, the word from insomnia.table
         // (pid|word) or "resumed" for a pid without a row; exit 0 when every
         // word is resumed or gone, 1 otherwise. Writes its parent's pid to
-        // insomnia.ppid, and the inode of the file open on its fd 9 to
-        // insomnia.fd9 (empty without an fd 9). Modes: "raw" prints insomnia.output verbatim and
+        // insomnia.ppid, the link count and type of what its standard input
+        // and output are open on to insomnia.io, one line each, and the
+        // inode of the file open on its fd 9 to insomnia.fd9 (empty without
+        // an fd 9). Modes: "raw" prints insomnia.output verbatim and
         // exits with insomnia.status. "hang" prints its answer and then
         // sleeps for 300 s, so only a signal ends it in time. "hold" waits
         // until insomnia.release exists (30 s at most), records "Insomnia
@@ -11939,6 +12698,7 @@ private final class ScriptFixture {
         for line in "${input[@]}"; do joined="${joined:+$joined; }$line"; done
         printf 'Insomnia %s < %s\\n' "$*" "$joined" >> "\(calls)"
         echo "$PPID" > "\(r)/insomnia.ppid"
+        /usr/bin/stat -f '%l %HT' /dev/fd/0 /dev/fd/8 8>&1 > "\(r)/insomnia.io" 2>/dev/null || :
         if [[ -e /dev/fd/9 ]]; then stat -f %i /dev/fd/9 > "\(r)/insomnia.fd9"; else : > "\(r)/insomnia.fd9"; fi
         mode="$(cat "\(r)/insomnia.mode" 2>/dev/null || echo ok)"
         if [[ "$mode" == hold ]]; then
@@ -12305,6 +13065,23 @@ private final class ScriptFixture {
         try? value.write(to: root.appendingPathComponent("\(name).mode"), atomically: true, encoding: .utf8)
     }
 
+    /// Makes one bounded call end without a status: the fake call whose
+    /// "<name> <arguments>" matches the bash glob `pattern`, once `skip`
+    /// such calls have gone by, SIGKILLs its supervisor, logs "<name>
+    /// SUPERVISOR-KILLED" and goes on (see fakePreamble). The file goes once
+    /// that call has started.
+    func killSupervisor(of pattern: String, after skip: Int = 0) throws {
+        try "\(skip)\n\(pattern)\n".write(to: supervisorKill, atomically: true, encoding: .utf8)
+    }
+
+    var supervisorKill: URL { root.appendingPathComponent("supervisor.kill") }
+
+    /// Makes the fake chmod skip every call with -N (see its comment), so an
+    /// install that reaches its staging step changes no ACL.
+    func skipACLRemoval() throws {
+        try "".write(to: root.appendingPathComponent("chmod.no-acl"), atomically: true, encoding: .utf8)
+    }
+
     /// Makes the rule one only root can read, as the real one is (root's,
     /// mode 0440): mode 000 here, readable only to what runs through the
     /// fake sudo (its root_run). Not for a test run as root.
@@ -12653,25 +13430,51 @@ private final class ScriptFixture {
     /// asked for, so every poll install.sh and uninstall.sh make is slow, as
     /// on a loaded machine where each fork takes long. The scripts call sleep
     /// by name; the fakes call /bin/sleep. Each call is counted (slowPolls()).
+    /// The stub is one file for every fixture (see SharedFakes), which has
+    /// had its one ready run by the time this returns, so macOS's check of
+    /// a new executable is not part of a timed run. It finds the fixture's
+    /// log from its own path at run time ($0 is <root>/slow-poll/sleep, as
+    /// bash finds it on this PATH).
     func slowPollingPath() throws -> String {
         let dir = root.appendingPathComponent("slow-poll", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let stub = dir.appendingPathComponent("sleep")
-        try """
-        #!/bin/bash
-        echo "$*" >> "\(root.path)/slow-poll.log"
-        /bin/sleep 0.25
-        exec /bin/sleep "$@"
-
-        """.write(to: stub, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: stub.path)
+        if fm.fileExists(atPath: stub.path) { try fm.removeItem(at: stub) }
+        try SharedFakes.link(Self.slowSleep, to: stub, ready: true)
         return "\(dir.path):/usr/bin:/bin:/usr/sbin:/sbin"
     }
 
+    /// The text of slowPollingPath's `sleep`.
+    static let slowSleep = """
+    #!/bin/bash
+    [[ "${1-}" != \(SharedFakes.readyArgument) ]] || exit 0
+    echo "$*" >> "${0%/slow-poll/sleep}/slow-poll.log"
+    /bin/sleep 0.25
+    exec /bin/sleep "$@"
+
+    """
+
     /// How many times the scripts called the slow `sleep`.
     func slowPolls() -> Int {
+        slowPollArguments().count
+    }
+
+    /// What each call of the slow `sleep` was asked for, in order.
+    func slowPollArguments() -> [String] {
         let text = (try? String(contentsOf: root.appendingPathComponent("slow-poll.log"), encoding: .utf8)) ?? ""
-        return text.split(separator: "\n").count
+        return text.split(separator: "\n").map(String.init)
+    }
+
+    /// The calls of the slow `sleep`, counted by what each was asked for,
+    /// as "0.1 x12, 0.002 x3", for a failure message.
+    func slowPollSummary() -> String {
+        var counts: [String: Int] = [:]
+        var order: [String] = []
+        for argument in slowPollArguments() {
+            if counts[argument] == nil { order.append(argument) }
+            counts[argument, default: 0] += 1
+        }
+        return order.isEmpty ? "none" : order.map { "\($0) x\(counts[$0]!)" }.joined(separator: ", ")
     }
 
     /// Runs a real tool (not a script) with the fixture's environment: the
