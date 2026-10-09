@@ -2439,13 +2439,33 @@ final class RecoveryScriptTests: XCTestCase {
     }
 
     // The journal is mode 0200 and only an ACL entry lets its owner read
-    // it. Tightening leaves the entry, so the backstop still reads the
-    // journal, through its private copy (cp -X onto a file it made, which
-    // copies the data and not the ACL), and turns sleep back on. The
-    // cleared journal is published from that copy: a new file, owner-only
-    // like the ones the app writes, without the entry. On main, publishing
-    // failed here (cp could not copy the extended attributes the entry does
-    // not let the owner read), and the journal was kept for the next run.
+    // it. Tightening leaves the entry, and the backstop reads the journal
+    // through its private copy (cp -X onto a file it made, which copies the
+    // data and not the ACL). With nothing to undo it publishes nothing, so
+    // the journal keeps its mode and its entry, as on main.
+    func testBackstopReadsAJournalOnlyAnACLMakesReadableAndLeavesTheEntry() throws {
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        XCTAssertEqual(chmod(fx.state.path, 0o200), 0)
+        try TestACL.grantOwnerRead(fx.state)
+        XCTAssertTrue(FileManager.default.isReadableFile(atPath: fx.state.path))
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 0, r.stderr + fx.log())
+        XCTAssertEqual(fx.calls(), [], fx.log())
+        XCTAssertFalse(fx.log().contains("unreadable or malformed"), fx.log())
+        XCTAssertEqual(try fx.mode(fx.state), 0o200)
+        XCTAssertEqual(TestACL.entries(fx.state), 1)
+    }
+
+    // The same journal with sleep left disabled: the backstop turns sleep
+    // back on and publishes the cleared journal from its private copy, a
+    // new file, owner-only like the ones the app writes. A rename over
+    // state.json leaves no entry behind, which is also true of every
+    // journal main's backstop publishes (its cp copies no ACL). On main the
+    // publish failed here instead: cp could not copy the extended
+    // attributes the entry does not let the owner read, so the dirty
+    // journal and its entry were kept for the next run.
     func testBackstopReadsAJournalOnlyAnACLMakesReadableAndPublishesItOwnerOnly() throws {
         try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
         XCTAssertEqual(chmod(fx.state.path, 0o200), 0)
