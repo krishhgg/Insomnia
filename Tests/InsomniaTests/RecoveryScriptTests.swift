@@ -195,18 +195,15 @@ final class RecoveryScriptTests: XCTestCase {
     /// before a valid session is ended, whatever ends it (the battery with
     /// the app alive, config.json missing or read, the app not running,
     /// --force): session.json and the journal stay byte for byte, no end is
-    /// recorded anywhere, nothing runs, and the log says why. The app does
-    /// not load these journals, or reads one copy of a key where plutil
-    /// would read and republish the other. The review's trace is the first
-    /// journal with config.json missing, at 20%. Once the journal is
-    /// repaired the next run ends the session.
+    /// recorded anywhere, nothing runs, and the log says why. The app's
+    /// decoder refuses each of these journals. The review's trace is the
+    /// first journal with config.json missing, at 20%. Once the journal is
+    /// repaired the next run ends the session. A journal with a key written
+    /// twice, which the app reads by its first copy, ends the session: the
+    /// next test.
     func testAJournalTheAppDoesNotLoadKeepsAValidSessionTheRunWouldEnd() throws {
-        let b = backslash
         let journals = [
             #"{"sleepDisabledByUs":true,"frozenProcesses":"bad","sessionCutoffs":"30 false"}"#,
-            #"{"sleepDisabledByUs":true,"sleepDisabledByUs":false,"frozenProcesses":[],"sessionCutoffs":"30 false"}"#,
-            #"{"sleepDisabledByUs":true,"frozenProcesses":[{"pid":5,"pid":6}],"sessionCutoffs":"30 false"}"#,
-            #"{"sleepDisabledByUs":true,"sleepDisabledBy\#(b)u0055s":true,"sessionCutoffs":"30 false"}"#,
             #"{"sleepDisabledByUs":true,"frozenProcesses":[{"pid":2147483648}],"sessionCutoffs":"30 false"}"#,
             #"{"sleepDisabledByUs":true,"sessionCutoffs":"30 false","#,
         ]
@@ -217,6 +214,7 @@ final class RecoveryScriptTests: XCTestCase {
             ("--force", true, nil, ["--force"], "it is not ended"),
         ]
         for journal in journals {
+            XCTAssertThrowsError(try Store.makeDecoder().decode(RuntimeState.self, from: Data(journal.utf8)), journal)
             for mode in modes {
                 let label = "\(mode.name), \(journal)"
                 try? FileManager.default.removeItem(at: fx.config)
@@ -255,7 +253,10 @@ final class RecoveryScriptTests: XCTestCase {
     /// build writes it or as an older one did (frozenPids, no record of the
     /// cutoffs), ends in each mode. With the app alive and config.json
     /// missing, the record's 30% floor ends it at 20%, and the defaults'
-    /// 10% one at 9% only.
+    /// 10% one at 9% only. A key written twice, as such or once with an
+    /// escape, is read by its first copy, as the app reads it: those
+    /// journals end the session in each mode of the test above, and the
+    /// journal published holds the key once, with that copy's value.
     func testAJournalTheAppLoadsLetsTheRunEndAValidSession() throws {
         let current = #"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"savedAudioOutputs":[],"appNapOverrides":[],"sessionCutoffs":"30 false"}"#
         let legacy = #"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenPids":[],"dockerFrozen":false}"#
@@ -295,6 +296,61 @@ final class RecoveryScriptTests: XCTestCase {
                 XCTAssertEqual(try String(contentsOf: fx.state, encoding: .utf8), c.journal, label)
             }
         }
+
+        // pids: the frozen processes the app reads, by pid (nil: no
+        // frozenProcesses key). Pid 5 has no startedAt, so there is no
+        // identity to check and nothing signals it; its entry stays, and
+        // the run exits 1 with the journal kept for it.
+        let b = backslash
+        let twice: [(journal: String, pids: [Int32]?)] = [
+            (#"{"sleepDisabledByUs":true,"sleepDisabledByUs":false,"frozenProcesses":[],"sessionCutoffs":"30 false"}"#, []),
+            (#"{"sleepDisabledByUs":true,"frozenProcesses":[{"pid":5,"pid":6}],"sessionCutoffs":"30 false"}"#, [5]),
+            (#"{"sleepDisabledByUs":true,"sleepDisabledBy\#(b)u0055s":true,"sessionCutoffs":"30 false"}"#, nil),
+        ]
+        let modes: [(name: String, alive: Bool, config: String?, args: [String], reason: String)] = [
+            ("app alive, config.json missing", true, nil, [], "below the 30% end floor"),
+            ("app alive, config.json read", true, #"{"endFloor":30,"thermalRules":false}"#, [], "below the 30% end floor"),
+            ("app not running", false, nil, [], "Insomnia is not running"),
+            ("--force", true, nil, ["--force"], "forced end of session"),
+        ]
+        for row in twice {
+            let decoded = try Store.makeDecoder().decode(RuntimeState.self, from: Data(row.journal.utf8))
+            XCTAssertTrue(decoded.sleepDisabledByUs, row.journal)
+            XCTAssertEqual(decoded.frozenProcesses.map(\.pid), row.pids ?? [], row.journal)
+            for mode in modes {
+                let label = "\(mode.name), \(row.journal)"
+                try? FileManager.default.removeItem(at: fx.config)
+                if let config = mode.config { try fx.writeConfig(config) }
+                try fx.writeSession(endsAt: Date(timeIntervalSinceNow: 3600))
+                try fx.writeState(row.journal)
+                try? FileManager.default.removeItem(at: fx.logFile)
+                fx.setBattery(fx.battery(source: "Battery Power", percent: 20))
+                fx.clearCalls()
+                let app = mode.alive ? try fx.holdAliveLock() : nil
+
+                let r = try fx.run(fx.backstop, mode.args)
+                app?.release()
+
+                let kept = row.pids ?? []
+                XCTAssertEqual(r.status, kept.isEmpty ? 0 : 1, "\(label): \(fx.log())")
+                for pid in kept {
+                    XCTAssertTrue(fx.log().contains("pid \(pid) was journaled without identity; not signaled, kept for the app to resolve"), "\(label): \(fx.log())")
+                }
+                XCTAssertTrue(calls().contains(sleepRestored), "\(label): \(calls()) \(fx.log())")
+                XCTAssertFalse(calls().contains { $0.hasPrefix("kill") }, "\(label): \(calls())")
+                XCTAssertFalse(fx.exists(fx.session), label)
+                XCTAssertTrue(fx.log().contains(mode.reason), "\(label): \(fx.log())")
+                XCTAssertFalse(fx.log().contains("unreadable or malformed"), "\(label): \(fx.log())")
+                let text = try String(contentsOf: fx.state, encoding: .utf8)
+                XCTAssertEqual(text.components(separatedBy: "sleepDisabledBy").count, 2, "\(label): \(text)")
+                XCTAssertEqual(text.components(separatedBy: #""pid""#).count, (row.pids?.count ?? 0) + 1, "\(label): \(text)")
+                let published = try fx.stateJSON()
+                XCTAssertEqual(published["sleepDisabledByUs"] as? Bool, false, label)
+                XCTAssertEqual(published["frozenProcesses"] as? [[String: Int]], row.pids.map { $0.map { ["pid": Int($0)] } }, label)
+                XCTAssertEqual(published["sessionCutoffs"] as? String, "30 false", label)
+            }
+        }
+        try? FileManager.default.removeItem(at: fx.config)
     }
 
     func testBatteryBelowTheEndFloorOnBatteryPowerEndsTheSession() throws {
@@ -5700,7 +5756,7 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertNotEqual(refused.status, 0)
         XCTAssertEqual(fx.calls(), [])
         XCTAssertEqual(try String(contentsOf: fx.state, encoding: .utf8), half)
-        XCTAssertTrue(fx.log().contains("frozenProcesses[0].pid is 5100.5, which is not a whole number, where the app reads one"), fx.log())
+        XCTAssertTrue(fx.log().contains("frozenProcesses[0].pid is 5100.5, which the app's decoder does not read as a whole number it holds there"), fx.log())
     }
 
     /// Microseconds of 0 are an identity too (the key is present), not a
