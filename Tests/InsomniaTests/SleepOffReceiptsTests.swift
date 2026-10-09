@@ -1,4 +1,5 @@
 import Darwin
+import Darwin.membership
 import XCTest
 @testable import Insomnia
 
@@ -16,8 +17,6 @@ final class SleepOffReceiptsTests: XCTestCase {
     }
 
     override func tearDown() {
-        _ = try? runChmod(["-N", receipts.file])
-        _ = try? runChmod(["-N", receipts.folder])
         chmod(receipts.folder, 0o755)
         chmod(receipts.file, 0o600)
         home.destroy()
@@ -34,18 +33,6 @@ final class SleepOffReceiptsTests: XCTestCase {
 
     private func attempt(_ identity: String, marker: String? = "1:2") -> SleepOffAttempt {
         SleepOffAttempt(nonce: nonce, owedBefore: false, receipt: identity, predecessor: predecessor, deadline: 1_800_000_000, expires: expires, marker: marker)
-    }
-
-    private func runChmod(_ args: [String]) throws -> Int32 {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/bin/chmod")
-        p.arguments = args
-        p.standardOutput = FileHandle.nullDevice
-        p.standardError = FileHandle.nullDevice
-        let exit = ProcessExit(p)
-        try p.run()
-        exit.wait()
-        return p.terminationStatus
     }
 
     private func mayHaveWritten(_ verdict: SleepOffVerdict) -> String? {
@@ -191,9 +178,10 @@ final class SleepOffReceiptsTests: XCTestCase {
     /// finds. A receipt nobody can read has a mode other than 600. Round
     /// 28 F3: every refused list of entries (TestReceipts.refusedLists) is
     /// a stand-in in front of the file's real entries, so none changes a
-    /// real list.
+    /// real list. Round 30 F6: so are the allow entries on the receipt and
+    /// on its folder (folderStandIn), which were real ones before.
     func testAReceiptOrFolderTheChecksDoNotTrustShowsNothing() async throws {
-        let user = String(cString: getpwuid(getuid()).pointee.pw_name)
+        let write = AccessEntry(allows: true, principal: .user(getuid()), rights: ["write"], flags: [])
         let file = receipts.file
         let folder = receipts.folder
         let cases: [(name: String, startable: Bool, says: String, damage: () throws -> Void, repair: () throws -> Void)] = [
@@ -210,13 +198,15 @@ final class SleepOffReceiptsTests: XCTestCase {
                 XCTAssertEqual(symlink(folder + "/target", file), 0)
             }, { unlink(folder + "/target") }),
             ("a folder", false, "is not a regular file", { XCTAssertEqual(unlink(file), 0); XCTAssertEqual(mkdir(file, 0o755), 0) }, { rmdir(file) }),
-            ("an allow entry on the receipt", false, "has 2 access control entries, not the one that lets uid \(getuid()) read it", { XCTAssertEqual(try self.runChmod(["+a", "user:\(user) allow write", file]), 0) },
-             { _ = try self.runChmod(["-N", file]) }),
+            ("an allow entry on the receipt", false, "has 2 access control entries, not the one that lets uid \(getuid()) read it",
+             { self.receipts = TestReceipts.with(self.receipts, standIn: [.installed(for: getuid()), write]) }, {}),
             ("mode 644, as an earlier build made it", false, "has mode 644, not the 600 install.sh gives it", { XCTAssertEqual(chmod(file, 0o644), 0) }, {}),
             ("mode 400", false, "has mode 400, not the 600 install.sh gives it", { XCTAssertEqual(chmod(file, 0o400), 0) }, {}),
             ("a group-writable folder", false, "can be changed by its group or by others", { XCTAssertEqual(chmod(folder, 0o775), 0) }, { chmod(folder, 0o755) }),
-            ("an allow entry on the folder", false, "has an access control entry that allows changes", { XCTAssertEqual(try self.runChmod(["+a", "user:\(user) allow add_file", folder]), 0) },
-             { _ = try self.runChmod(["-N", folder]) }),
+            ("an allow entry on the folder", false, "has an access control entry that allows changes", {
+                let r = self.receipts!
+                self.receipts = SleepOffReceipts(folder: r.folder, owners: r.owners, user: r.user, standIn: r.standIn, folderStandIn: [folder: [write]])
+            }, {}),
             ("unreadable", false, "has mode 0, not the 600 install.sh gives it", { XCTAssertEqual(chmod(file, 0o000), 0) }, { chmod(file, 0o600) }),
             ("a lower-case nonce", true, "does not hold two nonces and writing or refused", { TestReceipts.write(file, nonce: self.nonce.lowercased(), predecessor: self.predecessor, word: "refused") }, {}),
             ("a lower-case predecessor", true, "does not hold two nonces and writing or refused", { TestReceipts.write(file, nonce: self.nonce, predecessor: self.predecessor.lowercased(), word: "refused") }, {}),
@@ -293,6 +283,64 @@ final class SleepOffReceiptsTests: XCTestCase {
         var deny = mine
         deny.allows = false
         XCTAssertEqual(SleepOffReceipts.receiptAccessProblem([deny], user: me), "has an access control entry other than the one that lets uid \(me) read it: uid \(me) deny read")
+    }
+
+    /// F6 (round 30). The native reader fails closed. acl_get_entry(3) ends
+    /// a list with -1 and EINVAL; a walk that fails any other way, at the
+    /// first entry or a later one, or answers something it does not
+    /// document, reads no list at all, never a shorter one. A flag
+    /// acl_get_flag_np(3) cannot read reads no list either, never one with
+    /// that flag clear. The lists are built in memory with acl(3); no
+    /// file's list is read or changed. A walk or flag that works is the
+    /// control.
+    func testTheReaderFailsClosedWhenACallOnTheListFails() throws {
+        var acl: acl_t? = acl_init(2)
+        XCTAssertNotNil(acl)
+        defer { acl_free(UnsafeMutableRawPointer(acl)) }
+        func add(_ right: acl_perm_t) {
+            var entry: acl_entry_t?
+            XCTAssertEqual(acl_create_entry(&acl, &entry), 0)
+            XCTAssertEqual(acl_set_tag_type(entry, ACL_EXTENDED_ALLOW), 0)
+            var uuid = [UInt8](repeating: 0, count: 16)
+            XCTAssertEqual(mbr_uid_to_uuid(getuid(), &uuid), 0)
+            XCTAssertEqual(acl_set_qualifier(entry, uuid), 0)
+            var rights: acl_permset_t?
+            XCTAssertEqual(acl_get_permset(entry, &rights), 0)
+            XCTAssertEqual(acl_clear_perms(rights), 0)
+            XCTAssertEqual(acl_add_perm(rights, right), 0)
+            XCTAssertEqual(acl_set_permset(entry, rights), 0)
+        }
+        let mine = AccessEntry.installed(for: getuid())
+        add(ACL_READ_DATA)
+        XCTAssertEqual(SleepOffReceipts.accessEntries(of: acl), [mine], "the control: one entry")
+
+        // A flag that cannot be read, and the control: one that is set.
+        var calls = SleepOffReceipts.ListCalls()
+        calls.flag = { flags, flag in flag == ACL_ENTRY_INHERITED ? -1 : acl_get_flag_np(flags, flag) }
+        XCTAssertNil(SleepOffReceipts.accessEntries(of: acl, calls: calls), "a flag that cannot be read")
+        calls.flag = { flags, flag in flag == ACL_ENTRY_INHERITED ? 1 : acl_get_flag_np(flags, flag) }
+        let inherited = try XCTUnwrap(SleepOffReceipts.accessEntries(of: acl, calls: calls), "the control: a flag that is set")
+        XCTAssertEqual(inherited.map(\.flags), [["inherited"]])
+        XCTAssertNotNil(SleepOffReceipts.receiptAccessProblem(inherited, user: getuid()))
+
+        add(ACL_WRITE_DATA)
+        XCTAssertEqual(SleepOffReceipts.accessEntries(of: acl)?.count, 2, "the control: two entries")
+        let failures: [(name: String, at: Int, answer: Int32, errno: Int32)] = [
+            ("the first call fails", 1, -1, EIO),
+            ("the second call fails", 2, -1, EIO),
+            ("the second call fails with no errno", 2, -1, 0),
+            ("the second call answers 1", 2, 1, 0),
+        ]
+        for f in failures {
+            var walked = 0
+            var failing = SleepOffReceipts.ListCalls()
+            failing.entry = { list, which, entry in
+                walked += 1
+                if walked == f.at { errno = f.errno; return f.answer }
+                return acl_get_entry(list, which, entry)
+            }
+            XCTAssertNil(SleepOffReceipts.accessEntries(of: acl, calls: failing), f.name)
+        }
     }
 
     /// A read-only control of the reader on real lists: for this user's
@@ -1479,6 +1527,7 @@ final class SleepOffSettlementTests: XCTestCase {
                 XCTAssertEqual(try h.store.loadSession(), session, name)
                 XCTAssertEqual(TestReceipts.text(h.receipts), receipt, "\(name): the receipt is not touched")
                 XCTAssertEqual(TestReceipts.release(h.receipts), fault == .journalImmutable ? "\(attempt.nonce) free\n" : release, "\(name): the claim goes back only when the release file can be written")
+                XCTAssertTrue(m.lastError?.hasPrefix("an earlier start is still recorded in the journal (it is settled, but ") == true, "\(name): the menu keeps the cleanup line: \(m.lastError ?? "")")
 
                 if endsFirst {
                     await m.end(reason: .user)
@@ -1509,6 +1558,7 @@ final class SleepOffSettlementTests: XCTestCase {
                     XCTAssertTrue(after.sleepDisabledByUs, name)
                     XCTAssertEqual(TestReceipts.release(h.receipts), "\(attempt.nonce) free\n", name)
                     XCTAssertEqual(h.guardFake.calls, ["pmset -g"], name)
+                    XCTAssertNil(m.lastError, "\(name): the line goes with the record")
 
                     await m.end(reason: .user)
 
@@ -1558,12 +1608,18 @@ final class SleepOffSettlementTests: XCTestCase {
 
     /// Only that start's own session resumes beside a settled record: the
     /// one whose first end is the start's deadline, extended or not, with
-    /// the sleep entry journaled. Another session (one a rolled-back start
-    /// put back, or one ending a second earlier), an extended one whose
-    /// first end is two seconds off, or a journal with no sleep entry ends
-    /// it as before. Sleep turned back on ends it as it ends any resumed
-    /// session, and an expired one is restored. The claim cannot be given
-    /// back throughout, so the record stays.
+    /// the sleep entry journaled. Each extension with a fraction of a
+    /// second can put the first end that comes out up to a second earlier
+    /// (`SessionManager.isSession`): two such extensions with a relaunch
+    /// between them put it 1.2 s early here, past the one second allowed
+    /// before. Another session (one a rolled-back start put back, or one
+    /// ending a second earlier), an extended one whose first end is two
+    /// seconds off, one whose two extensions with fractions put its first
+    /// end 2.2 s early or 1.2 s late, one begun less than a minute before
+    /// the deadline, or a journal with no sleep entry ends it as before.
+    /// Sleep turned back on ends it as it ends any resumed session, and an
+    /// expired one is restored. The claim cannot be given back throughout,
+    /// so the record stays.
     func testOnlyTheSettledStartsOwnSessionResumes() async throws {
         let cases: [(name: String, resumes: Bool, restores: Int, change: (inout Session, inout RuntimeState) -> Void)] = [
             ("its own session", true, 0, { _, _ in }),
@@ -1575,12 +1631,25 @@ final class SleepOffSettlementTests: XCTestCase {
                 s.endsAt = s.endsAt.addingTimeInterval(899)
                 s.extensions = [899.6]
             }),
+            ("its own, cut short at the maximum twice with a relaunch between", true, 0, { s, _ in
+                s.endsAt = s.endsAt.addingTimeInterval(841)
+                s.extensions = [840.6, 1.6]
+            }),
             ("another session, ending 600 s later", false, 1, { s, _ in s.endsAt = s.endsAt.addingTimeInterval(600) }),
             ("another session, ending a second earlier", false, 1, { s, _ in s.endsAt = s.endsAt.addingTimeInterval(-1) }),
             ("extended by 900 s, its first end two seconds off", false, 1, { s, _ in
                 s.endsAt = s.endsAt.addingTimeInterval(902)
                 s.extensions = [900]
             }),
+            ("cut short twice, its first end 2.2 s early", false, 1, { s, _ in
+                s.endsAt = s.endsAt.addingTimeInterval(840)
+                s.extensions = [840.6, 1.6]
+            }),
+            ("cut short twice, its first end 1.2 s late", false, 1, { s, _ in
+                s.endsAt = s.endsAt.addingTimeInterval(843)
+                s.extensions = [840.6, 1.2]
+            }),
+            ("begun 59 s before its deadline", false, 1, { s, _ in s.startedAt = s.endsAt.addingTimeInterval(-59) }),
             ("no sleep entry", false, 0, { _, j in j.sleepDisabledByUs = false }),
         ]
         for c in cases {
@@ -1635,6 +1704,136 @@ final class SleepOffSettlementTests: XCTestCase {
         XCTAssertNil(try h.store.loadSession())
         XCTAssertEqual(restores, 1, "\(h.guardFake.calls)")
         XCTAssertEqual(try h.store.loadState()?.sleepOffAttempt, expired, "the record stays")
+    }
+
+    /// Round 29 F10: the start's own session, extended six times and cut
+    /// short at the maximum each time, at times with a fraction of a
+    /// second. With a save and a relaunch after each extension, every save
+    /// drops a fraction of the end, and the first end comes out 3.348 s
+    /// early, which the one second allowed before refused. It resumes,
+    /// whether each extension is followed by a relaunch or all six run in
+    /// one process: the deadline is kept, sleep is read and never written,
+    /// and the menu keeps the line that says starts are refused until the
+    /// record goes. The same history beside a deadline just outside the
+    /// window (`SessionManager.isSession`) on either side is not the
+    /// start's.
+    func testTheSettledStartsOwnSessionResumesAfterEveryClampedExtensionAndRelaunch() async throws {
+        let steps: [TimeInterval] = [7.6, 7.3, 7.95, 7.45, 7.999, 7.1]
+        for relaunches in [true, false] {
+            let name = relaunches ? "a relaunch after each extension" : "one process"
+            fresh()
+            let (attempt, original) = try await journalSettledStart(givenBack: false)
+            var session = original
+            var at = original.startedAt
+            for (i, step) in steps.enumerated() {
+                at = at.addingTimeInterval(step)
+                session = SessionMath.extended(session, by: 86_400, now: at, maxDuration: 7_200)
+                XCTAssertEqual(session.endsAt, at.addingTimeInterval(7_200), "\(name) \(i): cut short at the maximum")
+                if relaunches {
+                    try h.store.saveSession(session)
+                    session = try XCTUnwrap(h.store.loadSession())
+                }
+                XCTAssertTrue(SessionManager.isSession(session, of: attempt), "\(name) \(i)")
+            }
+            try h.store.saveSession(session)
+            let saved = try XCTUnwrap(h.store.loadSession())
+            let first = try XCTUnwrap(SessionMath.firstEnd(of: saved))
+            XCTAssertEqual(first, Double(attempt.deadline) - (relaunches ? 3.348 : 0.399), accuracy: 0.0001, name)
+            for other in [Int(first.rounded(.down)) - 2, Int(first.rounded(.down)) + steps.count + 1] {
+                var another = attempt
+                another.deadline = other
+                XCTAssertFalse(SessionManager.isSession(saved, of: another), "\(name): deadline \(other)")
+            }
+            let clear = try await impose(.releaseReadOnly)
+            defer { clear() }
+            let m = h.makeManager()
+
+            await m.reconcile()
+
+            XCTAssertTrue(m.isActive, "\(name): \(m.lastError ?? "")")
+            XCTAssertEqual(m.session, saved, "\(name): the deadline is kept")
+            XCTAssertEqual(h.backstop.arms, 1, name)
+            XCTAssertEqual(h.guardFake.calls, ["pmset -g"], "\(name): sleep is read, never written")
+            XCTAssertEqual(try h.store.loadState()?.sleepOffAttempt, attempt, "\(name): the record stays")
+            XCTAssertTrue(m.lastError?.hasPrefix("an earlier start is still recorded in the journal (it is settled, but ") == true, "\(name): \(m.lastError ?? "")")
+            await m.end(reason: .user)
+        }
+    }
+
+    /// Round 29 F9: session.json beside a settled record whose extensions
+    /// add up to no first end a session can have (1e20 s, or two of 1e308
+    /// s, whose sum is infinite) traps nothing. The relaunch moves it aside
+    /// as it moves any file that is not a session, and restores the
+    /// journal's sleep entry once; the record stays. A journal whose
+    /// deadline is Int.min or Int.max beside an ordinary extended session
+    /// traps nothing either: that session is not the start's, and it is
+    /// ended as before. No case runs `disablesleep 1`.
+    func testASessionWhoseArithmeticCannotWorkTrapsNothingOnRelaunch() async throws {
+        let movedAside: [(name: String, extensions: [TimeInterval])] = [
+            ("an extension of 1e20 s", [1e20]),
+            ("two extensions of 1e308 s", [1e308, 1e308]),
+        ]
+        for c in movedAside {
+            fresh()
+            let (attempt, original) = try await journalSettledStart(givenBack: false)
+            var session = original
+            session.extensions = c.extensions
+            XCTAssertFalse(SessionManager.isSession(session, of: attempt), c.name)
+            try h.store.saveSession(session)
+            XCTAssertThrowsError(try h.store.loadSession(), c.name) { error in
+                guard case let StoreError.unreadable(_, detail) = error else { return XCTFail("\(c.name): \(error)") }
+                XCTAssertEqual(detail, "its extensions do not add up to a first end between 1970 and 9999", c.name)
+            }
+            let clear = try await impose(.releaseReadOnly)
+            defer { clear() }
+            let m = h.makeManager()
+
+            await m.reconcile()
+
+            XCTAssertFalse(m.isActive, c.name)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: h.home.paths.sessionFile.path), "\(c.name): moved aside")
+            let aside = try FileManager.default.contentsOfDirectory(atPath: h.home.paths.appSupport.path).filter { $0.hasPrefix(Paths.unreadableSessionPrefix) }
+            XCTAssertEqual(aside.count, 1, "\(c.name): \(aside)")
+            XCTAssertEqual(restores, 1, "\(c.name): \(h.guardFake.calls)")
+            XCTAssertFalse(h.guardFake.calls.contains("disablesleep 1"), c.name)
+            XCTAssertEqual(try h.store.loadState()?.sleepOffAttempt, attempt, "\(c.name): the record stays")
+        }
+
+        for deadline in [Int.min, Int.max] {
+            fresh()
+            var (attempt, session) = try await journalSettledStart(givenBack: false)
+            attempt.deadline = deadline
+            var journal = try XCTUnwrap(h.store.loadState())
+            journal.sleepOffAttempt = attempt
+            try h.store.saveState(journal)
+            session.endsAt = session.endsAt.addingTimeInterval(1)
+            session.extensions = [1]
+            try h.store.saveSession(session)
+            XCTAssertFalse(SessionManager.isSession(session, of: attempt), "deadline \(deadline)")
+            let clear = try await impose(.releaseReadOnly)
+            defer { clear() }
+            let m = h.makeManager()
+
+            await m.reconcile()
+
+            XCTAssertFalse(m.isActive, "deadline \(deadline)")
+            XCTAssertNil(try h.store.loadSession(), "deadline \(deadline)")
+            XCTAssertEqual(restores, 1, "deadline \(deadline): \(h.guardFake.calls)")
+            XCTAssertFalse(h.guardFake.calls.contains("disablesleep 1"), "deadline \(deadline)")
+            XCTAssertEqual(try h.store.loadState()?.sleepOffAttempt, attempt, "deadline \(deadline): the record stays")
+        }
+
+        // In memory, where no decoder stands in the way.
+        let start = Date(timeIntervalSince1970: TimeInterval(now))
+        let probe = SleepOffAttempt(nonce: "n", owedBefore: false, receipt: "1:2", predecessor: "p", deadline: now + 3_600, expires: now)
+        for extensions: [TimeInterval] in [[.nan], [.infinity], [-.infinity, .infinity], [-1e20], [1e308, 1e308]] {
+            let s = Session(startedAt: start, endsAt: start.addingTimeInterval(3_600), extensions: extensions)
+            XCTAssertNil(SessionMath.firstEnd(of: s), "\(extensions)")
+            XCTAssertFalse(SessionManager.isSession(s, of: probe), "\(extensions)")
+        }
+        let healthy = Session(startedAt: start, endsAt: start.addingTimeInterval(3_600))
+        XCTAssertTrue(SessionManager.isSession(healthy, of: probe))
+        XCTAssertFalse(SessionManager.isSession(Session(startedAt: Date(timeIntervalSince1970: .nan), endsAt: healthy.endsAt), of: probe))
     }
 
     /// A claim that cannot be written (the release file is read-only here)

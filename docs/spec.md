@@ -238,8 +238,20 @@ recovery; newly written journals use `frozenProcesses`.
   chmod +a`. Only root and the user can open it, so no other account can
   take its lock. It checks again once they exist. A receipt an earlier
   build made (root's, one link, 82 bytes, no group or other write, no
-  entry or only that one) gets mode 0600 and the entry in place, bytes,
-  inode and `held` claim kept. A folder or receipt already there in
+  entry or only that one) is repaired in place by `sudo -n chmod`, bytes
+  and inode kept, only while the release file shows no claim (none, or a
+  nonce and `free`); a claim, or a release file that is not a regular
+  file, cannot be read or holds anything else, stops the install before
+  any change. One the user can open (any mode but 0600) is locked first,
+  the release file is read under that lock, and before each chmod the
+  receipt must still be the locked file with the same line. One the user
+  cannot open (0600, no entry) is refused by every reader until it has
+  the entry, so nothing claims or writes it meanwhile; it gets the entry
+  first and is locked and checked with the release file after. The entry
+  goes on before the mode. The readers of earlier builds of this change
+  refuse a repaired receipt, and stay installed when the install stops
+  later or rolls back to the bundle it was replacing. A folder or receipt
+  already there in
   another form stops the install with nothing about it changed (no chown
   of something it did not make), the 45-byte receipt of earlier builds of
   this change included; a receipt already as it makes it is kept. Every
@@ -247,7 +259,11 @@ recovery; newly written journals use `frozenProcesses`.
   user's uid, not inherited, no flags): the app through acl(3), the
   scripts and the root command through `ls -le` and `id -u`, which cannot
   see the rights and flags ls does not print for a file or an entry it
-  cannot read. Beside
+  cannot read. The two are not equivalent: a receipt with such a right or
+  flag passes the scripts and the root command, and the app refuses it.
+  The app also refuses the receipt when an acl(3) call on the list fails
+  or gives an answer acl(3) does not document
+  (`SleepOffReceipts.accessEntries`). Beside
   it, under the receipt's lock, install.sh writes `<uid>.released`
   through `sudo -n install`: the user's own file, 0600, 42 bytes, the
   receipt's nonce and `free`. A `held` claim on an existing receipt is
@@ -387,9 +403,17 @@ recovery; newly written journals use `frozenProcesses`.
   beside it, under the same sudo (section 1 and the receipt invariant in
   section 8). `uninstall.sh` removes both, then the folder once it is
   empty, after the same checks, only under the receipt's lock and only
-  while the release file shows the receipt's own nonce `free`. Both
-  refuse, changing nothing, at a folder or file that is not as install.sh
-  makes it. No passwordless line covers the receipt.
+  while the release file shows the receipt's own nonce `free`. It stops
+  before removing anything at a folder or file that is not as install.sh
+  makes it or cannot be read, and at one of the two files without the
+  other. It asks for the password once with `sudo -v`, stops there when
+  `sudo -n -v` shows sudo kept no credential, and runs every root command
+  through `sudo -n` with its 30 s call limit under the recovery lock and
+  the receipt's lock. A call that fails, stops on SIGTERM at the limit or
+  is still running stops it there, and a sudo still running keeps both
+  locks until it exits. install.sh refuses, changing nothing, at a folder
+  or file that is not as it makes it, apart from the repair of an earlier
+  receipt (section 1). No passwordless line covers the receipt.
 - `install.sh` never writes `disablesleep 1`, on any path. When
   `session.json` holds a future deadline it first says the upgrade will end
   the session and, in a terminal, asks to continue. It asks for the password
@@ -1169,7 +1193,9 @@ Invariants:
   line. One that fails after it (the claim not given back, the settled
   record not removed, the receipt's lock busy) keeps the settled record,
   which holds nothing back: the undo follows its decision, Starts stay
-  refused, and every run tries again. A crash leaves one of those
+  refused, and every run tries again. A start that went through keeps its
+  session; a relaunch resumes it (reconcile, step 2), and the menu says
+  the start is still recorded and why. A crash leaves one of those
   journals. The messages say whether session.json was removed and whether
   the decision was journaled. When the receipt showed "never wrote" and no
   earlier restore is owed, or decided nothing, no pmset runs for sleep
@@ -1224,7 +1250,10 @@ a marker no attempt accounts
 for (the receipt invariant above). A session.json that is still there
 and unexpired while an attempt stays journaled, or whose removal beside
 such a marker failed, is ended (`performEnd(.startFailed)`), never
-resumed. Then:
+resumed, with one exception: a settled attempt whose claim could not be
+given back or record removed, beside that start's own session with the
+sleep entry still journaled, resumes the session in step 2 (`isSession`,
+below). Then:
 
 1. Session file missing or expired → restore journaled changes: sleep,
    verified owned processes, Low Power Mode if we set it, saved audio, and
@@ -1236,7 +1265,14 @@ resumed. Then:
    restored as with no session. `backstop.sh` does the same once the journal
    is clean. A session file that decodes as JSON but lacks a key or type
    the `Session` decoder needs (`startedAt`, `endsAt`, `extensions`) is not
-   a session either; `backstop.sh` checks the same keys and types. The app
+   a session either; `backstop.sh` checks the same keys and types. Nor is
+   one whose extensions do not add up: an extension or their running sum
+   that is not finite, or a first end (`endsAt` less their sum) outside
+   the dates the store reads (`SessionMath.firstEnd`, checked by
+   `Store.loadSession`). The app moves it aside the same way and restores
+   the journal; no session it wrote has such a history. `backstop.sh` does
+   not add the extensions and honors its end until the app has moved it
+   (`uninstall.sh` ends any session either way). The app
    and both scripts read a date in one form only: `2027-01-15T08:00:00Z`,
    as Store writes it, or the same with an offset such as `+02:00` in place
    of `Z`, in whole seconds, naming a date and time that exist, years 1970
@@ -1266,7 +1302,18 @@ resumed. Then:
    `SleepDisabled 0` (something turned sleep back on while Insomnia was not
    running): end the session with a notification, no prompt. If the lid is
    open, restore recorded lid-close actions. Arming, read or restoration
-   errors must remain visible.
+   errors must remain visible. Beside a settled attempt (above), only that
+   start's own session gets here: it began at least `minimumDuration`
+   before the attempt's `deadline`, and its first end falls in the second
+   the deadline names, or, for each extension with a fraction of a second
+   (one cut short at the maximum), up to a second earlier, since each save
+   drops the end's fraction but keeps the extension's. The comparison uses
+   Doubles only, so no value on disk can trap a conversion. Anything else
+   beside that record ends, including an earlier session a failed start
+   put back as it was before its claim could not be given back: an
+   unwaived cost. The menu keeps the line that the start is still recorded
+   (`recordedStartText`) while the session goes on, and Starts stay
+   refused until a run gives the claim back and removes the record.
 3. `pmset -g` reports `SleepDisabled 1` with no session and no journal
    entry → leave it. Step 1 has already undone a disable Insomnia journaled,
    so this one was set by something else (a hand-run `pmset`, another tool)
@@ -1343,8 +1390,9 @@ Backstop, independent of the app:
   is held until the call has exited or been stopped: no `launchctl bootout`
   or `bootstrap` it started is still running once the lock is released. A call past the
   limit gets SIGTERM, then SIGKILL one to two seconds later; `sudo` only ever gets
-  SIGTERM, and one that ignores it keeps the lock until it ends, reported
-  with its pid. A `sudo` call or `pgrep` that does not answer stops the
+  SIGTERM, and one that ignores it keeps the lock until it ends. The run
+  names no pid for it: by the time anyone acted on one, it could name
+  another process. A `sudo` call or `pgrep` that does not answer stops the
   run, which releases the lock so the app and the agent can recover. A `launchctl print` that does not answer counts as unknown, never
   as unloaded. A `codesign --verify` that does not answer leaves it unknown
   which bundle the plist on disk pins, so the run stops and moves neither

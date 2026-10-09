@@ -205,8 +205,9 @@ exited or been stopped, so no `launchctl bootout` it started is still
 running once the lock is released. A call that does not answer in time gets SIGTERM, then SIGKILL
 one to two seconds later, and the install stops, so the lock is released and the app
 and the agent's backstop can take it again to undo a session. `sudo` only
-ever gets SIGTERM: one that ignores it keeps the lock until it ends, and the
-installer prints its pid.
+ever gets SIGTERM: one that ignores it keeps the lock until it ends (a
+restart ends it too). The installer names no pid for it, since by the time
+anyone acted on one it could name another process.
 
 </details>
 
@@ -332,7 +333,11 @@ installer prints its pid.
      turned back on only when the receipt showed nothing or an earlier
      restore is owed. Once the result is journaled, a claim that cannot be
      given back or a record that cannot be removed keeps Start refused
-     until a later run finishes them; the result is not read again.
+     until a later run finishes them; the result is not read again. A
+     session that start began goes on, a relaunch resumes it while sleep is
+     still off, and the menu says the start is still recorded and why. Any
+     other session file beside that record ends at the relaunch, including
+     an earlier session a failed start put back.
 
    Insomnia shows no dialog at all while the `backstop.sh` sealed in its
    bundle is missing or older than the app expects, because an older one
@@ -540,7 +545,12 @@ clean. A session file that cannot be read at all (permissions, or not a
 regular file, which is never opened) also counts as expired, since its end
 time is unknown: the journal is restored and the file is renamed the same
 way without being opened, so a later launch cannot resume a session that
-was treated as ended. The app says where it went. If the rename fails, the
+was treated as ended. The app says where it went. A session file whose
+extensions do not add up to a first end between 1970 and 9999 (an extension
+too large to add, which no session Insomnia wrote has) counts as expired
+too: the app renames it at launch and restores the journal. The agent reads
+only the file's end time and honors it until the app has renamed the file.
+If the rename fails, the
 app keeps trying it and will not quit until the file is gone.
 `uninstall.sh --purge` removes the renamed copies that are regular files;
 without `--purge` they stay.
@@ -827,8 +837,19 @@ The uninstaller requests cleanup before removing the app, agent, sudoers
 rule, your receipt and its `.released` file. It removes those two only
 under the receipt's lock and only while no start claims the receipt. A
 start from another Insomnia folder of yours that is not settled, a lock
-that stays held, or a `.released` file it cannot read keeps both, with a
-message. Once they are gone, any other Insomnia folder of yours needs
+that stays held, a receipt, `.released` file or folder it cannot read or
+that fails its checks, or one of the two files without the other stops it
+with nothing removed and a message. It asks for your password once (`sudo
+-v`), before removing anything, and runs each command that needs root
+through `sudo -n` with a 30 s limit. One that fails, does not answer in
+time or is still running stops the uninstall there, with what it already
+removed listed; a `sudo` still running keeps the locks until it exits.
+If your sudo credential runs out between the password and those
+commands, it stops after removing the LaunchAgent; rerun it. A start that
+is settled can still have a session running in another Insomnia folder
+of yours, and once the rule is gone that folder cannot turn sleep back on
+by itself (SECURITY.md). Once they are gone, any other Insomnia folder of
+yours needs
 `./scripts/install.sh` again before its next start. It removes the
 receipts folder too once no other account's receipt is in it, and leaves
 the folder and everything in it alone when someone other than root could

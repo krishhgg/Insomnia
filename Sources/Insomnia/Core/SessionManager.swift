@@ -1301,10 +1301,7 @@ final class SessionManager {
             // receipt shows. Or it is settled, but its claim on the
             // receipt was not given back yet. A new start would replace
             // that record.
-            let why = attemptProblem ?? "it could not be settled"
-            let text = recorded.isSettled
-                ? "an earlier start is still recorded in the journal (\(why)). Starts are refused until a later run gives its claim on the receipt back"
-                : "an earlier start is still recorded in the journal and is not settled (\(why)). Starts are refused until a later run settles it"
+            let text = Self.recordedStartText(recorded, attemptProblem)
             fail("start refused, nothing changed: \(text)")
             notifier.post(title: Self.endTitle(.startFailed, had: false), body: "Nothing was changed: \(text).")
             return
@@ -3486,21 +3483,38 @@ final class SessionManager {
     }
 
     /// Whole seconds since 1970, rounded down, as the journal and
-    /// session.json hold times.
+    /// session.json hold times. For this Mac's clock only: times read from
+    /// disk are compared as Doubles (`isSession`), so nothing there can
+    /// trap the conversion.
     private static func seconds(_ date: Date) -> Int { Int(date.timeIntervalSince1970.rounded(.down)) }
 
-    /// Whether `s` is the session `attempt`'s start wrote: its first end,
-    /// before any extension, is the start's deadline. session.json keeps
-    /// the end to the second and each extension to a fraction of one. An
-    /// extension cut short at the maximum ends at a fraction of a second,
-    /// so the first end is then known only to within a second (a second
-    /// more for each relaunch between two such extensions). Beyond one
-    /// second the session is not taken for the start's own, and reconcile
-    /// ends it as before.
+    /// Whether `s` is the session `attempt`'s start wrote: it began at
+    /// least `SessionMath.minimumDuration` before the start's deadline, and
+    /// its first end, before any extension (`SessionMath.firstEnd`), is
+    /// that deadline. The deadline is the first end rounded down to the
+    /// second, as session.json keeps every time, while it keeps each
+    /// extension to a fraction of a second. With whole-second extensions
+    /// the first end comes out exactly. An extension with a fraction (one
+    /// cut short at the maximum) leaves an end with a fraction, which each
+    /// save drops from the end but not from the extensions, and a relaunch
+    /// extends from the end without it. So each such extension can put
+    /// the first end that comes out up to a second earlier, and the
+    /// fraction the start's own end had, up to a second later: with `n` of
+    /// them it is after `deadline - n` and before `deadline + 1`. Outside
+    /// that, or with a history no session this app wrote has, the session
+    /// is not the start's own, and reconcile ends it as before. Everything
+    /// here compares Doubles, so no journal or session.json value can trap
+    /// a conversion or overflow a subtraction.
     static func isSession(_ s: Session, of attempt: SleepOffAttempt) -> Bool {
-        if s.extensions.isEmpty { return seconds(s.endsAt) == attempt.deadline }
-        let first = seconds(s.endsAt.addingTimeInterval(-s.extensions.reduce(0, +)))
-        return abs(first - attempt.deadline) <= 1
+        guard let first = SessionMath.firstEnd(of: s) else { return false }
+        let deadline = Double(attempt.deadline)
+        let started = s.startedAt.timeIntervalSince1970.rounded(.down)
+        guard started + SessionMath.minimumDuration <= deadline else { return false }
+        let fractions = s.extensions.filter { $0 != $0.rounded(.down) }.count
+        if fractions == 0 { return first.rounded(.down) == deadline }
+        // A thousandth of a second for the rounding of the sums above.
+        let slack = 0.001
+        return first > deadline - Double(fractions) - slack && first < deadline + 1 + slack
     }
 
     /// The receipt's lock (`SleepOffReceipts.lock`), or the error it threw.
@@ -3604,7 +3618,7 @@ final class SessionManager {
     /// it is never resumed because a SleepDisabled 1 someone else set reads
     /// as still off. Returns whether it deleted it.
     private func removeSessionOfUnfinishedStart(_ attempt: SleepOffAttempt) throws -> Bool {
-        guard session == nil, let s = try? store.loadSession(), Self.seconds(s.endsAt) == attempt.deadline else { return false }
+        guard session == nil, let s = try? store.loadSession(), s.endsAt.timeIntervalSince1970.rounded(.down) == Double(attempt.deadline) else { return false }
         try store.deleteSession()
         Log.info("removed session.json of a start that never finished")
         return true
@@ -3753,6 +3767,7 @@ final class SessionManager {
         case let .success(g):
             held = g
         case let .failure(error):
+            attemptProblem = "the receipt could not be locked to give this start's claim back (\(error.localizedDescription))"
             Log.error("could not lock the receipt to give the start's claim back (\(error.localizedDescription)); the next run settles the start and keeps the sleep entry")
             return
         }
@@ -3761,6 +3776,7 @@ final class SessionManager {
         case .done:
             break
         case let .notPublished(why):
+            attemptProblem = why
             Log.error("could not clear the start's record: \(why); the next run settles it and keeps the sleep entry")
         case let .pending(why):
             settlementPending(why)
@@ -3922,9 +3938,21 @@ final class SessionManager {
 
     /// The menu's error line goes away after a success, except for a
     /// pending-start marker that is still in place, which keeps its line
-    /// until a transaction removes it.
+    /// until a transaction removes it, and then for a start the journal
+    /// still records, which keeps its line until a run settles it and
+    /// removes it. That start's own session can go on beside the record,
+    /// but every new start is refused until then.
     private func clearLastError() {
         lastError = markerProblem.map(Self.markerProblemText)
+            ?? state.sleepOffAttempt.map { Self.recordedStartText($0, attemptProblem) }
+    }
+
+    /// Why a start the journal still records refuses new starts.
+    static func recordedStartText(_ recorded: SleepOffAttempt, _ problem: String?) -> String {
+        let why = problem ?? "it could not be settled"
+        return recorded.isSettled
+            ? "an earlier start is still recorded in the journal (\(why)). Starts are refused until a later run gives its claim on the receipt back"
+            : "an earlier start is still recorded in the journal and is not settled (\(why)). Starts are refused until a later run settles it"
     }
 
     static func markerProblemText(_ problem: String) -> String {

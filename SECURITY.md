@@ -129,8 +129,23 @@ allows anything. It then gives the file one access control entry, `sudo
 root and that account can open the receipt, so no other account can take
 its lock. It checks the folder and the file again once they exist. A
 receipt an earlier build made (root's, one link, 82 bytes, no group or
-other write, with no entry or only that one) gets mode 0600 and the entry
-in place, with its bytes, its inode and any `held` claim kept. A folder or
+other write, with no entry or only that one) is repaired in place by `sudo
+-n chmod`, keeping its bytes and its inode, and only while the release
+file shows no claim: there is none, or it holds a nonce and `free`. A
+claim, or a release file that is not a regular file, cannot be read or
+holds anything else, stops the install before any change: settle that
+start first, or remove both files by hand when no Insomnia folder has a
+start to settle. A receipt the user can open (any mode but 0600) is
+locked first, as the root command and every reader lock it, the release
+file is read under that lock, and before each chmod the receipt must
+still be the locked file with the same line. One the user cannot open
+(0600 with no entry) is refused by the app, backstop.sh and the root
+command until it has the entry, so nothing can claim it or write it
+meanwhile; it gets the entry, then is locked and checked with the release
+file below. The entry goes on before the mode, so the user can read the
+receipt throughout. The readers of earlier builds of this change refuse a
+repaired receipt, and they stay installed when the install stops later,
+or rolls back to the bundle it was replacing. A folder or
 file already there in any other form (another owner, a looser mode, a
 link, another type or size, a second hard link, an allowing ACL on a
 folder, any other entry on the file) stops the install: it never changes
@@ -150,7 +165,11 @@ every entry. The scripts and the root command read it through `ls -le`,
 which never prints the synchronize right, prints folder-only rights and
 the inherit flags only for folders, and skips an entry it cannot read; a
 receipt with one of those added can pass their check. They then ask
-`id -u` whether the entry's name is the user's uid.
+`id -u` whether the entry's name is the user's uid. The two checks are not
+equivalent: such a receipt passes the scripts and the root command, and the
+app refuses it. The app also refuses the receipt when an acl(3) call on
+the list fails or gives an answer acl(3) does not document, rather than
+take it for the end of the list or for a flag that is clear.
 
 Beside it, install.sh makes `<uid>.released` through `sudo -n install`:
 the user's own file, mode 0600, 42 bytes, holding a nonce and `free` or
@@ -176,17 +195,19 @@ start claims it, before they read it to settle a start, before install.sh
 writes the release file, and before uninstall.sh removes it. Each of them
 therefore reads the receipt before a command took the lock or after that
 command and its pmset exited, whichever marker file the command opened.
-Taking the lock needs only read access, which every account on the Mac
-has, so any local account can hold it. While one does, Start is refused
-after 10 s, the root command refuses with exit 75 after 10 s, and a
+Taking the lock needs read access, which only root and the user have
+(mode 0600 and the one entry), so no other account can hold it. While root
+or a process of the user does, Start is refused after 10 s, the root
+command refuses with exit 75 after 10 s, and a
 settlement decides nothing (below). The lock is advisory: root can change
 the file without it.
 
 Under that lock the root command checks the receipt: the uid must be plain
 digits, and `stat` and `ls -le` of the receipt and of every folder above it
-up to / must show a regular file with one link and 82 bytes under folders,
-each of them root's, with no group or other write permission and no
-allowing entry. The open descriptor and the path must both be the file
+up to / must show a regular file with one link, 82 bytes, mode 0600 and
+the one entry for the user under folders, each of them root's, with no
+group or other write permission and no allowing entry. The open
+descriptor and the path must both be the file
 (device and inode) the start claimed. Anything else exits 7 with nothing
 written. Exit 3 means the marker no longer holds the nonce. Exit 4 means the
 clock is not before the start's `expires`. Then come the sudo checks above
@@ -351,12 +372,21 @@ this user's receipt and release file and then the folder once it is empty,
 as root, after the same checks) and the root command of an authenticated
 Start change the receipt. uninstall.sh removes the two files only under the
 receipt's lock, and only while the release file shows the receipt's own
-nonce `free`; it leaves them, says why and exits 1 when the lock stays
-busy, a start claims the receipt, or the release file cannot be read. A
-receipt that fails the checks shows nothing to any reader and is removed
-without the lock. The app, backstop.sh and uninstall.sh also write the
-release file, which is the user's. Each start rewrites the same 82 bytes
-in place, so nothing accumulates. A new start's nonce is random and never
+nonce `free`. It stops before removing anything, says why and exits 1 when
+the lock stays busy, a start claims the receipt, the release file shows
+another nonce, the receipt, the release file or a folder above them cannot
+be read or fails the checks, or one of the two files is there without the
+other. It runs `sudo -v` first, which asks for the password before
+anything is removed, then `sudo -n -v`, which stops it there when sudo
+kept no credential. Every command it then runs as root goes through `sudo
+-n` with its 30 s call limit, while it holds the recovery lock and the
+receipt's lock. A call that fails, is stopped by SIGTERM at that limit, or
+is still running after it stops the uninstall there: what it did is not
+known, so nothing after it is removed. sudo only ever gets SIGTERM, and a
+sudo still running keeps both locks until it exits. The app, backstop.sh
+and uninstall.sh also write the release file, which is the user's. Each
+start rewrites the same 82 bytes in place, so nothing accumulates. A new
+start's nonce is random and never
 the all-zero one.
 
 What this design does not close. pmset has no compare-and-set and one
@@ -430,11 +460,24 @@ trace.
   for that start runs or the receipt's lock, the claim or the journal
   cannot be had. A start in one Insomnia folder keeps
   Starts in every other folder of the user refused until it is settled.
-  uninstall.sh holds the receipt's lock while it runs `sudo rm`, which may
-  ask for a password. After uninstall.sh removes the shared receipt, any
-  other Insomnia folder of the user needs `./scripts/install.sh` again
-  before its next start. A Mac without `/usr/bin/perl` refuses every Start
-  with exit 7.
+  uninstall.sh holds the recovery lock and the receipt's lock while `sudo
+  -v` asks for the password, with no time limit. A credential that runs
+  out after `sudo -n -v` found it makes the next `sudo -n` fail, and the
+  uninstall stops after the LaunchAgent is gone, so no recovery agent runs
+  until a rerun finishes the uninstall or install.sh runs again. After
+  uninstall.sh removes the shared receipt, any other Insomnia folder of the
+  user needs `./scripts/install.sh` again before its next start. A Mac
+  without `/usr/bin/perl` refuses every Start with exit 7.
+- uninstall.sh removes the shared rule and receipt when the release file
+  shows no claim, and no claim does not prove that no other Insomnia
+  folder of the user owes a restore. A start gives its claim back once it
+  is settled, while the session it began still runs, and a settlement
+  gives the claim back before an undo that may then fail. An uninstall run
+  from another folder at that point removes the rule that folder's restore
+  of sleep needs: that restore then fails and is retried, and sleep stays
+  off until install.sh runs again or the user runs `sudo pmset -a
+  disablesleep 0`. Nothing in this change closes that, and it is not
+  waived.
 - The clock is the wall clock, as session.json's end is, and `expires`
   proves that no command for a start will begin only while that clock does
   not go back. A clock set back after a settlement lets a dialog left on
@@ -462,11 +505,28 @@ trace.
   settled keeps it unsettled; a later settlement finds its `writing`,
   removes the session.json whose end is that deadline and so ends that
   session early, with sleep restored. One that marked it settled but could
-  not give the claim back or remove the record keeps the session while the
-  app runs; an app relaunched over that record ends the session rather
-  than resume it. A session whose marker could not be deleted when it
-  started ends early too, when a later run deletes that marker with no
-  attempt journaled.
+  not give the claim back or remove the record keeps its session, and an
+  app relaunched over that record resumes it while sleep is still off and
+  the journal still holds the sleep entry. The menu keeps a line saying
+  that the start is still recorded and why, and new Starts stay refused
+  until a run gives the claim back and removes the record. Only that
+  start's own session resumes: it began at least a minute before the
+  start's deadline, and its first end (its end less every extension) falls
+  in the second the deadline names, or up to a second earlier for each
+  extension with a fraction of a second (one cut short at the maximum).
+  Any other session.json beside that record is ended rather than resumed.
+  That includes the earlier session a failed start put back as it was when
+  it then could not give its claim back: a relaunch ends that session
+  while the record stays. That cost is not waived. A session whose marker
+  could not be deleted when it started ends early too, when a later run
+  deletes that marker with no attempt journaled.
+- The app reads a session.json whose extensions do not add up (one that
+  is not a finite number, a sum that is not, or a first end outside 1970
+  to 9999) as one that does not parse: it moves the file aside and
+  restores the journal. No session the app wrote has such a history; a
+  process running as the user, or damage on disk, can write one.
+  backstop.sh reads only the session's end, so it honors that end until
+  the app moves the file aside; uninstall.sh ends any session either way.
 - While the journal claims a 1 from an earlier session, another tool's 1
   is taken for it, and a refused start leaves that 1 in place with its
   restore still owed.

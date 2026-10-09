@@ -69,6 +69,9 @@ MKDIR=/bin/mkdir
 CHMOD=/bin/chmod
 CAT=/bin/cat
 HEAD=/usr/bin/head
+# sed reads the requirement the LaunchAgent pins and escapes the plist's
+# text (xml_escape).
+SED=/usr/bin/sed
 INSTALL=/usr/bin/install
 STAT=/usr/bin/stat
 LS=/bin/ls
@@ -144,7 +147,8 @@ command_line() { local line; line="$(printf '%q ' "$@")"; printf '%s' "${line% }
 # keep this run waiting forever. Its combined output is left in
 # BOUNDED_OUTPUT (trailing newline removed) and its exit status returned, or
 # 124 when it did not finish within CALL_TIMEOUT_SECONDS and was stopped, or
-# 125 when it is sudo and still running (pid in BOUNDED_PID).
+# 125 when it is sudo and still running. No pid is kept or printed for it:
+# by the time anyone acted on one, it could name another process.
 #
 # supervise() starts the call in the background and enforces the limit
 # itself, so the limit holds even if this run is killed while it waits, or
@@ -164,12 +168,10 @@ command_line() { local line; line="$(printf '%q ' "$@")"; printf '%s' "${line% }
 # Each call's files get a name from mktemp, so a call made inside $(...)
 # cannot reuse another's.
 BOUNDED_OUTPUT=""
-BOUNDED_PID=""
 bounded() { # command args...
   local base supervisor rc deadline
   base="$("$MKTEMP" "$WORK/call.XXXXXX")"
   BOUNDED_OUTPUT=""
-  BOUNDED_PID=""
   supervise "$base" "$@" </dev/null >/dev/null 2>&1 &
   supervisor=$!
   if [[ "$1" == "$SUDO" ]]; then
@@ -180,7 +182,6 @@ bounded() { # command args...
       sleep 0.01
     done
     if [[ ! -s "$base.rc" ]]; then
-      BOUNDED_PID="$("$CAT" "$base.pid" 2>/dev/null || true)"
       return 125
     fi
   fi
@@ -296,7 +297,7 @@ move_bundle() { # from to
 # Whether sudo lists the three pmset commands of the rule as permitted
 # without asking for a password: 0 when it does, 124 when a check did not
 # answer within CALL_TIMEOUT_SECONDS and stopped on SIGTERM, 125 when it did
-# not stop and is still running (BOUNDED_PID), 1 otherwise. `sudo -l
+# not stop and is still running, 1 otherwise. `sudo -l
 # <command>` checks the policy without running pmset, so nothing on the
 # machine changes. `-k` ignores the credential step 2 cached (without
 # removing it) and `-n` fails instead of prompting, so a machine where no
@@ -316,7 +317,7 @@ pmset_rule_check() { # pmset arguments
 }
 # The part of a message about a sudo check that is still running.
 sudo_alive_note() {
-  printf "It was sent SIGTERM and is still running as pid %s. It is not killed, because killing sudo could leave what it runs as root behind" "${BOUNDED_PID:-?}"
+  printf "It was sent SIGTERM and is still running. It is not killed, because killing sudo could leave what it runs as root behind"
 }
 pmset_rule_effective() {
   pmset_rule_check -a disablesleep 0 \
@@ -575,7 +576,7 @@ echo "signed $("$CODESIGN" -dv "$NEW_APP" 2>&1 | grep -i identifier || true)"
 # instead. It does not depend on the path, so it still holds
 # once the bundle is at $APP. The app reads the same text through the
 # Security framework (CodeRequirement.swift) to recognise this plist.
-REQUIREMENT="$("$CODESIGN" -d -r- "$NEW_APP" 2>&1 | sed -n 's/^#\{0,1\} *designated => //p' | head -n 1)"
+REQUIREMENT="$("$CODESIGN" -d -r- "$NEW_APP" 2>&1 | "$SED" -n 's/^#\{0,1\} *designated => //p' | "$HEAD" -n 1)"
 if [[ -z "$REQUIREMENT" ]]; then
   echo "could not read the designated requirement of the new bundle ('codesign -d -r-'); the LaunchAgent cannot pin it." >&2
   unchanged_note
@@ -654,9 +655,9 @@ sudo_stalled_note() { # rc what
     cat >&2 <<FAIL
 $2 did not answer within ${CALL_TIMEOUT_SECONDS}s. $(sudo_alive_note).
 It keeps the recovery lock until it ends, so until then the app cannot start a
-session and the LaunchAgent's backstop cannot undo one. If it does not end by
-itself, stop it:
-  sudo kill ${BOUNDED_PID:-<pid>}
+session and the LaunchAgent's backstop cannot undo one. Nothing here stops it
+by pid: a pid noted now could name another process by the time anyone acts on
+it. Once it has ended (a restart ends it too), rerun this script.
 FAIL
   else
     cat >&2 <<FAIL
@@ -813,6 +814,57 @@ receipt_problem() {
     echo "$RECEIPT does not have exactly one access control entry, the one that lets $USER_NAME (uid $UID_NUM) read it and nothing else, or its list could not be read"
   fi
 }
+# Prints the release file's owner, mode, links, size and type, by lstat.
+release_meta() {
+  "$STAT" -f '%u %Lp %l %z %HT' "$RELEASED" 2>/dev/null || true
+}
+# Prints the release file's first 43 bytes, then a dot and head's exit
+# status, so bytes printed by a read that failed are never taken as the
+# file's.
+release_bytes() {
+  "$HEAD" -c 43 "$RELEASED" 2>/dev/null
+  echo ".$?"
+}
+# Prints why the release file does not show that no start claims the
+# receipt, or nothing: a claim, or a file that is not a regular file,
+# cannot be read, or holds anything but a nonce and free. No file shows no
+# claim (the release file came after the first receipts).
+release_claim_problem() {
+  local bytes
+  [[ -e "$RELEASED" || -L "$RELEASED" ]] || return 0
+  if [[ -L "$RELEASED" || ! -f "$RELEASED" ]]; then
+    echo "$RELEASED is not a regular file"
+    return 0
+  fi
+  bytes="$(release_bytes)"
+  if [[ "${bytes##*.}" != 0 ]]; then
+    echo "$RELEASED could not be read (head exit ${bytes##*.})"
+    return 0
+  fi
+  bytes="${bytes%.*}"
+  if [[ "$bytes" =~ ^([0-9A-F-]{36})\ held$'\n'$ ]]; then
+    echo "$RELEASED shows that a start (${BASH_REMATCH[1]}) claims the receipt and is not settled yet"
+  elif ! [[ "$bytes" =~ ^[0-9A-F-]{36}\ free$'\n'$ ]]; then
+    echo "$RELEASED does not hold a nonce and free or held, so whether a start claims the receipt is unknown"
+  fi
+}
+# Stops the install before a receipt that needs repair is changed, because
+# a start may still need it as it is.
+receipt_claimed_stop() { # why
+  "$CAT" >&2 <<FAIL
+
+Install stopped before changing $RECEIPT: $1.
+Its mode or access entry needs repair, and a receipt a start may still need
+is not changed. Open Insomnia from the folder of that start, or let its
+recovery agent run, so the start is settled; then rerun this script. If no
+Insomnia folder of yours has a start to settle, remove both files by hand
+(sudo rm -f $RECEIPT $RELEASED) once no Insomnia password dialog is open,
+then rerun.
+Installed so far: $SUDOERS. The app at $APP and the LaunchAgent were not touched;
+the new build was discarded.
+FAIL
+  exit 1
+}
 receipt_stop() { # problem
   cat >&2 <<FAIL
 
@@ -851,6 +903,47 @@ receipt_sudo() { # what command...
     receipt_sudo_failed "$what" "$rc"
   fi
 }
+# Opens the receipt read-only on fd 7 and locks it as the root command and
+# every reader lock it, then reads its line under that lock (receipt_line)
+# and its nonce (receipt_nonce). Stops the install when any of that fails.
+lock_and_read_receipt() {
+  local rc=0
+  { exec 7<"$RECEIPT"; } 2>/dev/null || receipt_stop "$RECEIPT could not be opened"
+  "$LOCKF" -s -t "$RECEIPT_LOCK_TIMEOUT_SECONDS" 7 2>/dev/null || rc=$?
+  if (( rc != 0 )); then
+    "$CAT" >&2 <<FAIL
+
+Install stopped: $RECEIPT stayed locked for ${RECEIPT_LOCK_TIMEOUT_SECONDS} s (lockf exit
+$rc): the command behind an Insomnia password dialog may be running, or
+another Insomnia folder of this user is settling a start. Rerun this script.
+Installed so far: $SUDOERS. The app at $APP and the LaunchAgent were not touched;
+the new build was discarded.
+FAIL
+    exit 1
+  fi
+  receipt_line="$("$HEAD" -c 83 <&7 2>/dev/null; echo ".$?")"
+  [[ "${receipt_line##*.}" == 0 ]] || receipt_stop "$RECEIPT could not be read under its lock (head exit ${receipt_line##*.})"
+  receipt_line="${receipt_line%.*}"
+  if ! [[ "$receipt_line" =~ ^([0-9A-F-]{36})\ [0-9A-F-]{36}\ (writing|refused)$'\n'$ ]]; then
+    receipt_stop "$RECEIPT does not hold two nonces and writing or refused"
+  fi
+  receipt_nonce="${BASH_REMATCH[1]}"
+}
+# Stops the install unless the receipt is still the file fd 7 locked,
+# passes the checks that do not depend on its mode or entry, and holds the
+# line read under the lock, read whole.
+receipt_still_locked() {
+  local problem now
+  if [[ "$("$STAT" -f '%d:%i' <&7 2>/dev/null)" != "$("$STAT" -f '%d:%i' "$RECEIPT" 2>/dev/null)" ]]; then
+    receipt_stop "$RECEIPT was replaced while it was locked"
+  fi
+  problem="$(receipt_base_problem)"
+  [[ -z "$problem" ]] || receipt_stop "$problem"
+  problem="$(folders_problem "$RECEIPTS")"
+  [[ -z "$problem" ]] || receipt_stop "$problem"
+  now="$("$HEAD" -c 83 "$RECEIPT" 2>/dev/null; echo ".$?")"
+  [[ "$now" == "$receipt_line.0" ]] || receipt_stop "$RECEIPT changed while it was locked, or could not be read again"
+}
 step "Creating the receipt $RECEIPT"
 # The account name the receipt's entry gives read access to. chmod +a
 # takes a name, which the directory maps to the account's UUID, and ls -le
@@ -877,7 +970,9 @@ if [[ ! -e "$RECEIPTS" && ! -L "$RECEIPTS" ]]; then
 fi
 problem="$(folders_problem "$RECEIPTS")"
 [[ -z "$problem" ]] || receipt_stop "$problem"
+receipt_made=0
 if [[ ! -e "$RECEIPT" && ! -L "$RECEIPT" ]]; then
+  receipt_made=1
   TMP_RECEIPT="$("$MKTEMP")"
   printf '00000000-0000-0000-0000-000000000000 00000000-0000-0000-0000-000000000000 refused\n' > "$TMP_RECEIPT"
   receipt_rc=0
@@ -892,24 +987,49 @@ if [[ ! -e "$RECEIPT" && ! -L "$RECEIPT" ]]; then
     receipt_sudo_failed "sudo install $RECEIPT" "$receipt_rc"
   fi
 fi
-# Then the mode and the entry. A receipt just made here is 0600 with no
-# entry. So is one an install stopped between `install` and `chmod +a`
-# left, and one an earlier build made is 0644 with no entry: either may
-# hold a line a start not settled yet still needs, so it is repaired in
-# place, keeping its line and its inode, by sudo chmod. The mode is set
-# first, so no account but root can open it until the entry is added. A
-# receipt that is not root's 82-byte file with one link that only root can
-# change, or that has any other entry, is left as it is and stops the
-# install below.
+# Then the entry and the mode. A receipt this run just made is 0600 with no
+# entry and gets the entry here. One that was here before may need the
+# same repair: an install stopped between `install` and `chmod +a` leaves
+# it 0600 with no entry, and builds of this branch before d933b68 made it
+# 0644 with no entry. Either may hold a line a start not settled yet still
+# needs, so it is repaired in place, keeping its line and its inode, by
+# sudo chmod, and only while its release file shows no claim
+# (release_claim_problem). A receipt a start may still need stops the
+# install unchanged. One this user can open (any mode but 600) is locked
+# first, as the root command and every reader lock it, the release file is
+# read under that lock, and the receipt must still be the locked file with
+# the same line before each chmod. One it cannot open (0600, no entry) is
+# refused by the app, the backstop and the root command until it has the
+# entry, so nothing can claim it or write it meanwhile; it gets the entry
+# first, and is locked and checked with the release file below. The entry
+# goes on before the mode, so this user can read the receipt throughout.
+# What this cannot help: a receipt repaired here is refused by the readers
+# of those earlier builds, which are still installed if this install stops
+# later. A receipt that is not root's 82-byte file with one link that only
+# root can change, or that has any other entry, is left as it is and stops
+# the install below.
 if [[ -z "$(receipt_base_problem)" ]]; then
   entries="$(receipt_entries)"
-  if [[ "$entries" == none || "$entries" == ours ]]; then
-    if [[ "$("$STAT" -f '%Lp' "$RECEIPT" 2>/dev/null)" != 600 ]]; then
-      receipt_sudo "sudo chmod 0600 $RECEIPT" "$CHMOD" 0600 "$RECEIPT"
+  mode="$("$STAT" -f '%Lp' "$RECEIPT" 2>/dev/null)" || mode=""
+  if [[ "$entries" == none ]] || [[ "$entries" == ours && "$mode" != 600 ]]; then
+    repair_locked=0
+    if (( ! receipt_made )); then
+      if [[ "$mode" != 600 ]]; then
+        lock_and_read_receipt
+        repair_locked=1
+      fi
+      problem="$(release_claim_problem)"
+      [[ -z "$problem" ]] || receipt_claimed_stop "$problem"
     fi
     if [[ "$entries" == none ]]; then
+      if (( repair_locked )); then receipt_still_locked; fi
       receipt_sudo "sudo chmod +a \"user:$USER_NAME allow read\" $RECEIPT" "$CHMOD" +a "user:$USER_NAME allow read" "$RECEIPT"
     fi
+    if [[ "$mode" != 600 ]]; then
+      if (( repair_locked )); then receipt_still_locked; fi
+      receipt_sudo "sudo chmod 0600 $RECEIPT" "$CHMOD" 0600 "$RECEIPT"
+    fi
+    if (( repair_locked )); then exec 7<&-; fi
   fi
 fi
 problem="$(receipt_problem)"
@@ -941,53 +1061,19 @@ echo "receipt $RECEIPT is root's, only root can change it or the folders above i
 # remove both files by hand (sudo rm -f $RECEIPT $RELEASED) once no
 # Insomnia password dialog is open, and run this script again. A release
 # file that is not a regular file stops the install, like the receipt.
-# Prints the release file's owner, mode, links, size and type, by lstat.
-release_meta() {
-  "$STAT" -f '%u %Lp %l %z %HT' "$RELEASED" 2>/dev/null || true
-}
-# Prints the release file's first 43 bytes, then a dot.
-release_bytes() {
-  "$HEAD" -c 43 "$RELEASED" 2>/dev/null
-  echo .
-}
 # Stops the install unless the receipt is the file fd 7 locked, still as
 # this script makes it, under folders as this script makes them, and holds
 # the line read under the lock.
 receipt_unchanged() {
-  local problem now
-  if [[ "$("$STAT" -f '%d:%i' <&7 2>/dev/null)" != "$("$STAT" -f '%d:%i' "$RECEIPT" 2>/dev/null)" ]]; then
-    receipt_stop "$RECEIPT was replaced while it was locked"
-  fi
+  local problem
+  receipt_still_locked
   problem="$(receipt_problem)"
   [[ -z "$problem" ]] || receipt_stop "$problem"
-  problem="$(folders_problem "$RECEIPTS")"
-  [[ -z "$problem" ]] || receipt_stop "$problem"
-  now="$("$HEAD" -c 83 "$RECEIPT" 2>/dev/null; echo .)"
-  [[ "$now" == "$receipt_line." ]] || receipt_stop "$RECEIPT changed while it was locked"
 }
 if [[ -L "$RELEASED" ]] || { [[ -e "$RELEASED" ]] && [[ ! -f "$RELEASED" ]]; }; then
   receipt_stop "$RELEASED is not a regular file"
 fi
-{ exec 7<"$RECEIPT"; } 2>/dev/null || receipt_stop "$RECEIPT could not be opened"
-receipt_lock_rc=0
-"$LOCKF" -s -t "$RECEIPT_LOCK_TIMEOUT_SECONDS" 7 2>/dev/null || receipt_lock_rc=$?
-if (( receipt_lock_rc != 0 )); then
-  "$CAT" >&2 <<FAIL
-
-Install stopped: $RECEIPT stayed locked for ${RECEIPT_LOCK_TIMEOUT_SECONDS} s (lockf exit
-$receipt_lock_rc): the command behind an Insomnia password dialog may be running, or
-another Insomnia folder of this user is settling a start. Rerun this script.
-Installed so far: $SUDOERS. The app at $APP and the LaunchAgent were not touched;
-the new build was discarded.
-FAIL
-  exit 1
-fi
-receipt_line="$("$HEAD" -c 83 <&7 2>/dev/null; echo .)"
-receipt_line="${receipt_line%.}"
-if ! [[ "$receipt_line" =~ ^([0-9A-F-]{36})\ [0-9A-F-]{36}\ (writing|refused)$'\n'$ ]]; then
-  receipt_stop "$RECEIPT does not hold two nonces and writing or refused"
-fi
-receipt_nonce="${BASH_REMATCH[1]}"
+lock_and_read_receipt
 receipt_unchanged
 if [[ -L "$RELEASED" ]] || { [[ -e "$RELEASED" ]] && [[ ! -f "$RELEASED" ]]; }; then
   receipt_stop "$RELEASED is not a regular file"
@@ -997,7 +1083,8 @@ release_line=""
 if [[ -f "$RELEASED" ]]; then
   release_was="$(release_meta)"
   release_line="$(release_bytes)"
-  release_line="${release_line%.}"
+  [[ "${release_line##*.}" == 0 ]] || receipt_stop "$RELEASED could not be read (head exit ${release_line##*.})"
+  release_line="${release_line%.*}"
 fi
 if [[ "$release_line" =~ ^([0-9A-F-]{36})\ held$'\n'$ ]]; then
   if [[ "$release_was" != "$UID_NUM 600 1 42 Regular File" ]]; then
@@ -1016,7 +1103,7 @@ else
     receipt_stop "$RELEASED is not a regular file"
   fi
   if [[ -n "$release_was" ]]; then
-    [[ "$(release_meta)" == "$release_was" && "$(release_bytes)" == "$release_line." ]] \
+    [[ "$(release_meta)" == "$release_was" && "$(release_bytes)" == "$release_line.0" ]] \
       || receipt_stop "$RELEASED changed while the receipt was locked"
   elif [[ -e "$RELEASED" || -L "$RELEASED" ]]; then
     receipt_stop "$RELEASED appeared while the receipt was locked"
@@ -1033,7 +1120,7 @@ else
     receipt_sudo_failed "sudo install $RELEASED" "$release_rc"
   fi
   if [[ "$(release_meta)" != "$UID_NUM 600 1 42 Regular File" ]] \
-     || [[ "$(release_bytes)" != "$receipt_nonce free"$'\n'. ]]; then
+     || [[ "$(release_bytes)" != "$receipt_nonce free"$'\n'.0 ]]; then
     receipt_stop "$RELEASED is not the file this script just wrote"
   fi
   echo "release file $RELEASED written: no start claims the receipt"
@@ -1330,8 +1417,8 @@ before="$(loaded_state)"
 
 # shellcheck disable=SC2016  # the $1/$2/$HOME/$r below are for the agent's shell, not this one
 AGENT_PROGRAM='r="$(/usr/bin/codesign --verify --strict "-R=$1" "$2" 2>&1)" && exec /bin/bash "$2/Contents/Resources/backstop.sh"; mkdir -p "$HOME/Library/Logs/Insomnia"; printf "%s [error] backstop agent: %s does not satisfy the pinned code requirement; backstop.sh not run. Reinstall Insomnia (scripts/install.sh). codesign: %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$2" "$(printf %s "$r" | tr "\n" " ")" >> "$HOME/Library/Logs/Insomnia/insomnia.log"; exit 1'
-xml_escape() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
-cat > "$CANDIDATE" <<PLIST
+xml_escape() { "$SED" -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+"$CAT" > "$CANDIDATE" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">

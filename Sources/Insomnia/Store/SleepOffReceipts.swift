@@ -124,11 +124,12 @@ struct SleepOffReceipts: Sendable {
     /// This user's receipt, trusting root alone.
     static var live: SleepOffReceipts { SleepOffReceipts(folder: folder, owners: [0], user: getuid()) }
 
-    init(folder: String, owners: Set<uid_t>, user: uid_t, standIn: [AccessEntry]? = nil) {
+    init(folder: String, owners: Set<uid_t>, user: uid_t, standIn: [AccessEntry]? = nil, folderStandIn: [String: [AccessEntry]] = [:]) {
         self.folder = folder
         self.owners = owners
         self.user = user
         self.standIn = standIn
+        self.folderStandIn = folderStandIn
     }
 
     /// An absolute path with no `.`, `..`, empty or symbolic link
@@ -144,6 +145,9 @@ struct SleepOffReceipts: Sendable {
     /// access control list, so they name entries here: the checks read
     /// them first in the receipt's list, before the entries it really has.
     let standIn: [AccessEntry]?
+    /// Empty in the app. The same for the folders the checks walk, by
+    /// path: entries read in front of the folder's real ones.
+    let folderStandIn: [String: [AccessEntry]]
 
     var file: String { folder + "/" + String(user) }
     /// `<uid>.released`, beside the receipt: the user's own file, 42 bytes,
@@ -473,9 +477,10 @@ struct SleepOffReceipts: Sendable {
         guard directory || info.st_mode & 0o7777 == 0o600 else {
             throw Problem(detail: "\(path) has mode \(String(info.st_mode & 0o7777, radix: 8)), not the 600 install.sh gives it")
         }
-        guard let real = Self.accessEntries(path) else {
+        guard let found = Self.accessEntries(path) else {
             throw Problem(detail: "the access control list of \(path) could not be read")
         }
+        let real = (directory ? folderStandIn[path] ?? [] : []) + found
         if directory {
             guard !real.contains(where: \.allows) else {
                 throw Problem(detail: "\(path) has an access control entry that allows changes")
@@ -513,10 +518,32 @@ struct SleepOffReceipts: Sendable {
             return errno == ENOENT ? [] : nil
         }
         defer { acl_free(UnsafeMutableRawPointer(acl)) }
+        return accessEntries(of: acl)
+    }
+
+    /// The acl(3) calls `accessEntries(of:)` makes to walk a list and read
+    /// each entry's flags, so a test can make either fail on a list it
+    /// builds in memory, without changing a real one.
+    struct ListCalls {
+        var entry: (acl_t?, Int32, UnsafeMutablePointer<acl_entry_t?>) -> Int32 = { acl_get_entry($0, $1, $2) }
+        var flag: (acl_flagset_t?, acl_flag_t) -> Int32 = { acl_get_flag_np($0, $1) }
+    }
+
+    /// `acl`'s entries, in order; nil when any of them cannot be read
+    /// whole. acl_get_entry(3) ends the list with -1 and EINVAL; any other
+    /// failure, or an answer it does not document, is not taken for the end
+    /// of the list, and a flag acl_get_flag_np(3) cannot read is not taken
+    /// for one that is clear: either could hide an entry or a flag that
+    /// makes the list one the checks refuse.
+    static func accessEntries(of acl: acl_t?, calls: ListCalls = ListCalls()) -> [AccessEntry]? {
         var entries: [AccessEntry] = []
         var entry: acl_entry_t?
         var which = ACL_FIRST_ENTRY.rawValue
-        while acl_get_entry(acl, which, &entry) == 0 {
+        while true {
+            errno = 0
+            let got = calls.entry(acl, which, &entry)
+            if got == -1 && errno == EINVAL { break }
+            guard got == 0 else { return nil }
             which = ACL_NEXT_ENTRY.rawValue
             var tag = ACL_UNDEFINED_TAG
             var rights: acl_permset_mask_t = 0
@@ -525,6 +552,14 @@ struct SleepOffReceipts: Sendable {
                   acl_get_flagset_np(UnsafeMutableRawPointer(entry), &flags) == 0,
                   let qualifier = acl_get_qualifier(entry) else { return nil }
             defer { acl_free(qualifier) }
+            var set: Set<String> = []
+            for (flag, word) in AccessEntry.flagWords {
+                switch calls.flag(flags, flag) {
+                case 1: set.insert(word)
+                case 0: break
+                default: return nil
+                }
+            }
             var id: id_t = 0
             var type: Int32 = -1
             let principal: AccessEntry.Principal
@@ -539,7 +574,7 @@ struct SleepOffReceipts: Sendable {
                 allows: tag == ACL_EXTENDED_ALLOW,
                 principal: principal,
                 rights: AccessEntry.words(rights),
-                flags: Set(AccessEntry.flagWords.filter { acl_get_flag_np(flags, $0.flag) == 1 }.map(\.word))
+                flags: set
             ))
         }
         return entries

@@ -34,6 +34,27 @@ enum SessionMath {
         return s
     }
 
+    /// The times session.json can hold, in seconds since 1970: the dates
+    /// `Store.parseDate` reads, from 1970-01-01T00:00:00+23:59 to
+    /// 9999-12-31T23:59:59-23:59.
+    static let storableTimes: ClosedRange<TimeInterval> = -86_340 ... 253_402_387_139
+
+    /// The session's first end, before any extension: `endsAt` less every
+    /// extension, in seconds since 1970. Nil when an extension or their
+    /// running total is not finite, or the first end is outside
+    /// `storableTimes`. A decoder takes any finite number for an
+    /// extension (1e20, or two of 1e308, whose sum is infinite), and no
+    /// session this app wrote has such a history.
+    static func firstEnd(of s: Session) -> TimeInterval? {
+        var total: TimeInterval = 0
+        for extra in s.extensions {
+            total += extra
+            guard extra.isFinite, total.isFinite else { return nil }
+        }
+        let first = s.endsAt.timeIntervalSince1970 - total
+        return storableTimes.contains(first) ? first : nil
+    }
+
     /// Seconds from `now` to `endsAt`, floored at zero.
     static func remaining(until endsAt: Date, at now: Date) -> TimeInterval {
         max(endsAt.timeIntervalSince(now), 0)

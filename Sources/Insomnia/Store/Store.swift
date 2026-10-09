@@ -146,13 +146,21 @@ struct Store: Sendable {
     // MARK: Typed helpers
 
     /// Throws StoreError.unreadable, with a one-line reason, when the file
-    /// does not decode.
+    /// does not decode, or when its extensions do not add up to a first
+    /// end it could hold (`SessionMath.firstEnd`): reconcile then moves it
+    /// aside as it moves any file that is not a session, before anything
+    /// does arithmetic with it.
     func loadSession() throws -> Session? {
+        let s: Session?
         do {
-            return try read(Session.self, from: paths.sessionFile)
+            s = try read(Session.self, from: paths.sessionFile)
         } catch let error as DecodingError {
             throw StoreError.unreadable(file: paths.sessionFile.path, detail: Self.brief(error))
         }
+        if let s, SessionMath.firstEnd(of: s) == nil {
+            throw StoreError.unreadable(file: paths.sessionFile.path, detail: "its extensions do not add up to a first end between 1970 and 9999")
+        }
+        return s
     }
     func saveSession(_ s: Session) throws { try write(s, to: paths.sessionFile) }
     func deleteSession() throws { try remove(at: paths.sessionFile) }

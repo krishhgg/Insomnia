@@ -40,6 +40,37 @@ final class SessionMathTests: XCTestCase {
         XCTAssertEqual(e.endsAt, now.addingTimeInterval(600))
     }
 
+    /// The times session.json can hold are the dates Store.parseDate
+    /// reads, to the second at both ends.
+    func testStorableTimesAreTheDatesTheStoreReads() throws {
+        let earliest = try XCTUnwrap(Store.parseDate("1970-01-01T00:00:00+23:59"))
+        let latest = try XCTUnwrap(Store.parseDate("9999-12-31T23:59:59-23:59"))
+        XCTAssertEqual(SessionMath.storableTimes, earliest.timeIntervalSince1970 ... latest.timeIntervalSince1970)
+        XCTAssertNil(Store.parseDate("1969-12-31T23:59:59Z"))
+        XCTAssertNil(Store.parseDate("1970-01-01T00:00:00+24:00"))
+        XCTAssertNil(Store.parseDate("9999-12-31T23:59:59-24:00"))
+    }
+
+    /// The first end is the end less every extension. A history no
+    /// session can have gives none: an extension or a running total that
+    /// is not finite, or a first end outside the storable times.
+    func testFirstEndIsTheEndLessEveryExtension() {
+        let end = t0.addingTimeInterval(3600)
+        func first(_ extensions: [TimeInterval]) -> TimeInterval? {
+            SessionMath.firstEnd(of: Session(startedAt: t0, endsAt: end, extensions: extensions))
+        }
+        XCTAssertEqual(first([]), end.timeIntervalSince1970)
+        XCTAssertEqual(try XCTUnwrap(first([840.6, 1.6])), end.timeIntervalSince1970 - 842.2, accuracy: 0.0001)
+        XCTAssertEqual(first([-600]), end.timeIntervalSince1970 + 600, "an extension cut below its end, as a lowered maximum makes it")
+        XCTAssertNil(first([1e20]))
+        XCTAssertNil(first([-1e20]))
+        XCTAssertNil(first([1e308, 1e308]))
+        XCTAssertNil(first([.nan]))
+        XCTAssertNil(first([.infinity, -.infinity]))
+        XCTAssertNil(first([end.timeIntervalSince1970 + 86_341]))
+        XCTAssertEqual(first([end.timeIntervalSince1970 + 86_340]), -86_340)
+    }
+
     func testRemainingNeverNegative() {
         XCTAssertEqual(SessionMath.remaining(until: t0, at: t0.addingTimeInterval(10)), 0)
         XCTAssertEqual(SessionMath.remaining(until: t0.addingTimeInterval(90), at: t0), 90)

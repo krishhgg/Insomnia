@@ -926,7 +926,8 @@ final class RootCommandTests: XCTestCase {
     /// starts with an earlier start's `writing`, which this start claimed it
     /// from. After a failed `writing` the command writes `refused` for its
     /// nonce, so a settlement finds that it never turned sleep off; when
-    /// that fails too the receipt holds whatever the failed writes left.
+    /// that fails in each of its three tries, the message says so and the
+    /// receipt holds whatever the failed writes left.
     /// Nothing here claims the write is atomic: a short write leaves a
     /// mixed line, here this nonce in front of the earlier `writing`, which
     /// a settlement reads as a start that may have turned sleep off.
@@ -947,7 +948,13 @@ final class RootCommandTests: XCTestCase {
                     XCTAssertTrue(r.stderr.contains(says), "\(label): \(r.stderr)")
                     XCTAssertFalse(r.stderr.contains("fake perl"), "\(label): the fault changed the program: \(r.stderr)")
                     XCTAssertTrue(OsascriptAdministratorPrompt.refusalStatuses.contains(r.status), label)
-                    XCTAssertEqual(r.perlCalls, fault == .perlMissing ? [] : ["\(nonce1) \(nonce2) writing", "\(nonce1) \(nonce2) refused"], label)
+                    // perl missing fails every write, so every try of the
+                    // refused line, like a fault on every write.
+                    let refusedFails = fault == .perlMissing || every
+                    let tries = refusedFails ? 3 : 1
+                    XCTAssertEqual(r.perlCalls, fault == .perlMissing ? [] : ["\(nonce1) \(nonce2) writing"] + Array(repeating: "\(nonce1) \(nonce2) refused", count: tries), label)
+                    XCTAssertEqual(r.sleepCalls, Array(repeating: "1", count: tries - 1), label)
+                    XCTAssertEqual(r.stderr.contains("its refused line could not be written either (attempts: 3), so a recovery that never gets this exit status may undo the start like an end"), refusedFails, "\(label): \(r.stderr)")
                     switch (fault, every) {
                     case (.perlMissing, _), (.openFails, true):
                         XCTAssertEqual(receipt, earlier, "\(label): nothing was written")
@@ -979,21 +986,21 @@ final class RootCommandTests: XCTestCase {
     /// other than root (here, the test user standing in for root) could
     /// change, or whose folders above could, stops the command before the
     /// marker is read and before sudo is asked anything, with nothing
-    /// written anywhere.
+    /// written anywhere. Round 30 F6: the allow entries are stand-ins the
+    /// command's ls shows (RootCommandProcess.withTestReceipts), where they
+    /// were real ones before; no real list changes.
     func testAMissingOrUnsafeReceiptStopsBeforeAnyQuestion() throws {
         let file = URL(fileURLWithPath: receipts.file)
         let folder = URL(fileURLWithPath: receipts.folder)
         let above = folder.deletingLastPathComponent().path
         let user = String(cString: getpwuid(getuid()).pointee.pw_name)
-        func acl(_ path: String, _ spec: String?) {
-            let p = Process()
-            p.executableURL = URL(fileURLWithPath: "/bin/chmod")
-            p.arguments = spec.map { ["+a", $0, path] } ?? ["-N", path]
-            let exit = ProcessExit(p)
-            XCTAssertNoThrow(try p.run())
-            exit.wait()
-            XCTAssertEqual(p.terminationStatus, 0, path)
+        let mine = AccessEntry.installed(for: getuid())
+        let write = AccessEntry(allows: true, principal: .user(getuid()), rights: ["write"], flags: [])
+        let folders = receipts.folder + ".acl"
+        func folderEntry(_ path: String, _ line: String) {
+            XCTAssertNoThrow(try TestReceipts.writeFolderEntries([path: [line]], besides: folders))
         }
+        func noFolderEntry() { XCTAssertEqual(unlink(folders + ".folders"), 0) }
         // A receipt written again (after "missing", say) gets the mode
         // install.sh gives it.
         func put(_ text: String) throws {
@@ -1025,10 +1032,11 @@ final class RootCommandTests: XCTestCase {
                 try FileManager.default.removeItem(at: file)
                 try put(initial)
             }),
-            ("an allow entry on the receipt", { acl(file.path, "user:\(user) allow write") }, { acl(file.path, nil) }),
+            ("an allow entry on the receipt", { self.receipts = TestReceipts.with(self.receipts, standIn: [mine, write]) },
+             { self.receipts = TestReceipts.with(self.receipts, standIn: [mine]) }),
             ("a group-writable folder", { XCTAssertEqual(chmod(folder.path, 0o775), 0) }, { XCTAssertEqual(chmod(folder.path, 0o755), 0) }),
-            ("an allow entry on the folder", { acl(folder.path, "user:\(user) allow add_file") }, { acl(folder.path, nil) }),
-            ("an allow entry on the folder above", { acl(above, "user:\(user) allow add_subdirectory") }, { acl(above, nil) }),
+            ("an allow entry on the folder", { folderEntry(folder.path, "user:\(user) allow add_file") }, noFolderEntry),
+            ("an allow entry on the folder above", { folderEntry(above, "user:\(user) allow add_subdirectory") }, noFolderEntry),
             ("a folder above writable by others", { XCTAssertEqual(chmod(above, 0o757), 0) }, { XCTAssertEqual(chmod(above, 0o755), 0) }),
         ]
         for c in cases {
@@ -1641,7 +1649,8 @@ final class RootCommandTests: XCTestCase {
     }
 
     /// The limit this leaves: when the `refused` over the record cannot be
-    /// written either, the receipt keeps the record's `writing`. The
+    /// written in any of its three tries, the receipt keeps the record's
+    /// `writing`. The
     /// status (6) still says nothing was written, and the app that reads
     /// it rolls the start back with no undo; a settlement that never sees
     /// that status (the app died) reads `writing` and undoes the start,
@@ -1654,8 +1663,75 @@ final class RootCommandTests: XCTestCase {
             XCTAssertEqual(r.status, 6, "\(name): \(r.stderr)")
             XCTAssertEqual(r.pmsetCalls, ["-g", "-g"], name)
             XCTAssertEqual(r.sleepDisabled, "1", name)
-            XCTAssertEqual(r.perlCalls, ["\(nonce1) \(SleepOffReceipts.zero) writing", "\(nonce1) \(SleepOffReceipts.zero) refused"], name)
+            XCTAssertEqual(r.perlCalls, ["\(nonce1) \(SleepOffReceipts.zero) writing"] + Array(repeating: "\(nonce1) \(SleepOffReceipts.zero) refused", count: 3), name)
+            XCTAssertEqual(r.sleepCalls, ["1", "1"], name)
             XCTAssertEqual(receipt, line(nonce1, "writing"), name)
+            XCTAssertTrue(r.stderr.contains("it was left alone and sleep was not turned off; its refused line could not be written either (attempts: 3), so a recovery that never gets this exit status may undo the start like an end"), "\(name): \(r.stderr)")
+        }
+    }
+
+    /// Round 30 F1. The three branches that write `refused` and exit
+    /// without the sleep write (a `writing` that failed, the second read's
+    /// 1, and a deadline passed during that read) retry a `refused` that
+    /// failed, through both copies of the command: a write that fails once
+    /// or twice is on record after the next try, with one pause per retry,
+    /// the branch's own status and no message about the refused line. No
+    /// try runs pmset again.
+    func testARefusedLineThatFailsOnlyAtFirstIsWrittenOnALaterTry() throws {
+        let clock = RootCommandClock(start: fakeDeadline - 100, later: fakeDeadline, at: "perl writing")
+        for (name, command) in try bothCommands() {
+            for faults in [1, 2] {
+                for branch in ["writing failed", "second read", "deadline"] {
+                    let label = "\(name), \(branch), \(faults) failed tries"
+                    try Data(nonce1.utf8).write(to: marker)
+                    resetReceipt()
+                    let r: RootCommandRun
+                    let status: Int32
+                    let pmset: [String]
+                    switch branch {
+                    case "writing failed":
+                        r = try runRootCommand(marker: marker, nonce: nonce1, command: command, receipts: receipts, receiptWriteFault: .fullSyncFails, everyReceiptWriteFails: true, refusedWriteFaults: faults, in: dir)
+                        status = 7; pmset = ["-g"]
+                    case "second read":
+                        r = try runRootCommand(marker: marker, nonce: nonce1, command: command, foreignAfter: "perl writing", receipts: receipts, receiptWriteFault: .openFails, refusedReceiptWriteFails: true, refusedWriteFaults: faults, in: dir)
+                        status = 6; pmset = ["-g", "-g"]
+                    default:
+                        r = try runRootCommand(marker: marker, nonce: nonce1, expires: String(fakeDeadline), command: command, clock: clock, receipts: receipts, receiptWriteFault: .closeFails, refusedReceiptWriteFails: true, refusedWriteFaults: faults, in: dir)
+                        status = 4; pmset = ["-g", "-g"]
+                    }
+                    XCTAssertEqual(r.status, status, "\(label): \(r.stderr)")
+                    XCTAssertEqual(r.pmsetCalls, pmset, "\(label): pmset never writes")
+                    XCTAssertEqual(r.perlCalls, ["\(nonce1) \(SleepOffReceipts.zero) writing"] + Array(repeating: "\(nonce1) \(SleepOffReceipts.zero) refused", count: faults + 1), label)
+                    XCTAssertEqual(r.sleepCalls, Array(repeating: "1", count: faults), label)
+                    XCTAssertEqual(receipt, line(nonce1, "refused"), "\(label): the refusal is on record")
+                    XCTAssertFalse(r.stderr.contains("could not be written either"), "\(label): \(r.stderr)")
+                }
+            }
+        }
+    }
+
+    /// The tries of the `refused` line stop at three, and a try starts only
+    /// while the clock reads less than 3 s after the first failure. Pauses
+    /// that move the fake clock 2 s each allow a second try and stop before
+    /// a third; 3 s allows none after the first; a clock that reads 0
+    /// (taken as unreadable) allows no retry and no pause. Every case keeps
+    /// the branch's status, says the refused line could not be written, and
+    /// runs no pmset write.
+    func testTheRefusedLineIsTriedAtMostThreeTimesWithinThreeSeconds() throws {
+        for (name, command) in try bothCommands() {
+            for (advance, later, tries, pauses) in [(0, fakeDeadline - 50, 3, 2), (2, fakeDeadline - 50, 2, 2), (3, fakeDeadline - 50, 1, 1), (0, 0, 1, 0)] {
+                let label = "\(name), pauses move the clock \(advance) s, clock \(later)"
+                try Data(nonce1.utf8).write(to: marker)
+                resetReceipt()
+                let clock = RootCommandClock(start: fakeDeadline - 100, later: later, at: "perl writing")
+                let r = try runRootCommand(marker: marker, nonce: nonce1, expires: String(fakeDeadline), command: command, clock: clock, foreignAfter: "perl writing", receipts: receipts, receiptWriteFault: .openFails, refusedReceiptWriteFails: true, sleepAdvancesClock: advance, in: dir)
+                XCTAssertEqual(r.status, 6, "\(label): \(r.stderr)")
+                XCTAssertEqual(r.pmsetCalls, ["-g", "-g"], label)
+                XCTAssertEqual(r.perlCalls, ["\(nonce1) \(SleepOffReceipts.zero) writing"] + Array(repeating: "\(nonce1) \(SleepOffReceipts.zero) refused", count: tries), label)
+                XCTAssertEqual(r.sleepCalls.count, pauses, label)
+                XCTAssertEqual(receipt, line(nonce1, "writing"), "\(label): the record is left as it was")
+                XCTAssertTrue(r.stderr.contains("its refused line could not be written either (attempts: \(tries))"), "\(label): \(r.stderr)")
+            }
         }
     }
 
