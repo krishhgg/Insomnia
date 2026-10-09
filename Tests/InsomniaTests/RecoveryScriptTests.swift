@@ -6527,7 +6527,11 @@ final class RecoveryScriptTests: XCTestCase {
     /// control lists and the rule, and the function that builds root's
     /// text, are one text in both scripts, so neither can trust a lock or
     /// rule the other refuses, and ROOT_UID (patched only by the tests) is
-    /// root's. Both list access control lists with /bin/ls.
+    /// root's. Both list access control lists with /bin/ls and ask
+    /// /usr/bin/dsmemberutil whose an entry is. In that text each of stat,
+    /// ls, cat and dsmemberutil is called from one place only (r_stat,
+    /// r_acl, r_read, r_root), where its answer is checked, so no call of
+    /// them goes around the checks.
     func testInstallAndUninstallTakeTheSameRootOnlySudoersLock() throws {
         var helpers: [String: [String]] = [:]
         for name in ["install.sh", "uninstall.sh"] {
@@ -6538,11 +6542,23 @@ final class RecoveryScriptTests: XCTestCase {
             XCTAssertEqual(lines.filter { $0.hasPrefix("ROOT_UID=") }, ["ROOT_UID=0"], name)
             XCTAssertEqual(lines.filter { $0 == "  umask 077" }.count, 1, name)
             XCTAssertEqual(lines.filter { $0.hasPrefix("LS=") }, ["LS=/bin/ls"], name)
-            for function in ["sudoers_file_problem", "sudoers_acl_check", "sudoers_dirs_check", "sudoers_guard_take",
-                             "sudoers_read_rule", "sudoers_pin_rule", "sudoers_recheck", "root_functions"] {
+            XCTAssertEqual(lines.filter { $0.hasPrefix("DSMEMBERUTIL=") }, ["DSMEMBERUTIL=/usr/bin/dsmemberutil"], name)
+            for function in ["r_die", "r_stat", "r_file", "r_root", "r_acl", "r_dirs", "r_guard",
+                             "r_read", "r_pin", "r_recheck", "root_functions"] {
                 let start = try XCTUnwrap(lines.firstIndex { $0.hasPrefix("\(function)() {") }, "\(name): \(function)")
                 let end = try XCTUnwrap(lines[start...].firstIndex(of: "}"), "\(name): \(function)")
                 helpers[name, default: []] += lines[start...end]
+            }
+            var rootText = helpers[name, default: []].joined(separator: "\n")
+            for function in name == "install.sh" ? ["sudoers_for_others", "sudoers_rule_text", "r_replace"] : ["sudoers_not_ours", "r_remove"] {
+                rootText += "\n" + (try Self.shellFunction(function, in: text, name))
+            }
+            for (tool, home) in [("\"$STAT\"", "r_stat"), ("\"$LS\"", "r_acl"), ("\"$CAT\"", "r_read"), ("\"$DSMEMBERUTIL\"", "r_root")] {
+                let start = try XCTUnwrap(lines.firstIndex { $0.hasPrefix("\(home)() {") }, "\(name): \(home)")
+                let end = try XCTUnwrap(lines[start...].firstIndex(of: "}"), "\(name): \(home)")
+                let inHome = lines[start...end].joined(separator: "\n").components(separatedBy: tool).count - 1
+                XCTAssertGreaterThan(inHome, 0, "\(name): \(tool) in \(home)")
+                XCTAssertEqual(rootText.components(separatedBy: tool).count - 1, inHome, "\(name): \(tool) is called outside \(home)")
             }
             // Nothing in either script removes, replaces or repairs the lock.
             let touchesLock = lines.filter { line in
@@ -7937,22 +7953,33 @@ final class RecoveryScriptTests: XCTestCase {
     }
 
     /// A list root cannot read in full counts as one that allows a change,
-    /// through the fake ls: ls fails on the rule (4, both scripts), marks
-    /// the lock "+" and prints no entry (7), or prints a line after the
-    /// rule's folder that is neither a file nor an entry (7).
+    /// through the fake ls: ls fails on the rule (4, both scripts), prints
+    /// all of its answer and then fails (4), marks the lock "+" and prints
+    /// no entry (7), prints a line after the rule's folder that is neither a
+    /// file nor an entry (7), numbers the lock's one entry ("everyone deny
+    /// delete", which alone would pass) 1 instead of 0, as when it skips an
+    /// entry it cannot read (7), or names a principal on the rule's folder
+    /// ("user:root") where the UUID was (7).
     func testRootStopsWhenAnAccessControlListCannotBeReadInFull() throws {
-        let cases: [(file: String, target: (ScriptFixture) -> String, status: Int, install: Bool)] = [
-            ("ls.fail", { $0.sudoers.path }, 4, true),
-            ("ls.plus", { $0.sudoersLock.path }, 7, false),
-            ("ls.extra", { $0.sudoersLock.deletingLastPathComponent().path }, 7, false),
+        let cases: [(file: String, target: (ScriptFixture) -> String, status: Int, install: Bool, entry: Bool)] = [
+            ("ls.fail", { $0.sudoers.path }, 4, true, false),
+            ("ls.fail-after", { $0.sudoers.path }, 4, false, false),
+            ("ls.plus", { $0.sudoersLock.path }, 7, false, false),
+            ("ls.extra", { $0.sudoersLock.deletingLastPathComponent().path }, 7, false, false),
+            ("ls.gap", { $0.sudoersLock.path }, 7, false, true),
+            ("ls.named", { $0.sudoersLock.deletingLastPathComponent().path }, 7, false, true),
         ]
         for c in cases {
             for install in c.install ? [true, false] : [false] {
                 let label = "\(c.file), \(install ? "install" : "uninstall")"
                 let f = try ruleFixture(install: install, fakes: ["ls"])
-                defer { f.destroy() }
-                try f.prepareSudoersLock()
                 let target = c.target(f)
+                defer {
+                    TestACL.clear(URL(fileURLWithPath: target))
+                    f.destroy()
+                }
+                try f.prepareSudoersLock()
+                if c.entry { try TestACL.add("everyone deny delete", to: URL(fileURLWithPath: target)) }
                 try (target + "\n").write(to: f.root.appendingPathComponent(c.file), atomically: true, encoding: .utf8)
 
                 let r = try runRuleScript(f, install: install)
@@ -7960,8 +7987,12 @@ final class RecoveryScriptTests: XCTestCase {
                 XCTAssertEqual(r.status, 1, "\(label): " + r.stderr + r.stdout)
                 let why = c.file == "ls.fail"
                     ? "the access control lists of \(target) could not be read (ls exited 1: ls: \(target): Permission denied)"
+                    : c.file == "ls.fail-after"
+                    ? "the access control lists of \(target) could not be read (ls exited 1: "
                     : "could not be read in full (ls: "
                 XCTAssertTrue(r.stderr.contains(why), "\(label): " + r.stderr)
+                if c.file == "ls.gap" { XCTAssertTrue(r.stderr.contains(" 1: ABCDEFAB-CDEF-ABCD-EFAB-CDEF0000000C deny delete"), "\(label): " + r.stderr) }
+                if c.file == "ls.named" { XCTAssertTrue(r.stderr.contains(" 0: user:root deny delete"), "\(label): " + r.stderr) }
                 if c.file == "ls.extra" { XCTAssertTrue(r.stderr.contains("unexpected line"), "\(label): " + r.stderr) }
                 XCTAssertTrue(r.stderr.contains(ruleRefusal(f, install: install, status: c.status)), "\(label): " + r.stderr)
                 XCTAssertEqual(try String(contentsOf: f.sudoers, encoding: .utf8), f.sudoersRule, label)
@@ -8073,13 +8104,295 @@ final class RecoveryScriptTests: XCTestCase {
         }
     }
 
+    // MARK: - Root checks every stat answer, and whose entry a list has
+
+    /// Root's text from the last transaction the fake sudo ran for this
+    /// script, run again on its own the way sudo runs it: /bin/bash -c
+    /// <text> <name> <arguments>, with the arguments the script passes
+    /// (install.sh: "same" and the text it judged, or "absent"; uninstall.sh:
+    /// the text).
+    private func runRootText(_ f: ScriptFixture, install: Bool, rule: Bool = true) throws -> (status: Int32, output: String) {
+        let name = install ? "insomnia-sudoers-replace" : "insomnia-sudoers-remove"
+        let text = try String(contentsOf: f.root.appendingPathComponent("root.payload.\(name)"), encoding: .utf8)
+        var judged = Substring(f.sudoersRule)
+        while judged.hasSuffix("\n") { judged = judged.dropLast() }
+        let arguments = install ? [rule ? "same" : "absent", f.sudoers.path, rule ? String(judged) : ""] : [f.sudoers.path, String(judged)]
+        return try f.runTool("/bin/bash", ["-c", text, name] + arguments)
+    }
+
+    /// The calls root's text made to the fake stat, from its log: each
+    /// one's number there and what follows the format r_stat passes (a
+    /// name, "-L" and a name, or nothing for a descriptor). Calls with
+    /// another format, the scripts' own, are left out.
+    private func rootStatCalls(_ f: ScriptFixture) -> [(n: Int, what: String)] {
+        let format = "-f %d:%i %Hp %Mp %Lp %u %l %z %.9Fc"
+        let text = (try? String(contentsOf: f.root.appendingPathComponent("stat.calls"), encoding: .utf8)) ?? ""
+        return text.split(separator: "\n").compactMap { line in
+            let parts = line.split(separator: " ", maxSplits: 1)
+            guard parts.count == 2, let n = Int(parts[0]), parts[1].hasPrefix(format) else { return nil }
+            var what = parts[1].dropFirst(format.count)
+            if what.hasPrefix(" ") { what = what.dropFirst() }
+            return (n, String(what))
+        }
+    }
+
+    /// The status root stops with when each of `calls` gets a wrong answer:
+    /// 4 for the rule before it is read, 7 for the folders, the lock and the
+    /// rule's folder. Of the stats of a descriptor, the first is the lock's
+    /// (7), then each read of the rule has one before cat (4) and one after
+    /// it (8).
+    private func rootStatStatuses(_ calls: [(n: Int, what: String)], rule: String) -> [Int] {
+        var descriptors = 0
+        return calls.map { call in
+            guard call.what.isEmpty else { return call.what == rule ? 4 : 7 }
+            descriptors += 1
+            return descriptors == 1 ? 7 : (descriptors % 2 == 0 ? 4 : 8)
+        }
+    }
+
+    /// Root trusts no stat answer it has not checked in full (r_stat): one
+    /// line of the eight fields asked for, from a stat that exits 0. With
+    /// every answer right (the matched control, through the script and
+    /// then through root's text alone) the transaction completes. Then the
+    /// fake stat answers one call at a time with the right answer followed
+    /// by exit 1: every call root's text makes but the folders between the
+    /// first and the last of each walk up to / (the same line of r_dirs as
+    /// those two). Each stops root at that call, before any later stat,
+    /// with the status of the check it was for (rootStatStatuses), saying
+    /// which stat failed, and before anything changes: the rule keeps its
+    /// bytes and inode (or stays absent), nothing is staged beside it, and
+    /// with no lock there before, a failure in the first walk up to / stops
+    /// root before it makes the lock. install.sh's text runs for a rule
+    /// that is there and for none (with no lock either); uninstall.sh's
+    /// for its removal. The other wrong answers (one field short, a second
+    /// line, nothing, no newline at the end, other words) stop it the same
+    /// way at the first folder and at the stat after the first read.
+    func testRootStopsAtAnyStatAnswerItCannotCheckInFull() throws {
+        let variants: [(name: String, install: Bool, rule: Bool)] = [
+            ("install, rule there", true, true),
+            ("install, no rule and no lock", true, false),
+            ("uninstall", false, true),
+        ]
+        for v in variants {
+            let f = try ruleFixture(install: v.install, fakes: ["stat"])
+            defer { f.destroy() }
+            let folder = f.sudoers.deletingLastPathComponent()
+            let answer = f.root.appendingPathComponent("stat.answer")
+            // The state each run starts from, checked: the rule and the lock,
+            // or neither, and nothing else in their folder; no stat log.
+            func reset() throws -> UInt64? {
+                for name in ["stat.calls", "stat.count", "stat.answer"] { try? FileManager.default.removeItem(at: f.root.appendingPathComponent(name)) }
+                if v.rule {
+                    try f.sudoersRule.write(to: f.sudoers, atomically: true, encoding: .utf8)
+                    try f.prepareSudoersLock()
+                } else {
+                    try? FileManager.default.removeItem(at: f.sudoers)
+                    try? FileManager.default.removeItem(at: f.sudoersLock)
+                }
+                XCTAssertEqual(try f.contents(of: folder), v.rule ? f.sudoersFolderAfterTransaction : [], v.name)
+                return v.rule ? try f.inode(f.sudoers) : nil
+            }
+            _ = try reset()
+            let whole = try runRuleScript(f, install: v.install)
+            XCTAssertEqual(whole.status, 0, "\(v.name): " + whole.stderr + whole.stdout)
+            XCTAssertEqual(f.exists(f.sudoers), v.install, v.name)
+
+            _ = try reset()
+            let control = try runRootText(f, install: v.install, rule: v.rule)
+            XCTAssertEqual(control.status, 0, "\(v.name): " + control.output)
+            XCTAssertEqual(f.exists(f.sudoers), v.install, v.name)
+            let calls = rootStatCalls(f)
+            XCTAssertEqual(calls.map(\.n), Array(1...max(calls.count, 1)), "\(v.name): every stat is root's, in r_stat's form")
+            XCTAssertEqual(calls.filter { $0.what.isEmpty }.count, v.rule ? 5 : 1, "\(v.name): \(calls)")
+            let statuses = rootStatStatuses(calls, rule: f.sudoers.path)
+            let isFolder = { (what: String) in what == "/" || f.sudoersLock.path.hasPrefix(what + "/") }
+            // The first and last call of each run of folders, and every other call.
+            var rows: [Int] = []
+            var i = 0
+            while i < calls.count {
+                var j = i
+                while isFolder(calls[i].what) && j + 1 < calls.count && isFolder(calls[j + 1].what) { j += 1 }
+                rows += j == i ? [i] : [i, j]
+                i = j + 1
+            }
+            let firstWalkEnd = calls.firstIndex { !isFolder($0.what) } ?? 0
+            XCTAssertGreaterThan(rows.count, v.rule ? 15 : 8, "\(v.name): \(calls)")
+            for i in rows {
+                let call = calls[i]
+                let label = "\(v.name), stat \(call.n) of \(calls.count) (\(call.what.isEmpty ? "a descriptor" : call.what))"
+                let inode = try reset()
+                try "\(call.n)|fail-after".write(to: answer, atomically: true, encoding: .utf8)
+
+                let r = try runRootText(f, install: v.install, rule: v.rule)
+
+                XCTAssertEqual(Int(r.status), statuses[i], "\(label): " + r.output)
+                XCTAssertTrue(r.output.contains("stat \(call.what.isEmpty ? "of a descriptor" : call.what) exited 1, or its answer is not the one line asked for: "), "\(label): " + r.output)
+                XCTAssertEqual(try String(contentsOf: f.root.appendingPathComponent("stat.count"), encoding: .utf8), "\(call.n)\n", "\(label): no stat after it")
+                if let inode {
+                    XCTAssertEqual(try String(contentsOf: f.sudoers, encoding: .utf8), f.sudoersRule, label)
+                    XCTAssertEqual(try f.inode(f.sudoers), inode, label)
+                } else {
+                    XCTAssertFalse(f.exists(f.sudoers), label)
+                }
+                let lockThere = v.rule || i >= firstWalkEnd
+                XCTAssertEqual(try f.contents(of: folder), ((lockThere ? [f.sudoersLock.lastPathComponent] : []) + (v.rule ? [f.sudoers.lastPathComponent] : [])).sorted(), "\(label): nothing made or staged")
+            }
+            guard v.install && v.rule else { continue }
+            let afterRead = try XCTUnwrap(statuses.firstIndex(of: 8))
+            for how in ["partial", "extra", "empty", "no-newline", "garbage"] {
+                for i in [0, afterRead] {
+                    let label = "\(how) at stat \(calls[i].n)"
+                    let inode = try reset()
+                    try "\(calls[i].n)|\(how)".write(to: answer, atomically: true, encoding: .utf8)
+
+                    let r = try runRootText(f, install: true)
+
+                    XCTAssertEqual(Int(r.status), statuses[i], "\(label): " + r.output)
+                    XCTAssertTrue(r.output.contains("exited 0, or its answer is not the one line asked for: "), "\(label): " + r.output)
+                    XCTAssertEqual(try String(contentsOf: f.sudoers, encoding: .utf8), f.sudoersRule, label)
+                    XCTAssertEqual(try f.inode(f.sudoers), inode, label)
+                    XCTAssertEqual(try f.contents(of: folder), f.sudoersFolderAfterTransaction, label)
+                }
+            }
+        }
+    }
+
+    /// The scripts take a stat of root's that answers and then fails as any
+    /// other refusal of root's: install.sh when it is the stat of the lock's
+    /// descriptor (7) or the last one, after the final read (8),
+    /// uninstall.sh when it is the first stat of the rule (4) or the final
+    /// check of the lock (7). The rule keeps its bytes and inode, the app
+    /// stays, and install.sh touches no LaunchAgent. The call to fail is
+    /// found in a run of the same script with every answer right (the
+    /// matched control, which completes); the failing run's log shows it
+    /// was that call.
+    func testScriptsStopWhenAStatOfRootsAnswersAndThenFails() throws {
+        for install in [true, false] {
+            let control = try ruleFixture(install: install, fakes: ["stat"])
+            defer { control.destroy() }
+            try control.prepareSudoersLock()
+            let ok = try runRuleScript(control, install: install)
+            XCTAssertEqual(ok.status, 0, "install \(install): " + ok.stderr + ok.stdout)
+            let calls = rootStatCalls(control)
+            let lock = control.sudoersLock.path, rule = control.sudoers.path
+            let picks: [(call: (n: Int, what: String)?, status: Int)] = install
+                ? [(calls.first { $0.what.isEmpty }, 7), (calls.last { $0.what.isEmpty }, 8)]
+                : [(calls.first { $0.what == rule }, 4), (calls.last { $0.what == lock }, 7)]
+            for pick in picks {
+                let picked = try XCTUnwrap(pick.call, "install \(install): \(calls)")
+                let f = try ruleFixture(install: install, fakes: ["stat"])
+                defer { f.destroy() }
+                // The same call in this fixture: its paths have this root.
+                let call = (n: picked.n, what: picked.what.replacingOccurrences(of: control.root.lastPathComponent, with: f.root.lastPathComponent))
+                let label = "install \(install), stat \(call.n) (\(call.what.isEmpty ? "a descriptor" : call.what))"
+                try f.prepareSudoersLock()
+                let inode = try f.inode(f.sudoers)
+                try "\(call.n)|fail-after".write(to: f.root.appendingPathComponent("stat.answer"), atomically: true, encoding: .utf8)
+
+                let r = try runRuleScript(f, install: install)
+
+                XCTAssertEqual(r.status, 1, "\(label): " + r.stderr + r.stdout)
+                XCTAssertEqual(rootStatCalls(f).last.map { "\($0.n) \($0.what)" }, "\(call.n) \(call.what)", "\(label): the call that failed is the last")
+                XCTAssertTrue(r.stderr.contains("stat \(call.what.isEmpty ? "of a descriptor" : call.what) exited 1, or its answer is not the one line asked for: "), "\(label): " + r.stderr)
+                XCTAssertTrue(r.stderr.contains(ruleRefusal(f, install: install, status: pick.status)), "\(label): " + r.stderr)
+                XCTAssertEqual(try String(contentsOf: f.sudoers, encoding: .utf8), f.sudoersRule, label)
+                XCTAssertEqual(try f.inode(f.sudoers), inode, label)
+                XCTAssertEqual(try f.contents(of: f.sudoers.deletingLastPathComponent()), f.sudoersFolderAfterTransaction, label)
+                XCTAssertTrue(f.exists(f.app), label)
+                if install {
+                    XCTAssertFalse(f.calls().contains { $0.hasPrefix("osascript") || $0.hasPrefix("launchctl bootout") || $0.hasPrefix("launchctl bootstrap") }, "\(label): \(f.calls())")
+                }
+            }
+        }
+    }
+
+    /// An entry that allows a change passes only when dsmemberutil (the
+    /// fake, answering from its table) shows that its UUID is root's own
+    /// user record: the UUID it gives for ROOT_UID is the entry's, and the
+    /// ID it gives for that UUID is "uid: <ROOT_UID>", each as one line
+    /// from a dsmemberutil that exits 0. Here the entry, on the rule's
+    /// folder, names the test account, which is ROOT_UID in these copies.
+    /// With both answers right each script completes (through the script)
+    /// and the entry stays. Then root's text alone, from the same state,
+    /// stops with exit 7 and changes nothing for each other answer: none
+    /// (the fake fails), another UUID, the UUID and a second line, the
+    /// UUID with no newline, the UUID and then exit 1, a group ("gid:"),
+    /// another user's ID, the right ID and then exit 1. With ls printing
+    /// "user:root" where the UUID was (as ls without -n can), the entry is
+    /// not read at all, and dsmemberutil is not asked.
+    func testRootAdmitsAChangeOnlyForAnEntryShownToBeRootsOwnUser() throws {
+        for install in [true, false] {
+            let f = try ruleFixture(install: install, fakes: ["ls"])
+            let folder = f.sudoersLock.deletingLastPathComponent()
+            defer {
+                TestACL.clear(folder)
+                f.destroy()
+            }
+            try f.prepareSudoersLock()
+            try TestACL.add("user:\(TestACL.owner) allow add_file,delete_child", to: folder)
+            let u = try XCTUnwrap(TestACL.qualifiers(folder).first, "install \(install)")
+            XCTAssertEqual(TestACL.qualifiers(folder).count, 1)
+            let root = f.uid
+            let table = f.root.appendingPathComponent("dsmemberutil.table")
+            func rows(_ uuid: String, _ id: String) -> String { "getuuid -u \(root)|\(uuid)\ngetid -X \(u)|\(id)\n" }
+            let right = rows("\(u)\\n|0", "uid: \(root)\\n|0")
+            try right.write(to: table, atomically: true, encoding: .utf8)
+
+            let whole = try runRuleScript(f, install: install)
+
+            XCTAssertEqual(whole.status, 0, "install \(install): " + whole.stderr + whole.stdout)
+            XCTAssertTrue(f.calls().contains("dsmemberutil getuuid -u \(root)"), "install \(install): \(f.calls())")
+            XCTAssertTrue(f.calls().contains("dsmemberutil getid -X \(u)"), "install \(install): \(f.calls())")
+            XCTAssertEqual(f.exists(f.sudoers), install, "install \(install)")
+            XCTAssertEqual(TestACL.entries(folder), 1, "install \(install)")
+
+            let wrong: [(name: String, table: String?, named: Bool)] = [
+                ("no answer", nil, false),
+                ("another UUID", rows("FFFFEEEE-DDDD-CCCC-BBBB-AAAA00000000\\n|0", "uid: \(root)\\n|0"), false),
+                ("the UUID and another line", rows("\(u)\\nanother line\\n|0", "uid: \(root)\\n|0"), false),
+                ("the UUID with no newline", rows("\(u)|0", "uid: \(root)\\n|0"), false),
+                ("the UUID, then exit 1", rows("\(u)\\n|1", "uid: \(root)\\n|0"), false),
+                ("a group", rows("\(u)\\n|0", "gid: \(root)\\n|0"), false),
+                ("another user", rows("\(u)\\n|0", "uid: 4242\\n|0"), false),
+                ("the ID, then exit 1", rows("\(u)\\n|0", "uid: \(root)\\n|1"), false),
+                ("a name where the UUID was", right, true),
+            ]
+            for c in wrong {
+                let label = "\(c.name), install \(install)"
+                try f.sudoersRule.write(to: f.sudoers, atomically: true, encoding: .utf8)
+                let inode = try f.inode(f.sudoers)
+                XCTAssertEqual(try f.contents(of: folder), f.sudoersFolderAfterTransaction, label)
+                if let rowsText = c.table { try rowsText.write(to: table, atomically: true, encoding: .utf8) } else { try? FileManager.default.removeItem(at: table) }
+                let named = f.root.appendingPathComponent("ls.named")
+                if c.named { try "\(folder.path)\n".write(to: named, atomically: true, encoding: .utf8) } else { try? FileManager.default.removeItem(at: named) }
+                f.clearCalls()
+
+                let r = try runRootText(f, install: install)
+
+                XCTAssertEqual(r.status, 7, "\(label): " + r.output)
+                if c.named {
+                    XCTAssertTrue(r.output.contains("could not be read in full (ls: "), "\(label): " + r.output)
+                    XCTAssertTrue(r.output.contains(": user:root allow add_file"), "\(label): " + r.output)
+                    XCTAssertFalse(f.calls().contains { $0.hasPrefix("dsmemberutil") }, "\(label): \(f.calls())")
+                } else {
+                    XCTAssertTrue(r.output.contains("\(folder.path) has an access control list entry that allows more than reading ( 0: \(u) allow "), "\(label): " + r.output)
+                    XCTAssertTrue(f.calls().contains("dsmemberutil getuuid -u \(root)"), "\(label): \(f.calls())")
+                }
+                XCTAssertEqual(try String(contentsOf: f.sudoers, encoding: .utf8), f.sudoersRule, label)
+                XCTAssertEqual(try f.inode(f.sudoers), inode, label)
+                XCTAssertEqual(try f.contents(of: folder), f.sudoersFolderAfterTransaction, "\(label): nothing staged")
+                XCTAssertEqual(TestACL.entries(folder), 1, label)
+            }
+        }
+    }
+
     /// root_functions cuts the spaces that start each line of the text a
     /// root shell runs. bash reads that text back to the same functions, so
     /// the cut changes nothing root runs, and the text is shorter.
     func testRootTextWithoutIndentationDefinesTheSameFunctions() throws {
         for (name, functions) in [
-            ("install.sh", "sudoers_file_problem sudoers_acl_check sudoers_dirs_check sudoers_guard_take sudoers_read_rule sudoers_pin_rule sudoers_recheck sudoers_for_others sudoers_rule_text sudoers_replace_as_root"),
-            ("uninstall.sh", "sudoers_file_problem sudoers_acl_check sudoers_dirs_check sudoers_guard_take sudoers_read_rule sudoers_pin_rule sudoers_recheck sudoers_not_ours sudoers_remove_as_root"),
+            ("install.sh", "r_die r_stat r_file r_root r_acl r_dirs r_guard r_read r_pin r_recheck sudoers_for_others sudoers_rule_text r_replace"),
+            ("uninstall.sh", "r_die r_stat r_file r_root r_acl r_dirs r_guard r_read r_pin r_recheck sudoers_not_ours r_remove"),
         ] {
             let text = try String(contentsOf: ScriptFixture.productionScripts.appendingPathComponent(name), encoding: .utf8)
             var definitions = try Self.shellFunction("root_functions", in: text, name)
@@ -9650,7 +9963,8 @@ private final class ScriptFixture {
     /// uninstall.sh: every tool that changes or asks the system is a fake,
     /// and the rule, its lock and the app are the fixture's. ROOT_UID is the
     /// account running the tests, which owns every file the fake sudo's root
-    /// shell checks. A test that needs another constant (a longer
+    /// shell checks. DSMEMBERUTIL is always the fake, so no test asks the
+    /// real directory service whose entry an access control list names. A test that needs another constant (a longer
     /// CALL_TIMEOUT_SECONDS, while a gate holds the fake sudo) rewrites the
     /// copy with it.
     func writeUninstallCopy(extraConstants: [String: String]) throws {
@@ -9666,6 +9980,7 @@ private final class ScriptFixture {
             "PLUTIL": bin.appendingPathComponent("plutil").path,
             "KILL": bin.appendingPathComponent("kill").path,
             "CP": bin.appendingPathComponent("cp").path,
+            "DSMEMBERUTIL": bin.appendingPathComponent("dsmemberutil").path,
             "APP": app.path,
             "SUDOERS": sudoers.path,
             "SUDOERS_LOCK": sudoersLock.path,
@@ -9705,6 +10020,7 @@ private final class ScriptFixture {
             "SUDOERS_LOCK": sudoersLock.path,
             "ROOT_UID": uid,
             "VISUDO": visudoPath,
+            "DSMEMBERUTIL": bin.appendingPathComponent("dsmemberutil").path,
             "CHOWN": bin.appendingPathComponent("chown").path,
             "PGREP": bin.appendingPathComponent("pgrep").path,
             "PS": bin.appendingPathComponent("ps").path,
@@ -10011,6 +10327,8 @@ private final class ScriptFixture {
               "\(r)"/*"|"*"SUDOERS_LOCK=\(resolvedRoot)/"*) ;;
               *) printf 'sudo REFUSED %s\\n' "${*:4}" >> "\(calls)"; exit 1 ;;
             esac
+            # The text root runs, for a test that runs it again on its own.
+            printf '%s' "$3" > "\(r)/root.payload.$4"
             if [[ -n "${FAKE_SUDO_GATE:-}" && -e "$FAKE_SUDO_GATE" ]]; then
               printf 'sudo GATED %s\\n' "$4" >> "\(calls)"
               : > "$FAKE_SUDO_GATE.waiting"
@@ -10296,8 +10614,33 @@ private final class ScriptFixture {
         // of the arguments. cat with no arguments, as root's read of the
         // rule calls it, counts those calls in cat.stdin.count; on the call
         // cat.stdin.fail names, it copies all of its input and then exits 1.
+        // stat counts every call in stat.count and logs it in stat.calls as
+        // "<n> <arguments>" (a stat of standard input has none). On the
+        // call stat.answer names ("<n>|<how>"), it answers wrongly: with the
+        // real answer and then exit 1 (fail-after), the real answer less its
+        // last field (partial), the real answer and a second line (extra),
+        // nothing (empty), the real answer without its newline (no-newline),
+        // or a line of other words (garbage).
         for (tool, real) in [("cat", "/bin/cat"), ("stat", "/usr/bin/stat")] {
-            let stdinPart = tool != "cat" ? "" : """
+            let toolPart = tool != "cat" ? """
+            n=$(( $(/bin/cat "\(r)/stat.count" 2>/dev/null || echo 0) + 1 ))
+            echo "$n" > "\(r)/stat.count"
+            printf '%s %s\\n' "$n" "$*" >> "\(r)/stat.calls"
+            if [[ -f "\(r)/stat.answer" ]]; then
+              IFS='|' read -r at how < "\(r)/stat.answer"
+              if [[ "$at" == "$n" ]]; then
+                out="$(/usr/bin/stat "$@" 2>&1)"
+                case "$how" in
+                  fail-after) printf '%s\\n' "$out"; exit 1 ;;
+                  partial) printf '%s\\n' "${out% *}"; exit 0 ;;
+                  extra) printf '%s\\nanother line\\n' "$out"; exit 0 ;;
+                  empty) exit 0 ;;
+                  no-newline) printf '%s' "$out"; exit 0 ;;
+                  garbage) printf 'not the fields asked for\\n'; exit 0 ;;
+                esac
+              fi
+            fi
+            """ : """
             if (( $# == 0 )); then
               n=$(( $(/bin/cat "\(r)/cat.stdin.count" 2>/dev/null || echo 0) + 1 ))
               echo "$n" > "\(r)/cat.stdin.count"
@@ -10310,7 +10653,7 @@ private final class ScriptFixture {
             """
             try writeFake(tool, """
             \(hangHere(tool))
-            \(stdinPart)
+            \(toolPart)
             for a in "$@"; do
               if [[ -f "\(r)/\(tool).hang" ]]; then
                 while IFS= read -r p || [[ -n "$p" ]]; do [[ -n "$p" && "$a" == $p ]] && hang_here; done < "\(r)/\(tool).hang"
@@ -10333,10 +10676,14 @@ private final class ScriptFixture {
         // REPLACED-RULE"); on the call ls.acl names, it first gives the
         // rule's folder an entry "everyone allow add_file" (logged "ls
         // ADDED-ACL"). Then, for an argument a line of ls.fail (a bash
-        // glob) matches, it exits 1. Otherwise it prints what /bin/ls -lde
+        // glob) matches, it exits 1. Otherwise it prints what /bin/ls
         // prints, with a "+" after the mode of each file a line of ls.plus
         // matches and a line "unexpected line" after each one a line of
-        // ls.extra matches.
+        // ls.extra matches. For a file a line of ls.gap matches, its entry
+        // 0 is numbered 1 (as when ls skips an entry it cannot read); for
+        // one ls.named matches, each entry names "user:root" instead of a
+        // UUID. When a line of ls.fail-after matches an argument, it prints
+        // all of that and then exits 1.
         try writeFake("ls", """
         n=$(( $(/bin/cat "\(r)/ls.count" 2>/dev/null || echo 0) + 1 ))
         echo "$n" > "\(r)/ls.count"
@@ -10359,18 +10706,48 @@ private final class ScriptFixture {
           if matches "\(r)/ls.fail" "$a"; then echo "ls: $a: Permission denied" >&2; exit 1; fi
         done
         out="$(/bin/ls "$@")" || exit $?
+        cur="" after=""
         while IFS= read -r line; do
           extra=""
+          if [[ "$line" == " "* ]]; then
+            if [[ -n "$cur" ]] && matches "\(r)/ls.gap" "$cur" && [[ "$line" == " 0: "* ]]; then line=" 1: ${line# 0: }"; fi
+            if [[ -n "$cur" ]] && matches "\(r)/ls.named" "$cur"; then
+              line="$(printf '%s\\n' "$line" | /usr/bin/sed -E 's/^( [0-9]+: )[0-9A-F-]{36}/\\1user:root/')"
+            fi
+          else
+            cur=""
+          fi
           for a in "$@"; do
             [[ "$a" == -* || "$line" != *" $a" ]] && continue
+            cur="$a"
             if matches "\(r)/ls.plus" "$a"; then
               if [[ "${line:10:1}" == [@+] ]]; then line="${line:0:10}+${line:11}"; else line="${line:0:10}+${line:10}"; fi
             fi
             matches "\(r)/ls.extra" "$a" && extra="unexpected line"
+            matches "\(r)/ls.fail-after" "$a" && after="$a"
           done
           printf '%s\\n' "$line"
           [[ -z "$extra" ]] || printf '%s\\n' "$extra"
         done <<< "$out"
+        if [[ -n "$after" ]]; then echo "ls: $after: Input/output error" >&2; exit 1; fi
+        """)
+        // dsmemberutil: root's DSMEMBERUTIL in every copy of install.sh and
+        // uninstall.sh, so no test asks the real directory service. Logged
+        // as "dsmemberutil <arguments>". It answers only from
+        // dsmemberutil.table, one "<arguments>|<answer>|<status>" line per
+        // call it knows, printing the answer with printf %b (\n is a
+        // newline) and exiting with the status (0 when empty). Any other
+        // call prints an error and exits 1, so no entry is shown to be
+        // root's unless a test says so.
+        try writeFake("dsmemberutil", """
+        printf 'dsmemberutil %s\\n' "$*" >> "\(calls)"
+        if [[ -f "\(r)/dsmemberutil.table" ]]; then
+          while IFS='|' read -r args answer status || [[ -n "$args" ]]; do
+            if [[ "$args" == "$*" ]]; then printf '%b' "$answer"; exit "${status:-0}"; fi
+          done < "\(r)/dsmemberutil.table"
+        fi
+        echo "dsmemberutil: this fixture has no answer for: $*" >&2
+        exit 1
         """)
         // Insomnia --resume-frozen: reads its entries from standard input,
         // one "<pid> <startedAt> <micros> <boot>" line each, and records the

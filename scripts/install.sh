@@ -69,6 +69,9 @@ TEST=/bin/test
 CAT=/bin/cat
 STAT=/usr/bin/stat
 LS=/bin/ls
+# What root's shell asks whether an access control list entry is root's own
+# (r_root): read only, never a change.
+DSMEMBERUTIL=/usr/bin/dsmemberutil
 WC=/usr/bin/wc
 CHOWN=/usr/sbin/chown
 VISUDO=/usr/sbin/visudo
@@ -111,7 +114,7 @@ SUDOERS=/etc/sudoers.d/insomnia
 # Held, as root, by install.sh and uninstall.sh around each compare and
 # write of $SUDOERS (sudoers_replace). It sits beside the rule, in the folder
 # sudo reads rules from: that folder and every folder above it belong to
-# root and only root can write them, which sudoers_guard_take checks before
+# root and only root can write them, which r_guard checks before
 # it opens the file. sudo skips a name there that contains a dot
 # (sudoers(5), @includedir), so this file is never read as a rule. It is
 # created once, root's with mode 0600, and never removed, so every run locks
@@ -682,214 +685,231 @@ stop_for_unverified() { # what was changed
   exit 1
 }
 
-# Why the file named $1 cannot take part in the rule's transaction, or
-# nothing when it can: a regular file of root's (ROOT_UID) with one link, no
-# setuid, setgid or sticky bit and no write permission for group or others;
-# with $3, exactly that mode. $2 is its `stat -f '%Hp %Mp %Lp %u %l'`, which
-# reads the name itself, not what a link points to. This and the functions
-# below, up to sudoers_recheck, are the same in install.sh and uninstall.sh
-# (a test keeps them in step) and run only as root.
-sudoers_file_problem() { # name stat [mode]
-  local type special perm uid links
-  read -r type special perm uid links <<< "$2"
-  if [[ "${type:-}" != 10 ]]; then
-    echo "$1 is not a regular file (stat: ${2:-no answer})"
-  elif [[ "${uid:-}" != "$ROOT_UID" ]]; then
-    echo "$1 belongs to uid ${uid:-?}, not root"
-  elif [[ "${links:-}" != 1 ]]; then
-    echo "$1 has ${links:-?} links, not 1"
-  elif [[ "${special:-}" != 0 || ! "${perm:-}" =~ ^[0-7]+$ ]] || (( (8#$perm & 8#022) != 0 )); then
-    echo "$1 has mode ${special:-?}${perm:-?}, so someone other than root may change it"
-  elif [[ -n "${3:-}" && "$perm" != "$3" ]]; then
-    echo "$1 has mode $perm, not $3"
-  fi
-  return 0
+# The functions from here to r_recheck run only as root, in the shell
+# sudoers_replace (install.sh) or sudoers_remove (uninstall.sh) starts.
+# They are the same in install.sh and uninstall.sh (a test keeps them in
+# step). Each one that finds a problem says why on stderr and exits that
+# shell with the status it is given (r_die); none returns a problem to a
+# caller that could miss it.
+r_die() { # status message
+  echo "$2" >&2
+  exit "$1"
 }
-# Exits with status $1, saying why on stderr, unless `ls -lde` shows that no
-# access control list on the files and folders named after it allows more
-# than reading. An entry that allows anything else (write, append, delete,
-# add_file, add_subdirectory, delete_child, writeattr, writeextattr,
-# writesecurity, chown, or a right not listed here) counts, whoever it names
-# and whatever its inheritance flags: a folder's inheritable entries reach
-# the files made in it. An entry for root counts too, though root needs
-# none. Deny entries pass. So does an answer only when it is read in full:
-# ls fails, prints a line not parsed here, marks a list (+) and prints no
-# entry, or leaves out a name, and the run stops. Nothing is ever repaired.
-sudoers_acl_check() { # status name...
-  local status="$1" out rc=0 line name="" plus="" entries=0 seen=0 a perm
+# Puts what `stat -f '%d:%i %Hp %Mp %Lp %u %l %z %.9Fc'` says about the
+# name given (the name itself, not what a link points to; with -L, what it
+# points to; with no name, standard input, as in `r_stat 7 <&8`) in ST, and
+# the fields checked one by one in ST_ID (device:inode), ST_T (file type),
+# ST_S (setuid, setgid, sticky), ST_P (permissions), ST_U (owner's uid),
+# ST_L (links) and ST_Z (size); the change time is only ever compared as
+# part of ST. The answer is trusted only when stat
+# exits 0 and prints exactly one line of those eight fields and nothing
+# else; anything else (a failure, even after an answer, an empty, partial,
+# longer or malformed answer, a warning) exits with status $1.
+r_stat() { # status [-L] [name]
+  local s="$1" rc=0 re='^([0-9]+:[0-9]+) ([0-9]{1,2}) ([0-7]) ([0-7]{1,3}) ([0-9]+) ([0-9]+) ([0-9]+) [0-9]+\.[0-9]{9}$'
   shift
-  out="$("$LS" -lde "$@" 2>&1)" || rc=$?
-  if (( rc != 0 )); then
-    echo "the access control lists of $* could not be read (ls exited $rc: $out)" >&2
-    exit "$status"
+  ST="$("$STAT" -f '%d:%i %Hp %Mp %Lp %u %l %z %.9Fc' "$@" 2>&1 && echo .)" || rc=$?
+  # Only an answer stat finished (the "." echo adds after its last newline)
+  # loses the ".": one without a newline at its end keeps it and fails.
+  ST="${ST%$'\n.'}"
+  if (( rc != 0 )) || ! [[ "$ST" =~ $re ]]; then
+    r_die "$s" "stat ${*:-of a descriptor} exited $rc, or its answer is not the one line asked for: $ST"
   fi
+  ST_ID="${BASH_REMATCH[1]}" ST_T="${BASH_REMATCH[2]}" ST_S="${BASH_REMATCH[3]}" ST_P="${BASH_REMATCH[4]}"
+  ST_U="${BASH_REMATCH[5]}" ST_L="${BASH_REMATCH[6]}" ST_Z="${BASH_REMATCH[7]}"
+}
+# Exits with status $1 unless the file the last r_stat read, named $2, is
+# a regular file of root's (ROOT_UID) with one link, no setuid, setgid or
+# sticky bit and no write permission for group or others; with $3, exactly
+# that mode.
+r_file() { # status name [mode]
+  [[ "$ST_T" == 10 ]] || r_die "$1" "$2 is not a regular file (stat: $ST_T $ST_S $ST_P $ST_U $ST_L)"
+  [[ "$ST_U" == "$ROOT_UID" ]] || r_die "$1" "$2 belongs to uid $ST_U, not root"
+  [[ "$ST_L" == 1 ]] || r_die "$1" "$2 has $ST_L links, not 1"
+  if [[ "$ST_S" != 0 ]] || (( (8#$ST_P & 8#022) != 0 )); then
+    r_die "$1" "$2 has mode $ST_S$ST_P, so someone other than root may change it"
+  fi
+  [[ -z "${3:-}" || "$ST_P" == "$3" ]] || r_die "$1" "$2 has mode $ST_P, not $3"
+}
+# Succeeds only when dsmemberutil shows that the UUID $1 is root's own user
+# record: the UUID it gives for the user ID ROOT_UID (0) is exactly $1, and
+# the ID it gives for $1 is that user ID ("uid: 0", not a group's "gid:").
+# Each answer must be exactly that one line, from a dsmemberutil that exits
+# 0. A name, a group (wheel, admin, everyone), another user, or an answer
+# that is missing, longer or malformed is not shown to be root.
+r_root() { # uuid
+  local out
+  out="$("$DSMEMBERUTIL" getuuid -u "$ROOT_UID" 2>&1 && echo .)" && [[ "$out" == "$1"$'\n.' ]] \
+    && out="$("$DSMEMBERUTIL" getid -X "$1" 2>&1 && echo .)" && [[ "$out" == "uid: $ROOT_UID"$'\n.' ]]
+}
+# Exits with status $1, saying why on stderr, unless `ls -lden` shows that
+# no access control list on the files and folders named after it lets
+# anyone but root change them. -n prints each entry's principal as its
+# UUID. An entry that allows anything but reading (write, append, delete,
+# add_file, add_subdirectory, delete_child, writeattr, writeextattr,
+# writesecurity, chown, or a right not listed here) passes only when
+# r_root shows its UUID is root's own user record, whatever its
+# inheritance flags: a folder's inheritable entries reach the files made in
+# it. Deny entries pass. So does an answer only when it is read in full:
+# ls fails (even after printing), prints a line not parsed here, numbers
+# its entries with a gap (ls skips an entry it cannot read but still counts
+# it), marks a list (+) and prints no entry, or leaves out a name, and the
+# run stops. Nothing is ever repaired.
+r_acl() { # status name...
+  local s="$1" out rc=0 line name="" plus="" n=0 seen=0 a p w u
+  local re='^ ([0-9]+): ([0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12})( inherited)? (allow|deny) ([a-z_,]+)$'
+  shift
+  out="$("$LS" -lden "$@" 2>&1 && echo .)" || rc=$?
+  if (( rc != 0 )); then
+    r_die "$s" "the access control lists of $* could not be read (ls exited $rc: $out)"
+  fi
+  # An answer without a newline at its end keeps the "." and fails below.
+  out="${out%$'\n.'}"
   while IFS= read -r line; do
     if [[ "$line" =~ ^[-a-z][-rwxsStT]{9}([@+]?)\  ]]; then
-      if [[ "$plus" == + ]] && (( entries == 0 )); then break; fi
-      plus="${BASH_REMATCH[1]}" entries=0 name=""
+      if [[ "$plus" == + ]] && (( n == 0 )); then break; fi
+      plus="${BASH_REMATCH[1]}" n=0 name=""
       for a in "$@"; do
         if [[ "$line" == *" $a" ]] && (( ${#a} > ${#name} )); then name="$a"; fi
       done
       [[ -n "$name" ]] || break
       seen=$(( seen + 1 ))
-    elif [[ -n "$name" && "$line" =~ ^\ *[0-9]+:\ .+\ (allow|deny)\ ([a-z_,]+)$ ]]; then
-      entries=$(( entries + 1 ))
-      [[ "${BASH_REMATCH[1]}" == allow ]] || continue
-      for perm in ${BASH_REMATCH[2]//,/ }; do
-        case "$perm" in
+    elif [[ -n "$name" && "$line" =~ $re && "${BASH_REMATCH[1]}" == "$n" ]]; then
+      n=$(( n + 1 ))
+      [[ "${BASH_REMATCH[4]}" == allow ]] || continue
+      u="${BASH_REMATCH[2]}" w=0
+      for p in ${BASH_REMATCH[5]//,/ }; do
+        case "$p" in
           read | execute | readattr | readextattr | readsecurity | list | search \
             | file_inherit | directory_inherit | limit_inherit | only_inherit) ;;
-          *)
-            echo "$name has an access control list entry that allows more than reading ($line)" >&2
-            exit "$status" ;;
+          *) w=1 ;;
         esac
       done
+      (( w == 0 )) || r_root "$u" || r_die "$s" "$name has an access control list entry that allows more than reading ($line)"
     else
       name=""
       break
     fi
   done <<< "$out"
-  if [[ -z "$name" || ( "$plus" == + && "$entries" == 0 ) || "$seen" != "$#" ]]; then
-    echo "the access control lists of $* could not be read in full (ls: $out)" >&2
-    exit "$status"
+  if [[ -z "$name" || ( "$plus" == + && "$n" == 0 ) || "$seen" != "$#" ]]; then
+    r_die "$s" "the access control lists of $* could not be read in full (ls: $out)"
   fi
 }
-# Exits 7, saying why on stderr, unless every folder from the one that holds
-# $SUDOERS_LOCK up to / is a folder of root's that group and others cannot
-# write, with no access control list that allows more than reading
-# (sudoers_acl_check). Leaves the folders in SUDOERS_DIRS.
-sudoers_dirs_check() {
-  local dir="$SUDOERS_LOCK" s type perm uid
-  SUDOERS_DIRS=()
-  while [[ "$dir" == /?* ]]; do
-    dir="${dir%/*}"
-    s="$("$STAT" -f '%Hp %Lp %u' "${dir:-/}" 2>/dev/null)"
-    read -r type perm uid <<< "$s"
-    if [[ "${type:-}" != 4 || ! "${perm:-}" =~ ^[0-7]+$ ]] \
-       || [[ "${uid:-}" != 0 && "${uid:-}" != "$ROOT_UID" ]] || (( (8#$perm & 8#022) != 0 )); then
-      echo "${dir:-/}, a folder above $SUDOERS_LOCK, is not a folder of root's that only root can write (stat: ${s:-no answer})" >&2
-      exit 7
+# Exits 7 unless every folder from the one that holds $SUDOERS_LOCK up to /
+# is a folder of root's that group and others cannot write, with no access
+# control list that lets anyone but root change it (r_acl). Leaves the
+# folders in DIRS.
+r_dirs() {
+  local d="$SUDOERS_LOCK"
+  DIRS=()
+  while [[ "$d" == /?* ]]; do
+    d="${d%/*}"
+    r_stat 7 "${d:-/}"
+    if [[ "$ST_T" != 4 || ( "$ST_U" != 0 && "$ST_U" != "$ROOT_UID" ) ]] || (( (8#$ST_P & 8#022) != 0 )); then
+      r_die 7 "${d:-/}, a folder above $SUDOERS_LOCK, is not a folder of root's that only root can write (stat: $ST_T $ST_P $ST_U)"
     fi
-    SUDOERS_DIRS+=("${dir:-/}")
+    DIRS+=("${d:-/}")
   done
-  sudoers_acl_check 7 "${SUDOERS_DIRS[@]}"
+  r_acl 7 "${DIRS[@]}"
 }
 # Takes $SUDOERS_LOCK on fd 8 for the rest of the root shell, once it is
-# shown that only root can have made or changed it. An existing file must be
-# a regular file of root's with mode 0600 and one link, and every folder from
-# its own up to / a folder of root's that group and others cannot write
-# (sudoers_dirs_check), none with an access control list that allows more
-# than reading. Both are checked before the file is opened, so a FIFO (whose
-# open would wait) or a link is never opened. The file is created, mode
-# 0600, only where nothing is (noclobber: no link is followed and nothing is
-# truncated), and its own access control list is checked before it is
+# shown that only root can have made or changed it. An existing file must
+# be a regular file of root's with mode 0600 and one link (r_file), and
+# every folder from its own up to / a folder of root's that group and
+# others cannot write (r_dirs), none with an access control list that lets
+# anyone but root change it. Both are checked before the file is opened, so
+# a FIFO (whose open would wait) or a link is never opened. The file is
+# created, mode 0600, only where nothing is (noclobber: no link is followed
+# and nothing is truncated), and its own list is checked before it is
 # opened. Nothing is ever repaired, replaced or removed. Once the lock is
 # taken, the descriptor and the path must still be the same file, unchanged
-# (kept in SUDOERS_LOCK_ID for sudoers_recheck), and the rule $1 must be in
-# the same folder. Exits 7 with the reason when a check fails, 3 when the
-# lock is not free within LOCK_TIMEOUT_SECONDS.
-sudoers_guard_take() { # rule
-  local why seen
+# down to its change time (kept in LOCK_ID for r_recheck), and the rule $1
+# must be in the same folder. Exits 7 when a check fails, 3 when the lock
+# is not free within LOCK_TIMEOUT_SECONDS.
+r_guard() { # rule
+  local id
   if [[ -e "$SUDOERS_LOCK" || -L "$SUDOERS_LOCK" ]]; then
-    why="$(sudoers_file_problem "$SUDOERS_LOCK" "$("$STAT" -f '%Hp %Mp %Lp %u %l' "$SUDOERS_LOCK" 2>/dev/null)" 600)"
-    if [[ -n "$why" ]]; then echo "$why" >&2; exit 7; fi
+    r_stat 7 "$SUDOERS_LOCK"
+    r_file 7 "$SUDOERS_LOCK" 600
   fi
-  sudoers_dirs_check
+  r_dirs
   ( set -C; : > "$SUDOERS_LOCK" ) 2>/dev/null || true
-  why="$(sudoers_file_problem "$SUDOERS_LOCK" "$("$STAT" -f '%Hp %Mp %Lp %u %l' "$SUDOERS_LOCK" 2>/dev/null)" 600)"
-  if [[ -n "$why" ]]; then echo "$why" >&2; exit 7; fi
-  sudoers_acl_check 7 "$SUDOERS_LOCK"
+  r_stat 7 "$SUDOERS_LOCK"
+  r_file 7 "$SUDOERS_LOCK" 600
+  r_acl 7 "$SUDOERS_LOCK"
   exec 8<"$SUDOERS_LOCK" || exit 7
   "$LOCKF" -t "$LOCK_TIMEOUT_SECONDS" 8 2>/dev/null || exit 3
-  SUDOERS_LOCK_ID="$("$STAT" -f '%d:%i %Hp %Mp %Lp %u %l' <&8 2>/dev/null)"
-  seen="$("$STAT" -f '%d:%i %Hp %Mp %Lp %u %l' "$SUDOERS_LOCK" 2>/dev/null)"
-  if [[ -z "$SUDOERS_LOCK_ID" || "$SUDOERS_LOCK_ID" != "$seen" ]]; then
-    echo "$SUDOERS_LOCK is no longer the file this run opened and locked" >&2
-    exit 7
-  fi
-  why="$(sudoers_file_problem "$SUDOERS_LOCK" "${SUDOERS_LOCK_ID#* }" 600)"
-  if [[ -n "$why" ]]; then echo "$why" >&2; exit 7; fi
-  if [[ "$("$STAT" -L -f '%d:%i' "${1%/*}" 2>/dev/null)" != "$("$STAT" -f '%d:%i' "${SUDOERS_LOCK%/*}" 2>/dev/null)" ]]; then
-    echo "$1 is not in the folder that holds $SUDOERS_LOCK" >&2
-    exit 7
-  fi
+  r_stat 7 <&8
+  LOCK_ID="$ST"
+  r_stat 7 "$SUDOERS_LOCK"
+  [[ "$ST" == "$LOCK_ID" ]] || r_die 7 "$SUDOERS_LOCK is no longer the file this run opened and locked"
+  r_file 7 "$SUDOERS_LOCK" 600
+  r_stat 7 -L "${1%/*}"
+  id="$ST_ID"
+  r_stat 7 "${SUDOERS_LOCK%/*}"
+  [[ "$ST_ID" == "$id" ]] || r_die 7 "$1 is not in the folder that holds $SUDOERS_LOCK"
 }
-# Opens the rule $1 on fd 6, once sudoers_file_problem (any mode without
-# group or other write) and sudoers_acl_check find nothing wrong with it,
-# and reads it from its start through that descriptor, checking cat's exit
-# status. Leaves the file's identity in RULE_ID and its bytes in RULE_RAW,
-# with a "." after them so $(...) keeps a trailing newline. Exits 4 unless
-# the path still names the opened file; 8 when cat fails, or the bytes read
-# are not as many as the file's size (a NUL byte, which the shell drops, or
-# a change while they were read).
-sudoers_read_rule() { # rule
-  local LC_ALL=C why size rc=0
-  why="$(sudoers_file_problem "$1" "$("$STAT" -f '%Hp %Mp %Lp %u %l' "$1" 2>/dev/null)")"
-  if [[ -n "$why" ]]; then echo "$why" >&2; exit 4; fi
-  sudoers_acl_check 4 "$1"
+# Opens the rule $1 on fd 6, once r_file (any mode without group or other
+# write) and r_acl find nothing wrong with it, checks the descriptor the
+# same way, and reads the rule from its start through it, checking cat's
+# exit status. Leaves what stat said about the descriptor in R_META, the
+# file's identity in R_ID and its bytes in R_RAW, with a "." after them so
+# $(...) keeps a trailing newline. Exits 4 unless the path still names the
+# opened file; 8 when cat fails, or the descriptor's stat after the read is
+# not the one before it, or the bytes read are not as many as the file's
+# size (a NUL byte, which the shell drops, or a change while they were
+# read).
+r_read() { # rule
+  local LC_ALL=C rc=0
+  r_stat 4 "$1"
+  r_file 4 "$1"
+  r_acl 4 "$1"
   exec 6<"$1" || exit 4
-  RULE_ID="$("$STAT" -f '%d:%i' <&6 2>/dev/null)"
-  if [[ -z "$RULE_ID" || "$RULE_ID" != "$("$STAT" -f '%d:%i' "$1" 2>/dev/null)" ]]; then
-    echo "$1 was replaced while it was opened" >&2
-    exit 4
-  fi
-  size="$("$STAT" -f '%z' <&6 2>/dev/null)"
-  RULE_RAW="$("$CAT" <&6 && echo .)" || rc=$?
-  if (( rc != 0 )); then
-    echo "$1 could not be read (cat exited $rc)" >&2
-    exit 8
-  fi
-  if [[ -z "$size" || "${#RULE_RAW}" != "$(( size + 1 ))" ]]; then
-    echo "$1 holds a NUL byte, or changed while it was read" >&2
-    exit 8
-  fi
+  r_stat 4 <&6
+  r_file 4 "$1"
+  R_META="$ST" R_ID="$ST_ID"
+  r_stat 4 "$1"
+  [[ "$ST_ID" == "$R_ID" ]] || r_die 4 "$1 was replaced while it was opened"
+  R_RAW="$("$CAT" <&6 && echo .)" || rc=$?
+  (( rc == 0 )) || r_die 8 "$1 could not be read (cat exited $rc)"
+  r_stat 8 <&6
+  [[ "$ST" == "$R_META" && "${#R_RAW}" == "$(( ST_Z + 1 ))" ]] || r_die 8 "$1 holds a NUL byte, or changed while it was read"
 }
-# Reads the rule $1 (sudoers_read_rule) and keeps that descriptor on fd 7
-# until the root shell exits, so no other file can take the inode while
-# PINNED_ID names it. Exits 4 unless the text read, trailing newlines
-# aside, is exactly $2, the text the caller read and judged before sudo ran.
-# Leaves the file's identity in PINNED_ID, its bytes as read in PINNED_RAW,
-# and its text in PINNED_TEXT.
-sudoers_pin_rule() { # rule text
+# Reads the rule $1 (r_read) and keeps that descriptor on fd 7 until the
+# root shell exits, so no other file can take the inode while P_META names
+# it. Exits 4 unless the text read, trailing newlines aside, is exactly $2,
+# the text the caller read and judged before sudo ran. Leaves what stat
+# said about the descriptor in P_META, the bytes as read in P_RAW, and the
+# text in P_TEXT.
+r_pin() { # rule text
   local LC_ALL=C
-  sudoers_read_rule "$1"
-  exec 7<&6
-  PINNED_ID="$RULE_ID"
-  PINNED_RAW="$RULE_RAW"
-  PINNED_TEXT="${RULE_RAW%.}"
-  PINNED_TEXT="${PINNED_TEXT%"${PINNED_TEXT##*[!$'\n']}"}"
-  if [[ "$PINNED_TEXT" != "$2" ]]; then
-    echo "$1 is not the text this run read" >&2
-    exit 4
-  fi
+  r_read "$1"
+  exec 7<&6 || exit 4
+  P_META="$R_META" P_RAW="$R_RAW"
+  P_TEXT="${R_RAW%.}"
+  P_TEXT="${P_TEXT%"${P_TEXT##*[!$'\n']}"}"
+  [[ "$P_TEXT" == "$2" ]] || r_die 4 "$1 is not the text this run read"
 }
 # The last checks before the rename or removal, after every other one: the
-# folders again (sudoers_dirs_check, exit 7), the lock still the file this
-# shell locked, unchanged, with no access control list that allows more
-# than reading (exit 7), and then the rule. With "absent", nothing may be at
+# folders again (r_dirs, exit 7), the lock still the file this shell
+# locked, unchanged, with no access control list that lets anyone but root
+# change it (exit 7), and then the rule. With "absent", nothing may be at
 # $2 (exit 4). With "same", the rule is read again from its start through a
-# new descriptor (sudoers_read_rule, exits 4 and 8), and must be the file
-# root pinned, holding exactly the bytes root read then (exit 4).
-sudoers_recheck() { # absent|same rule
-  sudoers_dirs_check
-  if [[ "$("$STAT" -f '%d:%i %Hp %Mp %Lp %u %l' "$SUDOERS_LOCK" 2>/dev/null)" != "$SUDOERS_LOCK_ID" ]]; then
-    echo "$SUDOERS_LOCK is no longer the file this run opened and locked" >&2
-    exit 7
-  fi
-  sudoers_acl_check 7 "$SUDOERS_LOCK"
+# new descriptor (r_read, exits 4 and 8), and must be the file root pinned,
+# unchanged down to its change time, holding exactly the bytes root read
+# then (exit 4).
+r_recheck() { # absent|same rule
+  r_dirs
+  r_stat 7 "$SUDOERS_LOCK"
+  [[ "$ST" == "$LOCK_ID" ]] || r_die 7 "$SUDOERS_LOCK is no longer the file this run opened and locked"
+  r_acl 7 "$SUDOERS_LOCK"
   if [[ "$1" == absent ]]; then
-    if [[ -e "$2" || -L "$2" ]]; then echo "$2 is there now" >&2; exit 4; fi
+    [[ ! -e "$2" && ! -L "$2" ]] || r_die 4 "$2 is there now"
     return 0
   fi
-  sudoers_read_rule "$2"
-  if [[ "$RULE_ID" != "$PINNED_ID" ]]; then
-    echo "$2 was replaced after root read it" >&2
-    exit 4
-  fi
-  if [[ "$RULE_RAW" != "$PINNED_RAW" ]]; then
-    echo "$2 changed after root read it" >&2
-    exit 4
-  fi
+  r_read "$2"
+  [[ "$R_ID" == "${P_META%% *}" ]] || r_die 4 "$2 was replaced after root read it"
+  [[ "$R_META" == "$P_META" && "$R_RAW" == "$P_RAW" ]] || r_die 4 "$2 changed after root read it"
 }
 
 # The rule this script writes for $USER: a header and the four pmset
@@ -909,12 +929,12 @@ sudoers_rule_text() {
 # handed to root as an argument, so what root compares is what was judged
 # here, not a file anyone could change meanwhile. The compare and the write
 # are one call to sudo, run as root while it holds $SUDOERS_LOCK
-# (sudoers_guard_take), the lock uninstall.sh takes for its compare and
-# removal. Root reads the rule through a descriptor it opened and checked
-# (sudoers_pin_rule), and judges that text again with sudoers_for_others.
+# (r_guard), the lock uninstall.sh takes for its compare and removal.
+# Root reads the rule through a descriptor it opened and checked (r_pin),
+# and judges that text again with sudoers_for_others.
 # The new rule is written from sudoers_rule_text beside the old one (sudo
 # skips a name with a dot), owned by root with mode 0440, and checked there
-# with visudo. Last, sudoers_recheck checks the folders, the lock and the
+# with visudo. Last, r_recheck checks the folders, the lock and the
 # access control lists again and reads the rule again through a new
 # descriptor; the rename follows only when the path still names the file
 # root opened and holds the bytes root read first. The rename puts the new
@@ -926,61 +946,69 @@ sudoers_rule_text() {
 # The lock keeps out only the runs that take it: install.sh and uninstall.sh
 # of this version. Scripts of earlier releases take no lock, and neither does
 # an administrator's own sudo. Against those, the checks above leave only the
-# moments between root's last check (the reread in sudoers_recheck) and its
+# moments between root's last check (the reread in r_recheck) and its
 # rename open; they do not close them. An identity or byte check cannot: a
 # writer that takes no lock can still change the rule after the last read.
 #
 # Exit status: 0 replaced; 3 the lock was not free within
 # LOCK_TIMEOUT_SECONDS; 4 the rule changed since it was read, or is not a
 # regular file of root's with one link that only root can change (an access
-# control list that allows more than reading, or one not read in full,
-# counts); 5 staging the new rule
-# failed, or mv reported that the rename failed; 6 the new rule failed
+# control list that lets anyone but root change it, or one not read in
+# full, counts), or a stat of it failed or gave an answer not in the form
+# asked for; 5 staging the new rule failed (mktemp's answer is not a name
+# beside the rule counts), or mv reported that the rename failed; 6 the new
+# rule failed
 # visudo's check; 7 the lock file, or a folder above it, is not one only
-# root can change, or its access control list could not be read; 8 the rule
-# as root read it could not be read in full (cat failed), holds a NUL byte,
-# changed while it was read, or has a line for someone else; 2 a bad call. 1 is
+# root can change, or its access control list or a stat of it could not be
+# read in full; 8 the rule as root read it could not be read in full (cat
+# failed, or the stat after the read failed), holds a NUL byte, changed
+# while it was read, or has a line for someone else; 2 a bad call. 1 is
 # sudo's own (a wrong password) or a shell error before the rename. In all
 # of these the rule was not replaced, though the lock file may have been
 # created. Any other status (the root shell, or its mv, was killed by a
 # signal), or a call that never returns, leaves it unknown whether the
 # rename happened.
-sudoers_replace_as_root() { # absent|same rule [text]
-  STAGED_RULE=""
-  trap '[[ -z "$STAGED_RULE" ]] || "$RM" -f "$STAGED_RULE"' EXIT
+r_replace() { # absent|same rule [text]
+  local t
+  STAGED=""
+  trap '[[ -z "$STAGED" ]] || "$RM" -f "$STAGED"' EXIT
   umask 077
   case "$1" in absent | same) ;; *) exit 2 ;; esac
-  sudoers_guard_take "$2"
+  r_guard "$2"
   if [[ "$1" == absent ]]; then
-    if [[ -e "$2" || -L "$2" ]]; then echo "$2 is there now" >&2; exit 4; fi
+    [[ ! -e "$2" && ! -L "$2" ]] || r_die 4 "$2 is there now"
   else
-    sudoers_pin_rule "$2" "${3-}"
-    [[ -z "$(sudoers_for_others "$PINNED_TEXT")" ]] || exit 8
+    r_pin "$2" "${3-}"
+    [[ -z "$(sudoers_for_others "$P_TEXT")" ]] || exit 8
   fi
-  STAGED_RULE="$("$MKTEMP" "$2.XXXXXX")" || exit 5
-  sudoers_rule_text > "$STAGED_RULE" || exit 5
-  { "$CHOWN" root:wheel "$STAGED_RULE" && "$CHMOD" 0440 "$STAGED_RULE"; } || exit 5
-  "$VISUDO" -cf "$STAGED_RULE" >/dev/null || exit 6
-  sudoers_recheck "$1" "$2"
+  # Only a name mktemp gives beside the rule is written, or removed on exit.
+  t="$("$MKTEMP" "$2.XXXXXX")" || exit 5
+  [[ "${t%.*}" == "$2" && ${#t} == $(( ${#2} + 7 )) ]] || exit 5
+  STAGED="$t"
+  sudoers_rule_text > "$STAGED" || exit 5
+  { "$CHOWN" root:wheel "$STAGED" && "$CHMOD" 0440 "$STAGED"; } || exit 5
+  "$VISUDO" -cf "$STAGED" >/dev/null || exit 6
+  r_recheck "$1" "$2"
   # An mv killed by a signal may have renamed already, so its status goes
   # on as it is, an unknown result, not as a failed rename.
-  "$MV" -f "$STAGED_RULE" "$2" || { rc=$?; (( rc > 128 )) && exit "$rc"; exit 5; }
-  STAGED_RULE=""
+  "$MV" -f "$STAGED" "$2" || { rc=$?; (( rc > 128 )) && exit "$rc"; exit 5; }
+  STAGED=""
   exit 0
 }
 # The functions named, as `declare -f` prints them, with the spaces that
 # start each line cut, for the text a root shell runs: sudo logs that text
-# and ps shows it, and the indentation is a fifth of it. None of these
-# functions has a quoted string that runs across lines, which the cut would
-# change; a test checks that bash reads the cut text back to the same
-# functions. The same in install.sh and uninstall.sh.
+# and ps shows it, and the indentation is a fifth of it. bash prints $'\n'
+# as a newline inside single quotes, so a quoted string may run across
+# lines; none of these functions has one whose next line starts with a
+# space, which the cut would change. A test checks that bash reads the cut
+# text back to the same functions. The same in install.sh and uninstall.sh.
 root_functions() { # name...
   local line
   while IFS= read -r line; do
     printf '%s\n' "${line#"${line%%[! ]*}"}"
   done <<< "$(declare -f "$@")"
 }
-# Runs sudoers_replace_as_root as root, in one sudo call. The shell's script
+# Runs r_replace as root, in one sudo call. The shell's script
 # is this script's fixed tool paths, the account's name and user ID, and the
 # text of the functions root runs (root_functions); sudo resets the
 # environment, so nothing root runs comes from PATH. $2 is the rule's text
@@ -989,11 +1017,10 @@ sudoers_replace() { # absent|same [text]
   "$SUDO" "$ROOT_BASH" -c "set -u
 $(printf '%s=%q\n' SUDOERS_LOCK "$SUDOERS_LOCK" ROOT_UID "$ROOT_UID" USER "$USER" UID_NUM "$UID_NUM" \
     LOCK_TIMEOUT_SECONDS "$LOCK_TIMEOUT_SECONDS" LOCKF "$LOCKF" STAT "$STAT" CAT "$CAT" LS "$LS" \
-    MKTEMP "$MKTEMP" CHOWN "$CHOWN" CHMOD "$CHMOD" VISUDO "$VISUDO" MV "$MV" RM "$RM")
-$(root_functions sudoers_file_problem sudoers_acl_check sudoers_dirs_check sudoers_guard_take \
-    sudoers_read_rule sudoers_pin_rule sudoers_recheck sudoers_for_others \
-    sudoers_rule_text sudoers_replace_as_root)
-sudoers_replace_as_root \"\$@\"" insomnia-sudoers-replace "$1" "$SUDOERS" "${2-}"
+    DSMEMBERUTIL "$DSMEMBERUTIL" MKTEMP "$MKTEMP" CHOWN "$CHOWN" CHMOD "$CHMOD" VISUDO "$VISUDO" MV "$MV" RM "$RM")
+$(root_functions r_die r_stat r_file r_root r_acl r_dirs r_guard r_read r_pin r_recheck \
+    sudoers_for_others sudoers_rule_text r_replace)
+r_replace \"\$@\"" insomnia-sudoers-replace "$1" "$SUDOERS" "${2-}"
 }
 
 cleanup() {

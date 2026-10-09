@@ -1055,4 +1055,25 @@ enum TestACL {
         }
         return count
     }
+
+    /// The UUID each ACL entry of `url` names, in order, upper case as
+    /// `ls -en` prints it, without following a symlink. Read from the
+    /// entries themselves, so a test learns which UUID an entry it made
+    /// names without asking the directory service.
+    static func qualifiers(_ url: URL) -> [String] {
+        guard let acl = acl_get_link_np(url.path, ACL_TYPE_EXTENDED) else { return [] }
+        defer { acl_free(UnsafeMutableRawPointer(acl)) }
+        var uuids: [String] = []
+        var entry: acl_entry_t?
+        var which = ACL_FIRST_ENTRY.rawValue
+        while acl_get_entry(acl, which, &entry) == 0 {
+            which = ACL_NEXT_ENTRY.rawValue
+            guard let qualifier = acl_get_qualifier(entry) else { continue }
+            defer { acl_free(qualifier) }
+            var text = [CChar](repeating: 0, count: 37)
+            uuid_unparse_upper(qualifier.assumingMemoryBound(to: UInt8.self), &text)
+            uuids.append(String(cString: text))
+        }
+        return uuids
+    }
 }
