@@ -5271,13 +5271,14 @@ final class RecoveryScriptTests: XCTestCase {
     /// and no pmset.
     func testUninstallStopsWhenTheSettlementCannotReadTheJournalOrTheSession() throws {
         let changed = #"echo "it changed while it was read" >&2; exit 2"#
-        let cases: [(label: String, perl: String?, plutil: String?, saying: String)] = [
+        // The expected text names each case's own fixture's paths.
+        let cases: [(label: String, perl: String?, plutil: String?, saying: (ScriptFixture) -> String)] = [
             ("journal copy", "*/insomnia-uninstall.*/read.settle.json", nil,
-             "Uninstall stopped BEFORE removing anything: \(fx.state.path) could not be read whole (it changed while it was read)"),
+             { "Uninstall stopped BEFORE removing anything: \($0.state.path) could not be read whole (it changed while it was read)" }),
             ("session copy", "*/insomnia-uninstall.*/read.settle-session.json", nil,
-             "The unfinished start is still journaled: \(fx.session.path) could not be read (it changed while it was read), so whether it is that start's session is unknown."),
+             { "The unfinished start is still journaled: \($0.session.path) could not be read (it changed while it was read), so whether it is that start's session is unknown." }),
             ("session read", nil, #""-extract endsAt raw -o - "*/insomnia-uninstall.*/read.settle-session.json"#,
-             "The unfinished start is still journaled: \(fx.session.path) could not be read (endsAt: plutil -extract exited 1 (simulated read error)), so whether it is that start's session is unknown."),
+             { "The unfinished start is still journaled: \($0.session.path) could not be read (endsAt: plutil -extract exited 1 (simulated read error)), so whether it is that start's session is unknown." }),
         ]
         for c in cases {
             let f = try ScriptFixture()
@@ -5295,7 +5296,7 @@ final class RecoveryScriptTests: XCTestCase {
             let r = try f.run(f.uninstall, ["--purge"])
 
             XCTAssertEqual(r.status, 1, "\(c.label): \(r.stderr)")
-            XCTAssertTrue(r.stderr.contains(c.saying), "\(c.label): \(r.stderr)")
+            XCTAssertTrue(r.stderr.contains(c.saying(f)), "\(c.label): \(r.stderr)")
             XCTAssertTrue(r.stderr.contains("Nothing was removed and no pmset ran"), "\(c.label): \(r.stderr)")
             XCTAssertEqual(f.release(), "\(nonce) held\n", c.label)
             XCTAssertEqual(try Data(contentsOf: f.session), session, c.label)
