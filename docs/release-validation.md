@@ -248,6 +248,9 @@ is performed. Do not replace "not run" with "passed" based on source review.
 | A lock file at `/etc/sudoers.d/.insomnia-sudoers.lock` that is not root's 0600 regular file with one link (made by hand for the test): install and uninstall stop before opening it, leave it and the rule exactly as they were, and name the reason | Not run |
 | A process named Insomnia whose owner `ps -o uid=` cannot read: install and uninstall stop before any password prompt, and the rule, app and agent stay | Not run |
 | Install by an administrator whose sudo policy lists only some commands and not `/bin/bash`: the rule write is refused by sudo, and nothing is replaced | Not run |
+| An access control list that allows more than reading, added by hand for the test to `/etc/sudoers.d`, to the lock file and to the rule in turn (for example `sudo chmod +a "admin allow add_file"`, removed with `sudo chmod -a` afterwards): install and uninstall stop before changing the rule, name the path and the entry, and leave the ACL as it was; a deny entry and a read-only allow entry pass | Not run |
+| The rule changed by hand with `sudo` between root's first read and its rename or removal (while a `visudo` check is slowed for the test): the run keeps the rule and asks for a rerun | Not run |
+| A stale session whose `backstop.sh` run outlasts its 300 s limit during install and uninstall (a `sudo pmset` held for the test): SIGTERM only, the pid named, the recovery lock held until the backstop and its `sudo` exit, nothing replaced or removed | Not run |
 | Recovery agent refuses to run after the installed bundle or its sealed backstop.sh is modified, and logs why | Not run |
 | Running app refuses to arm (session start refused, reason shown) after its installed bundle is edited or re-signed under it | Not run |
 | Upgrade whose new agent fails to load puts the previous bundle back and reloads the previous agent, on a working Mac | Not run |

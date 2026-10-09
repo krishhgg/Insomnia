@@ -132,12 +132,43 @@ recovery; newly written journals use `frozenProcesses`.
   script before its first `sudo` call; only a process identified as the API
   client (`com.insomnia.app`) is ignored. Under the recovery lock the
   scripts' process checks read no Info.plist, not even with a time limit: a
-  process first seen there counts as unverified and stops the run. The
-  `backstop.sh` each script runs under the lock is main's: it has no time
-  limit and reads the installed app's Info.plist itself. `uninstall.sh`
-  reads `InsomniaResumeFrozenVersion` before the lock (bounded, with the
-  file's identity before and after) and under it only checks with `stat`
-  that the file is unchanged; anything else stops it before a backstop runs.
+  process first seen there counts as unverified and stops the run.
+- Both scripts read `InsomniaResumeFrozenVersion` before the recovery lock
+  (bounded, with the file's identity, device:inode:change time:size, before
+  and after) and pass the value and the identity to the `backstop.sh` they
+  run under the lock, in `INSOMNIA_INFO_PATH`, `INSOMNIA_INFO_EVIDENCE` and
+  `INSOMNIA_INFO_VERSION`. A backstop that shares its caller's lock reads no
+  Info.plist: it uses the value only when its bounded `stat` under the lock
+  shows the same file unchanged, and otherwise keeps the frozen entries that
+  need the app binary. Run by launchd, it reads the value itself before it
+  takes the lock and checks the identity the same way. From a checkout,
+  `uninstall.sh` stops before any backstop runs when its read fails or the
+  file changed; from the zip, and in `install.sh`, the run goes on with the
+  value unknown, and kept entries then stop it after the backstop.
+  `install.sh` reads the Info.plist of the bundle that will be at the app's
+  path when the backstop runs: the set-aside previous bundle when an
+  interrupted install left only that.
+- Each script runs the backstop as one bounded call with a 300 s limit and
+  SIGTERM only. A backstop still running 3 s after its SIGTERM is reported
+  with its pid (status 125) and keeps the lock until it ends, and so does
+  each `sudo pmset` or app binary call it started, through that call's own
+  supervisor, which ignores SIGTERM and SIGHUP sent to the process group.
+  Every read the backstop makes under the lock (`cp`, `plutil`, `cat`,
+  `stat`, `ps`) has 30 s, a checked status, and its output in a private
+  directory. One that fails, is cut short, holds a NUL byte or does not
+  answer stops the run: what was undone stays undone and the rest stays
+  journaled. A backstop sealed in a bundle from an earlier release ignores
+  these variables and reads the Info.plist and the journal itself, without
+  a limit on each read; only the 300 s limit applies to it.
+- `uninstall.sh`'s own journal check reads each file once, by a bounded `cp`
+  into a private directory, and runs every check on that copy, each with an
+  explicit status that does not depend on `set -e`. A read that fails, is
+  cut short, prints a NUL byte or does not answer is a check that did not
+  complete, never a clean journal. A path that is not a regular file when
+  it is checked is not opened. One put there after the check is opened only
+  by the bounded `cp`: a FIFO with no writer blocks it until its 30 s limit,
+  and the check counts as not complete. A session.json still present after
+  the backstop, readable or not, stops the uninstall.
 - Both scripts change the file in one `sudo /bin/bash -c` call, which
   restricted administrators whose policy does not allow `/bin/bash` cannot
   make. As root it takes `/etc/sudoers.d/.insomnia-sudoers.lock` with
@@ -145,23 +176,37 @@ recovery; newly written journals use `frozenProcesses`.
   every folder above the file must be root's and not writable by group or
   others, and an existing file a regular file of root's with mode 0600 and
   one link, so a FIFO or a link is never opened; after locking, the
-  descriptor and the path must still be that same file. The file is created
+  descriptor and the path must still be that same file. No access control
+  list on those folders or on the file may allow more than reading: `/bin/ls
+  -lde` lists them, and an allow entry with any right but `read`,
+  `execute`, `readattr`, `readextattr`, `readsecurity`, `list`, `search` or
+  an inheritance flag fails the check whoever it names, root included. Deny
+  entries pass. A list `ls` cannot print, or prints in a form the check does
+  not parse, fails it too. The folders' lists are checked before the file
+  is created and the file's after, before it is opened. The file is created
   (umask 077, noclobber) only where nothing is, and is never repaired,
-  replaced or removed; a check that fails stops the run (exit 7). Scripts of
+  replaced or removed; nor is an access control list. A check that fails
+  stops the run (exit 7). Scripts of
   earlier releases took no lock, unmerged branches used
   `/var/run/insomnia-sudoers.lock`, and an administrator's own `sudo` takes
   none: the lock does not serialize against those.
 - Root then opens the rule on a descriptor, after checking it is a regular
-  file of root's with one link that only root can change, reads it through
-  that descriptor, and compares it with the exact text the run read and
-  judged, which is passed to root as an argument. It judges that text again
+  file of root's with one link that only root can change, access control
+  list included, reads it through that descriptor with `cat`'s status
+  checked, and compares it with the exact text the run read and judged,
+  which is passed to root as an argument. It judges that text again
   (another account's grant stops it) and refuses a NUL byte or a size that
   does not match what was read. Only then does `install.sh` write a copy
-  beside the rule (`mktemp`, `root:wheel`, 0440), check that copy with
-  `visudo -cf` and rename it over the rule while the path still names the
-  opened file, or `uninstall.sh` remove the rule under the same check. A
-  checked failure removes the copy and leaves the rule. A file that changed
-  since the read, or a lock still taken after 10 s, stops the run:
+  beside the rule (`mktemp`, `root:wheel`, 0440) and check that copy with
+  `visudo -cf`. Immediately before the rename, or before `uninstall.sh`
+  removes the rule, root checks the folders, the lock file's identity and
+  every access control list again, opens the rule anew, and reads it again
+  the same way: the rename or removal goes ahead only when that read
+  completes with the same bytes from the same file (device and inode). A
+  checked failure removes the copy and leaves the rule. A rule that cannot
+  be read in full or holds a NUL byte stops the run (exit 8). A file that
+  changed since either read, or a lock still taken after 10 s, stops the
+  run:
   `install.sh` leaves the rule, the app and the agent, and `uninstall.sh`
   keeps the rule and the app. Both ask for a rerun. The lock file may have
   been created by then. A root shell killed by a signal, or an `mv` or `rm`
@@ -174,6 +219,12 @@ recovery; newly written journals use `frozenProcesses`.
   with `sudo -v` before the recovery lock, and every sudo call under it is
   `sudo -n`, with the time limit every call there has. Every tool run
   through sudo has a fixed path.
+- Not closed: a writer that takes no lock (an earlier release's scripts, an
+  administrator's own `sudo`) can still change the rule between root's last
+  read and its `mv` or `rm`. No identity or byte check can see that change.
+  The root text is sent as one `bash -c` argument, about 7.9 KB for
+  `install.sh` and 6.7 KB for `uninstall.sh` with each function's leading
+  indentation removed.
 - Nothing else runs as root.
 
 ### 3. Lid observer

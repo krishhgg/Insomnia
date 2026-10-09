@@ -47,13 +47,15 @@
 #                              such an entry itself. The binary runs only
 #                              when the bundle's Info.plist declares the
 #                              interface version this script speaks
-#                              (InsomniaResumeFrozenVersion), and it keeps
+#                              (InsomniaResumeFrozenVersion), read before
+#                              the lock (see "Version evidence"), and it keeps
 #                              the lock on fd 9 until it exits, which it does
 #                              by itself after <seconds>. When the binary is
 #                              missing, does not declare that version, cannot
 #                              run, times out, or answers anything but one
-#                              documented line per entry, those entries are
-#                              kept and not signaled. An entry
+#                              documented line per entry, or when the version
+#                              is unknown, those entries are kept and not
+#                              signaled. An entry
 #                              without startedAtMicros (an older build) is
 #                              checked here instead: it must exist, be
 #                              stopped, have started in this boot session at
@@ -127,15 +129,19 @@
 #     Exit 0 only when the journal is clean afterwards; otherwise exit 1 so
 #     the failure is visible and the next periodic run retries.
 #   - state.json unreadable, not a JSON object, or with a known key of the
-#     wrong type: nothing is touched, exit 1.
+#     wrong type: nothing is touched, exit 1. A read of the journal's copy
+#     that fails or does not answer in time (see "Reads") stops the run the
+#     same way, at whatever point it happens: what was undone before it
+#     stays undone and its flag stays set, so the next run sees it again.
 #   - session.json present but not a session: readable, but not the shape
 #     the app's Session decoder accepts (session_shape_problems). It is
 #     treated as expired. Once the journal is clean (already, or after the
 #     undo above succeeded) the file is renamed to
 #     session.json.unreadable-<UTC stamp>, never deleted or overwritten, so
 #     the next run sees no session. While the journal stays dirty it stays.
-#   - session.json present but not readable at all (permissions, I/O), or
-#     not a regular file (a FIFO or device is never opened: open(2) could
+#   - session.json present but not readable at all (permissions, I/O, no
+#     answer within READ_TIMEOUT_SECONDS, or no room for the private copy),
+#     or not a regular file (a FIFO or device is never opened: open(2) could
 #     block while this run holds the lock): its end time is unknown, and
 #     sleep is never held without a deadline that can be enforced, so it is
 #     treated as expired and the journal is undone as above. The file is
@@ -144,6 +150,32 @@
 #     bytes stay as evidence and no later run, of this script or the app,
 #     can read it back as a session that was already treated as ended. A
 #     state.json that is not a regular file is malformed.
+#
+# Reads: every read of a file (plutil, cp, cat, stat) and every ps call
+# runs as a child with fd 9 closed and its output in a private directory
+# made with mktemp in TMPDIR, and has READ_TIMEOUT_SECONDS to answer. A
+# child still running then gets SIGTERM, then SIGKILL; none of them is
+# privileged. Each status is checked, never left to set -e, which is off in
+# command substitutions and on the left of || and &&. sysctl and date read
+# only the kernel and run directly; defaults read runs like the undo
+# commands (run_bounded). The journal and session.json are copied once (cp
+# -X onto a file this run created, so the copy is readable even when the
+# original is readable only through an ACL), and every later read is of the
+# copy. The journal published at the end is built from that copy. A run
+# killed with SIGKILL leaves its private directory behind in TMPDIR. Not
+# bounded here: the stat of fd 9 and of the lock file that decides whether
+# to share a caller's lock (a child with fd 9 closed cannot stat fd 9).
+# install.sh and uninstall.sh bound the whole run instead (run_backstop).
+#
+# Version evidence: the run reads InsomniaResumeFrozenVersion and the
+# identity of INSOMNIA_INFO (device, inode, change time, size) before it
+# takes the lock, and checks the identity again under the lock just before
+# the binary would run. A caller that already holds the lock and passes it
+# down as fd 9 (install.sh, uninstall.sh) did the first read itself, before
+# it took the lock, and passes the result in INSOMNIA_INFO_PATH,
+# INSOMNIA_INFO_EVIDENCE and INSOMNIA_INFO_VERSION. Missing, changed or
+# unreadable evidence makes the version unknown, and entries that need the
+# binary are kept.
 #
 # Limitation: for an entry without startedAtMicros the shell compares process
 # start time to the second only. For every entry a lookup and a signal are
@@ -177,6 +209,9 @@ RM=/bin/rm
 MV=/bin/mv
 CP=/bin/cp
 MKTEMP=/usr/bin/mktemp
+CAT=/bin/cat
+WC=/usr/bin/wc
+STAT=/usr/bin/stat
 # The installed app binary, for the microsecond identity check of
 # frozenProcesses entries (see above), and the bundle's Info.plist, which
 # must declare InsomniaResumeFrozenVersion RESUME_FROZEN_VERSION before the
@@ -191,6 +226,9 @@ LOCK_TIMEOUT_SECONDS=10
 # sent SIGTERM, and how long it then gets to exit before this run fails closed.
 COMMAND_TIMEOUT_SECONDS=30
 KILL_GRACE_SECONDS=3
+# Longest a single read (plutil, cat, cp, stat, ps) may run before it is
+# stopped and counts as failed; see bounded.
+READ_TIMEOUT_SECONDS=30
 
 force=0
 for arg in "$@"; do
@@ -213,9 +251,279 @@ STATE="$APP_SUPPORT/state.json"
 LOCK="$APP_SUPPORT/.recovery.lock"
 LOG="$LOG_DIR/insomnia.log"
 
+# A log path that is not a regular file is not opened: an append to a FIFO
+# with no reader would block, and this run may hold the recovery lock.
 log() { # level message
   "$MKDIR" -p "$LOG_DIR"
+  [[ ! -e "$LOG" || -f "$LOG" ]] || return 0
   printf '%s [%s] backstop: %s\n' "$("$DATE" -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" >> "$LOG"
+}
+
+# --- Reads -------------------------------------------------------------------
+# Every read made under the recovery lock is a bounded call (below), so a
+# FIFO put where a file was, a stalled disk or a tool that hangs cannot keep
+# the lock waiting, and every read has an explicit result. session.json and
+# state.json are read once each, by a bounded cp into WORK, and every check
+# reads that private copy. The app's Info.plist is not read under the lock
+# (see read_info_version).
+
+# Whether pid $1 is a running job of this shell, by bash's own job list.
+job_running() { # pid
+  local p
+  for p in $(jobs -rp); do
+    [[ "$p" == "$1" ]] && return 0
+  done
+  return 1
+}
+# True once job pid $1 has left bash's running list; waits at least $2
+# seconds for that unless it happens first, on the SECONDS clock like
+# wait_for_status (and within the same bounds), and checks once more after
+# the limit.
+wait_for_job() { # pid seconds
+  local deadline=$(( SECONDS + $2 ))
+  while job_running "$1" && (( SECONDS <= deadline )); do
+    sleep 0.1
+  done
+  ! job_running "$1"
+}
+# Sends signal $1 to the current job (%+), but only while that job is pid
+# $2; see run_app_bounded.
+signal_job() { # signal pid
+  [[ "$(jobs -p %+)" == "$2" ]] || return 1
+  kill -"$1" %+
+}
+
+# Run one read (plutil, cat, cp, stat or ps) with a time limit. Its
+# combined output goes to $BOUNDED_BASE.out, a new file in WORK, and its
+# exit status is returned; 124 when it did not finish within
+# READ_TIMEOUT_SECONDS (on bash's SECONDS clock, so up to a second more), or
+# 126 when no file for its output could be made. The read is a background
+# job of this shell started without fd 9: a read needs no lock, and one left
+# behind keeps none. It reads and changes nothing that matters, so unlike an
+# undo command it has no supervisor: past the limit this shell sends it
+# SIGTERM and, KILL_GRACE_SECONDS later, SIGKILL, both by jobspec (see
+# run_app_bounded); a read still in the kernel KILL_GRACE_SECONDS after that
+# is left behind. Most reads end within a few milliseconds, sooner than one
+# sleep (a fork) takes, so the first checks are up to 400 kill -0 calls in a
+# row, a few milliseconds in all, before the first sleep. The output file's
+# name comes from a counter, and noclobber makes sure the file is new: in a
+# $(...) subshell the counter starts again from the parent's value. The
+# function's stderr is /dev/null, since bash reports a job a signal ended
+# on its own stderr.
+BOUNDED_BASE=""
+bounded_reads=0
+bounded() { # command args...
+  local out cpid rc=0 spins=0 polls=0 deadline
+  BOUNDED_BASE=""
+  while :; do
+    bounded_reads=$((bounded_reads + 1))
+    out="$WORK/call.$bounded_reads.out"
+    [[ -e "$out" || -L "$out" ]] && continue
+    set -C
+    if { : > "$out"; } 2>/dev/null; then set +C; break; fi
+    set +C
+    return 126
+  done
+  BOUNDED_BASE="${out%.out}"
+  deadline=$(( SECONDS + READ_TIMEOUT_SECONDS ))
+  "$@" </dev/null >"$out" 2>&1 9>&- &
+  cpid=$!
+  while (( spins < 400 )) && kill -0 "$cpid" 2>/dev/null; do
+    spins=$((spins + 1))
+  done
+  while kill -0 "$cpid" 2>/dev/null && (( SECONDS <= deadline )); do
+    if (( polls < 50 )); then sleep 0.002; else sleep 0.05; fi
+    polls=$((polls + 1))
+  done
+  if job_running "$cpid"; then
+    signal_job TERM "$cpid" || true
+    if ! wait_for_job "$cpid" "$KILL_GRACE_SECONDS"; then
+      signal_job KILL "$cpid" || true
+      wait_for_job "$cpid" "$KILL_GRACE_SECONDS" || return 124
+    fi
+    wait "$cpid" || true
+    return 124
+  fi
+  wait "$cpid" || rc=$?
+  return "$rc"
+} 2>/dev/null
+# How a bounded read's exit status reads in a message.
+call_result() { # status
+  case "$1" in
+    124) printf 'did not answer within %ss' "$READ_TIMEOUT_SECONDS" ;;
+    126) printf 'could not be started (no file for its output)' ;;
+    *) printf 'exited %s' "$1" ;;
+  esac
+}
+
+# Reads under the lock, from here on, each have an explicit result, as in
+# uninstall.sh: 0 with the value; 1 when plutil said in so many words that
+# the key path holds no value or only null (or, for -convert, that the file
+# does not parse); 2 when it failed any other way, did not answer in time,
+# or its output could not be read back whole. A 2 is noted in
+# READ_FAILURES, and every caller passes it on, so a check that made the
+# read returns 2 and the run treats that as a read that did not complete:
+# never as a clean journal or an absent value. Once a read has failed, the
+# rest return 2 at once: they would most likely wait the same way. The
+# notes go to a file because most reads run inside $(...). The text from
+# work_read to snapshot is the same as in uninstall.sh (a test keeps the
+# two in step).
+# Reads a file this run wrote in WORK (a call's output) into READ_TEXT byte
+# for byte, without $(...), which drops NUL bytes and trailing newlines.
+# Returns 0 when all of it was read; 1 when it has a NUL byte, which no shell
+# variable can hold (READ_TEXT is then the text without them and trailing
+# newlines, and READ_HEAD the text before the first); 2 when it is not a
+# regular file, or the read failed or came up short of the size wc gives.
+# READ_HEAD is READ_TEXT otherwise. WORK is this run's own folder (mktemp
+# -d, mode 0700), so only this account could put anything else there.
+work_read() { # file -> READ_TEXT, READ_HEAD
+  local LC_ALL=C size
+  READ_TEXT=""
+  READ_HEAD=""
+  [[ -f "$1" && ! -L "$1" ]] || return 2
+  size="$("$WC" -c 2>/dev/null < "$1")" || return 2
+  size="${size//[!0-9]/}"
+  [[ -n "$size" ]] || return 2
+  if IFS= read -r -d '' READ_HEAD 2>/dev/null < "$1"; then
+    READ_TEXT="$(<"$1")" || return 2
+    return 1
+  fi
+  READ_TEXT="$READ_HEAD"
+  (( ${#READ_TEXT} == 10#$size )) || return 2
+  return 0
+}
+# The non-empty lines of $1 in TEXT_LINES, split in the shell itself: no
+# here-string, whose temporary file can fail to be written.
+TEXT_LINES=()
+text_lines() { # text
+  local rest="$1" line
+  TEXT_LINES=()
+  while [[ -n "$rest" ]]; do
+    line="${rest%%$'\n'*}"
+    if [[ "$rest" == *$'\n'* ]]; then rest="${rest#*$'\n'}"; else rest=""; fi
+    [[ -z "$line" ]] || TEXT_LINES+=("$line")
+  done
+  return 0
+}
+plutil_read() { # plutil arguments... file -> its output; 0, 1 or 2 (see above)
+  local rc=0 file="${!#}" why
+  [[ ! -s "$READ_FAILURES" ]] || return 2
+  bounded "$PLUTIL" "$@" || rc=$?
+  if (( rc == 0 )); then
+    work_read "$BOUNDED_BASE.out" || rc=$?
+    case "$rc" in
+      0) printf '%s' "$READ_TEXT" || return 2; return 0 ;;
+      1) why="printed a NUL byte, which this script cannot pass on" ;;
+      *) why="exited 0, but its output could not be read back" ;;
+    esac
+  elif (( rc == 1 )) && plutil_said_none "$@"; then
+    return 1
+  elif (( rc == 1 )); then
+    why="exited 1 ($PLUTIL_SAID)"
+  else
+    why="$(call_result "$rc")"
+  fi
+  echo "'plutil $1 $2' on ${file##*/} $why" >> "$READ_FAILURES"
+  return 2
+}
+# Whether the exit 1 of the plutil call just made with these arguments says
+# no more than that there is no value: for -extract and -type, plutil's
+# exact words for a key path that holds none, or for a null read as raw; a
+# null read as JSON is confirmed with -type, which shows it as "(any)". For
+# -convert, any exit 1. Anything else, such as a file plutil could not open,
+# is a failed read, and plutil's words are left in PLUTIL_SAID.
+PLUTIL_SAID=""
+plutil_said_none() { # the plutil arguments of the call just made
+  local file="${!#}" said rc=0
+  PLUTIL_SAID="its message could not be read back"
+  [[ "$1" != -convert ]] || return 0
+  work_read "$BOUNDED_BASE.out" || return 1
+  said="${READ_TEXT%$'\n'}"
+  said="${said#"$file: "}"
+  PLUTIL_SAID="$said"
+  [[ "$1" == -extract || "$1" == -type ]] || return 1
+  [[ "$said" != "Could not extract value, error: No value at that key path or invalid key path: $2" ]] || return 0
+  [[ "$1 $3" != "-extract raw" || "$said" != "Value at $2 is a any type and cannot be extracted in raw format" ]] || return 0
+  [[ "$1 $3" == "-extract json" ]] || return 1
+  bounded "$PLUTIL" -type "$2" -o - "$file" || rc=$?
+  (( rc == 0 )) || return 1
+  work_read "$BOUNDED_BASE.out" || return 1
+  [[ "$READ_TEXT" == "(any)"$'\n' ]]
+}
+extract() { # file keypath -> the value as plutil prints it raw; 0, 1 or 2
+  plutil_read -extract "$2" raw -o - "$1"
+}
+# The type at a key path (bool, integer, float, string, array, dictionary,
+# "(any)" for null), or nothing when there is no value; 2 when the read failed.
+type_of() { # file keypath
+  local rc=0
+  plutil_read -type "$2" -o - "$1" || rc=$?
+  (( rc != 2 )) || return 2
+  return 0
+}
+# The value at a key path in VALUE, as plutil prints it raw or as JSON ($3),
+# with extract's status, without a subshell for the status.
+VALUE=""
+value_at() { # file keypath [raw|json]
+  local rc=0
+  VALUE="$(plutil_read -extract "$2" "${3:-raw}" -o - "$1")" || rc=$?
+  return "$rc"
+}
+# Reads file $1 whole into WHOLE_TEXT (and WHOLE_HEAD, see work_read) with
+# one bounded cat, so a FIFO or a stalled disk cannot keep the lock waiting:
+# 0, 1 when it has a NUL byte, or 2 when the read failed or did not answer
+# (noted in READ_FAILURES).
+read_whole() { # file -> WHOLE_TEXT, WHOLE_HEAD
+  local rc=0 why
+  WHOLE_TEXT=""
+  WHOLE_HEAD=""
+  [[ ! -s "$READ_FAILURES" ]] || return 2
+  bounded "$CAT" "$1" || rc=$?
+  if (( rc == 0 )); then
+    work_read "$BOUNDED_BASE.out" || rc=$?
+    WHOLE_TEXT="$READ_TEXT"
+    WHOLE_HEAD="$READ_HEAD"
+    (( rc == 2 )) || return "$rc"
+    why="exited 0, but its output could not be read back"
+  else
+    why="$(call_result "$rc")"
+  fi
+  echo "'cat' on ${1##*/} $why" >> "$READ_FAILURES"
+  return 2
+}
+# Copies the regular file $1 to $2, in WORK, with one bounded cp, so the
+# checks read a private copy that cannot block or change under them. This
+# shell makes the copy first, empty, so it has this run's mode, which lets
+# its owner read it; cp writes into it and keeps that mode. cp -X copies no
+# extended attributes or ACL: a journal its owner can read only through an
+# ACL entry (mode 0200, say) would otherwise make cp fail or leave a copy
+# its mode keeps unreadable. Returns cp's status, 124 when it did not answer
+# in time, or 1 when the empty copy could not be made.
+snapshot() { # file copy
+  local rc=0
+  "$RM" -f "$2"
+  { : > "$2"; } 2>/dev/null || return 1
+  bounded "$CP" -X "$1" "$2" || rc=$?
+  return "$rc"
+}
+
+# The first note in READ_FAILURES, or why there is none, in READ_WHY.
+READ_WHY=""
+first_read_failure() { # status of the check that stopped
+  READ_WHY="the check stopped with status $1"
+  [[ -e "$READ_FAILURES" ]] || return 0
+  READ_WHY="the note saying why could not be read back"
+  if work_read "$READ_FAILURES" && [[ -n "$READ_TEXT" ]]; then READ_WHY="${READ_TEXT%%$'\n'*}"; fi
+  return 0
+}
+# A read of the journal that failed or did not answer ends the run there.
+# Nothing further is undone, and state.json and session.json stay as they
+# are on disk (with this boot for a kept display entry's record, if that
+# journal was published already); the next run retries.
+read_stopped() { # what was read, status
+  first_read_failure "${2:-2}"
+  log error "could not read $1 ($READ_WHY); recovery stopped here, nothing further undone this run, journal and session kept; will retry"
+  exit 1
 }
 
 # --- Lock --------------------------------------------------------------------
@@ -241,11 +549,122 @@ tighten() { # path...
   done
 }
 tighten "$APP_SUPPORT" "$LOG_DIR" "$LOG" "$LOCK" "$STATE" "$SESSION"
-inode() { stat -f %i "$1" 2>/dev/null; }
+# This run's own folder for the output of its reads and its private copies
+# of session.json and state.json (mktemp -d: a new name, mode 0700), removed
+# when the run exits. One killed by SIGKILL stays in the temporary folder,
+# which the system empties.
+if ! WORK="$("$MKTEMP" -d "${TMPDIR:-/tmp}/insomnia-backstop.XXXXXX" 2>/dev/null)"; then
+  log error "could not create a private folder for this run's reads in ${TMPDIR:-/tmp}; nothing read or undone, will retry"
+  exit 1
+fi
+trap '"$RM" -rf "$WORK" 2>/dev/null || true' EXIT
+READ_FAILURES="$WORK/read-failures.lines"
+inode() { "$STAT" -f %i "$1" 2>/dev/null; }
 lock_shared=0
 if [[ -e /dev/fd/9 && -e "$LOCK" && -n "$(inode "$LOCK")" && "$(inode /dev/fd/9)" == "$(inode "$LOCK")" ]]; then
   lock_shared=1 # fd 9 is the caller's handle on the lock file; share its lock.
+fi
+
+# --- The installed app's --resume-frozen version -------------------------------
+# resume_via_app runs the app binary only when the bundle's Info.plist
+# declares InsomniaResumeFrozenVersion RESUME_FROZEN_VERSION. No Info.plist
+# is read under the recovery lock: the value is read before the lock, with
+# bounded calls, together with the file's identity (device, inode, change
+# time with nanoseconds, size) before and after the read, and
+# resume_via_app uses it only when a bounded stat under the lock, which
+# reads no contents, shows the same file unchanged. A caller that holds the
+# lock already and passes it down as fd 9 (install.sh, uninstall.sh) read
+# both before it took the lock, and passes them in the environment:
+# INSOMNIA_INFO_PATH (this run's INSOMNIA_INFO, or the values are not
+# used), INSOMNIA_INFO_EVIDENCE (the identity, "none" when no regular file
+# was there, which declares nothing, or "unknown") and
+# INSOMNIA_INFO_VERSION. INFO_EVIDENCE is "unknown" when the read failed,
+# did not answer, found a file that does not parse or saw the file change,
+# or when nothing usable was passed down; INFO_PROBLEM then says why. Only
+# frozen entries that record microseconds need the value; while it is
+# unknown they are kept, not signaled. The reading functions are the same
+# text in install.sh and uninstall.sh (a test keeps the three equal).
+INFO_EVIDENCE=unknown
+INFO_VERSION=""
+INFO_PROBLEM=""
+# The identity of an Info.plist (device, inode, change time with
+# nanoseconds, size) in INFO_ID, or "none" when no regular file is there;
+# 1, with INFO_PROBLEM, when stat failed, did not answer or printed
+# something else. stat reads no contents.
+INFO_ID=""
+info_identity() { # file
+  local rc=0 form='^[0-9]+:[0-9]+:[0-9]+(\.[0-9]+)?:[0-9]+$'
+  INFO_ID=none
+  [[ -f "$1" ]] || return 0
+  bounded "$STAT" -L -f '%d:%i:%Fc:%z' "$1" || rc=$?
+  if (( rc != 0 )); then
+    INFO_PROBLEM="'stat' $(call_result "$rc")"
+    return 1
+  fi
+  INFO_ID=""
+  if work_read "$BOUNDED_BASE.out"; then INFO_ID="${READ_TEXT%$'\n'}"; fi
+  if [[ ! "$INFO_ID" =~ $form ]]; then
+    INFO_PROBLEM="'stat' exited 0, but its output could not be read back as the file's identity"
+    return 1
+  fi
+  return 0
+}
+# InsomniaResumeFrozenVersion from an Info.plist in INFO_VERSION, and the
+# file's identity before the read in INFO_EVIDENCE ("none" when no regular
+# file is there, which declares nothing). 1, with INFO_PROBLEM and
+# INFO_EVIDENCE left as they were, when a read failed or did not answer,
+# when the file does not parse, or when its identity after the read differs.
+read_info_version() { # file
+  local rc=0 before
+  info_identity "$1" || return 1
+  before="$INFO_ID"
+  INFO_VERSION=""
+  if [[ "$before" != none ]]; then
+    bounded "$PLUTIL" -extract InsomniaResumeFrozenVersion raw -o - "$1" || rc=$?
+    if (( rc == 0 )); then
+      if ! work_read "$BOUNDED_BASE.out"; then
+        INFO_PROBLEM="'plutil -extract InsomniaResumeFrozenVersion' exited 0, but its output could not be read back whole"
+        return 1
+      fi
+      # As $(...) would read it: trailing newlines cut.
+      INFO_VERSION="${READ_TEXT%"${READ_TEXT##*[!$'\n']}"}"
+    elif (( rc == 1 )); then
+      # No such key, or no plist at all: only a plist that parses declares
+      # no version.
+      rc=0
+      bounded "$PLUTIL" -lint "$1" || rc=$?
+      if (( rc != 0 )); then
+        INFO_PROBLEM="it does not parse ('plutil -lint' $(call_result "$rc"))"
+        return 1
+      fi
+    else
+      INFO_PROBLEM="'plutil -extract InsomniaResumeFrozenVersion' $(call_result "$rc")"
+      return 1
+    fi
+    info_identity "$1" || return 1
+    if [[ "$INFO_ID" != "$before" ]]; then
+      INFO_PROBLEM="it changed while it was read"
+      return 1
+    fi
+  fi
+  INFO_EVIDENCE="$before"
+  return 0
+}
+if (( lock_shared )); then
+  if [[ "${INSOMNIA_INFO_PATH:-}" == "$INSOMNIA_INFO" && -n "${INSOMNIA_INFO_EVIDENCE:-}" ]]; then
+    INFO_EVIDENCE="$INSOMNIA_INFO_EVIDENCE"
+    INFO_VERSION="${INSOMNIA_INFO_VERSION:-}"
+    INFO_PROBLEM="the program that started this run could not read it before it took the recovery lock"
+  else
+    INFO_PROBLEM="the program that started this run holds the recovery lock and did not pass down a version it read before it took the lock"
+  fi
+elif [[ -x "$INSOMNIA_BIN" ]]; then
+  read_info_version "$INSOMNIA_INFO" || INFO_EVIDENCE=unknown
 else
+  INFO_PROBLEM="it was not read: no app binary was at $INSOMNIA_BIN before the recovery lock"
+fi
+
+if (( ! lock_shared )); then
   exec 9<>"$LOCK"
 fi
 lock_rc=0
@@ -258,21 +677,6 @@ fi
 
 # --- Helpers -----------------------------------------------------------------
 
-# plutil -extract <key> raw prints the scalar; returns non-zero if missing.
-extract() { # file keypath
-  "$PLUTIL" -extract "$2" raw -o - "$1" 2>/dev/null
-}
-extract_json() { # file keypath
-  "$PLUTIL" -extract "$2" json -o - "$1" 2>/dev/null
-}
-# Type name of a keypath (bool, integer, float, string, array, dictionary,
-# "(any)" for null); empty if the key is absent.
-type_of() { # file keypath
-  "$PLUTIL" -type "$2" -o - "$1" 2>/dev/null || true
-}
-is_true() { # file key
-  [[ "$(extract "$1" "$2" || true)" == "true" ]]
-}
 is_positive_int() {
   [[ "$1" =~ ^[0-9]+$ ]] && (( 10#$1 > 0 ))
 }
@@ -447,28 +851,6 @@ supervise_command() { # base command args...
 # job that a signal ended ("Terminated: 15") on its own stderr; the log says
 # what happened instead.
 app_answer_dir=""
-job_running() { # pid
-  local p
-  for p in $(jobs -rp); do
-    [[ "$p" == "$1" ]] && return 0
-  done
-  return 1
-}
-# True once job pid $1 has left bash's running list; waits at least $2
-# seconds for that unless it happens first, on the SECONDS clock like
-# wait_for_status (and within the same bounds), and checks once more after
-# the limit.
-wait_for_job() { # pid seconds
-  local deadline=$(( SECONDS + $2 ))
-  while job_running "$1" && (( SECONDS <= deadline )); do
-    sleep 0.1
-  done
-  ! job_running "$1"
-}
-signal_job() { # signal pid
-  [[ "$(jobs -p %+)" == "$2" ]] || return 1
-  kill -"$1" %+
-}
 run_app_bounded() { # command args...
   local cpid rc=0
   "$@" <"$app_answer_dir/in" >"$app_answer_dir/out" &
@@ -528,9 +910,12 @@ stop_transaction() { # what
 # decoder's Unicode equivalence, so a file with neither "keptDisplay" nor a
 # backslash in it has none of them and is not read further. Any of these
 # makes the journal malformed, as for a wrong type, and nothing is undone.
+# The file is read whole by read_whole, which each script defines with a
+# time limit. A read that fails or does not answer prints nothing here and
+# returns 2, which the caller passes on as a check that did not complete.
 record_text_problems() { # file
   local LC_ALL=C
-  local text rest raw key c token depth str plain scalar number esc hex lost
+  local text rest raw key c token depth str plain scalar number esc hex lost rc=0
   local n_low=0 n_lit=0 n_boot=0 digits sig exp e10 lead
   str='^"([^"\\]|\\.)*"'
   plain='^[^]["{}]+'
@@ -539,9 +924,11 @@ record_text_problems() { # file
   esc='^u00(4[1-9A-Fa-f]|5[0-9Aa]|6[1-9A-Fa-f]|7[0-9Aa])'
   hex='^u[0-9A-Fa-f]{4}'
   lost="the top level of state.json cannot be followed here, so its records about a kept display entry cannot be checked"
-  text="$(<"$1")"
+  read_whole "$1" || rc=$?
+  (( rc != 2 )) || return 2
+  text="$WHOLE_TEXT"
   [[ "$text" == *keptDisplay* || "$text" == *\\* ]] || return 0
-  if IFS= read -r -d '' c < "$1"; then
+  if (( rc == 1 )); then
     echo "$lost"
     return 0
   fi
@@ -660,106 +1047,122 @@ record_text_problems() { # file
 
 # Prints one line per way the journal does not have the shape the app writes
 # (RuntimeState.swift). Present keys must have the right type; a JSON null is
-# the same as an absent optional (Swift decodeIfPresent).
+# the same as an absent optional (Swift decodeIfPresent). A read that failed
+# or did not answer makes it return 2 at once, after any lines already
+# printed (see plutil_read). The function is the same as uninstall.sh's.
 journal_shape_problems() { # file
-  local f="$1" key t i n
-  if [[ "$("$PLUTIL" -convert json -o - "$f" 2>/dev/null | head -c 1)" != "{" ]]; then
+  local f="$1" key t i n json rc=0
+  json="$(plutil_read -convert json -o - "$f")" || rc=$?
+  (( rc != 2 )) || return 2
+  if [[ "${json:0:1}" != "{" ]]; then
     echo "state.json is not a JSON object"
     return 0
   fi
   for key in sleepDisabledByUs lowPowerSetByUs dockerFrozen savedMuted displayRestoreRefused keyboardRestoreRefused; do
-    t="$(type_of "$f" "$key")"
+    t="$(type_of "$f" "$key")" || return 2
     [[ -z "$t" || "$t" == bool || "$t" == "(any)" ]] || echo "$key is a $t, not a bool"
   done
   for key in savedOutputVolume savedDisplayBrightness savedKeyboardBrightness displayRestoredUnderLowPower; do
-    t="$(type_of "$f" "$key")"
+    t="$(type_of "$f" "$key")" || return 2
     [[ -z "$t" || "$t" == float || "$t" == integer || "$t" == "(any)" ]] || echo "$key is a $t, not a number"
   done
-  # The app's records about a kept display entry: kept for the app, never
-  # read for an undo here. Each must still decode, or the app cannot read
-  # the journal at all.
+  # The app's records about a kept display entry: never read for an undo
+  # here. Each must still decode, or the app cannot read the journal at all.
   for key in keptDisplayUnderLowPower keptDisplayReadLit; do
-    t="$(type_of "$f" "$key")"
+    t="$(type_of "$f" "$key")" || return 2
     [[ -z "$t" || "$t" == float || "$t" == integer || "$t" == "(any)" ]] || echo "$key is a $t, not a number"
   done
-  t="$(type_of "$f" keptDisplayUnderLowPowerBoot)"
+  t="$(type_of "$f" keptDisplayUnderLowPowerBoot)" || return 2
   [[ -z "$t" || "$t" == string || "$t" == "(any)" ]] || echo "keptDisplayUnderLowPowerBoot is a $t, not a string"
-  record_text_problems "$f"
-  t="$(type_of "$f" frozenProcesses)"
+  record_text_problems "$f" || return 2
+  t="$(type_of "$f" frozenProcesses)" || return 2
   if [[ -n "$t" && "$t" != "(any)" ]]; then
     if [[ "$t" != array ]]; then
       echo "frozenProcesses is a $t, not an array"
     else
       i=0
-      while [[ -n "$(type_of "$f" "frozenProcesses.$i")" ]]; do
-        if [[ "$(type_of "$f" "frozenProcesses.$i")" != dictionary ]]; then
+      while :; do
+        t="$(type_of "$f" "frozenProcesses.$i")" || return 2
+        [[ -n "$t" ]] || break
+        if [[ "$t" != dictionary ]]; then
           echo "frozenProcesses[$i] is not an object"
         else
-          [[ "$(type_of "$f" "frozenProcesses.$i.pid")" == integer ]] || echo "frozenProcesses[$i].pid is not an integer"
+          t="$(type_of "$f" "frozenProcesses.$i.pid")" || return 2
+          [[ "$t" == integer ]] || echo "frozenProcesses[$i].pid is not an integer"
           for n in startedAt startedAtMicros; do
-            t="$(type_of "$f" "frozenProcesses.$i.$n")"
+            t="$(type_of "$f" "frozenProcesses.$i.$n")" || return 2
             [[ -z "$t" || "$t" == integer || "$t" == "(any)" ]] || echo "frozenProcesses[$i].$n is a $t, not an integer"
           done
-          t="$(type_of "$f" "frozenProcesses.$i.bootSession")"
+          t="$(type_of "$f" "frozenProcesses.$i.bootSession")" || return 2
           [[ -z "$t" || "$t" == string || "$t" == "(any)" ]] || echo "frozenProcesses[$i].bootSession is a $t, not a string"
         fi
         i=$((i + 1))
       done
     fi
   fi
-  t="$(type_of "$f" frozenPids)"
+  t="$(type_of "$f" frozenPids)" || return 2
   if [[ -n "$t" && "$t" != "(any)" ]]; then
     if [[ "$t" != array ]]; then
       echo "frozenPids is a $t, not an array"
     else
       i=0
-      while [[ -n "$(type_of "$f" "frozenPids.$i")" ]]; do
-        [[ "$(type_of "$f" "frozenPids.$i")" == integer ]] || echo "frozenPids[$i] is not an integer"
+      while :; do
+        t="$(type_of "$f" "frozenPids.$i")" || return 2
+        [[ -n "$t" ]] || break
+        [[ "$t" == integer ]] || echo "frozenPids[$i] is not an integer"
         i=$((i + 1))
       done
     fi
   fi
-  t="$(type_of "$f" savedAudioOutputs)"
+  t="$(type_of "$f" savedAudioOutputs)" || return 2
   if [[ -n "$t" && "$t" != "(any)" ]]; then
     if [[ "$t" != array ]]; then
       echo "savedAudioOutputs is a $t, not an array"
     else
       i=0
-      while [[ -n "$(type_of "$f" "savedAudioOutputs.$i")" ]]; do
-        if [[ "$(type_of "$f" "savedAudioOutputs.$i")" != dictionary ]]; then
+      while :; do
+        t="$(type_of "$f" "savedAudioOutputs.$i")" || return 2
+        [[ -n "$t" ]] || break
+        if [[ "$t" != dictionary ]]; then
           echo "savedAudioOutputs[$i] is not an object"
         else
-          [[ "$(type_of "$f" "savedAudioOutputs.$i.deviceUID")" == string ]] || echo "savedAudioOutputs[$i].deviceUID is not a string"
-          t="$(type_of "$f" "savedAudioOutputs.$i.volume")"
+          t="$(type_of "$f" "savedAudioOutputs.$i.deviceUID")" || return 2
+          [[ "$t" == string ]] || echo "savedAudioOutputs[$i].deviceUID is not a string"
+          t="$(type_of "$f" "savedAudioOutputs.$i.volume")" || return 2
           [[ "$t" == float || "$t" == integer ]] || echo "savedAudioOutputs[$i].volume is not a number"
-          [[ "$(type_of "$f" "savedAudioOutputs.$i.muted")" == bool ]] || echo "savedAudioOutputs[$i].muted is not a bool"
-          t="$(type_of "$f" "savedAudioOutputs.$i.name")"
+          t="$(type_of "$f" "savedAudioOutputs.$i.muted")" || return 2
+          [[ "$t" == bool ]] || echo "savedAudioOutputs[$i].muted is not a bool"
+          t="$(type_of "$f" "savedAudioOutputs.$i.name")" || return 2
           [[ -z "$t" || "$t" == string || "$t" == "(any)" ]] || echo "savedAudioOutputs[$i].name is a $t, not a string"
-          t="$(type_of "$f" "savedAudioOutputs.$i.saveID")"
+          t="$(type_of "$f" "savedAudioOutputs.$i.saveID")" || return 2
           [[ -z "$t" || "$t" == string || "$t" == "(any)" ]] || echo "savedAudioOutputs[$i].saveID is a $t, not a string"
         fi
         i=$((i + 1))
       done
     fi
   fi
-  t="$(type_of "$f" appNapOverrides)"
+  t="$(type_of "$f" appNapOverrides)" || return 2
   if [[ -n "$t" && "$t" != "(any)" ]]; then
     if [[ "$t" != array ]]; then
       echo "appNapOverrides is a $t, not an array"
     else
       i=0
-      while [[ -n "$(type_of "$f" "appNapOverrides.$i")" ]]; do
-        if [[ "$(type_of "$f" "appNapOverrides.$i")" != dictionary ]]; then
+      while :; do
+        t="$(type_of "$f" "appNapOverrides.$i")" || return 2
+        [[ -n "$t" ]] || break
+        if [[ "$t" != dictionary ]]; then
           echo "appNapOverrides[$i] is not an object"
         else
-          [[ "$(type_of "$f" "appNapOverrides.$i.bundleId")" == string ]] || echo "appNapOverrides[$i].bundleId is not a string"
-          t="$(type_of "$f" "appNapOverrides.$i.previous")"
+          t="$(type_of "$f" "appNapOverrides.$i.bundleId")" || return 2
+          [[ "$t" == string ]] || echo "appNapOverrides[$i].bundleId is not a string"
+          t="$(type_of "$f" "appNapOverrides.$i.previous")" || return 2
           [[ -z "$t" || "$t" == bool || "$t" == "(any)" ]] || echo "appNapOverrides[$i].previous is a $t, not a bool"
         fi
         i=$((i + 1))
       done
     fi
   fi
+  return 0
 }
 
 # Seconds since the epoch for a date in the one form session.json may hold,
@@ -790,10 +1193,12 @@ epoch_of() { # string
 # epoch_of the string at a keypath, read exactly as the app's decoder sees
 # it. Command substitution strips every trailing newline, stored ones too,
 # so a sentinel follows plutil's output and only plutil's own newline is
-# cut: "...Z\n" in the file is refused here as it is in the app.
+# cut: "...Z\n" in the file is refused here as it is in the app. Returns 2
+# when the read failed.
 epoch_at() { # file keypath
-  local v
-  v="$(extract "$1" "$2"; echo .)"
+  local v rc=0
+  v="$(extract "$1" "$2" && echo .)" || rc=$?
+  (( rc != 2 )) || return 2
   v="${v%.}"
   epoch_of "${v%$'\n'}"
 }
@@ -803,63 +1208,97 @@ epoch_at() { # file keypath
 # endsAt are dates as Store.swift writes them and whose extensions is an
 # array of numbers. All three are required; extra keys are ignored, as in
 # Swift. The app refuses a file with any of these problems, so the shell
-# does not act on its endsAt either.
+# does not act on its endsAt either. Returns 2 when a read failed, like
+# journal_shape_problems, whose rules and text it shares with uninstall.sh.
 session_shape_problems() { # file
-  local f="$1" key t i
+  local f="$1" key t e i json rc=0 lead
   # plutil also reads XML and binary property lists, which the app's
-  # JSONDecoder refuses, so the file itself must start with "{" too.
-  if [[ "$(LC_ALL=C tr -d ' \t\r\n' < "$f" 2>/dev/null | head -c 1)" != "{" ]] \
-     || [[ "$("$PLUTIL" -convert json -o - "$f" 2>/dev/null | head -c 1)" != "{" ]]; then
+  # JSONDecoder refuses, so the file itself must start with "{" too, after
+  # any spaces, tabs and line ends (a NUL byte there is not "{" either).
+  json="$(plutil_read -convert json -o - "$f")" || rc=$?
+  (( rc != 2 )) || return 2
+  rc=0
+  read_whole "$f" || rc=$?
+  (( rc != 2 )) || return 2
+  lead="${WHOLE_HEAD#"${WHOLE_HEAD%%[!$' \t\r\n']*}"}"
+  if [[ "${lead:0:1}" != "{" || "${json:0:1}" != "{" ]]; then
     echo "session.json is not a JSON object"
     return 0
   fi
   for key in startedAt endsAt; do
-    t="$(type_of "$f" "$key")"
+    t="$(type_of "$f" "$key")" || return 2
     if [[ -z "$t" ]]; then
       echo "$key is missing"
     elif [[ "$t" != string ]]; then
       echo "$key is a JSON $t, not a date string"
-    elif [[ -z "$(epoch_at "$f" "$key")" ]]; then
-      echo "$key is not a date in the form 2027-01-15T08:00:00Z or 2027-01-15T10:00:00+02:00"
+    else
+      e="$(epoch_at "$f" "$key")" || return 2
+      [[ -n "$e" ]] || echo "$key is not a date in the form 2027-01-15T08:00:00Z or 2027-01-15T10:00:00+02:00"
     fi
   done
-  t="$(type_of "$f" extensions)"
+  t="$(type_of "$f" extensions)" || return 2
   if [[ -z "$t" ]]; then
     echo "extensions is missing"
   elif [[ "$t" != array ]]; then
     echo "extensions is a JSON $t, not an array"
   else
     i=0
-    while [[ -n "$(type_of "$f" "extensions.$i")" ]]; do
-      t="$(type_of "$f" "extensions.$i")"
+    while :; do
+      t="$(type_of "$f" "extensions.$i")" || return 2
+      [[ -n "$t" ]] || break
       [[ "$t" == integer || "$t" == float ]] || echo "extensions[$i] is a JSON $t, not a number"
       i=$((i + 1))
     done
   fi
+  return 0
 }
 
 # --- Read the session --------------------------------------------------------
 # session_state: none | valid | expired | malformed | unreadable
 session_state=none
 ends_at=""
+ends_epoch=""
 unreadable_why=""
 session_problems=""
+SESSION_COPY="$WORK/session.json"
 if [[ -e "$SESSION" ]]; then
   # Only a regular file is opened: open(2) on a FIFO with no writer, or on
-  # some devices, blocks, and this run holds the recovery lock.
+  # some devices, blocks, and this run holds the recovery lock. The copy is
+  # a bounded call, so a FIFO put there after this check cannot keep the
+  # lock waiting either.
   if [[ ! -f "$SESSION" ]]; then
     session_state=unreadable
     unreadable_why="it is not a regular file, so it is not opened"
-  elif ! cat "$SESSION" >/dev/null 2>&1; then
-    session_state=unreadable
-    unreadable_why="permissions or I/O"
   else
-    session_problems="$(session_shape_problems "$SESSION")"
-    if [[ -n "$session_problems" ]]; then
-      session_state=malformed
+    read_rc=0
+    snapshot "$SESSION" "$SESSION_COPY" || read_rc=$?
+    if (( read_rc == 124 )); then
+      session_state=unreadable
+      unreadable_why="it could not be read within ${READ_TIMEOUT_SECONDS}s"
+    elif (( read_rc != 0 )); then
+      session_state=unreadable
+      unreadable_why="permissions or I/O"
     else
-      ends_at="$(extract "$SESSION" endsAt || true)"
-      if (( $(epoch_at "$SESSION" endsAt) > $("$DATE" -u +%s) )); then
+      session_problems="$(session_shape_problems "$SESSION_COPY")" || read_rc=$?
+      if (( read_rc == 0 )) && [[ -z "$session_problems" ]]; then
+        value_at "$SESSION_COPY" endsAt || read_rc=$?
+        ends_at="$VALUE"
+        if (( read_rc == 0 )); then
+          ends_epoch="$(epoch_at "$SESSION_COPY" endsAt)" || read_rc=$?
+        fi
+      fi
+      if (( read_rc != 0 )); then
+        # A read of the private copy failed or did not answer: the end time
+        # is unknown, as for a file that cannot be read at all. The journal
+        # reads below get their own chance.
+        first_read_failure "$read_rc"
+        session_state=unreadable
+        session_problems=""
+        unreadable_why="reading its copy failed: $READ_WHY"
+        "$RM" -f "$READ_FAILURES"
+      elif [[ -n "$session_problems" ]]; then
+        session_state=malformed
+      elif (( ${ends_epoch:-0} > $("$DATE" -u +%s) )); then
         session_state=valid
       else
         session_state=expired
@@ -874,54 +1313,76 @@ fi
 
 # --- Read the journal --------------------------------------------------------
 # journal_state: missing | malformed | clean | dirty
+# Every check reads the private copy; every journal value used from here
+# on, the ones published again included, comes from it.
+STATE_COPY="$WORK/state.json"
 if [[ ! -e "$STATE" ]]; then
   journal_state=missing
 elif [[ ! -f "$STATE" ]]; then
   # Never opened, for the same reason as session.json above.
   journal_state=malformed
   shape_problems="not a regular file"
-elif ! "$PLUTIL" -convert json -o /dev/null "$STATE" >/dev/null 2>&1; then
-  journal_state=malformed
-  shape_problems="not valid JSON"
 else
-  shape_problems="$(journal_shape_problems "$STATE")"
-  if [[ -n "$shape_problems" ]]; then journal_state=malformed; else journal_state=clean; fi
+  read_rc=0
+  snapshot "$STATE" "$STATE_COPY" || read_rc=$?
+  if (( read_rc != 0 )); then
+    journal_state=malformed
+    shape_problems="it could not be read: cp $(call_result "$read_rc")"
+  else
+    shape_problems="$(journal_shape_problems "$STATE_COPY")" || read_rc=$?
+    (( read_rc == 0 )) || read_stopped "$STATE" "$read_rc"
+    if [[ -n "$shape_problems" ]]; then journal_state=malformed; else journal_state=clean; fi
+  fi
 fi
 
 if [[ "$journal_state" == malformed ]]; then
-  while IFS= read -r line; do
-    [[ -n "$line" ]] && log error "$STATE: $line"
-  done <<< "$shape_problems"
+  text_lines "$shape_problems"
+  for line in ${TEXT_LINES[@]+"${TEXT_LINES[@]}"}; do
+    log error "$STATE: $line"
+  done
   log error "$STATE is unreadable or malformed; nothing undone, evidence kept. Open Insomnia or repair the file, then rerun"
   exit 1
 fi
+
+# The value at key path $1 of the journal copy in VALUE: 0 when there is
+# one, 1 when there is none or only null. A read that failed or did not
+# answer ends the run (read_stopped), so callers never see it as absent.
+journal_value() { # keypath [raw|json]
+  local rc=0
+  value_at "$STATE_COPY" "$1" "${2:-raw}" || rc=$?
+  (( rc != 2 )) || read_stopped "$1 in $STATE"
+  return "$rc"
+}
+journal_true() { # key
+  journal_value "$1" && [[ "$VALUE" == true ]]
+}
 
 sleep_held=false; low_power=false; docker_frozen=false; has_audio=0
 has_display=0; has_keyboard=0; refused_display=0; refused_keyboard=0
 frozen_count=0; legacy_count=0; app_nap_count=0; output_count=0
 if [[ "$journal_state" == clean ]]; then
-  is_true "$STATE" sleepDisabledByUs && sleep_held=true
-  is_true "$STATE" lowPowerSetByUs && low_power=true
-  is_true "$STATE" dockerFrozen && docker_frozen=true
-  extract "$STATE" savedOutputVolume >/dev/null && has_audio=1
-  extract "$STATE" savedMuted >/dev/null && has_audio=1
-  if extract "$STATE" savedDisplayBrightness >/dev/null; then
-    if is_true "$STATE" displayRestoreRefused; then refused_display=1; else has_display=1; fi
+  journal_true sleepDisabledByUs && sleep_held=true
+  journal_true lowPowerSetByUs && low_power=true
+  journal_true dockerFrozen && docker_frozen=true
+  journal_value savedOutputVolume && has_audio=1
+  journal_value savedMuted && has_audio=1
+  if journal_value savedDisplayBrightness; then
+    if journal_true displayRestoreRefused; then refused_display=1; else has_display=1; fi
   fi
-  if extract "$STATE" savedKeyboardBrightness >/dev/null; then
-    if is_true "$STATE" keyboardRestoreRefused; then refused_keyboard=1; else has_keyboard=1; fi
+  if journal_value savedKeyboardBrightness; then
+    if journal_true keyboardRestoreRefused; then refused_keyboard=1; else has_keyboard=1; fi
   fi
-  while extract_json "$STATE" "frozenProcesses.$frozen_count" >/dev/null; do
+  while journal_value "frozenProcesses.$frozen_count" json; do
     frozen_count=$((frozen_count + 1))
   done
-  while extract "$STATE" "frozenPids.$legacy_count" >/dev/null; do
+  while journal_value "frozenPids.$legacy_count"; do
     legacy_count=$((legacy_count + 1))
   done
-  while extract_json "$STATE" "appNapOverrides.$app_nap_count" >/dev/null; do
+  while journal_value "appNapOverrides.$app_nap_count" json; do
     app_nap_count=$((app_nap_count + 1))
   done
   # Kept for the app and not counted as dirty; see the header.
-  while extract_json "$STATE" "savedAudioOutputs.$output_count" >/dev/null; do
+  while journal_value "savedAudioOutputs.$output_count" json; do
     output_count=$((output_count + 1))
   done
   if [[ "$sleep_held" == true || "$low_power" == true || "$docker_frozen" == true ]] \
@@ -951,9 +1412,10 @@ fi
 # hence the check of both paths afterwards).
 quarantine_session() {
   local base dest n line what
-  while IFS= read -r line; do
-    [[ -n "$line" ]] && log warn "$SESSION: $line"
-  done <<< "$session_problems"
+  text_lines "$session_problems"
+  for line in ${TEXT_LINES[@]+"${TEXT_LINES[@]}"}; do
+    log warn "$SESSION: $line"
+  done
   what="session.json unreadable"
   [[ "$session_state" == unreadable ]] && what="session.json cannot be read ($unreadable_why)"
   base="$SESSION.unreadable-$("$DATE" -u +%Y%m%dT%H%M%SZ)"
@@ -1024,6 +1486,18 @@ if [[ "$sleep_held" == true ]]; then
   fi
 fi
 
+# Whether file $1, about to be published as state.json, is still a JSON
+# object both as plutil reads it and as text (plutil keeps a JSON file
+# JSON): 0 when it is; 1 when not, or when a read failed or did not answer
+# (noted in READ_FAILURES).
+still_json() { # file
+  local json rc=0
+  json="$(plutil_read -convert json -o - "$1")" || return 1
+  [[ "${json:0:1}" == "{" ]] || return 1
+  read_whole "$1" || rc=$?
+  (( rc == 0 )) && [[ "${WHOLE_TEXT:0:1}" == "{" ]]
+}
+
 # The app's record of a kept display entry the mode was over
 # (keptDisplayUnderLowPower). The mode may have been on in this boot until
 # now, and the panel comes back from it over a time nobody has measured, so
@@ -1039,21 +1513,22 @@ fi
 # since switched off with the old boot on disk, the app could take the panel
 # on its way back for the level the user set. A journal with no record, or a
 # null one, gets none.
+boot_published=0
+boot_value=""
 prepare_low_power_off() {
-  local t boot recorded tmp ok=1
-  t="$(type_of "$STATE" keptDisplayUnderLowPower)"
+  local t tmp ok=1
+  t="$(type_of "$STATE_COPY" keptDisplayUnderLowPower)" || read_stopped "keptDisplayUnderLowPower in $STATE"
   [[ "$t" == float || "$t" == integer ]] || return 0
-  boot="$("$SYSCTL" -n kern.bootsessionuuid 2>/dev/null || true)"
-  recorded="$(extract "$STATE" keptDisplayUnderLowPowerBoot || true)"
-  [[ "$recorded" == "$boot" ]] && return 0
+  boot_value="$("$SYSCTL" -n kern.bootsessionuuid 2>/dev/null || true)"
+  journal_value keptDisplayUnderLowPowerBoot || true
+  [[ "$VALUE" == "$boot_value" ]] && return 0
   tmp="$APP_SUPPORT/.state.json.backstop-boot.$$"
-  "$CP" "$STATE" "$tmp" || ok=0
+  snapshot "$STATE_COPY" "$tmp" || ok=0
   if (( ok == 1 )); then
-    "$PLUTIL" -replace keptDisplayUnderLowPowerBoot -string "$boot" "$tmp" >/dev/null 2>&1 || ok=0
+    bounded "$PLUTIL" -replace keptDisplayUnderLowPowerBoot -string "$boot_value" "$tmp" || ok=0
   fi
   if (( ok == 1 )); then
-    [[ "$("$PLUTIL" -convert json -o - "$tmp" 2>/dev/null | head -c 1)" == "{" ]] || ok=0
-    [[ "$(head -c 1 "$tmp")" == "{" ]] || ok=0
+    still_json "$tmp" || ok=0
   fi
   if (( ok == 1 )); then
     "$MV" -f "$tmp" "$STATE" || ok=0
@@ -1062,7 +1537,10 @@ prepare_low_power_off() {
     "$RM" -f "$tmp"
     return 1
   fi
-  log info "kept display entry's record given this boot (${boot:-unreadable, written empty}) before Low Power Mode is switched off"
+  # The journal published at the end starts from the copy read at the
+  # start, so it gets the same boot.
+  boot_published=1
+  log info "kept display entry's record given this boot (${boot_value:-unreadable, written empty}) before Low Power Mode is switched off"
 }
 
 new_low="$low_power"
@@ -1091,11 +1569,17 @@ keep_entry() { # index
 # Observe one pid. Sets observation to one of:
 #   gone      ps exited 1 and printed nothing (the only absence signal ps gives)
 #   seen      p_epoch, p_stat, p_uid are filled in
-#   unknown   ps failed some other way or printed something unparseable
+#   unknown   ps failed some other way, did not answer within
+#             READ_TIMEOUT_SECONDS (a bounded read), or printed something
+#             unparseable
 observe() { # pid
   local out rc=0
   observation=unknown; p_epoch=""; p_stat=""; p_uid=""
-  out="$("$PS" -o lstart=,stat=,uid= -p "$1" 2>&1)" || rc=$?
+  bounded "$PS" -o lstart=,stat=,uid= -p "$1" || rc=$?
+  (( rc == 0 || rc == 1 )) || return 0
+  work_read "$BOUNDED_BASE.out" || return 0
+  # As $(...) would read it: trailing newlines cut.
+  out="${READ_TEXT%"${READ_TEXT##*[!$'\n']}"}"
   if (( rc == 1 )) && [[ -z "$out" ]]; then
     observation=gone
     return 0
@@ -1125,7 +1609,7 @@ app_args=()
 # binary may have resumed some of them before it went wrong; the next run
 # finds those running and clears them.
 resume_via_app() {
-  local n=${#app_pid[@]} k rc=0 valid=1 settled=1 expected=0 size line word excerpt="" p answer declared
+  local n=${#app_pid[@]} k rc=0 read_rc valid=1 settled=1 expected=0 line word excerpt="" p rest declared unknown
   local -a words
   words=()
   if [[ ! -x "$INSOMNIA_BIN" ]]; then
@@ -1136,10 +1620,26 @@ resume_via_app() {
     done
     return 0
   fi
-  # A regular file only: a FIFO there could block this run under the lock.
+  # The version read before the lock applies only to the same file,
+  # unchanged (see read_info_version); no Info.plist is read here.
   declared=""
-  if [[ -f "$INSOMNIA_INFO" ]]; then
-    declared="$(extract "$INSOMNIA_INFO" InsomniaResumeFrozenVersion || true)"
+  unknown=""
+  if [[ "$INFO_EVIDENCE" == unknown ]]; then
+    unknown="the InsomniaResumeFrozenVersion that $INSOMNIA_INFO declares is unknown ($INFO_PROBLEM), and no Info.plist is read under the recovery lock"
+  elif ! info_identity "$INSOMNIA_INFO"; then
+    unknown="whether the InsomniaResumeFrozenVersion read from $INSOMNIA_INFO before the recovery lock still applies is unknown ($INFO_PROBLEM under the lock)"
+  elif [[ "$INFO_ID" != "$INFO_EVIDENCE" ]]; then
+    unknown="$INSOMNIA_INFO changed after its InsomniaResumeFrozenVersion was read before the recovery lock (an install may have replaced the app meanwhile)"
+  else
+    declared="$INFO_VERSION"
+  fi
+  if [[ -n "$unknown" ]]; then
+    for (( k = 0; k < n; k++ )); do
+      log error "pid ${app_pid[k]} needs the app binary for its microsecond identity check, but $unknown; the binary was not run; kept, not signaled"
+      failures+=("pid ${app_pid[k]} was not resumed: whether the installed app declares --resume-frozen version $RESUME_FROZEN_VERSION is unknown")
+      keep_entry "${app_index[k]}"
+    done
+    return 0
   fi
   if [[ "$declared" != "$RESUME_FROZEN_VERSION" ]]; then
     for (( k = 0; k < n; k++ )); do
@@ -1164,18 +1664,29 @@ resume_via_app() {
   else
     run_app_bounded "$INSOMNIA_BIN" --resume-frozen "$((COMMAND_TIMEOUT_SECONDS + KILL_GRACE_SECONDS))" || rc=$?
   fi
-  if (( rc == 125 )) || [[ ! -f "$app_answer_dir/out" ]]; then
+  # The answer is read whole by work_read (the folder is this run's own,
+  # like WORK): one with a NUL byte, or one that cannot be read back whole,
+  # is not valid. The excerpt for the log leaves NUL bytes out and shows
+  # other bytes that do not print as spaces.
+  read_rc=2
+  if (( rc != 125 )) && [[ -n "$app_answer_dir" ]]; then
+    read_rc=0
+    work_read "$app_answer_dir/out" || read_rc=$?
+  fi
+  (( read_rc == 2 )) || excerpt="${READ_TEXT:0:200}"
+  excerpt="${excerpt//[![:print:]]/ }"
+  if (( read_rc != 0 )); then
     valid=0
   else
-    answer="$app_answer_dir/out"
-    size="$(stat -f %z "$answer" 2>/dev/null || echo 0)"
-    excerpt="$(head -c 200 "$answer" | tr -c '[:print:]' ' ')"
     # A valid line is at most 24 bytes ("<10-digit pid> unverifiable\n").
-    if (( size > n * 32 )); then
+    if (( ${#READ_TEXT} > n * 32 )); then
       valid=0
     else
       k=0
-      while IFS= read -r line || [[ -n "$line" ]]; do
+      rest="$READ_TEXT"
+      while [[ -n "$rest" ]]; do
+        line="${rest%%$'\n'*}"
+        if [[ "$rest" == *$'\n'* ]]; then rest="${rest#*$'\n'}"; else rest=""; fi
         if (( k >= n )) || [[ "$line" != "${app_pid[k]} "* ]]; then valid=0; break; fi
         word="${line#"${app_pid[k]} "}"
         case "$word" in
@@ -1185,7 +1696,7 @@ resume_via_app() {
         esac
         words+=("$word")
         k=$((k + 1))
-      done < "$answer"
+      done
       (( k == n )) || valid=0
     fi
   fi
@@ -1225,10 +1736,14 @@ if (( frozen_count > 0 )); then
   uid_now="$(id -u)"
   i=0
   while (( i < frozen_count )); do
-    pid="$(extract "$STATE" "frozenProcesses.$i.pid" || true)"
-    started="$(extract "$STATE" "frozenProcesses.$i.startedAt" || true)"
-    micros="$(extract "$STATE" "frozenProcesses.$i.startedAtMicros" || true)"
-    boot="$(extract "$STATE" "frozenProcesses.$i.bootSession" || true)"
+    journal_value "frozenProcesses.$i.pid" || true
+    pid="$VALUE"
+    journal_value "frozenProcesses.$i.startedAt" || true
+    started="$VALUE"
+    journal_value "frozenProcesses.$i.startedAtMicros" || true
+    micros="$VALUE"
+    journal_value "frozenProcesses.$i.bootSession" || true
+    boot="$VALUE"
     if ! is_positive_int "$pid"; then
       log error "frozen entry $i has no valid pid (${pid:-?}); kept, not signaled"
       failures+=("frozen entry $i has an invalid pid")
@@ -1295,7 +1810,9 @@ kept_frozen=""
 kept_frozen_count=0
 for (( i = 0; i < frozen_count; i++ )); do
   [[ -n "${kept[i]:-}" ]] || continue
-  if ! entry="$(extract_json "$STATE" "frozenProcesses.$i")" || [[ -z "$entry" ]]; then
+  journal_value "frozenProcesses.$i" json || true
+  entry="$VALUE"
+  if [[ -z "$entry" ]]; then
     log error "could not read frozen entry $i back from $STATE; previous journal kept, will retry"
     exit 1
   fi
@@ -1304,7 +1821,8 @@ for (( i = 0; i < frozen_count; i++ )); do
 done
 
 if (( legacy_count > 0 )); then
-  legacy_json="$(extract_json "$STATE" frozenPids || true)"
+  journal_value frozenPids json || true
+  legacy_json="$VALUE"
   log error "legacy frozenPids $legacy_json have no identity; not signaled and not cleared here, the app must resolve them"
   failures+=("legacy frozenPids $legacy_json were not resumed (identity unknown; only the app resolves these)")
 fi
@@ -1314,6 +1832,14 @@ if [[ "$docker_frozen" == true ]] && (( kept_frozen_count == 0 && legacy_count =
   new_docker=false; changed=1
 fi
 
+# Whether the output defaults wrote to $1, a file in WORK, holds the words
+# $2. Output that cannot be read back holds nothing.
+probe_says() { # file words
+  local rc=0
+  work_read "$1" || rc=$?
+  (( rc != 2 )) && [[ "$READ_TEXT" == *"$2"* ]]
+}
+
 # App Nap. The app set NSAppSleepDisabled to YES in each listed agent app's
 # preferences and journaled what the key was before. Put that back with the
 # tool a person would use. Each entry is kept verbatim (unknown fields
@@ -1322,15 +1848,22 @@ kept_app_nap=""
 kept_app_nap_count=0
 keep_app_nap_entry() { # index
   local entry
-  entry="$(extract_json "$STATE" "appNapOverrides.$1")"
+  journal_value "appNapOverrides.$1" json || true
+  entry="$VALUE"
+  if [[ -z "$entry" ]]; then
+    log error "could not read App Nap entry $1 back from $STATE; previous journal kept, will retry"
+    exit 1
+  fi
   if [[ -n "$kept_app_nap" ]]; then kept_app_nap="$kept_app_nap,$entry"; else kept_app_nap="$entry"; fi
   kept_app_nap_count=$((kept_app_nap_count + 1))
 }
 if (( app_nap_count > 0 )); then
   i=0
   while (( i < app_nap_count )); do
-    bundle="$(extract "$STATE" "appNapOverrides.$i.bundleId" || true)"
-    previous="$(extract "$STATE" "appNapOverrides.$i.previous" || true)"
+    journal_value "appNapOverrides.$i.bundleId" || true
+    bundle="$VALUE"
+    journal_value "appNapOverrides.$i.previous" || true
+    previous="$VALUE"
     if [[ -z "$bundle" || "$bundle" == -* ]]; then
       log error "App Nap entry $i has no usable bundle id (${bundle:-?}); kept, nothing written"
       failures+=("App Nap entry $i has no usable bundle id")
@@ -1358,7 +1891,7 @@ if (( app_nap_count > 0 )); then
         changed=1
       else
         if (( command_alive )); then stop_transaction "defaults delete $bundle NSAppSleepDisabled"; fi
-        probe="$APP_SUPPORT/.backstop.$$.read"
+        probe="$WORK/defaults-read.out"
         bounded_output="$probe"
         read_rc=0
         run_bounded "$DEFAULTS" read "$bundle" NSAppSleepDisabled || read_rc=$?
@@ -1368,7 +1901,7 @@ if (( app_nap_count > 0 )); then
           log error "defaults delete $bundle NSAppSleepDisabled failed and the key is still set; keeping journal entry for retry"
           failures+=("App Nap is still off for $bundle: defaults delete failed")
           keep_app_nap_entry "$i"
-        elif grep -q "does not exist" "$probe" 2>/dev/null; then
+        elif probe_says "$probe" "does not exist"; then
           log info "defaults delete $bundle NSAppSleepDisabled: the key is already absent"
           changed=1
         else
@@ -1396,31 +1929,35 @@ fi
 [[ -n "$refused_note" ]] && log info "$refused_note"
 
 # --- Publish -----------------------------------------------------------------
-# Edit a private copy, verify it, then rename it over state.json so readers
-# only ever see a complete journal. Keys we do not own survive untouched.
+# Edit a copy of the journal as this run read it (STATE_COPY), verify it,
+# then rename it over state.json so readers only ever see a complete
+# journal. Keys we do not own survive untouched. Each edit and check is a
+# bounded call; one that fails or does not answer keeps the previous
+# journal.
 if (( changed == 1 )); then
   tmp="$APP_SUPPORT/.state.json.backstop.$$"
   publish_ok=1
-  "$CP" "$STATE" "$tmp" || publish_ok=0
+  snapshot "$STATE_COPY" "$tmp" || publish_ok=0
+  if (( publish_ok == 1 && boot_published == 1 )); then
+    bounded "$PLUTIL" -replace keptDisplayUnderLowPowerBoot -string "$boot_value" "$tmp" || publish_ok=0
+  fi
   if (( publish_ok == 1 )) && [[ "$new_sleep" != "$sleep_held" ]]; then
-    "$PLUTIL" -replace sleepDisabledByUs -bool "$new_sleep" "$tmp" >/dev/null 2>&1 || publish_ok=0
+    bounded "$PLUTIL" -replace sleepDisabledByUs -bool "$new_sleep" "$tmp" || publish_ok=0
   fi
   if (( publish_ok == 1 )) && [[ "$new_low" != "$low_power" ]]; then
-    "$PLUTIL" -replace lowPowerSetByUs -bool "$new_low" "$tmp" >/dev/null 2>&1 || publish_ok=0
+    bounded "$PLUTIL" -replace lowPowerSetByUs -bool "$new_low" "$tmp" || publish_ok=0
   fi
   if (( publish_ok == 1 )) && [[ "$new_docker" != "$docker_frozen" ]]; then
-    "$PLUTIL" -replace dockerFrozen -bool "$new_docker" "$tmp" >/dev/null 2>&1 || publish_ok=0
+    bounded "$PLUTIL" -replace dockerFrozen -bool "$new_docker" "$tmp" || publish_ok=0
   fi
   if (( publish_ok == 1 && frozen_count > 0 )); then
-    "$PLUTIL" -replace frozenProcesses -json "[$kept_frozen]" "$tmp" >/dev/null 2>&1 || publish_ok=0
+    bounded "$PLUTIL" -replace frozenProcesses -json "[$kept_frozen]" "$tmp" || publish_ok=0
   fi
   if (( publish_ok == 1 && app_nap_count > 0 )); then
-    "$PLUTIL" -replace appNapOverrides -json "[$kept_app_nap]" "$tmp" >/dev/null 2>&1 || publish_ok=0
+    bounded "$PLUTIL" -replace appNapOverrides -json "[$kept_app_nap]" "$tmp" || publish_ok=0
   fi
   if (( publish_ok == 1 )); then
-    # plutil keeps JSON files as JSON; make sure the result is still one.
-    [[ "$("$PLUTIL" -convert json -o - "$tmp" 2>/dev/null | head -c 1)" == "{" ]] || publish_ok=0
-    [[ "$(head -c 1 "$tmp")" == "{" ]] || publish_ok=0
+    still_json "$tmp" || publish_ok=0
   fi
   if (( publish_ok == 1 )); then
     "$MV" -f "$tmp" "$STATE" || publish_ok=0

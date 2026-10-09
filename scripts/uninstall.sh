@@ -86,6 +86,8 @@ TEST=/bin/test
 CAT=/bin/cat
 CP=/bin/cp
 STAT=/usr/bin/stat
+LS=/bin/ls
+WC=/usr/bin/wc
 # The shell sudoers_remove runs as root.
 ROOT_BASH=/bin/bash
 LOCK_TIMEOUT_SECONDS=10
@@ -100,6 +102,9 @@ QUIT_WAIT_SECONDS=10
 # password is asked once, with `sudo -v` before the lock is taken, so no
 # call made under the lock waits for a prompt.
 CALL_TIMEOUT_SECONDS=30
+# Longest backstop.sh may run in step 3 before it is sent SIGTERM (see
+# run_backstop).
+BACKSTOP_TIMEOUT_SECONDS=300
 APP="$HOME/Applications/Insomnia.app"
 SUDOERS=/etc/sudoers.d/insomnia
 # Held, as root, by install.sh and uninstall.sh around each compare and
@@ -182,24 +187,30 @@ trap '"$RM" -f "$WORK"/call.* "$WORK"/*.json "$WORK"/*.lines 2>/dev/null; "$RMDI
 # sudo. The supervisor and the call keep fd 9 (the recovery lock) until the
 # call has exited, so a launchctl bootout made under the lock cannot unload
 # an agent the app confirms after this run is gone, and a sudo that ignores
-# SIGTERM keeps the lock until it ends.
+# SIGTERM keeps the lock until it ends. BOUNDED_LIMIT and BOUNDED_TERM_ONLY
+# give one call another limit, or SIGTERM only (see run_backstop).
 BOUNDED_OUTPUT=""
 BOUNDED_PID=""
 BOUNDED_BASE=""
+BOUNDED_LIMIT=""
+BOUNDED_TERM_ONLY=""
 bounded() { # command args...
-  local base supervisor rc deadline
-  base="$("$MKTEMP" "$WORK/call.XXXXXX")"
-  BOUNDED_BASE="$base"
+  local base supervisor rc deadline limit="${BOUNDED_LIMIT:-$CALL_TIMEOUT_SECONDS}" term_only=0 polls=0
+  if [[ "$1" == "$SUDO" || -n "${BOUNDED_TERM_ONLY:-}" ]]; then term_only=1; fi
+  BOUNDED_BASE=""
   BOUNDED_OUTPUT=""
   BOUNDED_PID=""
-  supervise "$base" "$@" </dev/null >/dev/null 2>&1 &
+  base="$("$MKTEMP" "$WORK/call.XXXXXX")" || return 126
+  BOUNDED_BASE="$base"
+  supervise "$base" "$limit" "$term_only" "$@" </dev/null >/dev/null 2>&1 &
   supervisor=$!
-  if [[ "$1" == "$SUDO" ]]; then
+  if (( term_only )); then
     # The supervisor's limit (at most a second over), then at least two
-    # seconds for sudo to stop on SIGTERM.
-    deadline=$(( SECONDS + CALL_TIMEOUT_SECONDS + 3 ))
+    # seconds for the call to stop on SIGTERM.
+    deadline=$(( SECONDS + limit + 3 ))
     while [[ ! -s "$base.rc" ]] && (( SECONDS <= deadline )); do
-      sleep 0.01
+      if (( polls < 50 )); then sleep 0.002; else sleep 0.05; fi
+      polls=$((polls + 1))
     done
     if [[ ! -s "$base.rc" ]]; then
       BOUNDED_PID="$(cat "$base.pid" 2>/dev/null || true)"
@@ -227,22 +238,23 @@ bounded() { # command args...
 # and SIGHUP actions this script started with, so it still stops on the
 # SIGTERM at its limit or from the group. errexit is off here: a failed
 # write must not end the supervisor while its call runs.
-supervise() { # base command args...
-  local base="$1" cpid rc=0 deadline
-  shift
+supervise() { # base limit term-only command args...
+  local base="$1" limit="$2" term_only="$3" cpid rc=0 deadline polls=0
+  shift 3
   set +e
   trap '' TERM HUP
   ( trap - TERM HUP; exec "$@" ) </dev/null >"$base.out" 2>&1 &
   cpid=$!
   echo "$cpid" > "$base.pid"
-  deadline=$(( SECONDS + CALL_TIMEOUT_SECONDS ))
+  deadline=$(( SECONDS + limit ))
   while kill -0 "$cpid" 2>/dev/null && (( SECONDS <= deadline )); do
-    sleep 0.01
+    if (( polls < 50 )); then sleep 0.002; else sleep 0.05; fi
+    polls=$((polls + 1))
   done
   # Past the limit, and the shell has not reaped the call: it is still there.
   if (( SECONDS > deadline )) && [[ -n "$(jobs -rp)" ]]; then
     kill -TERM %1 2>/dev/null || true
-    if [[ "$1" != "$SUDO" ]]; then
+    if (( ! term_only )); then
       deadline=$(( SECONDS + 1 ))
       while [[ -n "$(jobs -rp)" ]] && (( SECONDS <= deadline )); do
         sleep 0.01
@@ -256,47 +268,180 @@ supervise() { # base command args...
   wait "$cpid" || rc=$?
   echo "$rc" > "$base.rc"
 }
+# backstop.sh, run as one bounded call with its own limit,
+# BACKSTOP_TIMEOUT_SECONDS, and SIGTERM only, never SIGKILL: on SIGTERM it
+# removes its private files and ends, while each sudo pmset or app binary
+# call it started keeps the recovery lock through its own supervisor until
+# that call has exited. It shares this run's lock through fd 9, which the
+# supervisor here keeps until the backstop has exited, even if this run is
+# killed first. The InsomniaResumeFrozenVersion read before the lock, and
+# the identity of the file it came from, go down in its environment (see
+# read_info_version). Returns the backstop's status, or 124 when it was
+# stopped at its limit, 125 when it was still running three seconds after
+# its SIGTERM (pid in BOUNDED_PID; it keeps the lock until it ends), 126
+# when it could not be started. What it printed is printed once it ends.
+run_backstop() { # backstop.sh
+  local rc=0 BOUNDED_LIMIT="$BACKSTOP_TIMEOUT_SECONDS" BOUNDED_TERM_ONLY=1
+  local INSOMNIA_INFO_PATH="$INFO_PLIST" INSOMNIA_INFO_EVIDENCE="$INFO_EVIDENCE" INSOMNIA_INFO_VERSION="$INFO_VERSION"
+  export INSOMNIA_INFO_PATH INSOMNIA_INFO_EVIDENCE INSOMNIA_INFO_VERSION
+  bounded /bin/bash "$1" --force || rc=$?
+  if [[ -n "$BOUNDED_OUTPUT" ]]; then printf '%s\n' "$BOUNDED_OUTPUT"; fi
+  return "$rc"
+}
 
 # Fail closed on paths that are not the exact things install.sh created.
 case "$APP_SUPPORT" in /*) ;; *) echo "refusing: app support path is not absolute: $APP_SUPPORT" >&2; exit 1 ;; esac
 [[ "$(basename "$APP")" == "Insomnia.app" ]] || { echo "refusing: $APP is not an Insomnia.app bundle path" >&2; exit 1; }
 
 # Reads made under the recovery lock (the journal, config.json) are bounded
-# calls, so none can keep the lock waiting. One that fails in a way other
-# than plutil's own "no such value" or "does not parse" (exit 1), or does
-# not answer in time, is noted in READ_FAILURES. Its caller sees no value,
-# so the caller of the whole check must treat a note there as a check that
-# did not complete (it is never a clean journal). Once a read has failed,
-# the rest return at once: they would most likely wait the same way. These
-# notes go to a file because most reads run inside $(...).
+# calls, so none can keep the lock waiting, and each has an explicit result:
+# 0 with the value; 1 when plutil said in so many words that the key path
+# holds no value or only null (or, for -convert, that the file does not
+# parse, which every caller reports as a problem); 2 when it failed any
+# other way, did not answer in time, or its output could not be read back
+# whole. A 2 is noted in READ_FAILURES, and every caller passes it on, so
+# the check that made the read returns 2 and its caller treats the 2, or a
+# note there, as a check that did not complete: never a clean journal, and
+# never an absent value. Once a read has failed, the rest return 2 at once:
+# they would most likely wait the same way. The notes go to a file because
+# most reads run inside $(...).
 READ_FAILURES="$WORK/read-failures.lines"
-plutil_read() { # plutil arguments... file -> its output; 0 read, 1 plutil said no, 2 failed (noted)
-  local rc=0 file="${!#}"
+# Reads a file this run wrote in WORK (a call's output) into READ_TEXT byte
+# for byte, without $(...), which drops NUL bytes and trailing newlines.
+# Returns 0 when all of it was read; 1 when it has a NUL byte, which no shell
+# variable can hold (READ_TEXT is then the text without them and trailing
+# newlines, and READ_HEAD the text before the first); 2 when it is not a
+# regular file, or the read failed or came up short of the size wc gives.
+# READ_HEAD is READ_TEXT otherwise. WORK is this run's own folder (mktemp
+# -d, mode 0700), so only this account could put anything else there.
+work_read() { # file -> READ_TEXT, READ_HEAD
+  local LC_ALL=C size
+  READ_TEXT=""
+  READ_HEAD=""
+  [[ -f "$1" && ! -L "$1" ]] || return 2
+  size="$("$WC" -c 2>/dev/null < "$1")" || return 2
+  size="${size//[!0-9]/}"
+  [[ -n "$size" ]] || return 2
+  if IFS= read -r -d '' READ_HEAD 2>/dev/null < "$1"; then
+    READ_TEXT="$(<"$1")" || return 2
+    return 1
+  fi
+  READ_TEXT="$READ_HEAD"
+  (( ${#READ_TEXT} == 10#$size )) || return 2
+  return 0
+}
+# The non-empty lines of $1 in TEXT_LINES, split in the shell itself: no
+# here-string, whose temporary file can fail to be written.
+TEXT_LINES=()
+text_lines() { # text
+  local rest="$1" line
+  TEXT_LINES=()
+  while [[ -n "$rest" ]]; do
+    line="${rest%%$'\n'*}"
+    if [[ "$rest" == *$'\n'* ]]; then rest="${rest#*$'\n'}"; else rest=""; fi
+    [[ -z "$line" ]] || TEXT_LINES+=("$line")
+  done
+  return 0
+}
+plutil_read() { # plutil arguments... file -> its output; 0, 1 or 2 (see above)
+  local rc=0 file="${!#}" why
   [[ ! -s "$READ_FAILURES" ]] || return 2
   bounded "$PLUTIL" "$@" || rc=$?
-  case "$rc" in
-    0) "$CAT" "$BOUNDED_BASE.out"; return 0 ;;
-    1) return 1 ;;
-  esac
-  echo "'plutil $1 $2' on ${file##*/} $(call_result "$rc")" >> "$READ_FAILURES"
+  if (( rc == 0 )); then
+    work_read "$BOUNDED_BASE.out" || rc=$?
+    case "$rc" in
+      0) printf '%s' "$READ_TEXT" || return 2; return 0 ;;
+      1) why="printed a NUL byte, which this script cannot pass on" ;;
+      *) why="exited 0, but its output could not be read back" ;;
+    esac
+  elif (( rc == 1 )) && plutil_said_none "$@"; then
+    return 1
+  elif (( rc == 1 )); then
+    why="exited 1 ($PLUTIL_SAID)"
+  else
+    why="$(call_result "$rc")"
+  fi
+  echo "'plutil $1 $2' on ${file##*/} $why" >> "$READ_FAILURES"
   return 2
 }
-extract() { # file keypath (raw scalar; non-zero if missing or failed)
+# Whether the exit 1 of the plutil call just made with these arguments says
+# no more than that there is no value: for -extract and -type, plutil's
+# exact words for a key path that holds none, or for a null read as raw; a
+# null read as JSON is confirmed with -type, which shows it as "(any)". For
+# -convert, any exit 1. Anything else, such as a file plutil could not open,
+# is a failed read, and plutil's words are left in PLUTIL_SAID.
+PLUTIL_SAID=""
+plutil_said_none() { # the plutil arguments of the call just made
+  local file="${!#}" said rc=0
+  PLUTIL_SAID="its message could not be read back"
+  [[ "$1" != -convert ]] || return 0
+  work_read "$BOUNDED_BASE.out" || return 1
+  said="${READ_TEXT%$'\n'}"
+  said="${said#"$file: "}"
+  PLUTIL_SAID="$said"
+  [[ "$1" == -extract || "$1" == -type ]] || return 1
+  [[ "$said" != "Could not extract value, error: No value at that key path or invalid key path: $2" ]] || return 0
+  [[ "$1 $3" != "-extract raw" || "$said" != "Value at $2 is a any type and cannot be extracted in raw format" ]] || return 0
+  [[ "$1 $3" == "-extract json" ]] || return 1
+  bounded "$PLUTIL" -type "$2" -o - "$file" || rc=$?
+  (( rc == 0 )) || return 1
+  work_read "$BOUNDED_BASE.out" || return 1
+  [[ "$READ_TEXT" == "(any)"$'\n' ]]
+}
+extract() { # file keypath -> the value as plutil prints it raw; 0, 1 or 2
   plutil_read -extract "$2" raw -o - "$1"
 }
-extract_json() { # file keypath
-  plutil_read -extract "$2" json -o - "$1"
+# The type at a key path (bool, integer, float, string, array, dictionary,
+# "(any)" for null), or nothing when there is no value; 2 when the read failed.
+type_of() { # file keypath
+  local rc=0
+  plutil_read -type "$2" -o - "$1" || rc=$?
+  (( rc != 2 )) || return 2
+  return 0
 }
-type_of() { # file keypath -> bool|integer|float|string|array|dictionary|(any); empty if absent or failed
-  plutil_read -type "$2" -o - "$1" || true
+# The value at a key path in VALUE, as plutil prints it raw or as JSON ($3),
+# with extract's status, without a subshell for the status.
+VALUE=""
+value_at() { # file keypath [raw|json]
+  local rc=0
+  VALUE="$(plutil_read -extract "$2" "${3:-raw}" -o - "$1")" || rc=$?
+  return "$rc"
+}
+# Reads file $1 whole into WHOLE_TEXT (and WHOLE_HEAD, see work_read) with
+# one bounded cat, so a FIFO or a stalled disk cannot keep the lock waiting:
+# 0, 1 when it has a NUL byte, or 2 when the read failed or did not answer
+# (noted in READ_FAILURES).
+read_whole() { # file -> WHOLE_TEXT, WHOLE_HEAD
+  local rc=0 why
+  WHOLE_TEXT=""
+  WHOLE_HEAD=""
+  [[ ! -s "$READ_FAILURES" ]] || return 2
+  bounded "$CAT" "$1" || rc=$?
+  if (( rc == 0 )); then
+    work_read "$BOUNDED_BASE.out" || rc=$?
+    WHOLE_TEXT="$READ_TEXT"
+    WHOLE_HEAD="$READ_HEAD"
+    (( rc == 2 )) || return "$rc"
+    why="exited 0, but its output could not be read back"
+  else
+    why="$(call_result "$rc")"
+  fi
+  echo "'cat' on ${1##*/} $why" >> "$READ_FAILURES"
+  return 2
 }
 # Copies the regular file $1 to $2, in WORK, with one bounded cp, so the
-# checks read a private copy that cannot block or change under them. Returns
-# cp's status, or 124 when it did not answer in time.
+# checks read a private copy that cannot block or change under them. This
+# shell makes the copy first, empty, so it has this run's mode, which lets
+# its owner read it; cp writes into it and keeps that mode. cp -X copies no
+# extended attributes or ACL: a journal its owner can read only through an
+# ACL entry (mode 0200, say) would otherwise make cp fail or leave a copy
+# its mode keeps unreadable. Returns cp's status, 124 when it did not answer
+# in time, or 1 when the empty copy could not be made.
 snapshot() { # file copy
   local rc=0
   "$RM" -f "$2"
-  bounded "$CP" "$1" "$2" || rc=$?
+  { : > "$2"; } 2>/dev/null || return 1
+  bounded "$CP" -X "$1" "$2" || rc=$?
   return "$rc"
 }
 # How a bounded call's exit status reads in a message.
@@ -335,9 +480,12 @@ call_result() { # status
 # decoder's Unicode equivalence, so a file with neither "keptDisplay" nor a
 # backslash in it has none of them and is not read further. Any of these
 # makes the journal malformed, as for a wrong type, and nothing is undone.
+# The file is read whole by read_whole, which each script defines with a
+# time limit. A read that fails or does not answer prints nothing here and
+# returns 2, which the caller passes on as a check that did not complete.
 record_text_problems() { # file
   local LC_ALL=C
-  local text rest raw key c token depth str plain scalar number esc hex lost
+  local text rest raw key c token depth str plain scalar number esc hex lost rc=0
   local n_low=0 n_lit=0 n_boot=0 digits sig exp e10 lead
   str='^"([^"\\]|\\.)*"'
   plain='^[^]["{}]+'
@@ -346,9 +494,11 @@ record_text_problems() { # file
   esc='^u00(4[1-9A-Fa-f]|5[0-9Aa]|6[1-9A-Fa-f]|7[0-9Aa])'
   hex='^u[0-9A-Fa-f]{4}'
   lost="the top level of state.json cannot be followed here, so its records about a kept display entry cannot be checked"
-  text="$(<"$1")"
+  read_whole "$1" || rc=$?
+  (( rc != 2 )) || return 2
+  text="$WHOLE_TEXT"
   [[ "$text" == *keptDisplay* || "$text" == *\\* ]] || return 0
-  if IFS= read -r -d '' c < "$1"; then
+  if (( rc == 1 )); then
     echo "$lost"
     return 0
   fi
@@ -466,128 +616,170 @@ record_text_problems() { # file
 }
 
 # Shape check, same rules as backstop.sh: a JSON object whose known keys have
-# the types RuntimeState.swift writes; null counts as absent.
+# the types RuntimeState.swift writes; null counts as absent. Each read has
+# an explicit status: a read that failed or did not answer returns 2 at
+# once, after any lines already printed, and the caller counts the check as
+# not done (see plutil_read).
 journal_shape_problems() { # file
-  local f="$1" key t i n json
-  json="$(plutil_read -convert json -o - "$f")" || true
-  [[ ! -s "$READ_FAILURES" ]] || return 0
+  local f="$1" key t i n json rc=0
+  json="$(plutil_read -convert json -o - "$f")" || rc=$?
+  (( rc != 2 )) || return 2
   if [[ "${json:0:1}" != "{" ]]; then
     echo "state.json is not a JSON object"
     return 0
   fi
   for key in sleepDisabledByUs lowPowerSetByUs dockerFrozen savedMuted displayRestoreRefused keyboardRestoreRefused; do
-    t="$(type_of "$f" "$key")"
+    t="$(type_of "$f" "$key")" || return 2
     [[ -z "$t" || "$t" == bool || "$t" == "(any)" ]] || echo "$key is a $t, not a bool"
   done
   for key in savedOutputVolume savedDisplayBrightness savedKeyboardBrightness displayRestoredUnderLowPower; do
-    t="$(type_of "$f" "$key")"
+    t="$(type_of "$f" "$key")" || return 2
     [[ -z "$t" || "$t" == float || "$t" == integer || "$t" == "(any)" ]] || echo "$key is a $t, not a number"
   done
   # The app's records about a kept display entry: never read for an undo
-  # here, and they stay or go with state.json. Each must still decode, or
-  # the app cannot read the journal at all.
+  # here. Each must still decode, or the app cannot read the journal at all.
   for key in keptDisplayUnderLowPower keptDisplayReadLit; do
-    t="$(type_of "$f" "$key")"
+    t="$(type_of "$f" "$key")" || return 2
     [[ -z "$t" || "$t" == float || "$t" == integer || "$t" == "(any)" ]] || echo "$key is a $t, not a number"
   done
-  t="$(type_of "$f" keptDisplayUnderLowPowerBoot)"
+  t="$(type_of "$f" keptDisplayUnderLowPowerBoot)" || return 2
   [[ -z "$t" || "$t" == string || "$t" == "(any)" ]] || echo "keptDisplayUnderLowPowerBoot is a $t, not a string"
-  record_text_problems "$f"
-  t="$(type_of "$f" frozenProcesses)"
+  record_text_problems "$f" || return 2
+  t="$(type_of "$f" frozenProcesses)" || return 2
   if [[ -n "$t" && "$t" != "(any)" ]]; then
     if [[ "$t" != array ]]; then
       echo "frozenProcesses is a $t, not an array"
     else
       i=0
-      while [[ -n "$(type_of "$f" "frozenProcesses.$i")" ]]; do
-        if [[ "$(type_of "$f" "frozenProcesses.$i")" != dictionary ]]; then
+      while :; do
+        t="$(type_of "$f" "frozenProcesses.$i")" || return 2
+        [[ -n "$t" ]] || break
+        if [[ "$t" != dictionary ]]; then
           echo "frozenProcesses[$i] is not an object"
         else
-          [[ "$(type_of "$f" "frozenProcesses.$i.pid")" == integer ]] || echo "frozenProcesses[$i].pid is not an integer"
+          t="$(type_of "$f" "frozenProcesses.$i.pid")" || return 2
+          [[ "$t" == integer ]] || echo "frozenProcesses[$i].pid is not an integer"
           for n in startedAt startedAtMicros; do
-            t="$(type_of "$f" "frozenProcesses.$i.$n")"
+            t="$(type_of "$f" "frozenProcesses.$i.$n")" || return 2
             [[ -z "$t" || "$t" == integer || "$t" == "(any)" ]] || echo "frozenProcesses[$i].$n is a $t, not an integer"
           done
-          t="$(type_of "$f" "frozenProcesses.$i.bootSession")"
+          t="$(type_of "$f" "frozenProcesses.$i.bootSession")" || return 2
           [[ -z "$t" || "$t" == string || "$t" == "(any)" ]] || echo "frozenProcesses[$i].bootSession is a $t, not a string"
         fi
         i=$((i + 1))
       done
     fi
   fi
-  t="$(type_of "$f" frozenPids)"
+  t="$(type_of "$f" frozenPids)" || return 2
   if [[ -n "$t" && "$t" != "(any)" ]]; then
     if [[ "$t" != array ]]; then
       echo "frozenPids is a $t, not an array"
     else
       i=0
-      while [[ -n "$(type_of "$f" "frozenPids.$i")" ]]; do
-        [[ "$(type_of "$f" "frozenPids.$i")" == integer ]] || echo "frozenPids[$i] is not an integer"
+      while :; do
+        t="$(type_of "$f" "frozenPids.$i")" || return 2
+        [[ -n "$t" ]] || break
+        [[ "$t" == integer ]] || echo "frozenPids[$i] is not an integer"
         i=$((i + 1))
       done
     fi
   fi
-  t="$(type_of "$f" savedAudioOutputs)"
+  t="$(type_of "$f" savedAudioOutputs)" || return 2
   if [[ -n "$t" && "$t" != "(any)" ]]; then
     if [[ "$t" != array ]]; then
       echo "savedAudioOutputs is a $t, not an array"
     else
       i=0
-      while [[ -n "$(type_of "$f" "savedAudioOutputs.$i")" ]]; do
-        if [[ "$(type_of "$f" "savedAudioOutputs.$i")" != dictionary ]]; then
+      while :; do
+        t="$(type_of "$f" "savedAudioOutputs.$i")" || return 2
+        [[ -n "$t" ]] || break
+        if [[ "$t" != dictionary ]]; then
           echo "savedAudioOutputs[$i] is not an object"
         else
-          [[ "$(type_of "$f" "savedAudioOutputs.$i.deviceUID")" == string ]] || echo "savedAudioOutputs[$i].deviceUID is not a string"
-          t="$(type_of "$f" "savedAudioOutputs.$i.volume")"
+          t="$(type_of "$f" "savedAudioOutputs.$i.deviceUID")" || return 2
+          [[ "$t" == string ]] || echo "savedAudioOutputs[$i].deviceUID is not a string"
+          t="$(type_of "$f" "savedAudioOutputs.$i.volume")" || return 2
           [[ "$t" == float || "$t" == integer ]] || echo "savedAudioOutputs[$i].volume is not a number"
-          [[ "$(type_of "$f" "savedAudioOutputs.$i.muted")" == bool ]] || echo "savedAudioOutputs[$i].muted is not a bool"
-          t="$(type_of "$f" "savedAudioOutputs.$i.name")"
+          t="$(type_of "$f" "savedAudioOutputs.$i.muted")" || return 2
+          [[ "$t" == bool ]] || echo "savedAudioOutputs[$i].muted is not a bool"
+          t="$(type_of "$f" "savedAudioOutputs.$i.name")" || return 2
           [[ -z "$t" || "$t" == string || "$t" == "(any)" ]] || echo "savedAudioOutputs[$i].name is a $t, not a string"
-          t="$(type_of "$f" "savedAudioOutputs.$i.saveID")"
+          t="$(type_of "$f" "savedAudioOutputs.$i.saveID")" || return 2
           [[ -z "$t" || "$t" == string || "$t" == "(any)" ]] || echo "savedAudioOutputs[$i].saveID is a $t, not a string"
         fi
         i=$((i + 1))
       done
     fi
   fi
-  t="$(type_of "$f" appNapOverrides)"
+  t="$(type_of "$f" appNapOverrides)" || return 2
   if [[ -n "$t" && "$t" != "(any)" ]]; then
     if [[ "$t" != array ]]; then
       echo "appNapOverrides is a $t, not an array"
     else
       i=0
-      while [[ -n "$(type_of "$f" "appNapOverrides.$i")" ]]; do
-        if [[ "$(type_of "$f" "appNapOverrides.$i")" != dictionary ]]; then
+      while :; do
+        t="$(type_of "$f" "appNapOverrides.$i")" || return 2
+        [[ -n "$t" ]] || break
+        if [[ "$t" != dictionary ]]; then
           echo "appNapOverrides[$i] is not an object"
         else
-          [[ "$(type_of "$f" "appNapOverrides.$i.bundleId")" == string ]] || echo "appNapOverrides[$i].bundleId is not a string"
-          t="$(type_of "$f" "appNapOverrides.$i.previous")"
+          t="$(type_of "$f" "appNapOverrides.$i.bundleId")" || return 2
+          [[ "$t" == string ]] || echo "appNapOverrides[$i].bundleId is not a string"
+          t="$(type_of "$f" "appNapOverrides.$i.previous")" || return 2
           [[ -z "$t" || "$t" == bool || "$t" == "(any)" ]] || echo "appNapOverrides[$i].previous is a $t, not a bool"
         fi
         i=$((i + 1))
       done
     fi
   fi
+  return 0
 }
 
+# Whether key $2 of $1 is true: 0 when it is, 1 when it is anything else or
+# has no value, 2 when the read failed.
 is_refused() { # file key
-  [[ "$(extract "$1" "$2" || true)" == "true" ]]
+  local rc=0
+  value_at "$1" "$2" || rc=$?
+  (( rc != 2 )) || return 2
+  (( rc == 0 )) && [[ "$VALUE" == true ]]
 }
 
 # Brightness the app kept after its private-call guard refused the restore
 # on this macOS, one line per device with the saved level. Not a problem
 # for uninstall: no step here can restore it. Read from the private copy of
-# state.json that journal_problems checked; a read that fails is noted in
-# READ_FAILURES, and the caller then keeps state.json.
+# state.json that journal_problems checked. Returns 2 when a read failed, or
+# when that copy is gone while state.json is there; the caller then keeps
+# state.json, since whether it holds such a level is unknown.
 refused_brightness() {
-  local value
-  [[ -f "$STATE_COPY" ]] || return 0
-  if is_refused "$STATE_COPY" displayRestoreRefused && value="$(extract "$STATE_COPY" savedDisplayBrightness)"; then
-    echo "display brightness $value"
+  if [[ ! -f "$STATE_COPY" ]]; then
+    [[ -e "$STATE" || -L "$STATE" ]] || return 0
+    echo "the copy of state.json that the journal check read is gone" >> "$READ_FAILURES"
+    return 2
   fi
-  if is_refused "$STATE_COPY" keyboardRestoreRefused && value="$(extract "$STATE_COPY" savedKeyboardBrightness)"; then
-    echo "keyboard backlight $value"
-  fi
+  refused_level savedDisplayBrightness displayRestoreRefused "display brightness" || return 2
+  refused_level savedKeyboardBrightness keyboardRestoreRefused "keyboard backlight" || return 2
+  return 0
+}
+refused_level() { # level-key refused-key what
+  local rc=0
+  is_refused "$STATE_COPY" "$2" || rc=$?
+  (( rc != 1 )) || return 0
+  (( rc == 0 )) || return 2
+  value_at "$STATE_COPY" "$1" || rc=$?
+  (( rc != 1 )) || return 0
+  (( rc == 0 )) || return 2
+  echo "$3 $VALUE"
+}
+# The line for a saved level the app has not restored, unless its restore
+# was refused (refused_brightness lists those); 2 when a read failed.
+unrestored_level() { # level-key refused-key what
+  local rc=0
+  value_at "$STATE_COPY" "$1" || rc=$?
+  (( rc != 1 )) || return 0
+  (( rc == 0 )) || return 2
+  is_refused "$STATE_COPY" "$2" || rc=$?
+  (( rc != 2 )) || return 2
+  (( rc == 0 )) || echo "saved $3 is not restored; only the app can do that"
   return 0
 }
 
@@ -612,47 +804,55 @@ epoch_of() { # string
 }
 
 # Same as backstop.sh: epoch_of the string exactly as stored, with only
-# plutil's own trailing newline cut.
+# plutil's own trailing newline cut; 2 when the read failed.
 epoch_at() { # file keypath
-  local v
-  v="$(extract "$1" "$2"; echo .)"
+  local v rc=0
+  v="$(extract "$1" "$2" && echo .)" || rc=$?
+  (( rc != 2 )) || return 2
   v="${v%.}"
   epoch_of "${v%$'\n'}"
 }
 session_shape_problems() { # file
-  local f="$1" key t i json
+  local f="$1" key t e i json rc=0 lead
   # plutil also reads XML and binary property lists, which the app's
-  # JSONDecoder refuses, so the file itself must start with "{" too.
-  json="$(plutil_read -convert json -o - "$f")" || true
-  [[ ! -s "$READ_FAILURES" ]] || return 0
-  if [[ "$(LC_ALL=C tr -d ' \t\r\n' < "$f" 2>/dev/null | head -c 1)" != "{" ]] \
-     || [[ "${json:0:1}" != "{" ]]; then
+  # JSONDecoder refuses, so the file itself must start with "{" too, after
+  # any spaces, tabs and line ends (a NUL byte there is not "{" either).
+  json="$(plutil_read -convert json -o - "$f")" || rc=$?
+  (( rc != 2 )) || return 2
+  rc=0
+  read_whole "$f" || rc=$?
+  (( rc != 2 )) || return 2
+  lead="${WHOLE_HEAD#"${WHOLE_HEAD%%[!$' \t\r\n']*}"}"
+  if [[ "${lead:0:1}" != "{" || "${json:0:1}" != "{" ]]; then
     echo "session.json is not a JSON object"
     return 0
   fi
   for key in startedAt endsAt; do
-    t="$(type_of "$f" "$key")"
+    t="$(type_of "$f" "$key")" || return 2
     if [[ -z "$t" ]]; then
       echo "$key is missing"
     elif [[ "$t" != string ]]; then
       echo "$key is a JSON $t, not a date string"
-    elif [[ -z "$(epoch_at "$f" "$key")" ]]; then
-      echo "$key is not a date in the form 2027-01-15T08:00:00Z or 2027-01-15T10:00:00+02:00"
+    else
+      e="$(epoch_at "$f" "$key")" || return 2
+      [[ -n "$e" ]] || echo "$key is not a date in the form 2027-01-15T08:00:00Z or 2027-01-15T10:00:00+02:00"
     fi
   done
-  t="$(type_of "$f" extensions)"
+  t="$(type_of "$f" extensions)" || return 2
   if [[ -z "$t" ]]; then
     echo "extensions is missing"
   elif [[ "$t" != array ]]; then
     echo "extensions is a JSON $t, not an array"
   else
     i=0
-    while [[ -n "$(type_of "$f" "extensions.$i")" ]]; do
-      t="$(type_of "$f" "extensions.$i")"
+    while :; do
+      t="$(type_of "$f" "extensions.$i")" || return 2
+      [[ -n "$t" ]] || break
       [[ "$t" == integer || "$t" == float ]] || echo "extensions[$i] is a JSON $t, not a number"
       i=$((i + 1))
     done
   fi
+  return 0
 }
 
 # Independent check of the journal: prints one line per unresolved item.
@@ -660,8 +860,9 @@ session_shape_problems() { # file
 # It runs under the recovery lock, so each file is read once, by a bounded
 # cp into WORK, and every check reads that copy: a FIFO, a stalled disk or
 # a file swapped meanwhile cannot keep the lock waiting or show one check
-# another file. A read that fails or does not answer is noted in
-# READ_FAILURES, which the caller counts as a problem.
+# another file. Returns 2 when a read failed or did not answer (noted in
+# READ_FAILURES), after the lines it printed so far: the caller counts that
+# as a check that did not complete, never as a clean journal.
 SESSION_COPY="$WORK/session.json"
 STATE_COPY="$WORK/state.json"
 journal_problems() {
@@ -670,7 +871,8 @@ journal_problems() {
     shape=""
     rc=0
     # Only a regular file is copied: open(2) on a FIFO with no writer
-    # blocks.
+    # blocks. One put there after this test blocks the bounded cp, which
+    # then does not answer in time.
     if [[ ! -f "$SESSION" ]]; then
       echo "session.json is still present and cannot be read: it is not a regular file, so it was not opened"
     else
@@ -679,10 +881,14 @@ journal_problems() {
         echo "session.json is still present and could not be read within ${CALL_TIMEOUT_SECONDS}s"
       elif (( rc != 0 )); then
         echo "session.json is still present and cannot be read (permissions or I/O)"
-      elif shape="$(session_shape_problems "$SESSION_COPY")" && [[ -n "$shape" ]]; then
-        echo "session.json is still present and is not a session: ${shape%%$'\n'*}"
       else
-        echo "session.json is still present"
+        shape="$(session_shape_problems "$SESSION_COPY")" || rc=$?
+        if [[ -n "$shape" ]]; then
+          echo "session.json is still present and is not a session: ${shape%%$'\n'*}"
+        else
+          echo "session.json is still present"
+        fi
+        (( rc == 0 )) || return 2
       fi
     fi
   fi
@@ -706,45 +912,64 @@ journal_problems() {
     echo "state.json is unreadable or malformed"
     return 0
   elif (( rc != 0 )); then
-    return 0
+    return 2
   fi
-  shape="$(journal_shape_problems "$STATE_COPY")"
+  rc=0
+  shape="$(journal_shape_problems "$STATE_COPY")" || rc=$?
   if [[ -n "$shape" ]]; then
     echo "state.json is malformed (unexpected shape):"
     echo "$shape"
-    return 0
   fi
+  (( rc == 0 )) || return 2
+  [[ -z "$shape" ]] || return 0
   for key in sleepDisabledByUs lowPowerSetByUs dockerFrozen; do
-    if [[ "$(extract "$STATE_COPY" "$key" || true)" == "true" ]]; then
-      echo "$key is still true"
-    fi
+    rc=0
+    is_refused "$STATE_COPY" "$key" || rc=$?
+    (( rc != 2 )) || return 2
+    (( rc != 0 )) || echo "$key is still true"
   done
-  value="$(extract_json "$STATE_COPY" frozenProcesses || true)"
-  if [[ -n "$value" && "$value" != "[]" ]]; then
-    echo "frozen processes are still journaled: $value"
+  rc=0
+  value_at "$STATE_COPY" frozenProcesses json || rc=$?
+  (( rc != 2 )) || return 2
+  if [[ -n "$VALUE" && "$VALUE" != "[]" ]]; then
+    echo "frozen processes are still journaled: $VALUE"
   fi
-  value="$(extract_json "$STATE_COPY" frozenPids || true)"
-  if [[ -n "$value" && "$value" != "[]" ]]; then
-    echo "legacy frozen pids (no identity; the backstop never signals or clears these, only the app does): $value"
+  rc=0
+  value_at "$STATE_COPY" frozenPids json || rc=$?
+  (( rc != 2 )) || return 2
+  if [[ -n "$VALUE" && "$VALUE" != "[]" ]]; then
+    echo "legacy frozen pids (no identity; the backstop never signals or clears these, only the app does): $VALUE"
   fi
-  if extract "$STATE_COPY" savedOutputVolume >/dev/null || extract "$STATE_COPY" savedMuted >/dev/null; then
-    echo "saved audio settings (volume/mute) are not restored; only the app can do that"
+  rc=0
+  value_at "$STATE_COPY" savedOutputVolume || rc=$?
+  if (( rc == 1 )); then
+    rc=0
+    value_at "$STATE_COPY" savedMuted || rc=$?
   fi
+  (( rc != 2 )) || return 2
+  (( rc != 0 )) || echo "saved audio settings (volume/mute) are not restored; only the app can do that"
   i=0
-  while extract_json "$STATE_COPY" "savedAudioOutputs.$i" >/dev/null; do
-    value="$(extract "$STATE_COPY" "savedAudioOutputs.$i.name" || extract "$STATE_COPY" "savedAudioOutputs.$i.deviceUID" || true)"
-    echo "$value is still muted from a lid close; only the app can restore its volume, once the device is connected"
+  while :; do
+    rc=0
+    value_at "$STATE_COPY" "savedAudioOutputs.$i" json || rc=$?
+    (( rc != 2 )) || return 2
+    (( rc == 0 )) || break
+    value_at "$STATE_COPY" "savedAudioOutputs.$i.name" || rc=$?
+    if (( rc == 1 )); then
+      rc=0
+      value_at "$STATE_COPY" "savedAudioOutputs.$i.deviceUID" || rc=$?
+    fi
+    (( rc != 2 )) || return 2
+    echo "$VALUE is still muted from a lid close; only the app can restore its volume, once the device is connected"
     i=$((i + 1))
   done
-  if extract "$STATE_COPY" savedDisplayBrightness >/dev/null && ! is_refused "$STATE_COPY" displayRestoreRefused; then
-    echo "saved display brightness is not restored; only the app can do that"
-  fi
-  if extract "$STATE_COPY" savedKeyboardBrightness >/dev/null && ! is_refused "$STATE_COPY" keyboardRestoreRefused; then
-    echo "saved keyboard backlight is not restored; only the app can do that"
-  fi
-  value="$(extract_json "$STATE_COPY" appNapOverrides || true)"
-  if [[ -n "$value" && "$value" != "[]" ]]; then
-    echo "App Nap settings (NSAppSleepDisabled) are not put back: $value"
+  unrestored_level savedDisplayBrightness displayRestoreRefused "display brightness" || return 2
+  unrestored_level savedKeyboardBrightness keyboardRestoreRefused "keyboard backlight" || return 2
+  rc=0
+  value_at "$STATE_COPY" appNapOverrides json || rc=$?
+  (( rc != 2 )) || return 2
+  if [[ -n "$VALUE" && "$VALUE" != "[]" ]]; then
+    echo "App Nap settings (NSAppSleepDisabled) are not put back: $VALUE"
   fi
   return 0
 }
@@ -769,8 +994,10 @@ list_unrecorded_app_nap() {
       i=$((i + 1))
       ids="$ids$id"$'\n'
     done
-    if [[ -s "$READ_FAILURES" ]]; then
-      echo "could not read all of the agent list in $CONFIG ($(head -n 1 "$READ_FAILURES")), so agent apps listed only there may not have been checked"
+    if [[ -e "$READ_FAILURES" ]]; then
+      value="its note could not be read back"
+      if work_read "$READ_FAILURES"; then value="${READ_TEXT%%$'\n'*}"; fi
+      echo "could not read all of the agent list in $CONFIG ($value), so agent apps listed only there may not have been checked"
     fi
   fi
   ids="$(printf '%s' "$ids" | awk '!seen[$0]++')"
@@ -1102,9 +1329,9 @@ sudoers_not_ours() { # file content
 # nothing when it can: a regular file of root's (ROOT_UID) with one link, no
 # setuid, setgid or sticky bit and no write permission for group or others;
 # with $3, exactly that mode. $2 is its `stat -f '%Hp %Mp %Lp %u %l'`, which
-# reads the name itself, not what a link points to. This and the two
-# functions below are the same in install.sh and uninstall.sh (a test keeps
-# them in step) and run only as root.
+# reads the name itself, not what a link points to. This and the functions
+# below, up to sudoers_recheck, are the same in install.sh and uninstall.sh
+# (a test keeps them in step) and run only as root.
 sudoers_file_problem() { # name stat [mode]
   local type special perm uid links
   read -r type special perm uid links <<< "$2"
@@ -1121,24 +1348,62 @@ sudoers_file_problem() { # name stat [mode]
   fi
   return 0
 }
-# Takes $SUDOERS_LOCK on fd 8 for the rest of the root shell, once it is
-# shown that only root can have made or changed it. An existing file must be
-# a regular file of root's with mode 0600 and one link, and every folder from
-# its own up to / a folder of root's that group and others cannot write.
-# Both are checked before the file is opened, so a FIFO (whose open would
-# wait) or a link is never opened. The file is created, mode 0600, only where
-# nothing is (noclobber: no link is followed and nothing is truncated).
-# Nothing is ever repaired, replaced or removed. Once the lock is taken, the
-# descriptor and the path must still be the same file, unchanged, and the
-# rule $1 must be in the same folder. Exits 7 with the reason when a check
-# fails, 3 when the lock is not free within LOCK_TIMEOUT_SECONDS.
-sudoers_guard_take() { # rule
-  local dir s type perm uid why took seen
-  if [[ -e "$SUDOERS_LOCK" || -L "$SUDOERS_LOCK" ]]; then
-    why="$(sudoers_file_problem "$SUDOERS_LOCK" "$("$STAT" -f '%Hp %Mp %Lp %u %l' "$SUDOERS_LOCK" 2>/dev/null)" 600)"
-    if [[ -n "$why" ]]; then echo "$why" >&2; exit 7; fi
+# Exits with status $1, saying why on stderr, unless `ls -lde` shows that no
+# access control list on the files and folders named after it allows more
+# than reading. An entry that allows anything else (write, append, delete,
+# add_file, add_subdirectory, delete_child, writeattr, writeextattr,
+# writesecurity, chown, or a right not listed here) counts, whoever it names
+# and whatever its inheritance flags: a folder's inheritable entries reach
+# the files made in it. An entry for root counts too, though root needs
+# none. Deny entries pass. So does an answer only when it is read in full:
+# ls fails, prints a line not parsed here, marks a list (+) and prints no
+# entry, or leaves out a name, and the run stops. Nothing is ever repaired.
+sudoers_acl_check() { # status name...
+  local status="$1" out rc=0 line name="" plus="" entries=0 seen=0 a perm
+  shift
+  out="$("$LS" -lde "$@" 2>&1)" || rc=$?
+  if (( rc != 0 )); then
+    echo "the access control lists of $* could not be read (ls exited $rc: $out)" >&2
+    exit "$status"
   fi
-  dir="$SUDOERS_LOCK"
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^[-a-z][-rwxsStT]{9}([@+]?)\  ]]; then
+      if [[ "$plus" == + ]] && (( entries == 0 )); then break; fi
+      plus="${BASH_REMATCH[1]}" entries=0 name=""
+      for a in "$@"; do
+        if [[ "$line" == *" $a" ]] && (( ${#a} > ${#name} )); then name="$a"; fi
+      done
+      [[ -n "$name" ]] || break
+      seen=$(( seen + 1 ))
+    elif [[ -n "$name" && "$line" =~ ^\ *[0-9]+:\ .+\ (allow|deny)\ ([a-z_,]+)$ ]]; then
+      entries=$(( entries + 1 ))
+      [[ "${BASH_REMATCH[1]}" == allow ]] || continue
+      for perm in ${BASH_REMATCH[2]//,/ }; do
+        case "$perm" in
+          read | execute | readattr | readextattr | readsecurity | list | search \
+            | file_inherit | directory_inherit | limit_inherit | only_inherit) ;;
+          *)
+            echo "$name has an access control list entry that allows more than reading ($line)" >&2
+            exit "$status" ;;
+        esac
+      done
+    else
+      name=""
+      break
+    fi
+  done <<< "$out"
+  if [[ -z "$name" || ( "$plus" == + && "$entries" == 0 ) || "$seen" != "$#" ]]; then
+    echo "the access control lists of $* could not be read in full (ls: $out)" >&2
+    exit "$status"
+  fi
+}
+# Exits 7, saying why on stderr, unless every folder from the one that holds
+# $SUDOERS_LOCK up to / is a folder of root's that group and others cannot
+# write, with no access control list that allows more than reading
+# (sudoers_acl_check). Leaves the folders in SUDOERS_DIRS.
+sudoers_dirs_check() {
+  local dir="$SUDOERS_LOCK" s type perm uid
+  SUDOERS_DIRS=()
   while [[ "$dir" == /?* ]]; do
     dir="${dir%/*}"
     s="$("$STAT" -f '%Hp %Lp %u' "${dir:-/}" 2>/dev/null)"
@@ -1148,52 +1413,124 @@ sudoers_guard_take() { # rule
       echo "${dir:-/}, a folder above $SUDOERS_LOCK, is not a folder of root's that only root can write (stat: ${s:-no answer})" >&2
       exit 7
     fi
+    SUDOERS_DIRS+=("${dir:-/}")
   done
+  sudoers_acl_check 7 "${SUDOERS_DIRS[@]}"
+}
+# Takes $SUDOERS_LOCK on fd 8 for the rest of the root shell, once it is
+# shown that only root can have made or changed it. An existing file must be
+# a regular file of root's with mode 0600 and one link, and every folder from
+# its own up to / a folder of root's that group and others cannot write
+# (sudoers_dirs_check), none with an access control list that allows more
+# than reading. Both are checked before the file is opened, so a FIFO (whose
+# open would wait) or a link is never opened. The file is created, mode
+# 0600, only where nothing is (noclobber: no link is followed and nothing is
+# truncated), and its own access control list is checked before it is
+# opened. Nothing is ever repaired, replaced or removed. Once the lock is
+# taken, the descriptor and the path must still be the same file, unchanged
+# (kept in SUDOERS_LOCK_ID for sudoers_recheck), and the rule $1 must be in
+# the same folder. Exits 7 with the reason when a check fails, 3 when the
+# lock is not free within LOCK_TIMEOUT_SECONDS.
+sudoers_guard_take() { # rule
+  local why seen
+  if [[ -e "$SUDOERS_LOCK" || -L "$SUDOERS_LOCK" ]]; then
+    why="$(sudoers_file_problem "$SUDOERS_LOCK" "$("$STAT" -f '%Hp %Mp %Lp %u %l' "$SUDOERS_LOCK" 2>/dev/null)" 600)"
+    if [[ -n "$why" ]]; then echo "$why" >&2; exit 7; fi
+  fi
+  sudoers_dirs_check
   ( set -C; : > "$SUDOERS_LOCK" ) 2>/dev/null || true
   why="$(sudoers_file_problem "$SUDOERS_LOCK" "$("$STAT" -f '%Hp %Mp %Lp %u %l' "$SUDOERS_LOCK" 2>/dev/null)" 600)"
   if [[ -n "$why" ]]; then echo "$why" >&2; exit 7; fi
+  sudoers_acl_check 7 "$SUDOERS_LOCK"
   exec 8<"$SUDOERS_LOCK" || exit 7
   "$LOCKF" -t "$LOCK_TIMEOUT_SECONDS" 8 2>/dev/null || exit 3
-  took="$("$STAT" -f '%d:%i %Hp %Mp %Lp %u %l' <&8 2>/dev/null)"
+  SUDOERS_LOCK_ID="$("$STAT" -f '%d:%i %Hp %Mp %Lp %u %l' <&8 2>/dev/null)"
   seen="$("$STAT" -f '%d:%i %Hp %Mp %Lp %u %l' "$SUDOERS_LOCK" 2>/dev/null)"
-  if [[ -z "$took" || "$took" != "$seen" ]]; then
+  if [[ -z "$SUDOERS_LOCK_ID" || "$SUDOERS_LOCK_ID" != "$seen" ]]; then
     echo "$SUDOERS_LOCK is no longer the file this run opened and locked" >&2
     exit 7
   fi
-  why="$(sudoers_file_problem "$SUDOERS_LOCK" "${took#* }" 600)"
+  why="$(sudoers_file_problem "$SUDOERS_LOCK" "${SUDOERS_LOCK_ID#* }" 600)"
   if [[ -n "$why" ]]; then echo "$why" >&2; exit 7; fi
   if [[ "$("$STAT" -L -f '%d:%i' "${1%/*}" 2>/dev/null)" != "$("$STAT" -f '%d:%i' "${SUDOERS_LOCK%/*}" 2>/dev/null)" ]]; then
     echo "$1 is not in the folder that holds $SUDOERS_LOCK" >&2
     exit 7
   fi
 }
-# Opens the rule $1 on fd 7, once sudoers_file_problem finds nothing wrong
-# with it (any mode without group or other write), and reads it through that
-# descriptor. Exits 4 unless the path still names the opened file and the
-# text read, trailing newlines aside, is exactly $2, the text the caller read
-# and judged before sudo ran; 8 when the shell cannot hold the bytes exactly
-# (a NUL byte, or a change while they were read). Leaves the file's identity
-# in PINNED_ID and its text in PINNED_TEXT.
-sudoers_pin_rule() { # rule text
-  local LC_ALL=C why size
+# Opens the rule $1 on fd 6, once sudoers_file_problem (any mode without
+# group or other write) and sudoers_acl_check find nothing wrong with it,
+# and reads it from its start through that descriptor, checking cat's exit
+# status. Leaves the file's identity in RULE_ID and its bytes in RULE_RAW,
+# with a "." after them so $(...) keeps a trailing newline. Exits 4 unless
+# the path still names the opened file; 8 when cat fails, or the bytes read
+# are not as many as the file's size (a NUL byte, which the shell drops, or
+# a change while they were read).
+sudoers_read_rule() { # rule
+  local LC_ALL=C why size rc=0
   why="$(sudoers_file_problem "$1" "$("$STAT" -f '%Hp %Mp %Lp %u %l' "$1" 2>/dev/null)")"
   if [[ -n "$why" ]]; then echo "$why" >&2; exit 4; fi
-  exec 7<"$1" || exit 4
-  PINNED_ID="$("$STAT" -f '%d:%i' <&7 2>/dev/null)"
-  if [[ -z "$PINNED_ID" || "$PINNED_ID" != "$("$STAT" -f '%d:%i' "$1" 2>/dev/null)" ]]; then
+  sudoers_acl_check 4 "$1"
+  exec 6<"$1" || exit 4
+  RULE_ID="$("$STAT" -f '%d:%i' <&6 2>/dev/null)"
+  if [[ -z "$RULE_ID" || "$RULE_ID" != "$("$STAT" -f '%d:%i' "$1" 2>/dev/null)" ]]; then
     echo "$1 was replaced while it was opened" >&2
     exit 4
   fi
-  size="$("$STAT" -f '%z' <&7 2>/dev/null)"
-  PINNED_TEXT="$("$CAT" <&7 && echo .)"
-  PINNED_TEXT="${PINNED_TEXT%.}"
-  if [[ -z "$size" || "${#PINNED_TEXT}" != "$size" ]]; then
+  size="$("$STAT" -f '%z' <&6 2>/dev/null)"
+  RULE_RAW="$("$CAT" <&6 && echo .)" || rc=$?
+  if (( rc != 0 )); then
+    echo "$1 could not be read (cat exited $rc)" >&2
+    exit 8
+  fi
+  if [[ -z "$size" || "${#RULE_RAW}" != "$(( size + 1 ))" ]]; then
     echo "$1 holds a NUL byte, or changed while it was read" >&2
     exit 8
   fi
+}
+# Reads the rule $1 (sudoers_read_rule) and keeps that descriptor on fd 7
+# until the root shell exits, so no other file can take the inode while
+# PINNED_ID names it. Exits 4 unless the text read, trailing newlines
+# aside, is exactly $2, the text the caller read and judged before sudo ran.
+# Leaves the file's identity in PINNED_ID, its bytes as read in PINNED_RAW,
+# and its text in PINNED_TEXT.
+sudoers_pin_rule() { # rule text
+  local LC_ALL=C
+  sudoers_read_rule "$1"
+  exec 7<&6
+  PINNED_ID="$RULE_ID"
+  PINNED_RAW="$RULE_RAW"
+  PINNED_TEXT="${RULE_RAW%.}"
   PINNED_TEXT="${PINNED_TEXT%"${PINNED_TEXT##*[!$'\n']}"}"
   if [[ "$PINNED_TEXT" != "$2" ]]; then
     echo "$1 is not the text this run read" >&2
+    exit 4
+  fi
+}
+# The last checks before the rename or removal, after every other one: the
+# folders again (sudoers_dirs_check, exit 7), the lock still the file this
+# shell locked, unchanged, with no access control list that allows more
+# than reading (exit 7), and then the rule. With "absent", nothing may be at
+# $2 (exit 4). With "same", the rule is read again from its start through a
+# new descriptor (sudoers_read_rule, exits 4 and 8), and must be the file
+# root pinned, holding exactly the bytes root read then (exit 4).
+sudoers_recheck() { # absent|same rule
+  sudoers_dirs_check
+  if [[ "$("$STAT" -f '%d:%i %Hp %Mp %Lp %u %l' "$SUDOERS_LOCK" 2>/dev/null)" != "$SUDOERS_LOCK_ID" ]]; then
+    echo "$SUDOERS_LOCK is no longer the file this run opened and locked" >&2
+    exit 7
+  fi
+  sudoers_acl_check 7 "$SUDOERS_LOCK"
+  if [[ "$1" == absent ]]; then
+    if [[ -e "$2" || -L "$2" ]]; then echo "$2 is there now" >&2; exit 4; fi
+    return 0
+  fi
+  sudoers_read_rule "$2"
+  if [[ "$RULE_ID" != "$PINNED_ID" ]]; then
+    echo "$2 was replaced after root read it" >&2
+    exit 4
+  fi
+  if [[ "$RULE_RAW" != "$PINNED_RAW" ]]; then
+    echo "$2 changed after root read it" >&2
     exit 4
   fi
 }
@@ -1204,15 +1541,21 @@ sudoers_pin_rule() { # rule text
 # compare and the removal are one call to sudo, run as root while it holds
 # $SUDOERS_LOCK (sudoers_guard_take), the lock install.sh takes for its
 # compare and write. Root reads the rule through a descriptor it opened and
-# checked (sudoers_pin_rule), judges that text again with sudoers_not_ours,
-# and removes the path only while it still names the file it opened. The
-# lock keeps out only the runs that take it, as install.sh says. Exit
+# checked (sudoers_pin_rule), and judges that text again with
+# sudoers_not_ours. Last, sudoers_recheck checks the folders, the lock and
+# the access control lists again and reads the rule again through a new
+# descriptor; the removal follows only when the path still names the file
+# root opened and holds the bytes root read first. The lock keeps out only
+# the runs that take it, as install.sh says, and the moments between that
+# reread and the removal stay open to a writer that takes no lock. Exit
 # status: 0 removed; 3 the lock was not free within LOCK_TIMEOUT_SECONDS; 4
 # the rule changed since it was read, or is not a regular file of root's
-# with one link that only root can change; 5 rm reported that the removal
-# failed; 7 the lock file, or a folder above it, is not one only root can
-# change; 8 the rule as root read it holds a NUL byte, changed while it was
-# read, or is not this account's. 1 is sudo's own (no valid timestamp, say)
+# with one link that only root can change (an access control list that
+# allows more than reading, or one not read in full, counts); 5 rm reported that the removal failed;
+# 7 the lock file, or a folder above it, is not one only root can change,
+# or its access control list could not be read; 8 the rule as root read it
+# could not be read in full (cat failed), holds a NUL byte, changed while it
+# was read, or is not this account's. 1 is sudo's own (no valid timestamp, say)
 # or a shell error before the removal. In all of these the rule was not
 # removed, though the lock file may have been created. Any other status (the
 # root shell, or its rm, was killed by a signal), or a call that did not
@@ -1222,27 +1565,37 @@ sudoers_remove_as_root() { # rule text
   sudoers_guard_take "$1"
   sudoers_pin_rule "$1" "$2"
   [[ -z "$(sudoers_not_ours "$PINNED_TEXT")" ]] || exit 8
-  if [[ "$("$STAT" -f '%d:%i' "$1" 2>/dev/null)" != "$PINNED_ID" ]]; then
-    echo "$1 was replaced while it was checked" >&2
-    exit 4
-  fi
+  sudoers_recheck same "$1"
   # An rm killed by a signal may have removed the rule already, so its
   # status goes on as it is, an unknown result, not as a failed removal.
   "$RM" -f "$1" || { rc=$?; (( rc > 128 )) && exit "$rc"; exit 5; }
   exit 0
+}
+# The functions named, as `declare -f` prints them, with the spaces that
+# start each line cut, for the text a root shell runs: sudo logs that text
+# and ps shows it, and the indentation is a fifth of it. None of these
+# functions has a quoted string that runs across lines, which the cut would
+# change; a test checks that bash reads the cut text back to the same
+# functions. The same in install.sh and uninstall.sh.
+root_functions() { # name...
+  local line
+  while IFS= read -r line; do
+    printf '%s\n' "${line#"${line%%[! ]*}"}"
+  done <<< "$(declare -f "$@")"
 }
 # Runs sudoers_remove_as_root as root, in one sudo call, bounded like every
 # other call made under the recovery lock: `sudo -n` never prompts (the
 # password was asked before the lock, with `sudo -v`), and a sudo still
 # running past the limit returns 125 and keeps the lock until it ends. The
 # shell's script is this script's fixed tool paths, the account's name, and
-# the text of the functions root runs; sudo resets the environment, so
-# nothing root runs comes from PATH.
+# the text of the functions root runs (root_functions); sudo resets the
+# environment, so nothing root runs comes from PATH.
 sudoers_remove() { # text
   bounded "$SUDO" -n "$ROOT_BASH" -c "set -u
 $(printf '%s=%q\n' SUDOERS_LOCK "$SUDOERS_LOCK" ROOT_UID "$ROOT_UID" ACCOUNT "$ACCOUNT" \
-    LOCK_TIMEOUT_SECONDS "$LOCK_TIMEOUT_SECONDS" LOCKF "$LOCKF" STAT "$STAT" CAT "$CAT" RM "$RM")
-$(declare -f sudoers_file_problem sudoers_guard_take sudoers_pin_rule sudoers_not_ours sudoers_remove_as_root)
+    LOCK_TIMEOUT_SECONDS "$LOCK_TIMEOUT_SECONDS" LOCKF "$LOCKF" STAT "$STAT" CAT "$CAT" LS "$LS" RM "$RM")
+$(root_functions sudoers_file_problem sudoers_acl_check sudoers_dirs_check sudoers_guard_take \
+    sudoers_read_rule sudoers_pin_rule sudoers_recheck sudoers_not_ours sudoers_remove_as_root)
 sudoers_remove_as_root \"\$@\"" insomnia-sudoers-remove "$SUDOERS" "$1"
 }
 # The part of a message about a sudo call that is still running.
@@ -1329,52 +1682,97 @@ else
   report_others
 fi
 
-# Which backstop.sh speaks the installed app's --resume-frozen interface
-# depends on the InsomniaResumeFrozenVersion its Info.plist declares (step
-# 3). No Info.plist is read under the recovery lock, so it is read here,
-# before the lock, with bounded calls, together with the file's identity
-# (device, inode, change time with nanoseconds, size) before and after the
-# read. Step 3 uses the value only when a bounded stat under the lock, which
-# reads no contents, shows the same file unchanged. A read that fails, does
-# not answer or sees the file change stops the run here, before anything is
-# removed and before any backstop runs. Only from a source checkout does
-# the value choose anything, so only there is it read.
+# The InsomniaResumeFrozenVersion the installed app's Info.plist declares,
+# read here, before the recovery lock, with bounded calls, together with
+# the file's identity (device, inode, change time with nanoseconds, size)
+# before and after the read: no Info.plist is read under the lock. From a
+# source checkout the value chooses which backstop.sh speaks the installed
+# app's --resume-frozen interface (step 3), which uses it only when a
+# bounded stat under the lock, which reads no contents, shows the same file
+# unchanged; there a read that fails, does not answer or sees the file
+# change stops the run here, before anything is removed and before any
+# backstop runs. Every backstop.sh step 3 runs also gets the value and the
+# identity in its environment (run_backstop). One that hands frozen entries
+# to the app binary uses the value only when its own stat under the lock
+# shows the same file unchanged, and keeps those entries while it is
+# unknown; step 4 then stops before anything is removed.
 CHECKOUT_BACKSTOP=""
 if in_checkout && [[ -f "$SCRIPT_DIR/backstop.sh" ]]; then
   CHECKOUT_BACKSTOP="$SCRIPT_DIR/backstop.sh"
 fi
 INFO_PLIST="$APP/Contents/Info.plist"
-installed_version=""
-VERSION_EVIDENCE=none   # no regular file at $INFO_PLIST, which declares nothing
-VERSION_PROBLEM=""
-read_installed_version() {
-  local rc=0 before
-  [[ -f "$INFO_PLIST" ]] || return 0
-  bounded "$STAT" -L -f '%d:%i:%Fc:%z' "$INFO_PLIST" || rc=$?
-  if (( rc != 0 )); then VERSION_PROBLEM="'stat' $(call_result "$rc")"; return 1; fi
-  before="$BOUNDED_OUTPUT"
-  bounded "$PLUTIL" -extract InsomniaResumeFrozenVersion raw -o - "$INFO_PLIST" || rc=$?
-  if (( rc == 0 )); then
-    installed_version="$("$CAT" "$BOUNDED_BASE.out")"
-  elif (( rc == 1 )); then
-    # No such key, or no plist at all: only a plist that parses declares
-    # no version.
-    rc=0
-    bounded "$PLUTIL" -lint "$INFO_PLIST" || rc=$?
-    if (( rc != 0 )); then VERSION_PROBLEM="it does not parse ('plutil -lint' $(call_result "$rc"))"; return 1; fi
-  else
-    VERSION_PROBLEM="'plutil -extract InsomniaResumeFrozenVersion' $(call_result "$rc")"
+INFO_EVIDENCE=unknown
+INFO_VERSION=""
+INFO_PROBLEM=""
+# The identity of an Info.plist (device, inode, change time with
+# nanoseconds, size) in INFO_ID, or "none" when no regular file is there;
+# 1, with INFO_PROBLEM, when stat failed, did not answer or printed
+# something else. stat reads no contents.
+INFO_ID=""
+info_identity() { # file
+  local rc=0 form='^[0-9]+:[0-9]+:[0-9]+(\.[0-9]+)?:[0-9]+$'
+  INFO_ID=none
+  [[ -f "$1" ]] || return 0
+  bounded "$STAT" -L -f '%d:%i:%Fc:%z' "$1" || rc=$?
+  if (( rc != 0 )); then
+    INFO_PROBLEM="'stat' $(call_result "$rc")"
     return 1
   fi
-  rc=0
-  bounded "$STAT" -L -f '%d:%i:%Fc:%z' "$INFO_PLIST" || rc=$?
-  if (( rc != 0 )); then VERSION_PROBLEM="'stat' $(call_result "$rc")"; return 1; fi
-  if [[ "$BOUNDED_OUTPUT" != "$before" ]]; then VERSION_PROBLEM="it changed while it was read"; return 1; fi
-  VERSION_EVIDENCE="$before"
+  INFO_ID=""
+  if work_read "$BOUNDED_BASE.out"; then INFO_ID="${READ_TEXT%$'\n'}"; fi
+  if [[ ! "$INFO_ID" =~ $form ]]; then
+    INFO_PROBLEM="'stat' exited 0, but its output could not be read back as the file's identity"
+    return 1
+  fi
+  return 0
 }
-if [[ -n "$CHECKOUT_BACKSTOP" ]] && ! read_installed_version; then
-  echo "Could not read InsomniaResumeFrozenVersion from $INFO_PLIST: $VERSION_PROBLEM. Which backstop.sh speaks the installed app's interface is unknown, so none was run. Nothing was removed; rerun once it reads." >&2
-  exit 1
+# InsomniaResumeFrozenVersion from an Info.plist in INFO_VERSION, and the
+# file's identity before the read in INFO_EVIDENCE ("none" when no regular
+# file is there, which declares nothing). 1, with INFO_PROBLEM and
+# INFO_EVIDENCE left as they were, when a read failed or did not answer,
+# when the file does not parse, or when its identity after the read differs.
+read_info_version() { # file
+  local rc=0 before
+  info_identity "$1" || return 1
+  before="$INFO_ID"
+  INFO_VERSION=""
+  if [[ "$before" != none ]]; then
+    bounded "$PLUTIL" -extract InsomniaResumeFrozenVersion raw -o - "$1" || rc=$?
+    if (( rc == 0 )); then
+      if ! work_read "$BOUNDED_BASE.out"; then
+        INFO_PROBLEM="'plutil -extract InsomniaResumeFrozenVersion' exited 0, but its output could not be read back whole"
+        return 1
+      fi
+      # As $(...) would read it: trailing newlines cut.
+      INFO_VERSION="${READ_TEXT%"${READ_TEXT##*[!$'\n']}"}"
+    elif (( rc == 1 )); then
+      # No such key, or no plist at all: only a plist that parses declares
+      # no version.
+      rc=0
+      bounded "$PLUTIL" -lint "$1" || rc=$?
+      if (( rc != 0 )); then
+        INFO_PROBLEM="it does not parse ('plutil -lint' $(call_result "$rc"))"
+        return 1
+      fi
+    else
+      INFO_PROBLEM="'plutil -extract InsomniaResumeFrozenVersion' $(call_result "$rc")"
+      return 1
+    fi
+    info_identity "$1" || return 1
+    if [[ "$INFO_ID" != "$before" ]]; then
+      INFO_PROBLEM="it changed while it was read"
+      return 1
+    fi
+  fi
+  INFO_EVIDENCE="$before"
+  return 0
+}
+if ! read_info_version "$INFO_PLIST"; then
+  if [[ -n "$CHECKOUT_BACKSTOP" ]]; then
+    echo "Could not read InsomniaResumeFrozenVersion from $INFO_PLIST: $INFO_PROBLEM. Which backstop.sh speaks the installed app's interface is unknown, so none was run. Nothing was removed; rerun once it reads." >&2
+    exit 1
+  fi
+  echo "note: could not read InsomniaResumeFrozenVersion from $INFO_PLIST before the recovery lock: $INFO_PROBLEM. If the journal holds a frozen process that only the app binary can resume, it stays frozen and journaled, and step 4 then stops before anything is removed." >&2
 fi
 
 # The password is asked here, once, before the recovery lock: each sudo call
@@ -1435,23 +1833,17 @@ if [[ -e "$SCRIPT_DIR/backstop.sh" ]] && ! in_checkout; then
   echo "not running $SCRIPT_DIR/backstop.sh: $SCRIPT_DIR is not the scripts folder of a source checkout, and a release zip has no backstop.sh, so it was added after the zip was unpacked." >&2
 fi
 # The version read before the lock still applies only to the same file,
-# unchanged (see read_installed_version).
+# unchanged (see read_info_version).
 if [[ -n "$CHECKOUT_BACKSTOP" ]]; then
-  version_rc=0
-  version_now=none
-  if [[ -f "$INFO_PLIST" ]]; then
-    bounded "$STAT" -L -f '%d:%i:%Fc:%z' "$INFO_PLIST" || version_rc=$?
-    version_now="$BOUNDED_OUTPUT"
-  fi
-  if (( version_rc != 0 )); then
-    echo "'stat $INFO_PLIST' $(call_result "$version_rc") under the recovery lock, so whether the InsomniaResumeFrozenVersion read before the lock still applies is unknown, and no backstop.sh was run. Nothing was removed; rerun." >&2
+  if ! info_identity "$INFO_PLIST"; then
+    echo "Checking $INFO_PLIST under the recovery lock failed ($INFO_PROBLEM), so whether the InsomniaResumeFrozenVersion read before the lock still applies is unknown, and no backstop.sh was run. Nothing was removed; rerun." >&2
     exit 1
-  elif [[ "$version_now" != "$VERSION_EVIDENCE" ]]; then
+  elif [[ "$INFO_ID" != "$INFO_EVIDENCE" ]]; then
     echo "$INFO_PLIST changed after this run read its InsomniaResumeFrozenVersion (an install may have replaced the app meanwhile). No Info.plist is read under the recovery lock, so which backstop.sh speaks the installed app's interface is unknown, and none was run. Nothing was removed; rerun." >&2
     exit 1
   fi
 fi
-if [[ -n "$CHECKOUT_BACKSTOP" ]] && { [[ "$installed_version" == "$RESUME_FROZEN_VERSION" ]] || { [[ ! -f "$APP/Contents/Resources/backstop.sh" ]] && [[ ! -f "$APP_SUPPORT/backstop.sh" ]]; }; }; then
+if [[ -n "$CHECKOUT_BACKSTOP" ]] && { [[ "$INFO_VERSION" == "$RESUME_FROZEN_VERSION" ]] || { [[ ! -f "$APP/Contents/Resources/backstop.sh" ]] && [[ ! -f "$APP_SUPPORT/backstop.sh" ]]; }; }; then
   BACKSTOP="$CHECKOUT_BACKSTOP"
 elif [[ -f "$APP/Contents/Resources/backstop.sh" ]]; then
   verify_rc=0
@@ -1482,27 +1874,48 @@ if [[ -n "$CHECKOUT_BACKSTOP" && "$BACKSTOP" != "$CHECKOUT_BACKSTOP" ]]; then
 fi
 echo "using $BACKSTOP"
 recovery_rc=0
-/bin/bash "$BACKSTOP" --force || recovery_rc=$?
+run_backstop "$BACKSTOP" || recovery_rc=$?
+case "$recovery_rc" in
+  125)
+    echo "$BACKSTOP did not finish within ${BACKSTOP_TIMEOUT_SECONDS}s and is still running as pid ${BOUNDED_PID:-?} three seconds after its SIGTERM. It is not killed, because it may be running sudo pmset, and it keeps the recovery lock until it ends. Nothing was removed; rerun once it has ended." >&2
+    exit 1 ;;
+  124) echo "$BACKSTOP did not finish within ${BACKSTOP_TIMEOUT_SECONDS}s and was stopped with SIGTERM; what it undid before then stays undone, and the journal shows what is left." >&2 ;;
+  126) echo "$BACKSTOP could not be started: no file for its output could be made in $WORK." >&2 ;;
+esac
 
 # 4. Verify independently ------------------------------------------------------
-# The checks run in a subshell this shell waits for, writing to a file in
-# WORK, not in a process substitution: so nothing the check starts outlives
-# it with the lock, and a check that stops early (its status) or a read that
-# failed (READ_FAILURES) counts as a problem, never as a clean journal.
+# The checks run in $(...), which this shell waits for, not in a process
+# substitution: so nothing the check starts outlives it with the lock. Their
+# result does not rest on set -e, which bash turns off on the left of ||:
+# each read returns an explicit status, a read that failed or did not answer
+# makes the check return 2 with a note in READ_FAILURES, and the check
+# prints "." last, so output cut short shows. Any of these counts as a
+# problem, never as a clean journal.
 step "Verifying the recovery journal"
 problems=()
 "$RM" -f "$READ_FAILURES"
 check_rc=0
-( journal_problems ) > "$WORK/journal.lines" || check_rc=$?
-while IFS= read -r line; do
-  [[ -n "$line" ]] && problems+=("$line")
-done < "$WORK/journal.lines"
-if [[ -s "$READ_FAILURES" ]]; then
-  while IFS= read -r line; do
-    [[ -n "$line" ]] && problems+=("the journal could not be fully checked: $line")
-  done < "$READ_FAILURES"
+check_text="$(journal_problems; rc=$?; echo .; exit "$rc")" || check_rc=$?
+if [[ "$check_text" != *. ]]; then
+  problems+=("the journal check ended before it printed all of its result, so the journal was not fully checked")
 fi
-if (( check_rc != 0 )); then
+text_lines "${check_text%.}"
+problems+=(${TEXT_LINES[@]+"${TEXT_LINES[@]}"})
+check_noted=0
+if [[ -e "$READ_FAILURES" ]]; then
+  if work_read "$READ_FAILURES"; then
+    text_lines "$READ_TEXT"
+    for line in ${TEXT_LINES[@]+"${TEXT_LINES[@]}"}; do
+      problems+=("the journal could not be fully checked: $line")
+      check_noted=1
+    done
+  fi
+  if (( ! check_noted )); then
+    problems+=("the journal could not be fully checked, and the note saying why could not be read back")
+    check_noted=1
+  fi
+fi
+if (( check_rc != 0 && ! check_noted )); then
   problems+=("the journal check stopped with status $check_rc, so the journal was not fully checked")
 fi
 if (( recovery_rc != 0 )) && (( ${#problems[@]} == 0 )); then
@@ -1515,18 +1928,19 @@ echo "journal clean"
 # state.json is kept when a brightness it records cannot be restored here,
 # and also when reading it again for that fails: a kept file is never the
 # wrong way round.
-kept_brightness=()
 "$RM" -f "$READ_FAILURES"
 kept_rc=0
-( refused_brightness ) > "$WORK/kept.lines" || kept_rc=$?
-while IFS= read -r line; do
-  [[ -n "$line" ]] && kept_brightness+=("$line")
-done < "$WORK/kept.lines"
+kept_text="$(refused_brightness; rc=$?; echo .; exit "$rc")" || kept_rc=$?
+text_lines "${kept_text%.}"
+kept_brightness=(${TEXT_LINES[@]+"${TEXT_LINES[@]}"})
 kept_unknown=""
-if [[ -s "$READ_FAILURES" ]]; then
-  kept_unknown="$(head -n 1 "$READ_FAILURES")"
+if [[ -e "$READ_FAILURES" ]]; then
+  kept_unknown="the note saying why could not be read back"
+  if work_read "$READ_FAILURES" && [[ -n "$READ_TEXT" ]]; then kept_unknown="${READ_TEXT%%$'\n'*}"; fi
 elif (( kept_rc != 0 )); then
   kept_unknown="the check stopped with status $kept_rc"
+elif [[ "$kept_text" != *. ]]; then
+  kept_unknown="the check ended before it printed all of its result"
 fi
 if (( ${#kept_brightness[@]} > 0 )); then
   echo "Not restored, and kept in $STATE:"
@@ -1624,10 +2038,10 @@ if (( sudoers_present )); then
     case "$remove_rc" in
       0) ;;
       3) echo "Kept $SUDOERS: $SUDOERS_LOCK stayed taken for ${LOCK_TIMEOUT_SECONDS}s, so another install.sh or uninstall.sh, perhaps in another account, is changing it." >&2 ;;
-      4) echo "Kept $SUDOERS: it changed after this uninstall read it, or is not a regular file of root's with one link that only root can change (${BOUNDED_OUTPUT:-no detail}). Another install.sh or uninstall.sh, perhaps in another account, may have written or removed it meanwhile, and a rule written then may be another account's." >&2 ;;
+      4) echo "Kept $SUDOERS: it changed after this uninstall read it, or could not be shown to be a regular file of root's with one link that only root can change (${BOUNDED_OUTPUT:-no detail}). Another install.sh or uninstall.sh, perhaps in another account, may have written or removed it meanwhile, and a rule written then may be another account's." >&2 ;;
       5) echo "Kept $SUDOERS: removing it failed (${BOUNDED_OUTPUT:-no detail})." >&2 ;;
-      7) echo "Kept $SUDOERS: the lock file $SUDOERS_LOCK, or a folder above it, is not one only root can change (${BOUNDED_OUTPUT:-no detail}), so the lock that keeps two runs from changing the rule at once cannot be trusted. Nothing there was repaired: check it yourself (the lock file must be a regular file of root's with mode 0600 and one link)." >&2 ;;
-      8) echo "Kept $SUDOERS: read again as root, it holds a NUL byte, changed while it was read, or is not the rule install.sh writes for $ACCOUNT${BOUNDED_OUTPUT:+ ($BOUNDED_OUTPUT)}." >&2 ;;
+      7) echo "Kept $SUDOERS: the lock file $SUDOERS_LOCK, or a folder above it, could not be shown to be one only root can change (${BOUNDED_OUTPUT:-no detail}), so the lock that keeps two runs from changing the rule at once cannot be trusted. Nothing there was repaired: check it yourself (the lock file must be a regular file of root's with mode 0600 and one link)." >&2 ;;
+      8) echo "Kept $SUDOERS: read again as root, it could not be read in full, holds a NUL byte, changed while it was read, or is not the rule install.sh writes for $ACCOUNT${BOUNDED_OUTPUT:+ ($BOUNDED_OUTPUT)}." >&2 ;;
       1 | 2) echo "Kept $SUDOERS: the sudo call that removes it exited $remove_rc before removing it${BOUNDED_OUTPUT:+ ($BOUNDED_OUTPUT)}." >&2 ;;
       124) sudoers_uncertain "The sudo call that removes $SUDOERS did not answer within ${CALL_TIMEOUT_SECONDS}s and stopped on SIGTERM, so whether the rule was removed is not known." ;;
       125) sudoers_uncertain "The sudo call that removes $SUDOERS did not answer within ${CALL_TIMEOUT_SECONDS}s, so whether the rule was removed is not known. $(sudo_alive_note). It keeps the recovery lock until it ends, so until then the app cannot start a session; if it does not end by itself, stop it with 'sudo kill ${BOUNDED_PID:-<pid>}'." ;;

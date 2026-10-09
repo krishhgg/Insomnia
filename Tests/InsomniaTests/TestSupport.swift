@@ -1014,9 +1014,28 @@ enum TestACL {
     /// Gives `url` one entry letting its owner, the user running the tests,
     /// read it. On a 0200 file that entry is the only way to read it.
     static func grantOwnerRead(_ url: URL) throws {
+        try add("user:\(owner) allow read", to: url)
+    }
+
+    /// The user running the tests, by name, as an entry names a user.
+    static var owner: String { String(cString: getpwuid(getuid()).pointee.pw_name) }
+
+    /// Adds `entry` (chmod +a syntax, "everyone deny delete") to the list
+    /// of `url`, a file or folder the test made.
+    static func add(_ entry: String, to url: URL) throws {
+        try chmod(["+a", entry, url.path])
+    }
+
+    /// Removes every entry from the list of `url`, so a folder with "deny
+    /// delete" can be removed again.
+    static func clear(_ url: URL) {
+        try? chmod(["-N", url.path])
+    }
+
+    private static func chmod(_ arguments: [String]) throws {
         let chmod = Process()
         chmod.executableURL = URL(fileURLWithPath: "/bin/chmod")
-        chmod.arguments = ["+a", "user:\(String(cString: getpwuid(getuid()).pointee.pw_name)) allow read", url.path]
+        chmod.arguments = arguments
         let exit = ProcessExit(chmod)
         try chmod.run()
         exit.wait()

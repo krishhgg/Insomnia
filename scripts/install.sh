@@ -68,6 +68,8 @@ MKDIR=/bin/mkdir
 TEST=/bin/test
 CAT=/bin/cat
 STAT=/usr/bin/stat
+LS=/bin/ls
+WC=/usr/bin/wc
 CHOWN=/usr/sbin/chown
 VISUDO=/usr/sbin/visudo
 # The shell sudoers_replace runs as root.
@@ -77,6 +79,9 @@ LOCK_TIMEOUT_SECONDS=10
 # made while this run holds the recovery lock (and for the sudoers check and
 # the process checks before it); see bounded() below.
 CALL_TIMEOUT_SECONDS=30
+# Longest backstop.sh may run in step 5 before it is sent SIGTERM (see
+# run_backstop).
+BACKSTOP_TIMEOUT_SECONDS=300
 
 # What a prebuilt bundle (--app) must be, and the bundle id that makes a
 # running process this app (find_insomnia).
@@ -161,25 +166,38 @@ command_line() { local line; line="$(printf '%q ' "$@")"; printf '%s' "${line% }
 # within three seconds of the limit. A sudo that ignores SIGTERM keeps the
 # lock until it ends, as backstop.sh does with sudo pmset.
 # Each call's files get a name from mktemp, so a call made inside $(...)
-# cannot reuse another's.
+# cannot reuse another's; when mktemp fails, the call is not made and the
+# status is 126. A call is checked on every 2 ms for its first fifty checks,
+# so a quick one is seen to end within milliseconds, and every 50 ms after
+# that; each check is one exec of sleep.
+# A caller whose call needs another limit than CALL_TIMEOUT_SECONDS sets
+# BOUNDED_LIMIT, and one whose command must never get SIGKILL sets
+# BOUNDED_TERM_ONLY=1, both as locals of its own (see run_backstop). Such a
+# call is then handled as sudo is: 125 while it is still running after its
+# SIGTERM.
 BOUNDED_OUTPUT=""
 BOUNDED_PID=""
 BOUNDED_BASE=""
+BOUNDED_LIMIT=""
+BOUNDED_TERM_ONLY=""
 # shellcheck disable=SC2034  # BOUNDED_BASE is read in uninstall.sh, whose bounded() is this one
 bounded() { # command args...
-  local base supervisor rc deadline
-  base="$("$MKTEMP" "$WORK/call.XXXXXX")"
-  BOUNDED_BASE="$base"
+  local base supervisor rc deadline limit="${BOUNDED_LIMIT:-$CALL_TIMEOUT_SECONDS}" term_only=0 polls=0
+  if [[ "$1" == "$SUDO" || -n "${BOUNDED_TERM_ONLY:-}" ]]; then term_only=1; fi
+  BOUNDED_BASE=""
   BOUNDED_OUTPUT=""
   BOUNDED_PID=""
-  supervise "$base" "$@" </dev/null >/dev/null 2>&1 &
+  base="$("$MKTEMP" "$WORK/call.XXXXXX")" || return 126
+  BOUNDED_BASE="$base"
+  supervise "$base" "$limit" "$term_only" "$@" </dev/null >/dev/null 2>&1 &
   supervisor=$!
-  if [[ "$1" == "$SUDO" ]]; then
+  if (( term_only )); then
     # The supervisor's limit (at most a second over), then at least two
-    # seconds for sudo to stop on SIGTERM.
-    deadline=$(( SECONDS + CALL_TIMEOUT_SECONDS + 3 ))
+    # seconds for the call to stop on SIGTERM.
+    deadline=$(( SECONDS + limit + 3 ))
     while [[ ! -s "$base.rc" ]] && (( SECONDS <= deadline )); do
-      sleep 0.01
+      if (( polls < 50 )); then sleep 0.002; else sleep 0.05; fi
+      polls=$((polls + 1))
     done
     if [[ ! -s "$base.rc" ]]; then
       BOUNDED_PID="$(cat "$base.pid" 2>/dev/null || true)"
@@ -207,22 +225,23 @@ bounded() { # command args...
 # and SIGHUP actions this script started with, so it still stops on the
 # SIGTERM at its limit or from the group. errexit is off here: a failed
 # write must not end the supervisor while its call runs.
-supervise() { # base command args...
-  local base="$1" cpid rc=0 deadline
-  shift
+supervise() { # base limit term-only command args...
+  local base="$1" limit="$2" term_only="$3" cpid rc=0 deadline polls=0
+  shift 3
   set +e
   trap '' TERM HUP
   ( trap - TERM HUP; exec "$@" ) </dev/null >"$base.out" 2>&1 &
   cpid=$!
   echo "$cpid" > "$base.pid"
-  deadline=$(( SECONDS + CALL_TIMEOUT_SECONDS ))
+  deadline=$(( SECONDS + limit ))
   while kill -0 "$cpid" 2>/dev/null && (( SECONDS <= deadline )); do
-    sleep 0.01
+    if (( polls < 50 )); then sleep 0.002; else sleep 0.05; fi
+    polls=$((polls + 1))
   done
   # Past the limit, and the shell has not reaped the call: it is still there.
   if (( SECONDS > deadline )) && [[ -n "$(jobs -rp)" ]]; then
     kill -TERM %1 2>/dev/null || true
-    if [[ "$1" != "$SUDO" ]]; then
+    if (( ! term_only )); then
       deadline=$(( SECONDS + 1 ))
       while [[ -n "$(jobs -rp)" ]] && (( SECONDS <= deadline )); do
         sleep 0.01
@@ -243,6 +262,122 @@ call_result() { # status
   else
     printf 'exited %s' "$1"
   fi
+}
+# Reads a file this run wrote in WORK (a call's output) into READ_TEXT byte
+# for byte, without $(...), which drops NUL bytes and trailing newlines.
+# Returns 0 when all of it was read; 1 when it has a NUL byte, which no shell
+# variable can hold (READ_TEXT is then the text without them and trailing
+# newlines, and READ_HEAD the text before the first); 2 when it is not a
+# regular file, or the read failed or came up short of the size wc gives.
+# READ_HEAD is READ_TEXT otherwise. WORK is this run's own folder (mktemp
+# -d, mode 0700), so only this account could put anything else there.
+work_read() { # file -> READ_TEXT, READ_HEAD
+  local LC_ALL=C size
+  READ_TEXT=""
+  READ_HEAD=""
+  [[ -f "$1" && ! -L "$1" ]] || return 2
+  size="$("$WC" -c 2>/dev/null < "$1")" || return 2
+  size="${size//[!0-9]/}"
+  [[ -n "$size" ]] || return 2
+  if IFS= read -r -d '' READ_HEAD 2>/dev/null < "$1"; then
+    READ_TEXT="$(<"$1")" || return 2
+    return 1
+  fi
+  READ_TEXT="$READ_HEAD"
+  (( ${#READ_TEXT} == 10#$size )) || return 2
+  return 0
+}
+# The InsomniaResumeFrozenVersion an installed app's Info.plist declares,
+# read before the recovery lock (step 5) for the backstop, which hands
+# frozen entries to the app binary only when the value is the
+# --resume-frozen interface version it speaks and its own stat under the
+# lock shows the same file unchanged. The same text as in uninstall.sh and
+# backstop.sh, which say more.
+INFO_EVIDENCE=unknown
+INFO_VERSION=""
+INFO_PROBLEM=""
+# The identity of an Info.plist (device, inode, change time with
+# nanoseconds, size) in INFO_ID, or "none" when no regular file is there;
+# 1, with INFO_PROBLEM, when stat failed, did not answer or printed
+# something else. stat reads no contents.
+INFO_ID=""
+info_identity() { # file
+  local rc=0 form='^[0-9]+:[0-9]+:[0-9]+(\.[0-9]+)?:[0-9]+$'
+  INFO_ID=none
+  [[ -f "$1" ]] || return 0
+  bounded "$STAT" -L -f '%d:%i:%Fc:%z' "$1" || rc=$?
+  if (( rc != 0 )); then
+    INFO_PROBLEM="'stat' $(call_result "$rc")"
+    return 1
+  fi
+  INFO_ID=""
+  if work_read "$BOUNDED_BASE.out"; then INFO_ID="${READ_TEXT%$'\n'}"; fi
+  if [[ ! "$INFO_ID" =~ $form ]]; then
+    INFO_PROBLEM="'stat' exited 0, but its output could not be read back as the file's identity"
+    return 1
+  fi
+  return 0
+}
+# InsomniaResumeFrozenVersion from an Info.plist in INFO_VERSION, and the
+# file's identity before the read in INFO_EVIDENCE ("none" when no regular
+# file is there, which declares nothing). 1, with INFO_PROBLEM and
+# INFO_EVIDENCE left as they were, when a read failed or did not answer,
+# when the file does not parse, or when its identity after the read differs.
+read_info_version() { # file
+  local rc=0 before
+  info_identity "$1" || return 1
+  before="$INFO_ID"
+  INFO_VERSION=""
+  if [[ "$before" != none ]]; then
+    bounded "$PLUTIL" -extract InsomniaResumeFrozenVersion raw -o - "$1" || rc=$?
+    if (( rc == 0 )); then
+      if ! work_read "$BOUNDED_BASE.out"; then
+        INFO_PROBLEM="'plutil -extract InsomniaResumeFrozenVersion' exited 0, but its output could not be read back whole"
+        return 1
+      fi
+      # As $(...) would read it: trailing newlines cut.
+      INFO_VERSION="${READ_TEXT%"${READ_TEXT##*[!$'\n']}"}"
+    elif (( rc == 1 )); then
+      # No such key, or no plist at all: only a plist that parses declares
+      # no version.
+      rc=0
+      bounded "$PLUTIL" -lint "$1" || rc=$?
+      if (( rc != 0 )); then
+        INFO_PROBLEM="it does not parse ('plutil -lint' $(call_result "$rc"))"
+        return 1
+      fi
+    else
+      INFO_PROBLEM="'plutil -extract InsomniaResumeFrozenVersion' $(call_result "$rc")"
+      return 1
+    fi
+    info_identity "$1" || return 1
+    if [[ "$INFO_ID" != "$before" ]]; then
+      INFO_PROBLEM="it changed while it was read"
+      return 1
+    fi
+  fi
+  INFO_EVIDENCE="$before"
+  return 0
+}
+# backstop.sh, run as one bounded call with its own limit,
+# BACKSTOP_TIMEOUT_SECONDS, and SIGTERM only, never SIGKILL: on SIGTERM it
+# removes its private files and ends, while each sudo pmset or app binary
+# call it started keeps the recovery lock through its own supervisor until
+# that call has exited. It shares this run's lock through fd 9, which the
+# supervisor here keeps until the backstop has exited, even if this run is
+# killed first. The InsomniaResumeFrozenVersion read before the lock, and
+# the identity of the file it came from, go down in its environment (see
+# read_info_version). Returns the backstop's status, or 124 when it was
+# stopped at its limit, 125 when it was still running three seconds after
+# its SIGTERM (pid in BOUNDED_PID; it keeps the lock until it ends), 126
+# when it could not be started. What it printed is printed once it ends.
+run_backstop() { # backstop.sh
+  local rc=0 BOUNDED_LIMIT="$BACKSTOP_TIMEOUT_SECONDS" BOUNDED_TERM_ONLY=1
+  local INSOMNIA_INFO_PATH="$INFO_PLIST" INSOMNIA_INFO_EVIDENCE="$INFO_EVIDENCE" INSOMNIA_INFO_VERSION="$INFO_VERSION"
+  export INSOMNIA_INFO_PATH INSOMNIA_INFO_EVIDENCE INSOMNIA_INFO_VERSION
+  bounded /bin/bash "$1" --force || rc=$?
+  if [[ -n "$BOUNDED_OUTPUT" ]]; then printf '%s\n' "$BOUNDED_OUTPUT"; fi
+  return "$rc"
 }
 
 # `launchctl print` exits 0 when a job with the label is loaded and 113 when
@@ -551,9 +686,9 @@ stop_for_unverified() { # what was changed
 # nothing when it can: a regular file of root's (ROOT_UID) with one link, no
 # setuid, setgid or sticky bit and no write permission for group or others;
 # with $3, exactly that mode. $2 is its `stat -f '%Hp %Mp %Lp %u %l'`, which
-# reads the name itself, not what a link points to. This and the two
-# functions below are the same in install.sh and uninstall.sh (a test keeps
-# them in step) and run only as root.
+# reads the name itself, not what a link points to. This and the functions
+# below, up to sudoers_recheck, are the same in install.sh and uninstall.sh
+# (a test keeps them in step) and run only as root.
 sudoers_file_problem() { # name stat [mode]
   local type special perm uid links
   read -r type special perm uid links <<< "$2"
@@ -570,24 +705,62 @@ sudoers_file_problem() { # name stat [mode]
   fi
   return 0
 }
-# Takes $SUDOERS_LOCK on fd 8 for the rest of the root shell, once it is
-# shown that only root can have made or changed it. An existing file must be
-# a regular file of root's with mode 0600 and one link, and every folder from
-# its own up to / a folder of root's that group and others cannot write.
-# Both are checked before the file is opened, so a FIFO (whose open would
-# wait) or a link is never opened. The file is created, mode 0600, only where
-# nothing is (noclobber: no link is followed and nothing is truncated).
-# Nothing is ever repaired, replaced or removed. Once the lock is taken, the
-# descriptor and the path must still be the same file, unchanged, and the
-# rule $1 must be in the same folder. Exits 7 with the reason when a check
-# fails, 3 when the lock is not free within LOCK_TIMEOUT_SECONDS.
-sudoers_guard_take() { # rule
-  local dir s type perm uid why took seen
-  if [[ -e "$SUDOERS_LOCK" || -L "$SUDOERS_LOCK" ]]; then
-    why="$(sudoers_file_problem "$SUDOERS_LOCK" "$("$STAT" -f '%Hp %Mp %Lp %u %l' "$SUDOERS_LOCK" 2>/dev/null)" 600)"
-    if [[ -n "$why" ]]; then echo "$why" >&2; exit 7; fi
+# Exits with status $1, saying why on stderr, unless `ls -lde` shows that no
+# access control list on the files and folders named after it allows more
+# than reading. An entry that allows anything else (write, append, delete,
+# add_file, add_subdirectory, delete_child, writeattr, writeextattr,
+# writesecurity, chown, or a right not listed here) counts, whoever it names
+# and whatever its inheritance flags: a folder's inheritable entries reach
+# the files made in it. An entry for root counts too, though root needs
+# none. Deny entries pass. So does an answer only when it is read in full:
+# ls fails, prints a line not parsed here, marks a list (+) and prints no
+# entry, or leaves out a name, and the run stops. Nothing is ever repaired.
+sudoers_acl_check() { # status name...
+  local status="$1" out rc=0 line name="" plus="" entries=0 seen=0 a perm
+  shift
+  out="$("$LS" -lde "$@" 2>&1)" || rc=$?
+  if (( rc != 0 )); then
+    echo "the access control lists of $* could not be read (ls exited $rc: $out)" >&2
+    exit "$status"
   fi
-  dir="$SUDOERS_LOCK"
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^[-a-z][-rwxsStT]{9}([@+]?)\  ]]; then
+      if [[ "$plus" == + ]] && (( entries == 0 )); then break; fi
+      plus="${BASH_REMATCH[1]}" entries=0 name=""
+      for a in "$@"; do
+        if [[ "$line" == *" $a" ]] && (( ${#a} > ${#name} )); then name="$a"; fi
+      done
+      [[ -n "$name" ]] || break
+      seen=$(( seen + 1 ))
+    elif [[ -n "$name" && "$line" =~ ^\ *[0-9]+:\ .+\ (allow|deny)\ ([a-z_,]+)$ ]]; then
+      entries=$(( entries + 1 ))
+      [[ "${BASH_REMATCH[1]}" == allow ]] || continue
+      for perm in ${BASH_REMATCH[2]//,/ }; do
+        case "$perm" in
+          read | execute | readattr | readextattr | readsecurity | list | search \
+            | file_inherit | directory_inherit | limit_inherit | only_inherit) ;;
+          *)
+            echo "$name has an access control list entry that allows more than reading ($line)" >&2
+            exit "$status" ;;
+        esac
+      done
+    else
+      name=""
+      break
+    fi
+  done <<< "$out"
+  if [[ -z "$name" || ( "$plus" == + && "$entries" == 0 ) || "$seen" != "$#" ]]; then
+    echo "the access control lists of $* could not be read in full (ls: $out)" >&2
+    exit "$status"
+  fi
+}
+# Exits 7, saying why on stderr, unless every folder from the one that holds
+# $SUDOERS_LOCK up to / is a folder of root's that group and others cannot
+# write, with no access control list that allows more than reading
+# (sudoers_acl_check). Leaves the folders in SUDOERS_DIRS.
+sudoers_dirs_check() {
+  local dir="$SUDOERS_LOCK" s type perm uid
+  SUDOERS_DIRS=()
   while [[ "$dir" == /?* ]]; do
     dir="${dir%/*}"
     s="$("$STAT" -f '%Hp %Lp %u' "${dir:-/}" 2>/dev/null)"
@@ -597,52 +770,124 @@ sudoers_guard_take() { # rule
       echo "${dir:-/}, a folder above $SUDOERS_LOCK, is not a folder of root's that only root can write (stat: ${s:-no answer})" >&2
       exit 7
     fi
+    SUDOERS_DIRS+=("${dir:-/}")
   done
+  sudoers_acl_check 7 "${SUDOERS_DIRS[@]}"
+}
+# Takes $SUDOERS_LOCK on fd 8 for the rest of the root shell, once it is
+# shown that only root can have made or changed it. An existing file must be
+# a regular file of root's with mode 0600 and one link, and every folder from
+# its own up to / a folder of root's that group and others cannot write
+# (sudoers_dirs_check), none with an access control list that allows more
+# than reading. Both are checked before the file is opened, so a FIFO (whose
+# open would wait) or a link is never opened. The file is created, mode
+# 0600, only where nothing is (noclobber: no link is followed and nothing is
+# truncated), and its own access control list is checked before it is
+# opened. Nothing is ever repaired, replaced or removed. Once the lock is
+# taken, the descriptor and the path must still be the same file, unchanged
+# (kept in SUDOERS_LOCK_ID for sudoers_recheck), and the rule $1 must be in
+# the same folder. Exits 7 with the reason when a check fails, 3 when the
+# lock is not free within LOCK_TIMEOUT_SECONDS.
+sudoers_guard_take() { # rule
+  local why seen
+  if [[ -e "$SUDOERS_LOCK" || -L "$SUDOERS_LOCK" ]]; then
+    why="$(sudoers_file_problem "$SUDOERS_LOCK" "$("$STAT" -f '%Hp %Mp %Lp %u %l' "$SUDOERS_LOCK" 2>/dev/null)" 600)"
+    if [[ -n "$why" ]]; then echo "$why" >&2; exit 7; fi
+  fi
+  sudoers_dirs_check
   ( set -C; : > "$SUDOERS_LOCK" ) 2>/dev/null || true
   why="$(sudoers_file_problem "$SUDOERS_LOCK" "$("$STAT" -f '%Hp %Mp %Lp %u %l' "$SUDOERS_LOCK" 2>/dev/null)" 600)"
   if [[ -n "$why" ]]; then echo "$why" >&2; exit 7; fi
+  sudoers_acl_check 7 "$SUDOERS_LOCK"
   exec 8<"$SUDOERS_LOCK" || exit 7
   "$LOCKF" -t "$LOCK_TIMEOUT_SECONDS" 8 2>/dev/null || exit 3
-  took="$("$STAT" -f '%d:%i %Hp %Mp %Lp %u %l' <&8 2>/dev/null)"
+  SUDOERS_LOCK_ID="$("$STAT" -f '%d:%i %Hp %Mp %Lp %u %l' <&8 2>/dev/null)"
   seen="$("$STAT" -f '%d:%i %Hp %Mp %Lp %u %l' "$SUDOERS_LOCK" 2>/dev/null)"
-  if [[ -z "$took" || "$took" != "$seen" ]]; then
+  if [[ -z "$SUDOERS_LOCK_ID" || "$SUDOERS_LOCK_ID" != "$seen" ]]; then
     echo "$SUDOERS_LOCK is no longer the file this run opened and locked" >&2
     exit 7
   fi
-  why="$(sudoers_file_problem "$SUDOERS_LOCK" "${took#* }" 600)"
+  why="$(sudoers_file_problem "$SUDOERS_LOCK" "${SUDOERS_LOCK_ID#* }" 600)"
   if [[ -n "$why" ]]; then echo "$why" >&2; exit 7; fi
   if [[ "$("$STAT" -L -f '%d:%i' "${1%/*}" 2>/dev/null)" != "$("$STAT" -f '%d:%i' "${SUDOERS_LOCK%/*}" 2>/dev/null)" ]]; then
     echo "$1 is not in the folder that holds $SUDOERS_LOCK" >&2
     exit 7
   fi
 }
-# Opens the rule $1 on fd 7, once sudoers_file_problem finds nothing wrong
-# with it (any mode without group or other write), and reads it through that
-# descriptor. Exits 4 unless the path still names the opened file and the
-# text read, trailing newlines aside, is exactly $2, the text the caller read
-# and judged before sudo ran; 8 when the shell cannot hold the bytes exactly
-# (a NUL byte, or a change while they were read). Leaves the file's identity
-# in PINNED_ID and its text in PINNED_TEXT.
-sudoers_pin_rule() { # rule text
-  local LC_ALL=C why size
+# Opens the rule $1 on fd 6, once sudoers_file_problem (any mode without
+# group or other write) and sudoers_acl_check find nothing wrong with it,
+# and reads it from its start through that descriptor, checking cat's exit
+# status. Leaves the file's identity in RULE_ID and its bytes in RULE_RAW,
+# with a "." after them so $(...) keeps a trailing newline. Exits 4 unless
+# the path still names the opened file; 8 when cat fails, or the bytes read
+# are not as many as the file's size (a NUL byte, which the shell drops, or
+# a change while they were read).
+sudoers_read_rule() { # rule
+  local LC_ALL=C why size rc=0
   why="$(sudoers_file_problem "$1" "$("$STAT" -f '%Hp %Mp %Lp %u %l' "$1" 2>/dev/null)")"
   if [[ -n "$why" ]]; then echo "$why" >&2; exit 4; fi
-  exec 7<"$1" || exit 4
-  PINNED_ID="$("$STAT" -f '%d:%i' <&7 2>/dev/null)"
-  if [[ -z "$PINNED_ID" || "$PINNED_ID" != "$("$STAT" -f '%d:%i' "$1" 2>/dev/null)" ]]; then
+  sudoers_acl_check 4 "$1"
+  exec 6<"$1" || exit 4
+  RULE_ID="$("$STAT" -f '%d:%i' <&6 2>/dev/null)"
+  if [[ -z "$RULE_ID" || "$RULE_ID" != "$("$STAT" -f '%d:%i' "$1" 2>/dev/null)" ]]; then
     echo "$1 was replaced while it was opened" >&2
     exit 4
   fi
-  size="$("$STAT" -f '%z' <&7 2>/dev/null)"
-  PINNED_TEXT="$("$CAT" <&7 && echo .)"
-  PINNED_TEXT="${PINNED_TEXT%.}"
-  if [[ -z "$size" || "${#PINNED_TEXT}" != "$size" ]]; then
+  size="$("$STAT" -f '%z' <&6 2>/dev/null)"
+  RULE_RAW="$("$CAT" <&6 && echo .)" || rc=$?
+  if (( rc != 0 )); then
+    echo "$1 could not be read (cat exited $rc)" >&2
+    exit 8
+  fi
+  if [[ -z "$size" || "${#RULE_RAW}" != "$(( size + 1 ))" ]]; then
     echo "$1 holds a NUL byte, or changed while it was read" >&2
     exit 8
   fi
+}
+# Reads the rule $1 (sudoers_read_rule) and keeps that descriptor on fd 7
+# until the root shell exits, so no other file can take the inode while
+# PINNED_ID names it. Exits 4 unless the text read, trailing newlines
+# aside, is exactly $2, the text the caller read and judged before sudo ran.
+# Leaves the file's identity in PINNED_ID, its bytes as read in PINNED_RAW,
+# and its text in PINNED_TEXT.
+sudoers_pin_rule() { # rule text
+  local LC_ALL=C
+  sudoers_read_rule "$1"
+  exec 7<&6
+  PINNED_ID="$RULE_ID"
+  PINNED_RAW="$RULE_RAW"
+  PINNED_TEXT="${RULE_RAW%.}"
   PINNED_TEXT="${PINNED_TEXT%"${PINNED_TEXT##*[!$'\n']}"}"
   if [[ "$PINNED_TEXT" != "$2" ]]; then
     echo "$1 is not the text this run read" >&2
+    exit 4
+  fi
+}
+# The last checks before the rename or removal, after every other one: the
+# folders again (sudoers_dirs_check, exit 7), the lock still the file this
+# shell locked, unchanged, with no access control list that allows more
+# than reading (exit 7), and then the rule. With "absent", nothing may be at
+# $2 (exit 4). With "same", the rule is read again from its start through a
+# new descriptor (sudoers_read_rule, exits 4 and 8), and must be the file
+# root pinned, holding exactly the bytes root read then (exit 4).
+sudoers_recheck() { # absent|same rule
+  sudoers_dirs_check
+  if [[ "$("$STAT" -f '%d:%i %Hp %Mp %Lp %u %l' "$SUDOERS_LOCK" 2>/dev/null)" != "$SUDOERS_LOCK_ID" ]]; then
+    echo "$SUDOERS_LOCK is no longer the file this run opened and locked" >&2
+    exit 7
+  fi
+  sudoers_acl_check 7 "$SUDOERS_LOCK"
+  if [[ "$1" == absent ]]; then
+    if [[ -e "$2" || -L "$2" ]]; then echo "$2 is there now" >&2; exit 4; fi
+    return 0
+  fi
+  sudoers_read_rule "$2"
+  if [[ "$RULE_ID" != "$PINNED_ID" ]]; then
+    echo "$2 was replaced after root read it" >&2
+    exit 4
+  fi
+  if [[ "$RULE_RAW" != "$PINNED_RAW" ]]; then
+    echo "$2 changed after root read it" >&2
     exit 4
   fi
 }
@@ -666,11 +911,14 @@ sudoers_rule_text() {
 # are one call to sudo, run as root while it holds $SUDOERS_LOCK
 # (sudoers_guard_take), the lock uninstall.sh takes for its compare and
 # removal. Root reads the rule through a descriptor it opened and checked
-# (sudoers_pin_rule), judges that text again with sudoers_for_others, and
-# renames only while the path still names the file it opened. The new rule
-# is written from sudoers_rule_text beside the old one (sudo skips a name
-# with a dot), owned by root with mode 0440, checked there with visudo, and
-# renamed over the old one: the rule is the old one or the new one, never a
+# (sudoers_pin_rule), and judges that text again with sudoers_for_others.
+# The new rule is written from sudoers_rule_text beside the old one (sudo
+# skips a name with a dot), owned by root with mode 0440, and checked there
+# with visudo. Last, sudoers_recheck checks the folders, the lock and the
+# access control lists again and reads the rule again through a new
+# descriptor; the rename follows only when the path still names the file
+# root opened and holds the bytes root read first. The rename puts the new
+# rule over the old one: the rule is the old one or the new one, never a
 # mix. The copy is removed when the root shell exits without renaming it;
 # a root shell killed outright (SIGKILL) leaves it, under a dotted name sudo
 # never reads.
@@ -678,16 +926,20 @@ sudoers_rule_text() {
 # The lock keeps out only the runs that take it: install.sh and uninstall.sh
 # of this version. Scripts of earlier releases take no lock, and neither does
 # an administrator's own sudo. Against those, the checks above leave only the
-# moments between root's last check and its rename open; they do not close
-# them.
+# moments between root's last check (the reread in sudoers_recheck) and its
+# rename open; they do not close them. An identity or byte check cannot: a
+# writer that takes no lock can still change the rule after the last read.
 #
 # Exit status: 0 replaced; 3 the lock was not free within
 # LOCK_TIMEOUT_SECONDS; 4 the rule changed since it was read, or is not a
-# regular file of root's with one link that only root can change; 5 staging
-# the new rule failed, or mv reported that the rename failed; 6 the new rule
-# failed visudo's check; 7 the lock file, or a folder above it, is not one
-# only root can change; 8 the rule as root read it holds a NUL byte, changed
-# while it was read, or has a line for someone else; 2 a bad call. 1 is
+# regular file of root's with one link that only root can change (an access
+# control list that allows more than reading, or one not read in full,
+# counts); 5 staging the new rule
+# failed, or mv reported that the rename failed; 6 the new rule failed
+# visudo's check; 7 the lock file, or a folder above it, is not one only
+# root can change, or its access control list could not be read; 8 the rule
+# as root read it could not be read in full (cat failed), holds a NUL byte,
+# changed while it was read, or has a line for someone else; 2 a bad call. 1 is
 # sudo's own (a wrong password) or a shell error before the rename. In all
 # of these the rule was not replaced, though the lock file may have been
 # created. Any other status (the root shell, or its mv, was killed by a
@@ -709,29 +961,37 @@ sudoers_replace_as_root() { # absent|same rule [text]
   sudoers_rule_text > "$STAGED_RULE" || exit 5
   { "$CHOWN" root:wheel "$STAGED_RULE" && "$CHMOD" 0440 "$STAGED_RULE"; } || exit 5
   "$VISUDO" -cf "$STAGED_RULE" >/dev/null || exit 6
-  if [[ "$1" == absent ]]; then
-    if [[ -e "$2" || -L "$2" ]]; then echo "$2 is there now" >&2; exit 4; fi
-  elif [[ "$("$STAT" -f '%d:%i' "$2" 2>/dev/null)" != "$PINNED_ID" ]]; then
-    echo "$2 was replaced while the new rule was staged" >&2
-    exit 4
-  fi
+  sudoers_recheck "$1" "$2"
   # An mv killed by a signal may have renamed already, so its status goes
   # on as it is, an unknown result, not as a failed rename.
   "$MV" -f "$STAGED_RULE" "$2" || { rc=$?; (( rc > 128 )) && exit "$rc"; exit 5; }
   STAGED_RULE=""
   exit 0
 }
+# The functions named, as `declare -f` prints them, with the spaces that
+# start each line cut, for the text a root shell runs: sudo logs that text
+# and ps shows it, and the indentation is a fifth of it. None of these
+# functions has a quoted string that runs across lines, which the cut would
+# change; a test checks that bash reads the cut text back to the same
+# functions. The same in install.sh and uninstall.sh.
+root_functions() { # name...
+  local line
+  while IFS= read -r line; do
+    printf '%s\n' "${line#"${line%%[! ]*}"}"
+  done <<< "$(declare -f "$@")"
+}
 # Runs sudoers_replace_as_root as root, in one sudo call. The shell's script
 # is this script's fixed tool paths, the account's name and user ID, and the
-# text of the functions root runs; sudo resets the environment, so nothing
-# root runs comes from PATH. $2 is the rule's text as step 2 read and judged
-# it ("same" only).
+# text of the functions root runs (root_functions); sudo resets the
+# environment, so nothing root runs comes from PATH. $2 is the rule's text
+# as step 2 read and judged it ("same" only).
 sudoers_replace() { # absent|same [text]
   "$SUDO" "$ROOT_BASH" -c "set -u
 $(printf '%s=%q\n' SUDOERS_LOCK "$SUDOERS_LOCK" ROOT_UID "$ROOT_UID" USER "$USER" UID_NUM "$UID_NUM" \
-    LOCK_TIMEOUT_SECONDS "$LOCK_TIMEOUT_SECONDS" LOCKF "$LOCKF" STAT "$STAT" CAT "$CAT" \
+    LOCK_TIMEOUT_SECONDS "$LOCK_TIMEOUT_SECONDS" LOCKF "$LOCKF" STAT "$STAT" CAT "$CAT" LS "$LS" \
     MKTEMP "$MKTEMP" CHOWN "$CHOWN" CHMOD "$CHMOD" VISUDO "$VISUDO" MV "$MV" RM "$RM")
-$(declare -f sudoers_file_problem sudoers_guard_take sudoers_pin_rule sudoers_for_others \
+$(root_functions sudoers_file_problem sudoers_acl_check sudoers_dirs_check sudoers_guard_take \
+    sudoers_read_rule sudoers_pin_rule sudoers_recheck sudoers_for_others \
     sudoers_rule_text sudoers_replace_as_root)
 sudoers_replace_as_root \"\$@\"" insomnia-sudoers-replace "$1" "$SUDOERS" "${2-}"
 }
@@ -891,7 +1151,7 @@ case "$replace_rc" in
     echo "$SUDOERS was not replaced: $SUDOERS_LOCK stayed taken for ${LOCK_TIMEOUT_SECONDS}s, so another install.sh or uninstall.sh, perhaps in another account, is changing it. Rerun in a moment. The app and the LaunchAgent were not touched." >&2
     exit 1 ;;
   4)
-    echo "$SUDOERS changed after this install read it, or is not a regular file of root's with one link that only root can change (see any line above). Another install.sh or uninstall.sh, perhaps in another account, may have written or removed it meanwhile. It was not replaced, so no rule written meanwhile was overwritten. Rerun to check it again. The app and the LaunchAgent were not touched." >&2
+    echo "$SUDOERS changed after this install read it, or could not be shown to be a regular file of root's with one link that only root can change (see any line above). Another install.sh or uninstall.sh, perhaps in another account, may have written or removed it meanwhile. It was not replaced, so no rule written meanwhile was overwritten. Rerun to check it again. The app and the LaunchAgent were not touched." >&2
     exit 1 ;;
   5)
     echo "$SUDOERS was not replaced: copying the new rule beside it, or renaming the copy into place, failed (see the error above). The app and the LaunchAgent were not touched." >&2
@@ -900,10 +1160,10 @@ case "$replace_rc" in
     echo "The new rule failed visudo's check once copied beside $SUDOERS, so $SUDOERS was not replaced. The app and the LaunchAgent were not touched." >&2
     exit 1 ;;
   7)
-    echo "$SUDOERS was not replaced: the lock file $SUDOERS_LOCK, or a folder above it, is not one only root can change (see the line above), so the lock that keeps two runs from writing the rule at once cannot be trusted. The app and the LaunchAgent were not touched, and nothing there was repaired: check it yourself (the lock file must be a regular file of root's with mode 0600 and one link), then rerun." >&2
+    echo "$SUDOERS was not replaced: the lock file $SUDOERS_LOCK, or a folder above it, could not be shown to be one only root can change (see the line above), so the lock that keeps two runs from writing the rule at once cannot be trusted. The app and the LaunchAgent were not touched, and nothing there was repaired: check it yourself (the lock file must be a regular file of root's with mode 0600 and one link), then rerun." >&2
     exit 1 ;;
   8)
-    echo "$SUDOERS was not replaced: read again as root, it holds a NUL byte, changed while it was read, or has a line that is not for $USER. Rerun to check it again. The app and the LaunchAgent were not touched." >&2
+    echo "$SUDOERS was not replaced: read again as root, it could not be read in full, holds a NUL byte, changed while it was read, or has a line that is not for $USER (see any line above). Rerun to check it again. The app and the LaunchAgent were not touched." >&2
     exit 1 ;;
   1 | 2)
     echo "$SUDOERS was not replaced: the sudo call that replaces it exited $replace_rc before replacing it. The app and the LaunchAgent were not touched." >&2
@@ -1024,6 +1284,23 @@ step "Creating $APP_SUPPORT, $LOG_DIR and $LAUNCH_AGENTS"
 #    and the bootout of the old job. The backstop inherits fd 9 and shares
 #    the lock instead of waiting on it. The lock file is never unlinked or
 #    replaced, so every party keeps locking the same inode.
+#
+# The backstop run under the lock hands frozen entries that record
+# microseconds to the app binary at $APP, and no Info.plist is read under
+# the lock, so the version it declares is read here (read_info_version).
+# When nothing is at $APP but an interrupted run set the previous app aside,
+# that bundle goes back to $APP under the lock (below), and a rename keeps
+# its Info.plist's identity, so its Info.plist is the one read. A read that
+# fails or does not answer leaves the version unknown: the backstop then
+# keeps those entries frozen, and the install stops after it.
+INFO_PLIST="$APP/Contents/Info.plist"
+info_source="$INFO_PLIST"
+if [[ -d "$PREVIOUS_APP" && ! -e "$APP" ]]; then
+  info_source="$PREVIOUS_APP/Contents/Info.plist"
+fi
+if ! read_info_version "$info_source"; then
+  echo "note: could not read InsomniaResumeFrozenVersion from $info_source before the recovery lock: $INFO_PROBLEM. If the journal holds a frozen process that only the app binary can resume, it stays frozen and journaled, and the install stops after the backstop runs." >&2
+fi
 step "Taking the recovery lock"
 LOCK="$APP_SUPPORT/.recovery.lock"
 exec 9<>"$LOCK"
@@ -1185,7 +1462,25 @@ plist_pins_previous() {
 
 step "Ending any stale session and checking the recovery journal"
 recovery_rc=0
-/bin/bash "$BACKSTOP" --force || recovery_rc=$?
+run_backstop "$BACKSTOP" || recovery_rc=$?
+if (( recovery_rc == 125 )); then
+  cat >&2 <<FAIL
+
+Install stopped: the backstop did not finish within ${BACKSTOP_TIMEOUT_SECONDS}s and is still running as
+pid ${BOUNDED_PID:-?} three seconds after its SIGTERM. It is not killed, because it may be
+running sudo pmset, and it keeps the recovery lock until it ends. The app at $APP
+and the LaunchAgent were not replaced or unloaded; the new build was discarded.
+Installed so far: $SUDOERS. Rerun this script once it has ended.
+FAIL
+  exit 1
+fi
+recovery_note=""
+case "$recovery_rc" in
+  124) recovery_note="
+It did not finish within ${BACKSTOP_TIMEOUT_SECONDS}s and was stopped with SIGTERM." ;;
+  126) recovery_note="
+It could not be started: no file for its output could be made in $WORK." ;;
+esac
 
 if (( recovery_rc != 0 )); then
   held="$(loaded_state)"
@@ -1231,7 +1526,7 @@ Then rerun this script to install the app and the LaunchAgent."
   cat >&2 <<FAIL
 
 Install stopped: the backstop could not fully undo a previous session
-(exit status $recovery_rc). $pair_note
+(exit status $recovery_rc).$recovery_note $pair_note
 Installed so far: $SUDOERS.
 $agent_note
 Check $LOG_DIR/insomnia.log and resolve what it reports. Saved audio, display

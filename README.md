@@ -138,28 +138,48 @@ another account. It then writes the rule in one `sudo /bin/bash -c` call.
 That root shell takes a lock file in the rule's own folder,
 `/etc/sudoers.d/.insomnia-sudoers.lock` (sudo skips a name with a dot).
 Before opening it, root checks that every folder above it is root's and
-writable only by root, and that the file, if it is there, is a regular file
-of root's with mode 0600 and one link; after locking it, that the descriptor
-and the path are still that same file. The lock file is created only where
-nothing is, and is never repaired, replaced or removed: one that fails a
-check stops the run and is left for you to look at. Root then opens the rule,
-checks that its exact text is the text the run read and judged (passed to
-root as an argument, not read again from a file), has `visudo` check a new
-copy beside it, and renames that copy over the rule only while the rule's
-path still names the file it opened. The uninstaller removes the rule the
-same way, under the same lock. So when two accounts run these scripts at
-once, neither overwrites or removes a rule the other wrote after its read:
-the run that finds the rule changed stops, and asks you to rerun it.
+writable only by root, that the file, if it is there, is a regular file of
+root's with mode 0600 and one link, and that no access control list (ACL)
+on those folders or on the file allows more than reading. After locking it,
+root checks that the descriptor and the path are still that same file. The
+lock file is created only where nothing is, and is never repaired, replaced
+or removed: one that fails a check stops the run and is left for you to look
+at. Root then checks the rule the same way, opens it, and checks that its
+exact text is the text the run read and judged (passed to root as an
+argument, not read again from a file). It has `visudo` check a new copy
+beside it. Just before it renames that copy over the rule, root checks the
+folders, the lock file and their ACLs again and reads the rule a second time
+through a new descriptor. It renames the copy only when that read completes,
+finds no NUL byte, and gives the same bytes from the same file. The
+uninstaller removes the rule the same way, under the same lock. So when two
+accounts run these scripts at once, neither overwrites or removes a rule the
+other wrote after its read: the run that finds the rule changed stops, and
+asks you to rerun it.
+
+The ACL check reads `ls -lde` for each of those paths and goes by the rights
+an entry allows, not by whom it names. An entry that allows anything beyond
+`read`, `execute`, `readattr`, `readextattr`, `readsecurity`, `list` or
+`search` (inheritance flags aside) stops the run, even one for root or one a
+management profile added, which may be harmless. An entry that only denies
+passes. A list that `ls` fails to print, or prints in a form the check does
+not know, stops the run too. Neither script removes or changes an ACL: the
+message names the path and the entry, and you decide whether to remove it
+before you rerun. On the Mac these scripts were tested on, `/`, `/private`,
+`/private/etc` and `/private/etc/sudoers.d` carry none.
 
 The lock keeps out only the runs that take it. Installers and uninstallers
 of earlier releases take no lock, or an older one, and neither does an
-administrator's own `sudo`; against those the checks leave the moments
-between root's last check and its rename or removal open. A root call that
-is killed or does not answer in time leaves it unknown whether the rule
-changed, and the script says so instead of claiming nothing changed. The
-root shell needs sudo to allow `/bin/bash`, as it does for an administrator
-by default; an account whose sudo policy allows only listed commands cannot
-install this way.
+administrator's own `sudo`. Against those, root's second read narrows the
+gap but does not close it: a writer that takes no lock can still change the
+rule between that read and the rename or removal, and no check of the file's
+identity or bytes can see that. A rule that changed between root's two
+reads, or that root cannot read in full, is kept, and the run asks you to
+rerun it, so a writer that keeps changing the rule keeps every run from
+changing it. A root call that is killed or does not answer in time leaves it
+unknown whether the rule changed, and the script says so instead of claiming
+nothing changed. The root shell needs sudo to allow `/bin/bash`, as it does
+for an administrator by default; an account whose sudo policy allows only
+listed commands cannot install this way.
 
 The recovery agent runs at login and every 60 seconds. Its command line pins
 the installed bundle's code requirement (for an ad-hoc build, the cdhash of
@@ -238,8 +258,21 @@ can take it again to undo a session. A read that fails or does not answer is
 never taken as a clean answer. `sudo` only ever gets SIGTERM: one that
 ignores it keeps the lock until it ends, and the installer prints its pid.
 The `backstop.sh` the installer runs under the lock to end a stale session
-is not one of these calls: as before, it has no such limit, and it reads the
-installed app's Info.plist and the journal itself.
+has a 300 s limit of its own. At the limit it gets SIGTERM only, never
+SIGKILL, since it may be running `sudo pmset`. Each `sudo pmset` or app
+binary call it started keeps the lock through its own supervisor until that
+call has exited, even if the backstop or the installer is killed first. A
+backstop still running three seconds after its SIGTERM keeps the lock until
+it ends, and the installer stops, prints its pid and replaces nothing. The
+backstop reads no Info.plist under the lock. The installer reads
+`InsomniaResumeFrozenVersion` and the file's identity before it takes the
+lock (from the bundle an interrupted install set aside, when that bundle is
+the one that goes back), and the backstop uses the version only while a
+`stat` under the lock shows the same file unchanged. Otherwise it keeps any
+frozen process that only the app binary can resume, and the install stops
+after it. Each of the backstop's reads of the journal has a 30 s limit, and
+one that fails, is cut short or does not answer stops its run with the
+journal kept.
 
 </details>
 
@@ -667,28 +700,41 @@ whose identity cannot be read, once a second look still finds it: the
 uninstaller then stops before its first `sudo` call. Only a process
 positively identified as the API client is ignored.
 
-From a checkout, the uninstaller reads the installed app's
-`InsomniaResumeFrozenVersion` before it takes the recovery lock, with the
-same time limit, and under the lock checks with `stat` (which reads no
-contents) that the Info.plist is still that file, unchanged. A read that
-fails or does not answer, or a file that changed, stops it before any
-`backstop.sh` runs or anything is removed. It asks for your password
-(`sudo -v`) before the lock as well, so every `sudo` call under the lock is
-`sudo -n` with the 30 s limit. Once it holds the lock, its own process check
-and journal checks read no Info.plist: a process it first sees then counts as
-unverified and blocks. The `backstop.sh` it runs there has no such limit and
-reads the installed app's Info.plist itself, as before. A journal check
-whose read fails or does not answer counts as a problem, never as a clean
-journal, and stops the uninstall before anything is removed. If the later
-read for a brightness Insomnia kept fails, the journal is kept.
+Before it takes the recovery lock, the uninstaller reads the installed app's
+`InsomniaResumeFrozenVersion` with the same time limit, and the Info.plist's
+identity (device, inode, change time, size) before and after the read. From
+a checkout, a read that fails or does not answer, or a file that changed,
+stops it before any `backstop.sh` runs or anything is removed. From the zip
+it goes on: the sealed backstop then keeps any frozen process that only the
+app binary can resume, and the uninstall stops before removing anything. It
+asks for your password (`sudo -v`) before the lock as well, so every `sudo`
+call under the lock is `sudo -n` with the 30 s limit. Once it holds the
+lock, no Info.plist is read: its own process check counts a process it
+first sees then as unverified and blocks, and the `backstop.sh` it runs gets
+the version and the identity in its environment and uses the version only
+while a `stat` under the lock (which reads no contents) shows the same file
+unchanged. That backstop run has a 300 s limit and gets SIGTERM only
+at the limit: a backstop still running three seconds after its SIGTERM
+keeps the lock until it ends, and the uninstaller stops, names its pid and
+removes nothing. A backstop sealed in a bundle from an earlier release does
+not know these variables. It reads the Info.plist and the journal itself,
+with no limit on each read, though the 300 s limit on its run still applies.
+A journal check whose read fails, is cut short, prints a NUL byte or does not
+answer counts as a problem, never as a clean journal, and stops the
+uninstall before anything is removed. A session.json still there after the
+backstop stops it too, whether or not it can be read. If the later read for
+a brightness Insomnia kept fails, the journal is kept.
 
 The sudoers rule is one file for the whole Mac and names the account whose
 install wrote it. The uninstaller reads it through sudo and removes it only
 when it is exactly the rule the installer writes for your account; otherwise
-it keeps the file and says why. It removes the rule only if the rule still
-holds what it read, checked under the lock the installer takes for its write.
-If the rule changed meanwhile, or another run holds that lock for 10 s, the
-uninstaller keeps the rule and the app, and asks you to rerun it. If the
+it keeps the file and says why. It removes the rule only if root, under the
+lock the installer takes for its write, finds the text it read, and then,
+just before the removal, finds the folders, the lock file and every ACL
+still as they must be and reads the same bytes from the same file again.
+If the rule changed meanwhile, root cannot read it in full, an ACL allows
+more than reading, or another run holds that lock for 10 s, the uninstaller
+keeps the rule and the app, and asks you to rerun it. If the
 root call that removes it fails in an unknown way or does not answer, the
 uninstaller keeps the app and the recovery journal too, since whether the
 rule is gone is not known; a `sudo` that ignores SIGTERM keeps the recovery
