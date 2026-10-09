@@ -799,8 +799,9 @@ final class RecoveryScriptTests: XCTestCase {
             let text = try String(contentsOf: script, encoding: .utf8)
             var functions = ""
             // read_at returns a status and epoch_at sets epoch; a read that
-            // fails stops the harness under set -e.
-            for name in ["plutil_run", "absent_reply", "read_at", "epoch_of", "epoch_at"] {
+            // fails stops the harness under set -e. plutil_run runs plutil
+            // through plutil_on.
+            for name in ["plutil_on", "plutil_run", "absent_reply", "read_at", "epoch_of", "epoch_at"] {
                 let start = try XCTUnwrap(text.range(of: "\n\(name)() {"), "\(name) in \(script.lastPathComponent)")
                 let end = try XCTUnwrap(text.range(of: "\n}\n", range: start.upperBound..<text.endIndex))
                 functions += text[start.lowerBound..<end.upperBound]
@@ -5425,7 +5426,9 @@ final class RecoveryScriptTests: XCTestCase {
     /// uninstall stops with the start, its claim and its session in place
     /// and no pmset.
     func testUninstallStopsWhenTheSettlementCannotReadTheJournalOrTheSession() throws {
-        let changed = #"echo "it changed while it was read" >&2; exit 2"#
+        // COPY_PERL prints its reason on standard output (round 30: a copy
+        // kept in memory has no file for its errors), and so does this fake.
+        let changed = #"echo "it changed while it was read"; exit 2"#
         // The expected text names each case's own fixture's paths.
         let cases: [(label: String, perl: String?, plutil: String?, saying: (ScriptFixture) -> String)] = [
             ("journal copy", "*/insomnia-uninstall.*/read.settle.json", nil,
@@ -6132,14 +6135,15 @@ final class RecoveryScriptTests: XCTestCase {
     }
 
     /// Round 30 (the hosted failure on 7e233e8): the backstop publishes
-    /// from the live journal, as main does, so what cp copies with it, its
-    /// extended attributes and its access control list, stays with the
-    /// journal. 7e233e8 published from its private copy, and the
-    /// journal's owner ACL was gone afterwards (the hosted run of
-    /// testBackstopKeepsAnOwnerACLAndStillUndoesTheJournal). No test here
-    /// may change an ACL, so this control uses an extended attribute, which
-    /// cp copies the same way: the published journal keeps it, and every
-    /// cp the run makes starts from state.json itself.
+    /// from a cp of the live journal, as main does, so what cp copies, its
+    /// extended attributes, stays with the journal. 7e233e8 published from
+    /// its private copy, a new file, and the journal's owner ACL was gone
+    /// afterwards (the hosted run of
+    /// testBackstopKeepsAnOwnerACLAndStillUndoesTheJournal, where cp fails
+    /// and the journal is kept, as on main). No test here may change an
+    /// ACL, so this control uses an extended attribute: the published
+    /// journal keeps it, and every cp the run makes starts from state.json
+    /// itself.
     func testBackstopPublishesFromTheLiveJournalSoWhatCpCopiesStaysWithIt() throws {
         try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
         try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)

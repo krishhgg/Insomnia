@@ -1358,7 +1358,8 @@ Backstop, independent of the app:
   same checks; a file holding a NUL byte, which a shell variable cannot
   hold, is then unknown and nothing is undone from it. Every journal it
   publishes starts as a `cp` of the live state.json, as on main, so the
-  file's extended attributes and access control list go with it, and is
+  file's extended attributes go with it (cp(1) copies an access control
+  list only with `-p`, which main does not pass either), and is
   published only when that copy holds the bytes the run read and
   state.json is still the file it copied. A publish that fails keeps the
   journal as it was, and the next run undoes what it records again. Two

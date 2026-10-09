@@ -1709,11 +1709,12 @@ publish_state() { # edited-copy
 # (publish_state, whose status it returns). Returns 1, with nothing
 # published and no copy left, when any step fails.
 # Every publish copies the live journal with cp, as main does, so its
-# extended attributes and access control list go with it, and then
-# requires the copy to hold the bytes this run read (same_as_read): a
-# journal that changed since, or a cp that copied something else, is not
-# published. A 0200 journal its owner reads only through an allow entry
-# keeps that entry.
+# extended attributes go with it (cp(1) copies an access control list only
+# with -p, which main does not pass either), and then requires the copy to
+# hold the bytes this run read (same_as_read): a journal that changed
+# since, or a cp that copied something else, is not published. A 0200
+# journal its owner reads only through an allow entry keeps that entry: cp
+# cannot read its extended attributes, so its publish fails, as on main.
 edit_state() { # edit...
   local tmp="$APP_SUPPORT/.state.json.settle.$$" e ok=1
   [[ -n "$state_copy" ]] && "$CP" "$STATE" "$tmp" && same_as_read "$tmp" "$state_copy" || ok=0

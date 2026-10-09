@@ -1724,11 +1724,11 @@ settle_read() { # keypath
 # plutil reads the edited copy whole as a JSON object and state.json is
 # still the file settle_copy was made from; then copies the new journal
 # again for the edit that follows. The copy is of the live journal, as
-# backstop.sh's, so its extended attributes and access control list go with
-# it, and it must hold the bytes settle_copy holds (same_as_read). Returns
-# 0; 1 with nothing published and no copy left when any step fails; 2 when
-# it was published but could not be copied again (copy_why), settle_copy
-# then empty.
+# backstop.sh's, so its extended attributes go with it (see backstop.sh's
+# edit_state), and it must hold the bytes settle_copy holds (same_as_read).
+# Returns 0; 1 with nothing published and no copy left when any step fails;
+# 2 when it was published but could not be copied again (copy_why),
+# settle_copy then empty.
 edit_state() { # edit...
   local tmp="$APP_SUPPORT/.state.json.uninstall.$$" e ok=1
   [[ -n "$settle_copy" ]] && "$CP" "$STATE" "$tmp" && same_as_read "$tmp" "$settle_copy" || ok=0
