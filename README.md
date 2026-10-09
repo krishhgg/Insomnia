@@ -161,21 +161,32 @@ accounts run these scripts at once, neither overwrites or removes a rule the
 other wrote after its read: the run that finds the rule changed stops, and
 asks you to rerun it.
 
-The ACL check reads `ls -lden` for each of those paths, which names each
-entry's principal by its UUID. An entry that allows anything beyond `read`,
-`execute`, `readattr`, `readextattr`, `readsecurity`, `list` or `search`
-(inheritance flags aside) stops the run unless `dsmemberutil` shows that its
-UUID is root's own user record: the UUID it gives for user ID 0 is that
-UUID, and the ID it gives for that UUID is `uid: 0`. An entry for a group
-(`wheel`, `admin`, `everyone`), for another user, or one a management
+The ACL check reads each list with `/usr/bin/perl`, which loads no module
+and makes one `fgetattrlist` system call on a descriptor it opens itself
+(never following a link). The same answer gives the file's type, device and
+file ID, which must match root's `stat` of that path just before, so the
+list judged is the list of the file root checked. The answer must be whole:
+its length, the list's size and its entry count must agree, and every entry
+must be an allow, deny, audit or alarm entry with only flags the check
+knows. Each entry names its principal by UUID. An allow entry with any
+right beyond `read` (`list` on a folder), `execute` (`search`), `readattr`,
+`readextattr`, `readsecurity`, `synchronize`, generic read or generic
+execute (inheritance flags aside) stops the run unless `dsmemberutil` shows
+that its UUID is root's own user record: the UUID it gives for user ID 0 is
+that UUID, and the ID it gives for that UUID is `uid: 0`. An entry for a
+group (`wheel`, `admin`, `everyone`), for another user, or one a management
 profile added under its own UUID stops the run, even though it may be
-harmless. An entry that only denies passes. A list that `ls` fails to
-print, prints in a form the check does not know, or numbers with a gap (an
-entry it could not read), and a `dsmemberutil` answer that is not exactly
-that one line, stop the run too. Neither script removes or changes an ACL: the
+harmless. An entry that only denies passes. A file perl cannot open, a call
+that fails, an answer for another file or one the check cannot account for
+byte for byte, perl output other than its one form ending in the count of
+files checked, and a `dsmemberutil` answer that is not exactly that one
+line, stop the run too. Neither script removes or changes an ACL: the
 message names the path and the entry, and you decide whether to remove it
 before you rerun. On the Mac these scripts were tested on, `/`, `/private`,
-`/private/etc` and `/private/etc/sudoers.d` carry none.
+`/private/etc` and `/private/etc/sudoers.d` carry none. The call and the
+layout of its answer are macOS's own (system call 228, `fgetattrlist`); a
+Mac without `/usr/bin/perl`, or one whose kernel answers in another layout,
+stops every install and uninstall at that check, before the rule changes.
 
 The lock keeps out only the runs that take it. Installers and uninstallers
 of earlier releases take no lock, or an older one, and neither does an
@@ -711,12 +722,14 @@ A `pgrep` that fails or does not answer stops the uninstall before anything
 is removed, and so does a copy running in another account, which is never
 asked to quit. So does a process whose owner `ps -o uid=` cannot tell, or
 whose identity cannot be read, once a second look still finds it: the
-uninstaller then stops before its first `sudo` call. One exception: when
-this app's own copy runs beside a process whose identity cannot be read,
-that process is waited for with the app's quit, after the rule is judged,
-so with a rule only root can read it stops the uninstall after the
-password prompt. Only a process positively identified as the API client is
-ignored.
+uninstaller then stops before its first `sudo` call. That holds when this
+app's own copy runs beside such a process too: the uninstaller looks for
+that process alone again, once a second for up to 10 s, before it judges
+the rule or asks the app to quit, and does not wait for its own copy,
+which has not been asked to quit yet. A process that first shows up after
+those looks is still waited for after the quit and blocks the removal, but
+by then the password may have been asked for. Only a process positively
+identified as the API client is ignored.
 
 Before it takes the recovery lock, the uninstaller reads the installed app's
 `InsomniaResumeFrozenVersion` with the same time limit, and the Info.plist's

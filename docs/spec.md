@@ -140,10 +140,14 @@ recovery; newly written journals use `frozenProcesses`.
   cannot tell (it fails, does not answer, or prints no user ID), or whose
   identity is unverified, is looked for once more and then stops either
   script before its first `sudo` call; only a process identified as the API
-  client (`com.insomnia.app`) is ignored. One exception in `uninstall.sh`:
-  an unverified process beside this app's identified copy is waited for
-  with the app's quit, after the rule is judged, so with a rule only root
-  can read it stops the run after the password prompt. Under the recovery lock the
+  client (`com.insomnia.app`) is ignored. In `uninstall.sh` this holds
+  also when this app's identified copy runs beside such a process: that
+  process alone is looked for again, once a second for up to 10 s, before
+  the rule is judged, and the identified copy is not waited for until it
+  has been asked to quit. A copy in another account or a `pgrep` problem
+  on any of those looks stops the run at once. A process first seen after
+  these looks is waited for with the quit, and blocks the removal, but may
+  then come after the password prompt. Under the recovery lock the
   scripts' process checks read no Info.plist, not even with a time limit: a
   process first seen there counts as unverified and stops the run.
 - Both scripts read `InsomniaResumeFrozenVersion` before the recovery lock
@@ -207,15 +211,25 @@ recovery; newly written journals use `frozenProcesses`.
   one link, so a FIFO or a link is never opened; after locking, the
   descriptor and the path must still be that same file. No access control
   list on those folders or on the file may let anyone but root change
-  them: `/bin/ls -lden` lists them with each principal as a UUID, and an
-  allow entry with any right but `read`, `execute`, `readattr`,
-  `readextattr`, `readsecurity`, `list`, `search` or an inheritance flag
-  fails the check unless `/usr/bin/dsmemberutil` shows its UUID is root's
-  own user record (`getuuid -u 0` answers exactly that UUID and `getid -X`
-  of it answers exactly `uid: 0`, each from a call that exits 0). A name,
-  a group, another user or any other answer fails. Deny entries pass. A
-  list `ls` cannot print, prints in a form the check does not parse, or
-  numbers with a gap fails it too. Every `stat` answer the root shell uses
+  them. `/usr/bin/perl` (no module loaded) opens each path itself with
+  `O_NOFOLLOW` (and `O_DIRECTORY` for a folder) and reads its list with
+  one `fgetattrlist` call (system call 228) asking for the device, type,
+  file ID and extended security; the type, device and file ID in that
+  answer must be those root's `stat` of the path gave just before. The
+  answer must account for every byte: its length, the list's offset and
+  size, the header (magic number, empty owner and group, a count of at
+  most 128, or the no-list count with nothing after it) and 24 bytes per
+  entry must agree, and each entry must be an allow, deny, audit or alarm
+  entry with known flags. An allow entry with any right but read data,
+  execute, read attributes, read extended attributes, read security,
+  synchronize, generic read, generic execute or an inheritance flag fails
+  the check unless `/usr/bin/dsmemberutil` shows its UUID is root's own
+  user record (`getuuid -u 0` answers exactly that UUID and `getid -X` of
+  it answers exactly `uid: 0`, each from a call that exits 0). A name, a
+  group, another user or any other answer fails. Deny entries pass. A file
+  perl cannot open, a call that fails, an answer it cannot account for, and
+  output other than one line per such entry followed by `checked N` for
+  the N files asked, from a perl that exits 0, fail it too. Every `stat` answer the root shell uses
   must come from a `stat` that exits 0 and be exactly the one line of
   fields asked for; any other answer stops it before any open, create or
   change. The folders' lists are checked before the file

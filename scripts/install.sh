@@ -68,7 +68,9 @@ MKDIR=/bin/mkdir
 TEST=/bin/test
 CAT=/bin/cat
 STAT=/usr/bin/stat
-LS=/bin/ls
+# What root's shell reads access control lists with (r_acl_reader): no
+# module, only its own fgetattrlist call, read only, never a change.
+PERL=/usr/bin/perl
 # What root's shell asks whether an access control list entry is root's own
 # (r_root): read only, never a change.
 DSMEMBERUTIL=/usr/bin/dsmemberutil
@@ -848,75 +850,105 @@ r_root() { # uuid
   out="$("$DSMEMBERUTIL" getuuid -u "$ROOT_UID" 2>&1 && echo .)" && [[ "$out" == "$1"$'\n.' ]] \
     && out="$("$DSMEMBERUTIL" getid -X "$1" 2>&1 && echo .)" && [[ "$out" == "uid: $ROOT_UID"$'\n.' ]]
 }
-# Exits with status $1, saying why on stderr, unless `ls -lden` shows that
-# no access control list on the files and folders named after it lets
-# anyone but root change them. -n prints each entry's principal as its
-# UUID. An entry that allows anything but reading (write, append, delete,
-# add_file, add_subdirectory, delete_child, writeattr, writeextattr,
-# writesecurity, chown, or a right not listed here) passes only when
-# r_root shows its UUID is root's own user record, whatever its
-# inheritance flags: a folder's inheritable entries reach the files made in
-# it. Deny entries pass. So does an answer only when it is read in full:
-# ls fails (even after printing), prints a line not parsed here, numbers
-# its entries with a gap (ls skips an entry it cannot read but still counts
-# it), marks a list (+) and prints no entry, or leaves out a name, and the
-# run stops. Nothing is ever repaired.
-r_acl() { # status name...
-  local s="$1" out rc=0 line name="" plus="" n=0 seen=0 a p w u
-  local re='^ ([0-9]+): ([0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12})( inherited)? (allow|deny) ([a-z_,]+)$'
+# The program r_acl runs with /usr/bin/perl, which loads no module. For
+# each pair of arguments, what r_stat said about a name ("<ST_T> <ST_ID>")
+# and the name, it opens the name for reading without following a link or
+# waiting (O_NOFOLLOW, O_NONBLOCK; a folder only as a folder,
+# O_DIRECTORY), and asks the kernel, with fgetattrlist (syscall 228), for
+# the device, type, file ID and access control list of that open file in
+# one answer, reported at its full size. Nothing is changed. parse checks
+# the whole answer: the call's status; a size that fits the buffer; the
+# type and the device and file ID r_stat gave, so the list read is the
+# named file's; the list's place and length; the header's magic and its
+# empty owner and group; an entry count of at most 128 that accounts for
+# every byte of the list, so no entry is left past the count; the list's
+# flags; and each entry's kind and flags, which must be values sys/kauth.h
+# defines. An entry that allows (kind 1) a right other than reading (read
+# data or list, execute or search, read attributes, extended attributes or
+# security, synchronize, generic read or execute) is printed as "<pair>
+# <UUID> <flags> <rights>" for r_acl to judge; deny, audit and alarm
+# entries grant nothing. Any problem prints why and exits non-zero. Last it
+# prints "checked <pairs>".
+r_acl_reader() {
+  printf %s 'sub uuid{sprintf("%08X-%04X-%04X-%04X-%04X%08X",unpack("N n n n n N",$_[0]))}
+sub parse{my($b,$size,$rc,$want)=@_;
+$rc eq "0" or return "fgetattrlist failed ($rc)";
+length($b)==$size or return "the answer is not in the buffer read";
+my($len,$dev,$type,$at,$n,$id)=unpack("L l L l L Q",$b);
+$len>=28&&$len<=$size or return "an answer of $len bytes, with $size read";
+my($t,$i)=split(/ /,$want,2);
+$type==({4,2,10,1}->{$t}//0)&&$i eq "$dev:$id" or return "type $type, file $dev:$id, not $want";
+$at==16&&$len==28+$n or return "a list of $n bytes at $at in an answer of $len";
+$n or return "";
+$n>=44 or return "a list of $n bytes";
+my($magic,$who,$count,$flags)=unpack("L a32 L L",substr($b,28,44));
+$magic==0x12cc16d&&$who eq "\0"x32 or return sprintf("a list header %#x",$magic);
+$count==0xffffffff&&$n==44 and return "";
+$count<=128&&$n==44+24*$count or return "$count entries in a list of $n bytes";
+$flags&~0x3ffff and return sprintf("list flags %#x",$flags);
+my @r;
+for my $k(0..$count-1){my($u,$f,$r)=unpack("a16 L L",substr($b,72+24*$k,24));
+$f&~0x7ff||($f&15)<1||($f&15)>4 and return sprintf("entry %d has flags %#x",$k,$f);
+($f&15)==1&&$r&~0x1500a8a and push(@r,sprintf("%s %#x %#x",uuid($u),$f,$r))}
+("",@r)}
+@ARGV%2==0&&@ARGV or die "no files named\n";
+for(my $k=0;$k<@ARGV;$k+=2){my($want,$p)=@ARGV[$k,$k+1];
+sysopen(my $h,$p,4|256|($want=~/^4 /?1048576:0)) or die "$p could not be opened: $!\n";
+my $b="\0"x4096;
+my $l=pack("S S L5",5,0,0x240000a,0,0,0,0);
+my $rc=syscall(228,fileno($h),$l,$b,4096,4);
+my($e,@r)=parse($b,4096,$rc==-1?"-1: $!":$rc,$want);
+$e eq "" or die "$p: $e\n";
+print($k/2+1," $_\n")for@r}
+print("checked ",@ARGV/2,"\n")'
+}
+# Exits with status $1, saying why on stderr, unless r_acl_reader shows
+# that no access control list on the files and folders named after it lets
+# anyone but root change them. Each name follows what r_stat said about it
+# ("$ST_T $ST_ID"), so each list read is that file's. An entry that allows
+# more than reading passes only when r_root shows its UUID is root's own
+# user record, whatever its inheritance flags: a folder's inheritable
+# entries reach the files made in it. Deny entries pass. So does an answer
+# only when it is read in full: perl fails (even after printing), prints a
+# line not parsed here, or does not end with "checked" and the number of
+# names, and the run stops. Nothing is ever repaired.
+r_acl() { # status type-and-id name...
+  local s="$1" out rc=0 line i=1 end=0 names=() k u w
+  local re='^([1-9][0-9]*) ([0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}) (0x[0-9a-f]+ 0x[0-9a-f]+)$'
   shift
-  out="$("$LS" -lden "$@" 2>&1 && echo .)" || rc=$?
+  while (( i < $# )); do names+=("${@:i+1:1}"); i=$(( i + 2 )); done
+  out="$("$PERL" -e "$(r_acl_reader)" -- "$@" 2>&1 && echo .)" || rc=$?
   if (( rc != 0 )); then
-    r_die "$s" "the access control lists of $* could not be read (ls exited $rc: $out)"
+    r_die "$s" "the access control lists of ${names[*]} could not be read (perl exited $rc: $out)"
   fi
   # An answer without a newline at its end keeps the "." and fails below.
   out="${out%$'\n.'}"
   while IFS= read -r line; do
-    if [[ "$line" =~ ^[-a-z][-rwxsStT]{9}([@+]?)\  ]]; then
-      if [[ "$plus" == + ]] && (( n == 0 )); then break; fi
-      plus="${BASH_REMATCH[1]}" n=0 name=""
-      for a in "$@"; do
-        if [[ "$line" == *" $a" ]] && (( ${#a} > ${#name} )); then name="$a"; fi
-      done
-      [[ -n "$name" ]] || break
-      seen=$(( seen + 1 ))
-    elif [[ -n "$name" && "$line" =~ $re && "${BASH_REMATCH[1]}" == "$n" ]]; then
-      n=$(( n + 1 ))
-      [[ "${BASH_REMATCH[4]}" == allow ]] || continue
-      u="${BASH_REMATCH[2]}" w=0
-      for p in ${BASH_REMATCH[5]//,/ }; do
-        case "$p" in
-          read | execute | readattr | readextattr | readsecurity | list | search \
-            | file_inherit | directory_inherit | limit_inherit | only_inherit) ;;
-          *) w=1 ;;
-        esac
-      done
-      (( w == 0 )) || r_root "$u" || r_die "$s" "$name has an access control list entry that allows more than reading ($line)"
+    if (( end == 0 )) && [[ "$line" == "checked ${#names[@]}" ]]; then
+      end=1
+    elif (( end == 0 )) && [[ "$line" =~ $re ]] && (( BASH_REMATCH[1] <= ${#names[@]} )); then
+      k="${BASH_REMATCH[1]}" u="${BASH_REMATCH[2]}" w="${BASH_REMATCH[3]}"
+      r_root "$u" || r_die "$s" "${names[k-1]} has an access control list entry that allows more than reading ($u allow $w)"
     else
-      name=""
-      break
+      end=2
     fi
   done <<< "$out"
-  if [[ -z "$name" || ( "$plus" == + && "$n" == 0 ) || "$seen" != "$#" ]]; then
-    r_die "$s" "the access control lists of $* could not be read in full (ls: $out)"
-  fi
+  (( end == 1 )) || r_die "$s" "the access control lists of ${names[*]} could not be read in full (perl: $out)"
 }
 # Exits 7 unless every folder from the one that holds $SUDOERS_LOCK up to /
 # is a folder of root's that group and others cannot write, with no access
-# control list that lets anyone but root change it (r_acl). Leaves the
-# folders in DIRS.
+# control list that lets anyone but root change it (r_acl).
 r_dirs() {
-  local d="$SUDOERS_LOCK"
-  DIRS=()
+  local d="$SUDOERS_LOCK" dirs=()
   while [[ "$d" == /?* ]]; do
     d="${d%/*}"
     r_stat 7 "${d:-/}"
     if [[ "$ST_T" != 4 || ( "$ST_U" != 0 && "$ST_U" != "$ROOT_UID" ) ]] || (( (8#$ST_P & 8#022) != 0 )); then
       r_die 7 "${d:-/}, a folder above $SUDOERS_LOCK, is not a folder of root's that only root can write (stat: $ST_T $ST_P $ST_U)"
     fi
-    DIRS+=("${d:-/}")
+    dirs+=("$ST_T $ST_ID" "${d:-/}")
   done
-  r_acl 7 "${DIRS[@]}"
+  r_acl 7 "${dirs[@]}"
 }
 # Takes $SUDOERS_LOCK on fd 8 for the rest of the root shell, once it is
 # shown that only root can have made or changed it. An existing file must
@@ -942,7 +974,7 @@ r_guard() { # rule
   ( set -C; : > "$SUDOERS_LOCK" ) 2>/dev/null || true
   r_stat 7 "$SUDOERS_LOCK"
   r_file 7 "$SUDOERS_LOCK" 600
-  r_acl 7 "$SUDOERS_LOCK"
+  r_acl 7 "$ST_T $ST_ID" "$SUDOERS_LOCK"
   exec 8<"$SUDOERS_LOCK" || exit 7
   "$LOCKF" -t "$LOCK_TIMEOUT_SECONDS" 8 2>/dev/null || exit 3
   r_stat 7 <&8
@@ -969,7 +1001,7 @@ r_read() { # rule
   local LC_ALL=C rc=0
   r_stat 4 "$1"
   r_file 4 "$1"
-  r_acl 4 "$1"
+  r_acl 4 "$ST_T $ST_ID" "$1"
   exec 6<"$1" || exit 4
   r_stat 4 <&6
   r_file 4 "$1"
@@ -1008,7 +1040,7 @@ r_recheck() { # absent|same rule
   r_dirs
   r_stat 7 "$SUDOERS_LOCK"
   [[ "$ST" == "$LOCK_ID" ]] || r_die 7 "$SUDOERS_LOCK is no longer the file this run opened and locked"
-  r_acl 7 "$SUDOERS_LOCK"
+  r_acl 7 "$ST_T $ST_ID" "$SUDOERS_LOCK"
   if [[ "$1" == absent ]]; then
     [[ ! -e "$2" && ! -L "$2" ]] || r_die 4 "$2 is there now"
     return 0
@@ -1103,11 +1135,12 @@ r_replace() { # absent|same rule [text]
 }
 # The functions named, as `declare -f` prints them, with the spaces that
 # start each line cut, for the text a root shell runs: sudo logs that text
-# and ps shows it, and the indentation is a fifth of it. bash prints $'\n'
-# as a newline inside single quotes, so a quoted string may run across
-# lines; none of these functions has one whose next line starts with a
-# space, which the cut would change. A test checks that bash reads the cut
-# text back to the same functions. The same in install.sh and uninstall.sh.
+# and ps shows it, and the indentation is more than a tenth of the shell
+# functions' text. bash prints $'\n' as a newline inside single quotes, so a quoted
+# string may run across lines (r_acl_reader's program does); none of these
+# functions has one whose next line starts with a space, which the cut
+# would change. A test checks that bash reads the cut text back to the same
+# functions. The same in install.sh and uninstall.sh.
 root_functions() { # name...
   local line
   while IFS= read -r line; do
@@ -1122,9 +1155,9 @@ root_functions() { # name...
 sudoers_replace() { # absent|same [text]
   "$SUDO" "$ROOT_BASH" -c "set -u
 $(printf '%s=%q\n' SUDOERS_LOCK "$SUDOERS_LOCK" ROOT_UID "$ROOT_UID" USER "$USER" UID_NUM "$UID_NUM" \
-    LOCK_TIMEOUT_SECONDS "$LOCK_TIMEOUT_SECONDS" LOCKF "$LOCKF" STAT "$STAT" CAT "$CAT" LS "$LS" \
+    LOCK_TIMEOUT_SECONDS "$LOCK_TIMEOUT_SECONDS" LOCKF "$LOCKF" STAT "$STAT" CAT "$CAT" PERL "$PERL" \
     DSMEMBERUTIL "$DSMEMBERUTIL" MKTEMP "$MKTEMP" CHOWN "$CHOWN" CHMOD "$CHMOD" VISUDO "$VISUDO" MV "$MV" RM "$RM")
-$(root_functions r_die r_stat r_file r_root r_acl r_dirs r_guard r_read r_pin r_recheck \
+$(root_functions r_die r_stat r_file r_root r_acl_reader r_acl r_dirs r_guard r_read r_pin r_recheck \
     sudoers_for_others sudoers_rule_text r_replace)
 r_replace \"\$@\"" insomnia-sudoers-replace "$1" "$SUDOERS" "${2-}"
 }

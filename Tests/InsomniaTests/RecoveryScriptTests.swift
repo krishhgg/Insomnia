@@ -6871,11 +6871,11 @@ final class RecoveryScriptTests: XCTestCase {
     /// control lists and the rule, and the function that builds root's
     /// text, are one text in both scripts, so neither can trust a lock or
     /// rule the other refuses, and ROOT_UID (patched only by the tests) is
-    /// root's. Both list access control lists with /bin/ls and ask
-    /// /usr/bin/dsmemberutil whose an entry is. In that text each of stat,
-    /// ls, cat and dsmemberutil is called from one place only (r_stat,
-    /// r_acl, r_read, r_root), where its answer is checked, so no call of
-    /// them goes around the checks.
+    /// root's. Both read access control lists with /usr/bin/perl running
+    /// r_acl_reader and ask /usr/bin/dsmemberutil whose an entry is. In
+    /// that text each of stat, perl, cat and dsmemberutil is called from one
+    /// place only (r_stat, r_acl, r_read, r_root), where its answer is
+    /// checked, so no call of them goes around the checks.
     func testInstallAndUninstallTakeTheSameRootOnlySudoersLock() throws {
         var helpers: [String: [String]] = [:]
         for name in ["install.sh", "uninstall.sh"] {
@@ -6885,9 +6885,10 @@ final class RecoveryScriptTests: XCTestCase {
             XCTAssertEqual(lines.filter { $0.hasPrefix("SUDOERS=") }, ["SUDOERS=/etc/sudoers.d/insomnia"], name)
             XCTAssertEqual(lines.filter { $0.hasPrefix("ROOT_UID=") }, ["ROOT_UID=0"], name)
             XCTAssertEqual(lines.filter { $0 == "  umask 077" }.count, 1, name)
-            XCTAssertEqual(lines.filter { $0.hasPrefix("LS=") }, ["LS=/bin/ls"], name)
+            XCTAssertEqual(lines.filter { $0.hasPrefix("PERL=") }, ["PERL=/usr/bin/perl"], name)
+            XCTAssertEqual(lines.filter { $0.hasPrefix("LS=") }, [], name)
             XCTAssertEqual(lines.filter { $0.hasPrefix("DSMEMBERUTIL=") }, ["DSMEMBERUTIL=/usr/bin/dsmemberutil"], name)
-            for function in ["r_die", "r_stat", "r_file", "r_root", "r_acl", "r_dirs", "r_guard",
+            for function in ["r_die", "r_stat", "r_file", "r_root", "r_acl_reader", "r_acl", "r_dirs", "r_guard",
                              "r_read", "r_pin", "r_recheck", "root_functions"] {
                 let start = try XCTUnwrap(lines.firstIndex { $0.hasPrefix("\(function)() {") }, "\(name): \(function)")
                 let end = try XCTUnwrap(lines[start...].firstIndex(of: "}"), "\(name): \(function)")
@@ -6897,7 +6898,7 @@ final class RecoveryScriptTests: XCTestCase {
             for function in name == "install.sh" ? ["sudoers_for_others", "sudoers_rule_text", "r_replace"] : ["sudoers_not_ours", "r_remove"] {
                 rootText += "\n" + (try Self.shellFunction(function, in: text, name))
             }
-            for (tool, home) in [("\"$STAT\"", "r_stat"), ("\"$LS\"", "r_acl"), ("\"$CAT\"", "r_read"), ("\"$DSMEMBERUTIL\"", "r_root")] {
+            for (tool, home) in [("\"$STAT\"", "r_stat"), ("\"$PERL\"", "r_acl"), ("\"$CAT\"", "r_read"), ("\"$DSMEMBERUTIL\"", "r_root")] {
                 let start = try XCTUnwrap(lines.firstIndex { $0.hasPrefix("\(home)() {") }, "\(name): \(home)")
                 let end = try XCTUnwrap(lines[start...].firstIndex(of: "}"), "\(name): \(home)")
                 let inHome = lines[start...end].joined(separator: "\n").components(separatedBy: tool).count - 1
@@ -7781,6 +7782,71 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, true)
     }
 
+    /// The same with a copy identified as this app beside that process (the
+    /// installed binary, pid 5151, with pid 4242 from a bundle whose id is
+    /// neither this app's nor the client's), and the rule only root can
+    /// read. The copy is asked to quit only after the rule is judged, so
+    /// the other process is waited for first, on its own: one more look,
+    /// after QUIT_WAIT_SECONDS (1 s here). Still there, it stops the run
+    /// before the first sudo and before any quit, changing nothing; a copy
+    /// in another account or a pgrep that fails on that look stops it
+    /// there too. Gone, the uninstall goes on as with the identified copy
+    /// alone (the control): password, rule read through sudo, quit, then
+    /// removal, the only difference one more pgrep before the password.
+    func testUninstallWaitsForAnUnverifiedProcessBesideItsOwnCopyBeforeTheFirstSudo() throws {
+        try XCTSkipIf(getuid() == 0, "root reads a mode-000 file")
+        let rows: [(name: String, pgrep: String, outcome: String?)] = [
+            ("still there", "pids:4242,5151\npids:4242,5151\n", "Cannot tell whether 1 process(es) named Insomnia are this app, and they were still running after 1s: pid 4242 ("),
+            ("another account's copy appears", "pids:4242,5151\npids:4242,5151,6161\n", "Insomnia is running in another account, or a process named Insomnia there could not be told apart from it: pid 6161 (uid \(ScriptFixture.otherUid), "),
+            ("pgrep fails", "pids:4242,5151\n2\n", "pgrep exited 2, so whether Insomnia runs in this or another account is unknown."),
+            ("gone", "pids:4242,5151\npids:5151\n1\n", nil),
+            ("own copy alone", "pids:5151\n1\n", nil),
+        ]
+        var sudoBeforeQuit: [String: [String]] = [:]
+        for row in rows {
+            let f = try ScriptFixture()
+            defer { f.destroy() }
+            try f.installMachinery()
+            try f.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+            try f.makeRuleRootOnly()
+            let renamed = try f.otherBundle(in: "DevBuild", bundleId: "com.example.insomnia-copy")
+            f.setMode("pgrep", row.pgrep)
+            try f.psComm([(4242, renamed.path), (5151, f.installedExecutable.path), (6161, f.installedExecutable.path)])
+            try f.psUid([(6161, ScriptFixture.otherUid)])
+            let plist = try String(contentsOf: f.plist, encoding: .utf8)
+            let journal = try String(contentsOf: f.state, encoding: .utf8)
+
+            let r = try f.run(f.uninstall)
+
+            let calls = f.calls()
+            let pgreps = calls.filter { $0.hasPrefix("pgrep") }.count
+            guard let outcome = row.outcome else {
+                XCTAssertEqual(r.status, 0, "\(row.name): " + r.stderr + r.stdout)
+                let quit = try XCTUnwrap(calls.firstIndex { $0.hasPrefix("osascript") }, "\(row.name): \(calls)")
+                XCTAssertEqual(calls.filter { $0.hasPrefix("osascript") }.count, 1, "\(row.name): \(calls)")
+                sudoBeforeQuit[row.name] = calls[..<quit].filter { $0.hasPrefix("sudo") }.map { $0.replacingOccurrences(of: f.sudoers.path, with: "<rule>") }
+                XCTAssertEqual(calls[..<quit].filter { $0.hasPrefix("pgrep") }.count, row.name == "gone" ? 2 : 1, "\(row.name): \(calls)")
+                let firstSudo = try XCTUnwrap(calls.firstIndex { $0.hasPrefix("sudo") }, "\(row.name): \(calls)")
+                XCTAssertEqual(calls[..<firstSudo].filter { $0.hasPrefix("pgrep") }.count, row.name == "gone" ? 2 : 1, "\(row.name): \(calls)")
+                XCTAssertFalse(calls.contains { $0.hasPrefix("pkill") || $0.hasPrefix("kill") }, "\(row.name): \(calls)")
+                XCTAssertFalse(f.exists(f.sudoers), row.name)
+                XCTAssertFalse(f.exists(f.app), row.name)
+                continue
+            }
+            XCTAssertEqual(r.status, 1, "\(row.name): " + r.stderr + r.stdout)
+            XCTAssertTrue(r.stderr.contains(outcome), "\(row.name): " + r.stderr)
+            XCTAssertTrue(r.stderr.contains("Nothing was removed."), "\(row.name): " + r.stderr)
+            XCTAssertEqual(pgreps, 2, "\(row.name): listed once more, then stopped: \(calls)")
+            XCTAssertFalse(calls.contains { $0.hasPrefix("sudo") || $0.hasPrefix("osascript") || $0.hasPrefix("launchctl") || $0.hasPrefix("pkill") || $0.hasPrefix("kill") }, "\(row.name): \(calls)")
+            XCTAssertEqual(try f.ruleText(), f.sudoersRule, row.name)
+            XCTAssertEqual(try String(contentsOf: f.plist, encoding: .utf8), plist, row.name)
+            XCTAssertEqual(try String(contentsOf: f.state, encoding: .utf8), journal, row.name)
+            XCTAssertTrue(f.exists(f.app), row.name)
+        }
+        XCTAssertEqual(sudoBeforeQuit["gone"], ["sudo -v", "sudo -n /bin/cat <rule>"], "\(sudoBeforeQuit)")
+        XCTAssertEqual(sudoBeforeQuit["own copy alone"], sudoBeforeQuit["gone"], "\(sudoBeforeQuit)")
+    }
+
     /// This account's own rule, only root can read: judged after the
     /// password, read again under the lock, and removed with the app.
     func testUninstallRemovesItsOwnRuleOnlyRootCanRead() throws {
@@ -8459,7 +8525,7 @@ final class RecoveryScriptTests: XCTestCase {
     // MARK: - Access control lists, and root's last read of the rule
 
     /// A fixture with the rule installed, ready for install.sh or
-    /// uninstall.sh (`install`), whose copy runs root's ls and cat through
+    /// uninstall.sh (`install`), whose copy runs root's perl and cat through
     /// the fakes named in `fakes`.
     private func ruleFixture(install: Bool, fakes: [String] = []) throws -> ScriptFixture {
         let f = try ScriptFixture()
@@ -8492,7 +8558,7 @@ final class RecoveryScriptTests: XCTestCase {
         }
     }
 
-    /// Root lists, with /bin/ls, the access control lists of every folder
+    /// Root reads, with /usr/bin/perl, the access control lists of every folder
     /// from the rule's up to /, of the lock and of the rule, and stops at an
     /// entry that allows more than reading, whoever it names: on a folder
     /// (the rule's own, one above it, or one that reaches only the files
@@ -8566,47 +8632,44 @@ final class RecoveryScriptTests: XCTestCase {
     }
 
     /// A list root cannot read in full counts as one that allows a change,
-    /// through the fake ls: ls fails on the rule (4, both scripts), prints
-    /// all of its answer and then fails (4), marks the lock "+" and prints
-    /// no entry (7), prints a line after the rule's folder that is neither a
-    /// file nor an entry (7), numbers the lock's one entry ("everyone deny
-    /// delete", which alone would pass) 1 instead of 0, as when it skips an
-    /// entry it cannot read (7), or names a principal on the rule's folder
-    /// ("user:root") where the UUID was (7).
+    /// through the fake perl, which runs the real reader and then changes
+    /// its answer; no access control list is changed. The reader cannot
+    /// open the rule (4, both scripts), or answers in full and then fails
+    /// (4); its answer for the lock has no last "checked" line (7), or an
+    /// unexpected line after it, for the rule's folder (7); or it prints an
+    /// entry whose principal is a name ("user:root"), not a UUID, which is
+    /// not read at all (7), and dsmemberutil is not asked.
     func testRootStopsWhenAnAccessControlListCannotBeReadInFull() throws {
-        let cases: [(file: String, target: (ScriptFixture) -> String, status: Int, install: Bool, entry: Bool)] = [
-            ("ls.fail", { $0.sudoers.path }, 4, true, false),
-            ("ls.fail-after", { $0.sudoers.path }, 4, false, false),
-            ("ls.plus", { $0.sudoersLock.path }, 7, false, false),
-            ("ls.extra", { $0.sudoersLock.deletingLastPathComponent().path }, 7, false, false),
-            ("ls.gap", { $0.sudoersLock.path }, 7, false, true),
-            ("ls.named", { $0.sudoersLock.deletingLastPathComponent().path }, 7, false, true),
+        let cases: [(file: String, target: (ScriptFixture) -> String, status: Int, install: Bool)] = [
+            ("perl.fail", { $0.sudoers.path }, 4, true),
+            ("perl.fail-after", { $0.sudoers.path }, 4, false),
+            ("perl.drop", { $0.sudoersLock.path }, 7, false),
+            ("perl.extra", { $0.sudoersLock.deletingLastPathComponent().path }, 7, false),
+            ("perl.entry", { $0.sudoersLock.deletingLastPathComponent().path }, 7, false),
         ]
         for c in cases {
             for install in c.install ? [true, false] : [false] {
                 let label = "\(c.file), \(install ? "install" : "uninstall")"
-                let f = try ruleFixture(install: install, fakes: ["ls"])
+                let f = try ruleFixture(install: install, fakes: ["perl"])
+                defer { f.destroy() }
                 let target = c.target(f)
-                defer {
-                    TestACL.clear(URL(fileURLWithPath: target))
-                    f.destroy()
-                }
                 try f.prepareSudoersLock()
-                if c.entry { try TestACL.add("everyone deny delete", to: URL(fileURLWithPath: target)) }
-                try (target + "\n").write(to: f.root.appendingPathComponent(c.file), atomically: true, encoding: .utf8)
+                let line = c.file == "perl.entry" ? "\(target)|user:root 0x1 0x4\n" : target + "\n"
+                try line.write(to: f.root.appendingPathComponent(c.file), atomically: true, encoding: .utf8)
 
                 let r = try runRuleScript(f, install: install)
 
                 XCTAssertEqual(r.status, 1, "\(label): " + r.stderr + r.stdout)
-                let why = c.file == "ls.fail"
-                    ? "the access control lists of \(target) could not be read (ls exited 1: ls: \(target): Permission denied)"
-                    : c.file == "ls.fail-after"
-                    ? "the access control lists of \(target) could not be read (ls exited 1: "
-                    : "could not be read in full (ls: "
+                let why = c.file == "perl.fail"
+                    ? "the access control lists of \(target) could not be read (perl exited 1: \(target) could not be opened: Permission denied)"
+                    : c.file == "perl.fail-after"
+                    ? "the access control lists of \(target) could not be read (perl exited 1: checked 1\n"
+                    : "could not be read in full (perl: "
                 XCTAssertTrue(r.stderr.contains(why), "\(label): " + r.stderr)
-                if c.file == "ls.gap" { XCTAssertTrue(r.stderr.contains(" 1: ABCDEFAB-CDEF-ABCD-EFAB-CDEF0000000C deny delete"), "\(label): " + r.stderr) }
-                if c.file == "ls.named" { XCTAssertTrue(r.stderr.contains(" 0: user:root deny delete"), "\(label): " + r.stderr) }
-                if c.file == "ls.extra" { XCTAssertTrue(r.stderr.contains("unexpected line"), "\(label): " + r.stderr) }
+                if c.file == "perl.extra" { XCTAssertTrue(r.stderr.contains("\nunexpected line)"), "\(label): " + r.stderr) }
+                if c.file == "perl.entry" { XCTAssertTrue(r.stderr.contains("(perl: 1 user:root 0x1 0x4\nchecked "), "\(label): " + r.stderr) }
+                if c.file == "perl.drop" { XCTAssertFalse(r.stderr.contains("(perl: checked"), "\(label): " + r.stderr) }
+                XCTAssertFalse(f.calls().contains { $0.hasPrefix("dsmemberutil") }, "\(label): \(f.calls())")
                 XCTAssertTrue(r.stderr.contains(ruleRefusal(f, install: install, status: c.status)), "\(label): " + r.stderr)
                 XCTAssertEqual(try String(contentsOf: f.sudoers, encoding: .utf8), f.sudoersRule, label)
                 XCTAssertTrue(f.exists(f.app), label)
@@ -8614,21 +8677,24 @@ final class RecoveryScriptTests: XCTestCase {
         }
     }
 
-    /// An entry that appears on the rule's folder after root's first checks
-    /// and its read of the rule (the fake ls adds it on its fourth call, the
-    /// first of the checks made last before the rename or removal) stops the
-    /// run there, with exit 7.
+    /// An entry that allows a change, reported for the rule's folder after
+    /// root's first checks and its read of the rule (the fake perl adds it
+    /// to the real reader's answer on its fourth call, the first of the
+    /// checks made last before the rename or removal), stops the run there,
+    /// with exit 7. No access control list is changed.
     func testRootChecksAccessControlListsAgainJustBeforeItChangesTheRule() throws {
         for install in [true, false] {
-            let f = try ruleFixture(install: install, fakes: ["ls"])
+            let f = try ruleFixture(install: install, fakes: ["perl"])
             defer { f.destroy() }
-            try "4".write(to: f.root.appendingPathComponent("ls.acl"), atomically: true, encoding: .utf8)
+            let folder = f.sudoersLock.deletingLastPathComponent().path
+            try "\(folder)|ABCDEFAB-CDEF-ABCD-EFAB-CDEF0000000C 0x1 0x4\n".write(to: f.root.appendingPathComponent("perl.entry"), atomically: true, encoding: .utf8)
+            try "4".write(to: f.root.appendingPathComponent("perl.entry.at"), atomically: true, encoding: .utf8)
 
             let r = try runRuleScript(f, install: install)
 
             XCTAssertEqual(r.status, 1, "install \(install): " + r.stderr + r.stdout)
-            XCTAssertTrue(f.calls().contains("ls ADDED-ACL"), "install \(install): \(f.calls())")
-            XCTAssertTrue(r.stderr.contains("\(f.sudoersLock.deletingLastPathComponent().path) has an access control list entry that allows more than reading ("), "install \(install): " + r.stderr)
+            XCTAssertEqual(f.calls().filter { $0 == "perl ADDED-ENTRY" }.count, 1, "install \(install): \(f.calls())")
+            XCTAssertTrue(r.stderr.contains("\(folder) has an access control list entry that allows more than reading (ABCDEFAB-CDEF-ABCD-EFAB-CDEF0000000C allow 0x1 0x4)"), "install \(install): " + r.stderr)
             XCTAssertTrue(r.stderr.contains(ruleRefusal(f, install: install, status: 7)), "install \(install): " + r.stderr)
             XCTAssertEqual(try String(contentsOf: f.sudoers, encoding: .utf8), f.sudoersRule)
             XCTAssertEqual(try f.contents(of: f.sudoers.deletingLastPathComponent()), f.sudoersFolderAfterTransaction, "no staged copy left")
@@ -8636,24 +8702,228 @@ final class RecoveryScriptTests: XCTestCase {
         }
     }
 
+    /// The reader opens each name itself, so the list it reads must be the
+    /// file r_stat checked just before: it compares the type, device and
+    /// file ID the kernel gives with that same answer as the list. Here the
+    /// fake perl puts another file at the rule's path by a rename (an owned
+    /// file in the fixture, no access control list changed) on the third
+    /// call, after root's stat of the rule and before the reader opens it.
+    /// Root stops with exit 4, naming both identities, and keeps the file
+    /// that is there now. The matched control is root's text from that run,
+    /// run again alone with no rename: it reads all six lists and
+    /// completes.
+    func testRootReadsTheListOfTheFileItCheckedNotOnePutAtItsPathLater() throws {
+        for install in [true, false] {
+            let label = "install \(install)"
+            let f = try ruleFixture(install: install, fakes: ["perl"])
+            defer { f.destroy() }
+            let count = f.root.appendingPathComponent("perl.count")
+            let theirs = ScriptFixture.sudoersRule(for: ScriptFixture.account)
+            try "3".write(to: f.root.appendingPathComponent("perl.replace"), atomically: true, encoding: .utf8)
+            try theirs.write(to: f.root.appendingPathComponent("rule.replacement"), atomically: true, encoding: .utf8)
+            let inode = try f.inode(f.sudoers)
+
+            let r = try runRuleScript(f, install: install)
+
+            XCTAssertEqual(r.status, 1, "\(label): " + r.stderr + r.stdout)
+            XCTAssertTrue(f.calls().contains("perl REPLACED-RULE"), "\(label): \(f.calls())")
+            XCTAssertTrue(r.stderr.contains("the access control lists of \(f.sudoers.path) could not be read (perl exited "), "\(label): " + r.stderr)
+            XCTAssertTrue(r.stderr.contains(": \(f.sudoers.path): type 1, file "), "\(label): " + r.stderr)
+            XCTAssertTrue(r.stderr.contains(ruleRefusal(f, install: install, status: 4)), "\(label): " + r.stderr)
+            XCTAssertEqual(try String(contentsOf: count, encoding: .utf8), "3\n", label)
+            XCTAssertEqual(try String(contentsOf: f.sudoers, encoding: .utf8), theirs, label)
+            XCTAssertNotEqual(try f.inode(f.sudoers), inode, label)
+            XCTAssertEqual(try f.contents(of: f.sudoers.deletingLastPathComponent()), f.sudoersFolderAfterTransaction, "\(label): no staged copy left")
+            XCTAssertTrue(f.exists(f.app), label)
+
+            try FileManager.default.removeItem(at: f.root.appendingPathComponent("perl.replace"))
+            try FileManager.default.removeItem(at: count)
+            let control = try runRootText(f, install: install)
+
+            XCTAssertEqual(control.status, 0, "\(label): " + control.output)
+            XCTAssertEqual(try String(contentsOf: count, encoding: .utf8), "6\n", label)
+            XCTAssertEqual(f.exists(f.sudoers), install, label)
+        }
+    }
+
+    /// The program r_acl_reader prints (the same text in both scripts,
+    /// testInstallAndUninstallTakeTheSameRootOnlySudoersLock), cut before
+    /// the line that starts reading files ("@ARGV%2==0", which must be
+    /// there once), so only its parse runs: on answers this test builds as
+    /// bytes, the way fgetattrlist lays them out (length, device, type,
+    /// the list's reference, file ID, then the list). No file is opened, no
+    /// system call made, and no access control list read or changed. Each
+    /// row is a whole answer and what parse must say: nothing to judge
+    /// ("ok|"), the entries that allow a change for r_acl to judge, or a
+    /// refusal with its reason. The rows that pass are the matched controls
+    /// of the ones that do not: no list and an empty one; deny, audit and
+    /// alarm entries; read-only rights with every inheritance flag; root's
+    /// entry and every other entry that allows a change (reported, not
+    /// passed); two entries that each count. Refused: an entry past the
+    /// count (the last one, that `ls` could leave out) or a count past the
+    /// entries, an answer larger than the buffer, a failed call even with a
+    /// whole answer, another file, device or type, a list elsewhere or of
+    /// another length, a short list, another magic, an owner set, 129
+    /// entries, flags or kinds sys/kauth.h does not define, and a buffer of
+    /// another size.
+    func testRootReaderJudgesTheKernelsWholeAnswer() throws {
+        let text = try String(contentsOf: ScriptFixture.productionScripts.appendingPathComponent("install.sh"), encoding: .utf8)
+        let function = try Self.shellFunction("r_acl_reader", in: text, "install.sh")
+        let printed = try fx.runTool("/bin/bash", ["-c", "eval \"$1\"; r_acl_reader", "bash", function])
+        XCTAssertEqual(printed.status, 0, printed.output)
+        let parts = printed.output.components(separatedBy: "\n@ARGV%2==0")
+        XCTAssertEqual(parts.count, 2, "the line that starts reading files, once: " + printed.output)
+        let driver = #"""
+        my $want="10 7:9";
+        my $E=pack("H32","ABCDEFABCDEFABCDEFABCDEF0000000C");
+        my $R=pack("H32","FFFFEEEEDDDDCCCCBBBBAAAA00000000");
+        sub ace{pack("a16 L L",@_)}
+        sub list{my($c,$f,@a)=@_;pack("L a32 L L",0x12cc16d,"\0"x32,$c,$f).join("",@a)}
+        sub answer{my($l,%o)=@_;my $b=pack("L l L l L Q",$o{len}//(28+length($l)),$o{dev}//7,$o{type}//1,$o{at}//16,$o{n}//length($l),$o{id}//9).$l;$b.("\0"x(4096-length($b)))}
+        sub show{my($name,$b,%o)=@_;my($e,@r)=parse($b,$o{size}//4096,$o{rc}//0,$o{want}//$want);print("$name|",($e eq ""?"ok|".join(";",@r):"refused|$e"),"\n")}
+        show("no list",answer(""));
+        show("no list, as a count",answer(list(0xffffffff,0)));
+        show("an empty list",answer(list(0,0)));
+        show("deny, audit and alarm",answer(list(4,0,ace($E,1,0x1500a8a),ace($E,2,0xffffffff),ace($E,3,4),ace($E,4,4))));
+        show("read, every inheritance flag",answer(list(1,0,ace($E,0x1f1,2))));
+        show("root may write",answer(list(1,0,ace($R,1,4))));
+        show("everyone may write what is made later",answer(list(1,0,ace($E,0x121,4))));
+        show("generic write",answer(list(1,0,ace($E,1,1<<23))));
+        show("generic all",answer(list(1,0,ace($E,1,1<<21))));
+        show("an unknown right",answer(list(1,0,ace($E,1,1<<30))));
+        show("deny of an unknown right",answer(list(1,0,ace($E,2,1<<30))));
+        show("two entries",answer(list(2,0,ace($E,2,0x10),ace($E,1,4))));
+        show("the last entry past the count",answer(list(1,0,ace($E,2,0x10),ace($E,1,4))));
+        show("a count past the entries",answer(list(2,0,ace($E,2,0x10))));
+        show("larger than the buffer",substr(answer(list(3,0,ace($E,2,1),ace($E,2,1),ace($E,2,1))),0,100),size=>100);
+        show("a failed call",answer(""),rc=>"-1: Operation not permitted");
+        show("a failed call with an answer",answer(list(1,0,ace($E,2,0x10))),rc=>1);
+        show("another file",answer(""),want=>"10 7:8");
+        show("another device",answer("",dev=>6));
+        show("a folder where a file was",answer("",type=>2));
+        show("a folder",answer("",type=>2),want=>"4 7:9");
+        show("a list elsewhere",answer("",at=>20));
+        show("a list longer than the answer",answer("",n=>44));
+        show("a short list",answer("\0"x20));
+        show("another magic",answer(pack("L a32 L L",0,"\0"x32,0,0)));
+        show("an owner",answer(pack("L a32 L L",0x12cc16d,"\1"x32,0,0)));
+        show("128 entries",answer(list(128,0,(ace($E,2,0x10))x128)));
+        show("129 entries",answer(list(129,0,(ace($E,2,0x10))x129)));
+        show("every list flag",answer(list(1,0x3ffff,ace($E,2,0x10))));
+        show("an unknown list flag",answer(list(1,1<<18,ace($E,2,0x10))));
+        show("kind 0",answer(list(1,0,ace($E,0,2))));
+        show("kind 5",answer(list(1,0,ace($E,5,2))));
+        show("an unknown entry flag",answer(list(1,0,ace($E,0x801,2))));
+        show("a buffer of another size",answer(""),size=>4095);
+        """#
+        let r = try fx.runTool("/usr/bin/perl", ["-e", parts[0] + "\n" + driver])
+
+        XCTAssertEqual(r.status, 0, r.output)
+        let E = "ABCDEFAB-CDEF-ABCD-EFAB-CDEF0000000C"
+        let expected = [
+            "no list|ok|",
+            "no list, as a count|ok|",
+            "an empty list|ok|",
+            "deny, audit and alarm|ok|",
+            "read, every inheritance flag|ok|",
+            "root may write|ok|FFFFEEEE-DDDD-CCCC-BBBB-AAAA00000000 0x1 0x4",
+            "everyone may write what is made later|ok|\(E) 0x121 0x4",
+            "generic write|ok|\(E) 0x1 0x800000",
+            "generic all|ok|\(E) 0x1 0x200000",
+            "an unknown right|ok|\(E) 0x1 0x40000000",
+            "deny of an unknown right|ok|",
+            "two entries|ok|\(E) 0x1 0x4",
+            "the last entry past the count|refused|1 entries in a list of 92 bytes",
+            "a count past the entries|refused|2 entries in a list of 68 bytes",
+            "larger than the buffer|refused|an answer of 144 bytes, with 100 read",
+            "a failed call|refused|fgetattrlist failed (-1: Operation not permitted)",
+            "a failed call with an answer|refused|fgetattrlist failed (1)",
+            "another file|refused|type 1, file 7:9, not 10 7:8",
+            "another device|refused|type 1, file 6:9, not 10 7:9",
+            "a folder where a file was|refused|type 2, file 7:9, not 10 7:9",
+            "a folder|ok|",
+            "a list elsewhere|refused|a list of 0 bytes at 20 in an answer of 28",
+            "a list longer than the answer|refused|a list of 44 bytes at 16 in an answer of 28",
+            "a short list|refused|a list of 20 bytes",
+            "another magic|refused|a list header 0",
+            "an owner|refused|a list header 0x12cc16d",
+            "128 entries|ok|",
+            "129 entries|refused|129 entries in a list of 3140 bytes",
+            "every list flag|ok|",
+            "an unknown list flag|refused|list flags 0x40000",
+            "kind 0|refused|entry 0 has flags 0",
+            "kind 5|refused|entry 0 has flags 0x5",
+            "an unknown entry flag|refused|entry 0 has flags 0x801",
+            "a buffer of another size|refused|the answer is not in the buffer read",
+        ]
+        XCTAssertEqual(r.output.components(separatedBy: "\n").filter { !$0.isEmpty }, expected)
+    }
+
+    /// The reader itself, with /usr/bin/perl, on files this test makes
+    /// (none has an access control list, and none is changed), each named
+    /// after what /usr/bin/stat says of it, as r_acl names them. A file and
+    /// a folder pass ("checked 2"). Refused, before any answer is trusted:
+    /// another inode, a folder named as a file (its type), a file named as
+    /// a folder (opened only as a folder), a link to the file (never
+    /// followed), a FIFO (opened without waiting, refused by its type), a
+    /// name that is not there, and a call with no pair or half of one.
+    func testRootReaderReadsOnlyTheFileStatDescribed() throws {
+        let dir = fx.root.appendingPathComponent("reader", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: false)
+        let file = dir.appendingPathComponent("file"), folder = dir.appendingPathComponent("folder")
+        let link = dir.appendingPathComponent("link"), fifo = dir.appendingPathComponent("fifo")
+        try "x\n".write(to: file, atomically: true, encoding: .utf8)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: file)
+        XCTAssertEqual(mkfifo(fifo.path, 0o600), 0)
+        func said(_ url: URL) throws -> (type: String, id: String) {
+            let s = try fx.runTool("/usr/bin/stat", ["-f", "%Hp %d:%i", url.path])
+            XCTAssertEqual(s.status, 0, s.output)
+            let w = s.output.trimmingCharacters(in: .newlines).split(separator: " ").map(String.init)
+            return (w[0], w[1])
+        }
+        let text = try String(contentsOf: ScriptFixture.productionScripts.appendingPathComponent("uninstall.sh"), encoding: .utf8)
+        let function = try Self.shellFunction("r_acl_reader", in: text, "uninstall.sh")
+        let program = try fx.runTool("/bin/bash", ["-c", "eval \"$1\"; r_acl_reader", "bash", function]).output
+        let (f, d, l, q) = (try said(file), try said(folder), try said(file), try said(fifo))
+        let cases: [(name: String, args: [String], answer: String)] = [
+            ("a file and a folder", ["\(f.type) \(f.id)", file.path, "\(d.type) \(d.id)", folder.path], "checked 2\n"),
+            ("another inode", ["10 \(f.id)0", file.path], "\(file.path): type 1, file \(f.id), not 10 \(f.id)0\n"),
+            ("a folder named as a file", ["10 \(d.id)", folder.path], "\(folder.path): type 2, file \(d.id), not 10 \(d.id)\n"),
+            ("a file named as a folder", ["4 \(f.id)", file.path], "\(file.path) could not be opened: Not a directory\n"),
+            ("a link to the file", ["\(l.type) \(l.id)", link.path], "\(link.path) could not be opened: Too many levels of symbolic links\n"),
+            ("a FIFO", ["10 \(q.id)", fifo.path], "\(fifo.path): type 7, file \(q.id), not 10 \(q.id)\n"),
+            ("a name that is not there", ["10 \(f.id)", dir.appendingPathComponent("gone").path], "\(dir.appendingPathComponent("gone").path) could not be opened: No such file or directory\n"),
+            ("no pair", [], "no files named\n"),
+            ("half a pair", ["10 \(f.id)"], "no files named\n"),
+        ]
+        XCTAssertEqual(f.type, "10")
+        XCTAssertEqual(d.type, "4")
+        for c in cases {
+            let r = try fx.runTool("/usr/bin/perl", ["-e", program, "--"] + c.args)
+            XCTAssertEqual(r.status == 0, c.answer == "checked 2\n", "\(c.name): \(r.status) " + r.output)
+            XCTAssertEqual(r.output, c.answer, c.name)
+        }
+    }
+
     /// Root reads the rule twice: when it pins it, and again through a new
     /// descriptor as the last check before the rename or removal. A rule
     /// changed in place between the two (after root judged it, through the
-    /// fake ls's fourth call, or, for install.sh, while visudo checks the
+    /// fake perl's fourth call, or, for install.sh, while visudo checks the
     /// staged copy) has other bytes the second time and is kept, with its
     /// inode. One put there by a rename is another file and is kept too.
     /// No staged copy is left.
     func testRootKeepsARuleChangedAfterItsFirstRead() throws {
         let cases: [(how: String, why: String, install: Bool)] = [
-            ("ls.rewrite", "changed after root read it", true),
-            ("ls.rewrite", "changed after root read it", false),
+            ("perl.rewrite", "changed after root read it", true),
+            ("perl.rewrite", "changed after root read it", false),
             ("visudo", "changed after root read it", true),
-            ("ls.replace", "was replaced after root read it", true),
-            ("ls.replace", "was replaced after root read it", false),
+            ("perl.replace", "was replaced after root read it", true),
+            ("perl.replace", "was replaced after root read it", false),
         ]
         for c in cases {
             let label = "\(c.how), \(c.install ? "install" : "uninstall")"
-            let f = try ruleFixture(install: c.install, fakes: c.how == "visudo" ? [] : ["ls"])
+            let f = try ruleFixture(install: c.install, fakes: c.how == "visudo" ? [] : ["perl"])
             defer { f.destroy() }
             let theirs = ScriptFixture.sudoersRule(for: "bob")
             let inode = try f.inode(f.sudoers)
@@ -8672,7 +8942,7 @@ final class RecoveryScriptTests: XCTestCase {
             XCTAssertTrue(r.stderr.contains("\(f.sudoers.path) \(c.why)"), "\(label): " + r.stderr)
             XCTAssertTrue(r.stderr.contains(ruleRefusal(f, install: c.install, status: 4)), "\(label): " + r.stderr)
             XCTAssertEqual(try String(contentsOf: f.sudoers, encoding: .utf8), theirs, "\(label): the rule written meanwhile stays")
-            if c.how != "ls.replace" { XCTAssertEqual(try f.inode(f.sudoers), inode, label) }
+            if c.how != "perl.replace" { XCTAssertEqual(try f.inode(f.sudoers), inode, label) }
             XCTAssertEqual(try f.contents(of: f.sudoers.deletingLastPathComponent()), f.sudoersFolderAfterTransaction, "\(label): no staged copy left")
             if c.install {
                 XCTAssertFalse(f.calls().contains { $0.hasPrefix("osascript") || $0.hasPrefix("launchctl bootout") || $0.hasPrefix("launchctl bootstrap") }, "\(label): \(f.calls())")
@@ -8923,52 +9193,71 @@ final class RecoveryScriptTests: XCTestCase {
     /// fake, answering from its table) shows that its UUID is root's own
     /// user record: the UUID it gives for ROOT_UID is the entry's, and the
     /// ID it gives for that UUID is "uid: <ROOT_UID>", each as one line
-    /// from a dsmemberutil that exits 0. Here the entry, on the rule's
-    /// folder, names the test account, which is ROOT_UID in these copies.
-    /// With both answers right each script completes (through the script)
-    /// and the entry stays. Then root's text alone, from the same state,
-    /// stops with exit 7 and changes nothing for each other answer: none
-    /// (the fake fails), another UUID, the UUID and a second line, the
-    /// UUID with no newline, the UUID and then exit 1, a group ("gid:"),
-    /// another user's ID, the right ID and then exit 1. With ls printing
-    /// "user:root" where the UUID was (as ls without -n can), the entry is
-    /// not read at all, and dsmemberutil is not asked.
+    /// from a dsmemberutil that exits 0. Here the fake perl adds the entry
+    /// (allow add_file and delete_child) to the real reader's answer for
+    /// the rule's folder on every call, so no access control list is
+    /// changed; ROOT_UID is the test account's uid in these copies. With no
+    /// answer each script stops at root with exit 7, through the script.
+    /// Root's text from that run, alone and from the same state, completes
+    /// with both answers right, unless the reader's last line ("checked
+    /// N") is dropped, and stops with exit 7, changing nothing, for each
+    /// other answer: none (the fake fails), another UUID, the UUID
+    /// and a second line, the UUID with no newline, the UUID and then exit
+    /// 1, a group ("gid:"), another user's ID, the right ID and then exit
+    /// 1.
     func testRootAdmitsAChangeOnlyForAnEntryShownToBeRootsOwnUser() throws {
         for install in [true, false] {
-            let f = try ruleFixture(install: install, fakes: ["ls"])
+            let f = try ruleFixture(install: install, fakes: ["perl"])
+            defer { f.destroy() }
             let folder = f.sudoersLock.deletingLastPathComponent()
-            defer {
-                TestACL.clear(folder)
-                f.destroy()
-            }
             try f.prepareSudoersLock()
-            try TestACL.add("user:\(TestACL.owner) allow add_file,delete_child", to: folder)
-            let u = try XCTUnwrap(TestACL.qualifiers(folder).first, "install \(install)")
-            XCTAssertEqual(TestACL.qualifiers(folder).count, 1)
+            let u = "0A1B2C3D-4E5F-4061-8293-A4B5C6D7E8F9"
+            try "\(folder.path)|\(u) 0x1 0x44\n".write(to: f.root.appendingPathComponent("perl.entry"), atomically: true, encoding: .utf8)
             let root = f.uid
             let table = f.root.appendingPathComponent("dsmemberutil.table")
             func rows(_ uuid: String, _ id: String) -> String { "getuuid -u \(root)|\(uuid)\ngetid -X \(u)|\(id)\n" }
             let right = rows("\(u)\\n|0", "uid: \(root)\\n|0")
-            try right.write(to: table, atomically: true, encoding: .utf8)
 
             let whole = try runRuleScript(f, install: install)
 
-            XCTAssertEqual(whole.status, 0, "install \(install): " + whole.stderr + whole.stdout)
+            XCTAssertEqual(whole.status, 1, "install \(install): " + whole.stderr + whole.stdout)
+            XCTAssertTrue(whole.stderr.contains("\(folder.path) has an access control list entry that allows more than reading (\(u) allow 0x1 0x44)"), "install \(install): " + whole.stderr)
+            XCTAssertTrue(whole.stderr.contains(ruleRefusal(f, install: install, status: 7)), "install \(install): " + whole.stderr)
+            XCTAssertTrue(f.calls().contains("perl ADDED-ENTRY"), "install \(install): \(f.calls())")
+            XCTAssertEqual(try String(contentsOf: f.sudoers, encoding: .utf8), f.sudoersRule, "install \(install)")
+
+            try right.write(to: table, atomically: true, encoding: .utf8)
+            f.clearCalls()
+            let control = try runRootText(f, install: install)
+
+            XCTAssertEqual(control.status, 0, "install \(install): " + control.output)
             XCTAssertTrue(f.calls().contains("dsmemberutil getuuid -u \(root)"), "install \(install): \(f.calls())")
             XCTAssertTrue(f.calls().contains("dsmemberutil getid -X \(u)"), "install \(install): \(f.calls())")
             XCTAssertEqual(f.exists(f.sudoers), install, "install \(install)")
-            XCTAssertEqual(TestACL.entries(folder), 1, "install \(install)")
 
-            let wrong: [(name: String, table: String?, named: Bool)] = [
-                ("no answer", nil, false),
-                ("another UUID", rows("FFFFEEEE-DDDD-CCCC-BBBB-AAAA00000000\\n|0", "uid: \(root)\\n|0"), false),
-                ("the UUID and another line", rows("\(u)\\nanother line\\n|0", "uid: \(root)\\n|0"), false),
-                ("the UUID with no newline", rows("\(u)|0", "uid: \(root)\\n|0"), false),
-                ("the UUID, then exit 1", rows("\(u)\\n|1", "uid: \(root)\\n|0"), false),
-                ("a group", rows("\(u)\\n|0", "gid: \(root)\\n|0"), false),
-                ("another user", rows("\(u)\\n|0", "uid: 4242\\n|0"), false),
-                ("the ID, then exit 1", rows("\(u)\\n|0", "uid: \(root)\\n|1"), false),
-                ("a name where the UUID was", right, true),
+            // The same entry shown to be root's, in an answer whose last line,
+            // "checked N", is missing: every line left is a known entry of
+            // root's, and only the missing count stops the run.
+            try f.sudoersRule.write(to: f.sudoers, atomically: true, encoding: .utf8)
+            try "\(folder.path)\n".write(to: f.root.appendingPathComponent("perl.drop"), atomically: true, encoding: .utf8)
+            f.clearCalls()
+            let hidden = try runRootText(f, install: install)
+
+            XCTAssertEqual(hidden.status, 7, "install \(install): " + hidden.output)
+            XCTAssertTrue(hidden.output.contains("could not be read in full (perl: 1 \(u) 0x1 0x44)"), "install \(install): " + hidden.output)
+            XCTAssertTrue(f.calls().contains("dsmemberutil getid -X \(u)"), "install \(install): \(f.calls())")
+            XCTAssertEqual(try String(contentsOf: f.sudoers, encoding: .utf8), f.sudoersRule, "install \(install)")
+            try FileManager.default.removeItem(at: f.root.appendingPathComponent("perl.drop"))
+
+            let wrong: [(name: String, table: String?)] = [
+                ("no answer", nil),
+                ("another UUID", rows("FFFFEEEE-DDDD-CCCC-BBBB-AAAA00000000\\n|0", "uid: \(root)\\n|0")),
+                ("the UUID and another line", rows("\(u)\\nanother line\\n|0", "uid: \(root)\\n|0")),
+                ("the UUID with no newline", rows("\(u)|0", "uid: \(root)\\n|0")),
+                ("the UUID, then exit 1", rows("\(u)\\n|1", "uid: \(root)\\n|0")),
+                ("a group", rows("\(u)\\n|0", "gid: \(root)\\n|0")),
+                ("another user", rows("\(u)\\n|0", "uid: 4242\\n|0")),
+                ("the ID, then exit 1", rows("\(u)\\n|0", "uid: \(root)\\n|1")),
             ]
             for c in wrong {
                 let label = "\(c.name), install \(install)"
@@ -8976,36 +9265,32 @@ final class RecoveryScriptTests: XCTestCase {
                 let inode = try f.inode(f.sudoers)
                 XCTAssertEqual(try f.contents(of: folder), f.sudoersFolderAfterTransaction, label)
                 if let rowsText = c.table { try rowsText.write(to: table, atomically: true, encoding: .utf8) } else { try? FileManager.default.removeItem(at: table) }
-                let named = f.root.appendingPathComponent("ls.named")
-                if c.named { try "\(folder.path)\n".write(to: named, atomically: true, encoding: .utf8) } else { try? FileManager.default.removeItem(at: named) }
                 f.clearCalls()
 
                 let r = try runRootText(f, install: install)
 
                 XCTAssertEqual(r.status, 7, "\(label): " + r.output)
-                if c.named {
-                    XCTAssertTrue(r.output.contains("could not be read in full (ls: "), "\(label): " + r.output)
-                    XCTAssertTrue(r.output.contains(": user:root allow add_file"), "\(label): " + r.output)
-                    XCTAssertFalse(f.calls().contains { $0.hasPrefix("dsmemberutil") }, "\(label): \(f.calls())")
-                } else {
-                    XCTAssertTrue(r.output.contains("\(folder.path) has an access control list entry that allows more than reading ( 0: \(u) allow "), "\(label): " + r.output)
-                    XCTAssertTrue(f.calls().contains("dsmemberutil getuuid -u \(root)"), "\(label): \(f.calls())")
-                }
+                XCTAssertTrue(r.output.contains("\(folder.path) has an access control list entry that allows more than reading (\(u) allow 0x1 0x44)"), "\(label): " + r.output)
+                XCTAssertTrue(f.calls().contains("dsmemberutil getuuid -u \(root)"), "\(label): \(f.calls())")
                 XCTAssertEqual(try String(contentsOf: f.sudoers, encoding: .utf8), f.sudoersRule, label)
                 XCTAssertEqual(try f.inode(f.sudoers), inode, label)
                 XCTAssertEqual(try f.contents(of: folder), f.sudoersFolderAfterTransaction, "\(label): nothing staged")
-                XCTAssertEqual(TestACL.entries(folder), 1, label)
             }
         }
     }
 
     /// root_functions cuts the spaces that start each line of the text a
     /// root shell runs. bash reads that text back to the same functions, so
-    /// the cut changes nothing root runs, and the text is shorter.
+    /// the cut changes nothing root runs, r_acl_reader's program included
+    /// (its lines start with no space). The cut takes exactly the spaces
+    /// that start each line, more than a tenth of the shell functions'
+    /// text; the program has no indentation to cut. (The ls parser this
+    /// reader replaced was nested deeper, and its indentation made the cut
+    /// more than 15% before.)
     func testRootTextWithoutIndentationDefinesTheSameFunctions() throws {
         for (name, functions) in [
-            ("install.sh", "r_die r_stat r_file r_root r_acl r_dirs r_guard r_read r_pin r_recheck sudoers_for_others sudoers_rule_text r_replace"),
-            ("uninstall.sh", "r_die r_stat r_file r_root r_acl r_dirs r_guard r_read r_pin r_recheck sudoers_not_ours r_remove"),
+            ("install.sh", "r_die r_stat r_file r_root r_acl_reader r_acl r_dirs r_guard r_read r_pin r_recheck sudoers_for_others sudoers_rule_text r_replace"),
+            ("uninstall.sh", "r_die r_stat r_file r_root r_acl_reader r_acl r_dirs r_guard r_read r_pin r_recheck sudoers_not_ours r_remove"),
         ] {
             let text = try String(contentsOf: ScriptFixture.productionScripts.appendingPathComponent(name), encoding: .utf8)
             var definitions = try Self.shellFunction("root_functions", in: text, name)
@@ -9019,7 +9304,13 @@ final class RecoveryScriptTests: XCTestCase {
             cut="$(root_functions \(functions))"
             back="$(/bin/bash -c 'eval "$1"; declare -f \(functions)' bash "$cut")"
             [[ "$back" == "$original" ]] || { echo "differs"; exit 1; }
-            (( ${#cut} < ${#original} * 85 / 100 )) || { echo "not shorter: ${#cut} of ${#original}"; exit 1; }
+            shell="$(declare -f \(functions.replacingOccurrences(of: "r_acl_reader ", with: "")))"
+            shellCut="$(root_functions \(functions.replacingOccurrences(of: "r_acl_reader ", with: "")))"
+            [[ "$shell" != "$original" ]] || { echo "r_acl_reader is not among the functions"; exit 1; }
+            spaces=0
+            while IFS= read -r line; do lead="${line%%[! ]*}"; spaces=$(( spaces + ${#lead} )); done <<< "$original"
+            (( ${#cut} == ${#original} - spaces )) || { echo "the cut took ${#original} - ${#cut} bytes, not the $spaces spaces"; exit 1; }
+            (( ${#shell} - ${#shellCut} > ${#shell} / 10 )) || { echo "not shorter by a tenth: ${#shellCut} of ${#shell}"; exit 1; }
             echo "same ${#original} ${#cut}"
 
             """.write(to: probe, atomically: true, encoding: .utf8)
@@ -11549,34 +11840,33 @@ private final class ScriptFixture {
             exec \(real) "$@"
             """)
         }
-        // ls: the LS of install.sh and uninstall.sh copies whose root shell
-        // lists access control lists through a fake. Counts its calls in
-        // ls.count. On the call ls.rewrite names, it first writes the text
-        // of rule.replacement into the rule in place (the same file, logged
-        // "ls REWROTE-RULE"); on the call ls.replace names, it first puts
-        // that text at the rule's path by a rename (a new file, logged "ls
-        // REPLACED-RULE"); on the call ls.acl names, it first gives the
-        // rule's folder an entry "everyone allow add_file" (logged "ls
-        // ADDED-ACL"). Then, for an argument a line of ls.fail (a bash
-        // glob) matches, it exits 1. Otherwise it prints what /bin/ls
-        // prints, with a "+" after the mode of each file a line of ls.plus
-        // matches and a line "unexpected line" after each one a line of
-        // ls.extra matches. For a file a line of ls.gap matches, its entry
-        // 0 is numbered 1 (as when ls skips an entry it cannot read); for
-        // one ls.named matches, each entry names "user:root" instead of a
-        // UUID. When a line of ls.fail-after matches an argument, it prints
-        // all of that and then exits 1.
-        try writeFake("ls", """
-        n=$(( $(/bin/cat "\(r)/ls.count" 2>/dev/null || echo 0) + 1 ))
-        echo "$n" > "\(r)/ls.count"
-        if [[ "$(/bin/cat "\(r)/ls.rewrite" 2>/dev/null)" == "$n" ]]; then
-          /bin/cat "\(r)/rule.replacement" > "\(sudoers.path)" && printf 'ls REWROTE-RULE\\n' >> "\(calls)"
+        // perl: the PERL of install.sh and uninstall.sh copies whose root
+        // shell reads access control lists through a fake. It takes only the
+        // call root's r_acl makes (-e <reader> -- then pairs of what stat
+        // said and a name) and counts those calls in perl.count. On the call
+        // perl.rewrite names, it first writes the text of rule.replacement
+        // into the rule in place (the same file, logged "perl REWROTE-RULE");
+        // on the call perl.replace names, it first puts that text at the
+        // rule's path by a rename (a new file, logged "perl REPLACED-RULE").
+        // For a name a line of perl.fail (a bash glob) matches, it exits 1
+        // as an open that fails. Otherwise it runs /usr/bin/perl with the
+        // same arguments, the real reader, and passes on its answer with
+        // these changes: for each name a line "<glob>|<text>" of perl.entry
+        // matches, on every call or only on the call perl.entry.at names, a
+        // line "<pair> <text>" before the last line, as the reader prints an
+        // entry that allows a change (logged "perl ADDED-ENTRY"); without the
+        // last line when a line of perl.drop matches a name; with a line
+        // "unexpected line" after it for perl.extra; and for perl.fail-after,
+        // all of that and then exit 1.
+        try writeFake("perl", """
+        [[ "${1:-}" == -e && "${3:-}" == -- ]] || { echo "perl: not the call r_acl makes: $*" >&2; exit 2; }
+        n=$(( $(/bin/cat "\(r)/perl.count" 2>/dev/null || echo 0) + 1 ))
+        echo "$n" > "\(r)/perl.count"
+        if [[ "$(/bin/cat "\(r)/perl.rewrite" 2>/dev/null)" == "$n" ]]; then
+          /bin/cat "\(r)/rule.replacement" > "\(sudoers.path)" && printf 'perl REWROTE-RULE\\n' >> "\(calls)"
         fi
-        if [[ "$(/bin/cat "\(r)/ls.replace" 2>/dev/null)" == "$n" ]]; then
-          /bin/cp "\(r)/rule.replacement" "\(r)/rule.new" && /bin/mv -f "\(r)/rule.new" "\(sudoers.path)" && printf 'ls REPLACED-RULE\\n' >> "\(calls)"
-        fi
-        if [[ "$(/bin/cat "\(r)/ls.acl" 2>/dev/null)" == "$n" ]]; then
-          /bin/chmod +a "everyone allow add_file" "\(sudoers.deletingLastPathComponent().path)" && printf 'ls ADDED-ACL\\n' >> "\(calls)"
+        if [[ "$(/bin/cat "\(r)/perl.replace" 2>/dev/null)" == "$n" ]]; then
+          /bin/cp "\(r)/rule.replacement" "\(r)/rule.new" && /bin/mv -f "\(r)/rule.new" "\(sudoers.path)" && printf 'perl REPLACED-RULE\\n' >> "\(calls)"
         fi
         matches() { # globs name
           [[ -f "$1" ]] || return 1
@@ -11584,34 +11874,28 @@ private final class ScriptFixture {
           while IFS= read -r p || [[ -n "$p" ]]; do [[ -n "$p" && "$2" == $p ]] && return 0; done < "$1"
           return 1
         }
-        for a in "$@"; do
-          if matches "\(r)/ls.fail" "$a"; then echo "ls: $a: Permission denied" >&2; exit 1; fi
-        done
-        out="$(/bin/ls "$@")" || exit $?
-        cur="" after=""
-        while IFS= read -r line; do
-          extra=""
-          if [[ "$line" == " "* ]]; then
-            if [[ -n "$cur" ]] && matches "\(r)/ls.gap" "$cur" && [[ "$line" == " 0: "* ]]; then line=" 1: ${line# 0: }"; fi
-            if [[ -n "$cur" ]] && matches "\(r)/ls.named" "$cur"; then
-              line="$(printf '%s\\n' "$line" | /usr/bin/sed -E 's/^( [0-9]+: )[0-9A-F-]{36}/\\1user:root/')"
-            fi
-          else
-            cur=""
+        added=() drop="" extra="" after=""
+        k=0
+        for (( i = 5; i <= $#; i += 2 )); do
+          name="${!i}" k=$(( k + 1 ))
+          if matches "\(r)/perl.fail" "$name"; then echo "$name could not be opened: Permission denied" >&2; exit 1; fi
+          matches "\(r)/perl.drop" "$name" && drop=1
+          matches "\(r)/perl.extra" "$name" && extra=1
+          matches "\(r)/perl.fail-after" "$name" && after="$name"
+          if [[ -f "\(r)/perl.entry" ]] && { [[ ! -f "\(r)/perl.entry.at" ]] || [[ "$(/bin/cat "\(r)/perl.entry.at")" == "$n" ]]; }; then
+            while IFS='|' read -r glob text || [[ -n "$glob" ]]; do
+              [[ -n "$glob" && "$name" == $glob ]] && added+=("$k $text")
+            done < "\(r)/perl.entry"
           fi
-          for a in "$@"; do
-            [[ "$a" == -* || "$line" != *" $a" ]] && continue
-            cur="$a"
-            if matches "\(r)/ls.plus" "$a"; then
-              if [[ "${line:10:1}" == [@+] ]]; then line="${line:0:10}+${line:11}"; else line="${line:0:10}+${line:10}"; fi
-            fi
-            matches "\(r)/ls.extra" "$a" && extra="unexpected line"
-            matches "\(r)/ls.fail-after" "$a" && after="$a"
-          done
-          printf '%s\\n' "$line"
-          [[ -z "$extra" ]] || printf '%s\\n' "$extra"
-        done <<< "$out"
-        if [[ -n "$after" ]]; then echo "ls: $after: Input/output error" >&2; exit 1; fi
+        done
+        out="$(/usr/bin/perl "$@" 2>&1)" || { rc=$?; printf '%s\\n' "$out"; exit "$rc"; }
+        last="${out##*$'\\n'}"
+        [[ "$out" == *$'\\n'* ]] && printf '%s\\n' "${out%$'\\n'*}"
+        if (( ${#added[@]} > 0 )); then printf '%s\\n' "${added[@]}"; printf 'perl ADDED-ENTRY\\n' >> "\(calls)"; fi
+        [[ -n "$drop" ]] || printf '%s\\n' "$last"
+        [[ -z "$extra" ]] || printf 'unexpected line\\n'
+        if [[ -n "$after" ]]; then echo "perl: $after: Input/output error" >&2; exit 1; fi
+        exit 0
         """)
         // dsmemberutil: root's DSMEMBERUTIL in every copy of install.sh and
         // uninstall.sh, so no test asks the real directory service. Logged
