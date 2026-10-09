@@ -246,11 +246,18 @@ recovery; newly written journals use `frozenProcesses`.
   the release file is read under that lock, and before each chmod the
   receipt must still be the locked file with the same line. One the user
   cannot open (0600, no entry) is refused by every reader until it has
-  the entry, so nothing claims or writes it meanwhile; it gets the entry
-  first and is locked and checked with the release file after. The entry
-  goes on before the mode. The readers of earlier builds of this change
-  refuse a repaired receipt, and stay installed when the install stops
-  later or rolls back to the bundle it was replacing. A folder or receipt
+  the entry, but a root command that opened it earlier may still hold its
+  lock. So one `sudo -n` call runs a root shell (`REPAIR_SH`) that locks
+  it, checks under the lock that it is the file the user saw with no
+  entry and a receipt's line and that the release file is as the user
+  read it, and adds the entry with the lock held; it is then locked and
+  checked with the release file. A receipt the run just made needs no
+  such lock. The entry goes on before the mode. The readers of earlier
+  builds of this change refuse a repaired receipt, and stay installed when
+  the install stops later or rolls back to the bundle it was replacing;
+  they check mode and entry before the lock, so such a build may settle a
+  start of its own as one that may have written and restore sleep, over
+  another tool's 1 too. A folder or receipt
   already there in
   another form stops the install with nothing about it changed (no chown
   of something it did not make), the 45-byte receipt of earlier builds of
@@ -399,28 +406,40 @@ recovery; newly written journals use `frozenProcesses`.
   app, `backstop.sh` and `uninstall.sh` can recover unattended: ending a
   stuck or crashed session must never need a password.
 - `install.sh` also makes `/private/var/db/com.kgarg.insomnia` and the
-  user's receipt in it, root's, and the user's own `<uid>.released`
-  beside it, under the same sudo (section 1 and the receipt invariant in
-  section 8). `uninstall.sh` removes both, then the folder once it is
-  empty, after the same checks, only under the receipt's lock and only
-  while the release file shows the receipt's own nonce `free`. It stops
-  before removing anything at a folder or file that is not as install.sh
-  makes it or cannot be read, and at one of the two files without the
-  other. One lone release file is known: the one this folder's uninstall
-  left when it stopped between the two removals. Under the receipt's
-  lock, just before it removes the receipt, it writes
-  `.uninstall-receipt-removal` in the app support folder: the release
-  file's device, inode, change time to the nanosecond and line. A rerun
+  user's receipt in it, root's, and the user's own `<uid>.released` beside
+  it, under the same sudo (section 1 and the receipt invariant in section
+  8). `uninstall.sh` removes both, then the folder once it is empty, after
+  the same checks, only under the receipt's lock and only while the
+  release file shows the receipt's own nonce `free`. From before that
+  check to its own end it holds the standard folder's recovery lock, which
+  install.sh holds from before the rule to its end (lock order: a folder's
+  recovery lock, the standard folder's, the receipt's). It stops before
+  removing anything at a folder or file that is not as install.sh makes it
+  or cannot be read, and at one of the two files without the other. It
+  keeps the rule, the receipt, its release file and the bundle, removes
+  only its own folder's files and exits 1 while `pmset -g` shows
+  SleepDisabled other than 0, `pmset -g custom` shows Battery Power
+  lowpowermode other than 0, or either read fails: another folder may
+  still owe the restore the rule runs. One lone release file is known: the
+  one this folder's uninstall left when it stopped between the two
+  removals. Under the receipt's lock, after the checks and before the
+  LaunchAgent goes, it writes `.uninstall-receipt-removal` in the app
+  support folder: the release file's device, inode, change time to the
+  nanosecond and line, flushed with F_FULLFSYNC and read back. A rerun
   that finds the release file without the receipt removes it only while
-  that record names it exactly and its line says `free`; a start claims
-  and gives back only by writing to it, which changes the change time.
-  Any other lone file, a record of another file or an older state of
-  this one, stays refused. It asks for the password once with `sudo -v`, stops there when
-  `sudo -n -v` shows sudo kept no credential, and runs every root command
-  through `sudo -n` with its 30 s call limit under the recovery lock and
-  the receipt's lock. A call that fails, stops on SIGTERM at the limit or
-  is still running stops it there, and a sudo still running keeps both
-  locks until it exits. install.sh refuses, changing nothing, at a folder
+  that record (one line in a 0600 file of the user's, one link, at most
+  200 bytes) names it exactly and its line says `free`; a start claims and
+  gives back only by writing to it, which changes the change time. Any
+  other lone file, a record of another file or an older state of this one,
+  stays refused. It asks for the password once with `sudo -v` before any
+  lock, stops before removing anything when `sudo -n -v` under the locks
+  shows sudo kept no credential, and runs every root command through `sudo
+  -n` with its 30 s call limit under the recovery lock, the standard
+  folder's lock and the receipt's lock. A call that fails, stops on
+  SIGTERM at the limit or is still running stops it there, and a sudo
+  still running keeps the three locks until it exits. A stop after the
+  LaunchAgent was booted out loads it again from its plist, except while a
+  sudo is still running. install.sh refuses, changing nothing, at a folder
   or file that is not as it makes it, apart from the repair of an earlier
   receipt (section 1). No passwordless line covers the receipt.
 - `install.sh` never writes `disablesleep 1`, on any path. When
@@ -1204,7 +1223,20 @@ Invariants:
   which holds nothing back: the undo follows its decision, Starts stay
   refused, and every run tries again. A start that went through keeps its
   session; a relaunch resumes it (reconcile, step 2), and the menu says
-  the start is still recorded and why. A crash leaves one of those
+  the start is still recorded and why. The app's journal write that marks
+  the attempt `settled` also names the session the settlement leaves to
+  be resumed (`resumes`: `startedAt` and first end in whole seconds, `{}`
+  for none): `finishAttempt` names the start's session, `abandonStart`
+  the session it put back, and a settlement from the receipt the session
+  in memory or the session.json left after its removal. A settlement that
+  cannot read session.json publishes nothing and retries at the next
+  transaction (reconcile moves the file aside meanwhile); one whose bytes
+  are not a session names none. Beside a settled record reconcile resumes
+  only the named session (`isResumed`), under step 2's checks, and ends
+  any other. A record without `resumes` (an older build's, or one settled
+  by backstop.sh or uninstall.sh) resumes a session only with the sleep
+  entry journaled and its first end matching `deadline` (`isSession`).
+  The scripts check only the field's shape. A crash leaves one of those
   journals. The messages say whether session.json was removed and whether
   the decision was journaled. When the receipt showed "never wrote" and no
   earlier restore is owed, or decided nothing, no pmset runs for sleep
@@ -1362,12 +1394,11 @@ Backstop, independent of the app:
   list only with `-p`, which main does not pass either), and is
   published only when that copy holds the bytes the run read and
   state.json is still the file it copied. A publish that fails keeps the
-  journal as it was, and the next run undoes what it records again. Two
-  things still need room, as on main. Each log line is appended to
-  insomnia.log and an append that fails ends the run, so on a disk where
-  that file's last block is full the run can stop before the restore.
-  Each publish makes a new file, so where none can be made the restore
-  runs and the journal stays for the next run.
+  journal as it was, and the next run undoes what it records again. One
+  thing still needs room, as on main: each publish makes a new file, so
+  where none can be made the restore runs and the journal stays for the
+  next run. A log line that cannot be appended to insomnia.log goes to
+  standard error, and the run goes on.
 - The agent runs only the `backstop.sh` sealed in the signed bundle. Its
   command line verifies the bundle against the code requirement pinned in the
   plist (`codesign --verify --strict -R=...`; for an ad-hoc build, that

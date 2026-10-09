@@ -1,20 +1,25 @@
 #!/bin/bash
-# Reverse install.sh. Quits the app, takes the recovery lock, runs the current
+# Reverse install.sh. Quits the app, asks for the password (sudo -v) before
+# it takes any lock, takes the recovery lock, runs the current
 # backstop with --force under that same lock (from a source checkout: the
 # checkout's copy when the installed app declares the interface version it
 # speaks, else the app's own: the one sealed in the bundle, else the writable
 # copy older installs left in Application Support; from anywhere else, such
 # as a release zip: the sealed copy only), verifies for itself that the
-# journal is clean, checks under the receipt's lock that no start of
+# journal is clean, takes the standard folder's recovery lock (the one
+# install.sh holds), checks under the receipt's lock that no start of
 # another Insomnia folder of this user claims this user's receipt in
-# /private/var/db/com.kgarg.insomnia, and only then, keeping that lock,
+# /private/var/db/com.kgarg.insomnia, and only then, keeping those locks,
 # removes the LaunchAgent, the sudoers rule, the receipt and its release
 # file (the folder too, once empty), the app bundle (backstop.sh included),
 # and the journal. A claim, a locked receipt, one it cannot read or that
 # fails its checks, and a receipt or release file without the other stop it
-# with nothing removed. Every command it runs as root goes through `sudo -n`
-# with the same time limit as its other calls, after one `sudo -v` (see
-# as_root). Keeps config.json
+# with nothing removed. While sleep is off or Low Power Mode is on for
+# battery, or either cannot be read, another folder may still owe a restore
+# the rule makes: the rule, the receipt and the bundle then stay, only this
+# folder's LaunchAgent and journal go, and the run ends with status 1.
+# Every command it runs as root goes through `sudo -n` with the same time
+# limit as its other calls (see as_root). Keeps config.json
 # and the logs unless --purge. Everything after the quit happens while this
 # process holds APP_SUPPORT/.recovery.lock, so neither a queued periodic
 # backstop nor a relaunched app can republish the journal while it is being
@@ -139,6 +144,13 @@ QUIT_WAIT_SECONDS=10
 CALL_TIMEOUT_SECONDS=30
 APP="$HOME/Applications/Insomnia.app"
 SUDOERS=/etc/sudoers.d/insomnia
+# The standard Insomnia folder, the only one install.sh installs from. Its
+# recovery lock guards the files every folder of this user shares (see
+# lock_standard). Tests patch this line in a private copy.
+STANDARD_HOME="$HOME/Library/Application Support/Insomnia"
+# Read without sudo, before step 5, to tell whether a restore the rule runs
+# may still be owed (see read_owed_power).
+PMSET=/usr/bin/pmset
 # The --resume-frozen interface version this checkout's backstop.sh speaks
 # (see step 3).
 RESUME_FROZEN_VERSION=1
@@ -286,37 +298,45 @@ case "$APP_SUPPORT" in /*) ;; *) echo "refusing: app support path is not absolut
 # run: session.json, state.json, config.json and the app's Info.plist are
 # never read in place. The same as backstop.sh's (a test keeps the two in
 # step). perl, run with an empty environment, opens the file without
-# blocking, refuses anything but a regular file (open(2) on a FIFO with no
-# writer would block under the lock, and a device is never read), reads it
-# to the end, checks that its device, inode, size, modification and change
-# times (to the second) did not move during the read and that the path
-# still names it, and writes the bytes to a new mode-600 file. SIGALRM ends
-# it after READ_TIMEOUT_SECONDS; a read the kernel cannot interrupt (a
-# stalled disk) holds it longer. Returns 0 with copy_path and copy_id
-# (device, inode, size, mtime and ctime, as stat -f '%d:%i:%z:%m:%c' prints
-# them); 3 when the file could not be opened or read (permissions, I/O); 4
-# when it is not a regular file; 2 for anything else: it changed while it
-# was read, the time ran out, or the copy could not be written. Its reason
-# is in copy_why.
+# blocking and without following a symbolic link, refuses anything but a
+# regular file (open(2) on a FIFO with no writer would block under the
+# lock, and a device is never read) and one larger than 8 MiB, reads it to
+# the end, checks that it holds as many bytes as its size, that its
+# identity (file_id: device, inode, size, and modification and change times
+# to a fraction of a microsecond) did not move during the read and that the
+# path still names it, not through a link, and writes the bytes to a new
+# mode-600 file. SIGALRM ends it after READ_TIMEOUT_SECONDS; a read the
+# kernel cannot interrupt (a stalled disk), or a perl stopped by SIGSTOP,
+# holds it longer. Returns 0 with copy_path and copy_id (that identity); 3
+# when the file could not be opened or read (permissions, I/O); 4 when it is
+# a symbolic link or not a regular file; 2 for anything else: it is larger
+# than 8 MiB, it changed while it was read, the time ran out, or the copy
+# could not be written. Its reason is in copy_why.
 # backstop.sh keeps a copy it cannot write in memory (COPY_IN_MEMORY=1).
 # This script sets COPY_IN_MEMORY to 0 and always has its READS folder, so
 # here such a copy is 2 and the uninstall stops before removing anything.
 # shellcheck disable=SC2016  # the $ below are perl's, not this shell's
-COPY_PERL='use strict; use Fcntl;
+COPY_PERL='use strict; use Fcntl qw(:DEFAULT :mode); use Time::HiRes ();
 $SIG{ALRM} = "DEFAULT"; alarm shift @ARGV;
 my ($src, $dst) = @ARGV;
+my $max = 8 * 1024 * 1024;
 sub fail { print "$_[1]\n"; exit $_[0] }
-sysopen(my $in, $src, O_RDONLY | O_NONBLOCK) or fail 3, "$!";
-my @a = stat($in) or fail 3, "$!";
--f _ or fail 4, "not a regular file";
+sub id { join(":", @_[0,1,7], map { sprintf "%.9f", $_ } @_[9,10]) }
+sysopen(my $in, $src, O_RDONLY | O_NONBLOCK | O_NOFOLLOW)
+  or fail $!{ELOOP} ? (4, "a symbolic link, which is not followed") : (3, "$!");
+my @a = Time::HiRes::stat($in) or fail 3, "$!";
+S_ISREG($a[2]) or fail 4, "not a regular file";
+$a[7] <= $max or fail 2, "it is larger than 8 MiB";
 my ($data, $n) = ("", 0);
-1 while ($n = sysread($in, $data, 65536, length $data));
+while ($n = sysread($in, $data, 65536, length $data)) {
+  length($data) <= $max or fail 2, "it grew past 8 MiB while it was read";
+}
 defined $n or fail 3, "$!";
-my @b = stat($in) or fail 3, "$!";
-my @c = stat($src);
-"@a[0,1,7,9,10]" eq "@b[0,1,7,9,10]" && @c && "@b[0,1]" eq "@c[0,1]" && length($data) == $b[7]
+my @b = Time::HiRes::stat($in) or fail 3, "$!";
+my @c = Time::HiRes::lstat($src);
+id(@a) eq id(@b) && @c && id(@b) eq id(@c) && length($data) == $b[7]
   or fail 2, "it changed while it was read";
-my $id = join(":", @b[0,1,7,9,10]);
+my $id = id(@b);
 if ($dst eq "-") {
   index($data, "\0") < 0 or fail 2, "it holds a NUL byte, which a copy kept in memory cannot hold";
   print "$id\n$data." or exit 2;
@@ -360,7 +380,7 @@ copy_private() { # live-file name
       fi
     fi
   fi
-  if (( rc == 0 )) && [[ "$out" =~ ^[0-9]+:[0-9]+:[0-9]+:-?[0-9]+:-?[0-9]+$ ]]; then
+  if (( rc == 0 )) && [[ "$out" =~ ^[0-9]+:[0-9]+:[0-9]+:-?[0-9]+\.[0-9]{9}:-?[0-9]+\.[0-9]{9}$ ]]; then
     copy_id="$out"
     if (( mem )); then printf -v "mem_${copy_path#mem:}" '%s' "$data"; fi
     return 0
@@ -374,6 +394,18 @@ copy_private() { # live-file name
   esac
   copy_why="${copy_why:-the copy exited $rc}"
   return "$rc"
+}
+# The identity copy_private gives a file (copy_id), of the file at $1 now,
+# not following a link: its device, inode and size, and its modification
+# and change times with the fraction perl's Time::HiRes gives them (the
+# nanoseconds the system keeps, rounded to a double, a fraction of a
+# microsecond). Prints nothing when there is no such file.
+# shellcheck disable=SC2016  # the $ below are perl's, not this shell's
+ID_PERL='use strict; use Time::HiRes ();
+my @s = Time::HiRes::lstat($ARGV[0]) or exit 1;
+print join(":", @s[0,1,7], map { sprintf "%.9f", $_ } @s[9,10]), "\n";'
+file_id() { # path
+  "$ENV" -i "$PERL" -e "$ID_PERL" "$1" 2>/dev/null
 }
 # Runs plutil with these arguments on the file given last, or, for a copy
 # kept in memory (mem:<name>, see copy_private), on those bytes through its
@@ -824,6 +856,15 @@ journal_shape_problems() { # file
       [[ -z "$t" || "$t" == string || "$t" == "(any)" ]] || echo "sleepOffAttempt.marker is a $t, not a string"
       ty "$f" sleepOffAttempt.settled || return 2
       [[ -z "$t" || "$t" == bool || "$t" == "(any)" ]] || echo "sleepOffAttempt.settled is a $t, not a bool"
+      ty "$f" sleepOffAttempt.resumes || return 2
+      if [[ "$t" == dictionary ]]; then
+        ty "$f" sleepOffAttempt.resumes.startedAt || return 2
+        [[ -z "$t" || "$t" == integer || "$t" == "(any)" ]] || echo "sleepOffAttempt.resumes.startedAt is a $t, not an integer"
+        ty "$f" sleepOffAttempt.resumes.firstEnd || return 2
+        [[ -z "$t" || "$t" == integer || "$t" == "(any)" ]] || echo "sleepOffAttempt.resumes.firstEnd is a $t, not an integer"
+      elif [[ -n "$t" && "$t" != "(any)" ]]; then
+        echo "sleepOffAttempt.resumes is a $t, not an object"
+      fi
     fi
   fi
   return 0
@@ -908,7 +949,7 @@ epoch_at() { # file keypath
 # does not act on its endsAt either. Returns 2, with read_why, when a read
 # of the file failed: its shape is then unknown, not malformed.
 session_shape_problems() { # file
-  local f="$1" key t i c json v
+  local f="$1" key t i c v
   # plutil also reads XML and binary property lists, which the app's
   # JSONDecoder refuses, so the file itself must start with "{" too. head
   # ends after one byte, and tr may then end on SIGPIPE (141); any other
@@ -924,10 +965,19 @@ session_shape_problems() { # file
     return 2
   fi
   c="${c%.*}"; c="${c%.*}"
-  if [[ "$c" == "{" ]] && json="$(plutil_on -convert json -o - "$f" 2>/dev/null)"; then
-    c="${json:0:1}"
-  else
-    c=""
+  # Then plutil's conversion of the whole file. Only its own verdict on the
+  # bytes, exit 1 with "Property List error", makes the file malformed; any
+  # other failure is a read that failed, and the shape is unknown.
+  if [[ "$c" == "{" ]]; then
+    plutil_run -convert json -o - "$f"
+    if [[ "$plutil_rc" == 0 ]]; then
+      c="${plutil_out:0:1}"
+    elif [[ "$plutil_rc" == 1 && "$plutil_err" == *": Property List error: "* ]]; then
+      c=""
+    else
+      read_why="plutil -convert json exited ${plutil_rc:-?} (${plutil_err:-no message})"
+      return 2
+    fi
   fi
   if [[ "$c" != "{" ]]; then
     echo "session.json is not a JSON object"
@@ -1354,6 +1404,21 @@ if app_running; then
   fi
 fi
 
+# The password, asked before any lock is taken. sudo -v waits for it as long
+# as the person at the keyboard takes, and nothing here waits on a prompt
+# while it holds the recovery lock, the standard folder's lock or the
+# receipt's lock, which the app, an install, another Insomnia folder of this
+# user and the root command behind a password dialog may need. It runs
+# nothing as root. Step 5 checks under the locks that sudo still keeps the
+# credential (as_root -v) and stops before removing anything when it does
+# not. The cost: the password is asked even when a check below then stops
+# the uninstall.
+step "Asking for your password, for $SUDOERS and the receipt"
+if ! "$SUDO" -v; then
+  echo "Uninstall stopped BEFORE removing anything: sudo -v did not authenticate. Rerun this script." >&2
+  exit 1
+fi
+
 # 2. Take the recovery lock and keep it to the end ---------------------------
 step "Taking the recovery lock"
 "$MKDIR" -p "$APP_SUPPORT"
@@ -1690,11 +1755,11 @@ settle_stop() { # why what-was-done
 }
 
 # state.json's private copy for the settlement (settle_copy) and the
-# identity of the file it was made from (settle_id), as stat -f
-# '%d:%i:%z:%m:%c' prints it: every read and edit of the settlement starts
-# from that copy, and an edit is published only while state.json is still
-# that file (to the second: a change within the second that keeps the
-# size, the inode and the times is not seen).
+# identity of the file it was made from (settle_id, see file_id): every
+# read and edit of the settlement starts from that copy, and an edit is
+# published only while state.json is still that file, and holds the same
+# bytes (same_as_read). A change that keeps the size, the inode and both
+# times to a fraction of a microsecond is seen only by that byte check.
 settle_copy=""
 settle_id=""
 copy_settle() {
@@ -1706,7 +1771,7 @@ copy_settle() {
 }
 settle_unchanged() {
   local now
-  now="$("$STAT" -L -f '%d:%i:%z:%m:%c' "$STATE" 2>/dev/null)" || return 1
+  now="$(file_id "$STATE")" || return 1
   [[ -n "$settle_id" && "$now" == "$settle_id" ]]
 }
 # A read of settle_copy the settlement cannot do without: read_at, raw,
@@ -1845,7 +1910,7 @@ settle_attempt() {
     fi
   fi
   if (( matched )); then
-    [[ "$("$STAT" -L -f '%d:%i:%z:%m:%c' "$SESSION" 2>/dev/null)" == "$session_id" ]] \
+    [[ "$(file_id "$SESSION")" == "$session_id" ]] \
       || settle_stop "$SESSION of that start changed after it was read"
     "$RM" -f "$SESSION" || settle_stop "$SESSION of that start could not be removed"
     removed="$SESSION was removed"
@@ -2016,23 +2081,47 @@ list_unrecorded_app_nap
 #     only by writing to it, and only through the receipt, which is gone.
 # Only a folder with neither file of this user in it, or no folder at all,
 # shows nothing to settle here.
-# The lock order is the one every reader keeps: the recovery lock (fd 9)
-# first, then the receipt's. Another folder's app or backstop holds its
-# own recovery lock, never this one, and waits for the receipt's for a
-# limited time, so the two cannot wait on each other.
+# The receipt's lock covers the receipt it was taken on, not a new one made
+# at its path after that one is removed, and none at all while there is no
+# receipt. install.sh makes the receipt and writes the release file, the
+# rule and the bundle, and it runs only in the standard folder, under that
+# folder's recovery lock, from before the rule until it ends. So before the
+# check, this run also takes the standard folder's recovery lock
+# (lock_standard, fd 6) and keeps it to the end: no install can make a
+# receipt, write the release file, the rule or the bundle, or swap the
+# bundle while this run checks and removes them, in any of the cases above,
+# a finishing rerun included. In the standard folder that lock is fd 9.
+# What it does not cover: the rule is shared by every account on this Mac,
+# and another account's install or uninstall holds its own standard lock.
+# The lock order every holder keeps: a folder's recovery lock (fd 9), then
+# the standard folder's (fd 6), then the receipt's (fd 7). install.sh and
+# an app or backstop of the standard folder take the standard lock as
+# their recovery lock and the receipt's after it; another folder's app or
+# backstop never takes the standard lock; and the root command behind a
+# password dialog holds only the receipt's. So no two of them can wait on
+# each other.
+# A free release file shows that no start claims the receipt. It does not
+# show that every start of another folder was restored: a start gives its
+# claim back once it has started, and the restore comes at its end. Every
+# restore the rule makes is `pmset -a disablesleep 0` or `pmset -b
+# lowpowermode 0`, so while sleep is off or Low Power Mode is on for
+# battery (read_owed_power), or either cannot be read, another folder may
+# still owe one. Then this run keeps the rule, the receipt, its release
+# file and the bundle, removes only this folder's own files, and says so.
 RECEIPT="$RECEIPTS/$UID_NUM"
 RELEASED="$RECEIPT.released"
-# This folder's record that its uninstall began removing the receipt and
-# its release file: the release file's identity and line as release_state
-# prints them, written under the receipt's lock, after the last check and
-# just before the receipt is removed. A rerun that finds the release file
-# without the receipt finishes the removal only when the record names that
-# file as it is now: the same device and inode, the same change time to
-# the nanosecond (every write to the file changes it, and a start claims
-# and gives back by writing), and the same line, free. Anything else, a
-# record of another file, an older state of this one, a claim, or no
-# record at all, stays refused as unknown. Another folder's record is in
-# that folder and is never read here.
+# This folder's record that its uninstall is removing the receipt and its
+# release file: the release file's identity and line as release_state prints
+# them, written under the receipt's lock and flushed to the disk after the
+# checks and before the LaunchAgent goes, so a record that cannot be written
+# stops the uninstall with nothing removed. A rerun that finds the release
+# file without the receipt finishes the removal only when the record names
+# that file as it is now: the same device and inode, the same change time to
+# the nanosecond (every write to the file changes it, and a start claims and
+# gives back by writing), and the same line, free. Anything else, a record
+# of another file, an older state of this one, a claim, or no record at all,
+# stays refused as unknown. Another folder's record is in that folder and is
+# never read here.
 PROGRESS="$APP_SUPPORT/.uninstall-receipt-removal"
 # Sets release_now to "<device>:<inode>:<change time> <nonce> <word>" when
 # the release file is a regular file with one link, this user's own, mode
@@ -2056,33 +2145,76 @@ release_state() {
   fi
   release_now="${before%% *} $release_nonce $release_word"
 }
-# Sets progress_seen to the first line of PROGRESS, read from a private
-# copy, when it is a regular file of this user's. Returns 1 when there is
-# none or it cannot be read.
+# Sets progress_seen to PROGRESS's record when the whole file is one, as
+# record_removal writes it: a regular file, not a link, with one link, this
+# user's own, mode 600 and at most 200 bytes, copied whole (copy_private)
+# from the file stat named, and holding one line and nothing else: ended by
+# a newline, with no other newline and no byte the shell would drop, that
+# reads "<device>:<inode>:<change time> <nonce> free". Returns 1 otherwise:
+# no file, a read that failed, a line without its newline, a second line,
+# anything else in it. A rerun then refuses the lone release file.
 progress_line() {
+  local meta data id size
   progress_seen=""
   [[ -f "$PROGRESS" && ! -L "$PROGRESS" ]] || return 1
-  [[ "$("$STAT" -f %u "$PROGRESS" 2>/dev/null)" == "$UID_NUM" ]] || return 1
+  meta="$("$STAT" -f '%d:%i %l %u %Lp %z %HT' "$PROGRESS" 2>/dev/null)" || return 1
+  [[ "$meta" =~ ^([0-9]+:[0-9]+)\ 1\ ([0-9]+)\ 600\ ([0-9]+)\ Regular\ File$ ]] || return 1
+  id="${BASH_REMATCH[1]}"; size="${BASH_REMATCH[3]}"
+  [[ "${BASH_REMATCH[2]}" == "$UID_NUM" ]] && (( size <= 200 )) || return 1
   copy_private "$PROGRESS" read.progress || return 1
-  { IFS= read -r progress_seen < "$copy_path"; } 2>/dev/null || [[ -n "$progress_seen" ]]
+  [[ "$copy_id" == "$id:$size:"* ]] || return 1
+  data="$("$CAT" "$copy_path" 2>/dev/null; echo ".$?")"
+  [[ "${data##*.}" == 0 ]] || return 1
+  data="${data%.*}"
+  [[ "$data" == *$'\n' ]] || return 1
+  data="${data%$'\n'}"
+  [[ "$data" != *$'\n'* && "$data" =~ ^[0-9]+:[0-9]+:[0-9]+\.[0-9]+\ [0-9A-F-]{36}\ free$ ]] || return 1
+  # The line is ASCII, so its length is its bytes: a NUL the shell dropped
+  # leaves it short of the file.
+  (( ${#data} + 1 == size )) || return 1
+  progress_seen="$data"
 }
-# Writes PROGRESS for the release file as it is now (release_state), by a
-# rename, and reads it back. Returns 1, with progress_why, when it cannot.
-# No fsync(2) in the shell: a crash right after may lose the record, and a
-# rerun then refuses the lone release file, the safe side.
+# Writes $2 to the file $1 for good: perl, run with an empty environment,
+# makes a new file beside it (O_EXCL, O_NOFOLLOW, mode 600), writes the
+# bytes whole, flushes them to the disk (F_FULLFSYNC), renames the file
+# over $1 and then flushes the folder the same way. Exits 1 with the step
+# that failed, and leaves no new file behind, when one does. A flush shows
+# that the kernel handed the bytes to the disk; it cannot show that a
+# drive's own cache kept them through a power cut.
+# shellcheck disable=SC2016  # the $ below are perl's, not this shell's
+DURABLE_PERL='use strict; use Fcntl;
+my ($path, $bytes) = @ARGV;
+sub fail { print "$_[0]: $!\n"; exit 1 }
+my ($dir) = $path =~ m{\A(.*)/[^/]+\z}s or fail "no folder in $path";
+my $tmp = "$path.new.$$";
+sysopen(my $fh, $tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600) or fail "open $tmp";
+my $ok = 1;
+for (my $off = 0; $ok && $off < length $bytes; ) {
+  my $w = syswrite($fh, $bytes, length($bytes) - $off, $off);
+  if (defined $w && $w > 0) { $off += $w } else { $ok = 0 }
+}
+$ok = $ok && fcntl($fh, 51, 0);
+$ok = close($fh) && $ok;
+if (!$ok || !rename($tmp, $path)) { my $e = $!; unlink $tmp; $! = $e; fail "write $tmp"; }
+sysopen(my $dh, $dir, O_RDONLY) or fail "open $dir";
+fcntl($dh, 51, 0) or fail "flush $dir";
+exit 0;'
+# Writes PROGRESS for the release file as it is now (release_state) with
+# DURABLE_PERL and reads it back whole (progress_line). Returns 1, with
+# progress_why, when it cannot; the caller then stops before removing
+# anything.
 record_removal() {
-  local tmp
+  local out
   progress_why=""
   if ! release_state; then progress_why="$release_why"; return 1; fi
-  if tmp="$("$MKTEMP" "$PROGRESS.XXXXXX" 2>/dev/null)" \
-     && printf '%s\n' "$release_now" 2>/dev/null > "$tmp" \
-     && "$MV" -f "$tmp" "$PROGRESS" 2>/dev/null \
-     && progress_line && [[ "$progress_seen" == "$release_now" ]]; then
-    return 0
+  if ! out="$("$ENV" -i "$PERL" -e "$DURABLE_PERL" "$PROGRESS" "$release_now"$'\n' 2>/dev/null)"; then
+    progress_why="$PROGRESS could not be written and flushed to the disk (${out:-perl failed})"
+    return 1
   fi
-  [[ -z "${tmp:-}" ]] || "$RM" -f "$tmp" 2>/dev/null || true
-  progress_why="$PROGRESS could not be written"
-  return 1
+  if ! progress_line || [[ "$progress_seen" != "$release_now" ]]; then
+    progress_why="$PROGRESS was written but does not read back as the record"
+    return 1
+  fi
 }
 # Sets shared_why to why another Insomnia folder of this user may still
 # need what step 5 removes, or to nothing. With a receipt that passes the
@@ -2188,7 +2320,139 @@ shared_unchanged() {
     return 1
   fi
 }
+# Takes the standard folder's recovery lock on fd 6 (see the lock order
+# above) and keeps it to the end. bounded() passes it to every supervisor,
+# so a command left running keeps it too, after this run is gone. The
+# folder and the lock file are made when they are missing, as install.sh
+# makes them: whichever opens the path first creates the file, and both
+# then lock that one file. When fd 9 is that same file (this is the
+# standard folder, or this folder's lock is a link to its lock), fd 6 is
+# closed: a second lock of one file through another descriptor would wait
+# on this run's own. Sets standard_lock, or returns 1 with standard_why and
+# standard_rc (75 when it stayed locked).
+STANDARD_LOCK="$STANDARD_HOME/.recovery.lock"
+lock_standard() {
+  local own ours rc=0
+  standard_lock=""; standard_why=""; standard_rc=1
+  if ! "$MKDIR" -p "$STANDARD_HOME" 2>/dev/null || ! { exec 6<>"$STANDARD_LOCK"; } 2>/dev/null; then
+    standard_why="$STANDARD_LOCK could not be opened"
+    return 1
+  fi
+  ours="$("$STAT" -f '%d:%i' <&6 2>/dev/null)" || ours=""
+  own="$("$STAT" -f '%d:%i' <&9 2>/dev/null)" || own=""
+  if [[ -z "$ours" || -z "$own" ]]; then
+    exec 6<&-
+    standard_why="$STANDARD_LOCK or $LOCK could not be identified"
+    return 1
+  fi
+  if [[ "$ours" == "$own" ]]; then
+    exec 6<&-
+    standard_lock="fd 9"
+    return 0
+  fi
+  "$LOCKF" -t "$LOCK_TIMEOUT_SECONDS" 6 2>/dev/null || rc=$?
+  if (( rc != 0 )); then
+    exec 6<&-
+    if (( rc == 75 )); then
+      standard_rc=75
+      standard_why="$STANDARD_LOCK stayed locked for ${LOCK_TIMEOUT_SECONDS} s: install.sh, the uninstall of another Insomnia folder of this user, or the app or backstop of the standard folder is running"
+    else
+      standard_why="$STANDARD_LOCK could not be locked (lockf exit $rc)"
+    fi
+    return 1
+  fi
+  # install.sh opens the lock by its path, so the path must still name the
+  # file locked here.
+  if [[ "$("$STAT" -L -f '%d:%i' "$STANDARD_LOCK" 2>/dev/null)" != "$ours" ]]; then
+    exec 6<&-
+    standard_why="$STANDARD_LOCK was replaced while it was locked"
+    return 1
+  fi
+  standard_lock="$ours"
+}
+# Sets pmset_found to 1 and pmset_value to the second field of the first
+# line of $1 (pmset's output) whose first field is $3, looking only in the
+# part headed by the line $2 when $2 is not empty, as the app's parsers do
+# (SleepGuard.swift). pmset_found is 0 when there is no such line. No here
+# string: bash would write it to a temporary file first.
+pmset_field() { # output section key
+  local rest="$1"$'\n' line key in=1
+  pmset_found=0; pmset_value=""
+  [[ -z "$2" ]] || in=0
+  while [[ -n "$rest" ]]; do
+    line="${rest%%$'\n'*}"; rest="${rest#*$'\n'}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    if [[ -n "$2" && "$line" == *: ]]; then
+      if [[ "$line" == "$2" ]]; then in=1; else in=0; fi
+      continue
+    fi
+    (( in )) || continue
+    key="${line%%[[:blank:]]*}"
+    [[ "$key" == "$3" && "$line" != "$key" ]] || continue
+    line="${line#"$key"}"
+    line="${line#"${line%%[![:blank:]]*}"}"
+    pmset_found=1; pmset_value="${line%%[[:blank:]]*}"
+    return 0
+  done
+}
+# Why a pmset read gave nothing to go on, from its bounded() status.
+pmset_failed() { # what status
+  if (( $2 == 124 )); then
+    echo "'$1' did not answer within ${CALL_TIMEOUT_SECONDS}s"
+  else
+    echo "'$1' exited $2"
+  fi
+}
+# Whether another Insomnia folder of this user may still owe a restore the
+# rule runs (see above). Reads, without sudo and within the call limit,
+# SleepDisabled in `pmset -g` and lowpowermode in the Battery Power part of
+# `pmset -g custom`, the settings the app reads. Sets owed_why to what was
+# found, or to nothing when sleep is not off and Low Power Mode is off for
+# battery, or this Mac has no battery setting for it. A value other than 0
+# or 1, or a read that fails, is unknown and counts as owed. This folder's
+# journal is clean (step 4), so neither is this folder's to restore. It may
+# be the user's own setting or another tool's: this cannot tell them apart.
+read_owed_power() {
+  local rc=0
+  owed_why=""
+  bounded "$PMSET" -g || rc=$?
+  if (( rc != 0 )); then
+    owed_why="$(pmset_failed "pmset -g" "$rc"), so whether sleep is off is unknown"
+    return 0
+  fi
+  pmset_field "$BOUNDED_OUTPUT" "" SleepDisabled
+  if (( pmset_found )) && [[ "$pmset_value" == 1 ]]; then
+    owed_why="sleep is off (pmset -g reports SleepDisabled 1)"
+    return 0
+  elif (( pmset_found )) && [[ "$pmset_value" != 0 ]]; then
+    owed_why="pmset -g reports SleepDisabled ${pmset_value:-with no value}, neither 0 nor 1, so whether sleep is off is unknown"
+    return 0
+  fi
+  rc=0
+  bounded "$PMSET" -g custom || rc=$?
+  if (( rc != 0 )); then
+    owed_why="$(pmset_failed "pmset -g custom" "$rc"), so whether Low Power Mode is on for battery is unknown"
+    return 0
+  fi
+  pmset_field "$BOUNDED_OUTPUT" "Battery Power:" lowpowermode
+  if (( pmset_found )) && [[ "$pmset_value" == 1 ]]; then
+    owed_why="Low Power Mode is on for battery (pmset -g custom reports lowpowermode 1 under Battery Power)"
+  elif (( pmset_found )) && [[ "$pmset_value" != 0 ]]; then
+    owed_why="pmset -g custom reports lowpowermode ${pmset_value:-with no value} under Battery Power, neither 0 nor 1, so whether Low Power Mode is on is unknown"
+  fi
+}
+
 step "Checking the receipt every Insomnia folder of this user shares"
+if ! lock_standard; then
+  echo "Uninstall stopped BEFORE removing anything: $standard_why. Rerun this script once it is done." >&2
+  exit "$standard_rc"
+fi
+if [[ "$standard_lock" == "fd 9" ]]; then
+  echo "this folder's recovery lock is the one install.sh takes"
+else
+  echo "took $STANDARD_LOCK, the lock install.sh takes, until the end"
+fi
 check_shared
 if [[ -n "$shared_why" ]]; then
   "$CAT" >&2 <<MSG
@@ -2211,64 +2475,113 @@ case "$shared_seen" in
   finishing*) echo "$RECEIPT is gone and $RELEASED is as this folder's uninstall left it when it began removing them ($PROGRESS); step 5 finishes the removal" ;;
   *) echo "no start claims $RECEIPT; it stays locked until the rule, the receipt and the bundle are gone" ;;
 esac
+# keep_shared=1: the rule, the receipt, its release file and the bundle
+# stay, and step 5 removes only this folder's own files.
+keep_shared=0
+read_owed_power
+if [[ -n "$owed_why" ]]; then
+  keep_shared=1
+  unlock_receipt
+  echo "kept for another Insomnia folder of this user: $owed_why, so a restore the sudoers rule runs may still be owed; $SUDOERS, the receipt and $APP stay"
+else
+  echo "sleep is not off and Low Power Mode is not on for battery: no restore the sudoers rule runs is owed"
+fi
 
 # 5. Remove, still under the lock -------------------------------------------
 # Every command step 5 runs as root goes through as_root: `sudo -n`, run by
 # bounded() with the same time limit as every other call here, so sudo
 # never prompts while this run holds the locks and never runs unsupervised.
-# `sudo -v` asks for the password first, before anything is removed. It
-# runs nothing as root; the calls after it use the credential it cached.
+# `sudo -v` asked for the password before the locks were taken; the calls
+# here use the credential it cached.
 # A call that fails, stops on SIGTERM at its limit, or is still running
 # after it stops the uninstall there: what it did is not known, so nothing
 # after it is removed. A sudo still running is never killed from here (no
 # pid is kept for it: by the time anyone acted on one, it could name
-# another process). Its supervisor holds this run's copies of fd 7 and
-# fd 9, so the receipt's lock and the recovery lock stay held until it has
-# exited and been reaped, after this run is gone.
+# another process). Its supervisor holds this run's copies of fd 6, fd 7
+# and fd 9, so the standard lock, the receipt's lock and the recovery lock
+# stay held until it has exited and been reaped, after this run is gone.
+root_rc=0
 as_root() { # command args...
   local rc=0
   root_why=""
   bounded "$SUDO" -n "$@" || rc=$?
+  root_rc="$rc"
   case "$rc" in
     0) return 0 ;;
     124) root_why="'sudo -n $*' did not answer within ${CALL_TIMEOUT_SECONDS}s and stopped on SIGTERM, so what it did is unknown" ;;
-    125) root_why="'sudo -n $*' did not answer within ${CALL_TIMEOUT_SECONDS}s and is still running; it is not stopped from here, and the recovery lock and the receipt's lock stay held until it ends" ;;
+    125) root_why="'sudo -n $*' did not answer within ${CALL_TIMEOUT_SECONDS}s and is still running; it is not stopped from here, and the recovery lock, the standard folder's lock and the receipt's lock stay held until it ends" ;;
     *) root_why="'sudo -n $*' exited $rc${BOUNDED_OUTPUT:+ (${BOUNDED_OUTPUT%%$'\n'*})}" ;;
   esac
   return "$rc"
+}
+# After the LaunchAgent was booted out, a stop loads it again from its
+# plist, which stays in place until the shared files are gone, so this
+# folder's recovery runs as it did before the uninstall. Not while a
+# command run as root may still be running (125): nothing new starts
+# beside it. The agent's backstop needs the recovery lock, which that
+# command's supervisor holds, so it could not run before the command ends
+# anyway.
+agent_out=0
+restore_agent() {
+  local rc=0
+  (( agent_out )) || return 0
+  if (( root_rc == 125 )); then
+    echo "The LaunchAgent was not loaded again while that command is still running. A rerun loads nothing either; load it yourself once it has ended: launchctl bootstrap gui/$UID_NUM $PLIST" >&2
+    return 0
+  fi
+  if [[ ! -f "$PLIST" ]]; then
+    echo "The LaunchAgent could not be loaded again: $PLIST is gone." >&2
+    return 0
+  fi
+  bounded "$LAUNCHCTL" bootstrap "gui/$UID_NUM" "$PLIST" || rc=$?
+  if (( rc == 0 )); then
+    agent_out=0
+    echo "The LaunchAgent was loaded again from $PLIST." >&2
+  else
+    if (( rc == 124 )); then rc="did not answer within ${CALL_TIMEOUT_SECONDS}s"; else rc="exited $rc"; fi
+    echo "The LaunchAgent could not be loaded again (launchctl bootstrap $rc); load it yourself: launchctl bootstrap gui/$UID_NUM $PLIST" >&2
+  fi
 }
 # Stops the uninstall after the rule went: what was kept, and why.
 removal_recorded=0
 stop_after_rule() { # why
   "$CAT" >&2 <<MSG
 
-Uninstall stopped after removing the LaunchAgent and $SUDOERS: $1.
+Uninstall stopped after removing $SUDOERS: $1.
 $APP, the journal and whatever is left of the receipt were kept. Rerun this
 script once nothing above is still running.
 MSG
   if (( removal_recorded )); then
     echo "$PROGRESS records the receipt's removal: a rerun finishes it while $RELEASED stays as it is now." >&2
   fi
+  restore_agent
   exit 1
 }
 
-step "Asking for your password, for $SUDOERS and the receipt"
-if ! "$SUDO" -v; then
-  echo "Uninstall stopped BEFORE removing anything: sudo -v did not authenticate. Rerun this script." >&2
-  exit 1
-fi
-# The calls below need the credential `sudo -v` cached. One that sudo does
-# not keep (timestamp_timeout 0) stops the uninstall here, before anything
-# is removed, rather than after the LaunchAgent.
-if ! as_root -v; then
-  echo "Uninstall stopped BEFORE removing anything: $root_why, so sudo did not keep the credential the commands below need." >&2
-  exit 1
+if (( ! keep_shared )); then
+  # The calls below need the credential `sudo -v` cached. One that sudo
+  # does not keep (timestamp_timeout 0), or that expired while the checks
+  # above ran, stops the uninstall here, before anything is removed.
+  if ! as_root -v; then
+    echo "Uninstall stopped BEFORE removing anything: $root_why, so sudo did not keep the credential the commands below need. Rerun this script." >&2
+    exit 1
+  fi
+  # The record of the receipt's removal, written and flushed now, under the
+  # receipt's lock, so a disk that cannot take it stops the uninstall before
+  # anything is removed rather than between the receipt and its release
+  # file. A finishing rerun's record is already there.
+  if [[ "$shared_seen" == locked* ]]; then
+    record_removal || { echo "Uninstall stopped BEFORE removing anything: $progress_why, so a stop between the removals of $RECEIPT and $RELEASED could not be finished by a rerun." >&2; exit 1; }
+    removal_recorded=1
+  fi
 fi
 
 # bootout first: it stops a running instance of the agent and drops queued
 # runs, so nothing is left to reopen the journal once the files go. Then
 # prove the job is really gone; if launchd still lists it, stop here with
-# every recovery file intact.
+# every recovery file intact. The label is the same for every Insomnia
+# folder, so launchd unloads whichever folder's agent holds it; another
+# folder's app loads its own again at its next launch.
 step "Removing LaunchAgent"
 bootout_rc=0
 bounded "$LAUNCHCTL" bootout "gui/$UID_NUM" "$PLIST" || bootout_rc=$?
@@ -2288,118 +2601,132 @@ if (( print_rc != 113 )); then
   echo "Nothing was removed. Run 'launchctl bootout gui/$UID_NUM $PLIST' yourself, then rerun." >&2
   exit 1
 fi
-"$RM" -f "$PLIST"
-# Candidate plists install.sh and the app write before a load and rename
-# into place after it: in the staging directory beside the plist, and in
-# $LAUNCH_AGENTS itself for older builds. Only files with the label's
-# candidate prefix, the same ones both of them sweep; the staging directory
-# goes only once empty.
-CANDIDATE_DIR="$LAUNCH_AGENTS/.$LABEL.staging"
-for candidate in "$CANDIDATE_DIR/$LABEL.candidate-"* "$LAUNCH_AGENTS/$LABEL.candidate-"*; do
-  if [[ -f "$candidate" && ! -L "$candidate" ]]; then "$RM" -f "$candidate"; fi
-done
-if [[ -d "$CANDIDATE_DIR" && ! -L "$CANDIDATE_DIR" ]]; then "$RMDIR" "$CANDIDATE_DIR" 2>/dev/null || true; fi
+(( bootout_rc != 0 )) || agent_out=1
+echo "$LABEL is not loaded"
+# The plist and the candidate plists install.sh and the app write before a
+# load and rename into place after it: in the staging directory beside the
+# plist, and in $LAUNCH_AGENTS itself for older builds. Only files with the
+# label's candidate prefix, the same ones both of them sweep; the staging
+# directory goes only once empty. Removed once the shared files are gone,
+# just before the bundle, or now when they stay: until then a stop loads
+# the agent again from the plist (restore_agent).
+remove_plists() {
+  local candidate
+  "$RM" -f "$PLIST"
+  agent_out=0
+  CANDIDATE_DIR="$LAUNCH_AGENTS/.$LABEL.staging"
+  for candidate in "$CANDIDATE_DIR/$LABEL.candidate-"* "$LAUNCH_AGENTS/$LABEL.candidate-"*; do
+    if [[ -f "$candidate" && ! -L "$candidate" ]]; then "$RM" -f "$candidate"; fi
+  done
+  if [[ -d "$CANDIDATE_DIR" && ! -L "$CANDIDATE_DIR" ]]; then "$RMDIR" "$CANDIDATE_DIR" 2>/dev/null || true; fi
+  echo "removed $PLIST"
+}
 
-# The receipt, the release file and their folder must still be as the
-# check before step 5 saw them, under the receipt's lock it still holds.
-step "Removing $SUDOERS"
-if ! shared_unchanged; then
-  "$CAT" >&2 <<MSG
+if (( keep_shared )); then
+  remove_plists
+else
+  # The receipt, the release file and their folder must still be as the
+  # check before step 5 saw them, under the receipt's lock it still holds.
+  step "Removing $SUDOERS"
+  if ! shared_unchanged; then
+    "$CAT" >&2 <<MSG
 
-Uninstall stopped after removing the LaunchAgent: $shared_why.
+Uninstall stopped after booting out the LaunchAgent: $shared_why.
 $SUDOERS, $APP, the receipt and the journal were kept. Rerun this script.
 MSG
-  exit 1
-fi
-# rm -f as root, whether or not this user can see the file: /etc/sudoers.d
-# is root's alone.
-if ! as_root "$RM" -f "$SUDOERS"; then
-  "$CAT" >&2 <<MSG
+    restore_agent
+    exit 1
+  fi
+  # rm -f as root, whether or not this user can see the file: /etc/sudoers.d
+  # is root's alone.
+  if ! as_root "$RM" -f "$SUDOERS"; then
+    "$CAT" >&2 <<MSG
 
-Uninstall stopped after removing the LaunchAgent: $root_why.
+Uninstall stopped after booting out the LaunchAgent: $root_why.
 $SUDOERS may still be there. $APP, the receipt and the journal were kept.
 Rerun this script once nothing above is still running.
 MSG
-  exit 1
-fi
-echo "$SUDOERS is gone"
-
-# The receipt and its release file, which no start claims (see the check
-# before step 5), and their folder once empty: other accounts on this Mac
-# keep theirs. Root removes them only while the folder and every folder
-# above it are root's alone, so no folder on the path given to rm can be
-# changed by anyone else, and while the receipt is the file it locked.
-# Another Insomnia folder of this user then needs install.sh again before
-# its next start.
-step "Removing the receipt $RECEIPT"
-if [[ "$shared_seen" == none ]]; then
-  echo "no $RECEIPTS"
-else
-  shared_unchanged || stop_after_rule "$shared_why"
-  if [[ "$shared_seen" == locked* ]]; then
-    record_removal || stop_after_rule "$progress_why, so a stop between the removals of $RECEIPT and $RELEASED could not be finished by a rerun; neither was removed"
-    removal_recorded=1
+    restore_agent
+    exit 1
   fi
-  for receipt_file in "$RECEIPT" "$RELEASED"; do
-    [[ -f "$receipt_file" ]] || continue
-    as_root "$RM" -f "$receipt_file" || stop_after_rule "$root_why"
-    echo "removed $receipt_file"
+  echo "$SUDOERS is gone"
+
+  # The receipt and its release file, which no start claims (see the check
+  # before step 5), and their folder once empty: other accounts on this Mac
+  # keep theirs. Root removes them only while the folder and every folder
+  # above it are root's alone, so no folder on the path given to rm can be
+  # changed by anyone else, and while the receipt is the file it locked.
+  # The standard folder's lock keeps install.sh from making a new receipt
+  # or release file at these paths meanwhile. Another Insomnia folder of
+  # this user then needs install.sh again before its next start.
+  step "Removing the receipt $RECEIPT"
+  if [[ "$shared_seen" == none ]]; then
+    echo "no $RECEIPTS"
+  else
+    shared_unchanged || stop_after_rule "$shared_why"
+    for receipt_file in "$RECEIPT" "$RELEASED"; do
+      [[ -f "$receipt_file" ]] || continue
+      as_root "$RM" -f "$receipt_file" || stop_after_rule "$root_why"
+      echo "removed $receipt_file"
+    done
+    # rmdir fails on a folder that still holds another account's receipt,
+    # which is kept; one that does not answer stops the uninstall.
+    rmdir_rc=0
+    as_root "$RMDIR" "$RECEIPTS" || rmdir_rc=$?
+    if (( rmdir_rc == 0 )); then
+      echo "removed $RECEIPTS"
+    elif (( rmdir_rc == 124 || rmdir_rc == 125 )); then
+      stop_after_rule "$root_why"
+    else
+      echo "kept $RECEIPTS: it still holds another account's receipt, or could not be removed"
+    fi
+  fi
+  # Both files are gone, so a record of their removal names nothing.
+  if [[ -e "$PROGRESS" || -L "$PROGRESS" ]]; then
+    if "$RM" -f "$PROGRESS" 2>/dev/null; then
+      echo "removed $PROGRESS"
+    else
+      echo "warning: could not remove $PROGRESS; it names a release file that is gone, so no rerun acts on it" >&2
+    fi
+  fi
+
+  step "Removing app bundle"
+  remove_plists
+  "$RM" -rf "$APP"
+  # install.sh's leftovers beside the bundle, by the exact names it gives them.
+  # An upgrade sets the previous bundle aside at .Insomnia.app.previous during
+  # its swap and assembles the new one in .Insomnia.app.staging.<pid>.<six
+  # letters and digits> (mktemp). The swap runs under the standard folder's
+  # recovery lock, which this script holds, so a set-aside bundle belongs to
+  # a run that was stopped. A staging directory whose run is still alive
+  # belongs to an install that has not reached the lock yet, and stays.
+  # kill -0 only asks whether the process exists; it sends no signal.
+  # Symlinks and any other name are left.
+  APP_DIR="$(dirname "$APP")"
+  PREVIOUS_APP="$APP_DIR/.Insomnia.app.previous"
+  if [[ -d "$PREVIOUS_APP" && ! -L "$PREVIOUS_APP" ]]; then
+    "$RM" -rf "$PREVIOUS_APP"
+    echo "removed $PREVIOUS_APP, the previous bundle an interrupted install set aside"
+  fi
+  staging_re='^\.Insomnia\.app\.staging\.([0-9]+)\.[A-Za-z0-9]{6}$'
+  for dir in "$APP_DIR"/.Insomnia.app.staging.*; do
+    [[ -d "$dir" && ! -L "$dir" ]] || continue
+    [[ "${dir##*/}" =~ $staging_re ]] || continue
+    owner="${BASH_REMATCH[1]}"
+    if "$KILL" -0 "$owner" 2>/dev/null; then
+      echo "kept $dir: the install.sh run that made it (pid $owner) is still running"
+      continue
+    fi
+    "$RM" -rf "$dir"
+    echo "removed $dir, left by an install.sh run that is gone"
   done
-  # rmdir fails on a folder that still holds another account's receipt,
-  # which is kept; one that does not answer stops the uninstall.
-  rmdir_rc=0
-  as_root "$RMDIR" "$RECEIPTS" || rmdir_rc=$?
-  if (( rmdir_rc == 0 )); then
-    echo "removed $RECEIPTS"
-  elif (( rmdir_rc == 124 || rmdir_rc == 125 )); then
-    stop_after_rule "$root_why"
-  else
-    echo "kept $RECEIPTS: it still holds another account's receipt, or could not be removed"
-  fi
+  # The bundle was the last thing another Insomnia folder of this user could
+  # need; a start of one that waits for the receipt's lock finds it gone.
+  unlock_receipt
 fi
-# Both files are gone, so a record of their removal names nothing.
-if [[ -e "$PROGRESS" || -L "$PROGRESS" ]]; then
-  if "$RM" -f "$PROGRESS" 2>/dev/null; then
-    echo "removed $PROGRESS"
-  else
-    echo "warning: could not remove $PROGRESS; it names a release file that is gone, so no rerun acts on it" >&2
-  fi
-fi
-
-step "Removing app bundle"
-"$RM" -rf "$APP"
-# install.sh's leftovers beside the bundle, by the exact names it gives them.
-# An upgrade sets the previous bundle aside at .Insomnia.app.previous during
-# its swap and assembles the new one in .Insomnia.app.staging.<pid>.<six
-# letters and digits> (mktemp). The swap runs under the recovery lock, which
-# this script holds, so a set-aside bundle belongs to a run that was stopped.
-# A staging directory whose run is still alive belongs to an install that
-# has not reached the lock yet, and stays. kill -0 only asks whether the
-# process exists; it sends no signal. Symlinks and any other name are left.
-APP_DIR="$(dirname "$APP")"
-PREVIOUS_APP="$APP_DIR/.Insomnia.app.previous"
-if [[ -d "$PREVIOUS_APP" && ! -L "$PREVIOUS_APP" ]]; then
-  "$RM" -rf "$PREVIOUS_APP"
-  echo "removed $PREVIOUS_APP, the previous bundle an interrupted install set aside"
-fi
-staging_re='^\.Insomnia\.app\.staging\.([0-9]+)\.[A-Za-z0-9]{6}$'
-for dir in "$APP_DIR"/.Insomnia.app.staging.*; do
-  [[ -d "$dir" && ! -L "$dir" ]] || continue
-  [[ "${dir##*/}" =~ $staging_re ]] || continue
-  owner="${BASH_REMATCH[1]}"
-  if "$KILL" -0 "$owner" 2>/dev/null; then
-    echo "kept $dir: the install.sh run that made it (pid $owner) is still running"
-    continue
-  fi
-  "$RM" -rf "$dir"
-  echo "removed $dir, left by an install.sh run that is gone"
-done
-# The bundle was the last thing another Insomnia folder of this user could
-# need; a start of one that waits for the receipt's lock finds it gone.
-unlock_receipt
 
 # $APP_SUPPORT/backstop.sh below is the writable copy of older installs; the
-# current one went with the bundle.
+# current one is sealed in the bundle.
 if (( PURGE == 1 )); then
   step "Purging Insomnia's files in $APP_SUPPORT and $LOG_DIR"
   remove_owned "$SESSION" "$APP_SUPPORT/config.json" "$APP_SUPPORT/backstop.sh" \
@@ -2445,6 +2772,20 @@ fi
 
 if (( remove_failures > 0 )); then
   echo "Done, except $remove_failures file(s) that could not be removed (named above)." >&2
+fi
+if (( keep_shared )); then
+  "$CAT" >&2 <<MSG
+
+Done with this folder, but $SUDOERS, the receipt and its release file in
+$RECEIPTS, and $APP were kept: $owed_why.
+Another Insomnia folder of this user may still owe that restore, and its
+app or recovery agent needs them to make it. Rerun this script once it is
+done to remove them. If the setting is your own or another tool's and no
+Insomnia folder of yours has a session, switch it back (sleep: sudo pmset
+-a disablesleep 0; Low Power Mode: System Settings > Battery), rerun this
+script, and set it again afterwards.
+MSG
   exit 1
 fi
+(( remove_failures == 0 )) || exit 1
 echo "Done."

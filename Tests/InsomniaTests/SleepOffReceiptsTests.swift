@@ -1216,6 +1216,8 @@ final class SleepOffSettlementTests: XCTestCase {
         defer { chmod(h.receipts.releaseFile, 0o600) }
         var settled = attempt
         settled.settled = true
+        // Its session was removed first: none is left to resume.
+        settled.resumes = ResumedSession.none
         let m = h.makeManager()
 
         for run in 1...2 {
@@ -1275,6 +1277,8 @@ final class SleepOffSettlementTests: XCTestCase {
         defer { chmod(h.receipts.releaseFile, 0o600) }
         var settled = attempt
         settled.settled = true
+        // Its session was removed first: none is left to resume.
+        settled.resumes = ResumedSession.none
         let m = h.makeManager()
 
         for run in 1...2 {
@@ -1434,13 +1438,16 @@ final class SleepOffSettlementTests: XCTestCase {
     /// seconds after the harness clock, the receipt's `writing` line for
     /// it, no marker, the sleep entry, the record marked settled, and the
     /// claim, still held or, with `givenBack`, given back already.
-    /// SleepDisabled is 1.
-    private func journalSettledStart(endsIn: TimeInterval = 1800, givenBack: Bool) async throws -> (attempt: SleepOffAttempt, session: Session) {
+    /// SleepDisabled is 1. With `named`, the record names that session as
+    /// the one to resume (`resumes`), as finishAttempt journals it.
+    /// Without, it is a record an older build or a script settled.
+    private func journalSettledStart(endsIn: TimeInterval = 1800, givenBack: Bool, named: Bool = true) async throws -> (attempt: SleepOffAttempt, session: Session) {
         var attempt = try journalUnfinishedStart(endsIn: endsIn)
         let session = try XCTUnwrap(h.store.loadSession())
         TestReceipts.write(h.receipts.file, nonce: attempt.nonce, predecessor: attempt.predecessor, word: "writing")
         try FileManager.default.removeItem(at: h.home.paths.pendingStartFile)
         attempt.settled = true
+        if named { attempt.resumes = ResumedSession(session) }
         var journal = try XCTUnwrap(h.store.loadState())
         journal.sleepOffAttempt = attempt
         try h.store.saveState(journal)
@@ -1606,83 +1613,112 @@ final class SleepOffSettlementTests: XCTestCase {
         }
     }
 
-    /// Only that start's own session resumes beside a settled record: the
-    /// one whose first end is the start's deadline, extended or not, with
-    /// the sleep entry journaled. Each extension with a fraction of a
-    /// second can put the first end that comes out up to a second earlier
-    /// (`SessionManager.isSession`): two such extensions with a relaunch
-    /// between them put it 1.2 s early here, past the one second allowed
-    /// before. Another session (one a rolled-back start put back, or one
-    /// ending a second earlier), an extended one whose first end is two
-    /// seconds off, one whose two extensions with fractions put its first
-    /// end 2.2 s early or 1.2 s late, one begun less than a minute before
-    /// the deadline, or a journal with no sleep entry ends it as before.
-    /// Sleep turned back on ends it as it ends any resumed session, and an
-    /// expired one is restored. The claim cannot be given back throughout,
-    /// so the record stays.
+    /// Only the session a settled record leaves to be resumed resumes
+    /// beside it. A record that names it (`resumes`, round 32) takes the
+    /// session with that `startedAt` and that first end, extended or not.
+    /// Each extension with a fraction of a second can put the first end
+    /// that comes out up to a second earlier (`SessionManager.isSession`):
+    /// two such extensions with a relaunch between them put it 1.2 s early
+    /// here, past the one second allowed before. Another session (one
+    /// ending a second earlier, or one begun earlier with the same first
+    /// end), an extended one whose first end is two seconds off, or one
+    /// whose two extensions with fractions put its first end 2.2 s early
+    /// or 1.2 s late ends it as before. With no sleep entry, the named
+    /// session resumes as it would with no record. A record that names
+    /// none ends the start's own session. A record without the name (an
+    /// older build's, or one a script settled) keeps the rule from before:
+    /// the first end is the start's deadline, the session began at least a
+    /// minute before it, and the sleep entry is journaled. So a session
+    /// begun earlier with the same first end passes there, which is the
+    /// limit of that rule. Sleep turned back on ends it as it ends any
+    /// resumed session, and an expired one is restored. The claim cannot
+    /// be given back throughout, so the record stays.
     func testOnlyTheSettledStartsOwnSessionResumes() async throws {
-        let cases: [(name: String, resumes: Bool, restores: Int, change: (inout Session, inout RuntimeState) -> Void)] = [
-            ("its own session", true, 0, { _, _ in }),
-            ("its own, extended by 900 s", true, 0, { s, _ in
+        let cases: [(name: String, named: Bool, unnamed: Bool, change: (inout Session, inout RuntimeState) -> Void)] = [
+            ("its own session", true, true, { _, _ in }),
+            ("its own, extended by 900 s", true, true, { s, _ in
                 s.endsAt = s.endsAt.addingTimeInterval(900)
                 s.extensions = [900]
             }),
-            ("its own, extended by 899.6 s, cut short at the maximum", true, 0, { s, _ in
+            ("its own, extended by 899.6 s, cut short at the maximum", true, true, { s, _ in
                 s.endsAt = s.endsAt.addingTimeInterval(899)
                 s.extensions = [899.6]
             }),
-            ("its own, cut short at the maximum twice with a relaunch between", true, 0, { s, _ in
+            ("its own, cut short at the maximum twice with a relaunch between", true, true, { s, _ in
                 s.endsAt = s.endsAt.addingTimeInterval(841)
                 s.extensions = [840.6, 1.6]
             }),
-            ("another session, ending 600 s later", false, 1, { s, _ in s.endsAt = s.endsAt.addingTimeInterval(600) }),
-            ("another session, ending a second earlier", false, 1, { s, _ in s.endsAt = s.endsAt.addingTimeInterval(-1) }),
-            ("extended by 900 s, its first end two seconds off", false, 1, { s, _ in
+            ("another session, ending 600 s later", false, false, { s, _ in s.endsAt = s.endsAt.addingTimeInterval(600) }),
+            ("another session, ending a second earlier", false, false, { s, _ in s.endsAt = s.endsAt.addingTimeInterval(-1) }),
+            ("another session, begun 600 s earlier with the same first end", false, true, { s, _ in s.startedAt = s.startedAt.addingTimeInterval(-600) }),
+            ("extended by 900 s, its first end two seconds off", false, false, { s, _ in
                 s.endsAt = s.endsAt.addingTimeInterval(902)
                 s.extensions = [900]
             }),
-            ("cut short twice, its first end 2.2 s early", false, 1, { s, _ in
+            ("cut short twice, its first end 2.2 s early", false, false, { s, _ in
                 s.endsAt = s.endsAt.addingTimeInterval(840)
                 s.extensions = [840.6, 1.6]
             }),
-            ("cut short twice, its first end 1.2 s late", false, 1, { s, _ in
+            ("cut short twice, its first end 1.2 s late", false, false, { s, _ in
                 s.endsAt = s.endsAt.addingTimeInterval(843)
                 s.extensions = [840.6, 1.2]
             }),
-            ("begun 59 s before its deadline", false, 1, { s, _ in s.startedAt = s.endsAt.addingTimeInterval(-59) }),
-            ("no sleep entry", false, 0, { _, j in j.sleepDisabledByUs = false }),
+            ("begun 59 s before its deadline", false, false, { s, _ in s.startedAt = s.endsAt.addingTimeInterval(-59) }),
+            ("no sleep entry", true, false, { _, j in j.sleepDisabledByUs = false }),
         ]
-        for c in cases {
-            fresh()
-            let (attempt, original) = try await journalSettledStart(givenBack: false)
-            var session = original
-            var journal = try XCTUnwrap(h.store.loadState())
-            c.change(&session, &journal)
-            try h.store.saveSession(session)
-            try h.store.saveState(journal)
-            let saved = try XCTUnwrap(h.store.loadSession())
-            let clear = try await impose(.releaseReadOnly)
-            defer { clear() }
-            let m = h.makeManager()
+        for named in [true, false] {
+            for c in cases {
+                let name = "\(named ? "named" : "unnamed"): \(c.name)"
+                let resumes = named ? c.named : c.unnamed
+                fresh()
+                let (attempt, original) = try await journalSettledStart(givenBack: false, named: named)
+                var session = original
+                var journal = try XCTUnwrap(h.store.loadState())
+                c.change(&session, &journal)
+                try h.store.saveSession(session)
+                try h.store.saveState(journal)
+                let saved = try XCTUnwrap(h.store.loadSession())
+                XCTAssertEqual(SessionManager.isResumed(saved, by: attempt, sleepEntry: journal.sleepDisabledByUs), resumes, name)
+                let clear = try await impose(.releaseReadOnly)
+                defer { clear() }
+                let m = h.makeManager()
 
-            await m.reconcile()
+                await m.reconcile()
 
-            XCTAssertEqual(m.isActive, c.resumes, "\(c.name): \(m.lastError ?? "")")
-            XCTAssertEqual(try h.store.loadSession(), c.resumes ? saved : nil, c.name)
-            XCTAssertEqual(restores, c.restores, "\(c.name): \(h.guardFake.calls)")
-            XCTAssertFalse(h.guardFake.calls.contains("disablesleep 1"), c.name)
-            XCTAssertEqual(try h.store.loadState()?.sleepOffAttempt, attempt, "\(c.name): the record stays")
-            if c.resumes {
-                XCTAssertEqual(m.session, saved, c.name)
-                await m.end(reason: .user)
+                XCTAssertEqual(m.isActive, resumes, "\(name): \(m.lastError ?? "")")
+                XCTAssertEqual(try h.store.loadSession(), resumes ? saved : nil, name)
+                XCTAssertEqual(restores, resumes || !journal.sleepDisabledByUs ? 0 : 1, "\(name): \(h.guardFake.calls)")
+                XCTAssertFalse(h.guardFake.calls.contains("disablesleep 1"), name)
+                XCTAssertEqual(try h.store.loadState()?.sleepOffAttempt, attempt, "\(name): the record stays")
+                if resumes {
+                    XCTAssertEqual(m.session, saved, name)
+                    XCTAssertEqual(try h.store.loadState()?.sleepDisabledByUs, true, "\(name): sleep is journaled as off, as for any resumed session")
+                    await m.end(reason: .user)
+                }
             }
         }
+
+        // A record that names no session ends the start's own.
+        fresh()
+        var (noneRecord, _) = try await journalSettledStart(givenBack: false)
+        noneRecord.resumes = ResumedSession.none
+        var noneJournal = try XCTUnwrap(h.store.loadState())
+        noneJournal.sleepOffAttempt = noneRecord
+        try h.store.saveState(noneJournal)
+        var clear = try await impose(.releaseReadOnly)
+        let ends = h.makeManager()
+        await ends.reconcile()
+        clear()
+        XCTAssertFalse(ends.isActive, ends.lastError ?? "")
+        XCTAssertNil(try h.store.loadSession())
+        XCTAssertEqual(restores, 1, "\(h.guardFake.calls)")
+        XCTAssertEqual(try h.store.loadState()?.sleepOffAttempt, noneRecord, "the record stays")
 
         // Sleep turned back on while Insomnia was not running.
         fresh()
         let (attempt, _) = try await journalSettledStart(givenBack: false)
         h.guardFake.sleepDisabled = false
-        var clear = try await impose(.releaseReadOnly)
+        clear = try await impose(.releaseReadOnly)
         let m = h.makeManager()
         await m.reconcile()
         clear()
@@ -1734,6 +1770,7 @@ final class SleepOffSettlementTests: XCTestCase {
                     session = try XCTUnwrap(h.store.loadSession())
                 }
                 XCTAssertTrue(SessionManager.isSession(session, of: attempt), "\(name) \(i)")
+                XCTAssertTrue(SessionManager.isResumed(session, by: attempt, sleepEntry: true), "\(name) \(i)")
             }
             try h.store.saveSession(session)
             let saved = try XCTUnwrap(h.store.loadSession())
@@ -1743,6 +1780,9 @@ final class SleepOffSettlementTests: XCTestCase {
                 var another = attempt
                 another.deadline = other
                 XCTAssertFalse(SessionManager.isSession(saved, of: another), "\(name): deadline \(other)")
+                another = attempt
+                another.resumes?.firstEnd = other
+                XCTAssertFalse(SessionManager.isResumed(saved, by: another, sleepEntry: true), "\(name): named first end \(other)")
             }
             let clear = try await impose(.releaseReadOnly)
             defer { clear() }
@@ -1801,7 +1841,7 @@ final class SleepOffSettlementTests: XCTestCase {
 
         for deadline in [Int.min, Int.max] {
             fresh()
-            var (attempt, session) = try await journalSettledStart(givenBack: false)
+            var (attempt, session) = try await journalSettledStart(givenBack: false, named: false)
             attempt.deadline = deadline
             var journal = try XCTUnwrap(h.store.loadState())
             journal.sleepOffAttempt = attempt
@@ -1834,6 +1874,24 @@ final class SleepOffSettlementTests: XCTestCase {
         let healthy = Session(startedAt: start, endsAt: start.addingTimeInterval(3_600))
         XCTAssertTrue(SessionManager.isSession(healthy, of: probe))
         XCTAssertFalse(SessionManager.isSession(Session(startedAt: Date(timeIntervalSince1970: .nan), endsAt: healthy.endsAt), of: probe))
+
+        // A named session traps nothing either, whatever the journal holds.
+        var named = probe
+        named.settled = true
+        named.resumes = ResumedSession(healthy)
+        XCTAssertEqual(named.resumes, ResumedSession(startedAt: now, firstEnd: now + 3_600))
+        XCTAssertTrue(SessionManager.isResumed(healthy, by: named, sleepEntry: false))
+        for extreme in [Int.min, Int.max] {
+            named.resumes = ResumedSession(startedAt: extreme, firstEnd: now + 3_600)
+            XCTAssertFalse(SessionManager.isResumed(healthy, by: named, sleepEntry: true), "startedAt \(extreme)")
+            named.resumes = ResumedSession(startedAt: now, firstEnd: extreme)
+            XCTAssertFalse(SessionManager.isResumed(healthy, by: named, sleepEntry: true), "firstEnd \(extreme)")
+        }
+        for extensions: [TimeInterval] in [[.nan], [1e308, 1e308]] {
+            let s = Session(startedAt: start, endsAt: start.addingTimeInterval(3_600), extensions: extensions)
+            XCTAssertEqual(ResumedSession(s), ResumedSession.none, "\(extensions)")
+        }
+        XCTAssertEqual(ResumedSession(Session(startedAt: Date(timeIntervalSince1970: .nan), endsAt: healthy.endsAt)), ResumedSession.none)
     }
 
     /// A claim that cannot be written (the release file is read-only here)
@@ -1877,6 +1935,7 @@ final class SleepOffSettlementTests: XCTestCase {
         let journal = try XCTUnwrap(h.store.loadState())
         XCTAssertEqual(journal.sleepOffAttempt?.nonce, nonce)
         XCTAssertEqual(journal.sleepOffAttempt?.settled, true)
+        XCTAssertEqual(journal.sleepOffAttempt?.resumes, ResumedSession.none, "no session was there before the start")
         XCTAssertFalse(journal.sleepDisabledByUs, "the journal is back as it was")
         XCTAssertNil(try h.store.loadSession())
         XCTAssertFalse(markerExists)
@@ -1899,6 +1958,172 @@ final class SleepOffSettlementTests: XCTestCase {
         XCTAssertEqual(h.prompt.starts.last?.predecessor, SleepOffReceipts.zero)
         await m.end(reason: .user)
         XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
+    }
+
+    // MARK: Round 32 P5: the session a settled record leaves to be resumed
+
+    /// A session ending `endsIn` seconds after the harness clock, begun 600
+    /// s before it, written to session.json with the sleep entry journaled
+    /// and SleepDisabled 1, as a session this process does not hold in
+    /// memory leaves it (one whose end could not delete its file, say).
+    private func writePreviousSession(endsIn: TimeInterval = 3000) throws -> Session {
+        let previous = SessionMath.newSession(now: h.clock.now.addingTimeInterval(-600), duration: endsIn + 600, maxDuration: 86400)
+        try h.store.saveSession(previous)
+        var journal = RuntimeState.clean
+        journal.sleepDisabledByUs = true
+        try h.store.saveState(journal)
+        h.guardFake.sleepDisabled = true
+        return try XCTUnwrap(h.store.loadSession())
+    }
+
+    /// Independent31: a cancelled start puts back the session.json it found
+    /// (`previous`), and its claim cannot be given back. Before, a relaunch
+    /// with that settled record left over ended `previous`, since it is not
+    /// the start's own, though without the record it resumes. The record
+    /// now names `previous` in the same journal write that marks it
+    /// settled, before the claim would go back, and the relaunch resumes it
+    /// as it would without the record: no pmset writes, the deadline kept,
+    /// and starts refused while the record stays. Once the claim can go
+    /// back, the next start finishes the record first, and its own record
+    /// names only its own session: no later nonce takes an earlier
+    /// record's selection.
+    func testARolledBackStartsPreviousSessionResumesWhileItsRecordStays() async throws {
+        let previous = try writePreviousSession()
+        let release = h.receipts.releaseFile
+        h.prompt.onShow = { _ in chmod(release, 0o400) }
+        h.prompt.mode = .cancel
+        defer { chmod(release, 0o600) }
+        let m = h.makeManager()
+
+        await m.start(duration: 1800)
+
+        XCTAssertFalse(m.isActive)
+        let nonce = try XCTUnwrap(h.prompt.starts.last?.nonce)
+        XCTAssertEqual(try h.store.loadSession(), previous, "put back")
+        var journal = try XCTUnwrap(h.store.loadState())
+        XCTAssertEqual(journal.sleepOffAttempt?.nonce, nonce)
+        XCTAssertEqual(journal.sleepOffAttempt?.settled, true)
+        XCTAssertEqual(journal.sleepOffAttempt?.resumes, ResumedSession(previous))
+        XCTAssertTrue(journal.sleepDisabledByUs, "the journal is back as it was")
+        XCTAssertEqual(TestReceipts.release(h.receipts), "\(nonce) held\n")
+
+        let relaunch = h.makeManager()
+        await relaunch.reconcile()
+
+        XCTAssertTrue(relaunch.isActive, relaunch.lastError ?? "")
+        XCTAssertEqual(relaunch.session, previous, "the deadline is kept")
+        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1", "pmset -g"], "the dialog, then sleep is read and never written")
+        XCTAssertEqual(try h.store.loadState()?.sleepOffAttempt?.nonce, nonce, "the record stays")
+        XCTAssertTrue(relaunch.lastError?.hasPrefix("an earlier start is still recorded in the journal (it is settled, but ") == true, relaunch.lastError ?? "")
+        await relaunch.end(reason: .user)
+        XCTAssertNil(try h.store.loadSession())
+
+        // The claim can go back: the next start finishes the record first.
+        // Its own claim cannot go back after its dialog, so its record stays
+        // and names its own session.
+        XCTAssertEqual(chmod(release, 0o600), 0)
+        h.guardFake.sleepDisabled = false
+        h.prompt.mode = .succeed
+        await relaunch.start(duration: 1800)
+
+        XCTAssertTrue(relaunch.isActive, relaunch.lastError ?? "")
+        let own = try XCTUnwrap(relaunch.session)
+        let next = try XCTUnwrap(h.prompt.starts.last?.nonce)
+        XCTAssertNotEqual(next, nonce)
+        journal = try XCTUnwrap(h.store.loadState())
+        XCTAssertEqual(journal.sleepOffAttempt?.nonce, next)
+        XCTAssertEqual(journal.sleepOffAttempt?.resumes, ResumedSession(own))
+        XCTAssertNotEqual(journal.sleepOffAttempt?.resumes, ResumedSession(previous))
+        h.prompt.onShow = nil
+        XCTAssertEqual(chmod(release, 0o600), 0)
+        await relaunch.end(reason: .user)
+        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
+    }
+
+    /// A rollback that put session.json back and stopped before its journal
+    /// write (a crash) leaves the start unsettled with its claim and
+    /// `previous` on disk. The relaunch settles it from the receipt, which
+    /// shows it never turned sleep off: `previous` is not that start's
+    /// session, so it stays, and the record names it in the same write
+    /// that settles it. With the claim still not given back, `previous`
+    /// resumes beside the record.
+    func testASettlementFromTheReceiptNamesThePreviousSessionItLeaves() async throws {
+        let previous = try writePreviousSession()
+        let attempt = try journalUnfinishedStart(owedBefore: true)
+        try h.store.saveSession(previous)
+        pastExpiry()
+        let clear = try await impose(.releaseReadOnly)
+        defer { clear() }
+        let m = h.makeManager()
+
+        await m.reconcile()
+
+        XCTAssertTrue(m.isActive, m.lastError ?? "")
+        XCTAssertEqual(m.session, previous)
+        XCTAssertEqual(restores, 0, "\(h.guardFake.calls)")
+        let journal = try XCTUnwrap(h.store.loadState())
+        XCTAssertEqual(journal.sleepOffAttempt?.nonce, attempt.nonce)
+        XCTAssertEqual(journal.sleepOffAttempt?.settled, true)
+        XCTAssertEqual(journal.sleepOffAttempt?.resumes, ResumedSession(previous))
+        XCTAssertTrue(journal.sleepDisabledByUs, "the restore the earlier session owes stays")
+        XCTAssertEqual(TestReceipts.release(h.receipts), "\(attempt.nonce) held\n")
+        await m.end(reason: .user)
+    }
+
+    /// A settlement that cannot read session.json cannot name the session
+    /// it leaves, so it publishes nothing: the record stays unsettled with
+    /// its claim, the menu says why, and no pmset runs for a start that
+    /// never turned sleep off. Reconcile moves the file aside, unopened,
+    /// as it moves any session.json it cannot read. The next transaction
+    /// settles the start with no session left, gives the claim back and
+    /// removes the record.
+    func testASettlementThatCannotReadTheSessionRetries() async throws {
+        let attempt = try journalUnfinishedStart()
+        pastExpiry()
+        let file = h.home.paths.sessionFile.path
+        XCTAssertEqual(chmod(file, 0o000), 0)
+        defer { chmod(file, 0o600) }
+        let m = h.makeManager()
+
+        await m.reconcile()
+
+        XCTAssertFalse(m.isActive)
+        var journal = try XCTUnwrap(h.store.loadState())
+        XCTAssertEqual(journal.sleepOffAttempt, attempt, "the record stays unsettled")
+        XCTAssertEqual(TestReceipts.release(h.receipts), "\(attempt.nonce) held\n", "the claim stays")
+        XCTAssertEqual(restores, 0, "\(h.guardFake.calls)")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: file), "moved aside")
+        XCTAssertTrue(m.lastError?.contains("session.json could not be read to name the session this settlement leaves (") == true, m.lastError ?? "")
+
+        await m.reconcile()
+
+        journal = try XCTUnwrap(h.store.loadState())
+        XCTAssertNil(journal.sleepOffAttempt, m.lastError ?? "")
+        XCTAssertFalse(journal.sleepDisabledByUs)
+        XCTAssertEqual(TestReceipts.release(h.receipts), "\(SleepOffReceipts.zero) free\n")
+        XCTAssertEqual(restores, 0, "\(h.guardFake.calls)")
+        XCTAssertFalse(m.isActive)
+    }
+
+    /// `resumes` is optional in the journal: a record from a build before
+    /// it reads with none, and writes back without the key. `.none` is an
+    /// empty object.
+    func testTheSessionASettledRecordResumesIsOptionalInTheJournal() throws {
+        let old = #"{"deadline":1800003600,"expires":1800000130,"nonce":"n","owedBefore":true,"predecessor":"p","receipt":"1:2","settled":true}"#
+        let decoded = try Store.makeDecoder().decode(SleepOffAttempt.self, from: Data(old.utf8))
+        XCTAssertNil(decoded.resumes)
+        XCTAssertFalse(String(decoding: try Store.makeEncoder().encode(decoded), as: UTF8.self).contains("resumes"))
+
+        var named = decoded
+        named.resumes = ResumedSession.none
+        let text = String(decoding: try Store.makeEncoder().encode(named), as: UTF8.self)
+        XCTAssertTrue(text.contains(#""resumes" : {"#), text)
+        XCTAssertEqual(try Store.makeDecoder().decode(SleepOffAttempt.self, from: Data(text.utf8)), named)
+
+        let empty = old.replacingOccurrences(of: #""settled":true"#, with: #""settled":true,"resumes":{}"#)
+        XCTAssertEqual(try Store.makeDecoder().decode(SleepOffAttempt.self, from: Data(empty.utf8)).resumes, ResumedSession.none)
+        let session = old.replacingOccurrences(of: #""settled":true"#, with: #""settled":true,"resumes":{"firstEnd":1800003600,"startedAt":1800000000}"#)
+        XCTAssertEqual(try Store.makeDecoder().decode(SleepOffAttempt.self, from: Data(session.utf8)).resumes, ResumedSession(startedAt: 1_800_000_000, firstEnd: 1_800_003_600))
     }
 
     // MARK: Round 28 F7

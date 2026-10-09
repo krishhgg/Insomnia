@@ -46,8 +46,53 @@ struct SleepOffAttempt: Codable, Equatable, Sendable {
     /// leaves the decision itself, never a record a later start's receipt
     /// line could be read against again. Left out of the JSON when nil.
     var settled: Bool? = nil
+    /// The session the settled record leaves to be resumed while it waits
+    /// for its claim to be given back: this start's own once sleep was
+    /// turned off for it, the one from before it that its rollback put
+    /// back, the one a settlement from the receipt left in place, or none
+    /// (`ResumedSession.none`). The app journals it in the same write as
+    /// `settled`, before the claim goes back, so a launch while the record
+    /// stays resumes that session only (`SessionManager.isResumed`) and
+    /// ends any other. nil in a record settled by a build from before it,
+    /// or by backstop.sh or uninstall.sh, which remove the start's own
+    /// session before they publish: a launch then takes the session whose
+    /// first end is `deadline` (`SessionManager.isSession`), and another
+    /// session with that first end passes too. Left out of the JSON when
+    /// nil. The scripts check only its shape, and a build from before it
+    /// drops it when it rewrites the journal.
+    var resumes: ResumedSession? = nil
 
     var isSettled: Bool { settled == true }
+}
+
+/// What `SleepOffAttempt.resumes` records of a session, in whole seconds
+/// since 1970 as session.json keeps them: its `startedAt`, which no
+/// extension changes, and its first end (`SessionMath.firstEnd`). With no
+/// `startedAt`, no session.
+struct ResumedSession: Codable, Equatable, Sendable {
+    var startedAt: Int?
+    var firstEnd: Int?
+
+    /// No session is left to be resumed.
+    static let none = ResumedSession()
+
+    init(startedAt: Int? = nil, firstEnd: Int? = nil) {
+        self.startedAt = startedAt
+        self.firstEnd = firstEnd
+    }
+
+    /// `s` as session.json keeps it, or `.none` for a session with no first
+    /// end or a start session.json cannot hold. Both times are checked
+    /// against `SessionMath.storableTimes` first, so neither conversion
+    /// can trap.
+    init(_ s: Session) {
+        let started = s.startedAt.timeIntervalSince1970.rounded(.down)
+        guard SessionMath.storableTimes.contains(started), let first = SessionMath.firstEnd(of: s) else {
+            self.init()
+            return
+        }
+        self.init(startedAt: Int(started), firstEnd: Int(first.rounded(.down)))
+    }
 }
 
 /// What a receipt shows about one start.

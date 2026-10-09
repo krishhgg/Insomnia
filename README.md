@@ -335,9 +335,12 @@ anyone acted on one it could name another process.
      given back or a record that cannot be removed keeps Start refused
      until a later run finishes them; the result is not read again. A
      session that start began goes on, a relaunch resumes it while sleep is
-     still off, and the menu says the start is still recorded and why. Any
-     other session file beside that record ends at the relaunch, including
-     an earlier session a failed start put back.
+     still off, and the menu says the start is still recorded and why. The
+     record names the session to resume, so an earlier session a failed
+     start put back resumes too, and any other session file beside that
+     record ends at the relaunch. A record an older build wrote, or one the
+     scripts settled, names none: then only a session whose first end is
+     the start's deadline resumes.
 
    Insomnia shows no dialog at all while the `backstop.sh` sealed in its
    bundle is missing or older than the app expects, because an older one
@@ -835,7 +838,9 @@ Neither looks in the folder above its own.
 
 The uninstaller requests cleanup before removing the app, agent, sudoers
 rule, your receipt and its `.released` file. It removes those two only
-under the receipt's lock and only while no start claims the receipt. A
+under the receipt's lock and only while no start claims the receipt, and
+holds the lock `install.sh` takes until it ends, so no install can make
+them again meanwhile. A
 start from another Insomnia folder of yours that is not settled, a lock
 that stays held, a receipt, `.released` file or folder it cannot read or
 that fails its checks, or one of the two files without the other stops it
@@ -844,16 +849,19 @@ is known: an uninstall of this folder that stopped after removing the
 receipt. Just before that removal it writes `.uninstall-receipt-removal`
 in the folder, and a rerun finishes the removal while that file still
 names the `.released` file as it is now, free. It asks for your password once (`sudo
--v`), before removing anything, and runs each command that needs root
-through `sudo -n` with a 30 s limit. One that fails, does not answer in
-time or is still running stops the uninstall there, with what it already
-removed listed; a `sudo` still running keeps the locks until it exits.
-If your sudo credential runs out between the password and those
-commands, it stops after removing the LaunchAgent; rerun it. A start that
-is settled can still have a session running in another Insomnia folder
-of yours, and once the rule is gone that folder cannot turn sleep back on
-by itself (SECURITY.md). Once they are gone, any other Insomnia folder of
-yours needs
+-v`), before it takes any lock or removes anything, and runs each command
+that needs root through `sudo -n` with a 30 s limit. One that fails, does
+not answer in time or is still running stops the uninstall there, with
+what it already removed listed; a `sudo` still running keeps the locks
+until it exits. If your sudo credential runs out before those commands,
+it stops before removing anything; if it runs out between them, it stops
+after booting out the LaunchAgent and loads it again. Rerun it. A start
+that is settled can still have a session running in another Insomnia
+folder of yours, so while sleep is off or Low Power Mode is on for
+battery (or either cannot be read), the uninstaller keeps the sudoers
+rule, the receipt and the app, removes the rest of this folder, says
+why and exits 1; rerun it once that session has ended (SECURITY.md). Once
+they are gone, any other Insomnia folder of yours needs
 `./scripts/install.sh` again before its next start. It removes the
 receipts folder too once no other account's receipt is in it, and leaves
 the folder and everything in it alone when someone other than root could

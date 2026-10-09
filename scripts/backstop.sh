@@ -318,9 +318,20 @@ PENDING="$APP_SUPPORT/pending-start"
 LOCK="$APP_SUPPORT/.recovery.lock"
 LOG="$LOG_DIR/insomnia.log"
 
+# Logging is best effort. A log line explains a decision; it never makes
+# one. A date, mkdir or append that fails (a full disk, a log made
+# read-only) sends the line to standard error instead (launchd discards
+# it: the plist names no StandardErrorPath), and the run goes on to the
+# restore it already decided on. Under set -e a failed append here would
+# otherwise end the run before pmset. The journal and the result of each
+# read and root command still decide what happens and how the run ends.
 log() { # level message
-  "$MKDIR" -p "$LOG_DIR"
-  printf '%s [%s] backstop: %s\n' "$("$DATE" -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" >> "$LOG"
+  local stamp line
+  stamp="$("$DATE" -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)" || stamp="(date failed)"
+  line="$stamp [$1] backstop: $2"
+  { "$MKDIR" -p "$LOG_DIR" && printf '%s\n' "$line" >> "$LOG"; } 2>/dev/null \
+    || printf '%s (not written to %s)\n' "$line" "$LOG" >&2 \
+    || true
 }
 
 # --- Lock --------------------------------------------------------------------
@@ -464,18 +475,20 @@ log_lines() { # level text prefix
 # Copies the live file $1 to $READS/$2, for every later read of it in this
 # run: session.json, state.json and the app's Info.plist are never read in
 # place. perl, run with an empty environment, opens the file without
-# blocking, refuses anything but a regular file (open(2) on a FIFO with no
-# writer would block under the lock, and a device is never read), reads it
-# to the end, checks that its device, inode, size, modification and change
-# times (to the second) did not move during the read and that the path
-# still names it, and writes the bytes to a new mode-600 file. SIGALRM ends
-# it after READ_TIMEOUT_SECONDS; a read the kernel cannot interrupt (a
-# stalled disk) holds it longer. Returns 0 with copy_path and copy_id
-# (device, inode, size, mtime and ctime, as stat -f '%d:%i:%z:%m:%c' prints
-# them); 3 when the file could not be opened or read (permissions, I/O); 4
-# when it is not a regular file; 2 for anything else: it changed while it
-# was read, the time ran out, or the copy could not be written. Its reason
-# is in copy_why.
+# blocking and without following a symbolic link, refuses anything but a
+# regular file (open(2) on a FIFO with no writer would block under the
+# lock, and a device is never read) and one larger than 8 MiB, reads it to
+# the end, checks that it holds as many bytes as its size, that its
+# identity (file_id: device, inode, size, and modification and change times
+# to a fraction of a microsecond) did not move during the read and that the
+# path still names it, not through a link, and writes the bytes to a new
+# mode-600 file. SIGALRM ends it after READ_TIMEOUT_SECONDS; a read the
+# kernel cannot interrupt (a stalled disk), or a perl stopped by SIGSTOP,
+# holds it longer. Returns 0 with copy_path and copy_id (that identity); 3
+# when the file could not be opened or read (permissions, I/O); 4 when it is
+# a symbolic link or not a regular file; 2 for anything else: it is larger
+# than 8 MiB, it changed while it was read, the time ran out, or the copy
+# could not be written. Its reason is in copy_why.
 # With no READS folder, or when the new file cannot be written (a full
 # disk) and COPY_IN_MEMORY is 1, perl makes the same checks and prints the
 # bytes instead. They are kept in the shell variable mem_<name>, and
@@ -484,21 +497,27 @@ log_lines() { # level text prefix
 # memory. Nothing in that mode creates a file. A shell variable cannot hold
 # a NUL byte, so a file with one is then 2.
 # shellcheck disable=SC2016  # the $ below are perl's, not this shell's
-COPY_PERL='use strict; use Fcntl;
+COPY_PERL='use strict; use Fcntl qw(:DEFAULT :mode); use Time::HiRes ();
 $SIG{ALRM} = "DEFAULT"; alarm shift @ARGV;
 my ($src, $dst) = @ARGV;
+my $max = 8 * 1024 * 1024;
 sub fail { print "$_[1]\n"; exit $_[0] }
-sysopen(my $in, $src, O_RDONLY | O_NONBLOCK) or fail 3, "$!";
-my @a = stat($in) or fail 3, "$!";
--f _ or fail 4, "not a regular file";
+sub id { join(":", @_[0,1,7], map { sprintf "%.9f", $_ } @_[9,10]) }
+sysopen(my $in, $src, O_RDONLY | O_NONBLOCK | O_NOFOLLOW)
+  or fail $!{ELOOP} ? (4, "a symbolic link, which is not followed") : (3, "$!");
+my @a = Time::HiRes::stat($in) or fail 3, "$!";
+S_ISREG($a[2]) or fail 4, "not a regular file";
+$a[7] <= $max or fail 2, "it is larger than 8 MiB";
 my ($data, $n) = ("", 0);
-1 while ($n = sysread($in, $data, 65536, length $data));
+while ($n = sysread($in, $data, 65536, length $data)) {
+  length($data) <= $max or fail 2, "it grew past 8 MiB while it was read";
+}
 defined $n or fail 3, "$!";
-my @b = stat($in) or fail 3, "$!";
-my @c = stat($src);
-"@a[0,1,7,9,10]" eq "@b[0,1,7,9,10]" && @c && "@b[0,1]" eq "@c[0,1]" && length($data) == $b[7]
+my @b = Time::HiRes::stat($in) or fail 3, "$!";
+my @c = Time::HiRes::lstat($src);
+id(@a) eq id(@b) && @c && id(@b) eq id(@c) && length($data) == $b[7]
   or fail 2, "it changed while it was read";
-my $id = join(":", @b[0,1,7,9,10]);
+my $id = id(@b);
 if ($dst eq "-") {
   index($data, "\0") < 0 or fail 2, "it holds a NUL byte, which a copy kept in memory cannot hold";
   print "$id\n$data." or exit 2;
@@ -542,7 +561,7 @@ copy_private() { # live-file name
       fi
     fi
   fi
-  if (( rc == 0 )) && [[ "$out" =~ ^[0-9]+:[0-9]+:[0-9]+:-?[0-9]+:-?[0-9]+$ ]]; then
+  if (( rc == 0 )) && [[ "$out" =~ ^[0-9]+:[0-9]+:[0-9]+:-?[0-9]+\.[0-9]{9}:-?[0-9]+\.[0-9]{9}$ ]]; then
     copy_id="$out"
     if (( mem )); then printf -v "mem_${copy_path#mem:}" '%s' "$data"; fi
     return 0
@@ -556,6 +575,18 @@ copy_private() { # live-file name
   esac
   copy_why="${copy_why:-the copy exited $rc}"
   return "$rc"
+}
+# The identity copy_private gives a file (copy_id), of the file at $1 now,
+# not following a link: its device, inode and size, and its modification
+# and change times with the fraction perl's Time::HiRes gives them (the
+# nanoseconds the system keeps, rounded to a double, a fraction of a
+# microsecond). Prints nothing when there is no such file.
+# shellcheck disable=SC2016  # the $ below are perl's, not this shell's
+ID_PERL='use strict; use Time::HiRes ();
+my @s = Time::HiRes::lstat($ARGV[0]) or exit 1;
+print join(":", @s[0,1,7], map { sprintf "%.9f", $_ } @s[9,10]), "\n";'
+file_id() { # path
+  "$ENV" -i "$PERL" -e "$ID_PERL" "$1" 2>/dev/null
 }
 # Runs plutil with these arguments on the file given last, or, for a copy
 # kept in memory (mem:<name>, see copy_private), on those bytes through its
@@ -597,7 +628,7 @@ copy_state() {
 # True while state.json is still the file state_copy was made from.
 state_unchanged() {
   local now
-  now="$("$STAT" -L -f '%d:%i:%z:%m:%c' "$STATE" 2>/dev/null)" || return 1
+  now="$(file_id "$STATE")" || return 1
   [[ -n "$state_id" && "$now" == "$state_id" ]]
 }
 
@@ -1279,6 +1310,15 @@ journal_shape_problems() { # file
       [[ -z "$t" || "$t" == string || "$t" == "(any)" ]] || echo "sleepOffAttempt.marker is a $t, not a string"
       ty "$f" sleepOffAttempt.settled || return 2
       [[ -z "$t" || "$t" == bool || "$t" == "(any)" ]] || echo "sleepOffAttempt.settled is a $t, not a bool"
+      ty "$f" sleepOffAttempt.resumes || return 2
+      if [[ "$t" == dictionary ]]; then
+        ty "$f" sleepOffAttempt.resumes.startedAt || return 2
+        [[ -z "$t" || "$t" == integer || "$t" == "(any)" ]] || echo "sleepOffAttempt.resumes.startedAt is a $t, not an integer"
+        ty "$f" sleepOffAttempt.resumes.firstEnd || return 2
+        [[ -z "$t" || "$t" == integer || "$t" == "(any)" ]] || echo "sleepOffAttempt.resumes.firstEnd is a $t, not an integer"
+      elif [[ -n "$t" && "$t" != "(any)" ]]; then
+        echo "sleepOffAttempt.resumes is a $t, not an object"
+      fi
     fi
   fi
   return 0
@@ -1337,7 +1377,7 @@ epoch_at() { # file keypath
 # does not act on its endsAt either. Returns 2, with read_why, when a read
 # of the file failed: its shape is then unknown, not malformed.
 session_shape_problems() { # file
-  local f="$1" key t i c json v
+  local f="$1" key t i c v
   # plutil also reads XML and binary property lists, which the app's
   # JSONDecoder refuses, so the file itself must start with "{" too. head
   # ends after one byte, and tr may then end on SIGPIPE (141); any other
@@ -1353,10 +1393,19 @@ session_shape_problems() { # file
     return 2
   fi
   c="${c%.*}"; c="${c%.*}"
-  if [[ "$c" == "{" ]] && json="$(plutil_on -convert json -o - "$f" 2>/dev/null)"; then
-    c="${json:0:1}"
-  else
-    c=""
+  # Then plutil's conversion of the whole file. Only its own verdict on the
+  # bytes, exit 1 with "Property List error", makes the file malformed; any
+  # other failure is a read that failed, and the shape is unknown.
+  if [[ "$c" == "{" ]]; then
+    plutil_run -convert json -o - "$f"
+    if [[ "$plutil_rc" == 0 ]]; then
+      c="${plutil_out:0:1}"
+    elif [[ "$plutil_rc" == 1 && "$plutil_err" == *": Property List error: "* ]]; then
+      c=""
+    else
+      read_why="plutil -convert json exited ${plutil_rc:-?} (${plutil_err:-no message})"
+      return 2
+    fi
   fi
   if [[ "$c" != "{" ]]; then
     echo "session.json is not a JSON object"

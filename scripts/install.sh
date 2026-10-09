@@ -79,6 +79,9 @@ ID=/usr/bin/id
 # sudo is given visudo and install by full path. Given a bare name, it would
 # search the caller's PATH and run whatever it finds there as root.
 VISUDO=/usr/sbin/visudo
+# The shell sudo runs the repair of a receipt this user cannot open in
+# (repair_unreadable_receipt), by full path.
+ROOT_SHELL=/bin/bash
 LOCK_TIMEOUT_SECONDS=10
 # How long to wait for the receipt's lock before the release file is
 # written: the root command holds it from its checks until pmset exits.
@@ -906,21 +909,22 @@ receipt_sudo() { # what command...
 # Opens the receipt read-only on fd 7 and locks it as the root command and
 # every reader lock it, then reads its line under that lock (receipt_line)
 # and its nonce (receipt_nonce). Stops the install when any of that fails.
-lock_and_read_receipt() {
-  local rc=0
-  { exec 7<"$RECEIPT"; } 2>/dev/null || receipt_stop "$RECEIPT could not be opened"
-  "$LOCKF" -s -t "$RECEIPT_LOCK_TIMEOUT_SECONDS" 7 2>/dev/null || rc=$?
-  if (( rc != 0 )); then
-    "$CAT" >&2 <<FAIL
+receipt_locked_stop() { # lockf status
+  "$CAT" >&2 <<FAIL
 
 Install stopped: $RECEIPT stayed locked for ${RECEIPT_LOCK_TIMEOUT_SECONDS} s (lockf exit
-$rc): the command behind an Insomnia password dialog may be running, or
+$1): the command behind an Insomnia password dialog may be running, or
 another Insomnia folder of this user is settling a start. Rerun this script.
 Installed so far: $SUDOERS. The app at $APP and the LaunchAgent were not touched;
 the new build was discarded.
 FAIL
-    exit 1
-  fi
+  exit 1
+}
+lock_and_read_receipt() {
+  local rc=0
+  { exec 7<"$RECEIPT"; } 2>/dev/null || receipt_stop "$RECEIPT could not be opened"
+  "$LOCKF" -s -t "$RECEIPT_LOCK_TIMEOUT_SECONDS" 7 2>/dev/null || rc=$?
+  (( rc == 0 )) || receipt_locked_stop "$rc"
   receipt_line="$("$HEAD" -c 83 <&7 2>/dev/null; echo ".$?")"
   [[ "${receipt_line##*.}" == 0 ]] || receipt_stop "$RECEIPT could not be read under its lock (head exit ${receipt_line##*.})"
   receipt_line="${receipt_line%.*}"
@@ -999,15 +1003,79 @@ fi
 # first, as the root command and every reader lock it, the release file is
 # read under that lock, and the receipt must still be the locked file with
 # the same line before each chmod. One it cannot open (0600, no entry) is
-# refused by the app, the backstop and the root command until it has the
-# entry, so nothing can claim it or write it meanwhile; it gets the entry
-# first, and is locked and checked with the release file below. The entry
-# goes on before the mode, so this user can read the receipt throughout.
-# What this cannot help: a receipt repaired here is refused by the readers
-# of those earlier builds, which are still installed if this install stops
-# later. A receipt that is not root's 82-byte file with one link that only
-# root can change, or that has any other entry, is left as it is and stops
-# the install below.
+# locked by root instead, in the same sudo call that adds its entry
+# (repair_unreadable_receipt): a root command that opened it before the
+# entry went away may still hold it, which its mode does not show. The
+# entry goes on before the mode, so this user can read the receipt
+# throughout. A receipt this run just made needs none of that: no command
+# could open it before this run made it, and every one refuses it until it
+# has the entry. What this cannot help: a receipt repaired here is refused
+# by the readers of those earlier builds, which are still installed if this
+# install stops later, and those readers check its mode and entry before
+# they take its lock, so they may take a start of theirs as one whose
+# command may have written. A receipt that is not root's 82-byte file with
+# one link that only root can change, or that has any other entry, is left
+# as it is and stops the install below.
+# Run as root by repair_unreadable_receipt: opens the receipt on fd 7,
+# locks it as the root command and every reader lock it, and under that
+# lock checks that it is still the file this user saw (device, inode,
+# owner, mode, links, size, type), still has no entry, holds a receipt's
+# line, and that the release file is still as this user read it (absent,
+# or the same metadata and nonce and free). Then it becomes chmod +a with
+# fd 7 still open, so the lock lasts exactly as long as the change: no
+# SIGTERM can end the lock and leave the change running. Exit 90 with the
+# reason on standard output when a check fails, 91 when the receipt could
+# not be opened, lockf's status when the lock was not taken in time.
+# shellcheck disable=SC2016  # the $ below are for root's shell, not this one
+REPAIR_SH='set -u
+r=$1 meta=$2 name=$3 rel=$4 rmeta=$5 rbytes=$6 stat=$7 ls=$8 head=$9 chmod=${10} lockf=${11} wait=${12}
+refuse() { echo "$1"; exit 90; }
+exec 7<"$r" || { echo "$r could not be opened as root"; exit 91; }
+"$lockf" -s -t "$wait" 7 || exit $?
+[[ "$("$stat" -f "%d:%i %u %Lp %l %z %HT" "$r" 2>/dev/null)" == "$meta" ]] || refuse "$r changed before its lock was taken"
+[[ "$("$stat" -f "%d:%i" <&7 2>/dev/null)" == "${meta%% *}" ]] || refuse "$r was replaced before its lock was taken"
+l="$("$ls" -le "$r" 2>/dev/null)" && [[ "$l" == -* && "$l" != *$'"'"'\n'"'"'* ]] || refuse "$r gained an access control entry, or its list could not be read, before its lock was taken"
+line="$("$head" -c 83 <&7 2>/dev/null; echo ".$?")"
+[[ "$line" =~ ^[0-9A-F-]{36}\ [0-9A-F-]{36}\ (writing|refused)$'"'"'\n'"'"'\.0$ ]] || refuse "$r does not hold two nonces and writing or refused, or could not be read, under its lock"
+if [[ "$rmeta" == absent ]]; then
+  [[ ! -e "$rel" && ! -L "$rel" ]] || refuse "$rel appeared before the lock on the receipt was taken"
+else
+  [[ "$("$stat" -f "%d:%i %u %Lp %l %z %HT" "$rel" 2>/dev/null)" == "$rmeta" ]] || refuse "$rel changed before the lock on the receipt was taken"
+  [[ "$("$head" -c 43 "$rel" 2>/dev/null; echo ".$?")" == "$rbytes" ]] || refuse "$rel changed before the lock on the receipt was taken"
+fi
+exec "$chmod" +a "user:$name allow read" "$r"'
+# Adds this user's entry to a receipt this user cannot open, as root and
+# under its lock (REPAIR_SH), once the release file, read just now, shows
+# that no start claims it. Stops the install when anything changed or the
+# call fails.
+repair_unreadable_receipt() {
+  local meta rmeta rbytes rc=0
+  meta="$("$STAT" -f '%d:%i %u %Lp %l %z %HT' "$RECEIPT" 2>/dev/null)" || meta=""
+  [[ -n "$meta" ]] || receipt_stop "$RECEIPT could not be checked again"
+  rmeta=absent
+  rbytes=""
+  if [[ -e "$RELEASED" || -L "$RELEASED" ]]; then
+    rmeta="$("$STAT" -f '%d:%i %u %Lp %l %z %HT' "$RELEASED" 2>/dev/null)" || rmeta=""
+    rbytes="$(release_bytes)"
+    if [[ -z "$rmeta" || "$rmeta" == absent ]] || ! [[ "$rbytes" =~ ^[0-9A-F-]{36}\ free$'\n'\.0$ ]]; then
+      receipt_claimed_stop "$RELEASED changed while it was read, so whether a start claims the receipt is unknown"
+    fi
+  fi
+  bounded "$SUDO" -n "$ROOT_SHELL" -c "$REPAIR_SH" repair "$RECEIPT" "$meta" "$USER_NAME" "$RELEASED" "$rmeta" "$rbytes" "$STAT" "$LS" "$HEAD" "$CHMOD" "$LOCKF" "$RECEIPT_LOCK_TIMEOUT_SECONDS" || rc=$?
+  case "$rc" in
+    0) ;;
+    124|125)
+      echo >&2
+      sudo_stalled_note "$rc" "Install stopped: 'sudo chmod +a \"user:$USER_NAME allow read\" $RECEIPT', under the receipt's lock,"
+      echo "Installed so far: $SUDOERS. The app at $APP and the LaunchAgent were not touched; the new build was discarded." >&2
+      exit 1 ;;
+    75) receipt_locked_stop "$rc" ;;
+    90) receipt_claimed_stop "${BOUNDED_OUTPUT:-a check under the lock failed}" ;;
+    *)
+      if [[ -n "$BOUNDED_OUTPUT" ]]; then printf '%s\n' "$BOUNDED_OUTPUT" >&2; fi
+      receipt_sudo_failed "sudo chmod +a \"user:$USER_NAME allow read\" $RECEIPT, under the receipt's lock" "$rc" ;;
+  esac
+}
 if [[ -z "$(receipt_base_problem)" ]]; then
   entries="$(receipt_entries)"
   mode="$("$STAT" -f '%Lp' "$RECEIPT" 2>/dev/null)" || mode=""
@@ -1023,7 +1091,11 @@ if [[ -z "$(receipt_base_problem)" ]]; then
     fi
     if [[ "$entries" == none ]]; then
       if (( repair_locked )); then receipt_still_locked; fi
-      receipt_sudo "sudo chmod +a \"user:$USER_NAME allow read\" $RECEIPT" "$CHMOD" +a "user:$USER_NAME allow read" "$RECEIPT"
+      if (( repair_locked || receipt_made )); then
+        receipt_sudo "sudo chmod +a \"user:$USER_NAME allow read\" $RECEIPT" "$CHMOD" +a "user:$USER_NAME allow read" "$RECEIPT"
+      else
+        repair_unreadable_receipt
+      fi
     fi
     if [[ "$mode" != 600 ]]; then
       if (( repair_locked )); then receipt_still_locked; fi
