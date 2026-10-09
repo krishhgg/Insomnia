@@ -1319,6 +1319,18 @@ final class CutoffAgreementTests: XCTestCase {
                 }
             }
         }
+        // The text cut short and the escape JSON does not have also with the
+        // other ways the binary fails, on the record, as the test of configs
+        // read neither way ran them before round 33.
+        for n in [2, 3] {
+            for b in [0, 2, 3] {
+                for (battery, level, ends) in [(50, 3, false), (39, 0, true)] {
+                    let logs = (ends ? ["below the 40% end floor"] : []) + ["read here, the app rejects it: ", "read here: a 40% end floor and thermal rules off"]
+                    cases.append(try policyCase("\(n)-break\(b)-\(battery)", config: configs[n].bytes, journal: .record("40 false"), battery: battery, level: level,
+                                                breakIt: binaryBreaks[b], ends: ends, logs: logs))
+                }
+            }
+        }
 
         let logs = try await runPolicyCases(cases)
 
