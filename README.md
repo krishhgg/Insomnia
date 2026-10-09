@@ -133,8 +133,13 @@ sandboxed. The app, scripts, and journals are local; hotspot passwords use the
 login Keychain, not the configuration file.
 
 The rule is one file for the whole Mac and grants one account. The installer
-reads it through sudo first and stops, changing nothing, when it grants
-another account. It then writes the rule in one `sudo /bin/bash -c` call.
+reads it first and stops, changing nothing, when it has a line for another
+account. A rule your account can read is read without sudo, with a 30 s
+limit, and judged before the password prompt. One only root can read (the
+rule the installer writes is root's, mode 0440) is read with `sudo -n cat`
+right after the one password prompt (`sudo -v`). A rule that cannot be read
+in full stops the install too. It then writes the rule in one `sudo
+/bin/bash -c` call.
 That root shell takes a lock file in the rule's own folder,
 `/etc/sudoers.d/.insomnia-sudoers.lock` (sudo skips a name with a dot).
 Before opening it, root checks that every folder above it is root's and
@@ -261,9 +266,13 @@ The `backstop.sh` the installer runs under the lock to end a stale session
 has a 300 s limit of its own. At the limit it gets SIGTERM only, never
 SIGKILL, since it may be running `sudo pmset`. Each `sudo pmset` or app
 binary call it started keeps the lock through its own supervisor until that
-call has exited, even if the backstop or the installer is killed first. A
-backstop still running three seconds after its SIGTERM keeps the lock until
-it ends, and the installer stops, prints its pid and replaces nothing. The
+call has exited, even if the backstop or the installer is killed first. The
+backstop and everything it starts run in a process group of their own, so
+closing the Terminal window does not reach them: the backstop runs to its
+end or its limit with the lock held, and the SIGTERM at the limit goes to
+the backstop process alone. A backstop still running three seconds after
+its SIGTERM keeps the lock until it ends, and the installer stops, prints
+its pid and replaces nothing. The
 backstop reads no Info.plist under the lock. The installer reads
 `InsomniaResumeFrozenVersion` and the file's identity before it takes the
 lock (from the bundle an interrupted install set aside, when that bundle is
@@ -716,7 +725,15 @@ while a `stat` under the lock (which reads no contents) shows the same file
 unchanged. That backstop run has a 300 s limit and gets SIGTERM only
 at the limit: a backstop still running three seconds after its SIGTERM
 keeps the lock until it ends, and the uninstaller stops, names its pid and
-removes nothing. A backstop sealed in a bundle from an earlier release does
+removes nothing. The backstop and everything it starts run in a process
+group of their own, so closing the Terminal window does not reach them: the
+backstop runs to its end or its limit with the lock held, and the SIGTERM
+at the limit goes to the backstop process alone. So a `sudo pmset` started
+by a backstop that takes the recovery lock, from this build or an earlier
+one, keeps the lock until that sudo has ended, even after the uninstaller
+or the backstop is gone. The oldest copies in Application Support take no
+lock and run `sudo pmset` in the foreground: a SIGTERM at the limit can
+leave that sudo running after the lock is released. A backstop sealed in a bundle from an earlier release does
 not know these variables. It reads the Info.plist and the journal itself,
 with no limit on each read, though the 300 s limit on its run still applies.
 A journal check whose read fails, is cut short, prints a NUL byte or does not
@@ -726,9 +743,15 @@ backstop stops it too, whether or not it can be read. If the later read for
 a brightness Insomnia kept fails, the journal is kept.
 
 The sudoers rule is one file for the whole Mac and names the account whose
-install wrote it. The uninstaller reads it through sudo and removes it only
-when it is exactly the rule the installer writes for your account; otherwise
-it keeps the file and says why. It removes the rule only if root, under the
+install wrote it. Before it asks the app to quit, the uninstaller reads the
+rule and stops, removing nothing, when it has a line for another account,
+since that account's agent may need it to undo a session. A rule your
+account can read is read without sudo, with the 30 s limit, and judged
+before the password prompt; one only root can read is read with `sudo -n
+cat` right after it. A rule that cannot be read in full stops the uninstall
+as well. Under the recovery lock it reads the rule through sudo again and
+removes it only when it is exactly the rule the installer writes for your
+account; otherwise it keeps the file and says why. It removes the rule only if root, under the
 lock the installer takes for its write, finds the text it read, and then,
 just before the removal, finds the folders, the lock file and every ACL
 still as they must be and reads the same bytes from the same file again.

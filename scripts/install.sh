@@ -72,7 +72,9 @@ LS=/bin/ls
 # What root's shell asks whether an access control list entry is root's own
 # (r_root): read only, never a change.
 DSMEMBERUTIL=/usr/bin/dsmemberutil
-WC=/usr/bin/wc
+# The most bytes work_read takes from one file (a call's output, status or
+# pid, a note): a longer file reads as not read back.
+READ_MAX_BYTES=1048576
 CHOWN=/usr/sbin/chown
 VISUDO=/usr/sbin/visudo
 # The shell sudoers_replace runs as root.
@@ -148,11 +150,16 @@ command_line() { local line; line="$(printf '%q ' "$@")"; printf '%s' "${line% }
 
 # Run one external call with a time limit, so a call that stalls (a sudo
 # policy or directory-service lookup, a launchd that does not answer) cannot
-# keep this run waiting forever. Its combined output is left in
-# BOUNDED_OUTPUT (trailing newline removed) and in the file $BOUNDED_BASE.out
-# byte for byte, and its exit status returned, or 124 when it did not finish
-# within CALL_TIMEOUT_SECONDS and was stopped, or 125 when it is sudo and
-# still running (pid in BOUNDED_PID).
+# keep this run waiting forever. Its exit status is returned, or 124 when it
+# did not finish within CALL_TIMEOUT_SECONDS and was stopped (or its status
+# could not be read back as one line of digits), or 125 when it is sudo and
+# still running (pid in BOUNDED_PID). Its combined output is read back once,
+# with work_read: byte for byte in READ_TEXT and READ_HEAD, work_read's
+# status in BOUNDED_READ (0 read whole, 1 with a NUL byte, 2 not read back),
+# and in BOUNDED_OUTPUT the text before any NUL byte without its last
+# newline, empty when it was not read back. A caller that acts on the output
+# checks BOUNDED_READ first. The status and the pid come back through
+# work_read too, so no read made after the call can hold this run either.
 #
 # supervise() starts the call in the background and enforces the limit
 # itself, so the limit holds even if this run is killed while it waits. Once
@@ -177,23 +184,30 @@ command_line() { local line; line="$(printf '%q ' "$@")"; printf '%s' "${line% }
 # BOUNDED_LIMIT, and one whose command must never get SIGKILL sets
 # BOUNDED_TERM_ONLY=1, both as locals of its own (see run_backstop). Such a
 # call is then handled as sudo is: 125 while it is still running after its
-# SIGTERM.
+# SIGTERM. One that sets BOUNDED_OWN_GROUP=1 as well has the supervisor and
+# the call started in a process group of their own (set -m around the one
+# `&`), so no signal sent to this run's process group reaches the call or
+# anything it started; only the supervisor's SIGTERM at the limit does.
 BOUNDED_OUTPUT=""
+BOUNDED_READ=2
 BOUNDED_PID=""
-BOUNDED_BASE=""
 BOUNDED_LIMIT=""
 BOUNDED_TERM_ONLY=""
-# shellcheck disable=SC2034  # BOUNDED_BASE is read in uninstall.sh, whose bounded() is this one
+BOUNDED_OWN_GROUP=""
 bounded() { # command args...
   local base supervisor rc deadline limit="${BOUNDED_LIMIT:-$CALL_TIMEOUT_SECONDS}" term_only=0 polls=0
+  local pid_form=$'^([0-9]+)\n?$' rc_form=$'^([0-9]{1,3})\n$'
   if [[ "$1" == "$SUDO" || -n "${BOUNDED_TERM_ONLY:-}" ]]; then term_only=1; fi
-  BOUNDED_BASE=""
   BOUNDED_OUTPUT=""
+  BOUNDED_READ=2
   BOUNDED_PID=""
+  READ_TEXT=""
+  READ_HEAD=""
   base="$("$MKTEMP" "$WORK/call.XXXXXX")" || return 126
-  BOUNDED_BASE="$base"
+  if [[ -n "${BOUNDED_OWN_GROUP:-}" ]]; then set -m; fi
   supervise "$base" "$limit" "$term_only" "$@" </dev/null >/dev/null 2>&1 &
   supervisor=$!
+  set +m
   if (( term_only )); then
     # The supervisor's limit (at most a second over), then at least two
     # seconds for the call to stop on SIGTERM.
@@ -203,7 +217,10 @@ bounded() { # command args...
       polls=$((polls + 1))
     done
     if [[ ! -s "$base.rc" ]]; then
-      BOUNDED_PID="$(cat "$base.pid" 2>/dev/null || true)"
+      # The pid is for messages only: nothing here signals it.
+      if work_read "$base.pid" && [[ "$READ_TEXT" =~ $pid_form ]]; then BOUNDED_PID="${BASH_REMATCH[1]}"; fi
+      READ_TEXT=""
+      READ_HEAD=""
       return 125
     fi
   fi
@@ -211,31 +228,47 @@ bounded() { # command args...
   # this wait ends.
   wait "$supervisor" 2>/dev/null || true
   rc=124
-  if [[ -s "$base.rc" ]]; then read -r rc < "$base.rc"; fi
-  IFS= read -r -d '' BOUNDED_OUTPUT < "$base.out" || true
-  BOUNDED_OUTPUT="${BOUNDED_OUTPUT%$'\n'}"
+  if work_read "$base.rc" && [[ "$READ_TEXT" =~ $rc_form ]] && (( 10#${BASH_REMATCH[1]} <= 255 )); then
+    rc=$(( 10#${BASH_REMATCH[1]} ))
+  fi
+  BOUNDED_READ=0
+  work_read "$base.out" || BOUNDED_READ=$?
+  BOUNDED_OUTPUT="${READ_HEAD%$'\n'}"
   return "$rc"
 }
 # The supervising process of one bounded() call; it runs in the background.
 # The call is its only job, so `kill %1` signals the call, and the shell
-# skips a job it has already reaped: a reused pid is never signalled. The
-# status file is written once the call has been reaped.
+# skips a job it has already reaped: a reused pid is never signalled. Bash
+# records that job under the process group the supervisor was started in,
+# and when that is a group of its own (BOUNDED_OWN_GROUP), `kill %1` would
+# signal the whole group, the call's own children too. Turning job control
+# on and off again before the call starts clears that record, so `kill %1`
+# always signals the call alone. The status file is written once the call
+# has been reaped.
+# The call's output, its pid and the status go to files opened read-write:
+# unlike a write-only open, that never waits for a reader when a FIFO stands
+# at the name, so no such file can hold the supervisor, the lock it keeps,
+# or bounded()'s wait for it. bounded() reads them back with work_read,
+# which takes nothing but a regular file.
 # Like backstop.sh's supervisor, it ignores SIGTERM and SIGHUP, so a signal
 # sent to this run's whole process group (a closed terminal, or launchd once
 # a job's main process has gone) does not end it while its call runs. sudo
 # closes its copy of fd 9, so the supervisor may be the only holder of the
 # recovery lock until the call has exited. The call gets back the SIGTERM
 # and SIGHUP actions this script started with, so it still stops on the
-# SIGTERM at its limit or from the group. errexit is off here: a failed
-# write must not end the supervisor while its call runs.
+# SIGTERM at its limit, and on one sent to the group when it shares this
+# run's group. errexit is off here: a failed write must not end the
+# supervisor while its call runs.
 supervise() { # base limit term-only command args...
   local base="$1" limit="$2" term_only="$3" cpid rc=0 deadline polls=0
   shift 3
   set +e
   trap '' TERM HUP
-  ( trap - TERM HUP; exec "$@" ) </dev/null >"$base.out" 2>&1 &
+  set -m
+  set +m
+  ( trap - TERM HUP; exec "$@" ) </dev/null 1<>"$base.out" 2>&1 &
   cpid=$!
-  echo "$cpid" > "$base.pid"
+  echo "$cpid" 1<>"$base.pid"
   deadline=$(( SECONDS + limit ))
   while kill -0 "$cpid" 2>/dev/null && (( SECONDS <= deadline )); do
     if (( polls < 50 )); then sleep 0.002; else sleep 0.05; fi
@@ -252,11 +285,11 @@ supervise() { # base limit term-only command args...
       if [[ -n "$(jobs -rp)" ]]; then kill -KILL %1 2>/dev/null || true; fi
     fi
     wait "$cpid" 2>/dev/null || true
-    echo 124 > "$base.rc"
+    echo 124 1<>"$base.rc"
     return
   fi
   wait "$cpid" || rc=$?
-  echo "$rc" > "$base.rc"
+  echo "$rc" 1<>"$base.rc"
 }
 # How a bounded call's exit status reads in a message.
 call_result() { # status
@@ -266,28 +299,68 @@ call_result() { # status
     printf 'exited %s' "$1"
   fi
 }
-# Reads a file this run wrote in WORK (a call's output) into READ_TEXT byte
-# for byte, without $(...), which drops NUL bytes and trailing newlines.
+# The same for a bounded call whose output was read: when it exited 0, what
+# was wrong with that output (BOUNDED_READ, from work_read).
+read_result() { # status
+  if (( $1 != 0 )); then
+    call_result "$1"
+  elif (( BOUNDED_READ == 1 )); then
+    printf 'exited 0, but printed a NUL byte'
+  else
+    printf 'exited 0, but what it printed could not be read back in full'
+  fi
+}
+# Reads a file this run made (a call's output, status or pid, a note, or
+# the app binary's answer) into READ_TEXT byte for byte, without $(...),
+# which drops NUL bytes and trailing newlines. Only bash itself opens and
+# reads it, through one descriptor, so no program that hangs can hold the
+# read. The open is read-write: a read-only open of a FIFO waits for a
+# writer, and this one does not. The open descriptor must be a regular file,
+# at most READ_MAX_BYTES are taken from it, so a file that keeps growing
+# cannot hold the read either, and after the read the name must still lead
+# to that file (the same inode), so a file swapped in meanwhile is not taken
+# for it. The name is checked first, so the open creates nothing unless the
+# file goes in between, which only this account could make happen: the
+# folder is this run's own (mktemp -d, mode 0700) or the app's.
 # Returns 0 when all of it was read; 1 when it has a NUL byte, which no shell
 # variable can hold (READ_TEXT is then the text without them and trailing
 # newlines, and READ_HEAD the text before the first); 2 when it is not a
-# regular file, or the read failed or came up short of the size wc gives.
-# READ_HEAD is READ_TEXT otherwise. WORK is this run's own folder (mktemp
-# -d, mode 0700), so only this account could put anything else there.
+# regular file, is longer than READ_MAX_BYTES, could not be opened or read
+# (bash leaves the variable of a read that failed unset, and sets it at the
+# end of the file), or was swapped. READ_HEAD is READ_TEXT otherwise.
 work_read() { # file -> READ_TEXT, READ_HEAD
-  local LC_ALL=C size
+  local LC_ALL=C part text="" head="" nul=0 left=$(( READ_MAX_BYTES + 1 ))
   READ_TEXT=""
   READ_HEAD=""
   [[ -f "$1" && ! -L "$1" ]] || return 2
-  size="$("$WC" -c 2>/dev/null < "$1")" || return 2
-  size="${size//[!0-9]/}"
-  [[ -n "$size" ]] || return 2
-  if IFS= read -r -d '' READ_HEAD 2>/dev/null < "$1"; then
-    READ_TEXT="$(<"$1")" || return 2
+  {
+    [[ -f /dev/fd/3 ]] || return 2
+    while :; do
+      unset -v part
+      if IFS= read -r -d '' -n "$left" -u 3 part; then
+        # A NUL byte ended this part, unless it took all that was left.
+        (( ${#part} < left )) || return 2
+        (( nul )) || head="$part"
+        nul=1
+        text="$text$part"
+        left=$(( left - ${#part} - 1 ))
+        (( left > 0 )) || return 2
+      else
+        [[ -n "${part+set}" ]] || return 2
+        text="$text$part"
+        break
+      fi
+    done
+    [[ -f "$1" && ! -L "$1" ]] || return 2
+    { [[ /dev/fd/3 -ef /dev/fd/4 ]]; } 4<>"$1" || return 2
+  } 2>/dev/null 3<>"$1" || return 2
+  if (( nul )); then
+    READ_HEAD="$head"
+    READ_TEXT="${text%"${text##*[!$'\n']}"}"
     return 1
   fi
-  READ_TEXT="$READ_HEAD"
-  (( ${#READ_TEXT} == 10#$size )) || return 2
+  READ_TEXT="$text"
+  READ_HEAD="$text"
   return 0
 }
 # The InsomniaResumeFrozenVersion an installed app's Info.plist declares,
@@ -314,7 +387,7 @@ info_identity() { # file
     return 1
   fi
   INFO_ID=""
-  if work_read "$BOUNDED_BASE.out"; then INFO_ID="${READ_TEXT%$'\n'}"; fi
+  if (( BOUNDED_READ == 0 )); then INFO_ID="${READ_TEXT%$'\n'}"; fi
   if [[ ! "$INFO_ID" =~ $form ]]; then
     INFO_PROBLEM="'stat' exited 0, but its output could not be read back as the file's identity"
     return 1
@@ -334,7 +407,7 @@ read_info_version() { # file
   if [[ "$before" != none ]]; then
     bounded "$PLUTIL" -extract InsomniaResumeFrozenVersion raw -o - "$1" || rc=$?
     if (( rc == 0 )); then
-      if ! work_read "$BOUNDED_BASE.out"; then
+      if (( BOUNDED_READ != 0 )); then
         INFO_PROBLEM="'plutil -extract InsomniaResumeFrozenVersion' exited 0, but its output could not be read back whole"
         return 1
       fi
@@ -368,14 +441,21 @@ read_info_version() { # file
 # call it started keeps the recovery lock through its own supervisor until
 # that call has exited. It shares this run's lock through fd 9, which the
 # supervisor here keeps until the backstop has exited, even if this run is
-# killed first. The InsomniaResumeFrozenVersion read before the lock, and
-# the identity of the file it came from, go down in its environment (see
-# read_info_version). Returns the backstop's status, or 124 when it was
-# stopped at its limit, 125 when it was still running three seconds after
-# its SIGTERM (pid in BOUNDED_PID; it keeps the lock until it ends), 126
-# when it could not be started. What it printed is printed once it ends.
+# killed first. The supervisor and the backstop run in a process group of
+# their own (BOUNDED_OWN_GROUP), so a signal sent to this run's group (a
+# closed terminal, or launchd once this run has gone) reaches nothing the
+# backstop started, and the SIGTERM at the limit goes to the backstop
+# process alone. So a backstop from an older build, whose supervisor for
+# sudo pmset does not ignore SIGTERM and SIGHUP, still keeps the lock in
+# that supervisor until its sudo has ended and been reaped. The
+# InsomniaResumeFrozenVersion read before the lock, and the identity of the
+# file it came from, go down in its environment (see read_info_version).
+# Returns the backstop's status, or 124 when it was stopped at its limit,
+# 125 when it was still running three seconds after its SIGTERM (pid in
+# BOUNDED_PID; it keeps the lock until it ends), 126 when it could not be
+# started. What it printed is printed once it ends.
 run_backstop() { # backstop.sh
-  local rc=0 BOUNDED_LIMIT="$BACKSTOP_TIMEOUT_SECONDS" BOUNDED_TERM_ONLY=1
+  local rc=0 BOUNDED_LIMIT="$BACKSTOP_TIMEOUT_SECONDS" BOUNDED_TERM_ONLY=1 BOUNDED_OWN_GROUP=1
   local INSOMNIA_INFO_PATH="$INFO_PLIST" INSOMNIA_INFO_EVIDENCE="$INFO_EVIDENCE" INSOMNIA_INFO_VERSION="$INFO_VERSION"
   export INSOMNIA_INFO_PATH INSOMNIA_INFO_EVIDENCE INSOMNIA_INFO_VERSION
   bounded /bin/bash "$1" --force || rc=$?
@@ -509,6 +589,7 @@ known_id() { # pid bundle
 }
 find_insomnia() {
   local pid pids rc owner owner_why exe bundle id desc this
+  local pid_lines=$'^[0-9]+(\n[0-9]+)*$'
   APP_FOUND=(); UNVERIFIED=(); OTHER_ACCOUNT=(); UNKNOWN_OWNER=(); OTHER_FOUND=(); BLOCKING=(); PGREP_PROBLEM=""
   # pgrep exits 1 when no process has the name.
   rc=0
@@ -516,6 +597,14 @@ find_insomnia() {
   pids="$BOUNDED_OUTPUT"
   if (( rc != 0 && rc != 1 )); then
     PGREP_PROBLEM="pgrep $(call_result "$rc")"
+  elif (( BOUNDED_READ != 0 )); then
+    PGREP_PROBLEM="pgrep exited $rc, but its output could not be read back"
+  elif (( rc == 0 )) && [[ ! "$pids" =~ $pid_lines ]]; then
+    PGREP_PROBLEM="pgrep exited 0, but did not print one process ID per line"
+  elif (( rc == 1 )) && [[ -n "$pids" ]]; then
+    PGREP_PROBLEM="pgrep exited 1, but printed something"
+  fi
+  if [[ -n "$PGREP_PROBLEM" ]]; then
     UNVERIFIED+=("$PGREP_PROBLEM")
     BLOCKING+=("$PGREP_PROBLEM")
     return 0
@@ -529,6 +618,8 @@ find_insomnia() {
     owner_why=""
     if (( rc != 0 )); then
       owner_why="ps -o uid= $(call_result "$rc")"
+    elif (( BOUNDED_READ != 0 )); then
+      owner_why="ps -o uid= exited 0, but its output could not be read back"
     elif [[ -z "$owner" ]]; then
       owner_why="ps -o uid= printed nothing"
     elif [[ ! "$owner" =~ ^[0-9]+$ ]]; then
@@ -537,7 +628,7 @@ find_insomnia() {
     rc=0
     bounded "$PS" -o comm= -p "$pid" || rc=$?
     exe=""
-    if (( rc == 0 )); then exe="$BOUNDED_OUTPUT"; fi
+    if (( rc == 0 && BOUNDED_READ == 0 )); then exe="$BOUNDED_OUTPUT"; fi
     id=""
     desc="${exe:-executable path unknown}"   # what the messages say; gains the reason when unverified
     if [[ "$exe" == /*/Contents/MacOS/* ]]; then
@@ -546,7 +637,7 @@ find_insomnia() {
       rc=0
       if [[ -z "$id" ]] && (( PLIST_READS == 1 )); then
         bounded "$PLUTIL" -extract CFBundleIdentifier raw -o - "$bundle/Contents/Info.plist" || rc=$?
-        if (( rc == 0 )); then id="${BOUNDED_OUTPUT%%$'\n'*}"; fi
+        if (( rc == 0 && BOUNDED_READ == 0 )); then id="${BOUNDED_OUTPUT%%$'\n'*}"; fi
         if [[ -n "$id" ]]; then KNOWN_IDS+=("$pid|$bundle|$id"); fi
       fi
       if [[ -z "$id" ]]; then
@@ -640,6 +731,21 @@ sudoers_for_others() { # file content
     return 0
   done <<< "$1"
   return 0
+}
+# Stops the install when the rule's text $1 has a line for anyone but $USER
+# (sudoers_for_others). Nothing has been changed by then.
+stop_for_rule_of_others() { # file content
+  local why
+  why="$(sudoers_for_others "$1")"
+  if [[ "$why" == grants\ * ]]; then
+    echo "$SUDOERS $why, not $USER. Another account installed Insomnia, and its recovery agent needs that rule to undo a session, even one whose app crashed. This Mac has room for one rule, so this install would take it away." >&2
+    echo "Uninstall Insomnia in that account first. If that account no longer exists, remove the rule with 'sudo rm $SUDOERS', then rerun. Nothing was changed." >&2
+    exit 1
+  elif [[ -n "$why" ]]; then
+    echo "$SUDOERS $why. Replacing the file would drop that line." >&2
+    echo "Check it, remove the file with 'sudo rm $SUDOERS' if nothing needs it, then rerun. Nothing was changed." >&2
+    exit 1
+  fi
 }
 # Stops the run when Insomnia runs in another account, when a process named
 # Insomnia has an owner ps could not give, or when pgrep could not say
@@ -1134,35 +1240,76 @@ fi
 #    in another account stops the install before the first sudo
 #    (find_insomnia), and so does a process named Insomnia whose owner or
 #    identity cannot be read and that is still listed after
-#    QUIT_WAIT_SECONDS (await_identified). So does a rule that grants
-#    another account: that account's agent needs it to undo a session even
-#    after its app crashed, when no process of it is left to find. The rule
-#    is written only if it is still what was read here (sudoers_replace).
+#    QUIT_WAIT_SECONDS (await_identified). So does a rule with a line for
+#    another account (stop_for_rule_of_others): that account's agent needs
+#    it to undo a session even after its app crashed, when no process of it
+#    is left to find. A rule this account can read is judged before the
+#    first sudo, the password prompt included; one only root can read (the
+#    rule this script writes is root's, mode 0440) right after the prompt.
+#    A rule that cannot be read in full stops the install either way. The
+#    rule is written only if it is still what was read here
+#    (sudoers_replace).
 find_insomnia
 await_identified
 stop_for_other_accounts "Nothing was changed."
 stop_for_unverified "Nothing was changed."
+if [[ -e "$SUDOERS" && -r "$SUDOERS" ]]; then
+  read_rc=0
+  bounded "$CAT" "$SUDOERS" || read_rc=$?
+  if (( read_rc != 0 || BOUNDED_READ != 0 )); then
+    # What a cat that exited 0 printed is the rule, not an error.
+    (( read_rc != 0 )) || BOUNDED_OUTPUT=""
+    echo "Could not read $SUDOERS ('cat' $(read_result "$read_rc")${BOUNDED_OUTPUT:+: $BOUNDED_OUTPUT}), so whether it grants another account is not known. Nothing was changed." >&2
+    exit 1
+  fi
+  stop_for_rule_of_others "$BOUNDED_OUTPUT"
+fi
 step "Writing $SUDOERS (requires your password once)"
+# The password is asked here, once. The calls that read the rule after it
+# are `sudo -n` and bounded, so a read that does not answer is stopped
+# instead of waiting; visudo and the transaction below use the same
+# authentication.
+if ! "$SUDO" -v; then
+  echo "sudo did not authenticate, so $SUDOERS was not written. Nothing was changed." >&2
+  exit 1
+fi
 sudoers_expect=absent
 sudoers_text=""
-if [[ -e "$SUDOERS" ]] || "$SUDO" "$TEST" -e "$SUDOERS"; then
+sudoers_present=0
+if [[ -e "$SUDOERS" ]]; then
+  sudoers_present=1
+else
+  test_rc=0
+  bounded "$SUDO" -n "$TEST" -e "$SUDOERS" || test_rc=$?
+  if (( test_rc == 0 )); then
+    sudoers_present=1
+  elif (( test_rc == 125 )); then
+    echo "'sudo -n test -e $SUDOERS' did not answer within ${CALL_TIMEOUT_SECONDS}s, so whether a rule is there is not known. $(sudo_alive_note). Nothing was changed." >&2
+    exit 1
+  elif (( test_rc != 1 || BOUNDED_READ != 0 )) || [[ -n "$BOUNDED_OUTPUT" ]]; then
+    echo "'sudo -n test -e $SUDOERS' $(read_result "$test_rc")${BOUNDED_OUTPUT:+ ($BOUNDED_OUTPUT)}, so whether a rule is there is not known. Nothing was changed." >&2
+    exit 1
+  fi
+fi
+if (( sudoers_present )); then
   # Root-only, so it is read through sudo, the same way uninstall.sh reads it.
-  # The text stays in this shell, never in a file, and goes to root as it is.
-  if ! sudoers_text="$("$SUDO" "$CAT" "$SUDOERS")"; then
+  # The text goes to root as it was read, trailing newlines cut, as $(...)
+  # would cut them.
+  read_rc=0
+  bounded "$SUDO" -n "$CAT" "$SUDOERS" || read_rc=$?
+  if (( read_rc == 125 )); then
+    echo "'sudo -n cat $SUDOERS' did not answer within ${CALL_TIMEOUT_SECONDS}s, so it was not replaced. $(sudo_alive_note). Nothing was changed." >&2
+    exit 1
+  elif (( read_rc != 0 || BOUNDED_READ != 0 )); then
+    # What a cat that exited 0 printed is the rule, not an error.
+    (( read_rc != 0 )) || BOUNDED_OUTPUT=""
     echo "Could not read $SUDOERS through sudo, so it was not replaced. Nothing was changed." >&2
+    echo "'sudo -n cat $SUDOERS' $(read_result "$read_rc")${BOUNDED_OUTPUT:+: $BOUNDED_OUTPUT}" >&2
     exit 1
   fi
+  sudoers_text="${BOUNDED_OUTPUT%"${BOUNDED_OUTPUT##*[!$'\n']}"}"
   sudoers_expect=same
-  sudoers_why="$(sudoers_for_others "$sudoers_text")"
-  if [[ "$sudoers_why" == grants\ * ]]; then
-    echo "$SUDOERS $sudoers_why, not $USER. Another account installed Insomnia, and its recovery agent needs that rule to undo a session, even one whose app crashed. This Mac has room for one rule, so this install would take it away." >&2
-    echo "Uninstall Insomnia in that account first. If that account no longer exists, remove the rule with 'sudo rm $SUDOERS', then rerun. Nothing was changed." >&2
-    exit 1
-  elif [[ -n "$sudoers_why" ]]; then
-    echo "$SUDOERS $sudoers_why. Replacing the file would drop that line." >&2
-    echo "Check it, remove the file with 'sudo rm $SUDOERS' if nothing needs it, then rerun. Nothing was changed." >&2
-    exit 1
-  fi
+  stop_for_rule_of_others "$sudoers_text"
 fi
 TMP_SUDOERS="$("$MKTEMP")"
 sudoers_rule_text > "$TMP_SUDOERS"
@@ -1467,6 +1614,10 @@ plist_pins_previous() {
     return 124
   elif (( rc != 0 )); then
     PINS_UNKNOWN="'plutil -extract ProgramArguments.4', which reads the requirement $PLIST pins, $(call_result "$rc")."
+    return 124
+  fi
+  if (( BOUNDED_READ != 0 )); then
+    PINS_UNKNOWN="'plutil -extract ProgramArguments.4', which reads the requirement $PLIST pins, exited 0, but its output could not be read back."
     return 124
   fi
   pinned="$BOUNDED_OUTPUT"

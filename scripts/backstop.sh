@@ -210,7 +210,9 @@ MV=/bin/mv
 CP=/bin/cp
 MKTEMP=/usr/bin/mktemp
 CAT=/bin/cat
-WC=/usr/bin/wc
+# The most bytes work_read takes from one file (a call's output, status or
+# pid, a note): a longer file reads as not read back.
+READ_MAX_BYTES=1048576
 STAT=/usr/bin/stat
 # The installed app binary, for the microsecond identity check of
 # frozenProcesses entries (see above), and the bundle's Info.plist, which
@@ -294,8 +296,11 @@ signal_job() { # signal pid
 }
 
 # Run one read (plutil, cat, cp, stat or ps) with a time limit. Its
-# combined output goes to $BOUNDED_BASE.out, a new file in WORK, and its
-# exit status is returned; 124 when it did not finish within
+# combined output goes to a new file in WORK, read back once the read has
+# ended with work_read: into READ_TEXT and READ_HEAD, with work_read's
+# status in BOUNDED_READ (2, not read back, also when the read did not end
+# in time or could not start). Its exit status is returned; 124 when it did
+# not finish within
 # READ_TIMEOUT_SECONDS (on bash's SECONDS clock, so up to a second more), or
 # 126 when no file for its output could be made. The read is a background
 # job of this shell started without fd 9: a read needs no lock, and one left
@@ -310,11 +315,13 @@ signal_job() { # signal pid
 # $(...) subshell the counter starts again from the parent's value. The
 # function's stderr is /dev/null, since bash reports a job a signal ended
 # on its own stderr.
-BOUNDED_BASE=""
+BOUNDED_READ=2
 bounded_reads=0
 bounded() { # command args...
   local out cpid rc=0 spins=0 polls=0 deadline
-  BOUNDED_BASE=""
+  BOUNDED_READ=2
+  READ_TEXT=""
+  READ_HEAD=""
   while :; do
     bounded_reads=$((bounded_reads + 1))
     out="$WORK/call.$bounded_reads.out"
@@ -324,7 +331,6 @@ bounded() { # command args...
     set +C
     return 126
   done
-  BOUNDED_BASE="${out%.out}"
   deadline=$(( SECONDS + READ_TIMEOUT_SECONDS ))
   "$@" </dev/null >"$out" 2>&1 9>&- &
   cpid=$!
@@ -345,6 +351,8 @@ bounded() { # command args...
     return 124
   fi
   wait "$cpid" || rc=$?
+  BOUNDED_READ=0
+  work_read "$out" || BOUNDED_READ=$?
   return "$rc"
 } 2>/dev/null
 # How a bounded read's exit status reads in a message.
@@ -368,28 +376,57 @@ call_result() { # status
 # notes go to a file because most reads run inside $(...). The text from
 # work_read to snapshot is the same as in uninstall.sh (a test keeps the
 # two in step).
-# Reads a file this run wrote in WORK (a call's output) into READ_TEXT byte
-# for byte, without $(...), which drops NUL bytes and trailing newlines.
+# Reads a file this run made (a call's output, status or pid, a note, or
+# the app binary's answer) into READ_TEXT byte for byte, without $(...),
+# which drops NUL bytes and trailing newlines. Only bash itself opens and
+# reads it, through one descriptor, so no program that hangs can hold the
+# read. The open is read-write: a read-only open of a FIFO waits for a
+# writer, and this one does not. The open descriptor must be a regular file,
+# at most READ_MAX_BYTES are taken from it, so a file that keeps growing
+# cannot hold the read either, and after the read the name must still lead
+# to that file (the same inode), so a file swapped in meanwhile is not taken
+# for it. The name is checked first, so the open creates nothing unless the
+# file goes in between, which only this account could make happen: the
+# folder is this run's own (mktemp -d, mode 0700) or the app's.
 # Returns 0 when all of it was read; 1 when it has a NUL byte, which no shell
 # variable can hold (READ_TEXT is then the text without them and trailing
 # newlines, and READ_HEAD the text before the first); 2 when it is not a
-# regular file, or the read failed or came up short of the size wc gives.
-# READ_HEAD is READ_TEXT otherwise. WORK is this run's own folder (mktemp
-# -d, mode 0700), so only this account could put anything else there.
+# regular file, is longer than READ_MAX_BYTES, could not be opened or read
+# (bash leaves the variable of a read that failed unset, and sets it at the
+# end of the file), or was swapped. READ_HEAD is READ_TEXT otherwise.
 work_read() { # file -> READ_TEXT, READ_HEAD
-  local LC_ALL=C size
+  local LC_ALL=C part text="" head="" nul=0 left=$(( READ_MAX_BYTES + 1 ))
   READ_TEXT=""
   READ_HEAD=""
   [[ -f "$1" && ! -L "$1" ]] || return 2
-  size="$("$WC" -c 2>/dev/null < "$1")" || return 2
-  size="${size//[!0-9]/}"
-  [[ -n "$size" ]] || return 2
-  if IFS= read -r -d '' READ_HEAD 2>/dev/null < "$1"; then
-    READ_TEXT="$(<"$1")" || return 2
+  {
+    [[ -f /dev/fd/3 ]] || return 2
+    while :; do
+      unset -v part
+      if IFS= read -r -d '' -n "$left" -u 3 part; then
+        # A NUL byte ended this part, unless it took all that was left.
+        (( ${#part} < left )) || return 2
+        (( nul )) || head="$part"
+        nul=1
+        text="$text$part"
+        left=$(( left - ${#part} - 1 ))
+        (( left > 0 )) || return 2
+      else
+        [[ -n "${part+set}" ]] || return 2
+        text="$text$part"
+        break
+      fi
+    done
+    [[ -f "$1" && ! -L "$1" ]] || return 2
+    { [[ /dev/fd/3 -ef /dev/fd/4 ]]; } 4<>"$1" || return 2
+  } 2>/dev/null 3<>"$1" || return 2
+  if (( nul )); then
+    READ_HEAD="$head"
+    READ_TEXT="${text%"${text##*[!$'\n']}"}"
     return 1
   fi
-  READ_TEXT="$READ_HEAD"
-  (( ${#READ_TEXT} == 10#$size )) || return 2
+  READ_TEXT="$text"
+  READ_HEAD="$text"
   return 0
 }
 # The non-empty lines of $1 in TEXT_LINES, split in the shell itself: no
@@ -410,7 +447,7 @@ plutil_read() { # plutil arguments... file -> its output; 0, 1 or 2 (see above)
   [[ ! -s "$READ_FAILURES" ]] || return 2
   bounded "$PLUTIL" "$@" || rc=$?
   if (( rc == 0 )); then
-    work_read "$BOUNDED_BASE.out" || rc=$?
+    rc=$BOUNDED_READ
     case "$rc" in
       0) printf '%s' "$READ_TEXT" || return 2; return 0 ;;
       1) why="printed a NUL byte, which this script cannot pass on" ;;
@@ -437,7 +474,7 @@ plutil_said_none() { # the plutil arguments of the call just made
   local file="${!#}" said rc=0
   PLUTIL_SAID="its message could not be read back"
   [[ "$1" != -convert ]] || return 0
-  work_read "$BOUNDED_BASE.out" || return 1
+  (( BOUNDED_READ == 0 )) || return 1
   said="${READ_TEXT%$'\n'}"
   said="${said#"$file: "}"
   PLUTIL_SAID="$said"
@@ -446,8 +483,7 @@ plutil_said_none() { # the plutil arguments of the call just made
   [[ "$1 $3" != "-extract raw" || "$said" != "Value at $2 is a any type and cannot be extracted in raw format" ]] || return 0
   [[ "$1 $3" == "-extract json" ]] || return 1
   bounded "$PLUTIL" -type "$2" -o - "$file" || rc=$?
-  (( rc == 0 )) || return 1
-  work_read "$BOUNDED_BASE.out" || return 1
+  (( rc == 0 && BOUNDED_READ == 0 )) || return 1
   [[ "$READ_TEXT" == "(any)"$'\n' ]]
 }
 extract() { # file keypath -> the value as plutil prints it raw; 0, 1 or 2
@@ -480,7 +516,7 @@ read_whole() { # file -> WHOLE_TEXT, WHOLE_HEAD
   [[ ! -s "$READ_FAILURES" ]] || return 2
   bounded "$CAT" "$1" || rc=$?
   if (( rc == 0 )); then
-    work_read "$BOUNDED_BASE.out" || rc=$?
+    rc=$BOUNDED_READ
     WHOLE_TEXT="$READ_TEXT"
     WHOLE_HEAD="$READ_HEAD"
     (( rc == 2 )) || return "$rc"
@@ -602,7 +638,7 @@ info_identity() { # file
     return 1
   fi
   INFO_ID=""
-  if work_read "$BOUNDED_BASE.out"; then INFO_ID="${READ_TEXT%$'\n'}"; fi
+  if (( BOUNDED_READ == 0 )); then INFO_ID="${READ_TEXT%$'\n'}"; fi
   if [[ ! "$INFO_ID" =~ $form ]]; then
     INFO_PROBLEM="'stat' exited 0, but its output could not be read back as the file's identity"
     return 1
@@ -622,7 +658,7 @@ read_info_version() { # file
   if [[ "$before" != none ]]; then
     bounded "$PLUTIL" -extract InsomniaResumeFrozenVersion raw -o - "$1" || rc=$?
     if (( rc == 0 )); then
-      if ! work_read "$BOUNDED_BASE.out"; then
+      if (( BOUNDED_READ != 0 )); then
         INFO_PROBLEM="'plutil -extract InsomniaResumeFrozenVersion' exited 0, but its output could not be read back whole"
         return 1
       fi
@@ -733,6 +769,7 @@ command_alive=0
 bounded_output=""   # file for the next bounded command's output; empty: discarded
 run_bounded() { # command args...
   local base status="" rc cpid="" supervisor answer_within
+  local status_form=$'^(exit [0-9]{1,3}|term|alive)\n$' pid_form=$'^([0-9]+)\n?$'
   bounded_calls=$((bounded_calls + 1))
   base="$APP_SUPPORT/.backstop.$$.$bounded_calls"
   if (( bounded_calls == 1 && ! lock_shared )); then
@@ -746,14 +783,14 @@ run_bounded() { # command args...
   # cover that at the usual 0.1 s poll. A supervisor slower than that gets
   # the 125 below, the safe side.
   answer_within=$(( COMMAND_TIMEOUT_SECONDS + KILL_GRACE_SECONDS + 4 ))
+  # Both files are read with work_read, which takes a regular file only, so
+  # a FIFO there cannot block this run under the lock. A status that does
+  # not read back as exactly one of the lines supervise_command writes counts
+  # as none.
   if wait_for_status "$base.rc" "$answer_within"; then
-    read -r status < "$base.rc" || true
+    if work_read "$base.rc" && [[ "$READ_TEXT" =~ $status_form ]]; then status="${BASH_REMATCH[1]}"; fi
   fi
-  # A regular file only: a FIFO there could block this run under the lock.
-  if [[ -f "$base.pid" ]]; then
-    read -r cpid < "$base.pid" || true
-    [[ "$cpid" =~ ^[0-9]+$ ]] || cpid=""
-  fi
+  if work_read "$base.pid" && [[ "$READ_TEXT" =~ $pid_form ]]; then cpid="${BASH_REMATCH[1]}"; fi
   case "$status" in
     "exit "*) rc="${status#exit }" ;;
     term)
@@ -1577,7 +1614,7 @@ observe() { # pid
   observation=unknown; p_epoch=""; p_stat=""; p_uid=""
   bounded "$PS" -o lstart=,stat=,uid= -p "$1" || rc=$?
   (( rc == 0 || rc == 1 )) || return 0
-  work_read "$BOUNDED_BASE.out" || return 0
+  (( BOUNDED_READ == 0 )) || return 0
   # As $(...) would read it: trailing newlines cut.
   out="${READ_TEXT%"${READ_TEXT##*[!$'\n']}"}"
   if (( rc == 1 )) && [[ -z "$out" ]]; then

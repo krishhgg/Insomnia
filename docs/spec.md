@@ -117,12 +117,20 @@ recovery; newly written journals use `frozenProcesses`.
   - `/usr/bin/pmset -b lowpowermode 1`
   - `/usr/bin/pmset -b lowpowermode 0`
 - The file is one per Mac and names one account, the one whose install
-  wrote it. `install.sh` reads it through sudo before writing and refuses a
-  rule with any line for another account.
-  `uninstall.sh` reads it through sudo and removes it only when every line
-  is blank, the header comment, or one of those four grants to the calling
-  account (`id -un`); a grant to another account, or any other line, keeps it with a
-  message. While Insomnia runs in another account (`ps -o uid=`), or a
+  wrote it. `install.sh` reads it before writing and refuses a rule with
+  any line for another account. A rule the account can read is read with a
+  bounded `cat` and judged before the first sudo, the password prompt
+  included; one only root can read (the rule `install.sh` writes is root's,
+  mode 0440) is read with a bounded `sudo -n cat` right after one `sudo -v`.
+  A read that fails, is cut short, holds a NUL byte or does not answer
+  stops the install. `uninstall.sh` judges the rule the same way, at the
+  same two points, before the app is asked to quit and before the recovery
+  lock, the backstop and the LaunchAgent: a line for another account, or a
+  read that does not complete, stops it with nothing changed.
+  Under the lock it reads the rule through sudo again and removes it only
+  when every line is blank, the header comment, or one of those four grants
+  to the calling account (`id -un`); a grant to another account, or any
+  other line, keeps it with a message. While Insomnia runs in another account (`ps -o uid=`), or a
   process there named Insomnia cannot be told apart from it, `install.sh`
   stops before the sudoers step and `uninstall.sh` before removing anything.
   That process is named and never asked to quit or signalled. So does a
@@ -153,6 +161,22 @@ recovery; newly written journals use `frozenProcesses`.
   with its pid (status 125) and keeps the lock until it ends, and so does
   each `sudo pmset` or app binary call it started, through that call's own
   supervisor, which ignores SIGTERM and SIGHUP sent to the process group.
+  The backstop and the supervisor of that call run in a process group of
+  their own (`set -m` around the one `&`). Before it starts the backstop,
+  the supervisor turns job control on and off again, which clears bash's
+  record of that group, so `kill %1` at the limit signals the backstop
+  process alone and not the group. A signal sent to the calling script's
+  group (a closed terminal, or launchd once the script has gone) reaches
+  nothing the backstop started; the backstop runs to its end or its limit
+  with the lock held. A backstop from an earlier build whose supervisor for
+  `sudo pmset` does not ignore SIGTERM and SIGHUP therefore keeps the lock
+  in that supervisor until its sudo has ended and been reaped. Not covered:
+  the oldest copies in `$APP_SUPPORT`, which take no lock and run `sudo
+  pmset` in the foreground (a SIGTERM at the limit can leave that sudo
+  running after the lock is released), and an earlier build's backstop run
+  by launchd as the pinned agent after an install rollback, whose group
+  launchd signals when the job's main process exits, since the agent does
+  not set AbandonProcessGroup.
   Every read the backstop makes under the lock (`cp`, `plutil`, `cat`,
   `stat`, `ps`) has 30 s, a checked status, and its output in a private
   directory. One that fails, is cut short, holds a NUL byte or does not
@@ -213,10 +237,14 @@ recovery; newly written journals use `frozenProcesses`.
   killed by one, leaves it unknown whether the rule changed; the scripts
   report that, and `uninstall.sh` then keeps the app and the journal. A
   root shell killed outright can leave its copy under a dotted name sudo
-  never reads. Before that call the scripts read the rule with `sudo
-  /bin/test -e` and `sudo /bin/cat`, and `install.sh` checks the new rule
-  with `sudo /usr/sbin/visudo -cf`. `uninstall.sh` asks for the password
-  with `sudo -v` before the recovery lock, and every sudo call under it is
+  never reads. Before that call the scripts read the rule with `/bin/cat`
+  when the account can read it, and otherwise with `sudo -n /bin/test -e`
+  and `sudo -n /bin/cat`, each with the 30 s limit, and `install.sh` checks
+  the new rule with `sudo /usr/sbin/visudo -cf`. Both scripts ask for the
+  password with `sudo -v` after judging a rule the account can read and
+  before the sudo reads (`uninstall.sh` only when a rule is there or its
+  folder cannot be searched without root, and always before the recovery
+  lock), so no bounded sudo call waits at a prompt. Every sudo call under the lock is
   `sudo -n`, with the time limit every call there has. Every tool run
   through sudo has a fixed path.
 - Not closed: a writer that takes no lock (an earlier release's scripts, an
