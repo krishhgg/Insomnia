@@ -197,7 +197,8 @@ step() { printf '\n==> %s\n' "$*"; }
 # emptied on exit.
 WORK="$("$MKTEMP" -d "${TMPDIR:-/tmp}/insomnia-uninstall.XXXXXX")"
 READS="$WORK"
-trap '"$RM" -f "$WORK"/call.* "$WORK"/read.* "$WORK"/plutil.err "$WORK"/copy.err 2>/dev/null; "$RMDIR" "$WORK" 2>/dev/null || true' EXIT
+COPY_IN_MEMORY=0
+trap '"$RM" -f "$WORK"/call.* "$WORK"/read.* "$WORK"/plutil.err 2>/dev/null; "$RMDIR" "$WORK" 2>/dev/null || true' EXIT
 
 # Run one external call with a time limit. Its combined output is left in
 # BOUNDED_OUTPUT (trailing newline removed) and its exit status returned, or
@@ -297,11 +298,14 @@ case "$APP_SUPPORT" in /*) ;; *) echo "refusing: app support path is not absolut
 # when it is not a regular file; 2 for anything else: it changed while it
 # was read, the time ran out, or the copy could not be written. Its reason
 # is in copy_why.
+# backstop.sh keeps a copy it cannot write in memory (COPY_IN_MEMORY=1).
+# This script sets COPY_IN_MEMORY to 0 and always has its READS folder, so
+# here such a copy is 2 and the uninstall stops before removing anything.
 # shellcheck disable=SC2016  # the $ below are perl's, not this shell's
 COPY_PERL='use strict; use Fcntl;
 $SIG{ALRM} = "DEFAULT"; alarm shift @ARGV;
 my ($src, $dst) = @ARGV;
-sub fail { print STDERR "$_[1]\n"; exit $_[0] }
+sub fail { print "$_[1]\n"; exit $_[0] }
 sysopen(my $in, $src, O_RDONLY | O_NONBLOCK) or fail 3, "$!";
 my @a = stat($in) or fail 3, "$!";
 -f _ or fail 4, "not a regular file";
@@ -312,24 +316,56 @@ my @b = stat($in) or fail 3, "$!";
 my @c = stat($src);
 "@a[0,1,7,9,10]" eq "@b[0,1,7,9,10]" && @c && "@b[0,1]" eq "@c[0,1]" && length($data) == $b[7]
   or fail 2, "it changed while it was read";
-sysopen(my $out, $dst, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600) or fail 2, "$dst: $!";
+my $id = join(":", @b[0,1,7,9,10]);
+if ($dst eq "-") {
+  index($data, "\0") < 0 or fail 2, "it holds a NUL byte, which a copy kept in memory cannot hold";
+  print "$id\n$data." or exit 2;
+  exit 0;
+}
+sysopen(my $out, $dst, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600) or fail 5, "$dst: $!";
 for (my $off = 0; $off < length $data; ) {
   my $w = syswrite($out, $data, length($data) - $off, $off);
-  defined $w && $w > 0 or fail 2, "$dst: $!";
+  defined $w && $w > 0 or fail 5, "$dst: $!";
   $off += $w;
 }
-close($out) or fail 2, "$dst: $!";
-print join(":", @b[0,1,7,9,10]), "\n";'
+close($out) or fail 5, "$dst: $!";
+print "$id\n";'
 copy_private() { # live-file name
-  local out rc=0
+  local out rc=0 mem=0 data=""
   copy_path="$READS/$2"; copy_id=""; copy_why=""
-  "$RM" -f "$copy_path" 2>/dev/null || { copy_why="its earlier copy $copy_path could not be removed"; return 2; }
-  out="$("$ENV" -i "$PERL" -e "$COPY_PERL" "$READ_TIMEOUT_SECONDS" "$1" "$copy_path" 2>"$READS/copy.err")" || rc=$?
+  if [[ -z "$READS" ]]; then
+    mem=1
+  else
+    "$RM" -f "$copy_path" 2>/dev/null || { copy_why="its earlier copy $copy_path could not be removed"; return 2; }
+    out="$("$ENV" -i "$PERL" -e "$COPY_PERL" "$READ_TIMEOUT_SECONDS" "$1" "$copy_path" 2>/dev/null)" || rc=$?
+    # A copy that could not be written (a full disk) is made again in
+    # memory.
+    if (( rc == 5 && ${COPY_IN_MEMORY:-0} == 1 )); then
+      "$RM" -f "$copy_path" 2>/dev/null || true
+      mem=1; rc=0
+    fi
+  fi
+  if (( mem )); then
+    copy_path="mem:${2//[^A-Za-z0-9_]/_}"
+    printf -v "mem_${copy_path#mem:}" '%s' ""
+    out="$("$ENV" -i "$PERL" -e "$COPY_PERL" "$READ_TIMEOUT_SECONDS" "$1" - 2>/dev/null)" || rc=$?
+    # The identity, a newline, the bytes and a "." that keeps their
+    # trailing newlines from the command substitution.
+    if (( rc == 0 )); then
+      if [[ "$out" == *$'\n'*. ]]; then
+        data="${out#*$'\n'}"; data="${data%.}"
+        out="${out%%$'\n'*}"
+      else
+        out=""
+      fi
+    fi
+  fi
   if (( rc == 0 )) && [[ "$out" =~ ^[0-9]+:[0-9]+:[0-9]+:-?[0-9]+:-?[0-9]+$ ]]; then
     copy_id="$out"
+    if (( mem )); then printf -v "mem_${copy_path#mem:}" '%s' "$data"; fi
     return 0
   fi
-  IFS= read -r copy_why < "$READS/copy.err" 2>/dev/null || true
+  copy_why="${out%%$'\n'*}"
   case "$rc" in
     3|4) ;;
     142) copy_why="it was still being read after ${READ_TIMEOUT_SECONDS}s"; rc=2 ;;
@@ -338,6 +374,29 @@ copy_private() { # live-file name
   esac
   copy_why="${copy_why:-the copy exited $rc}"
   return "$rc"
+}
+# Runs plutil with these arguments on the file given last, or, for a copy
+# kept in memory (mem:<name>, see copy_private), on those bytes through its
+# standard input. Returns plutil's status.
+plutil_on() { # plutil-arguments... file
+  local f="${!#}" v
+  if [[ "$f" != mem:* ]]; then
+    "$PLUTIL" "$@" || return
+    return 0
+  fi
+  v="mem_${f#mem:}"
+  printf '%s' "${!v}" | "$PLUTIL" "${@:1:$#-1}" - && return 0
+  return "${PIPESTATUS[1]}"
+}
+# True when file $1 holds the same bytes as this run's copy $2, a file or
+# one kept in memory.
+same_as_read() { # file copy
+  if [[ "$2" == mem:* ]]; then
+    local v="mem_${2#mem:}"
+    printf '%s' "${!v}" | "$CMP" -s - "$1"
+  else
+    "$CMP" -s "$1" "$2"
+  fi
 }
 # Reads through plutil, always of a private copy. type_at sets t to the
 # type name at the key path (bool, integer, float, string, array,
@@ -351,16 +410,32 @@ copy_private() { # live-file name
 # it. A plutil that words the absence differently makes every absent key
 # unknown, and the uninstall then stops before removing anything. The same
 # as backstop.sh's.
-plutil_run() { # plutil-arguments...
-  local out
-  out="$("$PLUTIL" "$@" 2>"$READS/plutil.err"; echo ".$?")"
-  plutil_rc="${out##*.}"
+plutil_run() { # plutil-arguments... file
+  local out all split
+  plutil_rc=""; plutil_err=""
+  if [[ -n "$READS" ]]; then
+    # A message file that cannot be made or read is quiet here: the run
+    # below then keeps the message in memory.
+    out="$(exec 2>/dev/null; plutil_on "$@" 2>"$READS/plutil.err"; echo ".$?")"
+    plutil_rc="${out##*.}"
+    if [[ "$plutil_rc" != 0 ]]; then
+      { IFS= read -r plutil_err < "$READS/plutil.err"; } 2>/dev/null || true
+    fi
+  fi
+  # With no folder, or a failure whose message could not be kept in one (a
+  # full disk), plutil runs again and its message is kept in memory: it
+  # goes to the outer capture first, then a line no message holds, then
+  # what plutil printed and its status.
+  if [[ -z "$READS" ]] || [[ "$plutil_rc" != 0 && -z "$plutil_err" ]]; then
+    split="--plutil-$$-$RANDOM--"
+    all="$( { out="$(plutil_on "$@" 2>&4; echo ".$?")"; printf '\n%s\n%s' "$split" "$out"; } 4>&1 )"
+    out="${all#*$'\n'"$split"$'\n'}"
+    plutil_err="${all%%$'\n'"$split"$'\n'*}"
+    plutil_err="${plutil_err%%$'\n'*}"
+    plutil_rc="${out##*.}"
+  fi
   out="${out%.*}"
   plutil_out="${out%$'\n'}"
-  plutil_err=""
-  if [[ "$plutil_rc" != 0 ]]; then
-    IFS= read -r plutil_err < "$READS/plutil.err" 2>/dev/null || true
-  fi
 }
 absent_reply() { # keypath
   [[ "$plutil_rc" == 1 && "$plutil_err" == *"No value at that key path or invalid key path: $1" ]]
@@ -406,11 +481,15 @@ count_at() { # file keypath
 # file itself start with "{". Each step's status counts: a conversion or a
 # read that fails is not a JSON object.
 json_object() { # file
-  local c
-  c="$("$PLUTIL" -convert json -o - "$1" 2>/dev/null)" || return 1
+  local c v
+  c="$(plutil_on -convert json -o - "$1" 2>/dev/null)" || return 1
   [[ "${c:0:1}" == "{" ]] || return 1
-  c="$("$HEAD" -c 1 "$1")" || return 1
-  [[ "$c" == "{" ]]
+  if [[ "$1" == mem:* ]]; then
+    v="mem_${1#mem:}"; c="${!v}"
+  else
+    c="$("$HEAD" -c 1 "$1")" || return 1
+  fi
+  [[ "${c:0:1}" == "{" ]]
 }
 # Runs journal_shape_problems or session_shape_problems on file $2. Sets
 # shape_lines to what it prints and returns its status: 0, or 2 when a read
@@ -464,7 +543,7 @@ shape_of() { # journal|session file
 # caller must not count the journal as clean.
 record_text_problems() { # file
   local LC_ALL=C
-  local text rest raw key c token depth str plain scalar number esc hex lost size
+  local text rest raw key c token depth str plain scalar number esc hex lost size v
   local n_low=0 n_lit=0 n_boot=0 digits sig exp e10 lead
   str='^"([^"\\]|\\.)*"'
   plain='^[^]["{}]+'
@@ -475,16 +554,23 @@ record_text_problems() { # file
   lost="the top level of state.json cannot be followed here, so its records about a kept display entry cannot be checked"
   # cat's status follows its output, so a read that fails part way is
   # seen, and so is every newline at the end.
-  text="$("$CAT" "$1"; echo ".$?")"
-  [[ "${text##*.}" == 0 ]] || return 2
-  text="${text%.*}"
+  if [[ "$1" == mem:* ]]; then
+    v="mem_${1#mem:}"; text="${!v}"
+  else
+    text="$("$CAT" "$1"; echo ".$?")"
+    [[ "${text##*.}" == 0 ]] || return 2
+    text="${text%.*}"
+  fi
   [[ "$text" == *keptDisplay* || "$text" == *\\* ]] || return 0
   # The shell drops NUL bytes from the text, so a file with one is longer
-  # than the text read from it.
-  size="$("$STAT" -f %z "$1")" || return 2
-  if (( ${#text} != size )); then
-    echo "$lost"
-    return 0
+  # than the text read from it. A copy in memory has none: copy_private
+  # refuses a file with one.
+  if [[ "$1" != mem:* ]]; then
+    size="$("$STAT" -f %z "$1")" || return 2
+    if (( ${#text} != size )); then
+      echo "$lost"
+      return 0
+    fi
   fi
   rest="${text#$'\xef\xbb\xbf'}"
   rest="${rest#"${rest%%[![:space:]]*}"}"
@@ -607,7 +693,7 @@ record_text_problems() { # file
 # then unknown, not malformed.
 journal_shape_problems() { # file
   local f="$1" key t i n json
-  json="$("$PLUTIL" -convert json -o - "$f" 2>/dev/null)" || { read_why="state.json could not be converted to JSON again (plutil -convert json failed)"; return 2; }
+  json="$(plutil_on -convert json -o - "$f" 2>/dev/null)" || { read_why="state.json could not be converted to JSON again (plutil -convert json failed)"; return 2; }
   if [[ "${json:0:1}" != "{" ]]; then
     echo "state.json is not a JSON object"
     return 0
@@ -822,18 +908,23 @@ epoch_at() { # file keypath
 # does not act on its endsAt either. Returns 2, with read_why, when a read
 # of the file failed: its shape is then unknown, not malformed.
 session_shape_problems() { # file
-  local f="$1" key t i c json
+  local f="$1" key t i c json v
   # plutil also reads XML and binary property lists, which the app's
   # JSONDecoder refuses, so the file itself must start with "{" too. head
   # ends after one byte, and tr may then end on SIGPIPE (141); any other
   # status of either is a read that failed.
-  c="$(LC_ALL=C "$TR" -d ' \t\r\n' < "$f" 2>/dev/null | "$HEAD" -c 1; echo ".${PIPESTATUS[0]}.${PIPESTATUS[1]}")"
+  if [[ "$f" == mem:* ]]; then
+    v="mem_${f#mem:}"
+    c="$(printf '%s' "${!v}" | LC_ALL=C "$TR" -d ' \t\r\n' 2>/dev/null | "$HEAD" -c 1; echo ".${PIPESTATUS[1]}.${PIPESTATUS[2]}")"
+  else
+    c="$(LC_ALL=C "$TR" -d ' \t\r\n' < "$f" 2>/dev/null | "$HEAD" -c 1; echo ".${PIPESTATUS[0]}.${PIPESTATUS[1]}")"
+  fi
   if [[ "${c##*.}" != 0 ]] || [[ "${c%.*}" != *.0 && "${c%.*}" != *.141 ]]; then
     read_why="its first character could not be read"
     return 2
   fi
   c="${c%.*}"; c="${c%.*}"
-  if [[ "$c" == "{" ]] && json="$("$PLUTIL" -convert json -o - "$f" 2>/dev/null)"; then
+  if [[ "$c" == "{" ]] && json="$(plutil_on -convert json -o - "$f" 2>/dev/null)"; then
     c="${json:0:1}"
   else
     c=""
@@ -1629,15 +1720,18 @@ settle_read() { # keypath
 }
 
 # Publishes $STATE with the edits given (remove:KEYPATH or
-# true:KEYPATH / false:KEYPATH), as one copy of settle_copy, edit, verify
-# and rename, once plutil reads the edited copy whole as a JSON object and
-# state.json is still the file settle_copy was made from; then copies the
-# new journal again for the edit that follows. Returns 0; 1 with nothing
-# published and no copy left when any step fails; 2 when it was published
-# but could not be copied again (copy_why), settle_copy then empty.
+# true:KEYPATH / false:KEYPATH), as one copy, edit, verify and rename, once
+# plutil reads the edited copy whole as a JSON object and state.json is
+# still the file settle_copy was made from; then copies the new journal
+# again for the edit that follows. The copy is of the live journal, as
+# backstop.sh's, so its extended attributes and access control list go with
+# it, and it must hold the bytes settle_copy holds (same_as_read). Returns
+# 0; 1 with nothing published and no copy left when any step fails; 2 when
+# it was published but could not be copied again (copy_why), settle_copy
+# then empty.
 edit_state() { # edit...
   local tmp="$APP_SUPPORT/.state.json.uninstall.$$" e ok=1
-  [[ -n "$settle_copy" ]] && "$CP" "$settle_copy" "$tmp" || ok=0
+  [[ -n "$settle_copy" ]] && "$CP" "$STATE" "$tmp" && same_as_read "$tmp" "$settle_copy" || ok=0
   for e in "$@"; do
     (( ok == 1 )) || break
     case "$e" in
@@ -1916,6 +2010,10 @@ list_unrecorded_app_nap
 #     claimed it before it failed them. And a receipt without its release
 #     file, or the other way round, comes from an install or a recovery
 #     that did not finish. Neither shows that no start needs the rule.
+#     One case is known: an uninstall of this folder that stopped between
+#     its two removals (see PROGRESS below) left the release file, free,
+#     and nothing has written to it since. A start claims and gives back
+#     only by writing to it, and only through the receipt, which is gone.
 # Only a folder with neither file of this user in it, or no folder at all,
 # shows nothing to settle here.
 # The lock order is the one every reader keeps: the recovery lock (fd 9)
@@ -1924,6 +2022,68 @@ list_unrecorded_app_nap
 # limited time, so the two cannot wait on each other.
 RECEIPT="$RECEIPTS/$UID_NUM"
 RELEASED="$RECEIPT.released"
+# This folder's record that its uninstall began removing the receipt and
+# its release file: the release file's identity and line as release_state
+# prints them, written under the receipt's lock, after the last check and
+# just before the receipt is removed. A rerun that finds the release file
+# without the receipt finishes the removal only when the record names that
+# file as it is now: the same device and inode, the same change time to
+# the nanosecond (every write to the file changes it, and a start claims
+# and gives back by writing), and the same line, free. Anything else, a
+# record of another file, an older state of this one, a claim, or no
+# record at all, stays refused as unknown. Another folder's record is in
+# that folder and is never read here.
+PROGRESS="$APP_SUPPORT/.uninstall-receipt-removal"
+# Sets release_now to "<device>:<inode>:<change time> <nonce> <word>" when
+# the release file is a regular file with one link, this user's own, mode
+# 600 and 42 bytes, holding a nonce and free or held, and stat gives the
+# same identity and change time before and after its line is read.
+# Returns 1 otherwise, with release_why.
+release_state() {
+  local before after
+  release_now=""
+  before="$("$STAT" -f '%d:%i:%Fc %l %u %Lp %z %HT' "$RELEASED" 2>/dev/null)" || before=""
+  if [[ -L "$RELEASED" || "${before#* }" != "1 $UID_NUM 600 42 Regular File" ]]; then
+    release_why="$RELEASED is not a regular file with one link, this user's own, mode 600 and 42 bytes"
+    return 1
+  fi
+  read_release
+  [[ -z "$release_why" ]] || return 1
+  after="$("$STAT" -f '%d:%i:%Fc %l %u %Lp %z %HT' "$RELEASED" 2>/dev/null)" || after=""
+  if [[ "$after" != "$before" ]]; then
+    release_why="$RELEASED changed while it was read"
+    return 1
+  fi
+  release_now="${before%% *} $release_nonce $release_word"
+}
+# Sets progress_seen to the first line of PROGRESS, read from a private
+# copy, when it is a regular file of this user's. Returns 1 when there is
+# none or it cannot be read.
+progress_line() {
+  progress_seen=""
+  [[ -f "$PROGRESS" && ! -L "$PROGRESS" ]] || return 1
+  [[ "$("$STAT" -f %u "$PROGRESS" 2>/dev/null)" == "$UID_NUM" ]] || return 1
+  copy_private "$PROGRESS" read.progress || return 1
+  { IFS= read -r progress_seen < "$copy_path"; } 2>/dev/null || [[ -n "$progress_seen" ]]
+}
+# Writes PROGRESS for the release file as it is now (release_state), by a
+# rename, and reads it back. Returns 1, with progress_why, when it cannot.
+# No fsync(2) in the shell: a crash right after may lose the record, and a
+# rerun then refuses the lone release file, the safe side.
+record_removal() {
+  local tmp
+  progress_why=""
+  if ! release_state; then progress_why="$release_why"; return 1; fi
+  if tmp="$("$MKTEMP" "$PROGRESS.XXXXXX" 2>/dev/null)" \
+     && printf '%s\n' "$release_now" 2>/dev/null > "$tmp" \
+     && "$MV" -f "$tmp" "$PROGRESS" 2>/dev/null \
+     && progress_line && [[ "$progress_seen" == "$release_now" ]]; then
+    return 0
+  fi
+  [[ -z "${tmp:-}" ]] || "$RM" -f "$tmp" 2>/dev/null || true
+  progress_why="$PROGRESS could not be written"
+  return 1
+}
 # Sets shared_why to why another Insomnia folder of this user may still
 # need what step 5 removes, or to nothing. With a receipt that passes the
 # checks, fd 7 stays locked (receipt_locked) when shared_why is empty.
@@ -1945,7 +2105,12 @@ check_shared() {
     return 0
   fi
   if [[ ! -e "$RECEIPT" ]]; then
-    shared_why="$RELEASED is there without the receipt $RECEIPT, so what the receipt showed, and whether a start still needs the rule, is unknown"
+    if release_state && [[ "$release_word" == free ]] && progress_line && [[ "$progress_seen" == "$release_now" ]]; then
+      shared_seen="finishing $release_now"
+      release_seen="$release_nonce $release_word"
+      return 0
+    fi
+    shared_why="$RELEASED is there without the receipt $RECEIPT, and no record of this folder's uninstall ($PROGRESS) names it as it is now, so what the receipt showed, and whether a start still needs the rule, is unknown"
     return 0
   fi
   lock_receipt
@@ -1991,6 +2156,9 @@ shared_unchanged() {
     fi
     line="${line%.*}"
     now="locked $receipt_locked ${line%$'\n'}"
+  elif [[ "$shared_seen" == finishing* && ! -e "$RECEIPT" && ! -L "$RECEIPT" ]]; then
+    now="finishing ?"
+    if release_state; then now="finishing $release_now"; fi
   elif [[ -e "$RECEIPT" || -L "$RECEIPT" || -e "$RELEASED" || -L "$RELEASED" ]]; then
     now=appeared
   elif [[ -e "$RECEIPTS" || -L "$RECEIPTS" ]]; then
@@ -2040,6 +2208,7 @@ fi
 case "$shared_seen" in
   none) echo "no $RECEIPTS" ;;
   absent) echo "no receipt of this user in $RECEIPTS" ;;
+  finishing*) echo "$RECEIPT is gone and $RELEASED is as this folder's uninstall left it when it began removing them ($PROGRESS); step 5 finishes the removal" ;;
   *) echo "no start claims $RECEIPT; it stays locked until the rule, the receipt and the bundle are gone" ;;
 esac
 
@@ -2069,6 +2238,7 @@ as_root() { # command args...
   return "$rc"
 }
 # Stops the uninstall after the rule went: what was kept, and why.
+removal_recorded=0
 stop_after_rule() { # why
   "$CAT" >&2 <<MSG
 
@@ -2076,6 +2246,9 @@ Uninstall stopped after removing the LaunchAgent and $SUDOERS: $1.
 $APP, the journal and whatever is left of the receipt were kept. Rerun this
 script once nothing above is still running.
 MSG
+  if (( removal_recorded )); then
+    echo "$PROGRESS records the receipt's removal: a rerun finishes it while $RELEASED stays as it is now." >&2
+  fi
   exit 1
 }
 
@@ -2163,6 +2336,10 @@ if [[ "$shared_seen" == none ]]; then
   echo "no $RECEIPTS"
 else
   shared_unchanged || stop_after_rule "$shared_why"
+  if [[ "$shared_seen" == locked* ]]; then
+    record_removal || stop_after_rule "$progress_why, so a stop between the removals of $RECEIPT and $RELEASED could not be finished by a rerun; neither was removed"
+    removal_recorded=1
+  fi
   for receipt_file in "$RECEIPT" "$RELEASED"; do
     [[ -f "$receipt_file" ]] || continue
     as_root "$RM" -f "$receipt_file" || stop_after_rule "$root_why"
@@ -2178,6 +2355,14 @@ else
     stop_after_rule "$root_why"
   else
     echo "kept $RECEIPTS: it still holds another account's receipt, or could not be removed"
+  fi
+fi
+# Both files are gone, so a record of their removal names nothing.
+if [[ -e "$PROGRESS" || -L "$PROGRESS" ]]; then
+  if "$RM" -f "$PROGRESS" 2>/dev/null; then
+    echo "removed $PROGRESS"
+  else
+    echo "warning: could not remove $PROGRESS; it names a release file that is gone, so no rerun acts on it" >&2
   fi
 fi
 

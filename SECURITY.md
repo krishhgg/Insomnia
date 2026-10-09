@@ -376,7 +376,17 @@ nonce `free`. It stops before removing anything, says why and exits 1 when
 the lock stays busy, a start claims the receipt, the release file shows
 another nonce, the receipt, the release file or a folder above them cannot
 be read or fails the checks, or one of the two files is there without the
-other. It runs `sudo -v` first, which asks for the password before
+other. One lone release file is let through: the one an uninstall of the
+same folder left when it stopped between removing the receipt and
+removing the release file. Just before it removes the receipt, under the
+receipt's lock, it writes `.uninstall-receipt-removal` in its own folder
+with the release file's device, inode, change time to the nanosecond and
+line. A rerun removes the lone release file only while it is a regular
+file of this user's with one link, mode 0600 and 42 bytes, matching that
+record exactly, with `free`. A start claims and gives back only by
+writing to the release file, through the receipt, which is gone, and any
+write changes the change time. The record has no fsync(2): a crash may
+lose it, and the rerun then refuses, the safe side. It runs `sudo -v` first, which asks for the password before
 anything is removed, then `sudo -n -v`, which stops it there when sudo
 kept no credential. Every command it then runs as root goes through `sudo
 -n` with its 30 s call limit, while it holds the recovery lock and the
@@ -478,6 +488,14 @@ trace.
   off until install.sh runs again or the user runs `sudo pmset -a
   disablesleep 0`. Nothing in this change closes that, and it is not
   waived.
+- On a full disk backstop.sh keeps its copies of session.json and
+  state.json in memory and still restores what the journal records, but
+  two things need room, as on main: a log line it cannot append ends the
+  run, which can be before the restore, and a journal it cannot publish
+  stays as it was until a later run can. A command whose supervisor
+  cannot write its status files counts as not known to have finished, so
+  the journal keeps its entry. A journal holding a NUL byte cannot be
+  kept in memory and is then left as it is.
 - The clock is the wall clock, as session.json's end is, and `expires`
   proves that no command for a start will begin only while that clock does
   not go back. A clock set back after a settlement lets a dialog left on

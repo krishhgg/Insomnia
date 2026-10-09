@@ -406,7 +406,16 @@ recovery; newly written journals use `frozenProcesses`.
   while the release file shows the receipt's own nonce `free`. It stops
   before removing anything at a folder or file that is not as install.sh
   makes it or cannot be read, and at one of the two files without the
-  other. It asks for the password once with `sudo -v`, stops there when
+  other. One lone release file is known: the one this folder's uninstall
+  left when it stopped between the two removals. Under the receipt's
+  lock, just before it removes the receipt, it writes
+  `.uninstall-receipt-removal` in the app support folder: the release
+  file's device, inode, change time to the nanosecond and line. A rerun
+  that finds the release file without the receipt removes it only while
+  that record names it exactly and its line says `free`; a start claims
+  and gives back only by writing to it, which changes the change time.
+  Any other lone file, a record of another file or an older state of
+  this one, stays refused. It asks for the password once with `sudo -v`, stops there when
   `sudo -n -v` shows sudo kept no credential, and runs every root command
   through `sudo -n` with its 30 s call limit under the recovery lock and
   the receipt's lock. A call that fails, stops on SIGTERM at the limit or
@@ -1342,6 +1351,22 @@ Backstop, independent of the app:
 
 - The agent reads the saved deadline; recurring recovery checks avoid replacing
   the loaded job for every extension and allow retries after a failure.
+- backstop.sh reads session.json and state.json from private copies it
+  makes in a folder of its own (`.backstop-read.*`), each made with the
+  file's identity checked before and after the read. When it cannot make that folder or write a copy in
+  it (a full disk), it keeps the copies in memory and reads them with the
+  same checks; a file holding a NUL byte, which a shell variable cannot
+  hold, is then unknown and nothing is undone from it. Every journal it
+  publishes starts as a `cp` of the live state.json, as on main, so the
+  file's extended attributes and access control list go with it, and is
+  published only when that copy holds the bytes the run read and
+  state.json is still the file it copied. A publish that fails keeps the
+  journal as it was, and the next run undoes what it records again. Two
+  things still need room, as on main. Each log line is appended to
+  insomnia.log and an append that fails ends the run, so on a disk where
+  that file's last block is full the run can stop before the restore.
+  Each publish makes a new file, so where none can be made the restore
+  runs and the journal stays for the next run.
 - The agent runs only the `backstop.sh` sealed in the signed bundle. Its
   command line verifies the bundle against the code requirement pinned in the
   plist (`codesign --verify --strict -R=...`; for an ad-hoc build, that

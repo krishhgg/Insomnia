@@ -2737,7 +2737,7 @@ final class RecoveryScriptTests: XCTestCase {
             ("receipt without its release file", { try FileManager.default.removeItem(atPath: self.fx.released) },
              "\(fx.receipt) is there without its release file \(fx.released), so it does not show that no start claims the receipt", SleepOffReceipts.initialContent, nil),
             ("release file without its receipt", { try FileManager.default.removeItem(atPath: self.fx.receipt) },
-             "\(fx.released) is there without the receipt \(fx.receipt), so what the receipt showed, and whether a start still needs the rule, is unknown", nil, SleepOffReceipts.initialRelease),
+             "\(fx.released) is there without the receipt \(fx.receipt), and no record of this folder's uninstall (\(fx.home.path)/.uninstall-receipt-removal) names it as it is now, so what the receipt showed, and whether a start still needs the rule, is unknown", nil, SleepOffReceipts.initialRelease),
             ("damaged receipt", { try self.fx.writeReceipt(String(repeating: "x", count: 81) + "\n") },
              "\(fx.receipt) does not hold two nonces and writing or refused", String(repeating: "x", count: 81) + "\n", SleepOffReceipts.initialRelease),
             ("release file that is a folder", {
@@ -4298,6 +4298,161 @@ final class RecoveryScriptTests: XCTestCase {
             XCTAssertEqual(f.release(), SleepOffReceipts.initialRelease, failing)
             XCTAssertTrue(f.exists(f.installedBackstop), failing)
             XCTAssertEqual(try Data(contentsOf: f.state), journal, failing)
+            // Round 30: the receipt and its release file are both still
+            // there, so a rerun removes them as the first run would have.
+            if failing == "receipt" {
+                unlink(f.root.appendingPathComponent("sudo-rm.fails").path)
+                let again = try f.run(f.uninstall)
+                XCTAssertEqual(again.status, 0, again.stdout + again.stderr)
+                XCTAssertFalse(FileManager.default.fileExists(atPath: f.receipt))
+                XCTAssertFalse(FileManager.default.fileExists(atPath: f.released))
+                XCTAssertFalse(f.exists(f.home.appendingPathComponent(".uninstall-receipt-removal")))
+                XCTAssertFalse(f.exists(f.installedBackstop))
+            }
+        }
+    }
+
+    /// Greptile on 7e233e8 (an interrupted uninstall cannot finish): a stop
+    /// between removing the receipt and removing its release file leaves
+    /// the release file alone, which the check before step 5 refuses as
+    /// unknown. Before it removes the receipt, the uninstall writes the
+    /// release file's device, inode, change time and line to
+    /// .uninstall-receipt-removal in its own folder, so a rerun that finds
+    /// that very file, unwritten since and free, finishes the removal.
+    /// Covered: the release file's removal fails, sudo has lost the
+    /// credential, and the removal stops on SIGTERM at its limit. Another
+    /// account's receipt in the folder stays, and so does the folder.
+    func testUninstallFinishesTheReceiptsRemovalAfterAStopBetweenItsRemovals() throws {
+        for stop in ["fails", "no-credential", "stops"] {
+            let f = try ScriptFixture()
+            defer { f.destroy() }
+            let progress = f.home.appendingPathComponent(".uninstall-receipt-removal")
+            try f.installMachinery()
+            try f.writeState(cleanJournal)
+            try f.writeReceipt()
+            let other = f.receipts + "/4242424"
+            try "another account\n".write(toFile: other, atomically: true, encoding: .utf8)
+            let journal = try Data(contentsOf: f.state)
+            let control = f.root.appendingPathComponent("sudo-rm.\(stop)")
+            try f.released.write(to: control, atomically: true, encoding: .utf8)
+
+            let r = try f.run(f.uninstall)
+
+            XCTAssertEqual(r.status, 1, "\(stop): \(r.stdout + r.stderr)")
+            let removal = "'sudo -n /bin/rm -f \(f.released)'"
+            let why = [
+                "fails": "\(removal) exited 1 (rm: \(f.released): Operation not permitted)",
+                "no-credential": "\(removal) exited 1 (sudo: a password is required)",
+                "stops": "\(removal) did not answer within 5s and stopped on SIGTERM, so what it did is unknown",
+            ][stop]!
+            XCTAssertTrue(r.stderr.contains("Uninstall stopped after removing the LaunchAgent and \(f.sudoers.path): \(why)."), "\(stop): \(r.stderr)")
+            XCTAssertTrue(r.stderr.contains("\(progress.path) records the receipt's removal: a rerun finishes it while \(f.released) stays as it is now."), "\(stop): \(r.stderr)")
+            XCTAssertFalse(FileManager.default.fileExists(atPath: f.receipt), stop)
+            XCTAssertEqual(f.release(), SleepOffReceipts.initialRelease, stop)
+            let identity = try f.runTool("/usr/bin/stat", ["-f", "%d:%i:%Fc", f.released]).output.trimmingCharacters(in: .newlines)
+            XCTAssertEqual(try String(contentsOf: progress, encoding: .utf8), "\(identity) \(SleepOffReceipts.initialRelease)", stop)
+            XCTAssertTrue(f.exists(f.installedBackstop), stop)
+            XCTAssertEqual(try Data(contentsOf: f.state), journal, stop)
+
+            unlink(control.path)
+            let again = try f.run(f.uninstall)
+
+            XCTAssertEqual(again.status, 0, "\(stop): \(again.stdout + again.stderr)")
+            XCTAssertTrue(again.stdout.contains("\(f.receipt) is gone and \(f.released) is as this folder's uninstall left it when it began removing them (\(progress.path)); step 5 finishes the removal"), "\(stop): \(again.stdout)")
+            XCTAssertTrue(again.stdout.contains("removed \(f.released)\n"), "\(stop): \(again.stdout)")
+            XCTAssertTrue(again.stdout.contains("kept \(f.receipts): it still holds another account's receipt"), "\(stop): \(again.stdout)")
+            XCTAssertTrue(again.stdout.contains("removed \(progress.path)\n"), "\(stop): \(again.stdout)")
+            XCTAssertFalse(FileManager.default.fileExists(atPath: f.released), stop)
+            XCTAssertFalse(f.exists(progress), stop)
+            XCTAssertEqual(try String(contentsOfFile: other, encoding: .utf8), "another account\n", stop)
+            XCTAssertFalse(f.exists(f.installedBackstop), stop)
+            XCTAssertFalse(f.exists(f.sudoers), stop)
+        }
+    }
+
+    /// The same stop, with the release file's removal still running at its
+    /// limit: it gets SIGTERM once and never SIGKILL, and its supervisor
+    /// keeps the recovery lock until it has ended. (The receipt's lock is
+    /// on a file that is gone by then, so no path reaches it to check.)
+    /// The rerun after that finishes the removal.
+    func testUninstallFinishesTheReceiptsRemovalAfterARemovalThatOutlivedItsLimit() throws {
+        try fx.installMachinery()
+        try fx.writeState(cleanJournal)
+        try fx.writeReceipt()
+        let control = fx.root.appendingPathComponent("sudo-rm.hangs")
+        try fx.released.write(to: control, atomically: true, encoding: .utf8)
+
+        let r = try fx.run(fx.uninstall)
+
+        XCTAssertEqual(r.status, 1, r.stdout + r.stderr)
+        XCTAssertTrue(r.stderr.contains("Uninstall stopped after removing the LaunchAgent and \(fx.sudoers.path): 'sudo -n /bin/rm -f \(fx.released)' did not answer within 5s and is still running; it is not stopped from here, and the recovery lock and the receipt's lock stay held until it ends."), r.stderr)
+        XCTAssertNotNil(fx.hungPid("sudo", within: 0))
+        XCTAssertEqual(fx.calls().filter { $0 == "sudo SIGTERM" }.count, 1, "\(fx.calls())")
+        XCTAssertFalse(fx.hungProcessGone("sudo", within: 2), "sudo is never sent SIGKILL")
+        XCTAssertFalse(try fx.lockIsFree(), "the recovery lock stays held while the removal runs")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fx.receipt))
+        XCTAssertEqual(fx.release(), SleepOffReceipts.initialRelease)
+        XCTAssertTrue(fx.exists(fx.home.appendingPathComponent(".uninstall-receipt-removal")))
+
+        fx.releaseCommand()
+        XCTAssertTrue(fx.hungProcessGone("sudo"))
+        XCTAssertEqual(fx.commandEnded(), "released")
+        XCTAssertTrue(try fx.waitUntilLockIsFree(5), "the recovery lock goes with the sudo that held it")
+        unlink(control.path)
+        let again = try fx.run(fx.uninstall)
+
+        XCTAssertEqual(again.status, 0, again.stdout + again.stderr)
+        XCTAssertTrue(again.stdout.contains("removed \(fx.released)\n"), again.stdout)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fx.released))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fx.receipts))
+        XCTAssertFalse(fx.exists(fx.home.appendingPathComponent(".uninstall-receipt-removal")))
+    }
+
+    /// A release file without its receipt stays refused, with nothing
+    /// removed, unless this folder's record names it as it is now. Each
+    /// case starts from a record that would finish the removal and then
+    /// changes one thing: the file written to since with the same line,
+    /// another file with the same line in its place, a claim of another
+    /// folder's start written since, a second link, mode 644, or no record.
+    /// A receipt without its release file stays refused with a record too.
+    func testUninstallStillRefusesALoneSharedFileItsRecordDoesNotName() throws {
+        let progress = fx.home.appendingPathComponent(".uninstall-receipt-removal")
+        let start = UUID().uuidString
+        let lone = "\(fx.released) is there without the receipt \(fx.receipt), and no record of this folder's uninstall (\(progress.path)) names it as it is now, so what the receipt showed, and whether a start still needs the rule, is unknown"
+        let initial = SleepOffReceipts.initialRelease
+        let cases: [(name: String, change: () throws -> Void, saying: String, receipt: String?, release: String?)] = [
+            ("written to since, with the same line", { try self.fx.writeRelease(initial) }, lone, nil, initial),
+            ("another file with the same line", {
+                let next = self.fx.receipts + "/next"
+                try initial.write(toFile: next, atomically: false, encoding: .utf8)
+                XCTAssertEqual(chmod(next, 0o600), 0)
+                XCTAssertEqual(rename(next, self.fx.released), 0)
+             }, lone, nil, initial),
+            ("a claim of another folder's start", { try self.fx.writeRelease("\(start) held\n") }, lone, nil, "\(start) held\n"),
+            ("a second link", { XCTAssertEqual(link(self.fx.released, self.fx.receipts + "/second"), 0) }, lone, nil, initial),
+            ("mode 644", { XCTAssertEqual(chmod(self.fx.released, 0o644), 0) }, lone, nil, initial),
+            ("no record", { XCTAssertEqual(unlink(progress.path), 0) }, lone, nil, initial),
+            ("a receipt without its release file", {
+                try self.fx.writeReceipt()
+                XCTAssertEqual(unlink(self.fx.released), 0)
+             }, "\(fx.receipt) is there without its release file \(fx.released), so it does not show that no start claims the receipt", SleepOffReceipts.initialContent, nil),
+        ]
+        for c in cases {
+            try? FileManager.default.removeItem(at: fx.installedBackstop)
+            try fx.installMachinery()
+            fx.clearCalls()
+            try fx.writeState(cleanJournal)
+            if FileManager.default.fileExists(atPath: fx.receipts) { try FileManager.default.removeItem(atPath: fx.receipts) }
+            try fx.writeReceipt()
+            XCTAssertEqual(unlink(fx.receipt), 0)
+            let identity = try fx.runTool("/usr/bin/stat", ["-f", "%d:%i:%Fc", fx.released]).output.trimmingCharacters(in: .newlines)
+            try "\(identity) \(initial)".write(to: progress, atomically: true, encoding: .utf8)
+            try c.change()
+            let journal = try Data(contentsOf: fx.state)
+
+            let r = try fx.run(fx.uninstall)
+
+            try assertUninstallRemovedNothing(r, saying: c.saying, journal: journal, receipt: c.receipt, release: c.release)
         }
     }
 
@@ -5676,6 +5831,336 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(mode, 0o600)
     }
 
+    /// Points `script`'s constant `name` (a tool's path) at a bash wrapper
+    /// in f.bin whose body is `body`: a fault injected into one tool.
+    private func patchTool(_ name: String, in script: URL, of f: ScriptFixture, _ body: String) throws {
+        let wrapper = f.bin.appendingPathComponent("\(name.lowercased())-\(UUID().uuidString.prefix(8))")
+        try "#!/bin/bash\n\(body)\n".write(to: wrapper, atomically: true, encoding: .utf8)
+        XCTAssertEqual(chmod(wrapper.path, 0o755), 0)
+        let text = try String(contentsOf: script, encoding: .utf8)
+        try ScriptFixture.patch(text, [name: wrapper.path]).write(to: script, atomically: true, encoding: .utf8)
+    }
+
+    /// The names in the fixture's folder that a run of the backstop makes
+    /// and removes before it exits: its folder for copies and the journal
+    /// copies it publishes from.
+    private func backstopLeftovers() throws -> [String] {
+        try FileManager.default.contentsOfDirectory(atPath: fx.home.path)
+            .filter { $0.hasPrefix(".backstop-read.") || $0.hasPrefix(".state.json.") }
+            .sorted()
+    }
+
+    /// Greptile on 7e233e8 (a full disk blocks backstop recovery):
+    /// copy_private, on its own, with no folder for its copies or one it
+    /// cannot write in. With COPY_IN_MEMORY 1 (backstop.sh) it keeps the
+    /// copy in memory with the same checks: a FIFO is still 4 and a file
+    /// it cannot open still 3, and it keeps the file's bytes exactly,
+    /// control bytes, trailing newlines and a final dot included. A NUL
+    /// byte, which a shell variable cannot hold, is 2. A copy whose file
+    /// cannot be created, or stops growing partway (RLIMIT_FSIZE, as a
+    /// full disk stops a write), is made again in memory and its file
+    /// removed. With COPY_IN_MEMORY 0 (uninstall.sh) the same copy is 2.
+    /// plutil_run reads a copy in memory through its standard input, and
+    /// keeps a failure's message in memory when no file can hold it.
+    func testTheBackstopsPrivateCopyFallsBackToMemoryWhenNoFileCanBeWritten() throws {
+        let text = try String(contentsOf: fx.backstop, encoding: .utf8)
+        let perl = try XCTUnwrap(text.range(of: "\nCOPY_PERL='"))
+        let copy = try XCTUnwrap(text.range(of: "\ncopy_private() {", range: perl.upperBound..<text.endIndex))
+        let copyEnd = try XCTUnwrap(text.range(of: "\n}\n", range: copy.upperBound..<text.endIndex))
+        func function(_ name: String) throws -> Substring {
+            let start = try XCTUnwrap(text.range(of: "\n\(name)() {"), name)
+            let end = try XCTUnwrap(text.range(of: "\n}\n", range: start.upperBound..<text.endIndex), name)
+            return text[start.lowerBound..<end.upperBound]
+        }
+        let harness = fx.root.appendingPathComponent("copy_memory.sh")
+        try ("set -euo pipefail\nRM=/bin/rm\nENV=/usr/bin/env\nPERL=/usr/bin/perl\nPLUTIL=/usr/bin/plutil\nREAD_TIMEOUT_SECONDS=10\n"
+            + #"READS="$3"; COPY_IN_MEMORY="$4""#
+            + text[perl.lowerBound..<copyEnd.upperBound] + (try function("plutil_on")) + (try function("plutil_run"))
+            + #"""
+            if [[ "${6:-}" == fsize ]]; then trap '' XFSZ; ulimit -S -f 1; fi
+            rc=0; copy_private "$1" "$2" || rc=$?
+            ulimit -S -f unlimited
+            printf '%s|%s|%s|%s\n' "$rc" "$copy_path" "$copy_id" "$copy_why"
+            if [[ "$copy_path" == mem:* ]]; then v="mem_${copy_path#mem:}"; printf '%s' "${!v}" > "$5"; fi
+            if (( rc == 0 )); then
+              plutil_run -extract noSuchKey raw -o - "$copy_path"
+              printf '%s|%s\n' "$plutil_rc" "$plutil_err"
+            fi
+
+            """#)
+            .write(to: harness, atomically: true, encoding: .utf8)
+        let reads = fx.root.appendingPathComponent("reads", isDirectory: true)
+        try FileManager.default.createDirectory(at: reads, withIntermediateDirectories: true)
+        let kept = fx.root.appendingPathComponent("kept")
+        func run(_ file: String, _ name: String, reads: String = "", inMemory: Int = 1, fsize: Bool = false) throws -> [String] {
+            try? FileManager.default.removeItem(at: kept)
+            let r = try fx.run(harness, [file, name, reads, String(inMemory), kept.path] + (fsize ? ["fsize"] : []))
+            XCTAssertEqual(r.status, 0, name)
+            XCTAssertEqual(r.stderr, "", name)
+            return r.stdout.components(separatedBy: "\n").filter { !$0.isEmpty }
+        }
+        func identity(_ path: String) throws -> String {
+            try fx.runTool("/usr/bin/stat", ["-L", "-f", "%d:%i:%z:%m:%c", path]).output.trimmingCharacters(in: .newlines)
+        }
+        let missing = "1|<stdin>: Could not extract value, error: No value at that key path or invalid key path: noSuchKey"
+
+        let fifo = fx.root.appendingPathComponent("pipe").path
+        XCTAssertEqual(mkfifo(fifo, 0o600), 0)
+        let started = Date()
+        XCTAssertEqual(try run(fifo, "pipe"), ["4|mem:pipe||not a regular file"])
+        XCTAssertLessThan(Date().timeIntervalSince(started), 5, "a FIFO with no writer does not block the copy")
+
+        let locked = fx.root.appendingPathComponent("locked.json")
+        try Data("{}".utf8).write(to: locked)
+        XCTAssertEqual(chmod(locked.path, 0), 0)
+        XCTAssertEqual(try run(locked.path, "locked"), ["3|mem:locked||Permission denied"])
+
+        let nul = fx.root.appendingPathComponent("nul.json")
+        try Data("{\"a\":\"x\u{0}y\"}".utf8).write(to: nul)
+        XCTAssertEqual(try run(nul.path, "nul.json"), ["2|mem:nul_json||it holds a NUL byte, which a copy kept in memory cannot hold"])
+        XCTAssertEqual(try Data(contentsOf: kept), Data(), "nothing of a refused copy is kept")
+
+        let source = fx.root.appendingPathComponent("journal.json")
+        let large = Data(#"{"sleepDisabledByUs":false,"x":"\#(String(repeating: "y", count: 200_000))"}"#.utf8)
+        for bytes in [Data(), Data("{}".utf8), Data("{\"a\":\"\u{1}\u{7f}\u{1b}[0m\"}\n\n".utf8), Data("{} ends with a dot.".utf8),
+                      Data("\n\n.\n".utf8), large] {
+            try bytes.write(to: source)
+            let lines = try run(source.path, "journal.json")
+            XCTAssertEqual(lines.first, "0|mem:journal_json|\(try identity(source.path))|", "\(bytes.count) bytes")
+            XCTAssertEqual(try Data(contentsOf: kept), bytes, "\(bytes.count) bytes")
+            if bytes == large { XCTAssertEqual(lines.dropFirst().first, missing) }
+        }
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: reads.path), [])
+
+        // A folder the copy cannot be created in.
+        XCTAssertEqual(chmod(reads.path, 0o500), 0)
+        defer { chmod(reads.path, 0o700) }
+        XCTAssertEqual(try run(source.path, "journal.json", reads: reads.path),
+                       ["0|mem:journal_json|\(try identity(source.path))|", missing])
+        XCTAssertEqual(try Data(contentsOf: kept), large)
+        XCTAssertEqual(try run(source.path, "journal.json", reads: reads.path, inMemory: 0),
+                       ["2|\(reads.path)/journal.json||\(reads.path)/journal.json: Permission denied"])
+        XCTAssertFalse(fx.exists(kept), "uninstall.sh keeps no copy in memory")
+        XCTAssertEqual(chmod(reads.path, 0o700), 0)
+
+        // A copy that stops growing partway.
+        XCTAssertEqual(try run(source.path, "journal.json", reads: reads.path, fsize: true),
+                       ["0|mem:journal_json|\(try identity(source.path))|", missing])
+        XCTAssertEqual(try Data(contentsOf: kept), large)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: reads.path), ["plutil.err"],
+                       "the part written is removed; plutil's message still has its file in the folder")
+        XCTAssertEqual(try run(source.path, "journal.json", reads: reads.path, inMemory: 0, fsize: true),
+                       ["2|\(reads.path)/journal.json||\(reads.path)/journal.json: File too large"])
+
+        // A folder it can write in: a copy there, and plutil's message
+        // through a file, naming the copy.
+        let inFolder = try run(source.path, "journal.json", reads: reads.path)
+        XCTAssertEqual(inFolder, ["0|\(reads.path)/journal.json|\(try identity(source.path))|",
+                                  "1|\(reads.path)/journal.json: Could not extract value, error: No value at that key path or invalid key path: noSuchKey"])
+    }
+
+    /// Greptile on 7e233e8: with no folder for its copies (mktemp -d fails,
+    /// as on a full disk), or a folder nothing can be created in, the
+    /// backstop keeps its copies in memory and restores what the journal
+    /// records with every check it makes on a file. An expired session is
+    /// undone and its journal cleared, other keys kept; a valid session is
+    /// left alone; a start whose receipt shows it never turned sleep off
+    /// is settled; a malformed session is moved aside. A journal of the
+    /// wrong shape, not JSON, unreadable, holding a NUL byte or not a
+    /// regular file undoes nothing.
+    func testBackstopRestoresWithItsCopiesInMemoryWhenItCannotMakeItsFolder() throws {
+        let original = try String(contentsOf: fx.backstop, encoding: .utf8)
+        let memory = "could not create a private folder in \(fx.home.path) for this run's copies of session.json and state.json; this run keeps its copies in memory"
+        let dirty = #"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"keepMe":{"x":1}}"#
+        func reset() throws {
+            try? FileManager.default.removeItem(at: fx.logFile)
+            try? FileManager.default.removeItem(at: fx.session)
+            try? FileManager.default.removeItem(at: fx.state)
+            fx.clearCalls()
+        }
+        for staging in ["no folder", "a folder nothing can be created in"] {
+            try original.write(to: fx.backstop, atomically: true, encoding: .utf8)
+            if staging == "no folder" {
+                try patchTool("MKTEMP", in: fx.backstop, of: fx, #"if [[ "$*" == *"/.backstop-read."* ]]; then exit 1; fi; exec /usr/bin/mktemp "$@""#)
+            } else {
+                try patchTool("MKTEMP", in: fx.backstop, of: fx, #"""
+                    if [[ "$*" == *"/.backstop-read."* ]]; then d="$(/usr/bin/mktemp "$@")" || exit; /bin/chmod 500 "$d"; echo "$d"; exit 0; fi
+                    exec /usr/bin/mktemp "$@"
+                    """#)
+            }
+
+            try reset()
+            try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+            try fx.writeState(dirty)
+            var r = try fx.run(fx.backstop)
+            XCTAssertEqual(r.status, 0, "\(staging): \(r.stderr) \(fx.log())")
+            XCTAssertEqual(fx.calls(), ["sudo -n \(fx.fakePmset) -a disablesleep 0"], staging)
+            let s = try fx.stateJSON()
+            XCTAssertEqual(s["sleepDisabledByUs"] as? Bool, false, staging)
+            XCTAssertEqual((s["keepMe"] as? [String: Any])?["x"] as? Int, 1, "\(staging): other keys stay")
+            XCTAssertFalse(fx.exists(fx.session), staging)
+            XCTAssertTrue(fx.log().contains("journal cleared"), "\(staging): \(fx.log())")
+            XCTAssertEqual(fx.log().contains(memory), staging == "no folder", "\(staging): \(fx.log())")
+            XCTAssertEqual(try backstopLeftovers(), [], staging)
+
+            try reset()
+            try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+            try fx.writeState(#"{"sleepDisabledByUs":"yes","lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+            r = try fx.run(fx.backstop)
+            XCTAssertEqual(r.status, 1, staging)
+            XCTAssertEqual(fx.calls(), [], staging)
+            XCTAssertTrue(fx.log().contains("\(fx.state.path): sleepDisabledByUs is a string, not a bool"), "\(staging): \(fx.log())")
+            XCTAssertEqual(try backstopLeftovers(), [], staging)
+        }
+
+        // With no folder: the remaining cases.
+        try original.write(to: fx.backstop, atomically: true, encoding: .utf8)
+        try patchTool("MKTEMP", in: fx.backstop, of: fx, #"if [[ "$*" == *"/.backstop-read."* ]]; then exit 1; fi; exec /usr/bin/mktemp "$@""#)
+
+        try reset()
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: 3600))
+        try fx.writeState(dirty)
+        var r = try fx.run(fx.backstop)
+        XCTAssertEqual(r.status, 0, r.stderr + fx.log())
+        XCTAssertEqual(fx.calls(), [], "a valid session is left alone")
+        XCTAssertEqual(try String(contentsOf: fx.state, encoding: .utf8), dirty)
+        XCTAssertTrue(fx.exists(fx.session))
+
+        try reset()
+        try journalUnfinishedStart()
+        r = try fx.run(fx.backstop)
+        XCTAssertEqual(r.status, 0, r.stderr + fx.log())
+        try assertSettled(sleepRestored: false)
+        XCTAssertTrue(fx.log().contains("its receipt shows the command behind its dialog never turned sleep off; sleepDisabledByUs goes back to false"), fx.log())
+        XCTAssertTrue(fx.log().contains(memory), fx.log())
+
+        try reset()
+        try "not json".write(to: fx.session, atomically: true, encoding: .utf8)
+        try fx.writeState(dirty)
+        r = try fx.run(fx.backstop)
+        XCTAssertEqual(r.status, 0, r.stderr + fx.log())
+        XCTAssertEqual(fx.calls(), ["sudo -n \(fx.fakePmset) -a disablesleep 0"])
+        XCTAssertFalse(fx.exists(fx.session))
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: fx.home.path).contains { $0.hasPrefix("session.json.unreadable-") })
+        XCTAssertTrue(fx.log().contains("session.json unreadable; moved to"), fx.log())
+
+        let refusals: [(name: String, write: () throws -> Void, saying: String)] = [
+            ("not JSON", { try self.fx.writeState(#"{"sleepDisabledByUs":true,"#) }, "\(fx.state.path): not valid JSON\n"),
+            ("unreadable", {
+                try self.fx.writeState(dirty)
+                XCTAssertEqual(chmod(self.fx.state.path, 0), 0)
+             }, "\(fx.state.path): not valid JSON (it could not be read: Permission denied)"),
+            ("a NUL byte", { try Data("{\"sleepDisabledByUs\":true,\"a\":\"x\u{0}y\"}".utf8).write(to: self.fx.state) },
+             "nothing undone, evidence kept: it holds a NUL byte, which a copy kept in memory cannot hold"),
+            ("not a regular file", { XCTAssertEqual(mkfifo(self.fx.state.path, 0o600), 0) }, "\(fx.state.path): not a regular file"),
+        ]
+        for c in refusals {
+            try reset()
+            try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+            try c.write()
+            r = try fx.run(fx.backstop)
+            XCTAssertEqual(r.status, 1, c.name)
+            XCTAssertEqual(fx.calls(), [], c.name)
+            XCTAssertTrue(fx.log().contains(c.saying), "\(c.name): \(fx.log())")
+            XCTAssertTrue(fx.log().contains(memory), c.name)
+            XCTAssertTrue(fx.exists(fx.session), "\(c.name): the session stays with the journal it ends")
+            if c.name == "not a regular file" {
+                var st = stat()
+                XCTAssertEqual(lstat(fx.state.path, &st), 0)
+                XCTAssertEqual(st.st_mode & S_IFMT, S_IFIFO, "the FIFO is never opened or replaced")
+                unlink(fx.state.path)
+            } else {
+                XCTAssertEqual(chmod(fx.state.path, 0o600), 0)
+                XCTAssertNotNil(try? Data(contentsOf: fx.state), c.name)
+            }
+        }
+    }
+
+    /// Greptile on 7e233e8: a restore made from copies kept in memory whose
+    /// updated journal cannot be published keeps the journal as it was, the
+    /// same file, so the next run undoes what it records again: cp fails
+    /// (as on a full disk), cp copies something other than what this run
+    /// read, or the journal is rewritten in place, to the same size, while
+    /// this run reads it. Each run makes the restore, exits 1 and names
+    /// why, and keeps the session; the run after it clears the journal.
+    func testBackstopKeepsTheJournalWhenItsPublishFailsWithItsCopiesInMemory() throws {
+        try patchTool("MKTEMP", in: fx.backstop, of: fx, #"if [[ "$*" == *"/.backstop-read."* ]]; then exit 1; fi; exec /usr/bin/mktemp "$@""#)
+        let withMemory = try String(contentsOf: fx.backstop, encoding: .utf8)
+        let journal = #"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#
+        let swapped = #"{"lowPowerSetByUs":false,"sleepDisabledByUs":true,"frozenProcesses":[],"dockerFrozen":false}"#
+        XCTAssertEqual(journal.utf8.count, swapped.utf8.count)
+        let other = "(its copy does not hold the bytes this run read: it changed since, or cp copied something else)"
+        let cases: [(name: String, inject: () throws -> Void, saying: String, after: String)] = [
+            ("cp fails", { try self.patchTool("CP", in: self.fx.backstop, of: self.fx, "exit 1") }, "(it could not be copied)", journal),
+            ("cp adds a byte", {
+                try self.patchTool("CP", in: self.fx.backstop, of: self.fx, #"/bin/cp "$@" || exit; printf x >> "${!#}""#)
+             }, other, journal),
+            ("rewritten in place while read", {
+                try self.wrapPlutil(in: self.fx.backstop, of: self.fx, on: #""-extract sleepDisabledByUs raw -o - -""#,
+                                    "printf '%s' '\(swapped)' 1<> '\(self.fx.state.path)'")
+             }, other, swapped),
+        ]
+        for c in cases {
+            try withMemory.write(to: fx.backstop, atomically: true, encoding: .utf8)
+            try? FileManager.default.removeItem(at: fx.logFile)
+            fx.clearCalls()
+            try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+            try fx.writeState(journal)
+            let inode = try XCTUnwrap(FileManager.default.attributesOfItem(atPath: fx.state.path)[.systemFileNumber] as? Int)
+            try c.inject()
+
+            let r = try fx.run(fx.backstop)
+
+            XCTAssertEqual(r.status, 1, "\(c.name): \(fx.log())")
+            XCTAssertEqual(fx.calls(), ["sudo -n \(fx.fakePmset) -a disablesleep 0"], c.name)
+            XCTAssertEqual(try String(contentsOf: fx.state, encoding: .utf8), c.after, c.name)
+            XCTAssertEqual(try FileManager.default.attributesOfItem(atPath: fx.state.path)[.systemFileNumber] as? Int, inode, "\(c.name): the same file")
+            XCTAssertTrue(fx.log().contains("could not publish the updated journal to \(fx.state.path) \(c.saying); previous journal kept, will retry"), "\(c.name): \(fx.log())")
+            XCTAssertTrue(fx.exists(fx.session), "\(c.name): the session goes only with the journal it ends")
+            XCTAssertEqual(try backstopLeftovers(), [], c.name)
+
+            try withMemory.write(to: fx.backstop, atomically: true, encoding: .utf8)
+            fx.clearCalls()
+            let again = try fx.run(fx.backstop)
+
+            XCTAssertEqual(again.status, 0, "\(c.name): \(again.stderr) \(fx.log())")
+            XCTAssertEqual(fx.calls(), ["sudo -n \(fx.fakePmset) -a disablesleep 0"], "\(c.name): the restore is made again")
+            XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, false, c.name)
+            XCTAssertFalse(fx.exists(fx.session), c.name)
+        }
+        XCTAssertEqual(try String(contentsOf: fx.root.appendingPathComponent("plutil.fired"), encoding: .utf8), "-extract sleepDisabledByUs raw -o - -\n")
+    }
+
+    /// Round 30 (the hosted failure on 7e233e8): the backstop publishes
+    /// from the live journal, as main does, so what cp copies with it, its
+    /// extended attributes and its access control list, stays with the
+    /// journal. 7e233e8 published from its private copy, and the
+    /// journal's owner ACL was gone afterwards (the hosted run of
+    /// testBackstopKeepsAnOwnerACLAndStillUndoesTheJournal). No test here
+    /// may change an ACL, so this control uses an extended attribute, which
+    /// cp copies the same way: the published journal keeps it, and every
+    /// cp the run makes starts from state.json itself.
+    func testBackstopPublishesFromTheLiveJournalSoWhatCpCopiesStaysWithIt() throws {
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        let mark = try fx.runTool("/usr/bin/xattr", ["-w", "com.kgarg.insomnia.test", "kept", fx.state.path])
+        XCTAssertEqual(mark.status, 0, mark.output)
+        let copies = fx.root.appendingPathComponent("cp.log")
+        try patchTool("CP", in: fx.backstop, of: fx, "printf '%s\\n' \"$*\" >> '\(copies.path)'; exec /bin/cp \"$@\"")
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 0, r.stderr + fx.log())
+        XCTAssertEqual(fx.calls(), ["sudo -n \(fx.fakePmset) -a disablesleep 0"])
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, false)
+        let kept = try fx.runTool("/usr/bin/xattr", ["-p", "com.kgarg.insomnia.test", fx.state.path])
+        XCTAssertEqual(kept.status, 0, kept.output)
+        XCTAssertEqual(kept.output, "kept\n", "the published journal keeps what cp copied with it")
+        let calls = try String(contentsOf: copies, encoding: .utf8).split(separator: "\n").map(String.init)
+        XCTAssertFalse(calls.isEmpty)
+        for call in calls { XCTAssertTrue(call.hasPrefix("\(fx.state.path) \(fx.home.path)/.state.json."), call) }
+    }
+
     // MARK: - Owner-only files
 
     /// `umask 077`: the log and its directory, the lock file and the
@@ -6172,7 +6657,9 @@ final class RecoveryScriptTests: XCTestCase {
     /// session, config.json and the app's Info.plist with backstop.sh's
     /// readers, so a read that fails is unknown in both, never absent: the
     /// private copy (its perl text too), every plutil read and its status,
-    /// the shape checks, the dates and the receipt's access check.
+    /// the shape checks, the dates and the receipt's access check. Also
+    /// the readers of a copy kept in memory (plutil_on) and the byte check
+    /// of a copy of the live journal (same_as_read).
     func testBothScriptsShareTheirReaders() throws {
         let backstop = try String(contentsOf: ScriptFixture.productionScripts.appendingPathComponent("backstop.sh"), encoding: .utf8)
         let uninstall = try String(contentsOf: ScriptFixture.productionScripts.appendingPathComponent("uninstall.sh"), encoding: .utf8)
@@ -6189,7 +6676,7 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(try perl(backstop), try perl(uninstall))
         for name in ["copy_private", "plutil_run", "absent_reply", "type_at", "ty", "read_at", "count_at", "json_object", "shape_of",
                      "record_text_problems", "journal_shape_problems", "epoch_of", "epoch_at", "session_shape_problems",
-                     "receipt_access_problem", "unlock_receipt"] {
+                     "receipt_access_problem", "unlock_receipt", "plutil_on", "same_as_read"] {
             XCTAssertEqual(try function(name, in: backstop), try function(name, in: uninstall), name)
         }
     }
@@ -11021,16 +11508,23 @@ private final class ScriptFixture {
         # its `sudo -v`): with no cached credential (modes
         # auth-fail, cache-expires and reauth-fails) they fail the way sudo
         # -n does. Otherwise they run as the forms without -n below, unless
-        # sudo-rm.hangs or sudo-rm.fails holds the path the command is
-        # given last: then it never answers and ignores SIGTERM
-        # (hang_on_term ignore), or fails like a refused removal.
+        # sudo-rm.hangs, sudo-rm.stops, sudo-rm.fails or
+        # sudo-rm.no-credential holds the path the command is given last:
+        # then it never answers and ignores SIGTERM (hang_on_term ignore),
+        # never answers and stops on SIGTERM (hang_on_term stop), fails like
+        # a refused removal, or fails as sudo -n does once the credential
+        # is gone.
         if [[ "${1:-}" == -n && ( "${2:-}" == /bin/rm || "${2:-}" == /bin/rmdir ) ]]; then
           case "$mode" in auth-fail|cache-expires|reauth-fails) echo "sudo: a password is required" >&2; exit 1 ;; esac
           shift
           p=""; if [[ -f "\(r)/sudo-rm.hangs" ]]; then IFS= read -r p < "\(r)/sudo-rm.hangs" || true; fi
           if [[ -n "$p" && "$p" == "${!#}" ]]; then hang_on_term ignore; fi
+          p=""; if [[ -f "\(r)/sudo-rm.stops" ]]; then IFS= read -r p < "\(r)/sudo-rm.stops" || true; fi
+          if [[ -n "$p" && "$p" == "${!#}" ]]; then hang_on_term stop; fi
           p=""; if [[ -f "\(r)/sudo-rm.fails" ]]; then IFS= read -r p < "\(r)/sudo-rm.fails" || true; fi
           if [[ -n "$p" && "$p" == "${!#}" ]]; then echo "${1##*/}: ${!#}: Operation not permitted" >&2; exit 1; fi
+          p=""; if [[ -f "\(r)/sudo-rm.no-credential" ]]; then IFS= read -r p < "\(r)/sudo-rm.no-credential" || true; fi
+          if [[ -n "$p" && "$p" == "${!#}" ]]; then echo "sudo: a password is required" >&2; exit 1; fi
         fi
         case "${1:-}" in
           -v) case "$mode" in

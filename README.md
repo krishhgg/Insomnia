@@ -839,7 +839,11 @@ under the receipt's lock and only while no start claims the receipt. A
 start from another Insomnia folder of yours that is not settled, a lock
 that stays held, a receipt, `.released` file or folder it cannot read or
 that fails its checks, or one of the two files without the other stops it
-with nothing removed and a message. It asks for your password once (`sudo
+with nothing removed and a message. One case of a lone `.released` file
+is known: an uninstall of this folder that stopped after removing the
+receipt. Just before that removal it writes `.uninstall-receipt-removal`
+in the folder, and a rerun finishes the removal while that file still
+names the `.released` file as it is now, free. It asks for your password once (`sudo
 -v`), before removing anything, and runs each command that needs root
 through `sudo -n` with a 30 s limit. One that fails, does not answer in
 time or is still running stops the uninstall there, with what it already

@@ -241,6 +241,7 @@ MKDIR=/bin/mkdir
 RM=/bin/rm
 MV=/bin/mv
 CP=/bin/cp
+CMP=/usr/bin/cmp
 STAT=/usr/bin/stat
 MKTEMP=/usr/bin/mktemp
 LS=/bin/ls
@@ -422,8 +423,11 @@ fi
 # copy_private), made below. Every exit from then on goes through leave,
 # which removes the folder first. A run that ends some other way (killed,
 # or stopped by the shell itself) leaves it; the next run that takes the
-# lock on its own handle removes it.
+# lock on its own handle removes it. Without the folder, or when a copy in
+# it cannot be written, the copies are kept in memory (COPY_IN_MEMORY), so
+# a full disk does not stop a recorded restore.
 READS=""
+COPY_IN_MEMORY=1
 leave() { # status
   if [[ -n "$READS" ]]; then "$RM" -rf "$READS" 2>/dev/null || true; fi
   exit "$1"
@@ -445,6 +449,18 @@ exit_unless_marker_stuck() { # what the run found
 
 # --- Helpers -----------------------------------------------------------------
 
+# Logs each non-empty line of $2 at level $1, with $3 before it. Not a
+# here-string: bash 3.2 writes one to a temporary file, which a full disk
+# refuses.
+log_lines() { # level text prefix
+  local rest="$2" line
+  while [[ -n "$rest" ]]; do
+    line="${rest%%$'\n'*}"
+    if [[ "$rest" == *$'\n'* ]]; then rest="${rest#*$'\n'}"; else rest=""; fi
+    if [[ -n "$line" ]]; then log "$1" "$3$line"; fi
+  done
+}
+
 # Copies the live file $1 to $READS/$2, for every later read of it in this
 # run: session.json, state.json and the app's Info.plist are never read in
 # place. perl, run with an empty environment, opens the file without
@@ -460,11 +476,18 @@ exit_unless_marker_stuck() { # what the run found
 # when it is not a regular file; 2 for anything else: it changed while it
 # was read, the time ran out, or the copy could not be written. Its reason
 # is in copy_why.
+# With no READS folder, or when the new file cannot be written (a full
+# disk) and COPY_IN_MEMORY is 1, perl makes the same checks and prints the
+# bytes instead. They are kept in the shell variable mem_<name>, and
+# copy_path is mem:<name>, which plutil_on, json_object,
+# record_text_problems, session_shape_problems and same_as_read read from
+# memory. Nothing in that mode creates a file. A shell variable cannot hold
+# a NUL byte, so a file with one is then 2.
 # shellcheck disable=SC2016  # the $ below are perl's, not this shell's
 COPY_PERL='use strict; use Fcntl;
 $SIG{ALRM} = "DEFAULT"; alarm shift @ARGV;
 my ($src, $dst) = @ARGV;
-sub fail { print STDERR "$_[1]\n"; exit $_[0] }
+sub fail { print "$_[1]\n"; exit $_[0] }
 sysopen(my $in, $src, O_RDONLY | O_NONBLOCK) or fail 3, "$!";
 my @a = stat($in) or fail 3, "$!";
 -f _ or fail 4, "not a regular file";
@@ -475,24 +498,56 @@ my @b = stat($in) or fail 3, "$!";
 my @c = stat($src);
 "@a[0,1,7,9,10]" eq "@b[0,1,7,9,10]" && @c && "@b[0,1]" eq "@c[0,1]" && length($data) == $b[7]
   or fail 2, "it changed while it was read";
-sysopen(my $out, $dst, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600) or fail 2, "$dst: $!";
+my $id = join(":", @b[0,1,7,9,10]);
+if ($dst eq "-") {
+  index($data, "\0") < 0 or fail 2, "it holds a NUL byte, which a copy kept in memory cannot hold";
+  print "$id\n$data." or exit 2;
+  exit 0;
+}
+sysopen(my $out, $dst, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600) or fail 5, "$dst: $!";
 for (my $off = 0; $off < length $data; ) {
   my $w = syswrite($out, $data, length($data) - $off, $off);
-  defined $w && $w > 0 or fail 2, "$dst: $!";
+  defined $w && $w > 0 or fail 5, "$dst: $!";
   $off += $w;
 }
-close($out) or fail 2, "$dst: $!";
-print join(":", @b[0,1,7,9,10]), "\n";'
+close($out) or fail 5, "$dst: $!";
+print "$id\n";'
 copy_private() { # live-file name
-  local out rc=0
+  local out rc=0 mem=0 data=""
   copy_path="$READS/$2"; copy_id=""; copy_why=""
-  "$RM" -f "$copy_path" 2>/dev/null || { copy_why="its earlier copy $copy_path could not be removed"; return 2; }
-  out="$("$ENV" -i "$PERL" -e "$COPY_PERL" "$READ_TIMEOUT_SECONDS" "$1" "$copy_path" 2>"$READS/copy.err")" || rc=$?
+  if [[ -z "$READS" ]]; then
+    mem=1
+  else
+    "$RM" -f "$copy_path" 2>/dev/null || { copy_why="its earlier copy $copy_path could not be removed"; return 2; }
+    out="$("$ENV" -i "$PERL" -e "$COPY_PERL" "$READ_TIMEOUT_SECONDS" "$1" "$copy_path" 2>/dev/null)" || rc=$?
+    # A copy that could not be written (a full disk) is made again in
+    # memory.
+    if (( rc == 5 && ${COPY_IN_MEMORY:-0} == 1 )); then
+      "$RM" -f "$copy_path" 2>/dev/null || true
+      mem=1; rc=0
+    fi
+  fi
+  if (( mem )); then
+    copy_path="mem:${2//[^A-Za-z0-9_]/_}"
+    printf -v "mem_${copy_path#mem:}" '%s' ""
+    out="$("$ENV" -i "$PERL" -e "$COPY_PERL" "$READ_TIMEOUT_SECONDS" "$1" - 2>/dev/null)" || rc=$?
+    # The identity, a newline, the bytes and a "." that keeps their
+    # trailing newlines from the command substitution.
+    if (( rc == 0 )); then
+      if [[ "$out" == *$'\n'*. ]]; then
+        data="${out#*$'\n'}"; data="${data%.}"
+        out="${out%%$'\n'*}"
+      else
+        out=""
+      fi
+    fi
+  fi
   if (( rc == 0 )) && [[ "$out" =~ ^[0-9]+:[0-9]+:[0-9]+:-?[0-9]+:-?[0-9]+$ ]]; then
     copy_id="$out"
+    if (( mem )); then printf -v "mem_${copy_path#mem:}" '%s' "$data"; fi
     return 0
   fi
-  IFS= read -r copy_why < "$READS/copy.err" 2>/dev/null || true
+  copy_why="${out%%$'\n'*}"
   case "$rc" in
     3|4) ;;
     142) copy_why="it was still being read after ${READ_TIMEOUT_SECONDS}s"; rc=2 ;;
@@ -501,6 +556,29 @@ copy_private() { # live-file name
   esac
   copy_why="${copy_why:-the copy exited $rc}"
   return "$rc"
+}
+# Runs plutil with these arguments on the file given last, or, for a copy
+# kept in memory (mem:<name>, see copy_private), on those bytes through its
+# standard input. Returns plutil's status.
+plutil_on() { # plutil-arguments... file
+  local f="${!#}" v
+  if [[ "$f" != mem:* ]]; then
+    "$PLUTIL" "$@" || return
+    return 0
+  fi
+  v="mem_${f#mem:}"
+  printf '%s' "${!v}" | "$PLUTIL" "${@:1:$#-1}" - && return 0
+  return "${PIPESTATUS[1]}"
+}
+# True when file $1 holds the same bytes as this run's copy $2, a file or
+# one kept in memory.
+same_as_read() { # file copy
+  if [[ "$2" == mem:* ]]; then
+    local v="mem_${2#mem:}"
+    printf '%s' "${!v}" | "$CMP" -s - "$1"
+  else
+    "$CMP" -s "$1" "$2"
+  fi
 }
 # state.json's private copy (state_copy) and the identity of the file it was
 # made from (state_id), for state_unchanged. state_copy_rc and
@@ -534,16 +612,32 @@ state_unchanged() {
 # how. What that key holds is then unknown, never absent: no caller acts on
 # it. A plutil that words the absence differently makes every absent key
 # unknown, and the run then undoes nothing and exits 1.
-plutil_run() { # plutil-arguments...
-  local out
-  out="$("$PLUTIL" "$@" 2>"$READS/plutil.err"; echo ".$?")"
-  plutil_rc="${out##*.}"
+plutil_run() { # plutil-arguments... file
+  local out all split
+  plutil_rc=""; plutil_err=""
+  if [[ -n "$READS" ]]; then
+    # A message file that cannot be made or read is quiet here: the run
+    # below then keeps the message in memory.
+    out="$(exec 2>/dev/null; plutil_on "$@" 2>"$READS/plutil.err"; echo ".$?")"
+    plutil_rc="${out##*.}"
+    if [[ "$plutil_rc" != 0 ]]; then
+      { IFS= read -r plutil_err < "$READS/plutil.err"; } 2>/dev/null || true
+    fi
+  fi
+  # With no folder, or a failure whose message could not be kept in one (a
+  # full disk), plutil runs again and its message is kept in memory: it
+  # goes to the outer capture first, then a line no message holds, then
+  # what plutil printed and its status.
+  if [[ -z "$READS" ]] || [[ "$plutil_rc" != 0 && -z "$plutil_err" ]]; then
+    split="--plutil-$$-$RANDOM--"
+    all="$( { out="$(plutil_on "$@" 2>&4; echo ".$?")"; printf '\n%s\n%s' "$split" "$out"; } 4>&1 )"
+    out="${all#*$'\n'"$split"$'\n'}"
+    plutil_err="${all%%$'\n'"$split"$'\n'*}"
+    plutil_err="${plutil_err%%$'\n'*}"
+    plutil_rc="${out##*.}"
+  fi
   out="${out%.*}"
   plutil_out="${out%$'\n'}"
-  plutil_err=""
-  if [[ "$plutil_rc" != 0 ]]; then
-    IFS= read -r plutil_err < "$READS/plutil.err" 2>/dev/null || true
-  fi
 }
 absent_reply() { # keypath
   [[ "$plutil_rc" == 1 && "$plutil_err" == *"No value at that key path or invalid key path: $1" ]]
@@ -586,14 +680,18 @@ count_at() { # file keypath
   done
 }
 # True when plutil converts $1 whole to JSON and both that JSON and the
-# file itself start with "{". Each step's status counts: a conversion or a
-# read that fails is not a JSON object.
+# file itself (or the copy in memory) start with "{". Each step's status
+# counts: a conversion or a read that fails is not a JSON object.
 json_object() { # file
-  local c
-  c="$("$PLUTIL" -convert json -o - "$1" 2>/dev/null)" || return 1
+  local c v
+  c="$(plutil_on -convert json -o - "$1" 2>/dev/null)" || return 1
   [[ "${c:0:1}" == "{" ]] || return 1
-  c="$("$HEAD" -c 1 "$1")" || return 1
-  [[ "$c" == "{" ]]
+  if [[ "$1" == mem:* ]]; then
+    v="mem_${1#mem:}"; c="${!v}"
+  else
+    c="$("$HEAD" -c 1 "$1")" || return 1
+  fi
+  [[ "${c:0:1}" == "{" ]]
 }
 # Runs journal_shape_problems or session_shape_problems on file $2. Sets
 # shape_lines to what it prints and returns its status: 0, or 2 when a read
@@ -900,7 +998,7 @@ stop_transaction() { # what
 # caller must not count the journal as clean.
 record_text_problems() { # file
   local LC_ALL=C
-  local text rest raw key c token depth str plain scalar number esc hex lost size
+  local text rest raw key c token depth str plain scalar number esc hex lost size v
   local n_low=0 n_lit=0 n_boot=0 digits sig exp e10 lead
   str='^"([^"\\]|\\.)*"'
   plain='^[^]["{}]+'
@@ -911,16 +1009,23 @@ record_text_problems() { # file
   lost="the top level of state.json cannot be followed here, so its records about a kept display entry cannot be checked"
   # cat's status follows its output, so a read that fails part way is
   # seen, and so is every newline at the end.
-  text="$("$CAT" "$1"; echo ".$?")"
-  [[ "${text##*.}" == 0 ]] || return 2
-  text="${text%.*}"
+  if [[ "$1" == mem:* ]]; then
+    v="mem_${1#mem:}"; text="${!v}"
+  else
+    text="$("$CAT" "$1"; echo ".$?")"
+    [[ "${text##*.}" == 0 ]] || return 2
+    text="${text%.*}"
+  fi
   [[ "$text" == *keptDisplay* || "$text" == *\\* ]] || return 0
   # The shell drops NUL bytes from the text, so a file with one is longer
-  # than the text read from it.
-  size="$("$STAT" -f %z "$1")" || return 2
-  if (( ${#text} != size )); then
-    echo "$lost"
-    return 0
+  # than the text read from it. A copy in memory has none: copy_private
+  # refuses a file with one.
+  if [[ "$1" != mem:* ]]; then
+    size="$("$STAT" -f %z "$1")" || return 2
+    if (( ${#text} != size )); then
+      echo "$lost"
+      return 0
+    fi
   fi
   rest="${text#$'\xef\xbb\xbf'}"
   rest="${rest#"${rest%%[![:space:]]*}"}"
@@ -1043,7 +1148,7 @@ record_text_problems() { # file
 # then unknown, not malformed.
 journal_shape_problems() { # file
   local f="$1" key t i n json
-  json="$("$PLUTIL" -convert json -o - "$f" 2>/dev/null)" || { read_why="state.json could not be converted to JSON again (plutil -convert json failed)"; return 2; }
+  json="$(plutil_on -convert json -o - "$f" 2>/dev/null)" || { read_why="state.json could not be converted to JSON again (plutil -convert json failed)"; return 2; }
   if [[ "${json:0:1}" != "{" ]]; then
     echo "state.json is not a JSON object"
     return 0
@@ -1232,18 +1337,23 @@ epoch_at() { # file keypath
 # does not act on its endsAt either. Returns 2, with read_why, when a read
 # of the file failed: its shape is then unknown, not malformed.
 session_shape_problems() { # file
-  local f="$1" key t i c json
+  local f="$1" key t i c json v
   # plutil also reads XML and binary property lists, which the app's
   # JSONDecoder refuses, so the file itself must start with "{" too. head
   # ends after one byte, and tr may then end on SIGPIPE (141); any other
   # status of either is a read that failed.
-  c="$(LC_ALL=C "$TR" -d ' \t\r\n' < "$f" 2>/dev/null | "$HEAD" -c 1; echo ".${PIPESTATUS[0]}.${PIPESTATUS[1]}")"
+  if [[ "$f" == mem:* ]]; then
+    v="mem_${f#mem:}"
+    c="$(printf '%s' "${!v}" | LC_ALL=C "$TR" -d ' \t\r\n' 2>/dev/null | "$HEAD" -c 1; echo ".${PIPESTATUS[1]}.${PIPESTATUS[2]}")"
+  else
+    c="$(LC_ALL=C "$TR" -d ' \t\r\n' < "$f" 2>/dev/null | "$HEAD" -c 1; echo ".${PIPESTATUS[0]}.${PIPESTATUS[1]}")"
+  fi
   if [[ "${c##*.}" != 0 ]] || [[ "${c%.*}" != *.0 && "${c%.*}" != *.141 ]]; then
     read_why="its first character could not be read"
     return 2
   fi
   c="${c%.*}"; c="${c%.*}"
-  if [[ "$c" == "{" ]] && json="$("$PLUTIL" -convert json -o - "$f" 2>/dev/null)"; then
+  if [[ "$c" == "{" ]] && json="$(plutil_on -convert json -o - "$f" 2>/dev/null)"; then
     c="${json:0:1}"
   else
     c=""
@@ -1595,12 +1705,18 @@ publish_state() { # edited-copy
 }
 
 # Publishes $STATE with the edits given (remove:KEYPATH or
-# true:KEYPATH / false:KEYPATH), as one copy of this run's copy, edit,
-# verify and rename (publish_state, whose status it returns). Returns 1,
-# with nothing published and no copy left, when any step fails.
+# true:KEYPATH / false:KEYPATH), as one copy, edit, verify and rename
+# (publish_state, whose status it returns). Returns 1, with nothing
+# published and no copy left, when any step fails.
+# Every publish copies the live journal with cp, as main does, so its
+# extended attributes and access control list go with it, and then
+# requires the copy to hold the bytes this run read (same_as_read): a
+# journal that changed since, or a cp that copied something else, is not
+# published. A 0200 journal its owner reads only through an allow entry
+# keeps that entry.
 edit_state() { # edit...
   local tmp="$APP_SUPPORT/.state.json.settle.$$" e ok=1
-  [[ -n "$state_copy" ]] && "$CP" "$state_copy" "$tmp" || ok=0
+  [[ -n "$state_copy" ]] && "$CP" "$STATE" "$tmp" && same_as_read "$tmp" "$state_copy" || ok=0
   for e in "$@"; do
     (( ok == 1 )) || break
     case "$e" in
@@ -1672,7 +1788,7 @@ settle_attempt() {
     return 0
   fi
   copy_state || true
-  if (( state_copy_rc != 0 )) || ! "$PLUTIL" -convert json -o /dev/null "$state_copy" >/dev/null 2>&1; then
+  if (( state_copy_rc != 0 )) || ! plutil_on -convert json -o /dev/null "$state_copy" >/dev/null 2>&1; then
     drop_unrecorded_session
     return 0
   fi
@@ -1790,12 +1906,12 @@ settle_attempt() {
 }
 # This run's private folder for its copies (see copy_private). A folder
 # left by an earlier run that ended without leave is removed first, unless
-# this run shares its caller's lock.
+# this run shares its caller's lock. Without one (a full disk), the copies
+# are kept in memory and read with the same checks.
 if (( ! lock_shared )); then "$RM" -rf "$APP_SUPPORT"/.backstop-read.* 2>/dev/null || true; fi
 if ! READS="$("$MKTEMP" -d "$APP_SUPPORT/.backstop-read.XXXXXX" 2>/dev/null)"; then
   READS=""
-  log error "could not create a private folder in $APP_SUPPORT for this run's copies of session.json and state.json; nothing undone, evidence kept, will retry"
-  exit 1
+  log warn "could not create a private folder in $APP_SUPPORT for this run's copies of session.json and state.json; this run keeps its copies in memory" || true
 fi
 settle_failed=""
 settle_attempt
@@ -1879,7 +1995,7 @@ elif (( state_copy_rc == 3 )); then
 elif (( state_copy_rc != 0 )); then
   journal_state=unreadable
   journal_why="$state_copy_why"
-elif ! "$PLUTIL" -convert json -o /dev/null "$state_copy" >/dev/null 2>&1; then
+elif ! plutil_on -convert json -o /dev/null "$state_copy" >/dev/null 2>&1; then
   journal_state=malformed
   shape_problems="not valid JSON"
 elif ! shape_of journal "$state_copy"; then
@@ -1898,9 +2014,7 @@ if [[ "$journal_state" == unreadable ]]; then
 fi
 
 if [[ "$journal_state" == malformed ]]; then
-  while IFS= read -r line; do
-    [[ -n "$line" ]] && log error "$STATE: $line"
-  done <<< "$shape_problems"
+  log_lines error "$shape_problems" "$STATE: "
   log error "$STATE is unreadable or malformed; nothing undone, evidence kept. Open Insomnia or repair the file, then rerun"
   leave 1
 fi
@@ -1957,10 +2071,8 @@ fi
 # rather than replace a file that appeared meanwhile (it exits 0 then,
 # hence the check of both paths afterwards).
 quarantine_session() {
-  local base dest n line what
-  while IFS= read -r line; do
-    [[ -n "$line" ]] && log warn "$SESSION: $line"
-  done <<< "$session_problems"
+  local base dest n what
+  log_lines warn "$session_problems" "$SESSION: "
   what="session.json unreadable"
   [[ "$session_state" == unreadable ]] && what="session.json cannot be read ($unreadable_why)"
   base="$SESSION.unreadable-$("$DATE" -u +%Y%m%dT%H%M%SZ)"
@@ -2066,7 +2178,7 @@ prepare_low_power_off() {
   (( rc != 2 )) || return 2
   [[ "$read_value" == "$boot" ]] && return 0
   tmp="$APP_SUPPORT/.state.json.backstop-boot.$$"
-  "$CP" "$state_copy" "$tmp" || ok=0
+  "$CP" "$STATE" "$tmp" && same_as_read "$tmp" "$state_copy" || ok=0
   if (( ok == 1 )); then
     "$PLUTIL" -replace keptDisplayUnderLowPowerBoot -string "$boot" "$tmp" >/dev/null 2>&1 || ok=0
   fi
@@ -2121,8 +2233,15 @@ observe() { # pid
     return 0
   fi
   (( rc == 0 )) || return 0
-  local w mon day time year stat uid rest
-  read -r w mon day time year stat uid rest <<< "$out"
+  local w mon day time year stat uid
+  # The words of the first line, as read would split them. Not a
+  # here-string: see log_lines.
+  out="${out%%$'\n'*}"
+  set -f
+  # shellcheck disable=SC2086  # split into words on purpose
+  set -- $out
+  set +f
+  w="${1:-}"; mon="${2:-}"; day="${3:-}"; time="${4:-}"; year="${5:-}"; stat="${6:-}"; uid="${7:-}"
   [[ -n "$w" && -n "$mon" && -n "$day" && -n "$time" && -n "$year" && -n "$stat" && -n "$uid" ]] || return 0
   p_epoch="$("$DATE" -j -u -f '%a %b %d %H:%M:%S %Y' "$w $mon $day $time $year" +%s 2>/dev/null || true)"
   [[ -n "$p_epoch" ]] && [[ "$uid" =~ ^[0-9]+$ ]] || return 0
@@ -2439,14 +2558,20 @@ fi
 [[ -n "$refused_note" ]] && log info "$refused_note"
 
 # --- Publish -----------------------------------------------------------------
-# Edit a copy of this run's copy, verify it, then rename it over state.json
-# (publish_state) so readers only ever see a complete journal. Keys we do
-# not own survive untouched.
+# Edit a copy of the live journal that holds the bytes this run read (see
+# edit_state), verify it, then rename it over state.json (publish_state) so
+# readers only ever see a complete journal. Keys we do not own survive
+# untouched. A publish that fails (a full disk among other causes) keeps
+# the journal as it was, so the next run undoes what it records again.
 if (( changed == 1 )); then
   tmp="$APP_SUPPORT/.state.json.backstop.$$"
   publish_ok=1
   publish_why=""
-  "$CP" "$state_copy" "$tmp" || publish_ok=0
+  if ! "$CP" "$STATE" "$tmp"; then
+    publish_ok=0; publish_why="it could not be copied"
+  elif ! same_as_read "$tmp" "$state_copy"; then
+    publish_ok=0; publish_why="its copy does not hold the bytes this run read: it changed since, or cp copied something else"
+  fi
   if (( publish_ok == 1 )) && [[ "$new_sleep" != "$sleep_held" ]]; then
     "$PLUTIL" -replace sleepDisabledByUs -bool "$new_sleep" "$tmp" >/dev/null 2>&1 || publish_ok=0
   fi
