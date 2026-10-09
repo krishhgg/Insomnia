@@ -3030,11 +3030,11 @@ final class RecoveryScriptTests: XCTestCase {
         let mode = "sudo -n \(fx.bin.path)/chmod 0600 \(fx.receipt)"
         let entry = "sudo -n \(fx.bin.path)/chmod +a user:\(me) allow read \(fx.receipt)"
         let cases: [(name: String, mode: mode_t, entries: [AccessEntry], release: Bool, calls: [String], locks: [String])] = [
-            ("an earlier build's: 0644, no entry", 0o644, [], true, [entry, mode], ["sudo chmod +a held", "sudo chmod 0600 held"]),
-            ("an install stopped before chmod +a: 0600, no entry", 0o600, [], true, [entry], ["sudo chmod +a free"]),
-            ("0644 with the entry", 0o644, mine, true, [mode], ["sudo chmod 0600 held"]),
-            ("0400, no entry", 0o400, [], true, [entry, mode], ["sudo chmod +a held", "sudo chmod 0600 held"]),
-            ("0644, no entry, no release file", 0o644, [], false, [entry, mode], ["sudo chmod +a held", "sudo chmod 0600 held"]),
+            ("an earlier build's: 0644, no entry", 0o644, [], true, [entry, mode], ["sudo chmod +a held", "sudo chmod 0600 held", "launchctl bootout free"]),
+            ("an install stopped before chmod +a: 0600, no entry", 0o600, [], true, [entry], ["sudo chmod +a free", "launchctl bootout free"]),
+            ("0644 with the entry", 0o644, mine, true, [mode], ["sudo chmod 0600 held", "launchctl bootout free"]),
+            ("0400, no entry", 0o400, [], true, [entry, mode], ["sudo chmod +a held", "sudo chmod 0600 held", "launchctl bootout free"]),
+            ("0644, no entry, no release file", 0o644, [], false, [entry, mode], ["sudo chmod +a held", "sudo chmod 0600 held", "launchctl bootout free"]),
         ]
         for c in cases {
             fx.clearCalls()
@@ -6545,7 +6545,7 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(fx.calls().contains("sudo -n \(fx.fakePmset) -a disablesleep 0"), "\(fx.calls())")
         XCTAssertTrue(fx.calls().contains("sudo -n \(fx.fakePmset) -b lowpowermode 0"), "\(fx.calls())")
         XCTAssertTrue(fx.calls().contains { $0.hasPrefix("mv FAILED \(fx.home.path)/.state.json.backstop.") }, "\(fx.calls())")
-        XCTAssertTrue(fx.log().contains("could not publish the updated journal to \(fx.state.path); previous journal kept, will retry"), fx.log())
+        XCTAssertTrue(fx.log().contains("could not publish the updated journal to \(fx.state.path) (the edited copy could not be renamed over it); previous journal kept, will retry"), fx.log())
         let after = try fx.stateJSON()
         XCTAssertEqual(after["lowPowerSetByUs"] as? Bool, true)
         XCTAssertEqual(after["sleepDisabledByUs"] as? Bool, true)
@@ -6603,7 +6603,7 @@ final class RecoveryScriptTests: XCTestCase {
             let log = f.log()
             XCTAssertTrue(log.contains("could not publish this boot for the kept display entry's record to \(f.state.path); Low Power Mode left on, keeping journal entry for retry"), log)
             if immutable {
-                XCTAssertTrue(log.contains("could not publish the updated journal to \(f.state.path); previous journal kept, will retry"), log)
+                XCTAssertTrue(log.contains("could not publish the updated journal to \(f.state.path) (the edited copy could not be renamed over it); previous journal kept, will retry"), log)
             } else {
                 XCTAssertTrue(log.contains("still journaled: Low Power Mode is still set: state.json could not take this boot for the kept display entry's record, so the mode was not switched off"), log)
             }

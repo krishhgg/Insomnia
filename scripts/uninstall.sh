@@ -413,18 +413,20 @@ json_object() { # file
   [[ "$c" == "{" ]]
 }
 # Runs journal_shape_problems or session_shape_problems on file $2. Sets
-# problems to what it prints and returns its status: 0, or 2 when a read
-# failed, with read_why saying which.
+# shape_lines to what it prints and returns its status: 0, or 2 when a read
+# failed, with read_why saying which. Not `problems`: uninstall.sh's step 4
+# keeps its list in an array of that name, and a string assigned to it
+# would become that array's first element.
 shape_of() { # journal|session file
   local out rc=0
   case "$1" in
     journal) out="$(journal_shape_problems "$2" || { rc=$?; echo "${read_why:-a read failed}"; exit "$rc"; })" || rc=$? ;;
     *) out="$(session_shape_problems "$2" || { rc=$?; echo "${read_why:-a read failed}"; exit "$rc"; })" || rc=$? ;;
   esac
-  problems="$out"
+  shape_lines="$out"
   if (( rc != 0 )); then
     read_why="${out##*$'\n'}"
-    problems=""
+    shape_lines=""
     return 2
   fi
   return 0
@@ -891,8 +893,8 @@ journal_problems() {
         0)
           if ! shape_of session "$copy_path"; then
             echo "session.json is still present and could not be read whole ($read_why)"
-          elif [[ -n "$problems" ]]; then
-            echo "session.json is still present and is not a session: ${problems%%$'\n'*}"
+          elif [[ -n "$shape_lines" ]]; then
+            echo "session.json is still present and is not a session: ${shape_lines%%$'\n'*}"
           else
             echo "session.json is still present"
           fi
@@ -929,9 +931,9 @@ journal_problems() {
     echo "state.json could not be read whole, so whether it has the shape the app writes is unknown ($read_why)"
     return 2
   fi
-  if [[ -n "$problems" ]]; then
+  if [[ -n "$shape_lines" ]]; then
     echo "state.json is malformed (unexpected shape):"
-    echo "$problems"
+    echo "$shape_lines"
     return 0
   fi
   snap_type sleepOffAttempt || return 2
@@ -1693,7 +1695,7 @@ settle_attempt() {
   [[ "$t" == dictionary ]] || return 0
   rc=0; shape_of journal "$settle_copy" || rc=$?
   (( rc == 0 )) || settle_unknown "$read_why"
-  [[ -z "$problems" ]] || return 0
+  [[ -z "$shape_lines" ]] || return 0
   settle_read sleepOffAttempt.nonce; nonce="$read_value"
   settle_read sleepOffAttempt.settled
   if [[ "$read_value" == true ]]; then
@@ -1741,7 +1743,7 @@ settle_attempt() {
     elif (( rc == 0 )); then
       session_id="$copy_id"
       shape_of session "$copy_path" || rc=$?
-      if (( rc == 0 )) && [[ -z "$problems" ]]; then
+      if (( rc == 0 )) && [[ -z "$shape_lines" ]]; then
         epoch_at "$copy_path" endsAt || rc=$?
         if (( rc == 0 )) && [[ -n "$epoch" && "$epoch" == "$deadline" ]]; then matched=1; fi
       fi

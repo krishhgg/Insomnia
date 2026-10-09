@@ -596,18 +596,20 @@ json_object() { # file
   [[ "$c" == "{" ]]
 }
 # Runs journal_shape_problems or session_shape_problems on file $2. Sets
-# problems to what it prints and returns its status: 0, or 2 when a read
-# failed, with read_why saying which.
+# shape_lines to what it prints and returns its status: 0, or 2 when a read
+# failed, with read_why saying which. Not `problems`: uninstall.sh's step 4
+# keeps its list in an array of that name, and a string assigned to it
+# would become that array's first element.
 shape_of() { # journal|session file
   local out rc=0
   case "$1" in
     journal) out="$(journal_shape_problems "$2" || { rc=$?; echo "${read_why:-a read failed}"; exit "$rc"; })" || rc=$? ;;
     *) out="$(session_shape_problems "$2" || { rc=$?; echo "${read_why:-a read failed}"; exit "$rc"; })" || rc=$? ;;
   esac
-  problems="$out"
+  shape_lines="$out"
   if (( rc != 0 )); then
     read_why="${out##*$'\n'}"
-    problems=""
+    shape_lines=""
     return 2
   fi
   return 0
@@ -1691,7 +1693,7 @@ settle_attempt() {
     log error "$STATE could not be read whole (its JSON, or its text for the kept display records), so the unfinished start it journals was not settled; nothing undone, evidence kept: $read_why. Check that it is a regular file this user can read"
     leave 1
   fi
-  [[ -z "$problems" ]] || return 0
+  [[ -z "$shape_lines" ]] || return 0
   state_read sleepOffAttempt.nonce raw; nonce="$read_value"
   state_read sleepOffAttempt.settled raw
   if [[ "$read_value" == true ]]; then
@@ -1752,7 +1754,7 @@ settle_attempt() {
       session_why="$copy_why"
     elif (( rc == 0 )); then
       rc=0; shape_of session "$copy_path" || rc=$?
-      if (( rc == 0 )) && [[ -z "$problems" ]]; then
+      if (( rc == 0 )) && [[ -z "$shape_lines" ]]; then
         epoch_at "$copy_path" endsAt || rc=$?
         if (( rc == 0 )) && [[ -n "$epoch" && "$epoch" == "$deadline" ]]; then matched=1; fi
       fi
@@ -1828,7 +1830,7 @@ if [[ -e "$SESSION" ]]; then
       log error "$SESSION could not be read ($read_why); nothing undone, evidence kept, will retry"
       leave 1
     fi
-    session_problems="$problems"
+    session_problems="$shape_lines"
     if [[ -n "$session_problems" ]]; then
       session_state=malformed
     else
@@ -1883,9 +1885,9 @@ elif ! "$PLUTIL" -convert json -o /dev/null "$state_copy" >/dev/null 2>&1; then
 elif ! shape_of journal "$state_copy"; then
   journal_state=unreadable
   journal_why="$read_why"
-elif [[ -n "$problems" ]]; then
+elif [[ -n "$shape_lines" ]]; then
   journal_state=malformed
-  shape_problems="$problems"
+  shape_problems="$shape_lines"
 else
   journal_state=clean
 fi
