@@ -201,12 +201,19 @@ recovery; newly written journals use `frozenProcesses`.
   others, and an existing file a regular file of root's with mode 0600 and
   one link, so a FIFO or a link is never opened; after locking, the
   descriptor and the path must still be that same file. No access control
-  list on those folders or on the file may allow more than reading: `/bin/ls
-  -lde` lists them, and an allow entry with any right but `read`,
-  `execute`, `readattr`, `readextattr`, `readsecurity`, `list`, `search` or
-  an inheritance flag fails the check whoever it names, root included. Deny
-  entries pass. A list `ls` cannot print, or prints in a form the check does
-  not parse, fails it too. The folders' lists are checked before the file
+  list on those folders or on the file may let anyone but root change
+  them: `/bin/ls -lden` lists them with each principal as a UUID, and an
+  allow entry with any right but `read`, `execute`, `readattr`,
+  `readextattr`, `readsecurity`, `list`, `search` or an inheritance flag
+  fails the check unless `/usr/bin/dsmemberutil` shows its UUID is root's
+  own user record (`getuuid -u 0` answers exactly that UUID and `getid -X`
+  of it answers exactly `uid: 0`, each from a call that exits 0). A name,
+  a group, another user or any other answer fails. Deny entries pass. A
+  list `ls` cannot print, prints in a form the check does not parse, or
+  numbers with a gap fails it too. Every `stat` answer the root shell uses
+  must come from a `stat` that exits 0 and be exactly the one line of
+  fields asked for; any other answer stops it before any open, create or
+  change. The folders' lists are checked before the file
   is created and the file's after, before it is opened. The file is created
   (umask 077, noclobber) only where nothing is, and is never repaired,
   replaced or removed; nor is an access control list. A check that fails

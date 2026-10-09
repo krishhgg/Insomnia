@@ -161,13 +161,18 @@ accounts run these scripts at once, neither overwrites or removes a rule the
 other wrote after its read: the run that finds the rule changed stops, and
 asks you to rerun it.
 
-The ACL check reads `ls -lde` for each of those paths and goes by the rights
-an entry allows, not by whom it names. An entry that allows anything beyond
-`read`, `execute`, `readattr`, `readextattr`, `readsecurity`, `list` or
-`search` (inheritance flags aside) stops the run, even one for root or one a
-management profile added, which may be harmless. An entry that only denies
-passes. A list that `ls` fails to print, or prints in a form the check does
-not know, stops the run too. Neither script removes or changes an ACL: the
+The ACL check reads `ls -lden` for each of those paths, which names each
+entry's principal by its UUID. An entry that allows anything beyond `read`,
+`execute`, `readattr`, `readextattr`, `readsecurity`, `list` or `search`
+(inheritance flags aside) stops the run unless `dsmemberutil` shows that its
+UUID is root's own user record: the UUID it gives for user ID 0 is that
+UUID, and the ID it gives for that UUID is `uid: 0`. An entry for a group
+(`wheel`, `admin`, `everyone`), for another user, or one a management
+profile added under its own UUID stops the run, even though it may be
+harmless. An entry that only denies passes. A list that `ls` fails to
+print, prints in a form the check does not know, or numbers with a gap (an
+entry it could not read), and a `dsmemberutil` answer that is not exactly
+that one line, stop the run too. Neither script removes or changes an ACL: the
 message names the path and the entry, and you decide whether to remove it
 before you rerun. On the Mac these scripts were tested on, `/`, `/private`,
 `/private/etc` and `/private/etc/sudoers.d` carry none.

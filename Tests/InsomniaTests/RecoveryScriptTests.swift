@@ -7731,6 +7731,37 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(fx.exists(fx.app))
     }
 
+    /// The rule was this account's when the uninstall judged it before the
+    /// first sudo, and another account's install replaced it while the
+    /// backstop ran (here the stand-in backstop moves that account's rule
+    /// into place). Read again under the lock, it grants that account, so it
+    /// is kept with a message and the rest of the uninstall goes on.
+    func testUninstallKeepsARuleAnotherAccountWroteAfterItsFirstCheck() throws {
+        try fx.installMachinery()
+        try fx.writeState(Self.cleanJournal)
+        let theirs = ScriptFixture.sudoersRule(for: "other_\(ScriptFixture.account)")
+        let staged = fx.root.appendingPathComponent("theirs.rule")
+        try theirs.write(to: staged, atomically: true, encoding: .utf8)
+        try """
+        #!/bin/bash
+        printf 'backstop replaced the rule\\n' >> "\(fx.callsLog.path)"
+        /bin/mv "\(staged.path)" "\(fx.sudoers.path)"
+
+        """.write(to: fx.backstop, atomically: true, encoding: .utf8)
+
+        let r = try fx.run(fx.uninstall)
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        let calls = fx.calls()
+        XCTAssertEqual(calls.filter { $0.hasPrefix("sudo") }, ["sudo -v", "sudo -n /bin/cat \(fx.sudoers.path)"])
+        let replaced = try XCTUnwrap(calls.firstIndex(of: "backstop replaced the rule"), "\(calls)")
+        XCTAssertEqual(calls.firstIndex(of: "sudo -n /bin/cat \(fx.sudoers.path)").map { $0 > replaced }, true, "\(calls)")
+        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), theirs)
+        XCTAssertTrue(r.stdout.contains("Kept \(fx.sudoers.path): it grants other_\(ScriptFixture.account), not \(ScriptFixture.account). Another account installed Insomnia after this one, and its app and agent need that rule to undo a session. Uninstall Insomnia in that account to remove it."), r.stdout)
+        XCTAssertFalse(fx.exists(fx.app))
+        XCTAssertFalse(fx.exists(fx.plist))
+    }
+
     /// A file this account's lines alone make up, but not exactly what
     /// install.sh writes for this account (an extra grant, no grant at
     /// all), is not Insomnia's to remove. It is kept with the reason, and
