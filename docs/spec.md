@@ -203,7 +203,9 @@ recovery; newly written journals use `frozenProcesses`.
   launchd signals when the job's main process exits, since the agent does
   not set AbandonProcessGroup. Without an executable `/usr/bin/perl`
   neither script starts the backstop (126, with the reason): `install.sh`
-  stops, and `uninstall.sh` goes on to its own journal check. A perl that
+  stops, and `uninstall.sh` goes on to its own journal check. `install.sh`
+  never reaches that step without perl, since root's access control list
+  check in its earlier sudoers step needs perl and stops it first. A perl that
   runs but cannot answer leaves the group unknown, and the supervisor keeps
   the lock.
   Every read the backstop makes under the lock (`cp`, `plutil`, `cat`,

@@ -290,8 +290,10 @@ SIGTERM at the limit goes to the backstop process alone. A backstop still
 running three seconds after its SIGTERM keeps the lock until it ends, and
 so does a process it started that is still in its group once it has ended.
 The installer then stops, prints the backstop's pid and replaces nothing.
-Without `/usr/bin/perl`, which starts that group and checks whether it is
-empty, the installer runs no backstop and stops, saying so.
+Without `/usr/bin/perl` the installer stops at its sudoers step, whose
+access control list check needs perl, before it reaches the backstop. The
+backstop step would refuse too, since perl starts that group and checks
+whether it is empty.
 The backstop reads no Info.plist under the lock. The installer reads
 `InsomniaResumeFrozenVersion` and the file's identity before it takes the
 lock (from the bundle an interrupted install set aside, when that bundle is
