@@ -326,6 +326,11 @@ struct Store: Sendable {
     static let lockEndRecordTag = "ended-session-v1"
     /// A larger lock file holds no whole record.
     static let lockEndRecordMaxBytes = 1 << 20
+    /// How many times the lock file is read before it counts as one that
+    /// cannot be read (`readLockFile`), and the pause between reads.
+    /// backstop.sh's read_lock_record reads it as many times.
+    static let lockReadAttempts = 3
+    static let lockReadRetryMicroseconds: useconds_t = 100_000
 
     #if DEBUG
     /// Tests set a lower limit on the record this app writes in the lock
@@ -338,6 +343,10 @@ struct Store: Sendable {
     /// app's own lock descriptor and its writes are untouched, so a held
     /// lock file can read as unreadable. Debug builds only.
     nonisolated(unsafe) static var lockReadErrnoForTesting: Int32?
+    /// With `lockReadErrnoForTesting`, how many reads fail before the rest
+    /// go through, as a passing error would; nil for every read. Debug
+    /// builds only.
+    nonisolated(unsafe) static var lockReadFailuresForTesting: Int?
     #endif
 
     private static var lockRecordWriteLimit: Int {
@@ -394,8 +403,23 @@ struct Store: Sendable {
 
     /// The recovery lock file's bytes, read only while it is a regular file
     /// (lstat, so not a symlink) this user owns and at most
-    /// `lockEndRecordMaxBytes` long.
+    /// `lockEndRecordMaxBytes` long. A read that fails (an error, or a file
+    /// that changed while it was read) is tried again, up to
+    /// `lockReadAttempts` reads in all, `lockReadRetryMicroseconds` apart:
+    /// an unreadable file may hold the end of the session in session.json
+    /// and counts as one, so a passing error or a change caught partway
+    /// must not end a session the file says nothing about.
     private func readLockFile() -> LockFile {
+        var found = readLockFileOnce()
+        for _ in 1..<Self.lockReadAttempts {
+            guard case .unreadable = found else { break }
+            usleep(Self.lockReadRetryMicroseconds)
+            found = readLockFileOnce()
+        }
+        return found
+    }
+
+    private func readLockFileOnce() -> LockFile {
         let path = paths.recoveryLock.path
         var st = stat()
         guard lstat(path, &st) == 0, st.st_mode & S_IFMT == S_IFREG, st.st_uid == getuid() else { return .notUsable }
@@ -412,7 +436,11 @@ struct Store: Sendable {
         }
         #if DEBUG
         if let injected = Self.lockReadErrnoForTesting {
-            return .unreadable("it could not be read (\(String(cString: strerror(injected))))")
+            let left = Self.lockReadFailuresForTesting
+            if left.map({ $0 > 0 }) ?? true {
+                Self.lockReadFailuresForTesting = left.map { $0 - 1 }
+                return .unreadable("it could not be read (\(String(cString: strerror(injected))))")
+            }
         }
         #endif
         // One byte more than the size: a file that grew meanwhile is not
@@ -460,6 +488,21 @@ struct Store: Sendable {
     /// whole that is not a record ends nothing (`LockEndRecord.foreign`).
     /// Nothing is recorded for a session.json that is not a regular file.
     func sessionEndRecordedInLock() -> String? {
+        lockEndEvidence()?.place
+    }
+
+    /// Where the recovery lock file records the end of the session, or
+    /// else the log (`sessionEndRecordedInLog`), and whether the log is
+    /// the place. A lock file that cannot be read only may hold the end,
+    /// while a whole record in the log shows it, so the log is named then.
+    /// Either way the session counts as ended.
+    func sessionEndRecordedInLockOrLog() -> (place: String, inLog: Bool)? {
+        guard let lock = lockEndEvidence() else { return sessionEndRecordedInLog().map { ($0, true) } }
+        if lock.unreadable, let log = sessionEndRecordedInLog() { return (log, true) }
+        return (lock.place, false)
+    }
+
+    private func lockEndEvidence() -> (place: String, unreadable: Bool)? {
         var st = stat()
         guard stat(paths.sessionFile.path, &st) == 0, st.st_mode & S_IFMT == S_IFREG else { return nil }
         switch lockEndRecord() {
@@ -467,11 +510,11 @@ struct Store: Sendable {
             return nil
         case .foreign:
             guard let encoded = sessionEndMarker(), lockHoldsRecordCutShort(of: encoded) else { return nil }
-            return "\(paths.recoveryLock.lastPathComponent), which holds this session's end record cut short, so it counts as one"
+            return ("\(paths.recoveryLock.lastPathComponent), which holds this session's end record cut short, so it counts as one", false)
         case let .unreadable(why):
-            return "\(paths.recoveryLock.lastPathComponent), which \(why), so it may hold this session's end and counts as one"
+            return ("\(paths.recoveryLock.lastPathComponent), which \(why), so it may hold this session's end and counts as one", true)
         case let .record(encoded):
-            return encoded == sessionEndMarker() ? paths.recoveryLock.lastPathComponent : nil
+            return encoded == sessionEndMarker() ? (paths.recoveryLock.lastPathComponent, false) : nil
         }
     }
 

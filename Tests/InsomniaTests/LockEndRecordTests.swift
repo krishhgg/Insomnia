@@ -28,6 +28,7 @@ final class LockEndRecordTests: XCTestCase {
 
     override func tearDown() async throws {
         Store.lockReadErrnoForTesting = nil
+        Store.lockReadFailuresForTesting = nil
         RecoveryLockHandle.pwriteForTesting = nil
         try? FileManager.default.setAttributes([.appendOnly: false], ofItemAtPath: lockFile.path)
         try? TestACL.removeAll(h.home.paths.appSupport)
@@ -930,6 +931,124 @@ final class LockEndRecordTests: XCTestCase {
             XCTAssertEqual(lockBytes(), Data(), form)
             XCTAssertEqual(try inode(lockFile), lockInode, form)
         }
+    }
+
+    // MARK: Reads that fail
+
+    /// A read of the lock file that fails is tried again, up to
+    /// `Store.lockReadAttempts` reads in all (`Store.lockReadErrnoForTesting`
+    /// with `lockReadFailuresForTesting`). A crash whose lock file holds
+    /// content that is no record, read on the last try, resumes, and the
+    /// resume empties the file. A file that fails every try still counts as
+    /// the end, as it may hold one. A whole record of the session in
+    /// insomnia.log is named then instead, since it shows the end that the
+    /// file only may hold.
+    func testTheAppReadsALockFileAgainBeforeItCountsAsTheEnd() async throws {
+        let first = h.makeManager()
+        await first.reconcile()
+        await first.start(duration: 3600)
+        let lockInode = try inode(lockFile)
+        let foreign = Data("pid 4242\n".utf8)
+        try writeInPlace(foreign, to: lockFile)
+        Store.lockReadErrnoForTesting = EIO
+        Store.lockReadFailuresForTesting = Store.lockReadAttempts - 1
+        var before = h.guardFake.calls.count
+        var mark = logText().count
+        let resumed = h.makeManager()
+        await resumed.reconcile()
+        XCTAssertTrue(resumed.isActive, logText(since: mark))
+        XCTAssertTrue(sleepHeldAgain(since: before))
+        XCTAssertEqual(Store.lockReadFailuresForTesting, 0, "every failed read was tried again")
+        XCTAssertFalse(logText(since: mark).contains("recorded in .recovery.lock"), logText(since: mark))
+        XCTAssertEqual(lockBytes(), Data(), "the resume empties it")
+
+        try writeInPlace(foreign, to: lockFile)
+        Store.lockReadFailuresForTesting = Store.lockReadAttempts
+        before = h.guardFake.calls.count
+        mark = logText().count
+        let ended = h.makeManager()
+        await ended.reconcile()
+        XCTAssertFalse(ended.isActive, logText(since: mark))
+        XCTAssertFalse(sleepHeldAgain(since: before))
+        XCTAssertTrue(logText(since: mark).contains("reconcile: session.json holds a session already ended (recorded in .recovery.lock, which it could not be read (Input/output error), so it may hold this session's end and counts as one); restoring, not resuming"), logText(since: mark))
+        XCTAssertNil(try h.store.loadSession())
+
+        Store.lockReadErrnoForTesting = nil
+        Store.lockReadFailuresForTesting = nil
+        let second = h.makeManager()
+        await second.reconcile()
+        await second.start(duration: 3600)
+        XCTAssertTrue(second.isActive, logText())
+        let line = try XCTUnwrap(LogEndRecord.line(for: try Data(contentsOf: h.home.paths.sessionFile)))
+        let log = try FileHandle(forWritingTo: h.home.paths.logFile)
+        try log.seekToEnd()
+        try log.write(contentsOf: line + Data("\n".utf8))
+        try log.close()
+        try writeInPlace(foreign, to: lockFile)
+        Store.lockReadErrnoForTesting = EIO
+        before = h.guardFake.calls.count
+        mark = logText().count
+        let named = h.makeManager()
+        await named.reconcile()
+        Store.lockReadErrnoForTesting = nil
+        XCTAssertFalse(named.isActive, logText(since: mark))
+        XCTAssertFalse(sleepHeldAgain(since: before))
+        XCTAssertTrue(logText(since: mark).contains("reconcile: session.json holds a session already ended (recorded in insomnia.log); restoring, not resuming"), logText(since: mark))
+        XCTAssertEqual(try inode(lockFile), lockInode)
+    }
+
+    /// The agent reads the lock file again too, LOCK_READ_ATTEMPTS reads
+    /// LOCK_READ_RETRY_SECONDS apart (the app's two values), while it cannot
+    /// read it (CAT fails, `failLockReadBack(times:)`). Content that is no
+    /// record, read on the last try, ends nothing: the agent empties it and
+    /// checks the session as usual. When every read fails the file counts
+    /// as the end, and a whole record of the session in insomnia.log is
+    /// named then instead.
+    func testTheAgentReadsALockFileAgainBeforeItCountsAsTheEnd() async throws {
+        let text = try String(contentsOf: agent.script, encoding: .utf8).components(separatedBy: "\n")
+        XCTAssertEqual(text.filter { $0.hasPrefix("LOCK_READ_ATTEMPTS=") }, ["LOCK_READ_ATTEMPTS=\(Store.lockReadAttempts)"])
+        XCTAssertEqual(Store.lockReadRetryMicroseconds, 100_000)
+        XCTAssertEqual(text.filter { $0.hasPrefix("LOCK_READ_RETRY_SECONDS=") }, ["LOCK_READ_RETRY_SECONDS=0.1"])
+
+        let m = h.makeManager()
+        await m.reconcile()
+        await m.start(duration: 3600)
+        XCTAssertTrue(m.isActive)
+        let lockInode = try inode(lockFile)
+        let foreign = Data("pid 4242\n".utf8)
+        try writeInPlace(foreign, to: lockFile)
+        try agent.failLockReadBack(times: Store.lockReadAttempts - 1)
+        var (status, log) = try await runAgentBesideTheApp()
+        XCTAssertEqual(status, 0, log)
+        XCTAssertEqual(try agent.lockReads(), Store.lockReadAttempts, "the failed reads were tried again")
+        XCTAssertNotNil(try h.store.loadSession(), log)
+        XCTAssertTrue(agent.calls.contains("pmset -g batt"), log)
+        XCTAssertFalse(log.contains("already ended"), log)
+        XCTAssertTrue(log.contains("emptying \(lockFile.path): it holds bytes other than one whole end record, which ends no session"), log)
+        XCTAssertEqual(lockBytes(), Data())
+
+        let line = try XCTUnwrap(LogEndRecord.line(for: try Data(contentsOf: h.home.paths.sessionFile)))
+        let handle = try FileHandle(forWritingTo: h.home.paths.logFile)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: line + Data("\n".utf8))
+        try handle.close()
+        try writeInPlace(foreign, to: lockFile)
+        let failing = try PatchedBackstop(home: h.home.root, dir: h.home.root.appendingPathComponent("agent-failing", isDirectory: true))
+        try failing.failLockReadBack()
+        let alive = AppAliveLock(url: h.home.paths.appAliveFile)
+        XCTAssertTrue(try alive.tryAcquire())
+        let mark = logText().count
+        status = try await failing.run()
+        alive.release()
+        log = logText(since: mark)
+        XCTAssertEqual(status, 0, log)
+        XCTAssertFalse(failing.calls.contains("pmset -g batt"), log)
+        XCTAssertTrue(log.contains("already ended (recorded in \(h.home.paths.logFile.path))"), log)
+        XCTAssertFalse(log.contains("already ended (recorded in \(lockFile.path)"), log)
+        XCTAssertGreaterThanOrEqual(try failing.lockReads(), Store.lockReadAttempts)
+        XCTAssertNil(try h.store.loadSession(), log)
+        XCTAssertEqual(lockBytes(), Data(), "emptied once session.json is gone, when it ends nothing")
+        XCTAssertEqual(try inode(lockFile), lockInode)
     }
 
     // MARK: Other sessions and cleanup

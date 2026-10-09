@@ -939,10 +939,12 @@ final class SessionManager {
             Log.error("the session until \(iso(s.endsAt)) is recorded as ended in state.json (endedSession): the recovery agent ended it but could not remove session.json or write ended-session.json (its log line says why); ending here from the journal")
         } else if let record = store.sessionEndRecordAside() {
             Log.error("the session until \(iso(s.endsAt)) is recorded as ended in \(record.lastPathComponent): the recovery agent ended it but could not remove session.json or write ended-session.json or state.json (its log line says why); ending here from the journal")
-        } else if let lock = store.sessionEndRecordedInLock() {
-            Log.error("the session until \(iso(s.endsAt)) is recorded as ended in \(lock): the recovery agent ended it but could not remove session.json or write ended-session.json, state.json or a new file (its log line says why); ending here from the journal")
-        } else if let log = store.sessionEndRecordedInLog() {
-            Log.error("the session until \(iso(s.endsAt)) is recorded as ended in \(log): the recovery agent ended it but could not remove session.json or write ended-session.json, state.json, a new file or the recovery lock file (its log line says why); ending here from the journal")
+        } else if let (place, inLog) = store.sessionEndRecordedInLockOrLog() {
+            if inLog {
+                Log.error("the session until \(iso(s.endsAt)) is recorded as ended in \(place): the recovery agent ended it but could not remove session.json or write ended-session.json, state.json, a new file or the recovery lock file (its log line says why); ending here from the journal")
+            } else {
+                Log.error("the session until \(iso(s.endsAt)) is recorded as ended in \(place): the recovery agent ended it but could not remove session.json or write ended-session.json, state.json or a new file (its log line says why); ending here from the journal")
+            }
         } else {
             return
         }
@@ -3207,14 +3209,14 @@ final class SessionManager {
         // (ended-session.json, the journal's endedSession, a record aside,
         // the recovery lock file or a line in insomnia.log or
         // insomnia.log.1 holds its bytes, or the lock file cannot be read
-        // whole) is over, deadline or not, whatever pmset reads now. Other
-        // content in the lock file ends nothing (`Store.LockEndRecord
-        // .foreign`).
+        // whole in three tries) is over, deadline or not, whatever pmset
+        // reads now. A record in the log is named before a lock file that
+        // cannot be read, which only may hold the end. Other content in the
+        // lock file ends nothing (`Store.LockEndRecord.foreign`).
         let endRecordedIn: String? = onDisk == nil ? nil
             : store.sessionEndIsRecorded() ? "ended-session.json"
             : store.sessionEndIsJournaled(in: state) ? "state.json"
-            : store.sessionEndRecordAside()?.lastPathComponent ?? store.sessionEndRecordedInLock()
-                ?? store.sessionEndRecordedInLog()
+            : store.sessionEndRecordAside()?.lastPathComponent ?? store.sessionEndRecordedInLockOrLog()?.place
         let endedEarlier = endRecordedIn != nil
 
         // A valid session is not resumed while config.json is rejected in

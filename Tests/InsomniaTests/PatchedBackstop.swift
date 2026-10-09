@@ -197,17 +197,37 @@ struct PatchedBackstop {
     /// Points CAT at a fake that fails on the recovery lock file and runs
     /// /bin/cat on anything else, so the agent cannot read the lock file
     /// back after it writes a record there, and reads session.json and its
-    /// other files as usual.
-    func failLockReadBack() throws {
+    /// other files as usual. With `times`, only the first that many reads
+    /// of the lock file fail, as a passing error would (`lockReads()`
+    /// counts them).
+    func failLockReadBack(times: Int? = nil) throws {
         let cat = dir.appendingPathComponent("cat")
+        let reads = dir.appendingPathComponent("lock-reads")
         try #"""
         #!/bin/bash
-        [[ "${1:-}" == */.recovery.lock ]] && exit 1
+        if [[ "${1:-}" == */.recovery.lock ]]; then
+          n=$(( $(/bin/cat '\#(reads.path)' 2>/dev/null || echo 0) + 1 ))
+          echo "$n" > '\#(reads.path)'
+          (( n > \#(times ?? Int.max) )) || exit 1
+        fi
         exec /bin/cat "$@"
 
         """#.write(to: cat, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: cat.path)
         try patch("CAT=/bin/cat", "CAT='\(cat.path)'")
+    }
+
+    /// How many times the agent read the recovery lock file through the
+    /// fake of `failLockReadBack`: 0 before the first read, which makes
+    /// the count file.
+    func lockReads() throws -> Int {
+        let url = dir.appendingPathComponent("lock-reads")
+        guard FileManager.default.fileExists(atPath: url.path) else { return 0 }
+        let text = try String(contentsOf: url, encoding: .utf8)
+        guard let count = Int(text.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+            throw RunError(description: "lock-reads holds \(text.debugDescription), not a count")
+        }
+        return count
     }
 
     /// Points RM at a fake that sets the user append-only flag (chflags

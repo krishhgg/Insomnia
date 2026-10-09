@@ -1169,7 +1169,9 @@ final class CutoffAgreementTests: XCTestCase {
     }
 
     /// config.json as the app writes it or as a user edits it by hand, with
-    /// the end floor off, lowered, or the thermal rules off: the agent ends
+    /// the end floor off, lowered, or the thermal rules off, also one over
+    /// 64 KiB and one with its end floor twice (the app reads the first),
+    /// which an agent before round 33 did not read itself: the agent ends
     /// the session exactly where the app's binary says it ends, whether the
     /// binary answers or the agent reads the file itself because the binary
     /// is missing, of another version, gives an answer the script does not
@@ -1187,12 +1189,22 @@ final class CutoffAgreementTests: XCTestCase {
             return try Store.makeEncoder().encode(c)
         }
         let handEdited = Data("{\n  \"thermalRules\" : false,\n  \"endFloor\" : 25\n}\n".utf8)
+        var big = Config()
+        big.setEndFloor(40)
+        big.thermalRules = false
+        big.hotspotSSID = String(repeating: "a", count: 70_000)
+        let overSixtyFourKiB = try Store.makeEncoder().encode(big)
+        let twice = Data(#"{"endFloor":40,"endFloor":0,"thermalRules":false}"#.utf8)
+        XCTAssertEqual(try Store.decodeConfig(overSixtyFourKiB).agentCutoffs, AgentCutoffs(endFloor: 40, thermalRules: false))
+        XCTAssertEqual(try Store.decodeConfig(twice).agentCutoffs, AgentCutoffs(endFloor: 40, thermalRules: false))
         let policies: [(name: String, config: Data, floor: Int, rules: Bool, probes: [(battery: Int, level: Int, ends: Bool)])] = [
             ("floor off", try app(0, true), 0, true, [(5, 0, false), (50, 3, true)]),
             ("lower floor", try app(5, true), 5, true, [(7, 0, false), (4, 0, true)]),
             ("thermal rules off", try app(10, false), 10, false, [(50, 3, false), (9, 0, true)]),
             ("repaired by the app", try app(20, false), 20, false, [(21, 3, false), (19, 0, true)]),
             ("edited by hand", handEdited, 25, false, [(27, 3, false), (24, 0, true)]),
+            ("over 64 KiB", overSixtyFourKiB, 40, false, [(42, 3, false), (39, 0, true)]),
+            ("its end floor twice", twice, 40, false, [(42, 3, false), (39, 0, true)]),
         ]
         let breaks: [(why: String, breakIt: (PatchedBackstop) throws -> Void)?] = [nil] + binaryBreaks.map { $0 }
         var cases: [PolicyCase] = []
@@ -1223,7 +1235,9 @@ final class CutoffAgreementTests: XCTestCase {
     }
 
     /// config.json the app rejects as a whole, for a field other than the
-    /// cutoffs (freezeList 42) or for the end floor itself (a string):
+    /// cutoffs (freezeList 42), for the end floor itself (a string), for
+    /// text cut short or for a string with an escape JSON does not have
+    /// (the last two an agent before round 33 could not read itself):
     /// read here, the agent finds the app rejects it too, so with or
     /// without the binary it enforces the cutoffs recorded for the session
     /// (40%, rules off), and the app's defaults (10%, on) where there is
@@ -1235,7 +1249,12 @@ final class CutoffAgreementTests: XCTestCase {
         let configs: [(name: String, bytes: Data, breaks: [(why: String, breakIt: (PatchedBackstop) throws -> Void)?])] = [
             ("rejected for another field", rejectedConfig, [nil] + binaryBreaks.map { $0 }),
             ("rejected for its end floor", Data(#"{"endFloor":"30","thermalRules":false}"#.utf8), [nil, binaryBreaks[1]]),
+            ("cut short", Data(#"{"endFloor":40,"thermalRules":fal"#.utf8), [nil, binaryBreaks[1]]),
+            ("an escape JSON does not have", Data(#"{"endFloor":40,"thermalRules":false,"hotspotSSID":"a\x41"}"#.utf8), [nil, binaryBreaks[1]]),
         ]
+        for config in configs {
+            XCTAssertNil(try? Store.decodeConfig(config.bytes), config.name)
+        }
         var cases: [PolicyCase] = []
         for (n, config) in configs.enumerated() {
             for (b, breakIt) in config.breaks.enumerated() {
@@ -1273,61 +1292,61 @@ final class CutoffAgreementTests: XCTestCase {
         }
     }
 
-    /// config.json the agent cannot read here: cut short (the app rejects
-    /// it, plutil cannot parse it), over 64 KiB (the app reads it), an end
-    /// floor there twice (the app reads the first) or a string with an
-    /// escape JSON does not have (the app rejects it). With the cutoffs
-    /// recorded for the session (40%, rules off, what the app enforces on
-    /// each of these files that it reads) the agent enforces the record,
-    /// with or without the binary, as the app does. Without a record the
-    /// binary still answers as the app reads the file, but an agent whose
-    /// binary cannot answer has nothing on disk that says what the app
-    /// enforces and enforces the strictest cutoffs (95%, on): it ends at
-    /// 50% a session the app keeps. That is an open limit (docs/spec.md),
-    /// pinned here as it is, not an accepted one.
+    /// config.json the agent cannot read here: over 8 MiB, which the app
+    /// reads, and an end floor on which Foundation's decoder stops the app
+    /// (a precondition in its Decimal parse; json_decimal_reads in the
+    /// scripts). The app's binary answers for neither: it reads no more
+    /// than 8 MiB (`AgentCutoffsCommand.maxInputBytes`), the bound the
+    /// agent reads too, and on the second it stops as the app does. Here a
+    /// stand-in exits with the status of a process stopped by SIGABRT, so
+    /// no crash report is written. With the cutoffs recorded for the
+    /// session (40%, rules off, what the app enforces on the first file),
+    /// the agent enforces the record. Without a record it has nothing on
+    /// disk that says what the app enforces and enforces the strictest
+    /// cutoffs (95%, on): on the first file it ends at 50% a session the
+    /// app keeps. That is an open limit (docs/spec.md), pinned here as it
+    /// is, not an accepted one. A read that does not finish within
+    /// TEXT_READ_SECONDS takes the same path; no such text runs here, as
+    /// one takes minutes.
     func testAConfigReadNeitherWayLeavesTheRecordOrTheStrictest() async throws {
         var big = Config()
         big.setEndFloor(40)
         big.thermalRules = false
-        big.hotspotSSID = String(repeating: "a", count: 70_000)
-        let configs: [(name: String, bytes: Data, appReads: Bool)] = [
-            ("cut short", Data(#"{"endFloor":40,"thermalRules":fal"#.utf8), false),
-            ("over 64 KiB", try Store.makeEncoder().encode(big), true),
-            ("its end floor twice", Data(#"{"endFloor":40,"endFloor":0,"thermalRules":false}"#.utf8), true),
-            ("an escape JSON does not have", Data(#"{"endFloor":40,"thermalRules":false,"hotspotSSID":"a\x41"}"#.utf8), false),
+        big.hotspotSSID = String(repeating: "a", count: AgentCutoffsCommand.maxInputBytes)
+        let oversized = try Store.makeEncoder().encode(big)
+        XCTAssertGreaterThan(oversized.count, AgentCutoffsCommand.maxInputBytes)
+        XCTAssertEqual(try Store.decodeConfig(oversized).agentCutoffs, AgentCutoffs(endFloor: 40, thermalRules: false))
+        // Not decoded here: the decoder would stop this process.
+        let stopping = Data(#"{"endFloor":0.\#(String(repeating: "0", count: 126))9007199254740993e142,"thermalRules":false}"#.utf8)
+        let tooLarge: (why: String, breakIt: (PatchedBackstop) throws -> Void) = ("(exit 74, output 'unreadable')", { _ in })
+        let stops: (why: String, breakIt: (PatchedBackstop) throws -> Void) = ("(exit 134, output '')", { try $0.replaceAppBinary(with: "exit 134") })
+        let configs: [(bytes: Data, here: String, breaks: [(why: String, breakIt: (PatchedBackstop) throws -> Void)])] = [
+            (oversized, "it holds more than \(AgentCutoffsCommand.maxInputBytes) bytes, which is not read here", [tooLarge] + binaryBreaks),
+            (stopping, "on which the app's decoder stops the app", [stops, binaryBreaks[0]]),
         ]
-        let breaks: [(why: String, breakIt: (PatchedBackstop) throws -> Void)?] = [nil] + binaryBreaks.map { $0 }
+        let strictest = "nothing on disk says which cutoffs the app enforces, so enforcing the strictest, a 95% end floor and thermal rules on"
         var cases: [PolicyCase] = []
-        var strictest: [Bool] = []
         for (n, config) in configs.enumerated() {
-            for (b, breakIt) in breaks.enumerated() {
-                let read = breakIt == nil ? [] : ["read here: a 40% end floor and thermal rules off"]
+            for (b, breakIt) in config.breaks.enumerated() {
                 for (battery, level, ends) in [(50, 3, false), (39, 0, true)] {
                     cases.append(try policyCase("\(n)-\(b)-\(battery)", config: config.bytes, journal: .record("40 false"), battery: battery, level: level,
-                                                breakIt: breakIt, ends: ends, logs: read))
-                    strictest.append(false)
+                                                breakIt: breakIt, ends: ends, logs: [config.here, "read here: a 40% end floor and thermal rules off"]))
                 }
             }
-            for (b, breakIt) in [nil, breaks[2]].enumerated() {
+            for (b, breakIt) in config.breaks.prefix(2).enumerated() {
                 for (j, journal) in [JournalForm.record(nil), .record("96 false"), .dangling, .missing].enumerated() {
-                    let logs = breakIt == nil ? [] : ["nothing on disk says which cutoffs the app enforces, so enforcing the strictest, a 95% end floor and thermal rules on",
-                                                      "below the 95% end floor"]
                     cases.append(try policyCase("\(n)-none\(b)-\(j)", config: config.bytes, journal: journal, battery: 50, level: 0,
-                                                breakIt: breakIt, ends: breakIt != nil, logs: logs))
-                    strictest.append(breakIt != nil)
+                                                breakIt: breakIt, ends: true, logs: [config.here, strictest, "below the 95% end floor"]))
                 }
             }
         }
-        XCTAssertNil(try? Store.decodeConfig(configs[0].bytes))
-        XCTAssertEqual(try Store.decodeConfig(configs[1].bytes).agentCutoffs, AgentCutoffs(endFloor: 40, thermalRules: false))
-        XCTAssertEqual(try Store.decodeConfig(configs[2].bytes).agentCutoffs, AgentCutoffs(endFloor: 40, thermalRules: false))
-        XCTAssertNil(try? Store.decodeConfig(configs[3].bytes))
 
         let logs = try await runPolicyCases(cases)
 
-        for ((c, log), strict) in zip(zip(cases, logs), strictest) {
-            XCTAssertEqual(log.contains("enforcing the strictest"), strict, "\(c.label): \(log)")
+        for (c, log) in zip(cases, logs) {
+            XCTAssertEqual(log.contains("enforcing the strictest"), c.record == nil, "\(c.label): \(log)")
             XCTAssertFalse(log.contains("enforcing the file's"), "\(c.label): \(log)")
+            XCTAssertFalse(log.contains("defaults apply"), "\(c.label): \(log)")
         }
     }
 
