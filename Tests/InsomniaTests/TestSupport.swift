@@ -1063,8 +1063,10 @@ enum TestACL {
         try chmod(["+a", "user:\(owner) deny add_file", dir.path])
     }
 
-    /// Removes every ACL entry from `url`.
+    /// Removes every ACL entry from `url`. A file that holds none (or
+    /// cannot be read for its ACL) is left alone: no chmod runs.
     static func removeAll(_ url: URL) throws {
+        guard entries(url) > 0 else { return }
         try chmod(["-N", url.path])
     }
 

@@ -223,7 +223,12 @@ final class LaunchdBackstopTests: XCTestCase {
         XCTAssertLessThan(verify.lowerBound, exec.lowerBound, "exec must follow a successful verify")
         XCTAssertTrue(p.hasSuffix("; exit 1"), "a failed verification ends the program: \(p)")
         XCTAssertTrue(p.contains(#"f="$HOME/Library/Logs/Insomnia/insomnia.log"; "#), "the refusal is logged where the app logs")
-        XCTAssertEqual(p.components(separatedBy: #">> "$f""#).count, 3, "a newline after a line cut short, then the refusal")
+        XCTAssertEqual(p.components(separatedBy: #"8>>"$f""#).count, 2, "one descriptor on the log")
+        XCTAssertEqual(p.components(separatedBy: ">>").count, 2, "no write but through that descriptor")
+        XCTAssertEqual(p.components(separatedBy: ">&8").count, 3, "a newline after a line cut short, then the refusal")
+        let lock = try XCTUnwrap(p.range(of: "/usr/bin/lockf -s -t 5 8 || exit 1;"))
+        let tail = try XCTUnwrap(p.range(of: "/usr/bin/tail -c 1"))
+        XCTAssertLessThan(lock.lowerBound, tail.lowerBound, "the last byte is read under the log's lock")
         XCTAssertFalse(p.contains("'"), "install.sh holds the program in single quotes")
         XCTAssertFalse(p.contains("\n"), "one line, so install.sh's AGENT_PROGRAM line stays one line")
         XCTAssertEqual(p.components(separatedBy: "/bin/bash").count, 2, "exactly one exec target: the sealed script")
@@ -290,6 +295,105 @@ final class LaunchdBackstopTests: XCTestCase {
             XCTAssertTrue(lines.dropLast().last?.contains("[error] backstop agent: \(home.root.path)/Missing.app does not satisfy") == true, "\(c.name): \(lines)")
             XCTAssertEqual(lines.last, "", c.name)
         }
+    }
+
+    /// The program as launchd runs it, refusing the bundle as above, for
+    /// the log at `log` in this test's HOME. Not yet started.
+    private struct CodesignStillRuns: Error {}
+
+    /// The program as launchd runs it, in a scratch HOME, with its one
+    /// codesign call replaced by /usr/bin/false: the bundle fails the check
+    /// and nothing is verified or executed. Throws, running nothing, if the
+    /// program would still call codesign.
+    private func refusingAgent() throws -> Process {
+        let p = LaunchdBackstop.agentProgram
+        let failing = p.replacingOccurrences(of: "/usr/bin/codesign", with: "/usr/bin/false")
+        guard p.components(separatedBy: "/usr/bin/codesign").count == 2,
+              !failing.contains("/usr/bin/codesign"), !failing.contains("exec /usr/bin/codesign") else { throw CodesignStillRuns() }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = ["-c", failing, "sh", Self.requirement, home.root.appendingPathComponent("Missing.app").path]
+        process.environment = ["HOME": home.root.path, "PATH": "/usr/bin:/bin"]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        return process
+    }
+
+    private var agentLog: URL { home.root.appendingPathComponent("Library/Logs/Insomnia/insomnia.log") }
+
+    /// The app writes a line in pieces, every write(2) cut short to four
+    /// bytes, and holds the log's lock until the last piece. The
+    /// LaunchAgent's refusal, started after the first piece, writes nothing
+    /// until then, and its line then follows the app's whole line on a line
+    /// of its own.
+    func testTheAgentsLineWaitsForEveryPieceOfAnAppLineCutShort() throws {
+        try FileManager.default.createDirectory(at: agentLog.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("a line\n".utf8).write(to: agentLog)
+        let agent = try refusingAgent()
+        let exit = ProcessExit(agent)
+        let pieces = Locked(0)
+        let startError = Locked<String?>(nil)
+        let sizeWhileWaiting = Locked<Int?>(nil)
+        let log = agentLog
+        OwnerOnly.logWriteForTesting = { fd, bytes, count in
+            pieces.value += 1
+            if pieces.value == 2 {
+                do {
+                    try agent.run()
+                    usleep(500_000)
+                } catch {
+                    startError.value = "\(error)"
+                }
+                sizeWhileWaiting.value = (try? Data(contentsOf: log))?.count
+            }
+            return Darwin.write(fd, bytes, min(count, 4))
+        }
+        defer { OwnerOnly.logWriteForTesting = nil }
+
+        try OwnerOnly.appendToLog("the app's line\n", at: agentLog)
+        OwnerOnly.logWriteForTesting = nil
+        XCTAssertNil(startError.value)
+        if agent.processIdentifier > 0 { exit.wait() }
+
+        XCTAssertEqual(agent.terminationStatus, 1)
+        XCTAssertEqual(pieces.value, 4, "15 bytes, four at a time")
+        XCTAssertEqual(sizeWhileWaiting.value, "a line\n".utf8.count + 4, "the agent wrote between two pieces of the app's line")
+        let lines = try String(contentsOf: agentLog, encoding: .utf8).components(separatedBy: "\n")
+        XCTAssertEqual(lines.count, 4, "\(lines)")
+        XCTAssertEqual(Array(lines.prefix(2)), ["a line", "the app's line"])
+        XCTAssertTrue(lines.dropFirst(2).first?.contains("[error] backstop agent: \(home.root.path)/Missing.app does not satisfy") == true, "\(lines)")
+        XCTAssertEqual(lines.last, "")
+    }
+
+    /// The app rotates the log under its lock. The agent's line, waiting
+    /// for that lock on the file the app renamed, goes to the fresh log the
+    /// path then names, not into the renamed file, and starts after the
+    /// line cut short left there.
+    func testTheAgentsLineFollowsARotationItWaitedFor() throws {
+        try FileManager.default.createDirectory(at: agentLog.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("old\n".utf8).write(to: agentLog)
+        let holder = try LogLockHolder(agentLog)
+        let agent = try refusingAgent()
+        let exit = ProcessExit(agent)
+        try agent.run()
+        defer {
+            holder.release()
+            exit.wait()
+        }
+        usleep(500_000)
+        XCTAssertEqual(try String(contentsOf: agentLog, encoding: .utf8), "old\n", "written under another writer's lock")
+
+        XCTAssertEqual(rename(agentLog.path, OwnerOnly.rotated(agentLog).path), 0)
+        try Data("fresh, cut sh".utf8).write(to: agentLog)
+        holder.release()
+        exit.wait()
+
+        XCTAssertEqual(agent.terminationStatus, 1)
+        XCTAssertEqual(try String(contentsOf: OwnerOnly.rotated(agentLog), encoding: .utf8), "old\n", "the line went into the renamed file")
+        let lines = try String(contentsOf: agentLog, encoding: .utf8).components(separatedBy: "\n")
+        XCTAssertEqual(lines.count, 3, "\(lines)")
+        XCTAssertEqual(lines.first, "fresh, cut sh")
+        XCTAssertTrue(lines.dropFirst().first?.contains("[error] backstop agent: ") == true, "\(lines)")
     }
 
     /// Running from a bundle pins that bundle; `swift run` falls back to the

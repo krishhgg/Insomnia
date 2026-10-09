@@ -17,11 +17,14 @@ import Foundation
 /// newline or by the end of the file, as grep(1) reads it, so a record
 /// whose newline alone is missing still counts: it holds every byte. Every
 /// writer of the log (`OwnerOnly.appendToLog`, `append` here, backstop.sh's
-/// log and record_end_in_log, the LaunchAgent's own line) puts a newline
-/// first when the file ends in a line cut short, so such a record keeps
-/// its line and a record written after a line cut short starts its own. A
-/// session.json with the same bytes as one that ended earlier, which takes
-/// the same start and end times to the second, would read as ended too.
+/// log and record_end_in_log, the LaunchAgent's own line) holds flock(2) on
+/// the file from its look at the last byte to the end of its write
+/// (`OwnerOnly.lockLog`), and puts a newline first when the file ends in a
+/// line cut short, so such a record keeps its line, a record written after
+/// a line cut short starts its own, and no other line, nor the rest of one
+/// a short write left to do, lands between the two. A session.json with
+/// the same bytes as one that ended earlier, which takes the same start
+/// and end times to the second, would read as ended too.
 ///
 /// It is written only under the recovery lock (`RecoveryLockHandle.locks`),
 /// to insomnia.log while that is a regular file (lstat, so not a symlink)
@@ -143,15 +146,17 @@ enum LogEndRecord {
 
     /// Appends `line` and a newline to the log at `url` and reads it back.
     /// Only while `url` is a regular file (lstat) this user owns; it is
-    /// opened without O_CREAT and without following a symlink, and the
-    /// descriptor must be on the file the path names. The line goes out in
-    /// one write(2) under flock(2) on the file, as a rotation by another
-    /// copy of the app takes it, after a newline when the file ends in a
-    /// line cut short (`OwnerOnly.endsMidLine`), so the record is a line of
-    /// its own. True only when the whole write went out and the file,
-    /// still the one at `url`, then holds the record as a line. The
-    /// caller holds the recovery lock and `Log.withFileLock`.
-    static func append(_ line: Data, to url: URL) -> Bool {
+    /// opened without O_CREAT and without following a symlink. The
+    /// descriptor is locked as every writer of the log locks it
+    /// (`OwnerOnly.lockLog`, at most `lockTimeout`), and once locked must
+    /// be on the file the path names. The line goes out in one write(2),
+    /// after a newline when the file ends in a line cut short
+    /// (`OwnerOnly.endsMidLine`), so the record is a line of its own. True
+    /// only when the whole write went out and the file, still the one at
+    /// `url`, then holds the record as a line. A lock not taken in time
+    /// writes nothing and returns false. The caller holds the recovery lock
+    /// and `Log.withFileLock`.
+    static func append(_ line: Data, to url: URL, lockTimeout: TimeInterval = OwnerOnly.logLockTimeout) -> Bool {
         var named = stat()
         guard lstat(url.path, &named) == 0, named.st_mode & S_IFMT == S_IFREG, named.st_uid == getuid() else { return false }
         // Opened for reading too, for its last byte; write-only when that
@@ -159,17 +164,18 @@ enum LogEndRecord {
         var fd = open(url.path, O_RDWR | O_APPEND | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
         if fd < 0, errno == EACCES { fd = open(url.path, O_WRONLY | O_APPEND | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC) }
         guard fd >= 0 else { return false }
+        // Closing the descriptor lets its lock go.
         defer { close(fd) }
+        guard (try? OwnerOnly.lockLog(fd, path: url.path, timeout: lockTimeout)) != nil else { return false }
         var held = stat()
         guard fstat(fd, &held) == 0, held.st_mode & S_IFMT == S_IFREG, held.st_uid == getuid(),
+              lstat(url.path, &named) == 0, named.st_mode & S_IFMT == S_IFREG,
               held.st_dev == named.st_dev, held.st_ino == named.st_ino else { return false }
-        guard flock(fd, LOCK_EX) == 0 else { return false }
-        defer { flock(fd, LOCK_UN) }
         return appendHeld(line, to: fd, at: url)
     }
 
-    /// The write and the read-back, on a descriptor already checked to be on
-    /// the log at `url` (O_APPEND).
+    /// The write and the read-back, on a descriptor already locked and
+    /// checked to be on the log at `url` (O_APPEND).
     private static func appendHeld(_ line: Data, to fd: Int32, at url: URL) -> Bool {
         let whole = (OwnerOnly.endsMidLine(fd) ? Data([0x0A]) : Data()) + line + Data([0x0A])
         let written = whole.withUnsafeBytes { Darwin.write(fd, $0.baseAddress!, $0.count) }
@@ -181,8 +187,9 @@ enum LogEndRecord {
         return scan(url, for: line) == .read(found: true, anyRecord: true)
     }
 
-    /// For a rotation of the log at `url`, held open (O_APPEND) on `fd`,
-    /// about to be renamed over `url`.1: copies into it the record in `.1`
+    /// For a rotation of the log at `url`, held open (O_APPEND) and locked
+    /// (`OwnerOnly.lockLog`) on `fd`, about to be renamed over `url`.1:
+    /// copies into it the record in `.1`
     /// of the session in `session` (session.json), when `.1` holds one, so
     /// the rename discards no record still in force. True when the rename
     /// may go ahead: session.json is gone, `.1` holds no record of its

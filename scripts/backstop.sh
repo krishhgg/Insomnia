@@ -293,6 +293,9 @@ LOCK_RECORD_MAX_BYTES=1048576
 LOG_RECORD_TAG=insomnia-ended-session-v1
 LOG_RECORD_MAX_BYTES=65536
 LOG_SCAN_MAX_BYTES=67108864
+# How long a line waits for another writer's lock on insomnia.log (log,
+# record_end_in_log). The app holds it for one line, or for one rotation.
+LOG_LOCK_TIMEOUT_SECONDS=5
 # com.apple.system.thermalpressurelevel at or above this ends a session. On
 # macOS the levels are 0 nominal, 1 moderate, 2 heavy, 3 trapping, 4 sleeping
 # (libkern/OSThermalNotification.h); ProcessInfo reports .critical from
@@ -329,13 +332,14 @@ LOG="$LOG_DIR/insomnia.log"
 
 # Whether the file at $1 ends in a line cut short: it is a regular file, not
 # empty, and its last byte is not a newline, or that byte cannot be read.
-# Every writer of the log then puts a newline before its own line, in the
-# same write, so the line cut short stays a line of its own: it may be the
-# record of a session's end whose newline alone is missing, which counts as
-# the end only while nothing follows it on its line (end_recorded_in_log),
-# or a line a write left partway, which a record must not join. The app's
-# writers read the same way (OwnerOnly.endsMidLine). The trailing x keeps
-# the newline that command substitution would drop.
+# Every writer of the log then puts a newline before its own line, under
+# the lock below, so the line cut short stays a line of its own: it may be
+# the record of a session's end whose newline alone is missing, which
+# counts as the end only while nothing follows it on its line
+# (end_recorded_in_log), or a line a write left partway, which a record
+# must not join. The app's writers read the same way
+# (OwnerOnly.endsMidLine). The trailing x keeps the newline that command
+# substitution would drop.
 ends_mid_line() { # file
   [[ -f "$1" && -s "$1" ]] || return 1
   local last
@@ -343,15 +347,60 @@ ends_mid_line() { # file
   [[ "$last" != $'\nx' ]]
 }
 
+# Device and inode of a path (lstat), and of an open descriptor: stat
+# with no operand reads its standard input with fstat(2). /dev/fd/N is no
+# substitute, as stat reports devfs's device for it.
+devino() { "$STAT" -f %d:%i "$1" 2>/dev/null; }
+fd_devino() { "$STAT" -f %d:%i <&"$1" 2>/dev/null; }
+# Whether descriptor $1 is open on the file the path $2 names, following a
+# symlink as opening the path did.
+fd_names() { # fd path
+  local held
+  held="$(fd_devino "$1")"
+  [[ -n "$held" && "$held" == "$("$STAT" -L -f %d:%i "$2" 2>/dev/null)" ]]
+}
+
+# Every writer of insomnia.log holds flock(2) on the file from its look at
+# the last byte (ends_mid_line) to the end of its write: this function,
+# record_end_in_log, the LaunchAgent's own line and the app
+# (OwnerOnly.lockLog), which also renames the file under it when it
+# rotates the log. So no line joins another, a write cut short and then
+# continued included. lockf takes the lock on the descriptor the line goes
+# out through, waiting at most LOG_LOCK_TIMEOUT_SECONDS, and closing that
+# descriptor lets it go. Once held, a descriptor on a file the path no
+# longer names (the app rotated it meanwhile) is let go and the path
+# opened again, up to three times. A line that gets no lock, or no file
+# the path still names, goes to standard error instead.
 log() { # level message
   "$MKDIR" -p "$LOG_DIR"
   # Append only to a regular file, or create one. open(2) on a FIFO with no
   # reader blocks, and most lines are written while this run holds the
   # recovery lock. A line with nowhere to go is dropped.
   if [[ -e "$LOG" && ! -f "$LOG" ]]; then return 0; fi
-  local first=""
-  if ends_mid_line "$LOG"; then first=$'\n'; fi
-  printf '%s%s [%s] backstop: %s\n' "$first" "$("$DATE" -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" >> "$LOG"
+  local stamp first try state line_lock_rc
+  stamp="$("$DATE" -u +%Y-%m-%dT%H:%M:%SZ)"
+  for try in 1 2 3; do
+    {
+      line_lock_rc=0
+      "$LOCKF" -s -t "$LOG_LOCK_TIMEOUT_SECONDS" 8 || line_lock_rc=$?
+      state="not locked within ${LOG_LOCK_TIMEOUT_SECONDS}s (lockf exit $line_lock_rc)"
+      if (( line_lock_rc == 0 )); then
+        state="renamed while this line waited for its lock"
+        if fd_names 8 "$LOG"; then
+          first=""
+          if ends_mid_line "$LOG"; then first=$'\n'; fi
+          state=written
+          printf '%s%s [%s] backstop: %s\n' "$first" "$stamp" "$1" "$2" >&8 || state=failed
+        fi
+      fi
+    } 8>>"$LOG" || return 1
+    [[ "$state" == renamed* ]] || break
+  done
+  case "$state" in
+    written) return 0 ;;
+    failed) return 1 ;;
+  esac
+  printf '%s [%s] backstop: %s (not in %s: %s)\n' "$stamp" "$1" "$2" "$LOG" "$state" >&2 || true
 }
 
 # --- Lock --------------------------------------------------------------------
@@ -2445,12 +2494,6 @@ record_end_in_lock() {
   [[ "$lock_record_state" == record && "$lock_record" == "$encoded" ]]
 }
 
-# Device and inode of a path (lstat), and of an open descriptor: stat
-# with no operand reads its standard input with fstat(2). /dev/fd/N is no
-# substitute, as stat reports devfs's device for it.
-devino() { "$STAT" -f %d:%i "$1" 2>/dev/null; }
-fd_devino() { "$STAT" -f %d:%i <&"$1" 2>/dev/null; }
-
 # Record the same end as one line appended to insomnia.log (see
 # end_recorded_in_log), for when $ENDED, the journal, both folders and the
 # lock file refuse it. This run holds the recovery lock (fd 9), and the app
@@ -2459,9 +2502,12 @@ fd_devino() { "$STAT" -f %d:%i <&"$1" 2>/dev/null; }
 # file, not a symlink, owned by this user, through a descriptor opened for
 # appending, read back through another opened for reading, both checked to
 # be on the file $LOG names (device and inode) before the write and after
-# the read. A log that ends in a line cut short gets a newline first, in the
-# same write (ends_mid_line), so the record is a line of its own. A record
-# already in either log for these bytes is used again.
+# the read. The descriptor written through holds the log's lock (see log)
+# from before those checks until the read-back is done, waiting at most
+# LOG_LOCK_TIMEOUT_SECONDS for it; a lock not taken records nothing here. A
+# log that ends in a line cut short gets a newline first, in the same write
+# (ends_mid_line), so the record is a line of its own. A record already in
+# either log for these bytes is used again.
 # True only when the read-back finds the whole line, and end_recorded_in_log
 # then finds it too.
 record_end_in_log() {
@@ -2471,7 +2517,8 @@ record_end_in_log() {
   [[ -f "$LOG" && ! -L "$LOG" && -O "$LOG" ]] || return 1
   # shellcheck disable=SC2094  # the log is appended to on 8 and read back on 7, on purpose
   {
-    if [[ -n "$(fd_devino 8)" && "$(fd_devino 8)" == "$(fd_devino 7)" \
+    if "$LOCKF" -s -t "$LOG_LOCK_TIMEOUT_SECONDS" 8 \
+        && [[ -n "$(fd_devino 8)" && "$(fd_devino 8)" == "$(fd_devino 7)" \
           && "$(fd_devino 8)" == "$(devino "$LOG")" && -f "$LOG" && ! -L "$LOG" && -O "$LOG" ]] \
         && { ! ends_mid_line "$LOG" || first=$'\n'; } \
         && { printf '%s%s\n' "$first" "$line" >&8; } 2>/dev/null \

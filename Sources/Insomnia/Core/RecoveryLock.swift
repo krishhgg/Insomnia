@@ -37,6 +37,14 @@ final class RecoveryLockHandle: @unchecked Sendable {
     private let mutex = NSLock()
     private var fd: Int32
 
+    #if DEBUG
+    /// Tests stand in for pwrite(2) in `replaceContents`: given the
+    /// descriptor, the bytes still to write, their count and the offset, it
+    /// returns what pwrite(2) would. Debug builds only; nothing reads it
+    /// otherwise.
+    nonisolated(unsafe) static var pwriteForTesting: ((Int32, UnsafeRawPointer, Int, off_t) -> Int)?
+    #endif
+
     fileprivate init(fd: Int32) { self.fd = fd }
 
     /// Closes this process's descriptor, as exiting would. No `LOCK_UN`:
@@ -93,7 +101,7 @@ final class RecoveryLockHandle: @unchecked Sendable {
     /// already there only grow. A file that cannot be read through the
     /// descriptor is left as it is. True once written and synced; the
     /// caller reads the file back. False once released or when a step
-    /// fails.
+    /// fails, a write that writes no byte included.
     func replaceContents(with data: Data, at path: String) -> Bool {
         mutex.withLock {
             guard fd >= 0 else { return false }
@@ -105,14 +113,20 @@ final class RecoveryLockHandle: @unchecked Sendable {
             let size = Int(held.st_size)
             guard let kept = sharedPrefix(with: data, upTo: min(size, data.count)) else { return false }
             if size > kept, ftruncate(fd, off_t(kept)) != 0 { return false }
+            var write: (Int32, UnsafeRawPointer, Int, off_t) -> Int = { pwrite($0, $1, $2, $3) }
+            #if DEBUG
+            if let injected = Self.pwriteForTesting { write = injected }
+            #endif
             let written = data.withUnsafeBytes { raw -> Bool in
                 var offset = kept
                 while offset < raw.count {
-                    let n = pwrite(fd, raw.baseAddress! + offset, raw.count - offset, off_t(offset))
+                    let n = write(fd, raw.baseAddress! + offset, raw.count - offset, off_t(offset))
                     if n < 0 {
                         if errno == EINTR { continue }
                         return false
                     }
+                    // A write that moved nothing would be tried forever.
+                    guard n > 0 else { return false }
                     offset += n
                 }
                 return true

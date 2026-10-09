@@ -96,18 +96,45 @@ struct PatchedBackstop {
         try "\(percent)".write(to: dir.appendingPathComponent("battery"), atomically: true, encoding: .utf8)
     }
 
+    struct RunError: Error, CustomStringConvertible {
+        let description: String
+    }
+
+    /// What the last run printed on standard output and standard error,
+    /// kept in `dir` (last.stdout, last.stderr) rather than thrown away.
+    var lastStdout: String { String(decoding: (try? Data(contentsOf: dir.appendingPathComponent("last.stdout"))) ?? Data(), as: UTF8.self) }
+    var lastStderr: String { String(decoding: (try? Data(contentsOf: dir.appendingPathComponent("last.stderr"))) ?? Data(), as: UTF8.self) }
+
     /// One run, as launchd starts it, or with another PATH. Returns its
-    /// exit status. The fakes call every tool by its full path.
+    /// exit status once it has exited and been reaped. What it prints goes
+    /// to `lastStdout` and `lastStderr`. A run that cannot be started
+    /// throws, and so does one a signal ended, which has no exit status:
+    /// its error carries the signal and what the run printed on standard
+    /// error. The fakes call every tool by its full path.
     func run(path: String = "/usr/bin:/bin:/usr/sbin:/sbin") async throws -> Int32 {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/bash")
         p.arguments = [script.path]
         p.environment = ["PATH": path, "INSOMNIA_HOME": home.path, "HOME": home.path]
-        p.standardOutput = FileHandle.nullDevice
-        p.standardError = FileHandle.nullDevice
+        let out = dir.appendingPathComponent("last.stdout")
+        let err = dir.appendingPathComponent("last.stderr")
+        for url in [out, err] {
+            guard FileManager.default.createFile(atPath: url.path, contents: nil) else {
+                throw RunError(description: "could not create \(url.path) for the run's output")
+            }
+        }
+        let outHandle = try FileHandle(forWritingTo: out)
+        defer { try? outHandle.close() }
+        let errHandle = try FileHandle(forWritingTo: err)
+        defer { try? errHandle.close() }
+        p.standardOutput = outHandle
+        p.standardError = errHandle
         let exit = ProcessExit(p)
         try p.run()
         await exit.exited()
+        guard p.terminationReason == .exit else {
+            throw RunError(description: "backstop.sh ended on signal \(p.terminationStatus); stderr: \(lastStderr)")
+        }
         return p.terminationStatus
     }
 
@@ -244,6 +271,39 @@ struct PatchedBackstop {
         try patch("GREP=/usr/bin/grep", "GREP='\(grep.path)'")
     }
 
+    /// Points GREP at a fake that, each time the agent looks for an end
+    /// record line while no other writer holds insomnia.log's lock (lockf
+    /// -t 0 gets it), first starts another writer that takes that lock,
+    /// writes `held sh`, waits a second, then writes `ort`, still without a
+    /// newline, and lets go. The fake runs /usr/bin/grep once that writer
+    /// holds the lock, or after 5 s without it. So the agent's write after
+    /// such a check, its record included, waits for that writer and finds
+    /// the log ends in a line cut short. A check while the lock is held
+    /// (the agent's own read-back) starts no writer. Each writer's process
+    /// ends by itself once it lets go.
+    func holdTheLogAtEveryRecordCheck(log: URL) throws {
+        let grep = dir.appendingPathComponent("grep")
+        let ready = dir.appendingPathComponent("holder.ready").path
+        try #"""
+        #!/bin/bash
+        if [[ "${1:-}" == -Fxq && "${2:-}" == -e && "${3:-}" == "insomnia-ended-session-v1 "* && -f '\#(log.path)' ]] \
+           && /usr/bin/lockf -k -s -t 0 '\#(log.path)' /usr/bin/true; then
+          /bin/rm -f '\#(ready)'
+          /usr/bin/lockf -k -s -t 5 '\#(log.path)' /bin/bash -c '
+            printf "held sh" >> "$0"; : > "$1"; /bin/sleep 1; printf "ort" >> "$0"
+          ' '\#(log.path)' '\#(ready)' </dev/null >/dev/null 2>&1 &
+          for _ in $(/usr/bin/jot 500); do
+            [[ -e '\#(ready)' ]] && break
+            /bin/sleep 0.01
+          done
+        fi
+        exec /usr/bin/grep "$@"
+
+        """#.write(to: grep, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: grep.path)
+        try patch("GREP=/usr/bin/grep", "GREP='\(grep.path)'")
+    }
+
     private func patch(_ line: String, _ replacement: String) throws {
         let text = try String(contentsOf: script, encoding: .utf8)
         let hits = text.components(separatedBy: "\n").filter { $0 == line }.count
@@ -282,6 +342,12 @@ struct PatchedBackstop {
     func replaceAppBinary(with body: String) throws {
         try "#!/bin/bash\n\(body)\n".write(to: appBinary, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: appBinary.path)
+    }
+
+    /// Sets LOG_LOCK_TIMEOUT_SECONDS, the longest each of the agent's
+    /// writes to insomnia.log waits for the log's lock, in this copy.
+    func setLogLockTimeout(_ seconds: Int) throws {
+        try patch("LOG_LOCK_TIMEOUT_SECONDS=5", "LOG_LOCK_TIMEOUT_SECONDS=\(seconds)")
     }
 
     /// Sets COMMAND_TIMEOUT_SECONDS, the limit on each read, in this copy.

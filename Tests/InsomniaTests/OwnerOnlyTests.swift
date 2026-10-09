@@ -190,6 +190,98 @@ final class OwnerOnlyTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: log, encoding: .utf8), "first\nsecond\n")
     }
 
+    /// Every writer of the log holds flock(2) on it from its look at the
+    /// last byte to the end of its write. While another writer holds it
+    /// with a line cut short, the rest of that line still to come, an
+    /// append writes nothing. Once that writer has written the rest, still
+    /// without a newline, and let go, the append reads the last byte under
+    /// the lock and puts a newline first.
+    func testAnAppendWaitsForTheLogsLockAndStartsAfterWhatItsHolderLeft() throws {
+        let log = home.paths.logs.appendingPathComponent("held.log")
+        try OwnerOnly.appendToLog("a line\n", at: log)
+        let holder = try LogLockHolder(log)
+        defer { holder.release() }
+        try holder.write("cut sh")
+        let appended = DispatchSemaphore(value: 0)
+        let failure = Locked<String?>(nil)
+        DispatchQueue.global().async {
+            do {
+                try OwnerOnly.appendToLog("next\n", at: log, lockTimeout: 30)
+            } catch {
+                failure.value = "\(error)"
+            }
+            appended.signal()
+        }
+        XCTAssertEqual(appended.wait(timeout: .now() + 0.5), .timedOut, "the append went ahead under another writer's lock")
+        XCTAssertEqual(try String(contentsOf: log, encoding: .utf8), "a line\ncut sh")
+
+        try holder.write("ort")
+        holder.release()
+
+        XCTAssertEqual(appended.wait(timeout: .now() + 30), .success)
+        XCTAssertNil(failure.value)
+        XCTAssertEqual(try String(contentsOf: log, encoding: .utf8), "a line\ncut short\nnext\n")
+    }
+
+    /// A line that gets no lock in time writes nothing: `appendToLog`
+    /// throws `.busy`, and `Log.append` keeps the line and writes it before
+    /// the next one, in order. A log held for good keeps at most
+    /// `Log.maxDeferredBytes` of lines waiting; the oldest go first.
+    func testALineThatGetsNoLockIsWrittenBeforeTheNextOne() throws {
+        let log = home.paths.logFile
+        Log.append(level: "info", "first", paths: home.paths)
+        let holder = try LogLockHolder(log)
+        defer { holder.release() }
+        let before = try Data(contentsOf: log)
+
+        XCTAssertThrowsError(try OwnerOnly.appendToLog("x\n", at: log, lockTimeout: 0.2)) { error in
+            guard case .busy(let path, _)? = error as? OwnerOnlyError else { return XCTFail("\(error)") }
+            XCTAssertEqual(path, log.path)
+        }
+        Log.append(level: "info", "second", paths: home.paths, lockTimeout: 0.2)
+        Log.append(level: "info", "third", paths: home.paths, lockTimeout: 0.2)
+        XCTAssertEqual(try Data(contentsOf: log), before, "written while another writer held the lock")
+        holder.release()
+        Log.append(level: "info", "fourth", paths: home.paths)
+
+        func messages() throws -> [String] {
+            try String(contentsOf: log, encoding: .utf8).split(separator: "\n").map {
+                String($0.split(separator: " ", maxSplits: 1).last ?? "")
+            }
+        }
+        XCTAssertEqual(try messages(), ["[info] insomnia: first", "[info] insomnia: second", "[info] insomnia: third", "[info] insomnia: fourth"])
+
+        let again = try LogLockHolder(log)
+        defer { again.release() }
+        // Three of these lines are just past the limit, two are well within it.
+        let long = String(repeating: "x", count: Log.maxDeferredBytes / 3)
+        for n in 1...3 { Log.append(level: "info", "\(n) \(long)", paths: home.paths, lockTimeout: 0.05) }
+        again.release()
+        Log.append(level: "info", "after", paths: home.paths)
+
+        XCTAssertEqual(try messages().dropFirst(4).map { String($0.prefix(18)) }, ["[info] insomnia: 2", "[info] insomnia: 3", "[info] insomnia: a"])
+    }
+
+    /// A write that writes nothing ends the append with an error instead of
+    /// trying again forever.
+    func testAWriteThatWritesNothingEndsTheAppend() throws {
+        let log = home.paths.logs.appendingPathComponent("stalled.log")
+        try OwnerOnly.appendToLog("a line\n", at: log)
+        let calls = Locked(0)
+        OwnerOnly.logWriteForTesting = { _, _, _ in
+            calls.value += 1
+            return 0
+        }
+        defer { OwnerOnly.logWriteForTesting = nil }
+
+        XCTAssertThrowsError(try OwnerOnly.appendToLog("next\n", at: log)) { error in
+            guard case .write(let path, _)? = error as? OwnerOnlyError else { return XCTFail("\(error)") }
+            XCTAssertEqual(path, log.path)
+        }
+        XCTAssertEqual(calls.value, 1)
+        XCTAssertEqual(try String(contentsOf: log, encoding: .utf8), "a line\n")
+    }
+
     /// A legacy 0644 log that is already past the cap is tightened before it
     /// becomes `.1`, so the retained copy is owner-only too.
     func testLooseLogPastTheCapIsTightenedBeforeItIsRotated() throws {
@@ -422,6 +514,42 @@ final class HandoffsLogPermissionTests: XCTestCase {
 /// Holds a worker until the test decides. Only `open` lets it through;
 /// `close`, or no decision before the wait runs out, makes `pass` throw so
 /// the worker stops where it is. The first decision stands.
+/// Holds flock(2) on a log through a descriptor of its own, as another
+/// writer of it would (backstop.sh, the LaunchAgent): it can write while it
+/// holds the lock, and lets go when released.
+final class LogLockHolder: @unchecked Sendable {
+    private let mutex = NSLock()
+    private var fd: Int32
+
+    init(_ url: URL) throws {
+        fd = open(url.path, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0o600)
+        guard fd >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        guard flock(fd, LOCK_EX | LOCK_NB) == 0 else {
+            let err = errno
+            close(fd)
+            throw POSIXError(POSIXErrorCode(rawValue: err) ?? .EIO)
+        }
+    }
+
+    func write(_ text: String) throws {
+        try mutex.withLock {
+            let data = Data(text.utf8)
+            let n = data.withUnsafeBytes { Darwin.write(fd, $0.baseAddress!, $0.count) }
+            guard n == data.count else { throw POSIXError(.EIO) }
+        }
+    }
+
+    func release() {
+        mutex.withLock {
+            guard fd >= 0 else { return }
+            close(fd)
+            fd = -1
+        }
+    }
+
+    deinit { release() }
+}
+
 private final class Gate: @unchecked Sendable {
     struct Closed: Error {}
 

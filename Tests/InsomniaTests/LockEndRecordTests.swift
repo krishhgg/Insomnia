@@ -28,6 +28,7 @@ final class LockEndRecordTests: XCTestCase {
 
     override func tearDown() async throws {
         Store.lockReadErrnoForTesting = nil
+        RecoveryLockHandle.pwriteForTesting = nil
         try? FileManager.default.setAttributes([.appendOnly: false], ofItemAtPath: lockFile.path)
         try? TestACL.removeAll(h.home.paths.appSupport)
         try? TestACL.removeAll(h.home.paths.logs)
@@ -337,6 +338,26 @@ final class LockEndRecordTests: XCTestCase {
         held.release()
         XCTAssertFalse(held.replaceContents(with: Data("x".utf8), at: lockFile.path), "a released handle writes nothing")
         XCTAssertEqual(try inode(lockFile), lockInode)
+    }
+
+    /// A write in place that writes no byte ends the attempt instead of
+    /// being tried again forever: `replaceContents` returns false after
+    /// that one write, and the file keeps the bytes it shared with the
+    /// start of the new content.
+    func testAWriteInPlaceThatWritesNothingEndsTheAttempt() throws {
+        let held = try XCTUnwrap(try RecoveryLock(url: lockFile).tryAcquire())
+        defer { held.release() }
+        XCTAssertTrue(held.replaceContents(with: Data("same start, old end".utf8), at: lockFile.path))
+        let calls = Locked(0)
+        RecoveryLockHandle.pwriteForTesting = { _, _, _, _ in
+            calls.value += 1
+            return 0
+        }
+        defer { RecoveryLockHandle.pwriteForTesting = nil }
+
+        XCTAssertFalse(held.replaceContents(with: Data("same start, new end".utf8), at: lockFile.path))
+        XCTAssertEqual(calls.value, 1)
+        XCTAssertEqual(lockBytes(), Data("same start, ".utf8))
     }
 
     /// Every state a writer leaves when it stops partway through this

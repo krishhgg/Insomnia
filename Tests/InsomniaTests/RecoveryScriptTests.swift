@@ -9728,8 +9728,17 @@ private final class ScriptFixture {
         try? fm.removeItem(at: logFile)
     }
 
-    func log() -> String {
-        (try? String(contentsOf: logFile, encoding: .utf8)) ?? ""
+    /// The backstop's log, or "" when there is none. A log that is there
+    /// but cannot be read fails the test instead of reading as empty.
+    func log(file: StaticString = #filePath, line: UInt = #line) -> String {
+        do {
+            return String(decoding: try Data(contentsOf: logFile), as: UTF8.self)
+        } catch CocoaError.fileReadNoSuchFile {
+            return ""
+        } catch {
+            XCTFail("could not read \(logFile.path): \(error)", file: file, line: line)
+            return ""
+        }
     }
 
     /// Environment for the child: no inheritance, so neither the real HOME
@@ -9770,7 +9779,7 @@ private final class ScriptFixture {
         let (p, childExit) = try launch.start()
         lastPid = p.processIdentifier
         childExit.wait()
-        return launch.result(of: p)
+        return try launch.result(of: p)
     }
 
     /// One run of a script copy as `run` starts it, held as paths and
@@ -9804,11 +9813,14 @@ private final class ScriptFixture {
             return (p, childExit)
         }
 
-        /// The exit status and what the run printed, once it has exited.
-        func result(of p: Process) -> (status: Int32, stdout: String, stderr: String) {
+        /// The exit status and what the run printed, once it has exited. An
+        /// output file that cannot be read throws, so it never reads as a
+        /// run that printed nothing; bytes that are not UTF-8 are kept as
+        /// replacement characters.
+        func result(of p: Process) throws -> (status: Int32, stdout: String, stderr: String) {
             (p.terminationStatus,
-             (try? String(contentsOf: stdout, encoding: .utf8)) ?? "",
-             (try? String(contentsOf: stderr, encoding: .utf8)) ?? "")
+             String(decoding: try Data(contentsOf: stdout), as: UTF8.self),
+             String(decoding: try Data(contentsOf: stderr), as: UTF8.self))
         }
     }
 
@@ -9872,7 +9884,7 @@ private final class ScriptFixture {
                 group.addTask {
                     let (p, childExit) = try launch.start()
                     await childExit.exited()
-                    let r = launch.result(of: p)
+                    let r = try launch.result(of: p)
                     return (i, r.status, r.stdout, r.stderr)
                 }
                 next += 1

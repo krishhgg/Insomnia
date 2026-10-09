@@ -824,6 +824,87 @@ final class LogEndRecordTests: XCTestCase {
         XCTAssertEqual(h.store.sessionEndRecordedInLog(), "insomnia.log")
     }
 
+    /// The agent's writes to the log wait for another writer that holds
+    /// the log's lock. Before each of the agent's checks for a record made
+    /// while no one holds that lock, another writer takes it, writes
+    /// `held sh`, waits a second, writes `ort` and lets go. The record,
+    /// and the line the agent logs right after its last check, each wait
+    /// for the whole of that line and start on lines of their own: no
+    /// write lands inside it. The record reads back on the first attempt
+    /// and the app counts it.
+    func testTheAgentsWritesWaitForAWriterThatHoldsTheLog() async throws {
+        _ = try await startThenPinAll()
+        let record = line(of: try sessionBytes())
+        try agent.refuseRecordsAside()
+        try agent.refuseLockRecord()
+        try agent.holdTheLogAtEveryRecordCheck(log: logFile)
+
+        try await runAgent(expecting: 1)
+        try await waitUntilNoWriterHoldsTheLog()
+
+        let recorded = "its end is recorded in the log file \(logFile.path) instead"
+        XCTAssertTrue(logText().contains("held short\n\(record)\nheld short\n"), logText())
+        let after = try XCTUnwrap(logText().components(separatedBy: "held short\n\(record)\nheld short\n").last)
+        XCTAssertTrue(try XCTUnwrap(after.components(separatedBy: "\n").first).hasSuffix(recorded + ", so Insomnia restores the session instead of resuming it. Every run retries the removal"), after)
+        XCTAssertEqual(count(record, in: logFile), 1)
+        let held = logText().components(separatedBy: "\n").filter { $0.contains("held sh") || $0.hasPrefix("ort") }
+        XCTAssertGreaterThanOrEqual(held.count, 2)
+        XCTAssertEqual(Set(held), ["held short"], logText())
+        XCTAssertEqual(h.store.sessionEndRecordedInLog(), "insomnia.log")
+    }
+
+    /// While another writer holds the log's lock for the whole run, every
+    /// write of the agent's to the log waits at most
+    /// LOG_LOCK_TIMEOUT_SECONDS (1 here) and then writes nothing there:
+    /// the log keeps exactly what that writer left, a line cut short. The
+    /// record goes in nowhere, so the agent keeps the sleep entry, and each
+    /// line it would have logged goes to standard error instead, saying
+    /// why. Once that writer lets go, the next run's first line starts
+    /// after a newline, and it records the end in the log.
+    func testTheAgentWritesNothingToALogItCannotLockAndSaysSo() async throws {
+        _ = try await startThenPinAll()
+        let record = line(of: try sessionBytes())
+        try agent.refuseRecordsAside()
+        try agent.refuseLockRecord()
+        try agent.setLogLockTimeout(1)
+        let holder = try LogLockHolder(logFile)
+        defer { holder.release() }
+        try holder.write("cut sh")
+        let before = logText()
+
+        try await runAgent(expecting: 1)
+
+        XCTAssertEqual(logText(), before)
+        XCTAssertTrue(agent.calls.contains(agent.restoreCall), agent.calls.joined(separator: "\n"))
+        XCTAssertEqual(try h.store.loadState()?.sleepDisabledByUs, true)
+        let refused = "(not in \(logFile.path): not locked within 1s (lockf exit 75))"
+        let lines = agent.lastStderr.components(separatedBy: "\n").filter { $0.contains("backstop: ") }
+        XCTAssertFalse(lines.isEmpty, agent.lastStderr)
+        XCTAssertTrue(lines.allSatisfy { $0.hasSuffix(refused) }, agent.lastStderr)
+        XCTAssertTrue(lines.contains { $0.contains("the recovery lock file \(lockFile.path), or the log file \(logFile.path). Sleep is restored anyway") }, agent.lastStderr)
+
+        holder.release()
+        agent.clearCalls()
+        try await runAgent(expecting: 1)
+        XCTAssertTrue(logText().hasPrefix(before + "\n"), "the line cut short stays as it was: \(logText())")
+        XCTAssertEqual(count(record, in: logFile), 1)
+        XCTAssertTrue(logText().contains("its end is recorded in the log file \(logFile.path) instead"), logText())
+        XCTAssertEqual(h.store.sessionEndRecordedInLog(), "insomnia.log")
+    }
+
+    /// Waits, at most 10 s, until no writer holds the log's lock, so every
+    /// writer a fake started has let go.
+    private func waitUntilNoWriterHoldsTheLog() async throws {
+        let fd = open(logFile.path, O_RDONLY | O_CLOEXEC)
+        guard fd >= 0 else { return XCTFail("could not open \(logFile.path)") }
+        defer { close(fd) }
+        for _ in 0..<500 {
+            if flock(fd, LOCK_EX | LOCK_NB) == 0 { return }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTFail("another writer still holds \(logFile.path) after 10 s")
+    }
+
     // MARK: Other sessions and ordinary ends
 
     /// A crash beside a record of an earlier session's bytes and lines that

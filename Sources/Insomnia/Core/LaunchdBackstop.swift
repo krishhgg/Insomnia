@@ -56,12 +56,17 @@ struct LaunchdBackstop: BackstopScheduling {
     /// failure it appends one line to ~/Library/Logs/Insomnia/insomnia.log
     /// (the LaunchAgent only ever exists in the standard layout), after a
     /// newline when the file ends in a line cut short or its last byte
-    /// cannot be read, as every writer of that log does (`LogEndRecord`),
-    /// and exits 1 without running anything. install.sh embeds this same
+    /// cannot be read, and exits 1 without running anything. Like every
+    /// writer of that log it holds flock(2) on the file (`lockf` on its
+    /// descriptor, at most 5 s) from its look at the last byte until the
+    /// line is written, and opens the path again, up to three times, when
+    /// the file it locked is no longer the one the path names
+    /// (`OwnerOnly.lockLog`, `LogEndRecord`). A lock not taken drops the
+    /// line. install.sh embeds this same
     /// text (its AGENT_PROGRAM line); LaunchdBackstopTests checks the two
     /// are equal so the app recognises the plist install.sh wrote. No
     /// single quotes, so the shell can hold it in one.
-    static let agentProgram = #"r="$(/usr/bin/codesign --verify --strict "-R=$1" "$2" 2>&1)" && exec /bin/bash "$2/Contents/Resources/backstop.sh"; mkdir -p "$HOME/Library/Logs/Insomnia"; f="$HOME/Library/Logs/Insomnia/insomnia.log"; [ -s "$f" ] && [ "$(/usr/bin/tail -c 1 "$f" 2>/dev/null; echo x)" != "$(printf "\nx")" ] && printf "\n" >> "$f"; printf "%s [error] backstop agent: %s does not satisfy the pinned code requirement; backstop.sh not run. Reinstall Insomnia (scripts/install.sh). codesign: %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$2" "$(printf %s "$r" | tr "\n" " ")" >> "$f"; exit 1"#
+    static let agentProgram = #"r="$(/usr/bin/codesign --verify --strict "-R=$1" "$2" 2>&1)" && exec /bin/bash "$2/Contents/Resources/backstop.sh"; mkdir -p "$HOME/Library/Logs/Insomnia"; f="$HOME/Library/Logs/Insomnia/insomnia.log"; m="$(printf "%s [error] backstop agent: %s does not satisfy the pinned code requirement; backstop.sh not run. Reinstall Insomnia (scripts/install.sh). codesign: %s" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$2" "$(printf %s "$r" | tr "\n" " ")")"; for t in 1 2 3; do { /usr/bin/lockf -s -t 5 8 || exit 1; i="$(/usr/bin/stat -f %d:%i <&8)"; [ -n "$i" ] && [ "$i" = "$(/usr/bin/stat -L -f %d:%i "$f" 2>/dev/null)" ] || continue; [ ! -s "$f" ] || [ "$(/usr/bin/tail -c 1 "$f" 2>/dev/null; echo x)" = "$(printf "\nx")" ] || printf "\n" >&8; printf "%s\n" "$m" >&8; exit 1; } 8>>"$f"; done; exit 1"#
 
     let plistURL: URL
     let bundle: URL
