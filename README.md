@@ -711,8 +711,12 @@ A `pgrep` that fails or does not answer stops the uninstall before anything
 is removed, and so does a copy running in another account, which is never
 asked to quit. So does a process whose owner `ps -o uid=` cannot tell, or
 whose identity cannot be read, once a second look still finds it: the
-uninstaller then stops before its first `sudo` call. Only a process
-positively identified as the API client is ignored.
+uninstaller then stops before its first `sudo` call. One exception: when
+this app's own copy runs beside a process whose identity cannot be read,
+that process is waited for with the app's quit, after the rule is judged,
+so with a rule only root can read it stops the uninstall after the
+password prompt. Only a process positively identified as the API client is
+ignored.
 
 Before it takes the recovery lock, the uninstaller reads the installed app's
 `InsomniaResumeFrozenVersion` with the same time limit, and the Info.plist's
@@ -753,8 +757,11 @@ rule and stops, removing nothing, when it has a line for another account,
 since that account's agent may need it to undo a session. A rule your
 account can read is read without sudo, with the 30 s limit, and judged
 before the password prompt; one only root can read is read with `sudo -n
-cat` right after it. A rule that cannot be read in full stops the uninstall
-as well. Under the recovery lock it reads the rule through sudo again and
+cat` right after it. So for a rule your account can read, the password is
+asked after the app has quit. For the usual rule, which only root can read,
+it is asked before the app is asked to quit, and an app that then refuses
+to quit stops the uninstall after the prompt. A rule that cannot be read in
+full stops the uninstall as well. Under the recovery lock it reads the rule through sudo again and
 removes it only when it is exactly the rule the installer writes for your
 account; otherwise it keeps the file and says why. It removes the rule only if root, under the
 lock the installer takes for its write, finds the text it read, and then,

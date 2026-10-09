@@ -126,7 +126,9 @@ recovery; newly written journals use `frozenProcesses`.
   stops the install. `uninstall.sh` judges the rule the same way, at the
   same two points, before the app is asked to quit and before the recovery
   lock, the backstop and the LaunchAgent: a line for another account, or a
-  read that does not complete, stops it with nothing changed.
+  read that does not complete, stops it with nothing changed. Its password
+  prompt comes after the app has quit when the rule was read without sudo,
+  and before the app is asked to quit when only root can read the rule.
   Under the lock it reads the rule through sudo again and removes it only
   when every line is blank, the header comment, or one of those four grants
   to the calling account (`id -un`); a grant to another account, or any
@@ -138,7 +140,10 @@ recovery; newly written journals use `frozenProcesses`.
   cannot tell (it fails, does not answer, or prints no user ID), or whose
   identity is unverified, is looked for once more and then stops either
   script before its first `sudo` call; only a process identified as the API
-  client (`com.insomnia.app`) is ignored. Under the recovery lock the
+  client (`com.insomnia.app`) is ignored. One exception in `uninstall.sh`:
+  an unverified process beside this app's identified copy is waited for
+  with the app's quit, after the rule is judged, so with a rule only root
+  can read it stops the run after the password prompt. Under the recovery lock the
   scripts' process checks read no Info.plist, not even with a time limit: a
   process first seen there counts as unverified and stops the run.
 - Both scripts read `InsomniaResumeFrozenVersion` before the recovery lock

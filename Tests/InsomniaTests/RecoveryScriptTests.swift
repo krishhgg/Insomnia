@@ -7710,6 +7710,77 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(r.stderr.contains("\(fx.sudoers.path) grants other_\(ScriptFixture.account), not \(ScriptFixture.account)."), r.stderr)
     }
 
+    /// When the password is asked depends on whether the rule can be judged
+    /// without sudo. A rule this account can read is judged from a plain
+    /// read, and the password comes after the app has quit. A rule only root
+    /// can read (the real one) is judged right after the password, before
+    /// the app is asked to quit, so an app that then refuses to quit stops
+    /// the uninstall after the prompt, with nothing removed.
+    func testUninstallAsksForThePasswordBeforeTheQuitOnlyForARuleOnlyRootCanRead() throws {
+        try XCTSkipIf(getuid() == 0, "root reads a mode-000 file")
+        do {
+            let f = try ScriptFixture()
+            defer { f.destroy() }
+            try f.installMachinery()
+            try f.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+            f.setMode("pgrep", "0\n1\n")   // running, gone after the quit request
+
+            let r = try f.run(f.uninstall)
+
+            XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+            let calls = f.calls()
+            let quit = try XCTUnwrap(calls.firstIndex { $0.hasPrefix("osascript") }, "\(calls)")
+            XCTAssertFalse(calls[..<quit].contains { $0.hasPrefix("sudo") }, "\(calls)")
+            XCTAssertEqual(calls.firstIndex(of: "sudo -v").map { $0 > quit }, true, "\(calls)")
+            XCTAssertFalse(f.exists(f.sudoers))
+        }
+        try fx.installMachinery()
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        try fx.makeRuleRootOnly()
+        fx.setMode("pgrep", "0\n")   // running, and it stays running
+
+        let r = try fx.run(fx.uninstall)
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertTrue(r.stderr.contains("refusing to quit"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("Nothing was removed."), r.stderr)
+        let calls = fx.calls()
+        XCTAssertEqual(calls.filter { $0.hasPrefix("sudo") }, ["sudo -v", "sudo -n /bin/cat \(fx.sudoers.path)"], "\(calls)")
+        let quit = try XCTUnwrap(calls.firstIndex { $0.hasPrefix("osascript") }, "\(calls)")
+        XCTAssertEqual(calls.firstIndex(of: "sudo -n /bin/cat \(fx.sudoers.path)").map { $0 < quit }, true, "\(calls)")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("pkill") || $0.hasPrefix("launchctl") }, "\(calls)")
+        XCTAssertEqual(try fx.ruleText(), fx.sudoersRule)
+        XCTAssertTrue(fx.exists(fx.app))
+        XCTAssertTrue(fx.exists(fx.plist))
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, true)
+    }
+
+    /// A process that cannot be told apart from this app, with no copy
+    /// identified as this app beside it, is waited for before the rule is
+    /// judged, so it stops the uninstall before the first sudo even when
+    /// only root can read the rule.
+    func testUninstallStopsForAnUnverifiedProcessBeforeTheFirstSudoEvenWhenOnlyRootCanReadTheRule() throws {
+        try XCTSkipIf(getuid() == 0, "root reads a mode-000 file")
+        try fx.installMachinery()
+        try fx.writeState(Self.journalToUndo)
+        try fx.makeRuleRootOnly()
+        let renamed = try fx.otherBundle(in: "DevBuild", bundleId: "com.example.insomnia-copy")
+        fx.setMode("pgrep", "0\n")
+        try fx.psComm([(4242, renamed.path)])
+
+        let r = try fx.run(fx.uninstall)
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertTrue(r.stderr.contains("pid 4242 (\(renamed.path); bundle id com.example.insomnia-copy is neither this app's nor the Insomnia API client's)"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("Nothing was removed."), r.stderr)
+        let calls = fx.calls()
+        XCTAssertFalse(calls.contains { $0.hasPrefix("sudo") || $0.hasPrefix("osascript") || $0.hasPrefix("launchctl") }, "\(calls)")
+        XCTAssertEqual(try fx.ruleText(), fx.sudoersRule)
+        XCTAssertTrue(fx.exists(fx.app))
+        XCTAssertTrue(fx.exists(fx.plist))
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, true)
+    }
+
     /// This account's own rule, only root can read: judged after the
     /// password, read again under the lock, and removed with the app.
     func testUninstallRemovesItsOwnRuleOnlyRootCanRead() throws {

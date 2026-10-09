@@ -1814,22 +1814,30 @@ stop_for_rule_of_others() { # file content
   fi
   exit 1
 }
+# Asks for the password, once, before the recovery lock. Each sudo call made
+# under the lock (step 5) is `sudo -n` and bounded, so none waits at a
+# prompt while the lock is held; step 5 reads the rule again there before it
+# removes it. sudo's timestamp lasts a few minutes (five by default); if it
+# runs out before step 5, that step keeps the rule and the app.
+ask_password() {
+  if ! "$SUDO" -v; then
+    echo "sudo did not authenticate, so $SUDOERS could not be removed later. Nothing was removed." >&2
+    exit 1
+  fi
+}
 # Judges the rule before anything is changed: before the app is asked to
 # quit, the recovery lock, the backstop and the LaunchAgent. A rule this
-# account can read is read with a bounded cat and judged before the first
-# sudo, the password prompt included. Then the password is asked, once,
-# when the rule is there or its folder cannot be searched without root,
-# and a rule only root can read (the rule install.sh writes is root's, mode
-# 0440) is read with a bounded `sudo -n cat` and judged right after. A read
-# that fails, does not answer, or cannot be read back in full or holds a NUL
-# byte stops the run as well: whether the rule serves another account is
-# then unknown. Each sudo call made under the lock (step 5) is `sudo -n`
-# and bounded, so none waits at a prompt while the lock is held; step 5
-# reads the rule again there before it removes it. sudo's timestamp lasts a
-# few minutes (five by default); if it runs out before step 5, that step
-# keeps the rule and the app.
+# account can read is read with a bounded cat and judged without sudo
+# (RULE_JUDGED=1); the password is asked only after the app has quit, so an
+# app that refuses to quit stops the run before any password prompt. When
+# the rule is there but only root can read it (the rule install.sh writes
+# is root's, mode 0440), or its folder cannot be searched without root, the
+# password is asked here, before the quit, and the rule is read with a
+# bounded `sudo -n cat` and judged right after. A read that fails, does not
+# answer, or cannot be read back in full or holds a NUL byte stops the run
+# as well: whether the rule serves another account is then unknown.
 check_rule_first() {
-  local rc=0 judged=0
+  local rc=0
   if [[ -e "$SUDOERS" && -r "$SUDOERS" ]]; then
     bounded "$CAT" "$SUDOERS" || rc=$?
     if (( rc != 0 || BOUNDED_READ != 0 )); then
@@ -1839,14 +1847,11 @@ check_rule_first() {
       exit 1
     fi
     stop_for_rule_of_others "$BOUNDED_OUTPUT"
-    judged=1
+    RULE_JUDGED=1
+    return 0
   fi
   [[ -e "$SUDOERS" || ! -x "${SUDOERS%/*}" ]] || return 0
-  if ! "$SUDO" -v; then
-    echo "sudo did not authenticate, so $SUDOERS could not be removed later. Nothing was removed." >&2
-    exit 1
-  fi
-  (( judged == 0 )) || return 0
+  ask_password
   if [[ ! -e "$SUDOERS" ]]; then
     # The folder cannot be searched without root, so only sudo can tell.
     bounded "$SUDO" -n "$TEST" -e "$SUDOERS" || rc=$?
@@ -1874,13 +1879,31 @@ check_rule_first() {
   stop_for_rule_of_others "$BOUNDED_OUTPUT"
 }
 
+# Waits up to QUIT_WAIT_SECONDS for every process app_running lists to exit,
+# and stops the run when one is still there.
+await_exit() {
+  local i
+  for (( i = 0; i < QUIT_WAIT_SECONDS; i++ )); do
+    app_running || break
+    sleep 1
+  done
+  if app_running; then
+    echo "Insomnia is still running (it may be refusing to quit until its own recovery finishes, or a process named Insomnia could not be identified): $(list "${BLOCKING[@]}")." >&2
+    echo "Let it finish or quit it from its menu, quit any process listed as unverified, then rerun. Nothing was removed." >&2
+    exit 1
+  fi
+}
+
 # 1. Check, then quit the app --------------------------------------------------
 # First, before anything is changed: a copy in another account stops the run
 # at once, and so does a process whose owner ps cannot give once
 # QUIT_WAIT_SECONDS have passed (await_known_owners), before anything is
 # asked to quit and before the first sudo. This app counts, and so does a
 # process named Insomnia that cannot be told apart from it (find_insomnia);
-# one proven to be another app is reported and left alone. Then the
+# one proven to be another app is reported and left alone. With no copy
+# identified as this app there is nothing to ask to quit, so what is listed
+# is waited for here, and a process that cannot be told apart from this app
+# stops the run before the first sudo whichever rule is there. Then the
 # installed app's version is read and the rule judged (check_rule_first),
 # and only then is the app asked to quit.
 step "Checking for Insomnia in this and other accounts"
@@ -1891,6 +1914,10 @@ if app_running; then
   report_others
   stop_for_other_accounts
   report_unverified
+  if (( ${#APP_FOUND[@]} == 0 )); then
+    await_exit
+    app_was_running=0
+  fi
 else
   report_others
 fi
@@ -1989,6 +2016,7 @@ if ! read_info_version "$INFO_PLIST"; then
 fi
 
 step "Checking $SUDOERS"
+RULE_JUDGED=0
 check_rule_first
 
 # Ask politely and wait. The app refuses to quit while it has unresolved
@@ -2002,16 +2030,10 @@ if (( app_was_running )); then
     echo "Insomnia is running ($(list "${APP_FOUND[@]}")); asking it to quit."
     "$OSASCRIPT" -e "tell application id \"$BUNDLE_ID\" to quit" >/dev/null 2>&1 || true
   fi
-  for (( i = 0; i < QUIT_WAIT_SECONDS; i++ )); do
-    app_running || break
-    sleep 1
-  done
-  if app_running; then
-    echo "Insomnia is still running (it may be refusing to quit until its own recovery finishes, or a process named Insomnia could not be identified): $(list "${BLOCKING[@]}")." >&2
-    echo "Let it finish or quit it from its menu, quit any process listed as unverified, then rerun. Nothing was removed." >&2
-    exit 1
-  fi
+  await_exit
 fi
+# A rule judged from a read without sudo still needs the password for step 5.
+(( RULE_JUDGED == 0 )) || ask_password
 
 # 2. Take the recovery lock and keep it to the end ---------------------------
 step "Taking the recovery lock"
