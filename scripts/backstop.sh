@@ -782,11 +782,15 @@ is_positive_int() {
 # once, where counting polls stretched the limit by every one of them. The
 # file is checked once more after the limit, so a status written during the
 # last poll still counts. A wall-clock change during the wait (the clock set
-# back or forward) lengthens or shortens it by that much.
+# back or forward) lengthens or shortens it by that much. The first 20 polls
+# sleep 0.01 s, so a command that ends at once, as most undo commands do, is
+# seen within milliseconds, as install.sh and uninstall.sh see theirs; later
+# ones sleep 0.1 s, so a long wait forks a tenth as many sleeps.
 wait_for_status() { # file seconds
-  local deadline=$(( SECONDS + $2 ))
+  local deadline=$(( SECONDS + $2 )) polls=0
   while [[ ! -s "$1" ]] && (( SECONDS <= deadline )); do
-    sleep 0.1
+    if (( polls < 20 )); then sleep 0.01; else sleep 0.1; fi
+    polls=$((polls + 1))
   done
   [[ -s "$1" ]]
 }
@@ -835,8 +839,8 @@ run_bounded() { # command args...
   # Each of the supervisor's two waits can end up to a second after its
   # limit, plus the poll in progress then (see wait_for_status), and the
   # supervisor takes a moment to start and to write its status. Four seconds
-  # cover that at the usual 0.1 s poll. A supervisor slower than that gets
-  # the 125 below, the safe side.
+  # cover that with polls at most 0.1 s apart. A supervisor slower than
+  # that gets the 125 below, the safe side.
   answer_within=$(( COMMAND_TIMEOUT_SECONDS + KILL_GRACE_SECONDS + 4 ))
   if wait_for_status "$base.rc" "$answer_within"; then
     read -r status < "$base.rc" || true
@@ -952,12 +956,13 @@ job_running() { # pid
 }
 # True once job pid $1 has left bash's running list; waits at least $2
 # seconds for that unless it happens first, on the SECONDS clock like
-# wait_for_status (and within the same bounds), and checks once more after
-# the limit.
+# wait_for_status (and within the same bounds, with the same polls), and
+# checks once more after the limit.
 wait_for_job() { # pid seconds
-  local deadline=$(( SECONDS + $2 ))
+  local deadline=$(( SECONDS + $2 )) polls=0
   while job_running "$1" && (( SECONDS <= deadline )); do
-    sleep 0.1
+    if (( polls < 20 )); then sleep 0.01; else sleep 0.1; fi
+    polls=$((polls + 1))
   done
   ! job_running "$1"
 }

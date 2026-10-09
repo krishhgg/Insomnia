@@ -524,6 +524,29 @@ trace.
   for every account on the Mac, and another account's install or
   uninstall holds its own standard lock, so an uninstall in one account
   can still remove the rule another account's restore needs, as on main.
+- Every Insomnia folder of the user loads its recovery agent under the one
+  label `com.insomnia.backstop`, and launchd holds one job for it, from
+  whichever folder loaded it last. uninstall.sh boots that job out only
+  while `launchctl print` names this folder's plist or candidate as the
+  file it was loaded from, asked at the check and again just before the
+  bootout. While it names another folder's file, the uninstall leaves that
+  agent loaded, keeps the rule, the receipt, its release file and the
+  bundle the agent runs, removes this folder's own files and exits 1,
+  saying to uninstall that folder first. A print that fails or names no
+  single absolute file stops it with nothing removed. It keeps the
+  receipt's lock from the check until the rule, the receipt and the bundle
+  are gone, or to its end when they stay, so a start in another folder,
+  which claims the receipt under that lock before it loads its agent,
+  cannot load one between the check and the bootout. That start waits up
+  to 10 s for the lock, then is refused with nothing written. A load that
+  takes no receipt lock can: an extend, end or relaunch of a folder other
+  than this one and the standard one (whose recovery locks the uninstall
+  holds) between the last print and the bootout is unloaded, since launchctl
+  cannot unload a job only while it comes from a given file. That folder's
+  app loads it again at its next transaction. Two folders whose
+  LaunchAgents folders are one through a link count as one. Another
+  folder whose agent is not loaded, because this folder loaded its agent
+  last, needs install.sh again once the shared files are gone.
 - On a full disk backstop.sh keeps its copies of session.json and
   state.json in memory and still restores what the journal records. A
   log line it cannot append goes to its standard error instead and the

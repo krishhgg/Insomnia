@@ -152,8 +152,14 @@ enum TestReceipts {
     /// folder the same way, with its lines from that file first. Any other
     /// call runs /bin/ls. It changes no access control list.
     static func writeFakeLs(at tool: String, receipt: String, entries: String) throws {
+        try fakeLsScript(receipt: receipt, entries: entries).write(toFile: tool, atomically: true, encoding: .utf8)
+        XCTAssertEqual(chmod(tool, 0o755), 0)
+    }
+
+    /// The text of writeFakeLs's ls, for a fake written with FakeTool.
+    static func fakeLsScript(receipt: String, entries: String) -> String {
         func quoted(_ s: String) -> String { "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
-        let script = """
+        return """
         #!/bin/bash
         if [[ "${1:-}" == -lde && -f \(quoted(entries + ".folders")) ]]; then
           shift
@@ -182,8 +188,6 @@ enum TestReceipts {
         exec /bin/ls "$@"
 
         """
-        try script.write(toFile: tool, atomically: true, encoding: .utf8)
-        XCTAssertEqual(chmod(tool, 0o755), 0)
     }
 
     /// Lists of access control entries every receipt check refuses, as
@@ -264,6 +268,108 @@ enum TestReceipts {
         guard let handle = FileHandle(forReadingAtPath: file) else { return nil }
         defer { try? handle.close() }
         return (try? handle.read(upToCount: 36)).map { String(decoding: $0, as: UTF8.self) }
+    }
+}
+
+/// Writes fake tools that scripts run by their path. macOS checks a new
+/// executable file the first time anything runs it, which took 0.12 to
+/// 0.38 s a fake on the Mac this was measured on, against about 5 ms for a
+/// symbolic link to a file it has already run; a script
+/// fixture writes some twenty fakes and its runs start several of them. So
+/// a fake is not an executable file of its own: `tool` is a symbolic link
+/// to one launcher that every fake of this test process shares, written,
+/// checked and run once, and the fake's text goes to `.fake-src/<name>` in
+/// `tool`'s folder. The launcher runs that text with /bin/bash, as the
+/// kernel runs a `#!/bin/bash` file, and execs it, so the fake keeps the
+/// pid the caller started, its arguments, descriptors, environment and
+/// signal actions; only $0, and the arguments `ps` shows, name the text's
+/// file instead of `tool`. A test that changes a fake reads it with
+/// `text(at:)` and writes it back with `write`. Read or copied through its
+/// path, a fake is the launcher's text; written or chmodded through it, it
+/// either changes the shared launcher or replaces the link with a copy of
+/// it. A fake a test must handle that way stays a file of its own. Each
+/// write here first checks that the launcher is still as written.
+enum FakeTool {
+    static let launcherText = "#!/bin/bash\nexec /bin/bash \"${0%/*}/.fake-src/${0##*/}\" \"$@\"\n"
+
+    struct Failure: Error, CustomStringConvertible {
+        let description: String
+    }
+
+    /// Writes `script` (a whole file, `#!/bin/bash` line included) as the
+    /// fake at `tool`, replacing a fake or link already there with one
+    /// rename, so the tool's path never goes missing.
+    static func write(_ script: String, at tool: String) throws {
+        let launcher = try made.get()
+        try check(launcher)
+        let url = URL(fileURLWithPath: tool)
+        let sources = url.deletingLastPathComponent().appendingPathComponent(".fake-src", isDirectory: true)
+        try FileManager.default.createDirectory(at: sources, withIntermediateDirectories: true)
+        try script.write(to: sources.appendingPathComponent(url.lastPathComponent), atomically: true, encoding: .utf8)
+        let link = sources.appendingPathComponent(".link-\(UUID().uuidString)").path
+        guard symlink(launcher, link) == 0 else { throw Failure(description: "could not link \(link) to \(launcher): errno \(errno)") }
+        guard rename(link, tool) == 0 else {
+            let why = errno
+            unlink(link)
+            throw Failure(description: "could not put the link at \(tool): errno \(why)")
+        }
+    }
+
+    /// The text of the fake at `tool`, as `write` put it there. A test that
+    /// changes a fake reads it here and writes it back with `write`.
+    static func text(at tool: String) throws -> String {
+        let url = URL(fileURLWithPath: tool)
+        guard try FileManager.default.destinationOfSymbolicLink(atPath: tool) == made.get() else {
+            throw Failure(description: "\(tool) is not a link to the shared fake launcher")
+        }
+        return try String(contentsOf: url.deletingLastPathComponent().appendingPathComponent(".fake-src/\(url.lastPathComponent)"), encoding: .utf8)
+    }
+
+    /// The launcher's folder, removed when the process that made it exits.
+    private static let folder = FileManager.default.temporaryDirectory
+        .appendingPathComponent("insomnia-fake-launcher-\(getpid())-\(UUID().uuidString)", isDirectory: true)
+    private static let owner = getpid()
+
+    private static let made: Result<String, any Error> = Result {
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+        atexit {
+            guard getpid() == FakeTool.owner else { return }
+            try? FileManager.default.removeItem(at: FakeTool.folder)
+        }
+        let launcher = folder.appendingPathComponent("launcher").path
+        try Data(launcherText.utf8).write(to: URL(fileURLWithPath: launcher), options: .withoutOverwriting)
+        guard chmod(launcher, 0o555) == 0 else { throw Failure(description: "chmod \(launcher): errno \(errno)") }
+        try check(launcher)
+        // Run it once through a link, as every fake runs, so that macOS
+        // checks it here, once.
+        let warm = folder.appendingPathComponent("warm", isDirectory: true)
+        try FileManager.default.createDirectory(at: warm.appendingPathComponent(".fake-src"), withIntermediateDirectories: true)
+        try "exit 7\n".write(to: warm.appendingPathComponent(".fake-src/check"), atomically: true, encoding: .utf8)
+        guard symlink(launcher, warm.appendingPathComponent("check").path) == 0 else { throw Failure(description: "could not link the check: errno \(errno)") }
+        let p = Process()
+        p.executableURL = warm.appendingPathComponent("check")
+        p.environment = ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin"]
+        p.standardInput = FileHandle.nullDevice
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        let exit = ProcessExit(p)
+        try p.run()
+        exit.wait()
+        guard p.terminationReason == .exit, p.terminationStatus == 7 else {
+            throw Failure(description: "the launcher's check exited \(p.terminationStatus), not with the 7 its text exits with")
+        }
+        try FileManager.default.removeItem(at: warm)
+        return launcher
+    }
+
+    /// Fails unless the launcher is a regular file, mode 0555, holding
+    /// launcherText.
+    private static func check(_ launcher: String) throws {
+        var info = stat()
+        guard lstat(launcher, &info) == 0, info.st_mode & S_IFMT == S_IFREG, info.st_mode & 0o7777 == 0o555,
+              let data = FileManager.default.contents(atPath: launcher), data == Data(launcherText.utf8) else {
+            throw Failure(description: "the shared fake launcher \(launcher) is no longer the regular file, mode 0555, it was written as")
+        }
     }
 }
 
@@ -1987,7 +2093,7 @@ final class RootCommandProcess {
         if [[ "$sig" == "$FAKE_CLOCK_AT" ]]; then printf '%s\\n' "$FAKE_CLOCK_LATER" > "$FAKE_CLOCK_FILE"; fi
         \(foreignHook)
         """
-        try """
+        try FakeTool.write("""
         #!/bin/bash
         printf '%s\\n' "$*" >> "$FAKE_PMSET_CALLS"
         who="${FAKE_SUDO_AS:-0}"; [[ "$who" == 0 ]] && who=root
@@ -2011,34 +2117,29 @@ final class RootCommandProcess {
         esac
         \(after)
         exit $rc
-        """.write(to: fake, atomically: true, encoding: .utf8)
+        """, at: fake.path)
         let restore = ([fake.path] + PmsetSleepGuard.restoreArguments).joined(separator: " ")
-        try fakeSudoScript(log: sudoCalls, answers: answers, restore: restore, conf: conf, before: before, after: after).write(to: sudo, atomically: true, encoding: .utf8)
-        try fakeEnvScript(log: envCalls).write(to: env, atomically: true, encoding: .utf8)
+        try FakeTool.write(fakeSudoScript(log: sudoCalls, answers: answers, restore: restore, conf: conf, before: before, after: after), at: sudo.path)
+        try FakeTool.write(fakeEnvScript(log: envCalls), at: env.path)
         if let clock {
             try "\(clock.start)\n".write(to: clockFile, atomically: true, encoding: .utf8)
-            try """
+            try FakeTool.write("""
             #!/bin/bash
             [[ "$*" == +%s ]] || { echo "fake date: unexpected arguments $*" >&2; exit 2; }
             /bin/cat "$FAKE_CLOCK_FILE"
-            """.write(to: fakeDate, atomically: true, encoding: .utf8)
+            """, at: fakeDate.path)
         }
         // The pause between tries of the `refused` line returns at once,
         // after moving the fake clock on by `sleepAdvancesClock` seconds.
-        try """
+        try FakeTool.write("""
         #!/bin/bash
         printf '%s\\n' "$*" >> "$FAKE_SLEEP_CALLS"
         [[ "$*" == 1 ]] || { echo "fake sleep: unexpected arguments $*" >&2; exit 2; }
         if (( FAKE_SLEEP_ADVANCES > 0 )); then now=$(/bin/cat "$FAKE_CLOCK_FILE") && printf '%s\\n' $(( now + FAKE_SLEEP_ADVANCES )) > "$FAKE_CLOCK_FILE"; fi
         exit 0
-        """.write(to: fakeSleep, atomically: true, encoding: .utf8)
+        """, at: fakeSleep.path)
         try FileManager.default.createDirectory(at: fakePerl.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try fakePerlScript.write(to: fakePerl, atomically: true, encoding: .utf8)
-        var executables = [fake, sudo, env, fakePerl, fakeSleep]
-        if clock != nil { executables.append(fakeDate) }
-        for url in executables {
-            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
-        }
+        try FakeTool.write(fakePerlScript, at: fakePerl.path)
 
         let realPmset = "/usr/bin/pmset"
         let realSudo = "/usr/bin/sudo"
@@ -2375,7 +2476,7 @@ final class FakeDialogMachine {
           exit 1
         fi
         """
-        try """
+        try FakeTool.write("""
         #!/bin/bash
         printf '%s\\n' "$*" >> '\(pmsetLog.path)'
         sig="pmset $*"
@@ -2389,16 +2490,16 @@ final class FakeDialogMachine {
           *) echo "fake pmset: unexpected arguments $*" >&2; exit 2 ;;
         esac
         \(after)
-        """.write(to: pmset, atomically: true, encoding: .utf8)
+        """, at: pmset.path)
         let restore = ([pmset.path] + PmsetSleepGuard.restoreArguments).joined(separator: " ")
-        try fakeSudoScript(log: sudoLog, answers: answers, restore: restore, conf: confFile, before: before, after: after).write(to: sudo, atomically: true, encoding: .utf8)
-        try fakeEnvScript(log: envLog).write(to: env, atomically: true, encoding: .utf8)
-        try """
+        try FakeTool.write(fakeSudoScript(log: sudoLog, answers: answers, restore: restore, conf: confFile, before: before, after: after), at: sudo.path)
+        try FakeTool.write(fakeEnvScript(log: envLog), at: env.path)
+        try FakeTool.write("""
         #!/bin/bash
         [[ "$*" == +%s ]] || { echo "fake date: unexpected arguments $*" >&2; exit 2; }
         /bin/cat '\(clock.path)'
-        """.write(to: date, atomically: true, encoding: .utf8)
-        try """
+        """, at: date.path)
+        try FakeTool.write("""
         #!/bin/bash
         [[ "$1" == -e && $# -eq 9 ]] || { echo "fake osascript: unexpected arguments" >&2; exit 2; }
         printf '%s' "$2" > '\(scriptLog.path)'
@@ -2410,10 +2511,7 @@ final class FakeDialogMachine {
         (( rc == 0 )) && exit 0
         printf '0:1: execution error: %s (%d)\\n' "$(printf '%s' "$err" | tr '\\n' '\\r')" "$rc" >&2
         exit 1
-        """.write(to: osascript, atomically: true, encoding: .utf8)
-        for url in [osascript, sudo, pmset, env, date] {
-            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
-        }
+        """, at: osascript.path)
         let embedded = RootCommandProcess.withTestReceipts(RootCommandProcess.withPrivateConfiguration(try appleScriptEmbeddedRootCommand(), sudoConf: confFile, pamSudo: pamFile), self.receipts)
             .replacingOccurrences(of: "/usr/bin/pmset", with: pmset.path)
             .replacingOccurrences(of: "/usr/bin/sudo", with: sudo.path)

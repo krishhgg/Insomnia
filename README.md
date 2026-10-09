@@ -339,8 +339,9 @@ anyone acted on one it could name another process.
      record names the session to resume, so an earlier session a failed
      start put back resumes too, and any other session file beside that
      record ends at the relaunch. A record an older build wrote, or one the
-     scripts settled, names none: then only a session whose first end is
-     the start's deadline resumes.
+     scripts settled, has no such name: then only a session whose first end
+     is the start's deadline resumes, and only while sleep is still
+     recorded as Insomnia's.
 
    Insomnia shows no dialog at all while the `backstop.sh` sealed in its
    bundle is missing or older than the app expects, because an older one
@@ -860,7 +861,12 @@ that is settled can still have a session running in another Insomnia
 folder of yours, so while sleep is off or Low Power Mode is on for
 battery (or either cannot be read), the uninstaller keeps the sudoers
 rule, the receipt and the app, removes the rest of this folder, says
-why and exits 1; rerun it once that session has ended (SECURITY.md). Once
+why and exits 1; rerun it once that session has ended (SECURITY.md). It
+does the same while the recovery agent loaded now is another Insomnia
+folder's (every folder loads its agent under one name, and `launchctl
+print` shows the file it came from), and leaves that agent loaded:
+uninstall that folder first, then rerun. If launchd cannot say whose
+agent is loaded, it stops with nothing removed. Once
 they are gone, any other Insomnia folder of yours needs
 `./scripts/install.sh` again before its next start. It removes the
 receipts folder too once no other account's receipt is in it, and leaves

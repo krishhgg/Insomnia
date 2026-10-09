@@ -420,7 +420,25 @@ recovery; newly written journals use `frozenProcesses`.
   only its own folder's files and exits 1 while `pmset -g` shows
   SleepDisabled other than 0, `pmset -g custom` shows Battery Power
   lowpowermode other than 0, or either read fails: another folder may
-  still owe the restore the rule runs. One lone release file is known: the
+  still owe the restore the rule runs. It does the same, and boots no
+  agent out, while `launchctl print gui/<uid>/com.insomnia.backstop`
+  names, on its one `path =` line, a file that is not this folder's plist
+  or candidate (compared by path, else by the device and inode of its
+  folder): every folder loads its agent under that one label, launchd
+  holds one job for it, and that job is another folder's, whose
+  backstop.sh in the bundle needs the rule. It asks at the check and again
+  just before the bootout, boots out only this folder's agent, and stops
+  before removing anything when print fails, does not answer or names no
+  single absolute file. It keeps the receipt's lock from the check until
+  the rule, the receipt and the bundle are gone, or to its end when they
+  stay. A start of another folder claims the receipt under that lock
+  before it loads its agent, so it waits, and is refused with nothing
+  written once the lock stays held for 10 s. A load that takes no
+  receipt lock between the last print and the bootout (an extend, end or
+  relaunch of a folder other than this one and the standard one, whose
+  recovery locks the run holds) is unloaded: launchctl cannot unload a
+  job only while it comes from a given file. That app loads it again at
+  its next transaction. One lone release file is known: the
   one this folder's uninstall left when it stopped between the two
   removals. Under the receipt's lock, after the checks and before the
   LaunchAgent goes, it writes `.uninstall-receipt-removal` in the app
@@ -1292,9 +1310,12 @@ for (the receipt invariant above). A session.json that is still there
 and unexpired while an attempt stays journaled, or whose removal beside
 such a marker failed, is ended (`performEnd(.startFailed)`), never
 resumed, with one exception: a settled attempt whose claim could not be
-given back or record removed, beside that start's own session with the
-sleep entry still journaled, resumes the session in step 2 (`isSession`,
-below). Then:
+given back or record removed resumes, in step 2, the session its record
+names (`resumes`, `isResumed`): the start's own, the session its rollback
+put back, or the one a settlement left in place. A settled record without
+`resumes` (an older build's, or one backstop.sh or uninstall.sh settled)
+resumes only the start's own session, and only with the sleep entry still
+journaled (`isSession`, below). Then:
 
 1. Session file missing or expired → restore journaled changes: sleep,
    verified owned processes, Low Power Mode if we set it, saved audio, and
@@ -1343,18 +1364,25 @@ below). Then:
    `SleepDisabled 0` (something turned sleep back on while Insomnia was not
    running): end the session with a notification, no prompt. If the lid is
    open, restore recorded lid-close actions. Arming, read or restoration
-   errors must remain visible. Beside a settled attempt (above), only that
-   start's own session gets here: it began at least `minimumDuration`
-   before the attempt's `deadline`, and its first end falls in the second
-   the deadline names, or, for each extension with a fraction of a second
-   (one cut short at the maximum), up to a second earlier, since each save
-   drops the end's fraction but keeps the extension's. The comparison uses
-   Doubles only, so no value on disk can trap a conversion. Anything else
-   beside that record ends, including an earlier session a failed start
-   put back as it was before its claim could not be given back: an
-   unwaived cost. The menu keeps the line that the start is still recorded
-   (`recordedStartText`) while the session goes on, and Starts stay
-   refused until a run gives the claim back and removes the record.
+   errors must remain visible. Beside a settled attempt (above), only the
+   session its record names gets here (`isResumed`): the same `startedAt`,
+   to the second, and a first end that matches the named one within the
+   window described next. A record that names no session (`{}`) lets none
+   through. A record without `resumes` lets only that start's own session
+   through, with the sleep entry still journaled (`isSession`): it began at
+   least `minimumDuration` before the attempt's `deadline`, and its first
+   end falls in the second the deadline names, or, for each extension with a
+   fraction of a second (one cut short at the maximum), up to a second
+   earlier, since each save drops the end's fraction but keeps the
+   extension's. The comparison uses Doubles only, so no value on disk can
+   trap a conversion. Either way another session written with the same times
+   passes too. Anything else beside that record ends. Under a record without
+   `resumes`, that includes an earlier session a failed start put back as it
+   was before its claim could not be given back: an unwaived cost of records
+   from older builds and from the scripts. The menu keeps the line that the
+   start is still recorded (`recordedStartText`) while the session goes on,
+   and Starts stay refused until a run gives the claim back and removes the
+   record.
 3. `pmset -g` reports `SleepDisabled 1` with no session and no journal
    entry → leave it. Step 1 has already undone a disable Insomnia journaled,
    so this one was set by something else (a hand-run `pmset`, another tool)

@@ -2890,13 +2890,19 @@ final class RecoveryScriptTests: XCTestCase {
     /// with the line of another folder's start that is settled (its claim
     /// given back, "free" with its nonce): the receipt's lock is held from
     /// the check through the agent's bootout, the rule's removal and the
-    /// receipt's own, and everything goes.
+    /// receipt's own, and everything goes. Round 34 (Greptile 4234715817):
+    /// this folder's agent is loaded, and every `launchctl print` that asks
+    /// whose it is (at the check, just before the bootout and after it)
+    /// runs under the receipt's lock too.
     func testUninstallHoldsTheReceiptLockFromTheCheckUntilTheSharedFilesAreGone() throws {
         let settled = UUID().uuidString
+        fx.setMode("launchctl", "loaded")
         for (name, line, release) in [("as made", SleepOffReceipts.initialContent, SleepOffReceipts.initialRelease),
                                       ("settled elsewhere", receiptLine(settled, "writing"), "\(settled) free\n")] {
             removeIfPresent(fx.installedBackstop)
             removeIfPresent(fx.root.appendingPathComponent("receipt-lock.log"))
+            removeIfPresent(fx.root.appendingPathComponent("print-lock.log"))
+            removeIfPresent(fx.root.appendingPathComponent("launchctl.unloaded"))
             try fx.installMachinery()
             fx.clearCalls()
             try fx.writeState(cleanJournal)
@@ -2907,12 +2913,15 @@ final class RecoveryScriptTests: XCTestCase {
 
             XCTAssertEqual(r.status, 0, "\(name): \(r.stderr + r.stdout)")
             XCTAssertTrue(r.stdout.contains("no start claims \(fx.receipt); it stays locked until the rule, the receipt and the bundle are gone"), "\(name): \(r.stdout)")
+            XCTAssertTrue(r.stdout.contains("the recovery agent loaded as com.insomnia.backstop is this folder's (\(fx.plist.path))"), "\(name): \(r.stdout)")
+            XCTAssertEqual(fx.printLockStates(), Array(repeating: "launchctl print held", count: 3), name)
             XCTAssertEqual(fx.receiptLockStates(), [
                 "launchctl bootout held",
                 "sudo rm \(fx.sudoers.path) held",
                 "sudo rm \(fx.receipt) held",
                 "sudo rm \(fx.released) absent",
             ], name)
+            XCTAssertTrue(fx.calls().contains("launchctl bootout gui/\(fx.uid) \(fx.plist.path)"), "\(name): \(fx.calls())")
             XCTAssertFalse(fx.exists(fx.sudoers), name)
             XCTAssertFalse(fx.exists(fx.plist), name)
             XCTAssertFalse(fx.exists(fx.app), name)
@@ -2928,22 +2937,28 @@ final class RecoveryScriptTests: XCTestCase {
     /// Round 30 (finding 2): so the uninstall stops before removing
     /// anything, with or without a claim in its release file.
     func testUninstallRemovesNothingWhileTheReceiptFailsItsChecks() throws {
+        let nonce = String(SleepOffReceipts.initialContent.prefix(36))
+        var fixtures: [ScriptFixture] = []
+        defer { fixtures.forEach { $0.destroy() } }
+        var rows: [(row: ScriptRow, held: Bool, journal: Data)] = []
         for held in [false, true] {
-            removeIfPresent(fx.installedBackstop)
-            try fx.installMachinery()
-            fx.clearCalls()
-            try fx.writeState(cleanJournal)
-            if FileManager.default.fileExists(atPath: fx.receipts) { try FileManager.default.removeItem(atPath: fx.receipts) }
-            try fx.writeReceipt()
-            let nonce = String(SleepOffReceipts.initialContent.prefix(36))
-            if held { try fx.writeRelease("\(nonce) held\n") }
-            XCTAssertEqual(chmod(fx.receipt, 0o666), 0)
-            let journal = try Data(contentsOf: fx.state)
+            let f = try ScriptFixture()
+            fixtures.append(f)
+            try f.installMachinery()
+            try f.writeState(cleanJournal)
+            try f.writeReceipt()
+            if held { try f.writeRelease("\(nonce) held\n") }
+            XCTAssertEqual(chmod(f.receipt, 0o666), 0)
+            rows.append((ScriptRow(held ? "a claim" : "no claim", f, f.uninstall), held, try Data(contentsOf: f.state)))
+        }
 
-            let r = try fx.run(fx.uninstall)
+        runTwoAtATime(rows.map(\.row))
 
-            try assertUninstallRemovedNothing(r, saying: "\(fx.receipt) is missing, is not the 82-byte file install.sh made, mode 600, or someone other than root can change it or a folder above it", journal: journal, receipt: SleepOffReceipts.initialContent, release: held ? "\(nonce) held\n" : SleepOffReceipts.initialRelease)
-            XCTAssertEqual(chmod(fx.receipt, 0o600), 0)
+        for (row, held, journal) in rows {
+            let f = row.fixture
+            let r = try row.outcome()
+            try assertUninstallRemovedNothing(r, saying: "\(f.receipt) is missing, is not the 82-byte file install.sh made, mode 600, or someone other than root can change it or a folder above it", journal: journal, receipt: SleepOffReceipts.initialContent, release: held ? "\(nonce) held\n" : SleepOffReceipts.initialRelease, in: f)
+            XCTAssertEqual(chmod(f.receipt, 0o600), 0)
         }
     }
 
@@ -2955,38 +2970,48 @@ final class RecoveryScriptTests: XCTestCase {
     func testUninstallRemovesNothingWhileTheReceiptHasAnotherModeOrList() throws {
         let mine = [AccessEntry.installed(for: getuid())]
         let lists = Dictionary(uniqueKeysWithValues: TestReceipts.refusedLists.map { ($0.name, $0.entries) })
-        let list = "\(fx.receipt) does not have exactly one access control entry, the one that lets uid \(fx.uid) read it and nothing else, or its list could not be read"
-        let cases: [(name: String, mode: mode_t, entries: [AccessEntry], listFails: Bool, why: String)] = [
-            ("mode 644", 0o644, mine, false, "\(fx.receipt) is missing, is not the 82-byte file install.sh made, mode 600, or someone other than root can change it or a folder above it"),
-            ("no entry", 0o600, [], false, list),
-            ("another account's entry", 0o600, try XCTUnwrap(lists["another account's entry"]), false, list),
-            ("an inherited entry", 0o600, try XCTUnwrap(lists["an inherited entry"]), false, list),
-            ("read and write", 0o600, try XCTUnwrap(lists["read and write"]), false, list),
-            ("a list ls cannot read", 0o600, mine, true, list),
+        // Each row has a fixture of its own, so what it says names that
+        // fixture's receipt.
+        func why(_ f: ScriptFixture, list: Bool) -> String {
+            list
+                ? "\(f.receipt) does not have exactly one access control entry, the one that lets uid \(f.uid) read it and nothing else, or its list could not be read"
+                : "\(f.receipt) is missing, is not the 82-byte file install.sh made, mode 600, or someone other than root can change it or a folder above it"
+        }
+        let cases: [(name: String, mode: mode_t, entries: [AccessEntry], listFails: Bool, list: Bool)] = [
+            ("mode 644", 0o644, mine, false, false),
+            ("no entry", 0o600, [], false, true),
+            ("another account's entry", 0o600, try XCTUnwrap(lists["another account's entry"]), false, true),
+            ("an inherited entry", 0o600, try XCTUnwrap(lists["an inherited entry"]), false, true),
+            ("read and write", 0o600, try XCTUnwrap(lists["read and write"]), false, true),
+            ("a list ls cannot read", 0o600, mine, true, true),
         ]
-        let fails = fx.receiptEntries + ".fails"
+        let nonce = String(SleepOffReceipts.initialContent.prefix(36))
+        var fixtures: [ScriptFixture] = []
+        defer { fixtures.forEach { $0.destroy() } }
+        var rows: [(row: ScriptRow, why: String, held: Bool, journal: Data)] = []
         for c in cases {
             for held in [false, true] {
                 let label = "\(c.name), \(held ? "a claim" : "no claim")"
-                removeIfPresent(fx.installedBackstop)
-                try fx.installMachinery()
-                fx.clearCalls()
-                try fx.writeState(cleanJournal)
-                if FileManager.default.fileExists(atPath: fx.receipts) { try FileManager.default.removeItem(atPath: fx.receipts) }
-                try fx.writeReceipt()
-                let nonce = String(SleepOffReceipts.initialContent.prefix(36))
-                if held { try fx.writeRelease("\(nonce) held\n") }
-                XCTAssertEqual(chmod(fx.receipt, c.mode), 0, label)
-                try fx.writeReceiptEntries(c.entries)
-                if c.listFails { XCTAssertTrue(FileManager.default.createFile(atPath: fails, contents: nil)) }
-                let journal = try Data(contentsOf: fx.state)
-
-                let r = try fx.run(fx.uninstall)
-                unlinkIfPresent(fails)
-
-                XCTAssertTrue(r.stderr.contains(c.why), "\(label): \(r.stderr)")
-                try assertUninstallRemovedNothing(r, saying: c.why, journal: journal, receipt: SleepOffReceipts.initialContent, release: held ? "\(nonce) held\n" : SleepOffReceipts.initialRelease)
+                let f = try ScriptFixture()
+                fixtures.append(f)
+                try f.installMachinery()
+                try f.writeState(cleanJournal)
+                try f.writeReceipt()
+                if held { try f.writeRelease("\(nonce) held\n") }
+                XCTAssertEqual(chmod(f.receipt, c.mode), 0, label)
+                try f.writeReceiptEntries(c.entries)
+                if c.listFails { XCTAssertTrue(FileManager.default.createFile(atPath: f.receiptEntries + ".fails", contents: nil), label) }
+                rows.append((ScriptRow(label, f, f.uninstall), why(f, list: c.list), held, try Data(contentsOf: f.state)))
             }
+        }
+        XCTAssertEqual(rows.count, 12)
+
+        runTwoAtATime(rows.map(\.row))
+
+        for (row, why, held, journal) in rows {
+            let r = try row.outcome()
+            XCTAssertTrue(r.stderr.contains(why), "\(row.label): \(r.stderr)")
+            try assertUninstallRemovedNothing(r, saying: why, journal: journal, receipt: SleepOffReceipts.initialContent, release: held ? "\(nonce) held\n" : SleepOffReceipts.initialRelease, in: row.fixture)
         }
     }
 
@@ -4035,7 +4060,9 @@ final class RecoveryScriptTests: XCTestCase {
 
     /// A `launchctl print` that never answers cannot prove the agent is
     /// gone: uninstall stops with every recovery file in place, and exits
-    /// instead of holding the lock while it waits.
+    /// instead of holding the lock while it waits. Round 34: the first
+    /// print, at the check, asks whose agent is loaded, so the run stops
+    /// there, before the bootout.
     func testUninstallStopsAHungLaunchctlPrintAndKeepsEverything() throws {
         try fx.installMachinery()
         try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
@@ -4048,8 +4075,9 @@ final class RecoveryScriptTests: XCTestCase {
 
         XCTAssertNotEqual(r.status, 0)
         XCTAssertLessThan(elapsed, 30, "one bounded print, not the fake's 60 s hang")
-        XCTAssertTrue(r.stderr.contains("'launchctl print' did not answer within 5s; cannot tell whether com.insomnia.backstop is still loaded"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("Uninstall stopped BEFORE removing anything: 'launchctl print gui/\(fx.uid)/com.insomnia.backstop' did not answer within 5s, so whether the recovery agent loaded as com.insomnia.backstop is this folder's or another Insomnia folder's is unknown."), r.stderr)
         XCTAssertTrue(fx.calls().contains("launchctl FD9-OPEN"), "\(fx.calls())")
+        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("launchctl bootout") }, "\(fx.calls())")
         XCTAssertTrue(fx.hungProcessGone("launchctl", within: 0))
         XCTAssertFalse(fx.calls().contains { Self.isRootRemoval($0) }, "\(fx.calls())")
         XCTAssertTrue(fx.exists(fx.plist))
@@ -4263,10 +4291,13 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(r.stderr.contains("sleepDisabledByUs is still true"), r.stderr)
     }
 
+    /// Round 34: this folder's agent is loaded (launchctl print names its
+    /// plist), so it is booted out.
     func testUninstallSuccessRemovesMachineryAndKeepsConfig() throws {
         try fx.installMachinery()
         try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
         try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        fx.setMode("launchctl", "loaded")
 
         let r = try fx.run(fx.uninstall)
 
@@ -4593,45 +4624,53 @@ final class RecoveryScriptTests: XCTestCase {
     /// drop, or more than 200 bytes. The control, the same line in a file
     /// as record_removal writes it, finishes the removal.
     func testUninstallRefusesARecordOfTheReceiptsRemovalThatIsNotAsItWritesIt() throws {
-        let progress = fx.home.appendingPathComponent(".uninstall-receipt-removal")
-        let second = fx.home.appendingPathComponent("record-second-link")
         let initial = SleepOffReceipts.initialRelease
-        let lone = "\(fx.released) is there without the receipt \(fx.receipt), and no record of this folder's uninstall (\(progress.path)) names it as it is now, so what the receipt showed, and whether a start still needs the rule, is unknown"
-        func write(_ data: Data) {
+        func write(_ data: Data, _ progress: URL) {
             XCTAssertTrue(FileManager.default.createFile(atPath: progress.path, contents: data, attributes: [.posixPermissions: 0o600]))
         }
-        let cases: [(name: String, damage: ((String) -> Void)?)] = [
-            ("mode 644", { write(Data($0.utf8)); XCTAssertEqual(chmod(progress.path, 0o644), 0) }),
-            ("a second link", { write(Data($0.utf8)); XCTAssertEqual(link(progress.path, second.path), 0) }),
-            ("a second line", { write(Data(($0 + $0).utf8)) }),
-            ("no final newline", { write(Data($0.dropLast().utf8)) }),
-            ("a NUL byte", { var d = Data($0.utf8); d.insert(0, at: d.count - 1); write(d) }),
-            ("more than 200 bytes", { write(Data(($0 + String(repeating: "x", count: 200) + "\n").utf8)) }),
+        // Each damage gets the record's line, the record and the path of a
+        // second link to it, all in the row's own fixture.
+        let cases: [(name: String, damage: ((String, URL, URL) -> Void)?)] = [
+            ("mode 644", { line, progress, _ in write(Data(line.utf8), progress); XCTAssertEqual(chmod(progress.path, 0o644), 0) }),
+            ("a second link", { line, progress, second in write(Data(line.utf8), progress); XCTAssertEqual(link(progress.path, second.path), 0) }),
+            ("a second line", { line, progress, _ in write(Data((line + line).utf8), progress) }),
+            ("no final newline", { line, progress, _ in write(Data(line.dropLast().utf8), progress) }),
+            ("a NUL byte", { line, progress, _ in var d = Data(line.utf8); d.insert(0, at: d.count - 1); write(d, progress) }),
+            ("more than 200 bytes", { line, progress, _ in write(Data((line + String(repeating: "x", count: 200) + "\n").utf8), progress) }),
             ("the control", nil),
         ]
+        var fixtures: [ScriptFixture] = []
+        defer { fixtures.forEach { $0.destroy() } }
+        var rows: [(row: ScriptRow, damaged: Bool, progress: URL, journal: Data)] = []
         for c in cases {
-            removeIfPresent(progress)
-            removeIfPresent(second)
-            removeIfPresent(fx.installedBackstop)
-            try fx.installMachinery()
-            fx.clearCalls()
-            try fx.writeState(cleanJournal)
-            if FileManager.default.fileExists(atPath: fx.receipts) { try FileManager.default.removeItem(atPath: fx.receipts) }
-            try fx.writeReceipt()
-            XCTAssertEqual(unlink(fx.receipt), 0)
-            let identity = try fx.runTool("/usr/bin/stat", ["-f", "%d:%i:%Fc", fx.released]).output.trimmingCharacters(in: .newlines)
+            let f = try ScriptFixture()
+            fixtures.append(f)
+            let progress = f.home.appendingPathComponent(".uninstall-receipt-removal")
+            let second = f.home.appendingPathComponent("record-second-link")
+            try f.installMachinery()
+            try f.writeState(cleanJournal)
+            try f.writeReceipt()
+            XCTAssertEqual(unlink(f.receipt), 0, c.name)
+            let identity = try f.runTool("/usr/bin/stat", ["-f", "%d:%i:%Fc", f.released]).output.trimmingCharacters(in: .newlines)
             let line = "\(identity) \(initial)"
-            let journal = try Data(contentsOf: fx.state)
-            if let damage = c.damage { damage(line) } else { write(Data(line.utf8)) }
+            let journal = try Data(contentsOf: f.state)
+            if let damage = c.damage { damage(line, progress, second) } else { write(Data(line.utf8), progress) }
+            rows.append((ScriptRow(c.name, f, f.uninstall), c.damage != nil, progress, journal))
+        }
+        XCTAssertEqual(rows.count, 7)
 
-            let r = try fx.run(fx.uninstall)
+        runTwoAtATime(rows.map(\.row))
 
-            if c.damage != nil {
-                try assertUninstallRemovedNothing(r, saying: lone, journal: journal, receipt: nil, release: initial)
+        for (row, damaged, progress, journal) in rows {
+            let f = row.fixture
+            let r = try row.outcome()
+            if damaged {
+                let lone = "\(f.released) is there without the receipt \(f.receipt), and no record of this folder's uninstall (\(progress.path)) names it as it is now, so what the receipt showed, and whether a start still needs the rule, is unknown"
+                try assertUninstallRemovedNothing(r, saying: lone, journal: journal, receipt: nil, release: initial, in: f)
             } else {
-                XCTAssertEqual(r.status, 0, "\(c.name): \(r.stdout + r.stderr)")
-                XCTAssertFalse(FileManager.default.fileExists(atPath: fx.released), c.name)
-                XCTAssertFalse(fx.exists(progress), c.name)
+                XCTAssertEqual(r.status, 0, "\(row.label): \(r.stdout + r.stderr)")
+                XCTAssertFalse(FileManager.default.fileExists(atPath: f.released), row.label)
+                XCTAssertFalse(f.exists(progress), row.label)
             }
         }
     }
@@ -4643,7 +4682,10 @@ final class RecoveryScriptTests: XCTestCase {
     /// the app does, without sudo (pmset -g, and pmset -g custom under
     /// Battery Power), keeps the rule, the receipt, its release file and the
     /// bundle, removes this folder's own files, and exits 1 saying why. It
-    /// runs nothing as root and leaves the receipt's lock free.
+    /// runs nothing as root. Round 34 (Greptile 4234715817): it keeps the
+    /// receipt's lock to the end, through the prints that ask whose agent
+    /// is loaded and through the bootout of this folder's own; the lock is
+    /// free once the run is over.
     func testUninstallKeepsTheSharedFilesWhileAnotherFolderMayOweARestore() throws {
         let cases: [(sleep: String, lowPower: String, saying: String)] = [
             ("1", "0", "sleep is off (pmset -g reports SleepDisabled 1)"),
@@ -4663,6 +4705,7 @@ final class RecoveryScriptTests: XCTestCase {
             try f.writeReceipt()
             f.setMode("pmset", c.sleep)
             f.setMode("pmset-custom", c.lowPower)
+            f.setMode("launchctl", "loaded")
             rows.append((ScriptRow("sleep \(c.sleep), lowpowermode \(c.lowPower)", f, f.uninstall), c))
         }
 
@@ -4680,6 +4723,9 @@ final class RecoveryScriptTests: XCTestCase {
             let calls = f.calls()
             XCTAssertEqual(calls.filter { $0.hasPrefix("pmset") }, c.sleep == "0" ? ["pmset -g", "pmset -g custom"] : ["pmset -g"], label)
             XCTAssertFalse(calls.contains { $0.hasPrefix("sudo -n") || $0.contains("DIRECT") }, "\(label): \(calls)")
+            XCTAssertTrue(calls.contains("launchctl bootout gui/\(f.uid) \(f.plist.path)"), "\(label): \(calls)")
+            XCTAssertEqual(f.printLockStates(), Array(repeating: "launchctl print held", count: 3), label)
+            XCTAssertEqual(f.receiptLockStates(), ["launchctl bootout held"], label)
             for kept in [f.sudoers, f.app, f.installedBackstop, f.config] { XCTAssertTrue(f.exists(kept), "\(label): \(kept.path)") }
             XCTAssertEqual(f.receiptText(), SleepOffReceipts.initialContent, label)
             XCTAssertEqual(f.release(), SleepOffReceipts.initialRelease, label)
@@ -4690,6 +4736,342 @@ final class RecoveryScriptTests: XCTestCase {
             XCTAssertGreaterThanOrEqual(fd, 0, label)
             XCTAssertEqual(flock(fd, LOCK_EX | LOCK_NB), 0, "\(label): the receipt's lock is free once the run is over")
             close(fd)
+        }
+    }
+
+    /// Round 34 (Greptile 4234715817): whose recovery agent launchd has
+    /// loaded, as the uninstall reads `launchctl print`: its own
+    /// loaded_agent and own_agent_file, run on their own with a stand-in
+    /// for the bounded print. The top-level `path =` line names the file
+    /// the job was loaded from. This folder's plist or candidate, in the
+    /// staging folder or beside the plist, spelled any way that leads to
+    /// this folder's LaunchAgents folder, is its own, whether the file is
+    /// still there or not. Any other file is another folder's. A print
+    /// that fails or does not answer, or that names no such file, two, or
+    /// a relative one, leaves it unknown. Only the line one tab in counts.
+    func testUninstallTellsWhoseAgentIsLoadedFromThePathLaunchctlPrints() throws {
+        let text = try String(contentsOf: fx.uninstall, encoding: .utf8)
+        func function(_ name: String) throws -> String {
+            let start = try XCTUnwrap(text.range(of: "\n\(name)() {"), name)
+            let end = try XCTUnwrap(text.range(of: "\n}\n", range: start.upperBound..<text.endIndex), name)
+            return String(text[start.lowerBound..<end.upperBound])
+        }
+        let label = "com.insomnia.backstop"
+        let fm = FileManager.default
+        let mine = fx.root.appendingPathComponent("Application Support/Insomnia/LaunchAgents", isDirectory: true).path
+        let other = fx.root.appendingPathComponent("Application Support/Insomnia Other/LaunchAgents", isDirectory: true).path
+        let link = fx.root.appendingPathComponent("a link to mine").path
+        let sibling = mine + "2"
+        for dir in [mine + "/.\(label).staging", other + "/.\(label).staging", sibling] { try fm.createDirectory(atPath: dir, withIntermediateDirectories: true) }
+        try fm.createSymbolicLink(atPath: link, withDestinationPath: mine)
+        try "plist".write(toFile: other + "/\(label).plist", atomically: true, encoding: .utf8)
+        let candidate = "\(label).candidate-\(UUID().uuidString).plist"
+        func printed(_ paths: [String], extra: String = "") -> String {
+            "gui/\(fx.uid)/\(label) = {\n\tactive count = 0\n" + paths.map { "\tpath = \($0)\n" }.joined()
+                + "\ttype = LaunchAgent\n\tstate = not running\n\n\tprogram = /bin/sh\n\targuments = {\n\t\t/bin/sh\n\t\t-c\n\t}\n\n" + extra
+                + "\tdefault environment = {\n\t\tPATH => /usr/bin:/bin:/usr/sbin:/sbin\n\t}\n\n\tstderr path = /dev/null\n}\n"
+        }
+        let asked = "'launchctl print gui/\(fx.uid)/\(label)'"
+        let noPath = "\(asked) lists the job but not one absolute path it was loaded from"
+        let nested = "\tendpoints = {\n\t\tpath = \(mine)/\(label).plist\n\t}\n\n"
+        var cases: [(name: String, rc: Int, output: String, seen: String, path: String, why: String)] = [
+            ("not loaded", 113, "", "none", "", ""),
+            ("no answer", 124, "", "unknown", "", "\(asked) did not answer within 5s"),
+            ("an error", 1, "Could not print domain: 1: Operation not permitted", "unknown", "", "\(asked) exited 1"),
+            ("this folder's plist", 0, printed(["\(mine)/\(label).plist"]), "own", "\(mine)/\(label).plist", ""),
+            ("this folder's candidate, renamed since", 0, printed(["\(mine)/.\(label).staging/\(candidate)"]), "own", "\(mine)/.\(label).staging/\(candidate)", ""),
+            ("an older build's candidate beside the plist", 0, printed(["\(mine)/\(candidate)"]), "own", "\(mine)/\(candidate)", ""),
+            ("this folder through a link", 0, printed(["\(link)/\(label).plist"]), "own", "\(link)/\(label).plist", ""),
+            ("a candidate through a link", 0, printed(["\(link)/.\(label).staging/\(candidate)"]), "own", "\(link)/.\(label).staging/\(candidate)", ""),
+            ("the top-level line among nested ones", 0, printed(["\(mine)/\(label).plist"], extra: nested), "own", "\(mine)/\(label).plist", ""),
+            ("another folder's plist", 0, printed(["\(other)/\(label).plist"]), "other", "\(other)/\(label).plist", ""),
+            ("another folder's candidate", 0, printed(["\(other)/.\(label).staging/\(candidate)"]), "other", "\(other)/.\(label).staging/\(candidate)", ""),
+            ("a folder beside this one", 0, printed(["\(sibling)/\(label).plist"]), "other", "\(sibling)/\(label).plist", ""),
+            ("a folder that is gone", 0, printed(["\(other)-gone/\(label).plist"]), "other", "\(other)-gone/\(label).plist", ""),
+            ("another name in this folder", 0, printed(["\(mine)/com.example.agent.plist"]), "other", "\(mine)/com.example.agent.plist", ""),
+            ("the plist's name in the staging folder", 0, printed(["\(mine)/.\(label).staging/\(label).plist"]), "other", "\(mine)/.\(label).staging/\(label).plist", ""),
+            ("no path line", 0, printed([]), "unknown", "", noPath),
+            ("only a nested path line", 0, printed([], extra: nested), "unknown", "", noPath),
+            ("two path lines", 0, printed(["\(mine)/\(label).plist", "\(other)/\(label).plist"]), "unknown", "", noPath),
+            ("a relative path", 0, printed(["LaunchAgents/\(label).plist"]), "unknown", "", noPath),
+        ]
+        // The same folder from the root, without the links on its way (on
+        // macOS /var is a link to /private/var), when that spelling differs.
+        let real = try XCTUnwrap(realpath(mine, nil).map { p in defer { free(p) }; return String(cString: p) })
+        if real != mine { cases.append(("this folder spelled from the root", 0, printed(["\(real)/\(label).plist"]), "own", "\(real)/\(label).plist", "")) }
+
+        let dir = fx.root.appendingPathComponent("prints", isDirectory: true)
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        var bases: [String] = []
+        for (i, c) in cases.enumerated() {
+            let base = dir.appendingPathComponent("\(i)").path
+            try "\(c.rc)\n".write(toFile: base + ".rc", atomically: true, encoding: .utf8)
+            try c.output.write(toFile: base + ".out", atomically: true, encoding: .utf8)
+            bases.append(base)
+        }
+        let harness = fx.root.appendingPathComponent("whose-agent.sh")
+        try """
+        set -euo pipefail
+        LABEL=\(label)
+        LAUNCHCTL=/bin/launchctl
+        UID_NUM=\(fx.uid)
+        CALL_TIMEOUT_SECONDS=5
+        STAT=/usr/bin/stat
+        LAUNCH_AGENTS="$1"
+        shift
+        # bounded() as the uninstall has it, without the process: the
+        # case's status, and its output without the last newline.
+        bounded() {
+          local rc
+          [[ "$*" == "$LAUNCHCTL print gui/$UID_NUM/$LABEL" ]] || { echo "unexpected call: $*" >&2; exit 3; }
+          read -r rc < "$CASE.rc"
+          IFS= read -r -d '' BOUNDED_OUTPUT < "$CASE.out" || true
+          BOUNDED_OUTPUT="${BOUNDED_OUTPUT%$'\\n'}"
+          return "$rc"
+        }
+        \(try function("own_agent_file"))
+        \(try function("loaded_agent"))
+        for CASE in "$@"; do
+          loaded_agent
+          printf '%s|%s|%s\\n' "$agent_seen" "$agent_path" "$agent_why"
+        done
+
+        """.write(to: harness, atomically: true, encoding: .utf8)
+
+        let r = try fx.run(harness, [mine] + bases)
+
+        XCTAssertEqual(r.status, 0, r.stderr)
+        XCTAssertEqual(r.stderr, "")
+        let lines = r.stdout.split(separator: "\n", omittingEmptySubsequences: false).dropLast().map(String.init)
+        XCTAssertEqual(lines.count, cases.count, r.stdout)
+        for (c, line) in zip(cases, lines) {
+            XCTAssertEqual(line, "\(c.seen)|\(c.path)|\(c.why)", c.name)
+        }
+    }
+
+    /// Round 34 (Greptile 4234715817): every Insomnia folder of this user
+    /// loads its recovery agent under one label, and launchd holds one job
+    /// for it. While `launchctl print` names another folder's file, at the
+    /// check and again just before the bootout, that agent stays loaded:
+    /// there is no bootout, and the rule, the receipt, its release file and
+    /// the bundle whose backstop.sh it runs stay, as while a restore may be
+    /// owed. Only this folder's plist and journal go. The receipt's lock is
+    /// held through both prints and free after, and the run exits 1 saying
+    /// which folder to uninstall first; with sleep off too, it gives both
+    /// reasons. With nothing loaded there is no bootout and everything
+    /// goes. This folder's agent, loaded from a staging candidate, is
+    /// booted out. A print that names no file stops the run before the
+    /// bootout with nothing removed.
+    func testUninstallLeavesAnotherFoldersLoadedAgentAndWhatItRuns() throws {
+        let label = "com.insomnia.backstop"
+        let cases: [(name: String, sleep: String, answers: [String]?)] = [
+            ("another folder's", "0", ["path OTHER"]),
+            ("another folder's, sleep off", "1", ["path OTHER"]),
+            ("none", "0", nil),
+            ("this folder's, from a candidate", "0", ["path CANDIDATE", "path CANDIDATE", "113"]),
+            ("no file named", "0", ["nopath"]),
+        ]
+        var fixtures: [ScriptFixture] = []
+        defer { fixtures.forEach { $0.destroy() } }
+        var rows: [(row: ScriptRow, sleep: String, other: String, candidate: String, journal: Data)] = []
+        for c in cases {
+            let f = try ScriptFixture()
+            fixtures.append(f)
+            try f.installMachinery()
+            try f.writeState(cleanJournal)
+            try f.writeReceipt()
+            f.setMode("pmset", c.sleep)
+            let other = f.root.appendingPathComponent("other home/LaunchAgents/\(label).plist")
+            try FileManager.default.createDirectory(at: other.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try "other plist".write(to: other, atomically: true, encoding: .utf8)
+            let candidate = f.plist.deletingLastPathComponent().appendingPathComponent(".\(label).staging/\(label).candidate-\(UUID().uuidString).plist").path
+            if let answers = c.answers {
+                try f.setPrintAnswers(answers.map { $0.replacingOccurrences(of: "OTHER", with: other.path).replacingOccurrences(of: "CANDIDATE", with: candidate) })
+            }
+            rows.append((ScriptRow(c.name, f, f.uninstall), c.sleep, other.path, candidate, try Data(contentsOf: f.state)))
+        }
+
+        runTwoAtATime(rows.map(\.row))
+
+        for (row, sleep, other, candidate, journal) in rows {
+            let label0 = row.label
+            let f = row.fixture
+            let r = try row.outcome()
+            let calls = f.calls()
+            XCTAssertFalse(calls.contains { $0.hasPrefix("launchctl bootstrap") }, "\(label0): \(calls)")
+            let fd = open(f.receipt, O_RDONLY)
+            if fd >= 0 {
+                XCTAssertEqual(flock(fd, LOCK_EX | LOCK_NB), 0, "\(label0): the receipt's lock is free once the run is over")
+                close(fd)
+            }
+            switch label0 {
+            case "another folder's", "another folder's, sleep off":
+                let agent = "the recovery agent loaded as \(label) is another Insomnia folder's (\(other))"
+                let why = sleep == "1" ? "sleep is off (pmset -g reports SleepDisabled 1), and \(agent)" : agent
+                XCTAssertEqual(r.status, 1, "\(label0): \(r.stdout + r.stderr)")
+                XCTAssertTrue(r.stdout.contains("kept for another Insomnia folder of this user: the recovery agent loaded as \(label) comes from \(other), not from \(f.plist.deletingLastPathComponent().path); it stays loaded, and \(f.sudoers.path), the receipt and \(f.app.path), which it runs, stay"), "\(label0): \(r.stdout)")
+                XCTAssertTrue(r.stderr.contains("\(f.app.path) were kept: \(why).\n"), "\(label0): \(r.stderr)")
+                XCTAssertTrue(r.stderr.contains("That agent runs the backstop.sh sealed in \(f.app.path), which needs the rule to\nturn sleep back on, so it was left loaded. Uninstall that Insomnia folder\nfirst"), "\(label0): \(r.stderr)")
+                XCTAssertEqual(r.stderr.contains("Another Insomnia folder of this user may still owe that restore"), sleep == "1", "\(label0): \(r.stderr)")
+                XCTAssertFalse(calls.contains { $0.hasPrefix("launchctl bootout") || $0.hasPrefix("sudo -n") }, "\(label0): \(calls)")
+                XCTAssertEqual(f.printLockStates(), ["launchctl print held", "launchctl print held"], label0)
+                for kept in [f.sudoers, f.app, f.installedBackstop, f.config, URL(fileURLWithPath: other)] { XCTAssertTrue(f.exists(kept), "\(label0): \(kept.path)") }
+                XCTAssertEqual(f.receiptText(), SleepOffReceipts.initialContent, label0)
+                XCTAssertEqual(f.release(), SleepOffReceipts.initialRelease, label0)
+                XCTAssertFalse(f.exists(f.plist), label0)
+                XCTAssertFalse(f.exists(f.state), label0)
+            case "none", "this folder's, from a candidate":
+                XCTAssertEqual(r.status, 0, "\(label0): \(r.stdout + r.stderr)")
+                let bootout = "launchctl bootout gui/\(f.uid) \(f.plist.path)"
+                if label0 == "none" {
+                    XCTAssertTrue(r.stdout.contains("no recovery agent is loaded as \(label)"), "\(label0): \(r.stdout)")
+                    XCTAssertTrue(r.stdout.contains("\(label) is not loaded"), "\(label0): \(r.stdout)")
+                    XCTAssertFalse(calls.contains { $0.hasPrefix("launchctl bootout") }, "\(label0): \(calls)")
+                    XCTAssertEqual(f.printLockStates(), ["launchctl print held", "launchctl print held"], label0)
+                } else {
+                    XCTAssertTrue(r.stdout.contains("the recovery agent loaded as \(label) is this folder's (\(candidate))"), "\(label0): \(r.stdout)")
+                    XCTAssertEqual(calls.filter { $0.hasPrefix("launchctl bootout") }, [bootout], label0)
+                    XCTAssertEqual(f.printLockStates(), Array(repeating: "launchctl print held", count: 3), label0)
+                    XCTAssertEqual(f.receiptLockStates().first, "launchctl bootout held", label0)
+                }
+                for gone in [f.sudoers, f.plist, f.app, f.state] { XCTAssertFalse(f.exists(gone), "\(label0): \(gone.path)") }
+                XCTAssertFalse(FileManager.default.fileExists(atPath: f.receipts), label0)
+            default:
+                try assertUninstallRemovedNothing(r, saying: "'launchctl print gui/\(f.uid)/\(label)' lists the job but not one absolute path it was loaded from, so whether the recovery agent loaded as \(label) is this folder's or another Insomnia folder's is unknown", journal: journal, receipt: SleepOffReceipts.initialContent, release: SleepOffReceipts.initialRelease, in: f)
+                XCTAssertEqual(f.printLockStates(), ["launchctl print held"], label0)
+            }
+        }
+    }
+
+    /// Round 34 (Greptile 4234715817): another folder's agent is loaded
+    /// while the run goes on, by a load that does not take this receipt's
+    /// lock (an extend, an end or a relaunch of that folder's app). Seen
+    /// just before the bootout, it is not booted out: with nothing owed the
+    /// run stops there with nothing removed, and with sleep off the shared
+    /// files stay as above. Seen after this folder's agent was booted out,
+    /// it stays loaded and this folder's is not loaded again beside it:
+    /// with nothing owed the run stops there, before the rule, and with
+    /// sleep off the shared files stay. An agent of another folder seen at
+    /// the check keeps them even when none is loaded by the bootout.
+    func testUninstallLeavesAnAgentAnotherFolderLoadsDuringTheRunLoaded() throws {
+        let label = "com.insomnia.backstop"
+        let cases: [(name: String, sleep: String, answers: [String])] = [
+            ("before the bootout", "0", ["path MINE", "path OTHER"]),
+            ("before the bootout, sleep off", "1", ["path MINE", "path OTHER"]),
+            ("after the bootout", "0", ["path MINE", "path MINE", "path OTHER"]),
+            ("after the bootout, sleep off", "1", ["path MINE", "path MINE", "path OTHER"]),
+            ("at the check, gone by the bootout", "0", ["path OTHER", "113"]),
+        ]
+        var fixtures: [ScriptFixture] = []
+        defer { fixtures.forEach { $0.destroy() } }
+        var rows: [(row: ScriptRow, sleep: String, other: String, journal: Data)] = []
+        for c in cases {
+            let f = try ScriptFixture()
+            fixtures.append(f)
+            try f.installMachinery()
+            try f.writeState(cleanJournal)
+            try f.writeReceipt()
+            f.setMode("pmset", c.sleep)
+            let other = f.root.appendingPathComponent("other home/LaunchAgents/\(label).plist").path
+            try f.setPrintAnswers(c.answers.map { $0.replacingOccurrences(of: "OTHER", with: other).replacingOccurrences(of: "MINE", with: f.plist.path) })
+            rows.append((ScriptRow(c.name, f, f.uninstall), c.sleep, other, try Data(contentsOf: f.state)))
+        }
+
+        runTwoAtATime(rows.map(\.row))
+
+        for (row, sleep, other, journal) in rows {
+            let name = row.label
+            let f = row.fixture
+            let r = try row.outcome()
+            let calls = f.calls()
+            let bootouts = calls.filter { $0.hasPrefix("launchctl bootout") }
+            XCTAssertEqual(r.status, 1, "\(name): \(r.stdout + r.stderr)")
+            XCTAssertFalse(calls.contains { $0.hasPrefix("launchctl bootstrap") }, "\(name): nothing is loaded beside it: \(calls)")
+            XCTAssertTrue(f.printLockStates().allSatisfy { $0 == "launchctl print held" } && !f.printLockStates().isEmpty, "\(name): \(f.printLockStates())")
+            XCTAssertEqual(bootouts, name.hasPrefix("after") ? ["launchctl bootout gui/\(f.uid) \(f.plist.path)"] : [], name)
+            let fd = open(f.receipt, O_RDONLY)
+            XCTAssertGreaterThanOrEqual(fd, 0, name)
+            XCTAssertEqual(flock(fd, LOCK_EX | LOCK_NB), 0, "\(name): the receipt's lock is free once the run is over")
+            close(fd)
+            for kept in [f.sudoers, f.app, f.installedBackstop, f.config] { XCTAssertTrue(f.exists(kept), "\(name): \(kept.path)") }
+            XCTAssertEqual(f.receiptText(), SleepOffReceipts.initialContent, name)
+            XCTAssertEqual(f.release(), SleepOffReceipts.initialRelease, name)
+            XCTAssertFalse(calls.contains { $0.hasPrefix("sudo -n") && $0 != "sudo -n -v" }, "\(name): \(calls)")
+            switch name {
+            case "before the bootout":
+                try assertUninstallRemovedNothing(r, saying: "the recovery agent of another Insomnia folder was loaded as \(label) (\(other)) after the check above, and it was left loaded", journal: journal, receipt: SleepOffReceipts.initialContent, release: SleepOffReceipts.initialRelease, in: f)
+            case "after the bootout":
+                XCTAssertTrue(r.stderr.contains("launchctl bootout exited 0, and then the recovery agent of another Insomnia folder was loaded as \(label) (\(other)); it was left loaded.\nNothing was removed. This folder's agent is not loaded again beside it. Rerun this script."), "\(name): \(r.stderr)")
+                XCTAssertTrue(f.exists(f.plist), name)
+                XCTAssertEqual(try Data(contentsOf: f.state), journal, name)
+            default:
+                let agent = "the recovery agent loaded as \(label) is another Insomnia folder's (\(other))"
+                XCTAssertTrue(r.stderr.contains("\(f.app.path) were kept: \(sleep == "1" ? "sleep is off (pmset -g reports SleepDisabled 1), and \(agent)" : agent).\n"), "\(name): \(r.stderr)")
+                XCTAssertTrue(r.stderr.contains("so it was left loaded"), "\(name): \(r.stderr)")
+                XCTAssertFalse(f.exists(f.plist), name)
+                XCTAssertFalse(f.exists(f.state), name)
+                if name.hasPrefix("at the check") { XCTAssertTrue(r.stdout.contains("\(label) is not loaded"), "\(name): \(r.stdout)") }
+            }
+        }
+    }
+
+    /// Round 34 (Greptile 4234715817): a start of another Insomnia folder
+    /// begins while the run asks whose agent is loaded. It waits for the
+    /// receipt's lock, as SleepOffReceipts.lock does, and gets it only
+    /// once the shared files are gone, or once the run is over when a
+    /// restore may be owed. With nothing owed, the rule, the bundle and the
+    /// receipt are gone by then, and only this folder's journal is left for
+    /// the run to remove after, so it claims nothing. With sleep off, the
+    /// run has booted out this
+    /// folder's own agent and kept the shared files; the start then finds
+    /// the rule, the bundle and the receipt, claims the receipt and loads
+    /// its agent, and nothing unloads it.
+    func testUninstallKeepsTheReceiptLockedUntilItEndsSoAStartElsewhereWaits() throws {
+        let label = "com.insomnia.backstop"
+        var fixtures: [ScriptFixture] = []
+        defer { fixtures.forEach { $0.destroy() } }
+        var rows: [(row: ScriptRow, other: String, nonce: String)] = []
+        for sleep in ["0", "1"] {
+            let f = try ScriptFixture()
+            fixtures.append(f)
+            try f.installMachinery()
+            try f.writeState(cleanJournal)
+            try f.writeReceipt()
+            f.setMode("pmset", sleep)
+            f.setMode("launchctl", "loaded")
+            let other = f.root.appendingPathComponent("other home/LaunchAgents/\(label).plist").path
+            let nonce = UUID().uuidString
+            try f.startElsewhere(at: "print", agent: other, nonce: nonce)
+            rows.append((ScriptRow(sleep == "0" ? "nothing owed" : "sleep off", f, f.uninstall), other, nonce))
+        }
+
+        runTwoAtATime(rows.map(\.row))
+
+        for (row, other, nonce) in rows {
+            let name = row.label
+            let f = row.fixture
+            let r = try row.outcome()
+            // plist, journal, rule, bundle, receipt: "+" there, "-" gone.
+            let saw = f.startElsewhereSaw(within: 25)
+            let calls = f.calls()
+            let bootout = try XCTUnwrap(calls.firstIndex(of: "launchctl bootout gui/\(f.uid) \(f.plist.path)"), "\(name): \(calls)")
+            XCTAssertEqual(f.printLockStates(), Array(repeating: "launchctl print held", count: 3), name)
+            XCTAssertEqual(f.receiptLockStates().first, "launchctl bootout held", name)
+            if name == "nothing owed" {
+                XCTAssertEqual(r.status, 0, "\(name): \(r.stdout + r.stderr)")
+                XCTAssertEqual(saw, "-+---", "\(name): the start got the lock once the run had removed everything but this folder's journal")
+                XCTAssertFalse(calls.contains("foreign start claimed the receipt"), "\(name): \(calls)")
+                XCTAssertFalse(FileManager.default.fileExists(atPath: f.receipts), name)
+            } else {
+                XCTAssertEqual(r.status, 1, "\(name): \(r.stdout + r.stderr)")
+                XCTAssertEqual(saw, "--+++", "\(name): the start got the lock after the run, with the shared files kept")
+                let claimed = try XCTUnwrap(calls.firstIndex(of: "foreign start claimed the receipt"), "\(name): \(calls)")
+                XCTAssertLessThan(bootout, claimed, "\(name): \(calls)")
+                XCTAssertEqual(calls.last, "foreign start loaded \(other)", "\(name): nothing unloads it after: \(calls)")
+                XCTAssertFalse(f.exists(f.root.appendingPathComponent("launchctl.unloaded")), "\(name): the other folder's agent is loaded")
+                XCTAssertEqual(f.release(), "\(nonce) held\n", name)
+                for kept in [f.sudoers, f.app, f.installedBackstop] { XCTAssertTrue(f.exists(kept), "\(name): \(kept.path)") }
+            }
         }
     }
 
@@ -4759,11 +5141,13 @@ final class RecoveryScriptTests: XCTestCase {
     /// and loads the agent again from its plist, so this folder's recovery
     /// runs as before. A removal still running at its limit (125) loads
     /// nothing: nothing new starts beside it, and the message says how to
-    /// load it once it has ended.
+    /// load it once it has ended. Round 34: the agent is this folder's and
+    /// loaded, so there is one to boot out and load again.
     func testUninstallLoadsTheAgentAgainWhenItStopsAfterTheBootout() throws {
         for stop in ["no-credential", "hangs"] {
             let f = try ScriptFixture()
             defer { f.destroy() }
+            f.setMode("launchctl", "loaded")
             try f.installMachinery()
             try f.writeState(cleanJournal)
             try f.writeReceipt()
@@ -5716,9 +6100,9 @@ final class RecoveryScriptTests: XCTestCase {
     }
 
     /// state.json changes, or appears, after the journal check and before
-    /// it would be removed (here, as the LaunchAgent is booted out): the
-    /// file is left, named, and the run exits 1. The rest is removed, as
-    /// the journal that was checked allowed.
+    /// it would be removed (here, as this folder's loaded LaunchAgent is
+    /// booted out): the file is left, named, and the run exits 1. The rest
+    /// is removed, as the journal that was checked allowed.
     func testUninstallLeavesAJournalThatChangedOrAppearedAfterItsCheck() throws {
         let checked = #"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#
         let later = #"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#
@@ -5729,6 +6113,7 @@ final class RecoveryScriptTests: XCTestCase {
             try f.installMachinery()
             try f.writeConfig(#"{"agentList":[]}"#)
             if !appears { try f.writeState(checked) }
+            f.setMode("launchctl", "loaded")
             let wrapper = f.bin.appendingPathComponent("launchctl-writes-state")
             try """
             #!/bin/bash
@@ -8881,21 +9266,44 @@ final class RecoveryScriptTests: XCTestCase {
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
     }
 
+    /// launchctl print and bootout both fail. Round 34: a print that fails
+    /// at the check leaves whose agent is loaded unknown, and the run stops
+    /// there without a bootout. One that names this folder's plist until
+    /// the bootout and fails after it cannot prove the agent gone: the run
+    /// stops there, with every file in place.
     func testUninstallAbortsWhenBootoutAndPrintBothFailAmbiguously() throws {
-        try fx.installMachinery()
-        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
-        fx.setMode("launchctl", "ambiguous")
+        let label = "com.insomnia.backstop"
+        let answers = fx.root.appendingPathComponent("launchctl.print-answers")
+        for when in ["at the check", "after the bootout"] {
+            removeIfPresent(fx.installedBackstop)
+            try fx.installMachinery()
+            fx.clearCalls()
+            try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+            fx.setMode("launchctl", "ambiguous")
+            removeIfPresent(fx.root.appendingPathComponent("print.count"))
+            if when == "after the bootout" {
+                try "path \(fx.plist.path)\npath \(fx.plist.path)\nerror\n".write(to: answers, atomically: true, encoding: .utf8)
+            }
 
-        let r = try fx.run(fx.uninstall, ["--purge"])
+            let r = try fx.run(fx.uninstall, ["--purge"])
+            removeIfPresent(answers)
 
-        XCTAssertNotEqual(r.status, 0)
-        XCTAssertFalse(fx.calls().contains { Self.isRootRemoval($0) }, "\(fx.calls())")
-        XCTAssertTrue(fx.exists(fx.plist), "an unproven bootout keeps the agent file")
-        XCTAssertTrue(fx.exists(fx.sudoers))
-        XCTAssertTrue(fx.exists(fx.app))
-        XCTAssertTrue(fx.exists(fx.installedBackstop))
-        XCTAssertTrue(fx.exists(fx.config))
-        XCTAssertTrue(r.stderr.contains("cannot tell"), r.stderr)
+            XCTAssertEqual(r.status, 1, "\(when): \(r.stdout + r.stderr)")
+            XCTAssertFalse(fx.calls().contains { Self.isRootRemoval($0) }, "\(when): \(fx.calls())")
+            XCTAssertTrue(fx.exists(fx.plist), "\(when): an unproven bootout keeps the agent file")
+            XCTAssertTrue(fx.exists(fx.sudoers), when)
+            XCTAssertTrue(fx.exists(fx.app), when)
+            XCTAssertTrue(fx.exists(fx.installedBackstop), when)
+            XCTAssertTrue(fx.exists(fx.config), when)
+            let bootouts = fx.calls().filter { $0.hasPrefix("launchctl bootout") }
+            if when == "at the check" {
+                XCTAssertTrue(r.stderr.contains("Uninstall stopped BEFORE removing anything: 'launchctl print gui/\(fx.uid)/\(label)' exited 1, so whether the recovery agent loaded as \(label) is this folder's or another Insomnia folder's is unknown."), r.stderr)
+                XCTAssertEqual(bootouts, [], when)
+            } else {
+                XCTAssertTrue(r.stderr.contains("launchctl bootout exited 1 and 'launchctl print gui/\(fx.uid)/\(label)' exited 1; cannot tell whether \(label) is still loaded."), r.stderr)
+                XCTAssertEqual(bootouts, ["launchctl bootout gui/\(fx.uid) \(fx.plist.path)"], when)
+            }
+        }
     }
 
     // MARK: - install.sh (fully redirected: fake build, signing, sudo, launchctl)
@@ -12005,10 +12413,11 @@ private final class ScriptFixture {
         """
     }
 
+    /// Each fake is a link to the shared launcher, with its text in
+    /// bin/.fake-src (FakeTool), so it starts as fast as a tool macOS has
+    /// already checked.
     private func writeFake(_ name: String, _ body: String) throws {
-        let url = bin.appendingPathComponent(name)
-        try ("#!/bin/bash\n" + body).write(to: url, atomically: true, encoding: .utf8)
-        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+        try FakeTool.write("#!/bin/bash\n" + body, at: bin.appendingPathComponent(name).path)
     }
 
     private func writeFakes() throws {
@@ -12466,7 +12875,7 @@ private final class ScriptFixture {
         // since a test cannot give its receipt the entry install.sh adds
         // without changing a real access control list. Any other call is
         // /bin/ls.
-        try TestReceipts.writeFakeLs(at: bin.appendingPathComponent("ls").path, receipt: receipt, entries: receiptEntries)
+        try FakeTool.write(TestReceipts.fakeLsScript(receipt: receipt, entries: receiptEntries), at: bin.appendingPathComponent("ls").path)
         // Insomnia --resume-frozen: reads its entries from standard input,
         // one "<pid> <startedAt> <micros> <boot>" line each, and records the
         // call as "Insomnia <arguments> < <line>; <line>; ...". Answers one
@@ -12633,19 +13042,72 @@ private final class ScriptFixture {
         //     lists the job.
         //   "bootout-claims-receipt": bootout succeeds and, without the
         //     receipt's lock, writes "<claim.nonce> held" over the release
-        //     file, as a writer that ignores the lock could; print says not
-        //     loaded.
+        //     file, as a writer that ignores the lock could; print says
+        //     loaded until then and not loaded after it.
         // Every bootout also records in receipt-lock.log whether the
-        // receipt's lock is held (see receiptLockHere).
+        // receipt's lock is held (see receiptLockHere), and every print in
+        // print-lock.log.
+        // A print that says loaded answers like launchctl (print_loaded):
+        // one top-level `path =` line names the file the job was loaded
+        // from, the fixture's plist unless launchctl.path names another.
+        // launchctl.print-answers, when it is there, decides every print
+        // instead of the mode: the Nth print answers its line N (its last
+        // line once past the end): "113" (not loaded), "error" (exits 1),
+        // "path <file>" (loaded from <file>), "nopath" (loaded, no path
+        // line) or "twopaths <file>" (two path lines).
+        // foreign-start.at holding "print" or "bootout": the first such call
+        // starts a start of another Insomnia folder, in the background and
+        // without any of the script's descriptors. It waits up to 20 s for
+        // the receipt's lock, as SleepOffReceipts.lock does, and once it has
+        // it writes to foreign-start.saw which of the plist, the journal,
+        // the rule, the bundle's backstop.sh and the receipt are there
+        // ("plist state rule bundle receipt", each "+" or "-"). With the
+        // receipt there, it claims it ("<claim.nonce> held" in the release
+        // file) and loads its agent from foreign-start.path (launchctl.path,
+        // and loaded for the stateful modes), and logs both in the call log.
+        // A lockf that fails leaves "lockf <status>" in foreign-start.saw.
+        // foreign-start.done appears once that start is over.
         try writeFake("launchctl", """
         printf 'launchctl %s\\n' "$*" >> "\(calls)"
         \(readFile(into: "mode", "\(r)/launchctl.mode", or: "ok"))
+        \(readFile(into: "loaded_path", "\(r)/launchctl.path", or: plist.path))
         \(receiptLockHere())
+        print_loaded() { # the files it was loaded from, one path line each
+          printf 'gui/%s/com.insomnia.backstop = {\\n\\tactive count = 0\\n' "\(uid)"
+          for p in "$@"; do printf '\\tpath = %s\\n' "$p"; done
+          printf '\\ttype = LaunchAgent\\n\\tstate = not running\\n\\n\\tprogram = /bin/sh\\n\\targuments = {\\n\\t\\t/bin/sh\\n\\t}\\n\\n'
+          printf '\\tdefault environment = {\\n\\t\\tPATH => /usr/bin:/bin:/usr/sbin:/sbin\\n\\t}\\n\\n\\tstderr path = /dev/null\\n}\\n'
+          exit 0
+        }
+        if [[ -e "\(r)/foreign-start.at" && ! -e "\(r)/foreign-start.started" ]] && [[ "$(/bin/cat "\(r)/foreign-start.at")" == "${1:-}" ]]; then
+          : > "\(r)/foreign-start.started"
+          (
+            exec 6>&- 7>&- 8>&- 9>&- </dev/null >/dev/null 2>&1
+            /usr/bin/lockf -k -n -s -t 20 "\(receipt)" /bin/bash -c '
+              saw=""
+              for f in "$@"; do if [[ -e "$f" ]]; then saw="$saw+"; else saw="$saw-"; fi; done
+              echo "$saw" > "\(r)/foreign-start.saw.part" && /bin/mv "\(r)/foreign-start.saw.part" "\(r)/foreign-start.saw"
+              [[ -e "\(receipt)" ]] || exit 0
+              printf "%s held\\n" "$(/bin/cat "\(r)/claim.nonce")" 1<> "\(released)"
+              echo "foreign start claimed the receipt" >> "\(calls)"
+              /bin/cp "\(r)/foreign-start.path" "\(r)/launchctl.path"
+              /bin/rm -f "\(r)/launchctl.unloaded"
+              echo "foreign start loaded $(/bin/cat "\(r)/foreign-start.path")" >> "\(calls)"
+            ' _ "\(plist.path)" "\(state.path)" "\(sudoers.path)" "\(installedBackstop.path)" "\(receipt)"
+            rc=$?
+            [[ -e "\(r)/foreign-start.saw" ]] || echo "lockf $rc" > "\(r)/foreign-start.saw"
+            : > "\(r)/foreign-start.done"
+          ) &
+        fi
         if [[ "${1:-}" == bootout ]]; then
           receipt_lock_state "launchctl bootout"
           if [[ "$mode" == bootout-claims-receipt ]]; then
             printf '%s held\\n' "$(/bin/cat "\(r)/claim.nonce")" 1<> "\(released)"
+            : > "\(r)/launchctl.unloaded"
           fi
+        fi
+        if [[ "${1:-}" == print ]]; then
+          receipt_lock_state "launchctl print" "\(r)/print-lock.log"
         fi
         if [[ "${1:-}" == bootstrap ]]; then
           [[ "${3:-}" == *.plist && -f "${3:-}" ]] || { echo "Bootstrap failed: 5: Input/output error" >&2; exit 5; }
@@ -12673,6 +13135,18 @@ private final class ScriptFixture {
         if [[ "${1:-}" == print ]]; then
           \(readFile(into: "prints", "\(r)/print.count", or: "0"))
           prints=$(( prints + 1 )); echo "$prints" > "\(r)/print.count"
+          if [[ -e "\(r)/launchctl.print-answers" ]]; then
+            answer="$(/usr/bin/sed -n "${prints}p" "\(r)/launchctl.print-answers")"
+            [[ -n "$answer" ]] || answer="$(/usr/bin/tail -n 1 "\(r)/launchctl.print-answers")"
+            case "$answer" in
+              113) exit 113 ;;
+              error) echo "Could not print domain: 1: Operation not permitted" >&2; exit 1 ;;
+              nopath) print_loaded ;;
+              "path "*) print_loaded "${answer#path }" ;;
+              "twopaths "*) print_loaded "${answer#twopaths }" "${answer#twopaths }" ;;
+              *) echo "fake: unknown print answer $answer" >&2; exit 98 ;;
+            esac
+          fi
         fi
         case "$mode" in
           loaded|loaded-bootstrap-fails-once|loaded-unload-fails-after-bootstrap|loaded-print-fails-once-after-bootstrap|loaded-print-fails-after-bootstrap|loaded-reload-fails-yet-listed)
@@ -12697,22 +13171,22 @@ private final class ScriptFixture {
                     || { [[ "$mode" == loaded-print-fails-once-after-bootstrap ]] && [[ ! -e "\(r)/print.failed" ]]; }; }; then
                   : > "\(r)/print.failed"; echo "Could not print domain: 1: Operation not permitted" >&2; exit 1
                 fi
-                if [[ -e "$unloaded" ]]; then exit 113; fi; exit 0 ;;
+                if [[ -e "$unloaded" ]]; then exit 113; fi; print_loaded "$loaded_path" ;;
             esac ;;
         esac
         case "${1:-}:$mode" in
           bootout:print-hangs|bootout:bootout-claims-receipt) exit 0 ;;
-          print:bootout-claims-receipt) exit 113 ;;
+          print:bootout-claims-receipt) if [[ -e "\(r)/launchctl.unloaded" ]]; then exit 113; fi; print_loaded "$loaded_path" ;;
           bootout:ok|bootout:loaded-then-lost|bootout:no-then-error|bootout:bootstrap-fails) exit 0 ;;
           bootstrap:ok) exit 0 ;;
           bootstrap:loaded-then-lost|bootstrap:no-then-error|bootstrap:bootstrap-fails) echo "Bootstrap failed: 5: Input/output error" >&2; exit 5 ;;
-          print:loaded-then-lost) if (( prints == 1 )); then exit 0; fi; exit 113 ;;
+          print:loaded-then-lost) if (( prints == 1 )); then print_loaded "$loaded_path"; fi; exit 113 ;;
           print:no-then-error) if (( prints == 1 )); then exit 113; fi; echo "Could not print domain: 1: Operation not permitted" >&2; exit 1 ;;
           print:ok|print:bootstrap-fails) exit 113 ;;
           bootout:ambiguous) echo "Boot-out failed: 1: Operation not permitted" >&2; exit 1 ;;
           print:ambiguous) echo "Could not print domain: 1: Operation not permitted" >&2; exit 1 ;;
           bootout:*) exit 5 ;;
-          print:*) exit 0 ;;
+          print:*) print_loaded "$loaded_path" ;;
           *) exit 1 ;;
         esac
         """)
@@ -12877,17 +13351,18 @@ private final class ScriptFixture {
         """
     }
 
-    /// Shell function for a fake: `receipt_lock_state <what>` appends
-    /// "<what> held", "<what> free" or "<what> absent" to receipt-lock.log:
-    /// whether someone holds the receipt's lock at that moment, asked
-    /// without waiting and without creating the file.
+    /// Shell function for a fake: `receipt_lock_state <what> [<log>]`
+    /// appends "<what> held", "<what> free" or "<what> absent" to
+    /// receipt-lock.log, or to <log>: whether someone holds the receipt's
+    /// lock at that moment, asked without waiting and without creating the
+    /// file.
     func receiptLockHere() -> String {
         """
         receipt_lock_state() {
           local s
           /usr/bin/lockf -k -n -s -t 0 "\(receipt)" /usr/bin/true 2>/dev/null
           case $? in 0) s=free ;; 75) s=held ;; 69) s=absent ;; *) s=unknown ;; esac
-          echo "$1 $s" >> "\(root.path)/receipt-lock.log"
+          echo "$1 $s" >> "${2:-\(root.path)/receipt-lock.log}"
         }
         """
     }
@@ -12901,6 +13376,37 @@ private final class ScriptFixture {
     /// What receipt-lock.log holds, one line per record.
     func receiptLockStates() -> [String] {
         ((try? String(contentsOf: root.appendingPathComponent("receipt-lock.log"), encoding: .utf8)) ?? "").split(separator: "\n").map(String.init)
+    }
+
+    /// What print-lock.log holds: one "launchctl print <state>" line per
+    /// print of the fake launchctl (see receiptLockHere).
+    func printLockStates() -> [String] {
+        ((try? String(contentsOf: root.appendingPathComponent("print-lock.log"), encoding: .utf8)) ?? "").split(separator: "\n").map(String.init)
+    }
+
+    /// What the fake launchctl's prints answer, in order, the last one from
+    /// then on (launchctl.print-answers, see writeFakes).
+    func setPrintAnswers(_ answers: [String]) throws {
+        try (answers.joined(separator: "\n") + "\n").write(to: root.appendingPathComponent("launchctl.print-answers"), atomically: true, encoding: .utf8)
+    }
+
+    /// Makes the next `launchctl <call>` start a start of another Insomnia
+    /// folder that loads its agent from `agent` once it has the receipt's
+    /// lock and claims the receipt with `nonce` (foreign-start.at, see
+    /// writeFakes).
+    func startElsewhere(at call: String, agent: String, nonce: String) throws {
+        try nonce.write(to: root.appendingPathComponent("claim.nonce"), atomically: true, encoding: .utf8)
+        try (agent + "\n").write(to: root.appendingPathComponent("foreign-start.path"), atomically: true, encoding: .utf8)
+        try call.write(to: root.appendingPathComponent("foreign-start.at"), atomically: true, encoding: .utf8)
+    }
+
+    /// Waits up to `seconds` for that start to be over, and returns what
+    /// it saw once it had the lock (foreign-start.saw), or nil.
+    func startElsewhereSaw(within seconds: TimeInterval) -> String? {
+        let deadline = Date(timeIntervalSinceNow: seconds)
+        while !exists(root.appendingPathComponent("foreign-start.done")) && Date() < deadline { Thread.sleep(forTimeInterval: 0.05) }
+        guard exists(root.appendingPathComponent("foreign-start.done")) else { return nil }
+        return (try? String(contentsOf: root.appendingPathComponent("foreign-start.saw"), encoding: .utf8))?.trimmingCharacters(in: .newlines)
     }
 
     /// Points `script`'s LOCKF at a wrapper around the real lockf. The first
@@ -13785,6 +14291,8 @@ private final class ScriptRow: @unchecked Sendable {
     let args: [String]
     let environment: [String: String]
     private(set) var result: Result<(status: Int32, stdout: String, stderr: String), Error>?
+    /// How long the run took, in awake time (the Mac can sleep during it).
+    private(set) var seconds: TimeInterval?
 
     init(_ label: String, _ fixture: ScriptFixture, _ script: URL, _ args: [String] = []) {
         self.label = label
@@ -13795,7 +14303,9 @@ private final class ScriptRow: @unchecked Sendable {
     }
 
     func run() {
+        let started = ProcessInfo.processInfo.systemUptime
         result = Result { try fixture.run(script, args, environment: environment) }
+        seconds = ProcessInfo.processInfo.systemUptime - started
     }
 
     /// The run's result; fails the test for a row that did not run or
@@ -13841,7 +14351,8 @@ private final class RowQueue: @unchecked Sendable {
 /// child's environment was its own fixture's. A test hands it only rows
 /// whose run touches nothing outside their own fixture and whose outcome
 /// does not depend on time: no limit it is meant to reach, and no time the
-/// test measures.
+/// test measures. Prints each row's time, so a log shows how long every
+/// variant took.
 private func runTwoAtATime(_ rows: [ScriptRow], file: StaticString = #filePath, line: UInt = #line) {
     let queue = RowQueue(rows)
     let group = DispatchGroup()
@@ -13856,6 +14367,9 @@ private func runTwoAtATime(_ rows: [ScriptRow], file: StaticString = #filePath, 
         }
     }
     group.wait()
+    for row in rows {
+        print("row \(row.label): \(row.seconds.map { String(format: "%.3f", $0) } ?? "did not run") s")
+    }
     XCTAssertLessThanOrEqual(queue.mostAtOnce, 2, file: file, line: line)
     XCTAssertEqual(rows.filter { $0.result == nil }.map(\.label), [], "rows that did not run", file: file, line: line)
     for row in rows {

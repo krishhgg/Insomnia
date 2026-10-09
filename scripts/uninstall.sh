@@ -17,7 +17,14 @@
 # with nothing removed. While sleep is off or Low Power Mode is on for
 # battery, or either cannot be read, another folder may still owe a restore
 # the rule makes: the rule, the receipt and the bundle then stay, only this
-# folder's LaunchAgent and journal go, and the run ends with status 1.
+# folder's LaunchAgent and journal go, and the run ends with status 1. The
+# same happens while the recovery agent launchd has loaded under the label
+# every folder shares is another folder's (launchctl print names the file
+# it was loaded from): that agent stays loaded. One whose file cannot be
+# told stops the run with nothing removed. The receipt's lock is kept until
+# the rule, the receipt and the bundle are gone, or to the end of the run
+# when they stay, so no start of another folder claims the receipt, and
+# loads its agent, between the checks and the bootout.
 # Every command it runs as root goes through `sudo -n` with the same time
 # limit as its other calls (see as_root). Keeps config.json
 # and the logs unless --purge. Everything after the quit happens while this
@@ -2108,6 +2115,12 @@ list_unrecorded_app_nap
 # battery (read_owed_power), or either cannot be read, another folder may
 # still owe one. Then this run keeps the rule, the receipt, its release
 # file and the bundle, removes only this folder's own files, and says so.
+# It does the same while another folder's recovery agent is loaded
+# (loaded_agent), which runs the bundle's backstop.sh and needs the rule,
+# and leaves that agent loaded. Either way it keeps the receipt's lock to
+# the end, as when it removes them: a start claims the receipt under that
+# lock before it loads its agent, so none can load one between the check
+# and the bootout.
 RECEIPT="$RECEIPTS/$UID_NUM"
 RELEASED="$RECEIPT.released"
 # This folder's record that its uninstall is removing the receipt and its
@@ -2442,6 +2455,85 @@ read_owed_power() {
     owed_why="pmset -g custom reports lowpowermode ${pmset_value:-with no value} under Battery Power, neither 0 nor 1, so whether Low Power Mode is on is unknown"
   fi
 }
+# Whether $1, the file launchd says the agent was loaded from, is this
+# folder's: its plist, or a candidate with the label's candidate prefix in
+# its staging directory or, for older builds, beside the plist (the names
+# remove_plists removes). A candidate is renamed over the plist after the
+# load, so the file itself may be gone; the folder it was in is compared
+# with $LAUNCH_AGENTS by path, else by device and inode, so another
+# spelling of this folder (a link, /var for /private/var) is still its own.
+own_agent_file() { # path
+  local dir="${1%/*}" here there
+  case "${1##*/}" in
+    "$LABEL.plist") ;;
+    "$LABEL.candidate-"*)
+      if [[ "${dir##*/}" == ".$LABEL.staging" ]]; then dir="${dir%/*}"; fi ;;
+    *) return 1 ;;
+  esac
+  [[ "$dir" != "$LAUNCH_AGENTS" ]] || return 0
+  here="$("$STAT" -L -f '%d:%i' "$LAUNCH_AGENTS" 2>/dev/null)" || return 1
+  there="$("$STAT" -L -f '%d:%i' "$dir" 2>/dev/null)" || return 1
+  [[ -n "$here" && "$here" == "$there" ]]
+}
+# Whose recovery agent launchd has loaded. Every Insomnia folder of this
+# user loads its agent under the one label, so launchd holds one such job
+# for the user, from whichever folder loaded it last, and `launchctl print`
+# names the file it was loaded from on its `path =` line (one tab in, like
+# every top-level key it prints; see LaunchdBackstop.loadedJob). Sets
+# agent_seen to none (print exited 113: nothing is loaded under the label),
+# own (loaded from a file of this folder, own_agent_file), other (from any
+# other file: another folder's agent, which this run leaves loaded) or
+# unknown (print failed or did not answer, or it names no such file, more
+# than one, or one that is not an absolute path), agent_path to the file,
+# and agent_why to why it is unknown.
+loaded_agent() {
+  local rc=0 rest line prefix=$'\tpath = ' count=0 path=""
+  agent_seen=unknown; agent_path=""; agent_why=""
+  bounded "$LAUNCHCTL" print "gui/$UID_NUM/$LABEL" || rc=$?
+  case "$rc" in
+    113) agent_seen=none; return 0 ;;
+    0) ;;
+    124) agent_why="'launchctl print gui/$UID_NUM/$LABEL' did not answer within ${CALL_TIMEOUT_SECONDS}s"; return 0 ;;
+    *) agent_why="'launchctl print gui/$UID_NUM/$LABEL' exited $rc"; return 0 ;;
+  esac
+  rest="$BOUNDED_OUTPUT"$'\n'
+  while [[ -n "$rest" ]]; do
+    line="${rest%%$'\n'*}"; rest="${rest#*$'\n'}"
+    if [[ "$line" == "$prefix"* ]]; then
+      path="${line#"$prefix"}"
+      count=$(( count + 1 ))
+    fi
+  done
+  if (( count != 1 )) || [[ "$path" != /* ]]; then
+    agent_why="'launchctl print gui/$UID_NUM/$LABEL' lists the job but not one absolute path it was loaded from"
+    return 0
+  fi
+  agent_path="$path"
+  if own_agent_file "$path"; then agent_seen=own; else agent_seen=other; fi
+}
+# Stops the run when loaded_agent could not tell whose agent is loaded:
+# booting it out could unload another folder's, and leaving it could leave
+# this folder's. Nothing was removed yet.
+stop_unknown_agent() {
+  "$CAT" >&2 <<MSG
+
+Uninstall stopped BEFORE removing anything: $agent_why, so whether the recovery agent loaded as $LABEL is this folder's or another Insomnia folder's is unknown.
+The LaunchAgent, $SUDOERS, $APP, the receipt and the journal were kept.
+Rerun this script once 'launchctl print gui/$UID_NUM/$LABEL' answers.
+MSG
+  exit 1
+}
+# Another folder's agent is loaded: it stays loaded, and the rule, the
+# receipt and the bundle it runs stay with it (keep_shared).
+agent_kept=0
+keep_for_other_agent() {
+  keep_shared=1
+  if (( ! agent_kept )); then
+    kept_why="${kept_why:+$kept_why, and }the recovery agent loaded as $LABEL is another Insomnia folder's ($agent_path)"
+  fi
+  agent_kept=1
+  echo "kept for another Insomnia folder of this user: the recovery agent loaded as $LABEL comes from $agent_path, not from $LAUNCH_AGENTS; it stays loaded, and $SUDOERS, the receipt and $APP, which it runs, stay"
+}
 
 step "Checking the receipt every Insomnia folder of this user shares"
 if ! lock_standard; then
@@ -2476,16 +2568,26 @@ case "$shared_seen" in
   *) echo "no start claims $RECEIPT; it stays locked until the rule, the receipt and the bundle are gone" ;;
 esac
 # keep_shared=1: the rule, the receipt, its release file and the bundle
-# stay, and step 5 removes only this folder's own files.
+# stay, and step 5 removes only this folder's own files; kept_why says
+# why. The receipt stays locked through both checks below, and then until
+# the bundle is gone, or to the end of the run when the shared files stay.
 keep_shared=0
+kept_why=""
 read_owed_power
 if [[ -n "$owed_why" ]]; then
   keep_shared=1
-  unlock_receipt
+  kept_why="$owed_why"
   echo "kept for another Insomnia folder of this user: $owed_why, so a restore the sudoers rule runs may still be owed; $SUDOERS, the receipt and $APP stay"
 else
   echo "sleep is not off and Low Power Mode is not on for battery: no restore the sudoers rule runs is owed"
 fi
+loaded_agent
+case "$agent_seen" in
+  none) echo "no recovery agent is loaded as $LABEL" ;;
+  own) echo "the recovery agent loaded as $LABEL is this folder's ($agent_path)" ;;
+  other) keep_for_other_agent ;;
+  *) stop_unknown_agent ;;
+esac
 
 # 5. Remove, still under the lock -------------------------------------------
 # Every command step 5 runs as root goes through as_root: `sudo -n`, run by
@@ -2580,29 +2682,62 @@ fi
 # runs, so nothing is left to reopen the journal once the files go. Then
 # prove the job is really gone; if launchd still lists it, stop here with
 # every recovery file intact. The label is the same for every Insomnia
-# folder, so launchd unloads whichever folder's agent holds it; another
-# folder's app loads its own again at its next launch.
+# folder, and a bootout unloads whichever folder's agent holds it, so this
+# run boots it out only when it is this folder's, asked again just before.
+# The receipt is still locked, so no start of another folder loads its
+# agent in between. launchctl cannot unload a job only if it still comes
+# from a given file: an agent another folder's app loads between this print
+# and the bootout without the receipt (an extend, an end or a relaunch of
+# a folder other than this one and the standard one, whose recovery locks
+# this run holds) is unloaded instead, and that app loads it again at its
+# next transaction.
 step "Removing LaunchAgent"
-bootout_rc=0
-bounded "$LAUNCHCTL" bootout "gui/$UID_NUM" "$PLIST" || bootout_rc=$?
-# `launchctl print` exits 113 only when the service is not loaded; 0 means
-# still loaded and anything else means launchd could not be asked. 124 from
-# either call means it did not answer within CALL_TIMEOUT_SECONDS.
-print_rc=0
-bounded "$LAUNCHCTL" print "gui/$UID_NUM/$LABEL" || print_rc=$?
-if (( print_rc != 113 )); then
-  if (( print_rc == 0 )); then
-    echo "launchctl bootout exited $bootout_rc and $LABEL is still loaded in gui/$UID_NUM." >&2
-  elif (( print_rc == 124 )); then
-    echo "launchctl bootout exited $bootout_rc and 'launchctl print' did not answer within ${CALL_TIMEOUT_SECONDS}s; cannot tell whether $LABEL is still loaded." >&2
-  else
-    echo "launchctl bootout exited $bootout_rc and 'launchctl print' exited $print_rc; cannot tell whether $LABEL is still loaded." >&2
-  fi
-  echo "Nothing was removed. Run 'launchctl bootout gui/$UID_NUM $PLIST' yourself, then rerun." >&2
-  exit 1
-fi
-(( bootout_rc != 0 )) || agent_out=1
-echo "$LABEL is not loaded"
+loaded_agent
+case "$agent_seen" in
+  none) echo "$LABEL is not loaded" ;;
+  other)
+    if (( ! keep_shared )); then
+      "$CAT" >&2 <<MSG
+
+Uninstall stopped BEFORE removing anything: the recovery agent of another Insomnia folder was loaded as $LABEL ($agent_path) after the check above, and it was left loaded.
+The LaunchAgent, $SUDOERS, $APP, the receipt and the journal were kept. Rerun this script.
+MSG
+      exit 1
+    fi
+    keep_for_other_agent ;;
+  own)
+    bootout_rc=0
+    bounded "$LAUNCHCTL" bootout "gui/$UID_NUM" "$PLIST" || bootout_rc=$?
+    # loaded_agent's print exits 113 only when the service is not loaded;
+    # 0 means still loaded and anything else means launchd could not be
+    # asked. 124 from either call means it did not answer within
+    # CALL_TIMEOUT_SECONDS.
+    loaded_agent
+    case "$agent_seen" in
+      none)
+        (( bootout_rc != 0 )) || agent_out=1
+        echo "$LABEL is not loaded" ;;
+      own)
+        echo "launchctl bootout exited $bootout_rc and $LABEL is still loaded in gui/$UID_NUM." >&2
+        echo "Nothing was removed. Run 'launchctl bootout gui/$UID_NUM $PLIST' yourself, then rerun." >&2
+        exit 1 ;;
+      other)
+        # This folder's agent went; another folder's was loaded after it.
+        # Its journal is clean (step 4), so it has nothing to restore, and
+        # it cannot be loaded beside the other one.
+        if (( ! keep_shared )); then
+          echo "launchctl bootout exited $bootout_rc, and then the recovery agent of another Insomnia folder was loaded as $LABEL ($agent_path); it was left loaded." >&2
+          echo "Nothing was removed. This folder's agent is not loaded again beside it. Rerun this script." >&2
+          exit 1
+        fi
+        keep_for_other_agent ;;
+      *)
+        echo "launchctl bootout exited $bootout_rc and $agent_why; cannot tell whether $LABEL is still loaded." >&2
+        echo "Nothing was removed. Run 'launchctl bootout gui/$UID_NUM $PLIST' yourself, then rerun." >&2
+        exit 1 ;;
+    esac ;;
+  *) stop_unknown_agent ;;
+esac
 # The plist and the candidate plists install.sh and the app write before a
 # load and rename into place after it: in the staging directory beside the
 # plist, and in $LAUNCH_AGENTS itself for older builds. Only files with the
@@ -2777,7 +2912,10 @@ if (( keep_shared )); then
   "$CAT" >&2 <<MSG
 
 Done with this folder, but $SUDOERS, the receipt and its release file in
-$RECEIPTS, and $APP were kept: $owed_why.
+$RECEIPTS, and $APP were kept: $kept_why.
+MSG
+  if [[ -n "$owed_why" ]]; then
+    "$CAT" >&2 <<MSG
 Another Insomnia folder of this user may still owe that restore, and its
 app or recovery agent needs them to make it. Rerun this script once it is
 done to remove them. If the setting is your own or another tool's and no
@@ -2785,6 +2923,17 @@ Insomnia folder of yours has a session, switch it back (sleep: sudo pmset
 -a disablesleep 0; Low Power Mode: System Settings > Battery), rerun this
 script, and set it again afterwards.
 MSG
+  fi
+  if (( agent_kept )); then
+    "$CAT" >&2 <<MSG
+That agent runs the backstop.sh sealed in $APP, which needs the rule to
+turn sleep back on, so it was left loaded. Uninstall that Insomnia folder
+first (uninstall.sh with INSOMNIA_HOME set as that folder's app had it, or
+unset for the standard folder), then rerun this script. If that folder is
+gone, unload its agent yourself (launchctl bootout gui/$UID_NUM/$LABEL)
+and rerun.
+MSG
+  fi
   exit 1
 fi
 (( remove_failures == 0 )) || exit 1

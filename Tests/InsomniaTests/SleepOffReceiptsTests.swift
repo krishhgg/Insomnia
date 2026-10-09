@@ -2307,7 +2307,7 @@ final class SleepOffSettlementTests: XCTestCase {
     /// first rewrites the marker in place (the same inode) to the bare
     /// nonce, round 21's forgery.
     private func failAfterTheWrite(_ fake: FakeDialogMachine, forge: Bool) throws {
-        var script = try String(contentsOf: fake.pmset, encoding: .utf8)
+        var script = try FakeTool.text(at: fake.pmset.path)
         let marker = quote(h.home.paths.pendingStartFile.path)
         let dir = quote(fake.dir.path)
         let old = "\"-a disablesleep 1\") printf 1 > '\(fake.dir.appendingPathComponent("sleep-disabled").path)' ;;"
@@ -2321,8 +2321,7 @@ final class SleepOffSettlementTests: XCTestCase {
         """
         XCTAssertTrue(script.contains(old))
         script = script.replacingOccurrences(of: old, with: injected)
-        try script.write(to: fake.pmset, atomically: true, encoding: .utf8)
-        XCTAssertEqual(chmod(fake.pmset.path, 0o755), 0)
+        try FakeTool.write(script, at: fake.pmset.path)
     }
 
     private func machine(_ name: String) throws -> FakeDialogMachine {
