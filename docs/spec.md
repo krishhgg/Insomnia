@@ -1267,8 +1267,10 @@ Backstop, independent of the app:
   launched before the next agent run with `SleepDisabled 1` (the restore
   failed, or something else set it) resumes a session whose end recorded
   nothing, because nothing on disk tells that end from a crash; the next
-  agent run treats it as any live session. An end stopped before the first
-  byte of its record (a crash or a kill there) records nothing either.
+  agent run treats it as any live session. An end stopped before any record
+  of it counts (a crash or a kill before `session.json` is removed and before
+  a record is whole, or before the first byte of one in the lock file)
+  records nothing either.
   Every writer records an end before it undoes anything, so sleep is still
   held then, and a relaunch before the next agent run resumes the session
   as after a crash: a check that still fails (the deadline, a floor, heat)

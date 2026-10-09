@@ -456,11 +456,13 @@ while its `session.json` cannot be replaced. Once `session.json` can be
 replaced and `state.json` written again, an app launched before the next agent
 run resumes a session ended with nothing recorded if sleep still reads as
 disabled (the restore failed, or something else disabled sleep), because
-nothing on disk tells that end from a crash. An end stopped before the first
-byte of its record has undone nothing yet, so a relaunch before the next agent
-run resumes that session too, and an end you asked for is lost. Both cases are
-open limits, not accepted ones. Otherwise the session stands until its
-deadline, and sessions are capped at 24 hours by default (`maxDuration`).
+nothing on disk tells that end from a crash. An end stopped before any record
+of it counts (before `session.json` is removed and before a record is whole, or
+before the first byte of one in the lock file) has undone nothing yet, so a
+relaunch before the next agent run resumes that session too, and an end you
+asked for is lost. Both cases are open limits, not accepted ones. Otherwise the
+session stands until its deadline, and sessions are capped at 24 hours by
+default (`maxDuration`).
 
 The app and backstop use the same lock so they do not restore and rewrite the
 journal over one another. Failed restoration keeps the relevant entries;

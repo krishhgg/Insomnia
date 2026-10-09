@@ -1069,6 +1069,16 @@ final class CutoffAgreementTests: XCTestCase {
             case .unreadable: "state.json unreadable"
             }
         }
+
+        /// Whether the journal records the session's sleep hold
+        /// (journalBase does), so an end restores sleep. With no journal
+        /// the agent has no hold recorded to undo.
+        var holdsSleep: Bool {
+            switch self {
+            case .record: true
+            case .missing, .dangling, .unreadable: false
+            }
+        }
     }
 
     private static let journalBase = #"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false"#
@@ -1109,20 +1119,24 @@ final class CutoffAgreementTests: XCTestCase {
         let record: AgentCutoffs?
     }
 
-    /// Makes `policyRun`s and remembers what each should do.
+    /// Makes `policyRun`s and remembers what each should do. A run that
+    /// stops on the journal (`ends` nil) stops before it asks the binary,
+    /// so it logs no line about the binary.
     private func policyCase(_ name: String, config: Data?, journal: JournalForm, battery: Int, level: Int,
                             breakIt: (why: String, breakIt: (PatchedBackstop) throws -> Void)?, ends: Bool?,
                             logs: [String]) throws -> PolicyCase {
         let run = try policyRun(name, config: config, journal: journal, battery: battery, level: level, breakIt: breakIt?.breakIt)
         let record = try? Store(paths: run.paths).loadState()?.sessionCutoffs
         let label = "\(name): \(journal), \(battery)%, level \(level), \(breakIt?.why ?? "the binary answers")"
-        return PolicyCase(run: run, label: label, journal: journal, ends: ends, logs: (breakIt.map { [$0.why] } ?? []) + logs, record: record ?? nil)
+        let why = ends == nil ? [] : breakIt.map { [$0.why] } ?? []
+        return PolicyCase(run: run, label: label, journal: journal, ends: ends, logs: why + logs, record: record ?? nil)
     }
 
     /// Runs the cases, at most eight at a time, and checks each: the exit
     /// status, whether session.json is gone, that sleep is restored only
-    /// with it, that the record the app reads in a journal it loads is the
-    /// one there before the run, and the log lines named. Returns the logs.
+    /// with it and only when the journal holds the sleep hold, that the
+    /// record the app reads in a journal it loads is the one there before
+    /// the run, and the log lines named. Returns the logs.
     @discardableResult
     private func runPolicyCases(_ cases: [PolicyCase]) async throws -> [String] {
         let results = try await SeparateRun.runAll(cases.map(\.run))
@@ -1136,7 +1150,7 @@ final class CutoffAgreementTests: XCTestCase {
             if let ends = c.ends {
                 XCTAssertEqual(result.status, 0, "\(c.label): \(log)")
                 XCTAssertEqual(result.ended, ends, "\(c.label): \(log)")
-                XCTAssertEqual(c.run.agent.calls.contains(c.run.agent.restoreCall), ends, "\(c.label): \(c.run.agent.calls.joined(separator: "\n"))")
+                XCTAssertEqual(c.run.agent.calls.contains(c.run.agent.restoreCall), ends && c.journal.holdsSleep, "\(c.label): \(c.run.agent.calls.joined(separator: "\n"))")
             } else {
                 XCTAssertEqual(result.status, 1, "\(c.label): \(log)")
                 XCTAssertFalse(result.ended, "\(c.label): \(log)")

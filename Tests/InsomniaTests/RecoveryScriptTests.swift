@@ -4724,13 +4724,13 @@ final class RecoveryScriptTests: XCTestCase {
     /// where plutil would read and republish the other copy; a whole number
     /// written with a fraction or an exponent that a Double does not hold,
     /// or one a Double rounds to whole; what plutil cannot parse even under
-    /// a key the app does not read (a leading zero). A record twice, or
-    /// with an escape JSON does not have, leaves the journal loading in the
-    /// scripts too. On every journal both accept, the agent's reader and
-    /// the binary give the same record, except a record twice, which the
-    /// reader takes as foreign and the binary as the app's first copy. The
-    /// journals the app writes now and wrote before (frozenPids, no record)
-    /// pass.
+    /// a key the app does not read (a leading zero). A record twice, with
+    /// an escape JSON does not have, or written as 1., leaves the journal
+    /// loading in the scripts too. On every journal both accept, the
+    /// agent's reader and the binary give the same record, except a record
+    /// twice, which the reader takes as foreign and the binary as the app's
+    /// first copy. The journals the app writes now and wrote before
+    /// (frozenPids, no record) pass.
     func testTheAppTheBinaryAndBothScriptsAcceptTheSameJournals() throws {
         let b = backslash
         var full = RuntimeState()
@@ -4804,6 +4804,7 @@ final class RecoveryScriptTests: XCTestCase {
             ("a key twice, once with a Kelvin sign", "{\"saved\u{212A}eyboardBrightness\":\"bad\",\"savedKeyboardBrightness\":0.5}", false, false),
             ("a record twice", #"{"sessionCutoffs":"30 false","sessionCutoffs":"0 true"}"#, true, true),
             ("a record with an escape JSON does not have", #"{"sessionCutoffs":"3\#(b)x30 false"}"#, true, true),
+            ("a record written as 1.", #"{"sessionCutoffs":1.}"#, true, true),
             ("a bad escape under another key", #"{"note":"\#(b)x41"}"#, true, true),
             ("values the app skips", #"{"note":[1.,-.5,2.e3,1e-400,"\#(b)x41\#(b)'",{"\#(b)x41":1}],"frozenProcesses":[{"pid":1,"x":0.,"y":"\#(b)x41"}],"sessionCutoffs":"0 true"}"#, true, true),
             ("+1 under another key", #"{"note":+1}"#, false, false),
@@ -4991,6 +4992,7 @@ final class RecoveryScriptTests: XCTestCase {
              "record: sessionCutoffs is a string with an escape JSON does not have, which the app does not read\n", true),
             ("a record written as +1", utf8(#"{"sessionCutoffs":+1}"#),
              "sessionCutoffs is written as +1, which is not a JSON value the app reads\n", false),
+            ("a record written as 1.", utf8(#"{"sessionCutoffs":1.}"#), "", true),
             ("one key in two objects", utf8(#"{"a":{"x":1},"b":{"x":2}}"#), "", true),
             ("a Kelvin sign spelling a key twice", utf8("{\"saved\u{212A}eyboardBrightness\":\"bad\",\"savedKeyboardBrightness\":0.5}"),
              "savedKeyboardBrightness is in the top level of state.json 2 times; the app reads the first and plutil the last\n", false),
