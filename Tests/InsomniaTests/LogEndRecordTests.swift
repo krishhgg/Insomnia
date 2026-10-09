@@ -198,7 +198,7 @@ final class LogEndRecordTests: XCTestCase {
         for (i, c) in cases.enumerated() {
             let paths = runs[i].paths
             if c.shape == .writeOnly { try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: paths.logFile.path) }
-            let log = c.shape == .file ? runs[i].log : ""
+            let log = try c.shape == .file ? runs[i].log : ""
             XCTAssertEqual(results[i].status, 0, "\(c.name): \(log)")
             XCTAssertEqual(results[i].ended, c.ends, "the agent: \(c.name): \(log)")
             XCTAssertEqual(runs[i].agent.calls.contains("pmset -g batt"), !c.ends, "\(c.name): checked only when not ended")

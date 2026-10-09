@@ -235,7 +235,8 @@ final class RecoveryScriptTests: XCTestCase {
                 XCTAssertEqual(try String(contentsOf: fx.state, encoding: .utf8), journal, label)
                 XCTAssertEqual(try fx.contents(of: fx.home).filter { $0.hasPrefix("ended-session") }, [], label)
                 XCTAssertEqual(((try? fx.contents(of: fx.logFile.deletingLastPathComponent())) ?? []).filter { $0.hasPrefix("ended-session") }, [], label)
-                XCTAssertFalse(String(decoding: (try? Data(contentsOf: fx.lock)) ?? Data(), as: UTF8.self).contains("ended-session-v1"), label)
+                let lockBytes = fx.exists(fx.lock) ? try Data(contentsOf: fx.lock) : Data()
+                XCTAssertFalse(String(decoding: lockBytes, as: UTF8.self).contains("ended-session-v1"), label)
                 XCTAssertFalse(calls().contains { $0.hasPrefix("sudo") || $0.hasPrefix("kill") }, "\(label): \(calls())")
                 XCTAssertTrue(fx.log().contains("is unreadable or malformed; nothing undone, evidence kept"), "\(label): \(fx.log())")
                 XCTAssertTrue(fx.log().contains("\(fx.session.path) is kept as it is: \(mode.kept) while"), "\(label): \(fx.log())")
@@ -4856,7 +4857,7 @@ final class RecoveryScriptTests: XCTestCase {
     /// the app reads as no record (an object, 1., a \x escape), foreign.
     /// The journals the app writes now and wrote before (frozenPids, no
     /// record) pass.
-    func testTheAppTheBinaryAndBothScriptsAcceptTheSameJournals() throws {
+    func testTheAppTheBinaryAndBothScriptsAcceptTheSameJournals() async throws {
         let b = backslash
         var full = RuntimeState()
         full.sleepDisabledByUs = true
@@ -4972,17 +4973,31 @@ final class RecoveryScriptTests: XCTestCase {
 
             """
         // Prints per journal "refused", or "accepted", the journal the
-        // script read (state or view), and for backstop.sh the record.
-        func check(_ script: String, functions: [String], loop: String) throws -> [String] {
+        // script read (state or view), and for backstop.sh the record. Each
+        // script reads the journals in `parts` runs, each over folders of
+        // its own; both scripts' runs go at once (runAll), and their lines
+        // are put back in the journals' order.
+        let parts = 4
+        let size = (states.count + parts - 1) / parts
+        let chunks = stride(from: 0, to: states.count, by: size).map { Array(states[$0..<min($0 + size, states.count)]) }
+        func launches(_ script: String, functions: [String], loop: String) throws -> [ScriptFixture.Launch] {
             let runner = f.root.appendingPathComponent("accept.\(script)")
             try (setup + Self.readerBlock(script) + "\n" + Self.scriptFunctions(functions, script: script) + "\n" + loop)
                 .write(to: runner, atomically: true, encoding: .utf8)
-            let r = try f.run(runner, states.map(\.path))
-            XCTAssertEqual(r.status, 0, "\(script): \(r.stderr)")
-            XCTAssertEqual(r.stderr, "", script)
-            return r.stdout.split(separator: "\n").map(String.init)
+            return chunks.map { f.launch(runner, $0.map(\.path)) }
         }
-        let agent = try check("backstop.sh", functions: ["extract", "type_of", "journal_shape_problems", "check_journal", "journal_cutoffs"], loop: """
+        func lines(_ script: String, _ results: ArraySlice<(status: Int32, stdout: String, stderr: String)>) -> [String] {
+            var printed: [String] = []
+            for (chunk, r) in zip(chunks, results) {
+                XCTAssertEqual(r.status, 0, "\(script): \(r.stderr)")
+                XCTAssertEqual(r.stderr, "", script)
+                let part = r.stdout.split(separator: "\n").map(String.init)
+                XCTAssertEqual(part.count, chunk.count, "\(script): \(r.stdout)")
+                printed += part
+            }
+            return printed
+        }
+        let agentRuns = try launches("backstop.sh", functions: ["extract", "type_of", "journal_shape_problems", "check_journal", "journal_cutoffs"], loop: """
             lock_shared=0
             for STATE in "$@"; do
               APP_SUPPORT="${STATE%/*}"
@@ -5000,7 +5015,7 @@ final class RecoveryScriptTests: XCTestCase {
             done
 
             """)
-        let uninstall = try check("uninstall.sh", functions: ["extract", "extract_json", "type_of", "journal_shape_problems", "is_refused", "journal_view", "journal_problems"], loop: """
+        let uninstallRuns = try launches("uninstall.sh", functions: ["extract", "extract_json", "type_of", "journal_shape_problems", "is_refused", "journal_view", "journal_problems"], loop: """
             for STATE in "$@"; do
               SESSION="${STATE%/*}/session.json"
               WORK="${STATE%/*}/uninstall"
@@ -5016,6 +5031,9 @@ final class RecoveryScriptTests: XCTestCase {
             done
 
             """)
+        let results = try await ScriptFixture.runAll(agentRuns + uninstallRuns)
+        let agent = lines("backstop.sh", results[..<agentRuns.count])
+        let uninstall = lines("uninstall.sh", results[agentRuns.count...])
         XCTAssertEqual(agent.count, table.count)
         XCTAssertEqual(uninstall.count, table.count)
         for (i, row) in table.enumerated() where i < agent.count && i < uninstall.count {
@@ -5674,16 +5692,19 @@ final class RecoveryScriptTests: XCTestCase {
 
     // MARK: - Microsecond identity through the app binary
 
-    private func writeMicrosecondEntry(pid: Int, started: Int, micros: Int, boot: String? = nil, extra: String = "") throws {
-        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
-        try fx.writeState("""
+    /// On `f`, or on `fx` when nil.
+    private func writeMicrosecondEntry(pid: Int, started: Int, micros: Int, boot: String? = nil, extra: String = "", on f: ScriptFixture? = nil) throws {
+        let target: ScriptFixture = f ?? fx
+        try target.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        try target.writeState("""
         {"sleepDisabledByUs":false,"lowPowerSetByUs":false,"dockerFrozen":true,
-         "frozenProcesses":[{"pid":\(pid),"startedAt":\(started),"startedAtMicros":\(micros),"bootSession":"\(boot ?? fx.bootUUID)"\(extra)}]}
+         "frozenProcesses":[{"pid":\(pid),"startedAt":\(started),"startedAtMicros":\(micros),"bootSession":"\(boot ?? target.bootUUID)"\(extra)}]}
         """)
     }
 
-    private func onlyFrozenEntry() throws -> [String: Any]? {
-        (try fx.stateJSON()["frozenProcesses"] as? [[String: Any]])?.first
+    private func onlyFrozenEntry(on f: ScriptFixture? = nil) throws -> [String: Any]? {
+        let target: ScriptFixture = f ?? fx
+        return (try target.stateJSON()["frozenProcesses"] as? [[String: Any]])?.first
     }
 
     /// Polls `condition` every 0.05 s; false if it does not hold within
@@ -5827,8 +5848,9 @@ final class RecoveryScriptTests: XCTestCase {
     /// The answer is checked whole. A word the shell does not know, a known
     /// word with the wrong exit status, the wrong pid, anything before or
     /// after the word, or a missing or extra line is not acted on: the entry
-    /// is kept, nothing is signaled, and the log carries the answer.
-    func testUnexpectedAppBinaryAnswerKeepsTheEntry() throws {
+    /// is kept, nothing is signaled, and the log carries the answer. Each
+    /// answer runs on a fixture of its own, several at a time.
+    func testUnexpectedAppBinaryAnswerKeepsTheEntry() async throws {
         let cases: [(output: String, status: Int)] = [
             ("5105 bogus\n", 0),
             ("5105 resumed\n", 1),
@@ -5848,24 +5870,30 @@ final class RecoveryScriptTests: XCTestCase {
             ("5105 resumed\r\n", 0),
             ("05105 resumed\n", 0),
         ]
+        // One fixture per answer; the runs go several at a time.
+        var fixtures: [ScriptFixture] = []
+        defer { fixtures.forEach { $0.destroy() } }
         for (output, status) in cases {
+            let f = try ScriptFixture.concurrentRow()
+            fixtures.append(f)
+            try writeMicrosecondEntry(pid: 5105, started: 1_789_388_423, micros: 2, on: f)
+            try f.insomniaRaw(output, status: status)
+        }
+
+        let results = try await ScriptFixture.runAll(fixtures.map { $0.launch($0.backstop) })
+
+        for ((output, status), (f, r)) in zip(cases, zip(fixtures, results)) {
             let label = "\(output.debugDescription) exit \(status)"
-            fx.destroy()
-            fx = try ScriptFixture()
-            try writeMicrosecondEntry(pid: 5105, started: 1_789_388_423, micros: 2)
-            try fx.insomniaRaw(output, status: status)
-
-            let r = try fx.run(fx.backstop)
-
             XCTAssertNotEqual(r.status, 0, label)
-            XCTAssertEqual(fx.calls().filter { !$0.hasPrefix("Insomnia --resume-frozen") }, [], label)
-            XCTAssertEqual(try onlyFrozenEntry()?["pid"] as? Int, 5105, label)
-            XCTAssertEqual(try fx.stateJSON()["dockerFrozen"] as? Bool, true, label)
-            XCTAssertTrue(fx.exists(fx.session), label)
-            XCTAssertTrue(fx.log().contains("unexpected answer from \(fx.fakeInsomnia.path) for pid(s) 5105 (exit \(status), output '"), "\(label): \(fx.log())")
+            XCTAssertEqual(f.calls().filter { !$0.hasPrefix("Insomnia --resume-frozen") }, [], label)
+            XCTAssertEqual(try onlyFrozenEntry(on: f)?["pid"] as? Int, 5105, label)
+            XCTAssertEqual(try f.stateJSON()["dockerFrozen"] as? Bool, true, label)
+            XCTAssertTrue(f.exists(f.session), label)
+            XCTAssertTrue(f.log().contains("unexpected answer from \(f.fakeInsomnia.path) for pid(s) 5105 (exit \(status), output '"), "\(label): \(f.log())")
         }
         // Control characters are logged as spaces, on one line.
-        XCTAssertTrue(fx.log().contains("output '05105 resumed '"), fx.log())
+        let last = try XCTUnwrap(fixtures.last)
+        XCTAssertTrue(last.log().contains("output '05105 resumed '"), last.log())
     }
 
     /// Another boot session is settled by the shell: cleared without a
@@ -9903,8 +9931,8 @@ private final class ScriptFixture {
     /// Decoded lossily: the fake launchctl copies the first line of the
     /// installed binary into the log, which is Mach-O bytes, not text, for
     /// the fixture the real codesign signs.
-    func calls() -> [String] {
-        guard let data = try? Data(contentsOf: callsLog) else { return [] }
+    func calls(file: StaticString = #filePath, line: UInt = #line) -> [String] {
+        guard let data = record(callsLog, file: file, line: line) else { return [] }
         return String(decoding: data, as: UTF8.self).split(separator: "\n").map(String.init)
     }
 
@@ -9915,9 +9943,9 @@ private final class ScriptFixture {
         calls().filter { call in !["mktemp", "rm", "rmdir", "mkdir"].contains { call == $0 || call.hasPrefix($0 + " ") } }
     }
 
-    func chmodCalls() -> [String] {
-        guard let text = try? String(contentsOf: root.appendingPathComponent("chmod.calls"), encoding: .utf8) else { return [] }
-        return text.split(separator: "\n").map(String.init)
+    func chmodCalls(file: StaticString = #filePath, line: UInt = #line) -> [String] {
+        guard let data = record(root.appendingPathComponent("chmod.calls"), file: file, line: line) else { return [] }
+        return String(decoding: data, as: UTF8.self).split(separator: "\n").map(String.init)
     }
 
     func clearCalls() {
@@ -9933,13 +9961,21 @@ private final class ScriptFixture {
     /// The backstop's log, or "" when there is none. A log that is there
     /// but cannot be read fails the test instead of reading as empty.
     func log(file: StaticString = #filePath, line: UInt = #line) -> String {
+        String(decoding: record(logFile, file: file, line: line) ?? Data(), as: UTF8.self)
+    }
+
+    /// The bytes of a file a run or a fake writes, or nil when there is
+    /// none. A file that is there but cannot be read fails the test instead
+    /// of reading as missing, so an unread record never passes for no
+    /// calls or no lines.
+    private func record(_ url: URL, file: StaticString, line: UInt) -> Data? {
         do {
-            return String(decoding: try Data(contentsOf: logFile), as: UTF8.self)
+            return try Data(contentsOf: url)
         } catch CocoaError.fileReadNoSuchFile {
-            return ""
+            return nil
         } catch {
-            XCTFail("could not read \(logFile.path): \(error)", file: file, line: line)
-            return ""
+            XCTFail("could not read \(url.path): \(error)", file: file, line: line)
+            return nil
         }
     }
 
@@ -10073,10 +10109,11 @@ private final class ScriptFixture {
     }
 
     /// Runs each launch once, at most `width` at a time, and returns their
-    /// results in order. Each launch belongs to its own fixture, so the runs
-    /// share no file. Every run that started is waited for and reaped, also
-    /// when another fails to start: the group waits for its tasks before it
-    /// throws.
+    /// results in order. The runs share no file they write: each launch
+    /// belongs to its own fixture or works only in folders of its own, as
+    /// the journal acceptance table's do. Every run that started is waited
+    /// for and reaped, also when another fails to start: the group waits for
+    /// its tasks before it throws.
     static func runAll(_ launches: [Launch], width: Int = 8) async throws -> [(status: Int32, stdout: String, stderr: String)] {
         var results = [(status: Int32, stdout: String, stderr: String)](repeating: (-1, "", ""), count: launches.count)
         try await withThrowingTaskGroup(of: (Int, Int32, String, String).self) { group in
@@ -10144,9 +10181,9 @@ private final class ScriptFixture {
     }
 
     /// How many times the scripts called the slow `sleep`.
-    func slowPolls() -> Int {
-        let text = (try? String(contentsOf: root.appendingPathComponent("slow-poll.log"), encoding: .utf8)) ?? ""
-        return text.split(separator: "\n").count
+    func slowPolls(file: StaticString = #filePath, line: UInt = #line) -> Int {
+        String(decoding: record(root.appendingPathComponent("slow-poll.log"), file: file, line: line) ?? Data(), as: UTF8.self)
+            .split(separator: "\n").count
     }
 
     /// Runs a real tool (not a script) with the fixture's environment: the

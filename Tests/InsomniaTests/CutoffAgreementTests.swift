@@ -439,30 +439,48 @@ final class CutoffAgreementTests: XCTestCase {
     /// for the session in state.json, so at 20% both end it, and at 40%,
     /// at critical heat too, both keep it: neither the agent's defaults
     /// (10%, rule on) nor the strictest (95%, rule on) apply. The agent's
-    /// end leaves the record; the app's end of the session clears it.
+    /// end leaves the record; the app's end of the session clears it. Each
+    /// row runs on a home of its own with this session's files, several at
+    /// a time; the last row then runs again on this test's home, so that
+    /// the app sees the agent's end.
     func testAHungSessionKeepsItsRecordedCutoffsWhileConfigIsRejectedOrMissing() async throws {
         let m = try await startWith(endFloor: 30, thermalRules: false)
         let cutoffs = AgentCutoffs(endFloor: 30, thermalRules: false)
         XCTAssertEqual(try recorded(), cutoffs, "Start records them")
         let session = try Data(contentsOf: h.home.paths.sessionFile)
         let journal = try Data(contentsOf: h.home.paths.stateFile)
-        let breaks: [(name: String, breakIt: () throws -> Void)] = [
-            ("rejected", { try self.rejectedConfig.write(to: self.h.home.paths.configFile) }),
-            ("missing", { try? FileManager.default.removeItem(at: self.h.home.paths.configFile) }),
-        ]
-        for (name, breakIt) in breaks {
+        let breaks: [(name: String, config: Data?)] = [("rejected", rejectedConfig), ("missing", nil)]
+        var rows: [(label: String, end: Bool, run: SeparateRun)] = []
+        for (name, config) in breaks {
             for (battery, critical, end) in [(40, true, false), (40, false, false), (31, false, false), (29, false, true), (20, false, true)] {
-                try session.write(to: h.home.paths.sessionFile)
-                try journal.write(to: h.home.paths.stateFile)
-                try breakIt()
-                agent.clearCalls()
                 XCTAssertEqual(appEnds(m, critical: critical, battery: battery), end, "the app at \(battery)%")
-                try agent.setBattery(battery)
-                let ended = try await agentEnds(level: critical ? 3 : 0)
-                XCTAssertEqual(ended, end, "\(name) config.json at \(battery)%, critical \(critical): \(logText())")
-                XCTAssertEqual(try recorded(), cutoffs, "the agent keeps the record")
+                let run = try SeparateRun(in: h, name: "\(name)-\(battery)-\(critical)", config: config ?? Data(), battery: battery,
+                                          level: critical ? 3 : 0, prepare: { _ in }) { paths in
+                    try session.write(to: paths.sessionFile)
+                    try journal.write(to: paths.stateFile)
+                    try config?.write(to: paths.configFile)
+                }
+                rows.append(("\(name) config.json at \(battery)%, critical \(critical)", end, run))
             }
         }
+
+        let results = try await SeparateRun.runAll(rows.map(\.run))
+
+        var logs: [String] = []
+        for (row, result) in zip(rows, results) {
+            let log = try row.run.check(result, row.label)
+            XCTAssertEqual(result.ended, row.end, "\(row.label): \(log)")
+            XCTAssertEqual(try Store(paths: row.run.paths).loadState()?.sessionCutoffs, cutoffs, "the agent keeps the record: \(row.label)")
+            logs.append(log)
+        }
+        XCTAssertTrue(logs.contains { $0.contains("below the 30% end floor") }, logs.joined(separator: "\n"))
+        XCTAssertFalse(logs.contains { $0.contains("enforcing the strictest") }, logs.joined(separator: "\n"))
+
+        try FileManager.default.removeItem(at: h.home.paths.configFile)
+        try agent.setBattery(20)
+        let ended = try await agentEnds(level: 0)
+        XCTAssertTrue(ended, "missing config.json at 20% here: \(logText())")
+        XCTAssertEqual(try recorded(), cutoffs, "the agent keeps the record")
         XCTAssertTrue(logText().contains("below the 30% end floor"), logText())
         XCTAssertFalse(logText().contains("enforcing the strictest"), logText())
 
@@ -478,13 +496,20 @@ final class CutoffAgreementTests: XCTestCase {
     /// reads as none and records its own over, is the defaults too, with
     /// the reason logged. A record found twice, which the app never writes,
     /// is read as the app reads it (the first copy): the binary decodes the
-    /// whole journal.
+    /// whole journal. Each journal runs on a home of its own with this
+    /// session and config.json rejected, several at a time; no state.json
+    /// at all runs here.
     func testTheAgentReadsTheRecordAsTheAppDoes() async throws {
         _ = try await startWith(endFloor: 30, thermalRules: false)
         let session = try Data(contentsOf: h.home.paths.sessionFile)
         let base = #"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false"#
-        let foreign = "\(h.home.paths.configFile.path) is rejected by the app; the cutoffs recorded for the session in \(h.home.paths.stateFile.path) are a value the app does not write, which it reads as none, so the app's defaults apply, a 10% end floor and thermal rules on"
-        let cases: [(value: String, battery: Int, end: Bool, log: String)] = [
+        // The line for a record the app reads as none, naming the files of
+        // the home the run reads.
+        func foreign(_ paths: Paths) -> String {
+            "\(paths.configFile.path) is rejected by the app; the cutoffs recorded for the session in \(paths.stateFile.path) are a value the app does not write, which it reads as none, so the app's defaults apply, a 10% end floor and thermal rules on"
+        }
+        // `log`: a line the run writes, none when empty, `foreign` when nil.
+        let cases: [(value: String, battery: Int, end: Bool, log: String?)] = [
             (#","sessionCutoffs":"30 false""#, 20, true, "below the 30% end floor"),
             (#","sessionCutoffs":"30 false""#, 40, false, ""),
             (#","session\u0043utoffs":"30 false""#, 20, true, "below the 30% end floor"),
@@ -492,47 +517,58 @@ final class CutoffAgreementTests: XCTestCase {
             ("", 20, false, ""),
             ("", 9, true, "below the 10% end floor"),
             (#","sessionCutoffs":null"#, 9, true, "below the 10% end floor"),
-            (#","sessionCutoffs":"96 false""#, 40, false, foreign),
-            (#","sessionCutoffs":"96 false""#, 9, true, foreign),
-            (#","sessionCutoffs":30"#, 40, false, foreign),
-            (#","sessionCutoffs":30"#, 9, true, foreign),
-            (#","sessionCutoffs":"30 off""#, 40, false, foreign),
-            (#","sessionCutoffs":"30 off""#, 9, true, foreign),
+            (#","sessionCutoffs":"96 false""#, 40, false, nil),
+            (#","sessionCutoffs":"96 false""#, 9, true, nil),
+            (#","sessionCutoffs":30"#, 40, false, nil),
+            (#","sessionCutoffs":30"#, 9, true, nil),
+            (#","sessionCutoffs":"30 off""#, 40, false, nil),
+            (#","sessionCutoffs":"30 off""#, 9, true, nil),
         ]
-        for c in cases {
-            try session.write(to: h.home.paths.sessionFile)
-            let text = base + c.value + "}"
-            try Data(text.utf8).write(to: h.home.paths.stateFile)
-            try rejectedConfig.write(to: h.home.paths.configFile)
-            try? FileManager.default.removeItem(at: h.home.paths.logFile)
-            agent.clearCalls()
-            try agent.setBattery(c.battery)
-            let ended = try await agentEnds(level: 0)
-            XCTAssertEqual(ended, c.end, "\(text) at \(c.battery)%: \(logText())")
-            if !c.log.isEmpty {
-                XCTAssertTrue(logText().contains(c.log), "\(text): \(logText())")
+        let twice = [#","sessionCutoffs":"30 false","sessionCutoffs":"0 false""#, #","sessionCutoffs":"0 false","sessionCutoffs":"30 false""#,
+                     #","session\u0043utoffs":"30 false","sessionCutoffs":"0 false""#]
+        func run(_ name: String, _ text: String, battery: Int) throws -> SeparateRun {
+            try SeparateRun(in: h, name: name, config: rejectedConfig, battery: battery, level: 0, prepare: { _ in }) { paths in
+                try session.write(to: paths.sessionFile)
+                try Data(text.utf8).write(to: paths.stateFile)
+                try self.rejectedConfig.write(to: paths.configFile)
             }
-            XCTAssertFalse(logText().contains("enforcing the strictest"), "\(text): \(logText())")
+        }
+        var runs: [SeparateRun] = []
+        for (i, c) in cases.enumerated() {
+            runs.append(try run("record\(i)", base + c.value + "}", battery: c.battery))
+        }
+        var appReads: [AgentCutoffs] = []
+        for (i, value) in twice.enumerated() {
+            let text = base + value + "}"
+            let r = try run("twice\(i)", text, battery: 5)
+            appReads.append(try XCTUnwrap(try Store(paths: r.paths).loadState()?.sessionCutoffs, "the app reads \(text)"))
+            runs.append(r)
         }
 
-        for twice in [#","sessionCutoffs":"30 false","sessionCutoffs":"0 false""#, #","sessionCutoffs":"0 false","sessionCutoffs":"30 false""#,
-                      #","session\u0043utoffs":"30 false","sessionCutoffs":"0 false""#] {
-            try session.write(to: h.home.paths.sessionFile)
-            let text = base + twice + "}"
-            try Data(text.utf8).write(to: h.home.paths.stateFile)
-            let appReads = try XCTUnwrap(try h.store.loadState()?.sessionCutoffs, "the app reads \(text)")
-            try rejectedConfig.write(to: h.home.paths.configFile)
-            try? FileManager.default.removeItem(at: h.home.paths.logFile)
-            agent.clearCalls()
-            try agent.setBattery(5)
-            let ended = try await agentEnds(level: 0)
-            XCTAssertEqual(ended, 5 < appReads.endFloor, "\(text), which the app reads as \(appReads.description): \(logText())")
-            if ended {
-                XCTAssertTrue(logText().contains("below the \(appReads.endFloor)% end floor"), logText())
-            } else {
-                XCTAssertEqual(try Data(contentsOf: h.home.paths.stateFile), Data(text.utf8), "kept as it is: \(text)")
+        let results = try await SeparateRun.runAll(runs)
+
+        for (i, c) in cases.enumerated() {
+            let (r, result) = (runs[i], results[i])
+            let text = base + c.value + "}"
+            let log = try r.check(result, "\(text) at \(c.battery)%")
+            XCTAssertEqual(result.ended, c.end, "\(text) at \(c.battery)%: \(log)")
+            let line = c.log ?? foreign(r.paths)
+            if !line.isEmpty {
+                XCTAssertTrue(log.contains(line), "\(text): \(log)")
             }
-            XCTAssertFalse(logText().contains("enforcing the strictest"), logText())
+            XCTAssertFalse(log.contains("enforcing the strictest"), "\(text): \(log)")
+        }
+        for (j, value) in twice.enumerated() {
+            let (r, result, appRead) = (runs[cases.count + j], results[cases.count + j], appReads[j])
+            let text = base + value + "}"
+            let log = try r.check(result, text)
+            XCTAssertEqual(result.ended, 5 < appRead.endFloor, "\(text), which the app reads as \(appRead.description): \(log)")
+            if result.ended {
+                XCTAssertTrue(log.contains("below the \(appRead.endFloor)% end floor"), log)
+            } else {
+                XCTAssertEqual(try Data(contentsOf: r.paths.stateFile), Data(text.utf8), "kept as it is: \(text)")
+            }
+            XCTAssertFalse(log.contains("enforcing the strictest"), log)
         }
 
         try session.write(to: h.home.paths.sessionFile)
@@ -1145,7 +1181,7 @@ final class CutoffAgreementTests: XCTestCase {
             if case .unreadable = c.journal {
                 try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: c.run.paths.stateFile.path)
             }
-            let log = c.run.log
+            let log = try c.run.log
             logs.append(log)
             if let ends = c.ends {
                 XCTAssertEqual(result.status, 0, "\(c.label): \(log)")
@@ -1450,8 +1486,9 @@ final class CutoffAgreementTests: XCTestCase {
         }
         let ended = try await SeparateRun.runAll(runs.map(\.run))
         for ((run, ends), (status, ended)) in zip(runs, ended) {
-            XCTAssertEqual(status, 0, run.log, file: file, line: line)
-            XCTAssertEqual(ended, ends, "\(String(decoding: run.config, as: UTF8.self)): the agent \(ended ? "ends" : "keeps") a session at \(run.battery)%: \(run.log)", file: file, line: line)
+            let log = try run.log
+            XCTAssertEqual(status, 0, log, file: file, line: line)
+            XCTAssertEqual(ended, ends, "\(String(decoding: run.config, as: UTF8.self)): the agent \(ended ? "ends" : "keeps") a session at \(run.battery)%: \(log)", file: file, line: line)
         }
     }
 
@@ -1596,14 +1633,21 @@ struct SeparateRun {
     @discardableResult
     func check(_ result: (status: Int32, ended: Bool), _ label: String,
                file: StaticString = #filePath, line: UInt = #line) throws -> String {
-        let log = self.log
+        let log = try self.log
         XCTAssertEqual(result.status, 0, "\(label): \(log)", file: file, line: line)
         XCTAssertEqual(agent.calls.contains(agent.restoreCall), result.ended, "\(label): \(agent.calls.joined(separator: "\n"))", file: file, line: line)
         XCTAssertEqual(try Store(paths: paths).loadState()?.sleepDisabledByUs, !result.ended, "\(label): \(log)", file: file, line: line)
         return log
     }
 
-    var log: String { (try? String(contentsOf: paths.logFile, encoding: .utf8)) ?? "" }
+    /// The run's log, empty when the run wrote none. A log that is there
+    /// but cannot be read throws, so it never reads as an empty one.
+    var log: String {
+        get throws {
+            guard FileManager.default.fileExists(atPath: paths.logFile.path) else { return "" }
+            return String(decoding: try Data(contentsOf: paths.logFile), as: UTF8.self)
+        }
+    }
 
     /// Runs each agent once, at most `width` at a time, then lets go of
     /// each alive lock. Returns, in order, each exit status and whether the

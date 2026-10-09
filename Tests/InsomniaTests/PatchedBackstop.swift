@@ -1,4 +1,5 @@
 import Foundation
+import XCTest
 @testable import Insomnia
 
 /// A copy of backstop.sh whose tools are fakes in `dir`, for tests that run
@@ -102,8 +103,23 @@ struct PatchedBackstop {
 
     /// What the last run printed on standard output and standard error,
     /// kept in `dir` (last.stdout, last.stderr) rather than thrown away.
-    var lastStdout: String { String(decoding: (try? Data(contentsOf: dir.appendingPathComponent("last.stdout"))) ?? Data(), as: UTF8.self) }
-    var lastStderr: String { String(decoding: (try? Data(contentsOf: dir.appendingPathComponent("last.stderr"))) ?? Data(), as: UTF8.self) }
+    var lastStdout: String { String(decoding: read("last.stdout") ?? Data(), as: UTF8.self) }
+    var lastStderr: String { String(decoding: read("last.stderr") ?? Data(), as: UTF8.self) }
+
+    /// The bytes of `name` in `dir`, or nil when there is no such file. A
+    /// file that is there but cannot be read fails the test instead of
+    /// reading as missing, so an unread record never passes for no calls.
+    private func read(_ name: String) -> Data? {
+        let url = dir.appendingPathComponent(name)
+        do {
+            return try Data(contentsOf: url)
+        } catch CocoaError.fileReadNoSuchFile {
+            return nil
+        } catch {
+            XCTFail("could not read \(url.path): \(error)")
+            return nil
+        }
+    }
 
     /// One run, as launchd starts it, or with another PATH. Returns its
     /// exit status once it has exited and been reaped. What it prints goes
@@ -166,8 +182,7 @@ struct PatchedBackstop {
     }
 
     var calls: [String] {
-        ((try? String(contentsOf: dir.appendingPathComponent("calls"), encoding: .utf8)) ?? "")
-            .split(separator: "\n").map(String.init)
+        String(decoding: read("calls") ?? Data(), as: UTF8.self).split(separator: "\n").map(String.init)
     }
 
     /// Makes every sudo call fail (exit 1) after it is recorded: the
@@ -335,18 +350,16 @@ struct PatchedBackstop {
     var restoreCall: String { "sudo -n \(dir.appendingPathComponent("pmset").path) -a disablesleep 0" }
 
     /// state.json as the last sudo call found it, or nil when there was none.
-    var stateAtSudo: Data? { try? Data(contentsOf: dir.appendingPathComponent("state-at-sudo")) }
+    var stateAtSudo: Data? { read("state-at-sudo") }
 
     /// The names in INSOMNIA_HOME as the last sudo call found them.
     var namesAtSudo: [String] {
-        ((try? String(contentsOf: dir.appendingPathComponent("names-at-sudo"), encoding: .utf8)) ?? "")
-            .split(separator: "\n").map(String.init)
+        String(decoding: read("names-at-sudo") ?? Data(), as: UTF8.self).split(separator: "\n").map(String.init)
     }
 
     /// The names in INSOMNIA_HOME/Logs as the last sudo call found them.
     var logsAtSudo: [String] {
-        ((try? String(contentsOf: dir.appendingPathComponent("logs-at-sudo"), encoding: .utf8)) ?? "")
-            .split(separator: "\n").map(String.init)
+        String(decoding: read("logs-at-sudo") ?? Data(), as: UTF8.self).split(separator: "\n").map(String.init)
     }
 
     /// Makes the app binary unusable for the agent: its Info.plist then
