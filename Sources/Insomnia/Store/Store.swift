@@ -333,6 +333,11 @@ struct Store: Sendable {
     /// as `PatchedBackstop.refuseLockRecord` does for the agent. Debug
     /// builds only; nothing reads it otherwise.
     nonisolated(unsafe) static var lockRecordWriteLimitForTesting: Int?
+    /// Tests set an errno that every read of the lock file through this
+    /// Store fails with once the file is open, as a disk error would: the
+    /// app's own lock descriptor and its writes are untouched, so a held
+    /// lock file can read as unreadable. Debug builds only.
+    nonisolated(unsafe) static var lockReadErrnoForTesting: Int32?
     #endif
 
     private static var lockRecordWriteLimit: Int {
@@ -364,7 +369,8 @@ struct Store: Sendable {
         /// The file could not be read whole (the text says why). It may
         /// hold a whole record of the session in session.json, so it counts
         /// as that session's end, the safe side, until it can be read or
-        /// session.json is gone. No writer takes it for a record it wrote.
+        /// session.json is gone. No writer takes it for a record it wrote,
+        /// and the app's writer leaves it as it is (`recordSessionEndInLock`).
         case unreadable(String)
     }
 
@@ -404,6 +410,11 @@ struct Store: Sendable {
         guard fstat(fd, &opened) == 0, opened.st_dev == st.st_dev, opened.st_ino == st.st_ino else {
             return .unreadable("it changed while it was read")
         }
+        #if DEBUG
+        if let injected = Self.lockReadErrnoForTesting {
+            return .unreadable("it could not be read (\(String(cString: strerror(injected))))")
+        }
+        #endif
         // One byte more than the size: a file that grew meanwhile is not
         // read as the shorter content it held.
         var bytes = [UInt8](repeating: 0, count: Int(st.st_size) + 1)
@@ -467,38 +478,86 @@ struct Store: Sendable {
     /// Whether the recovery lock file holds the record of the session.json
     /// whose bytes `encoded` holds in base64, cut short as a writer leaves
     /// it when it stops partway: the record's first bytes and nothing else
-    /// (backstop.sh empties the file, then writes; a write that fails
-    /// partway), or the whole record followed by bytes the file held before
-    /// (`RecoveryLockHandle.replaceContents` writes over the old bytes
-    /// before it cuts the file to length). A writer was recording that end,
-    /// so it counts as one, the safe side. Other content that is no record
-    /// ends nothing. backstop.sh's lock_holds_record_cut_short reads the
-    /// same way.
+    /// (both writers keep the bytes the file shares with the record and
+    /// append the rest; a write that fails partway), or the whole record
+    /// followed by bytes the file held before (an older app wrote over the
+    /// old bytes before it cut the file to length). A writer was recording
+    /// that end, so it counts as one, the safe side. Other content that is
+    /// no record ends nothing. backstop.sh's lock_holds_record_cut_short
+    /// reads the same way.
     private func lockHoldsRecordCutShort(of encoded: String) -> Bool {
-        guard case let .bytes(data) = readLockFile(), !data.isEmpty else { return false }
-        let whole = Data("\(Self.lockEndRecordTag) \(encoded)\n".utf8)
+        guard case let .bytes(data) = readLockFile() else { return false }
+        return Self.holdsRecordCutShort(data, of: encoded)
+    }
+
+    private static func holdsRecordCutShort(_ data: Data, of encoded: String) -> Bool {
+        guard !data.isEmpty else { return false }
+        let whole = Data("\(lockEndRecordTag) \(encoded)\n".utf8)
         return data.count < whole.count ? whole.starts(with: data) : data.count > whole.count && data.starts(with: whole)
     }
 
+    /// Whether `data`, the recovery lock file's bytes, count as the end of
+    /// the session.json whose bytes are `session`: a whole record of them,
+    /// or that record cut short (`holdsRecordCutShort`).
+    static func lockContents(_ data: Data, endSessionWithBytes session: Data) -> Bool {
+        let encoded = session.base64EncodedString()
+        return parseLockEndRecord(data) == .record(encoded) || holdsRecordCutShort(data, of: encoded)
+    }
+
     /// For an end that could not remove session.json and could write
-    /// neither ended-session.json, the journal nor a record aside: the record of its
-    /// bytes in the recovery lock file, written through `lock`, the handle
-    /// this transaction holds, over anything else there. A record already
-    /// there for these bytes is kept. Over that record cut short
-    /// (`lockHoldsRecordCutShort`) the write never leaves less of it: the
-    /// first bytes grow into the record, and the record with bytes after it
-    /// is cut to the record. A file that cannot be read whole
-    /// counts as an end for readers, but not here: it is written over too,
-    /// as no read shows what it holds. True only when the file then reads
-    /// back as a whole record of these bytes.
+    /// neither ended-session.json, the journal nor a record aside: the
+    /// record of its bytes in the recovery lock file, written through
+    /// `lock`, the handle this transaction holds. A record already there
+    /// for these bytes is kept. The writer keeps what the file shares with
+    /// the record and appends the rest (`RecoveryLockHandle
+    /// .replaceContents`), so a write cut short never leaves less of this
+    /// end than the file held, and from the first byte it changes the file
+    /// holds the record's first bytes, which count as this end. A file
+    /// that cannot be read whole is left as it is: readers count it as the
+    /// end of any session.json already, and a write over what no read
+    /// shows could replace a whole record with fewer bytes of it. The
+    /// caller goes on to the log, as backstop.sh's record_end_in_lock does.
+    /// True only when the file then reads back as a whole record of these
+    /// bytes.
     func recordSessionEndInLock(lock: RecoveryLockHandle? = RecoveryLock.held) -> Bool {
         guard let encoded = sessionEndMarker() else { return false }
-        if lockEndRecord() == .record(encoded) { return true }
+        let found = lockEndRecord()
+        if found == .record(encoded) { return true }
+        if case .unreadable = found { return false }
         guard let lock else { return false }
         let record = Data("\(Self.lockEndRecordTag) \(encoded)\n".utf8)
         guard record.count <= Self.lockRecordWriteLimit else { return false }
         _ = lock.replaceContents(with: record, at: paths.recoveryLock.path)
         return lockEndRecord() == .record(encoded) && sessionEndRecordedInLock() != nil
+    }
+
+    /// Before a start writes its session.json over `previous`, the bytes
+    /// of the session.json there now (nil when there is none): leaves the
+    /// recovery lock file holding nothing that can count as the end of the
+    /// new session, and, while `previous` is still on disk, everything that
+    /// counts as its end. Nothing, a whole record of `previous`, or that
+    /// record with bytes after it stays: a whole record ends no other
+    /// session.json. Its first bytes are completed to the whole record,
+    /// since a short prefix (the tag's first letter, say) is also the first
+    /// bytes of the new session's record. Anything else, and everything
+    /// when there is no `previous`, ends nothing now and is emptied. True
+    /// once that reads back; the caller refuses the start otherwise and
+    /// puts the file's bytes back (`restoreLockContents`). The start empties
+    /// the file of `previous`'s record once its session.json is written.
+    func settleLockForStart(replacing previous: Data?, lock: RecoveryLockHandle? = RecoveryLock.held) -> Bool {
+        let found = lockEndRecord()
+        if found == .none { return true }
+        guard let previous else { return clearLockEndRecord(lock: lock) }
+        let encoded = previous.base64EncodedString()
+        if found == .record(encoded) { return true }
+        if case .unreadable = found { return false }
+        guard case let .bytes(data) = readLockFile() else { return clearLockEndRecord(lock: lock) }
+        let whole = Data("\(Self.lockEndRecordTag) \(encoded)\n".utf8)
+        if data.count > whole.count, data.starts(with: whole) { return true }
+        guard Self.holdsRecordCutShort(data, of: encoded) else { return clearLockEndRecord(lock: lock) }
+        guard let lock else { return false }
+        _ = lock.replaceContents(with: whole, at: paths.recoveryLock.path)
+        return lockEndRecord() == .record(encoded)
     }
 
     /// Empties the recovery lock file of any record, through `lock`, once
@@ -525,8 +584,9 @@ struct Store: Sendable {
         }
     }
 
-    /// Puts `data` back in the recovery lock file through `lock`. True when
-    /// it then holds exactly those bytes.
+    /// Puts `data` back in the recovery lock file through `lock`, keeping
+    /// what the file shares with it (`RecoveryLockHandle.replaceContents`).
+    /// True when it then holds exactly those bytes.
     func restoreLockContents(_ data: Data, lock: RecoveryLockHandle? = RecoveryLock.held) -> Bool {
         if lockContents() == data { return true }
         guard let lock else { return false }
@@ -713,7 +773,7 @@ enum StoreError: Error, LocalizedError {
         case let .notRegularFile(file):
             return "\(file) is not a regular file; it was not opened"
         case let .lockRecordNotCleared(file):
-            return "\(file) holds the record of an earlier session's end and could not be emptied"
+            return "\(file) holds bytes that may record a session's end and could not be rewritten"
         }
     }
 }

@@ -222,7 +222,8 @@ final class LaunchdBackstopTests: XCTestCase {
         let exec = try XCTUnwrap(p.range(of: #"&& exec /bin/bash "$2/Contents/Resources/backstop.sh""#))
         XCTAssertLessThan(verify.lowerBound, exec.lowerBound, "exec must follow a successful verify")
         XCTAssertTrue(p.hasSuffix("; exit 1"), "a failed verification ends the program: \(p)")
-        XCTAssertTrue(p.contains(#">> "$HOME/Library/Logs/Insomnia/insomnia.log""#), "the refusal is logged where the app logs")
+        XCTAssertTrue(p.contains(#"f="$HOME/Library/Logs/Insomnia/insomnia.log"; "#), "the refusal is logged where the app logs")
+        XCTAssertEqual(p.components(separatedBy: #">> "$f""#).count, 3, "a newline after a line cut short, then the refusal")
         XCTAssertFalse(p.contains("'"), "install.sh holds the program in single quotes")
         XCTAssertFalse(p.contains("\n"), "one line, so install.sh's AGENT_PROGRAM line stays one line")
         XCTAssertEqual(p.components(separatedBy: "/bin/bash").count, 2, "exactly one exec target: the sealed script")
@@ -241,6 +242,54 @@ final class LaunchdBackstopTests: XCTestCase {
         let line = try XCTUnwrap(definitions.first)
         XCTAssertTrue(line.hasSuffix("'"), line)
         XCTAssertEqual(String(line.dropFirst("AGENT_PROGRAM='".count).dropLast()), LaunchdBackstop.agentProgram)
+    }
+
+    /// The program run as launchd runs it, in a scratch HOME, with codesign
+    /// replaced by /usr/bin/false, so the bundle fails the check and
+    /// nothing is verified or executed. Its refusal line starts on a line
+    /// of its own after a line cut short: the record of a session's end
+    /// whose newline alone is missing, a line a write left partway, or a
+    /// last byte it cannot read in a log this user may only write to. A log
+    /// that ends in a newline, an empty log and a missing one get no extra
+    /// newline.
+    func testAgentProgramsRefusalLineNeverJoinsALineCutShort() throws {
+        let p = LaunchdBackstop.agentProgram
+        XCTAssertEqual(p.components(separatedBy: "/usr/bin/codesign").count, 2)
+        let failing = p.replacingOccurrences(of: "/usr/bin/codesign", with: "/usr/bin/false")
+        let log = home.root.appendingPathComponent("Library/Logs/Insomnia/insomnia.log")
+        let record = "\(LogEndRecord.tag) 2 e30="
+        let cases: [(name: String, before: String?, mode: Int, lines: [String])] = [
+            ("a record without its newline", "a line\n\(record)", 0o600, ["a line", record]),
+            ("a line cut short", "a line\ncut sh", 0o600, ["a line", "cut sh"]),
+            ("a whole line", "a line\n", 0o600, ["a line"]),
+            ("empty", "", 0o600, []),
+            ("missing", nil, 0o600, []),
+            ("write-only, cut short", "a line\ncut sh", 0o200, ["a line", "cut sh"]),
+        ]
+        for c in cases {
+            try? FileManager.default.removeItem(at: log)
+            try FileManager.default.createDirectory(at: log.deletingLastPathComponent(), withIntermediateDirectories: true)
+            if let before = c.before {
+                try Data(before.utf8).write(to: log)
+                try FileManager.default.setAttributes([.posixPermissions: c.mode], ofItemAtPath: log.path)
+            }
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/bin/sh")
+            process.arguments = ["-c", failing, "sh", Self.requirement, home.root.appendingPathComponent("Missing.app").path]
+            process.environment = ["HOME": home.root.path, "PATH": "/usr/bin:/bin"]
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+            let exit = ProcessExit(process)
+            try process.run()
+            exit.wait()
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: log.path)
+
+            XCTAssertEqual(process.terminationStatus, 1, c.name)
+            let lines = try String(contentsOf: log, encoding: .utf8).components(separatedBy: "\n")
+            XCTAssertEqual(Array(lines.dropLast(2)), c.lines, c.name)
+            XCTAssertTrue(lines.dropLast().last?.contains("[error] backstop agent: \(home.root.path)/Missing.app does not satisfy") == true, "\(c.name): \(lines)")
+            XCTAssertEqual(lines.last, "", c.name)
+        }
     }
 
     /// Running from a bundle pins that bundle; `swift run` falls back to the

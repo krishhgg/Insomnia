@@ -466,6 +466,15 @@ final class SessionManager {
     /// nil in tests. Started after a session starts, stopped when it ends.
     @ObservationIgnored var services: AppServices?
 
+    #if DEBUG
+    /// The points in a start where tests copy the files on disk, as a crash
+    /// there would leave them, or change them: once the lock file's bytes
+    /// are read, before it is settled, and after each write. Debug builds
+    /// only; nothing sets it otherwise.
+    enum StartStep { case lockFileRead, sessionWritten, journalWritten }
+    @ObservationIgnored var onStartStepForTesting: ((StartStep) -> Void)?
+    #endif
+
     @ObservationIgnored private var deadlineTimer: Timer?
     @ObservationIgnored private var countdownTimer: Timer?
     @ObservationIgnored private var retryTimer: Timer?
@@ -1702,15 +1711,18 @@ final class SessionManager {
         // A rollback puts back the session.json this start replaces byte for
         // byte, since every record of its end matches exact bytes, and with
         // it the recovery lock file, which may hold such a record
-        // (`Store.recordSessionEndInLock`). Both must be read whole.
+        // (`Store.recordSessionEndInLock`). Both must be read whole. With no
+        // session.json the lock file ends nothing: its bytes are put back
+        // when they can be read, and a file that cannot be read is emptied
+        // and stays empty.
         var sessionBytesBefore: Data?
-        var lockBefore: Data?
+        var lockBefore = store.lockContents()
         if sessionBefore != nil {
             guard let bytes = try? store.readData(from: paths.sessionFile) else {
                 fail("start refused, nothing changed: session.json could not be read again")
                 return
             }
-            guard let lock = store.lockContents() else {
+            guard let lock = lockBefore else {
                 fail("start refused, nothing changed: \(paths.recoveryLock.path) could not be read whole, and it may record the end of the session.json in place")
                 return
             }
@@ -1718,28 +1730,39 @@ final class SessionManager {
             lockBefore = lock
         }
 
+        #if DEBUG
+        onStartStepForTesting?(.lockFileRead)
+        #endif
         do {
-            // A recorded end of an earlier session.json goes first: written
-            // after it, a file with the same bytes would read as ended.
-            if state.endedSession != nil {
-                try journal { $0.endedSession = nil }
+            // Before the new session.json exists, the lock file is left
+            // holding nothing that could count as its end: a stale record's
+            // first bytes are also the first bytes of the new session's
+            // record. What records the end of the session.json being
+            // replaced stays, whole, until that file is gone
+            // (`Store.settleLockForStart`).
+            guard store.settleLockForStart(replacing: sessionBytesBefore) else {
+                throw StoreError.lockRecordNotCleared(file: paths.recoveryLock.path)
             }
             try store.saveSession(new)
             keptSessionFile = nil
-            // The record in the recovery lock file goes only once the file
-            // it may end is replaced. A file that cannot be read whole
-            // counts as the end of any session, this new one too, and
-            // other content is emptied with it.
-            guard store.clearLockEndRecord() else {
-                throw StoreError.lockRecordNotCleared(file: paths.recoveryLock.path)
-            }
+            #if DEBUG
+            onStartStepForTesting?(.sessionWritten)
+            #endif
             // The cutoffs the agent enforces for this session when it
             // cannot use config.json (`RuntimeState.sessionCutoffs`), in
-            // the journal before anything runs for the session.
+            // the journal before anything runs for the session. A recorded
+            // end of an earlier session.json goes in the same write, only
+            // after the file it ends is replaced: a crash before it then
+            // leaves that earlier file ended, and a new file with the same
+            // bytes would read as ended, the safe side.
             try journal {
+                $0.endedSession = nil
                 $0.sleepDisabledByUs = true
                 $0.sessionCutoffs = config.agentCutoffs
             }
+            #if DEBUG
+            onStartStepForTesting?(.journalWritten)
+            #endif
         } catch {
             fail("could not write session: \(error.localizedDescription)")
             rollBackStart(journal: journalBefore, session: sessionBytesBefore, lock: lockBefore)
@@ -1758,6 +1781,15 @@ final class SessionManager {
         guard endTicket == ticket else {
             rollBackStart(journal: journalBefore, session: sessionBytesBefore, lock: lockBefore)
             Log.info("start abandoned before disabling sleep: end requested meanwhile")
+            return
+        }
+        // The record of the replaced session.json's end goes last, once
+        // nothing left can roll this start back: it ends no other file, so
+        // until now a rollback only had to cut the file back to the bytes
+        // it held, never write them again.
+        guard store.clearLockEndRecord() else {
+            rollBackStart(journal: journalBefore, session: sessionBytesBefore, lock: lockBefore)
+            fail("could not write session: \(StoreError.lockRecordNotCleared(file: paths.recoveryLock.path).localizedDescription)")
             return
         }
 
@@ -3266,6 +3298,16 @@ final class SessionManager {
                 _ = await performEnd(reason: .backstop)
                 return
             }
+            // Whatever the recovery lock file holds ends nothing here (it
+            // would have ended the session above), so it is emptied before
+            // the session goes on: an end of it written to that file later
+            // then starts from an empty file. One that cannot be emptied
+            // stays; the end's writer keeps only the bytes the file shares
+            // with the record, so it never leaves the record's first bytes
+            // over these (`RecoveryLockHandle.replaceContents`).
+            if !store.clearLockEndRecord() {
+                Log.error("reconcile: could not empty \(paths.recoveryLock.path), which holds bytes that end no session; resuming, and an end recorded there later replaces them")
+            }
             do {
                 try await sleepGuard.setSleepDisabled(true)
                 lastError = nil
@@ -3537,19 +3579,29 @@ final class SessionManager {
     // MARK: Private
 
     /// Undo the writes made at the top of `start` by restoring the journal,
-    /// the recovery lock file's record and the session file exactly as they
-    /// were read under this transaction's lock, the record before the file
-    /// it may end. `lock` is nil when no session.json was there, so no
-    /// record in the lock file ended anything. Nothing has touched the
-    /// machine at this point.
+    /// the session file and the recovery lock file exactly as they were
+    /// read under this transaction's lock. Lock bytes that count as the end
+    /// of the earlier session.json go back before that file: until the
+    /// start's last step the lock file holds that record whole, so putting
+    /// back its first bytes only cuts the file
+    /// (`RecoveryLockHandle.replaceContents`). Other bytes ended nothing;
+    /// the start emptied them before it wrote its session.json, and they go
+    /// back only once the earlier file is back or the new one is gone, so
+    /// none of them is read against the new session. `lock` is nil when
+    /// they could not be read; the file then stays empty. Nothing has
+    /// touched the machine at this point.
     private func rollBackStart(journal before: RuntimeState, session previous: Data?, lock lockBefore: Data?) {
         do {
             try persistState(before)
         } catch {
             fail("could not restore the journal after a failed start: \(error.localizedDescription)")
         }
-        if let lockBefore, !store.restoreLockContents(lockBefore) {
-            fail("could not restore \(paths.recoveryLock.path) after a failed start; a record of an earlier session's end that it held is lost")
+        var lockAfterSession = lockBefore
+        if let previous, let lockBefore, Store.lockContents(lockBefore, endSessionWithBytes: previous) {
+            lockAfterSession = nil
+            if !store.restoreLockContents(lockBefore) {
+                fail("could not restore \(paths.recoveryLock.path) after a failed start; it may hold more or less of the record of an earlier session's end than it did")
+            }
         }
         do {
             if let previous {
@@ -3559,6 +3611,9 @@ final class SessionManager {
             }
         } catch {
             fail("could not restore session.json after a failed start: \(error.localizedDescription)")
+        }
+        if let lockAfterSession, !store.restoreLockContents(lockAfterSession) {
+            fail("could not restore \(paths.recoveryLock.path) after a failed start; it held bytes that ended no session, and it is left as it is")
         }
     }
 

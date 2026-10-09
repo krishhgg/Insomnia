@@ -722,13 +722,12 @@ or hang before that end runs leaves the agent the new cutoffs and the
 session, the same gap as any end recorded nowhere.
 So a session whose app has stopped answering keeps the floor and rule the
 app enforced, also after its `config.json` is deleted or rejected, while
-`state.json` holds the record the app wrote. Where it does not (the
-strictest-values cases below), the backstop's cutoffs can differ from the
-app's: the app reads a value it does not write, or a `state.json` that is a
-symlink to nothing, as no record and keeps enforcing its own settings. The
-record is not an undo entry: it never makes the journal dirty, the backstop
-never changes it, and the app clears it when it removes `session.json`. The
-app reads a value it does not write as none and records its own over it.
+`state.json` holds the record the app wrote. Where it does not (the cases
+without a record below), the backstop's cutoffs can differ from the app's,
+which keeps enforcing its own settings. The record is not an undo entry: it
+never makes the journal dirty, the backstop never changes it, and the app
+clears it when it removes `session.json`. The app reads a value it does not
+write as none and records its own over it.
 
 Before it reads the cutoffs for a valid session, or ends one, the backstop
 checks that `state.json` loads as the app loads it: JSON whose top level
@@ -741,50 +740,84 @@ the journal and every undo entry as they were: the app neither ends nor
 resumes a session on a journal it cannot load, and nothing says which
 cutoffs it holds. The check follows every object and array but checks only
 what the app decodes: the top level, the four arrays and the objects in
-them. It accepts whole numbers written with a fraction or an exponent
-(`5105.0`, `1e2`) up to 2^53, a key twice or an escape or number the app
-skips where the app reads nothing, and UTF-16 with or without a byte order
-mark. It refuses some text the app's decoder reads, none of which the app
-writes: a key the app reads twice in an object it reads (the decoder takes
-the first), a whole number past 2^53 or one a `Double` rounds (`1e18`,
-`1.0000000000000001`, `1e-99999`), a number or escape `plutil` cannot parse
-even where the app skips it (`01`, `1e400`, `\a`, `\u0000`, a lone
-surrogate), a number written `1.` under `sessionCutoffs`, a NUL byte, and
-UTF-32. While such a journal stays,
+them. In a frozen process it checks `startedAtMicros` only after a
+`startedAt` that is there and not null, and `bootSession` only after both,
+as `FrozenProcess` decodes them. It accepts a whole number written
+with a fraction or an exponent (`5105.0`, `1e18`) when the field's type
+holds it and a `Double` holds it exactly, so `plutil` reads the same
+number; a key twice or an escape or number the app skips where the app
+reads nothing; UTF-16 with or without a byte order mark; and UTF-32
+without one, or big-endian with one. A `sessionCutoffs` written twice or
+with an escape JSON does not have leaves the journal loadable and counts as
+a record the app does not write. It refuses some text the app's decoder
+reads, none of which the app writes: a key the app reads twice in an object
+it reads (the decoder takes the first), a whole number written with a
+fraction or an exponent that a `Double` does not hold exactly
+(`9007199254740993.0`), a number a `Double` rounds (`1.0000000000000001`,
+`1e-99999`), a number or escape `plutil` cannot parse even where the app
+skips it (`01`, `1e400`, `\a`, `\u0000`, a lone surrogate), a NUL byte, and
+UTF-32LE with a byte order mark, which the app refuses too. While such a
+journal stays,
 a valid session keeps sleep held unless the app ends it, and nothing is
 undone, until the file is fixed.
 
-When the binary cannot answer (missing or not executable, or another
-declared version: the agent runs only the script sealed in
-`~/Applications/Insomnia.app`, after checking that bundle's signature, so
-these need the bundle removed or replaced during the run; no answer in
-time, more than 8 MiB of input, output in another form), the backstop reads
-`sessionCutoffs` from the journal it checked itself (`journal_cutoffs`): a
-string of exactly the form the app writes, a floor of 0 to 95 with no
-leading zero and `true` or `false`, which `plutil` reads from the one copy
-of the key the check allows. It enforces that record and logs that it read
-it. A journal with no record gives the app's defaults when `config.json`
-was missing or rejected, and the strictest values when `config.json` is
-there and only the binary failed on it, since the app may enforce what that
-file holds. A binary that failed on `config.json` is not run again on the
-journal, and a hand edit of `config.json` the app has not adopted yet is
-not seen on that path; the app records an edit it adopts within a second
-while it answers.
+When the binary cannot answer for `config.json` (missing or not
+executable, or another declared version: the agent runs only the script
+sealed in `~/Applications/Insomnia.app`, after checking that bundle's
+signature, so these need the bundle removed or replaced during the run; no
+answer in time, more than 8 MiB of input, output in another form), the
+backstop reads the file itself (`config_cutoffs`) and logs that it did. It
+copies the file once through a bounded read and uses the copy only where it
+can tell exactly what the app's `Config` decoder makes of it: at most
+64 KiB, parsed by `plutil`, and passed by the journal's text check in its
+`config.json` form (`record_text_problems`). That check follows the whole
+file and also checks each value the decoder reads for the type it takes
+there, null included where it reads the key with `decodeIfPresent`, and
+that a `lidCloseDefaultsNotice` object holds both its keys. A file that
+passes gives `endFloor` (10 when absent or null, clamped to 0 to 95 as
+`Config.agentCutoffs` clamps it) and `thermalRules` (on when absent or
+null), the values the binary prints for it. A file whose only failures are
+values of a type the decoder does not take counts as rejected, as the
+binary answers for it. Any other failure (a key the app reads written
+twice, an escape JSON does not have, a number the decoder rounds or cannot
+hold, text the check cannot follow, a file `plutil` cannot parse or larger
+than 64 KiB) means the backstop cannot tell what the app makes of the file,
+and it is not used. A hand edit reaches the backstop on this path as it
+does through the binary. The binary is not run again on the journal then:
+the backstop reads `sessionCutoffs` from the journal it checked itself
+(`journal_cutoffs`), a string of exactly the form the app writes, a floor
+of 0 to 95 with no leading zero and `true` or `false`, which `plutil` reads
+from the one copy of the key the check allows. It enforces that record and
+logs that it read it.
 
-Any other outcome gives the strictest values, a 95% end floor with thermal
-rules on, and a log line naming the cause: a `sessionCutoffs` the app does
-not write (`foreign`), a `state.json` that is a symlink to nothing, or no
-record, or no `state.json`, while only the binary failed on `config.json`.
-Until the installed binary answers again or the app records its cutoffs,
-that fallback ends a session on battery power below 95% and ends one at
-critical heat even with the thermal rule off, where the app, which reads
-none of these as a record of other cutoffs, may keep it. No decoder or
-record says which cutoffs the app enforces in these cases; the 95% choice
-is the fallback in place, not a measured match, and the alternatives (the
-app's defaults, the deadline and liveness only) are open. A config.json removed between
-the check and the open counts as a binary that failed on it for that run. The app takes those two values only from
-a file that decodes, runs no session while a config.json it rejected stays
-in place, and writes its settings where the file is missing (section 10).
+Where no record says which cutoffs apply, the outcome depends on
+`config.json`. A `sessionCutoffs` the app does not write (`foreign`) counts
+as none, as the app reads it (`RuntimeState.decodeSessionCutoffs`), and so
+does a `state.json` that is a symlink to nothing, which the app reads as no
+journal (`Store.readData`) and replaces at its next write. An existing
+`state.json` that cannot be read stops the run as above. While
+`config.json` is missing or rejected, none gives the app's defaults, a 10%
+end floor with thermal rules on (`Config.agentDefaultCutoffs`), which the
+app enforces while the file is missing and it has recorded nothing
+(section 10). While `config.json` is there but neither the binary nor the
+backstop can read it, none gives the strictest values, a 95% end floor with
+thermal rules on, and a log line naming the cause. Nothing on disk then
+says which cutoffs the app enforces: that fallback ends a session on
+battery power below 95% and ends one at critical heat even with the
+thermal rule off, where the app may keep it, and the defaults can keep a
+session the app, holding stricter settings in memory, would end. The app
+writes its record within a second while it answers
+(`publishSessionCutoffs`), so each case needs an app that has stopped
+answering. Both are stopgaps, not a decided policy, and remain open: the
+defaults where `config.json` is missing or rejected and nothing is
+recorded, and the 95% values where the file cannot be read either way and
+nothing is recorded. The alternatives (the deadline and liveness only, an
+immediate end, refusing such a session) are open too; none has been
+approved. A config.json removed between the check and the open counts as a
+file neither can read for that run. The app takes those two values only
+from a file that decodes, runs no session while a config.json it rejected
+stays in place, and writes its settings where the file is missing
+(section 10).
 Performance effects depend on workload.
 
 ### 7. Network failover
@@ -1093,40 +1126,60 @@ Backstop, independent of the app:
   folder `~/Library/Logs/Insomnia`. When neither folder takes one, the
   record goes into the recovery lock file `.recovery.lock`, which exists
   already: `ended-session-v1 `, the bytes in base64 and a newline, at most 1
-  MiB. Both sides write it in place while they hold the lock (the app
-  through the lock's own descriptor, with `pwrite`, `ftruncate` and `fsync`,
-  only while the path still names that file, a regular file this user owns;
-  the agent with `>`, or with `>>` to complete the record's first bytes,
-  only while the path names the file its fd 9 holds, a regular file this
-  user owns; `>` empties the file before it writes, so a run stopped in
-  between leaves an empty file, which is no record, and the agent uses `>`
-  only over content that ends nothing for that session), so the file keeps
-  its inode and stays the lock every party takes. Both read it back before
-  they undo anything. The lock file is read only while it is a regular file
-  this user owns (`lstat`, `O_NOFOLLOW` in the app; `-L`, `-f`, `-O` in the
-  agent); anything else holds no record and is never written. Empty content
-  is no record. Content read whole that is the record of the bytes in
-  `session.json` cut short as a writer leaves it when it stops partway (the
-  record's first bytes and nothing else, or the whole record followed by
-  bytes the file held before) counts as that session's end, the safe side,
-  since a writer was recording it. No writer empties it: the app writes the
-  record over it, which only adds to it before the cut to length, the agent
-  appends the rest of the first bytes, and the agent leaves the whole record
-  with bytes after it as it is. Other content read whole that is no whole
-  record of that form (other bytes, a record of other bytes cut short, more
-  than 1 MiB) ends no session, and a writer writes its record over it. A
-  record cut short matches only the bytes it has: a stale one is the start
-  of a later session's record too while it stops before the first byte
-  where the two `session.json` files differ, and then ends that session. A
-  start empties the lock file once it has written its new `session.json`,
-  so that takes a start stopped in between, or a person. A lock file
-  whose size or bytes cannot be read counts as the end of whatever
-  `session.json` holds, since it may hold that record, until it can be read
-  or that file is gone or replaced; no writer takes it for its own record,
-  and the agent does not write over it.
-  The app empties the record when it removes `session.json` and when a
-  start replaces it (a start that fails puts it back with the old file,
-  byte for byte). Each agent run empties any content once `session.json`
+  MiB. Both sides write it in place while they hold the lock, so the file
+  keeps its inode and stays the lock every party takes. The app writes
+  through the lock's own descriptor, only while the path still names that
+  file, a regular file this user owns: it keeps the bytes the file already
+  shares with the start of the record (read with `pread`), cuts the file to
+  them with `ftruncate`, appends the rest with `pwrite` and calls `fsync`.
+  The agent writes only while the path names the file its fd 9 holds, a
+  regular file this user owns: with `>>` to complete the record's first
+  bytes, and otherwise with `>`, only over content that ends nothing for
+  that session. So a writer stopped partway leaves the old bytes as they
+  were, an empty file (stopped after the cut and before the first new
+  byte), or the record's first bytes, never those bytes over old bytes
+  that differ. The first two record nothing, and no reader can tell them
+  from no write; the last counts as the end (below). Both read the file
+  back before they undo anything. The lock file is read only while it is a
+  regular file this user owns (`lstat`, `O_NOFOLLOW` in the app; `-L`,
+  `-f`, `-O` in the agent); anything else holds no record and is never
+  written. Empty content is no record. Content read whole that is the
+  record of the bytes in `session.json` cut short as a writer leaves it
+  when it stops partway (the record's first bytes and nothing else, or the
+  whole record followed by bytes the file held before, as an older app's
+  writer left it) counts as that session's end, the safe side, since a
+  writer was recording it. No writer empties it: both append the rest of
+  the first bytes, the agent leaves the whole record with bytes after it
+  as it is, and the app cuts that to the record. Other content read whole
+  that is no whole record of that form (other bytes, a record of other
+  bytes cut short, more than 1 MiB) ends no session, and a writer replaces
+  it with its record as above. A record cut short matches only the bytes
+  it has: a stale one is the start of a later session's record too while
+  it stops before the first byte where the two `session.json` files
+  differ. So a start settles the lock file before it writes its new
+  `session.json` (`Store.settleLockForStart`). It keeps a whole record of
+  the `session.json` it replaces, alone or with bytes after it, completes
+  that record's first bytes to the whole record, and empties anything
+  else, everything when no `session.json` is there. A start whose lock
+  file does not read back settled refuses and puts back what it wrote. A
+  whole record ends no other `session.json`, so the replaced file's record
+  stays its end until that file is replaced, and the start empties it as
+  its last step before it disables sleep. A relaunch that resumes a
+  session first empties whatever the lock file holds, since none of it
+  ends that session (or the session would have ended), so an end recorded
+  there later starts from an empty file; one that cannot be emptied stays,
+  the resume goes on and the app logs it. A lock file whose size or bytes
+  cannot be read counts as the end of whatever `session.json` holds, since
+  it may hold that record, until it can be read or that file is gone or
+  replaced; no writer takes it for its own record or writes its record
+  over it, and both go on to the log.
+  The app empties the record when it removes `session.json`. A start that
+  fails puts back the journal, the old `session.json` and the lock file
+  byte for byte, the lock file before the old `session.json`; with no old
+  `session.json`, the lock file's bytes go back once the new one is
+  removed, since they end nothing. The bytes of a lock file that could not
+  be read beside no `session.json`, or that held over 1 MiB, are not put
+  back. Each agent run empties any content once `session.json`
   is gone and, while `session.json` is a regular file it can read, a record
   of other bytes and content that is no record and not that record cut
   short, as it does a stale record aside. `uninstall.sh` empties it in
@@ -1169,22 +1222,30 @@ Backstop, independent of the app:
   spaces. It is appended only under the recovery lock, while the log is a
   regular file this user owns and not a symlink, through a descriptor
   checked to be on that file (device and inode), in one write, and it
-  counts only once it reads back as a whole line. A `session.json` over 64
-  KiB is never recorded there. The app at launch, in reconcile, on its 1 Hz
-  tick and in every transaction, each agent run and `uninstall.sh` look for
-  a line equal to the one the current bytes of `session.json` give, in
-  `insomnia.log` and `insomnia.log.1`, so a line cut short or one of other
-  bytes ends nothing. A log that cannot be read, or one over 64 MiB, holds
-  no record for them, and a run whose read-back fails appends another line
-  at the next run. The app rotates `insomnia.log` only while it holds the
-  recovery lock (`OwnerOnly.LogRotation`), so a rotation never runs between
-  a write and its read-back. Before the rename discards the old
-  `insomnia.log.1`, it copies a record there of the `session.json` still on
-  disk into the file it renames, so the record outlasts any number of
-  rotations while that file stays. When `.1` cannot be read, or
-  `session.json` cannot be read while `.1` holds any record, the rotation
-  waits for the next line. Lines the app writes without the lock never
-  rotate, so the log can pass 1 MiB until one written under the lock
+  counts only once it reads back as a whole line. A record at the very end
+  of the log that lacks only its newline counts too, so every writer of
+  `insomnia.log` reads the log's last byte first and, when it is not a
+  newline or cannot be read, puts a newline before its own line: the app
+  (`OwnerOnly.appendToLog`, `LogEndRecord`) and the agent (`log`,
+  `record_end_in_log`) in the same write, the agent program's line when
+  the code check fails in a write before it. `uninstall.sh` writes the log
+  only through the agent. So a line written later never joins that record,
+  and a line a write cut short never joins the record written after it. A
+  `session.json` over 64 KiB is never recorded there. The app at launch,
+  in reconcile, on its 1 Hz tick and in every transaction, each agent run
+  and `uninstall.sh` look for a line equal to the one the current bytes of
+  `session.json` give, in `insomnia.log` and `insomnia.log.1`, so a line
+  cut short or one of other bytes ends nothing. A log that cannot be read,
+  or one over 64 MiB, holds no record for them, and a run whose read-back
+  fails appends another line at the next run. The app rotates `insomnia.log`
+  only while it holds the recovery lock (`OwnerOnly.LogRotation`), so a
+  rotation never runs between a write and its read-back. Before the rename
+  discards the old `insomnia.log.1`, it copies a record there of the
+  `session.json` still on disk into the file it renames, so the record
+  outlasts any number of rotations while that file stays. When `.1` cannot
+  be read, or `session.json` cannot be read while `.1` holds any record, the
+  rotation waits for the next line. Lines the app writes without the lock
+  never rotate, so the log can pass 1 MiB until one written under the lock
   rotates it. The record is not removed: once `session.json` is gone or
   holds other bytes it ends nothing, and later rotations drop it.
   `uninstall.sh --purge` removes both logs only once `session.json` is
@@ -1206,7 +1267,16 @@ Backstop, independent of the app:
   launched before the next agent run with `SleepDisabled 1` (the restore
   failed, or something else set it) resumes a session whose end recorded
   nothing, because nothing on disk tells that end from a crash; the next
-  agent run treats it as any live session.
+  agent run treats it as any live session. An end stopped before the first
+  byte of its record (a crash or a kill there) records nothing either.
+  Every writer records an end before it undoes anything, so sleep is still
+  held then, and a relaunch before the next agent run resumes the session
+  as after a crash: a check that still fails (the deadline, a floor, heat)
+  ends it again, and an end the user asked for is lost. Neither history is
+  accepted; both are open. Nothing on disk tells them from a crash, so
+  only refusing every crash resume closes them. Refusing a resume while the
+  log takes no line at launch would not: once every file takes writes
+  again, the launch sees the same files as after a crash.
 - The battery and thermal reads have the undo commands' time limit but never
   hold the lock: they run with its descriptor closed, and one that ignores
   SIGTERM gets SIGKILL. A hung read fails only its own check, never the next

@@ -629,6 +629,201 @@ final class LogEndRecordTests: XCTestCase {
         XCTAssertTrue(logText().contains(endedInLogLine()), logText())
     }
 
+    // MARK: Lines cut short
+
+    /// A record whose newline alone is missing counts, and the app's
+    /// ordinary lines (`Log.append`) put a newline first, so it still
+    /// counts after them; a log that ends in a newline gets no blank line.
+    /// A record of other bytes at the end of the file ends nothing, before
+    /// or after. The record writer separates a line cut short the same
+    /// way, whether another write left it or one of the app's lines
+    /// stopped partway (the file size limit), and its record reads back on
+    /// the first attempt. Part of a record counts as nothing and stays a
+    /// line of its own; the retry then counts. In a log this user may only
+    /// write to, the last byte cannot be read, so a newline always goes
+    /// first.
+    func testEveryAppWriterStartsOnALineOfItsOwnAfterALineCutShort() throws {
+        try h.store.saveSession(Session(startedAt: h.clock.now, endsAt: h.clock.now.addingTimeInterval(600)))
+        let record = line(of: try sessionBytes())
+        let other = line(of: Data("an earlier session.json".utf8))
+        func lines() -> [String] { logText().components(separatedBy: "\n") }
+
+        try Data("a line\n\(other)".utf8).write(to: logFile)
+        XCTAssertNil(h.store.sessionEndRecordedInLog())
+        Log.append(level: "info", "after another record", paths: h.home.paths)
+        XCTAssertEqual(Array(lines().prefix(2)), ["a line", other])
+        XCTAssertNil(h.store.sessionEndRecordedInLog())
+
+        try Data("a line\n\(record)".utf8).write(to: logFile)
+        XCTAssertEqual(h.store.sessionEndRecordedInLog(), "insomnia.log", "at the end of the file, without its newline")
+        Log.append(level: "info", "after the record", paths: h.home.paths)
+        Log.append(level: "info", "and again", paths: h.home.paths)
+        XCTAssertEqual(lines().count, 5, logText())
+        XCTAssertEqual(Array(lines().prefix(2)), ["a line", record])
+        XCTAssertTrue(lines()[2].hasSuffix("insomnia: after the record"), logText())
+        XCTAssertTrue(lines()[3].hasSuffix("insomnia: and again"), logText())
+        XCTAssertEqual(h.store.sessionEndRecordedInLog(), "insomnia.log")
+
+        let held = try XCTUnwrap(try RecoveryLock(url: lockFile).tryAcquire())
+        defer { held.release() }
+        try Data("a line\ncut sh".utf8).write(to: logFile)
+        XCTAssertTrue(h.store.recordSessionEndInLog(lock: held), "the first attempt")
+        XCTAssertEqual(logText(), "a line\ncut sh\n\(record)\n")
+
+        // The size limit stops these writes in an empty log, where the end
+        // of the file and the start of a new descriptor are the same offset:
+        // an append here is measured from the descriptor's offset.
+        try Data().write(to: logFile)
+        try withFileSizeLimit(6) { Log.append(level: "info", "stopped partway", paths: h.home.paths) }
+        XCTAssertEqual(try size(logFile), 6, "six bytes of the line")
+        XCTAssertTrue(h.store.recordSessionEndInLog(lock: held))
+        XCTAssertEqual(lines().count, 3, logText())
+        XCTAssertEqual(lines()[1], record)
+
+        try Data().write(to: logFile)
+        XCTAssertFalse(try withFileSizeLimit(20) { h.store.recordSessionEndInLog(lock: held) })
+        XCTAssertEqual(logText(), String(record.prefix(20)))
+        XCTAssertNil(h.store.sessionEndRecordedInLog(), "part of a record counts as nothing")
+        Log.append(level: "info", "after the part", paths: h.home.paths)
+        XCTAssertEqual(lines()[0], String(record.prefix(20)))
+        XCTAssertNil(h.store.sessionEndRecordedInLog())
+        XCTAssertTrue(h.store.recordSessionEndInLog(lock: held), "the retry")
+        XCTAssertEqual(count(record, in: logFile), 1)
+        XCTAssertEqual(lines().count, 4, logText())
+
+        try Data("a line\n\(record)".utf8).write(to: logFile)
+        try FileManager.default.setAttributes([.posixPermissions: 0o200], ofItemAtPath: logFile.path)
+        Log.append(level: "info", "write-only", paths: h.home.paths)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: logFile.path)
+        XCTAssertEqual(Array(lines().prefix(2)), ["a line", record])
+        XCTAssertTrue(lines()[2].hasSuffix("insomnia: write-only"), logText())
+        XCTAssertEqual(h.store.sessionEndRecordedInLog(), "insomnia.log")
+    }
+
+    /// Two rotations under the lock with lines cut short. A record whose
+    /// newline alone is missing goes to .1 as it is and still counts there.
+    /// The next rotation copies it forward into a log that ends in a line
+    /// cut short, after a newline, so the copy reads back and .1 then holds
+    /// it whole beside that line.
+    func testTwoRotationsKeepARecordWithoutItsNewlineAndALineCutShortApart() throws {
+        try h.store.saveSession(Session(startedAt: h.clock.now, endsAt: h.clock.now.addingTimeInterval(600)))
+        let record = line(of: try sessionBytes())
+        try Data("a line\n".utf8).write(to: logFile)
+        Self.appendFiller(to: logFile)
+        try append(record, to: logFile)
+        XCTAssertEqual(h.store.sessionEndRecordedInLog(), "insomnia.log")
+        let held = try XCTUnwrap(try RecoveryLock(url: lockFile).tryAcquire())
+        defer { held.release() }
+        func rotate(_ text: String) {
+            RecoveryLock.$held.withValue(held) { Log.append(level: "info", text, paths: h.home.paths) }
+        }
+
+        rotate("first rotation")
+        XCTAssertTrue(text(rotatedLog).hasSuffix("a\n\(record)"), "renamed as it was")
+        XCTAssertEqual(count(record, in: logFile), 0)
+        XCTAssertTrue(logText().hasSuffix("insomnia: first rotation\n"), logText())
+        XCTAssertEqual(h.store.sessionEndRecordedInLog(), "insomnia.log.1")
+
+        Self.appendFiller(to: logFile)
+        try append("cut sh", to: logFile)
+        rotate("second rotation")
+        XCTAssertTrue(text(rotatedLog).hasSuffix("a\ncut sh\n\(record)\n"), String(text(rotatedLog).suffix(120)))
+        XCTAssertEqual(count(record, in: rotatedLog), 1)
+        XCTAssertEqual(count(record, in: logFile), 0)
+        XCTAssertTrue(logText().hasSuffix("insomnia: second rotation\n"), logText())
+        XCTAssertEqual(h.store.sessionEndRecordedInLog(), "insomnia.log.1")
+    }
+
+    /// The tick adopts an end recorded only in the log as a record whose
+    /// newline alone is missing (a write that stopped at its last byte) and
+    /// logs that before it ends the session; every other file still
+    /// refuses the end. The lines it logs start on lines of their own, so
+    /// the record still counts: a relaunch after a full repair, with
+    /// SleepDisabled still 1, ends the session instead of holding sleep
+    /// again.
+    func testTheTickAdoptsARecordWithoutItsNewlineAndKeepsIt() async throws {
+        let m = try await startThenPinAll()
+        let record = line(of: try sessionBytes())
+        try refuseAllButTheLogForTheApp()
+        try append(record, to: logFile)
+
+        await m.noticeAgentEnd()
+
+        XCTAssertFalse(m.isActive, logText())
+        XCTAssertTrue(logText().contains("is recorded as ended in insomnia.log: the recovery agent ended it"), logText())
+        XCTAssertTrue(logText().contains("\(record)\n"), logText())
+        XCTAssertEqual(count(record, in: logFile), 1)
+        XCTAssertEqual(h.store.sessionEndRecordedInLog(), "insomnia.log")
+        XCTAssertNotNil(try h.store.loadSession(), "session.json could not be removed")
+
+        try repairAll()
+        h.guardFake.sleepDisabled = true
+        let alive = AppAliveLock(url: h.home.paths.appAliveFile)
+        XCTAssertTrue(try alive.tryAcquire())
+        defer { alive.release() }
+        let before = h.guardFake.calls.count
+        let next = h.makeManager()
+        await next.reconcile()
+
+        XCTAssertFalse(next.isActive, logText())
+        XCTAssertFalse(sleepHeldAgain(since: before), "\(h.guardFake.calls)")
+        XCTAssertTrue(logText().contains(endedInLogLine()), logText())
+        XCTAssertNil(try h.store.loadSession())
+    }
+
+    /// The agent finds the end recorded in the log as a record whose
+    /// newline alone is missing, ends the session again without the checks
+    /// and logs that. Each line it writes starts on a line of its own, so
+    /// the record still counts for its next run and for the app.
+    func testTheAgentsLinesLeaveARecordWithoutItsNewlineWhole() async throws {
+        _ = try await startThenPinAll()
+        let record = line(of: try sessionBytes())
+        try agent.refuseRecordsAside()
+        try agent.refuseLockRecord()
+        try append(record, to: logFile)
+        let alive = AppAliveLock(url: h.home.paths.appAliveFile)
+        XCTAssertTrue(try alive.tryAcquire())
+        defer { alive.release() }
+
+        try await runAgent(expecting: 1)
+
+        XCTAssertTrue(logText().contains("already ended (recorded in \(logFile.path))"), logText())
+        XCTAssertTrue(logText().contains("\(record)\n"), logText())
+        XCTAssertFalse(agent.calls.contains("pmset -g batt"))
+        XCTAssertTrue(agent.calls.contains(agent.restoreCall), agent.calls.joined(separator: "\n"))
+        XCTAssertEqual(count(record, in: logFile), 1)
+        XCTAssertEqual(h.store.sessionEndRecordedInLog(), "insomnia.log")
+
+        agent.clearCalls()
+        try await runAgent(expecting: 1)
+        XCTAssertFalse(agent.calls.contains("pmset -g batt"), "still ended for the next run")
+        XCTAssertEqual(count(record, in: logFile), 1, "used again, not appended again")
+    }
+
+    /// The agent writes its record into a log that ends in a line cut
+    /// short: another write leaves `cut sh` at the end before each of its
+    /// checks for a record, the one just before the write included. The
+    /// record starts on a line of its own and reads back on the first
+    /// attempt, the line cut short stays as it was, and the app counts the
+    /// record too.
+    func testTheAgentsRecordAfterALineCutShortReadsBackOnTheFirstAttempt() async throws {
+        _ = try await startThenPinAll()
+        let record = line(of: try sessionBytes())
+        try agent.refuseRecordsAside()
+        try agent.refuseLockRecord()
+        try agent.cutTheLogShortAtEveryRecordCheck(log: logFile)
+
+        try await runAgent(expecting: 1)
+
+        XCTAssertTrue(logText().contains("its end is recorded in the log file \(logFile.path) instead"), logText())
+        XCTAssertTrue(logText().contains("cut sh\n\(record)\n"), logText())
+        XCTAssertEqual(count(record, in: logFile), 1)
+        let cut = logText().components(separatedBy: "\n").filter { $0.contains("cut sh") }
+        XCTAssertFalse(cut.isEmpty)
+        XCTAssertEqual(Set(cut), ["cut sh"], logText())
+        XCTAssertEqual(h.store.sessionEndRecordedInLog(), "insomnia.log")
+    }
+
     // MARK: Other sessions and ordinary ends
 
     /// A crash beside a record of an earlier session's bytes and lines that

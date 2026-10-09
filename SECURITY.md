@@ -25,11 +25,15 @@ agent checks before each run, and while that file is missing or rejected, the
 values the app recorded for the session in `state.json`
 (`Insomnia --agent-session-cutoffs`). When that binary is gone or replaced by
 another version during the run, or gives no usable answer in time, the
-backstop reads the values recorded in `state.json` itself, once the journal
-passes its check. When there is no usable record (a value the app does not
-write, or none while only the binary failed), it enforces the strictest
-values, a 95% end floor with thermal rules on. A journal the app would not
-load stops the run with the session and the journal kept. The app is not
+backstop reads `config.json` itself where it can tell exactly what the app's
+decoder makes of it, and otherwise the values recorded in `state.json`, once
+the journal passes its check. A recorded value the app does not write counts
+as none, as the app reads it. With no record, it enforces the app's defaults
+(a 10% end floor, thermal rules on) while `config.json` is missing or
+rejected, and the strictest values (95%, on) while the file is there but
+cannot be read either way; both are open stopgaps (spec section 6). A
+journal the app would not load stops the run with the session and the
+journal kept. The app is not
 sandboxed; local logs can contain SSIDs, process metadata, and tmux target names.
 The lines the app writes to `insomnia.log` also reach the unified log with the
 body marked private, so programs reading `log show` see `<private>` instead of

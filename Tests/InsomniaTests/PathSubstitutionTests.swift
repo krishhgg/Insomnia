@@ -2,14 +2,14 @@ import Foundation
 import XCTest
 @testable import Insomnia
 
-/// A PATH whose cat, grep, head, tr, iconv, id, stat, awk, basename and
-/// dirname are stand-ins, for the tests that show the recovery scripts take
-/// every tool that reads state from its fixed path (CAT, GREP, HEAD, TR,
-/// ICONV, ID, STAT, AWK), never from PATH, and that neither script names a
-/// folder with basename or dirname (uninstall.sh finds its own folder by
-/// parameter expansion; install.sh, which still runs dirname, is not run
-/// here). iconv runs only on a journal in UTF-16, which these tests do not
-/// write. A stand-in called by a process whose
+/// A PATH whose cat, grep, head, tail, tr, iconv, id, stat, awk, basename
+/// and dirname are stand-ins, for the tests that show the recovery scripts
+/// take every tool that reads state from its fixed path (CAT, GREP, HEAD,
+/// TAIL, TR, ICONV, ID, STAT, AWK), never from PATH, and that neither
+/// script names a folder with basename or dirname (uninstall.sh finds its
+/// own folder by parameter expansion; install.sh, which still runs
+/// dirname, is not run here). iconv runs only on a journal in UTF-16,
+/// which these tests do not write. A stand-in called by a process whose
 /// command line holds one of `scripts` (a recovery script, or a subshell of
 /// one) logs the call and answers with something that would change the
 /// run: a 0% end floor from the app's binary, a full battery, a file that
@@ -20,6 +20,7 @@ enum PathSubstitutes {
         ("cat", "/bin/cat", "printf 'cutoffs 0 false\\n'"),
         ("grep", "/usr/bin/grep", #"printf ' -InternalBattery-0 (id=1)\t100%%; charged; 0:00 remaining present: true\n'"#),
         ("head", "/usr/bin/head", "printf x"),
+        ("tail", "/usr/bin/tail", "printf x"),
         ("tr", "/usr/bin/tr", ":"),
         ("iconv", "/usr/bin/iconv", "printf '{}'"),
         ("id", "/usr/bin/id", "echo 0"),

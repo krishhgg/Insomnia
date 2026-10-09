@@ -474,16 +474,16 @@ final class CutoffAgreementTests: XCTestCase {
     /// The journal's record as the agent reads it through the app's binary,
     /// with config.json rejected: escaped keys as the app's decoder takes
     /// them; none (a session an older build started) and no state.json at
-    /// all are the defaults; a value the app does not write is the
-    /// strictest, with the reason logged. The app reads that value as none
-    /// and records its own over it. A record found twice, which the app
-    /// reads (the first copy) and never writes, stops the agent with the
-    /// session and the journal kept, as any key twice does: plutil would
-    /// read and republish the other copy.
+    /// all are the defaults; a value the app does not write, which the app
+    /// reads as none and records its own over, is the defaults too, with
+    /// the reason logged. A record found twice, which the app never writes,
+    /// is read as the app reads it (the first copy): the binary decodes the
+    /// whole journal.
     func testTheAgentReadsTheRecordAsTheAppDoes() async throws {
         _ = try await startWith(endFloor: 30, thermalRules: false)
         let session = try Data(contentsOf: h.home.paths.sessionFile)
         let base = #"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false"#
+        let foreign = "\(h.home.paths.configFile.path) is rejected by the app; the cutoffs recorded for the session in \(h.home.paths.stateFile.path) are a value the app does not write, which it reads as none, so the app's defaults apply, a 10% end floor and thermal rules on"
         let cases: [(value: String, battery: Int, end: Bool, log: String)] = [
             (#","sessionCutoffs":"30 false""#, 20, true, "below the 30% end floor"),
             (#","sessionCutoffs":"30 false""#, 40, false, ""),
@@ -492,9 +492,12 @@ final class CutoffAgreementTests: XCTestCase {
             ("", 20, false, ""),
             ("", 9, true, "below the 10% end floor"),
             (#","sessionCutoffs":null"#, 9, true, "below the 10% end floor"),
-            (#","sessionCutoffs":"96 false""#, 40, true, "enforcing the strictest, a 95% end floor and thermal rules on"),
-            (#","sessionCutoffs":30"#, 40, true, "enforcing the strictest, a 95% end floor and thermal rules on"),
-            (#","sessionCutoffs":"30 off""#, 94, true, "below the 95% end floor"),
+            (#","sessionCutoffs":"96 false""#, 40, false, foreign),
+            (#","sessionCutoffs":"96 false""#, 9, true, foreign),
+            (#","sessionCutoffs":30"#, 40, false, foreign),
+            (#","sessionCutoffs":30"#, 9, true, foreign),
+            (#","sessionCutoffs":"30 off""#, 40, false, foreign),
+            (#","sessionCutoffs":"30 off""#, 9, true, foreign),
         ]
         for c in cases {
             try session.write(to: h.home.paths.sessionFile)
@@ -509,9 +512,7 @@ final class CutoffAgreementTests: XCTestCase {
             if !c.log.isEmpty {
                 XCTAssertTrue(logText().contains(c.log), "\(text): \(logText())")
             }
-            if c.log.hasPrefix("enforcing") {
-                XCTAssertTrue(logText().contains("is rejected by the app, and the cutoffs recorded for the session in \(h.home.paths.stateFile.path) are a value the app does not write"), logText())
-            }
+            XCTAssertFalse(logText().contains("enforcing the strictest"), "\(text): \(logText())")
         }
 
         for twice in [#","sessionCutoffs":"30 false","sessionCutoffs":"0 false""#, #","sessionCutoffs":"0 false","sessionCutoffs":"30 false""#,
@@ -519,19 +520,19 @@ final class CutoffAgreementTests: XCTestCase {
             try session.write(to: h.home.paths.sessionFile)
             let text = base + twice + "}"
             try Data(text.utf8).write(to: h.home.paths.stateFile)
-            XCTAssertNotNil(try h.store.loadState()?.sessionCutoffs, "the app reads \(text)")
+            let appReads = try XCTUnwrap(try h.store.loadState()?.sessionCutoffs, "the app reads \(text)")
             try rejectedConfig.write(to: h.home.paths.configFile)
             try? FileManager.default.removeItem(at: h.home.paths.logFile)
             agent.clearCalls()
             try agent.setBattery(5)
-            try agent.setThermal(0)
-            let exit = try await agent.run()
-            XCTAssertEqual(exit, 1, "\(text): \(logText())")
-            XCTAssertEqual(try Data(contentsOf: h.home.paths.sessionFile), session, text)
-            XCTAssertEqual(try Data(contentsOf: h.home.paths.stateFile), Data(text.utf8), text)
-            XCTAssertFalse(agent.calls.contains(agent.restoreCall), agent.calls.joined(separator: "\n"))
-            XCTAssertTrue(logText().contains("sessionCutoffs is in the top level of state.json 2 times"), logText())
-            XCTAssertTrue(logText().contains("is kept as it is: its cutoffs are not read and it is not ended"), logText())
+            let ended = try await agentEnds(level: 0)
+            XCTAssertEqual(ended, 5 < appReads.endFloor, "\(text), which the app reads as \(appReads.description): \(logText())")
+            if ended {
+                XCTAssertTrue(logText().contains("below the \(appReads.endFloor)% end floor"), logText())
+            } else {
+                XCTAssertEqual(try Data(contentsOf: h.home.paths.stateFile), Data(text.utf8), "kept as it is: \(text)")
+            }
+            XCTAssertFalse(logText().contains("enforcing the strictest"), logText())
         }
 
         try session.write(to: h.home.paths.sessionFile)
@@ -898,27 +899,43 @@ final class CutoffAgreementTests: XCTestCase {
 
     // MARK: When the app's binary cannot answer
 
-    /// The agent cannot read config.json without the app's binary. When the
-    /// bundle declares no `--agent-cutoffs` version, the binary is missing,
-    /// it answers something else or does not answer in time, the agent
-    /// enforces the strictest cutoffs, a 95% end floor and thermal rules
-    /// on, and logs why: on a file with both off, it ends a session at 94%
-    /// and keeps one at 95%. Each answer the binary gives here is one the
-    /// script does not take. Each run after the control has a home of its
-    /// own (`SeparateRun`), so they go several at a time.
-    func testTheAgentEnforcesTheStrictestCutoffsWhenTheAppBinaryCannotAnswer() async throws {
+    /// The ways the app's binary cannot answer: the bundle declares no
+    /// `--agent-cutoffs` version, the binary is missing, it answers
+    /// something else or does not answer in time. Each pairs the words the
+    /// log gives for it with what breaks a run's copy. A binary that does
+    /// not answer is cut off after 5 s, not 1 s: the undo commands share
+    /// that limit, and with eight runs at once a fake that answers at once
+    /// was seen to start too late for 1 s.
+    private var binaryBreaks: [(why: String, breakIt: (PatchedBackstop) throws -> Void)] {
+        [
+            ("declares InsomniaAgentCutoffsVersion '', not \(AgentCutoffsCommand.version)", { try $0.withdrawAgentCutoffs() }),
+            ("is missing or not executable", { try FileManager.default.removeItem(at: $0.appBinary) }),
+            ("(exit 0, output 'cutoffs 96 false')", { try $0.replaceAppBinary(with: "echo 'cutoffs 96 false'") }),
+            ("did not answer within 5s", {
+                try $0.replaceAppBinary(with: "exec /bin/sleep 300")
+                try $0.setCommandTimeout(5)
+            }),
+        ]
+    }
+
+    /// The agent reads config.json itself when the app's binary cannot
+    /// answer for it, and logs why: on the app's own file with a 30% end
+    /// floor and the thermal rules off, and no cutoffs recorded for the
+    /// session, it ends a session at 29% and keeps one at 31% at critical
+    /// heat, as the app does, where neither the defaults (10%, on) nor the
+    /// strictest (95%, on) would. Each answer the binary gives here is one
+    /// the script does not take. Each run after the control has a home of
+    /// its own (`SeparateRun`), so they go several at a time.
+    func testTheAgentReadsConfigItselfWhenTheAppBinaryCannotAnswer() async throws {
         var c = Config()
-        c.setEndFloor(0)
+        c.setEndFloor(30)
         c.thermalRules = false
         try h.store.saveConfig(c)
         let config = try Data(contentsOf: h.home.paths.configFile)
-        let control = try await agentEnds(atBattery: 94)
-        XCTAssertFalse(control, "the binary answers: \(logText())")
+        let control = try await agentEnds(atBattery: 29)
+        XCTAssertTrue(control, "the binary answers: \(logText())")
 
         // Each run's copy has its own app binary, which one message names.
-        // A binary that does not answer is cut off after 5 s, not 1 s: the
-        // undo commands share that limit, and with eight runs at once a fake
-        // that answers at once was seen to start too late for 1 s.
         let cases: [(why: (PatchedBackstop) -> String, breakIt: (PatchedBackstop) throws -> Void)] = [
             ({ _ in "declares InsomniaAgentCutoffsVersion '', not \(AgentCutoffsCommand.version)" }, { try $0.withdrawAgentCutoffs() }),
             ({ _ in "is missing or not executable" }, { try FileManager.default.removeItem(at: $0.appBinary) }),
@@ -933,7 +950,7 @@ final class CutoffAgreementTests: XCTestCase {
         ]
         var runs: [(run: SeparateRun, why: String, ends: Bool, what: String)] = []
         for (i, (why, breakIt)) in cases.enumerated() {
-            for (battery, level, ends, what) in [(94, 0, true, "at 94%"), (95, 0, false, "at 95%"), (95, 3, true, "at 95%, critical: the thermal rule is on")] {
+            for (battery, level, ends, what) in [(29, 0, true, "at 29%"), (31, 3, false, "at 31%, critical: the thermal rule is off")] {
                 let run = try SeparateRun(in: h, name: "\(i)-\(battery)-\(level)", config: config, battery: battery, level: level, prepare: breakIt)
                 runs.append((run, why(run.agent), ends, what))
             }
@@ -944,41 +961,32 @@ final class CutoffAgreementTests: XCTestCase {
         for (r, result) in zip(runs, results) {
             let log = try r.run.check(result, "\(r.why) \(r.what)")
             XCTAssertEqual(result.ended, r.ends, "\(r.why) \(r.what): \(log)")
-            if r.run.battery == 94 {
-                XCTAssertTrue(log.contains("below the 95% end floor"), log)
-                XCTAssertTrue(log.contains(r.why), "\(r.why): \(log)")
-                XCTAssertTrue(log.contains("enforcing the strictest, a 95% end floor and thermal rules on"), log)
-            }
+            XCTAssertTrue(log.contains(r.why), "\(r.why): \(log)")
+            XCTAssertTrue(log.contains("enforcing the file's, read here as the app's decoder reads it: a 30% end floor and thermal rules off"), log)
+            XCTAssertEqual(log.contains("below the 30% end floor"), r.ends, log)
+            XCTAssertFalse(log.contains("enforcing the strictest"), log)
         }
     }
 
     /// The agent reads the journal's record itself when the app's binary
     /// cannot answer for config.json (it is not run again on the journal)
     /// or for the journal: the round-24 session on a 30% floor with the
-    /// thermal rules off ends at 29% and is kept at 31% at critical heat,
-    /// with config.json rejected, missing, or one the binary could not
-    /// read, and the log says the record was read here. A journal without
-    /// a record gives the defaults where config.json was missing (a session
-    /// an older build started: kept at 20%, ended at 9%), and the strictest
-    /// cutoffs where config.json is there and the binary could not read it,
-    /// rejected or not. Each run has a home of its own holding copies of
-    /// the session's files (`SeparateRun`), so they go several at a time.
+    /// thermal rules off ends at 29% and is kept at 31% at critical heat.
+    /// With config.json rejected (read here too) or missing, the log says
+    /// the record was read here; with the app's own config.json, the file
+    /// is read here and gives the same cutoffs. A journal without a record
+    /// gives the defaults where config.json is missing or rejected (a
+    /// session an older build started: kept at 20%, ended at 9%), and the
+    /// file's cutoffs where it is read here. Each run has a home of its own
+    /// holding copies of the session's files (`SeparateRun`), so they go
+    /// several at a time.
     func testTheAgentReadsTheRecordItselfWhenTheAppBinaryCannotAnswer() async throws {
         _ = try await startWith(endFloor: 30, thermalRules: false)
         XCTAssertEqual(try recorded(), AgentCutoffs(endFloor: 30, thermalRules: false))
         let session = try Data(contentsOf: h.home.paths.sessionFile)
         let journal = try Data(contentsOf: h.home.paths.stateFile)
         let config = try Data(contentsOf: h.home.paths.configFile)
-        let breaks: [(why: String, breakIt: (PatchedBackstop) throws -> Void)] = [
-            ("declares InsomniaAgentCutoffsVersion '', not \(AgentCutoffsCommand.version)", { try $0.withdrawAgentCutoffs() }),
-            ("is missing or not executable", { try FileManager.default.removeItem(at: $0.appBinary) }),
-            ("(exit 0, output 'cutoffs 96 false')", { try $0.replaceAppBinary(with: "echo 'cutoffs 96 false'") }),
-            // 5 s, not 1 s, as in the strictest-cutoffs test above.
-            ("did not answer within 5s", {
-                try $0.replaceAppBinary(with: "exec /bin/sleep 300")
-                try $0.setCommandTimeout(5)
-            }),
-        ]
+        let breaks = binaryBreaks
         let configs: [(name: String, bytes: Data?)] = [("read", config), ("rejected", rejectedConfig), ("missing", nil)]
         var older = try Store.decodeState(journal)
         older.sessionCutoffs = nil
@@ -996,13 +1004,14 @@ final class CutoffAgreementTests: XCTestCase {
             }
         }
 
-        var runs: [(run: SeparateRun, label: String, end: Bool, logs: [String], strictest: Bool)] = []
+        var runs: [(run: SeparateRun, label: String, end: Bool, logs: [String])] = []
+        let file = "enforcing the file's, read here as the app's decoder reads it: a 30% end floor and thermal rules off"
         for (b, (why, breakIt)) in breaks.enumerated() {
             for (c, (name, _)) in configs.enumerated() {
                 for (battery, critical, end) in [(31, true, false), (29, false, true)] {
                     let r = try run("\(b)-\(name)-\(battery)", journal: journal, config: c, battery: battery, level: critical ? 3 : 0, prepare: breakIt)
                     let read = "enforcing the cutoffs recorded for the session in \(r.paths.stateFile.path), read here: a 30% end floor and thermal rules off"
-                    runs.append((r, "\(why), config.json \(name), \(battery)%, critical \(critical)", end, [why, read], false))
+                    runs.append((r, "\(why), config.json \(name), \(battery)%, critical \(critical)", end, [why, name == "read" ? file : read]))
                 }
             }
         }
@@ -1011,14 +1020,17 @@ final class CutoffAgreementTests: XCTestCase {
             try breaks[3].breakIt($0)
             try FileManager.default.removeItem(at: $0.appBinary)
         }
-        for (c, battery, end, log) in [
-            (2, 20, false, "records no cutoffs for the session (an older build started it), so the app's defaults apply"),
-            (2, 9, true, "below the 10% end floor"),
-            (1, 94, true, "records no cutoffs for the session; enforcing the strictest, a 95% end floor and thermal rules on"),
-            (0, 94, true, "records no cutoffs for the session; enforcing the strictest, a 95% end floor and thermal rules on"),
+        let defaults = "records no cutoffs for the session (an older build started it), so the app's defaults apply, a 10% end floor and thermal rules on"
+        for (c, battery, end, logs) in [
+            (2, 20, false, [defaults]),
+            (2, 9, true, ["below the 10% end floor"]),
+            (1, 20, false, ["read here, the app rejects it: ", defaults]),
+            (1, 9, true, ["read here, the app rejects it: ", "below the 10% end floor"]),
+            (0, 31, false, [file]),
+            (0, 29, true, [file, "below the 30% end floor"]),
         ] {
             let r = try run("older-\(configs[c].name)-\(battery)", journal: olderJournal, config: c, battery: battery, level: 0, prepare: gone)
-            runs.append((r, "no record, config.json \(configs[c].name), \(battery)%", end, [log], true))
+            runs.append((r, "no record, config.json \(configs[c].name), \(battery)%", end, logs))
         }
 
         let results = try await SeparateRun.runAll(runs.map(\.run))
@@ -1029,9 +1041,279 @@ final class CutoffAgreementTests: XCTestCase {
             for line in r.logs {
                 XCTAssertTrue(log.contains(line), "\(r.label): \(log)")
             }
-            if !r.strictest {
-                XCTAssertFalse(log.contains("enforcing the strictest"), "\(r.label): \(log)")
+            XCTAssertFalse(log.contains("enforcing the strictest"), "\(r.label): \(log)")
+        }
+    }
+
+    // MARK: Each policy, with and without the app's binary
+
+    /// What state.json holds in a policy run (`policyRun`).
+    private enum JournalForm: CustomStringConvertible {
+        /// A running session's journal with this sessionCutoffs text, or
+        /// none.
+        case record(String?)
+        /// No state.json.
+        case missing
+        /// A symlink to nothing, which the app reads as no journal.
+        case dangling
+        /// A regular file this user cannot read, which the app does not
+        /// load.
+        case unreadable
+
+        var description: String {
+            switch self {
+            case .record(let value?): "record '\(value)'"
+            case .record(nil): "no record"
+            case .missing: "no state.json"
+            case .dangling: "state.json a symlink to nothing"
+            case .unreadable: "state.json unreadable"
             }
+        }
+    }
+
+    private static let journalBase = #"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false"#
+
+    /// A run on a running session, config.json `config` (none when nil),
+    /// state.json as `journal` says, the battery at `battery`% on battery
+    /// power and thermal pressure `level`, the app's binary broken by
+    /// `breakIt` (or not, when nil).
+    private func policyRun(_ name: String, config: Data?, journal: JournalForm, battery: Int, level: Int,
+                           breakIt: ((PatchedBackstop) throws -> Void)?) throws -> SeparateRun {
+        let now = h.clock.now
+        return try SeparateRun(in: h, name: name, config: config ?? Data(), battery: battery, level: level, prepare: { try breakIt?($0) }) { paths in
+            try Store(paths: paths).saveSession(Session(startedAt: now, endsAt: now.addingTimeInterval(3600)))
+            try config?.write(to: paths.configFile)
+            switch journal {
+            case .record(let value):
+                let record = value.map { #","sessionCutoffs":"\#($0)""# } ?? ""
+                try Data((Self.journalBase + record + "}").utf8).write(to: paths.stateFile)
+            case .missing:
+                break
+            case .dangling:
+                try FileManager.default.createSymbolicLink(at: paths.stateFile, withDestinationURL: paths.appSupport.appendingPathComponent("nothing.json"))
+            case .unreadable:
+                try Data((Self.journalBase + "}").utf8).write(to: paths.stateFile)
+                try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: paths.stateFile.path)
+            }
+        }
+    }
+
+    /// One policy run made, with what it should do: `ends` true or false
+    /// with exit 0, or nil for a run that stops (exit 1) with nothing done.
+    private struct PolicyCase {
+        let run: SeparateRun
+        let label: String
+        let journal: JournalForm
+        let ends: Bool?
+        let logs: [String]
+        let record: AgentCutoffs?
+    }
+
+    /// Makes `policyRun`s and remembers what each should do.
+    private func policyCase(_ name: String, config: Data?, journal: JournalForm, battery: Int, level: Int,
+                            breakIt: (why: String, breakIt: (PatchedBackstop) throws -> Void)?, ends: Bool?,
+                            logs: [String]) throws -> PolicyCase {
+        let run = try policyRun(name, config: config, journal: journal, battery: battery, level: level, breakIt: breakIt?.breakIt)
+        let record = try? Store(paths: run.paths).loadState()?.sessionCutoffs
+        let label = "\(name): \(journal), \(battery)%, level \(level), \(breakIt?.why ?? "the binary answers")"
+        return PolicyCase(run: run, label: label, journal: journal, ends: ends, logs: (breakIt.map { [$0.why] } ?? []) + logs, record: record ?? nil)
+    }
+
+    /// Runs the cases, at most eight at a time, and checks each: the exit
+    /// status, whether session.json is gone, that sleep is restored only
+    /// with it, that the record the app reads in a journal it loads is the
+    /// one there before the run, and the log lines named. Returns the logs.
+    @discardableResult
+    private func runPolicyCases(_ cases: [PolicyCase]) async throws -> [String] {
+        let results = try await SeparateRun.runAll(cases.map(\.run))
+        var logs: [String] = []
+        for (c, result) in zip(cases, results) {
+            if case .unreadable = c.journal {
+                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: c.run.paths.stateFile.path)
+            }
+            let log = c.run.log
+            logs.append(log)
+            if let ends = c.ends {
+                XCTAssertEqual(result.status, 0, "\(c.label): \(log)")
+                XCTAssertEqual(result.ended, ends, "\(c.label): \(log)")
+                XCTAssertEqual(c.run.agent.calls.contains(c.run.agent.restoreCall), ends, "\(c.label): \(c.run.agent.calls.joined(separator: "\n"))")
+            } else {
+                XCTAssertEqual(result.status, 1, "\(c.label): \(log)")
+                XCTAssertFalse(result.ended, "\(c.label): \(log)")
+                XCTAssertFalse(c.run.agent.calls.contains(c.run.agent.restoreCall), "\(c.label): \(c.run.agent.calls.joined(separator: "\n"))")
+            }
+            if case .record = c.journal {
+                let state = try Store(paths: c.run.paths).loadState()
+                XCTAssertEqual(state?.sleepDisabledByUs, c.ends != true, "\(c.label): \(log)")
+                XCTAssertEqual(state?.sessionCutoffs, c.record, "the record is kept: \(c.label)")
+            }
+            for line in c.logs {
+                XCTAssertTrue(log.contains(line), "\(c.label): no '\(line)' in \(log)")
+            }
+        }
+        return logs
+    }
+
+    /// config.json as the app writes it or as a user edits it by hand, with
+    /// the end floor off, lowered, or the thermal rules off: the agent ends
+    /// the session exactly where the app's binary says it ends, whether the
+    /// binary answers or the agent reads the file itself because the binary
+    /// is missing, of another version, gives an answer the script does not
+    /// take, or does not answer in time. Each pair of battery and heat is
+    /// one the defaults (10%, on) or the strictest (95%, on) would decide
+    /// otherwise. The journal's record, here other cutoffs, is not used
+    /// while the file can be read, and neither is a record the app does
+    /// not write, none, a symlink to nothing or no journal; the record is
+    /// kept.
+    func testTheAgentEnforcesEachPolicyInConfigAsTheAppsBinaryDoes() async throws {
+        func app(_ floor: Int, _ rules: Bool) throws -> Data {
+            var c = Config()
+            c.setEndFloor(floor)
+            c.thermalRules = rules
+            return try Store.makeEncoder().encode(c)
+        }
+        let handEdited = Data("{\n  \"thermalRules\" : false,\n  \"endFloor\" : 25\n}\n".utf8)
+        let policies: [(name: String, config: Data, floor: Int, rules: Bool, probes: [(battery: Int, level: Int, ends: Bool)])] = [
+            ("floor off", try app(0, true), 0, true, [(5, 0, false), (50, 3, true)]),
+            ("lower floor", try app(5, true), 5, true, [(7, 0, false), (4, 0, true)]),
+            ("thermal rules off", try app(10, false), 10, false, [(50, 3, false), (9, 0, true)]),
+            ("repaired by the app", try app(20, false), 20, false, [(21, 3, false), (19, 0, true)]),
+            ("edited by hand", handEdited, 25, false, [(27, 3, false), (24, 0, true)]),
+        ]
+        let breaks: [(why: String, breakIt: (PatchedBackstop) throws -> Void)?] = [nil] + binaryBreaks.map { $0 }
+        var cases: [PolicyCase] = []
+        for (p, policy) in policies.enumerated() {
+            let file = "enforcing the file's, read here as the app's decoder reads it: a \(policy.floor)% end floor and thermal rules \(policy.rules ? "on" : "off")"
+            for (b, breakIt) in breaks.enumerated() {
+                for probe in policy.probes {
+                    cases.append(try policyCase("\(p)-\(b)-\(probe.battery)-\(probe.level)", config: policy.config, journal: .record("30 true"),
+                                                battery: probe.battery, level: probe.level, breakIt: breakIt, ends: probe.ends,
+                                                logs: breakIt == nil ? [] : [file]))
+                }
+                if p == 0 {
+                    for (j, journal) in [JournalForm.record("96 false"), .record(nil), .dangling, .missing].enumerated() {
+                        cases.append(try policyCase("\(p)-\(b)-journal\(j)", config: policy.config, journal: journal,
+                                                    battery: 5, level: 0, breakIt: breakIt, ends: false,
+                                                    logs: breakIt == nil ? [] : [file]))
+                    }
+                }
+            }
+        }
+
+        let logs = try await runPolicyCases(cases)
+
+        for (c, log) in zip(cases, logs) {
+            XCTAssertFalse(log.contains("enforcing the strictest"), "\(c.label): \(log)")
+            XCTAssertFalse(log.contains("defaults apply"), "\(c.label): \(log)")
+        }
+    }
+
+    /// config.json the app rejects as a whole, for a field other than the
+    /// cutoffs (freezeList 42) or for the end floor itself (a string):
+    /// read here, the agent finds the app rejects it too, so with or
+    /// without the binary it enforces the cutoffs recorded for the session
+    /// (40%, rules off), and the app's defaults (10%, on) where there is
+    /// no record, a record the app does not write, a symlink to nothing or
+    /// no journal. A journal that is a regular file this user cannot read
+    /// does not load in the app either: the run stops with the session
+    /// kept.
+    func testARejectedConfigLeavesTheRecordOrTheDefaultsWithOrWithoutTheBinary() async throws {
+        let configs: [(name: String, bytes: Data, breaks: [(why: String, breakIt: (PatchedBackstop) throws -> Void)?])] = [
+            ("rejected for another field", rejectedConfig, [nil] + binaryBreaks.map { $0 }),
+            ("rejected for its end floor", Data(#"{"endFloor":"30","thermalRules":false}"#.utf8), [nil, binaryBreaks[1]]),
+        ]
+        var cases: [PolicyCase] = []
+        for (n, config) in configs.enumerated() {
+            for (b, breakIt) in config.breaks.enumerated() {
+                let rejected = breakIt == nil ? "is rejected by the app" : "read here, the app rejects it: "
+                let defaults = "so the app's defaults apply, a 10% end floor and thermal rules on"
+                let rows: [(JournalForm, Int, Int, Bool?, [String])] = [
+                    (.record("40 false"), 50, 3, false, []),
+                    (.record("40 false"), 39, 0, true, ["below the 40% end floor"]),
+                    (.record("96 false"), 50, 0, false, [rejected, "a value the app does not write, which it reads as none", defaults]),
+                    (.record("96 false"), 9, 0, true, ["below the 10% end floor"]),
+                    (.record(nil), 50, 0, false, breakIt == nil ? [] : [rejected, "records no cutoffs for the session (an older build started it)", defaults]),
+                    (.record(nil), 9, 0, true, ["below the 10% end floor"]),
+                    (.dangling, 50, 0, false, [rejected, "is a symlink to nothing, which the app reads as no journal", defaults]),
+                    (.dangling, 9, 0, true, ["below the 10% end floor"]),
+                    (.missing, 50, 0, false, breakIt == nil ? [] : [rejected, "there is no ", defaults]),
+                    (.missing, 9, 0, true, ["below the 10% end floor"]),
+                    (.unreadable, 50, 0, nil, ["is kept as it is: its cutoffs are not read and it is not ended"]),
+                ]
+                for (r, row) in rows.enumerated() {
+                    var logs = row.4
+                    if case .record("40 false") = row.0, breakIt != nil {
+                        logs += [rejected, "read here: a 40% end floor and thermal rules off"]
+                    }
+                    cases.append(try policyCase("\(n)-\(b)-\(r)", config: config.bytes, journal: row.0, battery: row.1, level: row.2,
+                                                breakIt: breakIt, ends: row.3, logs: logs))
+                }
+            }
+        }
+
+        let logs = try await runPolicyCases(cases)
+
+        for (c, log) in zip(cases, logs) {
+            XCTAssertFalse(log.contains("enforcing the strictest"), "\(c.label): \(log)")
+            XCTAssertFalse(log.contains("enforcing the file's"), "\(c.label): \(log)")
+        }
+    }
+
+    /// config.json the agent cannot read here: cut short (the app rejects
+    /// it, plutil cannot parse it), over 64 KiB (the app reads it), an end
+    /// floor there twice (the app reads the first) or a string with an
+    /// escape JSON does not have (the app rejects it). With the cutoffs
+    /// recorded for the session (40%, rules off, what the app enforces on
+    /// each of these files that it reads) the agent enforces the record,
+    /// with or without the binary, as the app does. Without a record the
+    /// binary still answers as the app reads the file, but an agent whose
+    /// binary cannot answer has nothing on disk that says what the app
+    /// enforces and enforces the strictest cutoffs (95%, on): it ends at
+    /// 50% a session the app keeps. That is an open limit (docs/spec.md),
+    /// pinned here as it is, not an accepted one.
+    func testAConfigReadNeitherWayLeavesTheRecordOrTheStrictest() async throws {
+        var big = Config()
+        big.setEndFloor(40)
+        big.thermalRules = false
+        big.hotspotSSID = String(repeating: "a", count: 70_000)
+        let configs: [(name: String, bytes: Data, appReads: Bool)] = [
+            ("cut short", Data(#"{"endFloor":40,"thermalRules":fal"#.utf8), false),
+            ("over 64 KiB", try Store.makeEncoder().encode(big), true),
+            ("its end floor twice", Data(#"{"endFloor":40,"endFloor":0,"thermalRules":false}"#.utf8), true),
+            ("an escape JSON does not have", Data(#"{"endFloor":40,"thermalRules":false,"hotspotSSID":"a\x41"}"#.utf8), false),
+        ]
+        let breaks: [(why: String, breakIt: (PatchedBackstop) throws -> Void)?] = [nil] + binaryBreaks.map { $0 }
+        var cases: [PolicyCase] = []
+        var strictest: [Bool] = []
+        for (n, config) in configs.enumerated() {
+            for (b, breakIt) in breaks.enumerated() {
+                let read = breakIt == nil ? [] : ["read here: a 40% end floor and thermal rules off"]
+                for (battery, level, ends) in [(50, 3, false), (39, 0, true)] {
+                    cases.append(try policyCase("\(n)-\(b)-\(battery)", config: config.bytes, journal: .record("40 false"), battery: battery, level: level,
+                                                breakIt: breakIt, ends: ends, logs: read))
+                    strictest.append(false)
+                }
+            }
+            for (b, breakIt) in [nil, breaks[2]].enumerated() {
+                for (j, journal) in [JournalForm.record(nil), .record("96 false"), .dangling, .missing].enumerated() {
+                    let logs = breakIt == nil ? [] : ["nothing on disk says which cutoffs the app enforces, so enforcing the strictest, a 95% end floor and thermal rules on",
+                                                      "below the 95% end floor"]
+                    cases.append(try policyCase("\(n)-none\(b)-\(j)", config: config.bytes, journal: journal, battery: 50, level: 0,
+                                                breakIt: breakIt, ends: breakIt != nil, logs: logs))
+                    strictest.append(breakIt != nil)
+                }
+            }
+        }
+        XCTAssertNil(try? Store.decodeConfig(configs[0].bytes))
+        XCTAssertEqual(try Store.decodeConfig(configs[1].bytes).agentCutoffs, AgentCutoffs(endFloor: 40, thermalRules: false))
+        XCTAssertEqual(try Store.decodeConfig(configs[2].bytes).agentCutoffs, AgentCutoffs(endFloor: 40, thermalRules: false))
+        XCTAssertNil(try? Store.decodeConfig(configs[3].bytes))
+
+        let logs = try await runPolicyCases(cases)
+
+        for ((c, log), strict) in zip(zip(cases, logs), strictest) {
+            XCTAssertEqual(log.contains("enforcing the strictest"), strict, "\(c.label): \(log)")
+            XCTAssertFalse(log.contains("enforcing the file's"), "\(c.label): \(log)")
         }
     }
 

@@ -360,39 +360,47 @@ second copy that cannot take it quits at launch without changing anything. The
 Mac is on battery power with the charge below the end floor from `config.json`
 (default 10%); a battery that is present but cannot be read counts as below
 it. Or the thermal pressure level reported by `notifyutil` is critical while
-the thermal rule is on. The agent does not parse `config.json` itself. It
-passes the file to the app's binary in `~/Applications/Insomnia.app` with
+the thermal rule is on. The agent normally does not parse `config.json` itself.
+It passes the file to the app's binary in `~/Applications/Insomnia.app` with
 `--agent-cutoffs`, which decodes it with the app's own code, prints the end
 floor and the thermal setting, and exits without starting the app. This runs
-once a minute while a session is valid, the app is running and the file
-exists. Without the file, or with one the app rejects or cannot read, the
-agent uses the end floor and thermal setting the app recorded for the session
-in `state.json`, read the same way with `--agent-session-cutoffs`. The app
-records them before a session starts or resumes and before a change to
-either takes effect; when it cannot, it refuses the change or ends the
-session. A journal without them (a session an older build started) gives the
-app's defaults (10%, on). When the binary cannot answer (it
-was removed or replaced by an older or newer build after the agent checked
-the bundle's signature, it gives no usable answer within 30 seconds, or
-`config.json` is over 8 MiB), the agent reads the recorded values from
-`state.json` itself and logs that it did. When the journal holds a value the
-app does not write, `state.json` is a symlink to nothing, or the journal
-holds no record while only the binary failed, the agent uses the strictest
-values instead, a 95% end floor with the thermal rule on, and logs why.
-These need not match the app: it reads such a value or link as no record
-and keeps enforcing its own settings, so the agent can end a session on
-battery below 95%, or at critical heat with the thermal rule off, that the
-app would keep. A running app that answers writes its record over such a
-value within a second. Before it reads them, or ends a session, the agent checks
+once a minute while a session is valid, the app is running and the file exists.
+Without the file, or with one the app rejects or cannot read, the agent uses
+the end floor and thermal setting the app recorded for the session in
+`state.json`, read the same way with `--agent-session-cutoffs`. The app records
+them before a session starts or resumes and before a change to either takes
+effect; when it cannot, it refuses the change or ends the session. A journal
+without them (a session an older build started) gives the app's defaults (10%,
+on). When the binary cannot answer (it was removed or replaced by an older or
+newer build after the agent checked the bundle's signature, it gives no usable
+answer within 30 seconds, or `config.json` is over 8 MiB), the agent reads
+`config.json` itself and logs that it did. It uses the file only where it can
+tell exactly what the app's decoder makes of it: at most 64 KiB, parsed by
+`plutil`, every setting the app reads of a type the app takes, and no key the
+app reads written twice, with an escape JSON does not have, or as a number the
+app rounds or cannot hold. A file with a setting of the wrong type counts as
+rejected. For any other file the agent reads the recorded values from
+`state.json` itself. On either path, a recorded value the app does not write
+counts as none, as the app reads it, and so does a `state.json` that is a
+symlink to nothing, which the app reads as no journal. With `config.json`
+missing or rejected, none gives the app's defaults (10%, on). With
+`config.json` there but read neither by the binary nor by the agent, none gives
+the strictest values, a 95% end floor with the thermal rule on, and a log line
+says why. Nothing on disk then says which values the app enforces, so the agent
+can end a session on battery below 95%, or at critical heat with the thermal
+rule off, that the app would keep. A running app that answers writes its record
+within a second, so these cases need an app that has stopped answering. The
+defaults and the 95% values here are stopgaps no one has approved; spec section
+6 lists them as open. Before it reads them, or ends a session, the agent checks
 the parts of `state.json` the app decodes. When they do not load as the app
 loads them, the agent keeps the session, changes nothing and logs why, until
 the app or a person fixes the file; the first run after the fix ends the
-session if it is over. The check also refuses some text the app loads but
-never writes (a key it reads written twice, a number a `Double` rounds,
-UTF-32; spec section 6 lists them). A running app rewrites the journal in its
-own form the next time it writes it, but with the app crashed or hung, such a
-journal keeps the session and its sleep hold, past the deadline too, until
-someone fixes the file. Each
+session if it is over. The check also refuses some text the app loads but never
+writes (a key it reads written twice, a number a `Double` rounds, UTF-32LE with
+a byte order mark; spec section 6 lists them). A running app rewrites the
+journal in its own form the next time it writes it, but with the app crashed or
+hung, such a journal keeps the session and its sleep hold, past the deadline
+too, until someone fixes the file. Each
 early end is logged with its reason, and the saved session is deleted before
 the restore starts. A restore that cannot finish leaves entries in the journal
 for the next run and the app. If the saved session cannot be deleted, its end
@@ -402,22 +410,29 @@ neither can be written, in a new file beside them named `ended-session.json.`
 followed by eight letters or digits; when that folder takes no new file,
 in a file with such a name in `~/Library/Logs/Insomnia`; and when neither
 folder takes one, in the recovery lock file `.recovery.lock`, which exists
-already. That record is written in place, so the file keeps its inode and
-stays the lock both sides take. A writer counts the record only once it
-reads it back whole. The saved session's record cut short as a writer leaves
-it when it stops partway (its first bytes, or the whole record followed by
-bytes the file held before) still counts as that session's end, and a writer
-completes it instead of emptying it. Other content there (other bytes, a
-record of other bytes cut short, more than 1 MiB) ends no session, and the
-agent empties it. A lock file that cannot be read counts as the end of the
-saved session, since it may hold one. When the lock file takes no write
-either, the end goes into `insomnia.log` as one line holding the saved
-session's bytes. It counts
-only once it reads back as a whole line, a saved session over 64 KiB is
-never recorded there, and a log that cannot be read or is over 64 MiB holds
-no record for the app or the agent. The app rotates that log only while it
-holds the recovery lock and copies such a line forward when it does, so the
-record lasts while the saved session stays. The agent reads each
+already. That record is written in place, so the file keeps its inode and stays
+the lock both sides take. A writer cuts the file back to bytes it shares with
+the start of the record, or to nothing, before it appends the rest, so a writer
+stopped partway leaves the old bytes, an empty file or the record's first
+bytes. A writer counts the record only once it reads it back whole. The saved
+session's record cut short as a writer leaves it when it stops partway (its
+first bytes, or the whole record followed by bytes the file held before) still
+counts as that session's end, and a writer completes it instead of emptying it.
+Other content there (other bytes, a record of other bytes cut short, more than
+1 MiB) ends no session, and the agent empties it, as the app does before it
+starts or resumes a session. A record's first bytes are also the first bytes of
+a later session's record, so a start empties everything but a record of the
+saved session it replaces before it writes its own. A lock file that cannot be
+read counts as the end of the saved session, since it may hold one, and no
+writer writes over it. When the lock file takes no write either, the end goes
+into `insomnia.log` as one line holding the saved session's bytes. A line that
+lacks only its newline at the end of the log counts too, so every writer of the
+log puts a newline first when the log does not end in one. It counts only once
+it reads back as a whole line, a saved session over 64 KiB is never recorded
+there, and a log that cannot be read or is over 64 MiB holds no record for the
+app or the agent. The app rotates that log only while it holds the recovery
+lock and copies such a line forward when it does, so the record lasts while the
+saved session stays. The agent reads each
 record back before it restores anything. The app and the agent count a record
 aside or in the lock file only if it is a regular file you own, not a link,
 and the log folder only if it is a real folder you own, not a link.
@@ -441,8 +456,11 @@ while its `session.json` cannot be replaced. Once `session.json` can be
 replaced and `state.json` written again, an app launched before the next agent
 run resumes a session ended with nothing recorded if sleep still reads as
 disabled (the restore failed, or something else disabled sleep), because
-nothing on disk tells that end from a crash. Otherwise the session stands until
-its deadline, and sessions are capped at 24 hours by default (`maxDuration`).
+nothing on disk tells that end from a crash. An end stopped before the first
+byte of its record has undone nothing yet, so a relaunch before the next agent
+run resumes that session too, and an end you asked for is lost. Both cases are
+open limits, not accepted ones. Otherwise the session stands until its
+deadline, and sessions are capped at 24 hours by default (`maxDuration`).
 
 The app and backstop use the same lock so they do not restore and rewrite the
 journal over one another. Failed restoration keeps the relevant entries;

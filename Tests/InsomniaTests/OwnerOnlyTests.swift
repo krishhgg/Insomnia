@@ -102,16 +102,45 @@ final class OwnerOnlyTests: XCTestCase {
     /// Exactly at the cap nothing moves; one byte over, the next append rotates.
     func testRotationHappensOnlyOncePastTheCap() throws {
         let log = home.paths.logs.appendingPathComponent("small.log")
-        try OwnerOnly.appendToLog("0123456789", at: log, maxBytes: 10)
+        try OwnerOnly.appendToLog("012345678\n", at: log, maxBytes: 10)
         try OwnerOnly.appendToLog("x", at: log, maxBytes: 10)
         XCTAssertFalse(FileManager.default.fileExists(atPath: OwnerOnly.rotated(log).path), "rotated at, not past, the cap")
-        XCTAssertEqual(try String(contentsOf: log, encoding: .utf8), "0123456789x")
+        XCTAssertEqual(try String(contentsOf: log, encoding: .utf8), "012345678\nx")
 
         try OwnerOnly.appendToLog("y", at: log, maxBytes: 10)
 
-        XCTAssertEqual(try String(contentsOf: OwnerOnly.rotated(log), encoding: .utf8), "0123456789x")
-        XCTAssertEqual(try String(contentsOf: log, encoding: .utf8), "y")
+        XCTAssertEqual(try String(contentsOf: OwnerOnly.rotated(log), encoding: .utf8), "012345678\nx")
+        XCTAssertEqual(try String(contentsOf: log, encoding: .utf8), "y", "a new file takes no newline first")
         XCTAssertEqual(try mode(OwnerOnly.rotated(log)), 0o600, "the rotated file keeps the owner-only mode")
+    }
+
+    /// A log whose last line was cut short (no newline at the end) gets a
+    /// newline before the next line, in the same write, so the line cut
+    /// short stays whole on its own line: one that ends in a newline, an
+    /// empty file and a file this user may only write to are appended to
+    /// as they are, except that a last byte that cannot be read counts as
+    /// cut short.
+    func testALineCutShortIsEndedBeforeTheNextLine() throws {
+        try FileManager.default.createDirectory(at: home.paths.logs, withIntermediateDirectories: true)
+        let log = home.paths.logs.appendingPathComponent("cut.log")
+        try Data("whole\ncut sh".utf8).write(to: log)
+        try OwnerOnly.appendToLog("next\n", at: log)
+        XCTAssertEqual(try String(contentsOf: log, encoding: .utf8), "whole\ncut sh\nnext\n")
+        try OwnerOnly.appendToLog("after a newline\n", at: log)
+        XCTAssertEqual(try String(contentsOf: log, encoding: .utf8), "whole\ncut sh\nnext\nafter a newline\n")
+
+        let empty = home.paths.logs.appendingPathComponent("empty.log")
+        try Data().write(to: empty)
+        try OwnerOnly.appendToLog("first\n", at: empty)
+        XCTAssertEqual(try String(contentsOf: empty, encoding: .utf8), "first\n")
+
+        let writeOnly = home.paths.logs.appendingPathComponent("write-only.log")
+        try Data("ends\n".utf8).write(to: writeOnly)
+        XCTAssertEqual(chmod(writeOnly.path, 0o200), 0)
+        defer { _ = chmod(writeOnly.path, 0o600) }
+        try OwnerOnly.appendToLog("line\n", at: writeOnly)
+        XCTAssertEqual(chmod(writeOnly.path, 0o600), 0)
+        XCTAssertEqual(try String(contentsOf: writeOnly, encoding: .utf8), "ends\n\nline\n", "its last byte could not be read")
     }
 
     // MARK: Rotation races and failures that must be reported
@@ -180,7 +209,7 @@ final class OwnerOnlyTests: XCTestCase {
     /// longer holds; the line itself is not lost.
     func testFailedRotationIsThrownAfterTheLineIsWritten() throws {
         let log = home.paths.logs.appendingPathComponent("stuck.log")
-        try OwnerOnly.appendToLog("0123456789A", at: log, maxBytes: 10)
+        try OwnerOnly.appendToLog("0123456789\n", at: log, maxBytes: 10)
         try FileManager.default.createDirectory(at: OwnerOnly.rotated(log), withIntermediateDirectories: true)
 
         XCTAssertThrowsError(try OwnerOnly.appendToLog("B", at: log, maxBytes: 10)) { error in
@@ -188,7 +217,7 @@ final class OwnerOnlyTests: XCTestCase {
             XCTAssertEqual(path, log.path)
             XCTAssertTrue(error.localizedDescription.hasPrefix("could not rotate \(log.path) to \(log.path).1: "), error.localizedDescription)
         }
-        XCTAssertEqual(try String(contentsOf: log, encoding: .utf8), "0123456789AB")
+        XCTAssertEqual(try String(contentsOf: log, encoding: .utf8), "0123456789\nB")
     }
 
     /// A file this user cannot chmod (here: immutable) is still read, and

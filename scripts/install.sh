@@ -827,10 +827,12 @@ fi
 #    are `/bin/sh -c "$AGENT_PROGRAM" sh "$REQUIREMENT" "$APP"`: the program
 #    runs `codesign --verify --strict -R=<requirement>` on the bundle and
 #    execs Contents/Resources/backstop.sh only when that passes; otherwise it
-#    logs one line to $LOG_DIR/insomnia.log and exits 1 without running
-#    anything. AGENT_PROGRAM must stay byte for byte what LaunchdBackstop.swift
-#    writes (LaunchdBackstopTests compares them), or the app reloads the agent
-#    at every session start. Same pattern as the app for the file itself: the
+#    logs one line to $LOG_DIR/insomnia.log (after a newline when the file
+#    ends in a line cut short or its last byte cannot be read, as
+#    backstop.sh's ends_mid_line) and exits 1 without running anything.
+#    AGENT_PROGRAM must stay byte for byte what LaunchdBackstop.swift writes
+#    (LaunchdBackstopTests compares them), or the app reloads the agent at
+#    every session start. Same pattern as the app for the file itself: the
 #    trusted plist at $PLIST is only ever a plist launchd actually loaded.
 #    The new one is written to a private candidate one directory below it:
 #    launchctl refuses any path without a `.plist` suffix (EIO), and
@@ -852,7 +854,7 @@ CANDIDATE="$CANDIDATE_DIR/$LABEL.candidate-$$.plist"
 before="$(loaded_state)"
 
 # shellcheck disable=SC2016  # the $1/$2/$HOME/$r below are for the agent's shell, not this one
-AGENT_PROGRAM='r="$(/usr/bin/codesign --verify --strict "-R=$1" "$2" 2>&1)" && exec /bin/bash "$2/Contents/Resources/backstop.sh"; mkdir -p "$HOME/Library/Logs/Insomnia"; printf "%s [error] backstop agent: %s does not satisfy the pinned code requirement; backstop.sh not run. Reinstall Insomnia (scripts/install.sh). codesign: %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$2" "$(printf %s "$r" | tr "\n" " ")" >> "$HOME/Library/Logs/Insomnia/insomnia.log"; exit 1'
+AGENT_PROGRAM='r="$(/usr/bin/codesign --verify --strict "-R=$1" "$2" 2>&1)" && exec /bin/bash "$2/Contents/Resources/backstop.sh"; mkdir -p "$HOME/Library/Logs/Insomnia"; f="$HOME/Library/Logs/Insomnia/insomnia.log"; [ -s "$f" ] && [ "$(/usr/bin/tail -c 1 "$f" 2>/dev/null; echo x)" != "$(printf "\nx")" ] && printf "\n" >> "$f"; printf "%s [error] backstop agent: %s does not satisfy the pinned code requirement; backstop.sh not run. Reinstall Insomnia (scripts/install.sh). codesign: %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$2" "$(printf %s "$r" | tr "\n" " ")" >> "$f"; exit 1'
 xml_escape() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
 cat > "$CANDIDATE" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

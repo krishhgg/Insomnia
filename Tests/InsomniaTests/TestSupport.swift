@@ -875,6 +875,23 @@ func setImmutable(_ url: URL, _ on: Bool) throws {
     try FileManager.default.setAttributes([.immutable: on], ofItemAtPath: url.path)
 }
 
+/// Runs `body` with this process's file size limit at `bytes` and SIGXFSZ
+/// ignored, so a write past that offset stops there, as one cut short by a
+/// full disk does: the kernel writes the bytes below the limit and fails
+/// the rest with EFBIG. The limit holds for the whole process, so it is set
+/// around one write only.
+func withFileSizeLimit<T>(_ bytes: Int, _ body: () -> T) throws -> T {
+    var old = rlimit()
+    guard getrlimit(RLIMIT_FSIZE, &old) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EINVAL) }
+    var limited = old
+    limited.rlim_cur = rlim_t(bytes)
+    let handler = signal(SIGXFSZ, SIG_IGN)
+    defer { signal(SIGXFSZ, handler) }
+    guard setrlimit(RLIMIT_FSIZE, &limited) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EINVAL) }
+    defer { setrlimit(RLIMIT_FSIZE, &old) }
+    return body()
+}
+
 /// Runs `request` in a new main-actor task and returns that task once the
 /// request has been called and the task has let go of the main actor: at
 /// its first suspension, or because it finished. Lifecycle requests join

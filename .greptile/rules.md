@@ -52,10 +52,19 @@ Int64 must fit. A key of letters found twice in one object, an escape
 JSON does not have, a value that is no JSON value, and text the reader
 cannot follow (JSON5 keys, comments, NUL bytes as in UTF-16) are refused.
 Any of these makes the journal malformed, so nothing is undone and
-uninstall removes nothing. backstop.sh checks the journal so before it
-reads the cutoffs for a valid session or ends one: a journal that fails,
-or that `--agent-session-cutoffs` answers `rejected` for, stops the run
-with `session.json`, the journal and every undo entry kept. `savedAudioOutputs` entries alone leave the
+uninstall removes nothing. Values are checked only where the app reads
+them: in a frozen process, `startedAtMicros` only after a `startedAt` that
+is there and not null, and `bootSession` only after both, as
+`FrozenProcess` decodes them. A `sessionCutoffs` written twice or with an
+escape JSON does not have is a record the app does not write (read as
+none), not a malformed journal. When the app's binary cannot answer for
+`config.json`, backstop.sh reads that file with the same reader in its
+config form, which also checks each value's type (`config_cutoffs`), and
+uses it only when the reader finds nothing it cannot settle. backstop.sh
+checks the journal so before it reads the cutoffs for a valid session or
+ends one: a journal that fails, or that `--agent-session-cutoffs` answers
+`rejected` for, stops the run with `session.json`, the journal and every
+undo entry kept. `savedAudioOutputs` entries alone leave the
 journal clean for the backstop (an entry can wait days for its device), but
 uninstall stops on them. A saved brightness flagged
 `displayRestoreRefused` or `keyboardRestoreRefused` (the app's private-call
@@ -91,13 +100,21 @@ The app and the script serialize on one `flock(2)` lock,
 `.recovery.lock`, which is never unlinked so both lock the same inode
 (`RecoveryLock.swift`; `lockf` on fd 9 in the scripts). It may also hold a
 record of a session's end (`ended-session-v1 <base64>`), written in place
-through the held descriptor and never by replacing the file. That record
-cut short as a writer leaves it (its first bytes, or the whole record with
-the file's old bytes after it) counts as the end of the session whose bytes
-it starts with, and no writer empties it; other content that is no record
-ends nothing. When that write fails too, the end is appended to
+through the held descriptor and never by replacing the file. Both writers
+cut the file back to bytes it shares with the start of the record, or to
+nothing, before they append the rest, so a stop partway never leaves the
+record's first bytes over old bytes that differ. That record cut short as
+a writer leaves it (its first bytes, or the whole record with the file's
+old bytes after it) counts as the end of the session whose bytes it starts
+with, and no writer empties it; other content that is no record ends
+nothing, and the app empties it before a resumed session goes on. A start
+settles the file before it writes session.json
+(`Store.settleLockForStart`): a stale record's first bytes would end the
+new session too. An unreadable lock file is never written over. When that
+write fails too, the end is appended to
 `insomnia.log` as one line (`insomnia-ended-session-v1 <size> <base64>`,
-`LogEndRecord.swift`), and
+`LogEndRecord.swift`); every log writer puts a newline first when the log
+does not end in one, so no line joins a record at its end, and
 insomnia.log is rotated only under this lock, with a record still in force
 copied forward. `uninstall.sh`
 takes the lock, runs the backstop with `--force` under it, and refuses to

@@ -127,9 +127,10 @@ final class AgentCutoffsCommandTests: XCTestCase {
     /// the app reads it (`Store.loadState`): the same cutoffs where the
     /// value is one the app writes, through the same decoder, so duplicate
     /// and escaped keys pick the same value. Absent or null is none, a
-    /// session an older build started. Any other value is `foreign` to the
-    /// agent, which then enforces the strictest cutoffs, and read as none
-    /// by the app, which records its own over it at its next transaction.
+    /// session an older build started. Any other value is `foreign`, which
+    /// the agent reads as no record, as the app does (the app's defaults
+    /// where config.json is missing or rejected), and the app records its
+    /// own over it at its next transaction.
     /// A journal the app does not load is `rejected`, whatever its
     /// sessionCutoffs: one that is not a JSON object, or has another key
     /// the app's decoder refuses, including the first of two copies.

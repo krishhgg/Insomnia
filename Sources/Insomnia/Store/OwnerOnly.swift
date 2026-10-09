@@ -106,6 +106,10 @@ enum OwnerOnly {
     /// Appends `text` to the log at `url`: the directory is created 0700,
     /// the file 0600 (an existing file is tightened), and a file already
     /// past `maxBytes` is rotated first so the line lands in a new file.
+    /// A file whose last line was cut short (`endsMidLine`) gets a newline
+    /// first, in the same write, so `text` never joins it: that line may be
+    /// the record of a session's end without its newline, which counts as
+    /// the end only while nothing follows it on its line (`LogEndRecord`).
     /// The line is written even when a chmod or the rotation fails; the
     /// first such failure is then thrown so the caller can report it.
     /// `rotation` says whether the file may be rotated now (`LogRotation`).
@@ -140,14 +144,35 @@ enum OwnerOnly {
                 if let problem = tighten(fd: fd, path: url.path) { problems.append(problem) }
             }
         }
-        try writeAll(Data(text.utf8), to: fd, path: url.path)
+        try writeAll((endsMidLine(fd) ? Data([0x0A]) : Data()) + Data(text.utf8), to: fd, path: url.path)
         if let first = problems.first { throw first }
     }
 
+    /// Opened for reading too, so `endsMidLine` can read the last byte; a
+    /// file this user may only write to is still appended to.
     private static func openForAppend(_ url: URL) throws -> Int32 {
-        let fd = open(url.path, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, fileMode)
+        var fd = open(url.path, O_RDWR | O_APPEND | O_CREAT | O_CLOEXEC, fileMode)
+        if fd < 0, errno == EACCES { fd = open(url.path, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, fileMode) }
         guard fd >= 0 else { throw OwnerOnlyError.open(path: url.path, errno: errno) }
         return fd
+    }
+
+    /// Whether the file open on `fd` ends in a line cut short: it is not
+    /// empty and its last byte, read through `fd`, is not a newline, or
+    /// that byte cannot be read. An appender then writes a newline before
+    /// its own line, so a line cut short, by a write that failed partway or
+    /// by a record whose newline alone is missing, stays a line of its own.
+    /// backstop.sh's ends_mid_line reads the same way.
+    static func endsMidLine(_ fd: Int32) -> Bool {
+        var st = stat()
+        guard fstat(fd, &st) == 0 else { return true }
+        guard st.st_size > 0 else { return false }
+        var last: UInt8 = 0
+        while true {
+            let n = pread(fd, &last, 1, st.st_size - 1)
+            if n < 0, errno == EINTR { continue }
+            return n != 1 || last != 0x0A
+        }
     }
 
     private static func size(of fd: Int32) -> UInt64 {

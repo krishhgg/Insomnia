@@ -208,7 +208,6 @@ final class RecoveryScriptTests: XCTestCase {
             #"{"sleepDisabledByUs":true,"frozenProcesses":[{"pid":5,"pid":6}],"sessionCutoffs":"30 false"}"#,
             #"{"sleepDisabledByUs":true,"sleepDisabledBy\#(b)u0055s":true,"sessionCutoffs":"30 false"}"#,
             #"{"sleepDisabledByUs":true,"frozenProcesses":[{"pid":2147483648}],"sessionCutoffs":"30 false"}"#,
-            #"{"sleepDisabledByUs":true,"sessionCutoffs":"30 false","sessionCutoffs":"0 false"}"#,
             #"{"sleepDisabledByUs":true,"sessionCutoffs":"30 false","#,
         ]
         let modes: [(name: String, alive: Bool, config: String?, args: [String], kept: String)] = [
@@ -2120,6 +2119,50 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(fx.log().contains("malformed"), fx.log())
     }
 
+    /// Frozen entries the app decodes without an identity, because a
+    /// startedAt or startedAtMicros is missing or null (FrozenProcess),
+    /// with what follows of the wrong type or past Int32: the app loads the
+    /// journal, so the run restores sleep, signals nothing and keeps each
+    /// entry for the app. The same values in an entry with every identity
+    /// key are read by the app and refused, so that journal stops the run
+    /// before any command, its bytes and session.json kept.
+    func testProvisionalEntriesTheAppDoesNotReadFurtherDoNotBlockRecovery() throws {
+        let rows: [(entry: String, loads: Bool)] = [
+            (#"{"pid":4242,"startedAtMicros":"bad","bootSession":"test"}"#, true),
+            (#"{"pid":4242,"startedAt":123,"bootSession":42}"#, true),
+            (#"{"pid":4242,"startedAtMicros":2147483648}"#, true),
+            (#"{"pid":4242,"startedAt":null,"startedAtMicros":"bad","bootSession":42}"#, true),
+            (#"{"pid":4242,"startedAt":123,"startedAtMicros":0,"bootSession":42}"#, false),
+            (#"{"pid":4242,"startedAt":123,"startedAtMicros":2147483648,"bootSession":"test"}"#, false),
+        ]
+        for row in rows {
+            let f = try ScriptFixture()
+            defer { f.destroy() }
+            try f.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+            let journal = #"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"dockerFrozen":false,"frozenProcesses":["# + row.entry + "]}"
+            try f.writeState(journal)
+            let session = try Data(contentsOf: f.session)
+
+            let r = try f.run(f.backstop)
+
+            let calls = f.calls().map { $0.replacingOccurrences(of: f.fakePmset, with: "PMSET") }
+            XCTAssertNotEqual(r.status, 0, row.entry)
+            XCTAssertFalse(calls.contains { $0.hasPrefix("kill") || $0.contains("-CONT") }, "\(row.entry): \(calls)")
+            if row.loads {
+                XCTAssertEqual(calls, [sleepRestored], row.entry)
+                XCTAssertTrue(f.log().contains("pid 4242 was journaled without identity; not signaled, kept for the app to resolve"), "\(row.entry): \(f.log())")
+                XCTAssertFalse(f.log().contains("malformed"), "\(row.entry): \(f.log())")
+                XCTAssertEqual((try f.stateJSON()["frozenProcesses"] as? [Any])?.count, 1, row.entry)
+                XCTAssertEqual(try f.stateJSON()["sleepDisabledByUs"] as? Bool, false, row.entry)
+            } else {
+                XCTAssertEqual(calls, [], row.entry)
+                XCTAssertTrue(f.log().contains("malformed"), "\(row.entry): \(f.log())")
+                XCTAssertEqual(try String(contentsOf: f.state, encoding: .utf8), journal, row.entry)
+                XCTAssertEqual(try Data(contentsOf: f.session), session, row.entry)
+            }
+        }
+    }
+
     func testExpiredSessionWithMissingJournalRunsNothingPrivileged() throws {
         try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
 
@@ -2857,6 +2900,73 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(again.status, 0, again.stderr + again.stdout)
         XCTAssertFalse(fx.exists(fx.logFile))
         XCTAssertFalse(fx.exists(rotated))
+    }
+
+    /// The backstop run uninstall makes (--force), in both modes, with a
+    /// log that ends in a line cut short. session.json, ended-session.json
+    /// and state.json are pinned, no record aside can be created and the
+    /// lock file takes none, so the log is the only place left for the
+    /// record. A record of this session whose newline alone is missing
+    /// ends it, and every line the run writes after it starts on a line of
+    /// its own, so it stays whole and is used again. Otherwise the log ends
+    /// in a line a write left partway, and another write leaves `cut sh`
+    /// at its end again before each check for a record (GREP is a fake
+    /// here), the one just before the record is written included: the
+    /// run's first attempt writes the record on a line of its own and
+    /// reads it back. Uninstall then stops with session.json and the logs
+    /// kept.
+    func testUninstallsBackstopRunKeepsALineCutShortApartInBothModes() throws {
+        for purge in [false, true] {
+            for recorded in [true, false] {
+                let f = try ScriptFixture()
+                defer {
+                    for file in [f.session, f.endedSession, f.state] { try? setImmutable(file, false) }
+                    f.destroy()
+                }
+                try f.installMachinery()
+                try f.writeSession(endsAt: Date(timeIntervalSinceNow: 3600))
+                try f.writeState(liveJournal)
+                let record = String(decoding: try XCTUnwrap(LogEndRecord.line(for: try Data(contentsOf: f.session))), as: UTF8.self)
+                try Data("log\n\(recorded ? record : "cut sh")".utf8).write(to: f.logFile)
+                try "{}".write(to: f.endedSession, atomically: true, encoding: .utf8)
+                for file in [f.session, f.endedSession, f.state] { try setImmutable(file, true) }
+                var text = try ScriptFixture.replaceOnce(try String(contentsOf: f.backstop, encoding: .utf8), "MKTEMP=/usr/bin/mktemp", with: "MKTEMP=/usr/bin/false")
+                text = try ScriptFixture.replaceOnce(text, "\nLOCK_RECORD_MAX_BYTES=1048576\n", with: "\nLOCK_RECORD_MAX_BYTES=0\n")
+                if !recorded {
+                    let grep = f.root.appendingPathComponent("grep")
+                    try #"""
+                    #!/bin/bash
+                    if [[ "${1:-}" == -Fxq && "${2:-}" == -e && "${3:-}" == "insomnia-ended-session-v1 "* ]]; then
+                      if [[ "$(/usr/bin/tail -c 1 '\#(f.logFile.path)'; printf x)" == $'\nx' ]]; then printf 'cut sh' >> '\#(f.logFile.path)'; fi
+                    fi
+                    exec /usr/bin/grep "$@"
+
+                    """#.write(to: grep, atomically: true, encoding: .utf8)
+                    try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: grep.path)
+                    text = try ScriptFixture.replaceOnce(text, "\nGREP=/usr/bin/grep\n", with: "\nGREP='\(grep.path)'\n")
+                }
+                try text.write(to: f.backstop, atomically: true, encoding: .utf8)
+
+                let r = try f.run(f.uninstall, purge ? ["--purge"] : [])
+
+                let label = "\(purge ? "--purge" : "plain"), \(recorded ? "record" : "cut sh")"
+                let log = f.log()
+                XCTAssertNotEqual(r.status, 0, "\(label): \(r.stdout)")
+                XCTAssertTrue(f.calls().contains("sudo -n \(f.fakePmset) -a disablesleep 0"), "\(label): \(f.calls())")
+                XCTAssertEqual(log.components(separatedBy: "\n").filter { $0 == record }.count, 1, "\(label): \(log)")
+                XCTAssertTrue(log.contains("\(record)\n"), "\(label): \(log)")
+                XCTAssertTrue(log.contains("its end is recorded in the log file \(f.logFile.path) instead"), "\(label): \(log)")
+                if recorded {
+                    XCTAssertTrue(log.hasPrefix("log\n\(record)\n"), "\(label): \(log)")
+                } else {
+                    XCTAssertTrue(log.hasPrefix("log\ncut sh\n"), "\(label): \(log)")
+                    XCTAssertTrue(log.contains("cut sh\n\(record)\n"), "\(label): \(log)")
+                    XCTAssertEqual(Set(log.components(separatedBy: "\n").filter { $0.contains("cut sh") }), ["cut sh"], "\(label): \(log)")
+                }
+                XCTAssertTrue(f.exists(f.session), label)
+                XCTAssertTrue(f.exists(f.logFile), label)
+            }
+        }
     }
 
     /// --purge removes the moved-aside copies, but only names of exactly the
@@ -4578,7 +4688,7 @@ final class RecoveryScriptTests: XCTestCase {
     private static func recordTextProblemsSource(_ script: String) throws -> String {
         let text = try String(contentsOf: ScriptFixture.productionScripts.appendingPathComponent(script), encoding: .utf8)
         let lines = text.components(separatedBy: "\n")
-        let start = try XCTUnwrap(lines.firstIndex(of: "record_text_problems() { # file"), script)
+        let start = try XCTUnwrap(lines.firstIndex(of: "record_text_problems() { # file [config]"), script)
         let end = try XCTUnwrap(lines[start...].firstIndex(of: "}"), script)
         return lines[start...end].joined(separator: "\n")
     }
@@ -4604,16 +4714,23 @@ final class RecoveryScriptTests: XCTestCase {
     /// reader takes it (journal_cutoffs). The scripts accept the same
     /// journals, and only ones the app loads. They accept what the app
     /// skips (a key twice in an object it does not read, a key it does not
-    /// read twice, a \x escape or 1. under a key it does not read), whole
-    /// numbers written as 5105.0 or 1e2 where it reads an integer, and
-    /// UTF-16. They refuse some the app loads and never writes: a key the
-    /// app reads twice in one object it reads, however it is spelled,
-    /// where plutil would read and republish the other copy; a whole
-    /// number past 2^53 written with an exponent, or one a Double rounds
-    /// to whole; what plutil cannot parse even under a key the app does not
-    /// read (a leading zero); UTF-32. On every journal both accept, the
-    /// agent's reader and the binary give the same record. The journals the
-    /// app writes now and wrote before (frozenPids, no record) pass.
+    /// read twice, a \x escape or 1. under a key it does not read, and in a
+    /// frozen process without a startedAt, or without a startedAtMicros,
+    /// what follows it, which the app does not decode: FrozenProcess),
+    /// whole numbers written as 5105.0 or 1e18 where it reads an integer
+    /// the type holds, UTF-16, and UTF-32 without a byte order mark or with
+    /// UTF-32BE's. They refuse some the app loads and never writes: a key
+    /// the app reads twice in one object it reads, however it is spelled,
+    /// where plutil would read and republish the other copy; a whole number
+    /// written with a fraction or an exponent that a Double does not hold,
+    /// or one a Double rounds to whole; what plutil cannot parse even under
+    /// a key the app does not read (a leading zero). A record twice, or
+    /// with an escape JSON does not have, leaves the journal loading in the
+    /// scripts too. On every journal both accept, the agent's reader and
+    /// the binary give the same record, except a record twice, which the
+    /// reader takes as foreign and the binary as the app's first copy. The
+    /// journals the app writes now and wrote before (frozenPids, no record)
+    /// pass.
     func testTheAppTheBinaryAndBothScriptsAcceptTheSameJournals() throws {
         let b = backslash
         var full = RuntimeState()
@@ -4652,8 +4769,25 @@ final class RecoveryScriptTests: XCTestCase {
             ("a pid that is not whole", #"{"frozenProcesses":[{"pid":5105.5}]}"#, false, false),
             ("a pid past Int32 written as a float", #"{"frozenProcesses":[{"pid":2147483648.0}]}"#, false, false),
             ("a startedAt up to 2^53 written as a float", #"{"frozenProcesses":[{"pid":1,"startedAt":9007199254740992.0}]}"#, true, true),
-            ("a startedAt past 2^53 written with an exponent", #"{"frozenProcesses":[{"pid":1,"startedAt":1e18}]}"#, false, true),
+            ("an identity with a startedAt of 1e18", #"{"frozenProcesses":[{"pid":4242,"startedAt":1e18,"startedAtMicros":0,"bootSession":"test"}]}"#, true, true),
+            ("a startedAt of 2^62 written as a float", #"{"frozenProcesses":[{"pid":1,"startedAt":4611686018427387904.0},{"pid":2,"startedAt":-4611686018427387904.0}]}"#, true, true),
+            ("a startedAt a Double does not hold, written as a float", #"{"frozenProcesses":[{"pid":1,"startedAt":9007199254740993.0}]}"#, false, true),
+            ("the ends of Int64", #"{"frozenProcesses":[{"pid":1,"startedAt":-9223372036854775808},{"pid":2,"startedAt":9223372036854775807}]}"#, true, true),
+            ("the lowest Int64 written as a float", #"{"frozenProcesses":[{"pid":1,"startedAt":-9223372036854775808.0}]}"#, false, false),
+            ("the ends of Int32 written as floats", #"{"frozenProcesses":[{"pid":2147483647.0}],"frozenPids":[-2147483648.0,21474836.47e2]}"#, true, true),
             ("a pid a Double rounds to whole", #"{"frozenProcesses":[{"pid":1.0000000000000001}]}"#, false, true),
+            ("a legacy pid a Double rounds to 0", #"{"frozenPids":[1e-99999]}"#, false, true),
+            ("a provisional entry: startedAtMicros of the wrong type, no startedAt", #"{"sleepDisabledByUs":true,"frozenProcesses":[{"pid":4242,"startedAtMicros":"bad","bootSession":"test"}]}"#, true, true),
+            ("a provisional entry: bootSession of the wrong type, no startedAtMicros", #"{"sleepDisabledByUs":true,"frozenProcesses":[{"pid":4242,"startedAt":123,"bootSession":42}]}"#, true, true),
+            ("a provisional entry: startedAtMicros past Int32, no startedAt", #"{"sleepDisabledByUs":true,"frozenProcesses":[{"pid":4242,"startedAtMicros":2147483648}]}"#, true, true),
+            ("a provisional entry: a null startedAt", #"{"frozenProcesses":[{"pid":4242,"startedAt":null,"startedAtMicros":"bad","bootSession":42}]}"#, true, true),
+            ("a provisional entry: startedAtMicros twice, no startedAt", #"{"frozenProcesses":[{"pid":4242,"startedAtMicros":1,"startedAtMicros":"x"}]}"#, true, true),
+            ("a provisional entry: bootSession twice, no startedAtMicros", #"{"frozenProcesses":[{"pid":4242,"startedAt":123,"bootSession":"a","bootSession":5}]}"#, true, true),
+            ("an identity with a bootSession of the wrong type", #"{"frozenProcesses":[{"pid":4242,"startedAt":123,"startedAtMicros":0,"bootSession":42}]}"#, false, false),
+            ("an identity with startedAtMicros past Int32", #"{"frozenProcesses":[{"pid":4242,"startedAt":123,"startedAtMicros":2147483648,"bootSession":"test"}]}"#, false, false),
+            ("an identity with startedAtMicros of the wrong type", #"{"frozenProcesses":[{"pid":4242,"startedAt":123,"startedAtMicros":"bad","bootSession":"test"}]}"#, false, false),
+            ("an identity with startedAtMicros after its bad bootSession", #"{"frozenProcesses":[{"pid":4242,"bootSession":42,"startedAtMicros":0,"startedAt":123}]}"#, false, false),
+            ("an identity with startedAtMicros twice", #"{"frozenProcesses":[{"pid":4242,"startedAt":123,"startedAtMicros":1,"startedAtMicros":2,"bootSession":"b"}]}"#, false, true),
             ("a pid too large", #"{"frozenProcesses":[{"pid":2147483648}]}"#, false, false),
             ("a saved output without muted", #"{"savedAudioOutputs":[{"deviceUID":"a","volume":0.5}]}"#, false, false),
             ("an App Nap entry without its bundle", #"{"appNapOverrides":[{"previous":true}]}"#, false, false),
@@ -4668,7 +4802,8 @@ final class RecoveryScriptTests: XCTestCase {
             ("an object under the record", #"{"sessionCutoffs":{"a":1,"a":2}}"#, true, true),
             ("a key twice, once escaped", #"{"sleepDisabledByUs":true,"sleepDisabledBy\#(b)u0055s":"x"}"#, false, true),
             ("a key twice, once with a Kelvin sign", "{\"saved\u{212A}eyboardBrightness\":\"bad\",\"savedKeyboardBrightness\":0.5}", false, false),
-            ("a record twice", #"{"sessionCutoffs":"30 false","sessionCutoffs":"0 true"}"#, false, true),
+            ("a record twice", #"{"sessionCutoffs":"30 false","sessionCutoffs":"0 true"}"#, true, true),
+            ("a record with an escape JSON does not have", #"{"sessionCutoffs":"3\#(b)x30 false"}"#, true, true),
             ("a bad escape under another key", #"{"note":"\#(b)x41"}"#, true, true),
             ("values the app skips", #"{"note":[1.,-.5,2.e3,1e-400,"\#(b)x41\#(b)'",{"\#(b)x41":1}],"frozenProcesses":[{"pid":1,"x":0.,"y":"\#(b)x41"}],"sessionCutoffs":"0 true"}"#, true, true),
             ("+1 under another key", #"{"note":+1}"#, false, false),
@@ -4682,7 +4817,9 @@ final class RecoveryScriptTests: XCTestCase {
         let encoded: [(label: String, bytes: Data, scripts: Bool, app: Bool)] = [
             ("UTF-16 with a byte order mark", Data([0xFF, 0xFE]) + written.data(using: .utf16LittleEndian)!, true, true),
             ("UTF-16 big-endian without a byte order mark", written.data(using: .utf16BigEndian)!, true, true),
-            ("UTF-32 without a byte order mark", written.data(using: .utf32LittleEndian)!, false, true),
+            ("UTF-32 without a byte order mark", written.data(using: .utf32LittleEndian)!, true, true),
+            ("UTF-32 big-endian without a byte order mark", written.data(using: .utf32BigEndian)!, true, true),
+            ("UTF-32 big-endian with a byte order mark", Data([0x00, 0x00, 0xFE, 0xFF]) + written.data(using: .utf32BigEndian)!, true, true),
             ("UTF-32 with a byte order mark", Data([0xFF, 0xFE, 0x00, 0x00]) + written.data(using: .utf32LittleEndian)!, false, false),
         ]
         let table = rows.map { (label: $0.label, bytes: Data($0.text.utf8), scripts: $0.scripts, app: $0.app) } + encoded
@@ -4722,6 +4859,9 @@ final class RecoveryScriptTests: XCTestCase {
         }
         let agent = try check("backstop.sh", reader: true)
         let uninstall = try check("uninstall.sh", reader: false)
+        // A record plutil reads otherwise than the app: the agent's reader
+        // takes it as foreign, and the binary reads the app's copy.
+        let readAsForeign = ["a record twice": "cutoffs 30 false"]
         XCTAssertEqual(agent.count, table.count)
         XCTAssertEqual(uninstall.count, table.count)
         for (i, row) in table.enumerated() where i < agent.count && i < uninstall.count {
@@ -4733,7 +4873,10 @@ final class RecoveryScriptTests: XCTestCase {
             XCTAssertEqual(agent[i] != "refused", row.scripts, "backstop.sh on \(row.label): \(agent[i])")
             XCTAssertEqual(uninstall[i] != "refused", row.scripts, "uninstall.sh on \(row.label): \(uninstall[i])")
             XCTAssertTrue(!row.scripts || row.app, "the scripts accept only what the app loads: \(row.label)")
-            if row.scripts {
+            if row.scripts, let appCopy = readAsForeign[row.label] {
+                XCTAssertEqual(agent[i], "accepted foreign", "the agent's reader on \(row.label)")
+                XCTAssertEqual(binary, appCopy, "the binary on \(row.label)")
+            } else if row.scripts {
                 XCTAssertEqual(agent[i], "accepted \(binary)", "the agent's reader and the binary on \(row.label)")
             }
         }
@@ -4755,13 +4898,17 @@ final class RecoveryScriptTests: XCTestCase {
     /// app does prints nothing, and what it refuses names the problem.
     /// Each text is also given to the app's decoder, which reads every one
     /// printing nothing. It also reads some the reader refuses, none of
-    /// which the app writes: a NUL byte in a UTF-8 string and UTF-32, which
-    /// the reader cannot follow, a key the app reads twice in one object it
-    /// reads, where plutil would check the other copy, and whole numbers
-    /// past 2^53 written with an exponent or that a Double rounds to whole.
-    /// What the app skips passes: a key twice in an object it does not
-    /// read, a bad escape or 1. in a value it does not read. UTF-16 is read
-    /// as text. The BOM-less UTF-16 file hiding a key is one the reader
+    /// which the app writes: a NUL byte in a UTF-8 string, which the reader
+    /// cannot follow, a key the app reads twice in one object it reads,
+    /// where plutil would check the other copy, and whole numbers written
+    /// with a fraction or an exponent that a Double does not hold or
+    /// rounds to whole. What the app skips passes: a key twice in an
+    /// object it does not read, a bad escape or 1. in a value it does not
+    /// read, and in a frozen process what follows a startedAt or a
+    /// startedAtMicros that is missing or null, wherever it is in the
+    /// object, unless plutil cannot parse it. UTF-16 and UTF-32 (without a
+    /// byte order mark, or with UTF-32BE's) are read as text. The BOM-less
+    /// UTF-16 file hiding a key is one the reader
     /// passed before it refused NUL bytes: the shell drops them, and what
     /// is left reads as a key inside an array, while the app reads 1e-400
     /// at the top level, as the reader now does through iconv.
@@ -4782,8 +4929,13 @@ final class RecoveryScriptTests: XCTestCase {
              "keptDisplayReadLit is 1e-400, too small a number for the app to read\n", false),
             ("UTF-16 with a key twice", #"{"keptDisplayReadLit":0.8,"keptDisplayReadLit":0.7}"#.data(using: .utf16LittleEndian)!,
              "keptDisplayReadLit is in the top level of state.json 2 times; the app reads the first and plutil the last\n", true),
-            ("UTF-32 without a byte order mark", #"{"keptDisplayReadLit":0.8}"#.data(using: .utf32LittleEndian)!,
-             "the text of state.json cannot be followed here, so the keys the app reads in it cannot be checked\n", true),
+            ("UTF-32 without a byte order mark", #"{"keptDisplayReadLit":0.8}"#.data(using: .utf32LittleEndian)!, "", true),
+            ("UTF-32 without a byte order mark, too small", #"{"keptDisplayReadLit":1e-400}"#.data(using: .utf32LittleEndian)!,
+             "keptDisplayReadLit is 1e-400, too small a number for the app to read\n", false),
+            ("UTF-32 big-endian without a byte order mark", #"{"keptDisplayReadLit":0.8}"#.data(using: .utf32BigEndian)!, "", true),
+            ("UTF-32 big-endian with a byte order mark", Data([0x00, 0x00, 0xFE, 0xFF]) + "{\"keptDisplayReadLit\":0.8,\"a\":\"\u{E9}\u{1F600}\"}".data(using: .utf32BigEndian)!, "", true),
+            ("UTF-32 big-endian with a byte order mark, too large", Data([0x00, 0x00, 0xFE, 0xFF]) + #"{"keptDisplayReadLit":1e39}"#.data(using: .utf32BigEndian)!,
+             "keptDisplayReadLit is 1e39, too large a number for the app to read\n", false),
             ("UTF-32 with a byte order mark", Data([0xFF, 0xFE, 0x00, 0x00]) + #"{"keptDisplayReadLit":0.8}"#.data(using: .utf32LittleEndian)!,
              "the text of state.json cannot be followed here, so the keys the app reads in it cannot be checked\n", false),
             ("UTF-16 without a byte order mark, hiding a key",
@@ -4833,6 +4985,12 @@ final class RecoveryScriptTests: XCTestCase {
             ("an App Nap key twice", utf8(#"{"appNapOverrides":[{"bundleId":"a","previous":true,"previous":null}]}"#),
              "appNapOverrides[0] has previous 2 times; the app reads the first and plutil the last\n", true),
             ("an object under the record", utf8(#"{"sessionCutoffs":{"a":1,"a":2,"b":"\#(b)x41"}}"#), "", true),
+            ("a record twice", utf8(#"{"sessionCutoffs":"30 false","session\#(b)u0043utoffs":"0 true"}"#),
+             "record: sessionCutoffs is in the top level of state.json 2 times; the app reads the first and plutil the last\n", true),
+            ("a record with a \\x escape", utf8(#"{"sessionCutoffs":"3\#(b)x30 false"}"#),
+             "record: sessionCutoffs is a string with an escape JSON does not have, which the app does not read\n", true),
+            ("a record written as +1", utf8(#"{"sessionCutoffs":+1}"#),
+             "sessionCutoffs is written as +1, which is not a JSON value the app reads\n", false),
             ("one key in two objects", utf8(#"{"a":{"x":1},"b":{"x":2}}"#), "", true),
             ("a Kelvin sign spelling a key twice", utf8("{\"saved\u{212A}eyboardBrightness\":\"bad\",\"savedKeyboardBrightness\":0.5}"),
              "savedKeyboardBrightness is in the top level of state.json 2 times; the app reads the first and plutil the last\n", false),
@@ -4872,8 +5030,27 @@ final class RecoveryScriptTests: XCTestCase {
             ("a whole number past Int32 written with an exponent", utf8(#"{"frozenPids":[21474836480e-1]}"#),
              "frozenPids[0] is 21474836480e-1, a whole number the app cannot read there\n", false),
             ("a startedAt up to 2^53 written with a fraction", utf8(#"{"frozenProcesses":[{"pid":1,"startedAt":9007199254740992.0}]}"#), "", true),
-            ("a startedAt past 2^53 written with an exponent", utf8(#"{"frozenProcesses":[{"pid":1,"startedAt":1e18}]}"#),
-             "frozenProcesses[0].startedAt is 1e18, a whole number past 9007199254740992 written with a fraction or an exponent, which is not read here\n", true),
+            ("a startedAt of 1e18", utf8(#"{"frozenProcesses":[{"pid":1,"startedAt":1e18}]}"#), "", true),
+            ("a startedAt of 2^62 written with a fraction", utf8(#"{"frozenProcesses":[{"pid":1,"startedAt":4611686018427387904.0},{"pid":2,"startedAt":-4611686018427387904.0}]}"#), "", true),
+            ("a startedAt a Double does not hold, written with a fraction", utf8(#"{"frozenProcesses":[{"pid":1,"startedAt":9007199254740993.0}]}"#),
+             "frozenProcesses[0].startedAt is 9007199254740993.0, a whole number a Double does not hold, written with a fraction or an exponent, so plutil reads another; not read here\n", true),
+            ("the lowest Int64 written with a fraction", utf8(#"{"frozenProcesses":[{"pid":1,"startedAt":-9223372036854775808.0}]}"#),
+             "frozenProcesses[0].startedAt is -9223372036854775808.0, a whole number the app cannot read there\n", false),
+            ("startedAtMicros past Int32, no startedAt", utf8(#"{"frozenProcesses":[{"pid":1,"startedAtMicros":2147483648}]}"#), "", true),
+            ("startedAtMicros past Int32 after a null startedAt", utf8(#"{"frozenProcesses":[{"pid":1,"startedAt":null,"startedAtMicros":2147483648}]}"#), "", true),
+            ("startedAtMicros past Int32 after a startedAt", utf8(#"{"frozenProcesses":[{"pid":1,"startedAt":5,"startedAtMicros":2147483648}]}"#),
+             "frozenProcesses[0].startedAtMicros is 2147483648, a whole number the app cannot read there\n", false),
+            ("startedAtMicros past Int32 before a startedAt", utf8(#"{"frozenProcesses":[{"pid":1,"startedAtMicros":2147483648,"startedAt":5}]}"#),
+             "frozenProcesses[0].startedAtMicros is 2147483648, a whole number the app cannot read there\n", false),
+            ("startedAtMicros past Int32 in the second entry only", utf8(#"{"frozenProcesses":[{"pid":1,"startedAt":5,"startedAtMicros":1,"bootSession":"b"},{"pid":2,"startedAtMicros":2147483648}]}"#), "", true),
+            ("a \\x escape in bootSession, no startedAtMicros", utf8(#"{"frozenProcesses":[{"pid":1,"startedAt":5,"bootSession":"\#(b)x41"}]}"#), "", true),
+            ("a \\x escape in bootSession of an identity", utf8(#"{"frozenProcesses":[{"pid":1,"startedAt":5,"startedAtMicros":0,"bootSession":"\#(b)x41"}]}"#),
+             "frozenProcesses[0].bootSession is a string with an escape JSON does not have, which the app does not read\n", false),
+            ("startedAtMicros written as +1, no startedAt", utf8(#"{"frozenProcesses":[{"pid":1,"startedAtMicros":+1}]}"#),
+             "frozenProcesses[0].startedAtMicros is written as +1, which is not a JSON value the app reads\n", false),
+            ("startedAtMicros twice, no startedAt", utf8(#"{"frozenProcesses":[{"pid":1,"startedAtMicros":1,"startedAtMicros":2}]}"#), "", true),
+            ("startedAtMicros twice in an identity", utf8(#"{"frozenProcesses":[{"pid":1,"startedAt":5,"startedAtMicros":1,"startedAtMicros":2,"bootSession":"b"}]}"#),
+             "frozenProcesses[0] has startedAtMicros 2 times; the app reads the first and plutil the last\n", true),
             ("a pid a Double rounds to whole", utf8(#"{"frozenProcesses":[{"pid":1.0000000000000001}]}"#),
              "frozenProcesses[0].pid is 1.0000000000000001, which is not a whole number, where the app reads one\n", true),
             // A Double rounds this one to 0.

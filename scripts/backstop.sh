@@ -41,14 +41,17 @@
 #                     the end floor (strict, so 0 disables it). The floor
 #                     and the thermal rule are what the app takes from
 #                     config.json: the installed app binary decodes the file
-#                     with the app's own decoder (read_cutoffs). When the
+#                     with the app's own decoder, or, when it cannot answer,
+#                     this script reads the file where it can tell exactly
+#                     what that decoder makes of it (read_cutoffs). When the
 #                     file is missing, cannot be read, or the app rejects
 #                     it, the cutoffs the app recorded for the session in
 #                     state.json (sessionCutoffs) apply, read by the same
 #                     binary, or here when it cannot answer; the defaults,
-#                     10% and on, only for a session recorded without them
-#                     (an older build); and the strictest, 95% and on, when
-#                     nothing tells which apply. A journal the app would not
+#                     10% and on, when the journal records none; and the
+#                     strictest, 95% and on, when config.json is there but
+#                     cannot be read either way and the journal records
+#                     none. A journal the app would not
 #                     load stops the run first, the session kept (below).
 #                     A battery present but unreadable,
 #                     or a failing pmset, ends too (fail closed). No battery
@@ -257,6 +260,7 @@ STAT=/usr/bin/stat
 CAT=/bin/cat
 GREP=/usr/bin/grep
 HEAD=/usr/bin/head
+TAIL=/usr/bin/tail
 TR=/usr/bin/tr
 ICONV=/usr/bin/iconv
 ID=/usr/bin/id
@@ -323,13 +327,31 @@ LOCK="$APP_SUPPORT/.recovery.lock"
 ALIVE="$APP_SUPPORT/.app.alive"
 LOG="$LOG_DIR/insomnia.log"
 
+# Whether the file at $1 ends in a line cut short: it is a regular file, not
+# empty, and its last byte is not a newline, or that byte cannot be read.
+# Every writer of the log then puts a newline before its own line, in the
+# same write, so the line cut short stays a line of its own: it may be the
+# record of a session's end whose newline alone is missing, which counts as
+# the end only while nothing follows it on its line (end_recorded_in_log),
+# or a line a write left partway, which a record must not join. The app's
+# writers read the same way (OwnerOnly.endsMidLine). The trailing x keeps
+# the newline that command substitution would drop.
+ends_mid_line() { # file
+  [[ -f "$1" && -s "$1" ]] || return 1
+  local last
+  last="$("$TAIL" -c 1 "$1" 2>/dev/null; printf x)"
+  [[ "$last" != $'\nx' ]]
+}
+
 log() { # level message
   "$MKDIR" -p "$LOG_DIR"
   # Append only to a regular file, or create one. open(2) on a FIFO with no
   # reader blocks, and most lines are written while this run holds the
   # recovery lock. A line with nowhere to go is dropped.
   if [[ -e "$LOG" && ! -f "$LOG" ]]; then return 0; fi
-  printf '%s [%s] backstop: %s\n' "$("$DATE" -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" >> "$LOG"
+  local first=""
+  if ends_mid_line "$LOG"; then first=$'\n'; fi
+  printf '%s%s [%s] backstop: %s\n' "$first" "$("$DATE" -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" >> "$LOG"
 }
 
 # --- Lock --------------------------------------------------------------------
@@ -382,7 +404,8 @@ extract_json() { # file keypath
 # A whole number at keypath $2, as digits with an optional minus sign.
 # plutil prints one written with a fraction or an exponent, such as 5105.0,
 # with six zeros after a point (5105.000000); record_text_problems has
-# found it whole and within 2^53, so the zeros are dropped, and -0 is 0.
+# found it whole and held exactly by a Double, so the zeros are dropped,
+# and -0 is 0.
 extract_whole() { # file keypath
   local v
   v="$(extract "$1" "$2")" || return 1
@@ -575,9 +598,14 @@ supervise_command() { # base command args...
 # status, or 124 when it was stopped. Its output goes through
 # .backstop.<this run's pid>.<call>.out, which this call removes, and the
 # first call of a run removes what earlier runs left (remove_stale_run_files).
+# With read_keep at 1 the output stays in that file, exact to the byte, and
+# kept_output names it (empty when the read was stopped); the variable is
+# left empty and the caller removes the file.
 # The function's stderr is /dev/null because bash reports a job that a signal
 # ended on its own stderr; the log says what happened instead.
 read_input=""   # file for the next read's standard input; empty: /dev/null
+read_keep=0
+kept_output=""
 run_read() { # varname command args...
   local name="$1" outfile cpid rc=0 read_output=""
   shift
@@ -606,9 +634,12 @@ run_read() { # varname command args...
       fi
     fi
   fi
-  if (( rc != 124 )) && [[ -f "$outfile" ]]; then read_output="$("$CAT" "$outfile")"; fi
+  kept_output=""
+  if (( rc != 124 )) && [[ -f "$outfile" ]]; then
+    if (( read_keep == 1 )); then kept_output="$outfile"; else read_output="$("$CAT" "$outfile")"; fi
+  fi
   printf -v "$name" '%s' "$read_output"
-  "$RM" -f "$outfile"
+  [[ -n "$kept_output" ]] || "$RM" -f "$outfile"
   return "$rc"
 } 2>/dev/null
 
@@ -692,30 +723,53 @@ stop_transaction() { # what
 }
 
 # Prints one line per way the text of state.json $1 would not decode in the
-# app, or would read otherwise than plutil reads it, or nothing. Read from
-# the text itself, not through plutil, which keeps the last of two copies
-# of a key where the app's JSONDecoder keeps the first, turns a number too
-# small for a Double, such as 1e-400, into 0.0, and reads 1., .5, +1,
-# single quotes, keys without quotes, comments and other JSON5 forms the
-# app refuses. The text is followed the way the app reads it: every object
-# and array, at any depth, key by key and value by value. What the app
-# decodes (RuntimeState.swift) is checked: the top level, the arrays under
-# frozenProcesses, frozenPids, savedAudioOutputs and appNapOverrides, the
-# objects in them, and the value under each key the app reads in those
-# objects. The rest is followed but not checked, as the app skips it: a
-# key it does not read and what is under that key, and what is inside an
-# object or array where the app reads no object or array, such as one
-# under sessionCutoffs. In what is checked, a key's \u escapes are decoded,
-# so "keptDisplayReadL\u0069t" is that key, and a Kelvin sign (U+212A),
-# written as such or as \u212A, is read as K, since the app's keys match
-# it as K. A string is stepped over to its closing quote, so a saved audio
-# name or UID that holds a key, a bracket or a bad number holds none of
-# them. A file in UTF-16, which the app reads but never writes, is read
-# through iconv(1) as UTF-8, its byte order taken from its byte order mark
-# or from where its first NUL byte is, as the app's decoder takes it.
+# app, or would read otherwise than plutil reads it, or nothing. With config
+# as $2, the same for config.json and the app's Config decoder
+# (Config.swift), which read_cutoffs in backstop.sh uses when the app's
+# binary cannot answer. Read from the text itself, not through plutil,
+# which keeps the last of two copies of a key where the app's JSONDecoder
+# keeps the first, turns a number too small for a Double, such as 1e-400,
+# into 0.0, and reads 1., .5, +1, single quotes, keys without quotes,
+# comments and other JSON5 forms the app refuses. The text is followed the
+# way the app reads it: every object and array, at any depth, key by key
+# and value by value. What the app decodes (RuntimeState.swift) is
+# checked: the top level, the arrays under frozenProcesses, frozenPids,
+# savedAudioOutputs and appNapOverrides, the objects in them, and the
+# value under each key the app reads in those objects. In config.json:
+# the top level, the arrays under presets, freezeList, agentList and
+# tmuxTargets, the object under lidCloseDefaultsNotice, and the values the
+# app reads in them. The rest is followed but not checked, as the app
+# skips it: a key it does not read and what is under that key, and what is
+# inside an object or array where the app reads no object or array, such
+# as one under sessionCutoffs. In a frozen process the app reads
+# startedAtMicros only after a startedAt that is there and not null, and
+# bootSession only after both (FrozenProcess): an entry without them has
+# no identity, and the app skips what follows, so it is not checked
+# either. The app reads sessionCutoffs as no record when it is not one the
+# app writes (RuntimeState.decodeSessionCutoffs), so its value is skipped
+# too, and what would make plutil read it otherwise than the app is
+# printed with "record: " in front: a string with an escape JSON does not
+# have, or the key twice. Such a record is foreign to the agent's reader
+# (journal_cutoffs); the journal still loads. In config.json, each value
+# checked must also have the type the app's Config decoder takes there,
+# null too where it reads the key with decodeIfPresent, and a
+# lidCloseDefaultsNotice object must hold both its keys. Those lines start
+# with "type: ": in a text with no other line, the app rejects the file for
+# them. Any other line means this reader cannot tell what the app makes of
+# the file (config_cutoffs in backstop.sh). In what is checked, a key's
+# \u escapes are decoded, so "keptDisplayReadL\u0069t" is that key, and a
+# Kelvin sign (U+212A), written as such or as \u212A, is read as K, since
+# the app's keys match it as K. A string is stepped over to its closing
+# quote, so a saved audio name or UID that holds a key, a bracket or a bad
+# number holds none of them. A file in UTF-16 or UTF-32, which the app
+# reads but never writes, is read through iconv(1) as UTF-8, its encoding
+# taken from a byte order mark (UTF-16's, or UTF-32BE's) or from where its
+# first NUL bytes are, as the app's decoder takes it.
 # Refused:
 #   - a key the app reads, found more than once in one object it reads,
-#     since plutil checks and republishes the last copy.
+#     since plutil checks and republishes the last copy. In a frozen
+#     process, startedAtMicros and bootSession only where the app reads
+#     them.
 #   - in what is checked, a string or key with an escape JSON does not
 #     have, such as \x41, which plutil reads as A. In a key, nothing after
 #     it is read.
@@ -731,20 +785,28 @@ stop_transaction() { # what
 #     digit and so small that it rounds to 0 (below about 7.0065e-46). The
 #     range is read from the decimal exponent and the first 9 significant
 #     digits, a little stricter than the app (from 3.40282356e38 and up to
-#     7.01e-46), where no level lies.
+#     7.01e-46), where no level lies. The same for a Double (config.json's
+#     presets, defaultPreset, maxDuration and nudgeThreshold): above about
+#     1.7976931348623157e308 (from 1.79769313e308 here), or rounding to 0
+#     (up to 2.47032823e-324 here).
 #   - a number where the app reads an Int32 (a frozen process's pid and
-#     startedAtMicros, a legacy frozen pid) or an Int64 (its startedAt)
-#     that is not a whole number the type holds. One written with a
-#     fraction or an exponent, such as 5105.0 or 1e2, passes when its exact
-#     decimal value is whole and at most 9007199254740992 (2^53) from 0, so
-#     plutil's double holds it exactly; plutil prints it with a fraction of
-#     zeros, which backstop.sh drops where it reads one (extract_whole).
-#     The app also reads larger ones, and ones a Double rounds to a whole
-#     number, such as 1.0000000000000001; they are refused here.
+#     startedAtMicros, a legacy frozen pid) or an Int64 (its startedAt, and
+#     config.json's lowPowerFloor and endFloor) that is not a whole number
+#     the type holds. One written with a fraction or an exponent, such as
+#     5105.0 or 1e18, passes when its exact decimal value is whole and the
+#     type holds it, and, for an Int64, a Double holds it exactly, so
+#     plutil reads the same number; plutil prints it with a fraction of
+#     zeros, which backstop.sh drops where it reads one (extract_whole). An
+#     Int64 written so reaches -9223372036854775807, not
+#     -9223372036854775808, which the app refuses as -9223372036854775808.0.
+#     The app also reads such Int64s that a Double does not hold, such as
+#     9007199254740993.0, and numbers a Double rounds to a whole number,
+#     such as 1.0000000000000001 or 1e-99999; they are refused here.
 #   - text this reader cannot follow: a key without quotes, a comment, a
-#     byte order mark other than UTF-8's or UTF-16's, a NUL byte in UTF-8
-#     or in the UTF-8 read from UTF-16, or UTF-16 iconv cannot read.
-#     UTF-32, which the app reads without a byte order mark, is refused
+#     byte order mark other than UTF-8's, UTF-16's or UTF-32BE's, a NUL
+#     byte in UTF-8 or in the UTF-8 read from UTF-16 or UTF-32, NUL bytes
+#     where neither encoding puts them, or text iconv cannot read. UTF-32LE
+#     with a byte order mark, which the app and plutil refuse, is refused
 #     that way.
 # A string, object or array where a number belongs is left to the type
 # check. plutil -convert, which runs first, refuses what it cannot parse
@@ -752,13 +814,14 @@ stop_transaction() { # what
 # as 01, a number too large for a Double such as 1e400, an escape such as
 # \a or \u0000, a lone surrogate. The app reads some of what is refused
 # here or by plutil, and never writes any of it. Any of these makes the
-# journal malformed, as for a wrong type, and nothing is undone.
-record_text_problems() { # file
+# journal malformed, as for a wrong type, and nothing is undone; in
+# config.json, config_cutoffs does not use the file.
+record_text_problems() { # file [config]
   local LC_ALL=C
-  local text rest raw name c token want d vpath vshown kind limit list seen nm n rel from
-  local str strict scalar number int lax esc kelvin hex lost
-  local digits sig exp e10 lead frac whole scale pad
-  local -a kinds paths shown keys names counts rels knowns
+  local text rest raw name c c2 c3 token want d vpath vshown kind limit list seen nm n rel from
+  local str strict scalar number int lax esc kelvin hex lost nul doc nl problem skipped line
+  local digits sig exp e10 lead frac whole scale pad odd allowed cls
+  local -a kinds paths shown keys names counts rels knowns begun timed mdecoded mskipped bdecoded bskipped
   str='^"([^"\\]|\\.)*"'
   strict='^"([^"\\]|\\["\\/bfnrt]|\\u[0-9A-Fa-f]{4})*"$'
   scalar='^[^],}[:space:]]+'
@@ -768,15 +831,29 @@ record_text_problems() { # file
   esc='^u00(4[1-9A-Fa-f]|5[0-9Aa]|6[1-9A-Fa-f]|7[0-9Aa])'
   kelvin='^u212[Aa]'
   hex='^u[0-9A-Fa-f]{4}'
-  lost="the text of state.json cannot be followed here, so the keys the app reads in it cannot be checked"
-  # c is what comes before the first NUL byte, if there is one. The shell
-  # drops NUL bytes from text, so UTF-8 with one is never read here.
+  nul='^null([],}[:space:]]|$)'
+  nl=$'\n'
+  doc=state.json
+  [[ "${2:-}" != config ]] || doc=config.json
+  lost="the text of $doc cannot be followed here, so the keys the app reads in it cannot be checked"
+  # c, c2 and c3 are what comes before the first, second and third NUL
+  # byte, if there is one; xx when there is no second or third. The shell
+  # drops NUL bytes from text, so UTF-8 with one is never read here. As in
+  # the app's decoder, the first four bytes 00 00 00 x are UTF-32BE (and
+  # 00 00 FE FF, its byte order mark), x 00 00 00 UTF-32LE, 00 x 00 x
+  # UTF-16BE and x 00 x 00 UTF-16LE.
   if IFS= read -r -d '' c < "$1"; then
+    { IFS= read -r -d '' c; IFS= read -r -d '' c2 || c2=xx; IFS= read -r -d '' c3 || c3=xx; } < "$1"
+    from=""
     case "$c" in
-      ''|$'\xfe\xff') from=UTF-16BE ;;
-      ?|$'\xff\xfe'?) from=UTF-16LE ;;
-      *) echo "$lost"; return 0 ;;
+      $'\xfe\xff') from=UTF-16BE ;;
+      $'\xff\xfe'?) from=UTF-16LE ;;
+      '')
+        if [[ -z "$c2" && ( -z "$c3" || "$c3" == $'\xfe\xff' ) ]]; then from=UTF-32BE; elif (( ${#c2} == 1 )); then from=UTF-16BE; fi ;;
+      ?)
+        if [[ -z "$c2" && -z "$c3" ]]; then from=UTF-32LE; elif (( ${#c2} == 1 )); then from=UTF-16LE; fi ;;
     esac
+    [[ -n "$from" ]] || { echo "$lost"; return 0; }
     if ! text="$("$ICONV" -f "$from" -t UTF-8 < "$1" 2> /dev/null)" ||
       IFS= read -r -d '' c < <("$ICONV" -f "$from" -t UTF-8 < "$1" 2> /dev/null); then
       echo "$lost"
@@ -793,9 +870,15 @@ record_text_problems() { # file
   # (frozenProcesses[]), shown the same as a log names it
   # (frozenProcesses[0]), keys its last key, rels 1 when it is checked,
   # knowns the keys the app reads in it, names those of its keys, and
-  # counts the values an array has had. want is what comes next: a key, a
-  # colon, a value, or a comma or the end (next). rel is 1 when the value
-  # about to be read is checked.
+  # counts the values an array has had. In a frozen process, begun is 1
+  # once a startedAt that is not null was read and timed once a
+  # startedAtMicros was, and mdecoded, mskipped, bdecoded and bskipped
+  # hold what is wrong with its startedAtMicros and bootSession when the
+  # app reads them and when it skips them, printed at the end of the
+  # object. want is what comes next: a key, a colon, a value, or a comma
+  # or the end (next). rel is 1 when the value about to be read is
+  # checked. problem is what is wrong with a value the app reads, skipped
+  # what is wrong with it when the app skips it.
   d=0
   want=value
   while :; do
@@ -804,6 +887,8 @@ record_text_problems() { # file
     vpath=""
     vshown=""
     rel=0
+    allowed=""
+    cls=""
     if [[ "$want" == value ]] && (( d > 0 )); then
       if [[ "${kinds[d]}" == "{" ]]; then
         vpath="${paths[d]:+${paths[d]}.}${keys[d]}"
@@ -814,10 +899,27 @@ record_text_problems() { # file
         vshown="${shown[d]}[${counts[d]}]"
         rel="${rels[d]}"
       fi
+      if (( rel == 1 )); then
+        # allowed is what the app's Config decoder takes there, null where
+        # it reads the key with decodeIfPresent.
+        case "$doc:$vpath" in
+          'state.json:frozenProcesses[].startedAt') [[ "$rest" =~ $nul ]] || begun[d]=1 ;;
+          'state.json:frozenProcesses[].startedAtMicros') [[ "$rest" =~ $nul ]] || timed[d]=1 ;;
+          config.json:presets|config.json:freezeList|config.json:agentList|config.json:tmuxTargets) allowed='|array|null|' ;;
+          config.json:lidCloseDefaultsNotice) allowed='|object|null|' ;;
+          config.json:defaultPreset|config.json:maxDuration|config.json:nudgeThreshold|config.json:lowPowerFloor|config.json:endFloor) allowed='|number|null|' ;;
+          config.json:hotspotSSID|config.json:launchAtLoginInstall) allowed='|string|null|' ;;
+          config.json:freezeAllApps|config.json:dockerRule|config.json:muteOnLidClose|config.json:darkenDisplayOnLidClose|config.json:lowPowerOnLidClose|config.json:disableAppNapForAgents|config.json:thermalRules|config.json:tmuxNudgePressesEnter|config.json:launchAtLogin|config.json:lidCloseDefaultsApplied) allowed='|bool|null|' ;;
+          'config.json:presets[]') allowed='|number|' ;;
+          'config.json:freezeList[]'|'config.json:agentList[]'|'config.json:tmuxTargets[]') allowed='|string|' ;;
+          config.json:lidCloseDefaultsNotice.turnedOffFreezeAll|config.json:lidCloseDefaultsNotice.turnedOnMute) allowed='|bool|' ;;
+        esac
+      fi
     fi
     case "$c" in
       '{'|'[')
         [[ "$want" == value ]] || { echo "$lost"; return 0; }
+        if [[ "$c" == "{" ]]; then cls="an object"; else cls="an array"; fi
         d=$((d + 1))
         (( d > 1 )) || rel=1
         kinds[d]="$c"
@@ -828,22 +930,31 @@ record_text_problems() { # file
         counts[d]=0
         knowns[d]=""
         rels[d]=0
+        begun[d]=0
+        timed[d]=0
+        mdecoded[d]=""
+        mskipped[d]=""
+        bdecoded[d]=""
+        bskipped[d]=""
         if [[ "$c" == "{" ]]; then
           want=key
           if (( rel == 1 )); then
-            case "$vpath" in
-              '') knowns[d]='|sleepDisabledByUs|lowPowerSetByUs|frozenProcesses|frozenPids|dockerFrozen|savedAudioOutputs|savedOutputVolume|savedMuted|savedDisplayBrightness|savedKeyboardBrightness|displayRestoredUnderLowPower|displayRestoreRefused|keyboardRestoreRefused|keptDisplayUnderLowPower|keptDisplayUnderLowPowerBoot|keptDisplayReadLit|appNapOverrides|endedSession|sessionCutoffs|' ;;
-              'frozenProcesses[]') knowns[d]='|pid|startedAt|startedAtMicros|bootSession|' ;;
-              'savedAudioOutputs[]') knowns[d]='|deviceUID|name|volume|muted|saveID|' ;;
-              'appNapOverrides[]') knowns[d]='|bundleId|previous|' ;;
+            case "$doc:$vpath" in
+              state.json:) knowns[d]='|sleepDisabledByUs|lowPowerSetByUs|frozenProcesses|frozenPids|dockerFrozen|savedAudioOutputs|savedOutputVolume|savedMuted|savedDisplayBrightness|savedKeyboardBrightness|displayRestoredUnderLowPower|displayRestoreRefused|keyboardRestoreRefused|keptDisplayUnderLowPower|keptDisplayUnderLowPowerBoot|keptDisplayReadLit|appNapOverrides|endedSession|sessionCutoffs|' ;;
+              'state.json:frozenProcesses[]') knowns[d]='|pid|startedAt|startedAtMicros|bootSession|' ;;
+              'state.json:savedAudioOutputs[]') knowns[d]='|deviceUID|name|volume|muted|saveID|' ;;
+              'state.json:appNapOverrides[]') knowns[d]='|bundleId|previous|' ;;
+              config.json:) knowns[d]='|presets|defaultPreset|maxDuration|freezeList|freezeAllApps|dockerRule|muteOnLidClose|darkenDisplayOnLidClose|lowPowerOnLidClose|agentList|disableAppNapForAgents|lowPowerFloor|endFloor|thermalRules|hotspotSSID|nudgeThreshold|tmuxTargets|tmuxNudgePressesEnter|launchAtLogin|launchAtLoginInstall|lidCloseDefaultsApplied|lidCloseDefaultsNotice|' ;;
+              config.json:lidCloseDefaultsNotice) knowns[d]='|turnedOffFreezeAll|turnedOnMute|' ;;
             esac
             [[ -z "${knowns[d]}" ]] || rels[d]=1
           fi
         else
           want=value
           if (( rel == 1 )); then
-            case "$vpath" in
-              frozenProcesses|frozenPids|savedAudioOutputs|appNapOverrides) rels[d]=1 ;;
+            case "$doc:$vpath" in
+              state.json:frozenProcesses|state.json:frozenPids|state.json:savedAudioOutputs|state.json:appNapOverrides) rels[d]=1 ;;
+              config.json:presets|config.json:freezeList|config.json:agentList|config.json:tmuxTargets) rels[d]=1 ;;
             esac
           fi
         fi
@@ -868,12 +979,28 @@ record_text_problems() { # file
               n=$((n + 1))
               token="|${token#*"|$nm|"}"
             done
-            if (( n > 1 && d == 1 )); then
-              echo "$nm is in the top level of state.json $n times; the app reads the first and plutil the last"
-            elif (( n > 1 )); then
-              echo "${shown[d]} has $nm $n times; the app reads the first and plutil the last"
+            (( n > 1 )) || continue
+            if (( d == 1 )); then
+              line="$nm is in the top level of $doc $n times; the app reads the first and plutil the last"
+            else
+              line="${shown[d]} has $nm $n times; the app reads the first and plutil the last"
             fi
+            case "$doc:${paths[d]}:$nm" in
+              state.json::sessionCutoffs) echo "record: $line" ;;
+              'state.json:frozenProcesses[]:startedAtMicros') mdecoded[d]+="$line$nl" ;;
+              'state.json:frozenProcesses[]:bootSession') bdecoded[d]+="$line$nl" ;;
+              *) echo "$line" ;;
+            esac
           done
+          if [[ "$doc:${paths[d]}" == config.json:lidCloseDefaultsNotice && "${rels[d]}" == 1 ]]; then
+            for nm in turnedOffFreezeAll turnedOnMute; do
+              [[ "${names[d]}" == *"|$nm|"* ]] || echo "type: lidCloseDefaultsNotice has no $nm, which the app's decoder requires there"
+            done
+          fi
+          if [[ "$doc:${paths[d]}" == 'state.json:frozenProcesses[]' ]]; then
+            if (( begun[d] == 1 )); then printf '%s' "${mdecoded[d]}"; else printf '%s' "${mskipped[d]}"; fi
+            if (( begun[d] == 1 && timed[d] == 1 )); then printf '%s' "${bdecoded[d]}"; else printf '%s' "${bskipped[d]}"; fi
+          fi
         else
           [[ "${kinds[d]}" == "[" && ( "$want" == value || "$want" == next ) ]] || { echo "$lost"; return 0; }
         fi
@@ -922,7 +1049,7 @@ record_text_problems() { # file
               else
                 case "${raw:0:1}" in
                   '"'|\\|/|b|f|n|r|t) name+="?"; raw="${raw:1}" ;;
-                  *) echo "a key in state.json has an escape JSON does not have, so the keys the app reads in it cannot be checked"; return 0 ;;
+                  *) echo "a key in $doc has an escape JSON does not have, so the keys the app reads in it cannot be checked"; return 0 ;;
                 esac
               fi
             done
@@ -936,8 +1063,15 @@ record_text_problems() { # file
           fi
           want="colon"
         elif [[ "$want" == value ]]; then
+          cls="a string"
           if (( rel == 1 )) && ! [[ "$raw" =~ $strict ]]; then
-            echo "$vshown is a string with an escape JSON does not have, which the app does not read"
+            problem="$vshown is a string with an escape JSON does not have, which the app does not read"
+            case "$doc:$vpath" in
+              state.json:sessionCutoffs) echo "record: $problem" ;;
+              'state.json:frozenProcesses[].startedAtMicros') mdecoded[d]+="$problem$nl" ;;
+              'state.json:frozenProcesses[].bootSession') bdecoded[d]+="$problem$nl" ;;
+              *) echo "$problem" ;;
+            esac
           fi
           want=next
           if [[ "${kinds[d]}" == "[" ]]; then counts[d]=$((counts[d] + 1)); fi
@@ -954,19 +1088,30 @@ record_text_problems() { # file
         [[ "$want" == value && "$rest" =~ $scalar ]] || { echo "$lost"; return 0; }
         token="${BASH_REMATCH[0]}"
         rest="${rest:${#token}}"
+        problem=""
+        skipped=""
+        [[ "$token" =~ $lax || "$token" == null || "$token" == true || "$token" == false ]] ||
+          skipped="$vshown is written as ${token:0:40}, which is not a JSON value the app reads"
         kind=any
         if (( rel == 1 )); then
-          case "$vpath" in
-            keptDisplayUnderLowPower|keptDisplayReadLit|displayRestoredUnderLowPower|savedOutputVolume|savedDisplayBrightness|savedKeyboardBrightness|'savedAudioOutputs[].volume') kind=float ;;
-            'frozenProcesses[].pid'|'frozenProcesses[].startedAtMicros'|'frozenPids[]') kind=int32 ;;
-            'frozenProcesses[].startedAt') kind=int64 ;;
+          case "$doc:$vpath" in
+            state.json:keptDisplayUnderLowPower|state.json:keptDisplayReadLit|state.json:displayRestoredUnderLowPower|state.json:savedOutputVolume|state.json:savedDisplayBrightness|state.json:savedKeyboardBrightness|'state.json:savedAudioOutputs[].volume') kind=float ;;
+            'state.json:frozenProcesses[].pid'|'state.json:frozenProcesses[].startedAtMicros'|'state.json:frozenPids[]') kind=int32 ;;
+            'state.json:frozenProcesses[].startedAt'|config.json:lowPowerFloor|config.json:endFloor) kind=int64 ;;
+            'config.json:presets[]'|config.json:defaultPreset|config.json:maxDuration|config.json:nudgeThreshold) kind=double ;;
+            state.json:sessionCutoffs) rel=0 ;;
           esac
         fi
+        case "$token" in
+          true|false) cls="a bool" ;;
+          null) cls=null ;;
+          *) [[ ! "$token" =~ $number ]] || cls="a number" ;;
+        esac
         if [[ "$token" == null || "$token" == true || "$token" == false ]]; then
           :
         elif (( rel == 0 )); then
-          [[ "$token" =~ $lax ]] || echo "$vshown is written as ${token:0:40}, which is not a JSON value the app reads"
-        elif [[ "$token" =~ $number && "$kind" == float ]]; then
+          problem="$skipped"
+        elif [[ "$token" =~ $number && ( "$kind" == float || "$kind" == double ) ]]; then
           digits="${BASH_REMATCH[1]}${BASH_REMATCH[3]}"
           sig="${digits#"${digits%%[1-9]*}"}"
           if [[ -n "$sig" ]]; then
@@ -980,10 +1125,16 @@ record_text_problems() { # file
             e10=$((e10 + ${#BASH_REMATCH[1]} - 1 - (${#digits} - ${#sig})))
             lead="${sig}00000000"
             lead=$((10#${lead:0:9}))
-            if (( e10 < -46 || (e10 == -46 && lead < 701000000) )); then
-              echo "$vshown is ${token:0:40}, too small a number for the app to read"
-            elif (( e10 > 38 || (e10 == 38 && lead > 340282355) )); then
-              echo "$vshown is ${token:0:40}, too large a number for the app to read"
+            if [[ "$kind" == float ]]; then
+              if (( e10 < -46 || (e10 == -46 && lead < 701000000) )); then
+                problem="$vshown is ${token:0:40}, too small a number for the app to read"
+              elif (( e10 > 38 || (e10 == 38 && lead > 340282355) )); then
+                problem="$vshown is ${token:0:40}, too large a number for the app to read"
+              fi
+            elif (( e10 < -324 || (e10 == -324 && lead < 247032823) )); then
+              problem="$vshown is ${token:0:40}, too small a number for the app to read"
+            elif (( e10 > 308 || (e10 == 308 && lead > 179769312) )); then
+              problem="$vshown is ${token:0:40}, too large a number for the app to read"
             fi
           fi
         elif [[ "$token" =~ $number && "$kind" == int* ]]; then
@@ -1008,7 +1159,7 @@ record_text_problems() { # file
             whole="${sig%"${sig##*[1-9]}"}"
             scale=$((e10 - ${#frac} + ${#sig} - ${#whole}))
             if (( scale < 0 )); then
-              echo "$vshown is ${token:0:40}, which is not a whole number, where the app reads one"
+              problem="$vshown is ${token:0:40}, which is not a whole number, where the app reads one"
               whole=""
             elif (( ${#whole} + scale > 19 )); then
               whole=9999999999999999999
@@ -1018,28 +1169,41 @@ record_text_problems() { # file
             fi
           fi
           if [[ -n "$whole" ]]; then
-            if [[ "$kind" == int32 ]]; then limit=2147483647; elif [[ "$token" =~ $int ]]; then limit=9223372036854775807; else limit=9007199254740992; fi
-            if [[ "$token" == -* && "$limit" != 9007199254740992 ]]; then limit="${limit%7}8"; fi
+            if [[ "$kind" == int32 ]]; then limit=2147483647; else limit=9223372036854775807; fi
+            if [[ "$token" == -* ]] && [[ "$kind" == int32 || "$token" =~ $int ]]; then limit="${limit%7}8"; fi
             # shellcheck disable=SC2071  # digit strings of one length, compared as text: the limits overflow $(( ))
             if (( ${#whole} > ${#limit} )) || { (( ${#whole} == ${#limit} )) && [[ "$whole" > "$limit" ]]; }; then
-              if [[ "$limit" == 9007199254740992 ]]; then
-                echo "$vshown is ${token:0:40}, a whole number past 9007199254740992 written with a fraction or an exponent, which is not read here"
-              else
-                echo "$vshown is ${token:0:40}, a whole number the app cannot read there"
-              fi
+              problem="$vshown is ${token:0:40}, a whole number the app cannot read there"
+            elif [[ "$kind" == int64 ]] && ! [[ "$token" =~ $int ]]; then
+              # A Double holds it exactly when its odd part is below 2^53.
+              odd=$((10#$whole))
+              while (( odd > 0 && odd % 2 == 0 )); do odd=$((odd / 2)); done
+              (( odd < 9007199254740992 )) ||
+                problem="$vshown is ${token:0:40}, a whole number a Double does not hold, written with a fraction or an exponent, so plutil reads another; not read here"
             fi
           fi
         elif [[ "$token" =~ $number ]]; then
           :
-        elif [[ "$kind" == float ]]; then
-          echo "$vshown is written as ${token:0:40}, which the app does not read as a number"
+        elif [[ "$kind" == float || "$kind" == double ]]; then
+          problem="$vshown is written as ${token:0:40}, which the app does not read as a number"
         else
-          echo "$vshown is written as ${token:0:40}, which is not a JSON value the app reads"
+          problem="$vshown is written as ${token:0:40}, which is not a JSON value the app reads"
         fi
+        case "$doc:$vpath" in
+          'state.json:frozenProcesses[].startedAtMicros')
+            mdecoded[d]+="${problem}${problem:+$nl}"
+            mskipped[d]+="${skipped}${skipped:+$nl}" ;;
+          'state.json:frozenProcesses[].bootSession')
+            bdecoded[d]+="${problem}${problem:+$nl}"
+            bskipped[d]+="${skipped}${skipped:+$nl}" ;;
+          *) [[ -z "$problem" ]] || echo "$problem" ;;
+        esac
         want=next
         if [[ "${kinds[d]}" == "[" ]]; then counts[d]=$((counts[d] + 1)); fi
         ;;
     esac
+    [[ -z "$cls" || -z "$allowed" || "$allowed" == *"|${cls##* }|"* ]] ||
+      echo "type: $vshown is $cls, which the app's decoder does not take there"
   done
   return 0
 }
@@ -1048,7 +1212,7 @@ record_text_problems() { # file
 # (RuntimeState.swift). Present keys must have the right type; a JSON null is
 # the same as an absent optional (Swift decodeIfPresent).
 journal_shape_problems() { # file
-  local f="$1" key t i n
+  local f="$1" key t i n line
   if [[ "$("$PLUTIL" -convert json -o - "$f" 2>/dev/null | "$HEAD" -c 1)" != "{" ]]; then
     echo "state.json is not a JSON object"
     return 0
@@ -1076,7 +1240,11 @@ journal_shape_problems() { # file
   done
   t="$(type_of "$f" keptDisplayUnderLowPowerBoot)"
   [[ -z "$t" || "$t" == string || "$t" == "(any)" ]] || echo "keptDisplayUnderLowPowerBoot is a $t, not a string"
-  record_text_problems "$f"
+  # A foreign record (lines with "record: " in front) leaves the journal
+  # loadable; journal_cutoffs reads it.
+  while IFS= read -r line; do
+    [[ "$line" == "record: "* ]] || printf '%s\n' "$line"
+  done < <(record_text_problems "$f")
   t="$(type_of "$f" frozenProcesses)"
   if [[ -n "$t" && "$t" != "(any)" ]]; then
     if [[ "$t" != array ]]; then
@@ -1088,15 +1256,22 @@ journal_shape_problems() { # file
           echo "frozenProcesses[$i] is not an object"
         else
           # A float here is a whole number written as one, such as
-          # 5105.0; record_text_problems refuses any other.
+          # 5105.0; record_text_problems refuses any other. As in
+          # FrozenProcess, startedAtMicros counts only after a startedAt
+          # that is there and not null, and bootSession only after both;
+          # an entry without them has no identity, and the app does not
+          # read what follows.
           t="$(type_of "$f" "frozenProcesses.$i.pid")"
           [[ "$t" == integer || "$t" == float ]] || echo "frozenProcesses[$i].pid is not an integer"
-          for n in startedAt startedAtMicros; do
+          for n in startedAt startedAtMicros bootSession; do
             t="$(type_of "$f" "frozenProcesses.$i.$n")"
-            [[ -z "$t" || "$t" == integer || "$t" == float || "$t" == "(any)" ]] || echo "frozenProcesses[$i].$n is a $t, not an integer"
+            [[ -n "$t" && "$t" != "(any)" ]] || break
+            if [[ "$n" == bootSession ]]; then
+              [[ "$t" == string ]] || echo "frozenProcesses[$i].bootSession is a $t, not a string"
+            else
+              [[ "$t" == integer || "$t" == float ]] || echo "frozenProcesses[$i].$n is a $t, not an integer"
+            fi
           done
-          t="$(type_of "$f" "frozenProcesses.$i.bootSession")"
-          [[ -z "$t" || "$t" == string || "$t" == "(any)" ]] || echo "frozenProcesses[$i].bootSession is a $t, not a string"
         fi
         i=$((i + 1))
       done
@@ -1709,8 +1884,9 @@ app_alive() {
 }
 
 # The end floor and thermal rule the app enforces. The app decides what its
-# files mean, so this script never parses config.json itself, and reads the
-# journal's sessionCutoffs itself only when the app's binary cannot. It
+# files mean, so this script reads config.json and the journal's
+# sessionCutoffs itself only when the app's binary cannot answer for them,
+# and then only where it can tell exactly what the app makes of them. It
 # hands a file's bytes on standard input to one of the installed app
 # binary's one-shot modes (AgentCutoffsCommand.swift), which decodes them
 # with the app's own decoder and prints the cutoffs. The file is opened
@@ -1726,134 +1902,241 @@ app_alive() {
 #     error in any other field). "cutoffs <floor> <true|false>" with exit 0
 #     is that floor and rule, the ones the app takes from a file that
 #     decodes (Config.agentCutoffs). "rejected" with exit 65 is a file the
-#     app does not use; the cutoffs below apply.
+#     app does not use; the journal's record applies, as below.
+#   - the binary cannot answer for config.json (missing or not executable,
+#     a bundle whose Info.plist does not declare InsomniaAgentCutoffsVersion
+#     AGENT_CUTOFFS_VERSION, since an older build has no such mode and would
+#     open the menu bar app instead, a timeout, another exit status or
+#     answer): config_cutoffs reads the file here, with an error logged. A
+#     file it finds the app decodes gives that floor and rule, as from the
+#     binary; one it finds the app rejects counts as rejected. Any other
+#     leaves the journal's record, and without one the strictest (below).
+#     The binary is not run again on the journal.
 #   - config.json missing, a dangling symlink, not a regular file (never
 #     opened: open(2) on a FIFO blocks), not readable by this user, or
 #     rejected: the cutoffs the app enforces for this session, which it
 #     records in state.json (sessionCutoffs) before the session starts or
-#     resumes and before a change to them takes effect. No state.json at
-#     all gives the app's defaults (Config.agentDefaultCutoffs), 10% and
-#     on, which an older build, one that recorded none, enforced there.
-#     Otherwise the journal must first load as the app loads it
-#     (check_journal). One that does not stops the run with the session
-#     kept (refuse_malformed_journal): the app neither ends nor resumes a
-#     session on it, and nothing says which cutoffs it holds. Then
-#     `Insomnia --agent-session-cutoffs <seconds>` decodes the whole
+#     resumes and before a change to them takes effect. No state.json, or a
+#     symlink there to nothing, which the app reads as no journal
+#     (Store.readData) and replaces at its next write, gives the app's
+#     defaults (Config.agentDefaultCutoffs), 10% and on, what the app
+#     enforces while config.json is missing and it has recorded none (as an
+#     older build did). Otherwise the journal must first load as the app
+#     loads it (check_journal). One that does not stops the run with the
+#     session kept (refuse_malformed_journal): the app neither ends nor
+#     resumes a session on it, and nothing says which cutoffs it holds.
+#     Then `Insomnia --agent-session-cutoffs <seconds>` decodes the whole
 #     journal with the app's decoder (Store.decodeState) and reads
 #     sessionCutoffs from it. "cutoffs <floor> <true|false>" with exit 0 is
-#     that floor and rule; "none" with exit 0 (a session an older build
-#     started) the app's defaults; "rejected" with exit 65, a journal the
-#     app does not load, stops the run as above; "foreign" with exit 65, a
-#     value the app does not write and reads as none, gives the strictest
-#     cutoffs below.
-#   - the binary cannot answer for either file (missing or not executable,
-#     a bundle whose Info.plist does not declare InsomniaAgentCutoffsVersion
-#     AGENT_CUTOFFS_VERSION, since an older build has no such mode and would
-#     open the menu bar app instead, a timeout, another exit status or
-#     answer): the journal, once check_journal finds it loads, gives its
-#     sessionCutoffs, read here (journal_cutoffs), with an error logged. A
-#     record there is used. None is the app's defaults when config.json was
-#     missing or rejected, and the strictest cutoffs when config.json is
-#     there and only the binary failed: the app may enforce what it holds.
-#     A binary that failed on config.json is not run again on the journal.
-#   - anything else (state.json a symlink to nothing, a sessionCutoffs the
-#     app does not write, no record where config.json could not be read):
-#     the strictest cutoffs, a 95% end floor and thermal rules on, with an
-#     error logged. On battery power that ends the session below 95%; the
-#     run cannot tell which cutoffs the app enforces, and keeping sleep
-#     disabled on a lower floor than the app's is the worse error. These
-#     need not match the app, which reads such a value or link as no record
-#     and keeps its own settings, and rewrites them within a second while
-#     it answers.
+#     that floor and rule. "none" with exit 0 (no record) and "foreign" with
+#     exit 65 (a value the app does not write, which the app reads as none)
+#     give the app's defaults. "rejected" with exit 65, a journal the app
+#     does not load, stops the run as above. When the binary cannot answer
+#     for the journal, journal_cutoffs reads the record here, with an error
+#     logged.
+#   - config.json there and read neither by the binary nor here, and no
+#     record (none, a value the app does not write, no journal or a symlink
+#     to nothing): the strictest cutoffs, a 95% end floor and thermal rules
+#     on, with an error logged. Nothing on disk then says which cutoffs the
+#     app enforces; it may hold others from that file. On battery power
+#     this ends the session below 95%. The app rewrites the record within a
+#     second while it answers (publishSessionCutoffs), so this needs an app
+#     that has stopped answering.
+# The strictest cutoffs here, and the defaults where config.json is missing
+# or rejected and nothing is recorded, are stopgaps, not a decided policy:
+# docs/spec.md lists both as open.
 cutoff_floor=10
 cutoff_thermal=true
 read_cutoffs() {
   local answer_re='^cutoffs ([0-9]|[1-8][0-9]|9[0-5]) (true|false)$'
-  local why="" fallback ask_journal=1 record rule
+  local fallback failed what older="" defaults=1 ask_binary=1 record="" here=0 quiet=0 rule
   cutoff_floor=10
   cutoff_thermal=true
   if [[ -f "$CONFIG" && -r "$CONFIG" ]]; then
     ask_app_cutoffs --agent-cutoffs "$CONFIG"
-    if [[ -n "$cutoffs_why" ]]; then
-      fallback="could not read the end floor and thermal rule in $CONFIG: $cutoffs_why"
-      ask_journal=0
-    elif (( cutoffs_rc == 0 )) && [[ "$cutoffs_answer" =~ $answer_re ]]; then
+    if [[ -z "$cutoffs_why" ]] && (( cutoffs_rc == 0 )) && [[ "$cutoffs_answer" =~ $answer_re ]]; then
       cutoff_floor="${BASH_REMATCH[1]}"
       cutoff_thermal="${BASH_REMATCH[2]}"
       return 0
-    elif (( cutoffs_rc == 65 )) && [[ "$cutoffs_answer" == rejected ]]; then
+    elif [[ -z "$cutoffs_why" ]] && (( cutoffs_rc == 65 )) && [[ "$cutoffs_answer" == rejected ]]; then
       fallback="$CONFIG is rejected by the app"
     else
-      fallback="could not read the end floor and thermal rule in $CONFIG: $(cutoffs_failure --agent-cutoffs)"
-      ask_journal=0
-    fi
-  else
-    fallback="$CONFIG is missing or cannot be read"
-  fi
-  if [[ ! -e "$STATE" && ! -L "$STATE" ]]; then
-    (( ask_journal == 0 )) || return 0
-    why="$fallback, and there is no $STATE with cutoffs recorded for the session"
-  elif [[ ! -e "$STATE" ]]; then
-    why="$fallback, and $STATE, which holds the cutoffs recorded for the session, is a symlink to nothing"
-  else
-    check_journal
-    [[ "$journal_state" != malformed ]] || refuse_malformed_journal "its cutoffs are not read and it is not ended"
-    if (( ask_journal == 1 )); then
-      ask_app_cutoffs --agent-session-cutoffs "$STATE"
-      if [[ -n "$cutoffs_why" ]]; then
-        fallback="$fallback, and the app's binary could not read $STATE: $cutoffs_why"
-      elif (( cutoffs_rc == 0 )) && [[ "$cutoffs_answer" =~ $answer_re ]]; then
-        cutoff_floor="${BASH_REMATCH[1]}"
-        cutoff_thermal="${BASH_REMATCH[2]}"
-        return 0
-      elif (( cutoffs_rc == 0 )) && [[ "$cutoffs_answer" == none ]]; then
-        return 0
-      elif (( cutoffs_rc == 65 )) && [[ "$cutoffs_answer" == rejected ]]; then
-        journal_state=malformed
-        shape_problems="the app's decoder does not load it ('$INSOMNIA_BIN --agent-session-cutoffs' answered rejected)"
-        refuse_malformed_journal "its cutoffs are not read and it is not ended"
-      elif (( cutoffs_rc == 65 )) && [[ "$cutoffs_answer" == foreign ]]; then
-        why="$fallback, and the cutoffs recorded for the session in $STATE are a value the app does not write, which it reads as none"
-      else
-        fallback="$fallback, and the app's binary could not read $STATE: $(cutoffs_failure --agent-session-cutoffs)"
-      fi
-    fi
-    if [[ -z "$why" ]]; then
-      record="$(journal_cutoffs)"
-      if [[ "$record" =~ $answer_re ]]; then
+      failed="${cutoffs_why:-$(cutoffs_failure --agent-cutoffs)}"
+      ask_binary=0
+      config_cutoffs
+      if [[ "$config_answer" =~ $answer_re ]]; then
         cutoff_floor="${BASH_REMATCH[1]}"
         cutoff_thermal="${BASH_REMATCH[2]}"
         rule=on
         [[ "$cutoff_thermal" == true ]] || rule=off
-        log error "$fallback; enforcing the cutoffs recorded for the session in $STATE, read here: a ${cutoff_floor}% end floor and thermal rules $rule"
+        log error "could not read the end floor and thermal rule in $CONFIG through the app's binary: $failed; enforcing the file's, read here as the app's decoder reads it: a ${cutoff_floor}% end floor and thermal rules $rule"
         return 0
-      elif [[ "$record" == none ]] && (( ask_journal == 1 )); then
-        log error "$fallback; $STATE records no cutoffs for the session (an older build started it), so the app's defaults apply, a 10% end floor and thermal rules on"
-        return 0
-      elif [[ "$record" == none ]]; then
-        why="$fallback, and $STATE records no cutoffs for the session"
+      elif [[ "$config_answer" == rejected ]]; then
+        fallback="could not read the end floor and thermal rule in $CONFIG through the app's binary: $failed; read here, the app rejects it: $config_why"
       else
-        why="$fallback, and the cutoffs recorded for the session in $STATE are a value the app does not write, which it reads as none"
+        fallback="could not read the end floor and thermal rule in $CONFIG through the app's binary ($failed) or here ($config_why)"
+        defaults=0
       fi
     fi
+  else
+    fallback="$CONFIG is missing or cannot be read"
+  fi
+  if [[ ! -e "$STATE" ]]; then
+    record=none
+    if [[ -L "$STATE" ]]; then
+      what="$STATE is a symlink to nothing, which the app reads as no journal"
+    else
+      what="there is no $STATE"
+      # Logged only when the binary could not answer for config.json.
+      (( ask_binary == 0 )) || quiet=1
+    fi
+  else
+    check_journal
+    [[ "$journal_state" != malformed ]] || refuse_malformed_journal "its cutoffs are not read and it is not ended"
+    if (( ask_binary == 1 )); then
+      ask_app_cutoffs --agent-session-cutoffs "$STATE"
+      if [[ -z "$cutoffs_why" ]] && (( cutoffs_rc == 0 )) && [[ "$cutoffs_answer" =~ $answer_re || "$cutoffs_answer" == none ]]; then
+        record="$cutoffs_answer"
+        quiet=1
+      elif [[ -z "$cutoffs_why" ]] && (( cutoffs_rc == 65 )) && [[ "$cutoffs_answer" == rejected ]]; then
+        journal_state=malformed
+        shape_problems="the app's decoder does not load it ('$INSOMNIA_BIN --agent-session-cutoffs' answered rejected)"
+        refuse_malformed_journal "its cutoffs are not read and it is not ended"
+      elif [[ -z "$cutoffs_why" ]] && (( cutoffs_rc == 65 )) && [[ "$cutoffs_answer" == foreign ]]; then
+        record=foreign
+      else
+        fallback="$fallback, and the app's binary could not read $STATE: ${cutoffs_why:-$(cutoffs_failure --agent-session-cutoffs)}"
+      fi
+    fi
+    if [[ -z "$record" ]]; then
+      record="$(journal_cutoffs)"
+      here=1
+    fi
+    if [[ "$record" =~ $answer_re ]]; then
+      cutoff_floor="${BASH_REMATCH[1]}"
+      cutoff_thermal="${BASH_REMATCH[2]}"
+      rule=on
+      [[ "$cutoff_thermal" == true ]] || rule=off
+      (( here == 0 )) || log error "$fallback; enforcing the cutoffs recorded for the session in $STATE, read here: a ${cutoff_floor}% end floor and thermal rules $rule"
+      return 0
+    elif [[ "$record" == none ]]; then
+      what="$STATE records no cutoffs for the session"
+      older=" (an older build started it)"
+    else
+      what="the cutoffs recorded for the session in $STATE are a value the app does not write, which it reads as none"
+    fi
+  fi
+  if (( defaults == 1 )); then
+    (( quiet == 1 )) || log error "$fallback; $what$older, so the app's defaults apply, a 10% end floor and thermal rules on"
+    return 0
   fi
   cutoff_floor=95
   cutoff_thermal=true
-  log error "$why; enforcing the strictest, a 95% end floor and thermal rules on"
+  log error "$fallback, and $what; nothing on disk says which cutoffs the app enforces, so enforcing the strictest, a 95% end floor and thermal rules on"
   return 0
+}
+
+# config.json read here, for when the app's binary cannot answer for it:
+# the end floor and thermal rule the app takes from it, only where this
+# reader can tell exactly what the app's Config decoder makes of it. The
+# file is copied once through a bounded read (run_read with read_keep), so
+# one version of it is read even if the app replaces it meanwhile, and
+# every check reads the copy. More than CONFIG_READ_LIMIT bytes is not read
+# here: the app writes a few kilobytes, and record_text_problems walks
+# every byte. plutil must parse the copy, and record_text_problems, in
+# config mode, must print nothing but "type: " lines. Any other line is
+# text the app may read otherwise than plutil does (a key the app reads
+# there twice, an escape JSON does not have, a number it rounds or cannot
+# hold, text that reader cannot follow), so the file is not used. A "type:
+# " line is a value the app's decoder does not take: it rejects the whole
+# file then, and no field is read from it. Otherwise endFloor is read as a
+# whole number (extract_whole), 10 when absent or null, and clamped to 0 to
+# 95 as Config.agentCutoffs clamps it, and thermalRules as true or false,
+# true when absent or null. Sets config_answer to "cutoffs <floor>
+# <true|false>", "rejected" or nothing, and config_why to what was found
+# otherwise.
+CONFIG_READ_LIMIT=65536
+config_answer=""
+config_why=""
+config_cutoffs() {
+  local copy="" rc=0 size problems line other="" t floor=10 rule=true
+  config_answer=""
+  config_why=""
+  read_input="$CONFIG"
+  read_keep=1
+  run_read copy "$HEAD" -c "$((CONFIG_READ_LIMIT + 1))" || rc=$?
+  read_input=""
+  read_keep=0
+  copy="$kept_output"
+  if (( rc != 0 )) || [[ -z "$copy" ]]; then
+    if (( rc == 124 )); then
+      config_why="copying it did not finish within ${COMMAND_TIMEOUT_SECONDS}s"
+    else
+      config_why="copying it failed (exit $rc)"
+    fi
+    [[ -z "$copy" ]] || "$RM" -f "$copy"
+    return 0
+  fi
+  size="$("$STAT" -f %z "$copy" 2>/dev/null || true)"
+  if ! [[ "$size" =~ ^[0-9]+$ ]] || (( size > CONFIG_READ_LIMIT )); then
+    config_why="it holds more than $CONFIG_READ_LIMIT bytes, which is not read here"
+  elif ! "$PLUTIL" -convert json -o /dev/null "$copy" >/dev/null 2>&1; then
+    config_why="plutil cannot parse it"
+  else
+    problems="$(record_text_problems "$copy" config)"
+    while IFS= read -r line; do
+      if [[ -n "$line" && "$line" != "type: "* ]]; then
+        other="$line"
+        break
+      fi
+    done <<< "$problems"
+    if [[ -n "$other" ]]; then
+      config_why="$other"
+    elif [[ -n "$problems" ]]; then
+      config_answer=rejected
+      line="${problems%%$'\n'*}"
+      config_why="${line#type: }"
+    else
+      t="$(type_of "$copy" endFloor)"
+      if [[ -n "$t" && "$t" != "(any)" ]]; then floor="$(extract_whole "$copy" endFloor || true)"; fi
+      t="$(type_of "$copy" thermalRules)"
+      if [[ -n "$t" && "$t" != "(any)" ]]; then rule="$(extract "$copy" thermalRules || true)"; fi
+      if [[ "$floor" =~ ^-[0-9]+$ ]]; then
+        floor=0
+      elif [[ "$floor" =~ ^[0-9]+$ ]]; then
+        if (( ${#floor} > 2 )); then floor=95; else floor=$((10#$floor)); fi
+        if (( floor > 95 )); then floor=95; fi
+      else
+        floor=""
+      fi
+      if [[ -n "$floor" && ( "$rule" == true || "$rule" == false ) ]]; then
+        config_answer="cutoffs $floor $rule"
+      else
+        config_why="plutil read endFloor and thermalRules as values the app's decoder does not take"
+      fi
+    fi
+  fi
+  "$RM" -f "$copy"
 }
 
 # The journal's sessionCutoffs read here, for when the app's binary cannot
 # read it: "cutoffs <floor> <true|false>", "none" for no record (the key
 # absent or null) or "foreign" for a value the app does not write. Only
-# for a journal check_journal found loads: each key the app reads at the
-# top level is then there once (record_text_problems), so the copy plutil
-# reads is the copy the app reads, and every escape in the record is one
-# JSON has. plutil -extract raw prints the string and a newline; the dot
+# for a journal check_journal found loads: each other key the app reads at
+# the top level is then there once (record_text_problems). A record plutil
+# could read otherwise than the app, there twice or with an escape JSON
+# does not have ("record: " lines), is foreign here: the app may read
+# another copy, or none. Otherwise the copy plutil reads is the copy the
+# app reads. plutil -extract raw prints the string and a newline; the dot
 # keeps any other trailing newline, which the app does not accept either.
 # The test is the one AgentCutoffs(journalValue:) makes.
 journal_cutoffs() {
   local t v re='^([0-9]|[1-8][0-9]|9[0-5]) (true|false)$'
+  v="$(record_text_problems "$STATE")"
+  if [[ $'\n'"$v" == *$'\n'"record: "* ]]; then
+    echo foreign
+    return 0
+  fi
   t="$(type_of "$STATE" sessionCutoffs)"
   if [[ -z "$t" || "$t" == "(any)" ]]; then
     echo none
@@ -2176,11 +2459,13 @@ fd_devino() { "$STAT" -f %d:%i <&"$1" 2>/dev/null; }
 # file, not a symlink, owned by this user, through a descriptor opened for
 # appending, read back through another opened for reading, both checked to
 # be on the file $LOG names (device and inode) before the write and after
-# the read. A record already in either log for these bytes is used again.
+# the read. A log that ends in a line cut short gets a newline first, in the
+# same write (ends_mid_line), so the record is a line of its own. A record
+# already in either log for these bytes is used again.
 # True only when the read-back finds the whole line, and end_recorded_in_log
 # then finds it too.
 record_end_in_log() {
-  local line rc=1
+  local line first="" rc=1
   if end_recorded_in_log; then return 0; fi
   line="$(log_record_line)" || return 1
   [[ -f "$LOG" && ! -L "$LOG" && -O "$LOG" ]] || return 1
@@ -2188,7 +2473,8 @@ record_end_in_log() {
   {
     if [[ -n "$(fd_devino 8)" && "$(fd_devino 8)" == "$(fd_devino 7)" \
           && "$(fd_devino 8)" == "$(devino "$LOG")" && -f "$LOG" && ! -L "$LOG" && -O "$LOG" ]] \
-        && { printf '%s\n' "$line" >&8; } 2>/dev/null \
+        && { ! ends_mid_line "$LOG" || first=$'\n'; } \
+        && { printf '%s%s\n' "$first" "$line" >&8; } 2>/dev/null \
         && "$GREP" -Fxq -e "$line" <&7 2>/dev/null \
         && [[ "$(fd_devino 7)" == "$(devino "$LOG")" ]]; then
       rc=0
@@ -2581,7 +2867,11 @@ if (( frozen_count > 0 )); then
       log error "frozen entry $i has no valid pid (${pid:-?}); kept, not signaled"
       failures+=("frozen entry $i has an invalid pid")
       keep_entry "$i"
-    elif [[ -z "$started" || -z "$boot" ]]; then
+    elif [[ -z "$started" || -z "$boot" ]] ||
+      { [[ -z "$micros" ]] && [[ "$(type_of "$STATE" "frozenProcesses.$i.bootSession")" != string ]]; }; then
+      # No startedAt (a provisional entry), or no bootSession, or, in an
+      # entry without startedAtMicros (an older build's), a bootSession
+      # that is no string, which the app does not read there.
       log error "pid $pid was journaled without identity; not signaled, kept for the app to resolve"
       failures+=("pid $pid has no recorded identity and was not resumed")
       keep_entry "$i"
@@ -2594,9 +2884,12 @@ if (( frozen_count > 0 )); then
       changed=1
     elif [[ -n "$micros" ]]; then
       # The binary accepts a pid that fits in 32 bits, a non-negative start
-      # second and microseconds below one million; anything else would make
-      # it reject the whole call, so such an entry is kept here instead.
-      if [[ "$micros" =~ ^[0-9]{1,6}$ && "$started" =~ ^[0-9]{1,18}$ ]] && (( ${#pid} <= 10 && 10#$pid <= 2147483647 )); then
+      # second that fits in 64 and microseconds below one million; anything
+      # else would make it reject the whole call, so such an entry is kept
+      # here instead.
+      # shellcheck disable=SC2071  # 19 digits compared as text: the limit overflows $(( ))
+      if [[ "$micros" =~ ^[0-9]{1,6}$ && "$started" =~ ^[0-9]{1,19}$ ]] && ! [[ ${#started} == 19 && "$started" > 9223372036854775807 ]] &&
+        (( ${#pid} <= 10 && 10#$pid <= 2147483647 )); then
         app_index+=("$i")
         app_pid+=("$pid")
         app_args+=("$pid" "$started" "$micros" "$boot")

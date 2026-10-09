@@ -82,14 +82,18 @@ final class RecoveryLockHandle: @unchecked Sendable {
     /// this handle's descriptor, so the file keeps its inode and stays the
     /// lock every party takes (`Store.recordSessionEndInLock`). Only while
     /// `path` still names that same file, a regular file (lstat, so not a
-    /// symlink) this user owns. The new bytes go over the old ones before
-    /// the file is cut to their length, so a write cut short never leaves an
-    /// empty file in place of a record. It leaves the record's first bytes
-    /// over the old ones, which count as the end when no old bytes but the
-    /// record's own follow them, or the whole record with old bytes after
-    /// it, which counts too (`Store.lockHoldsRecordCutShort`).
-    /// True once written and synced; the caller reads the file back. False
-    /// once released or when a step fails, which can leave part of `data`.
+    /// symlink) this user owns. The bytes the file already shares with the
+    /// start of `data`, read through the same descriptor, are kept; the
+    /// file is cut to them, then the rest of `data` is appended. So a step
+    /// cut short leaves the old bytes untouched, or a prefix of `data` at
+    /// least as long as the part they shared: never `data`'s first bytes
+    /// over old bytes that differ. A record's first bytes count as its end
+    /// (`Store.lockHoldsRecordCutShort`), so the end of a session written
+    /// here counts from the moment the file changes, and its first bytes
+    /// already there only grow. A file that cannot be read through the
+    /// descriptor is left as it is. True once written and synced; the
+    /// caller reads the file back. False once released or when a step
+    /// fails.
     func replaceContents(with data: Data, at path: String) -> Bool {
         mutex.withLock {
             guard fd >= 0 else { return false }
@@ -98,8 +102,11 @@ final class RecoveryLockHandle: @unchecked Sendable {
             guard fstat(fd, &held) == 0, lstat(path, &named) == 0,
                   named.st_mode & S_IFMT == S_IFREG, named.st_uid == getuid(),
                   held.st_dev == named.st_dev, held.st_ino == named.st_ino else { return false }
+            let size = Int(held.st_size)
+            guard let kept = sharedPrefix(with: data, upTo: min(size, data.count)) else { return false }
+            if size > kept, ftruncate(fd, off_t(kept)) != 0 { return false }
             let written = data.withUnsafeBytes { raw -> Bool in
-                var offset = 0
+                var offset = kept
                 while offset < raw.count {
                     let n = pwrite(fd, raw.baseAddress! + offset, raw.count - offset, off_t(offset))
                     if n < 0 {
@@ -110,8 +117,26 @@ final class RecoveryLockHandle: @unchecked Sendable {
                 }
                 return true
             }
-            return written && ftruncate(fd, off_t(data.count)) == 0 && fsync(fd) == 0
+            return written && fsync(fd) == 0
         }
+    }
+
+    /// How many of the file's first `count` bytes equal `data`'s, read
+    /// through the held descriptor; nil when they cannot be read.
+    private func sharedPrefix(with data: Data, upTo count: Int) -> Int? {
+        guard count > 0 else { return 0 }
+        var bytes = [UInt8](repeating: 0, count: count)
+        var read = 0
+        while read < count {
+            let n = bytes.withUnsafeMutableBytes { pread(fd, $0.baseAddress! + read, count - read, off_t(read)) }
+            if n < 0 {
+                if errno == EINTR { continue }
+                return nil
+            }
+            if n == 0 { break }
+            read += n
+        }
+        return zip(bytes.prefix(read), data).prefix { $0 == $1 }.count
     }
 
     deinit { release() }

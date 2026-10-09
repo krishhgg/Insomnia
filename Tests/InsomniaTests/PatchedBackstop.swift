@@ -223,6 +223,27 @@ struct PatchedBackstop {
         try patch("GREP=/usr/bin/grep", "GREP='\(grep.path)'")
     }
 
+    /// Points GREP at a fake that, each time the agent looks for an end
+    /// record line, first appends `cut sh` without a newline to `log`
+    /// unless the log already ends mid-line, then runs /usr/bin/grep: a
+    /// line some other write left cut short sits at the end of the log
+    /// whenever the agent writes there after a check, its record included.
+    func cutTheLogShortAtEveryRecordCheck(log: URL) throws {
+        let grep = dir.appendingPathComponent("grep")
+        try #"""
+        #!/bin/bash
+        if [[ "${1:-}" == -Fxq && "${2:-}" == -e && "${3:-}" == "insomnia-ended-session-v1 "* ]]; then
+          if [[ ! -s '\#(log.path)' || "$(/usr/bin/tail -c 1 '\#(log.path)'; printf x)" == $'\nx' ]]; then
+            printf 'cut sh' >> '\#(log.path)'
+          fi
+        fi
+        exec /usr/bin/grep "$@"
+
+        """#.write(to: grep, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: grep.path)
+        try patch("GREP=/usr/bin/grep", "GREP='\(grep.path)'")
+    }
+
     private func patch(_ line: String, _ replacement: String) throws {
         let text = try String(contentsOf: script, encoding: .utf8)
         let hits = text.components(separatedBy: "\n").filter { $0 == line }.count

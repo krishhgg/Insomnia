@@ -15,7 +15,11 @@ import Foundation
 /// insomnia.log.1. A write cut short, a line another write broke into, a
 /// different length or other bytes match nothing. A line is ended by a
 /// newline or by the end of the file, as grep(1) reads it, so a record
-/// whose newline alone is missing still counts: it holds every byte. A
+/// whose newline alone is missing still counts: it holds every byte. Every
+/// writer of the log (`OwnerOnly.appendToLog`, `append` here, backstop.sh's
+/// log and record_end_in_log, the LaunchAgent's own line) puts a newline
+/// first when the file ends in a line cut short, so such a record keeps
+/// its line and a record written after a line cut short starts its own. A
 /// session.json with the same bytes as one that ended earlier, which takes
 /// the same start and end times to the second, would read as ended too.
 ///
@@ -142,13 +146,18 @@ enum LogEndRecord {
     /// opened without O_CREAT and without following a symlink, and the
     /// descriptor must be on the file the path names. The line goes out in
     /// one write(2) under flock(2) on the file, as a rotation by another
-    /// copy of the app takes it. True only when the whole line was written
-    /// and the file, still the one at `url`, then holds it as a line. The
+    /// copy of the app takes it, after a newline when the file ends in a
+    /// line cut short (`OwnerOnly.endsMidLine`), so the record is a line of
+    /// its own. True only when the whole write went out and the file,
+    /// still the one at `url`, then holds the record as a line. The
     /// caller holds the recovery lock and `Log.withFileLock`.
     static func append(_ line: Data, to url: URL) -> Bool {
         var named = stat()
         guard lstat(url.path, &named) == 0, named.st_mode & S_IFMT == S_IFREG, named.st_uid == getuid() else { return false }
-        let fd = open(url.path, O_WRONLY | O_APPEND | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+        // Opened for reading too, for its last byte; write-only when that
+        // is all this user may do, and then the newline always goes first.
+        var fd = open(url.path, O_RDWR | O_APPEND | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+        if fd < 0, errno == EACCES { fd = open(url.path, O_WRONLY | O_APPEND | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC) }
         guard fd >= 0 else { return false }
         defer { close(fd) }
         var held = stat()
@@ -162,7 +171,7 @@ enum LogEndRecord {
     /// The write and the read-back, on a descriptor already checked to be on
     /// the log at `url` (O_APPEND).
     private static func appendHeld(_ line: Data, to fd: Int32, at url: URL) -> Bool {
-        let whole = line + Data([0x0A])
+        let whole = (OwnerOnly.endsMidLine(fd) ? Data([0x0A]) : Data()) + line + Data([0x0A])
         let written = whole.withUnsafeBytes { Darwin.write(fd, $0.baseAddress!, $0.count) }
         guard written == whole.count else { return false }
         var held = stat()

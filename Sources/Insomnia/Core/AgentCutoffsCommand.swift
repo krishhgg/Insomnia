@@ -50,11 +50,13 @@ import Foundation
 ///     usage                             bad arguments, nothing read; exit 64
 ///
 /// backstop.sh enforces the printed cutoffs. On `rejected` from
-/// config.json it asks for the journal's; on `none` it enforces the app's
-/// defaults (`Config.agentDefaultCutoffs`); on `rejected` from the journal
-/// it stops without ending the session; on `foreign`, the strictest
-/// cutoffs; when the binary gives no answer, it reads the journal's
-/// cutoffs itself (see read_cutoffs there).
+/// config.json it asks for the journal's; on `none` or `foreign` it
+/// enforces the app's defaults (`Config.agentDefaultCutoffs`), since the
+/// app reads a foreign value as none; on `rejected` from the journal it
+/// stops without ending the session. When the binary gives no answer for
+/// config.json, the script reads that file itself where it can tell
+/// exactly what this decoder makes of it, and otherwise the journal's
+/// cutoffs (see read_cutoffs there).
 ///
 /// The bundle declares this interface as `InsomniaAgentCutoffsVersion`
 /// (`version`) in its Info.plist. backstop.sh runs the binary only when the
