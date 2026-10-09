@@ -8770,13 +8770,16 @@ final class RecoveryScriptTests: XCTestCase {
 
     /// A fixture with the rule installed, ready for install.sh or
     /// uninstall.sh (`install`), whose copy runs root's perl and cat through
-    /// the fakes named in `fakes`.
+    /// the fakes named in `fakes`. An install that gets past its rule step
+    /// skips the staging step's `chmod -R -N` (skipACLRemoval): no test
+    /// here checks the staged bundle's access control lists.
     private func ruleFixture(install: Bool, fakes: [String] = []) throws -> ScriptFixture {
         let f = try ScriptFixture()
         let constants = Dictionary(uniqueKeysWithValues: fakes.map { ($0.uppercased(), f.bin.appendingPathComponent($0).path) })
         if install {
             try f.writeInstallCopies(extraConstants: constants)
             try f.prepareInstall()
+            try f.skipACLRemoval()
             f.setMode("launchctl", "loaded")
         } else {
             try f.writeUninstallCopy(extraConstants: constants)
@@ -12598,13 +12601,19 @@ private final class ScriptFixture {
             """)
         }
         // perl: the PERL of install.sh and uninstall.sh copies whose root
-        // shell reads access control lists through a fake. It takes only the
-        // call root's r_acl makes (-e <reader> -- then pairs of what stat
-        // said and a name) and counts those calls in perl.count. On the call
-        // perl.rewrite names, it first writes the text of rule.replacement
-        // into the rule in place (the same file, logged "perl REWROTE-RULE");
-        // on the call perl.replace names, it first puts that text at the
-        // rule's path by a rename (a new file, logged "perl REPLACED-RULE").
+        // shell reads access control lists through a fake. That PERL also
+        // starts the backstop as the leader of its own process group and
+        // asks whether that group is empty (group_gone); those two programs,
+        // matched as the scripts write them, go straight to /usr/bin/perl
+        // with the same pid and are not counted, so the backstop's
+        // supervisor sees what it would with the real perl. Apart from them
+        // it takes only the call root's r_acl makes (-e <reader> -- then
+        // pairs of what stat said and a name) and counts those calls in
+        // perl.count. On the call perl.rewrite names, it first writes the
+        // text of rule.replacement into the rule in place (the same file,
+        // logged "perl REWROTE-RULE"); on the call perl.replace names, it
+        // first puts that text at the rule's path by a rename (a new file,
+        // logged "perl REPLACED-RULE").
         // For a name a line of perl.fail (a bash glob) matches, it exits 1
         // as an open that fails. Otherwise it runs /usr/bin/perl with the
         // same arguments, the real reader, and passes on its answer with
@@ -12616,6 +12625,9 @@ private final class ScriptFixture {
         // "unexpected line" after it for perl.extra; and for perl.fail-after,
         // all of that and then exit 1.
         try writeFake("perl", """
+        case "${1:-} ${2:-} ${3:-}" in
+          '-e setpgrp(0, 0) or exit 127; exec { $ARGV[0] } @ARGV; exit 127 --'|'-e kill(0, -$ARGV[0]) and exit 1; exit($!{ESRCH} ? 0 : 1) --') exec /usr/bin/perl "$@" ;;
+        esac
         [[ "${1:-}" == -e && "${3:-}" == -- ]] || { echo "perl: not the call r_acl makes: $*" >&2; exit 2; }
         n=$(( $(/bin/cat "\(r)/perl.count" 2>/dev/null || echo 0) + 1 ))
         echo "$n" > "\(r)/perl.count"
