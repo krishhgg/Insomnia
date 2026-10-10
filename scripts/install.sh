@@ -59,6 +59,20 @@ UID_NUM="$(id -u)"
 
 step() { printf '\n==> %s\n' "$*"; }
 
+# True when <dir> is <physical path> or one of the folders above it. Compared
+# by device and inode (-ef), so a symlink, other letter case or another
+# spelling of either path cannot hide the overlap. <physical path> must come
+# from `pwd -P`: its parents are then the real folders that contain it.
+is_within() { # <physical path> <dir>
+  local d="$1" up
+  while :; do
+    [[ "$d" -ef "$2" ]] && return 0
+    up="$(dirname "$d")"
+    [[ "$up" == "$d" ]] && return 1
+    d="$up"
+  done
+}
+
 # 1. Build, or check the prebuilt app ----------------------------------------
 #    Every --app check comes before the password prompt, so a bundle that
 #    fails one leaves the machine exactly as it was.
@@ -82,6 +96,23 @@ if [[ -n "$PREBUILT" ]]; then
   # Step 3 deletes $APP before copying, which would delete the source too.
   if [[ -e "$APP" && "$PREBUILT" -ef "$APP" ]]; then
     echo "--app names the installed app $APP itself; pass the Insomnia.app from the release zip. Nothing was changed." >&2
+    exit 1
+  fi
+  if is_within "$PREBUILT" "$APP"; then
+    echo "--app: $PREBUILT is inside the installed app $APP, which step 3 deletes before copying. Move it out of $APP first. Nothing was changed." >&2
+    exit 1
+  fi
+  # The copy lands in $APP_DIR (created if missing), so that folder, or the
+  # nearest existing folder above it, must not be inside the bundle: cp -R
+  # would copy the bundle into itself and change it.
+  dest="$APP_DIR"
+  while [[ ! -d "$dest" ]]; do dest="$(dirname "$dest")"; done
+  if ! dest_physical="$(cd "$dest" 2>/dev/null && pwd -P)"; then
+    echo "--app: cannot open $dest to check where $APP_DIR is. Nothing was changed." >&2
+    exit 1
+  fi
+  if is_within "$dest_physical" "$PREBUILT"; then
+    echo "--app: $APP_DIR is (or would be created) inside $PREBUILT, so the copy would land inside the bundle it copies. Nothing was changed." >&2
     exit 1
   fi
   for f in Contents/Info.plist Contents/MacOS/Insomnia Contents/_CodeSignature/CodeResources; do
@@ -108,6 +139,11 @@ if [[ -n "$PREBUILT" ]]; then
   fi
   if [[ ! -f "$ROOT/scripts/backstop.sh" ]]; then
     echo "$ROOT/scripts/backstop.sh is missing; run the install.sh in the unpacked release folder. Nothing was changed." >&2
+    exit 1
+  fi
+  # Step 4 copies backstop.sh from here after step 3 deleted $APP.
+  if is_within "$(cd "$ROOT" && pwd -P)" "$APP"; then
+    echo "$ROOT is inside the installed app $APP, which step 3 deletes, together with this folder's backstop.sh and uninstall.sh. Unpack the release somewhere else. Nothing was changed." >&2
     exit 1
   fi
   # The bundle is installed with the signature it came with, so that
@@ -173,12 +209,32 @@ if "$PGREP" -x Insomnia >/dev/null 2>&1; then
     exit 1
   fi
 fi
-rm -rf "$APP"
 if [[ -n "$PREBUILT" ]]; then
   # A plain copy: the bundle's own signature covers these exact bytes, so
-  # nothing is rebuilt, edited or re-signed.
-  mkdir -p "$APP_DIR"
-  cp -R "$PREBUILT" "$APP"
+  # nothing is rebuilt, edited or re-signed. A failed step stops the install
+  # and says what is at $APP now; nothing is restored and nothing left there
+  # is deleted.
+  copy_failed() { # <what failed> [<what happened at $APP before>]
+    echo "Install stopped: $1 (see the error above)." >&2
+    if [[ -n "${2:-}" ]]; then
+      echo "$2." >&2
+    fi
+    if [[ -e "$APP" || -L "$APP" ]]; then
+      echo "What is at $APP now may be incomplete and was not verified. It was left as it is." >&2
+    else
+      echo "Nothing is at $APP now." >&2
+    fi
+    echo "$SUDOERS is installed; $APP_SUPPORT/backstop.sh and the LaunchAgent were not touched. Fix the error and rerun this script." >&2
+    exit 1
+  }
+  if [[ -e "$APP" || -L "$APP" ]]; then
+    before_copy="What was at $APP before was removed first"
+  else
+    before_copy="Nothing was at $APP before"
+  fi
+  rm -rf "$APP" || copy_failed "'rm -rf' could not remove all of the previous app at $APP"
+  mkdir -p "$APP_DIR" || copy_failed "could not create $APP_DIR" "$before_copy"
+  cp -R "$PREBUILT" "$APP" || copy_failed "copying $PREBUILT to $APP failed" "$before_copy"
   if ! "$CODESIGN" --verify --strict --deep "$APP"; then
     echo "The copy at $APP fails 'codesign --verify --strict --deep' (the previous app there was already removed)." >&2
     echo "$SUDOERS is installed; backstop.sh and the LaunchAgent were not touched. Rerun this script." >&2
@@ -186,6 +242,7 @@ if [[ -n "$PREBUILT" ]]; then
   fi
   echo "installed $PREBUILT as $APP; signature unchanged and verified"
 else
+  rm -rf "$APP"
   mkdir -p "$APP/Contents/MacOS"
   cp "$BIN" "$APP/Contents/MacOS/Insomnia"
   cp "$ROOT/Resources/Info.plist" "$APP/Contents/Info.plist"

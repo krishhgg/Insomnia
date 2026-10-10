@@ -1505,6 +1505,237 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "plist")
     }
 
+    /// Step 3 deletes the installed app before copying, so a bundle inside
+    /// it would be deleted with it. However the path is spelled (directly,
+    /// through a symlink, or in other letter case where the volume ignores
+    /// case), the installer refuses before the password prompt and the
+    /// bundle stays byte for byte as it was.
+    func testInstallAppRefusesABundleInsideTheInstalledApp() throws {
+        try fx.installMachinery()
+        let backstopBefore = try Data(contentsOf: fx.installedBackstop)
+        let nested = try fx.preparePrebuilt("Nested.app", in: fx.app.appendingPathComponent("Contents"))
+        let alias = fx.root.appendingPathComponent("download/alias.app")
+        try FileManager.default.createDirectory(at: alias.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: nested)
+        var spellings = [nested.path, alias.path]
+        let otherCase = fx.appsDir.appendingPathComponent("INSOMNIA.APP/contents/Nested.app").path
+        if FileManager.default.fileExists(atPath: otherCase) { spellings.append(otherCase) }
+        let appBefore = try fx.tree(under: fx.app)
+
+        for spelling in spellings {
+            fx.clearCalls()
+
+            let r = try fx.run(fx.installRedirected, ["--app", spelling], extraEnvironment: ["USER": "tester"])
+
+            XCTAssertEqual(r.status, 1, "\(spelling): \(r.stderr + r.stdout)")
+            XCTAssertTrue(r.stderr.contains("is inside the installed app \(fx.app.path), which step 3 deletes"), "\(spelling): \(r.stderr)")
+            XCTAssertTrue(r.stderr.contains("Nothing was changed"), "\(spelling): \(r.stderr)")
+            XCTAssertEqual(fx.calls(), [], "\(spelling): refused before codesign and the password prompt")
+            XCTAssertEqual(try fx.tree(under: fx.app), appBefore, "\(spelling): the installed app and the bundle inside it are unchanged")
+            XCTAssertEqual(try Data(contentsOf: fx.installedBackstop), backstopBefore, spelling)
+            XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "plist", spelling)
+            XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), "rule", spelling)
+        }
+    }
+
+    /// The copy lands in the Applications folder. When that folder (or the
+    /// nearest existing folder above it) is inside the bundle, cp -R would
+    /// copy the bundle into itself, so the installer refuses first. Covers a
+    /// folder that exists with an app in it, one that does not exist yet,
+    /// and one reached through a symlink.
+    func testInstallAppRefusesAnApplicationsFolderInsideTheBundle() throws {
+        try fx.installMachinery()
+        let installText = try String(contentsOf: fx.installRedirected, encoding: .utf8)
+        let cases: [(name: String, appsDir: (URL) throws -> String)] = [
+            ("existing folder with an app", { bundle in
+                let dir = bundle.appendingPathComponent("Contents/Applications")
+                try FileManager.default.createDirectory(at: dir.appendingPathComponent("Insomnia.app/Contents"), withIntermediateDirectories: true)
+                try "old".write(to: dir.appendingPathComponent("Insomnia.app/Contents/old"), atomically: true, encoding: .utf8)
+                return dir.path
+            }),
+            ("missing folder", { bundle in bundle.appendingPathComponent("Contents/Home/Applications").path }),
+            ("symlinked folder", { bundle in
+                let link = self.fx.root.appendingPathComponent("AppsLink")
+                try FileManager.default.createSymbolicLink(at: link, withDestinationURL: bundle.appendingPathComponent("Contents/MacOS"))
+                return link.path
+            }),
+        ]
+
+        for (i, c) in cases.enumerated() {
+            fx.clearCalls()
+            let bundle = try fx.preparePrebuilt("dir\(i).app")
+            let appsDir = try c.appsDir(bundle)
+            let script = fx.repoScripts.appendingPathComponent("install.appsdir\(i).sh")
+            try ScriptFixture.patch(installText, ["APP_DIR": appsDir]).write(to: script, atomically: true, encoding: .utf8)
+            let before = try fx.tree(under: bundle)
+
+            let r = try fx.run(script, ["--app", bundle.path], extraEnvironment: ["USER": "tester"])
+
+            XCTAssertEqual(r.status, 1, "\(c.name): \(r.stderr + r.stdout)")
+            XCTAssertTrue(r.stderr.contains("\(appsDir) is (or would be created) inside \(fx.physicalPath(bundle))"), "\(c.name): \(r.stderr)")
+            XCTAssertTrue(r.stderr.contains("Nothing was changed"), "\(c.name): \(r.stderr)")
+            XCTAssertEqual(fx.calls(), [], "\(c.name): refused before codesign and the password prompt")
+            XCTAssertEqual(try fx.tree(under: bundle), before, "\(c.name): nothing added to or removed from the bundle")
+            XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), "rule", c.name)
+            XCTAssertEqual(try String(contentsOf: fx.app.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "binary", c.name)
+        }
+    }
+
+    /// backstop.sh is copied from beside install.sh after step 3 deleted the
+    /// installed app, so a release folder inside the installed app is refused.
+    func testInstallAppRefusesAReleaseFolderInsideTheInstalledApp() throws {
+        try fx.installMachinery()
+        let prebuilt = try fx.preparePrebuilt()
+        let scripts = fx.app.appendingPathComponent("Contents/release/scripts")
+        try FileManager.default.createDirectory(at: scripts, withIntermediateDirectories: true)
+        let script = scripts.appendingPathComponent("install.sh")
+        try FileManager.default.copyItem(at: fx.installRedirected, to: script)
+        try FileManager.default.copyItem(at: fx.backstop, to: scripts.appendingPathComponent("backstop.sh"))
+        let appBefore = try fx.tree(under: fx.app)
+
+        let r = try fx.run(script, ["--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertTrue(r.stderr.contains("\(fx.app.path)/Contents/release is inside the installed app \(fx.app.path), which step 3 deletes"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("Nothing was changed"), r.stderr)
+        XCTAssertEqual(fx.calls(), [], "refused before codesign and the password prompt")
+        XCTAssertEqual(try fx.tree(under: fx.app), appBefore)
+        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), "rule")
+    }
+
+    /// Only the installed app itself and what is inside it are refused. A
+    /// sibling whose name merely starts the same way installs normally and
+    /// is left as it was.
+    func testInstallAppAcceptsASiblingWhoseNameStartsLikeTheInstalledApp() throws {
+        try fx.installMachinery()
+        let prebuilt = try fx.preparePrebuilt("Insomnia.app2", in: fx.appsDir)
+        let source = try fx.tree(under: prebuilt)
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        fx.setMode("launchctl", "loaded")
+
+        let r = try fx.run(fx.installRedirected, ["--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertEqual(fx.calls().filter { $0.hasPrefix("codesign") }, [
+            "codesign --verify --strict --deep \(fx.physicalPath(prebuilt))",
+            "codesign --verify --strict --deep \(fx.app.path)",
+        ])
+        XCTAssertEqual(try fx.tree(under: fx.app), source, "the installed app is exactly the sibling's files")
+        XCTAssertEqual(try fx.tree(under: prebuilt), source, "the sibling is unchanged")
+    }
+
+    /// When the previous app cannot be fully removed, the install stops
+    /// there and says so: the sudoers rule is installed, what rm could not
+    /// remove is left in place, backstop.sh and the LaunchAgent are untouched.
+    func testInstallAppStopsWhenThePreviousAppCannotBeRemoved() throws {
+        let prebuilt = try fx.preparePrebuilt()
+        let source = try fx.tree(under: prebuilt)
+        try fx.installMachinery()
+        try "old helper".write(to: fx.installedBackstop, atomically: true, encoding: .utf8)
+        try "old info".write(to: fx.app.appendingPathComponent("Contents/Info.plist"), atomically: true, encoding: .utf8)
+        let locked = fx.app.appendingPathComponent("Contents/MacOS")
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: locked.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: locked.path) }
+
+        let r = try fx.run(fx.installRedirected, ["--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertTrue(r.stderr.contains("Install stopped: 'rm -rf' could not remove all of the previous app at \(fx.app.path) (see the error above)."), r.stderr)
+        XCTAssertTrue(r.stderr.contains("What is at \(fx.app.path) now may be incomplete and was not verified. It was left as it is."), r.stderr)
+        XCTAssertTrue(r.stderr.contains("\(fx.sudoers.path) is installed; \(fx.installedBackstop.path) and the LaunchAgent were not touched."), r.stderr)
+        XCTAssertFalse(r.stderr.contains("Nothing was changed"), r.stderr)
+        XCTAssertEqual(try FileManager.default.subpathsOfDirectory(atPath: fx.app.path).sorted(),
+                       ["Contents", "Contents/MacOS", "Contents/MacOS/Insomnia"], "only what rm could not remove is left")
+        XCTAssertEqual(try String(contentsOf: fx.app.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "binary")
+        assertStoppedInStep3(prebuilt: prebuilt, source: source)
+    }
+
+    /// The Applications folder cannot be created (here: a symlink to a
+    /// folder that does not exist). The install stops with nothing at the app path.
+    func testInstallAppStopsWhenTheApplicationsFolderCannotBeCreated() throws {
+        let prebuilt = try fx.preparePrebuilt()
+        let source = try fx.tree(under: prebuilt)
+        try fx.installMachinery()
+        try "old helper".write(to: fx.installedBackstop, atomically: true, encoding: .utf8)
+        try FileManager.default.moveItem(at: fx.appsDir, to: fx.root.appendingPathComponent("Applications.old"))
+        let gone = fx.root.appendingPathComponent("gone").path
+        try FileManager.default.createSymbolicLink(atPath: fx.appsDir.path, withDestinationPath: gone)
+
+        let r = try fx.run(fx.installRedirected, ["--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertTrue(r.stderr.contains("Install stopped: could not create \(fx.appsDir.path) (see the error above)."), r.stderr)
+        XCTAssertTrue(r.stderr.contains("Nothing was at \(fx.app.path) before."), r.stderr)
+        XCTAssertTrue(r.stderr.contains("Nothing is at \(fx.app.path) now."), r.stderr)
+        XCTAssertTrue(r.stderr.contains("\(fx.sudoers.path) is installed; \(fx.installedBackstop.path) and the LaunchAgent were not touched."), r.stderr)
+        XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: fx.appsDir.path), gone, "the link is left as it was")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: gone))
+        assertStoppedInStep3(prebuilt: prebuilt, source: source)
+    }
+
+    /// cp -R fails partway (a file in the bundle cannot be read). The old app
+    /// is already gone, the partial copy stays at the app path as it is, and
+    /// the message says both.
+    func testInstallAppStopsAndLeavesAPartialCopyWhenTheCopyFails() throws {
+        let prebuilt = try fx.preparePrebuilt()
+        let source = try fx.tree(under: prebuilt)
+        try fx.installMachinery()
+        try "old helper".write(to: fx.installedBackstop, atomically: true, encoding: .utf8)
+        let icon = prebuilt.appendingPathComponent("Contents/Resources/AppIcon.icns")
+        let iconMode = try XCTUnwrap(try FileManager.default.attributesOfItem(atPath: icon.path)[.posixPermissions] as? NSNumber)
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: icon.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: iconMode], ofItemAtPath: icon.path) }
+
+        let r = try fx.run(fx.installRedirected, ["--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
+        try FileManager.default.setAttributes([.posixPermissions: iconMode], ofItemAtPath: icon.path)
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertTrue(r.stderr.contains("Install stopped: copying \(fx.physicalPath(prebuilt)) to \(fx.app.path) failed (see the error above)."), r.stderr)
+        XCTAssertTrue(r.stderr.contains("What was at \(fx.app.path) before was removed first."), r.stderr)
+        XCTAssertTrue(r.stderr.contains("What is at \(fx.app.path) now may be incomplete and was not verified. It was left as it is."), r.stderr)
+        XCTAssertTrue(r.stderr.contains("\(fx.sudoers.path) is installed; \(fx.installedBackstop.path) and the LaunchAgent were not touched."), r.stderr)
+        var partial = source
+        partial["Contents/Resources/AppIcon.icns"] = nil
+        XCTAssertEqual(try fx.tree(under: fx.app), partial, "every file but the unreadable one, none of the old app")
+        assertStoppedInStep3(prebuilt: prebuilt, source: source)
+    }
+
+    /// cp -R fails before creating anything (the Applications folder is not
+    /// writable) and there was no previous app: nothing is at the app path.
+    func testInstallAppStopsWhenTheCopyCreatesNothing() throws {
+        let prebuilt = try fx.preparePrebuilt()
+        let source = try fx.tree(under: prebuilt)
+        try fx.installMachinery()
+        try FileManager.default.removeItem(at: fx.app)
+        try "old helper".write(to: fx.installedBackstop, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: fx.appsDir.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fx.appsDir.path) }
+
+        let r = try fx.run(fx.installRedirected, ["--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertTrue(r.stderr.contains("Install stopped: copying \(fx.physicalPath(prebuilt)) to \(fx.app.path) failed (see the error above)."), r.stderr)
+        XCTAssertTrue(r.stderr.contains("Nothing was at \(fx.app.path) before."), r.stderr)
+        XCTAssertTrue(r.stderr.contains("Nothing is at \(fx.app.path) now."), r.stderr)
+        XCTAssertFalse(fx.exists(fx.app))
+        assertStoppedInStep3(prebuilt: prebuilt, source: source)
+    }
+
+    /// What every step 3 copy failure leaves: the new sudoers rule, the old
+    /// backstop.sh and LaunchAgent plist, an unchanged bundle, no copy check
+    /// and no launchctl call.
+    private func assertStoppedInStep3(prebuilt: URL, source: [String: String], file: StaticString = #filePath, line: UInt = #line) {
+        let calls = fx.calls()
+        XCTAssertEqual(calls.filter { $0.hasPrefix("codesign") }, ["codesign --verify --strict --deep \(fx.physicalPath(prebuilt))"],
+                       "the bundle was checked; no copy was verified", file: file, line: line)
+        XCTAssertFalse(calls.contains { $0.hasPrefix("launchctl") || $0.hasPrefix("swift") }, "\(calls)", file: file, line: line)
+        XCTAssertTrue((try? String(contentsOf: fx.sudoers, encoding: .utf8))?.contains("NOPASSWD: /usr/bin/pmset") == true,
+                      "the new sudoers rule is installed", file: file, line: line)
+        XCTAssertEqual(try? String(contentsOf: fx.installedBackstop, encoding: .utf8), "old helper", file: file, line: line)
+        XCTAssertEqual(try? String(contentsOf: fx.plist, encoding: .utf8), "plist", file: file, line: line)
+        XCTAssertEqual(try? fx.tree(under: prebuilt), source, "the bundle is unchanged", file: file, line: line)
+    }
+
     func testInstallRejectsUnexpectedArgumentsBeforeDoingAnything() throws {
         for args in [["--bogus"], ["--app"], ["--app", ""], ["--app=x"], ["x", "--app"], ["--app", "a", "b"]] {
             fx.clearCalls()
@@ -1584,7 +1815,12 @@ private final class ScriptFixture {
     private let fm = FileManager.default
 
     init() throws {
-        root = fm.temporaryDirectory.appendingPathComponent("insomnia-script-tests-\(UUID().uuidString)", isDirectory: true)
+        // Below $TMPDIR when the test run sets an absolute one, so a run can
+        // keep every fixture file in a folder it owns.
+        let tmp = ProcessInfo.processInfo.environment["TMPDIR"].flatMap {
+            $0.hasPrefix("/") ? URL(fileURLWithPath: $0, isDirectory: true) : nil
+        } ?? fm.temporaryDirectory
+        root = tmp.appendingPathComponent("insomnia-script-tests-\(UUID().uuidString)", isDirectory: true)
         home = root.appendingPathComponent("home", isDirectory: true)
         bin = root.appendingPathComponent("bin", isDirectory: true)
         repoScripts = root.appendingPathComponent("repo/scripts", isDirectory: true)
@@ -1650,9 +1886,10 @@ private final class ScriptFixture {
     /// A complete prebuilt bundle, the shape of the one in the 0.1.0 release
     /// zip, at root/download/<name>. Its bytes differ from everything
     /// prepareInstall writes, so a test can tell which one was installed.
+    /// `parent` puts it somewhere else, such as inside the installed app.
     @discardableResult
-    func preparePrebuilt(_ name: String = "Insomnia.app") throws -> URL {
-        let bundle = root.appendingPathComponent("download", isDirectory: true).appendingPathComponent(name, isDirectory: true)
+    func preparePrebuilt(_ name: String = "Insomnia.app", in parent: URL? = nil) throws -> URL {
+        let bundle = (parent ?? root.appendingPathComponent("download", isDirectory: true)).appendingPathComponent(name, isDirectory: true)
         let contents = bundle.appendingPathComponent("Contents", isDirectory: true)
         for dir in ["MacOS", "Resources", "_CodeSignature"] {
             try fm.createDirectory(at: contents.appendingPathComponent(dir, isDirectory: true), withIntermediateDirectories: true)
@@ -1681,6 +1918,29 @@ private final class ScriptFixture {
             guard attrs[.type] as? FileAttributeType == .typeRegular else { continue }
             let mode = (attrs[.posixPermissions] as? NSNumber)?.intValue ?? -1
             out[rel] = (try Data(contentsOf: URL(fileURLWithPath: path)), mode)
+        }
+        return out
+    }
+
+    /// Every entry below `dir`, folders and symlinks included, with its type,
+    /// mode and bytes (or link target), so a test can tell that nothing was
+    /// added, removed or rewritten there.
+    func tree(under dir: URL) throws -> [String: String] {
+        var out: [String: String] = [:]
+        for rel in try fm.subpathsOfDirectory(atPath: dir.path) {
+            let path = dir.appendingPathComponent(rel).path
+            let attrs = try fm.attributesOfItem(atPath: path)
+            let mode = (attrs[.posixPermissions] as? NSNumber)?.intValue ?? -1
+            switch attrs[.type] as? FileAttributeType {
+            case .typeRegular?:
+                out[rel] = "file \(mode) " + (try Data(contentsOf: URL(fileURLWithPath: path))).base64EncodedString()
+            case .typeDirectory?:
+                out[rel] = "dir \(mode)"
+            case .typeSymbolicLink?:
+                out[rel] = "link " + (try fm.destinationOfSymbolicLink(atPath: path))
+            default:
+                out[rel] = "other"
+            }
         }
         return out
     }
@@ -1737,7 +1997,7 @@ private final class ScriptFixture {
         // install.sh: every $HOME-derived path and every tool is redirected
         // into the fixture (build, signing, sudo, launchctl included).
         let installText = try String(contentsOf: src.appendingPathComponent("install.sh"), encoding: .utf8)
-        let patchedInstall = try Self.patch(installText, [
+        let patchedConstants = try Self.patch(installText, [
             "QUIT_WAIT_SECONDS": "1",
             "APP_DIR": appsDir.path,
             "APP_SUPPORT": home.path,
@@ -1753,6 +2013,11 @@ private final class ScriptFixture {
             "SYSCTL": bin.appendingPathComponent("sysctl").path,
             "LOCK_TIMEOUT_SECONDS": "1",
         ])
+        // macOS mktemp without a template can ignore TMPDIR; the sudoers
+        // candidate goes inside the fixture instead.
+        guard !root.path.contains("'") else { throw FixtureError("fixture path contains a quote: \(root.path)") }
+        let patchedInstall = try Self.replaceOnce(patchedConstants, #"TMP_SUDOERS="$(mktemp)""#,
+                                                  with: #"TMP_SUDOERS="$(mktemp '"# + root.path + #"/sudoers.XXXXXXXX')""#)
         try patchedInstall.write(to: install, atomically: true, encoding: .utf8)
         // The redirected copy runs past the INSOMNIA_HOME refusal: that
         // variable is what makes the backstop copy it installs act on the
@@ -2074,11 +2339,13 @@ private final class ScriptFixture {
 
     /// Environment for the child: no inheritance, so neither the real HOME
     /// nor a TempHome's INSOMNIA_HOME can leak in. HOME is deliberately
-    /// unset (see the class comment).
+    /// unset (see the class comment). TMPDIR is the fixture, for tools that
+    /// honor it.
     private var childEnvironment: [String: String] {
         [
             "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
             "INSOMNIA_HOME": home.path,
+            "TMPDIR": root.path,
         ]
     }
 
