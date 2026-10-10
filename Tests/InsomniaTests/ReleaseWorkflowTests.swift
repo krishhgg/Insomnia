@@ -8,8 +8,8 @@ import XCTest
 /// pushed v* tag publishes a stable release and only main a nightly, that the
 /// two channels never share their release flags, and that only the
 /// publishing jobs can write. Plain text checks, except that the plan job's
-/// script also runs with a stub `gh`; the files are small and have no YAML
-/// anchors.
+/// script and the nightly job's tag step also run with a stub `gh`; the
+/// files are small and have no YAML anchors.
 final class ReleaseWorkflowTests: XCTestCase {
     private var workflowsDir: URL {
         URL(fileURLWithPath: #filePath)
@@ -185,88 +185,162 @@ final class ReleaseWorkflowTests: XCTestCase {
     /// characters on another commit, stops the run with no outputs, so
     /// nothing is built. A commit with no nightly tag gets a new one.
     func testThePlanSkipsOnlyACommitWhoseNightlyHasARelease() throws {
-        let script = try planScript()
+        let script = try stepScript("plan", "Choose the channel, and the tag for a nightly")
         let sha = "0123456789abcdef0123456789abcdef01234567"
         let tag = "nightly-20261009-0123456789ab"
         let olderRef = "refs/tags/nightly-20261008-fedcba987654 fedcba9876543210fedcba9876543210fedcba98"
         let olderRelease = "nightly-20261008-fedcba987654"
-
-        var r = try runPlan(script, sha: sha, refs: [olderRef, "refs/tags/\(tag) \(sha)"], releases: ["v0.1.0", olderRelease, tag])
-        XCTAssertEqual(r.status, 0, r.stderr)
-        XCTAssertEqual(r.output, "channel=nightly\nbuild=false\n", "a published nightly of this commit is skipped")
-
-        // A release whose name only starts with the tag is not its release.
-        r = try runPlan(script, sha: sha, refs: [olderRef, "refs/tags/\(tag) \(sha)"], releases: ["v0.1.0", olderRelease, "\(tag)-rc"])
-        XCTAssertEqual(r.status, 1, "a tag without a release stops the run")
-        XCTAssertEqual(r.output, "", "no outputs, so nothing is built")
-        XCTAssertTrue(r.stderr.contains("tag \(tag) exists but has no release"), r.stderr)
-
-        let foreign = "0123456789ab" + String(repeating: "f", count: 28)
-        r = try runPlan(script, sha: sha, refs: ["refs/tags/\(tag) \(foreign)"], releases: [tag])
-        XCTAssertEqual(r.status, 1, "a tag of another commit with the same first 12 characters stops the run")
-        XCTAssertEqual(r.output, "", "no outputs, so nothing is built")
-        XCTAssertTrue(r.stderr.contains("tag \(tag) points at \(foreign), not \(sha)"), r.stderr)
-
-        // A tag whose name only starts with this commit's nightly name is not its nightly.
-        r = try runPlan(script, sha: sha, refs: [olderRef, "refs/tags/\(tag)-x \(sha)"], releases: ["v0.1.0", olderRelease])
-        XCTAssertEqual(r.status, 0, r.stderr)
-        XCTAssertNotNil(r.output.range(of: #"^channel=nightly\nbuild=true\ntag=nightly-[0-9]{8}-0123456789ab\n$"#, options: .regularExpression),
-                        "a commit with no nightly gets a new tag: \(r.output)")
-    }
-
-    /// The plan job's one `run: |` block, unindented.
-    private func planScript() throws -> String {
-        let body = try job("plan")
-        let runs = body.indices.filter { body[$0] == "        run: |" }
-        XCTAssertEqual(runs.count, 1, "one run block in the plan job")
-        let script = body[(try XCTUnwrap(runs.first) + 1)...]
-            .prefix { $0.isEmpty || $0.hasPrefix("          ") }
-            .map { String($0.dropFirst(10)) }
-        XCTAssertTrue(script.contains("done <<< \"$refs\""), "the whole block, up to the end of the tag loop")
-        return script.joined(separator: "\n") + "\n"
-    }
-
-    /// Runs the plan script under `bash -e`, as the runner does, with only
-    /// the stub `gh` ahead of /usr/bin:/bin. The stub prints the given tag
-    /// refs and release names, what the script's two `gh api` calls would
-    /// print after their jq filters, and fails any other call.
-    private func runPlan(_ script: String, sha: String, refs: [String], releases: [String]) throws -> (status: Int32, output: String, stderr: String) {
-        let fm = FileManager.default
-        let root = fm.temporaryDirectory.appendingPathComponent("release-plan-\(UUID().uuidString)", isDirectory: true)
-        let bin = root.appendingPathComponent("bin", isDirectory: true)
-        try fm.createDirectory(at: bin, withIntermediateDirectories: true)
-        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
-        try (refs.map { $0 + "\n" }.joined()).write(to: root.appendingPathComponent("refs"), atomically: true, encoding: .utf8)
-        try (releases.map { $0 + "\n" }.joined()).write(to: root.appendingPathComponent("releases"), atomically: true, encoding: .utf8)
-        let gh = bin.appendingPathComponent("gh")
-        try #"""
-            #!/bin/bash
-            here="$(cd "$(dirname "$0")/.." && pwd)"
+        // The stub prints what the script's two `gh api` calls would print
+        // after their jq filters, and fails any other call.
+        let stub = """
             if [[ $# -eq 5 && $1 == api && $2 == --paginate && $4 == --jq ]]; then
               case "$3" in
                 repos/krishhgg/Insomnia/git/matching-refs/tags/nightly-) exec /bin/cat "$here/refs" ;;
                 "repos/krishhgg/Insomnia/releases?per_page=100") exec /bin/cat "$here/releases" ;;
               esac
             fi
+            """
+        func plan(refs: [String], releases: [String]) throws -> StepResult {
+            try runStep(script, gh: stub,
+                        files: ["refs": refs.map { $0 + "\n" }.joined(), "releases": releases.map { $0 + "\n" }.joined()],
+                        environment: ["EVENT": "schedule", "NIGHTLY_INPUT": "", "GITHUB_REF": "refs/heads/main", "GITHUB_SHA": sha])
+        }
+
+        var r = try plan(refs: [olderRef, "refs/tags/\(tag) \(sha)"], releases: ["v0.1.0", olderRelease, tag])
+        XCTAssertEqual(r.status, 0, r.stderr)
+        XCTAssertEqual(r.output, "channel=nightly\nbuild=false\n", "a published nightly of this commit is skipped")
+
+        // A release whose name only starts with the tag is not its release.
+        r = try plan(refs: [olderRef, "refs/tags/\(tag) \(sha)"], releases: ["v0.1.0", olderRelease, "\(tag)-rc"])
+        XCTAssertEqual(r.status, 1, "a tag without a release stops the run")
+        XCTAssertEqual(r.output, "", "no outputs, so nothing is built")
+        XCTAssertTrue(r.stderr.contains("tag \(tag) exists but has no release"), r.stderr)
+
+        let foreign = "0123456789ab" + String(repeating: "f", count: 28)
+        r = try plan(refs: ["refs/tags/\(tag) \(foreign)"], releases: [tag])
+        XCTAssertEqual(r.status, 1, "a tag of another commit with the same first 12 characters stops the run")
+        XCTAssertEqual(r.output, "", "no outputs, so nothing is built")
+        XCTAssertTrue(r.stderr.contains("tag \(tag) points at \(foreign), not \(sha)"), r.stderr)
+
+        // A tag whose name only starts with this commit's nightly name is not its nightly.
+        r = try plan(refs: [olderRef, "refs/tags/\(tag)-x \(sha)"], releases: ["v0.1.0", olderRelease])
+        XCTAssertEqual(r.status, 0, r.stderr)
+        XCTAssertNotNil(r.output.range(of: #"^channel=nightly\nbuild=true\ntag=nightly-[0-9]{8}-0123456789ab\n$"#, options: .regularExpression),
+                        "a commit with no nightly gets a new tag: \(r.output)")
+    }
+
+    /// Runs the nightly job's last step with a stub `gh`. The tag is created
+    /// on the built commit; when it already exists, as on a rerun of this
+    /// job, it is used only if it names that commit. A tag on another commit,
+    /// or one that cannot be read, stops the job before any release exists.
+    func testTheNightlyTagIsCreatedOrReusedOnlyOnItsOwnCommit() throws {
+        let script = try stepScript("nightly", "Create the tag and the prerelease")
+        let sha = "0123456789abcdef0123456789abcdef01234567"
+        let tag = "nightly-20261009-0123456789ab"
+        let post = "api repos/krishhgg/Insomnia/git/refs -f ref=refs/tags/\(tag) -f sha=\(sha) --silent"
+        let get = "api repos/krishhgg/Insomnia/git/ref/tags/\(tag) --jq .object.sha"
+        let create = "release create \(tag) release/Insomnia-0.1.0-\(tag)-macos.zip release/SHA256SUMS --repo krishhgg/Insomnia"
+            + " --title Insomnia nightly 2026-10-09 (0123456789ab) --notes-file notes.md --verify-tag --prerelease --latest=false"
+        // Creating the ref exits with the status in create-status; reading it
+        // prints the file `at`, or fails as GitHub does when there is none.
+        let stub = """
+            case "$1 $2" in
+              "api repos/krishhgg/Insomnia/git/refs") exit "$(/bin/cat "$here/create-status")" ;;
+              "api repos/krishhgg/Insomnia/git/ref/tags/\(tag)")
+                [[ -e $here/at ]] || { echo "gh: Not Found (HTTP 404)" >&2; exit 1; }
+                exec /bin/cat "$here/at" ;;
+              "release create") exit 0 ;;
+            esac
+            """
+        func publish(createStatus: Int, at: String?) throws -> StepResult {
+            var files = ["release/Insomnia-0.1.0-\(tag)-macos.zip": "", "release/SHA256SUMS": "", "notes.md": "notes\n",
+                         "create-status": "\(createStatus)\n"]
+            if let at { files["at"] = at + "\n" }
+            return try runStep(script, gh: stub, files: files, environment: ["GITHUB_SHA": sha, "TAG": tag])
+        }
+
+        var r = try publish(createStatus: 0, at: nil)
+        XCTAssertEqual(r.status, 0, r.stderr)
+        XCTAssertEqual(r.calls, [post, create], "a new tag on the built commit, then the prerelease")
+
+        r = try publish(createStatus: 1, at: sha)
+        XCTAssertEqual(r.status, 0, r.stderr)
+        XCTAssertEqual(r.calls, [post, get, create], "a rerun uses the tag it made on this commit")
+
+        let foreign = "0123456789ab" + String(repeating: "f", count: 28)
+        r = try publish(createStatus: 1, at: foreign)
+        XCTAssertEqual(r.status, 1)
+        XCTAssertEqual(r.calls, [post, get], "a tag on another commit stops the job before any release")
+        XCTAssertTrue(r.stderr.contains("tag \(tag) points at \(foreign), not \(sha)"), r.stderr)
+
+        r = try publish(createStatus: 1, at: nil)
+        XCTAssertNotEqual(r.status, 0)
+        XCTAssertEqual(r.calls, [post, get], "a tag that cannot be read stops the job before any release")
+    }
+
+    /// The `run: |` block of the job's step with this name, unindented.
+    private func stepScript(_ id: String, _ step: String) throws -> String {
+        let body = try job(id)
+        let names = body.indices.filter { body[$0] == "      - name: \(step)" }
+        XCTAssertEqual(names.count, 1, "one \(step) step in the \(id) job")
+        let name = try XCTUnwrap(names.first)
+        let run = try XCTUnwrap(body[name...].firstIndex(of: "        run: |"), "\(step) has no run block")
+        XCTAssertFalse(body[(name + 1)..<run].contains { $0.hasPrefix("      - ") }, "the run block after \(step) is another step's")
+        let script = body[(run + 1)...]
+            .prefix { $0.isEmpty || $0.hasPrefix("          ") }
+            .map { String($0.dropFirst(10)) }
+        XCTAssertFalse(script.allSatisfy(\.isEmpty), "\(step) has an empty run block")
+        return script.joined(separator: "\n") + "\n"
+    }
+
+    private struct StepResult {
+        var status: Int32
+        var output: String
+        var stderr: String
+        var calls: [String]
+    }
+
+    /// Runs a step's script under `bash -e`, as the runner does, in a fresh
+    /// directory holding `files`, with only a stub `gh` ahead of
+    /// /usr/bin:/bin. The stub logs each call's arguments, runs `body` with
+    /// `$here` set to that directory, and fails any call `body` does not
+    /// end. Returns what the step wrote to $GITHUB_OUTPUT and the calls.
+    private func runStep(_ script: String, gh body: String, files: [String: String], environment: [String: String]) throws -> StepResult {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("release-step-\(UUID().uuidString)", isDirectory: true)
+        let bin = root.appendingPathComponent("bin", isDirectory: true)
+        try fm.createDirectory(at: bin, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+        for (path, contents) in files {
+            let url = root.appendingPathComponent(path)
+            try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try contents.write(to: url, atomically: true, encoding: .utf8)
+        }
+        let gh = bin.appendingPathComponent("gh")
+        try """
+            #!/bin/bash
+            here="$(cd "$(dirname "$0")/.." && pwd)"
+            echo "$*" >> "$here/calls"
+            \(body)
             echo "stub gh: unexpected call: $*" >&2
             exit 99
 
-            """#.write(to: gh, atomically: true, encoding: .utf8)
+            """.write(to: gh, atomically: true, encoding: .utf8)
         try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: gh.path)
-        let scriptURL = root.appendingPathComponent("plan.sh")
+        let scriptURL = root.appendingPathComponent("step.sh")
         try script.write(to: scriptURL, atomically: true, encoding: .utf8)
         let outputURL = root.appendingPathComponent("output")
         let errURL = root.appendingPathComponent("stderr")
-        for url in [outputURL, errURL] { fm.createFile(atPath: url.path, contents: nil) }
+        for url in [outputURL, errURL, root.appendingPathComponent("calls")] { fm.createFile(atPath: url.path, contents: nil) }
 
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/bash")
         p.arguments = ["-e", scriptURL.path]
-        p.environment = [
+        p.currentDirectoryURL = root
+        p.environment = environment.merging([
             "PATH": "\(bin.path):/usr/bin:/bin", "TMPDIR": NSTemporaryDirectory(),
-            "EVENT": "schedule", "NIGHTLY_INPUT": "", "GITHUB_REF": "refs/heads/main", "GITHUB_SHA": sha,
             "GITHUB_REPOSITORY": "krishhgg/Insomnia", "GITHUB_OUTPUT": outputURL.path,
-        ]
+        ]) { _, fixed in fixed }
         // Capture to files rather than pipes: nothing to drain, nothing to deadlock.
         let err = try FileHandle(forWritingTo: errURL)
         defer { try? err.close() }
@@ -275,9 +349,9 @@ final class ReleaseWorkflowTests: XCTestCase {
         let childExit = ProcessExit(p)
         try p.run()
         childExit.wait()
-        return (p.terminationStatus,
-                (try? String(contentsOf: outputURL, encoding: .utf8)) ?? "",
-                (try? String(contentsOf: errURL, encoding: .utf8)) ?? "")
+        let read = { (name: String) in (try? String(contentsOf: root.appendingPathComponent(name), encoding: .utf8)) ?? "" }
+        return StepResult(status: p.terminationStatus, output: read("output"), stderr: read("stderr"),
+                          calls: read("calls").split(separator: "\n").map(String.init))
     }
 
     /// Releases are ad-hoc signed and not notarized: the workflow reads no
