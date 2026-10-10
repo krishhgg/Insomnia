@@ -1,13 +1,15 @@
 import Foundation
 import XCTest
+@testable import Insomnia
 
 /// Static checks on .github/workflows/*.yml: every action is pinned to a
 /// commit SHA with its version alongside, and no job runs with the default
 /// token permissions. release.yml gets a few more: its triggers, that only a
 /// pushed v* tag publishes a stable release and only main a nightly, that the
 /// two channels never share their release flags, and that only the
-/// publishing jobs can write. Plain text checks; the files are small and
-/// have no YAML anchors.
+/// publishing jobs can write. Plain text checks, except that the plan job's
+/// script also runs with a stub `gh`; the files are small and have no YAML
+/// anchors.
 final class ReleaseWorkflowTests: XCTestCase {
     private var workflowsDir: URL {
         URL(fileURLWithPath: #filePath)
@@ -176,6 +178,108 @@ final class ReleaseWorkflowTests: XCTestCase {
         }
     }
 
+    /// Runs the plan job's script from release.yml, as a scheduled run on
+    /// main would, with a stub `gh` serving the nightly tags and the release
+    /// names of each case. Only a commit whose nightly tag has a release is
+    /// skipped. A tag with no release, or a tag naming this commit's first 12
+    /// characters on another commit, stops the run with no outputs, so
+    /// nothing is built. A commit with no nightly tag gets a new one.
+    func testThePlanSkipsOnlyACommitWhoseNightlyHasARelease() throws {
+        let script = try planScript()
+        let sha = "0123456789abcdef0123456789abcdef01234567"
+        let tag = "nightly-20261009-0123456789ab"
+        let olderRef = "refs/tags/nightly-20261008-fedcba987654 fedcba9876543210fedcba9876543210fedcba98"
+        let olderRelease = "nightly-20261008-fedcba987654"
+
+        var r = try runPlan(script, sha: sha, refs: [olderRef, "refs/tags/\(tag) \(sha)"], releases: ["v0.1.0", olderRelease, tag])
+        XCTAssertEqual(r.status, 0, r.stderr)
+        XCTAssertEqual(r.output, "channel=nightly\nbuild=false\n", "a published nightly of this commit is skipped")
+
+        // A release whose name only starts with the tag is not its release.
+        r = try runPlan(script, sha: sha, refs: [olderRef, "refs/tags/\(tag) \(sha)"], releases: ["v0.1.0", olderRelease, "\(tag)-rc"])
+        XCTAssertEqual(r.status, 1, "a tag without a release stops the run")
+        XCTAssertEqual(r.output, "", "no outputs, so nothing is built")
+        XCTAssertTrue(r.stderr.contains("tag \(tag) exists but has no release"), r.stderr)
+
+        let foreign = "0123456789ab" + String(repeating: "f", count: 28)
+        r = try runPlan(script, sha: sha, refs: ["refs/tags/\(tag) \(foreign)"], releases: [tag])
+        XCTAssertEqual(r.status, 1, "a tag of another commit with the same first 12 characters stops the run")
+        XCTAssertEqual(r.output, "", "no outputs, so nothing is built")
+        XCTAssertTrue(r.stderr.contains("tag \(tag) points at \(foreign), not \(sha)"), r.stderr)
+
+        // A tag whose name only starts with this commit's nightly name is not its nightly.
+        r = try runPlan(script, sha: sha, refs: [olderRef, "refs/tags/\(tag)-x \(sha)"], releases: ["v0.1.0", olderRelease])
+        XCTAssertEqual(r.status, 0, r.stderr)
+        XCTAssertNotNil(r.output.range(of: #"^channel=nightly\nbuild=true\ntag=nightly-[0-9]{8}-0123456789ab\n$"#, options: .regularExpression),
+                        "a commit with no nightly gets a new tag: \(r.output)")
+    }
+
+    /// The plan job's one `run: |` block, unindented.
+    private func planScript() throws -> String {
+        let body = try job("plan")
+        let runs = body.indices.filter { body[$0] == "        run: |" }
+        XCTAssertEqual(runs.count, 1, "one run block in the plan job")
+        let script = body[(try XCTUnwrap(runs.first) + 1)...]
+            .prefix { $0.isEmpty || $0.hasPrefix("          ") }
+            .map { String($0.dropFirst(10)) }
+        XCTAssertTrue(script.contains("done <<< \"$refs\""), "the whole block, up to the end of the tag loop")
+        return script.joined(separator: "\n") + "\n"
+    }
+
+    /// Runs the plan script under `bash -e`, as the runner does, with only
+    /// the stub `gh` ahead of /usr/bin:/bin. The stub prints the given tag
+    /// refs and release names, what the script's two `gh api` calls would
+    /// print after their jq filters, and fails any other call.
+    private func runPlan(_ script: String, sha: String, refs: [String], releases: [String]) throws -> (status: Int32, output: String, stderr: String) {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("release-plan-\(UUID().uuidString)", isDirectory: true)
+        let bin = root.appendingPathComponent("bin", isDirectory: true)
+        try fm.createDirectory(at: bin, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+        try (refs.map { $0 + "\n" }.joined()).write(to: root.appendingPathComponent("refs"), atomically: true, encoding: .utf8)
+        try (releases.map { $0 + "\n" }.joined()).write(to: root.appendingPathComponent("releases"), atomically: true, encoding: .utf8)
+        let gh = bin.appendingPathComponent("gh")
+        try #"""
+            #!/bin/bash
+            here="$(cd "$(dirname "$0")/.." && pwd)"
+            if [[ $# -eq 5 && $1 == api && $2 == --paginate && $4 == --jq ]]; then
+              case "$3" in
+                repos/krishhgg/Insomnia/git/matching-refs/tags/nightly-) exec /bin/cat "$here/refs" ;;
+                "repos/krishhgg/Insomnia/releases?per_page=100") exec /bin/cat "$here/releases" ;;
+              esac
+            fi
+            echo "stub gh: unexpected call: $*" >&2
+            exit 99
+
+            """#.write(to: gh, atomically: true, encoding: .utf8)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: gh.path)
+        let scriptURL = root.appendingPathComponent("plan.sh")
+        try script.write(to: scriptURL, atomically: true, encoding: .utf8)
+        let outputURL = root.appendingPathComponent("output")
+        let errURL = root.appendingPathComponent("stderr")
+        for url in [outputURL, errURL] { fm.createFile(atPath: url.path, contents: nil) }
+
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/bash")
+        p.arguments = ["-e", scriptURL.path]
+        p.environment = [
+            "PATH": "\(bin.path):/usr/bin:/bin", "TMPDIR": NSTemporaryDirectory(),
+            "EVENT": "schedule", "NIGHTLY_INPUT": "", "GITHUB_REF": "refs/heads/main", "GITHUB_SHA": sha,
+            "GITHUB_REPOSITORY": "krishhgg/Insomnia", "GITHUB_OUTPUT": outputURL.path,
+        ]
+        // Capture to files rather than pipes: nothing to drain, nothing to deadlock.
+        let err = try FileHandle(forWritingTo: errURL)
+        defer { try? err.close() }
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = err
+        let childExit = ProcessExit(p)
+        try p.run()
+        childExit.wait()
+        return (p.terminationStatus,
+                (try? String(contentsOf: outputURL, encoding: .utf8)) ?? "",
+                (try? String(contentsOf: errURL, encoding: .utf8)) ?? "")
+    }
+
     /// Releases are ad-hoc signed and not notarized: the workflow reads no
     /// secret, imports no certificate, notarizes nothing, build-app.sh has
     /// no Developer ID path (no signing identity from the environment, no
@@ -237,6 +341,7 @@ final class ReleaseWorkflowTests: XCTestCase {
         let install = try readmeInstallSection().split(whereSeparator: \.isWhitespace).joined(separator: " ")
         for phrase in ["Stable: the release GitHub marks Latest", "Nightly: prereleases tagged `nightly-", "A nightly is never marked Latest",
                        "`refs/tags/v<version>` for a stable release or `refs/heads/main` for a nightly",
+                       "--source-ref <ref> --source-digest <commit>",
                        "If the release you picked is `v0.1.0`", "Install the latest stable Insomnia release from", "the newest Insomnia nightly prerelease"] {
             XCTAssertTrue(install.contains(phrase), "the README's Install section lacks: \(phrase)")
         }

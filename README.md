@@ -57,6 +57,13 @@ has no attestation, and its zip installs with
 `v0.1.0` (its zip is `Insomnia-0.1.0-macos-arm64.zip`), follow the install
 steps in its release notes instead of steps 2 and 3.
 
+The rest of this README describes releases built by the Release workflow and
+builds of the current source, not `v0.1.0`. The `README.md` in the `v0.1.0`
+zip describes what that release installs, how its recovery works and its
+limits. In particular, the installer's version check, the recovery script
+sealed inside the app and the code requirement the recovery agent pins,
+described below, are not in `v0.1.0`.
+
 Paste this into your coding agent:
 
 ```text
@@ -69,35 +76,63 @@ prerelease" in place of "the latest stable Insomnia release".
 Or run it yourself (`gh` is the [GitHub CLI](https://cli.github.com)):
 
 1. Download the zip and `SHA256SUMS` of the release you chose into an empty
-   folder, from the releases page or with `gh`:
+   folder, from the releases page or with `gh`. For the stable release, the
+   one marked Latest:
 
    ```bash
-   # Stable: the release marked Latest
    gh release download --repo krishhgg/Insomnia --pattern '*.zip' --pattern SHA256SUMS
+   ```
 
-   # Nightly: the newest nightly prerelease
-   tag="$(gh release list --repo krishhgg/Insomnia --exclude-drafts --limit 100 \
-     --json tagName,isPrerelease,publishedAt \
-     --jq '[.[] | select(.isPrerelease and (.tagName | startswith("nightly-")))] | sort_by(.publishedAt) | last | .tagName')"
-   gh release download "$tag" --repo krishhgg/Insomnia --pattern '*.zip' --pattern SHA256SUMS
+   For the newest nightly, paste this whole block. It reads every page of
+   the release list and picks the most recently published nightly. It
+   downloads nothing, and returns an error, when it cannot read the list,
+   when no nightly has been published yet, or when the tag it picked is not
+   in the `nightly-<YYYYMMDD>-<12-character commit>` form. It never falls
+   back to the stable release.
+
+   ```bash
+   insomnia_nightly() {
+     local list tag
+     list="$(gh api --paginate 'repos/krishhgg/Insomnia/releases?per_page=100' \
+       --jq '.[] | select(.prerelease and (.draft | not) and (.tag_name | startswith("nightly-")))
+         | "\(.published_at) \(.tag_name)"')" ||
+       { echo "Could not read the release list. Nothing was downloaded." >&2; return 1; }
+     tag="$(printf '%s\n' "$list" | sort | tail -n 1)"
+     tag="${tag#* }"
+     if [ -z "$tag" ]; then
+       echo "No nightly has been published yet. Nothing was downloaded." >&2
+       echo "Wait for the next daily build, or build from source." >&2
+       return 1
+     fi
+     if ! printf '%s\n' "$tag" | grep -Eqx 'nightly-[0-9]{8}-[0-9a-f]{12}'; then
+       printf 'Unexpected nightly tag: %s. Nothing was downloaded.\n' "$tag" >&2
+       return 1
+     fi
+     gh release download "$tag" --repo krishhgg/Insomnia --pattern '*.zip' --pattern SHA256SUMS
+   }
+   insomnia_nightly
    ```
 
    If the releases page has no release yet, build from source (below).
-2. Verify the download. `<zip>` is the zip's file name, and `<ref>` is
+2. Verify the download. `<zip>` is the zip's file name. `<ref>` is
    `refs/tags/v<version>` for a stable release or `refs/heads/main` for a
-   nightly:
+   nightly. `<commit>` is the full 40-character commit the release was built
+   from: its release notes name it after "Built from" and carry this command
+   filled in. A nightly's tag ends with the first 12 characters of it.
 
    ```bash
    shasum -a 256 -c SHA256SUMS
    gh attestation verify <zip> -R krishhgg/Insomnia \
      --signer-workflow krishhgg/Insomnia/.github/workflows/release.yml \
-     --source-ref <ref>
+     --source-ref <ref> --source-digest <commit>
    ```
 
-   The second command checks that this repository's Release workflow built
-   this exact zip for that ref, so a nightly cannot pass for a stable
-   release. The command in the release notes also adds `--source-digest`
-   with the commit, which pins the zip to that commit.
+   The first command checks the zip against the `SHA256SUMS` downloaded with
+   it. The second checks that this repository's Release workflow built this
+   exact zip from that commit for that ref, so a nightly cannot pass for a
+   stable release. Every nightly is built for `refs/heads/main`, so only
+   `--source-digest` keeps another nightly's zip from passing: do not leave
+   it out, and do not shorten the commit to the 12 characters in the tag.
 
 3. Unzip and run the installer that comes in the zip:
 
@@ -115,7 +150,8 @@ Or run it yourself (`gh` is the [GitHub CLI](https://cli.github.com)):
    System Settings > Privacy & Security.
 
 The installer checks the bundle's signature, identifier and version before it
-asks for anything. It then installs the app and a background recovery agent,
+asks for anything (the `v0.1.0` installer checks the signature and
+identifier, not the version). It then installs the app and a background recovery agent,
 and asks for administrator access to install a narrowly scoped sudoers rule. It grants
 **your user account**, not just Insomnia, passwordless access to four
 power-setting commands. Review that permission before installing.
@@ -148,6 +184,16 @@ a `build-app.sh` was added to its folder after unpacking. A checkout of
 
 <details>
 <summary><strong>Exactly what gets installed</strong></summary>
+
+This describes releases built by the Release workflow and builds of the
+current source. `v0.1.0` installs an older layout. Its app has no
+`backstop.sh` inside it: its installer copies `backstop.sh` into
+`~/Library/Application Support/Insomnia/`, and its recovery agent runs that
+copy with `/bin/bash` without checking any code signature. The sealed script,
+the pinned code requirement and the refusal of an edited or re-signed bundle
+described below do not apply to it, and neither does the upgrade procedure.
+Its sudoers rule grants the same four commands. The `README.md` in its zip
+describes what it installs and its limits.
 
 | Location | Purpose |
 | --- | --- |
@@ -674,6 +720,16 @@ offline with Xcode's swiftc and iconutil.
 
 [Contributing](CONTRIBUTING.md) · [Security reporting](SECURITY.md) ·
 [Release validation](docs/release-validation.md) · [Design notes](docs/spec.md)
+
+## Star history
+
+<a href="https://www.star-history.com/?repos=krishhgg%2FInsomnia&amp;type=date&amp;legend=top-left">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=krishhgg/insomnia&amp;type=date&amp;theme=dark&amp;legend=top-left" />
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=krishhgg/insomnia&amp;type=date&amp;legend=top-left" />
+    <img alt="Star history for krishhgg/Insomnia" src="https://api.star-history.com/svg?repos=krishhgg/insomnia&amp;type=date&amp;legend=top-left" />
+  </picture>
+</a>
 
 ## License
 

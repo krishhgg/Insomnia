@@ -45,8 +45,9 @@ ignores the data-protection accessibility classes (this device only, when
 unlocked); using that Keychain needs an access-group entitlement, which needs
 a team id. Releases are ad-hoc signed, so both limits stay.
 
-The recovery LaunchAgent runs only the `backstop.sh` sealed inside the signed
-app bundle, after `codesign --verify --strict` passes against the code
+In releases built by the Release workflow and in builds of the current
+source, the recovery LaunchAgent runs only the `backstop.sh` sealed inside the
+signed app bundle, after `codesign --verify --strict` passes against the code
 requirement pinned in its plist (the build's cdhash for an ad-hoc signature).
 An edited bundle or script is refused and logged. The app pins the code it is
 running (its own designated requirement, after confirming that the bundle on
@@ -67,7 +68,8 @@ before installing (`shasum -a 256 -c SHA256SUMS`,
 `gh attestation verify <zip> -R krishhgg/Insomnia --signer-workflow
 krishhgg/Insomnia/.github/workflows/release.yml --source-ref <ref>
 --source-digest <commit>`, with `refs/tags/v<version>` or `refs/heads/main`
-as the ref; the release notes carry the command filled in). `install.sh
+as the ref and the full commit the release was built from as the digest; the
+release notes carry the command filled in). `install.sh
 --app` then checks the signature, identifier and version of a private copy
 of the bundle before asking for a password, installs that copy, and refuses
 it unless `--allow-unverified-origin` is given, because it cannot verify where
@@ -83,7 +85,12 @@ check on the download. Its `scripts/install.sh --app` runs
 `codesign --verify --strict --deep` and checks the bundle identifier before
 the password prompt, but it has no `--allow-unverified-origin` opt-in: it
 installs any intact bundle it is given that has that identifier and the
-0.1.0 layout.
+0.1.0 layout. It does not check the version. Its recovery agent predates the
+sealed script and the pinned requirement described above: the installer
+copies `backstop.sh` into `~/Library/Application Support/Insomnia/`, and the
+agent runs that copy with `/bin/bash` without checking any code signature, so
+an edited copy runs as it is. The `README.md` in its zip describes that
+layout and its limits.
 
 Passing automated checks or a secret scan does not establish the absence of
 vulnerabilities. Do not probe recovery by disrupting someone else's processes,
