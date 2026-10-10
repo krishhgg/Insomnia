@@ -84,10 +84,11 @@ final class PrivateDisplayGuardTests: XCTestCase {
 
     func testDisplayServicesIsAllowedOnMeasuredMajorsOnly() throws {
         XCTAssertNil(DisplayPower.displayServicesRefusal(osMajorVersion: 26))
-        for major in [15, 25, 27, 30] {
+        XCTAssertNil(DisplayPower.displayServicesRefusal(osMajorVersion: 27))
+        for major in [15, 25, 28, 30] {
             let why = try XCTUnwrap(DisplayPower.displayServicesRefusal(osMajorVersion: major))
             XCTAssertTrue(why.contains("this is macOS \(major)"), why)
-            XCTAssertTrue(why.contains("measured on macOS 26 only"), why)
+            XCTAssertTrue(why.contains("measured on macOS 26, 27 only"), why)
         }
     }
 
@@ -95,11 +96,11 @@ final class PrivateDisplayGuardTests: XCTestCase {
     /// throws before the framework is opened, with the reason Settings
     /// shows, and the refusal is logged once.
     func testTheDimmerOnAnUnmeasuredMacOSRefusesEveryBrightnessCall() throws {
-        let dimmer = DisplayServicesDimmer(osMajorVersion: 27)
+        let dimmer = DisplayServicesDimmer(osMajorVersion: 28)
 
         let why = try XCTUnwrap(dimmer.refusal())
 
-        XCTAssertTrue(why.contains("this is macOS 27"), why)
+        XCTAssertTrue(why.contains("this is macOS 28"), why)
         XCTAssertThrowsError(try dimmer.readBrightness()) { XCTAssertEqual($0.localizedDescription, why) }
         XCTAssertThrowsError(try dimmer.setBrightness(0)) { XCTAssertEqual($0.localizedDescription, why) }
         XCTAssertEqual(dimmer.refusal(), why)
@@ -234,7 +235,7 @@ final class RefusedDarkeningTests: XCTestCase {
     }
 
     private var refusedDisplay: BrightnessOnlyDimmer {
-        BrightnessOnlyDimmer(inner: DisplayServicesDimmer(osMajorVersion: 27), power: h.display)
+        BrightnessOnlyDimmer(inner: DisplayServicesDimmer(osMajorVersion: 28), power: h.display)
     }
 
     private func logText() -> String {
@@ -258,8 +259,8 @@ final class RefusedDarkeningTests: XCTestCase {
         XCTAssertEqual(h.keyboard.sets, [0])
         XCTAssertEqual(h.display.sleepRequests, 1)
         let log = logText()
-        XCTAssertTrue(log.contains("display darkening refused: DisplayServices brightness calls were measured on macOS 26 only; this is macOS 27"), log)
-        XCTAssertTrue(log.contains("display darken on lid close skipped: DisplayServices brightness calls were measured on macOS 26 only; this is macOS 27"), log)
+        XCTAssertTrue(log.contains("display darkening refused: DisplayServices brightness calls were measured on macOS 26, 27 only; this is macOS 28"), log)
+        XCTAssertTrue(log.contains("display darken on lid close skipped: DisplayServices brightness calls were measured on macOS 26, 27 only; this is macOS 28"), log)
         XCTAssertTrue(log.contains("keyboard backlight off (was brightness 0.5)"), log)
 
         await actions.onOpen()
@@ -357,7 +358,7 @@ final class RefusedDarkeningTests: XCTestCase {
         XCTAssertFalse(after.hasLidActions, "the live session keeps the sleep guard journaled, but no lid action is left to undo")
         let error = try XCTUnwrap(m.lastError)
         XCTAssertTrue(error.hasPrefix("could not restore the brightness saved before the lid closed on this macOS build. "), error)
-        XCTAssertTrue(error.contains("Display brightness 0.8: DisplayServices brightness calls were measured on macOS 26 only; this is macOS 27"), error)
+        XCTAssertTrue(error.contains("Display brightness 0.8: DisplayServices brightness calls were measured on macOS 26, 27 only; this is macOS 28"), error)
         XCTAssertTrue(error.contains("Keyboard backlight 0.3: KeyboardBrightnessClient isKeyboardBuiltIn: has type encoding B@:i"), error)
         XCTAssertTrue(error.contains("Set the levels with the brightness keys or Control Center"), error)
         XCTAssertTrue(error.contains("the saved values stay in the journal"), error)
@@ -2982,7 +2983,7 @@ final class RefusedDarkeningTests: XCTestCase {
         let notes = m.darkenRefusals
 
         XCTAssertEqual(notes.count, 2, "\(notes)")
-        XCTAssertTrue(notes.first?.hasPrefix("Display: DisplayServices brightness calls were measured on macOS 26 only; this is macOS 27") == true, "\(notes)")
+        XCTAssertTrue(notes.first?.hasPrefix("Display: DisplayServices brightness calls were measured on macOS 26, 27 only; this is macOS 28") == true, "\(notes)")
         XCTAssertTrue(notes.last?.hasPrefix("Keyboard backlight: KeyboardBrightnessClient isKeyboardBuiltIn: has type encoding B@:i") == true, "\(notes)")
         XCTAssertEqual(h.makeManager().darkenRefusals, [], "the harness fakes refuse nothing")
     }
