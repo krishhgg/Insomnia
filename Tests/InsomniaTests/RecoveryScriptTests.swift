@@ -1566,7 +1566,10 @@ final class RecoveryScriptTests: XCTestCase {
     /// a string id (`Session.id`, `sleepOffAttempt.session`), the ids are
     /// the same. Another id keeps it, whatever its end. An id missing on
     /// either side, or one that is not a string, leaves the end to decide,
-    /// as in the app (`SessionManager.isSession`).
+    /// as in the app (`SessionManager.isSession`). Each case has a fixture
+    /// of its own; the runs go two at a time (runTwoAtATime): the dialog
+    /// ended a second before the journal was written and the session ends
+    /// an hour after, so no row depends on when it runs.
     func testBothScriptsRemoveTheStartsSessionOnlyWhenItsIdIsTheStarts() throws {
         let cases: [(name: String, session: String?, record: String?, removed: Bool)] = [
             ("the same id", #""A""#, #""A""#, true),
@@ -1575,32 +1578,44 @@ final class RecoveryScriptTests: XCTestCase {
             ("a record without the id", #""A""#, nil, true),
             ("a session without the id", nil, #""B""#, true),
         ]
+        var fixtures: [ScriptFixture] = []
+        defer { fixtures.forEach { $0.destroy() } }
+        var rows: [(row: ScriptRow, script: String, removed: Bool)] = []
         for script in ["backstop", "uninstall"] {
             for c in cases {
-                let name = "\(script): \(c.name)"
-                fx.destroy()
-                fx = try ScriptFixture()
-                if script == "uninstall" { try fx.installMachinery() }
+                let f = try ScriptFixture()
+                fixtures.append(f)
+                if script == "uninstall" { try f.installMachinery() }
+                let previous = fx
+                fx = f
+                defer { fx = previous }
                 try journalUnfinishedStart()
                 if let id = c.session {
-                    let text = try String(contentsOf: fx.session, encoding: .utf8)
-                    try text.replacingOccurrences(of: #""extensions":[]}"#, with: #""extensions":[],"id":\#(id)}"#).write(to: fx.session, atomically: true, encoding: .utf8)
+                    let text = try String(contentsOf: f.session, encoding: .utf8)
+                    try text.replacingOccurrences(of: #""extensions":[]}"#, with: #""extensions":[],"id":\#(id)}"#).write(to: f.session, atomically: true, encoding: .utf8)
                 }
                 if let id = c.record {
-                    let text = try String(contentsOf: fx.state, encoding: .utf8)
-                    try text.replacingOccurrences(of: #""deadline":"#, with: #""session":\#(id),"deadline":"#).write(to: fx.state, atomically: true, encoding: .utf8)
+                    let text = try String(contentsOf: f.state, encoding: .utf8)
+                    try text.replacingOccurrences(of: #""deadline":"#, with: #""session":\#(id),"deadline":"#).write(to: f.state, atomically: true, encoding: .utf8)
                 }
+                rows.append((ScriptRow("\(script): \(c.name)", f, script == "backstop" ? f.backstop : f.uninstall), script, c.removed))
+            }
+        }
+        XCTAssertEqual(rows.count, 10)
 
-                let r = try fx.run(script == "backstop" ? fx.backstop : fx.uninstall)
+        runTwoAtATime(rows.map(\.row))
 
-                let said = script == "backstop" ? fx.log() : r.stdout
-                XCTAssertEqual(said.contains("removed \(fx.session.path): its start never finished"), c.removed, "\(name): \(said)")
-                XCTAssertEqual(said.contains("kept \(fx.session.path): its end is the start's deadline, but its id is not the session the start journaled"), !c.removed, "\(name): \(said)")
-                if script == "backstop" {
-                    XCTAssertEqual(fx.exists(fx.session), !c.removed, "\(name): \(r.stderr)")
-                } else {
-                    XCTAssertEqual(r.status, 0, "\(name): \(r.stderr + r.stdout)")
-                }
+        for (row, script, removed) in rows {
+            let f = row.fixture
+            let name = row.label
+            let r = try row.outcome()
+            let said = script == "backstop" ? f.log() : r.stdout
+            XCTAssertEqual(said.contains("removed \(f.session.path): its start never finished"), removed, "\(name): \(said)")
+            XCTAssertEqual(said.contains("kept \(f.session.path): its end is the start's deadline, but its id is not the session the start journaled"), !removed, "\(name): \(said)")
+            if script == "backstop" {
+                XCTAssertEqual(f.exists(f.session), !removed, "\(name): \(r.stderr)")
+            } else {
+                XCTAssertEqual(r.status, 0, "\(name): \(r.stderr + r.stdout)")
             }
         }
     }
@@ -1971,86 +1986,102 @@ final class RecoveryScriptTests: XCTestCase {
     /// on a line that ends in a newline, with a status that agrees; one
     /// longer than any valid answer, which is not read; one with a NUL
     /// byte; and a folder whose list allows something (installed on a
-    /// folder too) or could not be read whole.
+    /// folder too) or could not be read whole. Each case and the control
+    /// have a fixture of their own, and the runs go two at a time
+    /// (runTwoAtATime), except the binary that does not answer, which
+    /// reaches its limit and so runs alone after them.
     func testBackstopRefusesAReceiptWhoseListsTheAppBinaryDoesNotGiveWhole() throws {
-        let folders = foldersAbove(fx.receipt)
-        let n = folders.count + 1
-        let listsLog = fx.root.appendingPathComponent("insomnia.lists.log").path
-        let output = fx.root.appendingPathComponent("insomnia.lists.output")
-        let status = fx.root.appendingPathComponent("insomnia.lists.status")
-        let hang = fx.root.appendingPathComponent("insomnia.lists.hang")
-        let none = Array(repeating: "none", count: n - 1)
-        func answer(_ text: String, _ code: Int) -> () throws -> Void {
-            {
-                try text.write(to: output, atomically: true, encoding: .utf8)
-                try "\(code)\n".write(to: status, atomically: true, encoding: .utf8)
+        func cases(_ f: ScriptFixture) -> [(name: String, prepare: () throws -> Void, says: String, ran: Bool)] {
+            let folders = foldersAbove(f.receipt)
+            let n = folders.count + 1
+            let output = f.root.appendingPathComponent("insomnia.lists.output")
+            let status = f.root.appendingPathComponent("insomnia.lists.status")
+            let hang = f.root.appendingPathComponent("insomnia.lists.hang")
+            let none = Array(repeating: "none", count: n - 1)
+            func answer(_ text: String, _ code: Int) -> () throws -> Void {
+                {
+                    try text.write(to: output, atomically: true, encoding: .utf8)
+                    try "\(code)\n".write(to: status, atomically: true, encoding: .utf8)
+                }
             }
+            func words(_ list: [String], _ code: Int) -> () throws -> Void { answer(list.map { $0 + "\n" }.joined(), code) }
+            let unknown = "the access control lists of \(f.receipt) and the folders above it are unknown: "
+            let notOne = unknown + "the app binary's answer is not one word for each of the \(n) paths "
+            let plist = { (version: String?) in { try ScriptFixture.infoPlist(resumeFrozenVersion: "1", accessListsVersion: version).write(to: f.appInfo, atomically: true, encoding: .utf8) } }
+            return [
+                ("a binary that is not executable", { try f.setFakeInsomniaExecutable(false) },
+                 unknown + "the app binary that reads them, \(f.fakeInsomnia.path), is missing or not executable", false),
+                ("an Info.plist without the version", plist(nil),
+                 unknown + "\(f.appInfo.path) does not declare InsomniaAccessListsVersion 1 ('': an older or newer build), so the app binary was not run", false),
+                ("an Info.plist with version 2", plist("2"),
+                 unknown + "\(f.appInfo.path) does not declare InsomniaAccessListsVersion 1 ('2': an older or newer build), so the app binary was not run", false),
+                ("no Info.plist", { try FileManager.default.removeItem(at: f.appInfo) },
+                 unknown + "\(f.appInfo.path) does not declare InsomniaAccessListsVersion 1 ('': an older or newer build), so the app binary was not run", false),
+                ("no answer in time", { XCTAssertTrue(FileManager.default.createFile(atPath: hang.path, contents: nil)) },
+                 unknown + "the app binary did not answer within 1s", true),
+                ("a word too few", words(["installed"] + none.dropLast(), 0), notOne + "(exit 0, output 'installed none", true),
+                ("a word too many", words(["installed"] + none + ["none"], 0), notOne + "(exit 0, output 'installed none", true),
+                ("no newline at the end", answer((["installed"] + none).joined(separator: "\n"), 0), notOne + "(exit 0, output 'installed none", true),
+                ("a word it does not know", words(["installed", "maybe"] + none.dropFirst(), 0), notOne + "(exit 0, output 'installed maybe none", true),
+                ("a word with a space after it", words(["installed "] + none, 0), notOne + "(exit 0, output 'installed  none", true),
+                ("unreadable 0", words(["unreadable 0"] + none, 1), notOne + "(exit 1, output 'unreadable 0 none", true),
+                ("a status that does not agree", words(["installed"] + none, 1), notOne + "(exit 1, output 'installed none", true),
+                ("a list not read whole with status 0", words(["unreadable 13"] + none, 0), notOne + "(exit 0, output 'unreadable 13 none", true),
+                ("usage", words(["usage"], 64), notOne + "(exit 64, output 'usage ')", true),
+                ("longer than any answer", answer(String(repeating: "x", count: n * 24 + 1), 0), notOne + "(exit 0, \(n * 24 + 1) bytes)", true),
+                ("a NUL byte", { try (Data("installed\n".utf8) + Data([0]) + Data(none.map { $0 + "\n" }.joined().utf8)).write(to: output); try "0\n".write(to: status, atomically: true, encoding: .utf8) },
+                 unknown + "the app binary's answer could not be read whole", true),
+                ("its folder allows something", words(["installed", "allows"] + none.dropFirst(), 0),
+                 "the folder of \(f.receipt) or one above it (\(folders[0])) has an access control entry that allows changes", true),
+                ("its folder has the receipt's entry", words(["installed", "installed"] + none.dropFirst(), 0),
+                 "the folder of \(f.receipt) or one above it (\(folders[0])) has an access control entry that allows changes", true),
+                ("a folder read in part", words(["installed", "none", "incomplete"] + none.dropFirst(2), 1),
+                 "the access control list of the folder of \(f.receipt) or one above it (\(folders[1])) could not be read whole (incomplete)", true),
+                ("/ unreadable", words(["installed"] + none.dropLast() + ["unreadable 13"], 1),
+                 "the access control list of the folder of \(f.receipt) or one above it (/) could not be read whole (unreadable 13)", true),
+            ]
         }
-        func words(_ list: [String], _ code: Int) -> () throws -> Void { answer(list.map { $0 + "\n" }.joined(), code) }
-        let unknown = "the access control lists of \(fx.receipt) and the folders above it are unknown: "
-        let notOne = unknown + "the app binary's answer is not one word for each of the \(n) paths "
-        let plist = { (version: String?) in { try ScriptFixture.infoPlist(resumeFrozenVersion: "1", accessListsVersion: version).write(to: self.fx.appInfo, atomically: true, encoding: .utf8) } }
-        let cases: [(name: String, prepare: () throws -> Void, says: String, ran: Bool)] = [
-            ("a binary that is not executable", { try self.fx.setFakeInsomniaExecutable(false) },
-             unknown + "the app binary that reads them, \(fx.fakeInsomnia.path), is missing or not executable", false),
-            ("an Info.plist without the version", plist(nil),
-             unknown + "\(fx.appInfo.path) does not declare InsomniaAccessListsVersion 1 ('': an older or newer build), so the app binary was not run", false),
-            ("an Info.plist with version 2", plist("2"),
-             unknown + "\(fx.appInfo.path) does not declare InsomniaAccessListsVersion 1 ('2': an older or newer build), so the app binary was not run", false),
-            ("no Info.plist", { try FileManager.default.removeItem(at: self.fx.appInfo) },
-             unknown + "\(fx.appInfo.path) does not declare InsomniaAccessListsVersion 1 ('': an older or newer build), so the app binary was not run", false),
-            ("no answer in time", { XCTAssertTrue(FileManager.default.createFile(atPath: hang.path, contents: nil)) },
-             unknown + "the app binary did not answer within 1s", true),
-            ("a word too few", words(["installed"] + none.dropLast(), 0), notOne + "(exit 0, output 'installed none", true),
-            ("a word too many", words(["installed"] + none + ["none"], 0), notOne + "(exit 0, output 'installed none", true),
-            ("no newline at the end", answer((["installed"] + none).joined(separator: "\n"), 0), notOne + "(exit 0, output 'installed none", true),
-            ("a word it does not know", words(["installed", "maybe"] + none.dropFirst(), 0), notOne + "(exit 0, output 'installed maybe none", true),
-            ("a word with a space after it", words(["installed "] + none, 0), notOne + "(exit 0, output 'installed  none", true),
-            ("unreadable 0", words(["unreadable 0"] + none, 1), notOne + "(exit 1, output 'unreadable 0 none", true),
-            ("a status that does not agree", words(["installed"] + none, 1), notOne + "(exit 1, output 'installed none", true),
-            ("a list not read whole with status 0", words(["unreadable 13"] + none, 0), notOne + "(exit 0, output 'unreadable 13 none", true),
-            ("usage", words(["usage"], 64), notOne + "(exit 64, output 'usage ')", true),
-            ("longer than any answer", answer(String(repeating: "x", count: n * 24 + 1), 0), notOne + "(exit 0, \(n * 24 + 1) bytes)", true),
-            ("a NUL byte", { try (Data("installed\n".utf8) + Data([0]) + Data(none.map { $0 + "\n" }.joined().utf8)).write(to: output); try "0\n".write(to: status, atomically: true, encoding: .utf8) },
-             unknown + "the app binary's answer could not be read whole", true),
-            ("its folder allows something", words(["installed", "allows"] + none.dropFirst(), 0),
-             "the folder of \(fx.receipt) or one above it (\(folders[0])) has an access control entry that allows changes", true),
-            ("its folder has the receipt's entry", words(["installed", "installed"] + none.dropFirst(), 0),
-             "the folder of \(fx.receipt) or one above it (\(folders[0])) has an access control entry that allows changes", true),
-            ("a folder read in part", words(["installed", "none", "incomplete"] + none.dropFirst(2), 1),
-             "the access control list of the folder of \(fx.receipt) or one above it (\(folders[1])) could not be read whole (incomplete)", true),
-            ("/ unreadable", words(["installed"] + none.dropLast() + ["unreadable 13"], 1),
-             "the access control list of the folder of \(fx.receipt) or one above it (/) could not be read whole (unreadable 13)", true),
-        ]
-        XCTAssertGreaterThanOrEqual(n, 4, "the receipt, its folder, a folder above it and /")
-        for c in cases {
-            removeIfPresent(fx.logFile)
-            fx.clearCalls()
-            unlinkIfPresent(listsLog)
+        XCTAssertGreaterThanOrEqual(foldersAbove(fx.receipt).count + 1, 4, "the receipt, its folder, a folder above it and /")
+        let count = cases(fx).count
+        XCTAssertEqual(count, 20)
+        var fixtures: [ScriptFixture] = []
+        defer { fixtures.forEach { $0.destroy() } }
+        var rows: [(row: ScriptRow, c: (name: String, prepare: () throws -> Void, says: String, ran: Bool)?, nonce: String)] = []
+        for i in 0...count {
+            let f = try ScriptFixture()
+            fixtures.append(f)
+            let previous = fx
+            fx = f
+            defer { fx = previous }
             let nonce = try journalUnfinishedStart()
-            try c.prepare()
-
-            let r = try fx.run(fx.backstop)
-
-            try fx.setFakeInsomniaExecutable(true)
-            try plist("1")()
-            for file in [output, status, hang] { unlinkIfPresent(file.path) }
-            try assertKept(r, nonce: nonce, restored: true, saying: [c.says, "an unfinished start could not be settled: "])
-            XCTAssertEqual(FileManager.default.fileExists(atPath: listsLog), c.ran, "\(c.name): \(fx.log())")
+            let c = i < count ? cases(f)[i] : nil
+            try c?.prepare()
+            rows.append((ScriptRow(c?.name ?? "control", f, f.backstop), c, nonce))
         }
+        let timed = rows.filter { $0.c?.name == "no answer in time" }
+        XCTAssertEqual(timed.count, 1)
 
-        removeIfPresent(fx.logFile)
-        fx.clearCalls()
-        unlinkIfPresent(listsLog)
-        try journalUnfinishedStart()
+        runTwoAtATime(rows.filter { $0.c?.name != "no answer in time" }.map(\.row))
+        for (row, _, _) in timed { row.run() }
 
-        let r = try fx.run(fx.backstop)
-
-        XCTAssertEqual(r.status, 0, r.stderr)
-        try assertSettled(sleepRestored: false)
-        let lines = try String(contentsOfFile: listsLog, encoding: .utf8).split(separator: "\n").map(String.init)
-        XCTAssertFalse(lines.isEmpty)
-        XCTAssertEqual(Set(lines), ["--access-lists 2 \(fx.receipt) \(folders.joined(separator: " "))"])
+        for (row, c, nonce) in rows {
+            let f = row.fixture
+            let r = try row.outcome()
+            let listsLog = f.root.appendingPathComponent("insomnia.lists.log").path
+            let previous = fx
+            fx = f
+            defer { fx = previous }
+            guard let c else {
+                XCTAssertEqual(r.status, 0, r.stderr)
+                try assertSettled(sleepRestored: false)
+                let lines = try String(contentsOfFile: listsLog, encoding: .utf8).split(separator: "\n").map(String.init)
+                XCTAssertFalse(lines.isEmpty)
+                XCTAssertEqual(Set(lines), ["--access-lists 2 \(f.receipt) \(foldersAbove(f.receipt).joined(separator: " "))"])
+                continue
+            }
+            try assertKept(r, nonce: nonce, restored: true, saying: [c.says, "an unfinished start could not be settled: "])
+            XCTAssertEqual(FileManager.default.fileExists(atPath: listsLog), c.ran, "\(c.name): \(f.log())")
+        }
     }
 
     /// F3 (round 28). install.sh and the root command (both copies) read
@@ -3015,7 +3046,9 @@ final class RecoveryScriptTests: XCTestCase {
     /// its own, a listing that fails (perl exits 3, as on a readdir error)
     /// and one whose output is not read whole. This account's own files
     /// still go, and nothing of another account's is touched. The control,
-    /// a folder holding only this account's files, removes the rule.
+    /// a folder holding only this account's files, removes the rule. Each
+    /// case and the control have a fixture of their own, and the
+    /// uninstalls run two at a time (runTwoAtATime).
     func testUninstallKeepsTheRuleWhileTheReceiptFolderMayShowAnotherAccount() throws {
         let a = String(getuid() + 1), b = String(getuid() + 2)
         let cases: [(name: String, own: Bool, others: [String], perl: String?, why: (ScriptFixture) -> String)] = [
@@ -3026,33 +3059,54 @@ final class RecoveryScriptTests: XCTestCase {
             ("a listing that fails", true, [], "exit 3", { "\($0.receipts) could not be listed whole (perl exit 3), so whether another account on this Mac has a receipt in it is unknown" }),
             ("a listing not read whole", true, [], #"printf '.\n..\n\0x\n'; exit 0"#, { "\($0.receipts) could not be listed whole (perl exit 0), so whether another account on this Mac has a receipt in it is unknown" }),
         ]
-        for c in cases {
+        var fixtures: [ScriptFixture] = []
+        defer { fixtures.forEach { $0.destroy() } }
+        var rows: [(row: ScriptRow, c: (name: String, own: Bool, others: [String], perl: String?, why: (ScriptFixture) -> String)?)] = []
+        for c in cases + [nil] {
             let f = try ScriptFixture()
-            defer { f.destroy() }
+            fixtures.append(f)
             try f.installMachinery()
             try f.writeState(cleanJournal)
             try f.writeReceipt()
-            if !c.own {
-                XCTAssertEqual(unlink(f.receipt), 0)
-                XCTAssertEqual(unlink(f.released), 0)
+            if let c {
+                if !c.own {
+                    XCTAssertEqual(unlink(f.receipt), 0)
+                    XCTAssertEqual(unlink(f.released), 0)
+                }
+                for name in c.others {
+                    try "another account\n".write(toFile: f.receipts + "/" + name, atomically: true, encoding: .utf8)
+                }
+                if let action = c.perl {
+                    let wrapper = f.bin.appendingPathComponent("perl-list")
+                    try """
+                    #!/bin/bash
+                    if [[ "$2" == *readdir* && "${!#}" == '\(f.receipts)' ]]; then \(action); fi
+                    exec /usr/bin/perl "$@"
+                    """.write(to: wrapper, atomically: true, encoding: .utf8)
+                    XCTAssertEqual(chmod(wrapper.path, 0o755), 0)
+                    let text = try String(contentsOf: f.uninstall, encoding: .utf8)
+                    try ScriptFixture.patch(text, ["PERL": wrapper.path]).write(to: f.uninstall, atomically: true, encoding: .utf8)
+                }
             }
-            for name in c.others {
-                try "another account\n".write(toFile: f.receipts + "/" + name, atomically: true, encoding: .utf8)
-            }
-            if let action = c.perl {
-                let wrapper = f.bin.appendingPathComponent("perl-list")
-                try """
-                #!/bin/bash
-                if [[ "$2" == *readdir* && "${!#}" == '\(f.receipts)' ]]; then \(action); fi
-                exec /usr/bin/perl "$@"
-                """.write(to: wrapper, atomically: true, encoding: .utf8)
-                XCTAssertEqual(chmod(wrapper.path, 0o755), 0)
-                let text = try String(contentsOf: f.uninstall, encoding: .utf8)
-                try ScriptFixture.patch(text, ["PERL": wrapper.path]).write(to: f.uninstall, atomically: true, encoding: .utf8)
-            }
+            rows.append((ScriptRow(c?.name ?? "control: only this account's files", f, f.uninstall), c))
+        }
+        XCTAssertEqual(rows.count, 7)
 
-            let r = try f.run(f.uninstall)
+        runTwoAtATime(rows.map(\.row))
 
+        for (row, c) in rows {
+            let f = row.fixture
+            let r = try row.outcome()
+            guard let c else {
+                XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+                XCTAssertTrue(r.stdout.contains("\(f.sudoers.path) is gone"), r.stdout)
+                XCTAssertFalse(r.stdout.contains("kept \(f.sudoers.path)"), r.stdout)
+                XCTAssertFalse(r.stderr.contains("was kept"), r.stderr)
+                XCTAssertTrue(f.calls().contains("sudo -n /bin/rm -f \(f.sudoers.path)"), "\(f.calls())")
+                XCTAssertFalse(f.exists(f.sudoers))
+                XCTAssertFalse(FileManager.default.fileExists(atPath: f.receipts))
+                continue
+            }
             XCTAssertEqual(r.status, 0, "\(c.name): \(r.stderr + r.stdout)")
             let why = c.why(f)
             XCTAssertTrue(r.stdout.contains("kept \(f.sudoers.path): \(why), and that account's recovery agent may need the rule"), "\(c.name): \(r.stdout)")
@@ -3067,20 +3121,6 @@ final class RecoveryScriptTests: XCTestCase {
             XCTAssertEqual(FileManager.default.fileExists(atPath: f.receipts), !c.others.isEmpty, "\(c.name): an empty folder still goes")
             XCTAssertFalse(f.exists(f.installedBackstop), "\(c.name): this account's bundle still goes")
         }
-
-        try fx.installMachinery()
-        try fx.writeState(cleanJournal)
-        try fx.writeReceipt()
-
-        let r = try fx.run(fx.uninstall)
-
-        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
-        XCTAssertTrue(r.stdout.contains("\(fx.sudoers.path) is gone"), r.stdout)
-        XCTAssertFalse(r.stdout.contains("kept \(fx.sudoers.path)"), r.stdout)
-        XCTAssertFalse(r.stderr.contains("was kept"), r.stderr)
-        XCTAssertTrue(fx.calls().contains("sudo -n /bin/rm -f \(fx.sudoers.path)"), "\(fx.calls())")
-        XCTAssertFalse(fx.exists(fx.sudoers))
-        XCTAssertFalse(FileManager.default.fileExists(atPath: fx.receipts))
     }
 
     // MARK: Round 28 (finding 2): what every Insomnia folder of this user shares
@@ -3456,7 +3496,9 @@ final class RecoveryScriptTests: XCTestCase {
     /// does not declare the version, when the binary is not run; for those
     /// two it says that installing this version again lets it go on. A
     /// binary that does not answer in time, and a folder whose list allows
-    /// something, stop it the same way.
+    /// something, stop it the same way. The rows run two at a time
+    /// (runTwoAtATime), except the binary that does not answer, whose rows
+    /// reach their limit and so run one at a time after them.
     func testUninstallRemovesNothingWhileTheAppBinaryDoesNotGiveTheListsWhole() throws {
         let hint = "run could not use. Install this version again (install.sh) and rerun, or\nremove the two files by hand as above."
         let cases: [(name: String, prepare: (ScriptFixture) throws -> Void, says: (ScriptFixture) -> String, hint: Bool, ran: Bool)] = [
@@ -3487,8 +3529,11 @@ final class RecoveryScriptTests: XCTestCase {
                 rows.append((ScriptRow("\(c.name), \(held ? "a claim" : "no claim")", f, f.uninstall), c, held, try Data(contentsOf: f.state)))
             }
         }
+        let timed = rows.filter { $0.c.name == "no answer in time" }
+        XCTAssertEqual(timed.count, 2)
 
-        runTwoAtATime(rows.map(\.row))
+        runTwoAtATime(rows.filter { $0.c.name != "no answer in time" }.map(\.row))
+        for (row, _, _, _) in timed { row.run() }
 
         for (row, c, held, journal) in rows {
             let f = row.fixture
@@ -15600,6 +15645,232 @@ final class AppEncodedJournalScriptTests: XCTestCase {
             XCTAssertTrue(f.calls().contains("sudo -n \(f.fakePmset) -a disablesleep 0"), label)
             XCTAssertEqual(try f.stateJSON()["sleepDisabledByUs"] as? Bool, false, label)
             XCTAssertFalse(f.exists(f.session), label)
+        }
+    }
+}
+
+/// Round 36 (independent35 R35-1): the F7 status-loss matrix, end to end.
+/// Each history is one start whose command ran and whose exit status was
+/// then lost, as when the app dies or quits under its dialog. The app
+/// journaled the start and its claim, the real root command
+/// (RootCommandProcess, under its fake pmset, sudo, env and perl) ran for
+/// it against the receipt, and another tool may have set SleepDisabled
+/// meanwhile. What is left is the receipt's line, the claim, the journal
+/// and SleepDisabled. From that alone the relaunched app, the agent
+/// (backstop.sh) and uninstall.sh each settle the start.
+///
+/// Histories that leave the same bytes cannot be told apart by any of the
+/// three, and these do:
+/// - A1, this start's pmset wrote 1 (B1 is A1 with its status returned);
+/// - A2, its command stopped after its `writing` and before pmset wrote
+///   (here pmset fails without writing), and another tool set 1 after the
+///   second read;
+/// - A3, the second read found another tool's 1 and none of the three
+///   tries of the `refused` line could be written (exit 6). The process
+///   that gets that status keeps the refusal in memory
+///   (testARefusalWhoseRollbackCannotBeJournaledStaysARefusalInThisProcess);
+///   here that memory is lost with the process;
+/// - B2, another tool's 1 landing between the second read and the write,
+///   which the write then repeats;
+/// - C1, a 1 the journal owns, with an earlier restore owed (owedBefore),
+///   and C2, another tool setting 1 again while that command runs;
+/// - L1, a published refusal (R1 below) and then a later start's line
+///   over it, and L2, A1 and then the same later line.
+/// A1, A2, A3 and B2 leave the same bytes, and so do C1 and C2, and L1
+/// and L2. Each of them reads as a start that may have turned sleep off,
+/// so every reader undoes it and turns sleep back on, and C1 and C2
+/// restore the owed 1 either way. For A2, A3, B2, C2 and L1 that clears
+/// another tool's 1: the F7 limit, observed here and not fixed. The
+/// controls are a published `refused`: on the first try (R1), on the third
+/// after two failed tries (R2), and on every try with a read-back that
+/// failed (R3, exit 6, yet the line is on record). Each leaves the other
+/// tool's 1 alone in all three readers.
+///
+/// The scripts never read SleepDisabled to settle a start: only
+/// uninstall.sh reads it, once its journal is clean, to ask whether
+/// another Insomnia folder may still owe a restore. So each fixture's
+/// pmset.mode stays 0, and the script columns check each script's
+/// decision and its restore call.
+@MainActor
+final class StatusLossMatrixTests: XCTestCase {
+    /// One history: how the real root command runs for the start, what
+    /// another tool does meanwhile, and whether a later start's line
+    /// lands over this start's.
+    private struct History {
+        let id: String
+        /// A 1 the journal owns, with an earlier restore owed (C1, C2).
+        var owned = false
+        var foreignAfter: String?
+        var foreignAfterCall = 1
+        /// pmset fails without writing: the command never wrote.
+        var writeFails = false
+        /// The fault of each `refused` line, or of the first
+        /// `refusedFaults` of them.
+        var fault: ReceiptWriteFault?
+        var refusedFaults: Int?
+        /// The exit status the app never gets.
+        let status: Int32
+        let pmset: [String]
+        /// The receipt's last word once the command has exited.
+        let word: String
+        /// The word of a later start's line, written over the receipt
+        /// once this start's command has exited.
+        var later: String?
+
+        /// Whether every reader turns sleep back on: the receipt does not
+        /// show this start's own `refused`, or a restore is owed.
+        var restored: Bool { word == "writing" || owned || later != nil }
+    }
+
+    private static let histories: [History] = [
+        History(id: "A1", status: 0, pmset: ["-g", "-g", "-a disablesleep 1"], word: "writing"),
+        History(id: "A2", foreignAfter: RootCommandProcess.read, foreignAfterCall: 2, writeFails: true, status: 1, pmset: ["-g", "-g", "-a disablesleep 1"], word: "writing"),
+        History(id: "A3", foreignAfter: "perl writing", fault: .openFails, status: 6, pmset: ["-g", "-g"], word: "writing"),
+        History(id: "B2", foreignAfter: RootCommandProcess.read, foreignAfterCall: 2, status: 0, pmset: ["-g", "-g", "-a disablesleep 1"], word: "writing"),
+        History(id: "C1", owned: true, status: 0, pmset: ["-a disablesleep 1"], word: "writing"),
+        History(id: "C2", owned: true, foreignAfter: "perl writing", status: 0, pmset: ["-a disablesleep 1"], word: "writing"),
+        History(id: "R1", foreignAfter: "perl writing", status: 6, pmset: ["-g", "-g"], word: "refused"),
+        History(id: "R2", foreignAfter: "perl writing", fault: .openFails, refusedFaults: 2, status: 6, pmset: ["-g", "-g"], word: "refused"),
+        History(id: "R3", foreignAfter: "perl writing", fault: .readBackDiffers, status: 6, pmset: ["-g", "-g"], word: "refused"),
+        History(id: "L1", foreignAfter: "perl writing", status: 6, pmset: ["-g", "-g"], word: "refused", later: "refused"),
+        History(id: "L2", status: 0, pmset: ["-g", "-g", "-a disablesleep 1"], word: "writing", later: "refused"),
+    ]
+
+    /// What performStart journals in `h` before the dialog
+    /// (SleepOffSettlementTests.journalUnfinishedStart with a marker and
+    /// ids): the attempt with its marker, sleepDisabledByUs, the claim,
+    /// and the session, ending in half an hour.
+    private func journalStart(in h: Harness, owedBefore: Bool) throws -> SleepOffAttempt {
+        var session = SessionMath.newSession(now: h.clock.now.addingTimeInterval(1800 - 3600), duration: 3600, maxDuration: 86400)
+        session.id = UUID().uuidString
+        let nonce = UUID().uuidString
+        let deadline = Int(session.endsAt.timeIntervalSince1970.rounded(.down))
+        let expires = min(deadline, Int(h.clock.now.addingTimeInterval(AdministratorPrompt.answerWindow).timeIntervalSince1970.rounded(.down)))
+        let predecessor = try XCTUnwrap(TestReceipts.nonce(h.receipts.file))
+        let marker = try h.store.savePendingStart(nonce).text
+        let attempt = SleepOffAttempt(nonce: nonce, owedBefore: owedBefore, receipt: try h.receipts.identity(), predecessor: predecessor, deadline: deadline, expires: expires, marker: marker, session: session.id)
+        var journal = RuntimeState.clean
+        journal.sleepDisabledByUs = true
+        journal.sleepOffAttempt = attempt
+        try h.store.saveState(journal)
+        TestReceipts.setRelease(h.receipts, "\(nonce) held\n")
+        try h.store.saveSession(session)
+        return attempt
+    }
+
+    /// The same in a script fixture, with the dialog over and the session
+    /// ending in an hour (RecoveryScriptTests.journalUnfinishedStart).
+    private func journalStart(in f: ScriptFixture, nonce: String, owedBefore: Bool) throws {
+        let now = Int(Date().timeIntervalSince1970)
+        let deadline = now + 3600
+        try f.writeReceipt()
+        let receipt = try XCTUnwrap(f.receiptIdentity())
+        try f.writeRelease("\(nonce) held\n")
+        try Data(nonce.utf8).write(to: f.pendingStart)
+        let marker = try XCTUnwrap(FileIdentity(atPath: f.pendingStart.path)?.text)
+        try f.writeSession(endsAt: Date(timeIntervalSince1970: TimeInterval(deadline)))
+        try f.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"sleepOffAttempt":{"nonce":"\#(nonce)","owedBefore":\#(owedBefore),"receipt":"\#(receipt)","predecessor":"\#(SleepOffReceipts.zero)","deadline":\#(deadline),"expires":\#(now - 1),"marker":"\#(marker)"}}"#)
+    }
+
+    /// Each history through the real root command, its status dropped,
+    /// then the relaunched app, the agent and uninstall.sh. The app runs
+    /// one history at a time; the scripts, each in a fixture of its own,
+    /// run two at a time (runTwoAtATime): every dialog is over and every
+    /// session ends an hour on, so no row depends on when it runs.
+    func testEveryReaderSettlesAStartWhoseStatusWasLostFromWhatItLeft() async throws {
+        var harnesses: [Harness] = []
+        var fixtures: [ScriptFixture] = []
+        defer {
+            harnesses.forEach { $0.home.destroy() }
+            fixtures.forEach { $0.destroy() }
+        }
+        var evidence: [String: String] = [:]
+        var rows: [(row: ScriptRow, history: History, script: String)] = []
+        for history in Self.histories {
+            let label = history.id
+            let h = Harness()
+            harnesses.append(h)
+            h.guardFake.sleepDisabled = history.owned
+            let attempt = try journalStart(in: h, owedBefore: history.owned)
+            XCTAssertEqual(attempt.predecessor, SleepOffReceipts.zero, label)
+            let dir = h.home.root.appendingPathComponent("root-command", isDirectory: true)
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+
+            let run = try RootCommandProcess(marker: h.home.paths.pendingStartFile, nonce: attempt.nonce, sleepDisabled: history.owned ? "1" : "0", owned: history.owned ? "1" : "0", foreignAfter: history.foreignAfter, foreignAfterCall: history.foreignAfterCall, writeFails: history.writeFails, receipts: h.receipts, receiptWriteFault: history.fault, refusedReceiptWriteFails: history.fault != nil, refusedWriteFaults: history.refusedFaults, in: dir).wait()
+
+            XCTAssertEqual(run.status, history.status, "\(label): \(run.stderr)")
+            XCTAssertEqual(run.pmsetCalls, history.pmset, label)
+            XCTAssertEqual(run.sleepDisabled, "1", "\(label): SleepDisabled is 1, whoever set it")
+            XCTAssertEqual(TestReceipts.text(h.receipts), "\(attempt.nonce) \(attempt.predecessor) \(history.word)\n", label)
+            XCTAssertEqual(TestReceipts.release(h.receipts), "\(attempt.nonce) held\n", label)
+            XCTAssertEqual(try h.store.loadState()?.sleepOffAttempt, attempt, label)
+            let later = UUID().uuidString
+            if let word = history.later {
+                TestReceipts.write(h.receipts.file, nonce: later, predecessor: attempt.nonce, word: word)
+            }
+            let line = try XCTUnwrap(TestReceipts.text(h.receipts), label)
+            XCTAssertEqual(line.utf8.count, 82, label)
+            evidence[label] = "\(line.replacingOccurrences(of: attempt.nonce, with: "N").replacingOccurrences(of: later, with: "L")) held, SleepDisabled \(run.sleepDisabled), owedBefore \(history.owned)"
+
+            // The status is gone with the app. The relaunch comes once the
+            // dialog can no longer be answered.
+            h.guardFake.sleepDisabled = run.sleepDisabled == "1"
+            h.clock.advance(AdministratorPrompt.answerWindow + 1)
+            let m = h.makeManager()
+            await m.reconcile()
+
+            XCTAssertEqual(h.guardFake.calls.filter { $0 == "disablesleep 0" }.count, history.restored ? 1 : 0, "\(label): \(h.guardFake.calls)")
+            XCTAssertEqual(h.guardFake.sleepDisabled, !history.restored, "\(label): the 1 is cleared exactly when the start is undone or a restore is owed")
+            XCTAssertFalse(m.isActive, label)
+            XCTAssertNil(try h.store.loadSession(), label)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: h.home.paths.pendingStartFile.path), label)
+            XCTAssertEqual(try h.store.loadState(), RuntimeState.clean, label)
+            XCTAssertEqual(TestReceipts.release(h.receipts), "\(line.prefix(36)) free\n", "\(label): the claim goes back under the receipt's nonce")
+
+            for script in ["backstop", "uninstall"] {
+                let f = try ScriptFixture()
+                fixtures.append(f)
+                if script == "uninstall" { try f.installMachinery() }
+                let nonce = UUID().uuidString
+                try journalStart(in: f, nonce: nonce, owedBefore: history.owned)
+                try f.writeReceipt(line.replacingOccurrences(of: attempt.nonce, with: nonce))
+                rows.append((ScriptRow("\(label) \(script)", f, script == "backstop" ? f.backstop : f.uninstall), history, script))
+            }
+        }
+        XCTAssertEqual(rows.count, 22)
+        for (a, b) in [("A1", "A2"), ("A1", "A3"), ("A1", "B2"), ("C1", "C2"), ("L1", "L2"), ("R1", "R2"), ("R1", "R3")] {
+            XCTAssertNotNil(evidence[a])
+            XCTAssertEqual(evidence[a], evidence[b], "\(a) and \(b) leave the same bytes")
+        }
+        XCTAssertEqual(Set(evidence.values).count, 4, "\(evidence)")
+
+        runTwoAtATime(rows.map(\.row))
+
+        for (row, history, script) in rows {
+            let f = row.fixture
+            let label = row.label
+            let r = try row.outcome()
+            XCTAssertEqual(r.status, 0, "\(label): \(r.stderr + r.stdout)")
+            let said = script == "backstop" ? f.log() : r.stdout
+            if history.later != nil {
+                XCTAssertTrue(said.contains("\(f.receipt) holds a later start's line, which no longer shows what the command for this start did"), "\(label): \(said)")
+            } else if history.word == "writing" {
+                XCTAssertTrue(said.contains("as one that may have turned sleep off (\(f.receipt) holds that start's writing line: its command was about to turn sleep off and may have)"), "\(label): \(said)")
+            } else {
+                XCTAssertTrue(said.contains("its receipt shows the command behind its dialog never turned sleep off; sleepDisabledByUs goes back to \(history.owned)"), "\(label): \(said)")
+            }
+            XCTAssertTrue(said.contains("removed \(f.session.path): its start never finished"), "\(label): \(said)")
+            let restore = "sudo -n \(f.fakePmset) -a disablesleep 0"
+            let sleepCalls = f.calls().filter { $0.contains("disablesleep") }
+            if script == "backstop" {
+                XCTAssertEqual(sleepCalls, history.restored ? [restore] : [], "\(label): \(f.calls())")
+                XCTAssertFalse(f.exists(f.session), label)
+                XCTAssertFalse(f.exists(f.pendingStart), label)
+                XCTAssertEqual(f.release(), "\(String((f.receiptText() ?? "").prefix(36))) free\n", "\(label): the claim goes back under the receipt's nonce")
+            } else {
+                XCTAssertEqual(sleepCalls.contains(restore), history.restored, "\(label): \(f.calls())")
+                XCTAssertEqual(Set(sleepCalls).subtracting([restore]), [], "\(label): \(f.calls())")
+            }
         }
     }
 }
