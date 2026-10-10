@@ -116,6 +116,259 @@ recovery; newly written journals use `frozenProcesses`.
   - `/usr/bin/pmset -a disablesleep 0`
   - `/usr/bin/pmset -b lowpowermode 1`
   - `/usr/bin/pmset -b lowpowermode 0`
+- The file is one per Mac and names one account, the one whose install
+  wrote it. `install.sh` reads it before writing and refuses a rule with
+  any line for another account. A rule the account can read is read with a
+  bounded `cat` and judged before the first sudo, the password prompt
+  included; one only root can read (the rule `install.sh` writes is root's,
+  mode 0440) is read with a bounded `sudo -n cat` right after one `sudo -v`.
+  A read that fails, is cut short, holds a NUL byte or does not answer
+  stops the install. `uninstall.sh` judges the rule the same way, at the
+  same two points, before the app is asked to quit and before the recovery
+  lock, the backstop and the LaunchAgent: a line for another account, or a
+  read that does not complete, stops it with nothing changed. Its password
+  prompt comes after the app has quit when the rule was read without sudo,
+  and before the app is asked to quit when only root can read the rule.
+  Under the lock it reads the rule through sudo again and removes it only
+  when every line is blank, the header comment, or one of those four grants
+  to the calling account (`id -un`); a grant to another account, or any
+  other line, keeps it with a message. While Insomnia runs in another account (`ps -o uid=`), or a
+  process there named Insomnia cannot be told apart from it, `install.sh`
+  stops before the sudoers step and `uninstall.sh` before removing anything.
+  That process is named and never asked to quit or signalled. So does a
+  `pgrep` that fails or does not answer. A process whose owner `ps -o uid=`
+  cannot tell (it fails, does not answer, or prints no user ID), or whose
+  identity is unverified, is looked for once more and then stops either
+  script before its first `sudo` call; only a process identified as the API
+  client (`com.insomnia.app`) is ignored. In `uninstall.sh` this holds
+  also when this app's identified copy runs beside such a process: that
+  process alone is looked for again, once a second for up to 10 s, before
+  the rule is judged, and the identified copy is not waited for until it
+  has been asked to quit. A copy in another account or a `pgrep` problem
+  on any of those looks stops the run at once. A process first seen after
+  these looks is waited for with the quit, and blocks the removal, but may
+  then come after the password prompt. Under the recovery lock the
+  scripts' process checks read no Info.plist, not even with a time limit: a
+  process first seen there counts as unverified and stops the run.
+- Both scripts read `InsomniaResumeFrozenVersion` before the recovery lock
+  (bounded, with the file's identity, device:inode:change time:size, before
+  and after) and pass the value and the identity to the `backstop.sh` they
+  run under the lock, in `INSOMNIA_INFO_PATH`, `INSOMNIA_INFO_EVIDENCE` and
+  `INSOMNIA_INFO_VERSION`. A backstop that shares its caller's lock reads no
+  Info.plist: it uses the value only when its bounded `stat` under the lock
+  shows the same file unchanged, and otherwise keeps the frozen entries that
+  need the app binary. Run by launchd, it reads the value itself before it
+  takes the lock and checks the identity the same way. From a checkout,
+  `uninstall.sh` stops before any backstop runs when its read fails or the
+  file changed; from the zip, and in `install.sh`, the run goes on with the
+  value unknown, and kept entries then stop it after the backstop.
+  `install.sh` reads the Info.plist of the bundle that will be at the app's
+  path when the backstop runs: the set-aside previous bundle when an
+  interrupted install left only that.
+- Each script runs the backstop as one bounded call with a 300 s limit and
+  SIGTERM only. A backstop still running 3 s after its SIGTERM, or one that
+  has ended with a process it started still in its group, is reported with
+  its pid (status 125), and the lock stays held until they end. Each `sudo
+  pmset` or app binary call it started also keeps the lock until it ends,
+  through that call's own supervisor, which ignores SIGTERM and SIGHUP sent
+  to the process group.
+  The supervisor of the backstop runs in a process group of its own
+  (`set -m` around the one `&`), and the backstop leads another: it starts
+  through `/usr/bin/perl`, which calls `setpgrp(0, 0)` and then runs the
+  backstop with the same pid. Before it starts the backstop, the supervisor
+  turns job control on and off again, which clears bash's record of its
+  group, so `kill %1` at the limit signals the backstop process alone and
+  not a group. A signal sent to the calling script's group (a closed
+  terminal, or launchd once the script has gone) reaches nothing the
+  backstop started; the backstop runs to its end or its limit with the lock
+  held. A backstop from an earlier build whose supervisor for `sudo pmset`
+  does not ignore SIGTERM and SIGHUP therefore keeps the lock in that
+  supervisor until its sudo has ended and been reaped. Once the backstop
+  has been reaped, the supervisor checks the backstop's group with
+  `kill(0, -pgid)` from perl, which sends nothing and tells ESRCH (no
+  process left) apart from EPERM (one left that runs as root). When a
+  process is still there after about a second, the supervisor sends no
+  status (125), closes the pipe, keeps fd 9 until the group is empty,
+  checking every half second, and signals nothing. So the oldest copies in
+  `$APP_SUPPORT`, which take no lock and run `sudo pmset` in the
+  foreground, keep the lock through this supervisor after the SIGTERM at
+  the limit has ended them, until their sudo has ended (the sudo closes its
+  own fd 9). Costs: about 4 ms for the perl start and 8 ms for each check
+  on a test Mac; a process that stays in the group keeps the lock as long
+  as it runs; and once the group is empty, another process can take its id
+  as its pid and lead a group with it before the next check, and the
+  supervisor then waits for that group too. Not covered: a process that
+  leaves the group (`setsid`, `setpgid`); an earlier build's backstop run
+  by launchd as the pinned agent after an install rollback, whose group
+  launchd signals when the job's main process exits, since the agent does
+  not set AbandonProcessGroup; an oldest copy in `$APP_SUPPORT` run by its
+  own older agent, which no script of this build starts; and this build's
+  backstop run by launchd, whose call supervisors and keepers are in the
+  job's group, so a signal launchd sends there that ends them all frees the
+  lock while a `sudo pmset` may still run. Which signal launchd sends there
+  was not measured: no test runs launchd. Without an executable `/usr/bin/perl`
+  neither script starts the backstop (126, with the reason): `install.sh`
+  stops, and `uninstall.sh` goes on to its own journal check. `install.sh`
+  never reaches that step without perl, since root's access control list
+  check in its earlier sudoers step needs perl and stops it first. A perl that
+  runs but cannot answer leaves the group unknown, and the supervisor keeps
+  the lock.
+  Every read the backstop makes under the lock (`cp`, `plutil`, `cat`,
+  `stat`, `ps`) has 30 s, a checked status, and its output in a private
+  directory. One that fails, is cut short, holds a NUL byte or does not
+  answer stops the run: what was undone stays undone and the rest stays
+  journaled. A backstop sealed in a bundle from an earlier release ignores
+  these variables and reads the Info.plist and the journal itself, without
+  a limit on each read; only the 300 s limit applies to it.
+- Each bounded call in the three scripts has a process of its own that keeps
+  the recovery lock (fd 9), once the run holds it, until it has reaped the
+  call. The call's limit counts from that process's start, so making the
+  output file comes out of it: when that takes the whole limit, the call is
+  not made (126; a backstop read reports 124, as for a read that did not
+  answer). That process makes the call's output file with `mktemp` in the
+  run's private folder, opens it twice, removes its name before the call
+  starts, reads it back through its own descriptor once the call has ended
+  (at most 1 MiB; a NUL byte is found and reported), and sends the status
+  and the text down a pipe. The text goes in four fields (status, text, the
+  text before any NUL byte, `end`), and the process that ran the supervisor
+  then sends `settled 0` once it has reaped it. The caller waits for the
+  status within the call's limit and takes the text only when all of it,
+  `settled 0` and the end of the pipe come within 5 s. Anything else counts
+  as not read back and as a call that may still be running, whose process
+  may still hold the lock: a field cut short, a field too many, a supervisor
+  that ends with a status other than 0 after it sent plausible text, a pipe
+  another process still holds open, or nothing in time. The installers then
+  return 125; the backstop stops the run (125 for a power command, 124 for a
+  read). The app binary is the exception to the process of its own: it has
+  to be a direct child of the backstop's own shell. Its answer file is made
+  and pinned before the recovery lock, its input comes down a pipe from a
+  process of its own that writes the lines and exits, and the read-back of
+  its answer runs in a process of its own; under the lock that shell opens,
+  writes and reads no file for it. Notes of failed reads, which a check made
+  inside `$(...)` has to pass back, are written and read only by processes
+  of their own, each waited for no longer than 5 s and keeping fd 9 while it
+  runs. The private copy of a journal file (`snapshot`) is two bounded
+  calls, `rm` and then `cp -X`, and the empty copy is made and checked to be
+  a regular file by cp's own process before cp runs, inside cp's limit.
+  `sudo` closes its copy of fd 9, so for each `sudo` call in the installers,
+  and each command the backstop runs through `run_bounded` (`sudo pmset`,
+  `defaults`), the process first starts a keeper, a second holder of fd 9.
+  The call starts in a bash of its own that sends its pid to the keeper
+  before it runs the command with the same pid. The keeper exits when the
+  process says it has reaped the call; when the process is gone without
+  saying so (a SIGKILL), the keeper keeps the lock until no process has that
+  pid, checking every half second, and signals nothing. A pid taken by
+  another process before the next check keeps the lock longer, not shorter.
+  The installers' other calls keep their own copy of fd 9. So a SIGKILL to
+  the process alone no longer frees the lock while its call runs, and a
+  second Start or install waits. The backstop's reads close their copy, so a
+  SIGKILL to a read's process frees the lock while that read, which changes
+  nothing but its own output and private copy, ends. A signal that ends both
+  the process and its keeper (a SIGKILL to each) frees the lock while the
+  call may still run; that is not covered.
+  Limits, not waived: between `mktemp` and the removal of the name, another
+  process of this account can open the file, and a process the call left
+  behind that still holds it can write to it after the read, unseen. The
+  notes are files at a name in the private folder (mode 0700), not pinned
+  descriptors, so another process of this account can change one between its
+  write and its read. cp's process opens the copy's name with `1<>`, which
+  follows a link and makes a missing file. The backstop's main shell still
+  writes the log, publishes the journal with `mv` and removes its temporary
+  file, and its exit trap removes the private folder, all without a limit.
+  Kernel work that never returns (a stalled `mktemp` or open) keeps its
+  process, and the lock, for as long as it lasts. Costs on a test Mac: a
+  `plutil` read through the shared layer takes about 7 ms in the backstop
+  and 8.7 ms in uninstall (6.9 and 8.4 ms at 6526105), and a journal copy 12
+  ms and 16.5 ms (6.9 and 9.3 ms with one bounded `cp`); the first 10000
+  `kill -0` checks of a wait cost up to 25 to 50 ms of CPU time.
+- `uninstall.sh`'s own journal check reads each file once, by a bounded `cp`
+  into a private directory, and runs every check on that copy, each with an
+  explicit status that does not depend on `set -e`. A read that fails, is
+  cut short, prints a NUL byte or does not answer is a check that did not
+  complete, never a clean journal. A path that is not a regular file when
+  it is checked is not opened. One put there after the check is opened only
+  by the bounded `cp`: a FIFO with no writer blocks it until its 30 s limit,
+  and the check counts as not complete. A session.json still present after
+  the backstop, readable or not, stops the uninstall.
+- Both scripts change the file in one `sudo /bin/bash -c` call, which
+  restricted administrators whose policy does not allow `/bin/bash` cannot
+  make. As root it takes `/etc/sudoers.d/.insomnia-sudoers.lock` with
+  `lockf` for at most 10 s (sudo skips a name with a dot). Before the open,
+  every folder above the file must be root's and not writable by group or
+  others, and an existing file a regular file of root's with mode 0600 and
+  one link, so a FIFO or a link is never opened; after locking, the
+  descriptor and the path must still be that same file. No access control
+  list on those folders or on the file may let anyone but root change
+  them. `/usr/bin/perl` (no module loaded) opens each path itself with
+  `O_NOFOLLOW` (and `O_DIRECTORY` for a folder) and reads its list with
+  one `fgetattrlist` call (system call 228) asking for the device, type,
+  file ID and extended security; the type, device and file ID in that
+  answer must be those root's `stat` of the path gave just before. The
+  answer must account for every byte: its length, the list's offset and
+  size, the header (magic number, empty owner and group, a count of at
+  most 128, or the no-list count with nothing after it) and 24 bytes per
+  entry must agree, and each entry must be an allow, deny, audit or alarm
+  entry with known flags. An allow entry with any right but read data,
+  execute, read attributes, read extended attributes, read security,
+  synchronize, generic read, generic execute or an inheritance flag fails
+  the check unless `/usr/bin/dsmemberutil` shows its UUID is root's own
+  user record (`getuuid -u 0` answers exactly that UUID and `getid -X` of
+  it answers exactly `uid: 0`, each from a call that exits 0). A name, a
+  group, another user or any other answer fails. Deny entries pass. A file
+  perl cannot open, a call that fails, an answer it cannot account for, and
+  output other than one line per such entry followed by `checked N` for
+  the N files asked, from a perl that exits 0, fail it too. Every `stat` answer the root shell uses
+  must come from a `stat` that exits 0 and be exactly the one line of
+  fields asked for; any other answer stops it before any open, create or
+  change. The folders' lists are checked before the file
+  is created and the file's after, before it is opened. The file is created
+  (umask 077, noclobber) only where nothing is, and is never repaired,
+  replaced or removed; nor is an access control list. A check that fails
+  stops the run (exit 7). Scripts of
+  earlier releases took no lock, unmerged branches used
+  `/var/run/insomnia-sudoers.lock`, and an administrator's own `sudo` takes
+  none: the lock does not serialize against those.
+- Root then opens the rule on a descriptor, after checking it is a regular
+  file of root's with one link that only root can change, access control
+  list included, reads it through that descriptor with `cat`'s status
+  checked, and compares it with the exact text the run read and judged,
+  which is passed to root as an argument. It judges that text again
+  (another account's grant stops it) and refuses a NUL byte or a size that
+  does not match what was read. Only then does `install.sh` write a copy
+  beside the rule (`mktemp`, `root:wheel`, 0440) and check that copy with
+  `visudo -cf`. Immediately before the rename, or before `uninstall.sh`
+  removes the rule, root checks the folders, the lock file's identity and
+  every access control list again, opens the rule anew, and reads it again
+  the same way: the rename or removal goes ahead only when that read
+  completes with the same bytes from the same file (device and inode). A
+  checked failure removes the copy and leaves the rule. A rule that cannot
+  be read in full or holds a NUL byte stops the run (exit 8). A file that
+  changed since either read, or a lock still taken after 10 s, stops the
+  run:
+  `install.sh` leaves the rule, the app and the agent, and `uninstall.sh`
+  keeps the rule and the app. Both ask for a rerun. The lock file may have
+  been created by then. A root shell killed by a signal, or an `mv` or `rm`
+  killed by one, leaves it unknown whether the rule changed; the scripts
+  report that, and `uninstall.sh` then keeps the app and the journal. A
+  root shell killed outright can leave its copy under a dotted name sudo
+  never reads. Before that call the scripts read the rule with `/bin/cat`
+  when the account can read it, and otherwise with `sudo -n /bin/test -e`
+  and `sudo -n /bin/cat`, each with the 30 s limit, and `install.sh` checks
+  the new rule with `sudo /usr/sbin/visudo -cf`. Both scripts ask for the
+  password with `sudo -v` after judging a rule the account can read and
+  before the sudo reads (`uninstall.sh` only when a rule is there or its
+  folder cannot be searched without root, and always before the recovery
+  lock), so no bounded sudo call waits at a prompt. Every sudo call under the lock is
+  `sudo -n`, with the time limit every call there has. Every tool run
+  through sudo has a fixed path.
+- Not closed: a writer that takes no lock (an earlier release's scripts, an
+  administrator's own `sudo`) can still change the rule between root's last
+  read and its `mv` or `rm`. No identity or byte check can see that change.
+  The root text is sent as one `bash -c` argument, which sudo's log and
+  `ps` show: 8,686 bytes for `install.sh` and 7,511 for `uninstall.sh`,
+  with each function's leading indentation removed, measured from the
+  functions and constants alone (7,362 and 6,187 before the ACL reader;
+  7,857 and 6,697 at 2e67600).
 - Nothing else runs as root.
 
 ### 3. Lid observer
@@ -927,8 +1180,13 @@ Backstop, independent of the app:
   never a process that reused its pid. The pid the script logs is never
   signaled. The subshell ignores SIGTERM and SIGHUP, so neither the end of
   the agent's run nor launchd's signal to what is left of the job's process
-  group frees the lock while the command runs; a SIGKILL to the subshell
-  would. The app runs no `sudo pmset` outside a
+  group frees the lock while the command runs. Nor does a SIGKILL to the
+  subshell: before the command starts, the subshell starts a keeper, a
+  second holder of fd 9, which gets the command's pid from the command
+  itself and keeps the lock until the subshell reports the command reaped
+  or, with the subshell gone, until no process has that pid. A signal that
+  ends both the subshell and its keeper frees the lock while the command
+  may still run. The app runs no `sudo pmset` outside a
   transaction. Every one goes through `PmsetSleepGuard.sudoPmset`,
   including a check that runs a sudoers command only to see whether it
   passes. It reports the pid with the `sudo kill` command, in a menu line

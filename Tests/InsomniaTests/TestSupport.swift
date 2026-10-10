@@ -1014,9 +1014,28 @@ enum TestACL {
     /// Gives `url` one entry letting its owner, the user running the tests,
     /// read it. On a 0200 file that entry is the only way to read it.
     static func grantOwnerRead(_ url: URL) throws {
+        try add("user:\(owner) allow read", to: url)
+    }
+
+    /// The user running the tests, by name, as an entry names a user.
+    static var owner: String { String(cString: getpwuid(getuid()).pointee.pw_name) }
+
+    /// Adds `entry` (chmod +a syntax, "everyone deny delete") to the list
+    /// of `url`, a file or folder the test made.
+    static func add(_ entry: String, to url: URL) throws {
+        try chmod(["+a", entry, url.path])
+    }
+
+    /// Removes every entry from the list of `url`, so a folder with "deny
+    /// delete" can be removed again.
+    static func clear(_ url: URL) {
+        try? chmod(["-N", url.path])
+    }
+
+    private static func chmod(_ arguments: [String]) throws {
         let chmod = Process()
         chmod.executableURL = URL(fileURLWithPath: "/bin/chmod")
-        chmod.arguments = ["+a", "user:\(String(cString: getpwuid(getuid()).pointee.pw_name)) allow read", url.path]
+        chmod.arguments = arguments
         let exit = ProcessExit(chmod)
         try chmod.run()
         exit.wait()
@@ -1035,5 +1054,26 @@ enum TestACL {
             which = ACL_NEXT_ENTRY.rawValue
         }
         return count
+    }
+
+    /// The UUID each ACL entry of `url` names, in order, upper case as
+    /// `ls -en` prints it, without following a symlink. Read from the
+    /// entries themselves, so a test learns which UUID an entry it made
+    /// names without asking the directory service.
+    static func qualifiers(_ url: URL) -> [String] {
+        guard let acl = acl_get_link_np(url.path, ACL_TYPE_EXTENDED) else { return [] }
+        defer { acl_free(UnsafeMutableRawPointer(acl)) }
+        var uuids: [String] = []
+        var entry: acl_entry_t?
+        var which = ACL_FIRST_ENTRY.rawValue
+        while acl_get_entry(acl, which, &entry) == 0 {
+            which = ACL_NEXT_ENTRY.rawValue
+            guard let qualifier = acl_get_qualifier(entry) else { continue }
+            defer { acl_free(qualifier) }
+            var text = [CChar](repeating: 0, count: 37)
+            uuid_unparse_upper(qualifier.assumingMemoryBound(to: UInt8.self), &text)
+            uuids.append(String(cString: text))
+        }
+        return uuids
     }
 }
