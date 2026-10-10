@@ -1558,6 +1558,51 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(fx.log().contains("removed \(fx.session.path): its start never finished, so it is never resumed"), fx.log())
     }
 
+    /// Round 36 (independent35 R35-7): both scripts remove the settled
+    /// start's session.json only when it is that start's: its end is the
+    /// start's deadline and, when session.json and the record both carry
+    /// a string id (`Session.id`, `sleepOffAttempt.session`), the ids are
+    /// the same. Another id keeps it, whatever its end. An id missing on
+    /// either side, or one that is not a string, leaves the end to decide,
+    /// as in the app (`SessionManager.isSession`).
+    func testBothScriptsRemoveTheStartsSessionOnlyWhenItsIdIsTheStarts() throws {
+        let cases: [(name: String, session: String?, record: String?, removed: Bool)] = [
+            ("the same id", #""A""#, #""A""#, true),
+            ("another id", #""A""#, #""B""#, false),
+            ("an id that is not a string", "1", #""B""#, true),
+            ("a record without the id", #""A""#, nil, true),
+            ("a session without the id", nil, #""B""#, true),
+        ]
+        for script in ["backstop", "uninstall"] {
+            for c in cases {
+                let name = "\(script): \(c.name)"
+                fx.destroy()
+                fx = try ScriptFixture()
+                if script == "uninstall" { try fx.installMachinery() }
+                try journalUnfinishedStart()
+                if let id = c.session {
+                    let text = try String(contentsOf: fx.session, encoding: .utf8)
+                    try text.replacingOccurrences(of: #""extensions":[]}"#, with: #""extensions":[],"id":\#(id)}"#).write(to: fx.session, atomically: true, encoding: .utf8)
+                }
+                if let id = c.record {
+                    let text = try String(contentsOf: fx.state, encoding: .utf8)
+                    try text.replacingOccurrences(of: #""deadline":"#, with: #""session":\#(id),"deadline":"#).write(to: fx.state, atomically: true, encoding: .utf8)
+                }
+
+                let r = try fx.run(script == "backstop" ? fx.backstop : fx.uninstall)
+
+                let said = script == "backstop" ? fx.log() : r.stdout
+                XCTAssertEqual(said.contains("removed \(fx.session.path): its start never finished"), c.removed, "\(name): \(said)")
+                XCTAssertEqual(said.contains("kept \(fx.session.path): its end is the start's deadline, but its id is not the session the start journaled"), !c.removed, "\(name): \(said)")
+                if script == "backstop" {
+                    XCTAssertEqual(fx.exists(fx.session), !c.removed, "\(name): \(r.stderr)")
+                } else {
+                    XCTAssertEqual(r.status, 0, "\(name): \(r.stderr + r.stdout)")
+                }
+            }
+        }
+    }
+
     /// The same receipt while the dialog can still be answered decides
     /// nothing: its command may still write. The start stays journaled
     /// with its claim, no pmset runs (nothing shows that sleep was turned
@@ -2796,13 +2841,15 @@ final class RecoveryScriptTests: XCTestCase {
         }
     }
 
-    /// Another account's receipt keeps the folder; this account's receipt
-    /// and release file go.
+    /// Another account's receipt keeps the folder and the rule, which is
+    /// one file for every account (round 36, independent35 R35-3); this
+    /// account's receipt and release file go.
     func testUninstallKeepsTheReceiptFolderWhileAnotherAccountsReceiptIsInIt() throws {
         try fx.installMachinery()
         try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
         try fx.writeReceipt()
-        let other = fx.receipts + "/" + String(getuid() + 1)
+        let uid = String(getuid() + 1)
+        let other = fx.receipts + "/" + uid
         try Data(SleepOffReceipts.initialContent.utf8).write(to: URL(fileURLWithPath: other))
 
         let r = try fx.run(fx.uninstall)
@@ -2812,6 +2859,87 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: fx.released))
         XCTAssertTrue(FileManager.default.fileExists(atPath: other))
         XCTAssertTrue(r.stdout.contains("kept \(fx.receipts): it still holds another account's receipt"), r.stdout)
+        let why = "\(fx.receipts) holds the receipt of another account on this Mac (uid \(uid))"
+        XCTAssertTrue(r.stdout.contains("kept \(fx.sudoers.path): \(why), and that account's recovery agent may need the rule"), r.stdout)
+        XCTAssertTrue(r.stderr.contains("\(fx.sudoers.path) was kept: \(why). It is one file for every account on this Mac."), r.stderr)
+        XCTAssertTrue(fx.exists(fx.sudoers))
+        XCTAssertFalse(fx.calls().contains("sudo -n /bin/rm -f \(fx.sudoers.path)"), "\(fx.calls())")
+        XCTAssertFalse(fx.exists(fx.installedBackstop), "this account's bundle still goes")
+    }
+
+    /// Round 36 (independent35 R35-3): the rule stays whenever the receipt
+    /// folder shows, or cannot rule out, another account that installed
+    /// Insomnia: another account's lone release file, two other accounts,
+    /// an entry install.sh does not make, this account with no receipt of
+    /// its own, a listing that fails (perl exits 3, as on a readdir error)
+    /// and one whose output is not read whole. This account's own files
+    /// still go, and nothing of another account's is touched. The control,
+    /// a folder holding only this account's files, removes the rule.
+    func testUninstallKeepsTheRuleWhileTheReceiptFolderMayShowAnotherAccount() throws {
+        let a = String(getuid() + 1), b = String(getuid() + 2)
+        let cases: [(name: String, own: Bool, others: [String], perl: String?, why: (ScriptFixture) -> String)] = [
+            ("another account's lone release file", true, [a + ".released"], nil, { "\($0.receipts) holds the receipt of another account on this Mac (uid \(a))" }),
+            ("two other accounts", true, [a, b + ".released", a + ".released"], nil, { "\($0.receipts) holds the receipt of another account on this Mac (uid \(a) \(b))" }),
+            ("an entry install.sh does not make", true, ["notes"], nil, { "\($0.receipts) holds names install.sh does not make (1), so whether another account uses the rule is unknown" }),
+            ("no receipt of this account", false, [a], nil, { "\($0.receipts) holds the receipt of another account on this Mac (uid \(a))" }),
+            ("a listing that fails", true, [], "exit 3", { "\($0.receipts) could not be listed whole (perl exit 3), so whether another account on this Mac has a receipt in it is unknown" }),
+            ("a listing not read whole", true, [], #"printf '.\n..\n\0x\n'; exit 0"#, { "\($0.receipts) could not be listed whole (perl exit 0), so whether another account on this Mac has a receipt in it is unknown" }),
+        ]
+        for c in cases {
+            let f = try ScriptFixture()
+            defer { f.destroy() }
+            try f.installMachinery()
+            try f.writeState(cleanJournal)
+            try f.writeReceipt()
+            if !c.own {
+                XCTAssertEqual(unlink(f.receipt), 0)
+                XCTAssertEqual(unlink(f.released), 0)
+            }
+            for name in c.others {
+                try "another account\n".write(toFile: f.receipts + "/" + name, atomically: true, encoding: .utf8)
+            }
+            if let action = c.perl {
+                let wrapper = f.bin.appendingPathComponent("perl-list")
+                try """
+                #!/bin/bash
+                if [[ "$2" == *readdir* && "${!#}" == '\(f.receipts)' ]]; then \(action); fi
+                exec /usr/bin/perl "$@"
+                """.write(to: wrapper, atomically: true, encoding: .utf8)
+                XCTAssertEqual(chmod(wrapper.path, 0o755), 0)
+                let text = try String(contentsOf: f.uninstall, encoding: .utf8)
+                try ScriptFixture.patch(text, ["PERL": wrapper.path]).write(to: f.uninstall, atomically: true, encoding: .utf8)
+            }
+
+            let r = try f.run(f.uninstall)
+
+            XCTAssertEqual(r.status, 0, "\(c.name): \(r.stderr + r.stdout)")
+            let why = c.why(f)
+            XCTAssertTrue(r.stdout.contains("kept \(f.sudoers.path): \(why), and that account's recovery agent may need the rule"), "\(c.name): \(r.stdout)")
+            XCTAssertTrue(r.stderr.contains("\(f.sudoers.path) was kept: \(why). It is one file for every account on this Mac.\nOnce no account uses Insomnia any more, remove it yourself: sudo rm -f \(f.sudoers.path)"), "\(c.name): \(r.stderr)")
+            XCTAssertTrue(f.exists(f.sudoers), c.name)
+            XCTAssertFalse(f.calls().contains("sudo -n /bin/rm -f \(f.sudoers.path)"), "\(c.name): \(f.calls())")
+            XCTAssertFalse(FileManager.default.fileExists(atPath: f.receipt), c.name)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: f.released), c.name)
+            for name in c.others {
+                XCTAssertEqual(try String(contentsOfFile: f.receipts + "/" + name, encoding: .utf8), "another account\n", "\(c.name): \(name)")
+            }
+            XCTAssertEqual(FileManager.default.fileExists(atPath: f.receipts), !c.others.isEmpty, "\(c.name): an empty folder still goes")
+            XCTAssertFalse(f.exists(f.installedBackstop), "\(c.name): this account's bundle still goes")
+        }
+
+        try fx.installMachinery()
+        try fx.writeState(cleanJournal)
+        try fx.writeReceipt()
+
+        let r = try fx.run(fx.uninstall)
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertTrue(r.stdout.contains("\(fx.sudoers.path) is gone"), r.stdout)
+        XCTAssertFalse(r.stdout.contains("kept \(fx.sudoers.path)"), r.stdout)
+        XCTAssertFalse(r.stderr.contains("was kept"), r.stderr)
+        XCTAssertTrue(fx.calls().contains("sudo -n /bin/rm -f \(fx.sudoers.path)"), "\(fx.calls())")
+        XCTAssertFalse(fx.exists(fx.sudoers))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fx.receipts))
     }
 
     // MARK: Round 28 (finding 2): what every Insomnia folder of this user shares
@@ -4203,7 +4331,9 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
         XCTAssertTrue(r.stdout.contains("could not read the whole answer of defaults read for com.example.Partial; check it yourself with: defaults read com.example.Partial NSAppSleepDisabled"), r.stdout)
         XCTAssertTrue(r.stdout.contains("1 could not be read"), r.stdout)
-        XCTAssertFalse(r.stdout.contains("none of the"), r.stdout)
+        // Only the shipped list counts as checked; the partial read does not.
+        XCTAssertTrue(r.stdout.contains("none of the \(Config.defaultAgentList.count) agent apps checked has NSAppSleepDisabled set"), r.stdout)
+        XCTAssertFalse(r.stdout.contains("defaults delete com.example.Partial"), r.stdout)
     }
 
     /// A `defaults read` that never answers (cfprefsd stuck) is stopped
@@ -4662,7 +4792,8 @@ final class RecoveryScriptTests: XCTestCase {
     /// that very file, unwritten since and free, finishes the removal.
     /// Covered: the release file's removal fails, sudo has lost the
     /// credential, and the removal stops on SIGTERM at its limit. Another
-    /// account's receipt in the folder stays, and so does the folder.
+    /// account's receipt in the folder stays, and so do the folder and the
+    /// rule (round 36, R35-3), so the stop comes after keeping the rule.
     func testUninstallFinishesTheReceiptsRemovalAfterAStopBetweenItsRemovals() throws {
         for stop in ["fails", "no-credential", "stops"] {
             let f = try ScriptFixture()
@@ -4686,7 +4817,7 @@ final class RecoveryScriptTests: XCTestCase {
                 "no-credential": "\(removal) exited 1 (sudo: a password is required)",
                 "stops": "\(removal) did not answer within 5s and stopped on SIGTERM, so what it did is unknown",
             ][stop]!
-            XCTAssertTrue(r.stderr.contains("Uninstall stopped after removing \(f.sudoers.path): \(why)."), "\(stop): \(r.stderr)")
+            XCTAssertTrue(r.stderr.contains("Uninstall stopped after keeping \(f.sudoers.path) for another account: \(why)."), "\(stop): \(r.stderr)")
             XCTAssertTrue(r.stderr.contains("\(progress.path) records the receipt's removal: a rerun finishes it while \(f.released) stays as it is now."), "\(stop): \(r.stderr)")
             XCTAssertFalse(FileManager.default.fileExists(atPath: f.receipt), stop)
             XCTAssertEqual(f.release(), SleepOffReceipts.initialRelease, stop)
@@ -4707,7 +4838,8 @@ final class RecoveryScriptTests: XCTestCase {
             XCTAssertFalse(f.exists(progress), stop)
             XCTAssertEqual(try String(contentsOfFile: other, encoding: .utf8), "another account\n", stop)
             XCTAssertFalse(f.exists(f.installedBackstop), stop)
-            XCTAssertFalse(f.exists(f.sudoers), stop)
+            XCTAssertTrue(f.exists(f.sudoers), "\(stop): the other account's receipt keeps the rule")
+            XCTAssertFalse(f.calls().contains("sudo -n /bin/rm -f \(f.sudoers.path)"), "\(stop): \(f.calls())")
         }
     }
 
@@ -4829,6 +4961,10 @@ final class RecoveryScriptTests: XCTestCase {
             ("no final newline", { line, progress, _ in write(Data(line.dropLast().utf8), progress) }),
             ("a NUL byte", { line, progress, _ in var d = Data(line.utf8); d.insert(0, at: d.count - 1); write(d, progress) }),
             ("more than 200 bytes", { line, progress, _ in write(Data((line + String(repeating: "x", count: 200) + "\n").utf8), progress) }),
+            // Round 36 (R35-3): a link to a record as it writes it, and a
+            // record its stat shows as another account's (see below).
+            ("a symlink to a record as it writes it", { line, progress, second in write(Data(line.utf8), second); XCTAssertEqual(symlink(second.path, progress.path), 0) }),
+            ("another owner", { line, progress, _ in write(Data(line.utf8), progress) }),
             ("the control", nil),
         ]
         var fixtures: [ScriptFixture] = []
@@ -4847,9 +4983,26 @@ final class RecoveryScriptTests: XCTestCase {
             let line = "\(identity) \(initial)"
             let journal = try Data(contentsOf: f.state)
             if let damage = c.damage { damage(line, progress, second) } else { write(Data(line.utf8), progress) }
+            if c.name == "another owner" {
+                // No chown without root: the script's STAT shows another
+                // owner for the record's metadata line only.
+                let wrapper = f.bin.appendingPathComponent("stat-other-owner")
+                try """
+                #!/bin/bash
+                if [[ "$2" == '%d:%i %l %u %Lp %z %HT' && "${!#}" == '\(progress.path)' ]]; then
+                  out="$(/usr/bin/stat "$@")" || exit
+                  printf '%s\\n' "${out/ 1 \(getuid()) 600 / 1 4242424 600 }"
+                  exit 0
+                fi
+                exec /usr/bin/stat "$@"
+                """.write(to: wrapper, atomically: true, encoding: .utf8)
+                XCTAssertEqual(chmod(wrapper.path, 0o755), 0)
+                let text = try String(contentsOf: f.uninstall, encoding: .utf8)
+                try ScriptFixture.patch(text, ["STAT": wrapper.path]).write(to: f.uninstall, atomically: true, encoding: .utf8)
+            }
             rows.append((ScriptRow(c.name, f, f.uninstall), c.damage != nil, progress, journal))
         }
-        XCTAssertEqual(rows.count, 7)
+        XCTAssertEqual(rows.count, 9)
 
         runTwoAtATime(rows.map(\.row))
 
@@ -4864,6 +5017,45 @@ final class RecoveryScriptTests: XCTestCase {
                 XCTAssertFalse(FileManager.default.fileExists(atPath: f.released), row.label)
                 XCTAssertFalse(f.exists(progress), row.label)
             }
+        }
+    }
+
+    /// Round 36 (R35-3): the receipt and its release file both gone with a
+    /// record still there, as a stop between the release file's removal
+    /// and the record's leaves them. Nothing claims the receipt any more,
+    /// so the record, which names nothing now, goes with the rule. A record
+    /// that is a symlink goes as a link; its target stays.
+    func testUninstallRemovesARecordWhoseSharedFilesAreBothGone() throws {
+        for isLink in [false, true] {
+            let f = try ScriptFixture()
+            defer { f.destroy() }
+            let progress = f.home.appendingPathComponent(".uninstall-receipt-removal")
+            let target = f.home.appendingPathComponent("record-target")
+            try f.installMachinery()
+            try f.writeState(cleanJournal)
+            try f.writeReceipt()
+            let identity = try f.runTool("/usr/bin/stat", ["-f", "%d:%i:%Fc", f.released]).output.trimmingCharacters(in: .newlines)
+            let line = "\(identity) \(SleepOffReceipts.initialRelease)"
+            XCTAssertEqual(unlink(f.receipt), 0)
+            XCTAssertEqual(unlink(f.released), 0)
+            if isLink {
+                try line.write(to: target, atomically: true, encoding: .utf8)
+                XCTAssertEqual(symlink(target.path, progress.path), 0)
+            } else {
+                try line.write(to: progress, atomically: true, encoding: .utf8)
+                XCTAssertEqual(chmod(progress.path, 0o600), 0)
+            }
+
+            let r = try f.run(f.uninstall)
+
+            XCTAssertEqual(r.status, 0, "\(isLink): \(r.stdout + r.stderr)")
+            XCTAssertTrue(r.stdout.contains("no receipt of this user in \(f.receipts)"), "\(isLink): \(r.stdout)")
+            XCTAssertTrue(r.stdout.contains("removed \(progress.path)\n"), "\(isLink): \(r.stdout)")
+            var info = stat()
+            XCTAssertNotEqual(lstat(progress.path, &info), 0, "\(isLink)")
+            XCTAssertEqual(FileManager.default.fileExists(atPath: target.path), isLink)
+            XCTAssertFalse(f.exists(f.sudoers), "\(isLink)")
+            XCTAssertFalse(FileManager.default.fileExists(atPath: f.receipts), "\(isLink)")
         }
     }
 

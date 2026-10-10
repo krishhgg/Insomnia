@@ -664,13 +664,17 @@ final class SleepOffSettlementTests: XCTestCase {
     /// journaled with `expires`: AdministratorPrompt.answerWindow after the
     /// clock, or the session's end if sooner.
     @discardableResult
-    private func journalUnfinishedStart(owedBefore: Bool = false, endsIn: TimeInterval = 1800, marker: Bool = true, in harness: Harness? = nil) throws -> SleepOffAttempt {
+    /// `ids`: the session and the record carry ids, as Start gives them
+    /// from round 36 on (`Session.id`, `SleepOffAttempt.session`); without,
+    /// as an older build wrote them.
+    private func journalUnfinishedStart(owedBefore: Bool = false, endsIn: TimeInterval = 1800, marker: Bool = true, ids: Bool = false, in harness: Harness? = nil) throws -> SleepOffAttempt {
         let h = harness ?? self.h!
-        let session = SessionMath.newSession(now: h.clock.now.addingTimeInterval(endsIn - 3600), duration: 3600, maxDuration: 86400)
+        var session = SessionMath.newSession(now: h.clock.now.addingTimeInterval(endsIn - 3600), duration: 3600, maxDuration: 86400)
+        if ids { session.id = UUID().uuidString }
         let nonce = UUID().uuidString
         let deadline = Int(session.endsAt.timeIntervalSince1970.rounded(.down))
         let predecessor = try XCTUnwrap(TestReceipts.nonce(h.receipts.file))
-        var attempt = SleepOffAttempt(nonce: nonce, owedBefore: owedBefore, receipt: try h.receipts.identity(), predecessor: predecessor, deadline: deadline, expires: deadline, marker: nil)
+        var attempt = SleepOffAttempt(nonce: nonce, owedBefore: owedBefore, receipt: try h.receipts.identity(), predecessor: predecessor, deadline: deadline, expires: deadline, marker: nil, session: session.id)
         var journal = RuntimeState.clean
         journal.sleepDisabledByUs = true
         journal.sleepOffAttempt = attempt
@@ -1534,8 +1538,8 @@ final class SleepOffSettlementTests: XCTestCase {
     /// SleepDisabled is 1. With `named`, the record names that session as
     /// the one to resume (`resumes`), as finishAttempt journals it.
     /// Without, it is a record an older build or a script settled.
-    private func journalSettledStart(endsIn: TimeInterval = 1800, givenBack: Bool, named: Bool = true) async throws -> (attempt: SleepOffAttempt, session: Session) {
-        var attempt = try journalUnfinishedStart(endsIn: endsIn)
+    private func journalSettledStart(endsIn: TimeInterval = 1800, givenBack: Bool, named: Bool = true, ids: Bool = false) async throws -> (attempt: SleepOffAttempt, session: Session) {
+        var attempt = try journalUnfinishedStart(endsIn: endsIn, ids: ids)
         let session = try XCTUnwrap(h.store.loadSession())
         TestReceipts.write(h.receipts.file, nonce: attempt.nonce, predecessor: attempt.predecessor, word: "writing")
         try FileManager.default.removeItem(at: h.home.paths.pendingStartFile)
@@ -2196,6 +2200,129 @@ final class SleepOffSettlementTests: XCTestCase {
         XCTAssertEqual(TestReceipts.release(h.receipts), "\(SleepOffReceipts.zero) free\n")
         XCTAssertEqual(restores, 0, "\(h.guardFake.calls)")
         XCTAssertFalse(m.isActive)
+    }
+
+    /// Round 36 (independent35 R35-7): sessions and records of this build
+    /// carry ids (`Session.id`, `SleepOffAttempt.session`,
+    /// `ResumedSession.id`). A session with the start's own times and
+    /// another id is another session: neither a record that names the
+    /// session nor one settled without the name (a script's) resumes it,
+    /// and it ends as any other. The start's own session without its id
+    /// (an older build wrote session.json again), or a record without ids
+    /// (an older build's), falls back to the times, as before. The claim
+    /// cannot be given back throughout, so the record stays.
+    func testASessionWithTheStartsTimesAndAnotherIdIsNotResumed() async throws {
+        let cases: [(name: String, resumes: Bool, change: (inout Session, inout SleepOffAttempt) -> Void)] = [
+            ("its own session", true, { _, _ in }),
+            ("its own, extended by 900 s", true, { s, _ in
+                s.endsAt = s.endsAt.addingTimeInterval(900)
+                s.extensions = [900]
+            }),
+            ("the same times, another id", false, { s, _ in s.id = UUID().uuidString }),
+            ("its own, without its id", true, { s, _ in s.id = nil }),
+            ("another id, beside a record without ids", true, { s, a in
+                s.id = UUID().uuidString
+                a.session = nil
+                a.resumes?.id = nil
+            }),
+        ]
+        for named in [true, false] {
+            for c in cases {
+                let name = "\(named ? "named" : "unnamed"): \(c.name)"
+                fresh()
+                var (attempt, session) = try await journalSettledStart(givenBack: false, named: named, ids: true)
+                XCTAssertNotNil(session.id, name)
+                XCTAssertEqual(attempt.session, session.id, name)
+                XCTAssertEqual(attempt.resumes?.id, named ? session.id : nil, name)
+                c.change(&session, &attempt)
+                try h.store.saveSession(session)
+                var journal = try XCTUnwrap(h.store.loadState())
+                journal.sleepOffAttempt = attempt
+                try h.store.saveState(journal)
+                let saved = try XCTUnwrap(h.store.loadSession())
+                XCTAssertEqual(saved.id, session.id, name)
+                XCTAssertEqual(SessionManager.isResumed(saved, by: attempt, sleepEntry: true), c.resumes, name)
+                let clear = try await impose(.releaseReadOnly)
+                defer { clear() }
+                let m = h.makeManager()
+
+                await m.reconcile()
+
+                XCTAssertEqual(m.isActive, c.resumes, "\(name): \(m.lastError ?? "")")
+                XCTAssertEqual(try h.store.loadSession(), c.resumes ? saved : nil, name)
+                XCTAssertEqual(restores, c.resumes ? 0 : 1, "\(name): \(h.guardFake.calls)")
+                XCTAssertFalse(h.guardFake.calls.contains("disablesleep 1"), name)
+                XCTAssertEqual(try h.store.loadState()?.sleepOffAttempt, attempt, "\(name): the record stays")
+                if c.resumes {
+                    XCTAssertEqual(m.session, saved, name)
+                    await m.end(reason: .user)
+                }
+            }
+        }
+    }
+
+    /// Round 36 (R35-7): a Start gives its session an id and journals it
+    /// with the attempt, before the dialog; the session keeps it through an
+    /// extension, and the settlement names it. A second Start gives
+    /// another.
+    func testAStartGivesItsSessionAnIdItJournalsBeforeTheDialog() async throws {
+        let seen = Locked<SleepOffAttempt?>(nil)
+        let store = h.store
+        h.prompt.onShow = { _ in seen.value = try? store.loadState()?.sleepOffAttempt }
+        let m = h.makeManager()
+
+        await m.start(duration: 1800)
+
+        XCTAssertTrue(m.isActive, m.lastError ?? "")
+        let first = try XCTUnwrap(m.session?.id)
+        XCTAssertEqual(try h.store.loadSession()?.id, first)
+        XCTAssertEqual(seen.value?.session, first, "journaled with the attempt before the dialog")
+        await m.extend(by: 600)
+        XCTAssertEqual(try h.store.loadSession()?.id, first, "an extension keeps it")
+        await m.end(reason: .user)
+
+        await m.start(duration: 1800)
+
+        XCTAssertTrue(m.isActive, m.lastError ?? "")
+        XCTAssertNotEqual(try XCTUnwrap(m.session?.id), first)
+        await m.end(reason: .user)
+    }
+
+    /// Round 36 (R35-7): the ids are optional and read leniently, as the
+    /// scripts ignore them: a file from a build before them reads with
+    /// none, an id that is not a string reads as none, and none is left
+    /// out of the JSON. The other keys stay as strict as before.
+    func testSessionIdsAreOptionalAndReadLeniently() throws {
+        let decoder = Store.makeDecoder()
+        let times = #""startedAt":"2027-01-15T08:00:00Z","endsAt":"2027-01-15T09:00:00Z","extensions":[]"#
+        XCTAssertNil(try decoder.decode(Session.self, from: Data("{\(times)}".utf8)).id)
+        XCTAssertEqual(try decoder.decode(Session.self, from: Data("{\(times),\"id\":\"A\"}".utf8)).id, "A")
+        let old = #"{"deadline":1800003600,"expires":1800000130,"nonce":"n","owedBefore":true,"predecessor":"p","receipt":"1:2","settled":true}"#
+        XCTAssertNil(try decoder.decode(SleepOffAttempt.self, from: Data(old.utf8)).session)
+        for odd in ["1", "null", "true", #"["A"]"#, "{}"] {
+            XCTAssertNil(try decoder.decode(Session.self, from: Data("{\(times),\"id\":\(odd)}".utf8)).id, odd)
+            let attempt = old.replacingOccurrences(of: #""settled":true"#, with: #""settled":true,"session":\#(odd),"resumes":{"startedAt":1,"firstEnd":2,"id":\#(odd)}"#)
+            let decoded = try decoder.decode(SleepOffAttempt.self, from: Data(attempt.utf8))
+            XCTAssertNil(decoded.session, odd)
+            XCTAssertEqual(decoded.resumes, ResumedSession(startedAt: 1, firstEnd: 2), odd)
+        }
+        XCTAssertThrowsError(try decoder.decode(Session.self, from: Data(#"{"startedAt":"2027-01-15T08:00:00Z","endsAt":1,"extensions":[]}"#.utf8)))
+        XCTAssertThrowsError(try decoder.decode(SleepOffAttempt.self, from: Data(old.replacingOccurrences(of: "1800003600", with: #""x""#).utf8)))
+        XCTAssertThrowsError(try decoder.decode(SleepOffAttempt.self, from: Data(old.replacingOccurrences(of: #""settled":true"#, with: #""settled":true,"resumes":{"startedAt":"x"}"#).utf8)))
+
+        let encoder = Store.makeEncoder()
+        let bare = Session(startedAt: Date(timeIntervalSince1970: 1_800_000_000), endsAt: Date(timeIntervalSince1970: 1_800_003_600))
+        XCTAssertFalse(String(decoding: try encoder.encode(bare), as: UTF8.self).contains("\"id\""))
+        var named = bare
+        named.id = "B"
+        XCTAssertEqual(try decoder.decode(Session.self, from: try encoder.encode(named)), named)
+        var attempt = try decoder.decode(SleepOffAttempt.self, from: Data(old.utf8))
+        XCTAssertFalse(String(decoding: try encoder.encode(attempt), as: UTF8.self).contains("session"))
+        attempt.session = "B"
+        attempt.resumes = ResumedSession(named)
+        XCTAssertEqual(attempt.resumes?.id, "B")
+        XCTAssertEqual(try decoder.decode(SleepOffAttempt.self, from: try encoder.encode(attempt)), attempt)
+        XCTAssertFalse(String(decoding: try encoder.encode(ResumedSession(bare)), as: UTF8.self).contains("\"id\""))
     }
 
     /// `resumes` is optional in the journal: a record from a build before

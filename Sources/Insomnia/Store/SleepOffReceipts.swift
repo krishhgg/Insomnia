@@ -61,8 +61,35 @@ struct SleepOffAttempt: Codable, Equatable, Sendable {
     /// nil. The scripts check only its shape, and a build from before it
     /// drops it when it rewrites the journal.
     var resumes: ResumedSession? = nil
+    /// The `Session.id` of the session this start writes, journaled with
+    /// the attempt before the dialog. A session.json with another id is
+    /// not this start's, whatever its times (`SessionManager.isSession`).
+    /// nil in a record of a build from before it. Read leniently, like
+    /// `Session.id`: the scripts do not check it. Left out of the JSON when
+    /// nil.
+    var session: String? = nil
 
     var isSettled: Bool { settled == true }
+
+    private enum CodingKeys: String, CodingKey {
+        case nonce, owedBefore, receipt, predecessor, deadline, expires, marker, settled, resumes, session
+    }
+}
+
+extension SleepOffAttempt {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        nonce = try c.decode(String.self, forKey: .nonce)
+        owedBefore = try c.decode(Bool.self, forKey: .owedBefore)
+        receipt = try c.decode(String.self, forKey: .receipt)
+        predecessor = try c.decode(String.self, forKey: .predecessor)
+        deadline = try c.decode(Int.self, forKey: .deadline)
+        expires = try c.decode(Int.self, forKey: .expires)
+        marker = try c.decodeIfPresent(String.self, forKey: .marker)
+        settled = try c.decodeIfPresent(Bool.self, forKey: .settled)
+        resumes = try c.decodeIfPresent(ResumedSession.self, forKey: .resumes)
+        session = try? c.decodeIfPresent(String.self, forKey: .session)
+    }
 }
 
 /// What `SleepOffAttempt.resumes` records of a session, in whole seconds
@@ -72,13 +99,17 @@ struct SleepOffAttempt: Codable, Equatable, Sendable {
 struct ResumedSession: Codable, Equatable, Sendable {
     var startedAt: Int?
     var firstEnd: Int?
+    /// The session's `Session.id`; nil for a session without one. Read
+    /// leniently, like `Session.id`: the scripts check only the two times.
+    var id: String?
 
     /// No session is left to be resumed.
     static let none = ResumedSession()
 
-    init(startedAt: Int? = nil, firstEnd: Int? = nil) {
+    init(startedAt: Int? = nil, firstEnd: Int? = nil, id: String? = nil) {
         self.startedAt = startedAt
         self.firstEnd = firstEnd
+        self.id = id
     }
 
     /// `s` as session.json keeps it, or `.none` for a session with no first
@@ -91,7 +122,16 @@ struct ResumedSession: Codable, Equatable, Sendable {
             self.init()
             return
         }
-        self.init(startedAt: Int(started), firstEnd: Int(first.rounded(.down)))
+        self.init(startedAt: Int(started), firstEnd: Int(first.rounded(.down)), id: s.id)
+    }
+
+    private enum CodingKeys: String, CodingKey { case startedAt, firstEnd, id }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        startedAt = try c.decodeIfPresent(Int.self, forKey: .startedAt)
+        firstEnd = try c.decodeIfPresent(Int.self, forKey: .firstEnd)
+        id = try? c.decodeIfPresent(String.self, forKey: .id)
     }
 }
 

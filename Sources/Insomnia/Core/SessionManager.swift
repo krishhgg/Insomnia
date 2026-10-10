@@ -1342,7 +1342,8 @@ final class SessionManager {
             return
         }
         let now = clock()
-        let new = SessionMath.newSession(now: now, duration: duration, maxDuration: config.maxDuration)
+        var new = SessionMath.newSession(now: now, duration: duration, maxDuration: config.maxDuration)
+        new.id = UUID().uuidString
         // What was on disk before this attempt, read under the lock. A
         // rollback puts exactly this back: an entry an earlier failed restore
         // left behind is evidence, not something this start may clear.
@@ -1394,7 +1395,7 @@ final class SessionManager {
         // unless the journal owned a 1 before this start, for which Start's
         // own read was skipped too.
         var pending = PendingStart(marker: store.paths.pendingStartFile, nonce: UUID().uuidString, deadline: new.endsAt, sleepOffIsOurs: journalBefore.sleepDisabledByUs, predecessor: predecessor, receipt: held.identity)
-        var attempt = SleepOffAttempt(nonce: pending.nonce, owedBefore: journalBefore.sleepDisabledByUs, receipt: held.identity, predecessor: predecessor, deadline: pending.deadlineSeconds, expires: pending.expiresSeconds, marker: nil)
+        var attempt = SleepOffAttempt(nonce: pending.nonce, owedBefore: journalBefore.sleepDisabledByUs, receipt: held.identity, predecessor: predecessor, deadline: pending.deadlineSeconds, expires: pending.expiresSeconds, marker: nil, session: new.id)
         do {
             try journal {
                 $0.sleepDisabledByUs = true
@@ -3511,7 +3512,11 @@ final class SessionManager {
     /// is not the start's own, and reconcile ends it as before. Everything
     /// here compares Doubles, so no journal or session.json value can trap
     /// a conversion or overflow a subtraction.
+    /// A session whose id (`Session.id`) is not the one the start
+    /// journaled (`SleepOffAttempt.session`) is not the start's own,
+    /// whatever its times; with no id on either side the times decide.
     static func isSession(_ s: Session, of attempt: SleepOffAttempt) -> Bool {
+        if s.sameID(as: attempt.session) == false { return false }
         let started = s.startedAt.timeIntervalSince1970.rounded(.down)
         guard started + SessionMath.minimumDuration <= Double(attempt.deadline) else { return false }
         return hasFirstEnd(s, attempt.deadline)
@@ -3534,13 +3539,17 @@ final class SessionManager {
     /// second, and the same first end, within `isSession`'s window. That
     /// is what session.json keeps of a session, not proof that it is the
     /// same one: a session written in that same second with that first end
-    /// passes too. Without `resumes` (a record settled by an older build or
-    /// by the scripts), the first end alone decides, as `isSession`, with
-    /// the sleep entry journaled. `.none` matches no session.
+    /// passes too, unless both carry an id (`Session.id`, round 36), which
+    /// must then be the same. A session or record of an older build has
+    /// none, and the times alone decide. Without `resumes` (a record
+    /// settled by an older build or by the scripts), the first end alone
+    /// decides, as `isSession`, with the sleep entry journaled. `.none`
+    /// matches no session.
     static func isResumed(_ s: Session, by attempt: SleepOffAttempt, sleepEntry: Bool) -> Bool {
         guard attempt.isSettled else { return false }
         guard let resumes = attempt.resumes else { return sleepEntry && isSession(s, of: attempt) }
         guard let started = resumes.startedAt, let end = resumes.firstEnd else { return false }
+        if s.sameID(as: resumes.id) == false { return false }
         return s.startedAt.timeIntervalSince1970.rounded(.down) == Double(started) && hasFirstEnd(s, end)
     }
 
@@ -3642,12 +3651,13 @@ final class SessionManager {
     }
 
     /// With no session in memory, deletes session.json when it is the one
-    /// `attempt` wrote (its end is the start's deadline): that session
+    /// `attempt` wrote (its end is the start's deadline, and its id, when
+    /// both have one, the start's session id): that session
     /// never began, and it must go before the settlement is published so
     /// it is never resumed because a SleepDisabled 1 someone else set reads
     /// as still off. Returns whether it deleted it.
     private func removeSessionOfUnfinishedStart(_ attempt: SleepOffAttempt) throws -> Bool {
-        guard session == nil, let s = try? store.loadSession(), s.endsAt.timeIntervalSince1970.rounded(.down) == Double(attempt.deadline) else { return false }
+        guard session == nil, let s = try? store.loadSession(), s.endsAt.timeIntervalSince1970.rounded(.down) == Double(attempt.deadline), s.sameID(as: attempt.session) != false else { return false }
         try store.deleteSession()
         Log.info("removed session.json of a start that never finished")
         return true

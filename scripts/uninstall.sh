@@ -514,6 +514,24 @@ type_at() { # file keypath
 ty() { # file keypath
   type_at "$@" || (( $? == 1 ))
 }
+# Round 36: a session.json whose id (Session.id) is a string other than
+# the one the start journaled (sleepOffAttempt.session, a string too) is
+# not that start's session, whatever its end. With either one missing or
+# not a string, the end alone decides, as in the app
+# (SessionManager.isSession). Sets id_differs to 1 or 0. Returns 2, with
+# read_why, when a read failed.
+session_id_differs() { # session-copy journal-copy
+  local ours
+  id_differs=0
+  type_at "$1" id || { (( $? == 1 )) && return 0; return 2; }
+  [[ "$t" == string ]] || return 0
+  read_at "$1" id raw || return 2
+  ours="$read_value"
+  type_at "$2" sleepOffAttempt.session || { (( $? == 1 )) && return 0; return 2; }
+  [[ "$t" == string ]] || return 0
+  read_at "$2" sleepOffAttempt.session raw || return 2
+  [[ "$ours" == "$read_value" ]] || id_differs=1
+}
 read_at() { # file keypath raw|json
   local rc err
   read_value=""
@@ -1960,6 +1978,11 @@ settle_attempt() {
       if (( rc == 0 )) && [[ -z "$shape_lines" ]]; then
         epoch_at "$copy_path" endsAt || rc=$?
         if (( rc == 0 )) && [[ -n "$epoch" && "$epoch" == "$deadline" ]]; then matched=1; fi
+        if (( rc == 0 && matched )); then
+          session_id_differs "$copy_path" "$settle_copy" || rc=$?
+          if (( id_differs )); then echo "kept $SESSION: its end is the start's deadline, but its id is not the session the start journaled"; fi
+          (( ! id_differs )) || matched=0
+        fi
       fi
       (( rc == 0 )) || settle_stop "$SESSION could not be read ($read_why), so whether it is that start's session is unknown"
     fi
@@ -2683,7 +2706,7 @@ if [[ -n "$owed_why" ]]; then
   kept_why="$owed_why"
   echo "kept for another Insomnia folder of this user: $owed_why, so a restore the sudoers rule runs may still be owed; $SUDOERS, the receipt and $APP stay"
 else
-  echo "sleep is not off and Low Power Mode is not on for battery: no restore the sudoers rule runs is owed"
+  echo "sleep is not off and Low Power Mode is not on for battery, so neither is owed a restore now; the App Nap, audio and brightness entries in the journal of another Insomnia folder of this user cannot be seen from here"
 fi
 loaded_agent
 case "$agent_seen" in
@@ -2774,12 +2797,56 @@ restore_agent() {
     *) echo "The LaunchAgent could not be loaded again (launchctl bootstrap $how), and $agent_why. If $LABEL is not loaded, load it yourself: launchctl bootstrap gui/$UID_NUM $PLIST" >&2 ;;
   esac
 }
-# Stops the uninstall after the rule went: what was kept, and why.
+# The rule is one file for every account on this Mac, while the receipts,
+# the locks and the bundles are each account's own. other_accounts sets
+# rule_why when $RECEIPTS holds another account's receipt or release file
+# (that account installed Insomnia, and its recovery agent may need the
+# rule), an entry install.sh does not make, or cannot be listed whole; the
+# rule then stays, and this account's own files are still removed. The
+# listing cannot keep another account's install.sh from writing the rule
+# or a receipt just after it: no lock spans accounts.
+# shellcheck disable=SC2016  # the $ below are perl's, not this shell's
+LIST_PERL='use strict;
+opendir(my $d, $ARGV[0]) or exit 2;
+my @names;
+while (1) { $! = 0; my $e = readdir($d); if (!defined $e) { exit 3 if $!; last; } push @names, $e; }
+closedir($d) or exit 3;
+print map { "$_\n" } sort @names;'
+rule_why=""
+other_accounts() {
+  local rc=0 name uids="" odd=0
+  rule_why=""
+  [[ -e "$RECEIPTS" || -L "$RECEIPTS" ]] || return 0
+  bounded "$ENV" -i "$PERL" -e "$LIST_PERL" "$RECEIPTS" || rc=$?
+  if (( rc != 0 || ! BOUNDED_WHOLE )); then
+    rule_why="$RECEIPTS could not be listed whole (perl exit $rc), so whether another account on this Mac has a receipt in it is unknown"
+    return 0
+  fi
+  while IFS= read -r name; do
+    case "$name" in
+      .|..|"$UID_NUM"|"$UID_NUM.released") continue ;;
+    esac
+    if [[ "$name" =~ ^([0-9]+)(\.released)?$ ]]; then
+      [[ " $uids " == *" ${BASH_REMATCH[1]} "* ]] || uids="${uids:+$uids }${BASH_REMATCH[1]}"
+    else
+      odd=$((odd + 1))
+    fi
+  done <<< "$BOUNDED_OUTPUT"
+  if [[ -n "$uids" ]]; then
+    rule_why="$RECEIPTS holds the receipt of another account on this Mac (uid $uids)"
+  fi
+  if (( odd > 0 )); then
+    rule_why="${rule_why:+$rule_why, and }$RECEIPTS holds names install.sh does not make ($odd), so whether another account uses the rule is unknown"
+  fi
+}
+# Stops the uninstall after the rule went or was kept: what was kept, and
+# why.
 removal_recorded=0
+rule_step="removing $SUDOERS"
 stop_after_rule() { # why
   "$CAT" >&2 <<MSG
 
-Uninstall stopped after removing $SUDOERS: $1.
+Uninstall stopped after $rule_step: $1.
 $APP, the journal and whatever is left of the receipt were kept. Rerun this
 script once nothing above is still running.
 MSG
@@ -2913,19 +2980,25 @@ MSG
     restore_agent
     exit 1
   fi
-  # rm -f as root, whether or not this user can see the file: /etc/sudoers.d
-  # is root's alone.
-  if ! as_root "$RM" -f "$SUDOERS"; then
-    "$CAT" >&2 <<MSG
+  other_accounts
+  if [[ -n "$rule_why" ]]; then
+    rule_step="keeping $SUDOERS for another account"
+    echo "kept $SUDOERS: $rule_why, and that account's recovery agent may need the rule"
+  else
+    # rm -f as root, whether or not this user can see the file:
+    # /etc/sudoers.d is root's alone.
+    if ! as_root "$RM" -f "$SUDOERS"; then
+      "$CAT" >&2 <<MSG
 
 Uninstall stopped after booting out the LaunchAgent: $root_why.
 $SUDOERS may still be there. $APP, the receipt and the journal were kept.
 Rerun this script once nothing above is still running.
 MSG
-    restore_agent
-    exit 1
+      restore_agent
+      exit 1
+    fi
+    echo "$SUDOERS is gone"
   fi
-  echo "$SUDOERS is gone"
 
   # The receipt and its release file, which no start claims (see the check
   # before step 5), and their folder once empty: other accounts on this Mac
@@ -3048,6 +3121,13 @@ fi
 
 if (( remove_failures > 0 )); then
   echo "Done, except $remove_failures file(s) that could not be removed (named above)." >&2
+fi
+if [[ -n "$rule_why" ]]; then
+  "$CAT" >&2 <<MSG
+
+$SUDOERS was kept: $rule_why. It is one file for every account on this Mac.
+Once no account uses Insomnia any more, remove it yourself: sudo rm -f $SUDOERS
+MSG
 fi
 if (( keep_shared )); then
   "$CAT" >&2 <<MSG

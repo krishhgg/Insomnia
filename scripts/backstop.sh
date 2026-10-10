@@ -686,6 +686,24 @@ type_at() { # file keypath
 ty() { # file keypath
   type_at "$@" || (( $? == 1 ))
 }
+# Round 36: a session.json whose id (Session.id) is a string other than
+# the one the start journaled (sleepOffAttempt.session, a string too) is
+# not that start's session, whatever its end. With either one missing or
+# not a string, the end alone decides, as in the app
+# (SessionManager.isSession). Sets id_differs to 1 or 0. Returns 2, with
+# read_why, when a read failed.
+session_id_differs() { # session-copy journal-copy
+  local ours
+  id_differs=0
+  type_at "$1" id || { (( $? == 1 )) && return 0; return 2; }
+  [[ "$t" == string ]] || return 0
+  read_at "$1" id raw || return 2
+  ours="$read_value"
+  type_at "$2" sleepOffAttempt.session || { (( $? == 1 )) && return 0; return 2; }
+  [[ "$t" == string ]] || return 0
+  read_at "$2" sleepOffAttempt.session raw || return 2
+  [[ "$ours" == "$read_value" ]] || id_differs=1
+}
 read_at() { # file keypath raw|json
   local rc err
   read_value=""
@@ -1956,6 +1974,11 @@ settle_attempt() {
       if (( rc == 0 )) && [[ -z "$shape_lines" ]]; then
         epoch_at "$copy_path" endsAt || rc=$?
         if (( rc == 0 )) && [[ -n "$epoch" && "$epoch" == "$deadline" ]]; then matched=1; fi
+        if (( rc == 0 && matched )); then
+          session_id_differs "$copy_path" "$state_copy" || rc=$?
+          if (( id_differs )); then log info "kept $SESSION: its end is the start's deadline, but its id is not the session the start journaled"; fi
+          (( ! id_differs )) || matched=0
+        fi
       fi
       if (( rc != 0 )); then session_why="$read_why"; fi
     fi
