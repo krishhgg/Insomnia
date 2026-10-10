@@ -198,10 +198,15 @@ recovery; newly written journals use `frozenProcesses`.
   as it runs; and once the group is empty, another process can take its id
   as its pid and lead a group with it before the next check, and the
   supervisor then waits for that group too. Not covered: a process that
-  leaves the group (`setsid`, `setpgid`), and an earlier build's backstop
-  run by launchd as the pinned agent after an install rollback, whose group
+  leaves the group (`setsid`, `setpgid`); an earlier build's backstop run
+  by launchd as the pinned agent after an install rollback, whose group
   launchd signals when the job's main process exits, since the agent does
-  not set AbandonProcessGroup. Without an executable `/usr/bin/perl`
+  not set AbandonProcessGroup; an oldest copy in `$APP_SUPPORT` run by its
+  own older agent, which no script of this build starts; and this build's
+  backstop run by launchd, whose call supervisors and keepers are in the
+  job's group, so a signal launchd sends there that ends them all frees the
+  lock while a `sudo pmset` may still run. Which signal launchd sends there
+  was not measured: no test runs launchd. Without an executable `/usr/bin/perl`
   neither script starts the backstop (126, with the reason): `install.sh`
   stops, and `uninstall.sh` goes on to its own journal check. `install.sh`
   never reaches that step without perl, since root's access control list
@@ -215,28 +220,67 @@ recovery; newly written journals use `frozenProcesses`.
   journaled. A backstop sealed in a bundle from an earlier release ignores
   these variables and reads the Info.plist and the journal itself, without
   a limit on each read; only the 300 s limit applies to it.
-- Each bounded call in the three scripts has a process of its own that
-  keeps the recovery lock (fd 9), once the run holds it, until it has
-  reaped the call. That process makes the call's
-  output file with `mktemp` in the run's private folder, opens it twice,
-  removes its name before the call starts, reads it back through its own
-  descriptor once the call has ended (at most 1 MiB; a NUL byte is found
-  and reported), and sends the status and the text down a pipe. The caller
-  waits for the status within the call's limit and for the text no longer
-  than 5 s; text that does not come in time counts as not read back. The
-  app binary is the exception: it has to be a child of the backstop's own
-  shell, which makes and pins its two files and writes its input, as on
-  main; only the read-back of its answer runs in a process of its own.
+- Each bounded call in the three scripts has a process of its own that keeps
+  the recovery lock (fd 9), once the run holds it, until it has reaped the
+  call. The call's limit counts from that process's start, so making the
+  output file comes out of it: when that takes the whole limit, the call is
+  not made (126; a backstop read reports 124, as for a read that did not
+  answer). That process makes the call's output file with `mktemp` in the
+  run's private folder, opens it twice, removes its name before the call
+  starts, reads it back through its own descriptor once the call has ended
+  (at most 1 MiB; a NUL byte is found and reported), and sends the status
+  and the text down a pipe. The text goes in four fields (status, text, the
+  text before any NUL byte, `end`), and the process that ran the supervisor
+  then sends `settled 0` once it has reaped it. The caller waits for the
+  status within the call's limit and takes the text only when all of it,
+  `settled 0` and the end of the pipe come within 5 s. Anything else counts
+  as not read back and as a call that may still be running, whose process
+  may still hold the lock: a field cut short, a field too many, a supervisor
+  that ends with a status other than 0 after it sent plausible text, a pipe
+  another process still holds open, or nothing in time. The installers then
+  return 125; the backstop stops the run (125 for a power command, 124 for a
+  read). The app binary is the exception to the process of its own: it has
+  to be a direct child of the backstop's own shell. Its answer file is made
+  and pinned before the recovery lock, its input comes down a pipe from a
+  process of its own that writes the lines and exits, and the read-back of
+  its answer runs in a process of its own; under the lock that shell opens,
+  writes and reads no file for it. Notes of failed reads, which a check made
+  inside `$(...)` has to pass back, are written and read only by processes
+  of their own, each waited for no longer than 5 s and keeping fd 9 while it
+  runs. The private copy of a journal file (`snapshot`) is two bounded
+  calls, `rm` and then `cp -X`, and the empty copy is made and checked to be
+  a regular file by cp's own process before cp runs, inside cp's limit.
+  `sudo` closes its copy of fd 9, so for each `sudo` call in the installers,
+  and each command the backstop runs through `run_bounded` (`sudo pmset`,
+  `defaults`), the process first starts a keeper, a second holder of fd 9.
+  The call starts in a bash of its own that sends its pid to the keeper
+  before it runs the command with the same pid. The keeper exits when the
+  process says it has reaped the call; when the process is gone without
+  saying so (a SIGKILL), the keeper keeps the lock until no process has that
+  pid, checking every half second, and signals nothing. A pid taken by
+  another process before the next check keeps the lock longer, not shorter.
+  The installers' other calls keep their own copy of fd 9. So a SIGKILL to
+  the process alone no longer frees the lock while its call runs, and a
+  second Start or install waits. The backstop's reads close their copy, so a
+  SIGKILL to a read's process frees the lock while that read, which changes
+  nothing but its own output and private copy, ends. A signal that ends both
+  the process and its keeper (a SIGKILL to each) frees the lock while the
+  call may still run; that is not covered.
   Limits, not waived: between `mktemp` and the removal of the name, another
   process of this account can open the file, and a process the call left
   behind that still holds it can write to it after the read, unseen. The
-  backstop's main shell makes its own `mktemp`, `rm` and note writes in the
-  private folder, writes the log and publishes the journal, all without a
-  limit; a note whose write fails is lost. Each read costs about 3 ms more
-  than a direct read, and its first 10000 `kill -0` checks up to 25 to
-  50 ms of CPU time. A process that sent no status, one killed with
-  SIGKILL included, reads as still running (125), and a SIGKILL to it
-  frees its hold on the lock.
+  notes are files at a name in the private folder (mode 0700), not pinned
+  descriptors, so another process of this account can change one between its
+  write and its read. cp's process opens the copy's name with `1<>`, which
+  follows a link and makes a missing file. The backstop's main shell still
+  writes the log, publishes the journal with `mv` and removes its temporary
+  file, and its exit trap removes the private folder, all without a limit.
+  Kernel work that never returns (a stalled `mktemp` or open) keeps its
+  process, and the lock, for as long as it lasts. Costs on a test Mac: a
+  `plutil` read through the shared layer takes about 7 ms in the backstop
+  and 8.7 ms in uninstall (6.9 and 8.4 ms at 6526105), and a journal copy 12
+  ms and 16.5 ms (6.9 and 9.3 ms with one bounded `cp`); the first 10000
+  `kill -0` checks of a wait cost up to 25 to 50 ms of CPU time.
 - `uninstall.sh`'s own journal check reads each file once, by a bounded `cp`
   into a private directory, and runs every check on that copy, each with an
   explicit status that does not depend on `set -e`. A read that fails, is
@@ -1136,8 +1180,13 @@ Backstop, independent of the app:
   never a process that reused its pid. The pid the script logs is never
   signaled. The subshell ignores SIGTERM and SIGHUP, so neither the end of
   the agent's run nor launchd's signal to what is left of the job's process
-  group frees the lock while the command runs; a SIGKILL to the subshell
-  would. The app runs no `sudo pmset` outside a
+  group frees the lock while the command runs. Nor does a SIGKILL to the
+  subshell: before the command starts, the subshell starts a keeper, a
+  second holder of fd 9, which gets the command's pid from the command
+  itself and keeps the lock until the subshell reports the command reaped
+  or, with the subshell gone, until no process has that pid. A signal that
+  ends both the subshell and its keeper frees the lock while the command
+  may still run. The app runs no `sudo pmset` outside a
   transaction. Every one goes through `PmsetSleepGuard.sudoPmset`,
   including a check that runs a sudoers command only to see whether it
   passes. It reports the pid with the `sudo kill` command, in a menu line

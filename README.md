@@ -282,7 +282,14 @@ The `backstop.sh` the installer runs under the lock to end a stale session
 has a 300 s limit of its own. At the limit it gets SIGTERM only, never
 SIGKILL, since it may be running `sudo pmset`. Each `sudo pmset` or app
 binary call it started keeps the lock through its own supervisor until that
-call has exited, even if the backstop or the installer is killed first. The
+call has exited, even if the backstop or the installer is killed first. A
+`sudo pmset` also has a keeper, a second process that holds the lock until
+its supervisor says the call has been reaped or, if a SIGKILL ended the
+supervisor, until no process has the call's pid, so a SIGKILL to the
+supervisor alone does not free the lock either. A signal that ends both
+does. When launchd runs the backstop, both are in the job's process group,
+which launchd signals once the backstop has exited; which signal it sends
+was not measured. The
 backstop leads a process group of its own, which everything it starts stays
 in unless it leaves it, so closing the Terminal window does not reach them:
 the backstop runs to its end or its limit with the lock held, and the
