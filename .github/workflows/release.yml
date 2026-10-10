@@ -1,52 +1,145 @@
 name: Release
 
-# Builds the downloadable Insomnia package and, for a version tag, publishes
-# it as a GitHub Release. docs/releasing.md walks through a release.
+# Builds the downloadable Insomnia package and publishes it on one of two
+# channels. docs/releasing.md walks through both.
 #
 # Triggers
-#   push of a tag v<version>  test, build, package, attest, publish a GitHub
-#                             Release. <version> must equal
-#                             CFBundleShortVersionString in Resources/Info.plist.
+#   push of a tag v<version>  stable: test, build, package, attest, publish a
+#                             GitHub Release marked Latest. <version> must
+#                             equal CFBundleShortVersionString in
+#                             Resources/Info.plist.
+#   schedule, daily           nightly: the same for the head of main, published
+#                             as a prerelease that is never Latest, under a new
+#                             tag nightly-<UTC date>-<first 12 hex digits of
+#                             the commit>. A commit that already has a nightly
+#                             is skipped before anything is built.
 #   workflow_dispatch         test, build and package only; the zip and
 #                             SHA256SUMS are uploaded as a workflow artifact.
-#                             Nothing is attested or published.
+#                             Nothing is attested or published. With the
+#                             nightly input set, it is a nightly run instead,
+#                             and only on main.
 #
 # The bundle is ad-hoc signed and not notarized (build-app.sh), so the run
-# uses no secrets and no keychain. The release is a prerelease. Every action
-# is pinned to a commit.
+# uses no secrets and no keychain. Every action is pinned to a commit.
 
 on:
   push:
     tags: ['v*']
+  schedule:
+    # 07:17 UTC. GitHub delays scheduled runs most at the start of the hour.
+    - cron: '17 7 * * *'
   workflow_dispatch:
+    inputs:
+      nightly:
+        description: Publish a nightly prerelease of this commit (main only; skipped if it already has one)
+        type: boolean
+        default: false
 
 # Nothing at the top level; each job declares exactly what it needs.
 permissions: {}
 
-# One run per tag; a rerun waits instead of cancelling a publish in progress.
+# One run per ref; a rerun waits instead of cancelling a publish in progress.
+# Scheduled and manual runs on main share a group, so two nightlies of one
+# commit never race.
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
+  plan:
+    name: Choose the channel
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    # Reads tags and releases to skip a commit that already has a nightly.
+    permissions:
+      contents: read
+    outputs:
+      channel: ${{ steps.plan.outputs.channel }}
+      build: ${{ steps.plan.outputs.build }}
+      tag: ${{ steps.plan.outputs.tag }}
+    steps:
+      - name: Choose the channel, and the tag for a nightly
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          NIGHTLY_INPUT: ${{ inputs.nightly }}
+        run: |
+          case "$EVENT" in
+            push)
+              # The trigger matches v* tags only.
+              printf 'channel=stable\nbuild=true\n' >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+            workflow_dispatch)
+              if [[ "$NIGHTLY_INPUT" != true ]]; then
+                printf 'channel=artifact\nbuild=true\n' >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              ;;
+            schedule) ;;
+            *)
+              echo "unexpected event $EVENT" >&2
+              exit 1
+              ;;
+          esac
+          if [[ "$GITHUB_REF" != refs/heads/main ]]; then
+            echo "A nightly is built from main only, not $GITHUB_REF. Nothing was built or published." >&2
+            exit 1
+          fi
+          sha12="${GITHUB_SHA:0:12}"
+          # Nightly tags of this commit. The workflow makes lightweight
+          # tags, so each ref names the commit itself.
+          refs="$(gh api --paginate "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/nightly-" --jq '.[] | "\(.ref) \(.object.sha)"')"
+          releases="$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq '.[].tag_name')"
+          while read -r ref sha; do
+            [[ "$ref" =~ ^refs/tags/nightly-[0-9]{8}-${sha12}$ ]] || continue
+            tag="${ref#refs/tags/}"
+            if [[ "$sha" != "$GITHUB_SHA" ]]; then
+              echo "tag $tag points at $sha, not $GITHUB_SHA. Nothing was built or published." >&2
+              exit 1
+            fi
+            if grep -qxF "$tag" <<< "$releases"; then
+              echo "$GITHUB_SHA already has the nightly $tag. Nothing to build."
+              printf 'channel=nightly\nbuild=false\n' >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "tag $tag exists but has no release. Rerun the failed jobs of the run that made it, or delete the tag; nothing was built or published." >&2
+            exit 1
+          done <<< "$refs"
+          tag="nightly-$(date -u +%Y%m%d)-$sha12"
+          echo "nightly $tag for $GITHUB_SHA"
+          printf 'channel=nightly\nbuild=true\ntag=%s\n' "$tag" >> "$GITHUB_OUTPUT"
+
   build:
     name: Test, build and package (macOS 26)
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
     runs-on: macos-26
     timeout-minutes: 60
-    # Read-only: only the release job below may write.
+    # Read-only: only the publishing jobs below may write.
     permissions:
       contents: read
     outputs:
       version: ${{ steps.version.outputs.version }}
+      package: ${{ steps.version.outputs.package }}
     steps:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Read the version and check the tag against it
+      - name: Read the version, check the tag against it and name the package
         id: version
+        env:
+          CHANNEL: ${{ needs.plan.outputs.channel }}
+          NIGHTLY_TAG: ${{ needs.plan.outputs.tag }}
         run: |
+          head="$(git rev-parse HEAD)"
+          if [[ "$head" != "$GITHUB_SHA" ]]; then
+            echo "checked out $head, not $GITHUB_SHA" >&2
+            exit 1
+          fi
           version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Resources/Info.plist)"
           case "$GITHUB_REF" in
             refs/tags/v*)
@@ -57,8 +150,18 @@ jobs:
               fi
               ;;
           esac
+          package="Insomnia-$version-macos"
+          if [[ "$CHANNEL" == nightly ]]; then
+            want="^nightly-[0-9]{8}-${GITHUB_SHA:0:12}\$"
+            if [[ ! "$NIGHTLY_TAG" =~ $want ]]; then
+              echo "nightly tag '$NIGHTLY_TAG' does not name $GITHUB_SHA" >&2
+              exit 1
+            fi
+            package="Insomnia-$version-$NIGHTLY_TAG-macos"
+          fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "Insomnia $version"
+          echo "package=$package" >> "$GITHUB_OUTPUT"
+          echo "Insomnia $version, $CHANNEL, package $package"
 
       - name: Print toolchain versions
         run: |
@@ -98,9 +201,9 @@ jobs:
 
       - name: Package
         env:
-          VERSION: ${{ steps.version.outputs.version }}
+          PACKAGE: ${{ steps.version.outputs.package }}
         run: |
-          pkg="Insomnia-$VERSION-macos"
+          pkg="$PACKAGE"
           mkdir -p "release/$pkg"
           /usr/bin/ditto dist/Insomnia.app "release/$pkg/Insomnia.app"
           cp scripts/install.sh scripts/uninstall.sh "release/$pkg/"
@@ -113,14 +216,14 @@ jobs:
       - name: Upload the package as a workflow artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: Insomnia-${{ steps.version.outputs.version }}-macos
+          name: ${{ steps.version.outputs.package }}
           path: |
             release/*.zip
             release/SHA256SUMS
           if-no-files-found: error
 
-  release:
-    name: Attest and publish the GitHub Release
+  stable:
+    name: Attest and publish the stable release
     needs: build
     # Pushed tags only. A manual run stops at the artifact, even one started
     # on a tag ref, which a check of the ref alone would let through.
@@ -137,7 +240,7 @@ jobs:
       - name: Download the package
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: Insomnia-${{ needs.build.outputs.version }}-macos
+          name: ${{ needs.build.outputs.package }}
           path: release
 
       - name: Attest build provenance
@@ -149,7 +252,7 @@ jobs:
         run: |
           zip="$(basename release/*.zip)"
           sum="$(cut -d' ' -f1 release/SHA256SUMS)"
-          signing="Prerelease: ad-hoc signed and not notarized, so macOS blocks the first launch until you allow it in System Settings > Privacy & Security. The checksum and attestation below show this zip is what the Release workflow built from the tagged commit."
+          signing="Stable release. Ad-hoc signed and not notarized, so macOS blocks the first launch until you allow it in System Settings > Privacy & Security. The checksum and attestation below show this zip is what the Release workflow built from the tagged commit."
           install_note="The installer checks the bundle's signature, identifier and version before asking for your password, but it cannot verify where this bundle came from: that is what the checksum and the attestation above are for, and \`--allow-unverified-origin\` says you checked them. It then installs the app, the recovery agent and the sudoers rule described in the README."
           {
             echo "Insomnia $VERSION for Apple Silicon Macs with macOS 26 or later. The app is built for arm64 only, so the installer stops on an Intel Mac."
@@ -160,10 +263,10 @@ jobs:
             echo
             echo '```bash'
             echo "shasum -a 256 -c SHA256SUMS"
-            echo "gh attestation verify $zip -R $GITHUB_REPOSITORY --signer-workflow $GITHUB_REPOSITORY/.github/workflows/release.yml --source-ref $GITHUB_REF"
+            echo "gh attestation verify $zip -R $GITHUB_REPOSITORY --signer-workflow $GITHUB_REPOSITORY/.github/workflows/release.yml --source-ref $GITHUB_REF --source-digest $GITHUB_SHA"
             echo '```'
             echo
-            echo "The second command checks that this zip is the subject of an attestation signed by this repository's Release workflow for the tag \`$GITHUB_REF_NAME\`, not by just any workflow of this repository."
+            echo "The second command checks that this zip is the subject of an attestation signed by this repository's Release workflow for the tag \`$GITHUB_REF_NAME\` at commit \`$GITHUB_SHA\`, not by just any workflow of this repository, and not for a nightly build of main."
             echo
             echo "SHA-256 of \`$zip\`: \`$sum\`"
             echo
@@ -188,7 +291,104 @@ jobs:
         run: |
           gh release create "$GITHUB_REF_NAME" release/*.zip release/SHA256SUMS \
             --repo "$GITHUB_REPOSITORY" \
-            --title "Insomnia $VERSION" \
+            --title "Insomnia $VERSION (stable)" \
             --notes-file notes.md \
             --verify-tag \
-            --prerelease
+            --latest
+
+  nightly:
+    name: Attest and publish the nightly prerelease
+    needs: [plan, build]
+    # Scheduled runs, and manual runs with the nightly input, on main only;
+    # the plan job has already refused any other ref.
+    if: needs.plan.outputs.channel == 'nightly' && github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write      # create the tag and the release, upload its assets
+      id-token: write      # sign the provenance statement (Sigstore)
+      attestations: write  # store the attestation on the repository
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+      TAG: ${{ needs.plan.outputs.tag }}
+    steps:
+      - name: Download the package
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.build.outputs.package }}
+          path: release
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: release/*.zip
+
+      - name: Write the release notes
+        run: |
+          zip="$(basename release/*.zip)"
+          sum="$(cut -d' ' -f1 release/SHA256SUMS)"
+          channel="Nightly prerelease: an automatic build of \`main\` at \`$GITHUB_SHA\`, for trying the newest changes. Nobody chose this commit as a release, it may be broken, and it is never marked Latest. The latest stable release is at $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/latest."
+          version_note="The app reports version $VERSION, the version in Resources/Info.plist at that commit, so the app itself does not tell nightlies apart. The tag \`$TAG\` and the zip's name identify this build."
+          signing="Ad-hoc signed and not notarized, so macOS blocks the first launch until you allow it in System Settings > Privacy & Security. The checksum and attestation below show this zip is what the Release workflow built from that commit of main."
+          install_note="The installer checks the bundle's signature, identifier and version before asking for your password, but it cannot verify where this bundle came from: that is what the checksum and the attestation above are for, and \`--allow-unverified-origin\` says you checked them. It then installs the app, the recovery agent and the sudoers rule described in the README."
+          {
+            echo "Insomnia $VERSION for Apple Silicon Macs with macOS 26 or later. The app is built for arm64 only, so the installer stops on an Intel Mac."
+            echo
+            echo "$channel"
+            echo
+            echo "$version_note"
+            echo
+            echo "$signing"
+            echo
+            echo "## Verify the download"
+            echo
+            echo '```bash'
+            echo "shasum -a 256 -c SHA256SUMS"
+            echo "gh attestation verify $zip -R $GITHUB_REPOSITORY --signer-workflow $GITHUB_REPOSITORY/.github/workflows/release.yml --source-ref $GITHUB_REF --source-digest $GITHUB_SHA"
+            echo '```'
+            echo
+            echo "The second command checks that this zip is the subject of an attestation signed by this repository's Release workflow for \`$GITHUB_REF\` at commit \`$GITHUB_SHA\`, not by just any workflow of this repository, and not for a stable tag."
+            echo
+            echo "SHA-256 of \`$zip\`: \`$sum\`"
+            echo
+            echo "## Install"
+            echo
+            echo '```bash'
+            echo "ditto -x -k $zip ."
+            echo "cd ${zip%.zip}"
+            echo "./install.sh --allow-unverified-origin --app ./Insomnia.app"
+            echo "open \"\$HOME/Applications/Insomnia.app\""
+            echo '```'
+            echo
+            echo "$install_note"
+            echo
+            echo "Built from \`$GITHUB_SHA\` by run $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID."
+          } > notes.md
+          cat notes.md
+
+      - name: Create the tag and the prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Creating a ref fails when it exists, so two runs never share a
+          # tag and an existing one is never moved. A rerun of this job after
+          # a failed release step finds the tag it made on this commit.
+          if ! gh api "repos/$GITHUB_REPOSITORY/git/refs" -f "ref=refs/tags/$TAG" -f "sha=$GITHUB_SHA" --silent; then
+            at="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq '.object.sha')"
+            if [[ "$at" != "$GITHUB_SHA" ]]; then
+              echo "tag $TAG points at $at, not $GITHUB_SHA. Nothing was published." >&2
+              exit 1
+            fi
+            echo "tag $TAG already points at $GITHUB_SHA"
+          fi
+          day="${TAG#nightly-}"
+          day="${day%%-*}"
+          # gh release create fails if the tag already has a release, so a
+          # published nightly's assets are never replaced.
+          gh release create "$TAG" release/*.zip release/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Insomnia nightly ${day:0:4}-${day:4:2}-${day:6:2} (${GITHUB_SHA:0:12})" \
+            --notes-file notes.md \
+            --verify-tag \
+            --prerelease \
+            --latest=false

@@ -253,6 +253,8 @@ is performed. Do not replace "not run" with "passed" based on source review.
 | `install.sh` and `uninstall.sh` from a release zip unpacked in `/tmp`, with a `build-app.sh` and a `backstop.sh` added to the unpacked folder, run neither (install without `--app` stops, uninstall runs the sealed copy), on a working Mac | Not run |
 | `install.sh --app` from a release zip stops with the Apple Silicon message on an Intel Mac, and installs on an Apple Silicon Mac from a Terminal running under Rosetta | Not run |
 | Release workflow end to end: tag push, tests, package, attestation, GitHub Release, `gh attestation verify` of the download | Not run |
+| Nightly channel end to end: scheduled run on `main`, tag `nightly-<date>-<commit>` created by the workflow, prerelease not marked Latest, `gh attestation verify --source-ref refs/heads/main --source-digest <commit>` of the download, and a second run on the same commit skipped before building | Not run |
+| `v0.1.0` zip (hand-packaged from the installed app): `./scripts/install.sh --app ./Insomnia.app` on a working Mac, first launch, and `./scripts/uninstall.sh` from the unpacked folder | Not run |
 | Install or uninstall whose own process is killed (`kill -9 <pid>`) during a `launchctl bootout` keeps the recovery lock until that bootout has ended or been stopped, about 33 s at most, and the app started afterwards keeps its agent loaded, on a working Mac | Not run |
 | First launch over an existing install tightens Application Support/Insomnia and Logs/Insomnia to 0700 and their files to 0600 | Not run |
 | Launch at login survives a reinstall by install.sh, including a second install.sh run on the same unchanged build (switch on, reinstall, relaunch: the log shows the launch-time check, System Settings > General > Login Items lists Insomnia as enabled, and the Settings switch reads on; a pending approval shows the note and the Open Login Items button) | Not run |
@@ -281,14 +283,18 @@ working Mac.
 ## Distribution boundary
 
 Packaging is automated: `scripts/build-app.sh` makes the bundle, and the
-Release workflow tests, packages, checksums, attests and publishes it for a
-`v*` tag (`docs/releasing.md`). PackagingTests run a patched copy of
-`build-app.sh` with the real codesign, RecoveryScriptTests run `install.sh
---app` against prebuilt fixtures, one of them ad-hoc signed by the real
-codesign, and ReleaseWorkflowTests check that every action in the workflows
-is pinned to a commit and that no job has more than read access except the
-one that publishes. No release has been produced with it yet. Releases are
-ad-hoc signed and not notarized, published as prereleases. A consumer
-installation and recovery walkthrough from a downloaded zip has not
-been done. Open-source availability and a passing PR are not equivalent to
-readiness for a public binary release.
+Release workflow tests, packages, checksums, attests and publishes it, as a
+stable release for a `v*` tag and as a nightly prerelease of `main` once a
+day when it has new commits (`docs/releasing.md`). PackagingTests run a
+patched copy of `build-app.sh` with the real codesign, RecoveryScriptTests
+run `install.sh --app` against prebuilt fixtures, one of them ad-hoc signed
+by the real codesign, and ReleaseWorkflowTests check that every action in the
+workflows is pinned to a commit and that no job has more than read access
+except the ones that publish. No release has been produced with it yet.
+Releases are ad-hoc signed and not notarized; stable releases are marked
+Latest, and nightlies are prereleases never marked Latest. The first stable
+release, `v0.1.0`, was packaged by hand from the maintainer's installed app,
+not by the workflow, and has no attestation. A consumer installation and
+recovery walkthrough from a downloaded zip has not been done. Open-source
+availability and a passing PR are not equivalent to readiness for a public
+binary release.

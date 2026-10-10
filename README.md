@@ -40,35 +40,70 @@
 
 Requires **macOS 26 or later on an Apple Silicon Mac**.
 
+Insomnia is published on two channels on the
+[releases page](https://github.com/krishhgg/Insomnia/releases):
+
+- Stable: the release GitHub marks Latest, tagged `v<version>`. Use this one
+  unless you want to try changes that are not in a stable release yet.
+- Nightly: prereleases tagged `nightly-<date>-<commit>`, built automatically
+  from `main` once a day when it has new commits. Newest code, experimental,
+  and possibly broken. A nightly is never marked Latest.
+
+Each release's notes give the exact commands for that release. One release
+differs from the steps below: `v0.1.0`, the first stable release, was packaged
+by hand from the maintainer's installed app, not by the Release workflow. It
+has no attestation, and its zip installs with
+`./scripts/install.sh --app ./Insomnia.app`. If the release you picked is
+`v0.1.0` (its zip is `Insomnia-0.1.0-macos-arm64.zip`), follow the install
+steps in its release notes instead of steps 2 and 3.
+
 Paste this into your coding agent:
 
 ```text
-Install Insomnia from https://github.com/krishhgg/Insomnia by following its README. If a step needs my password, give me the command to run in Terminal.
+Install the latest stable Insomnia release from https://github.com/krishhgg/Insomnia by following its README. If a step needs my password, give me the command to run in Terminal.
 ```
 
-Or run it yourself:
+For the newest nightly instead, write "the newest Insomnia nightly
+prerelease" in place of "the latest stable Insomnia release".
 
-1. Download `Insomnia-<version>-macos.zip` and `SHA256SUMS` from the newest
-   release on the [releases page](https://github.com/krishhgg/Insomnia/releases)
-   (releases are marked Pre-release). If the page has no release yet, build
-   from source (below).
-2. Verify the download (`gh` is the [GitHub CLI](https://cli.github.com)):
+Or run it yourself (`gh` is the [GitHub CLI](https://cli.github.com)):
+
+1. Download the zip and `SHA256SUMS` of the release you chose into an empty
+   folder, from the releases page or with `gh`:
+
+   ```bash
+   # Stable: the release marked Latest
+   gh release download --repo krishhgg/Insomnia --pattern '*.zip' --pattern SHA256SUMS
+
+   # Nightly: the newest nightly prerelease
+   tag="$(gh release list --repo krishhgg/Insomnia --exclude-drafts --limit 100 \
+     --json tagName,isPrerelease,publishedAt \
+     --jq '[.[] | select(.isPrerelease and (.tagName | startswith("nightly-")))] | sort_by(.publishedAt) | last | .tagName')"
+   gh release download "$tag" --repo krishhgg/Insomnia --pattern '*.zip' --pattern SHA256SUMS
+   ```
+
+   If the releases page has no release yet, build from source (below).
+2. Verify the download. `<zip>` is the zip's file name, and `<ref>` is
+   `refs/tags/v<version>` for a stable release or `refs/heads/main` for a
+   nightly:
 
    ```bash
    shasum -a 256 -c SHA256SUMS
-   gh attestation verify Insomnia-<version>-macos.zip -R krishhgg/Insomnia \
+   gh attestation verify <zip> -R krishhgg/Insomnia \
      --signer-workflow krishhgg/Insomnia/.github/workflows/release.yml \
-     --source-ref refs/tags/v<version>
+     --source-ref <ref>
    ```
 
    The second command checks that this repository's Release workflow built
-   this exact zip for that tag.
+   this exact zip for that ref, so a nightly cannot pass for a stable
+   release. The command in the release notes also adds `--source-digest`
+   with the commit, which pins the zip to that commit.
 
 3. Unzip and run the installer that comes in the zip:
 
    ```bash
-   ditto -x -k Insomnia-<version>-macos.zip .
-   cd Insomnia-<version>-macos
+   ditto -x -k <zip> .
+   cd <the zip's name without .zip>
    ./install.sh --allow-unverified-origin --app ./Insomnia.app
    open "$HOME/Applications/Insomnia.app"
    ```
@@ -91,9 +126,9 @@ it is untested there.
 
 ### Build from source (experimental)
 
-Requires **Xcode with Swift 6.2 or later**. Clone the newest release tag
-rather than `main`. While no release exists, leave out `--branch v<version>`
-to build `main`:
+Requires **Xcode with Swift 6.2 or later**. Clone the latest stable tag, or a
+nightly tag for the newest code, rather than `main`. If the releases page has
+no release yet, leave out `--branch v<version>` to build `main`:
 
 ```bash
 git clone --branch v<version> --depth 1 https://github.com/krishhgg/Insomnia.git
@@ -107,7 +142,8 @@ open "$HOME/Applications/Insomnia.app"
 builds only when it runs from a checkout's `scripts` folder, with
 `Package.swift` one level up, and then runs the `build-app.sh` beside it. The
 `install.sh` from a release zip stops and asks for `--app` instead, even when
-a `build-app.sh` was added to its folder after unpacking.
+a `build-app.sh` was added to its folder after unpacking. A checkout of
+`v0.1.0` has the installer of that release; its README describes it.
 [docs/releasing.md](docs/releasing.md) describes the release pipeline.
 
 <details>
@@ -596,13 +632,17 @@ From your checkout:
 ```
 
 From the unpacked release zip, run `./uninstall.sh` (or `./uninstall.sh
---purge`) in the `Insomnia-<version>-macos` folder. A checkout's uninstaller
-(in `scripts`, with `Package.swift` one level up) runs the `backstop.sh`
-beside it. Anywhere else, such as the zip's folder, the uninstaller runs only
-the copy sealed in the installed app, after `codesign --verify --strict`
-passes on the app, and stops without removing anything when there is none.
-The zip has no `backstop.sh`, so one added beside its uninstaller is not run.
-Neither looks in the folder above its own.
+--purge`) in its folder (`Insomnia-<version>-macos`, or the nightly name). A
+checkout's uninstaller (in `scripts`, with `Package.swift` one level up) runs
+the `backstop.sh` beside it. Anywhere else, such as the zip's folder, the
+uninstaller runs only the copy sealed in the installed app, after `codesign
+--verify --strict` passes on the app, and stops without removing anything
+when there is none. The zip has no `backstop.sh`, so one added beside its
+uninstaller is not run. Neither looks in the folder above its own.
+
+The `v0.1.0` zip is different: run `./scripts/uninstall.sh` in its unpacked
+`Insomnia-0.1.0-macos-arm64` folder, as its release notes say. That older
+uninstaller runs the `scripts/backstop.sh` in the same folder.
 
 The uninstaller requests cleanup before removing the app, agent, and sudoers
 rule. If recovery is incomplete or the app refuses to quit, it stops; resolve

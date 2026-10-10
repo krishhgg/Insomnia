@@ -59,19 +59,31 @@ tampered bundle; they are not a boundary against a process running as the
 same user, which can edit the plist, load its own agent, replace and relaunch
 the app, and invoke the four pmset commands directly.
 
-Release zips are built by the Release workflow from the tagged commit and
-published with a `SHA256SUMS` file and a GitHub build provenance attestation.
-Verify both before installing (`shasum -a 256 -c SHA256SUMS`,
+Release zips on both channels, stable releases (`v<version>` tags) and
+nightly prereleases (`nightly-*` tags built from `main`), are built by the
+Release workflow from the commit they name and published with a
+`SHA256SUMS` file and a GitHub build provenance attestation. Verify both
+before installing (`shasum -a 256 -c SHA256SUMS`,
 `gh attestation verify <zip> -R krishhgg/Insomnia --signer-workflow
-krishhgg/Insomnia/.github/workflows/release.yml --source-ref
-refs/tags/v<version>`); `install.sh --app` then checks the signature,
-identifier and version of a private copy of the bundle before asking for a
-password, installs that copy, and refuses
+krishhgg/Insomnia/.github/workflows/release.yml --source-ref <ref>
+--source-digest <commit>`, with `refs/tags/v<version>` or `refs/heads/main`
+as the ref; the release notes carry the command filled in). `install.sh
+--app` then checks the signature, identifier and version of a private copy
+of the bundle before asking for a password, installs that copy, and refuses
 it unless `--allow-unverified-origin` is given, because it cannot verify where
 a bundle came from, whatever its signature names. The attestation shows which workflow run produced
 the bytes, not that the code is free of defects. Releases are ad-hoc signed and
 not notarized ([docs/releasing.md](docs/releasing.md)), so macOS blocks their
 first launch.
+
+The first stable release, `v0.1.0`, is the exception. It was packaged by hand
+from the app installed on the maintainer's Mac, so it has no attestation: the
+`SHA256SUMS` file and the per-file hashes in its release notes are the only
+check on the download. Its `scripts/install.sh --app` runs
+`codesign --verify --strict --deep` and checks the bundle identifier before
+the password prompt, but it has no `--allow-unverified-origin` opt-in: it
+installs any intact bundle it is given that has that identifier and the
+0.1.0 layout.
 
 Passing automated checks or a secret scan does not establish the absence of
 vulnerabilities. Do not probe recovery by disrupting someone else's processes,

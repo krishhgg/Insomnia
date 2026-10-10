@@ -3,9 +3,11 @@ import XCTest
 
 /// Static checks on .github/workflows/*.yml: every action is pinned to a
 /// commit SHA with its version alongside, and no job runs with the default
-/// token permissions. release.yml gets a few more: its triggers, that a
-/// manual run never publishes, and that only the publishing job can write.
-/// Plain text checks; the files are small and have no YAML anchors.
+/// token permissions. release.yml gets a few more: its triggers, that only a
+/// pushed v* tag publishes a stable release and only main a nightly, that the
+/// two channels never share their release flags, and that only the
+/// publishing jobs can write. Plain text checks; the files are small and
+/// have no YAML anchors.
 final class ReleaseWorkflowTests: XCTestCase {
     private var workflowsDir: URL {
         URL(fileURLWithPath: #filePath)
@@ -20,6 +22,59 @@ final class ReleaseWorkflowTests: XCTestCase {
     }
 
     private func lines(_ text: String) -> [String] { text.components(separatedBy: "\n") }
+
+    private func releaseWorkflow() throws -> String {
+        try XCTUnwrap(try workflows().first { $0.name == "release.yml" }).text
+    }
+
+    /// release.yml's jobs by id, each with its lines up to the next job.
+    private func releaseJobs() throws -> [String: [String]] {
+        let ls = lines(try releaseWorkflow())
+        let start = try XCTUnwrap(ls.firstIndex(of: "jobs:"), "release.yml has no jobs")
+        var jobs: [String: [String]] = [:]
+        var current: String?
+        for line in ls[(start + 1)...] {
+            if line.range(of: #"^  [A-Za-z_][\w-]*:\s*$"#, options: .regularExpression) != nil {
+                let id = String(line.trimmingCharacters(in: .whitespaces).dropLast())
+                XCTAssertNil(jobs[id], "job \(id) appears twice")
+                jobs[id] = []
+                current = id
+            } else if let current {
+                jobs[current, default: []].append(line)
+            }
+        }
+        return jobs
+    }
+
+    private func job(_ id: String) throws -> [String] {
+        try XCTUnwrap(try releaseJobs()[id], "release.yml has no job \(id)")
+    }
+
+    /// The flags of the job's one `gh release create` command (comments
+    /// that name it aside), continuation lines included.
+    private func releaseCreateFlags(_ body: [String]) throws -> [String] {
+        let starts = body.indices.filter { body[$0].trimmingCharacters(in: .whitespaces).hasPrefix("gh release create ") }
+        XCTAssertEqual(starts.count, 1, "one gh release create")
+        var command: [String] = []
+        for line in body[try XCTUnwrap(starts.first)...] {
+            command.append(line)
+            if !line.hasSuffix("\\") { break }
+        }
+        return command.joined(separator: " ").split(separator: " ").map(String.init).filter { $0.hasPrefix("--") }
+    }
+
+    /// The scopes of the job's one `permissions:` block, comments dropped.
+    /// A scope added on any later line, or an inline map or write-all in
+    /// place of the block, fails the caller's comparison.
+    private func permissionScopes(_ body: [String], job id: String) throws -> [String] {
+        let keys = body.indices.filter { body[$0].hasPrefix("    permissions:") }
+        XCTAssertEqual(keys.count, 1, "one permissions key in the \(id) job")
+        let key = try XCTUnwrap(keys.first)
+        XCTAssertEqual(body[key], "    permissions:", "\(id): a block, not an inline map or write-all")
+        return body[(key + 1)...]
+            .prefix { $0.hasPrefix("      ") }
+            .map { $0.split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false)[0].trimmingCharacters(in: .whitespaces) }
+    }
 
     func testEveryActionIsPinnedToACommitSHAWithItsVersionNoted() throws {
         let pinned = try NSRegularExpression(pattern: #"^\s*-?\s*uses:\s*[\w.-]+/[\w./-]+@[0-9a-f]{40}\s+#\s*v\d+(\.\d+)*\s*$"#)
@@ -65,22 +120,60 @@ final class ReleaseWorkflowTests: XCTestCase {
         }
     }
 
-    func testReleaseWorkflowRunsOnVersionTagsAndManuallyButOnlyTagsPublish() throws {
-        let text = try XCTUnwrap(try workflows().first { $0.name == "release.yml" }).text
+    func testReleaseWorkflowTriggersAndWhatEachOnePublishes() throws {
+        let text = try releaseWorkflow()
         XCTAssertTrue(text.contains("tags: ['v*']") || text.contains("tags: [\"v*\"]"), "runs on v* tags")
+        XCTAssertTrue(text.contains("\n  schedule:\n") && text.contains("\n    - cron: '"), "runs daily for the nightly")
         XCTAssertTrue(text.contains("workflow_dispatch:"), "can be run by hand")
+        XCTAssertTrue(text.contains("    inputs:\n      nightly:\n        description: "), "a manual run can ask for a nightly")
+        XCTAssertTrue(text.contains("        type: boolean\n        default: false\n"), "a manual run publishes nothing unless asked")
         XCTAssertFalse(text.contains("pull_request"), "never runs for pull requests")
-        XCTAssertTrue(text.contains("if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')"), "publishing is gated on a pushed tag, not on a manual run that happens to use a tag ref")
-        XCTAssertTrue(text.contains("--signer-workflow $GITHUB_REPOSITORY/.github/workflows/release.yml --source-ref $GITHUB_REF"), "the notes pin the verify command to this workflow and the tag")
-        XCTAssertTrue(text.contains(#"echo "./install.sh --allow-unverified-origin --app ./Insomnia.app""#), "the notes' install command carries the origin opt-in install.sh needs for an ad-hoc bundle")
         XCTAssertTrue(text.contains("permissions: {}"), "nothing at the top level")
-        XCTAssertTrue(text.contains("--prerelease"), "ad-hoc releases are marked prerelease")
-        XCTAssertTrue(text.contains("attest-build-provenance"), "build provenance is attested")
+        XCTAssertEqual(Set(try releaseJobs().keys), ["plan", "build", "stable", "nightly"])
+
+        let plan = try job("plan").joined(separator: "\n")
+        XCTAssertTrue(plan.contains(#"if [[ "$NIGHTLY_INPUT" != true ]]; then\#n                printf 'channel=artifact\nbuild=true\n' >> "$GITHUB_OUTPUT""#), "a manual run without the input only builds")
+        XCTAssertTrue(plan.contains(#"if [[ "$GITHUB_REF" != refs/heads/main ]]; then"#), "a nightly from any other ref stops before building")
+        XCTAssertTrue(try job("build").contains("    if: needs.plan.outputs.build == 'true'"), "nothing is built when the plan says so")
+
+        let stable = try job("stable")
+        let nightly = try job("nightly")
+        XCTAssertTrue(stable.contains("    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')"), "a stable release is gated on a pushed tag, not on a manual run that happens to use a tag ref")
+        XCTAssertTrue(nightly.contains("    if: needs.plan.outputs.channel == 'nightly' && github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')"), "a nightly is gated on main and on a scheduled or manual run")
+        for (id, body) in [("stable", stable.joined(separator: "\n")), ("nightly", nightly.joined(separator: "\n"))] {
+            XCTAssertTrue(body.contains("--signer-workflow $GITHUB_REPOSITORY/.github/workflows/release.yml --source-ref $GITHUB_REF --source-digest $GITHUB_SHA"), "\(id): the notes pin the verify command to this workflow, the ref and the commit")
+            XCTAssertTrue(body.contains(#"echo "./install.sh --allow-unverified-origin --app ./Insomnia.app""#), "\(id): the notes' install command carries the origin opt-in install.sh needs for an ad-hoc bundle")
+            XCTAssertTrue(body.contains("attest-build-provenance"), "\(id): build provenance is attested")
+        }
         XCTAssertTrue(text.contains("shasum -a 256"), "a checksum file is produced")
         XCTAssertTrue(text.contains("ditto -c -k --sequesterRsrc --keepParent"), "zipped the way Finder expects")
         XCTAssertTrue(text.contains("CFBundleShortVersionString"), "the tag is checked against the bundle version")
         XCTAssertTrue(text.contains("scripts/build-app.sh --output"), "built with the same script as install.sh")
         XCTAssertFalse(text.contains("--allow-unsigned"), "no Gatekeeper workarounds")
+    }
+
+    /// A stable release is Latest and never a prerelease. A nightly is a
+    /// prerelease, never Latest, under a new tag that names its date and
+    /// commit; the workflow creates that tag with the call that fails when
+    /// it exists, and nothing in the workflow moves, deletes or replaces a
+    /// tag, a release or an asset.
+    func testStableAndNightlyNeverShareTheirReleaseFlags() throws {
+        XCTAssertEqual(try releaseCreateFlags(try job("stable")), ["--repo", "--title", "--notes-file", "--verify-tag", "--latest"])
+        XCTAssertEqual(try releaseCreateFlags(try job("nightly")), ["--repo", "--title", "--notes-file", "--verify-tag", "--prerelease", "--latest=false"])
+        let plan = try job("plan").joined(separator: "\n")
+        XCTAssertTrue(plan.contains(#"sha12="${GITHUB_SHA:0:12}""#))
+        XCTAssertTrue(plan.contains(#"tag="nightly-$(date -u +%Y%m%d)-$sha12""#), "the nightly tag names the UTC date and the commit")
+        XCTAssertTrue(plan.contains(#"matching-refs/tags/nightly-"#), "existing nightly tags are looked up")
+        XCTAssertTrue(plan.contains(#"printf 'channel=nightly\nbuild=false\n' >> "$GITHUB_OUTPUT""#), "a commit that already has a nightly is skipped")
+        let build = try job("build").joined(separator: "\n")
+        XCTAssertTrue(build.contains(#"want="^nightly-[0-9]{8}-${GITHUB_SHA:0:12}\$""#), "the build checks the tag names the commit it built")
+        XCTAssertTrue(build.contains(#"package="Insomnia-$version-$NIGHTLY_TAG-macos""#), "a nightly zip carries its tag in its name")
+        let nightly = try job("nightly").joined(separator: "\n")
+        XCTAssertTrue(nightly.contains(#"gh api "repos/$GITHUB_REPOSITORY/git/refs" -f "ref=refs/tags/$TAG" -f "sha=$GITHUB_SHA""#), "the tag is created on the built commit, failing if it exists")
+        let text = try releaseWorkflow()
+        for absent in ["force", "PATCH", "DELETE", "--clobber", "gh release upload", "gh release edit", "gh release delete", "git push", "git tag"] {
+            XCTAssertFalse(text.contains(absent), "release.yml contains \(absent)")
+        }
     }
 
     /// Releases are ad-hoc signed and not notarized: the workflow reads no
@@ -92,7 +185,7 @@ final class ReleaseWorkflowTests: XCTestCase {
     /// testInstallFromPrebuiltAppNeedsTheOptInWhateverItsSignatureNames
     /// checks the behaviour.
     func testTheReleaseIsAdHocSignedWithNoSigningOrNotarizationStep() throws {
-        let text = try XCTUnwrap(try workflows().first { $0.name == "release.yml" }).text
+        let text = try releaseWorkflow()
         for absent in ["secrets.", "security ", "create-keychain", "notarytool", "stapler", "INSOMNIA_SIGN", "INSOMNIA_NOTARY"] {
             XCTAssertFalse(text.contains(absent), "release.yml contains \(absent)")
         }
@@ -108,35 +201,22 @@ final class ReleaseWorkflowTests: XCTestCase {
         }
     }
 
-    /// The build job has read-only access; only the job
-    /// that publishes may write, and only what publishing needs.
-    func testOnlyTheReleaseJobMayWrite() throws {
-        let text = try XCTUnwrap(try workflows().first { $0.name == "release.yml" }).text
-        let ls = lines(text)
-        let buildStart = try XCTUnwrap(ls.firstIndex(of: "  build:"))
-        let releaseStart = try XCTUnwrap(ls.firstIndex(of: "  release:"))
-        XCTAssertLessThan(buildStart, releaseStart)
-        let buildLines = Array(ls[buildStart..<releaseStart])
-        let build = buildLines.joined(separator: "\n")
-        let release = ls[releaseStart...].joined(separator: "\n")
-        // The build job's one permissions key is a block whose entries are
-        // exactly `contents: read`, so a scope added on any later line, or
-        // an inline map or write-all in its place, fails here.
-        let keys = buildLines.indices.filter { buildLines[$0].hasPrefix("    permissions:") }
-        XCTAssertEqual(keys.count, 1, "one permissions key in the build job")
-        let key = try XCTUnwrap(keys.first)
-        XCTAssertEqual(buildLines[key], "    permissions:", "a block, not an inline map or write-all")
-        let scopes = buildLines[(key + 1)...]
-            .prefix { $0.hasPrefix("      ") }
-            .map { $0.split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false)[0].trimmingCharacters(in: .whitespaces) }
-        XCTAssertEqual(scopes, ["contents: read"], "the build job only reads the repository")
-        XCTAssertNil(build.range(of: #"(?m)^\s+[\w-]+:\s*write"#, options: .regularExpression), "no write scope on any line of the build job")
-        for scope in ["contents: write", "id-token: write", "attestations: write"] {
-            XCTAssertTrue(release.contains("      \(scope)"), "release job needs \(scope)")
+    /// The plan and build jobs have read-only access; only the jobs that
+    /// publish may write, and only what publishing needs.
+    func testOnlyThePublishingJobsMayWrite() throws {
+        for id in ["plan", "build"] {
+            let body = try job(id)
+            XCTAssertEqual(try permissionScopes(body, job: id), ["contents: read"], "the \(id) job only reads the repository")
+            XCTAssertNil(body.joined(separator: "\n").range(of: #"(?m)^\s+[\w-]+:\s*write"#, options: .regularExpression), "no write scope on any line of the \(id) job")
         }
-        XCTAssertFalse(release.contains("packages:"), release)
-        XCTAssertFalse(release.contains("actions: write"), release)
-        XCTAssertFalse(release.contains("uses: actions/checkout"), "publishing needs no checkout")
+        for id in ["stable", "nightly"] {
+            let body = try job(id)
+            XCTAssertEqual(try permissionScopes(body, job: id), ["contents: write", "id-token: write", "attestations: write"], id)
+            let text = body.joined(separator: "\n")
+            XCTAssertFalse(text.contains("packages:"), id)
+            XCTAssertFalse(text.contains("actions: write"), id)
+            XCTAssertFalse(text.contains("uses: actions/checkout"), "\(id): publishing needs no checkout")
+        }
     }
 
     /// Release bundles are arm64 only (no universal build), so the notes'
@@ -144,13 +224,30 @@ final class ReleaseWorkflowTests: XCTestCase {
     /// Apple Silicon Mac. RecoveryScriptTests checks that install.sh --app
     /// stops on any other Mac.
     func testTheNotesAndTheReadmeStateTheAppleSiliconRequirement() throws {
-        let text = try XCTUnwrap(try workflows().first { $0.name == "release.yml" }).text
-        XCTAssertTrue(text.contains(#"echo "Insomnia $VERSION for Apple Silicon Macs with macOS 26 or later."#), "the notes' first line")
+        for id in ["stable", "nightly"] {
+            XCTAssertTrue(try job(id).joined(separator: "\n").contains(#"echo "Insomnia $VERSION for Apple Silicon Macs with macOS 26 or later."#), "the \(id) notes' first line")
+        }
+        XCTAssertTrue(try readmeInstallSection().contains("Apple Silicon"), "the README's Install section")
+    }
+
+    /// The README's Install section lets a reader, or the coding agent the
+    /// README is pasted into, choose a channel, and sends v0.1.0, which no
+    /// workflow built, to its own release notes.
+    func testTheReadmeOffersBothChannelsAndSetsV010Apart() throws {
+        let install = try readmeInstallSection().split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        for phrase in ["Stable: the release GitHub marks Latest", "Nightly: prereleases tagged `nightly-", "A nightly is never marked Latest",
+                       "`refs/tags/v<version>` for a stable release or `refs/heads/main` for a nightly",
+                       "If the release you picked is `v0.1.0`", "Install the latest stable Insomnia release from", "the newest Insomnia nightly prerelease"] {
+            XCTAssertTrue(install.contains(phrase), "the README's Install section lacks: \(phrase)")
+        }
+    }
+
+    private func readmeInstallSection() throws -> String {
         let repo = workflowsDir.deletingLastPathComponent().deletingLastPathComponent()
         let readme = try String(contentsOf: repo.appendingPathComponent("README.md"), encoding: .utf8)
         let install = try XCTUnwrap(readme.range(of: "\n## Install\n"), "README has no Install section")
         let end = readme.range(of: "\n## ", range: install.upperBound..<readme.endIndex)?.lowerBound ?? readme.endIndex
-        XCTAssertTrue(readme[install.upperBound..<end].contains("Apple Silicon"), "the README's Install section")
+        return String(readme[install.upperBound..<end])
     }
 
     /// The scripts the zip carries sit at its top level, so the folder above
@@ -159,7 +256,7 @@ final class ReleaseWorkflowTests: XCTestCase {
     /// parent of the script's folder would run whatever another account put
     /// there. RecoveryScriptTests runs both from a zip layout.
     func testTheZipsScriptsTakeNothingFromTheFolderAboveTheirOwn() throws {
-        let text = try XCTUnwrap(try workflows().first { $0.name == "release.yml" }).text
+        let text = try releaseWorkflow()
         let copy = try XCTUnwrap(lines(text).first { $0.contains(#""release/$pkg/""#) && $0.contains("cp ") }, "no cp into the package folder")
         let shipped = copy.split(separator: " ").map(String.init).filter { $0.hasPrefix("scripts/") }
         XCTAssertEqual(shipped, ["scripts/install.sh", "scripts/uninstall.sh"])
