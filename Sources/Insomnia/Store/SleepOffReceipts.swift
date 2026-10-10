@@ -145,8 +145,9 @@ enum SleepOffVerdict: Equatable, Sendable {
 /// change, or a later start's line that names another predecessor all
 /// prove nothing: once the start has expired it is undone like an end,
 /// and until then it stays journaled (`SleepOffVerdict.undecided`). So
-/// does a receipt that stays locked or cannot be locked, whenever it is
-/// read.
+/// does a receipt that stays locked or cannot be locked, or that is the
+/// file the start journaled but cannot be opened to be locked, whenever it
+/// is read.
 ///
 /// The release file beside it (`releaseFile`) keeps those lines from
 /// being overwritten while a start is not settled: see `claimable`.

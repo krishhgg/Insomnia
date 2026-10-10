@@ -2370,6 +2370,117 @@ final class RecoveryScriptTests: XCTestCase {
         }
     }
 
+    /// The damage a receipt can show while keeping its inode, so the lock
+    /// a test holds on it is the lock a run finds; each with how to undo it
+    /// and what the checks say about it.
+    private func damageInPlace() -> [(name: String, damage: () throws -> Void, repair: () throws -> Void, says: String)] {
+        let user = String(cString: getpwuid(getuid()).pointee.pw_name)
+        let mine = AccessEntry.installed(for: getuid())
+        let write = AccessEntry(allows: true, principal: .user(getuid()), rights: ["write"], flags: [])
+        let fails = fx.receiptEntries + ".fails"
+        let shape = "is missing, is not the 82-byte file install.sh made, mode 600, or someone other than root can change it or a folder above it"
+        return [
+            ("83 bytes", { try self.fx.writeReceipt(SleepOffReceipts.initialContent + "\n") }, { try self.fx.writeReceipt() }, shape),
+            ("mode 644", { XCTAssertEqual(chmod(self.fx.receipt, 0o644), 0) }, { XCTAssertEqual(chmod(self.fx.receipt, 0o600), 0) }, shape),
+            ("group-writable", { XCTAssertEqual(chmod(self.fx.receipt, 0o664), 0) }, { XCTAssertEqual(chmod(self.fx.receipt, 0o600), 0) }, shape),
+            ("a hard link", { XCTAssertEqual(link(self.fx.receipt, self.fx.receipts + "/link"), 0) }, { unlinkIfPresent(self.fx.receipts + "/link") }, shape),
+            ("a writable folder", { XCTAssertEqual(chmod(self.fx.receipts, 0o775), 0) }, { XCTAssertEqual(chmod(self.fx.receipts, 0o755), 0) }, shape),
+            ("an allow entry on the receipt", { try self.fx.writeReceiptEntries([mine, write]) }, { try self.fx.writeReceiptEntries([mine]) },
+             "does not have exactly one access control entry, the one that lets uid \(getuid()) read it and nothing else"),
+            ("a list ls cannot read", { XCTAssertTrue(FileManager.default.createFile(atPath: fails, contents: nil)) }, { unlinkIfPresent(fails) },
+             "does not have exactly one access control entry, the one that lets uid \(getuid()) read it and nothing else, or its list could not be read"),
+            ("an allow entry on the folder", { try self.fx.writeFolderEntries([self.fx.receipts: ["user:\(user) allow add_file"]]) },
+             { unlinkIfPresent(self.fx.folderEntries) }, "has an access control entry that allows changes"),
+        ]
+    }
+
+    /// R35-4: the scripts check the receipt and its folders only under the
+    /// receipt's lock, as the app does. While the lock is held (here by
+    /// this test, as the command behind the start's dialog holds it until
+    /// pmset exits), the run decides nothing, whatever the receipt shows
+    /// and whether or not the dialog's expiry has passed: the checks never
+    /// run, no pmset runs for the sleep entry, and the start and its claim
+    /// stay. Once the lock is let go the same damage decides as it did
+    /// before: undecided until the expiry, then sleep is restored and the
+    /// start stays journaled with its claim. The backstop's lockf is given
+    /// no wait, as in the test above.
+    func testBackstopDecidesNothingWhileTheReceiptIsLockedWhateverItsChecksWouldFind() throws {
+        let text = try String(contentsOf: fx.backstop, encoding: .utf8)
+        try ScriptFixture.patch(text, ["RECEIPT_LOCK_TIMEOUT_SECONDS": "0"]).write(to: fx.backstop, atomically: true, encoding: .utf8)
+        for c in damageInPlace() {
+            for expired in [false, true] {
+                let name = "\(c.name), expired \(expired)"
+                removeIfPresent(fx.logFile)
+                fx.clearCalls()
+                let nonce = try journalUnfinishedStart(expiresIn: expired ? -1 : 60)
+                let fd = open(fx.receipt, O_RDONLY)
+                XCTAssertGreaterThanOrEqual(fd, 0, name)
+                XCTAssertEqual(flock(fd, LOCK_EX | LOCK_NB), 0, name)
+                try c.damage()
+
+                let held = try fx.run(fx.backstop)
+
+                try assertKept(held, nonce: nonce, restored: false, saying: ["an unfinished start is not settled yet: \(fx.receipt) stayed locked for 0 s"])
+                XCTAssertFalse(fx.log().contains(c.says), "\(name): the checks run only under the lock: \(fx.log())")
+                close(fd)
+                removeIfPresent(fx.logFile)
+                fx.clearCalls()
+
+                let free = try fx.run(fx.backstop)
+
+                if expired {
+                    try assertKept(free, nonce: nonce, restored: true, saying: [c.says, "an unfinished start could not be settled: "])
+                } else {
+                    try assertKept(free, nonce: nonce, restored: false, saying: ["an unfinished start is not settled yet: ", c.says, "; a command for that start could still write until "])
+                }
+                XCTAssertFalse(fx.log().contains("stayed locked"), "\(name): \(fx.log())")
+                try c.repair()
+            }
+        }
+    }
+
+    /// R35-4: a receipt this user cannot open (mode 000 here; in use, a
+    /// list without the entry) cannot show whether a command holds its
+    /// lock. When it is the file the start journaled, the run decides
+    /// nothing, before the dialog's expiry and after it. A copy put in its
+    /// place that cannot be opened is another file, which shows nothing
+    /// about the start: undecided only until the expiry, then undone as a
+    /// start that may have turned sleep off.
+    func testBackstopDecidesNothingWhileTheJournaledReceiptCannotBeOpened() throws {
+        for expired in [false, true] {
+            removeIfPresent(fx.logFile)
+            fx.clearCalls()
+            let nonce = try journalUnfinishedStart(expiresIn: expired ? -1 : 60)
+            XCTAssertEqual(chmod(fx.receipt, 0), 0)
+
+            let r = try fx.run(fx.backstop)
+
+            try assertKept(r, nonce: nonce, restored: false, saying: ["an unfinished start is not settled yet: \(fx.receipt) could not be opened to be locked; a command for that start may hold its lock"])
+            XCTAssertEqual(chmod(fx.receipt, 0o600), 0)
+        }
+
+        removeIfPresent(fx.logFile)
+        fx.clearCalls()
+        let nonce = try journalUnfinishedStart(expiresIn: 60)
+        let copy = fx.receipts + "/copy"
+        try Data(SleepOffReceipts.initialContent.utf8).write(to: URL(fileURLWithPath: copy))
+        XCTAssertEqual(chmod(copy, 0), 0)
+        XCTAssertEqual(rename(copy, fx.receipt), 0)
+        defer { chmod(fx.receipt, 0o600) }
+
+        let early = try fx.run(fx.backstop)
+
+        try assertKept(early, nonce: nonce, restored: false, saying: ["an unfinished start is not settled yet: \(fx.receipt) could not be opened to be locked; a command for that start could still write until "])
+        try endTheDialog()
+        removeIfPresent(fx.logFile)
+        fx.clearCalls()
+
+        let late = try fx.run(fx.backstop)
+
+        try assertKept(late, nonce: nonce, restored: true, saying: ["\(fx.receipt) could not be opened to be locked", "an unfinished start could not be settled: "])
+        XCTAssertFalse(fx.log().contains("may hold its lock"), fx.log())
+    }
+
     // MARK: - uninstall.sh settles an unfinished start and removes the receipt
 
     /// uninstall.sh settles the start before its backstop runs: a receipt
@@ -2458,6 +2569,55 @@ final class RecoveryScriptTests: XCTestCase {
             "Nothing was removed and no pmset ran. Then rerun.",
         ])
         XCTAssertTrue(fx.exists(fx.session))
+    }
+
+    /// R35-4, as in the backstop: uninstall checks the receipt only under
+    /// its lock. While the lock is held, whatever the receipt shows, an
+    /// unfinished start is not settled and nothing is removed; once it is
+    /// let go, the damage stops the uninstall as before. A journaled
+    /// receipt this user cannot open decides nothing either, whatever the
+    /// time.
+    func testUninstallDecidesNothingWhileTheReceiptIsLockedOrCannotBeOpened() throws {
+        try fx.installMachinery()
+        for c in damageInPlace() {
+            fx.clearCalls()
+            let nonce = try journalUnfinishedStart()
+            let fd = open(fx.receipt, O_RDONLY)
+            XCTAssertGreaterThanOrEqual(fd, 0, c.name)
+            XCTAssertEqual(flock(fd, LOCK_EX | LOCK_NB), 0, c.name)
+            try c.damage()
+
+            let held = try fx.run(fx.uninstall)
+
+            try assertUninstallStopped(held, nonce: nonce, saying: [
+                "The unfinished start is still journaled: it is not settled yet (\(fx.receipt) stayed locked for 1 s: the command behind a password dialog may be running",
+                "Nothing was removed and no pmset ran. Then rerun.",
+            ])
+            XCTAssertFalse(held.stderr.contains(c.says), "\(c.name): the checks run only under the lock: \(held.stderr)")
+            close(fd)
+            fx.clearCalls()
+
+            let free = try fx.run(fx.uninstall)
+
+            XCTAssertEqual(free.status, 1, "\(c.name): \(free.stderr)")
+            XCTAssertTrue(free.stderr.contains(c.says), "\(c.name): \(free.stderr)")
+            XCTAssertFalse(free.stderr.contains("stayed locked"), "\(c.name): \(free.stderr)")
+            XCTAssertFalse(fx.calls().contains { Self.isRootRemoval($0) }, "\(c.name): \(fx.calls())")
+            XCTAssertTrue(fx.exists(fx.sudoers), c.name)
+            try c.repair()
+        }
+
+        fx.clearCalls()
+        let nonce = try journalUnfinishedStart()
+        XCTAssertEqual(chmod(fx.receipt, 0), 0)
+        defer { chmod(fx.receipt, 0o600) }
+
+        let r = try fx.run(fx.uninstall)
+
+        try assertUninstallStopped(r, nonce: nonce, saying: [
+            "The unfinished start is still journaled: it is not settled yet (\(fx.receipt) could not be opened to be locked; a command for that start may hold its lock).",
+            "Nothing was removed and no pmset ran. Then rerun.",
+        ])
     }
 
     /// The session of a start that never turned sleep off cannot be
@@ -2930,10 +3090,11 @@ final class RecoveryScriptTests: XCTestCase {
         }
     }
 
-    /// A receipt that fails its own checks (here writable by others) can
-    /// be locked by nobody, and the app and the root command refuse it, so
-    /// no start can claim it now. But a start may have claimed it before it
-    /// failed them, and its settlement needs the rule and the bundle.
+    /// A receipt that fails its own checks (here writable by others) is
+    /// refused once it is locked, by this uninstall, the app and the root
+    /// command alike, so no start can claim it now. But a start may have
+    /// claimed it before it failed them, and its settlement needs the rule
+    /// and the bundle.
     /// Round 30 (finding 2): so the uninstall stops before removing
     /// anything, with or without a claim in its release file.
     func testUninstallRemovesNothingWhileTheReceiptFailsItsChecks() throws {

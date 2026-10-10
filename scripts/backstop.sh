@@ -1464,9 +1464,10 @@ session_shape_problems() { # file
 #   - "may": the receipt holds this start's "writing", a later start's
 #     line, or, once expires has passed, anything else: a receipt that is
 #     missing, replaced, unsafe or damaged.
-#   - "undecided": the receipt stays locked or cannot be locked, or expires
-#     has not passed and the receipt shows nothing yet: the dialog may
-#     still be answered.
+#   - "undecided": the receipt stays locked or cannot be locked, or the
+#     file the start journaled cannot be opened, so its lock cannot be
+#     seen; or expires has not passed and the receipt shows nothing yet:
+#     the dialog may still be answered.
 # Decided, the start never finished, so its session never began:
 # session.json goes when its end is the attempt's deadline, so that session
 # is never resumed (a SleepDisabled 1 someone else set would read as still
@@ -1543,25 +1544,41 @@ receipt_access_problem() { # receipt uid
 }
 
 # Opens the receipt read-only on fd 7 and locks it as the root command does
-# (SleepOffReceipts.lock): the checks, the open, fd 7's identity against the
-# path's, then `lockf <fd>`, whose lock lasts until fd 7 closes, then the
-# checks again and the path must still name the locked file. Sets
-# receipt_locked to that file's device:inode; otherwise receipt_lock_why,
-# and receipt_lock_busy=1 when lockf found it locked for the whole
-# RECEIPT_LOCK_TIMEOUT_SECONDS or failed, which decides nothing whenever it
-# happens. fd 7 stays open only while locked; unlock_receipt closes it.
+# (SleepOffReceipts.lock). Before the lock only what the open needs: the
+# path, by lstat, names a regular file. Then the open, fd 7's identity
+# against that lstat's, and `lockf <fd>`, whose lock lasts until fd 7
+# closes. Every other check of the receipt and the folders above it
+# (receipt_unsafe) runs only once fd 7 is locked, so nothing those checks
+# find passes over a command that holds the lock; then the path must still
+# name the locked file. Sets receipt_locked to that file's device:inode;
+# otherwise receipt_lock_why, and receipt_lock_busy=1 when lockf found it
+# locked for the whole RECEIPT_LOCK_TIMEOUT_SECONDS or failed, which
+# decides nothing whenever it happens. A regular file that cannot be opened
+# sets receipt_unopened to its device:inode: when that is the file the
+# start journaled, its lock cannot be seen, and attempt_verdict decides
+# nothing either. Unlike the app, the shell opens with neither O_NOFOLLOW
+# nor O_NONBLOCK: a link put in the receipt's place after the lstat fails
+# the identity check, but a FIFO put there stalls the open until something
+# writes to it. Only someone who can write the receipt's folder can put
+# either there, and the checks under the lock refuse such a folder. fd 7
+# stays open only while locked; unlock_receipt closes it.
 receipt_locked=""
 lock_receipt() {
-  local f="$RECEIPTS/$UID" why rc=0 opened
-  receipt_locked=""; receipt_lock_why=""; receipt_lock_busy=0; receipt_read=0
-  why="$(receipt_unsafe)"
-  if [[ -n "$why" ]]; then receipt_lock_why="$why"; return 0; fi
+  local f="$RECEIPTS/$UID" why rc=0 found opened
+  receipt_locked=""; receipt_lock_why=""; receipt_lock_busy=0; receipt_read=0; receipt_unopened=""
+  found="$("$STAT" -f '%HT %d:%i' "$f" 2>/dev/null)" || found=""
+  if [[ "$found" != "Regular File "?* ]]; then
+    receipt_lock_why="$f is missing, is not the 82-byte file install.sh made, mode 600, or someone other than root can change it or a folder above it"
+    return 0
+  fi
+  found="${found##* }"
   if ! { exec 7<"$f"; } 2>/dev/null; then
-    receipt_lock_why="$f could not be opened"
+    receipt_unopened="$found"
+    receipt_lock_why="$f could not be opened to be locked"
     return 0
   fi
   opened="$("$STAT" -f '%d:%i' <&7 2>/dev/null)" || opened=""
-  if [[ -z "$opened" || "$opened" != "$("$STAT" -f '%d:%i' "$f" 2>/dev/null)" ]]; then
+  if [[ -z "$opened" || "$opened" != "$found" ]]; then
     exec 7<&-
     receipt_lock_why="$f changed while it was opened"
     return 0
@@ -1577,8 +1594,15 @@ lock_receipt() {
     fi
     return 0
   fi
-  why="$(receipt_unsafe)"
-  if [[ -n "$why" || "$opened" != "$("$STAT" -f '%d:%i' "$f" 2>/dev/null)" ]]; then
+  if [[ "$opened" == "$("$STAT" -f '%d:%i' "$f" 2>/dev/null)" ]]; then
+    why="$(receipt_unsafe)"
+    if [[ -n "$why" ]]; then
+      exec 7<&-
+      receipt_lock_why="$why"
+      return 0
+    fi
+  fi
+  if [[ "$opened" != "$("$STAT" -f '%d:%i' "$f" 2>/dev/null)" ]]; then
     exec 7<&-
     receipt_lock_why="$f was replaced while it was locked"
     return 0
@@ -1687,6 +1711,10 @@ attempt_verdict() { # nonce predecessor identity expires now has-marker
   until="until $("$DATE" -u -r "$4" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "$4")"
   if (( receipt_lock_busy )); then
     verdict=undecided; verdict_why="$receipt_lock_why"
+    return 0
+  fi
+  if [[ -n "$receipt_unopened" && "$receipt_unopened" == "$3" ]]; then
+    verdict=undecided; verdict_why="$receipt_lock_why; a command for that start may hold its lock"
     return 0
   fi
   if [[ -z "$receipt_locked" ]]; then

@@ -46,9 +46,9 @@ final class SleepOffReceiptsTests: XCTestCase {
     }
 
     /// The verdict for `attempt`, read under the receipt's lock at `now`.
-    private func verdict(_ attempt: SleepOffAttempt, now: Int, dialogOver: Bool = false) async -> SleepOffVerdict {
+    private func verdict(_ attempt: SleepOffAttempt, now: Int, dialogOver: Bool = false, timeout: TimeInterval = 0.2) async -> SleepOffVerdict {
         let outcome: Result<SleepOffReceipts.Guard, Error>
-        do { outcome = .success(try await receipts.lock(timeout: 0.2)) } catch { outcome = .failure(error) }
+        do { outcome = .success(try await receipts.lock(timeout: timeout)) } catch { outcome = .failure(error) }
         defer { if case let .success(held) = outcome { held.release() } }
         return receipts.verdict(for: attempt, lock: outcome, now: now, dialogOver: dialogOver)
     }
@@ -283,7 +283,8 @@ final class SleepOffReceiptsTests: XCTestCase {
             try c.damage()
 
             for (now, dialogOver) in [(expires - 1, false), (expires, false), (expires + 3600, true)] {
-                let v = await verdict(attempt(identity), now: now, dialogOver: dialogOver)
+                // No wait: the test holds the lock until after these reads.
+                let v = await verdict(attempt(identity), now: now, dialogOver: dialogOver, timeout: 0)
                 if c.claimed {
                     let why = try XCTUnwrap(undecided(v), "\(c.name), \(now - expires) s from expires: \(v)")
                     XCTAssertTrue(why.hasPrefix("\(file) stayed locked for 0 s"), "\(c.name): \(why)")
