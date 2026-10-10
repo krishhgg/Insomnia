@@ -52,6 +52,9 @@ final class EarlierBootLowPowerClaimTests: XCTestCase {
             try h.store.saveSession(Session(startedAt: now.addingTimeInterval(-7200), endsAt: now.addingTimeInterval(-3600)))
         case .valid:
             try h.store.saveSession(Session(startedAt: now.addingTimeInterval(-600), endsAt: now.addingTimeInterval(3000)))
+            // The session boot A left still has sleep off: reconcile reads
+            // that setting and resumes, it never turns sleep off again.
+            h.guardFake.sleepDisabled = true
         }
     }
 

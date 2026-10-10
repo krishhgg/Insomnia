@@ -1,9 +1,32 @@
 import Foundation
 
-/// The only two things Insomnia ever does as root, both through the four
-/// sudoers-allowed pmset commands written by install.sh.
+/// The only things Insomnia ever does as root. Turning sleep off goes
+/// through the administrator password dialog (see AdministratorPrompt);
+/// everything else goes through the three passwordless pmset lines
+/// install.sh writes to sudoers, none of which can keep the Mac awake.
 protocol SleepGuarding: Sendable {
-    func setSleepDisabled(_ disabled: Bool) async throws
+    /// Start calls it before anything is written or the dialog is shown.
+    /// It only reads `pmset -g` and runs nothing as root. `sleepOffIsOurs`
+    /// is the journal's `sleepDisabledByUs`: when it is set, a SleepDisabled
+    /// 1 is Insomnia's own and nothing is read. Otherwise a 1 means someone
+    /// else turned sleep off, and a session's end would turn it back on for
+    /// them, so Start is refused; so it is when the setting cannot be read.
+    /// Throws `SleepSettingRefusal`. Behind the dialog, before it writes
+    /// anything, the root command asks sudo whether sleep can be turned
+    /// back on without a password and reads the setting again (see
+    /// `AdministratorPrompt.rootCommand`).
+    func checkSleepSettingForStart(sleepOffIsOurs: Bool) async throws
+    /// Shows the administrator password dialog and waits for it; only an
+    /// explicit Start by the user may call it, after writing `start`'s
+    /// marker. Sleep is turned off only while that marker holds its nonce.
+    /// The wait is bounded: an `AdministratorPromptError.stillRunning` means
+    /// the dialog's process would not stop and may still turn sleep off, so
+    /// the caller must keep its lock and journal entry until the handle it
+    /// carries resolves.
+    func disableSleep(_ start: PendingStart) async throws
+    /// Turns sleep back on. Never prompts, so a crashed or stuck session can
+    /// always be ended.
+    func enableSleep() async throws
     func isSleepDisabled() async throws -> Bool
     func setLowPowerMode(_ on: Bool) async throws
     /// Battery Low Power Mode as pmset reports it now. Throws when it cannot
@@ -27,11 +50,36 @@ struct SleepGuardError: Error, LocalizedError, Sendable {
     }
 }
 
-/// `sudo -n pmset …`. Never prompts; if the sudoers rule is missing the call
-/// fails fast with a readable error instead of hanging on a password prompt.
+/// Why `checkSleepSettingForStart` refused Start.
+enum SleepSettingRefusal: Error, LocalizedError, Sendable {
+    /// `pmset -g` already reports SleepDisabled 1 and the journal does not
+    /// say Insomnia set it.
+    case sleepAlreadyOff
+    /// `pmset -g` could not be read, so a setting someone else made could
+    /// not be ruled out.
+    case sleepSettingUnreadable(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .sleepAlreadyOff:
+            "sleep is already off (pmset reports SleepDisabled 1) and Insomnia did not turn it off, so Start leaves it alone: the session's end would turn it back on. To re-enable sleep: sudo pmset -a disablesleep 0, then start again"
+        case let .sleepSettingUnreadable(detail):
+            "`pmset -g` could not be read (\(detail)), so it is not known whether someone else turned sleep off"
+        }
+    }
+}
+
+/// `sudo -n pmset …` for everything but `disablesleep 1`. `sudo -n` never
+/// prompts; if the sudoers rule is missing the call fails fast with a
+/// readable error instead of hanging on a password prompt. `disablesleep
+/// 1` has no sudoers line and runs through `prompt` instead.
 struct PmsetSleepGuard: SleepGuarding {
     static let sudo = "/usr/bin/sudo"
     static let pmset = "/usr/bin/pmset"
+    /// What `enableSleep` passes to pmset. The root command asks sudo
+    /// about the same line before it turns sleep off
+    /// (`AdministratorPrompt.rootCommand`).
+    static let restoreArguments = ["-a", "disablesleep", "0"]
     /// pmset normally returns in well under a second; a hung powerd must not
     /// hang a quit or a lid action forever.
     static let timeout: TimeInterval = 20
@@ -40,21 +88,30 @@ struct PmsetSleepGuard: SleepGuarding {
     /// scripts/backstop.sh.
     static let stopGrace: TimeInterval = 3
 
-    /// The app uses the defaults; tests point `sudo` at a fake, shorten the
-    /// limits, and start the deadline once the fake is ready.
+    /// Shows the administrator password dialog for `disableSleep`.
+    let prompt: any AdministratorPromptRunning
+    /// The sudo that is run. Only tests pass another (a fake that records
+    /// its arguments); the app always runs `PmsetSleepGuard.sudo`.
     let sudoPath: String
+    /// The pmset that `pmset -g` reads run. Only tests pass another; what
+    /// sudo runs is always `PmsetSleepGuard.pmset`, the path the sudoers
+    /// rule names.
     let pmsetPath: String
     let commandTimeout: TimeInterval
     let grace: TimeInterval
     let runner: CancellableCommand
 
+    /// The app uses the defaults; tests point `sudo` at a fake, shorten the
+    /// limits, and start the deadline once the fake is ready.
     init(
+        prompt: any AdministratorPromptRunning = OsascriptAdministratorPrompt(),
         sudo: String = Self.sudo,
         pmset: String = Self.pmset,
         timeout: TimeInterval = Self.timeout,
         stopGrace: TimeInterval = Self.stopGrace,
         runner: CancellableCommand = CancellableCommand()
     ) {
+        self.prompt = prompt
         sudoPath = sudo
         pmsetPath = pmset
         commandTimeout = timeout
@@ -62,8 +119,28 @@ struct PmsetSleepGuard: SleepGuarding {
         self.runner = runner
     }
 
-    func setSleepDisabled(_ disabled: Bool) async throws {
-        try await sudoPmset(["-a", "disablesleep", disabled ? "1" : "0"])
+    /// Reads `pmset -g` unless the journal already owns a SleepDisabled 1.
+    /// Nothing runs as root here, and the restore is never run to test it:
+    /// it would turn sleep back on for whoever set it. Whether it needs a
+    /// password is asked of sudo by the root command, under the marker's
+    /// lock, with listings that change nothing.
+    func checkSleepSettingForStart(sleepOffIsOurs: Bool) async throws {
+        guard !sleepOffIsOurs else { return }
+        let sleepOff: Bool
+        do {
+            sleepOff = try await isSleepDisabled()
+        } catch {
+            throw SleepSettingRefusal.sleepSettingUnreadable(error.localizedDescription)
+        }
+        guard !sleepOff else { throw SleepSettingRefusal.sleepAlreadyOff }
+    }
+
+    func disableSleep(_ start: PendingStart) async throws {
+        try await prompt.disableSleep(start)
+    }
+
+    func enableSleep() async throws {
+        try await sudoPmset(Self.restoreArguments)
     }
 
     func setLowPowerMode(_ on: Bool) async throws {
@@ -143,7 +220,7 @@ struct PmsetSleepGuard: SleepGuarding {
     /// run an undo beside it, or before it, and have it change power state
     /// afterwards with no journal entry left.
     func sudoPmset(_ args: [String], sudoOptions: [String] = []) async throws {
-        let full = [pmsetPath] + args
+        let full = [Self.pmset] + args
         let options = sudoOptions + ["-n"]
         let command = "sudo \(options.joined(separator: " ")) \(full.joined(separator: " "))"
         guard let lock = RecoveryLock.held else {

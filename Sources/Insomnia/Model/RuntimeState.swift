@@ -202,6 +202,19 @@ struct RuntimeState: Codable, Equatable, Sendable {
     /// each with the value to put back. Not a lid action: restored at
     /// session end, at reconcile, or by the backstop with `defaults`.
     var appNapOverrides: [AppNapOverride] = []
+    /// A start that may still turn sleep off, journaled with
+    /// `sleepDisabledByUs` before its password dialog (SleepOffAttempt).
+    /// Until it is settled it is never set without `sleepDisabledByUs`, so
+    /// it adds nothing to undo on its own; it records whether that entry
+    /// may be cleared without one. A settled one sits beside whatever
+    /// `sleepDisabledByUs` the settlement decided and only waits for its
+    /// claim on the receipt to be given back.
+    var sleepOffAttempt: SleepOffAttempt? = nil
+
+    /// The journaled start, unless a settlement has already decided it.
+    var unsettledSleepOffAttempt: SleepOffAttempt? {
+        sleepOffAttempt.flatMap { $0.isSettled ? nil : $0 }
+    }
 
     /// Bare pids of every journaled freeze, for display and de-duplication.
     var frozenPids: [Int32] { frozenProcesses.map(\.pid) }
@@ -328,7 +341,7 @@ struct RuntimeState: Codable, Equatable, Sendable {
         case savedDisplayBrightness, savedKeyboardBrightness, displayRestoredUnderLowPower
         case displayRestoreRefused, keyboardRestoreRefused
         case keptDisplayUnderLowPower, keptDisplayUnderLowPowerBoot, keptDisplayReadLit
-        case appNapOverrides
+        case appNapOverrides, sleepOffAttempt
     }
 
     // Tolerate missing keys so a state.json written by an older build, or by
@@ -359,6 +372,7 @@ struct RuntimeState: Codable, Equatable, Sendable {
         keptDisplayUnderLowPowerBoot = try c.decodeIfPresent(String.self, forKey: .keptDisplayUnderLowPowerBoot)
         keptDisplayReadLit = try c.decodeIfPresent(Float.self, forKey: .keptDisplayReadLit)
         appNapOverrides = try c.decodeIfPresent([AppNapOverride].self, forKey: .appNapOverrides) ?? []
+        sleepOffAttempt = try c.decodeIfPresent(SleepOffAttempt.self, forKey: .sleepOffAttempt)
     }
 
     /// `frozenPids` is read for migration only and never written again, so
@@ -383,5 +397,6 @@ struct RuntimeState: Codable, Equatable, Sendable {
         try c.encodeIfPresent(keptDisplayUnderLowPowerBoot, forKey: .keptDisplayUnderLowPowerBoot)
         try c.encodeIfPresent(keptDisplayReadLit, forKey: .keptDisplayReadLit)
         try c.encode(appNapOverrides, forKey: .appNapOverrides)
+        try c.encodeIfPresent(sleepOffAttempt, forKey: .sleepOffAttempt)
     }
 }

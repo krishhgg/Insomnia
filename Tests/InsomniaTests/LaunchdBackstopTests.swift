@@ -19,6 +19,12 @@ final class LaunchdBackstopTests: XCTestCase {
     let loadedJob = Locked<[String]>([])
     /// Its StartInterval, which `launchctl print` lists as `run interval`.
     let loadedInterval = Locked<Int?>(nil)
+    /// The file it was bootstrapped from, which `launchctl print` lists as
+    /// its top-level `path`; nil prints no such line.
+    let loadedFrom = Locked<String?>(nil)
+    /// For each launchctl call: its verb, whether it was handed a lock, and
+    /// whether the agent lock was free to another holder when it ran.
+    let lockSeen = Locked<[String]>([])
     let bootstrapFails = Locked(false)
     /// bootout returns an error and leaves the job loaded, as launchd does
     /// for a job that is mid-transition.
@@ -28,6 +34,8 @@ final class LaunchdBackstopTests: XCTestCase {
     /// moment and still let a later arm() recover.
     let onBootout = Locked<(@Sendable () -> Void)?>(nil)
     let onBootstrapped = Locked<(@Sendable () -> Void)?>(nil)
+    /// Runs once, inside the next fake `print`.
+    let onPrint = Locked<(@Sendable () -> Void)?>(nil)
     /// What the trusted plist path held when each `bootstrap` ran.
     let trustedPlistAtBootstrap = Locked<[Data?]>([])
 
@@ -37,10 +45,13 @@ final class LaunchdBackstopTests: XCTestCase {
         loaded.value = false
         loadedJob.value = []
         loadedInterval.value = nil
+        loadedFrom.value = nil
+        lockSeen.value = []
         bootstrapFails.value = false
         bootoutFails.value = false
         onBootout.value = nil
         onBootstrapped.value = nil
+        onPrint.value = nil
         trustedPlistAtBootstrap.value = []
     }
 
@@ -50,16 +61,22 @@ final class LaunchdBackstopTests: XCTestCase {
         installScript: Bool = true,
         requirement: String = LaunchdBackstopTests.requirement,
         requirementUnreadable: Bool = false,
-        bundleFailsCheck: Bool = false
+        bundleFailsCheck: Bool = false,
+        paths: Paths? = nil,
+        agentLock: URL? = nil,
+        agentLockTimeout: TimeInterval = 0.2
     ) throws -> LaunchdBackstop {
+        let paths = paths ?? home.paths
         if installScript {
-            let script = home.paths.backstopScript
+            let script = paths.backstopScript
             try FileManager.default.createDirectory(at: script.deletingLastPathComponent(), withIntermediateDirectories: true)
             try Data("#!/bin/bash\n".utf8).write(to: script)
         }
         let calls = calls, loaded = loaded, loadedJob = loadedJob, loadedInterval = loadedInterval, bootstrapFails = bootstrapFails, bootoutFails = bootoutFails
         let onBootout = onBootout, onBootstrapped = onBootstrapped, trustedPlistAtBootstrap = trustedPlistAtBootstrap
-        let trusted = home.paths.backstopPlist
+        let loadedFrom = loadedFrom, lockSeen = lockSeen, onPrint = onPrint
+        let trusted = paths.backstopPlist
+        let agentLock = agentLock ?? home.paths.recoveryLock
         let label = "com.insomnia.backstop"
         // What launchd itself enforces on a path argument (proven against a
         // disposable label, see the class comment on the regression test):
@@ -71,7 +88,7 @@ final class LaunchdBackstopTests: XCTestCase {
             else { return false }
             return obj["Label"] as? String == label
         }
-        let bundle = home.paths.appBundle
+        let bundle = paths.appBundle
         // Stands in for CodeRequirement.pin: the requirement of the fixture
         // bundle, or the two ways the real one refuses (no readable
         // signature; a bundle that fails the agent's check).
@@ -84,12 +101,14 @@ final class LaunchdBackstopTests: XCTestCase {
             }
             return requirement
         }
-        return LaunchdBackstop(paths: home.paths, bundle: bundle, pin: pin, uid: 501) { exe, args in
+        return LaunchdBackstop(paths: paths, agentLock: agentLock, agentLockTimeout: agentLockTimeout, bundle: bundle, pin: pin, uid: 501) { exe, args, holding in
             calls.value.append([exe] + args)
+            lockSeen.value.append("\(args.first ?? "") \(holding == nil ? "unhanded" : "handed") \(Self.lockIsFree(agentLock) ? "free" : "held")")
             switch args.first {
             case "print":
+                if let hook = onPrint.value { onPrint.value = nil; hook() }
                 guard loaded.value else { return ShellResult(status: 113, stdout: "", stderr: "Could not find service") }
-                return ShellResult(status: 0, stdout: Self.printOutput(arguments: loadedJob.value, runInterval: loadedInterval.value), stderr: "")
+                return ShellResult(status: 0, stdout: Self.printOutput(arguments: loadedJob.value, runInterval: loadedInterval.value, path: loadedFrom.value), stderr: "")
             case "bootstrap":
                 trustedPlistAtBootstrap.value.append(try? Data(contentsOf: trusted))
                 guard args.count == 3, launchdAccepts(args[2]) else {
@@ -103,6 +122,7 @@ final class LaunchdBackstopTests: XCTestCase {
                     .flatMap { try? PropertyListSerialization.propertyList(from: $0, format: nil) as? [String: Any] }
                 loadedJob.value = plist?["ProgramArguments"] as? [String] ?? []
                 loadedInterval.value = plist?["StartInterval"] as? Int
+                loadedFrom.value = args[2]
                 if let hook = onBootstrapped.value { onBootstrapped.value = nil; hook() }
                 return ShellResult(status: 0, stdout: "", stderr: "")
             case "bootout":
@@ -124,16 +144,25 @@ final class LaunchdBackstopTests: XCTestCase {
         }
     }
 
+    /// Whether another holder could take the flock on `url` right now: a
+    /// new open file description, as another process would have.
+    static func lockIsFree(_ url: URL) -> Bool {
+        let fd = open(url.path, O_RDONLY | O_CLOEXEC)
+        guard fd >= 0 else { return true }
+        defer { close(fd) }
+        return flock(fd, LOCK_EX | LOCK_NB) == 0
+    }
+
     /// `launchctl print gui/501/<label>` for a loaded job, in the layout
     /// launchctl prints (checked 2026-10-02): top-level keys indented by one
-    /// tab, each argument on its own line indented by two, and `run
-    /// interval` only for a job with a StartInterval.
-    static func printOutput(arguments: [String], runInterval: Int?) -> String {
+    /// tab, the file the job was loaded from on `path`, each argument on its
+    /// own line indented by two, and `run interval` only for a job with a
+    /// StartInterval.
+    static func printOutput(arguments: [String], runInterval: Int?, path: String? = "/Users/tester/Library/LaunchAgents/.com.insomnia.backstop.staging/com.insomnia.backstop.candidate-1.plist") -> String {
         """
         gui/501/com.insomnia.backstop = {
         \tactive count = 0
-        \tpath = /Users/tester/Library/LaunchAgents/.com.insomnia.backstop.staging/com.insomnia.backstop.candidate-1.plist
-        \ttype = LaunchAgent
+        \(path.map { "\tpath = \($0)\n" } ?? "")\ttype = LaunchAgent
         \tstate = not running
 
         \tprogram = /bin/sh
@@ -408,7 +437,7 @@ final class LaunchdBackstopTests: XCTestCase {
 
         try await b.arm()
 
-        XCTAssertEqual(calls.value.map { $0[1] }, ["print", "bootout", "bootstrap"], "a loaded label is not this build's agent")
+        XCTAssertEqual(calls.value.map { $0[1] }, ["print", "print", "bootout", "bootstrap"], "a loaded label is not this build's agent")
         XCTAssertEqual(loadedJob.value, expectedArguments)
         XCTAssertEqual(try Data(contentsOf: home.paths.backstopPlist), trusted)
 
@@ -511,13 +540,13 @@ final class LaunchdBackstopTests: XCTestCase {
 
         try await b.arm()
 
-        XCTAssertEqual(calls.value.map { $0[1] }, ["print", "bootout", "bootstrap"], "a job that does not poll is not armed")
+        XCTAssertEqual(calls.value.map { $0[1] }, ["print", "print", "bootout", "bootstrap"], "a job that does not poll is not armed")
         XCTAssertEqual(loadedInterval.value, 60)
 
         loadedInterval.value = 3600
         calls.value = []
         try await b.arm()
-        XCTAssertEqual(calls.value.map { $0[1] }, ["print", "bootout", "bootstrap"], "nor one that polls once an hour")
+        XCTAssertEqual(calls.value.map { $0[1] }, ["print", "print", "bootout", "bootstrap"], "nor one that polls once an hour")
 
         calls.value = []
         try await b.arm()
@@ -530,7 +559,7 @@ final class LaunchdBackstopTests: XCTestCase {
         loaded.value = false
         calls.value = []
         try await b.arm()
-        XCTAssertEqual(calls.value.map { $0[1] }, ["print", "bootout", "bootstrap"])
+        XCTAssertEqual(calls.value.map { $0[1] }, ["print", "print", "bootout", "bootstrap"], "read once without the agent lock and again under it")
     }
 
     func testArmReloadsWhenThePlistOnDiskIsStale() async throws {
@@ -669,5 +698,221 @@ final class LaunchdBackstopTests: XCTestCase {
             XCTAssertTrue(error.localizedDescription.contains("install.sh"), error.localizedDescription)
         }
         XCTAssertEqual(calls.value, [])
+    }
+
+    // MARK: One lock for every load and unload of the label (round 36, R35-2)
+
+    /// Another Insomnia folder of the user (`INSOMNIA_HOME`): its paths, its
+    /// own recovery lock, and the standard folder's lock as a separate file.
+    private func otherFolder(_ name: String) throws -> Paths {
+        let root = home.root.appendingPathComponent(name, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        return Paths(root: root)
+    }
+
+    private var standardLock: URL { home.root.appendingPathComponent("standard/.recovery.lock") }
+
+    /// A folder other than the standard one reloads under the standard
+    /// folder's lock, taken after its own transaction's: bootout and
+    /// bootstrap both run holding it and are handed it for their child;
+    /// the readings are not. It is free again once arm() returns, and the
+    /// transaction's own lock is still held.
+    func testAReloadHoldsTheAgentLockAndHandsItToEachLaunchctlCall() async throws {
+        let b = try makeBackstop(agentLock: standardLock)
+        try writeStalePlist()
+        loaded.value = true
+        let own = try XCTUnwrap(RecoveryLock(url: home.paths.recoveryLock).tryAcquire())
+        defer { own.release() }
+
+        try await RecoveryLock.$held.withValue(own) { try await b.arm() }
+
+        XCTAssertEqual(lockSeen.value, ["bootout handed held", "bootstrap handed held"])
+        XCTAssertTrue(Self.lockIsFree(standardLock), "the agent lock outlived arm()")
+        XCTAssertFalse(Self.lockIsFree(home.paths.recoveryLock), "arm() released the transaction's lock")
+        XCTAssertTrue(loaded.value)
+
+        // Plist current, job loaded but not this build's: the reading
+        // before the lock, then the reading again under it.
+        loadedJob.value = ["/bin/sh", "-c", "exit 0"]
+        lockSeen.value = []
+        try await RecoveryLock.$held.withValue(own) { try await b.arm() }
+        XCTAssertEqual(lockSeen.value, ["print unhanded free", "print unhanded held", "bootout handed held", "bootstrap handed held"])
+    }
+
+    /// In the standard folder the transaction's lock is the agent lock, by
+    /// its path or a link to it: arm() reloads under the transaction's
+    /// lock and does not lock the file a second time, which would wait on
+    /// itself until the limit. The transaction keeps it afterwards.
+    func testTheStandardFoldersTransactionLockIsTheAgentLockAndIsNotTakenTwice() async throws {
+        let link = home.root.appendingPathComponent("a link to the lock")
+        try FileManager.default.createDirectory(at: home.paths.recoveryLock.deletingLastPathComponent(), withIntermediateDirectories: true)
+        for agentLock in [home.paths.recoveryLock, link] {
+            let own = try XCTUnwrap(RecoveryLock(url: home.paths.recoveryLock).tryAcquire())
+            if agentLock == link { try FileManager.default.createSymbolicLink(at: link, withDestinationURL: home.paths.recoveryLock) }
+            let b = try makeBackstop(agentLock: agentLock, agentLockTimeout: 5)
+            try writeStalePlist()
+            loaded.value = true
+            lockSeen.value = []
+            let started = ContinuousClock.now
+
+            try await RecoveryLock.$held.withValue(own) { try await b.arm() }
+
+            XCTAssertLessThan(ContinuousClock.now - started, .seconds(2), "\(agentLock.lastPathComponent): arm() waited on its own transaction's lock")
+            XCTAssertEqual(lockSeen.value, ["bootout handed held", "bootstrap handed held"], agentLock.lastPathComponent)
+            XCTAssertFalse(Self.lockIsFree(home.paths.recoveryLock), "\(agentLock.lastPathComponent): arm() released the transaction's lock")
+            own.release()
+        }
+    }
+
+    /// The agent lock is held elsewhere (install.sh, uninstall.sh, or the
+    /// standard folder's app or backstop): a reload waits for it and,
+    /// past the limit, fails having asked launchd nothing but the reading,
+    /// with the trusted plist untouched. A job this folder already loaded
+    /// is armed without the lock.
+    func testAReloadWaitsForTheAgentLockAndChangesNothingWithoutIt() async throws {
+        let b = try makeBackstop(agentLock: standardLock)
+        try FileManager.default.createDirectory(at: standardLock.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let other = try XCTUnwrap(RecoveryLock(url: standardLock).tryAcquire())
+        try writeStalePlist()
+        let stale = try Data(contentsOf: home.paths.backstopPlist)
+        loaded.value = true
+
+        do {
+            try await b.arm()
+            XCTFail("arm reloaded the agent without the agent lock")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.hasPrefix("the recovery agent was not reloaded: recovery lock \(standardLock.path) still held by another process"), error.localizedDescription)
+        }
+        XCTAssertEqual(calls.value, [])
+        XCTAssertEqual(try Data(contentsOf: home.paths.backstopPlist), stale)
+        XCTAssertEqual(try launchAgentsEntries(), ["com.insomnia.backstop.plist"])
+
+        other.release()
+        try await b.arm()
+        XCTAssertEqual(calls.value.map { $0[1] }, ["bootout", "bootstrap"])
+        let armed = try XCTUnwrap(RecoveryLock(url: standardLock).tryAcquire())
+        calls.value = []
+        try await b.arm()
+        XCTAssertEqual(calls.value.map { $0[1] }, ["print"], "an armed folder needs no lock")
+        armed.release()
+    }
+
+    /// The schedule independent35 (R35-2) gave, for a third folder's
+    /// Extend, failed End or relaunch, which all arm inside their own
+    /// folder's transaction: the uninstall of folder A holds the agent
+    /// lock and has read that A's job is loaded. Folder C's arm reads A's
+    /// job too (the same command line: both run one bundle, but loaded
+    /// from A's plist), and waits for the lock. A boots its job out and
+    /// lets go of the lock. C reads again under the lock, finds nothing
+    /// loaded and loads its own job, which A's bootout never touched. If
+    /// C's app is gone while it waits (a crash or a quit cancels its
+    /// task), it has changed nothing in launchd or on disk.
+    func testAnArmCannotLoadBetweenAnUninstallsReadingAndItsBootout() async throws {
+        let a = try otherFolder("folder A")
+        try FileManager.default.createDirectory(at: standardLock.deletingLastPathComponent(), withIntermediateDirectories: true)
+        for crashes in [false, true] {
+            let c = try otherFolder("folder C \(crashes)")
+            let b = try makeBackstop(paths: c, agentLock: standardLock, agentLockTimeout: 30)
+            let desired = LaunchdBackstop.plistDictionary(label: "com.insomnia.backstop", target: BackstopTarget(bundle: c.appBundle, requirement: Self.requirement))
+            try FileManager.default.createDirectory(at: c.launchAgents, withIntermediateDirectories: true)
+            try PropertyListSerialization.data(fromPropertyList: desired, format: .xml, options: 0).write(to: c.backstopPlist)
+            let trusted = try Data(contentsOf: c.backstopPlist)
+            loaded.value = true
+            loadedJob.value = try XCTUnwrap(desired["ProgramArguments"] as? [String])
+            loadedInterval.value = 60
+            loadedFrom.value = a.backstopPlist.path
+            calls.value = []
+            lockSeen.value = []
+            let uninstallOfA = try XCTUnwrap(RecoveryLock(url: standardLock).tryAcquire())
+            let read = expectation(description: "C read A's job")
+            onPrint.value = { read.fulfill() }
+            let own = try XCTUnwrap(RecoveryLock(url: c.recoveryLock).tryAcquire())
+
+            let arm = Task { try await RecoveryLock.$held.withValue(own) { try await b.arm() } }
+            await fulfillment(of: [read], timeout: 10)
+            // A's bootout, made while it holds the lock.
+            loaded.value = false
+            XCTAssertEqual(calls.value.map { $0[1] }, ["print"], "C changed launchd while A held the lock")
+            if crashes {
+                arm.cancel()
+                do {
+                    try await arm.value
+                    XCTFail("a cancelled arm reported the agent armed")
+                } catch {}
+                uninstallOfA.release()
+                XCTAssertEqual(calls.value.map { $0[1] }, ["print"], "a crash while waiting changed nothing in launchd")
+                XCTAssertFalse(loaded.value)
+                XCTAssertEqual(try Data(contentsOf: c.backstopPlist), trusted)
+                XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: c.launchAgents.path), ["com.insomnia.backstop.plist"], "a candidate was left behind")
+            } else {
+                uninstallOfA.release()
+                try await arm.value
+                XCTAssertEqual(calls.value.map { $0[1] }, ["print", "print", "bootout", "bootstrap"])
+                XCTAssertEqual(lockSeen.value, ["print unhanded held", "print unhanded held", "bootout handed held", "bootstrap handed held"], "A's lock at the first reading, C's after")
+                XCTAssertTrue(loaded.value)
+                XCTAssertTrue(b.isOwnAgentFile(try XCTUnwrap(loadedFrom.value)), "C's job is loaded at the end: \(loadedFrom.value ?? "none")")
+            }
+            own.release()
+        }
+    }
+
+    /// A job running this build's exact command line counts as this
+    /// folder's only when launchd loaded it from this folder's plist or
+    /// candidate: another folder's uninstall would unload it. A link to the
+    /// whole folder is still this folder. A LaunchAgents folder of another
+    /// folder that only links here, or a link to LaunchAgents under another
+    /// name, is not: that folder keeps its own journal and lock. Neither is
+    /// a print without one absolute path.
+    func testOnlyAJobLoadedFromThisFolderIsArmed() async throws {
+        let fm = FileManager.default
+        let mine = home.paths.launchAgents.path
+        let label = "com.insomnia.backstop"
+        try fm.createDirectory(atPath: mine + "/.\(label).staging", withIntermediateDirectories: true)
+        let wholeLink = home.root.appendingPathComponent("a link to this folder").path
+        try fm.createSymbolicLink(atPath: wholeLink, withDestinationPath: home.root.path)
+        let aliasHome = try otherFolder("folder sharing LaunchAgents")
+        try fm.createSymbolicLink(atPath: aliasHome.launchAgents.path, withDestinationPath: mine)
+        let oddLink = home.root.appendingPathComponent("a link to LaunchAgents").path
+        try fm.createSymbolicLink(atPath: oddLink, withDestinationPath: mine)
+        let elsewhere = try otherFolder("folder elsewhere")
+        let candidate = "\(label).candidate-\(UUID().uuidString).plist"
+        var cases: [(name: String, path: String?, own: Bool)] = [
+            ("this folder's plist", "\(mine)/\(label).plist", true),
+            ("this folder's candidate", "\(mine)/.\(label).staging/\(candidate)", true),
+            ("an older build's candidate beside the plist", "\(mine)/\(candidate)", true),
+            ("this folder through a link to all of it", "\(wholeLink)/LaunchAgents/\(label).plist", true),
+            ("a candidate through a link to all of it", "\(wholeLink)/LaunchAgents/.\(label).staging/\(candidate)", true),
+            ("another folder whose LaunchAgents links here", "\(aliasHome.launchAgents.path)/\(label).plist", false),
+            ("a link to LaunchAgents under another name", "\(oddLink)/\(label).plist", false),
+            ("another folder", elsewhere.backstopPlist.path, false),
+            ("another name in this folder", "\(mine)/com.example.agent.plist", false),
+            ("the plist's name in the staging folder", "\(mine)/.\(label).staging/\(label).plist", false),
+            ("a relative path", "LaunchAgents/\(label).plist", false),
+            ("no path line", nil, false),
+        ]
+        // The same folder from the root, without the links on its way (on
+        // macOS /var is a link to /private/var), when that spelling differs.
+        let real = try XCTUnwrap(realpath(mine, nil).map { p in defer { free(p) }; return String(cString: p) })
+        if real != mine { cases.append(("this folder spelled from the root", "\(real)/\(label).plist", true)) }
+        let b = try makeBackstop()
+        try await b.arm()
+        for c in cases {
+            loadedFrom.value = c.path
+            calls.value = []
+            try await b.arm()
+            XCTAssertEqual(calls.value.map { $0[1] }, c.own ? ["print"] : ["print", "print", "bootout", "bootstrap"], c.name)
+            if let path = c.path, path.hasPrefix("/") { XCTAssertEqual(b.isOwnAgentFile(path), c.own, c.name) }
+        }
+    }
+
+    /// The one top-level `path =` line, as uninstall.sh's loaded_agent
+    /// reads it: none, two, a relative one or only a nested one is no path.
+    func testTheLoadPathIsTheOneTopLevelAbsolutePath() {
+        let job = ["/bin/sh"]
+        XCTAssertEqual(LaunchdBackstop.loadedPath(fromPrint: Self.printOutput(arguments: job, runInterval: 60, path: "/x/LaunchAgents/a.plist")), "/x/LaunchAgents/a.plist")
+        XCTAssertNil(LaunchdBackstop.loadedPath(fromPrint: Self.printOutput(arguments: job, runInterval: 60, path: nil)))
+        XCTAssertNil(LaunchdBackstop.loadedPath(fromPrint: Self.printOutput(arguments: job, runInterval: 60, path: "x/a.plist")))
+        XCTAssertNil(LaunchdBackstop.loadedPath(fromPrint: "x = {\n\tpath = /a.plist\n\tpath = /b.plist\n}\n"))
+        XCTAssertNil(LaunchdBackstop.loadedPath(fromPrint: "x = {\n\tendpoints = {\n\t\tpath = /a.plist\n\t}\n}\n"))
     }
 }

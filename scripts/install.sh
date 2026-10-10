@@ -1,13 +1,16 @@
 #!/bin/bash
 # Install Insomnia: put Insomnia.app (with backstop.sh sealed inside it) in
 # ~/Applications, install the LaunchAgent that verifies the bundle and runs
-# that script, and write the sudoers rule. Idempotent; asks for sudo once (for
-# /etc/sudoers.d/insomnia), before anything of a previous install is touched.
-# The bundle and the LaunchAgent are replaced together, in one locked step
-# (the agent pins one build, so the two must match at every moment), and a
-# run that stops after that step began puts the previous bundle back. Not
-# atomic beyond that: a failure after the sudoers step says exactly what was
-# replaced so far.
+# that script, write the three-line sudoers rule, and create the root-owned
+# receipt folder and this user's receipt in /private/var/db/com.kgarg.insomnia
+# (kept if already there and safe). Idempotent; asks for sudo once (for
+# /etc/sudoers.d/insomnia and the receipt), before a running Insomnia is asked
+# to quit and before anything of a previous install is touched. The rule, the
+# receipt, the bundle and the LaunchAgent are set up under the recovery lock; the bundle
+# and the LaunchAgent together, in one step (the agent pins one build, so the
+# two must match at every moment), and a run that stops after that step began
+# puts the previous bundle back. Not atomic beyond that: a failure after the
+# rule is written says exactly what was replaced so far.
 #
 # Where the bundle comes from:
 #   ./scripts/install.sh                      builds it from this checkout
@@ -56,7 +59,6 @@ SUDO=/usr/bin/sudo
 PLUTIL=/usr/bin/plutil
 CODESIGN=/usr/bin/codesign
 DITTO=/usr/bin/ditto
-CHMOD=/bin/chmod
 SYSCTL=/usr/sbin/sysctl
 LOCKF=/usr/bin/lockf
 MV=/bin/mv
@@ -64,10 +66,28 @@ RM=/bin/rm
 RMDIR=/bin/rmdir
 MKTEMP=/usr/bin/mktemp
 MKDIR=/bin/mkdir
+CHMOD=/bin/chmod
+CAT=/bin/cat
+HEAD=/usr/bin/head
+# sed reads the requirement the LaunchAgent pins and escapes the plist's
+# text (xml_escape).
+SED=/usr/bin/sed
+INSTALL=/usr/bin/install
+STAT=/usr/bin/stat
+LS=/bin/ls
+ID=/usr/bin/id
+# sudo is given visudo and install by full path. Given a bare name, it would
+# search the caller's PATH and run whatever it finds there as root.
+VISUDO=/usr/sbin/visudo
+# The shell sudo runs the repair of a receipt this user cannot open in
+# (repair_unreadable_receipt), by full path.
+ROOT_SHELL=/bin/bash
 LOCK_TIMEOUT_SECONDS=10
+# How long to wait for the receipt's lock before the release file is
+# written: the root command holds it from its checks until pmset exits.
+RECEIPT_LOCK_TIMEOUT_SECONDS=10
 # The limit for one call to sudo, pgrep, launchctl or codesign made while this
-# run holds the recovery lock (and for the sudoers check before it); see
-# bounded() below.
+# run holds the recovery lock; see bounded() below.
 CALL_TIMEOUT_SECONDS=30
 
 # What a prebuilt bundle (--app) must be.
@@ -92,6 +112,15 @@ LABEL="com.insomnia.backstop"
 PLIST="$LAUNCH_AGENTS/$LABEL.plist"
 SUDOERS=/etc/sudoers.d/insomnia
 UID_NUM="$(id -u)"
+# The folder of the root-owned receipts (SleepOffReceipts.swift) and the one
+# owner besides root it may have: none, as uid 0 is root. Tests patch both
+# lines in a private copy, for a folder in their temporary directory.
+RECEIPTS=/private/var/db/com.kgarg.insomnia
+RECEIPT_OWNER=0
+RECEIPT="$RECEIPTS/$UID_NUM"
+RELEASED="$RECEIPT.released"
+TMP_RECEIPT=""
+TMP_RELEASE=""
 # Where the new bundle is assembled and signed (step 3) and where the previous
 # one waits during the swap (step 6). Both inside $APP_DIR, so the swap is two
 # renames on one filesystem. The staging directory's name carries the PID of
@@ -103,6 +132,9 @@ NEW_APP=""
 # Where build-app.sh writes a source build before it is staged.
 BUILD_DIR=""
 TMP_SUDOERS=""
+# Set from the moment the new rule is installed (step 5) until the new bundle
+# is at $APP. A stop in between prints rule_ahead_note on exit.
+RULE_AHEAD_OF_BUNDLE=0
 CANDIDATE=""
 CANDIDATE_DIR=""
 WORK=""
@@ -118,10 +150,12 @@ command_line() { local line; line="$(printf '%q ' "$@")"; printf '%s' "${line% }
 # keep this run waiting forever. Its combined output is left in
 # BOUNDED_OUTPUT (trailing newline removed) and its exit status returned, or
 # 124 when it did not finish within CALL_TIMEOUT_SECONDS and was stopped, or
-# 125 when it is sudo and still running (pid in BOUNDED_PID).
+# 125 when it is sudo and still running. No pid is kept or printed for it:
+# by the time anyone acted on one, it could name another process.
 #
 # supervise() starts the call in the background and enforces the limit
-# itself, so the limit holds even if this run is killed while it waits. Once
+# itself, so the limit holds even if this run is killed while it waits, or
+# its whole process group gets SIGTERM or SIGHUP. Once
 # the limit has passed, the call gets SIGTERM, and SIGKILL one to two seconds
 # later if it is still there. sudo only ever gets SIGTERM: killing sudo would
 # orphan what it runs as root. Both waits are read from bash's SECONDS clock,
@@ -136,13 +170,25 @@ command_line() { local line; line="$(printf '%q ' "$@")"; printf '%s' "${line% }
 # lock until it ends, as backstop.sh does with sudo pmset.
 # Each call's files get a name from mktemp, so a call made inside $(...)
 # cannot reuse another's.
+# BOUNDED_WHOLE is 1 only when the output was read whole: the read ran to
+# the end of the file, not to a NUL byte or an error, and its byte count
+# equals the size stat gave just before, with the same device, inode and
+# size just after. Otherwise it is 0, and the output is only a prefix that
+# looks plausible, so a caller that decides anything from the output must
+# treat it as unknown even after an exit status of 0. The file is this run's
+# own, in its private 0700 $WORK, written by a call that has been reaped (or,
+# for 124, stopped and reaped). A status file that cannot be read, or that
+# holds no number from 0 to 255, gives 124.
 BOUNDED_OUTPUT=""
-BOUNDED_PID=""
+BOUNDED_WHOLE=0
+# install.sh only prints a call's output and decides nothing from it, so it
+# never reads BOUNDED_WHOLE; bounded() stays the same as uninstall.sh's.
+# shellcheck disable=SC2034
 bounded() { # command args...
-  local base supervisor rc deadline
+  local base supervisor rc deadline file="" size opened=0 read_rc=0
   base="$("$MKTEMP" "$WORK/call.XXXXXX")"
   BOUNDED_OUTPUT=""
-  BOUNDED_PID=""
+  BOUNDED_WHOLE=0
   supervise "$base" "$@" </dev/null >/dev/null 2>&1 &
   supervisor=$!
   if [[ "$1" == "$SUDO" ]]; then
@@ -153,7 +199,6 @@ bounded() { # command args...
       sleep 0.01
     done
     if [[ ! -s "$base.rc" ]]; then
-      BOUNDED_PID="$(cat "$base.pid" 2>/dev/null || true)"
       return 125
     fi
   fi
@@ -161,19 +206,39 @@ bounded() { # command args...
   # this wait ends.
   wait "$supervisor" 2>/dev/null || true
   rc=124
-  if [[ -s "$base.rc" ]]; then read -r rc < "$base.rc"; fi
-  IFS= read -r -d '' BOUNDED_OUTPUT < "$base.out" || true
+  if [[ -s "$base.rc" ]]; then read -r rc < "$base.rc" || rc=124; fi
+  [[ "$rc" =~ ^[0-9]{1,3}$ ]] && (( 10#$rc <= 255 )) || rc=124
+  file="$("$STAT" -f '%d:%i %z' "$base.out" 2>/dev/null)" || file=""
+  { opened=1; IFS= read -r -d '' BOUNDED_OUTPUT || read_rc=$?; } 2>/dev/null < "$base.out" || true
+  if (( opened && read_rc == 1 )) && [[ "$file" =~ ^[0-9]+:[0-9]+\ ([0-9]+)$ ]]; then
+    size="${BASH_REMATCH[1]}"
+    bounded_bytes
+    if [[ "$("$STAT" -f '%d:%i %z' "$base.out" 2>/dev/null)" == "$file" ]] && (( BOUNDED_BYTES == 10#$size )); then
+      BOUNDED_WHOLE=1
+    fi
+  fi
   BOUNDED_OUTPUT="${BOUNDED_OUTPUT%$'\n'}"
   return "$rc"
 }
+# BOUNDED_BYTES: the bytes in BOUNDED_OUTPUT, not its characters.
+bounded_bytes() { local LC_ALL=C; BOUNDED_BYTES=${#BOUNDED_OUTPUT}; }
 # The supervising process of one bounded() call; it runs in the background.
 # The call is its only job, so `kill %1` signals the call, and the shell
 # skips a job it has already reaped: a reused pid is never signalled. The
 # status file is written once the call has been reaped.
+# The supervisor keeps fd 9 until the call has exited and been reaped, and
+# the call may close its own copy (sudo does), so nothing else may end the
+# supervisor first. It ignores SIGTERM and SIGHUP, which reach this run's
+# whole process group when launchd stops what is left of a job or a
+# terminal closes, and with errexit off a failed status write or a failed
+# check does not end it either. The call gets the default actions back
+# before it starts, so the SIGTERM at its limit can still stop it.
 supervise() { # base command args...
   local base="$1" cpid rc=0 deadline
   shift
-  "$@" </dev/null >"$base.out" 2>&1 &
+  set +e
+  trap '' TERM HUP
+  ( trap - TERM HUP; exec "$@" ) </dev/null >"$base.out" 2>&1 &
   cpid=$!
   echo "$cpid" > "$base.pid"
   deadline=$(( SECONDS + CALL_TIMEOUT_SECONDS ))
@@ -257,30 +322,63 @@ move_bundle() { # from to
   "$MV" "$1" "$2"
 }
 
-# Whether sudo grants the four pmset commands of the rule without a
-# password: 0 when it does, 124 when a check did not answer within
-# CALL_TIMEOUT_SECONDS and stopped on SIGTERM, 125 when it did not stop and
-# is still running (BOUNDED_PID), 1 otherwise. `sudo -n -l <command>` checks
-# the rule without running pmset (nothing on the machine changes).
+# Whether sudo lists the three pmset commands of the rule as permitted
+# without asking for a password: 0 when it does, 124 when a check did not
+# answer within CALL_TIMEOUT_SECONDS and stopped on SIGTERM, 125 when it did
+# not stop and is still running, 1 otherwise. `sudo -l
+# <command>` checks the policy without running pmset, so nothing on the
+# machine changes. `-k` ignores the credential step 2 cached (without
+# removing it) and `-n` fails instead of prompting, so a machine where no
+# rule lets this user list without a password fails here. This is not proof
+# that the restore runs without a password: by default sudo lists without a
+# password once any of the user's rules is NOPASSWD, and the listing does not
+# say which rule matched (an admin rule that needs the password would pass
+# too). The command behind the app's password dialog asks again at every
+# Start, before it writes anything, with `sudo -k -n -ll`, which shows the
+# rule that matched, and turns sleep off only when that is this file's
+# NOPASSWD restore line.
 pmset_rule_check() { # pmset arguments
   local rc=0
-  bounded "$SUDO" -n -l /usr/bin/pmset "$@" || rc=$?
+  bounded "$SUDO" -k -n -l /usr/bin/pmset "$@" || rc=$?
   if (( rc == 0 || rc == 124 || rc == 125 )); then return "$rc"; fi
   return 1
 }
 # The part of a message about a sudo check that is still running.
 sudo_alive_note() {
-  printf "It was sent SIGTERM and is still running as pid %s. It is not killed, because killing sudo could leave what it runs as root behind" "${BOUNDED_PID:-?}"
+  printf "It was sent SIGTERM and is still running. It is not killed, because killing sudo could leave what it runs as root behind"
 }
 pmset_rule_effective() {
-  pmset_rule_check -a disablesleep 1 \
-    && pmset_rule_check -a disablesleep 0 \
+  pmset_rule_check -a disablesleep 0 \
     && pmset_rule_check -b lowpowermode 1 \
     && pmset_rule_check -b lowpowermode 0
 }
 
+# This script again, with the same bundle source. A prebuilt bundle is checked
+# again from $PREBUILT: the private copy is deleted when this run exits.
+rerun_command() {
+  if [[ -n "$PREBUILT" ]]; then
+    command_line "$0" --allow-unverified-origin --app "$PREBUILT"
+  else
+    command_line "$SCRIPT_DIR/install.sh"
+  fi
+}
+
+rule_ahead_note() {
+  cat >&2 <<NOTE
+
+$SUDOERS already holds the new three-line rule, but the new build is not at
+$APP. An Insomnia build older than this installer cannot start a session with
+that rule. Finish the install by rerunning:
+  $(rerun_command)
+NOTE
+}
+
 cleanup() {
+  local rc=$?
+  if (( rc != 0 && RULE_AHEAD_OF_BUNDLE )); then rule_ahead_note; fi
   if [[ -n "$TMP_SUDOERS" ]]; then "$RM" -f "$TMP_SUDOERS"; fi
+  if [[ -n "$TMP_RECEIPT" ]]; then "$RM" -f "$TMP_RECEIPT"; fi
+  if [[ -n "$TMP_RELEASE" ]]; then "$RM" -f "$TMP_RELEASE"; fi
   if [[ -n "$CANDIDATE" ]]; then "$RM" -f "$CANDIDATE"; fi
   if [[ -n "$CANDIDATE_DIR" ]]; then "$RMDIR" "$CANDIDATE_DIR" 2>/dev/null || true; fi
   if [[ -n "$STAGE" ]]; then "$RM" -rf "$STAGE"; fi
@@ -383,48 +481,46 @@ else
   SOURCE_APP="$BUILD_DIR/Insomnia.app"
 fi
 
-# 2. sudoers -----------------------------------------------------------------
-#    The password prompt comes first: until the rule is installed and proven
-#    effective, the running app is not asked to quit and neither the bundle
-#    (backstop.sh included) nor the LaunchAgent are touched.
-step "Writing $SUDOERS (requires your password once)"
-TMP_SUDOERS="$("$MKTEMP")"
-cat > "$TMP_SUDOERS" <<SUDO
-# Installed by Insomnia install.sh. Exactly four commands, nothing else.
-$USER ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 1
-$USER ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0
-$USER ALL=(root) NOPASSWD: /usr/bin/pmset -b lowpowermode 1
-$USER ALL=(root) NOPASSWD: /usr/bin/pmset -b lowpowermode 0
-SUDO
-if "$SUDO" visudo -cf "$TMP_SUDOERS" >/dev/null; then
-  "$SUDO" install -m 0440 -o root -g wheel "$TMP_SUDOERS" "$SUDOERS"
-else
-  echo "sudoers file failed validation (or sudo did not authenticate); not installed. Nothing was changed." >&2
-  exit 1
+# 2. Password, then quit -----------------------------------------------------
+#    Order: say whether a session will end, ask for the password (`sudo -v`),
+#    then quit the running app. A cancelled or failed password stops before
+#    the app is asked to quit, so it changes nothing and a running session
+#    keeps going. An app that refuses to quit stops the install with
+#    nothing changed. Nothing of the previous install, $SUDOERS included, is
+#    touched before step 5 holds the recovery lock.
+
+# Whether session.json holds a deadline still in the future. Only the Z
+# form the app writes is read here; a deadline this cannot read (one with
+# an offset in place of Z included) counts as a running session: it may
+# be one, and the cost is one question.
+session_running() {
+  local f="$APP_SUPPORT/session.json" ends ends_epoch
+  [[ -f "$f" ]] || return 1
+  ends="$("$PLUTIL" -extract endsAt raw -o - "$f" 2>/dev/null || true)"
+  ends_epoch="$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$ends" +%s 2>/dev/null || true)"
+  [[ -z "$ends_epoch" ]] || (( ends_epoch > $(date -u +%s) ))
+}
+if session_running; then
+  echo "A session is running and the upgrade will end it."
+  # Asked only when there is a terminal to answer on; a run without one
+  # goes ahead after the line above.
+  if [[ -t 0 ]]; then
+    answer=""
+    read -r -p "Continue? [y/N] " answer || true
+    case "$answer" in
+      [yY]|[yY][eE][sS]) ;;
+      *) echo "Nothing was changed; the session keeps running." >&2; exit 1 ;;
+    esac
+  fi
 fi
-# The backstop cannot undo anything without the rule, so stop here. Checked
-# again once this run holds the recovery lock (step 5).
-rule_rc=0
-pmset_rule_effective || rule_rc=$?
-if (( rule_rc == 0 )); then
-  echo "sudoers rule verified"
-elif (( rule_rc == 124 )); then
-  echo "'sudo -n -l', which checks the rule, did not answer within ${CALL_TIMEOUT_SECONDS}s, so the rule in $SUDOERS is not verified. The app (with backstop.sh) and the LaunchAgent were not touched; rerun once sudo answers." >&2
-  exit 1
-elif (( rule_rc == 125 )); then
-  echo "'sudo -n -l', which checks the rule, did not answer within ${CALL_TIMEOUT_SECONDS}s, so the rule in $SUDOERS is not verified. $(sudo_alive_note). The app (with backstop.sh) and the LaunchAgent were not touched; rerun once it has ended (or stop it with 'sudo kill ${BOUNDED_PID:-<pid>}')." >&2
-  exit 1
-else
-  echo "'sudo -n pmset' is still not permitted; check $SUDOERS. The app (with backstop.sh) and the LaunchAgent were not touched." >&2
+
+step "Authenticating (requires your password once)"
+if ! "$SUDO" -v; then
+  echo "sudo did not authenticate. Nothing was changed; Insomnia was not asked to quit, so a running session keeps going." >&2
   exit 1
 fi
 
-# 3. Bundle ------------------------------------------------------------------
-#    Copied into a staging directory inside $APP_DIR. $APP itself is
-#    replaced in step 6, in the same locked step as the LaunchAgent: the
-#    agent pins one build's requirement, so the bundle at $APP and the loaded
-#    agent must be a matching pair before, during and after a failed run.
-step "Staging Insomnia.app"
+QUIT_DONE=0
 # Ask the app to quit and wait until it has actually exited. It refuses to
 # quit while it has unresolved recovery work; that refusal stands (no pkill),
 # and nothing of the old install is overwritten while it is still running.
@@ -437,10 +533,39 @@ if "$PGREP" -x Insomnia >/dev/null 2>&1; then
   done
   if "$PGREP" -x Insomnia >/dev/null 2>&1; then
     echo "Insomnia is still running after ${QUIT_WAIT_SECONDS}s (it may be refusing to quit until its own recovery finishes)." >&2
-    echo "Let it finish or quit it from its menu, then rerun. $SUDOERS is installed; the app (with backstop.sh) and the LaunchAgent were not touched." >&2
+    echo "Let it finish or quit it from its menu, then rerun. Nothing was changed." >&2
+    exit 1
+  fi
+  QUIT_DONE=1
+fi
+
+# What a stop before the rule is written adds: whether the app was quit.
+unchanged_note() {
+  if (( QUIT_DONE )); then
+    echo "Insomnia was quit, which ended any session; nothing else was changed. Open the installed build to keep using it ($(command_line open "$APP")), or rerun." >&2
+  else
+    echo "Nothing was changed." >&2
+  fi
+}
+
+# The quit can take up to QUIT_WAIT_SECONDS. If sudo's cached credential
+# expired meanwhile, ask once more. `sudo -v` also restarts the credential's
+# timeout, so the sudoers step under the lock can use it.
+if ! "$SUDO" -n -v 2>/dev/null; then
+  echo "The sudo credential expired while Insomnia was quitting; asking again."
+  if ! "$SUDO" -v; then
+    echo "sudo did not authenticate; nothing was installed." >&2
+    unchanged_note
     exit 1
   fi
 fi
+
+# 3. Bundle ------------------------------------------------------------------
+#    Copied into a staging directory inside $APP_DIR. $APP itself is
+#    replaced in step 6, in the same locked step as the LaunchAgent: the
+#    agent pins one build's requirement, so the bundle at $APP and the loaded
+#    agent must be a matching pair before, during and after a failed run.
+step "Staging Insomnia.app"
 "$MKDIR" -p "$APP_DIR"
 STAGE="$("$MKTEMP" -d "$APP_DIR/.Insomnia.app.staging.$$.XXXXXX")"
 NEW_APP="$STAGE/Insomnia.app"
@@ -460,7 +585,8 @@ NEW_APP="$STAGE/Insomnia.app"
 # Extended attributes, the quarantine flag among them, stay. chmod -R
 # skips symbolic links.
 if ! "$CHMOD" -R go-w "$NEW_APP" || ! "$CHMOD" -R -N "$NEW_APP"; then
-  echo "could not remove group and other write permission and ACLs from the staged bundle $NEW_APP (see the error above). $SUDOERS is installed; the app at $APP and the LaunchAgent were not touched." >&2
+  echo "could not remove group and other write permission and ACLs from the staged bundle $NEW_APP (see the error above)." >&2
+  unchanged_note
   exit 1
 fi
 # backstop.sh was sealed into the bundle before signing (build-app.sh), so
@@ -478,15 +604,17 @@ echo "signed $("$CODESIGN" -dv "$NEW_APP" 2>&1 | grep -i identifier || true)"
 # instead. It does not depend on the path, so it still holds
 # once the bundle is at $APP. The app reads the same text through the
 # Security framework (CodeRequirement.swift) to recognise this plist.
-REQUIREMENT="$("$CODESIGN" -d -r- "$NEW_APP" 2>&1 | sed -n 's/^#\{0,1\} *designated => //p' | head -n 1)"
+REQUIREMENT="$("$CODESIGN" -d -r- "$NEW_APP" 2>&1 | "$SED" -n 's/^#\{0,1\} *designated => //p' | "$HEAD" -n 1)"
 if [[ -z "$REQUIREMENT" ]]; then
-  echo "could not read the designated requirement of the new bundle ('codesign -d -r-'); the LaunchAgent cannot pin it. $SUDOERS is installed; the app at $APP and the LaunchAgent were not touched." >&2
+  echo "could not read the designated requirement of the new bundle ('codesign -d -r-'); the LaunchAgent cannot pin it." >&2
+  unchanged_note
   exit 1
 fi
 # The check the agent will run every minute, run once here so a bundle the
 # agent would refuse is caught now instead of at the first recovery.
 if ! "$CODESIGN" --verify --strict "-R=$REQUIREMENT" "$NEW_APP"; then
-  echo "the new bundle does not satisfy its own requirement ($REQUIREMENT); the LaunchAgent would never run backstop.sh. $SUDOERS is installed; the app at $APP and the LaunchAgent were not touched." >&2
+  echo "the new bundle does not satisfy its own requirement ($REQUIREMENT); the LaunchAgent would never run backstop.sh. $SUDOERS, the app at $APP and the LaunchAgent were not touched." >&2
+  unchanged_note
   exit 1
 fi
 echo "LaunchAgent will require: $REQUIREMENT"
@@ -495,20 +623,20 @@ echo "LaunchAgent will require: $REQUIREMENT"
 step "Creating $APP_SUPPORT, $LOG_DIR and $LAUNCH_AGENTS"
 "$MKDIR" -p "$APP_SUPPORT" "$LOG_DIR" "$LAUNCH_AGENTS"
 
-# 5. Recovery and LaunchAgent replacement are one transaction under the
-#    recovery lock (the same flock(2) file the app and backstop use), so a
-#    freshly started app cannot dirty the journal between the clean check
-#    and the bootout of the old job. The backstop inherits fd 9 and shares
-#    the lock instead of waiting on it. The lock file is never unlinked or
-#    replaced, so every party keeps locking the same inode.
+# 5. The sudoers rule, the recovery and the LaunchAgent replacement are one
+#    transaction under the recovery lock (the same flock(2) file the app and
+#    backstop use), so a freshly started app cannot dirty the journal between
+#    the clean check and the bootout of the old job. The backstop inherits
+#    fd 9 and shares the lock instead of waiting on it. The lock file is
+#    never unlinked or replaced, so every party keeps locking the same inode.
 step "Taking the recovery lock"
 LOCK="$APP_SUPPORT/.recovery.lock"
 exec 9<>"$LOCK"
 lock_rc=0
 "$LOCKF" -t "$LOCK_TIMEOUT_SECONDS" 9 2>/dev/null || lock_rc=$?
 if (( lock_rc != 0 )); then
-  echo "The recovery lock $LOCK is held by another process (the app or a running backstop)." >&2
-  echo "Wait a minute and rerun. $SUDOERS is installed; the app at $APP and the LaunchAgent were not touched." >&2
+  echo "The recovery lock $LOCK is held by another process (the app or a running backstop). Wait a minute and rerun." >&2
+  unchanged_note
   exit 75
 fi
 # From here on every sudo, pgrep, launchctl and codesign call goes through
@@ -519,55 +647,583 @@ fi
 pgrep_rc=0
 bounded "$PGREP" -x Insomnia || pgrep_rc=$?
 if (( pgrep_rc == 0 )); then
-  echo "Insomnia started again; quit it and rerun. The app at $APP and the LaunchAgent were not touched." >&2
+  echo "Insomnia started again; quit it and rerun." >&2
+  unchanged_note
   exit 1
 elif (( pgrep_rc != 1 )); then
-  echo "pgrep $(call_result "$pgrep_rc"), so whether Insomnia started again is unknown. The app at $APP and the LaunchAgent were not touched; rerun." >&2
+  echo "pgrep $(call_result "$pgrep_rc"), so whether Insomnia started again is unknown. Rerun this script." >&2
+  unchanged_note
   exit 1
 fi
-# The rule was verified in step 2, before this run waited for the lock. An
-# uninstall.sh that took the lock first removes $SUDOERS under it, and its
-# recovery leaves no journal, so the recovery below would succeed without
-# the rule. Without it no session can undo pmset. Checked here, under the
-# lock that uninstall.sh also needs, and this run holds the lock until the
-# new pair is published.
+# The sudoers rule is written here, under the lock and after the app has
+# quit, so every stop before this point leaves the installed app with the
+# rule it was installed with, and an uninstall.sh that removes $SUDOERS under
+# the same lock cannot run between the write and the check below. Three
+# commands, and none of them can keep the Mac awake: turning sleep back on
+# and the battery Low Power Mode floor stay passwordless so the app,
+# backstop.sh and uninstall.sh can recover unattended. Turning sleep off
+# (`pmset -a disablesleep 1`) has no line here, on any path; the app asks for
+# the administrator password each time a session starts. The file is always
+# rewritten, so a reinstall over an older four-line rule drops that line. An
+# older build left at $APP cannot start a session under the new rule, so a
+# stop between the rule and the new bundle says so and gives the rerun
+# command (rule_ahead_note). sudo runs with -n on the credential step 2
+# refreshed: it never prompts while this run holds the lock.
+step "Writing $SUDOERS"
+TMP_SUDOERS="$("$MKTEMP")"
+"$CAT" > "$TMP_SUDOERS" <<SUDO
+# Installed by Insomnia install.sh. Exactly three commands, nothing else.
+$USER ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0
+$USER ALL=(root) NOPASSWD: /usr/bin/pmset -b lowpowermode 1
+$USER ALL=(root) NOPASSWD: /usr/bin/pmset -b lowpowermode 0
+SUDO
+# What a stop says about a sudo call made here that did not answer in time.
+sudo_stalled_note() { # rc what
+  if (( $1 == 125 )); then
+    cat >&2 <<FAIL
+$2 did not answer within ${CALL_TIMEOUT_SECONDS}s. $(sudo_alive_note).
+It keeps the recovery lock until it ends, so until then the app cannot start a
+session and the LaunchAgent's backstop cannot undo one. Nothing here stops it
+by pid: a pid noted now could name another process by the time anyone acts on
+it. Once it has ended (a restart ends it too), rerun this script.
+FAIL
+  else
+    cat >&2 <<FAIL
+$2 did not answer within ${CALL_TIMEOUT_SECONDS}s. It stopped on SIGTERM and this
+run exits, which lets go of the lock, so the app and the LaunchAgent's backstop
+can take it again and undo a session left over.
+FAIL
+  fi
+}
+validate_rc=0
+bounded "$SUDO" -n "$VISUDO" -cf "$TMP_SUDOERS" || validate_rc=$?
+if (( validate_rc == 124 || validate_rc == 125 )); then
+  echo >&2
+  sudo_stalled_note "$validate_rc" "Install stopped: 'sudo visudo -cf', which validates the new rule,"
+  echo "$SUDOERS, the app at $APP and the LaunchAgent were not touched; the new build was discarded. Rerun this script." >&2
+  unchanged_note
+  exit 1
+elif (( validate_rc != 0 )); then
+  if [[ -n "$BOUNDED_OUTPUT" ]]; then printf '%s\n' "$BOUNDED_OUTPUT" >&2; fi
+  echo "The new sudoers rule failed validation, or sudo did not run visudo without a password (the credential step 2 cached may have expired). $SUDOERS was not touched." >&2
+  unchanged_note
+  exit 1
+fi
+install_rc=0
+bounded "$SUDO" -n "$INSTALL" -m 0440 -o root -g wheel "$TMP_SUDOERS" "$SUDOERS" || install_rc=$?
+if (( install_rc == 124 || install_rc == 125 )); then
+  echo >&2
+  sudo_stalled_note "$install_rc" "Install stopped: 'sudo install', which writes $SUDOERS,"
+  cat >&2 <<FAIL
+Whether $SUDOERS holds the previous rule, the new one or neither is unknown. The
+app at $APP and the LaunchAgent were not touched; the new build was discarded.
+Rerun this script to write the rule again.
+FAIL
+  exit 1
+elif (( install_rc != 0 )); then
+  if [[ -n "$BOUNDED_OUTPUT" ]]; then printf '%s\n' "$BOUNDED_OUTPUT" >&2; fi
+  cat >&2 <<FAIL
+
+Install stopped: 'sudo install' exited $install_rc writing $SUDOERS, so it may hold
+the previous rule or none. The app at $APP and the LaunchAgent were not touched;
+the new build was discarded. Rerun this script to write the rule again.
+FAIL
+  exit 1
+fi
+RULE_AHEAD_OF_BUNDLE=1
+# A listing, not a run of the restore: see pmset_rule_check above. It
+# catches a rule sudo does not read at all (no rule lets this user list
+# without a password), not one that a later rule overrides.
 rule_rc=0
 pmset_rule_effective || rule_rc=$?
-if (( rule_rc == 124 )); then
-  cat >&2 <<FAIL
-
-Install stopped: 'sudo -n -l', which checks the rule in $SUDOERS again now that
-this run holds the recovery lock, did not answer within ${CALL_TIMEOUT_SECONDS}s. The check
-stopped on SIGTERM and this run exits, which lets go of the lock, so the app and
-the LaunchAgent's backstop can take it again and undo a session left over. The
-app at $APP and the LaunchAgent were not touched; the new build was discarded.
-Rerun this script once sudo answers.
-FAIL
+if (( rule_rc == 0 )); then
+  echo "sudoers rule written; 'sudo -k -n -l' lists its three commands (at every Start, before sleep is turned off, Insomnia checks with 'sudo -k -n -ll' that the restore matches this rule without a password)"
+elif (( rule_rc == 124 || rule_rc == 125 )); then
+  echo >&2
+  sudo_stalled_note "$rule_rc" "Install stopped: 'sudo -k -n -l', which checks the rule just written to $SUDOERS,"
+  echo "The app at $APP and the LaunchAgent were not touched; the new build was discarded." >&2
   exit 1
-elif (( rule_rc == 125 )); then
+else
   cat >&2 <<FAIL
 
-Install stopped: 'sudo -n -l', which checks the rule in $SUDOERS again now that
-this run holds the recovery lock, did not answer within ${CALL_TIMEOUT_SECONDS}s. $(sudo_alive_note).
-It keeps the recovery lock until it ends, so until then the app cannot start a
-session and the LaunchAgent's backstop cannot undo one. If it does not end by
-itself, stop it:
-  sudo kill ${BOUNDED_PID:-<pid>}
-The app at $APP and the LaunchAgent were not touched; the new build was
-discarded. Rerun this script once it has ended.
-FAIL
-  exit 1
-elif (( rule_rc != 0 )); then
-  cat >&2 <<FAIL
-
-Install stopped: 'sudo -n pmset' was permitted when $SUDOERS was installed above,
-but is not now that this run holds the recovery lock. Something removed or changed
-the rule while this run waited (uninstall.sh removes it under the same lock), and
-without it no session can undo pmset. The app at $APP and the LaunchAgent were not
-touched; the new build was discarded. Rerun this script to install the rule again.
+Install stopped: $SUDOERS was written, but 'sudo -k -n -l /usr/bin/pmset ...'
+does not list its commands without a password, so sudo does not read the rule
+as written. Check $SUDOERS and the other files in /etc/sudoers.d. Without the
+rule no session can undo pmset. The app at $APP and the LaunchAgent were not
+touched; the new build was discarded.
 FAIL
   exit 1
 fi
+
+# The receipt: /private/var/db/com.kgarg.insomnia/<uid>, root's, 0600, one
+# link, 82 bytes (SleepOffReceipts.swift), with one access control entry,
+# `user:<name> allow read`, for this user. Only root and this user can open
+# it, so no other account can hold its lock. The command behind a Start's
+# password dialog locks it and writes it as root before it turns sleep off,
+# and the app, backstop.sh and uninstall.sh read it under the same lock to
+# tell whether a start that never finished did. Root writes only under
+# folders nobody but root can change, so every folder from the receipt's up
+# to / is checked first, by lstat (a link fails), and again at the end.
+# Nothing here changes the owner or mode of something already there, apart
+# from the receipt's mode and entry below: a folder or file that is not as
+# this script makes it stops the install, to be removed by hand. A receipt
+# that is already as this script makes it stays as it is, since it may
+# record a start the recovery below, or an Insomnia folder of this user
+# other than this one (INSOMNIA_HOME), still has to settle.
+# Prints why the folders from $1 up to / are not safe for root to write
+# under, or nothing.
+folders_problem() { # folder
+  local p="$1" listing
+  local paths=()
+  while [[ -n "$p" ]]; do paths+=("$p"); p="${p%/*}"; done
+  paths+=(/)
+  listing="$("$STAT" -f '%u %Lp %l %z %HT' "${paths[@]}" 2>/dev/null)" || listing=""
+  if ! printf '%s\n' "$listing" | /usr/bin/awk -v o="$RECEIPT_OWNER" -v n="${#paths[@]}" '{ k = (NR == 1 || k) && NF == 5 && $5 == "Directory" && ($1 == 0 || $1 == o) && $2 !~ /[2367].?$/ }; END { exit !(k && NR == n) }'; then
+    echo "$1 or a folder above it is missing, is not a folder, or is not root's alone (owner or group or other write permission)"
+    return 0
+  fi
+  listing="$("$LS" -lde "${paths[@]}" 2>/dev/null)" || listing=""
+  if [[ -z "$listing" ]] || ! printf '%s\n' "$listing" | /usr/bin/awk '$1 ~ /^[0-9]+:$/ && / allow / { f = 1 }; END { exit f }'; then
+    echo "$1 or a folder above it has an access control entry that allows changes, or could not be listed"
+  fi
+}
+# Prints why $RECEIPT is not a regular file of root's with one link and 82
+# bytes that only root can change, or nothing.
+receipt_base_problem() {
+  local listing
+  listing="$("$STAT" -f '%u %Lp %l %z %HT' "$RECEIPT" 2>/dev/null)" || listing=""
+  if ! printf '%s\n' "$listing" | /usr/bin/awk -v o="$RECEIPT_OWNER" '{ k = NR == 1 && NF == 6 && $5 == "Regular" && $6 == "File" && $3 == 1 && $4 == 82 && ($1 == 0 || $1 == o) && $2 !~ /[2367].?$/ }; END { exit !(k && NR == 1) }'; then
+    echo "$RECEIPT is not a regular file of root's with one link and 82 bytes that only root can change"
+  fi
+}
+# Prints the receipt's access control entries as `ls -le` shows them: none
+# (it has no entry), ours (exactly the one this script adds), or other
+# (anything else, or a list that could not be read). Only `user:<name>
+# allow read`, as entry 0 and alone, with `id -u <name>` this user's uid,
+# is ours. ls(1) prints `inherited` after the name of an inherited entry,
+# every right after `allow` or `deny`, and a UUID in place of
+# `user:<name>` for an account the directory cannot name (file_cmds
+# ls/print.c), so each of those is other. It never prints synchronize,
+# prints the rights and flags only folders use only for a folder, and
+# skips an entry it cannot read, so those pass here; the app's check reads
+# every entry, right and flag. As the root command reads it.
+# backstop.sh and uninstall.sh ask the app binary instead
+# (read_access_lists), which reads what ls leaves out.
+receipt_entries() {
+  local listing name
+  if ! listing="$("$LS" -le "$RECEIPT" 2>/dev/null)" || [[ "$listing" != -* ]]; then
+    echo other
+    return 0
+  fi
+  if [[ "$listing" != *$'\n'* ]]; then
+    echo none
+    return 0
+  fi
+  name="$(printf '%s\n' "$listing" | /usr/bin/awk 'NR == 1 { k = /^-/ }; NR == 2 && k && /^ 0: user:[^ :]+ allow read$/ { n = substr($2, 6) }; END { if (NR == 2) print n }')"
+  if [[ -n "$name" ]] && [[ "$("$ID" -u -- "$name" 2>/dev/null)" == "$UID_NUM" ]]; then
+    echo ours
+  else
+    echo other
+  fi
+}
+# Prints why $RECEIPT is not as this script makes it, or nothing.
+receipt_problem() {
+  local problem mode
+  problem="$(receipt_base_problem)"
+  if [[ -n "$problem" ]]; then
+    echo "$problem"
+    return 0
+  fi
+  mode="$("$STAT" -f '%Lp' "$RECEIPT" 2>/dev/null)" || mode=""
+  if [[ "$mode" != 600 ]]; then
+    echo "$RECEIPT has mode ${mode:-that could not be read}, not 600"
+    return 0
+  fi
+  if [[ "$(receipt_entries)" != ours ]]; then
+    echo "$RECEIPT does not have exactly one access control entry, the one that lets $USER_NAME (uid $UID_NUM) read it and nothing else, or its list could not be read"
+  fi
+}
+# Prints the release file's owner, mode, links, size and type, by lstat.
+release_meta() {
+  "$STAT" -f '%u %Lp %l %z %HT' "$RELEASED" 2>/dev/null || true
+}
+# Prints the release file's first 43 bytes, then a dot and head's exit
+# status, so bytes printed by a read that failed are never taken as the
+# file's.
+release_bytes() {
+  "$HEAD" -c 43 "$RELEASED" 2>/dev/null
+  echo ".$?"
+}
+# Prints why the release file does not show that no start claims the
+# receipt, or nothing: a claim, or a file that is not a regular file,
+# cannot be read, or holds anything but a nonce and free. No file shows no
+# claim (the release file came after the first receipts).
+release_claim_problem() {
+  local bytes
+  [[ -e "$RELEASED" || -L "$RELEASED" ]] || return 0
+  if [[ -L "$RELEASED" || ! -f "$RELEASED" ]]; then
+    echo "$RELEASED is not a regular file"
+    return 0
+  fi
+  bytes="$(release_bytes)"
+  if [[ "${bytes##*.}" != 0 ]]; then
+    echo "$RELEASED could not be read (head exit ${bytes##*.})"
+    return 0
+  fi
+  bytes="${bytes%.*}"
+  if [[ "$bytes" =~ ^([0-9A-F-]{36})\ held$'\n'$ ]]; then
+    echo "$RELEASED shows that a start (${BASH_REMATCH[1]}) claims the receipt and is not settled yet"
+  elif ! [[ "$bytes" =~ ^[0-9A-F-]{36}\ free$'\n'$ ]]; then
+    echo "$RELEASED does not hold a nonce and free or held, so whether a start claims the receipt is unknown"
+  fi
+}
+# Stops the install before a receipt that needs repair is changed, because
+# a start may still need it as it is.
+receipt_claimed_stop() { # why
+  "$CAT" >&2 <<FAIL
+
+Install stopped before changing $RECEIPT: $1.
+Its mode or access entry needs repair, and a receipt a start may still need
+is not changed. Open Insomnia from the folder of that start, or let its
+recovery agent run, so the start is settled; then rerun this script. If no
+Insomnia folder of yours has a start to settle, remove both files by hand
+(sudo rm -f $RECEIPT $RELEASED) once no Insomnia password dialog is open,
+then rerun.
+Installed so far: $SUDOERS. The app at $APP and the LaunchAgent were not touched;
+the new build was discarded.
+FAIL
+  exit 1
+}
+receipt_stop() { # problem
+  cat >&2 <<FAIL
+
+Install stopped: $1. Insomnia does not change
+the owner or mode of anything it did not make. Remove it by hand
+(sudo rm -f $RECEIPT $RELEASED, or sudo rmdir $RECEIPTS once empty) and rerun
+this script.
+Installed so far: $SUDOERS. The app at $APP and the LaunchAgent were not touched;
+the new build was discarded.
+FAIL
+  exit 1
+}
+receipt_sudo_failed() { # what rc
+  cat >&2 <<FAIL
+
+Install stopped: '$1' exited $2, perhaps because sudo wanted a password again
+(the credential step 2 cached may have expired). Rerun this script.
+Installed so far: $SUDOERS. The app at $APP and the LaunchAgent were not touched;
+the new build was discarded.
+FAIL
+  exit 1
+}
+# Runs `sudo -n` with the command after $1, which names it for a message,
+# within the call limit, and stops the install when it fails.
+receipt_sudo() { # what command...
+  local what="$1" rc=0
+  shift
+  bounded "$SUDO" -n "$@" || rc=$?
+  if (( rc == 124 || rc == 125 )); then
+    echo >&2
+    sudo_stalled_note "$rc" "Install stopped: '$what'"
+    echo "Installed so far: $SUDOERS. The app at $APP and the LaunchAgent were not touched; the new build was discarded." >&2
+    exit 1
+  elif (( rc != 0 )); then
+    if [[ -n "$BOUNDED_OUTPUT" ]]; then printf '%s\n' "$BOUNDED_OUTPUT" >&2; fi
+    receipt_sudo_failed "$what" "$rc"
+  fi
+}
+# Opens the receipt read-only on fd 7 and locks it as the root command and
+# every reader lock it, then reads its line under that lock (receipt_line)
+# and its nonce (receipt_nonce). Stops the install when any of that fails.
+receipt_locked_stop() { # lockf status
+  "$CAT" >&2 <<FAIL
+
+Install stopped: $RECEIPT stayed locked for ${RECEIPT_LOCK_TIMEOUT_SECONDS} s (lockf exit
+$1): the command behind an Insomnia password dialog may be running, or
+another Insomnia folder of this user is settling a start. Rerun this script.
+Installed so far: $SUDOERS. The app at $APP and the LaunchAgent were not touched;
+the new build was discarded.
+FAIL
+  exit 1
+}
+lock_and_read_receipt() {
+  local rc=0
+  { exec 7<"$RECEIPT"; } 2>/dev/null || receipt_stop "$RECEIPT could not be opened"
+  "$LOCKF" -s -t "$RECEIPT_LOCK_TIMEOUT_SECONDS" 7 2>/dev/null || rc=$?
+  (( rc == 0 )) || receipt_locked_stop "$rc"
+  receipt_line="$("$HEAD" -c 83 <&7 2>/dev/null; echo ".$?")"
+  [[ "${receipt_line##*.}" == 0 ]] || receipt_stop "$RECEIPT could not be read under its lock (head exit ${receipt_line##*.})"
+  receipt_line="${receipt_line%.*}"
+  if ! [[ "$receipt_line" =~ ^([0-9A-F-]{36})\ [0-9A-F-]{36}\ (writing|refused)$'\n'$ ]]; then
+    receipt_stop "$RECEIPT does not hold two nonces and writing or refused"
+  fi
+  receipt_nonce="${BASH_REMATCH[1]}"
+}
+# Stops the install unless the receipt is still the file fd 7 locked,
+# passes the checks that do not depend on its mode or entry, and holds the
+# line read under the lock, read whole.
+receipt_still_locked() {
+  local problem now
+  if [[ "$("$STAT" -f '%d:%i' <&7 2>/dev/null)" != "$("$STAT" -f '%d:%i' "$RECEIPT" 2>/dev/null)" ]]; then
+    receipt_stop "$RECEIPT was replaced while it was locked"
+  fi
+  problem="$(receipt_base_problem)"
+  [[ -z "$problem" ]] || receipt_stop "$problem"
+  problem="$(folders_problem "$RECEIPTS")"
+  [[ -z "$problem" ]] || receipt_stop "$problem"
+  now="$("$HEAD" -c 83 "$RECEIPT" 2>/dev/null; echo ".$?")"
+  [[ "$now" == "$receipt_line.0" ]] || receipt_stop "$RECEIPT changed while it was locked, or could not be read again"
+}
+step "Creating the receipt $RECEIPT"
+# The account name the receipt's entry gives read access to. chmod +a
+# takes a name, which the directory maps to the account's UUID, and ls -le
+# prints it back. A name with a space or a colon, which chmod would split,
+# or one that is not this uid's, stops the install.
+USER_NAME="$("$ID" -un 2>/dev/null)" || USER_NAME=""
+if [[ -z "$USER_NAME" || "$USER_NAME" == *[\ :]* ]] || [[ "$("$ID" -u -- "$USER_NAME" 2>/dev/null)" != "$UID_NUM" ]]; then
+  receipt_stop "the account name of uid $UID_NUM (${USER_NAME:-none}) is empty, holds a space or a colon, or is not this uid's, so the receipt cannot be given an entry for it"
+fi
+problem="$(folders_problem "${RECEIPTS%/*}")"
+[[ -z "$problem" ]] || receipt_stop "$problem"
+if [[ ! -e "$RECEIPTS" && ! -L "$RECEIPTS" ]]; then
+  mkdir_rc=0
+  bounded "$SUDO" -n "$MKDIR" -m 0755 "$RECEIPTS" || mkdir_rc=$?
+  if (( mkdir_rc == 124 || mkdir_rc == 125 )); then
+    echo >&2
+    sudo_stalled_note "$mkdir_rc" "Install stopped: 'sudo mkdir $RECEIPTS'"
+    echo "Installed so far: $SUDOERS. The app at $APP and the LaunchAgent were not touched; the new build was discarded." >&2
+    exit 1
+  elif (( mkdir_rc != 0 )); then
+    if [[ -n "$BOUNDED_OUTPUT" ]]; then printf '%s\n' "$BOUNDED_OUTPUT" >&2; fi
+    receipt_sudo_failed "sudo mkdir $RECEIPTS" "$mkdir_rc"
+  fi
+fi
+problem="$(folders_problem "$RECEIPTS")"
+[[ -z "$problem" ]] || receipt_stop "$problem"
+receipt_made=0
+if [[ ! -e "$RECEIPT" && ! -L "$RECEIPT" ]]; then
+  receipt_made=1
+  TMP_RECEIPT="$("$MKTEMP")"
+  printf '00000000-0000-0000-0000-000000000000 00000000-0000-0000-0000-000000000000 refused\n' > "$TMP_RECEIPT"
+  receipt_rc=0
+  bounded "$SUDO" -n "$INSTALL" -m 0600 -o root -g wheel "$TMP_RECEIPT" "$RECEIPT" || receipt_rc=$?
+  if (( receipt_rc == 124 || receipt_rc == 125 )); then
+    echo >&2
+    sudo_stalled_note "$receipt_rc" "Install stopped: 'sudo install', which writes $RECEIPT,"
+    echo "Installed so far: $SUDOERS. The app at $APP and the LaunchAgent were not touched; the new build was discarded." >&2
+    exit 1
+  elif (( receipt_rc != 0 )); then
+    if [[ -n "$BOUNDED_OUTPUT" ]]; then printf '%s\n' "$BOUNDED_OUTPUT" >&2; fi
+    receipt_sudo_failed "sudo install $RECEIPT" "$receipt_rc"
+  fi
+fi
+# Then the entry and the mode. A receipt this run just made is 0600 with no
+# entry and gets the entry here. One that was here before may need the
+# same repair: an install stopped between `install` and `chmod +a` leaves
+# it 0600 with no entry, and builds of this branch before d933b68 made it
+# 0644 with no entry. Either may hold a line a start not settled yet still
+# needs, so it is repaired in place, keeping its line and its inode, by
+# sudo chmod, and only while its release file shows no claim
+# (release_claim_problem). A receipt a start may still need stops the
+# install unchanged. One this user can open (any mode but 600) is locked
+# first, as the root command and every reader lock it, the release file is
+# read under that lock, and the receipt must still be the locked file with
+# the same line before each chmod. One it cannot open (0600, no entry) is
+# locked by root instead, in the same sudo call that adds its entry
+# (repair_unreadable_receipt): a root command that opened it before the
+# entry went away may still hold it, which its mode does not show. The
+# entry goes on before the mode, so this user can read the receipt
+# throughout. A receipt this run just made needs none of that: no command
+# could open it before this run made it, and every one refuses it until it
+# has the entry. What this cannot help: a receipt repaired here is refused
+# by the readers of those earlier builds, which are still installed if this
+# install stops later, and those readers check its mode and entry before
+# they take its lock, so they may take a start of theirs as one whose
+# command may have written. A receipt that is not root's 82-byte file with
+# one link that only root can change, or that has any other entry, is left
+# as it is and stops the install below.
+# Run as root by repair_unreadable_receipt: opens the receipt on fd 7,
+# locks it as the root command and every reader lock it, and under that
+# lock checks that it is still the file this user saw (device, inode,
+# owner, mode, links, size, type), still has no entry, holds a receipt's
+# line, and that the release file is still as this user read it (absent,
+# or the same metadata and nonce and free). Then it becomes chmod +a with
+# fd 7 still open, so the lock lasts exactly as long as the change: no
+# SIGTERM can end the lock and leave the change running. Exit 90 with the
+# reason on standard output when a check fails, 91 when the receipt could
+# not be opened, lockf's status when the lock was not taken in time.
+# shellcheck disable=SC2016  # the $ below are for root's shell, not this one
+REPAIR_SH='set -u
+r=$1 meta=$2 name=$3 rel=$4 rmeta=$5 rbytes=$6 stat=$7 ls=$8 head=$9 chmod=${10} lockf=${11} wait=${12}
+refuse() { echo "$1"; exit 90; }
+exec 7<"$r" || { echo "$r could not be opened as root"; exit 91; }
+"$lockf" -s -t "$wait" 7 || exit $?
+[[ "$("$stat" -f "%d:%i %u %Lp %l %z %HT" "$r" 2>/dev/null)" == "$meta" ]] || refuse "$r changed before its lock was taken"
+[[ "$("$stat" -f "%d:%i" <&7 2>/dev/null)" == "${meta%% *}" ]] || refuse "$r was replaced before its lock was taken"
+l="$("$ls" -le "$r" 2>/dev/null)" && [[ "$l" == -* && "$l" != *$'"'"'\n'"'"'* ]] || refuse "$r gained an access control entry, or its list could not be read, before its lock was taken"
+line="$("$head" -c 83 <&7 2>/dev/null; echo ".$?")"
+[[ "$line" =~ ^[0-9A-F-]{36}\ [0-9A-F-]{36}\ (writing|refused)$'"'"'\n'"'"'\.0$ ]] || refuse "$r does not hold two nonces and writing or refused, or could not be read, under its lock"
+if [[ "$rmeta" == absent ]]; then
+  [[ ! -e "$rel" && ! -L "$rel" ]] || refuse "$rel appeared before the lock on the receipt was taken"
+else
+  [[ "$("$stat" -f "%d:%i %u %Lp %l %z %HT" "$rel" 2>/dev/null)" == "$rmeta" ]] || refuse "$rel changed before the lock on the receipt was taken"
+  [[ "$("$head" -c 43 "$rel" 2>/dev/null; echo ".$?")" == "$rbytes" ]] || refuse "$rel changed before the lock on the receipt was taken"
+fi
+exec "$chmod" +a "user:$name allow read" "$r"'
+# Adds this user's entry to a receipt this user cannot open, as root and
+# under its lock (REPAIR_SH), once the release file, read just now, shows
+# that no start claims it. Stops the install when anything changed or the
+# call fails.
+repair_unreadable_receipt() {
+  local meta rmeta rbytes rc=0
+  meta="$("$STAT" -f '%d:%i %u %Lp %l %z %HT' "$RECEIPT" 2>/dev/null)" || meta=""
+  [[ -n "$meta" ]] || receipt_stop "$RECEIPT could not be checked again"
+  rmeta=absent
+  rbytes=""
+  if [[ -e "$RELEASED" || -L "$RELEASED" ]]; then
+    rmeta="$("$STAT" -f '%d:%i %u %Lp %l %z %HT' "$RELEASED" 2>/dev/null)" || rmeta=""
+    rbytes="$(release_bytes)"
+    if [[ -z "$rmeta" || "$rmeta" == absent ]] || ! [[ "$rbytes" =~ ^[0-9A-F-]{36}\ free$'\n'\.0$ ]]; then
+      receipt_claimed_stop "$RELEASED changed while it was read, so whether a start claims the receipt is unknown"
+    fi
+  fi
+  bounded "$SUDO" -n "$ROOT_SHELL" -c "$REPAIR_SH" repair "$RECEIPT" "$meta" "$USER_NAME" "$RELEASED" "$rmeta" "$rbytes" "$STAT" "$LS" "$HEAD" "$CHMOD" "$LOCKF" "$RECEIPT_LOCK_TIMEOUT_SECONDS" || rc=$?
+  case "$rc" in
+    0) ;;
+    124|125)
+      echo >&2
+      sudo_stalled_note "$rc" "Install stopped: 'sudo chmod +a \"user:$USER_NAME allow read\" $RECEIPT', under the receipt's lock,"
+      echo "Installed so far: $SUDOERS. The app at $APP and the LaunchAgent were not touched; the new build was discarded." >&2
+      exit 1 ;;
+    75) receipt_locked_stop "$rc" ;;
+    90) receipt_claimed_stop "${BOUNDED_OUTPUT:-a check under the lock failed}" ;;
+    *)
+      if [[ -n "$BOUNDED_OUTPUT" ]]; then printf '%s\n' "$BOUNDED_OUTPUT" >&2; fi
+      receipt_sudo_failed "sudo chmod +a \"user:$USER_NAME allow read\" $RECEIPT, under the receipt's lock" "$rc" ;;
+  esac
+}
+if [[ -z "$(receipt_base_problem)" ]]; then
+  entries="$(receipt_entries)"
+  mode="$("$STAT" -f '%Lp' "$RECEIPT" 2>/dev/null)" || mode=""
+  if [[ "$entries" == none ]] || [[ "$entries" == ours && "$mode" != 600 ]]; then
+    repair_locked=0
+    if (( ! receipt_made )); then
+      if [[ "$mode" != 600 ]]; then
+        lock_and_read_receipt
+        repair_locked=1
+      fi
+      problem="$(release_claim_problem)"
+      [[ -z "$problem" ]] || receipt_claimed_stop "$problem"
+    fi
+    if [[ "$entries" == none ]]; then
+      if (( repair_locked )); then receipt_still_locked; fi
+      if (( repair_locked || receipt_made )); then
+        receipt_sudo "sudo chmod +a \"user:$USER_NAME allow read\" $RECEIPT" "$CHMOD" +a "user:$USER_NAME allow read" "$RECEIPT"
+      else
+        repair_unreadable_receipt
+      fi
+    fi
+    if [[ "$mode" != 600 ]]; then
+      if (( repair_locked )); then receipt_still_locked; fi
+      receipt_sudo "sudo chmod 0600 $RECEIPT" "$CHMOD" 0600 "$RECEIPT"
+    fi
+    if (( repair_locked )); then exec 7<&-; fi
+  fi
+fi
+problem="$(receipt_problem)"
+[[ -z "$problem" ]] || receipt_stop "$problem"
+problem="$(folders_problem "$RECEIPTS")"
+[[ -z "$problem" ]] || receipt_stop "$problem"
+echo "receipt $RECEIPT is root's, only root can change it or the folders above it, and only root and $USER_NAME can read it"
+
+# The release file beside it: <uid>.released, this user's, 0600, 42 bytes
+# (SleepOffReceipts.releaseFile): a nonce and "free" or "held". A start
+# claims the receipt there before its dialog, and gives the claim back only
+# once its settlement is journaled; meanwhile, while this file is intact, no
+# start from another Insomnia folder of this user can replace the receipt's
+# line, which that settlement reads. Every
+# decision here is made under the receipt's lock (fd 7, as the root command
+# and every reader lock it), from the receipt's line and the release file
+# as they are while it is held, since a start claims the receipt under the
+# same lock. A claim ("held") in this user's file with one link is kept,
+# even right after the receipt was made: it may be a start of another
+# Insomnia folder of this user that is not settled yet, and one of this
+# folder's own is settled by the recovery below. A claim in any other file
+# stops the install rather than be replaced, since the app reads it as a
+# claim. The receipt's own nonce, free, is kept too. Anything else (no
+# file, another nonce free, or bytes not in that shape) is written new as
+# the receipt's nonce, free, by sudo install(1), which replaces the file by
+# rename; just before that, the receipt, the folders above it and the
+# release file are checked again, and the release file must still hold the
+# bytes read above. A claim whose folder is gone keeps every start refused:
+# remove both files by hand (sudo rm -f $RECEIPT $RELEASED) once no
+# Insomnia password dialog is open, and run this script again. A release
+# file that is not a regular file stops the install, like the receipt.
+# Stops the install unless the receipt is the file fd 7 locked, still as
+# this script makes it, under folders as this script makes them, and holds
+# the line read under the lock.
+receipt_unchanged() {
+  local problem
+  receipt_still_locked
+  problem="$(receipt_problem)"
+  [[ -z "$problem" ]] || receipt_stop "$problem"
+}
+if [[ -L "$RELEASED" ]] || { [[ -e "$RELEASED" ]] && [[ ! -f "$RELEASED" ]]; }; then
+  receipt_stop "$RELEASED is not a regular file"
+fi
+lock_and_read_receipt
+receipt_unchanged
+if [[ -L "$RELEASED" ]] || { [[ -e "$RELEASED" ]] && [[ ! -f "$RELEASED" ]]; }; then
+  receipt_stop "$RELEASED is not a regular file"
+fi
+release_was=""
+release_line=""
+if [[ -f "$RELEASED" ]]; then
+  release_was="$(release_meta)"
+  release_line="$(release_bytes)"
+  [[ "${release_line##*.}" == 0 ]] || receipt_stop "$RELEASED could not be read (head exit ${release_line##*.})"
+  release_line="${release_line%.*}"
+fi
+if [[ "$release_line" =~ ^([0-9A-F-]{36})\ held$'\n'$ ]]; then
+  if [[ "$release_was" != "$UID_NUM 600 1 42 Regular File" ]]; then
+    receipt_stop "$RELEASED claims the receipt for a start (${BASH_REMATCH[1]}), but is not this user's 0600 file with one link, so it is not replaced"
+  fi
+  echo "kept $RELEASED: a start of this user (${BASH_REMATCH[1]}) claims the receipt and is not settled yet"
+elif [[ "$release_line" == "$receipt_nonce free"$'\n' && "$release_was" == "$UID_NUM 600 1 42 Regular File" ]]; then
+  echo "kept $RELEASED"
+else
+  TMP_RELEASE="$("$MKTEMP")"
+  printf '%s free\n' "$receipt_nonce" > "$TMP_RELEASE"
+  # Checked again just before the write: the receipt, the folders and the
+  # release file, which must still be what was read above.
+  receipt_unchanged
+  if [[ -L "$RELEASED" ]] || { [[ -e "$RELEASED" ]] && [[ ! -f "$RELEASED" ]]; }; then
+    receipt_stop "$RELEASED is not a regular file"
+  fi
+  if [[ -n "$release_was" ]]; then
+    [[ "$(release_meta)" == "$release_was" && "$(release_bytes)" == "$release_line.0" ]] \
+      || receipt_stop "$RELEASED changed while the receipt was locked"
+  elif [[ -e "$RELEASED" || -L "$RELEASED" ]]; then
+    receipt_stop "$RELEASED appeared while the receipt was locked"
+  fi
+  release_rc=0
+  bounded "$SUDO" -n "$INSTALL" -m 0600 -o "$UID_NUM" "$TMP_RELEASE" "$RELEASED" || release_rc=$?
+  if (( release_rc == 124 || release_rc == 125 )); then
+    echo >&2
+    sudo_stalled_note "$release_rc" "Install stopped: 'sudo install', which writes $RELEASED,"
+    echo "Installed so far: $SUDOERS. The app at $APP and the LaunchAgent were not touched; the new build was discarded." >&2
+    exit 1
+  elif (( release_rc != 0 )); then
+    if [[ -n "$BOUNDED_OUTPUT" ]]; then printf '%s\n' "$BOUNDED_OUTPUT" >&2; fi
+    receipt_sudo_failed "sudo install $RELEASED" "$release_rc"
+  fi
+  if [[ "$(release_meta)" != "$UID_NUM 600 1 42 Regular File" ]] \
+     || [[ "$(release_bytes)" != "$receipt_nonce free"$'\n'.0 ]]; then
+    receipt_stop "$RELEASED is not the file this script just wrote"
+  fi
+  echo "release file $RELEASED written: no start claims the receipt"
+fi
+exec 7<&-
 
 # Leftovers of earlier runs are handled only here, under the lock. Step 6
 # runs under it too, so no other install is between setting the previous
@@ -631,9 +1287,15 @@ plist_pins_previous() {
 pins_unknown_note="'codesign --verify', which tells which of the two bundles $PLIST pins,
 did not answer within ${CALL_TIMEOUT_SECONDS}s."
 
+# The staged copy runs with --own-bundle: frozen entries that record
+# startedAtMicros go to the staged binary, which the codesign check above
+# covered with this script and whose Info.plist that copy checks for the
+# --resume-frozen version it speaks. The build still at $APP may predate that
+# interface, and it is never run here: an older binary would open the menu
+# bar app instead of answering.
 step "Ending any stale session and checking the recovery journal"
 recovery_rc=0
-/bin/bash "$BACKSTOP" --force || recovery_rc=$?
+/bin/bash "$BACKSTOP" --force --own-bundle || recovery_rc=$?
 
 if (( recovery_rc != 0 )); then
   held="$(loaded_state)"
@@ -662,20 +1324,20 @@ $pins_unknown_note"
     pair_note="The app at $APP and the LaunchAgent were not replaced or unloaded,
 so they still match each other; the new build was discarded."
   fi
-  # How to run the recovery again. A checkout has backstop.sh under scripts/.
-  # A zip has it only inside the bundle at $PREBUILT, and the checked private
-  # copy is deleted when this script exits; the original may have changed
-  # since the check, so the step is this script again, which checks a new copy.
+  # How to run the recovery again: this script, which stages a new copy and
+  # runs that copy's recovery with --own-bundle, as above. A zip has
+  # backstop.sh only inside the bundle at $PREBUILT, which may have changed
+  # since the check, and the checked private copy is deleted when this script
+  # exits. A checkout's scripts/backstop.sh run by hand would hand frozen
+  # processes to the build at $APP, which may predate --resume-frozen.
   if [[ -n "$PREBUILT" ]]; then
-    manual_step="Or rerun this script. It checks a new private
-copy of the bundle and runs that copy's recovery before it replaces the app
-or the LaunchAgent:
-  $(command_line "$0" --allow-unverified-origin --app "$PREBUILT")"
+    again="checks a new private copy of the bundle"
   else
-    manual_step="Or run the recovery by hand:
-  $(command_line /bin/bash "$SCRIPT_DIR/backstop.sh" --force)
-Then rerun this script to install the app and the LaunchAgent."
+    again="builds and stages the bundle again"
   fi
+  manual_step="Or rerun this script. It $again and runs that
+copy's recovery before it replaces the app or the LaunchAgent:
+  $(rerun_command)"
   cat >&2 <<FAIL
 
 Install stopped: the backstop could not fully undo a previous session
@@ -853,8 +1515,8 @@ before="$(loaded_state)"
 
 # shellcheck disable=SC2016  # the $1/$2/$HOME/$r below are for the agent's shell, not this one
 AGENT_PROGRAM='r="$(/usr/bin/codesign --verify --strict "-R=$1" "$2" 2>&1)" && exec /bin/bash "$2/Contents/Resources/backstop.sh"; mkdir -p "$HOME/Library/Logs/Insomnia"; printf "%s [error] backstop agent: %s does not satisfy the pinned code requirement; backstop.sh not run. Reinstall Insomnia (scripts/install.sh). codesign: %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$2" "$(printf %s "$r" | tr "\n" " ")" >> "$HOME/Library/Logs/Insomnia/insomnia.log"; exit 1'
-xml_escape() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
-cat > "$CANDIDATE" <<PLIST
+xml_escape() { "$SED" -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+"$CAT" > "$CANDIDATE" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -925,6 +1587,9 @@ fi
 if [[ -z "$swap_reason" ]]; then
   if move_bundle "$NEW_APP" "$APP"; then
     swapped=1
+    # The new build is at $APP, so the rule is no longer ahead of it. Set
+    # again below if the swap is undone.
+    RULE_AHEAD_OF_BUNDLE=0
   else
     swap_reason="the new build could not be moved from $NEW_APP to $APP"
   fi
@@ -1023,6 +1688,8 @@ ${fix_note%.} before you log out.
 FAIL
     exit 1
   fi
+  # The new build has left $APP (or never reached it).
+  RULE_AHEAD_OF_BUNDLE=1
   if (( set_aside )); then
     if ! move_bundle "$PREVIOUS_APP" "$APP"; then
       # Nothing is at $APP now. The previous app stays set aside and the

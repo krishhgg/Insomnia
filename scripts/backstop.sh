@@ -15,7 +15,11 @@
 #
 # Every run is one transaction under APP_SUPPORT/.recovery.lock, an flock(2)
 # exclusive lock on the same file the app locks: read session.json and
-# state.json, decide, undo, publish the new journal atomically, release. If
+# state.json, decide, undo, publish the new journal atomically, release.
+# Both files are read from private copies made under the lock (see
+# copy_private), each read's status is checked, and a read that fails is
+# never taken for a key that is absent: the run then undoes nothing more and
+# exits 1. If
 # the lock is not free within LOCK_TIMEOUT_SECONDS the run does nothing and
 # exits 75; launchd retries a minute later. The lock file is never unlinked
 # or replaced here, so every party locks the same inode.
@@ -26,19 +30,49 @@
 # instead of deadlocking against it; fd 9 is accepted only if its inode is
 # the lock file's inode.
 #
+# First thing under the lock, every run deletes APP_SUPPORT/pending-start.
+# The app holds the lock for as long as a Start waits on its password
+# dialog, so a marker found here belongs to a start that was abandoned (the
+# app died under its dialog). The root command behind that dialog turns
+# sleep off only while the marker holds its nonce, so answering the dialog
+# after this point changes nothing. That command also holds a lockf lock on
+# the marker from before its nonce check until pmset exits, and the marker
+# is deleted only under the same lock, and only while its path still names
+# the locked file: it goes before the check, or after pmset, whose effect
+# the journal entry still covers. A marker that cannot
+# be locked within PENDING_LOCK_TIMEOUT_SECONDS or cannot be deleted means
+# that dialog could still turn sleep off later: sleep is still restored,
+# but sleepDisabledByUs stays journaled and the run exits 1, so the next run
+# retries.
+#
+# Then, whether or not the marker went, the run settles a start the
+# journal still records (sleepOffAttempt, see settle_attempt): the
+# root-owned receipt install.sh made in RECEIPTS, read under its own lock,
+# shows whether the command behind that start's dialog turned sleep off.
+# This happens before the session is read, so a session whose start never
+# finished is never left to be resumed. A start that cannot be settled yet
+# stays journaled, its session is ended rather than resumed, and the run
+# exits 1. A marker that no journaled start accounts for takes session.json
+# with it (drop_unrecorded_session), for the same reason.
+#
 # Decision, driven only by what the journal says was changed:
-#   - session.json valid (endsAt in the future) and no --force: exit 0.
+#   - session.json valid (endsAt in the future) and no --force: exit 0
+#     (1 while pending-start is still present).
 #   - state.json missing or clean: nothing is undone and nothing privileged
 #     runs; an expired session.json is removed. Exit 0. Entries in
 #     savedAudioOutputs alone count as clean (see below).
 #   - state.json dirty: undo each journaled entry from the journal alone:
-#       sleepDisabledByUs   -> sudo -n pmset -a disablesleep 0
+#       sleepDisabledByUs   -> sudo -n pmset -a disablesleep 0 (the entry is
+#                              cleared only if pending-start is gone and no
+#                              start is still journaled; no pmset at all
+#                              while settle_attempt holds it back)
 #       lowPowerSetByUs     -> sudo -n pmset -b lowpowermode 0
 #       frozenProcesses     -> SIGCONT, but only to a pid verified to be the
 #                              process the app froze. Entries that record
 #                              startedAtMicros are handed to the installed
-#                              app binary (INSOMNIA_BIN --resume-frozen
-#                              <seconds>) in one call with a time limit, one
+#                              app binary, or with --own-bundle to the one
+#                              beside this copy (INSOMNIA_BIN --resume-frozen
+#                              <seconds>), in one call with a time limit, one
 #                              line per entry on its standard input. For
 #                              each entry in turn it does one kernel lookup
 #                              (start time to the microsecond, boot session,
@@ -127,7 +161,10 @@
 #     Exit 0 only when the journal is clean afterwards; otherwise exit 1 so
 #     the failure is visible and the next periodic run retries.
 #   - state.json unreadable, not a JSON object, or with a known key of the
-#     wrong type: nothing is touched, exit 1.
+#     wrong type: nothing is touched, exit 1. So also when its JSON or text
+#     could not be read again after the first check passed, or a later read
+#     of one of its keys fails: nothing more is undone, and no entry is
+#     cleared or published on a read that failed.
 #   - session.json present but not a session: readable, but not the shape
 #     the app's Session decoder accepts (session_shape_problems). It is
 #     treated as expired. Once the journal is clean (already, or after the
@@ -153,7 +190,35 @@
 # --force: treat the session as expired even if endsAt is in the future
 # (used by install.sh / uninstall.sh to end a stale session deliberately).
 #
+# --own-bundle: run --resume-frozen with the app binary and Info.plist of the
+# bundle this copy is sealed in (Contents/MacOS/Insomnia and
+# Contents/Info.plist, beside Contents/Resources/backstop.sh), never the
+# installed app's. install.sh passes it to the copy in the bundle it has just
+# staged and verified with codesign, and runs that copy's recovery before the
+# bundle replaces the installed one. The installed build may predate
+# --resume-frozen and would open the menu bar app instead; the staged binary
+# is the build this copy was sealed with. The path this copy was run by
+# (BASH_SOURCE, not the environment) must be absolute and end in
+# .app/Contents/Resources/backstop.sh, or the run refuses with exit 2 before
+# it takes the lock or reads the journal. That shape check does not verify
+# the bundle: the caller must run a copy it has verified. The Info.plist
+# check and every other rule above still apply to that binary.
+#
 # Honours INSOMNIA_HOME with the same layout as the app (see Paths.swift).
+#
+# The line below says which recovery contract this copy implements. The app
+# reads it from the installed script before every password dialog and
+# refuses Start when it is missing or lower than it needs
+# (BackstopVersion.swift). 2: pending-start is deleted under its lock, as
+# described above. 3: a start the journal still records is settled from its
+# receipt once its marker is gone (settle_attempt). 4: the receipt is read
+# under its lock, as the 82-byte line with the predecessor, against the
+# start's expires, whatever happened to the marker; the start's claim on
+# the receipt is given back; and no pmset runs for a start held back. 5: a
+# settlement publishes its decision (sleepOffAttempt.settled) before it gives
+# the claim back, and a settled record is finished rather than refused.
+# Raise it when the app comes to rely on something new here.
+# insomnia-backstop-version: 5
 set -euo pipefail
 export LC_ALL=C TZ=UTC
 # Everything this run creates (log lines, the lock file, the published
@@ -176,30 +241,71 @@ MKDIR=/bin/mkdir
 RM=/bin/rm
 MV=/bin/mv
 CP=/bin/cp
+CMP=/usr/bin/cmp
+STAT=/usr/bin/stat
 MKTEMP=/usr/bin/mktemp
+CAT=/bin/cat
+HEAD=/usr/bin/head
+TR=/usr/bin/tr
+GREP=/usr/bin/grep
+# perl makes the private copies of the files this run reads (copy_private),
+# through env -i, so nothing in the environment (PERL5OPT, PERL5LIB) reaches
+# it.
+ENV=/usr/bin/env
+PERL=/usr/bin/perl
+# The folder of the root-owned receipts (SleepOffReceipts.swift), and the
+# one owner besides root it may have: none, as uid 0 is root. Tests patch
+# both lines in a private copy, for a folder in their temporary directory.
+RECEIPTS=/private/var/db/com.kgarg.insomnia
+RECEIPT_OWNER=0
 # The installed app binary, for the microsecond identity check of
 # frozenProcesses entries (see above), and the bundle's Info.plist, which
 # must declare InsomniaResumeFrozenVersion RESUME_FROZEN_VERSION before the
 # binary is run: an older build has no such mode and would open the menu bar
 # app instead. Fixed paths like the tools, never PATH. install.sh puts the
-# bundle here, copying the binary before Info.plist.
+# bundle here, copying the binary before Info.plist. --own-bundle replaces
+# both with the paths beside this copy (see above).
 INSOMNIA_BIN="${HOME:-}/Applications/Insomnia.app/Contents/MacOS/Insomnia"
 INSOMNIA_INFO="${HOME:-}/Applications/Insomnia.app/Contents/Info.plist"
 RESUME_FROZEN_VERSION=1
+# The same binary reads the receipt's access control lists
+# (read_access_lists), once Info.plist declares InsomniaAccessListsVersion
+# ACCESS_LISTS_VERSION.
+ACCESS_LISTS_VERSION=1
 LOCK_TIMEOUT_SECONDS=10
+# How long to wait for the root command behind a password dialog to let go
+# of the pending-start marker (pmset takes well under a second).
+PENDING_LOCK_TIMEOUT_SECONDS=10
+# How long to wait for the receipt's lock (see settle_attempt): the root
+# command holds it from its checks until pmset exits.
+RECEIPT_LOCK_TIMEOUT_SECONDS=10
+# Longest the private copy of one file this run reads (session.json,
+# state.json, an Info.plist) may take; see copy_private.
+READ_TIMEOUT_SECONDS=10
 # Longest a single undo command (sudo pmset, defaults) may run before it is
 # sent SIGTERM, and how long it then gets to exit before this run fails closed.
 COMMAND_TIMEOUT_SECONDS=30
 KILL_GRACE_SECONDS=3
 
 force=0
+own_bundle=0
 for arg in "$@"; do
   case "$arg" in
     --force) force=1 ;;
-    -h|--help) echo "usage: $0 [--force]"; exit 0 ;;
+    --own-bundle) own_bundle=1 ;;
+    -h|--help) echo "usage: $0 [--force] [--own-bundle]"; exit 0 ;;
     *) echo "unknown option: $arg" >&2; exit 2 ;;
   esac
 done
+if (( own_bundle )); then
+  own_path="${BASH_SOURCE[0]}"
+  if [[ "$own_path" != /*.app/Contents/Resources/backstop.sh ]]; then
+    echo "--own-bundle: $own_path is not an absolute path ending in .app/Contents/Resources/backstop.sh; nothing was done" >&2
+    exit 2
+  fi
+  INSOMNIA_BIN="${own_path%/Resources/backstop.sh}/MacOS/Insomnia"
+  INSOMNIA_INFO="${own_path%/Resources/backstop.sh}/Info.plist"
+fi
 
 if [[ -n "${INSOMNIA_HOME:-}" ]]; then
   APP_SUPPORT="$INSOMNIA_HOME"
@@ -210,12 +316,24 @@ else
 fi
 SESSION="$APP_SUPPORT/session.json"
 STATE="$APP_SUPPORT/state.json"
+PENDING="$APP_SUPPORT/pending-start"
 LOCK="$APP_SUPPORT/.recovery.lock"
 LOG="$LOG_DIR/insomnia.log"
 
+# Logging is best effort. A log line explains a decision; it never makes
+# one. A date, mkdir or append that fails (a full disk, a log made
+# read-only) sends the line to standard error instead (launchd discards
+# it: the plist names no StandardErrorPath), and the run goes on to the
+# restore it already decided on. Under set -e a failed append here would
+# otherwise end the run before pmset. The journal and the result of each
+# read and root command still decide what happens and how the run ends.
 log() { # level message
-  "$MKDIR" -p "$LOG_DIR"
-  printf '%s [%s] backstop: %s\n' "$("$DATE" -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" >> "$LOG"
+  local stamp line
+  stamp="$("$DATE" -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)" || stamp="(date failed)"
+  line="$stamp [$1] backstop: $2"
+  { "$MKDIR" -p "$LOG_DIR" && printf '%s\n' "$line" >> "$LOG"; } 2>/dev/null \
+    || printf '%s (not written to %s)\n' "$line" "$LOG" >&2 \
+    || true
 }
 
 # --- Lock --------------------------------------------------------------------
@@ -241,7 +359,7 @@ tighten() { # path...
   done
 }
 tighten "$APP_SUPPORT" "$LOG_DIR" "$LOG" "$LOCK" "$STATE" "$SESSION"
-inode() { stat -f %i "$1" 2>/dev/null; }
+inode() { "$STAT" -f %i "$1" 2>/dev/null; }
 lock_shared=0
 if [[ -e /dev/fd/9 && -e "$LOCK" && -n "$(inode "$LOCK")" && "$(inode /dev/fd/9)" == "$(inode "$LOCK")" ]]; then
   lock_shared=1 # fd 9 is the caller's handle on the lock file; share its lock.
@@ -256,22 +374,420 @@ if (( lock_rc != 0 )); then
 fi
 # From here on this process holds the lock until it exits (fd 9 closes).
 
+# Deletes pending-start under its own lock, as Store.removePendingStart
+# does. The marker is opened on fd 8 and locked through it: lockf given a
+# descriptor locks this shell's open file, and the lock lasts until fd 8
+# closes. Then the path must still name the locked file (stat of fd 8
+# against stat -L of the path), because lockf locks a file and rm goes by
+# path: a file put in the marker's place after the open is not covered by
+# the lock, so it is left alone. Only a regular file is opened; open(2) on
+# a FIFO with no writer blocks, and this runs under the recovery lock. A
+# link to nothing is removed: the root command cannot open it either.
+# Sets marker_rc: 0 deleted or gone, 75 still locked after
+# PENDING_LOCK_TIMEOUT_SECONDS, 3 replaced after the open, 4 not a regular
+# file, anything else from the open or rm. Sets removed_marker to the
+# device:inode of the file it locked and deleted, for settle_attempt.
+removed_marker=""
+delete_pending_marker() {
+  local locked
+  marker_rc=0
+  if [[ -L "$PENDING" && ! -e "$PENDING" ]]; then
+    "$RM" -f "$PENDING" 2>/dev/null || marker_rc=$?
+    return 0
+  fi
+  [[ -e "$PENDING" ]] || return 0
+  if [[ ! -f "$PENDING" ]]; then
+    marker_rc=4
+    return 0
+  fi
+  { exec 8<"$PENDING"; } 2>/dev/null || { marker_rc=$?; return 0; }
+  "$LOCKF" -s -t "$PENDING_LOCK_TIMEOUT_SECONDS" 8 2>/dev/null || marker_rc=$?
+  if (( marker_rc == 0 )); then
+    locked="$("$STAT" -f '%d:%i' <&8 2>/dev/null)" || locked=""
+    if [[ -n "$locked" && "$locked" == "$("$STAT" -L -f '%d:%i' "$PENDING" 2>/dev/null)" ]]; then
+      if "$RM" -f "$PENDING" 2>/dev/null; then removed_marker="$locked"; else marker_rc=$?; fi
+    else
+      marker_rc=3
+    fi
+  fi
+  exec 8<&-
+}
+
+# A pending-start marker under the lock belongs to an abandoned start: void
+# the password dialog it was written for, under the marker's own lock (see
+# the header).
+marker_stuck=0
+if [[ -e "$PENDING" || -L "$PENDING" ]]; then
+  delete_pending_marker
+  if [[ -e "$PENDING" || -L "$PENDING" ]]; then
+    marker_stuck=1
+    case "$marker_rc" in
+      75) why="still locked after ${PENDING_LOCK_TIMEOUT_SECONDS}s by the command a password dialog started as root" ;;
+      3) why="was replaced after it was opened, so its lock does not cover the file now at that path" ;;
+      4) why="is not a regular file, so it was not opened" ;;
+      *) why="could not be deleted (exit $marker_rc)" ;;
+    esac
+    log error "$PENDING $why; a password dialog left from an abandoned start could still turn sleep off, so sleepDisabledByUs stays journaled until a later run deletes it"
+  else
+    log info "deleted $PENDING; a command a password dialog left from an abandoned start runs stops at its marker check from now on, unless this user writes the marker again or the clock is set back"
+  fi
+fi
+# This run's private folder for its copies of the files it reads (see
+# copy_private), made below. Every exit from then on goes through leave,
+# which removes the folder first. A run that ends some other way (killed,
+# or stopped by the shell itself) leaves it; the next run that takes the
+# lock on its own handle removes it. Without the folder, or when a copy in
+# it cannot be written, the copies are kept in memory (COPY_IN_MEMORY), so
+# a full disk does not stop a recorded restore.
+READS=""
+COPY_IN_MEMORY=1
+leave() { # status
+  if [[ -n "$READS" ]]; then "$RM" -rf "$READS" 2>/dev/null || true; fi
+  exit "$1"
+}
+# Every exit 0 from here on goes through this: a marker still present is a
+# failure whatever else the run found, so it is retried and the caller sees
+# it.
+exit_unless_marker_stuck() { # what the run found
+  if (( marker_stuck )); then
+    log error "$1, but $PENDING is still present; will retry on the next run"
+    leave 1
+  fi
+  if [[ -n "${settle_failed:-}" ]]; then
+    log error "$1, but $settle_failed; will retry on the next run"
+    leave 1
+  fi
+  leave 0
+}
+
 # --- Helpers -----------------------------------------------------------------
 
-# plutil -extract <key> raw prints the scalar; returns non-zero if missing.
-extract() { # file keypath
-  "$PLUTIL" -extract "$2" raw -o - "$1" 2>/dev/null
+# Logs each non-empty line of $2 at level $1, with $3 before it. Not a
+# here-string: bash 3.2 writes one to a temporary file, which a full disk
+# refuses.
+log_lines() { # level text prefix
+  local rest="$2" line
+  while [[ -n "$rest" ]]; do
+    line="${rest%%$'\n'*}"
+    if [[ "$rest" == *$'\n'* ]]; then rest="${rest#*$'\n'}"; else rest=""; fi
+    if [[ -n "$line" ]]; then log "$1" "$3$line"; fi
+  done
 }
-extract_json() { # file keypath
-  "$PLUTIL" -extract "$2" json -o - "$1" 2>/dev/null
+
+# Copies the live file $1 to $READS/$2, for every later read of it in this
+# run: session.json, state.json and the app's Info.plist are never read in
+# place. perl, run with an empty environment, opens the file without
+# blocking and without following a symbolic link, refuses anything but a
+# regular file (open(2) on a FIFO with no writer would block under the
+# lock, and a device is never read) and one larger than 8 MiB, reads it to
+# the end, checks that it holds as many bytes as its size, that its
+# identity (file_id: device, inode, size, and modification and change times
+# to a fraction of a microsecond) did not move during the read and that the
+# path still names it, not through a link, and writes the bytes to a new
+# mode-600 file. SIGALRM ends it after READ_TIMEOUT_SECONDS; a read the
+# kernel cannot interrupt (a stalled disk), or a perl stopped by SIGSTOP,
+# holds it longer. Returns 0 with copy_path and copy_id (that identity); 3
+# when the file could not be opened or read (permissions, I/O); 4 when it is
+# a symbolic link or not a regular file; 2 for anything else: it is larger
+# than 8 MiB, it changed while it was read, the time ran out, or the copy
+# could not be written. Its reason is in copy_why.
+# With no READS folder, or when the new file cannot be written (a full
+# disk) and COPY_IN_MEMORY is 1, perl makes the same checks and prints the
+# bytes instead. They are kept in the shell variable mem_<name>, and
+# copy_path is mem:<name>, which plutil_on, json_object,
+# record_text_problems, session_shape_problems and same_as_read read from
+# memory. Nothing in that mode creates a file. A shell variable cannot hold
+# a NUL byte, so a file with one is then 2.
+# shellcheck disable=SC2016  # the $ below are perl's, not this shell's
+COPY_PERL='use strict; use Fcntl qw(:DEFAULT :mode); use Time::HiRes ();
+$SIG{ALRM} = "DEFAULT"; alarm shift @ARGV;
+my ($src, $dst) = @ARGV;
+my $max = 8 * 1024 * 1024;
+sub fail { print "$_[1]\n"; exit $_[0] }
+sub id { join(":", @_[0,1,7], map { sprintf "%.9f", $_ } @_[9,10]) }
+sysopen(my $in, $src, O_RDONLY | O_NONBLOCK | O_NOFOLLOW)
+  or fail $!{ELOOP} ? (4, "a symbolic link, which is not followed") : (3, "$!");
+my @a = Time::HiRes::stat($in) or fail 3, "$!";
+S_ISREG($a[2]) or fail 4, "not a regular file";
+$a[7] <= $max or fail 2, "it is larger than 8 MiB";
+my ($data, $n) = ("", 0);
+while ($n = sysread($in, $data, 65536, length $data)) {
+  length($data) <= $max or fail 2, "it grew past 8 MiB while it was read";
 }
-# Type name of a keypath (bool, integer, float, string, array, dictionary,
-# "(any)" for null); empty if the key is absent.
-type_of() { # file keypath
-  "$PLUTIL" -type "$2" -o - "$1" 2>/dev/null || true
+defined $n or fail 3, "$!";
+my @b = Time::HiRes::stat($in) or fail 3, "$!";
+my @c = Time::HiRes::lstat($src);
+id(@a) eq id(@b) && @c && id(@b) eq id(@c) && length($data) == $b[7]
+  or fail 2, "it changed while it was read";
+my $id = id(@b);
+if ($dst eq "-") {
+  index($data, "\0") < 0 or fail 2, "it holds a NUL byte, which a copy kept in memory cannot hold";
+  print "$id\n$data." or exit 2;
+  exit 0;
 }
-is_true() { # file key
-  [[ "$(extract "$1" "$2" || true)" == "true" ]]
+sysopen(my $out, $dst, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600) or fail 5, "$dst: $!";
+for (my $off = 0; $off < length $data; ) {
+  my $w = syswrite($out, $data, length($data) - $off, $off);
+  defined $w && $w > 0 or fail 5, "$dst: $!";
+  $off += $w;
+}
+close($out) or fail 5, "$dst: $!";
+print "$id\n";'
+copy_private() { # live-file name
+  local out rc=0 mem=0 data=""
+  copy_path="$READS/$2"; copy_id=""; copy_why=""
+  if [[ -z "$READS" ]]; then
+    mem=1
+  else
+    "$RM" -f "$copy_path" 2>/dev/null || { copy_why="its earlier copy $copy_path could not be removed"; return 2; }
+    out="$("$ENV" -i "$PERL" -e "$COPY_PERL" "$READ_TIMEOUT_SECONDS" "$1" "$copy_path" 2>/dev/null)" || rc=$?
+    # A copy that could not be written (a full disk) is made again in
+    # memory.
+    if (( rc == 5 && ${COPY_IN_MEMORY:-0} == 1 )); then
+      "$RM" -f "$copy_path" 2>/dev/null || true
+      mem=1; rc=0
+    fi
+  fi
+  if (( mem )); then
+    copy_path="mem:${2//[^A-Za-z0-9_]/_}"
+    printf -v "mem_${copy_path#mem:}" '%s' ""
+    out="$("$ENV" -i "$PERL" -e "$COPY_PERL" "$READ_TIMEOUT_SECONDS" "$1" - 2>/dev/null)" || rc=$?
+    # The identity, a newline, the bytes and a "." that keeps their
+    # trailing newlines from the command substitution.
+    if (( rc == 0 )); then
+      if [[ "$out" == *$'\n'*. ]]; then
+        data="${out#*$'\n'}"; data="${data%.}"
+        out="${out%%$'\n'*}"
+      else
+        out=""
+      fi
+    fi
+  fi
+  if (( rc == 0 )) && [[ "$out" =~ ^[0-9]+:[0-9]+:[0-9]+:-?[0-9]+\.[0-9]{9}:-?[0-9]+\.[0-9]{9}$ ]]; then
+    copy_id="$out"
+    if (( mem )); then printf -v "mem_${copy_path#mem:}" '%s' "$data"; fi
+    return 0
+  fi
+  copy_why="${out%%$'\n'*}"
+  case "$rc" in
+    3|4) ;;
+    142) copy_why="it was still being read after ${READ_TIMEOUT_SECONDS}s"; rc=2 ;;
+    0) copy_why="the copy did not report what it copied"; rc=2 ;;
+    *) copy_why="${copy_why:-the copy exited $rc}"; rc=2 ;;
+  esac
+  copy_why="${copy_why:-the copy exited $rc}"
+  return "$rc"
+}
+# The identity copy_private gives a file (copy_id), of the file at $1 now,
+# not following a link: its device, inode and size, and its modification
+# and change times with the fraction perl's Time::HiRes gives them (the
+# nanoseconds the system keeps, rounded to a double, a fraction of a
+# microsecond). Prints nothing when there is no such file.
+# shellcheck disable=SC2016  # the $ below are perl's, not this shell's
+ID_PERL='use strict; use Time::HiRes ();
+my @s = Time::HiRes::lstat($ARGV[0]) or exit 1;
+print join(":", @s[0,1,7], map { sprintf "%.9f", $_ } @s[9,10]), "\n";'
+file_id() { # path
+  "$ENV" -i "$PERL" -e "$ID_PERL" "$1" 2>/dev/null
+}
+# Runs plutil with these arguments on the file given last, or, for a copy
+# kept in memory (mem:<name>, see copy_private), on those bytes through its
+# standard input. Returns plutil's status.
+plutil_on() { # plutil-arguments... file
+  local f="${!#}" v
+  if [[ "$f" != mem:* ]]; then
+    "$PLUTIL" "$@" || return
+    return 0
+  fi
+  v="mem_${f#mem:}"
+  printf '%s' "${!v}" | "$PLUTIL" "${@:1:$#-1}" - && return 0
+  return "${PIPESTATUS[1]}"
+}
+# True when file $1 holds the same bytes as this run's copy $2, a file or
+# one kept in memory.
+same_as_read() { # file copy
+  if [[ "$2" == mem:* ]]; then
+    local v="mem_${2#mem:}"
+    printf '%s' "${!v}" | "$CMP" -s - "$1"
+  else
+    "$CMP" -s "$1" "$2"
+  fi
+}
+# state.json's private copy (state_copy) and the identity of the file it was
+# made from (state_id), for state_unchanged. state_copy_rc and
+# state_copy_why keep copy_private's status and reason.
+state_copy=""
+state_id=""
+state_copy_why=""
+copy_state() {
+  local rc=0
+  state_copy=""; state_id=""
+  copy_private "$STATE" state.json || rc=$?
+  state_copy_rc="$rc"; state_copy_why="$copy_why"
+  if (( rc == 0 )); then state_copy="$copy_path"; state_id="$copy_id"; fi
+  return "$rc"
+}
+# True while state.json is still the file state_copy was made from.
+state_unchanged() {
+  local now
+  now="$(file_id "$STATE")" || return 1
+  [[ -n "$state_id" && "$now" == "$state_id" ]]
+}
+
+# Reads through plutil, always of a private copy. type_at sets t to the
+# type name at the key path (bool, integer, float, string, array,
+# dictionary, or "(any)" for null) and read_at sets read_value to what
+# -extract prints there (raw or json), apart from the one newline plutil
+# adds, so a stored trailing newline is kept. Both return 0 with the value;
+# 1 when the key path is absent, which plutil reports as "No value at that
+# key path", and read_at also for a null, as for the app's decodeIfPresent;
+# and 2 for any other failure, with read_why saying which read failed and
+# how. What that key holds is then unknown, never absent: no caller acts on
+# it. A plutil that words the absence differently makes every absent key
+# unknown, and the run then undoes nothing and exits 1.
+plutil_run() { # plutil-arguments... file
+  local out all split
+  plutil_rc=""; plutil_err=""
+  if [[ -n "$READS" ]]; then
+    # A message file that cannot be made or read is quiet here: the run
+    # below then keeps the message in memory.
+    out="$(exec 2>/dev/null; plutil_on "$@" 2>"$READS/plutil.err"; echo ".$?")"
+    plutil_rc="${out##*.}"
+    if [[ "$plutil_rc" != 0 ]]; then
+      { IFS= read -r plutil_err < "$READS/plutil.err"; } 2>/dev/null || true
+    fi
+  fi
+  # With no folder, or a failure whose message could not be kept in one (a
+  # full disk), plutil runs again and its message is kept in memory: it
+  # goes to the outer capture first, then a line no message holds, then
+  # what plutil printed and its status.
+  if [[ -z "$READS" ]] || [[ "$plutil_rc" != 0 && -z "$plutil_err" ]]; then
+    split="--plutil-$$-$RANDOM--"
+    all="$( { out="$(plutil_on "$@" 2>&4; echo ".$?")"; printf '\n%s\n%s' "$split" "$out"; } 4>&1 )"
+    out="${all#*$'\n'"$split"$'\n'}"
+    plutil_err="${all%%$'\n'"$split"$'\n'*}"
+    plutil_err="${plutil_err%%$'\n'*}"
+    plutil_rc="${out##*.}"
+  fi
+  out="${out%.*}"
+  plutil_out="${out%$'\n'}"
+}
+absent_reply() { # keypath
+  [[ "$plutil_rc" == 1 && "$plutil_err" == *"No value at that key path or invalid key path: $1" ]]
+}
+type_at() { # file keypath
+  t=""
+  plutil_run -type "$2" -o - "$1"
+  if [[ "$plutil_rc" == 0 ]]; then t="$plutil_out"; return 0; fi
+  absent_reply "$2" && return 1
+  read_why="$2: plutil -type exited ${plutil_rc:-?} (${plutil_err:-no message})"
+  return 2
+}
+# For the shape checks: type_at with t empty when the key is absent, and a
+# failure only when the read failed.
+ty() { # file keypath
+  type_at "$@" || (( $? == 1 ))
+}
+# Round 36: a session.json whose id (Session.id) is a string other than
+# the one the start journaled (sleepOffAttempt.session, a string too) is
+# not that start's session, whatever its end. With either one missing or
+# not a string, the end alone decides, as in the app
+# (SessionManager.isSession). Sets id_differs to 1 or 0. Returns 2, with
+# read_why, when a read failed.
+session_id_differs() { # session-copy journal-copy
+  local ours
+  id_differs=0
+  type_at "$1" id || { (( $? == 1 )) && return 0; return 2; }
+  [[ "$t" == string ]] || return 0
+  read_at "$1" id raw || return 2
+  ours="$read_value"
+  type_at "$2" sleepOffAttempt.session || { (( $? == 1 )) && return 0; return 2; }
+  [[ "$t" == string ]] || return 0
+  read_at "$2" sleepOffAttempt.session raw || return 2
+  [[ "$ours" == "$read_value" ]] || id_differs=1
+}
+read_at() { # file keypath raw|json
+  local rc err
+  read_value=""
+  plutil_run -extract "$2" "$3" -o - "$1"
+  if [[ "$plutil_rc" == 0 ]]; then read_value="$plutil_out"; return 0; fi
+  absent_reply "$2" && return 1
+  rc="$plutil_rc"; err="$plutil_err"
+  # A null cannot be extracted; its type is "(any)".
+  if [[ "$rc" == 1 ]]; then
+    plutil_run -type "$2" -o - "$1"
+    [[ "$plutil_rc" == 0 && "$plutil_out" == "(any)" ]] && return 1
+  fi
+  read_why="$2: plutil -extract exited ${rc:-?} (${err:-no message})"
+  return 2
+}
+# The number of elements of the array at key path $2 into count: 0 when it
+# is absent or null. Returns 2 when a read failed.
+count_at() { # file keypath
+  count=0
+  while :; do
+    type_at "$1" "$2.$count" || { (( $? == 1 )) && return 0; return 2; }
+    count=$((count + 1))
+  done
+}
+# True when plutil converts $1 whole to JSON and both that JSON and the
+# file itself (or the copy in memory) start with "{". Each step's status
+# counts: a conversion or a read that fails is not a JSON object.
+json_object() { # file
+  local c v
+  c="$(plutil_on -convert json -o - "$1" 2>/dev/null)" || return 1
+  [[ "${c:0:1}" == "{" ]] || return 1
+  if [[ "$1" == mem:* ]]; then
+    v="mem_${1#mem:}"; c="${!v}"
+  else
+    c="$("$HEAD" -c 1 "$1")" || return 1
+  fi
+  [[ "${c:0:1}" == "{" ]]
+}
+# Runs journal_shape_problems or session_shape_problems on file $2. Sets
+# shape_lines to what it prints and returns its status: 0, or 2 when a read
+# failed, with read_why saying which. Not `problems`: uninstall.sh's step 4
+# keeps its list in an array of that name, and a string assigned to it
+# would become that array's first element.
+shape_of() { # journal|session file
+  local out rc=0
+  case "$1" in
+    journal) out="$(journal_shape_problems "$2" || { rc=$?; echo "${read_why:-a read failed}"; exit "$rc"; })" || rc=$? ;;
+    *) out="$(session_shape_problems "$2" || { rc=$?; echo "${read_why:-a read failed}"; exit "$rc"; })" || rc=$? ;;
+  esac
+  shape_lines="$out"
+  if (( rc != 0 )); then
+    read_why="${out##*$'\n'}"
+    shape_lines=""
+    return 2
+  fi
+  return 0
+}
+# A read of the journal's copy that this run cannot do without. Sets
+# read_value, empty for a key that is absent or null, and found to 1 when
+# it is neither. A read that fails ends the run here: nothing more is undone
+# and the journal is kept as it was.
+state_read() { # keypath raw|json
+  local rc=0
+  found=0
+  read_at "$state_copy" "$1" "$2" || rc=$?
+  if (( rc == 2 )); then
+    log error "$STATE: $read_why; nothing more undone this run, the journal is kept as it was, and the next run tries again"
+    leave 1
+  fi
+  if (( rc == 0 )); then found=1; fi
+  return 0
+}
+# The number of elements of the journal's array $1 into count, as
+# state_read: a read that fails ends the run.
+state_count() { # keypath
+  local rc=0
+  count_at "$state_copy" "$1" || rc=$?
+  if (( rc != 0 )); then
+    log error "$STATE: $read_why; nothing more undone this run, the journal is kept as it was, and the next run tries again"
+    leave 1
+  fi
+  return 0
 }
 is_positive_int() {
   [[ "$1" =~ ^[0-9]+$ ]] && (( 10#$1 > 0 ))
@@ -286,11 +802,15 @@ is_positive_int() {
 # once, where counting polls stretched the limit by every one of them. The
 # file is checked once more after the limit, so a status written during the
 # last poll still counts. A wall-clock change during the wait (the clock set
-# back or forward) lengthens or shortens it by that much.
+# back or forward) lengthens or shortens it by that much. The first 20 polls
+# sleep 0.01 s, so a command that ends at once, as most undo commands do, is
+# seen within milliseconds, as install.sh and uninstall.sh see theirs; later
+# ones sleep 0.1 s, so a long wait forks a tenth as many sleeps.
 wait_for_status() { # file seconds
-  local deadline=$(( SECONDS + $2 ))
+  local deadline=$(( SECONDS + $2 )) polls=0
   while [[ ! -s "$1" ]] && (( SECONDS <= deadline )); do
-    sleep 0.1
+    if (( polls < 20 )); then sleep 0.01; else sleep 0.1; fi
+    polls=$((polls + 1))
   done
   [[ -s "$1" ]]
 }
@@ -339,8 +859,8 @@ run_bounded() { # command args...
   # Each of the supervisor's two waits can end up to a second after its
   # limit, plus the poll in progress then (see wait_for_status), and the
   # supervisor takes a moment to start and to write its status. Four seconds
-  # cover that at the usual 0.1 s poll. A supervisor slower than that gets
-  # the 125 below, the safe side.
+  # cover that with polls at most 0.1 s apart. A supervisor slower than
+  # that gets the 125 below, the safe side.
   answer_within=$(( COMMAND_TIMEOUT_SECONDS + KILL_GRACE_SECONDS + 4 ))
   if wait_for_status "$base.rc" "$answer_within"; then
     read -r status < "$base.rc" || true
@@ -423,9 +943,10 @@ supervise_command() { # base command args...
   log info "'$*' (pid $cpid), left running after SIGTERM, has exited (wait status $rc); its supervisor now lets go of the recovery lock, and the next run will retry"
 }
 
-# Run the app binary's --resume-frozen check (see resume_via_app) with the
-# same time limit, standard input from app_answer_dir/in and standard output
-# to app_answer_dir/out. This shell starts the binary as its own background
+# Run one of the app binary's one-shot modes, --resume-frozen (see
+# resume_via_app) or --access-lists (see read_access_lists), with the same
+# time limit, standard input from app_answer_dir/in and standard output to
+# app_answer_dir/out. This shell starts the binary as its own background
 # job and is the only process that signals it; no supervisor stands between
 # them. Bash reaps a finished child on its own (in its SIGCHLD handler), so a
 # signal sent by pid could reach whatever process gets that pid next. Each
@@ -437,10 +958,11 @@ supervise_command() { # base command args...
 # our own unprivileged binary, so when SIGTERM does not end it within
 # KILL_GRACE_SECONDS it gets SIGKILL: from then on it runs no more of its own
 # code and so cannot send another signal.
-# The binary inherits fd 9, so the recovery lock stays held for as long as it
-# runs, also after this shell is gone: a run killed mid-call leaves no helper
-# that could resume a process a later session froze while the lock was free.
-# The binary ends itself after its lifetime argument (resume_via_app passes
+# The binary inherits fd 9 (and fd 7 while the receipt is locked), so the
+# recovery lock stays held for as long as it runs, also after this shell is
+# gone: a run killed mid-call leaves no helper that could resume a process a
+# later session froze while the lock was free.
+# The binary ends itself after its lifetime argument (both callers pass
 # COMMAND_TIMEOUT_SECONDS + KILL_GRACE_SECONDS), so such a helper frees the
 # lock on its own. Returns the binary's exit status, or 124 when it did not
 # finish in time. The function's stderr is /dev/null because bash reports a
@@ -456,12 +978,13 @@ job_running() { # pid
 }
 # True once job pid $1 has left bash's running list; waits at least $2
 # seconds for that unless it happens first, on the SECONDS clock like
-# wait_for_status (and within the same bounds), and checks once more after
-# the limit.
+# wait_for_status (and within the same bounds, with the same polls), and
+# checks once more after the limit.
 wait_for_job() { # pid seconds
-  local deadline=$(( SECONDS + $2 ))
+  local deadline=$(( SECONDS + $2 )) polls=0
   while job_running "$1" && (( SECONDS <= deadline )); do
-    sleep 0.1
+    if (( polls < 20 )); then sleep 0.01; else sleep 0.1; fi
+    polls=$((polls + 1))
   done
   ! job_running "$1"
 }
@@ -480,15 +1003,15 @@ run_app_bounded() { # command args...
   signal_job TERM "$cpid" || true
   if wait_for_job "$cpid" "$KILL_GRACE_SECONDS"; then
     wait "$cpid" || rc=$?
-    log error "'$1 --resume-frozen' (pid $cpid) did not answer within ${COMMAND_TIMEOUT_SECONDS}s; sent SIGTERM, and it ended (wait status $rc)"
+    log error "'$1 $2' (pid $cpid) did not answer within ${COMMAND_TIMEOUT_SECONDS}s; sent SIGTERM, and it ended (wait status $rc)"
     return 124
   fi
   signal_job KILL "$cpid" || true
   if wait_for_job "$cpid" "$KILL_GRACE_SECONDS"; then
     wait "$cpid" || rc=$?
-    log error "'$1 --resume-frozen' (pid $cpid) did not answer within ${COMMAND_TIMEOUT_SECONDS}s and was still running ${KILL_GRACE_SECONDS}s after SIGTERM; sent SIGKILL, and it ended (wait status $rc)"
+    log error "'$1 $2' (pid $cpid) did not answer within ${COMMAND_TIMEOUT_SECONDS}s and was still running ${KILL_GRACE_SECONDS}s after SIGTERM; sent SIGKILL, and it ended (wait status $rc)"
   else
-    log error "'$1 --resume-frozen' (pid $cpid) did not answer within ${COMMAND_TIMEOUT_SECONDS}s and has not exited ${KILL_GRACE_SECONDS}s after SIGKILL; it runs no further code, and it keeps the recovery lock until the kernel ends it"
+    log error "'$1 $2' (pid $cpid) did not answer within ${COMMAND_TIMEOUT_SECONDS}s and has not exited ${KILL_GRACE_SECONDS}s after SIGKILL; it runs no further code, and it keeps the recovery lock until the kernel ends it"
   fi
   return 124
 } 2>/dev/null
@@ -498,7 +1021,7 @@ run_app_bounded() { # command args...
 # the lock stays with the live command's supervisor.
 stop_transaction() { # what
   log error "recovery stopped after '$1' (still running); no further undo this run, journal and session kept unchanged until it ends"
-  exit 1
+  leave 1
 }
 
 # Prints one line per way the app's records about a kept display entry would
@@ -528,9 +1051,12 @@ stop_transaction() { # what
 # decoder's Unicode equivalence, so a file with neither "keptDisplay" nor a
 # backslash in it has none of them and is not read further. Any of these
 # makes the journal malformed, as for a wrong type, and nothing is undone.
+# A read that fails, of the text or of the file's size, returns 2 with
+# nothing printed for it: its records are unknown, not absent, and the
+# caller must not count the journal as clean.
 record_text_problems() { # file
   local LC_ALL=C
-  local text rest raw key c token depth str plain scalar number esc hex lost
+  local text rest raw key c token depth str plain scalar number esc hex lost size v
   local n_low=0 n_lit=0 n_boot=0 digits sig exp e10 lead
   str='^"([^"\\]|\\.)*"'
   plain='^[^]["{}]+'
@@ -539,11 +1065,25 @@ record_text_problems() { # file
   esc='^u00(4[1-9A-Fa-f]|5[0-9Aa]|6[1-9A-Fa-f]|7[0-9Aa])'
   hex='^u[0-9A-Fa-f]{4}'
   lost="the top level of state.json cannot be followed here, so its records about a kept display entry cannot be checked"
-  text="$(<"$1")"
+  # cat's status follows its output, so a read that fails part way is
+  # seen, and so is every newline at the end.
+  if [[ "$1" == mem:* ]]; then
+    v="mem_${1#mem:}"; text="${!v}"
+  else
+    text="$("$CAT" "$1"; echo ".$?")"
+    [[ "${text##*.}" == 0 ]] || return 2
+    text="${text%.*}"
+  fi
   [[ "$text" == *keptDisplay* || "$text" == *\\* ]] || return 0
-  if IFS= read -r -d '' c < "$1"; then
-    echo "$lost"
-    return 0
+  # The shell drops NUL bytes from the text, so a file with one is longer
+  # than the text read from it. A copy in memory has none: copy_private
+  # refuses a file with one.
+  if [[ "$1" != mem:* ]]; then
+    size="$("$STAT" -f %z "$1")" || return 2
+    if (( ${#text} != size )); then
+      echo "$lost"
+      return 0
+    fi
   fi
   rest="${text#$'\xef\xbb\xbf'}"
   rest="${rest#"${rest%%[![:space:]]*}"}"
@@ -660,142 +1200,200 @@ record_text_problems() { # file
 
 # Prints one line per way the journal does not have the shape the app writes
 # (RuntimeState.swift). Present keys must have the right type; a JSON null is
-# the same as an absent optional (Swift decodeIfPresent).
+# the same as an absent optional (Swift decodeIfPresent). Returns 2 when a
+# read of the file failed, the conversion, its text for the kept display
+# records or the type of a key, with read_why saying which: its shape is
+# then unknown, not malformed.
 journal_shape_problems() { # file
-  local f="$1" key t i n
-  if [[ "$("$PLUTIL" -convert json -o - "$f" 2>/dev/null | head -c 1)" != "{" ]]; then
+  local f="$1" key t i n json
+  json="$(plutil_on -convert json -o - "$f" 2>/dev/null)" || { read_why="state.json could not be converted to JSON again (plutil -convert json failed)"; return 2; }
+  if [[ "${json:0:1}" != "{" ]]; then
     echo "state.json is not a JSON object"
     return 0
   fi
   for key in sleepDisabledByUs lowPowerSetByUs dockerFrozen savedMuted displayRestoreRefused keyboardRestoreRefused; do
-    t="$(type_of "$f" "$key")"
+    ty "$f" "$key" || return 2
     [[ -z "$t" || "$t" == bool || "$t" == "(any)" ]] || echo "$key is a $t, not a bool"
   done
   for key in savedOutputVolume savedDisplayBrightness savedKeyboardBrightness displayRestoredUnderLowPower; do
-    t="$(type_of "$f" "$key")"
+    ty "$f" "$key" || return 2
     [[ -z "$t" || "$t" == float || "$t" == integer || "$t" == "(any)" ]] || echo "$key is a $t, not a number"
   done
   # The app's records about a kept display entry: kept for the app, never
   # read for an undo here. Each must still decode, or the app cannot read
   # the journal at all.
   for key in keptDisplayUnderLowPower keptDisplayReadLit; do
-    t="$(type_of "$f" "$key")"
+    ty "$f" "$key" || return 2
     [[ -z "$t" || "$t" == float || "$t" == integer || "$t" == "(any)" ]] || echo "$key is a $t, not a number"
   done
-  t="$(type_of "$f" keptDisplayUnderLowPowerBoot)"
+  ty "$f" keptDisplayUnderLowPowerBoot || return 2
   [[ -z "$t" || "$t" == string || "$t" == "(any)" ]] || echo "keptDisplayUnderLowPowerBoot is a $t, not a string"
-  record_text_problems "$f"
-  t="$(type_of "$f" frozenProcesses)"
+  record_text_problems "$f" || { read_why="its text could not be read for the kept display records"; return 2; }
+  ty "$f" frozenProcesses || return 2
   if [[ -n "$t" && "$t" != "(any)" ]]; then
     if [[ "$t" != array ]]; then
       echo "frozenProcesses is a $t, not an array"
     else
       i=0
-      while [[ -n "$(type_of "$f" "frozenProcesses.$i")" ]]; do
-        if [[ "$(type_of "$f" "frozenProcesses.$i")" != dictionary ]]; then
+      while :; do
+        ty "$f" "frozenProcesses.$i" || return 2
+        [[ -n "$t" ]] || break
+        if [[ "$t" != dictionary ]]; then
           echo "frozenProcesses[$i] is not an object"
         else
-          [[ "$(type_of "$f" "frozenProcesses.$i.pid")" == integer ]] || echo "frozenProcesses[$i].pid is not an integer"
+          ty "$f" "frozenProcesses.$i.pid" || return 2
+          [[ "$t" == integer ]] || echo "frozenProcesses[$i].pid is not an integer"
           for n in startedAt startedAtMicros; do
-            t="$(type_of "$f" "frozenProcesses.$i.$n")"
+            ty "$f" "frozenProcesses.$i.$n" || return 2
             [[ -z "$t" || "$t" == integer || "$t" == "(any)" ]] || echo "frozenProcesses[$i].$n is a $t, not an integer"
           done
-          t="$(type_of "$f" "frozenProcesses.$i.bootSession")"
+          ty "$f" "frozenProcesses.$i.bootSession" || return 2
           [[ -z "$t" || "$t" == string || "$t" == "(any)" ]] || echo "frozenProcesses[$i].bootSession is a $t, not a string"
         fi
         i=$((i + 1))
       done
     fi
   fi
-  t="$(type_of "$f" frozenPids)"
+  ty "$f" frozenPids || return 2
   if [[ -n "$t" && "$t" != "(any)" ]]; then
     if [[ "$t" != array ]]; then
       echo "frozenPids is a $t, not an array"
     else
       i=0
-      while [[ -n "$(type_of "$f" "frozenPids.$i")" ]]; do
-        [[ "$(type_of "$f" "frozenPids.$i")" == integer ]] || echo "frozenPids[$i] is not an integer"
+      while :; do
+        ty "$f" "frozenPids.$i" || return 2
+        [[ -n "$t" ]] || break
+        [[ "$t" == integer ]] || echo "frozenPids[$i] is not an integer"
         i=$((i + 1))
       done
     fi
   fi
-  t="$(type_of "$f" savedAudioOutputs)"
+  ty "$f" savedAudioOutputs || return 2
   if [[ -n "$t" && "$t" != "(any)" ]]; then
     if [[ "$t" != array ]]; then
       echo "savedAudioOutputs is a $t, not an array"
     else
       i=0
-      while [[ -n "$(type_of "$f" "savedAudioOutputs.$i")" ]]; do
-        if [[ "$(type_of "$f" "savedAudioOutputs.$i")" != dictionary ]]; then
+      while :; do
+        ty "$f" "savedAudioOutputs.$i" || return 2
+        [[ -n "$t" ]] || break
+        if [[ "$t" != dictionary ]]; then
           echo "savedAudioOutputs[$i] is not an object"
         else
-          [[ "$(type_of "$f" "savedAudioOutputs.$i.deviceUID")" == string ]] || echo "savedAudioOutputs[$i].deviceUID is not a string"
-          t="$(type_of "$f" "savedAudioOutputs.$i.volume")"
+          ty "$f" "savedAudioOutputs.$i.deviceUID" || return 2
+          [[ "$t" == string ]] || echo "savedAudioOutputs[$i].deviceUID is not a string"
+          ty "$f" "savedAudioOutputs.$i.volume" || return 2
           [[ "$t" == float || "$t" == integer ]] || echo "savedAudioOutputs[$i].volume is not a number"
-          [[ "$(type_of "$f" "savedAudioOutputs.$i.muted")" == bool ]] || echo "savedAudioOutputs[$i].muted is not a bool"
-          t="$(type_of "$f" "savedAudioOutputs.$i.name")"
+          ty "$f" "savedAudioOutputs.$i.muted" || return 2
+          [[ "$t" == bool ]] || echo "savedAudioOutputs[$i].muted is not a bool"
+          ty "$f" "savedAudioOutputs.$i.name" || return 2
           [[ -z "$t" || "$t" == string || "$t" == "(any)" ]] || echo "savedAudioOutputs[$i].name is a $t, not a string"
-          t="$(type_of "$f" "savedAudioOutputs.$i.saveID")"
+          ty "$f" "savedAudioOutputs.$i.saveID" || return 2
           [[ -z "$t" || "$t" == string || "$t" == "(any)" ]] || echo "savedAudioOutputs[$i].saveID is a $t, not a string"
         fi
         i=$((i + 1))
       done
     fi
   fi
-  t="$(type_of "$f" appNapOverrides)"
+  ty "$f" appNapOverrides || return 2
   if [[ -n "$t" && "$t" != "(any)" ]]; then
     if [[ "$t" != array ]]; then
       echo "appNapOverrides is a $t, not an array"
     else
       i=0
-      while [[ -n "$(type_of "$f" "appNapOverrides.$i")" ]]; do
-        if [[ "$(type_of "$f" "appNapOverrides.$i")" != dictionary ]]; then
+      while :; do
+        ty "$f" "appNapOverrides.$i" || return 2
+        [[ -n "$t" ]] || break
+        if [[ "$t" != dictionary ]]; then
           echo "appNapOverrides[$i] is not an object"
         else
-          [[ "$(type_of "$f" "appNapOverrides.$i.bundleId")" == string ]] || echo "appNapOverrides[$i].bundleId is not a string"
-          t="$(type_of "$f" "appNapOverrides.$i.previous")"
+          ty "$f" "appNapOverrides.$i.bundleId" || return 2
+          [[ "$t" == string ]] || echo "appNapOverrides[$i].bundleId is not a string"
+          ty "$f" "appNapOverrides.$i.previous" || return 2
           [[ -z "$t" || "$t" == bool || "$t" == "(any)" ]] || echo "appNapOverrides[$i].previous is a $t, not a bool"
         fi
         i=$((i + 1))
       done
     fi
   fi
-}
-
-# Seconds since the epoch for a date in the one form session.json may hold,
-# or nothing. Store.parseDate in the app reads exactly this form:
-# 2027-01-15T08:00:00Z, which is what Store.swift writes, or the same with
-# an offset such as +02:00 or -05:30 in place of Z. Whole seconds, a date
-# and time that exist, years 1970 to 9999, offsets up to 23:59. `date -j -f`
-# rolls an impossible day or second over, so the result is formatted back
-# and must match.
-epoch_of() { # string
-  local form='^([0-9]{4})-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(Z|([+-])([0-9]{2}):([0-9]{2}))$'
-  local clock offset=0 e
-  [[ "$1" =~ $form ]] || return 0
-  (( 10#${BASH_REMATCH[1]} >= 1970 )) || return 0
-  if [[ "${BASH_REMATCH[2]}" != Z ]]; then
-    (( 10#${BASH_REMATCH[4]} <= 23 && 10#${BASH_REMATCH[5]} <= 59 )) || return 0
-    offset=$(( 10#${BASH_REMATCH[4]} * 3600 + 10#${BASH_REMATCH[5]} * 60 ))
-    if [[ "${BASH_REMATCH[3]}" == - ]]; then offset=$(( -offset )); fi
-  fi
-  clock="${1:0:19}"
-  e="$("$DATE" -j -u -f '%Y-%m-%dT%H:%M:%S' "$clock" +%s 2>/dev/null)" || return 0
-  if [[ "$("$DATE" -u -r "$e" +%Y-%m-%dT%H:%M:%S 2>/dev/null)" == "$clock" ]]; then
-    echo $(( e - offset ))
+  ty "$f" sleepOffAttempt || return 2
+  if [[ -n "$t" && "$t" != "(any)" ]]; then
+    if [[ "$t" != dictionary ]]; then
+      echo "sleepOffAttempt is a $t, not an object"
+    else
+      ty "$f" sleepOffAttempt.nonce || return 2
+      [[ "$t" == string ]] || echo "sleepOffAttempt.nonce is not a string"
+      ty "$f" sleepOffAttempt.owedBefore || return 2
+      [[ "$t" == bool ]] || echo "sleepOffAttempt.owedBefore is not a bool"
+      ty "$f" sleepOffAttempt.receipt || return 2
+      [[ "$t" == string ]] || echo "sleepOffAttempt.receipt is not a string"
+      ty "$f" sleepOffAttempt.predecessor || return 2
+      [[ "$t" == string ]] || echo "sleepOffAttempt.predecessor is not a string"
+      ty "$f" sleepOffAttempt.deadline || return 2
+      [[ "$t" == integer ]] || echo "sleepOffAttempt.deadline is not an integer"
+      ty "$f" sleepOffAttempt.expires || return 2
+      [[ "$t" == integer ]] || echo "sleepOffAttempt.expires is not an integer"
+      ty "$f" sleepOffAttempt.marker || return 2
+      [[ -z "$t" || "$t" == string || "$t" == "(any)" ]] || echo "sleepOffAttempt.marker is a $t, not a string"
+      ty "$f" sleepOffAttempt.settled || return 2
+      [[ -z "$t" || "$t" == bool || "$t" == "(any)" ]] || echo "sleepOffAttempt.settled is a $t, not a bool"
+      ty "$f" sleepOffAttempt.resumes || return 2
+      if [[ "$t" == dictionary ]]; then
+        ty "$f" sleepOffAttempt.resumes.startedAt || return 2
+        [[ -z "$t" || "$t" == integer || "$t" == "(any)" ]] || echo "sleepOffAttempt.resumes.startedAt is a $t, not an integer"
+        ty "$f" sleepOffAttempt.resumes.firstEnd || return 2
+        [[ -z "$t" || "$t" == integer || "$t" == "(any)" ]] || echo "sleepOffAttempt.resumes.firstEnd is a $t, not an integer"
+      elif [[ -n "$t" && "$t" != "(any)" ]]; then
+        echo "sleepOffAttempt.resumes is a $t, not an object"
+      fi
+    fi
   fi
   return 0
 }
 
+# Seconds since the epoch, into epoch, for a date in the one form
+# session.json may hold; epoch is empty for anything else. Store.parseDate
+# in the app reads exactly this form: 2027-01-15T08:00:00Z, which is what
+# Store.swift writes, or the same with an offset such as +02:00 or -05:30
+# in place of Z. Whole seconds, a date and time that exist, years 1970 to
+# 9999, offsets up to 23:59. `date -j -f` refuses a month outside 1 to 12,
+# a day above 31, an hour above 23, a minute above 59 and a second above
+# 60, so those are refused here before it runs; it rolls an impossible day
+# or second over, so the result is formatted back and must match. Returns
+# 2 when date fails on a string it accepts, or prints no number: the date
+# is then unknown, not malformed.
+epoch_of() { # string
+  local form='^([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})(Z|([+-])([0-9]{2}):([0-9]{2}))$'
+  local clock offset=0 e back
+  epoch=""
+  [[ "$1" =~ $form ]] || return 0
+  (( 10#${BASH_REMATCH[1]} >= 1970 )) || return 0
+  (( 10#${BASH_REMATCH[2]} >= 1 && 10#${BASH_REMATCH[2]} <= 12 && 10#${BASH_REMATCH[3]} <= 31 \
+     && 10#${BASH_REMATCH[4]} <= 23 && 10#${BASH_REMATCH[5]} <= 59 && 10#${BASH_REMATCH[6]} <= 60 )) || return 0
+  if [[ "${BASH_REMATCH[7]}" != Z ]]; then
+    (( 10#${BASH_REMATCH[9]} <= 23 && 10#${BASH_REMATCH[10]} <= 59 )) || return 0
+    offset=$(( 10#${BASH_REMATCH[9]} * 3600 + 10#${BASH_REMATCH[10]} * 60 ))
+    if [[ "${BASH_REMATCH[8]}" == - ]]; then offset=$(( -offset )); fi
+  fi
+  clock="${1:0:19}"
+  e="$("$DATE" -j -u -f '%Y-%m-%dT%H:%M:%S' "$clock" +%s 2>/dev/null)" || return 2
+  [[ "$e" =~ ^[0-9]+$ ]] || return 2
+  back="$("$DATE" -u -r "$e" +%Y-%m-%dT%H:%M:%S 2>/dev/null)" || return 2
+  if [[ "$back" == "$clock" ]]; then epoch=$(( e - offset )); fi
+  return 0
+}
+
 # epoch_of the string at a keypath, read exactly as the app's decoder sees
-# it. Command substitution strips every trailing newline, stored ones too,
-# so a sentinel follows plutil's output and only plutil's own newline is
-# cut: "...Z\n" in the file is refused here as it is in the app.
+# it: read_at keeps a stored trailing newline and cuts only plutil's own,
+# so "...Z\n" in the file is refused here as it is in the app. An absent
+# key leaves epoch empty; a read that fails returns 2.
 epoch_at() { # file keypath
-  local v
-  v="$(extract "$1" "$2"; echo .)"
-  v="${v%.}"
-  epoch_of "${v%$'\n'}"
+  local rc=0
+  epoch=""
+  read_at "$1" "$2" raw || rc=$?
+  (( rc != 2 )) || return 2
+  (( rc == 0 )) || return 0
+  epoch_of "$read_value" || { read_why="$2: date could not read $read_value"; return 2; }
 }
 
 # Prints one line per way session.json does not have the shape the app's
@@ -803,40 +1401,735 @@ epoch_at() { # file keypath
 # endsAt are dates as Store.swift writes them and whose extensions is an
 # array of numbers. All three are required; extra keys are ignored, as in
 # Swift. The app refuses a file with any of these problems, so the shell
-# does not act on its endsAt either.
+# does not act on its endsAt either. Returns 2, with read_why, when a read
+# of the file failed: its shape is then unknown, not malformed.
 session_shape_problems() { # file
-  local f="$1" key t i
+  local f="$1" key t i c v
   # plutil also reads XML and binary property lists, which the app's
-  # JSONDecoder refuses, so the file itself must start with "{" too.
-  if [[ "$(LC_ALL=C tr -d ' \t\r\n' < "$f" 2>/dev/null | head -c 1)" != "{" ]] \
-     || [[ "$("$PLUTIL" -convert json -o - "$f" 2>/dev/null | head -c 1)" != "{" ]]; then
+  # JSONDecoder refuses, so the file itself must start with "{" too. head
+  # ends after one byte, and tr may then end on SIGPIPE (141); any other
+  # status of either is a read that failed.
+  if [[ "$f" == mem:* ]]; then
+    v="mem_${f#mem:}"
+    c="$(printf '%s' "${!v}" | LC_ALL=C "$TR" -d ' \t\r\n' 2>/dev/null | "$HEAD" -c 1; echo ".${PIPESTATUS[1]}.${PIPESTATUS[2]}")"
+  else
+    c="$(LC_ALL=C "$TR" -d ' \t\r\n' < "$f" 2>/dev/null | "$HEAD" -c 1; echo ".${PIPESTATUS[0]}.${PIPESTATUS[1]}")"
+  fi
+  if [[ "${c##*.}" != 0 ]] || [[ "${c%.*}" != *.0 && "${c%.*}" != *.141 ]]; then
+    read_why="its first character could not be read"
+    return 2
+  fi
+  c="${c%.*}"; c="${c%.*}"
+  # Then plutil's conversion of the whole file. Only its own verdict on the
+  # bytes, exit 1 with "Property List error", makes the file malformed; any
+  # other failure is a read that failed, and the shape is unknown.
+  if [[ "$c" == "{" ]]; then
+    plutil_run -convert json -o - "$f"
+    if [[ "$plutil_rc" == 0 ]]; then
+      c="${plutil_out:0:1}"
+    elif [[ "$plutil_rc" == 1 && "$plutil_err" == *": Property List error: "* ]]; then
+      c=""
+    else
+      read_why="plutil -convert json exited ${plutil_rc:-?} (${plutil_err:-no message})"
+      return 2
+    fi
+  fi
+  if [[ "$c" != "{" ]]; then
     echo "session.json is not a JSON object"
     return 0
   fi
   for key in startedAt endsAt; do
-    t="$(type_of "$f" "$key")"
+    ty "$f" "$key" || return 2
     if [[ -z "$t" ]]; then
       echo "$key is missing"
     elif [[ "$t" != string ]]; then
       echo "$key is a JSON $t, not a date string"
-    elif [[ -z "$(epoch_at "$f" "$key")" ]]; then
-      echo "$key is not a date in the form 2027-01-15T08:00:00Z or 2027-01-15T10:00:00+02:00"
+    else
+      epoch_at "$f" "$key" || return 2
+      [[ -n "$epoch" ]] || echo "$key is not a date in the form 2027-01-15T08:00:00Z or 2027-01-15T10:00:00+02:00"
     fi
   done
-  t="$(type_of "$f" extensions)"
+  ty "$f" extensions || return 2
   if [[ -z "$t" ]]; then
     echo "extensions is missing"
   elif [[ "$t" != array ]]; then
     echo "extensions is a JSON $t, not an array"
   else
     i=0
-    while [[ -n "$(type_of "$f" "extensions.$i")" ]]; do
-      t="$(type_of "$f" "extensions.$i")"
+    while :; do
+      ty "$f" "extensions.$i" || return 2
+      [[ -n "$t" ]] || break
       [[ "$t" == integer || "$t" == float ]] || echo "extensions[$i] is a JSON $t, not a number"
       i=$((i + 1))
     done
   fi
+  return 0
 }
+
+# --- Settle an unfinished start ----------------------------------------------
+# A start journals sleepOffAttempt (RuntimeState.swift) together with
+# sleepDisabledByUs before its password dialog can run anything, and
+# removes it once it has finished or rolled back. One still here belongs to
+# a start that never finished, or whose settlement could not finish: the
+# app died under it, or could not write. The root-owned receipt shows
+# whether the command behind its dialog turned sleep off
+# (SleepOffReceipts.swift), read under the receipt's own lock, which that
+# command holds from before its checks until pmset exits. This run reads
+# it exactly as the app does (attempt_verdict), whatever happened to the
+# marker above:
+#   - "never": the attempt has no marker (no dialog was shown); or the
+#     receipt holds this start's nonce with "refused"; or another start's
+#     line that names the same predecessor; or, once the start's expires
+#     has passed (its command refuses from then on, while the wall clock
+#     does not go back), the predecessor itself. Its command never turned
+#     sleep off, and never will.
+#   - "may": the receipt holds this start's "writing", a later start's
+#     line, or, once expires has passed, anything else: a receipt that is
+#     missing, replaced, unsafe or damaged.
+#   - "undecided": the receipt stays locked or cannot be locked, or the
+#     file the start journaled cannot be opened, so its lock cannot be
+#     seen; or expires has not passed and the receipt shows nothing yet:
+#     the dialog may still be answered.
+# Decided, the start never finished, so its session never began:
+# session.json goes when its end is the attempt's deadline, so that session
+# is never resumed (a SleepDisabled 1 someone else set would read as still
+# off). Then the journal records the decision while the claim is still
+# held (copy, edit, verify, rename, as below): sleepOffAttempt.settled, and
+# sleepDisabledByUs as it was before the start (owedBefore) after "never",
+# which keeps a restore an earlier session still owes, or set after "may",
+# so the undo below runs. Only then does the start's claim on the receipt
+# go back (the release file, see give_back_claim) and the journal drop
+# sleepOffAttempt (finish_settlement). While the claim is held no start
+# from another Insomnia folder can add a line to the receipt, so a crash or
+# a failure before the decision is published leaves a receipt that still
+# shows the same thing; after it, the decision itself is kept, and a
+# settled record is only finished, never read against the receipt again.
+#
+# Anything that keeps the start unsettled (undecided, a lock, removal or
+# journal write that fails) keeps the record, the sleep entry and the
+# claim. The session is then ended rather than resumed, as --force would,
+# and the run exits 1. The undo below follows attempt_hold: no pmset runs
+# for the sleep entry while it says why (the receipt stays locked or the
+# dialog can still be answered, so a command for that start may still act,
+# whatever the time and whatever an earlier session owes; or the receipt
+# shows "never" and no earlier restore is owed); otherwise sleep is
+# restored and the entry stays with the record. A settled record that
+# cannot be finished holds nothing back and keeps the entry for nothing;
+# the run exits 1 so the next one finishes it. Skipped for a journal that
+# is missing, not a regular file or malformed, which the rest of the run
+# handles.
+
+# Sets unsafe_why to why the receipt $1 or a folder above it fails the
+# checks, or to nothing. Every check matches SleepOffReceipts.swift and the
+# root command (AdministratorPrompt.swift): the receipt, its folder and each
+# folder above up to /, by lstat, must be root's (or RECEIPT_OWNER's), with
+# no write permission for group or others; the receipt a regular file with
+# one link, 82 bytes and mode 600, the rest folders. No folder may have an
+# access control entry that allows anything, and the receipt must have
+# exactly the one install.sh adds for uid $2, so only root and that user
+# can open it and hold its lock. The lists come from the app binary
+# (read_access_lists), which reads every entry, right and flag as the app's
+# own check does. ls(1) never prints synchronize, prints the rights and
+# flags only folders use only for a folder, and skips or stops at an entry
+# it cannot read, so no reading of its text shows those. A list the binary
+# could not read whole, or lists it could not be asked for, fail.
+receipt_unsafe() { # receipt uid
+  local f="$1" p="${1%/*}" listing k
+  local folders=()
+  unsafe_why=""
+  while [[ -n "$p" ]]; do folders+=("$p"); p="${p%/*}"; done
+  folders+=(/)
+  listing="$("$STAT" -f '%u %Lp %l %z %HT' "$f" "${folders[@]}" 2>/dev/null)" || listing=""
+  if ! printf '%s\n' "$listing" | /usr/bin/awk -v o="$RECEIPT_OWNER" -v n="$(( ${#folders[@]} + 1 ))" 'NR == 1 { k = NF == 6 && $5 == "Regular" && $6 == "File" && $3 == 1 && $4 == 82 && $2 == 600 }; NR > 1 { k = k && NF == 5 && $5 == "Directory" }; { k = k && ($1 == 0 || $1 == o) && $2 !~ /[2367].?$/ }; END { exit !(k && NR == n) }'; then
+    unsafe_why="$f is missing, is not the 82-byte file install.sh made, mode 600, or someone other than root can change it or a folder above it"
+    return 0
+  fi
+  read_access_lists "$f" "${folders[@]}"
+  if [[ -n "$lists_why" ]]; then
+    unsafe_why="the access control lists of $f and the folders above it are unknown: $lists_why"
+    return 0
+  fi
+  for (( k = 1; k < ${#lists_words[@]}; k++ )); do
+    case "${lists_words[k]}" in
+      none|denies) ;;
+      allows|installed)
+        unsafe_why="the folder of $f or one above it (${folders[k-1]}) has an access control entry that allows changes"
+        return 0 ;;
+      *)
+        unsafe_why="the access control list of the folder of $f or one above it (${folders[k-1]}) could not be read whole (${lists_words[k]})"
+        return 0 ;;
+    esac
+  done
+  case "${lists_words[0]}" in
+    installed) ;;
+    none|denies|allows) unsafe_why="$f does not have exactly one access control entry, the one that lets uid $2 read it and nothing else" ;;
+    *) unsafe_why="the access control list of $f could not be read whole (${lists_words[0]})" ;;
+  esac
+}
+
+# Sets lists_words from the answer $1 of --access-lists for $2 paths, which
+# exited $3 (AccessListsCommand.swift): one word per path, in order, each on
+# a line of its own that ends in a newline, and a status that agrees with
+# the words, 0 when every list was read whole and 1 when one was not.
+# Anything else leaves lists_words empty and says in lists_why that the
+# lists are unknown.
+lists_from_answer() { # answer count status
+  local rest="$1" line whole=1 valid=1 excerpt
+  lists_words=(); lists_why=""
+  # The longest line, "unreadable <errno>", is under 24 bytes.
+  if (( ${#rest} > $2 * 24 )); then valid=0; rest=""; fi
+  while [[ -n "$rest" ]]; do
+    line="${rest%%$'\n'*}"
+    if [[ "$line" == "$rest" ]]; then valid=0; break; fi
+    rest="${rest#*$'\n'}"
+    case "$line" in
+      none|installed|denies|allows) ;;
+      incomplete) whole=0 ;;
+      *)
+        if ! [[ "$line" =~ ^unreadable\ [1-9][0-9]{0,9}$ ]]; then valid=0; break; fi
+        whole=0 ;;
+    esac
+    lists_words+=("$line")
+  done
+  if (( ! valid || ${#lists_words[@]} != $2 )) || [[ "$3" != "$(( 1 - whole ))" ]]; then
+    excerpt="${1:0:200}"
+    lists_words=()
+    lists_why="the app binary's answer is not one word for each of the $2 paths (exit $3, output '${excerpt//[^[:print:]]/ }')"
+  fi
+}
+
+# Reads the access control lists of the paths $@ with the app binary's
+# --access-lists mode (AccessListsCommand.swift) into lists_words
+# (lists_from_answer), or says in lists_why why they are unknown. The binary
+# is INSOMNIA_BIN, the one in the bundle this copy came from with
+# --own-bundle, and it runs as resume_via_app runs it: only once
+# INSOMNIA_INFO, read from a private copy once per run (lists_gate),
+# declares InsomniaAccessListsVersion ACCESS_LISTS_VERSION, since an older
+# build has no such mode and would open the menu bar app instead; with the
+# same time limit (run_app_bounded); and with an empty file as its standard
+# input, in a fresh private directory that also takes its answer.
+lists_gate=""
+read_access_lists() { # path...
+  local rc=0 info_rc=0 declared="" size="" answer="" read_rc=0 opened=0
+  lists_words=(); lists_why=""
+  if [[ ! -x "$INSOMNIA_BIN" ]]; then
+    lists_why="the app binary that reads them, $INSOMNIA_BIN, is missing or not executable"
+    return 0
+  fi
+  if [[ -z "$lists_gate" ]]; then
+    if [[ -f "$INSOMNIA_INFO" ]]; then
+      copy_private "$INSOMNIA_INFO" Info.plist || info_rc=$?
+      if (( info_rc == 0 )); then
+        read_at "$copy_path" InsomniaAccessListsVersion raw || info_rc=$?
+        if (( info_rc == 0 )); then declared="$read_value"; elif (( info_rc == 2 )); then lists_gate="$INSOMNIA_INFO could not be read ($read_why)"; fi
+      else
+        lists_gate="$INSOMNIA_INFO could not be read ($copy_why)"
+      fi
+    fi
+    if [[ -z "$lists_gate" && "$declared" == "$ACCESS_LISTS_VERSION" ]]; then
+      lists_gate=ok
+    elif [[ -z "$lists_gate" ]]; then
+      lists_gate="$INSOMNIA_INFO does not declare InsomniaAccessListsVersion $ACCESS_LISTS_VERSION ('$declared': an older or newer build), so the app binary was not run"
+    fi
+  fi
+  if [[ "$lists_gate" != ok ]]; then
+    lists_why="$lists_gate"
+    return 0
+  fi
+  "$RM" -rf "$APP_SUPPORT"/.backstop-lists.* 2>/dev/null || true
+  if ! app_answer_dir="$("$MKTEMP" -d "$APP_SUPPORT/.backstop-lists.XXXXXX" 2>/dev/null)"; then
+    app_answer_dir=""
+    lists_why="a private directory for the app binary's answer could not be made in $APP_SUPPORT"
+    return 0
+  fi
+  if ! printf '' 2>/dev/null > "$app_answer_dir/in"; then
+    lists_why="the app binary's empty input could not be written in $app_answer_dir"
+  else
+    run_app_bounded "$INSOMNIA_BIN" --access-lists "$((COMMAND_TIMEOUT_SECONDS + KILL_GRACE_SECONDS))" "$@" || rc=$?
+    size="$("$STAT" -f %z "$app_answer_dir/out" 2>/dev/null)" || size=""
+    if (( rc == 124 )); then
+      lists_why="the app binary did not answer within ${COMMAND_TIMEOUT_SECONDS}s"
+    elif ! [[ "$size" =~ ^[0-9]+$ ]]; then
+      lists_why="the app binary's answer could not be read whole"
+    elif (( 10#$size > $# * 24 )); then
+      # Longer than a valid answer can be ("unreadable <errno>" is under 24
+      # bytes), so it is not read into memory.
+      lists_why="the app binary's answer is not one word for each of the $# paths (exit $rc, $size bytes)"
+    else
+      { opened=1; IFS= read -r -d '' answer || read_rc=$?; } 2>/dev/null < "$app_answer_dir/out" || true
+      if (( ! opened || read_rc != 1 )) || ! byte_count_is "$answer" "$size"; then
+        lists_why="the app binary's answer could not be read whole"
+      fi
+    fi
+  fi
+  "$RM" -rf "$app_answer_dir" 2>/dev/null || true
+  app_answer_dir=""
+  [[ -n "$lists_why" ]] || lists_from_answer "$answer" "$#" "$rc"
+}
+# True when $1 is $2 bytes long.
+byte_count_is() { local LC_ALL=C; (( ${#1} == $2 )); }
+
+# Opens the receipt read-only on fd 7 and locks it as the root command does
+# (SleepOffReceipts.lock). Before the lock only what the open needs: the
+# path, by lstat, names a regular file. Then the open, fd 7's identity
+# against that lstat's, and `lockf <fd>`, whose lock lasts until fd 7
+# closes. Every other check of the receipt and the folders above it
+# (receipt_unsafe) runs only once fd 7 is locked, so nothing those checks
+# find passes over a command that holds the lock; then the path must still
+# name the locked file. Sets receipt_locked to that file's device:inode;
+# otherwise receipt_lock_why, and receipt_lock_busy=1 when lockf found it
+# locked for the whole RECEIPT_LOCK_TIMEOUT_SECONDS or failed, which
+# decides nothing whenever it happens. A regular file that cannot be opened
+# sets receipt_unopened to its device:inode: when that is the file the
+# start journaled, its lock cannot be seen, and attempt_verdict decides
+# nothing either. Unlike the app, the shell opens with neither O_NOFOLLOW
+# nor O_NONBLOCK: a link put in the receipt's place after the lstat fails
+# the identity check, but a FIFO put there stalls the open until something
+# writes to it. Only someone who can write the receipt's folder can put
+# either there, and the checks under the lock refuse such a folder. fd 7
+# stays open only while locked; unlock_receipt closes it.
+receipt_locked=""
+lock_receipt() {
+  local f="$RECEIPTS/$UID" why rc=0 found opened
+  receipt_locked=""; receipt_lock_why=""; receipt_lock_busy=0; receipt_read=0; receipt_unopened=""
+  found="$("$STAT" -f '%HT %d:%i' "$f" 2>/dev/null)" || found=""
+  if [[ "$found" != "Regular File "?* ]]; then
+    receipt_lock_why="$f is missing, is not the 82-byte file install.sh made, mode 600, or someone other than root can change it or a folder above it"
+    return 0
+  fi
+  found="${found##* }"
+  if ! { exec 7<"$f"; } 2>/dev/null; then
+    receipt_unopened="$found"
+    receipt_lock_why="$f could not be opened to be locked"
+    return 0
+  fi
+  opened="$("$STAT" -f '%d:%i' <&7 2>/dev/null)" || opened=""
+  if [[ -z "$opened" || "$opened" != "$found" ]]; then
+    exec 7<&-
+    receipt_lock_why="$f changed while it was opened"
+    return 0
+  fi
+  "$LOCKF" -s -t "$RECEIPT_LOCK_TIMEOUT_SECONDS" 7 2>/dev/null || rc=$?
+  if (( rc != 0 )); then
+    exec 7<&-
+    receipt_lock_busy=1
+    if (( rc == 75 )); then
+      receipt_lock_why="$f stayed locked for ${RECEIPT_LOCK_TIMEOUT_SECONDS} s: the command behind a password dialog may be running, or another Insomnia folder of this user, or something else running as this user, is holding it"
+    else
+      receipt_lock_why="$f could not be locked (lockf exit $rc)"
+    fi
+    return 0
+  fi
+  if [[ "$opened" == "$("$STAT" -f '%d:%i' "$f" 2>/dev/null)" ]]; then
+    receipt_unsafe "$f" "$UID"
+    why="$unsafe_why"
+    if [[ -n "$why" ]]; then
+      exec 7<&-
+      receipt_lock_why="$why"
+      return 0
+    fi
+  fi
+  if [[ "$opened" != "$("$STAT" -f '%d:%i' "$f" 2>/dev/null)" ]]; then
+    exec 7<&-
+    receipt_lock_why="$f was replaced while it was locked"
+    return 0
+  fi
+  receipt_locked="$opened"
+}
+unlock_receipt() {
+  if [[ -n "$receipt_locked" ]]; then exec 7<&-; fi
+  receipt_locked=""
+}
+
+# The receipt's line, read through the locked fd 7
+# (SleepOffReceipts.record): sets receipt_nonce, receipt_pred and
+# receipt_word, or receipt_read_why. The read moves fd 7's offset, so it is
+# read once per lock (receipt_read) and kept here.
+read_receipt() {
+  local size content line
+  receipt_nonce=""; receipt_pred=""; receipt_word=""; receipt_read_why=""; receipt_read=1
+  size="$("$STAT" -f '%l %z' <&7 2>/dev/null)" || size=""
+  if [[ "$size" != "1 82" ]]; then
+    receipt_read_why="$RECEIPTS/$UID is not the 82-byte file install.sh made"
+    return 0
+  fi
+  content="$("$HEAD" -c 83 <&7 2>/dev/null; echo ".$?")"
+  if [[ "${content##*.}" != 0 ]]; then
+    receipt_read_why="$RECEIPTS/$UID could not be read (head exit ${content##*.})"
+    return 0
+  fi
+  content="${content%.*}"
+  line="${content%$'\n'}"
+  if (( ${#content} != 82 )) || [[ "$line" == "$content" ]] \
+     || ! [[ "$line" =~ ^([0-9A-F-]{36})\ ([0-9A-F-]{36})\ (writing|refused)$ ]]; then
+    receipt_read_why="$RECEIPTS/$UID does not hold two nonces and writing or refused"
+    return 0
+  fi
+  receipt_nonce="${BASH_REMATCH[1]}"
+  receipt_pred="${BASH_REMATCH[2]}"
+  receipt_word="${BASH_REMATCH[3]}"
+}
+
+# The release file's line (SleepOffReceipts.readRelease): sets
+# release_nonce and release_word, or release_why. It is the user's own
+# file, so it never shows that a start did not turn sleep off: it only
+# keeps a start from another Insomnia folder from replacing the receipt's
+# line while a start is not settled.
+read_release() {
+  local rf="$RECEIPTS/$UID.released" content line
+  release_nonce=""; release_word=""; release_why=""
+  if [[ -L "$rf" || ! -f "$rf" || "$("$STAT" -f %z "$rf" 2>/dev/null)" != 42 ]]; then
+    release_why="$rf is not the 42-byte file install.sh made. Run install.sh again"
+    return 0
+  fi
+  content="$("$HEAD" -c 43 "$rf" 2>/dev/null; echo ".$?")"
+  if [[ "${content##*.}" != 0 ]]; then
+    release_why="$rf could not be read (head exit ${content##*.})"
+    return 0
+  fi
+  content="${content%.*}"
+  line="${content%$'\n'}"
+  if (( ${#content} != 42 )) || [[ "$line" == "$content" ]] \
+     || ! [[ "$line" =~ ^([0-9A-F-]{36})\ (free|held)$ ]]; then
+    release_why="$rf does not hold a nonce and free or held. Run install.sh again"
+    return 0
+  fi
+  release_nonce="${BASH_REMATCH[1]}"
+  release_word="${BASH_REMATCH[2]}"
+}
+
+# Writes "$1 $2" over the release file in place, then reads it back
+# (SleepOffReceipts.writeRelease). Only a regular 42-byte file is opened;
+# only root can create a file in RECEIPTS, so the open never creates one.
+# Unlike the app, the shell has no fsync(2): a crash right after can lose
+# the write (see the costs in SECURITY.md).
+write_release() { # nonce free|held
+  local rf="$RECEIPTS/$UID.released"
+  [[ ! -L "$rf" && -f "$rf" && "$("$STAT" -f %z "$rf" 2>/dev/null)" == 42 ]] || return 1
+  { printf '%s %s\n' "$1" "$2" 1<>"$rf"; } 2>/dev/null || return 1
+  read_release
+  [[ -z "$release_why" && "$release_nonce" == "$1" && "$release_word" == "$2" ]]
+}
+
+# Under the receipt's lock, gives back the claim of the start with nonce $1
+# (SleepOffReceipts.release): when the release file shows "$1 held", writes
+# the receipt's nonce there, free. Sets gave_back=1 when it wrote. Returns
+# non-zero, with claim_why, when the release file or the receipt's line
+# cannot be read, or the write fails.
+give_back_claim() { # nonce
+  gave_back=0; claim_why=""
+  read_release
+  if [[ -n "$release_why" ]]; then claim_why="$release_why"; return 1; fi
+  [[ "$release_word" == held && "$release_nonce" == "$1" ]] || return 0
+  (( receipt_read )) || read_receipt
+  if [[ -z "$receipt_nonce" ]]; then claim_why="$receipt_read_why"; return 1; fi
+  if ! write_release "$receipt_nonce" free; then claim_why="$RECEIPTS/$UID.released could not be written"; return 1; fi
+  gave_back=1
+}
+
+# What the receipt shows about the journaled start (SleepOffReceipts
+# verdict, with no dialog known to be over): sets verdict to never, may or
+# undecided and verdict_why, from lock_receipt's outcome and the clock.
+attempt_verdict() { # nonce predecessor identity expires now has-marker
+  local f="$RECEIPTS/$UID" over=0 until
+  verdict=may; verdict_why=""
+  if [[ "$6" != 1 ]]; then verdict=never; return 0; fi
+  (( $5 >= $4 )) && over=1
+  until="until $("$DATE" -u -r "$4" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "$4")"
+  if (( receipt_lock_busy )); then
+    verdict=undecided; verdict_why="$receipt_lock_why"
+    return 0
+  fi
+  if [[ -n "$receipt_unopened" && "$receipt_unopened" == "$3" ]]; then
+    verdict=undecided; verdict_why="$receipt_lock_why; a command for that start may hold its lock"
+    return 0
+  fi
+  if [[ -z "$receipt_locked" ]]; then
+    verdict_why="$receipt_lock_why"
+  elif [[ "$receipt_locked" != "$3" ]]; then
+    verdict_why="$f is not the file it was when the start began"
+  else
+    read_receipt
+    if [[ -n "$receipt_read_why" ]]; then
+      verdict_why="$receipt_read_why"
+    elif [[ "$receipt_nonce" == "$1" ]]; then
+      if [[ "$receipt_word" == refused ]]; then verdict=never; else verdict_why="$f holds that start's writing line: its command was about to turn sleep off and may have"; fi
+      return 0
+    elif [[ "$receipt_nonce" == "$2" ]]; then
+      if (( over )); then verdict=never; else verdict=undecided; verdict_why="the password dialog of that start can still be answered $until"; fi
+      return 0
+    elif [[ "$receipt_pred" == "$2" ]]; then
+      verdict=never
+      return 0
+    else
+      verdict_why="$f holds a later start's line, which no longer shows what the command for this start did"
+      return 0
+    fi
+  fi
+  if (( ! over )); then
+    verdict=undecided; verdict_why="$verdict_why; a command for that start could still write $until"
+  fi
+}
+
+# Keeps the start journaled and unsettled, with the reason, as the app's
+# keepAttempt does: attempt_hold says why no pmset may run for the sleep
+# entry, or is empty. Undecided always holds it: a pmset its command
+# already started may still turn sleep off after the undo, and expires only
+# stops commands that have not begun. "never" holds it unless an earlier
+# restore is owed. The session is ended rather than resumed.
+attempt_kept=0
+attempt_hold=""
+keep_attempt() { # verdict owedBefore why
+  attempt_kept=1
+  settle_failed="$3"
+  case "$1" in
+    never) [[ "$2" == true ]] || attempt_hold="the receipt shows that the command behind that start's dialog never turned sleep off and no earlier restore is owed, but $3" ;;
+    undecided) attempt_hold="$3" ;;
+  esac
+  force=1
+}
+
+# Renames the edited copy $1 over state.json, once plutil reads it whole as
+# a JSON object and state.json is still the file this run copied, then
+# copies the new journal again for the reads that follow. Returns 0; 1 with
+# nothing published and the edited copy removed, publish_why saying why; 2
+# when it was published but could not be copied again, read_why saying
+# why. state_copy is then empty, so no later edit starts from an old copy.
+publish_state() { # edited-copy
+  publish_why=""
+  if ! json_object "$1"; then
+    publish_why="the edited copy is not a JSON object"
+  elif ! state_unchanged; then
+    publish_why="$STATE changed since this run read it"
+  elif ! "$MV" -f "$1" "$STATE"; then
+    publish_why="the edited copy could not be renamed over it"
+  else
+    copy_state && return 0
+    state_copy_rc=2
+    read_why="$STATE was published, but could not be read again ($copy_why)"
+    return 2
+  fi
+  "$RM" -f "$1"
+  return 1
+}
+
+# Publishes $STATE with the edits given (remove:KEYPATH or
+# true:KEYPATH / false:KEYPATH), as one copy, edit, verify and rename
+# (publish_state, whose status it returns). Returns 1, with nothing
+# published and no copy left, when any step fails.
+# Every publish copies the live journal with cp, as main does, so its
+# extended attributes go with it (cp(1) copies an access control list only
+# with -p, which main does not pass either), and then requires the copy to
+# hold the bytes this run read (same_as_read): a journal that changed
+# since, or a cp that copied something else, is not published. A 0200
+# journal its owner reads only through an allow entry keeps that entry: cp
+# cannot read its extended attributes, so its publish fails, as on main.
+edit_state() { # edit...
+  local tmp="$APP_SUPPORT/.state.json.settle.$$" e ok=1
+  [[ -n "$state_copy" ]] && "$CP" "$STATE" "$tmp" && same_as_read "$tmp" "$state_copy" || ok=0
+  for e in "$@"; do
+    (( ok == 1 )) || break
+    case "$e" in
+      remove:*) "$PLUTIL" -remove "${e#remove:}" "$tmp" >/dev/null 2>&1 || ok=0 ;;
+      true:*|false:*) "$PLUTIL" -replace "${e#*:}" -bool "${e%%:*}" "$tmp" >/dev/null 2>&1 || ok=0 ;;
+      *) ok=0 ;;
+    esac
+  done
+  if (( ok == 0 )); then
+    "$RM" -f "$tmp"
+    return 1
+  fi
+  publish_state "$tmp"
+}
+
+# Finishes a settlement whose decision is in the journal
+# (sleepOffAttempt.settled), under the receipt's lock, which the caller
+# holds and this lets go: gives the start's claim back and publishes the
+# journal without sleepOffAttempt. A failure leaves the settled record,
+# which holds nothing back, and the run exits 1 so the next one finishes
+# it.
+finish_settlement() { # nonce what-was-removed
+  if ! give_back_claim "$1"; then
+    unlock_receipt
+    settle_failed="an unfinished start is settled, but its claim on the receipt could not be given back ($claim_why)$2"
+    log error "$settle_failed"
+    return 0
+  fi
+  local rc=0
+  edit_state remove:sleepOffAttempt || rc=$?
+  if (( rc == 1 )); then
+    unlock_receipt
+    settle_failed="an unfinished start is settled, but its settled record could not be removed from $STATE$2"
+    log error "$settle_failed"
+    return 0
+  fi
+  unlock_receipt
+  log info "the settlement is finished: $( (( gave_back )) && echo "the start's claim on the receipt was given back" || echo "the start held no claim on the receipt") and its record removed"
+}
+
+# A marker this run deleted that no journaled start accounts for was left
+# by a build from before sleepOffAttempt, or by a start that finished or
+# rolled back but could not delete it. Whether a command behind its dialog
+# turned sleep off is unknown, so session.json beside it is never resumed:
+# it goes, and a sleep entry still journaled is undone below like any other.
+# A session that had started and lost its marker only to a failed delete
+# ends early, which is the safe side. If session.json cannot be removed,
+# this run undoes the journal as --force would and exits 1.
+drop_unrecorded_session() {
+  [[ -n "$removed_marker" && -f "$SESSION" ]] || return 0
+  if "$RM" -f "$SESSION"; then
+    log info "removed $SESSION: it was beside a pending-start marker that no journaled start accounts for, so it is never resumed"
+  else
+    settle_failed="$SESSION, beside a pending-start marker that no journaled start accounts for, could not be removed"
+    log error "could not remove $SESSION beside a pending-start marker that no journaled start accounts for; undoing the journal as --force would"
+    force=1
+  fi
+}
+
+# The journal is copied here once (copy_state, whose status is kept in
+# state_copy_rc) and read from that copy from then on; only a publish of
+# this run copies it again. A journal that cannot be copied is not settled
+# here: the journal read below reports it, and the run ends there.
+state_copy_rc=""
+settle_attempt() {
+  local nonce owed receipt pred deadline expires now has_marker=0 owes removed="" rc=0 matched=0 session_why=""
+  if [[ ! -f "$STATE" ]]; then
+    drop_unrecorded_session
+    return 0
+  fi
+  copy_state || true
+  if (( state_copy_rc != 0 )) || ! plutil_on -convert json -o /dev/null "$state_copy" >/dev/null 2>&1; then
+    drop_unrecorded_session
+    return 0
+  fi
+  type_at "$state_copy" sleepOffAttempt || rc=$?
+  if (( rc == 2 )); then
+    drop_unrecorded_session
+    log error "$STATE: $read_why, so whether it journals an unfinished start is unknown; nothing undone, evidence kept"
+    leave 1
+  fi
+  if [[ "$t" != dictionary ]]; then
+    drop_unrecorded_session
+    return 0
+  fi
+  # A journal that could not be read whole is handled as below: nothing
+  # undone and exit 1, here before the start's record is read.
+  rc=0; shape_of journal "$state_copy" || rc=$?
+  if (( rc != 0 )); then
+    log error "$STATE could not be read whole (its JSON, or its text for the kept display records), so the unfinished start it journals was not settled; nothing undone, evidence kept: $read_why. Check that it is a regular file this user can read"
+    leave 1
+  fi
+  [[ -z "$shape_lines" ]] || return 0
+  state_read sleepOffAttempt.nonce raw; nonce="$read_value"
+  state_read sleepOffAttempt.settled raw
+  if [[ "$read_value" == true ]]; then
+    # An earlier settlement published its decision but did not finish.
+    # Only the decision counts: the receipt is not read against it again.
+    lock_receipt
+    if [[ -z "$receipt_locked" ]]; then
+      settle_failed="an unfinished start is settled, but the receipt could not be locked to give its claim back ($receipt_lock_why)"
+      log error "$settle_failed"
+      return 0
+    fi
+    log info "finishing the settlement of an earlier start, which the journal records as settled"
+    finish_settlement "$nonce" ""
+    return 0
+  fi
+  state_read sleepOffAttempt.owedBefore raw; owed="$read_value"
+  state_read sleepOffAttempt.receipt raw; receipt="$read_value"
+  state_read sleepOffAttempt.predecessor raw; pred="$read_value"
+  state_read sleepOffAttempt.deadline raw; deadline="$read_value"
+  state_read sleepOffAttempt.expires raw; expires="$read_value"
+  rc=0; type_at "$state_copy" sleepOffAttempt.marker || rc=$?
+  if (( rc == 2 )); then
+    log error "$STATE: $read_why; nothing undone, evidence kept, and the next run tries again"
+    leave 1
+  fi
+  [[ "$t" == string ]] && has_marker=1
+  lock_receipt
+  # A clock that cannot be read leaves the start unexpired: undecided
+  # unless the receipt shows something else.
+  now="$("$DATE" -u +%s 2>/dev/null)" || now=0
+  [[ "$now" =~ ^[0-9]+$ ]] || now=0
+  attempt_verdict "$nonce" "$pred" "$receipt" "$expires" "$now" "$has_marker"
+  if [[ "$verdict" == undecided ]]; then
+    unlock_receipt
+    keep_attempt "$verdict" "$owed" "an unfinished start is not settled yet: $verdict_why"
+    log info "$settle_failed; it stays journaled, the session is ended rather than resumed, and sleep is left as it is"
+    return 0
+  fi
+  if [[ -z "$receipt_locked" ]]; then
+    keep_attempt "$verdict" "$owed" "an unfinished start could not be settled: the receipt could not be locked to give its claim back ($receipt_lock_why). Nothing was removed"
+    log error "$settle_failed"
+    return 0
+  fi
+  if [[ "$verdict" == never ]]; then
+    owes="$owed"
+    log info "settling an unfinished start: its receipt shows the command behind its dialog never turned sleep off; sleepDisabledByUs goes back to $owed"
+  else
+    owes=true
+    log info "settling an unfinished start as one that may have turned sleep off ($verdict_why); sleepDisabledByUs stays set"
+  fi
+  # Only a session.json this run can read as a session is matched; one it
+  # cannot open, or that is not a regular file, is treated as expired below,
+  # and the app never resumes it. One whose read fails some other way is
+  # unknown: nothing is removed, and the run ends here.
+  if [[ -f "$SESSION" ]]; then
+    rc=0; copy_private "$SESSION" session.json || rc=$?
+    if (( rc == 2 )); then
+      session_why="$copy_why"
+    elif (( rc == 0 )); then
+      rc=0; shape_of session "$copy_path" || rc=$?
+      if (( rc == 0 )) && [[ -z "$shape_lines" ]]; then
+        epoch_at "$copy_path" endsAt || rc=$?
+        if (( rc == 0 )) && [[ -n "$epoch" && "$epoch" == "$deadline" ]]; then matched=1; fi
+        if (( rc == 0 && matched )); then
+          session_id_differs "$copy_path" "$state_copy" || rc=$?
+          if (( id_differs )); then log info "kept $SESSION: its end is the start's deadline, but its id is not the session the start journaled"; fi
+          (( ! id_differs )) || matched=0
+        fi
+      fi
+      if (( rc != 0 )); then session_why="$read_why"; fi
+    fi
+  fi
+  if [[ -n "$session_why" ]]; then
+    unlock_receipt
+    log error "$SESSION could not be read ($session_why), so the unfinished start was not settled; nothing undone, evidence kept"
+    leave 1
+  fi
+  if (( matched )); then
+    if ! "$RM" -f "$SESSION"; then
+      unlock_receipt
+      keep_attempt "$verdict" "$owed" "an unfinished start could not be settled: $SESSION could not be removed. Nothing was removed"
+      log error "$settle_failed"
+      return 0
+    fi
+    removed="; $SESSION of that start was removed"
+    log info "removed $SESSION: its start never finished, so it is never resumed"
+  fi
+  # The decision, published while the claim is still held. Published but
+  # not read again (2) counts as published: the record that holds it back
+  # is gone from the journal only once finish_settlement removes it.
+  rc=0; edit_state true:sleepOffAttempt.settled "$owes:sleepDisabledByUs" || rc=$?
+  if (( rc == 1 )); then
+    unlock_receipt
+    keep_attempt "$verdict" "$owed" "an unfinished start could not be settled: the settled journal could not be published to $STATE$removed"
+    log error "$settle_failed"
+    return 0
+  fi
+  finish_settlement "$nonce" "$removed"
+}
+# This run's private folder for its copies (see copy_private). A folder
+# left by an earlier run that ended without leave is removed first, unless
+# this run shares its caller's lock. Without one (a full disk), the copies
+# are kept in memory and read with the same checks.
+if (( ! lock_shared )); then "$RM" -rf "$APP_SUPPORT"/.backstop-read.* "$APP_SUPPORT"/.backstop-defaults.* 2>/dev/null || true; fi
+if ! READS="$("$MKTEMP" -d "$APP_SUPPORT/.backstop-read.XXXXXX" 2>/dev/null)"; then
+  READS=""
+  log warn "could not create a private folder in $APP_SUPPORT for this run's copies of session.json and state.json; this run keeps its copies in memory" || true
+fi
+settle_failed=""
+settle_attempt
 
 # --- Read the session --------------------------------------------------------
 # session_state: none | valid | expired | malformed | unreadable
@@ -847,19 +2140,43 @@ session_problems=""
 if [[ -e "$SESSION" ]]; then
   # Only a regular file is opened: open(2) on a FIFO with no writer, or on
   # some devices, blocks, and this run holds the recovery lock.
-  if [[ ! -f "$SESSION" ]]; then
+  # It is read from a private copy (copy_private). A read that fails other
+  # than for permissions or I/O, or a date that cannot be worked out, ends
+  # the run: whether the session is still on is unknown.
+  session_rc=4
+  if [[ -f "$SESSION" ]]; then session_rc=0; copy_private "$SESSION" session.json || session_rc=$?; fi
+  if (( session_rc == 4 )); then
     session_state=unreadable
     unreadable_why="it is not a regular file, so it is not opened"
-  elif ! cat "$SESSION" >/dev/null 2>&1; then
+  elif (( session_rc == 3 )); then
     session_state=unreadable
     unreadable_why="permissions or I/O"
+  elif (( session_rc != 0 )); then
+    log error "$SESSION could not be read ($copy_why); nothing undone, evidence kept, will retry"
+    leave 1
   else
-    session_problems="$(session_shape_problems "$SESSION")"
+    session_copy="$copy_path"
+    session_rc=0; shape_of session "$session_copy" || session_rc=$?
+    if (( session_rc != 0 )); then
+      log error "$SESSION could not be read ($read_why); nothing undone, evidence kept, will retry"
+      leave 1
+    fi
+    session_problems="$shape_lines"
     if [[ -n "$session_problems" ]]; then
       session_state=malformed
     else
-      ends_at="$(extract "$SESSION" endsAt || true)"
-      if (( $(epoch_at "$SESSION" endsAt) > $("$DATE" -u +%s) )); then
+      epoch_at "$session_copy" endsAt || session_rc=$?
+      ends_at="$read_value"
+      if (( session_rc != 0 )) || [[ -z "$epoch" ]]; then
+        log error "$SESSION: its endsAt could not be read again (${read_why:-no date}); nothing undone, evidence kept, will retry"
+        leave 1
+      fi
+      now="$("$DATE" -u +%s 2>/dev/null)" || now=""
+      if ! [[ "$now" =~ ^[0-9]+$ ]]; then
+        log error "the clock could not be read (date -u +%s printed '$now'), so whether $SESSION has ended is unknown; nothing undone, evidence kept, will retry"
+        leave 1
+      fi
+      if (( epoch > now )); then
         session_state=valid
       else
         session_state=expired
@@ -869,61 +2186,80 @@ if [[ -e "$SESSION" ]]; then
 fi
 
 if [[ "$session_state" == valid ]] && (( force == 0 )); then
-  exit 0
+  exit_unless_marker_stuck "session.json is valid until $ends_at"
 fi
 
 # --- Read the journal --------------------------------------------------------
-# journal_state: missing | malformed | clean | dirty
-if [[ ! -e "$STATE" ]]; then
+# journal_state: missing | malformed | unreadable | clean | dirty
+# The copy settle_attempt made is read, or the one its publish made. A
+# state.json that settle_attempt did not copy, because it was not a regular
+# file then, is copied now only if it still is not one.
+journal_why=""
+if [[ -z "$state_copy_rc" && -f "$STATE" ]]; then
+  journal_state=unreadable
+  journal_why="it became a regular file while this run read it"
+elif [[ -z "$state_copy_rc" ]] && [[ ! -e "$STATE" ]]; then
   journal_state=missing
-elif [[ ! -f "$STATE" ]]; then
+elif [[ -z "$state_copy_rc" ]] || (( state_copy_rc == 4 )); then
   # Never opened, for the same reason as session.json above.
   journal_state=malformed
   shape_problems="not a regular file"
-elif ! "$PLUTIL" -convert json -o /dev/null "$STATE" >/dev/null 2>&1; then
+elif (( state_copy_rc == 3 )); then
+  journal_state=malformed
+  shape_problems="not valid JSON (it could not be read: $state_copy_why)"
+elif (( state_copy_rc != 0 )); then
+  journal_state=unreadable
+  journal_why="$state_copy_why"
+elif ! plutil_on -convert json -o /dev/null "$state_copy" >/dev/null 2>&1; then
   journal_state=malformed
   shape_problems="not valid JSON"
+elif ! shape_of journal "$state_copy"; then
+  journal_state=unreadable
+  journal_why="$read_why"
+elif [[ -n "$shape_lines" ]]; then
+  journal_state=malformed
+  shape_problems="$shape_lines"
 else
-  shape_problems="$(journal_shape_problems "$STATE")"
-  if [[ -n "$shape_problems" ]]; then journal_state=malformed; else journal_state=clean; fi
+  journal_state=clean
+fi
+
+if [[ "$journal_state" == unreadable ]]; then
+  log error "$STATE could not be read whole (its JSON, or its text for the kept display records); nothing undone, evidence kept: $journal_why. Check that it is a regular file this user can read, then rerun"
+  leave 1
 fi
 
 if [[ "$journal_state" == malformed ]]; then
-  while IFS= read -r line; do
-    [[ -n "$line" ]] && log error "$STATE: $line"
-  done <<< "$shape_problems"
+  log_lines error "$shape_problems" "$STATE: "
   log error "$STATE is unreadable or malformed; nothing undone, evidence kept. Open Insomnia or repair the file, then rerun"
-  exit 1
+  leave 1
 fi
 
 sleep_held=false; low_power=false; docker_frozen=false; has_audio=0
 has_display=0; has_keyboard=0; refused_display=0; refused_keyboard=0
 frozen_count=0; legacy_count=0; app_nap_count=0; output_count=0
 if [[ "$journal_state" == clean ]]; then
-  is_true "$STATE" sleepDisabledByUs && sleep_held=true
-  is_true "$STATE" lowPowerSetByUs && low_power=true
-  is_true "$STATE" dockerFrozen && docker_frozen=true
-  extract "$STATE" savedOutputVolume >/dev/null && has_audio=1
-  extract "$STATE" savedMuted >/dev/null && has_audio=1
-  if extract "$STATE" savedDisplayBrightness >/dev/null; then
-    if is_true "$STATE" displayRestoreRefused; then refused_display=1; else has_display=1; fi
+  # Every read below is of the copy; one that fails ends the run
+  # (state_read), so a key is only ever taken as absent when plutil says so.
+  state_read sleepDisabledByUs raw; [[ "$read_value" == true ]] && sleep_held=true
+  state_read lowPowerSetByUs raw; [[ "$read_value" == true ]] && low_power=true
+  state_read dockerFrozen raw; [[ "$read_value" == true ]] && docker_frozen=true
+  state_read savedOutputVolume raw; (( found )) && has_audio=1
+  state_read savedMuted raw; (( found )) && has_audio=1
+  state_read savedDisplayBrightness raw
+  if (( found )); then
+    state_read displayRestoreRefused raw
+    if [[ "$read_value" == true ]]; then refused_display=1; else has_display=1; fi
   fi
-  if extract "$STATE" savedKeyboardBrightness >/dev/null; then
-    if is_true "$STATE" keyboardRestoreRefused; then refused_keyboard=1; else has_keyboard=1; fi
+  state_read savedKeyboardBrightness raw
+  if (( found )); then
+    state_read keyboardRestoreRefused raw
+    if [[ "$read_value" == true ]]; then refused_keyboard=1; else has_keyboard=1; fi
   fi
-  while extract_json "$STATE" "frozenProcesses.$frozen_count" >/dev/null; do
-    frozen_count=$((frozen_count + 1))
-  done
-  while extract "$STATE" "frozenPids.$legacy_count" >/dev/null; do
-    legacy_count=$((legacy_count + 1))
-  done
-  while extract_json "$STATE" "appNapOverrides.$app_nap_count" >/dev/null; do
-    app_nap_count=$((app_nap_count + 1))
-  done
+  state_count frozenProcesses; frozen_count="$count"
+  state_count frozenPids; legacy_count="$count"
+  state_count appNapOverrides; app_nap_count="$count"
   # Kept for the app and not counted as dirty; see the header.
-  while extract_json "$STATE" "savedAudioOutputs.$output_count" >/dev/null; do
-    output_count=$((output_count + 1))
-  done
+  state_count savedAudioOutputs; output_count="$count"
   if [[ "$sleep_held" == true || "$low_power" == true || "$docker_frozen" == true ]] \
      || (( has_audio == 1 || has_display == 1 || has_keyboard == 1 || frozen_count > 0 || legacy_count > 0 || app_nap_count > 0 )); then
     journal_state=dirty
@@ -950,10 +2286,8 @@ fi
 # rather than replace a file that appeared meanwhile (it exits 0 then,
 # hence the check of both paths afterwards).
 quarantine_session() {
-  local base dest n line what
-  while IFS= read -r line; do
-    [[ -n "$line" ]] && log warn "$SESSION: $line"
-  done <<< "$session_problems"
+  local base dest n what
+  log_lines warn "$session_problems" "$SESSION: "
   what="session.json unreadable"
   [[ "$session_state" == unreadable ]] && what="session.json cannot be read ($unreadable_why)"
   base="$SESSION.unreadable-$("$DATE" -u +%Y%m%dT%H%M%SZ)"
@@ -991,10 +2325,8 @@ if [[ "$journal_state" != dirty ]]; then
   fi
   if [[ "$session_state" == malformed || "$session_state" == unreadable ]]; then
     [[ -n "$refused_note" ]] && log info "$refused_note"
-    quarantine_session || exit 1
-    exit 0
-  fi
-  if [[ "$session_state" != none ]]; then
+    quarantine_session || leave 1
+  elif [[ "$session_state" != none ]]; then
     if [[ "$journal_state" == missing ]]; then
       log warn "$session_note; no journal on disk, nothing recorded to undo"
     else
@@ -1003,7 +2335,7 @@ if [[ "$journal_state" != dirty ]]; then
     [[ -n "$refused_note" ]] && log info "$refused_note"
     "$RM" -f "$SESSION"
   fi
-  exit 0
+  exit_unless_marker_stuck "journal is clean"
 fi
 
 # --- Undo --------------------------------------------------------------------
@@ -1013,10 +2345,20 @@ failures=()   # what is still journaled after this run
 changed=0     # whether the journal needs republishing
 
 new_sleep="$sleep_held"
-if [[ "$sleep_held" == true ]]; then
+if [[ "$sleep_held" == true && -n "$attempt_hold" ]]; then
+  # The start the journal still records: no pmset may run for it yet (see
+  # settle_attempt). Its failure is reported below.
+  log info "sleepDisabledByUs stays journaled, and sleep is left as it is: $attempt_hold"
+elif [[ "$sleep_held" == true ]]; then
   if run_bounded "$SUDO" -n "$PMSET" -a disablesleep 0; then
     log info "pmset -a disablesleep 0 ok"
-    new_sleep=false; changed=1
+    if (( marker_stuck )); then
+      log error "sleep restored, but sleepDisabledByUs stays journaled while $PENDING is present"
+    elif (( attempt_kept )); then
+      log error "sleep restored, but sleepDisabledByUs stays journaled with the start the journal still records"
+    else
+      new_sleep=false; changed=1
+    fi
   else
     if (( command_alive )); then stop_transaction "pmset -a disablesleep 0"; fi
     log error "pmset -a disablesleep 0 failed (sudoers rule missing? run install.sh); keeping journal entry for retry"
@@ -1038,36 +2380,41 @@ fi
 # the record could not be published; the caller then leaves the mode on,
 # since switched off with the old boot on disk, the app could take the panel
 # on its way back for the level the user set. A journal with no record, or a
-# null one, gets none.
+# null one, gets none. Returns 2, with read_why, when a read of the record
+# failed or the published journal could not be read again: the caller then
+# leaves the mode on and ends the run.
 prepare_low_power_off() {
-  local t boot recorded tmp ok=1
-  t="$(type_of "$STATE" keptDisplayUnderLowPower)"
+  local boot tmp ok=1 rc=0
+  type_at "$state_copy" keptDisplayUnderLowPower || rc=$?
+  (( rc != 2 )) || return 2
   [[ "$t" == float || "$t" == integer ]] || return 0
-  boot="$("$SYSCTL" -n kern.bootsessionuuid 2>/dev/null || true)"
-  recorded="$(extract "$STATE" keptDisplayUnderLowPowerBoot || true)"
-  [[ "$recorded" == "$boot" ]] && return 0
+  boot="$("$SYSCTL" -n kern.bootsessionuuid 2>/dev/null)" || boot=""
+  rc=0; read_at "$state_copy" keptDisplayUnderLowPowerBoot raw || rc=$?
+  (( rc != 2 )) || return 2
+  [[ "$read_value" == "$boot" ]] && return 0
   tmp="$APP_SUPPORT/.state.json.backstop-boot.$$"
-  "$CP" "$STATE" "$tmp" || ok=0
+  "$CP" "$STATE" "$tmp" && same_as_read "$tmp" "$state_copy" || ok=0
   if (( ok == 1 )); then
     "$PLUTIL" -replace keptDisplayUnderLowPowerBoot -string "$boot" "$tmp" >/dev/null 2>&1 || ok=0
-  fi
-  if (( ok == 1 )); then
-    [[ "$("$PLUTIL" -convert json -o - "$tmp" 2>/dev/null | head -c 1)" == "{" ]] || ok=0
-    [[ "$(head -c 1 "$tmp")" == "{" ]] || ok=0
-  fi
-  if (( ok == 1 )); then
-    "$MV" -f "$tmp" "$STATE" || ok=0
   fi
   if (( ok == 0 )); then
     "$RM" -f "$tmp"
     return 1
   fi
+  rc=0; publish_state "$tmp" || rc=$?
+  (( rc != 1 )) || return 1
   log info "kept display entry's record given this boot (${boot:-unreadable, written empty}) before Low Power Mode is switched off"
+  return "$rc"
 }
 
 new_low="$low_power"
 if [[ "$low_power" == true ]]; then
-  if ! prepare_low_power_off; then
+  low_rc=0; prepare_low_power_off || low_rc=$?
+  if (( low_rc == 2 )); then
+    log error "$STATE: $read_why; Low Power Mode left on and nothing more undone this run, the journal is kept, and the next run tries again"
+    leave 1
+  fi
+  if (( low_rc == 1 )); then
     log error "could not publish this boot for the kept display entry's record to $STATE; Low Power Mode left on, keeping journal entry for retry"
     failures+=("Low Power Mode is still set: state.json could not take this boot for the kept display entry's record, so the mode was not switched off")
   elif run_bounded "$SUDO" -n "$PMSET" -b lowpowermode 0; then
@@ -1101,8 +2448,15 @@ observe() { # pid
     return 0
   fi
   (( rc == 0 )) || return 0
-  local w mon day time year stat uid rest
-  read -r w mon day time year stat uid rest <<< "$out"
+  local w mon day time year stat uid
+  # The words of the first line, as read would split them. Not a
+  # here-string: see log_lines.
+  out="${out%%$'\n'*}"
+  set -f
+  # shellcheck disable=SC2086  # split into words on purpose
+  set -- $out
+  set +f
+  w="${1:-}"; mon="${2:-}"; day="${3:-}"; time="${4:-}"; year="${5:-}"; stat="${6:-}"; uid="${7:-}"
   [[ -n "$w" && -n "$mon" && -n "$day" && -n "$time" && -n "$year" && -n "$stat" && -n "$uid" ]] || return 0
   p_epoch="$("$DATE" -j -u -f '%a %b %d %H:%M:%S %Y' "$w $mon $day $time $year" +%s 2>/dev/null || true)"
   [[ -n "$p_epoch" ]] && [[ "$uid" =~ ^[0-9]+$ ]] || return 0
@@ -1125,7 +2479,7 @@ app_args=()
 # binary may have resumed some of them before it went wrong; the next run
 # finds those running and clears them.
 resume_via_app() {
-  local n=${#app_pid[@]} k rc=0 valid=1 settled=1 expected=0 size line word excerpt="" p answer declared
+  local n=${#app_pid[@]} k rc=0 valid=1 settled=1 expected=0 size line word excerpt="" p answer declared info_rc=0 info_why=""
   local -a words
   words=()
   if [[ ! -x "$INSOMNIA_BIN" ]]; then
@@ -1136,15 +2490,31 @@ resume_via_app() {
     done
     return 0
   fi
-  # A regular file only: a FIFO there could block this run under the lock.
+  # A regular file only, read from a private copy (copy_private): a FIFO
+  # there could block this run under the lock. A read that fails keeps
+  # every entry, as an interface the bundle does not declare does.
   declared=""
   if [[ -f "$INSOMNIA_INFO" ]]; then
-    declared="$(extract "$INSOMNIA_INFO" InsomniaResumeFrozenVersion || true)"
+    copy_private "$INSOMNIA_INFO" Info.plist || info_rc=$?
+    if (( info_rc == 0 )); then
+      read_at "$copy_path" InsomniaResumeFrozenVersion raw || info_rc=$?
+      if (( info_rc == 0 )); then declared="$read_value"; elif (( info_rc == 2 )); then info_why="$read_why"; fi
+    else
+      info_why="$copy_why"
+    fi
+  fi
+  if [[ -n "$info_why" ]]; then
+    for (( k = 0; k < n; k++ )); do
+      log error "pid ${app_pid[k]} needs the app binary for its microsecond identity check, but $INSOMNIA_INFO could not be read ($info_why); the binary was not run; kept, not signaled"
+      failures+=("pid ${app_pid[k]} was not resumed: $INSOMNIA_INFO could not be read")
+      keep_entry "${app_index[k]}"
+    done
+    return 0
   fi
   if [[ "$declared" != "$RESUME_FROZEN_VERSION" ]]; then
     for (( k = 0; k < n; k++ )); do
       log error "pid ${app_pid[k]} needs the app binary for its microsecond identity check, but $INSOMNIA_INFO declares InsomniaResumeFrozenVersion '${declared}', not $RESUME_FROZEN_VERSION (an older or newer build); the binary was not run; kept, not signaled"
-      failures+=("pid ${app_pid[k]} was not resumed: the installed app does not declare --resume-frozen version $RESUME_FROZEN_VERSION")
+      failures+=("pid ${app_pid[k]} was not resumed: $INSOMNIA_INFO does not declare --resume-frozen version $RESUME_FROZEN_VERSION")
       keep_entry "${app_index[k]}"
     done
     return 0
@@ -1168,10 +2538,10 @@ resume_via_app() {
     valid=0
   else
     answer="$app_answer_dir/out"
-    size="$(stat -f %z "$answer" 2>/dev/null || echo 0)"
-    excerpt="$(head -c 200 "$answer" | tr -c '[:print:]' ' ')"
+    size="$("$STAT" -f %z "$answer" 2>/dev/null)" || size=""
+    excerpt="$("$HEAD" -c 200 "$answer" | "$TR" -c '[:print:]' ' ')" || excerpt="(could not be read)"
     # A valid line is at most 24 bytes ("<10-digit pid> unverifiable\n").
-    if (( size > n * 32 )); then
+    if ! [[ "$size" =~ ^[0-9]+$ ]] || (( size > n * 32 )); then
       valid=0
     else
       k=0
@@ -1221,14 +2591,14 @@ resume_via_app() {
   done
 }
 if (( frozen_count > 0 )); then
-  boot_now="$("$SYSCTL" -n kern.bootsessionuuid 2>/dev/null || true)"
-  uid_now="$(id -u)"
+  boot_now="$("$SYSCTL" -n kern.bootsessionuuid 2>/dev/null)" || boot_now=""
+  uid_now="$UID"
   i=0
   while (( i < frozen_count )); do
-    pid="$(extract "$STATE" "frozenProcesses.$i.pid" || true)"
-    started="$(extract "$STATE" "frozenProcesses.$i.startedAt" || true)"
-    micros="$(extract "$STATE" "frozenProcesses.$i.startedAtMicros" || true)"
-    boot="$(extract "$STATE" "frozenProcesses.$i.bootSession" || true)"
+    state_read "frozenProcesses.$i.pid" raw; pid="$read_value"
+    state_read "frozenProcesses.$i.startedAt" raw; started="$read_value"
+    state_read "frozenProcesses.$i.startedAtMicros" raw; micros="$read_value"
+    state_read "frozenProcesses.$i.bootSession" raw; boot="$read_value"
     if ! is_positive_int "$pid"; then
       log error "frozen entry $i has no valid pid (${pid:-?}); kept, not signaled"
       failures+=("frozen entry $i has an invalid pid")
@@ -1295,16 +2665,19 @@ kept_frozen=""
 kept_frozen_count=0
 for (( i = 0; i < frozen_count; i++ )); do
   [[ -n "${kept[i]:-}" ]] || continue
-  if ! entry="$(extract_json "$STATE" "frozenProcesses.$i")" || [[ -z "$entry" ]]; then
+  state_read "frozenProcesses.$i" json; entry="$read_value"
+  if [[ -z "$entry" ]]; then
     log error "could not read frozen entry $i back from $STATE; previous journal kept, will retry"
-    exit 1
+    leave 1
   fi
   if [[ -n "$kept_frozen" ]]; then kept_frozen="$kept_frozen,$entry"; else kept_frozen="$entry"; fi
   kept_frozen_count=$((kept_frozen_count + 1))
 done
 
 if (( legacy_count > 0 )); then
-  legacy_json="$(extract_json "$STATE" frozenPids || true)"
+  # Only for the messages: a read that fails names the count instead.
+  legacy_json="($legacy_count entries)"
+  if read_at "$state_copy" frozenPids json; then legacy_json="$read_value"; fi
   log error "legacy frozenPids $legacy_json have no identity; not signaled and not cleared here, the app must resolve them"
   failures+=("legacy frozenPids $legacy_json were not resumed (identity unknown; only the app resolves these)")
 fi
@@ -1322,15 +2695,19 @@ kept_app_nap=""
 kept_app_nap_count=0
 keep_app_nap_entry() { # index
   local entry
-  entry="$(extract_json "$STATE" "appNapOverrides.$1")"
+  state_read "appNapOverrides.$1" json; entry="$read_value"
+  if [[ -z "$entry" ]]; then
+    log error "could not read App Nap entry $1 back from $STATE; previous journal kept, will retry"
+    leave 1
+  fi
   if [[ -n "$kept_app_nap" ]]; then kept_app_nap="$kept_app_nap,$entry"; else kept_app_nap="$entry"; fi
   kept_app_nap_count=$((kept_app_nap_count + 1))
 }
 if (( app_nap_count > 0 )); then
   i=0
   while (( i < app_nap_count )); do
-    bundle="$(extract "$STATE" "appNapOverrides.$i.bundleId" || true)"
-    previous="$(extract "$STATE" "appNapOverrides.$i.previous" || true)"
+    state_read "appNapOverrides.$i.bundleId" raw; bundle="$read_value"
+    state_read "appNapOverrides.$i.previous" raw; previous="$read_value"
     if [[ -z "$bundle" || "$bundle" == -* ]]; then
       log error "App Nap entry $i has no usable bundle id (${bundle:-?}); kept, nothing written"
       failures+=("App Nap entry $i has no usable bundle id")
@@ -1358,17 +2735,26 @@ if (( app_nap_count > 0 )); then
         changed=1
       else
         if (( command_alive )); then stop_transaction "defaults delete $bundle NSAppSleepDisabled"; fi
-        probe="$APP_SUPPORT/.backstop.$$.read"
-        bounded_output="$probe"
+        # The read's output goes to a new file of this run's own (mktemp),
+        # so nothing an earlier run left under a name can answer for it.
+        # Without one, whether the key is still set is unknown.
         read_rc=0
-        run_bounded "$DEFAULTS" read "$bundle" NSAppSleepDisabled || read_rc=$?
-        bounded_output=""
-        if (( command_alive )); then "$RM" -f "$probe"; stop_transaction "defaults read $bundle NSAppSleepDisabled"; fi
-        if (( read_rc == 0 )); then
+        probe="$("$MKTEMP" "${READS:-$APP_SUPPORT}/.backstop-defaults.XXXXXX" 2>/dev/null)" || probe=""
+        if [[ -n "$probe" ]]; then
+          bounded_output="$probe"
+          run_bounded "$DEFAULTS" read "$bundle" NSAppSleepDisabled || read_rc=$?
+          bounded_output=""
+          if (( command_alive )); then "$RM" -f "$probe"; stop_transaction "defaults read $bundle NSAppSleepDisabled"; fi
+        fi
+        if [[ -z "$probe" ]]; then
+          log error "defaults delete $bundle NSAppSleepDisabled failed, and no file could be made for the output of defaults read; keeping journal entry for retry"
+          failures+=("App Nap may still be off for $bundle: defaults delete failed and the key could not be read")
+          keep_app_nap_entry "$i"
+        elif (( read_rc == 0 )); then
           log error "defaults delete $bundle NSAppSleepDisabled failed and the key is still set; keeping journal entry for retry"
           failures+=("App Nap is still off for $bundle: defaults delete failed")
           keep_app_nap_entry "$i"
-        elif grep -q "does not exist" "$probe" 2>/dev/null; then
+        elif "$GREP" -q "does not exist" "$probe" 2>/dev/null; then
           log info "defaults delete $bundle NSAppSleepDisabled: the key is already absent"
           changed=1
         else
@@ -1376,7 +2762,7 @@ if (( app_nap_count > 0 )); then
           failures+=("App Nap may still be off for $bundle: defaults delete failed and the key could not be read")
           keep_app_nap_entry "$i"
         fi
-        "$RM" -f "$probe"
+        [[ -z "$probe" ]] || "$RM" -f "$probe"
       fi
     fi
     i=$((i + 1))
@@ -1396,12 +2782,20 @@ fi
 [[ -n "$refused_note" ]] && log info "$refused_note"
 
 # --- Publish -----------------------------------------------------------------
-# Edit a private copy, verify it, then rename it over state.json so readers
-# only ever see a complete journal. Keys we do not own survive untouched.
+# Edit a copy of the live journal that holds the bytes this run read (see
+# edit_state), verify it, then rename it over state.json (publish_state) so
+# readers only ever see a complete journal. Keys we do not own survive
+# untouched. A publish that fails (a full disk among other causes) keeps
+# the journal as it was, so the next run undoes what it records again.
 if (( changed == 1 )); then
   tmp="$APP_SUPPORT/.state.json.backstop.$$"
   publish_ok=1
-  "$CP" "$STATE" "$tmp" || publish_ok=0
+  publish_why=""
+  if ! "$CP" "$STATE" "$tmp"; then
+    publish_ok=0; publish_why="it could not be copied"
+  elif ! same_as_read "$tmp" "$state_copy"; then
+    publish_ok=0; publish_why="its copy does not hold the bytes this run read: it changed since, or cp copied something else"
+  fi
   if (( publish_ok == 1 )) && [[ "$new_sleep" != "$sleep_held" ]]; then
     "$PLUTIL" -replace sleepDisabledByUs -bool "$new_sleep" "$tmp" >/dev/null 2>&1 || publish_ok=0
   fi
@@ -1417,26 +2811,32 @@ if (( changed == 1 )); then
   if (( publish_ok == 1 && app_nap_count > 0 )); then
     "$PLUTIL" -replace appNapOverrides -json "[$kept_app_nap]" "$tmp" >/dev/null 2>&1 || publish_ok=0
   fi
+  # plutil keeps JSON files as JSON; publish_state makes sure the result is
+  # still one. Published but not read again (2) is published: nothing reads
+  # the journal after this.
   if (( publish_ok == 1 )); then
-    # plutil keeps JSON files as JSON; make sure the result is still one.
-    [[ "$("$PLUTIL" -convert json -o - "$tmp" 2>/dev/null | head -c 1)" == "{" ]] || publish_ok=0
-    [[ "$(head -c 1 "$tmp")" == "{" ]] || publish_ok=0
-  fi
-  if (( publish_ok == 1 )); then
-    "$MV" -f "$tmp" "$STATE" || publish_ok=0
+    publish_rc=0; publish_state "$tmp" || publish_rc=$?
+    if (( publish_rc == 1 )); then publish_ok=0; fi
+  else
+    "$RM" -f "$tmp"
   fi
   if (( publish_ok == 0 )); then
-    "$RM" -f "$tmp"
-    log error "could not publish the updated journal to $STATE; previous journal kept, will retry"
-    exit 1
+    log error "could not publish the updated journal to $STATE${publish_why:+ ($publish_why)}; previous journal kept, will retry"
+    leave 1
   fi
 fi
 
 # --- Report ------------------------------------------------------------------
+if (( marker_stuck )); then
+  failures+=("$PENDING is still present, so a password dialog left from an abandoned start could still turn sleep off")
+fi
+if [[ -n "$settle_failed" ]]; then
+  failures+=("$settle_failed")
+fi
 if (( ${#failures[@]} > 0 )); then
   for f in "${failures[@]}"; do log error "still journaled: $f"; done
   log error "journal kept dirty (${#failures[@]} item(s)); will retry on the next run"
-  exit 1
+  leave 1
 fi
 
 if (( output_count > 0 )); then
@@ -1445,7 +2845,7 @@ else
   log info "journal cleared"
 fi
 case "$session_state" in
-  malformed|unreadable) quarantine_session || exit 1 ;;
+  malformed|unreadable) quarantine_session || leave 1 ;;
   *)                    "$RM" -f "$SESSION" ;;
 esac
-exit 0
+leave 0

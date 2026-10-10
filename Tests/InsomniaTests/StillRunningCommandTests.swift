@@ -313,7 +313,7 @@ final class StillRunningCommandTests: XCTestCase {
 
         XCTAssertEqual(m.session, session)
         XCTAssertNil(h.store.loadUnfinishedCommand())
-        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1", "pmset -g custom", "lowpowermode 0"])
+        XCTAssertEqual(h.guardFake.calls, ["pmset -g", "pmset -g custom", "lowpowermode 0"])
         XCTAssertEqual(try h.store.loadState()?.lowPowerSetByUs, false, "ownership of a mode that is off was kept")
 
         await floors.run(battery: .percent(30), isCharging: false, thermal: .nominal, lidClosed: false)
@@ -386,7 +386,7 @@ final class StillRunningCommandTests: XCTestCase {
         await waitUntil("the resumed session was never checked against the mode") { resyncs.value == [false] }
 
         XCTAssertEqual(m.session, session)
-        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1", "pmset -g custom", "lowpowermode 0"])
+        XCTAssertEqual(h.guardFake.calls, ["pmset -g", "pmset -g custom", "lowpowermode 0"])
         XCTAssertEqual(try h.store.loadState()?.lowPowerSetByUs, false, "ownership of a mode that is off was kept")
         await floors.run(battery: .percent(30), isCharging: false, thermal: .nominal, lidClosed: false)
         XCTAssertTrue(h.guardFake.lowPowerOn, "the Low Power Mode floor did not act on the resumed session")
@@ -422,41 +422,6 @@ final class StillRunningCommandTests: XCTestCase {
         XCTAssertEqual(try h.store.loadState()?.lowPowerSetByUs, false, "ownership of a mode that is off was kept")
         await floors.run(battery: .percent(30), isCharging: false, thermal: .nominal, lidClosed: false)
         XCTAssertTrue(h.guardFake.lowPowerOn, "the Low Power Mode floor did not act on the started session")
-    }
-
-    /// A start whose `disablesleep 1` is left running is not surfaced, and
-    /// nothing is rolled back: session.json and the journal entry stay so
-    /// the backstop can honour the deadline if Insomnia dies first. The undo
-    /// runs once the command has exited.
-    func testStartStopsAtTheLiveCommandAndUndoesItselfWhenItExits() async throws {
-        h.guardFake.stillRunning = ["disablesleep 1"]
-        let m = h.makeManager()
-
-        await m.start(duration: 3600)
-
-        XCTAssertNil(m.session, "a session was surfaced over a pmset of unknown effect")
-        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1"])
-        XCTAssertEqual(m.pendingEnd, .startFailed)
-        XCTAssertNotNil(try h.store.loadSession(), "session.json rolled back beside the live pmset")
-        XCTAssertEqual(try h.store.loadState()?.sleepDisabledByUs, true, "journal entry dropped beside the live pmset")
-        XCTAssertEqual(h.backstop.arms, 1)
-        XCTAssertTrue(try lockIsHeld())
-        XCTAssertEqual(h.notifier.posts.last?.title, SessionManager.commandRunningTitle)
-        let quit = await m.end(reason: .quit)
-        XCTAssertEqual(quit, .privilegedCommandRunning(pid: 4242))
-        XCTAssertFalse(m.quitRequested)
-        await m.start(duration: 60)
-        XCTAssertNil(m.session)
-        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1"])
-
-        h.guardFake.stillRunning = []
-        h.guardFake.exitStuckCommands(status: 1)
-        await waitUntil("pending end never retried") { m.pendingEnd == nil }
-        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1", "disablesleep 0"])
-        XCTAssertNil(try h.store.loadSession())
-        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
-        XCTAssertFalse(try lockIsHeld())
-        XCTAssertNil(m.session)
     }
 
     /// A live `lowpowermode 1` is not rolled back with a `lowpowermode 0`
@@ -648,33 +613,6 @@ final class StillRunningCommandTests: XCTestCase {
         XCTAssertEqual(h.notifier.posts.filter { $0.title == SessionManager.commandRunningTitle }.count, 1, "\(h.notifier.posts)")
         XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
         XCTAssertNil(m.unfinishedCommand)
-        XCTAssertFalse(try lockIsHeld())
-    }
-
-    /// Reconcile re-applying sleep for a session found on disk, with that
-    /// pmset left running: the session is not surfaced, the files stay, and
-    /// the end that undoes it runs once the command has exited.
-    func testReconcileStopsAtTheLiveReapplyAndEndsWhenItExits() async throws {
-        let first = h.makeManager()
-        await first.start(duration: 3600)
-        h.guardFake.stillRunning = ["disablesleep 1"]
-        let m = h.makeManager()
-
-        await m.reconcile()
-
-        XCTAssertNil(m.session)
-        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1", "disablesleep 1"])
-        XCTAssertEqual(m.pendingEnd, .recoveryUnavailable)
-        XCTAssertNotNil(try h.store.loadSession())
-        XCTAssertEqual(try h.store.loadState()?.sleepDisabledByUs, true)
-        XCTAssertTrue(try lockIsHeld())
-
-        h.guardFake.stillRunning = []
-        h.guardFake.exitStuckCommands()
-        await waitUntil("pending end never retried") { m.pendingEnd == nil }
-        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1", "disablesleep 1", "disablesleep 0"])
-        XCTAssertNil(try h.store.loadSession())
-        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
         XCTAssertFalse(try lockIsHeld())
     }
 

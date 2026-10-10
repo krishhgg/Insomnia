@@ -44,8 +44,10 @@ final class ReconcileTests: XCTestCase {
         XCTAssertFalse(h.guardFake.sleepDisabled)
     }
 
-    // (b) valid session -> agent confirmed, disablesleep re-applied idempotently, timer rescheduled
-    func testValidSessionIsReappliedAndRearmed() async throws {
+    // (b) valid session, sleep still off -> agent confirmed, sleep read but
+    // never re-applied (that would need the administrator password), timer
+    // rescheduled
+    func testValidSessionWithSleepStillOffIsRearmedWithoutPrompt() async throws {
         let now = h.clock.now
         let s = Session(startedAt: now.addingTimeInterval(-600), endsAt: now.addingTimeInterval(2 * 3600 + 14 * 60 + 30))
         try h.store.saveSession(s)
@@ -59,7 +61,8 @@ final class ReconcileTests: XCTestCase {
 
         XCTAssertEqual(m.session, s)
         XCTAssertTrue(m.isActive)
-        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1"])
+        XCTAssertEqual(h.guardFake.calls, ["pmset -g"])
+        XCTAssertEqual(h.prompt.shown, 0, "a relaunch must never ask for the password")
         XCTAssertEqual(m.scheduledDeadline, s.endsAt)
         XCTAssertEqual(h.backstop.arms, 1)
         XCTAssertEqual(m.remainingText, "2h 14m")
@@ -67,19 +70,20 @@ final class ReconcileTests: XCTestCase {
         XCTAssertEqual(try h.store.loadState()?.sleepDisabledByUs, true)
     }
 
-    // (b') valid session whose state.json was lost -> state rewritten before pmset
+    // (b') valid session whose state.json was lost, sleep still off -> ownership journaled again
     func testValidSessionWithMissingStateMarksSleepDisabledByUs() async throws {
         let now = h.clock.now
         try h.store.saveSession(Session(startedAt: now, endsAt: now.addingTimeInterval(3600)))
+        h.guardFake.sleepDisabled = true
         let m = h.makeManager()
         await m.reconcile()
         XCTAssertEqual(try h.store.loadState()?.sleepDisabledByUs, true)
-        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1"])
+        XCTAssertEqual(h.guardFake.calls, ["pmset -g"])
     }
 
     // (c) no session, no journal entry, but pmset reports SleepDisabled:
     // something else set it. Left alone, reported once with the command to
-    // undo it; an Insomnia session's end still sets it to 0 as always.
+    // undo it, and Start is refused while it stays.
     func testNoSessionButSleepDisabledIsLeftAloneAndReported() async throws {
         h.guardFake.sleepDisabled = true
         let m = h.makeManager()
@@ -98,8 +102,19 @@ final class ReconcileTests: XCTestCase {
         XCTAssertEqual(h.notifier.posts.count, 1)
         XCTAssertEqual(m.foreignSleepWarning, SessionManager.foreignSleepLine)
 
-        // Insomnia's own session clears the line, and its end sets the bit to 0.
+        // Start leaves the bit alone too: it is refused with nothing run.
         await m.start(duration: 3600)
+        XCTAssertNil(m.session)
+        XCTAssertEqual(h.guardFake.calls.filter { $0.hasPrefix("disablesleep") }, [])
+        XCTAssertTrue(h.guardFake.sleepDisabled)
+        XCTAssertEqual(m.foreignSleepWarning, SessionManager.foreignSleepLine)
+        XCTAssertTrue(try XCTUnwrap(m.lastError).contains("sleep is already off"), m.lastError ?? "")
+
+        // Once its owner turns sleep back on, a session starts and clears
+        // the line, and its end sets the bit to 0.
+        h.guardFake.sleepDisabled = false
+        await m.start(duration: 3600)
+        XCTAssertTrue(m.isActive)
         XCTAssertNil(m.foreignSleepWarning)
         XCTAssertNil(m.lastError)
         _ = await m.end(reason: .user)
@@ -175,6 +190,7 @@ final class ReconcileTests: XCTestCase {
     // read it. Tightening leaves the entry, so recovery still reads the
     // journal and turns sleep back on.
     func testJournalReadableOnlyThroughAnOwnerACLIsStillRestored() async throws {
+        try SystemIntegration.require("a real access control list changed")
         var st = RuntimeState()
         st.sleepDisabledByUs = true
         try h.store.saveState(st)
@@ -260,8 +276,9 @@ final class ReconcileTests: XCTestCase {
     }
 
     // Start ordering: journal first, then pmset. A pmset failure is
-    // ambiguous (the setting may have been applied), so the start is undone
-    // from the journal; once the undo is confirmed nothing remains.
+    // ambiguous (the setting may have been applied), and the root command
+    // wrote its record before it ran pmset, so the start is undone from
+    // the journal; once the undo is confirmed nothing remains.
     func testStartUndoesFromJournalWhenPmsetFails() async throws {
         h.guardFake.throwOn = ["disablesleep 1"]
         let m = h.makeManager()
@@ -368,6 +385,30 @@ final class ReconcileTests: XCTestCase {
         XCTAssertEqual(h.backstop.arms, 2)
     }
 
+    /// Round 36 (independent35 R35-2): Start, Extend, a failed End and the
+    /// relaunch's reconcile each arm the agent inside their transaction,
+    /// holding this folder's recovery lock, so the agent lock arm() takes
+    /// for a reload always comes after it (the lock order in
+    /// BackstopScheduling), and in the standard folder is the same lock.
+    func testEveryArmRunsHoldingTheFoldersRecoveryLock() async throws {
+        let m = h.makeManager()
+        await m.start(duration: 3600)
+        h.clock.advance(600)
+        await m.extend(by: 3600)
+        h.guardFake.throwOn = ["disablesleep 0"]
+        let outcome = await m.end(reason: .quit)
+        XCTAssertEqual(outcome, .incomplete(agentArmed: true))
+        h.guardFake.throwOn = []
+        try h.store.saveSession(Session(startedAt: h.clock.now, endsAt: h.clock.now.addingTimeInterval(3600)))
+        h.guardFake.sleepDisabled = true
+        let relaunched = h.makeManager()
+        await relaunched.reconcile()
+
+        XCTAssertEqual(h.backstop.arms, 4, "start, extend, the failed end and the relaunch")
+        let own = try XCTUnwrap(FileIdentity(atPath: h.home.paths.recoveryLock.path))
+        XCTAssertEqual(h.backstop.armLocks, Array(repeating: own, count: 4))
+    }
+
     func testCountdownPauseResume() async throws {
         let m = h.makeManager()
         await m.start(duration: 3600)
@@ -388,6 +429,7 @@ final class ReconcileTests: XCTestCase {
             sleepGuard: real.guardFake,
             processControl: real.procs,
             backstop: real.backstop,
+            receipts: real.receipts,
             notifier: real.notifier,
             clamshell: { false },
             clock: { Date() }
@@ -397,6 +439,7 @@ final class ReconcileTests: XCTestCase {
         // come back up to a second earlier than written.
         let endsAt = Date(timeIntervalSince1970: (Date().timeIntervalSince1970 + 2).rounded(.up))
         try real.store.saveSession(Session(startedAt: Date(), endsAt: endsAt))
+        real.guardFake.sleepDisabled = true
         await m.reconcile()
         XCTAssertTrue(m.isActive)
         XCTAssertEqual(m.scheduledDeadline, endsAt)
@@ -415,7 +458,7 @@ final class ReconcileTests: XCTestCase {
         XCTAssertFalse(m.isActive)
         XCTAssertNil(try real.store.loadSession())
         XCTAssertEqual(try real.store.loadState(), RuntimeState.clean)
-        XCTAssertEqual(real.guardFake.calls, ["disablesleep 1", "disablesleep 0"])
+        XCTAssertEqual(real.guardFake.calls, ["pmset -g", "disablesleep 0"])
         XCTAssertFalse(real.guardFake.sleepDisabled)
     }
 
@@ -447,14 +490,18 @@ final class ReconcileTests: XCTestCase {
         // h.clock.now is 2027-01-15T08:00:00Z; the end is an hour later.
         let json = #"{"startedAt":"2027-01-15T09:50:00+02:00","endsAt":"2027-01-15T11:00:00+02:00","extensions":[]}"#
         try Data(json.utf8).write(to: h.home.paths.sessionFile)
-        try h.store.saveState(RuntimeState())
+        var st = RuntimeState()
+        st.sleepDisabledByUs = true
+        try h.store.saveState(st)
+        h.guardFake.sleepDisabled = true
 
         let m = h.makeManager()
         await m.reconcile()
 
         XCTAssertEqual(m.session?.endsAt, h.clock.now.addingTimeInterval(3600))
         XCTAssertEqual(m.scheduledDeadline, h.clock.now.addingTimeInterval(3600))
-        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1"])
+        XCTAssertEqual(h.guardFake.calls, ["pmset -g"])
+        XCTAssertEqual(h.prompt.shown, 0)
         XCTAssertEqual(try movedAsideSessions, [])
     }
 

@@ -62,6 +62,7 @@ Session {
   startedAt:   Date
   endsAt:      Date          // the only thing that keeps sleep disabled
   extendedBy:  [TimeInterval]
+  id:          String?       // a UUID drawn at Start and kept through every extension; nil in an older build's session; see section 8
 }
 
 RuntimeState {                // everything Insomnia changed and must undo
@@ -99,10 +100,301 @@ recovery; newly written journals use `frozenProcesses`.
   timer runs at 1 Hz and stops while the lid is closed.
 - Click the cup/countdown to enter an extension; hold the end control to end.
   Right-click opens the status, browser actions, Settings, and Quit menu.
-- Session start: write session + state to disk, arm the launchd backstop, and
-  only then run `sudo pmset -a disablesleep 1`. A session never starts unless
-  the backstop is armed. If pmset fails, delete the session file and surface
-  the error. The journal and backstop always exist before sleep is disabled.
+- Session start: check that the `backstop.sh` sealed in the bundle the
+  agent runs declares `# insomnia-backstop-version: 5` or later
+  (`BackstopVersion.swift`; 2 is the first that deletes `pending-start`, 3
+  the first that settles a journaled `sleepOffAttempt` from its receipt, 4
+  the first that reads the receipt under its lock as the 82-byte line with
+  the predecessor and the start's `expires`, and gives the start's claim
+  back, 5 the first that journals a settlement's decision
+  (`sleepOffAttempt.settled`) before it gives the claim back, and finishes
+  a settled record it finds)
+  and refuse with nothing written, asking for `scripts/install.sh` again,
+  if not. Then read `pmset -g`
+  (`SleepGuarding.checkSleepSettingForStart`, which runs nothing through
+  sudo). A `SleepDisabled 1` the journal does not claim is left alone, as
+  after a cancelled dialog: run nothing and refuse, giving
+  `sudo pmset -a disablesleep 0`, since the session's end would turn it
+  back on. An unreadable `pmset -g` refuses too. When the journal already
+  has `sleepDisabledByUs` (a failed restore is owed anyway) there is
+  nothing to read. Then take the receipt's lock
+  (`SleepOffReceipts.lock`; one that stays busy for 10 s refuses with
+  nothing written) and claim the receipt (`claimable`: the release file
+  must show the receipt's current nonce `free`, which becomes the start's
+  predecessor; another folder's claim, a missing or unsafe receipt and an
+  unreadable release file refuse with nothing written). Journal
+  `sleepDisabledByUs` with `sleepOffAttempt`, write the claim (`<nonce>
+  held`) and let the receipt's lock go. Then write session.json, arm the
+  launchd backstop, write a fresh random nonce to `pending-start`, journal
+  the marker's identity and `expires`, and only then run `pmset -a
+  disablesleep 1` through the macOS administrator password dialog
+  (`osascript` running a fixed `do shell script ... with administrator
+  privileges` literal; 120 s limit, SIGTERM only at the deadline).
+  `expires` is the session's `endsAt`, or 130 s after the marker is
+  written if that is sooner (`AdministratorPrompt.answerWindow`: the
+  dialog's 120 s, the 3 s grace after SIGTERM and 7 s for osascript to
+  start), in whole seconds since 1970, rounded down. The marker path, the
+  nonce, `expires`, the user's uid, whether the journal already claimed a
+  `SleepDisabled 1` before this start (`1` or `0`), the predecessor and
+  the receipt's `device:inode` are the script's only inputs, passed as
+  positional parameters. The root command runs under `lockf` on the
+  marker and keeps that lock from the nonce check until pmset exits
+  (section 8). A uid that is not a positive number exits 5 before
+  anything runs. Then comes the receipt (`SleepOffReceipts`, section 8).
+  The uid must be plain digits. The command opens
+  `/private/var/db/com.kgarg.insomnia/<uid>` read-only on descriptor 8
+  and takes an exclusive flock(2) on it with `/usr/bin/lockf -s -t 10 8`
+  (exit 75 after 10 s). Its shell and every tool it starts, pmset
+  included, inherit the descriptor, so the lock lasts until all of them
+  have exited. `stat -f '%u %Lp %l %z %HT'` plus `ls -lde` of the receipt
+  and of every folder above it up to / must show a regular file with one
+  link and 82 bytes under folders, each owned by root, with no group or
+  other write bit and no ACL entry that allows anything, and descriptor 8
+  and the path must both be the journaled `device:inode`. Anything else,
+  an open that fails included, exits 7 with nothing written. Then the
+  marker must still hold the nonce (exit 3) and `/bin/date +%s` must be
+  below `expires` (exit 4). Before it writes anything, the command checks
+  whether the end can turn sleep back on with no password. As root it first exits 5 when
+  `/private/etc/sudo.conf` exists in any form: Apple's sudo loads plugins
+  only from that compiled-in path, and an approval plugin there can print
+  nothing in `sudo -V` and refuse only a command that runs. It also exits
+  5 when `/private/etc/pam.d/sudo` cannot be read or has any uncommented
+  session line but macOS's single `session required pam_permit.so`,
+  since sudo opens a PAM session only to run a command. Root then runs
+  `/usr/bin/sudo -n -u "#<uid>" /usr/bin/env -i LC_ALL=C /usr/bin/sudo
+  ...` three times, with stdin from /dev/null; sudo never asks root for a
+  password, and macOS's default `root ALL = (ALL) ALL` lets root run it
+  as the user. The answers are read as sudo 1.9.17p2 prints them, the
+  sudo in macOS 26.2 (Apple's sudo-114.100.11), the only source read for
+  what a listing shares with running a command. `sudo -V` must show
+  exactly `Sudo version 1.9.17p2`, the sudoers policy plugin 1.9.17p2,
+  grammar version 50, and after them nothing but the sudoers I/O and
+  audit plugins' own lines. `sudo -k -n -l` must list without a
+  password, show no Runas or command-specific Defaults (they apply when
+  the restore runs but not to a listing), and show only Defaults entries
+  from a list of settings that cannot stop a NOPASSWD rule from running:
+  env_reset, env_keep, env_check, env_delete, log_allowed, log_denied,
+  and settings sudo reads only when it asks for a password (lecture,
+  lecture_file, passprompt, badpass_message, passwd_timeout,
+  passwd_tries, timestamp_timeout, timestamp_type, tty_tickets,
+  pwfeedback, insults). Any other entry, such as `log_output`, exits 5
+  and the message names it; so does a Defaults line with a backslash or
+  a tab. `sudo -k -n -ll
+  /usr/bin/pmset -a disablesleep 0` must print exactly six lines: the
+  entry from /etc/sudoers.d/insomnia (`/private/etc/...` or `/etc/...`),
+  `RunAsUsers: root`, `Options: !authenticate`, `Commands:`, the restore
+  after a tab, and `Matched:` the restore. For a command, sudo prints the
+  rule that decides it, the last match, so a later rule that asks for a
+  password, denies, or runs as another user shows there instead and
+  refuses. `-k` ignores a cached credential and `-n` fails instead of
+  prompting. None of the three runs a command; a generic `sudo -l`,
+  `sudo -v`, a listing's exit status alone, or a search for NOPASSWD is
+  never taken as proof. Any failed file check or query, any other
+  version, plugin, Defaults entry or output, output cut short, and a
+  `listpw` that wants a password exit 5 with nothing changed
+  (`AdministratorPromptError.restoreNeedsPassword`, whose message names
+  the check and says `scripts/install.sh` fixes only a missing rule).
+  Then `/bin/date +%s` is compared with `expires` again (exit 4). Both
+  nonces must be different uppercase UUIDs and the nonce not the all-zero
+  one (exit 7), and the receipt must still begin with the predecessor
+  (`head -c 36` on descriptor 8; exit 8: another start or a recovery came
+  first). The command then reads `pmset -g` itself, as root and under
+  both locks, because another tool may have turned sleep off while the
+  password was typed: a `SleepDisabled 1` (read the way
+  `PmsetSleepGuard.parseSleepDisabled` reads it) or a read that fails
+  exits 6 with nothing changed. Only when the journal claimed the 1
+  before this start is nothing read, as at Start. Then it writes `<nonce>
+  <predecessor> writing` into the receipt in place: `/usr/bin/perl`, run
+  under `env -i`, opens the path with `O_WRONLY|O_NOFOLLOW` (no create, no
+  truncate), checks by fstat that the descriptor is the locked file,
+  writes the 82 bytes with one write(2) that must write them all, calls
+  `fcntl(F_FULLFSYNC)`, closes the file, opens it again read-only with
+  `O_NOFOLLOW` and reads the line back. Any failure, a missing perl
+  included, writes `<nonce> <predecessor> refused` the same way and exits
+  7. Then the command reads `pmset -g` again, under the same rule and only
+  when it read it before: a `SleepDisabled 1` set while the line was
+  written, or a read that fails, writes `refused` the same way and exits
+  6, and that 1 stays. This second read narrows the time in which another
+  tool's 1 can be taken for Insomnia's; it is not an owner token. The
+  clock is compared once more: at or after `expires` the command
+  writes `refused` and exits 4. Only then does root run `/usr/bin/pmset
+  -a disablesleep 1` (the change the start journaled before the dialog),
+  the command's only power write; if it fails, the command exits 1. Root
+  reads the marker and never writes it, and writes nothing in the user's
+  folders. The command ignores SIGPIPE, so a refusal keeps its status
+  when the dialog's output is gone. No query or read has a timer of its
+  own: the dialog's 120 s is how long the app waits before SIGTERM to
+  osascript, which does not stop the root command, and a query that never
+  returns keeps the marker's and the receipt's locks, so the start keeps
+  the recovery lock and waits for it with no limit (below). The clock
+  checks stop the write when it returns at or after `expires`. The user
+  has typed the password before any refusal.
+
+  The receipt exists before any Start: install.sh makes the folder
+  (0755) and the file (0600, 82 bytes, the all-zero nonce twice and
+  `refused`), root's, through `sudo -n` by those fixed paths, after
+  checking by lstat that every folder from `/private/var/db` up is root's
+  with no group or other write bit and no allowing ACL, then adds the
+  file's one access control entry, `user:<name> allow read`, with `sudo -n
+  chmod +a`. Only root and the user can open it, so no other account can
+  take its lock. It checks again once they exist. A receipt an earlier
+  build made (root's, one link, 82 bytes, no group or other write, no
+  entry or only that one) is repaired in place by `sudo -n chmod`, bytes
+  and inode kept, only while the release file shows no claim (none, or a
+  nonce and `free`); a claim, or a release file that is not a regular
+  file, cannot be read or holds anything else, stops the install before
+  any change. One the user can open (any mode but 0600) is locked first,
+  the release file is read under that lock, and before each chmod the
+  receipt must still be the locked file with the same line. One the user
+  cannot open (0600, no entry) is refused by every reader until it has
+  the entry, but a root command that opened it earlier may still hold its
+  lock. So one `sudo -n` call runs a root shell (`REPAIR_SH`) that locks
+  it, checks under the lock that it is the file the user saw with no
+  entry and a receipt's line and that the release file is as the user
+  read it, and adds the entry with the lock held; it is then locked and
+  checked with the release file. A receipt the run just made needs no
+  such lock. The entry goes on before the mode. The readers of earlier
+  builds of this change refuse a repaired receipt, and stay installed when
+  the install stops later or rolls back to the bundle it was replacing;
+  they check mode and entry before the lock, so such a build may settle a
+  start of its own as one that may have written and restore sleep, over
+  another tool's 1 too. A folder or receipt
+  already there in
+  another form stops the install with nothing about it changed (no chown
+  of something it did not make), the 45-byte receipt of earlier builds of
+  this change included; a receipt already as it makes it is kept. Every
+  reader accepts only mode 0600 and that one entry (allow, read alone, the
+  user's uid, not inherited, no flags): the app through acl(3);
+  backstop.sh and uninstall.sh through the app binary's `--access-lists`
+  mode (`AccessListsCommand.swift`), which reads the lists the same way
+  and prints one word per path; install.sh and the root command through
+  `ls -le` and `id -u`, which cannot see the rights and flags ls does not
+  print for a file or an entry it cannot read. These are not equivalent:
+  a receipt with such a right or flag passes install.sh and the root
+  command, and the app and the two scripts refuse it. The app also
+  refuses the receipt when an acl(3) call on the list fails or gives an
+  answer acl(3) does not document (`SleepOffReceipts.accessEntries`).
+  The scripts run the binary only while the bundle's Info.plist declares
+  `InsomniaAccessListsVersion` 1, since an older build has no such mode
+  and would open the menu bar app. A list the binary could not read
+  whole, a missing or older binary, or an answer that is not one word per
+  path makes the lists unknown, and the scripts treat the receipt as
+  unsafe (round 36; until round 35 the scripts read the lists with
+  `ls -le` too). Beside
+  it, under the receipt's lock, install.sh writes `<uid>.released`
+  through `sudo -n install`: the user's own file, 0600, 42 bytes, the
+  receipt's nonce and `free`. A `held` claim on an existing receipt is
+  kept. Every Insomnia folder of the user (`INSOMNIA_HOME`) shares both
+  files. Start refuses with nothing written, asking for install.sh again,
+  while `SleepOffReceipts.live.identity()` fails (missing, or not as
+  above), and journals that identity ("device:inode") in the attempt.
+
+  Not closed (the round 14 P1 is narrowed, not removed). pmset has no
+  compare-and-set and one `SleepDisabled` value with no owner, so no read
+  proves anything a moment later and a 1 written over a 1 leaves no
+  trace. A `SleepDisabled 1` another tool sets between the root command's
+  second read and its `disablesleep 1` (the last clock check and the time
+  pmset takes to start) is taken for Insomnia's own and set to 0 by the
+  end. One set while the `writing` line is written stops the command at
+  the second read and stays, except when its `refused` line cannot be
+  written and the exit 6 never reaches the app (a signal, the time limit,
+  a crash), or reaches it but the app cannot journal its rollback before
+  it quits or crashes or backstop.sh or uninstall.sh settles the start:
+  the receipt then still shows `writing`, and that settlement sets that 1
+  to 0. While the app that got the exit 6 runs, its own settlements of
+  that start keep the exit 6 as their verdict. One set after the second
+  read is set to 0 by that
+  start's undo when the start then fails, even when the command stopped
+  before its write. One set while a dialog is up is also set to 0 once
+  `expires` has passed when the receipt shows nothing (missing, replaced,
+  unreadable, a changed folder). A receipt that stays locked decides
+  nothing at any time, and the sleep undo waits for it (section 8). A
+  settlement that cannot be journaled keeps the attempt and runs the
+  restore only when the receipt showed something else than a never-write
+  or an earlier restore is owed.
+  The receipt is flushed with `F_FULLFSYNC`, which Apple's fcntl(2)
+  describes as a request some drives ignore: on such a drive a power loss
+  can bring it back older while pmset's 1 survives, and that 1 is then
+  reported as someone else's. A process running as the user can rewrite
+  state.json, the attempt included, and the release file, or swap the
+  marker while a command holds it. A settled start's nonce written into a
+  new marker turns nothing off: a start whose receipt still holds the
+  predecessor is settled before `expires` only when its dialog ended on
+  its own, and every command for it refuses from `expires` on
+  (SECURITY.md). While the journal claims a 1, another
+  tool's 1 cannot be told from it, and a refused start leaves it with its
+  restore still owed. sudo answers for the moment it is asked: a rule
+  removed later, a sudo.conf or PAM file changed later, or other groups
+  for the user when the app or the backstop runs sudo can still make a
+  restore fail, and the backstop keeps the entry and retries. Any sudo
+  but 1.9.17p2, a sudo.conf, PAM session lines other than macOS's own,
+  Defaults bound to a Runas user or a command, Defaults for the user, the
+  host or everyone outside the list, `listpw=always` and a later rule for
+  the restore, even a passwordless one, refuse every Start, and rerunning
+  install.sh changes none of them.
+
+  A session never starts unless the backstop is armed, and a start is
+  refused while a `pending-start` from an earlier start cannot be
+  removed or an earlier start's `sleepOffAttempt` is still journaled. The
+  start journals `sleepDisabledByUs` together with `sleepOffAttempt`
+  (nonce, `owedBefore`, receipt identity, predecessor, `deadline` =
+  `endsAt` in whole seconds, `expires`) before its claim and
+  session.json, then writes the marker and journals its identity
+  (`marker`) and `expires` before the dialog. If the dialog is cancelled,
+  osascript cannot be launched, or the root command refuses (its exit 3
+  to 8, or lockf's 69 or 75, which osascript ends its error line
+  with: `AdministratorPromptError.restoreNeedsPassword` and `.refused`),
+  the command left no change of its own for an undo to reverse: put
+  session.json and the journal back exactly as they were read, give the
+  claim back, run no pmset (a `SleepDisabled` set by another tool, even
+  while the dialog was up, stays), and surface the error. If the password
+  is wrong, the dialog times out, pmset fails, or the command ends with
+  any other status, the start deletes `pending-start` under its lock and
+  reads the receipt under the receipt's lock
+  (`SleepOffReceipts.verdict`). No command for this start turned sleep
+  off (`neverWrote`) only when the receipt passes the checks, is the file
+  it journaled, and holds this start's nonce with `refused`, another
+  start's line that names the same predecessor, or the predecessor itself
+  once no command can still write: the dialog ended on its own
+  (`AdministratorPromptError.dialogOver`: a cancel, a launch failure, a
+  wrong password, a refusal or another osascript failure, but not a
+  timeout, a signal or `stillRunning`) or `expires` has passed. It then
+  rolls back as for a refusal, with no pmset. This start's `writing` and
+  a later start's line that names another predecessor (`mayHaveWritten`)
+  remove the attempt and undo from the journal like an end, delete the
+  session file and surface the error. So does a receipt that is missing,
+  replaced, unreadable or unsafe once `expires` has passed. Before then it
+  decides nothing (`undecided`), and neither does the predecessor after a
+  dialog that may still be answered, nor, at any time, a receipt that
+  stays locked or whose lock fails. When `expires` is at most 15 s away
+  the start waits for it and reads the receipt again; otherwise it keeps
+  the attempt and its claim, refuses Starts, holds the sleep undo whatever
+  an earlier session owes (a command for the start may still be in pmset)
+  while the rest of the end runs, and the next transaction after `expires`
+  that can lock the receipt settles it (section 8). The start
+  deletes `pending-start` on every outcome before it lets go of the
+  recovery lock. A successful start deletes the marker, then journals the
+  attempt as settled, gives the claim back and removes the attempt. The
+  wait is bounded only for the
+  dialog: if its process has not finished 3 s after the SIGTERM, Insomnia
+  kills nothing and deletes the marker under its lock. Once that
+  succeeds the dialog's command can no longer pass its nonce check, so
+  the start is settled from the receipt as above (with the short wait for
+  `expires`) and the recovery lock released; the process is watched on
+  its own, and the menu line names its pid until osascript exits and goes
+  when the whole prompt has. While the dialog's root command holds the
+  marker's lock (anywhere from its nonce check to its exit, a hung sudo
+  query included), or the marker cannot be deleted, Insomnia instead
+  keeps session.json, the journal entry and the recovery lock until the
+  prompt exits, with no time limit, and settles from the receipt then;
+  starts, ends and the agent wait behind it, the same rule as a `sudo
+  pmset` that will not stop. Either way a notification and the menu line
+  name the pid while osascript runs.
+  The journal and backstop always exist before sleep is disabled, so a
+  crash while the dialog is up leaves recovery the journal entry and the
+  attempt to settle (section 8). Only an explicit
+  Start reaches the dialog; there is no auto-start, URL scheme or scheduled
+  start, and launch at login only reconciles.
 - Session end (timer, End now, Quit, battery floor, thermal critical):
   `sudo pmset -a disablesleep 0`, undo every RuntimeState entry, delete
   session, notify.
@@ -112,10 +404,110 @@ recovery; newly written journals use `frozenProcesses`.
 
 - `install.sh` writes `/etc/sudoers.d/insomnia` allowing the user to run,
   without a password, exactly:
-  - `/usr/bin/pmset -a disablesleep 1`
   - `/usr/bin/pmset -a disablesleep 0`
   - `/usr/bin/pmset -b lowpowermode 1`
   - `/usr/bin/pmset -b lowpowermode 0`
+- `/usr/bin/pmset -a disablesleep 1` is deliberately absent. With a
+  passwordless line, any process running as the user could keep the Mac
+  awake, unjournaled, with Insomnia not running. Turning sleep off goes
+  through the administrator password dialog instead
+  (`AdministratorPrompt.swift`).
+- Turning sleep back on and the Low Power Mode floor stay passwordless so the
+  app, `backstop.sh` and `uninstall.sh` can recover unattended: ending a
+  stuck or crashed session must never need a password.
+- `install.sh` also makes `/private/var/db/com.kgarg.insomnia` and the
+  user's receipt in it, root's, and the user's own `<uid>.released` beside
+  it, under the same sudo (section 1 and the receipt invariant in section
+  8). `uninstall.sh` removes both, then the folder once it is empty, after
+  the same checks, only under the receipt's lock and only while the
+  release file shows the receipt's own nonce `free`. From before that
+  check to its own end it holds the standard folder's recovery lock, which
+  install.sh holds from before the rule to its end (lock order: a folder's
+  recovery lock, the standard folder's, the receipt's). It stops before
+  removing anything at a folder or file that is not as install.sh makes it
+  or cannot be read, and at one of the two files without the other. It
+  keeps the rule, the receipt, its release file and the bundle, removes
+  only its own folder's files and exits 1 while `pmset -g` shows
+  SleepDisabled other than 0, `pmset -g custom` shows Battery Power
+  lowpowermode other than 0, or either read fails: another folder may
+  still owe the restore the rule runs. It does the same, and boots no
+  agent out, while `launchctl print gui/<uid>/com.insomnia.backstop`
+  names, on its one `path =` line, a file that is not this folder's plist
+  or candidate (compared by the path of its LaunchAgents folder, else
+  only when that folder has the same name and both it and the folder
+  above it are this folder's by device and inode, so a link to the whole
+  folder is this folder while a LaunchAgents folder that only leads here
+  from another folder is that folder's; `own_agent_file`,
+  `LaunchdBackstop.isOwnAgentFile`): every folder loads its agent under that one label, launchd
+  holds one job for it, and that job is another folder's, whose
+  backstop.sh in the bundle needs the rule. It asks at the check and again
+  just before the bootout, boots out only this folder's agent, and stops
+  before removing anything when print fails, does not answer or names no
+  single absolute file. It keeps the receipt's lock from the check until
+  the rule, the receipt and the bundle are gone, or to its end when they
+  stay. A start of another folder claims the receipt under that lock
+  before it loads its agent, so it waits, and is refused with nothing
+  written once the lock stays held for 10 s. Every load and unload of the
+  label takes one more lock, the standard folder's recovery lock (the
+  agent lock): install.sh and uninstall.sh hold it around each launchctl
+  call, and the app's reload (`LaunchdBackstop.arm`) holds it from its
+  reading of the loaded job until the plist is published, and hands it to
+  each launchctl call so a bootout or bootstrap keeps it until it exits.
+  uninstall.sh holds it from its check to its end, so no folder loads its
+  agent between the last print and the bootout: another folder's reload
+  waits up to 10 s, then fails with nothing changed and tries again at
+  its next transaction. Until round 35 such a load could be unloaded by
+  this bootout. One lone release file is known: the
+  one this folder's uninstall left when it stopped between the two
+  removals. Under the receipt's lock, after the checks and before the
+  LaunchAgent goes, it writes `.uninstall-receipt-removal` in the app
+  support folder: the release file's device, inode, change time to the
+  nanosecond and line, flushed with F_FULLFSYNC and read back. A rerun
+  that finds the release file without the receipt removes it only while
+  that record (one line in a 0600 file of the user's, one link, at most
+  200 bytes) names it exactly and its line says `free`; a start claims and
+  gives back only by writing to it, which changes the change time. Any
+  other lone file, a record of another file or an older state of this one,
+  stays refused. It asks for the password once with `sudo -v` before any
+  lock, stops before removing anything when `sudo -n -v` under the locks
+  shows sudo kept no credential, and runs every root command through `sudo
+  -n` with its 30 s call limit under the recovery lock, the standard
+  folder's lock and the receipt's lock. A call that fails, stops on
+  SIGTERM at the limit or is still running stops it there, and a sudo
+  still running keeps the three locks until it exits. A stop after the
+  LaunchAgent was booted out loads it again from its plist, except while a
+  sudo is still running. The rule is one file for every account on this
+  Mac, while the receipts, locks and bundles are each account's own.
+  uninstall.sh keeps the rule, says why and how to remove it later, and
+  still removes this account's receipt, release file and the rest, while
+  the receipt folder holds another account's receipt or release file, a
+  name install.sh does not make, or cannot be listed whole (perl's
+  readdir under the call limit; `other_accounts`, round 36). No lock spans
+  accounts, so the listing cannot keep another account's install.sh from
+  writing the rule or a receipt just after it. install.sh refuses, changing nothing, at a folder
+  or file that is not as it makes it, apart from the repair of an earlier
+  receipt (section 1). No passwordless line covers the receipt.
+- `install.sh` never writes `disablesleep 1`, on any path. When
+  `session.json` holds a future deadline it first says the upgrade will end
+  the session and, in a terminal, asks to continue. It asks for the password
+  (`sudo -v`) before anything else, so a cancelled or failed password
+  changes nothing and a running session keeps going. Then it asks a running
+  app to quit and stops with nothing changed, the sudoers file included, if
+  the app is still running after 15 s, and asks for the password once more
+  if sudo's cached credential expired during the quit. It assembles the
+  new bundle with `backstop.sh` sealed inside, then takes the recovery
+  lock, checks that the app was not opened again meanwhile, and writes the
+  three-line rule with `sudo -n` (`visudo -cf`, then `install`). It then
+  checks that `sudo -k -n -l` lists the three commands without a password
+  and stops if not. That catches a rule sudo does not read, but a listing
+  is not proof that the restore runs: it passes once any of the user's
+  rules is passwordless. The root command's `sudo -k -n -ll` at every
+  Start (section 1) reads the rule that decides the restore. The installer runs no pmset. Only after the listing
+  does it replace the bundle. A build older than this rule
+  starts sessions with `sudo -n pmset -a disablesleep 1`, so any stop between
+  the rule and the new bundle leaves that build unable to start a session;
+  the installer says so and prints the rerun command. A successful install
+  writes the file once.
 - Nothing else runs as root.
 
 ### 3. Lid observer
@@ -774,10 +1166,201 @@ provided by the standalone backstop. Performance effects depend on workload.
 Invariants:
 
 - Sleep is never disabled unless a session file with a future `endsAt` exists.
+- A password dialog turns sleep off only for the start that showed it,
+  only while that start still holds the recovery lock, and only before
+  that session's `endsAt`. The start writes a
+  fresh nonce to `pending-start` before the dialog and deletes it before it
+  releases the lock. Every other holder of the lock (any app transaction,
+  reconcile at launch, `backstop.sh`, `uninstall.sh`) deletes it first,
+  before it reads or clears the journal. The root command runs as `lockf
+  -k -n <marker> /bin/sh -c ...`: it holds the marker's flock from before
+  its nonce check until pmset exits, and every deleter takes that lock
+  before it unlinks the file. A lock belongs to a file, and the unlink goes
+  by path, so a deleter unlinks only while the path still names the file it
+  locked (device and inode of the locked descriptor against `stat` of the
+  path; the scripts open the marker on fd 8 and lock that descriptor). The
+  marker therefore goes either before the
+  check, which then fails, or after pmset, while the journal entry still
+  covers it, so a dialog answered after its start was abandoned (crash or
+  force-quit under the dialog, rollback, a newer start) cannot leave sleep
+  off once the journal entry is gone. No dialog is shown unless the
+  `backstop.sh` sealed in the bundle declares a version that deletes the
+  marker.
+- Root's receipt shows whether a start turned sleep off
+  (`SleepOffReceipts`). `/private/var/db/com.kgarg.insomnia/<uid>` holds
+  82 bytes, `<nonce> <predecessor> writing|refused` and a newline, and it
+  and every folder up to / are root's with no group or other write bit
+  and no allowing ACL, so nothing running as the user can write or
+  replace any of them. Every Insomnia folder of the user shares it. The
+  production reader trusts uid 0 alone; tests add their own uid only
+  through `SleepOffReceipts(folder:owners:user:)` and patched copies of
+  the scripts, never through anything a build reads at run time. The
+  receipt is also the lock for every party that acts on a start. The root
+  command takes an exclusive flock(2) on it (`lockf -s -t 10` on its open
+  descriptor) before any other check and holds it until it and its pmset
+  have exited. The app, `backstop.sh`, `install.sh` and `uninstall.sh`
+  take the same lock through a read-only descriptor before a start claims
+  the receipt, before they read it to settle a start, before install.sh
+  writes the release file and before uninstall.sh removes it. A lock that
+  stays busy or fails decides nothing. Beside the receipt,
+  `<uid>.released` (the user's, 0600) holds `<nonce> free|held`. A start
+  claims the receipt under its lock only while that file shows the
+  receipt's nonce `free`, writes its own nonce `held`, and gives the claim
+  back (the receipt's nonce, `free`) only once its settlement is
+  journaled, so no start of another Insomnia folder can replace the line
+  the claimed start's settlement reads. A claim nobody gives back (a
+  folder deleted while its start is journaled, a damaged release file)
+  refuses every Start of the user until the files are removed and
+  install.sh runs again. The file is the user's, so it never shows that a
+  start did not turn sleep off: a false line can only let a later start's
+  line in, which names this start's nonce as its predecessor and shows
+  nothing, or refuse every Start. The root command writes `<nonce>
+  <predecessor> writing` (perl, `F_FULLFSYNC`, read back) only while the
+  receipt begins with the predecessor, after its first read finds no
+  `SleepDisabled 1` and before its second read, its last clock check and
+  pmset, and `refused` when the second read, that check or the write
+  fails. A start journals
+  `sleepOffAttempt` (nonce, `owedBefore`, the receipt's identity, the
+  predecessor, `deadline`, `expires`, the id of the session it writes
+  (`session`), and the marker's identity once written) with
+  `sleepDisabledByUs` before its claim and before the
+  dialog can run anything. Every reader reads the receipt only under its
+  lock and after the marker is gone under the marker's lock. Each locks
+  before it checks the file (round 36; until round 35 the readers checked
+  first): before the lock only a plain folder path and a regular file at
+  it, by lstat, so a FIFO or a device put there is never opened; its
+  owner, mode, size, access control list and folders under the lock, as
+  the root command checks them under its own, so a command that holds the
+  lock is waited for before anything about the file decides a start. The
+  readers are the start
+  itself after a failure its status cannot vouch for, and the next holder
+  itself after a failure its status cannot vouch for, and the next holder
+  of the recovery lock (the app's first transaction after a relaunch,
+  `backstop.sh`, `uninstall.sh`) for an attempt still journaled, before
+  it reads the session. Which marker file went decides nothing. The
+  verdict is "never wrote" when the attempt has no marker (no dialog), or
+  when the receipt passes every check, is the journaled file, and holds
+  this start's nonce with `refused`, another start's line with the same
+  predecessor, or the predecessor itself once the dialog ended on its own
+  or `expires` has passed. This start's `writing` or a later start's line
+  with another predecessor is "may have written", and so is a missing,
+  replaced, unreadable or unsafe receipt once `expires` has passed. Before
+  `expires` such a receipt, and the predecessor after a dialog that may
+  still be answered, are "undecided", and so is a receipt that stays
+  locked or whose lock fails, at any time, and the journaled file still at
+  the path but one that cannot be opened to be locked, since a command
+  for that start may hold its lock. "May have written" undoes the
+  start like an end, and a settlement keeps `sleepDisabledByUs`. "Never
+  wrote" rolls the start back with no pmset, and a settlement puts
+  `sleepDisabledByUs` back to `owedBefore`, so an earlier session's owed
+  restore is never cleared. "Undecided" keeps the attempt and its claim:
+  new Starts are refused in every Insomnia folder of the user, an
+  unexpired session of that start is ended rather than resumed, and no
+  pmset runs for sleep, whatever an earlier session owes, since `expires`
+  only proves that no command for the start begins later (while the wall
+  clock does not go back), not that one already past its last check has
+  exited. The rest of the undo (Low Power Mode, processes, audio) runs. A
+  receipt that stays locked is retried for as long as the lock is held,
+  with no limit, so a root command that never exits leaves sleep as it is.
+  A settlement removes session.json when its `endsAt` in whole
+  seconds is the attempt's `deadline` and, when both carry one, its `id`
+  is the attempt's `session`, whatever the verdict: that session
+  never began, so it is never resumed because a `SleepDisabled 1` someone
+  else set reads as still off. Then, with the claim still held, it
+  journals the decision: the attempt marked `settled`, and
+  `sleepDisabledByUs` as above. Then it gives the claim back, then the
+  journal drops the attempt (`finishSettlement`, `finish_settlement`). A
+  record already `settled` is finished that way from its decision and
+  never read against the receipt again, since a later start's line may
+  follow once its claim is back. A step that fails before the decision is
+  journaled (session.json not removed, the journal not published) keeps
+  the attempt unsettled with the claim, so the next run reads the same
+  line. One that fails after it (the claim not given back, the settled
+  record not removed, the receipt's lock busy) keeps the settled record,
+  which holds nothing back: the undo follows its decision, Starts stay
+  refused, and every run tries again. A start that went through keeps its
+  session; a relaunch resumes it (reconcile, step 2), and the menu says
+  the start is still recorded and why. The app's journal write that marks
+  the attempt `settled` also names the session the settlement leaves to
+  be resumed (`resumes`: `startedAt` and first end in whole seconds, and
+  its `id` when it has one, `{}` for none): `finishAttempt` names the
+  start's session, `abandonStart`
+  the session it put back, and a settlement from the receipt the session
+  in memory or the session.json left after its removal. A settlement that
+  cannot read session.json publishes nothing and retries at the next
+  transaction (reconcile moves the file aside meanwhile); one whose bytes
+  are not a session names none. Beside a settled record reconcile resumes
+  only the named session (`isResumed`), under step 2's checks, and ends
+  any other. A record without `resumes` (an older build's, or one settled
+  by backstop.sh or uninstall.sh) resumes a session only with the sleep
+  entry journaled and its first end matching `deadline` (`isSession`).
+  Times alone do not tell two sessions apart, so when the session and the
+  record both carry an id (round 36), a different id is another session
+  in both checks, whatever its times; a session or record of an older
+  build has none, and the times alone decide. The scripts check only the
+  field's shape, and compare the ids only before they remove session.json.
+  A crash leaves one of those
+  journals. The messages say whether session.json was removed and whether
+  the decision was journaled. When the receipt showed "never wrote" and no
+  earlier restore is owed, or decided nothing, no pmset runs for sleep
+  while the attempt waits: the app refuses
+  Start and retries at every transaction, `backstop.sh` logs that sleep
+  is left as it is, keeps the journal dirty and exits 1, and
+  `uninstall.sh` stops with nothing else removed. Otherwise the app and
+  `backstop.sh` run the restore and keep the attempt; `uninstall.sh` runs
+  no pmset while an attempt stays unsettled or a settled one cannot be
+  finished. A marker deleted with no attempt
+  journaled (an older build's, or one a finished start could not delete)
+  takes session.json with it when no session is in memory
+  (`dropSessionOfUnrecordedMarker`, `drop_unrecorded_session`). If that
+  removal fails, the app ends that session instead of resuming it, and
+  `backstop.sh` undoes the journal as `--force` would and exits 1. Only
+  install.sh, uninstall.sh and an authenticated Start's root command
+  write the receipt. Each start rewrites it in place, so no record
+  accumulates, and a new start's nonce is random and never the all-zero
+  one.
+- A transaction holds the recovery lock while a command it started may
+  still change something. A stuck dialog whose marker this transaction
+  deleted under the marker's lock can no longer change anything while the
+  marker is not written again under this user and the clock is not set
+  back, so it does not hold the lock. That holds only for the file the start wrote:
+  `savePendingStart` returns its device and inode, and a marker found
+  replaced (a copy could have been swapped in after the root command
+  locked the original) or missing (it went without the lock) is not
+  counted as voided, so the transaction waits for the dialog to exit.
+  Deleters that did not write the marker (a transaction after a relaunch,
+  `backstop.sh`, `uninstall.sh`) have no identity to compare, so a copy
+  swapped in before their open while the root command holds the original
+  would be deleted in its place. Only a process running as the user can
+  make that swap, and it can already clear `sleepDisabledByUs` in
+  `state.json` directly. The settlement still waits for the receipt's
+  lock, which that command holds until its pmset exits, and then reads
+  its line.
+- `sleepDisabledByUs` is cleared only by a transaction that removed
+  `pending-start` before it restored sleep. A marker that cannot be locked
+  within its timeout or cannot be deleted leaves recovery incomplete: sleep
+  is still restored, the entry stays, the app reports it (log, "Restore
+  incomplete" notification, menu line) and refuses new starts, the agent
+  exits 1, and every later run retries. A journal write that fails after
+  sleep was restored is reported the same way, and the entry it could not
+  clear is retried.
 - Every change Insomnia makes is in RuntimeState before it is made, and is
   undone from RuntimeState, never from memory.
 
-Reconcile runs at every Insomnia launch:
+Reconcile runs at every Insomnia launch. Its transaction first deletes
+`pending-start` under its lock and settles a `sleepOffAttempt` still
+journaled (or finishes one already settled), or drops session.json beside
+a marker no attempt accounts
+for (the receipt invariant above). A session.json that is still there
+and unexpired while an attempt stays journaled, or whose removal beside
+such a marker failed, is ended (`performEnd(.startFailed)`), never
+resumed, with one exception: a settled attempt whose claim could not be
+given back or record removed resumes, in step 2, the session its record
+names (`resumes`, `isResumed`): the start's own, the session its rollback
+put back, or the one a settlement left in place. A settled record without
+`resumes` (an older build's, or one backstop.sh or uninstall.sh settled)
+resumes only the start's own session, and only with the sleep entry still
+journaled (`isSession`, below). Then:
 
 1. Session file missing or expired → restore journaled changes: sleep,
    verified owned processes, Low Power Mode if we set it, saved audio, and
@@ -789,7 +1372,14 @@ Reconcile runs at every Insomnia launch:
    restored as with no session. `backstop.sh` does the same once the journal
    is clean. A session file that decodes as JSON but lacks a key or type
    the `Session` decoder needs (`startedAt`, `endsAt`, `extensions`) is not
-   a session either; `backstop.sh` checks the same keys and types. The app
+   a session either; `backstop.sh` checks the same keys and types. Nor is
+   one whose extensions do not add up: an extension or their running sum
+   that is not finite, or a first end (`endsAt` less their sum) outside
+   the dates the store reads (`SessionMath.firstEnd`, checked by
+   `Store.loadSession`). The app moves it aside the same way and restores
+   the journal; no session it wrote has such a history. `backstop.sh` does
+   not add the extensions and honors its end until the app has moved it
+   (`uninstall.sh` ends any session either way). The app
    and both scripts read a date in one form only: `2027-01-15T08:00:00Z`,
    as Store writes it, or the same with an offset such as `+02:00` in place
    of `Z`, in whole seconds, naming a date and time that exist, years 1970
@@ -812,17 +1402,41 @@ Reconcile runs at every Insomnia launch:
    the folder. `backstop.sh` tries the rename again on every run.
    An unreadable journal still refuses every transaction and leaves both
    files in place.
-2. Session valid → establish the independent recovery agent before reapplying
-   the sleep guard, then resume observers. If the lid is open, restore recorded
-   lid-close actions. Arming or restoration errors must remain visible.
+2. Session valid → establish the independent recovery agent, then read
+   `pmset -g`. `SleepDisabled 1`: journal ownership if missing and resume
+   observers; the guard is never re-applied, since that needs the
+   administrator password and a relaunch has nobody at the keyboard.
+   `SleepDisabled 0` (something turned sleep back on while Insomnia was not
+   running): end the session with a notification, no prompt. If the lid is
+   open, restore recorded lid-close actions. Arming, read or restoration
+   errors must remain visible. Beside a settled attempt (above), only the
+   session its record names gets here (`isResumed`): the same `startedAt`,
+   to the second, and a first end that matches the named one within the
+   window described next. A record that names no session (`{}`) lets none
+   through. A record without `resumes` lets only that start's own session
+   through, with the sleep entry still journaled (`isSession`): it began at
+   least `minimumDuration` before the attempt's `deadline`, and its first
+   end falls in the second the deadline names, or, for each extension with a
+   fraction of a second (one cut short at the maximum), up to a second
+   earlier, since each save drops the end's fraction but keeps the
+   extension's. The comparison uses Doubles only, so no value on disk can
+   trap a conversion. Either way another session written with the same times
+   passes too. Anything else beside that record ends. Under a record without
+   `resumes`, that includes an earlier session a failed start put back as it
+   was before its claim could not be given back: an unwaived cost of records
+   from older builds and from the scripts. The menu keeps the line that the
+   start is still recorded (`recordedStartText`) while the session goes on,
+   and Starts stay refused until a run gives the claim back and removes the
+   record.
 3. `pmset -g` reports `SleepDisabled 1` with no session and no journal
    entry → leave it. Step 1 has already undone a disable Insomnia journaled,
    so this one was set by something else (a hand-run `pmset`, another tool)
    and is not Insomnia's to undo. Log it, show it on the menu's warning line,
-   and notify once per launch with `sudo pmset -a disablesleep 0`. A bit
-   still journaled as ours after a failed restore is retried from the
-   journal, not from this check. Nothing clears `SleepDisabled` without a
-   journal entry, in the app or in the agent.
+   and notify once per launch with `sudo pmset -a disablesleep 0`. Start is
+   refused while it stays (section 2). A bit still journaled as ours after
+   a failed restore is retried from the journal, not from this check.
+   Nothing clears `SleepDisabled` without a journal entry, in the app or in
+   the agent.
 
 A reconcile refused for a busy lock or an unreadable journal changes
 nothing and runs again after the retry delay until it goes through, unless
@@ -842,6 +1456,22 @@ Backstop, independent of the app:
 
 - The agent reads the saved deadline; recurring recovery checks avoid replacing
   the loaded job for every extension and allow retries after a failure.
+- backstop.sh reads session.json and state.json from private copies it
+  makes in a folder of its own (`.backstop-read.*`), each made with the
+  file's identity checked before and after the read. When it cannot make that folder or write a copy in
+  it (a full disk), it keeps the copies in memory and reads them with the
+  same checks; a file holding a NUL byte, which a shell variable cannot
+  hold, is then unknown and nothing is undone from it. Every journal it
+  publishes starts as a `cp` of the live state.json, as on main, so the
+  file's extended attributes go with it (cp(1) copies an access control
+  list only with `-p`, which main does not pass either), and is
+  published only when that copy holds the bytes the run read and
+  state.json is still the file it copied. A publish that fails keeps the
+  journal as it was, and the next run undoes what it records again. One
+  thing still needs room, as on main: each publish makes a new file, so
+  where none can be made the restore runs and the journal stays for the
+  next run. A log line that cannot be appended to insomnia.log goes to
+  standard error, and the run goes on.
 - The agent runs only the `backstop.sh` sealed in the signed bundle. Its
   command line verifies the bundle against the code requirement pinned in the
   plist (`codesign --verify --strict -R=...`; for an ad-hoc build, that
@@ -881,19 +1511,18 @@ Backstop, independent of the app:
   and no step after a failed bootstrap counts on a loaded job. Before
   recovery the run only puts a set-aside bundle back when nothing is at the
   app's path, and removes staging directories whose owning install is gone
-  (matched by the exact name install.sh gives them). Right after taking the
-  lock it checks the sudoers rule again with `sudo -n -l` for each of the
-  four commands and stops if it no longer holds: an uninstall.sh that took
-  the lock first removes the rule and leaves no journal, so the recovery
-  alone would pass. Under the lock every `sudo -n -l`, `pgrep`, `launchctl`
-  and `codesign --verify` call has a 30 s limit (the sudoers check before
-  the lock has it too). A supervising process enforces it, even if the
+  (matched by the exact name install.sh gives them). The sudoers rule is
+  written and listed under the lock before any of this (section 2), so an
+  uninstall.sh that took the lock first and removed the rule cannot leave
+  the new app without it. Under the lock every `sudo`, `pgrep`, `launchctl`
+  and `codesign --verify` call has a 30 s limit. A supervising process enforces it, even if the
   installer is killed while it waits, and the call keeps fd 9, so the lock
   is held until the call has exited or been stopped: no `launchctl bootout`
   or `bootstrap` it started is still running once the lock is released. A call past the
   limit gets SIGTERM, then SIGKILL one to two seconds later; `sudo` only ever gets
-  SIGTERM, and one that ignores it keeps the lock until it ends, reported
-  with its pid. A sudoers check or `pgrep` that does not answer stops the
+  SIGTERM, and one that ignores it keeps the lock until it ends. The run
+  names no pid for it: by the time anyone acted on one, it could name
+  another process. A `sudo` call or `pgrep` that does not answer stops the
   run, which releases the lock so the app and the agent can recover. A `launchctl print` that does not answer counts as unknown, never
   as unloaded. A `codesign --verify` that does not answer leaves it unknown
   which bundle the plist on disk pins, so the run stops and moves neither
@@ -993,7 +1622,11 @@ Backstop, independent of the app:
   64) that checks nothing. The script runs the binary only when the bundle's
   `Info.plist` declares `InsomniaResumeFrozenVersion` equal to the version
   the script speaks, because an older build would start the menu bar app
-  instead; otherwise it keeps those entries. It runs it with the same
+  instead; otherwise it keeps those entries. `install.sh` runs the staged
+  bundle's backstop with `--own-bundle`, which takes the binary and
+  `Info.plist` beside that copy instead of the installed app's, so an
+  upgrade from a build without the interface still resumes these entries
+  before the swap. It runs it with the same
   30-second limit as a power command, then SIGTERM, then SIGKILL, and with
   the lock descriptor: the binary keeps the recovery lock while it can
   still send a signal, even if the script dies first, and ends itself with
@@ -1040,12 +1673,16 @@ Backstop, independent of the app:
 
 ### 9. Notifications
 
-`UNUserNotificationCenter`: session ended (with reason), extend reminder 5
-minutes before end, battery floor reached, battery unreadable twice in a row,
-thermal action taken, network gap recovered (with nudge summary), sleep
-restored by backstop, sleep disabled by something other than Insomnia
-(reconcile step 3, once per launch), lid-close settings changed by the
-one-time update (section 10, once).
+`UNUserNotificationCenter`: session ended (with reason), session not started
+(the password dialog was cancelled or failed, or a `pending-start` that
+cannot be removed refused the start), password prompt still running
+(osascript's pid, while it runs), session ended because sleep was
+turned back on while Insomnia was not running, extend reminder 5 minutes
+before end, battery floor reached, battery unreadable twice in a row, thermal
+action taken, network gap recovered (with nudge summary), sleep restored by
+backstop, sleep disabled by something other than Insomnia (reconcile step 3,
+once per launch), lid-close settings changed by the one-time update
+(section 10, once).
 
 ### 10. Settings
 
@@ -1222,6 +1859,7 @@ Insomnia/
       Session.swift
     Store/
       Paths.swift
+      SleepOffReceipts.swift
       Store.swift
     Core/
       AppServices.swift
@@ -1298,10 +1936,12 @@ Insomnia/
 
 ```
 git clone https://github.com/krishhgg/Insomnia.git && cd Insomnia
-./scripts/install.sh      # asks for sudo once, for the sudoers file
+./scripts/install.sh      # asks for sudo once, for the sudoers file and the receipt
 ```
 
 Then set the hotspot in Settings, pick a freeze list, and start a session.
+Each start asks for the administrator password (that is the `disablesleep 1`
+the sudoers file does not cover).
 
 ## Manual test plan
 
@@ -1311,9 +1951,17 @@ that any case passed; record results in the release validation record.
 
 1. **First launch.** Confirm the status item is visible to the right of the
    notch on first launch.
-2. **Stays awake.** Start 30m session, close lid, wait 5 minutes, ping the Mac
+2. **Stays awake.** Start 30m session; the administrator password dialog
+   appears and names what it does. Close lid, wait 5 minutes, ping the Mac
    from the phone or check the heartbeat log. Open lid: session still running,
-   sleep still disabled until end.
+   sleep still disabled until end. Separately: Enter, then Cancel in the
+   dialog → no session, `pmset -g` unchanged (no `SleepDisabled`),
+   session.json and the journal are clean, and the "Session not started"
+   notification says Insomnia undid anything it changed. With
+   `SleepDisabled 1` set by hand first, Enter shows no dialog, changes
+   nothing and gives the command that turns sleep back on. With `sudo pmset -a disablesleep 1` run in a
+   terminal while the dialog is up, the password then starts no session
+   (status 6) and `SleepDisabled 1` stays.
 3. **Restores.** End now → `pmset -g` shows no `SleepDisabled`. Quit → same.
    Timer expiry → same, plus notification.
 4. **Backstop.** Force-quit a supervised disposable session, then verify
