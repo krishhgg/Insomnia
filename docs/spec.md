@@ -62,6 +62,7 @@ Session {
   startedAt:   Date
   endsAt:      Date          // the only thing that keeps sleep disabled
   extendedBy:  [TimeInterval]
+  id:          String?       // a UUID drawn at Start and kept through every extension; nil in an older build's session; see section 8
 }
 
 RuntimeState {                // everything Insomnia changed and must undo
@@ -263,14 +264,23 @@ recovery; newly written journals use `frozenProcesses`.
   of something it did not make), the 45-byte receipt of earlier builds of
   this change included; a receipt already as it makes it is kept. Every
   reader accepts only mode 0600 and that one entry (allow, read alone, the
-  user's uid, not inherited, no flags): the app through acl(3), the
-  scripts and the root command through `ls -le` and `id -u`, which cannot
-  see the rights and flags ls does not print for a file or an entry it
-  cannot read. The two are not equivalent: a receipt with such a right or
-  flag passes the scripts and the root command, and the app refuses it.
-  The app also refuses the receipt when an acl(3) call on the list fails
-  or gives an answer acl(3) does not document
-  (`SleepOffReceipts.accessEntries`). Beside
+  user's uid, not inherited, no flags): the app through acl(3);
+  backstop.sh and uninstall.sh through the app binary's `--access-lists`
+  mode (`AccessListsCommand.swift`), which reads the lists the same way
+  and prints one word per path; install.sh and the root command through
+  `ls -le` and `id -u`, which cannot see the rights and flags ls does not
+  print for a file or an entry it cannot read. These are not equivalent:
+  a receipt with such a right or flag passes install.sh and the root
+  command, and the app and the two scripts refuse it. The app also
+  refuses the receipt when an acl(3) call on the list fails or gives an
+  answer acl(3) does not document (`SleepOffReceipts.accessEntries`).
+  The scripts run the binary only while the bundle's Info.plist declares
+  `InsomniaAccessListsVersion` 1, since an older build has no such mode
+  and would open the menu bar app. A list the binary could not read
+  whole, a missing or older binary, or an answer that is not one word per
+  path makes the lists unknown, and the scripts treat the receipt as
+  unsafe (round 36; until round 35 the scripts read the lists with
+  `ls -le` too). Beside
   it, under the receipt's lock, install.sh writes `<uid>.released`
   through `sudo -n install`: the user's own file, 0600, 42 bytes, the
   receipt's nonce and `free`. A `held` claim on an existing receipt is
@@ -423,8 +433,12 @@ recovery; newly written journals use `frozenProcesses`.
   still owe the restore the rule runs. It does the same, and boots no
   agent out, while `launchctl print gui/<uid>/com.insomnia.backstop`
   names, on its one `path =` line, a file that is not this folder's plist
-  or candidate (compared by path, else by the device and inode of its
-  folder): every folder loads its agent under that one label, launchd
+  or candidate (compared by the path of its LaunchAgents folder, else
+  only when that folder has the same name and both it and the folder
+  above it are this folder's by device and inode, so a link to the whole
+  folder is this folder while a LaunchAgents folder that only leads here
+  from another folder is that folder's; `own_agent_file`,
+  `LaunchdBackstop.isOwnAgentFile`): every folder loads its agent under that one label, launchd
   holds one job for it, and that job is another folder's, whose
   backstop.sh in the bundle needs the rule. It asks at the check and again
   just before the bootout, boots out only this folder's agent, and stops
@@ -433,12 +447,17 @@ recovery; newly written journals use `frozenProcesses`.
   the rule, the receipt and the bundle are gone, or to its end when they
   stay. A start of another folder claims the receipt under that lock
   before it loads its agent, so it waits, and is refused with nothing
-  written once the lock stays held for 10 s. A load that takes no
-  receipt lock between the last print and the bootout (an extend, end or
-  relaunch of a folder other than this one and the standard one, whose
-  recovery locks the run holds) is unloaded: launchctl cannot unload a
-  job only while it comes from a given file. That app loads it again at
-  its next transaction. One lone release file is known: the
+  written once the lock stays held for 10 s. Every load and unload of the
+  label takes one more lock, the standard folder's recovery lock (the
+  agent lock): install.sh and uninstall.sh hold it around each launchctl
+  call, and the app's reload (`LaunchdBackstop.arm`) holds it from its
+  reading of the loaded job until the plist is published, and hands it to
+  each launchctl call so a bootout or bootstrap keeps it until it exits.
+  uninstall.sh holds it from its check to its end, so no folder loads its
+  agent between the last print and the bootout: another folder's reload
+  waits up to 10 s, then fails with nothing changed and tries again at
+  its next transaction. Until round 35 such a load could be unloaded by
+  this bootout. One lone release file is known: the
   one this folder's uninstall left when it stopped between the two
   removals. Under the receipt's lock, after the checks and before the
   LaunchAgent goes, it writes `.uninstall-receipt-removal` in the app
@@ -457,7 +476,15 @@ recovery; newly written journals use `frozenProcesses`.
   SIGTERM at the limit or is still running stops it there, and a sudo
   still running keeps the three locks until it exits. A stop after the
   LaunchAgent was booted out loads it again from its plist, except while a
-  sudo is still running. install.sh refuses, changing nothing, at a folder
+  sudo is still running. The rule is one file for every account on this
+  Mac, while the receipts, locks and bundles are each account's own.
+  uninstall.sh keeps the rule, says why and how to remove it later, and
+  still removes this account's receipt, release file and the rest, while
+  the receipt folder holds another account's receipt or release file, a
+  name install.sh does not make, or cannot be listed whole (perl's
+  readdir under the call limit; `other_accounts`, round 36). No lock spans
+  accounts, so the listing cannot keep another account's install.sh from
+  writing the rule or a receipt just after it. install.sh refuses, changing nothing, at a folder
   or file that is not as it makes it, apart from the repair of an earlier
   receipt (section 1). No passwordless line covers the receipt.
 - `install.sh` never writes `disablesleep 1`, on any path. When
@@ -1194,10 +1221,19 @@ Invariants:
   pmset, and `refused` when the second read, that check or the write
   fails. A start journals
   `sleepOffAttempt` (nonce, `owedBefore`, the receipt's identity, the
-  predecessor, `deadline`, `expires`, and the marker's identity once
-  written) with `sleepDisabledByUs` before its claim and before the
+  predecessor, `deadline`, `expires`, the id of the session it writes
+  (`session`), and the marker's identity once written) with
+  `sleepDisabledByUs` before its claim and before the
   dialog can run anything. Every reader reads the receipt only under its
-  lock and after the marker is gone under the marker's lock: the start
+  lock and after the marker is gone under the marker's lock. Each locks
+  before it checks the file (round 36; until round 35 the readers checked
+  first): before the lock only a plain folder path and a regular file at
+  it, by lstat, so a FIFO or a device put there is never opened; its
+  owner, mode, size, access control list and folders under the lock, as
+  the root command checks them under its own, so a command that holds the
+  lock is waited for before anything about the file decides a start. The
+  readers are the start
+  itself after a failure its status cannot vouch for, and the next holder
   itself after a failure its status cannot vouch for, and the next holder
   of the recovery lock (the app's first transaction after a relaunch,
   `backstop.sh`, `uninstall.sh`) for an attempt still journaled, before
@@ -1211,7 +1247,9 @@ Invariants:
   replaced, unreadable or unsafe receipt once `expires` has passed. Before
   `expires` such a receipt, and the predecessor after a dialog that may
   still be answered, are "undecided", and so is a receipt that stays
-  locked or whose lock fails, at any time. "May have written" undoes the
+  locked or whose lock fails, at any time, and the journaled file still at
+  the path but one that cannot be opened to be locked, since a command
+  for that start may hold its lock. "May have written" undoes the
   start like an end, and a settlement keeps `sleepDisabledByUs`. "Never
   wrote" rolls the start back with no pmset, and a settlement puts
   `sleepDisabledByUs` back to `owedBefore`, so an earlier session's owed
@@ -1225,7 +1263,8 @@ Invariants:
   receipt that stays locked is retried for as long as the lock is held,
   with no limit, so a root command that never exits leaves sleep as it is.
   A settlement removes session.json when its `endsAt` in whole
-  seconds is the attempt's `deadline`, whatever the verdict: that session
+  seconds is the attempt's `deadline` and, when both carry one, its `id`
+  is the attempt's `session`, whatever the verdict: that session
   never began, so it is never resumed because a `SleepDisabled 1` someone
   else set reads as still off. Then, with the claim still held, it
   journals the decision: the attempt marked `settled`, and
@@ -1243,8 +1282,9 @@ Invariants:
   session; a relaunch resumes it (reconcile, step 2), and the menu says
   the start is still recorded and why. The app's journal write that marks
   the attempt `settled` also names the session the settlement leaves to
-  be resumed (`resumes`: `startedAt` and first end in whole seconds, `{}`
-  for none): `finishAttempt` names the start's session, `abandonStart`
+  be resumed (`resumes`: `startedAt` and first end in whole seconds, and
+  its `id` when it has one, `{}` for none): `finishAttempt` names the
+  start's session, `abandonStart`
   the session it put back, and a settlement from the receipt the session
   in memory or the session.json left after its removal. A settlement that
   cannot read session.json publishes nothing and retries at the next
@@ -1254,7 +1294,12 @@ Invariants:
   any other. A record without `resumes` (an older build's, or one settled
   by backstop.sh or uninstall.sh) resumes a session only with the sleep
   entry journaled and its first end matching `deadline` (`isSession`).
-  The scripts check only the field's shape. A crash leaves one of those
+  Times alone do not tell two sessions apart, so when the session and the
+  record both carry an id (round 36), a different id is another session
+  in both checks, whatever its times; a session or record of an older
+  build has none, and the times alone decide. The scripts check only the
+  field's shape, and compare the ids only before they remove session.json.
+  A crash leaves one of those
   journals. The messages say whether session.json was removed and whether
   the decision was journaled. When the receipt showed "never wrote" and no
   earlier restore is owed, or decided nothing, no pmset runs for sleep
