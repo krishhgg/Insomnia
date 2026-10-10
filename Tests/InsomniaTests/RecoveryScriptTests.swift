@@ -4716,7 +4716,18 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(try fx.lockIsFree(), "the recovery lock stays held while the removal runs")
         XCTAssertFalse(FileManager.default.fileExists(atPath: fx.receipt))
         XCTAssertEqual(fx.release(), SleepOffReceipts.initialRelease)
-        XCTAssertTrue(fx.exists(fx.home.appendingPathComponent(".uninstall-receipt-removal")))
+        let progress = fx.home.appendingPathComponent(".uninstall-receipt-removal")
+        XCTAssertTrue(fx.exists(progress))
+
+        // Round 36 (R35-3): a rerun while that removal still runs waits for
+        // the recovery lock its supervisor holds and stops at its limit,
+        // so the record of the removal stays while the rm can still act.
+        let early = try fx.run(fx.uninstall)
+        XCTAssertEqual(early.status, 75, early.stdout + early.stderr)
+        XCTAssertTrue(early.stderr.contains("The recovery lock \(fx.lock.path) is held by another process"), early.stderr)
+        XCTAssertTrue(fx.exists(progress))
+        XCTAssertEqual(fx.release(), SleepOffReceipts.initialRelease)
+        XCTAssertNil(fx.commandEnded(), "the removal still runs")
 
         fx.releaseCommand()
         XCTAssertTrue(fx.hungProcessGone("sudo"))
@@ -5332,41 +5343,171 @@ final class RecoveryScriptTests: XCTestCase {
     /// rule's removal asks for it, after the agent was booted out. The
     /// uninstall stops with the rule, the receipt and the bundle in place
     /// and loads the agent again from its plist, so this folder's recovery
-    /// runs as before. A removal still running at its limit (125) loads
-    /// nothing: nothing new starts beside it, and the message says how to
-    /// load it once it has ended. Round 34: the agent is this folder's and
-    /// loaded, so there is one to boot out and load again.
+    /// runs as before. Round 34: the agent is this folder's and loaded, so
+    /// there is one to boot out and load again.
+    /// Round 36 (R35-3): a bootout that unloads the job and still exits 5,
+    /// or does not answer and is stopped at its limit, counts as out once
+    /// the print after it says the job is not loaded, so the stop loads it
+    /// again too. A removal still running at its limit (125) is waited for
+    /// and never stopped: the agent is loaded again only once it has
+    /// ended. Every load happens with the recovery lock still held.
     func testUninstallLoadsTheAgentAgainWhenItStopsAfterTheBootout() throws {
-        for stop in ["no-credential", "hangs"] {
+        let cases: [(name: String, launchctl: String, sudo: String)] = [
+            ("no-credential", "loaded", "no-credential"),
+            ("bootout fails yet unloads", "loaded-bootout-fails-yet-unloads", "no-credential"),
+            ("bootout hangs yet unloads", "loaded-bootout-hangs-yet-unloads", "no-credential"),
+            ("hangs", "loaded", "hangs"),
+        ]
+        for c in cases {
+            let f = try ScriptFixture()
+            defer { f.destroy() }
+            f.setMode("launchctl", c.launchctl)
+            try f.installMachinery()
+            try f.writeState(cleanJournal)
+            try f.writeReceipt()
+            try f.sudoers.path.write(to: f.root.appendingPathComponent("sudo-rm.\(c.sudo)"), atomically: true, encoding: .utf8)
+
+            let r: (status: Int32, stdout: String, stderr: String)
+            if c.sudo == "hangs" {
+                let row = ScriptRow(c.name, f, f.uninstall)
+                let done = DispatchSemaphore(value: 0)
+                Thread.detachNewThread { row.run(); done.signal() }
+                XCTAssertNotNil(f.hungPid("sudo", within: 60), "the removal never started: \(f.calls())")
+                let limit = Date(timeIntervalSinceNow: 60)
+                while !f.sudoEvents().contains(where: { $0.hasPrefix("TERM") }) && Date() < limit { Thread.sleep(forTimeInterval: 0.1) }
+                // bounded() gives sudo three seconds after its SIGTERM
+                // before it returns 125; six is past that.
+                XCTAssertEqual(done.wait(timeout: .now() + 6), .timedOut, "the run waits for the removal to end")
+                XCTAssertFalse(f.calls().contains { $0.hasPrefix("launchctl bootstrap") }, "nothing is loaded beside it: \(f.calls())")
+                XCTAssertFalse(f.hungProcessGone("sudo", within: 0), "sudo is never stopped from here")
+                f.releaseCommand()
+                XCTAssertEqual(done.wait(timeout: .now() + 60), .success, "the run ends once the removal has")
+                r = try row.outcome()
+            } else {
+                r = try f.run(f.uninstall)
+            }
+
+            XCTAssertEqual(r.status, 1, "\(c.name): \(r.stdout + r.stderr)")
+            let bootstrap = "launchctl bootstrap gui/\(f.uid) \(f.plist.path)"
+            let calls = f.calls()
+            if c.sudo == "no-credential" {
+                XCTAssertTrue(r.stderr.contains("Uninstall stopped after booting out the LaunchAgent: 'sudo -n /bin/rm -f \(f.sudoers.path)' exited 1 (sudo: a password is required)."), "\(c.name): \(r.stderr)")
+                XCTAssertEqual(f.bootstrapLog(), ["not ended"], c.name)
+            } else {
+                XCTAssertTrue(r.stderr.contains("'sudo -n /bin/rm -f \(f.sudoers.path)' did not answer within 5s and is still running; it is not stopped from here, and the recovery lock, the standard folder's lock and the receipt's lock stay held until it ends."), r.stderr)
+                XCTAssertTrue(r.stderr.contains("A command this run started as root is still running; it is not stopped from here. The LaunchAgent is loaded again once it has ended. If this wait is stopped first, load it yourself after that: \(bootstrap)\nThat command has ended.\n"), r.stderr)
+                XCTAssertEqual(f.commandEnded(), "released")
+                XCTAssertEqual(f.bootstrapLog(), ["ended"], "loaded only once the removal had ended")
+                XCTAssertEqual(calls.filter { $0 == "sudo SIGTERM" }.count, 1, "\(calls)")
+            }
+            XCTAssertTrue(r.stdout.contains("com.insomnia.backstop is not loaded"), "\(c.name): \(r.stdout)")
+            XCTAssertTrue(r.stderr.contains("The LaunchAgent was loaded again from \(f.plist.path)."), "\(c.name): \(r.stderr)")
+            let out = try XCTUnwrap(calls.firstIndex(of: "launchctl bootout gui/\(f.uid) \(f.plist.path)"), "\(c.name): \(calls)")
+            let back = try XCTUnwrap(calls.firstIndex(of: bootstrap), "\(c.name): \(calls)")
+            XCTAssertLessThan(out, back, c.name)
+            XCTAssertEqual(calls.filter { $0.hasPrefix("launchctl bootstrap") }, [bootstrap], c.name)
+            XCTAssertTrue(calls.contains("launchctl LOCK-HELD during bootstrap"), "\(c.name): \(calls)")
+            for kept in [f.plist, f.sudoers, f.app, f.installedBackstop] { XCTAssertTrue(f.exists(kept), "\(c.name): \(kept.path)") }
+            XCTAssertEqual(f.receiptText(), SleepOffReceipts.initialContent, c.name)
+            XCTAssertEqual(f.release(), SleepOffReceipts.initialRelease, c.name)
+        }
+    }
+
+    /// Round 36 (R35-3): after the bootout, a stop that never reaches
+    /// restore_agent still loads the agent again, from the EXIT trap: a
+    /// message that fails under errexit, and SIGTERM while the rule's
+    /// removal still runs. The SIGTERM'd run waits for that removal first
+    /// and never stops it. Both load with the recovery lock still held.
+    func testUninstallLoadsTheAgentAgainAfterAFailureOrSignalItDidNotPlanFor() throws {
+        for stop in ["a message fails", "SIGTERM"] {
             let f = try ScriptFixture()
             defer { f.destroy() }
             f.setMode("launchctl", "loaded")
             try f.installMachinery()
             try f.writeState(cleanJournal)
             try f.writeReceipt()
-            try f.sudoers.path.write(to: f.root.appendingPathComponent("sudo-rm.\(stop)"), atomically: true, encoding: .utf8)
+            let bootstrap = "launchctl bootstrap gui/\(f.uid) \(f.plist.path)"
+            if stop == "a message fails" {
+                try f.sudoers.path.write(to: f.root.appendingPathComponent("sudo-rm.no-credential"), atomically: true, encoding: .utf8)
+                FileManager.default.createFile(atPath: f.root.appendingPathComponent("cat.fails-after-unload").path, contents: nil)
+
+                let r = try f.run(f.uninstall)
+
+                XCTAssertEqual(r.status, 1, r.stdout + r.stderr)
+                XCTAssertFalse(r.stderr.contains("Uninstall stopped after booting out the LaunchAgent"), "the message failed: \(r.stderr)")
+                XCTAssertTrue(r.stderr.contains("The LaunchAgent was loaded again from \(f.plist.path)."), r.stderr)
+                XCTAssertEqual(f.bootstrapLog(), ["not ended"])
+            } else {
+                try f.sudoers.path.write(to: f.root.appendingPathComponent("sudo-rm.hangs"), atomically: true, encoding: .utf8)
+                let shell = try f.spawn(f.uninstall)
+                defer { _ = shell.wait() }
+                XCTAssertNotNil(f.hungPid("sudo", within: 60), "the removal never started: \(f.calls())")
+                XCTAssertTrue(f.exists(f.root.appendingPathComponent("launchctl.unloaded")), "booted out first")
+                XCTAssertEqual(shell.signal(SIGTERM), 0)
+                let held = Date(timeIntervalSinceNow: 3)
+                while !shell.hasExited && Date() < held { Thread.sleep(forTimeInterval: 0.1) }
+                XCTAssertFalse(shell.hasExited, "the run waits for the removal to end")
+                XCTAssertFalse(f.calls().contains { $0.hasPrefix("launchctl bootstrap") }, "nothing is loaded beside it: \(f.calls())")
+                XCTAssertFalse(f.hungProcessGone("sudo", within: 0), "sudo is never stopped from here")
+                f.releaseCommand()
+                let ended = Date(timeIntervalSinceNow: 60)
+                while !shell.hasExited && Date() < ended { Thread.sleep(forTimeInterval: 0.1) }
+                XCTAssertTrue(shell.hasExited, "the run ends once the removal has")
+                let status = shell.wait()
+                XCTAssertTrue(status & 0x7f == SIGTERM || (status & 0x7f == 0 && (status >> 8) & 0xff == 143), "ended by its SIGTERM: wait status \(status)")
+                XCTAssertEqual(f.commandEnded(), "released")
+                XCTAssertEqual(f.bootstrapLog(), ["ended"], "loaded only once the removal had ended")
+            }
+            let calls = f.calls()
+            XCTAssertEqual(calls.filter { $0.hasPrefix("launchctl bootstrap") }, [bootstrap], "\(stop): \(calls)")
+            XCTAssertTrue(calls.contains("launchctl LOCK-HELD during bootstrap"), "\(stop): \(calls)")
+            XCTAssertFalse(f.exists(f.root.appendingPathComponent("launchctl.unloaded")), "\(stop): loaded again")
+            for kept in [f.plist, f.sudoers, f.app, f.installedBackstop] { XCTAssertTrue(f.exists(kept), "\(stop): \(kept.path)") }
+            XCTAssertEqual(f.receiptText(), SleepOffReceipts.initialContent, stop)
+        }
+    }
+
+    /// Round 36 (R35-3): the print after this folder's bootout fails, so
+    /// whether the job went is unknown. The run removes nothing and tries
+    /// to load the agent again from its plist, which launchd refuses while
+    /// a job still holds the label: a bootout that did unload it gets it
+    /// back, and one whose bootstrap fails is followed by a print that
+    /// says what is loaded.
+    func testUninstallTriesToLoadTheAgentAgainWhenThePrintAfterItsBootoutFails() throws {
+        for (name, mode) in [("unloaded", "loaded"), ("still loaded", "loaded-unload-fails-after-bootstrap")] {
+            let f = try ScriptFixture()
+            defer { f.destroy() }
+            f.setMode("launchctl", mode)
+            try f.installMachinery()
+            try f.writeState(cleanJournal)
+            try f.writeReceipt()
+            // Two prints name this folder's plist (the check and the step),
+            // the one after the bootout fails, and any after that names
+            // the plist again.
+            let answers = "path \(f.plist.path)\npath \(f.plist.path)\nerror\npath \(f.plist.path)\n"
+            try answers.write(to: f.root.appendingPathComponent("launchctl.print-answers"), atomically: true, encoding: .utf8)
+            if name == "still loaded" {
+                // The bootout fails and the job stays loaded.
+                FileManager.default.createFile(atPath: f.root.appendingPathComponent("launchctl.bootstrapped").path, contents: nil)
+            }
 
             let r = try f.run(f.uninstall)
 
-            XCTAssertEqual(r.status, 1, "\(stop): \(r.stdout + r.stderr)")
-            let bootstrap = "launchctl bootstrap gui/\(f.uid) \(f.plist.path)"
+            XCTAssertEqual(r.status, 1, "\(name): \(r.stdout + r.stderr)")
+            XCTAssertTrue(r.stderr.contains("; cannot tell whether com.insomnia.backstop is still loaded.\nNothing was removed. Rerun this script once 'launchctl print gui/\(f.uid)/com.insomnia.backstop' answers.\n"), "\(name): \(r.stderr)")
             let calls = f.calls()
-            if stop == "no-credential" {
-                XCTAssertTrue(r.stderr.contains("Uninstall stopped after booting out the LaunchAgent: 'sudo -n /bin/rm -f \(f.sudoers.path)' exited 1 (sudo: a password is required)."), r.stderr)
+            XCTAssertFalse(calls.contains { Self.isRootRemoval($0) }, "\(name): \(calls)")
+            XCTAssertEqual(calls.filter { $0.hasPrefix("launchctl bootstrap") }, ["launchctl bootstrap gui/\(f.uid) \(f.plist.path)"], "\(name): \(calls)")
+            XCTAssertTrue(calls.contains("launchctl LOCK-HELD during bootstrap"), "\(name): \(calls)")
+            if name == "unloaded" {
                 XCTAssertTrue(r.stderr.contains("The LaunchAgent was loaded again from \(f.plist.path)."), r.stderr)
-                let out = try XCTUnwrap(calls.firstIndex(of: "launchctl bootout gui/\(f.uid) \(f.plist.path)"), "\(calls)")
-                let back = try XCTUnwrap(calls.firstIndex(of: bootstrap), "\(calls)")
-                XCTAssertLessThan(out, back)
             } else {
-                XCTAssertTrue(r.stderr.contains("'sudo -n /bin/rm -f \(f.sudoers.path)' did not answer within 5s and is still running; it is not stopped from here, and the recovery lock, the standard folder's lock and the receipt's lock stay held until it ends."), r.stderr)
-                XCTAssertTrue(r.stderr.contains("The LaunchAgent was not loaded again while that command is still running. A rerun loads nothing either; load it yourself once it has ended: \(bootstrap)"), r.stderr)
-                XCTAssertFalse(calls.contains(bootstrap), "\(calls)")
-                f.releaseCommand()
-                XCTAssertTrue(f.hungProcessGone("sudo"))
+                XCTAssertTrue(r.stderr.contains("launchctl bootout exited 5 and"), r.stderr)
+                XCTAssertTrue(r.stderr.contains("launchctl bootstrap exited 37, and the LaunchAgent is loaded from \(f.plist.path)."), r.stderr)
             }
-            for kept in [f.plist, f.sudoers, f.app, f.installedBackstop] { XCTAssertTrue(f.exists(kept), "\(stop): \(kept.path)") }
-            XCTAssertEqual(f.receiptText(), SleepOffReceipts.initialContent, stop)
-            XCTAssertEqual(f.release(), SleepOffReceipts.initialRelease, stop)
+            for kept in [f.plist, f.sudoers, f.app, f.installedBackstop] { XCTAssertTrue(f.exists(kept), "\(name): \(kept.path)") }
+            XCTAssertEqual(f.receiptText(), SleepOffReceipts.initialContent, name)
+            XCTAssertEqual(f.release(), SleepOffReceipts.initialRelease, name)
         }
     }
 
@@ -9464,7 +9605,8 @@ final class RecoveryScriptTests: XCTestCase {
     /// at the check leaves whose agent is loaded unknown, and the run stops
     /// there without a bootout. One that names this folder's plist until
     /// the bootout and fails after it cannot prove the agent gone: the run
-    /// stops there, with every file in place.
+    /// stops there, with every file in place. Round 36 (R35-3): it tries to
+    /// load the agent again, which fails here, and says so.
     func testUninstallAbortsWhenBootoutAndPrintBothFailAmbiguously() throws {
         let label = "com.insomnia.backstop"
         let answers = fx.root.appendingPathComponent("launchctl.print-answers")
@@ -9496,6 +9638,8 @@ final class RecoveryScriptTests: XCTestCase {
             } else {
                 XCTAssertTrue(r.stderr.contains("launchctl bootout exited 1 and 'launchctl print gui/\(fx.uid)/\(label)' exited 1; cannot tell whether \(label) is still loaded."), r.stderr)
                 XCTAssertEqual(bootouts, ["launchctl bootout gui/\(fx.uid) \(fx.plist.path)"], when)
+                XCTAssertEqual(fx.calls().filter { $0.hasPrefix("launchctl bootstrap") }, ["launchctl bootstrap gui/\(fx.uid) \(fx.plist.path)"], when)
+                XCTAssertTrue(r.stderr.contains("The LaunchAgent could not be loaded again (launchctl bootstrap exited 1), and 'launchctl print gui/\(fx.uid)/\(label)' exited 1. If \(label) is not loaded, load it yourself: launchctl bootstrap gui/\(fx.uid) \(fx.plist.path)"), r.stderr)
             }
         }
     }
@@ -12271,6 +12415,13 @@ private final class ScriptFixture {
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    /// What the fake launchctl wrote to bootstrap.log, one line per
+    /// bootstrap: "ended" when a release-controlled fake command had ended
+    /// by then, "not ended" otherwise.
+    func bootstrapLog() -> [String] {
+        ((try? String(contentsOf: root.appendingPathComponent("bootstrap.log"), encoding: .utf8)) ?? "").split(separator: "\n").map(String.init)
+    }
+
     /// Polls until the recovery lock is free; false after `seconds`.
     func waitUntilLockIsFree(_ seconds: Double = 15) throws -> Bool {
         let deadline = Date(timeIntervalSinceNow: seconds)
@@ -12629,9 +12780,14 @@ private final class ScriptFixture {
         // a script never reaches them. The fakes below call /bin/cat and
         // /usr/bin/head by full path, so a hostile folder put first in PATH
         // sees only the scripts' own calls.
+        // cat.fails-after-unload: a cat with no arguments (one that prints
+        // a message from a here-document) exits 1 once launchctl.unloaded
+        // is there, so the next message after a bootout fails under
+        // errexit.
         try writeFake("cat", """
         printf 'cat %s\\n' "$*" >> "\(toolsLog.path)"
         printf '%s\\n' "$PATH" >> "\(toolPathsLog.path)"
+        if [[ $# == 0 && -e "\(r)/cat.fails-after-unload" && -e "\(r)/launchctl.unloaded" ]]; then exit 1; fi
         exec /bin/cat "$@"
         """)
         try writeFake("head", """
@@ -13233,7 +13389,9 @@ private final class ScriptFixture {
         // also takes a service target `gui/<uid>/<label>` with no path.
         // Every bootstrap also records whether the recovery lock was held at
         // that moment (LOCK-HELD / LOCK-FREE), to prove the installer keeps
-        // its transaction open across the agent replacement.
+        // its transaction open across the agent replacement, and adds to
+        // bootstrap.log "ended" when a release-controlled fake command has
+        // ended by then (command.ended) or "not ended" otherwise.
         // Modes that keep state like launchd: the job starts loaded, bootout
         // unloads it, bootstrap loads it (and fails with 37 while it is
         // loaded), and print reports which.
@@ -13247,6 +13405,10 @@ private final class ScriptFixture {
         //     bootstrap fails with an error.
         //   "loaded-reload-fails-yet-listed": the first bootstrap fails (5);
         //     the second fails (5) too, but leaves a job listed.
+        //   "loaded-bootout-fails-yet-unloads": bootout unloads the job and
+        //     still exits 5.
+        //   "loaded-bootout-hangs-yet-unloads": bootout unloads the job and
+        //     then never answers (see hangHere).
         // Fixed answers:
         //   "bootout-fails-still-loaded": bootout exits 5 and print always
         //     lists the job. "ambiguous": bootout and print fail with errors.
@@ -13334,6 +13496,7 @@ private final class ScriptFixture {
           [[ "${2:-}" == gui/\(uid)/com.insomnia.backstop ]] || { echo "Boot-out failed: 5: Input/output error" >&2; exit 5; }
         fi
         if [[ "${1:-}" == bootstrap ]]; then
+          if [[ -e "\(r)/command.ended" ]]; then echo ended >> "\(r)/bootstrap.log"; else echo 'not ended' >> "\(r)/bootstrap.log"; fi
           if /usr/bin/lockf -k -s -t 0 "\(r)/home/.recovery.lock" /usr/bin/true 2>/dev/null; then
             echo 'launchctl LOCK-FREE during bootstrap' >> "\(calls)"
           else
@@ -13366,10 +13529,14 @@ private final class ScriptFixture {
           fi
         fi
         case "$mode" in
-          loaded|loaded-bootstrap-fails-once|loaded-unload-fails-after-bootstrap|loaded-print-fails-once-after-bootstrap|loaded-print-fails-after-bootstrap|loaded-reload-fails-yet-listed)
+          loaded|loaded-bootstrap-fails-once|loaded-unload-fails-after-bootstrap|loaded-print-fails-once-after-bootstrap|loaded-print-fails-after-bootstrap|loaded-reload-fails-yet-listed|loaded-bootout-fails-yet-unloads|loaded-bootout-hangs-yet-unloads)
             unloaded="\(r)/launchctl.unloaded"; bootstrapped="\(r)/launchctl.bootstrapped"
             case "${1:-}" in
               bootout)
+                if [[ "$mode" == loaded-bootout-fails-yet-unloads ]]; then
+                  : > "$unloaded"; echo "Boot-out failed: 5: Input/output error" >&2; exit 5
+                fi
+                if [[ "$mode" == loaded-bootout-hangs-yet-unloads ]]; then : > "$unloaded"; hang_here; fi
                 if [[ "$mode" == loaded-unload-fails-after-bootstrap && -e "$bootstrapped" ]]; then
                   echo "Boot-out failed: 5: Input/output error" >&2; exit 5
                 fi

@@ -217,7 +217,15 @@ step() { printf '\n==> %s\n' "$*"; }
 WORK="$("$MKTEMP" -d "${TMPDIR:-/tmp}/insomnia-uninstall.XXXXXX")"
 READS="$WORK"
 COPY_IN_MEMORY=0
-trap '"$RM" -f "$WORK"/call.* "$WORK"/read.* "$WORK"/plutil.err 2>/dev/null; "$RMDIR" "$WORK" 2>/dev/null || true' EXIT
+# On every exit, a stop, a failed command under errexit or SIGTERM, SIGHUP
+# or SIGINT (bash runs this trap for each): first load the LaunchAgent
+# again if this run booted it out and it is still out (restore_agent),
+# while this run's descriptors still hold the locks, then empty WORK.
+on_exit() {
+  if (( ${agent_out:-0} )); then restore_agent || true; fi
+  "$RM" -f "$WORK"/call.* "$WORK"/read.* "$WORK"/plutil.err 2>/dev/null; "$RMDIR" "$WORK" 2>/dev/null || true
+}
+trap on_exit EXIT
 
 # Run one external call with a time limit. Its combined output is left in
 # BOUNDED_OUTPUT (trailing newline removed) and its exit status returned, or
@@ -229,11 +237,16 @@ trap '"$RM" -f "$WORK"/call.* "$WORK"/read.* "$WORK"/plutil.err 2>/dev/null; "$R
 # one to two seconds later, never SIGKILL for sudo. The supervisor and the call keep fd 9 (the recovery lock) until the
 # call has exited, so a launchctl bootout made under the lock cannot unload
 # an agent the app confirms after this run is gone.
+# root_running is 1 from just before a sudo call starts until its status
+# is in, which its supervisor writes once the call has been reaped; it
+# stays 1 after a 125. restore_agent waits for it.
 BOUNDED_OUTPUT=""
+root_running=0
 bounded() { # command args...
   local base supervisor rc deadline
   base="$("$MKTEMP" "$WORK/call.XXXXXX")"
   BOUNDED_OUTPUT=""
+  if [[ "$1" == "$SUDO" ]]; then root_running=1; fi
   supervise "$base" "$@" </dev/null >/dev/null 2>&1 &
   supervisor=$!
   if [[ "$1" == "$SUDO" ]]; then
@@ -250,6 +263,7 @@ bounded() { # command args...
   # Any other call gets SIGKILL at most two seconds after its SIGTERM, so
   # this wait ends.
   wait "$supervisor" 2>/dev/null || true
+  [[ "$1" != "$SUDO" ]] || root_running=0
   rc=124
   if [[ -s "$base.rc" ]]; then read -r rc < "$base.rc"; fi
   IFS= read -r -d '' BOUNDED_OUTPUT < "$base.out" || true
@@ -2663,12 +2677,11 @@ esac
 # another process). Its supervisor holds this run's copies of fd 6, fd 7
 # and fd 9, so the standard lock, the receipt's lock and the recovery lock
 # stay held until it has exited and been reaped, after this run is gone.
-root_rc=0
+# Loading the LaunchAgent again after a stop waits for it (restore_agent).
 as_root() { # command args...
   local rc=0
   root_why=""
   bounded "$SUDO" -n "$@" || rc=$?
-  root_rc="$rc"
   case "$rc" in
     0) return 0 ;;
     124) root_why="'sudo -n $*' did not answer within ${CALL_TIMEOUT_SECONDS}s and stopped on SIGTERM, so what it did is unknown" ;;
@@ -2677,20 +2690,36 @@ as_root() { # command args...
   esac
   return "$rc"
 }
-# After the LaunchAgent was booted out, a stop loads it again from its
-# plist, which stays in place until the shared files are gone, so this
-# folder's recovery runs as it did before the uninstall. Not while a
-# command run as root may still be running (125): nothing new starts
-# beside it. The agent's backstop needs the recovery lock, which that
-# command's supervisor holds, so it could not run before the command ends
-# anyway.
+# After the LaunchAgent was booted out (agent_out), a stop loads it again
+# from its plist, which stays in place until the shared files are gone,
+# so this folder's recovery runs as it did before the uninstall. It runs
+# once: from the stop, or from on_exit after any other exit. This run
+# still holds the recovery lock, the standard folder's lock (the agent
+# lock every load of the label takes) and the receipt's lock, so no app,
+# install.sh or uninstall.sh of this build loads or unloads the label
+# meanwhile (an older app does not take that lock; see "Removing
+# LaunchAgent").
+# A command run as root that may still be running (root_running: it was
+# still running at its limit, or a signal ended this run while it waited
+# for one) is waited for first and never stopped: nothing new starts
+# beside it. Stopping that wait leaves the agent unloaded until someone
+# loads it, or, for the standard folder, whose plist is in
+# ~/Library/LaunchAgents, until the next login.
+# launchd refuses a bootstrap while any job holds the label, so one still
+# loaded, this folder's or another's, stays as it is. After a failed
+# bootstrap a print tells which.
 agent_out=0
 restore_agent() {
-  local rc=0
+  local rc=0 how
   (( agent_out )) || return 0
-  if (( root_rc == 125 )); then
-    echo "The LaunchAgent was not loaded again while that command is still running. A rerun loads nothing either; load it yourself once it has ended: launchctl bootstrap gui/$UID_NUM $PLIST" >&2
-    return 0
+  agent_out=0
+  if (( root_running )); then
+    echo "A command this run started as root is still running; it is not stopped from here. The LaunchAgent is loaded again once it has ended. If this wait is stopped first, load it yourself after that: launchctl bootstrap gui/$UID_NUM $PLIST" >&2
+    # Every background child of this run is a bounded() supervisor, and
+    # each exits once its call has been reaped.
+    wait 2>/dev/null || true
+    root_running=0
+    echo "That command has ended." >&2
   fi
   if [[ ! -f "$PLIST" ]]; then
     echo "The LaunchAgent could not be loaded again: $PLIST is gone." >&2
@@ -2698,12 +2727,17 @@ restore_agent() {
   fi
   bounded "$LAUNCHCTL" bootstrap "gui/$UID_NUM" "$PLIST" || rc=$?
   if (( rc == 0 )); then
-    agent_out=0
     echo "The LaunchAgent was loaded again from $PLIST." >&2
-  else
-    if (( rc == 124 )); then rc="did not answer within ${CALL_TIMEOUT_SECONDS}s"; else rc="exited $rc"; fi
-    echo "The LaunchAgent could not be loaded again (launchctl bootstrap $rc); load it yourself: launchctl bootstrap gui/$UID_NUM $PLIST" >&2
+    return 0
   fi
+  if (( rc == 124 )); then how="did not answer within ${CALL_TIMEOUT_SECONDS}s"; else how="exited $rc"; fi
+  loaded_agent
+  case "$agent_seen" in
+    own) echo "launchctl bootstrap $how, and the LaunchAgent is loaded from $agent_path." >&2 ;;
+    other) echo "The LaunchAgent was not loaded again (launchctl bootstrap $how): the recovery agent of another Insomnia folder is loaded as $LABEL ($agent_path), and it was left loaded." >&2 ;;
+    none) echo "The LaunchAgent could not be loaded again (launchctl bootstrap $how); load it yourself: launchctl bootstrap gui/$UID_NUM $PLIST" >&2 ;;
+    *) echo "The LaunchAgent could not be loaded again (launchctl bootstrap $how), and $agent_why. If $LABEL is not loaded, load it yourself: launchctl bootstrap gui/$UID_NUM $PLIST" >&2 ;;
+  esac
 }
 # Stops the uninstall after the rule went: what was kept, and why.
 removal_recorded=0
@@ -2745,13 +2779,14 @@ fi
 # every recovery file intact. The label is the same for every Insomnia
 # folder, and a bootout unloads whichever folder's agent holds it, so this
 # run boots it out only when it is this folder's, asked again just before.
-# The receipt is still locked, so no start of another folder loads its
-# agent in between. launchctl cannot unload a job only if it still comes
-# from a given file: an agent another folder's app loads between this print
-# and the bootout without the receipt (an extend, an end or a relaunch of
-# a folder other than this one and the standard one, whose recovery locks
-# this run holds) is unloaded instead, and that app loads it again at its
-# next transaction.
+# This run holds the standard folder's recovery lock, the agent lock that
+# every load and unload of the label by this build's app, install.sh and
+# uninstall.sh takes first (LaunchdBackstop), so no other folder's agent is
+# loaded between this print and the bootout. An app of a build before
+# round 36 does not take it: launchctl cannot unload a job only if it
+# still comes from a given file, so an agent such an app loads in between
+# is unloaded instead, and that app loads it again at its next
+# transaction.
 step "Removing LaunchAgent"
 loaded_agent
 case "$agent_seen" in
@@ -2773,10 +2808,15 @@ MSG
     # 0 means still loaded and anything else means launchd could not be
     # asked. 124 from either call means it did not answer within
     # CALL_TIMEOUT_SECONDS.
+    # Not loaded after the bootout, whatever the bootout returned (a
+    # bootout can unload the job and still fail or time out): this
+    # folder's job was loaded at the print before it, under the agent
+    # lock, and is out now, so a stop from here on loads it again
+    # (restore_agent).
     loaded_agent
     case "$agent_seen" in
       none)
-        (( bootout_rc != 0 )) || agent_out=1
+        agent_out=1
         echo "$LABEL is not loaded" ;;
       own)
         echo "launchctl bootout exited $bootout_rc and $LABEL is still loaded in gui/$UID_NUM." >&2
@@ -2793,8 +2833,13 @@ MSG
         fi
         keep_for_other_agent ;;
       *)
+        # The bootout may have unloaded it: restore_agent loads it again
+        # from the plist, which launchd refuses if a job still holds the
+        # label.
         echo "launchctl bootout exited $bootout_rc and $agent_why; cannot tell whether $LABEL is still loaded." >&2
-        echo "Nothing was removed. Run 'launchctl bootout gui/$UID_NUM $PLIST' yourself, then rerun." >&2
+        echo "Nothing was removed. Rerun this script once 'launchctl print gui/$UID_NUM/$LABEL' answers." >&2
+        agent_out=1
+        restore_agent
         exit 1 ;;
     esac ;;
   *) stop_unknown_agent ;;
