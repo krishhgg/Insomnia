@@ -13,6 +13,16 @@ struct InsomniaApp: App {
         Settings {
             EmptyView()
         }
+        .commands {
+            CommandGroup(replacing: .appSettings) {
+                Button("Insomnia Settings…") { delegate.showControlWindow() }
+                    .keyboardShortcut(",", modifiers: .command)
+            }
+            CommandGroup(after: .windowArrangement) {
+                Button("Open Insomnia") { delegate.showControlWindow() }
+                    .keyboardShortcut("1", modifiers: .command)
+            }
+        }
     }
 }
 
@@ -52,7 +62,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // No Dock icon even when run from `swift run` (the bundle has LSUIElement).
-        NSApp.setActivationPolicy(.accessory)
+        NSApp.setActivationPolicy(.regular)
         Log.info("launched")
         if LidSimulationBuild.isCompiledIn {
             Log.info(LidSimulationBuild.marker)
@@ -70,10 +80,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 Log.error("could not save config after the launch at login check: \(error.localizedDescription)")
             }
         }
-        let settings = SettingsWindow { [manager, secrets, locationPermission, loginItem] in
+        let settings = SettingsWindow { [manager, status, secrets, locationPermission, loginItem] in
             AnyView(
-                SettingsView(
+                ControlCenterView(
                     manager: manager,
+                    status: status,
                     secrets: secrets,
                     locationPermission: locationPermission,
                     loginItem: loginItem
@@ -84,7 +95,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem = StatusItemController(manager: manager, status: status) { [weak settings] in
             settings?.show()
         }
-        Task { await manager.reconcile() }
+        Task {
+            await manager.reconcile()
+            if !NSApp.isHidden { settings.show() }
+        }
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        settingsWindow?.show()
+        return true
+    }
+
+    func showControlWindow() {
+        settingsWindow?.show()
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        false
     }
 
     /// Quitting always ends the session (spec 1). Terminate is deferred until

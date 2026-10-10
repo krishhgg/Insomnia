@@ -1,3 +1,5 @@
+> **Desktop edition 0.1.1:** This branch adds a standalone control center with a Dock window and grouped settings. See [desktop/README.md](desktop/README.md) for the portable installer, verification results, and platform limits. Package an already-built app with `./scripts/package-desktop.sh /path/to/Insomnia.app /path/to/output.zip`; source installs use `./scripts/install-desktop.sh`. The original menu bar and recovery workflow remain available.
+
 <p align="center">
   <img src="docs/assets/eye-open.svg" alt="Insomnia: an open eye with a round pupil and five lashes above it" width="112">
 </p>
