@@ -813,7 +813,7 @@ final class RecoveryScriptTests: XCTestCase {
             // Exits 3 with the notes when a read failed.
             try ("set -euo pipefail\n" + functions
                 + #"for f in "$@"; do printf '[%s]\n' "$(epoch_at "$f" endsAt)"; done"# + "\n"
-                + #"if noted; then notes_read || true; printf 'noted: %s' "$READ_TEXT" >&2; exit 3; fi"# + "\n")
+                + #"if notes_made; then printf 'noted: %s' "$READ_TEXT" >&2; exit 3; fi"# + "\n")
                 .write(to: harness, atomically: true, encoding: .utf8)
 
             let r = try fx.run(harness, files)
@@ -2157,10 +2157,10 @@ final class RecoveryScriptTests: XCTestCase {
         try FileManager.default.removeItem(at: fx.backstop)
         try fx.writeMarkerBackstop(at: fx.installedBackstop, name: "sealed")
         fx.setMode("codesign", "verify-hangs")
-        var phases = PhaseTimes()
-        let path = try phases.time("slow sleep ready") { try fx.slowPollingPath() }
 
         let started = Date()
+        var phases = PhaseTimes()
+        let path = try phases.time("slow sleep ready") { try fx.slowPollingPath() }
         let r = try fx.run(fx.uninstall, ["--purge"], extraEnvironment: ["PATH": path])
         let elapsed = Date().timeIntervalSince(started)
         let timing = slowPollTiming(phases, started: started, elapsed: elapsed, commandStartedFile: "codesign.hung.pid", command: "codesign --verify")
@@ -2404,6 +2404,43 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(try harnessFiles(), [], "nothing is left with a name after the reap")
     }
 
+    /// The keeper of the shared supervisor (see keep_lock) for a sudo call
+    /// whose supervisor is killed with SIGKILL, which it cannot ignore. The
+    /// fake sudo closes its fd 9, as sudo does, kills its parent, the
+    /// supervisor, half a second in, and keeps running. bounded() gets the
+    /// pid and then no status, only what the supervisor's own parent sends
+    /// once it has reaped it ("settled 137"), so it gives 125 and the
+    /// harness ends. The keeper, which the supervisor started before the
+    /// call, holds the recovery lock while the call lives: the app's own
+    /// attempt (RecoveryLock.tryAcquire, as Start makes it) and a second
+    /// harness get nothing, and nothing signals the call. The keeper lets
+    /// go only once the call has ended.
+    func testTheSharedSupervisorsKeeperHoldsTheLockWhileItsCallOutlivesTheSupervisor() throws {
+        let harness = try boundedHarness()
+        fx.setMode("sudo", "kills-supervisor")
+
+        let r = try fx.run(harness)
+
+        XCTAssertEqual(r.status, 0, r.stderr)
+        let command = try XCTUnwrap(fx.hungPid("sudo", within: 5), "the call runs on: \(fx.calls())")
+        XCTAssertTrue(waitUntil(5) { self.fx.calls().contains("sudo SUPERVISOR-KILLED") }, fx.calls().joined(separator: "\n"))
+        XCTAssertEqual(fx.calls().sorted(), ["sudo -n \(fx.fakePmset) -a disablesleep 0", "sudo SUPERVISOR-KILLED", "bounded 125"].sorted())
+        XCTAssertNil(fx.commandEnded(), "the call still runs")
+        XCTAssertFalse(try fx.lockIsFree(), "with its supervisor killed, the keeper holds the lock for the live call")
+        XCTAssertNil(try RecoveryLock(url: fx.lock).tryAcquire(), "Start cannot take the lock while the call lives")
+        fx.clearCalls()
+        let second = try fx.run(harness)
+        XCTAssertNotEqual(second.status, 0, "a second run cannot take the lock")
+        XCTAssertEqual(fx.calls(), [], "the second run made no call")
+        XCTAssertNil(fx.commandEnded(), "the keeper signaled nothing")
+
+        fx.releaseCommand()
+        try assertLockHeldUntilGone(command, within: 10)
+        XCTAssertEqual(fx.commandEnded(), "released")
+        XCTAssertTrue(try fx.waitUntilLockIsFree(5), "the keeper lets go once the call has ended")
+        XCTAssertEqual(try harnessFiles(), [], "nothing is left with a name")
+    }
+
     /// A script that runs install.sh's bounded() and supervise() on their
     /// own, with the functions they read back through
     /// (testInstallAndUninstallShareTheBoundedCallHelper and
@@ -2425,6 +2462,8 @@ final class RecoveryScriptTests: XCTestCase {
         SUDO="\(fx.bin.appendingPathComponent("sudo").path)"
         MKTEMP=/usr/bin/mktemp
         RM=/bin/rm
+        PERL=/usr/bin/perl
+        BASH_PATH=/bin/bash
         CALL_TIMEOUT_SECONDS=3
         READ_MAX_BYTES=1048576
         READ_GRACE_SECONDS=5
@@ -2445,7 +2484,7 @@ final class RecoveryScriptTests: XCTestCase {
 
     /// The read-back functions of the layer the scripts share (see
     /// pin_output), in the order they are defined.
-    static let readBackFunctions = ["pin_output", "read_fd3", "send_output", "pipe_field", "take_output"]
+    static let readBackFunctions = ["pin_output", "read_fd3", "send_output", "settle", "pipe_field", "pipe_ends", "pipe_settles", "take_output"]
 
     /// Every name in boundedHarness's folders, as "<folder>/<name>".
     private func harnessFiles() throws -> [String] {
@@ -2605,10 +2644,22 @@ final class RecoveryScriptTests: XCTestCase {
     /// over the limit, a NUL past it, a byte written while it reads, a
     /// descriptor that is closed or opened again write-only before its
     /// second read, and one that is not a regular file. take_output takes
-    /// the four fields send_output sends, and returns 2 for a field
-    /// missing, a status that is not 0, 1 or 2, or a sender that stops
-    /// sending, within its deadline; a sender that sends all four and does
-    /// not end holds it until the deadline, no longer.
+    /// the four fields send_output sends and then "settled 0", the field
+    /// settle sends once the sender's parent has reaped it, and returns
+    /// their status (0, 1 or 2) only when the pipe then ends with nothing
+    /// more on it. It returns 3, with no text, for a field missing or cut
+    /// short, a status that is not 0, 1 or 2, a fourth field that is not
+    /// "end", a settled field that is missing, cut short or not "settled 0"
+    /// (a sender that exited 3 or was killed after it sent all four), a
+    /// wait that failed while a process of the sender keeps its lock, one
+    /// more field or byte after it, a byte from a process that writes after
+    /// the rest, a pipe that ends with nothing sent, a send that failed, a
+    /// sender that stops sending, one that sends all of it and does not
+    /// end, and one that sends only after the deadline. It waits for none
+    /// of them past its deadline, and a sender it gave up on keeps what it
+    /// holds (here a lock on a file of its own) until it ends. Every case
+    /// runs at once in a process of its own, and the test waits for each
+    /// sender to end before it finishes.
     func testTheReadBackLayerTakesOnlyAWholePrivateFileAndWaitsNoLongerThanItsDeadline() throws {
         let text = try String(contentsOf: ScriptFixture.productionScripts.appendingPathComponent("install.sh"), encoding: .utf8)
         let dir = fx.root.appendingPathComponent("reads", isDirectory: true)
@@ -2717,28 +2768,69 @@ final class RecoveryScriptTests: XCTestCase {
         pinned write-only 'ab\0cd' && { hooked write-only read_fd3; printf 'write-only-before-second-read %s %q hook=[%s]\n' "$HOOKED" "$READ_TEXT" "$hook_case"; exec 3<&- 4>&-; }
         exec 3< <(printf abc); show a-pipe
         pinned sent 'a\0b\n' && {
-          exec 5< <(send_output)
+          exec 5< <(send_output & settle "$!")
           rc=0; take_output "$(( SECONDS + 3 ))" || rc=$?
           exec 5<&- 3<&- 4>&-
           printf 'sent %s %q %q\n' "$rc" "$READ_TEXT" "$READ_HEAD"
         }
-        took() { # name
-          local rc=0 started=$SECONDS waited when
+        # A sender that holds a lock on a file of its own, $d/held.<name>,
+        # for as long as it (and the sleep it runs) lives.
+        hold() { # name
+          exec 9>"$d/held.$1" && /usr/bin/lockf -t 0 9 || exit 1
+        }
+        # One case: take_output from the sender's pipe on fd 5, with a
+        # deadline 2 to 3 s away, and then, for a sender that holds a lock,
+        # whether it still does.
+        took() { # name sender
+          local rc=0 started waited when lock=""
+          exec 5< <(eval "$2")
+          started=$SECONDS
           take_output "$(( SECONDS + 2 ))" || rc=$?
           waited=$(( SECONDS - started ))
           exec 5<&-
           when="after $waited s"
           (( waited > 1 )) || when=at-once
           (( waited < 2 || waited > 4 )) || when=at-the-deadline
-          printf 'take %s %s %q %q %s\n' "$1" "$rc" "$READ_TEXT" "$READ_HEAD" "$when"
+          if [[ -e "$d/held.$1" ]]; then
+            lock=" free"
+            /usr/bin/lockf -k -t 0 "$d/held.$1" /usr/bin/true 2>/dev/null || lock=" held"
+          fi
+          printf 'take %s %s %q %q %s%s\n' "$1" "$rc" "$READ_TEXT" "$READ_HEAD" "$when" "$lock"
         }
-        exec 5< <(printf '%s\0' 0 abc '' end); took whole
-        exec 5< <(printf '%s\0' 1 abcd ab end); took nul
-        exec 5< <(printf '%s\0' 0 abc ''); took no-end
-        exec 5< <(printf '%s\0' 7 abc '' end); took status-7
-        exec 5< <(printf '%s\0' 0 abc '' other); took not-end
-        exec 5< <(printf '%s\0' 0; exec /bin/sleep 10 2>/dev/null); took stalls
-        exec 5< <(printf '%s\0' 0 abc '' end; exec /bin/sleep 10 2>/dev/null); took does-not-end
+        cases=0
+        each() { # name sender
+          cases=$(( cases + 1 ))
+          took "$@" > "$d/take.$cases" 2>&1 &
+        }
+        each whole "printf '%s\\0' 0 abc '' end 'settled 0'"
+        each nul "printf '%s\\0' 1 abcd ab end 'settled 0'"
+        each not-read "printf '%s\\0' 2 '' '' end 'settled 0'"
+        each settled-by-its-parent "printf '%s\\0' 0 abc '' end & settle \"\$!\""
+        each nothing-sent "true"
+        each no-end "printf '%s\\0' 0 abc ''"
+        each status-7 "printf '%s\\0' 7 abc '' end 'settled 0'"
+        each not-end "printf '%s\\0' 0 abc '' other 'settled 0'"
+        each end-cut-short "printf '%s\\0' 0 abc ''; printf en"
+        each not-settled "printf '%s\\0' 0 abc '' end"
+        each settled-1 "printf '%s\\0' 0 abc '' end 'settled 1'"
+        each settle-cut-short "printf '%s\\0' 0 abc '' end; printf 'settled 0'"
+        each exits-3-after-sending "(printf '%s\\0' 0 abc '' end; exit 3) & settle \"\$!\""
+        each killed-after-sending "exec 2>/dev/null; (printf '%s\\0' 0 abc '' end; exec /bin/sh -c 'kill -KILL \$\$') & settle \"\$!\""
+        each wait-fails "hold wait-fails; (printf '%s\\0' 0 abc '' end; exec /bin/sleep 5) & settle 1 2>/dev/null"
+        each one-more-field "printf '%s\\0' 0 abc '' end 'settled 0' more"
+        each a-byte-after-end "printf '%s\\0' 0 abc '' end 'settled 0'; printf x"
+        each a-late-writer "(/bin/sleep 0.3; printf x) & printf '%s\\0' 0 abc '' end 'settled 0'"
+        each send-failed "exec 1>&-; printf '%s\\0' 0 abc '' end 'settled 0' 2>/dev/null"
+        each stalls "hold stalls; printf '%s\\0' 0; exec /bin/sleep 5"
+        each does-not-end "hold does-not-end; printf '%s\\0' 0 abc '' end 'settled 0'; exec /bin/sleep 5"
+        each sends-late "hold sends-late; /bin/sleep 5; printf '%s\\0' 0 abc '' end 'settled 0'"
+        wait
+        for (( i = 1; i <= cases; i++ )); do /bin/cat "$d/take.$i"; done
+        # Each sender that held a lock has ended (lockf takes the lock once
+        # it is gone) before the script ends.
+        for held in "$d"/held.*; do
+          /usr/bin/lockf -k -t 10 "$held" /usr/bin/true || echo "${held##*/} did not end"
+        done
 
         """#).write(to: script, atomically: true, encoding: .utf8)
 
@@ -2790,13 +2882,188 @@ final class RecoveryScriptTests: XCTestCase {
             "sent 1 ab a",
             "take whole 0 abc abc at-once",
             "take nul 1 abcd ab at-once",
-            "take no-end 2 '' '' at-once",
-            "take status-7 2 '' '' at-once",
-            "take not-end 2 '' '' at-once",
-            "take stalls 2 '' '' at-the-deadline",
-            "take does-not-end 0 abc abc at-the-deadline",
+            "take not-read 2 '' '' at-once",
+            "take settled-by-its-parent 0 abc abc at-once",
+            "take nothing-sent 3 '' '' at-once",
+            "take no-end 3 '' '' at-once",
+            "take status-7 3 '' '' at-once",
+            "take not-end 3 '' '' at-once",
+            "take end-cut-short 3 '' '' at-once",
+            "take not-settled 3 '' '' at-once",
+            "take settled-1 3 '' '' at-once",
+            "take settle-cut-short 3 '' '' at-once",
+            "take exits-3-after-sending 3 '' '' at-once",
+            "take killed-after-sending 3 '' '' at-once",
+            "take wait-fails 3 '' '' at-once held",
+            "take one-more-field 3 '' '' at-once",
+            "take a-byte-after-end 3 '' '' at-once",
+            "take a-late-writer 3 '' '' at-once",
+            "take send-failed 3 '' '' at-once",
+            "take stalls 3 '' '' at-the-deadline held",
+            "take does-not-end 3 '' '' at-the-deadline held",
+            "take sends-late 3 '' '' at-the-deadline held",
             "",
         ], r.stdout)
+    }
+
+    /// What a caller makes of a supervisor that sends a status and its
+    /// output but is not seen to end. install.sh's bounded() (the same text
+    /// as uninstall.sh's) and backstop.sh's bounded() and run_bounded() run
+    /// on their own, each with a stand-in supervisor that sends what its
+    /// caller reads first (a pid, and the status 7 or "exit 7"), then the
+    /// four output fields with "out" when the caller takes output, and
+    /// then: nothing, and it returns ("ends"); one more field ("field"); one
+    /// more byte ("byte"); nothing, and it exits 3 ("exits") or is killed
+    /// ("killed"), so the process that started it, its parent, sends
+    /// another settled status than 0 once it has reaped it; or nothing
+    /// while it keeps the pipe and fd 9, the lock, until the test releases
+    /// it ("stays"). Only "ends" gives back
+    /// the status and the text. Each other way gives install.sh 125 with no
+    /// text and the pid for its message, a backstop read 124 with no text
+    /// (a read that did not answer), and run_bounded 125 with
+    /// command_alive=1 and a log line, with output or without, so the run
+    /// stops there. "stays" costs READ_GRACE_SECONDS (1 here) and a second,
+    /// no more, and its stand-in keeps the lock after the harness has
+    /// ended, until it ends itself.
+    func testACallerTakesNothingFromASupervisorThatIsNotSeenToEnd() throws {
+        func text(_ name: String) throws -> String {
+            try String(contentsOf: ScriptFixture.productionScripts.appendingPathComponent(name), encoding: .utf8)
+        }
+        let install = try text("install.sh"), backstop = try text("backstop.sh")
+        let after = """
+        after() {
+          local n=0
+          case "$CASE" in
+            field) printf 'more\\0' ;;
+            byte) printf x ;;
+            exits) exit 3 ;;
+            killed) exec /bin/sh -c 'kill -KILL $$' ;;
+            stays) until [[ -e '\(fx.root.appendingPathComponent("release").path)' ]] || (( n >= 300 )); do /bin/sleep 0.1; n=$(( n + 1 )); done ;;
+          esac
+        }
+
+        """
+        let installHarness = fx.root.appendingPathComponent("install-take.sh")
+        var layer = ""
+        for name in Self.readBackFunctions + ["bounded"] { layer += try Self.shellFunction(name, in: install, "install.sh") }
+        try ("""
+        set -uo pipefail
+        SUDO=/nonexistent/sudo
+        CALL_TIMEOUT_SECONDS=3
+        READ_GRACE_SECONDS=1
+        FIELD=""
+        exec 9<>'\(fx.lock.path)'
+        /usr/bin/lockf -t 0 9 || exit 1
+
+        """ + layer + after + #"""
+        supervise() {
+          trap '' TERM HUP PIPE
+          printf '%s\0' 4242 7 0 out '' end
+          after
+        }
+        for CASE in ends field byte exits killed stays; do
+          rc=0
+          started=$SECONDS
+          bounded /usr/bin/true || rc=$?
+          when=in-time
+          (( SECONDS - started <= 3 )) || when=late
+          echo "install $CASE $rc read=$BOUNDED_READ pid=$BOUNDED_PID out=[$BOUNDED_OUTPUT] text=[$READ_TEXT] $when"
+        done
+
+        """#).write(to: installHarness, atomically: true, encoding: .utf8)
+        let backstopHarness = fx.root.appendingPathComponent("backstop-take.sh")
+        layer = ""
+        for name in ["settle", "pipe_field", "pipe_ends", "pipe_settles", "take_output", "bounded", "run_bounded"] {
+            layer += try Self.shellFunction(name, in: backstop, "backstop.sh")
+        }
+        try ("""
+        set -uo pipefail
+        RM=/bin/rm
+        APP_SUPPORT=/nonexistent
+        READ_TIMEOUT_SECONDS=3
+        COMMAND_TIMEOUT_SECONDS=3
+        KILL_GRACE_SECONDS=1
+        READ_GRACE_SECONDS=1
+        FIELD=""
+        lock_shared=1
+        bounded_calls=0
+        bounded_output=0
+        command_alive=0
+        log() { echo "log $1"; }
+
+        """ + layer + after + #"""
+        read_unit() {
+          printf '%s\0' 7 0 out '' end
+          after
+        }
+        supervise_command() {
+          printf '%s\0' 4242 "exit 7"
+          (( ! bounded_output )) || printf '%s\0' 0 out '' end
+          after
+        }
+        for CASE in ends field byte exits killed; do
+          rc=0
+          bounded /usr/bin/true || rc=$?
+          echo "read $CASE $rc read=$BOUNDED_READ text=[$READ_TEXT]"
+          for bounded_output in 0 1; do
+            rc=0
+            command_alive=0
+            run_bounded /usr/bin/true || rc=$?
+            echo "command $CASE output=$bounded_output $rc alive=$command_alive read=$BOUNDED_READ text=[$READ_TEXT]"
+          done
+        done
+
+        """#).write(to: backstopHarness, atomically: true, encoding: .utf8)
+
+        let first = try fx.start(installHarness), second = try fx.start(backstopHarness)
+        let ended = waitUntil(20) { first.process.hasExited && second.process.hasExited }
+        defer {
+            fx.releaseCommand()
+            _ = try? fx.waitUntilLockIsFree(10)
+        }
+        let a = first.finish(), b = second.finish()
+
+        XCTAssertTrue(ended, a.stdout + b.stdout)
+        XCTAssertEqual(a.status, 0, a.stderr)
+        XCTAssertEqual(a.stdout.components(separatedBy: "\n"), [
+            "install ends 7 read=0 pid= out=[out] text=[out] in-time",
+            "install field 125 read=2 pid=4242 out=[] text=[] in-time",
+            "install byte 125 read=2 pid=4242 out=[] text=[] in-time",
+            "install exits 125 read=2 pid=4242 out=[] text=[] in-time",
+            "install killed 125 read=2 pid=4242 out=[] text=[] in-time",
+            "install stays 125 read=2 pid=4242 out=[] text=[] in-time",
+            "",
+        ], a.stdout)
+        XCTAssertFalse(try fx.lockIsFree(), "the stand-in that stays keeps the lock after the harness has ended")
+        XCTAssertEqual(b.status, 0, b.stderr)
+        XCTAssertEqual(b.stdout.components(separatedBy: "\n"), [
+            "read ends 7 read=0 text=[out]",
+            "command ends output=0 7 alive=0 read=2 text=[]",
+            "command ends output=1 7 alive=0 read=0 text=[out]",
+            "read field 124 read=2 text=[]",
+            "log error",
+            "command field output=0 125 alive=1 read=2 text=[]",
+            "log error",
+            "command field output=1 125 alive=1 read=2 text=[]",
+            "read byte 124 read=2 text=[]",
+            "log error",
+            "command byte output=0 125 alive=1 read=2 text=[]",
+            "log error",
+            "command byte output=1 125 alive=1 read=2 text=[]",
+            "read exits 124 read=2 text=[]",
+            "log error",
+            "command exits output=0 125 alive=1 read=2 text=[]",
+            "log error",
+            "command exits output=1 125 alive=1 read=2 text=[]",
+            "read killed 124 read=2 text=[]",
+            "log error",
+            "command killed output=0 125 alive=1 read=2 text=[]",
+            "log error",
+            "command killed output=1 125 alive=1 read=2 text=[]",
+            "",
+        ], b.stdout)
+        fx.releaseCommand()
+        XCTAssertTrue(try fx.waitUntilLockIsFree(10), "the stand-in ends once released, and the lock with it")
     }
 
     /// An uninstall killed while its `launchctl bootout` does not answer:
@@ -3387,6 +3654,8 @@ final class RecoveryScriptTests: XCTestCase {
         RM=/bin/rm
         STAT=/usr/bin/stat
         SUDO=/usr/bin/sudo
+        PERL=/usr/bin/perl
+        BASH_PATH=/bin/bash
         CALL_TIMEOUT_SECONDS=5
         READ_TIMEOUT_SECONDS=5
         KILL_GRACE_SECONDS=1
@@ -3395,19 +3664,253 @@ final class RecoveryScriptTests: XCTestCase {
         WORK='\(work.path)'
         BOUNDED_OUTPUT=""
         BOUNDED_READ=2
+        BOUNDED_NOTED=0
         BOUNDED_PID=""
         BOUNDED_LIMIT=""
         BOUNDED_TERM_ONLY=""
         BOUNDED_OWN_GROUP=""
         FIELD=""
-        NOTES_BROKEN=1
 
         """
         let own = script == "backstop.sh"
             ? ["job_running", "wait_for_job", "signal_job", "bounded", "read_unit", "call_result"]
-            : ["bounded", "supervise", "call_result"]
+            : ["bounded", "pid_gone", "keep_lock", "supervise", "call_result"]
         for name in own { source += try shellFunction(name, in: text, script) }
         return source + (try sharedReadLayer(in: text, script)) + "notes_reset\n"
+    }
+
+    /// snapshot as each of backstop.sh and uninstall.sh has it, run on its
+    /// own through the script's read layer with 1 s limits, over a fake rm,
+    /// cp and mktemp that log each call and, for the copy only, do what
+    /// the case says. The copy is made, empty, inside cp's own timed
+    /// process, after a bounded rm, so the shell itself opens and checks
+    /// nothing at that name. A FIFO, a link (to a file that keeps what it
+    /// has) or a read-only file put at the name once rm has removed it, or
+    /// a folder that is not there, gives 1 with no cp run (a read-only file
+    /// only when the test does not run as root). An rm that fails
+    /// gives its status, with no cp run, and an rm or cp that does not
+    /// answer is stopped at the limit (124). A mktemp that takes past the
+    /// limit, before the call would start, leaves the call not run: the
+    /// limit counts from before the call's own setup, so the status (124
+    /// for backstop.sh's read, 126 for uninstall.sh's call that could not
+    /// start) comes within the limit and a second of grace.
+    /// The notes (see notes_reset) as each of backstop.sh and uninstall.sh
+    /// keeps them: only a timed process of the shell's own writes or reads
+    /// the notes file, so the shell itself never opens it. Two notes read
+    /// back in order; no note leaves no file and notes_made says none; a
+    /// note made in a subshell (as `$(...)` makes one) is found by
+    /// notes_made though the shell's own NOTED stays 0, and the next read
+    /// (value_at, through plutil_read) gives 2 with no value: its
+    /// supervisor finds the note before it runs plutil. A FIFO or a link
+    /// (to a file that keeps what it has) at the name before the first note
+    /// is not written, and the note still counts, with no text. A read of
+    /// the notes that does not answer in time counts as a note, and a write that waits at a FIFO put at the name
+    /// just before it is given up on in time (READ_GRACE_SECONDS, 1 here,
+    /// and a second): the note counts, and the
+    /// process that waits keeps the lock the shell held (fd 9) until the
+    /// test reads the FIFO and it ends.
+    func testNotesAreWrittenAndReadOnlyByTimedProcessesOfTheShells() throws {
+        var runs: [(script: String, run: ScriptFixture.Started)] = []
+        for script in ["backstop.sh", "uninstall.sh"] {
+            let text = try String(contentsOf: ScriptFixture.productionScripts.appendingPathComponent(script), encoding: .utf8)
+            let d = fx.root.appendingPathComponent("notes.\(script)", isDirectory: true)
+            let work = d.appendingPathComponent("work", isDirectory: true)
+            try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
+            let harness = d.appendingPathComponent("notes.sh")
+            try ("set -uo pipefail\n" + Self.readLayerSource(text, script: script, work: work) + #"""
+            D='\#(d.path)'
+            READ_GRACE_SECONDS=1
+            printf 'keep\n' > "$D/linked"
+            at_name() {
+              if [[ -L "$NOTES_FILE" ]]; then echo link
+              elif [[ -p "$NOTES_FILE" ]]; then echo fifo
+              elif [[ -f "$NOTES_FILE" ]]; then echo file
+              elif [[ -e "$NOTES_FILE" ]]; then echo other
+              else echo none
+              fi
+            }
+            show() { # label
+              local made=no rc=0 started=$SECONDS when=in-time
+              notes_made || rc=1
+              (( SECONDS - started <= 3 )) || when=late
+              (( rc != 0 )) || made="yes [$(printf %q "$READ_TEXT")]"
+              echo "$1 noted=$NOTED made=$made at-name=$(at_name) linked=$(/bin/cat "$D/linked") $when"
+            }
+            hook_case=""
+            hook() {
+              case "$hook_case" in
+                write-blocks)
+                  if [[ "$BASH_COMMAND" == *'>> "$NOTES_FILE"' ]]; then /bin/rm -f "$NOTES_FILE"; /usr/bin/mkfifo "$NOTES_FILE"; fi ;;
+                read-stalls)
+                  if [[ "$BASH_COMMAND" == send_output ]]; then /usr/bin/lockf -k "$D/stall" /bin/sleep 3; fi ;;
+              esac
+              return 0
+            }
+            hooked() { # case command...
+              hook_case="$1"
+              shift
+              set -T
+              trap hook DEBUG
+              "$@"
+              trap - DEBUG
+              set +T
+              hook_case=""
+              return 0
+            }
+            timed() { # label command...
+              local started=$SECONDS when=in-time
+              "${@:2}"
+              (( SECONDS - started <= 3 )) || when=late
+              echo "$1 $when"
+            }
+            notes_reset; note a; note b; show two-notes
+            notes_reset; show none
+            printf '{"a":1}' > "$D/a.json"
+            notes_reset; rc=0; value_at "$D/a.json" a || rc=$?; echo "read-with-no-note rc=$rc value=[$VALUE]"
+            notes_reset; x="$(note c)"; show in-a-subshell
+            rc=0; value_at "$D/a.json" a || rc=$?; echo "read-after-a-note-in-a-subshell rc=$rc value=[$VALUE]"
+            notes_reset; /usr/bin/mkfifo "$NOTES_FILE"; timed fifo-before note d; show fifo-before
+            notes_reset; /bin/ln -s "$D/linked" "$NOTES_FILE"; timed link-before note e; show link-before
+            notes_reset; note f; hooked read-stalls show read-stalls
+            notes_reset; note g
+            exec 9>"$D/held"
+            /usr/bin/lockf -t 0 9 || echo "no lock"
+            timed write-blocks hooked write-blocks note h
+            exec 9>&-
+            held=free
+            /usr/bin/lockf -k -t 0 "$D/held" /usr/bin/true 2>/dev/null || held=held
+            echo "write-blocks noted=$NOTED at-name=$(at_name) lock=$held"
+            /bin/cat "$NOTES_FILE" > /dev/null
+            held=free
+            /usr/bin/lockf -k -t 10 "$D/held" /usr/bin/true 2>/dev/null || held=held
+            echo "write-blocks read lock=$held"
+            /usr/bin/lockf -k -t 10 "$D/stall" /usr/bin/true || echo "the stalled read did not end"
+
+            """#).write(to: harness, atomically: true, encoding: .utf8)
+            runs.append((script, try fx.start(harness)))
+        }
+        let ended = waitUntil(40) { runs.allSatisfy { $0.run.process.hasExited } }
+        for (script, run) in runs {
+            if !run.process.hasExited { _ = run.process.signal(SIGKILL) }
+            let r = run.finish()
+            XCTAssertTrue(ended, "\(script): \(r.stdout)")
+            XCTAssertEqual(r.status, 0, "\(script): \(r.stderr)")
+            XCTAssertEqual(r.stdout.components(separatedBy: "\n"), [
+                "two-notes noted=1 made=yes [$'a\\nb\\n'] at-name=file linked=keep in-time",
+                "none noted=0 made=no at-name=none linked=keep in-time",
+                "read-with-no-note rc=0 value=[1]",
+                "in-a-subshell noted=0 made=yes [$'c\\n'] at-name=file linked=keep in-time",
+                "read-after-a-note-in-a-subshell rc=2 value=[]",
+                "fifo-before in-time",
+                "fifo-before noted=1 made=yes [''] at-name=fifo linked=keep in-time",
+                "link-before in-time",
+                "link-before noted=1 made=yes [''] at-name=link linked=keep in-time",
+                "read-stalls noted=1 made=yes [''] at-name=file linked=keep in-time",
+                "write-blocks in-time",
+                "write-blocks noted=1 at-name=fifo lock=held",
+                "write-blocks read lock=free",
+                "",
+            ], "\(script): \(r.stdout)")
+        }
+    }
+
+    func testSnapshotMakesItsCopyInsideTheTimedCallAndStopsAtItsLimit() throws {
+        let cases = ["plain", "fifo-after-rm", "link-after-rm", "read-only-after-rm", "missing-folder",
+                     "rm-fails", "rm-stalls", "cp-stalls", "slow-mktemp"]
+        var runs: [(script: String, run: ScriptFixture.Started)] = []
+        for script in ["backstop.sh", "uninstall.sh"] {
+            let text = try String(contentsOf: ScriptFixture.productionScripts.appendingPathComponent(script), encoding: .utf8)
+            let d = fx.root.appendingPathComponent("snapshot.\(script)", isDirectory: true)
+            let work = d.appendingPathComponent("work", isDirectory: true)
+            try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
+            let tools = """
+            #!/bin/bash
+            D='\(d.path)'
+            tool="${0##*/}"
+            mode="$(/bin/cat "$D/mode")"
+            last="${!#}"
+            [[ "$tool" != mktemp || "$mode" != slow-mktemp ]] || /bin/sleep 2.5
+            if [[ "$last" == "$D/work/copy" || "$last" == "$D/gone/copy" ]]; then
+              echo "$tool" >> "$D/calls"
+              case "$tool $mode" in
+                "rm rm-fails") exit 1 ;;
+                "rm rm-stalls"|"cp cp-stalls") exec /bin/sleep 30 ;;
+              esac
+            fi
+            case "$tool" in
+              rm) /bin/rm "$@" || exit ;;
+              cp) exec /bin/cp "$@" ;;
+              mktemp) exec /usr/bin/mktemp "$@" ;;
+            esac
+            if [[ "$last" == "$D/work/copy" ]]; then
+              case "$mode" in
+                fifo-after-rm) /usr/bin/mkfifo "$last" ;;
+                link-after-rm) /bin/ln -s "$D/linked" "$last" ;;
+                read-only-after-rm) : > "$last"; /bin/chmod 0400 "$last" ;;
+              esac
+            fi
+            exit 0
+
+            """
+            for tool in ["rm", "cp", "mktemp"] {
+                let url = d.appendingPathComponent(tool)
+                try tools.write(to: url, atomically: true, encoding: .utf8)
+                try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+            }
+            let harness = d.appendingPathComponent("snapshot.sh")
+            try ("set -uo pipefail\n" + Self.readLayerSource(text, script: script, work: work) + #"""
+            D='\#(d.path)'
+            RM="$D/rm" CP="$D/cp" MKTEMP="$D/mktemp"
+            READ_TIMEOUT_SECONDS=1 CALL_TIMEOUT_SECONDS=1 READ_GRACE_SECONDS=1
+            printf 'journal\n' > "$D/source"
+            for mode in \#(cases.joined(separator: " ")); do
+              printf '%s' "$mode" > "$D/mode"
+              : > "$D/calls"
+              /bin/rm -rf "$D/work/copy"
+              printf 'keep\n' > "$D/linked"
+              copy="$D/work/copy"
+              [[ "$mode" != missing-folder ]] || copy="$D/gone/copy"
+              started=$SECONDS
+              rc=0
+              snapshot "$D/source" "$copy" || rc=$?
+              took=$(( SECONDS - started ))
+              when=in-time
+              (( took <= 4 )) || when="after $took s"
+              what=none
+              if [[ -L "$copy" ]]; then what=link
+              elif [[ -p "$copy" ]]; then what=fifo
+              elif [[ -f "$copy" ]]; then what="file:$(/bin/cat "$copy" 2>/dev/null || echo unreadable)"
+              fi
+              calls="$(/usr/bin/paste -s -d , "$D/calls")"
+              echo "$mode rc=$rc copy=$what linked=$(/bin/cat "$D/linked") calls=[$calls] $when"
+            done
+
+            """#).write(to: harness, atomically: true, encoding: .utf8)
+            runs.append((script, try fx.start(harness)))
+        }
+        let ended = waitUntil(40) { runs.allSatisfy { $0.run.process.hasExited } }
+        for (script, run) in runs {
+            if !run.process.hasExited { _ = run.process.signal(SIGKILL) }
+            let r = run.finish()
+            XCTAssertTrue(ended, "\(script): \(r.stdout)")
+            XCTAssertEqual(r.status, 0, "\(script): \(r.stderr)")
+            let late = script == "backstop.sh" ? "124" : "126"
+            let readOnly = getuid() == 0
+                ? "read-only-after-rm rc=0 copy=file:journal linked=keep calls=[rm,cp] in-time"
+                : "read-only-after-rm rc=1 copy=file: linked=keep calls=[rm] in-time"
+            XCTAssertEqual(r.stdout.components(separatedBy: "\n"), [
+                "plain rc=0 copy=file:journal linked=keep calls=[rm,cp] in-time",
+                "fifo-after-rm rc=1 copy=fifo linked=keep calls=[rm] in-time",
+                "link-after-rm rc=1 copy=link linked=keep calls=[rm] in-time",
+                readOnly,
+                "missing-folder rc=1 copy=none linked=keep calls=[rm] in-time",
+                "rm-fails rc=1 copy=none linked=keep calls=[rm] in-time",
+                "rm-stalls rc=124 copy=none linked=keep calls=[rm] in-time",
+                "cp-stalls rc=124 copy=file: linked=keep calls=[rm,cp] in-time",
+                "slow-mktemp rc=\(late) copy=none linked=keep calls=[] in-time",
+                "",
+            ], "\(script): \(r.stdout)")
+        }
     }
 
     /// The two scripts carry the same reader, comment and all.
@@ -3919,7 +4422,9 @@ final class RecoveryScriptTests: XCTestCase {
     /// such an entry. "resumed" clears it. The binary's parent is the
     /// backstop shell itself: no supervisor process sits between them that
     /// could reap it before the shell decides whether to signal it. Its
-    /// standard input and output are files with no name (see pin_output).
+    /// standard input is a pipe (a FIFO with no name, unlike one made with
+    /// mkfifo) from a process of the shell's, and its standard output a
+    /// file with no name, pinned before the recovery lock (see pin_output).
     func testMicrosecondEntryIsHandedToTheAppBinaryWithItsFullIdentity() throws {
         let started = 1_789_388_423
         try writeMicrosecondEntry(pid: 5100, started: started, micros: 654_321)
@@ -3934,10 +4439,10 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(fx.log().contains("SIGCONT sent to pid 5100 by the app binary"), fx.log())
         let parent = try String(contentsOf: fx.root.appendingPathComponent("insomnia.ppid"), encoding: .utf8)
         XCTAssertEqual(parent.trimmingCharacters(in: .whitespacesAndNewlines), String(fx.lastPid), "the binary is not a direct child of the backstop shell")
-        // Its input and its answer are files with no name, which nothing
-        // else can open, write or replace.
+        // Its input and its answer have no name, so nothing else can open,
+        // write or replace them.
         let io = try String(contentsOf: fx.root.appendingPathComponent("insomnia.io"), encoding: .utf8)
-        XCTAssertEqual(io, "0 Regular File\n0 Regular File\n")
+        XCTAssertEqual(io, "0 Fifo File\n0 Regular File\n")
     }
 
     /// Microseconds of 0 are an identity too (the key is present), not a
@@ -4272,11 +4777,11 @@ final class RecoveryScriptTests: XCTestCase {
     func testAppBinaryThatDoesNotAnswerIsStoppedOnTimeWhenEveryPollIsSlow() throws {
         try writeMicrosecondEntry(pid: 5311, started: 1_789_388_423, micros: 11)
         fx.setMode("insomnia", "hang")
+
+        let started = Date()
         var phases = PhaseTimes()
         let script = try phases.time("patched copy") { try backstop(commandTimeout: 4) }
         let path = try phases.time("slow sleep ready") { try fx.slowPollingPath() }
-
-        let started = Date()
         let r = try fx.run(script, extraEnvironment: ["PATH": path])
         let elapsed = Date().timeIntervalSince(started)
         let timing = slowPollTiming(phases, started: started, elapsed: elapsed, commandStartedFile: "insomnia.ppid", command: "the binary")
@@ -4652,11 +5157,13 @@ final class RecoveryScriptTests: XCTestCase {
     /// gets the pid and then the end of the pipe, with no status, so it
     /// cannot tell whether the command still runs: it logs the pid, signals
     /// nothing, and stops the transaction (journal and session kept, no
-    /// second undo). Once the run has exited nothing holds the recovery lock,
-    /// though the command still runs: that is what a SIGKILL to the
-    /// supervisor costs (see supervise_command). No pid or status goes to a
-    /// file, so the next run, after the command has ended, finds no file of
-    /// the call's.
+    /// second undo). The command's keeper (see keep_lock) still holds the
+    /// recovery lock once the run has exited: a backstop run started then
+    /// gives up on the lock (75) and runs nothing, and the app's own
+    /// attempt (RecoveryLock.tryAcquire, as Start makes it) gets nothing.
+    /// The keeper never signals the command, and lets go of the lock only
+    /// once the command has ended. No pid or status goes to a file, so the
+    /// next run, after the command has ended, finds no file of the call's.
     func testASupervisorKilledWithSigkillLeavesTheTransactionStoppedAndSignalsNothing() throws {
         try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
         try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":true,"frozenProcesses":[],"dockerFrozen":false}"#)
@@ -4676,13 +5183,19 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(log.contains("(pid \(command)): its supervisor reported no result within 6s"), "the pid is only logged: \(log)")
         XCTAssertTrue(log.contains("recovery stopped"), log)
         XCTAssertNil(fx.commandEnded(), "the command still runs")
-        XCTAssertTrue(try fx.lockIsFree(), "with its supervisor killed, nothing holds the lock for the live command")
+        XCTAssertFalse(try fx.lockIsFree(), "with its supervisor killed, the keeper holds the lock for the live command")
+        fx.setMode("sudo", "ok")
+        fx.clearCalls()
+        let blocked = try fx.run(fx.backstop)
+        XCTAssertEqual(blocked.status, 75, "no retry while the command lives: \(blocked.stderr)")
+        XCTAssertEqual(fx.calls(), [], "the retry ran nothing")
+        XCTAssertNil(try RecoveryLock(url: fx.lock).tryAcquire(), "Start cannot take the lock while the command lives")
+        XCTAssertNil(fx.commandEnded(), "the keeper signaled nothing")
 
         fx.releaseCommand()
         XCTAssertTrue(waitUntil(10) { self.fx.commandEnded() != nil })
         XCTAssertEqual(fx.commandEnded(), "released")
-        fx.setMode("sudo", "ok")
-        fx.clearCalls()
+        XCTAssertTrue(try fx.waitUntilLockIsFree(5), "the keeper lets go once the command has ended")
         let after = try fx.run(fx.backstop)
         XCTAssertEqual(after.status, 0, after.stderr + fx.log())
         XCTAssertEqual(fx.calls(), ["sudo -n \(fx.fakePmset) -a disablesleep 0", "sudo -n \(fx.fakePmset) -b lowpowermode 0"])
@@ -4702,11 +5215,11 @@ final class RecoveryScriptTests: XCTestCase {
         try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
         try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":true,"frozenProcesses":[],"dockerFrozen":false}"#)
         fx.setMode("sudo", "logs-term")
+
+        let started = Date()
         var phases = PhaseTimes()
         let script = try phases.time("patched copy") { try backstop(commandTimeout: 4) }
         let path = try phases.time("slow sleep ready") { try fx.slowPollingPath() }
-
-        let started = Date()
         let r = try fx.run(script, extraEnvironment: ["PATH": path])
         let elapsed = Date().timeIntervalSince(started)
         let timing = slowPollTiming(phases, started: started, elapsed: elapsed, commandStartedFile: "sudo.hung.pid", command: "the sudo pmset")
@@ -4879,16 +5392,18 @@ final class RecoveryScriptTests: XCTestCase {
 
     /// Where the time of a slow-poll test went, for its failure message: the
     /// fixture (made before the test, the fakes' ready runs and the scripts'
-    /// parse included), the test's own steps before its run (`phases`), the
-    /// run split where the hung command started (the modification time of
-    /// `commandStartedFile`, which the fake writes once as it starts): the
-    /// script's own work before the command, then the command's limit, its
-    /// SIGTERM, any grace and the reap or report up to the run's end; and
-    /// the slow `sleep` calls by what each asked for. It is printed too, so
-    /// the test log has it for a run that passed.
+    /// parse included), the test's own steps before its run (`phases`),
+    /// which its clock includes, as it did when they were arguments to the
+    /// run, the time from that clock split where the hung command started
+    /// (the modification time of `commandStartedFile`, which the fake writes
+    /// once as it starts): those steps and the script's own work before the
+    /// command, then the command's limit, its SIGTERM, any grace and the
+    /// reap or report up to the run's end; and the slow `sleep` calls by
+    /// what each asked for. It is printed too, so the test log has it for a
+    /// run that passed.
     private func slowPollTiming(_ phases: PhaseTimes, started: Date, elapsed: TimeInterval, commandStartedFile: String, command: String, test: String = #function) -> String {
         var run = PhaseTimes()
-        run.add("run", elapsed)
+        run.add("from the clock, the steps before the run included", elapsed)
         let marker = fx.root.appendingPathComponent(commandStartedFile).path
         if let commandStarted = (try? FileManager.default.attributesOfItem(atPath: marker))?[.modificationDate] as? Date {
             let before = commandStarted.timeIntervalSince(started)
@@ -6423,10 +6938,10 @@ final class RecoveryScriptTests: XCTestCase {
     func testInstallGivesUpOnAHungSudoOnTimeWhenEveryPollIsSlow() throws {
         try writePreviousPair()
         fx.setMode("sudo", "rule-check-hangs")
-        var phases = PhaseTimes()
-        let path = try phases.time("slow sleep ready") { try fx.slowPollingPath() }
 
         let started = Date()
+        var phases = PhaseTimes()
+        let path = try phases.time("slow sleep ready") { try fx.slowPollingPath() }
         let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": ScriptFixture.account, "PATH": path])
         let elapsed = Date().timeIntervalSince(started)
         let timing = slowPollTiming(phases, started: started, elapsed: elapsed, commandStartedFile: "sudo.hung.pid", command: "the sudo check")
@@ -11149,7 +11664,9 @@ final class RecoveryScriptTests: XCTestCase {
     /// same layer and check the journal and the session with the same
     /// functions, all three read an Info.plist's version the same way and
     /// read back what a bounded call printed through the same text (from
-    /// the comment on it to take_output), and
+    /// the comment on it to take_output) and keep the recovery lock for a
+    /// privileged command that outlives its supervisor with the same keeper
+    /// (keep_lock and pid_gone), and
     /// install.sh and uninstall.sh run the backstop and every other bounded
     /// call, report a call whose output could not be read, and judge whose
     /// the rule is the same way.
@@ -11183,6 +11700,11 @@ final class RecoveryScriptTests: XCTestCase {
         let layer = try readBack(install, "install.sh")
         XCTAssertEqual(try readBack(uninstall, "uninstall.sh"), layer)
         XCTAssertEqual(try readBack(backstop, "backstop.sh"), layer)
+        for name in ["pid_gone", "keep_lock"] {
+            let keeper = try Self.shellFunction(name, in: backstop, "backstop.sh")
+            XCTAssertEqual(try Self.shellFunction(name, in: install, "install.sh"), keeper, name)
+            XCTAssertEqual(try Self.shellFunction(name, in: uninstall, "uninstall.sh"), keeper, name)
+        }
     }
 
     // MARK: - A process named Insomnia whose owner cannot be read

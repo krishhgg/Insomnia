@@ -71,6 +71,10 @@ STAT=/usr/bin/stat
 # What root's shell reads access control lists with (r_acl_reader): no
 # module, only its own fgetattrlist call, read only, never a change.
 PERL=/usr/bin/perl
+# The shell a call that may outlive its supervisor's copy of fd 9 starts in:
+# it sends its own pid to the call's keeper before it runs the call (see
+# supervise).
+BASH_PATH=/bin/bash
 # What root's shell asks whether an access control list entry is root's own
 # (r_root): read only, never a change.
 DSMEMBERUTIL=/usr/bin/dsmemberutil
@@ -165,8 +169,8 @@ command_line() { local line; line="$(printf '%q ' "$@")"; printf '%s' "${line% }
 # started, is in BOUNDED_PID. A 125 says nothing about what the call did or
 # may still do, so no caller takes it for a call that failed and changed
 # nothing; the supervisor keeps the recovery lock until the call has ended
-# and been reaped. 126 when no file for its output could be made, and the
-# call was not made.
+# and been reaped. 126 when no file for its output could be made, or making
+# it took the whole limit, and the call was not made.
 # Its combined output is read back once, inside the supervisor, after the
 # call has been reaped (see pin_output): byte for byte in READ_TEXT and
 # READ_HEAD, read_fd3's status in BOUNDED_READ (0 read whole, 1 with a NUL
@@ -212,12 +216,14 @@ BOUNDED_PID=""
 BOUNDED_LIMIT=""
 BOUNDED_TERM_ONLY=""
 BOUNDED_OWN_GROUP=""
+BOUNDED_NOTED=0
 bounded() { # command args...
-  local limit="${BOUNDED_LIMIT:-$CALL_TIMEOUT_SECONDS}" term_only=0 deadline pid="" rc=""
+  local limit="${BOUNDED_LIMIT:-$CALL_TIMEOUT_SECONDS}" term_only=0 deadline pid="" rc="" noted=0
   if [[ "$1" == "$SUDO" || -n "${BOUNDED_TERM_ONLY:-}" ]]; then term_only=1; fi
   BOUNDED_OUTPUT=""
   BOUNDED_READ=2
   BOUNDED_PID=""
+  BOUNDED_NOTED=0
   READ_TEXT=""
   READ_HEAD=""
   # The supervisor's limit (at most a second over), then at least two
@@ -229,10 +235,18 @@ bounded() { # command args...
     if [[ -n "${BOUNDED_OWN_GROUP:-}" ]]; then set -m; fi
     supervise "$limit" "$term_only" "$@" </dev/null &
     set +m
+    settle "$!"
   )
   if pipe_field "$deadline" && [[ "$FIELD" =~ ^[0-9]*$ ]]; then
     pid="$FIELD"
-    if pipe_field "$deadline" && [[ "$FIELD" =~ ^[0-9]{1,3}$ ]] && (( 10#$FIELD <= 255 )); then rc=$(( 10#$FIELD )); fi
+    if pipe_field "$deadline"; then
+      if [[ "$FIELD" =~ ^[0-9]{1,3}$ ]] && (( 10#$FIELD <= 255 )); then
+        rc=$(( 10#$FIELD ))
+      elif [[ -z "$pid" && "$FIELD" == noted ]]; then
+        rc=2
+        noted=1
+      fi
+    fi
   fi
   if [[ -z "$rc" ]]; then
     # The pid is for messages only: nothing here signals it.
@@ -243,6 +257,15 @@ bounded() { # command args...
   BOUNDED_READ=0
   take_output "$(( SECONDS + READ_GRACE_SECONDS ))" || BOUNDED_READ=$?
   exec 5<&-
+  if (( BOUNDED_READ == 3 )); then
+    # The status came, but the supervisor was not seen to finish: it may
+    # still hold the lock and what it sent is not taken.
+    BOUNDED_READ=2
+    BOUNDED_PID="$pid"
+    return 125
+  fi
+  # shellcheck disable=SC2034  # uninstall.sh's readers use it; install.sh shares this text
+  BOUNDED_NOTED=$noted
   BOUNDED_OUTPUT="${READ_HEAD%$'\n'}"
   return "$rc"
 }
@@ -254,6 +277,43 @@ bounded() { # command args...
 group_gone() { # process group id
   # shellcheck disable=SC2016  # $ARGV and $! are perl's
   "$PERL" -e 'kill(0, -$ARGV[0]) and exit 1; exit($!{ESRCH} ? 0 : 1)' -- "$1" 2>/dev/null
+}
+# Whether no process has pid $1, by kill with signal 0, which sends
+# nothing: only "No such process" says so. A process this account may not
+# signal (one running as root) is still there.
+pid_gone() { # pid
+  local said
+  said="$(kill -0 "$1" 2>&1)" && return 1
+  [[ "$said" == *"No such process"* ]]
+}
+# The keeper of one call that may outlive its supervisor's copy of fd 9
+# (see supervise), a process substitution the supervisor starts before the
+# call. It holds fd 9 (the recovery lock) and ignores SIGTERM, SIGHUP and
+# SIGPIPE, as the supervisor does, so the lock stays held while the call may
+# run even after a SIGKILL to the supervisor. It reads two fields from the
+# pipe on its standard input: the call's pid, which the call sends itself
+# before it runs anything, and "reaped", which the supervisor sends once it
+# has reaped the call. Then it exits. When the pipe ends without "reaped",
+# the supervisor is gone without having reaped the call, and the keeper
+# keeps the lock until no process has that pid (pid_gone), checking every
+# half second; it never signals it. While the call runs its pid cannot go to
+# another process; once it has ended, another process may take the pid
+# before the next check, and the keeper then waits for that one too. A pipe
+# that ends before any pid, or with "reaped" first, says the call never ran:
+# it sends its pid before it runs the command and closes its end of the pipe
+# only then. The keeper's standard output is the supervisor's pipe to its
+# caller, so that pipe ends only once the keeper is gone too; the keeper
+# closes it as soon as the supervisor is gone, so the caller is not kept
+# waiting for a status that cannot come.
+keep_lock() {
+  local cpid="" word=""
+  IFS= read -r -d '' cpid || return 0
+  [[ "$cpid" != reaped ]] || return 0
+  if IFS= read -r -d '' word && [[ "$word" == reaped ]]; then return 0; fi
+  exec 1>/dev/null
+  until [[ "$cpid" =~ ^[1-9][0-9]*$ ]] && pid_gone "$cpid"; do
+    sleep 0.5
+  done
 }
 # The supervising process of one bounded() call; it runs in the background,
 # its standard output the pipe bounded() reads. Down that pipe it sends, as
@@ -284,6 +344,27 @@ group_gone() { # process group id
 # run's group. It gets none of the descriptors the supervisor reads from or
 # writes to but its output. errexit is off here: a failed write must not end
 # the supervisor while its call runs.
+# The limit counts from the supervisor's start, so making the file for the
+# output comes out of the call's time; when that took the whole limit, the
+# call is not made, and the status is 126. A read whose caller passes
+# BOUNDED_NOTES (a notes file, see notes_reset in uninstall.sh) is not made
+# either when a note is in that file already: the status is then "noted"
+# with no pid, which bounded() returns as 2 with BOUNDED_NOTED=1. A call
+# that writes a file of its own, BOUNDED_NEW_FILE (snapshot's copy), has the
+# file opened read-write by the call's own process before the command runs,
+# inside the call's limit: that makes it when it is missing, does not wait
+# at a FIFO, and must leave a regular file, or the process exits 1 and the
+# command does not run.
+# sudo closes every descriptor but its standard ones before it runs its
+# command, fd 9 too, and a sudo or a command still running after its
+# SIGTERM is never sent SIGKILL. So for each such call (BOUNDED_TERM_ONLY
+# or sudo, unless it has a group of its own) the supervisor first starts a
+# keeper (keep_lock), a second holder of fd 9 that outlives a supervisor
+# killed with SIGKILL, and the call starts in a bash of its own (BASH_PATH)
+# that sends its own pid to the keeper and closes its end of the keeper's
+# pipe before it runs the command in its place (exec, so the pid stays the
+# call's): no such call runs before its keeper has its pid. The supervisor
+# sends the keeper "reaped" once it has reaped the call.
 # A call with BOUNDED_OWN_GROUP (the backstop) starts through perl, which
 # makes it the leader of a new process group, with its pid as the group's
 # id, before it runs the command. Bash's record of the job is unchanged, so
@@ -299,28 +380,52 @@ group_gone() { # process group id
 # that pid and lead a group with it before the next check, and the
 # supervisor then waits for that group too.
 supervise() { # limit term-only command args...
-  local limit="$1" term_only="$2" base cpid rc=0 status deadline polls=0
+  local limit="$1" term_only="$2" base cpid rc=0 status deadline polls=0 kept=0
   shift 2
   set +e
   trap '' TERM HUP PIPE
+  deadline=$(( SECONDS + limit ))
+  if [[ -n "${BOUNDED_NOTES:-}" && -s "$BOUNDED_NOTES" ]]; then
+    printf '%s\0' "" noted 2 "" "" end
+    return 0
+  fi
   base="$("$MKTEMP" "$WORK/call.XXXXXX" 2>/dev/null)"
   if [[ -z "$base" ]] || ! pin_output "$base"; then
     printf '%s\0' "" 126 2 "" "" end
     [[ -z "$base" ]] || "$RM" -f "$base" 2>/dev/null
-    return
+    return 0
+  fi
+  if (( term_only )) && [[ -z "${BOUNDED_OWN_GROUP:-}" ]]; then
+    if ! exec 8> >(exec 3<&- 4>&- 6<&- 7<&- 8>&-; keep_lock); then
+      printf '%s\0' "" 126 2 "" "" end
+      return 0
+    fi
+    kept=1
+  fi
+  if (( SECONDS > deadline )); then
+    printf '%s\0' "" 126 2 "" "" end
+    (( ! kept )) || printf 'reaped\0' >&8
+    return 0
   fi
   set -m
   set +m
-  if [[ -n "${BOUNDED_OWN_GROUP:-}" ]]; then
-    # shellcheck disable=SC2016  # $ARGV is perl's
-    ( trap - TERM HUP PIPE; exec "$PERL" -e 'setpgrp(0, 0) or exit 127; exec { $ARGV[0] } @ARGV; exit 127' -- "$@" ) </dev/null >&4 2>&4 3<&- 4>&- 6<&- 7<&- &
-  else
-    ( trap - TERM HUP PIPE; exec "$@" ) </dev/null >&4 2>&4 3<&- 4>&- 6<&- 7<&- &
-  fi
+  # shellcheck disable=SC2016  # $ARGV is perl's; $$ and $@ the inner bash's
+  (
+    trap - TERM HUP PIPE
+    (( kept )) || exec 8>&-
+    if [[ -n "${BOUNDED_NEW_FILE:-}" ]]; then
+      { : 1<>"$BOUNDED_NEW_FILE"; } 2>/dev/null && [[ -f "$BOUNDED_NEW_FILE" && ! -L "$BOUNDED_NEW_FILE" ]] || exit 1
+    fi
+    if [[ -n "${BOUNDED_OWN_GROUP:-}" ]]; then
+      exec "$PERL" -e 'setpgrp(0, 0) or exit 127; exec { $ARGV[0] } @ARGV; exit 127' -- "$@"
+    elif (( kept )); then
+      exec "$BASH_PATH" -c 'printf "%s\0" "$$" >&8 && exec 8>&- && exec "$@"; exit 126' bash "$@"
+    fi
+    exec "$@"
+  ) </dev/null >&4 2>&4 3<&- 4>&- 6<&- 7<&- &
   cpid=$!
   exec 4>&-
   printf '%s\0' "$cpid"
-  deadline=$(( SECONDS + limit ))
   while kill -0 "$cpid" 2>/dev/null && (( SECONDS <= deadline )); do
     if (( polls < 50 )); then sleep 0.002; else sleep 0.05; fi
     polls=$((polls + 1))
@@ -343,6 +448,8 @@ supervise() { # limit term-only command args...
     status=0
     wait "$cpid" 2>/dev/null || status=$?
   done
+  (( ! kept )) || printf 'reaped\0' >&8
+  exec 8>&-
   (( rc == 124 )) || rc=$status
   if [[ -n "${BOUNDED_OWN_GROUP:-}" ]]; then
     polls=0
@@ -350,7 +457,7 @@ supervise() { # limit term-only command args...
       if (( polls >= 10 )); then
         exec 1>&-
         until group_gone "$cpid"; do sleep 0.5; done
-        return
+        return 0
       fi
       sleep 0.1
       polls=$((polls + 1))
@@ -393,7 +500,10 @@ read_result() { # status
 # FIFO or a file it puts there instead fails the checks.) Once the call has
 # been reaped, the supervisor reads fd 3 to its end (read_fd3) and sends the
 # result down the pipe its caller reads (send_output), and the caller waits
-# for it no longer than its own deadline (take_output). The pid and the
+# for it no longer than its own deadline (take_output). The process
+# substitution that started the supervisor with `&` then waits for it and
+# sends whether it returned 0 (settle), so the caller takes the output only
+# from a supervisor that has returned and been reaped. The pid and the
 # status come down the same pipe. So the caller opens no file of the call's
 # and reads none, and a read that stalls holds the supervisor, which keeps
 # the recovery lock while it lives, while the caller counts the output as
@@ -469,6 +579,18 @@ send_output() {
   (( status == 1 )) || READ_HEAD=""
   printf '%s\0' "$status" "$READ_TEXT" "$READ_HEAD" end
 }
+# The last field down a pipe whose sender a process substitution started
+# with `&` (a supervisor, a read unit, or a process that reads or writes the
+# notes): "settled" and the sender's exit status, which this shell, the
+# sender's parent, takes with wait once the sender has exited. So a
+# "settled 0" says the sender returned and has been reaped, and a sender
+# that was killed, or a wait that failed, gives another word. Nothing here
+# reads a pid or a status from a file.
+settle() { # pid
+  local status=0
+  wait "$1" || status=$?
+  printf '%s\0' "settled $status"
+}
 # The next field from fd 5, the pipe from a supervisor, in FIELD: 1 when no
 # whole field came by the deadline, a time on bash's SECONDS clock (the wait
 # lasts until the clock has gone past it), or the pipe ended first.
@@ -479,24 +601,47 @@ pipe_field() { # deadline
   (( seconds > 0 )) || return 1
   IFS= read -r -d '' -t "$seconds" -u 5 FIELD
 } 2>/dev/null
+# Whether fd 5 ends, with nothing more on it, no later than the deadline. A
+# pipe ends once every process that holds its write end has exited or closed
+# it, so a 0 here says the sender is gone. 1 when a byte came first (one more
+# field, or part of one), when the deadline came first, or when the read
+# failed: bash leaves the variable of a read that timed out or failed unset,
+# and sets it, to what came before, at the end of the pipe.
+pipe_ends() { # deadline
+  local seconds=$(( $1 - SECONDS + 1 )) part rc=0
+  (( seconds > 0 )) || return 1
+  unset -v part
+  IFS= read -r -d '' -t "$seconds" -u 5 part || rc=$?
+  (( rc == 1 )) && [[ -n "${part+set}" && -z "$part" ]]
+} 2>/dev/null
+# "settled 0" from fd 5 (see settle) and then the end of the pipe, both no
+# later than the deadline: the sender returned 0 and was reaped, and no
+# process holds the pipe open any more.
+pipe_settles() { # deadline
+  pipe_field "$1" && [[ "$FIELD" == "settled 0" ]] && pipe_ends "$1"
+}
 # The four fields send_output sends, from fd 5, in READ_TEXT and READ_HEAD,
-# waiting no later than the deadline: their status (see read_fd3), or 2 when
-# they did not all come, in that form, by then. It then waits, no later than
-# the deadline either, for the end of the pipe, which comes once the sender
-# has exited (or closed it), so a sender that has sent all it had is gone,
-# with the lock it kept, before the caller goes on.
+# then "settled 0" and the end of the pipe (pipe_settles), all no later than
+# the deadline. Their status (see read_fd3) only when all of that came in
+# that form, with nothing more on the pipe: the sender has returned and been
+# reaped, and every process that held the pipe (and with it the lock) has
+# exited or closed it. 3 otherwise, with READ_TEXT and READ_HEAD empty: a
+# field that did not come or came in another form, a sender that did not
+# settle with 0, a byte after the last field, or a pipe still open at the
+# deadline. Whether the sender has finished, and what it may still do, is
+# then not known, and no caller takes the text it sent.
 take_output() { # deadline
   local status text head
   READ_TEXT=""
   READ_HEAD=""
-  pipe_field "$1" && [[ "$FIELD" =~ ^[012]$ ]] || return 2
+  pipe_field "$1" && [[ "$FIELD" =~ ^[012]$ ]] || return 3
   status="$FIELD"
-  pipe_field "$1" || return 2
+  pipe_field "$1" || return 3
   text="$FIELD"
-  pipe_field "$1" || return 2
+  pipe_field "$1" || return 3
   head="$FIELD"
-  pipe_field "$1" && [[ "$FIELD" == end ]] || return 2
-  pipe_field "$1" || true
+  pipe_field "$1" && [[ "$FIELD" == end ]] || return 3
+  pipe_settles "$1" || return 3
   (( status == 1 )) || head="$text"
   READ_TEXT="$text"
   READ_HEAD="$head"
