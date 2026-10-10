@@ -25,8 +25,10 @@ final class RecoveryScriptTests: XCTestCase {
         fx = try ScriptFixture()
     }
 
+    // A fixture that could not be made fails its test in setUp; the test
+    // process goes on to the next one.
     override func tearDown() {
-        fx.destroy()
+        fx?.destroy()
         fx = nil
     }
 
@@ -1819,8 +1821,8 @@ final class RecoveryScriptTests: XCTestCase {
                 XCTAssertEqual(symlink(target, self.fx.receipt), 0)
             }, { unlinkIfPresent(self.fx.receipt); unlinkIfPresent(self.fx.receipts + "/target") }, "is missing, is not the 82-byte file"),
             ("a writable folder", { XCTAssertEqual(chmod(self.fx.receipts, 0o775), 0) }, { XCTAssertEqual(chmod(self.fx.receipts, 0o755), 0) }, "someone other than root can change it or a folder above it"),
-            // Round 30 F6: stand-ins the scripts' ls shows, where these two
-            // were real entries before; no real list changes.
+            // Round 30 F6: stand-ins the fake app binary reads (writeFakes),
+            // where these two were real entries before; no real list changes.
             ("an allow entry on the receipt", { try self.fx.writeReceiptEntries([mine, write]) },
              { try self.fx.writeReceiptEntries([mine]) }, "does not have exactly one access control entry, the one that lets uid \(getuid()) read it and nothing else"),
             ("an allow entry on the folder", { try self.fx.writeFolderEntries([self.fx.receipts: ["user:\(user) allow add_file"]]) },
@@ -1851,18 +1853,19 @@ final class RecoveryScriptTests: XCTestCase {
     }
 
     /// F3 (round 28). A receipt with a mode other than 600, any list of
-    /// access control entries but the one install.sh adds, or a list ls
-    /// cannot read shows nothing: sleep is restored and the start stays
-    /// journaled with its claim, and the run changes neither the receipt
-    /// nor its list. The lists are stand-ins the scripts' ls shows
-    /// (ScriptFixture.receiptEntries); no real list changes.
+    /// access control entries but the one install.sh adds, or a list the
+    /// app binary cannot read whole shows nothing: sleep is restored and
+    /// the start stays journaled with its claim, and the run changes
+    /// neither the receipt nor its list. The lists are stand-ins the fake
+    /// app binary reads (ScriptFixture.receiptEntries); no real list
+    /// changes.
     func testBackstopTrustsOnlyAReceiptOfModeSixHundredWithTheEntryInstallShAdds() throws {
         let mine = [AccessEntry.installed(for: getuid())]
         let mode = "is missing, is not the 82-byte file install.sh made, mode 600, or someone other than root can change it or a folder above it"
-        let list = "\(fx.receipt) does not have exactly one access control entry, the one that lets uid \(fx.uid) read it and nothing else, or its list could not be read"
+        let list = "\(fx.receipt) does not have exactly one access control entry, the one that lets uid \(fx.uid) read it and nothing else"
         var cases: [(name: String, mode: mode_t, entries: [AccessEntry], listFails: Bool, says: String)] = [0o644, 0o640, 0o400].map { ("mode \(String($0, radix: 8))", $0, mine, false, mode) }
         cases += TestReceipts.refusedLists.map { ($0.name, 0o600, $0.entries, false, list) }
-        cases.append(("a list ls cannot read", 0o600, mine, true, list))
+        cases.append(("a list the app binary cannot read", 0o600, mine, true, "the access control list of \(fx.receipt) could not be read whole (unreadable 13)"))
         let fails = fx.receiptEntries + ".fails"
         for c in cases {
             removeIfPresent(fx.logFile)
@@ -1891,17 +1894,19 @@ final class RecoveryScriptTests: XCTestCase {
         try assertSettled(sleepRestored: false)
     }
 
-    /// F6 (round 30). What the scripts cannot see. ls(1) never prints
+    /// F6 (round 30), R35-5. What ls(1) cannot show. It never prints
     /// synchronize, and prints delete_child and every inheritance flag but
     /// limit_inherit only for a folder (TestReceipts.lsText), and it skips
     /// an entry whose rights or flags it cannot read. A receipt whose entry
     /// differs from the one install.sh adds only there prints the same
-    /// listing, and the backstop trusts it, where the app's own check,
-    /// which reads every entry, right and flag, refuses it (and so does not
-    /// start with it). The lists are stand-ins as ls prints them; no real
-    /// list changes. This is the limit of a check that reads ls's text, not
-    /// a list that lets another account read the receipt.
-    func testBackstopSeesOnlyWhatLsPrintsOfTheReceiptsList() throws {
+    /// listing as the right one, which the backstop used to trust.
+    /// backstop.sh now asks the app binary, which reads every entry, right
+    /// and flag as the app's own check does, so it refuses each such
+    /// receipt as the app does: sleep is restored and the start stays
+    /// journaled with its claim. So does a list the binary reads only in
+    /// part. The lists are stand-ins the fake binary answers from
+    /// (writeFakes); no real list changes.
+    func testBackstopRefusesWhatLsCannotPrintOfTheReceiptsList() throws {
         let installed = AccessEntry.installed(for: getuid())
         var hidden: [(name: String, entry: AccessEntry)] = ["synchronize", "delete_child"].map {
             var entry = installed
@@ -1913,24 +1918,145 @@ final class RecoveryScriptTests: XCTestCase {
             entry.flags.insert($0)
             return ($0, entry)
         }
+        let refused = "\(fx.receipt) does not have exactly one access control entry, the one that lets uid \(fx.uid) read it and nothing else"
         for h in hidden {
             XCTAssertEqual(TestReceipts.lsText(h.entry), TestReceipts.lsText(installed), h.name)
             XCTAssertNotNil(SleepOffReceipts.receiptAccessProblem([h.entry], user: getuid()), "\(h.name): the app's check refuses it")
+            XCTAssertEqual(AccessListsCommand.word(.entries([h.entry]), user: getuid()), .allows, h.name)
             removeIfPresent(fx.logFile)
             fx.clearCalls()
-            try journalUnfinishedStart()
+            let nonce = try journalUnfinishedStart()
             try fx.writeReceiptEntries([h.entry])
 
             let r = try fx.run(fx.backstop)
 
-            XCTAssertEqual(r.status, 0, "\(h.name): \(r.stderr)")
-            try assertSettled(sleepRestored: false)
+            try assertKept(r, nonce: nonce, restored: true, saying: [refused, "an unfinished start could not be settled: "])
+            try fx.writeReceiptEntries([installed])
         }
+        removeIfPresent(fx.logFile)
+        fx.clearCalls()
+        let nonce = try journalUnfinishedStart()
+        try "incomplete\n".write(toFile: fx.receiptEntries + ".word", atomically: true, encoding: .utf8)
+
+        let r = try fx.run(fx.backstop)
+
+        try assertKept(r, nonce: nonce, restored: true, saying: ["the access control list of \(fx.receipt) could not be read whole (incomplete)", "an unfinished start could not be settled: "])
         try fx.writeReceiptEntries([installed])
     }
 
-    /// F3 (round 28). backstop.sh, uninstall.sh, install.sh and the root
-    /// command (both copies) read the receipt's list with one awk program.
+    /// The folders above `path` up to /, nearest first: the order in which
+    /// backstop.sh and uninstall.sh pass them to --access-lists.
+    private func foldersAbove(_ path: String) -> [String] {
+        var folders: [String] = []
+        var p = path
+        while let slash = p.lastIndex(of: "/") {
+            p = String(p[..<slash])
+            if p.isEmpty { break }
+            folders.append(p)
+        }
+        return folders + ["/"]
+    }
+
+    /// R35-5. backstop.sh reads the lists of the receipt and of each folder
+    /// above it, up to /, through the app binary's --access-lists mode: the
+    /// receipt first, then the folders nearest first, with the lifetime of
+    /// its other calls of the binary (COMMAND_TIMEOUT_SECONDS plus
+    /// KILL_GRACE_SECONDS, here 2). The control settles. A start whose
+    /// lists are not had whole is not settled: sleep is restored and the
+    /// start stays journaled with its claim, as for any receipt the checks
+    /// refuse. That holds for a binary that is not executable; an
+    /// Info.plist that does not declare the version (no key, version 2, no
+    /// Info.plist), when the binary is not run at all; a binary that does
+    /// not answer in time; an answer that is not one word per path, each
+    /// on a line that ends in a newline, with a status that agrees; one
+    /// longer than any valid answer, which is not read; one with a NUL
+    /// byte; and a folder whose list allows something (installed on a
+    /// folder too) or could not be read whole.
+    func testBackstopRefusesAReceiptWhoseListsTheAppBinaryDoesNotGiveWhole() throws {
+        let folders = foldersAbove(fx.receipt)
+        let n = folders.count + 1
+        let listsLog = fx.root.appendingPathComponent("insomnia.lists.log").path
+        let output = fx.root.appendingPathComponent("insomnia.lists.output")
+        let status = fx.root.appendingPathComponent("insomnia.lists.status")
+        let hang = fx.root.appendingPathComponent("insomnia.lists.hang")
+        let none = Array(repeating: "none", count: n - 1)
+        func answer(_ text: String, _ code: Int) -> () throws -> Void {
+            {
+                try text.write(to: output, atomically: true, encoding: .utf8)
+                try "\(code)\n".write(to: status, atomically: true, encoding: .utf8)
+            }
+        }
+        func words(_ list: [String], _ code: Int) -> () throws -> Void { answer(list.map { $0 + "\n" }.joined(), code) }
+        let unknown = "the access control lists of \(fx.receipt) and the folders above it are unknown: "
+        let notOne = unknown + "the app binary's answer is not one word for each of the \(n) paths "
+        let plist = { (version: String?) in { try ScriptFixture.infoPlist(resumeFrozenVersion: "1", accessListsVersion: version).write(to: self.fx.appInfo, atomically: true, encoding: .utf8) } }
+        let cases: [(name: String, prepare: () throws -> Void, says: String, ran: Bool)] = [
+            ("a binary that is not executable", { try self.fx.setFakeInsomniaExecutable(false) },
+             unknown + "the app binary that reads them, \(fx.fakeInsomnia.path), is missing or not executable", false),
+            ("an Info.plist without the version", plist(nil),
+             unknown + "\(fx.appInfo.path) does not declare InsomniaAccessListsVersion 1 ('': an older or newer build), so the app binary was not run", false),
+            ("an Info.plist with version 2", plist("2"),
+             unknown + "\(fx.appInfo.path) does not declare InsomniaAccessListsVersion 1 ('2': an older or newer build), so the app binary was not run", false),
+            ("no Info.plist", { try FileManager.default.removeItem(at: self.fx.appInfo) },
+             unknown + "\(fx.appInfo.path) does not declare InsomniaAccessListsVersion 1 ('': an older or newer build), so the app binary was not run", false),
+            ("no answer in time", { XCTAssertTrue(FileManager.default.createFile(atPath: hang.path, contents: nil)) },
+             unknown + "the app binary did not answer within 1s", true),
+            ("a word too few", words(["installed"] + none.dropLast(), 0), notOne + "(exit 0, output 'installed none", true),
+            ("a word too many", words(["installed"] + none + ["none"], 0), notOne + "(exit 0, output 'installed none", true),
+            ("no newline at the end", answer((["installed"] + none).joined(separator: "\n"), 0), notOne + "(exit 0, output 'installed none", true),
+            ("a word it does not know", words(["installed", "maybe"] + none.dropFirst(), 0), notOne + "(exit 0, output 'installed maybe none", true),
+            ("a word with a space after it", words(["installed "] + none, 0), notOne + "(exit 0, output 'installed  none", true),
+            ("unreadable 0", words(["unreadable 0"] + none, 1), notOne + "(exit 1, output 'unreadable 0 none", true),
+            ("a status that does not agree", words(["installed"] + none, 1), notOne + "(exit 1, output 'installed none", true),
+            ("a list not read whole with status 0", words(["unreadable 13"] + none, 0), notOne + "(exit 0, output 'unreadable 13 none", true),
+            ("usage", words(["usage"], 64), notOne + "(exit 64, output 'usage ')", true),
+            ("longer than any answer", answer(String(repeating: "x", count: n * 24 + 1), 0), notOne + "(exit 0, \(n * 24 + 1) bytes)", true),
+            ("a NUL byte", { try (Data("installed\n".utf8) + Data([0]) + Data(none.map { $0 + "\n" }.joined().utf8)).write(to: output); try "0\n".write(to: status, atomically: true, encoding: .utf8) },
+             unknown + "the app binary's answer could not be read whole", true),
+            ("its folder allows something", words(["installed", "allows"] + none.dropFirst(), 0),
+             "the folder of \(fx.receipt) or one above it (\(folders[0])) has an access control entry that allows changes", true),
+            ("its folder has the receipt's entry", words(["installed", "installed"] + none.dropFirst(), 0),
+             "the folder of \(fx.receipt) or one above it (\(folders[0])) has an access control entry that allows changes", true),
+            ("a folder read in part", words(["installed", "none", "incomplete"] + none.dropFirst(2), 1),
+             "the access control list of the folder of \(fx.receipt) or one above it (\(folders[1])) could not be read whole (incomplete)", true),
+            ("/ unreadable", words(["installed"] + none.dropLast() + ["unreadable 13"], 1),
+             "the access control list of the folder of \(fx.receipt) or one above it (/) could not be read whole (unreadable 13)", true),
+        ]
+        XCTAssertGreaterThanOrEqual(n, 4, "the receipt, its folder, a folder above it and /")
+        for c in cases {
+            removeIfPresent(fx.logFile)
+            fx.clearCalls()
+            unlinkIfPresent(listsLog)
+            let nonce = try journalUnfinishedStart()
+            try c.prepare()
+
+            let r = try fx.run(fx.backstop)
+
+            try fx.setFakeInsomniaExecutable(true)
+            try plist("1")()
+            for file in [output, status, hang] { unlinkIfPresent(file.path) }
+            try assertKept(r, nonce: nonce, restored: true, saying: [c.says, "an unfinished start could not be settled: "])
+            XCTAssertEqual(FileManager.default.fileExists(atPath: listsLog), c.ran, "\(c.name): \(fx.log())")
+        }
+
+        removeIfPresent(fx.logFile)
+        fx.clearCalls()
+        unlinkIfPresent(listsLog)
+        try journalUnfinishedStart()
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 0, r.stderr)
+        try assertSettled(sleepRestored: false)
+        let lines = try String(contentsOfFile: listsLog, encoding: .utf8).split(separator: "\n").map(String.init)
+        XCTAssertFalse(lines.isEmpty)
+        XCTAssertEqual(Set(lines), ["--access-lists 2 \(fx.receipt) \(folders.joined(separator: " "))"])
+    }
+
+    /// F3 (round 28). install.sh and the root command (both copies) read
+    /// the receipt's list with one awk program. backstop.sh and
+    /// uninstall.sh run neither it nor ls: they ask the app binary
+    /// (R35-5, read_access_lists).
     /// Fed listings in ls's shapes (file_cmds ls/print.c, TestReceipts.lsText)
     /// through the real awk, it prints a name only for exactly ` 0:
     /// user:<name> allow read`, alone, under a regular file's line. Each
@@ -1938,10 +2064,16 @@ final class RecoveryScriptTests: XCTestCase {
     /// real id(1) answers here for this user and for daemon.
     func testEveryCopyReadsTheReceiptsListWithOneProgram() throws {
         let reader = "NR == 1 { k = /^-/ }; NR == 2 && k && /^ 0: user:[^ :]+ allow read$/ { n = substr($2, 6) }; END { if (NR == 2) print n }"
-        var copies = try ["backstop.sh", "uninstall.sh", "install.sh"].map { try String(contentsOf: ScriptFixture.productionScripts.appendingPathComponent($0), encoding: .utf8) }
-        copies += [AdministratorPrompt.rootCommand, try appleScriptEmbeddedRootCommand()]
+        let copies = [try String(contentsOf: ScriptFixture.productionScripts.appendingPathComponent("install.sh"), encoding: .utf8),
+                      AdministratorPrompt.rootCommand, try appleScriptEmbeddedRootCommand()]
         for (i, copy) in copies.enumerated() {
             XCTAssertEqual(copy.components(separatedBy: "/usr/bin/awk '\(reader)'").count - 1, 1, "copy \(i)")
+        }
+        for name in ["backstop.sh", "uninstall.sh"] {
+            let text = try String(contentsOf: ScriptFixture.productionScripts.appendingPathComponent(name), encoding: .utf8)
+            XCTAssertFalse(text.contains(reader), name)
+            XCTAssertFalse(text.contains("/bin/ls") || text.contains("\"$LS\""), name)
+            XCTAssertEqual(text.components(separatedBy: "\nread_access_lists() { # path...\n").count - 1, 1, name)
         }
         let me = String(cString: getpwuid(getuid()).pointee.pw_name)
         let head = "-rw-------+ 1 root  wheel  82 Oct  8 12:00 /private/var/db/com.kgarg.insomnia/\(getuid())"
@@ -2432,8 +2564,8 @@ final class RecoveryScriptTests: XCTestCase {
             ("a writable folder", { XCTAssertEqual(chmod(self.fx.receipts, 0o775), 0) }, { XCTAssertEqual(chmod(self.fx.receipts, 0o755), 0) }, shape),
             ("an allow entry on the receipt", { try self.fx.writeReceiptEntries([mine, write]) }, { try self.fx.writeReceiptEntries([mine]) },
              "does not have exactly one access control entry, the one that lets uid \(getuid()) read it and nothing else"),
-            ("a list ls cannot read", { XCTAssertTrue(FileManager.default.createFile(atPath: fails, contents: nil)) }, { unlinkIfPresent(fails) },
-             "does not have exactly one access control entry, the one that lets uid \(getuid()) read it and nothing else, or its list could not be read"),
+            ("a list the app binary cannot read", { XCTAssertTrue(FileManager.default.createFile(atPath: fails, contents: nil)) }, { unlinkIfPresent(fails) },
+             "the access control list of \(fx.receipt) could not be read whole (unreadable 13)"),
             ("an allow entry on the folder", { try self.fx.writeFolderEntries([self.fx.receipts: ["user:\(user) allow add_file"]]) },
              { unlinkIfPresent(self.fx.folderEntries) }, "has an access control entry that allows changes"),
         ]
@@ -2462,11 +2594,13 @@ final class RecoveryScriptTests: XCTestCase {
                 XCTAssertGreaterThanOrEqual(fd, 0, name)
                 XCTAssertEqual(flock(fd, LOCK_EX | LOCK_NB), 0, name)
                 try c.damage()
+                unlinkIfPresent(fx.root.path + "/insomnia.lists.log")
 
                 let held = try fx.run(fx.backstop)
 
                 try assertKept(held, nonce: nonce, restored: false, saying: ["an unfinished start is not settled yet: \(fx.receipt) stayed locked for 0 s"])
                 XCTAssertFalse(fx.log().contains(c.says), "\(name): the checks run only under the lock: \(fx.log())")
+                XCTAssertFalse(FileManager.default.fileExists(atPath: fx.root.path + "/insomnia.lists.log"), "\(name): no list is read before the lock")
                 close(fd)
                 removeIfPresent(fx.logFile)
                 fx.clearCalls()
@@ -2549,6 +2683,13 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(fx.calls().contains("sudo -n /bin/rmdir \(fx.receipts)"), "\(fx.calls())")
         XCTAssertFalse(FileManager.default.fileExists(atPath: fx.receipts))
         XCTAssertFalse(fx.exists(fx.sudoers))
+        // R35-5: every list was read through the app binary, the receipt's
+        // with its folders' and the receipt folder's with the folders above
+        // it, with uninstall.sh's limit (8) and the backstop's (2).
+        let folders = foldersAbove(fx.receipt).joined(separator: " ")
+        let lines = Set(try String(contentsOfFile: fx.root.path + "/insomnia.lists.log", encoding: .utf8).split(separator: "\n").map(String.init))
+        XCTAssertTrue(lines.isSubset(of: ["--access-lists 8 \(fx.receipt) \(folders)", "--access-lists 8 \(folders)", "--access-lists 2 \(fx.receipt) \(folders)"]), "\(lines)")
+        XCTAssertTrue(lines.isSuperset(of: ["--access-lists 8 \(fx.receipt) \(folders)", "--access-lists 8 \(folders)"]), "\(lines)")
     }
 
     /// The receipt shows this start's `writing`: uninstall settles it as one
@@ -3253,26 +3394,29 @@ final class RecoveryScriptTests: XCTestCase {
 
     /// F3 (round 28). The same for a receipt with a mode other than 600,
     /// another list of access control entries (stand-ins, as in the
-    /// backstop's test) or a list ls cannot read: the checks refuse it, and
-    /// since round 30 the uninstall stops before removing anything, with or
-    /// without a claim.
+    /// backstop's test) or a list the app binary cannot read whole: the
+    /// checks refuse it, and since round 30 the uninstall stops before
+    /// removing anything, with or without a claim.
     func testUninstallRemovesNothingWhileTheReceiptHasAnotherModeOrList() throws {
         let mine = [AccessEntry.installed(for: getuid())]
         let lists = Dictionary(uniqueKeysWithValues: TestReceipts.refusedLists.map { ($0.name, $0.entries) })
         // Each row has a fixture of its own, so what it says names that
         // fixture's receipt.
-        func why(_ f: ScriptFixture, list: Bool) -> String {
-            list
-                ? "\(f.receipt) does not have exactly one access control entry, the one that lets uid \(f.uid) read it and nothing else, or its list could not be read"
-                : "\(f.receipt) is missing, is not the 82-byte file install.sh made, mode 600, or someone other than root can change it or a folder above it"
+        enum Why { case shape, list, unread }
+        func why(_ f: ScriptFixture, _ kind: Why) -> String {
+            switch kind {
+            case .shape: "\(f.receipt) is missing, is not the 82-byte file install.sh made, mode 600, or someone other than root can change it or a folder above it"
+            case .list: "\(f.receipt) does not have exactly one access control entry, the one that lets uid \(f.uid) read it and nothing else"
+            case .unread: "the access control list of \(f.receipt) could not be read whole (unreadable 13)"
+            }
         }
-        let cases: [(name: String, mode: mode_t, entries: [AccessEntry], listFails: Bool, list: Bool)] = [
-            ("mode 644", 0o644, mine, false, false),
-            ("no entry", 0o600, [], false, true),
-            ("another account's entry", 0o600, try XCTUnwrap(lists["another account's entry"]), false, true),
-            ("an inherited entry", 0o600, try XCTUnwrap(lists["an inherited entry"]), false, true),
-            ("read and write", 0o600, try XCTUnwrap(lists["read and write"]), false, true),
-            ("a list ls cannot read", 0o600, mine, true, true),
+        let cases: [(name: String, mode: mode_t, entries: [AccessEntry], listFails: Bool, why: Why)] = [
+            ("mode 644", 0o644, mine, false, .shape),
+            ("no entry", 0o600, [], false, .list),
+            ("another account's entry", 0o600, try XCTUnwrap(lists["another account's entry"]), false, .list),
+            ("an inherited entry", 0o600, try XCTUnwrap(lists["an inherited entry"]), false, .list),
+            ("read and write", 0o600, try XCTUnwrap(lists["read and write"]), false, .list),
+            ("a list the app binary cannot read", 0o600, mine, true, .unread),
         ]
         let nonce = String(SleepOffReceipts.initialContent.prefix(36))
         var fixtures: [ScriptFixture] = []
@@ -3290,7 +3434,7 @@ final class RecoveryScriptTests: XCTestCase {
                 XCTAssertEqual(chmod(f.receipt, c.mode), 0, label)
                 try f.writeReceiptEntries(c.entries)
                 if c.listFails { XCTAssertTrue(FileManager.default.createFile(atPath: f.receiptEntries + ".fails", contents: nil), label) }
-                rows.append((ScriptRow(label, f, f.uninstall), why(f, list: c.list), held, try Data(contentsOf: f.state)))
+                rows.append((ScriptRow(label, f, f.uninstall), why(f, c.why), held, try Data(contentsOf: f.state)))
             }
         }
         XCTAssertEqual(rows.count, 12)
@@ -3301,6 +3445,57 @@ final class RecoveryScriptTests: XCTestCase {
             let r = try row.outcome()
             XCTAssertTrue(r.stderr.contains(why), "\(row.label): \(r.stderr)")
             try assertUninstallRemovedNothing(r, saying: why, journal: journal, receipt: SleepOffReceipts.initialContent, release: held ? "\(nonce) held\n" : SleepOffReceipts.initialRelease, in: row.fixture)
+        }
+    }
+
+    /// R35-5: uninstall.sh reads the lists through the installed bundle's
+    /// binary (APP_BIN) as the backstop does, with its own time limit
+    /// (CALL_TIMEOUT_SECONDS plus 3, here 8). Lists it cannot have whole
+    /// stop it before it removes anything, claim or not: a binary that is
+    /// not executable, as when the bundle is gone, and an Info.plist that
+    /// does not declare the version, when the binary is not run; for those
+    /// two it says that installing this version again lets it go on. A
+    /// binary that does not answer in time, and a folder whose list allows
+    /// something, stop it the same way.
+    func testUninstallRemovesNothingWhileTheAppBinaryDoesNotGiveTheListsWhole() throws {
+        let hint = "run could not use. Install this version again (install.sh) and rerun, or\nremove the two files by hand as above."
+        let cases: [(name: String, prepare: (ScriptFixture) throws -> Void, says: (ScriptFixture) -> String, hint: Bool, ran: Bool)] = [
+            ("a binary that is not executable", { f in try f.setFakeInsomniaExecutable(false) },
+             { "the access control lists of \($0.receipts) and the folders above it are unknown: the app binary that reads them, \($0.fakeInsomnia.path), is missing or not executable" }, true, false),
+            ("an Info.plist without the version", { f in try ScriptFixture.infoPlist(resumeFrozenVersion: "1", accessListsVersion: nil).write(to: f.appInfo, atomically: true, encoding: .utf8) },
+             { "the access control lists of \($0.receipts) and the folders above it are unknown: \($0.appInfo.path) does not declare InsomniaAccessListsVersion 1 ('': an older or newer build), so the app binary was not run" }, true, false),
+            ("no answer in time", { f in XCTAssertTrue(FileManager.default.createFile(atPath: f.root.path + "/insomnia.lists.hang", contents: nil)) },
+             { "the access control lists of \($0.receipts) and the folders above it are unknown: '\($0.fakeInsomnia.path) --access-lists' did not answer within 5s" }, false, true),
+            ("a folder whose list allows something", { f in
+                let count = self.foldersAbove(f.receipt).count
+                try (["allows"] + Array(repeating: "none", count: count - 1)).map { $0 + "\n" }.joined().write(toFile: f.root.path + "/insomnia.lists.output", atomically: true, encoding: .utf8)
+             }, { "\($0.receipts) or a folder above it (\($0.receipts)) has an access control entry that allows changes" }, false, true),
+        ]
+        let nonce = String(SleepOffReceipts.initialContent.prefix(36))
+        var fixtures: [ScriptFixture] = []
+        defer { fixtures.forEach { $0.destroy() } }
+        var rows: [(row: ScriptRow, c: (name: String, prepare: (ScriptFixture) throws -> Void, says: (ScriptFixture) -> String, hint: Bool, ran: Bool), held: Bool, journal: Data)] = []
+        for c in cases {
+            for held in [false, true] {
+                let f = try ScriptFixture()
+                fixtures.append(f)
+                try f.installMachinery()
+                try f.writeState(cleanJournal)
+                try f.writeReceipt()
+                if held { try f.writeRelease("\(nonce) held\n") }
+                try c.prepare(f)
+                rows.append((ScriptRow("\(c.name), \(held ? "a claim" : "no claim")", f, f.uninstall), c, held, try Data(contentsOf: f.state)))
+            }
+        }
+
+        runTwoAtATime(rows.map(\.row))
+
+        for (row, c, held, journal) in rows {
+            let f = row.fixture
+            let r = try row.outcome()
+            try assertUninstallRemovedNothing(r, saying: c.says(f), journal: journal, receipt: SleepOffReceipts.initialContent, release: held ? "\(nonce) held\n" : SleepOffReceipts.initialRelease, in: f)
+            XCTAssertEqual(r.stderr.contains(hint), c.hint, "\(row.label): \(r.stderr)")
+            XCTAssertEqual(FileManager.default.fileExists(atPath: f.root.path + "/insomnia.lists.log"), c.ran, row.label)
         }
     }
 
@@ -4444,17 +4639,21 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(ids, Config.defaultAgentList)
     }
 
-    /// The --resume-frozen interface version is the same in the binary, in
-    /// the bundle's Info.plist, and in the two scripts that check it.
+    /// The --resume-frozen and --access-lists interface versions are the
+    /// same in the binary, in the bundle's Info.plist, and in the two
+    /// scripts that check them.
     func testTheResumeFrozenVersionIsTheSameEverywhere() throws {
         let scripts = ScriptFixture.productionScripts
         let info = scripts.deletingLastPathComponent().appendingPathComponent("Resources/Info.plist")
         let plist = try XCTUnwrap(try PropertyListSerialization.propertyList(from: Data(contentsOf: info), format: nil) as? [String: Any])
         XCTAssertEqual(plist["InsomniaResumeFrozenVersion"] as? Int, ResumeFrozenCommand.version)
+        XCTAssertEqual(plist["InsomniaAccessListsVersion"] as? Int, AccessListsCommand.version)
         for name in ["backstop.sh", "uninstall.sh"] {
             let text = try String(contentsOf: scripts.appendingPathComponent(name), encoding: .utf8)
             let lines = text.split(separator: "\n").filter { $0.hasPrefix("RESUME_FROZEN_VERSION=") }
             XCTAssertEqual(lines, ["RESUME_FROZEN_VERSION=\(ResumeFrozenCommand.version)"], name)
+            let lists = text.split(separator: "\n").filter { $0.hasPrefix("ACCESS_LISTS_VERSION=") }
+            XCTAssertEqual(lists, ["ACCESS_LISTS_VERSION=\(AccessListsCommand.version)"], name)
         }
     }
 
@@ -8195,7 +8394,8 @@ final class RecoveryScriptTests: XCTestCase {
     /// session, config.json and the app's Info.plist with backstop.sh's
     /// readers, so a read that fails is unknown in both, never absent: the
     /// private copy (its perl text too), every plutil read and its status,
-    /// the shape checks, the dates and the receipt's access check. Also
+    /// the shape checks, the dates and the receipt's checks with the
+    /// reading of the app binary's answer about access control lists. Also
     /// the readers of a copy kept in memory (plutil_on) and the byte check
     /// of a copy of the live journal (same_as_read).
     func testBothScriptsShareTheirReaders() throws {
@@ -8215,8 +8415,62 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(try perl(backstop, "ID_PERL"), try perl(uninstall, "ID_PERL"))
         for name in ["copy_private", "file_id", "plutil_run", "absent_reply", "type_at", "ty", "read_at", "count_at", "json_object", "shape_of",
                      "record_text_problems", "journal_shape_problems", "epoch_of", "epoch_at", "session_shape_problems",
-                     "receipt_access_problem", "unlock_receipt", "plutil_on", "same_as_read"] {
+                     "receipt_unsafe", "lists_from_answer", "unlock_receipt", "plutil_on", "same_as_read"] {
             XCTAssertEqual(try function(name, in: backstop), try function(name, in: uninstall), name)
+        }
+    }
+
+    /// R35-5: lists_from_answer, which both scripts share, takes the app
+    /// binary's --access-lists answer only as one known word per path, in
+    /// order, each on a line that ends in a newline, with exit 0 when every
+    /// word is a list read whole and 1 when one is not. Anything else gives
+    /// no words and says why, with the start of the answer, its bytes that
+    /// cannot be printed shown as spaces. Run by the real /bin/bash on the
+    /// function's own text.
+    func testTheListsAnswerIsTakenOnlyWhole() throws {
+        let backstop = try String(contentsOf: ScriptFixture.productionScripts.appendingPathComponent("backstop.sh"), encoding: .utf8)
+        let start = try XCTUnwrap(backstop.range(of: "\nlists_from_answer() {"))
+        let end = try XCTUnwrap(backstop.range(of: "\n}\n", range: start.upperBound..<backstop.endIndex))
+        let function = String(backstop[start.lowerBound..<end.upperBound])
+        let driver = function + #"""
+        set -u
+        lists_from_answer "$1" "$2" "$3"
+        printf 'why=%s\n' "$lists_why"
+        for (( i = 0; i < ${#lists_words[@]}; i++ )); do printf 'word=%s\n' "${lists_words[i]}"; done
+        """#
+        func notOne(_ count: Int, _ status: String, _ shown: String) -> String {
+            "why=the app binary's answer is not one word for each of the \(count) paths (exit \(status), output '\(shown)')\n"
+        }
+        let cases: [(answer: String, count: Int, status: String, prints: String)] = [
+            ("installed\nnone\nnone\n", 3, "0", "why=\nword=installed\nword=none\nword=none\n"),
+            ("denies\nallows\n", 2, "0", "why=\nword=denies\nword=allows\n"),
+            ("installed\nunreadable 13\nincomplete\n", 3, "1", "why=\nword=installed\nword=unreadable 13\nword=incomplete\n"),
+            ("unreadable 2147483647\n", 1, "1", "why=\nword=unreadable 2147483647\n"),
+            ("installed\nnone\n", 3, "0", notOne(3, "0", "installed none ")),
+            ("installed\nnone\nnone\nnone\n", 3, "0", notOne(3, "0", "installed none none none ")),
+            ("installed\nnone\nnone", 3, "0", notOne(3, "0", "installed none none")),
+            ("", 1, "0", notOne(1, "0", "")),
+            ("\n", 1, "0", notOne(1, "0", " ")),
+            ("Installed\n", 1, "0", notOne(1, "0", "Installed ")),
+            (" none\n", 1, "0", notOne(1, "0", " none ")),
+            ("none\r\n", 1, "0", notOne(1, "0", "none  ")),
+            ("unreadable\n", 1, "1", notOne(1, "1", "unreadable ")),
+            ("unreadable 0\n", 1, "1", notOne(1, "1", "unreadable 0 ")),
+            ("unreadable 01\n", 1, "1", notOne(1, "1", "unreadable 01 ")),
+            ("unreadable -1\n", 1, "1", notOne(1, "1", "unreadable -1 ")),
+            ("unreadable 12345678901\n", 1, "1", notOne(1, "1", "unreadable 12345678901 ")),
+            ("none\n", 1, "1", notOne(1, "1", "none ")),
+            ("incomplete\n", 1, "0", notOne(1, "0", "incomplete ")),
+            ("none\n", 1, "64", notOne(1, "64", "none ")),
+            ("none\n", 1, "", notOne(1, "", "none ")),
+            ("usage\n", 1, "64", notOne(1, "64", "usage ")),
+            ("none\u{1B}[0m\n", 1, "0", notOne(1, "0", "none [0m ")),
+            (String(repeating: "none\n", count: 5), 1, "0", notOne(1, "0", "none none none none none ")),
+        ]
+        for c in cases {
+            let r = try fx.runTool("/bin/bash", ["-c", driver, "bash", c.answer, String(c.count), c.status])
+            XCTAssertEqual(r.status, 0, c.answer.debugDescription)
+            XCTAssertEqual(r.output, c.prints, c.answer.debugDescription)
         }
     }
 
@@ -10140,10 +10394,11 @@ final class RecoveryScriptTests: XCTestCase {
     }
 
     /// The Info.plist of the build being installed: what install.sh checks
-    /// in a release bundle, and InsomniaResumeFrozenVersion 1 when
-    /// `declares`, as Resources/Info.plist has it.
+    /// in a release bundle, and InsomniaResumeFrozenVersion 1 and
+    /// InsomniaAccessListsVersion 1 when `declares`, as Resources/Info.plist
+    /// has them.
     private static func newBuildInfoPlist(declares: Bool) -> String {
-        let key = declares ? "<key>InsomniaResumeFrozenVersion</key><integer>1</integer>" : ""
+        let key = declares ? "<key>InsomniaResumeFrozenVersion</key><integer>1</integer><key>InsomniaAccessListsVersion</key><integer>1</integer>" : ""
         return """
         <?xml version="1.0" encoding="UTF-8"?>
         <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -12599,12 +12854,14 @@ private final class ScriptFixture {
     var logFile: URL { home.appendingPathComponent("Logs/insomnia.log") }
     var plist: URL { home.appendingPathComponent("LaunchAgents/com.insomnia.backstop.plist") }
     var fakePmset: String { bin.appendingPathComponent("pmset").path }
-    /// The fake app binary backstop.sh calls for `--resume-frozen`.
+    /// The fake app binary backstop.sh calls for `--resume-frozen`, and
+    /// both backstop.sh and uninstall.sh (APP_BIN) for `--access-lists`.
     var fakeInsomnia: URL { bin.appendingPathComponent("Insomnia") }
     /// The installed bundle's Info.plist. As in production, both scripts
     /// read this one file: uninstall.sh to pick a backstop, and the
     /// backstop copies before they run the fake binary. writeFakes makes it
-    /// declare InsomniaResumeFrozenVersion 1. The fake binary itself stays
+    /// declare InsomniaResumeFrozenVersion 1 and InsomniaAccessListsVersion
+    /// 1. The fake binary itself stays
     /// in `bin`, so installMachinery and install.sh can put their own
     /// Contents/MacOS/Insomnia in the bundle.
     var appInfo: URL { app.appendingPathComponent("Contents/Info.plist") }
@@ -12723,7 +12980,7 @@ private final class ScriptFixture {
         try """
         <?xml version="1.0" encoding="UTF-8"?>
         <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-        <plist version="1.0"><dict><key>CFBundleIdentifier</key><string>com.kgarg.insomnia</string></dict></plist>
+        <plist version="1.0"><dict><key>CFBundleIdentifier</key><string>com.kgarg.insomnia</string><key>InsomniaAccessListsVersion</key><integer>1</integer></dict></plist>
         """.write(to: resources.appendingPathComponent("Info.plist"), atomically: true, encoding: .utf8)
         try "icns".write(to: resources.appendingPathComponent("AppIcon.icns"), atomically: true, encoding: .utf8)
         let binroot = root.appendingPathComponent("binroot", isDirectory: true)
@@ -12774,7 +13031,7 @@ private final class ScriptFixture {
     /// receipt is written over in place, as the root command's perl does.
     /// A new receipt, or one with no receiptEntries file, gets the access
     /// control entry install.sh adds, as a stand-in in receiptEntries
-    /// (see writeFakes' ls). A release file is made beside it, as
+    /// (see writeFakes' ls and Insomnia). A release file is made beside it, as
     /// install.sh makes it, unless there is one.
     func writeReceipt(_ text: String = SleepOffReceipts.initialContent) throws {
         if mkdir(receipts, 0o755) != 0 && errno != EEXIST { throw FixtureError("mkdir \(receipts): \(errno)") }
@@ -12785,22 +13042,52 @@ private final class ScriptFixture {
         if !fm.fileExists(atPath: released) { try writeRelease(SleepOffReceipts.initialRelease) }
     }
 
-    /// The receipt's access control entries, the whole list the scripts'
-    /// LS shows for it; LS reads no real list (writeFakes).
+    /// The receipt's access control entries as ls prints them, a stand-in
+    /// for its real list: install.sh's LS and the root command's ls show
+    /// them, and the fake app binary's --access-lists answers from them or
+    /// from receiptEntries + ".word" (writeFakes). Neither reads a real list.
     var receiptEntries: String { root.path + "/receipt.acl" }
 
-    /// Puts `list` in receiptEntries.
+    /// Puts `list` in receiptEntries, and the word the app binary's
+    /// --access-lists mode prints for it (AccessListsCommand.word) in
+    /// receiptEntries + ".word", for the fake binary.
     func writeReceiptEntries(_ list: [AccessEntry]) throws {
         try TestReceipts.writeEntries(list, to: receiptEntries)
+        try (AccessListsCommand.word(.entries(list), user: getuid()).text + "\n")
+            .write(toFile: receiptEntries + ".word", atomically: true, encoding: .utf8)
     }
 
-    /// The entries the scripts' LS shows for folders, by path; a folder it
-    /// does not name has none (TestReceipts.writeFakeLs).
+    /// The entries folders have, by path, as ls prints them; a folder it
+    /// does not name has none. install.sh's LS shows them
+    /// (TestReceipts.writeFakeLs), and the fake app binary answers allows
+    /// or denies from them (writeFakes).
     var folderEntries: String { receiptEntries + ".folders" }
 
     /// Puts `lines` (by folder, each as ls prints it) in folderEntries.
     func writeFolderEntries(_ lines: [String: [String]]) throws {
         try TestReceipts.writeFolderEntries(lines, besides: receiptEntries)
+    }
+
+    /// With `false`, the fake app binary becomes a file of its own, mode
+    /// 0644, with the same text, which the scripts find not executable;
+    /// with `true`, the link to the shared launcher comes back. A chmod
+    /// through the link would change the launcher every fake of the test
+    /// process runs (FakeTool), so no test changes the mode that way.
+    func setFakeInsomniaExecutable(_ executable: Bool) throws {
+        let text = try String(contentsOf: bin.appendingPathComponent(".fake-src/Insomnia"), encoding: .utf8)
+        if executable {
+            try FakeTool.write(text, at: fakeInsomnia.path)
+            return
+        }
+        let copy = bin.appendingPathComponent(".Insomnia-\(UUID().uuidString)").path
+        guard fm.createFile(atPath: copy, contents: Data(text.utf8), attributes: [.posixPermissions: 0o644]) else {
+            throw FixtureError("could not write \(copy)")
+        }
+        guard rename(copy, fakeInsomnia.path) == 0 else {
+            let why = errno
+            unlink(copy)
+            throw FixtureError("could not put \(copy) at \(fakeInsomnia.path): errno \(why)")
+        }
     }
 
     /// The receipt's checks in Swift, reading the entry install.sh adds as
@@ -12868,7 +13155,6 @@ private final class ScriptFixture {
             "CAT": bin.appendingPathComponent("cat").path,
             "HEAD": bin.appendingPathComponent("head").path,
             "TR": bin.appendingPathComponent("tr").path,
-            "LS": bin.appendingPathComponent("ls").path,
             "RECEIPTS": receipts,
             "RECEIPT_OWNER": uid,
             "MV": bin.appendingPathComponent("mv").path,
@@ -12889,6 +13175,7 @@ private final class ScriptFixture {
             "DEFAULTS": bin.appendingPathComponent("defaults").path,
             "KILL": bin.appendingPathComponent("kill").path,
             "APP": app.path,
+            "APP_BIN": fakeInsomnia.path,
             "SUDOERS": sudoers.path,
             // The fixture's folder is the standard one too, so its recovery
             // lock is the one install.sh takes (lock_standard's alias case).
@@ -12898,7 +13185,6 @@ private final class ScriptFixture {
             "CAT": bin.appendingPathComponent("cat").path,
             "HEAD": bin.appendingPathComponent("head").path,
             "TR": bin.appendingPathComponent("tr").path,
-            "LS": bin.appendingPathComponent("ls").path,
             "RECEIPTS": receipts,
             "RECEIPT_OWNER": uid,
             "LOCK_TIMEOUT_SECONDS": "1",
@@ -13029,9 +13315,11 @@ private final class ScriptFixture {
     // MARK: Fakes
 
     /// An app bundle's Info.plist, with InsomniaResumeFrozenVersion set to
-    /// `resumeFrozenVersion` as an integer, or without the key when nil.
-    static func infoPlist(resumeFrozenVersion: String?) -> String {
-        let key = resumeFrozenVersion.map { "<key>InsomniaResumeFrozenVersion</key><integer>\($0)</integer>" } ?? ""
+    /// `resumeFrozenVersion` and InsomniaAccessListsVersion to
+    /// `accessListsVersion`, each as an integer, or without the key when nil.
+    static func infoPlist(resumeFrozenVersion: String?, accessListsVersion: String? = "1") -> String {
+        let key = (resumeFrozenVersion.map { "<key>InsomniaResumeFrozenVersion</key><integer>\($0)</integer>" } ?? "")
+            + (accessListsVersion.map { "<key>InsomniaAccessListsVersion</key><integer>\($0)</integer>" } ?? "")
         return """
         <?xml version="1.0" encoding="UTF-8"?>
         <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -13283,7 +13571,7 @@ private final class ScriptFixture {
               /bin/mkdir -p "$(dirname "$dst")"; /bin/cp "$src" "$dst"
               if [[ -n "$perm" ]]; then /bin/chmod "$perm" "$dst"; fi
               # A file install(1) makes has no access control entry.
-              if [[ "$dst" == "\(receipt)" ]]; then : > "\(receiptEntries)"; fi
+              if [[ "$dst" == "\(receipt)" ]]; then : > "\(receiptEntries)"; /bin/rm -f "\(receiptEntries).word"; fi
               exit 0 ;;
             esac
             printf 'sudo REFUSED %s\\n' "$*" >> "\(calls)"; exit 1 ;;
@@ -13299,7 +13587,7 @@ private final class ScriptFixture {
             receipt_lock_state "sudo chmod $2"
             if [[ -e "\(r)/sudo-chmod.fail" ]]; then echo "chmod: \(receipt): Operation not permitted" >&2; exit 1; fi
             if [[ $# == 3 && "$2" == 0600 && "$3" == "\(receipt)" ]]; then exec /bin/chmod 0600 "$3"; fi
-            if [[ $# == 4 && "$2" == +a && "$4" == "\(receipt)" && ! -s "\(receiptEntries)" ]]; then printf '%s\\n' "$3" > "\(receiptEntries)"; exit 0; fi
+            if [[ $# == 4 && "$2" == +a && "$4" == "\(receipt)" && ! -s "\(receiptEntries)" ]]; then printf '%s\\n' "$3" > "\(receiptEntries)"; /bin/rm -f "\(receiptEntries).word"; exit 0; fi
             printf 'sudo REFUSED %s\\n' "$*" >> "\(calls)"; exit 1 ;;
           "\(bin.path)/mkdir")
             if [[ "$mode" == auth-fail ]]; then echo "sudo: a password is required" >&2; exit 1; fi
@@ -13492,7 +13780,7 @@ private final class ScriptFixture {
           printf 'root chmod %s\\n' "$*" >> "\(calls)"
           receipt_lock_state "root chmod $1"
           if [[ -e "\(r)/sudo-chmod.fail" ]]; then echo "chmod: \(receipt): Operation not permitted" >&2; exit 1; fi
-          if [[ $# == 3 && "$1" == +a && "$3" == "\(receipt)" && ! -s "\(receiptEntries)" ]]; then printf '%s\\n' "$2" > "\(receiptEntries)"; exit 0; fi
+          if [[ $# == 3 && "$1" == +a && "$3" == "\(receipt)" && ! -s "\(receiptEntries)" ]]; then printf '%s\\n' "$2" > "\(receiptEntries)"; /bin/rm -f "\(receiptEntries).word"; exit 0; fi
           printf 'sudo REFUSED root chmod %s\\n' "$*" >> "\(calls)"; exit 1
         fi
         if [[ -f "\(r)/chmod.fail" ]] && grep -qxF -- "${2:-}" "\(r)/chmod.fail"; then
@@ -13522,7 +13810,8 @@ private final class ScriptFixture {
           /bin/chmod "$(/usr/bin/stat -f '%Mp%Lp' "$src/$p")" "$dst/$p" || exit 1
         done
         """)
-        // ls: the scripts' LS. `ls -le <receipt>` shows receiptEntries'
+        // ls: install.sh's LS (backstop.sh and uninstall.sh ask the app
+        // binary). `ls -le <receipt>` shows receiptEntries'
         // lines as the receipt's entries, and a folder's come from
         // folderEntries (TestReceipts.writeFakeLs), since a test cannot
         // give its receipt the entry install.sh adds without changing a
@@ -13544,9 +13833,58 @@ private final class ScriptFixture {
         // needs SIGTERM ignored runs the backstop with it ignored (see
         // ScriptFixture.run): the fake inherits that from its first
         // instruction, so no trap has to be in place before the signal.
+        // Insomnia --access-lists <seconds> <path>...: reads no list and no
+        // standard input, and leaves the calls log, insomnia.ppid and
+        // insomnia.fd9 alone; it appends its arguments to
+        // insomnia.lists.log. One word per path: for the receipt, "unreadable
+        // 13" while receiptEntries + ".fails" exists, else the word
+        // writeReceiptEntries put in receiptEntries + ".word" (the app's own
+        // classification of the list it wrote). The fake install and chmod
+        // that write receiptEntries remove that file; without it the word
+        // comes from receiptEntries' text: installed for exactly the line
+        // install.sh adds, allows when a line allows something, denies for
+        // other lines, none when it is empty or missing. For any other
+        // path, allows when a line folderEntries has for it allows
+        // something, denies when it has others, else none. Exit 1 when a
+        // word is not a list read whole, else 0. insomnia.lists.output
+        // replaces the answer, with insomnia.lists.status as the exit status;
+        // insomnia.lists.hang makes it exec a 300 s sleep and never answer,
+        // so the signal at the limit reaches the sleeping process itself.
         try fm.createDirectory(at: appInfo.deletingLastPathComponent(), withIntermediateDirectories: true)
         try Self.infoPlist(resumeFrozenVersion: "1").write(to: appInfo, atomically: true, encoding: .utf8)
         try writeFake("Insomnia", """
+        if [[ "${1:-}" == --access-lists ]]; then
+          printf '%s\\n' "$*" >> "\(r)/insomnia.lists.log"
+          if [[ -e "\(r)/insomnia.lists.hang" ]]; then exec /bin/sleep 300; fi
+          if [[ -f "\(r)/insomnia.lists.output" ]]; then
+            /bin/cat "\(r)/insomnia.lists.output"
+            \(readFile(into: "status", "\(r)/insomnia.lists.status", or: "0"))
+            exit "$status"
+          fi
+          shift 2
+          status=0
+          for p in "$@"; do
+            word=none
+            if [[ "$p" == "\(receipt)" ]]; then
+              if [[ -e "\(receiptEntries).fails" ]]; then word="unreadable 13"
+              elif [[ -f "\(receiptEntries).word" ]]; then IFS= read -r word < "\(receiptEntries).word"
+              elif [[ -s "\(receiptEntries)" ]]; then
+                list="$(/bin/cat "\(receiptEntries)")"
+                if [[ "$list" == '\(TestReceipts.lsText(.installed(for: getuid())))' ]]; then word=installed
+                elif [[ "$list" == *" allow "* ]]; then word=allows
+                else word=denies; fi
+              fi
+            elif [[ -f "\(receiptEntries).folders" ]]; then
+              while IFS=$'\\t' read -r q e; do
+                if [[ "$q" != "$p" ]]; then continue; fi
+                if [[ "$e" == *" allow "* ]]; then word=allows; elif [[ "$word" == none ]]; then word=denies; fi
+              done < "\(receiptEntries).folders"
+            fi
+            printf '%s\\n' "$word"
+            case "$word" in none|installed|denies|allows) ;; *) status=1 ;; esac
+          done
+          exit "$status"
+        fi
         input=()
         while IFS= read -r line || [[ -n "$line" ]]; do input+=("$line"); done
         joined=""

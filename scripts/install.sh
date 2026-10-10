@@ -181,6 +181,9 @@ command_line() { local line; line="$(printf '%q ' "$@")"; printf '%s' "${line% }
 # holds no number from 0 to 255, gives 124.
 BOUNDED_OUTPUT=""
 BOUNDED_WHOLE=0
+# install.sh only prints a call's output and decides nothing from it, so it
+# never reads BOUNDED_WHOLE; bounded() stays the same as uninstall.sh's.
+# shellcheck disable=SC2034
 bounded() { # command args...
   local base supervisor rc deadline file="" size opened=0 read_rc=0
   base="$("$MKTEMP" "$WORK/call.XXXXXX")"
@@ -803,8 +806,9 @@ receipt_base_problem() {
 # ls/print.c), so each of those is other. It never prints synchronize,
 # prints the rights and flags only folders use only for a folder, and
 # skips an entry it cannot read, so those pass here; the app's check reads
-# every entry, right and flag. As receipt_access_problem in backstop.sh
-# and uninstall.sh, the root command and SleepOffReceipts.swift.
+# every entry, right and flag. As the root command reads it.
+# backstop.sh and uninstall.sh ask the app binary instead
+# (read_access_lists), which reads what ls leaves out.
 receipt_entries() {
   local listing name
   if ! listing="$("$LS" -le "$RECEIPT" 2>/dev/null)" || [[ "$listing" != -* ]]; then

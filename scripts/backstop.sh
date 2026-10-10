@@ -244,11 +244,9 @@ CP=/bin/cp
 CMP=/usr/bin/cmp
 STAT=/usr/bin/stat
 MKTEMP=/usr/bin/mktemp
-LS=/bin/ls
 CAT=/bin/cat
 HEAD=/usr/bin/head
 TR=/usr/bin/tr
-ID=/usr/bin/id
 GREP=/usr/bin/grep
 # perl makes the private copies of the files this run reads (copy_private),
 # through env -i, so nothing in the environment (PERL5OPT, PERL5LIB) reaches
@@ -270,6 +268,10 @@ RECEIPT_OWNER=0
 INSOMNIA_BIN="${HOME:-}/Applications/Insomnia.app/Contents/MacOS/Insomnia"
 INSOMNIA_INFO="${HOME:-}/Applications/Insomnia.app/Contents/Info.plist"
 RESUME_FROZEN_VERSION=1
+# The same binary reads the receipt's access control lists
+# (read_access_lists), once Info.plist declares InsomniaAccessListsVersion
+# ACCESS_LISTS_VERSION.
+ACCESS_LISTS_VERSION=1
 LOCK_TIMEOUT_SECONDS=10
 # How long to wait for the root command behind a password dialog to let go
 # of the pending-start marker (pmset takes well under a second).
@@ -941,9 +943,10 @@ supervise_command() { # base command args...
   log info "'$*' (pid $cpid), left running after SIGTERM, has exited (wait status $rc); its supervisor now lets go of the recovery lock, and the next run will retry"
 }
 
-# Run the app binary's --resume-frozen check (see resume_via_app) with the
-# same time limit, standard input from app_answer_dir/in and standard output
-# to app_answer_dir/out. This shell starts the binary as its own background
+# Run one of the app binary's one-shot modes, --resume-frozen (see
+# resume_via_app) or --access-lists (see read_access_lists), with the same
+# time limit, standard input from app_answer_dir/in and standard output to
+# app_answer_dir/out. This shell starts the binary as its own background
 # job and is the only process that signals it; no supervisor stands between
 # them. Bash reaps a finished child on its own (in its SIGCHLD handler), so a
 # signal sent by pid could reach whatever process gets that pid next. Each
@@ -955,10 +958,11 @@ supervise_command() { # base command args...
 # our own unprivileged binary, so when SIGTERM does not end it within
 # KILL_GRACE_SECONDS it gets SIGKILL: from then on it runs no more of its own
 # code and so cannot send another signal.
-# The binary inherits fd 9, so the recovery lock stays held for as long as it
-# runs, also after this shell is gone: a run killed mid-call leaves no helper
-# that could resume a process a later session froze while the lock was free.
-# The binary ends itself after its lifetime argument (resume_via_app passes
+# The binary inherits fd 9 (and fd 7 while the receipt is locked), so the
+# recovery lock stays held for as long as it runs, also after this shell is
+# gone: a run killed mid-call leaves no helper that could resume a process a
+# later session froze while the lock was free.
+# The binary ends itself after its lifetime argument (both callers pass
 # COMMAND_TIMEOUT_SECONDS + KILL_GRACE_SECONDS), so such a helper frees the
 # lock on its own. Returns the binary's exit status, or 124 when it did not
 # finish in time. The function's stderr is /dev/null because bash reports a
@@ -999,15 +1003,15 @@ run_app_bounded() { # command args...
   signal_job TERM "$cpid" || true
   if wait_for_job "$cpid" "$KILL_GRACE_SECONDS"; then
     wait "$cpid" || rc=$?
-    log error "'$1 --resume-frozen' (pid $cpid) did not answer within ${COMMAND_TIMEOUT_SECONDS}s; sent SIGTERM, and it ended (wait status $rc)"
+    log error "'$1 $2' (pid $cpid) did not answer within ${COMMAND_TIMEOUT_SECONDS}s; sent SIGTERM, and it ended (wait status $rc)"
     return 124
   fi
   signal_job KILL "$cpid" || true
   if wait_for_job "$cpid" "$KILL_GRACE_SECONDS"; then
     wait "$cpid" || rc=$?
-    log error "'$1 --resume-frozen' (pid $cpid) did not answer within ${COMMAND_TIMEOUT_SECONDS}s and was still running ${KILL_GRACE_SECONDS}s after SIGTERM; sent SIGKILL, and it ended (wait status $rc)"
+    log error "'$1 $2' (pid $cpid) did not answer within ${COMMAND_TIMEOUT_SECONDS}s and was still running ${KILL_GRACE_SECONDS}s after SIGTERM; sent SIGKILL, and it ended (wait status $rc)"
   else
-    log error "'$1 --resume-frozen' (pid $cpid) did not answer within ${COMMAND_TIMEOUT_SECONDS}s and has not exited ${KILL_GRACE_SECONDS}s after SIGKILL; it runs no further code, and it keeps the recovery lock until the kernel ends it"
+    log error "'$1 $2' (pid $cpid) did not answer within ${COMMAND_TIMEOUT_SECONDS}s and has not exited ${KILL_GRACE_SECONDS}s after SIGKILL; it runs no further code, and it keeps the recovery lock until the kernel ends it"
   fi
   return 124
 } 2>/dev/null
@@ -1515,51 +1519,155 @@ session_shape_problems() { # file
 # is missing, not a regular file or malformed, which the rest of the run
 # handles.
 
-# Prints why the receipt or a folder above it fails the checks, or nothing.
-# Every check matches SleepOffReceipts.swift and the root command
-# (AdministratorPrompt.swift): the receipt, its folder and each folder above
-# up to /, by lstat, must be root's (or RECEIPT_OWNER's), with no write
-# permission for group or others; the receipt a regular file with one link,
-# 82 bytes and mode 600, the rest folders. No folder may have an access
-# control entry that allows anything, and the receipt must have exactly the
-# one install.sh adds (receipt_access_problem).
-receipt_unsafe() {
-  local f="$RECEIPTS/$UID" p="$RECEIPTS" listing
+# Sets unsafe_why to why the receipt $1 or a folder above it fails the
+# checks, or to nothing. Every check matches SleepOffReceipts.swift and the
+# root command (AdministratorPrompt.swift): the receipt, its folder and each
+# folder above up to /, by lstat, must be root's (or RECEIPT_OWNER's), with
+# no write permission for group or others; the receipt a regular file with
+# one link, 82 bytes and mode 600, the rest folders. No folder may have an
+# access control entry that allows anything, and the receipt must have
+# exactly the one install.sh adds for uid $2, so only root and that user
+# can open it and hold its lock. The lists come from the app binary
+# (read_access_lists), which reads every entry, right and flag as the app's
+# own check does. ls(1) never prints synchronize, prints the rights and
+# flags only folders use only for a folder, and skips or stops at an entry
+# it cannot read, so no reading of its text shows those. A list the binary
+# could not read whole, or lists it could not be asked for, fail.
+receipt_unsafe() { # receipt uid
+  local f="$1" p="${1%/*}" listing k
   local folders=()
+  unsafe_why=""
   while [[ -n "$p" ]]; do folders+=("$p"); p="${p%/*}"; done
   folders+=(/)
   listing="$("$STAT" -f '%u %Lp %l %z %HT' "$f" "${folders[@]}" 2>/dev/null)" || listing=""
   if ! printf '%s\n' "$listing" | /usr/bin/awk -v o="$RECEIPT_OWNER" -v n="$(( ${#folders[@]} + 1 ))" 'NR == 1 { k = NF == 6 && $5 == "Regular" && $6 == "File" && $3 == 1 && $4 == 82 && $2 == 600 }; NR > 1 { k = k && NF == 5 && $5 == "Directory" }; { k = k && ($1 == 0 || $1 == o) && $2 !~ /[2367].?$/ }; END { exit !(k && NR == n) }'; then
-    echo "$f is missing, is not the 82-byte file install.sh made, mode 600, or someone other than root can change it or a folder above it"
+    unsafe_why="$f is missing, is not the 82-byte file install.sh made, mode 600, or someone other than root can change it or a folder above it"
     return 0
   fi
-  listing="$("$LS" -lde "${folders[@]}" 2>/dev/null)" || listing=""
-  if [[ -z "$listing" ]] || ! printf '%s\n' "$listing" | /usr/bin/awk '$1 ~ /^[0-9]+:$/ && / allow / { f = 1 }; END { exit f }'; then
-    echo "a folder above $f has an access control entry that allows changes, or could not be listed"
+  read_access_lists "$f" "${folders[@]}"
+  if [[ -n "$lists_why" ]]; then
+    unsafe_why="the access control lists of $f and the folders above it are unknown: $lists_why"
     return 0
   fi
-  receipt_access_problem "$f" "$UID"
+  for (( k = 1; k < ${#lists_words[@]}; k++ )); do
+    case "${lists_words[k]}" in
+      none|denies) ;;
+      allows|installed)
+        unsafe_why="the folder of $f or one above it (${folders[k-1]}) has an access control entry that allows changes"
+        return 0 ;;
+      *)
+        unsafe_why="the access control list of the folder of $f or one above it (${folders[k-1]}) could not be read whole (${lists_words[k]})"
+        return 0 ;;
+    esac
+  done
+  case "${lists_words[0]}" in
+    installed) ;;
+    none|denies|allows) unsafe_why="$f does not have exactly one access control entry, the one that lets uid $2 read it and nothing else" ;;
+    *) unsafe_why="the access control list of $f could not be read whole (${lists_words[0]})" ;;
+  esac
 }
 
-# Prints why the access control list of the receipt $1 is not the one
-# install.sh adds, or nothing. `ls -le` must show exactly one entry,
-# ` 0: user:<name> allow read`, and `id -u <name>` must be $2: so only
-# root and that user can open the receipt and hold its lock. ls(1) prints
-# `inherited` after the name of an inherited entry, every right after
-# `allow` or `deny`, and a UUID in place of `user:<name>` for an account the
-# directory cannot name (file_cmds ls/print.c), so each of those fails. It
-# never prints synchronize, prints the rights and flags only folders use
-# only for a folder, and skips an entry it cannot read, so those pass here;
-# the app's check reads every entry, right and flag. As
-# SleepOffReceipts.swift and the root command.
-receipt_access_problem() { # receipt uid
-  local listing name
-  listing="$("$LS" -le "$1" 2>/dev/null)" || listing=""
-  name="$(printf '%s\n' "$listing" | /usr/bin/awk 'NR == 1 { k = /^-/ }; NR == 2 && k && /^ 0: user:[^ :]+ allow read$/ { n = substr($2, 6) }; END { if (NR == 2) print n }')"
-  if [[ -z "$name" ]] || [[ "$("$ID" -u -- "$name" 2>/dev/null)" != "$2" ]]; then
-    echo "$1 does not have exactly one access control entry, the one that lets uid $2 read it and nothing else, or its list could not be read"
+# Sets lists_words from the answer $1 of --access-lists for $2 paths, which
+# exited $3 (AccessListsCommand.swift): one word per path, in order, each on
+# a line of its own that ends in a newline, and a status that agrees with
+# the words, 0 when every list was read whole and 1 when one was not.
+# Anything else leaves lists_words empty and says in lists_why that the
+# lists are unknown.
+lists_from_answer() { # answer count status
+  local rest="$1" line whole=1 valid=1 excerpt
+  lists_words=(); lists_why=""
+  # The longest line, "unreadable <errno>", is under 24 bytes.
+  if (( ${#rest} > $2 * 24 )); then valid=0; rest=""; fi
+  while [[ -n "$rest" ]]; do
+    line="${rest%%$'\n'*}"
+    if [[ "$line" == "$rest" ]]; then valid=0; break; fi
+    rest="${rest#*$'\n'}"
+    case "$line" in
+      none|installed|denies|allows) ;;
+      incomplete) whole=0 ;;
+      *)
+        if ! [[ "$line" =~ ^unreadable\ [1-9][0-9]{0,9}$ ]]; then valid=0; break; fi
+        whole=0 ;;
+    esac
+    lists_words+=("$line")
+  done
+  if (( ! valid || ${#lists_words[@]} != $2 )) || [[ "$3" != "$(( 1 - whole ))" ]]; then
+    excerpt="${1:0:200}"
+    lists_words=()
+    lists_why="the app binary's answer is not one word for each of the $2 paths (exit $3, output '${excerpt//[^[:print:]]/ }')"
   fi
 }
+
+# Reads the access control lists of the paths $@ with the app binary's
+# --access-lists mode (AccessListsCommand.swift) into lists_words
+# (lists_from_answer), or says in lists_why why they are unknown. The binary
+# is INSOMNIA_BIN, the one in the bundle this copy came from with
+# --own-bundle, and it runs as resume_via_app runs it: only once
+# INSOMNIA_INFO, read from a private copy once per run (lists_gate),
+# declares InsomniaAccessListsVersion ACCESS_LISTS_VERSION, since an older
+# build has no such mode and would open the menu bar app instead; with the
+# same time limit (run_app_bounded); and with an empty file as its standard
+# input, in a fresh private directory that also takes its answer.
+lists_gate=""
+read_access_lists() { # path...
+  local rc=0 info_rc=0 declared="" size="" answer="" read_rc=0 opened=0
+  lists_words=(); lists_why=""
+  if [[ ! -x "$INSOMNIA_BIN" ]]; then
+    lists_why="the app binary that reads them, $INSOMNIA_BIN, is missing or not executable"
+    return 0
+  fi
+  if [[ -z "$lists_gate" ]]; then
+    if [[ -f "$INSOMNIA_INFO" ]]; then
+      copy_private "$INSOMNIA_INFO" Info.plist || info_rc=$?
+      if (( info_rc == 0 )); then
+        read_at "$copy_path" InsomniaAccessListsVersion raw || info_rc=$?
+        if (( info_rc == 0 )); then declared="$read_value"; elif (( info_rc == 2 )); then lists_gate="$INSOMNIA_INFO could not be read ($read_why)"; fi
+      else
+        lists_gate="$INSOMNIA_INFO could not be read ($copy_why)"
+      fi
+    fi
+    if [[ -z "$lists_gate" && "$declared" == "$ACCESS_LISTS_VERSION" ]]; then
+      lists_gate=ok
+    elif [[ -z "$lists_gate" ]]; then
+      lists_gate="$INSOMNIA_INFO does not declare InsomniaAccessListsVersion $ACCESS_LISTS_VERSION ('$declared': an older or newer build), so the app binary was not run"
+    fi
+  fi
+  if [[ "$lists_gate" != ok ]]; then
+    lists_why="$lists_gate"
+    return 0
+  fi
+  "$RM" -rf "$APP_SUPPORT"/.backstop-lists.* 2>/dev/null || true
+  if ! app_answer_dir="$("$MKTEMP" -d "$APP_SUPPORT/.backstop-lists.XXXXXX" 2>/dev/null)"; then
+    app_answer_dir=""
+    lists_why="a private directory for the app binary's answer could not be made in $APP_SUPPORT"
+    return 0
+  fi
+  if ! printf '' 2>/dev/null > "$app_answer_dir/in"; then
+    lists_why="the app binary's empty input could not be written in $app_answer_dir"
+  else
+    run_app_bounded "$INSOMNIA_BIN" --access-lists "$((COMMAND_TIMEOUT_SECONDS + KILL_GRACE_SECONDS))" "$@" || rc=$?
+    size="$("$STAT" -f %z "$app_answer_dir/out" 2>/dev/null)" || size=""
+    if (( rc == 124 )); then
+      lists_why="the app binary did not answer within ${COMMAND_TIMEOUT_SECONDS}s"
+    elif ! [[ "$size" =~ ^[0-9]+$ ]]; then
+      lists_why="the app binary's answer could not be read whole"
+    elif (( 10#$size > $# * 24 )); then
+      # Longer than a valid answer can be ("unreadable <errno>" is under 24
+      # bytes), so it is not read into memory.
+      lists_why="the app binary's answer is not one word for each of the $# paths (exit $rc, $size bytes)"
+    else
+      { opened=1; IFS= read -r -d '' answer || read_rc=$?; } 2>/dev/null < "$app_answer_dir/out" || true
+      if (( ! opened || read_rc != 1 )) || ! byte_count_is "$answer" "$size"; then
+        lists_why="the app binary's answer could not be read whole"
+      fi
+    fi
+  fi
+  "$RM" -rf "$app_answer_dir" 2>/dev/null || true
+  app_answer_dir=""
+  [[ -n "$lists_why" ]] || lists_from_answer "$answer" "$#" "$rc"
+}
+# True when $1 is $2 bytes long.
+byte_count_is() { local LC_ALL=C; (( ${#1} == $2 )); }
 
 # Opens the receipt read-only on fd 7 and locks it as the root command does
 # (SleepOffReceipts.lock). Before the lock only what the open needs: the
@@ -1613,7 +1721,8 @@ lock_receipt() {
     return 0
   fi
   if [[ "$opened" == "$("$STAT" -f '%d:%i' "$f" 2>/dev/null)" ]]; then
-    why="$(receipt_unsafe)"
+    receipt_unsafe "$f" "$UID"
+    why="$unsafe_why"
     if [[ -n "$why" ]]; then
       exec 7<&-
       receipt_lock_why="$why"

@@ -114,11 +114,9 @@ RMDIR=/bin/rmdir
 MKTEMP=/usr/bin/mktemp
 CP=/bin/cp
 MV=/bin/mv
-LS=/bin/ls
 CAT=/bin/cat
 HEAD=/usr/bin/head
 TR=/usr/bin/tr
-ID=/usr/bin/id
 CMP=/usr/bin/cmp
 # perl makes the private copies of the files this run reads (copy_private),
 # through env -i, so nothing in the environment (PERL5OPT, PERL5LIB) reaches
@@ -150,6 +148,11 @@ QUIT_WAIT_SECONDS=10
 # root are bounded too (as_root); sudo only ever gets SIGTERM.
 CALL_TIMEOUT_SECONDS=30
 APP="$HOME/Applications/Insomnia.app"
+# The installed bundle's binary, which reads access control lists
+# (read_access_lists) once $APP/Contents/Info.plist declares
+# InsomniaAccessListsVersion ACCESS_LISTS_VERSION.
+APP_BIN="$APP/Contents/MacOS/Insomnia"
+ACCESS_LISTS_VERSION=1
 SUDOERS=/etc/sudoers.d/insomnia
 # The standard Insomnia folder, the only one install.sh installs from. Its
 # recovery lock guards the files every folder of this user shares (see
@@ -1573,49 +1576,135 @@ fi
 # The message says what was removed or written. Skipped for a journal that
 # is missing, not a regular file or malformed, which step 4 reports.
 
-# Prints why the receipt or a folder above it fails the checks, or nothing.
-# Every check matches SleepOffReceipts.swift and the root command
-# (AdministratorPrompt.swift): the receipt, its folder and each folder above
-# up to /, by lstat, must be root's (or RECEIPT_OWNER's), with no write
-# permission for group or others; the receipt a regular file with one link,
-# 82 bytes and mode 600, the rest folders. No folder may have an access
-# control entry that allows anything, and the receipt must have exactly the
-# one install.sh adds (receipt_access_problem).
-receipt_unsafe() {
-  local f="$RECEIPTS/$UID_NUM" p="$RECEIPTS" listing
+# Sets unsafe_why to why the receipt $1 or a folder above it fails the
+# checks, or to nothing. Every check matches SleepOffReceipts.swift and the
+# root command (AdministratorPrompt.swift): the receipt, its folder and each
+# folder above up to /, by lstat, must be root's (or RECEIPT_OWNER's), with
+# no write permission for group or others; the receipt a regular file with
+# one link, 82 bytes and mode 600, the rest folders. No folder may have an
+# access control entry that allows anything, and the receipt must have
+# exactly the one install.sh adds for uid $2, so only root and that user
+# can open it and hold its lock. The lists come from the app binary
+# (read_access_lists), which reads every entry, right and flag as the app's
+# own check does. ls(1) never prints synchronize, prints the rights and
+# flags only folders use only for a folder, and skips or stops at an entry
+# it cannot read, so no reading of its text shows those. A list the binary
+# could not read whole, or lists it could not be asked for, fail.
+receipt_unsafe() { # receipt uid
+  local f="$1" p="${1%/*}" listing k
   local folders=()
+  unsafe_why=""
   while [[ -n "$p" ]]; do folders+=("$p"); p="${p%/*}"; done
   folders+=(/)
   listing="$("$STAT" -f '%u %Lp %l %z %HT' "$f" "${folders[@]}" 2>/dev/null)" || listing=""
   if ! printf '%s\n' "$listing" | /usr/bin/awk -v o="$RECEIPT_OWNER" -v n="$(( ${#folders[@]} + 1 ))" 'NR == 1 { k = NF == 6 && $5 == "Regular" && $6 == "File" && $3 == 1 && $4 == 82 && $2 == 600 }; NR > 1 { k = k && NF == 5 && $5 == "Directory" }; { k = k && ($1 == 0 || $1 == o) && $2 !~ /[2367].?$/ }; END { exit !(k && NR == n) }'; then
-    echo "$f is missing, is not the 82-byte file install.sh made, mode 600, or someone other than root can change it or a folder above it"
+    unsafe_why="$f is missing, is not the 82-byte file install.sh made, mode 600, or someone other than root can change it or a folder above it"
     return 0
   fi
-  listing="$("$LS" -lde "${folders[@]}" 2>/dev/null)" || listing=""
-  if [[ -z "$listing" ]] || ! printf '%s\n' "$listing" | /usr/bin/awk '$1 ~ /^[0-9]+:$/ && / allow / { f = 1 }; END { exit f }'; then
-    echo "a folder above $f has an access control entry that allows changes, or could not be listed"
+  read_access_lists "$f" "${folders[@]}"
+  if [[ -n "$lists_why" ]]; then
+    unsafe_why="the access control lists of $f and the folders above it are unknown: $lists_why"
     return 0
   fi
-  receipt_access_problem "$f" "$UID_NUM"
+  for (( k = 1; k < ${#lists_words[@]}; k++ )); do
+    case "${lists_words[k]}" in
+      none|denies) ;;
+      allows|installed)
+        unsafe_why="the folder of $f or one above it (${folders[k-1]}) has an access control entry that allows changes"
+        return 0 ;;
+      *)
+        unsafe_why="the access control list of the folder of $f or one above it (${folders[k-1]}) could not be read whole (${lists_words[k]})"
+        return 0 ;;
+    esac
+  done
+  case "${lists_words[0]}" in
+    installed) ;;
+    none|denies|allows) unsafe_why="$f does not have exactly one access control entry, the one that lets uid $2 read it and nothing else" ;;
+    *) unsafe_why="the access control list of $f could not be read whole (${lists_words[0]})" ;;
+  esac
 }
 
-# Prints why the access control list of the receipt $1 is not the one
-# install.sh adds, or nothing. `ls -le` must show exactly one entry,
-# ` 0: user:<name> allow read`, and `id -u <name>` must be $2: so only
-# root and that user can open the receipt and hold its lock. ls(1) prints
-# `inherited` after the name of an inherited entry, every right after
-# `allow` or `deny`, and a UUID in place of `user:<name>` for an account the
-# directory cannot name (file_cmds ls/print.c), so each of those fails. It
-# never prints synchronize, prints the rights and flags only folders use
-# only for a folder, and skips an entry it cannot read, so those pass here;
-# the app's check reads every entry, right and flag. As
-# SleepOffReceipts.swift and the root command.
-receipt_access_problem() { # receipt uid
-  local listing name
-  listing="$("$LS" -le "$1" 2>/dev/null)" || listing=""
-  name="$(printf '%s\n' "$listing" | /usr/bin/awk 'NR == 1 { k = /^-/ }; NR == 2 && k && /^ 0: user:[^ :]+ allow read$/ { n = substr($2, 6) }; END { if (NR == 2) print n }')"
-  if [[ -z "$name" ]] || [[ "$("$ID" -u -- "$name" 2>/dev/null)" != "$2" ]]; then
-    echo "$1 does not have exactly one access control entry, the one that lets uid $2 read it and nothing else, or its list could not be read"
+# Sets lists_words from the answer $1 of --access-lists for $2 paths, which
+# exited $3 (AccessListsCommand.swift): one word per path, in order, each on
+# a line of its own that ends in a newline, and a status that agrees with
+# the words, 0 when every list was read whole and 1 when one was not.
+# Anything else leaves lists_words empty and says in lists_why that the
+# lists are unknown.
+lists_from_answer() { # answer count status
+  local rest="$1" line whole=1 valid=1 excerpt
+  lists_words=(); lists_why=""
+  # The longest line, "unreadable <errno>", is under 24 bytes.
+  if (( ${#rest} > $2 * 24 )); then valid=0; rest=""; fi
+  while [[ -n "$rest" ]]; do
+    line="${rest%%$'\n'*}"
+    if [[ "$line" == "$rest" ]]; then valid=0; break; fi
+    rest="${rest#*$'\n'}"
+    case "$line" in
+      none|installed|denies|allows) ;;
+      incomplete) whole=0 ;;
+      *)
+        if ! [[ "$line" =~ ^unreadable\ [1-9][0-9]{0,9}$ ]]; then valid=0; break; fi
+        whole=0 ;;
+    esac
+    lists_words+=("$line")
+  done
+  if (( ! valid || ${#lists_words[@]} != $2 )) || [[ "$3" != "$(( 1 - whole ))" ]]; then
+    excerpt="${1:0:200}"
+    lists_words=()
+    lists_why="the app binary's answer is not one word for each of the $2 paths (exit $3, output '${excerpt//[^[:print:]]/ }')"
+  fi
+}
+
+# Reads the access control lists of the paths $@ with the --access-lists
+# mode (AccessListsCommand.swift) of APP_BIN, the installed bundle's binary,
+# into lists_words (lists_from_answer), or says in lists_why why they are
+# unknown. As backstop.sh's: the binary runs only once the bundle's
+# Info.plist, read from a private copy once per run (lists_gate), declares
+# InsomniaAccessListsVersion ACCESS_LISTS_VERSION, since an older build has
+# no such mode and would open the menu bar app instead. bounded() gives it
+# the time limit of every other call here, and it ends itself a little
+# after that if this run is gone. bounded() drops the answer's last
+# newline, which is given back here. Nothing reads the lists after step 5
+# has removed the bundle. lists_unavailable is 1 once the binary was missing
+# or not run because of its version, so the stop can say how to go on.
+lists_gate=""
+lists_unavailable=0
+read_access_lists() { # path...
+  local rc=0 info_rc=0 declared=""
+  lists_words=(); lists_why=""
+  if [[ ! -x "$APP_BIN" ]]; then
+    lists_why="the app binary that reads them, $APP_BIN, is missing or not executable"
+    lists_unavailable=1
+    return 0
+  fi
+  if [[ -z "$lists_gate" ]]; then
+    if [[ -f "$APP/Contents/Info.plist" ]]; then
+      copy_private "$APP/Contents/Info.plist" lists.info.plist || info_rc=$?
+      if (( info_rc == 0 )); then
+        read_at "$copy_path" InsomniaAccessListsVersion raw || info_rc=$?
+        if (( info_rc == 0 )); then declared="$read_value"; elif (( info_rc == 2 )); then lists_gate="$APP/Contents/Info.plist could not be read ($read_why)"; fi
+      else
+        lists_gate="$APP/Contents/Info.plist could not be read ($copy_why)"
+      fi
+    fi
+    if [[ -z "$lists_gate" && "$declared" == "$ACCESS_LISTS_VERSION" ]]; then
+      lists_gate=ok
+    elif [[ -z "$lists_gate" ]]; then
+      lists_gate="$APP/Contents/Info.plist does not declare InsomniaAccessListsVersion $ACCESS_LISTS_VERSION ('$declared': an older or newer build), so the app binary was not run"
+    fi
+  fi
+  if [[ "$lists_gate" != ok ]]; then
+    lists_why="$lists_gate"
+    lists_unavailable=1
+    return 0
+  fi
+  bounded "$APP_BIN" --access-lists "$(( CALL_TIMEOUT_SECONDS + 3 ))" "$@" || rc=$?
+  if (( rc == 124 )); then
+    lists_why="'$APP_BIN --access-lists' did not answer within ${CALL_TIMEOUT_SECONDS}s"
+  elif (( ! BOUNDED_WHOLE )); then
+    lists_why="the answer of '$APP_BIN --access-lists' could not be read whole"
+  else
+    lists_from_answer "$BOUNDED_OUTPUT"$'\n' "$#" "$rc"
   fi
 }
 
@@ -1658,7 +1747,8 @@ lock_receipt() {
     return 0
   fi
   if [[ "$opened" == "$("$STAT" -f '%d:%i' "$f" 2>/dev/null)" ]]; then
-    why="$(receipt_unsafe)"
+    receipt_unsafe "$f" "$UID_NUM"
+    why="$unsafe_why"
     if [[ -n "$why" ]]; then
       exec 7<&-
       receipt_lock_why="$why"
@@ -1796,23 +1886,36 @@ attempt_verdict() { # nonce predecessor identity expires now has-marker
   fi
 }
 
-# Prints why the folders from $1 up to / are not root's alone (the checks
-# above, for folders only), or nothing. Step 5 removes the receipt as root
-# only when this prints nothing for its folder.
+# Sets folders_why to why the folders from $1 up to / are not root's alone
+# (the checks above, for folders only), or to nothing. Step 5 removes the
+# receipt as root only when it is empty for its folder.
 folders_problem() { # folder
-  local p="$1" listing
+  local p="$1" listing k
   local paths=()
+  folders_why=""
   while [[ -n "$p" ]]; do paths+=("$p"); p="${p%/*}"; done
   paths+=(/)
   listing="$("$STAT" -f '%u %Lp %l %z %HT' "${paths[@]}" 2>/dev/null)" || listing=""
   if ! printf '%s\n' "$listing" | /usr/bin/awk -v o="$RECEIPT_OWNER" -v n="${#paths[@]}" '{ k = (NR == 1 || k) && NF == 5 && $5 == "Directory" && ($1 == 0 || $1 == o) && $2 !~ /[2367].?$/ }; END { exit !(k && NR == n) }'; then
-    echo "$1 or a folder above it is not a folder, or is not root's alone"
+    folders_why="$1 or a folder above it is not a folder, or is not root's alone"
     return 0
   fi
-  listing="$("$LS" -lde "${paths[@]}" 2>/dev/null)" || listing=""
-  if [[ -z "$listing" ]] || ! printf '%s\n' "$listing" | /usr/bin/awk '$1 ~ /^[0-9]+:$/ && / allow / { f = 1 }; END { exit f }'; then
-    echo "$1 or a folder above it has an access control entry that allows changes, or could not be listed"
+  read_access_lists "${paths[@]}"
+  if [[ -n "$lists_why" ]]; then
+    folders_why="the access control lists of $1 and the folders above it are unknown: $lists_why"
+    return 0
   fi
+  for (( k = 0; k < ${#lists_words[@]}; k++ )); do
+    case "${lists_words[k]}" in
+      none|denies) ;;
+      allows|installed)
+        folders_why="$1 or a folder above it (${paths[k]}) has an access control entry that allows changes"
+        return 0 ;;
+      *)
+        folders_why="the access control list of $1 or a folder above it (${paths[k]}) could not be read whole (${lists_words[k]})"
+        return 0 ;;
+    esac
+  done
 }
 
 # Stops the uninstall with the start still journaled. No pmset has run.
@@ -2308,7 +2411,8 @@ record_removal() {
 check_shared() {
   shared_why=""; shared_seen=none; release_seen=""; receipt_lock_why=""
   if [[ ! -e "$RECEIPTS" && ! -L "$RECEIPTS" ]]; then return 0; fi
-  shared_why="$(folders_problem "$RECEIPTS")"
+  folders_problem "$RECEIPTS"
+  shared_why="$folders_why"
   [[ -z "$shared_why" ]] || return 0
   if [[ -L "$RECEIPT" || -L "$RELEASED" ]] || { [[ -e "$RECEIPT" ]] && [[ ! -f "$RECEIPT" ]]; } || { [[ -e "$RELEASED" ]] && [[ ! -f "$RELEASED" ]]; }; then
     shared_why="$RECEIPT or $RELEASED is not a regular file, so install.sh did not make it"
@@ -2360,7 +2464,9 @@ shared_unchanged() {
   local now=none line
   shared_why=""
   if [[ "$shared_seen" == locked* ]]; then
-    if [[ "$receipt_locked" != "$("$STAT" -f '%d:%i' "$RECEIPT" 2>/dev/null)" || -n "$(receipt_unsafe)" ]]; then
+    unsafe_why=replaced
+    if [[ "$receipt_locked" == "$("$STAT" -f '%d:%i' "$RECEIPT" 2>/dev/null)" ]]; then receipt_unsafe "$RECEIPT" "$UID_NUM"; fi
+    if [[ -n "$unsafe_why" ]]; then
       shared_why="$RECEIPT was replaced, or stopped passing the checks, while it was locked"
       return 1
     fi
@@ -2385,7 +2491,8 @@ shared_unchanged() {
     return 1
   fi
   [[ "$shared_seen" != none ]] || return 0
-  if [[ -n "$(folders_problem "$RECEIPTS")" ]]; then
+  folders_problem "$RECEIPTS"
+  if [[ -n "$folders_why" ]]; then
     shared_why="$RECEIPTS or a folder above it stopped passing the checks after it was checked"
     return 1
   fi
@@ -2686,6 +2793,13 @@ If no other Insomnia folder of yours has a start to settle, remove the
 receipt and its release file by hand (sudo rm -f $RECEIPT $RELEASED)
 once no Insomnia password dialog is open, then rerun.
 MSG
+  if (( lists_unavailable )); then
+    "$CAT" >&2 <<MSG
+The checks read access control lists with $APP_BIN, which this
+run could not use. Install this version again (install.sh) and rerun, or
+remove the two files by hand as above.
+MSG
+  fi
   exit 1
 fi
 case "$shared_seen" in
