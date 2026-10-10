@@ -59,7 +59,7 @@ final class ReconcileTests: XCTestCase {
 
         XCTAssertEqual(m.session, s)
         XCTAssertTrue(m.isActive)
-        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1"])
+        XCTAssertEqual(h.guardFake.calls, ["pmset -g", "disablesleep 1"], "the journaled hold is confirmed first")
         XCTAssertEqual(m.scheduledDeadline, s.endsAt)
         XCTAssertEqual(h.backstop.arms, 1)
         XCTAssertEqual(m.remainingText, "2h 14m")
@@ -75,6 +75,50 @@ final class ReconcileTests: XCTestCase {
         await m.reconcile()
         XCTAssertEqual(try h.store.loadState()?.sleepDisabledByUs, true)
         XCTAssertEqual(h.guardFake.calls, ["disablesleep 1"])
+    }
+
+    // (b'') valid session whose journaled hold no longer holds: pmset reads
+    // SleepDisabled 0, so the disable was undone while Insomnia was not
+    // running (here by hand; in JournaledSessionEndTests by an agent end
+    // that could record nothing). Ended from the journal, not held again.
+    func testAValidSessionWhoseJournaledHoldWasUndoneIsEndedNotResumed() async throws {
+        let now = h.clock.now
+        try h.store.saveSession(Session(startedAt: now.addingTimeInterval(-600), endsAt: now.addingTimeInterval(3600)))
+        var st = RuntimeState()
+        st.sleepDisabledByUs = true
+        try h.store.saveState(st)
+        h.guardFake.sleepDisabled = false
+
+        let m = h.makeManager()
+        await m.reconcile()
+
+        XCTAssertFalse(m.isActive)
+        XCTAssertFalse(h.guardFake.calls.contains("disablesleep 1"), "\(h.guardFake.calls)")
+        XCTAssertFalse(h.guardFake.sleepDisabled)
+        XCTAssertNil(try h.store.loadSession())
+        XCTAssertEqual(try h.store.loadState()?.isDirty, false)
+        XCTAssertEqual(h.notifier.posts.last?.title, "Sleep restored")
+    }
+
+    // (b''') the same session when pmset -g cannot be read: the hold
+    // cannot be confirmed, so the session ends instead of being held again.
+    func testAValidSessionWhoseJournaledHoldCannotBeConfirmedIsEndedNotResumed() async throws {
+        let now = h.clock.now
+        try h.store.saveSession(Session(startedAt: now.addingTimeInterval(-600), endsAt: now.addingTimeInterval(3600)))
+        var st = RuntimeState()
+        st.sleepDisabledByUs = true
+        try h.store.saveState(st)
+        h.guardFake.sleepDisabled = true
+        h.guardFake.throwOn = ["pmset -g"]
+
+        let m = h.makeManager()
+        await m.reconcile()
+
+        XCTAssertFalse(m.isActive)
+        XCTAssertFalse(h.guardFake.calls.contains("disablesleep 1"), "\(h.guardFake.calls)")
+        XCTAssertTrue(h.guardFake.calls.contains("disablesleep 0"), "\(h.guardFake.calls)")
+        XCTAssertNil(try h.store.loadSession())
+        XCTAssertEqual(try h.store.loadState()?.isDirty, false)
     }
 
     // (c) no session, no journal entry, but pmset reports SleepDisabled:
@@ -377,6 +421,234 @@ final class ReconcileTests: XCTestCase {
         XCTAssertEqual(m.remainingText, "1h")
         m.resumeCountdown()
         XCTAssertEqual(m.remainingText, "58m")
+    }
+
+    // MARK: A session the recovery agent ended while the app could not act
+
+    /// backstop.sh ended the session (battery below the floor while the app
+    /// was stopped, say) and restored from the journal: session.json gone,
+    /// state.json clean. The app still holds the session in memory. Its next
+    /// transaction (an extend here) ends it on the app's side from the clean
+    /// journal: no pmset, no session written back, countdown stopped, and a
+    /// notification that says who ended it. A later end by the user is then
+    /// an ordinary end with nothing left to do.
+    func testASessionTheAgentEndedIsDroppedAtTheNextTransaction() async throws {
+        let m = h.makeManager()
+        await m.start(duration: 3600)
+        XCTAssertTrue(m.isActive)
+        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1"])
+        try h.store.deleteSession()
+        try h.store.saveState(.clean)
+
+        await m.extend(by: 600)
+
+        XCTAssertNil(m.session)
+        XCTAssertFalse(m.isActive)
+        XCTAssertNil(try h.store.loadSession(), "the extend must not write the session back")
+        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
+        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1"], "the agent restored sleep; nothing to undo here")
+        XCTAssertFalse(m.countdownTimerArmed)
+        XCTAssertEqual(h.notifier.posts.last?.title, "Session ended")
+        XCTAssertTrue(h.notifier.posts.last?.body.contains("recovery agent ended the session") ?? false, "\(h.notifier.posts)")
+
+        let outcome = await m.end(reason: .user)
+        XCTAssertEqual(outcome, .restored)
+        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1"])
+    }
+
+    /// What the agent could not undo stays in its journal, and the app's end
+    /// retries it from there: the agent restored sleep but left a frozen
+    /// process, which the app resumes.
+    func testTheAppRetriesWhatTheAgentLeftJournaled() async throws {
+        let m = h.makeManager()
+        await m.start(duration: 3600)
+        try h.store.deleteSession()
+        var left = RuntimeState.clean
+        left.frozenProcesses = [FrozenProcess(pid: 111, startedAt: 5)]
+        try h.store.saveState(left)
+
+        await m.extend(by: 600)
+
+        XCTAssertFalse(m.isActive)
+        XCTAssertEqual(h.procs.resumed, [[111]])
+        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
+    }
+
+    /// An end requested by the user does the same work itself and must not
+    /// be doubled by the check: one end, one notification.
+    func testAUserEndAfterTheAgentsEndIsOneEnd() async throws {
+        let m = h.makeManager()
+        await m.start(duration: 3600)
+        try h.store.deleteSession()
+        try h.store.saveState(.clean)
+        let before = h.notifier.posts.count
+
+        let outcome = await m.end(reason: .user)
+
+        XCTAssertEqual(outcome, .restored)
+        XCTAssertFalse(m.isActive)
+        XCTAssertEqual(h.notifier.posts.count, before + 1)
+        XCTAssertEqual(h.notifier.posts.last?.body, "Ended by you. Sleep is back to normal.")
+    }
+
+    /// With the lid open the countdown ticks once a second, and a tick that
+    /// finds session.json gone ends the session within about a second, with
+    /// no transaction of the user's needed.
+    func testTheCountdownTickNoticesASessionTheAgentEnded() async throws {
+        // Real-time harness so the 1 Hz Timer actually fires.
+        let real = Harness(now: Date())
+        defer { real.home.destroy() }
+        let m = real.makeManager()
+        await m.start(duration: 3600)
+        XCTAssertTrue(m.isActive)
+        XCTAssertTrue(m.countdownTimerArmed)
+        try real.store.deleteSession()
+        try real.store.saveState(.clean)
+
+        let deadline = Date().addingTimeInterval(8)
+        while m.isActive && Date() < deadline {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+
+        XCTAssertFalse(m.isActive)
+        XCTAssertFalse(m.countdownTimerArmed)
+        XCTAssertEqual(real.guardFake.calls, ["disablesleep 1"])
+        XCTAssertTrue(real.notifier.posts.last?.body.contains("recovery agent") ?? false, "\(real.notifier.posts)")
+    }
+
+    /// backstop.sh removes session.json before its undo, so a pmset of its
+    /// that hangs still holds the recovery lock when the tick sees the end.
+    /// The test runs the ticks itself: the 1 Hz timer's first fire date
+    /// comes from the harness clock, which is fixed in 2027, so it never
+    /// fires during the test. The first tick finds the lock held and
+    /// fails one bounded wait. Ticks within the retry delay do not try
+    /// again, although the lock is free by then. The first tick after the
+    /// delay ends the session.
+    func testTheTickWaitsTheRetryDelayWhileTheAgentHoldsTheLock() async throws {
+        let m = h.makeManager(retryDelay: 60)
+        await m.start(duration: 3600)
+        let held = try XCTUnwrap(try RecoveryLock(url: h.home.paths.recoveryLock).tryAcquire())
+        try h.store.deleteSession()
+        try h.store.saveState(.clean)
+        func skipped() -> Int {
+            let log = (try? String(contentsOf: h.home.paths.logFile, encoding: .utf8)) ?? ""
+            return log.components(separatedBy: "agent end skipped").count - 1
+        }
+
+        await m.noticeAgentEnd()
+        XCTAssertEqual(skipped(), 1)
+        XCTAssertTrue(m.isActive)
+
+        held.release()
+        await m.noticeAgentEnd()
+        h.clock.advance(59)
+        await m.noticeAgentEnd()
+        XCTAssertTrue(m.isActive, "no new attempt before the retry delay")
+        XCTAssertEqual(skipped(), 1)
+
+        h.clock.advance(1)
+        await m.noticeAgentEnd()
+        XCTAssertFalse(m.isActive)
+        XCTAssertEqual(skipped(), 1)
+        XCTAssertTrue(h.notifier.posts.last?.body.contains("recovery agent") ?? false, "\(h.notifier.posts)")
+    }
+
+    /// The same backoff for a journal that does not decode: the first tick
+    /// that sees the agent's end is refused, and later ticks inside the
+    /// retry delay start no transaction and log nothing. Once the journal
+    /// is repaired, the first tick after the delay ends the session.
+    func testTheTickWaitsTheRetryDelayWhileTheJournalIsUnreadable() async throws {
+        let m = h.makeManager(retryDelay: 60)
+        await m.start(duration: 3600)
+        try h.store.deleteSession()
+        try Data("{unreadable journal".utf8).write(to: h.home.paths.stateFile)
+        let calls = h.guardFake.calls
+        func refused() -> Int {
+            let log = (try? String(contentsOf: h.home.paths.logFile, encoding: .utf8)) ?? ""
+            return log.components(separatedBy: "agent end refused, nothing changed:").count - 1
+        }
+
+        await m.noticeAgentEnd()
+        await m.noticeAgentEnd()
+        h.clock.advance(59)
+        await m.noticeAgentEnd()
+        XCTAssertEqual(refused(), 1, "one attempt inside the retry delay")
+        XCTAssertTrue(m.isActive)
+        XCTAssertEqual(h.guardFake.calls, calls, "nothing changed")
+
+        try h.store.saveState(.clean)
+        await m.noticeAgentEnd()
+        XCTAssertTrue(m.isActive, "repaired, but still inside the delay")
+
+        h.clock.advance(1)
+        await m.noticeAgentEnd()
+        XCTAssertFalse(m.isActive)
+        XCTAssertEqual(refused(), 1)
+        XCTAssertNil(try h.store.loadSession())
+        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
+        XCTAssertTrue(h.notifier.posts.last?.body.contains("recovery agent") ?? false, "\(h.notifier.posts)")
+    }
+
+    // MARK: A session.json recorded as ended
+
+    /// The agent ended the session but could not remove session.json, so it
+    /// recorded the end in ended-session.json. The tick treats the record as
+    /// it treats a missing file and ends the session here.
+    func testTheTickAdoptsASessionTheAgentRecordedAsEnded() async throws {
+        let m = h.makeManager()
+        await m.start(duration: 3600)
+        XCTAssertTrue(h.store.recordSessionEnd())
+        try h.store.saveState(.clean)
+
+        await m.noticeAgentEnd()
+
+        XCTAssertFalse(m.isActive)
+        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1"], "the agent restored sleep")
+        XCTAssertNil(try h.store.loadSession())
+        XCTAssertFalse(FileManager.default.fileExists(atPath: h.home.paths.endedSessionFile.path), "the record goes with the file")
+        XCTAssertTrue(h.notifier.posts.last?.body.contains("recovery agent ended the session") ?? false, "\(h.notifier.posts)")
+    }
+
+    /// At launch, a valid session.json whose end is recorded is restored as
+    /// an ended session, never resumed, and both files are removed.
+    func testASessionRecordedAsEndedIsRestoredNotResumed() async throws {
+        let now = h.clock.now
+        try h.store.saveSession(Session(startedAt: now.addingTimeInterval(-600), endsAt: now.addingTimeInterval(3600)))
+        var st = RuntimeState()
+        st.sleepDisabledByUs = true
+        try h.store.saveState(st)
+        h.guardFake.sleepDisabled = true
+        XCTAssertTrue(h.store.recordSessionEnd())
+
+        let m = h.makeManager()
+        await m.reconcile()
+
+        XCTAssertFalse(m.isActive)
+        XCTAssertFalse(h.guardFake.calls.contains("disablesleep 1"), "\(h.guardFake.calls)")
+        XCTAssertTrue(h.guardFake.calls.contains("disablesleep 0"), "\(h.guardFake.calls)")
+        XCTAssertNil(try h.store.loadSession())
+        XCTAssertFalse(FileManager.default.fileExists(atPath: h.home.paths.endedSessionFile.path))
+        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
+    }
+
+    /// A record of an earlier session.json matches no later one: the session
+    /// on disk now is resumed as usual.
+    func testAStaleEndRecordDoesNotEndTheSessionOnDisk() async throws {
+        let now = h.clock.now
+        try h.store.saveSession(Session(startedAt: now.addingTimeInterval(-7200), endsAt: now.addingTimeInterval(1800)))
+        XCTAssertTrue(h.store.recordSessionEnd())
+        let s = Session(startedAt: now.addingTimeInterval(-600), endsAt: now.addingTimeInterval(3600))
+        try h.store.saveSession(s)
+        var st = RuntimeState()
+        st.sleepDisabledByUs = true
+        try h.store.saveState(st)
+        h.guardFake.sleepDisabled = true // the crashed session's hold
+
+        let m = h.makeManager()
+        await m.reconcile()
+
+        XCTAssertEqual(m.session, s)
+        XCTAssertEqual(h.guardFake.calls, ["pmset -g", "disablesleep 1"])
     }
 
     func testDeadlineTimerFiresEnd() async throws {

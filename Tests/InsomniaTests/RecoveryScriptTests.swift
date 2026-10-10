@@ -11,13 +11,14 @@ private let backslash = "\\"
 ///
 /// Each test runs a private COPY of the production script against a
 /// throwaway INSOMNIA_HOME. The copy has its fixed tool-path constants
-/// (sudo, pmset, ps, kill, sysctl, pgrep, pkill, osascript, launchctl,
-/// defaults) and its app-bundle / sudoers paths rewritten to point inside
-/// the fixture, so nothing privileged runs, no real process is signaled, no
-/// real app's preferences are read or written, and no real home,
-/// LaunchAgent, sudoers file, or installed app is read or written. plutil
-/// and lockf are the real tools, and so is date, except for the backstop's
-/// moved-aside stamp, which a test can freeze. The fakes record every call.
+/// (sudo, pmset, ps, kill, sysctl, notifyutil, ioreg, pgrep, pkill,
+/// osascript, launchctl, defaults) and its app-bundle / sudoers paths rewritten to
+/// point inside the fixture, so nothing privileged runs, no real process is
+/// signaled, no real app's preferences are read or written, and no real
+/// home, LaunchAgent, sudoers file, or installed app is read or written.
+/// plutil, lockf and cmp are the real tools, and so is date, except for the
+/// backstop's moved-aside stamp, which a test can freeze. The fakes record
+/// every call.
 final class RecoveryScriptTests: XCTestCase {
     private var fx: ScriptFixture!
 
@@ -28,6 +29,14 @@ final class RecoveryScriptTests: XCTestCase {
     override func tearDown() {
         fx.destroy()
         fx = nil
+        // The app tests here point INSOMNIA_HOME at the fixture. Whatever a
+        // test did, the next one must start on the loader's throwaway home,
+        // never on an unset variable that resolves the real ~/Library.
+        let home = ProcessTestHome.current
+        if home != ProcessTestHome.root.path {
+            setenv(Paths.environmentKey, ProcessTestHome.root.path, 1)
+            XCTFail("the test left INSOMNIA_HOME at \(home ?? "unset"), not \(ProcessTestHome.root.path)")
+        }
     }
 
     // MARK: - backstop.sh
@@ -74,17 +83,641 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(fx.exists(fx.state), "must not seed a journal")
     }
 
-    func testValidFutureSessionIsNoOpWithoutForce() throws {
+    // MARK: backstop.sh: a valid session is live only while the app and the floors say so
+
+    private let liveJournal = #"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#
+    private let sleepRestored = "sudo -n PMSET -a disablesleep 0"
+    private let batteryRead = "pmset -g batt"
+    private let thermalRead = "notifyutil -g com.apple.system.thermalpressurelevel"
+    private let batteryServiceRead = "ioreg -r -c AppleSmartBattery -d 1"
+
+    /// A session with an hour left and sleep journaled as ours: what the
+    /// backstop sees every minute while the app runs.
+    private func writeLiveSession() throws {
         try fx.writeSession(endsAt: Date(timeIntervalSinceNow: 3600))
-        let dirty = #"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#
-        try fx.writeState(dirty)
+        try fx.writeState(liveJournal)
+    }
+
+    private func calls() -> [String] {
+        fx.calls().map { $0.replacingOccurrences(of: fx.fakePmset, with: "PMSET") }
+    }
+
+    private func assertSessionEnded(_ r: (status: Int32, stdout: String, stderr: String), reason: String, file: StaticString = #filePath, line: UInt = #line) throws {
+        XCTAssertEqual(r.status, 0, r.stderr + fx.log(), file: file, line: line)
+        XCTAssertTrue(calls().contains(sleepRestored), "\(calls())", file: file, line: line)
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, false, file: file, line: line)
+        XCTAssertFalse(fx.exists(fx.session), "session.json must go with the session", file: file, line: line)
+        XCTAssertTrue(fx.log().contains("ending the session before its deadline"), fx.log(), file: file, line: line)
+        XCTAssertTrue(fx.log().contains(reason), fx.log(), file: file, line: line)
+    }
+
+    private func assertSessionKept(_ r: (status: Int32, stdout: String, stderr: String), file: StaticString = #filePath, line: UInt = #line) throws {
+        XCTAssertEqual(r.status, 0, r.stderr + fx.log(), file: file, line: line)
+        XCTAssertFalse(calls().contains { $0.hasPrefix("sudo") || $0.hasPrefix("kill -CONT") }, "\(calls())", file: file, line: line)
+        XCTAssertEqual(try String(contentsOf: fx.state, encoding: .utf8), liveJournal, "journal must not be rewritten", file: file, line: line)
+        XCTAssertTrue(fx.exists(fx.session), "the session must stand", file: file, line: line)
+    }
+
+    /// The app holds the alive lock, the Mac is on AC power and cool: the
+    /// minute tick reads the battery and the heat and leaves the session
+    /// alone, without a word in the log.
+    func testValidSessionWithTheAppAliveAndAHealthyMachineIsLeftAlone() throws {
+        try writeLiveSession()
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+
+        let r = try fx.run(fx.backstop)
+
+        try assertSessionKept(r)
+        XCTAssertEqual(calls(), [batteryRead, thermalRead], "reads only, nothing privileged")
+        XCTAssertFalse(fx.exists(fx.logFile), "a healthy minute must not spam the log")
+    }
+
+    /// Nobody holds the alive lock: the app crashed, was force-quit or has
+    /// not started yet. The deadline no longer matters; the session ends
+    /// as if --force had been given, and the battery and heat are not even
+    /// read.
+    func testAppNotRunningEndsAValidSession() throws {
+        try writeLiveSession()
+
+        let r = try fx.run(fx.backstop)
+
+        try assertSessionEnded(r, reason: "Insomnia is not running")
+        XCTAssertEqual(calls(), [sleepRestored])
+        XCTAssertTrue(fx.exists(fx.alive), "the probe creates the lock file and keeps it (lockf -k)")
+        XCTAssertTrue(fx.log().contains("journal cleared"), fx.log())
+    }
+
+    /// The probe gives the lock back when it exits: the app can take it
+    /// right after a run, and the next run then sees it held.
+    func testAliveProbeReleasesTheLockItTook() throws {
+        try writeLiveSession()
+        XCTAssertEqual(try fx.run(fx.backstop).status, 0)
+        XCTAssertFalse(fx.exists(fx.session))
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+        try writeLiveSession()
+        fx.clearCalls()
+        try assertSessionKept(try fx.run(fx.backstop))
+    }
+
+    /// The lock the app takes (AppAliveLock.swift) is the lock the script
+    /// probes: held in this process, the session stands; released, as the
+    /// kernel does when the process dies, the next run ends it.
+    func testAppAliveLockTakenByTheAppIsSeenByTheBackstop() throws {
+        try writeLiveSession()
+        let lock = AppAliveLock(url: fx.alive)
+        XCTAssertTrue(try lock.tryAcquire())
+
+        try assertSessionKept(try fx.run(fx.backstop))
+
+        lock.release()
+        fx.clearCalls()
+        try assertSessionEnded(try fx.run(fx.backstop), reason: "Insomnia is not running")
+    }
+
+    /// A valid session whose journal is clean (the app died between writing
+    /// session.json and pmset) is removed without running anything.
+    func testAppNotRunningWithACleanJournalRemovesTheSessionOnly() throws {
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: 3600))
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
 
         let r = try fx.run(fx.backstop)
 
         XCTAssertEqual(r.status, 0, r.stderr)
-        XCTAssertEqual(fx.calls(), [])
-        XCTAssertEqual(try String(contentsOf: fx.state, encoding: .utf8), dirty)
-        XCTAssertTrue(fx.exists(fx.session))
+        XCTAssertEqual(calls(), [])
+        XCTAssertFalse(fx.exists(fx.session))
+        XCTAssertTrue(fx.log().contains("Insomnia is not running"), fx.log())
+        XCTAssertTrue(fx.log().contains("journal already clean"), fx.log())
+    }
+
+    /// Greptile 4219151866: a journal the app does not load stops the run
+    /// before a valid session is ended, whatever ends it (the battery with
+    /// the app alive, config.json missing or read, the app not running,
+    /// --force): session.json and the journal stay byte for byte, no end is
+    /// recorded anywhere, nothing runs, and the log says why. The app's
+    /// decoder refuses each of these journals. The review's trace is the
+    /// first journal with config.json missing, at 20%. Once the journal is
+    /// repaired the next run ends the session. A journal with a key written
+    /// twice, which the app reads by its first copy, ends the session: the
+    /// next test.
+    func testAJournalTheAppDoesNotLoadKeepsAValidSessionTheRunWouldEnd() throws {
+        let journals = [
+            #"{"sleepDisabledByUs":true,"frozenProcesses":"bad","sessionCutoffs":"30 false"}"#,
+            #"{"sleepDisabledByUs":true,"frozenProcesses":[{"pid":2147483648}],"sessionCutoffs":"30 false"}"#,
+            #"{"sleepDisabledByUs":true,"sessionCutoffs":"30 false","#,
+        ]
+        let modes: [(name: String, alive: Bool, config: String?, args: [String], kept: String)] = [
+            ("app alive, config.json missing", true, nil, [], "its cutoffs are not read and it is not ended"),
+            ("app alive, config.json read", true, #"{"endFloor":30,"thermalRules":false}"#, [], "it is not ended"),
+            ("app not running", false, nil, [], "it is not ended"),
+            ("--force", true, nil, ["--force"], "it is not ended"),
+        ]
+        for journal in journals {
+            XCTAssertThrowsError(try Store.makeDecoder().decode(RuntimeState.self, from: Data(journal.utf8)), journal)
+            for mode in modes {
+                let label = "\(mode.name), \(journal)"
+                try? FileManager.default.removeItem(at: fx.config)
+                if let config = mode.config { try fx.writeConfig(config) }
+                try fx.writeSession(endsAt: Date(timeIntervalSinceNow: 3600))
+                let session = try Data(contentsOf: fx.session)
+                try fx.writeState(journal)
+                try? FileManager.default.removeItem(at: fx.logFile)
+                fx.setBattery(fx.battery(source: "Battery Power", percent: 20))
+                fx.clearCalls()
+                let app = mode.alive ? try fx.holdAliveLock() : nil
+
+                let r = try fx.run(fx.backstop, mode.args)
+                app?.release()
+
+                XCTAssertEqual(r.status, 1, "\(label): \(fx.log())")
+                XCTAssertEqual(try Data(contentsOf: fx.session), session, label)
+                XCTAssertEqual(try String(contentsOf: fx.state, encoding: .utf8), journal, label)
+                XCTAssertEqual(try fx.contents(of: fx.home).filter { $0.hasPrefix("ended-session") }, [], label)
+                XCTAssertEqual(((try? fx.contents(of: fx.logFile.deletingLastPathComponent())) ?? []).filter { $0.hasPrefix("ended-session") }, [], label)
+                let lockBytes = fx.exists(fx.lock) ? try Data(contentsOf: fx.lock) : Data()
+                XCTAssertFalse(String(decoding: lockBytes, as: UTF8.self).contains("ended-session-v1"), label)
+                XCTAssertFalse(calls().contains { $0.hasPrefix("sudo") || $0.hasPrefix("kill") }, "\(label): \(calls())")
+                XCTAssertTrue(fx.log().contains("is unreadable or malformed; nothing undone, evidence kept"), "\(label): \(fx.log())")
+                XCTAssertTrue(fx.log().contains("\(fx.session.path) is kept as it is: \(mode.kept) while"), "\(label): \(fx.log())")
+            }
+        }
+
+        try? FileManager.default.removeItem(at: fx.config)
+        try fx.writeState(#"{"sleepDisabledByUs":true,"frozenProcesses":[],"sessionCutoffs":"30 false"}"#)
+        fx.clearCalls()
+        let r = try fx.run(fx.backstop)
+        try assertSessionEnded(r, reason: "Insomnia is not running")
+    }
+
+    /// The controls: the same session with a journal the app loads, as this
+    /// build writes it or as an older one did (frozenPids, no record of the
+    /// cutoffs), ends in each mode. With the app alive and config.json
+    /// missing, the record's 30% floor ends it at 20%, and the defaults'
+    /// 10% one at 9% only. A key written twice, as such or once with an
+    /// escape, is read by its first copy, as the app reads it: those
+    /// journals end the session in each mode of the test above, and the
+    /// journal published holds the key once, with that copy's value.
+    func testAJournalTheAppLoadsLetsTheRunEndAValidSession() throws {
+        let current = #"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"savedAudioOutputs":[],"appNapOverrides":[],"sessionCutoffs":"30 false"}"#
+        let legacy = #"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenPids":[],"dockerFrozen":false}"#
+        let cases: [(journal: String, alive: Bool, args: [String], battery: Int, reason: String?)] = [
+            (current, true, [], 20, "below the 30% end floor"),
+            (current, true, [], 31, nil),
+            (legacy, true, [], 9, "below the 10% end floor"),
+            (legacy, true, [], 20, nil),
+            (current, false, [], 20, "Insomnia is not running"),
+            (legacy, false, [], 20, "Insomnia is not running"),
+            (current, true, ["--force"], 20, "forced end of session"),
+            (legacy, true, ["--force"], 20, "forced end of session"),
+        ]
+        for c in cases {
+            let label = "\(c.args) alive \(c.alive) at \(c.battery)%: \(c.journal)"
+            XCTAssertNoThrow(try Store.makeDecoder().decode(RuntimeState.self, from: Data(c.journal.utf8)), label)
+            try fx.writeSession(endsAt: Date(timeIntervalSinceNow: 3600))
+            try fx.writeState(c.journal)
+            try? FileManager.default.removeItem(at: fx.logFile)
+            fx.setBattery(fx.battery(source: "Battery Power", percent: c.battery))
+            fx.clearCalls()
+            let app = c.alive ? try fx.holdAliveLock() : nil
+
+            let r = try fx.run(fx.backstop, c.args)
+            app?.release()
+
+            if let reason = c.reason {
+                XCTAssertEqual(r.status, 0, "\(label): \(fx.log())")
+                XCTAssertTrue(calls().contains(sleepRestored), "\(label): \(calls()) \(fx.log())")
+                XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, false, label)
+                XCTAssertFalse(fx.exists(fx.session), label)
+                XCTAssertTrue(fx.log().contains(reason), "\(label): \(fx.log())")
+                XCTAssertFalse(fx.log().contains("unreadable or malformed"), "\(label): \(fx.log())")
+            } else {
+                XCTAssertEqual(r.status, 0, "\(label): \(fx.log())")
+                XCTAssertTrue(fx.exists(fx.session), label)
+                XCTAssertEqual(try String(contentsOf: fx.state, encoding: .utf8), c.journal, label)
+            }
+        }
+
+        // pids: the frozen processes the app reads, by pid (nil: no
+        // frozenProcesses key). Pid 5 has no startedAt, so there is no
+        // identity to check and nothing signals it; its entry stays, and
+        // the run exits 1 with the journal kept for it.
+        let b = backslash
+        let twice: [(journal: String, pids: [Int32]?)] = [
+            (#"{"sleepDisabledByUs":true,"sleepDisabledByUs":false,"frozenProcesses":[],"sessionCutoffs":"30 false"}"#, []),
+            (#"{"sleepDisabledByUs":true,"frozenProcesses":[{"pid":5,"pid":6}],"sessionCutoffs":"30 false"}"#, [5]),
+            (#"{"sleepDisabledByUs":true,"sleepDisabledBy\#(b)u0055s":true,"sessionCutoffs":"30 false"}"#, nil),
+        ]
+        let modes: [(name: String, alive: Bool, config: String?, args: [String], reason: String)] = [
+            ("app alive, config.json missing", true, nil, [], "below the 30% end floor"),
+            ("app alive, config.json read", true, #"{"endFloor":30,"thermalRules":false}"#, [], "below the 30% end floor"),
+            ("app not running", false, nil, [], "Insomnia is not running"),
+            ("--force", true, nil, ["--force"], "forced end of session"),
+        ]
+        for row in twice {
+            let decoded = try Store.makeDecoder().decode(RuntimeState.self, from: Data(row.journal.utf8))
+            XCTAssertTrue(decoded.sleepDisabledByUs, row.journal)
+            XCTAssertEqual(decoded.frozenProcesses.map(\.pid), row.pids ?? [], row.journal)
+            for mode in modes {
+                let label = "\(mode.name), \(row.journal)"
+                try? FileManager.default.removeItem(at: fx.config)
+                if let config = mode.config { try fx.writeConfig(config) }
+                try fx.writeSession(endsAt: Date(timeIntervalSinceNow: 3600))
+                try fx.writeState(row.journal)
+                try? FileManager.default.removeItem(at: fx.logFile)
+                fx.setBattery(fx.battery(source: "Battery Power", percent: 20))
+                fx.clearCalls()
+                let app = mode.alive ? try fx.holdAliveLock() : nil
+
+                let r = try fx.run(fx.backstop, mode.args)
+                app?.release()
+
+                let kept = row.pids ?? []
+                XCTAssertEqual(r.status, kept.isEmpty ? 0 : 1, "\(label): \(fx.log())")
+                for pid in kept {
+                    XCTAssertTrue(fx.log().contains("pid \(pid) was journaled without identity; not signaled, kept for the app to resolve"), "\(label): \(fx.log())")
+                }
+                XCTAssertTrue(calls().contains(sleepRestored), "\(label): \(calls()) \(fx.log())")
+                XCTAssertFalse(calls().contains { $0.hasPrefix("kill") }, "\(label): \(calls())")
+                XCTAssertFalse(fx.exists(fx.session), label)
+                XCTAssertTrue(fx.log().contains(mode.reason), "\(label): \(fx.log())")
+                XCTAssertFalse(fx.log().contains("unreadable or malformed"), "\(label): \(fx.log())")
+                let text = try String(contentsOf: fx.state, encoding: .utf8)
+                XCTAssertEqual(text.components(separatedBy: "sleepDisabledBy").count, 2, "\(label): \(text)")
+                XCTAssertEqual(text.components(separatedBy: #""pid""#).count, (row.pids?.count ?? 0) + 1, "\(label): \(text)")
+                let published = try fx.stateJSON()
+                XCTAssertEqual(published["sleepDisabledByUs"] as? Bool, false, label)
+                XCTAssertEqual(published["frozenProcesses"] as? [[String: Int]], row.pids.map { $0.map { ["pid": Int($0)] } }, label)
+                XCTAssertEqual(published["sessionCutoffs"] as? String, "30 false", label)
+            }
+        }
+        try? FileManager.default.removeItem(at: fx.config)
+    }
+
+    func testBatteryBelowTheEndFloorOnBatteryPowerEndsTheSession() throws {
+        try writeLiveSession()
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+        fx.setBattery(fx.battery(source: "Battery Power", percent: 9))
+
+        let r = try fx.run(fx.backstop)
+
+        try assertSessionEnded(r, reason: "battery at 9% on battery power, below the 10% end floor")
+        XCTAssertEqual(calls(), [batteryRead, sleepRestored], "no thermal read once the battery has decided")
+    }
+
+    /// Strict less-than, as in FloorRules.swift: at the floor is not below
+    /// it. On AC power the charge does not matter at all.
+    func testBatteryAtTheFloorOrOnACPowerKeepsTheSession() throws {
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+        for (source, percent, state) in [("Battery Power", 10, "discharging"), ("AC Power", 3, "charging"), ("AC Power", 0, "charging")] {
+            try writeLiveSession()
+            fx.setBattery(fx.battery(source: source, percent: percent, state: state))
+            try assertSessionKept(try fx.run(fx.backstop))
+        }
+    }
+
+    /// Fail closed: a battery that is there but cannot be read, or a pmset
+    /// that fails, ends the session; sleep must not stay disabled on a guess.
+    func testBatteryUnreadableOrPmsetFailingEndsTheSession() throws {
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+        let cases: [(output: String, reason: String)] = [
+            ("FAIL", "battery state unreadable (pmset -g batt exit 1)"),
+            ("Now drawing from 'Battery Power'\n -InternalBattery-0 (id=1)\t(no estimate) present: true\n", "battery present but unreadable"),
+            ("Now drawing from 'UPS Power'\n -InternalBattery-0 (id=1)\t50%; discharging; present: true\n", "battery present but unreadable"),
+            (" -InternalBattery-0 (id=1)\t50%; discharging; present: true\n", "battery present but unreadable"),
+        ]
+        for c in cases {
+            try writeLiveSession()
+            fx.clearCalls()
+            fx.setBattery(c.output)
+            try assertSessionEnded(try fx.run(fx.backstop), reason: c.reason)
+        }
+    }
+
+    /// No InternalBattery line and no AppleSmartBattery service is a
+    /// desktop: there is no battery rule, and the thermal check still runs.
+    func testDesktopWithoutABatteryHasNoBatteryRule() throws {
+        try writeLiveSession()
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+        fx.setBattery("Now drawing from 'AC Power'\n")
+
+        let r = try fx.run(fx.backstop)
+
+        try assertSessionKept(r)
+        XCTAssertEqual(calls(), [batteryRead, batteryServiceRead, thermalRead])
+    }
+
+    /// A laptop whose power source list lost its battery row still has the
+    /// AppleSmartBattery service, as the app's PowerMonitor.classify checks.
+    /// Its level is unknown, so the session ends unless the driver reports a
+    /// charger. An ioreg that fails or hangs cannot show a desktop either.
+    func testABatteryMissingFromPmsetIsJudgedByTheBatteryService() throws {
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+        let ended: [(mode: String, reason: String)] = [
+            ("BATTERY", "battery present (AppleSmartBattery) but missing from pmset -g batt, and no charger reported"),
+            ("BATTERY_NOKEY", "battery present (AppleSmartBattery) but missing from pmset -g batt, and no charger reported"),
+            ("FAIL", "no battery in pmset -g batt, and ioreg exit 1 could not show there is none"),
+            ("HANG", "no battery in pmset -g batt, and ioreg did not finish within 1s"),
+        ]
+        for c in ended {
+            try writeLiveSession()
+            fx.clearCalls()
+            fx.clearLog()
+            fx.setBattery("Now drawing from 'AC Power'\n")
+            fx.setBatteryService(c.mode)
+            try assertSessionEnded(try fx.run(fx.backstop), reason: c.reason)
+            XCTAssertTrue(calls().contains(batteryServiceRead), "\(calls())")
+        }
+
+        try writeLiveSession()
+        fx.clearCalls()
+        fx.setBatteryService("BATTERY_AC")
+        try assertSessionKept(try fx.run(fx.backstop))
+        XCTAssertEqual(calls(), [batteryRead, batteryServiceRead, thermalRead])
+    }
+
+    /// endFloor comes from config.json like the app's; 0 disables the rule;
+    /// a value that is not a whole number falls back to the default 10.
+    func testEndFloorIsReadFromConfigAndZeroDisablesIt() throws {
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+
+        try writeLiveSession()
+        try fx.writeConfig(#"{"endFloor": 30}"#)
+        fx.setBattery(fx.battery(source: "Battery Power", percent: 25))
+        try assertSessionEnded(try fx.run(fx.backstop), reason: "battery at 25% on battery power, below the 30% end floor")
+
+        try writeLiveSession()
+        fx.clearCalls()
+        try fx.writeConfig(#"{"endFloor": 0}"#)
+        fx.setBattery(fx.battery(source: "Battery Power", percent: 1))
+        try assertSessionKept(try fx.run(fx.backstop))
+
+        try writeLiveSession()
+        fx.clearCalls()
+        try fx.writeConfig(#"{"endFloor": "ten"}"#)
+        fx.setBattery(fx.battery(source: "Battery Power", percent: 9))
+        try assertSessionEnded(try fx.run(fx.backstop), reason: "below the 10% end floor")
+
+        try writeLiveSession()
+        fx.clearCalls()
+        try fx.writeConfig("not json at all")
+        try assertSessionEnded(try fx.run(fx.backstop), reason: "below the 10% end floor")
+    }
+
+    /// JSONDecoder reads a number that is exactly an integer as an Int, so
+    /// 30.0 and 3e1 are a 30% floor in the app and 0.0 turns the rule off; a
+    /// fraction fails the app's decode, which then uses the default 10. The
+    /// app clamps the floor to 0...95 (Config.normalizeFloors). The backstop
+    /// enforces the same floor in every case.
+    func testNumericEndFloorsAreReadAsTheAppDecodesAndClampsThem() throws {
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+        let ended: [(config: String, percent: Int, floor: Int)] = [
+            (#"{"configVersion": 2, "endFloor": 30.0}"#, 25, 30),
+            (#"{"endFloor": 3e1}"#, 25, 30),
+            (#"{"endFloor": 30.5}"#, 9, 10),
+            (#"{"endFloor": 30.0000001}"#, 9, 10),
+            (#"{"endFloor": 200}"#, 90, 95),
+        ]
+        for c in ended {
+            try writeLiveSession()
+            fx.clearCalls()
+            fx.clearLog()
+            try fx.writeConfig(c.config)
+            fx.setBattery(fx.battery(source: "Battery Power", percent: c.percent))
+            try assertSessionEnded(try fx.run(fx.backstop), reason: "battery at \(c.percent)% on battery power, below the \(c.floor)% end floor")
+        }
+        let kept: [(config: String, percent: Int)] = [
+            (#"{"endFloor": 30.5}"#, 25),
+            (#"{"endFloor": 0.0}"#, 1),
+            (#"{"endFloor": -5}"#, 1),
+        ]
+        for c in kept {
+            try writeLiveSession()
+            fx.clearCalls()
+            try fx.writeConfig(c.config)
+            fx.setBattery(fx.battery(source: "Battery Power", percent: c.percent))
+            try assertSessionKept(try fx.run(fx.backstop))
+        }
+    }
+
+    /// With the floor off nothing is read, so a failing pmset cannot end a
+    /// session the user exempted from the battery rule.
+    func testEndFloorZeroSkipsTheBatteryReadSoAFailingPmsetCannotEnd() throws {
+        try writeLiveSession()
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+        try fx.writeConfig(#"{"endFloor": 0}"#)
+        fx.setBattery("FAIL")
+
+        let r = try fx.run(fx.backstop)
+
+        try assertSessionKept(r)
+        XCTAssertEqual(calls(), [thermalRead], "no battery read with the floor off")
+    }
+
+    /// A JSON string is not the Int or Bool the app decodes: "30" and
+    /// "false" fall back to the defaults here as they do in the app, so both
+    /// sides enforce the same floor and the same thermal rule.
+    func testStringTypedConfigValuesAreIgnoredLikeTheAppDoes() throws {
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+
+        try writeLiveSession()
+        try fx.writeConfig(#"{"endFloor": "30"}"#)
+        fx.setBattery(fx.battery(source: "Battery Power", percent: 25))
+        try assertSessionKept(try fx.run(fx.backstop))
+
+        try writeLiveSession()
+        fx.clearCalls()
+        try fx.writeConfig(#"{"endFloor": "30"}"#)
+        fx.setBattery(fx.battery(source: "Battery Power", percent: 9))
+        try assertSessionEnded(try fx.run(fx.backstop), reason: "below the 10% end floor")
+
+        try writeLiveSession()
+        fx.clearCalls()
+        try fx.writeConfig(#"{"thermalRules": "false", "endFloor": 10.0}"#)
+        fx.setBattery(fx.battery(source: "AC Power", percent: 50, state: "charging"))
+        fx.setThermal("4")
+        try assertSessionEnded(try fx.run(fx.backstop), reason: "thermal pressure level 4")
+    }
+
+    /// The reads are bounded like the undo commands (COMMAND_TIMEOUT_SECONDS,
+    /// 1 s in this fixture). A battery read that hangs is terminated and
+    /// counts as unreadable: the session ends. A thermal read that hangs
+    /// only warns.
+    func testHungReadsAreBoundedBatteryFailsClosedThermalWarns() throws {
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+
+        try writeLiveSession()
+        fx.setBattery("HANG")
+        var started = Date()
+        try assertSessionEnded(try fx.run(fx.backstop), reason: "pmset -g batt did not finish within 1s")
+        XCTAssertLessThan(Date().timeIntervalSince(started), 20, "the hung read must not hold the run for its whole minute")
+        XCTAssertTrue(fx.log().contains("did not finish within 1s; terminated with SIGTERM"), fx.log())
+        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("kill") }, "the read is signaled as this shell's job, never by a pid handed to $KILL: \(fx.calls())")
+        XCTAssertTrue(fx.hungReadIsGone(), "the hung read was stopped and reaped")
+        let seen = try String(contentsOf: fx.root.appendingPathComponent("read.files"), encoding: .utf8)
+            .split(separator: "\n").map(String.init)
+        XCTAssertEqual(seen.count, 1, "\(seen)")
+        // The battery read is the run's second: with no config.json, the
+        // cutoffs the journal records for the session are read first.
+        XCTAssertTrue(seen.allSatisfy { $0.hasSuffix(".2.out") }, "a read has its output file and no .pid or .rc status files: \(seen)")
+
+        try writeLiveSession()
+        fx.clearCalls()
+        fx.setBattery(fx.battery(source: "AC Power", percent: 100, state: "charged"))
+        fx.setThermal("HANG")
+        started = Date()
+        try assertSessionKept(try fx.run(fx.backstop))
+        XCTAssertLessThan(Date().timeIntervalSince(started), 20)
+        XCTAssertTrue(fx.log().contains("thermal pressure level unreadable"), fx.log())
+        let leftovers = try FileManager.default.contentsOfDirectory(atPath: fx.home.path).filter { $0.hasPrefix(".backstop.") }
+        XCTAssertEqual(leftovers, [], "status and capture files are cleaned up")
+    }
+
+    /// A read never holds the recovery lock: it starts with fd 9 closed, so
+    /// it does not have it while the run holds the lock.
+    /// The fake looks with lsof, which can take seconds on a busy machine,
+    /// so this run gets a 30 s time limit; the read answers as soon as it
+    /// has looked, so the limit never fires.
+    func testReadsRunWithoutTheLockDescriptor() throws {
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+        try writeLiveSession()
+        try fx.setCommandTimeout(30)
+        fx.setThermal("CHECK_FD9")
+
+        try assertSessionKept(try fx.run(fx.backstop))
+
+        XCTAssertTrue(fx.calls().contains("notifyutil checked fd 9"), "\(fx.calls())")
+        XCTAssertFalse(fx.calls().contains { $0.hasSuffix("had fd 9") }, "the read must not inherit the lock: \(fx.calls())")
+        XCTAssertFalse(fx.log().contains("did not finish"), fx.log())
+    }
+
+    /// A read that ignores SIGTERM and leaves a child behind is killed, and
+    /// the lock is free the moment the run exits, so the next minute's run
+    /// takes it and can still end the session.
+    func testReadThatIgnoresSigtermLeavesTheLockToTheNextRun() throws {
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+        try writeLiveSession()
+        fx.setThermal("IGNORE_TERM")
+
+        try assertSessionKept(try fx.run(fx.backstop))
+
+        XCTAssertTrue(fx.log().contains("ignored SIGTERM; sent SIGKILL"), fx.log())
+        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("kill") }, "the read is signaled as this shell's job, never by a pid handed to $KILL: \(fx.calls())")
+        XCTAssertTrue(fx.hungReadIsGone(), "the read that ignored SIGTERM was killed and reaped")
+        XCTAssertTrue(fx.log().contains("thermal pressure level unreadable"), fx.log())
+        XCTAssertTrue(try fx.lockIsFree(), "nothing the read started holds the lock")
+
+        fx.clearCalls()
+        fx.setThermal("3")
+        try assertSessionEnded(try fx.run(fx.backstop), reason: "thermal pressure level 3")
+        let leftovers = try FileManager.default.contentsOfDirectory(atPath: fx.home.path).filter { $0.hasPrefix(".backstop.") }
+        XCTAssertEqual(leftovers, [])
+    }
+
+    /// The first read of a run cleans up like the first undo command (see
+    /// testStatusFilesGoWithTheirCallAndLeftoversOnlyUnderTheRunsOwnLock):
+    /// a run that took the lock itself removes the status and output files
+    /// earlier runs left, and a run that shares its caller's lock leaves
+    /// them, since an earlier run under that lock may still have a
+    /// supervisor waiting for its command. The read's own output file goes
+    /// with its call either way.
+    func testReadsRemoveLeftoversOnlyUnderTheRunsOwnLock() throws {
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+        try writeLiveSession()
+        let leftovers = [".backstop.4242.1.out", ".backstop.4242.1.pid", ".backstop.4242.1.rc"]
+        for name in leftovers {
+            try "4242\n".write(to: fx.home.appendingPathComponent(name), atomically: true, encoding: .utf8)
+        }
+        try Data().write(to: fx.lock)
+        let sharing = fx.root.appendingPathComponent("holder-then-backstop.sh")
+        try """
+        #!/bin/bash
+        set -eu
+        exec 9<>"\(fx.lock.path)"
+        /usr/bin/lockf -t 0 9
+        /bin/bash "\(fx.backstop.path)"
+        """.write(to: sharing, atomically: true, encoding: .utf8)
+
+        try assertSessionKept(try fx.run(sharing))
+        XCTAssertEqual(calls(), [batteryRead, thermalRead])
+        XCTAssertEqual(try fx.backstopFiles(), leftovers)
+
+        try assertSessionKept(try fx.run(fx.backstop))
+        XCTAssertEqual(try fx.backstopFiles(), [])
+    }
+
+    /// Levels 0 to 2 (nominal, moderate, heavy) keep the session; 3 and 4
+    /// (trapping, sleeping) are what ProcessInfo reports as critical and
+    /// end it.
+    func testThermalPressureAtTrappingOrAboveEndsTheSession() throws {
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+        for level in 0...2 {
+            try writeLiveSession()
+            fx.setThermal("\(level)")
+            try assertSessionKept(try fx.run(fx.backstop))
+        }
+        for level in 3...4 {
+            try writeLiveSession()
+            fx.clearCalls()
+            fx.setThermal("\(level)")
+            try assertSessionEnded(try fx.run(fx.backstop), reason: "thermal pressure level \(level) (critical")
+            XCTAssertEqual(calls(), [batteryRead, thermalRead, sleepRestored])
+        }
+    }
+
+    /// Heat is read best effort: a failing or nonsensical notifyutil is a
+    /// warning in the log, never an end on its own.
+    func testThermalUnreadableWarnsWithoutEndingTheSession() throws {
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+        for mode in ["FAIL", "GARBAGE"] {
+            try writeLiveSession()
+            fx.setThermal(mode)
+            try assertSessionKept(try fx.run(fx.backstop))
+            XCTAssertTrue(fx.log().contains("thermal pressure level unreadable"), fx.log())
+            XCTAssertFalse(fx.log().contains("ending the session before its deadline"), fx.log())
+        }
+    }
+
+    func testThermalRulesOffIgnoresCriticalHeat() throws {
+        try writeLiveSession()
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+        try fx.writeConfig(#"{"thermalRules": false}"#)
+        fx.setThermal("4")
+
+        let r = try fx.run(fx.backstop)
+
+        try assertSessionKept(r)
+        XCTAssertEqual(calls(), [batteryRead], "with the rule off the level is not even read")
+    }
+
+    /// A thermal end is logged with the level, and the log names the reason
+    /// in the same line as the restore, so one grep tells the story.
+    func testCutoffReasonIsInTheRestoreLogLine() throws {
+        try writeLiveSession()
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+        fx.setThermal("3")
+
+        _ = try fx.run(fx.backstop)
+
+        XCTAssertTrue(fx.log().contains("session ended early, thermal pressure level 3 (critical from 3 up) (endsAt="), fx.log())
+        XCTAssertTrue(fx.log().contains("restoring from journal"), fx.log())
     }
 
     func testForceEndsValidSession() throws {
@@ -97,6 +730,991 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(fx.calls(), ["sudo -n \(fx.fakePmset) -a disablesleep 0"])
         XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, false)
         XCTAssertFalse(fx.exists(fx.session))
+    }
+
+    // MARK: backstop.sh: an early end is final even when its undo is not
+
+    private let journalWithSavedBrightness = #"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"savedDisplayBrightness":0.6}"#
+
+    /// Saved brightness is the app's to restore, so the run that ends the
+    /// session of an app that died cannot clear the journal. The session
+    /// ends anyway: session.json goes, and what is left stays journaled.
+    func testEarlyEndWithAnUndoOnlyTheAppCanFinishStillRemovesTheSession() throws {
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: 3600))
+        try fx.writeState(journalWithSavedBrightness)
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 1, r.stderr + fx.log())
+        XCTAssertEqual(calls(), [sleepRestored])
+        XCTAssertFalse(fx.exists(fx.session), "a relaunched app must find no session to resume")
+        let s = try fx.stateJSON()
+        XCTAssertEqual(s["sleepDisabledByUs"] as? Bool, false)
+        XCTAssertEqual((s["savedDisplayBrightness"] as? NSNumber)?.doubleValue, 0.6, "kept for the app")
+        XCTAssertTrue(fx.log().contains("Insomnia is not running"), fx.log())
+    }
+
+    /// A pmset that fails leaves sleep journaled, not the session. The next
+    /// run finds no session to check and undoes what is journaled.
+    func testEarlyEndWithAFailingPmsetRemovesTheSessionAndTheNextRunFinishes() throws {
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+        try writeLiveSession()
+        fx.setBattery(fx.battery(source: "Battery Power", percent: 9))
+        fx.setMode("sudo", "fail")
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 1, r.stderr + fx.log())
+        XCTAssertFalse(fx.exists(fx.session))
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, true, "a failed pmset stays journaled")
+        XCTAssertTrue(fx.log().contains("journal kept dirty"), fx.log())
+
+        fx.setMode("sudo", "ok")
+        fx.clearCalls()
+        let next = try fx.run(fx.backstop)
+
+        XCTAssertEqual(next.status, 0, next.stderr + fx.log())
+        XCTAssertEqual(calls(), [sleepRestored], "no session left, so nothing is read before the undo")
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, false)
+    }
+
+    /// --force (install.sh, uninstall.sh) ends a valid session the same way.
+    func testForcedEndWithAFailingPmsetStillRemovesTheSession() throws {
+        try writeLiveSession()
+        fx.setMode("sudo", "fail")
+
+        let r = try fx.run(fx.backstop, ["--force"])
+
+        XCTAssertEqual(r.status, 1, r.stderr + fx.log())
+        XCTAssertFalse(fx.exists(fx.session))
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, true)
+        XCTAssertTrue(fx.log().contains("forced end of session"), fx.log())
+    }
+
+    /// An undo that hangs stops the run with the journal as read and the
+    /// lock with the live command. The session it ended is gone all the
+    /// same, so the app sees the end and nothing can resume it.
+    func testEarlyEndWhoseUndoHangsStillRemovesTheSession() throws {
+        try writeLiveSession()
+        fx.setMode("sudo", "ignore-term")
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertNotEqual(r.status, 0)
+        XCTAssertFalse(fx.exists(fx.session))
+        XCTAssertEqual(try String(contentsOf: fx.state, encoding: .utf8), liveJournal, "journal unchanged while the command runs")
+        XCTAssertFalse(try fx.lockIsFree(), "the live command keeps the lock")
+        fx.releaseCommand()
+        XCTAssertTrue(try fx.waitUntilLockIsFree())
+    }
+
+    /// The relaunch the early end must not undo. The backstop ends the
+    /// session of an app that died; its pmset fails and the saved
+    /// brightness is the app's to restore. Insomnia launched afterwards
+    /// finds no session, so it does not disable sleep again: it restores
+    /// what the journal still holds and leaves it clean.
+    @MainActor
+    func testAppRelaunchedAfterAPartialEarlyEndRestoresInsteadOfResuming() async throws {
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: 3600))
+        try fx.writeState(journalWithSavedBrightness)
+        fx.setMode("sudo", "fail")
+        XCTAssertEqual(try fx.run(fx.backstop).status, 1, fx.log())
+        XCTAssertFalse(fx.exists(fx.session))
+
+        // The app logs into the fixture, not ~/Library/Logs/Insomnia.
+        let restoreHome = pointInsomniaHome(at: fx.home)
+        defer { restoreHome() }
+        let paths = Paths.fromEnvironment()
+        let sleepGuard = FakeSleepGuard()
+        let display = FakeDisplayDimmer(brightness: 0)
+        let m = SessionManager(
+            paths: paths,
+            sleepGuard: sleepGuard,
+            processControl: FakeProcessControl(),
+            backstop: FakeBackstop(),
+            display: display,
+            clamshell: { false },
+            recoveryLockTimeout: 2,
+            recoveryRetryDelay: 3600,
+            reassertDelay: .seconds(3600)
+        )
+        await m.reconcile()
+
+        XCTAssertNil(m.session, "the ended session must not come back")
+        XCTAssertFalse(sleepGuard.calls.contains("disablesleep 1"), "\(sleepGuard.calls)")
+        XCTAssertTrue(sleepGuard.calls.contains("disablesleep 0"), "\(sleepGuard.calls)")
+        XCTAssertEqual(display.sets.last, 0.6)
+        let after = try XCTUnwrap(try Store(paths: paths).loadState())
+        XCTAssertFalse(after.isDirty, "\(after)")
+    }
+
+    // MARK: backstop.sh: a session.json that cannot be removed
+
+    /// session.json is immutable, so the run that ends the session cannot
+    /// remove it. It records the end in ended-session.json, a copy of the
+    /// file's bytes, and still restores sleep. Later runs end the session
+    /// again without reading the battery or the heat, even with the app
+    /// alive, and retry the removal; once it works the record goes too.
+    func testEndThatCannotRemoveSessionJSONRecordsItAndLaterRunsFinish() throws {
+        try writeLiveSession()
+        try setImmutable(fx.session, true)
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 1, r.stderr + fx.log())
+        XCTAssertEqual(calls(), [sleepRestored], "sleep is restored all the same")
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, false)
+        XCTAssertTrue(fx.exists(fx.session))
+        XCTAssertEqual(try Data(contentsOf: fx.endedSession), try Data(contentsOf: fx.session), "the record is the file's exact bytes")
+        XCTAssertNil(try fx.stateJSON()["endedSession"], "ended-session.json holds the record; the journal needs none")
+        XCTAssertTrue(fx.log().contains("its end is recorded in"), fx.log())
+
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+        fx.clearCalls()
+        let again = try fx.run(fx.backstop)
+
+        XCTAssertEqual(again.status, 1, again.stderr + fx.log())
+        XCTAssertEqual(calls(), [], "a session recorded as ended is not checked again")
+        XCTAssertTrue(fx.log().contains("already ended (recorded in"), fx.log())
+        XCTAssertTrue(fx.exists(fx.endedSession))
+
+        try setImmutable(fx.session, false)
+        let last = try fx.run(fx.backstop)
+
+        XCTAssertEqual(last.status, 0, last.stderr + fx.log())
+        XCTAssertFalse(fx.exists(fx.session))
+        XCTAssertFalse(fx.exists(fx.endedSession), "the record goes with the file it copies")
+    }
+
+    /// session.json cannot be removed and ended-session.json holds an
+    /// unrelated record that cannot be replaced. The end goes in the journal
+    /// instead (endedSession, the file's bytes in base64), and every other
+    /// key stays. Sleep is restored and its entry cleared: the record says
+    /// the session is over. Later runs end it again without reading the
+    /// battery or the heat, even with the app alive. The record stays once
+    /// the file is gone; only the app removes it, and it matches nothing.
+    func testEndThatCannotWriteTheEndRecordRecordsItInTheJournal() throws {
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: 3600))
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"futureKey":{"kept":1}}"#)
+        try setImmutable(fx.session, true)
+        try "{}".write(to: fx.endedSession, atomically: true, encoding: .utf8)
+        try setImmutable(fx.endedSession, true)
+        let marker = try Data(contentsOf: fx.session).base64EncodedString()
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 1, r.stderr + fx.log())
+        XCTAssertEqual(calls(), [sleepRestored])
+        let journal = try fx.stateJSON()
+        XCTAssertEqual(journal["endedSession"] as? String, marker)
+        XCTAssertEqual(journal["sleepDisabledByUs"] as? Bool, false)
+        XCTAssertEqual((journal["futureKey"] as? [String: Any])?["kept"] as? Int, 1, "keys the agent does not own survive")
+        XCTAssertNoThrow(try Store(paths: Paths(root: fx.home)).loadState(), "the app still reads the journal")
+        XCTAssertTrue(fx.exists(fx.session))
+        XCTAssertEqual(try String(contentsOf: fx.endedSession, encoding: .utf8), "{}")
+        XCTAssertTrue(fx.log().contains("its end is recorded in \(fx.state.path) (endedSession) instead"), fx.log())
+
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+        fx.clearCalls()
+        let again = try fx.run(fx.backstop)
+
+        XCTAssertEqual(again.status, 1, again.stderr + fx.log())
+        XCTAssertEqual(calls(), [], "a session recorded as ended is not checked again")
+        XCTAssertTrue(fx.log().contains("already ended (recorded in \(fx.state.path) (endedSession))"), fx.log())
+
+        try setImmutable(fx.session, false)
+        let last = try fx.run(fx.backstop)
+
+        XCTAssertEqual(last.status, 0, last.stderr + fx.log())
+        XCTAssertFalse(fx.exists(fx.session))
+        XCTAssertEqual(try fx.stateJSON()["endedSession"] as? String, marker)
+    }
+
+    /// The same with sleep that cannot be restored: the record is in the
+    /// journal before the undo is tried, so it is there although the undo
+    /// failed and sleepDisabledByUs stays for the retry.
+    func testEndRecordGoesInTheJournalBeforeTheUndo() throws {
+        try writeLiveSession()
+        try setImmutable(fx.session, true)
+        try "{}".write(to: fx.endedSession, atomically: true, encoding: .utf8)
+        try setImmutable(fx.endedSession, true)
+        fx.setMode("sudo", "fail")
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 1, r.stderr + fx.log())
+        let journal = try fx.stateJSON()
+        XCTAssertEqual(journal["endedSession"] as? String, try Data(contentsOf: fx.session).base64EncodedString())
+        XCTAssertEqual(journal["sleepDisabledByUs"] as? Bool, true)
+    }
+
+    /// No journal on disk: the record is a journal of its own, which the app
+    /// reads as clean.
+    func testEndRecordWithNoJournalWritesOne() throws {
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: 3600))
+        try setImmutable(fx.session, true)
+        try "{}".write(to: fx.endedSession, atomically: true, encoding: .utf8)
+        try setImmutable(fx.endedSession, true)
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 1, r.stderr + fx.log())
+        XCTAssertEqual(calls(), [], "nothing journaled means nothing to undo")
+        let journal = try XCTUnwrap(try Store(paths: Paths(root: fx.home)).loadState())
+        XCTAssertEqual(journal.endedSession, try Data(contentsOf: fx.session).base64EncodedString())
+        XCTAssertFalse(journal.isDirty)
+    }
+
+    /// The records aside in the fixture's home: names of the record's shape.
+    private func recordsAside() throws -> [String] {
+        try fx.contents(of: fx.home).filter { Paths.isEndedSessionAsideName($0) }
+    }
+
+    /// Neither session.json, nor ended-session.json, nor the journal can be
+    /// written, but the folder takes new files: the end is recorded in a
+    /// new file beside them, ended-session.json.<8 letters or digits>, the
+    /// file's exact bytes, mode 0600. Sleep is restored; the journal keeps
+    /// sleepDisabledByUs because it cannot be written. Later runs end the
+    /// session again without the checks, even with the app alive, and keep
+    /// the record. Once the files can be changed, session.json and the
+    /// record go.
+    func testEndThatCanWriteOnlyANewFileRecordsItAside() throws {
+        try writeLiveSession()
+        try setImmutable(fx.session, true)
+        try "{}".write(to: fx.endedSession, atomically: true, encoding: .utf8)
+        try setImmutable(fx.endedSession, true)
+        try setImmutable(fx.state, true)
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 1, r.stderr + fx.log())
+        XCTAssertEqual(calls(), [sleepRestored])
+        let names = try recordsAside()
+        XCTAssertEqual(names.count, 1, "\(names)")
+        let record = fx.home.appendingPathComponent(try XCTUnwrap(names.first))
+        XCTAssertEqual(try Data(contentsOf: record), try Data(contentsOf: fx.session), "the record is the file's exact bytes")
+        XCTAssertEqual(try FileManager.default.attributesOfItem(atPath: record.path)[.posixPermissions] as? Int, 0o600)
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, true, "state.json cannot be written")
+        XCTAssertNil(try fx.stateJSON()["endedSession"])
+        XCTAssertEqual(try String(contentsOf: fx.endedSession, encoding: .utf8), "{}")
+        XCTAssertTrue(fx.log().contains("could not remove \(fx.session.path) or record its end in \(fx.endedSession.path) or \(fx.state.path); its end is recorded in \(record.path) instead"), fx.log())
+
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+        fx.clearCalls()
+        let again = try fx.run(fx.backstop)
+
+        XCTAssertEqual(again.status, 1, again.stderr + fx.log())
+        XCTAssertEqual(calls(), [sleepRestored], "no checks; the journal still asks for the restore")
+        XCTAssertTrue(fx.log().contains("already ended (recorded in \(record.path))"), fx.log())
+        XCTAssertEqual(try recordsAside(), names, "a record that matches is kept and used again")
+
+        for file in [fx.session, fx.endedSession, fx.state] { try setImmutable(file, false) }
+        let last = try fx.run(fx.backstop)
+
+        XCTAssertEqual(last.status, 0, last.stderr + fx.log())
+        XCTAssertFalse(fx.exists(fx.session))
+        XCTAssertEqual(try recordsAside(), [], "the record goes with the file it copies")
+    }
+
+    /// The same files, the record aside cannot be created either (the
+    /// MKTEMP constant is /usr/bin/false here), and the recovery lock file
+    /// takes no record (LOCK_RECORD_MAX_BYTES is 0 here, a stand-in for a
+    /// write it refuses), nor does insomnia.log (LOG_RECORD_MAX_BYTES is 0):
+    /// nothing on disk says the session is over. Sleep
+    /// is restored anyway, but its journal entry stays as evidence and the
+    /// run exits 1. (The app then resumes nothing either: it writes the
+    /// journal before it resumes a session; JournaledSessionEndTests.)
+    func testEndThatCanNeitherRemoveNorRecordKeepsTheSleepEntry() throws {
+        try writeLiveSession()
+        try setImmutable(fx.session, true)
+        try "{}".write(to: fx.endedSession, atomically: true, encoding: .utf8)
+        try setImmutable(fx.endedSession, true)
+        try setImmutable(fx.state, true)
+        var text = try String(contentsOf: fx.backstop, encoding: .utf8)
+        text = try ScriptFixture.replaceOnce(text, "MKTEMP=/usr/bin/mktemp", with: "MKTEMP=/usr/bin/false")
+        text = try ScriptFixture.replaceOnce(text, "\nLOG_RECORD_MAX_BYTES=65536\n", with: "\nLOG_RECORD_MAX_BYTES=0\n")
+        try ScriptFixture.replaceOnce(text, "\nLOCK_RECORD_MAX_BYTES=1048576\n", with: "\nLOCK_RECORD_MAX_BYTES=0\n")
+            .write(to: fx.backstop, atomically: true, encoding: .utf8)
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 1, r.stderr + fx.log())
+        XCTAssertEqual(calls(), [sleepRestored])
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, true, "evidence kept while the session still reads as valid")
+        XCTAssertNil(try fx.stateJSON()["endedSession"])
+        XCTAssertTrue(fx.exists(fx.session))
+        XCTAssertEqual(try String(contentsOf: fx.endedSession, encoding: .utf8), "{}")
+        XCTAssertEqual(try recordsAside(), [])
+        XCTAssertEqual(try Data(contentsOf: fx.lock), Data())
+        let log = fx.log()
+        XCTAssertTrue(log.contains("could not remove \(fx.session.path) or record its end in \(fx.endedSession.path), \(fx.state.path), a new file in \(fx.home.path) or \(logs.path), the recovery lock file \(fx.lock.path), or the log file \(fx.logFile.path)"), log)
+        XCTAssertTrue(log.contains("still journaled: sleepDisabledByUs is kept although sleep is restored"), log)
+    }
+
+    /// The same files and no record aside, with a recovery lock file that
+    /// takes the record: it then holds the tag and the file's bytes in
+    /// base64, written in place, so its inode stays. Sleep is restored and
+    /// the run exits 1 while session.json stays. Later runs end the session
+    /// again without the checks, even with the app alive. Once the files
+    /// can be changed, session.json goes and the lock file is emptied, the
+    /// same inode still.
+    func testEndThatCanWriteOnlyTheLockFileRecordsItThere() throws {
+        try writeLiveSession()
+        FileManager.default.createFile(atPath: fx.lock.path, contents: nil)
+        let lockInode = try fx.inode(fx.lock)
+        try setImmutable(fx.session, true)
+        try "{}".write(to: fx.endedSession, atomically: true, encoding: .utf8)
+        try setImmutable(fx.endedSession, true)
+        try setImmutable(fx.state, true)
+        let text = try String(contentsOf: fx.backstop, encoding: .utf8)
+        try ScriptFixture.replaceOnce(text, "MKTEMP=/usr/bin/mktemp", with: "MKTEMP=/usr/bin/false")
+            .write(to: fx.backstop, atomically: true, encoding: .utf8)
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 1, r.stderr + fx.log())
+        XCTAssertEqual(calls(), [sleepRestored])
+        let record = "ended-session-v1 \(try Data(contentsOf: fx.session).base64EncodedString())\n"
+        XCTAssertEqual(try String(contentsOf: fx.lock, encoding: .utf8), record)
+        XCTAssertEqual(try fx.inode(fx.lock), lockInode)
+        XCTAssertEqual(try recordsAside(), [])
+        XCTAssertTrue(fx.log().contains("its end is recorded in the recovery lock file \(fx.lock.path) instead"), fx.log())
+
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+        fx.clearCalls()
+        let again = try fx.run(fx.backstop)
+
+        XCTAssertEqual(again.status, 1, again.stderr + fx.log())
+        XCTAssertEqual(calls(), [sleepRestored], "no checks; the journal still asks for the restore")
+        XCTAssertTrue(fx.log().contains("already ended (recorded in \(fx.lock.path))"), fx.log())
+        XCTAssertEqual(try String(contentsOf: fx.lock, encoding: .utf8), record, "a record that matches is kept and used again")
+
+        for file in [fx.session, fx.endedSession, fx.state] { try setImmutable(file, false) }
+        let last = try fx.run(fx.backstop)
+
+        XCTAssertEqual(last.status, 0, last.stderr + fx.log())
+        XCTAssertFalse(fx.exists(fx.session))
+        XCTAssertEqual(try Data(contentsOf: fx.lock), Data(), "the record goes with the file it copies")
+        XCTAssertEqual(try fx.inode(fx.lock), lockInode)
+    }
+
+    private var logs: URL { fx.home.appendingPathComponent("Logs", isDirectory: true) }
+
+    /// The records aside in the log folder.
+    private func recordsInTheLogFolder() throws -> [String] {
+        try fx.contents(of: logs).filter { Paths.isEndedSessionAsideName($0) }
+    }
+
+    /// A folder that takes no new file (mode 0555; the lock file and the
+    /// log folder already exist): session.json cannot be removed and no
+    /// record can be written beside it. The record goes in the log folder,
+    /// the file's exact bytes, mode 0600. The restore still runs, but its
+    /// supervisor cannot write the status files either, so the run cannot
+    /// tell whether the command finished: it reports no result, keeps the
+    /// journal as it was and exits 1. Once the folder takes files again, a
+    /// run with the app alive ends the session without the checks, and
+    /// session.json and the record go.
+    func testEndInAFolderThatTakesNoNewFileRecordsItInTheLogFolder() throws {
+        try writeLiveSession()
+        FileManager.default.createFile(atPath: fx.lock.path, contents: nil)
+        try FileManager.default.createDirectory(at: logs, withIntermediateDirectories: true)
+        let journal = try Data(contentsOf: fx.state)
+        fx.clearCalls()
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: fx.home.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fx.home.path) }
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 1, r.stderr + fx.log())
+        XCTAssertEqual(calls(), [sleepRestored], "the restore runs")
+        XCTAssertTrue(fx.exists(fx.session))
+        XCTAssertFalse(fx.exists(fx.endedSession))
+        XCTAssertEqual(try recordsAside(), [])
+        let names = try recordsInTheLogFolder()
+        XCTAssertEqual(names.count, 1, "\(names)")
+        let record = logs.appendingPathComponent(try XCTUnwrap(names.first))
+        XCTAssertEqual(try Data(contentsOf: record), try Data(contentsOf: fx.session), "the record is the file's exact bytes")
+        XCTAssertEqual(try FileManager.default.attributesOfItem(atPath: record.path)[.posixPermissions] as? Int, 0o600)
+        XCTAssertEqual(try Data(contentsOf: fx.state), journal, "the journal is kept as it was")
+        XCTAssertEqual(try Data(contentsOf: fx.lock), Data(), "the lock file is only the last place")
+        let log = fx.log()
+        XCTAssertTrue(log.contains("its end is recorded in \(record.path) instead"), log)
+        XCTAssertTrue(log.contains("its supervisor reported no result within"), log)
+
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fx.home.path)
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+        fx.clearCalls()
+        let again = try fx.run(fx.backstop)
+
+        XCTAssertEqual(again.status, 0, again.stderr + fx.log())
+        XCTAssertEqual(calls(), [sleepRestored], "no checks; the journal still asks for the restore")
+        XCTAssertTrue(fx.log().contains("already ended (recorded in \(record.path))"), fx.log())
+        XCTAssertFalse(fx.exists(fx.session))
+        XCTAssertEqual(try recordsInTheLogFolder(), [], "the record goes with the file it copies")
+    }
+
+    /// The same with the log folder refusing new files too (both mode
+    /// 0555): no new file can be written anywhere. The record goes in the
+    /// recovery lock file, which exists already, in place, before the
+    /// restore. The restore still runs, the run reports no result, keeps
+    /// the journal as it was and exits 1. Once both folders take files
+    /// again, a run with the app alive ends the session without the
+    /// checks, and session.json goes and the lock file is emptied, its
+    /// inode the same throughout.
+    func testEndWhereNeitherFolderTakesANewFileRecordsItInTheLockFile() throws {
+        try writeLiveSession()
+        FileManager.default.createFile(atPath: fx.lock.path, contents: nil)
+        let lockInode = try fx.inode(fx.lock)
+        try FileManager.default.createDirectory(at: logs, withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: fx.logFile.path, contents: nil)
+        let journal = try Data(contentsOf: fx.state)
+        fx.clearCalls()
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: logs.path)
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: fx.home.path)
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fx.home.path)
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: logs.path)
+        }
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 1, r.stderr + fx.log())
+        XCTAssertEqual(calls(), [sleepRestored], "the restore runs")
+        XCTAssertTrue(fx.exists(fx.session))
+        XCTAssertFalse(fx.exists(fx.endedSession))
+        XCTAssertEqual(try recordsAside(), [])
+        XCTAssertEqual(try recordsInTheLogFolder(), [])
+        XCTAssertEqual(try String(contentsOf: fx.lock, encoding: .utf8), "ended-session-v1 \(try Data(contentsOf: fx.session).base64EncodedString())\n")
+        XCTAssertEqual(try fx.inode(fx.lock), lockInode)
+        XCTAssertEqual(try Data(contentsOf: fx.state), journal, "the journal is kept as it was")
+        let log = fx.log()
+        XCTAssertTrue(log.contains("or a new file in \(fx.home.path) or \(logs.path); its end is recorded in the recovery lock file \(fx.lock.path) instead"), log)
+        XCTAssertTrue(log.contains("its supervisor reported no result within"), log)
+
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fx.home.path)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: logs.path)
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+        fx.clearCalls()
+        let again = try fx.run(fx.backstop)
+
+        XCTAssertEqual(again.status, 0, again.stderr + fx.log())
+        XCTAssertEqual(calls(), [sleepRestored], "no checks; the journal still asks for the restore")
+        XCTAssertTrue(fx.log().contains("already ended (recorded in \(fx.lock.path))"), fx.log())
+        XCTAssertFalse(fx.exists(fx.session))
+        XCTAssertEqual(try Data(contentsOf: fx.lock), Data())
+        XCTAssertEqual(try fx.inode(fx.lock), lockInode)
+    }
+
+    /// The same, and neither the lock file nor insomnia.log takes a
+    /// record (LOCK_RECORD_MAX_BYTES and LOG_RECORD_MAX_BYTES are 0 here,
+    /// stand-ins for a write each refuses): no record can be written
+    /// anywhere. The restore still
+    /// runs, the run reports no result, keeps the journal as it was and
+    /// exits 1. This is the case no record covers (the app then resumes
+    /// nothing while session.json cannot be replaced;
+    /// JournaledSessionEndTests).
+    func testEndWhereNeitherFolderNorTheLockFileTakesTheRecordRecordsNothing() throws {
+        try writeLiveSession()
+        FileManager.default.createFile(atPath: fx.lock.path, contents: nil)
+        try FileManager.default.createDirectory(at: logs, withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: fx.logFile.path, contents: nil)
+        let text = try ScriptFixture.replaceOnce(try String(contentsOf: fx.backstop, encoding: .utf8), "\nLOG_RECORD_MAX_BYTES=65536\n", with: "\nLOG_RECORD_MAX_BYTES=0\n")
+        try ScriptFixture.replaceOnce(text, "\nLOCK_RECORD_MAX_BYTES=1048576\n", with: "\nLOCK_RECORD_MAX_BYTES=0\n")
+            .write(to: fx.backstop, atomically: true, encoding: .utf8)
+        let journal = try Data(contentsOf: fx.state)
+        fx.clearCalls()
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: logs.path)
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: fx.home.path)
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fx.home.path)
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: logs.path)
+        }
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 1, r.stderr + fx.log())
+        XCTAssertEqual(calls(), [sleepRestored], "the restore runs")
+        XCTAssertTrue(fx.exists(fx.session))
+        XCTAssertFalse(fx.exists(fx.endedSession))
+        XCTAssertEqual(try recordsAside(), [])
+        XCTAssertEqual(try recordsInTheLogFolder(), [])
+        XCTAssertEqual(try Data(contentsOf: fx.lock), Data())
+        XCTAssertEqual(try Data(contentsOf: fx.state), journal, "the journal is kept as it was")
+        let log = fx.log()
+        XCTAssertTrue(log.contains("a new file in \(fx.home.path) or \(logs.path), the recovery lock file \(fx.lock.path), or the log file \(fx.logFile.path). Sleep is restored anyway"), log)
+        XCTAssertTrue(log.contains("its supervisor reported no result within"), log)
+    }
+
+    /// In the log folder as beside session.json: a record that matches no
+    /// session.json goes, and the live session is checked as usual. One
+    /// that cmp cannot read stays and ends nothing. A symlink, a FIFO and
+    /// other names are never opened or removed.
+    func testStaleRecordInTheLogFolderIsRemovedAndOthersAreLeft() throws {
+        try writeLiveSession()
+        try FileManager.default.createDirectory(at: logs, withIntermediateDirectories: true)
+        let stale = logs.appendingPathComponent("ended-session.json.Stale001")
+        try #"{"endsAt":"2001-01-01T00:00:00Z","startedAt":"2001-01-01T00:00:00Z"}"#.write(to: stale, atomically: true, encoding: .utf8)
+        let unreadable = logs.appendingPathComponent("ended-session.json.NoRead00")
+        try FileManager.default.copyItem(at: fx.session, to: unreadable)
+        try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: unreadable.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: unreadable.path) }
+        let copy = fx.root.appendingPathComponent("copy-of-session")
+        try FileManager.default.copyItem(at: fx.session, to: copy)
+        let link = logs.appendingPathComponent("ended-session.json.Link0000")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: copy)
+        let other = logs.appendingPathComponent("ended-session.json.Other0000")
+        try FileManager.default.copyItem(at: fx.session, to: other)
+        let fifo = try FIFOWatch(at: logs.appendingPathComponent("ended-session.json.Fifo0000"))
+        defer { fifo.stop() }
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+
+        try assertSessionKept(try fx.run(fx.backstop))
+
+        XCTAssertEqual(calls(), [batteryRead, thermalRead])
+        XCTAssertFalse(fifo.readerSeen, "a FIFO named like a record was opened")
+        XCTAssertFalse(fx.exists(stale))
+        for kept in [unreadable, link, other, fifo.url] {
+            XCTAssertNotNil(try? FileManager.default.attributesOfItem(atPath: kept.path), kept.lastPathComponent)
+        }
+    }
+
+    /// A log folder that is a symlink is not searched: a matching record
+    /// in the folder it points to ends nothing and stays. Nor is a record
+    /// written through it when the folder beside session.json takes no new
+    /// file: the record goes in the recovery lock file, as when both
+    /// folders refuse.
+    func testALogFolderThatIsASymlinkIsNeitherSearchedNorWrittenThrough() throws {
+        try writeLiveSession()
+        let elsewhere = fx.root.appendingPathComponent("elsewhere", isDirectory: true)
+        try FileManager.default.createDirectory(at: elsewhere, withIntermediateDirectories: true)
+        if fx.exists(logs) {
+            for name in try fx.contents(of: logs) {
+                try FileManager.default.moveItem(at: logs.appendingPathComponent(name), to: elsewhere.appendingPathComponent(name))
+            }
+            try FileManager.default.removeItem(at: logs)
+        }
+        try FileManager.default.createSymbolicLink(at: logs, withDestinationURL: elsewhere)
+        let matching = elsewhere.appendingPathComponent("ended-session.json.Elsewher")
+        try FileManager.default.copyItem(at: fx.session, to: matching)
+        do {
+            let app = try fx.holdAliveLock()
+            defer { app.release() }
+            try assertSessionKept(try fx.run(fx.backstop))
+            XCTAssertEqual(calls(), [batteryRead, thermalRead], "checked as usual")
+            XCTAssertTrue(fx.exists(matching))
+        }
+
+        try FileManager.default.removeItem(at: matching)
+        FileManager.default.createFile(atPath: fx.lock.path, contents: nil)
+        fx.clearCalls()
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: fx.home.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fx.home.path) }
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 1, r.stderr + fx.log())
+        XCTAssertEqual(calls(), [sleepRestored])
+        XCTAssertTrue(fx.exists(fx.session))
+        XCTAssertEqual(try fx.contents(of: elsewhere).filter { Paths.isEndedSessionAsideName($0) }, [], "no record through the symlink")
+        XCTAssertTrue(fx.log().contains("or a new file in \(fx.home.path) or \(logs.path); its end is recorded in the recovery lock file \(fx.lock.path) instead"), fx.log())
+        XCTAssertEqual(try String(contentsOf: fx.lock, encoding: .utf8), "ended-session-v1 \(try Data(contentsOf: fx.session).base64EncodedString())\n")
+    }
+
+    /// A record aside that matches no session.json goes, as a stale
+    /// ended-session.json does, and the live session is checked as usual.
+    /// One that cmp cannot read is not shown to be stale and stays; it ends
+    /// nothing. A symlink, a FIFO and other names are never opened or
+    /// removed.
+    func testStaleRecordAsideIsRemovedAndOthersAreLeft() throws {
+        try writeLiveSession()
+        let stale = fx.home.appendingPathComponent("ended-session.json.Stale001")
+        try #"{"endsAt":"2001-01-01T00:00:00Z","startedAt":"2001-01-01T00:00:00Z"}"#.write(to: stale, atomically: true, encoding: .utf8)
+        let unreadable = fx.home.appendingPathComponent("ended-session.json.NoRead00")
+        try FileManager.default.copyItem(at: fx.session, to: unreadable)
+        try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: unreadable.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: unreadable.path) }
+        let copy = fx.root.appendingPathComponent("copy-of-session")
+        try FileManager.default.copyItem(at: fx.session, to: copy)
+        let link = fx.home.appendingPathComponent("ended-session.json.Link0000")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: copy)
+        let other = fx.home.appendingPathComponent("ended-session.json.Other0000")
+        try FileManager.default.copyItem(at: fx.session, to: other)
+        let fifo = try FIFOWatch(at: fx.home.appendingPathComponent("ended-session.json.Fifo0000"))
+        defer { fifo.stop() }
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+
+        try assertSessionKept(try fx.run(fx.backstop))
+
+        XCTAssertEqual(calls(), [batteryRead, thermalRead])
+        XCTAssertFalse(fifo.readerSeen, "a FIFO named like a record was opened")
+        XCTAssertFalse(fx.exists(stale))
+        for kept in [unreadable, link, other, fifo.url] {
+            XCTAssertNotNil(try? FileManager.default.attributesOfItem(atPath: kept.path), kept.lastPathComponent)
+        }
+    }
+
+    /// A journaled end of another session.json (other bytes) ends nothing:
+    /// the live session is checked as usual and kept, and the record stays.
+    func testJournalRecordOfAnotherSessionDoesNotEndTheSession() throws {
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: 3600))
+        let other = Data(#"{"endsAt":"2001-01-01T00:00:00Z","startedAt":"2001-01-01T00:00:00Z"}"#.utf8).base64EncodedString()
+        let journal = #"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"endedSession":"\#(other)"}"#
+        try fx.writeState(journal)
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 0, r.stderr + fx.log())
+        XCTAssertEqual(calls(), [batteryRead, thermalRead])
+        XCTAssertTrue(fx.exists(fx.session), "the session must stand")
+        XCTAssertEqual(try String(contentsOf: fx.state, encoding: .utf8), journal, "journal must not be rewritten")
+    }
+
+    /// endedSession is a string or absent, as the app decodes it. Any other
+    /// type makes the journal malformed for the agent and the app alike.
+    func testJournalWithAnEndRecordThatIsNotAStringIsMalformed() throws {
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        let broken = #"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"endedSession":42}"#
+        try fx.writeState(broken)
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertNotEqual(r.status, 0)
+        XCTAssertEqual(fx.calls(), [])
+        XCTAssertEqual(try String(contentsOf: fx.state, encoding: .utf8), broken)
+        XCTAssertTrue(fx.log().contains("endedSession is a integer, not a string"), fx.log())
+        XCTAssertThrowsError(try Store(paths: Paths(root: fx.home)).loadState())
+    }
+
+    /// sessionCutoffs is a record the app writes as "30 false". A value it
+    /// does not write, of any type, leaves the journal usable for the agent
+    /// and both uninstall modes, as for the app, which reads it as none:
+    /// the undo runs, and the value stays as it is. Each run has a fixture
+    /// of its own, and they go several at a time.
+    func testJournalWithSessionCutoffsTheAppDoesNotWriteIsStillUsable() async throws {
+        var fixtures: [ScriptFixture] = []
+        defer { fixtures.forEach { $0.destroy() } }
+        var rows: [(value: String, purge: Bool?, f: ScriptFixture)] = []
+        for value in [#""96 false""#, "30", "true", #"["30 false"]"#, #"{"endFloor":30}"#, "null", #""30 false""#] {
+            for purge in [nil, false, true] {
+                let f = try ScriptFixture.concurrentRow()
+                fixtures.append(f)
+                if purge != nil {
+                    try f.installMachinery()
+                }
+                try f.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+                let journal = #"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"sessionCutoffs":\#(value)}"#
+                try f.writeState(journal)
+                XCTAssertEqual(try Store(paths: Paths(root: f.home)).loadState()?.sleepDisabledByUs, true, value)
+                rows.append((value, purge, f))
+            }
+        }
+
+        let results = try await ScriptFixture.runAll(rows.map { row in
+            row.purge.map { row.f.launch(row.f.uninstall, $0 ? ["--purge"] : []) } ?? row.f.launch(row.f.backstop)
+        })
+
+        for (row, r) in zip(rows, results) {
+            let (value, purge, f) = (row.value, row.purge, row.f)
+            let label = "\(value), \(purge.map { $0 ? "uninstall --purge" : "uninstall" } ?? "agent")"
+            XCTAssertEqual(r.status, 0, "\(label): \(r.stderr) \(r.stdout) \(f.log())")
+            XCTAssertTrue(f.calls().contains("sudo -n \(f.fakePmset) -a disablesleep 0"), "\(label): \(f.calls())")
+            XCTAssertFalse(f.log().contains("sessionCutoffs is a"), "\(label): \(f.log())")
+            if purge == nil {
+                let after = try String(contentsOf: f.state, encoding: .utf8)
+                XCTAssertTrue(after.contains(#""sessionCutoffs":\#(value)"#) || after.contains(#""sessionCutoffs" : \#(value)"#), "\(label): kept as it is: \(after)")
+                XCTAssertFalse(f.exists(f.session), label)
+            }
+        }
+    }
+
+    /// Greptile 4219151895, uninstall.sh's side (PathSubstitutionTests has
+    /// the agent's): an uninstall that undoes a journaled sleep hold through
+    /// the checkout's backstop.sh, run on twin fixtures with the usual PATH
+    /// (the control) and with PathSubstitutes first in PATH, prints the
+    /// same, makes the same calls and removes the same files, and neither
+    /// script calls a stand-in. Its readers (session.json and the journal's
+    /// shape, the App Nap list, its uid and the app's folder names) would
+    /// read otherwise from a stand-in.
+    func testUninstallAndItsBackstopTakeNoToolFromPath() throws {
+        let twin = try ScriptFixture()
+        defer { twin.destroy() }
+        for f in [fx!, twin] {
+            try f.installMachinery()
+            try f.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+            try f.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        }
+        let log = twin.root.appendingPathComponent("substitutes.log")
+        let path = try PathSubstitutes.path(in: twin.root.appendingPathComponent("substitutes", isDirectory: true), log: log,
+                                            scripts: [twin.repoScripts.path + "/", twin.app.path + "/"])
+
+        let control = try fx.run(fx.uninstall)
+        let r = try twin.run(twin.uninstall, extraEnvironment: ["PATH": path])
+
+        XCTAssertEqual(PathSubstitutes.calls(in: log), [], "uninstall.sh or its backstop.sh called a tool from PATH")
+        XCTAssertEqual(control.status, 0, control.stderr + control.stdout)
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        let same = { (text: String, f: ScriptFixture) in text.replacingOccurrences(of: f.root.path, with: "<root>") }
+        XCTAssertEqual(same(r.stdout, twin), same(control.stdout, fx))
+        XCTAssertEqual(same(r.stderr, twin), same(control.stderr, fx))
+        XCTAssertEqual(twin.calls().map { same($0, twin) }, fx.calls().map { same($0, fx) })
+        XCTAssertTrue(fx.calls().contains("sudo -n \(fx.fakePmset) -a disablesleep 0"), fx.calls().joined(separator: "\n"))
+        for f in [fx!, twin] {
+            XCTAssertFalse(f.exists(f.session))
+            XCTAssertFalse(f.exists(f.app))
+        }
+    }
+
+    /// A record left from an earlier session.json matches nothing: it goes,
+    /// and the live session is checked as usual.
+    func testStaleEndRecordIsRemovedAndDoesNotEndTheSession() throws {
+        try writeLiveSession()
+        try #"{"endsAt":"2001-01-01T00:00:00Z","startedAt":"2001-01-01T00:00:00Z"}"#.write(to: fx.endedSession, atomically: true, encoding: .utf8)
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+
+        try assertSessionKept(try fx.run(fx.backstop))
+
+        XCTAssertEqual(calls(), [batteryRead, thermalRead])
+        XCTAssertFalse(fx.exists(fx.endedSession))
+    }
+
+    /// An exact record beside a session.json that cannot be read (mode 0,
+    /// immutable, so it cannot be moved aside either) is not shown to be
+    /// stale: cmp cannot compare them (exit 2), so it stays, on every
+    /// retry. Once session.json can be read again it ends that session:
+    /// the next run, with the app alive, ends it without the checks and
+    /// removes both. A record beside a session.json that is not a regular
+    /// file stays too; one beside no session.json goes.
+    func testAnExactEndRecordStaysWhileSessionJSONCannotBeCompared() throws {
+        try writeLiveSession()
+        try FileManager.default.copyItem(at: fx.session, to: fx.endedSession)
+        let bytes = try Data(contentsOf: fx.session)
+        try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: fx.session.path)
+        try setImmutable(fx.session, true)
+        defer {
+            try? setImmutable(fx.session, false)
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fx.session.path)
+        }
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+
+        let r = try fx.run(fx.backstop)
+        XCTAssertEqual(r.status, 1, r.stderr + fx.log())
+        XCTAssertEqual(try Data(contentsOf: fx.endedSession), bytes, "kept while it cannot be compared")
+        let retry = try fx.run(fx.backstop)
+        XCTAssertEqual(retry.status, 1, retry.stderr + fx.log())
+        XCTAssertEqual(try Data(contentsOf: fx.endedSession), bytes, "kept on the retry too")
+
+        try setImmutable(fx.session, false)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fx.session.path)
+        try fx.writeState(liveJournal)
+        fx.clearCalls()
+        let repaired = try fx.run(fx.backstop)
+        XCTAssertEqual(repaired.status, 0, repaired.stderr + fx.log())
+        XCTAssertTrue(fx.log().contains("already ended (recorded in \(fx.endedSession.path))"), fx.log())
+        XCTAssertEqual(calls(), [sleepRestored], "no checks for a session recorded as ended")
+        XCTAssertFalse(fx.exists(fx.session))
+        XCTAssertFalse(fx.exists(fx.endedSession))
+
+        try FileManager.default.createDirectory(at: fx.session, withIntermediateDirectories: false)
+        try bytes.write(to: fx.endedSession)
+        _ = try fx.run(fx.backstop)
+        XCTAssertEqual(try Data(contentsOf: fx.endedSession), bytes, "not shown to be stale beside a session.json that is not a file")
+        // That run moved the directory aside, as any session.json it cannot
+        // read; nothing is at session.json now.
+        try? FileManager.default.removeItem(at: fx.session)
+        _ = try fx.run(fx.backstop)
+        XCTAssertFalse(fx.exists(fx.endedSession), "stale once session.json is gone")
+    }
+
+    /// A stale record that cannot be removed ends nothing, but it is a copy
+    /// of a session's times, so every run says it is still there.
+    func testStaleEndRecordThatCannotBeRemovedIsLogged() throws {
+        try writeLiveSession()
+        try "{}".write(to: fx.endedSession, atomically: true, encoding: .utf8)
+        try setImmutable(fx.endedSession, true)
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+
+        try assertSessionKept(try fx.run(fx.backstop))
+
+        XCTAssertTrue(fx.exists(fx.endedSession))
+        XCTAssertTrue(fx.log().contains("could not remove \(fx.endedSession.path)"), fx.log())
+    }
+
+    /// A FIFO at ended-session.json is never opened: cmp would block on it
+    /// while the run holds the recovery lock, and then neither this script
+    /// nor the app could ever end the session. It is not a record, so it
+    /// matches nothing and goes, and the session is judged as usual: with no
+    /// app alive it ends and sleep is restored.
+    func testEndRecordThatIsAFIFOIsNeverOpenedAndTheSessionStillEnds() throws {
+        try writeLiveSession()
+        let fifo = try FIFOWatch(at: fx.endedSession)
+        defer { fifo.stop() }
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertFalse(fifo.readerSeen, "ended-session.json was opened although it is a FIFO")
+        try assertSessionEnded(r, reason: "Insomnia is not running")
+        XCTAssertEqual(calls(), [sleepRestored])
+        XCTAssertFalse(fx.exists(fx.session))
+        XCTAssertFalse(fx.exists(fx.endedSession))
+    }
+
+    /// The same FIFO with the app alive: the session stands, the reads run,
+    /// and the FIFO goes without being opened.
+    func testEndRecordThatIsAFIFODoesNotEndALiveAppsSession() throws {
+        try writeLiveSession()
+        let fifo = try FIFOWatch(at: fx.endedSession)
+        defer { fifo.stop() }
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+
+        try assertSessionKept(try fx.run(fx.backstop))
+
+        XCTAssertFalse(fifo.readerSeen, "ended-session.json was opened although it is a FIFO")
+        XCTAssertEqual(calls(), [batteryRead, thermalRead])
+        XCTAssertFalse(fx.exists(fx.endedSession))
+    }
+
+    /// A FIFO there that cannot be removed either, with session.json that
+    /// cannot be removed: recording the end compares and replaces, and
+    /// neither opens the FIFO. Sleep is restored and the run exits 1.
+    func testEndRecordFIFOThatCannotBeReplacedIsNeverOpenedWhenRecordingTheEnd() throws {
+        try writeLiveSession()
+        try setImmutable(fx.session, true)
+        let fifo = try FIFOWatch(at: fx.endedSession)
+        defer { fifo.stop() }
+        try setImmutable(fx.endedSession, true)
+        defer { try? setImmutable(fx.endedSession, false) }
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 1, r.stderr + fx.log())
+        XCTAssertFalse(fifo.readerSeen, "ended-session.json was opened although it is a FIFO")
+        XCTAssertTrue(fifo.isStillFIFO)
+        XCTAssertEqual(calls(), [sleepRestored])
+        XCTAssertTrue(fx.log().contains("could not remove \(fx.session.path) or record its end"), fx.log())
+    }
+
+    /// config.json is read only as a regular file, like session.json and
+    /// state.json. A FIFO there reads as a missing file: the defaults apply
+    /// (10% floor, thermal rules on), so both reads run and the session
+    /// stands. plutil on macOS 26 refuses a FIFO by itself, so this pins
+    /// the outcome; the regular-file check does not rely on that.
+    func testConfigThatIsAFIFOIsNeverOpenedAndTheDefaultsApply() throws {
+        try writeLiveSession()
+        let fifo = try FIFOWatch(at: fx.config)
+        defer { fifo.stop() }
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+
+        try assertSessionKept(try fx.run(fx.backstop))
+
+        XCTAssertFalse(fifo.readerSeen, "config.json was opened although it is a FIFO")
+        XCTAssertTrue(fifo.isStillFIFO)
+        XCTAssertEqual(calls(), [batteryRead, thermalRead])
+    }
+
+    /// A config.json this user cannot read gives the app no settings
+    /// either (it moves the file aside), so the defaults apply, 10% and
+    /// thermal rules on, whatever the file holds.
+    func testConfigThatCannotBeReadGivesTheDefaults() throws {
+        try writeLiveSession()
+        try fx.writeConfig(#"{"endFloor": 0, "thermalRules": false}"#)
+        try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: fx.config.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fx.config.path) }
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
+        fx.setBattery(fx.battery(source: "Battery Power", percent: 9))
+
+        try assertSessionEnded(try fx.run(fx.backstop), reason: "battery at 9% on battery power, below the 10% end floor")
+        XCTAssertFalse(fx.log().contains("enforcing the strictest"), fx.log())
+    }
+
+    /// The log is appended to only as a regular file. Most lines are written
+    /// under the recovery lock, and open(2) for writing on a FIFO with no
+    /// reader blocks. The test holds a read end open, so a write lands in
+    /// the FIFO's buffer instead of hanging the run, and the buffer must
+    /// stay empty. The lines are dropped; the session still ends.
+    func testLogThatIsAFIFOIsNeverWrittenAndTheSessionStillEnds() throws {
+        try writeLiveSession()
+        try FileManager.default.createDirectory(at: fx.logFile.deletingLastPathComponent(), withIntermediateDirectories: true)
+        XCTAssertEqual(mkfifo(fx.logFile.path, 0o600), 0)
+        let reader = open(fx.logFile.path, O_RDONLY | O_NONBLOCK)
+        XCTAssertGreaterThanOrEqual(reader, 0)
+        defer { close(reader) }
+
+        let r = try fx.run(fx.backstop)
+
+        var buffer = [UInt8](repeating: 0, count: 4096)
+        let n = read(reader, &buffer, buffer.count)
+        XCTAssertLessThanOrEqual(n, 0, "the log FIFO was written: \(String(decoding: buffer.prefix(max(n, 0)), as: UTF8.self))")
+        XCTAssertEqual(r.status, 0, r.stderr)
+        XCTAssertEqual(calls(), [sleepRestored])
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, false)
+        XCTAssertFalse(fx.exists(fx.session))
+        var info = stat()
+        XCTAssertTrue(lstat(fx.logFile.path, &info) == 0 && info.st_mode & S_IFMT == S_IFIFO)
+    }
+
+    /// The relaunch the record exists for. The backstop ends the session of
+    /// an app that died and cannot remove session.json. Insomnia launched
+    /// afterwards finds a valid session.json, sees the record and restores
+    /// instead of resuming. Once the file can be removed, its next reconcile
+    /// removes both.
+    @MainActor
+    func testAppRelaunchedAfterAnEndRecordRestoresInsteadOfResuming() async throws {
+        // Written by the app's Store, so the app reads it as a valid session.
+        try Store(paths: Paths(root: fx.home)).saveSession(Session(startedAt: Date(timeIntervalSinceNow: -600), endsAt: Date(timeIntervalSinceNow: 3600)))
+        try fx.writeState(journalWithSavedBrightness)
+        try setImmutable(fx.session, true)
+        XCTAssertEqual(try fx.run(fx.backstop).status, 1, fx.log())
+        XCTAssertTrue(fx.exists(fx.endedSession))
+
+        let restoreHome = pointInsomniaHome(at: fx.home)
+        defer { restoreHome() }
+        let paths = Paths.fromEnvironment()
+        let sleepGuard = FakeSleepGuard()
+        let display = FakeDisplayDimmer(brightness: 0)
+        let notifier = RecordingNotifier()
+        let m = SessionManager(
+            paths: paths,
+            sleepGuard: sleepGuard,
+            processControl: FakeProcessControl(),
+            backstop: FakeBackstop(),
+            display: display,
+            notifier: notifier,
+            clamshell: { false },
+            recoveryLockTimeout: 2,
+            recoveryRetryDelay: 3600,
+            reassertDelay: .seconds(3600)
+        )
+        await m.reconcile()
+
+        XCTAssertNil(m.session, "the ended session must not come back")
+        XCTAssertFalse(sleepGuard.calls.contains("disablesleep 1"), "\(sleepGuard.calls)")
+        XCTAssertEqual(display.sets.last, 0.6)
+        XCTAssertFalse(try XCTUnwrap(try Store(paths: paths).loadState()).isDirty)
+        XCTAssertTrue(notifier.posts.contains { $0.body.contains("its end is recorded, so a relaunch will not resume it") }, "\(notifier.posts)")
+
+        try setImmutable(fx.session, false)
+        await m.reconcile()
+
+        XCTAssertFalse(fx.exists(fx.session))
+        XCTAssertFalse(fx.exists(fx.endedSession))
+        XCTAssertFalse(sleepGuard.calls.contains("disablesleep 1"), "\(sleepGuard.calls)")
     }
 
     func testExpiredSessionRestoresEverythingAndClearsJournal() throws {
@@ -558,6 +2176,50 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(fx.log().contains("malformed"), fx.log())
     }
 
+    /// Frozen entries the app decodes without an identity, because a
+    /// startedAt or startedAtMicros is missing or null (FrozenProcess),
+    /// with what follows of the wrong type or past Int32: the app loads the
+    /// journal, so the run restores sleep, signals nothing and keeps each
+    /// entry for the app. The same values in an entry with every identity
+    /// key are read by the app and refused, so that journal stops the run
+    /// before any command, its bytes and session.json kept.
+    func testProvisionalEntriesTheAppDoesNotReadFurtherDoNotBlockRecovery() throws {
+        let rows: [(entry: String, loads: Bool)] = [
+            (#"{"pid":4242,"startedAtMicros":"bad","bootSession":"test"}"#, true),
+            (#"{"pid":4242,"startedAt":123,"bootSession":42}"#, true),
+            (#"{"pid":4242,"startedAtMicros":2147483648}"#, true),
+            (#"{"pid":4242,"startedAt":null,"startedAtMicros":"bad","bootSession":42}"#, true),
+            (#"{"pid":4242,"startedAt":123,"startedAtMicros":0,"bootSession":42}"#, false),
+            (#"{"pid":4242,"startedAt":123,"startedAtMicros":2147483648,"bootSession":"test"}"#, false),
+        ]
+        for row in rows {
+            let f = try ScriptFixture()
+            defer { f.destroy() }
+            try f.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+            let journal = #"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"dockerFrozen":false,"frozenProcesses":["# + row.entry + "]}"
+            try f.writeState(journal)
+            let session = try Data(contentsOf: f.session)
+
+            let r = try f.run(f.backstop)
+
+            let calls = f.calls().map { $0.replacingOccurrences(of: f.fakePmset, with: "PMSET") }
+            XCTAssertNotEqual(r.status, 0, row.entry)
+            XCTAssertFalse(calls.contains { $0.hasPrefix("kill") || $0.contains("-CONT") }, "\(row.entry): \(calls)")
+            if row.loads {
+                XCTAssertEqual(calls, [sleepRestored], row.entry)
+                XCTAssertTrue(f.log().contains("pid 4242 was journaled without identity; not signaled, kept for the app to resolve"), "\(row.entry): \(f.log())")
+                XCTAssertFalse(f.log().contains("malformed"), "\(row.entry): \(f.log())")
+                XCTAssertEqual((try f.stateJSON()["frozenProcesses"] as? [Any])?.count, 1, row.entry)
+                XCTAssertEqual(try f.stateJSON()["sleepDisabledByUs"] as? Bool, false, row.entry)
+            } else {
+                XCTAssertEqual(calls, [], row.entry)
+                XCTAssertTrue(f.log().contains("malformed"), "\(row.entry): \(f.log())")
+                XCTAssertEqual(try String(contentsOf: f.state, encoding: .utf8), journal, row.entry)
+                XCTAssertEqual(try Data(contentsOf: f.session), session, row.entry)
+            }
+        }
+    }
+
     func testExpiredSessionWithMissingJournalRunsNothingPrivileged() throws {
         try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
 
@@ -745,15 +2407,18 @@ final class RecoveryScriptTests: XCTestCase {
     }
 
     /// The fixture's own session, which has every field the decoder needs,
-    /// is a session: a future one keeps sleep disabled and nothing runs.
+    /// is a session: a future one, with the app holding the alive lock,
+    /// keeps sleep disabled, and only the battery and thermal reads run.
     func testCompleteSessionWithAFutureEndsAtIsValid() throws {
         try fx.writeSession(endsAt: Date(timeIntervalSinceNow: 3600))
         try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
 
         let r = try fx.run(fx.backstop)
 
         XCTAssertEqual(r.status, 0, r.stderr + fx.log())
-        XCTAssertEqual(fx.calls(), [])
+        XCTAssertEqual(calls(), [batteryRead, thermalRead], "reads only, nothing privileged")
         XCTAssertTrue(fx.exists(fx.session))
         XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, true)
     }
@@ -845,8 +2510,9 @@ final class RecoveryScriptTests: XCTestCase {
     }
 
     /// A session written with offsets is a session for the backstop too: a
-    /// future one keeps sleep disabled and nothing runs, a past one is
-    /// undone like any expired session.
+    /// future one with the app running keeps sleep disabled, and only the
+    /// battery and thermal reads run. A past one is undone like any expired
+    /// session.
     func testSessionWithOffsetDatesIsReadLikeTheApp() throws {
         let dirty = #"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#
         let f = DateFormatter()
@@ -861,13 +2527,16 @@ final class RecoveryScriptTests: XCTestCase {
 
         try write(endsAt: Date(timeIntervalSinceNow: 3600))
         try fx.writeState(dirty)
+        let app = try fx.holdAliveLock()
         let future = try fx.run(fx.backstop)
+        app.release()
 
         XCTAssertEqual(future.status, 0, future.stderr + fx.log())
-        XCTAssertEqual(fx.calls(), [])
+        XCTAssertEqual(calls(), [batteryRead, thermalRead])
         XCTAssertTrue(fx.exists(fx.session))
         XCTAssertEqual(try String(contentsOf: fx.state, encoding: .utf8), dirty)
 
+        fx.clearCalls()
         try write(endsAt: Date(timeIntervalSinceNow: -60))
         let past = try fx.run(fx.backstop)
 
@@ -1123,6 +2792,240 @@ final class RecoveryScriptTests: XCTestCase {
         }
     }
 
+    /// Records aside (ended-session.json.<8 letters or digits>) go with or
+    /// without --purge. The backstop run removes a stale one first; one it
+    /// cannot remove (immutable here) is named and counted by uninstall,
+    /// a directory of that name is left and named, other names stay.
+    func testUninstallRemovesRecordsAsideAndNamesWhatItCannot() throws {
+        for purge in [false, true] {
+            try fx.installMachinery()
+            let removable = fx.home.appendingPathComponent("ended-session.json.Abcd1234")
+            let pinned = fx.home.appendingPathComponent("ended-session.json.Pinned00")
+            let dir = fx.home.appendingPathComponent("ended-session.json.Dir00000")
+            let notOurs = fx.home.appendingPathComponent("ended-session.json.notes")
+            for file in [removable, pinned, notOurs] {
+                try "{}".write(to: file, atomically: true, encoding: .utf8)
+            }
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            try setImmutable(pinned, true)
+            defer { try? setImmutable(pinned, false) }
+
+            let r = try fx.run(fx.uninstall, purge ? ["--purge"] : [])
+
+            XCTAssertEqual(r.status, 1, "purge \(purge): " + r.stderr + r.stdout)
+            XCTAssertFalse(fx.exists(removable), "purge \(purge)")
+            XCTAssertTrue(fx.exists(pinned))
+            XCTAssertTrue(r.stderr.contains("Could not remove \(pinned.path); left in place."), r.stderr)
+            XCTAssertTrue(r.stdout.contains("Left \(dir.path): it is not a regular file, so Insomnia did not write it."), r.stdout)
+            XCTAssertTrue(fx.exists(dir))
+            XCTAssertTrue(fx.exists(notOurs))
+            try setImmutable(pinned, false)
+            try FileManager.default.removeItem(at: pinned)
+            try FileManager.default.removeItem(at: dir)
+            try FileManager.default.removeItem(at: notOurs)
+        }
+    }
+
+    /// The record of a session's end in the recovery lock file goes with or
+    /// without --purge, emptied in place: the file and its inode stay. The
+    /// fixture's backstop is changed here to leave it, so what empties it
+    /// is uninstall's own copy of the rule. A symlink at the lock path
+    /// before uninstall starts stops it before it removes anything, as on
+    /// main: the backstop cannot show that the link is the lock uninstall
+    /// holds, so it waits on that lock and gives up (exit 75). One put there
+    /// during the run is named and left. Neither writes the file a symlink
+    /// points to.
+    func testUninstallEmptiesTheLockFileRecordInPlaceInBothModes() throws {
+        let text = try String(contentsOf: fx.backstop, encoding: .utf8)
+        let clear = #"  if lock_is_held_file && { : > "$LOCK"; } 2>/dev/null; then return 0; fi"#
+        try ScriptFixture.replaceOnce(text, clear, with: "  return 0")
+            .write(to: fx.backstop, atomically: true, encoding: .utf8)
+        let record = Data("ended-session-v1 QUJD\n".utf8)
+        for purge in [false, true] {
+            try fx.installMachinery()
+            FileManager.default.createFile(atPath: fx.lock.path, contents: record)
+            let lockInode = try fx.inode(fx.lock)
+
+            let r = try fx.run(fx.uninstall, purge ? ["--purge"] : [])
+
+            XCTAssertEqual(r.status, 0, "purge \(purge): " + r.stderr + r.stdout)
+            XCTAssertEqual(try Data(contentsOf: fx.lock), Data(), "purge \(purge)")
+            XCTAssertEqual(try fx.inode(fx.lock), lockInode, "purge \(purge)")
+            XCTAssertTrue(r.stdout.contains("Emptied \(fx.lock.path) of the record of a session's end; the file itself is kept."), r.stdout)
+        }
+
+        try fx.installMachinery()
+        let target = fx.root.appendingPathComponent("elsewhere.lock")
+        try record.write(to: target)
+        try FileManager.default.removeItem(at: fx.lock)
+        try FileManager.default.createSymbolicLink(at: fx.lock, withDestinationURL: target)
+        var r = try fx.run(fx.uninstall)
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertTrue(r.stderr.contains("Uninstall stopped BEFORE removing anything"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("backstop exited 75"), r.stderr)
+        XCTAssertTrue((try? String(contentsOf: fx.logFile, encoding: .utf8))?.contains("recovery lock \(fx.lock.path) still held") == true)
+        XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: fx.lock.path), target.path)
+        XCTAssertEqual(try Data(contentsOf: target), record)
+
+        // That uninstall removed nothing, so the machinery is still there.
+        try FileManager.default.removeItem(at: fx.lock)
+        FileManager.default.createFile(atPath: fx.lock.path, contents: record)
+        let moved = fx.root.appendingPathComponent("moved.lock")
+        try ScriptFixture.replaceOnce(text, clear, with: "  /bin/mv \"$LOCK\" '\(moved.path)' && /bin/ln -s '\(target.path)' \"$LOCK\"; return 0")
+            .write(to: fx.backstop, atomically: true, encoding: .utf8)
+        r = try fx.run(fx.uninstall)
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertTrue(r.stdout.contains("Left the contents of \(fx.lock.path): it is not a regular file this user owns."), r.stdout)
+        XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: fx.lock.path), target.path)
+        XCTAssertEqual(try Data(contentsOf: target), record)
+        XCTAssertEqual(try Data(contentsOf: moved), record)
+    }
+
+    /// Records in the log folder go with or without --purge, as those
+    /// beside session.json do: one uninstall cannot remove (immutable) is
+    /// named by uninstall itself, and other names stay. With only a record
+    /// in it, --purge then removes the log folder.
+    func testUninstallRemovesRecordsInTheLogFolderInBothModes() throws {
+        for purge in [false, true] {
+            try fx.installMachinery()
+            try FileManager.default.createDirectory(at: logs, withIntermediateDirectories: true)
+            let removable = logs.appendingPathComponent("ended-session.json.Abcd1234")
+            let pinned = logs.appendingPathComponent("ended-session.json.Pinned00")
+            let notOurs = logs.appendingPathComponent("ended-session.json.notes")
+            for file in [removable, pinned, notOurs] {
+                try "{}".write(to: file, atomically: true, encoding: .utf8)
+            }
+            try setImmutable(pinned, true)
+            defer { try? setImmutable(pinned, false) }
+
+            let r = try fx.run(fx.uninstall, purge ? ["--purge"] : [])
+
+            XCTAssertEqual(r.status, 1, "purge \(purge): " + r.stderr + r.stdout)
+            XCTAssertFalse(fx.exists(removable), "purge \(purge)")
+            XCTAssertTrue(fx.exists(pinned))
+            XCTAssertTrue(r.stderr.contains("Could not remove \(pinned.path); left in place."), r.stderr)
+            XCTAssertTrue(fx.exists(notOurs))
+            try setImmutable(pinned, false)
+            try FileManager.default.removeItem(at: pinned)
+            try FileManager.default.removeItem(at: notOurs)
+        }
+
+        try fx.installMachinery()
+        try FileManager.default.createDirectory(at: logs, withIntermediateDirectories: true)
+        let only = logs.appendingPathComponent("ended-session.json.Only0000")
+        try "{}".write(to: only, atomically: true, encoding: .utf8)
+        let r = try fx.run(fx.uninstall, ["--purge"])
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertFalse(fx.exists(only))
+        XCTAssertFalse(fx.exists(logs), "--purge removes the log folder once the record is gone")
+    }
+
+    /// --purge keeps insomnia.log and insomnia.log.1 while session.json is
+    /// still there, as they may record its end (record_end_in_log in
+    /// backstop.sh); it removes them once session.json is gone. Purge runs
+    /// only with no session.json (journal_problems), so this copy of
+    /// uninstall.sh puts a pinned one back once purge starts: the guard is
+    /// defensive, and this is the only way to reach it.
+    func testUninstallPurgeKeepsTheLogsWhileSessionJSONIsThere() throws {
+        try fx.installMachinery()
+        try FileManager.default.createDirectory(at: logs, withIntermediateDirectories: true)
+        let rotated = logs.appendingPathComponent("insomnia.log.1")
+        for file in [fx.logFile, rotated] {
+            try "insomnia-ended-session-v1 2 e30=\n".write(to: file, atomically: true, encoding: .utf8)
+        }
+        let step = "  step \"Purging Insomnia's files in $APP_SUPPORT and $LOG_DIR\"\n"
+        var text = try String(contentsOf: fx.uninstall, encoding: .utf8)
+        XCTAssertEqual(text.components(separatedBy: step).count, 2)
+        text = text.replacingOccurrences(of: step, with: step + "  printf '{}' > \"$SESSION\"; /usr/bin/chflags uchg \"$SESSION\"\n")
+        try text.write(to: fx.uninstall, atomically: true, encoding: .utf8)
+        defer { try? setImmutable(fx.session, false) }
+
+        let r = try fx.run(fx.uninstall, ["--purge"])
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertTrue(r.stderr.contains("Could not remove \(fx.session.path); left in place."), r.stderr)
+        XCTAssertTrue(r.stdout.contains("Kept \(logs.path)/insomnia.log and \(logs.path)/insomnia.log.1: \(fx.session.path) is still there, and they may record its end."), r.stdout)
+        XCTAssertTrue(fx.exists(fx.logFile))
+        XCTAssertTrue(fx.exists(rotated))
+
+        try setImmutable(fx.session, false)
+        try FileManager.default.removeItem(at: fx.session)
+        text = text.replacingOccurrences(of: "  printf '{}' > \"$SESSION\"; /usr/bin/chflags uchg \"$SESSION\"\n", with: "")
+        try text.write(to: fx.uninstall, atomically: true, encoding: .utf8)
+        try fx.installMachinery()
+        let again = try fx.run(fx.uninstall, ["--purge"])
+        XCTAssertEqual(again.status, 0, again.stderr + again.stdout)
+        XCTAssertFalse(fx.exists(fx.logFile))
+        XCTAssertFalse(fx.exists(rotated))
+    }
+
+    /// The backstop run uninstall makes (--force), in both modes, with a
+    /// log that ends in a line cut short. session.json, ended-session.json
+    /// and state.json are pinned, no record aside can be created and the
+    /// lock file takes none, so the log is the only place left for the
+    /// record. A record of this session whose newline alone is missing
+    /// ends it, and every line the run writes after it starts on a line of
+    /// its own, so it stays whole and is used again. Otherwise the log ends
+    /// in a line a write left partway, and another write leaves `cut sh`
+    /// at its end again before each check for a record (GREP is a fake
+    /// here), the one just before the record is written included: the
+    /// run's first attempt writes the record on a line of its own and
+    /// reads it back. Uninstall then stops with session.json and the logs
+    /// kept.
+    func testUninstallsBackstopRunKeepsALineCutShortApartInBothModes() throws {
+        for purge in [false, true] {
+            for recorded in [true, false] {
+                let f = try ScriptFixture()
+                defer {
+                    for file in [f.session, f.endedSession, f.state] { try? setImmutable(file, false) }
+                    f.destroy()
+                }
+                try f.installMachinery()
+                try f.writeSession(endsAt: Date(timeIntervalSinceNow: 3600))
+                try f.writeState(liveJournal)
+                let record = String(decoding: try XCTUnwrap(LogEndRecord.line(for: try Data(contentsOf: f.session))), as: UTF8.self)
+                try Data("log\n\(recorded ? record : "cut sh")".utf8).write(to: f.logFile)
+                try "{}".write(to: f.endedSession, atomically: true, encoding: .utf8)
+                for file in [f.session, f.endedSession, f.state] { try setImmutable(file, true) }
+                var text = try ScriptFixture.replaceOnce(try String(contentsOf: f.backstop, encoding: .utf8), "MKTEMP=/usr/bin/mktemp", with: "MKTEMP=/usr/bin/false")
+                text = try ScriptFixture.replaceOnce(text, "\nLOCK_RECORD_MAX_BYTES=1048576\n", with: "\nLOCK_RECORD_MAX_BYTES=0\n")
+                if !recorded {
+                    let grep = f.root.appendingPathComponent("grep")
+                    try #"""
+                    #!/bin/bash
+                    if [[ "${1:-}" == -Fxq && "${2:-}" == -e && "${3:-}" == "insomnia-ended-session-v1 "* ]]; then
+                      if [[ "$(/usr/bin/tail -c 1 '\#(f.logFile.path)'; printf x)" == $'\nx' ]]; then printf 'cut sh' >> '\#(f.logFile.path)'; fi
+                    fi
+                    exec /usr/bin/grep "$@"
+
+                    """#.write(to: grep, atomically: true, encoding: .utf8)
+                    try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: grep.path)
+                    text = try ScriptFixture.replaceOnce(text, "\nGREP=/usr/bin/grep\n", with: "\nGREP='\(grep.path)'\n")
+                }
+                try text.write(to: f.backstop, atomically: true, encoding: .utf8)
+
+                let r = try f.run(f.uninstall, purge ? ["--purge"] : [])
+
+                let label = "\(purge ? "--purge" : "plain"), \(recorded ? "record" : "cut sh")"
+                let log = f.log()
+                XCTAssertNotEqual(r.status, 0, "\(label): \(r.stdout)")
+                XCTAssertTrue(f.calls().contains("sudo -n \(f.fakePmset) -a disablesleep 0"), "\(label): \(f.calls())")
+                XCTAssertEqual(log.components(separatedBy: "\n").filter { $0 == record }.count, 1, "\(label): \(log)")
+                XCTAssertTrue(log.contains("\(record)\n"), "\(label): \(log)")
+                XCTAssertTrue(log.contains("its end is recorded in the log file \(f.logFile.path) instead"), "\(label): \(log)")
+                if recorded {
+                    XCTAssertTrue(log.hasPrefix("log\n\(record)\n"), "\(label): \(log)")
+                } else {
+                    XCTAssertTrue(log.hasPrefix("log\ncut sh\n"), "\(label): \(log)")
+                    XCTAssertTrue(log.contains("cut sh\n\(record)\n"), "\(label): \(log)")
+                    XCTAssertEqual(Set(log.components(separatedBy: "\n").filter { $0.contains("cut sh") }), ["cut sh"], "\(label): \(log)")
+                }
+                XCTAssertTrue(f.exists(f.session), label)
+                XCTAssertTrue(f.exists(f.logFile), label)
+            }
+        }
+    }
+
     /// --purge removes the moved-aside copies, but only names of exactly the
     /// shape Insomnia produces. Anything else under the prefix stays.
     func testUninstallPurgeRemovesOnlyMovedAsideSessionFilesOfInsomniasShape() throws {
@@ -1137,6 +3040,38 @@ final class RecoveryScriptTests: XCTestCase {
 
         XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
         XCTAssertEqual(try movedAsideSessions(), [notOurs])
+    }
+
+    /// The app renames a config.json it cannot decode to the same shape
+    /// (Store.moveAsideUnreadableConfig). A plain uninstall keeps those
+    /// copies, as it keeps config.json; --purge removes them, and only them:
+    /// another name under the prefix and a directory named like a copy stay.
+    func testUninstallKeepsMovedAsideConfigCopiesAndPurgeRemovesOnlyThose() throws {
+        func movedAsideConfigs() throws -> [String] {
+            try fx.contents(of: fx.home).filter { $0.hasPrefix("config.json.unreadable-") }.sorted()
+        }
+        try fx.installMachinery()
+        let ours = ["config.json.unreadable-20260101T000000Z", "config.json.unreadable-20260101T000000Z-2"]
+        let notOurs = "config.json.unreadable-notes.txt"
+        for name in ours + [notOurs] {
+            try "x".write(to: fx.home.appendingPathComponent(name), atomically: true, encoding: .utf8)
+        }
+        let dir = fx.home.appendingPathComponent("config.json.unreadable-20260101T000000Z-1")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+
+        let kept = try fx.run(fx.uninstall)
+
+        XCTAssertEqual(kept.status, 0, kept.stderr + kept.stdout)
+        XCTAssertEqual(try movedAsideConfigs().count, 4)
+        XCTAssertTrue(kept.stdout.contains("Kept 2 unreadable config.json file(s) moved aside"), kept.stdout)
+        XCTAssertTrue(kept.stdout.contains("Kept \(dir.path): it is named like a moved-aside config.json but is not a regular file"), kept.stdout)
+
+        try fx.installMachinery()
+        let purged = try fx.run(fx.uninstall, ["--purge"])
+
+        XCTAssertEqual(purged.status, 0, purged.stderr + purged.stdout)
+        XCTAssertEqual(try movedAsideConfigs(), [dir.lastPathComponent, notOurs].sorted())
+        XCTAssertTrue(purged.stdout.contains("Left \(dir.path): it is named like a moved-aside config.json but is not a regular file"), purged.stdout)
     }
 
     /// Something that is not a regular file but has a moved-aside name (here
@@ -1805,10 +3740,12 @@ final class RecoveryScriptTests: XCTestCase {
         }
         try fx.writeMarkerBackstop(at: fx.legacyBackstop, name: "legacy")
 
+        try "{}".write(to: fx.endedSession, atomically: true, encoding: .utf8)
+
         let r = try fx.run(fx.uninstall, ["--purge"])
 
         XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
-        for gone in [fx.state, fx.config, fx.logFile, fx.home.appendingPathComponent("Logs/handoffs.log"),
+        for gone in [fx.state, fx.config, fx.endedSession, fx.logFile, fx.home.appendingPathComponent("Logs/handoffs.log"),
                      fx.home.appendingPathComponent("Logs/insomnia.log.1"), fx.home.appendingPathComponent("Logs/handoffs.log.1"),
                      fx.installedBackstop, fx.legacyBackstop, fx.plist, fx.app, fx.sudoers] {
             XCTAssertFalse(fx.exists(gone), gone.path)
@@ -1819,6 +3756,25 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(try fx.contents(of: fx.home), [".recovery.lock"], "nothing but the lock remains")
         XCTAssertTrue(fx.exists(fx.appsDir))
         XCTAssertTrue(fx.exists(fx.bin), "nothing outside the Insomnia tree is deleted")
+    }
+
+    /// An end record that cannot be removed survives the purge, and the
+    /// purge names it and fails, as for any file it owns, instead of
+    /// reporting everything gone. The rest is still removed.
+    func testUninstallPurgeReportsAnEndRecordItCannotRemove() throws {
+        try fx.installMachinery()
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        try "{}".write(to: fx.endedSession, atomically: true, encoding: .utf8)
+        try setImmutable(fx.endedSession, true)
+
+        let r = try fx.run(fx.uninstall, ["--purge"])
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertTrue(fx.exists(fx.endedSession))
+        XCTAssertTrue(r.stderr.contains("Could not remove \(fx.endedSession.path); left in place."), r.stderr)
+        XCTAssertTrue(r.stderr.contains("Done, except 1 file(s) that could not be removed"), r.stderr)
+        XCTAssertFalse(fx.exists(fx.state))
+        XCTAssertFalse(fx.exists(fx.config))
     }
 
     func testUninstallPurgeNeverDeletesFilesItDidNotCreate() throws {
@@ -1994,6 +3950,71 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(fx.exists(fx.app))
     }
 
+    /// The folder uninstall.sh takes a checkout's backstop.sh from is found
+    /// without PATH or CDPATH (script_dir). Run by a relative path from the
+    /// checkout, with a dirname and a cat first in PATH that both print a
+    /// decoy checkout's scripts folder to uninstall.sh, and with CDPATH
+    /// holding that decoy, it runs the checkout's own backstop.sh; it calls
+    /// neither stand-in. The
+    /// control is the same copy with the folder found the way it was
+    /// before (cd "$(dirname ...)"): the stand-in dirname then picks the
+    /// decoy, whose backstop.sh runs.
+    func testUninstallFindsItsCheckoutWithoutPATHOrCDPATH() throws {
+        let found = "SCRIPT_DIR=\"$(script_dir)\"\n"
+        let original = try String(contentsOf: fx.uninstall, encoding: .utf8)
+        XCTAssertEqual(original.components(separatedBy: found).count, 2)
+        for control in [false, true] {
+            fx.destroy()
+            fx = try ScriptFixture()
+            try fx.installMachinery()
+            try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+            try fx.writeMarkerBackstop(at: fx.backstop, name: "checkout")
+            if control {
+                let text = try String(contentsOf: fx.uninstall, encoding: .utf8)
+                    .replacingOccurrences(of: found, with: "SCRIPT_DIR=\"$(cd \"$(dirname \"${BASH_SOURCE[0]}\")\" && pwd)\"\n")
+                try text.write(to: fx.uninstall, atomically: true, encoding: .utf8)
+            }
+            let decoy = fx.root.appendingPathComponent("decoy", isDirectory: true)
+            let decoyScripts = decoy.appendingPathComponent("repo/scripts", isDirectory: true)
+            try fx.writeMarkerBackstop(at: decoyScripts.appendingPathComponent("backstop.sh"), name: "decoy")
+            try "// swift-tools-version: 6.2\n".write(to: decoy.appendingPathComponent("repo/Package.swift"), atomically: true, encoding: .utf8)
+            let shadow = fx.root.appendingPathComponent("shadow", isDirectory: true)
+            try FileManager.default.createDirectory(at: shadow, withIntermediateDirectories: true)
+            let standIns = fx.root.appendingPathComponent("stand-ins.log")
+            // A stand-in answers uninstall.sh only; the fake tools' own
+            // calls (they read their mode files with cat) go to the real one.
+            for (tool, real) in [("dirname", "/usr/bin/dirname"), ("cat", "/bin/cat")] {
+                let url = shadow.appendingPathComponent(tool)
+                try """
+                    #!/bin/bash
+                    case "$(/bin/ps -o command= -p "$PPID")" in
+                      *repo/scripts/uninstall.sh*) ;;
+                      *) exec \(real) "$@" ;;
+                    esac
+                    printf '\(tool) %s\\n' "$*" >> '\(standIns.path)'
+                    printf '%s\\n' '\(decoyScripts.path)'
+
+                    """.write(to: url, atomically: true, encoding: .utf8)
+                try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: url.path)
+            }
+            let relative = fx.root.appendingPathComponent("relative-uninstall.sh")
+            try "cd '\(fx.root.path)' && exec /bin/bash repo/scripts/uninstall.sh \"$@\"\n".write(to: relative, atomically: true, encoding: .utf8)
+
+            let r = try fx.run(relative, extraEnvironment: ["PATH": "\(shadow.path):/usr/bin:/bin:/usr/sbin:/sbin", "CDPATH": decoy.path])
+
+            XCTAssertEqual(r.status, 0, "control \(control): " + r.stderr + r.stdout)
+            let ran = fx.calls().filter { $0.hasPrefix("backstop ") }
+            if control {
+                XCTAssertEqual(ran, ["backstop decoy --force"], "the control picks the decoy: \(fx.calls())")
+                XCTAssertTrue(((try? String(contentsOf: standIns, encoding: .utf8)) ?? "").hasPrefix("dirname "), "the control runs the stand-in dirname")
+            } else {
+                XCTAssertEqual(ran, ["backstop checkout --force"], "\(fx.calls())")
+                XCTAssertTrue(r.stdout.contains("using \(fx.backstop.path)\n"), r.stdout)
+                XCTAssertFalse(fx.exists(standIns), "a stand-in ran: \((try? String(contentsOf: standIns, encoding: .utf8)) ?? "")")
+            }
+        }
+    }
+
     /// A backstop.sh added beside the zip's uninstall.sh (the zip has none),
     /// as another account could do in a folder it created in /tmp before the
     /// zip was unpacked there, is not run. Outside a source checkout
@@ -2140,15 +4161,36 @@ final class RecoveryScriptTests: XCTestCase {
 
     /// install.sh and uninstall.sh make their calls through the same
     /// bounded() and supervise(), so a fix to one cannot miss the other.
+    /// The one tool bounded() takes by name, cat, reads a sudo call's pid,
+    /// and uninstall.sh calls bounded() only with fixed paths that are not
+    /// $SUDO, so it never reaches that cat: every call site names one of
+    /// them, and a whole uninstall with a stand-in cat first in PATH runs
+    /// no stand-in (testUninstallFindsItsCheckoutWithoutPATHOrCDPATH).
     func testInstallAndUninstallShareTheBoundedCallHelper() throws {
+        func text(_ name: String) throws -> String {
+            try String(contentsOf: ScriptFixture.productionScripts.appendingPathComponent(name), encoding: .utf8)
+        }
         func helper(_ name: String) throws -> String {
-            let text = try String(contentsOf: ScriptFixture.productionScripts.appendingPathComponent(name), encoding: .utf8)
+            let text = try text(name)
             let start = try XCTUnwrap(text.range(of: "\nbounded() {"), name)
             let supervise = try XCTUnwrap(text.range(of: "\nsupervise() {", range: start.upperBound..<text.endIndex), name)
             let end = try XCTUnwrap(text.range(of: "\n}\n", range: supervise.upperBound..<text.endIndex), name)
             return String(text[start.lowerBound..<end.upperBound])
         }
         XCTAssertEqual(try helper("install.sh"), try helper("uninstall.sh"))
+        let uninstall = try text("uninstall.sh")
+        let calls = uninstall.components(separatedBy: "\n").filter {
+            !$0.trimmingCharacters(in: .whitespaces).hasPrefix("#") && $0.range(of: #"(^|[^_A-Za-z])bounded( |$)"#, options: .regularExpression) != nil
+        }
+        XCTAssertFalse(calls.isEmpty)
+        for line in calls {
+            let words = line.trimmingCharacters(in: .whitespaces).split(separator: " ")
+            let tool = try XCTUnwrap(words.firstIndex(of: "bounded").map { words.index(after: $0) }.flatMap { $0 < words.endIndex ? String(words[$0]) : nil }, line)
+            XCTAssertTrue(["\"$DEFAULTS\"", "\"$PGREP\"", "\"$CODESIGN\"", "\"$LAUNCHCTL\""].contains(tool), "bounded runs \(tool): \(line)")
+        }
+        for name in ["DEFAULTS", "PGREP", "CODESIGN", "LAUNCHCTL"] {
+            XCTAssertNotNil(uninstall.range(of: "\n\(name)=/", options: .literal), "\(name) is a fixed path")
+        }
     }
 
     /// An uninstall killed while its `launchctl bootout` does not answer:
@@ -2243,7 +4285,9 @@ final class RecoveryScriptTests: XCTestCase {
 
     /// An upgrade over an older build: the log, lock, journal, session and
     /// the two directories it left loose are tightened by the backstop too,
-    /// since it may run before the upgraded app has opened them.
+    /// since it may run before the upgraded app has opened them. The app is
+    /// running, so the session stands and session.json is still there to
+    /// check.
     func testBackstopTightensWhatAnOlderBuildLeftLoose() throws {
         try fx.writeSession(endsAt: Date(timeIntervalSinceNow: 3600))
         try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
@@ -2255,6 +4299,8 @@ final class RecoveryScriptTests: XCTestCase {
             try FileManager.default.setAttributes([.posixPermissions: mode], ofItemAtPath: url.path)
         }
 
+        let app = try fx.holdAliveLock()
+        defer { app.release() }
         let r = try fx.run(fx.backstop)
 
         XCTAssertEqual(r.status, 0, r.stderr)
@@ -2327,7 +4373,7 @@ final class RecoveryScriptTests: XCTestCase {
 
     // MARK: - Journal shape (typed corruption)
 
-    func testTypedCorruptJournalIsRejectedByBackstopWithoutCommands() throws {
+    func testTypedCorruptJournalIsRejectedByBackstopWithoutCommands() async throws {
         let corrupt = [
             "[]",
             #"{"sleepDisabledByUs":"true"}"#,
@@ -2346,14 +4392,19 @@ final class RecoveryScriptTests: XCTestCase {
             #"{"sleepDisabledByUs":false,"appNapOverrides":[{"previous":true}]}"#,
             #"{"sleepDisabledByUs":false,"appNapOverrides":[{"bundleId":"com.google.Chrome","previous":"yes"}]}"#,
         ] + Self.corruptOutputJournals
+        // One fixture per journal; the runs go several at a time.
+        var fixtures: [ScriptFixture] = []
+        defer { fixtures.forEach { $0.destroy() } }
         for json in corrupt {
-            let f = try ScriptFixture()
-            defer { f.destroy() }
+            let f = try ScriptFixture.concurrentRow()
+            fixtures.append(f)
             try f.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
             try f.writeState(json)
+        }
 
-            let r = try f.run(f.backstop)
+        let results = try await ScriptFixture.runAll(fixtures.map { $0.launch($0.backstop) })
 
+        for (json, (f, r)) in zip(corrupt, zip(fixtures, results)) {
             XCTAssertNotEqual(r.status, 0, json)
             XCTAssertEqual(f.calls(), [], "no privileged command for \(json)")
             XCTAssertEqual(try String(contentsOf: f.state, encoding: .utf8), json, "evidence kept for \(json)")
@@ -2476,10 +4527,10 @@ final class RecoveryScriptTests: XCTestCase {
         ("keptDisplayReadLit is ", #""keptDisplayReadLit":1e-400,"keptDisplayReadLit":0.8"#),
         ("keptDisplayReadLit is ", #""kept\u0044isplayReadLit":1e-400"#),
         ("keptDisplayUnderLowPower is ", #""keptDisplayUnderLowPowe\#(backslash)u0072":"0.8""#),
-        ("a key in state.json has an escape JSON does not have", #""kept\#(backslash)x44isplayReadLit":0.8"#),
-        ("the top level of state.json cannot be followed here", #"keptDisplayReadLit:1e-400"#),
-        ("the top level of state.json cannot be followed here", #"'keptDisplayReadLit':0.8"#),
-        ("the top level of state.json cannot be followed here", #"/* note */"keptDisplayReadLit":0.8"#),
+        ("a key in the top level of state.json is text the app's decoder does not read", #""kept\#(backslash)x44isplayReadLit":0.8"#),
+        ("the text of state.json is not JSON the app's decoder reads", #"keptDisplayReadLit:1e-400"#),
+        ("the text of state.json is not JSON the app's decoder reads", #"'keptDisplayReadLit':0.8"#),
+        ("the text of state.json is not JSON the app's decoder reads", #"/* note */"keptDisplayReadLit":0.8"#),
         ("keptDisplayUnderLowPowerBoot is ", #""keptDisplayUnderLowPowerBoot":7"#),
         ("keptDisplayUnderLowPowerBoot is ", #""keptDisplayUnderLowPowerBoot":true"#),
         ("keptDisplayUnderLowPowerBoot is ", #""keptDisplayUnderLowPowerBoot":["boot-a"]"#),
@@ -2506,14 +4557,15 @@ final class RecoveryScriptTests: XCTestCase {
         #""note":"\#(backslash)"keptDisplayReadLit\#(backslash)":1e-400 \#(backslash)\#(backslash)u0041 \#(backslash)\#(backslash)","keptDisplayReadLit" : 0.8"#,
     ]
 
-    /// Journals the app reads, taking the first copy of a key, that both
-    /// scripts refuse: plutil checks the last copy, and a republished
-    /// journal would keep only that one.
-    static let duplicatedKeptDisplayRecords: [(problem: String, json: String)] = [
-        ("keptDisplayReadLit is in the top level of state.json 2 times; the app reads the first and plutil the last", #""keptDisplayReadLit":0.8,"keptDisplayReadLit":0.7"#),
-        ("keptDisplayReadLit is in the top level of state.json 2 times", #""keptDisplayReadLit":0.8,"keptDisplayReadL\#(backslash)u0069t":0.7"#),
-        ("keptDisplayUnderLowPower is in the top level of state.json 3 times", #""keptDisplayUnderLowPower":0.8,"keptDisplayUnderLowPower":0.8,"keptDisplayUnderLowPower":0.8"#),
-        ("keptDisplayUnderLowPowerBoot is in the top level of state.json 2 times", #""keptDisplayUnderLowPowerBoot":"boot A","keptDisplayUnderLowPowerBoot":"boot B""#),
+    /// Journals the app reads, taking the first copy of a key it reads
+    /// twice, however the copy is spelled. plutil would read the last copy,
+    /// so both scripts read the view of the journal that the reader writes,
+    /// which holds the first copy alone.
+    static let duplicatedKeptDisplayRecords = [
+        #""keptDisplayReadLit":0.8,"keptDisplayReadLit":0.7"#,
+        #""keptDisplayReadLit":0.8,"keptDisplayReadL\#(backslash)u0069t":0.7"#,
+        #""keptDisplayUnderLowPower":0.8,"keptDisplayUnderLowPower":0.7,"keptDisplayUnderLowPower":0.6"#,
+        #""keptDisplayUnderLowPowerBoot":"boot A","keptDisplayUnderLowPowerBoot":"boot B""#,
     ]
 
     static let keptDisplayRecordKeys = [
@@ -2524,17 +4576,23 @@ final class RecoveryScriptTests: XCTestCase {
     /// any other key of the wrong shape does: no pmset, the bytes and the
     /// session kept, and the log names the key. The app's decoder refuses
     /// each of these journals too.
-    func testMalformedKeptDisplayRecordsAreRejectedByBackstopWithoutCommands() throws {
-        for (problem, record) in Self.malformedKeptDisplayRecords {
+    func testMalformedKeptDisplayRecordsAreRejectedByBackstopWithoutCommands() async throws {
+        // One fixture per journal; the runs go several at a time.
+        var fixtures: [ScriptFixture] = []
+        defer { fixtures.forEach { $0.destroy() } }
+        for (_, record) in Self.malformedKeptDisplayRecords {
             let json = Self.keptDisplayJournal(record)
             XCTAssertThrowsError(try Store.makeDecoder().decode(RuntimeState.self, from: Data(json.utf8)), "the app refuses \(json)")
-            let f = try ScriptFixture()
-            defer { f.destroy() }
+            let f = try ScriptFixture.concurrentRow()
+            fixtures.append(f)
             try f.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
             try f.writeState(json)
+        }
 
-            let r = try f.run(f.backstop)
+        let results = try await ScriptFixture.runAll(fixtures.map { $0.launch($0.backstop) })
 
+        for ((problem, record), (f, r)) in zip(Self.malformedKeptDisplayRecords, zip(fixtures, results)) {
+            let json = Self.keptDisplayJournal(record)
             XCTAssertNotEqual(r.status, 0, json)
             XCTAssertEqual(f.calls(), [], "no privileged command for \(json)")
             XCTAssertEqual(try String(contentsOf: f.state, encoding: .utf8), json, "evidence kept for \(json)")
@@ -2549,18 +4607,24 @@ final class RecoveryScriptTests: XCTestCase {
     /// of the kept entry, which becomes this boot as the mode goes off. The
     /// published journal still decodes in the app and passes the check on
     /// the next run.
-    func testValidKeptDisplayRecordsAreKeptForTheApp() throws {
+    func testValidKeptDisplayRecordsAreKeptForTheApp() async throws {
+        // One fixture per journal; each round of runs goes several at a time.
+        var fixtures: [ScriptFixture] = []
+        defer { fixtures.forEach { $0.destroy() } }
         for records in Self.validKeptDisplayRecords {
+            let f = try ScriptFixture.concurrentRow()
+            fixtures.append(f)
+            try f.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+            try f.writeState(Self.keptDisplayJournal(records))
+        }
+
+        let results = try await ScriptFixture.runAll(fixtures.map { $0.launch($0.backstop) })
+
+        var publishedJournals: [Data] = []
+        for (records, (f, r)) in zip(Self.validKeptDisplayRecords, zip(fixtures, results)) {
             let json = Self.keptDisplayJournal(records)
             let before = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
             let decodedBefore = try Store.makeDecoder().decode(RuntimeState.self, from: Data(json.utf8))
-            let f = try ScriptFixture()
-            defer { f.destroy() }
-            try f.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
-            try f.writeState(json)
-
-            let r = try f.run(f.backstop)
-
             XCTAssertEqual(r.status, 0, json + r.stderr + f.log())
             XCTAssertEqual(f.calls(), [
                 "sudo -n \(f.fakePmset) -a disablesleep 0",
@@ -2582,9 +4646,14 @@ final class RecoveryScriptTests: XCTestCase {
             XCTAssertEqual(decoded.keptDisplayUnderLowPowerBoot, stamped ? f.bootUUID : decodedBefore.keptDisplayUnderLowPowerBoot, json)
             XCTAssertEqual(decoded.keptDisplayReadLit, decodedBefore.keptDisplayReadLit, json)
             XCTAssertEqual(decoded.displayRestoredUnderLowPower, decodedBefore.displayRestoredUnderLowPower, json)
+            publishedJournals.append(published)
+        }
 
-            let again = try f.run(f.backstop)
-            XCTAssertEqual(again.status, 0, json + again.stderr + f.log())
+        let again = try await ScriptFixture.runAll(fixtures.map { $0.launch($0.backstop) })
+
+        for (records, (f, (r, published))) in zip(Self.validKeptDisplayRecords, zip(fixtures, zip(again, publishedJournals))) {
+            let json = Self.keptDisplayJournal(records)
+            XCTAssertEqual(r.status, 0, json + r.stderr + f.log())
             XCTAssertEqual(f.calls().count, 2, json)
             XCTAssertFalse(f.log().contains("malformed"), f.log())
             XCTAssertEqual(try Data(contentsOf: f.state), published, "a clean journal is not rewritten: \(json)")
@@ -2594,17 +4663,22 @@ final class RecoveryScriptTests: XCTestCase {
     /// uninstall.sh checks the same records itself: one the app could not
     /// decode stops it with everything in place, even when the backstop
     /// exits 0.
-    func testUninstallRejectsMalformedKeptDisplayRecordsEvenWhenBackstopExitsZero() throws {
-        for (problem, record) in Self.malformedKeptDisplayRecords {
-            let json = Self.keptDisplayJournal(record, ours: false)
-            let f = try ScriptFixture()
-            defer { f.destroy() }
+    func testUninstallRejectsMalformedKeptDisplayRecordsEvenWhenBackstopExitsZero() async throws {
+        // One fixture per journal; the runs go several at a time.
+        var fixtures: [ScriptFixture] = []
+        defer { fixtures.forEach { $0.destroy() } }
+        for (_, record) in Self.malformedKeptDisplayRecords {
+            let f = try ScriptFixture.concurrentRow()
+            fixtures.append(f)
             try f.installMachinery()
             try "#!/bin/bash\nexit 0\n".write(to: f.backstop, atomically: true, encoding: .utf8)
-            try f.writeState(json)
+            try f.writeState(Self.keptDisplayJournal(record, ours: false))
+        }
 
-            let r = try f.run(f.uninstall, ["--purge"])
+        let results = try await ScriptFixture.runAll(fixtures.map { $0.launch($0.uninstall, ["--purge"]) })
 
+        for ((problem, record), (f, r)) in zip(Self.malformedKeptDisplayRecords, zip(fixtures, results)) {
+            let json = Self.keptDisplayJournal(record, ours: false)
             XCTAssertNotEqual(r.status, 0, json)
             XCTAssertTrue(f.exists(f.plist), json)
             XCTAssertTrue(f.exists(f.sudoers), json)
@@ -2616,88 +4690,407 @@ final class RecoveryScriptTests: XCTestCase {
         }
     }
 
-    /// A key the app reads more than once, as in `duplicatedKeptDisplayRecords`:
-    /// the app decodes the journal, and both scripts refuse it before any
-    /// command, with the bytes kept.
-    func testDuplicatedKeptDisplayRecordsAreRefusedByBothScripts() throws {
-        for (problem, record) in Self.duplicatedKeptDisplayRecords {
-            let json = Self.keptDisplayJournal(record)
-            XCTAssertNoThrow(try Store.makeDecoder().decode(RuntimeState.self, from: Data(json.utf8)), "the app reads \(json)")
-            let f = try ScriptFixture()
-            defer { f.destroy() }
+    /// A key the app reads more than once, as in
+    /// `duplicatedKeptDisplayRecords`: the backstop reads the first copy,
+    /// as the app does, undoes sleep and the mode, and publishes the
+    /// journal with each key once, from which the app decodes the records
+    /// it read before, but for the boot of a record of the kept entry,
+    /// which becomes this boot as the mode goes off. uninstall.sh, with
+    /// the backstop it installed, completes past the same records and
+    /// keeps state.json byte for byte.
+    func testDuplicatedKeptDisplayRecordsAreReadAsTheAppReadsThem() async throws {
+        // One fixture per journal and script; the runs go several at a time.
+        var fixtures: [ScriptFixture] = []
+        var uninstallFixtures: [ScriptFixture] = []
+        defer { (fixtures + uninstallFixtures).forEach { $0.destroy() } }
+        for record in Self.duplicatedKeptDisplayRecords {
+            let f = try ScriptFixture.concurrentRow()
+            fixtures.append(f)
             try f.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
-            try f.writeState(json)
-
-            let r = try f.run(f.backstop)
-
-            XCTAssertNotEqual(r.status, 0, json)
-            XCTAssertEqual(f.calls(), [], "no privileged command for \(json)")
-            XCTAssertEqual(try String(contentsOf: f.state, encoding: .utf8), json)
-            XCTAssertTrue(f.log().contains("\(f.state.path): \(problem)"), "\(json): \(f.log())")
-
-            let u = try ScriptFixture()
-            defer { u.destroy() }
+            try f.writeState(Self.keptDisplayJournal(record))
+            let u = try ScriptFixture.concurrentRow()
+            uninstallFixtures.append(u)
             try u.installMachinery()
-            try "#!/bin/bash\nexit 0\n".write(to: u.backstop, atomically: true, encoding: .utf8)
+            try u.writeConfig(#"{"agentList":[]}"#)
             try u.writeState(Self.keptDisplayJournal(record, ours: false))
+        }
 
-            let ur = try u.run(u.uninstall, ["--purge"])
+        let results = try await ScriptFixture.runAll(fixtures.map { $0.launch($0.backstop) })
+        let uninstalls = try await ScriptFixture.runAll(uninstallFixtures.map { $0.launch($0.uninstall, ["--purge"]) })
 
-            XCTAssertNotEqual(ur.status, 0, json)
-            XCTAssertTrue(u.exists(u.app), json)
-            XCTAssertTrue(ur.stderr.contains(problem), "\(json): \(ur.stderr)")
+        for (record, ((f, r), (u, ur))) in zip(Self.duplicatedKeptDisplayRecords, zip(zip(fixtures, results), zip(uninstallFixtures, uninstalls))) {
+            let json = Self.keptDisplayJournal(record)
+            let decodedBefore = try Store.makeDecoder().decode(RuntimeState.self, from: Data(json.utf8))
+            XCTAssertEqual(r.status, 0, json + r.stderr + f.log())
+            XCTAssertEqual(f.calls(), [
+                "sudo -n \(f.fakePmset) -a disablesleep 0",
+                "sudo -n \(f.fakePmset) -b lowpowermode 0",
+            ], json)
+            XCTAssertFalse(f.log().contains("malformed"), f.log())
+            let published = try Data(contentsOf: f.state)
+            let text = String(decoding: published, as: UTF8.self)
+            for key in Self.keptDisplayRecordKeys {
+                XCTAssertLessThanOrEqual(text.components(separatedBy: "\"\(key)\"").count - 1, 1, "\(key) in what \(json) became: \(text)")
+            }
+            let decoded = try Store.makeDecoder().decode(RuntimeState.self, from: published)
+            let stamped = decodedBefore.keptDisplayUnderLowPower != nil
+            XCTAssertFalse(decoded.lowPowerSetByUs, json)
+            XCTAssertEqual(decoded.keptDisplayUnderLowPower, decodedBefore.keptDisplayUnderLowPower, json)
+            XCTAssertEqual(decoded.keptDisplayUnderLowPowerBoot, stamped ? f.bootUUID : decodedBefore.keptDisplayUnderLowPowerBoot, json)
+            XCTAssertEqual(decoded.keptDisplayReadLit, decodedBefore.keptDisplayReadLit, json)
+            XCTAssertEqual(decoded.displayRestoredUnderLowPower, decodedBefore.displayRestoredUnderLowPower, json)
+
+            let kept = Self.keptDisplayJournal(record, ours: false)
+            XCTAssertEqual(ur.status, 0, kept + ur.stderr + ur.stdout)
+            XCTAssertFalse(u.exists(u.plist), kept)
+            XCTAssertFalse(u.exists(u.app), kept)
+            XCTAssertEqual(try String(contentsOf: u.state, encoding: .utf8), kept)
+            XCTAssertTrue(ur.stdout.contains("  - display brightness 0.8"), ur.stdout)
         }
     }
 
-    /// record_text_problems as it is in each script, run on its own over
-    /// exact bytes: what it prints, or nothing.
-    private func recordTextProblems(_ inputs: [(label: String, bytes: Data)], script: String = "backstop.sh") throws -> [String: String] {
+    /// The reader as it is in each script (`readerBlock`), run on its own
+    /// over exact bytes as state.json: what record_text_problems prints, or
+    /// nothing, and the view it writes, if it writes one, which plutil must
+    /// read for the run to pass.
+    private func recordTextProblems(_ inputs: [(label: String, bytes: Data)], script: String = "backstop.sh") throws -> [String: (printed: String, view: Data?)] {
         let f = try ScriptFixture()
         defer { f.destroy() }
         let runner = f.root.appendingPathComponent("record-text-problems.sh")
-        try ("set -euo pipefail\n" + Self.recordTextProblemsSource(script) + "\nrecord_text_problems \"$1\"\n")
+        try ("""
+        set -euo pipefail
+        STAT=/usr/bin/stat
+        HEAD=/usr/bin/head
+        CMP=/usr/bin/cmp
+        ICONV=/usr/bin/iconv
+        TEXT_READ_SECONDS=30
+
+        """ + Self.readerBlock(script) + """
+
+        record_text_problems "$1" state "$2"
+        [[ ! -f "$2" ]] || /usr/bin/plutil -convert json -o /dev/null "$2"
+
+        """)
             .write(to: runner, atomically: true, encoding: .utf8)
-        var printed: [String: String] = [:]
+        var printed: [String: (printed: String, view: Data?)] = [:]
         for (i, input) in inputs.enumerated() {
             let file = f.root.appendingPathComponent("input.\(i)")
+            let view = f.root.appendingPathComponent("view.\(i)")
             try input.bytes.write(to: file)
-            let r = try f.run(runner, [file.path])
+            let r = try f.run(runner, [file.path, view.path])
             XCTAssertEqual(r.status, 0, "\(input.label): \(r.stderr)")
             XCTAssertEqual(r.stderr, "", input.label)
-            printed[input.label] = r.stdout
+            var written: Data?
+            if f.exists(view) { written = try Data(contentsOf: view) }
+            printed[input.label] = (r.stdout, written)
         }
         return printed
     }
 
-    private static func recordTextProblemsSource(_ script: String) throws -> String {
+    /// The lines of `script`, which is ASCII.
+    private static func scriptLines(_ script: String) throws -> [String] {
         let text = try String(contentsOf: ScriptFixture.productionScripts.appendingPathComponent(script), encoding: .utf8)
-        let lines = text.components(separatedBy: "\n")
-        let start = try XCTUnwrap(lines.firstIndex(of: "record_text_problems() { # file"), script)
-        let end = try XCTUnwrap(lines[start...].firstIndex(of: "}"), script)
+        XCTAssertTrue(text.allSatisfy(\.isASCII), script)
+        return text.components(separatedBy: "\n")
+    }
+
+    /// The index of the one line of `lines` that is the header of the
+    /// function `name`, with or without a comment after the brace, and of
+    /// the first line after it that is a closing brace alone. Fails unless
+    /// the header is there exactly once and every line between is empty or
+    /// indented, so that what is taken is the function and nothing else.
+    private static func functionRange(_ name: String, in lines: [String], script: String) throws -> ClosedRange<Int> {
+        let headers = lines.indices.filter { lines[$0] == "\(name)() {" || lines[$0].hasPrefix("\(name)() { #") }
+        XCTAssertEqual(headers.count, 1, "\(name) in \(script)")
+        let start = try XCTUnwrap(headers.first, "\(name) in \(script)")
+        let end = try XCTUnwrap(lines[start...].firstIndex(of: "}"), "\(name) in \(script)")
+        for line in lines[(start + 1)..<end] {
+            XCTAssertTrue(line.isEmpty || line.hasPrefix(" "), "\(name) in \(script): \(line)")
+        }
+        return start...end
+    }
+
+    /// The functions `names` as they are in `script` (`functionRange`).
+    private static func scriptFunctions(_ names: [String], script: String) throws -> String {
+        let lines = try scriptLines(script)
+        return try names.map { name in
+            lines[try functionRange(name, in: lines, script: script)].joined(separator: "\n")
+        }.joined(separator: "\n")
+    }
+
+    /// The reader both scripts carry: from the comment on json_whole, its
+    /// first function, to the end of record_text_problems, its last. Every
+    /// line of it is a comment, a function's header or closing brace, empty
+    /// or indented, so it defines functions and runs nothing.
+    private static func readerBlock(_ script: String) throws -> String {
+        let lines = try scriptLines(script)
+        let first = "# Sets whole_value to the whole number the app's JSONDecoder reads for the"
+        XCTAssertEqual(lines.filter { $0 == first }.count, 1, script)
+        let start = try XCTUnwrap(lines.firstIndex(of: first), script)
+        let end = try functionRange("record_text_problems", in: lines, script: script).upperBound
+        XCTAssertLessThan(start, end, script)
+        for line in lines[start...end] {
+            let header = line.range(of: #"^[a-z_]+\(\) \{( #.*)?$"#, options: .regularExpression) != nil
+            XCTAssertTrue(line.isEmpty || line.hasPrefix("#") || line.hasPrefix(" ") || line == "}" || header, "\(script): \(line)")
+        }
         return lines[start...end].joined(separator: "\n")
     }
 
-    /// The two scripts carry the same reader, comment and all.
-    func testBothScriptsReadTheRecordsTheSameWay() throws {
-        func withComment(_ script: String) throws -> String {
-            let text = try String(contentsOf: ScriptFixture.productionScripts.appendingPathComponent(script), encoding: .utf8)
-            let start = try XCTUnwrap(text.range(of: "# Prints one line per way the app's records about a kept display entry would"), script)
-            let end = try XCTUnwrap(text.range(of: "\n}\n", range: start.upperBound..<text.endIndex), script)
-            return String(text[start.lowerBound..<end.upperBound])
+    /// Greptile 4219151866: one table of journals, each read by the app
+    /// (`Store.decodeState`, what `Store.loadState` runs), by the agent's
+    /// mode of the app's binary (`AgentCutoffsCommand.sessionAnswer`), and
+    /// by each script's own check as the script runs it: check_journal in
+    /// backstop.sh, and journal_view then journal_problems in uninstall.sh.
+    /// For the agent, the record is also read as its own reader takes it
+    /// (journal_cutoffs). Both scripts accept exactly the journals the app
+    /// loads here. Where plutil would read the text otherwise than the app
+    /// (a key the app reads twice or spelled with an escape, a whole number
+    /// written with a fraction or an exponent, UTF-16 or UTF-32, text plutil
+    /// cannot parse under a key the app skips), both read the view the
+    /// reader writes, the same bytes in each script, which the app decodes
+    /// to the same state as the journal. They accept what the app skips (a
+    /// key twice in an object it does not read, a \x escape or 1. under a
+    /// key it does not read, and in a frozen process without a startedAt,
+    /// or without a startedAtMicros, what follows it: FrozenProcess). On
+    /// every journal they accept, the agent's reader gives the binary's
+    /// record: for a record twice, the app's first copy, and for a value
+    /// the app reads as no record (an object, 1., a \x escape), foreign.
+    /// The journals the app writes now and wrote before (frozenPids, no
+    /// record) pass.
+    func testTheAppTheBinaryAndBothScriptsAcceptTheSameJournals() async throws {
+        let b = backslash
+        var full = RuntimeState()
+        full.sleepDisabledByUs = true
+        full.lowPowerSetByUs = true
+        full.dockerFrozen = true
+        full.frozenProcesses = [FrozenProcess(pid: 5105, identity: ProcessIdentity(startedAt: 1_700_000_000, startedAtMicros: 250_000, bootSession: "0F0F0F0F-1111-2222-3333-444444444444"))]
+        full.savedAudioOutputs = [SavedAudioOutput(deviceUID: "BuiltInSpeakerDevice", name: "MacBook Pro Speakers", volume: 0.5, muted: false, saveID: "a")]
+        full.savedOutputVolume = 0.25
+        full.savedMuted = false
+        full.savedDisplayBrightness = 0.8
+        full.savedKeyboardBrightness = 0.3
+        full.appNapOverrides = [AppNapOverride(bundleId: "com.example.agent", previous: nil)]
+        full.endedSession = "e30="
+        full.sessionCutoffs = AgentCutoffs(endFloor: 30, thermalRules: false)
+        let written = String(decoding: try Store.makeEncoder().encode(full), as: UTF8.self)
+        // (label, text, the app loads)
+        let rows: [(label: String, text: String, app: Bool)] = [
+            ("the app's journal now", written, true),
+            ("an older build's journal", #"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenPids":[5105,5106],"dockerFrozen":false}"#, true),
+            ("a frozen process without identity", #"{"frozenProcesses":[{"pid":5105}]}"#, true),
+            ("no keys", "{}", true),
+            ("commas before the ends", #"{"frozenProcesses":[],"sleepDisabledByUs":true,}"#, true),
+            ("keys spelled with escapes", #"{"sleep\#(b)u0044isabledByUs":true,"session\#(b)u0043utoffs":"30 false"}"#, true),
+            ("an escaped record", #"{"sessionCutoffs":"\#(b)u0033\#(b)u0030 false"}"#, true),
+            ("other keys and values", #"{"note":{"a":[1,{"b":null}],"c":"\#(b)u00e9"},"sessionCutoffs":"0 true"}"#, true),
+            ("a record the app does not write", #"{"sessionCutoffs":"96 false"}"#, true),
+            ("a record of another type", #"{"sessionCutoffs":30}"#, true),
+            ("a record with a newline", #"{"sessionCutoffs":"30 false\#(b)n"}"#, true),
+            ("a null record", #"{"sessionCutoffs":null}"#, true),
+            ("a bool of the wrong type", #"{"sleepDisabledByUs":"yes","sessionCutoffs":"30 false"}"#, false),
+            ("frozenProcesses of the wrong type", #"{"sleepDisabledByUs":true,"frozenProcesses":"bad","sessionCutoffs":"30 false"}"#, false),
+            ("a pid of the wrong type", #"{"frozenProcesses":[{"pid":"5105"}]}"#, false),
+            ("a pid written as 1.0", #"{"frozenProcesses":[{"pid":5105.0}]}"#, true),
+            ("whole numbers written with a fraction or an exponent", #"{"frozenProcesses":[{"pid":5105.0,"startedAt":1.7e9,"startedAtMicros":25E4,"bootSession":"x"}],"frozenPids":[1e2,-0.0,0e999]}"#, true),
+            ("a pid that is not whole", #"{"frozenProcesses":[{"pid":5105.5}]}"#, false),
+            ("a pid past Int32 written as a float", #"{"frozenProcesses":[{"pid":2147483648.0}]}"#, false),
+            ("a startedAt up to 2^53 written as a float", #"{"frozenProcesses":[{"pid":1,"startedAt":9007199254740992.0}]}"#, true),
+            ("an identity with a startedAt of 1e18", #"{"frozenProcesses":[{"pid":4242,"startedAt":1e18,"startedAtMicros":0,"bootSession":"test"}]}"#, true),
+            ("a startedAt of 2^62 written as a float", #"{"frozenProcesses":[{"pid":1,"startedAt":4611686018427387904.0},{"pid":2,"startedAt":-4611686018427387904.0}]}"#, true),
+            ("a startedAt a Double does not hold, written as a float", #"{"frozenProcesses":[{"pid":1,"startedAt":9007199254740993.0}]}"#, true),
+            ("the ends of Int64", #"{"frozenProcesses":[{"pid":1,"startedAt":-9223372036854775808},{"pid":2,"startedAt":9223372036854775807}]}"#, true),
+            ("the lowest Int64 written as a float", #"{"frozenProcesses":[{"pid":1,"startedAt":-9223372036854775808.0}]}"#, false),
+            ("the ends of Int32 written as floats", #"{"frozenProcesses":[{"pid":2147483647.0}],"frozenPids":[-2147483648.0,21474836.47e2]}"#, true),
+            ("a pid a Double rounds to whole", #"{"frozenProcesses":[{"pid":1.0000000000000001}]}"#, true),
+            ("a legacy pid a Double rounds to 0", #"{"frozenPids":[1e-99999]}"#, true),
+            ("a provisional entry: startedAtMicros of the wrong type, no startedAt", #"{"sleepDisabledByUs":true,"frozenProcesses":[{"pid":4242,"startedAtMicros":"bad","bootSession":"test"}]}"#, true),
+            ("a provisional entry: bootSession of the wrong type, no startedAtMicros", #"{"sleepDisabledByUs":true,"frozenProcesses":[{"pid":4242,"startedAt":123,"bootSession":42}]}"#, true),
+            ("a provisional entry: startedAtMicros past Int32, no startedAt", #"{"sleepDisabledByUs":true,"frozenProcesses":[{"pid":4242,"startedAtMicros":2147483648}]}"#, true),
+            ("a provisional entry: a null startedAt", #"{"frozenProcesses":[{"pid":4242,"startedAt":null,"startedAtMicros":"bad","bootSession":42}]}"#, true),
+            ("a provisional entry: startedAtMicros twice, no startedAt", #"{"frozenProcesses":[{"pid":4242,"startedAtMicros":1,"startedAtMicros":"x"}]}"#, true),
+            ("a provisional entry: bootSession twice, no startedAtMicros", #"{"frozenProcesses":[{"pid":4242,"startedAt":123,"bootSession":"a","bootSession":5}]}"#, true),
+            ("an identity with a bootSession of the wrong type", #"{"frozenProcesses":[{"pid":4242,"startedAt":123,"startedAtMicros":0,"bootSession":42}]}"#, false),
+            ("an identity with startedAtMicros past Int32", #"{"frozenProcesses":[{"pid":4242,"startedAt":123,"startedAtMicros":2147483648,"bootSession":"test"}]}"#, false),
+            ("an identity with startedAtMicros of the wrong type", #"{"frozenProcesses":[{"pid":4242,"startedAt":123,"startedAtMicros":"bad","bootSession":"test"}]}"#, false),
+            ("an identity with startedAtMicros after its bad bootSession", #"{"frozenProcesses":[{"pid":4242,"bootSession":42,"startedAtMicros":0,"startedAt":123}]}"#, false),
+            ("an identity with startedAtMicros twice", #"{"frozenProcesses":[{"pid":4242,"startedAt":123,"startedAtMicros":1,"startedAtMicros":2,"bootSession":"b"}]}"#, true),
+            ("a pid too large", #"{"frozenProcesses":[{"pid":2147483648}]}"#, false),
+            ("a saved output without muted", #"{"savedAudioOutputs":[{"deviceUID":"a","volume":0.5}]}"#, false),
+            ("an App Nap entry without its bundle", #"{"appNapOverrides":[{"previous":true}]}"#, false),
+            ("an endedSession of the wrong type", #"{"endedSession":5}"#, false),
+            ("a level too large", #"{"savedKeyboardBrightness":1e39}"#, false),
+            ("a key twice", #"{"sleepDisabledByUs":true,"sleepDisabledByUs":false}"#, true),
+            ("a bad first copy", #"{"frozenProcesses":"bad","frozenProcesses":[]}"#, false),
+            ("a bad last copy", #"{"frozenProcesses":[],"frozenProcesses":"bad"}"#, true),
+            ("a nested key twice", #"{"frozenProcesses":[{"pid":5,"pid":"x"}]}"#, true),
+            ("a key twice in objects the app does not read", #"{"note":{"x":1,"x":2},"frozenProcesses":[{"pid":5,"extra":{"y":1,"y":2}}],"sessionCutoffs":"30 false"}"#, true),
+            ("a key the app does not read twice", #"{"note":1,"note":2,"savedAudioOutputs":[{"deviceUID":"a","volume":0.5,"muted":false,"x":1,"x":2}]}"#, true),
+            ("an object under the record", #"{"sessionCutoffs":{"a":1,"a":2}}"#, true),
+            ("a key twice, once escaped", #"{"sleepDisabledByUs":true,"sleepDisabledBy\#(b)u0055s":"x"}"#, true),
+            ("a key twice, once with a Kelvin sign", "{\"saved\u{212A}eyboardBrightness\":\"bad\",\"savedKeyboardBrightness\":0.5}", false),
+            ("a record twice", #"{"sessionCutoffs":"30 false","sessionCutoffs":"0 true"}"#, true),
+            ("a record with an escape JSON does not have", #"{"sessionCutoffs":"3\#(b)x30 false"}"#, true),
+            ("a record written as 1.", #"{"sessionCutoffs":1.}"#, true),
+            ("a bad escape under another key", #"{"note":"\#(b)x41"}"#, true),
+            ("values the app skips", #"{"note":[1.,-.5,2.e3,1e-400,"\#(b)x41\#(b)'",{"\#(b)x41":1}],"frozenProcesses":[{"pid":1,"x":0.,"y":"\#(b)x41"}],"sessionCutoffs":"0 true"}"#, true),
+            ("+1 under another key", #"{"note":+1}"#, false),
+            ("a bad escape in a key of an entry the app reads", #"{"appNapOverrides":[{"bundleId":"a","\#(b)x41":1}]}"#, false),
+            ("a leading zero under another key", #"{"note":01}"#, true),
+            ("not an object", #"["sleepDisabledByUs",true]"#, false),
+            ("not JSON", #"{"sleepDisabledByUs":true,"#, false),
+        ]
+        // The app's journal in other encodings the app reads; it writes
+        // only UTF-8.
+        let encoded: [(label: String, bytes: Data, app: Bool)] = [
+            ("UTF-16 with a byte order mark", Data([0xFF, 0xFE]) + written.data(using: .utf16LittleEndian)!, true),
+            ("UTF-16 big-endian without a byte order mark", written.data(using: .utf16BigEndian)!, true),
+            ("UTF-32 without a byte order mark", written.data(using: .utf32LittleEndian)!, true),
+            ("UTF-32 big-endian without a byte order mark", written.data(using: .utf32BigEndian)!, true),
+            ("UTF-32 big-endian with a byte order mark", Data([0x00, 0x00, 0xFE, 0xFF]) + written.data(using: .utf32BigEndian)!, true),
+            ("UTF-32 with a byte order mark", Data([0xFF, 0xFE, 0x00, 0x00]) + written.data(using: .utf32LittleEndian)!, false),
+        ]
+        let table = rows.map { (label: $0.label, bytes: Data($0.text.utf8), app: $0.app) } + encoded
+        let f = try ScriptFixture()
+        defer { f.destroy() }
+        var states: [URL] = []
+        for (i, row) in table.enumerated() {
+            let dir = f.root.appendingPathComponent("journal.\(i)")
+            try FileManager.default.createDirectory(at: dir.appendingPathComponent("uninstall"), withIntermediateDirectories: true)
+            states.append(dir.appendingPathComponent("state.json"))
+            try row.bytes.write(to: states[i])
         }
-        XCTAssertEqual(try withComment("backstop.sh"), try withComment("uninstall.sh"))
-        XCTAssertEqual(try Self.recordTextProblemsSource("backstop.sh"), try Self.recordTextProblemsSource("uninstall.sh"))
+        let setup = """
+            set -euo pipefail
+            export LC_ALL=C
+            RM=/bin/rm
+            CAT=/bin/cat
+            PLUTIL=/usr/bin/plutil
+            HEAD=/usr/bin/head
+            STAT=/usr/bin/stat
+            CMP=/usr/bin/cmp
+            ICONV=/usr/bin/iconv
+            TEXT_READ_SECONDS=30
+
+            """
+        // Prints per journal "refused", or "accepted", the journal the
+        // script read (state or view), and for backstop.sh the record. Each
+        // script reads the journals in `parts` runs, each over folders of
+        // its own; both scripts' runs go at once (runAll), and their lines
+        // are put back in the journals' order.
+        let parts = 4
+        let size = (states.count + parts - 1) / parts
+        let chunks = stride(from: 0, to: states.count, by: size).map { Array(states[$0..<min($0 + size, states.count)]) }
+        func launches(_ script: String, functions: [String], loop: String) throws -> [ScriptFixture.Launch] {
+            let runner = f.root.appendingPathComponent("accept.\(script)")
+            try (setup + Self.readerBlock(script) + "\n" + Self.scriptFunctions(functions, script: script) + "\n" + loop)
+                .write(to: runner, atomically: true, encoding: .utf8)
+            return chunks.map { f.launch(runner, $0.map(\.path)) }
+        }
+        func lines(_ script: String, _ results: ArraySlice<(status: Int32, stdout: String, stderr: String)>) -> [String] {
+            var printed: [String] = []
+            for (chunk, r) in zip(chunks, results) {
+                XCTAssertEqual(r.status, 0, "\(script): \(r.stderr)")
+                XCTAssertEqual(r.stderr, "", script)
+                let part = r.stdout.split(separator: "\n").map(String.init)
+                XCTAssertEqual(part.count, chunk.count, "\(script): \(r.stdout)")
+                printed += part
+            }
+            return printed
+        }
+        let agentRuns = try launches("backstop.sh", functions: ["extract", "type_of", "shape_types", "shape_value_type", "shape_type", "shape_name", "journal_shape_problems", "check_journal", "journal_cutoffs"], loop: """
+            lock_shared=0
+            for STATE in "$@"; do
+              APP_SUPPORT="${STATE%/*}"
+              JOURNAL_VIEW="$APP_SUPPORT/backstop-view"
+              journal_checked=0
+              journal_state=""
+              check_journal
+              if [[ "$journal_state" != clean ]]; then
+                echo refused
+              elif [[ "$JOURNAL" == "$STATE" ]]; then
+                echo "accepted state $(journal_cutoffs)"
+              else
+                echo "accepted view $(journal_cutoffs)"
+              fi
+            done
+
+            """)
+        let uninstallRuns = try launches("uninstall.sh", functions: ["extract", "extract_json", "type_of", "shape_types", "shape_value_type", "shape_type", "shape_name", "journal_shape_problems", "is_refused", "journal_view", "journal_problems"], loop: """
+            for STATE in "$@"; do
+              SESSION="${STATE%/*}/session.json"
+              WORK="${STATE%/*}/uninstall"
+              journal_view
+              problems="$(journal_problems)"
+              if [[ $'\\n'"$problems" == *$'\\n'"state.json is malformed"* || $'\\n'"$problems" == *$'\\n'"state.json is unreadable"* ]]; then
+                echo refused
+              elif [[ "$JOURNAL" == "$STATE" ]]; then
+                echo "accepted state"
+              else
+                echo "accepted view"
+              fi
+            done
+
+            """)
+        let results = try await ScriptFixture.runAll(agentRuns + uninstallRuns)
+        let agent = lines("backstop.sh", results[..<agentRuns.count])
+        let uninstall = lines("uninstall.sh", results[agentRuns.count...])
+        XCTAssertEqual(agent.count, table.count)
+        XCTAssertEqual(uninstall.count, table.count)
+        for (i, row) in table.enumerated() where i < agent.count && i < uninstall.count {
+            let data = row.bytes
+            let app = try? Store.decodeState(data)
+            let binary = AgentCutoffsCommand.sessionAnswer(for: data).lines.joined()
+            XCTAssertEqual(app != nil, row.app, "the app on \(row.label)")
+            XCTAssertEqual(binary == "rejected", !row.app, "the binary on \(row.label): \(binary)")
+            XCTAssertEqual(agent[i] != "refused", row.app, "backstop.sh on \(row.label): \(agent[i])")
+            XCTAssertEqual(uninstall[i] != "refused", row.app, "uninstall.sh on \(row.label): \(uninstall[i])")
+            guard row.app else { continue }
+            let read = agent[i].hasPrefix("accepted view ") ? "view" : "state"
+            XCTAssertEqual(agent[i], "accepted \(read) \(binary)", "the agent's reader and the binary on \(row.label)")
+            XCTAssertEqual(uninstall[i], "accepted \(read)", "the journal each script read on \(row.label)")
+            guard read == "view" else { continue }
+            let dir = states[i].deletingLastPathComponent()
+            let view = try Data(contentsOf: dir.appendingPathComponent("backstop-view"))
+            XCTAssertEqual(try Data(contentsOf: dir.appendingPathComponent("uninstall/call.state-view")), view, row.label)
+            XCTAssertEqual(try? Store.decodeState(view), app, "the app reads the view of \(row.label) as the journal")
+        }
     }
 
-    /// The reader over texts no fixture writes whole: what it reads as the
-    /// app does prints nothing, and what it refuses names the problem.
-    /// Each text is also given to the app's decoder, which reads every one
-    /// printing nothing. It also reads some the reader refuses: UTF-16 and
-    /// a NUL byte in a string, which the reader cannot follow, and the keys
-    /// read twice, where plutil would check the other copy. The BOM-less
-    /// UTF-16 file hiding a key is one the reader passed before it refused
-    /// NUL bytes: the shell drops them, and what is left reads as a key
-    /// inside an array, while the app reads 1e-400 at the top level.
+    /// The two scripts carry the same reader, every function and comment of
+    /// it (`readerBlock`).
+    func testBothScriptsReadTheRecordsTheSameWay() throws {
+        let reader = try Self.readerBlock("backstop.sh")
+        XCTAssertEqual(reader, try Self.readerBlock("uninstall.sh"))
+        for name in ["json_whole", "json_decimal_reads", "json_range", "json_magnitude_above", "json_digits_times", "json_float", "json_string_check", "json_nul_mark", "json_view_put", "json_window_trim", "record_text_problems"] {
+            XCTAssertTrue(reader.contains("\n\(name)() {"), name)
+        }
+    }
+
+    /// The reader over texts no fixture writes whole, as each script runs
+    /// it: what it prints, the view it writes, and the app's decoder on the
+    /// same bytes. Where the app reads the text, the reader prints nothing
+    /// or only "view: " and "record: " lines, and writes a view that plutil
+    /// reads and the app decodes to the same state. A "view: " line names
+    /// what plutil would read otherwise than the app: a key the app reads
+    /// twice in one object it reads, or spelled with an escape; a whole
+    /// number written with a fraction or an exponent, also one a Double
+    /// does not hold or rounds to whole; UTF-16 and UTF-32 (without a byte
+    /// order mark, or with UTF-32BE's); -0 where the app reads a Float, and
+    /// a NUL byte in text the app skips (both as in
+    /// testTheRecordReaderKeepsFloatsAndNULsAsTheAppReadsThem). A "record: "
+    /// line is a sessionCutoffs the app reads as no record. Where the app
+    /// refuses the text, a line names the problem and no view is written,
+    /// but for a key spelled twice whose first copy has a type the app does
+    /// not take: the view holds that copy, and journal_shape_problems
+    /// refuses it there. What the app skips passes: a key twice in an
+    /// object it does not read, a bad escape or 1. in a value it does not
+    /// read, and in a frozen process what follows a startedAt or a
+    /// startedAtMicros that is missing or null, wherever it is in the
+    /// object. The BOM-less UTF-16
+    /// file hiding a key is one the reader passed before it refused NUL
+    /// bytes: the shell drops them, and what is left reads as a key inside
+    /// an array, while the app reads 1e-400 at the top level, as the reader
+    /// now does through iconv.
     func testTheRecordReaderFollowsTheTopLevelAsTheAppReadsIt() throws {
         let b = backslash
         let bom = Data([0xEF, 0xBB, 0xBF])
@@ -2707,71 +5100,431 @@ final class RecoveryScriptTests: XCTestCase {
             ("empty object", utf8("{ }"), "", true),
             ("UTF-8 byte order mark", bom + utf8(#"{"keptDisplayReadLit":0.8}"#), "", true),
             ("UTF-8 byte order mark, too small", bom + utf8(#"{"keptDisplayReadLit":1e-400}"#),
-             "keptDisplayReadLit is 1e-400, too small a number for the app to read\n", false),
+             "keptDisplayReadLit is 1e-400, which the app reads as a Float that is not 0 and rounds to 0, and throws\n", false),
             ("UTF-16 with a byte order mark", Data([0xFF, 0xFE]) + #"{"keptDisplayReadLit":0.8}"#.data(using: .utf16LittleEndian)!,
-             "the top level of state.json cannot be followed here, so its records about a kept display entry cannot be checked\n", true),
+             "view: state.json is UTF-16LE, read here as UTF-8\n", true),
             ("UTF-16 without a byte order mark", #"{"keptDisplayReadLit":0.8}"#.data(using: .utf16LittleEndian)!,
-             "the top level of state.json cannot be followed here, so its records about a kept display entry cannot be checked\n", true),
+             "view: state.json is UTF-16LE, read here as UTF-8\n", true),
+            ("UTF-16 big-endian with a byte order mark", Data([0xFE, 0xFF]) + "{\"keptDisplayReadLit\":0.8,\"a\":\"\u{E9}\u{1F600}\"}".data(using: .utf16BigEndian)!,
+             "view: state.json is UTF-16BE, read here as UTF-8\n", true),
+            ("UTF-16 big-endian, too small", #"{"keptDisplayReadLit":1e-400}"#.data(using: .utf16BigEndian)!,
+             "view: state.json is UTF-16BE, read here as UTF-8\n"
+                + "keptDisplayReadLit is 1e-400, which the app reads as a Float that is not 0 and rounds to 0, and throws\n", false),
+            ("UTF-16 with a key twice", #"{"keptDisplayReadLit":0.8,"keptDisplayReadLit":0.7}"#.data(using: .utf16LittleEndian)!,
+             "view: state.json is UTF-16LE, read here as UTF-8\n"
+                + "view: the top level of state.json has keptDisplayReadLit more than once; the app reads the first, and so is it read here\n", true),
+            ("UTF-32 without a byte order mark", #"{"keptDisplayReadLit":0.8}"#.data(using: .utf32LittleEndian)!,
+             "view: state.json is UTF-32LE, read here as UTF-8\n", true),
+            ("UTF-32 without a byte order mark, too small", #"{"keptDisplayReadLit":1e-400}"#.data(using: .utf32LittleEndian)!,
+             "view: state.json is UTF-32LE, read here as UTF-8\n"
+                + "keptDisplayReadLit is 1e-400, which the app reads as a Float that is not 0 and rounds to 0, and throws\n", false),
+            ("UTF-32 big-endian without a byte order mark", #"{"keptDisplayReadLit":0.8}"#.data(using: .utf32BigEndian)!,
+             "view: state.json is UTF-32BE, read here as UTF-8\n", true),
+            ("UTF-32 big-endian with a byte order mark", Data([0x00, 0x00, 0xFE, 0xFF]) + "{\"keptDisplayReadLit\":0.8,\"a\":\"\u{E9}\u{1F600}\"}".data(using: .utf32BigEndian)!,
+             "view: state.json is UTF-32BE, read here as UTF-8\n", true),
+            ("UTF-32 big-endian with a byte order mark, too large", Data([0x00, 0x00, 0xFE, 0xFF]) + #"{"keptDisplayReadLit":1e39}"#.data(using: .utf32BigEndian)!,
+             "view: state.json is UTF-32BE, read here as UTF-8\n"
+                + "keptDisplayReadLit is 1e39, too large a number for the app's Float\n", false),
+            ("UTF-32 with a byte order mark", Data([0xFF, 0xFE, 0x00, 0x00]) + #"{"keptDisplayReadLit":0.8}"#.data(using: .utf32LittleEndian)!,
+             "view: state.json is UTF-16LE, read here as UTF-8\n"
+                + "state.json is not a JSON object, which the app's decoder requires\n", false),
             ("UTF-16 without a byte order mark, hiding a key",
              "{\"a\":\"\u{2278}\u{222C}\u{2271}\u{203A}\u{205B}\",\"keptDisplayReadLit\":1e-400,\"b\":\"\u{2C5D}\u{2220}\u{2263}\u{203A}\u{7822}\"}"
                 .data(using: .utf16LittleEndian)!,
-             "the top level of state.json cannot be followed here, so its records about a kept display entry cannot be checked\n", false),
-            ("UTF-16 without records", #"{"sleepDisabledByUs":true}"#.data(using: .utf16LittleEndian)!, "", true),
+             "view: state.json is UTF-16LE, read here as UTF-8\n"
+                + "keptDisplayReadLit is 1e-400, which the app reads as a Float that is not 0 and rounds to 0, and throws\n", false),
+            ("UTF-16 without records", #"{"sleepDisabledByUs":true}"#.data(using: .utf16LittleEndian)!,
+             "view: state.json is UTF-16LE, read here as UTF-8\n", true),
             ("NUL byte in a string", utf8("{\"keptDisplayReadLit\":0.8,\"a\":\"x\u{0}y\"}"),
-             "the top level of state.json cannot be followed here, so its records about a kept display entry cannot be checked\n", true),
+             "view: state.json holds a NUL byte in text the app skips, which plutil does not read; left out\n", true),
             ("comma before the end", utf8(#"{"keptDisplayReadLit":0.8,}"#), "", true),
             ("whitespace everywhere", utf8("\n{ \"a\" :\t[ 1 ,2 ] ,\r\n \"keptDisplayReadLit\"\n:\n0.8\n}\n"), "", true),
             ("escaped letter, upper hex", utf8(#"{"kept\#(b)u0044isplayReadLit":1e-400}"#),
-             "keptDisplayReadLit is 1e-400, too small a number for the app to read\n", false),
+             "view: the top level of state.json has keptDisplayReadLit written as another key the app reads as keptDisplayReadLit; read here as keptDisplayReadLit\n"
+                + "keptDisplayReadLit is 1e-400, which the app reads as a Float that is not 0 and rounds to 0, and throws\n", false),
             ("escaped letter, lower hex", utf8(#"{"keptDisplayRead\#(b)u004cit":1e39}"#),
-             "keptDisplayReadLit is 1e39, too large a number for the app to read\n", false),
-            ("escaped letter, valid value", utf8(#"{"keptDisplayReadL\#(b)u0069t":0.8}"#), "", true),
+             "view: the top level of state.json has keptDisplayReadLit written as another key the app reads as keptDisplayReadLit; read here as keptDisplayReadLit\n"
+                + "keptDisplayReadLit is 1e39, too large a number for the app's Float\n", false),
+            ("escaped letter, valid value", utf8(#"{"keptDisplayReadL\#(b)u0069t":0.8}"#),
+             "view: the top level of state.json has keptDisplayReadLit written as another key the app reads as keptDisplayReadLit; read here as keptDisplayReadLit\n", true),
             ("other escapes in keys", utf8(#"{"a\#(b)"\#(b)\#(b)\#(b)/\#(b)b\#(b)f\#(b)n\#(b)r\#(b)t\#(b)u00e9\#(b)ud83d\#(b)ude00":1}"#), "", true),
             ("a key with a \\x escape", utf8(#"{"kept\#(b)x44isplayReadLit":0.8}"#),
-             "a key in state.json has an escape JSON does not have, so its records about a kept display entry cannot be checked\n", false),
+             "a key in the top level of state.json is text the app's decoder does not read (a control character, bytes that are not UTF-8, an escape JSON does not have, or a lone surrogate)\n", false),
             ("unquoted key", utf8(#"{keptDisplayReadLit:0.8}"#),
-             "the top level of state.json cannot be followed here, so its records about a kept display entry cannot be checked\n", false),
+             "the text of state.json is not JSON the app's decoder reads\n", false),
             ("block comment", utf8(#"{"a":1,/* c */"keptDisplayReadLit":0.8}"#),
-             "the top level of state.json cannot be followed here, so its records about a kept display entry cannot be checked\n", false),
+             "the text of state.json is not JSON the app's decoder reads\n", false),
             ("line comment", utf8("{\"a\":1, // c\n\"keptDisplayReadLit\":0.8}"),
-             "the top level of state.json cannot be followed here, so its records about a kept display entry cannot be checked\n", false),
+             "the text of state.json is not JSON the app's decoder reads\n", false),
             ("escaped backslash in a value", utf8(#"{"name":"Headset \#(b)\#(b)u0041","uid":"\#(b)\#(b)"}"#), "", true),
             ("escape in a value", utf8(#"{"name":"Headset \#(b)u0041 \#(b)"keptDisplayReadLit\#(b)":1e-400"}"#), "", true),
             ("nested copies", utf8(#"{"keptDisplayReadLit":0.8,"a":{"keptDisplayReadLit":1e-400,"b":[["keptDisplayReadLit",{"keptDisplayReadLit":0.7}]]}}"#), "", true),
             ("brackets in nested strings", utf8(#"{"a":{"b":"}]","c":["{[",{"d":"\#(b)"}"}]},"keptDisplayReadLit":1e-400}"#),
-             "keptDisplayReadLit is 1e-400, too small a number for the app to read\n", false),
+             "keptDisplayReadLit is 1e-400, which the app reads as a Float that is not 0 and rounds to 0, and throws\n", false),
             ("read twice", utf8(#"{"keptDisplayReadLit":0.8,"keptDisplayReadL\#(b)u0069t":0.8}"#),
-             "keptDisplayReadLit is in the top level of state.json 2 times; the app reads the first and plutil the last\n", true),
+             "view: the top level of state.json has keptDisplayReadLit more than once; the app reads the first, and so is it read here\n", true),
             ("boot read twice", utf8(#"{"keptDisplayUnderLowPowerBoot":"a","keptDisplayUnderLowPowerBoot":null}"#),
-             "keptDisplayUnderLowPowerBoot is in the top level of state.json 2 times; the app reads the first and plutil the last\n", true),
-            ("zero forms", utf8(#"{"keptDisplayReadLit":-0,"keptDisplayUnderLowPower":0e-400}"#), "", true),
+             "view: the top level of state.json has keptDisplayUnderLowPowerBoot more than once; the app reads the first, and so is it read here\n", true),
+            ("zero forms", utf8(#"{"keptDisplayReadLit":-0,"keptDisplayUnderLowPower":0e-400}"#),
+             "view: keptDisplayReadLit is written as -0, which plutil would write back as text the app reads as another Float; read here as -0.0\n", true),
             ("leading zero", utf8(#"{"keptDisplayReadLit":01}"#),
-             "keptDisplayReadLit is written as 01, which the app does not read as a number\n", false),
+             "keptDisplayReadLit is written as 01, which is not a JSON number the app's decoder reads\n", false),
+            ("any key read twice", utf8(#"{"sleepDisabledByUs":true,"sleepDisabledByUs":false}"#),
+             "view: the top level of state.json has sleepDisabledByUs more than once; the app reads the first, and so is it read here\n", true),
+            ("a nested key read twice", utf8(#"{"frozenProcesses":[{"pid":5,"p\#(b)u0069d":6}]}"#),
+             "view: frozenProcesses[0] has pid more than once; the app reads the first, and so is it read here\n", true),
+            ("a key twice in an object the app does not read", utf8(#"{"a":{"x":1,"x":2}}"#), "", true),
+            ("a key twice in an object under an entry", utf8(#"{"frozenProcesses":[{"pid":1,"a":{"x":1,"x":2}}]}"#), "", true),
+            ("a key the app does not read twice", utf8(#"{"a":1,"a":2,"frozenProcesses":[{"pid":1,"x":1,"x":2}]}"#), "", true),
+            ("a key twice in an entry the app reads", utf8(#"{"savedAudioOutputs":[{"deviceUID":"a","volume":0.5,"muted":false,"device\#(b)u0055ID":"b"}]}"#),
+             "view: savedAudioOutputs[0] has deviceUID more than once; the app reads the first, and so is it read here\n", true),
+            ("an App Nap key twice", utf8(#"{"appNapOverrides":[{"bundleId":"a","previous":true,"previous":null}]}"#),
+             "view: appNapOverrides[0] has previous more than once; the app reads the first, and so is it read here\n", true),
+            ("an object under the record", utf8(#"{"sessionCutoffs":{"a":1,"a":2,"b":"\#(b)x41"}}"#),
+             "record: sessionCutoffs is an object, which the app does not read as a record\n", true),
+            ("a record twice", utf8(#"{"sessionCutoffs":"30 false","session\#(b)u0043utoffs":"0 true"}"#),
+             "view: the top level of state.json has sessionCutoffs more than once; the app reads the first, and so is it read here\n", true),
+            ("a record with a \\x escape", utf8(#"{"sessionCutoffs":"3\#(b)x30 false"}"#),
+             "record: sessionCutoffs is a string the app does not read as a record\n", true),
+            ("a record written as +1", utf8(#"{"sessionCutoffs":+1}"#),
+             "sessionCutoffs is written as +1, which is not a JSON value the app's decoder reads\n", false),
+            ("a record written as 1.", utf8(#"{"sessionCutoffs":1.}"#),
+             "record: sessionCutoffs is written as 1., which the app does not read as a record\n", true),
+            ("one key in two objects", utf8(#"{"a":{"x":1},"b":{"x":2}}"#), "", true),
+            ("a Kelvin sign spelling a key twice", utf8("{\"saved\u{212A}eyboardBrightness\":\"bad\",\"savedKeyboardBrightness\":0.5}"),
+             "view: the top level of state.json has savedKeyboardBrightness written as another key the app reads as savedKeyboardBrightness; read here as savedKeyboardBrightness\n"
+                + "view: the top level of state.json has savedKeyboardBrightness more than once; the app reads the first, and so is it read here\n", false),
+            ("an escaped Kelvin sign spelling a key twice", utf8(#"{"savedKeyboardBrightness":0.5,"saved\#(b)u212AeyboardBrightness":0.4}"#),
+             "view: the top level of state.json has savedKeyboardBrightness more than once; the app reads the first, and so is it read here\n", true),
+            ("commas before the ends inside", utf8(#"{"a":[1,2,],"b":{"c":1,}}"#), "", true),
+            ("an Int32 too large", utf8(#"{"frozenProcesses":[{"pid":2147483648}]}"#),
+             "frozenProcesses[0].pid is 2147483648, which the app's decoder does not read as a whole number it holds there\n", false),
+            ("the ends of Int32 and Int64", utf8(#"{"frozenProcesses":[{"pid":-2147483648,"startedAt":9223372036854775807,"startedAtMicros":2147483647}]}"#), "", true),
+            ("an Int64 too large", utf8(#"{"frozenProcesses":[{"pid":1,"startedAt":9223372036854775808}]}"#),
+             "frozenProcesses[0].startedAt is 9223372036854775808, which the app's decoder does not read as a whole number it holds there\n", false),
+            ("a legacy pid too small", utf8(#"{"frozenPids":[1,2,-2147483649]}"#),
+             "frozenPids[2] is -2147483649, which the app's decoder does not read as a whole number it holds there\n", false),
+            ("an output volume too large", utf8(#"{"savedAudioOutputs":[{"deviceUID":"a","volume":1e39,"muted":false}]}"#),
+             "savedAudioOutputs[0].volume is 1e39, too large a number for the app's Float\n", false),
+            ("a saved level written as 1.", utf8(#"{"savedOutputVolume":1.}"#),
+             "savedOutputVolume is written as 1., which is not a JSON number the app's decoder reads\n", false),
+            ("not a JSON number in an object the app does not read", utf8(#"{"note":{"a":+1}}"#),
+             "note.a is written as +1, which is not a JSON value the app's decoder reads\n", false),
+            ("single quotes in an array", utf8(#"{"note":['s']}"#),
+             "note[0] is written as 's', which is not a JSON value the app's decoder reads\n", false),
+            ("a \\x escape in a value the app reads", utf8(#"{"endedSession":"abc\#(b)x41"}"#),
+             "endedSession is a string the app's decoder does not read (a control character, bytes that are not UTF-8, an escape JSON does not have, or a lone surrogate)\n", false),
+            ("a \\x escape in a value the app does not read", utf8(#"{"note":"abc\#(b)x41"}"#), "", true),
+            ("a \\x escape in a key the app does not read", utf8(#"{"note":{"\#(b)x41":1},"frozenProcesses":[{"pid":1,"y":{"\#(b)x41":"\#(b)'"}}]}"#), "", true),
+            ("a \\x escape in a key of an entry the app reads", utf8(#"{"appNapOverrides":[{"bundleId":"a","\#(b)x41":1}]}"#),
+             "a key in appNapOverrides[0] is text the app's decoder does not read (a control character, bytes that are not UTF-8, an escape JSON does not have, or a lone surrogate)\n", false),
+            ("a \\x escape in a saved output's name", utf8(#"{"savedAudioOutputs":[{"deviceUID":"a","name":"\#(b)x41","volume":0.5,"muted":false}]}"#),
+             "savedAudioOutputs[0].name is a string the app's decoder does not read (a control character, bytes that are not UTF-8, an escape JSON does not have, or a lone surrogate)\n", false),
+            ("numbers the app skips", utf8(#"{"note":[1.,-.5,2.e3,1e-400,1-2],"frozenProcesses":[{"pid":1,"x":0.}]}"#), "", true),
+            (".5 under a key the app does not read", utf8(#"{"frozenProcesses":[{"pid":1,"x":.5}]}"#),
+             "frozenProcesses[0].x is written as .5, which is not a JSON value the app's decoder reads\n", false),
+            ("a pid written as 1.0", utf8(#"{"frozenProcesses":[{"pid":5105.0,"startedAt":1.7e9,"startedAtMicros":25E4}]}"#),
+             "view: frozenProcesses[0].pid is written as 5105.0, which the app reads as 5105; read here as 5105\n"
+                + "view: frozenProcesses[0].startedAt is written as 1.7e9, which the app reads as 1700000000; read here as 1700000000\n"
+                + "view: frozenProcesses[0].startedAtMicros is written as 25E4, which the app reads as 250000; read here as 250000\n", true),
+            ("a pid that is not whole", utf8(#"{"frozenProcesses":[{"pid":5105.5}]}"#),
+             "frozenProcesses[0].pid is 5105.5, which the app's decoder does not read as a whole number it holds there\n", false),
+            ("whole numbers within Int32 written with a fraction or an exponent", utf8(#"{"frozenPids":[214748364.7e1,-2147483648.0,0e999,-0.0,100e-2]}"#),
+             "view: frozenPids[0] is written as 214748364.7e1, which the app reads as 2147483647; read here as 2147483647\n"
+                + "view: frozenPids[1] is written as -2147483648.0, which the app reads as -2147483648; read here as -2147483648\n"
+                + "view: frozenPids[2] is written as 0e999, which the app reads as 0; read here as 0\n"
+                + "view: frozenPids[3] is written as -0.0, which the app reads as 0; read here as 0\n"
+                + "view: frozenPids[4] is written as 100e-2, which the app reads as 1; read here as 1\n", true),
+            ("a whole number past Int32 written with an exponent", utf8(#"{"frozenPids":[21474836480e-1]}"#),
+             "frozenPids[0] is 21474836480e-1, which the app's decoder does not read as a whole number it holds there\n", false),
+            ("a startedAt up to 2^53 written with a fraction", utf8(#"{"frozenProcesses":[{"pid":1,"startedAt":9007199254740992.0}]}"#),
+             "view: frozenProcesses[0].startedAt is written as 9007199254740992.0, which the app reads as 9007199254740992; read here as 9007199254740992\n", true),
+            ("a startedAt of 1e18", utf8(#"{"frozenProcesses":[{"pid":1,"startedAt":1e18}]}"#),
+             "view: frozenProcesses[0].startedAt is written as 1e18, which the app reads as 1000000000000000000; read here as 1000000000000000000\n", true),
+            ("a startedAt of 2^62 written with a fraction", utf8(#"{"frozenProcesses":[{"pid":1,"startedAt":4611686018427387904.0},{"pid":2,"startedAt":-4611686018427387904.0}]}"#),
+             "view: frozenProcesses[0].startedAt is written as 4611686018427387904.0, which the app reads as 4611686018427387904; read here as 4611686018427387904\n"
+                + "view: frozenProcesses[1].startedAt is written as -4611686018427387904.0, which the app reads as -4611686018427387904; read here as -4611686018427387904\n", true),
+            ("a startedAt a Double does not hold, written with a fraction", utf8(#"{"frozenProcesses":[{"pid":1,"startedAt":9007199254740993.0}]}"#),
+             "view: frozenProcesses[0].startedAt is written as 9007199254740993.0, which the app reads as 9007199254740993; read here as 9007199254740993\n", true),
+            ("the lowest Int64 written with a fraction", utf8(#"{"frozenProcesses":[{"pid":1,"startedAt":-9223372036854775808.0}]}"#),
+             "frozenProcesses[0].startedAt is -9223372036854775808.0, which the app's decoder does not read as a whole number it holds there\n", false),
+            ("startedAtMicros past Int32, no startedAt", utf8(#"{"frozenProcesses":[{"pid":1,"startedAtMicros":2147483648}]}"#), "", true),
+            ("startedAtMicros past Int32 after a null startedAt", utf8(#"{"frozenProcesses":[{"pid":1,"startedAt":null,"startedAtMicros":2147483648}]}"#), "", true),
+            ("startedAtMicros past Int32 after a startedAt", utf8(#"{"frozenProcesses":[{"pid":1,"startedAt":5,"startedAtMicros":2147483648}]}"#),
+             "frozenProcesses[0].startedAtMicros is 2147483648, which the app's decoder does not read as a whole number it holds there\n", false),
+            ("startedAtMicros past Int32 before a startedAt", utf8(#"{"frozenProcesses":[{"pid":1,"startedAtMicros":2147483648,"startedAt":5}]}"#),
+             "frozenProcesses[0].startedAtMicros is 2147483648, which the app's decoder does not read as a whole number it holds there\n", false),
+            ("startedAtMicros past Int32 in the second entry only", utf8(#"{"frozenProcesses":[{"pid":1,"startedAt":5,"startedAtMicros":1,"bootSession":"b"},{"pid":2,"startedAtMicros":2147483648}]}"#), "", true),
+            ("a \\x escape in bootSession, no startedAtMicros", utf8(#"{"frozenProcesses":[{"pid":1,"startedAt":5,"bootSession":"\#(b)x41"}]}"#),
+             "view: frozenProcesses[0].bootSession, which the app does not read there, is a string the app would not read; left out\n", true),
+            ("a \\x escape in bootSession of an identity", utf8(#"{"frozenProcesses":[{"pid":1,"startedAt":5,"startedAtMicros":0,"bootSession":"\#(b)x41"}]}"#),
+             "frozenProcesses[0].bootSession is a string the app's decoder does not read (a control character, bytes that are not UTF-8, an escape JSON does not have, or a lone surrogate)\n", false),
+            ("startedAtMicros written as +1, no startedAt", utf8(#"{"frozenProcesses":[{"pid":1,"startedAtMicros":+1}]}"#),
+             "frozenProcesses[0].startedAtMicros is written as +1, which is not a JSON value the app's decoder reads\n", false),
+            ("startedAtMicros twice, no startedAt", utf8(#"{"frozenProcesses":[{"pid":1,"startedAtMicros":1,"startedAtMicros":2}]}"#),
+             "view: frozenProcesses[0] has startedAtMicros more than once; the app reads the first, and so is it read here\n", true),
+            ("startedAtMicros twice in an identity", utf8(#"{"frozenProcesses":[{"pid":1,"startedAt":5,"startedAtMicros":1,"startedAtMicros":2,"bootSession":"b"}]}"#),
+             "view: frozenProcesses[0] has startedAtMicros more than once; the app reads the first, and so is it read here\n", true),
+            ("a pid a Double rounds to whole", utf8(#"{"frozenProcesses":[{"pid":1.0000000000000001}]}"#),
+             "view: frozenProcesses[0].pid is written as 1.0000000000000001, which the app reads as 1; read here as 1\n", true),
+            // A Double rounds this one to 0.
+            ("a pid with a very small exponent", utf8(#"{"frozenPids":[1e-99999]}"#),
+             "view: frozenPids[0] is written as 1e-99999, which the app reads as 0; read here as 0\n", true),
         ]
+        try checkRecordReader(cases)
+    }
+
+    /// Runs the reader of each script over each text (`recordTextProblems`)
+    /// and checks what it prints, the view it writes, and the app's decoder
+    /// on the same bytes. Both scripts print the same and write the same
+    /// view. A view is written exactly when the reader prints nothing or
+    /// only "view: " and "record: " lines, and the app decodes it to the
+    /// state it decodes from the text, bit for bit (each Float too, as the
+    /// app's encoder writes it). A view that holds U+E000 for \u0000
+    /// (json_nul_mark) is checked as every journal published from it is
+    /// (journal_candidate_ok): each U+E000 put back as \u0000.
+    private func checkRecordReader(_ cases: [(label: String, bytes: Data, prints: String, appReads: Bool)]) throws {
+        let b = backslash
         let printed = try recordTextProblems(cases.map { ($0.label, $0.bytes) })
         let printedByUninstall = try recordTextProblems(cases.map { ($0.label, $0.bytes) }, script: "uninstall.sh")
         for c in cases {
-            XCTAssertEqual(printed[c.label], c.prints, c.label)
-            XCTAssertEqual(printedByUninstall[c.label], c.prints, c.label)
-            let reads = (try? Store.makeDecoder().decode(RuntimeState.self, from: c.bytes)) != nil
-            XCTAssertEqual(reads, c.appReads, "the app's decoder on \(c.label)")
+            let backstop = try XCTUnwrap(printed[c.label], c.label)
+            let uninstall = try XCTUnwrap(printedByUninstall[c.label], c.label)
+            XCTAssertEqual(backstop.printed, c.prints, c.label)
+            XCTAssertEqual(uninstall.printed, c.prints, c.label)
+            XCTAssertEqual(uninstall.view, backstop.view, c.label)
+            let app = try? Store.makeDecoder().decode(RuntimeState.self, from: c.bytes)
+            XCTAssertEqual(app != nil, c.appReads, "the app's decoder on \(c.label)")
+            let onlyViewLines = c.prints.split(separator: "\n").allSatisfy { $0.hasPrefix("view: ") || $0.hasPrefix("record: ") }
+            XCTAssertEqual(backstop.view != nil, onlyViewLines, "a view for \(c.label)")
+            if var view = backstop.view {
+                if c.prints.contains("written in the view as U+E000") {
+                    view = Data(String(decoding: view, as: UTF8.self).replacingOccurrences(of: "\(b)uE000", with: "\(b)u0000").utf8)
+                }
+                let read = try? Store.makeDecoder().decode(RuntimeState.self, from: view)
+                XCTAssertEqual(read, app, "the app reads the view of \(c.label) as the text")
+                XCTAssertEqual(try read.map { try Store.makeEncoder().encode($0) }, try app.map { try Store.makeEncoder().encode($0) }, "the view of \(c.label), bit for bit")
+            }
+        }
+    }
+
+    /// Review35 R35-1: the reader over Floats and NULs, as
+    /// checkRecordReader checks it. A Float plutil would write back as text
+    /// the app reads as another Float (it reads up to 17 digits through a
+    /// Double and up to 38 through a Decimal, and "-0" as the whole number
+    /// 0) is held in the view as the same Float in 9 digits, -0 as -0.0;
+    /// one plutil keeps stays as written. A NUL byte in text the app skips,
+    /// which plutil does not read, is left out of the view; one the app
+    /// refuses (in a string it reads, between values) is refused. A string
+    /// the app reads that holds \u0000, which plutil cannot hold, is held
+    /// in the view with U+E000 for each \u0000 (json_nul_mark); after
+    /// escaped backslashes too, in each place the app reads a string: an
+    /// audio output, an App Nap entry, the kept record's boot, a frozen
+    /// process's bootSession, endedSession. Where the app does not read the
+    /// string, or reads it as no record, it goes as any such string. The
+    /// texts the app loads that the reader refuses, its kept residual
+    /// cost: such a string longer than 1024 bytes, as bash takes time that
+    /// grows with the square of the length to mark it, and a journal that
+    /// holds U+E000 as well, raw or as an escape, which the view could not
+    /// tell from a mark. U+E000 alone passes.
+    func testTheRecordReaderKeepsFloatsAndNULsAsTheAppReadsThem() throws {
+        let b = backslash
+        func utf8(_ s: String) -> Data { Data(s.utf8) }
+        // The line for a string the app reads that holds \u0000.
+        func marked(_ shown: String) -> String {
+            "view: \(shown) holds \(b)u0000, which plutil cannot hold; written in the view as U+E000 (\(b)uE000), which each journal published from it writes back as \(b)u0000\n"
+        }
+        let markRefused = "state.json holds \(b)u0000 where the app reads it, which the view writes as U+E000, and U+E000 as well, so what the app reads is not known here\n"
+        let skippedNUL = "view: state.json holds a NUL byte in text the app skips, which plutil does not read; left out\n"
+        let cases: [(label: String, bytes: Data, prints: String, appReads: Bool)] = [
+            ("NUL byte in a key the app skips", utf8("{\"a\":{\"x\u{0}\":1}}"), skippedNUL, true),
+            ("NUL byte in a string the app reads", utf8("{\"appNapOverrides\":[{\"bundleId\":\"a\u{0}b\"}]}"),
+             "appNapOverrides[0].bundleId is a string the app's decoder does not read (a control character, bytes that are not UTF-8, an escape JSON does not have, or a lone surrogate)\n", false),
+            ("NUL byte between values", utf8("{\"a\":1,\u{0}\"b\":2}"), "the text of state.json is not JSON the app's decoder reads\n", false),
+            ("\\u0000 in a device UID", utf8(#"{"savedAudioOutputs":[{"deviceUID":"a\#(b)u0000b","volume":0.5,"muted":false}]}"#),
+             marked("savedAudioOutputs[0].deviceUID"), true),
+            ("\\u0000 after escaped backslashes", utf8(#"{"appNapOverrides":[{"bundleId":"a\#(b)\#(b)u0000\#(b)\#(b)\#(b)u0000"}]}"#),
+             marked("appNapOverrides[0].bundleId"), true),
+            ("\\u0000 in the kept record's boot", utf8(#"{"keptDisplayUnderLowPower":0.8,"keptDisplayUnderLowPowerBoot":"\#(b)u0000"}"#),
+             marked("keptDisplayUnderLowPowerBoot"), true),
+            ("\\u0000 in a bootSession", utf8(#"{"frozenProcesses":[{"pid":1,"startedAt":5,"startedAtMicros":0,"bootSession":"b\#(b)u0000"}]}"#),
+             marked("frozenProcesses[0].bootSession"), true),
+            ("\\u0000 in a bootSession the app does not read", utf8(#"{"frozenProcesses":[{"pid":1,"startedAt":5,"bootSession":"b\#(b)u0000"}]}"#),
+             "view: frozenProcesses[0].bootSession, which the app does not read there, is a string the app would not read; left out\n", true),
+            ("\\u0000 in an endedSession", utf8(#"{"endedSession":"e\#(b)u0000"}"#), marked("endedSession"), true),
+            ("\\u0000 in a record", utf8(#"{"sessionCutoffs":"30\#(b)u0000 false"}"#),
+             "record: sessionCutoffs is a string the app does not read as a record\n", true),
+            ("\\u0000 where the app does not read it", utf8(#"{"note":"\#(b)u0000","appNapOverrides":[{"bundleId":"a","a\#(b)u0000":1}]}"#), "", true),
+            ("U+E000 without \\u0000", utf8("{\"appNapOverrides\":[{\"bundleId\":\"\u{E000}\"}],\"note\":\"\(b)uE000\"}"), "", true),
+            ("\\u0000 and U+E000", utf8("{\"appNapOverrides\":[{\"bundleId\":\"a\(b)u0000\"},{\"bundleId\":\"\u{E000}\"}]}"),
+             marked("appNapOverrides[0].bundleId") + markRefused, true),
+            ("\\u0000 and U+E000 as an escape", utf8(#"{"appNapOverrides":[{"bundleId":"a\#(b)u0000"}],"note":"\#(b)ue000"}"#),
+             marked("appNapOverrides[0].bundleId") + markRefused, true),
+            ("\\u0000 in a string longer than 1024 bytes",
+             utf8(#"{"savedAudioOutputs":[{"deviceUID":"a","name":""# + String(repeating: "n", count: 1100) + #"\#(b)u0000","volume":0.5,"muted":false}]}"#),
+             "savedAudioOutputs[0].name holds \(b)u0000, which the app reads and plutil does not; not read here\n", true),
+            ("a Float plutil would write back as another", utf8(#"{"keptDisplayReadLit":0.5000000298023223876953125000000000000001}"#),
+             "view: keptDisplayReadLit is written as 0.50000002980232238769531250000000000000, which plutil would write back as text the app reads as another Float; read here as 0.50000006\n", true),
+            ("a Float at the midpoint of two", utf8(#"{"keptDisplayReadLit":0.5000000298023223876953125}"#),
+             "view: keptDisplayReadLit is written as 0.5000000298023223876953125, which plutil would write back as text the app reads as another Float; read here as 0.5\n", true),
+            ("negative zero Floats", utf8(#"{"keptDisplayReadLit":-0,"savedDisplayBrightness":-0.0}"#),
+             "view: keptDisplayReadLit is written as -0, which plutil would write back as text the app reads as another Float; read here as -0.0\n", true),
+            ("a Float plutil keeps", utf8(#"{"keptDisplayReadLit":0.30000001192092896}"#), "", true),
+        ]
+        try checkRecordReader(cases)
+    }
+
+    /// A journal the app loads whose Floats plutil would write back as
+    /// others, or whose strings the app reads hold \u0000, what a backstop
+    /// run over it calls and exits with, and what the journal it publishes
+    /// holds afterwards. `ending` journals go with a valid session whose
+    /// end is recorded in the journal.
+    private typealias PublishedJournalRow = (label: String, journal: String, ending: Bool, status: Int32,
+                                             calls: (ScriptFixture) -> [String], undone: (inout RuntimeState, ScriptFixture) throws -> Void)
+
+    private static func publishedJournalRows() -> [PublishedJournalRow] {
+        let lit = "0.5000000298023223876953125000000000000001"
+        let mid = "0.50000002980232238769531250"
+        let above = "0.500000059604644775390625"
+        let sleepOff = { (f: ScriptFixture) in "sudo -n \(f.fakePmset) -a disablesleep 0" }
+        let lowPowerOff = { (f: ScriptFixture) in "sudo -n \(f.fakePmset) -b lowpowermode 0" }
+        return [
+            ("Floats plutil would write back as others",
+             #"{"sleepDisabledByUs":true,"savedOutputVolume":0.50000002980232239,"savedDisplayBrightness":\#(lit),"savedKeyboardBrightness":0.500000029802322387695312500000000001,"displayRestoredUnderLowPower":\#(mid),"displayRestoreRefused":true,"keyboardRestoreRefused":true,"keptDisplayUnderLowPower":\#(above),"keptDisplayUnderLowPowerBoot":"boot-private","keptDisplayReadLit":0.5000000298023223876953125000000000000000000000000000001}"#,
+             false, 1, { [sleepOff($0)] }, { s, _ in s.sleepDisabledByUs = false }),
+            ("-0 through four edits, with Low Power Mode",
+             #"{"sleepDisabledByUs":true,"lowPowerSetByUs":true,"dockerFrozen":true,"frozenProcesses":[{"pid":4343,"startedAt":1760000001}],"savedAudioOutputs":[{"deviceUID":"u\u0000","volume":-0,"muted":true}],"savedOutputVolume":-0.0,"savedDisplayBrightness":-0,"displayRestoreRefused":true,"keptDisplayUnderLowPower":-0e0,"keptDisplayUnderLowPowerBoot":"boot\u0000","keptDisplayReadLit":-0,"appNapOverrides":[{"bundleId":"com.example.y","previous":false}]}"#,
+             false, 1, { [sleepOff($0), lowPowerOff($0), "defaults write com.example.y NSAppSleepDisabled -bool false"] },
+             { s, f in s.sleepDisabledByUs = false; s.lowPowerSetByUs = false; s.keptDisplayUnderLowPowerBoot = f.bootUUID; s.appNapOverrides = [] }),
+            ("\\u0000 in each string the app reads",
+             #"{"sleepDisabledByUs":true,"savedAudioOutputs":[{"deviceUID":"u\u0000id","name":"n\u0000\\u0000","volume":\#(lit),"muted":true,"saveID":"\u0000"}],"keptDisplayUnderLowPowerBoot":"k\u0000","frozenProcesses":[{"pid":4242,"startedAt":1760000000,"startedAtMicros":5,"bootSession":"b\u0000"},{"pid":4343,"startedAt":1760000001,"bootSession":"c\u0000"}],"appNapOverrides":[{"bundleId":"com.example\u0000x","previous":true},{"bundleId":"com.example.y","previous":false}]}"#,
+             false, 1, { [sleepOff($0), "defaults write com.example.y NSAppSleepDisabled -bool false"] },
+             { s, _ in s.sleepDisabledByUs = false; s.frozenProcesses.removeFirst(); s.appNapOverrides.removeLast() }),
+            ("\\u0000 in the kept display entry's boot, with Low Power Mode",
+             #"{"sleepDisabledByUs":true,"lowPowerSetByUs":true,"savedDisplayBrightness":\#(above),"displayRestoreRefused":true,"keptDisplayUnderLowPower":\#(above),"keptDisplayUnderLowPowerBoot":"boot\u0000","keptDisplayReadLit":\#(above)}"#,
+             false, 0, { [sleepOff($0), lowPowerOff($0)] },
+             { s, f in s.sleepDisabledByUs = false; s.lowPowerSetByUs = false; s.keptDisplayUnderLowPowerBoot = f.bootUUID }),
+            ("\\u0000 in endedSession, the end recorded in the journal",
+             #"{"sleepDisabledByUs":true,"endedSession":"e\u0000","savedDisplayBrightness":\#(lit),"displayRestoreRefused":true,"keptDisplayUnderLowPower":\#(above),"keptDisplayUnderLowPowerBoot":"boot-private","keptDisplayReadLit":\#(above)}"#,
+             true, 1, { [sleepOff($0)] },
+             { s, f in s.sleepDisabledByUs = false; s.endedSession = try Data(contentsOf: f.session).base64EncodedString() }),
+        ]
+    }
+
+    /// Review35 R35-1, past the reader: whole backstop runs on journals the
+    /// app loads whose Floats plutil would write back as others (38 digits,
+    /// the midpoint of two Floats and digits beside it, -0 in each
+    /// spelling) and whose strings the app reads hold \u0000. Each journal
+    /// the run publishes (the end record in the journal, the kept display
+    /// entry's record given this boot before Low Power Mode goes off, the
+    /// undo at the end, which can take four edits) decodes, bit for bit, to
+    /// what the app read before, but for what the run undid or recorded:
+    /// sleep, Low Power Mode, a frozen process of another boot, an App Nap
+    /// entry restored, this boot, the end. An App Nap entry whose bundle id
+    /// holds \u0000 is kept with no defaults call, and nothing is left
+    /// beside the journal.
+    func testPublishedJournalsKeepTheFloatsAndStringsTheAppReads() async throws {
+        let rows = Self.publishedJournalRows()
+        // One fixture per journal; the runs go several at a time.
+        var fixtures: [ScriptFixture] = []
+        defer { fixtures.forEach { $0.destroy() } }
+        for row in rows {
+            let f = try ScriptFixture.concurrentRow()
+            fixtures.append(f)
+            try f.writeState(row.journal)
+            if row.ending {
+                // session.json, with the app gone, cannot be removed, and
+                // ended-session.json holds a record that cannot be replaced.
+                try f.writeSession(endsAt: Date(timeIntervalSinceNow: 3600))
+                try setImmutable(f.session, true)
+                try "{}".write(to: f.endedSession, atomically: true, encoding: .utf8)
+                try setImmutable(f.endedSession, true)
+            }
+        }
+
+        let results = try await ScriptFixture.runAll(fixtures.map { $0.launch($0.backstop) })
+
+        for (row, (f, r)) in zip(rows, zip(fixtures, results)) {
+            let before = try Store.makeDecoder().decode(RuntimeState.self, from: Data(row.journal.utf8))
+            XCTAssertEqual(r.status, row.status, row.label + r.stderr + f.log())
+            XCTAssertEqual(f.calls().filter { call in ["sudo", "defaults", "kill"].contains { call.hasPrefix($0 + " ") } }, row.calls(f), row.label)
+            XCTAssertFalse(f.log().contains("could not publish"), "\(row.label): \(f.log())")
+            XCTAssertEqual(try f.contents(of: f.home).filter { $0.hasPrefix(".state.json") }, [], row.label)
+            let published = try Data(contentsOf: f.state)
+            let text = String(decoding: published, as: UTF8.self)
+            XCTAssertFalse(text.contains("\u{E000}") || text.lowercased().contains("\(backslash)ue000") || text.contains("\u{0}"), "\(row.label): \(text)")
+            var expected = before
+            try row.undone(&expected, f)
+            let after = try Store.makeDecoder().decode(RuntimeState.self, from: published)
+            XCTAssertEqual(after, expected, "\(row.label): \(text)")
+            XCTAssertEqual(try Store.makeEncoder().encode(after), try Store.makeEncoder().encode(expected), "\(row.label), bit for bit: \(text)")
+        }
+    }
+
+    /// Review35 R35-1, the same journals through uninstall.sh, which
+    /// publishes a journal only through the backstop it runs. Each
+    /// uninstall undoes what the backstop alone undoes, exits as it does,
+    /// and leaves a journal that decodes, bit for bit, to the same. Where
+    /// an entry only the app restores stays, the uninstall stops with the
+    /// app, the agent and the sudoers rule in place; where only the kept
+    /// display entry stays, it removes them. Every row but the one that
+    /// records a session's end in the journal, which needs a valid session.
+    /// The runs go several at a time, one fixture each.
+    func testAnUninstallPublishesTheFloatsAndStringsTheAppReads() async throws {
+        let rows = Self.publishedJournalRows().filter { !$0.ending }
+        var fixtures: [ScriptFixture] = []
+        defer { fixtures.forEach { $0.destroy() } }
+        for row in rows {
+            let f = try ScriptFixture.concurrentRow()
+            fixtures.append(f)
+            try f.installMachinery()
+            try f.writeConfig(#"{"agentList":[]}"#)
+            try f.writeState(row.journal)
+        }
+
+        let results = try await ScriptFixture.runAll(fixtures.map { $0.launch($0.uninstall) })
+
+        for (row, (f, r)) in zip(rows, zip(fixtures, results)) {
+            let label = "\(row.label): \(r.stdout) \(r.stderr) \(f.log())"
+            XCTAssertEqual(r.status, row.status, label)
+            XCTAssertFalse(r.stderr.contains("malformed") || f.log().contains("malformed"), label)
+            XCTAssertFalse(f.log().contains("could not publish"), label)
+            let undoing = f.calls().filter { call in ["sudo -n ", "defaults write ", "defaults delete ", "kill "].contains { call.hasPrefix($0) } }
+            XCTAssertEqual(undoing, row.calls(f), label)
+            for url in [f.app, f.plist, f.sudoers] {
+                XCTAssertEqual(f.exists(url), row.status != 0, "\(url.lastPathComponent): \(label)")
+            }
+            XCTAssertEqual(try f.contents(of: f.home).filter { $0.hasPrefix(".state.json") }, [], row.label)
+            let published = try Data(contentsOf: f.state)
+            let text = String(decoding: published, as: UTF8.self)
+            XCTAssertFalse(text.contains("\u{E000}") || text.lowercased().contains("\(backslash)ue000") || text.contains("\u{0}"), "\(row.label): \(text)")
+            var expected = try Store.makeDecoder().decode(RuntimeState.self, from: Data(row.journal.utf8))
+            try row.undone(&expected, f)
+            let after = try Store.makeDecoder().decode(RuntimeState.self, from: published)
+            XCTAssertEqual(after, expected, "\(row.label): \(text)")
+            XCTAssertEqual(try Store.makeEncoder().encode(after), try Store.makeEncoder().encode(expected), "\(row.label), bit for bit: \(text)")
         }
     }
 
     /// The same records in a form the app reads do not stop the uninstall:
     /// it completes past the kept entry, and state.json stays byte for byte
     /// with them, even with --purge.
-    func testUninstallCompletesPastValidKeptDisplayRecordsAndKeepsThem() throws {
+    func testUninstallCompletesPastValidKeptDisplayRecordsAndKeepsThem() async throws {
+        // One fixture per journal; the runs go several at a time.
+        var fixtures: [ScriptFixture] = []
+        defer { fixtures.forEach { $0.destroy() } }
         for records in Self.validKeptDisplayRecords {
-            let json = Self.keptDisplayJournal(records, ours: false)
-            let f = try ScriptFixture()
-            defer { f.destroy() }
+            let f = try ScriptFixture.concurrentRow()
+            fixtures.append(f)
             try f.installMachinery()
             try f.writeConfig(#"{"agentList":[]}"#)
-            try f.writeState(json)
+            try f.writeState(Self.keptDisplayJournal(records, ours: false))
+        }
 
-            let r = try f.run(f.uninstall, ["--purge"])
+        let results = try await ScriptFixture.runAll(fixtures.map { $0.launch($0.uninstall, ["--purge"]) })
 
+        for (records, (f, r)) in zip(Self.validKeptDisplayRecords, zip(fixtures, results)) {
+            let json = Self.keptDisplayJournal(records, ours: false)
             XCTAssertEqual(r.status, 0, json + r.stderr + r.stdout)
             XCTAssertFalse(f.exists(f.plist), json)
             XCTAssertFalse(f.exists(f.app), json)
@@ -3158,16 +5911,19 @@ final class RecoveryScriptTests: XCTestCase {
 
     // MARK: - Microsecond identity through the app binary
 
-    private func writeMicrosecondEntry(pid: Int, started: Int, micros: Int, boot: String? = nil, extra: String = "") throws {
-        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
-        try fx.writeState("""
+    /// On `f`, or on `fx` when nil.
+    private func writeMicrosecondEntry(pid: Int, started: Int, micros: Int, boot: String? = nil, extra: String = "", on f: ScriptFixture? = nil) throws {
+        let target: ScriptFixture = f ?? fx
+        try target.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        try target.writeState("""
         {"sleepDisabledByUs":false,"lowPowerSetByUs":false,"dockerFrozen":true,
-         "frozenProcesses":[{"pid":\(pid),"startedAt":\(started),"startedAtMicros":\(micros),"bootSession":"\(boot ?? fx.bootUUID)"\(extra)}]}
+         "frozenProcesses":[{"pid":\(pid),"startedAt":\(started),"startedAtMicros":\(micros),"bootSession":"\(boot ?? target.bootUUID)"\(extra)}]}
         """)
     }
 
-    private func onlyFrozenEntry() throws -> [String: Any]? {
-        (try fx.stateJSON()["frozenProcesses"] as? [[String: Any]])?.first
+    private func onlyFrozenEntry(on f: ScriptFixture? = nil) throws -> [String: Any]? {
+        let target: ScriptFixture = f ?? fx
+        return (try target.stateJSON()["frozenProcesses"] as? [[String: Any]])?.first
     }
 
     /// Polls `condition` every 0.05 s; false if it does not hold within
@@ -3200,6 +5956,47 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(fx.log().contains("SIGCONT sent to pid 5100 by the app binary"), fx.log())
         let parent = try String(contentsOf: fx.root.appendingPathComponent("insomnia.ppid"), encoding: .utf8)
         XCTAssertEqual(parent.trimmingCharacters(in: .whitespacesAndNewlines), String(fx.lastPid), "the binary is not a direct child of the backstop shell")
+    }
+
+    /// The same entry with each whole number written with a fraction or an
+    /// exponent (5100.0, 1.789388423e9, 654321.0), which the app reads as
+    /// those numbers: the binary gets the same line, digits alone
+    /// (extract_whole). The control is a pid that is not whole (5100.5),
+    /// which the app does not load: the journal is refused, nothing runs
+    /// and the file is kept.
+    func testWholeNumbersWrittenWithAFractionReachTheBinaryAsDigits() throws {
+        let started = 1_789_388_423
+        let json = """
+        {"sleepDisabledByUs":false,"lowPowerSetByUs":false,"dockerFrozen":true,
+         "frozenProcesses":[{"pid":5100.0,"startedAt":1.789388423e9,"startedAtMicros":654321.0,"bootSession":"\(fx.bootUUID)"}]}
+        """
+        let entry = try XCTUnwrap(try Store.decodeState(Data(json.utf8)).frozenProcesses.first)
+        XCTAssertEqual(entry.pid, 5100)
+        XCTAssertEqual(entry.identity, ProcessIdentity(startedAt: Int64(started), startedAtMicros: 654_321, bootSession: fx.bootUUID))
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        try fx.writeState(json)
+        try fx.psTable([(5100, fx.lstart(started), "T", fx.uid)])
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 0, r.stderr)
+        XCTAssertEqual(fx.calls(), ["Insomnia --resume-frozen 2 < 5100 \(started) 654321 \(fx.bootUUID)"])
+        XCTAssertEqual((try fx.stateJSON()["frozenProcesses"] as? [Any])?.count, 0)
+
+        fx.destroy()
+        fx = try ScriptFixture()
+        let half = json.replacingOccurrences(of: "5100.0", with: "5100.5")
+        XCTAssertThrowsError(try Store.decodeState(Data(half.utf8)))
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        try fx.writeState(half)
+        try fx.psTable([(5100, fx.lstart(started), "T", fx.uid)])
+
+        let refused = try fx.run(fx.backstop)
+
+        XCTAssertNotEqual(refused.status, 0)
+        XCTAssertEqual(fx.calls(), [])
+        XCTAssertEqual(try String(contentsOf: fx.state, encoding: .utf8), half)
+        XCTAssertTrue(fx.log().contains("frozenProcesses[0].pid is 5100.5, which the app's decoder does not read as a whole number it holds there"), fx.log())
     }
 
     /// Microseconds of 0 are an identity too (the key is present), not a
@@ -3270,8 +6067,9 @@ final class RecoveryScriptTests: XCTestCase {
     /// The answer is checked whole. A word the shell does not know, a known
     /// word with the wrong exit status, the wrong pid, anything before or
     /// after the word, or a missing or extra line is not acted on: the entry
-    /// is kept, nothing is signaled, and the log carries the answer.
-    func testUnexpectedAppBinaryAnswerKeepsTheEntry() throws {
+    /// is kept, nothing is signaled, and the log carries the answer. Each
+    /// answer runs on a fixture of its own, several at a time.
+    func testUnexpectedAppBinaryAnswerKeepsTheEntry() async throws {
         let cases: [(output: String, status: Int)] = [
             ("5105 bogus\n", 0),
             ("5105 resumed\n", 1),
@@ -3291,24 +6089,30 @@ final class RecoveryScriptTests: XCTestCase {
             ("5105 resumed\r\n", 0),
             ("05105 resumed\n", 0),
         ]
+        // One fixture per answer; the runs go several at a time.
+        var fixtures: [ScriptFixture] = []
+        defer { fixtures.forEach { $0.destroy() } }
         for (output, status) in cases {
+            let f = try ScriptFixture.concurrentRow()
+            fixtures.append(f)
+            try writeMicrosecondEntry(pid: 5105, started: 1_789_388_423, micros: 2, on: f)
+            try f.insomniaRaw(output, status: status)
+        }
+
+        let results = try await ScriptFixture.runAll(fixtures.map { $0.launch($0.backstop) })
+
+        for ((output, status), (f, r)) in zip(cases, zip(fixtures, results)) {
             let label = "\(output.debugDescription) exit \(status)"
-            fx.destroy()
-            fx = try ScriptFixture()
-            try writeMicrosecondEntry(pid: 5105, started: 1_789_388_423, micros: 2)
-            try fx.insomniaRaw(output, status: status)
-
-            let r = try fx.run(fx.backstop)
-
             XCTAssertNotEqual(r.status, 0, label)
-            XCTAssertEqual(fx.calls().filter { !$0.hasPrefix("Insomnia --resume-frozen") }, [], label)
-            XCTAssertEqual(try onlyFrozenEntry()?["pid"] as? Int, 5105, label)
-            XCTAssertEqual(try fx.stateJSON()["dockerFrozen"] as? Bool, true, label)
-            XCTAssertTrue(fx.exists(fx.session), label)
-            XCTAssertTrue(fx.log().contains("unexpected answer from \(fx.fakeInsomnia.path) for pid(s) 5105 (exit \(status), output '"), "\(label): \(fx.log())")
+            XCTAssertEqual(f.calls().filter { !$0.hasPrefix("Insomnia --resume-frozen") }, [], label)
+            XCTAssertEqual(try onlyFrozenEntry(on: f)?["pid"] as? Int, 5105, label)
+            XCTAssertEqual(try f.stateJSON()["dockerFrozen"] as? Bool, true, label)
+            XCTAssertTrue(f.exists(f.session), label)
+            XCTAssertTrue(f.log().contains("unexpected answer from \(f.fakeInsomnia.path) for pid(s) 5105 (exit \(status), output '"), "\(label): \(f.log())")
         }
         // Control characters are logged as spaces, on one line.
-        XCTAssertTrue(fx.log().contains("output '05105 resumed '"), fx.log())
+        let last = try XCTUnwrap(fixtures.last)
+        XCTAssertTrue(last.log().contains("output '05105 resumed '"), last.log())
     }
 
     /// Another boot session is settled by the shell: cleared without a
@@ -6179,9 +8983,14 @@ private final class ScriptFixture {
     var installRedirected: URL { repoScripts.appendingPathComponent("install.redirected.sh") }
     /// installRedirected with a 1 s limit for each bounded call.
     var session: URL { home.appendingPathComponent("session.json") }
+    var endedSession: URL { home.appendingPathComponent("ended-session.json") }
     var state: URL { home.appendingPathComponent("state.json") }
     var config: URL { home.appendingPathComponent("config.json") }
     var lock: URL { home.appendingPathComponent(".recovery.lock") }
+    /// Every run's TMPDIR (childEnvironment): uninstall.sh's scratch folder
+    /// goes here, inside the fixture, not in the shared /tmp.
+    var tmp: URL { root.appendingPathComponent("tmp", isDirectory: true) }
+    var alive: URL { home.appendingPathComponent(".app.alive") }
     /// backstop.sh as install.sh seals it into the bundle.
     var installedBackstop: URL { app.appendingPathComponent("Contents/Resources/backstop.sh") }
     /// The writable copy installs before the sealed layout left here.
@@ -6212,7 +9021,7 @@ private final class ScriptFixture {
         app = appsDir.appendingPathComponent("Insomnia.app", isDirectory: true)
         sudoers = root.appendingPathComponent("etc/sudoers.d/insomnia")
         callsLog = root.appendingPathComponent("calls.log")
-        for dir in [home, bin, repoScripts, appsDir] {
+        for dir in [home, bin, repoScripts, appsDir, tmp] {
             try fm.createDirectory(at: dir, withIntermediateDirectories: true)
         }
         // repo/ is a source checkout to install.sh and uninstall.sh: their
@@ -6228,11 +9037,15 @@ private final class ScriptFixture {
         // A supervisor still waiting to write its status into a FIFO would
         // wait forever once the FIFO is gone.
         drainStatusFIFOs(within: 1)
+        // A test that failed before clearing the flag must not leave its
+        // temp home behind.
+        for file in [session, endedSession, state] { try? setImmutable(file, false) }
         try? fm.removeItem(at: root)
     }
 
     /// The backstop's files in INSOMNIA_HOME: each bounded call's .pid and
-    /// .rc status files, and the app binary's input and answer directory.
+    /// .rc status files, each read's .out file, and the app binary's input
+    /// and answer directory.
     func backstopFiles() throws -> [String] {
         try contents(of: home).filter { $0.hasPrefix(".backstop") }
     }
@@ -6280,6 +9093,14 @@ private final class ScriptFixture {
     func commandEnded() -> String? {
         (try? String(contentsOf: root.appendingPathComponent("command.ended"), encoding: .utf8))?
             .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Whether the read a fake recorded in read.hung.pid is gone: stopped
+    /// and reaped, so the pid names no process. False when no fake wrote it.
+    func hungReadIsGone() -> Bool {
+        guard let text = try? String(contentsOf: root.appendingPathComponent("read.hung.pid"), encoding: .utf8),
+              let pid = pid_t(text.trimmingCharacters(in: .whitespacesAndNewlines)) else { return false }
+        return kill(pid, 0) == -1 && errno == ESRCH
     }
 
     /// Polls until the recovery lock is free; false after `seconds`.
@@ -6369,6 +9190,8 @@ private final class ScriptFixture {
             "PS": bin.appendingPathComponent("ps").path,
             "KILL": bin.appendingPathComponent("kill").path,
             "SYSCTL": bin.appendingPathComponent("sysctl").path,
+            "NOTIFYUTIL": bin.appendingPathComponent("notifyutil").path,
+            "IOREG": bin.appendingPathComponent("ioreg").path,
             "CHMOD": bin.appendingPathComponent("chmod").path,
             "INSOMNIA_BIN": fakeInsomnia.path,
             "INSOMNIA_INFO": appInfo.path,
@@ -6510,15 +9333,11 @@ private final class ScriptFixture {
     // MARK: Fakes
 
     /// An app bundle's Info.plist, with InsomniaResumeFrozenVersion set to
-    /// `resumeFrozenVersion` as an integer, or without the key when nil.
-    static func infoPlist(resumeFrozenVersion: String?) -> String {
-        let key = resumeFrozenVersion.map { "<key>InsomniaResumeFrozenVersion</key><integer>\($0)</integer>" } ?? ""
-        return """
-        <?xml version="1.0" encoding="UTF-8"?>
-        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-        <plist version="1.0"><dict><key>CFBundleExecutable</key><string>Insomnia</string>\(key)</dict></plist>
-
-        """
+    /// `resumeFrozenVersion` as an integer, or without the key when nil,
+    /// and InsomniaAgentCutoffsVersion set to `agentCutoffsVersion` the
+    /// same way.
+    static func infoPlist(resumeFrozenVersion: String?, agentCutoffsVersion: String? = "\(AgentCutoffsCommand.version)") -> String {
+        BuiltApp.infoPlist(resumeFrozenVersion: resumeFrozenVersion, agentCutoffsVersion: agentCutoffsVersion)
     }
 
     private func writeFake(_ name: String, _ body: String) throws {
@@ -6641,9 +9460,81 @@ private final class ScriptFixture {
           *) exit 1 ;;
         esac
         """)
+        // pmset: `-g batt` is the only form the script may run directly. It
+        // prints pmset.batt when the test wrote one ("FAIL": exit 1 with no
+        // output; "HANG": never returns, after writing its pid to
+        // read.hung.pid and the names of the backstop's files it sees to
+        // read.files), else a MacBook on AC power at 100%. Any other direct
+        // call is recorded as DIRECT and fails: power changes go through sudo.
         try writeFake("pmset", """
+        if [[ "${1:-}" == -g && "${2:-}" == batt ]]; then
+          printf 'pmset -g batt\\n' >> "\(calls)"
+          if [[ -f "\(r)/pmset.batt" ]]; then
+            [[ "$(cat "\(r)/pmset.batt")" == FAIL ]] && exit 1
+            if [[ "$(cat "\(r)/pmset.batt")" == HANG ]]; then
+              echo $$ > "\(r)/read.hung.pid"
+              /bin/ls -A "\(home.path)" | /usr/bin/grep '^\\.backstop\\.' > "\(r)/read.files" || true
+              exec /bin/sleep 60
+            fi
+            cat "\(r)/pmset.batt"; exit 0
+          fi
+          printf "Now drawing from 'AC Power'\\n -InternalBattery-0 (id=1)\\t100%%; charged; 0:00 remaining present: true\\n"
+          exit 0
+        fi
         printf 'pmset DIRECT %s\\n' "$*" >> "\(calls)"
         exit 99
+        """)
+        // notifyutil -g <key>: prints "<key> <level>" with the level from
+        // thermal.mode (default 0). "FAIL": exit 1 with no output. "GARBAGE":
+        // exit 0 with a line that has no level in it. "HANG": never returns.
+        // "IGNORE_TERM": never returns and ignores SIGTERM, after writing its
+        // pid to read.hung.pid; it leaves a child behind that would keep any
+        // descriptor it inherited. "CHECK_FD9": records whether it has fd 9
+        // open, by its own descriptor table and by lsof, then prints level 0.
+        // lsof can take seconds on a busy machine, so a test using it raises
+        // the time limit (setCommandTimeout).
+        try writeFake("notifyutil", """
+        printf 'notifyutil %s\\n' "$*" >> "\(calls)"
+        mode="$(cat "\(r)/thermal.mode" 2>/dev/null || echo 0)"
+        [[ "$mode" == FAIL ]] && exit 1
+        [[ "$mode" == HANG ]] && exec /bin/sleep 60
+        if [[ "$mode" == IGNORE_TERM ]]; then
+          trap '' TERM
+          echo $$ > "\(r)/read.hung.pid"
+          /bin/sleep 5 </dev/null >/dev/null 2>&1 &
+          exec /bin/sleep 60
+        fi
+        if [[ "$mode" == CHECK_FD9 ]]; then
+          [[ -e /dev/fd/9 ]] && printf 'notifyutil had fd 9\\n' >> "\(calls)"
+          [[ -n "$(/usr/sbin/lsof -a -p "$$" -d 9 -t 2>/dev/null)" ]] && printf 'notifyutil lsof had fd 9\\n' >> "\(calls)"
+          printf 'notifyutil checked fd 9\\n' >> "\(calls)"
+          echo "${2:-} 0"; exit 0
+        fi
+        [[ "$mode" == GARBAGE ]] && { echo "something unexpected"; exit 0; }
+        echo "${2:-} $mode"
+        """)
+        // ioreg -r -c AppleSmartBattery -d 1, by battery_service.mode.
+        // "NONE" (the default): no service, so nothing is printed. "BATTERY":
+        // the service, on battery power. "BATTERY_AC": the service with a
+        // charger. "BATTERY_NOKEY": the service without ExternalConnected.
+        // "FAIL": exit 1. "HANG": never returns.
+        try writeFake("ioreg", """
+        printf 'ioreg %s\\n' "$*" >> "\(calls)"
+        mode="$(cat "\(r)/battery_service.mode" 2>/dev/null || echo NONE)"
+        case "$mode" in
+          FAIL) exit 1 ;;
+          HANG) exec /bin/sleep 60 ;;
+          NONE) exit 0 ;;
+        esac
+        echo '+-o AppleSmartBattery  <class AppleSmartBattery, id 0x100000a1b, registered, matched, active, busy 0 (25 ms), retain 9>'
+        echo '    {'
+        echo '      "AppleRawExternalConnected" = No'
+        case "$mode" in
+          BATTERY) echo '      "ExternalConnected" = No' ;;
+          BATTERY_AC) echo '      "ExternalConnected" = Yes' ;;
+        esac
+        echo '      "BatteryInstalled" = Yes'
+        echo '    }'
         """)
         // swift / codesign: install.sh's build and signing steps, redirected
         // to a fake binary inside the fixture.
@@ -6770,6 +9661,9 @@ private final class ScriptFixture {
         fi
         exec /bin/chmod "$@"
         """)
+        // Insomnia --agent-cutoffs and --agent-session-cutoffs: this build's
+        // own binary, unrecorded, so config.json and the journal's cutoffs
+        // are read by the app's decoder as in production.
         // Insomnia --resume-frozen: reads its entries from standard input,
         // one "<pid> <startedAt> <micros> <boot>" line each, and records the
         // call as "Insomnia <arguments> < <line>; <line>; ...". Answers one
@@ -6788,6 +9682,7 @@ private final class ScriptFixture {
         try fm.createDirectory(at: appInfo.deletingLastPathComponent(), withIntermediateDirectories: true)
         try Self.infoPlist(resumeFrozenVersion: "1").write(to: appInfo, atomically: true, encoding: .utf8)
         try writeFake("Insomnia", """
+        [[ "${1:-}" == --agent-cutoffs || "${1:-}" == --agent-session-cutoffs ]] && exec '\(BuiltApp.binary.path)' "$@"
         input=()
         while IFS= read -r line || [[ -n "$line" ]]; do input+=("$line"); done
         joined=""
@@ -7047,6 +9942,43 @@ private final class ScriptFixture {
         try? value.write(to: root.appendingPathComponent("\(name).mode"), atomically: true, encoding: .utf8)
     }
 
+    /// What the fake `pmset -g batt` prints ("FAIL": it fails instead;
+    /// "HANG": it never returns). The fixture default is a MacBook on AC
+    /// power at 100%.
+    func setBattery(_ output: String) {
+        try? output.write(to: root.appendingPathComponent("pmset.batt"), atomically: true, encoding: .utf8)
+    }
+
+    /// `pmset -g batt` as a MacBook prints it, tab and all.
+    func battery(source: String, percent: Int, state: String = "discharging") -> String {
+        "Now drawing from '\(source)'\n -InternalBattery-0 (id=22610019)\t\(percent)%; \(state); 0:41 remaining present: true\n"
+    }
+
+    /// The thermal pressure level the fake notifyutil reports (default 0),
+    /// or "FAIL" / "GARBAGE" / "HANG".
+    func setThermal(_ mode: String) {
+        setMode("thermal", mode)
+    }
+
+    /// What the fake ioreg reports for AppleSmartBattery: "NONE" (the
+    /// default, a desktop), "BATTERY", "BATTERY_AC", "BATTERY_NOKEY",
+    /// "FAIL" or "HANG".
+    func setBatteryService(_ mode: String) {
+        setMode("battery_service", mode)
+    }
+
+    func writeConfig(_ json: String) throws {
+        try json.write(to: config, atomically: true, encoding: .utf8)
+    }
+
+    /// Sets COMMAND_TIMEOUT_SECONDS in this fixture's copy of backstop.sh,
+    /// for a fake command that needs more than the default 1 s to look
+    /// around before it answers.
+    func setCommandTimeout(_ seconds: Int) throws {
+        let text = try String(contentsOf: backstop, encoding: .utf8)
+        try Self.patch(text, ["COMMAND_TIMEOUT_SECONDS": "\(seconds)"]).write(to: backstop, atomically: true, encoding: .utf8)
+    }
+
     /// The word the fake app binary answers per pid; the exit status follows
     /// from the words.
     func insomniaTable(_ rows: [(pid: Int, word: String)]) throws {
@@ -7098,7 +10030,14 @@ private final class ScriptFixture {
     /// it and keeps running until the test calls releaseCommand (or the
     /// fixture goes, or a 60 s watchdog), then writes command.ended. Both
     /// note an inherited fd 9 and record the pid in `sudo.hung.pid`, once
-    /// the SIGTERM trap is in place.
+    /// the SIGTERM trap and the watchdog's deadline are in place. The
+    /// watchdog runs on bash's SECONDS, so the fake forks nothing but
+    /// /bin/sleep while it waits. A test may signal the fake's process
+    /// group as soon as the pid appears, and a signal that killed a `date`
+    /// setting the deadline would leave it at 60, ending the fake at once.
+    /// A command substitution would also log one signal twice. Bash 3.2
+    /// starts it with the shell's pending traps and trap commands, so a
+    /// SIGTERM that lands just before the fork runs the trap in both.
     func sudoHangHere() -> String {
         """
         hang_on_term() {
@@ -7109,9 +10048,9 @@ private final class ScriptFixture {
           else
             trap 'echo "sudo SIGTERM" >> "$calls_log"' TERM
           fi
+          deadline=$(( SECONDS + 60 ))
           echo $$ > "\(root.path)/sudo.hung.pid"
-          deadline=$(( $(date +%s) + 60 ))
-          while [[ ! -e "\(root.path)/release" && -d "\(root.path)" && $(date +%s) -lt $deadline ]]; do /bin/sleep 0.1; done
+          while [[ ! -e "\(root.path)/release" && -d "\(root.path)" && $SECONDS -lt $deadline ]]; do /bin/sleep 0.1; done
           if [[ -e "\(root.path)/release" ]]; then echo released > "\(root.path)/command.ended"
           elif [[ -d "\(root.path)" ]]; then echo watchdog > "\(root.path)/command.ended"; fi
           exit 0
@@ -7130,12 +10069,11 @@ private final class ScriptFixture {
         """
     }
 
-    /// A TMPDIR inside the fixture for one run, so a test can check that
-    /// the script leaves no scratch files behind.
+    /// The TMPDIR inside the fixture that every run gets (`tmp`), so a
+    /// test can check that the script leaves no scratch files behind.
     func privateTmp() throws -> URL {
-        let dir = root.appendingPathComponent("tmp", isDirectory: true)
-        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir
+        try fm.createDirectory(at: tmp, withIntermediateDirectories: true)
+        return tmp
     }
 
     /// Whether the hung fake of `tool` ran and has since exited.
@@ -7172,10 +10110,6 @@ private final class ScriptFixture {
 
     func writeState(_ json: String) throws {
         try json.write(to: state, atomically: true, encoding: .utf8)
-    }
-
-    func writeConfig(_ json: String) throws {
-        try json.write(to: config, atomically: true, encoding: .utf8)
     }
 
     func writeSession(endsAt: Date) throws {
@@ -7216,8 +10150,8 @@ private final class ScriptFixture {
     /// Decoded lossily: the fake launchctl copies the first line of the
     /// installed binary into the log, which is Mach-O bytes, not text, for
     /// the fixture the real codesign signs.
-    func calls() -> [String] {
-        guard let data = try? Data(contentsOf: callsLog) else { return [] }
+    func calls(file: StaticString = #filePath, line: UInt = #line) -> [String] {
+        guard let data = record(callsLog, file: file, line: line) else { return [] }
         return String(decoding: data, as: UTF8.self).split(separator: "\n").map(String.init)
     }
 
@@ -7228,17 +10162,40 @@ private final class ScriptFixture {
         calls().filter { call in !["mktemp", "rm", "rmdir", "mkdir"].contains { call == $0 || call.hasPrefix($0 + " ") } }
     }
 
-    func chmodCalls() -> [String] {
-        guard let text = try? String(contentsOf: root.appendingPathComponent("chmod.calls"), encoding: .utf8) else { return [] }
-        return text.split(separator: "\n").map(String.init)
+    func chmodCalls(file: StaticString = #filePath, line: UInt = #line) -> [String] {
+        guard let data = record(root.appendingPathComponent("chmod.calls"), file: file, line: line) else { return [] }
+        return String(decoding: data, as: UTF8.self).split(separator: "\n").map(String.init)
     }
 
     func clearCalls() {
         try? fm.removeItem(at: callsLog)
     }
 
-    func log() -> String {
-        (try? String(contentsOf: logFile, encoding: .utf8)) ?? ""
+    /// Removes the backstop's log, so a loop's next case cannot pass on a
+    /// line an earlier case wrote.
+    func clearLog() {
+        try? fm.removeItem(at: logFile)
+    }
+
+    /// The backstop's log, or "" when there is none. A log that is there
+    /// but cannot be read fails the test instead of reading as empty.
+    func log(file: StaticString = #filePath, line: UInt = #line) -> String {
+        String(decoding: record(logFile, file: file, line: line) ?? Data(), as: UTF8.self)
+    }
+
+    /// The bytes of a file a run or a fake writes, or nil when there is
+    /// none. A file that is there but cannot be read fails the test instead
+    /// of reading as missing, so an unread record never passes for no
+    /// calls or no lines.
+    private func record(_ url: URL, file: StaticString, line: UInt) -> Data? {
+        do {
+            return try Data(contentsOf: url)
+        } catch CocoaError.fileReadNoSuchFile {
+            return nil
+        } catch {
+            XCTFail("could not read \(url.path): \(error)", file: file, line: line)
+            return nil
+        }
     }
 
     /// Environment for the child: no inheritance, so neither the real HOME
@@ -7248,6 +10205,7 @@ private final class ScriptFixture {
         [
             "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
             "INSOMNIA_HOME": home.path,
+            "TMPDIR": tmp.path,
         ]
     }
 
@@ -7268,42 +10226,154 @@ private final class ScriptFixture {
     /// first, the way uninstall.sh hands its lock handle to the backstop.
     /// `ignoringTerm` starts the script with SIGTERM ignored, which every
     /// process it starts inherits (not combined with `fd9`).
-    /// `extraEnvironment` is for install.sh's refusal test and for a
-    /// private TMPDIR (see privateTmp). `lastPid` is the script's pid
+    /// `extraEnvironment` is for install.sh's refusal test and USER; every
+    /// run already has the fixture's TMPDIR (see privateTmp). `lastPid` is the script's pid
     /// afterwards: the wrappers exec it, so it is the pid of the process
     /// started here.
     private(set) var lastPid: Int32 = 0
 
     func run(_ script: URL, _ args: [String] = [], fd9: URL? = nil, ignoringTerm: Bool = false, extraEnvironment: [String: String] = [:]) throws -> (status: Int32, stdout: String, stderr: String) {
-        precondition(fd9 == nil || !ignoringTerm, "fd9 and ignoringTerm are not combined")
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/bin/bash")
-        if let fd9 {
-            p.arguments = ["-c", #"exec 9<>"$0" && exec /bin/bash "$@""#, fd9.path, script.path] + args
-        } else if ignoringTerm {
-            p.arguments = ["-c", #"trap '' TERM && exec /bin/bash "$@""#, "bash", script.path] + args
-        } else {
-            p.arguments = [script.path] + args
-        }
-        p.environment = childEnvironment.merging(extraEnvironment) { $1 }
-        p.currentDirectoryURL = root
-        // Capture to files rather than pipes: nothing to drain, nothing to deadlock.
-        let outURL = root.appendingPathComponent("stdout.\(UUID().uuidString)")
-        let errURL = root.appendingPathComponent("stderr.\(UUID().uuidString)")
-        fm.createFile(atPath: outURL.path, contents: nil)
-        fm.createFile(atPath: errURL.path, contents: nil)
-        let out = try FileHandle(forWritingTo: outURL)
-        let err = try FileHandle(forWritingTo: errURL)
-        defer { try? out.close(); try? err.close() }
-        p.standardOutput = out
-        p.standardError = err
-        let childExit = ProcessExit(p)
-        try p.run()
+        let launch = launch(script, args, fd9: fd9, ignoringTerm: ignoringTerm, extraEnvironment: extraEnvironment)
+        let (p, childExit) = try launch.start()
         lastPid = p.processIdentifier
         childExit.wait()
-        return (p.terminationStatus,
-                (try? String(contentsOf: outURL, encoding: .utf8)) ?? "",
-                (try? String(contentsOf: errURL, encoding: .utf8)) ?? "")
+        return try launch.result(of: p)
+    }
+
+    /// One run of a script copy as `run` starts it, held as paths and
+    /// strings only, so that runs on separate fixtures can go several at a
+    /// time (`runAll`).
+    struct Launch: Sendable {
+        let arguments: [String]
+        let environment: [String: String]
+        let directory: URL
+        let stdout: URL
+        let stderr: URL
+
+        /// Starts the run. Its output goes to files rather than pipes:
+        /// nothing to drain, nothing to deadlock. Each file is created
+        /// empty here, or the run is not started.
+        func start() throws -> (Process, ProcessExit) {
+            let fm = FileManager.default
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/bin/bash")
+            p.arguments = arguments
+            p.environment = environment
+            p.currentDirectoryURL = directory
+            for url in [stdout, stderr] {
+                guard fm.createFile(atPath: url.path, contents: nil) else {
+                    throw FixtureError("could not create \(url.path) for the run's output")
+                }
+            }
+            let out = try FileHandle(forWritingTo: stdout)
+            let err = try FileHandle(forWritingTo: stderr)
+            defer { try? out.close(); try? err.close() }
+            p.standardOutput = out
+            p.standardError = err
+            let childExit = ProcessExit(p)
+            try p.run()
+            return (p, childExit)
+        }
+
+        /// The exit status and what the run printed, once it has exited. An
+        /// output file that cannot be read throws, so it never reads as a
+        /// run that printed nothing; bytes that are not UTF-8 are kept as
+        /// replacement characters. A run a signal ended throws too, with
+        /// the signal and what it printed on standard error: it has no exit
+        /// status, and the signal's number must not read as one the script
+        /// chose. No test ends such a run with a signal (spawn is for that).
+        func result(of p: Process) throws -> (status: Int32, stdout: String, stderr: String) {
+            let out = String(decoding: try Data(contentsOf: stdout), as: UTF8.self)
+            let err = String(decoding: try Data(contentsOf: stderr), as: UTF8.self)
+            guard p.terminationReason == .exit else {
+                throw FixtureError("bash \(arguments.joined(separator: " ")) ended on signal \(p.terminationStatus); stderr: \(err)")
+            }
+            return (p.terminationStatus, out, err)
+        }
+    }
+
+    func launch(_ script: URL, _ args: [String] = [], fd9: URL? = nil, ignoringTerm: Bool = false, extraEnvironment: [String: String] = [:]) -> Launch {
+        precondition(fd9 == nil || !ignoringTerm, "fd9 and ignoringTerm are not combined")
+        let arguments: [String]
+        if let fd9 {
+            arguments = ["-c", #"exec 9<>"$0" && exec /bin/bash "$@""#, fd9.path, script.path] + args
+        } else if ignoringTerm {
+            arguments = ["-c", #"trap '' TERM && exec /bin/bash "$@""#, "bash", script.path] + args
+        } else {
+            arguments = [script.path] + args
+        }
+        return Launch(arguments: arguments, environment: childEnvironment.merging(extraEnvironment) { $1 }, directory: root,
+                      stdout: root.appendingPathComponent("stdout.\(UUID().uuidString)"),
+                      stderr: root.appendingPathComponent("stderr.\(UUID().uuidString)"))
+    }
+
+    /// A fixture for a row that runs beside others (runAll). Its copies of
+    /// backstop.sh and uninstall.sh keep the production limits on commands,
+    /// the lock and uninstall's calls, not the 1 s and 5 s the other tests
+    /// set: with eight runs at once, a fake that answers at once here was
+    /// seen to start too late for 1 s. No fake in such a row hangs, so a
+    /// limit never fires there. The limits are copied before
+    /// installMachinery(), which installs this backstop.
+    static func concurrentRow() throws -> ScriptFixture {
+        let f = try ScriptFixture()
+        do {
+            for (copy, script, names) in [
+                (f.backstop, "backstop.sh", ["LOCK_TIMEOUT_SECONDS", "COMMAND_TIMEOUT_SECONDS", "KILL_GRACE_SECONDS"]),
+                (f.uninstall, "uninstall.sh", ["LOCK_TIMEOUT_SECONDS", "CALL_TIMEOUT_SECONDS"]),
+            ] {
+                let production = try String(contentsOf: productionScripts.appendingPathComponent(script), encoding: .utf8).components(separatedBy: "\n")
+                var limits: [String: String] = [:]
+                for name in names {
+                    let lines = production.filter { $0.hasPrefix("\(name)=") }
+                    guard lines.count == 1 else { throw FixtureError("expected exactly one '\(name)=' line in \(script), found \(lines.count)") }
+                    limits[name] = String(lines[0].dropFirst(name.count + 1))
+                }
+                try patch(try String(contentsOf: copy, encoding: .utf8), limits).write(to: copy, atomically: true, encoding: .utf8)
+            }
+        } catch {
+            f.destroy()
+            throw error
+        }
+        return f
+    }
+
+    /// Runs each launch once, at most `width` at a time, and returns their
+    /// results in order. The runs share no file they write: each launch
+    /// belongs to its own fixture or works only in folders of its own, as
+    /// the journal acceptance table's do. Every run that started is waited
+    /// for and reaped, also when another fails to start: the group waits for
+    /// its tasks before it throws.
+    static func runAll(_ launches: [Launch], width: Int = 8) async throws -> [(status: Int32, stdout: String, stderr: String)] {
+        var results = [(status: Int32, stdout: String, stderr: String)](repeating: (-1, "", ""), count: launches.count)
+        try await withThrowingTaskGroup(of: (Int, Int32, String, String).self) { group in
+            var next = 0
+            func add() {
+                guard next < launches.count else { return }
+                let (i, launch) = (next, launches[next])
+                group.addTask {
+                    let (p, childExit) = try launch.start()
+                    await childExit.exited()
+                    let r = try launch.result(of: p)
+                    return (i, r.status, r.stdout, r.stderr)
+                }
+                next += 1
+            }
+            for _ in 0..<width { add() }
+            while let (i, status, stdout, stderr) = try await group.next() {
+                results[i] = (status, stdout, stderr)
+                add()
+            }
+        }
+        return results
+    }
+
+    /// Holds the alive lock the way the running app does, with its own type
+    /// (AppAliveLock.swift), in this process until the test releases it. No
+    /// timer: it cannot run out between the script runs of a slow test.
+    func holdAliveLock() throws -> AppAliveLock {
+        let lock = AppAliveLock(url: alive)
+        guard try lock.tryAcquire() else { throw FixtureError("could not take \(alive.lastPathComponent): another holder has it") }
+        return lock
     }
 
     /// The pid a hung fake of `tool` recorded (see hangHere), once it has
@@ -7340,9 +10410,9 @@ private final class ScriptFixture {
     }
 
     /// How many times the scripts called the slow `sleep`.
-    func slowPolls() -> Int {
-        let text = (try? String(contentsOf: root.appendingPathComponent("slow-poll.log"), encoding: .utf8)) ?? ""
-        return text.split(separator: "\n").count
+    func slowPolls(file: StaticString = #filePath, line: UInt = #line) -> Int {
+        String(decoding: record(root.appendingPathComponent("slow-poll.log"), file: file, line: line) ?? Data(), as: UTF8.self)
+            .split(separator: "\n").count
     }
 
     /// Runs a real tool (not a script) with the fixture's environment: the
@@ -7906,40 +10976,50 @@ final class AppEncodedJournalScriptTests: XCTestCase {
     /// The agent on an expired session: the same outcome for each name or
     /// UID as for a plain one, with or without a kept display record, in
     /// the current entry form and the legacy one. The app then restores
-    /// the device from the journal the agent published.
+    /// the device from the journal the agent published. The journals are
+    /// written one at a time (each Harness points INSOMNIA_HOME at its
+    /// home), the agent runs go several at a time, one fixture each, and
+    /// the app's restores one at a time again.
     func testAnEscapedNameOrUIDDoesNotStopTheAgentAndTheAppRestoresIt() async throws {
+        var fixtures: [ScriptFixture] = []
+        defer { fixtures.forEach { $0.destroy() } }
+        var rows: [(label: String, uid: String, name: String, f: ScriptFixture, before: Data)] = []
         for v in Self.variants() {
             for record in [false, true] {
                 for legacy in [false, true] {
                     let label = "\(v.label) record \(record) legacy \(legacy)"
-                    let f = try ScriptFixture()
-                    defer { f.destroy() }
+                    let f = try ScriptFixture.concurrentRow()
+                    fixtures.append(f)
                     let before = try await appJournal(uid: v.uid, name: v.name, record: record, legacy: legacy, boot: f.bootUUID)
                     if v.label != "plain" {
                         XCTAssertTrue(String(decoding: before, as: UTF8.self).contains("\(backslash)\(backslash)u0041"), label)
                     }
                     try before.write(to: f.state)
                     try f.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
-
-                    let r = try f.run(f.backstop)
-
-                    XCTAssertEqual(r.status, 0, "\(label): \(r.stderr) \(f.log())")
-                    XCTAssertFalse(f.exists(f.session), label)
-                    try checkUndone(f, before: before, label)
-
-                    let h = Harness()
-                    defer { h.home.destroy() }
-                    h.audio.connect(v.uid, name: v.name, volume: 0.6, muted: true)
-                    h.clamshell.closed = false
-                    try Data(contentsOf: f.state).write(to: h.home.paths.stateFile)
-                    let m = h.makeManager(bootSession: f.bootUUID)
-                    await m.reconcile()
-
-                    XCTAssertEqual(h.audio.device(v.uid)?.muted, false, label)
-                    XCTAssertEqual(h.audio.device(v.uid)?.volume, 0.6, label)
-                    XCTAssertEqual(try h.store.loadState()?.savedAudioOutputs, [], label)
+                    rows.append((label, v.uid, v.name, f, before))
                 }
             }
+        }
+
+        let results = try await ScriptFixture.runAll(rows.map { $0.f.launch($0.f.backstop) })
+
+        for (row, r) in zip(rows, results) {
+            let (label, f) = (row.label, row.f)
+            XCTAssertEqual(r.status, 0, "\(label): \(r.stderr) \(f.log())")
+            XCTAssertFalse(f.exists(f.session), label)
+            try checkUndone(f, before: row.before, label)
+
+            let h = Harness()
+            defer { h.home.destroy() }
+            h.audio.connect(row.uid, name: row.name, volume: 0.6, muted: true)
+            h.clamshell.closed = false
+            try Data(contentsOf: f.state).write(to: h.home.paths.stateFile)
+            let m = h.makeManager(bootSession: f.bootUUID)
+            await m.reconcile()
+
+            XCTAssertEqual(h.audio.device(row.uid)?.muted, false, label)
+            XCTAssertEqual(h.audio.device(row.uid)?.volume, 0.6, label)
+            XCTAssertEqual(try h.store.loadState()?.savedAudioOutputs, [], label)
         }
     }
 
@@ -7947,40 +11027,48 @@ final class AppEncodedJournalScriptTests: XCTestCase {
     /// installed over the same journals: the undo goes as far as for a
     /// plain name, and the saved output, which only the app restores,
     /// stops the removal with the app, the agent and the sudoers rule in
-    /// place.
+    /// place. The journals are written one at a time, and the uninstalls
+    /// go several at a time, one fixture each.
     func testAnEscapedNameOrUIDDoesNotStopTheUndoOfAnUninstall() async throws {
+        var fixtures: [ScriptFixture] = []
+        defer { fixtures.forEach { $0.destroy() } }
+        var rows: [(label: String, f: ScriptFixture, before: Data, purge: Bool)] = []
         for v in Self.variants() {
             for record in [false, true] {
                 for legacy in [false, true] {
                     for purge in [false, true] {
                         let label = "\(v.label) record \(record) legacy \(legacy) purge \(purge)"
-                        let f = try ScriptFixture()
-                        defer { f.destroy() }
+                        let f = try ScriptFixture.concurrentRow()
+                        fixtures.append(f)
                         let before = try await appJournal(uid: v.uid, name: v.name, record: record, legacy: legacy, boot: f.bootUUID)
                         try f.installMachinery()
                         try before.write(to: f.state)
                         try f.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
-
-                        let r = try f.run(f.uninstall, purge ? ["--purge"] : [])
-
-                        XCTAssertNotEqual(r.status, 0, label)
-                        XCTAssertTrue(f.exists(f.app), label)
-                        XCTAssertTrue(f.exists(f.plist), label)
-                        XCTAssertTrue(f.exists(f.sudoers), label)
-                        XCTAssertFalse(r.stderr.contains("malformed"), "\(label): \(r.stderr)")
-                        XCTAssertTrue(r.stderr.contains("audio") || r.stdout.contains("audio"), "\(label): \(r.stdout) \(r.stderr)")
-                        try checkUndone(f, before: before, label)
+                        rows.append((label, f, before, purge))
                     }
                 }
             }
+        }
+
+        let results = try await ScriptFixture.runAll(rows.map { $0.f.launch($0.f.uninstall, $0.purge ? ["--purge"] : []) })
+
+        for (row, r) in zip(rows, results) {
+            let (label, f) = (row.label, row.f)
+            XCTAssertNotEqual(r.status, 0, label)
+            XCTAssertTrue(f.exists(f.app), label)
+            XCTAssertTrue(f.exists(f.plist), label)
+            XCTAssertTrue(f.exists(f.sudoers), label)
+            XCTAssertFalse(r.stderr.contains("malformed"), "\(label): \(r.stderr)")
+            XCTAssertTrue(r.stderr.contains("audio") || r.stdout.contains("audio"), "\(label): \(r.stdout) \(r.stderr)")
+            try checkUndone(f, before: row.before, label)
         }
     }
 
     /// Journals the app reads, each with sleep journaled, through the
     /// agent: what is around the records, in strings and nested values,
     /// holds none, and the forms of a record the app reads pass. Sleep is
-    /// undone each time.
-    func testWhatTheAppReadsAroundTheRecordsDoesNotStopTheAgent() throws {
+    /// undone each time. The runs go several at a time, one fixture each.
+    func testWhatTheAppReadsAroundTheRecordsDoesNotStopTheAgent() async throws {
         let b = backslash
         let base = #"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false"#
         let tails: [(label: String, tail: String)] = [
@@ -7995,16 +11083,20 @@ final class AppEncodedJournalScriptTests: XCTestCase {
             ("an integer", #","keptDisplayReadLit":1}"#),
             ("null", #","keptDisplayReadLit":null}"#),
         ]
+        var fixtures: [ScriptFixture] = []
+        defer { fixtures.forEach { $0.destroy() } }
         for (label, tail) in tails {
             let json = base + tail
             XCTAssertNoThrow(try Store.makeDecoder().decode(RuntimeState.self, from: Data(json.utf8)), label)
-            let f = try ScriptFixture()
-            defer { f.destroy() }
+            let f = try ScriptFixture.concurrentRow()
+            fixtures.append(f)
             try f.writeState(json)
             try f.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        }
 
-            let r = try f.run(f.backstop)
+        let results = try await ScriptFixture.runAll(fixtures.map { $0.launch($0.backstop) })
 
+        for ((label, _), (f, r)) in zip(tails, zip(fixtures, results)) {
             XCTAssertEqual(r.status, 0, "\(label): \(r.stderr) \(f.log())")
             XCTAssertTrue(f.calls().contains("sudo -n \(f.fakePmset) -a disablesleep 0"), label)
             XCTAssertEqual(try f.stateJSON()["sleepDisabledByUs"] as? Bool, false, label)

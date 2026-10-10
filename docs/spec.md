@@ -94,7 +94,18 @@ recovery; newly written journals use `frozenProcesses`.
 ### 1. Timed sessions (the only way to keep the Mac awake)
 
 - Time is entered inline in the menu bar as Days / Hours / Minutes pills.
-  Enter with empty fields uses the configured default preset. Maximum 30 days.
+  Enter with empty fields uses the configured default preset. Maximum 24
+  hours by default (`maxDuration` in config.json, which also caps presets and
+  extensions). A time past the maximum is refused with the allowance shown
+  beside the pills ("Up to 1d", "Up to 23h30m"); it is never shortened
+  without saying so. Current builds write `configVersion` 2 into
+  config.json. In a file without it, written by an older build, that build's
+  defaults (30 days, a 3-day preset) read as the current defaults and any
+  other saved value is kept. When the user never set the ceiling, presets
+  above 24 hours are dropped and a default above it moves to the largest
+  preset left (the 4-hour stock default if none is), so bare Enter still
+  starts. The app writes such a file back once at launch, so a 30-day
+  ceiling typed in later is the user's and stays.
 - While active the menu bar shows a second-resolution countdown. The redraw
   timer runs at 1 Hz and stops while the lid is closed.
 - Click the cup/countdown to enter an extension; hold the end control to end.
@@ -645,8 +656,214 @@ that violates it is corrected at load by raising `lowPowerFloor` to `endFloor`
 Insomnia does not enable Low Power Mode merely because a session starts; the
 causes are the battery floor, a serious thermal state, and (by default) a closed
 lid. One evaluation owns the mode: it is switched off only when no cause holds.
-Battery and thermal rules run only while the app is alive; they are not
-provided by the standalone backstop. Performance effects depend on workload.
+The Low Power Mode rules run only while the app is alive. The three ends are
+also enforced by the standalone backstop once a minute (section 8), so they
+hold after a crash. The backstop reads the battery with `pmset -g batt` and
+ends on the first read it cannot use, where the app tolerates one IOKit miss.
+When `pmset` lists no internal battery, the backstop asks `ioreg` for the
+`AppleSmartBattery` service, as `PowerMonitor` does: with no service the Mac
+is a desktop, and with one but no charger reported (`ExternalConnected`) the
+battery counts as unreadable and the session ends. It reads `endFloor` and
+`thermalRules` through the app's own decoder, not by parsing config.json
+itself, while that binary answers (its own reader when it does not is
+below). While a session is valid and the app holds the liveness lock, it
+opens a readable regular `config.json` once and passes its bytes on standard
+input to `Insomnia --agent-cutoffs 33` in the installed bundle
+(`~/Applications/Insomnia.app/Contents/MacOS/Insomnia`). That mode
+(`AgentCutoffsCommand`) answers before AppKit starts. It arms a SIGALRM for
+its 33 second lifetime, reads at most 8 MiB, decodes the bytes with
+`Store.decodeConfig` (the call `Store.loadConfig` makes), prints
+`cutoffs <endFloor> <thermalRules>` from `Config.agentCutoffs` (the end floor
+clamped to 0 through 95 as `normalizeFloors` clamps it) and exits. It takes
+no lock, opens none of Insomnia's files, writes nothing and calls no
+private API, so it
+answers while the app's UI is hung. A duplicate or escaped key, a number the
+decoder rounds (`1e-400` is 0, `4.9999999999999999` is 5) and an error in
+any other field therefore read the same on both sides. The backstop runs it
+as one of its bounded reads (section 8): without the recovery lock's
+descriptor, stopped with SIGTERM after `COMMAND_TIMEOUT_SECONDS` (30) and
+with SIGKILL 3 seconds later. It runs the binary only when the bundle's
+Info.plist declares `InsomniaAgentCutoffsVersion` 3, the version the script
+speaks, since an older build has no such mode and would open the menu bar
+app instead. Version 3 decodes the whole journal before it reads the
+cutoffs from it.
+
+A missing file, one that is not a regular file (never opened), one this
+user cannot read, and the answer `rejected` (the decoder refused the bytes)
+give the cutoffs the app recorded for the session in `state.json`:
+`sessionCutoffs`, the end floor and the rule as `"30 false"`. The backstop
+reads them the same way, through the app's decoder: it opens a readable
+regular `state.json` once and passes its bytes to
+`Insomnia --agent-session-cutoffs 33`. That mode decodes the whole journal
+as `Store.loadState` does (`Store.decodeState`), then `sessionCutoffs`, and
+prints `cutoffs <endFloor> <thermalRules>`, or `none` for a journal without
+them (a session an older build started). It answers `rejected` (exit 65)
+for a journal the app does not load, and `foreign` (exit 65) for a
+`sessionCutoffs` the app does not write, which the app reads as none.
+`none`, and no `state.json` at all, give the app's defaults, 10% and on. The app records them before a session
+starts (with `sleepDisabledByUs`) or resumes, before a Settings change to
+either takes effect (under the recovery lock taken without waiting, before
+`config.json` is written; a busy lock or a failed write refuses the change
+and a failed `config.json` write puts the record back), and in the next
+transaction after it adopts a hand edit or finds another record there. A
+transaction that cannot record them ends the session (`cutoffsNotRecorded`).
+So does a Settings change whose `config.json` write fails after the record
+was written, when the record then cannot be put back either: the journal
+would hold cutoffs the app does not enforce, looser or stricter. Still under
+the lock the record was written under, the app ends the session on disk as
+an end does (section 8): it removes `session.json`, or records its end in
+`ended-session.json`, the journal, a record aside, the lock file or
+`insomnia.log`. Settings says the session ended, the undo runs in the next
+transaction, and no relaunch or agent run from then on reads the session as
+live. When none of those can be written either, the end is not recorded, as
+for any end (section 8): the session then stays on disk with the journal's
+new cutoffs after the lock is released, and only the pending end in the
+app's memory, which blocks a start and is retried, stands for it. A crash
+or hang before that end runs leaves the agent the new cutoffs and the
+session, the same gap as any end recorded nowhere.
+So a session whose app has stopped answering keeps the floor and rule the
+app enforced, also after its `config.json` is deleted or rejected, while
+`state.json` holds the record the app wrote. Where it does not (the cases
+without a record below), the backstop's cutoffs can differ from the app's,
+which keeps enforcing its own settings. The record is not an undo entry: it
+never makes the journal dirty, the backstop never changes it, and the app
+clears it when it removes `session.json`. The app reads a value it does not
+write as none and records its own over it.
+
+Before it reads the cutoffs for a valid session, or ends one, the backstop
+checks that `state.json` loads as the app loads it: JSON whose top level
+is an object, the keys the app reads of the types and ranges it decodes,
+and no key of letters twice in one object (`journal_shape_problems`,
+`record_text_problems`, section 8). A journal that fails, a `state.json`
+that is not a regular file or cannot be read, and a journal the binary
+answers `rejected` for stop the run (exit 1), logged, with `session.json`,
+the journal and every undo entry as they were: the app neither ends nor
+resumes a session on a journal it cannot load, and nothing says which
+cutoffs it holds. The check follows every object and array but checks only
+what the app decodes: the top level, the four arrays and the objects in
+them. In a frozen process it checks `startedAtMicros` only after a
+`startedAt` that is there and not null, and `bootSession` only after both,
+as `FrozenProcess` decodes them. The check reads the file's own text as
+the app's decoder reads it (`record_text_problems`), not through `plutil`,
+which keeps the last of two copies of a key where the app keeps the first
+and reads numbers through a `Double`. Where `plutil` would read the file
+otherwise than the app (a key the app reads written twice or with an
+escape, a whole number written with a fraction or an exponent, a `Float`
+`plutil` would write back as another `Float`, UTF-16 or UTF-32, a NUL byte
+in text the app skips, `\u0000` in a string the app reads), the backstop
+reads and edits a copy of the journal as the app
+reads it (the view) and leaves the file as it is until it publishes a
+journal. The view holds the keys the app reads, the first copy of each,
+without escapes, with whole numbers as digits, and nothing the app skips.
+So a journal the backstop publishes from it drops what the app's own save
+drops: keys the app does not read, later copies of a key, and a
+`sessionCutoffs` the app reads as no record. The check accepts a
+whole number written with a fraction or an exponent when the app reads it
+as a whole number the field's type holds (`5105.0`, `1e3`, and `1e-400` as
+0; not `0.5`, and not `2147483648` for an Int32), a number where the app
+reads a `Float` that does not round to infinity, or to 0 unless it is 0
+(compared as exact decimal digits), a key, escape or number the app
+skips, UTF-16 with or without a byte order mark, and UTF-32 without one or
+big-endian with one. A `sessionCutoffs` written twice counts by its first
+copy, and one the app reads as no record leaves the journal loadable and
+counts as a record the app does not write. A NUL byte in text the app
+skips, which `plutil` does not read, is left out of the view; one in a
+string the app reads or between values is refused, as the app refuses it.
+A string the app reads that holds `\u0000`, which `plutil` cannot hold, is
+held in the view with U+E000 for each `\u0000`, and each journal published
+from the view has them written back as `\u0000`. The check refuses some
+text the app's decoder reads, none of which the app writes: such a string
+longer than 1024 bytes, `\u0000` in a journal that also holds U+E000 (raw
+or as an escape), which the view could not tell from a mark, and text the
+check does not finish reading within 30 s (an object with very many keys or
+a very long array can take that long). It cannot tell what the app makes of
+an Int64 on which Foundation stops the app (a precondition in its `Decimal`
+parse): the app neither loads nor rejects that journal, it stops, and the
+check refuses it as not known. It refuses UTF-32LE with a byte order mark,
+which the app does not load either.
+
+Loading is not the whole test for a journal the backstop publishes.
+`plutil` writes every number of a journal it edits back through a `Double`
+or a `Decimal`, which can turn the text of a `Float` into text the app reads
+as another `Float`, and writes -0 as text it reads back as the whole number
+0. The view holds each such `Float` as the same `Float` in 9 digits, which
+`plutil` writes back unchanged, and -0 as -0.0; a copy that holds -0.0 is
+read into a view again before each edit after the first (`publish_edit`).
+Before an edited copy is renamed over `state.json`
+(`journal_candidate_ok`), the check reads it as it reads the journal: it
+must load as the app loads it, hold every `Float` the app decodes, where it
+is and bit for bit, as the journal it was copied from, and, where the view
+wrote U+E000 for `\u0000`, hold `\u0000` there and no U+E000. Strings,
+whole numbers and bools `plutil` writes back as they were. A copy that
+fails is not published: the run keeps the old journal, with every entry it
+still has to undo, and exits 1. While a refused journal stays, a valid
+session keeps sleep held unless the app ends it, and nothing is undone,
+until the file is fixed.
+
+When the binary cannot answer for `config.json` (missing or not
+executable, or another declared version: the agent runs only the script
+sealed in `~/Applications/Insomnia.app`, after checking that bundle's
+signature, so these need the bundle removed or replaced during the run; no
+answer in time, more than 8 MiB of input, output in another form), the
+backstop reads the file itself (`config_cutoffs`) and logs that it did. It
+copies the file once through a bounded read, at most 8 MiB as the binary
+reads, and reads the copy's text with the journal's reader in its
+`config.json` form (`record_text_problems`), without `plutil`. The reader
+follows the whole file as the app's `Config` decoder reads it: the first
+copy of a key, keys after their escapes, numbers as the field's type reads
+them (`1e-400` as an end floor of 0), and what the decoder skips skipped.
+It checks each value the decoder reads for the type it takes there, null
+included where it reads the key with `decodeIfPresent`, and that a
+`lidCloseDefaultsNotice` object holds both its keys. A file that passes
+gives `endFloor` (10 when absent or null, clamped to 0 to 95 as
+`Config.agentCutoffs` clamps it) and `thermalRules` (on when absent or
+null), the values the binary prints for it. A file the decoder rejects
+(text that is not JSON it reads, a value of a type it does not take there,
+a number the type does not hold, a string it does not read, a
+`lidCloseDefaultsNotice` without one of its keys) counts as rejected, as
+the binary answers for it. The backstop cannot tell what the app makes of
+a file over 8 MiB, one with an Int64 on which Foundation stops the app (it
+stops there, neither loading nor rejecting the file), or one the reader does
+not finish within 30 s (very many keys or a very long array), and it does
+not use one of those: they count as read neither way, not as rejected. So a hand edit reaches the
+backstop on this path only in a form this reader can read; one it cannot
+read leaves the cases below. The binary is not run again on the journal then:
+the backstop reads `sessionCutoffs` from the journal it checked itself
+(`journal_cutoffs`), a string of exactly the form the app writes, a floor
+of 0 to 95 with no leading zero and `true` or `false`, which `plutil` reads
+from the journal as the app reads it, the first copy of the key (from the
+view where the text holds it twice). It enforces that record and
+logs that it read it.
+
+Where no record says which cutoffs apply, the outcome depends on
+`config.json`. A `sessionCutoffs` the app does not write (`foreign`) counts
+as none, as the app reads it (`RuntimeState.decodeSessionCutoffs`), and so
+does a `state.json` that is a symlink to nothing, which the app reads as no
+journal (`Store.readData`) and replaces at its next write. An existing
+`state.json` that cannot be read stops the run as above. While
+`config.json` is missing or rejected, none gives the app's defaults, a 10%
+end floor with thermal rules on (`Config.agentDefaultCutoffs`), which the
+app enforces while the file is missing and it has recorded nothing
+(section 10). While `config.json` is there but neither the binary nor the
+backstop can read it, none gives the strictest values, a 95% end floor with
+thermal rules on, and a log line naming the cause. Nothing on disk then
+says which cutoffs the app enforces: that fallback ends a session on
+battery power below 95% and ends one at critical heat even with the
+thermal rule off, where the app may keep it, and the defaults can keep a
+session the app, holding stricter settings in memory, would end. The app
+writes its record within a second while it answers
+(`publishSessionCutoffs`), so each case needs an app that has stopped
+answering. Both are stopgaps, not a decided policy, and remain open: the
+defaults where `config.json` is missing or rejected and nothing is
+recorded, and the 95% values where the file cannot be read either way and
+nothing is recorded. The alternatives (the deadline and liveness only, an
+immediate end, refusing such a session) are open too; none has been
+approved. A config.json removed between the check and the open counts as a
+file neither can read for that run. The app takes those two values only
+from a file that decodes, runs no session while a config.json it rejected
+stays in place, and writes its settings where the file is missing
+(section 10).
+Performance effects depend on workload.
 
 ### 7. Network failover
 
@@ -814,7 +1031,15 @@ Reconcile runs at every Insomnia launch:
    files in place.
 2. Session valid → establish the independent recovery agent before reapplying
    the sleep guard, then resume observers. If the lid is open, restore recorded
-   lid-close actions. Arming or restoration errors must remain visible.
+   lid-close actions. Arming or restoration errors must remain visible. A
+   journal that says Insomnia disabled sleep must find `SleepDisabled 1`
+   first: a 0 means the hold was undone while no Insomnia ran (an agent end
+   that could record nothing, a hand-run `pmset`, a start that died before
+   its `pmset`), and a read that fails cannot confirm it. Either way the
+   session is ended as in step 1, not resumed. After it arms the agent and
+   writes the journal, the app replaces `session.json` with the same bytes
+   before it holds sleep; a file it cannot replace ends the session the
+   same way (the end-record rules under Backstop below).
 3. `pmset -g` reports `SleepDisabled 1` with no session and no journal
    entry → leave it. Step 1 has already undone a disable Insomnia journaled,
    so this one was set by something else (a hand-run `pmset`, another tool)
@@ -910,6 +1135,225 @@ Backstop, independent of the app:
   and, from older builds, in the LaunchAgents directory).
 - App and script transactions must coordinate through a shared lock. Failure
   to acquire it must not permit an unprotected journal write or side effect.
+- Only the Insomnia that holds `.app.alive` runs. A copy that cannot take it
+  within 2 s (`open -n`, or the binary run directly, while another copy
+  runs) does not reconcile, show the menu, start a session or end one on
+  quit; it posts a notification and quits.
+- A valid session is live only while the app holds `.app.alive`, an flock(2)
+  taken at launch and released by the kernel when the process dies, and while
+  the end floor and the critical thermal level (`notifyutil -g
+  com.apple.system.thermalpressurelevel`, 3 and up) are not crossed. The
+  agent ends the session otherwise, exactly as `--force` does, and logs the
+  reason. A present battery that cannot be read fails closed; an unreadable
+  thermal level only warns. `--force` runs none of these checks.
+- Before the agent decides an end for a valid session, `--force` included,
+  it checks that `state.json` loads as the app loads it (section 6). A
+  journal that does not stops the run with `session.json` and the journal
+  kept, since the undo could not run on it and a removed `session.json`
+  would leave sleep held with no session to end.
+- An end the agent decides is final from that decision. It removes
+  `session.json` under the lock before it undoes anything, so an undo it
+  cannot finish (a failing or hung `pmset`, saved audio or brightness only the
+  app restores) leaves journal entries, not a session to resume. The app ends
+  its side when it sees `session.json` gone. A file that cannot be removed is
+  recorded as ended instead (below); the one gap is when neither its folder
+  nor the log folder takes a new file, the recovery lock file takes no
+  write and `insomnia.log` takes no append either.
+- A `session.json` that cannot be removed (an immutable file) is recorded as
+  ended in `ended-session.json`, a copy of its bytes. The app writes the same
+  record when its own end cannot remove the file. When `ended-session.json`
+  cannot be written either (an unrelated record there that cannot be
+  replaced), the end is recorded in the journal instead: `endedSession` in
+  `state.json`, the same bytes in base64. When the journal cannot be
+  written either (all three files immutable), the record goes to a new file
+  named `ended-session.json.` and eight letters or digits, in the same folder
+  or, when that folder takes no new file (a deny ACL, say), in the log
+  folder `~/Library/Logs/Insomnia`. When neither folder takes one, the
+  record goes into the recovery lock file `.recovery.lock`, which exists
+  already: `ended-session-v1 `, the bytes in base64 and a newline, at most 1
+  MiB. Both sides write it in place while they hold the lock, so the file
+  keeps its inode and stays the lock every party takes. The app writes
+  through the lock's own descriptor, only while the path still names that
+  file, a regular file this user owns: it keeps the bytes the file already
+  shares with the start of the record (read with `pread`), cuts the file to
+  them with `ftruncate`, appends the rest with `pwrite` and calls `fsync`.
+  The agent writes only while the path names the file its fd 9 holds, a
+  regular file this user owns: with `>>` to complete the record's first
+  bytes, and otherwise with `>`, only over content that ends nothing for
+  that session. So a writer stopped partway leaves the old bytes as they
+  were, an empty file (stopped after the cut and before the first new
+  byte), or the record's first bytes, never those bytes over old bytes
+  that differ. The first two record nothing, and no reader can tell them
+  from no write; the last counts as the end (below). Both read the file
+  back before they undo anything. The lock file is read only while it is a
+  regular file this user owns (`lstat`, `O_NOFOLLOW` in the app; `-L`,
+  `-f`, `-O` in the agent); anything else holds no record and is never
+  written. Empty content is no record. Content read whole that is the
+  record of the bytes in `session.json` cut short as a writer leaves it
+  when it stops partway (the record's first bytes and nothing else, or the
+  whole record followed by bytes the file held before, as an older app's
+  writer left it) counts as that session's end, the safe side, since a
+  writer was recording it. No writer empties it: both append the rest of
+  the first bytes, the agent leaves the whole record with bytes after it
+  as it is, and the app cuts that to the record. Other content read whole
+  that is no whole record of that form (other bytes, a record of other
+  bytes cut short, more than 1 MiB) ends no session, and a writer replaces
+  it with its record as above. A record cut short matches only the bytes
+  it has: a stale one is the start of a later session's record too while
+  it stops before the first byte where the two `session.json` files
+  differ. So a start settles the lock file before it writes its new
+  `session.json` (`Store.settleLockForStart`). It keeps a whole record of
+  the `session.json` it replaces, alone or with bytes after it, completes
+  that record's first bytes to the whole record, and empties anything
+  else, everything when no `session.json` is there. A start whose lock
+  file does not read back settled refuses and puts back what it wrote. A
+  whole record ends no other `session.json`, so the replaced file's record
+  stays its end until that file is replaced, and the start empties it as
+  its last step before it disables sleep. A relaunch that resumes a
+  session first empties whatever the lock file holds, since none of it
+  ends that session (or the session would have ended), so an end recorded
+  there later starts from an empty file; one that cannot be emptied stays,
+  the resume goes on and the app logs it. A lock file whose size or bytes
+  cannot be read counts as the end of whatever `session.json` holds, since
+  it may hold that record, until it can be read or that file is gone or
+  replaced; no writer takes it for its own record or writes its record
+  over it, and both go on to the log. Both read it three times, 0.1 s
+  apart (`Store.lockReadAttempts`, `LOCK_READ_ATTEMPTS`), before it counts
+  as unreadable, so a read error that passes ends nothing. When
+  `insomnia.log` holds a whole record of that session, both name the log
+  as where the end is recorded, since the lock file only may hold it.
+  Counting an unreadable lock file as the end keeps to the safe side; it
+  does not show that anyone ended the session. A lock file that holds no
+  record and whose reads keep failing (an I/O error, say) ends a session
+  nobody ended, and the agent then empties it once `session.json` is gone.
+  Whether such a file should end, keep or defer the session is an open
+  decision.
+  The app empties the record when it removes `session.json`. A start that
+  fails puts back the journal, the old `session.json` and the lock file
+  byte for byte, the lock file before the old `session.json`; with no old
+  `session.json`, the lock file's bytes go back once the new one is
+  removed, since they end nothing. The bytes of a lock file that could not
+  be read beside no `session.json`, or that held over 1 MiB, are not put
+  back. Each agent run empties any content once `session.json`
+  is gone and, while `session.json` is a regular file it can read, a record
+  of other bytes and content that is no record and not that record cut
+  short, as it does a stale record aside. `uninstall.sh` empties it in
+  both modes, never removing the file. A start over a `session.json`
+  refuses while the lock file cannot be read, since it could not put a
+  record back; a lock
+  file over 1 MiB holds no record and does not refuse it. A record aside is created exclusively (`mktemp` in the agent,
+  `O_EXCL` with a random name in the app), mode 0600, and kept
+  only when it reads back identical. Only a regular file of exactly that
+  name owned by this user counts; a symlink, a FIFO, another owner's file or
+  another name is never opened or removed. The log folder is searched and
+  written only while it is a directory owned by this user, not a symlink
+  (`lstat` in the app, `-d`, `-L` and `-O` in the agent). The app at launch
+  and on its 1 Hz tick, every agent run and `uninstall.sh` search both
+  folders. A record aside that already matches, in either folder, is used
+  again. The agent and the app write the record and read it back before
+  they undo anything. While a record matches the file, the app restores that session
+  instead of resuming it, whatever `SleepDisabled` reads, the 1 Hz tick ends
+  a session the app still holds, and each agent run ends it again and
+  retries the removal. `endedSession` is not an undo entry and never makes
+  the journal dirty; the app removes it before it writes a new
+  `session.json` and after it removes one, so a record of one session never
+  ends another. A record aside is removed with `session.json` by the app and
+  the agent, and by each agent run once it differs from `session.json` byte
+  for byte or the file is gone; one `cmp` cannot read stays and ends
+  nothing. `ended-session.json` follows the same rule: the app and each
+  agent run remove it only once it differs from `session.json` or the file
+  is gone, and keep it while `session.json` cannot be read; both follow a
+  symlink there to a regular file and check no owner, and an unreadable
+  record ends nothing while it stays unreadable. `uninstall.sh` removes the
+  rest from both folders, with or without `--purge`. When neither folder
+  takes a new file, the agent still runs the restore but cannot write the
+  status files that confirm it, so the run reports no result, keeps the
+  journal as it was and exits 1, and uninstall stops; a record in the lock
+  file still ends the session for the app and every later run. When the
+  lock file takes no write either (not a regular file this user owns, say),
+  the end goes into `insomnia.log` as one line (`LogEndRecord` in the app,
+  `record_end_in_log` in the agent): `insomnia-ended-session-v1`, the number
+  of bytes in `session.json` and those bytes in base64, separated by single
+  spaces. It is appended only under the recovery lock, while the log is a
+  regular file this user owns and not a symlink, through a descriptor
+  checked to be on that file (device and inode), in one write, and it
+  counts only once it reads back as a whole line. A record at the very end
+  of the log that lacks only its newline counts too, so every writer of
+  `insomnia.log` reads the log's last byte first and, when it is not a
+  newline or cannot be read, puts a newline before its own line: the app
+  (`OwnerOnly.appendToLog`, `LogEndRecord`) and the agent (`log`,
+  `record_end_in_log`) in the same write, the agent program's line when
+  the code check fails in a write before it. Each holds `flock(2)` on
+  `insomnia.log` itself from that read until its line is written (taken
+  last, after the recovery lock), checks once it holds it that its
+  descriptor is still on the file the path names, and opens the path again
+  when it is not (four opens at most in the app, three in the agent); a
+  rotation renames the file under the same lock. The app waits up to 2 s
+  for the lock: an ordinary line not locked in time waits in memory
+  (64 KiB, the oldest whole lines dropped first) and goes out before the
+  next line that gets the lock, and a record not locked in time is not
+  written and does not count. The agent
+  and the agent program wait up to 5 s (`lockf -s -t 5`); a line of the
+  agent's not locked in time goes to standard error, the agent program's is
+  not written, and neither is a record. `uninstall.sh` writes the log only
+  through the agent. So among these writers a line written later never
+  joins that record, and a line a write cut short never joins the record
+  written after it. A writer that takes no lock (an older build's agent
+  still installed, another program, a hand edit) can still append in
+  between; its line can join a record that already read back, and that
+  record then ends nothing. A
+  `session.json` over 64 KiB is never recorded there. The app at launch,
+  in reconcile, on its 1 Hz tick and in every transaction, each agent run
+  and `uninstall.sh` look for a line equal to the one the current bytes of
+  `session.json` give, in `insomnia.log` and `insomnia.log.1`, so a line
+  cut short or one of other bytes ends nothing. A log that cannot be read,
+  or one over 64 MiB, holds no record for them, and a run whose read-back
+  fails appends another line at the next run. The app rotates `insomnia.log`
+  only while it holds the recovery lock (`OwnerOnly.LogRotation`), so a
+  rotation never runs between a write and its read-back. Before the rename
+  discards the old `insomnia.log.1`, it copies a record there of the
+  `session.json` still on disk into the file it renames, so the record
+  outlasts any number of rotations while that file stays. When `.1` cannot
+  be read, or `session.json` cannot be read while `.1` holds any record, the
+  rotation waits for the next line. Lines the app writes without the lock
+  never rotate, so the log can pass 1 MiB until one written under the lock
+  rotates it. The record is not removed: once `session.json` is gone or
+  holds other bytes it ends nothing, and later rotations drop it.
+  `uninstall.sh --purge` removes both logs only once `session.json` is
+  gone. No record can be written at all only when the log takes no append
+  either (a full disk or an I/O error, say). The app
+  writes the journal before it resumes any session, so it resumes none
+  while `state.json` cannot be written. A relaunch that finds
+  `sleepDisabledByUs` while `pmset` reports `SleepDisabled 0` ends the
+  session instead of resuming it (step 2 in Reconcile), recording the end
+  where it can. `SleepDisabled 1` cannot show that the session is still
+  live: it is one global bit, and a failed restore or another process can
+  leave it set. So the app also replaces `session.json` with the same bytes
+  (a temporary file renamed over it and read back) before it holds sleep,
+  and ends the session instead when that fails, since an end that recorded
+  nothing left a `session.json` it could not remove. This has a cost: a
+  session the app was running when it crashed is ended at the next launch,
+  not resumed, while its `session.json` cannot be replaced. Once
+  `session.json` can be replaced and `state.json` written again, an app
+  launched before the next agent run with `SleepDisabled 1` (the restore
+  failed, or something else set it) resumes a session whose end recorded
+  nothing, because nothing on disk tells that end from a crash; the next
+  agent run treats it as any live session. An end stopped before any record
+  of it counts (a crash or a kill before `session.json` is removed and before
+  a record is whole, or before the first byte of one in the lock file)
+  records nothing either.
+  Every writer records an end before it undoes anything, so sleep is still
+  held then, and a relaunch before the next agent run resumes the session
+  as after a crash: a check that still fails (the deadline, a floor, heat)
+  ends it again, and an end the user asked for is lost. Neither history is
+  accepted; both are open. Nothing on disk tells them from a crash, so
+  only refusing every crash resume closes them. Refusing a resume while the
+  log takes no line at launch would not: once every file takes writes
+  again, the launch sees the same files as after a crash.
+- The battery and thermal reads have the undo commands' time limit but never
+  hold the lock: they run with its descriptor closed, and one that ignores
+  SIGTERM gets SIGKILL. A hung read fails only its own check, never the next
+  run or the app.
 - A `sudo pmset` is sent SIGTERM at its timeout (20 s in the app, 30 s in the
   agent), never SIGKILL: a killed sudo can orphan a root pmset that still
   changes power state later, outside any transaction. One still running 3 s
@@ -1034,9 +1478,18 @@ Backstop, independent of the app:
   absent. A delete that fails counts as done only when `defaults read` then
   says the key does not exist; a read that succeeds or fails any other way
   keeps the entry.
-- The agent is a recovery mechanism, not a guarantee of crash/reboot behavior
-  or a replacement for battery/thermal observers. These scenarios require
-  the separate hardware validation record.
+- The agent is a recovery mechanism, not a guarantee of crash/reboot behavior.
+  Its battery and thermal checks cover the two ends once a minute, not Low
+  Power Mode or notifications. A reboot alone does not end a session whose
+  deadline is still ahead. If no Insomnia holds the alive lock when the agent
+  first runs after login, the agent ends it. With launch at login on, the app can
+  start first; its reconcile then follows step 2. A session with an end
+  record is restored, not resumed. A journaled hold must still read
+  `SleepDisabled 1`, so the session resumes only if that setting survived
+  the reboot, which has not been measured, and is ended otherwise. One
+  whose `session.json` the app cannot replace is ended too. A resumed
+  session lasts until its deadline or a cutoff. These scenarios require the
+  separate hardware validation record.
 
 ### 9. Notifications
 
@@ -1044,8 +1497,9 @@ Backstop, independent of the app:
 minutes before end, battery floor reached, battery unreadable twice in a row,
 thermal action taken, network gap recovered (with nudge summary), sleep
 restored by backstop, sleep disabled by something other than Insomnia
-(reconcile step 3, once per launch), lid-close settings changed by the
-one-time update (section 10, once).
+(reconcile step 3, once per launch), config.json moved aside because it does
+not decode, another copy already running (the copy quits), and lid-close
+settings changed by the one-time update (section 10, once).
 
 ### 10. Settings
 
@@ -1105,6 +1559,74 @@ older build is tightened when the app reads it:
   System Settings shows without a relaunch. With the flag off nothing is
   registered or unregistered at launch.
 
+The app reads config.json at launch. A missing key takes its default, and
+`configVersion` counts by its presence alone, whatever its value. A file
+that does not decode (a value of the wrong type, broken JSON, not a regular
+file) is never written over: the app renames it to
+`config.json.unreadable-<UTC stamp>`, runs on the defaults, writes them to
+config.json and posts a notification naming the copy. When the rename
+fails, the file stays as it is and the app runs on the defaults without
+writing them. `uninstall.sh` keeps these copies; `--purge` removes them. A
+missing config.json is not written at launch but by the first transaction,
+under the recovery lock (below).
+
+The backstop reads `endFloor` and `thermalRules` from config.json through
+the app's decoder on every run while the app is alive (section 6), so the
+app and the backstop must enforce the same two values before a session
+starts, resumes or goes on. Every transaction
+(reconcile, start, extend, end, and the lid, floor and Low Power changes)
+checks the file again:
+
+- A file that decodes is what the backstop enforces. When its end floor or
+  thermal rule differs from the app's (a hand edit, a repair after a
+  rejection), the app takes those two values from the file, raises the Low
+  Power Mode floor above the end floor if needed, and logs the change. No
+  other setting changes, and the file is not rewritten.
+- A missing file (deleted, or never written) gets the settings the app runs
+  on written in its place. While it is missing, the backstop enforces the
+  cutoffs the journal records for the session (section 6), or its own
+  defaults (10%, thermal rules on) where it records none. When the write
+  fails, as on a full disk, and the app's end floor and thermal rule are
+  those defaults, the session goes on, the failure is logged once, and
+  every transaction writes again. When they differ, no session runs
+  (below), as before the journal recorded them: a Start would then rest on
+  the journal record alone.
+- A file that does not decode is renamed aside as at launch, and the
+  settings the app runs on are written in its place. Until then the
+  backstop enforces the journal's record for it, as for a missing file. A rejected
+  file that cannot be renamed and that a person then deletes gets the same
+  write.
+
+While a rejected file cannot be renamed, or its replacement is not written
+yet, or a missing file is not written while the app's cutoffs differ from
+the backstop's defaults, no session runs:
+
+- Start refuses and changes nothing. Its notification names the file and
+  says to make it writable or delete it, or, when the replacement could not
+  be written, to free disk space or make its folder writable.
+- A session already running ends at the next transaction, through the
+  normal end.
+- Reconcile ends a valid session on disk instead of resuming it.
+
+Settings changes the end floor and the thermal rule only through
+config.json: the change is written first and takes effect once the write
+succeeds. A write that fails changes neither side once the session's
+record of them in state.json is put back; Settings shows the error under
+the power settings, and both keep the old values. When the record cannot be
+put back either, the session ends instead and Settings says so (section 6).
+Any other setting
+takes effect at once and is written behind it; a write that fails is
+logged, and the next save writes it.
+
+While a session runs, the app's 1 Hz tick also looks at config.json. A file
+that is missing, does not decode, or holds another end floor or thermal rule
+than the app runs the check above within a second; one still in that state
+afterwards (a write that failed, a busy lock) is looked at again after the
+retry delay. With the lid closed there is no tick, so a hand edit then
+reaches the app at its next transaction (a lid event, a floor change, the
+deadline). A backstop run that read config.json before a change uses the
+old values for that run only.
+
 ### 11. Menu bar UI: inline time entry
 
 Reference: the attached screenshot (coffee icon, then three rounded pill
@@ -1128,7 +1650,8 @@ one after another with a short stagger.
   replaces it with the number and the pill grows to fit. Tab and Shift-Tab
   move between pills, Enter starts the session, Esc collapses.
 - The "?" badge on each pill is a help affordance: hover shows a tooltip
-  ("Up to 30 days" etc.). It is not an input.
+  ("Up to 1d per session" on Days, from `maxDuration`; the range 0 to 23 on
+  Hours and 0 to 59 on Minutes). It is not an input.
 - The current interface uses inline entry, not the preset-popover proposal
   from the original design. Empty-field Enter starts the default preset.
 
@@ -1316,11 +1839,16 @@ that any case passed; record results in the release validation record.
    sleep still disabled until end.
 3. **Restores.** End now → `pmset -g` shows no `SleepDisabled`. Quit → same.
    Timer expiry → same, plus notification.
-4. **Backstop.** Force-quit a supervised disposable session, then verify
-   deadline recovery and retry after an injected restore failure. Separately
-   test reboot/login with valid, expired, and dirty journals; the polling
-   agent honors a valid future deadline rather than unconditionally ending
-   every session at login. Saved audio requires the app to reopen.
+4. **Backstop.** Force-quit a supervised disposable session: the agent ends it
+   within a minute (log line "Insomnia is not running"). Verify retry after an
+   injected restore failure. With the app stopped (`kill -STOP`) and the Mac
+   on battery below the end floor, the agent ends the session on its own;
+   drive the thermal end with an injected reading against a patched copy of
+   the script, not the installed agent. Separately test reboot/login with
+   valid, expired, and dirty journals. With launch at login off, the agent
+   ends a valid session at login, since no app holds the alive lock. With it
+   on, the app may resume the session first, and it then lasts until its
+   deadline or a cutoff. Saved audio requires the app to reopen.
 5. **Freeze.** Slack and WhatsApp on list, close lid, `ps -o stat` shows `T`
    for their whole trees. Open lid → running, reconnected, no relaunch.
 6. **Docker rule.** Rule on. No containers → paused on close; insomnia.log

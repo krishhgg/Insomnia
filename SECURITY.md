@@ -13,16 +13,52 @@ the sensitive details, and wait for the maintainer to arrange one.
 
 The installer grants the user account passwordless access to four exact pmset
 commands listed in the README. This grant is not exclusive to the Insomnia app:
-other processes running as that user can invoke them too. The app is not
+other processes running as that user can invoke them too. The liveness lock
+the backstop probes (`.app.alive` in Application Support) is an flock(2) any
+process running as that user can hold; a process holding it stops the backstop
+from noticing that Insomnia has quit. Only that check is lost: the backstop
+still ends the session at its deadline, below the battery end floor, or at
+critical thermal pressure. While the lock is held, the backstop reads the end
+floor and the thermal rule by passing `config.json` to the installed app's
+binary (`Insomnia --agent-cutoffs`), the one in the bundle whose signature the
+agent checks before each run, and while that file is missing or rejected, the
+values the app recorded for the session in `state.json`
+(`Insomnia --agent-session-cutoffs`). When that binary is gone or replaced by
+another version during the run, or gives no answer in its form in time, the
+backstop reads `config.json` itself where its own reader can tell what the
+app's decoder makes of it (not for a file over 8 MiB, one the reader does
+not finish within 30 s, or one on which Foundation stops the app), and
+otherwise the values recorded in `state.json`, once the journal passes its
+check. A recorded value the app does not write counts
+as none, as the app reads it. With no record, it enforces the app's defaults
+(a 10% end floor, thermal rules on) while `config.json` is missing or
+rejected, and the strictest values (95%, on) while the file is there but
+cannot be read either way; both are open stopgaps (spec section 6). A
+journal the app would not load, or one whose meaning to the app the check
+cannot tell (an Int64 on which Foundation stops the app, text it does not
+finish reading within 30 s, the two `\u0000` cases in spec section 6), stops
+the run with the session and the journal kept. An edited journal replaces
+`state.json` only when it loads as the app loads it and keeps every `Float`
+the app decodes bit for bit. The app is not
 sandboxed; local logs can contain SSIDs, process metadata, and tmux target names.
 The lines the app writes to `insomnia.log` also reach the unified log with the
 body marked private, so programs reading `log show` see `<private>` instead of
 those names unless private data logging is enabled on the Mac. The files
-Insomnia creates (logs, journal, session, config, recovery lock) are mode 0600
+Insomnia creates (logs, journal, session, config, recovery lock, session end
+records) are mode 0600
 and its directories 0700; the backstop runs with `umask 077`. Insomnia sets
 only these modes and leaves any access control list (ACL) on these files as it
 is, so an ACL someone added can still give another account access. Logs are capped at
-1 MiB with one older copy kept. A log the user replaced with a symlink is not
+1 MiB with one older copy kept. `insomnia.log` is rotated only while the app
+holds the recovery lock, because it can hold the record of a session's end (a
+line with session.json's bytes in base64), so it can grow past 1 MiB until
+then. Insomnia's writers of `insomnia.log` (the app, the backstop and its
+LaunchAgent) hold flock(2) on the file while they write, so no line of
+theirs lands inside such a record. Any process running as that user can
+hold that lock too: the app's lines then wait in memory (64 KiB),
+the backstop's go to standard error, and no record of a session's end is
+written there. A process that appends without the lock can still break a
+record that was already read back. A log the user replaced with a symlink is not
 rotated: the file it points to is the user's to manage. Location
 Services access is requested only when a hotspot is saved or a session starts
 with one configured; it is used to read Wi-Fi network names and the app never

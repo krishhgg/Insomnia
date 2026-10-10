@@ -37,6 +37,14 @@ final class RecoveryLockHandle: @unchecked Sendable {
     private let mutex = NSLock()
     private var fd: Int32
 
+    #if DEBUG
+    /// Tests stand in for pwrite(2) in `replaceContents`: given the
+    /// descriptor, the bytes still to write, their count and the offset, it
+    /// returns what pwrite(2) would. Debug builds only; nothing reads it
+    /// otherwise.
+    nonisolated(unsafe) static var pwriteForTesting: ((Int32, UnsafeRawPointer, Int, off_t) -> Int)?
+    #endif
+
     fileprivate init(fd: Int32) { self.fd = fd }
 
     /// Closes this process's descriptor, as exiting would. No `LOCK_UN`:
@@ -51,6 +59,21 @@ final class RecoveryLockHandle: @unchecked Sendable {
         }
     }
 
+    /// Whether this handle still holds the lock on the file at `path`: not
+    /// released, and `path` names the file its descriptor is open on. The
+    /// log's rotation and its end record (`LogEndRecord`) run only then, so
+    /// a handle inherited by a task that outlived its transaction, or one
+    /// on another home's lock, never counts.
+    func locks(path: String) -> Bool {
+        mutex.withLock {
+            guard fd >= 0 else { return false }
+            var held = stat()
+            var named = stat()
+            return fstat(fd, &held) == 0 && stat(path, &named) == 0
+                && held.st_dev == named.st_dev && held.st_ino == named.st_ino
+        }
+    }
+
     /// A new close-on-exec descriptor on the locked file, for a child that
     /// must keep the lock while it runs: the spawn installs it without the
     /// flag. The caller closes its copy once the child has been started.
@@ -61,6 +84,73 @@ final class RecoveryLockHandle: @unchecked Sendable {
             let copy = fcntl(fd, F_DUPFD_CLOEXEC, 0)
             return copy >= 0 ? copy : nil
         }
+    }
+
+    /// Makes the locked file hold exactly `data`, written in place through
+    /// this handle's descriptor, so the file keeps its inode and stays the
+    /// lock every party takes (`Store.recordSessionEndInLock`). Only while
+    /// `path` still names that same file, a regular file (lstat, so not a
+    /// symlink) this user owns. The bytes the file already shares with the
+    /// start of `data`, read through the same descriptor, are kept; the
+    /// file is cut to them, then the rest of `data` is appended. So a step
+    /// cut short leaves the old bytes untouched, or a prefix of `data` at
+    /// least as long as the part they shared: never `data`'s first bytes
+    /// over old bytes that differ. A record's first bytes count as its end
+    /// (`Store.lockHoldsRecordCutShort`), so the end of a session written
+    /// here counts from the moment the file changes, and its first bytes
+    /// already there only grow. A file that cannot be read through the
+    /// descriptor is left as it is. True once written and synced; the
+    /// caller reads the file back. False once released or when a step
+    /// fails, a write that writes no byte included.
+    func replaceContents(with data: Data, at path: String) -> Bool {
+        mutex.withLock {
+            guard fd >= 0 else { return false }
+            var held = stat()
+            var named = stat()
+            guard fstat(fd, &held) == 0, lstat(path, &named) == 0,
+                  named.st_mode & S_IFMT == S_IFREG, named.st_uid == getuid(),
+                  held.st_dev == named.st_dev, held.st_ino == named.st_ino else { return false }
+            let size = Int(held.st_size)
+            guard let kept = sharedPrefix(with: data, upTo: min(size, data.count)) else { return false }
+            if size > kept, ftruncate(fd, off_t(kept)) != 0 { return false }
+            var write: (Int32, UnsafeRawPointer, Int, off_t) -> Int = { pwrite($0, $1, $2, $3) }
+            #if DEBUG
+            if let injected = Self.pwriteForTesting { write = injected }
+            #endif
+            let written = data.withUnsafeBytes { raw -> Bool in
+                var offset = kept
+                while offset < raw.count {
+                    let n = write(fd, raw.baseAddress! + offset, raw.count - offset, off_t(offset))
+                    if n < 0 {
+                        if errno == EINTR { continue }
+                        return false
+                    }
+                    // A write that moved nothing would be tried forever.
+                    guard n > 0 else { return false }
+                    offset += n
+                }
+                return true
+            }
+            return written && fsync(fd) == 0
+        }
+    }
+
+    /// How many of the file's first `count` bytes equal `data`'s, read
+    /// through the held descriptor; nil when they cannot be read.
+    private func sharedPrefix(with data: Data, upTo count: Int) -> Int? {
+        guard count > 0 else { return 0 }
+        var bytes = [UInt8](repeating: 0, count: count)
+        var read = 0
+        while read < count {
+            let n = bytes.withUnsafeMutableBytes { pread(fd, $0.baseAddress! + read, count - read, off_t(read)) }
+            if n < 0 {
+                if errno == EINTR { continue }
+                return nil
+            }
+            if n == 0 { break }
+            read += n
+        }
+        return zip(bytes.prefix(read), data).prefix { $0 == $1 }.count
     }
 
     deinit { release() }

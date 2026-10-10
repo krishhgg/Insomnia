@@ -52,6 +52,9 @@ final class EarlierBootLowPowerClaimTests: XCTestCase {
             try h.store.saveSession(Session(startedAt: now.addingTimeInterval(-7200), endsAt: now.addingTimeInterval(-3600)))
         case .valid:
             try h.store.saveSession(Session(startedAt: now.addingTimeInterval(-600), endsAt: now.addingTimeInterval(3000)))
+            // Boot A's sleep hold, which a restart keeps: a session whose
+            // hold reads 0 at launch is ended, not resumed.
+            h.guardFake.sleepDisabled = true
         }
     }
 

@@ -403,7 +403,9 @@ final class RecoverySafetyTests: XCTestCase {
         XCTAssertEqual(outcome, .sessionRetained)
         XCTAssertNotNil(try h.store.loadSession(), "fixture did not keep session.json")
         XCTAssertFalse(h.guardFake.sleepDisabled, "the machine must still be restored")
-        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
+        var kept = RuntimeState.clean
+        kept.sessionCutoffs = m.config.agentCutoffs
+        XCTAssertEqual(try h.store.loadState(), kept, "the session's cutoffs stay while its session.json does")
         XCTAssertEqual(m.pendingEnd, .quit)
         XCTAssertFalse(m.quitRequested)
         let last = try XCTUnwrap(h.notifier.posts.last)
@@ -418,6 +420,7 @@ final class RecoverySafetyTests: XCTestCase {
         let second = await m.end(reason: .user)
         XCTAssertEqual(second, .restored)
         XCTAssertNil(try h.store.loadSession())
+        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
         XCTAssertNil(m.pendingEnd)
 
         // A fresh launch finds nothing to hold.
@@ -425,6 +428,59 @@ final class RecoverySafetyTests: XCTestCase {
         await again.reconcile()
         XCTAssertNil(again.session)
         XCTAssertFalse(h.guardFake.calls.dropFirst(2).contains("disablesleep 1"), "\(h.guardFake.calls)")
+    }
+
+    /// The end the app could not finish by removing session.json is still
+    /// durable: it records the end, and the next launch restores instead of
+    /// holding sleep again, even while the file stays.
+    func testAnEndThatCannotRemoveSessionJSONRecordsItForTheNextLaunch() async throws {
+        let m = h.makeManager()
+        await m.start(duration: 3600)
+        let file = h.home.paths.sessionFile
+        try setImmutable(file, true)
+        defer { try? setImmutable(file, false) }
+
+        let outcome = await m.end(reason: .user)
+
+        XCTAssertEqual(outcome, .sessionRetained)
+        XCTAssertTrue(h.store.sessionEndIsRecorded())
+        let last = try XCTUnwrap(h.notifier.posts.last)
+        XCTAssertTrue(last.body.contains("its end is recorded, so a relaunch will not resume it"), last.body)
+
+        let relaunched = h.makeManager()
+        await relaunched.reconcile()
+
+        XCTAssertFalse(relaunched.isActive)
+        XCTAssertEqual(h.guardFake.calls.filter { $0 == "disablesleep 1" }.count, 1, "\(h.guardFake.calls)")
+
+        // Both pending ends finish once the file can go, which also stops
+        // their retry timers.
+        try setImmutable(file, false)
+        let relaunchedEnd = await relaunched.end(reason: .user)
+        XCTAssertEqual(relaunchedEnd, .restored)
+        let firstEnd = await m.end(reason: .user)
+        XCTAssertEqual(firstEnd, .restored)
+        XCTAssertNil(try h.store.loadSession())
+        XCTAssertFalse(FileManager.default.fileExists(atPath: h.home.paths.endedSessionFile.path))
+    }
+
+    /// A record whose session.json is gone but that cannot be removed
+    /// itself is logged, not dropped silently. The end still completes.
+    func testAnEndRecordThatCannotBeRemovedIsLogged() async throws {
+        let m = h.makeManager()
+        await m.start(duration: 3600)
+        XCTAssertTrue(h.store.recordSessionEnd())
+        let record = h.home.paths.endedSessionFile
+        try setImmutable(record, true)
+        defer { try? setImmutable(record, false) }
+
+        let outcome = await m.end(reason: .user)
+
+        XCTAssertEqual(outcome, .restored)
+        XCTAssertNil(try h.store.loadSession())
+        XCTAssertTrue(FileManager.default.fileExists(atPath: record.path))
+        let log = (try? String(contentsOf: h.home.paths.logFile, encoding: .utf8)) ?? ""
+        XCTAssertTrue(log.contains("could not remove \(record.path)"), log)
     }
 
     // MARK: Cross-process lock: fail closed
@@ -606,5 +662,78 @@ final class RecoverySafetyTests: XCTestCase {
         XCTAssertEqual(h.guardFake.calls, ["disablesleep 1", "disablesleep 0"])
         XCTAssertFalse(h.guardFake.sleepDisabled)
         XCTAssertNil(m.pendingEnd)
+    }
+
+    /// An end refused for an unreadable journal is retried like any other
+    /// pending end: once the file is repaired, the retry restores with no
+    /// new request, and the journal notification is not repeated.
+    func testAnEndRefusedForAnUnreadableJournalIsRetriedOnceTheFileIsRepaired() async throws {
+        let m = h.makeManager(retryDelay: 0.3)
+        await m.start(duration: 3600)
+        try Data(#"{"sleepDisabledByUs": tru"#.utf8).write(to: h.home.paths.stateFile)
+
+        let outcome = await m.end(reason: .timer)
+        XCTAssertEqual(outcome, .journalUnreadable)
+        XCTAssertEqual(m.pendingEnd, .timer)
+        var repaired = RuntimeState()
+        repaired.sleepDisabledByUs = true
+        try h.store.saveState(repaired)
+
+        for _ in 0..<1000 where m.pendingEnd != nil {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertNil(m.pendingEnd, "the refused end was never retried")
+        XCTAssertFalse(m.isActive)
+        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1", "disablesleep 0"])
+        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
+        XCTAssertEqual(h.notifier.posts.filter { $0.title == SessionManager.journalTitle }.count, 1, "\(h.notifier.posts)")
+    }
+
+    /// The deadline end finds the journal unreadable and stays pending. A
+    /// person repairs the journal, and the agent restores and removes
+    /// session.json before the retry runs. The tick adopts the agent's end,
+    /// which settles the pending end and its retry, so the next start is
+    /// not refused.
+    func testAnAdoptedAgentEndSettlesAnEndPendingOnAnUnreadableJournal() async throws {
+        let m = h.makeManager(retryDelay: 3600)
+        await m.start(duration: 3600)
+        try Data(#"{"sleepDisabledByUs": tru"#.utf8).write(to: h.home.paths.stateFile)
+        let outcome = await m.end(reason: .timer)
+        XCTAssertEqual(outcome, .journalUnreadable)
+        XCTAssertEqual(m.pendingEnd, .timer)
+
+        try h.store.saveState(.clean)
+        try h.store.deleteSession()
+        h.guardFake.sleepDisabled = false
+        await m.noticeAgentEnd()
+
+        XCTAssertFalse(m.isActive)
+        XCTAssertNil(m.pendingEnd, "the adopted end left the earlier end pending")
+        await m.start(duration: 600)
+        XCTAssertTrue(m.isActive, m.lastError ?? "")
+        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1", "disablesleep 1"])
+    }
+
+    /// The same sequence, but the restore the adopted end runs fails and is
+    /// left to the armed agent. Nothing is left for this process to retry,
+    /// so that end settles the pending end too.
+    func testAnAdoptedEndLeftToTheAgentSettlesAnEndPendingOnAnUnreadableJournal() async throws {
+        let m = h.makeManager(retryDelay: 3600)
+        await m.start(duration: 3600)
+        try Data(#"{"sleepDisabledByUs": tru"#.utf8).write(to: h.home.paths.stateFile)
+        let outcome = await m.end(reason: .timer)
+        XCTAssertEqual(outcome, .journalUnreadable)
+
+        var dirty = RuntimeState()
+        dirty.sleepDisabledByUs = true
+        try h.store.saveState(dirty)
+        try h.store.deleteSession()
+        h.guardFake.throwOn = ["disablesleep 0"]
+        await m.noticeAgentEnd()
+
+        XCTAssertFalse(m.isActive)
+        XCTAssertEqual(try h.store.loadState()?.sleepDisabledByUs, true, "the failed restore stays journaled for the agent")
+        XCTAssertTrue(h.notifier.posts.last?.body.contains("The recovery agent retries every minute.") ?? false, "\(h.notifier.posts)")
+        XCTAssertNil(m.pendingEnd, "the adopted end left the earlier end pending")
     }
 }

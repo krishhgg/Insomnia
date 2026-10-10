@@ -42,17 +42,39 @@ Before the backstop's `lowpowermode 0`, when the journal has
 the app doubts that entry's readings in that boot even if the journal of
 the undo never lands. If that publish fails, the mode is left on and its
 entry kept for retry. Both scripts check the records' types and read the
-three keys from the file's text too (`record_text_problems`, the same in
-both), as the app's decoder reads it: keys of the top-level object only,
-with their `\u` escapes decoded, every value stepped over whole, so a
-string or nested value holds no record. Each number must be null or a
-JSON number that a Swift Float holds and that does not round to 0 from a
-nonzero value (plutil turns 1e-400 into 0.0). One of the keys found twice
-at the top level, a key with an escape JSON does not have, and a top
-level the reader cannot follow (JSON5 keys, comments, NUL bytes as in
-UTF-16) are refused. Any of
-these makes the journal malformed, so nothing is undone and uninstall
-removes nothing. `savedAudioOutputs` entries alone leave the
+whole file's text too (`record_text_problems`, the same in both), as the
+app's decoder reads it: every object and array at any depth, keys with
+their `\u` escapes decoded (a Kelvin sign read as K), strings stepped over
+whole, so a saved name holds no key. A key written twice counts by its
+first copy, as in the app's decoder. A number where the app reads a Float
+must not round to infinity, or to 0 from a nonzero value, compared as
+exact decimal digits rather than through plutil's Double; one where it
+reads an Int32 or Int64 must be a whole number the type holds as the app
+reads it (`5105.0`, `1e3`, `1e-400` as 0). Where plutil would read the
+file otherwise than the app (a later copy of a key, an escaped key, such a
+number, UTF-16 or UTF-32), the scripts read and edit a view of the journal
+as the app reads it, which drops what the app's own save drops. An escape
+JSON does not have, a value that is no JSON value and text the app's
+decoder refuses (JSON5 keys, comments) are refused. So are two forms the
+app loads but never writes, a NUL byte and `\u0000` in a string the app
+reads, and text the reader does not finish within 30 s (very many keys or
+a very long array). Any of these makes the journal malformed, so nothing
+is undone and uninstall removes nothing. Values are checked only where the
+app reads them: in a frozen process, `startedAtMicros` only after a
+`startedAt` that is there and not null, and `bootSession` only after both,
+as `FrozenProcess` decodes them. A `sessionCutoffs` the app reads as no
+record (not a string of the form it writes) is a record the app does not
+write (read as none), not a malformed journal. When the app's binary cannot
+answer for `config.json`, backstop.sh reads that file with the same reader
+in its config form, which also checks each value's type (`config_cutoffs`),
+and uses it only when the reader finds nothing it cannot settle: not a file
+over 8 MiB, one it does not finish within 30 s, or one on which Foundation
+stops the app. So a hand edit reaches the backstop on that path only in a
+form the reader reads as the app does. backstop.sh
+checks the journal so before it reads the cutoffs for a valid session or
+ends one: a journal that fails, or that `--agent-session-cutoffs` answers
+`rejected` for, stops the run with `session.json`, the journal and every
+undo entry kept. `savedAudioOutputs` entries alone leave the
 journal clean for the backstop (an entry can wait days for its device), but
 uninstall stops on them. A saved brightness flagged
 `displayRestoreRefused` or `keyboardRestoreRefused` (the app's private-call
@@ -86,11 +108,42 @@ known key of the wrong type is left untouched and the run exits 1.
 
 The app and the script serialize on one `flock(2)` lock,
 `.recovery.lock`, which is never unlinked so both lock the same inode
-(`RecoveryLock.swift`; `lockf` on fd 9 in the scripts). `uninstall.sh`
+(`RecoveryLock.swift`; `lockf` on fd 9 in the scripts). It may also hold a
+record of a session's end (`ended-session-v1 <base64>`), written in place
+through the held descriptor and never by replacing the file. Both writers
+cut the file back to bytes it shares with the start of the record, or to
+nothing, before they append the rest, so a stop partway never leaves the
+record's first bytes over old bytes that differ. That record cut short as
+a writer leaves it (its first bytes, or the whole record with the file's
+old bytes after it) counts as the end of the session whose bytes it starts
+with, and no writer empties it; other content that is no record ends
+nothing, and the app empties it before a resumed session goes on. A start
+settles the file before it writes session.json
+(`Store.settleLockForStart`): a stale record's first bytes would end the
+new session too. An unreadable lock file is never written over. Both sides
+read it three times, 0.1 s apart (`Store.lockReadAttempts`,
+`LOCK_READ_ATTEMPTS`), before it counts as unreadable, and then it counts
+as the end of the session in session.json: a rule for the safe side, not
+proof of an end, since content that is no record but keeps failing to read
+ends a live session. When insomnia.log holds that session's record, the log
+is named as where the end is recorded. When the lock file write fails too,
+the end is appended to
+`insomnia.log` as one line (`insomnia-ended-session-v1 <size> <base64>`,
+`LogEndRecord.swift`). Every writer of the log in this repo (the app's
+`OwnerOnly.appendToLog` and `LogEndRecord`, backstop.sh's `log` and
+`record_end_in_log`, the LaunchAgent program) holds flock(2) on the log
+from its look at the last byte until its write ends and puts a newline
+first when the log does not end in one, so no line of theirs joins a
+record; a process that appends without that lock still can. insomnia.log
+is rotated only under the recovery lock and the log's flock, with a record
+still in force copied forward. `uninstall.sh`
 takes the lock, runs the backstop with `--force` under it, and refuses to
-remove the recovery machinery while anything is still journaled. Battery
-and thermal floors run only while the app is alive; the backstop does not
-provide them.
+remove the recovery machinery while anything is still journaled. The Low
+Power Mode requests for battery and thermal run only while the app is
+alive. The ends do not: the backstop ends a valid session below the end
+floor on battery power, on a battery it cannot read and at critical
+thermal pressure, once a minute, as well as at its deadline and once the
+app is gone.
 
 ## Deliberate designs, do not flag
 
@@ -179,7 +232,7 @@ Flag a change that breaks one of these; do not flag the behavior itself.
   except that a backstop run gives `keptDisplayUnderLowPowerBoot` its own
   boot, in a journal it publishes before its `lowpowermode 0`, and leaves
   the mode on if it cannot. The records are read from the file's text as
-  well as through plutil (`record_text_problems`), at the top level only.
+  well as through plutil (`record_text_problems`), which reads every object.
   Legacy `frozenPids` are never signaled or cleared there, even when the
   pid is gone (spec section 8).
 - `ProcessControl.swift`, `LidActions.swift`, `backstop.sh`. Only pids
@@ -220,6 +273,9 @@ Flag a change that breaks one of these; do not flag the behavior itself.
   `insomnia.log`, a local file shared with `backstop.sh` so one file tells
   the whole story. That file may contain SSIDs, process metadata and tmux
   target names (SECURITY.md). The privacy rule applies to the unified log.
+  A line written without the recovery lock is never followed by a rotation
+  (`OwnerOnly.LogRotation.deferred`), so the file can pass 1 MiB until a
+  line is written under the lock: it may hold an end record.
 - `LidActions.swift`. Lid events do nothing when no session is active
   (spec section 3).
 - `simulate-lid.sh`, `LidSimulation.swift`. The trigger file is the same

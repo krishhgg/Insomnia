@@ -20,10 +20,12 @@ struct DurationInput: Equatable, Sendable {
             }
         }
 
-        /// Tooltip on the "?" badge.
-        var help: String {
+        /// Tooltip on the "?" badge. Days names the configured maximum
+        /// session (`Config.maxDuration`), not the pill's own 30-day entry
+        /// ceiling: that is the number a session is held to.
+        func help(maxDuration: TimeInterval) -> String {
             switch self {
-            case .days: return "Up to \(DurationInput.maxDays) days"
+            case .days: return "Up to \(exactLabel(for: maxDuration)) per session"
             case .hours: return "0\u{2013}\(DurationInput.maxHours)"
             case .minutes: return "0\u{2013}\(DurationInput.maxMinutes)"
             }

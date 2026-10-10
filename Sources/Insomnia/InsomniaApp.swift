@@ -22,6 +22,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let status: any StatusSource
     let secrets: any HotspotSecretStore
     let locationPermission: LocationPermission
+    /// Held from launch to exit (see AppAliveLock): backstop.sh ends a valid
+    /// session once it can take this lock, because the app is then gone. A
+    /// launch that cannot take it quits (LaunchGate).
+    let aliveLock: AppAliveLock
     let loginItem = LoginItem()
     private var statusItem: StatusItemController?
     private var settingsWindow: SettingsWindow?
@@ -30,6 +34,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     override init() {
         let manager = SessionManager.live()
         self.manager = manager
+        aliveLock = AppAliveLock(url: manager.paths.appAliveFile)
         secrets = KeychainHotspotSecretStore(keychain: KeychainStore()) {
             manager.config.hotspotSSID
         }
@@ -57,6 +62,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if LidSimulationBuild.isCompiledIn {
             Log.info(LidSimulationBuild.marker)
         }
+        let gate = LaunchGate(aliveLock: aliveLock, notifier: manager.notifier)
+        Task {
+            if await !gate.open(manager: manager, start: { self.start() }) {
+                NSApp.terminate(nil)
+            }
+        }
+    }
+
+    /// The rest of a launch, run only once this process holds the alive
+    /// lock, before reconcile.
+    private func start() {
         // The login item is tied to the bundle's signature, which install.sh
         // renews on every run: register again if the flag is on, macOS no
         // longer reports the item and the install changed; follow the user
@@ -84,7 +100,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem = StatusItemController(manager: manager, status: status) { [weak settings] in
             settings?.show()
         }
-        Task { await manager.reconcile() }
     }
 
     /// Quitting always ends the session (spec 1). Terminate is deferred until
@@ -98,7 +113,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// outlive a quit (the command holds it through its own descriptor),
     /// but the end the command holds up would not: the app is what retries
     /// it, and confirms an undo the command finishes, the moment it exits.
+    ///
+    /// A copy without the alive lock never reconciled or started anything,
+    /// and an end there would restore the journal of the copy that holds
+    /// the lock, ending that copy's session. It quits at once.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard aliveLock.isHeld else { return .terminateNow }
         guard !terminating else { return .terminateCancel }
         terminating = true
         Task {

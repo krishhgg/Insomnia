@@ -571,6 +571,21 @@ final class StoreTests: XCTestCase {
         XCTAssertTrue(fifo.isStillFIFO)
     }
 
+    /// The end record check runs on every 1 Hz tick while a record exists.
+    /// A session.json that is a FIFO is never opened by it, or by the write
+    /// of a record: neither counts as recorded.
+    func testEndRecordChecksDoNotOpenASessionFileThatIsAFIFO() throws {
+        try FileManager.default.createDirectory(at: home.paths.appSupport, withIntermediateDirectories: true)
+        try Data("{}".utf8).write(to: home.paths.endedSessionFile)
+        let fifo = try FIFOWatch(at: home.paths.sessionFile)
+        defer { fifo.stop() }
+
+        XCTAssertFalse(store.sessionEndIsRecorded())
+        XCTAssertFalse(store.recordSessionEnd())
+        XCTAssertFalse(fifo.readerSeen, "session.json was opened although it is a FIFO")
+        XCTAssertTrue(fifo.isStillFIFO)
+    }
+
     func testCorruptStateIsLeftInPlaceAndKeepsFailing() throws {
         try Data("{not json".utf8).write(to: home.paths.stateFile)
         for _ in 0..<2 {

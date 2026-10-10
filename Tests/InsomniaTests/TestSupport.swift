@@ -75,6 +75,17 @@ final class TempHome {
     }
 }
 
+/// Points INSOMNIA_HOME at `home` for a test that does not own a TempHome,
+/// and returns the closure that puts back the value it had before (the
+/// loader's `ProcessTestHome.root` if it somehow had none). Call it in a
+/// defer. Never unsetenv instead: `Log.append` and `SessionManager.live`
+/// would then resolve the real ~/Library for the rest of the process.
+func pointInsomniaHome(at home: URL) -> () -> Void {
+    let previous = ProcessTestHome.current ?? ProcessTestHome.root.path
+    setenv(Paths.environmentKey, home.path, 1)
+    return { setenv(Paths.environmentKey, previous, 1) }
+}
+
 /// Records every call; can be told to throw.
 final class FakeSleepGuard: SleepGuarding, @unchecked Sendable {
     private let lock = NSLock()
@@ -438,6 +449,9 @@ final class FakeAudioControl: AudioControlling, @unchecked Sendable {
     func set(_ uid: String, volume: Float, muted: Bool) {
         lock.withLock { _devices[uid]?.volume = volume; _devices[uid]?.muted = muted }
     }
+
+    /// Whether SessionManager has registered for device changes.
+    var watched: Bool { lock.withLock { _devicesChanged != nil } }
 
     /// Calls the handler SessionManager registered, as CoreAudio does when
     /// a device connects or disconnects.
@@ -854,6 +868,30 @@ struct Harness {
     }
 }
 
+/// Sets or clears the user immutable flag (chflags uchg) on a test file, so
+/// unlink and rename onto it fail with EPERM, as for a file a person locked.
+/// Tests clear it again before their temp home is removed.
+func setImmutable(_ url: URL, _ on: Bool) throws {
+    try FileManager.default.setAttributes([.immutable: on], ofItemAtPath: url.path)
+}
+
+/// Runs `body` with this process's file size limit at `bytes` and SIGXFSZ
+/// ignored, so a write past that offset stops there, as one cut short by a
+/// full disk does: the kernel writes the bytes below the limit and fails
+/// the rest with EFBIG. The limit holds for the whole process, so it is set
+/// around one write only.
+func withFileSizeLimit<T>(_ bytes: Int, _ body: () -> T) throws -> T {
+    var old = rlimit()
+    guard getrlimit(RLIMIT_FSIZE, &old) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EINVAL) }
+    var limited = old
+    limited.rlim_cur = rlim_t(bytes)
+    let handler = signal(SIGXFSZ, SIG_IGN)
+    defer { signal(SIGXFSZ, handler) }
+    guard setrlimit(RLIMIT_FSIZE, &limited) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EINVAL) }
+    defer { setrlimit(RLIMIT_FSIZE, &old) }
+    return body()
+}
+
 /// Runs `request` in a new main-actor task and returns that task once the
 /// request has been called and the task has let go of the main actor: at
 /// its first suspension, or because it finished. Lifecycle requests join
@@ -1009,21 +1047,68 @@ final class FIFOWatch: @unchecked Sendable {
     private func markSeen() { lock.lock(); seen = true; lock.unlock() }
 }
 
+/// The ACL entries one test gives (TestACL.denyNewFiles), so that its
+/// cleanup takes off exactly those. No ACL is read to find them, and a test
+/// that gives none makes no ACL call at all, in its body or its tearDown.
+final class OwnedACLs {
+    private var given: [URL] = []
+
+    /// TestACL.denyNewFiles, kept for removeGiven once chmod added it.
+    func denyNewFiles(in dir: URL) throws {
+        try TestACL.denyNewFiles(in: dir)
+        given.append(dir)
+    }
+
+    /// TestACL.removeAll on `dir`, which this test gave an entry.
+    func removeAll(_ dir: URL) throws {
+        try TestACL.removeAll(dir)
+        given.removeAll { $0 == dir }
+    }
+
+    /// Takes off the entries still given, for a tearDown; runs nothing
+    /// when there are none.
+    func removeGiven() {
+        for dir in given { try? TestACL.removeAll(dir) }
+        given = []
+    }
+}
+
 /// Access control lists for the tests that check Insomnia leaves them alone.
 enum TestACL {
     /// Gives `url` one entry letting its owner, the user running the tests,
     /// read it. On a 0200 file that entry is the only way to read it.
     static func grantOwnerRead(_ url: URL) throws {
+        try chmod(["+a", "user:\(owner) allow read", url.path])
+    }
+
+    /// Gives directory `dir` one entry that stops its owner creating files
+    /// in it, so the temp file of an atomic write fails as on a full disk.
+    /// A directory inside can still be renamed: that needs
+    /// add_subdirectory, which the entry leaves allowed.
+    static func denyNewFiles(in dir: URL) throws {
+        try chmod(["+a", "user:\(owner) deny add_file", dir.path])
+    }
+
+    /// Removes every ACL entry from `url`, which the caller gave one
+    /// (OwnedACLs keeps which): no ACL is read first.
+    static func removeAll(_ url: URL) throws {
+        try chmod(["-N", url.path])
+    }
+
+    private static var owner: String { String(cString: getpwuid(getuid()).pointee.pw_name) }
+
+    private static func chmod(_ arguments: [String]) throws {
         let chmod = Process()
         chmod.executableURL = URL(fileURLWithPath: "/bin/chmod")
-        chmod.arguments = ["+a", "user:\(String(cString: getpwuid(getuid()).pointee.pw_name)) allow read", url.path]
+        chmod.arguments = arguments
         let exit = ProcessExit(chmod)
         try chmod.run()
         exit.wait()
         guard chmod.terminationStatus == 0 else { throw POSIXError(.EPERM) }
     }
 
-    /// How many ACL entries `url` has, without following a symlink.
+    /// How many ACL entries `url` has, without following a symlink. Only
+    /// for a test that checks the entries it gave.
     static func entries(_ url: URL) -> Int {
         guard let acl = acl_get_link_np(url.path, ACL_TYPE_EXTENDED) else { return 0 }
         defer { acl_free(UnsafeMutableRawPointer(acl)) }
@@ -1035,5 +1120,31 @@ enum TestACL {
             which = ACL_NEXT_ENTRY.rawValue
         }
         return count
+    }
+}
+
+/// The Insomnia executable this build made, beside the test bundle. Tests
+/// that run backstop.sh hand it config.json through `--agent-cutoffs`, as
+/// the installed app binary is in production, so the agent's reading of the
+/// file is the app's decoder and not a test double.
+enum BuiltApp {
+    private final class Marker {}
+
+    static var binary: URL {
+        Bundle(for: Marker.self).bundleURL.deletingLastPathComponent().appendingPathComponent("Insomnia")
+    }
+
+    /// An app bundle's Info.plist declaring `InsomniaAgentCutoffsVersion`
+    /// as `agentCutoffsVersion`, or without that key when nil, and
+    /// `InsomniaResumeFrozenVersion` likewise.
+    static func infoPlist(resumeFrozenVersion: String? = nil, agentCutoffsVersion: String?) -> String {
+        let frozen = resumeFrozenVersion.map { "<key>InsomniaResumeFrozenVersion</key><integer>\($0)</integer>" } ?? ""
+        let cutoffs = agentCutoffsVersion.map { "<key>InsomniaAgentCutoffsVersion</key><integer>\($0)</integer>" } ?? ""
+        return """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0"><dict><key>CFBundleExecutable</key><string>Insomnia</string>\(frozen)\(cutoffs)</dict></plist>
+
+        """
     }
 }
