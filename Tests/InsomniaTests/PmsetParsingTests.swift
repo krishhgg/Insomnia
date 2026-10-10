@@ -102,4 +102,40 @@ final class PmsetParsingTests: XCTestCase {
         XCTAssertNil(PmsetSleepGuard.parseLowPowerMode("Battery Power:\n lowpowermode 2\n"))
         XCTAssertNil(PmsetSleepGuard.parseLowPowerMode("Battery Power:\n lowpowermode (unknown)\n"), "an unreadable value was taken as proof the mode is off")
     }
+
+    // `pmset -g custom` on macOS 27.0.1 (MacBook Pro, M5 Pro): no
+    // `lowpowermode` key, the mode is reported as `powermode`.
+    let custom27 = """
+    Battery Power:
+     lidwake              1
+     powermode            1
+     sleep                1
+    AC Power:
+     lidwake              1
+     powermode            0
+     sleep                1
+    """
+
+    func testLowPowerModeIsReadFromPowermodeWhenLowpowermodeIsAbsent() {
+        XCTAssertEqual(PmsetSleepGuard.parseLowPowerMode(custom27), true)
+        XCTAssertEqual(PmsetSleepGuard.parseLowPowerMode("Battery Power:\n powermode 0\n"), false)
+        XCTAssertNil(PmsetSleepGuard.parseLowPowerMode("AC Power:\n powermode 1\n"), "read the AC value instead of the battery value")
+        let swapped = custom27.replacingOccurrences(of: "powermode            1", with: "powermode            X")
+            .replacingOccurrences(of: "powermode            0", with: "powermode            1")
+            .replacingOccurrences(of: "powermode            X", with: "powermode            0")
+        XCTAssertEqual(PmsetSleepGuard.parseLowPowerMode(swapped), false, "read the AC value instead of the battery value")
+    }
+
+    /// High Power is a preference the user set: it must read as unknown, not
+    /// as "off", or the session end's `lowpowermode 0` would replace it.
+    func testHighPowerModeIsUnknownNotOff() {
+        XCTAssertNil(PmsetSleepGuard.parseLowPowerMode("Battery Power:\n powermode 2\n"))
+        XCTAssertNil(PmsetSleepGuard.parseLowPowerMode("Battery Power:\n powermode (unknown)\n"))
+    }
+
+    func testLowpowermodeWinsOverPowermode() {
+        XCTAssertEqual(PmsetSleepGuard.parseLowPowerMode("Battery Power:\n powermode 0\n lowpowermode 1\n"), true)
+        XCTAssertEqual(PmsetSleepGuard.parseLowPowerMode("Battery Power:\n lowpowermode 0\n powermode 1\n"), false)
+        XCTAssertNil(PmsetSleepGuard.parseLowPowerMode("Battery Power:\n lowpowermode 2\n powermode 1\n"), "an unreadable lowpowermode fell back to powermode")
+    }
 }
