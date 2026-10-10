@@ -171,54 +171,68 @@ final class SleepOffReceiptsTests: XCTestCase {
     }
 
     /// Each way a receipt or a folder above it can be something the checks
-    /// do not trust. A receipt that would otherwise show "never" shows
-    /// nothing (undecided before expires, may have written after), and a
-    /// start could not begin with it (identity throws), apart from content
-    /// that is wrong in an 82-byte file, which only the read under the lock
-    /// finds. A receipt nobody can read has a mode other than 600. Round
-    /// 28 F3: every refused list of entries (TestReceipts.refusedLists) is
-    /// a stand-in in front of the file's real entries, so none changes a
-    /// real list. Round 30 F6: so are the allow entries on the receipt and
-    /// on its folder (folderStandIn), which were real ones before.
-    func testAReceiptOrFolderTheChecksDoNotTrustShowsNothing() async throws {
+    /// do not trust, with what the checks say, whether a start could still
+    /// begin with it (only content that is wrong in an 82-byte file, which
+    /// only the read under the lock finds), and whether the file at the
+    /// path stays the one the start claimed. Round 28 F3: every refused
+    /// list of entries (TestReceipts.refusedLists) is a fixed list the
+    /// receipts read, so none changes a real list. Round 30 F6: so are the
+    /// allow entries on the receipt and on its folder. Round 36: so are
+    /// the lists that cannot be read, and no real list is read at all.
+    private func untrusted() -> [(name: String, startable: Bool, claimed: Bool, says: String, damage: () throws -> Void, repair: () throws -> Void)] {
         let write = AccessEntry(allows: true, principal: .user(getuid()), rights: ["write"], flags: [])
         let file = receipts.file
         let folder = receipts.folder
-        let cases: [(name: String, startable: Bool, says: String, damage: () throws -> Void, repair: () throws -> Void)] = [
-            ("missing", false, "No such file or directory", { XCTAssertEqual(unlink(file), 0) }, {}),
-            ("81 bytes", false, "is 81 bytes, not 82", { XCTAssertEqual(truncate(file, 81), 0) }, {}),
-            ("83 bytes", false, "is 83 bytes, not 82", { XCTAssertEqual(truncate(file, 83), 0) }, {}),
-            ("an earlier build's 45 bytes", false, "is 45 bytes, not 82", { try Data("\(self.nonce) refused\n".utf8).write(to: URL(fileURLWithPath: file)) }, {}),
-            ("group-writable", false, "can be changed by its group or by others", { XCTAssertEqual(chmod(file, 0o664), 0) }, {}),
-            ("writable by others", false, "can be changed by its group or by others", { XCTAssertEqual(chmod(file, 0o646), 0) }, {}),
-            ("a hard link", false, "has 2 links", { XCTAssertEqual(link(file, folder + "/link"), 0) }, { unlink(folder + "/link") }),
-            ("a symbolic link", false, "is not a regular file", {
+        return [
+            ("missing", false, false, "No such file or directory", { XCTAssertEqual(unlink(file), 0) }, {}),
+            ("81 bytes", false, true, "is 81 bytes, not 82", { XCTAssertEqual(truncate(file, 81), 0) }, {}),
+            ("83 bytes", false, true, "is 83 bytes, not 82", { XCTAssertEqual(truncate(file, 83), 0) }, {}),
+            ("an earlier build's 45 bytes", false, true, "is 45 bytes, not 82", { try Data("\(self.nonce) refused\n".utf8).write(to: URL(fileURLWithPath: file)) }, {}),
+            ("group-writable", false, true, "can be changed by its group or by others", { XCTAssertEqual(chmod(file, 0o664), 0) }, {}),
+            ("writable by others", false, true, "can be changed by its group or by others", { XCTAssertEqual(chmod(file, 0o646), 0) }, {}),
+            ("a hard link", false, true, "has 2 links", { XCTAssertEqual(link(file, folder + "/link"), 0) }, { unlink(folder + "/link") }),
+            ("a symbolic link", false, false, "is not a regular file", {
                 try Data(SleepOffReceipts.initialContent.utf8).write(to: URL(fileURLWithPath: folder + "/target"))
                 XCTAssertEqual(unlink(file), 0)
                 XCTAssertEqual(symlink(folder + "/target", file), 0)
             }, { unlink(folder + "/target") }),
-            ("a folder", false, "is not a regular file", { XCTAssertEqual(unlink(file), 0); XCTAssertEqual(mkdir(file, 0o755), 0) }, { rmdir(file) }),
-            ("an allow entry on the receipt", false, "has 2 access control entries, not the one that lets uid \(getuid()) read it",
-             { self.receipts = TestReceipts.with(self.receipts, standIn: [.installed(for: getuid()), write]) }, {}),
-            ("mode 644, as an earlier build made it", false, "has mode 644, not the 600 install.sh gives it", { XCTAssertEqual(chmod(file, 0o644), 0) }, {}),
-            ("mode 400", false, "has mode 400, not the 600 install.sh gives it", { XCTAssertEqual(chmod(file, 0o400), 0) }, {}),
-            ("a group-writable folder", false, "can be changed by its group or by others", { XCTAssertEqual(chmod(folder, 0o775), 0) }, { chmod(folder, 0o755) }),
-            ("an allow entry on the folder", false, "has an access control entry that allows changes", {
-                let r = self.receipts!
-                self.receipts = SleepOffReceipts(folder: r.folder, owners: r.owners, user: r.user, standIn: r.standIn, folderStandIn: [folder: [write]])
+            ("a folder", false, false, "is not a regular file", { XCTAssertEqual(unlink(file), 0); XCTAssertEqual(mkdir(file, 0o755), 0) }, { rmdir(file) }),
+            ("an allow entry on the receipt", false, true, "has 2 access control entries, not the one that lets uid \(getuid()) read it",
+             { self.receipts = TestReceipts.with(self.receipts, entries: [.installed(for: getuid()), write]) }, {}),
+            ("mode 644, as an earlier build made it", false, true, "has mode 644, not the 600 install.sh gives it", { XCTAssertEqual(chmod(file, 0o644), 0) }, {}),
+            ("mode 400", false, true, "has mode 400, not the 600 install.sh gives it", { XCTAssertEqual(chmod(file, 0o400), 0) }, {}),
+            ("a group-writable folder", false, true, "can be changed by its group or by others", { XCTAssertEqual(chmod(folder, 0o775), 0) }, { chmod(folder, 0o755) }),
+            ("an allow entry on the folder", false, true, "has an access control entry that allows changes", {
+                self.receipts = TestReceipts.with(self.receipts, folder: folder, list: .entries([write]))
             }, {}),
-            ("unreadable", false, "has mode 0, not the 600 install.sh gives it", { XCTAssertEqual(chmod(file, 0o000), 0) }, { chmod(file, 0o600) }),
-            ("a lower-case nonce", true, "does not hold two nonces and writing or refused", { TestReceipts.write(file, nonce: self.nonce.lowercased(), predecessor: self.predecessor, word: "refused") }, {}),
-            ("a lower-case predecessor", true, "does not hold two nonces and writing or refused", { TestReceipts.write(file, nonce: self.nonce, predecessor: self.predecessor.lowercased(), word: "refused") }, {}),
-            ("another word", true, "does not hold two nonces and writing or refused", { TestReceipts.write(file, nonce: self.nonce, predecessor: self.predecessor, word: "written") }, {}),
-            ("no newline", true, "does not hold two nonces and writing or refused", { TestReceipts.write(file, nonce: self.nonce, predecessor: self.predecessor, word: "refused\u{20}"); XCTAssertEqual(truncate(file, 82), 0) }, {}),
+            ("the receipt's list cannot be had", false, true, "the access control list of \(file) could not be read: Input/output error",
+             { self.receipts = TestReceipts.with(self.receipts, receipt: .unreadable(EIO)) }, {}),
+            ("an entry of the receipt's list cannot be read", false, true, "the access control list of \(file) could not be read whole",
+             { self.receipts = TestReceipts.with(self.receipts, receipt: .incomplete) }, {}),
+            ("the folder's list cannot be had", false, true, "the access control list of \(folder) could not be read: Permission denied",
+             { self.receipts = TestReceipts.with(self.receipts, folder: folder, list: .unreadable(EACCES)) }, {}),
+            ("an entry of the list of a folder above it cannot be read", false, true, "the access control list of / could not be read whole",
+             { self.receipts = TestReceipts.with(self.receipts, folder: "/", list: .incomplete) }, {}),
+            ("a lower-case nonce", true, true, "does not hold two nonces and writing or refused", { TestReceipts.write(file, nonce: self.nonce.lowercased(), predecessor: self.predecessor, word: "refused") }, {}),
+            ("a lower-case predecessor", true, true, "does not hold two nonces and writing or refused", { TestReceipts.write(file, nonce: self.nonce, predecessor: self.predecessor.lowercased(), word: "refused") }, {}),
+            ("another word", true, true, "does not hold two nonces and writing or refused", { TestReceipts.write(file, nonce: self.nonce, predecessor: self.predecessor, word: "written") }, {}),
+            ("no newline", true, true, "does not hold two nonces and writing or refused", { TestReceipts.write(file, nonce: self.nonce, predecessor: self.predecessor, word: "refused\u{20}"); XCTAssertEqual(truncate(file, 82), 0) }, {}),
         ] + TestReceipts.refusedLists.map { list in
             let says = list.entries.isEmpty ? "has no access control entry, so uid \(getuid()) cannot read it"
                 : list.entries.count > 1 ? "has \(list.entries.count) access control entries, not the one that lets uid \(getuid()) read it"
                 : "has an access control entry other than the one that lets uid \(getuid()) read it: \(list.entries[0].text)"
-            return (list.name, false, says, { self.receipts = TestReceipts.with(self.receipts, standIn: list.entries) }, {})
+            return (list.name, false, true, says, { self.receipts = TestReceipts.with(self.receipts, entries: list.entries) }, {})
         }
-        for c in cases {
+    }
+
+    /// A receipt or folder the checks do not trust shows nothing:
+    /// undecided before expires, may have written after, and a start could
+    /// not begin with it (identity throws), apart from content that is
+    /// wrong in an 82-byte file. Each is found under the lock (round 36),
+    /// with no command holding it.
+    func testAReceiptOrFolderTheChecksDoNotTrustShowsNothing() async throws {
+        let file = receipts.file
+        for c in untrusted() {
             receipts = try TestReceipts.make(in: home.root)
             TestReceipts.write(file, nonce: nonce, predecessor: predecessor, word: "refused")
             let identity = try receipts.identity()
@@ -244,6 +258,83 @@ final class SleepOffReceiptsTests: XCTestCase {
             try c.repair()
             unlink(file)
         }
+    }
+
+    /// R35-4 (round 36). Nothing about the file decides a start while
+    /// something holds its lock, as a root command for that start holds it
+    /// until its pmset exits: every untrusted receipt or folder above,
+    /// still the file the start claimed, is undecided at any time, even
+    /// with its dialog over, and says it stayed locked, not what the
+    /// checks would find. Once the lock is let go the same receipt shows
+    /// what it shows with no holder (the control). A receipt that is
+    /// gone from its path, or is another file there, cannot show a lock
+    /// held on the file the start claimed: those decide as before (only
+    /// root can remove or replace the real receipt, and every root party
+    /// does that under its lock).
+    func testAHeldLockDecidesNothingWhateverTheFileShows() async throws {
+        let file = receipts.file
+        for c in untrusted() {
+            receipts = try TestReceipts.make(in: home.root)
+            TestReceipts.write(file, nonce: nonce, predecessor: predecessor, word: "refused")
+            let identity = try receipts.identity()
+            let holder = open(file, O_RDONLY | O_CLOEXEC)
+            XCTAssertGreaterThanOrEqual(holder, 0, c.name)
+            XCTAssertEqual(flock(holder, LOCK_EX | LOCK_NB), 0, c.name)
+            try c.damage()
+
+            for (now, dialogOver) in [(expires - 1, false), (expires, false), (expires + 3600, true)] {
+                let v = await verdict(attempt(identity), now: now, dialogOver: dialogOver)
+                if c.claimed {
+                    let why = try XCTUnwrap(undecided(v), "\(c.name), \(now - expires) s from expires: \(v)")
+                    XCTAssertTrue(why.hasPrefix("\(file) stayed locked for 0 s"), "\(c.name): \(why)")
+                    XCTAssertFalse(why.contains(c.says), "\(c.name): nothing about the file is read while it is held: \(why)")
+                } else if now >= expires {
+                    let reason = try XCTUnwrap(mayHaveWritten(v), "\(c.name): \(v)")
+                    XCTAssertTrue(reason.contains(c.says), "\(c.name): \(reason)")
+                } else {
+                    XCTAssertNotNil(undecided(v), "\(c.name): \(v)")
+                }
+            }
+            XCTAssertEqual(close(holder), 0, c.name)
+            let late = await verdict(attempt(identity), now: expires)
+            let reason = try XCTUnwrap(mayHaveWritten(late), "\(c.name), the control once let go")
+            XCTAssertTrue(reason.contains(c.says), "\(c.name): \(reason)")
+
+            try c.repair()
+            unlink(file)
+        }
+    }
+
+    /// R35-4 (round 36). The file the start claimed, still at its path but
+    /// one this process cannot open (mode 000 here; a real receipt whose
+    /// entry is gone), cannot be locked, so nothing shows whether a command
+    /// holds it: undecided at any time. Another file at the path that
+    /// cannot be opened shows nothing about the start, as any other file
+    /// there: undone like an end once the start has expired.
+    func testAClaimedReceiptThatCannotBeOpenedDecidesNothing() async throws {
+        let file = receipts.file
+        TestReceipts.write(file, nonce: nonce, predecessor: predecessor, word: "refused")
+        let identity = try receipts.identity()
+        XCTAssertEqual(chmod(file, 0o000), 0)
+        defer { chmod(file, 0o600) }
+        XCTAssertThrowsError(try receipts.identity(), "a start cannot begin with it") { error in
+            XCTAssertTrue(error.localizedDescription.contains("has mode 0, not the 600 install.sh gives it"), error.localizedDescription)
+        }
+        for (now, dialogOver) in [(expires - 1, false), (expires, false), (expires + 3600, true)] {
+            let v = await verdict(attempt(identity), now: now, dialogOver: dialogOver)
+            let why = try XCTUnwrap(undecided(v), "\(now - expires) s from expires: \(v)")
+            XCTAssertEqual(why, "\(file) could not be opened to be locked: Permission denied; a command for that start may hold its lock")
+        }
+        XCTAssertEqual(chmod(file, 0o600), 0)
+        let copy = receipts.folder + "/copy"
+        try Data(line(nonce, "refused").utf8).write(to: URL(fileURLWithPath: copy))
+        XCTAssertEqual(chmod(copy, 0o000), 0)
+        XCTAssertEqual(rename(copy, file), 0)
+        let early = await verdict(attempt(identity), now: expires - 1)
+        let why = try XCTUnwrap(undecided(early))
+        XCTAssertTrue(why.hasPrefix("\(file) could not be opened to be locked: Permission denied; a command for that start could still write until "), why)
+        let late = await verdict(attempt(identity), now: expires)
+        XCTAssertEqual(mayHaveWritten(late), "\(file) could not be opened to be locked: Permission denied")
     }
 
     /// F3 (round 28). Only the one entry install.sh adds is the receipt's
@@ -350,9 +441,10 @@ final class SleepOffReceiptsTests: XCTestCase {
     /// and flags that it prints for files too). Nothing is changed. On a
     /// Mac where none of them has an entry it is skipped.
     func testTheReaderReadsWhatLsPrints() throws {
+        try SystemIntegration.require("real access control lists read")
         var seen = 0
         for path in [NSHomeDirectory(), "/private/var/db/fseventsd", "/private/var/db", "/usr/bin"] {
-            guard let entries = SleepOffReceipts.accessEntries(path) else {
+            guard case let .entries(entries) = SleepOffReceipts.accessList(path) else {
                 XCTFail("\(path): the list could not be read")
                 continue
             }
@@ -398,7 +490,7 @@ final class SleepOffReceiptsTests: XCTestCase {
         XCTAssertEqual(live.releaseFile, "/private/var/db/com.kgarg.insomnia/\(getuid()).released")
 
         let identity = try receipts.identity()
-        let shipped = SleepOffReceipts(folder: receipts.folder, owners: [0], user: getuid())
+        let shipped = SleepOffReceipts(folder: receipts.folder, owners: [0], user: getuid(), lists: receipts.lists)
         XCTAssertThrowsError(try shipped.identity()) { error in
             XCTAssertTrue(error.localizedDescription.contains("belongs to uid \(getuid()), not root"), error.localizedDescription)
         }
@@ -421,14 +513,14 @@ final class SleepOffReceiptsTests: XCTestCase {
         XCTAssertTrue(real.hasPrefix("/private/var/"), real)
         let viaVar = String(real.dropFirst("/private".count))
         for folder in ["receipts", base + "/./receipts", base + "/../" + (base as NSString).lastPathComponent + "/receipts", base + "//receipts", real + "/", "/"] {
-            XCTAssertThrowsError(try SleepOffReceipts(folder: folder, owners: [0, getuid()], user: getuid()).identity(), folder) { error in
+            XCTAssertThrowsError(try SleepOffReceipts(folder: folder, owners: [0, getuid()], user: getuid(), lists: .listed([.installed(for: getuid())])).identity(), folder) { error in
                 XCTAssertTrue(error.localizedDescription.hasSuffix("is not a plain absolute path"), "\(folder): \(error.localizedDescription)")
             }
         }
-        XCTAssertThrowsError(try SleepOffReceipts(folder: viaVar, owners: [0, getuid()], user: getuid(), standIn: [.installed(for: getuid())]).identity()) { error in
+        XCTAssertThrowsError(try SleepOffReceipts(folder: viaVar, owners: [0, getuid()], user: getuid(), lists: .listed([.installed(for: getuid())])).identity()) { error in
             XCTAssertEqual(error.localizedDescription, "/var is not a folder")
         }
-        XCTAssertNoThrow(try SleepOffReceipts(folder: real, owners: [0, getuid()], user: getuid(), standIn: [.installed(for: getuid())]).identity())
+        XCTAssertNoThrow(try SleepOffReceipts(folder: real, owners: [0, getuid()], user: getuid(), lists: .listed([.installed(for: getuid())])).identity())
     }
 
     /// The identity the journal keeps is what `stat -f '%d:%i'` prints,
@@ -2250,7 +2342,7 @@ final class SleepOffSettlementTests: XCTestCase {
     /// user owns (all a process running as the user could make) stops a
     /// start before anything is written or shown.
     func testAStartRefusesAReceiptTheUserOwnsUnderTheShippedTrust() async throws {
-        let m = h.makeManager(receipts: SleepOffReceipts(folder: h.receipts.folder, owners: [0], user: getuid()))
+        let m = h.makeManager(receipts: SleepOffReceipts(folder: h.receipts.folder, owners: [0], user: getuid(), lists: h.receipts.lists))
 
         await m.start(duration: 1800)
 

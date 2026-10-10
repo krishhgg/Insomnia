@@ -85,7 +85,7 @@ final class BackstopVersionTests: XCTestCase {
         try "#!/bin/bash\n# insomnia-backstop-version: 1\n".write(to: script, atomically: true, encoding: .utf8)
         XCTAssertThrowsError(try backstop.checkVoidsPrompts())
         try FileManager.default.removeItem(at: script)
-        try FileManager.default.copyItem(at: repoBackstop, to: script)
+        try TestFiles.copy(at: repoBackstop, to: script)
         XCTAssertNoThrow(try backstop.checkVoidsPrompts())
     }
 }

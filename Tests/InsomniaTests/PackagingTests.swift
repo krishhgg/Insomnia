@@ -125,7 +125,7 @@ final class PackagingTests: XCTestCase {
         let bundle = scratch.appendingPathComponent("\(name).app", isDirectory: true)
         try fm.createDirectory(at: bundle.appendingPathComponent("Contents/MacOS"), withIntermediateDirectories: true)
         try fm.createDirectory(at: bundle.appendingPathComponent("Contents/Resources"), withIntermediateDirectories: true)
-        try fm.copyItem(atPath: "/usr/bin/true", toPath: bundle.appendingPathComponent("Contents/MacOS/\(name)").path)
+        try TestFiles.copy(atPath: "/usr/bin/true", toPath: bundle.appendingPathComponent("Contents/MacOS/\(name)").path)
         let info: [String: Any] = [
             "CFBundleExecutable": name, "CFBundleIdentifier": "com.kgarg.insomnia.packaging-test",
             "CFBundlePackageType": "APPL", "CFBundleShortVersionString": "0.0.1",
@@ -175,6 +175,7 @@ final class PackagingTests: XCTestCase {
     /// install.sh through codesign; the plist only matches when both print
     /// the same text. Checked on Apple-signed code and on an ad-hoc bundle.
     func testDesignatedRequirementMatchesWhatCodesignPrints() throws {
+        try SystemIntegration.require("the real codesign and the Security framework")
         XCTAssertEqual(try CodeRequirement.designated(ofCodeAt: URL(fileURLWithPath: "/bin/ls")), try codesignDesignatedRequirement(of: "/bin/ls"))
         let bundle = try makeSignedBundle()
         let fromSecurity = try CodeRequirement.designated(ofCodeAt: bundle)
@@ -183,7 +184,8 @@ final class PackagingTests: XCTestCase {
         XCTAssertFalse(fromSecurity.contains("'"), "install.sh and the plist must hold it without quoting trouble")
     }
 
-    func testUnsignedCodeHasNoRequirementToPin() {
+    func testUnsignedCodeHasNoRequirementToPin() throws {
+        try SystemIntegration.require("the real codesign and the Security framework")
         let unsigned = scratch.appendingPathComponent("plain.sh")
         try? "#!/bin/bash\n".write(to: unsigned, atomically: true, encoding: .utf8)
         XCTAssertThrowsError(try CodeRequirement.designated(ofCodeAt: unsigned)) { error in
@@ -195,6 +197,7 @@ final class PackagingTests: XCTestCase {
     /// sealed backstop.sh; a bundle whose sealed script was edited, or one
     /// that is not the build the plist pins, runs nothing and logs why.
     func testAgentProgramRunsTheSealedBackstopOnlyWhileTheBundleSatisfiesItsRequirement() throws {
+        try SystemIntegration.require("the real codesign and the Security framework")
         let bundle = try makeSignedBundle()
         let requirement = try CodeRequirement.designated(ofCodeAt: bundle)
         let home = scratch.appendingPathComponent("home", isDirectory: true)
@@ -241,6 +244,7 @@ final class PackagingTests: XCTestCase {
     /// pinned to it refuses every run. pin() runs the agent's check as well
     /// and refuses the bundle, so arm() fails with the reason.
     func testPinRefusesABundleWhoseSealedScriptWasEditedAfterSigning() throws {
+        try SystemIntegration.require("the real codesign and the Security framework")
         let bundle = try makeSignedBundle()
         let requirement = try CodeRequirement.designated(ofCodeAt: bundle)
         // The test host is not an app bundle, so pin() takes the development
@@ -264,6 +268,7 @@ final class PackagingTests: XCTestCase {
     /// bundle ad hoc under the running app; the bundle then carries a new
     /// requirement, and pin() refuses it instead of publishing it.
     func testPinOfTheRunningAppRefusesABundleReSignedSinceLaunch() throws {
+        try SystemIntegration.require("the real codesign and the Security framework")
         let bundle = try makeSignedBundle()
         let launched = CodeRequirement.RunningCode(path: bundle, requirement: try CodeRequirement.designated(ofCodeAt: bundle))
         XCTAssertEqual(try CodeRequirement.pin(bundle: bundle, running: { launched }, mainBundle: bundle), launched.requirement)
@@ -293,6 +298,7 @@ final class PackagingTests: XCTestCase {
     /// the reported requirement) and the host is not an app bundle, so the
     /// default pin() in these tests reads bundles from disk.
     func testRunningCodeSatisfiesItsOwnRequirement() throws {
+        try SystemIntegration.require("the real codesign and the Security framework")
         let me = try CodeRequirement.running()
         XCTAssertTrue(FileManager.default.fileExists(atPath: me.path.path), me.path.path)
         XCTAssertFalse(me.requirement.isEmpty)
@@ -318,10 +324,10 @@ final class PackagingTests: XCTestCase {
             try fm.createDirectory(at: dir, withIntermediateDirectories: true)
         }
         for name in ["Info.plist", "AppIcon.icns"] {
-            try fm.copyItem(at: Self.repoRoot.appendingPathComponent("Resources/\(name)"), to: checkout.appendingPathComponent("Resources/\(name)"))
+            try TestFiles.copy(at: Self.repoRoot.appendingPathComponent("Resources/\(name)"), to: checkout.appendingPathComponent("Resources/\(name)"))
         }
-        try fm.copyItem(at: Self.repoRoot.appendingPathComponent("scripts/backstop.sh"), to: checkout.appendingPathComponent("scripts/backstop.sh"))
-        try fm.copyItem(atPath: "/usr/bin/true", toPath: binroot.appendingPathComponent("Insomnia").path)
+        try TestFiles.copy(at: Self.repoRoot.appendingPathComponent("scripts/backstop.sh"), to: checkout.appendingPathComponent("scripts/backstop.sh"))
+        try TestFiles.copy(atPath: "/usr/bin/true", toPath: binroot.appendingPathComponent("Insomnia").path)
 
         func fake(_ name: String, _ body: String) throws -> URL {
             let url = bin.appendingPathComponent(name)
@@ -366,6 +372,7 @@ final class PackagingTests: XCTestCase {
     /// resource seal covers the backstop, and whose designated requirement
     /// is the build's cdhash, the pin install.sh's agent uses.
     func testBuildAppAssemblesAndAdHocSignsABundleWhoseSealCoversTheBackstop() throws {
+        try SystemIntegration.require("the real codesign and the Security framework")
         let (script, _) = try patchedBuildApp(recordingCodesign: false)
         let out = scratch.appendingPathComponent("out", isDirectory: true)
 
@@ -390,6 +397,7 @@ final class PackagingTests: XCTestCase {
     }
 
     func testBuildAppReplacesABundleAlreadyInTheOutputDirectory() throws {
+        try SystemIntegration.require("the real codesign and the Security framework")
         let (script, _) = try patchedBuildApp(recordingCodesign: false)
         let out = scratch.appendingPathComponent("out", isDirectory: true)
         let stale = out.appendingPathComponent("Insomnia.app/Contents/Resources/stale.txt")

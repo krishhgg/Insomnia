@@ -678,7 +678,7 @@ final class RootCommandTests: XCTestCase {
         XCTAssertNotEqual(getuid(), 1)
         XCTAssertNotNil(getpwuid(1), "daemon")
         let other = "1"
-        let theirs = SleepOffReceipts(folder: receipts.folder, owners: receipts.owners, user: 1, standIn: [.installed(for: 1)])
+        let theirs = SleepOffReceipts(folder: receipts.folder, owners: receipts.owners, user: 1, lists: .listed([.installed(for: 1)]))
         try Data(SleepOffReceipts.initialContent.utf8).write(to: URL(fileURLWithPath: theirs.file))
         XCTAssertEqual(chmod(theirs.file, 0o600), 0)
         let r = try runRootCommand(marker: marker, nonce: nonce1, uid: other, receipts: theirs, in: dir)
@@ -1032,8 +1032,8 @@ final class RootCommandTests: XCTestCase {
                 try FileManager.default.removeItem(at: file)
                 try put(initial)
             }),
-            ("an allow entry on the receipt", { self.receipts = TestReceipts.with(self.receipts, standIn: [mine, write]) },
-             { self.receipts = TestReceipts.with(self.receipts, standIn: [mine]) }),
+            ("an allow entry on the receipt", { self.receipts = TestReceipts.with(self.receipts, entries: [mine, write]) },
+             { self.receipts = TestReceipts.with(self.receipts, entries: [mine]) }),
             ("a group-writable folder", { XCTAssertEqual(chmod(folder.path, 0o775), 0) }, { XCTAssertEqual(chmod(folder.path, 0o755), 0) }),
             ("an allow entry on the folder", { folderEntry(folder.path, "user:\(user) allow add_file") }, noFolderEntry),
             ("an allow entry on the folder above", { folderEntry(above, "user:\(user) allow add_subdirectory") }, noFolderEntry),
@@ -1072,16 +1072,16 @@ final class RootCommandTests: XCTestCase {
     /// F3 (round 28). A receipt with any mode but 600, or with any list of
     /// access control entries but the one install.sh adds, or whose list
     /// ls cannot read, stops the command the same way. The entries are
-    /// stand-ins the command's ls shows in front of the file's real ones,
-    /// which are none (RootCommandProcess.withTestReceipts): no real list
-    /// changes. `id -u` resolves the name for real. The control is the
+    /// the whole list the command's ls shows, which reads no real list
+    /// (RootCommandProcess.withTestReceipts): no real list is read or
+    /// changed. `id -u` resolves the name for real. The control is the
     /// entry install.sh adds.
     func testAReceiptWithAnotherModeOrListStopsBeforeAnyQuestion() throws {
         let says = "is missing, is not the 82-byte file install.sh made, mode 600 with one access control entry that lets uid \(uid) read it and nothing else, or someone other than root can change it or a folder above it. Run install.sh again; sleep was not turned off"
         let base: SleepOffReceipts = receipts
         let fails = base.folder + ".acl.fails"
         var cases: [(what: String, receipts: SleepOffReceipts, mode: mode_t, listFails: Bool)] = [0o644, 0o640, 0o400, 0o700].map { ("mode \(String($0, radix: 8))", base, $0, false) }
-        cases += TestReceipts.refusedLists.map { ($0.name, TestReceipts.with(base, standIn: $0.entries), 0o600, false) }
+        cases += TestReceipts.refusedLists.map { ($0.name, TestReceipts.with(base, entries: $0.entries), 0o600, false) }
         cases.append(("a list ls cannot read", base, 0o600, true))
         for c in cases {
             for (name, command) in try bothCommands() {

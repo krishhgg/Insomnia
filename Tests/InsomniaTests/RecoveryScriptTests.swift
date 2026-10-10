@@ -1786,7 +1786,7 @@ final class RecoveryScriptTests: XCTestCase {
             fx.clearCalls()
             let nonce = try journalUnfinishedStart()
             try c.damage()
-            let modes = (try? fx.runTool("/bin/ls", ["-lde", fx.receipts, fx.receipt]).output) ?? ""
+            let modes = TestFiles.metadata([fx.receipts, fx.receipt]) + ((try? String(contentsOfFile: fx.receiptEntries, encoding: .utf8)) ?? "")
 
             for run in 1...2 {
                 removeIfPresent(fx.logFile)
@@ -1798,7 +1798,7 @@ final class RecoveryScriptTests: XCTestCase {
                 } else {
                     try assertKept(r, nonce: nonce, restored: true, saying: [c.says, "an unfinished start could not be settled: "])
                 }
-                XCTAssertEqual((try? fx.runTool("/bin/ls", ["-lde", fx.receipts, fx.receipt]).output) ?? "", modes, "\(c.name), run \(run): the run changes nothing about the receipt or its folder")
+                XCTAssertEqual(TestFiles.metadata([fx.receipts, fx.receipt]) + ((try? String(contentsOfFile: fx.receiptEntries, encoding: .utf8)) ?? ""), modes, "\(c.name), run \(run): the run changes nothing about the receipt, its list or its folder")
             }
             try c.repair()
             if c.name == "missing" || c.name == "83 bytes" { unlinkIfPresent(fx.receipt) }
@@ -1826,12 +1826,12 @@ final class RecoveryScriptTests: XCTestCase {
             XCTAssertEqual(chmod(fx.receipt, c.mode), 0, c.name)
             try fx.writeReceiptEntries(c.entries)
             if c.listFails { XCTAssertTrue(FileManager.default.createFile(atPath: fails, contents: nil)) }
-            let before = [(try? fx.runTool("/bin/ls", ["-lde", fx.receipts, fx.receipt]).output) ?? "", fx.receiptText() ?? "", (try? String(contentsOfFile: fx.receiptEntries, encoding: .utf8)) ?? ""]
+            let before = [TestFiles.metadata([fx.receipts, fx.receipt]), fx.receiptText() ?? "", (try? String(contentsOfFile: fx.receiptEntries, encoding: .utf8)) ?? ""]
 
             let r = try fx.run(fx.backstop)
 
             try assertKept(r, nonce: nonce, restored: true, saying: [c.says, "an unfinished start could not be settled: "])
-            let after = [(try? fx.runTool("/bin/ls", ["-lde", fx.receipts, fx.receipt]).output) ?? "", fx.receiptText() ?? "", (try? String(contentsOfFile: fx.receiptEntries, encoding: .utf8)) ?? ""]
+            let after = [TestFiles.metadata([fx.receipts, fx.receipt]), fx.receiptText() ?? "", (try? String(contentsOfFile: fx.receiptEntries, encoding: .utf8)) ?? ""]
             XCTAssertEqual(after, before, "\(c.name): the run changes nothing about the receipt, its list or its folder")
             unlinkIfPresent(fails)
             XCTAssertEqual(chmod(fx.receipt, 0o600), 0)
@@ -3450,9 +3450,12 @@ final class RecoveryScriptTests: XCTestCase {
             }, { unlinkIfPresent(self.fx.receipts) }),
         ]
         // The folder itself (a link at it as the link) and, through it,
-        // everything in it, with modes, owners, links and ACLs.
+        // everything in it, with modes, owners, links and identities, and
+        // the receipt's list as the fixture's ls shows it. No real list is
+        // read (round 36).
         func receiptListing() throws -> String {
-            try fx.runTool("/bin/ls", ["-lde", fx.receipts]).output + fx.runTool("/bin/ls", ["-leAR", fx.receipts + "/"]).output
+            TestFiles.metadata([fx.receipts]) + "\n" + TestFiles.metadata([fx.receipts + "/"], recursive: true)
+                + "\n" + ((try? String(contentsOfFile: fx.receiptEntries, encoding: .utf8)) ?? "")
         }
         for c in cases {
             removeIfPresent(atPath: fx.receipts)
@@ -5360,7 +5363,7 @@ final class RecoveryScriptTests: XCTestCase {
         let shared = fx.root.appendingPathComponent("shared-tmp", isDirectory: true)
         let unpacked = shared.appendingPathComponent("Insomnia-0.1.0-macos", isDirectory: true)
         try FileManager.default.createDirectory(at: unpacked, withIntermediateDirectories: true)
-        try FileManager.default.copyItem(at: fx.uninstall, to: unpacked.appendingPathComponent("uninstall.sh"))
+        try TestFiles.copy(at: fx.uninstall, to: unpacked.appendingPathComponent("uninstall.sh"))
         try fx.writeMarkerBackstop(at: shared.appendingPathComponent("scripts/backstop.sh"), name: "planted")
 
         let r = try fx.run(unpacked.appendingPathComponent("uninstall.sh"))
@@ -5391,7 +5394,7 @@ final class RecoveryScriptTests: XCTestCase {
             try fx.writeMarkerBackstop(at: fx.installedBackstop, name: "sealed")
             let unpacked = fx.root.appendingPathComponent(folder, isDirectory: true)
             try FileManager.default.createDirectory(at: unpacked, withIntermediateDirectories: true)
-            try FileManager.default.copyItem(at: fx.uninstall, to: unpacked.appendingPathComponent("uninstall.sh"))
+            try TestFiles.copy(at: fx.uninstall, to: unpacked.appendingPathComponent("uninstall.sh"))
             let planted = unpacked.appendingPathComponent("backstop.sh")
             try fx.writeMarkerBackstop(at: planted, name: "planted")
 
@@ -5421,7 +5424,7 @@ final class RecoveryScriptTests: XCTestCase {
         try fx.writeMarkerBackstop(at: fx.legacyBackstop, name: "legacy")
         let unpacked = fx.root.appendingPathComponent("shared-tmp/Insomnia-0.1.0-macos", isDirectory: true)
         try FileManager.default.createDirectory(at: unpacked, withIntermediateDirectories: true)
-        try FileManager.default.copyItem(at: fx.uninstall, to: unpacked.appendingPathComponent("uninstall.sh"))
+        try TestFiles.copy(at: fx.uninstall, to: unpacked.appendingPathComponent("uninstall.sh"))
         try fx.writeMarkerBackstop(at: unpacked.appendingPathComponent("backstop.sh"), name: "planted")
 
         let r = try fx.run(unpacked.appendingPathComponent("uninstall.sh"), ["--purge"])
@@ -7085,6 +7088,7 @@ final class RecoveryScriptTests: XCTestCase {
     // The journal is kept for the next run, so the exit status is not
     // checked here.
     func testBackstopKeepsAnOwnerACLAndStillUndoesTheJournal() throws {
+        try SystemIntegration.require("a real access control list changed")
         try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
         XCTAssertEqual(chmod(fx.state.path, 0o200), 0)
         try TestACL.grantOwnerRead(fx.state)
@@ -7094,7 +7098,7 @@ final class RecoveryScriptTests: XCTestCase {
 
         XCTAssertEqual(fx.calls(), ["sudo -n \(fx.fakePmset) -a disablesleep 0"], fx.log())
         XCTAssertFalse(fx.log().contains("unreadable or malformed"), fx.log())
-        XCTAssertEqual(TestACL.entries(fx.state), 1)
+        XCTAssertEqual(try TestACL.entries(fx.state), 1)
     }
 
     func testBackstopLogsAFailedTighteningAndStillRecovers() throws {
@@ -8573,7 +8577,7 @@ final class RecoveryScriptTests: XCTestCase {
         let binary = bundle.appendingPathComponent("Contents/MacOS/Insomnia")
         try fm.createDirectory(at: script.deletingLastPathComponent(), withIntermediateDirectories: true)
         try fm.createDirectory(at: binary.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try fm.copyItem(at: fx.backstop, to: script)
+        try TestFiles.copy(at: fx.backstop, to: script)
         try "#!/bin/bash\nprintf 'OWN-BINARY %s\\n' \"$0\" >> '\(fx.callsLog.path)'\nexec '\(fx.fakeInsomnia.path)' \"$@\"\n"
             .write(to: binary, atomically: true, encoding: .utf8)
         try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: binary.path)
@@ -8629,7 +8633,7 @@ final class RecoveryScriptTests: XCTestCase {
         let misplaced = fx.root.appendingPathComponent("odd/Insomnia.app/Contents/backstop.sh")
         for copy in [loose, misplaced] {
             try fm.createDirectory(at: copy.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try fm.copyItem(at: fx.backstop, to: copy)
+            try TestFiles.copy(at: fx.backstop, to: copy)
         }
         let bundled = try writeOwnBundle(at: fx.root.appendingPathComponent("rel/Insomnia.app"), version: "1")
         let runs: [(label: String, run: () throws -> (status: Int32, output: String))] = [
@@ -9376,7 +9380,7 @@ final class RecoveryScriptTests: XCTestCase {
         try fx.writeAgentPlist()
         try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
         let checkout = fx.root.appendingPathComponent(#"My "src" $HOME"#, isDirectory: true)
-        try FileManager.default.copyItem(at: fx.repoScripts.deletingLastPathComponent(), to: checkout)
+        try TestFiles.copy(at: fx.repoScripts.deletingLastPathComponent(), to: checkout)
         let install = checkout.appendingPathComponent("scripts/install.redirected.sh")
         fx.setMode("sudo", "fail")          // recovery stops the first run
         fx.setMode("launchctl", "loaded")
@@ -9768,7 +9772,7 @@ final class RecoveryScriptTests: XCTestCase {
         fx.setMode("launchctl", "loaded")
         let unpacked = fx.repoScripts.deletingLastPathComponent().appendingPathComponent("Insomnia-0.1.0-macos", isDirectory: true)
         try FileManager.default.createDirectory(at: unpacked, withIntermediateDirectories: true)
-        try FileManager.default.copyItem(at: fx.installRedirected, to: unpacked.appendingPathComponent("install.sh"))
+        try TestFiles.copy(at: fx.installRedirected, to: unpacked.appendingPathComponent("install.sh"))
         try "# the zip's uninstaller\n".write(to: unpacked.appendingPathComponent("uninstall.sh"), atomically: true, encoding: .utf8)
         XCTAssertTrue(fx.exists(fx.repoScripts.appendingPathComponent("uninstall.sh")), "the checkout around it has one too")
 
@@ -9787,7 +9791,7 @@ final class RecoveryScriptTests: XCTestCase {
         let shared = fx.root.appendingPathComponent("shared-tmp", isDirectory: true)
         let unpacked = shared.appendingPathComponent("Insomnia-0.1.0-macos", isDirectory: true)
         try FileManager.default.createDirectory(at: unpacked, withIntermediateDirectories: true)
-        try FileManager.default.copyItem(at: fx.installRedirected, to: unpacked.appendingPathComponent("install.sh"))
+        try TestFiles.copy(at: fx.installRedirected, to: unpacked.appendingPathComponent("install.sh"))
         let planted = shared.appendingPathComponent("scripts/build-app.sh")
         try FileManager.default.createDirectory(at: planted.deletingLastPathComponent(), withIntermediateDirectories: true)
         try "#!/bin/bash\nprintf 'planted build-app.sh %s\\n' \"$*\" >> \"\(fx.callsLog.path)\"\nexit 1\n"
@@ -9818,7 +9822,7 @@ final class RecoveryScriptTests: XCTestCase {
             fx.clearCalls()
             let unpacked = fx.root.appendingPathComponent(folder, isDirectory: true)
             try FileManager.default.createDirectory(at: unpacked, withIntermediateDirectories: true)
-            try FileManager.default.copyItem(at: fx.installRedirected, to: unpacked.appendingPathComponent("install.sh"))
+            try TestFiles.copy(at: fx.installRedirected, to: unpacked.appendingPathComponent("install.sh"))
             let planted = unpacked.appendingPathComponent("build-app.sh")
             try "#!/bin/bash\nprintf 'planted build-app.sh %s\\n' \"$*\" >> \"\(fx.callsLog.path)\"\nexit 0\n"
                 .write(to: planted, atomically: true, encoding: .utf8)
@@ -9909,8 +9913,9 @@ final class RecoveryScriptTests: XCTestCase {
     /// sealed script is edited the same bundle is refused before sudo with
     /// codesign's reason.
     func testInstallFromAnAdHocSignedPrebuiltAppVerifiesTheRealSignatureAndItsDittoCopy() throws {
+        try SystemIntegration.require("the real codesign, ditto and the Security framework")
         try fx.prepareInstall()
-        try fx.writeInstallCopies(extraConstants: ["CODESIGN": "/usr/bin/codesign"])
+        try fx.writeInstallCopies(extraConstants: ["CODESIGN": "/usr/bin/codesign", "DITTO": "/usr/bin/ditto"])
         let prebuilt = try fx.writePrebuiltApp(machO: true)
         let sign = try fx.runTool("/usr/bin/codesign", ["--force", "--sign", "-", prebuilt.path])
         XCTAssertEqual(sign.status, 0, sign.output)
@@ -9947,10 +9952,11 @@ final class RecoveryScriptTests: XCTestCase {
     /// the installed copy loses both, keeps the quarantine flag and still
     /// passes the real codesign and the requirement the agent pins.
     func testInstallFromAPrebuiltAppDropsOtherAccountsWriteAccessButKeepsTheSignatureAndQuarantine() throws {
+        try SystemIntegration.require("real access control lists changed and read, the quarantine flag, the real codesign, ditto and the Security framework")
         try fx.prepareInstall()
         // install.sh's chmod -R -N runs for real here (see writeFakes).
         XCTAssertTrue(FileManager.default.createFile(atPath: fx.root.appendingPathComponent("chmod.real-acl").path, contents: nil))
-        try fx.writeInstallCopies(extraConstants: ["CODESIGN": "/usr/bin/codesign"])
+        try fx.writeInstallCopies(extraConstants: ["CODESIGN": "/usr/bin/codesign", "DITTO": "/usr/bin/ditto"])
         let prebuilt = try fx.writePrebuiltApp(machO: true)
         let sign = try fx.runTool("/usr/bin/codesign", ["--force", "--sign", "-", prebuilt.path])
         XCTAssertEqual(sign.status, 0, sign.output)
@@ -12160,8 +12166,8 @@ private final class ScriptFixture {
         if !fm.fileExists(atPath: released) { try writeRelease(SleepOffReceipts.initialRelease) }
     }
 
-    /// The stand-in access control entries of the receipt, which the
-    /// scripts' LS shows in front of its real ones (writeFakes).
+    /// The receipt's access control entries, the whole list the scripts'
+    /// LS shows for it; LS reads no real list (writeFakes).
     var receiptEntries: String { root.path + "/receipt.acl" }
 
     /// Puts `list` in receiptEntries.
@@ -12169,8 +12175,8 @@ private final class ScriptFixture {
         try TestReceipts.writeEntries(list, to: receiptEntries)
     }
 
-    /// The stand-in entries the scripts' LS shows for folders, in front of
-    /// their real ones, while this file exists (TestReceipts.writeFakeLs).
+    /// The entries the scripts' LS shows for folders, by path; a folder it
+    /// does not name has none (TestReceipts.writeFakeLs).
     var folderEntries: String { receiptEntries + ".folders" }
 
     /// Puts `lines` (by folder, each as ls prints it) in folderEntries.
@@ -12178,10 +12184,11 @@ private final class ScriptFixture {
         try TestReceipts.writeFolderEntries(lines, besides: receiptEntries)
     }
 
-    /// The receipt's checks in Swift, with the entry install.sh adds as
-    /// their stand-in, as writeReceipt puts it in receiptEntries.
+    /// The receipt's checks in Swift, reading the entry install.sh adds as
+    /// the receipt's list, as writeReceipt puts it in receiptEntries, and
+    /// no real list.
     var swiftReceipts: SleepOffReceipts {
-        SleepOffReceipts(folder: receipts, owners: [0, getuid()], user: getuid(), standIn: [.installed(for: getuid())])
+        SleepOffReceipts(folder: receipts, owners: [0, getuid()], user: getuid(), lists: .listed([.installed(for: getuid())]))
     }
 
     /// The release file with `text`, the test user's, 0600: written over in
@@ -12321,6 +12328,7 @@ private final class ScriptFixture {
             "MKTEMP": bin.appendingPathComponent("mktemp").path,
             "MKDIR": bin.appendingPathComponent("mkdir").path,
             "CHMOD": bin.appendingPathComponent("chmod").path,
+            "DITTO": bin.appendingPathComponent("ditto").path,
             "CAT": bin.appendingPathComponent("cat").path,
             "HEAD": bin.appendingPathComponent("head").path,
             "LS": bin.appendingPathComponent("ls").path,
@@ -12359,12 +12367,12 @@ private final class ScriptFixture {
         </dict></plist>
         """.write(to: app.appendingPathComponent("Contents/Info.plist"), atomically: true, encoding: .utf8)
         if machO {
-            try fm.copyItem(atPath: "/usr/bin/true", toPath: app.appendingPathComponent("Contents/MacOS/Insomnia").path)
+            try TestFiles.copy(atPath: "/usr/bin/true", toPath: app.appendingPathComponent("Contents/MacOS/Insomnia").path)
         } else {
             try "prebuilt".write(to: app.appendingPathComponent("Contents/MacOS/Insomnia"), atomically: true, encoding: .utf8)
         }
         if withBackstop {
-            try fm.copyItem(at: backstop, to: app.appendingPathComponent("Contents/Resources/backstop.sh"))
+            try TestFiles.copy(at: backstop, to: app.appendingPathComponent("Contents/Resources/backstop.sh"))
         }
         return app
     }
@@ -12870,11 +12878,30 @@ private final class ScriptFixture {
         done
         exec /bin/chmod "$@"
         """)
+        // ditto: install.sh's DITTO, for a destination that does not exist
+        // yet, as install.sh calls it: the data, links, extended attributes
+        // and modes, through cp -R and chmod with each source path's mode.
+        // cp without -p reads and copies no access control list (file_cmds
+        // cp: COPYFILE_ACL and preserve_dir_acls only under pflag), where
+        // ditto copies them (round 36: no real list is read). Each call is
+        // recorded in ditto.calls, apart from calls.log; any other call
+        // fails. The tests of the real signature pass /usr/bin/ditto.
+        try writeFake("ditto", """
+        set -o pipefail
+        printf 'ditto %s\\n' "$*" >> "\(r)/ditto.calls"
+        if [[ $# != 2 || ! -d "$1" || -L "$1" || -e "$2" || -L "$2" ]]; then echo "ditto: this stand-in does not answer: $*" >&2; exit 64; fi
+        src="$1"; dst="$2"
+        /bin/cp -R "$src" "$dst" || exit 1
+        (cd "$src" && /usr/bin/find . ! -type l -print0) | while IFS= read -r -d '' p; do
+          /bin/chmod "$(/usr/bin/stat -f '%Mp%Lp' "$src/$p")" "$dst/$p" || exit 1
+        done
+        """)
         // ls: the scripts' LS. `ls -le <receipt>` shows receiptEntries'
-        // lines as the receipt's first entries (TestReceipts.writeFakeLs),
-        // since a test cannot give its receipt the entry install.sh adds
-        // without changing a real access control list. Any other call is
-        // /bin/ls.
+        // lines as the receipt's entries, and a folder's come from
+        // folderEntries (TestReceipts.writeFakeLs), since a test cannot
+        // give its receipt the entry install.sh adds without changing a
+        // real access control list, and reads none. It never runs ls(1);
+        // any other call fails and is recorded.
         try FakeTool.write(TestReceipts.fakeLsScript(receipt: receipt, entries: receiptEntries), at: bin.appendingPathComponent("ls").path)
         // Insomnia --resume-frozen: reads its entries from standard input,
         // one "<pid> <startedAt> <micros> <boot>" line each, and records the
@@ -13514,7 +13541,7 @@ private final class ScriptFixture {
         try "log\n".write(to: logFile, atomically: true, encoding: .utf8)
         try "{}".write(to: config, atomically: true, encoding: .utf8)
         try fm.createDirectory(at: installedBackstop.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try fm.copyItem(at: backstop, to: installedBackstop)
+        try TestFiles.copy(at: backstop, to: installedBackstop)
     }
 
     /// Points `script`'s LOCKF at a wrapper around the real lockf. Once it

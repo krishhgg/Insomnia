@@ -190,6 +190,7 @@ final class ReconcileTests: XCTestCase {
     // read it. Tightening leaves the entry, so recovery still reads the
     // journal and turns sleep back on.
     func testJournalReadableOnlyThroughAnOwnerACLIsStillRestored() async throws {
+        try SystemIntegration.require("a real access control list changed")
         var st = RuntimeState()
         st.sleepDisabledByUs = true
         try h.store.saveState(st)

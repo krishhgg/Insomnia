@@ -83,11 +83,21 @@ final class TempHome {
 /// them. The test user owns all three, so the receipts trust that uid
 /// besides root; `SleepOffReceipts.live` trusts root alone. A test cannot
 /// give its receipt the access control entry install.sh adds without
-/// changing a real list, so the receipts read
-/// `AccessEntry.installed(for:)` as a stand-in in front of the file's real
-/// entries, which are none. `parent` is set to 0755 too, whatever the
-/// umask: it is the test's own directory. Files already there are kept, so
-/// two Insomnia folders of one test can share them.
+/// changing a real list, and reads no real list either, so the receipts
+/// read their lists from `AccessLists.listed`: the receipt's is
+/// `AccessEntry.installed(for:)` alone and each folder's is empty.
+/// `parent` is set to 0755 too, whatever the umask: it is the test's own
+/// directory. Files already there are kept, so two Insomnia folders of one
+/// test can share them.
+extension AccessLists {
+    /// Fixed lists, with no real list read: `receipt` as the receipt's
+    /// entries, and `folders` as the folders' by path (a folder not named
+    /// has none).
+    static func listed(_ receipt: [AccessEntry], folders: [String: [AccessEntry]] = [:]) -> AccessLists {
+        .fixed(receipt: .entries(receipt), folders: folders.mapValues(AccessList.entries))
+    }
+}
+
 enum TestReceipts {
     static func make(in parent: URL) throws -> SleepOffReceipts {
         guard let resolved = realpath(parent.path, nil) else { throw POSIXError(.ENOENT) }
@@ -97,7 +107,7 @@ enum TestReceipts {
         let folder = real + "/receipts"
         if mkdir(folder, 0o755) != 0 { XCTAssertEqual(errno, EEXIST) }
         XCTAssertEqual(chmod(folder, 0o755), 0)
-        let receipts = SleepOffReceipts(folder: folder, owners: [0, getuid()], user: getuid(), standIn: [.installed(for: getuid())])
+        let receipts = SleepOffReceipts(folder: folder, owners: [0, getuid()], user: getuid(), lists: .listed([.installed(for: getuid())]))
         if !FileManager.default.fileExists(atPath: receipts.file) {
             try Data(SleepOffReceipts.initialContent.utf8).write(to: URL(fileURLWithPath: receipts.file))
             try? FileManager.default.removeItem(atPath: receipts.releaseFile)
@@ -110,10 +120,41 @@ enum TestReceipts {
         return receipts
     }
 
-    /// `receipts` with `standIn` read in front of the receipt's real
-    /// entries.
-    static func with(_ receipts: SleepOffReceipts, standIn: [AccessEntry]?) -> SleepOffReceipts {
-        SleepOffReceipts(folder: receipts.folder, owners: receipts.owners, user: receipts.user, standIn: standIn, folderStandIn: receipts.folderStandIn)
+    /// `receipts` reading `entries` as the receipt's list, and the folders'
+    /// lists they read already.
+    static func with(_ receipts: SleepOffReceipts, entries: [AccessEntry]) -> SleepOffReceipts {
+        with(receipts, receipt: .entries(entries))
+    }
+
+    /// `receipts` reading `list` as the receipt's list, and the folders'
+    /// lists they read already.
+    static func with(_ receipts: SleepOffReceipts, receipt list: AccessList) -> SleepOffReceipts {
+        guard case let .fixed(_, folders) = receipts.lists else {
+            XCTFail("a test's receipts read no real list")
+            return receipts
+        }
+        return SleepOffReceipts(folder: receipts.folder, owners: receipts.owners, user: receipts.user, lists: .fixed(receipt: list, folders: folders))
+    }
+
+    /// `receipts` reading `list` as `folder`'s list, and the other lists
+    /// they read already.
+    static func with(_ receipts: SleepOffReceipts, folder: String, list: AccessList) -> SleepOffReceipts {
+        guard case let .fixed(file, folders) = receipts.lists else {
+            XCTFail("a test's receipts read no real list")
+            return receipts
+        }
+        return SleepOffReceipts(folder: receipts.folder, owners: receipts.owners, user: receipts.user,
+                                lists: .fixed(receipt: file, folders: folders.merging([folder: list]) { $1 }))
+    }
+
+    /// The receipt's entries `receipts` read; a test's receipts read a
+    /// fixed list.
+    static func entries(_ receipts: SleepOffReceipts) -> [AccessEntry] {
+        guard case let .fixed(.entries(entries), _) = receipts.lists else {
+            XCTFail("the receipt's list is not a fixed list of entries")
+            return []
+        }
+        return entries
     }
 
     /// The rights ls(1) prints for a file's entry, in its order. It never
@@ -142,15 +183,19 @@ enum TestReceipts {
     }
 
     /// Writes an ls(1) at `tool` that stands in for the scripts' and the
-    /// root command's: `ls -le <receipt>` prints the real `/bin/ls -le` of
-    /// `receipt` with the lines of `entries` (lsText, one per line) as its
-    /// first entries, numbered as ls numbers them, and the file's real
-    /// entries after them, renumbered. While `entries` + ".fails" exists,
-    /// that call fails as an ls that cannot read the list would. While
-    /// `entries` + ".folders" exists (lines of a path, a tab and an entry as
-    /// ls prints it; writeFolderEntries), `ls -lde <folders>` prints each
-    /// folder the same way, with its lines from that file first. Any other
-    /// call runs /bin/ls. It changes no access control list.
+    /// root command's. It never runs ls(1) or reads a real access control
+    /// list: each operand's first line is made from stat(1) (`stat -f`,
+    /// lstat, which reads no list) as `ls -l` prints it, and its entries
+    /// come only from the test's files. `ls -le <receipt>` shows the lines
+    /// of `entries` (lsText, one per line), numbered as ls numbers them;
+    /// while `entries` + ".fails" exists, that call fails as an ls that
+    /// cannot read the list would. `ls -le` or `ls -lde` of any other path
+    /// shows the lines `entries` + ".folders" names for it (a path, a tab
+    /// and an entry as ls prints it; writeFolderEntries), or none. A path
+    /// stat cannot read fails as ls fails for it, after the other operands
+    /// print. Any other call, or `-le` of a folder, is recorded in
+    /// `entries` + ".unexpected" and fails, so no caller is answered by a
+    /// real ls.
     static func writeFakeLs(at tool: String, receipt: String, entries: String) throws {
         try fakeLsScript(receipt: receipt, entries: entries).write(toFile: tool, atomically: true, encoding: .utf8)
         XCTAssertEqual(chmod(tool, 0o755), 0)
@@ -161,31 +206,46 @@ enum TestReceipts {
         func quoted(_ s: String) -> String { "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
         return """
         #!/bin/bash
-        if [[ "${1:-}" == -lde && -f \(quoted(entries + ".folders")) ]]; then
-          shift
-          for p in "$@"; do
-            out="$(/bin/ls -lde "$p")" || exit 1
-            printf '%s\\n' "${out%%$'\\n'*}"
-            n=0
-            while IFS=$'\\t' read -r q e; do
-              if [[ "$q" == "$p" ]]; then printf ' %d: %s\\n' "$n" "$e"; n=$((n + 1)); fi
-            done < \(quoted(entries + ".folders"))
-            printf '%s\\n' "$out" | /usr/bin/awk -v n="$n" 'NR > 1 { sub(/^ [0-9]+: /, ""); printf " %d: %s\\n", n++, $0 }'
-          done
-          exit 0
-        fi
-        if [[ $# == 2 && "$1" == -le && "$2" == \(quoted(receipt)) ]]; then
-          if [[ -e \(quoted(entries + ".fails")) ]]; then echo "ls: $2: Permission denied" >&2; exit 1; fi
-          out="$(/bin/ls -le "$2")" || exit 1
-          printf '%s\\n' "${out%%$'\\n'*}"
-          n=0
-          if [[ -f \(quoted(entries)) ]]; then
-            while IFS= read -r e; do printf ' %d: %s\\n' "$n" "$e"; n=$((n + 1)); done < \(quoted(entries))
+        receipt=\(quoted(receipt))
+        entries=\(quoted(entries))
+        unexpected() { printf '%s\\n' "$*" >> "$entries.unexpected"; echo "ls: this stand-in does not answer: $*" >&2; exit 64; }
+        case "${1:-}" in
+          -le) folder_ok=0 ;;
+          -lde) folder_ok=1 ;;
+          *) unexpected "$@" ;;
+        esac
+        shift
+        (( $# > 0 )) || unexpected "$@"
+        rc=0
+        for p in "$@"; do
+          if ! line="$(/usr/bin/stat -f $'%Sp\\t%l %Su %Sg %z %Sm %N' -t '%b %e %H:%M' -- "$p" 2>/dev/null)"; then
+            echo "ls: $p: No such file or directory" >&2
+            rc=1
+            continue
           fi
-          printf '%s\\n' "$out" | /usr/bin/awk -v n="$n" 'NR > 1 { sub(/^ [0-9]+: /, ""); printf " %d: %s\\n", n++, $0 }'
-          exit 0
-        fi
-        exec /bin/ls "$@"
+          mode="${line%%$'\\t'*}"
+          if [[ "$mode" == d* ]] && (( ! folder_ok )); then unexpected "-le" "$p"; fi
+          if [[ "$p" == "$receipt" ]]; then
+            if [[ -e "$entries.fails" ]]; then echo "ls: $p: Permission denied" >&2; exit 1; fi
+            list=""
+            if [[ -f "$entries" ]]; then list="$(/bin/cat "$entries")" || exit 1; fi
+          else
+            list=""
+            if [[ -f "$entries.folders" ]]; then
+              while IFS=$'\\t' read -r q e; do
+                if [[ "$q" == "$p" ]]; then list+="$e"$'\\n'; fi
+              done < "$entries.folders"
+            fi
+          fi
+          plus=""
+          if [[ -n "$list" ]]; then plus="+"; fi
+          printf '%s%s %s\\n' "$mode" "$plus" "${line#*$'\\t'}"
+          n=0
+          while IFS= read -r e; do
+            if [[ -n "$e" ]]; then printf ' %d: %s\\n' "$n" "$e"; n=$((n + 1)); fi
+          done <<< "$list"
+        done
+        exit "$rc"
 
         """
     }
@@ -2232,10 +2292,11 @@ final class RootCommandProcess {
     /// receipt's access control entries once, with `/bin/ls -le $f`, and
     /// the folders' once, with `/bin/ls -lde $d`; here both are an ls
     /// (TestReceipts.writeFakeLs, at the folder's path plus `.ls`) that
-    /// shows `receipts.standIn` first, from the folder's path plus `.acl`,
-    /// and a folder's stand-ins from the folder's path plus `.acl.folders`
-    /// (TestReceipts.writeFolderEntries). A test makes the receipt's
-    /// listing fail by creating the folder's path plus `.acl.fails`.
+    /// shows the receipt's entries `receipts` read (TestReceipts.entries),
+    /// from the folder's path plus `.acl`, and a folder's entries from the
+    /// folder's path plus `.acl.folders` (TestReceipts.writeFolderEntries).
+    /// A test makes the receipt's listing fail by creating the folder's
+    /// path plus `.acl.fails`.
     static func withTestReceipts(_ command: String, _ receipts: SleepOffReceipts, trustTestUser: Bool = true) -> String {
         XCTAssertEqual(command.components(separatedBy: SleepOffReceipts.folder).count - 1, 1, "the command names the receipt folder once")
         XCTAssertEqual(command.components(separatedBy: "-v o=0 ").count - 1, 1, "the command's awk check trusts one owner besides root, uid 0, given once")
@@ -2243,7 +2304,7 @@ final class RootCommandProcess {
         XCTAssertEqual(command.components(separatedBy: receiptListing).count - 1, 1, "the command lists the receipt's entries once")
         XCTAssertEqual(command.components(separatedBy: folderListing).count - 1, 1, "the command lists the folders' entries once")
         XCTAssertFalse(receipts.folder.contains(" "), "the fixture replaces an unquoted word")
-        XCTAssertNoThrow(try TestReceipts.writeEntries(receipts.standIn ?? [], to: receipts.folder + ".acl"))
+        XCTAssertNoThrow(try TestReceipts.writeEntries(TestReceipts.entries(receipts), to: receipts.folder + ".acl"))
         XCTAssertNoThrow(try TestReceipts.writeFakeLs(at: receipts.folder + ".ls", receipt: receipts.file, entries: receipts.folder + ".acl"))
         return command.replacingOccurrences(of: SleepOffReceipts.folder, with: receipts.folder)
             .replacingOccurrences(of: "-v o=0 ", with: trustTestUser ? "-v o=\(getuid()) " : "-v o=0 ")
@@ -2778,11 +2839,134 @@ final class FIFOWatch: @unchecked Sendable {
     private func markSeen() { lock.lock(); seen = true; lock.unlock() }
 }
 
-/// Access control lists for the tests that check Insomnia leaves them alone.
+/// Tests that read or change a real access control list, sign with
+/// codesign, read a signature through the Security framework, or set the
+/// quarantine flag. They run on hosted CI (GITHUB_ACTIONS is "true") or
+/// where INSOMNIA_SYSTEM_TESTS=1 allows them, and are skipped elsewhere, as
+/// the first thing they do, before anything of theirs runs. A run that
+/// skips them does not cover them: it is not the full suite.
+enum SystemIntegration {
+    static var allowed: Bool {
+        let env = ProcessInfo.processInfo.environment
+        return env["GITHUB_ACTIONS"] == "true" || env["INSOMNIA_SYSTEM_TESTS"] == "1"
+    }
+
+    /// Skips the test unless system integration tests are allowed here.
+    static func require(_ what: String) throws {
+        guard allowed else {
+            throw XCTSkip("needs \(what) on this Mac; runs on hosted CI, or with INSOMNIA_SYSTEM_TESTS=1")
+        }
+    }
+}
+
+/// Copies files the way `cp` without -p does: bytes, permission bits and
+/// links, through open(2), read(2), write(2), readlink(2) and readdir(3),
+/// with no access control list, extended attribute or other metadata read
+/// or copied. FileManager.copyItem copies with copyfile(3) and
+/// COPYFILE_ALL, which reads the source's access control list.
+enum TestFiles {
+    static func copy(at source: URL, to destination: URL) throws {
+        try copy(atPath: source.path, toPath: destination.path)
+    }
+
+    /// A regular file, a symbolic link, or a folder and everything in it,
+    /// to `destination`, which must not exist yet.
+    static func copy(atPath source: String, toPath destination: String) throws {
+        var info = stat()
+        guard lstat(source, &info) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        let mode = info.st_mode & 0o7777
+        switch info.st_mode & S_IFMT {
+        case S_IFREG:
+            let data = try Data(contentsOf: URL(fileURLWithPath: source))
+            let fd = open(destination, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
+            guard fd >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+            defer { close(fd) }
+            let written = data.withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }
+            guard written == data.count, fchmod(fd, mode) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        case S_IFLNK:
+            var buffer = [CChar](repeating: 0, count: Int(PATH_MAX) + 1)
+            let n = readlink(source, &buffer, buffer.count - 1)
+            guard n >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+            guard symlink(String(decoding: buffer[0..<n].map { UInt8(bitPattern: $0) }, as: UTF8.self), destination) == 0 else {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+        case S_IFDIR:
+            guard mkdir(destination, 0o700) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+            guard let dir = opendir(source) else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+            var names: [String] = []
+            while let entry = readdir(dir) {
+                let name = withUnsafeBytes(of: entry.pointee.d_name) { raw in
+                    String(decoding: raw.prefix(Int(entry.pointee.d_namlen)), as: UTF8.self)
+                }
+                if name != "." && name != ".." { names.append(name) }
+            }
+            closedir(dir)
+            for name in names {
+                try copy(atPath: source + "/" + name, toPath: destination + "/" + name)
+            }
+            guard chmod(destination, mode) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        default:
+            throw POSIXError(.EINVAL)
+        }
+    }
+}
+
+extension TestFiles {
+    /// lstat(2) of each of `paths`, one line each: the path, its type and
+    /// mode in octal, owner, group, links, size, device:inode, modification
+    /// and status change times to the nanosecond, and a link's target; with
+    /// `recursive`, everything in a folder too, in name order. For a test
+    /// that checks a run changed nothing about files: it reads no access
+    /// control list, where `ls -le` would.
+    static func metadata(_ paths: [String], recursive: Bool = false) -> String {
+        var lines: [String] = []
+        func visit(_ path: String) {
+            var info = stat()
+            guard lstat(path, &info) == 0 else {
+                lines.append("\(path) missing: \(String(cString: strerror(errno)))")
+                return
+            }
+            var line = "\(path) \(String(info.st_mode, radix: 8)) \(info.st_uid) \(info.st_gid) \(info.st_nlink) \(info.st_size) \(info.st_dev):\(info.st_ino)"
+            line += " \(info.st_mtimespec.tv_sec).\(info.st_mtimespec.tv_nsec) \(info.st_ctimespec.tv_sec).\(info.st_ctimespec.tv_nsec)"
+            switch info.st_mode & S_IFMT {
+            case S_IFLNK:
+                var buffer = [CChar](repeating: 0, count: Int(PATH_MAX) + 1)
+                let n = readlink(path, &buffer, buffer.count - 1)
+                line += " -> " + (n >= 0 ? String(decoding: buffer[0..<n].map { UInt8(bitPattern: $0) }, as: UTF8.self) : "?")
+                lines.append(line)
+            case S_IFDIR:
+                lines.append(line)
+                guard recursive else { return }
+                guard let dir = opendir(path) else {
+                    lines.append("\(path) unlisted: \(String(cString: strerror(errno)))")
+                    return
+                }
+                var names: [String] = []
+                while let entry = readdir(dir) {
+                    let name = withUnsafeBytes(of: entry.pointee.d_name) { raw in
+                        String(decoding: raw.prefix(Int(entry.pointee.d_namlen)), as: UTF8.self)
+                    }
+                    if name != "." && name != ".." { names.append(name) }
+                }
+                closedir(dir)
+                for name in names.sorted() { visit(path + "/" + name) }
+            default:
+                lines.append(line)
+            }
+        }
+        paths.forEach(visit)
+        return lines.joined(separator: "\n")
+    }
+}
+
+/// Access control lists for the tests that check Insomnia leaves them
+/// alone. Each changes or reads a real list, so every test that calls one
+/// first calls `SystemIntegration.require`.
 enum TestACL {
     /// Gives `url` one entry letting its owner, the user running the tests,
     /// read it. On a 0200 file that entry is the only way to read it.
     static func grantOwnerRead(_ url: URL) throws {
+        try SystemIntegration.require("a real access control list changed")
         let chmod = Process()
         chmod.executableURL = URL(fileURLWithPath: "/bin/chmod")
         chmod.arguments = ["+a", "user:\(String(cString: getpwuid(getuid()).pointee.pw_name)) allow read", url.path]
@@ -2793,7 +2977,8 @@ enum TestACL {
     }
 
     /// How many ACL entries `url` has, without following a symlink.
-    static func entries(_ url: URL) -> Int {
+    static func entries(_ url: URL) throws -> Int {
+        try SystemIntegration.require("a real access control list read")
         guard let acl = acl_get_link_np(url.path, ACL_TYPE_EXTENDED) else { return 0 }
         defer { acl_free(UnsafeMutableRawPointer(acl)) }
         var count = 0

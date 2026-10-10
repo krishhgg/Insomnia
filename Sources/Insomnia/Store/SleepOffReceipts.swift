@@ -166,15 +166,15 @@ struct SleepOffReceipts: Sendable {
     /// A nonce (36), a space, `free` or `held` (4) and a newline.
     static let releaseSize = 42
 
-    /// This user's receipt, trusting root alone.
-    static var live: SleepOffReceipts { SleepOffReceipts(folder: folder, owners: [0], user: getuid()) }
+    /// This user's receipt, trusting root alone, with the lists acl(3)
+    /// reads.
+    static var live: SleepOffReceipts { SleepOffReceipts(folder: folder, owners: [0], user: getuid(), lists: .native) }
 
-    init(folder: String, owners: Set<uid_t>, user: uid_t, standIn: [AccessEntry]? = nil, folderStandIn: [String: [AccessEntry]] = [:]) {
+    init(folder: String, owners: Set<uid_t>, user: uid_t, lists: AccessLists) {
         self.folder = folder
         self.owners = owners
         self.user = user
-        self.standIn = standIn
-        self.folderStandIn = folderStandIn
+        self.lists = lists
     }
 
     /// An absolute path with no `.`, `..`, empty or symbolic link
@@ -185,14 +185,11 @@ struct SleepOffReceipts: Sendable {
     /// their temporary directory, since they cannot create root's files.
     let owners: Set<uid_t>
     let user: uid_t
-    /// nil in the app. Tests cannot make root's file, and cannot give a
-    /// file of their own the entry install.sh adds without changing a real
-    /// access control list, so they name entries here: the checks read
-    /// them first in the receipt's list, before the entries it really has.
-    let standIn: [AccessEntry]?
-    /// Empty in the app. The same for the folders the checks walk, by
-    /// path: entries read in front of the folder's real ones.
-    let folderStandIn: [String: [AccessEntry]]
+    /// Where the checks read each access control list: acl(3) in the app
+    /// (`live`). Tests give every list, and every failure to read one,
+    /// here, so no real list is read (`AccessLists.fixed`); there is no
+    /// default, so no receipt reads a real list unless it asks for one.
+    let lists: AccessLists
 
     var file: String { folder + "/" + String(user) }
     /// `<uid>.released`, beside the receipt: the user's own file, 42 bytes,
@@ -218,6 +215,17 @@ struct SleepOffReceipts: Sendable {
         let file: String
         let errno: Int32
         var errorDescription: String? { "\(file) could not be locked: \(String(cString: strerror(errno)))" }
+    }
+
+    /// The file at the receipt's path could not be opened to be locked:
+    /// open(2)'s errno, and "device:inode" of the file, by lstat. When that
+    /// is the file a start claimed, a command for it may hold its lock, and
+    /// nothing shows whether one does.
+    struct Unopened: Error, LocalizedError {
+        let file: String
+        let identity: String
+        let errno: Int32
+        var errorDescription: String? { "\(file) could not be opened to be locked: \(String(cString: strerror(errno)))" }
     }
 
     /// The release file shows another start's claim.
@@ -284,17 +292,28 @@ struct SleepOffReceipts: Sendable {
         FileIdentity(try check()).text
     }
 
-    /// Opens the receipt read-only, once it passes the checks, and locks
-    /// it, trying every `pollEvery` for up to `timeout`. Throws `Busy` when
-    /// it stays locked, `LockFailed` when flock(2) fails another way, and
-    /// `Problem` when the receipt is missing, unsafe, or not the file at
-    /// its path once locked.
+    /// Opens the receipt read-only and locks it, trying every `pollEvery`
+    /// for up to `timeout`, then checks it. Throws `Busy` when it stays
+    /// locked, `LockFailed` when flock(2) fails another way, `Unopened`
+    /// when the file at the path cannot be opened, and `Problem` when the
+    /// receipt is missing or not a regular file before the lock, or once
+    /// locked, fails the checks or is not the file at its path.
+    ///
+    /// Only what opening needs comes before the lock: a plain folder path
+    /// and a regular file at it, by lstat, so a FIFO or a device put there
+    /// is never opened. Its owner, mode, size, list and folders are checked
+    /// under the lock, as the root command checks them under its own: a
+    /// command that holds the lock is waited for, and decides nothing
+    /// (`Busy`), before anything about the file can decide a start.
     func lock(timeout: TimeInterval, pollEvery: Duration = .milliseconds(50)) async throws -> Guard {
-        let info = try check()
-        // O_NONBLOCK: the checks found a regular file, but a FIFO put in its
+        try checkFolderPath()
+        var info = stat()
+        guard lstat(file, &info) == 0 else { throw Problem(detail: "\(file): \(String(cString: strerror(errno)))") }
+        guard info.st_mode & S_IFMT == S_IFREG else { throw Problem(detail: "\(file) is not a regular file") }
+        // O_NONBLOCK: lstat found a regular file, but a FIFO put in its
         // place since must not hang the open.
         let fd = open(file, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
-        guard fd >= 0 else { throw Problem(detail: "\(file): \(String(cString: strerror(errno)))") }
+        guard fd >= 0 else { throw Unopened(file: file, identity: FileIdentity(info).text, errno: errno) }
         var opened = stat()
         guard fstat(fd, &opened) == 0, opened.st_dev == info.st_dev, opened.st_ino == info.st_ino else {
             close(fd)
@@ -320,10 +339,19 @@ struct SleepOffReceipts: Sendable {
             }
         }
         let held = Guard(fd: fd, identity: FileIdentity(opened).text)
-        // The path must still name the locked file, and pass the checks.
-        guard let now = try? check(), FileIdentity(now).text == held.identity else {
+        // The path must still name the locked file, and it must pass the
+        // checks.
+        do {
+            var now = stat()
+            guard lstat(file, &now) == 0, FileIdentity(now).text == held.identity else {
+                throw Problem(detail: "\(file) was replaced while it was locked")
+            }
+            guard FileIdentity(try check()).text == held.identity else {
+                throw Problem(detail: "\(file) was replaced while it was locked")
+            }
+        } catch {
             held.release()
-            throw Problem(detail: "\(file) was replaced while it was locked")
+            throw error
         }
         return held
     }
@@ -357,8 +385,11 @@ struct SleepOffReceipts: Sendable {
     /// that still holds the predecessor decides nothing, and neither does
     /// a receipt this process could not lock as the file the start
     /// claimed: a command may hold that file's lock, and after `expires` it
-    /// is undone like an end. A receipt that is locked, or a lock that
-    /// fails, decides nothing.
+    /// is undone like an end. A receipt that is locked, a lock that fails,
+    /// and the claimed file still at the path but one that cannot be opened
+    /// to lock it decide nothing: a command may hold that lock. Every check
+    /// of the file itself comes after the lock (`lock`), so a file that
+    /// fails one decides only once no command holds it.
     func verdict(for attempt: SleepOffAttempt, lock outcome: Result<Guard, Error>, now: Int, dialogOver: Bool = false) -> SleepOffVerdict {
         // Nothing ran as root for a start that never showed its dialog.
         guard attempt.marker != nil else { return .neverWrote }
@@ -370,6 +401,8 @@ struct SleepOffReceipts: Sendable {
             held = g
         case let .failure(error) where error is Busy || error is LockFailed || error is CancellationError:
             return .undecided(error.localizedDescription)
+        case let .failure(error as Unopened) where error.identity == attempt.receipt:
+            return .undecided("\(error.localizedDescription); a command for that start may hold its lock")
         case let .failure(error):
             return over ? .mayHaveWritten(error.localizedDescription) : .undecided("\(error.localizedDescription); a command for that start could still write \(until)")
         }
@@ -487,10 +520,7 @@ struct SleepOffReceipts: Sendable {
     /// regular file with one link, `size` bytes and mode 0600, whose list
     /// is exactly `AccessEntry.installed(for: user)`.
     private func check() throws -> stat {
-        let parts = folder.split(separator: "/", omittingEmptySubsequences: false)
-        guard folder.hasPrefix("/"), parts.count > 1, parts.dropFirst().allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." }) else {
-            throw Problem(detail: "\(folder) is not a plain absolute path")
-        }
+        try checkFolderPath()
         let info = try inspect(file, directory: false)
         guard info.st_nlink == 1 else { throw Problem(detail: "\(file) has \(info.st_nlink) links") }
         guard info.st_size == off_t(Self.size) else { throw Problem(detail: "\(file) is \(info.st_size) bytes, not \(Self.size)") }
@@ -502,6 +532,14 @@ struct SleepOffReceipts: Sendable {
             dir = cut == dir.startIndex ? "/" : String(dir[..<cut])
         }
         return info
+    }
+
+    /// `folder` is an absolute path with no `.`, `..` or empty component.
+    private func checkFolderPath() throws {
+        let parts = folder.split(separator: "/", omittingEmptySubsequences: false)
+        guard folder.hasPrefix("/"), parts.count > 1, parts.dropFirst().allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." }) else {
+            throw Problem(detail: "\(folder) is not a plain absolute path")
+        }
     }
 
     private func inspect(_ path: String, directory: Bool) throws -> stat {
@@ -522,15 +560,20 @@ struct SleepOffReceipts: Sendable {
         guard directory || info.st_mode & 0o7777 == 0o600 else {
             throw Problem(detail: "\(path) has mode \(String(info.st_mode & 0o7777, radix: 8)), not the 600 install.sh gives it")
         }
-        guard let found = Self.accessEntries(path) else {
-            throw Problem(detail: "the access control list of \(path) could not be read")
+        let entries: [AccessEntry]
+        switch lists.list(of: path, receipt: !directory) {
+        case let .entries(found):
+            entries = found
+        case let .unreadable(err):
+            throw Problem(detail: "the access control list of \(path) could not be read: \(String(cString: strerror(err)))")
+        case .incomplete:
+            throw Problem(detail: "the access control list of \(path) could not be read whole")
         }
-        let real = (directory ? folderStandIn[path] ?? [] : []) + found
         if directory {
-            guard !real.contains(where: \.allows) else {
+            guard !entries.contains(where: \.allows) else {
                 throw Problem(detail: "\(path) has an access control entry that allows changes")
             }
-        } else if let why = Self.receiptAccessProblem((standIn ?? []) + real, user: user) {
+        } else if let why = Self.receiptAccessProblem(entries, user: user) {
             throw Problem(detail: "\(path) \(why)")
         }
         return info
@@ -556,14 +599,17 @@ struct SleepOffReceipts: Sendable {
     }
 
     /// `path`'s own extended access control list (never a link's target),
-    /// in order; empty when it has none, nil when it cannot be read whole.
-    static func accessEntries(_ path: String) -> [AccessEntry]? {
+    /// in order, through acl(3): no entries when it has none (acl_get_link_np
+    /// answers ENOENT), `unreadable` when acl_get_link_np fails another
+    /// way, `incomplete` when an entry or flag cannot be read.
+    static func accessList(_ path: String) -> AccessList {
         errno = 0
         guard let acl = acl_get_link_np(path, ACL_TYPE_EXTENDED) else {
-            return errno == ENOENT ? [] : nil
+            let err = errno
+            return err == ENOENT ? .entries([]) : .unreadable(err)
         }
         defer { acl_free(UnsafeMutableRawPointer(acl)) }
-        return accessEntries(of: acl)
+        return accessEntries(of: acl).map(AccessList.entries) ?? .incomplete
     }
 
     /// The acl(3) calls `accessEntries(of:)` makes to walk a list and read
@@ -623,6 +669,38 @@ struct SleepOffReceipts: Sendable {
             ))
         }
         return entries
+    }
+}
+
+/// What the checks read of one path's own extended access control list.
+enum AccessList: Equatable, Sendable {
+    /// Its entries, in order; none when it has no list.
+    case entries([AccessEntry])
+    /// The list could not be had at all: acl_get_link_np(3)'s errno.
+    case unreadable(Int32)
+    /// An entry, or one of its flags, could not be read, so the list is
+    /// not known whole.
+    case incomplete
+}
+
+/// Where `SleepOffReceipts` reads each access control list.
+enum AccessLists: Sendable {
+    /// acl(3), on each path itself (`SleepOffReceipts.accessList`). The
+    /// app's.
+    case native
+    /// What each read gives, with no real list read: the receipt's, and a
+    /// folder's by its path. A folder not named has no entries. For tests,
+    /// which cannot make root's files or give a file of their own the
+    /// entry install.sh adds without changing a real list.
+    case fixed(receipt: AccessList, folders: [String: AccessList])
+
+    func list(of path: String, receipt: Bool) -> AccessList {
+        switch self {
+        case .native:
+            SleepOffReceipts.accessList(path)
+        case let .fixed(file, folders):
+            receipt ? file : folders[path] ?? .entries([])
+        }
     }
 }
 
