@@ -63,6 +63,11 @@ final class RecoveryLockHandle: @unchecked Sendable {
         }
     }
 
+    /// The locked file, by device and inode; nil once released.
+    var file: FileIdentity? {
+        mutex.withLock { fd >= 0 ? FileIdentity(of: fd) : nil }
+    }
+
     deinit { release() }
 }
 

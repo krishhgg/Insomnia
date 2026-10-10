@@ -2474,37 +2474,74 @@ read_owed_power() {
     owed_why="pmset -g custom reports lowpowermode ${pmset_value:-with no value} under Battery Power, neither 0 nor 1, so whether Low Power Mode is on is unknown"
   fi
 }
+# Device and inode of $1, following links, read with bounded() so a stat
+# that hangs (a folder on a server that stopped answering) cannot hold the
+# locks. Sets path_id, or own_why and returns 1 when stat exits 1 (there is
+# no such file, or it cannot be reached), 2 when it fails some other way,
+# does not answer or prints something else.
+path_identity() { # path
+  local rc=0
+  path_id=""
+  bounded "$STAT" -L -f '%d:%i' "$1" || rc=$?
+  if (( rc == 0 )) && [[ "$BOUNDED_OUTPUT" =~ ^[0-9]+:[0-9]+$ ]]; then
+    path_id="$BOUNDED_OUTPUT"
+    return 0
+  fi
+  own_why="$(pmset_failed "stat -L $1" "$rc")"
+  if (( rc == 1 )); then return 1; fi
+  (( rc != 0 )) || own_why="$own_why without a device and inode"
+  return 2
+}
 # Whether $1, the file launchd says the agent was loaded from, is this
 # folder's: its plist, or a candidate with the label's candidate prefix in
 # its staging directory or, for older builds, beside the plist (the names
 # remove_plists removes). A candidate is renamed over the plist after the
-# load, so the file itself may be gone; the folder it was in is compared
-# with $LAUNCH_AGENTS by path, else by device and inode, so another
-# spelling of this folder (a link, /var for /private/var) is still its own.
+# load, so the file itself may be gone. The folder it was in is this
+# folder's $LAUNCH_AGENTS by path, or else when it has the same name and
+# both it and the folder above it are this folder's by device and inode:
+# a link to the whole folder (or /var for /private/var) is still this
+# folder, while a LaunchAgents folder that only leads here from another
+# folder is that folder's, with its own journal and lock
+# (LaunchdBackstop.isOwnAgentFile reads the path the same way). Returns 0
+# for this folder's, 1 for another's (also when its folder cannot be
+# reached: this folder can be), and 2 with own_why when one of the folders
+# could not be identified.
 own_agent_file() { # path
-  local dir="${1%/*}" here there
+  local dir="${1%/*}" mine="$LAUNCH_AGENTS" here rc step
+  own_why=""
   case "${1##*/}" in
     "$LABEL.plist") ;;
     "$LABEL.candidate-"*)
       if [[ "${dir##*/}" == ".$LABEL.staging" ]]; then dir="${dir%/*}"; fi ;;
     *) return 1 ;;
   esac
-  [[ "$dir" != "$LAUNCH_AGENTS" ]] || return 0
-  here="$("$STAT" -L -f '%d:%i' "$LAUNCH_AGENTS" 2>/dev/null)" || return 1
-  there="$("$STAT" -L -f '%d:%i' "$dir" 2>/dev/null)" || return 1
-  [[ -n "$here" && "$here" == "$there" ]]
+  [[ "$dir" != "$mine" ]] || return 0
+  [[ "${dir##*/}" == "${mine##*/}" ]] || return 1
+  # The LaunchAgents folders, then the folders above them.
+  for step in 1 2; do
+    if (( step == 2 )); then
+      mine="${mine%/*}"; dir="${dir%/*}"
+      [[ -n "$mine" && -n "$dir" ]] || return 1
+    fi
+    path_identity "$mine" || return 2
+    here="$path_id"
+    rc=0; path_identity "$dir" || rc=$?
+    (( rc != 2 )) || return 2
+    if (( rc != 0 )) || [[ "$path_id" != "$here" ]]; then return 1; fi
+  done
 }
 # Whose recovery agent launchd has loaded. Every Insomnia folder of this
 # user loads its agent under the one label, so launchd holds one such job
 # for the user, from whichever folder loaded it last, and `launchctl print`
 # names the file it was loaded from on its `path =` line (one tab in, like
-# every top-level key it prints; see LaunchdBackstop.loadedJob). Sets
+# every top-level key it prints; see LaunchdBackstop.loadedPath). Sets
 # agent_seen to none (print exited 113: nothing is loaded under the label),
 # own (loaded from a file of this folder, own_agent_file), other (from any
 # other file: another folder's agent, which this run leaves loaded) or
 # unknown (print failed or did not answer, or it names no such file, more
-# than one, or one that is not an absolute path), agent_path to the file,
-# and agent_why to why it is unknown.
+# than one, or one that is not an absolute path, or its folders could not
+# be compared with this one), agent_path to the file, and agent_why to why
+# it is unknown.
 loaded_agent() {
   local rc=0 rest line prefix=$'\tpath = ' count=0 path=""
   agent_seen=unknown; agent_path=""; agent_why=""
@@ -2528,7 +2565,12 @@ loaded_agent() {
     return 0
   fi
   agent_path="$path"
-  if own_agent_file "$path"; then agent_seen=own; else agent_seen=other; fi
+  rc=0; own_agent_file "$path" || rc=$?
+  case "$rc" in
+    0) agent_seen=own ;;
+    1) agent_seen=other ;;
+    *) agent_path=""; agent_why="the folders of $path could not be compared with this one ($own_why)" ;;
+  esac
 }
 # Stops the run when loaded_agent could not tell whose agent is loaded:
 # booting it out could unload another folder's, and leaving it could leave

@@ -16,6 +16,18 @@ import Foundation
 /// that code and still passes the agent's check. A bundle edited or
 /// re-signed under the running app makes arm() fail, with the reason, rather
 /// than report an agent that refuses every run or pin the replacement.
+///
+/// Every Insomnia folder of the user loads its agent under the one label,
+/// so launchd holds one such job, from whichever folder loaded it last.
+/// Every load and unload of the label happens under one lock, the standard
+/// folder's recovery lock (`agentLock`): install.sh holds it as fd 9 and
+/// uninstall.sh as fd 6 around each launchctl call, and arm() holds it from
+/// the reading before a reload until the plist is published. So an
+/// uninstall of one folder that has just read whose job is loaded unloads
+/// that job, never one another folder loaded since. The lock order is the
+/// folder's own recovery lock, then this one, then the receipt
+/// (SleepOffReceipts); arm() runs inside a transaction and never holds the
+/// receipt.
 protocol BackstopScheduling: Sendable {
     /// Make sure the polling agent is loaded with the current plist. Cheap
     /// when it already is; throws when it cannot be loaded.
@@ -43,7 +55,11 @@ struct BackstopTarget: Sendable, Equatable {
 }
 
 struct LaunchdBackstop: BackstopScheduling {
-    typealias Runner = @Sendable (_ exe: String, _ args: [String]) async throws -> ShellResult
+    /// Runs one launchctl call. `holding`, when there is one, is the agent
+    /// lock, handed to the child (`CancellableCommand.run(holding:)`) so a
+    /// bootout or bootstrap keeps it until it exits, even if this process
+    /// does not.
+    typealias Runner = @Sendable (_ exe: String, _ args: [String], _ holding: RecoveryLockHandle?) async throws -> ShellResult
     /// Returns the requirement to pin for a bundle that satisfies it right
     /// now, or throws with the reason it must not be pinned.
     typealias BundlePinner = @Sendable (_ bundle: URL) throws -> String
@@ -52,6 +68,8 @@ struct LaunchdBackstop: BackstopScheduling {
     /// Seconds between backstop.sh runs while loaded. install.sh writes the same value.
     static let pollInterval = 60
     static let commandTimeout: TimeInterval = 15
+    /// How long arm() waits for the agent lock before it fails.
+    static let agentLockTimeout: TimeInterval = 10
 
     /// What launchd runs: `/bin/sh -c <agentProgram> sh <requirement> <bundle>`.
     /// The program verifies the bundle ($2) against the requirement ($1) with
@@ -69,6 +87,10 @@ struct LaunchdBackstop: BackstopScheduling {
     let bundle: URL
     let label: String
     let uid: uid_t
+    /// The lock every load and unload of `label` takes (see
+    /// BackstopScheduling): `Paths.standard.recoveryLock` for the app.
+    let agentLock: URL
+    let agentLockTimeout: TimeInterval
     private let pin: BundlePinner
     private let run: Runner
 
@@ -78,17 +100,22 @@ struct LaunchdBackstop: BackstopScheduling {
     /// installed app's sealed script. `pin` runs at every arm(), so an
     /// upgrade is pinned the first time the upgraded app arms; the default
     /// is CodeRequirement.pin (the running code's own requirement, and the
-    /// agent's check on the bundle).
+    /// agent's check on the bundle). `agentLock` has no default, so no
+    /// test can reach the standard folder's lock by leaving it out.
     init(
         paths: Paths,
+        agentLock: URL,
+        agentLockTimeout: TimeInterval = LaunchdBackstop.agentLockTimeout,
         bundle: URL? = nil,
         pin: @escaping BundlePinner = { try CodeRequirement.pin(bundle: $0) },
         label: String = Paths.backstopLabel,
         uid: uid_t = getuid(),
-        run: @escaping Runner = { try await CancellableCommand().run($0, $1, timeout: LaunchdBackstop.commandTimeout) }
+        run: @escaping Runner = { try await CancellableCommand().run($0, $1, timeout: LaunchdBackstop.commandTimeout, holding: $2) }
     ) {
         self.plistURL = paths.backstopPlist
         self.bundle = bundle ?? Self.runningOrInstalledBundle(paths: paths)
+        self.agentLock = agentLock
+        self.agentLockTimeout = agentLockTimeout
         self.pin = pin
         self.label = label
         self.uid = uid
@@ -116,16 +143,17 @@ struct LaunchdBackstop: BackstopScheduling {
             throw BackstopError(message: "the recovery agent cannot pin \(bundle.path): \(error.localizedDescription). Reinstall with scripts/install.sh")
         }
         let desired = Self.plistDictionary(label: label, target: BackstopTarget(bundle: bundle, requirement: requirement))
-        // Armed when the plist the next login loads is this build's and the
-        // loaded job is the one it describes: the same command line, started
-        // every `pollInterval` seconds. A loaded label alone may be another
-        // build's job, pinning a bundle or requirement this one does not
-        // satisfy (install.sh can leave one loaded when it stops between its
-        // bootstrap and publishing the plist), or a job loaded from a plist
-        // without the interval, which never runs again to end a session.
-        if plistOnDiskMatches(desired), try await loadedJob() == LoadedJob(plist: desired) {
-            return
-        }
+        // Without the agent lock: reading changes nothing, and a job this
+        // folder loaded stays loaded until a holder of the lock unloads it,
+        // which only this folder's uninstall does (it holds this folder's
+        // recovery lock, so not during this transaction) or install.sh,
+        // which replaces it with the standard folder's.
+        if try await isArmed(desired) { return }
+        let held = try await takeAgentLock()
+        defer { held.release() }
+        // Again under the lock: another folder may have loaded its job, or
+        // unloaded this one, since the reading above.
+        if try await isArmed(desired) { return }
         // The plist at `plistURL` is what the next arm() trusts when the
         // loaded job is the one it describes, so it may only ever hold a
         // plist launchd actually loaded. Load through a private
@@ -135,8 +163,92 @@ struct LaunchdBackstop: BackstopScheduling {
         // exactly as it was, whether or not any cleanup below works.
         let candidate = try writeCandidate(desired)
         defer { discard(candidate) }
-        try await reload(from: candidate)
+        try await reload(from: candidate, holding: held.handle)
         try publish(candidate)
+    }
+
+    /// Armed when the plist the next login loads is this build's and the
+    /// loaded job is the one it describes, loaded from this folder: the same
+    /// command line, started every `pollInterval` seconds, from this
+    /// folder's plist or one of its candidates. A loaded label alone may be
+    /// another build's job, pinning a bundle or requirement this one does
+    /// not satisfy (install.sh can leave one loaded when it stops between
+    /// its bootstrap and publishing the plist), a job loaded from a plist
+    /// without the interval, which never runs again to end a session, or
+    /// another folder's job running the same command line, which that
+    /// folder's uninstall unloads.
+    private func isArmed(_ desired: [String: Any]) async throws -> Bool {
+        guard plistOnDiskMatches(desired) else { return false }
+        let r = try await run(Self.launchctl, ["print", "gui/\(uid)/\(label)"], nil)
+        guard r.succeeded, Self.loadedJob(fromPrint: r.stdout) == LoadedJob(plist: desired),
+              let path = Self.loadedPath(fromPrint: r.stdout)
+        else { return false }
+        return isOwnAgentFile(path)
+    }
+
+    /// The agent lock for one reload, released by `release()` when arm()
+    /// took it itself.
+    private struct AgentLockHold {
+        let handle: RecoveryLockHandle
+        let taken: Bool
+        func release() { if taken { handle.release() } }
+    }
+
+    /// The transaction's own lock when it already is the agent lock's file
+    /// (the standard folder, or a folder whose lock is a link to it): a
+    /// second flock of one file in this process would wait on the first.
+    /// Otherwise the agent lock, within `agentLockTimeout`, made with its
+    /// folder when missing as uninstall.sh's lock_standard makes it, and
+    /// checked to still be the file its path names, which is what
+    /// install.sh and uninstall.sh open.
+    private func takeAgentLock() async throws -> AgentLockHold {
+        let path = agentLock.path
+        if let held = RecoveryLock.held, let file = held.file, FileIdentity(atPath: path) == file {
+            return AgentLockHold(handle: held, taken: false)
+        }
+        let handle: RecoveryLockHandle
+        do {
+            if let problem = try OwnerOnly.createDirectory(agentLock.deletingLastPathComponent()) { OwnerOnly.reportOnce(problem) }
+            handle = try await RecoveryLock(url: agentLock).acquire(timeout: agentLockTimeout)
+        } catch {
+            throw BackstopError(message: "the recovery agent was not reloaded: \(error.localizedDescription); install.sh, uninstall.sh and the standard Insomnia folder's app and backstop take that lock")
+        }
+        guard let file = handle.file, FileIdentity(atPath: path) == file else {
+            handle.release()
+            throw BackstopError(message: "the recovery agent was not reloaded: \(path) was replaced while it was locked")
+        }
+        return AgentLockHold(handle: handle, taken: true)
+    }
+
+    /// Whether `path`, the file launchd says the loaded job came from, is
+    /// this folder's: its plist, or a candidate in its staging folder or,
+    /// for older builds, beside the plist. A candidate is renamed over the
+    /// plist after the load, so the file may be gone. The folder it was in
+    /// is this folder's LaunchAgents folder by path, or else when it has the
+    /// same name and both it and the folder above it are this folder's by
+    /// device and inode: a link to the whole folder is still this folder,
+    /// while a LaunchAgents folder that only leads here from another folder
+    /// is that folder's, with its own journal and lock. uninstall.sh's
+    /// own_agent_file reads the path the same way.
+    func isOwnAgentFile(_ path: String) -> Bool {
+        guard let slash = path.lastIndex(of: "/") else { return false }
+        let name = path[path.index(after: slash)...]
+        var dir = String(path[..<slash])
+        if name == "\(label).plist" {
+        } else if name.hasPrefix(candidatePrefix) {
+            if let up = dir.lastIndex(of: "/"), dir[dir.index(after: up)...] == ".\(label).staging" { dir = String(dir[..<up]) }
+        } else {
+            return false
+        }
+        let mine = plistURL.deletingLastPathComponent().path
+        if dir == mine { return true }
+        func parent(_ p: String) -> String { p.lastIndex(of: "/").map { String(p[..<$0]) } ?? "" }
+        func last(_ p: String) -> Substring { p.lastIndex(of: "/").map { p[p.index(after: $0)...] } ?? Substring(p) }
+        guard last(dir) == last(mine),
+              let a = FileIdentity(atPath: mine), FileIdentity(atPath: dir) == a,
+              let b = FileIdentity(atPath: parent(mine)), FileIdentity(atPath: parent(dir)) == b
+        else { return false }
+        return true
     }
 
     // MARK: Plist
@@ -241,11 +353,15 @@ struct LaunchdBackstop: BackstopScheduling {
         }
     }
 
-    /// The loaded job, from `launchctl print`: nil when no job with the
-    /// label is loaded or the output cannot be read.
-    func loadedJob() async throws -> LoadedJob? {
-        let r = try await run(Self.launchctl, ["print", "gui/\(uid)/\(label)"])
-        return r.succeeded ? Self.loadedJob(fromPrint: r.stdout) : nil
+    /// The file the job was loaded from, from `launchctl print`: the one
+    /// top-level `path =` line (one tab in, like every top-level key). nil
+    /// when there is none, more than one, or it is not an absolute path,
+    /// as uninstall.sh's loaded_agent reads it.
+    static func loadedPath(fromPrint output: String) -> String? {
+        let prefix = "\tpath = "
+        let found = output.split(separator: "\n", omittingEmptySubsequences: false).filter { $0.hasPrefix(prefix) }
+        guard found.count == 1, let path = found.first?.dropFirst(prefix.count), path.hasPrefix("/") else { return nil }
+        return String(path)
     }
 
     /// Reads `launchctl print <service>` output, whose top-level keys are
@@ -289,10 +405,15 @@ struct LaunchdBackstop: BackstopScheduling {
     ///
     /// Throws when the agent cannot be loaded: a session must never hold
     /// sleep without an agent that will release it.
-    private func reload(from candidate: URL) async throws {
+    ///
+    /// Both calls get the agent lock: the runner returns only once the
+    /// child has exited and been reaped (SIGTERM, then SIGKILL, at its
+    /// limit), and the child's own descriptor keeps the lock if this
+    /// process ends first.
+    private func reload(from candidate: URL, holding lock: RecoveryLockHandle) async throws {
         let domain = "gui/\(uid)"
-        _ = try await run(Self.launchctl, ["bootout", "\(domain)/\(label)"])
-        let r = try await run(Self.launchctl, ["bootstrap", domain, candidate.path])
+        _ = try await run(Self.launchctl, ["bootout", "\(domain)/\(label)"], lock)
+        let r = try await run(Self.launchctl, ["bootstrap", domain, candidate.path], lock)
         if !r.succeeded {
             throw BackstopError(message: "launchctl bootstrap failed (\(r.status)): \(r.stderr.trimmingCharacters(in: .whitespacesAndNewlines))")
         }

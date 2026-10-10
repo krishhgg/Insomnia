@@ -694,7 +694,7 @@ final class SessionManager {
             paths: paths,
             sleepGuard: PmsetSleepGuard(),
             processControl: processControl,
-            backstop: LaunchdBackstop(paths: paths),
+            backstop: LaunchdBackstop(paths: paths, agentLock: Paths.standard.recoveryLock),
             receipts: .live,
             audio: audio,
             display: display,

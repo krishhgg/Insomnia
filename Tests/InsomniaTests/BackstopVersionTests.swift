@@ -78,7 +78,7 @@ final class BackstopVersionTests: XCTestCase {
         defer { home.destroy() }
         let bundle = home.paths.appBundle
         let script = Paths.backstopScript(inBundle: bundle)
-        let backstop = LaunchdBackstop(paths: home.paths, bundle: bundle, run: { _, _ in ShellResult(status: 0, stdout: "", stderr: "") })
+        let backstop = LaunchdBackstop(paths: home.paths, agentLock: home.paths.recoveryLock, bundle: bundle, run: { _, _, _ in ShellResult(status: 0, stdout: "", stderr: "") })
         XCTAssertEqual(backstop.scriptPath, script.path)
         XCTAssertThrowsError(try backstop.checkVoidsPrompts())
         try FileManager.default.createDirectory(at: script.deletingLastPathComponent(), withIntermediateDirectories: true)

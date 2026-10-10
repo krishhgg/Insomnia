@@ -385,6 +385,30 @@ final class ReconcileTests: XCTestCase {
         XCTAssertEqual(h.backstop.arms, 2)
     }
 
+    /// Round 36 (independent35 R35-2): Start, Extend, a failed End and the
+    /// relaunch's reconcile each arm the agent inside their transaction,
+    /// holding this folder's recovery lock, so the agent lock arm() takes
+    /// for a reload always comes after it (the lock order in
+    /// BackstopScheduling), and in the standard folder is the same lock.
+    func testEveryArmRunsHoldingTheFoldersRecoveryLock() async throws {
+        let m = h.makeManager()
+        await m.start(duration: 3600)
+        h.clock.advance(600)
+        await m.extend(by: 3600)
+        h.guardFake.throwOn = ["disablesleep 0"]
+        let outcome = await m.end(reason: .quit)
+        XCTAssertEqual(outcome, .incomplete(agentArmed: true))
+        h.guardFake.throwOn = []
+        try h.store.saveSession(Session(startedAt: h.clock.now, endsAt: h.clock.now.addingTimeInterval(3600)))
+        h.guardFake.sleepDisabled = true
+        let relaunched = h.makeManager()
+        await relaunched.reconcile()
+
+        XCTAssertEqual(h.backstop.arms, 4, "start, extend, the failed end and the relaunch")
+        let own = try XCTUnwrap(FileIdentity(atPath: h.home.paths.recoveryLock.path))
+        XCTAssertEqual(h.backstop.armLocks, Array(repeating: own, count: 4))
+    }
+
     func testCountdownPauseResume() async throws {
         let m = h.makeManager()
         await m.start(duration: 3600)

@@ -1350,7 +1350,15 @@ final class FakeBackstop: BackstopScheduling, @unchecked Sendable {
         get { lock.withLock { _armGate } }
         set { lock.withLock { _armGate = newValue } }
     }
+    private var _armLocks: [FileIdentity?] = []
+    /// For each `arm()` call, the file of the recovery lock the calling
+    /// transaction held (`RecoveryLock.held`), nil when none was held. The
+    /// real arm() takes the agent lock after it, or reuses it when it is
+    /// the same file.
+    var armLocks: [FileIdentity?] { lock.withLock { _armLocks } }
     func arm() async throws {
+        let held = RecoveryLock.held?.file
+        lock.withLock { _armLocks.append(held) }
         if let gate = armGate { await gate.wait() }
         if failArm { throw BackstopError(message: "fake launchd refused") }
         lock.withLock { _arms += 1 }

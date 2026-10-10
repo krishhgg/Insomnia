@@ -4906,13 +4906,19 @@ final class RecoveryScriptTests: XCTestCase {
     /// Round 34 (Greptile 4234715817): whose recovery agent launchd has
     /// loaded, as the uninstall reads `launchctl print`: its own
     /// loaded_agent and own_agent_file, run on their own with a stand-in
-    /// for the bounded print. The top-level `path =` line names the file
+    /// for the bounded calls. The top-level `path =` line names the file
     /// the job was loaded from. This folder's plist or candidate, in the
-    /// staging folder or beside the plist, spelled any way that leads to
-    /// this folder's LaunchAgents folder, is its own, whether the file is
+    /// staging folder or beside the plist, is its own, whether the file is
     /// still there or not. Any other file is another folder's. A print
     /// that fails or does not answer, or that names no such file, two, or
     /// a relative one, leaves it unknown. Only the line one tab in counts.
+    /// Round 36 (independent35 R35-2): another spelling of the folder is
+    /// its own only when it leads to this folder as a whole, the
+    /// LaunchAgents folder and the folder above it. A link to the whole
+    /// folder is its own; another folder whose LaunchAgents folder links
+    /// here, or a link to LaunchAgents under another name, is not. Each
+    /// stat is bounded: one that does not answer, for this folder or the
+    /// other, leaves it unknown; another folder that is gone is another's.
     func testUninstallTellsWhoseAgentIsLoadedFromThePathLaunchctlPrints() throws {
         let text = try String(contentsOf: fx.uninstall, encoding: .utf8)
         func function(_ name: String) throws -> String {
@@ -4925,9 +4931,13 @@ final class RecoveryScriptTests: XCTestCase {
         let mine = fx.root.appendingPathComponent("Application Support/Insomnia/LaunchAgents", isDirectory: true).path
         let other = fx.root.appendingPathComponent("Application Support/Insomnia Other/LaunchAgents", isDirectory: true).path
         let link = fx.root.appendingPathComponent("a link to mine").path
+        let wholeLink = fx.root.appendingPathComponent("a link to all of mine").path
+        let aliasHome = fx.root.appendingPathComponent("Application Support/Insomnia Alias", isDirectory: true).path
         let sibling = mine + "2"
-        for dir in [mine + "/.\(label).staging", other + "/.\(label).staging", sibling] { try fm.createDirectory(atPath: dir, withIntermediateDirectories: true) }
+        for dir in [mine + "/.\(label).staging", other + "/.\(label).staging", sibling, aliasHome] { try fm.createDirectory(atPath: dir, withIntermediateDirectories: true) }
         try fm.createSymbolicLink(atPath: link, withDestinationPath: mine)
+        try fm.createSymbolicLink(atPath: wholeLink, withDestinationPath: (mine as NSString).deletingLastPathComponent)
+        try fm.createSymbolicLink(atPath: aliasHome + "/LaunchAgents", withDestinationPath: mine)
         try "plist".write(toFile: other + "/\(label).plist", atomically: true, encoding: .utf8)
         let candidate = "\(label).candidate-\(UUID().uuidString).plist"
         func printed(_ paths: [String], extra: String = "") -> String {
@@ -4938,31 +4948,39 @@ final class RecoveryScriptTests: XCTestCase {
         let asked = "'launchctl print gui/\(fx.uid)/\(label)'"
         let noPath = "\(asked) lists the job but not one absolute path it was loaded from"
         let nested = "\tendpoints = {\n\t\tpath = \(mine)/\(label).plist\n\t}\n\n"
-        var cases: [(name: String, rc: Int, output: String, seen: String, path: String, why: String)] = [
-            ("not loaded", 113, "", "none", "", ""),
-            ("no answer", 124, "", "unknown", "", "\(asked) did not answer within 5s"),
-            ("an error", 1, "Could not print domain: 1: Operation not permitted", "unknown", "", "\(asked) exited 1"),
-            ("this folder's plist", 0, printed(["\(mine)/\(label).plist"]), "own", "\(mine)/\(label).plist", ""),
-            ("this folder's candidate, renamed since", 0, printed(["\(mine)/.\(label).staging/\(candidate)"]), "own", "\(mine)/.\(label).staging/\(candidate)", ""),
-            ("an older build's candidate beside the plist", 0, printed(["\(mine)/\(candidate)"]), "own", "\(mine)/\(candidate)", ""),
-            ("this folder through a link", 0, printed(["\(link)/\(label).plist"]), "own", "\(link)/\(label).plist", ""),
-            ("a candidate through a link", 0, printed(["\(link)/.\(label).staging/\(candidate)"]), "own", "\(link)/.\(label).staging/\(candidate)", ""),
-            ("the top-level line among nested ones", 0, printed(["\(mine)/\(label).plist"], extra: nested), "own", "\(mine)/\(label).plist", ""),
-            ("another folder's plist", 0, printed(["\(other)/\(label).plist"]), "other", "\(other)/\(label).plist", ""),
-            ("another folder's candidate", 0, printed(["\(other)/.\(label).staging/\(candidate)"]), "other", "\(other)/.\(label).staging/\(candidate)", ""),
-            ("a folder beside this one", 0, printed(["\(sibling)/\(label).plist"]), "other", "\(sibling)/\(label).plist", ""),
-            ("a folder that is gone", 0, printed(["\(other)-gone/\(label).plist"]), "other", "\(other)-gone/\(label).plist", ""),
-            ("another name in this folder", 0, printed(["\(mine)/com.example.agent.plist"]), "other", "\(mine)/com.example.agent.plist", ""),
-            ("the plist's name in the staging folder", 0, printed(["\(mine)/.\(label).staging/\(label).plist"]), "other", "\(mine)/.\(label).staging/\(label).plist", ""),
-            ("no path line", 0, printed([]), "unknown", "", noPath),
-            ("only a nested path line", 0, printed([], extra: nested), "unknown", "", noPath),
-            ("two path lines", 0, printed(["\(mine)/\(label).plist", "\(other)/\(label).plist"]), "unknown", "", noPath),
-            ("a relative path", 0, printed(["LaunchAgents/\(label).plist"]), "unknown", "", noPath),
+        let stalls = "did not answer within 5s"
+        var cases: [(name: String, rc: Int, output: String, seen: String, path: String, why: String, stall: String?)] = [
+            ("not loaded", 113, "", "none", "", "", nil),
+            ("no answer", 124, "", "unknown", "", "\(asked) did not answer within 5s", nil),
+            ("an error", 1, "Could not print domain: 1: Operation not permitted", "unknown", "", "\(asked) exited 1", nil),
+            ("this folder's plist", 0, printed(["\(mine)/\(label).plist"]), "own", "\(mine)/\(label).plist", "", nil),
+            ("this folder's candidate, renamed since", 0, printed(["\(mine)/.\(label).staging/\(candidate)"]), "own", "\(mine)/.\(label).staging/\(candidate)", "", nil),
+            ("an older build's candidate beside the plist", 0, printed(["\(mine)/\(candidate)"]), "own", "\(mine)/\(candidate)", "", nil),
+            ("this folder through a link to all of it", 0, printed(["\(wholeLink)/LaunchAgents/\(label).plist"]), "own", "\(wholeLink)/LaunchAgents/\(label).plist", "", nil),
+            ("a candidate through a link to all of it", 0, printed(["\(wholeLink)/LaunchAgents/.\(label).staging/\(candidate)"]), "own", "\(wholeLink)/LaunchAgents/.\(label).staging/\(candidate)", "", nil),
+            ("the top-level line among nested ones", 0, printed(["\(mine)/\(label).plist"], extra: nested), "own", "\(mine)/\(label).plist", "", nil),
+            ("another folder whose LaunchAgents links here", 0, printed(["\(aliasHome)/LaunchAgents/\(label).plist"]), "other", "\(aliasHome)/LaunchAgents/\(label).plist", "", nil),
+            ("a candidate of that folder", 0, printed(["\(aliasHome)/LaunchAgents/.\(label).staging/\(candidate)"]), "other", "\(aliasHome)/LaunchAgents/.\(label).staging/\(candidate)", "", nil),
+            ("a link to this LaunchAgents folder under another name", 0, printed(["\(link)/\(label).plist"]), "other", "\(link)/\(label).plist", "", nil),
+            ("a candidate through that link", 0, printed(["\(link)/.\(label).staging/\(candidate)"]), "other", "\(link)/.\(label).staging/\(candidate)", "", nil),
+            ("another folder's plist", 0, printed(["\(other)/\(label).plist"]), "other", "\(other)/\(label).plist", "", nil),
+            ("another folder's candidate", 0, printed(["\(other)/.\(label).staging/\(candidate)"]), "other", "\(other)/.\(label).staging/\(candidate)", "", nil),
+            ("a folder beside this one", 0, printed(["\(sibling)/\(label).plist"]), "other", "\(sibling)/\(label).plist", "", nil),
+            ("a folder that is gone", 0, printed(["\(other)-gone/LaunchAgents/\(label).plist"]), "other", "\(other)-gone/LaunchAgents/\(label).plist", "", nil),
+            ("another name in this folder", 0, printed(["\(mine)/com.example.agent.plist"]), "other", "\(mine)/com.example.agent.plist", "", nil),
+            ("the plist's name in the staging folder", 0, printed(["\(mine)/.\(label).staging/\(label).plist"]), "other", "\(mine)/.\(label).staging/\(label).plist", "", nil),
+            ("this folder does not answer", 0, printed(["\(other)/\(label).plist"]), "unknown", "", "the folders of \(other)/\(label).plist could not be compared with this one ('stat -L \(mine)' \(stalls))", mine),
+            ("the other folder does not answer", 0, printed(["\(other)/\(label).plist"]), "unknown", "", "the folders of \(other)/\(label).plist could not be compared with this one ('stat -L \(other)' \(stalls))", other),
+            ("the folder above a linked LaunchAgents does not answer", 0, printed(["\(aliasHome)/LaunchAgents/\(label).plist"]), "unknown", "", "the folders of \(aliasHome)/LaunchAgents/\(label).plist could not be compared with this one ('stat -L \(aliasHome)' \(stalls))", aliasHome),
+            ("no path line", 0, printed([]), "unknown", "", noPath, nil),
+            ("only a nested path line", 0, printed([], extra: nested), "unknown", "", noPath, nil),
+            ("two path lines", 0, printed(["\(mine)/\(label).plist", "\(other)/\(label).plist"]), "unknown", "", noPath, nil),
+            ("a relative path", 0, printed(["LaunchAgents/\(label).plist"]), "unknown", "", noPath, nil),
         ]
         // The same folder from the root, without the links on its way (on
         // macOS /var is a link to /private/var), when that spelling differs.
         let real = try XCTUnwrap(realpath(mine, nil).map { p in defer { free(p) }; return String(cString: p) })
-        if real != mine { cases.append(("this folder spelled from the root", 0, printed(["\(real)/\(label).plist"]), "own", "\(real)/\(label).plist", "")) }
+        if real != mine { cases.append(("this folder spelled from the root", 0, printed(["\(real)/\(label).plist"]), "own", "\(real)/\(label).plist", "", nil)) }
 
         let dir = fx.root.appendingPathComponent("prints", isDirectory: true)
         try fm.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -4971,6 +4989,7 @@ final class RecoveryScriptTests: XCTestCase {
             let base = dir.appendingPathComponent("\(i)").path
             try "\(c.rc)\n".write(toFile: base + ".rc", atomically: true, encoding: .utf8)
             try c.output.write(toFile: base + ".out", atomically: true, encoding: .utf8)
+            if let stall = c.stall { try stall.write(toFile: base + ".stall", atomically: true, encoding: .utf8) }
             bases.append(base)
         }
         let harness = fx.root.appendingPathComponent("whose-agent.sh")
@@ -4983,16 +5002,26 @@ final class RecoveryScriptTests: XCTestCase {
         STAT=/usr/bin/stat
         LAUNCH_AGENTS="$1"
         shift
-        # bounded() as the uninstall has it, without the process: the
-        # case's status, and its output without the last newline.
+        # bounded() as the uninstall has it, without the process: for the
+        # print, the case's status, and its output without the last
+        # newline; for a stat, the real one, or 124 for the path in the
+        # case's .stall file.
         bounded() {
-          local rc
+          local rc=0
+          if [[ "$1" == "$STAT" ]]; then
+            [[ $# == 5 && "$2 $3 $4" == "-L -f %d:%i" ]] || { echo "unexpected call: $*" >&2; exit 3; }
+            if [[ -f "$CASE.stall" && "${*: -1}" == "$(< "$CASE.stall")" ]]; then BOUNDED_OUTPUT=""; return 124; fi
+            BOUNDED_OUTPUT="$("$@" 2>&1)" || rc=$?
+            return "$rc"
+          fi
           [[ "$*" == "$LAUNCHCTL print gui/$UID_NUM/$LABEL" ]] || { echo "unexpected call: $*" >&2; exit 3; }
           read -r rc < "$CASE.rc"
           IFS= read -r -d '' BOUNDED_OUTPUT < "$CASE.out" || true
           BOUNDED_OUTPUT="${BOUNDED_OUTPUT%$'\\n'}"
           return "$rc"
         }
+        \(try function("pmset_failed"))
+        \(try function("path_identity"))
         \(try function("own_agent_file"))
         \(try function("loaded_agent"))
         for CASE in "$@"; do
